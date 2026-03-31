@@ -13,22 +13,17 @@ use mo_agent_runtime::{
     turn::headless_tool_assembly::tool_calls_for_stall_guard,
 };
 
-use crate::{
-    ExplainMode, StreamResult, VerdictEvent, cli_utils::compact_or_raw, edge_tools,
-    stream_render::consume_turn_sse,
-};
+use crate::{ExplainMode, StreamResult, VerdictEvent, edge_tools};
 
 use super::super::{
     ChatTurnParams,
-    edge_executor::edge_executor_instance_id,
     explain_reports::{print_explain_report, print_verdict_report},
 };
+use super::fetch_chat_turn_sse::{ChatTurnSseFetchRequest, fetch_chat_turn_sse};
 use super::post_tool_round::{
     PostToolTurnOutcome, PostToolTurnRequest, apply_post_tool_turn_policy,
 };
-use super::prepare_turn_request::{
-    PrepareChatTurnRequest, PrepareTurnTelemetry, prepare_chat_turn_payload,
-};
+use super::prepare_turn_request::PrepareTurnTelemetry;
 use super::stall_preflight::{StallPreflightRequest, apply_stall_preflight};
 use super::tool_round::{HeadlessToolRoundRequest, run_headless_tool_round};
 use super::turn_result_ingest::{
@@ -146,28 +141,29 @@ pub(crate) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
         step_recorder.begin_turn(_turn as u32);
 
         let assembly_start = Instant::now();
-        let explain_stderr = explain != ExplainMode::Off;
-        let payload = prepare_chat_turn_payload(PrepareChatTurnRequest {
-            messages: &messages,
-            current_session_id: current_session_id.as_deref(),
+        let turn_result = fetch_chat_turn_sse(ChatTurnSseFetchRequest {
+            api,
+            token,
             model,
-            explain_verbose: matches!(explain, ExplainMode::Verbose),
-            explain_on: matches!(explain, ExplainMode::On),
-            explain_stderr,
-            project_root: &project_root,
+            explain,
+            render_md,
+            term_width,
+            quiet,
             message,
             history,
             recent_tools,
+            project_root: project_root.as_path(),
             executor: &mut executor,
             selector,
             registry: &registry,
+            messages: &messages,
+            current_session_id: current_session_id.as_deref(),
             tool_results: &tool_results,
             all_schemas: &all_schemas,
             turn_guard: &turn_guard,
             restricted_tools: &mut restricted_tools,
             step_recorder: &mut step_recorder,
             skill_registry,
-            quiet,
             file_context: &file_context,
             assembly_start,
             telem: PrepareTurnTelemetry {
@@ -181,31 +177,9 @@ pub(crate) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
                 first_context_assembly_ms: &mut first_context_assembly_ms,
                 all_selected_skills: &mut all_selected_skills,
             },
+            perm_manager,
         })
-        .await;
-
-        let resp = api
-            .post_chat_turn_retry_429(token, &payload, 3, quiet)
-            .await
-            .map_err(|e| e.to_string())?;
-
-        let status = resp.status();
-        if !status.is_success() {
-            let body = resp.text().await.map_err(|e| e.to_string())?;
-            return Err(format!("API Error ({}): {}", status, compact_or_raw(&body)));
-        }
-
-        let edge_ctx = crate::stream_render::EdgeSseContext {
-            api,
-            token,
-            executor_id: edge_executor_instance_id(),
-            executor: &executor,
-            quiet,
-            perm_manager: Some(std::ptr::NonNull::from(&mut *perm_manager)),
-            _pm: std::marker::PhantomData,
-        };
-        let turn_result =
-            consume_turn_sse(resp, render_md, term_width, quiet, Some(edge_ctx)).await;
+        .await?;
 
         match ingest_turn_sse_result(TurnResultIngestRequest {
             turn_result: &turn_result,
