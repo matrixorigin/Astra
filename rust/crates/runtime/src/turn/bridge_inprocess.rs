@@ -29,7 +29,7 @@ use crate::{
     },
     turn::edge_ledger::{assistant_message_with_tool_calls, ensure_tool_call_ids},
     turn::persist::{build_tool_call_event_payload, build_tool_result_event_payload},
-    turn::sse_blocks::drain_complete_sse_event_blocks,
+    turn::sse_blocks::SseBlankLineUtf8Buf,
     turn::sse_data_lines::{
         drain_sse_data_lines, finish_sse_data_buffer, json_events_from_sse_event_block,
     },
@@ -72,20 +72,19 @@ fn render_sse_map(event: &Map<String, Value>) -> Bytes {
 
 /// Parse OpenAI-style SSE from a streaming response body.
 ///
-/// Complete events are split on blank lines (`sse_blocks::drain_complete_sse_event_blocks`, same
-/// framing as `/chat/turn` and `chat_turn_sse_dispatch::ChatTurnSseFramer`). Each block is scanned
+/// Complete events are split on blank lines (`sse_blocks::SseBlankLineUtf8Buf`, same framing as
+/// `/chat/turn` and `chat_turn_sse_dispatch::ChatTurnSseFramer`). Each block is scanned
 /// for `data:` JSON lines. After the byte stream ends, any remainder is flushed with line-oriented
 /// `sse_data_lines` draining so single-`\n` or partial tails still work.
 fn parse_sse_chunks(
     stream: impl futures_util::Stream<Item = Result<Bytes, reqwest::Error>> + Unpin + Send + 'static,
 ) -> impl futures_util::Stream<Item = Value> + Send + 'static {
     stream! {
-        let mut buf = String::new();
+        let mut sse_in = SseBlankLineUtf8Buf::new();
         tokio::pin!(stream);
         while let Some(chunk) = stream.next().await {
             let Ok(bytes) = chunk else { break };
-            buf.push_str(&String::from_utf8_lossy(&bytes));
-            for block in drain_complete_sse_event_blocks(&mut buf) {
+            for block in sse_in.push_lossy_bytes(&bytes) {
                 let d = json_events_from_sse_event_block(&block);
                 for v in d.events {
                     yield v;
@@ -95,6 +94,7 @@ fn parse_sse_chunks(
                 }
             }
         }
+        let mut buf = sse_in.into_inner();
         let tail = drain_sse_data_lines(&mut buf, "");
         for v in tail.events {
             yield v;

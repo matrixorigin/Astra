@@ -7,6 +7,8 @@
 use serde_json::Value;
 use std::time::Instant;
 
+use super::sse_blocks::SseBlankLineUtf8Buf;
+
 /// State collected from one `/chat/turn` SSE stream (excluding edge executor bookkeeping).
 #[derive(Debug, Clone, Default)]
 pub struct ChatTurnSseAccum {
@@ -201,7 +203,7 @@ pub fn dispatch_chat_turn_sse_event_block(
 /// records [`ChatTurnSseFramer::ttft_ms`] on the first `text_delta` / `content_block_delta` payload.
 #[derive(Debug)]
 pub struct ChatTurnSseFramer {
-    buf: String,
+    sse: SseBlankLineUtf8Buf,
     stream_start: Instant,
     pub ttft_ms: Option<u64>,
     first_token_recorded: bool,
@@ -210,7 +212,7 @@ pub struct ChatTurnSseFramer {
 impl ChatTurnSseFramer {
     pub fn new() -> Self {
         Self {
-            buf: String::new(),
+            sse: SseBlankLineUtf8Buf::new(),
             stream_start: Instant::now(),
             ttft_ms: None,
             first_token_recorded: false,
@@ -230,8 +232,7 @@ impl ChatTurnSseFramer {
 
     /// Append one HTTP chunk; returns every **complete** SSE event block (may be empty).
     pub fn push_lossy_bytes(&mut self, bytes: &[u8]) -> Vec<String> {
-        self.buf.push_str(&String::from_utf8_lossy(bytes));
-        let blocks = crate::turn::sse_blocks::drain_complete_sse_event_blocks(&mut self.buf);
+        let blocks = self.sse.push_lossy_bytes(bytes);
         for b in &blocks {
             self.note_ttft_from_raw_event_text(b);
         }
@@ -241,7 +242,7 @@ impl ChatTurnSseFramer {
     /// After the byte stream ends: run TTFT detection on any trailing bytes, then take the buffer
     /// for a final [`dispatch_chat_turn_sse_event_block`] pass (partial event without `\n\n` yet).
     pub fn take_trailing_dispatch_blob(&mut self) -> String {
-        let tail = std::mem::take(&mut self.buf);
+        let tail = self.sse.take_buf();
         self.note_ttft_from_raw_event_text(&tail);
         tail
     }

@@ -2,6 +2,9 @@
 //!
 //! Matches mo-agent HTTP streams and [`mo_thin_client::sse::SseParser`] boundaries. Distinct from
 //! [`super::sse_data_lines`] (OpenAI-style `data:` per `\n` without requiring `\n\n`).
+//!
+//! [`SseBlankLineUtf8Buf`] is the shared incremental buffer used by [`super::chat_turn_sse_dispatch::ChatTurnSseFramer`]
+//! and [`super::bridge_inprocess`] for streaming HTTP bodies.
 
 /// Returns `(byte_index_before_separator, separator_width)` for the first complete block in `s`.
 fn next_event_boundary(s: &str) -> Option<(usize, usize)> {
@@ -26,9 +29,46 @@ pub fn drain_complete_sse_event_blocks(buf: &mut String) -> Vec<String> {
     out
 }
 
+/// Incremental UTF-8 buffer for SSE over HTTP: decode chunks with [`String::from_utf8_lossy`], then
+/// drain every complete blank-line event (same boundaries as `/chat/turn` and mo-thin-client).
+#[derive(Debug, Default)]
+pub struct SseBlankLineUtf8Buf {
+    buf: String,
+}
+
+impl SseBlankLineUtf8Buf {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn push_lossy_bytes(&mut self, bytes: &[u8]) -> Vec<String> {
+        self.buf.push_str(&String::from_utf8_lossy(bytes));
+        drain_complete_sse_event_blocks(&mut self.buf)
+    }
+
+    /// Replace the inner buffer with empty and return the previous contents (trailing partial SSE event).
+    pub fn take_buf(&mut self) -> String {
+        std::mem::take(&mut self.buf)
+    }
+
+    pub fn into_inner(self) -> String {
+        self.buf
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn blank_line_buf_chunks_match_single_drain() {
+        let mut b = SseBlankLineUtf8Buf::new();
+        assert!(b.push_lossy_bytes(b"data: ").is_empty());
+        let v = b.push_lossy_bytes(b"{\"z\":3}\n\n");
+        assert_eq!(v.len(), 1);
+        assert!(v[0].contains("\"z\""));
+        assert!(b.into_inner().is_empty());
+    }
 
     #[test]
     fn drain_two_lf_blocks_in_one_buffer() {
