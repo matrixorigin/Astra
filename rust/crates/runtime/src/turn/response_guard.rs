@@ -1,3 +1,58 @@
+// ── Fallback messages when guards fire ──────────────────────────────
+/// Replacement text when the LLM leaks the system prompt.
+pub const PROMPT_LEAK_FALLBACK: &str =
+    "I apologize, but I encountered an issue generating that response. Let me try again.";
+
+/// Replacement text when the LLM enters a repetition loop.
+pub const REPETITION_LOOP_FALLBACK: &str =
+    "I noticed I was repeating myself. Let me approach this differently.";
+
+/// Apply response guards to LLM output. Returns `Some(replacement)` if the
+/// text was blocked, `None` if it passed all guards.
+pub fn apply_response_guards(
+    text: &str,
+    tool_calls: &[serde_json::Value],
+    allowed_tools: &[&str],
+    user_query: &str,
+) -> ResponseGuardResult {
+    if text.is_empty() {
+        return ResponseGuardResult {
+            replacement: None,
+            quality: QualityReport::default(),
+        };
+    }
+
+    // Hard blocks: replace entire text
+    if is_prompt_leaked(text, &[]) {
+        return ResponseGuardResult {
+            replacement: Some(PROMPT_LEAK_FALLBACK.to_string()),
+            quality: QualityReport::default(),
+        };
+    }
+    if is_repetition_loop(text) {
+        return ResponseGuardResult {
+            replacement: Some(REPETITION_LOOP_FALLBACK.to_string()),
+            quality: QualityReport::default(),
+        };
+    }
+
+    // Soft signals: return quality report (caller decides what to do)
+    let quality = check_response_quality(text, tool_calls, allowed_tools, user_query);
+    ResponseGuardResult {
+        replacement: None,
+        quality,
+    }
+}
+
+/// Outcome of running all response guards on LLM output.
+#[derive(Debug, Clone)]
+pub struct ResponseGuardResult {
+    /// If `Some`, the original text should be replaced with this fallback.
+    pub replacement: Option<String>,
+    /// Quality signals (fabrication, echo, hallucination) — advisory only.
+    pub quality: QualityReport,
+}
+
 const STRUCTURAL_MARKERS: &[&str] = &[
     "## Core Rules",
     "## Planning Protocol",
@@ -447,5 +502,84 @@ mod tests {
         assert!(warning.starts_with("⚠ Quality issues:"));
         assert!(warning.contains("invented_tool"));
         assert!(warning.contains("get_agent_info"));
+    }
+
+    // ── apply_response_guards ───────────────────────────────────
+
+    #[test]
+    fn guard_blocks_prompt_leak() {
+        let result = apply_response_guards(
+            "Here are ## Core Rules that must be followed",
+            &[],
+            &["bash"],
+            "help me",
+        );
+        assert_eq!(result.replacement.as_deref(), Some(PROMPT_LEAK_FALLBACK));
+    }
+
+    #[test]
+    fn guard_blocks_repetition() {
+        let result = apply_response_guards(
+            "loop loop loop loop loop loop loop loop loop",
+            &[],
+            &["bash"],
+            "help me",
+        );
+        assert_eq!(
+            result.replacement.as_deref(),
+            Some(REPETITION_LOOP_FALLBACK)
+        );
+    }
+
+    #[test]
+    fn guard_passes_clean_text() {
+        let result = apply_response_guards(
+            "Here's what I found in the codebase.",
+            &[],
+            &["bash"],
+            "what did you find?",
+        );
+        assert!(
+            result.replacement.is_none(),
+            "clean text should pass all guards"
+        );
+        assert!(!result.quality.has_issues());
+    }
+
+    #[test]
+    fn guard_empty_text_passes() {
+        let result = apply_response_guards("", &[], &["bash"], "query");
+        assert!(result.replacement.is_none());
+    }
+
+    #[test]
+    fn guard_returns_quality_for_fabrication() {
+        let result = apply_response_guards(
+            "Check path/to/your/config.yaml for the settings",
+            &[],
+            &["bash"],
+            "where is config?",
+        );
+        assert!(
+            result.replacement.is_none(),
+            "fabrication is advisory, not a hard block"
+        );
+        assert!(result.quality.has_fabrication_markers);
+    }
+
+    #[test]
+    fn guard_constants_are_user_facing() {
+        assert!(
+            !PROMPT_LEAK_FALLBACK.is_empty(),
+            "fallback must have content"
+        );
+        assert!(
+            !REPETITION_LOOP_FALLBACK.is_empty(),
+            "fallback must have content"
+        );
+        assert!(
+            !PROMPT_LEAK_FALLBACK.contains("error code"),
+            "fallback should be user-friendly"
+        );
     }
 }

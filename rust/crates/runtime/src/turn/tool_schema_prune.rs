@@ -1,10 +1,11 @@
-//! Progressive tool schema pruning under token pressure (shared by in-process bridge and future clients).
+//! Tool schema manipulation: pruning under token pressure and pinning previously-invoked tools.
 
 use std::collections::HashSet;
 
 use serde_json::{Value, json};
 
 use crate::prompts::CompactionTier;
+use crate::tool_registry::SelectionReport;
 
 /// Prune tool schemas under token pressure to reduce context size.
 /// - `TrimSchemas` tier: truncate descriptions to first sentence
@@ -145,6 +146,46 @@ fn strip_property_descriptions(func: &mut Value) {
             }
         }
     }
+}
+
+/// Extract the function name from a tool schema `{"function":{"name":"…"}}`.
+fn schema_tool_name(schema: &Value) -> Option<&str> {
+    schema
+        .get("function")
+        .and_then(|f| f.get("name"))
+        .and_then(|n| n.as_str())
+}
+
+/// Ensure tool schemas for previously-invoked tools remain available in follow-up turns.
+///
+/// When the selector picks a fresh set of tools for the next LLM round it may drop
+/// tools the LLM already called (because the query shifted). This function re-pins
+/// those schemas so the LLM can continue using them. Mutates `selected` and `report`
+/// in-place, returning the count of schemas that were added.
+pub fn pin_invoked_tool_schemas(
+    selected: &mut Vec<Value>,
+    report: &mut SelectionReport,
+    tool_results: &[Value],
+    all_schemas: &[Value],
+) -> u32 {
+    let selected_names: HashSet<String> = selected
+        .iter()
+        .filter_map(|s| schema_tool_name(s).map(String::from))
+        .collect();
+
+    let mut pinned = 0u32;
+    for tr in tool_results {
+        if let Some(name) = tr.get("name").and_then(|n| n.as_str())
+            && !selected_names.contains(name)
+            && let Some(schema) = all_schemas.iter().find(|s| schema_tool_name(s) == Some(name))
+        {
+            selected.push(schema.clone());
+            report.tools_selected.push(name.to_string());
+            report.selected_count += 1;
+            pinned += 1;
+        }
+    }
+    pinned
 }
 
 #[cfg(test)]
@@ -290,5 +331,85 @@ mod tests {
             trimmed_bytes,
             normal_bytes
         );
+    }
+
+    // ── pin_invoked_tool_schemas ──────────────────────────────
+
+    #[test]
+    fn pin_adds_missing_invoked_tool() {
+        let all = vec![
+            make_tool_schema("bash", "run", false),
+            make_tool_schema("grep", "search", false),
+            make_tool_schema("read_file", "read", false),
+        ];
+        let mut selected = vec![make_tool_schema("bash", "run", false)];
+        let mut report = SelectionReport {
+            tools_selected: vec!["bash".into()],
+            selected_count: 1,
+            budget_used: 0,
+            budget_total: 100,
+        };
+        let results = vec![json!({"name": "grep"}), json!({"name": "read_file"})];
+
+        let pinned = pin_invoked_tool_schemas(&mut selected, &mut report, &results, &all);
+
+        assert_eq!(pinned, 2);
+        assert_eq!(selected.len(), 3);
+        assert_eq!(report.selected_count, 3);
+        assert!(report.tools_selected.contains(&"grep".to_string()));
+        assert!(report.tools_selected.contains(&"read_file".to_string()));
+    }
+
+    #[test]
+    fn pin_does_not_duplicate_already_selected() {
+        let all = vec![make_tool_schema("bash", "run", false)];
+        let mut selected = vec![make_tool_schema("bash", "run", false)];
+        let mut report = SelectionReport {
+            tools_selected: vec!["bash".into()],
+            selected_count: 1,
+            budget_used: 0,
+            budget_total: 100,
+        };
+        let results = vec![json!({"name": "bash"})];
+
+        let pinned = pin_invoked_tool_schemas(&mut selected, &mut report, &results, &all);
+
+        assert_eq!(pinned, 0);
+        assert_eq!(selected.len(), 1);
+    }
+
+    #[test]
+    fn pin_skips_unknown_tools() {
+        let all = vec![make_tool_schema("bash", "run", false)];
+        let mut selected = vec![];
+        let mut report = SelectionReport {
+            tools_selected: vec![],
+            selected_count: 0,
+            budget_used: 0,
+            budget_total: 100,
+        };
+        let results = vec![json!({"name": "nonexistent_tool"})];
+
+        let pinned = pin_invoked_tool_schemas(&mut selected, &mut report, &results, &all);
+
+        assert_eq!(pinned, 0);
+        assert!(selected.is_empty());
+    }
+
+    #[test]
+    fn pin_empty_results_is_noop() {
+        let all = vec![make_tool_schema("bash", "run", false)];
+        let mut selected = vec![make_tool_schema("bash", "run", false)];
+        let mut report = SelectionReport {
+            tools_selected: vec!["bash".into()],
+            selected_count: 1,
+            budget_used: 0,
+            budget_total: 100,
+        };
+
+        let pinned = pin_invoked_tool_schemas(&mut selected, &mut report, &[], &all);
+
+        assert_eq!(pinned, 0);
+        assert_eq!(selected.len(), 1);
     }
 }

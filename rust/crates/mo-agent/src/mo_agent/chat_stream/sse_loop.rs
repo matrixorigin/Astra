@@ -26,7 +26,7 @@ use mo_agent_runtime::{
         extract_repos_from_memory, factual_tool_retry_message, should_force_factual_tool_retry,
     },
     turn::edge_prompt_context::{detect_project_languages, detect_workspace_context, make_args_preview},
-    turn::tool_schema_prune::filter_tool_schemas_by_excluded_names,
+    turn::tool_schema_prune::{filter_tool_schemas_by_excluded_names, pin_invoked_tool_schemas},
     turn::headless_tool_assembly::{
         take_edge_output_for_tool_call, tool_calls_for_stall_guard, CACHEABLE_TOOLS,
     },
@@ -356,31 +356,8 @@ pub(crate) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
                 &sel_result.tool_names,
                 budget_pressure,
             );
-            // Add any tools the LLM invoked that aren't already selected
-            let selected_names: std::collections::HashSet<String> = selected
-                .iter()
-                .filter_map(|s| {
-                    s.get("function")
-                        .and_then(|f| f.get("name"))
-                        .and_then(|n| n.as_str())
-                        .map(String::from)
-                })
-                .collect();
-            for tr in &tool_results {
-                if let Some(name) = tr.get("name").and_then(|n| n.as_str())
-                    && !selected_names.contains(name)
-                    && let Some(schema) = all_schemas.iter().find(|s| {
-                        s.get("function")
-                            .and_then(|f| f.get("name"))
-                            .and_then(|n| n.as_str())
-                            == Some(name)
-                    })
-                {
-                    selected.push(schema.clone());
-                    report.tools_selected.push(name.to_string());
-                    report.selected_count += 1;
-                }
-            }
+            // Pin schemas for tools the LLM already invoked in prior turns
+            pin_invoked_tool_schemas(&mut selected, &mut report, &tool_results, &all_schemas);
             (selected, report, conf)
         };
         
@@ -548,41 +525,25 @@ pub(crate) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
         if !turn_result.full_text.is_empty() {
             final_text = turn_result.full_text.clone();
 
-            // Response guard: detect prompt leakage in LLM output
-            if mo_agent_runtime::turn::response_guard::is_prompt_leaked(&final_text, &[]) {
-                agent_warn!(
-                    "response_guard",
-                    "Prompt leak detected in LLM output, sanitizing"
-                );
-                final_text = "I apologize, but I encountered an issue generating that response. Let me try again.".to_string();
-                break;
-            }
-
-            // Response guard: detect repetition loops (LLM stuck repeating same word)
-            if mo_agent_runtime::turn::response_guard::is_repetition_loop(&final_text) {
-                agent_warn!(
-                    "response_guard",
-                    "Repetition loop detected in LLM output, breaking"
-                );
-                final_text = "I noticed I was repeating myself. Let me approach this differently."
-                    .to_string();
-                break;
-            }
-
-            // Response guard: quality check for fabrication and echo
-            let quality = mo_agent_runtime::turn::response_guard::check_response_quality(
+            // Unified response guard: hard blocks (prompt leak, repetition) + soft quality signals
+            let guard = mo_agent_runtime::turn::response_guard::apply_response_guards(
                 &final_text,
                 &turn_result.tool_calls,
-                &[], // tool name validation handled at execution time (line 1262+)
+                &[], // tool name validation handled at execution time
                 message,
             );
-            if quality.has_fabrication_markers {
+            if let Some(replacement) = guard.replacement {
+                agent_warn!("response_guard", "Guard triggered, replacing LLM output");
+                final_text = replacement;
+                break;
+            }
+            if guard.quality.has_fabrication_markers {
                 agent_warn!(
                     "response_guard",
                     "Fabrication markers detected: placeholder paths in response"
                 );
             }
-            if quality.is_echo {
+            if guard.quality.is_echo {
                 agent_warn!(
                     "response_guard",
                     "Echo detected: LLM repeated user query instead of answering"
