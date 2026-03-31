@@ -490,6 +490,30 @@ pub async fn ensure_core_schema(settings: &MatrixOneSettings) -> Result<(), sqlx
     .execute(&pool)
     .await?;
 
+    // Durable agent runs — event-sourced run state with checkpoint support
+    query(
+        "CREATE TABLE IF NOT EXISTS agent_runs (
+            run_id VARCHAR(36) PRIMARY KEY,
+            user_id VARCHAR(36) NOT NULL,
+            session_id VARCHAR(36) NOT NULL,
+            status VARCHAR(20) NOT NULL DEFAULT 'running',
+            waiting_for VARCHAR(200) NULL,
+            checkpoint_json LONGTEXT NULL,
+            error_message TEXT NULL,
+            total_prompt_tokens BIGINT NOT NULL DEFAULT 0,
+            total_completion_tokens BIGINT NOT NULL DEFAULT 0,
+            total_tool_calls INT NOT NULL DEFAULT 0,
+            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            completed_at DATETIME(6) NULL,
+            INDEX idx_runs_user_status (user_id, status),
+            INDEX idx_runs_user_updated (user_id, updated_at),
+            INDEX idx_runs_session (session_id)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
     Ok(())
 }
 

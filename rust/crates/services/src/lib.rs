@@ -106,7 +106,8 @@ pub use reflect::{
 };
 pub use replay::{DatabaseReplayService, ReplayService, UnconfiguredReplayService};
 pub use runs::{
-    CancelRunRecord, ChatRequestData, ChatRunRecord, ChatStreamRecord, RunLifecycleService,
+    CancelRunRecord, ChatRequestData, ChatRunRecord, ChatStreamRecord, DurableRunRecord,
+    InMemoryRunStateStore, RunLifecycleService, RunListRecord, RunMutationRecord, RunStateStore,
     RunStatusRecord, UnconfiguredRunLifecycleService, transform_run_event_for_client,
 };
 pub use sandbox::{

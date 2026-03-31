@@ -30,6 +30,7 @@ use crate::pipeline::step_recorder::StepRecorder;
 use crate::FernetTokenEncryptor;
 use crate::MatrixOneSettings;
 
+use super::run_engine::RunEngine;
 use super::server_loop_host::ServerAgenticLoopHostBuilder;
 
 // ─── Run State ──────────────────────────────────────────────────────────────
@@ -73,8 +74,11 @@ struct RunState {
 
 /// Production [`RunLifecycleService`] that executes agentic loops via
 /// [`ServerAgenticLoopHost`].
+///
+/// When a `RunEngine` is attached, all state changes are also persisted
+/// to the durable store for crash recovery.
 pub struct AgenticRunLifecycleService {
-    /// In-memory run store (run_id → state).
+    /// In-memory run store (run_id → state). Hot cache for low-latency queries.
     runs: RwLock<HashMap<String, RunState>>,
     /// LLM resolution dependencies.
     matrixone: MatrixOneSettings,
@@ -82,6 +86,8 @@ pub struct AgenticRunLifecycleService {
     shared_pool: Option<SharedPool>,
     /// Edge callback ledger shared with the API server.
     edge_callback_ledger: Arc<TokioMutex<HashMap<String, Value>>>,
+    /// Optional durable run engine for persistence.
+    run_engine: Option<RunEngine>,
 }
 
 impl AgenticRunLifecycleService {
@@ -96,11 +102,17 @@ impl AgenticRunLifecycleService {
             encryptor,
             shared_pool: None,
             edge_callback_ledger,
+            run_engine: None,
         }
     }
 
     pub fn with_pool(mut self, pool: SharedPool) -> Self {
         self.shared_pool = Some(pool);
+        self
+    }
+
+    pub fn with_run_engine(mut self, engine: RunEngine) -> Self {
+        self.run_engine = Some(engine);
         self
     }
 
@@ -268,6 +280,11 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         };
         self.runs.write().await.insert(run_id.clone(), run_state);
 
+        // Persist to durable store if available
+        if let Some(engine) = &self.run_engine {
+            let _ = engine.start_run(&run_id, &user_id, &session_id).await;
+        }
+
         Ok(ChatRunRecord {
             session_id,
             run_id,
@@ -399,6 +416,11 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 "event_type": "run_finished",
                 "data": {"cancelled": true}
             }));
+            // Persist cancellation
+            if let Some(engine) = &self.run_engine {
+                let _ = engine.persist_status(&run_id, "cancelled", None, None).await;
+                let _ = engine.append_event(&run_id, json!({"event_type": "run_finished", "data": {"cancelled": true}})).await;
+            }
         }
         Ok(CancelRunRecord {
             run_id,
@@ -455,6 +477,11 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             "event_type": "run_paused",
             "data": {}
         }));
+        // Persist pause
+        if let Some(engine) = &self.run_engine {
+            let _ = engine.persist_status(&run_id, "paused", Some("user_resume"), None).await;
+            let _ = engine.append_event(&run_id, json!({"event_type": "run_paused", "data": {}})).await;
+        }
         Ok(RunMutationRecord {
             run_id,
             status: "paused".to_string(),
@@ -487,6 +514,11 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             "event_type": "run_resumed",
             "data": {}
         }));
+        // Persist resume
+        if let Some(engine) = &self.run_engine {
+            let _ = engine.persist_status(&run_id, "running", None, None).await;
+            let _ = engine.append_event(&run_id, json!({"event_type": "run_resumed", "data": {}})).await;
+        }
         Ok(RunMutationRecord {
             run_id,
             status: "running".to_string(),
@@ -853,5 +885,69 @@ mod tests {
         ok(svc.pause_run(run.run_id.clone(), "user-1".into()).await);
         let e = err(svc.pause_run(run.run_id, "user-1".into()).await);
         assert_eq!(e.0, StatusCode::CONFLICT);
+    }
+
+    // ─── Durable persistence integration tests ─────────────────────────
+
+    fn test_service_with_engine() -> AgenticRunLifecycleService {
+        use mo_agent_services::runs::InMemoryRunStateStore;
+        use crate::server::run_engine::RunEngine;
+
+        let engine = RunEngine::new(Arc::new(InMemoryRunStateStore::new()));
+        AgenticRunLifecycleService::new(
+            test_settings(),
+            test_encryptor(),
+            Arc::new(TokioMutex::new(HashMap::new())),
+        )
+        .with_run_engine(engine)
+    }
+
+    #[tokio::test]
+    async fn durable_create_run_persists_to_store() {
+        let svc = test_service_with_engine();
+        let run = ok(svc.create_run("user-1".into(), test_request("hello")).await);
+
+        let engine = svc.run_engine.as_ref().unwrap();
+        let durable = engine.load_run(&run.run_id).await.unwrap().unwrap();
+        assert_eq!(durable.user_id, "user-1");
+        assert_eq!(durable.status, "running");
+        assert_eq!(durable.session_id, run.session_id);
+    }
+
+    #[tokio::test]
+    async fn durable_cancel_persists_to_store() {
+        let svc = test_service_with_engine();
+        let run = ok(svc.create_run("user-1".into(), test_request("task")).await);
+        ok(svc.cancel_run(run.run_id.clone(), "user-1".into()).await);
+
+        let engine = svc.run_engine.as_ref().unwrap();
+        let durable = engine.load_run(&run.run_id).await.unwrap().unwrap();
+        assert_eq!(durable.status, "cancelled");
+        assert!(durable.events.len() >= 2); // run_started + run_finished
+    }
+
+    #[tokio::test]
+    async fn durable_pause_resume_round_trip() {
+        let svc = test_service_with_engine();
+        let run = ok(svc.create_run("user-1".into(), test_request("task")).await);
+
+        ok(svc.pause_run(run.run_id.clone(), "user-1".into()).await);
+        let engine = svc.run_engine.as_ref().unwrap();
+        let durable = engine.load_run(&run.run_id).await.unwrap().unwrap();
+        assert_eq!(durable.status, "paused");
+        assert_eq!(durable.waiting_for.as_deref(), Some("user_resume"));
+
+        ok(svc.resume_run(run.run_id.clone(), "user-1".into()).await);
+        let durable = engine.load_run(&run.run_id).await.unwrap().unwrap();
+        assert_eq!(durable.status, "running");
+        assert!(durable.waiting_for.is_none());
+    }
+
+    #[tokio::test]
+    async fn no_engine_works_without_persistence() {
+        // Service without engine should still work (backward compat)
+        let svc = test_service();
+        let run = ok(svc.create_run("user-1".into(), test_request("hello")).await);
+        ok(svc.cancel_run(run.run_id, "user-1".into()).await);
     }
 }

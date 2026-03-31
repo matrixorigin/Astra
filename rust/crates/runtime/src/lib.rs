@@ -189,6 +189,8 @@ pub use introspection::{
 // ── Re-exports: server ───────────────────────────────────────────────────────
 
 pub use server::{build_app, serve};
+pub use server::run_engine::RunEngine;
+pub use server::run_lifecycle::AgenticRunLifecycleService;
 
 // ── Re-exports: turn engine ──────────────────────────────────────────────────
 
