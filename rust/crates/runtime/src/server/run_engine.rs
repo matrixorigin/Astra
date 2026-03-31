@@ -40,6 +40,10 @@ use mo_agent_services::runs::{DurableRunRecord, RunStateStore};
 /// Wraps a [`RunStateStore`] and provides high-level operations for
 /// durable run management. The engine is designed to be composed into
 /// `AgenticRunLifecycleService` alongside the volatile in-memory cache.
+/// Wraps a [`RunStateStore`] with higher-level operations for durable run
+/// management: create, status transitions, usage/checkpoint persistence,
+/// event logging, and recovery.
+#[derive(Clone)]
 pub struct RunEngine {
     store: Arc<dyn RunStateStore>,
 }

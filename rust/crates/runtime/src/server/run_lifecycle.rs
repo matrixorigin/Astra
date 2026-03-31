@@ -20,6 +20,7 @@ use tokio::sync::{Mutex as TokioMutex, RwLock};
 use uuid::Uuid;
 
 use mo_agent_core::{ErrorResponse, SharedPool, error_response};
+use mo_agent_services::EdgeContext;
 use mo_agent_services::runs::{
     CancelRunRecord, ChatRequestData, ChatRunRecord, ChatStreamRecord, RunLifecycleService,
     RunListRecord, RunMutationRecord, RunStatusRecord,
@@ -79,7 +80,8 @@ struct RunState {
 /// to the durable store for crash recovery.
 pub struct AgenticRunLifecycleService {
     /// In-memory run store (run_id → state). Hot cache for low-latency queries.
-    runs: RwLock<HashMap<String, RunState>>,
+    /// Arc-wrapped so background tasks spawned by `create_run` can update events.
+    runs: Arc<RwLock<HashMap<String, RunState>>>,
     /// LLM resolution dependencies.
     matrixone: MatrixOneSettings,
     encryptor: Arc<FernetTokenEncryptor>,
@@ -97,7 +99,7 @@ impl AgenticRunLifecycleService {
         edge_callback_ledger: Arc<TokioMutex<HashMap<String, Value>>>,
     ) -> Self {
         Self {
-            runs: RwLock::new(HashMap::new()),
+            runs: Arc::new(RwLock::new(HashMap::new())),
             matrixone,
             encryptor,
             shared_pool: None,
@@ -114,6 +116,11 @@ impl AgenticRunLifecycleService {
     pub fn with_run_engine(mut self, engine: RunEngine) -> Self {
         self.run_engine = Some(engine);
         self
+    }
+
+    /// Clone the Arc handle to the runs map (for background tasks).
+    fn runs_handle(&self) -> Arc<RwLock<HashMap<String, RunState>>> {
+        Arc::clone(&self.runs)
     }
 
     /// Build a [`ServerAgenticLoopHost`] for a single run.
@@ -206,25 +213,23 @@ impl AgenticRunLifecycleService {
     }
 
     /// Extract edge tools from the request context, or provide empty defaults.
-    fn extract_edge_tools(request: &ChatRequestData) -> Vec<Value> {
+    /// Parse the request context into a typed [`EdgeContext`].
+    fn extract_edge_context(request: &ChatRequestData) -> EdgeContext {
         request
             .context
             .as_ref()
-            .and_then(|ctx| ctx.get("edge_tools"))
-            .and_then(Value::as_array)
-            .cloned()
+            .map(EdgeContext::from_context_map)
             .unwrap_or_default()
+    }
+
+    /// Extract edge tools from the request context, or provide empty defaults.
+    fn extract_edge_tools(request: &ChatRequestData) -> Vec<Value> {
+        Self::extract_edge_context(request).edge_tools
     }
 
     /// Extract edge profile from the request context, or provide empty defaults.
     fn extract_edge_profile(request: &ChatRequestData) -> Map<String, Value> {
-        request
-            .context
-            .as_ref()
-            .and_then(|ctx| ctx.get("edge_profile"))
-            .and_then(Value::as_object)
-            .cloned()
-            .unwrap_or_default()
+        Self::extract_edge_context(request).edge_profile.to_map()
     }
 
     /// Collect run events into SSE-compatible format.
@@ -284,6 +289,74 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         if let Some(engine) = &self.run_engine {
             let _ = engine.start_run(&run_id, &user_id, &session_id).await;
         }
+
+        // Spawn background agentic loop.
+        let edge_tools = Self::extract_edge_tools(&request);
+        let edge_profile = Self::extract_edge_profile(&request);
+        let mut host =
+            self.build_host(&user_id, &session_id, &request, edge_tools, edge_profile);
+        let mut loop_state = self.build_initial_state(&request, &session_id, &run_id);
+        loop_state.cancel_flag = Some(cancel_flag);
+
+        // Clone handles we need inside the spawned task.
+        let runs = self.runs_handle();
+        let run_engine = self.run_engine.clone();
+        let bg_run_id = run_id.clone();
+
+        tokio::spawn(async move {
+            let outcome = run_agentic_loop_with_host(&mut host, &mut loop_state).await;
+
+            let mut events = host.take_emitted_events();
+            let (final_status, error_msg) = match outcome {
+                Ok(_) => {
+                    if !loop_state.final_text.is_empty() {
+                        events.push(json!({
+                            "event_type": "text_done",
+                            "data": { "full_text": loop_state.final_text }
+                        }));
+                    }
+                    events.push(json!({
+                        "event_type": "run_finished",
+                        "data": {
+                            "prompt_tokens": loop_state.total_prompt,
+                            "completion_tokens": loop_state.total_completion,
+                            "tool_call_count": loop_state.total_tool_calls,
+                        }
+                    }));
+                    (RunStatus::Completed, None)
+                }
+                Err(err) => {
+                    events.push(json!({
+                        "event_type": "run_error",
+                        "data": {"error": &err}
+                    }));
+                    (RunStatus::Failed, Some(err))
+                }
+            };
+
+            // Persist final status + usage to durable store.
+            let status_str = final_status.as_str();
+
+            // Update in-memory state with collected events and final status.
+            if let Some(run) = runs.write().await.get_mut(&bg_run_id) {
+                run.events.extend(events);
+                run.status = final_status;
+            }
+
+            if let Some(engine) = &run_engine {
+                let _ = engine
+                    .persist_status(&bg_run_id, status_str, None, error_msg.as_deref())
+                    .await;
+                let _ = engine
+                    .persist_usage(
+                        &bg_run_id,
+                        loop_state.total_prompt,
+                        loop_state.total_completion,
+                        loop_state.total_tool_calls,
+                    )
+                    .await;
+            }
+        });
 
         Ok(ChatRunRecord {
             session_id,
@@ -949,5 +1022,175 @@ mod tests {
         let svc = test_service();
         let run = ok(svc.create_run("user-1".into(), test_request("hello")).await);
         ok(svc.cancel_run(run.run_id, "user-1".into()).await);
+    }
+
+    // ─── EdgeContext integration tests ──────────────────────────────────
+
+    #[test]
+    fn extract_edge_context_from_request_with_tools() {
+        let mut ctx = serde_json::Map::new();
+        ctx.insert(
+            "edge_tools".to_string(),
+            json!([{"function": {"name": "bash", "parameters": {}}}]),
+        );
+        ctx.insert(
+            "edge_profile".to_string(),
+            json!({"cwd": "/tmp", "git_branch": "main"}),
+        );
+        let req = ChatRequestData {
+            context: Some(ctx),
+            ..test_request("hello")
+        };
+
+        let edge_ctx = AgenticRunLifecycleService::extract_edge_context(&req);
+        assert_eq!(edge_ctx.tool_count(), 1);
+        assert_eq!(edge_ctx.tool_names(), vec!["bash"]);
+        assert_eq!(edge_ctx.edge_profile.cwd.as_deref(), Some("/tmp"));
+        assert_eq!(edge_ctx.edge_profile.git_branch.as_deref(), Some("main"));
+    }
+
+    #[test]
+    fn extract_edge_context_from_empty_request() {
+        let req = test_request("hello");
+        let edge_ctx = AgenticRunLifecycleService::extract_edge_context(&req);
+        assert!(!edge_ctx.has_tools());
+        assert!(edge_ctx.edge_profile.cwd.is_none());
+    }
+
+    #[test]
+    fn extract_edge_tools_backward_compat() {
+        let mut ctx = serde_json::Map::new();
+        ctx.insert(
+            "edge_tools".to_string(),
+            json!([
+                {"function": {"name": "bash"}},
+                {"function": {"name": "grep"}}
+            ]),
+        );
+        let req = ChatRequestData {
+            context: Some(ctx),
+            ..test_request("hello")
+        };
+        let tools = AgenticRunLifecycleService::extract_edge_tools(&req);
+        assert_eq!(tools.len(), 2);
+    }
+
+    #[test]
+    fn extract_edge_profile_backward_compat() {
+        let mut ctx = serde_json::Map::new();
+        ctx.insert(
+            "edge_profile".to_string(),
+            json!({"cwd": "/workspace", "os": "linux"}),
+        );
+        let req = ChatRequestData {
+            context: Some(ctx),
+            ..test_request("hello")
+        };
+        let profile = AgenticRunLifecycleService::extract_edge_profile(&req);
+        assert_eq!(profile.get("cwd").unwrap(), "/workspace");
+        assert_eq!(profile.get("os").unwrap(), "linux");
+    }
+
+    // ─── Background spawning integration tests ──────────────────────────
+
+    #[tokio::test]
+    async fn create_run_spawns_background_task() {
+        let svc = test_service();
+        let run = ok(svc.create_run("user-1".into(), test_request("hello")).await);
+        assert_eq!(run.status, "running");
+
+        // Give the spawned task a moment to execute and fail
+        // (it will fail because there's no real LLM, but that's fine — we
+        // just verify the task was actually spawned and updates state).
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        let status = ok(svc.get_run_status(run.run_id.clone(), "user-1".into()).await);
+        // The run should have progressed beyond just "running" — either
+        // completed, failed, or have more events.
+        let advanced = status.status != "running" || status.events_count > 1;
+        assert!(
+            advanced,
+            "Expected background task to advance state, but status={} events={}",
+            status.status, status.events_count
+        );
+    }
+
+    #[tokio::test]
+    async fn create_run_with_engine_persists_final_state() {
+        let svc = test_service_with_engine();
+        let run = ok(svc.create_run("user-1".into(), test_request("hello")).await);
+
+        // Wait for background task
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        let engine = svc.run_engine.as_ref().unwrap();
+        let durable = engine.load_run(&run.run_id).await.unwrap().unwrap();
+        // After background task completes, status should not be "running"
+        assert_ne!(
+            durable.status, "running",
+            "Expected final status, but run is still running"
+        );
+    }
+
+    // ─── DelegationTracker integration tests ────────────────────────────
+
+    #[tokio::test]
+    async fn delegation_tracker_get_children() {
+        use crate::server::delegation_engine::{DelegationTracker, SubRunRecord};
+
+        let tracker = DelegationTracker::new();
+        tracker
+            .record_sub_run(SubRunRecord {
+                delegation_id: "d1".into(),
+                run_id: "child-1".into(),
+                parent_run_id: "parent-1".into(),
+                agent_id: "agent-a".into(),
+                depth: 1,
+            })
+            .await;
+        tracker
+            .record_sub_run(SubRunRecord {
+                delegation_id: "d1".into(),
+                run_id: "child-2".into(),
+                parent_run_id: "parent-1".into(),
+                agent_id: "agent-b".into(),
+                depth: 1,
+            })
+            .await;
+        tracker
+            .record_sub_run(SubRunRecord {
+                delegation_id: "d2".into(),
+                run_id: "other-child".into(),
+                parent_run_id: "parent-2".into(),
+                agent_id: "agent-c".into(),
+                depth: 1,
+            })
+            .await;
+
+        let mut children = tracker.get_children("parent-1").await;
+        children.sort();
+        assert_eq!(children, vec!["child-1", "child-2"]);
+
+        let children = tracker.get_children("parent-2").await;
+        assert_eq!(children, vec!["other-child"]);
+
+        let children = tracker.get_children("nonexistent").await;
+        assert!(children.is_empty());
+    }
+
+    // ─── Router route registration test ─────────────────────────────────
+
+    #[test]
+    fn router_includes_delegation_routes() {
+        // Quick check that our delegation routes are registered.
+        let source = include_str!("router_builder.rs");
+        assert!(
+            source.contains("/chat/runs/{run_id}/delegate"),
+            "Missing delegation route"
+        );
+        assert!(
+            source.contains("/chat/runs/{run_id}/delegations"),
+            "Missing delegations list route"
+        );
     }
 }

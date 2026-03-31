@@ -320,6 +320,7 @@ impl DelegationResult {
 ///
 /// Production deployments extend this with database-backed storage via
 /// the existing `AgentService` (agents.rs).
+#[derive(Clone)]
 pub struct AgentProfileRegistry {
     profiles: HashMap<String, AgentProfile>,
 }

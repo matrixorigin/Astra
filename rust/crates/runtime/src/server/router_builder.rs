@@ -57,6 +57,14 @@ pub(super) fn build_router(state: AppState) -> Router {
             "/chat/runs/{run_id}/resume",
             post(run_handlers::resume_run_handler),
         )
+        .route(
+            "/chat/runs/{run_id}/delegate",
+            post(delegation_handlers::delegate_run_handler),
+        )
+        .route(
+            "/chat/runs/{run_id}/delegations",
+            get(delegation_handlers::list_delegations_handler),
+        )
         // Reflect / decision-trace
         .route(
             "/chat/session/{session_id}/reflect",

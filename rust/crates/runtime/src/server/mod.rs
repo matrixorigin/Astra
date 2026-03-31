@@ -22,6 +22,7 @@ mod admin_handlers;
 mod auth_handlers;
 mod bridge_prep;
 mod chat_handlers;
+mod delegation_handlers;
 mod edge_callback_handlers;
 mod http_helpers;
 mod http_types;

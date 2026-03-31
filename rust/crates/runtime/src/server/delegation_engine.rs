@@ -96,6 +96,17 @@ impl DelegationTracker {
         self.parents.read().await.contains_key(run_id)
     }
 
+    /// Get all sub-run IDs for a given parent run across all delegations.
+    pub async fn get_children(&self, parent_run_id: &str) -> Vec<String> {
+        self.parents
+            .read()
+            .await
+            .iter()
+            .filter(|(_, parent)| parent.as_str() == parent_run_id)
+            .map(|(child, _)| child.clone())
+            .collect()
+    }
+
     /// Get the full ancestry chain (run_id → parent → grandparent → ...).
     pub async fn get_ancestry(&self, run_id: &str) -> Vec<String> {
         let parents = self.parents.read().await;
