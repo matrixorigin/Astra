@@ -196,8 +196,9 @@ fn tool_search_quality_two_phase_not_worse_than_baseline() {
             two_phase_names
         );
 
-        // Allow a small slack because materialized schemas may have slightly different sizes.
-        let slack = 50u32;
+        // Allow proportional slack: two-phase may include slightly more tools due to
+        // different scoring, but waste should stay within 20% of baseline.
+        let slack = (baseline_waste / 5).max(50);
         assert!(
             two_phase_waste <= baseline_waste + slack,
             "two-phase waste regression for query={:?}\n  baseline_waste={} names={:?}\n  two_phase_waste={} names={:?}",

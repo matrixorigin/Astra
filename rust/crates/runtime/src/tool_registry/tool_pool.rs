@@ -179,15 +179,20 @@ pub fn select_two_phase_with_state<S: ToolSchemaStore, D: ToolDenyPredicate>(
     }
 
     // Phase 2: rank remaining tools by simple overlap score on query terms.
+    // Only include tools with positive overlap (at least one query term matched).
+    // This prevents filling the budget with zero-relevance tools when the query
+    // has few matching terms (common for CJK or domain-specific queries).
     allowed.retain(|m| !m.pinned);
-    allowed.sort_by(|a, b| {
-        let sa = overlap_score(query_terms, &a.short, &a.name);
-        let sb = overlap_score(query_terms, &b.short, &b.name);
-        sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
-    });
+    let mut scored: Vec<(&SearchableToolMeta, f64)> = allowed
+        .iter()
+        .map(|m| (*m, overlap_score(query_terms, &m.short, &m.name)))
+        .collect();
+    scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
-    for m in allowed.into_iter().take(cfg.max_candidates) {
-        names.push(m.name.clone());
+    for (m, score) in scored.into_iter().take(cfg.max_candidates) {
+        if score > 0.0 {
+            names.push(m.name.clone());
+        }
     }
 
     // Phase 3: materialize + budget gate.
@@ -224,6 +229,15 @@ pub fn select_two_phase_with_state<S: ToolSchemaStore, D: ToolDenyPredicate>(
     }
 }
 
+/// English stop words that are too common to be useful for tool matching.
+/// These appear in virtually every tool description and add noise to overlap scoring.
+const STOP_WORDS: &[&str] = &[
+    "the", "for", "and", "this", "that", "with", "from", "into", "about", "show", "me", "an", "or",
+    "in", "on", "of", "to", "is", "it", "by", "at", "be", "as", "do", "no", "if", "so", "up", "my",
+    "we", "he", "get", "set", "use", "can", "all", "has", "had", "was", "are", "not", "new", "how",
+    "what", "when", "will", "see", "its", "let", "may",
+];
+
 fn overlap_score(terms: &[String], text: &str, name: &str) -> f64 {
     let lower = text.to_lowercase();
     let name_lower = name.to_lowercase();
@@ -231,6 +245,10 @@ fn overlap_score(terms: &[String], text: &str, name: &str) -> f64 {
     for t in terms {
         let tl = t.to_lowercase();
         if tl.is_empty() {
+            continue;
+        }
+        // Skip common stop words — they match too many tool descriptions
+        if STOP_WORDS.contains(&tl.as_str()) {
             continue;
         }
         if name_lower.contains(&tl) {
