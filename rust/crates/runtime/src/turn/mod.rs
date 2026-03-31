@@ -2,6 +2,7 @@ pub mod activity;
 pub mod agentic_post_tool_policy;
 pub mod agentic_prepare_payload;
 pub mod agentic_stall_preflight;
+pub mod agentic_turn_flow;
 pub mod agentic_turn_ingest;
 pub mod agentic_turn_telemetry;
 pub mod agentic_verdict_audit;

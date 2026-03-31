@@ -18,8 +18,8 @@ use mo_agent_runtime::{
         apply_agentic_post_tool_policy, map_post_tool_policy_outcome,
     },
     turn::agentic_prepare_payload::apply_selector_hints_then_attach_filtered_edge_tools,
-    turn::agentic_stall_preflight::{
-        CliAgenticStallPreflightRequest, apply_cli_agentic_stall_preflight,
+    turn::agentic_turn_flow::{
+        agentic_round_stall_preflight_with_tool_calls, append_explain_turn_batch,
     },
     turn::agentic_turn_ingest::{
         AgenticIngestIterationControl, AgenticTurnIngestMut,
@@ -32,7 +32,9 @@ use mo_agent_runtime::{
     },
     turn::boost_domain_hints::{domain_hints_debug_strings, domain_hints_from_boost_terms},
     turn::chat_history_openai::merge_skill_names_track,
-    turn::chat_turn_api_error::{CHAT_TURN_POST_MAX_RETRIES, chat_turn_http_error_user_message},
+    turn::chat_turn_api_error::{
+        CHAT_TURN_POST_MAX_RETRIES, chat_turn_http_error_with_compact_body,
+    },
     turn::chat_turn_budget_pressure::budget_pressure_for_chat_turn,
     turn::chat_turn_edge_profile::{
         detect_active_system_skills_in_message, read_git_branch_abbrev,
@@ -50,7 +52,7 @@ use mo_agent_runtime::{
         CACHEABLE_TOOLS, HeadlessResolvedToolSlot, begin_headless_tool_round_opening,
         headless_idempotency_hit_openai_pair, headless_openai_duplicate_within_turn_pair,
         headless_unknown_local_tool_openai_pair, openai_tool_roundtrip_values,
-        resolve_headless_tool_slot, take_edge_output_for_tool_call, tool_calls_for_stall_guard,
+        resolve_headless_tool_slot, take_edge_output_for_tool_call,
         unknown_local_tool_error_message,
     },
     turn::headless_tool_journal::{
@@ -475,9 +477,10 @@ async fn fetch_chat_turn_sse(ctx: ChatTurnSseFetchRequest<'_>) -> Result<TurnRes
     let status = resp.status();
     if !status.is_success() {
         let body = resp.text().await.map_err(|e| e.to_string())?;
-        return Err(chat_turn_http_error_user_message(
+        return Err(chat_turn_http_error_with_compact_body(
             status.as_u16(),
-            compact_or_raw(&body).as_str(),
+            body.as_str(),
+            compact_or_raw,
         ));
     }
 
@@ -944,17 +947,15 @@ pub(crate) async fn run_agentic_loop_iteration(
         AgenticIngestIterationControl::ProceedWithToolCalls => {}
     }
 
-    let tool_calls_for_guard =
-        tool_calls_for_stall_guard(&turn_result.tool_calls, &turn_result.edge_tool_round);
-
-    apply_cli_agentic_stall_preflight(CliAgenticStallPreflightRequest {
-        turn_index: turn_index as u32,
-        tool_calls_for_guard: &tool_calls_for_guard,
+    let tool_calls_for_guard = agentic_round_stall_preflight_with_tool_calls(
+        turn_index,
+        &turn_result.tool_calls,
+        &turn_result.edge_tool_round,
         turn_sigs,
         turn_tool_names,
         stall_events,
         turn_guard,
-    });
+    );
 
     run_headless_tool_round(HeadlessToolRoundRequest {
         turn_index,
@@ -974,7 +975,7 @@ pub(crate) async fn run_agentic_loop_iteration(
         tool_call_records,
     })
     .await;
-    explain_turns.extend(turn_result.explain_turns.iter().cloned());
+    append_explain_turn_batch(explain_turns, turn_result.explain_turns.as_slice());
 
     match map_post_tool_policy_outcome(apply_agentic_post_tool_policy(
         AgenticPostToolPolicyRequest {
