@@ -3,7 +3,7 @@
 //! Part of Phase 0: move cognition-adjacent **pure** helpers out of `mo-agent` toward `runtime` so
 //! in-process bridge and thin clients can converge on one implementation.
 //!
-//! [`make_args_preview`] reuses [`super::tool_argument_hints`] for path/command extraction so journal
+//! [`make_args_preview`] reuses [`super::tool_argument_hints`] (`path` / `command` only) so journal
 //! previews match CLI permission lines and cloud path hints.
 
 use std::path::Path;
@@ -187,8 +187,8 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
-    fn make_args_preview_file_tool_resolves_file_path_alias() {
-        let v = json!({"file_path": "crates/foo/src/lib.rs"});
+    fn make_args_preview_file_tool_uses_path() {
+        let v = json!({"path": "crates/foo/src/lib.rs"});
         assert_eq!(
             make_args_preview("read_file", &v).as_deref(),
             Some("crates/foo/src/lib.rs")
@@ -196,8 +196,8 @@ mod tests {
     }
 
     #[test]
-    fn make_args_preview_grep_uses_shared_path_hints() {
-        let v = json!({"pattern": "TODO", "target_file": "src/main.rs"});
+    fn make_args_preview_grep_uses_path() {
+        let v = json!({"pattern": "TODO", "path": "src/main.rs"});
         assert_eq!(
             make_args_preview("grep", &v).as_deref(),
             Some("/TODO/ in src/main.rs")
@@ -205,8 +205,8 @@ mod tests {
     }
 
     #[test]
-    fn make_args_preview_bash_falls_back_to_cmd() {
-        let v = json!({"cmd": "cargo test -p mo-agent-runtime"});
+    fn make_args_preview_bash_uses_command() {
+        let v = json!({"command": "cargo test -p mo-agent-runtime"});
         assert_eq!(
             make_args_preview("bash", &v).as_deref(),
             Some("cargo test -p mo-agent-runtime")

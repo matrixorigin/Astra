@@ -1,5 +1,7 @@
 //! Normalized reads of OpenAI-style `function.arguments` (object or stringified JSON).
-//! Used for `approval_required` path hints and CLI permission prompts (thin-client tool delivery).
+//!
+//! **Canonical keys only** (no legacy aliases): file targets use `path`; shell tools use `command`.
+//! Edge executors and tool schemas should emit these names; hints do not read `file_path`, `target_file`, or `cmd`.
 
 use serde_json::Value;
 
@@ -13,20 +15,16 @@ pub fn normalize_llm_function_arguments(arguments: &Value) -> Value {
     }
 }
 
-/// Path-like keys commonly used across edge tools and providers.
+/// Primary filesystem path from tool arguments (`path` only).
 pub fn path_hint_from_args(args: &Value) -> Option<String> {
     args.get("path")
-        .or_else(|| args.get("file_path"))
-        .or_else(|| args.get("target_file"))
         .and_then(Value::as_str)
         .map(String::from)
 }
 
-/// Shell-style tools: `command` (OpenAI) or `cmd` (legacy / aliases).
+/// Shell command line from tool arguments (`command` only).
 pub fn command_hint_from_args(args: &Value) -> Option<&str> {
-    args.get("command")
-        .or_else(|| args.get("cmd"))
-        .and_then(Value::as_str)
+    args.get("command").and_then(Value::as_str)
 }
 
 /// One-line detail next to the CLI permission icon (aligned with cloud `approval_required` path).
@@ -67,27 +65,27 @@ mod tests {
     }
 
     #[test]
-    fn path_hint_prefers_path_over_file_path() {
-        let args = json!({"path": "a", "file_path": "b"});
-        assert_eq!(path_hint_from_args(&args).as_deref(), Some("a"));
+    fn path_hint_reads_path_only() {
+        let args = json!({"path": "src/lib.rs"});
+        assert_eq!(path_hint_from_args(&args).as_deref(), Some("src/lib.rs"));
     }
 
     #[test]
-    fn path_hint_falls_back_to_target_file() {
-        let args = json!({"target_file": "z.rs"});
-        assert_eq!(path_hint_from_args(&args).as_deref(), Some("z.rs"));
+    fn path_hint_ignores_legacy_file_keys() {
+        let args = json!({"file_path": "x.rs", "target_file": "y.rs"});
+        assert!(path_hint_from_args(&args).is_none());
     }
 
     #[test]
-    fn command_hint_prefers_command_over_cmd() {
-        let args = json!({"command": "ls", "cmd": "echo"});
-        assert_eq!(command_hint_from_args(&args), Some("ls"));
+    fn command_hint_reads_command_only() {
+        let args = json!({"command": "ls -la"});
+        assert_eq!(command_hint_from_args(&args), Some("ls -la"));
     }
 
     #[test]
-    fn command_hint_uses_cmd_when_command_absent() {
+    fn command_hint_ignores_cmd_key() {
         let args = json!({"cmd": "whoami"});
-        assert_eq!(command_hint_from_args(&args), Some("whoami"));
+        assert!(command_hint_from_args(&args).is_none());
     }
 
     #[test]

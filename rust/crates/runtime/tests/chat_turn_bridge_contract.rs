@@ -480,7 +480,7 @@ async fn tool_call_internal_turn() -> Response {
         .status(StatusCode::OK)
         .header("content-type", "text/event-stream")
         .body(Body::from(
-            "data: {\"type\":\"tool_call\",\"id\":\"tc1\",\"function\":{\"name\":\"bash\",\"arguments\":\"{\\\"cmd\\\":\\\"ls\\\"\"},\"ignored\":true}\n\n\
+            "data: {\"type\":\"tool_call\",\"id\":\"tc1\",\"function\":{\"name\":\"bash\",\"arguments\":\"{\\\"command\\\":\\\"ls\\\"}\"},\"ignored\":true}\n\n\
 data: {\"type\":\"turn_complete\",\"has_tool_calls\":true}\n\n",
         ))
         .unwrap()
@@ -3475,7 +3475,7 @@ async fn http_chat_turn_bridge_rebuilds_tool_call_events() {
     assert_eq!(frames[1]["type"], "tool_call");
     assert_eq!(frames[1]["id"], "tc1");
     assert_eq!(frames[1]["name"], "bash");
-    assert_eq!(frames[1]["arguments"], serde_json::json!({"cmd": "ls"}));
+    assert_eq!(frames[1]["arguments"], serde_json::json!({"command": "ls"}));
     assert_eq!(frames[2]["type"], "turn_complete");
 
     server.abort();
