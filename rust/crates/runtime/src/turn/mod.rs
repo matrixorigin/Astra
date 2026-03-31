@@ -35,6 +35,7 @@ pub mod stall;
 pub mod state;
 pub mod stream_events;
 pub mod tail_persist;
+pub mod tool_result_semantics;
 pub mod tool_schema_prune;
 pub mod task;
 pub mod tool_args_repair;

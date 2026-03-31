@@ -90,7 +90,10 @@ async fn flush_pending_edge_work(
                 } else {
                     "Permission denied".to_string()
                 };
-                let sig = crate::chat_stream::tool_dedup_signature(&req.tool, &req.args);
+                let sig = mo_agent_runtime::turn::tool_result_semantics::tool_dedup_signature(
+                    &req.tool,
+                    &req.args,
+                );
                 result
                     .edge_callback_outputs
                     .insert(sig, output.clone());
@@ -218,7 +221,7 @@ pub(super) struct TurnResult {
     pub(super) error_message: Option<String>,
     /// Time to first token in milliseconds (streaming latency).
     pub(super) ttft_ms: Option<u64>,
-    /// Outputs from SSE `tool_request` (same key as [`crate::chat_stream::tool_dedup_signature`]).
+    /// Outputs from SSE `tool_request` (same key as [`mo_agent_runtime::turn::tool_result_semantics::tool_dedup_signature`]).
     pub(super) edge_callback_outputs: std::collections::HashMap<String, String>,
     /// Ordered executions from this SSE stream (for rounds without legacy `tool_call` events).
     pub(super) edge_tool_round: Vec<EdgeToolRoundEntry>,
