@@ -1752,13 +1752,19 @@ mod tests {
 
     /// Helper to build a DelegationEngine with StubSubRunExecutor for tests.
     fn make_test_delegation_engine() -> Arc<crate::server::delegation_engine::DelegationEngine> {
-        use crate::server::delegation_engine::{DelegationEngine, DelegationTracker, StubSubRunExecutor};
+        use crate::server::delegation_engine::{
+            DelegationEngine, DelegationTracker, StubSubRunExecutor,
+        };
         use crate::server::run_engine::RunEngine;
         use mo_agent_services::AgentProfileRegistry;
         use mo_agent_services::coordination::{AgentProfile, AgentTier};
 
         let mut registry = AgentProfileRegistry::new();
-        let _ = registry.register(AgentProfile::new("orchestrator", "Orchestrator", AgentTier::Orchestrator));
+        let _ = registry.register(AgentProfile::new(
+            "orchestrator",
+            "Orchestrator",
+            AgentTier::Orchestrator,
+        ));
         let mut coder = AgentProfile::new("coder", "Coder", AgentTier::System);
         coder.system_prompt = Some("You are a coder.".to_string());
         let _ = registry.register(coder);
@@ -1815,12 +1821,19 @@ mod tests {
                 100,
                 50,
             ),
-            text_result("Done! Tests written based on delegation results.", 80, 30, None),
+            text_result(
+                "Done! Tests written based on delegation results.",
+                80,
+                30,
+                None,
+            ),
         ];
 
         let mut host = MockHost::new(turns);
         let mut state = make_state();
-        state.messages.push(json!({"role": "user", "content": "Please delegate test writing to the coder agent."}));
+        state.messages.push(
+            json!({"role": "user", "content": "Please delegate test writing to the coder agent."}),
+        );
         state.current_run_id = Some("test-run-e2e".to_string());
         state.current_session_id = Some("test-session-e2e".to_string());
 
@@ -1829,7 +1842,10 @@ mod tests {
 
         let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
         assert!(outcome.is_ok(), "loop should complete: {outcome:?}");
-        assert_eq!(state.final_text, "Done! Tests written based on delegation results.");
+        assert_eq!(
+            state.final_text,
+            "Done! Tests written based on delegation results."
+        );
 
         // Verify delegation result was injected into messages
         let tool_messages: Vec<&Value> = state
@@ -1843,12 +1859,13 @@ mod tests {
         );
 
         // The tool message should reference our call_id
-        let has_delegation_result = tool_messages.iter().any(|m| {
-            m.get("tool_call_id")
-                .and_then(Value::as_str)
-                == Some("call_del_1")
-        });
-        assert!(has_delegation_result, "delegation result should reference call_del_1");
+        let has_delegation_result = tool_messages
+            .iter()
+            .any(|m| m.get("tool_call_id").and_then(Value::as_str) == Some("call_del_1"));
+        assert!(
+            has_delegation_result,
+            "delegation result should reference call_del_1"
+        );
 
         // Verify the delegation result content mentions delegation status
         let delegation_content = tool_messages
@@ -1863,7 +1880,10 @@ mod tests {
 
         // Verify token accounting includes both turns
         assert!(state.total_prompt >= 180, "should accumulate prompt tokens");
-        assert!(state.total_completion >= 80, "should accumulate completion tokens");
+        assert!(
+            state.total_completion >= 80,
+            "should accumulate completion tokens"
+        );
     }
 
     #[tokio::test]
@@ -1877,7 +1897,9 @@ mod tests {
             50,
         );
         // Add a regular edge tool to this turn
-        turn1.edge_tool_round.push(make_edge_tool("bash", "ls output"));
+        turn1
+            .edge_tool_round
+            .push(make_edge_tool("bash", "ls output"));
 
         let turns = vec![
             turn1,
@@ -1886,7 +1908,9 @@ mod tests {
 
         let mut host = MockHost::new(turns).with_valid_tools(&["bash"]);
         let mut state = make_state();
-        state.messages.push(json!({"role": "user", "content": "review and list files"}));
+        state
+            .messages
+            .push(json!({"role": "user", "content": "review and list files"}));
         state.current_run_id = Some("run-mix".to_string());
         state.delegation_engine = Some(make_test_delegation_engine());
 
@@ -1909,18 +1933,15 @@ mod tests {
         // Turn 1: LLM issues a malformed delegate call
         // The loop should inject an error result and continue to turn 2
         let turns = vec![
-            delegate_tool_call_result(
-                "call_bad",
-                "this is not json",
-                100,
-                50,
-            ),
+            delegate_tool_call_result("call_bad", "this is not json", 100, 50),
             text_result("Recovered after bad delegation.", 60, 20, None),
         ];
 
         let mut host = MockHost::new(turns);
         let mut state = make_state();
-        state.messages.push(json!({"role": "user", "content": "delegate something"}));
+        state
+            .messages
+            .push(json!({"role": "user", "content": "delegate something"}));
         state.delegation_engine = Some(make_test_delegation_engine());
 
         let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
@@ -1931,9 +1952,7 @@ mod tests {
         let error_msg = state
             .messages
             .iter()
-            .find(|m| {
-                m.get("tool_call_id").and_then(Value::as_str) == Some("call_bad")
-            })
+            .find(|m| m.get("tool_call_id").and_then(Value::as_str) == Some("call_bad"))
             .and_then(|m| m.get("content").and_then(Value::as_str))
             .unwrap_or("");
         assert!(
@@ -1957,7 +1976,9 @@ mod tests {
 
         let mut host = MockHost::new(turns);
         let mut state = make_state();
-        state.messages.push(json!({"role": "user", "content": "implement and review"}));
+        state
+            .messages
+            .push(json!({"role": "user", "content": "implement and review"}));
         state.current_run_id = Some("run-fanout".to_string());
         state.delegation_engine = Some(make_test_delegation_engine());
 
@@ -1972,8 +1993,14 @@ mod tests {
             .find(|m| m.get("tool_call_id").and_then(Value::as_str) == Some("call_fanout"))
             .and_then(|m| m.get("content").and_then(Value::as_str))
             .unwrap_or("");
-        assert!(result_content.contains("coder"), "result should mention coder agent");
-        assert!(result_content.contains("reviewer"), "result should mention reviewer agent");
+        assert!(
+            result_content.contains("coder"),
+            "result should mention coder agent"
+        );
+        assert!(
+            result_content.contains("reviewer"),
+            "result should mention reviewer agent"
+        );
     }
 
     #[tokio::test]
@@ -1996,7 +2023,9 @@ mod tests {
 
         let mut host = MockHost::new(turns).with_valid_tools(&["delegate"]);
         let mut state = make_state();
-        state.messages.push(json!({"role": "user", "content": "test delegate passthrough"}));
+        state
+            .messages
+            .push(json!({"role": "user", "content": "test delegate passthrough"}));
         // Intentionally leave delegation_engine as None
         assert!(state.delegation_engine.is_none());
 
@@ -2019,7 +2048,9 @@ mod tests {
 
         let mut host = MockHost::new(turns);
         let mut state = make_state();
-        state.messages.push(json!({"role": "user", "content": "write and review auth"}));
+        state
+            .messages
+            .push(json!({"role": "user", "content": "write and review auth"}));
         state.current_run_id = Some("run-adversarial".to_string());
         state.delegation_engine = Some(make_test_delegation_engine());
 
@@ -2034,11 +2065,11 @@ mod tests {
     async fn auto_inject_delegate_schema_when_engine_present() {
         // When delegation_engine is Some, the loop preamble should call
         // inject_tool_schema with the delegate tool schema.
-        let mut host = MockHost::new(vec![
-            text_result("done", 50, 20, Some(10)),
-        ]);
+        let mut host = MockHost::new(vec![text_result("done", 50, 20, Some(10))]);
         let mut state = make_state();
-        state.messages.push(json!({"role": "user", "content": "hello"}));
+        state
+            .messages
+            .push(json!({"role": "user", "content": "hello"}));
         state.delegation_engine = Some(make_test_delegation_engine());
 
         let _ = run_agentic_loop_with_host(&mut host, &mut state).await;
@@ -2053,11 +2084,11 @@ mod tests {
     #[tokio::test]
     async fn no_inject_when_delegation_engine_absent() {
         // When delegation_engine is None, no schema should be injected.
-        let mut host = MockHost::new(vec![
-            text_result("done", 50, 20, Some(10)),
-        ]);
+        let mut host = MockHost::new(vec![text_result("done", 50, 20, Some(10))]);
         let mut state = make_state();
-        state.messages.push(json!({"role": "user", "content": "hello"}));
+        state
+            .messages
+            .push(json!({"role": "user", "content": "hello"}));
         // delegation_engine defaults to None
 
         let _ = run_agentic_loop_with_host(&mut host, &mut state).await;
@@ -2068,11 +2099,11 @@ mod tests {
 
     #[tokio::test]
     async fn injected_schema_matches_delegate_tool_schema() {
-        let mut host = MockHost::new(vec![
-            text_result("done", 50, 20, Some(10)),
-        ]);
+        let mut host = MockHost::new(vec![text_result("done", 50, 20, Some(10))]);
         let mut state = make_state();
-        state.messages.push(json!({"role": "user", "content": "hello"}));
+        state
+            .messages
+            .push(json!({"role": "user", "content": "hello"}));
         state.delegation_engine = Some(make_test_delegation_engine());
 
         let _ = run_agentic_loop_with_host(&mut host, &mut state).await;
@@ -2109,7 +2140,9 @@ mod tests {
             text_result("done", 50, 20, None),
         ]);
         let mut state = make_state();
-        state.messages.push(json!({"role": "user", "content": "list files"}));
+        state
+            .messages
+            .push(json!({"role": "user", "content": "list files"}));
         state.delegation_engine = Some(make_test_delegation_engine());
 
         let _ = run_agentic_loop_with_host(&mut host, &mut state).await;

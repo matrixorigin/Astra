@@ -442,11 +442,13 @@ async fn collect_llm_stream(
 }
 
 #[derive(Debug)]
+#[allow(dead_code)] // Transport variant reserved for future network error handling
 enum StreamCollectError {
     IdleTimeout { elapsed_ms: u64 },
     Transport(String),
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn call_llm_nonstream_fallback(
     client: &reqwest::Client,
     messages: &[Value],
@@ -516,17 +518,20 @@ fn parse_nonstream_response(v: &Value, model_name: &str, started: Instant) -> Ll
         }
     }
 
-    if let Some(choice) = v.get("choices").and_then(Value::as_array).and_then(|a| a.first()) {
-        if let Some(msg) = choice.get("message").and_then(Value::as_object) {
-            if let Some(content) = msg.get("content").and_then(Value::as_str) {
-                full_text = content.to_string();
-            }
-            if let Some(r) = msg.get("reasoning_content").and_then(Value::as_str) {
-                reasoning = r.to_string();
-            }
-            if let Some(tcs) = msg.get("tool_calls").and_then(Value::as_array) {
-                tool_calls = tcs.clone();
-            }
+    if let Some(choice) = v
+        .get("choices")
+        .and_then(Value::as_array)
+        .and_then(|a| a.first())
+        && let Some(msg) = choice.get("message").and_then(Value::as_object)
+    {
+        if let Some(content) = msg.get("content").and_then(Value::as_str) {
+            full_text = content.to_string();
+        }
+        if let Some(r) = msg.get("reasoning_content").and_then(Value::as_str) {
+            reasoning = r.to_string();
+        }
+        if let Some(tcs) = msg.get("tool_calls").and_then(Value::as_array) {
+            tool_calls = tcs.clone();
         }
     }
 

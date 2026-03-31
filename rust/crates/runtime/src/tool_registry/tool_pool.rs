@@ -113,10 +113,10 @@ pub fn restore_state_from_messages(messages: &[Value]) -> ToolSearchState {
             .and_then(Value::as_array);
         if let Some(arr) = tools {
             for t in arr {
-                if let Some(s) = t.as_str() {
-                    if !s.is_empty() {
-                        st.discovered.insert(s.to_string());
-                    }
+                if let Some(s) = t.as_str()
+                    && !s.is_empty()
+                {
+                    st.discovered.insert(s.to_string());
                 }
             }
         }

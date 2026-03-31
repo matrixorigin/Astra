@@ -1,10 +1,10 @@
+use mo_agent_runtime::prompts::CompactionTier;
 use mo_agent_runtime::tool_registry::tool_pool::{
-    restore_state_from_messages, select_two_phase_with_state, ToolDenyPredicate, ToolPool,
-    ToolSchemaStore, ToolSearchConfig, ToolSearchState,
+    ToolDenyPredicate, ToolPool, ToolSchemaStore, ToolSearchConfig, ToolSearchState,
+    restore_state_from_messages, select_two_phase_with_state,
 };
 use mo_agent_runtime::turn::cloud::compaction::compact_tiered_with_result;
-use mo_agent_runtime::prompts::CompactionTier;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 struct DenyNone;
 impl ToolDenyPredicate for DenyNone {
@@ -50,7 +50,9 @@ fn compaction_boundary_discovered_tools_can_restore_and_materialize() {
     let result = compact_tiered_with_result(&pre, 50, 2000, CompactionTier::CompactHistory, 4);
     let boundary = result.boundary.expect("should compact and create boundary");
     assert!(
-        boundary.discovered_tools.contains(&"mcp__k8s_logs".to_string()),
+        boundary
+            .discovered_tools
+            .contains(&"mcp__k8s_logs".to_string()),
         "boundary must carry discovered tools"
     );
 
@@ -101,4 +103,3 @@ fn compaction_boundary_discovered_tools_can_restore_and_materialize() {
     replay_messages.push(json!({"role":"user","content":"next"}));
     let _ = replay_messages;
 }
-

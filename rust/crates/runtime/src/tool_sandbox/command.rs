@@ -132,7 +132,9 @@ pub fn analyze_command_risks(command: &str) -> Vec<CommandRisk> {
 
     // 1) AST-level analysis (best-effort). This avoids many string-literal false positives.
     // If parsing fails, we still fall back to the legacy heuristic scanner below.
-    risks.extend(super::bash_ast::analyze_bash_risks_ast(command));
+    let ast_risks = super::bash_ast::analyze_bash_risks_ast(command);
+    let ast_parsed = super::bash_ast::parse_bash(command).is_some();
+    risks.extend(ast_risks);
 
     // 2) Legacy heuristic scanner (kept for backward compatibility + coverage when AST misses).
     let lower = command.to_lowercase();
@@ -158,8 +160,9 @@ pub fn analyze_command_risks(command: &str) -> Vec<CommandRisk> {
         push_unique(&mut risks, CommandRisk::EnvManipulation);
     }
 
-    // Network access
-    if lower.contains("curl ") || lower.contains("wget ") || lower.contains("nc ") {
+    // Network access — skip legacy check if AST parsed (AST handles string literals correctly)
+    if !ast_parsed && (lower.contains("curl ") || lower.contains("wget ") || lower.contains("nc "))
+    {
         push_unique(&mut risks, CommandRisk::NetworkAccess);
     }
 
@@ -173,8 +176,9 @@ pub fn analyze_command_risks(command: &str) -> Vec<CommandRisk> {
         push_unique(&mut risks, CommandRisk::PrivilegeEscalation);
     }
 
-    // Pipe to shell (code injection vector)
-    if (lower.contains("| sh") || lower.contains("| bash") || lower.contains("| /bin/"))
+    // Pipe to shell (code injection vector) — skip legacy check if AST parsed
+    if !ast_parsed
+        && (lower.contains("| sh") || lower.contains("| bash") || lower.contains("| /bin/"))
         && (lower.contains("curl") || lower.contains("wget"))
     {
         push_unique(&mut risks, CommandRisk::RemoteCodeExecution);

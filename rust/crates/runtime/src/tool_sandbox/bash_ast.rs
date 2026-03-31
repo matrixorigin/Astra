@@ -172,17 +172,28 @@ fn analyze_command_invocation(node: Node<'_>, ctx: &mut RiskCtx<'_>) {
 }
 
 fn command_name(node: Node<'_>, ctx: &RiskCtx<'_>) -> Option<String> {
-    // For both `command` and `simple_command`, the "name" is typically the first "word".
-    // We intentionally ignore assignments (FOO=bar) by taking the first word that
-    // looks like a bare identifier.
+    // For both `command` and `simple_command`, the "name" is in a "command_name" node
+    // containing a "word" child. In older tree-sitter-bash, it was directly a "word".
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
+        // Handle new tree-sitter-bash structure: command_name -> word
+        if child.kind() == "command_name" {
+            let mut inner = child.walk();
+            for grandchild in child.children(&mut inner) {
+                if grandchild.kind() == "word" {
+                    let w = ctx.text(grandchild).trim();
+                    if !w.is_empty() {
+                        return Some(w.to_string());
+                    }
+                }
+            }
+        }
+        // Fallback for older tree-sitter-bash: direct "word" child
         if child.kind() == "word" {
             let w = ctx.text(child).trim();
             if w.is_empty() {
                 continue;
             }
-            // Strip leading command-prefixes like `command`, `builtin`? (rare)
             return Some(w.to_string());
         }
     }

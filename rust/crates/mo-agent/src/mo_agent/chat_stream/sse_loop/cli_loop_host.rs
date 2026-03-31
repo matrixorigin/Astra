@@ -130,10 +130,9 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
             .get("function")
             .and_then(|f| f.get("name"))
             .and_then(Value::as_str)
+            && self.valid_tool_names.insert(name.to_string())
         {
-            if self.valid_tool_names.insert(name.to_string()) {
-                self.all_schemas.push(schema);
-            }
+            self.all_schemas.push(schema);
         }
     }
 }
