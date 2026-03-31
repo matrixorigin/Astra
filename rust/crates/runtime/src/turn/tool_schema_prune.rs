@@ -150,6 +150,15 @@ fn schema_tool_name(schema: &Value) -> Option<&str> {
         .and_then(|n| n.as_str())
 }
 
+/// Unique `function.name` values from an OpenAI-style tools list (e.g. edge registry export).
+#[must_use]
+pub fn openai_tool_names_from_schemas(schemas: &[Value]) -> HashSet<String> {
+    schemas
+        .iter()
+        .filter_map(|s| schema_tool_name(s).map(String::from))
+        .collect()
+}
+
 /// Ensure tool schemas for previously-invoked tools remain available in follow-up turns.
 ///
 /// When the selector picks a fresh set of tools for the next LLM round it may drop
@@ -207,6 +216,16 @@ mod tests {
                 }
             }
         })
+    }
+
+    #[test]
+    fn openai_tool_names_from_schemas_dedupes() {
+        let a = make_tool_schema("bash", "x", false);
+        let b = make_tool_schema("read_file", "y", false);
+        let names = openai_tool_names_from_schemas(&[a.clone(), b, a]);
+        assert_eq!(names.len(), 2);
+        assert!(names.contains("bash"));
+        assert!(names.contains("read_file"));
     }
 
     #[test]

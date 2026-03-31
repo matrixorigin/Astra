@@ -7,6 +7,10 @@ use serde_json::Value;
 /// (e.g. read_file with different args each turn) triggered false stalls.
 pub const SERVER_STALL_WINDOW: usize = 3;
 
+/// User-visible error when the agentic loop exhausts the per-request remaining-turn budget (stall guard).
+pub const CLI_AGENTIC_TURN_BUDGET_STALL_ABORT_MSG: &str =
+    "Turn budget exhausted due to repeated stalls. Aborting.";
+
 /// Tools considered "exploration" — low-value if used repeatedly without
 /// a "productive" tool call in between.
 const EXPLORATION_TOOLS: &[&str] = &["bash", "list_dir", "read_file", "glob", "grep"];

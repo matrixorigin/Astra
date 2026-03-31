@@ -15,7 +15,9 @@ use mo_agent_runtime::{
     tool_registry::{self, ToolRegistry},
     turn::chat_history_openai::openai_messages_from_repl_history,
     turn::edge_prompt_context::detect_project_languages,
+    turn::stall::CLI_AGENTIC_TURN_BUDGET_STALL_ABORT_MSG,
     turn::tool_health::ToolHealthTracker,
+    turn::tool_schema_prune::openai_tool_names_from_schemas,
     turn::turn_guard::TurnGuard,
 };
 use mo_agent_services::session_journal::ToolCallRecord;
@@ -86,15 +88,7 @@ impl AgenticSseLoopState {
             edge_tools::ToolExecutor::new(&project_root).with_cloud(p.api.api_origin(), p.token);
         let all_schemas = edge_tools::all_tool_schemas();
         let registry = ToolRegistry::new(all_schemas.clone());
-        let valid_tool_names: HashSet<String> = all_schemas
-            .iter()
-            .filter_map(|s| {
-                s.get("function")
-                    .and_then(|f| f.get("name"))
-                    .and_then(|n| n.as_str())
-                    .map(String::from)
-            })
-            .collect();
+        let valid_tool_names = openai_tool_names_from_schemas(&all_schemas);
 
         let current_session_id = p.session_id.map(|s| s.to_string());
         let messages = openai_messages_from_repl_history(p.history, p.message);
@@ -165,7 +159,7 @@ impl AgenticSseLoopState {
     pub(crate) async fn run_all_turns(&mut self, p: &mut ChatTurnParams<'_>) -> Result<(), String> {
         for turn_index in 0..self.max_turns {
             if self.remaining_turns == 0 {
-                return Err("Turn budget exhausted due to repeated stalls. Aborting.".to_string());
+                return Err(CLI_AGENTIC_TURN_BUDGET_STALL_ABORT_MSG.to_string());
             }
             self.remaining_turns = self.remaining_turns.saturating_sub(1);
             self.step_recorder.begin_turn(turn_index as u32);
