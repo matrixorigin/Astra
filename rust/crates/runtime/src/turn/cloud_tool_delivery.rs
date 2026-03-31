@@ -10,6 +10,7 @@ use mo_thin_client::ApprovalRespondRequest;
 use serde_json::{Map, Value, json};
 
 use super::cloud_approval_policy::edge_tool_requires_cloud_approval;
+use super::tool_argument_hints::{normalize_llm_function_arguments, path_hint_from_args};
 use super::edge_ledger::{
     approval_callback_key, persist_value_for_ledger_tool_result, take_ledger_entry,
     tool_callback_key, tool_content_from_ledger_entry, MSG_TOOL_LEDGER_TIMEOUT,
@@ -48,16 +49,8 @@ fn raw_tool_arguments(tool_call: &Value) -> Value {
 
 fn tool_path_hint(tool_call: &Value) -> Option<String> {
     let raw = raw_tool_arguments(tool_call);
-    let parsed = match &raw {
-        Value::String(s) => serde_json::from_str::<Value>(s).unwrap_or_else(|_| json!({})),
-        v => v.clone(),
-    };
-    parsed
-        .get("path")
-        .or_else(|| parsed.get("file_path"))
-        .or_else(|| parsed.get("target_file"))
-        .and_then(Value::as_str)
-        .map(String::from)
+    let parsed = normalize_llm_function_arguments(&raw);
+    path_hint_from_args(&parsed)
 }
 
 pub fn parse_cloud_approval_outcome(entry: Option<&Value>) -> CloudApprovalResult {

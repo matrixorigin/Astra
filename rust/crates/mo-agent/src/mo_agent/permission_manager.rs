@@ -1,6 +1,9 @@
 use super::*;
 
 use mo_agent_runtime::turn::cloud_approval_policy::{cloud_gated_tool_kind, CloudGatedToolKind};
+use mo_agent_runtime::turn::tool_argument_hints::{
+    command_hint_from_args, permission_prompt_primary_detail,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum SideEffect {
@@ -83,9 +86,7 @@ impl PermissionManager {
 
     fn is_dangerous(name: &str, args: &serde_json::Value) -> bool {
         let cmd_str = match cloud_gated_tool_kind(name) {
-            Some(CloudGatedToolKind::Execute) => {
-                args.get("command").and_then(|v| v.as_str()).unwrap_or("")
-            }
+            Some(CloudGatedToolKind::Execute) => command_hint_from_args(args).unwrap_or(""),
             _ => return false,
         };
         let lower = cmd_str.to_lowercase();
@@ -164,15 +165,10 @@ impl PermissionManager {
             SideEffect::Write => "✎",
             SideEffect::Read => "◉",
         };
-        let brief = args
-            .get("command")
-            .or_else(|| args.get("path"))
-            .or_else(|| args.get("file_path"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("…");
+        let brief = permission_prompt_primary_detail(name, args).unwrap_or_else(|| "…".into());
         let header = format!("{icon} {name}");
         let detail = if brief.len() > 120 {
-            Some(format!("  {}", truncate_str(brief, 120)))
+            Some(format!("  {}", truncate_str(&brief, 120)))
         } else {
             Some(format!("  {brief}"))
         };

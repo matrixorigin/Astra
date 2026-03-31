@@ -39,6 +39,7 @@ pub mod tail_persist;
 pub mod tool_result_semantics;
 pub mod tool_schema_prune;
 pub mod task;
+pub mod tool_argument_hints;
 pub mod tool_args_repair;
 pub mod tool_health;
 pub mod tool_selection;
