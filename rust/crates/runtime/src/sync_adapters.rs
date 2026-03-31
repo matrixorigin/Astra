@@ -203,7 +203,7 @@ impl DomainAdapter for LearningAdapter {
         })?;
 
         // Merge remote entities into local (remote wins on duplicate by recency)
-        let remote_entity_names: std::collections::HashSet<String> = remote_snap
+        let remote_entity_names: HashSet<String> = remote_snap
             .entities
             .iter()
             .map(|e| e.name.clone())
@@ -221,7 +221,7 @@ impl DomainAdapter for LearningAdapter {
             }
         }
 
-        let remote_pattern_sigs: std::collections::HashSet<String> = remote_snap
+        let remote_pattern_sigs: HashSet<String> = remote_snap
             .patterns
             .iter()
             .map(|p| p.signature.clone())
@@ -720,6 +720,9 @@ impl DomainAdapter for EventAdapter {
 
 /// Cloud → edge cache of [`PlanTemplateSyncRow`]. Populated by `pull_domain(Templates)`;
 /// edge never pushes template packs ([`SyncPolicy::templates`] uses [`mo_agent_services::sync_engine::PushTrigger::Never`]).
+///
+/// Diagnostics: set environment variable `MO_SYNC_DEBUG=1` to print one line to stderr whenever
+/// [`DomainAdapter::merge_remote`] replaces the template cache after a successful pull.
 pub struct TemplateAdapter {
     cache: Arc<Mutex<Vec<PlanTemplateSyncRow>>>,
     envelope: Arc<Mutex<SyncEnvelope>>,
@@ -765,6 +768,9 @@ impl DomainAdapter for TemplateAdapter {
         let n = rows.len() as u32;
         if let Ok(mut g) = self.cache.lock() {
             *g = rows;
+        }
+        if std::env::var("MO_SYNC_DEBUG").as_deref() == Ok("1") {
+            eprintln!("[mo-agent-sync][templates] merge_remote: replaced cache with {n} row(s)");
         }
         Ok(MergeResult {
             items_added: n,
