@@ -478,8 +478,8 @@ mod tests {
         let ev = sse("session_info", ",\"session_id\":\"split-id\"");
         let mid = ev.find("session").unwrap();
         let mut f = ChatTurnSseFramer::new();
-        assert!(f.push_lossy_bytes(ev[..mid].as_bytes()).is_empty());
-        let blocks = f.push_lossy_bytes(ev[mid..].as_bytes());
+        assert!(f.push_lossy_bytes(&ev.as_bytes()[..mid]).is_empty());
+        let blocks = f.push_lossy_bytes(&ev.as_bytes()[mid..]);
         assert_eq!(blocks.len(), 1);
         let mut a = ChatTurnSseAccum::default();
         dispatch_chat_turn_sse_event_block(&blocks[0], &mut a, &mut vec![]);

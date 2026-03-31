@@ -20,10 +20,10 @@ use mo_agent_runtime::{
         CliAgenticStallPreflightRequest, apply_cli_agentic_stall_preflight,
     },
     turn::agentic_turn_ingest::{
-        AgenticTurnIngestMut, AgenticTurnIngestOutcome, AgenticTurnStreamSnapshot,
-        ingest_agentic_turn_stream,
+        AgenticTurnIngestMut, AgenticTurnIngestOutcome,
+        agentic_turn_stream_snapshot_from_sse_accum, ingest_agentic_turn_stream,
     },
-    turn::boost_domain_hints::domain_hints_from_boost_terms,
+    turn::boost_domain_hints::{domain_hints_debug_strings, domain_hints_from_boost_terms},
     turn::chat_history_openai::merge_skill_names_track,
     turn::chat_turn_api_error::chat_turn_http_error_user_message,
     turn::chat_turn_budget_pressure::budget_pressure_for_chat_turn,
@@ -40,10 +40,10 @@ use mo_agent_runtime::{
     turn::chat_turn_step_plan::record_agentic_step_plan_after_payload_prep,
     turn::edge_prompt_context::make_args_preview,
     turn::headless_tool_assembly::{
-        CACHEABLE_TOOLS, HeadlessRoundToolIdx, begin_headless_tool_round_opening,
+        CACHEABLE_TOOLS, HeadlessResolvedToolSlot, begin_headless_tool_round_opening,
         headless_idempotency_hit_openai_pair, headless_openai_duplicate_within_turn_pair,
         headless_unknown_local_tool_openai_pair, openai_tool_roundtrip_values,
-        parse_flat_tool_call_event, take_edge_output_for_tool_call, tool_calls_for_stall_guard,
+        resolve_headless_tool_slot, take_edge_output_for_tool_call, tool_calls_for_stall_guard,
         unknown_local_tool_error_message,
     },
     turn::headless_tool_journal::{
@@ -70,7 +70,7 @@ use mo_agent_runtime::{
     turn::skill_instructions_merge::merge_skill_instruction_bodies_for_chat,
     turn::tool_result_semantics::{is_tool_error, tool_dedup_signature},
     turn::tool_schema_prune::{filter_tool_schemas_by_excluded_names, pin_invoked_tool_schemas},
-    turn::turn_guard::TurnGuard,
+    turn::turn_guard::{TurnGuard, merge_deprioritized_tools_into_restricted},
 };
 use mo_agent_services::session_journal::ToolCallRecord;
 use serde_json::Value;
@@ -176,18 +176,13 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
     }
 
     let memory_domain_hints = domain_hints_from_boost_terms(&boost_terms);
-    for tool in ctx.turn_guard.health.deprioritized_tools() {
-        ctx.restricted_tools.insert(tool.to_string());
-    }
+    merge_deprioritized_tools_into_restricted(ctx.turn_guard, ctx.restricted_tools);
     let restricted_vec: Vec<String> = ctx.restricted_tools.iter().cloned().collect();
 
     ctx.step_recorder.record_perceive(
         ctx.message,
         &[],
-        &memory_domain_hints
-            .iter()
-            .map(|h| format!("{h:?}"))
-            .collect::<Vec<_>>(),
+        &domain_hints_debug_strings(&memory_domain_hints),
         &boost_terms,
     );
 
@@ -558,16 +553,16 @@ async fn run_headless_tool_round(ctx: HeadlessToolRoundRequest<'_>) {
             break;
         }
 
-        let (id, name, args, synthetic_idx) = match *item {
-            HeadlessRoundToolIdx::ServerToolCall(i) => {
-                let (id, name, args) = parse_flat_tool_call_event(&turn_result.tool_calls[i]);
-                (id, name, args, None)
-            }
-            HeadlessRoundToolIdx::SyntheticEdge(i) => {
-                let e = &turn_result.edge_tool_round[i];
-                (format!("edge-{i}"), e.tool.clone(), e.args.clone(), Some(i))
-            }
-        };
+        let slot = resolve_headless_tool_slot(*item, &turn_result.tool_calls, |i| {
+            let e = &turn_result.edge_tool_round[i];
+            (e.tool.clone(), e.args.clone())
+        });
+        let HeadlessResolvedToolSlot {
+            id,
+            name,
+            args,
+            synthetic_edge_index: synthetic_idx,
+        } = slot;
 
         let call_sig = tool_dedup_signature(&name, &args);
         if !seen_calls.insert(call_sig.clone()) {
@@ -898,17 +893,7 @@ pub(crate) async fn run_agentic_loop_iteration(
     })
     .await?;
 
-    let snap = AgenticTurnStreamSnapshot {
-        ttft_ms: turn_result.ttft_ms,
-        session_id: &turn_result.session_id,
-        run_id: &turn_result.run_id,
-        full_text: turn_result.full_text.as_str(),
-        tool_calls: &turn_result.tool_calls,
-        prompt_tokens: turn_result.prompt_tokens,
-        completion_tokens: turn_result.completion_tokens,
-        has_usage: turn_result.has_usage,
-        error_message: &turn_result.error_message,
-    };
+    let snap = agentic_turn_stream_snapshot_from_sse_accum(&turn_result, turn_result.ttft_ms);
     let edge_len = turn_result.edge_tool_round.len();
     match ingest_agentic_turn_stream(
         &snap,

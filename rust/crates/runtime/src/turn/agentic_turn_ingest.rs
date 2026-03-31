@@ -12,6 +12,7 @@ use serde_json::Value;
 use super::chat_turn_heuristics::{
     openai_factual_tool_retry_user_message, should_force_factual_tool_retry,
 };
+use super::chat_turn_sse_dispatch::ChatTurnSseAccum;
 use super::response_guard::apply_response_guards;
 use crate::pipeline::step_recorder::StepRecorder;
 
@@ -27,6 +28,25 @@ pub struct AgenticTurnStreamSnapshot<'a> {
     pub completion_tokens: u64,
     pub has_usage: bool,
     pub error_message: &'a Option<String>,
+}
+
+/// Build [`AgenticTurnStreamSnapshot`] from a [`ChatTurnSseAccum`] plus TTFT (CLI `TurnResult` derefs to accum).
+#[must_use]
+pub fn agentic_turn_stream_snapshot_from_sse_accum<'a>(
+    accum: &'a ChatTurnSseAccum,
+    ttft_ms: Option<u64>,
+) -> AgenticTurnStreamSnapshot<'a> {
+    AgenticTurnStreamSnapshot {
+        ttft_ms,
+        session_id: &accum.session_id,
+        run_id: &accum.run_id,
+        full_text: accum.full_text.as_str(),
+        tool_calls: accum.tool_calls.as_slice(),
+        prompt_tokens: accum.prompt_tokens,
+        completion_tokens: accum.completion_tokens,
+        has_usage: accum.has_usage,
+        error_message: &accum.error_message,
+    }
 }
 
 /// Mutable agentic-loop fields updated by [`ingest_agentic_turn_stream`].
@@ -198,6 +218,31 @@ mod tests {
                 messages: &mut self.messages,
             }
         }
+    }
+
+    #[test]
+    fn snapshot_from_sse_accum_matches_fields() {
+        let accum = ChatTurnSseAccum {
+            session_id: Some("s1".into()),
+            run_id: Some("r1".into()),
+            full_text: "hi".into(),
+            tool_calls: vec![json!({"name": "bash"})],
+            prompt_tokens: 3,
+            completion_tokens: 4,
+            has_usage: true,
+            error_message: Some("e".into()),
+            ..Default::default()
+        };
+        let snap = agentic_turn_stream_snapshot_from_sse_accum(&accum, Some(99));
+        assert_eq!(snap.ttft_ms, Some(99));
+        assert_eq!(snap.session_id.as_deref(), Some("s1"));
+        assert_eq!(snap.run_id.as_deref(), Some("r1"));
+        assert_eq!(snap.full_text, "hi");
+        assert_eq!(snap.tool_calls.len(), 1);
+        assert_eq!(snap.prompt_tokens, 3);
+        assert_eq!(snap.completion_tokens, 4);
+        assert!(snap.has_usage);
+        assert_eq!(snap.error_message.as_deref(), Some("e"));
     }
 
     #[test]

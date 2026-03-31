@@ -23,6 +23,12 @@ pub fn domain_hints_from_boost_terms(boost_terms: &[String]) -> Vec<DomainHint> 
     hints
 }
 
+/// Debug strings for step recorder / telemetry (`format!("{hint:?}")` per hint).
+#[must_use]
+pub fn domain_hints_debug_strings(hints: &[DomainHint]) -> Vec<String> {
+    hints.iter().map(|h| format!("{h:?}")).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -64,5 +70,14 @@ mod tests {
     fn case_insensitive() {
         let h = domain_hints_from_boost_terms(&["GITHUB".into()]);
         assert!(h.contains(&DomainHint::GitHub));
+    }
+
+    #[test]
+    fn domain_hints_debug_strings_match_debug_fmt() {
+        let hints = vec![DomainHint::GitHub, DomainHint::Code];
+        assert_eq!(
+            domain_hints_debug_strings(&hints),
+            vec!["GitHub".to_string(), "Code".to_string()]
+        );
     }
 }

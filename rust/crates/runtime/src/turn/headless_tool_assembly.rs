@@ -15,6 +15,47 @@ pub enum HeadlessRoundToolIdx {
     SyntheticEdge(usize),
 }
 
+/// Resolved id/name/args for one headless round slot (server `tool_calls` row or synthetic edge row).
+#[derive(Debug, Clone, PartialEq)]
+pub struct HeadlessResolvedToolSlot {
+    pub id: String,
+    pub name: String,
+    pub args: Value,
+    pub synthetic_edge_index: Option<usize>,
+}
+
+/// Map one [`HeadlessRoundToolIdx`] to flat call fields; `edge_lookup` is used only for [`HeadlessRoundToolIdx::SyntheticEdge`].
+#[must_use]
+pub fn resolve_headless_tool_slot(
+    item: HeadlessRoundToolIdx,
+    server_tool_calls: &[Value],
+    mut edge_lookup: impl FnMut(usize) -> (String, Value),
+) -> HeadlessResolvedToolSlot {
+    match item {
+        HeadlessRoundToolIdx::ServerToolCall(i) => {
+            let (id, name, args) = server_tool_calls
+                .get(i)
+                .map(parse_flat_tool_call_event)
+                .unwrap_or_else(|| (String::new(), String::new(), json!({})));
+            HeadlessResolvedToolSlot {
+                id,
+                name,
+                args,
+                synthetic_edge_index: None,
+            }
+        }
+        HeadlessRoundToolIdx::SyntheticEdge(i) => {
+            let (name, args) = edge_lookup(i);
+            HeadlessResolvedToolSlot {
+                id: format!("edge-{i}"),
+                name,
+                args,
+                synthetic_edge_index: Some(i),
+            }
+        }
+    }
+}
+
 /// Prefer iterating server `tool_calls` when present; otherwise one synthetic slot per edge row (§5.5).
 pub fn headless_round_tool_indices(
     server_tool_calls_len: usize,
@@ -410,6 +451,28 @@ mod tests {
                 HeadlessRoundToolIdx::SyntheticEdge(1),
             ]
         );
+    }
+
+    #[test]
+    fn resolve_headless_slot_server_and_synthetic() {
+        let server = vec![json!({"id":"a","name":"read_file","arguments":{}})];
+        let s0 =
+            resolve_headless_tool_slot(HeadlessRoundToolIdx::ServerToolCall(0), &server, |_| {
+                panic!("edge lookup not used")
+            });
+        assert_eq!(s0.id, "a");
+        assert_eq!(s0.name, "read_file");
+        assert_eq!(s0.args, json!({}));
+        assert!(s0.synthetic_edge_index.is_none());
+
+        let s1 = resolve_headless_tool_slot(HeadlessRoundToolIdx::SyntheticEdge(2), &[], |i| {
+            assert_eq!(i, 2);
+            ("bash".into(), json!({"command":"ls"}))
+        });
+        assert_eq!(s1.id, "edge-2");
+        assert_eq!(s1.name, "bash");
+        assert_eq!(s1.args, json!({"command":"ls"}));
+        assert_eq!(s1.synthetic_edge_index, Some(2));
     }
 
     #[test]

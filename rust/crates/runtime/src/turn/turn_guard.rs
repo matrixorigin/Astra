@@ -61,6 +61,16 @@ pub struct TurnGuard {
     last_reflection: Option<StallReflection>,
 }
 
+/// Insert deprioritized tool names from [`TurnGuard`] into the selector restriction set (CLI parity).
+pub fn merge_deprioritized_tools_into_restricted(
+    turn_guard: &TurnGuard,
+    restricted: &mut HashSet<String>,
+) {
+    for t in turn_guard.health.deprioritized_tools() {
+        restricted.insert(t.to_string());
+    }
+}
+
 impl TurnGuard {
     pub fn new() -> Self {
         Self {
