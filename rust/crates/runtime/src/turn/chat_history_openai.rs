@@ -25,6 +25,12 @@ pub fn openai_messages_from_repl_history(
     messages
 }
 
+/// Injected `role: user` row (guard nudges, intent-drift correction, etc.).
+#[must_use]
+pub fn openai_user_content_message(content: &str) -> Value {
+    json!({ "role": "user", "content": content })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -56,5 +62,12 @@ mod tests {
         assert_eq!(m[0]["role"], "user");
         assert_eq!(m[0]["content"], "u1");
         assert_eq!(m[4]["content"], "u3");
+    }
+
+    #[test]
+    fn openai_user_content_message_shape() {
+        let v = openai_user_content_message("fix drift");
+        assert_eq!(v["role"], "user");
+        assert_eq!(v["content"], "fix drift");
     }
 }

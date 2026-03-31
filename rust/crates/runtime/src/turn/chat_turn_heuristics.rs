@@ -5,6 +5,9 @@ use std::collections::HashSet;
 use std::sync::LazyLock;
 
 use regex::Regex;
+use serde_json::Value;
+
+use super::chat_history_openai::openai_user_content_message;
 
 /// Cloud API returned no such session (case-insensitive substring match).
 pub fn is_session_not_found_error(error: &str) -> bool {
@@ -125,6 +128,12 @@ pub fn factual_tool_retry_message(original_query: &str) -> String {
 \n\
 Original user query: {original_query}"
     )
+}
+
+/// OpenAI `messages` entry for [`factual_tool_retry_message`].
+#[must_use]
+pub fn openai_factual_tool_retry_user_message(original_query: &str) -> Value {
+    openai_user_content_message(&factual_tool_retry_message(original_query))
 }
 
 /// Extract `owner/repo` patterns from memory text.
@@ -260,6 +269,15 @@ mod tests {
         assert!(msg.contains("github_repo_stats"));
         assert!(msg.contains("memoria"));
         assert!(msg.contains("Do NOT fall back to bash"));
+    }
+
+    #[test]
+    fn openai_factual_tool_retry_user_message_shape() {
+        let v = openai_factual_tool_retry_user_message("q");
+        assert_eq!(v["role"], "user");
+        let s = v["content"].as_str().unwrap();
+        assert!(s.contains("Runtime correction"));
+        assert!(s.contains("Original user query: q"));
     }
 
     #[test]

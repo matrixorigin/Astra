@@ -17,7 +17,7 @@ use mo_agent_runtime::{
     },
     tool_selector,
     turn::boost_domain_hints::domain_hints_from_boost_terms,
-    turn::chat_history_openai::openai_messages_from_repl_history,
+    turn::chat_history_openai::{openai_messages_from_repl_history, openai_user_content_message},
     turn::chat_turn_edge_profile::{detect_active_system_skills_in_message, read_git_branch_abbrev},
     turn::chat_turn_payload::{
         chat_turn_base_payload, merge_active_skills_into_edge_profile,
@@ -25,7 +25,8 @@ use mo_agent_runtime::{
         set_payload_tool_results_if_non_empty, ChatTurnBasePayloadInput,
     },
     turn::chat_turn_heuristics::{
-        extract_repos_from_memory, factual_tool_retry_message, should_force_factual_tool_retry,
+        extract_repos_from_memory, openai_factual_tool_retry_user_message,
+        should_force_factual_tool_retry,
     },
     turn::edge_prompt_context::{detect_project_languages, make_args_preview},
     turn::tool_schema_prune::{filter_tool_schemas_by_excluded_names, pin_invoked_tool_schemas},
@@ -568,10 +569,7 @@ pub(crate) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
                             .yellow()
                     );
                 }
-                messages.push(serde_json::json!({
-                    "role": "user",
-                    "content": factual_tool_retry_message(message),
-                }));
+                messages.push(openai_factual_tool_retry_user_message(message));
                 final_text.clear();
                 continue;
             }
@@ -1021,10 +1019,7 @@ pub(crate) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
             if let mo_agent_runtime::turn::stall::IntentDrift::Drifting { correction, .. } =
                 mo_agent_runtime::turn::stall::detect_intent_drift(message, &intent_tool_turns)
             {
-                messages.push(serde_json::json!({
-                    "role": "user",
-                    "content": correction
-                }));
+                messages.push(openai_user_content_message(&correction));
                 stall_events.push(("intent_drift".to_string(), _turn as u32));
             }
         }
