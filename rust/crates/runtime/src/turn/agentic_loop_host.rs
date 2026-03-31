@@ -198,6 +198,12 @@ pub struct AgenticLoopState {
     // ── Cancellation ──
     /// Shared flag checked between turns. Set externally (e.g. by cancel_run).
     pub cancel_flag: Option<Arc<AtomicBool>>,
+
+    // ── Delegation ──
+    /// Optional delegation engine for multi-agent coordination.
+    /// When set, the loop intercepts `delegate` tool calls and routes them
+    /// through the delegation engine instead of the headless tool round.
+    pub delegation_engine: Option<Arc<crate::server::delegation_engine::DelegationEngine>>,
 }
 
 // ─── Loop exit ───────────────────────────────────────────────────────────────
@@ -214,6 +220,232 @@ pub enum AgenticLoopOutcome {
     /// Loop is waiting for external input (tool approval, user resume, webhook).
     /// The caller should provide the requested input and re-invoke the loop.
     Waiting(String),
+}
+
+// ─── Delegation support ──────────────────────────────────────────────────────
+
+const DELEGATE_TOOL_NAME: &str = "delegate";
+
+/// Check if a tool call is a delegation call.
+fn is_delegation_call(tool_call: &Value) -> bool {
+    tool_call
+        .get("function")
+        .and_then(|f| f.get("name"))
+        .and_then(Value::as_str)
+        == Some(DELEGATE_TOOL_NAME)
+}
+
+/// Parse delegation arguments from a tool call.
+fn parse_delegation_request(
+    tool_call: &Value,
+    parent_run_id: &str,
+    session_id: &str,
+) -> Result<mo_agent_services::coordination::DelegationRequest, String> {
+    let args_str = tool_call
+        .get("function")
+        .and_then(|f| f.get("arguments"))
+        .and_then(Value::as_str)
+        .ok_or("delegate call missing arguments")?;
+
+    let args: Value = serde_json::from_str(args_str).map_err(|e| format!("invalid delegation JSON: {e}"))?;
+
+    let task = args
+        .get("task")
+        .and_then(Value::as_str)
+        .unwrap_or("delegated task")
+        .to_string();
+
+    let pattern = parse_coordination_pattern(&args)?;
+
+    let mut context = std::collections::HashMap::new();
+    context.insert("session_id".to_string(), Value::String(session_id.to_string()));
+    if let Some(ctx) = args.get("context").and_then(Value::as_object) {
+        for (k, v) in ctx {
+            context.insert(k.clone(), v.clone());
+        }
+    }
+
+    Ok(mo_agent_services::coordination::DelegationRequest {
+        delegation_id: uuid::Uuid::new_v4().to_string(),
+        parent_run_id: parent_run_id.to_string(),
+        task,
+        pattern,
+        user_id: "system".to_string(),
+        depth: 0,
+        context,
+    })
+}
+
+/// Parse a CoordinationPattern from the LLM's delegate arguments.
+fn parse_coordination_pattern(args: &Value) -> Result<mo_agent_services::coordination::CoordinationPattern, String> {
+    let pattern_type = args
+        .get("pattern")
+        .and_then(Value::as_str)
+        .unwrap_or("sequential");
+
+    let agents: Vec<String> = args
+        .get("agents")
+        .and_then(Value::as_array)
+        .map(|arr| arr.iter().filter_map(Value::as_str).map(String::from).collect())
+        .unwrap_or_else(|| vec!["coder".to_string()]);
+
+    match pattern_type {
+        "fan_out" => Ok(mo_agent_services::coordination::CoordinationPattern::FanOut {
+            agent_ids: agents,
+            aggregation: mo_agent_services::coordination::AggregationStrategy::AllResults,
+            timeout_sec: 300,
+        }),
+        "pipeline" => {
+            let stages = agents
+                .into_iter()
+                .map(|id| mo_agent_services::coordination::PipelineStage {
+                    agent_id: id,
+                    output_transform: None,
+                })
+                .collect();
+            Ok(mo_agent_services::coordination::CoordinationPattern::Pipeline { stages })
+        }
+        "adversarial" => {
+            let producer = agents.first().cloned().unwrap_or_else(|| "coder".to_string());
+            let reviewer = agents.get(1).cloned().unwrap_or_else(|| "reviewer".to_string());
+            let max_rounds = args.get("max_rounds").and_then(Value::as_u64).unwrap_or(2) as u32;
+            Ok(mo_agent_services::coordination::CoordinationPattern::AdversarialReview {
+                producer_id: producer,
+                reviewer_id: reviewer,
+                max_rounds,
+                acceptance_threshold: 0.8,
+            })
+        }
+        _ => Ok(mo_agent_services::coordination::CoordinationPattern::Sequential {
+            agent_ids: agents,
+            stop_on_success: false,
+        }),
+    }
+}
+
+/// Partition tool calls into delegation calls and remaining calls,
+/// execute delegations, and return results as (call_id, result_text) pairs.
+async fn partition_and_execute_delegations(
+    tool_calls: &[Value],
+    engine: &crate::server::delegation_engine::DelegationEngine,
+    parent_run_id: &str,
+    session_id: &str,
+    source_agent_id: &str,
+) -> (Vec<(String, String)>, Vec<Value>) {
+    let mut delegation_results = Vec::new();
+    let mut remaining = Vec::new();
+
+    for tc in tool_calls {
+        if is_delegation_call(tc) {
+            let call_id = tc
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown")
+                .to_string();
+
+            match parse_delegation_request(tc, parent_run_id, session_id) {
+                Ok(request) => {
+                    match engine.execute(request, source_agent_id).await {
+                        Ok(result) => {
+                            let summary = format_delegation_result(&result);
+                            delegation_results.push((call_id, summary));
+                        }
+                        Err(e) => {
+                            delegation_results.push((
+                                call_id,
+                                format!("Delegation failed: {e}"),
+                            ));
+                        }
+                    }
+                }
+                Err(e) => {
+                    delegation_results.push((call_id, format!("Invalid delegation request: {e}")));
+                }
+            }
+        } else {
+            remaining.push(tc.clone());
+        }
+    }
+
+    (delegation_results, remaining)
+}
+
+/// Format a DelegationResult as a human-readable summary for the LLM.
+fn format_delegation_result(result: &mo_agent_services::coordination::DelegationResult) -> String {
+    let mut parts = Vec::new();
+    parts.push(format!("Delegation {} — status: {}", result.delegation_id, result.status));
+
+    for ar in &result.agent_results {
+        let status_icon = if ar.is_success() { "✅" } else { "❌" };
+        let output_preview = ar
+            .output
+            .as_deref()
+            .map(|o| {
+                if o.len() > 500 {
+                    format!("{}...", &o[..500])
+                } else {
+                    o.to_string()
+                }
+            })
+            .unwrap_or_else(|| "[no output]".to_string());
+        parts.push(format!(
+            "\n{status_icon} Agent '{}' ({}): {output_preview}",
+            ar.agent_id, ar.status
+        ));
+        if let Some(err) = &ar.error {
+            parts.push(format!("   Error: {err}"));
+        }
+    }
+
+    if let Some(agg) = &result.aggregated_output {
+        parts.push(format!("\n📋 Aggregated output:\n{agg}"));
+    }
+
+    parts.push(format!(
+        "\nTokens: {} prompt + {} completion, {} tool calls",
+        result.total_prompt_tokens, result.total_completion_tokens, result.total_tool_calls
+    ));
+
+    parts.join("\n")
+}
+
+/// Generate the OpenAI-compatible tool schema for the "delegate" tool.
+pub fn delegate_tool_schema() -> Value {
+    serde_json::json!({
+        "type": "function",
+        "function": {
+            "name": "delegate",
+            "description": "Delegate a task to one or more specialized sub-agents. Use this when a task benefits from parallel execution, pipeline processing, or adversarial review by specialized agents.",
+            "parameters": {
+                "type": "object",
+                "required": ["task", "agents"],
+                "properties": {
+                    "task": {
+                        "type": "string",
+                        "description": "The task description/prompt for the delegated agents."
+                    },
+                    "agents": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Agent IDs to delegate to. Available: 'coder' (code tasks), 'reviewer' (code review), 'writer' (documentation)."
+                    },
+                    "pattern": {
+                        "type": "string",
+                        "enum": ["sequential", "fan_out", "pipeline", "adversarial"],
+                        "description": "Coordination pattern. 'sequential': agents run one by one. 'fan_out': agents run in parallel. 'pipeline': output of each feeds the next. 'adversarial': producer+reviewer iterate."
+                    },
+                    "max_rounds": {
+                        "type": "integer",
+                        "description": "Maximum rounds for adversarial pattern (default: 2)."
+                    },
+                    "context": {
+                        "type": "object",
+                        "description": "Additional context to pass to sub-agents."
+                    }
+                }
+            }
+        }
+    })
 }
 
 // ─── Runtime loop ────────────────────────────────────────────────────────────
@@ -294,6 +526,40 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
             &mut state.turn_guard,
         );
 
+        // ─── Step 3b: Delegation interception ───────────────────────────
+        // If a delegation engine is wired, intercept "delegate" tool calls
+        // and execute them as multi-agent coordination runs.
+        let (delegation_results, remaining_tool_calls) = if let Some(engine) = &state.delegation_engine {
+            partition_and_execute_delegations(
+                &turn_result.accum.tool_calls,
+                engine,
+                state.current_run_id.as_deref().unwrap_or("unknown"),
+                state.current_session_id.as_deref().unwrap_or("unknown"),
+                "orchestrator",
+            )
+            .await
+        } else {
+            (Vec::new(), turn_result.accum.tool_calls.clone())
+        };
+
+        // Inject delegation results into messages + tool_results
+        for (call_id, result_text) in &delegation_results {
+            let tool_msg = serde_json::json!({
+                "role": "tool",
+                "tool_call_id": call_id,
+                "content": result_text,
+            });
+            state.messages.push(tool_msg.clone());
+            state.tool_results.push(tool_msg);
+        }
+
+        // Use remaining (non-delegation) tool calls for headless round
+        let effective_tool_calls = if delegation_results.is_empty() {
+            &turn_result.accum.tool_calls
+        } else {
+            &remaining_tool_calls
+        };
+
         // ─── Step 4: Headless tool round ────────────────────────────────
         struct HostTerminalAdapter<'a, H: AgenticLoopHost>(&'a mut H);
         impl<H: AgenticLoopHost> HeadlessRoundTerminal for HostTerminalAdapter<'_, H> {
@@ -318,7 +584,7 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
                 &state.api,
                 &state.api_token,
                 state.current_session_id.as_ref(),
-                &turn_result.accum.tool_calls,
+                effective_tool_calls,
                 turn_result.edge_tool_round.as_slice(),
                 turn_result.accum.reasoning_content.as_str(),
                 &edge_callback_outputs,
@@ -558,6 +824,7 @@ mod tests {
             api: mo_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap(),
             api_token: String::new(),
             cancel_flag: None,
+            delegation_engine: None,
         }
     }
 
@@ -1027,5 +1294,380 @@ mod tests {
             let _ = format!("{v:?}");
         }
         assert_eq!(variants.len(), 4);
+    }
+
+    // ── Delegation integration tests ────────────────────────────────────────
+
+    #[test]
+    fn is_delegation_call_detects_delegate_tool() {
+        let delegate = json!({
+            "id": "call_123",
+            "type": "function",
+            "function": {
+                "name": "delegate",
+                "arguments": "{}"
+            }
+        });
+        let non_delegate = json!({
+            "id": "call_456",
+            "type": "function",
+            "function": {
+                "name": "bash",
+                "arguments": "{}"
+            }
+        });
+        assert!(super::is_delegation_call(&delegate));
+        assert!(!super::is_delegation_call(&non_delegate));
+    }
+
+    #[test]
+    fn is_delegation_call_rejects_missing_function() {
+        let malformed = json!({"id": "call_000"});
+        assert!(!super::is_delegation_call(&malformed));
+    }
+
+    #[test]
+    fn delegate_tool_schema_has_correct_structure() {
+        let schema = super::delegate_tool_schema();
+        assert_eq!(schema["type"], "function");
+        assert_eq!(schema["function"]["name"], "delegate");
+
+        let params = &schema["function"]["parameters"];
+        assert_eq!(params["type"], "object");
+
+        let required = params["required"].as_array().unwrap();
+        assert!(required.contains(&json!("task")));
+        assert!(required.contains(&json!("agents")));
+
+        let props = &params["properties"];
+        assert!(props["task"].is_object());
+        assert!(props["agents"].is_object());
+        assert!(props["pattern"].is_object());
+        assert!(props["max_rounds"].is_object());
+        assert!(props["context"].is_object());
+    }
+
+    #[test]
+    fn parse_coordination_pattern_defaults_to_sequential() {
+        let args = json!({"agents": ["coder", "reviewer"]});
+        let pattern = super::parse_coordination_pattern(&args).unwrap();
+        match pattern {
+            mo_agent_services::coordination::CoordinationPattern::Sequential { agent_ids, stop_on_success } => {
+                assert_eq!(agent_ids, vec!["coder", "reviewer"]);
+                assert!(!stop_on_success);
+            }
+            _ => panic!("expected Sequential"),
+        }
+    }
+
+    #[test]
+    fn parse_coordination_pattern_fan_out() {
+        let args = json!({"pattern": "fan_out", "agents": ["coder", "writer"]});
+        let pattern = super::parse_coordination_pattern(&args).unwrap();
+        match pattern {
+            mo_agent_services::coordination::CoordinationPattern::FanOut { agent_ids, timeout_sec, .. } => {
+                assert_eq!(agent_ids, vec!["coder", "writer"]);
+                assert_eq!(timeout_sec, 300);
+            }
+            _ => panic!("expected FanOut"),
+        }
+    }
+
+    #[test]
+    fn parse_coordination_pattern_pipeline() {
+        let args = json!({"pattern": "pipeline", "agents": ["coder", "reviewer"]});
+        let pattern = super::parse_coordination_pattern(&args).unwrap();
+        match pattern {
+            mo_agent_services::coordination::CoordinationPattern::Pipeline { stages } => {
+                assert_eq!(stages.len(), 2);
+                assert_eq!(stages[0].agent_id, "coder");
+                assert_eq!(stages[1].agent_id, "reviewer");
+            }
+            _ => panic!("expected Pipeline"),
+        }
+    }
+
+    #[test]
+    fn parse_coordination_pattern_adversarial() {
+        let args = json!({"pattern": "adversarial", "agents": ["coder", "reviewer"], "max_rounds": 3});
+        let pattern = super::parse_coordination_pattern(&args).unwrap();
+        match pattern {
+            mo_agent_services::coordination::CoordinationPattern::AdversarialReview { producer_id, reviewer_id, max_rounds, .. } => {
+                assert_eq!(producer_id, "coder");
+                assert_eq!(reviewer_id, "reviewer");
+                assert_eq!(max_rounds, 3);
+            }
+            _ => panic!("expected AdversarialReview"),
+        }
+    }
+
+    #[test]
+    fn parse_delegation_request_extracts_fields() {
+        let tool_call = json!({
+            "id": "call_abc",
+            "type": "function",
+            "function": {
+                "name": "delegate",
+                "arguments": "{\"task\": \"write tests\", \"agents\": [\"coder\"], \"pattern\": \"sequential\", \"context\": {\"repo\": \"my-repo\"}}"
+            }
+        });
+        let req = super::parse_delegation_request(&tool_call, "run-123", "session-456").unwrap();
+        assert_eq!(req.task, "write tests");
+        assert_eq!(req.parent_run_id, "run-123");
+        assert!(req.context.contains_key("session_id"));
+        assert!(req.context.contains_key("repo"));
+    }
+
+    #[test]
+    fn parse_delegation_request_handles_missing_args() {
+        let tool_call = json!({
+            "id": "call_bad",
+            "type": "function",
+            "function": {
+                "name": "delegate"
+            }
+        });
+        let result = super::parse_delegation_request(&tool_call, "run-1", "sess-1");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("missing arguments"));
+    }
+
+    #[test]
+    fn format_delegation_result_includes_status_and_agents() {
+        let result = mo_agent_services::coordination::DelegationResult {
+            delegation_id: "del-1".to_string(),
+            status: "completed".to_string(),
+            agent_results: vec![
+                mo_agent_services::coordination::AgentResult {
+                    agent_id: "coder".to_string(),
+                    run_id: "run-1".to_string(),
+                    status: "completed".to_string(),
+                    output: Some("implemented feature X".to_string()),
+                    error: None,
+                    prompt_tokens: 100,
+                    completion_tokens: 50,
+                    tool_calls: 3,
+                },
+            ],
+            aggregated_output: Some("All tasks done.".to_string()),
+            total_prompt_tokens: 100,
+            total_completion_tokens: 50,
+            total_tool_calls: 3,
+        };
+        let formatted = super::format_delegation_result(&result);
+        assert!(formatted.contains("del-1"));
+        assert!(formatted.contains("completed"));
+        assert!(formatted.contains("✅"));
+        assert!(formatted.contains("coder"));
+        assert!(formatted.contains("implemented feature X"));
+        assert!(formatted.contains("All tasks done"));
+        assert!(formatted.contains("Tokens:"));
+    }
+
+    #[test]
+    fn format_delegation_result_truncates_long_output() {
+        let long_output = "x".repeat(1000);
+        let result = mo_agent_services::coordination::DelegationResult {
+            delegation_id: "del-2".to_string(),
+            status: "completed".to_string(),
+            agent_results: vec![
+                mo_agent_services::coordination::AgentResult {
+                    agent_id: "writer".to_string(),
+                    run_id: "run-2".to_string(),
+                    status: "completed".to_string(),
+                    output: Some(long_output),
+                    error: None,
+                    prompt_tokens: 200,
+                    completion_tokens: 100,
+                    tool_calls: 1,
+                },
+            ],
+            aggregated_output: None,
+            total_prompt_tokens: 200,
+            total_completion_tokens: 100,
+            total_tool_calls: 1,
+        };
+        let formatted = super::format_delegation_result(&result);
+        assert!(formatted.contains("..."));
+        // Output should be truncated to ~500 chars + "..."
+        assert!(formatted.len() < 1500);
+    }
+
+    #[test]
+    fn format_delegation_result_shows_errors() {
+        let result = mo_agent_services::coordination::DelegationResult {
+            delegation_id: "del-3".to_string(),
+            status: "partial_failure".to_string(),
+            agent_results: vec![
+                mo_agent_services::coordination::AgentResult {
+                    agent_id: "coder".to_string(),
+                    run_id: "run-3".to_string(),
+                    status: "failed".to_string(),
+                    output: None,
+                    error: Some("timeout".to_string()),
+                    prompt_tokens: 50,
+                    completion_tokens: 0,
+                    tool_calls: 0,
+                },
+            ],
+            aggregated_output: None,
+            total_prompt_tokens: 50,
+            total_completion_tokens: 0,
+            total_tool_calls: 0,
+        };
+        let formatted = super::format_delegation_result(&result);
+        assert!(formatted.contains("❌"));
+        assert!(formatted.contains("timeout"));
+        assert!(formatted.contains("partial_failure"));
+    }
+
+    #[tokio::test]
+    async fn partition_and_execute_with_no_delegation_engine() {
+        // When delegation_engine is None, all calls pass through
+        let tool_calls = [
+            json!({"id": "c1", "function": {"name": "bash", "arguments": "{}"}}),
+            json!({"id": "c2", "function": {"name": "read_file", "arguments": "{}"}}),
+        ];
+
+        let state = make_state();
+
+        // Verify that without delegation_engine, no delegation happens
+        assert!(state.delegation_engine.is_none());
+        // All calls remain as-is
+        assert_eq!(tool_calls.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn partition_separates_delegate_from_regular_calls() {
+        use crate::server::delegation_engine::{DelegationEngine, DelegationTracker, StubSubRunExecutor};
+        use crate::server::run_engine::RunEngine;
+        use mo_agent_services::AgentProfileRegistry;
+
+        // Create a delegation engine with stub executor
+        let mut registry = AgentProfileRegistry::new();
+        {
+            use mo_agent_services::coordination::{AgentProfile, AgentTier};
+            let _ = registry.register(AgentProfile::new("coder", "Coder", AgentTier::System));
+        }
+        let run_store = Arc::new(mo_agent_services::runs::InMemoryRunStateStore::default());
+        let engine = DelegationEngine::with_executor(
+            Arc::new(tokio::sync::RwLock::new(registry)),
+            Arc::new(RunEngine::new(run_store)),
+            Arc::new(DelegationTracker::new()),
+            Arc::new(StubSubRunExecutor),
+        );
+
+        let tool_calls = vec![
+            json!({
+                "id": "call_delegate",
+                "type": "function",
+                "function": {
+                    "name": "delegate",
+                    "arguments": "{\"task\": \"write tests\", \"agents\": [\"coder\"]}"
+                }
+            }),
+            json!({
+                "id": "call_bash",
+                "type": "function",
+                "function": {
+                    "name": "bash",
+                    "arguments": "{\"command\": \"ls\"}"
+                }
+            }),
+        ];
+
+        let (delegation_results, remaining) = super::partition_and_execute_delegations(
+            &tool_calls,
+            &engine,
+            "test-run",
+            "test-session",
+            "orchestrator",
+        )
+        .await;
+
+        // One delegation executed, one regular call passed through
+        assert_eq!(delegation_results.len(), 1);
+        assert_eq!(remaining.len(), 1);
+
+        // Delegation result should contain the call_id
+        assert_eq!(delegation_results[0].0, "call_delegate");
+        // Remaining should be the bash call
+        assert_eq!(remaining[0]["id"], "call_bash");
+    }
+
+    #[tokio::test]
+    async fn partition_handles_all_delegate_calls() {
+        use crate::server::delegation_engine::{DelegationEngine, DelegationTracker, StubSubRunExecutor};
+        use crate::server::run_engine::RunEngine;
+        use mo_agent_services::AgentProfileRegistry;
+
+        let mut registry = AgentProfileRegistry::new();
+        {
+            use mo_agent_services::coordination::{AgentProfile, AgentTier};
+            let _ = registry.register(AgentProfile::new("coder", "Coder", AgentTier::System));
+            let _ = registry.register(AgentProfile::new("reviewer", "Reviewer", AgentTier::System));
+        }
+        let run_store = Arc::new(mo_agent_services::runs::InMemoryRunStateStore::default());
+        let engine = DelegationEngine::with_executor(
+            Arc::new(tokio::sync::RwLock::new(registry)),
+            Arc::new(RunEngine::new(run_store)),
+            Arc::new(DelegationTracker::new()),
+            Arc::new(StubSubRunExecutor),
+        );
+
+        let tool_calls = vec![
+            json!({
+                "id": "d1",
+                "function": {"name": "delegate", "arguments": "{\"task\": \"code\", \"agents\": [\"coder\"]}"}
+            }),
+            json!({
+                "id": "d2",
+                "function": {"name": "delegate", "arguments": "{\"task\": \"review\", \"agents\": [\"reviewer\"]}"}
+            }),
+        ];
+
+        let (delegation_results, remaining) = super::partition_and_execute_delegations(
+            &tool_calls, &engine, "run-1", "sess-1", "orchestrator"
+        ).await;
+
+        assert_eq!(delegation_results.len(), 2);
+        assert!(remaining.is_empty());
+    }
+
+    #[tokio::test]
+    async fn partition_handles_invalid_delegation_args_gracefully() {
+        use crate::server::delegation_engine::{DelegationEngine, DelegationTracker, StubSubRunExecutor};
+        use crate::server::run_engine::RunEngine;
+        use mo_agent_services::AgentProfileRegistry;
+
+        let registry = AgentProfileRegistry::new();
+        let run_store = Arc::new(mo_agent_services::runs::InMemoryRunStateStore::default());
+        let engine = DelegationEngine::with_executor(
+            Arc::new(tokio::sync::RwLock::new(registry)),
+            Arc::new(RunEngine::new(run_store)),
+            Arc::new(DelegationTracker::new()),
+            Arc::new(StubSubRunExecutor),
+        );
+
+        let tool_calls = vec![
+            json!({
+                "id": "bad_call",
+                "function": {"name": "delegate", "arguments": "not valid json!!!"}
+            }),
+        ];
+
+        let (delegation_results, remaining) = super::partition_and_execute_delegations(
+            &tool_calls, &engine, "run-1", "sess-1", "orchestrator"
+        ).await;
+
+        assert_eq!(delegation_results.len(), 1);
+        assert!(delegation_results[0].1.contains("Invalid delegation request"));
+        assert!(remaining.is_empty());
+    }
+
+    #[test]
+    fn state_delegation_engine_defaults_to_none() {
+        let state = make_state();
+        assert!(state.delegation_engine.is_none());
     }
 }

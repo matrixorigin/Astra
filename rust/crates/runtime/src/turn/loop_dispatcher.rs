@@ -292,6 +292,7 @@ mod tests {
             api: mo_thin_client::ThinClient::new("http://localhost:1", None).unwrap(),
             api_token: "test".to_string(),
             cancel_flag: None,
+            delegation_engine: None,
         }
     }
 

@@ -178,14 +178,6 @@ pub(super) async fn build_server_state(
         Arc::new(FernetTokenEncryptor::from_env().map_err(Box::<dyn std::error::Error>::from)?);
     let run_store = Arc::new(mo_agent_services::runs::InMemoryRunStateStore::default());
     let run_engine = crate::server::run_engine::RunEngine::new(run_store);
-    let run_lifecycle = super::run_lifecycle::AgenticRunLifecycleService::new(
-        settings.matrixone.clone(),
-        run_encryptor.clone(),
-        state.edge_callback_ledger.clone(),
-    )
-    .with_pool(shared_pool.clone())
-    .with_run_engine(run_engine.clone());
-    let state = state.with_run_lifecycle_service(Arc::new(run_lifecycle));
 
     // Wire multi-agent coordination: profile registry + delegation engine.
     let mut profile_registry = mo_agent_services::AgentProfileRegistry::new();
@@ -231,7 +223,7 @@ pub(super) async fn build_server_state(
     let sub_run_executor: Arc<dyn crate::server::delegation_engine::SubRunExecutor> = Arc::new(
         super::run_lifecycle::ServerSubRunExecutor::new(
             settings.matrixone.clone(),
-            run_encryptor,
+            run_encryptor.clone(),
             state.edge_callback_ledger.clone(),
         )
         .with_pool(shared_pool.clone()),
@@ -239,12 +231,23 @@ pub(super) async fn build_server_state(
     let delegation_engine = Arc::new(
         crate::server::delegation_engine::DelegationEngine::with_executor(
             Arc::new(tokio::sync::RwLock::new((*profile_registry).clone())),
-            Arc::new(run_engine),
+            Arc::new(run_engine.clone()),
             delegation_tracker,
             sub_run_executor,
         ),
     );
+
+    // Create lifecycle service with delegation engine wired in.
+    let run_lifecycle = super::run_lifecycle::AgenticRunLifecycleService::new(
+        settings.matrixone.clone(),
+        run_encryptor.clone(),
+        state.edge_callback_ledger.clone(),
+    )
+    .with_pool(shared_pool.clone())
+    .with_run_engine(run_engine)
+    .with_delegation_engine(Arc::clone(&delegation_engine));
     let state = state
+        .with_run_lifecycle_service(Arc::new(run_lifecycle))
         .with_agent_profile_registry(profile_registry)
         .with_delegation_engine(delegation_engine);
 

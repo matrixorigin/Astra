@@ -90,6 +90,8 @@ pub struct AgenticRunLifecycleService {
     edge_callback_ledger: Arc<TokioMutex<HashMap<String, Value>>>,
     /// Optional durable run engine for persistence.
     run_engine: Option<RunEngine>,
+    /// Optional delegation engine for multi-agent coordination.
+    delegation_engine: Option<Arc<crate::server::delegation_engine::DelegationEngine>>,
 }
 
 impl AgenticRunLifecycleService {
@@ -105,6 +107,7 @@ impl AgenticRunLifecycleService {
             shared_pool: None,
             edge_callback_ledger,
             run_engine: None,
+            delegation_engine: None,
         }
     }
 
@@ -115,6 +118,11 @@ impl AgenticRunLifecycleService {
 
     pub fn with_run_engine(mut self, engine: RunEngine) -> Self {
         self.run_engine = Some(engine);
+        self
+    }
+
+    pub fn with_delegation_engine(mut self, engine: Arc<crate::server::delegation_engine::DelegationEngine>) -> Self {
+        self.delegation_engine = Some(engine);
         self
     }
 
@@ -209,6 +217,7 @@ impl AgenticRunLifecycleService {
             api: mo_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap(),
             api_token: String::new(),
             cancel_flag: None,
+            delegation_engine: None,
         }
     }
 
@@ -296,6 +305,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         let mut host = self.build_host(&user_id, &session_id, &request, edge_tools, edge_profile);
         let mut loop_state = self.build_initial_state(&request, &session_id, &run_id);
         loop_state.cancel_flag = Some(cancel_flag);
+        loop_state.delegation_engine = self.delegation_engine.clone();
 
         // Clone handles we need inside the spawned task.
         let runs = self.runs_handle();
@@ -743,6 +753,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
             api: mo_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap(),
             api_token: String::new(),
             cancel_flag: None,
+            delegation_engine: None,
         };
 
         let outcome = run_agentic_loop_with_host(&mut host, &mut loop_state).await;
