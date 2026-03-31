@@ -4,14 +4,11 @@ use std::{collections::HashSet, path::PathBuf, time::Instant};
 
 use crossterm::style::Stylize;
 use crossterm::terminal;
-use mo_agent_core::{RuntimeLimits, agent_warn};
+use mo_agent_core::RuntimeLimits;
 use mo_agent_runtime::{
     pipeline::step_protocol::InMemoryIdempotencyCache,
     tool_registry::{self},
     turn::chat_history_openai::openai_messages_from_repl_history,
-    turn::chat_turn_heuristics::{
-        openai_factual_tool_retry_user_message, should_force_factual_tool_retry,
-    },
     turn::edge_prompt_context::detect_project_languages,
     turn::headless_tool_assembly::tool_calls_for_stall_guard,
 };
@@ -34,6 +31,9 @@ use super::prepare_turn_request::{
 };
 use super::stall_preflight::{StallPreflightRequest, apply_stall_preflight};
 use super::tool_round::{HeadlessToolRoundRequest, run_headless_tool_round};
+use super::turn_result_ingest::{
+    TurnIngestOutcome, TurnResultIngestRequest, ingest_turn_sse_result,
+};
 
 pub(crate) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResult, String> {
     // Destructure for readability within the function body
@@ -207,92 +207,28 @@ pub(crate) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
         let turn_result =
             consume_turn_sse(resp, render_md, term_width, quiet, Some(edge_ctx)).await;
 
-        // Capture TTFT from first turn for observability
-        if first_ttft_ms.is_none() {
-            first_ttft_ms = turn_result.ttft_ms;
-        }
-
-        if let Some(sid) = &turn_result.session_id {
-            current_session_id = Some(sid.clone());
-        }
-        if turn_result.run_id.is_some() {
-            current_run_id = turn_result.run_id.clone();
-        }
-        if !turn_result.full_text.is_empty() {
-            final_text = turn_result.full_text.clone();
-
-            // Unified response guard: hard blocks (prompt leak, repetition) + soft quality signals
-            let guard = mo_agent_runtime::turn::response_guard::apply_response_guards(
-                &final_text,
-                &turn_result.tool_calls,
-                &[], // tool name validation handled at execution time
-                message,
-            );
-            if let Some(replacement) = guard.replacement {
-                agent_warn!("response_guard", "Guard triggered, replacing LLM output");
-                final_text = replacement;
-                break;
-            }
-            if guard.quality.has_fabrication_markers {
-                agent_warn!(
-                    "response_guard",
-                    "Fabrication markers detected: placeholder paths in response"
-                );
-            }
-            if guard.quality.is_echo {
-                agent_warn!(
-                    "response_guard",
-                    "Echo detected: LLM repeated user query instead of answering"
-                );
-            }
-        }
-        total_prompt += turn_result.prompt_tokens;
-        total_completion += turn_result.completion_tokens;
-        total_tool_calls += if !turn_result.tool_calls.is_empty() {
-            turn_result.tool_calls.len()
-        } else {
-            turn_result.edge_tool_round.len()
-        } as u32;
-
-        // Record LLM token usage in step recorder
-        step_recorder.record_tokens(turn_result.prompt_tokens, turn_result.completion_tokens);
-        // Track all unique tool names that the LLM actually invoked
-        for tc in &turn_result.tool_calls {
-            if let Some(name) = tc.get("name").and_then(|v| v.as_str()) {
-                all_tools_used.insert(name.to_string());
-            }
-        }
-        for e in &turn_result.edge_tool_round {
-            all_tools_used.insert(e.tool.clone());
-        }
-        has_any_usage = has_any_usage || turn_result.has_usage;
-
-        if let Some(ref err) = turn_result.error_message {
-            return Err(err.clone());
-        }
-
-        let round_has_edge_work =
-            !turn_result.tool_calls.is_empty() || !turn_result.edge_tool_round.is_empty();
-        if !round_has_edge_work {
-            if should_force_factual_tool_retry(
-                message,
-                recent_tools,
-                total_tool_calls,
-                forced_factual_retry,
-            ) {
-                forced_factual_retry = true;
-                if !quiet {
-                    eprintln!(
-                        "{}",
-                        "  ↻ No tool call on a live-data query; forcing one corrective retry…"
-                            .yellow()
-                    );
-                }
-                messages.push(openai_factual_tool_retry_user_message(message));
-                final_text.clear();
-                continue;
-            }
-            break;
+        match ingest_turn_sse_result(TurnResultIngestRequest {
+            turn_result: &turn_result,
+            message,
+            recent_tools,
+            quiet,
+            first_ttft_ms: &mut first_ttft_ms,
+            current_session_id: &mut current_session_id,
+            current_run_id: &mut current_run_id,
+            final_text: &mut final_text,
+            total_prompt: &mut total_prompt,
+            total_completion: &mut total_completion,
+            total_tool_calls: &mut total_tool_calls,
+            step_recorder: &mut step_recorder,
+            all_tools_used: &mut all_tools_used,
+            has_any_usage: &mut has_any_usage,
+            forced_factual_retry: &mut forced_factual_retry,
+            messages: &mut messages,
+        }) {
+            TurnIngestOutcome::Fatal(e) => return Err(e),
+            TurnIngestOutcome::Break => break,
+            TurnIngestOutcome::Continue => continue,
+            TurnIngestOutcome::HasToolCalls => {}
         }
 
         let tool_calls_for_guard =

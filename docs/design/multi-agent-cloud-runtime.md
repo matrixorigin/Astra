@@ -1,7 +1,7 @@
 # Multi-Agent Cloud Runtime Architecture
 
 > **Status**: Living Design Document  
-> **Version**: 1.4.19 (Phase 0 partial: `sse_loop/stall_preflight` — per-turn stall signatures before headless tool execution; loop orchestration still in CLI)  
+> **Version**: 1.4.20 (Phase 0 partial: `sse_loop/turn_result_ingest` — fold `TurnResult` after SSE; loop orchestration still in CLI)  
 > **Scope**: Edge-cloud state management, multi-agent orchestration, and cloud-scale execution  
 > **Audience**: Core contributors, architecture reviewers
 
@@ -102,7 +102,7 @@ rust/crates/
 │   ├── main.rs              # Entry point, REPL loop, session management
 │   ├── edge_tools.rs        # 50 tools: bash, file ops, git (gix), code intel, web, memory
 │   ├── mo_agent/
-│   │   ├── chat_stream/     # `mod.rs` + `sse_loop/` (`run.rs`, `prepare_turn_request`, `stall_preflight`, `tool_round`, `post_tool_round`, …); headless §5.5
+│   │   ├── chat_stream/     # `mod.rs` + `sse_loop/` (`run.rs`, `prepare_turn_request`, `turn_result_ingest`, `stall_preflight`, `tool_round`, `post_tool_round`, …); headless §5.5
 │   │   └── repl_turn.rs     # Single turn execution
 │   └── edge_tools/
 │       ├── code_intel.rs    # 10 tree-sitter AST tools
@@ -263,7 +263,7 @@ The graph is correct (no cycles), but `mo-agent` being the **only crate that can
 
 ### 4.3 What's Solid and Should Not Change
 
-- **Phase 0 progress (v1.4.19)**: same as v1.4.18, plus **`sse_loop/stall_preflight.rs`** (`apply_stall_preflight` — turn signature / name-set history, `TurnGuard::record_tool_calls`, name-stall journal). Remaining: move the multi-turn loop body to a server handler; **`ReplState`** / **`AppState`** infra largely converged on **`MatrixCloudRuntime`**.
+- **Phase 0 progress (v1.4.20)**: same as v1.4.19, plus **`sse_loop/turn_result_ingest.rs`** (`ingest_turn_sse_result` — TTFT/session/run_id, response guard, token + tool usage, factual retry vs break vs tool path). Remaining: move the multi-turn loop body to a server handler; **`ReplState`** / **`AppState`** infra largely converged on **`MatrixCloudRuntime`**.
 - **Local-first journal**: Append-only JSONL is the correct foundation. Fast, crash-safe, auditable.
 - **Sync envelope state machine**: Clean→Dirty→Syncing→Conflict is correct. Extend, don't replace.
 - **DomainAdapter trait**: The trait signature is well-designed. **Learning, Events, Tasks, Templates, and Preferences** now have real [`runtime::sync_adapters`](../../rust/crates/runtime/src/sync_adapters.rs) implementations (see §6.2.1); residual “stub” language in older sections is obsolete for those domains.
@@ -1759,12 +1759,13 @@ mo-agent Orchestrator
 | Extract headless tool round after SSE turn (assistant msg → per-tool edge results → OpenAI pairs) | ✅ Done (slice 24) | Small | **`sse_loop/tool_round.rs`**: `HeadlessToolRoundRequest`, `run_headless_tool_round` |
 | Extract post-tool-turn policy (intent drift + TurnGuard verdict / checkpoints / retry) | ✅ Done (slice 25) | Small | **`sse_loop/post_tool_round.rs`**: `PostToolTurnRequest`, `PostToolTurnOutcome`, `apply_post_tool_turn_policy` |
 | Extract pre-tool stall preflight (signatures, `record_tool_calls`, name-stall) | ✅ Done (slice 26) | Tiny | **`sse_loop/stall_preflight.rs`**: `TOOL_NAME_STALL_WINDOW`, `StallPreflightRequest`, `apply_stall_preflight` |
+| Extract `TurnResult` ingest after `consume_turn_sse` (guards, usage, no-tool exit) | ✅ Done (slice 27) | Small | **`sse_loop/turn_result_ingest.rs`**: `TurnResultIngestRequest`, `TurnIngestOutcome`, `ingest_turn_sse_result` |
 | Implement tool execution callback protocol (cloud → edge) | ✅ Core path | Medium | §5.5 `/tools/result`, `tool_request` SSE; `chat_stream` **does not** re-execute tools for that path. |
 | Add `edge_executor_id` to chat turn protocol | ✅ | Small | Thin client + §5.5.2 light edge helpers. |
 | Move `SyncOrchestrator` construction from `ReplState` to `AppState` | ✅ Done | — | **`MatrixCloudRuntime`** bundles `SharedPool` + `IngestionSender` + `SyncOrchestrator`; `ReplState` / `AppState` hold `Option<Arc<MatrixCloudRuntime>>` only (no separate orchestrator field) |
 | Move `IngestionSender` from `ReplState` to server pipeline | ✅ Done | — | Same bundle as row above; journal flush via `enqueue_journal_events` |
 | Remove `matrixone_pool` from `ReplState` (use server `shared_pool`) | ✅ Done | — | Superseded by `MatrixCloudRuntime::shared_pool()`; no `matrixone_pool` field on `ReplState` |
-| Refactor `chat_stream/`: cognitive loop → `runtime`, rendering stays CLI | 🟡 In progress | Large | **Slices 1–26** + **`sse_loop/`** (`run.rs` + `prepare_turn_request` + `stall_preflight` + `tool_round` + `post_tool_round` + helpers). Remaining: move main loop body to server; `consume_turn_sse` + `bridge_inprocess` convergence |
+| Refactor `chat_stream/`: cognitive loop → `runtime`, rendering stays CLI | 🟡 In progress | Large | **Slices 1–27** + **`sse_loop/`** (`run.rs` + `prepare_turn_request` + `turn_result_ingest` + `stall_preflight` + `tool_round` + `post_tool_round` + helpers). Remaining: move main loop body to server; `consume_turn_sse` + `bridge_inprocess` convergence |
 
 **Success criteria** (unchanged): `mo-agent` CLI can be deleted and replaced with a ~500-line thin client; **not yet met** — `chat_stream` + `ReplState` infra fields remain.
 
@@ -1889,7 +1890,7 @@ mo-agent Orchestrator
 | Chat turn heuristics | `runtime/src/turn/chat_turn_heuristics.rs` | Factual-query guard, `openai_factual_tool_retry_user_message`, session-not-found, repo extraction from memory text | runtime ✅ |
 | Headless tool assembly | `runtime/src/turn/headless_tool_assembly.rs` | `CACHEABLE_TOOLS`, edge row → `tool_call` output match, `openai_assistant_with_tool_calls_message`, `openai_tool_roundtrip_values` | runtime ✅ |
 | Bridge (HTTP) | `runtime/src/turn/bridge/mod.rs` | HttpChatTurnBridge, forwards to external service | runtime ✅ |
-| Chat stream | `mo-agent/src/mo_agent/chat_stream/` (`sse_loop/run.rs`, `prepare_turn_request.rs`, `stall_preflight.rs`, `tool_round.rs`, `post_tool_round.rs`, …) | Multi-turn loop orchestration + CLI rendering; imports runtime headless helpers | ⚠️ Core loop should move to runtime |
+| Chat stream | `mo-agent/src/mo_agent/chat_stream/` (`sse_loop/run.rs`, `prepare_turn_request.rs`, `turn_result_ingest.rs`, `stall_preflight.rs`, `tool_round.rs`, `post_tool_round.rs`, …) | Multi-turn loop orchestration + CLI rendering; imports runtime headless helpers | ⚠️ Core loop should move to runtime |
 | Plan decompose | `runtime/src/plan_decompose.rs` | Long-horizon planning, subtask generation | runtime ✅ |
 | Entity graph | `runtime/src/pipeline/entity.rs` | EntityKnowledge, decayed_confidence | runtime ✅ |
 | Pattern library | `runtime/src/pipeline/pattern.rs` | ToolChainPattern, drift detection | runtime ✅ |

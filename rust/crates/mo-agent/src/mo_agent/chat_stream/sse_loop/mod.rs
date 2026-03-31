@@ -9,5 +9,6 @@ mod run;
 mod skill_instructions_round;
 mod stall_preflight;
 mod tool_round;
+mod turn_result_ingest;
 
 pub(crate) use run::stream_chat_sse;
