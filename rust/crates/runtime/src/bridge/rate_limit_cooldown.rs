@@ -620,5 +620,201 @@ mod tests {
         assert!(!rl.is_in_cooldown());
         assert_eq!(rl.metrics().consecutive_errors, 0);
         assert_eq!(rl.check_request(false), RateLimitAction::Proceed);
+    // ── Fallback model resolution integration tests ──────────────────────────
+
+    #[test]
+    fn fallback_lifecycle_529_then_success_resets() {
+        let rl = RateLimitCooldown::new();
+
+        // Trigger fallback via 3 consecutive 529 errors
+        rl.record_529(None, true);
+        rl.record_529(None, true);
+        let action = rl.record_529(None, true);
+        assert!(
+            matches!(
+                action,
+                RateLimitAction::UseFallback {
+                    reason: CooldownReason::Overloaded
+                }
+            ),
+            "expected UseFallback, got {action:?}"
+        );
+
+        // Simulate success on fallback model
+        rl.record_success();
+
+        // Counters should be reset, but cooldown is still active
+        // (cooldown expires by time, not by success)
+        assert!(
+            rl.is_in_cooldown(),
+            "cooldown should still be active after success"
+        );
+        assert_eq!(
+            rl.metrics().consecutive_errors,
+            0,
+            "consecutive errors should reset"
+        );
+        assert_eq!(rl.metrics().consecutive_errors, 0);
+
+        // During cooldown, check_request with fallback still returns UseFallback
+        let action = rl.check_request(true);
+        assert!(
+            matches!(action, RateLimitAction::UseFallback { .. }),
+            "during cooldown, check_request(true) should return UseFallback"
+        );
+    }
+
+    #[test]
+    fn fallback_lifecycle_cooldown_expires_then_primary_resumes() {
+        let rl = RateLimitCooldown::new();
+
+        // Trigger fallback with short cooldown
+        rl.enter_cooldown_with_fallback(CooldownReason::Overloaded);
+
+        // Override cooldown with a very short duration
+        {
+            let mut info = rl.cooldown_info.lock().expect("lock");
+            if let Some(ref mut ci) = *info {
+                ci.reset_at = Instant::now() + Duration::from_millis(50);
+            }
+        }
+
+        assert!(rl.is_in_cooldown());
+
+        // Wait for cooldown to expire
+        std::thread::sleep(Duration::from_millis(100));
+
+        // check_request should auto-exit cooldown and return Proceed
+        let action = rl.check_request(true);
+        assert_eq!(
+            action,
+            RateLimitAction::Proceed,
+            "after cooldown expires, should proceed with primary"
+        );
+        assert!(!rl.is_in_cooldown());
+    }
+
+    #[test]
+    fn mixed_429_529_only_529_triggers_fallback_metric() {
+        let rl = RateLimitCooldown::new();
+
+        // 2 x 429 (no fallback metric)
+        rl.record_429(None, true);
+        rl.record_429(None, true);
+        assert_eq!(
+            rl.metrics().fallbacks_triggered,
+            0,
+            "429 should not trigger fallback metric"
+        );
+
+        // Reset counters to test 529 path separately
+        rl.record_success();
+
+        // 3 x 529 triggers fallback
+        rl.record_529(None, true);
+        rl.record_529(None, true);
+        let action = rl.record_529(None, true);
+        assert!(matches!(action, RateLimitAction::UseFallback { .. }));
+        assert_eq!(
+            rl.metrics().fallbacks_triggered,
+            1,
+            "529 should trigger fallback metric"
+        );
+    }
+
+    #[test]
+    fn check_request_during_cooldown_without_fallback_rejects() {
+        let rl = RateLimitCooldown::new();
+
+        // Enter cooldown via 429s without fallback
+        rl.record_429(None, false);
+        rl.record_429(None, false);
+        let action = rl.record_429(None, false);
+        assert!(matches!(action, RateLimitAction::Reject { .. }));
+
+        // Subsequent checks without fallback → still reject
+        let action = rl.check_request(false);
+        assert!(matches!(action, RateLimitAction::Reject { .. }));
+
+        // Same cooldown, but NOW fallback is available → UseFallback
+        // (simulates DB config change while in cooldown)
+        let action = rl.check_request(true);
+        assert!(
+            matches!(action, RateLimitAction::UseFallback { .. }),
+            "adding fallback during cooldown should switch to UseFallback"
+        );
+    }
+
+    #[test]
+    fn state_reflects_fallback_triggered() {
+        let rl = RateLimitCooldown::new();
+
+        // 429-triggered cooldown (no fallback metric)
+        rl.record_429(None, true);
+        rl.record_429(None, true);
+        rl.record_429(None, true);
+
+        if let RateLimitState::Cooldown {
+            fallback_triggered, ..
+        } = rl.state()
+        {
+            assert!(
+                !fallback_triggered,
+                "429 cooldown should not set fallback_triggered"
+            );
+        } else {
+            panic!("expected cooldown state");
+        }
+
+        // Reset
+        rl.exit_cooldown();
+
+        // 529-triggered fallback cooldown
+        rl.record_529(None, true);
+        rl.record_529(None, true);
+        rl.record_529(None, true);
+
+        if let RateLimitState::Cooldown {
+            fallback_triggered, ..
+        } = rl.state()
+        {
+            assert!(
+                fallback_triggered,
+                "529 fallback cooldown should set fallback_triggered"
+            );
+        } else {
+            panic!("expected cooldown state");
+        }
+    }
+
+    #[test]
+    fn multiple_fallback_cycles() {
+        let rl = RateLimitCooldown::new();
+
+        // First fallback cycle
+        rl.record_529(None, true);
+        rl.record_529(None, true);
+        rl.record_529(None, true);
+        assert_eq!(rl.metrics().fallbacks_triggered, 1);
+
+        // Simulate cooldown expiry
+        rl.exit_cooldown();
+        rl.record_success();
+
+        // Second fallback cycle
+        rl.record_529(None, true);
+        rl.record_529(None, true);
+        let action = rl.record_529(None, true);
+        assert!(matches!(action, RateLimitAction::UseFallback { .. }));
+        assert_eq!(
+            rl.metrics().fallbacks_triggered,
+            2,
+            "second cycle should increment fallbacks"
+        );
+        assert_eq!(
+            rl.metrics().total_529_errors,
+            6,
+            "total 529 errors accumulated"
+        );
     }
 }
