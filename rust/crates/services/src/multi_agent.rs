@@ -371,7 +371,7 @@ pub enum LeaseClaimResult {
     },
 }
 
-fn clamp_ttl_sec(ttl_sec: i64) -> i64 {
+pub(crate) fn clamp_ttl_sec(ttl_sec: i64) -> i64 {
     ttl_sec.clamp(30, 86_400)
 }
 
@@ -690,5 +690,49 @@ impl TaskLeaseService for UnconfiguredTaskLeaseService {
         _ttl_sec: i64,
     ) -> Result<Option<TaskLeaseView>, String> {
         Err("task lease service not configured".to_string())
+    }
+}
+
+#[cfg(test)]
+mod unit_tests {
+    use super::*;
+
+    #[test]
+    fn task_lease_hold_cache_records_and_releases() {
+        let c = TaskLeaseHoldCache::default();
+        c.record_hold("a1", "t1");
+        c.record_hold("a1", "t2");
+        let s = c.held_task_ids_for_agent("a1");
+        assert!(s.contains("t1") && s.contains("t2"));
+        c.release_hold("a1", "t1");
+        let s2 = c.held_task_ids_for_agent("a1");
+        assert!(!s2.contains("t1") && s2.contains("t2"));
+    }
+
+    #[test]
+    fn clamp_ttl_sec_bounds() {
+        assert_eq!(clamp_ttl_sec(10), 30);
+        assert_eq!(clamp_ttl_sec(60), 60);
+        assert_eq!(clamp_ttl_sec(200_000), 86_400);
+    }
+
+    #[tokio::test]
+    async fn unconfigured_edge_registry_errors() {
+        let s = UnconfiguredEdgeRegistryService;
+        let r = s
+            .register_or_update("u", "e1", "hdr", None, None, None)
+            .await;
+        assert!(r.is_err());
+        let h = s.heartbeat("u", "e1", "hdr").await;
+        assert!(h.is_err());
+    }
+
+    #[tokio::test]
+    async fn unconfigured_task_lease_errors() {
+        let s = UnconfiguredTaskLeaseService;
+        assert!(s
+            .try_claim_lease("u", "t", "a", "e", 60)
+            .await
+            .is_err());
     }
 }

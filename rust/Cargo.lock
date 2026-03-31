@@ -2853,6 +2853,7 @@ dependencies = [
  "bcrypt",
  "chrono",
  "dirs",
+ "dotenvy",
  "fernet",
  "flate2",
  "jsonwebtoken",

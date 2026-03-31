@@ -21,6 +21,7 @@
      - 5.5.2 [Lightweight edge executor](#552-lightweight-edge-executor)
      - 5.5.3 [CLI registry and heartbeat environment](#553-cli-registry-and-heartbeat-environment)
 6. [Edge-Cloud State Model](#6-edge-cloud-state-model)
+   - 6.2.1 [Runtime sync adapters (implemented)](#621-runtime-sync-adapters-implemented)
 7. [MatrixOne-Native Acceleration](#7-matrixone-native-acceleration)
 8. [Multi-Agent Coordination Protocol](#8-multi-agent-coordination-protocol)
 9. [Task Leasing & Distributed Execution](#9-task-leasing--distributed-execution)
@@ -180,7 +181,7 @@ Clean ──write──▶ Dirty ──push──▶ Syncing ──ok──▶ C
 ```
 
 **Five sync domains**: Learning, Events, Tasks, Templates, Preferences  
-**Transport**: MatrixOneTransport (currently wired for Learning only)
+**Transport**: [`MatrixOneTransport`](../../rust/crates/runtime/src/sync_adapters.rs) for **Learning, Tasks, Templates, Preferences**; **Events** use the ingestion pipeline instead of orchestrator push/pull (see §6.2.1).
 
 ### 3.3 Production Readiness Assessment
 
@@ -194,9 +195,9 @@ Clean ──write──▶ Dirty ──push──▶ Syncing ──ok──▶ C
 | Stall/error detection | ✅ Production | Intent drift, name stall, error budgets, circuit breaker |
 | Code intelligence (tree-sitter) | ✅ Production | 10 AST tools, 8 languages, 44 tests |
 | Git operations (gix) | ✅ Production | Pure-Rust, 46 tests, no binary dependency |
-| Task orchestrator | ⚠️ Moderate | Checkpoint/resume works; no concurrent edit safety |
-| Sync adapters (Event/Task) | ❌ Stub | Return errors on export/merge |
-| Multi-agent coordination | ❌ Design only | Fan-out/pipeline patterns documented but not wired |
+| Task orchestrator | ⚠️ Moderate | Checkpoint/resume works; Phase 3 adds **lease-backed** ownership for concurrent agents (not full RunEngine) |
+| Sync adapters (all five domains) | ✅ Production | [`runtime::sync_adapters`](../../rust/crates/runtime/src/sync_adapters.rs): Events via ingestion side-channel; Tasks lease-filtered export; Templates pull-only; Preferences bidirectional |
+| Multi-agent coordination | ⚠️ Partial | **Registry + task leases + `TaskAdapter`** shipped; fan-out / pipeline / adversarial patterns still design-stage (Phase 4) |
 | Durable long-running tasks | ❌ Design only | AgentRun record exists; RunEngine not wired |
 
 ### 3.4 Architectural Debt: Layer Violations
@@ -243,11 +244,12 @@ The graph is correct (no cycles), but `mo-agent` being the **only crate that can
 |---|-----|-----------|----------------|--------|
 | G1 | **Durable agent runs** | durable-agent-runs.md: full RunEngine, AsyncToolRegistry, multi-day workflows | AgentRun record exists; RunEngine not wired to ChatLoop | Cannot run tasks spanning hours/days |
 | G2 | **Multi-agent orchestration** | agents-and-orchestration.md: Fan-Out/Fan-In, Pipeline, Adversarial Review | Basic delegation skill exists; coordination patterns incomplete | Cannot run agent teams |
-| G3 | **Task leasing & ownership** | Not designed | TaskRecord has `user_id` but no `agent_id` ownership, no lease TTL | Multiple agents can't claim tasks safely |
+| G3 | **Task leasing & ownership** | §9 / Phase 3 | `task_leases` + `agent_tasks.agent_id`, HTTP lease APIs, [`DatabaseTaskLeaseService`](../../rust/crates/services/src/multi_agent.rs) (transaction + `FOR UPDATE`) | **Largely addressed**; remaining: git worktree isolation, richer orchestration UX |
 | G4 | **Distributed plan execution** | plans/cloud-edge-redesign-v2.md: PlanState with CRDT merge | Plan events logged; no distributed executor | Plans can't span multiple agents |
-| G5 | **EventAdapter sync** | sync_engine.rs: DomainAdapter trait | Stub: returns errors on export | Events don't sync through unified engine |
-| G6 | **TaskAdapter sync** | sync_engine.rs: DomainAdapter trait | Stub: returns errors on export | Tasks don't sync through unified engine |
+| G5 | **EventAdapter vs sync engine** | sync_engine.rs: `DomainAdapter` | **Implemented**: [`EventAdapter`](../../rust/crates/runtime/src/sync_adapters.rs) uses dedicated ingestion (`export_delta` → `None`; `export_full` intentionally unsupported) | Events do not ride `SyncOrchestrator` push/pull — by design they use `IngestionSender` |
+| G6 | **TaskAdapter sync** | sync_engine.rs: `DomainAdapter` | **Implemented**: [`TaskAdapter`](../../rust/crates/runtime/src/sync_adapters.rs) exports **dirty ∩ leased** tasks; [`push_tasks_pack_held_mysql`](../../rust/crates/services/src/multi_agent.rs) enforces holder on push | Remaining gap is product/UX (RunEngine, long-running tasks), not the adapter stub |
 | G7 | **Cross-agent learning merge** | state_sync.rs: observation-count-wins merge | Single-writer assumption; no 3-way merge | Multiple agents writing creates conflicts |
+| G8 | **Dual cognitive loops (Phase 0)** | One headless cloud runtime | `mo-agent` [`chat_stream.rs`](../../rust/crates/mo-agent/src/mo_agent/chat_stream.rs) (~3.1k lines) **and** [`bridge_inprocess.rs`](../../rust/crates/runtime/src/turn/bridge_inprocess.rs) both run multi-turn LLM loops | Blocks a single thin-client story; duplicates stall/token/schema logic unless consolidated |
 
 ### 4.2 Design Docs That Outpace Implementation
 
@@ -264,7 +266,7 @@ The graph is correct (no cycles), but `mo-agent` being the **only crate that can
 - **Phase 0 progress (v1.4.3)**: `plan_decompose` and `sync_adapters` live in **`mo-agent-runtime`**; **`resolve_active_llm_model`** lives in **`mo-agent-services`**; headless **`tool_request`** / edge callback assembly is implemented in `chat_stream`. Remaining: move **`chat_stream`** loop + **`ReplState`** sync/pool/ingestion to server `AppState`.
 - **Local-first journal**: Append-only JSONL is the correct foundation. Fast, crash-safe, auditable.
 - **Sync envelope state machine**: Clean→Dirty→Syncing→Conflict is correct. Extend, don't replace.
-- **DomainAdapter trait**: The trait signature is well-designed. Fill in stub implementations.
+- **DomainAdapter trait**: The trait signature is well-designed. **Learning, Events, Tasks, Templates, and Preferences** now have real [`runtime::sync_adapters`](../../rust/crates/runtime/src/sync_adapters.rs) implementations (see §6.2.1); residual “stub” language in older sections is obsolete for those domains.
 - **FallbackSelector pattern**: TF-IDF fast path + LLM verification is the right hybrid. Extend with learned context.
 - **LearnedContext flow**: Entity/pattern/calibration/tool hints as "priors, not hard requirements" is correct.
 
@@ -713,11 +715,23 @@ pub trait DomainAdapter: Send + Sync {
 }
 ```
 
-**What must change**: EventAdapter and TaskAdapter need real implementations instead of stubs.
+**Current state (2026)**: [`EventAdapter`](../../rust/crates/runtime/src/sync_adapters.rs) and [`TaskAdapter`](../../rust/crates/runtime/src/sync_adapters.rs) are **implemented** — not stubs. The narrative below in §6.3–6.4 remains useful as design rationale (ingestion side-channel for events).
+
+#### 6.2.1 Runtime sync adapters (implemented)
+
+| Adapter | `SyncDomain` | Behavior | Code |
+|---------|--------------|----------|------|
+| **LearningAdapter** | Learning | Versioned push/pull via `StateSyncService` / `MatrixOneTransport` | [`sync_adapters.rs`](../../rust/crates/runtime/src/sync_adapters.rs) |
+| **EventAdapter** | Events | Write path: `IngestionSender` + worker — `export_delta` returns `None`, `has_dirty_data` is `false` so the orchestrator does not double-push | [`EventAdapter`](../../rust/crates/runtime/src/sync_adapters.rs) |
+| **TaskAdapter** | Tasks | Local mirror; **export** only tasks that are both dirty and present in [`TaskLeaseHoldCache`](../../rust/crates/services/src/multi_agent.rs); **pull** merges server pack into mirror; server enforces lease on [`push_tasks_pack_held_mysql`](../../rust/crates/services/src/multi_agent.rs) | [`TaskAdapter`](../../rust/crates/runtime/src/sync_adapters.rs) |
+| **TemplateAdapter** | Templates | Pull-only cache of plan templates; cloud authoritative; push disabled (`PushTrigger::Never`) | [`TemplateAdapter`](../../rust/crates/runtime/src/sync_adapters.rs) |
+| **PreferenceAdapter** | Preferences | Bidirectional key/value sync over `user_preferences` via `MatrixOneTransport` | [`PreferenceAdapter`](../../rust/crates/runtime/src/sync_adapters.rs) |
+
+**Tests**: `services` crate includes [`multi_agent` unit tests](../../rust/crates/services/src/multi_agent.rs) (hold cache, TTL clamp, unconfigured services) and **ignored** MySQL integration tests in [`tests/multi_agent_integration.rs`](../../rust/crates/services/tests/multi_agent_integration.rs) (`MO_AGENT_MULTI_AGENT_IT=1`, `cargo test -p mo-agent-services multi_agent_integration -- --ignored`).
 
 ### 6.3 EventAdapter: Wire to Batch Ingestion
 
-The EventAdapter currently returns errors. It should delegate to the existing `IngestionSender`:
+[`EventAdapter`](../../rust/crates/runtime/src/sync_adapters.rs) follows this model: it does **not** serialize event batches through `SyncOrchestrator`; live ingestion uses the existing `IngestionSender`. The snippet below is the intended shape (and matches the implementation’s “no delta export” policy):
 
 ```rust
 // TARGET: EventAdapter delegates to existing batch ingestion pipeline
@@ -1732,14 +1746,14 @@ mo-agent Orchestrator
 
 ### Phase 1: Complete Single-Agent Foundation
 
-**Status**: 🔄 **In progress** (2026-03-31).
+**Status**: ✅ **Sync-domain adapters complete** (2026); Phase 0 extraction (§Phase 0 table) still open.
 
-**Goal**: Fill stub implementations, make all 5 sync domains operational. Depends on Phase 0 (LearningAdapter lives in **`runtime::sync_adapters`**, sharing `services` sync traits).
+**Goal**: Operational `DomainAdapter` implementations for all sync domains. LearningAdapter lives in **`runtime::sync_adapters`**, sharing `services` sync traits.
 
 | Task | Status | Effort | Dependency |
 |------|--------|--------|------------|
 | Wire EventAdapter to IngestionSender (`EventAdapter` in `runtime`, sender from CLI/server state) | ✅ Done | Small | [`EventAdapter::new(sender)`](../../rust/crates/runtime/src/sync_adapters.rs) + [`IngestionSender::disconnected()`](../../rust/crates/services/src/event_ingestion.rs) for tests |
-| Implement TaskAdapter with lease protocol | ❌ Deferred | Medium | **Phase 3** (`task_leases` + [`TaskService`](../../rust/crates/services/src/task_orchestrator.rs)); stub adapter removed — no fake `DomainAdapter` |
+| Implement TaskAdapter with lease protocol | ✅ Done | Medium | [`TaskAdapter`](../../rust/crates/runtime/src/sync_adapters.rs) + Phase 3 DB (`task_leases`, [`push_tasks_pack_held_mysql`](../../rust/crates/services/src/multi_agent.rs)); exports only leased+dirty tasks |
 | Implement TemplateAdapter (read-only pull) | ✅ Done | Small | [`TemplateAdapter`](../../rust/crates/runtime/src/sync_adapters.rs) + [`StateSyncService::pull_plan_templates_pack`](../../rust/crates/services/src/state_sync.rs) + [`MatrixOneTransport`](../../rust/crates/runtime/src/sync_adapters.rs) `Templates` pull; [`PushTrigger::Never`](../../rust/crates/services/src/sync_engine.rs) for templates |
 | Implement PreferenceAdapter (bidirectional) | ✅ Done | Small | [`PreferenceAdapter`](../../rust/crates/runtime/src/sync_adapters.rs) + `MatrixOneTransport` preferences push/pull via `user_preferences` |
 
@@ -1757,17 +1771,20 @@ mo-agent Orchestrator
 
 ### Phase 3: Agent Registry & Task Leasing
 
+**Status**: ✅ **Implemented** (server + HTTP + sync); optional hardening (git worktree isolation, broader integration tests in CI) remains.
+
 **Goal**: Multiple agents can safely claim and execute tasks without conflicts.
 
-**Implemented (server)**: `edge_agent_registry` + `task_leases` tables (see `storage.rs`), `POST /agents/edge` and `POST /agents/edge/heartbeat`, task lease APIs under `/tasks/{task_id}/lease/*`, `agent_tasks.agent_id`, `StateSyncService::pull_tasks_pack` / `push_tasks_pack_held`, [`TaskAdapter`](../../rust/crates/runtime/src/sync_adapters.rs) + [`MatrixOneTransport`](../../rust/crates/runtime/src/sync_adapters.rs) for [`SyncDomain::Tasks`](../../rust/crates/services/src/sync_engine.rs). Optional git worktree path is stored on registration (`worktree_path` on `edge_agent_registry`). Edge clients set `MO_EDGE_AGENT_ID` (and header `x-mo-edge-id`) consistently with lease claim bodies.
+**Implemented**: `edge_agent_registry` + `task_leases` ([`storage.rs`](../../rust/crates/services/src/storage.rs)), [`DatabaseEdgeRegistryService`](../../rust/crates/services/src/multi_agent.rs) / [`DatabaseTaskLeaseService`](../../rust/crates/services/src/multi_agent.rs), `POST /agents/edge` and `POST /agents/edge/heartbeat`, task lease routes under `/tasks/{task_id}/lease/*`, `agent_tasks.agent_id`, `StateSyncService::pull_tasks_pack` / `push_tasks_pack_held`, [`TaskAdapter`](../../rust/crates/runtime/src/sync_adapters.rs) + [`MatrixOneTransport`](../../rust/crates/runtime/src/sync_adapters.rs) for [`SyncDomain::Tasks`](../../rust/crates/services/src/sync_engine.rs). CLI chat uses `MO_EDGE_EXECUTOR_ID` (or `edge-{uuid}`) for `edge_executor_id` / `X-Mo-Edge-Id`; [`MatrixCloudRuntime`](../../rust/crates/runtime/src/matrix_cloud_runtime.rs) may use `MO_EDGE_AGENT_ID` for the same logical role in server-side wiring — keep **one** id per process consistent with lease claim bodies.
 
-| Task | Effort | Dependency |
-|------|--------|------------|
-| Create `agent_registry` table + heartbeat endpoint | Medium | Phase 2 |
-| Create `task_leases` table + atomic CAS claim (MatrixOne-native) | Medium | Phase 2 |
-| Add `agent_id` to TaskRecord ownership model | Small | agent_registry |
-| Git worktree isolation for multi-agent edge | Medium | agent_registry |
-| Lease-aware TaskAdapter sync | Medium | task_leases |
+| Task | Status | Notes |
+|------|--------|--------|
+| `edge_agent_registry` + heartbeat | ✅ Done | Typed bodies in `mo-thin-client`; see [`edge_callback_handlers`](../../rust/crates/runtime/src/server/edge_callback_handlers.rs) |
+| `task_leases` + transactional claim | ✅ Done | `SELECT … FOR UPDATE` on `agent_tasks` + `task_leases` in [`try_claim_lease`](../../rust/crates/services/src/multi_agent.rs) |
+| `agent_id` on `TaskRecord` / `agent_tasks` | ✅ Done | Nullable `agent_id` column + lease-driven updates |
+| Lease-aware TaskAdapter + held push | ✅ Done | [`TaskAdapter`](../../rust/crates/runtime/src/sync_adapters.rs), [`push_tasks_pack_held_mysql`](../../rust/crates/services/src/multi_agent.rs) |
+| Git worktree isolation for multi-agent edge | ❌ Open | Still future work |
+| Automated DB tests in default CI | ⚠️ Partial | Unit tests always on; MySQL scenarios: [`tests/multi_agent_integration.rs`](../../rust/crates/services/tests/multi_agent_integration.rs) (`--ignored`) |
 
 ### Phase 4: Distributed Plan Execution
 
@@ -1824,6 +1841,7 @@ mo-agent Orchestrator
 | Session restore | `services/src/session_restore.rs` | HybridRestoreService, RestoredSession | services ✅ |
 | Session journal | `services/src/session_journal.rs` | JournalWriter, append-only JSONL | services ✅ |
 | Task orchestrator | `services/src/task_orchestrator.rs` | TaskRecord, TaskCheckpoint, SubtaskPlan | services ✅ |
+| Phase 3 registry & leases | `services/src/multi_agent.rs` | `DatabaseEdgeRegistryService`, `DatabaseTaskLeaseService`, `push_tasks_pack_held_mysql`, `TaskLeaseHoldCache` | services ✅ |
 | Sync adapters | `runtime/src/sync_adapters.rs` | LearningAdapter, EventAdapter (ingestion), TemplateAdapter (pull cache), PreferenceAdapter (bidirectional), TaskAdapter (lease-filtered tasks) | runtime ✅ |
 | Active LLM resolution | `services/src/models.rs` | `resolve_active_llm_model`, `ResolvedActiveLlmModel` | services ✅ |
 | Tool selector | `runtime/src/tool_selector.rs` | LearnedContext, FallbackSelector, confidence gate | runtime ✅ |
