@@ -1,0 +1,695 @@
+//! Concrete [`RunLifecycleService`] backed by [`ServerAgenticLoopHost`].
+//!
+//! This module replaces `UnconfiguredRunLifecycleService` with a real implementation
+//! that runs multi-turn agentic loops on the server via the shared
+//! [`run_agentic_loop_with_host`] cognitive pipeline.
+//!
+//! Run state is held in-memory (`DashMap`) for low-latency queries; events are
+//! buffered per-run so `stream_run()` can replay from any offset.
+
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::Instant;
+
+use async_trait::async_trait;
+use axum::http::StatusCode;
+use axum::Json;
+use serde_json::{Map, Value, json};
+use tokio::sync::{Mutex as TokioMutex, RwLock};
+use uuid::Uuid;
+
+use mo_agent_core::{ErrorResponse, SharedPool, error_response};
+use mo_agent_services::runs::{
+    CancelRunRecord, ChatRequestData, ChatRunRecord, ChatStreamRecord, RunLifecycleService,
+    RunListRecord, RunStatusRecord,
+};
+
+use crate::turn::agentic_loop_host::{AgenticLoopState, run_agentic_loop_with_host};
+use crate::pipeline::step_recorder::StepRecorder;
+use crate::FernetTokenEncryptor;
+use crate::MatrixOneSettings;
+
+use super::server_loop_host::ServerAgenticLoopHostBuilder;
+
+// ─── Run State ──────────────────────────────────────────────────────────────
+
+/// Status of a single agentic run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RunStatus {
+    Running,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+impl RunStatus {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Running => "running",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+        }
+    }
+}
+
+/// Per-run state held in the lifecycle service.
+struct RunState {
+    run_id: String,
+    session_id: String,
+    user_id: String,
+    status: RunStatus,
+    events: Vec<Value>,
+    cancel_flag: Arc<AtomicBool>,
+    #[allow(dead_code)]
+    started_at: Instant,
+    waiting_for: Option<String>,
+}
+
+// ─── Service ────────────────────────────────────────────────────────────────
+
+/// Production [`RunLifecycleService`] that executes agentic loops via
+/// [`ServerAgenticLoopHost`].
+pub struct AgenticRunLifecycleService {
+    /// In-memory run store (run_id → state).
+    runs: RwLock<HashMap<String, RunState>>,
+    /// LLM resolution dependencies.
+    matrixone: MatrixOneSettings,
+    encryptor: Arc<FernetTokenEncryptor>,
+    shared_pool: Option<SharedPool>,
+    /// Edge callback ledger shared with the API server.
+    edge_callback_ledger: Arc<TokioMutex<HashMap<String, Value>>>,
+}
+
+impl AgenticRunLifecycleService {
+    pub fn new(
+        matrixone: MatrixOneSettings,
+        encryptor: Arc<FernetTokenEncryptor>,
+        edge_callback_ledger: Arc<TokioMutex<HashMap<String, Value>>>,
+    ) -> Self {
+        Self {
+            runs: RwLock::new(HashMap::new()),
+            matrixone,
+            encryptor,
+            shared_pool: None,
+            edge_callback_ledger,
+        }
+    }
+
+    pub fn with_pool(mut self, pool: SharedPool) -> Self {
+        self.shared_pool = Some(pool);
+        self
+    }
+
+    /// Build a [`ServerAgenticLoopHost`] for a single run.
+    fn build_host(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        request: &ChatRequestData,
+        edge_tools: Vec<Value>,
+        edge_profile: Map<String, Value>,
+    ) -> super::server_loop_host::ServerAgenticLoopHost {
+        let mut builder = ServerAgenticLoopHostBuilder::new(
+            self.matrixone.clone(),
+            self.encryptor.clone(),
+            user_id.to_string(),
+            session_id.to_string(),
+        )
+        .with_model(request.model.clone())
+        .with_edge_tools(edge_tools)
+        .with_edge_profile(edge_profile)
+        .with_edge_callback_ledger(self.edge_callback_ledger.clone());
+
+        if let Some(pool) = &self.shared_pool {
+            builder = builder.with_pool(pool.clone());
+        }
+        builder.build()
+    }
+
+    /// Build the initial [`AgenticLoopState`] from a chat request.
+    fn build_initial_state(
+        &self,
+        request: &ChatRequestData,
+        session_id: &str,
+        run_id: &str,
+    ) -> AgenticLoopState {
+        use crate::pipeline::step_protocol::InMemoryIdempotencyCache;
+        use crate::semantic_dedup::SemanticDedup;
+        use crate::turn::turn_guard::TurnGuard;
+
+        let user_message = json!({
+            "role": "user",
+            "content": request.message,
+        });
+
+        let max_turns = request.max_candidates.max(1) as usize;
+
+        AgenticLoopState {
+            messages: vec![user_message],
+            tool_results: Vec::new(),
+            current_session_id: Some(session_id.to_string()),
+            current_run_id: Some(run_id.to_string()),
+            final_text: String::new(),
+            total_prompt: 0,
+            total_completion: 0,
+            total_tool_calls: 0,
+            has_any_usage: false,
+            max_turns,
+            remaining_turns: max_turns,
+            turn_guard: TurnGuard::new(),
+            restricted_tools: std::collections::HashSet::new(),
+            step_recorder: StepRecorder::new(session_id, run_id),
+            idempotency_cache: InMemoryIdempotencyCache::new(),
+            semantic_dedup: SemanticDedup::new(0.75),
+            turn_sigs: Vec::new(),
+            turn_tool_names: Vec::new(),
+            stall_events: Vec::new(),
+            intent_tool_turns: Vec::new(),
+            verdict_events: Vec::new(),
+            last_heavy_checkpoint: None,
+            tool_call_records: Vec::new(),
+            forced_factual_retry: false,
+            explain_turns: Vec::new(),
+            first_ttft_ms: None,
+            all_tools_used: std::collections::HashSet::new(),
+            first_selection_report: None,
+            first_budget_pressure: 0.0,
+            first_context_assembly_ms: None,
+            first_memoria_ms: None,
+            first_selector_ms: None,
+            first_selector_strategy: None,
+            selector_tokens_in: 0,
+            selector_tokens_out: 0,
+            all_selected_skills: Vec::new(),
+            message: request.message.clone(),
+            recent_tools: Vec::new(),
+            api: mo_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap(),
+            api_token: String::new(),
+        }
+    }
+
+    /// Extract edge tools from the request context, or provide empty defaults.
+    fn extract_edge_tools(request: &ChatRequestData) -> Vec<Value> {
+        request
+            .context
+            .as_ref()
+            .and_then(|ctx| ctx.get("edge_tools"))
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Extract edge profile from the request context, or provide empty defaults.
+    fn extract_edge_profile(request: &ChatRequestData) -> Map<String, Value> {
+        request
+            .context
+            .as_ref()
+            .and_then(|ctx| ctx.get("edge_profile"))
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Collect run events into SSE-compatible format.
+    fn format_run_events(events: &[Value]) -> Vec<Value> {
+        events
+            .iter()
+            .enumerate()
+            .map(|(i, ev)| {
+                let mut out = ev.clone();
+                if let Some(obj) = out.as_object_mut() {
+                    obj.insert("index".to_string(), json!(i));
+                }
+                out
+            })
+            .collect()
+    }
+
+    fn status_record(run: &RunState) -> RunStatusRecord {
+        RunStatusRecord {
+            run_id: run.run_id.clone(),
+            session_id: run.session_id.clone(),
+            status: run.status.as_str().to_string(),
+            waiting_for: run.waiting_for.clone(),
+            events_count: run.events.len() as i64,
+        }
+    }
+}
+
+#[async_trait]
+impl RunLifecycleService for AgenticRunLifecycleService {
+    /// Create a run (background mode): spawns the agentic loop in a task, returns immediately.
+    async fn create_run(
+        &self,
+        user_id: String,
+        request: ChatRequestData,
+    ) -> Result<ChatRunRecord, (StatusCode, Json<ErrorResponse>)> {
+        let run_id = Uuid::new_v4().to_string();
+        let session_id = request
+            .session_id
+            .clone()
+            .unwrap_or_else(|| Uuid::new_v4().to_string());
+
+        let cancel_flag = Arc::new(AtomicBool::new(false));
+        let run_state = RunState {
+            run_id: run_id.clone(),
+            session_id: session_id.clone(),
+            user_id: user_id.clone(),
+            status: RunStatus::Running,
+            events: vec![json!({"event_type": "run_started", "data": {}})],
+            cancel_flag: cancel_flag.clone(),
+            started_at: Instant::now(),
+            waiting_for: None,
+        };
+        self.runs.write().await.insert(run_id.clone(), run_state);
+
+        Ok(ChatRunRecord {
+            session_id,
+            run_id,
+            status: "running".to_string(),
+            explain: if request.explain {
+                Some(json!({"mode": "background"}))
+            } else {
+                None
+            },
+        })
+    }
+
+    /// Stream chat (synchronous mode): runs the full agentic loop, returns all events.
+    async fn stream_chat(
+        &self,
+        user_id: String,
+        request: ChatRequestData,
+    ) -> Result<ChatStreamRecord, (StatusCode, Json<ErrorResponse>)> {
+        let run_id = Uuid::new_v4().to_string();
+        let session_id = request
+            .session_id
+            .clone()
+            .unwrap_or_else(|| Uuid::new_v4().to_string());
+
+        let edge_tools = Self::extract_edge_tools(&request);
+        let edge_profile = Self::extract_edge_profile(&request);
+
+        // If no edge tools are provided, return a minimal "no tools" response.
+        // The client (CLI thin-client) is expected to provide edge_tools in context.
+        let mut host = self.build_host(&user_id, &session_id, &request, edge_tools, edge_profile);
+        let mut state = self.build_initial_state(&request, &session_id, &run_id);
+
+        // Run the agentic loop
+        let mut all_events = vec![json!({"event_type": "run_started", "data": {}})];
+
+        match run_agentic_loop_with_host(&mut host, &mut state).await {
+            Ok(_outcome) => {
+                // Collect all events emitted by the host during the loop
+                all_events.extend(host.take_emitted_events());
+
+                // Emit final text_done event
+                if !state.final_text.is_empty() {
+                    all_events.push(json!({
+                        "event_type": "text_done",
+                        "data": {
+                            "full_text": state.final_text,
+                        }
+                    }));
+                }
+
+                all_events.push(json!({
+                    "event_type": "run_finished",
+                    "data": {
+                        "prompt_tokens": state.total_prompt,
+                        "completion_tokens": state.total_completion,
+                        "tool_call_count": state.total_tool_calls,
+                    }
+                }));
+            }
+            Err(err) => {
+                all_events.extend(host.take_emitted_events());
+                all_events.push(json!({
+                    "event_type": "run_error",
+                    "data": {"error": err}
+                }));
+            }
+        }
+
+        Ok(ChatStreamRecord {
+            session_id,
+            run_id,
+            events: all_events,
+        })
+    }
+
+    async fn get_run_status(
+        &self,
+        run_id: String,
+        user_id: String,
+    ) -> Result<RunStatusRecord, (StatusCode, Json<ErrorResponse>)> {
+        let runs = self.runs.read().await;
+        let run = runs.get(&run_id).ok_or_else(|| {
+            error_response(StatusCode::NOT_FOUND, "Run not found")
+        })?;
+        if run.user_id != user_id {
+            return Err(error_response(StatusCode::FORBIDDEN, "Access denied"));
+        }
+        Ok(Self::status_record(run))
+    }
+
+    async fn stream_run(
+        &self,
+        run_id: String,
+        user_id: String,
+        last_index: u32,
+    ) -> Result<Vec<Value>, (StatusCode, Json<ErrorResponse>)> {
+        let runs = self.runs.read().await;
+        let run = runs.get(&run_id).ok_or_else(|| {
+            error_response(StatusCode::NOT_FOUND, "Run not found")
+        })?;
+        if run.user_id != user_id {
+            return Err(error_response(StatusCode::FORBIDDEN, "Access denied"));
+        }
+        let offset = last_index as usize;
+        let events = if offset < run.events.len() {
+            Self::format_run_events(&run.events[offset..])
+        } else {
+            Vec::new()
+        };
+        Ok(events)
+    }
+
+    async fn cancel_run(
+        &self,
+        run_id: String,
+        user_id: String,
+    ) -> Result<CancelRunRecord, (StatusCode, Json<ErrorResponse>)> {
+        let mut runs = self.runs.write().await;
+        let run = runs.get_mut(&run_id).ok_or_else(|| {
+            error_response(StatusCode::NOT_FOUND, "Run not found")
+        })?;
+        if run.user_id != user_id {
+            return Err(error_response(StatusCode::FORBIDDEN, "Access denied"));
+        }
+        if run.status == RunStatus::Running {
+            run.cancel_flag.store(true, Ordering::SeqCst);
+            run.status = RunStatus::Cancelled;
+            run.events.push(json!({
+                "event_type": "run_finished",
+                "data": {"cancelled": true}
+            }));
+        }
+        Ok(CancelRunRecord {
+            run_id,
+            status: run.status.as_str().to_string(),
+        })
+    }
+
+    async fn list_runs(
+        &self,
+        user_id: String,
+        limit: u32,
+        offset: u32,
+    ) -> Result<RunListRecord, (StatusCode, Json<ErrorResponse>)> {
+        let runs = self.runs.read().await;
+        let all: Vec<RunStatusRecord> = runs
+            .values()
+            .filter(|run| run.user_id == user_id)
+            .map(Self::status_record)
+            .collect();
+        let total = all.len() as i64;
+        let start = (offset as usize).min(all.len());
+        let end = (start + limit as usize).min(all.len());
+        let page = all[start..end].to_vec();
+        Ok(RunListRecord {
+            runs: page,
+            total,
+            limit,
+            offset,
+        })
+    }
+}
+
+
+// ─── Tests ──────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Unwrap a `Result<T, (StatusCode, Json<ErrorResponse>)>` in tests.
+    fn ok<T>(result: Result<T, (StatusCode, Json<ErrorResponse>)>) -> T {
+        match result {
+            Ok(v) => v,
+            Err((status, body)) => panic!("expected Ok, got {status}: {}", body.0.detail),
+        }
+    }
+
+    /// Unwrap the error side.
+    fn err<T>(result: Result<T, (StatusCode, Json<ErrorResponse>)>) -> (StatusCode, Json<ErrorResponse>) {
+        match result {
+            Ok(_) => panic!("expected Err, got Ok"),
+            Err(e) => e,
+        }
+    }
+
+    fn test_settings() -> MatrixOneSettings {
+        MatrixOneSettings {
+            host: "localhost".to_string(),
+            port: 6001,
+            user: "test".to_string(),
+            password: "test".to_string(),
+            database: "test".to_string(),
+        }
+    }
+
+    fn test_encryptor() -> Arc<FernetTokenEncryptor> {
+        Arc::new(FernetTokenEncryptor::new("cJ8pxr3t6iJmSYqe6wD7vu2rN_C3ovGUxkC5H3NXFNY=").unwrap())
+    }
+
+    fn test_service() -> AgenticRunLifecycleService {
+        AgenticRunLifecycleService::new(
+            test_settings(),
+            test_encryptor(),
+            Arc::new(TokioMutex::new(HashMap::new())),
+        )
+    }
+
+    fn test_request(message: &str) -> ChatRequestData {
+        ChatRequestData {
+            message: message.to_string(),
+            session_id: None,
+            agent_id: None,
+            model: None,
+            context: None,
+            max_candidates: 5,
+            explain: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn create_run_returns_running_status() {
+        let svc = test_service();
+        let result = ok(svc.create_run("user-1".into(), test_request("hello")).await);
+        assert_eq!(result.status, "running");
+        assert!(!result.run_id.is_empty());
+        assert!(!result.session_id.is_empty());
+    }
+
+    #[tokio::test]
+    async fn create_run_uses_provided_session_id() {
+        let svc = test_service();
+        let mut req = test_request("hi");
+        req.session_id = Some("custom-session".into());
+        let result = ok(svc.create_run("user-1".into(), req).await);
+        assert_eq!(result.session_id, "custom-session");
+    }
+
+    #[tokio::test]
+    async fn create_run_explain_mode_returns_metadata() {
+        let svc = test_service();
+        let mut req = test_request("explain me");
+        req.explain = true;
+        let result = ok(svc.create_run("user-1".into(), req).await);
+        assert!(result.explain.is_some());
+        assert_eq!(result.explain.unwrap()["mode"], "background");
+    }
+
+    #[tokio::test]
+    async fn get_run_status_returns_state() {
+        let svc = test_service();
+        let run = ok(svc.create_run("user-1".into(), test_request("hello")).await);
+        let status = ok(svc.get_run_status(run.run_id.clone(), "user-1".into()).await);
+        assert_eq!(status.run_id, run.run_id);
+        assert_eq!(status.status, "running");
+        assert_eq!(status.events_count, 1);
+    }
+
+    #[tokio::test]
+    async fn get_run_status_not_found() {
+        let svc = test_service();
+        let e = err(svc.get_run_status("nonexistent".into(), "user-1".into()).await);
+        assert_eq!(e.0, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn get_run_status_forbidden_for_other_user() {
+        let svc = test_service();
+        let run = ok(svc.create_run("user-1".into(), test_request("hello")).await);
+        let e = err(svc.get_run_status(run.run_id, "user-2".into()).await);
+        assert_eq!(e.0, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn cancel_run_sets_cancelled_status() {
+        let svc = test_service();
+        let run = ok(svc.create_run("user-1".into(), test_request("task")).await);
+        let result = ok(svc.cancel_run(run.run_id.clone(), "user-1".into()).await);
+        assert_eq!(result.status, "cancelled");
+        let status = ok(svc.get_run_status(run.run_id, "user-1".into()).await);
+        assert_eq!(status.status, "cancelled");
+        assert_eq!(status.events_count, 2);
+    }
+
+    #[tokio::test]
+    async fn cancel_run_idempotent_for_non_running() {
+        let svc = test_service();
+        let run = ok(svc.create_run("user-1".into(), test_request("task")).await);
+        ok(svc.cancel_run(run.run_id.clone(), "user-1".into()).await);
+        let result = ok(svc.cancel_run(run.run_id.clone(), "user-1".into()).await);
+        assert_eq!(result.status, "cancelled");
+    }
+
+    #[tokio::test]
+    async fn cancel_run_forbidden_for_other_user() {
+        let svc = test_service();
+        let run = ok(svc.create_run("user-1".into(), test_request("task")).await);
+        let e = err(svc.cancel_run(run.run_id, "user-2".into()).await);
+        assert_eq!(e.0, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn stream_run_returns_events_from_offset() {
+        let svc = test_service();
+        let run = ok(svc.create_run("user-1".into(), test_request("hello")).await);
+        let events = ok(svc.stream_run(run.run_id.clone(), "user-1".into(), 0).await);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["event_type"], "run_started");
+        let events = ok(svc.stream_run(run.run_id, "user-1".into(), 1).await);
+        assert!(events.is_empty());
+    }
+
+    #[tokio::test]
+    async fn stream_run_not_found() {
+        let svc = test_service();
+        let e = err(svc.stream_run("nonexistent".into(), "user-1".into(), 0).await);
+        assert_eq!(e.0, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn list_runs_empty_initially() {
+        let svc = test_service();
+        let result = ok(svc.list_runs("user-1".into(), 10, 0).await);
+        assert_eq!(result.total, 0);
+        assert!(result.runs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_runs_filters_by_user() {
+        let svc = test_service();
+        ok(svc.create_run("user-1".into(), test_request("a")).await);
+        ok(svc.create_run("user-2".into(), test_request("b")).await);
+        ok(svc.create_run("user-1".into(), test_request("c")).await);
+        let result = ok(svc.list_runs("user-1".into(), 10, 0).await);
+        assert_eq!(result.total, 2);
+        assert!(result.runs.iter().all(|r| r.status == "running"));
+    }
+
+    #[tokio::test]
+    async fn list_runs_pagination() {
+        let svc = test_service();
+        for i in 0..5 {
+            ok(svc.create_run("user-1".into(), test_request(&format!("msg {i}"))).await);
+        }
+        let page1 = ok(svc.list_runs("user-1".into(), 2, 0).await);
+        assert_eq!(page1.runs.len(), 2);
+        assert_eq!(page1.total, 5);
+        let page2 = ok(svc.list_runs("user-1".into(), 2, 2).await);
+        assert_eq!(page2.runs.len(), 2);
+        let page3 = ok(svc.list_runs("user-1".into(), 2, 4).await);
+        assert_eq!(page3.runs.len(), 1);
+    }
+
+    #[test]
+    fn format_run_events_adds_index() {
+        let events = vec![
+            json!({"event_type": "run_started"}),
+            json!({"event_type": "text_delta", "data": {"chunk": "hi"}}),
+        ];
+        let formatted = AgenticRunLifecycleService::format_run_events(&events);
+        assert_eq!(formatted[0]["index"], 0);
+        assert_eq!(formatted[1]["index"], 1);
+        assert_eq!(formatted[1]["event_type"], "text_delta");
+    }
+
+    #[test]
+    fn extract_edge_tools_from_context() {
+        let mut ctx = serde_json::Map::new();
+        ctx.insert("edge_tools".to_string(), json!([{"function": {"name": "bash"}}]));
+        let req = ChatRequestData {
+            message: "hi".into(), session_id: None, agent_id: None,
+            model: None, context: Some(ctx), max_candidates: 5, explain: false,
+        };
+        let tools = AgenticRunLifecycleService::extract_edge_tools(&req);
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["function"]["name"], "bash");
+    }
+
+    #[test]
+    fn extract_edge_tools_empty_when_no_context() {
+        assert!(AgenticRunLifecycleService::extract_edge_tools(&test_request("hi")).is_empty());
+    }
+
+    #[test]
+    fn extract_edge_profile_from_context() {
+        let mut ctx = serde_json::Map::new();
+        ctx.insert("edge_profile".to_string(), json!({"cwd": "/tmp", "git_branch": "main"}));
+        let req = ChatRequestData {
+            message: "hi".into(), session_id: None, agent_id: None,
+            model: None, context: Some(ctx), max_candidates: 5, explain: false,
+        };
+        let profile = AgenticRunLifecycleService::extract_edge_profile(&req);
+        assert_eq!(profile["cwd"], "/tmp");
+        assert_eq!(profile["git_branch"], "main");
+    }
+
+    #[test]
+    fn build_initial_state_sets_user_message() {
+        let svc = test_service();
+        let req = test_request("write a test");
+        let state = svc.build_initial_state(&req, "sess-1", "run-1");
+        assert_eq!(state.messages.len(), 1);
+        assert_eq!(state.messages[0]["role"], "user");
+        assert_eq!(state.messages[0]["content"], "write a test");
+        assert_eq!(state.current_session_id, Some("sess-1".to_string()));
+        assert_eq!(state.current_run_id, Some("run-1".to_string()));
+        assert_eq!(state.max_turns, 5);
+        assert_eq!(state.remaining_turns, 5);
+        assert_eq!(state.message, "write a test");
+    }
+
+    #[test]
+    fn build_initial_state_clamps_max_turns() {
+        let svc = test_service();
+        let mut req = test_request("go");
+        req.max_candidates = 0;
+        let state = svc.build_initial_state(&req, "s", "r");
+        assert_eq!(state.max_turns, 1);
+    }
+
+    #[test]
+    fn run_status_as_str() {
+        assert_eq!(RunStatus::Running.as_str(), "running");
+        assert_eq!(RunStatus::Completed.as_str(), "completed");
+        assert_eq!(RunStatus::Failed.as_str(), "failed");
+        assert_eq!(RunStatus::Cancelled.as_str(), "cancelled");
+    }
+}

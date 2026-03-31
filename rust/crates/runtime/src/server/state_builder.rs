@@ -172,6 +172,17 @@ pub(super) async fn build_server_state(
     };
     let state = state.with_memoria_config(settings.memoria_base_url, settings.memoria_master_key);
 
+    // Wire run lifecycle service: uses ServerAgenticLoopHost for agentic loops.
+    let run_encryptor =
+        Arc::new(FernetTokenEncryptor::from_env().map_err(Box::<dyn std::error::Error>::from)?);
+    let run_lifecycle = super::run_lifecycle::AgenticRunLifecycleService::new(
+        settings.matrixone.clone(),
+        run_encryptor,
+        state.edge_callback_ledger.clone(),
+    )
+    .with_pool(shared_pool.clone());
+    let state = state.with_run_lifecycle_service(Arc::new(run_lifecycle));
+
     let user_id = std::env::var("MO_USER_ID").unwrap_or_else(|_| "local".to_string());
     let matrix_rt = Arc::new(crate::matrix_cloud_runtime::MatrixCloudRuntime::attach(
         shared_pool.clone(),
