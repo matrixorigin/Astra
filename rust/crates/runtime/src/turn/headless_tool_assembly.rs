@@ -4,7 +4,7 @@
 
 use std::collections::HashMap;
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use super::tool_result_semantics::tool_dedup_signature;
 
@@ -38,6 +38,12 @@ pub trait EdgeToolRoundRow {
     fn tool_name(&self) -> &str;
     fn tool_args(&self) -> &Value;
     fn tool_output(&self) -> &str;
+
+    /// OpenAI `tool_calls[].id` when synthesizing from an edge-only round (§5.5).
+    /// Default `edge-{index}`; rows with a server `request_id` should override.
+    fn assistant_tool_call_id(&self, index: usize) -> String {
+        format!("edge-{index}")
+    }
 }
 
 /// Take output for a server-emitted `tool_call` by matching dedup signature against the edge round.
@@ -87,6 +93,70 @@ pub fn tool_calls_for_stall_guard<T: EdgeToolRoundRow>(
             })
             .collect()
     }
+}
+
+fn openai_tool_call_entries_from_server(tool_calls: &[Value]) -> Vec<Value> {
+    tool_calls
+        .iter()
+        .map(|tc| {
+            let id = tc.get("id").and_then(|v| v.as_str()).unwrap_or("");
+            let name = tc.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            let args = tc.get("arguments").cloned().unwrap_or(json!({}));
+            json!({
+                "id": id,
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "arguments": serde_json::to_string(&args)
+                        .unwrap_or_else(|_| r#"{"error":"argument serialization failed"}"#.to_string()),
+                }
+            })
+        })
+        .collect()
+}
+
+/// Assistant message with `content: null` and OpenAI-shaped `tool_calls` (server list or edge round).
+pub fn openai_assistant_with_tool_calls_message<T: EdgeToolRoundRow>(
+    server_tool_calls: &[Value],
+    edge_round: &[T],
+    reasoning_content: &str,
+) -> Value {
+    let mut msg = if !server_tool_calls.is_empty() {
+        json!({
+            "role": "assistant",
+            "content": Value::Null,
+            "tool_calls": openai_tool_call_entries_from_server(server_tool_calls),
+        })
+    } else {
+        let items: Vec<Value> = edge_round
+            .iter()
+            .enumerate()
+            .map(|(i, e)| {
+                let id = e.assistant_tool_call_id(i);
+                json!({
+                    "id": id,
+                    "type": "function",
+                    "function": {
+                        "name": e.tool_name(),
+                        "arguments": serde_json::to_string(e.tool_args())
+                            .unwrap_or_else(|_| "{}".to_string()),
+                    }
+                })
+            })
+            .collect();
+        json!({
+            "role": "assistant",
+            "content": Value::Null,
+            "tool_calls": items,
+        })
+    };
+    if !reasoning_content.is_empty() && let Some(obj) = msg.as_object_mut() {
+        obj.insert(
+            "reasoning_content".to_string(),
+            Value::String(reasoning_content.to_string()),
+        );
+    }
+    msg
 }
 
 #[cfg(test)]
@@ -236,5 +306,92 @@ mod tests {
                 "missing cacheable tool: {expected}"
             );
         }
+    }
+
+    #[test]
+    fn openai_assistant_message_from_server_tool_calls() {
+        let server = vec![json!({
+            "id": "call_1",
+            "name": "read_file",
+            "arguments": {"path": "a.rs"}
+        })];
+        let msg = openai_assistant_with_tool_calls_message(&server, &[] as &[Row], "");
+        assert_eq!(msg["role"], "assistant");
+        assert!(msg["content"].is_null());
+        let tc = msg["tool_calls"].as_array().unwrap();
+        assert_eq!(tc.len(), 1);
+        assert_eq!(tc[0]["id"], "call_1");
+        assert_eq!(tc[0]["type"], "function");
+        assert_eq!(tc[0]["function"]["name"], "read_file");
+        let args: Value = serde_json::from_str(tc[0]["function"]["arguments"].as_str().unwrap())
+            .unwrap();
+        assert_eq!(args["path"], "a.rs");
+    }
+
+    #[test]
+    fn openai_assistant_message_from_edge_round_default_ids() {
+        let edge = vec![Row {
+            tool: "grep".into(),
+            args: json!({"pattern": "x"}),
+            output: "".into(),
+        }];
+        let msg = openai_assistant_with_tool_calls_message(&[], &edge, "");
+        let tc = msg["tool_calls"].as_array().unwrap();
+        assert_eq!(tc[0]["id"], "edge-0");
+        assert_eq!(tc[0]["function"]["name"], "grep");
+    }
+
+    #[derive(Debug)]
+    struct RowWithRequestId {
+        tool: String,
+        args: Value,
+        output: String,
+        request_id: String,
+    }
+
+    impl EdgeToolRoundRow for RowWithRequestId {
+        fn tool_name(&self) -> &str {
+            &self.tool
+        }
+        fn tool_args(&self) -> &Value {
+            &self.args
+        }
+        fn tool_output(&self) -> &str {
+            &self.output
+        }
+        fn assistant_tool_call_id(&self, index: usize) -> String {
+            if self.request_id.is_empty() {
+                format!("edge-{index}")
+            } else {
+                self.request_id.clone()
+            }
+        }
+    }
+
+    #[test]
+    fn openai_assistant_message_edge_uses_request_id_when_set() {
+        let edge = vec![RowWithRequestId {
+            tool: "bash".into(),
+            args: json!({"command": "true"}),
+            output: "ok".into(),
+            request_id: "req-abc".into(),
+        }];
+        let msg = openai_assistant_with_tool_calls_message(&[], &edge, "");
+        let tc = msg["tool_calls"].as_array().unwrap();
+        assert_eq!(tc[0]["id"], "req-abc");
+    }
+
+    #[test]
+    fn openai_assistant_message_includes_reasoning_content_when_non_empty() {
+        let msg = openai_assistant_with_tool_calls_message(
+            &[],
+            &[Row {
+                tool: "t".into(),
+                args: json!({}),
+                output: "".into(),
+            }],
+            "think",
+        );
+        assert_eq!(msg["reasoning_content"], "think");
     }
 }

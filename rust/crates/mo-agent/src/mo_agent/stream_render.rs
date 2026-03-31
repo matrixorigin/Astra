@@ -41,6 +41,13 @@ impl mo_agent_runtime::turn::headless_tool_assembly::EdgeToolRoundRow for EdgeTo
     fn tool_output(&self) -> &str {
         &self.output
     }
+    fn assistant_tool_call_id(&self, index: usize) -> String {
+        if self.request_id.is_empty() {
+            format!("edge-{index}")
+        } else {
+            self.request_id.clone()
+        }
+    }
 }
 
 /// When set, SSE `tool_request` / `approval_required` are handled and posted to the cloud API.

@@ -28,7 +28,8 @@ use mo_agent_runtime::{
     turn::edge_prompt_context::{detect_project_languages, detect_workspace_context, make_args_preview},
     turn::tool_schema_prune::{filter_tool_schemas_by_excluded_names, pin_invoked_tool_schemas},
     turn::headless_tool_assembly::{
-        take_edge_output_for_tool_call, tool_calls_for_stall_guard, CACHEABLE_TOOLS,
+        openai_assistant_with_tool_calls_message, take_edge_output_for_tool_call,
+        tool_calls_for_stall_guard, CACHEABLE_TOOLS,
     },
     turn::tool_result_semantics::{is_resource_limit_output, is_tool_error, tool_dedup_signature},
 };
@@ -651,51 +652,11 @@ pub(crate) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
         // Assemble tool results from SSE `tool_request` only — legacy inline execution removed.
         tool_results = Vec::new();
 
-        let mut assistant_tc_msg = if !turn_result.tool_calls.is_empty() {
-            serde_json::json!({
-                "role": "assistant",
-                "content": null,
-                "tool_calls": turn_result.tool_calls.iter().map(|tc| {
-                    let id = tc.get("id").and_then(|v| v.as_str()).unwrap_or("");
-                    let name = tc.get("name").and_then(|v| v.as_str()).unwrap_or("");
-                    let args = tc.get("arguments").cloned().unwrap_or(serde_json::json!({}));
-                    serde_json::json!({
-                        "id": id,
-                        "type": "function",
-                        "function": {
-                            "name": name,
-                            "arguments": serde_json::to_string(&args)
-                                .unwrap_or_else(|_| r#"{"error":"argument serialization failed"}"#.to_string()),
-                        }
-                    })
-                }).collect::<Vec<_>>(),
-            })
-        } else {
-            serde_json::json!({
-                "role": "assistant",
-                "content": null,
-                "tool_calls": turn_result.edge_tool_round.iter().enumerate().map(|(i, e)| {
-                    let id = if e.request_id.is_empty() {
-                        format!("edge-{i}")
-                    } else {
-                        e.request_id.clone()
-                    };
-                    serde_json::json!({
-                        "id": id,
-                        "type": "function",
-                        "function": {
-                            "name": e.tool,
-                            "arguments": serde_json::to_string(&e.args)
-                                .unwrap_or_else(|_| "{}".to_string()),
-                        }
-                    })
-                }).collect::<Vec<_>>(),
-            })
-        };
-        if !turn_result.reasoning_content.is_empty() {
-            assistant_tc_msg["reasoning_content"] =
-                serde_json::Value::String(turn_result.reasoning_content.clone());
-        }
+        let assistant_tc_msg = openai_assistant_with_tool_calls_message(
+            &turn_result.tool_calls,
+            &turn_result.edge_tool_round,
+            &turn_result.reasoning_content,
+        );
         messages.push(assistant_tc_msg);
 
         enum RoundToolItem {
