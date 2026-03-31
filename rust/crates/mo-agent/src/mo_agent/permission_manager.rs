@@ -1,5 +1,7 @@
 use super::*;
 
+use mo_agent_runtime::turn::cloud_approval_policy::{cloud_gated_tool_kind, CloudGatedToolKind};
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum SideEffect {
     Read,
@@ -72,16 +74,16 @@ impl PermissionManager {
     }
 
     fn classify(name: &str) -> SideEffect {
-        match name {
-            "shell" | "bash" | "run_command" | "exec" => SideEffect::Execute,
-            "write_file" | "edit_file" | "create_file" | "str_replace" => SideEffect::Write,
-            _ => SideEffect::Read,
+        match cloud_gated_tool_kind(name) {
+            Some(CloudGatedToolKind::Execute) => SideEffect::Execute,
+            Some(CloudGatedToolKind::Write) => SideEffect::Write,
+            None => SideEffect::Read,
         }
     }
 
     fn is_dangerous(name: &str, args: &serde_json::Value) -> bool {
-        let cmd_str = match name {
-            "shell" | "bash" | "run_command" | "exec" => {
+        let cmd_str = match cloud_gated_tool_kind(name) {
+            Some(CloudGatedToolKind::Execute) => {
                 args.get("command").and_then(|v| v.as_str()).unwrap_or("")
             }
             _ => return false,
@@ -316,20 +318,6 @@ mod tests {
             PermissionManager::classify("github_ci_status"),
             SideEffect::Read
         );
-    }
-
-    /// Contract: cloud `approval_required` gate ([`mo_agent_runtime::turn::cloud_approval_policy`])
-    /// must stay aligned with how the CLI labels side effects (Write / Execute vs Read).
-    #[test]
-    fn cloud_approval_required_tools_are_not_classified_as_read() {
-        use mo_agent_runtime::turn::cloud_approval_policy::CLOUD_APPROVAL_REQUIRED_TOOLS;
-        for &name in CLOUD_APPROVAL_REQUIRED_TOOLS {
-            assert_ne!(
-                PermissionManager::classify(name),
-                SideEffect::Read,
-                "{name}: cloud bridge gates this tool — CLI must classify as Write or Execute"
-            );
-        }
     }
 
     // ── is_dangerous ──────────────────────────────────────────────────────────

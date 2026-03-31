@@ -1735,7 +1735,7 @@ mo-agent Orchestrator
 | Extract active LLM row query + decrypt from `bridge_inprocess` | ✅ Done | — | **`services::resolve_active_llm_model`** (`models.rs`); bridge calls it. |
 | Extract shared edge prompt context + tool schema prune to `runtime` | ✅ Done (slice 1) | Small | **`runtime/src/turn/edge_prompt_context.rs`** (`detect_workspace_context`, `detect_project_languages`, `make_args_preview`); **`runtime/src/turn/tool_schema_prune.rs`** (`prune_tool_schemas`) — used by CLI `chat_stream` + `bridge_inprocess` |
 | Extract tool result semantics (error / resource-limit / dedup key) | ✅ Done (slice 2) | Small | **`runtime/src/turn/tool_result_semantics.rs`** — `is_tool_error`, `is_resource_limit_output`, `normalize_tool_arguments`, `tool_dedup_signature`; CLI `chat_stream` + `stream_render` |
-| Extract cloud approval tool-name policy (sec. 5.5 gate list) | ✅ Done (slice 3) | Small | **`runtime/src/turn/cloud_approval_policy.rs`** — `CLOUD_APPROVAL_REQUIRED_TOOLS`, `edge_tool_requires_cloud_approval`; `cloud_tool_delivery`; CLI contract test in `permission_manager` |
+| Extract cloud approval tool-name policy (sec. 5.5 gate list) | ✅ Done (slice 3) | Small | **`runtime/src/turn/cloud_approval_policy.rs`** — `cloud_gated_tool_kind` / execute+required lists; `cloud_tool_delivery`; CLI `PermissionManager::classify` + `is_dangerous` delegate here |
 | Implement tool execution callback protocol (cloud → edge) | ✅ Core path | Medium | §5.5 `/tools/result`, `tool_request` SSE; `chat_stream` **does not** re-execute tools for that path. |
 | Add `edge_executor_id` to chat turn protocol | ✅ | Small | Thin client + §5.5.2 light edge helpers. |
 | Move `SyncOrchestrator` construction from `ReplState` to `AppState` | ❌ Open | Small | Still wired in CLI `main.rs` for REPL session |
@@ -1852,7 +1852,7 @@ mo-agent Orchestrator
 | Edge prompt context | `runtime/src/turn/edge_prompt_context.rs` | Shared `edge_profile.workspace` + file-context helpers (CLI `chat_stream` + future clients) | runtime ✅ |
 | Tool schema prune | `runtime/src/turn/tool_schema_prune.rs` | Tiered OpenAI-style tool definition pruning | runtime ✅ |
 | Tool result semantics | `runtime/src/turn/tool_result_semantics.rs` | `is_tool_error`, `is_resource_limit_output`, `tool_dedup_signature` (sec. 5.5 SSE vs `tool_call`) | runtime ✅ |
-| Cloud approval policy | `runtime/src/turn/cloud_approval_policy.rs` | `edge_tool_requires_cloud_approval` / `CLOUD_APPROVAL_REQUIRED_TOOLS` (sec. 5.5 before `tool_request`) | runtime ✅ |
+| Cloud approval policy | `runtime/src/turn/cloud_approval_policy.rs` | `CLOUD_APPROVAL_REQUIRED_TOOLS`, `CLOUD_APPROVAL_EXECUTE_TOOLS`, `cloud_gated_tool_kind` → CLI classify + cloud gate (sec. 5.5) | runtime ✅ |
 | Bridge (HTTP) | `runtime/src/turn/bridge/mod.rs` | HttpChatTurnBridge, forwards to external service | runtime ✅ |
 | Chat stream | `mo-agent/src/mo_agent/chat_stream.rs` | Multi-turn loop, headless tool assembly (§5.5) | ⚠️ Core loop should move to runtime |
 | Plan decompose | `runtime/src/plan_decompose.rs` | Long-horizon planning, subtask generation | runtime ✅ |
