@@ -1,19 +1,16 @@
-use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
-
 use super::credentials::{CredentialsFile, Profile, load_credentials, profile_name};
 
-pub(crate) fn auth_headers(token: &str) -> Result<HeaderMap, String> {
-    let mut headers = HeaderMap::new();
-    headers.insert(
-        AUTHORIZATION,
-        HeaderValue::from_str(&format!("Bearer {token}")).map_err(|e| e.to_string())?,
-    );
-    headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-    Ok(headers)
+pub(crate) fn read_api_error(status: u16, body: &str) -> String {
+    format!("request failed ({status}): {}", compact_or_raw(body))
 }
 
-pub(crate) fn read_api_error(status: reqwest::StatusCode, body: &str) -> String {
-    format!("request failed ({}): {}", status, compact_or_raw(body))
+pub(crate) fn map_thin_err(e: mo_thin_client::ThinClientError) -> String {
+    match e {
+        mo_thin_client::ThinClientError::Api { status, body } => {
+            read_api_error(status.as_u16(), &body)
+        }
+        other => other.to_string(),
+    }
 }
 
 pub(crate) fn compact_or_raw(body: &str) -> String {
@@ -56,24 +53,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn auth_headers_sets_bearer() {
-        let headers = auth_headers("my-token").unwrap();
-        assert_eq!(
-            headers.get("authorization").unwrap().to_str().unwrap(),
-            "Bearer my-token"
-        );
-    }
-
-    #[test]
-    fn auth_headers_sets_content_type() {
-        let headers = auth_headers("tok").unwrap();
-        assert_eq!(
-            headers.get("content-type").unwrap().to_str().unwrap(),
-            "application/json"
-        );
-    }
-
-    #[test]
     fn compact_or_raw_valid_json() {
         let result = compact_or_raw("{\"a\": 1}");
         assert!(result.contains("\"a\""));
@@ -86,14 +65,13 @@ mod tests {
 
     #[test]
     fn read_api_error_includes_status_and_body() {
-        let err = read_api_error(reqwest::StatusCode::FORBIDDEN, "{\"detail\":\"denied\"}");
+        let err = read_api_error(403, "{\"detail\":\"denied\"}");
         assert!(err.contains("403"), "got: {err}");
         assert!(err.contains("denied"), "got: {err}");
     }
 
     #[test]
     fn get_profile_and_token_missing_profile() {
-        // Empty creds → no profile → error
         let result = get_profile_and_token(Some("nonexistent"));
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("no profile"));

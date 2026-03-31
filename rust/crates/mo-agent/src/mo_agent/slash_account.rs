@@ -3,8 +3,7 @@ use super::*;
 pub(super) async fn handle_account_command(
     cmd: &str,
     arg: &str,
-    client: &reqwest::Client,
-    base: &str,
+    api: &mo_thin_client::ThinClient,
     profile: Option<&str>,
 ) -> Result<(), String> {
     match cmd {
@@ -16,10 +15,10 @@ pub(super) async fn handle_account_command(
             let username = prompt_or("Username", None)?;
             let email = prompt_or("Email   ", None)?;
             let password = prompt_password_masked("Password", None)?;
-            match do_register(client, base, &username, &email, &password).await {
+            match do_register(api, &username, &email, &password).await {
                 Ok(_) => {
                     eprintln!("{}", "  \u{2713}  Registered! Logging in…".green());
-                    match do_login(client, base, profile, &username, &password).await {
+                    match do_login(api, profile, &username, &password).await {
                         Ok(_) => eprintln!("{}", "  \u{2713}  Logged in".green()),
                         Err(e) => {
                             eprintln!("{}", format!("  \u{2717}  Login failed: {}", e).red())
@@ -33,7 +32,7 @@ pub(super) async fn handle_account_command(
         "/login" => {
             let username = prompt_or("Username", None)?;
             let password = prompt_password_masked("Password", None)?;
-            match do_login(client, base, profile, &username, &password).await {
+            match do_login(api, profile, &username, &password).await {
                 Ok(_) => eprintln!("{}", "  \u{2713}  Logged in".green()),
                 Err(e) => eprintln!("{}", format!("  \u{2717}  Login failed: {}", e).red()),
             }
@@ -45,11 +44,8 @@ pub(super) async fn handle_account_command(
             if let Some(p) = creds.profiles.get(&pname).cloned()
                 && let Some(refresh) = p.refresh_token
             {
-                let _ = client
-                    .post(format!("{base}/auth/logout"))
-                    .header(CONTENT_TYPE, "application/json")
-                    .json(&serde_json::json!({ "refresh_token": refresh }))
-                    .send()
+                let _ = api
+                    .post_auth_logout_json(&serde_json::json!({ "refresh_token": refresh }))
                     .await;
             }
             if let Some(p) = creds.profiles.get_mut(&pname) {

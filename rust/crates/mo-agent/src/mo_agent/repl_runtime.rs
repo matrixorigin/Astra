@@ -1,11 +1,10 @@
 use super::*;
 
 pub(super) fn create_tool_selector(
-    client: &reqwest::Client,
-    base: &str,
+    api: &mo_thin_client::ThinClient,
     profile: Option<&str>,
 ) -> (Box<dyn tool_selector::ToolSelector>, PipelineModules) {
-    create_tool_selector_with_quality(client, base, profile, None, None)
+    create_tool_selector_with_quality(api, profile, None, None)
 }
 
 /// Shared pipeline learning modules — kept accessible for cross-session persistence.
@@ -24,8 +23,7 @@ pub(super) struct PipelineModules {
 }
 
 pub(super) fn create_tool_selector_with_quality(
-    client: &reqwest::Client,
-    base: &str,
+    api: &mo_thin_client::ThinClient,
     profile: Option<&str>,
     quality_tracker: Option<std::sync::Arc<std::sync::Mutex<tool_registry::ToolQualityTracker>>>,
     confidence_calibrator: Option<
@@ -124,7 +122,7 @@ pub(super) fn create_tool_selector_with_quality(
     let selector: Box<dyn tool_selector::ToolSelector> = match token {
         Some(tok) => {
             // Register skills with LLM selector so it can include them in selection
-            let llm = tool_selector::LlmToolSelector::new(client.clone(), base.to_string(), tok)
+            let llm = tool_selector::LlmToolSelector::new(api.clone(), tok.to_string())
                 .with_skills(skill_catalog);
             Box::new(tool_selector::FallbackSelector::new(
                 Box::new(llm),
@@ -140,18 +138,11 @@ pub(super) fn create_tool_selector_with_quality(
 /// Quick check whether the server has at least one LLM model configured.
 /// Returns `true` on network errors (optimistic — don't block startup).
 pub(super) async fn check_server_has_models(
-    client: &reqwest::Client,
-    base: &str,
+    api: &mo_thin_client::ThinClient,
     token: &str,
 ) -> bool {
-    let resp = match client
-        .get(format!("{base}/models"))
-        .headers(match auth_headers(token) {
-            Ok(h) => h,
-            Err(_) => return true,
-        })
-        .timeout(std::time::Duration::from_secs(3))
-        .send()
+    let resp = match api
+        .get_models_response_timeout(token, std::time::Duration::from_secs(3))
         .await
     {
         Ok(r) if r.status().is_success() => r,
@@ -173,21 +164,15 @@ pub(super) async fn check_server_has_models(
 /// Best-effort silent auth: validate existing token or try refresh.
 /// Never blocks or prompts — just ensures credentials are fresh if possible.
 /// Clears stale credentials when the server rejects them.
-pub(super) async fn try_silent_auth(client: &reqwest::Client, base: &str, profile: Option<&str>) {
+pub(super) async fn try_silent_auth(api: &mo_thin_client::ThinClient, profile: Option<&str>) {
     let creds = load_credentials();
     let name = profile_name(profile, &creds);
     let prof = creds.profiles.get(&name);
 
     // Try existing access_token
     if let Some(token) = prof.and_then(|p| p.access_token.as_ref()) {
-        match client
-            .get(format!("{base}/auth/me"))
-            .headers(match auth_headers(token) {
-                Ok(h) => h,
-                Err(_) => return,
-            })
-            .timeout(std::time::Duration::from_secs(3))
-            .send()
+        match api
+            .get_auth_me_text_timeout(token, std::time::Duration::from_secs(3))
             .await
         {
             Ok(resp) if resp.status().is_success() => return,
@@ -202,7 +187,7 @@ pub(super) async fn try_silent_auth(client: &reqwest::Client, base: &str, profil
 
     // Try refresh_token first
     if let Some(refresh) = prof.and_then(|p| p.refresh_token.as_ref())
-        && try_refresh_token(client, base, profile, refresh)
+        && try_refresh_token(api, profile, refresh)
             .await
             .is_ok()
     {
@@ -222,23 +207,14 @@ pub(super) async fn try_silent_auth(client: &reqwest::Client, base: &str, profil
 
 /// Try to refresh an expired access token using the stored refresh_token.
 async fn try_refresh_token(
-    client: &reqwest::Client,
-    base: &str,
+    api: &mo_thin_client::ThinClient,
     profile: Option<&str>,
     refresh_token: &str,
 ) -> Result<(), String> {
-    let resp = client
-        .post(format!("{base}/auth/refresh"))
-        .header(CONTENT_TYPE, "application/json")
-        .json(&serde_json::json!({ "refresh_token": refresh_token }))
-        .send()
+    let body = api
+        .post_auth_refresh_json(&serde_json::json!({ "refresh_token": refresh_token }))
         .await
         .map_err(|e| e.to_string())?;
-    let status = resp.status();
-    let body = resp.text().await.map_err(|e| e.to_string())?;
-    if !status.is_success() {
-        return Err(format!("refresh failed: {status}"));
-    }
     let value: serde_json::Value = serde_json::from_str(&body).map_err(|e| e.to_string())?;
     let new_access = value
         .get("access_token")

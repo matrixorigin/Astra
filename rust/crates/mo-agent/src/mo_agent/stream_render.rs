@@ -129,7 +129,7 @@ impl StreamRenderState {
 /// Consume one /chat/turn SSE stream, render text deltas, collect tool_calls.
 /// When `quiet` is true, all terminal output is suppressed but result.full_text is still captured.
 pub(super) async fn consume_turn_sse(
-    resp: reqwest::Response,
+    resp: mo_thin_client::HttpResponse,
     render_md: bool,
     term_width: usize,
     quiet: bool,

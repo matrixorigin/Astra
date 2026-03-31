@@ -2,8 +2,7 @@ use super::*;
 
 pub(super) async fn handle_skill_command(
     arg: &str,
-    client: &reqwest::Client,
-    base: &str,
+    api: &mo_thin_client::ThinClient,
     state: &mut ReplState,
     token: Option<&str>,
 ) -> Result<(), String> {
@@ -20,58 +19,41 @@ pub(super) async fn handle_skill_command(
                 eprintln!("{}", "  Not logged in. Use /login.".yellow());
                 return Ok(());
             };
-            let resp = client
-                .get(format!("{base}/skills"))
-                .headers(auth_headers(tok)?)
-                .query(&[("limit", "50"), ("offset", "0")])
-                .send()
+            let body = api
+                .get_skills_query_text(tok, &[("limit", "50".into()), ("offset", "0".into())])
                 .await
-                .map_err(|e| e.to_string())?;
-            let status = resp.status();
-            let body = resp.text().await.map_err(|e| e.to_string())?;
-            if !status.is_success() {
-                eprintln!(
-                    "{}",
-                    format!(
-                        "  \u{2717} API Error ({}): {}",
-                        status,
-                        compact_or_raw(&body)
-                    )
-                    .red()
-                );
-            } else {
-                let value: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
-                let skills = value
-                    .as_array()
-                    .cloned()
-                    .or_else(|| value.get("skills").and_then(|v| v.as_array()).cloned())
-                    .unwrap_or_default();
-                eprintln!(
-                    "\n{}",
-                    format!("{:<30}  {:<10}  {}", "Name", "Version", "Description").bold()
-                );
-                eprintln!("{}", "\u{2500}".repeat(70).dim());
-                for s in &skills {
-                    let name = s
-                        .get("skill_name")
-                        .or_else(|| s.get("name"))
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("?");
-                    let version = s
-                        .get("skill_version")
-                        .or_else(|| s.get("version"))
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("?");
-                    let desc = s.get("description").and_then(|v| v.as_str()).unwrap_or("");
-                    let desc_s = if desc.len() > 40 {
-                        format!("{}\u{2026}", &desc[..40])
-                    } else {
-                        desc.to_string()
-                    };
-                    eprintln!("  {:<28}  {:<10}  {}", name.cyan(), version.dim(), desc_s);
-                }
-                eprintln!();
+                .map_err(map_thin_err)?;
+            let value: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
+            let skills = value
+                .as_array()
+                .cloned()
+                .or_else(|| value.get("skills").and_then(|v| v.as_array()).cloned())
+                .unwrap_or_default();
+            eprintln!(
+                "\n{}",
+                format!("{:<30}  {:<10}  {}", "Name", "Version", "Description").bold()
+            );
+            eprintln!("{}", "\u{2500}".repeat(70).dim());
+            for s in &skills {
+                let name = s
+                    .get("skill_name")
+                    .or_else(|| s.get("name"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("?");
+                let version = s
+                    .get("skill_version")
+                    .or_else(|| s.get("version"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("?");
+                let desc = s.get("description").and_then(|v| v.as_str()).unwrap_or("");
+                let desc_s = if desc.len() > 40 {
+                    format!("{}\u{2026}", &desc[..40])
+                } else {
+                    desc.to_string()
+                };
+                eprintln!("  {:<28}  {:<10}  {}", name.cyan(), version.dim(), desc_s);
             }
+            eprintln!();
         }
 
         "new" => {
@@ -183,20 +165,13 @@ if __name__ == "__main__":
                         serde_json::from_str(json_args).unwrap_or(serde_json::Value::String(json_args.to_string()))
                     }
                 });
-                match client
-                    .post(format!("{base}/skills/test"))
-                    .headers(auth_headers(tok)?)
-                    .json(&payload)
-                    .send()
-                    .await
-                {
-                    Ok(r) if r.status().is_success() => {
-                        let body = r.text().await.unwrap_or_default();
+                match api.post_skills_test_json(tok, &payload).await {
+                    Ok(body) => {
                         eprintln!("  {}", "\u{2713} API test result:".green());
                         eprintln!("  {body}");
                         true
                     }
-                    _ => false,
+                    Err(_) => false,
                 }
             } else {
                 false
@@ -323,14 +298,8 @@ if __name__ == "__main__":
             );
             // Try API first
             let api_ok = if let Some(tok) = token {
-                match client
-                    .get(format!("{base}/skills/status"))
-                    .headers(auth_headers(tok)?)
-                    .send()
-                    .await
-                {
-                    Ok(r) if r.status().is_success() => {
-                        let body = r.text().await.unwrap_or_default();
+                match api.get_skills_status_query_text(tok, &[]).await {
+                    Ok(body) => {
                         let value: serde_json::Value =
                             serde_json::from_str(&body).unwrap_or_default();
                         let skills = value

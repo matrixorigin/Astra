@@ -33,6 +33,8 @@
 //! - **Level 2 (Instructions)**: Full SKILL.md content loaded on skill invocation
 //! - **Level 3 (Resources)**: Templates, scripts, references loaded on demand
 
+#![allow(dead_code)]
+
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 

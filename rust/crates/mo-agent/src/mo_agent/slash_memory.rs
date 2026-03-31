@@ -3,8 +3,7 @@ use super::*;
 pub(super) async fn handle_memory_domain_command(
     cmd: &str,
     arg: &str,
-    client: &reqwest::Client,
-    base: &str,
+    api: &mo_thin_client::ThinClient,
     state: &mut ReplState,
     token: Option<&str>,
 ) -> Result<(), String> {
@@ -23,12 +22,7 @@ pub(super) async fn handle_memory_domain_command(
                         "query": sub_arg,
                         "top_k": 10,
                     });
-                    match client
-                        .post(format!("{base}/memory/search"))
-                        .headers(auth_headers(tok)?)
-                        .json(&payload)
-                        .send()
-                        .await
+                    match api.post_memory_search_json(tok, &payload).await
                     {
                         Ok(r) if r.status().is_success() => {
                             let body = r.text().await.unwrap_or_default();
@@ -81,12 +75,7 @@ pub(super) async fn handle_memory_domain_command(
                         "query": "user preferences knowledge plans tasks",
                         "top_k": 20,
                     });
-                    match client
-                        .post(format!("{base}/memory/search"))
-                        .headers(auth_headers(tok)?)
-                        .json(&payload)
-                        .send()
-                        .await
+                    match api.post_memory_search_json(tok, &payload).await
                     {
                         Ok(r) if r.status().is_success() => {
                             let body = r.text().await.unwrap_or_default();
@@ -205,12 +194,7 @@ pub(super) async fn handle_memory_domain_command(
                         prompts::memory_proto::NS_PLAN,
                         "current goals",
                     );
-                    match client
-                        .post(format!("{base}/memory/search"))
-                        .headers(auth_headers(tok)?)
-                        .json(&payload)
-                        .send()
-                        .await
+                    match api.post_memory_search_json(tok, &payload).await
                     {
                         Ok(r) if r.status().is_success() => {
                             let body = r.text().await.unwrap_or_default();
@@ -262,12 +246,7 @@ pub(super) async fn handle_memory_domain_command(
                         state.turn,
                         prompts::memory_proto::SRC_USER,
                     );
-                    match client
-                        .post(format!("{base}/memory/store"))
-                        .headers(auth_headers(tok)?)
-                        .json(&entry.to_store_payload_with_meta(&meta))
-                        .send()
-                        .await
+                    match api.post_memory_store_json(tok, &entry.to_store_payload_with_meta(&meta)).await
                     {
                         Ok(r) if r.status().is_success() => {
                             eprintln!("  {} Plan saved to memory.", "✓".green());
@@ -280,12 +259,7 @@ pub(super) async fn handle_memory_domain_command(
                     let payload = prompts::memory_proto::MemoryEntry::purge_payload(
                         prompts::memory_proto::NS_PLAN,
                     );
-                    match client
-                        .post(format!("{base}/memory/purge"))
-                        .headers(auth_headers(tok)?)
-                        .json(&payload)
-                        .send()
-                        .await
+                    match api.post_memory_purge_json(tok, &payload).await
                     {
                         Ok(r) if r.status().is_success() => {
                             eprintln!("  {} Plan cleared.", "✓".green());
@@ -319,12 +293,7 @@ pub(super) async fn handle_memory_domain_command(
                         sub_arg,
                     );
                     let store_payload = entry.to_store_payload();
-                    let _ = client
-                        .post(format!("{base}/memory/store"))
-                        .headers(auth_headers(tok)?)
-                        .json(&store_payload)
-                        .send()
-                        .await;
+                    let _ = api.post_memory_store_json(tok, &store_payload).await;
 
                     // Call LLM via /chat/turn SSE endpoint
                     eprintln!("  {} Decomposing goal into subtasks...", "⋯".dim());
@@ -339,13 +308,7 @@ pub(super) async fn handle_memory_domain_command(
                         "edge_tools": [],  // No tools needed for plan generation
                     });
 
-                    match client
-                        .post(format!("{base}/chat/turn"))
-                        .headers(auth_headers(tok)?)
-                        .header("Accept", "text/event-stream")
-                        .json(&payload)
-                        .send()
-                        .await
+                    match api.post_chat_turn(tok, &payload).await
                     {
                         Ok(resp) if resp.status().is_success() => {
                             // Collect text from SSE stream
@@ -451,12 +414,7 @@ pub(super) async fn handle_memory_domain_command(
                         "session_id": state.session_id.clone(),
                     });
 
-                    let resp = client
-                        .post(format!("{base}/chat/turn"))
-                        .bearer_auth(tok)
-                        .json(&payload)
-                        .send()
-                        .await;
+                    let resp = api.post_chat_turn(tok, &payload).await;
 
                     match resp {
                         Ok(r) if r.status().is_success() => {
@@ -1150,12 +1108,7 @@ pub(super) async fn handle_memory_domain_command(
                         "session_id": state.session_id.clone(),
                     });
 
-                    let resp = client
-                        .post(format!("{base}/chat/turn"))
-                        .bearer_auth(tok)
-                        .json(&payload)
-                        .send()
-                        .await;
+                    let resp = api.post_chat_turn(tok, &payload).await;
 
                     match resp {
                         Ok(r) if r.status().is_success() => {
@@ -1268,13 +1221,7 @@ pub(super) async fn handle_memory_domain_command(
                         "session_id": state.session_id.clone(),
                     });
 
-                    match client
-                        .post(format!("{base}/chat/turn"))
-                        .bearer_auth(tok)
-                        .json(&payload)
-                        .send()
-                        .await
-                    {
+                    match api.post_chat_turn(tok, &payload).await {
                         Ok(r) if r.status().is_success() => {
                             let mut full_text = String::new();
                             let mut stream = r.bytes_stream();
@@ -1357,8 +1304,7 @@ pub async fn handle_plan_mode_input(
     input: String,
     token: Option<&str>,
     state: &mut ReplState,
-    client: &reqwest::Client,
-    base: &str,
+    api: &mo_thin_client::ThinClient,
 ) -> Result<(), String> {
     use super::plan_decompose::{
         ClarificationAnswer, PendingClarifications, PlanEntryChoice, PlanModeState,
@@ -1434,12 +1380,7 @@ pub async fn handle_plan_mode_input(
             "session_id": state.session_id.clone(),
         });
 
-        let resp = client
-            .post(format!("{base}/chat/turn"))
-            .bearer_auth(tok)
-            .json(&payload)
-            .send()
-            .await;
+        let resp = api.post_chat_turn(tok, &payload).await;
 
         match resp {
             Ok(r) if r.status().is_success() => {
@@ -1567,12 +1508,7 @@ pub async fn handle_plan_mode_input(
                     "session_id": state.session_id.clone(),
                 });
 
-                let resp = client
-                    .post(format!("{base}/chat/turn"))
-                    .bearer_auth(tok)
-                    .json(&payload)
-                    .send()
-                    .await;
+                let resp = api.post_chat_turn(tok, &payload).await;
 
                 match resp {
                     Ok(r) if r.status().is_success() => {
@@ -1892,7 +1828,6 @@ pub async fn handle_plan_mode_input(
     };
 
     // Call LLM via SSE (match the format used by /plan decompose)
-    let turn_url = format!("{base}/chat/turn");
     let messages = vec![serde_json::json!({
         "role": "user",
         "content": prompt
@@ -1911,13 +1846,7 @@ pub async fn handle_plan_mode_input(
         "edge_tools": [],  // No tools needed for plan editing
     });
 
-    let resp = client
-        .post(&turn_url)
-        .headers(auth_headers(tok)?)
-        .header("Accept", "text/event-stream")
-        .json(&payload)
-        .send()
-        .await;
+    let resp = api.post_chat_turn(tok, &payload).await;
 
     match resp {
         Ok(r) if r.status().is_success() => {

@@ -52,16 +52,6 @@ pub(super) fn profile_name(cli_profile: Option<&str>, data: &CredentialsFile) ->
         .unwrap_or_else(|| "default".to_string())
 }
 
-pub(super) fn auth_headers(token: &str) -> Result<HeaderMap, String> {
-    let mut headers = HeaderMap::new();
-    headers.insert(
-        AUTHORIZATION,
-        HeaderValue::from_str(&format!("Bearer {token}")).map_err(|e| e.to_string())?,
-    );
-    headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-    Ok(headers)
-}
-
 /// Capitalize the first letter of a string.
 pub(super) fn capitalize(s: &str) -> String {
     let mut c = s.chars();
@@ -119,8 +109,17 @@ pub(super) fn resumable_last_session_id(cli_profile: Option<&str>) -> Option<Str
         .filter(|session_id| session_is_resumable(session_id))
 }
 
-pub(super) fn read_api_error(status: reqwest::StatusCode, body: &str) -> String {
-    format!("request failed ({}): {}", status, compact_or_raw(body))
+pub(super) fn read_api_error(status: u16, body: &str) -> String {
+    format!("request failed ({status}): {}", compact_or_raw(body))
+}
+
+pub(super) fn map_thin_err(e: mo_thin_client::ThinClientError) -> String {
+    match e {
+        mo_thin_client::ThinClientError::Api { status, body } => {
+            read_api_error(status.as_u16(), &body)
+        }
+        other => other.to_string(),
+    }
 }
 
 pub(super) fn compact_or_raw(body: &str) -> String {
@@ -974,7 +973,7 @@ mod tests {
 
     #[test]
     fn read_api_error_includes_status() {
-        let err = read_api_error(reqwest::StatusCode::NOT_FOUND, "not found");
+        let err = read_api_error(404, "not found");
         assert!(err.contains("404"), "got: {err}");
     }
 

@@ -23,6 +23,9 @@
 //! let tools = client.list_tools().await?;
 //! ```
 
+// Connection helpers are staged for upcoming MCP wiring; keep the surface without warning spam.
+#![allow(dead_code)]
+
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;

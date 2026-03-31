@@ -717,8 +717,7 @@ fn print_verdict_report(verdict_events: &[VerdictEvent], verbose: bool) {
 /// Parameters for a single agentic chat turn — groups the many arguments
 /// to `stream_chat_sse` into a named struct to reduce cognitive load.
 pub(super) struct ChatTurnParams<'a> {
-    pub(super) client: &'a reqwest::Client,
-    pub(super) base: &'a str,
+    pub(super) api: &'a mo_thin_client::ThinClient,
     pub(super) token: &'a str,
     pub(super) message: &'a str,
     pub(super) session_id: Option<&'a str>,
@@ -741,8 +740,7 @@ pub(super) struct ChatTurnParams<'a> {
 pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResult, String> {
     // Destructure for readability within the function body
     let ChatTurnParams {
-        client,
-        base,
+        api,
         token,
         message,
         session_id,
@@ -762,7 +760,7 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
     let term_width = terminal::size().map(|(w, _)| w as usize).unwrap_or(80);
     let project_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let file_context = detect_project_languages(&project_root);
-    let executor = edge_tools::ToolExecutor::new(&project_root).with_cloud(base, token);
+    let executor = edge_tools::ToolExecutor::new(&project_root).with_cloud(api.api_origin(), token);
     let all_schemas = edge_tools::all_tool_schemas();
     let registry = tool_registry::ToolRegistry::new(all_schemas.clone());
     let valid_tool_names: HashSet<String> = all_schemas
@@ -1292,30 +1290,10 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
             first_context_assembly_ms = Some(assembly_start.elapsed().as_millis() as u64);
         }
 
-        // HTTP call with retry on 429 (rate limit) — exponential backoff up to 3 attempts.
-        let mut resp_result = None;
-        for attempt in 0..3u32 {
-            let resp = client
-                .post(format!("{base}/chat/turn"))
-                .headers(auth_headers(token)?)
-                .header("Accept", "text/event-stream")
-                .json(&payload)
-                .send()
-                .await
-                .map_err(|e| e.to_string())?;
-
-            if resp.status().as_u16() == 429 && attempt < 2 {
-                let delay_secs = 2u64 << attempt; // 2s, 4s
-                if !quiet {
-                    eprintln!("  ⏳ Rate limited (429), retrying in {}s…", delay_secs);
-                }
-                tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
-                continue;
-            }
-            resp_result = Some(resp);
-            break;
-        }
-        let resp = resp_result.ok_or_else(|| "retry exhausted".to_string())?;
+        let resp = api
+            .post_chat_turn_retry_429(token, &payload, 3, quiet)
+            .await
+            .map_err(|e| e.to_string())?;
 
         let status = resp.status();
         if !status.is_success() {
@@ -1778,22 +1756,20 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
                     qp.push(format!("question={}", urlencoding(question)));
                 }
                 qp.push(format!("last_n={last_n}"));
-                let reflect_url = format!("{base}/chat/session/{sid}/reflect?{}", qp.join("&"));
-                match auth_headers(token) {
-                    Ok(hdrs) => match client.get(&reflect_url).headers(hdrs).send().await {
-                        Ok(resp) if resp.status().is_success() => {
-                            result_str = resp.text().await.unwrap_or(result_str);
-                        }
-                        Ok(resp) => {
-                            result_str =
-                                format!("{{\"error\": \"reflect HTTP {}\"}}", resp.status());
-                        }
-                        Err(e) => {
-                            result_str = format!("{{\"error\": \"reflect failed: {e}\"}}");
-                        }
-                    },
+                let rel = format!(
+                    "{}?{}",
+                    mo_thin_client::paths::chat_session_reflect(sid).trim_start_matches('/'),
+                    qp.join("&")
+                );
+                match api.get_authed_path_text(token, &rel).await {
+                    Ok(text) => {
+                        result_str = text;
+                    }
+                    Err(mo_thin_client::ThinClientError::Api { status, .. }) => {
+                        result_str = format!("{{\"error\": \"reflect HTTP {status}\"}}");
+                    }
                     Err(e) => {
-                        result_str = format!("{{\"error\": \"reflect auth: {e}\"}}");
+                        result_str = format!("{{\"error\": \"reflect failed: {e}\"}}");
                     }
                 }
             }

@@ -1,8 +1,7 @@
 use super::*;
 
 pub(super) struct ReplTurnContext<'a> {
-    pub(super) client: &'a reqwest::Client,
-    pub(super) base: &'a str,
+    pub(super) api: &'a mo_thin_client::ThinClient,
     pub(super) profile: Option<&'a str>,
     pub(super) selector: &'a dyn tool_selector::ToolSelector,
 }
@@ -157,8 +156,7 @@ async fn maybe_auto_compact(
 
     let mut auto_pm_compact = PermissionManager::new(true);
     let compact_result = stream_chat_sse(ChatTurnParams {
-        client: ctx.client,
-        base: ctx.base,
+        api: ctx.api,
         token,
         message: prompts::COMPACT_SUMMARY_REQUEST,
         session_id: state.session_id.as_deref(),
@@ -236,11 +234,8 @@ async fn apply_auto_compact_result(
         prompts::memory_proto::SRC_AUTO_COMPACT,
     );
     if let Err(e) = ctx
-        .client
-        .post(format!("{}/memory/store", ctx.base))
-        .headers(auth_headers(token)?)
-        .json(&entry.to_store_payload_with_meta(&meta))
-        .send()
+        .api
+        .post_memory_store_json(token, &entry.to_store_payload_with_meta(&meta))
         .await
     {
         mo_agent_core::agent_warn!("repl_turn", "failed to persist compacted memory: {e}");
@@ -271,8 +266,7 @@ async fn run_chat_turn(
     
     tokio::select! {
         result = stream_chat_sse(ChatTurnParams {
-            client: ctx.client,
-            base: ctx.base,
+            api: ctx.api,
             token,
             message,
             session_id,

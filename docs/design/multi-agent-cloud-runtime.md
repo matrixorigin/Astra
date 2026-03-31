@@ -1,7 +1,7 @@
 # Multi-Agent Cloud Runtime Architecture
 
 > **Status**: Living Design Document  
-> **Version**: 1.2 (headless cloud runtime + thin client split)  
+> **Version**: 1.3 (§5.5 `mo-thin-client` implementation reference + tasks/context paths)  
 > **Scope**: Edge-cloud state management, multi-agent orchestration, and cloud-scale execution  
 > **Audience**: Core contributors, architecture reviewers
 
@@ -17,6 +17,7 @@
    - 5.3 [Headless Cloud Runtime: Client-Runtime Decoupling](#53-headless-cloud-runtime-client-runtime-decoupling)
    - 5.4 [Responsibility Split: What Moves Where](#54-responsibility-split-what-moves-where)
    - 5.5 [Thin Client Protocol](#55-thin-client-protocol)
+     - 5.5.1 [Reference implementation: `mo-thin-client`](#551-reference-implementation-mo-thin-client)
 6. [Edge-Cloud State Model](#6-edge-cloud-state-model)
 7. [MatrixOne-Native Acceleration](#7-matrixone-native-acceleration)
 8. [Multi-Agent Coordination Protocol](#8-multi-agent-coordination-protocol)
@@ -604,6 +605,26 @@ POST   /plans/{id}/resume               # resume paused plan
 ```
 
 > **Note**: Many of these routes already exist in `router_builder.rs` (~50 routes). The gap is that today's CLI bypasses them (calling internal Rust functions directly) and the Web UI only uses ~15 routes as read-only GETs. The thin client protocol makes all clients go through the same API surface.
+
+#### 5.5.1 Reference implementation: `mo-thin-client`
+
+Shared crate: `rust/crates/mo-thin-client` (dependency of `mo-agent-cli` and any future Web/IDE clients).
+
+| Layer | Module / type | Role |
+|-------|----------------|------|
+| Paths | [`paths.rs`](../../rust/crates/mo-thin-client/src/paths.rs) | Canonical URL constants and `session` / `task` / `context_capture` helpers — keep in sync with `runtime/src/server/router_builder.rs`. |
+| Bodies | [`protocol.rs`](../../rust/crates/mo-thin-client/src/protocol.rs) | `ChatStreamRequest` (includes §5.5 `edge_executor_id`, `capabilities`), `ToolResultRequest`, `ApprovalRespondRequest`, `StreamEvent`, session DTOs. |
+| Transport | [`ThinClient`](../../rust/crates/mo-thin-client/src/client.rs) | `reqwest`-based HTTP + SSE (`chat_stream` / `post_chat_turn`), auth, sessions, skills, memory, tasks, context snapshots, `get_url` for off-origin probes (e.g. Memoria health). |
+| Admin CLI | [`mo-admin-cli`](../../rust/crates/mo-admin/) | Same crate: **only** [`ThinClient`](../../rust/crates/mo-thin-client/src/client.rs) for server calls (no standalone `reqwest` client). |
+
+**Chat endpoints (two surfaces, same SSE framing):**
+
+- **`POST /chat/stream`** — preferred for typed streaming; body is [`ChatStreamRequest`](../../rust/crates/mo-thin-client/src/protocol.rs). Use `ThinClient::chat_stream` / `chat_stream_collect`.
+- **`POST /chat/turn`** — used by the current CLI agentic loop (tools, retries); same `Accept: text/event-stream`, JSON body shaped like the server’s chat-turn handler. Use `ThinClient::post_chat_turn` / `post_chat_turn_retry_429`.
+
+**§5.5 callbacks** — Client methods exist (`post_tool_result`, `post_approval`); wire to **`router_builder`** when those routes are added on the server (today they may 404 until implemented).
+
+**Server-aligned additions (not all listed in the prose above):** `GET/POST /tasks`, `PUT /tasks/{id}/status`, `GET /tasks/{id}/progress`, `GET/POST /context`, `GET /context/{id}`, `POST /memory/retrieve`, `POST /chat/route` — path constants and `ThinClient` helpers live alongside the rest in `paths.rs` / `client.rs`.
 
 ---
 
@@ -1763,6 +1784,7 @@ mo-agent Orchestrator
 | Server builder | `runtime/src/server/state_builder.rs` | Pipeline learning writer, bridge wiring | runtime ✅ |
 | Router | `runtime/src/server/router_builder.rs` | 50+ HTTP routes, the thin client API surface | runtime ✅ |
 | Web proxy | `web/app/api/backend/[...path]/route.ts` | Server-side proxy, httpOnly cookie auth | web ✅ |
+| Thin client (§5.5) | `mo-thin-client/src/{paths,protocol,client}.rs` | Shared HTTP+SSE; CLI and future clients | ✅ |
 
 ---
 

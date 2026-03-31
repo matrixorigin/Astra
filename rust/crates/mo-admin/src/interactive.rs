@@ -1,7 +1,8 @@
 use std::{borrow::Cow, fs, path::PathBuf};
 
 use crossterm::style::Stylize;
-use reqwest::header::CONTENT_TYPE;
+use mo_thin_client::paths;
+use mo_thin_client::ThinClient;
 use rustyline::{
     CompletionType, Config, Context, Editor, Helper,
     completion::{Completer, Pair},
@@ -13,7 +14,7 @@ use rustyline::{
 };
 
 use super::credentials::{load_credentials, profile_name, save_credentials};
-use super::http_helpers::{auth_headers, get_profile_and_token, print_json_or_raw, read_api_error};
+use super::http_helpers::{get_profile_and_token, map_thin_err, print_json_or_raw};
 
 const ADMIN_COMMANDS: &[(&str, &str)] = &[
     ("whoami", "Show current user info"),
@@ -92,8 +93,7 @@ impl Validator for AdminHelper {
 impl Helper for AdminHelper {}
 
 pub(crate) async fn run_interactive(
-    client: &reqwest::Client,
-    base: &str,
+    api: &ThinClient,
     profile: Option<&str>,
 ) -> Result<(), String> {
     let history_path = dirs::home_dir()
@@ -165,52 +165,23 @@ pub(crate) async fn run_interactive(
             Ok(())
         } else if line.eq("whoami") {
             let (_, _, _, token) = get_profile_and_token(profile)?;
-            let resp = client
-                .get(format!("{base}/auth/me"))
-                .headers(auth_headers(&token)?)
-                .send()
-                .await
-                .map_err(|e| e.to_string())?;
-            let status = resp.status();
-            let body = resp.text().await.map_err(|e| e.to_string())?;
-            if !status.is_success() {
-                Err(read_api_error(status, &body))
-            } else {
-                print_json_or_raw(&body);
-                Ok(())
-            }
+            let body = api.get_auth_me_text(&token).await.map_err(map_thin_err)?;
+            print_json_or_raw(&body);
+            Ok(())
         } else if line.eq("health") {
-            let resp = client
-                .get(format!("{base}/health"))
-                .send()
-                .await
-                .map_err(|e| e.to_string())?;
-            let status = resp.status();
-            let body = resp.text().await.map_err(|e| e.to_string())?;
-            if status.is_success() {
-                eprintln!("{}", "✓ API server is healthy".green());
-                print_json_or_raw(&body);
-                Ok(())
-            } else {
-                Err(read_api_error(status, &body))
-            }
+            let body = api.get_health_text().await.map_err(map_thin_err)?;
+            eprintln!("{}", "✓ API server is healthy".green());
+            print_json_or_raw(&body);
+            Ok(())
         } else if line.eq("init") {
             let (_, _, _, token) = get_profile_and_token(profile)?;
-            let resp = client
-                .post(format!("{base}/admin/init"))
-                .headers(auth_headers(&token)?)
-                .send()
+            let body = api
+                .post_bearer_path_empty_text(&token, paths::ADMIN_INIT)
                 .await
-                .map_err(|e| e.to_string())?;
-            let status = resp.status();
-            let body = resp.text().await.map_err(|e| e.to_string())?;
-            if !status.is_success() {
-                Err(read_api_error(status, &body))
-            } else {
-                eprintln!("{}", "✓ Admin initialized".green());
-                print_json_or_raw(&body);
-                Ok(())
-            }
+                .map_err(map_thin_err)?;
+            eprintln!("{}", "✓ Admin initialized".green());
+            print_json_or_raw(&body);
+            Ok(())
         } else if line.eq("refresh") {
             let mut creds = load_credentials();
             let name = profile_name(profile, &creds);
@@ -222,35 +193,26 @@ pub(crate) async fn run_interactive(
             let refresh_token = saved
                 .refresh_token
                 .ok_or_else(|| "no refresh token".to_string())?;
-            let resp = client
-                .post(format!("{base}/auth/refresh"))
-                .header(CONTENT_TYPE, "application/json")
-                .json(&serde_json::json!({ "refresh_token": refresh_token }))
-                .send()
+            let body = api
+                .post_auth_refresh_json(&serde_json::json!({ "refresh_token": refresh_token }))
                 .await
-                .map_err(|e| e.to_string())?;
-            let status = resp.status();
-            let body = resp.text().await.map_err(|e| e.to_string())?;
-            if !status.is_success() {
-                Err(read_api_error(status, &body))
-            } else {
-                let value: serde_json::Value =
-                    serde_json::from_str(&body).map_err(|e| e.to_string())?;
-                let new_access = value
-                    .get("access_token")
-                    .and_then(serde_json::Value::as_str)
-                    .ok_or("missing access_token")?;
-                let new_refresh = value
-                    .get("refresh_token")
-                    .and_then(serde_json::Value::as_str)
-                    .ok_or("missing refresh_token")?;
-                let entry = creds.profiles.entry(name).or_default();
-                entry.access_token = Some(new_access.to_string());
-                entry.refresh_token = Some(new_refresh.to_string());
-                save_credentials(&creds)?;
-                eprintln!("{}", "✓ Token refreshed".green());
-                Ok(())
-            }
+                .map_err(map_thin_err)?;
+            let value: serde_json::Value =
+                serde_json::from_str(&body).map_err(|e| e.to_string())?;
+            let new_access = value
+                .get("access_token")
+                .and_then(serde_json::Value::as_str)
+                .ok_or("missing access_token")?;
+            let new_refresh = value
+                .get("refresh_token")
+                .and_then(serde_json::Value::as_str)
+                .ok_or("missing refresh_token")?;
+            let entry = creds.profiles.entry(name).or_default();
+            entry.access_token = Some(new_access.to_string());
+            entry.refresh_token = Some(new_refresh.to_string());
+            save_credentials(&creds)?;
+            eprintln!("{}", "✓ Token refreshed".green());
+            Ok(())
         } else if line.eq("logout") {
             let mut creds = load_credentials();
             let name = profile_name(profile, &creds);
@@ -262,11 +224,8 @@ pub(crate) async fn run_interactive(
             let refresh_token = saved
                 .refresh_token
                 .ok_or_else(|| "no refresh token".to_string())?;
-            let _ = client
-                .post(format!("{base}/auth/logout"))
-                .header(CONTENT_TYPE, "application/json")
-                .json(&serde_json::json!({ "refresh_token": refresh_token }))
-                .send()
+            let _ = api
+                .post_auth_logout_json(&serde_json::json!({ "refresh_token": refresh_token }))
                 .await;
             if let Some(entry) = creds.profiles.get_mut(&name) {
                 entry.access_token = None;
@@ -282,102 +241,51 @@ pub(crate) async fn run_interactive(
                 .nth(1)
                 .and_then(|v| v.parse::<u32>().ok())
                 .unwrap_or(100);
-            let resp = client
-                .get(format!("{base}/admin/audit"))
-                .headers(auth_headers(&token)?)
-                .query(&[("limit", limit.to_string())])
-                .send()
+            let q = vec![("limit", limit.to_string())];
+            let body = api
+                .get_bearer_path_query_text(&token, paths::ADMIN_AUDIT, &q)
                 .await
-                .map_err(|e| e.to_string())?;
-            let status = resp.status();
-            let body = resp.text().await.map_err(|e| e.to_string())?;
-            if !status.is_success() {
-                Err(read_api_error(status, &body))
-            } else {
-                print_json_or_raw(&body);
-                Ok(())
-            }
+                .map_err(map_thin_err)?;
+            print_json_or_raw(&body);
+            Ok(())
         } else if line.eq("token list") {
             let (_, _, _, token) = get_profile_and_token(profile)?;
-            let resp = client
-                .get(format!("{base}/admin/tokens"))
-                .headers(auth_headers(&token)?)
-                .send()
+            let body = api
+                .get_bearer_path_query_text(&token, paths::ADMIN_TOKENS, &[])
                 .await
-                .map_err(|e| e.to_string())?;
-            let status = resp.status();
-            let body = resp.text().await.map_err(|e| e.to_string())?;
-            if !status.is_success() {
-                Err(read_api_error(status, &body))
-            } else {
-                print_json_or_raw(&body);
-                Ok(())
-            }
+                .map_err(map_thin_err)?;
+            print_json_or_raw(&body);
+            Ok(())
         } else if line.eq("skill list") {
             let (_, _, _, token) = get_profile_and_token(profile)?;
-            let resp = client
-                .get(format!("{base}/skills"))
-                .headers(auth_headers(&token)?)
-                .query(&[("limit", "50"), ("offset", "0")])
-                .send()
+            let q = vec![("limit", "50".to_string()), ("offset", "0".to_string())];
+            let body = api
+                .get_skills_query_text(&token, &q)
                 .await
-                .map_err(|e| e.to_string())?;
-            let status = resp.status();
-            let body = resp.text().await.map_err(|e| e.to_string())?;
-            if !status.is_success() {
-                Err(read_api_error(status, &body))
-            } else {
-                print_json_or_raw(&body);
-                Ok(())
-            }
+                .map_err(map_thin_err)?;
+            print_json_or_raw(&body);
+            Ok(())
         } else if line.eq("feedback stats") {
             let (_, _, _, token) = get_profile_and_token(profile)?;
-            let resp = client
-                .get(format!("{base}/admin/feedback/stats"))
-                .headers(auth_headers(&token)?)
-                .send()
+            let body = api
+                .get_bearer_path_query_text(&token, paths::ADMIN_FEEDBACK_STATS, &[])
                 .await
-                .map_err(|e| e.to_string())?;
-            let status = resp.status();
-            let body = resp.text().await.map_err(|e| e.to_string())?;
-            if !status.is_success() {
-                Err(read_api_error(status, &body))
-            } else {
-                print_json_or_raw(&body);
-                Ok(())
-            }
+                .map_err(map_thin_err)?;
+            print_json_or_raw(&body);
+            Ok(())
         } else if line.eq("model list") {
             let (_, _, _, token) = get_profile_and_token(profile)?;
-            let resp = client
-                .get(format!("{base}/models"))
-                .headers(auth_headers(&token)?)
-                .send()
-                .await
-                .map_err(|e| e.to_string())?;
-            let status = resp.status();
-            let body = resp.text().await.map_err(|e| e.to_string())?;
-            if !status.is_success() {
-                Err(read_api_error(status, &body))
-            } else {
-                print_json_or_raw(&body);
-                Ok(())
-            }
+            let body = api.get_models_text(&token).await.map_err(map_thin_err)?;
+            print_json_or_raw(&body);
+            Ok(())
         } else if let Some(model_name) = line.strip_prefix("model check ") {
             let (_, _, _, token) = get_profile_and_token(profile)?;
-            let resp = client
-                .post(format!("{base}/models/{}/check", model_name.trim()))
-                .headers(auth_headers(&token)?)
-                .send()
+            let body = api
+                .post_bearer_path_empty_text(&token, &paths::model_check(model_name.trim()))
                 .await
-                .map_err(|e| e.to_string())?;
-            let status = resp.status();
-            let body = resp.text().await.map_err(|e| e.to_string())?;
-            if !status.is_success() {
-                Err(read_api_error(status, &body))
-            } else {
-                print_json_or_raw(&body);
-                Ok(())
-            }
+                .map_err(map_thin_err)?;
+            print_json_or_raw(&body);
+            Ok(())
         } else if let Some(rest) = line.strip_prefix("prompt optimize ") {
             let mut parts = rest.split_whitespace();
             let agent_id = parts.next().ok_or_else(|| {
@@ -385,18 +293,16 @@ pub(crate) async fn run_interactive(
             })?;
             let optimization_type = parts.next().unwrap_or("quality");
             let (_, _, _, token) = get_profile_and_token(profile)?;
-            let resp = client.post(format!("{base}/admin/prompts/optimize"))
-                .headers(auth_headers(&token)?)
-                .json(&serde_json::json!({"agent_id": agent_id, "optimization_type": optimization_type}))
-                .send().await.map_err(|e| e.to_string())?;
-            let status = resp.status();
-            let body = resp.text().await.map_err(|e| e.to_string())?;
-            if !status.is_success() {
-                Err(read_api_error(status, &body))
-            } else {
-                print_json_or_raw(&body);
-                Ok(())
-            }
+            let body = api
+                .post_bearer_path_json_text(
+                    &token,
+                    paths::ADMIN_PROMPTS_OPTIMIZE,
+                    &serde_json::json!({"agent_id": agent_id, "optimization_type": optimization_type}),
+                )
+                .await
+                .map_err(map_thin_err)?;
+            print_json_or_raw(&body);
+            Ok(())
         } else if let Some(rest) = line.strip_prefix("user grant-role ") {
             let mut parts = rest.split_whitespace();
             let username = parts
@@ -406,24 +312,18 @@ pub(crate) async fn run_interactive(
                 .next()
                 .ok_or_else(|| "usage: user grant-role <username> <role_name>".to_string())?;
             let (_, _, _, token) = get_profile_and_token(profile)?;
-            let resp = client
-                .post(format!("{base}/admin/users/grant-role"))
-                .headers(auth_headers(&token)?)
-                .json(&serde_json::json!({"username": username, "role_name": role_name}))
-                .send()
-                .await
-                .map_err(|e| e.to_string())?;
-            let status = resp.status();
-            let body = resp.text().await.map_err(|e| e.to_string())?;
-            if !status.is_success() {
-                Err(read_api_error(status, &body))
-            } else {
-                eprintln!(
-                    "{}",
-                    format!("✓ Role '{role_name}' granted to '{username}'").green()
-                );
-                Ok(())
-            }
+            api.post_bearer_path_json_text(
+                &token,
+                paths::ADMIN_USERS_GRANT_ROLE,
+                &serde_json::json!({"username": username, "role_name": role_name}),
+            )
+            .await
+            .map_err(map_thin_err)?;
+            eprintln!(
+                "{}",
+                format!("✓ Role '{role_name}' granted to '{username}'").green()
+            );
+            Ok(())
         } else if let Some(rest) = line.strip_prefix("user revoke-role ") {
             let mut parts = rest.split_whitespace();
             let username = parts
@@ -433,24 +333,18 @@ pub(crate) async fn run_interactive(
                 .next()
                 .ok_or_else(|| "usage: user revoke-role <username> <role_name>".to_string())?;
             let (_, _, _, token) = get_profile_and_token(profile)?;
-            let resp = client
-                .post(format!("{base}/admin/users/revoke-role"))
-                .headers(auth_headers(&token)?)
-                .json(&serde_json::json!({"username": username, "role_name": role_name}))
-                .send()
-                .await
-                .map_err(|e| e.to_string())?;
-            let status = resp.status();
-            let body = resp.text().await.map_err(|e| e.to_string())?;
-            if !status.is_success() {
-                Err(read_api_error(status, &body))
-            } else {
-                eprintln!(
-                    "{}",
-                    format!("✓ Role '{role_name}' revoked from '{username}'").green()
-                );
-                Ok(())
-            }
+            api.post_bearer_path_json_text(
+                &token,
+                paths::ADMIN_USERS_REVOKE_ROLE,
+                &serde_json::json!({"username": username, "role_name": role_name}),
+            )
+            .await
+            .map_err(map_thin_err)?;
+            eprintln!(
+                "{}",
+                format!("✓ Role '{role_name}' revoked from '{username}'").green()
+            );
+            Ok(())
         } else {
             Err(format!(
                 "unknown command '{line}' — type 'help' to list commands"

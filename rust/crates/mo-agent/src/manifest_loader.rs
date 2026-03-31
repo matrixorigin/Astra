@@ -35,7 +35,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use std::path::Path;
 
-use crate::mcp_client::{McpServerConfig, Transport};
+use crate::mcp_client::McpServerConfig;
 use crate::skill_instructions::{SkillInstruction, SkillMetadata, parse_skill_md};
 
 // ─── Manifest Types ─────────────────────────────────────────────────────────
@@ -446,6 +446,7 @@ pub fn expand_command_template(template: &str, args: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mcp_client::Transport;
 
     const SAMPLE_MANIFEST: &str = r#"
 name: kubernetes

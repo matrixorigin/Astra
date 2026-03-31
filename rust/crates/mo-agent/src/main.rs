@@ -28,7 +28,6 @@ mod edge_tools;
 mod manifest_loader;
 mod mcp_client;
 mod skill_instructions;
-use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
 use rustyline::{
     Cmd as RlCmd, CompletionType, ConditionalEventHandler, Config, Context, Editor,
     Event as RlEvent, EventContext as RlEventContext, EventHandler as RlEventHandler, Helper,
@@ -82,10 +81,10 @@ use chat_stream::{
     ChatTurnParams, is_session_not_found_error, looks_like_live_query_with_context, stream_chat_sse,
 };
 use cli_utils::{
-    Profile, auth_headers, capitalize, compact_or_raw, get_profile_and_token, interactive_select,
-    load_credentials, print_json_or_raw, print_markdown, profile_name, prompt_or,
-    prompt_password_masked, read_api_error, resumable_last_session_id, save_credentials,
-    tool_call_detail, tool_result_summary, truncate_str, urlencoding,
+    Profile, capitalize, compact_or_raw, get_profile_and_token, interactive_select,
+    load_credentials, map_thin_err, print_json_or_raw, print_markdown, profile_name, prompt_or,
+    prompt_password_masked, resumable_last_session_id, save_credentials, tool_call_detail,
+    tool_result_summary, truncate_str, urlencoding,
 };
 use command_router::{execute_cli_command, ExitCode};
 use permission_manager::PermissionManager;
@@ -445,6 +444,7 @@ struct ReplState {
     /// MCP client manager for external tool servers.
     mcp_manager: std::sync::Arc<std::sync::RwLock<mcp_client::McpClientManager>>,
     /// Skill classification cache for LLM-based skill detection.
+    #[allow(dead_code)]
     skill_classification_cache: skill_instructions::SkillClassificationCache,
 }
 
@@ -1649,8 +1649,7 @@ fn format_bytes(bytes: u64) -> String {
 async fn run_plan_execution(
     state: &mut ReplState,
     current_token: Option<&str>,
-    client: &reqwest::Client,
-    base: &str,
+    api: &mo_thin_client::ThinClient,
     profile: Option<&str>,
     selector: &dyn tool_selector::ToolSelector,
 ) -> Result<(), String> {
@@ -1889,8 +1888,7 @@ async fn run_plan_execution(
                 current_token,
                 state,
                 ReplTurnContext {
-                    client,
-                    base,
+                    api,
                     profile,
                     selector,
                 },
@@ -2542,8 +2540,7 @@ async fn find_task_by_query(
 /// Returns `true` when the REPL should exit.
 async fn handle_slash_command(
     line: &str,
-    client: &reqwest::Client,
-    base: &str,
+    api: &mo_thin_client::ThinClient,
     profile: Option<&str>,
     state: &mut ReplState,
     token: Option<&str>,
@@ -2597,25 +2594,11 @@ async fn handle_slash_command(
                 eprintln!("{}", "  Not logged in. Use /login.".yellow());
                 return Ok(false);
             };
-            let resp = client
-                .get(format!("{base}/models"))
-                .headers(auth_headers(tok)?)
-                .send()
+            let body = api
+                .get_models_text(tok)
                 .await
-                .map_err(|e| e.to_string())?;
-            let status = resp.status();
-            let body = resp.text().await.map_err(|e| e.to_string())?;
-            if !status.is_success() {
-                eprintln!(
-                    "{}",
-                    format!(
-                        "  \u{2717} API Error ({}): {}",
-                        status,
-                        compact_or_raw(&body)
-                    )
-                    .red()
-                );
-            } else {
+                .map_err(map_thin_err)?;
+            {
                 let value: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
                 let models = value
                     .as_array()
@@ -2673,16 +2656,16 @@ async fn handle_slash_command(
 
         "/history" | "/search" | "/copy" | "/doctor" | "/context" | "/version" | "/rewind"
         | "/turn" => {
-            handle_info_command(cmd, arg, client, base, state, token).await?;
+            handle_info_command(cmd, arg, api, state, token).await?;
         }
 
         "/skill" | "/skill list" | "/skill new" | "/skill test" | "/skill dev"
         | "/skill doctor" | "/skill validate" | "/skill config" | "/skill system" => {
-            handle_skill_command(arg, client, base, state, token).await?;
+            handle_skill_command(arg, api, state, token).await?;
         }
 
         "/register" | "/login" | "/logout" | "/memory-setup" => {
-            handle_account_command(cmd, arg, client, base, profile).await?;
+            handle_account_command(cmd, arg, api, profile).await?;
         }
 
         "/clear" | "/explain" | "/verbose" | "/compact" | "/reflect" => {
@@ -2690,8 +2673,7 @@ async fn handle_slash_command(
                 cmd,
                 arg,
                 StateCommandContext {
-                    client,
-                    base,
+                    api,
                     profile,
                     token,
                     selector,
@@ -2702,7 +2684,7 @@ async fn handle_slash_command(
         }
 
         "/memory" | "/plan" => {
-            handle_memory_domain_command(cmd, arg, client, base, state, token).await?;
+            handle_memory_domain_command(cmd, arg, api, state, token).await?;
         }
 
         "/task" => {
@@ -2770,15 +2752,14 @@ async fn handle_slash_command(
 // ═══════════════════════════════════════════════════════════════ REPL ════
 
 async fn run_chat_repl(
-    client: &reqwest::Client,
-    base: &str,
+    api: &mo_thin_client::ThinClient,
     profile: Option<&str>,
     initial_model: Option<&str>,
 ) -> Result<(), String> {
     // Try silent auth (validate/refresh token) but don't block entry.
     // If not authenticated, user can still explore — operations that need
     // auth will prompt "Not logged in. Use /login."
-    try_silent_auth(client, base, profile).await;
+    try_silent_auth(api, profile).await;
 
     let (mut editor, hist_path) = build_repl_editor()?;
     let mut state = initialize_repl_state(profile, initial_model);
@@ -2791,8 +2772,7 @@ async fn run_chat_repl(
         mo_agent_runtime::turn::routing_metrics::ConfidenceCalibrator::default(),
     );
     let (selector, pipeline_modules) = create_tool_selector_with_quality(
-        client,
-        base,
+        api,
         profile,
         Some(quality_tracker),
         Some(confidence_calibrator),
@@ -2921,7 +2901,7 @@ async fn run_chat_repl(
 
     // Pre-flight: check if server has any LLM models configured
     if let Some(token) = current_access_token(profile) {
-        let has_models = check_server_has_models(client, base, &token).await;
+        let has_models = check_server_has_models(api, &token).await;
         if !has_models {
             state.model = Some("⚠ none".to_string());
         }
@@ -2980,8 +2960,7 @@ async fn run_chat_repl(
                     let dispatch_line = pending.as_deref().unwrap_or(&line);
                     let should_exit = handle_slash_command(
                         dispatch_line,
-                        client,
-                        base,
+                        api,
                         profile,
                         &mut state,
                         current_token.as_deref(),
@@ -3006,8 +2985,7 @@ async fn run_chat_repl(
                         run_plan_execution(
                             &mut state,
                             current_token.as_deref(),
-                            client,
-                            base,
+                            api,
                             profile,
                             &*selector,
                         )
@@ -3019,8 +2997,7 @@ async fn run_chat_repl(
                         line.clone(),
                         current_token.as_deref(),
                         &mut state,
-                        client,
-                        base,
+                        api,
                     )
                     .await?;
 
@@ -3029,8 +3006,7 @@ async fn run_chat_repl(
                         run_plan_execution(
                             &mut state,
                             current_token.as_deref(),
-                            client,
-                            base,
+                            api,
                             profile,
                             &*selector,
                         )
@@ -3044,8 +3020,7 @@ async fn run_chat_repl(
                     run_plan_execution(
                         &mut state,
                         current_token.as_deref(),
-                        client,
-                        base,
+                        api,
                         profile,
                         &*selector,
                     )
@@ -3110,8 +3085,7 @@ async fn run_chat_repl(
                                     line_for_plan,
                                     current_token.as_deref(),
                                     &mut state,
-                                    client,
-                                    base,
+                                    api,
                                 )
                                 .await?;
                             } else {
@@ -3126,8 +3100,7 @@ async fn run_chat_repl(
                             current_token.as_deref(),
                             &mut state,
                             ReplTurnContext {
-                                client,
-                                base,
+                                api,
                                 profile,
                                 selector: &*selector,
                             },
@@ -3285,11 +3258,8 @@ async fn run_chat_repl(
 async fn main() {
     dotenvy::dotenv().ok();
     let cli = Cli::parse();
-    let client = reqwest::Client::builder()
-        .no_proxy()
-        .build()
-        .expect("http client should build");
     let base = cli.api_url.trim_end_matches('/').to_string();
+    let api = mo_thin_client::ThinClient::new(&base, None).expect("valid API URL");
 
     // Set MEMORIA_API_KEY from credentials if not already set
     if std::env::var("MEMORIA_API_KEY").is_err() {
@@ -3312,7 +3282,7 @@ async fn main() {
         command,
     } = cli;
 
-    match execute_cli_command(command, profile, &client, &base).await {
+    match execute_cli_command(command, profile, &api).await {
         Ok(exit_code) => {
             std::process::exit(i32::from(exit_code));
         }
@@ -3446,7 +3416,8 @@ mod tests {
 
     #[tokio::test]
     async fn slash_explain_toggles_state() {
-        let client = reqwest::Client::new();
+        let api =
+            mo_thin_client::ThinClient::new("http://127.0.0.1:8000", None).expect("test API URL");
         let mut state = ReplState::default();
         let selector = tool_selector::TfIdfSelector::new(tool_registry::ToolRegistry::new(
             edge_tools::all_tool_schemas(),
@@ -3455,8 +3426,7 @@ mod tests {
 
         let should_exit = handle_slash_command(
             "/explain",
-            &client,
-            "http://127.0.0.1:8000",
+            &api,
             None,
             &mut state,
             None,
@@ -3469,8 +3439,7 @@ mod tests {
 
         let should_exit = handle_slash_command(
             "/explain",
-            &client,
-            "http://127.0.0.1:8000",
+            &api,
             None,
             &mut state,
             None,
@@ -3483,8 +3452,7 @@ mod tests {
 
         let should_exit = handle_slash_command(
             "/explain",
-            &client,
-            "http://127.0.0.1:8000",
+            &api,
             None,
             &mut state,
             None,
@@ -3598,15 +3566,6 @@ mod tests {
         base
     }
 
-    /// HTTP/1.1-only client for mock server tests (axum test server is HTTP/1 only).
-    fn mock_client() -> reqwest::Client {
-        reqwest::Client::builder()
-            .http1_only()
-            .no_proxy()
-            .build()
-            .unwrap()
-    }
-
     /// Guard that serializes tests touching MO_AGENT_CREDENTIALS_DIR.
     /// Multiple async tests concurrently setting this env var is a data race;
     /// the guard ensures they execute sequentially.
@@ -3653,8 +3612,8 @@ mod tests {
             }),
         );
         let base = spawn_mock(app).await;
-        let client = mock_client();
-        let result = do_login(&client, &base, Some("__test__"), "user1", "pass1").await;
+        let api = mo_thin_client::ThinClient::new(&base, None).unwrap();
+        let result = do_login(&api, Some("__test__"), "user1", "pass1").await;
         assert_eq!(result.unwrap(), "tok-abc");
     }
 
@@ -3671,8 +3630,8 @@ mod tests {
             }),
         );
         let base = spawn_mock(app).await;
-        let client = mock_client();
-        let result = do_login(&client, &base, Some("test-profile"), "user1", "wrong").await;
+        let api = mo_thin_client::ThinClient::new(&base, None).unwrap();
+        let result = do_login(&api, Some("test-profile"), "user1", "wrong").await;
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("401"));
     }
@@ -3685,8 +3644,8 @@ mod tests {
             post(|| async { axum::Json(serde_json::json!({"ok": true})) }),
         );
         let base = spawn_mock(app).await;
-        let client = mock_client();
-        let result = do_register(&client, &base, "newuser", "a@b.com", "pass").await;
+        let api = mo_thin_client::ThinClient::new(&base, None).unwrap();
+        let result = do_register(&api, "newuser", "a@b.com", "pass").await;
         assert!(result.is_ok());
     }
 
@@ -3703,8 +3662,8 @@ mod tests {
             }),
         );
         let base = spawn_mock(app).await;
-        let client = mock_client();
-        let result = do_register(&client, &base, "taken", "a@b.com", "pass").await;
+        let api = mo_thin_client::ThinClient::new(&base, None).unwrap();
+        let result = do_register(&api, "taken", "a@b.com", "pass").await;
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("409"));
     }
@@ -3734,13 +3693,12 @@ mod tests {
             }),
         );
         let base = spawn_mock(app).await;
-        let client = mock_client();
+        let api = mo_thin_client::ThinClient::new(&base, None).unwrap();
         let registry = tool_registry::ToolRegistry::new(edge_tools::all_tool_schemas());
         let selector = tool_selector::TfIdfSelector::new(registry);
         let mut pm = PermissionManager::new(true);
         let result = stream_chat_sse(ChatTurnParams {
-            client: &client,
-            base: &base,
+            api: &api,
             token: "fake-token",
             message: "hi",
             session_id: None,
@@ -3776,13 +3734,12 @@ mod tests {
             }),
         );
         let base = spawn_mock(app).await;
-        let client = mock_client();
+        let api = mo_thin_client::ThinClient::new(&base, None).unwrap();
         let registry = tool_registry::ToolRegistry::new(edge_tools::all_tool_schemas());
         let selector = tool_selector::TfIdfSelector::new(registry);
         let mut pm = PermissionManager::new(true);
         let result = stream_chat_sse(ChatTurnParams {
-            client: &client,
-            base: &base,
+            api: &api,
             token: "fake-token",
             message: "hi",
             session_id: None,
@@ -3834,13 +3791,12 @@ mod tests {
             }),
         );
         let base = spawn_mock(app).await;
-        let client = mock_client();
+        let api = mo_thin_client::ThinClient::new(&base, None).unwrap();
         let registry = tool_registry::ToolRegistry::new(edge_tools::all_tool_schemas());
         let selector = tool_selector::TfIdfSelector::new(registry);
         let mut pm = PermissionManager::new(true); // auto-approve
         let result = stream_chat_sse(ChatTurnParams {
-            client: &client,
-            base: &base,
+            api: &api,
             token: "fake-token",
             message: "run echo hi",
             session_id: None,
@@ -3873,7 +3829,7 @@ mod tests {
             post(|| async { axum::Json(serde_json::json!({"session_id": "new-sess-42"})) }),
         );
         let base = spawn_mock(app).await;
-        let client = mock_client();
+        let api = mo_thin_client::ThinClient::new(&base, None).unwrap();
         let selector = tool_selector::TfIdfSelector::new(tool_registry::ToolRegistry::new(
             edge_tools::all_tool_schemas(),
         ));
@@ -3885,8 +3841,7 @@ mod tests {
         };
         let exit = handle_slash_command(
             "/clear",
-            &client,
-            &base,
+            &api,
             None,
             &mut state,
             Some("fake-token"),
@@ -3902,15 +3857,14 @@ mod tests {
 
     #[tokio::test]
     async fn slash_model_with_arg_sets_model() {
-        let client = mock_client();
+        let api = mo_thin_client::ThinClient::new("http://unused", None).unwrap();
         let selector = tool_selector::TfIdfSelector::new(tool_registry::ToolRegistry::new(
             edge_tools::all_tool_schemas(),
         ));
         let mut state = ReplState::default();
         let exit = handle_slash_command(
             "/model gpt-4o",
-            &client,
-            "http://unused",
+            &api,
             None,
             &mut state,
             None,
@@ -3924,15 +3878,14 @@ mod tests {
 
     #[tokio::test]
     async fn slash_exit_returns_true() {
-        let client = mock_client();
+        let api = mo_thin_client::ThinClient::new("http://unused", None).unwrap();
         let selector = tool_selector::TfIdfSelector::new(tool_registry::ToolRegistry::new(
             edge_tools::all_tool_schemas(),
         ));
         let mut state = ReplState::default();
         let exit = handle_slash_command(
             "/exit",
-            &client,
-            "http://unused",
+            &api,
             None,
             &mut state,
             None,
@@ -3945,15 +3898,14 @@ mod tests {
 
     #[tokio::test]
     async fn slash_unknown_command_does_not_crash() {
-        let client = mock_client();
+        let api = mo_thin_client::ThinClient::new("http://unused", None).unwrap();
         let selector = tool_selector::TfIdfSelector::new(tool_registry::ToolRegistry::new(
             edge_tools::all_tool_schemas(),
         ));
         let mut state = ReplState::default();
         let exit = handle_slash_command(
             "/nonexistent_command_xyz",
-            &client,
-            "http://unused",
+            &api,
             None,
             &mut state,
             None,
@@ -3966,7 +3918,7 @@ mod tests {
 
     #[tokio::test]
     async fn slash_health_does_not_crash_empty() {
-        let client = mock_client();
+        let api = mo_thin_client::ThinClient::new("http://unused", None).unwrap();
         let selector = tool_selector::TfIdfSelector::new(tool_registry::ToolRegistry::new(
             edge_tools::all_tool_schemas(),
         ));
@@ -3974,8 +3926,7 @@ mod tests {
         // No health entries — should print "no data" gracefully
         let exit = handle_slash_command(
             "/health",
-            &client,
-            "http://unused",
+            &api,
             None,
             &mut state,
             None,
@@ -3988,7 +3939,7 @@ mod tests {
 
     #[tokio::test]
     async fn slash_health_with_entries_does_not_crash() {
-        let client = mock_client();
+        let api = mo_thin_client::ThinClient::new("http://unused", None).unwrap();
         let selector = tool_selector::TfIdfSelector::new(tool_registry::ToolRegistry::new(
             edge_tools::all_tool_schemas(),
         ));
@@ -4013,8 +3964,7 @@ mod tests {
         };
         let exit = handle_slash_command(
             "/health",
-            &client,
-            "http://unused",
+            &api,
             None,
             &mut state,
             None,
@@ -4027,7 +3977,7 @@ mod tests {
 
     #[tokio::test]
     async fn slash_health_detail_mode() {
-        let client = mock_client();
+        let api = mo_thin_client::ThinClient::new("http://unused", None).unwrap();
         let selector = tool_selector::TfIdfSelector::new(tool_registry::ToolRegistry::new(
             edge_tools::all_tool_schemas(),
         ));
@@ -4043,8 +3993,7 @@ mod tests {
         };
         let exit = handle_slash_command(
             "/health detail",
-            &client,
-            "http://unused",
+            &api,
             None,
             &mut state,
             None,
@@ -4065,12 +4014,11 @@ mod tests {
             get(|| async { axum::Json(serde_json::json!({"status": "ok"})) }),
         );
         let base = spawn_mock(app).await;
-        let client = mock_client();
+        let api = mo_thin_client::ThinClient::new(&base, None).unwrap();
         let result = execute_cli_command(
             Some(Command::Health),
             Some("nonexistent-profile".to_string()),
-            &client,
-            &base,
+            &api,
         )
         .await;
         // Health command should succeed regardless of auth
@@ -4133,7 +4081,7 @@ mod tests {
             }),
         );
         let base = spawn_mock(app).await;
-        let client = mock_client();
+        let api = mo_thin_client::ThinClient::new(&base, None).unwrap();
         let mut state = ReplState {
             session_id: Some("sess-1".to_string()),
             ..Default::default()
@@ -4142,8 +4090,7 @@ mod tests {
         let result = handle_memory_domain_command(
             "/memory",
             "search rust preferences",
-            &client,
-            &base,
+            &api,
             &mut state,
             Some("fake-token"),
         )
@@ -5070,7 +5017,7 @@ total_tokens_out: 500
 
     #[tokio::test]
     async fn slash_health_offline_shows_cloud_section() {
-        let client = mock_client();
+        let api = mo_thin_client::ThinClient::new("http://unused", None).unwrap();
         let selector = tool_selector::TfIdfSelector::new(tool_registry::ToolRegistry::new(
             edge_tools::all_tool_schemas(),
         ));
@@ -5079,8 +5026,7 @@ total_tokens_out: 500
         assert!(state.matrixone_pool.is_none());
         let exit = handle_slash_command(
             "/health",
-            &client,
-            "http://unused",
+            &api,
             None,
             &mut state,
             None,

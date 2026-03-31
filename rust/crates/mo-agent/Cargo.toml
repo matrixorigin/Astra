@@ -11,6 +11,7 @@ path = "src/main.rs"
 mo-agent-core.workspace = true
 mo-agent-services.workspace = true
 mo-agent-runtime.workspace = true
+mo-thin-client.workspace = true
 async-trait.workspace = true
 axum.workspace = true
 chrono.workspace = true

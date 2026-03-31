@@ -219,8 +219,7 @@ fn review_search(executor: &edge_tools::ToolExecutor, pattern: &str) -> String {
 pub(super) async fn handle_info_command(
     cmd: &str,
     arg: &str,
-    client: &reqwest::Client,
-    base: &str,
+    api: &mo_thin_client::ThinClient,
     state: &mut ReplState,
     token: Option<&str>,
 ) -> Result<(), String> {
@@ -376,10 +375,9 @@ pub(super) async fn handle_info_command(
             ));
 
             // API health
-            match client.get(format!("{base}/health")).send().await {
-                Ok(r) => {
-                    let status = r.status();
-                    rows.push((status.is_success(), "api health", format!("HTTP {status}")));
+            match api.get_health_text().await {
+                Ok(_) => {
+                    rows.push((true, "api health", "OK".to_string()));
                 }
                 Err(e) => {
                     rows.push((false, "api health", e.to_string()));
@@ -388,23 +386,19 @@ pub(super) async fn handle_info_command(
 
             // Auth status
             if let Some(tok) = token {
-                match client
-                    .get(format!("{base}/auth/me"))
-                    .headers(auth_headers(tok)?)
-                    .send()
-                    .await
-                {
-                    Ok(r) if r.status().is_success() => {
-                        let b = r.text().await.unwrap_or_default();
+                match api.get_auth_me_text(tok).await {
+                    Ok(b) => {
                         let v: serde_json::Value = serde_json::from_str(&b).unwrap_or_default();
                         let un = v.get("username").and_then(|u| u.as_str()).unwrap_or("?");
                         rows.push((true, "auth", format!("logged in as {un}")));
                     }
-                    Ok(r) if r.status().as_u16() == 401 => {
+                    Err(mo_thin_client::ThinClientError::Api { status, .. })
+                        if status.as_u16() == 401 =>
+                    {
                         rows.push((false, "auth", "token expired — run /login".to_string()));
                     }
-                    Ok(r) => {
-                        rows.push((false, "auth", format!("HTTP {}", r.status())));
+                    Err(mo_thin_client::ThinClientError::Api { status, .. }) => {
+                        rows.push((false, "auth", format!("HTTP {status}")));
                     }
                     Err(e) => {
                         rows.push((false, "auth", e.to_string()));
@@ -435,7 +429,11 @@ pub(super) async fn handle_info_command(
             if memoria_key_set {
                 let memoria_base = std::env::var("MEMORIA_BASE_URL")
                     .unwrap_or_else(|_| mo_agent_core::config::DEFAULT_MEMORIA_URL.to_string());
-                match client.get(format!("{memoria_base}/health")).send().await {
+                let memoria_health = format!(
+                    "{}/health",
+                    memoria_base.trim_end_matches('/')
+                );
+                match api.get_url(&memoria_health).await {
                     Ok(r) if r.status().is_success() => {
                         rows.push((true, "memoria", format!("reachable at {memoria_base}")));
                     }

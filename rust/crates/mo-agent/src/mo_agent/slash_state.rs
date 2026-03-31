@@ -1,8 +1,7 @@
 use super::*;
 
 pub(super) struct StateCommandContext<'a> {
-    pub(super) client: &'a reqwest::Client,
-    pub(super) base: &'a str,
+    pub(super) api: &'a mo_thin_client::ThinClient,
     pub(super) profile: Option<&'a str>,
     pub(super) token: Option<&'a str>,
     pub(super) selector: &'a dyn tool_selector::ToolSelector,
@@ -15,8 +14,7 @@ pub(super) async fn handle_state_command(
     state: &mut ReplState,
 ) -> Result<(), String> {
     let StateCommandContext {
-        client,
-        base,
+        api,
         profile,
         token,
         selector,
@@ -27,62 +25,43 @@ pub(super) async fn handle_state_command(
                 eprintln!("{}", "  Not logged in. Use /login.".yellow());
                 return Ok(());
             };
-            let resp = client
-                .post(format!("{base}/sessions"))
-                .headers(auth_headers(tok)?)
-                .json(&serde_json::json!({}))
-                .send()
+            let body = api
+                .post_sessions_json(tok, &serde_json::json!({}))
                 .await
-                .map_err(|e| e.to_string())?;
-            let status = resp.status();
-            let body = resp.text().await.map_err(|e| e.to_string())?;
-            if !status.is_success() {
-                eprintln!(
-                    "{}",
-                    format!(
-                        "  \u{2717} API Error ({}): {}",
-                        status,
-                        compact_or_raw(&body)
-                    )
-                    .red()
-                );
-            } else {
-                let value: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
-                let new_sid = value
-                    .get("session_id")
-                    .or_else(|| value.get("id"))
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string());
-                if let Some(sid) = &new_sid {
-                    let mut creds = load_credentials();
-                    let pname = profile_name(profile, &creds);
-                    let p = creds.profiles.entry(pname).or_default();
-                    p.last_session_id = Some(sid.clone());
-                    let _ = save_credentials(&creds);
-                }
-                // Reset all per-session state so the new session starts clean
-                state.session_id = new_sid.clone();
-                state.turn = 0;
-                state.run_id = None;
-                state.history.clear();
-                state.total_prompt_tokens = 0;
-                state.total_completion_tokens = 0;
-                // Initialize journal for new session
-                if let Some(ref sid) = new_sid {
-                    state.journal = session_journal::JournalWriter::new(sid).ok();
-                    if let Some(ref j) = state.journal {
-                        let _ = j.append(&session_journal::JournalEvent::session_start(
-                            Some(sid),
-                            state.model.as_deref(),
-                        ));
-                    }
-                }
-                let display = new_sid.as_deref().unwrap_or("(none)");
-                eprintln!(
-                    "{}",
-                    format!("  \u{2713}  New session: {}", display).green()
-                );
+                .map_err(map_thin_err)?;
+            let value: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
+            let new_sid = value
+                .get("session_id")
+                .or_else(|| value.get("id"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            if let Some(sid) = &new_sid {
+                let mut creds = load_credentials();
+                let pname = profile_name(profile, &creds);
+                let p = creds.profiles.entry(pname).or_default();
+                p.last_session_id = Some(sid.clone());
+                let _ = save_credentials(&creds);
             }
+            state.session_id = new_sid.clone();
+            state.turn = 0;
+            state.run_id = None;
+            state.history.clear();
+            state.total_prompt_tokens = 0;
+            state.total_completion_tokens = 0;
+            if let Some(ref sid) = new_sid {
+                state.journal = session_journal::JournalWriter::new(sid).ok();
+                if let Some(ref j) = state.journal {
+                    let _ = j.append(&session_journal::JournalEvent::session_start(
+                        Some(sid),
+                        state.model.as_deref(),
+                    ));
+                }
+            }
+            let display = new_sid.as_deref().unwrap_or("(none)");
+            eprintln!(
+                "{}",
+                format!("  \u{2713}  New session: {}", display).green()
+            );
         }
 
         "/explain" => {
@@ -133,8 +112,7 @@ pub(super) async fn handle_state_command(
             let mut auto_pm = PermissionManager::new(true);
             let summary_result = tokio::select! {
                 r = stream_chat_sse(ChatTurnParams {
-                    client,
-                    base,
+                    api,
                     token: tok,
                     message: prompts::COMPACT_SUMMARY_REQUEST,
                     session_id: state.session_id.as_deref(),
@@ -185,11 +163,8 @@ pub(super) async fn handle_state_command(
                     prompts::memory_proto::ST_SUMMARY,
                     &summary,
                 );
-                match client
-                    .post(format!("{base}/memory/store"))
-                    .headers(auth_headers(tok)?)
-                    .json(&entry.to_store_payload_with_meta(&meta))
-                    .send()
+                match api
+                    .post_memory_store_json(tok, &entry.to_store_payload_with_meta(&meta))
                     .await
                 {
                     Ok(r) if r.status().is_success() => saved_to_memoria = true,
@@ -208,8 +183,7 @@ pub(super) async fn handle_state_command(
                     let extract_msg = format!("{}{summary}", prompts::MEMORY_EXTRACTOR_PROMPT);
                     let mut auto_pm2 = PermissionManager::new(true);
                     let extract_result = stream_chat_sse(ChatTurnParams {
-                        client,
-                        base,
+                        api,
                         token: tok,
                         message: &extract_msg,
                         session_id: state.session_id.as_deref(),
@@ -240,11 +214,8 @@ pub(super) async fn handle_state_command(
                                 mem_type,
                                 fact,
                             );
-                            let _ = client
-                                .post(format!("{base}/memory/store"))
-                                .headers(auth_headers(tok)?)
-                                .json(&fact_entry.to_store_payload_with_meta(&fact_meta))
-                                .send()
+                            let _ = api
+                                .post_memory_store_json(tok, &fact_entry.to_store_payload_with_meta(&fact_meta))
                                 .await;
                             facts_stored += 1;
                         }
@@ -262,8 +233,7 @@ pub(super) async fn handle_state_command(
                             );
                             let mut auto_pm3 = PermissionManager::new(true);
                             let synth_result = stream_chat_sse(ChatTurnParams {
-                                client,
-                                base,
+                                api,
                                 token: tok,
                                 message: &synthesis_prompt,
                                 session_id: state.session_id.as_deref(),
@@ -297,13 +267,11 @@ pub(super) async fn handle_state_command(
                                         state.turn,
                                         prompts::memory_proto::SRC_SYNTHESIS,
                                     );
-                                    let _ = client
-                                        .post(format!("{base}/memory/store"))
-                                        .headers(auth_headers(tok)?)
-                                        .json(
+                                    let _ = api
+                                        .post_memory_store_json(
+                                            tok,
                                             &insight_entry.to_store_payload_with_meta(&synth_meta),
                                         )
-                                        .send()
                                         .await;
                                     facts_stored += 1; // count insight as a stored fact
                                 }
@@ -349,11 +317,8 @@ pub(super) async fn handle_state_command(
                             state.turn,
                             prompts::memory_proto::SRC_COMPACT,
                         );
-                        let _ = client
-                            .post(format!("{base}/memory/store"))
-                            .headers(auth_headers(tok)?)
-                            .json(&swap_entry.to_store_payload_with_meta(&swap_meta))
-                            .send()
+                        let _ = api
+                            .post_memory_store_json(tok, &swap_entry.to_store_payload_with_meta(&swap_meta))
                             .await;
                     }
                 }
@@ -429,7 +394,7 @@ pub(super) async fn handle_state_command(
                 "history",
                 "performance",
             ];
-            let mut url = format!("{base}/chat/session/{sid}/reflect");
+            let mut rel = mo_thin_client::paths::chat_session_reflect(&sid).trim_start_matches('/').to_string();
             let mut query_parts: Vec<String> = Vec::new();
             let mut parts2 = arg.splitn(2, ' ');
             let first = parts2.next().unwrap_or("").trim();
@@ -445,23 +410,17 @@ pub(super) async fn handle_state_command(
                 query_parts.push(format!("question={}", urlencoding(arg)));
             }
             if !query_parts.is_empty() {
-                url = format!("{}?{}", url, query_parts.join("&"));
+                rel = format!("{rel}?{}", query_parts.join("&"));
             }
-            let resp = client
-                .get(&url)
-                .headers(auth_headers(tok)?)
-                .send()
-                .await
-                .map_err(|e| e.to_string())?;
-            let status = resp.status();
-            let body = resp.text().await.map_err(|e| e.to_string())?;
-            if !status.is_success() {
-                eprintln!(
-                    "{}",
-                    format!("  ✗ API Error ({}): {}", status, compact_or_raw(&body)).red()
-                );
-            } else {
-                render_reflect_report(&body, &sid);
+            match api.get_authed_path_text(tok, &rel).await {
+                Ok(body) => render_reflect_report(&body, &sid),
+                Err(mo_thin_client::ThinClientError::Api { status, body: err_body }) => {
+                    eprintln!(
+                        "{}",
+                        format!("  ✗ API Error ({}): {}", status, compact_or_raw(&err_body)).red()
+                    );
+                }
+                Err(e) => eprintln!("{}", format!("  ✗ Reflect failed: {e}").red()),
             }
         }
         _ => unreachable!("unexpected state command: {cmd}"),

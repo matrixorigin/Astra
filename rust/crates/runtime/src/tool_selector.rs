@@ -34,6 +34,7 @@ use crate::pipeline::routing::{DomainHint, RoutingEngine, TaskType};
 use crate::tool_registry::{self, TOOL_CATALOG, ToolQualityTracker, ToolRegistry};
 use crate::turn::routing_metrics::ConfidenceCalibrator;
 use async_trait::async_trait;
+use mo_thin_client::ThinClient;
 use serde_json::Value;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -827,8 +828,7 @@ fn parse_tool_names_from_llm(text: &str) -> Vec<String> {
 ///
 /// If the call fails, returns an empty result so the fallback can take over.
 pub struct LlmToolSelector {
-    client: reqwest::Client,
-    base_url: String,
+    api: ThinClient,
     token: String,
     model: Option<String>,
     catalog_summary: String,
@@ -837,11 +837,10 @@ pub struct LlmToolSelector {
 }
 
 impl LlmToolSelector {
-    pub fn new(client: reqwest::Client, base_url: String, token: String) -> Self {
+    pub fn new(api: ThinClient, token: String) -> Self {
         let catalog_summary = build_catalog_summary();
         Self {
-            client,
-            base_url,
+            api,
             token,
             model: None,
             catalog_summary,
@@ -878,13 +877,8 @@ impl LlmToolSelector {
         }
 
         let resp = self
-            .client
-            .post(format!("{}/chat/turn", self.base_url))
-            .header("authorization", format!("Bearer {}", self.token))
-            .header("accept", "text/event-stream")
-            .json(&payload)
-            .timeout(Duration::from_secs(8))
-            .send()
+            .api
+            .post_chat_turn_timeout(&self.token, &payload, Duration::from_secs(8))
             .await
             .map_err(|e| format!("tool-select LLM call failed: {e}"))?;
 

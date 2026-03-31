@@ -10,24 +10,15 @@ pub(super) fn clear_profile_last_session(profile: Option<&str>) -> Result<(), St
 }
 
 pub(super) async fn do_login(
-    client: &reqwest::Client,
-    base: &str,
+    api: &mo_thin_client::ThinClient,
     profile: Option<&str>,
     username: &str,
     password: &str,
 ) -> Result<String, String> {
-    let resp = client
-        .post(format!("{base}/auth/login"))
-        .header(CONTENT_TYPE, "application/json")
-        .json(&serde_json::json!({ "username": username, "password": password }))
-        .send()
+    let body = api
+        .post_auth_login_json(&serde_json::json!({ "username": username, "password": password }))
         .await
-        .map_err(|e| e.to_string())?;
-    let status = resp.status();
-    let body = resp.text().await.map_err(|e| e.to_string())?;
-    if !status.is_success() {
-        return Err(read_api_error(status, &body));
-    }
+        .map_err(map_thin_err)?;
     let value: serde_json::Value = serde_json::from_str(&body).map_err(|e| e.to_string())?;
     let access = value
         .get("access_token")
@@ -57,27 +48,17 @@ pub(super) async fn do_login(
 }
 
 pub(super) async fn do_register(
-    client: &reqwest::Client,
-    base: &str,
+    api: &mo_thin_client::ThinClient,
     username: &str,
     email: &str,
     password: &str,
 ) -> Result<(), String> {
-    let resp = client
-        .post(format!("{base}/auth/register"))
-        .header(CONTENT_TYPE, "application/json")
-        .json(&serde_json::json!({
+    api.post_auth_register_json(&serde_json::json!({
             "username": username,
             "email": email,
             "password": password,
         }))
-        .send()
         .await
-        .map_err(|e| e.to_string())?;
-    let status = resp.status();
-    let body = resp.text().await.map_err(|e| e.to_string())?;
-    if !status.is_success() {
-        return Err(read_api_error(status, &body));
-    }
+        .map_err(map_thin_err)?;
     Ok(())
 }

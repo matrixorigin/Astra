@@ -1,7 +1,8 @@
 use std::fs;
 
 use clap::Parser;
-use reqwest::header::CONTENT_TYPE;
+use mo_thin_client::paths;
+use mo_thin_client::ThinClient;
 
 mod cli_args;
 mod credentials;
@@ -18,33 +19,22 @@ use interactive::run_interactive;
 #[tokio::main]
 async fn main() -> Result<(), String> {
     let cli = Cli::parse();
-    let client = reqwest::Client::builder()
-        .no_proxy()
-        .build()
-        .expect("http client should build");
     let base = cli.api_url.trim_end_matches('/').to_string();
+    let api = ThinClient::new(&base, None).map_err(|e| e.to_string())?;
     let command = cli.command.unwrap_or(Command::Interactive);
 
     match command {
-        Command::Interactive => run_interactive(&client, &base, cli.profile.as_deref()).await,
+        Command::Interactive => run_interactive(&api, cli.profile.as_deref()).await,
         Command::Login(args) => {
             let username = prompt_or("Username", args.username)?;
             let password = prompt_or("Password", args.password)?;
-            let resp = client
-                .post(format!("{base}/auth/login"))
-                .header(CONTENT_TYPE, "application/json")
-                .json(&serde_json::json!({
+            let body = api
+                .post_auth_login_json(&serde_json::json!({
                     "username": username,
                     "password": password
                 }))
-                .send()
                 .await
-                .map_err(|e| e.to_string())?;
-            let status = resp.status();
-            let body = resp.text().await.map_err(|e| e.to_string())?;
-            if !status.is_success() {
-                return Err(read_api_error(status, &body));
-            }
+                .map_err(map_thin_err)?;
             let value: serde_json::Value =
                 serde_json::from_str(&body).map_err(|e| e.to_string())?;
             let access = value
@@ -78,38 +68,20 @@ async fn main() -> Result<(), String> {
             let email = args
                 .email
                 .unwrap_or_else(|| format!("{username}@example.com"));
-            let resp = client
-                .post(format!("{base}/auth/register"))
-                .header(CONTENT_TYPE, "application/json")
-                .json(&serde_json::json!({
+            let body = api
+                .post_auth_register_json(&serde_json::json!({
                     "username": username,
                     "email": email,
                     "password": password
                 }))
-                .send()
                 .await
-                .map_err(|e| e.to_string())?;
-            let status = resp.status();
-            let body = resp.text().await.map_err(|e| e.to_string())?;
-            if !status.is_success() {
-                return Err(read_api_error(status, &body));
-            }
+                .map_err(map_thin_err)?;
             print_json_or_raw(&body);
             Ok(())
         }
         Command::Whoami => {
             let (_, _, _, token) = get_profile_and_token(cli.profile.as_deref())?;
-            let resp = client
-                .get(format!("{base}/auth/me"))
-                .headers(auth_headers(&token)?)
-                .send()
-                .await
-                .map_err(|e| e.to_string())?;
-            let status = resp.status();
-            let body = resp.text().await.map_err(|e| e.to_string())?;
-            if !status.is_success() {
-                return Err(read_api_error(status, &body));
-            }
+            let body = api.get_auth_me_text(&token).await.map_err(map_thin_err)?;
             print_json_or_raw(&body);
             Ok(())
         }
@@ -124,18 +96,10 @@ async fn main() -> Result<(), String> {
             let refresh_token = profile
                 .refresh_token
                 .ok_or_else(|| format!("profile '{name}' has no refresh token"))?;
-            let resp = client
-                .post(format!("{base}/auth/refresh"))
-                .header(CONTENT_TYPE, "application/json")
-                .json(&serde_json::json!({ "refresh_token": refresh_token }))
-                .send()
+            let body = api
+                .post_auth_refresh_json(&serde_json::json!({ "refresh_token": refresh_token }))
                 .await
-                .map_err(|e| e.to_string())?;
-            let status = resp.status();
-            let body = resp.text().await.map_err(|e| e.to_string())?;
-            if !status.is_success() {
-                return Err(read_api_error(status, &body));
-            }
+                .map_err(map_thin_err)?;
             let value: serde_json::Value =
                 serde_json::from_str(&body).map_err(|e| e.to_string())?;
             let new_access = value
@@ -164,18 +128,10 @@ async fn main() -> Result<(), String> {
             let refresh_token = profile
                 .refresh_token
                 .ok_or_else(|| format!("profile '{name}' has no refresh token"))?;
-            let resp = client
-                .post(format!("{base}/auth/logout"))
-                .header(CONTENT_TYPE, "application/json")
-                .json(&serde_json::json!({ "refresh_token": refresh_token }))
-                .send()
+            let body = api
+                .post_auth_logout_json(&serde_json::json!({ "refresh_token": refresh_token }))
                 .await
-                .map_err(|e| e.to_string())?;
-            let status = resp.status();
-            let body = resp.text().await.map_err(|e| e.to_string())?;
-            if !status.is_success() {
-                return Err(read_api_error(status, &body));
-            }
+                .map_err(map_thin_err)?;
             if let Some(entry) = creds.profiles.get_mut(&name) {
                 entry.access_token = None;
                 entry.refresh_token = None;
@@ -186,148 +142,100 @@ async fn main() -> Result<(), String> {
         }
         Command::Init => {
             let (_, _, _, token) = get_profile_and_token(cli.profile.as_deref())?;
-            let resp = client
-                .post(format!("{base}/admin/init"))
-                .headers(auth_headers(&token)?)
-                .send()
+            let body = api
+                .post_bearer_path_empty_text(&token, paths::ADMIN_INIT)
                 .await
-                .map_err(|e| e.to_string())?;
-            let status = resp.status();
-            let body = resp.text().await.map_err(|e| e.to_string())?;
-            if !status.is_success() {
-                return Err(read_api_error(status, &body));
-            }
+                .map_err(map_thin_err)?;
             print_json_or_raw(&body);
             Ok(())
         }
         Command::Audit(args) => {
             let (_, _, _, token) = get_profile_and_token(cli.profile.as_deref())?;
-            let mut req = client
-                .get(format!("{base}/admin/audit"))
-                .headers(auth_headers(&token)?)
-                .query(&[("limit", args.limit.to_string())]);
+            let mut q: Vec<(&str, String)> = vec![("limit", args.limit.to_string())];
             if let Some(user_id) = args.user_id {
-                req = req.query(&[("user_id", user_id)]);
+                q.push(("user_id", user_id));
             }
             if let Some(since) = args.since {
-                req = req.query(&[("since", since)]);
+                q.push(("since", since));
             }
-            let resp = req.send().await.map_err(|e| e.to_string())?;
-            let status = resp.status();
-            let body = resp.text().await.map_err(|e| e.to_string())?;
-            if !status.is_success() {
-                return Err(read_api_error(status, &body));
-            }
+            let body = api
+                .get_bearer_path_query_text(&token, paths::ADMIN_AUDIT, &q)
+                .await
+                .map_err(map_thin_err)?;
             print_json_or_raw(&body);
             Ok(())
         }
         Command::User(UserCmd::GrantRole(args)) => {
             let (_, _, _, token) = get_profile_and_token(cli.profile.as_deref())?;
-            let resp = client
-                .post(format!("{base}/admin/users/grant-role"))
-                .headers(auth_headers(&token)?)
-                .json(&serde_json::json!({
-                    "username": args.username,
-                    "role_name": args.role_name
-                }))
-                .send()
+            let body = api
+                .post_bearer_path_json_text(
+                    &token,
+                    paths::ADMIN_USERS_GRANT_ROLE,
+                    &serde_json::json!({
+                        "username": args.username,
+                        "role_name": args.role_name
+                    }),
+                )
                 .await
-                .map_err(|e| e.to_string())?;
-            let status = resp.status();
-            let body = resp.text().await.map_err(|e| e.to_string())?;
-            if !status.is_success() {
-                return Err(read_api_error(status, &body));
-            }
+                .map_err(map_thin_err)?;
             print_json_or_raw(&body);
             Ok(())
         }
         Command::User(UserCmd::RevokeRole(args)) => {
             let (_, _, _, token) = get_profile_and_token(cli.profile.as_deref())?;
-            let resp = client
-                .post(format!("{base}/admin/users/revoke-role"))
-                .headers(auth_headers(&token)?)
-                .json(&serde_json::json!({
-                    "username": args.username,
-                    "role_name": args.role_name
-                }))
-                .send()
+            let body = api
+                .post_bearer_path_json_text(
+                    &token,
+                    paths::ADMIN_USERS_REVOKE_ROLE,
+                    &serde_json::json!({
+                        "username": args.username,
+                        "role_name": args.role_name
+                    }),
+                )
                 .await
-                .map_err(|e| e.to_string())?;
-            let status = resp.status();
-            let body = resp.text().await.map_err(|e| e.to_string())?;
-            if !status.is_success() {
-                return Err(read_api_error(status, &body));
-            }
+                .map_err(map_thin_err)?;
             print_json_or_raw(&body);
             Ok(())
         }
         Command::Model(ModelCmd::List) => {
             let (_, _, _, token) = get_profile_and_token(cli.profile.as_deref())?;
-            let resp = client
-                .get(format!("{base}/models"))
-                .headers(auth_headers(&token)?)
-                .send()
-                .await
-                .map_err(|e| e.to_string())?;
-            let status = resp.status();
-            let body = resp.text().await.map_err(|e| e.to_string())?;
-            if !status.is_success() {
-                return Err(read_api_error(status, &body));
-            }
+            let body = api.get_models_text(&token).await.map_err(map_thin_err)?;
             print_json_or_raw(&body);
             Ok(())
         }
         Command::Model(ModelCmd::Add(args)) => {
             let (_, _, _, token) = get_profile_and_token(cli.profile.as_deref())?;
-            let resp = client
-                .post(format!("{base}/models"))
-                .headers(auth_headers(&token)?)
-                .json(&serde_json::json!({
-                    "name": args.name,
-                    "provider": args.provider,
-                    "api_key": args.api_key,
-                    "base_url": args.base_url
-                }))
-                .send()
+            let body = api
+                .post_bearer_path_json_text(
+                    &token,
+                    paths::MODELS,
+                    &serde_json::json!({
+                        "name": args.name,
+                        "provider": args.provider,
+                        "api_key": args.api_key,
+                        "base_url": args.base_url
+                    }),
+                )
                 .await
-                .map_err(|e| e.to_string())?;
-            let status = resp.status();
-            let body = resp.text().await.map_err(|e| e.to_string())?;
-            if !status.is_success() {
-                return Err(read_api_error(status, &body));
-            }
+                .map_err(map_thin_err)?;
             print_json_or_raw(&body);
             Ok(())
         }
         Command::Model(ModelCmd::Show(args)) => {
             let (_, _, _, token) = get_profile_and_token(cli.profile.as_deref())?;
-            let resp = client
-                .get(format!("{base}/models/{}", args.model_name))
-                .headers(auth_headers(&token)?)
-                .send()
+            let body = api
+                .get_model_text(&token, &args.model_name)
                 .await
-                .map_err(|e| e.to_string())?;
-            let status = resp.status();
-            let body = resp.text().await.map_err(|e| e.to_string())?;
-            if !status.is_success() {
-                return Err(read_api_error(status, &body));
-            }
+                .map_err(map_thin_err)?;
             print_json_or_raw(&body);
             Ok(())
         }
         Command::Model(ModelCmd::Delete(args)) => {
             let (_, _, _, token) = get_profile_and_token(cli.profile.as_deref())?;
-            let resp = client
-                .delete(format!("{base}/models/{}", args.model_name))
-                .headers(auth_headers(&token)?)
-                .send()
+            let body = api
+                .delete_bearer_path_text(&token, &paths::model(&args.model_name))
                 .await
-                .map_err(|e| e.to_string())?;
-            let status = resp.status();
-            let body = resp.text().await.map_err(|e| e.to_string())?;
-            if !status.is_success() {
-                return Err(read_api_error(status, &body));
-            }
+                .map_err(map_thin_err)?;
             if body.is_empty() {
                 println!("deleted");
             } else {
@@ -337,17 +245,10 @@ async fn main() -> Result<(), String> {
         }
         Command::Model(ModelCmd::Check(args)) => {
             let (_, _, _, token) = get_profile_and_token(cli.profile.as_deref())?;
-            let resp = client
-                .post(format!("{base}/models/{}/check", args.model_name))
-                .headers(auth_headers(&token)?)
-                .send()
+            let body = api
+                .post_bearer_path_empty_text(&token, &paths::model_check(&args.model_name))
                 .await
-                .map_err(|e| e.to_string())?;
-            let status = resp.status();
-            let body = resp.text().await.map_err(|e| e.to_string())?;
-            if !status.is_success() {
-                return Err(read_api_error(status, &body));
-            }
+                .map_err(map_thin_err)?;
             print_json_or_raw(&body);
             Ok(())
         }
@@ -355,7 +256,6 @@ async fn main() -> Result<(), String> {
             let content = fs::read_to_string(&args.path).map_err(|e| e.to_string())?;
             let doc: serde_yaml::Value =
                 serde_yaml::from_str(&content).map_err(|e| e.to_string())?;
-            // Support both `models: [...]` and bare `- name: ...` array formats
             let models = if let Some(seq) = doc.as_sequence() {
                 seq
             } else {
@@ -382,184 +282,147 @@ async fn main() -> Result<(), String> {
                     .get("base_url")
                     .and_then(serde_yaml::Value::as_str)
                     .map(ToString::to_string);
-                let resp = client
-                    .post(format!("{base}/models"))
-                    .headers(auth_headers(&token)?)
-                    .json(&serde_json::json!({
-                        "name": model_name,
-                        "provider": provider,
-                        "api_key": api_key,
-                        "base_url": base_url
-                    }))
-                    .send()
+                let payload = serde_json::json!({
+                    "name": model_name,
+                    "provider": provider,
+                    "api_key": api_key,
+                    "base_url": base_url
+                });
+                match api
+                    .post_bearer_path_json_text(&token, paths::MODELS, &payload)
                     .await
-                    .map_err(|e| e.to_string())?;
-                let status = resp.status();
-                let body = resp.text().await.map_err(|e| e.to_string())?;
-                if !status.is_success() {
-                    if body.contains("already exists") {
+                {
+                    Ok(_) => println!("loaded model: {model_name}"),
+                    Err(mo_thin_client::ThinClientError::Api { body, .. })
+                        if body.contains("already exists") =>
+                    {
                         println!("skipped (already exists): {model_name}");
-                        continue;
                     }
-                    return Err(read_api_error(status, &body));
+                    Err(e) => return Err(map_thin_err(e)),
                 }
-                println!("loaded model: {model_name}");
             }
             Ok(())
         }
         Command::Token(TokenCmd::List(args)) => {
             let (_, _, _, token) = get_profile_and_token(cli.profile.as_deref())?;
-            let mut req = client
-                .get(format!("{base}/admin/tokens"))
-                .headers(auth_headers(&token)?);
+            let mut q: Vec<(&str, String)> = Vec::new();
             if let Some(token_type) = args.token_type {
-                req = req.query(&[("token_type", token_type)]);
+                q.push(("token_type", token_type));
             }
             if let Some(scope) = args.scope {
-                req = req.query(&[("scope", scope)]);
+                q.push(("scope", scope));
             }
-            let resp = req.send().await.map_err(|e| e.to_string())?;
-            let status = resp.status();
-            let body = resp.text().await.map_err(|e| e.to_string())?;
-            if !status.is_success() {
-                return Err(read_api_error(status, &body));
-            }
+            let body = api
+                .get_bearer_path_query_text(&token, paths::ADMIN_TOKENS, &q)
+                .await
+                .map_err(map_thin_err)?;
             print_json_or_raw(&body);
             Ok(())
         }
         Command::Token(TokenCmd::Create(args)) => {
             let (_, _, _, token) = get_profile_and_token(cli.profile.as_deref())?;
-            let resp = client
-                .post(format!("{base}/admin/tokens"))
-                .headers(auth_headers(&token)?)
-                .json(&serde_json::json!({
-                    "token_type": args.token_type,
-                    "provider": args.provider,
-                    "scope": args.scope,
-                    "scope_id": args.scope_id,
-                    "token_value": args.token_value
-                }))
-                .send()
+            let body = api
+                .post_bearer_path_json_text(
+                    &token,
+                    paths::ADMIN_TOKENS,
+                    &serde_json::json!({
+                        "token_type": args.token_type,
+                        "provider": args.provider,
+                        "scope": args.scope,
+                        "scope_id": args.scope_id,
+                        "token_value": args.token_value
+                    }),
+                )
                 .await
-                .map_err(|e| e.to_string())?;
-            let status = resp.status();
-            let body = resp.text().await.map_err(|e| e.to_string())?;
-            if !status.is_success() {
-                return Err(read_api_error(status, &body));
-            }
+                .map_err(map_thin_err)?;
             print_json_or_raw(&body);
             Ok(())
         }
         Command::Skill(SkillCmd::List(args)) => {
             let (_, _, _, token) = get_profile_and_token(cli.profile.as_deref())?;
-            let resp = client
-                .get(format!("{base}/skills"))
-                .headers(auth_headers(&token)?)
-                .query(&[
-                    ("limit", args.limit.to_string()),
-                    ("offset", args.offset.to_string()),
-                ])
-                .send()
+            let q = vec![
+                ("limit", args.limit.to_string()),
+                ("offset", args.offset.to_string()),
+            ];
+            let body = api
+                .get_skills_query_text(&token, &q)
                 .await
-                .map_err(|e| e.to_string())?;
-            let status = resp.status();
-            let body = resp.text().await.map_err(|e| e.to_string())?;
-            if !status.is_success() {
-                return Err(read_api_error(status, &body));
-            }
+                .map_err(map_thin_err)?;
             print_json_or_raw(&body);
             Ok(())
         }
         Command::Skill(SkillCmd::Show(args)) => {
             let (_, _, _, token) = get_profile_and_token(cli.profile.as_deref())?;
-            let mut req = client
-                .get(format!("{base}/skills/{}", args.skill_id))
-                .headers(auth_headers(&token)?);
-            if let Some(version) = args.version {
-                req = req.query(&[("version", version)]);
-            }
-            let resp = req.send().await.map_err(|e| e.to_string())?;
-            let status = resp.status();
-            let body = resp.text().await.map_err(|e| e.to_string())?;
-            if !status.is_success() {
-                return Err(read_api_error(status, &body));
-            }
+            let q: Vec<(&str, String)> = if let Some(version) = args.version {
+                vec![("version", version)]
+            } else {
+                vec![]
+            };
+            let body = api
+                .get_skill_query_text(&token, &args.skill_id, &q)
+                .await
+                .map_err(map_thin_err)?;
             print_json_or_raw(&body);
             Ok(())
         }
         Command::Skill(SkillCmd::Versions(args)) => {
             let (_, _, _, token) = get_profile_and_token(cli.profile.as_deref())?;
-            let resp = client
-                .get(format!("{base}/skills/{}/versions", args.skill_name))
-                .headers(auth_headers(&token)?)
-                .send()
+            let body = api
+                .get_bearer_path_query_text(
+                    &token,
+                    &paths::skill_versions(&args.skill_name),
+                    &[],
+                )
                 .await
-                .map_err(|e| e.to_string())?;
-            let status = resp.status();
-            let body = resp.text().await.map_err(|e| e.to_string())?;
-            if !status.is_success() {
-                return Err(read_api_error(status, &body));
-            }
+                .map_err(map_thin_err)?;
             print_json_or_raw(&body);
             Ok(())
         }
         Command::Prompt(PromptCmd::Optimize(args)) => {
             let (_, _, _, token) = get_profile_and_token(cli.profile.as_deref())?;
-            let resp = client
-                .post(format!("{base}/admin/prompts/optimize"))
-                .headers(auth_headers(&token)?)
-                .json(&serde_json::json!({
-                    "agent_id": args.agent_id,
-                    "optimization_type": args.optimization_type
-                }))
-                .send()
+            let body = api
+                .post_bearer_path_json_text(
+                    &token,
+                    paths::ADMIN_PROMPTS_OPTIMIZE,
+                    &serde_json::json!({
+                        "agent_id": args.agent_id,
+                        "optimization_type": args.optimization_type
+                    }),
+                )
                 .await
-                .map_err(|e| e.to_string())?;
-            let status = resp.status();
-            let body = resp.text().await.map_err(|e| e.to_string())?;
-            if !status.is_success() {
-                return Err(read_api_error(status, &body));
-            }
+                .map_err(map_thin_err)?;
             print_json_or_raw(&body);
             Ok(())
         }
         Command::Feedback(FeedbackCmd::Stats(args)) => {
             let (_, _, _, token) = get_profile_and_token(cli.profile.as_deref())?;
-            let mut req = client
-                .get(format!("{base}/admin/feedback/stats"))
-                .headers(auth_headers(&token)?);
+            let mut q: Vec<(&str, String)> = Vec::new();
             if let Some(agent_id) = args.agent_id {
-                req = req.query(&[("agent_id", agent_id)]);
+                q.push(("agent_id", agent_id));
             }
             if let Some(since) = args.since {
-                req = req.query(&[("since", since)]);
+                q.push(("since", since));
             }
-            let resp = req.send().await.map_err(|e| e.to_string())?;
-            let status = resp.status();
-            let body = resp.text().await.map_err(|e| e.to_string())?;
-            if !status.is_success() {
-                return Err(read_api_error(status, &body));
-            }
+            let body = api
+                .get_bearer_path_query_text(&token, paths::ADMIN_FEEDBACK_STATS, &q)
+                .await
+                .map_err(map_thin_err)?;
             print_json_or_raw(&body);
             Ok(())
         }
         Command::Feedback(FeedbackCmd::Export(args)) => {
             let (_, _, _, token) = get_profile_and_token(cli.profile.as_deref())?;
-            let resp = client
-                .post(format!("{base}/admin/feedback/export"))
-                .headers(auth_headers(&token)?)
-                .json(&serde_json::json!({
-                    "agent_id": args.agent_id,
-                    "format": args.format
-                }))
-                .send()
+            let body = api
+                .post_bearer_path_json_text(
+                    &token,
+                    paths::ADMIN_FEEDBACK_EXPORT,
+                    &serde_json::json!({
+                        "agent_id": args.agent_id,
+                        "format": args.format
+                    }),
+                )
                 .await
-                .map_err(|e| e.to_string())?;
-            let status = resp.status();
-            let body = resp.text().await.map_err(|e| e.to_string())?;
-            if !status.is_success() {
-                return Err(read_api_error(status, &body));
-            }
+                .map_err(map_thin_err)?;
             print_json_or_raw(&body);
             Ok(())
         }
