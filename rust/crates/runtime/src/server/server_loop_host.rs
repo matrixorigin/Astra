@@ -21,10 +21,12 @@ use async_trait::async_trait;
 use serde_json::{Map, Value, json};
 use tokio::sync::Mutex as TokioMutex;
 
-use crate::turn::agentic_loop_host::{AgenticLoopHost, AgenticLoopState, HostTurnResult};
 use crate::turn::agentic_headless_round::HeadlessStderrStyle;
+use crate::turn::agentic_loop_host::{AgenticLoopHost, AgenticLoopState, HostTurnResult};
 use crate::turn::chat_turn_sse_dispatch::ChatTurnSseAccum;
-use crate::turn::llm_client::{LlmCallResult, cached_system_prompt, call_llm_and_collect, classify_llm_error};
+use crate::turn::llm_client::{
+    LlmCallResult, cached_system_prompt, call_llm_and_collect, classify_llm_error,
+};
 use crate::turn::tool_schema_prune::prune_tool_schemas;
 use crate::{FernetTokenEncryptor, MatrixOneSettings};
 use mo_agent_core::SharedPool;
@@ -277,8 +279,7 @@ impl ServerAgenticLoopHost {
             .sum();
         let mut all_msgs = llm_messages.clone();
         all_msgs.extend(state.messages.iter().cloned());
-        let cache_est =
-            crate::prompts::estimate_tokens_cache_aware(&all_msgs, tool_schema_tokens);
+        let cache_est = crate::prompts::estimate_tokens_cache_aware(&all_msgs, tool_schema_tokens);
         let tier = budget.compaction_tier(cache_est.total_tokens);
         let budget_chars = budget.effective_input_limit() * 4;
         let merged = crate::compact_tiered(
@@ -358,8 +359,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
 
         // ── 3. Call LLM ─────────────────────────────────────────────────
         let budget = crate::prompts::budget_for_model(Some(&model_name));
-        let max_output_tokens =
-            (budget.model_limit as f64 * budget.output_reserve_ratio) as usize;
+        let max_output_tokens = (budget.model_limit as f64 * budget.output_reserve_ratio) as usize;
 
         let tool_schema_tokens: usize = self
             .edge_tools
@@ -372,8 +372,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             .sum();
         let mut est_msgs = vec![json!({"role": "system", "content": system_prompt})];
         est_msgs.extend(state.messages.iter().cloned());
-        let cache_est =
-            crate::prompts::estimate_tokens_cache_aware(&est_msgs, tool_schema_tokens);
+        let cache_est = crate::prompts::estimate_tokens_cache_aware(&est_msgs, tool_schema_tokens);
         let tier = budget.compaction_tier(cache_est.total_tokens);
         let pruned_tools = prune_tool_schemas(&self.edge_tools, tier);
 
@@ -534,7 +533,10 @@ mod tests {
         .build();
 
         let prompt = host.build_system_prompt("test query");
-        assert!(prompt.contains("/home/user/project"), "prompt should contain cwd");
+        assert!(
+            prompt.contains("/home/user/project"),
+            "prompt should contain cwd"
+        );
         assert!(prompt.contains("main"), "prompt should contain git branch");
     }
 
@@ -700,7 +702,9 @@ mod tests {
         .build();
 
         let mut state = create_test_state();
-        state.messages.push(json!({"role": "user", "content": "hello"}));
+        state
+            .messages
+            .push(json!({"role": "user", "content": "hello"}));
 
         let msgs = host.build_llm_messages("system prompt text", &state, "gpt-4");
         assert!(msgs.len() >= 2, "should have system + user messages");
@@ -840,7 +844,9 @@ mod tests {
     async fn server_host_mock_text_response() {
         let mut host = MockServerHost::with_text_response("Hello from server", 100, 50);
         let mut state = create_test_state();
-        state.messages.push(json!({"role": "user", "content": "hi"}));
+        state
+            .messages
+            .push(json!({"role": "user", "content": "hi"}));
 
         let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
         assert!(outcome.is_ok());
@@ -862,7 +868,9 @@ mod tests {
 
         let mut host = MockServerHost::with_tool_response(tools, 200, 100);
         let mut state = create_test_state();
-        state.messages.push(json!({"role": "user", "content": "run bash"}));
+        state
+            .messages
+            .push(json!({"role": "user", "content": "run bash"}));
 
         let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
         // Should complete (tool round runs but no more turns to consume)
@@ -873,7 +881,9 @@ mod tests {
     async fn server_host_budget_tracking() {
         let mut host = MockServerHost::with_text_response("response", 500, 200);
         let mut state = create_test_state();
-        state.messages.push(json!({"role": "user", "content": "test"}));
+        state
+            .messages
+            .push(json!({"role": "user", "content": "test"}));
 
         let _ = run_agentic_loop_with_host(&mut host, &mut state).await;
         assert!(state.has_any_usage);
@@ -887,7 +897,9 @@ mod tests {
         let mut state = create_test_state();
         state.max_turns = 2;
         state.remaining_turns = 2;
-        state.messages.push(json!({"role": "user", "content": "test"}));
+        state
+            .messages
+            .push(json!({"role": "user", "content": "test"}));
 
         // Two text responses — loop should complete after consuming both
         let mut host = MockServerHost {

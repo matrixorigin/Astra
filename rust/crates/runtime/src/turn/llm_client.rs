@@ -11,7 +11,9 @@ use futures_util::StreamExt;
 use serde_json::{Map, Value, json};
 
 use super::sse_blocks::SseBlankLineUtf8Buf;
-use super::sse_data_lines::{drain_sse_data_lines, finish_sse_data_buffer, json_events_from_sse_event_block};
+use super::sse_data_lines::{
+    drain_sse_data_lines, finish_sse_data_buffer, json_events_from_sse_event_block,
+};
 use crate::prompts;
 
 /// Maximum retries for transient LLM errors (429, 5xx, network).
@@ -254,10 +256,7 @@ async fn collect_llm_stream(
                     Map::from_iter([
                         ("id".to_string(), Value::String(String::new())),
                         ("type".to_string(), Value::String("function".to_string())),
-                        (
-                            "function".to_string(),
-                            json!({"name": "", "arguments": ""}),
-                        ),
+                        ("function".to_string(), json!({"name": "", "arguments": ""})),
                     ])
                 });
                 if let Some(id) = tc.get("id").and_then(Value::as_str)
@@ -348,7 +347,10 @@ mod tests {
     #[test]
     fn classify_llm_error_categories() {
         assert_eq!(classify_llm_error("rate limit exceeded"), "rate_limit");
-        assert_eq!(classify_llm_error("error 429: too many requests"), "rate_limit");
+        assert_eq!(
+            classify_llm_error("error 429: too many requests"),
+            "rate_limit"
+        );
         assert_eq!(classify_llm_error("request timed out"), "timeout");
         assert_eq!(classify_llm_error("connection refused"), "transport");
         assert_eq!(classify_llm_error("401 unauthorized"), "permission");

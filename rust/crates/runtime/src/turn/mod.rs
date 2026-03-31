@@ -12,8 +12,6 @@ pub mod boost_domain_hints;
 #[cfg(feature = "bridge-e2e-hooks")]
 pub mod bridge_e2e_hooks;
 pub mod bridge_inprocess;
-pub(crate) mod llm_client;
-pub mod loop_dispatcher;
 pub mod cache;
 pub mod chat_history_openai;
 pub mod chat_turn_api_error;
@@ -49,6 +47,8 @@ pub mod history_apply;
 pub mod hook_plans;
 pub mod hydrate_reflect;
 pub mod implicit_feedback;
+pub(crate) mod llm_client;
+pub mod loop_dispatcher;
 pub mod observer;
 pub mod persist;
 pub mod persist_inputs;

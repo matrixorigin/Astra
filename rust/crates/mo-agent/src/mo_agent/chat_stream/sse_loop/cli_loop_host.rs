@@ -19,9 +19,7 @@ use mo_agent_runtime::{
 use serde_json::Value;
 
 use crate::{
-    ExplainMode,
-    edge_tools::ToolExecutor,
-    permission_manager::PermissionManager,
+    ExplainMode, edge_tools::ToolExecutor, permission_manager::PermissionManager,
     skill_instructions::SharedSkillRegistry,
 };
 

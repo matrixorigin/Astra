@@ -5,8 +5,8 @@ pub mod branches;
 pub mod context;
 pub mod coordination;
 pub mod data_versioning;
-pub mod edge_context;
 pub mod decisions;
+pub mod edge_context;
 pub mod evaluation;
 pub mod event_ingestion;
 pub mod events;
@@ -47,12 +47,6 @@ pub use agents::{
     AgentCreateRequestData, AgentListRecord, AgentRecord, AgentService, AgentUpdateRequestData,
     DatabaseAgentService, UnconfiguredAgentService,
 };
-pub use coordination::{
-    AgentProfile, AgentProfileRegistry, AgentResult, AgentTier, AgentTrigger,
-    AggregationStrategy, CoordinationPattern, DelegationRequest, DelegationResult, PipelineStage,
-    aggregate_results,
-};
-pub use edge_context::{EdgeContext, EdgeProfile, EdgeSkillRef};
 pub use auth::{
     AuthLoginRequestData, AuthRefreshRequestData, AuthRegisterRequestData, AuthService,
     AuthTokenRecord, AuthUserRecord, DatabaseAdminAuditReader, DatabaseAdminAuthorizer,
@@ -66,6 +60,10 @@ pub use context::{
     ContextService, DatabaseContextService, SnapshotCreateRequestData, SnapshotListFilter,
     SnapshotListRecord, SnapshotRecord, UnconfiguredContextService,
 };
+pub use coordination::{
+    AgentProfile, AgentProfileRegistry, AgentResult, AgentTier, AgentTrigger, AggregationStrategy,
+    CoordinationPattern, DelegationRequest, DelegationResult, PipelineStage, aggregate_results,
+};
 pub use data_versioning::{
     DataVersioningService, DatabaseDataVersioningService, UnconfiguredDataVersioningService,
 };
@@ -73,6 +71,7 @@ pub use decisions::{
     DatabaseDecisionService, DecisionCreateRequestData, DecisionListFilter, DecisionListRecord,
     DecisionRecord, DecisionService, DecisionWithContextRecord, UnconfiguredDecisionService,
 };
+pub use edge_context::{EdgeContext, EdgeProfile, EdgeSkillRef};
 pub use evaluation::{DatabaseEvaluationService, EvaluationService, UnconfiguredEvaluationService};
 pub use events::{
     DatabaseEventService, EventCreateRequestData, EventListFilter, EventListRecord, EventRecord,

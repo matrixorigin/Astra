@@ -140,8 +140,7 @@ pub async fn consume_sse_stream<H: SseStreamHost>(
     while let Some(chunk) = chunks.next().await {
         let Ok(bytes) = chunk else { break };
         for event_str in framer.push_lossy_bytes(&bytes) {
-            let effects =
-                dispatch_chat_turn_sse_event_block(&event_str, &mut accum, &mut pending);
+            let effects = dispatch_chat_turn_sse_event_block(&event_str, &mut accum, &mut pending);
             host.on_render_effects(effects);
             flush_pending_via_host(&mut pending, host, &mut tool_results, &mut approval_results)
                 .await;
@@ -153,8 +152,7 @@ pub async fn consume_sse_stream<H: SseStreamHost>(
     if !tail.trim().is_empty() {
         let effects = dispatch_chat_turn_sse_event_block(&tail, &mut accum, &mut pending);
         host.on_render_effects(effects);
-        flush_pending_via_host(&mut pending, host, &mut tool_results, &mut approval_results)
-            .await;
+        flush_pending_via_host(&mut pending, host, &mut tool_results, &mut approval_results).await;
     }
 
     host.on_stream_complete();
@@ -269,7 +267,8 @@ impl RecordingSseStreamHost {
     }
 
     fn with_tool_output(mut self, tool: &str, output: &str) -> Self {
-        self.tool_outputs.insert(tool.to_string(), output.to_string());
+        self.tool_outputs
+            .insert(tool.to_string(), output.to_string());
         self
     }
 }
@@ -353,10 +352,7 @@ mod tests {
 
     #[tokio::test]
     async fn noop_host_captures_usage() {
-        let events = sse_event(
-            "usage",
-            ",\"prompt_tokens\":100,\"completion_tokens\":50",
-        );
+        let events = sse_event("usage", ",\"prompt_tokens\":100,\"completion_tokens\":50");
         let chunks = chunks_from_sse(&events);
         let mut stream = stream::iter(chunks);
         let mut host = NoopSseStreamHost;
@@ -434,7 +430,10 @@ mod tests {
     async fn empty_request_ids_are_skipped() {
         let events = format!(
             "{}{}",
-            sse_event("tool_request", ",\"request_id\":\"\",\"tool\":\"bash\",\"args\":{}"),
+            sse_event(
+                "tool_request",
+                ",\"request_id\":\"\",\"tool\":\"bash\",\"args\":{}"
+            ),
             sse_event("approval_required", ",\"request_id\":\"\",\"tool\":\"x\""),
         );
         let chunks = chunks_from_sse(&events);
@@ -466,10 +465,8 @@ mod tests {
         // Split one event across two chunks
         let part1 = "data: {\"type\":\"text_delta\",\"content\":\"he";
         let part2 = "llo\"}\n\n";
-        let chunks: Vec<Result<Vec<u8>, String>> = vec![
-            Ok(part1.as_bytes().to_vec()),
-            Ok(part2.as_bytes().to_vec()),
-        ];
+        let chunks: Vec<Result<Vec<u8>, String>> =
+            vec![Ok(part1.as_bytes().to_vec()), Ok(part2.as_bytes().to_vec())];
         let mut stream = stream::iter(chunks);
         let mut host = NoopSseStreamHost;
         let result = consume_sse_stream(&mut stream, &mut host).await;
@@ -481,7 +478,10 @@ mod tests {
         // `has_tool_calls` is set by the `turn_complete` event
         let events = format!(
             "{}{}",
-            sse_event("tool_call", ",\"id\":\"tc-1\",\"name\":\"bash\",\"args\":\"{\\\"command\\\":\\\"ls\\\"}\""),
+            sse_event(
+                "tool_call",
+                ",\"id\":\"tc-1\",\"name\":\"bash\",\"args\":\"{\\\"command\\\":\\\"ls\\\"}\""
+            ),
             sse_event("turn_complete", ",\"has_tool_calls\":true"),
         );
         let chunks = chunks_from_sse(&events);

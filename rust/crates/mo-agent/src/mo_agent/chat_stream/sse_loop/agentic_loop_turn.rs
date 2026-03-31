@@ -351,7 +351,9 @@ pub(crate) struct ChatTurnSseFetchRequest<'a> {
     pub perm_manager: &'a mut PermissionManager,
 }
 
-pub(crate) async fn fetch_chat_turn_sse(ctx: ChatTurnSseFetchRequest<'_>) -> Result<TurnResult, String> {
+pub(crate) async fn fetch_chat_turn_sse(
+    ctx: ChatTurnSseFetchRequest<'_>,
+) -> Result<TurnResult, String> {
     let ChatTurnSseFetchRequest {
         api,
         token,

@@ -189,18 +189,12 @@ pub(super) async fn build_server_state(
 
     // Wire multi-agent coordination: profile registry + delegation engine.
     let profile_registry = Arc::new(mo_agent_services::AgentProfileRegistry::new());
-    let delegation_tracker = Arc::new(
-        crate::server::delegation_engine::DelegationTracker::new(),
-    );
-    let delegation_engine = Arc::new(
-        crate::server::delegation_engine::DelegationEngine::new(
-            Arc::new(tokio::sync::RwLock::new(
-                (*profile_registry).clone(),
-            )),
-            Arc::new(run_engine),
-            delegation_tracker,
-        ),
-    );
+    let delegation_tracker = Arc::new(crate::server::delegation_engine::DelegationTracker::new());
+    let delegation_engine = Arc::new(crate::server::delegation_engine::DelegationEngine::new(
+        Arc::new(tokio::sync::RwLock::new((*profile_registry).clone())),
+        Arc::new(run_engine),
+        delegation_tracker,
+    ));
     let state = state
         .with_agent_profile_registry(profile_registry)
         .with_delegation_engine(delegation_engine);

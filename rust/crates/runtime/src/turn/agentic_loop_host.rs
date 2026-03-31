@@ -247,10 +247,8 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
         let turn_result = host.execute_turn(state).await?;
 
         // ─── Step 2: Ingest turn stream into loop state ─────────────────
-        let snap = agentic_turn_stream_snapshot_from_sse_accum(
-            &turn_result.accum,
-            turn_result.ttft_ms,
-        );
+        let snap =
+            agentic_turn_stream_snapshot_from_sse_accum(&turn_result.accum, turn_result.ttft_ms);
         let edge_len = turn_result.edge_tool_round.len();
         let quiet = host.is_quiet();
         match map_ingest_outcome_to_iteration_control(ingest_agentic_turn_stream(
@@ -645,7 +643,12 @@ mod tests {
     #[tokio::test]
     async fn remaining_turns_decrements_per_turn() {
         let mut host = MockHost::new(vec![
-            edge_tool_result(vec![make_edge_tool("read_file", "content")], 10, 5, Some(20)),
+            edge_tool_result(
+                vec![make_edge_tool("read_file", "content")],
+                10,
+                5,
+                Some(20),
+            ),
             text_result("Done", 10, 5, None),
         ]);
         let mut state = make_state();
@@ -706,9 +709,12 @@ mod tests {
     #[tokio::test]
     async fn host_error_on_second_turn_preserves_first_state() {
         // Turn 1 succeeds with edge tools; turn 2 errors (no more results)
-        let mut host = MockHost::new(vec![
-            edge_tool_result(vec![make_edge_tool("bash", "ok")], 20, 10, Some(50)),
-        ]);
+        let mut host = MockHost::new(vec![edge_tool_result(
+            vec![make_edge_tool("bash", "ok")],
+            20,
+            10,
+            Some(50),
+        )]);
         let mut state = make_state();
         state.max_turns = 5;
         state.remaining_turns = 5;
@@ -765,8 +771,13 @@ mod tests {
     async fn total_tool_calls_sums_across_turns() {
         let mut host = MockHost::new(vec![
             edge_tool_result(
-                vec![make_edge_tool("bash", "a"), make_edge_tool("read_file", "b")],
-                10, 5, None,
+                vec![
+                    make_edge_tool("bash", "a"),
+                    make_edge_tool("read_file", "b"),
+                ],
+                10,
+                5,
+                None,
             ),
             edge_tool_result(vec![make_edge_tool("grep", "c")], 10, 5, None),
             text_result("done", 10, 5, None),
@@ -856,8 +867,14 @@ mod tests {
         // With valid_tool_names set, edge tool outputs are preserved (not replaced by error)
         let mut host = MockHost::new(vec![
             edge_tool_result(
-                vec![make_edge_tool_with_args("bash", json!({"cmd": "ls"}), "file.txt")],
-                10, 5, None,
+                vec![make_edge_tool_with_args(
+                    "bash",
+                    json!({"cmd": "ls"}),
+                    "file.txt",
+                )],
+                10,
+                5,
+                None,
             ),
             text_result("done", 10, 5, None),
         ])

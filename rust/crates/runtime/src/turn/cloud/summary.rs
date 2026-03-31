@@ -108,7 +108,9 @@ pub async fn generate_compact_summary(
                 }
                 eprintln!(
                     "[compact_summary] PTL error, dropping oldest round (attempt {}, {} → {} rounds)",
-                    attempt, rounds_before, new_rounds.len()
+                    attempt,
+                    rounds_before,
+                    new_rounds.len()
                 );
                 rounds = new_rounds.to_vec();
             }
@@ -168,11 +170,11 @@ impl SummaryLlmClient for HttpSummaryClient {
             "max_completion_tokens": self.params.max_output_tokens,
         });
 
-        if self.params.provider == "anthropic"
-            || self.params.model_name.contains("claude")
-        {
+        if self.params.provider == "anthropic" || self.params.model_name.contains("claude") {
             body["max_tokens"] = serde_json::json!(self.params.max_output_tokens);
-            body.as_object_mut().unwrap().remove("max_completion_tokens");
+            body.as_object_mut()
+                .unwrap()
+                .remove("max_completion_tokens");
         }
 
         let url = format!(
@@ -242,8 +244,8 @@ fn is_ptl_error(body: &str) -> bool {
 pub mod tests {
     use super::*;
     use serde_json::json;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// Mock LLM client for testing.
     pub struct MockSummaryClient {
@@ -371,9 +373,11 @@ pub mod tests {
         assert_eq!(msgs.len(), 2);
         assert_eq!(msgs[0]["role"].as_str().unwrap(), "system");
         assert_eq!(msgs[1]["role"].as_str().unwrap(), "user");
-        assert!(msgs[1]["content"]
-            .as_str()
-            .unwrap()
-            .contains("some conversation"));
+        assert!(
+            msgs[1]["content"]
+                .as_str()
+                .unwrap()
+                .contains("some conversation")
+        );
     }
 }

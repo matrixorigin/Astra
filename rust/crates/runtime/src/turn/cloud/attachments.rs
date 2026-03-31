@@ -162,8 +162,7 @@ pub const TRUNCATION_MARKER: &str =
     "\n...[file content truncated for compaction; re-read the file if you need the full text]";
 
 /// Truncation marker for skill content.
-pub const SKILL_TRUNCATION_MARKER: &str =
-    "\n...[skill content truncated for compaction; use Read on the skill path if you need the full text]";
+pub const SKILL_TRUNCATION_MARKER: &str = "\n...[skill content truncated for compaction; use Read on the skill path if you need the full text]";
 
 // ---------------------------------------------------------------------------
 // PostCompactAttachments — collected set of attachments for a single compaction
@@ -281,7 +280,11 @@ impl AttachmentBuilder {
     pub fn build(self) -> PostCompactAttachments {
         // Sort files most-recent first
         let mut files = self.files;
-        files.sort_by(|a, b| b.recency.partial_cmp(&a.recency).unwrap_or(std::cmp::Ordering::Equal));
+        files.sort_by(|a, b| {
+            b.recency
+                .partial_cmp(&a.recency)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         PostCompactAttachments {
             files,
             skills: self.skills,
@@ -371,10 +374,12 @@ mod tests {
         let msgs = result.to_messages();
         // Order: plan, skill, file (reversed — most recent last)
         assert_eq!(msgs.len(), 3);
-        assert!(msgs[0]["content"]
-            .as_str()
-            .unwrap()
-            .contains("current plan"));
+        assert!(
+            msgs[0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("current plan")
+        );
         assert!(msgs[1]["content"].as_str().unwrap().contains("skill"));
         assert!(msgs[2]["content"].as_str().unwrap().contains("a.rs"));
     }
@@ -384,10 +389,7 @@ mod tests {
         let a = FileAttachment::new("foo.rs", "content", 1.0);
         let msg = a.to_message();
         assert!(msg.get("attachment_metadata").is_some());
-        assert_eq!(
-            msg["attachment_metadata"]["kind"].as_str().unwrap(),
-            "file"
-        );
+        assert_eq!(msg["attachment_metadata"]["kind"].as_str().unwrap(), "file");
         assert_eq!(
             msg["attachment_metadata"]["path"].as_str().unwrap(),
             "foo.rs"

@@ -157,11 +157,7 @@ mod tests {
 
     #[test]
     fn system_messages_extracted_as_preamble() {
-        let msgs = vec![
-            system("you are helpful"),
-            user("hello"),
-            assistant("hi"),
-        ];
+        let msgs = vec![system("you are helpful"), user("hello"), assistant("hi")];
         let (sys, rounds) = group_by_api_round(&msgs);
         assert_eq!(sys.len(), 1);
         assert_eq!(rounds.len(), 1);
@@ -217,9 +213,12 @@ mod tests {
     #[test]
     fn drop_oldest_rounds_respects_min_keep() {
         let msgs = vec![
-            user("q1"), assistant("a1"),
-            user("q2"), assistant("a2"),
-            user("q3"), assistant("a3"),
+            user("q1"),
+            assistant("a1"),
+            user("q2"),
+            assistant("a2"),
+            user("q3"),
+            assistant("a3"),
         ];
         let (_, rounds) = group_by_api_round(&msgs);
         assert_eq!(rounds.len(), 3);
@@ -232,25 +231,25 @@ mod tests {
     #[test]
     fn drop_oldest_rounds_normal_case() {
         let msgs = vec![
-            user("q1"), assistant("a1"),
-            user("q2"), assistant("a2"),
-            user("q3"), assistant("a3"),
+            user("q1"),
+            assistant("a1"),
+            user("q2"),
+            assistant("a2"),
+            user("q3"),
+            assistant("a3"),
         ];
         let (_, rounds) = group_by_api_round(&msgs);
         let kept = drop_oldest_rounds(&rounds, 1, 1);
         assert_eq!(kept.len(), 2);
-        assert_eq!(
-            kept[0].user_messages[0]["content"].as_str().unwrap(),
-            "q2"
-        );
+        assert_eq!(kept[0].user_messages[0]["content"].as_str().unwrap(), "q2");
     }
 
     #[test]
     fn round_char_count() {
         let msgs = vec![
-            user("hello"),    // 5 chars
-            assistant("hi"),  // 2 chars
-            tool("result"),   // 6 chars
+            user("hello"),   // 5 chars
+            assistant("hi"), // 2 chars
+            tool("result"),  // 6 chars
         ];
         let (_, rounds) = group_by_api_round(&msgs);
         assert_eq!(rounds[0].char_count(), 13);

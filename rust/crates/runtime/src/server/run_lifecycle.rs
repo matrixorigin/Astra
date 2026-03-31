@@ -8,13 +8,13 @@
 //! buffered per-run so `stream_run()` can replay from any offset.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use async_trait::async_trait;
-use axum::http::StatusCode;
 use axum::Json;
+use axum::http::StatusCode;
 use serde_json::{Map, Value, json};
 use tokio::sync::{Mutex as TokioMutex, RwLock};
 use uuid::Uuid;
@@ -26,10 +26,10 @@ use mo_agent_services::runs::{
     RunListRecord, RunMutationRecord, RunStatusRecord,
 };
 
-use crate::turn::agentic_loop_host::{AgenticLoopState, run_agentic_loop_with_host};
-use crate::pipeline::step_recorder::StepRecorder;
 use crate::FernetTokenEncryptor;
 use crate::MatrixOneSettings;
+use crate::pipeline::step_recorder::StepRecorder;
+use crate::turn::agentic_loop_host::{AgenticLoopState, run_agentic_loop_with_host};
 
 use super::run_engine::RunEngine;
 use super::server_loop_host::ServerAgenticLoopHostBuilder;
@@ -293,8 +293,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         // Spawn background agentic loop.
         let edge_tools = Self::extract_edge_tools(&request);
         let edge_profile = Self::extract_edge_profile(&request);
-        let mut host =
-            self.build_host(&user_id, &session_id, &request, edge_tools, edge_profile);
+        let mut host = self.build_host(&user_id, &session_id, &request, edge_tools, edge_profile);
         let mut loop_state = self.build_initial_state(&request, &session_id, &run_id);
         loop_state.cancel_flag = Some(cancel_flag);
 
@@ -439,9 +438,9 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         user_id: String,
     ) -> Result<RunStatusRecord, (StatusCode, Json<ErrorResponse>)> {
         let runs = self.runs.read().await;
-        let run = runs.get(&run_id).ok_or_else(|| {
-            error_response(StatusCode::NOT_FOUND, "Run not found")
-        })?;
+        let run = runs
+            .get(&run_id)
+            .ok_or_else(|| error_response(StatusCode::NOT_FOUND, "Run not found"))?;
         if run.user_id != user_id {
             return Err(error_response(StatusCode::FORBIDDEN, "Access denied"));
         }
@@ -455,9 +454,9 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         last_index: u32,
     ) -> Result<Vec<Value>, (StatusCode, Json<ErrorResponse>)> {
         let runs = self.runs.read().await;
-        let run = runs.get(&run_id).ok_or_else(|| {
-            error_response(StatusCode::NOT_FOUND, "Run not found")
-        })?;
+        let run = runs
+            .get(&run_id)
+            .ok_or_else(|| error_response(StatusCode::NOT_FOUND, "Run not found"))?;
         if run.user_id != user_id {
             return Err(error_response(StatusCode::FORBIDDEN, "Access denied"));
         }
@@ -476,9 +475,9 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         user_id: String,
     ) -> Result<CancelRunRecord, (StatusCode, Json<ErrorResponse>)> {
         let mut runs = self.runs.write().await;
-        let run = runs.get_mut(&run_id).ok_or_else(|| {
-            error_response(StatusCode::NOT_FOUND, "Run not found")
-        })?;
+        let run = runs
+            .get_mut(&run_id)
+            .ok_or_else(|| error_response(StatusCode::NOT_FOUND, "Run not found"))?;
         if run.user_id != user_id {
             return Err(error_response(StatusCode::FORBIDDEN, "Access denied"));
         }
@@ -491,8 +490,15 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             }));
             // Persist cancellation
             if let Some(engine) = &self.run_engine {
-                let _ = engine.persist_status(&run_id, "cancelled", None, None).await;
-                let _ = engine.append_event(&run_id, json!({"event_type": "run_finished", "data": {"cancelled": true}})).await;
+                let _ = engine
+                    .persist_status(&run_id, "cancelled", None, None)
+                    .await;
+                let _ = engine
+                    .append_event(
+                        &run_id,
+                        json!({"event_type": "run_finished", "data": {"cancelled": true}}),
+                    )
+                    .await;
             }
         }
         Ok(CancelRunRecord {
@@ -531,9 +537,9 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         user_id: String,
     ) -> Result<RunMutationRecord, (StatusCode, Json<ErrorResponse>)> {
         let mut runs = self.runs.write().await;
-        let run = runs.get_mut(&run_id).ok_or_else(|| {
-            error_response(StatusCode::NOT_FOUND, "Run not found")
-        })?;
+        let run = runs
+            .get_mut(&run_id)
+            .ok_or_else(|| error_response(StatusCode::NOT_FOUND, "Run not found"))?;
         if run.user_id != user_id {
             return Err(error_response(StatusCode::FORBIDDEN, "Access denied"));
         }
@@ -552,8 +558,12 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         }));
         // Persist pause
         if let Some(engine) = &self.run_engine {
-            let _ = engine.persist_status(&run_id, "paused", Some("user_resume"), None).await;
-            let _ = engine.append_event(&run_id, json!({"event_type": "run_paused", "data": {}})).await;
+            let _ = engine
+                .persist_status(&run_id, "paused", Some("user_resume"), None)
+                .await;
+            let _ = engine
+                .append_event(&run_id, json!({"event_type": "run_paused", "data": {}}))
+                .await;
         }
         Ok(RunMutationRecord {
             run_id,
@@ -568,9 +578,9 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         user_id: String,
     ) -> Result<RunMutationRecord, (StatusCode, Json<ErrorResponse>)> {
         let mut runs = self.runs.write().await;
-        let run = runs.get_mut(&run_id).ok_or_else(|| {
-            error_response(StatusCode::NOT_FOUND, "Run not found")
-        })?;
+        let run = runs
+            .get_mut(&run_id)
+            .ok_or_else(|| error_response(StatusCode::NOT_FOUND, "Run not found"))?;
         if run.user_id != user_id {
             return Err(error_response(StatusCode::FORBIDDEN, "Access denied"));
         }
@@ -590,7 +600,9 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         // Persist resume
         if let Some(engine) = &self.run_engine {
             let _ = engine.persist_status(&run_id, "running", None, None).await;
-            let _ = engine.append_event(&run_id, json!({"event_type": "run_resumed", "data": {}})).await;
+            let _ = engine
+                .append_event(&run_id, json!({"event_type": "run_resumed", "data": {}}))
+                .await;
         }
         Ok(RunMutationRecord {
             run_id,
@@ -599,7 +611,6 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         })
     }
 }
-
 
 // ─── Tests ──────────────────────────────────────────────────────────────────
 
@@ -616,7 +627,9 @@ mod tests {
     }
 
     /// Unwrap the error side.
-    fn err<T>(result: Result<T, (StatusCode, Json<ErrorResponse>)>) -> (StatusCode, Json<ErrorResponse>) {
+    fn err<T>(
+        result: Result<T, (StatusCode, Json<ErrorResponse>)>,
+    ) -> (StatusCode, Json<ErrorResponse>) {
         match result {
             Ok(_) => panic!("expected Err, got Ok"),
             Err(e) => e,
@@ -689,7 +702,9 @@ mod tests {
     async fn get_run_status_returns_state() {
         let svc = test_service();
         let run = ok(svc.create_run("user-1".into(), test_request("hello")).await);
-        let status = ok(svc.get_run_status(run.run_id.clone(), "user-1".into()).await);
+        let status = ok(svc
+            .get_run_status(run.run_id.clone(), "user-1".into())
+            .await);
         assert_eq!(status.run_id, run.run_id);
         assert_eq!(status.status, "running");
         assert_eq!(status.events_count, 1);
@@ -698,7 +713,9 @@ mod tests {
     #[tokio::test]
     async fn get_run_status_not_found() {
         let svc = test_service();
-        let e = err(svc.get_run_status("nonexistent".into(), "user-1".into()).await);
+        let e = err(svc
+            .get_run_status("nonexistent".into(), "user-1".into())
+            .await);
         assert_eq!(e.0, StatusCode::NOT_FOUND);
     }
 
@@ -752,7 +769,9 @@ mod tests {
     #[tokio::test]
     async fn stream_run_not_found() {
         let svc = test_service();
-        let e = err(svc.stream_run("nonexistent".into(), "user-1".into(), 0).await);
+        let e = err(svc
+            .stream_run("nonexistent".into(), "user-1".into(), 0)
+            .await);
         assert_eq!(e.0, StatusCode::NOT_FOUND);
     }
 
@@ -779,7 +798,9 @@ mod tests {
     async fn list_runs_pagination() {
         let svc = test_service();
         for i in 0..5 {
-            ok(svc.create_run("user-1".into(), test_request(&format!("msg {i}"))).await);
+            ok(svc
+                .create_run("user-1".into(), test_request(&format!("msg {i}")))
+                .await);
         }
         let page1 = ok(svc.list_runs("user-1".into(), 2, 0).await);
         assert_eq!(page1.runs.len(), 2);
@@ -805,10 +826,18 @@ mod tests {
     #[test]
     fn extract_edge_tools_from_context() {
         let mut ctx = serde_json::Map::new();
-        ctx.insert("edge_tools".to_string(), json!([{"function": {"name": "bash"}}]));
+        ctx.insert(
+            "edge_tools".to_string(),
+            json!([{"function": {"name": "bash"}}]),
+        );
         let req = ChatRequestData {
-            message: "hi".into(), session_id: None, agent_id: None,
-            model: None, context: Some(ctx), max_candidates: 5, explain: false,
+            message: "hi".into(),
+            session_id: None,
+            agent_id: None,
+            model: None,
+            context: Some(ctx),
+            max_candidates: 5,
+            explain: false,
         };
         let tools = AgenticRunLifecycleService::extract_edge_tools(&req);
         assert_eq!(tools.len(), 1);
@@ -823,10 +852,18 @@ mod tests {
     #[test]
     fn extract_edge_profile_from_context() {
         let mut ctx = serde_json::Map::new();
-        ctx.insert("edge_profile".to_string(), json!({"cwd": "/tmp", "git_branch": "main"}));
+        ctx.insert(
+            "edge_profile".to_string(),
+            json!({"cwd": "/tmp", "git_branch": "main"}),
+        );
         let req = ChatRequestData {
-            message: "hi".into(), session_id: None, agent_id: None,
-            model: None, context: Some(ctx), max_candidates: 5, explain: false,
+            message: "hi".into(),
+            session_id: None,
+            agent_id: None,
+            model: None,
+            context: Some(ctx),
+            max_candidates: 5,
+            explain: false,
         };
         let profile = AgenticRunLifecycleService::extract_edge_profile(&req);
         assert_eq!(profile["cwd"], "/tmp");
@@ -943,7 +980,9 @@ mod tests {
         let run = ok(svc.create_run("user-1".into(), test_request("task")).await);
         ok(svc.pause_run(run.run_id.clone(), "user-1".into()).await);
         ok(svc.resume_run(run.run_id.clone(), "user-1".into()).await);
-        let status = ok(svc.get_run_status(run.run_id.clone(), "user-1".into()).await);
+        let status = ok(svc
+            .get_run_status(run.run_id.clone(), "user-1".into())
+            .await);
         assert_eq!(status.events_count, 3); // run_started + run_paused + run_resumed
         let events = ok(svc.stream_run(run.run_id, "user-1".into(), 0).await);
         assert_eq!(events[0]["event_type"], "run_started");
@@ -963,8 +1002,8 @@ mod tests {
     // ─── Durable persistence integration tests ─────────────────────────
 
     fn test_service_with_engine() -> AgenticRunLifecycleService {
-        use mo_agent_services::runs::InMemoryRunStateStore;
         use crate::server::run_engine::RunEngine;
+        use mo_agent_services::runs::InMemoryRunStateStore;
 
         let engine = RunEngine::new(Arc::new(InMemoryRunStateStore::new()));
         AgenticRunLifecycleService::new(
@@ -1104,7 +1143,9 @@ mod tests {
         // just verify the task was actually spawned and updates state).
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
-        let status = ok(svc.get_run_status(run.run_id.clone(), "user-1".into()).await);
+        let status = ok(svc
+            .get_run_status(run.run_id.clone(), "user-1".into())
+            .await);
         // The run should have progressed beyond just "running" — either
         // completed, failed, or have more events.
         let advanced = status.status != "running" || status.events_count > 1;

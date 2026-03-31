@@ -166,9 +166,7 @@ impl LoopDispatcher {
             }
             Ok(AgenticLoopOutcome::Cancelled) => DispatchOutcome::Cancelled,
             Ok(AgenticLoopOutcome::Waiting(reason)) => {
-                DispatchOutcome::Waiting(WaitReason::ExternalEvent {
-                    event_type: reason,
-                })
+                DispatchOutcome::Waiting(WaitReason::ExternalEvent { event_type: reason })
             }
             Ok(AgenticLoopOutcome::Error(e)) | Err(e) => DispatchOutcome::Error(e),
         }
@@ -189,8 +187,8 @@ mod tests {
     use crate::pipeline::step_protocol::InMemoryIdempotencyCache;
     use crate::pipeline::step_recorder::StepRecorder;
     use crate::semantic_dedup::SemanticDedup;
-    use crate::turn::agentic_loop_host::HostTurnResult;
     use crate::turn::agentic_headless_round::HeadlessStderrStyle;
+    use crate::turn::agentic_loop_host::HostTurnResult;
     use crate::turn::chat_turn_sse_dispatch::ChatTurnSseAccum;
     use crate::turn::turn_guard::TurnGuard;
     use async_trait::async_trait;
@@ -243,8 +241,12 @@ mod tests {
         }
 
         fn emit_headless_line(&mut self, _style: HeadlessStderrStyle, _line: String) {}
-        fn is_quiet(&self) -> bool { true }
-        fn valid_tool_names(&self) -> &HashSet<String> { &self.valid_tools }
+        fn is_quiet(&self) -> bool {
+            true
+        }
+        fn valid_tool_names(&self) -> &HashSet<String> {
+            &self.valid_tools
+        }
     }
 
     fn test_state(message: &str) -> AgenticLoopState {

@@ -355,10 +355,7 @@ impl AgentProfileRegistry {
 
     /// List profiles by tier.
     pub fn list_by_tier(&self, tier: AgentTier) -> Vec<&AgentProfile> {
-        self.profiles
-            .values()
-            .filter(|p| p.tier == tier)
-            .collect()
+        self.profiles.values().filter(|p| p.tier == tier).collect()
     }
 
     /// Find agents that can handle a delegation from the source agent.
@@ -537,7 +534,10 @@ mod tests {
     fn tier_as_str_and_from_str() {
         assert_eq!(AgentTier::Orchestrator.as_str(), "orchestrator");
         assert_eq!(AgentTier::from_str_lossy("system"), AgentTier::System);
-        assert_eq!(AgentTier::from_str_lossy("ORCHESTRATOR"), AgentTier::Orchestrator);
+        assert_eq!(
+            AgentTier::from_str_lossy("ORCHESTRATOR"),
+            AgentTier::Orchestrator
+        );
         assert_eq!(AgentTier::from_str_lossy("unknown"), AgentTier::User);
     }
 
@@ -870,7 +870,11 @@ mod tests {
 
     #[test]
     fn aggregate_first_success() {
-        let results = vec![make_failed("a1"), make_result("a2", "answer"), make_result("a3", "other")];
+        let results = vec![
+            make_failed("a1"),
+            make_result("a2", "answer"),
+            make_result("a3", "other"),
+        ];
         let out = aggregate_results(&AggregationStrategy::FirstSuccess, &results);
         assert_eq!(out.as_deref(), Some("answer"));
     }
@@ -883,7 +887,11 @@ mod tests {
 
     #[test]
     fn aggregate_all_results() {
-        let results = vec![make_result("a1", "one"), make_failed("a2"), make_result("a3", "three")];
+        let results = vec![
+            make_result("a1", "one"),
+            make_failed("a2"),
+            make_result("a3", "three"),
+        ];
         let out = aggregate_results(&AggregationStrategy::AllResults, &results).unwrap();
         assert!(out.contains("one"));
         assert!(out.contains("three"));

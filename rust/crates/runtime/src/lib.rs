@@ -216,6 +216,11 @@ pub use turn::{
     activity::{SessionActivityUpdatePlan, build_session_activity_update_plan},
     cache::SessionCache,
     cloud::{
+        analytics::{
+            CompactionEvent, CompactionEventType, MessageRange, PartialCompactRequest,
+            PartialCompactResult, TimeBasedCompactConfig, TimeBasedTrigger, compact_partial,
+            evaluate_time_based_trigger,
+        },
         attachments::{
             AttachmentBuilder, FileAttachment, PlanAttachment, PostCompactAttachments,
             SkillAttachment,

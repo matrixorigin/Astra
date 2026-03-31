@@ -119,11 +119,7 @@ impl RunEngine {
     }
 
     /// Append an event to the durable event log.
-    pub async fn append_event(
-        &self,
-        run_id: &str,
-        event: serde_json::Value,
-    ) -> Result<(), String> {
+    pub async fn append_event(&self, run_id: &str, event: serde_json::Value) -> Result<(), String> {
         self.store.append_event(run_id, event).await
     }
 
@@ -181,10 +177,7 @@ mod tests {
     #[tokio::test]
     async fn start_and_load_run() {
         let engine = test_engine();
-        engine
-            .start_run("run-1", "user-1", "sess-1")
-            .await
-            .unwrap();
+        engine.start_run("run-1", "user-1", "sess-1").await.unwrap();
         let run = engine.load_run("run-1").await.unwrap().unwrap();
         assert_eq!(run.run_id, "run-1");
         assert_eq!(run.user_id, "user-1");
@@ -202,10 +195,7 @@ mod tests {
     #[tokio::test]
     async fn persist_status_updates() {
         let engine = test_engine();
-        engine
-            .start_run("run-1", "user-1", "sess-1")
-            .await
-            .unwrap();
+        engine.start_run("run-1", "user-1", "sess-1").await.unwrap();
         let ok = engine
             .persist_status("run-1", "paused", Some("user_resume"), None)
             .await
@@ -229,14 +219,8 @@ mod tests {
     #[tokio::test]
     async fn persist_usage_updates() {
         let engine = test_engine();
-        engine
-            .start_run("run-1", "user-1", "sess-1")
-            .await
-            .unwrap();
-        engine
-            .persist_usage("run-1", 1000, 500, 7)
-            .await
-            .unwrap();
+        engine.start_run("run-1", "user-1", "sess-1").await.unwrap();
+        engine.persist_usage("run-1", 1000, 500, 7).await.unwrap();
         let run = engine.load_run("run-1").await.unwrap().unwrap();
         assert_eq!(run.total_prompt_tokens, 1000);
         assert_eq!(run.total_completion_tokens, 500);
@@ -246,10 +230,7 @@ mod tests {
     #[tokio::test]
     async fn persist_checkpoint_saves() {
         let engine = test_engine();
-        engine
-            .start_run("run-1", "user-1", "sess-1")
-            .await
-            .unwrap();
+        engine.start_run("run-1", "user-1", "sess-1").await.unwrap();
         let ck = r#"{"messages":[],"turn":3}"#;
         engine.persist_checkpoint("run-1", ck).await.unwrap();
         let run = engine.load_run("run-1").await.unwrap().unwrap();
@@ -259,12 +240,12 @@ mod tests {
     #[tokio::test]
     async fn append_event_accumulates() {
         let engine = test_engine();
+        engine.start_run("run-1", "user-1", "sess-1").await.unwrap();
         engine
-            .start_run("run-1", "user-1", "sess-1")
-            .await
-            .unwrap();
-        engine
-            .append_event("run-1", serde_json::json!({"event_type": "tool_call_start"}))
+            .append_event(
+                "run-1",
+                serde_json::json!({"event_type": "tool_call_start"}),
+            )
             .await
             .unwrap();
         engine
@@ -278,14 +259,8 @@ mod tests {
     #[tokio::test]
     async fn find_waiting_runs_filters_correctly() {
         let engine = test_engine();
-        engine
-            .start_run("run-1", "user-1", "sess-1")
-            .await
-            .unwrap();
-        engine
-            .start_run("run-2", "user-1", "sess-2")
-            .await
-            .unwrap();
+        engine.start_run("run-1", "user-1", "sess-1").await.unwrap();
+        engine.start_run("run-2", "user-1", "sess-2").await.unwrap();
         engine
             .persist_status("run-2", "waiting", Some("tool_approval"), None)
             .await
@@ -318,14 +293,8 @@ mod tests {
     #[tokio::test]
     async fn recover_active_runs_returns_waiting() {
         let engine = test_engine();
-        engine
-            .start_run("run-1", "user-1", "sess-1")
-            .await
-            .unwrap();
-        engine
-            .start_run("run-2", "user-1", "sess-2")
-            .await
-            .unwrap();
+        engine.start_run("run-1", "user-1", "sess-1").await.unwrap();
+        engine.start_run("run-2", "user-1", "sess-2").await.unwrap();
         engine
             .persist_status("run-1", "waiting", Some("user_resume"), None)
             .await
@@ -342,10 +311,7 @@ mod tests {
     #[tokio::test]
     async fn full_lifecycle_start_pause_resume_complete() {
         let engine = test_engine();
-        engine
-            .start_run("run-1", "user-1", "sess-1")
-            .await
-            .unwrap();
+        engine.start_run("run-1", "user-1", "sess-1").await.unwrap();
 
         // Simulate pause
         engine
@@ -399,10 +365,7 @@ mod tests {
     #[tokio::test]
     async fn error_message_persists() {
         let engine = test_engine();
-        engine
-            .start_run("run-1", "user-1", "sess-1")
-            .await
-            .unwrap();
+        engine.start_run("run-1", "user-1", "sess-1").await.unwrap();
         engine
             .persist_status("run-1", "failed", None, Some("OOM killed"))
             .await

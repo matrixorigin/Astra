@@ -13,10 +13,12 @@ pub(super) async fn delegate_run_handler(
 ) -> Result<Json<DelegationResponse>, (StatusCode, Json<ErrorResponse>)> {
     let _user = state.auth_service.current_user(&headers).await?;
 
-    let engine = state
-        .delegation_engine
-        .as_ref()
-        .ok_or_else(|| error_response(StatusCode::SERVICE_UNAVAILABLE, "delegation engine not configured"))?;
+    let engine = state.delegation_engine.as_ref().ok_or_else(|| {
+        error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "delegation engine not configured",
+        )
+    })?;
 
     // Validate the delegation request against the profile registry.
     engine
@@ -43,10 +45,12 @@ pub(super) async fn list_delegations_handler(
 ) -> Result<Json<DelegationListResponse>, (StatusCode, Json<ErrorResponse>)> {
     let _user = state.auth_service.current_user(&headers).await?;
 
-    let engine = state
-        .delegation_engine
-        .as_ref()
-        .ok_or_else(|| error_response(StatusCode::SERVICE_UNAVAILABLE, "delegation engine not configured"))?;
+    let engine = state.delegation_engine.as_ref().ok_or_else(|| {
+        error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "delegation engine not configured",
+        )
+    })?;
 
     let sub_runs = engine.tracker().get_children(&run_id).await;
     Ok(Json(DelegationListResponse {

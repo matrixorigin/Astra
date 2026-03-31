@@ -1,3 +1,4 @@
+pub mod analytics;
 pub mod attachments;
 pub mod compact_prompt;
 pub mod compaction;

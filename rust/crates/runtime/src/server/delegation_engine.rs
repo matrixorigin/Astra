@@ -21,8 +21,8 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 
 use mo_agent_services::coordination::{
-    AgentProfileRegistry, AgentResult, AggregationStrategy, CoordinationPattern,
-    DelegationRequest, DelegationResult, aggregate_results,
+    AgentProfileRegistry, AgentResult, AggregationStrategy, CoordinationPattern, DelegationRequest,
+    DelegationResult, aggregate_results,
 };
 
 use super::run_engine::RunEngine;
@@ -156,7 +156,11 @@ impl DelegationEngine {
     }
 
     /// Validate a delegation request without executing it.
-    pub async fn validate(&self, request: &DelegationRequest, source_agent_id: &str) -> Result<(), String> {
+    pub async fn validate(
+        &self,
+        request: &DelegationRequest,
+        source_agent_id: &str,
+    ) -> Result<(), String> {
         let reg = self.registry.read().await;
         reg.validate_delegation(request, source_agent_id)
     }
@@ -179,10 +183,7 @@ impl DelegationEngine {
                 agent_ids,
                 aggregation,
                 ..
-            } => {
-                self.execute_fan_out(&request, agent_ids, aggregation)
-                    .await
-            }
+            } => self.execute_fan_out(&request, agent_ids, aggregation).await,
             CoordinationPattern::Pipeline { stages } => {
                 let agent_ids: Vec<String> = stages.iter().map(|s| s.agent_id.clone()).collect();
                 self.execute_sequential(&request, &agent_ids, false).await
@@ -423,10 +424,18 @@ mod tests {
         Arc<DelegationTracker>,
     ) {
         let mut reg = AgentProfileRegistry::new();
-        reg.register(AgentProfile::new("orch", "Orchestrator", AgentTier::Orchestrator)).unwrap();
-        reg.register(AgentProfile::new("coder", "Coder", AgentTier::System)).unwrap();
-        reg.register(AgentProfile::new("reviewer", "Reviewer", AgentTier::System)).unwrap();
-        reg.register(AgentProfile::new("writer", "Writer", AgentTier::User)).unwrap();
+        reg.register(AgentProfile::new(
+            "orch",
+            "Orchestrator",
+            AgentTier::Orchestrator,
+        ))
+        .unwrap();
+        reg.register(AgentProfile::new("coder", "Coder", AgentTier::System))
+            .unwrap();
+        reg.register(AgentProfile::new("reviewer", "Reviewer", AgentTier::System))
+            .unwrap();
+        reg.register(AgentProfile::new("writer", "Writer", AgentTier::User))
+            .unwrap();
 
         let store = Arc::new(InMemoryRunStateStore::new());
         let engine = Arc::new(RunEngine::new(store));

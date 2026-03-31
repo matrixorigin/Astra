@@ -292,7 +292,6 @@ impl Default for ContextBudget {
     }
 }
 
-
 /// Return a ContextBudget tuned for a known model name.
 pub fn budget_for_model(model: Option<&str>) -> ContextBudget {
     let name = model.unwrap_or("");

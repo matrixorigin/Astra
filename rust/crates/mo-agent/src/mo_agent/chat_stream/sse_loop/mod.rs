@@ -32,8 +32,7 @@ use crate::{StreamResult, edge_tools};
 
 use super::ChatTurnParams;
 use agentic_sse_loop::{
-    StreamLoopSidecarEprint, StreamResultBuild,
-    build_stream_result, eprint_stream_loop_sidecars,
+    StreamLoopSidecarEprint, StreamResultBuild, build_stream_result, eprint_stream_loop_sidecars,
 };
 use cli_loop_host::CliAgenticLoopHost;
 
@@ -42,8 +41,8 @@ pub(crate) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
     let term_width = terminal::size().map(|(w, _)| w as usize).unwrap_or(80);
     let project_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let file_context = detect_project_languages(&project_root);
-    let executor = edge_tools::ToolExecutor::new(&project_root)
-        .with_cloud(p.api.api_origin(), p.token);
+    let executor =
+        edge_tools::ToolExecutor::new(&project_root).with_cloud(p.api.api_origin(), p.token);
     let all_schemas = edge_tools::all_tool_schemas();
     let registry = ToolRegistry::new(all_schemas.clone());
     let valid_tool_names = openai_tool_names_from_schemas(&all_schemas);
