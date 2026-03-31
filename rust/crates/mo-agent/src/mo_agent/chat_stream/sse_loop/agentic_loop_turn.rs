@@ -1,5 +1,5 @@
-//! Single agentic iteration: `/chat/turn` fetch + SSE consume, turn ingest, stall preflight,
-//! headless tool round (in-file), post-tool policy.
+//! Single agentic iteration: outbound `/chat` payload (selector, skills, explain stderr), `/chat/turn`
+//! fetch + SSE consume, turn ingest, stall preflight, headless tool round, post-tool policy.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::Path;
@@ -14,11 +14,21 @@ use mo_agent_runtime::{
     },
     pipeline::step_recorder::StepRecorder,
     semantic_dedup::SemanticDedup,
-    tool_registry::ToolRegistry,
-    tool_selector::ToolSelector,
+    tool_registry::{self, ToolRegistry},
+    tool_selector::{self, ToolSelector},
+    turn::boost_domain_hints::domain_hints_from_boost_terms,
     turn::chat_history_openai::{append_openai_user_content_messages, openai_user_content_message},
+    turn::chat_turn_edge_profile::{
+        detect_active_system_skills_in_message, read_git_branch_abbrev,
+    },
     turn::chat_turn_heuristics::{
-        openai_factual_tool_retry_user_message, should_force_factual_tool_retry,
+        extract_repos_from_memory, openai_factual_tool_retry_user_message,
+        should_force_factual_tool_retry,
+    },
+    turn::chat_turn_payload::{
+        ChatTurnBasePayloadInput, chat_turn_base_payload, merge_active_skills_into_edge_profile,
+        merge_skill_instructions_into_edge_profile, set_payload_edge_tools,
+        set_payload_tool_results_if_non_empty,
     },
     turn::edge_prompt_context::make_args_preview,
     turn::headless_tool_assembly::{
@@ -28,6 +38,7 @@ use mo_agent_runtime::{
     turn::response_guard::apply_response_guards,
     turn::stall::{IntentDrift, detect_intent_drift},
     turn::tool_result_semantics::{is_resource_limit_output, is_tool_error, tool_dedup_signature},
+    turn::tool_schema_prune::{filter_tool_schemas_by_excluded_names, pin_invoked_tool_schemas},
     turn::turn_guard::{TurnGuard, VerdictSeverity},
 };
 use mo_agent_services::session_journal::ToolCallRecord;
@@ -44,9 +55,337 @@ use crate::{
 
 use super::super::edge_executor::edge_executor_instance_id;
 use super::super::hydrate_reflect::hydrate_reflect_placeholder_if_needed;
-use super::prepare_turn_request::{
-    PrepareChatTurnRequest, PrepareTurnTelemetry, prepare_chat_turn_payload,
-};
+
+// ─── Outbound `/chat` JSON body (was `prepare_turn_request.rs`) ───────────────
+
+/// First-turn / cross-turn counters updated while building the payload.
+pub(crate) struct PrepareTurnTelemetry<'a> {
+    pub first_memoria_ms: &'a mut Option<u64>,
+    pub first_selector_ms: &'a mut Option<u64>,
+    pub first_selector_strategy: &'a mut Option<String>,
+    pub selector_tokens_in: &'a mut u64,
+    pub selector_tokens_out: &'a mut u64,
+    pub first_selection_report: &'a mut Option<tool_registry::SelectionReport>,
+    pub first_budget_pressure: &'a mut f64,
+    pub first_context_assembly_ms: &'a mut Option<u64>,
+    pub all_selected_skills: &'a mut Vec<String>,
+}
+
+struct PrepareChatTurnRequest<'a> {
+    messages: &'a [Value],
+    current_session_id: Option<&'a str>,
+    model: Option<&'a str>,
+    explain_verbose: bool,
+    explain_on: bool,
+    explain_stderr: bool,
+    project_root: &'a Path,
+    message: &'a str,
+    history: &'a [(String, String)],
+    recent_tools: &'a [String],
+    executor: &'a mut ToolExecutor,
+    selector: &'a dyn tool_selector::ToolSelector,
+    registry: &'a tool_registry::ToolRegistry,
+    tool_results: &'a [Value],
+    all_schemas: &'a [Value],
+    turn_guard: &'a TurnGuard,
+    restricted_tools: &'a mut HashSet<String>,
+    step_recorder: &'a mut StepRecorder,
+    skill_registry: &'a SharedSkillRegistry,
+    quiet: bool,
+    file_context: &'a [String],
+    assembly_start: Instant,
+    telem: PrepareTurnTelemetry<'a>,
+}
+
+async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
+    let git_branch = read_git_branch_abbrev();
+    let mut payload = chat_turn_base_payload(ChatTurnBasePayloadInput {
+        messages: ctx.messages,
+        session_id: ctx.current_session_id,
+        model: ctx.model,
+        explain_verbose: ctx.explain_verbose,
+        explain_on: ctx.explain_on,
+        edge_executor_id: edge_executor_instance_id(),
+        capabilities: mo_thin_client::builtin_capability_preset(),
+        project_root: ctx.project_root,
+        git_branch,
+    });
+    let active_skills = detect_active_system_skills_in_message(ctx.message);
+    merge_active_skills_into_edge_profile(&mut payload, &active_skills);
+
+    let budget_pressure = {
+        let schema_tokens = ctx.selector.registry().total_pinned_token_cost();
+        let estimated = mo_agent_runtime::prompts::estimate_tokens_precise(
+            ctx.messages,
+            schema_tokens as usize,
+            0,
+        );
+        let budget = mo_agent_runtime::prompts::budget_for_model(ctx.model);
+        let tier = budget.compaction_tier(estimated);
+        tier.budget_pressure()
+    };
+
+    let mut boost_terms =
+        mo_agent_runtime::turn::retrieval::extract_boost_terms_from_pairs(ctx.history, ctx.message);
+    {
+        let mem_start = Instant::now();
+        let memory_contents = ctx.executor.memory_boost_search(ctx.message, 5).await;
+        let mem_elapsed = mem_start.elapsed().as_millis() as u64;
+        if ctx.telem.first_memoria_ms.is_none() {
+            *ctx.telem.first_memoria_ms = Some(mem_elapsed);
+        }
+        if !memory_contents.is_empty() {
+            for content in &memory_contents {
+                for repo in extract_repos_from_memory(content) {
+                    ctx.executor.add_preferred_repo(&repo);
+                }
+            }
+            let ranked = mo_agent_runtime::turn::retrieval::rank_memory_results(
+                ctx.message,
+                &memory_contents,
+            );
+            mo_agent_runtime::turn::retrieval::append_boost_terms_from_ranked_memory(
+                &mut boost_terms,
+                ctx.message,
+                &ranked,
+            );
+        }
+    }
+
+    let memory_domain_hints = domain_hints_from_boost_terms(&boost_terms);
+    for tool in ctx.turn_guard.health.deprioritized_tools() {
+        ctx.restricted_tools.insert(tool.to_string());
+    }
+    let restricted_vec: Vec<String> = ctx.restricted_tools.iter().cloned().collect();
+
+    ctx.step_recorder.record_perceive(
+        ctx.message,
+        &[],
+        &memory_domain_hints
+            .iter()
+            .map(|h| format!("{h:?}"))
+            .collect::<Vec<_>>(),
+        &boost_terms,
+    );
+
+    let learned_context = ctx.selector.learned_context(ctx.message, ctx.recent_tools);
+    let learned_context_hint = learned_context.prompt_fragment();
+    let learned_task_type = learned_context
+        .task_archetype
+        .map(|task_type| format!("{task_type:?}").to_lowercase());
+
+    let mut selected_skills: Vec<String> = Vec::new();
+    let (turn_schemas, selection_report, selection_confidence) = if ctx.tool_results.is_empty() {
+        let sel_start = Instant::now();
+        let turn_count = ctx.history.len() as u32 + 1;
+        let sel_ctx = tool_selector::SelectionContext {
+            query: ctx.message,
+            turn_count,
+            recent_tools: ctx.recent_tools,
+            budget_tokens: ctx.registry.default_budget(),
+            boost_terms: boost_terms.clone(),
+            budget_pressure,
+            memory_domain_hints: memory_domain_hints.clone(),
+            restricted_tools: restricted_vec.clone(),
+            file_context: ctx.file_context.to_vec(),
+        };
+        let sel_result = ctx
+            .selector
+            .select_with_learned_context(&sel_ctx, &learned_context)
+            .await;
+        if ctx.telem.first_selector_ms.is_none() {
+            *ctx.telem.first_selector_ms = Some(sel_start.elapsed().as_millis() as u64);
+            *ctx.telem.first_selector_strategy = Some(format!(
+                "{} (conf={:.2})",
+                sel_result.strategy, sel_result.confidence
+            ));
+        }
+        *ctx.telem.selector_tokens_in += sel_result.selector_tokens_in;
+        *ctx.telem.selector_tokens_out += sel_result.selector_tokens_out;
+        selected_skills = sel_result.selected_skills.clone();
+        let conf = sel_result.confidence;
+        let (schemas, report) = tool_selector::resolve_schemas_with_pressure(
+            ctx.registry,
+            &sel_result.tool_names,
+            budget_pressure,
+        );
+        (schemas, report, conf)
+    } else {
+        let turn_count = ctx.history.len() as u32 + 1;
+        let sel_ctx = tool_selector::SelectionContext {
+            query: ctx.message,
+            turn_count,
+            recent_tools: ctx.recent_tools,
+            budget_tokens: ctx.registry.default_budget() * 2,
+            boost_terms,
+            budget_pressure,
+            memory_domain_hints,
+            restricted_tools: restricted_vec,
+            file_context: ctx.file_context.to_vec(),
+        };
+        let sel_result = ctx
+            .selector
+            .select_with_learned_context(&sel_ctx, &learned_context)
+            .await;
+        if !sel_result.selected_skills.is_empty() {
+            selected_skills = sel_result.selected_skills.clone();
+        }
+        let conf = sel_result.confidence;
+        let (mut selected, mut report) = tool_selector::resolve_schemas_with_pressure(
+            ctx.registry,
+            &sel_result.tool_names,
+            budget_pressure,
+        );
+        pin_invoked_tool_schemas(
+            &mut selected,
+            &mut report,
+            ctx.tool_results,
+            ctx.all_schemas,
+        );
+        (selected, report, conf)
+    };
+
+    let skill_instructions =
+        load_skill_instructions_text(ctx.skill_registry, &selected_skills, ctx.quiet);
+    merge_skill_names_track(ctx.telem.all_selected_skills, &selected_skills);
+
+    merge_skill_instructions_into_edge_profile(&mut payload, skill_instructions.as_deref());
+
+    if ctx.telem.first_selection_report.is_none() {
+        *ctx.telem.first_selection_report = Some(selection_report);
+        *ctx.telem.first_budget_pressure = budget_pressure;
+    }
+    ctx.executor.set_budget_pressure(budget_pressure);
+
+    tool_registry::apply_selector_hints_to_edge_profile(
+        &mut payload["edge_profile"],
+        ctx.telem.first_selection_report.as_ref(),
+        selection_confidence,
+        &learned_context_hint,
+        learned_task_type.as_deref(),
+    );
+    let final_schemas = filter_tool_schemas_by_excluded_names(turn_schemas, ctx.restricted_tools);
+    set_payload_edge_tools(&mut payload, final_schemas);
+    eprint_restricted_tools_explain(ctx.explain_stderr, ctx.restricted_tools);
+    eprint_selector_guidance_explain(ctx.explain_stderr, &payload, selection_confidence);
+    set_payload_tool_results_if_non_empty(&mut payload, ctx.tool_results);
+
+    {
+        let selected_tool_names: Vec<String> = ctx
+            .telem
+            .first_selection_report
+            .as_ref()
+            .map(|r| r.tools_selected.clone())
+            .unwrap_or_default();
+        let bp = *ctx.telem.first_budget_pressure;
+        let bt = ctx
+            .telem
+            .first_selection_report
+            .as_ref()
+            .map(|r| r.budget_used as u64)
+            .unwrap_or(0);
+        ctx.step_recorder
+            .record_plan(&selected_tool_names, selection_confidence, bp, bt);
+    }
+
+    if ctx.telem.first_context_assembly_ms.is_none() {
+        *ctx.telem.first_context_assembly_ms =
+            Some(ctx.assembly_start.elapsed().as_millis() as u64);
+    }
+
+    payload
+}
+
+fn eprint_restricted_tools_explain(show: bool, restricted_tools: &HashSet<String>) {
+    if !show || restricted_tools.is_empty() {
+        return;
+    }
+    eprintln!(
+        "{}",
+        format!(
+            "  ├─ restricted: {} tool(s) filtered [{}]",
+            restricted_tools.len(),
+            restricted_tools
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+        .dim()
+    );
+}
+
+fn eprint_selector_guidance_explain(show: bool, payload: &Value, selection_confidence: f64) {
+    if !show {
+        return;
+    }
+    let Some(recommended) = payload["edge_profile"]["recommended_tools"].as_array() else {
+        return;
+    };
+    let names: Vec<&str> = recommended.iter().filter_map(|v| v.as_str()).collect();
+    if names.is_empty() {
+        return;
+    }
+    eprintln!(
+        "{}",
+        format!(
+            "  ├─ guidance: {} (confidence: {:.2})",
+            names.join(", "),
+            selection_confidence
+        )
+        .dim()
+    );
+}
+
+fn load_skill_instructions_text(
+    skill_registry: &SharedSkillRegistry,
+    selected_skills: &[String],
+    quiet: bool,
+) -> Option<String> {
+    if selected_skills.is_empty() {
+        return None;
+    }
+    let mut instructions = Vec::new();
+    let mut activated_skills = Vec::new();
+    if let Ok(mut reg) = skill_registry.try_write() {
+        for skill_name in selected_skills {
+            if let Err(e) = reg.load_instructions(skill_name) {
+                eprintln!(
+                    "  {} Failed to load skill {}: {}",
+                    "⚠".yellow(),
+                    skill_name,
+                    e
+                );
+                continue;
+            }
+            if let Some(skill) = reg.get(skill_name)
+                && let Some(text) = skill.instruction_text()
+            {
+                activated_skills.push(skill_name.clone());
+                instructions.push(format!("## Skill: {skill_name}\n\n{text}"));
+            }
+        }
+    }
+    if instructions.is_empty() {
+        return None;
+    }
+    if !quiet {
+        eprintln!(
+            "  {} Using skill: {}",
+            "◆".cyan(),
+            activated_skills.join(", ").cyan()
+        );
+    }
+    Some(instructions.join("\n\n---\n\n"))
+}
+
+fn merge_skill_names_track(all_selected: &mut Vec<String>, round_skills: &[String]) {
+    for skill_name in round_skills {
+        if !all_selected.contains(skill_name) {
+            all_selected.push(skill_name.clone());
+        }
+    }
+}
 
 // ─── Fetch: payload → POST → consume_turn_sse ─────────────────────────────────
 
@@ -1181,5 +1520,12 @@ mod tests {
             });
         }
         assert_eq!(stall_events, vec![("name_stall".to_string(), 2)]);
+    }
+
+    #[test]
+    fn merge_skill_names_track_dedupes() {
+        let mut v = vec!["a".into()];
+        super::merge_skill_names_track(&mut v, &["b".into(), "a".into()]);
+        assert_eq!(v, vec!["a", "b"]);
     }
 }

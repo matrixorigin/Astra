@@ -26,9 +26,8 @@ use crate::{ExplainMode, StreamResult, VerdictEvent, edge_tools};
 use super::super::ChatTurnParams;
 use super::super::explain_reports::{print_explain_report, print_verdict_report};
 use super::agentic_loop_turn::{
-    AgenticLoopTurnExit, AgenticTurnRequest, run_agentic_loop_iteration,
+    AgenticLoopTurnExit, AgenticTurnRequest, PrepareTurnTelemetry, run_agentic_loop_iteration,
 };
-use super::prepare_turn_request::PrepareTurnTelemetry;
 
 pub(crate) struct AgenticSseLoopState {
     start: Instant,
