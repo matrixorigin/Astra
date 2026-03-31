@@ -38,8 +38,10 @@ use mo_agent_runtime::{
     },
     turn::edge_prompt_context::make_args_preview,
     turn::headless_tool_assembly::{
-        CACHEABLE_TOOLS, openai_assistant_with_tool_calls_message, openai_tool_roundtrip_values,
-        take_edge_output_for_tool_call, tool_calls_for_stall_guard,
+        CACHEABLE_TOOLS, HeadlessRoundToolIdx, headless_round_tool_indices,
+        headless_timeout_aborted_tool_names, openai_assistant_with_tool_calls_message,
+        openai_tool_roundtrip_values, parse_flat_tool_call_event, take_edge_output_for_tool_call,
+        tool_calls_for_stall_guard, unknown_local_tool_error_message,
     },
     turn::tool_result_semantics::{is_resource_limit_output, is_tool_error, tool_dedup_signature},
     turn::tool_schema_prune::{filter_tool_schemas_by_excluded_names, pin_invoked_tool_schemas},
@@ -524,11 +526,6 @@ struct HeadlessToolRoundRequest<'a> {
     tool_call_records: &'a mut Vec<mo_agent_services::session_journal::ToolCallRecord>,
 }
 
-enum RoundToolItem {
-    ServerTc(usize),
-    Synthetic(usize),
-}
-
 /// Clears `tool_results`, appends the assistant tool-call message, then fills `tool_results` and
 /// matching `tool` OpenAI messages for the next `/chat` request.
 async fn run_headless_tool_round(ctx: HeadlessToolRoundRequest<'_>) {
@@ -559,15 +556,10 @@ async fn run_headless_tool_round(ctx: HeadlessToolRoundRequest<'_>) {
     );
     messages.push(assistant_tc_msg);
 
-    let indices: Vec<RoundToolItem> = if !turn_result.tool_calls.is_empty() {
-        (0..turn_result.tool_calls.len())
-            .map(RoundToolItem::ServerTc)
-            .collect()
-    } else {
-        (0..turn_result.edge_tool_round.len())
-            .map(RoundToolItem::Synthetic)
-            .collect()
-    };
+    let indices = headless_round_tool_indices(
+        turn_result.tool_calls.len(),
+        turn_result.edge_tool_round.len(),
+    );
 
     let tool_count = indices.len().max(1);
     let mut seen_calls: HashSet<String> = HashSet::new();
@@ -581,17 +573,12 @@ async fn run_headless_tool_round(ctx: HeadlessToolRoundRequest<'_>) {
         let step_elapsed_ms = step_start_time.elapsed().as_millis() as u64;
         if step_elapsed_ms > step_timeout_ms {
             let aborted_count = indices.len() - tool_results.len();
-            let aborted_tools: Vec<String> = indices[tool_results.len()..]
-                .iter()
-                .map(|it| match it {
-                    RoundToolItem::ServerTc(i) => turn_result.tool_calls[*i]
-                        .get("name")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string(),
-                    RoundToolItem::Synthetic(i) => turn_result.edge_tool_round[*i].tool.clone(),
-                })
-                .collect();
+            let aborted_tools = headless_timeout_aborted_tool_names(
+                &indices,
+                tool_results.len(),
+                &turn_result.tool_calls,
+                |i| turn_result.edge_tool_round[i].tool.clone(),
+            );
             agent_warn!(
                 "step",
                 "Step timeout exceeded: {}ms > {}ms, aborting {} tools: {:?}",
@@ -604,33 +591,14 @@ async fn run_headless_tool_round(ctx: HeadlessToolRoundRequest<'_>) {
             break;
         }
 
-        let (id, name, args, from_synthetic) = match item {
-            RoundToolItem::ServerTc(i) => {
-                let tc_event = &turn_result.tool_calls[*i];
-                let id = tc_event
-                    .get("id")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let name = tc_event
-                    .get("name")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let args_raw = tc_event
-                    .get("arguments")
-                    .cloned()
-                    .unwrap_or(serde_json::Value::Object(Default::default()));
-                let args = match args_raw {
-                    serde_json::Value::String(s) => serde_json::from_str::<serde_json::Value>(&s)
-                        .unwrap_or_else(|_| serde_json::Value::Object(Default::default())),
-                    other => other,
-                };
-                (id, name, args, false)
+        let (id, name, args, synthetic_idx) = match *item {
+            HeadlessRoundToolIdx::ServerToolCall(i) => {
+                let (id, name, args) = parse_flat_tool_call_event(&turn_result.tool_calls[i]);
+                (id, name, args, None)
             }
-            RoundToolItem::Synthetic(i) => {
-                let e = &turn_result.edge_tool_round[*i];
-                (format!("edge-{i}"), e.tool.clone(), e.args.clone(), true)
+            HeadlessRoundToolIdx::SyntheticEdge(i) => {
+                let e = &turn_result.edge_tool_round[i];
+                (format!("edge-{i}"), e.tool.clone(), e.args.clone(), Some(i))
             }
         };
 
@@ -682,11 +650,8 @@ async fn run_headless_tool_round(ctx: HeadlessToolRoundRequest<'_>) {
             continue;
         }
 
-        let mut result_str = if from_synthetic {
-            match item {
-                RoundToolItem::Synthetic(i) => turn_result.edge_tool_round[*i].output.clone(),
-                _ => unreachable!(),
-            }
+        let mut result_str = if let Some(i) = synthetic_idx {
+            turn_result.edge_tool_round[i].output.clone()
         } else {
             take_edge_output_for_tool_call(
                 &name,
@@ -698,15 +663,7 @@ async fn run_headless_tool_round(ctx: HeadlessToolRoundRequest<'_>) {
         };
 
         if !valid_tool_names.contains(&name) {
-            let err_msg = format!(
-                "Unknown tool '{}'. Available: {}",
-                name,
-                valid_tool_names
-                    .iter()
-                    .cloned()
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            );
+            let err_msg = unknown_local_tool_error_message(&name, valid_tool_names);
             if !quiet {
                 eprintln!("{}", format!("  ✗ {name}").red());
             }

@@ -2,11 +2,86 @@
 //!
 //! Shared between the CLI SSE loop and any future server-side handler that consumes the same shape.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use serde_json::{Value, json};
 
 use super::tool_result_semantics::tool_dedup_signature;
+
+/// One tool slot to execute in a headless round: either a server `tool_calls[i]` or synthetic edge row `i`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HeadlessRoundToolIdx {
+    ServerToolCall(usize),
+    SyntheticEdge(usize),
+}
+
+/// Prefer iterating server `tool_calls` when present; otherwise one synthetic slot per edge row (§5.5).
+pub fn headless_round_tool_indices(
+    server_tool_calls_len: usize,
+    edge_round_len: usize,
+) -> Vec<HeadlessRoundToolIdx> {
+    if server_tool_calls_len > 0 {
+        (0..server_tool_calls_len)
+            .map(HeadlessRoundToolIdx::ServerToolCall)
+            .collect()
+    } else {
+        (0..edge_round_len)
+            .map(HeadlessRoundToolIdx::SyntheticEdge)
+            .collect()
+    }
+}
+
+/// Parse flat `/chat/turn` tool-call JSON: top-level `id`, `name`, `arguments` (object or JSON string).
+pub fn parse_flat_tool_call_event(tc: &Value) -> (String, String, Value) {
+    let id = tc
+        .get("id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let name = tc
+        .get("name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let args_raw = tc
+        .get("arguments")
+        .cloned()
+        .unwrap_or(Value::Object(Default::default()));
+    let args = match args_raw {
+        Value::String(s) => {
+            serde_json::from_str::<Value>(&s).unwrap_or_else(|_| Value::Object(Default::default()))
+        }
+        other => other,
+    };
+    (id, name, args)
+}
+
+/// Tool names still pending when step scheduling times out (abort tail of `indices`).
+pub fn headless_timeout_aborted_tool_names(
+    indices: &[HeadlessRoundToolIdx],
+    completed_tool_results_len: usize,
+    server_tool_calls: &[Value],
+    mut synthetic_tool_name: impl FnMut(usize) -> String,
+) -> Vec<String> {
+    indices
+        .iter()
+        .skip(completed_tool_results_len)
+        .map(|idx| match *idx {
+            HeadlessRoundToolIdx::ServerToolCall(i) => server_tool_calls
+                .get(i)
+                .map(|tc| parse_flat_tool_call_event(tc).1)
+                .unwrap_or_default(),
+            HeadlessRoundToolIdx::SyntheticEdge(i) => synthetic_tool_name(i),
+        })
+        .collect()
+}
+
+/// User-facing error when the LLM names a tool not in the local registry.
+pub fn unknown_local_tool_error_message(name: &str, valid_tool_names: &HashSet<String>) -> String {
+    let mut names: Vec<_> = valid_tool_names.iter().cloned().collect();
+    names.sort();
+    format!("Unknown tool '{}'. Available: {}", name, names.join(", "))
+}
 
 /// Tools that are idempotent reads — safe to cache across turns.
 /// Side-effectful tools must not appear here.
@@ -247,6 +322,76 @@ mod tests {
             &by_sig,
         );
         assert_eq!(out, "from-map");
+    }
+
+    #[test]
+    fn headless_round_indices_server_first() {
+        let v = headless_round_tool_indices(2, 5);
+        assert_eq!(
+            v,
+            vec![
+                HeadlessRoundToolIdx::ServerToolCall(0),
+                HeadlessRoundToolIdx::ServerToolCall(1),
+            ]
+        );
+    }
+
+    #[test]
+    fn headless_round_indices_edge_when_no_server_calls() {
+        let v = headless_round_tool_indices(0, 2);
+        assert_eq!(
+            v,
+            vec![
+                HeadlessRoundToolIdx::SyntheticEdge(0),
+                HeadlessRoundToolIdx::SyntheticEdge(1),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_flat_tool_call_string_arguments() {
+        let tc = json!({
+            "id": "c1",
+            "name": "bash",
+            "arguments": "{\"command\":\"ls\"}"
+        });
+        let (id, name, args) = parse_flat_tool_call_event(&tc);
+        assert_eq!(id, "c1");
+        assert_eq!(name, "bash");
+        assert_eq!(args, json!({"command":"ls"}));
+    }
+
+    #[test]
+    fn parse_flat_tool_call_object_arguments() {
+        let tc = json!({
+            "id": "c2",
+            "name": "grep",
+            "arguments": {"pattern": "x"}
+        });
+        let (id, name, args) = parse_flat_tool_call_event(&tc);
+        assert_eq!(id, "c2");
+        assert_eq!(name, "grep");
+        assert_eq!(args, json!({"pattern":"x"}));
+    }
+
+    #[test]
+    fn headless_timeout_aborted_names_tail() {
+        let idx = vec![
+            HeadlessRoundToolIdx::ServerToolCall(0),
+            HeadlessRoundToolIdx::SyntheticEdge(0),
+        ];
+        let server = vec![json!({"name":"read_file","arguments":{}})];
+        let names = headless_timeout_aborted_tool_names(&idx, 1, &server, |_| "bash".to_string());
+        assert_eq!(names, vec!["bash".to_string()]);
+    }
+
+    #[test]
+    fn unknown_local_tool_lists_sorted() {
+        let mut s = HashSet::new();
+        s.insert("zebra".into());
+        s.insert("alpha".into());
+        let m = unknown_local_tool_error_message("foo", &s);
+        assert_eq!(m, "Unknown tool 'foo'. Available: alpha, zebra");
     }
 
     #[test]
