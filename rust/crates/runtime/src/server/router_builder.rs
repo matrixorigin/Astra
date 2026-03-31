@@ -49,6 +49,14 @@ pub(super) fn build_router(state: AppState) -> Router {
             "/chat/runs/{run_id}/stream",
             get(run_handlers::stream_run_handler),
         )
+        .route(
+            "/chat/runs/{run_id}/pause",
+            post(run_handlers::pause_run_handler),
+        )
+        .route(
+            "/chat/runs/{run_id}/resume",
+            post(run_handlers::resume_run_handler),
+        )
         // Reflect / decision-trace
         .route(
             "/chat/session/{session_id}/reflect",

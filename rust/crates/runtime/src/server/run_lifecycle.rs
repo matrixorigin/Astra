@@ -22,7 +22,7 @@ use uuid::Uuid;
 use mo_agent_core::{ErrorResponse, SharedPool, error_response};
 use mo_agent_services::runs::{
     CancelRunRecord, ChatRequestData, ChatRunRecord, ChatStreamRecord, RunLifecycleService,
-    RunListRecord, RunStatusRecord,
+    RunListRecord, RunMutationRecord, RunStatusRecord,
 };
 
 use crate::turn::agentic_loop_host::{AgenticLoopState, run_agentic_loop_with_host};
@@ -38,6 +38,7 @@ use super::server_loop_host::ServerAgenticLoopHostBuilder;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RunStatus {
     Running,
+    Paused,
     Completed,
     Failed,
     Cancelled,
@@ -47,6 +48,7 @@ impl RunStatus {
     fn as_str(&self) -> &'static str {
         match self {
             Self::Running => "running",
+            Self::Paused => "paused",
             Self::Completed => "completed",
             Self::Failed => "failed",
             Self::Cancelled => "cancelled",
@@ -427,6 +429,70 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             offset,
         })
     }
+
+    async fn pause_run(
+        &self,
+        run_id: String,
+        user_id: String,
+    ) -> Result<RunMutationRecord, (StatusCode, Json<ErrorResponse>)> {
+        let mut runs = self.runs.write().await;
+        let run = runs.get_mut(&run_id).ok_or_else(|| {
+            error_response(StatusCode::NOT_FOUND, "Run not found")
+        })?;
+        if run.user_id != user_id {
+            return Err(error_response(StatusCode::FORBIDDEN, "Access denied"));
+        }
+        if run.status != RunStatus::Running {
+            return Err(error_response(
+                StatusCode::CONFLICT,
+                format!("Cannot pause run in '{}' state", run.status.as_str()),
+            ));
+        }
+        let previous = run.status.as_str().to_string();
+        run.status = RunStatus::Paused;
+        run.waiting_for = Some("user_resume".to_string());
+        run.events.push(json!({
+            "event_type": "run_paused",
+            "data": {}
+        }));
+        Ok(RunMutationRecord {
+            run_id,
+            status: "paused".to_string(),
+            previous_status: previous,
+        })
+    }
+
+    async fn resume_run(
+        &self,
+        run_id: String,
+        user_id: String,
+    ) -> Result<RunMutationRecord, (StatusCode, Json<ErrorResponse>)> {
+        let mut runs = self.runs.write().await;
+        let run = runs.get_mut(&run_id).ok_or_else(|| {
+            error_response(StatusCode::NOT_FOUND, "Run not found")
+        })?;
+        if run.user_id != user_id {
+            return Err(error_response(StatusCode::FORBIDDEN, "Access denied"));
+        }
+        if run.status != RunStatus::Paused {
+            return Err(error_response(
+                StatusCode::CONFLICT,
+                format!("Cannot resume run in '{}' state", run.status.as_str()),
+            ));
+        }
+        let previous = run.status.as_str().to_string();
+        run.status = RunStatus::Running;
+        run.waiting_for = None;
+        run.events.push(json!({
+            "event_type": "run_resumed",
+            "data": {}
+        }));
+        Ok(RunMutationRecord {
+            run_id,
+            status: "running".to_string(),
+            previous_status: previous,
+        })
+    }
 }
 
 
@@ -692,5 +758,100 @@ mod tests {
         assert_eq!(RunStatus::Completed.as_str(), "completed");
         assert_eq!(RunStatus::Failed.as_str(), "failed");
         assert_eq!(RunStatus::Cancelled.as_str(), "cancelled");
+        assert_eq!(RunStatus::Paused.as_str(), "paused");
+    }
+
+    #[tokio::test]
+    async fn pause_run_transitions_running_to_paused() {
+        let svc = test_service();
+        let run = ok(svc.create_run("user-1".into(), test_request("task")).await);
+        let result = ok(svc.pause_run(run.run_id.clone(), "user-1".into()).await);
+        assert_eq!(result.status, "paused");
+        assert_eq!(result.previous_status, "running");
+        let status = ok(svc.get_run_status(run.run_id, "user-1".into()).await);
+        assert_eq!(status.status, "paused");
+    }
+
+    #[tokio::test]
+    async fn pause_run_conflict_when_not_running() {
+        let svc = test_service();
+        let run = ok(svc.create_run("user-1".into(), test_request("task")).await);
+        ok(svc.cancel_run(run.run_id.clone(), "user-1".into()).await);
+        let e = err(svc.pause_run(run.run_id, "user-1".into()).await);
+        assert_eq!(e.0, StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn pause_run_forbidden_for_other_user() {
+        let svc = test_service();
+        let run = ok(svc.create_run("user-1".into(), test_request("task")).await);
+        let e = err(svc.pause_run(run.run_id, "user-2".into()).await);
+        assert_eq!(e.0, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn pause_run_not_found() {
+        let svc = test_service();
+        let e = err(svc.pause_run("nonexistent".into(), "user-1".into()).await);
+        assert_eq!(e.0, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn resume_run_transitions_paused_to_running() {
+        let svc = test_service();
+        let run = ok(svc.create_run("user-1".into(), test_request("task")).await);
+        ok(svc.pause_run(run.run_id.clone(), "user-1".into()).await);
+        let result = ok(svc.resume_run(run.run_id.clone(), "user-1".into()).await);
+        assert_eq!(result.status, "running");
+        assert_eq!(result.previous_status, "paused");
+        let status = ok(svc.get_run_status(run.run_id, "user-1".into()).await);
+        assert_eq!(status.status, "running");
+    }
+
+    #[tokio::test]
+    async fn resume_run_conflict_when_not_paused() {
+        let svc = test_service();
+        let run = ok(svc.create_run("user-1".into(), test_request("task")).await);
+        let e = err(svc.resume_run(run.run_id, "user-1".into()).await);
+        assert_eq!(e.0, StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn resume_run_forbidden_for_other_user() {
+        let svc = test_service();
+        let run = ok(svc.create_run("user-1".into(), test_request("task")).await);
+        ok(svc.pause_run(run.run_id.clone(), "user-1".into()).await);
+        let e = err(svc.resume_run(run.run_id, "user-2".into()).await);
+        assert_eq!(e.0, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn resume_run_not_found() {
+        let svc = test_service();
+        let e = err(svc.resume_run("nonexistent".into(), "user-1".into()).await);
+        assert_eq!(e.0, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn pause_resume_round_trip_preserves_events() {
+        let svc = test_service();
+        let run = ok(svc.create_run("user-1".into(), test_request("task")).await);
+        ok(svc.pause_run(run.run_id.clone(), "user-1".into()).await);
+        ok(svc.resume_run(run.run_id.clone(), "user-1".into()).await);
+        let status = ok(svc.get_run_status(run.run_id.clone(), "user-1".into()).await);
+        assert_eq!(status.events_count, 3); // run_started + run_paused + run_resumed
+        let events = ok(svc.stream_run(run.run_id, "user-1".into(), 0).await);
+        assert_eq!(events[0]["event_type"], "run_started");
+        assert_eq!(events[1]["event_type"], "run_paused");
+        assert_eq!(events[2]["event_type"], "run_resumed");
+    }
+
+    #[tokio::test]
+    async fn double_pause_is_conflict() {
+        let svc = test_service();
+        let run = ok(svc.create_run("user-1".into(), test_request("task")).await);
+        ok(svc.pause_run(run.run_id.clone(), "user-1".into()).await);
+        let e = err(svc.pause_run(run.run_id, "user-1".into()).await);
+        assert_eq!(e.0, StatusCode::CONFLICT);
     }
 }

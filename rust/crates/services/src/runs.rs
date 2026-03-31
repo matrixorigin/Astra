@@ -41,6 +41,30 @@ pub trait RunLifecycleService: Send + Sync {
         limit: u32,
         offset: u32,
     ) -> Result<RunListRecord, (StatusCode, Json<ErrorResponse>)>;
+
+    /// Pause an active run. Default: NOT_IMPLEMENTED.
+    async fn pause_run(
+        &self,
+        _run_id: String,
+        _user_id: String,
+    ) -> Result<RunMutationRecord, (StatusCode, Json<ErrorResponse>)> {
+        Err(error_response(
+            StatusCode::NOT_IMPLEMENTED,
+            "Pause not supported",
+        ))
+    }
+
+    /// Resume a paused run. Default: NOT_IMPLEMENTED.
+    async fn resume_run(
+        &self,
+        _run_id: String,
+        _user_id: String,
+    ) -> Result<RunMutationRecord, (StatusCode, Json<ErrorResponse>)> {
+        Err(error_response(
+            StatusCode::NOT_IMPLEMENTED,
+            "Resume not supported",
+        ))
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -82,6 +106,14 @@ pub struct RunStatusRecord {
 pub struct CancelRunRecord {
     pub run_id: String,
     pub status: String,
+}
+
+/// Generic record for run mutations (pause, resume, etc.).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RunMutationRecord {
+    pub run_id: String,
+    pub status: String,
+    pub previous_status: String,
 }
 
 #[derive(Clone, Debug, PartialEq)]

@@ -59,3 +59,29 @@ pub(super) async fn list_runs_handler(
         .await?;
     Ok(Json(RunListResponse::from(runs)))
 }
+
+pub(super) async fn pause_run_handler(
+    State(state): State<AppState>,
+    Path(run_id): Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<RunMutationResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let user = state.auth_service.current_user(&headers).await?;
+    let result = state
+        .run_lifecycle_service
+        .pause_run(run_id, user.user_id)
+        .await?;
+    Ok(Json(RunMutationResponse::from(result)))
+}
+
+pub(super) async fn resume_run_handler(
+    State(state): State<AppState>,
+    Path(run_id): Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<RunMutationResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let user = state.auth_service.current_user(&headers).await?;
+    let result = state
+        .run_lifecycle_service
+        .resume_run(run_id, user.user_id)
+        .await?;
+    Ok(Json(RunMutationResponse::from(result)))
+}

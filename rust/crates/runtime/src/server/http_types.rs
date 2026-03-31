@@ -178,6 +178,13 @@ pub(super) struct CancelRunResponse {
     pub(super) status: String,
 }
 
+#[derive(Serialize, PartialEq, Eq)]
+pub(super) struct RunMutationResponse {
+    pub(super) run_id: String,
+    pub(super) status: String,
+    pub(super) previous_status: String,
+}
+
 #[derive(Deserialize, Default)]
 pub(super) struct RunListQuery {
     #[serde(default = "default_run_list_limit")]
@@ -512,6 +519,16 @@ impl From<CancelRunRecord> for CancelRunResponse {
         Self {
             run_id: value.run_id,
             status: value.status,
+        }
+    }
+}
+
+impl From<RunMutationRecord> for RunMutationResponse {
+    fn from(value: RunMutationRecord) -> Self {
+        Self {
+            run_id: value.run_id,
+            status: value.status,
+            previous_status: value.previous_status,
         }
     }
 }
@@ -1421,6 +1438,19 @@ mod tests {
         let resp: CancelRunResponse = record.into();
         assert_eq!(resp.run_id, "r1");
         assert_eq!(resp.status, "cancelled");
+    }
+
+    #[test]
+    fn run_mutation_record_to_response() {
+        let record = RunMutationRecord {
+            run_id: "r1".into(),
+            status: "paused".into(),
+            previous_status: "running".into(),
+        };
+        let resp: RunMutationResponse = record.into();
+        assert_eq!(resp.run_id, "r1");
+        assert_eq!(resp.status, "paused");
+        assert_eq!(resp.previous_status, "running");
     }
 
     #[test]

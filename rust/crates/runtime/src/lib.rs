@@ -162,7 +162,7 @@ pub use mo_agent_services::{
 };
 
 pub(crate) use mo_agent_services::runs::{
-    UnconfiguredRunLifecycleService, transform_run_event_for_client,
+    RunMutationRecord, UnconfiguredRunLifecycleService, transform_run_event_for_client,
 };
 
 // ── Re-exports: runtime app state ────────────────────────────────────────────
