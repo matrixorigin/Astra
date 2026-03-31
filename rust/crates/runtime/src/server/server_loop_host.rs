@@ -458,6 +458,17 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
     fn valid_tool_names(&self) -> &HashSet<String> {
         &self.valid_tools
     }
+
+    fn inject_tool_schema(&mut self, schema: Value) {
+        if let Some(name) = schema
+            .get("function")
+            .and_then(|f| f.get("name"))
+            .and_then(Value::as_str)
+            && self.valid_tools.insert(name.to_string())
+        {
+            self.edge_tools.push(schema);
+        }
+    }
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────────
@@ -956,5 +967,69 @@ mod tests {
         let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
         assert!(outcome.is_ok());
         assert!(state.final_text.contains("turn1"));
+    }
+
+    // ── inject_tool_schema tests ────────────────────────────────────────────
+
+    #[test]
+    fn inject_tool_schema_adds_to_edge_tools_and_valid_tools() {
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "user1".to_string(),
+            "sess1".to_string(),
+        )
+        .with_edge_tools(sample_edge_tools())
+        .build();
+
+        assert!(!host.valid_tool_names().contains("delegate"));
+        let initial_count = host.edge_tools.len();
+
+        use crate::turn::agentic_loop_host::delegate_tool_schema;
+        host.inject_tool_schema(delegate_tool_schema());
+
+        assert!(host.valid_tool_names().contains("delegate"));
+        assert_eq!(host.edge_tools.len(), initial_count + 1);
+        let last = host.edge_tools.last().unwrap();
+        assert_eq!(last["function"]["name"], "delegate");
+    }
+
+    #[test]
+    fn inject_tool_schema_is_idempotent() {
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "user1".to_string(),
+            "sess1".to_string(),
+        )
+        .with_edge_tools(sample_edge_tools())
+        .build();
+
+        use crate::turn::agentic_loop_host::delegate_tool_schema;
+        let initial_count = host.edge_tools.len();
+
+        host.inject_tool_schema(delegate_tool_schema());
+        host.inject_tool_schema(delegate_tool_schema());
+
+        // Only one injection — duplicate is skipped
+        assert_eq!(host.edge_tools.len(), initial_count + 1);
+    }
+
+    #[test]
+    fn inject_tool_schema_ignores_malformed_schema() {
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "user1".to_string(),
+            "sess1".to_string(),
+        )
+        .with_edge_tools(sample_edge_tools())
+        .build();
+
+        let initial_count = host.edge_tools.len();
+        host.inject_tool_schema(json!({"bad": "schema"}));
+
+        // No change — malformed schema ignored
+        assert_eq!(host.edge_tools.len(), initial_count);
     }
 }

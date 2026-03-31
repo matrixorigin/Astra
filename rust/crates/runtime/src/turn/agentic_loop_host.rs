@@ -130,6 +130,18 @@ pub trait AgenticLoopHost: Send {
 
     /// Valid tool names from the host's tool schemas.
     fn valid_tool_names(&self) -> &HashSet<String>;
+
+    /// Inject an additional tool schema into the host's tool list.
+    ///
+    /// Called by the runtime in the loop preamble to auto-register tools
+    /// that are provided by the runtime layer (e.g. the `delegate` tool when
+    /// a [`DelegationEngine`] is wired into the loop state).
+    ///
+    /// The host should add the schema to its tool list (for LLM visibility)
+    /// and register the tool name in its valid-tool set.
+    ///
+    /// Default: no-op (used by MockHost and hosts that don't support injection).
+    fn inject_tool_schema(&mut self, _schema: Value) {}
 }
 
 // ─── Loop state ──────────────────────────────────────────────────────────────
@@ -459,6 +471,11 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
     host: &mut H,
     state: &mut AgenticLoopState,
 ) -> Result<AgenticLoopOutcome, String> {
+    // ─── Preamble: auto-inject delegate tool when delegation is wired ────
+    if state.delegation_engine.is_some() {
+        host.inject_tool_schema(delegate_tool_schema());
+    }
+
     for turn_index in 0..state.max_turns {
         // ─── Cancel check (cooperative) ─────────────────────────────────
         if state
@@ -654,6 +671,7 @@ mod tests {
         valid_tools: HashSet<String>,
         emitted_lines: Vec<String>,
         quiet: bool,
+        injected_schemas: Vec<Value>,
     }
 
     impl MockHost {
@@ -664,6 +682,7 @@ mod tests {
                 valid_tools: HashSet::new(),
                 emitted_lines: Vec::new(),
                 quiet: true,
+                injected_schemas: Vec::new(),
             }
         }
 
@@ -697,6 +716,17 @@ mod tests {
 
         fn valid_tool_names(&self) -> &HashSet<String> {
             &self.valid_tools
+        }
+
+        fn inject_tool_schema(&mut self, schema: Value) {
+            if let Some(name) = schema
+                .get("function")
+                .and_then(|f| f.get("name"))
+                .and_then(Value::as_str)
+            {
+                self.valid_tools.insert(name.to_string());
+            }
+            self.injected_schemas.push(schema);
         }
     }
 
@@ -1949,5 +1979,95 @@ mod tests {
         let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
         assert!(outcome.is_ok());
         assert_eq!(state.final_text, "Adversarial review complete.");
+    }
+
+    // ── Auto-injection tests ────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn auto_inject_delegate_schema_when_engine_present() {
+        // When delegation_engine is Some, the loop preamble should call
+        // inject_tool_schema with the delegate tool schema.
+        let mut host = MockHost::new(vec![
+            text_result("done", 50, 20, Some(10)),
+        ]);
+        let mut state = make_state();
+        state.messages.push(json!({"role": "user", "content": "hello"}));
+        state.delegation_engine = Some(make_test_delegation_engine());
+
+        let _ = run_agentic_loop_with_host(&mut host, &mut state).await;
+
+        assert_eq!(host.injected_schemas.len(), 1);
+        let injected = &host.injected_schemas[0];
+        let name = injected["function"]["name"].as_str().unwrap();
+        assert_eq!(name, "delegate");
+        assert!(host.valid_tools.contains("delegate"));
+    }
+
+    #[tokio::test]
+    async fn no_inject_when_delegation_engine_absent() {
+        // When delegation_engine is None, no schema should be injected.
+        let mut host = MockHost::new(vec![
+            text_result("done", 50, 20, Some(10)),
+        ]);
+        let mut state = make_state();
+        state.messages.push(json!({"role": "user", "content": "hello"}));
+        // delegation_engine defaults to None
+
+        let _ = run_agentic_loop_with_host(&mut host, &mut state).await;
+
+        assert!(host.injected_schemas.is_empty());
+        assert!(!host.valid_tools.contains("delegate"));
+    }
+
+    #[tokio::test]
+    async fn injected_schema_matches_delegate_tool_schema() {
+        let mut host = MockHost::new(vec![
+            text_result("done", 50, 20, Some(10)),
+        ]);
+        let mut state = make_state();
+        state.messages.push(json!({"role": "user", "content": "hello"}));
+        state.delegation_engine = Some(make_test_delegation_engine());
+
+        let _ = run_agentic_loop_with_host(&mut host, &mut state).await;
+
+        let expected = delegate_tool_schema();
+        assert_eq!(host.injected_schemas[0], expected);
+    }
+
+    #[test]
+    fn delegate_schema_has_required_openai_structure() {
+        let schema = delegate_tool_schema();
+        assert_eq!(schema["type"], "function");
+        assert_eq!(schema["function"]["name"], "delegate");
+        assert!(schema["function"]["description"].as_str().unwrap().len() > 10);
+        let params = &schema["function"]["parameters"];
+        assert_eq!(params["type"], "object");
+        let required = params["required"].as_array().unwrap();
+        assert!(required.contains(&json!("task")));
+        assert!(required.contains(&json!("agents")));
+        let props = &params["properties"];
+        assert!(props.get("task").is_some());
+        assert!(props.get("agents").is_some());
+        assert!(props.get("pattern").is_some());
+        assert!(props.get("max_rounds").is_some());
+        assert!(props.get("context").is_some());
+    }
+
+    #[tokio::test]
+    async fn auto_inject_only_once_across_loop() {
+        // Even with multiple turns, injection should happen only once (in preamble).
+        // Use a delegate call followed by final text — two turns total.
+        let mut host = MockHost::new(vec![
+            text_result("still going", 100, 50, Some(10)),
+            text_result("done", 50, 20, None),
+        ]);
+        let mut state = make_state();
+        state.messages.push(json!({"role": "user", "content": "list files"}));
+        state.delegation_engine = Some(make_test_delegation_engine());
+
+        let _ = run_agentic_loop_with_host(&mut host, &mut state).await;
+
+        // Only one injection, not one per turn
+        assert_eq!(host.injected_schemas.len(), 1);
     }
 }

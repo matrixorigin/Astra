@@ -124,4 +124,16 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
     fn valid_tool_names(&self) -> &HashSet<String> {
         &self.valid_tool_names
     }
+
+    fn inject_tool_schema(&mut self, schema: Value) {
+        if let Some(name) = schema
+            .get("function")
+            .and_then(|f| f.get("name"))
+            .and_then(Value::as_str)
+        {
+            if self.valid_tool_names.insert(name.to_string()) {
+                self.all_schemas.push(schema);
+            }
+        }
+    }
 }
