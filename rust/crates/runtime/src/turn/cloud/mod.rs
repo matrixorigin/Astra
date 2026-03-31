@@ -5,4 +5,6 @@ pub mod grouping;
 pub mod history;
 pub mod iteration;
 pub mod prefilter;
+pub mod session_memory;
+pub mod sm_compact;
 pub mod summary;

@@ -188,10 +188,10 @@ pub use introspection::{
 
 // ── Re-exports: server ───────────────────────────────────────────────────────
 
-pub use server::{build_app, serve};
+pub use server::delegation_engine::{DelegationEngine, DelegationTracker};
 pub use server::run_engine::RunEngine;
 pub use server::run_lifecycle::AgenticRunLifecycleService;
-pub use server::delegation_engine::{DelegationEngine, DelegationTracker};
+pub use server::{build_app, serve};
 
 // ── Re-exports: turn engine ──────────────────────────────────────────────────
 
@@ -227,6 +227,14 @@ pub use turn::{
         history::compact_cloud_loop_history,
         iteration::{CloudLoopIterationPlan, plan_cloud_loop_iteration},
         prefilter::{CloudSkillCandidatePlan, plan_cloud_skill_candidates},
+        session_memory::{
+            SESSION_MEMORY_SECTIONS, SESSION_MEMORY_TEMPLATE, SessionMemory, SessionMemoryConfig,
+            SessionMemoryState, SmCompactConfig,
+        },
+        sm_compact::{
+            SmCompactOutcome, SmFallbackReason, compact_with_session_memory_fallback,
+            session_memory_compact,
+        },
         summary::{HttpSummaryClient, LlmConnParams, SummaryLlmClient, SummaryResponse},
     },
     complete::build_turn_complete_event,

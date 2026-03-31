@@ -139,8 +139,7 @@ pub fn compact_tiered(
     tier: CompactionTier,
     keep_recent_turns: usize,
 ) -> Vec<Value> {
-    compact_tiered_with_result(messages, budget_chars, keep_chars, tier, keep_recent_turns)
-        .messages
+    compact_tiered_with_result(messages, budget_chars, keep_chars, tier, keep_recent_turns).messages
 }
 
 /// Tier-aware compaction returning a [`CompactResult`] with rich metadata.
@@ -302,34 +301,35 @@ pub async fn compact_with_summary(
     llm_client: Option<&dyn super::summary::SummaryLlmClient>,
 ) -> CompactResult {
     // Always run structural compaction first
-    let mut result = compact_tiered_with_result(messages, budget_chars, keep_chars, tier, keep_recent_turns);
+    let mut result =
+        compact_tiered_with_result(messages, budget_chars, keep_chars, tier, keep_recent_turns);
 
     // Attempt LLM summary if configured and a client is provided
-    if compact_config.should_summarize(tier) {
-        if let Some(client) = llm_client {
-            match super::summary::generate_compact_summary(messages, client).await {
-                Some(summary) => {
-                    // Prepend summary as a user message
-                    let summary_msg = serde_json::json!({
-                        "role": "user",
-                        "content": format!("[Conversation summary — context compacted]\n\n{summary}"),
-                        "attachment_metadata": { "kind": "compact_summary" }
-                    });
-                    let mut new_messages = vec![summary_msg];
-                    new_messages.extend(result.messages.iter().cloned());
-                    result.messages = new_messages;
+    if compact_config.should_summarize(tier)
+        && let Some(client) = llm_client
+    {
+        match super::summary::generate_compact_summary(messages, client).await {
+            Some(summary) => {
+                // Prepend summary as a user message
+                let summary_msg = serde_json::json!({
+                    "role": "user",
+                    "content": format!("[Conversation summary — context compacted]\n\n{summary}"),
+                    "attachment_metadata": { "kind": "compact_summary" }
+                });
+                let mut new_messages = vec![summary_msg];
+                new_messages.extend(result.messages.iter().cloned());
+                result.messages = new_messages;
 
-                    // Store summary in boundary
-                    if let Some(ref mut boundary) = result.boundary {
-                        boundary.summary = Some(summary);
-                    }
+                // Store summary in boundary
+                if let Some(ref mut boundary) = result.boundary {
+                    boundary.summary = Some(summary);
                 }
-                None => {
-                    eprintln!(
-                        "[compact_with_summary] summary generation failed (tier={:?}), using truncation only",
-                        tier
-                    );
-                }
+            }
+            None => {
+                eprintln!(
+                    "[compact_with_summary] summary generation failed (tier={:?}), using truncation only",
+                    tier
+                );
             }
         }
     }
@@ -337,11 +337,12 @@ pub async fn compact_with_summary(
     result
 }
 
-
+#[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
 
+    #[allow(dead_code)]
     fn tool(content: &str) -> Value {
         json!({"role": "tool", "content": content})
     }
@@ -437,7 +438,10 @@ mod tests {
         let msgs = vec![user("hello"), tool("world")];
         let result = compact_tiered_with_result(&msgs, 100, 100, CompactionTier::Normal, 4);
         assert_eq!(result.tier, CompactionTier::Normal);
-        assert!(result.boundary.is_none(), "Normal tier should produce no boundary");
+        assert!(
+            result.boundary.is_none(),
+            "Normal tier should produce no boundary"
+        );
         assert_eq!(result.messages.len(), 2);
     }
 
@@ -446,18 +450,19 @@ mod tests {
         let msgs = vec![user("hello"), tool("world")];
         let result =
             compact_tiered_with_result(&msgs, 100_000, 100, CompactionTier::AggressivePrune, 4);
-        assert!(result.boundary.is_none(), "Under-budget should produce no boundary");
+        assert!(
+            result.boundary.is_none(),
+            "Under-budget should produce no boundary"
+        );
     }
 
     #[test]
     fn with_result_over_budget_has_boundary() {
-        let msgs = vec![
-            tool(&"a".repeat(5000)),
-            tool(&"b".repeat(100)),
-        ];
-        let result =
-            compact_tiered_with_result(&msgs, 50, 2000, CompactionTier::CompactHistory, 4);
-        let boundary = result.boundary.expect("over-budget should produce boundary");
+        let msgs = vec![tool(&"a".repeat(5000)), tool(&"b".repeat(100))];
+        let result = compact_tiered_with_result(&msgs, 50, 2000, CompactionTier::CompactHistory, 4);
+        let boundary = result
+            .boundary
+            .expect("over-budget should produce boundary");
         assert_eq!(boundary.tier, CompactionTier::CompactHistory);
         assert_eq!(boundary.trigger, CompactTrigger::Auto);
         assert_eq!(boundary.messages_before, 2);
@@ -466,9 +471,10 @@ mod tests {
 
     #[test]
     fn boundary_to_system_message() {
-        let boundary = CompactBoundary::new(CompactTrigger::Manual, CompactionTier::AggressivePrune)
-            .with_pre_metrics(12000, 10)
-            .with_post_count(4);
+        let boundary =
+            CompactBoundary::new(CompactTrigger::Manual, CompactionTier::AggressivePrune)
+                .with_pre_metrics(12000, 10)
+                .with_post_count(4);
         let msg = boundary.to_system_message();
         assert_eq!(msg["role"].as_str().unwrap(), "system");
         let content = msg["content"].as_str().unwrap();
@@ -551,12 +557,21 @@ mod tests {
     async fn compact_with_summary_disabled_no_summary_injected() {
         use crate::turn::cloud::summary::tests::MockSummaryClient;
         let client = MockSummaryClient::success("should not appear");
-        let msgs = vec![
-            tool(&"a".repeat(5000)),
-            tool(&"b".repeat(100)),
-        ];
-        let cfg = CompactConfig { enable_summary: false, ..Default::default() };
-        let result = compact_with_summary(&msgs, 50, 2000, CompactionTier::AggressivePrune, 4, &cfg, Some(&client)).await;
+        let msgs = vec![tool(&"a".repeat(5000)), tool(&"b".repeat(100))];
+        let cfg = CompactConfig {
+            enable_summary: false,
+            ..Default::default()
+        };
+        let result = compact_with_summary(
+            &msgs,
+            50,
+            2000,
+            CompactionTier::AggressivePrune,
+            4,
+            &cfg,
+            Some(&client),
+        )
+        .await;
         // No summary message should be prepended
         let has_summary = result.messages.iter().any(|m| {
             m.get("attachment_metadata")
@@ -572,21 +587,35 @@ mod tests {
         use crate::turn::cloud::summary::tests::MockSummaryClient;
         let client = MockSummaryClient::success("## Task\nFix the bug");
         let msgs: Vec<Value> = (0..5)
-            .flat_map(|i| vec![
-                json!({"role": "user", "content": format!("q{i} {}", "x".repeat(200))}),
-                json!({"role": "assistant", "content": format!("a{i} {}", "y".repeat(200))}),
-            ])
+            .flat_map(|i| {
+                vec![
+                    json!({"role": "user", "content": format!("q{i} {}", "x".repeat(200))}),
+                    json!({"role": "assistant", "content": format!("a{i} {}", "y".repeat(200))}),
+                ]
+            })
             .collect();
         let cfg = CompactConfig {
             enable_summary: true,
             summary_min_tier: CompactionTier::AggressivePrune,
             ..Default::default()
         };
-        let result = compact_with_summary(&msgs, 50, 100, CompactionTier::AggressivePrune, 1, &cfg, Some(&client)).await;
+        let result = compact_with_summary(
+            &msgs,
+            50,
+            100,
+            CompactionTier::AggressivePrune,
+            1,
+            &cfg,
+            Some(&client),
+        )
+        .await;
         // Summary message should be first
         let first = &result.messages[0];
         assert_eq!(
-            first.get("attachment_metadata").and_then(|a| a.get("kind")).and_then(|k| k.as_str()),
+            first
+                .get("attachment_metadata")
+                .and_then(|a| a.get("kind"))
+                .and_then(|k| k.as_str()),
             Some("compact_summary")
         );
         assert!(first["content"].as_str().unwrap().contains("Fix the bug"));
@@ -597,13 +626,22 @@ mod tests {
 
     #[tokio::test]
     async fn compact_with_summary_fallback_on_no_client() {
-        let msgs = vec![
-            tool(&"a".repeat(5000)),
-            tool(&"b".repeat(100)),
-        ];
-        let cfg = CompactConfig { enable_summary: true, ..Default::default() };
+        let msgs = vec![tool(&"a".repeat(5000)), tool(&"b".repeat(100))];
+        let cfg = CompactConfig {
+            enable_summary: true,
+            ..Default::default()
+        };
         // Pass None as client — should fall back to truncation silently
-        let result = compact_with_summary(&msgs, 50, 2000, CompactionTier::AggressivePrune, 4, &cfg, None).await;
+        let result = compact_with_summary(
+            &msgs,
+            50,
+            2000,
+            CompactionTier::AggressivePrune,
+            4,
+            &cfg,
+            None,
+        )
+        .await;
         assert!(result.boundary.is_some());
         // No summary
         assert!(result.boundary.unwrap().summary.is_none());
