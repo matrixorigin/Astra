@@ -130,6 +130,7 @@ pub(crate) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
         recent_tools: p.recent_tools.to_vec(),
         api: p.api.clone(),
         api_token: p.token.to_string(),
+        cancel_flag: None,
     };
 
     // ─── Run the runtime loop ────────────────────────────────────────────

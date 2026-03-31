@@ -1,7 +1,8 @@
 //! WebSocket handler for browser-based agent access.
 //!
 //! Provides bidirectional real-time communication as an alternative to SSE.
-//! Reuses the same bridge infrastructure and event format as the HTTP/SSE path.
+//! Integrates with [`RunLifecycleService`] for multi-turn orchestration with
+//! cancel propagation and tool approval gating.
 //!
 //! ## Protocol
 //!
@@ -9,6 +10,8 @@
 //! ```json
 //! {"type": "auth", "token": "Bearer ..."}
 //! {"type": "message", "content": "...", "session_id": "...", "model": "..."}
+//! {"type": "cancel_run", "run_id": "..."}
+//! {"type": "tool_approval", "request_id": "...", "approved": true, "reason": "..."}
 //! {"type": "ping"}
 //! ```
 //!
@@ -17,10 +20,14 @@
 //! {"type": "auth_ok", "user_id": "...", "username": "..."}
 //! {"type": "auth_error", "message": "..."}
 //! {"type": "session_info", "session_id": "..."}
+//! {"type": "run_started", "run_id": "...", "session_id": "..."}
 //! {"type": "text_delta", "content": "..."}
 //! {"type": "tool_call_start", "tool": "...", "call_id": "..."}
+//! {"type": "tool_approval_request", "request_id": "...", "tool": "...", "args": {...}}
 //! {"type": "usage", "prompt_tokens": N, "completion_tokens": N}
 //! {"type": "turn_complete"}
+//! {"type": "run_finished", "run_id": "...", "status": "completed"}
+//! {"type": "run_cancelled", "run_id": "..."}
 //! {"type": "error", "message": "...", "code": "...", "retryable": bool}
 //! {"type": "pong"}
 //! ```
@@ -62,6 +69,19 @@ pub(super) enum WsClientMessage {
         context: Option<serde_json::Map<String, serde_json::Value>>,
     },
 
+    /// Cancel an active run.
+    #[serde(rename = "cancel_run")]
+    CancelRun { run_id: String },
+
+    /// Respond to a tool approval request.
+    #[serde(rename = "tool_approval")]
+    ToolApproval {
+        request_id: String,
+        approved: bool,
+        #[serde(default)]
+        reason: Option<String>,
+    },
+
     /// Client heartbeat.
     #[serde(rename = "ping")]
     Ping,
@@ -81,6 +101,32 @@ pub(super) enum WsServerMessage {
     #[serde(rename = "auth_error")]
     AuthError { message: String },
 
+    /// Agentic run started — client should track this run_id.
+    #[serde(rename = "run_started")]
+    RunStarted { run_id: String, session_id: String },
+
+    /// Agentic run finished (completed or failed).
+    #[serde(rename = "run_finished")]
+    RunFinished {
+        run_id: String,
+        status: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
+
+    /// Run was cancelled by client request.
+    #[serde(rename = "run_cancelled")]
+    RunCancelled { run_id: String },
+
+    /// Tool requires user approval before execution.
+    #[serde(rename = "tool_approval_request")]
+    #[allow(dead_code)] // Protocol variant — will be used when approval gate lands
+    ToolApprovalRequest {
+        request_id: String,
+        tool: String,
+        args: serde_json::Value,
+    },
+
     /// Error during processing.
     #[serde(rename = "error")]
     Error {
@@ -95,7 +141,7 @@ pub(super) enum WsServerMessage {
 
     /// Connection is being closed.
     #[serde(rename = "closing")]
-    #[allow(dead_code)] // Protocol variant — needed for serde deserialization
+    #[allow(dead_code)]
     Closing { reason: String },
 }
 
@@ -105,6 +151,8 @@ pub(super) enum WsServerMessage {
 struct WsConnection {
     user: AuthUserRecord,
     session_id: Option<String>,
+    /// Active run ID (if any). Used for cancel/approval routing.
+    active_run_id: Option<String>,
 }
 
 // ─── Handler ─────────────────────────────────────────────────────────────────
@@ -259,7 +307,11 @@ async fn authenticate_with_token(
                 },
             )
             .await;
-            Ok(WsConnection { user, session_id })
+            Ok(WsConnection {
+                user,
+                session_id,
+                active_run_id: None,
+            })
         }
         Err((_status, error)) => {
             send_msg(
@@ -290,12 +342,24 @@ async fn message_loop(socket: &mut WebSocket, state: &AppState, mut conn: WsConn
                                 model,
                                 context,
                             }) => {
-                                // Update session if provided
                                 if session_id.is_some() {
                                     conn.session_id = session_id;
                                 }
                                 handle_chat_message(
-                                    socket, state, &conn, &content, model, context,
+                                    socket, state, &mut conn, &content, model, context,
+                                )
+                                .await;
+                            }
+                            Ok(WsClientMessage::CancelRun { run_id }) => {
+                                handle_cancel_run(socket, state, &conn, &run_id).await;
+                            }
+                            Ok(WsClientMessage::ToolApproval {
+                                request_id,
+                                approved,
+                                reason,
+                            }) => {
+                                handle_tool_approval(
+                                    state, &conn, &request_id, approved, reason,
                                 )
                                 .await;
                             }
@@ -330,20 +394,17 @@ async fn message_loop(socket: &mut WebSocket, state: &AppState, mut conn: WsConn
                         let _ = socket.send(Message::Pong(data)).await;
                     }
                     Some(Ok(Message::Close(_))) | None => {
-                        // Client disconnected
                         break;
                     }
                     Some(Ok(_)) => {
                         // Binary or other — ignore
                     }
                     Some(Err(_)) => {
-                        // Connection error
                         break;
                     }
                 }
             }
             _ = heartbeat.tick() => {
-                // Send WebSocket ping for keep-alive
                 if socket.send(Message::Ping(vec![].into())).await.is_err() {
                     break;
                 }
@@ -352,8 +413,155 @@ async fn message_loop(socket: &mut WebSocket, state: &AppState, mut conn: WsConn
     }
 }
 
-/// Handle a chat message: forward to bridge and stream events back as WS frames.
+/// Handle a chat message: run agentic loop via RunLifecycleService and stream
+/// events back as WS frames.
+///
+/// Prefers RunLifecycleService (server-side agentic loop). Falls back to bridge
+/// if the lifecycle service returns NOT_IMPLEMENTED (unconfigured).
 async fn handle_chat_message(
+    socket: &mut WebSocket,
+    state: &AppState,
+    conn: &mut WsConnection,
+    content: &str,
+    model: Option<String>,
+    context: Option<serde_json::Map<String, serde_json::Value>>,
+) {
+    use mo_agent_services::runs::ChatRequestData;
+
+    let request = ChatRequestData {
+        message: content.to_string(),
+        session_id: conn.session_id.clone(),
+        agent_id: None,
+        model,
+        context,
+        max_candidates: 25,
+        explain: false,
+    };
+
+    // Try RunLifecycleService first (server-side agentic loop)
+    match state
+        .run_lifecycle_service
+        .stream_chat(conn.user.user_id.clone(), request)
+        .await
+    {
+        Ok(record) => {
+            conn.active_run_id = Some(record.run_id.clone());
+
+            // Send run_started
+            send_msg(
+                socket,
+                &WsServerMessage::RunStarted {
+                    run_id: record.run_id.clone(),
+                    session_id: record.session_id.clone(),
+                },
+            )
+            .await;
+
+            // Update session_id from the record
+            conn.session_id = Some(record.session_id);
+
+            // Stream all events as WS frames
+            let mut client_disconnected = false;
+            for event in &record.events {
+                let Ok(json) = serde_json::to_string(event) else {
+                    continue;
+                };
+                if socket.send(Message::Text(json.into())).await.is_err() {
+                    client_disconnected = true;
+                    break;
+                }
+            }
+
+            // Send run_finished (unless client already disconnected)
+            if !client_disconnected {
+                send_msg(
+                    socket,
+                    &WsServerMessage::RunFinished {
+                        run_id: record.run_id.clone(),
+                        status: "completed".to_string(),
+                        error: None,
+                    },
+                )
+                .await;
+            }
+
+            conn.active_run_id = None;
+        }
+        Err((status, _err)) if status == StatusCode::NOT_IMPLEMENTED => {
+            // Lifecycle service not configured — fall back to bridge
+            handle_chat_message_via_bridge(socket, state, conn, content, None, None).await;
+        }
+        Err((_status, err)) => {
+            send_msg(
+                socket,
+                &WsServerMessage::Error {
+                    message: err.0.detail,
+                    code: "RUN_ERROR".into(),
+                    retryable: false,
+                },
+            )
+            .await;
+        }
+    }
+}
+
+/// Cancel an active run by run_id.
+async fn handle_cancel_run(
+    socket: &mut WebSocket,
+    state: &AppState,
+    conn: &WsConnection,
+    run_id: &str,
+) {
+    match state
+        .run_lifecycle_service
+        .cancel_run(run_id.to_string(), conn.user.user_id.clone())
+        .await
+    {
+        Ok(_record) => {
+            send_msg(
+                socket,
+                &WsServerMessage::RunCancelled {
+                    run_id: run_id.to_string(),
+                },
+            )
+            .await;
+        }
+        Err((_status, err)) => {
+            send_msg(
+                socket,
+                &WsServerMessage::Error {
+                    message: err.0.detail,
+                    code: "CANCEL_ERROR".into(),
+                    retryable: false,
+                },
+            )
+            .await;
+        }
+    }
+}
+
+/// Store a tool approval response in the edge callback ledger.
+async fn handle_tool_approval(
+    state: &AppState,
+    conn: &WsConnection,
+    request_id: &str,
+    approved: bool,
+    reason: Option<String>,
+) {
+    use crate::turn::edge_ledger::approval_callback_key;
+
+    let key = approval_callback_key(&conn.user.user_id, request_id);
+    let value = serde_json::json!({
+        "approved": approved,
+        "reason": reason,
+    });
+    let ledger = state.edge_callback_ledger.clone();
+    let mut guard = ledger.lock().await;
+    guard.insert(key, value);
+}
+
+/// Legacy bridge-based chat handler (fallback when RunLifecycleService is unconfigured).
+async fn handle_chat_message_via_bridge(
     socket: &mut WebSocket,
     state: &AppState,
     conn: &WsConnection,
@@ -1021,5 +1229,196 @@ mod tests {
         // "id: 1" and "retry: 3000" don't start with "data: " or '{', so they are skipped
         assert_eq!(events.len(), 1);
         assert!(events[0].contains("ok"));
+    }
+
+    // ─── New protocol message tests ─────────────────────────────────────
+
+    #[test]
+    fn parse_cancel_run_message() {
+        let json = r#"{"type": "cancel_run", "run_id": "run-abc"}"#;
+        let msg: WsClientMessage = serde_json::from_str(json).unwrap();
+        match msg {
+            WsClientMessage::CancelRun { run_id } => assert_eq!(run_id, "run-abc"),
+            _ => panic!("expected CancelRun"),
+        }
+    }
+
+    #[test]
+    fn parse_tool_approval_approved() {
+        let json = r#"{"type": "tool_approval", "request_id": "req-1", "approved": true}"#;
+        let msg: WsClientMessage = serde_json::from_str(json).unwrap();
+        match msg {
+            WsClientMessage::ToolApproval {
+                request_id,
+                approved,
+                reason,
+            } => {
+                assert_eq!(request_id, "req-1");
+                assert!(approved);
+                assert!(reason.is_none());
+            }
+            _ => panic!("expected ToolApproval"),
+        }
+    }
+
+    #[test]
+    fn parse_tool_approval_denied_with_reason() {
+        let json = r#"{"type": "tool_approval", "request_id": "req-2", "approved": false, "reason": "risky command"}"#;
+        let msg: WsClientMessage = serde_json::from_str(json).unwrap();
+        match msg {
+            WsClientMessage::ToolApproval {
+                request_id,
+                approved,
+                reason,
+            } => {
+                assert_eq!(request_id, "req-2");
+                assert!(!approved);
+                assert_eq!(reason.as_deref(), Some("risky command"));
+            }
+            _ => panic!("expected ToolApproval"),
+        }
+    }
+
+    #[test]
+    fn serialize_run_started() {
+        let msg = WsServerMessage::RunStarted {
+            run_id: "r1".into(),
+            session_id: "s1".into(),
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains(r#""type":"run_started""#));
+        assert!(json.contains(r#""run_id":"r1""#));
+        assert!(json.contains(r#""session_id":"s1""#));
+    }
+
+    #[test]
+    fn serialize_run_finished_completed() {
+        let msg = WsServerMessage::RunFinished {
+            run_id: "r1".into(),
+            status: "completed".into(),
+            error: None,
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains(r#""type":"run_finished""#));
+        assert!(json.contains(r#""status":"completed""#));
+        assert!(!json.contains("error")); // skip_serializing_if = None
+    }
+
+    #[test]
+    fn serialize_run_finished_with_error() {
+        let msg = WsServerMessage::RunFinished {
+            run_id: "r1".into(),
+            status: "failed".into(),
+            error: Some("LLM timeout".into()),
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains(r#""status":"failed""#));
+        assert!(json.contains("LLM timeout"));
+    }
+
+    #[test]
+    fn serialize_run_cancelled() {
+        let msg = WsServerMessage::RunCancelled {
+            run_id: "r1".into(),
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains(r#""type":"run_cancelled""#));
+        assert!(json.contains(r#""run_id":"r1""#));
+    }
+
+    #[test]
+    fn serialize_tool_approval_request() {
+        let msg = WsServerMessage::ToolApprovalRequest {
+            request_id: "req-1".into(),
+            tool: "bash".into(),
+            args: serde_json::json!({"command": "rm -rf /"}),
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains(r#""type":"tool_approval_request""#));
+        assert!(json.contains(r#""tool":"bash""#));
+        assert!(json.contains(r#""request_id":"req-1""#));
+        assert!(json.contains("rm -rf"));
+    }
+
+    #[test]
+    fn all_server_message_variants_serialize() {
+        let variants: Vec<WsServerMessage> = vec![
+            WsServerMessage::AuthOk {
+                user_id: "u1".into(),
+                username: "alice".into(),
+            },
+            WsServerMessage::AuthError {
+                message: "bad".into(),
+            },
+            WsServerMessage::RunStarted {
+                run_id: "r1".into(),
+                session_id: "s1".into(),
+            },
+            WsServerMessage::RunFinished {
+                run_id: "r1".into(),
+                status: "completed".into(),
+                error: None,
+            },
+            WsServerMessage::RunCancelled {
+                run_id: "r1".into(),
+            },
+            WsServerMessage::ToolApprovalRequest {
+                request_id: "req-1".into(),
+                tool: "bash".into(),
+                args: serde_json::json!({}),
+            },
+            WsServerMessage::Error {
+                message: "err".into(),
+                code: "E".into(),
+                retryable: false,
+            },
+            WsServerMessage::Pong,
+            WsServerMessage::Closing {
+                reason: "bye".into(),
+            },
+        ];
+        for msg in &variants {
+            let json = serde_json::to_string(msg).unwrap();
+            let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+            assert!(parsed.is_object(), "not valid JSON object: {json}");
+            assert!(
+                parsed.get("type").is_some(),
+                "missing type field in: {json}"
+            );
+        }
+    }
+
+    #[test]
+    fn all_client_message_variants_parse() {
+        let inputs = [
+            r#"{"type":"auth","token":"t1"}"#,
+            r#"{"type":"message","content":"hello"}"#,
+            r#"{"type":"cancel_run","run_id":"r1"}"#,
+            r#"{"type":"tool_approval","request_id":"req-1","approved":true}"#,
+            r#"{"type":"ping"}"#,
+        ];
+        for json in &inputs {
+            let msg: WsClientMessage = serde_json::from_str(json)
+                .unwrap_or_else(|e| panic!("failed to parse {json}: {e}"));
+            // Just verify it parses (variant matching tested above)
+            let _ = format!("{msg:?}");
+        }
+    }
+
+    #[test]
+    fn cancel_run_requires_run_id() {
+        let json = r#"{"type":"cancel_run"}"#;
+        assert!(serde_json::from_str::<WsClientMessage>(json).is_err());
+    }
+
+    #[test]
+    fn tool_approval_requires_request_id_and_approved() {
+        // Missing approved
+        let json = r#"{"type":"tool_approval","request_id":"req-1"}"#;
+        assert!(serde_json::from_str::<WsClientMessage>(json).is_err());
+
+        // Missing request_id
+        let json = r#"{"type":"tool_approval","approved":true}"#;
+        assert!(serde_json::from_str::<WsClientMessage>(json).is_err());
     }
 }

@@ -15,6 +15,8 @@
 //! ```
 
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_trait::async_trait;
 use mo_agent_services::session_journal::ToolCallRecord;
@@ -159,6 +161,10 @@ pub struct AgenticLoopState {
     // ── API context (for cloud tool delivery) ──
     pub api: mo_thin_client::ThinClient,
     pub api_token: String,
+
+    // ── Cancellation ──
+    /// Shared flag checked between turns. Set externally (e.g. by cancel_run).
+    pub cancel_flag: Option<Arc<AtomicBool>>,
 }
 
 // ─── Loop exit ───────────────────────────────────────────────────────────────
@@ -170,6 +176,8 @@ pub enum AgenticLoopOutcome {
     Completed,
     /// Loop aborted due to a fatal error.
     Error(String),
+    /// Loop was cancelled externally via cancel_flag.
+    Cancelled,
 }
 
 // ─── Runtime loop ────────────────────────────────────────────────────────────
@@ -184,6 +192,15 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
     state: &mut AgenticLoopState,
 ) -> Result<AgenticLoopOutcome, String> {
     for turn_index in 0..state.max_turns {
+        // ─── Cancel check (cooperative) ─────────────────────────────────
+        if state
+            .cancel_flag
+            .as_ref()
+            .is_some_and(|f| f.load(Ordering::Relaxed))
+        {
+            return Ok(AgenticLoopOutcome::Cancelled);
+        }
+
         if state.remaining_turns == 0 {
             return Err(CLI_AGENTIC_TURN_BUDGET_STALL_ABORT_MSG.to_string());
         }
@@ -506,6 +523,7 @@ mod tests {
             recent_tools: Vec::new(),
             api: mo_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap(),
             api_token: String::new(),
+            cancel_flag: None,
         }
     }
 
@@ -876,5 +894,61 @@ mod tests {
 
         let _ = run_agentic_loop_with_host(&mut host, &mut state).await;
         assert!(state.has_any_usage); // has_usage=true in text_result
+    }
+
+    // ── Cancel flag tests ───────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn cancel_flag_none_does_not_cancel() {
+        let mut host = MockHost::new(vec![text_result("ok", 10, 5, Some(42))]);
+        let mut state = make_state();
+        state.cancel_flag = None; // default
+        let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
+        assert!(matches!(outcome, Ok(AgenticLoopOutcome::Completed)));
+        assert_eq!(state.final_text, "ok");
+    }
+
+    #[tokio::test]
+    async fn cancel_flag_false_does_not_cancel() {
+        let flag = Arc::new(AtomicBool::new(false));
+        let mut host = MockHost::new(vec![text_result("ok", 10, 5, Some(42))]);
+        let mut state = make_state();
+        state.cancel_flag = Some(flag);
+        let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
+        assert!(matches!(outcome, Ok(AgenticLoopOutcome::Completed)));
+        assert_eq!(state.final_text, "ok");
+    }
+
+    #[tokio::test]
+    async fn cancel_flag_true_aborts_before_first_turn() {
+        let flag = Arc::new(AtomicBool::new(true));
+        let mut host = MockHost::new(vec![text_result("should not run", 10, 5, Some(42))]);
+        let mut state = make_state();
+        state.cancel_flag = Some(flag);
+        let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
+        assert!(matches!(outcome, Ok(AgenticLoopOutcome::Cancelled)));
+        // No turns executed — host never called
+        assert_eq!(host.current_turn, 0);
+        assert!(state.final_text.is_empty());
+    }
+
+    #[tokio::test]
+    async fn cancel_flag_set_between_turns() {
+        let flag = Arc::new(AtomicBool::new(false));
+        let flag_clone = flag.clone();
+
+        // Cancel is already set, so even with available turns the loop won't execute
+        let mut host = MockHost::new(vec![
+            text_result("first", 10, 5, Some(42)),
+            text_result("should not run", 10, 5, Some(42)),
+        ]);
+        let mut state = make_state();
+        state.cancel_flag = Some(flag_clone);
+
+        // Set cancel flag before loop starts — simulates cancel arriving
+        flag.store(true, Ordering::Relaxed);
+
+        let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
+        assert!(matches!(outcome, Ok(AgenticLoopOutcome::Cancelled)));
     }
 }

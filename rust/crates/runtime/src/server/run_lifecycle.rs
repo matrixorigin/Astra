@@ -187,6 +187,7 @@ impl AgenticRunLifecycleService {
             recent_tools: Vec::new(),
             api: mo_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap(),
             api_token: String::new(),
+            cancel_flag: None,
         }
     }
 
