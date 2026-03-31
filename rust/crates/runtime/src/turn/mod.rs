@@ -5,6 +5,7 @@ pub mod bridge_inprocess;
 pub mod edge_prompt_context;
 pub mod edge_ledger;
 pub mod cache;
+pub mod chat_turn_heuristics;
 pub mod cloud;
 pub mod cloud_approval_policy;
 pub mod cloud_tool_delivery;

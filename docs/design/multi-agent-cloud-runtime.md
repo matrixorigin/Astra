@@ -1741,12 +1741,13 @@ mo-agent Orchestrator
 | Canonical tool arg keys in hints layer | ✅ Done (slice 6) | Small | **`tool_argument_hints`**: only `path` and `command` (no `cmd`, `file_path`, `target_file`); cloud approval path + CLI prompts + journal previews aligned |
 | Extract SSE `data:` JSON line parser | ✅ Done (slice 7) | Small | **`runtime/src/turn/sse_data_lines.rs`** — `drain_sse_data_lines`, `finish_sse_data_buffer`, `parse_sse_data_json_events`; `bridge_inprocess` stream + lifecycle contract tests |
 | Extract SSE blank-line event blocks | ✅ Done (slice 8) | Small | **`runtime/src/turn/sse_blocks.rs`** — `drain_complete_sse_event_blocks` (`\n\n` / `\r\n\r\n`); CLI `consume_turn_sse` |
+| Extract chat-turn factual / session heuristics | ✅ Done (slice 9) | Small | **`runtime/src/turn/chat_turn_heuristics.rs`** — `looks_like_factual_query`, `looks_like_live_query_with_context`, `should_force_factual_tool_retry`, `extract_repos_from_memory`, `is_session_not_found_error`; CLI `chat_stream` + `repl_turn` / `command_router` via `main` imports |
 | Implement tool execution callback protocol (cloud → edge) | ✅ Core path | Medium | §5.5 `/tools/result`, `tool_request` SSE; `chat_stream` **does not** re-execute tools for that path. |
 | Add `edge_executor_id` to chat turn protocol | ✅ | Small | Thin client + §5.5.2 light edge helpers. |
-| Move `SyncOrchestrator` construction from `ReplState` to `AppState` | ❌ Open | Small | Still wired in CLI `main.rs` for REPL session |
-| Move `IngestionSender` from `ReplState` to server pipeline | ❌ Open | Small | |
-| Remove `matrixone_pool` from `ReplState` (use server `shared_pool`) | ❌ Open | Small | `app_state.rs` already has `shared_pool` |
-| Refactor `chat_stream.rs`: cognitive loop → `runtime`, rendering stays CLI | 🟡 In progress | Large | **Slices 1–8** landed (SSE line + blank-line framing shared where applicable). Remaining: multi-turn loop, stall/TurnGuard, tool execution vs `bridge_inprocess` convergence |
+| Move `SyncOrchestrator` construction from `ReplState` to `AppState` | ✅ Done | — | **`MatrixCloudRuntime`** bundles `SharedPool` + `IngestionSender` + `SyncOrchestrator`; `ReplState` / `AppState` hold `Option<Arc<MatrixCloudRuntime>>` only (no separate orchestrator field) |
+| Move `IngestionSender` from `ReplState` to server pipeline | ✅ Done | — | Same bundle as row above; journal flush via `enqueue_journal_events` |
+| Remove `matrixone_pool` from `ReplState` (use server `shared_pool`) | ✅ Done | — | Superseded by `MatrixCloudRuntime::shared_pool()`; no `matrixone_pool` field on `ReplState` |
+| Refactor `chat_stream.rs`: cognitive loop → `runtime`, rendering stays CLI | 🟡 In progress | Large | **Slices 1–9**: factual-query heuristics → **`turn/chat_turn_heuristics.rs`**. Remaining: main multi-turn loop, stall/TurnGuard, headless tool assembly vs `bridge_inprocess` |
 
 **Success criteria** (unchanged): `mo-agent` CLI can be deleted and replaced with a ~500-line thin client; **not yet met** — `chat_stream` + `ReplState` infra fields remain.
 
@@ -1754,7 +1755,7 @@ mo-agent Orchestrator
 
 ### Phase 1: Complete Single-Agent Foundation
 
-**Status**: ✅ **Sync-domain adapters complete** (2026); Phase 0 extraction (§Phase 0 table) still open.
+**Status**: ✅ **Sync-domain adapters complete** (2026); Phase 0 mechanical extraction is **mostly complete** (see Phase 0 table — large `chat_stream` loop remains in CLI).
 
 **Goal**: Operational `DomainAdapter` implementations for all sync domains. LearningAdapter lives in **`runtime::sync_adapters`**, sharing `services` sync traits.
 
@@ -1861,6 +1862,7 @@ mo-agent Orchestrator
 | Tool argument hints | `runtime/src/turn/tool_argument_hints.rs` | Normalize LLM `arguments`; **`path` + `command` only** for hints (approval, CLI, previews) | runtime ✅ |
 | SSE data JSON lines | `runtime/src/turn/sse_data_lines.rs` | Incremental `data:` line → JSON; `[DONE]`; EOF flush | runtime ✅ |
 | SSE event blocks | `runtime/src/turn/sse_blocks.rs` | Blank-line delimited event text (server / thin-client framing) | runtime ✅ |
+| Chat turn heuristics | `runtime/src/turn/chat_turn_heuristics.rs` | Factual-query guard, session-not-found, repo extraction from memory text | runtime ✅ |
 | Bridge (HTTP) | `runtime/src/turn/bridge/mod.rs` | HttpChatTurnBridge, forwards to external service | runtime ✅ |
 | Chat stream | `mo-agent/src/mo_agent/chat_stream.rs` | Multi-turn loop, headless tool assembly (§5.5) | ⚠️ Core loop should move to runtime |
 | Plan decompose | `runtime/src/plan_decompose.rs` | Long-horizon planning, subtask generation | runtime ✅ |

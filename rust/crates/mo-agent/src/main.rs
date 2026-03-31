@@ -75,8 +75,9 @@ mod slash_state;
 mod stream_render;
 
 use auth_flow::{clear_profile_last_session, do_login, do_register};
-use chat_stream::{
-    ChatTurnParams, is_session_not_found_error, looks_like_live_query_with_context, stream_chat_sse,
+use chat_stream::{ChatTurnParams, stream_chat_sse};
+use mo_agent_runtime::turn::chat_turn_heuristics::{
+    is_session_not_found_error, looks_like_live_query_with_context,
 };
 use cli_utils::{
     Profile, capitalize, compact_or_raw, get_profile_and_token, interactive_select,
