@@ -19,6 +19,7 @@ mod report;
 pub mod scoring;
 mod selection_edge_hints;
 pub mod state;
+pub mod tool_pool;
 
 pub use chain::{ChainContext, ChainStep, ToolChain};
 pub use meta::{IntentType, Scope, TOOL_CATALOG, ToolMeta};

@@ -46,6 +46,7 @@ criterion = { version = "0.5", features = ["html_reports"] }
 futures-util.workspace = true
 tempfile = "3"
 tower.workspace = true
+proptest = "1"
 
 [[bench]]
 name = "hot_paths"
