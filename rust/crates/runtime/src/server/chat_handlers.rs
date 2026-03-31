@@ -224,6 +224,8 @@ pub(super) async fn dispatch_chat_turn_bridge(
         bridge_headers.insert(HeaderName::from_static("x-mo-bridge-test-secret"), v);
     }
 
+    let client_disconnect = std::sync::Arc::new(tokio_util::sync::CancellationToken::new());
+
     match state
         .chat_turn_bridge
         .forward(
@@ -237,6 +239,7 @@ pub(super) async fn dispatch_chat_turn_bridge(
             state.turn_observer_worker.clone(),
             state.turn_auxiliary_event_writer.clone(),
             state.turn_session_activity_writer.clone(),
+            Some(client_disconnect),
         )
         .await
     {

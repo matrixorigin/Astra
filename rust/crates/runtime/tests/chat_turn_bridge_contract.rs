@@ -178,6 +178,7 @@ impl ChatTurnBridge for StubChatTurnBridge {
         _turn_observer_worker: Arc<dyn TurnObserverWorker>,
         _turn_auxiliary_event_writer: Arc<dyn TurnAuxiliaryEventWriter>,
         _turn_session_activity_writer: Arc<dyn TurnSessionActivityWriter>,
+        _client_cancel: Option<Arc<tokio_util::sync::CancellationToken>>,
     ) -> Result<Response, (StatusCode, String)> {
         *self.capture.bridge_secret.lock().await = headers
             .get("x-mo-bridge-secret")
@@ -682,6 +683,7 @@ impl ChatTurnBridge for FailingChatTurnBridge {
         _turn_observer_worker: Arc<dyn TurnObserverWorker>,
         _turn_auxiliary_event_writer: Arc<dyn TurnAuxiliaryEventWriter>,
         _turn_session_activity_writer: Arc<dyn TurnSessionActivityWriter>,
+        _client_cancel: Option<Arc<tokio_util::sync::CancellationToken>>,
     ) -> Result<Response, (StatusCode, String)> {
         Err((StatusCode::BAD_GATEWAY, "connection refused".to_string()))
     }

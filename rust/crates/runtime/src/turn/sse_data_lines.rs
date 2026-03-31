@@ -110,6 +110,33 @@ pub fn parse_sse_data_json_events(body: &str) -> Vec<Value> {
     events
 }
 
+/// Fails if any `data: ` line carries a non-empty payload that is not `[DONE]` and is not valid JSON.
+/// Use this when silent `Skip` (see [`json_events_from_sse_event_block`]) is unacceptable.
+pub fn validate_sse_event_block_json(block: &str) -> Result<(), String> {
+    for line in block.lines() {
+        let line = line.trim_end_matches('\r').trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Some(rest) = line.strip_prefix("data: ") else {
+            continue;
+        };
+        let rest = rest.trim();
+        if rest.is_empty() || rest == "[DONE]" {
+            continue;
+        }
+        serde_json::from_str::<Value>(rest)
+            .map_err(|e| format!("invalid JSON in SSE data line: {e}"))?;
+    }
+    Ok(())
+}
+
+/// [`validate_sse_event_block_json`] then extract JSON events (same as [`json_events_from_sse_event_block`]).
+pub fn validated_json_events_from_sse_block(block: &str) -> Result<Vec<Value>, String> {
+    validate_sse_event_block_json(block)?;
+    Ok(json_events_from_sse_event_block(block).events)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -194,5 +221,16 @@ mod tests {
         let body = "data: {\"x\":1}\ndata: {\"y\":2}";
         let v = parse_sse_data_json_events(body);
         assert_eq!(v, vec![json!({"x": 1}), json!({"y": 2})]);
+    }
+
+    #[test]
+    fn validate_sse_block_rejects_bad_json_data_line() {
+        let r = validate_sse_event_block_json("data: not-json\n");
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn validate_sse_block_accepts_good_line() {
+        assert!(validate_sse_event_block_json("data: {\"t\":1}\n").is_ok());
     }
 }

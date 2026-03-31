@@ -411,7 +411,11 @@ mod tests {
             }
             let deny = DenySet(set);
 
-            let cfg = ToolSearchConfig { max_candidates: 20, budget_tokens: 2000, max_prior_discovered: 8 };
+            let cfg = ToolSearchConfig {
+                max_candidates: 20,
+                budget_tokens: 2000,
+                max_prior_discovered: 8,
+            };
             let terms = ["matrixorigin".to_string(), "pr".to_string(), "latest".to_string()];
             let a = select_two_phase(&pool, &deny, &terms, cfg);
             let b = select_two_phase(&pool, &deny, &terms, cfg);

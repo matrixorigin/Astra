@@ -147,14 +147,16 @@ fn apply_one_event(
             }
         }
         "usage" => {
-            accum.prompt_tokens = event
-                .get("prompt_tokens")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0);
-            accum.completion_tokens = event
-                .get("completion_tokens")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0);
+            let prompt = event.get("prompt_tokens").and_then(|v| v.as_u64());
+            let completion = event.get("completion_tokens").and_then(|v| v.as_u64());
+            if prompt.is_none() && completion.is_none() {
+                if accum.error_message.is_none() {
+                    accum.error_message = Some("Error: invalid usage payload".to_string());
+                }
+                return;
+            }
+            accum.prompt_tokens = prompt.unwrap_or(0);
+            accum.completion_tokens = completion.unwrap_or(0);
             accum.has_usage = true;
         }
         "error" => {
@@ -192,6 +194,11 @@ pub fn dispatch_chat_turn_sse_event_block(
             continue;
         }
         let Ok(event) = serde_json::from_str::<Value>(data) else {
+            // Synthetic error: protocol parse error should be visible, not silently ignored.
+            effects.push(SseRenderEffect::StopThinkingSpinner);
+            if accum.error_message.is_none() {
+                accum.error_message = Some("Error: invalid JSON in SSE data".to_string());
+            }
             continue;
         };
         apply_one_event(&event, accum, edge_pending, &mut effects);
@@ -405,7 +412,10 @@ mod tests {
     fn invalid_json_ignored() {
         let mut a = ChatTurnSseAccum::default();
         dispatch_chat_turn_sse_event_block("data: {invalid json}\n\n", &mut a, &mut vec![]);
-        assert!(a.full_text.is_empty());
+        assert_eq!(
+            a.error_message.as_deref(),
+            Some("Error: invalid JSON in SSE data")
+        );
     }
 
     #[test]
@@ -484,6 +494,14 @@ mod tests {
         let mut a = ChatTurnSseAccum::default();
         dispatch_chat_turn_sse_event_block(&blocks[0], &mut a, &mut vec![]);
         assert_eq!(a.session_id.as_deref(), Some("split-id"));
+    }
+
+    #[test]
+    fn invalid_usage_payload_sets_error() {
+        let mut a = ChatTurnSseAccum::default();
+        dispatch_chat_turn_sse_event_block("data: {\"type\":\"usage\"}\n\n", &mut a, &mut vec![]);
+        assert_eq!(a.error_message.as_deref(), Some("Error: invalid usage payload"));
+        assert!(!a.has_usage);
     }
 
     #[test]

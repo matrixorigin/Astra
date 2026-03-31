@@ -1,5 +1,14 @@
 /// In-process ChatTurnBridge — calls LLM directly without an external bridge service.
 ///
+/// # Claude Code–style behaviors mapped onto this stack
+///
+/// | Claude Code (desktop) | Here |
+/// |------------------------|------|
+/// | Long-lived stream “stall” / no chunks | [`super::llm_client::stream_idle_timeout`] on SSE `next()` (90s default, `MO_STREAM_IDLE_TIMEOUT_MS`) |
+/// | Recover via one-shot completion | [`super::llm_client::call_llm_nonstream_fallback`] after idle in both `call_llm_and_collect` and [`call_llm_stream`] below |
+/// | User cancel clears in-flight work | HTTP `/chat/turn` passes `CancellationToken`; dropping the SSE body (client disconnect) cancels in-flight LLM byte/SSE consumption in-process |
+/// | Tool permission queue + single resolve | CLI: `mo-agent-cli` `permission_manager`; cloud: edge approval ledger / `POST /tools/result`. Claude’s `PermissionContext` “resolve once” matches ledger single-shot semantics |
+///
 /// # Legacy Status
 ///
 /// This module implements the **old-style cloud tool loop** (its own `for round_ix..`
@@ -29,6 +38,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::Response;
 use futures_util::StreamExt;
 use serde_json::{Map, Value, json};
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::{
@@ -46,7 +56,8 @@ use crate::{
     turn::persist::{build_tool_call_event_payload, build_tool_result_event_payload},
     turn::sse_blocks::SseBlankLineUtf8Buf,
     turn::sse_data_lines::{
-        drain_sse_data_lines, finish_sse_data_buffer, json_events_from_sse_event_block,
+        drain_sse_data_lines, finish_sse_data_buffer, validate_sse_event_block_json,
+        validated_json_events_from_sse_block,
     },
     turn::stream_events::build_approval_required_event,
     turn::tool_schema_prune::prune_tool_schemas,
@@ -85,43 +96,119 @@ fn render_sse_map(event: &Map<String, Value>) -> Bytes {
     render_sse(&Value::Object(event.clone()))
 }
 
-/// Parse OpenAI-style SSE from a streaming response body.
-///
-/// Complete events are split on blank lines (`sse_blocks::SseBlankLineUtf8Buf`, same framing as
-/// `/chat/turn` and `chat_turn_sse_dispatch::ChatTurnSseFramer`). Each block is scanned
-/// for `data:` JSON lines. After the byte stream ends, any remainder is flushed with line-oriented
-/// `sse_data_lines` draining so single-`\n` or partial tails still work.
-fn parse_sse_chunks(
-    stream: impl futures_util::Stream<Item = Result<Bytes, reqwest::Error>> + Unpin + Send + 'static,
-) -> impl futures_util::Stream<Item = Value> + Send + 'static {
-    stream! {
-        let mut sse_in = SseBlankLineUtf8Buf::new();
-        tokio::pin!(stream);
-        while let Some(chunk) = stream.next().await {
-            let Ok(bytes) = chunk else { break };
-            for block in sse_in.push_lossy_bytes(&bytes) {
-                let d = json_events_from_sse_event_block(&block);
-                for v in d.events {
-                    yield v;
-                }
-                if d.stream_finished {
-                    return;
-                }
+/// Maps one parsed JSON event from the in-process LLM SSE stream to bytes forwarded to the HTTP client.
+fn apply_forward_llm_sse_event(
+    event: &Value,
+    saw_inprocess_summary: &mut bool,
+    loop_text: &mut String,
+    loop_reasoning: &mut String,
+    loop_tool_calls: &mut Vec<Value>,
+    usage: &mut Map<String, Value>,
+    resolved_model: &mut String,
+) -> Result<Vec<Bytes>, String> {
+    let Some(t) = event.get("type").and_then(Value::as_str) else {
+        return Err("SSE event missing type field".into());
+    };
+    match t {
+        "_inprocess_summary" => {
+            *saw_inprocess_summary = true;
+            *loop_text = event
+                .get("full_text")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            *loop_reasoning = event
+                .get("reasoning")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            *loop_tool_calls = event
+                .get("tool_calls")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            if let Some(u) = event.get("usage").and_then(Value::as_object) {
+                *usage = u.clone();
             }
+            if let Some(m) = event.get("model_used").and_then(Value::as_str) {
+                *resolved_model = m.to_string();
+            }
+            Ok(vec![])
         }
-        let mut buf = sse_in.into_inner();
-        let tail = drain_sse_data_lines(&mut buf, "");
-        for v in tail.events {
-            yield v;
+        "text_delta" | "reasoning_delta" | "tool_call_start" | "usage" | "error" | "error_message" => {
+            Ok(vec![render_sse(event)])
         }
-        if tail.stream_finished {
-            return;
-        }
-        let fin = finish_sse_data_buffer(&mut buf);
-        for v in fin.events {
-            yield v;
-        }
+        "warning" => Ok(vec![render_sse(event)]),
+        _ => Ok(vec![]),
     }
+}
+
+fn extend_forward_from_validated_sse_block(
+    block: &str,
+    saw_inprocess_summary: &mut bool,
+    loop_text: &mut String,
+    loop_reasoning: &mut String,
+    loop_tool_calls: &mut Vec<Value>,
+    usage: &mut Map<String, Value>,
+    resolved_model: &mut String,
+) -> Result<Vec<Bytes>, String> {
+    let events = validated_json_events_from_sse_block(block)?;
+    let mut out = Vec::new();
+    for ev in events {
+        out.extend(apply_forward_llm_sse_event(
+            &ev,
+            saw_inprocess_summary,
+            loop_text,
+            loop_reasoning,
+            loop_tool_calls,
+            usage,
+            resolved_model,
+        )?);
+    }
+    Ok(out)
+}
+
+fn flush_tail_buf_into_llm_forward(
+    buf: &mut String,
+    saw_inprocess_summary: &mut bool,
+    loop_text: &mut String,
+    loop_reasoning: &mut String,
+    loop_tool_calls: &mut Vec<Value>,
+    usage: &mut Map<String, Value>,
+    resolved_model: &mut String,
+) -> Result<Vec<Bytes>, String> {
+    if !buf.trim().is_empty() {
+        validate_sse_event_block_json(buf)?;
+    }
+    let mut out = Vec::new();
+    let d = drain_sse_data_lines(buf, "");
+    for ev in d.events {
+        out.extend(apply_forward_llm_sse_event(
+            &ev,
+            saw_inprocess_summary,
+            loop_text,
+            loop_reasoning,
+            loop_tool_calls,
+            usage,
+            resolved_model,
+        )?);
+    }
+    if d.stream_finished {
+        return Ok(out);
+    }
+    let fin = finish_sse_data_buffer(buf);
+    for ev in fin.events {
+        out.extend(apply_forward_llm_sse_event(
+            &ev,
+            saw_inprocess_summary,
+            loop_text,
+            loop_reasoning,
+            loop_tool_calls,
+            usage,
+            resolved_model,
+        )?);
+    }
+    Ok(out)
 }
 
 /// Maximum retries for transient LLM errors (429, 5xx, network).
@@ -198,6 +285,10 @@ fn cached_system_prompt(
 /// Emits: text_delta, reasoning_delta, tool_call_start, usage SSE events,
 /// then a final `_inprocess_summary` event with full_text/tool_calls/usage/model_used.
 ///
+/// **Stream resilience (Claude Code–style, same as [`super::llm_client::call_llm_and_collect`])**:
+/// per-chunk idle watchdog on parsed SSE; if the provider stops sending, partial state is
+/// discarded and a **single non-stream** `/chat/completions` request attempts recovery.
+///
 /// Retries up to LLM_MAX_RETRIES times on transient errors (429/5xx/network)
 /// with exponential backoff.
 ///
@@ -214,6 +305,7 @@ async fn call_llm_stream(
     provider: &str,
     max_output_tokens: Option<usize>,
     has_fallback: bool,
+    client_cancel: Option<Arc<CancellationToken>>,
 ) -> Result<impl futures_util::Stream<Item = Bytes> + Send + 'static, String> {
     let cooldown = rate_limit_cooldown();
 
@@ -283,102 +375,213 @@ async fn call_llm_stream(
             let byte_stream = response.bytes_stream();
             let model_name = model_name.to_string();
 
+            let client_for_fallback = client.clone();
+            let messages_for_fallback: Vec<Value> = messages.to_vec();
+            let tools_for_fallback: Vec<Value> = tools.to_vec();
+            let api_key_for_fallback = api_key.to_string();
+            let base_url_for_fallback = base_url.to_string();
+            let provider_for_fallback = provider.to_string();
+            let max_out_for_fallback = max_output_tokens;
+            let idle_dur = crate::turn::llm_client::stream_idle_timeout();
+
             let out = stream! {
+                let cc = client_cancel.clone();
                 let mut full_text = String::new();
                 let mut reasoning = String::new();
                 let mut tool_calls_map: std::collections::HashMap<usize, Map<String, Value>> =
                     std::collections::HashMap::new();
                 let mut usage = Map::new();
 
-                let sse = parse_sse_chunks(byte_stream);
+                let sse = crate::turn::llm_client::parse_openai_sse_json_stream(byte_stream);
                 tokio::pin!(sse);
 
-                while let Some(chunk) = sse.next().await {
-                    // Some providers attach usage to a chunk that also contains choices,
-                    // so parse usage first on every chunk.
-                    if let Some(u) = chunk.get("usage").and_then(Value::as_object) {
-                        let prompt = u.get("prompt_tokens").and_then(Value::as_i64);
-                        let completion = u.get("completion_tokens").and_then(Value::as_i64);
-                        if prompt.is_some() || completion.is_some() {
-                            let mut usage_map = Map::new();
-                            if let Some(value) = prompt {
-                                usage_map.insert("prompt".to_string(), Value::from(value));
-                            }
-                            if let Some(value) = completion {
-                                usage_map.insert("completion".to_string(), Value::from(value));
-                            }
-                            if let (Some(p), Some(c)) = (prompt, completion) {
-                                usage_map.insert("total".to_string(), Value::from(p + c));
-                            }
-                            usage = usage_map;
-                            yield render_sse(&json!({
-                                "type": "usage",
-                                "prompt_tokens": prompt,
-                                "completion_tokens": completion,
-                                "cache_read_tokens": u.get("prompt_tokens_details")
-                                    .and_then(|d| d.get("cached_tokens"))
-                                    .and_then(Value::as_i64),
-                            }));
+                loop {
+                    tokio::select! {
+                        biased;
+                        _ = crate::turn::llm_client::wait_until_cancelled_or_pending(cc.as_deref()) => {
+                            mo_agent_core::agent_warn!(
+                                "llm",
+                                "in-process LLM SSE cancelled (client disconnect)"
+                            );
+                            tool_calls_map.clear();
+                            full_text.clear();
+                            reasoning.clear();
+                            break;
                         }
-                    }
-
-                    let Some(choices) = chunk.get("choices").and_then(Value::as_array) else {
-                        continue;
-                    };
-
-                    let Some(delta) = choices.first()
-                        .and_then(|c| c.get("delta"))
-                        .and_then(Value::as_object)
-                    else { continue };
-
-                    // Text content
-                    if let Some(content) = delta.get("content").and_then(Value::as_str)
-                        && !content.is_empty() {
-                            full_text.push_str(content);
-                            yield render_sse(&json!({"type": "text_delta", "content": content}));
-                        }
-
-                    // Reasoning (DeepSeek / o1 style)
-                    if let Some(r) = delta.get("reasoning_content").and_then(Value::as_str)
-                        && !r.is_empty() {
-                            reasoning.push_str(r);
-                            yield render_sse(&json!({"type": "reasoning_delta", "content": r}));
-                        }
-
-                    // Tool calls (streaming accumulation)
-                    if let Some(tcs) = delta.get("tool_calls").and_then(Value::as_array) {
-                        for tc in tcs {
-                            let idx = tc.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
-                            let entry = tool_calls_map.entry(idx).or_insert_with(|| {
-                                Map::from_iter([
-                                    ("id".to_string(), Value::String(String::new())),
-                                    ("type".to_string(), Value::String("function".to_string())),
-                                    ("function".to_string(), json!({"name": "", "arguments": ""})),
-                                ])
-                            });
-                            if let Some(id) = tc.get("id").and_then(Value::as_str)
-                                && !id.is_empty() {
-                                    entry.insert("id".to_string(), Value::String(id.to_string()));
-                                }
-                            if let Some(func) = tc.get("function").and_then(Value::as_object) {
-                                let f = entry
-                                    .entry("function".to_string())
-                                    .or_insert_with(|| json!({}));
-                                let Some(f) = f.as_object_mut() else { continue; };
-                                if let Some(name) = func.get("name").and_then(Value::as_str)
-                                    && !name.is_empty() {
-                                        let is_new = f.get("name").and_then(Value::as_str).unwrap_or("").is_empty();
-                                        f.insert("name".to_string(), Value::String(name.to_string()));
-                                        if is_new {
-                                            yield render_sse(&json!({"type": "tool_call_start", "name": name}));
+                        tick = tokio::time::timeout(idle_dur, sse.next()) => {
+                            let next = tick;
+                            let chunk = match next {
+                                Ok(c) => c,
+                                Err(_) => {
+                                    mo_agent_core::agent_warn!(
+                                        "llm",
+                                        "in-process stream idle after {}ms — attempting non-stream fallback",
+                                        idle_dur.as_millis()
+                                    );
+                                    tool_calls_map.clear();
+                                    full_text.clear();
+                                    reasoning.clear();
+                                    match crate::turn::llm_client::call_llm_nonstream_fallback(
+                                        &client_for_fallback,
+                                        &messages_for_fallback,
+                                        &tools_for_fallback,
+                                        &model_name,
+                                        &api_key_for_fallback,
+                                        &base_url_for_fallback,
+                                        &provider_for_fallback,
+                                        max_out_for_fallback,
+                                    )
+                                    .await
+                                    {
+                                        Ok(result) => {
+                                            full_text = result.full_text.clone();
+                                            reasoning = result.reasoning.clone();
+                                            usage = result.usage.clone();
+                                            tool_calls_map.clear();
+                                            for (i, tc) in result.tool_calls.iter().enumerate() {
+                                                if let Value::Object(m) = tc {
+                                                    tool_calls_map.insert(i, m.clone());
+                                                }
+                                            }
+                                            if !result.full_text.is_empty() {
+                                                yield render_sse(&json!({"type":"text_delta","content": result.full_text}));
+                                            }
+                                            if !result.reasoning.is_empty() {
+                                                yield render_sse(&json!({"type":"reasoning_delta","content": result.reasoning}));
+                                            }
+                                            for tc in &result.tool_calls {
+                                                if let Some(name) = tc
+                                                    .get("function")
+                                                    .and_then(|f| f.get("name"))
+                                                    .and_then(Value::as_str)
+                                                    && !name.is_empty()
+                                                {
+                                                    yield render_sse(&json!({"type":"tool_call_start","name": name}));
+                                                }
+                                            }
+                                            let prompt = result.usage.get("prompt").and_then(Value::as_i64);
+                                            let completion = result.usage.get("completion").and_then(Value::as_i64);
+                                            if prompt.is_some() || completion.is_some() {
+                                                yield render_sse(&json!({
+                                                    "type": "usage",
+                                                    "prompt_tokens": prompt,
+                                                    "completion_tokens": completion,
+                                                    "cache_read_tokens": Value::Null,
+                                                }));
+                                            }
+                                        }
+                                        Err(e) => {
+                                            yield render_sse(&json!({"type":"error","message": format!("stream stalled; non-stream recovery failed: {e}")}));
+                                            tool_calls_map.clear();
+                                            full_text.clear();
+                                            reasoning.clear();
                                         }
                                     }
-                                if let Some(args) = func.get("arguments").and_then(Value::as_str) {
-                                    let existing = f
-                                        .entry("arguments".to_string())
-                                        .or_insert_with(|| Value::String(String::new()));
-                                    if let Value::String(s) = existing {
-                                        s.push_str(args);
+                                    break;
+                                }
+                            };
+                            let Some(item) = chunk else { break };
+                            let chunk = match item {
+                                Ok(v) => v,
+                                Err(e) => {
+                                    mo_agent_core::agent_warn!(
+                                        "llm",
+                                        "in-process stream transport error: {e}"
+                                    );
+                                    yield render_sse(&json!({"type":"error","message": format!("LLM stream transport error: {e}")}));
+                                    tool_calls_map.clear();
+                                    full_text.clear();
+                                    reasoning.clear();
+                                    break;
+                                }
+                            };
+                            // Some providers attach usage to a chunk that also contains choices,
+                            // so parse usage first on every chunk.
+                            if let Some(u) = chunk.get("usage").and_then(Value::as_object) {
+                                let prompt = u.get("prompt_tokens").and_then(Value::as_i64);
+                                let completion = u.get("completion_tokens").and_then(Value::as_i64);
+                                if prompt.is_some() || completion.is_some() {
+                                    let mut usage_map = Map::new();
+                                    if let Some(value) = prompt {
+                                        usage_map.insert("prompt".to_string(), Value::from(value));
+                                    }
+                                    if let Some(value) = completion {
+                                        usage_map.insert("completion".to_string(), Value::from(value));
+                                    }
+                                    if let (Some(p), Some(c)) = (prompt, completion) {
+                                        usage_map.insert("total".to_string(), Value::from(p + c));
+                                    }
+                                    usage = usage_map;
+                                    yield render_sse(&json!({
+                                        "type": "usage",
+                                        "prompt_tokens": prompt,
+                                        "completion_tokens": completion,
+                                        "cache_read_tokens": u.get("prompt_tokens_details")
+                                            .and_then(|d| d.get("cached_tokens"))
+                                            .and_then(Value::as_i64),
+                                    }));
+                                }
+                            }
+
+                            let Some(choices) = chunk.get("choices").and_then(Value::as_array) else {
+                                continue;
+                            };
+
+                            let Some(delta) = choices.first()
+                                .and_then(|c| c.get("delta"))
+                                .and_then(Value::as_object)
+                            else { continue };
+
+                            // Text content
+                            if let Some(content) = delta.get("content").and_then(Value::as_str)
+                                && !content.is_empty() {
+                                    full_text.push_str(content);
+                                    yield render_sse(&json!({"type": "text_delta", "content": content}));
+                                }
+
+                            // Reasoning (DeepSeek / o1 style)
+                            if let Some(r) = delta.get("reasoning_content").and_then(Value::as_str)
+                                && !r.is_empty() {
+                                    reasoning.push_str(r);
+                                    yield render_sse(&json!({"type": "reasoning_delta", "content": r}));
+                                }
+
+                            // Tool calls (streaming accumulation)
+                            if let Some(tcs) = delta.get("tool_calls").and_then(Value::as_array) {
+                                for tc in tcs {
+                                    let idx = tc.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
+                                    let entry = tool_calls_map.entry(idx).or_insert_with(|| {
+                                        Map::from_iter([
+                                            ("id".to_string(), Value::String(String::new())),
+                                            ("type".to_string(), Value::String("function".to_string())),
+                                            ("function".to_string(), json!({"name": "", "arguments": ""})),
+                                        ])
+                                    });
+                                    if let Some(id) = tc.get("id").and_then(Value::as_str)
+                                        && !id.is_empty() {
+                                            entry.insert("id".to_string(), Value::String(id.to_string()));
+                                        }
+                                    if let Some(func) = tc.get("function").and_then(Value::as_object) {
+                                        let f = entry
+                                            .entry("function".to_string())
+                                            .or_insert_with(|| json!({}));
+                                        let Some(f) = f.as_object_mut() else { continue; };
+                                        if let Some(name) = func.get("name").and_then(Value::as_str)
+                                            && !name.is_empty() {
+                                                let is_new = f.get("name").and_then(Value::as_str).unwrap_or("").is_empty();
+                                                f.insert("name".to_string(), Value::String(name.to_string()));
+                                                if is_new {
+                                                    yield render_sse(&json!({"type": "tool_call_start", "name": name}));
+                                                }
+                                            }
+                                        if let Some(args) = func.get("arguments").and_then(Value::as_str) {
+                                            let existing = f
+                                                .entry("arguments".to_string())
+                                                .or_insert_with(|| Value::String(String::new()));
+                                            if let Value::String(s) = existing {
+                                                s.push_str(args);
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -517,6 +720,7 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
         turn_observer_worker: Arc<dyn TurnObserverWorker>,
         turn_auxiliary_event_writer: Arc<dyn TurnAuxiliaryEventWriter>,
         turn_session_activity_writer: Arc<dyn TurnSessionActivityWriter>,
+        client_cancel: Option<Arc<CancellationToken>>,
     ) -> Result<Response, (StatusCode, String)> {
         // Extract trusted context injected by dispatch_chat_turn_bridge
         let user_id = header_str(headers, "x-mo-user-id").unwrap_or_default();
@@ -585,8 +789,13 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
         let bridge_e2e_for_stream: Option<Vec<Value>> = None;
 
         let bridge_e2e_capture = bridge_e2e_for_stream.clone();
+        let client_cancel_capture = client_cancel.clone();
 
         let stream = stream! {
+            let cc = client_cancel_capture.clone();
+            let _client_disconnect_guard = cc
+                .as_ref()
+                .map(|t| crate::turn::llm_client::CancelOnClientDisconnect::new(t.clone()));
             let turn_started = Instant::now();
             // Emit session_info first
             yield render_sse(&json!({"type": "session_info", "session_id": session_id}));
@@ -907,6 +1116,7 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
                         let _ = round_val;
                     }
                 } else {
+                    let mut client_stopped = false;
                     let llm_stream = match call_llm_stream(
                         &llm_messages,
                         &pruned_tools,
@@ -916,6 +1126,7 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
                         &provider,
                         Some(max_output_tokens),
                         has_fallback,
+                        cc.clone(),
                     )
                     .await
                     {
@@ -928,30 +1139,94 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
                     };
 
                     tokio::pin!(llm_stream);
+                    let mut sse_buf = SseBlankLineUtf8Buf::new();
+                    let mut saw_inprocess_summary = false;
 
-                    while let Some(bytes) = llm_stream.next().await {
-                        let text = String::from_utf8_lossy(&bytes);
-                        if let Some(data) = text.strip_prefix("data: ")
-                            && let Ok(event) = serde_json::from_str::<Value>(data.trim()) {
-                                let event_type = event.get("type").and_then(Value::as_str).unwrap_or("");
-                                match event_type {
-                                    "_inprocess_summary" => {
-                                        loop_text = event.get("full_text").and_then(Value::as_str).unwrap_or("").to_string();
-                                        loop_reasoning = event.get("reasoning").and_then(Value::as_str).unwrap_or("").to_string();
-                                        loop_tool_calls = event.get("tool_calls").and_then(Value::as_array).cloned().unwrap_or_default();
-                                        if let Some(u) = event.get("usage").and_then(Value::as_object) {
-                                            usage = u.clone();
+                    loop {
+                        tokio::select! {
+                            biased;
+                            _ = crate::turn::llm_client::wait_until_cancelled_or_pending(cc.as_deref()) => {
+                                mo_agent_core::agent_warn!(
+                                    "bridge",
+                                    "chat turn cancelled — stopping LLM byte forward"
+                                );
+                                client_stopped = true;
+                                break;
+                            }
+                            item = llm_stream.next() => {
+                                let Some(bytes) = item else { break };
+                                for block in sse_buf.push_lossy_bytes(&bytes) {
+                                    match extend_forward_from_validated_sse_block(
+                                        &block,
+                                        &mut saw_inprocess_summary,
+                                        &mut loop_text,
+                                        &mut loop_reasoning,
+                                        &mut loop_tool_calls,
+                                        &mut usage,
+                                        &mut resolved_model,
+                                    ) {
+                                        Ok(chunks) => {
+                                            for b in chunks {
+                                                yield b;
+                                            }
                                         }
-                                        if let Some(m) = event.get("model_used").and_then(Value::as_str) {
-                                            resolved_model = m.to_string();
+                                        Err(msg) => {
+                                            mo_agent_core::agent_warn!("bridge", "in-process LLM SSE block invalid: {msg}");
+                                            yield render_sse_map(&build_stream_error_event(
+                                                &msg,
+                                                "SSE_PARSE_ERROR",
+                                                false,
+                                            ));
+                                            return;
                                         }
                                     }
-                                    "text_delta" | "reasoning_delta" | "tool_call_start" | "usage" => {
-                                        yield bytes;
-                                    }
-                                    _ => {}
                                 }
                             }
+                        }
+                    }
+
+                    if client_stopped {
+                        yield render_sse_map(&build_stream_error_event(
+                            "Request cancelled (client disconnected)",
+                            "CLIENT_DISCONNECT",
+                            false,
+                        ));
+                        return;
+                    }
+
+                    let mut tail = sse_buf.into_inner();
+                    match flush_tail_buf_into_llm_forward(
+                        &mut tail,
+                        &mut saw_inprocess_summary,
+                        &mut loop_text,
+                        &mut loop_reasoning,
+                        &mut loop_tool_calls,
+                        &mut usage,
+                        &mut resolved_model,
+                    ) {
+                        Ok(chunks) => {
+                            for b in chunks {
+                                yield b;
+                            }
+                        }
+                        Err(msg) => {
+                            mo_agent_core::agent_warn!("bridge", "in-process LLM SSE tail invalid: {msg}");
+                            yield render_sse_map(&build_stream_error_event(
+                                &msg,
+                                "SSE_PARSE_ERROR",
+                                false,
+                            ));
+                            return;
+                        }
+                    }
+
+                    if !saw_inprocess_summary {
+                        yield render_sse_map(&build_stream_error_event(
+                            "LLM stream ended without completion summary from provider",
+                            "STREAM_INCOMPLETE",
+                            true,
+                        ));
+                        return;
                     }
                 }
 

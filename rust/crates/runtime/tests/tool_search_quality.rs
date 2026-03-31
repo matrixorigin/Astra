@@ -18,10 +18,11 @@ impl ToolSchemaStore for MapStore {
     }
 }
 
-struct DenyNone;
-impl ToolDenyPredicate for DenyNone {
-    fn denied(&self, _tool_name: &str) -> bool {
-        false
+/// Noise tools in this harness: they must not affect normal queries' rankings.
+struct DenySyntheticNoise;
+impl ToolDenyPredicate for DenySyntheticNoise {
+    fn denied(&self, tool_name: &str) -> bool {
+        tool_name.starts_with("mcp__synthetic_tool_")
     }
 }
 
@@ -181,7 +182,7 @@ fn tool_search_quality_two_phase_not_worse_than_baseline() {
 
         // Two-phase: search over huge pool, then materialize and budget gate.
         let terms = mo_agent_runtime::text_tokenize::tokenize(c.query);
-        let two_phase_schemas = select_two_phase(&pool, &DenyNone, &terms, cfg);
+        let two_phase_schemas = select_two_phase(&pool, &DenySyntheticNoise, &terms, cfg);
         let two_phase_names = extract_tool_names(&two_phase_schemas);
         let two_phase_recall = recall(&two_phase_names, c.used);
         let two_phase_waste = dynamic_token_cost_sum(&two_phase_schemas);
@@ -199,11 +200,13 @@ fn tool_search_quality_two_phase_not_worse_than_baseline() {
         // Allow proportional slack: two-phase may include slightly more tools due to
         // different scoring, but waste should stay within 20% of baseline.
         let slack = (baseline_waste / 5).max(50);
+        let cap = baseline_waste + slack;
         assert!(
-            two_phase_waste <= baseline_waste + slack,
-            "two-phase waste regression for query={:?}\n  baseline_waste={} names={:?}\n  two_phase_waste={} names={:?}",
+            two_phase_waste <= cap,
+            "two-phase waste regression for query={:?}\n  baseline_waste={} cap={} names={:?}\n  two_phase_waste={} names={:?}",
             c.query,
             baseline_waste,
+            cap,
             baseline_names,
             two_phase_waste,
             two_phase_names

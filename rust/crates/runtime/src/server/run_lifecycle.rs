@@ -29,7 +29,9 @@ use mo_agent_services::runs::{
 use crate::FernetTokenEncryptor;
 use crate::MatrixOneSettings;
 use crate::pipeline::step_recorder::StepRecorder;
-use crate::turn::agentic_loop_host::{AgenticLoopOutcome, AgenticLoopState, run_agentic_loop_with_host};
+use crate::turn::agentic_loop_host::{
+    AgenticLoopOutcome, AgenticLoopState, run_agentic_loop_with_host,
+};
 
 use super::run_engine::RunEngine;
 use super::server_loop_host::ServerAgenticLoopHostBuilder;
@@ -320,7 +322,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
 
             let mut events = host.take_emitted_events();
             let (final_status, error_msg) = match outcome {
-                Ok(_) => {
+                Ok(AgenticLoopOutcome::Completed) => {
                     if !loop_state.final_text.is_empty() {
                         events.push(json!({
                             "event_type": "text_done",
@@ -337,12 +339,57 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                     }));
                     (RunStatus::Completed, None)
                 }
-                Err(err) => {
+                Ok(AgenticLoopOutcome::Cancelled) => {
+                    events.push(json!({
+                        "event_type": "run_finished",
+                        "data": {
+                            "cancelled": true,
+                            "prompt_tokens": loop_state.total_prompt,
+                            "completion_tokens": loop_state.total_completion,
+                            "tool_call_count": loop_state.total_tool_calls,
+                        }
+                    }));
+                    (RunStatus::Cancelled, None)
+                }
+                Ok(AgenticLoopOutcome::Error(e)) => {
                     events.push(json!({
                         "event_type": "run_error",
-                        "data": {"error": &err}
+                        "data": {"error": &e}
                     }));
-                    (RunStatus::Failed, Some(err))
+                    (RunStatus::Failed, Some(e))
+                }
+                Ok(AgenticLoopOutcome::Waiting(w)) => {
+                    let msg = format!("waiting: {w}");
+                    events.push(json!({
+                        "event_type": "run_error",
+                        "data": {"error": &msg}
+                    }));
+                    (RunStatus::Failed, Some(msg))
+                }
+                Err(err) => {
+                    let user_cancelled = loop_state
+                        .cancel_flag
+                        .as_ref()
+                        .is_some_and(|f| f.load(Ordering::Relaxed))
+                        || err.contains("LLM call cancelled");
+                    if user_cancelled {
+                        events.push(json!({
+                            "event_type": "run_finished",
+                            "data": {
+                                "cancelled": true,
+                                "prompt_tokens": loop_state.total_prompt,
+                                "completion_tokens": loop_state.total_completion,
+                                "tool_call_count": loop_state.total_tool_calls,
+                            }
+                        }));
+                        (RunStatus::Cancelled, None)
+                    } else {
+                        events.push(json!({
+                            "event_type": "run_error",
+                            "data": {"error": &err}
+                        }));
+                        (RunStatus::Failed, Some(err))
+                    }
                 }
             };
 
@@ -1364,21 +1411,25 @@ mod tests {
         let run = ok(svc.create_run("user-1".into(), test_request("hello")).await);
         assert_eq!(run.status, "running");
 
-        // Give the spawned task a moment to execute and fail
-        // (it will fail because there's no real LLM, but that's fine — we
-        // just verify the task was actually spawned and updates state).
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-
-        let status = ok(svc
-            .get_run_status(run.run_id.clone(), "user-1".into())
-            .await);
-        // The run should have progressed beyond just "running" — either
-        // completed, failed, or have more events.
-        let advanced = status.status != "running" || status.events_count > 1;
+        // Deterministic wait: poll until the background task advances state.
+        let status = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                let status = ok(svc
+                    .get_run_status(run.run_id.clone(), "user-1".into())
+                    .await);
+                if status.status != "running" || status.events_count > 1 {
+                    break status;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("timeout waiting for background task to advance state");
         assert!(
-            advanced,
+            status.status != "running" || status.events_count > 1,
             "Expected background task to advance state, but status={} events={}",
-            status.status, status.events_count
+            status.status,
+            status.events_count
         );
     }
 
@@ -1387,16 +1438,20 @@ mod tests {
         let svc = test_service_with_engine();
         let run = ok(svc.create_run("user-1".into(), test_request("hello")).await);
 
-        // Wait for background task
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-
+        // Deterministic wait: poll durable state until it leaves "running".
         let engine = svc.run_engine.as_ref().unwrap();
-        let durable = engine.load_run(&run.run_id).await.unwrap().unwrap();
-        // After background task completes, status should not be "running"
-        assert_ne!(
-            durable.status, "running",
-            "Expected final status, but run is still running"
-        );
+        let durable = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                let durable = engine.load_run(&run.run_id).await.unwrap().unwrap();
+                if durable.status != "running" {
+                    break durable;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("timeout waiting for durable run status to finalize");
+        assert_ne!(durable.status, "running");
     }
 
     // ─── DelegationTracker integration tests ────────────────────────────

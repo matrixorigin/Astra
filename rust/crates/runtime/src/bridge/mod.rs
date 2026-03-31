@@ -35,6 +35,7 @@ use self::sse_events::{
 };
 
 use crate::turn::routing::max_tool_rounds;
+use tokio_util::sync::CancellationToken;
 
 const TOOL_RESULT_AUDIT_CHARS: usize = 4000;
 /// Safety limit for SSE frame buffer. Prevents OOM if a client is slow or a
@@ -43,6 +44,8 @@ const MAX_SSE_BUFFER_BYTES: usize = 16 * 1024 * 1024;
 
 #[async_trait]
 pub trait ChatTurnBridge: Send + Sync {
+    /// Last argument: optional cancel token — HTTP `/chat/turn` passes one so dropping the SSE body
+    /// (client disconnect) stops in-process LLM streaming promptly.
     #[allow(clippy::too_many_arguments)]
     async fn forward(
         &self,
@@ -56,6 +59,7 @@ pub trait ChatTurnBridge: Send + Sync {
         turn_observer_worker: Arc<dyn TurnObserverWorker>,
         turn_auxiliary_event_writer: Arc<dyn TurnAuxiliaryEventWriter>,
         turn_session_activity_writer: Arc<dyn TurnSessionActivityWriter>,
+        client_cancel: Option<Arc<CancellationToken>>,
     ) -> Result<Response, (StatusCode, String)>;
 }
 
@@ -154,6 +158,7 @@ impl ChatTurnBridge for UnavailableChatTurnBridge {
         _turn_observer_worker: Arc<dyn TurnObserverWorker>,
         _turn_auxiliary_event_writer: Arc<dyn TurnAuxiliaryEventWriter>,
         _turn_session_activity_writer: Arc<dyn TurnSessionActivityWriter>,
+        _client_cancel: Option<Arc<CancellationToken>>,
     ) -> Result<Response, (StatusCode, String)> {
         Err((
             StatusCode::SERVICE_UNAVAILABLE,
@@ -177,6 +182,7 @@ impl ChatTurnBridge for HttpChatTurnBridge {
         turn_observer_worker: Arc<dyn TurnObserverWorker>,
         turn_auxiliary_event_writer: Arc<dyn TurnAuxiliaryEventWriter>,
         turn_session_activity_writer: Arc<dyn TurnSessionActivityWriter>,
+        _client_cancel: Option<Arc<CancellationToken>>,
     ) -> Result<Response, (StatusCode, String)> {
         let mut bridge_headers = HeaderMap::new();
         let side_effect_request_context = parse_bridge_side_effect_request_context(&body);

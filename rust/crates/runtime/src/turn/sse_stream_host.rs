@@ -22,6 +22,9 @@ use crate::turn::chat_turn_sse_dispatch::{
 use async_trait::async_trait;
 use serde_json::Value;
 
+/// Stream idle watchdog: abort SSE consumption if no chunk arrives within this time.
+pub const STREAM_IDLE_TIMEOUT_MS: u64 = 90_000;
+
 // ─── Data types ──────────────────────────────────────────────────────────────
 
 /// Result of executing an edge tool request via the host.
@@ -77,6 +80,13 @@ pub struct SseConsumeResult {
     pub approval_results: Vec<EdgeApprovalResult>,
 }
 
+/// Why SSE consumption aborted unexpectedly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SseAbortReason {
+    IdleTimeout,
+    TransportError,
+}
+
 // ─── Host trait ──────────────────────────────────────────────────────────────
 
 /// Abstraction over CLI-specific SSE consumption behavior.
@@ -122,13 +132,18 @@ pub trait SseStreamHost: Send {
 
 /// Consume an SSE byte stream using the provided host for rendering and edge work.
 ///
-/// This is the **runtime-generic** equivalent of CLI's `consume_turn_sse`.
-/// The protocol parsing (framing, event dispatch, accumulation) runs identically
-/// in all contexts; only the host callbacks differ.
+/// **This is the only supported entrypoint.** It always enforces an idle watchdog and returns
+/// an abort reason when the stream ends unexpectedly.
+///
+/// When idle timeout triggers, the consumer tombstones partial state:
+/// - clears partial `full_text` / `reasoning` / `tool_calls`
+/// - drops pending edge work to prevent dirty state leaks
+/// - sets `accum.error_message` to a synthetic error for visibility
 pub async fn consume_sse_stream<H: SseStreamHost>(
     chunks: &mut (dyn futures_util::Stream<Item = Result<Vec<u8>, String>> + Unpin + Send),
     host: &mut H,
-) -> SseConsumeResult {
+    idle_timeout: std::time::Duration,
+) -> (SseConsumeResult, Option<SseAbortReason>) {
     use futures_util::StreamExt;
 
     let mut accum = ChatTurnSseAccum::default();
@@ -136,15 +151,42 @@ pub async fn consume_sse_stream<H: SseStreamHost>(
     let mut pending: Vec<ChatTurnEdgePending> = Vec::new();
     let mut tool_results: Vec<EdgeToolExecResult> = Vec::new();
     let mut approval_results: Vec<EdgeApprovalResult> = Vec::new();
+    let mut abort: Option<SseAbortReason> = None;
 
-    while let Some(chunk) = chunks.next().await {
-        let Ok(bytes) = chunk else { break };
+    let idle = idle_timeout;
+    loop {
+        let next = tokio::time::timeout(idle, chunks.next()).await;
+        let chunk = match next {
+            Ok(v) => v,
+            Err(_) => {
+                abort = Some(SseAbortReason::IdleTimeout);
+                break;
+            }
+        };
+        let Some(chunk) = chunk else { break };
+        let Ok(bytes) = chunk else {
+            abort = Some(SseAbortReason::TransportError);
+            break;
+        };
         for event_str in framer.push_lossy_bytes(&bytes) {
             let effects = dispatch_chat_turn_sse_event_block(&event_str, &mut accum, &mut pending);
             host.on_render_effects(effects);
             flush_pending_via_host(&mut pending, host, &mut tool_results, &mut approval_results)
                 .await;
         }
+    }
+
+    if abort == Some(SseAbortReason::IdleTimeout) {
+        // Tombstone: discard partial state to avoid dirty/half-applied deltas.
+        accum.full_text.clear();
+        accum.reasoning_content.clear();
+        accum.tool_calls.clear();
+        pending.clear();
+        accum.error_message = Some(format!(
+            "Error: stream idle timeout after {}ms",
+            idle.as_millis()
+        ));
+        host.on_render_effects(vec![SseRenderEffect::StopThinkingSpinner]);
     }
 
     let tail = framer.take_trailing_dispatch_blob();
@@ -157,12 +199,15 @@ pub async fn consume_sse_stream<H: SseStreamHost>(
 
     host.on_stream_complete();
 
-    SseConsumeResult {
+    (
+        SseConsumeResult {
         accum,
         ttft_ms,
         tool_results,
         approval_results,
-    }
+        },
+        abort,
+    )
 }
 
 async fn flush_pending_via_host<H: SseStreamHost>(
@@ -325,6 +370,7 @@ impl SseStreamHost for RecordingSseStreamHost {
 mod tests {
     use super::*;
     use futures_util::stream;
+    use futures_util::StreamExt;
 
     fn sse_event(typ: &str, extra: &str) -> String {
         format!("data: {{\"type\":\"{typ}\"{extra}}}\n\n")
@@ -344,7 +390,13 @@ mod tests {
         let chunks = chunks_from_sse(&events);
         let mut stream = stream::iter(chunks);
         let mut host = NoopSseStreamHost;
-        let result = consume_sse_stream(&mut stream, &mut host).await;
+        let (result, abort) = consume_sse_stream(
+            &mut stream,
+            &mut host,
+            std::time::Duration::from_millis(STREAM_IDLE_TIMEOUT_MS),
+        )
+        .await;
+        assert!(abort.is_none());
         assert_eq!(result.accum.full_text, "hello world");
         assert!(result.tool_results.is_empty());
         assert!(result.approval_results.is_empty());
@@ -356,7 +408,13 @@ mod tests {
         let chunks = chunks_from_sse(&events);
         let mut stream = stream::iter(chunks);
         let mut host = NoopSseStreamHost;
-        let result = consume_sse_stream(&mut stream, &mut host).await;
+        let (result, abort) = consume_sse_stream(
+            &mut stream,
+            &mut host,
+            std::time::Duration::from_millis(STREAM_IDLE_TIMEOUT_MS),
+        )
+        .await;
+        assert!(abort.is_none());
         assert_eq!(result.accum.prompt_tokens, 100);
         assert_eq!(result.accum.completion_tokens, 50);
         assert!(result.accum.has_usage);
@@ -373,7 +431,13 @@ mod tests {
         let chunks = chunks_from_sse(&events);
         let mut stream = stream::iter(chunks);
         let mut host = RecordingSseStreamHost::new();
-        let result = consume_sse_stream(&mut stream, &mut host).await;
+        let (result, abort) = consume_sse_stream(
+            &mut stream,
+            &mut host,
+            std::time::Duration::from_millis(STREAM_IDLE_TIMEOUT_MS),
+        )
+        .await;
+        assert!(abort.is_none());
 
         assert!(host.stream_completed);
         assert_eq!(result.accum.full_text, "answer done");
@@ -401,7 +465,13 @@ mod tests {
         let chunks = chunks_from_sse(&events);
         let mut stream = stream::iter(chunks);
         let mut host = RecordingSseStreamHost::new().with_tool_output("bash", "hi\n");
-        let result = consume_sse_stream(&mut stream, &mut host).await;
+        let (result, abort) = consume_sse_stream(
+            &mut stream,
+            &mut host,
+            std::time::Duration::from_millis(STREAM_IDLE_TIMEOUT_MS),
+        )
+        .await;
+        assert!(abort.is_none());
 
         assert_eq!(result.tool_results.len(), 1);
         assert_eq!(result.tool_results[0].request_id, "tr-1");
@@ -419,7 +489,13 @@ mod tests {
         let chunks = chunks_from_sse(&events);
         let mut stream = stream::iter(chunks);
         let mut host = RecordingSseStreamHost::new();
-        let result = consume_sse_stream(&mut stream, &mut host).await;
+        let (result, abort) = consume_sse_stream(
+            &mut stream,
+            &mut host,
+            std::time::Duration::from_millis(STREAM_IDLE_TIMEOUT_MS),
+        )
+        .await;
+        assert!(abort.is_none());
 
         assert_eq!(result.approval_results.len(), 1);
         assert_eq!(result.approval_results[0].request_id, "ap-1");
@@ -439,7 +515,13 @@ mod tests {
         let chunks = chunks_from_sse(&events);
         let mut stream = stream::iter(chunks);
         let mut host = RecordingSseStreamHost::new();
-        let result = consume_sse_stream(&mut stream, &mut host).await;
+        let (result, abort) = consume_sse_stream(
+            &mut stream,
+            &mut host,
+            std::time::Duration::from_millis(STREAM_IDLE_TIMEOUT_MS),
+        )
+        .await;
+        assert!(abort.is_none());
 
         assert!(result.tool_results.is_empty());
         assert!(result.approval_results.is_empty());
@@ -455,7 +537,13 @@ mod tests {
         let chunks = chunks_from_sse(&events);
         let mut stream = stream::iter(chunks);
         let mut host = NoopSseStreamHost;
-        let result = consume_sse_stream(&mut stream, &mut host).await;
+        let (result, abort) = consume_sse_stream(
+            &mut stream,
+            &mut host,
+            std::time::Duration::from_millis(STREAM_IDLE_TIMEOUT_MS),
+        )
+        .await;
+        assert!(abort.is_none());
         assert_eq!(result.accum.session_id.as_deref(), Some("sess-42"));
         assert_eq!(result.accum.run_id.as_deref(), Some("run-7"));
     }
@@ -469,7 +557,13 @@ mod tests {
             vec![Ok(part1.as_bytes().to_vec()), Ok(part2.as_bytes().to_vec())];
         let mut stream = stream::iter(chunks);
         let mut host = NoopSseStreamHost;
-        let result = consume_sse_stream(&mut stream, &mut host).await;
+        let (result, abort) = consume_sse_stream(
+            &mut stream,
+            &mut host,
+            std::time::Duration::from_millis(STREAM_IDLE_TIMEOUT_MS),
+        )
+        .await;
+        assert!(abort.is_none());
         assert_eq!(result.accum.full_text, "hello");
     }
 
@@ -487,7 +581,13 @@ mod tests {
         let chunks = chunks_from_sse(&events);
         let mut stream = stream::iter(chunks);
         let mut host = NoopSseStreamHost;
-        let result = consume_sse_stream(&mut stream, &mut host).await;
+        let (result, abort) = consume_sse_stream(
+            &mut stream,
+            &mut host,
+            std::time::Duration::from_millis(STREAM_IDLE_TIMEOUT_MS),
+        )
+        .await;
+        assert!(abort.is_none());
         assert!(result.accum.has_tool_calls);
         assert_eq!(result.accum.tool_calls.len(), 1);
     }
@@ -508,7 +608,13 @@ mod tests {
         let chunks = chunks_from_sse(&events);
         let mut stream = stream::iter(chunks);
         let mut host = NoopSseStreamHost;
-        let result = consume_sse_stream(&mut stream, &mut host).await;
+        let (result, abort) = consume_sse_stream(
+            &mut stream,
+            &mut host,
+            std::time::Duration::from_millis(STREAM_IDLE_TIMEOUT_MS),
+        )
+        .await;
+        assert!(abort.is_none());
 
         assert_eq!(result.tool_results.len(), 1);
         assert_eq!(result.tool_results[0].status, "error");
@@ -524,11 +630,40 @@ mod tests {
         let chunks = chunks_from_sse(&events);
         let mut stream = stream::iter(chunks);
         let mut host = NoopSseStreamHost;
-        let result = consume_sse_stream(&mut stream, &mut host).await;
+        let (result, abort) = consume_sse_stream(
+            &mut stream,
+            &mut host,
+            std::time::Duration::from_millis(STREAM_IDLE_TIMEOUT_MS),
+        )
+        .await;
+        assert!(abort.is_none());
         // dispatch prepends "Error: " to the message
         assert_eq!(
             result.accum.error_message.as_deref(),
             Some("Error: rate limited")
         );
+    }
+
+    #[tokio::test]
+    async fn idle_watchdog_aborts_and_tombstones_state() {
+        let events = sse_event("text_delta", ",\"content\":\"partial\"");
+        // First chunk yields partial text, then the stream never yields again → idle timeout.
+        let mut stream = stream::iter(chunks_from_sse(&events))
+            .chain(stream::pending::<Result<Vec<u8>, String>>());
+
+        let mut host = RecordingSseStreamHost::new();
+        let (result, abort) = consume_sse_stream(
+            &mut stream,
+            &mut host,
+            std::time::Duration::from_millis(5),
+        )
+        .await;
+
+        assert_eq!(abort, Some(SseAbortReason::IdleTimeout));
+        assert!(host.stream_completed);
+        assert!(result.accum.full_text.is_empty());
+        assert!(result.accum.reasoning_content.is_empty());
+        assert!(result.accum.tool_calls.is_empty());
+        assert!(result.accum.error_message.as_deref().unwrap_or("").contains("idle timeout"));
     }
 }

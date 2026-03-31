@@ -35,8 +35,12 @@
 use super::*;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::response::IntoResponse;
+use futures_util::StreamExt;
+use serde_json::Value;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::timeout;
+use tokio_util::sync::CancellationToken;
 
 /// Timeout for the initial auth message after WebSocket upgrade.
 const AUTH_TIMEOUT: Duration = Duration::from_secs(30);
@@ -661,6 +665,8 @@ async fn handle_chat_message_via_bridge(
     // Add optional headers from prepared context
     apply_prepared_headers(&mut bridge_headers, &prepared);
 
+    let client_cancel = Arc::new(CancellationToken::new());
+
     // Call bridge
     let response = state
         .chat_turn_bridge
@@ -675,12 +681,13 @@ async fn handle_chat_message_via_bridge(
             state.turn_observer_worker.clone(),
             state.turn_auxiliary_event_writer.clone(),
             state.turn_session_activity_writer.clone(),
+            Some(client_cancel.clone()),
         )
         .await;
 
     match response {
         Ok(resp) => {
-            stream_sse_response_as_ws(socket, resp).await;
+            stream_sse_response_as_ws(socket, resp, Some(client_cancel)).await;
         }
         Err((_status, error)) => {
             send_msg(
@@ -727,56 +734,161 @@ fn apply_prepared_headers(
     }
 }
 
+/// Parse one blank-line SSE block into JSON values for WebSocket forwarding.
+/// Validates `data:` JSON lines; if the block has no `data:` events, accepts a single raw `{...}` payload (HTTP bridge compatibility).
+fn ws_json_events_from_sse_block(block: &str) -> Result<Vec<Value>, String> {
+    crate::turn::sse_data_lines::validate_sse_event_block_json(block)?;
+    let mut events = crate::turn::sse_data_lines::json_events_from_sse_event_block(block).events;
+    if events.is_empty() {
+        let t = block.trim();
+        if t.starts_with('{')
+            && let Ok(v) = serde_json::from_str::<Value>(t)
+        {
+            events.push(v);
+        }
+    }
+    Ok(events)
+}
+
 /// Convert SSE response from bridge into WebSocket text frames.
 ///
 /// The bridge returns `text/event-stream` format: `data: {json}\n\n`.
-/// We parse each SSE event and send it as a WebSocket text frame.
-async fn stream_sse_response_as_ws(socket: &mut WebSocket, response: Response) {
-    // Read entire response body. The bridge response is typically small enough
-    // for buffered read (SSE events for a single turn).
-    let (parts, body) = response.into_parts();
-    let _ = parts; // status/headers not needed — events carry their own types
+/// Streams the HTTP body so client disconnect stops in-process LLM work promptly
+/// (via [`CancellationToken`] passed into [`crate::bridge::ChatTurnBridge::forward`]).
+async fn stream_sse_response_as_ws(
+    socket: &mut WebSocket,
+    response: Response,
+    cancel: Option<Arc<CancellationToken>>,
+) {
+    let (_parts, body) = response.into_parts();
+    let mut stream = body.into_data_stream();
+    let mut sse_in = crate::turn::sse_blocks::SseBlankLineUtf8Buf::new();
+    let mut total_read: usize = 0;
 
-    // Convert body to bytes using axum's built-in method
-    let body_bytes = match axum::body::to_bytes(body, MAX_MESSAGE_SIZE).await {
-        Ok(bytes) => bytes,
-        Err(e) => {
-            send_msg(
-                socket,
-                &WsServerMessage::Error {
-                    message: format!("Failed to read response: {e}"),
-                    code: "INTERNAL_ERROR".into(),
-                    retryable: false,
-                },
-            )
-            .await;
-            return;
-        }
-    };
-
-    let text = String::from_utf8_lossy(&body_bytes);
-
-    // Parse SSE frames: "data: {json}\n\n"
-    for line in text.split("\n\n") {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let json_str = if let Some(stripped) = line.strip_prefix("data: ") {
-            stripped
-        } else if line.starts_with('{') {
-            line
-        } else {
-            continue;
+    loop {
+        let next = match cancel.as_ref() {
+            Some(t) => {
+                tokio::select! {
+                    biased;
+                    _ = t.cancelled() => {
+                        mo_agent_core::agent_warn!("ws", "bridge response stream cancelled");
+                        return;
+                    }
+                    n = stream.next() => n,
+                }
+            }
+            None => stream.next().await,
         };
 
-        // Forward raw JSON event as WebSocket text frame
-        if socket
-            .send(Message::Text(json_str.to_string().into()))
-            .await
-            .is_err()
-        {
-            break; // Client disconnected
+        match next {
+            None => break,
+            Some(Ok(chunk)) => {
+                total_read += chunk.len();
+                if total_read > MAX_MESSAGE_SIZE {
+                    send_msg(
+                        socket,
+                        &WsServerMessage::Error {
+                            message: "Bridge response exceeded size limit".into(),
+                            code: "INTERNAL_ERROR".into(),
+                            retryable: false,
+                        },
+                    )
+                    .await;
+                    if let Some(t) = cancel.as_ref() {
+                        t.cancel();
+                    }
+                    return;
+                }
+                for block in sse_in.push_lossy_bytes(&chunk) {
+                    let events = match ws_json_events_from_sse_block(&block) {
+                        Ok(e) => e,
+                        Err(m) => {
+                            send_msg(
+                                socket,
+                                &WsServerMessage::Error {
+                                    message: m,
+                                    code: "PROTOCOL_ERROR".into(),
+                                    retryable: false,
+                                },
+                            )
+                            .await;
+                            if let Some(t) = cancel.as_ref() {
+                                t.cancel();
+                            }
+                            return;
+                        }
+                    };
+                    for event in events {
+                        let text = match serde_json::to_string(&event) {
+                            Ok(s) => s,
+                            Err(e) => {
+                                send_msg(
+                                    socket,
+                                    &WsServerMessage::Error {
+                                        message: format!("Failed to serialize event: {e}"),
+                                        code: "INTERNAL_ERROR".into(),
+                                        retryable: false,
+                                    },
+                                )
+                                .await;
+                                if let Some(t) = cancel.as_ref() {
+                                    t.cancel();
+                                }
+                                return;
+                            }
+                        };
+                        if socket.send(Message::Text(text.into())).await.is_err() {
+                            if let Some(t) = cancel.as_ref() {
+                                t.cancel();
+                            }
+                            return;
+                        }
+                    }
+                }
+            }
+            Some(Err(e)) => {
+                send_msg(
+                    socket,
+                    &WsServerMessage::Error {
+                        message: format!("Failed to read bridge response: {e}"),
+                        code: "INTERNAL_ERROR".into(),
+                        retryable: false,
+                    },
+                )
+                .await;
+                if let Some(t) = cancel.as_ref() {
+                    t.cancel();
+                }
+                return;
+            }
+        }
+    }
+
+    let tail = sse_in.into_inner();
+    if !tail.trim().is_empty() {
+        match ws_json_events_from_sse_block(&tail) {
+            Ok(events) => {
+                for event in events {
+                    let Ok(text) = serde_json::to_string(&event) else {
+                        continue;
+                    };
+                    let _ = socket.send(Message::Text(text.into())).await;
+                }
+            }
+            Err(m) => {
+                send_msg(
+                    socket,
+                    &WsServerMessage::Error {
+                        message: m,
+                        code: "PROTOCOL_ERROR".into(),
+                        retryable: false,
+                    },
+                )
+                .await;
+                if let Some(t) = cancel.as_ref() {
+                    t.cancel();
+                }
+            }
         }
     }
 }

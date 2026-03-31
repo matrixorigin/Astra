@@ -199,6 +199,7 @@ impl ChatTurnBridge for StubChatTurnBridge {
         _turn_observer_worker: Arc<dyn TurnObserverWorker>,
         _turn_auxiliary_event_writer: Arc<dyn TurnAuxiliaryEventWriter>,
         _turn_session_activity_writer: Arc<dyn TurnSessionActivityWriter>,
+        _client_cancel: Option<Arc<tokio_util::sync::CancellationToken>>,
     ) -> Result<Response, (StatusCode, String)> {
         *self.capture.body.lock().await =
             Some(serde_json::from_slice(&body).expect("request body should be valid json"));

@@ -36,6 +36,7 @@ serde_json.workspace = true
 sha2.workspace = true
 sqlx.workspace = true
 tokio.workspace = true
+tokio-util.workspace = true
 tower-http.workspace = true
 uuid.workspace = true
 tree-sitter = "0.24"
@@ -45,6 +46,7 @@ tree-sitter-bash = "0.23"
 criterion = { version = "0.5", features = ["html_reports"] }
 futures-util.workspace = true
 tempfile = "3"
+tokio-util.workspace = true
 tower.workspace = true
 proptest = "1"
 

@@ -27,7 +27,7 @@ use crate::turn::agentic_headless_round::HeadlessStderrStyle;
 use crate::turn::agentic_loop_host::{AgenticLoopHost, AgenticLoopState, HostTurnResult};
 use crate::turn::chat_turn_sse_dispatch::ChatTurnSseAccum;
 use crate::turn::llm_client::{
-    LlmCallResult, cached_system_prompt, call_llm_and_collect, classify_llm_error,
+    LlmCallResult, LlmCancel, cached_system_prompt, call_llm_and_collect, classify_llm_error,
 };
 use crate::turn::tool_schema_prune::prune_tool_schemas;
 use crate::{FernetTokenEncryptor, MatrixOneSettings};
@@ -476,6 +476,10 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         let tier = budget.compaction_tier(cache_est.total_tokens);
         let pruned_tools = prune_tool_schemas(&self.edge_tools, tier);
 
+        let llm_cancel = match &state.cancel_flag {
+            Some(f) => LlmCancel::Flag(f.as_ref()),
+            None => LlmCancel::None,
+        };
         let result = call_llm_and_collect(
             &llm_messages,
             &pruned_tools,
@@ -485,6 +489,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             &provider,
             Some(max_output_tokens),
             has_fallback,
+            llm_cancel,
         )
         .await
         .map_err(|e| {

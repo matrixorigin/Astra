@@ -9,6 +9,7 @@ use mo_agent_runtime::turn::sse_edge_stderr_lines::{
 };
 use mo_agent_runtime::turn::sse_stream_host::{
     EdgeApprovalResult, EdgeToolExecResult, NoopSseStreamHost, SseStreamHost, consume_sse_stream,
+    STREAM_IDLE_TIMEOUT_MS,
 };
 use mo_agent_runtime::turn::tool_result_semantics::cloud_tool_result_status_label;
 use std::ops::{Deref, DerefMut};
@@ -335,13 +336,14 @@ pub(super) async fn consume_turn_sse(
     );
 
     // Delegate to runtime's generic SSE consumer with the appropriate host
+    let idle = std::time::Duration::from_millis(STREAM_IDLE_TIMEOUT_MS);
     let (sse_result, edge_tool_round) = if let Some(ctx) = edge {
         let mut host = CliSseStreamHost::from_edge_ctx(ctx);
-        let result = consume_sse_stream(&mut byte_stream, &mut host).await;
+        let (result, _abort) = consume_sse_stream(&mut byte_stream, &mut host, idle).await;
         (result, host.edge_tool_round)
     } else {
         let mut host = NoopSseStreamHost;
-        let result = consume_sse_stream(&mut byte_stream, &mut host).await;
+        let (result, _abort) = consume_sse_stream(&mut byte_stream, &mut host, idle).await;
         (result, Vec::new())
     };
 

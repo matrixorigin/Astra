@@ -4,11 +4,17 @@
 //! and [`crate::server::server_loop_host::ServerAgenticLoopHost`] can call LLMs
 //! without duplicating the retry/backoff/parsing logic.
 
-use std::{collections::HashMap, time::Instant};
+use std::{
+    collections::HashMap,
+    sync::Arc,
+    sync::atomic::{AtomicBool, Ordering},
+    time::Instant,
+};
 
 use axum::body::Bytes;
 use futures_util::StreamExt;
 use serde_json::{Map, Value, json};
+use tokio_util::sync::CancellationToken;
 
 use super::sse_blocks::SseBlankLineUtf8Buf;
 use super::sse_data_lines::{
@@ -119,9 +125,43 @@ fn turn_timeout_s() -> f64 {
     mo_agent_core::RuntimeLimits::global().turn_timeout_s
 }
 
-fn stream_idle_timeout() -> std::time::Duration {
+/// Cooperative cancellation for [`call_llm_and_collect`] / [`collect_llm_stream`].
+#[derive(Clone, Copy)]
+pub(crate) enum LlmCancel<'a> {
+    None,
+    /// Cooperative cancel when the caller already owns a [`CancellationToken`].
+    #[allow(dead_code)] // Agentic loop wires [`Flag`]; bridge/WS can use this without duplicating state.
+    Token(&'a CancellationToken),
+    Flag(&'a AtomicBool),
+}
+
+impl LlmCancel<'_> {
+    pub(crate) fn is_triggered(self) -> bool {
+        match self {
+            LlmCancel::None => false,
+            LlmCancel::Token(t) => t.is_cancelled(),
+            LlmCancel::Flag(f) => f.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// Completes when cancellation is requested; otherwise never completes if [`LlmCancel::None`].
+pub(crate) async fn wait_llm_cancel(cancel: LlmCancel<'_>) {
+    match cancel {
+        LlmCancel::None => std::future::pending().await,
+        LlmCancel::Token(t) => t.cancelled().await,
+        LlmCancel::Flag(f) => {
+            const POLL: std::time::Duration = std::time::Duration::from_millis(50);
+            while !f.load(Ordering::Relaxed) {
+                tokio::time::sleep(POLL).await;
+            }
+        }
+    }
+}
+
+/// Per-chunk idle watchdog (Claude Code–style): no SSE JSON for this long → treat as stalled.
+pub(crate) fn stream_idle_timeout() -> std::time::Duration {
     // Allow tests and deployments to override the idle watchdog.
-    // Default: 90s to match Claude Code's stream idle watchdog.
     let ms = std::env::var("MO_STREAM_IDLE_TIMEOUT_MS")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
@@ -150,6 +190,7 @@ pub(crate) async fn call_llm_and_collect(
     provider: &str,
     max_output_tokens: Option<usize>,
     has_fallback: bool,
+    cancel: LlmCancel<'_>,
 ) -> Result<LlmCallResult, String> {
     let cooldown = rate_limit_cooldown();
 
@@ -184,9 +225,16 @@ pub(crate) async fn call_llm_and_collect(
 
     let mut last_err = String::new();
     for attempt in 0..=LLM_MAX_RETRIES {
+        if cancel.is_triggered() {
+            return Err("LLM call cancelled".to_string());
+        }
         if attempt > 0 {
             let delay = LLM_RETRY_BASE_MS * (1 << (attempt - 1));
-            tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+            tokio::select! {
+                biased;
+                _ = wait_llm_cancel(cancel) => return Err("LLM call cancelled".to_string()),
+                _ = tokio::time::sleep(std::time::Duration::from_millis(delay)) => {}
+            }
         }
 
         let mut req = client.post(&url).header("content-type", "application/json");
@@ -211,9 +259,19 @@ pub(crate) async fn call_llm_and_collect(
             // Success — record to cooldown tracker
             cooldown.record_success();
             let byte_stream = response.bytes_stream();
-            match collect_llm_stream(byte_stream, model_name, started).await {
+            match collect_llm_stream(byte_stream, model_name, started, cancel).await {
                 Ok(result) => return Ok(result),
+                Err(StreamCollectError::Cancelled) => {
+                    return Err("LLM call cancelled".to_string());
+                }
+                Err(StreamCollectError::Transport(e)) => {
+                    last_err = format!("LLM stream transport error: {e}");
+                    continue;
+                }
                 Err(StreamCollectError::IdleTimeout { elapsed_ms }) => {
+                    if cancel.is_triggered() {
+                        return Err("LLM call cancelled".to_string());
+                    }
                     // Abort streaming and fall back to non-stream request (single response).
                     mo_agent_core::agent_warn!(
                         "llm",
@@ -231,10 +289,6 @@ pub(crate) async fn call_llm_and_collect(
                         max_output_tokens,
                     )
                     .await;
-                }
-                Err(StreamCollectError::Transport(e)) => {
-                    last_err = format!("LLM stream transport error: {e}");
-                    continue;
                 }
             }
         }
@@ -294,27 +348,35 @@ async fn collect_llm_stream(
     stream: impl futures_util::Stream<Item = Result<Bytes, reqwest::Error>> + Unpin + Send + 'static,
     model_name: &str,
     started: Instant,
+    cancel: LlmCancel<'_>,
 ) -> Result<LlmCallResult, StreamCollectError> {
     let mut full_text = String::new();
     let mut reasoning = String::new();
     let mut tool_calls_map: HashMap<usize, Map<String, Value>> = HashMap::new();
     let mut usage = Map::new();
 
-    let sse = parse_sse_chunks(stream);
+    let sse = parse_openai_sse_json_stream(stream);
     tokio::pin!(sse);
 
     let idle = stream_idle_timeout();
     loop {
-        let next = tokio::time::timeout(idle, sse.next()).await;
-        let chunk = match next {
-            Ok(v) => v,
-            Err(_elapsed) => {
-                return Err(StreamCollectError::IdleTimeout {
-                    elapsed_ms: idle.as_millis() as u64,
-                });
-            }
+        let item = tokio::select! {
+            biased;
+            _ = wait_llm_cancel(cancel) => return Err(StreamCollectError::Cancelled),
+            r = tokio::time::timeout(idle, sse.next()) => match r {
+                Ok(v) => v,
+                Err(_elapsed) => {
+                    return Err(StreamCollectError::IdleTimeout {
+                        elapsed_ms: idle.as_millis() as u64,
+                    });
+                }
+            },
         };
-        let Some(chunk) = chunk else { break };
+        let Some(item) = item else { break };
+        let chunk = match item {
+            Ok(v) => v,
+            Err(e) => return Err(StreamCollectError::Transport(e)),
+        };
         // Parse usage from any chunk
         if let Some(u) = chunk.get("usage").and_then(Value::as_object) {
             let prompt = u.get("prompt_tokens").and_then(Value::as_i64);
@@ -421,11 +483,39 @@ async fn collect_llm_stream(
 #[allow(dead_code)] // Transport variant reserved for future network error handling
 enum StreamCollectError {
     IdleTimeout { elapsed_ms: u64 },
+    /// Byte stream error from the HTTP client (e.g. reset, TLS failure).
     Transport(String),
+    /// [`LlmCancel`] fired during collection.
+    Cancelled,
+}
+
+/// For `tokio::select!`: completes when `cancel` fires, or never if `cancel` is `None`.
+pub(crate) async fn wait_until_cancelled_or_pending(cancel: Option<&CancellationToken>) {
+    match cancel {
+        Some(t) => t.cancelled().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Optional: cancel in-flight collection when this drops (e.g. SSE response body dropped).
+pub(crate) struct CancelOnClientDisconnect {
+    token: Arc<CancellationToken>,
+}
+
+impl CancelOnClientDisconnect {
+    pub(crate) fn new(token: Arc<CancellationToken>) -> Self {
+        Self { token }
+    }
+}
+
+impl Drop for CancelOnClientDisconnect {
+    fn drop(&mut self) {
+        self.token.cancel();
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn call_llm_nonstream_fallback(
+pub(crate) async fn call_llm_nonstream_fallback(
     client: &reqwest::Client,
     messages: &[Value],
     tools: &[Value],
@@ -521,19 +611,25 @@ fn parse_nonstream_response(v: &Value, model_name: &str, started: Instant) -> Ll
     }
 }
 
-/// Parse OpenAI-style SSE chunks into JSON values.
-fn parse_sse_chunks(
+/// Parse OpenAI-style SSE bytes into JSON event values. Transport errors surface as `Err`.
+pub(crate) fn parse_openai_sse_json_stream(
     stream: impl futures_util::Stream<Item = Result<Bytes, reqwest::Error>> + Unpin + Send + 'static,
-) -> impl futures_util::Stream<Item = Value> + Send + 'static {
+) -> impl futures_util::Stream<Item = Result<Value, String>> + Send + 'static {
     async_stream::stream! {
         let mut sse_in = SseBlankLineUtf8Buf::new();
         tokio::pin!(stream);
         while let Some(chunk) = stream.next().await {
-            let Ok(bytes) = chunk else { break };
+            let bytes = match chunk {
+                Ok(b) => b,
+                Err(e) => {
+                    yield Err(e.to_string());
+                    return;
+                }
+            };
             for block in sse_in.push_lossy_bytes(&bytes) {
                 let d = json_events_from_sse_event_block(&block);
                 for v in d.events {
-                    yield v;
+                    yield Ok(v);
                 }
                 if d.stream_finished {
                     return;
@@ -543,14 +639,14 @@ fn parse_sse_chunks(
         let mut buf = sse_in.into_inner();
         let tail = drain_sse_data_lines(&mut buf, "");
         for v in tail.events {
-            yield v;
+            yield Ok(v);
         }
         if tail.stream_finished {
             return;
         }
         let fin = finish_sse_data_buffer(&mut buf);
         for v in fin.events {
-            yield v;
+            yield Ok(v);
         }
     }
 }
@@ -560,6 +656,7 @@ mod tests {
     use super::*;
     use futures_util::stream;
     use serde_json::json;
+    use std::sync::atomic::AtomicBool;
 
     #[test]
     fn classify_llm_error_categories() {
@@ -629,10 +726,62 @@ mod tests {
         // Stream that never yields any bytes (simulates a hung connection).
         let pending_stream = stream::pending::<Result<Bytes, reqwest::Error>>();
         let started = Instant::now();
-        let res = collect_llm_stream(pending_stream, "test-model", started).await;
+        let res = collect_llm_stream(pending_stream, "test-model", started, LlmCancel::None).await;
         assert!(
             matches!(res, Err(StreamCollectError::IdleTimeout { .. })),
             "expected idle timeout, got: {res:?}"
+        );
+        unsafe { std::env::remove_var("MO_STREAM_IDLE_TIMEOUT_MS") };
+    }
+
+    #[tokio::test]
+    async fn collect_llm_stream_respects_cancel_flag() {
+        unsafe { std::env::set_var("MO_STREAM_IDLE_TIMEOUT_MS", "60000") };
+        let flag = Arc::new(AtomicBool::new(false));
+        let flag_signal = flag.clone();
+        let pending_stream = stream::pending::<Result<Bytes, reqwest::Error>>();
+        let started = Instant::now();
+        let handle = tokio::spawn(async move {
+            collect_llm_stream(
+                pending_stream,
+                "test-model",
+                started,
+                LlmCancel::Flag(flag.as_ref()),
+            )
+            .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        flag_signal.store(true, Ordering::SeqCst);
+        let res = handle.await.expect("join");
+        assert!(
+            matches!(res, Err(StreamCollectError::Cancelled)),
+            "expected cancel, got: {res:?}"
+        );
+        unsafe { std::env::remove_var("MO_STREAM_IDLE_TIMEOUT_MS") };
+    }
+
+    #[tokio::test]
+    async fn collect_llm_stream_respects_cancel_token() {
+        unsafe { std::env::set_var("MO_STREAM_IDLE_TIMEOUT_MS", "60000") };
+        let token = CancellationToken::new();
+        let token_for_stream = token.clone();
+        let pending_stream = stream::pending::<Result<Bytes, reqwest::Error>>();
+        let started = Instant::now();
+        let handle = tokio::spawn(async move {
+            collect_llm_stream(
+                pending_stream,
+                "test-model",
+                started,
+                LlmCancel::Token(&token_for_stream),
+            )
+            .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        token.cancel();
+        let res = handle.await.expect("join");
+        assert!(
+            matches!(res, Err(StreamCollectError::Cancelled)),
+            "expected cancel, got: {res:?}"
         );
         unsafe { std::env::remove_var("MO_STREAM_IDLE_TIMEOUT_MS") };
     }
