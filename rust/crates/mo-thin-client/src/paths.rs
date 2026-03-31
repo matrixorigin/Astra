@@ -12,6 +12,12 @@ pub const TOOLS_RESULT: &str = "/tools/result";
 /// `POST` — design doc: user approval for gated tools.
 pub const APPROVAL_RESPOND: &str = "/approval/respond";
 
+/// `POST` — edge registry (design: agent / edge node registration). May 404 until server implements Phase 3.
+pub const AGENTS_EDGE: &str = "/agents/edge";
+
+/// `POST` — edge heartbeat / liveness (paired with [`AGENTS_EDGE`]). May 404 until implemented.
+pub const AGENTS_EDGE_HEARTBEAT: &str = "/agents/edge/heartbeat";
+
 pub const SESSIONS: &str = "/sessions";
 
 /// `GET/PUT/DELETE /sessions/{id}`

@@ -11,6 +11,7 @@ use reqwest::{
 };
 use serde_json::Value;
 
+use crate::edge::MO_EDGE_ID_HEADER;
 use crate::error::ThinClientError;
 use crate::paths;
 use crate::protocol::{
@@ -936,7 +937,7 @@ impl ThinClient {
         if let Some(id) = edge_executor_id
             && let Ok(v) = HeaderValue::from_str(id)
         {
-            req = req.header("X-Mo-Edge-Id", v);
+            req = req.header(MO_EDGE_ID_HEADER, v);
         }
         let resp = req.send().await?;
         Self::json_or_error(resp).await

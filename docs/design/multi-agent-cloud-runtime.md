@@ -1,7 +1,7 @@
 # Multi-Agent Cloud Runtime Architecture
 
 > **Status**: Living Design Document  
-> **Version**: 1.3 (§5.5 `mo-thin-client` implementation reference + tasks/context paths)  
+> **Version**: 1.4 (§5.5.2 lightweight edge executor + `mo-thin-client::edge`)  
 > **Scope**: Edge-cloud state management, multi-agent orchestration, and cloud-scale execution  
 > **Audience**: Core contributors, architecture reviewers
 
@@ -18,6 +18,7 @@
    - 5.4 [Responsibility Split: What Moves Where](#54-responsibility-split-what-moves-where)
    - 5.5 [Thin Client Protocol](#55-thin-client-protocol)
      - 5.5.1 [Reference implementation: `mo-thin-client`](#551-reference-implementation-mo-thin-client)
+     - 5.5.2 [Lightweight edge executor](#552-lightweight-edge-executor)
 6. [Edge-Cloud State Model](#6-edge-cloud-state-model)
 7. [MatrixOne-Native Acceleration](#7-matrixone-native-acceleration)
 8. [Multi-Agent Coordination Protocol](#8-multi-agent-coordination-protocol)
@@ -614,6 +615,7 @@ Shared crate: `rust/crates/mo-thin-client` (dependency of `mo-agent-cli` and any
 |-------|----------------|------|
 | Paths | [`paths.rs`](../../rust/crates/mo-thin-client/src/paths.rs) | Canonical URL constants and `session` / `task` / `context_capture` helpers — keep in sync with `runtime/src/server/router_builder.rs`. |
 | Bodies | [`protocol.rs`](../../rust/crates/mo-thin-client/src/protocol.rs) | `ChatStreamRequest` (includes §5.5 `edge_executor_id`, `capabilities`), `ToolResultRequest`, `ApprovalRespondRequest`, `StreamEvent`, session DTOs. |
+| Light edge | [`edge.rs`](../../rust/crates/mo-thin-client/src/edge.rs) | §5.5.2: `advertise_executor`, `builtin_capability_preset`, `MO_EDGE_ID_HEADER`. |
 | Transport | [`ThinClient`](../../rust/crates/mo-thin-client/src/client.rs) | `reqwest`-based HTTP + SSE (`chat_stream` / `post_chat_turn`), auth, sessions, skills, memory, tasks, context snapshots, `get_url` for off-origin probes (e.g. Memoria health). |
 | Admin CLI | [`mo-admin-cli`](../../rust/crates/mo-admin/) | Same crate: **only** [`ThinClient`](../../rust/crates/mo-thin-client/src/client.rs) for server calls (no standalone `reqwest` client). |
 
@@ -626,9 +628,42 @@ Shared crate: `rust/crates/mo-thin-client` (dependency of `mo-agent-cli` and any
 
 **Server-aligned additions (not all listed in the prose above):** `GET/POST /tasks`, `PUT /tasks/{id}/status`, `GET /tasks/{id}/progress`, `GET/POST /context`, `GET /context/{id}`, `POST /memory/retrieve`, `POST /chat/route` — path constants and `ThinClient` helpers live alongside the rest in `paths.rs` / `client.rs`.
 
+#### 5.5.2 Lightweight edge executor
+
+The **edge** tier is intentionally **thin**: it is not a second copy of the cognitive runtime. A *light edge* process:
+
+| In scope | Out of scope (stays cloud / `mo-agent-server`) |
+|----------|-----------------------------------------------|
+| Hold JWT (or receive per-turn token), call `POST /chat/stream` with SSE | LLM calls, tool selection, stall detection, plan decomposition |
+| Parse [`StreamEvent`](../../rust/crates/mo-thin-client/src/protocol.rs); on `tool_request`, run **local** tools (bash, fs, git, tree-sitter, …) | `SyncOrchestrator`, MatrixOne pool, `IngestionSender`, session journal |
+| `POST /tools/result` with [`ToolResultRequest`](../../rust/crates/mo-thin-client/src/protocol.rs) + `X-Mo-Edge-Id` | EntityGraph, PatternLibrary, progressive calibration |
+| Optional: `POST /approval/respond` if the UX is on the same machine | Cross-session learning merge |
+
+**Dependency budget**: `mo-thin-client` (+ serde / async runtime) and a **local tool runner** crate or embedded module. **Must not** depend on `mo-agent` (CLI), `runtime` pipeline, or `services` — otherwise the edge stops being deployable as a small sidecar (CI runner, IDE helper, headless worker).
+
+**Advertise capabilities** on every chat turn so the cloud router knows which `tool_request` events to emit:
+
+- Rust: [`advertise_executor`](../../rust/crates/mo-thin-client/src/edge.rs) on [`ChatStreamRequest`](../../rust/crates/mo-thin-client/src/protocol.rs) sets `edge_executor_id` and, if empty, fills [`builtin_capability_preset`](../../rust/crates/mo-thin-client/src/edge.rs) (`bash`, `fs`, `git`, `code_intel`).
+- Header constant: [`MO_EDGE_ID_HEADER`](../../rust/crates/mo-thin-client/src/edge.rs) (`X-Mo-Edge-Id`) — used by [`ThinClient::post_tool_result`](../../rust/crates/mo-thin-client/src/client.rs).
+
+**Registry (future)**: [`paths::AGENTS_EDGE`](../../rust/crates/mo-thin-client/src/paths.rs) and [`AGENTS_EDGE_HEARTBEAT`](../../rust/crates/mo-thin-client/src/paths.rs) are reserved for Phase 3 agent registry; servers may return 404 until wired.
+
+**Event loop (conceptual)**:
+
+```text
+open SSE (chat/stream with edge_executor_id + capabilities)
+  → for each StreamEvent::ToolRequest { run locally → post_tool_result }
+  → for each StreamEvent::ApprovalRequired { optional local UX → post_approval }
+  → render text/plan events for UI
+```
+
+This is the same protocol as CLI/Web/IDE **thin clients**; the edge differs only in **also** executing tools and posting callbacks. Today’s `mo-agent` CLI still bundles thin client + cognitive loop + edge tools — splitting out a **standalone light edge** is the mechanical next step after the server owns `chat_stream` / `plan_decompose` (§5.3).
+
 ---
 
 ## 6. Edge-Cloud State Model
+
+> **Scope note**: §5.5.2 defines the *transport and responsibility* boundary for a minimal edge. §6 below covers **durable state sync** (learning, events, tasks) between edge-associated clients and cloud — orthogonal to how small the edge binary is.
 
 ### 6.1 State Domains & Sync Semantics
 
@@ -1785,6 +1820,7 @@ mo-agent Orchestrator
 | Router | `runtime/src/server/router_builder.rs` | 50+ HTTP routes, the thin client API surface | runtime ✅ |
 | Web proxy | `web/app/api/backend/[...path]/route.ts` | Server-side proxy, httpOnly cookie auth | web ✅ |
 | Thin client (§5.5) | `mo-thin-client/src/{paths,protocol,client}.rs` | Shared HTTP+SSE; CLI and future clients | ✅ |
+| Light edge (§5.5.2) | `mo-thin-client/src/edge.rs` | `edge_executor_id` helpers, capability preset, `X-Mo-Edge-Id` | ✅ |
 
 ---
 
