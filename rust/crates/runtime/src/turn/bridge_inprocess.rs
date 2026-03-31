@@ -685,8 +685,26 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
                 let tier = budget.compaction_tier(cache_est.total_tokens);
                 // Use effective input limit as char budget (×4 for char-to-token ratio)
                 let budget_chars = budget.effective_input_limit() * 4;
-                let merged = crate::compact_tiered(&raw, budget_chars, 2_000, tier, budget.keep_recent_turns);
-                (merged, tier)
+
+                // Try to load Session Memory for this session
+                let session_memory = crate::turn::cloud::session_memory::SessionMemory::load_or_create_for_session(&session_id);
+
+                // Use Session Memory-aware compaction if available
+                let sm_config = crate::turn::cloud::session_memory::SmCompactConfig::default();
+                let autocompact_threshold = budget.effective_input_limit() / 2; // ~50% of budget
+
+                let compact_result = crate::turn::cloud::sm_compact::compact_with_session_memory_sync(
+                    &raw,
+                    session_memory.as_ref(),
+                    &sm_config,
+                    budget_chars,
+                    2_000,
+                    tier,
+                    budget.keep_recent_turns,
+                    autocompact_threshold,
+                );
+
+                (compact_result.messages, tier)
             };
 
             llm_messages.extend(merged_messages);

@@ -377,6 +377,52 @@ pub async fn compact_with_session_memory_fallback(
     .await
 }
 
+/// Synchronous compaction with Session Memory fallback to truncation.
+///
+/// This is a simpler version that doesn't require async/LLM - useful for
+/// integration points that can't easily use async or don't want LLM costs.
+///
+/// Compaction hierarchy:
+/// 1. Session Memory (instant, no API cost) - if available and conditions met
+/// 2. Pure truncation (guaranteed to work) - fallback
+#[allow(clippy::too_many_arguments)]
+pub fn compact_with_session_memory_sync(
+    messages: &[Value],
+    session_memory: Option<&SessionMemory>,
+    sm_config: &SmCompactConfig,
+    budget_chars: usize,
+    keep_chars: usize,
+    tier: CompactionTier,
+    keep_recent_turns: usize,
+    autocompact_threshold_tokens: usize,
+) -> super::compaction::CompactResult {
+    // Try SM compaction first if session memory is available
+    if let Some(sm) = session_memory {
+        match session_memory_compact(messages, sm, sm_config, tier, autocompact_threshold_tokens) {
+            SmCompactOutcome::Success(result) => {
+                eprintln!(
+                    "[compact] SM sync compaction succeeded ({} → {} messages)",
+                    messages.len(),
+                    result.messages.len()
+                );
+                return result;
+            }
+            SmCompactOutcome::Fallback(reason) => {
+                eprintln!("[compact] SM sync fallback: {:?}", reason);
+            }
+        }
+    }
+
+    // Fall back to pure truncation (Phase 1 behavior)
+    super::compaction::compact_tiered_with_result(
+        messages,
+        budget_chars,
+        keep_chars,
+        tier,
+        keep_recent_turns,
+    )
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------

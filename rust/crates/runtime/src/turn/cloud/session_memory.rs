@@ -239,6 +239,37 @@ impl SessionMemory {
         // Simple estimate: ~4 chars per token for ASCII, ~1.5 tokens per CJK char
         crate::prompts::estimate_str_tokens(&self.content)
     }
+
+    /// Load or create Session Memory for a given session ID.
+    ///
+    /// This is a convenience method for server-side integration.
+    /// Returns `Some(memory)` if the memory exists and has meaningful content,
+    /// or `None` if the memory doesn't exist or only has template content.
+    pub fn load_or_create_for_session(session_id: &str) -> Option<Self> {
+        // Use a standard location based on session_id
+        // In production this would be under the session's working directory
+        let session_dir = std::env::var("MO_SESSION_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| {
+                std::env::var("HOME")
+                    .map(|h| {
+                        PathBuf::from(h)
+                            .join(".mo-agent")
+                            .join("sessions")
+                            .join(session_id)
+                    })
+                    .unwrap_or_else(|_| PathBuf::from("/tmp").join("mo-sessions").join(session_id))
+            });
+
+        let mut memory = Self::new(session_dir, SessionMemoryConfig::default());
+
+        // Try to load existing memory
+        if memory.load().is_ok() && memory.has_content() {
+            Some(memory)
+        } else {
+            None
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
