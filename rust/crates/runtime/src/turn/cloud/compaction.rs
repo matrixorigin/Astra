@@ -41,6 +41,13 @@ pub struct CompactBoundary {
     /// Files that were recently accessed and may be restored as attachments.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub recent_files: Vec<String>,
+    /// Discovered tools carried across compaction/replay boundaries.
+    ///
+    /// This is the runtime-native equivalent of Claude Code's discovered-tool set.
+    /// These names can be used by the tool selection layer to re-materialize
+    /// schemas even if the current tool index no longer lists them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub discovered_tools: Vec<String>,
 }
 
 impl CompactBoundary {
@@ -55,6 +62,7 @@ impl CompactBoundary {
             last_pre_compact_uuid: None,
             summary: None,
             recent_files: Vec::new(),
+            discovered_tools: Vec::new(),
         }
     }
 
@@ -80,6 +88,12 @@ impl CompactBoundary {
     /// Set recent files for potential attachment restoration.
     pub fn with_recent_files(mut self, files: Vec<String>) -> Self {
         self.recent_files = files;
+        self
+    }
+
+    /// Carry forward discovered tools across the compaction boundary.
+    pub fn with_discovered_tools(mut self, tools: Vec<String>) -> Self {
+        self.discovered_tools = tools;
         self
     }
 
@@ -271,15 +285,40 @@ pub fn compact_tiered_with_result(
     }
 
     let messages_after = compacted.len();
+    let carried_discovered = extract_discovered_tools(messages);
     let boundary = CompactBoundary::new(CompactTrigger::Auto, tier)
         .with_pre_metrics(0, messages_before)
-        .with_post_count(messages_after);
+        .with_post_count(messages_after)
+        .with_discovered_tools(carried_discovered);
 
     CompactResult {
         messages: compacted,
         boundary: Some(boundary),
         tier,
     }
+}
+
+/// Extract discovered tool names carried by prior compact boundaries.
+///
+/// Scans messages for `compact_metadata.discovered_tools` and unions them.
+fn extract_discovered_tools(messages: &[Value]) -> Vec<String> {
+    let mut set = std::collections::BTreeSet::<String>::new();
+    for m in messages {
+        let tools = m
+            .get("compact_metadata")
+            .and_then(|cm| cm.get("discovered_tools"))
+            .and_then(Value::as_array);
+        if let Some(arr) = tools {
+            for t in arr {
+                if let Some(s) = t.as_str() {
+                    if !s.is_empty() {
+                        set.insert(s.to_string());
+                    }
+                }
+            }
+        }
+    }
+    set.into_iter().collect()
 }
 
 /// Async compaction that optionally generates an LLM summary.
@@ -489,7 +528,8 @@ mod tests {
             .with_pre_metrics(5000, 8)
             .with_post_count(6)
             .with_last_uuid("abc-123")
-            .with_recent_files(vec!["src/lib.rs".into()]);
+            .with_recent_files(vec!["src/lib.rs".into()])
+            .with_discovered_tools(vec!["mcp__k8s_logs".into(), "mcp__special".into()]);
         let json = serde_json::to_string(&boundary).unwrap();
         let restored: CompactBoundary = serde_json::from_str(&json).unwrap();
         assert_eq!(restored.tier, CompactionTier::TrimSchemas);
@@ -499,6 +539,29 @@ mod tests {
         assert_eq!(restored.messages_after, 6);
         assert_eq!(restored.last_pre_compact_uuid.as_deref(), Some("abc-123"));
         assert_eq!(restored.recent_files, vec!["src/lib.rs"]);
+        assert_eq!(
+            restored.discovered_tools,
+            vec!["mcp__k8s_logs".to_string(), "mcp__special".to_string()]
+        );
+    }
+
+    #[test]
+    fn compaction_carries_discovered_tools_into_new_boundary() {
+        let prior_boundary = CompactBoundary::new(CompactTrigger::Auto, CompactionTier::TrimSchemas)
+            .with_pre_metrics(0, 2)
+            .with_post_count(2)
+            .with_discovered_tools(vec!["mcp__k8s_logs".into()]);
+        let msgs = vec![
+            prior_boundary.to_system_message(),
+            tool(&"a".repeat(5000)),
+            tool(&"b".repeat(100)),
+        ];
+        let result = compact_tiered_with_result(&msgs, 50, 2000, CompactionTier::CompactHistory, 4);
+        let boundary = result.boundary.expect("should have boundary");
+        assert!(
+            boundary.discovered_tools.contains(&"mcp__k8s_logs".into()),
+            "new boundary should carry forward discovered tools"
+        );
     }
 
     #[test]
