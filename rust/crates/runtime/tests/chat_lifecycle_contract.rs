@@ -408,10 +408,7 @@ async fn response_to_string(response: Response<body::Body>) -> String {
 }
 
 fn parse_sse_events(body: &str) -> Vec<serde_json::Value> {
-    body.lines()
-        .filter_map(|line| line.strip_prefix("data: "))
-        .map(|line| serde_json::from_str(line).unwrap())
-        .collect()
+    mo_agent_runtime::turn::sse_data_lines::parse_sse_data_json_events(body)
 }
 
 fn assert_sse_headers(headers: &HeaderMap, expected: &HashMap<String, String>) {

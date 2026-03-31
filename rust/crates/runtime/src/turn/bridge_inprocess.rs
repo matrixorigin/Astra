@@ -22,6 +22,7 @@ use crate::{
     TurnHookDbWriter, TurnObserverWorker, TurnReflectionLessonWriter, TurnReflectionStateStore,
     TurnSessionActivityWriter, TurnToolEventPersistPlan, TurnToolEventRecord, TurnToolEventWriter,
     build_explain_event, build_stream_error_event, prompts,
+    turn::sse_data_lines::{drain_sse_data_lines, finish_sse_data_buffer},
     turn::tool_schema_prune::prune_tool_schemas,
     turn::cloud_tool_delivery::{
         cloud_tool_requires_approval_for_delivery, sse_maps_through_tool_request,
@@ -77,18 +78,20 @@ fn parse_sse_chunks(
         while let Some(chunk) = stream.next().await {
             let Ok(bytes) = chunk else { break };
             let Ok(text) = std::str::from_utf8(&bytes) else { continue };
-            buf.push_str(text);
-            while let Some(newline) = buf.find('\n') {
-                let line = buf.drain(..=newline).collect::<String>();
-                let line = line.trim();
-                if let Some(data) = line.strip_prefix("data: ") {
-                    let data = data.trim();
-                    if data == "[DONE]" { return; }
-                    if let Ok(v) = serde_json::from_str::<Value>(data) {
-                        yield v;
-                    }
-                }
+            let d = drain_sse_data_lines(&mut buf, text);
+            for v in d.events {
+                yield v;
             }
+            if d.stream_finished {
+                return;
+            }
+        }
+        let fin = finish_sse_data_buffer(&mut buf);
+        for v in fin.events {
+            yield v;
+        }
+        if fin.stream_finished {
+            return;
         }
     }
 }
