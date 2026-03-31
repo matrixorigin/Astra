@@ -15,8 +15,9 @@ use crate::edge::MO_EDGE_ID_HEADER;
 use crate::error::ThinClientError;
 use crate::paths;
 use crate::protocol::{
-    ApprovalRespondRequest, ChatStreamRequest, SessionCreateRequest, SessionUpdateRequest,
-    StreamEvent, ToolResultRequest,
+    ApprovalRespondRequest, ChatStreamRequest, EdgeHeartbeatRequest, EdgeRegisterRequest,
+    SessionCreateRequest, SessionUpdateRequest, StreamEvent, TaskLeaseMutationRequest,
+    ToolResultRequest,
 };
 use crate::sse::SseParser;
 
@@ -959,12 +960,13 @@ impl ThinClient {
         Self::json_or_error(resp).await
     }
 
-    /// `POST /agents/edge` — register edge capabilities (Phase 3 stub; server echoes JSON).
+    /// `POST /agents/edge` — persist edge registry row (JWT). `edge_transport_id` → [`MO_EDGE_ID_HEADER`]
+    /// (transport instance); `body.edge_agent_id` is the logical agent id (often the same string).
     pub async fn post_agents_edge_register(
         &self,
         bearer_override: Option<&str>,
-        edge_executor_id: Option<&str>,
-        body: &Value,
+        edge_transport_id: Option<&str>,
+        body: &EdgeRegisterRequest,
     ) -> Result<Value, ThinClientError> {
         let url = self.url(paths::AGENTS_EDGE)?;
         let mut req = self
@@ -972,7 +974,7 @@ impl ThinClient {
             .post(url)
             .headers(self.auth_headers_for(bearer_override))
             .json(body);
-        if let Some(id) = edge_executor_id
+        if let Some(id) = edge_transport_id
             && let Ok(v) = HeaderValue::from_str(id)
         {
             req = req.header(MO_EDGE_ID_HEADER, v);
@@ -981,12 +983,12 @@ impl ThinClient {
         Self::json_or_error(resp).await
     }
 
-    /// `POST /agents/edge/heartbeat` — liveness ping (Phase 3 stub).
+    /// `POST /agents/edge/heartbeat` — liveness ping (must register first).
     pub async fn post_agents_edge_heartbeat(
         &self,
         bearer_override: Option<&str>,
-        edge_executor_id: Option<&str>,
-        body: &Value,
+        edge_transport_id: Option<&str>,
+        body: &EdgeHeartbeatRequest,
     ) -> Result<Value, ThinClientError> {
         let url = self.url(paths::AGENTS_EDGE_HEARTBEAT)?;
         let mut req = self
@@ -994,7 +996,92 @@ impl ThinClient {
             .post(url)
             .headers(self.auth_headers_for(bearer_override))
             .json(body);
-        if let Some(id) = edge_executor_id
+        if let Some(id) = edge_transport_id
+            && let Ok(v) = HeaderValue::from_str(id)
+        {
+            req = req.header(MO_EDGE_ID_HEADER, v);
+        }
+        let resp = req.send().await?;
+        Self::json_or_error(resp).await
+    }
+
+    /// `GET /tasks/{task_id}/lease` — current lease metadata.
+    pub async fn get_task_lease(
+        &self,
+        bearer_override: Option<&str>,
+        task_id: &str,
+    ) -> Result<Value, ThinClientError> {
+        let url = self.url(&paths::task_lease(task_id))?;
+        let resp = self
+            .http
+            .get(url)
+            .headers(self.auth_headers_for(bearer_override))
+            .send()
+            .await?;
+        Self::json_or_error(resp).await
+    }
+
+    /// `POST /tasks/{task_id}/lease/claim`
+    pub async fn post_task_lease_claim(
+        &self,
+        bearer_override: Option<&str>,
+        edge_transport_id: Option<&str>,
+        task_id: &str,
+        body: &TaskLeaseMutationRequest,
+    ) -> Result<Value, ThinClientError> {
+        let url = self.url(&paths::task_lease_claim(task_id))?;
+        let mut req = self
+            .http
+            .post(url)
+            .headers(self.auth_headers_for(bearer_override))
+            .json(body);
+        if let Some(id) = edge_transport_id
+            && let Ok(v) = HeaderValue::from_str(id)
+        {
+            req = req.header(MO_EDGE_ID_HEADER, v);
+        }
+        let resp = req.send().await?;
+        Self::json_or_error(resp).await
+    }
+
+    /// `POST /tasks/{task_id}/lease/release`
+    pub async fn post_task_lease_release(
+        &self,
+        bearer_override: Option<&str>,
+        edge_transport_id: Option<&str>,
+        task_id: &str,
+        body: &TaskLeaseMutationRequest,
+    ) -> Result<Value, ThinClientError> {
+        let url = self.url(&paths::task_lease_release(task_id))?;
+        let mut req = self
+            .http
+            .post(url)
+            .headers(self.auth_headers_for(bearer_override))
+            .json(body);
+        if let Some(id) = edge_transport_id
+            && let Ok(v) = HeaderValue::from_str(id)
+        {
+            req = req.header(MO_EDGE_ID_HEADER, v);
+        }
+        let resp = req.send().await?;
+        Self::json_or_error(resp).await
+    }
+
+    /// `POST /tasks/{task_id}/lease/renew`
+    pub async fn post_task_lease_renew(
+        &self,
+        bearer_override: Option<&str>,
+        edge_transport_id: Option<&str>,
+        task_id: &str,
+        body: &TaskLeaseMutationRequest,
+    ) -> Result<Value, ThinClientError> {
+        let url = self.url(&paths::task_lease_renew(task_id))?;
+        let mut req = self
+            .http
+            .post(url)
+            .headers(self.auth_headers_for(bearer_override))
+            .json(body);
+        if let Some(id) = edge_transport_id
             && let Ok(v) = HeaderValue::from_str(id)
         {
             req = req.header(MO_EDGE_ID_HEADER, v);
@@ -1130,5 +1217,53 @@ mod tests {
             .unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("401"), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn wiremock_agents_edge_register_typed_body() {
+        let srv = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/agents/edge"))
+            .and(header("authorization", "Bearer t"))
+            .and(header("x-mo-edge-id", "transport-1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
+            .mount(&srv)
+            .await;
+
+        let client = ThinClient::new(&srv.uri(), None).unwrap();
+        let body = EdgeRegisterRequest {
+            edge_agent_id: "agent-logical".into(),
+            hostname: Some("host-a".into()),
+            worktree_path: None,
+            capabilities: None,
+        };
+        let v = client
+            .post_agents_edge_register(Some("t"), Some("transport-1"), &body)
+            .await
+            .unwrap();
+        assert_eq!(v["ok"], true);
+    }
+
+    #[tokio::test]
+    async fn wiremock_task_lease_claim_sends_edge_header() {
+        let srv = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/tasks/t1/lease/claim"))
+            .and(header("authorization", "Bearer t"))
+            .and(header("x-mo-edge-id", "edge-xyz"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"status":"granted"})))
+            .mount(&srv)
+            .await;
+
+        let client = ThinClient::new(&srv.uri(), None).unwrap();
+        let body = TaskLeaseMutationRequest {
+            edge_agent_id: "edge-xyz".into(),
+            ttl_sec: Some(120),
+        };
+        let v = client
+            .post_task_lease_claim(Some("t"), Some("edge-xyz"), "t1", &body)
+            .await
+            .unwrap();
+        assert_eq!(v["status"], "granted");
     }
 }

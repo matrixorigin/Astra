@@ -617,9 +617,9 @@ Shared crate: `rust/crates/mo-thin-client` (dependency of `mo-agent-cli` and any
 | Layer | Module / type | Role |
 |-------|----------------|------|
 | Paths | [`paths.rs`](../../rust/crates/mo-thin-client/src/paths.rs) | Canonical URL constants and `session` / `task` / `context_capture` helpers — keep in sync with `runtime/src/server/router_builder.rs`. |
-| Bodies | [`protocol.rs`](../../rust/crates/mo-thin-client/src/protocol.rs) | `ChatStreamRequest` (includes §5.5 `edge_executor_id`, `capabilities`), `ToolResultRequest`, `ApprovalRespondRequest`, `StreamEvent`, session DTOs. |
-| Light edge | [`edge.rs`](../../rust/crates/mo-thin-client/src/edge.rs) | §5.5.2: `advertise_executor`, `builtin_capability_preset`, `MO_EDGE_ID_HEADER`. |
-| Transport | [`ThinClient`](../../rust/crates/mo-thin-client/src/client.rs) | `reqwest`-based HTTP + SSE (`chat_stream` / `post_chat_turn`), auth, sessions, skills, memory, tasks, context snapshots, `get_url` for off-origin probes (e.g. Memoria health). |
+| Bodies | [`protocol.rs`](../../rust/crates/mo-thin-client/src/protocol.rs) | `ChatStreamRequest` (§5.5 `edge_executor_id`, `capabilities`), `ToolResultRequest`, `ApprovalRespondRequest`, `EdgeRegisterRequest`, `EdgeHeartbeatRequest`, `TaskLeaseMutationRequest`, `StreamEvent`, session DTOs. |
+| Light edge | [`edge.rs`](../../rust/crates/mo-thin-client/src/edge.rs) | §5.5.2: `advertise_executor`, `builtin_capability_preset`, `edge_register_with_capabilities`, `MO_EDGE_ID_HEADER`. |
+| Transport | [`ThinClient`](../../rust/crates/mo-thin-client/src/client.rs) | `reqwest`-based HTTP + SSE (`chat_stream` / `post_chat_turn`), auth, sessions, skills, memory, tasks (incl. lease helpers), context snapshots, `get_url` for off-origin probes (e.g. Memoria health). |
 | Admin CLI | [`mo-admin-cli`](../../rust/crates/mo-admin/) | Same crate: **only** [`ThinClient`](../../rust/crates/mo-thin-client/src/client.rs) for server calls (no standalone `reqwest` client). |
 
 **Chat endpoints (two surfaces, same SSE framing):**
@@ -627,9 +627,9 @@ Shared crate: `rust/crates/mo-thin-client` (dependency of `mo-agent-cli` and any
 - **`POST /chat/stream`** — preferred for typed streaming; body is [`ChatStreamRequest`](../../rust/crates/mo-thin-client/src/protocol.rs). Use `ThinClient::chat_stream` / `chat_stream_collect`.
 - **`POST /chat/turn`** — used by the current CLI agentic loop (tools, retries); same `Accept: text/event-stream`, JSON body shaped like the server’s chat-turn handler. Use `ThinClient::post_chat_turn` / `post_chat_turn_retry_429`.
 
-**§5.5 callbacks** — `mo-agent-server` exposes `POST /tools/result`, `POST /approval/respond` (JWT + ledger in `AppState::edge_callback_ledger`; bridge correlation is future work). `POST /agents/edge` and `POST /agents/edge/heartbeat` are Phase 3 stubs. [`ThinClient`](../../rust/crates/mo-thin-client/src/client.rs): `post_tool_result`, `post_approval`, `post_agents_edge_register`, `post_agents_edge_heartbeat`.
+**§5.5 callbacks** — `mo-agent-server` exposes `POST /tools/result`, `POST /approval/respond` (JWT + `AppState::edge_callback_ledger`). **Registry**: `POST /agents/edge` and `POST /agents/edge/heartbeat` persist `edge_agent_registry` (typed bodies in `mo-thin-client`). **Task leases**: `GET /tasks/{id}/lease`, `POST .../lease/claim|release|renew` (JWT + `X-Mo-Edge-Id`). [`ThinClient`](../../rust/crates/mo-thin-client/src/client.rs): `post_tool_result`, `post_approval`, `post_agents_edge_register`, `post_agents_edge_heartbeat`, `get_task_lease`, `post_task_lease_claim` / `release` / `renew`.
 
-**Server-aligned additions (not all listed in the prose above):** `GET/POST /tasks`, `PUT /tasks/{id}/status`, `GET /tasks/{id}/progress`, `GET/POST /context`, `GET /context/{id}`, `POST /memory/retrieve`, `POST /chat/route` — path constants and `ThinClient` helpers live alongside the rest in `paths.rs` / `client.rs`.
+**Server-aligned additions (not all listed in the prose above):** `GET/POST /tasks`, task lease paths above, `PUT /tasks/{id}/status`, `GET /tasks/{id}/progress`, `GET/POST /context`, `GET /context/{id}`, `POST /memory/retrieve`, `POST /chat/route` — path helpers in [`paths.rs`](../../rust/crates/mo-thin-client/src/paths.rs) and `ThinClient` in `client.rs`.
 
 #### 5.5.2 Lightweight edge executor
 
@@ -641,6 +641,7 @@ The **edge** tier is intentionally **thin**: it is not a second copy of the cogn
 | Parse [`StreamEvent`](../../rust/crates/mo-thin-client/src/protocol.rs); on `tool_request`, run **local** tools (bash, fs, git, tree-sitter, …) | `SyncOrchestrator`, MatrixOne pool, `IngestionSender`, session journal |
 | `POST /tools/result` with [`ToolResultRequest`](../../rust/crates/mo-thin-client/src/protocol.rs) + `X-Mo-Edge-Id` | EntityGraph, PatternLibrary, progressive calibration |
 | Optional: `POST /approval/respond` if the UX is on the same machine | Cross-session learning merge |
+| Optional: `POST /agents/edge` (+ heartbeat) with [`EdgeRegisterRequest`](../../rust/crates/mo-thin-client/src/protocol.rs); task lease mutations with [`TaskLeaseMutationRequest`](../../rust/crates/mo-thin-client/src/protocol.rs) for multi-agent coordination | `SyncOrchestrator` / MatrixOne pool (server-side) |
 
 **Dependency budget**: `mo-thin-client` (+ serde / async runtime) and a **local tool runner** crate or embedded module. **Must not** depend on `mo-agent` (CLI), `runtime` pipeline, or `services` — otherwise the edge stops being deployable as a small sidecar (CI runner, IDE helper, headless worker).
 
@@ -649,7 +650,7 @@ The **edge** tier is intentionally **thin**: it is not a second copy of the cogn
 - Rust: [`advertise_executor`](../../rust/crates/mo-thin-client/src/edge.rs) on [`ChatStreamRequest`](../../rust/crates/mo-thin-client/src/protocol.rs) sets `edge_executor_id` and, if empty, fills [`builtin_capability_preset`](../../rust/crates/mo-thin-client/src/edge.rs) (`bash`, `fs`, `git`, `code_intel`).
 - Header constant: [`MO_EDGE_ID_HEADER`](../../rust/crates/mo-thin-client/src/edge.rs) (`X-Mo-Edge-Id`) — used by [`ThinClient::post_tool_result`](../../rust/crates/mo-thin-client/src/client.rs).
 
-**Registry (stub)**: [`paths::AGENTS_EDGE`](../../rust/crates/mo-thin-client/src/paths.rs) / [`AGENTS_EDGE_HEARTBEAT`](../../rust/crates/mo-thin-client/src/paths.rs) are implemented as authenticated JSON echo endpoints until persistence + heartbeat TTL land in Phase 3.
+**Registry**: [`paths::AGENTS_EDGE`](../../rust/crates/mo-thin-client/src/paths.rs) / [`AGENTS_EDGE_HEARTBEAT`](../../rust/crates/mo-thin-client/src/paths.rs) call MatrixOne `edge_agent_registry` (after JWT). Use the same string for `body.edge_agent_id` and (typically) `X-Mo-Edge-Id` unless you split logical agent vs transport instance.
 
 **Event loop (conceptual)**:
 

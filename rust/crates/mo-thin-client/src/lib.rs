@@ -20,8 +20,11 @@ pub use client::ThinClient;
 pub use error::ThinClientError;
 /// SSE / buffered HTTP response from [`ThinClient::post_chat_turn`] (transport type for consumers like CLI stream rendering).
 pub use reqwest::Response as HttpResponse;
-pub use edge::{advertise_executor, builtin_capability_preset, MO_EDGE_ID_HEADER};
+pub use edge::{
+    advertise_executor, builtin_capability_preset, edge_register_with_capabilities, MO_EDGE_ID_HEADER,
+};
 pub use protocol::{
     classify_stream_event, ApprovalDecision, ApprovalRespondRequest, ChatStreamRequest,
-    SessionCreateRequest, SessionUpdateRequest, StreamEvent, ToolResultRequest,
+    EdgeHeartbeatRequest, EdgeRegisterRequest, SessionCreateRequest, SessionUpdateRequest,
+    StreamEvent, TaskLeaseMutationRequest, ToolResultRequest,
 };

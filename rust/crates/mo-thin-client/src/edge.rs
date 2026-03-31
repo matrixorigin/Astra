@@ -3,7 +3,7 @@
 //! An edge process should depend on [`crate::ThinClient`] and local tool execution, not on
 //! `mo-agent` / `runtime` / cognitive pipelines.
 
-use crate::protocol::ChatStreamRequest;
+use crate::protocol::{ChatStreamRequest, EdgeRegisterRequest};
 
 /// HTTP header matching design doc §5.5 (`POST /tools/result`).
 pub const MO_EDGE_ID_HEADER: &str = "X-Mo-Edge-Id";
@@ -29,6 +29,13 @@ pub fn advertise_executor(req: &mut ChatStreamRequest, executor_id: impl Into<St
     }
 }
 
+/// [`EdgeRegisterRequest`] with `capabilities` set to [`builtin_capability_preset`] as JSON (for `POST /agents/edge`).
+pub fn edge_register_with_capabilities(executor_id: impl Into<String>) -> EdgeRegisterRequest {
+    let mut r = EdgeRegisterRequest::new(executor_id);
+    r.capabilities = Some(serde_json::json!(builtin_capability_preset()));
+    r
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -47,5 +54,12 @@ mod tests {
         r.capabilities = vec!["bash".into()];
         advertise_executor(&mut r, "e1");
         assert_eq!(r.capabilities, vec!["bash"]);
+    }
+
+    #[test]
+    fn edge_register_with_capabilities_json() {
+        let r = edge_register_with_capabilities("my-edge");
+        assert_eq!(r.edge_agent_id, "my-edge");
+        assert!(r.capabilities.as_ref().unwrap().is_array());
     }
 }

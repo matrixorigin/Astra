@@ -100,6 +100,43 @@ pub enum ApprovalDecision {
     AllowSession,
 }
 
+/// `POST /agents/edge` — matches server `EdgeRegisterRequest` (Phase 3 registry).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct EdgeRegisterRequest {
+    pub edge_agent_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hostname: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capabilities: Option<Value>,
+}
+
+impl EdgeRegisterRequest {
+    pub fn new(edge_agent_id: impl Into<String>) -> Self {
+        Self {
+            edge_agent_id: edge_agent_id.into(),
+            hostname: None,
+            worktree_path: None,
+            capabilities: None,
+        }
+    }
+}
+
+/// `POST /agents/edge/heartbeat`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct EdgeHeartbeatRequest {
+    pub edge_agent_id: String,
+}
+
+/// `POST /tasks/{id}/lease/{claim,release,renew}` — matches server lease handlers.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct TaskLeaseMutationRequest {
+    pub edge_agent_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttl_sec: Option<i64>,
+}
+
 /// Classified SSE JSON line (`data: …` payload). Unknown `type` values are preserved as [`StreamEvent::Other`].
 #[derive(Debug, Clone, PartialEq)]
 pub enum StreamEvent {

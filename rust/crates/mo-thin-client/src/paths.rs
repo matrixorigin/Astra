@@ -12,10 +12,10 @@ pub const TOOLS_RESULT: &str = "/tools/result";
 /// `POST` — design doc: user approval for gated tools.
 pub const APPROVAL_RESPOND: &str = "/approval/respond";
 
-/// `POST` — edge registry (design: agent / edge node registration). May 404 until server implements Phase 3.
+/// `POST` — edge registry (`edge_agent_registry` + JWT); body: [`crate::protocol::EdgeRegisterRequest`].
 pub const AGENTS_EDGE: &str = "/agents/edge";
 
-/// `POST` — edge heartbeat / liveness (paired with [`AGENTS_EDGE`]). May 404 until implemented.
+/// `POST` — edge heartbeat / liveness (paired with [`AGENTS_EDGE`]).
 pub const AGENTS_EDGE_HEARTBEAT: &str = "/agents/edge/heartbeat";
 
 pub const SESSIONS: &str = "/sessions";
@@ -98,6 +98,27 @@ pub fn task_progress(id: &str) -> String {
 #[inline]
 pub fn task_status(id: &str) -> String {
     format!("/tasks/{id}/status")
+}
+
+/// `GET /tasks/{id}/lease` — current lease row (or null).
+#[inline]
+pub fn task_lease(id: &str) -> String {
+    format!("/tasks/{id}/lease")
+}
+
+#[inline]
+pub fn task_lease_claim(id: &str) -> String {
+    format!("/tasks/{id}/lease/claim")
+}
+
+#[inline]
+pub fn task_lease_release(id: &str) -> String {
+    format!("/tasks/{id}/lease/release")
+}
+
+#[inline]
+pub fn task_lease_renew(id: &str) -> String {
+    format!("/tasks/{id}/lease/renew")
 }
 
 /// Context snapshots (`GET/POST /context`, `GET /context/{id}`).
