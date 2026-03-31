@@ -235,6 +235,8 @@ pub use turn::{
             SmCompactOutcome, SmFallbackReason, compact_with_session_memory_fallback,
             session_memory_compact,
         },
+        sm_extract::{build_extraction_prompt, parse_extraction_response},
+        sm_service::{SessionMemoryService, estimate_messages_tokens, get_last_message_id},
         summary::{HttpSummaryClient, LlmConnParams, SummaryLlmClient, SummaryResponse},
     },
     complete::build_turn_complete_event,
