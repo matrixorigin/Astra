@@ -15,7 +15,6 @@ use mo_agent_runtime::{
     tool_selector::ToolSelector,
     turn::agentic_headless_round::HeadlessStderrStyle,
     turn::agentic_loop_host::{AgenticLoopHost, AgenticLoopState, HostTurnResult},
-    turn::sse_stream_host::EdgeToolExecResult,
 };
 use serde_json::Value;
 
@@ -104,24 +103,10 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
         })
         .await?;
 
-        // Convert CLI TurnResult → runtime HostTurnResult
-        let edge_tool_round: Vec<EdgeToolExecResult> = turn_result
-            .edge_tool_round
-            .iter()
-            .map(|e| EdgeToolExecResult {
-                request_id: e.request_id.clone(),
-                tool: e.tool.clone(),
-                args: e.args.clone(),
-                output: e.output.clone(),
-                status: "ok".to_string(),
-                duration_ms: 0,
-            })
-            .collect();
-
         Ok(HostTurnResult {
             accum: turn_result.core,
             ttft_ms: turn_result.ttft_ms,
-            edge_tool_round,
+            edge_tool_round: turn_result.edge_tool_round,
         })
     }
 

@@ -15,34 +15,6 @@ use std::ops::{Deref, DerefMut};
 
 pub use mo_agent_runtime::turn::chat_turn_sse_dispatch::ChatTurnEdgePending;
 
-/// One tool executed from SSE `tool_request` (ordering preserved for synthetic `tool_calls`).
-#[derive(Debug, Clone)]
-pub(super) struct EdgeToolRoundEntry {
-    pub request_id: String,
-    pub tool: String,
-    pub args: serde_json::Value,
-    pub output: String,
-}
-
-impl mo_agent_runtime::turn::headless_tool_assembly::EdgeToolRoundRow for EdgeToolRoundEntry {
-    fn tool_name(&self) -> &str {
-        &self.tool
-    }
-    fn tool_args(&self) -> &serde_json::Value {
-        &self.args
-    }
-    fn tool_output(&self) -> &str {
-        &self.output
-    }
-    fn assistant_tool_call_id(&self, index: usize) -> String {
-        if self.request_id.is_empty() {
-            format!("edge-{index}")
-        } else {
-            self.request_id.clone()
-        }
-    }
-}
-
 /// When set, SSE `tool_request` / `approval_required` are handled and posted to the cloud API.
 pub(super) struct EdgeSseContext<'a> {
     pub api: &'a mo_thin_client::ThinClient,
@@ -74,7 +46,7 @@ struct CliSseStreamHost<'a> {
     perm_manager: Option<&'a mut crate::permission_manager::PermissionManager>,
     render: StreamRenderState,
     /// Ordered tool executions from this SSE stream.
-    pub edge_tool_round: Vec<EdgeToolRoundEntry>,
+    pub edge_tool_round: Vec<EdgeToolExecResult>,
 }
 
 impl<'a> CliSseStreamHost<'a> {
@@ -136,22 +108,24 @@ impl SseStreamHost for CliSseStreamHost<'_> {
         } else {
             "Permission denied".to_string()
         };
-        self.edge_tool_round.push(EdgeToolRoundEntry {
-            request_id: request_id.to_string(),
-            tool: tool.to_string(),
-            args: args.clone(),
-            output: output.clone(),
-        });
         let status = if !allowed {
             "error"
         } else {
             cloud_tool_result_status_label(&output)
         };
         let duration_ms = start.elapsed().as_millis() as u64;
+        self.edge_tool_round.push(EdgeToolExecResult {
+            request_id: request_id.to_string(),
+            tool: tool.to_string(),
+            args: args.clone(),
+            output: output.clone(),
+            status: status.to_string(),
+            duration_ms,
+        });
         let body = mo_thin_client::ToolResultRequest {
             request_id: request_id.to_string(),
             status: status.to_string(),
-            output: Some(output.clone()),
+            output: Some(output),
             duration_ms: Some(duration_ms),
         };
         if let Err(e) = self
@@ -162,14 +136,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
         {
             eprintln!("{}", edge_sse_post_tool_result_fail_line(e).yellow());
         }
-        EdgeToolExecResult {
-            request_id: request_id.to_string(),
-            tool: tool.to_string(),
-            args: args.clone(),
-            output,
-            status: status.to_string(),
-            duration_ms,
-        }
+        self.edge_tool_round.last().unwrap().clone()
     }
 
     async fn resolve_approval(
@@ -268,7 +235,7 @@ pub(super) struct TurnResult {
     /// Time to first token in milliseconds (streaming latency).
     pub(super) ttft_ms: Option<u64>,
     /// Ordered executions from this SSE stream (for rounds without legacy `tool_call` events).
-    pub(super) edge_tool_round: Vec<EdgeToolRoundEntry>,
+    pub(super) edge_tool_round: Vec<EdgeToolExecResult>,
 }
 
 impl Deref for TurnResult {

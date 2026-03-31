@@ -1,8 +1,8 @@
 //! Apply one `/chat/turn` stream outcome to agentic loop state (usage, response guards, factual retry).
 //!
 //! Hosts (CLI `stream_chat_sse`, future headless clients) build [`AgenticTurnStreamSnapshot`] and pass
-//! edge-tool names via `edge_round_len` + an index closure (`usize` → owned `String`) so this crate
-//! stays free of `EdgeToolRoundEntry` and closure signatures stay lifetime-simple.
+//! edge-tool names via `edge_round_len` + an index closure (`usize` → owned `String`) so closure
+//! signatures stay lifetime-simple.
 
 use std::collections::HashSet;
 
