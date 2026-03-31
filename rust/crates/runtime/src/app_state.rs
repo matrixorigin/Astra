@@ -86,6 +86,10 @@ pub struct AppState {
     /// Edge §5.5 callbacks (`/tools/result`, `/approval/respond`); keys via [`crate::turn::edge_ledger`].
     pub(crate) edge_callback_ledger:
         Arc<tokio::sync::Mutex<std::collections::HashMap<String, serde_json::Value>>>,
+    /// Multi-agent profile registry — defines agent tiers, delegation rules.
+    pub(crate) agent_profile_registry: Arc<mo_agent_services::AgentProfileRegistry>,
+    /// Delegation engine — coordinates multi-agent runs.
+    pub(crate) delegation_engine: Option<Arc<crate::server::delegation_engine::DelegationEngine>>,
 }
 
 impl AppState {
@@ -159,6 +163,8 @@ impl AppState {
             edge_callback_ledger: Arc::new(tokio::sync::Mutex::new(
                 std::collections::HashMap::new(),
             )),
+            agent_profile_registry: Arc::new(mo_agent_services::AgentProfileRegistry::new()),
+            delegation_engine: None,
         }
     }
 
@@ -527,6 +533,34 @@ impl AppState {
     ) -> Self {
         self.matrix_cloud_runtime = rt;
         self
+    }
+
+    pub fn with_agent_profile_registry(
+        mut self,
+        registry: Arc<mo_agent_services::AgentProfileRegistry>,
+    ) -> Self {
+        self.agent_profile_registry = registry;
+        self
+    }
+
+    pub fn with_delegation_engine(
+        mut self,
+        engine: Arc<crate::server::delegation_engine::DelegationEngine>,
+    ) -> Self {
+        self.delegation_engine = Some(engine);
+        self
+    }
+
+    /// Access the agent profile registry.
+    pub fn agent_profile_registry(&self) -> &mo_agent_services::AgentProfileRegistry {
+        &self.agent_profile_registry
+    }
+
+    /// Access the delegation engine (if configured).
+    pub fn delegation_engine(
+        &self,
+    ) -> Option<&Arc<crate::server::delegation_engine::DelegationEngine>> {
+        self.delegation_engine.as_ref()
     }
 }
 

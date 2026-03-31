@@ -5,6 +5,7 @@ pub mod branches;
 pub mod context;
 pub mod coordination;
 pub mod data_versioning;
+pub mod edge_context;
 pub mod decisions;
 pub mod evaluation;
 pub mod event_ingestion;
@@ -51,6 +52,7 @@ pub use coordination::{
     AggregationStrategy, CoordinationPattern, DelegationRequest, DelegationResult, PipelineStage,
     aggregate_results,
 };
+pub use edge_context::{EdgeContext, EdgeProfile, EdgeSkillRef};
 pub use auth::{
     AuthLoginRequestData, AuthRefreshRequestData, AuthRegisterRequestData, AuthService,
     AuthTokenRecord, AuthUserRecord, DatabaseAdminAuditReader, DatabaseAdminAuthorizer,
