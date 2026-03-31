@@ -65,6 +65,36 @@ pub fn merge_active_skills_into_edge_profile(payload: &mut Value, active_skills:
     }
 }
 
+/// Set `edge_profile.skill_instructions` when LLM-based skill selection produced text.
+pub fn merge_skill_instructions_into_edge_profile(payload: &mut Value, instructions: Option<&str>) {
+    let Some(text) = instructions.filter(|s| !s.is_empty()) else {
+        return;
+    };
+    if let Some(root) = payload.as_object_mut()
+        && let Some(ep) = root.get_mut("edge_profile")
+        && let Some(ep_obj) = ep.as_object_mut()
+    {
+        ep_obj.insert("skill_instructions".to_string(), Value::String(text.to_string()));
+    }
+}
+
+/// Dynamic tool schemas for this turn (`edge_tools`).
+pub fn set_payload_edge_tools(payload: &mut Value, schemas: Vec<Value>) {
+    if let Some(obj) = payload.as_object_mut() {
+        obj.insert("edge_tools".to_string(), Value::Array(schemas));
+    }
+}
+
+/// Callback-style `tool_results` array (only set when non-empty, matching historical CLI behavior).
+pub fn set_payload_tool_results_if_non_empty(payload: &mut Value, rows: &[Value]) {
+    if rows.is_empty() {
+        return;
+    }
+    if let Some(obj) = payload.as_object_mut() {
+        obj.insert("tool_results".to_string(), Value::Array(rows.to_vec()));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -125,5 +155,40 @@ mod tests {
         let mut p = json!({ "edge_profile": {} });
         merge_active_skills_into_edge_profile(&mut p, &[]);
         assert!(p["edge_profile"].as_object().unwrap().get("active_skills").is_none());
+    }
+
+    #[test]
+    fn merge_skill_instructions_into_edge_profile_inserts() {
+        let mut p = json!({ "edge_profile": {} });
+        merge_skill_instructions_into_edge_profile(&mut p, Some("do the thing"));
+        assert_eq!(p["edge_profile"]["skill_instructions"], "do the thing");
+    }
+
+    #[test]
+    fn merge_skill_instructions_skips_none_and_empty() {
+        let mut p = json!({ "edge_profile": {} });
+        merge_skill_instructions_into_edge_profile(&mut p, None);
+        merge_skill_instructions_into_edge_profile(&mut p, Some(""));
+        assert!(p["edge_profile"]
+            .as_object()
+            .unwrap()
+            .get("skill_instructions")
+            .is_none());
+    }
+
+    #[test]
+    fn set_payload_edge_tools_and_tool_results() {
+        let mut p = json!({});
+        set_payload_edge_tools(&mut p, vec![json!({"fn": "t1"})]);
+        assert_eq!(p["edge_tools"], json!([{"fn": "t1"}]));
+        set_payload_tool_results_if_non_empty(&mut p, &[json!({"tool_call_id": "1"})]);
+        assert_eq!(p["tool_results"], json!([{"tool_call_id": "1"}]));
+    }
+
+    #[test]
+    fn set_payload_tool_results_no_op_when_empty() {
+        let mut p = json!({});
+        set_payload_tool_results_if_non_empty(&mut p, &[]);
+        assert!(p.get("tool_results").is_none());
     }
 }

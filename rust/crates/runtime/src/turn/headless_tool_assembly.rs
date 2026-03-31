@@ -159,6 +159,26 @@ pub fn openai_assistant_with_tool_calls_message<T: EdgeToolRoundRow>(
     msg
 }
 
+/// OpenAI `role: "tool"` message plus matching `/chat` `tool_results` row (`content` / `result` identical).
+#[must_use]
+pub fn openai_tool_roundtrip_values(
+    tool_call_id: &str,
+    tool_name: &str,
+    content: &str,
+) -> (Value, Value) {
+    let msg = json!({
+        "role": "tool",
+        "tool_call_id": tool_call_id,
+        "content": content,
+    });
+    let tr = json!({
+        "tool_call_id": tool_call_id,
+        "name": tool_name,
+        "result": content,
+    });
+    (msg, tr)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -393,5 +413,16 @@ mod tests {
             "think",
         );
         assert_eq!(msg["reasoning_content"], "think");
+    }
+
+    #[test]
+    fn openai_tool_roundtrip_values_matches_headless_shape() {
+        let (m, tr) = openai_tool_roundtrip_values("call-1", "read_file", "ok");
+        assert_eq!(m["role"], "tool");
+        assert_eq!(m["tool_call_id"], "call-1");
+        assert_eq!(m["content"], "ok");
+        assert_eq!(tr["tool_call_id"], "call-1");
+        assert_eq!(tr["name"], "read_file");
+        assert_eq!(tr["result"], "ok");
     }
 }

@@ -20,7 +20,9 @@ use mo_agent_runtime::{
     turn::chat_history_openai::openai_messages_from_repl_history,
     turn::chat_turn_edge_profile::{detect_active_system_skills_in_message, read_git_branch_abbrev},
     turn::chat_turn_payload::{
-        chat_turn_base_payload, merge_active_skills_into_edge_profile, ChatTurnBasePayloadInput,
+        chat_turn_base_payload, merge_active_skills_into_edge_profile,
+        merge_skill_instructions_into_edge_profile, set_payload_edge_tools,
+        set_payload_tool_results_if_non_empty, ChatTurnBasePayloadInput,
     },
     turn::chat_turn_heuristics::{
         extract_repos_from_memory, factual_tool_retry_message, should_force_factual_tool_retry,
@@ -28,8 +30,8 @@ use mo_agent_runtime::{
     turn::edge_prompt_context::{detect_project_languages, make_args_preview},
     turn::tool_schema_prune::{filter_tool_schemas_by_excluded_names, pin_invoked_tool_schemas},
     turn::headless_tool_assembly::{
-        openai_assistant_with_tool_calls_message, take_edge_output_for_tool_call,
-        tool_calls_for_stall_guard, CACHEABLE_TOOLS,
+        openai_assistant_with_tool_calls_message, openai_tool_roundtrip_values,
+        take_edge_output_for_tool_call, tool_calls_for_stall_guard, CACHEABLE_TOOLS,
     },
     turn::tool_result_semantics::{is_resource_limit_output, is_tool_error, tool_dedup_signature},
 };
@@ -380,10 +382,7 @@ pub(crate) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
             }
         }
         
-        // Inject skill instructions into payload if LLM selected any skills
-        if let Some(ref instructions) = skill_instructions {
-            payload["edge_profile"]["skill_instructions"] = serde_json::json!(instructions);
-        }
+        merge_skill_instructions_into_edge_profile(&mut payload, skill_instructions.as_deref());
         
         if first_selection_report.is_none() {
             first_selection_report = Some(selection_report);
@@ -405,7 +404,7 @@ pub(crate) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
         // Dynamic schema restriction: remove tools that were stall-restricted
         let final_schemas =
             filter_tool_schemas_by_excluded_names(turn_schemas, &restricted_tools);
-        payload["edge_tools"] = serde_json::Value::Array(final_schemas);
+        set_payload_edge_tools(&mut payload, final_schemas);
         if explain != ExplainMode::Off && !restricted_tools.is_empty() {
             eprintln!(
                 "{}",
@@ -437,9 +436,7 @@ pub(crate) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
                 );
             }
         }
-        if !tool_results.is_empty() {
-            payload["tool_results"] = serde_json::Value::Array(tool_results.clone());
-        }
+        set_payload_tool_results_if_non_empty(&mut payload, &tool_results);
 
         // Step recorder: mark plan phase (tool selection done, LLM call about to start)
         {
@@ -722,17 +719,10 @@ pub(crate) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
 
             let call_sig = tool_dedup_signature(&name, &args);
             if !seen_calls.insert(call_sig.clone()) {
-                let cached_tr = serde_json::json!({
-                    "tool_call_id": id,
-                    "name": name,
-                    "result": "(duplicate call — result same as previous identical call this turn)",
-                });
-                messages.push(serde_json::json!({
-                    "role": "tool",
-                    "tool_call_id": id,
-                    "content": "(duplicate call — result same as previous identical call this turn)",
-                }));
-                tool_results.push(cached_tr);
+                let dup = "(duplicate call — result same as previous identical call this turn)";
+                let (tool_msg, tr) = openai_tool_roundtrip_values(&id, &name, dup);
+                messages.push(tool_msg);
+                tool_results.push(tr);
                 tool_call_records.push(mo_agent_services::session_journal::ToolCallRecord {
                     name: name.clone(),
                     ok: true,
@@ -756,16 +746,9 @@ pub(crate) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
                 if !quiet {
                     eprintln!("{}", format!("  ↻ {name} (cached)").dim());
                 }
-                messages.push(serde_json::json!({
-                    "role": "tool",
-                    "tool_call_id": id,
-                    "content": cached_note,
-                }));
-                tool_results.push(serde_json::json!({
-                    "tool_call_id": id,
-                    "name": name,
-                    "result": cached_note,
-                }));
+                let (tool_msg, tr) = openai_tool_roundtrip_values(&id, &name, &cached_note);
+                messages.push(tool_msg);
+                tool_results.push(tr);
                 let cache_key = idem_key.cache_key();
                 step_recorder.begin_tool_with_key(&name, &id, Some(&cache_key));
                 step_recorder.record_cache_hit(&name, cached.clone());
@@ -813,16 +796,8 @@ pub(crate) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
                 if !quiet {
                     eprintln!("  {}", format!("└ {err_msg}").dim());
                 }
-                let err_tr = serde_json::json!({
-                    "tool_call_id": id,
-                    "name": name,
-                    "result": err_msg,
-                });
-                messages.push(serde_json::json!({
-                    "role": "tool",
-                    "tool_call_id": id,
-                    "content": err_msg,
-                }));
+                let (tool_msg, err_tr) = openai_tool_roundtrip_values(&id, &name, &err_msg);
+                messages.push(tool_msg);
                 tool_results.push(err_tr);
                 tool_call_records.push(mo_agent_services::session_journal::ToolCallRecord {
                     name: name.clone(),
@@ -1022,16 +997,8 @@ pub(crate) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
                 }
             }
 
-            let tr = serde_json::json!({
-                "tool_call_id": id,
-                "name": name,
-                "result": result_str,
-            });
-            messages.push(serde_json::json!({
-                "role": "tool",
-                "tool_call_id": id,
-                "content": result_str,
-            }));
+            let (tool_msg, tr) = openai_tool_roundtrip_values(&id, &name, &result_str);
+            messages.push(tool_msg);
             tool_results.push(tr);
         }
         // ── Intent drift detection ──
