@@ -33,6 +33,8 @@
 //! - **Level 2 (Instructions)**: Full SKILL.md content loaded on skill invocation
 //! - **Level 3 (Resources)**: Templates, scripts, references loaded on demand
 
+// Some types/methods are staged for runtime wiring (e.g., SkillInstruction fields, level constants);
+// keep the full API surface without warning spam during incremental integration.
 #![allow(dead_code)]
 
 use serde::{Deserialize, Serialize};

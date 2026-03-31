@@ -1084,8 +1084,21 @@ pub(super) async fn handle_memory_domain_command(
                         // User provided reason
                         ReplanReason::UserRequest
                     } else {
-                        // Auto-detect reason
-                        let failed: Vec<(&str, &str)> = vec![]; // TODO: track failed subtasks
+                        // Auto-detect reason from plan state
+                        let failed: Vec<(&str, &str)> = ps
+                            .plan
+                            .subtasks
+                            .iter()
+                            .filter(|s| {
+                                s.status == mo_agent_services::task_orchestrator::TaskStatus::Failed
+                            })
+                            .map(|s| {
+                                (
+                                    s.id.as_str(),
+                                    s.description.as_deref().unwrap_or("subtask failed"),
+                                )
+                            })
+                            .collect();
                         match detect_replan_needed(&ps.plan, state.plan_execution_rounds, &failed) {
                             Some(suggestion) => suggestion.reason,
                             None => ReplanReason::UserRequest,
