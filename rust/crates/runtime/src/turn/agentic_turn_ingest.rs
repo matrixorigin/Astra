@@ -73,6 +73,29 @@ pub enum AgenticTurnIngestOutcome {
     HasToolCalls,
 }
 
+/// Maps [`AgenticTurnIngestOutcome`] to multi-turn loop control (hosts map break/continue to their enums).
+#[derive(Debug, PartialEq, Eq)]
+pub enum AgenticIngestIterationControl {
+    Fatal(String),
+    BreakLoop,
+    ContinueIterating,
+    ProceedWithToolCalls,
+}
+
+#[must_use]
+pub fn map_ingest_outcome_to_iteration_control(
+    outcome: AgenticTurnIngestOutcome,
+) -> AgenticIngestIterationControl {
+    match outcome {
+        AgenticTurnIngestOutcome::Fatal(e) => AgenticIngestIterationControl::Fatal(e),
+        AgenticTurnIngestOutcome::Break => AgenticIngestIterationControl::BreakLoop,
+        AgenticTurnIngestOutcome::Continue => AgenticIngestIterationControl::ContinueIterating,
+        AgenticTurnIngestOutcome::HasToolCalls => {
+            AgenticIngestIterationControl::ProceedWithToolCalls
+        }
+    }
+}
+
 /// Merge streaming turn metadata into running totals and decide whether to break, retry, or run tools.
 pub fn ingest_agentic_turn_stream(
     snap: &AgenticTurnStreamSnapshot<'_>,
@@ -243,6 +266,26 @@ mod tests {
         assert_eq!(snap.completion_tokens, 4);
         assert!(snap.has_usage);
         assert_eq!(snap.error_message.as_deref(), Some("e"));
+    }
+
+    #[test]
+    fn map_ingest_outcome_control() {
+        assert_eq!(
+            map_ingest_outcome_to_iteration_control(AgenticTurnIngestOutcome::Fatal("x".into())),
+            AgenticIngestIterationControl::Fatal("x".into())
+        );
+        assert_eq!(
+            map_ingest_outcome_to_iteration_control(AgenticTurnIngestOutcome::Break),
+            AgenticIngestIterationControl::BreakLoop
+        );
+        assert_eq!(
+            map_ingest_outcome_to_iteration_control(AgenticTurnIngestOutcome::Continue),
+            AgenticIngestIterationControl::ContinueIterating
+        );
+        assert_eq!(
+            map_ingest_outcome_to_iteration_control(AgenticTurnIngestOutcome::HasToolCalls),
+            AgenticIngestIterationControl::ProceedWithToolCalls
+        );
     }
 
     #[test]

@@ -38,6 +38,17 @@ pub fn capture_first_selection_report_if_empty(
     }
 }
 
+/// Add selector token accounting from one `select_with_learned_context` result.
+pub fn accumulate_selector_token_usage(
+    total_in: &mut u64,
+    total_out: &mut u64,
+    delta_in: u64,
+    delta_out: u64,
+) {
+    *total_in += delta_in;
+    *total_out += delta_out;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -62,6 +73,16 @@ mod tests {
         assert_eq!(strat.as_deref(), Some("llm (conf=0.50)"));
         record_first_selector_latency_and_strategy(&mut ms, &mut strat, t0, "other", 0.9);
         assert_eq!(strat.as_deref(), Some("llm (conf=0.50)"));
+    }
+
+    #[test]
+    fn accumulate_selector_tokens_adds() {
+        let mut a = 0u64;
+        let mut b = 0u64;
+        accumulate_selector_token_usage(&mut a, &mut b, 3, 7);
+        accumulate_selector_token_usage(&mut a, &mut b, 1, 2);
+        assert_eq!(a, 4);
+        assert_eq!(b, 9);
     }
 
     #[test]

@@ -20,12 +20,13 @@ use mo_agent_runtime::{
         CliAgenticStallPreflightRequest, apply_cli_agentic_stall_preflight,
     },
     turn::agentic_turn_ingest::{
-        AgenticTurnIngestMut, AgenticTurnIngestOutcome,
+        AgenticIngestIterationControl, AgenticTurnIngestMut,
         agentic_turn_stream_snapshot_from_sse_accum, ingest_agentic_turn_stream,
+        map_ingest_outcome_to_iteration_control,
     },
     turn::agentic_turn_telemetry::{
-        capture_first_selection_report_if_empty, record_first_latency_ms_since,
-        record_first_selector_latency_and_strategy,
+        accumulate_selector_token_usage, capture_first_selection_report_if_empty,
+        record_first_latency_ms_since, record_first_selector_latency_and_strategy,
     },
     turn::boost_domain_hints::{domain_hints_debug_strings, domain_hints_from_boost_terms},
     turn::chat_history_openai::merge_skill_names_track,
@@ -34,6 +35,7 @@ use mo_agent_runtime::{
     turn::chat_turn_edge_profile::{
         detect_active_system_skills_in_message, read_git_branch_abbrev,
     },
+    turn::chat_turn_explain_wire::AgenticChatExplainFlags,
     turn::chat_turn_heuristics::extract_repos_from_memory,
     turn::chat_turn_payload::{
         ChatTurnBasePayloadInput, attach_filtered_edge_tools, chat_turn_base_payload,
@@ -88,6 +90,27 @@ use crate::{
 
 use super::super::edge_executor::edge_executor_instance_id;
 
+#[must_use]
+fn agentic_explain_flags(explain: ExplainMode) -> AgenticChatExplainFlags {
+    match explain {
+        ExplainMode::Off => AgenticChatExplainFlags {
+            explain_verbose: false,
+            explain_on: false,
+            explain_stderr: false,
+        },
+        ExplainMode::On => AgenticChatExplainFlags {
+            explain_verbose: false,
+            explain_on: true,
+            explain_stderr: true,
+        },
+        ExplainMode::Verbose => AgenticChatExplainFlags {
+            explain_verbose: true,
+            explain_on: false,
+            explain_stderr: true,
+        },
+    }
+}
+
 // ─── Outbound `/chat` JSON body (was `prepare_turn_request.rs`) ───────────────
 
 /// First-turn / cross-turn counters updated while building the payload.
@@ -107,9 +130,7 @@ struct PrepareChatTurnRequest<'a> {
     messages: &'a [Value],
     current_session_id: Option<&'a str>,
     model: Option<&'a str>,
-    explain_verbose: bool,
-    explain_on: bool,
-    explain_stderr: bool,
+    explain: AgenticChatExplainFlags,
     project_root: &'a Path,
     message: &'a str,
     history: &'a [(String, String)],
@@ -135,8 +156,8 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
         messages: ctx.messages,
         session_id: ctx.current_session_id,
         model: ctx.model,
-        explain_verbose: ctx.explain_verbose,
-        explain_on: ctx.explain_on,
+        explain_verbose: ctx.explain.explain_verbose,
+        explain_on: ctx.explain.explain_on,
         edge_executor_id: edge_executor_instance_id(),
         capabilities: mo_thin_client::builtin_capability_preset(),
         project_root: ctx.project_root,
@@ -217,8 +238,12 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
             sel_result.strategy,
             sel_result.confidence,
         );
-        *ctx.telem.selector_tokens_in += sel_result.selector_tokens_in;
-        *ctx.telem.selector_tokens_out += sel_result.selector_tokens_out;
+        accumulate_selector_token_usage(
+            ctx.telem.selector_tokens_in,
+            ctx.telem.selector_tokens_out,
+            sel_result.selector_tokens_in,
+            sel_result.selector_tokens_out,
+        );
         selected_skills = sel_result.selected_skills.clone();
         let conf = sel_result.confidence;
         let (schemas, report) = tool_selector::resolve_schemas_with_pressure(
@@ -244,6 +269,12 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
             .selector
             .select_with_learned_context(&sel_ctx, &learned_context)
             .await;
+        accumulate_selector_token_usage(
+            ctx.telem.selector_tokens_in,
+            ctx.telem.selector_tokens_out,
+            sel_result.selector_tokens_in,
+            sel_result.selector_tokens_out,
+        );
         if !sel_result.selected_skills.is_empty() {
             selected_skills = sel_result.selected_skills.clone();
         }
@@ -284,7 +315,7 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
         learned_task_type.as_deref(),
     );
     attach_filtered_edge_tools(&mut payload, turn_schemas, ctx.restricted_tools);
-    if ctx.explain_stderr {
+    if ctx.explain.explain_stderr {
         let (restricted_line, guidance_line) =
             explain_stderr_payload_line_pair(ctx.restricted_tools, &payload, selection_confidence);
         if let Some(line) = restricted_line {
@@ -407,14 +438,11 @@ async fn fetch_chat_turn_sse(ctx: ChatTurnSseFetchRequest<'_>) -> Result<TurnRes
         perm_manager,
     } = ctx;
 
-    let explain_stderr = explain != ExplainMode::Off;
     let payload = prepare_chat_turn_payload(PrepareChatTurnRequest {
         messages,
         current_session_id,
         model,
-        explain_verbose: matches!(explain, ExplainMode::Verbose),
-        explain_on: matches!(explain, ExplainMode::On),
-        explain_stderr,
+        explain: agentic_explain_flags(explain),
         project_root,
         message,
         history,
@@ -882,7 +910,7 @@ pub(crate) async fn run_agentic_loop_iteration(
 
     let snap = agentic_turn_stream_snapshot_from_sse_accum(&turn_result, turn_result.ttft_ms);
     let edge_len = turn_result.edge_tool_round.len();
-    match ingest_agentic_turn_stream(
+    match map_ingest_outcome_to_iteration_control(ingest_agentic_turn_stream(
         &snap,
         edge_len,
         |i| turn_result.edge_tool_round[i].tool.clone(),
@@ -903,11 +931,13 @@ pub(crate) async fn run_agentic_loop_iteration(
             forced_factual_retry,
             messages,
         },
-    ) {
-        AgenticTurnIngestOutcome::Fatal(e) => return Err(e),
-        AgenticTurnIngestOutcome::Break => return Ok(AgenticLoopTurnExit::BreakLoop),
-        AgenticTurnIngestOutcome::Continue => return Ok(AgenticLoopTurnExit::ContinueIterating),
-        AgenticTurnIngestOutcome::HasToolCalls => {}
+    )) {
+        AgenticIngestIterationControl::Fatal(e) => return Err(e),
+        AgenticIngestIterationControl::BreakLoop => return Ok(AgenticLoopTurnExit::BreakLoop),
+        AgenticIngestIterationControl::ContinueIterating => {
+            return Ok(AgenticLoopTurnExit::ContinueIterating);
+        }
+        AgenticIngestIterationControl::ProceedWithToolCalls => {}
     }
 
     let tool_calls_for_guard =
