@@ -41,7 +41,7 @@ use crate::turn::agentic_turn_ingest::{
 };
 use crate::turn::agentic_verdict_audit::AgenticVerdictAuditEvent;
 use crate::turn::chat_turn_sse_dispatch::ChatTurnSseAccum;
-use crate::turn::sse_stream_host::{EdgeToolExecResult, SseStreamHost};
+use crate::turn::sse_stream_host::EdgeToolExecResult;
 use crate::turn::stall::CLI_AGENTIC_TURN_BUDGET_STALL_ABORT_MSG;
 use crate::turn::tool_result_semantics::tool_dedup_signature;
 use crate::turn::turn_guard::TurnGuard;
@@ -75,7 +75,7 @@ pub struct HostTurnResult {
 /// **Headless host**: receives payload from client, calls LLM directly,
 /// streams SSE to client, executes tools via ledger.
 #[async_trait]
-pub trait AgenticLoopHost: SseStreamHost + Send {
+pub trait AgenticLoopHost: Send {
     /// Execute one LLM turn: prepare payload → POST → consume SSE.
     ///
     /// The host is responsible for all CLI/server-specific logic:
@@ -329,14 +329,11 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::turn::chat_turn_sse_dispatch::SseRenderEffect;
-    use crate::turn::sse_stream_host::EdgeApprovalResult;
 
     /// A mock host that returns a canned turn result and then signals loop exit.
     struct MockLoopHost {
         turn_results: Vec<HostTurnResult>,
         current_turn: usize,
-        render_effects: Vec<SseRenderEffect>,
     }
 
     impl MockLoopHost {
@@ -344,7 +341,6 @@ mod tests {
             Self {
                 turn_results: results,
                 current_turn: 0,
-                render_effects: Vec::new(),
             }
         }
 
@@ -361,41 +357,6 @@ mod tests {
                 ttft_ms: Some(42),
                 edge_callback_outputs: HashMap::new(),
                 edge_tool_round: Vec::new(),
-            }
-        }
-    }
-
-    #[async_trait]
-    impl SseStreamHost for MockLoopHost {
-        fn on_render_effects(&mut self, effects: Vec<SseRenderEffect>) {
-            self.render_effects.extend(effects);
-        }
-        fn on_stream_complete(&mut self) {}
-        async fn execute_tool(
-            &mut self,
-            request_id: &str,
-            tool: &str,
-            args: &Value,
-        ) -> EdgeToolExecResult {
-            EdgeToolExecResult {
-                request_id: request_id.to_string(),
-                tool: tool.to_string(),
-                args: args.clone(),
-                output: "mock".to_string(),
-                status: "ok".to_string(),
-                duration_ms: 0,
-            }
-        }
-        async fn resolve_approval(
-            &mut self,
-            request_id: &str,
-            _tool: &str,
-            _path: Option<&str>,
-        ) -> EdgeApprovalResult {
-            EdgeApprovalResult {
-                request_id: request_id.to_string(),
-                decision: "allow".to_string(),
-                reason: None,
             }
         }
     }

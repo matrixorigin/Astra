@@ -57,6 +57,10 @@ pub(super) struct EdgeSseContext<'a> {
     pub _pm: std::marker::PhantomData<&'a mut crate::permission_manager::PermissionManager>,
 }
 
+// SAFETY: Same safety argument as CliSseStreamHost — perm_manager is accessed
+// exclusively through this context during the SSE consumption lifetime.
+unsafe impl Send for EdgeSseContext<'_> {}
+
 // ─── CLI SSE stream host ─────────────────────────────────────────────────────
 //
 // Implements the runtime's `SseStreamHost` trait, wiring terminal rendering,
@@ -287,6 +291,9 @@ pub(super) struct TurnResult {
     /// Time to first token in milliseconds (streaming latency).
     pub(super) ttft_ms: Option<u64>,
     /// Outputs from SSE `tool_request` (same key as [`mo_agent_runtime::turn::tool_result_semantics::tool_dedup_signature`]).
+    /// Populated by CliSseStreamHost during SSE consumption; consumed by CliAgenticLoopHost
+    /// when converting to runtime's HostTurnResult.
+    #[allow(dead_code)]
     pub(super) edge_callback_outputs: std::collections::HashMap<String, String>,
     /// Ordered executions from this SSE stream (for rounds without legacy `tool_call` events).
     pub(super) edge_tool_round: Vec<EdgeToolRoundEntry>,

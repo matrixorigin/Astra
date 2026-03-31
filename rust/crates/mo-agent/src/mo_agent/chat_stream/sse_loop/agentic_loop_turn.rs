@@ -1,34 +1,19 @@
-//! Single agentic iteration: outbound `/chat` payload (selector, skills, explain stderr), `/chat/turn`
-//! fetch + SSE consume, turn ingest, stall preflight, headless tool round, post-tool policy.
+//! Outbound `/chat/turn` payload preparation + fetch + SSE consume.
+//!
+//! The heavy orchestrator (`run_agentic_loop_iteration`) has been replaced by
+//! the runtime's [`run_agentic_loop_with_host`]; this module now only exposes
+//! `fetch_chat_turn_sse` for use by [`super::cli_loop_host::CliAgenticLoopHost`].
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::HashSet;
 use std::path::Path;
 use std::time::Instant;
 
 use crossterm::style::Stylize;
 use mo_agent_runtime::{
-    pipeline::step_protocol::{InMemoryIdempotencyCache, StepCheckpoint},
     pipeline::step_recorder::StepRecorder,
-    semantic_dedup::SemanticDedup,
     tool_registry::{self, ToolRegistry},
     tool_selector::{self, ToolSelector},
-    turn::agentic_headless_round::{
-        HeadlessRoundTerminal, HeadlessStderrStyle, NoopHeadlessTerminal,
-        run_agentic_headless_tool_round,
-    },
-    turn::agentic_post_tool_policy::{
-        AgenticPostToolIterationControl, AgenticPostToolPolicyRequest,
-        apply_agentic_post_tool_policy, map_post_tool_policy_outcome,
-    },
     turn::agentic_prepare_payload::apply_selector_hints_then_attach_filtered_edge_tools,
-    turn::agentic_turn_flow::{
-        agentic_round_stall_preflight_with_tool_calls, append_explain_turn_batch,
-    },
-    turn::agentic_turn_ingest::{
-        AgenticIngestIterationControl, AgenticTurnIngestMut,
-        agentic_turn_stream_snapshot_from_sse_accum, ingest_agentic_turn_stream,
-        map_ingest_outcome_to_iteration_control,
-    },
     turn::agentic_turn_telemetry::{
         accumulate_selector_token_usage, capture_first_selection_report_if_empty,
         record_first_latency_ms_since, record_first_selector_latency_and_strategy,
@@ -58,11 +43,10 @@ use mo_agent_runtime::{
     turn::tool_schema_prune::pin_invoked_tool_schemas,
     turn::turn_guard::{TurnGuard, merge_deprioritized_tools_into_restricted},
 };
-use mo_agent_services::session_journal::ToolCallRecord;
 use serde_json::Value;
 
 use crate::{
-    ExplainMode, VerdictEvent,
+    ExplainMode,
     cli_utils::compact_or_raw,
     edge_tools::ToolExecutor,
     permission_manager::PermissionManager,
@@ -71,20 +55,6 @@ use crate::{
 };
 
 use super::super::edge_executor::edge_executor_instance_id;
-
-struct CrosstermHeadlessTerminal;
-
-impl HeadlessRoundTerminal for CrosstermHeadlessTerminal {
-    fn emit_line(&mut self, style: HeadlessStderrStyle, line: String) {
-        use crossterm::style::Stylize;
-        match style {
-            HeadlessStderrStyle::Dim => eprintln!("{}", line.dim()),
-            HeadlessStderrStyle::Red => eprintln!("{}", line.red()),
-            HeadlessStderrStyle::Green => eprintln!("{}", line.green()),
-            HeadlessStderrStyle::Yellow => eprintln!("{}", line.yellow()),
-        }
-    }
-}
 
 // ─── Outbound `/chat` JSON body (was `prepare_turn_request.rs`) ───────────────
 
@@ -381,7 +351,7 @@ pub(crate) struct ChatTurnSseFetchRequest<'a> {
     pub perm_manager: &'a mut PermissionManager,
 }
 
-async fn fetch_chat_turn_sse(ctx: ChatTurnSseFetchRequest<'_>) -> Result<TurnResult, String> {
+pub(crate) async fn fetch_chat_turn_sse(ctx: ChatTurnSseFetchRequest<'_>) -> Result<TurnResult, String> {
     let ChatTurnSseFetchRequest {
         api,
         token,
@@ -468,253 +438,7 @@ async fn fetch_chat_turn_sse(ctx: ChatTurnSseFetchRequest<'_>) -> Result<TurnRes
     Ok(consume_turn_sse(resp, render_md, term_width, quiet, Some(edge_ctx)).await)
 }
 
-// ─── Orchestrator: one full iteration ────────────────────────────────────────
-
-pub(crate) enum AgenticLoopTurnExit {
-    ContinueIterating,
-    BreakLoop,
-}
-
-pub(crate) struct AgenticTurnRequest<'a> {
-    pub turn_index: usize,
-    pub max_turns: usize,
-    pub api: &'a mo_thin_client::ThinClient,
-    pub token: &'a str,
-    pub model: Option<&'a str>,
-    pub explain: ExplainMode,
-    pub render_md: bool,
-    pub term_width: usize,
-    pub quiet: bool,
-    pub message: &'a str,
-    pub history: &'a [(String, String)],
-    pub recent_tools: &'a [String],
-    pub project_root: &'a Path,
-    pub executor: &'a mut ToolExecutor,
-    pub selector: &'a dyn ToolSelector,
-    pub registry: &'a ToolRegistry,
-    pub messages: &'a mut Vec<Value>,
-    pub current_session_id: &'a mut Option<String>,
-    pub tool_results: &'a mut Vec<Value>,
-    pub all_schemas: &'a [Value],
-    pub turn_guard: &'a mut TurnGuard,
-    pub restricted_tools: &'a mut HashSet<String>,
-    pub step_recorder: &'a mut StepRecorder,
-    pub skill_registry: &'a SharedSkillRegistry,
-    pub file_context: &'a [String],
-    pub perm_manager: &'a mut PermissionManager,
-    pub valid_tool_names: &'a HashSet<String>,
-    pub idempotency_cache: &'a mut InMemoryIdempotencyCache,
-    pub semantic_dedup: &'a mut SemanticDedup,
-    pub turn_sigs: &'a mut Vec<BTreeSet<String>>,
-    pub turn_tool_names: &'a mut Vec<HashSet<String>>,
-    pub stall_events: &'a mut Vec<(String, u32)>,
-    pub intent_tool_turns: &'a mut Vec<(Vec<String>, String)>,
-    pub verdict_events: &'a mut Vec<VerdictEvent>,
-    pub remaining_turns: &'a mut usize,
-    pub last_heavy_checkpoint: &'a mut Option<StepCheckpoint>,
-    pub tool_call_records: &'a mut Vec<ToolCallRecord>,
-    pub first_ttft_ms: &'a mut Option<u64>,
-    pub current_run_id: &'a mut Option<String>,
-    pub final_text: &'a mut String,
-    pub total_prompt: &'a mut u64,
-    pub total_completion: &'a mut u64,
-    pub total_tool_calls: &'a mut u32,
-    pub all_tools_used: &'a mut HashSet<String>,
-    pub has_any_usage: &'a mut bool,
-    pub forced_factual_retry: &'a mut bool,
-    pub explain_turns: &'a mut Vec<Value>,
-    pub telem: PrepareTurnTelemetry<'a>,
-}
-
-pub(crate) async fn run_agentic_loop_iteration(
-    ctx: AgenticTurnRequest<'_>,
-) -> Result<AgenticLoopTurnExit, String> {
-    let AgenticTurnRequest {
-        turn_index,
-        max_turns,
-        api,
-        token,
-        model,
-        explain,
-        render_md,
-        term_width,
-        quiet,
-        message,
-        history,
-        recent_tools,
-        project_root,
-        executor,
-        selector,
-        registry,
-        messages,
-        current_session_id,
-        tool_results,
-        all_schemas,
-        turn_guard,
-        restricted_tools,
-        step_recorder,
-        skill_registry,
-        file_context,
-        perm_manager,
-        valid_tool_names,
-        idempotency_cache,
-        semantic_dedup,
-        turn_sigs,
-        turn_tool_names,
-        stall_events,
-        intent_tool_turns,
-        verdict_events,
-        remaining_turns,
-        last_heavy_checkpoint,
-        tool_call_records,
-        first_ttft_ms,
-        current_run_id,
-        final_text,
-        total_prompt,
-        total_completion,
-        total_tool_calls,
-        all_tools_used,
-        has_any_usage,
-        forced_factual_retry,
-        explain_turns,
-        telem,
-    } = ctx;
-
-    let assembly_start = Instant::now();
-    let turn_result = fetch_chat_turn_sse(ChatTurnSseFetchRequest {
-        api,
-        token,
-        model,
-        explain,
-        render_md,
-        term_width,
-        quiet,
-        message,
-        history,
-        recent_tools,
-        project_root,
-        executor,
-        selector,
-        registry,
-        messages: messages.as_slice(),
-        current_session_id: current_session_id.as_deref(),
-        tool_results: tool_results.as_slice(),
-        all_schemas,
-        turn_guard,
-        restricted_tools,
-        step_recorder,
-        skill_registry,
-        file_context,
-        assembly_start,
-        telem,
-        perm_manager,
-    })
-    .await?;
-
-    let snap = agentic_turn_stream_snapshot_from_sse_accum(&turn_result, turn_result.ttft_ms);
-    let edge_len = turn_result.edge_tool_round.len();
-    match map_ingest_outcome_to_iteration_control(ingest_agentic_turn_stream(
-        &snap,
-        edge_len,
-        |i| turn_result.edge_tool_round[i].tool.clone(),
-        message,
-        recent_tools,
-        quiet,
-        AgenticTurnIngestMut {
-            first_ttft_ms,
-            current_session_id,
-            current_run_id,
-            final_text,
-            total_prompt,
-            total_completion,
-            total_tool_calls,
-            step_recorder,
-            all_tools_used,
-            has_any_usage,
-            forced_factual_retry,
-            messages,
-        },
-    )) {
-        AgenticIngestIterationControl::Fatal(e) => return Err(e),
-        AgenticIngestIterationControl::BreakLoop => return Ok(AgenticLoopTurnExit::BreakLoop),
-        AgenticIngestIterationControl::ContinueIterating => {
-            return Ok(AgenticLoopTurnExit::ContinueIterating);
-        }
-        AgenticIngestIterationControl::ProceedWithToolCalls => {}
-    }
-
-    let tool_calls_for_guard = agentic_round_stall_preflight_with_tool_calls(
-        turn_index,
-        &turn_result.tool_calls,
-        &turn_result.edge_tool_round,
-        turn_sigs,
-        turn_tool_names,
-        stall_events,
-        turn_guard,
-    );
-
-    let mut noop = NoopHeadlessTerminal;
-    let mut crossterm_term = CrosstermHeadlessTerminal;
-    let term: &mut dyn HeadlessRoundTerminal = if quiet {
-        &mut noop
-    } else {
-        &mut crossterm_term
-    };
-    run_agentic_headless_tool_round(
-        turn_index,
-        quiet,
-        api,
-        token,
-        current_session_id.as_ref(),
-        &turn_result.tool_calls,
-        turn_result.edge_tool_round.as_slice(),
-        turn_result.reasoning_content.as_str(),
-        &turn_result.edge_callback_outputs,
-        messages,
-        tool_results,
-        valid_tool_names,
-        restricted_tools,
-        turn_guard,
-        step_recorder,
-        idempotency_cache,
-        semantic_dedup,
-        tool_call_records,
-        term,
-    )
-    .await;
-    append_explain_turn_batch(explain_turns, turn_result.explain_turns.as_slice());
-
-    match map_post_tool_policy_outcome(apply_agentic_post_tool_policy(
-        AgenticPostToolPolicyRequest {
-            turn_index: turn_index as u32,
-            message,
-            tool_calls_for_guard: &tool_calls_for_guard,
-            intent_tool_turns,
-            messages,
-            stall_events,
-            turn_guard,
-            verdict_events,
-            restricted_tools,
-            remaining_turns,
-            step_recorder,
-            current_session_id: current_session_id.as_ref(),
-            max_turns,
-            loop_turn: turn_index,
-            recent_tools,
-            last_heavy_checkpoint,
-        },
-    )) {
-        AgenticPostToolIterationControl::Abort(e) => Err(e),
-        AgenticPostToolIterationControl::RetryLlmClearToolResults => {
-            tool_results.clear();
-            Ok(AgenticLoopTurnExit::ContinueIterating)
-        }
-        AgenticPostToolIterationControl::ProceedEndTurn => {
-            step_recorder.end_turn(false);
-            Ok(AgenticLoopTurnExit::ContinueIterating)
-        }
-    }
-}
+// ─── Tests ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
