@@ -11,28 +11,15 @@ use crossterm::terminal;
 use mo_agent_core::{RuntimeLimits, agent_warn};
 use mo_agent_runtime::{
     pipeline::step_protocol::{CachedToolResult, IdempotencyKey, InMemoryIdempotencyCache},
-    tool_registry::{
-        self,
-        apply_selector_hints_to_edge_profile,
-    },
-    tool_selector,
-    turn::boost_domain_hints::domain_hints_from_boost_terms,
+    tool_registry::{self},
     turn::chat_history_openai::{
         append_openai_user_content_messages, openai_messages_from_repl_history,
         openai_user_content_message,
     },
-    turn::chat_turn_edge_profile::{detect_active_system_skills_in_message, read_git_branch_abbrev},
-    turn::chat_turn_payload::{
-        chat_turn_base_payload, merge_active_skills_into_edge_profile,
-        merge_skill_instructions_into_edge_profile, set_payload_edge_tools,
-        set_payload_tool_results_if_non_empty, ChatTurnBasePayloadInput,
-    },
     turn::chat_turn_heuristics::{
-        extract_repos_from_memory, openai_factual_tool_retry_user_message,
-        should_force_factual_tool_retry,
+        openai_factual_tool_retry_user_message, should_force_factual_tool_retry,
     },
     turn::edge_prompt_context::{detect_project_languages, make_args_preview},
-    turn::tool_schema_prune::{filter_tool_schemas_by_excluded_names, pin_invoked_tool_schemas},
     turn::headless_tool_assembly::{
         openai_assistant_with_tool_calls_message, openai_tool_roundtrip_values,
         take_edge_output_for_tool_call, tool_calls_for_stall_guard, CACHEABLE_TOOLS,
@@ -47,10 +34,9 @@ use crate::{
     ExplainMode, StreamResult, VerdictEvent,
 };
 
-use super::explain_sidecar::{
-    eprint_restricted_tools_explain, eprint_selector_guidance_explain,
+use super::prepare_turn_request::{
+    prepare_chat_turn_payload, PrepareChatTurnRequest, PrepareTurnTelemetry,
 };
-use super::skill_instructions_round::{load_skill_instructions_text, merge_skill_names_track};
 use super::super::{
     edge_executor::edge_executor_instance_id,
     explain_reports::{print_explain_report, print_verdict_report},
@@ -81,7 +67,7 @@ pub(crate) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
     let term_width = terminal::size().map(|(w, _)| w as usize).unwrap_or(80);
     let project_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let file_context = detect_project_languages(&project_root);
-    let executor = edge_tools::ToolExecutor::new(&project_root).with_cloud(api.api_origin(), token);
+    let mut executor = edge_tools::ToolExecutor::new(&project_root).with_cloud(api.api_origin(), token);
     let all_schemas = edge_tools::all_tool_schemas();
     let registry = tool_registry::ToolRegistry::new(all_schemas.clone());
     let valid_tool_names: HashSet<String> = all_schemas
@@ -168,237 +154,44 @@ pub(crate) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
         remaining_turns = remaining_turns.saturating_sub(1);
         step_recorder.begin_turn(_turn as u32);
 
-        // Track context assembly time
         let assembly_start = Instant::now();
-
-        // Build request payload (invariant top-level keys; tools / tool_results added below).
-        let git_branch = read_git_branch_abbrev();
-        let mut payload = chat_turn_base_payload(ChatTurnBasePayloadInput {
+        let explain_stderr = explain != ExplainMode::Off;
+        let payload = prepare_chat_turn_payload(PrepareChatTurnRequest {
             messages: &messages,
-            session_id: current_session_id.as_deref(),
+            current_session_id: current_session_id.as_deref(),
             model,
             explain_verbose: matches!(explain, ExplainMode::Verbose),
             explain_on: matches!(explain, ExplainMode::On),
-            edge_executor_id: edge_executor_instance_id(),
-            capabilities: mo_thin_client::builtin_capability_preset(),
+            explain_stderr,
             project_root: &project_root,
-            git_branch,
-        });
-        let active_skills = detect_active_system_skills_in_message(message);
-        merge_active_skills_into_edge_profile(&mut payload, &active_skills);
-        // NOTE: Skill instructions are now injected after tool selection (see below)
-        // when LLM-based selection chooses a skill.
-        
-        // Tool selection via pluggable ToolSelector strategy.
-        // First turn: selector decides which tools. Follow-up turns: also pin
-        // tools the LLM already invoked so they remain available.
-
-        // ── Budget pressure: pre-estimate token usage to reduce tool count ──
-        // When context is filling up, select fewer dynamic tools to save tokens.
-        // Uses precise estimation with actual schema token costs when available.
-        let budget_pressure = {
-            let schema_tokens = selector.registry().total_pinned_token_cost();
-            let estimated = mo_agent_runtime::prompts::estimate_tokens_precise(
-                &messages,
-                schema_tokens as usize,
-                0, // use default system prompt estimate
-            );
-            let budget = mo_agent_runtime::prompts::budget_for_model(model);
-            let tier = budget.compaction_tier(estimated);
-            tier.budget_pressure()
-        };
-
-        // Phase 7.5: Memory-augmented boost terms.
-        // Step 1: Extract domain keywords from session history (sync, always works).
-        let mut boost_terms =
-            mo_agent_runtime::turn::retrieval::extract_boost_terms_from_pairs(history, message);
-        // Step 2: Augment with memory service (async, best-effort, 2s timeout).
-        // On cold-start (no relevant history), memory may still have stored
-        // domain hints (e.g., "matrixorigin is a GitHub org") that improve
-        // tool selection. This closes the cold-start gap in entity-rich queries.
-        //
-        // Memory results are re-ranked by TF-IDF cosine similarity to filter
-        // irrelevant memories before boost term extraction (Phase A.2).
-        {
-            let mem_start = Instant::now();
-            let memory_contents = executor.memory_boost_search(message, 5).await;
-            let mem_elapsed = mem_start.elapsed().as_millis() as u64;
-            if first_memoria_ms.is_none() {
-                first_memoria_ms = Some(mem_elapsed);
-            }
-            if !memory_contents.is_empty() {
-                // Bridge memory→preferred_repos: extract owner/repo references
-                // from memory content so tool executor can resolve bare repo names.
-                for content in &memory_contents {
-                    for repo in extract_repos_from_memory(content) {
-                        executor.add_preferred_repo(&repo);
-                    }
-                }
-
-                // Re-rank by TF-IDF similarity; filter below threshold.
-                let ranked = mo_agent_runtime::turn::retrieval::rank_memory_results(
-                    message,
-                    &memory_contents,
-                );
-                mo_agent_runtime::turn::retrieval::append_boost_terms_from_ranked_memory(
-                    &mut boost_terms,
-                    message,
-                    &ranked,
-                );
-            }
-        }
-
-        // ── Extract memory domain hints from boost terms ──
-        let memory_domain_hints = domain_hints_from_boost_terms(&boost_terms);
-
-        // Proactively seed restricted_tools with deprioritized tools from health tracker.
-        // This ensures cross-session deprioritized tools are excluded BEFORE scoring.
-        for tool in turn_guard.health.deprioritized_tools() {
-            restricted_tools.insert(tool.to_string());
-        }
-        let restricted_vec: Vec<String> = restricted_tools.iter().cloned().collect();
-
-        // Record PERCEIVE phase: user query + memory context + domain hints
-        step_recorder.record_perceive(
             message,
-            &[], // memory IDs not yet tracked individually
-            &memory_domain_hints
-                .iter()
-                .map(|h| format!("{:?}", h))
-                .collect::<Vec<_>>(),
-            &boost_terms,
-        );
-
-        let learned_context = selector.learned_context(message, recent_tools);
-        let learned_context_hint = learned_context.prompt_fragment();
-        let learned_task_type = learned_context
-            .task_archetype
-            .map(|task_type| format!("{task_type:?}").to_lowercase());
-
-        // Variables to capture selection results including skills
-        let mut selected_skills: Vec<String> = Vec::new();
-        
-        let (turn_schemas, selection_report, selection_confidence) = if tool_results.is_empty() {
-            let sel_start = Instant::now();
-            let turn_count = history.len() as u32 + 1;
-            let sel_ctx = tool_selector::SelectionContext {
-                query: message,
-                turn_count,
-                recent_tools,
-                budget_tokens: registry.default_budget(),
-                boost_terms: boost_terms.clone(),
-                budget_pressure,
-                memory_domain_hints: memory_domain_hints.clone(),
-                restricted_tools: restricted_vec.clone(),
-                file_context: file_context.clone(),
-            };
-            let sel_result = selector
-                .select_with_learned_context(&sel_ctx, &learned_context)
-                .await;
-            if first_selector_ms.is_none() {
-                first_selector_ms = Some(sel_start.elapsed().as_millis() as u64);
-                first_selector_strategy = Some(format!(
-                    "{} (conf={:.2})",
-                    sel_result.strategy, sel_result.confidence
-                ));
-            }
-            selector_tokens_in += sel_result.selector_tokens_in;
-            selector_tokens_out += sel_result.selector_tokens_out;
-            
-            // Capture selected skills from LLM selection
-            selected_skills = sel_result.selected_skills.clone();
-            
-            let conf = sel_result.confidence;
-            let (schemas, report) = tool_selector::resolve_schemas_with_pressure(
-                &registry,
-                &sel_result.tool_names,
-                budget_pressure,
-            );
-            (schemas, report, conf)
-        } else {
-            // Follow-up turn: use 2x budget, then pin tools already invoked.
-            let turn_count = history.len() as u32 + 1;
-            let sel_ctx = tool_selector::SelectionContext {
-                query: message,
-                turn_count,
-                recent_tools,
-                budget_tokens: registry.default_budget() * 2,
-                boost_terms,
-                budget_pressure,
-                memory_domain_hints,
-                restricted_tools: restricted_vec,
-                file_context: file_context.clone(),
-            };
-            let sel_result = selector
-                .select_with_learned_context(&sel_ctx, &learned_context)
-                .await;
-            
-            // Capture selected skills (may be new skills in follow-up)
-            if !sel_result.selected_skills.is_empty() {
-                selected_skills = sel_result.selected_skills.clone();
-            }
-            
-            let conf = sel_result.confidence;
-            let (mut selected, mut report) = tool_selector::resolve_schemas_with_pressure(
-                &registry,
-                &sel_result.tool_names,
-                budget_pressure,
-            );
-            // Pin schemas for tools the LLM already invoked in prior turns
-            pin_invoked_tool_schemas(&mut selected, &mut report, &tool_results, &all_schemas);
-            (selected, report, conf)
-        };
-        
-        let skill_instructions =
-            load_skill_instructions_text(skill_registry, &selected_skills, quiet);
-        merge_skill_names_track(&mut all_selected_skills, &selected_skills);
-        
-        merge_skill_instructions_into_edge_profile(&mut payload, skill_instructions.as_deref());
-        
-        if first_selection_report.is_none() {
-            first_selection_report = Some(selection_report);
-            first_budget_pressure = budget_pressure;
-        }
-        // Propagate budget pressure to tool executor for output scaling.
-        // Updated each iteration so tools always use the latest pressure.
-        executor.set_budget_pressure(budget_pressure);
-
-        // ── Tool guidance hint: when the selector is confident, tell the server
-        // which dynamic tools scored highest (see `apply_selector_hints_to_edge_profile`).
-        apply_selector_hints_to_edge_profile(
-            &mut payload["edge_profile"],
-            first_selection_report.as_ref(),
-            selection_confidence,
-            &learned_context_hint,
-            learned_task_type.as_deref(),
-        );
-        // Dynamic schema restriction: remove tools that were stall-restricted
-        let final_schemas =
-            filter_tool_schemas_by_excluded_names(turn_schemas, &restricted_tools);
-        set_payload_edge_tools(&mut payload, final_schemas);
-        let explain_stderr = explain != ExplainMode::Off;
-        eprint_restricted_tools_explain(explain_stderr, &restricted_tools);
-        eprint_selector_guidance_explain(explain_stderr, &payload, selection_confidence);
-        set_payload_tool_results_if_non_empty(&mut payload, &tool_results);
-
-        // Step recorder: mark plan phase (tool selection done, LLM call about to start)
-        {
-            let selected_tool_names: Vec<String> = first_selection_report
-                .as_ref()
-                .map(|r| r.tools_selected.clone())
-                .unwrap_or_default();
-            let bp = first_budget_pressure;
-            let bt = first_selection_report
-                .as_ref()
-                .map(|r| r.budget_used as u64)
-                .unwrap_or(0);
-            step_recorder.record_plan(&selected_tool_names, selection_confidence, bp, bt);
-        }
-
-        // Capture context assembly time (first turn only)
-        if first_context_assembly_ms.is_none() {
-            first_context_assembly_ms = Some(assembly_start.elapsed().as_millis() as u64);
-        }
+            history,
+            recent_tools,
+            executor: &mut executor,
+            selector,
+            registry: &registry,
+            tool_results: &tool_results,
+            all_schemas: &all_schemas,
+            turn_guard: &turn_guard,
+            restricted_tools: &mut restricted_tools,
+            step_recorder: &mut step_recorder,
+            skill_registry,
+            quiet,
+            file_context: &file_context,
+            assembly_start,
+            telem: PrepareTurnTelemetry {
+                first_memoria_ms: &mut first_memoria_ms,
+                first_selector_ms: &mut first_selector_ms,
+                first_selector_strategy: &mut first_selector_strategy,
+                selector_tokens_in: &mut selector_tokens_in,
+                selector_tokens_out: &mut selector_tokens_out,
+                first_selection_report: &mut first_selection_report,
+                first_budget_pressure: &mut first_budget_pressure,
+                first_context_assembly_ms: &mut first_context_assembly_ms,
+                all_selected_skills: &mut all_selected_skills,
+            },
+        })
+        .await;
 
         let resp = api
             .post_chat_turn_retry_429(token, &payload, 3, quiet)
