@@ -8,10 +8,7 @@ use mo_agent_core::{RuntimeLimits, agent_warn};
 use mo_agent_runtime::{
     pipeline::step_protocol::InMemoryIdempotencyCache,
     tool_registry::{self},
-    turn::chat_history_openai::{
-        append_openai_user_content_messages, openai_messages_from_repl_history,
-        openai_user_content_message,
-    },
+    turn::chat_history_openai::openai_messages_from_repl_history,
     turn::chat_turn_heuristics::{
         openai_factual_tool_retry_user_message, should_force_factual_tool_retry,
     },
@@ -26,15 +23,18 @@ use crate::{
     ExplainMode, StreamResult, VerdictEvent,
 };
 
-use super::prepare_turn_request::{
-    prepare_chat_turn_payload, PrepareChatTurnRequest, PrepareTurnTelemetry,
-};
-use super::tool_round::{run_headless_tool_round, HeadlessToolRoundRequest};
 use super::super::{
+    ChatTurnParams,
     edge_executor::edge_executor_instance_id,
     explain_reports::{print_explain_report, print_verdict_report},
-    ChatTurnParams,
 };
+use super::post_tool_round::{
+    PostToolTurnOutcome, PostToolTurnRequest, apply_post_tool_turn_policy,
+};
+use super::prepare_turn_request::{
+    PrepareChatTurnRequest, PrepareTurnTelemetry, prepare_chat_turn_payload,
+};
+use super::tool_round::{HeadlessToolRoundRequest, run_headless_tool_round};
 
 pub(crate) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResult, String> {
     // Destructure for readability within the function body
@@ -59,7 +59,8 @@ pub(crate) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
     let term_width = terminal::size().map(|(w, _)| w as usize).unwrap_or(80);
     let project_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let file_context = detect_project_languages(&project_root);
-    let mut executor = edge_tools::ToolExecutor::new(&project_root).with_cloud(api.api_origin(), token);
+    let mut executor =
+        edge_tools::ToolExecutor::new(&project_root).with_cloud(api.api_origin(), token);
     let all_schemas = edge_tools::all_tool_schemas();
     let registry = tool_registry::ToolRegistry::new(all_schemas.clone());
     let valid_tool_names: HashSet<String> = all_schemas
@@ -205,14 +206,8 @@ pub(crate) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
             perm_manager: Some(std::ptr::NonNull::from(&mut *perm_manager)),
             _pm: std::marker::PhantomData,
         };
-        let turn_result = consume_turn_sse(
-            resp,
-            render_md,
-            term_width,
-            quiet,
-            Some(edge_ctx),
-        )
-        .await;
+        let turn_result =
+            consume_turn_sse(resp, render_md, term_width, quiet, Some(edge_ctx)).await;
 
         // Capture TTFT from first turn for observability
         if first_ttft_ms.is_none() {
@@ -367,140 +362,32 @@ pub(crate) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
         })
         .await;
         explain_turns.extend(turn_result.explain_turns);
-        // ── Intent drift detection ──
-        // Track per-turn tool names + args, detect when agent drifts from user's query
-        {
-            let turn_names: Vec<String> = tool_calls_for_guard
-                .iter()
-                .filter_map(|tc| tc.get("name").and_then(|v| v.as_str()).map(String::from))
-                .collect();
-            let turn_args_text: String = tool_calls_for_guard
-                .iter()
-                .filter_map(|tc| {
-                    tc.get("arguments")
-                        .map(|v| serde_json::to_string(v).unwrap_or_default())
-                })
-                .collect::<Vec<_>>()
-                .join(" ");
-            intent_tool_turns.push((turn_names, turn_args_text));
 
-            if let mo_agent_runtime::turn::stall::IntentDrift::Drifting { correction, .. } =
-                mo_agent_runtime::turn::stall::detect_intent_drift(message, &intent_tool_turns)
-            {
-                messages.push(openai_user_content_message(&correction));
-                stall_events.push(("intent_drift".to_string(), _turn as u32));
-            }
-        }
-
-        // ── TurnGuard: unified non-happy-path evaluation ──
-        // Evaluate AFTER all tool results recorded, BEFORE next LLM call.
-        {
-            use mo_agent_runtime::turn::turn_guard::VerdictSeverity;
-
-            let verdict = turn_guard.evaluate();
-
-            // ── Audit: collect non-Healthy verdict events ──
-            if verdict.severity > VerdictSeverity::Healthy {
-                let severity_str = match verdict.severity {
-                    VerdictSeverity::Critical => "critical",
-                    VerdictSeverity::Warning => "warning",
-                    VerdictSeverity::Info => "info",
-                    VerdictSeverity::Healthy => unreachable!(),
-                };
-                let health_summary = turn_guard.health.summary();
-                verdict_events.push(VerdictEvent {
-                    turn: _turn as u32,
-                    severity: severity_str.to_string(),
-                    injections: verdict.injections.clone(),
-                    avoid_tools: verdict.avoid_tools.clone(),
-                    force_stop: verdict.force_stop,
-                    nudge_count: turn_guard.nudge_count,
-                    total_errors: turn_guard.errors.total_errors,
-                    deprioritized_count: health_summary.deprioritized_count,
-                    total_timeouts: health_summary.total_timeouts,
-                    total_cache_hits: health_summary.total_cache_hits,
-                    flaky_count: health_summary.flaky_count,
-                });
-            }
-
-            // Inject all verdict messages (stall nudge, divergence correction,
-            // tool health warnings, escalation messages, nudge-ignore warnings)
-            append_openai_user_content_messages(&mut messages, &verdict.injections);
-
-            // Restrict tools that TurnGuard says to avoid
-            for tool in &verdict.avoid_tools {
-                restricted_tools.insert(tool.clone());
-            }
-
-            // Apply turn budget penalties based on severity.
-            match verdict.severity {
-                VerdictSeverity::Critical => {
-                    remaining_turns = remaining_turns.saturating_sub(5);
-                }
-                VerdictSeverity::Warning => {
-                    remaining_turns = remaining_turns.saturating_sub(2);
-                }
-                _ => {}
-            }
-
-            // Step recorder: record verdict outcome
-            let severity_label = match verdict.severity {
-                VerdictSeverity::Critical => "critical",
-                VerdictSeverity::Warning => "warning",
-                VerdictSeverity::Info => "info",
-                VerdictSeverity::Healthy => "healthy",
-            };
-            step_recorder.record_verdict(
-                severity_label,
-                verdict.stall_detected,
-                verdict.is_diverging,
-                verdict.force_stop,
-                verdict.injections.len(),
-            );
-
-            // Heavy checkpoint after verdict (captures full conversation state)
-            if let Some(ref sid) = current_session_id
-                && let Some(heavy) = step_recorder.build_heavy_checkpoint(
-                    &messages,
-                    0, // budget tokens filled by caller if available
-                    max_turns.saturating_sub(_turn) as u32,
-                    &turn_guard
-                        .health
-                        .deprioritized_tools()
-                        .iter()
-                        .map(|s| s.to_string())
-                        .collect::<Vec<_>>(),
-                    recent_tools,
-                )
-            {
-                let cp = mo_agent_runtime::pipeline::step_protocol::StepCheckpoint::Heavy(
-                    Box::new(heavy),
-                );
-                let _ = mo_agent_runtime::pipeline::step_checkpoint::write_step_checkpoint(
-                    sid,
-                    step_recorder.summary().checkpoints,
-                    &cp,
-                );
-                last_heavy_checkpoint = Some(cp);
-            }
-
-            // Force stop on critical verdict
-            if verdict.force_stop {
-                step_recorder.end_turn(true);
-                return Err(
-                    "Agent escalated to critical — too many errors and stalls. Aborting."
-                        .to_string(),
-                );
-            }
-
-            // If verdict injected stall messages, skip to next LLM call (don't re-process results)
-            if !verdict.injections.is_empty() && verdict.severity >= VerdictSeverity::Warning {
-                step_recorder.end_turn(false);
+        match apply_post_tool_turn_policy(PostToolTurnRequest {
+            turn_index: _turn as u32,
+            message,
+            tool_calls_for_guard: &tool_calls_for_guard,
+            intent_tool_turns: &mut intent_tool_turns,
+            messages: &mut messages,
+            stall_events: &mut stall_events,
+            turn_guard: &mut turn_guard,
+            verdict_events: &mut verdict_events,
+            restricted_tools: &mut restricted_tools,
+            remaining_turns: &mut remaining_turns,
+            step_recorder: &mut step_recorder,
+            current_session_id: current_session_id.as_ref(),
+            max_turns,
+            loop_turn: _turn,
+            recent_tools,
+            last_heavy_checkpoint: &mut last_heavy_checkpoint,
+        }) {
+            PostToolTurnOutcome::Abort(e) => return Err(e),
+            PostToolTurnOutcome::RetryLlmClearToolResults => {
                 tool_results = Vec::new();
                 continue;
             }
+            PostToolTurnOutcome::ProceedEndTurn => step_recorder.end_turn(false),
         }
-        step_recorder.end_turn(false);
     }
 
     if explain != ExplainMode::Off && !explain_turns.is_empty() && !quiet {

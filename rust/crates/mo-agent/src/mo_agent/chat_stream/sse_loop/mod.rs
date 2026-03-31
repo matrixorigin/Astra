@@ -3,6 +3,7 @@
 //! Implementation lives in `run`; `prepare_turn_request` holds one iteration’s outbound payload assembly.
 
 mod explain_sidecar;
+mod post_tool_round;
 mod prepare_turn_request;
 mod run;
 mod skill_instructions_round;
