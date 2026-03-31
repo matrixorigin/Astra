@@ -199,7 +199,11 @@ fn cached_system_prompt(
 /// then a final `_inprocess_summary` event with full_text/tool_calls/usage/model_used.
 ///
 /// Retries up to LLM_MAX_RETRIES times on transient errors (429/5xx/network)
-/// with exponential backoff. Honors rate-limit cooldown state.
+/// with exponential backoff.
+///
+/// **Note**: Caller must check rate-limit cooldown state and handle fallback model
+/// resolution BEFORE calling this function. This function only handles retries for
+/// transient errors within a single model.
 #[allow(clippy::too_many_arguments)]
 async fn call_llm_stream(
     messages: &[Value],
@@ -211,36 +215,7 @@ async fn call_llm_stream(
     max_output_tokens: Option<usize>,
     has_fallback: bool,
 ) -> Result<impl futures_util::Stream<Item = Bytes> + Send + 'static, String> {
-    // Check rate-limit cooldown state before starting
     let cooldown = rate_limit_cooldown();
-    match cooldown.check_request(has_fallback) {
-        RateLimitAction::Proceed => {}
-        RateLimitAction::WaitAndRetry { delay_ms } => {
-            mo_agent_core::agent_info!(
-                "llm",
-                "rate-limit cooldown: waiting {delay_ms}ms before request"
-            );
-            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
-        }
-        RateLimitAction::UseFallback { reason } => {
-            // TODO: support fallback model selection
-            mo_agent_core::agent_warn!(
-                "llm",
-                "rate-limit cooldown: fallback requested ({}) but not implemented",
-                reason.as_str()
-            );
-        }
-        RateLimitAction::Reject {
-            reason,
-            reset_in_ms,
-        } => {
-            return Err(format!(
-                "Rate limit cooldown active ({}). Resets in {}s. Try again later.",
-                reason.as_str(),
-                reset_in_ms / 1000
-            ));
-        }
-    }
 
     let client = reqwest::Client::builder()
         .no_proxy()
@@ -620,14 +595,15 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
             let use_e2e_llm = bridge_e2e.as_ref().map(|r| !r.is_empty()).unwrap_or(false);
 
             // Resolve LLM model (skipped when `test_llm_rounds` drives the turn — feature `bridge-e2e-hooks`).
+            // Also capture fallback_model name for rate-limit-triggered fallback.
             let pool_ref = shared_pool.as_deref();
-            let (model_name, api_key, base_url, provider, has_fallback) = if use_e2e_llm {
+            let (mut model_name, mut api_key, mut base_url, mut provider, fallback_model_name) = if use_e2e_llm {
                 (
                     "bridge-e2e-mock".to_string(),
                     "unused".to_string(),
                     "http://127.0.0.1:1".to_string(),
                     "openai".to_string(),
-                    false,
+                    None::<String>,
                 )
             } else {
                 match mo_agent_services::resolve_active_llm_model(
@@ -638,13 +614,80 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
                 )
                 .await
                 {
-                    Ok(m) => (m.model_name, m.api_key, m.base_url, m.provider, m.fallback_model.is_some()),
+                    Ok(m) => (m.model_name, m.api_key, m.base_url, m.provider, m.fallback_model),
                     Err(e) => {
                         yield render_sse_map(&build_stream_error_event(&e, "MODEL_NOT_AVAILABLE", false));
                         return;
                     }
                 }
             };
+            let has_fallback = fallback_model_name.is_some();
+
+            // Check rate-limit cooldown and handle fallback model resolution
+            let cooldown = rate_limit_cooldown();
+            match cooldown.check_request(has_fallback) {
+                RateLimitAction::Proceed => {}
+                RateLimitAction::WaitAndRetry { delay_ms } => {
+                    mo_agent_core::agent_info!(
+                        "llm",
+                        "rate-limit cooldown: waiting {delay_ms}ms before request"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                }
+                RateLimitAction::UseFallback { reason } => {
+                    if let Some(ref fb_name) = fallback_model_name {
+                        mo_agent_core::agent_info!(
+                            "llm",
+                            "rate-limit cooldown: switching to fallback model '{}' ({})",
+                            fb_name,
+                            reason.as_str()
+                        );
+                        // Resolve fallback model credentials
+                        match mo_agent_services::resolve_active_llm_model(
+                            &matrixone,
+                            encryptor.as_ref(),
+                            Some(fb_name.as_str()),
+                            pool_ref,
+                        )
+                        .await
+                        {
+                            Ok(fb) => {
+                                model_name = fb.model_name;
+                                api_key = fb.api_key;
+                                base_url = fb.base_url;
+                                provider = fb.provider;
+                            }
+                            Err(e) => {
+                                mo_agent_core::agent_warn!(
+                                    "llm",
+                                    "fallback model '{}' resolution failed: {}",
+                                    fb_name,
+                                    e
+                                );
+                                // Continue with primary model (best effort)
+                            }
+                        }
+                    } else {
+                        mo_agent_core::agent_warn!(
+                            "llm",
+                            "rate-limit cooldown: fallback requested ({}) but no fallback configured",
+                            reason.as_str()
+                        );
+                    }
+                }
+                RateLimitAction::Reject {
+                    reason,
+                    reset_in_ms,
+                } => {
+                    let err_msg = format!(
+                        "Rate limit cooldown active ({}). Resets in {}s. Try again later.",
+                        reason.as_str(),
+                        reset_in_ms / 1000
+                    );
+                    yield render_sse_map(&build_stream_error_event(&err_msg, "RATE_LIMITED", true));
+                    return;
+                }
+            }
 
             // Build LLM messages: system prompt + history + current messages + tool results
             let mut llm_messages: Vec<Value> = Vec::new();

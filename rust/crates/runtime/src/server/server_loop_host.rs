@@ -15,12 +15,14 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::time::Instant;
 
 use async_trait::async_trait;
 use serde_json::{Map, Value, json};
 use tokio::sync::Mutex as TokioMutex;
 
+use crate::bridge::rate_limit_cooldown::{RateLimitAction, RateLimitCooldown};
 use crate::turn::agentic_headless_round::HeadlessStderrStyle;
 use crate::turn::agentic_loop_host::{AgenticLoopHost, AgenticLoopState, HostTurnResult};
 use crate::turn::chat_turn_sse_dispatch::ChatTurnSseAccum;
@@ -30,6 +32,13 @@ use crate::turn::llm_client::{
 use crate::turn::tool_schema_prune::prune_tool_schemas;
 use crate::{FernetTokenEncryptor, MatrixOneSettings};
 use mo_agent_core::SharedPool;
+
+// ── Rate-Limit Cooldown ──────────────────────────────────────────────────────
+/// Global rate-limit cooldown tracker (shared with llm_client).
+fn rate_limit_cooldown() -> &'static RateLimitCooldown {
+    static COOLDOWN: OnceLock<RateLimitCooldown> = OnceLock::new();
+    COOLDOWN.get_or_init(RateLimitCooldown::new)
+}
 
 /// Server-side host for the runtime agentic loop.
 ///
@@ -348,8 +357,9 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         let turn_started = Instant::now();
 
         // ── 1. Resolve LLM model ────────────────────────────────────────
+        // Also capture fallback_model name for rate-limit-triggered fallback.
         let pool_ref = self.shared_pool.as_ref().map(|sp| sp.get());
-        let (model_name, api_key, base_url, provider, has_fallback) =
+        let (mut model_name, mut api_key, mut base_url, mut provider, fallback_model_name) =
             match mo_agent_services::resolve_active_llm_model(
                 &self.matrixone,
                 self.encryptor.as_ref(),
@@ -363,10 +373,75 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                     m.api_key,
                     m.base_url,
                     m.provider,
-                    m.fallback_model.is_some(),
+                    m.fallback_model,
                 ),
                 Err(e) => return Err(format!("Model resolution failed: {e}")),
             };
+        let has_fallback = fallback_model_name.is_some();
+
+        // ── 1b. Check rate-limit cooldown and handle fallback model resolution ──
+        let cooldown = rate_limit_cooldown();
+        match cooldown.check_request(has_fallback) {
+            RateLimitAction::Proceed => {}
+            RateLimitAction::WaitAndRetry { delay_ms } => {
+                mo_agent_core::agent_info!(
+                    "llm",
+                    "rate-limit cooldown: waiting {delay_ms}ms before request"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+            }
+            RateLimitAction::UseFallback { reason } => {
+                if let Some(ref fb_name) = fallback_model_name {
+                    mo_agent_core::agent_info!(
+                        "llm",
+                        "rate-limit cooldown: switching to fallback model '{}' ({})",
+                        fb_name,
+                        reason.as_str()
+                    );
+                    // Resolve fallback model credentials
+                    match mo_agent_services::resolve_active_llm_model(
+                        &self.matrixone,
+                        self.encryptor.as_ref(),
+                        Some(fb_name.as_str()),
+                        pool_ref,
+                    )
+                    .await
+                    {
+                        Ok(fb) => {
+                            model_name = fb.model_name;
+                            api_key = fb.api_key;
+                            base_url = fb.base_url;
+                            provider = fb.provider;
+                        }
+                        Err(e) => {
+                            mo_agent_core::agent_warn!(
+                                "llm",
+                                "fallback model '{}' resolution failed: {}",
+                                fb_name,
+                                e
+                            );
+                            // Continue with primary model (best effort)
+                        }
+                    }
+                } else {
+                    mo_agent_core::agent_warn!(
+                        "llm",
+                        "rate-limit cooldown: fallback requested ({}) but no fallback configured",
+                        reason.as_str()
+                    );
+                }
+            }
+            RateLimitAction::Reject {
+                reason,
+                reset_in_ms,
+            } => {
+                return Err(format!(
+                    "Rate limit cooldown active ({}). Resets in {}s. Try again later.",
+                    reason.as_str(),
+                    reset_in_ms / 1000
+                ));
+            }
+        }
 
         // ── 2. Build messages ───────────────────────────────────────────
         let user_content = state

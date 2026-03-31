@@ -135,7 +135,11 @@ fn stream_idle_timeout() -> std::time::Duration {
 /// parses the stream and returns the aggregated `LlmCallResult` directly.
 /// Used by `ServerAgenticLoopHost` for server-side agentic loops.
 ///
-/// Honors rate-limit cooldown state and records 429/529 errors for tracking.
+/// Records 429/529 errors for rate-limit cooldown tracking.
+///
+/// **Note**: Caller must check rate-limit cooldown state and handle fallback model
+/// resolution BEFORE calling this function. This function only records errors
+/// for cooldown tracking, not pre-checks.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn call_llm_and_collect(
     messages: &[Value],
@@ -147,35 +151,7 @@ pub(crate) async fn call_llm_and_collect(
     max_output_tokens: Option<usize>,
     has_fallback: bool,
 ) -> Result<LlmCallResult, String> {
-    // Check rate-limit cooldown state before starting
     let cooldown = rate_limit_cooldown();
-    match cooldown.check_request(has_fallback) {
-        RateLimitAction::Proceed => {}
-        RateLimitAction::WaitAndRetry { delay_ms } => {
-            mo_agent_core::agent_info!(
-                "llm",
-                "rate-limit cooldown: waiting {delay_ms}ms before request"
-            );
-            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
-        }
-        RateLimitAction::UseFallback { reason } => {
-            mo_agent_core::agent_warn!(
-                "llm",
-                "rate-limit cooldown: fallback requested ({}) but not implemented",
-                reason.as_str()
-            );
-        }
-        RateLimitAction::Reject {
-            reason,
-            reset_in_ms,
-        } => {
-            return Err(format!(
-                "Rate limit cooldown active ({}). Resets in {}s. Try again later.",
-                reason.as_str(),
-                reset_in_ms / 1000
-            ));
-        }
-    }
 
     let started = Instant::now();
     let client = reqwest::Client::builder()
