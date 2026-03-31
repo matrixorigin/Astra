@@ -1,4 +1,5 @@
 pub mod activity;
+pub mod agentic_turn_ingest;
 pub mod boost_domain_hints;
 #[cfg(feature = "bridge-e2e-hooks")]
 pub mod bridge_e2e_hooks;

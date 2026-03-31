@@ -1,7 +1,7 @@
 # Multi-Agent Cloud Runtime Architecture
 
 > **Status**: Living Design Document  
-> **Version**: 1.4.34 (Phase 0 partial: slice 40 — CLI agentic stall/name-stall + verdict turn penalties live in **`runtime::turn::stall`**)  
+> **Version**: 1.4.35 (Phase 0 partial: slice 41 — `/chat/turn` **ingest** after SSE in **`runtime::turn::agentic_turn_ingest`**)  
 > **Scope**: Edge-cloud state management, multi-agent orchestration, and cloud-scale execution  
 > **Audience**: Core contributors, architecture reviewers
 
@@ -263,7 +263,7 @@ The graph is correct (no cycles), but `mo-agent` being the **only crate that can
 
 ### 4.3 What's Solid and Should Not Change
 
-- **Phase 0 progress (v1.4.34)**: **`sse_loop/`** is two implementation modules + `mod.rs` entry (`stream_chat_sse` → `AgenticSseLoopState` → `run_all_turns` / `agentic_loop_turn`). **`bridge_inprocess`** and **`ChatTurnSseFramer`** share **`sse_blocks::SseBlankLineUtf8Buf`** (slice 39). CLI agentic **`apply_stall_preflight` / verdict budget nudges** delegate to **`stall::round_tool_call_sig_and_names`**, **`detect_cli_tool_name_stall`** (`SERVER_STALL_WINDOW`), and verdict penalty constants (slice 40). Remaining: move the multi-turn loop body to a server handler; **`ReplState`** / **`AppState`** infra largely converged on **`MatrixCloudRuntime`**.
+- **Phase 0 progress (v1.4.35)**: **`sse_loop/`** is two implementation modules + `mod.rs` entry (`stream_chat_sse` → `AgenticSseLoopState` → `run_all_turns` / `agentic_loop_turn`). **`bridge_inprocess`** and **`ChatTurnSseFramer`** share **`sse_blocks::SseBlankLineUtf8Buf`** (slice 39). CLI agentic stall + verdict penalties in **`stall`** (slice 40). **`ingest_agentic_turn_stream`** (response guards, token totals, factual retry, no-tool break) lives in **`agentic_turn_ingest`** (slice 41); CLI passes **`AgenticTurnStreamSnapshot`** + edge-tool index closure. Remaining: move the multi-turn loop body to a server handler; **`ReplState`** / **`AppState`** infra largely converged on **`MatrixCloudRuntime`**.
 - **Local-first journal**: Append-only JSONL is the correct foundation. Fast, crash-safe, auditable.
 - **Sync envelope state machine**: Clean→Dirty→Syncing→Conflict is correct. Extend, don't replace.
 - **DomainAdapter trait**: The trait signature is well-designed. **Learning, Events, Tasks, Templates, and Preferences** now have real [`runtime::sync_adapters`](../../rust/crates/runtime/src/sync_adapters.rs) implementations (see §6.2.1); residual “stub” language in older sections is obsolete for those domains.
@@ -1759,7 +1759,7 @@ mo-agent Orchestrator
 | Extract headless tool round after SSE turn (assistant msg → per-tool edge results → OpenAI pairs) | ✅ Done (slice 24; coalesced slice 36) | Small | **`sse_loop/agentic_loop_turn.rs`** (private): `HeadlessToolRoundRequest`, `run_headless_tool_round`; removed `tool_round.rs` |
 | Extract post-tool-turn policy (intent drift + TurnGuard verdict / checkpoints / retry) | ✅ Done (slice 25; coalesced slice 32) | Small | **`sse_loop/agentic_loop_turn.rs`** (private): `PostToolTurnRequest`, `PostToolTurnOutcome`, `apply_post_tool_turn_policy` |
 | Extract pre-tool stall preflight (signatures, `record_tool_calls`, name-stall) | ✅ Done (slice 26; coalesced slice 32) | Tiny | **`sse_loop/agentic_loop_turn.rs`** (private): `TOOL_NAME_STALL_WINDOW`, `StallPreflightRequest`, `apply_stall_preflight` |
-| Extract `TurnResult` ingest after `consume_turn_sse` (guards, usage, no-tool exit) | ✅ Done (slice 27; coalesced slice 32) | Small | **`sse_loop/agentic_loop_turn.rs`** (private): `TurnResultIngestRequest`, `TurnIngestOutcome`, `ingest_turn_sse_result` |
+| Extract `TurnResult` ingest after `consume_turn_sse` (guards, usage, no-tool exit) | ✅ Done (slice 27; coalesced 32 → **41**) | Small | Logic in **`runtime/turn/agentic_turn_ingest.rs`** (`ingest_agentic_turn_stream`, slice 41); **`agentic_loop_turn`** builds snapshot + calls runtime |
 | Extract per-iteration `/chat/turn` fetch (payload → POST → `consume_turn_sse`) | ✅ Done (slice 28; coalesced slice 32) | Small | **`sse_loop/agentic_loop_turn.rs`** (private): `ChatTurnSseFetchRequest`, `fetch_chat_turn_sse` |
 | Extract post-loop CLI sidecars + `StreamResult` build | ✅ Done (slice 29; inlined slice 32) | Small | **`sse_loop/agentic_sse_loop.rs`** (private): `StreamLoopSidecarEprint`, `StreamResultBuild`, `eprint_stream_loop_sidecars`, `build_stream_result` |
 | Extract one agentic SSE loop iteration (fetch through post-tool policy) | ✅ Done (slice 30) | Small | **`sse_loop/agentic_loop_turn.rs`**: `AgenticTurnRequest`, `AgenticLoopTurnExit`, `run_agentic_loop_iteration` |
@@ -1773,12 +1773,13 @@ mo-agent Orchestrator
 | Inline `sse_loop/run.rs` into `sse_loop/mod.rs` | ✅ Done (slice 38) | Tiny | **`sse_loop/`** = `mod.rs` + `agentic_sse_loop.rs` + `agentic_loop_turn.rs` only |
 | Align `bridge_inprocess` LLM SSE with blank-line framing + shared `data:` parse | ✅ Done (slice 39) | Small | **`SseBlankLineUtf8Buf`** in **`sse_blocks`** (shared with **`ChatTurnSseFramer`**); **`parse_sse_chunks`**: blank-line blocks → `json_events_from_sse_event_block`; tail → `drain_sse_data_lines` / `finish_sse_data_buffer` |
 | Extract CLI agentic stall signatures + name-stall + verdict turn penalties | ✅ Done (slice 40) | Small | **`runtime::turn::stall`**: `round_tool_call_sig_and_names`, `detect_cli_tool_name_stall` (uses **`SERVER_STALL_WINDOW`**), `CLI_AGENTIC_VERDICT_REMAINING_PENALTY_*`; **`agentic_loop_turn`** calls in |
+| Extract `/chat/turn` stream ingest (guards, usage, factual retry, no-tool exit) | ✅ Done (slice 41) | Small | **`runtime::turn::agentic_turn_ingest`**: `ingest_agentic_turn_stream`, `AgenticTurnStreamSnapshot`, `AgenticTurnIngestMut`; CLI wires `TurnResult` → snapshot + edge index fn |
 | Implement tool execution callback protocol (cloud → edge) | ✅ Core path | Medium | §5.5 `/tools/result`, `tool_request` SSE; `chat_stream` **does not** re-execute tools for that path. |
 | Add `edge_executor_id` to chat turn protocol | ✅ | Small | Thin client + §5.5.2 light edge helpers. |
 | Move `SyncOrchestrator` construction from `ReplState` to `AppState` | ✅ Done | — | **`MatrixCloudRuntime`** bundles `SharedPool` + `IngestionSender` + `SyncOrchestrator`; `ReplState` / `AppState` hold `Option<Arc<MatrixCloudRuntime>>` only (no separate orchestrator field) |
 | Move `IngestionSender` from `ReplState` to server pipeline | ✅ Done | — | Same bundle as row above; journal flush via `enqueue_journal_events` |
 | Remove `matrixone_pool` from `ReplState` (use server `shared_pool`) | ✅ Done | — | Superseded by `MatrixCloudRuntime::shared_pool()`; no `matrixone_pool` field on `ReplState` |
-| Refactor `chat_stream/`: cognitive loop → `runtime`, rendering stays CLI | 🟡 In progress | Large | **Slices 1–40** + **`sse_loop/`** (2 child modules + `mod.rs`) + **`runtime/turn/chat_turn_sse_dispatch`**. Remaining: move multi-turn loop to server |
+| Refactor `chat_stream/`: cognitive loop → `runtime`, rendering stays CLI | 🟡 In progress | Large | **Slices 1–41** + **`sse_loop/`** (2 child modules + `mod.rs`) + **`runtime/turn/chat_turn_sse_dispatch`**. Remaining: move multi-turn loop to server |
 
 **Success criteria** (unchanged): `mo-agent` CLI can be deleted and replaced with a ~500-line thin client; **not yet met** — `chat_stream` + `ReplState` infra fields remain.
 

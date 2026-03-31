@@ -16,15 +16,16 @@ use mo_agent_runtime::{
     semantic_dedup::SemanticDedup,
     tool_registry::{self, ToolRegistry},
     tool_selector::{self, ToolSelector},
+    turn::agentic_turn_ingest::{
+        AgenticTurnIngestMut, AgenticTurnIngestOutcome, AgenticTurnStreamSnapshot,
+        ingest_agentic_turn_stream,
+    },
     turn::boost_domain_hints::domain_hints_from_boost_terms,
     turn::chat_history_openai::{append_openai_user_content_messages, openai_user_content_message},
     turn::chat_turn_edge_profile::{
         detect_active_system_skills_in_message, read_git_branch_abbrev,
     },
-    turn::chat_turn_heuristics::{
-        extract_repos_from_memory, openai_factual_tool_retry_user_message,
-        should_force_factual_tool_retry,
-    },
+    turn::chat_turn_heuristics::extract_repos_from_memory,
     turn::chat_turn_payload::{
         ChatTurnBasePayloadInput, chat_turn_base_payload, merge_active_skills_into_edge_profile,
         merge_skill_instructions_into_edge_profile, set_payload_edge_tools,
@@ -35,7 +36,6 @@ use mo_agent_runtime::{
         CACHEABLE_TOOLS, openai_assistant_with_tool_calls_message, openai_tool_roundtrip_values,
         take_edge_output_for_tool_call, tool_calls_for_stall_guard,
     },
-    turn::response_guard::apply_response_guards,
     turn::stall::{
         CLI_AGENTIC_VERDICT_REMAINING_PENALTY_CRITICAL,
         CLI_AGENTIC_VERDICT_REMAINING_PENALTY_WARNING, IntentDrift, SERVER_STALL_WINDOW,
@@ -502,138 +502,6 @@ async fn fetch_chat_turn_sse(ctx: ChatTurnSseFetchRequest<'_>) -> Result<TurnRes
     };
 
     Ok(consume_turn_sse(resp, render_md, term_width, quiet, Some(edge_ctx)).await)
-}
-
-// ─── Ingest TurnResult (guards, usage, no-tool exit) ──────────────────────────
-
-struct TurnResultIngestRequest<'a> {
-    turn_result: &'a TurnResult,
-    message: &'a str,
-    recent_tools: &'a [String],
-    quiet: bool,
-    first_ttft_ms: &'a mut Option<u64>,
-    current_session_id: &'a mut Option<String>,
-    current_run_id: &'a mut Option<String>,
-    final_text: &'a mut String,
-    total_prompt: &'a mut u64,
-    total_completion: &'a mut u64,
-    total_tool_calls: &'a mut u32,
-    step_recorder: &'a mut StepRecorder,
-    all_tools_used: &'a mut HashSet<String>,
-    has_any_usage: &'a mut bool,
-    forced_factual_retry: &'a mut bool,
-    messages: &'a mut Vec<Value>,
-}
-
-enum TurnIngestOutcome {
-    Break,
-    Continue,
-    Fatal(String),
-    HasToolCalls,
-}
-
-fn ingest_turn_sse_result(ctx: TurnResultIngestRequest<'_>) -> TurnIngestOutcome {
-    let TurnResultIngestRequest {
-        turn_result,
-        message,
-        recent_tools,
-        quiet,
-        first_ttft_ms,
-        current_session_id,
-        current_run_id,
-        final_text,
-        total_prompt,
-        total_completion,
-        total_tool_calls,
-        step_recorder,
-        all_tools_used,
-        has_any_usage,
-        forced_factual_retry,
-        messages,
-    } = ctx;
-
-    if first_ttft_ms.is_none() {
-        *first_ttft_ms = turn_result.ttft_ms;
-    }
-
-    if let Some(sid) = &turn_result.session_id {
-        *current_session_id = Some(sid.clone());
-    }
-    if turn_result.run_id.is_some() {
-        *current_run_id = turn_result.run_id.clone();
-    }
-    if !turn_result.full_text.is_empty() {
-        *final_text = turn_result.full_text.clone();
-
-        let guard =
-            apply_response_guards(final_text.as_str(), &turn_result.tool_calls, &[], message);
-        if let Some(replacement) = guard.replacement {
-            agent_warn!("response_guard", "Guard triggered, replacing LLM output");
-            *final_text = replacement;
-            return TurnIngestOutcome::Break;
-        }
-        if guard.quality.has_fabrication_markers {
-            agent_warn!(
-                "response_guard",
-                "Fabrication markers detected: placeholder paths in response"
-            );
-        }
-        if guard.quality.is_echo {
-            agent_warn!(
-                "response_guard",
-                "Echo detected: LLM repeated user query instead of answering"
-            );
-        }
-    }
-
-    *total_prompt += turn_result.prompt_tokens;
-    *total_completion += turn_result.completion_tokens;
-    *total_tool_calls += if !turn_result.tool_calls.is_empty() {
-        turn_result.tool_calls.len()
-    } else {
-        turn_result.edge_tool_round.len()
-    } as u32;
-
-    step_recorder.record_tokens(turn_result.prompt_tokens, turn_result.completion_tokens);
-
-    for tc in &turn_result.tool_calls {
-        if let Some(name) = tc.get("name").and_then(|v| v.as_str()) {
-            all_tools_used.insert(name.to_string());
-        }
-    }
-    for e in &turn_result.edge_tool_round {
-        all_tools_used.insert(e.tool.clone());
-    }
-    *has_any_usage = *has_any_usage || turn_result.has_usage;
-
-    if let Some(ref err) = turn_result.error_message {
-        return TurnIngestOutcome::Fatal(err.clone());
-    }
-
-    let round_has_edge_work =
-        !turn_result.tool_calls.is_empty() || !turn_result.edge_tool_round.is_empty();
-    if !round_has_edge_work {
-        if should_force_factual_tool_retry(
-            message,
-            recent_tools,
-            *total_tool_calls,
-            *forced_factual_retry,
-        ) {
-            *forced_factual_retry = true;
-            if !quiet {
-                eprintln!(
-                    "{}",
-                    "  ↻ No tool call on a live-data query; forcing one corrective retry…".yellow()
-                );
-            }
-            messages.push(openai_factual_tool_retry_user_message(message));
-            final_text.clear();
-            return TurnIngestOutcome::Continue;
-        }
-        return TurnIngestOutcome::Break;
-    }
-
-    TurnIngestOutcome::HasToolCalls
 }
 
 // ─── Stall preflight (signatures + name-stall) ────────────────────────────────
@@ -1393,28 +1261,44 @@ pub(crate) async fn run_agentic_loop_iteration(
     })
     .await?;
 
-    match ingest_turn_sse_result(TurnResultIngestRequest {
-        turn_result: &turn_result,
+    let snap = AgenticTurnStreamSnapshot {
+        ttft_ms: turn_result.ttft_ms,
+        session_id: &turn_result.session_id,
+        run_id: &turn_result.run_id,
+        full_text: turn_result.full_text.as_str(),
+        tool_calls: &turn_result.tool_calls,
+        prompt_tokens: turn_result.prompt_tokens,
+        completion_tokens: turn_result.completion_tokens,
+        has_usage: turn_result.has_usage,
+        error_message: &turn_result.error_message,
+    };
+    let edge_len = turn_result.edge_tool_round.len();
+    match ingest_agentic_turn_stream(
+        &snap,
+        edge_len,
+        |i| turn_result.edge_tool_round[i].tool.clone(),
         message,
         recent_tools,
         quiet,
-        first_ttft_ms,
-        current_session_id,
-        current_run_id,
-        final_text,
-        total_prompt,
-        total_completion,
-        total_tool_calls,
-        step_recorder,
-        all_tools_used,
-        has_any_usage,
-        forced_factual_retry,
-        messages,
-    }) {
-        TurnIngestOutcome::Fatal(e) => return Err(e),
-        TurnIngestOutcome::Break => return Ok(AgenticLoopTurnExit::BreakLoop),
-        TurnIngestOutcome::Continue => return Ok(AgenticLoopTurnExit::ContinueIterating),
-        TurnIngestOutcome::HasToolCalls => {}
+        AgenticTurnIngestMut {
+            first_ttft_ms,
+            current_session_id,
+            current_run_id,
+            final_text,
+            total_prompt,
+            total_completion,
+            total_tool_calls,
+            step_recorder,
+            all_tools_used,
+            has_any_usage,
+            forced_factual_retry,
+            messages,
+        },
+    ) {
+        AgenticTurnIngestOutcome::Fatal(e) => return Err(e),
+        AgenticTurnIngestOutcome::Break => return Ok(AgenticLoopTurnExit::BreakLoop),
+        AgenticTurnIngestOutcome::Continue => return Ok(AgenticLoopTurnExit::ContinueIterating),
+        AgenticTurnIngestOutcome::HasToolCalls => {}
     }
 
     let tool_calls_for_guard =
