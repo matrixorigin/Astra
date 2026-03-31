@@ -9,6 +9,7 @@ use std::time::Duration;
 use mo_thin_client::ApprovalRespondRequest;
 use serde_json::{Map, Value, json};
 
+use super::cloud_approval_policy::edge_tool_requires_cloud_approval;
 use super::edge_ledger::{
     approval_callback_key, persist_value_for_ledger_tool_result, take_ledger_entry,
     tool_callback_key, tool_content_from_ledger_entry, MSG_TOOL_LEDGER_TIMEOUT,
@@ -34,11 +35,7 @@ fn cloud_tool_requires_approval(tool_call: &Value) -> bool {
         .and_then(|f| f.get("name"))
         .and_then(Value::as_str)
         .unwrap_or("");
-    matches!(
-        name,
-        "write_file" | "edit_file" | "create_file" | "str_replace" | "shell" | "bash"
-            | "run_command" | "exec"
-    )
+    edge_tool_requires_cloud_approval(name)
 }
 
 fn raw_tool_arguments(tool_call: &Value) -> Value {

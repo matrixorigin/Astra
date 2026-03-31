@@ -318,6 +318,20 @@ mod tests {
         );
     }
 
+    /// Contract: cloud `approval_required` gate ([`mo_agent_runtime::turn::cloud_approval_policy`])
+    /// must stay aligned with how the CLI labels side effects (Write / Execute vs Read).
+    #[test]
+    fn cloud_approval_required_tools_are_not_classified_as_read() {
+        use mo_agent_runtime::turn::cloud_approval_policy::CLOUD_APPROVAL_REQUIRED_TOOLS;
+        for &name in CLOUD_APPROVAL_REQUIRED_TOOLS {
+            assert_ne!(
+                PermissionManager::classify(name),
+                SideEffect::Read,
+                "{name}: cloud bridge gates this tool — CLI must classify as Write or Execute"
+            );
+        }
+    }
+
     // ── is_dangerous ──────────────────────────────────────────────────────────
 
     #[test]

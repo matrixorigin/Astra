@@ -6,6 +6,7 @@ pub mod edge_prompt_context;
 pub mod edge_ledger;
 pub mod cache;
 pub mod cloud;
+pub mod cloud_approval_policy;
 pub mod cloud_tool_delivery;
 pub mod complete;
 pub mod contracts;
