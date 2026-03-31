@@ -1,7 +1,7 @@
 # Multi-Agent Cloud Runtime Architecture
 
 > **Status**: Living Design Document  
-> **Version**: 1.4.31 (Phase 0 partial: `sse_loop` fully collapsed — `stream_chat_sse` in `sse_loop/mod.rs`; only `agentic_sse_loop` + `agentic_loop_turn` remain)  
+> **Version**: 1.4.32 (Phase 0 partial: `sse_loop` collapsed; **`bridge_inprocess`** LLM stream now uses blank-line SSE framing + `json_events_from_sse_event_block`, aligned with `/chat/turn`)  
 > **Scope**: Edge-cloud state management, multi-agent orchestration, and cloud-scale execution  
 > **Audience**: Core contributors, architecture reviewers
 
@@ -249,7 +249,7 @@ The graph is correct (no cycles), but `mo-agent` being the **only crate that can
 | G5 | **EventAdapter vs sync engine** | sync_engine.rs: `DomainAdapter` | **Implemented**: [`EventAdapter`](../../rust/crates/runtime/src/sync_adapters.rs) uses dedicated ingestion (`export_delta` → `None`; `export_full` intentionally unsupported) | Events do not ride `SyncOrchestrator` push/pull — by design they use `IngestionSender` |
 | G6 | **TaskAdapter sync** | sync_engine.rs: `DomainAdapter` | **Implemented**: [`TaskAdapter`](../../rust/crates/runtime/src/sync_adapters.rs) exports **dirty ∩ leased** tasks; [`push_tasks_pack_held_mysql`](../../rust/crates/services/src/multi_agent.rs) enforces holder on push | Remaining gap is product/UX (RunEngine, long-running tasks), not the adapter stub |
 | G7 | **Cross-agent learning merge** | state_sync.rs: observation-count-wins merge | Single-writer assumption; no 3-way merge | Multiple agents writing creates conflicts |
-| G8 | **Dual cognitive loops (Phase 0)** | One headless cloud runtime | `mo-agent` [`chat_stream/sse_loop/`](../../rust/crates/mo-agent/src/mo_agent/chat_stream/sse_loop/) **and** [`bridge_inprocess.rs`](../../rust/crates/runtime/src/turn/bridge_inprocess.rs) both run multi-turn LLM loops | Blocks a single thin-client story; duplicates stall/token/schema logic unless consolidated |
+| G8 | **Dual cognitive loops (Phase 0)** | One headless cloud runtime | `mo-agent` [`chat_stream/sse_loop/`](../../rust/crates/mo-agent/src/mo_agent/chat_stream/sse_loop/) **and** [`bridge_inprocess.rs`](../../rust/crates/runtime/src/turn/bridge_inprocess.rs) both run multi-turn LLM loops | Blocks a single thin-client story; duplicates stall/token/schema logic unless consolidated; **SSE event framing** now shared (`sse_blocks` + `json_events_from_sse_event_block`, slice 39) |
 
 ### 4.2 Design Docs That Outpace Implementation
 
@@ -263,7 +263,7 @@ The graph is correct (no cycles), but `mo-agent` being the **only crate that can
 
 ### 4.3 What's Solid and Should Not Change
 
-- **Phase 0 progress (v1.4.31)**: **`sse_loop/`** is two implementation modules + `mod.rs` entry (`stream_chat_sse` → `AgenticSseLoopState` → `run_all_turns` / `agentic_loop_turn`). Remaining: move the multi-turn loop body to a server handler; **`ReplState`** / **`AppState`** infra largely converged on **`MatrixCloudRuntime`**.
+- **Phase 0 progress (v1.4.32)**: **`sse_loop/`** is two implementation modules + `mod.rs` entry (`stream_chat_sse` → `AgenticSseLoopState` → `run_all_turns` / `agentic_loop_turn`). **`bridge_inprocess`** OpenAI stream parsing uses the same blank-line boundaries as **`ChatTurnSseFramer`** (slice 39). Remaining: move the multi-turn loop body to a server handler; **`ReplState`** / **`AppState`** infra largely converged on **`MatrixCloudRuntime`**.
 - **Local-first journal**: Append-only JSONL is the correct foundation. Fast, crash-safe, auditable.
 - **Sync envelope state machine**: Clean→Dirty→Syncing→Conflict is correct. Extend, don't replace.
 - **DomainAdapter trait**: The trait signature is well-designed. **Learning, Events, Tasks, Templates, and Preferences** now have real [`runtime::sync_adapters`](../../rust/crates/runtime/src/sync_adapters.rs) implementations (see §6.2.1); residual “stub” language in older sections is obsolete for those domains.
@@ -1739,7 +1739,7 @@ mo-agent Orchestrator
 | Extract LLM tool argument hints (path / command / normalize) | ✅ Done (slice 4) | Small | **`runtime/src/turn/tool_argument_hints.rs`** — `normalize_llm_function_arguments`, `path_hint_from_args`, `permission_prompt_primary_detail`; `cloud_tool_delivery` path hint; CLI prompts + dangerous-pattern `cmd` alias |
 | Reuse hints in `make_args_preview` | ✅ Done (slice 5) | Tiny | **`edge_prompt_context`**: file/bash/grep previews share `tool_argument_hints` |
 | Canonical tool arg keys in hints layer | ✅ Done (slice 6) | Small | **`tool_argument_hints`**: only `path` and `command` (no `cmd`, `file_path`, `target_file`); cloud approval path + CLI prompts + journal previews aligned |
-| Extract SSE `data:` JSON line parser | ✅ Done (slice 7) | Small | **`runtime/src/turn/sse_data_lines.rs`** — `drain_sse_data_lines`, `finish_sse_data_buffer`, `parse_sse_data_json_events`; `bridge_inprocess` stream + lifecycle contract tests |
+| Extract SSE `data:` JSON line parser | ✅ Done (slice 7) | Small | **`runtime/src/turn/sse_data_lines.rs`** — `drain_sse_data_lines`, `finish_sse_data_buffer`, `parse_sse_data_json_events`; `json_events_from_sse_event_block` (slice 39); `bridge_inprocess` stream + lifecycle contract tests |
 | Extract SSE blank-line event blocks | ✅ Done (slice 8) | Small | **`runtime/src/turn/sse_blocks.rs`** — `drain_complete_sse_event_blocks` (`\n\n` / `\r\n\r\n`); wired through **`ChatTurnSseFramer`** (slice 34) for `/chat/turn` |
 | Extract chat-turn factual / session heuristics | ✅ Done (slice 9) | Small | **`runtime/src/turn/chat_turn_heuristics.rs`** — `looks_like_factual_query`, `looks_like_live_query_with_context`, `should_force_factual_tool_retry`, `extract_repos_from_memory`, `is_session_not_found_error`; CLI `chat_stream` + `repl_turn` / `command_router` via `main` imports |
 | Extract headless tool round assembly (cache list, stall-guard shape, edge output match) | ✅ Done (slice 10) | Small | **`runtime/src/turn/headless_tool_assembly.rs`** — `CACHEABLE_TOOLS`, `EdgeToolRoundRow`, `take_edge_output_for_tool_call`, `tool_calls_for_stall_guard`; CLI `chat_stream` + `EdgeToolRoundEntry` impl in `stream_render` |
@@ -1771,12 +1771,13 @@ mo-agent Orchestrator
 | Merge headless tool round file into `agentic_loop_turn` | ✅ Done (slice 36) | Medium | Inlines `run_headless_tool_round`; **`sse_loop/`** shrinks further in slice 37 |
 | Merge `prepare_turn_request` into `agentic_loop_turn` | ✅ Done (slice 37) | Medium | Drops **`prepare_turn_request.rs`**; **`sse_loop/`** had `run.rs` until slice 38 |
 | Inline `sse_loop/run.rs` into `sse_loop/mod.rs` | ✅ Done (slice 38) | Tiny | **`sse_loop/`** = `mod.rs` + `agentic_sse_loop.rs` + `agentic_loop_turn.rs` only |
+| Align `bridge_inprocess` LLM SSE with blank-line framing + shared `data:` parse | ✅ Done (slice 39) | Small | **`parse_sse_chunks`**: `drain_complete_sse_event_blocks` → `json_events_from_sse_event_block`; tail → `drain_sse_data_lines` / `finish_sse_data_buffer` |
 | Implement tool execution callback protocol (cloud → edge) | ✅ Core path | Medium | §5.5 `/tools/result`, `tool_request` SSE; `chat_stream` **does not** re-execute tools for that path. |
 | Add `edge_executor_id` to chat turn protocol | ✅ | Small | Thin client + §5.5.2 light edge helpers. |
 | Move `SyncOrchestrator` construction from `ReplState` to `AppState` | ✅ Done | — | **`MatrixCloudRuntime`** bundles `SharedPool` + `IngestionSender` + `SyncOrchestrator`; `ReplState` / `AppState` hold `Option<Arc<MatrixCloudRuntime>>` only (no separate orchestrator field) |
 | Move `IngestionSender` from `ReplState` to server pipeline | ✅ Done | — | Same bundle as row above; journal flush via `enqueue_journal_events` |
 | Remove `matrixone_pool` from `ReplState` (use server `shared_pool`) | ✅ Done | — | Superseded by `MatrixCloudRuntime::shared_pool()`; no `matrixone_pool` field on `ReplState` |
-| Refactor `chat_stream/`: cognitive loop → `runtime`, rendering stays CLI | 🟡 In progress | Large | **Slices 1–38** + **`sse_loop/`** (2 child modules + `mod.rs`) + **`runtime/turn/chat_turn_sse_dispatch`**. Remaining: move multi-turn loop to server; `bridge_inprocess` uses `sse_data_lines` vs blank-line events |
+| Refactor `chat_stream/`: cognitive loop → `runtime`, rendering stays CLI | 🟡 In progress | Large | **Slices 1–39** + **`sse_loop/`** (2 child modules + `mod.rs`) + **`runtime/turn/chat_turn_sse_dispatch`**. Remaining: move multi-turn loop to server |
 
 **Success criteria** (unchanged): `mo-agent` CLI can be deleted and replaced with a ~500-line thin client; **not yet met** — `chat_stream` + `ReplState` infra fields remain.
 
@@ -1883,7 +1884,7 @@ mo-agent Orchestrator
 | Sync adapters | `runtime/src/sync_adapters.rs` | LearningAdapter, EventAdapter (ingestion), TemplateAdapter (pull cache), PreferenceAdapter (bidirectional), TaskAdapter (lease-filtered tasks) | runtime ✅ |
 | Active LLM resolution | `services/src/models.rs` | `resolve_active_llm_model`, `ResolvedActiveLlmModel` | services ✅ |
 | Tool selector | `runtime/src/tool_selector.rs` | LearnedContext, FallbackSelector, confidence gate | runtime ✅ |
-| Bridge (in-process) | `runtime/src/turn/bridge_inprocess.rs` | Prompt cache, streaming LLM; `sse_data_lines` for LLM byte stream; `resolve_active_llm_model`; `tool_schema_prune` | runtime ✅ (SQL out of bridge) |
+| Bridge (in-process) | `runtime/src/turn/bridge_inprocess.rs` | Prompt cache, streaming LLM; `sse_blocks` + `sse_data_lines` (`json_events_from_sse_event_block`, slice 39); `resolve_active_llm_model`; `tool_schema_prune` | runtime ✅ (SQL out of bridge) |
 | Edge prompt context | `runtime/src/turn/edge_prompt_context.rs` | Workspace/lang detection; `make_args_preview` uses `tool_argument_hints` for path/command (CLI `chat_stream`) | runtime ✅ |
 | Tool schema prune | `runtime/src/turn/tool_schema_prune.rs` | Tiered pruning + `filter_tool_schemas_by_excluded_names` (stall-restricted tools) | runtime ✅ |
 | Boost → domain hints | `runtime/src/turn/boost_domain_hints.rs` | `domain_hints_from_boost_terms` → `DomainHint` for selector | runtime ✅ |
@@ -1896,7 +1897,7 @@ mo-agent Orchestrator
 | Tool result semantics | `runtime/src/turn/tool_result_semantics.rs` | `is_tool_error`, `is_resource_limit_output`, `tool_dedup_signature` (sec. 5.5 SSE vs `tool_call`) | runtime ✅ |
 | Cloud approval policy | `runtime/src/turn/cloud_approval_policy.rs` | `CLOUD_APPROVAL_REQUIRED_TOOLS`, `CLOUD_APPROVAL_EXECUTE_TOOLS`, `cloud_gated_tool_kind` → CLI classify + cloud gate (sec. 5.5) | runtime ✅ |
 | Tool argument hints | `runtime/src/turn/tool_argument_hints.rs` | Normalize LLM `arguments`; **`path` + `command` only** for hints (approval, CLI, previews) | runtime ✅ |
-| SSE data JSON lines | `runtime/src/turn/sse_data_lines.rs` | Incremental `data:` line → JSON; `[DONE]`; EOF flush | runtime ✅ |
+| SSE data JSON lines | `runtime/src/turn/sse_data_lines.rs` | Incremental `data:` line → JSON; per-block parse for blank-line SSE; `[DONE]`; EOF flush | runtime ✅ |
 | SSE event blocks | `runtime/src/turn/sse_blocks.rs` | Blank-line delimited event text (server / thin-client framing) | runtime ✅ |
 | `/chat/turn` SSE JSON dispatch | `runtime/src/turn/chat_turn_sse_dispatch.rs` | `ChatTurnSseAccum`, `ChatTurnEdgePending`, `ChatTurnSseFramer`, `dispatch_chat_turn_sse_event_block`, `parse_chat_turn_sse_utf8_body` | runtime ✅ |
 | Chat turn heuristics | `runtime/src/turn/chat_turn_heuristics.rs` | Factual-query guard, `openai_factual_tool_retry_user_message`, session-not-found, repo extraction from memory text | runtime ✅ |

@@ -1,7 +1,10 @@
 //! Incremental parsing of SSE `data: …` lines into JSON values (OpenAI-style stream).
 //!
-//! Used by [`super::bridge_inprocess`] and contract tests. Handles chunked UTF-8 and optional
-//! flush of a final line without trailing `\n`.
+//! [`super::bridge_inprocess`] buffers provider chunks, drains **blank-line** SSE events via
+//! [`super::sse_blocks::drain_complete_sse_event_blocks`], then parses each block with
+//! [`json_events_from_sse_event_block`]. Any trailing bytes fall back to line-oriented
+//! [`drain_sse_data_lines`] / [`finish_sse_data_buffer`] (single-`\n` providers, partial tail).
+//! Contract tests use [`parse_sse_data_json_events`] and friends.
 
 use serde_json::Value;
 
@@ -36,6 +39,27 @@ fn process_trimmed_line(line: &str) -> LineAction {
         return LineAction::Skip;
     };
     handle_data_payload(rest)
+}
+
+/// Parse `data:` JSON payloads (and `data: [DONE]`) from lines inside one blank-line-delimited SSE
+/// event block (the same framing as [`super::sse_blocks`] and [`super::chat_turn_sse_dispatch::ChatTurnSseFramer`]).
+pub fn json_events_from_sse_event_block(block: &str) -> SseJsonDrain {
+    let mut out = SseJsonDrain::default();
+    for line in block.lines() {
+        let line = line.trim_end_matches('\r');
+        if line.is_empty() {
+            continue;
+        }
+        match process_trimmed_line(line) {
+            LineAction::Json(v) => out.events.push(v),
+            LineAction::Done => {
+                out.stream_finished = true;
+                break;
+            }
+            LineAction::Skip => {}
+        }
+    }
+    out
 }
 
 /// Append `utf8_chunk` to `buf`, then drain every **complete** line (ending with `\n`).
@@ -89,7 +113,34 @@ pub fn parse_sse_data_json_events(body: &str) -> Vec<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::turn::sse_blocks::drain_complete_sse_event_blocks;
     use serde_json::json;
+
+    #[test]
+    fn json_events_from_block_matches_openai_framing() {
+        let mut buf = "data: {\"a\":1}\n\n".to_string();
+        let blocks = drain_complete_sse_event_blocks(&mut buf);
+        assert!(buf.is_empty());
+        assert_eq!(blocks.len(), 1);
+        let d = json_events_from_sse_event_block(&blocks[0]);
+        assert_eq!(d.events, vec![json!({"a": 1})]);
+        assert!(!d.stream_finished);
+    }
+
+    #[test]
+    fn json_events_from_block_crlf_inside_block() {
+        let mut buf = "data: {\"x\":2}\r\n\r\n".to_string();
+        let blocks = drain_complete_sse_event_blocks(&mut buf);
+        let d = json_events_from_sse_event_block(&blocks[0]);
+        assert_eq!(d.events, vec![json!({"x": 2})]);
+    }
+
+    #[test]
+    fn json_events_from_block_done() {
+        let d = json_events_from_sse_event_block("data: [DONE]");
+        assert!(d.events.is_empty());
+        assert!(d.stream_finished);
+    }
 
     #[test]
     fn drain_multiple_json_lines_in_one_chunk() {

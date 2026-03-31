@@ -29,7 +29,10 @@ use crate::{
     },
     turn::edge_ledger::{assistant_message_with_tool_calls, ensure_tool_call_ids},
     turn::persist::{build_tool_call_event_payload, build_tool_result_event_payload},
-    turn::sse_data_lines::{drain_sse_data_lines, finish_sse_data_buffer},
+    turn::sse_blocks::drain_complete_sse_event_blocks,
+    turn::sse_data_lines::{
+        drain_sse_data_lines, finish_sse_data_buffer, json_events_from_sse_event_block,
+    },
     turn::stream_events::build_approval_required_event,
     turn::tool_schema_prune::prune_tool_schemas,
 };
@@ -67,8 +70,12 @@ fn render_sse_map(event: &Map<String, Value>) -> Bytes {
     render_sse(&Value::Object(event.clone()))
 }
 
-/// Parse SSE data lines from a streaming response body.
-/// Yields parsed JSON objects for each `data: {...}` line.
+/// Parse OpenAI-style SSE from a streaming response body.
+///
+/// Complete events are split on blank lines (`sse_blocks::drain_complete_sse_event_blocks`, same
+/// framing as `/chat/turn` and `chat_turn_sse_dispatch::ChatTurnSseFramer`). Each block is scanned
+/// for `data:` JSON lines. After the byte stream ends, any remainder is flushed with line-oriented
+/// `sse_data_lines` draining so single-`\n` or partial tails still work.
 fn parse_sse_chunks(
     stream: impl futures_util::Stream<Item = Result<Bytes, reqwest::Error>> + Unpin + Send + 'static,
 ) -> impl futures_util::Stream<Item = Value> + Send + 'static {
@@ -77,21 +84,27 @@ fn parse_sse_chunks(
         tokio::pin!(stream);
         while let Some(chunk) = stream.next().await {
             let Ok(bytes) = chunk else { break };
-            let Ok(text) = std::str::from_utf8(&bytes) else { continue };
-            let d = drain_sse_data_lines(&mut buf, text);
-            for v in d.events {
-                yield v;
+            buf.push_str(&String::from_utf8_lossy(&bytes));
+            for block in drain_complete_sse_event_blocks(&mut buf) {
+                let d = json_events_from_sse_event_block(&block);
+                for v in d.events {
+                    yield v;
+                }
+                if d.stream_finished {
+                    return;
+                }
             }
-            if d.stream_finished {
-                return;
-            }
+        }
+        let tail = drain_sse_data_lines(&mut buf, "");
+        for v in tail.events {
+            yield v;
+        }
+        if tail.stream_finished {
+            return;
         }
         let fin = finish_sse_data_buffer(&mut buf);
         for v in fin.events {
             yield v;
-        }
-        if fin.stream_finished {
-            return;
         }
     }
 }
