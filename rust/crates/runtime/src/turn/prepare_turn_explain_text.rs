@@ -37,6 +37,19 @@ pub fn selector_guidance_explain_text(
     ))
 }
 
+/// Pair of optional stderr lines for `--explain` (restricted list, then selector guidance).
+#[must_use]
+pub fn explain_stderr_payload_line_pair(
+    restricted_tools: &HashSet<String>,
+    payload: &Value,
+    selection_confidence: f64,
+) -> (Option<String>, Option<String>) {
+    (
+        restricted_tools_explain_text(restricted_tools),
+        selector_guidance_explain_text(payload, selection_confidence),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -62,5 +75,15 @@ mod tests {
         let t = selector_guidance_explain_text(&p, 0.88).expect("line");
         assert!(t.contains("read_file, bash"));
         assert!(t.contains("0.88"));
+    }
+
+    #[test]
+    fn line_pair_matches_individual_helpers() {
+        let mut s = HashSet::new();
+        s.insert("x".into());
+        let p = json!({"edge_profile":{"recommended_tools":["a"]}});
+        let (r, g) = explain_stderr_payload_line_pair(&s, &p, 0.5);
+        assert_eq!(r, restricted_tools_explain_text(&s));
+        assert_eq!(g, selector_guidance_explain_text(&p, 0.5));
     }
 }

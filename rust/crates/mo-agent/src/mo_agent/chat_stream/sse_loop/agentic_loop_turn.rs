@@ -23,6 +23,10 @@ use mo_agent_runtime::{
         AgenticTurnIngestMut, AgenticTurnIngestOutcome,
         agentic_turn_stream_snapshot_from_sse_accum, ingest_agentic_turn_stream,
     },
+    turn::agentic_turn_telemetry::{
+        capture_first_selection_report_if_empty, record_first_latency_ms_since,
+        record_first_selector_latency_and_strategy,
+    },
     turn::boost_domain_hints::{domain_hints_debug_strings, domain_hints_from_boost_terms},
     turn::chat_history_openai::merge_skill_names_track,
     turn::chat_turn_api_error::chat_turn_http_error_user_message,
@@ -32,8 +36,8 @@ use mo_agent_runtime::{
     },
     turn::chat_turn_heuristics::extract_repos_from_memory,
     turn::chat_turn_payload::{
-        ChatTurnBasePayloadInput, chat_turn_base_payload, merge_active_skills_into_edge_profile,
-        merge_skill_instructions_into_edge_profile, set_payload_edge_tools,
+        ChatTurnBasePayloadInput, attach_filtered_edge_tools, chat_turn_base_payload,
+        merge_active_skills_into_edge_profile, merge_skill_instructions_into_edge_profile,
         set_payload_tool_results_if_non_empty,
     },
     turn::chat_turn_selection_context::build_agentic_tool_selection_context,
@@ -64,12 +68,10 @@ use mo_agent_runtime::{
         headless_stderr_unknown_tool_detail, headless_stderr_unknown_tool_header,
     },
     turn::hydrate_reflect::hydrate_reflect_placeholder_if_needed,
-    turn::prepare_turn_explain_text::{
-        restricted_tools_explain_text, selector_guidance_explain_text,
-    },
+    turn::prepare_turn_explain_text::explain_stderr_payload_line_pair,
     turn::skill_instructions_merge::merge_skill_instruction_bodies_for_chat,
     turn::tool_result_semantics::{is_tool_error, tool_dedup_signature},
-    turn::tool_schema_prune::{filter_tool_schemas_by_excluded_names, pin_invoked_tool_schemas},
+    turn::tool_schema_prune::pin_invoked_tool_schemas,
     turn::turn_guard::{TurnGuard, merge_deprioritized_tools_into_restricted},
 };
 use mo_agent_services::session_journal::ToolCallRecord;
@@ -153,10 +155,7 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
     {
         let mem_start = Instant::now();
         let memory_contents = ctx.executor.memory_boost_search(ctx.message, 5).await;
-        let mem_elapsed = mem_start.elapsed().as_millis() as u64;
-        if ctx.telem.first_memoria_ms.is_none() {
-            *ctx.telem.first_memoria_ms = Some(mem_elapsed);
-        }
+        record_first_latency_ms_since(ctx.telem.first_memoria_ms, mem_start);
         if !memory_contents.is_empty() {
             for content in &memory_contents {
                 for repo in extract_repos_from_memory(content) {
@@ -211,13 +210,13 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
             .selector
             .select_with_learned_context(&sel_ctx, &learned_context)
             .await;
-        if ctx.telem.first_selector_ms.is_none() {
-            *ctx.telem.first_selector_ms = Some(sel_start.elapsed().as_millis() as u64);
-            *ctx.telem.first_selector_strategy = Some(format!(
-                "{} (conf={:.2})",
-                sel_result.strategy, sel_result.confidence
-            ));
-        }
+        record_first_selector_latency_and_strategy(
+            ctx.telem.first_selector_ms,
+            ctx.telem.first_selector_strategy,
+            sel_start,
+            sel_result.strategy,
+            sel_result.confidence,
+        );
         *ctx.telem.selector_tokens_in += sel_result.selector_tokens_in;
         *ctx.telem.selector_tokens_out += sel_result.selector_tokens_out;
         selected_skills = sel_result.selected_skills.clone();
@@ -269,10 +268,12 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
 
     merge_skill_instructions_into_edge_profile(&mut payload, skill_instructions.as_deref());
 
-    if ctx.telem.first_selection_report.is_none() {
-        *ctx.telem.first_selection_report = Some(selection_report);
-        *ctx.telem.first_budget_pressure = budget_pressure;
-    }
+    capture_first_selection_report_if_empty(
+        ctx.telem.first_selection_report,
+        ctx.telem.first_budget_pressure,
+        selection_report,
+        budget_pressure,
+    );
     ctx.executor.set_budget_pressure(budget_pressure);
 
     tool_registry::apply_selector_hints_to_edge_profile(
@@ -282,10 +283,17 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
         &learned_context_hint,
         learned_task_type.as_deref(),
     );
-    let final_schemas = filter_tool_schemas_by_excluded_names(turn_schemas, ctx.restricted_tools);
-    set_payload_edge_tools(&mut payload, final_schemas);
-    eprint_restricted_tools_explain(ctx.explain_stderr, ctx.restricted_tools);
-    eprint_selector_guidance_explain(ctx.explain_stderr, &payload, selection_confidence);
+    attach_filtered_edge_tools(&mut payload, turn_schemas, ctx.restricted_tools);
+    if ctx.explain_stderr {
+        let (restricted_line, guidance_line) =
+            explain_stderr_payload_line_pair(ctx.restricted_tools, &payload, selection_confidence);
+        if let Some(line) = restricted_line {
+            eprintln!("{}", line.dim());
+        }
+        if let Some(line) = guidance_line {
+            eprintln!("{}", line.dim());
+        }
+    }
     set_payload_tool_results_if_non_empty(&mut payload, ctx.tool_results);
 
     record_agentic_step_plan_after_payload_prep(
@@ -295,30 +303,9 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
         selection_confidence,
     );
 
-    if ctx.telem.first_context_assembly_ms.is_none() {
-        *ctx.telem.first_context_assembly_ms =
-            Some(ctx.assembly_start.elapsed().as_millis() as u64);
-    }
+    record_first_latency_ms_since(ctx.telem.first_context_assembly_ms, ctx.assembly_start);
 
     payload
-}
-
-fn eprint_restricted_tools_explain(show: bool, restricted_tools: &HashSet<String>) {
-    if !show {
-        return;
-    }
-    if let Some(line) = restricted_tools_explain_text(restricted_tools) {
-        eprintln!("{}", line.dim());
-    }
-}
-
-fn eprint_selector_guidance_explain(show: bool, payload: &Value, selection_confidence: f64) {
-    if !show {
-        return;
-    }
-    if let Some(line) = selector_guidance_explain_text(payload, selection_confidence) {
-        eprintln!("{}", line.dim());
-    }
 }
 
 fn load_skill_instructions_text(

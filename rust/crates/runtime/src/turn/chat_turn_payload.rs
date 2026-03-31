@@ -1,5 +1,6 @@
 //! Top-level `/chat` (streaming) JSON body skeleton before `edge_tools`, `tool_results`, and selector hints.
 
+use std::collections::HashSet;
 use std::path::Path;
 
 use serde_json::{Value, json};
@@ -7,6 +8,7 @@ use serde_json::{Value, json};
 use super::chat_turn_edge_profile::build_base_edge_profile_value;
 use super::chat_turn_explain_wire::chat_turn_explain_field_json;
 use super::edge_prompt_context::detect_workspace_context;
+use super::tool_schema_prune::filter_tool_schemas_by_excluded_names;
 
 /// Inputs for [`chat_turn_base_payload`] (keeps the arity aligned with the JSON body without a 9-arg function).
 pub struct ChatTurnBasePayloadInput<'a> {
@@ -88,6 +90,16 @@ pub fn set_payload_edge_tools(payload: &mut Value, schemas: Vec<Value>) {
     }
 }
 
+/// Drop schemas whose `function.name` is in `restricted_tools`, then set `edge_tools` on the payload.
+pub fn attach_filtered_edge_tools(
+    payload: &mut Value,
+    turn_schemas: Vec<Value>,
+    restricted_tools: &HashSet<String>,
+) {
+    let final_schemas = filter_tool_schemas_by_excluded_names(turn_schemas, restricted_tools);
+    set_payload_edge_tools(payload, final_schemas);
+}
+
 /// Callback-style `tool_results` array (only set when non-empty, matching historical CLI behavior).
 pub fn set_payload_tool_results_if_non_empty(payload: &mut Value, rows: &[Value]) {
     if rows.is_empty() {
@@ -101,6 +113,7 @@ pub fn set_payload_tool_results_if_non_empty(payload: &mut Value, rows: &[Value]
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
     use std::path::Path;
 
     #[test]
@@ -204,5 +217,20 @@ mod tests {
         let mut p = json!({});
         set_payload_tool_results_if_non_empty(&mut p, &[]);
         assert!(p.get("tool_results").is_none());
+    }
+
+    #[test]
+    fn attach_filtered_edge_tools_excludes_by_name() {
+        let mut p = json!({});
+        let schemas = vec![
+            json!({"function": {"name": "bash"}}),
+            json!({"function": {"name": "danger"}}),
+        ];
+        let mut r = HashSet::new();
+        r.insert("danger".into());
+        attach_filtered_edge_tools(&mut p, schemas, &r);
+        let arr = p["edge_tools"].as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["function"]["name"], "bash");
     }
 }
