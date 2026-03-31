@@ -13,10 +13,13 @@ use mo_agent_runtime::{
     pipeline::step_protocol::{CachedToolResult, IdempotencyKey, InMemoryIdempotencyCache},
     tool_registry,
     tool_selector,
+    turn::boost_domain_hints::domain_hints_from_boost_terms,
+    turn::chat_history_openai::openai_messages_from_repl_history,
     turn::chat_turn_heuristics::{
         extract_repos_from_memory, factual_tool_retry_message, should_force_factual_tool_retry,
     },
     turn::edge_prompt_context::{detect_project_languages, detect_workspace_context, make_args_preview},
+    turn::tool_schema_prune::filter_tool_schemas_by_excluded_names,
     turn::headless_tool_assembly::{
         take_edge_output_for_tool_call, tool_calls_for_stall_guard, CACHEABLE_TOOLS,
     },
@@ -77,21 +80,7 @@ pub(crate) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
 
     let mut current_session_id: Option<String> = session_id.map(|s| s.to_string());
     // Build messages: history + current user message
-    let mut messages: Vec<serde_json::Value> = history
-        .iter()
-        .flat_map(|(u, a)| {
-            if u.is_empty() {
-                // Compacted context: only include the summary as assistant message
-                vec![serde_json::json!({"role": "assistant", "content": a})]
-            } else {
-                vec![
-                    serde_json::json!({"role": "user", "content": u}),
-                    serde_json::json!({"role": "assistant", "content": a}),
-                ]
-            }
-        })
-        .collect();
-    messages.push(serde_json::json!({"role": "user", "content": message}));
+    let mut messages: Vec<serde_json::Value> = openai_messages_from_repl_history(history, message);
 
     let mut tool_results: Vec<serde_json::Value> = Vec::new();
     let mut final_text = String::new();
@@ -292,27 +281,7 @@ pub(crate) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
         }
 
         // ── Extract memory domain hints from boost terms ──
-        // Map detected boost term keywords → DomainHint for gate softening.
-        // General: boost_terms containing domain-related keywords map to hints.
-        let memory_domain_hints = {
-            use mo_agent_runtime::pipeline::routing::DomainHint;
-            let mut hints = Vec::new();
-            let terms_lower: Vec<String> = boost_terms.iter().map(|t| t.to_lowercase()).collect();
-            let has = |kw: &str| terms_lower.iter().any(|t| t.contains(kw));
-            if has("github") || has("repo") || has("pr") || has("issue") || has("pull") {
-                hints.push(DomainHint::GitHub);
-            }
-            if has("git") || has("commit") || has("branch") || has("diff") || has("log") {
-                hints.push(DomainHint::Git);
-            }
-            if has("code") || has("file") || has("edit") || has("read") || has("write") {
-                hints.push(DomainHint::Code);
-            }
-            if has("memory") || has("store") || has("remember") || has("preference") {
-                hints.push(DomainHint::Memory);
-            }
-            hints
-        };
+        let memory_domain_hints = domain_hints_from_boost_terms(&boost_terms);
 
         // Proactively seed restricted_tools with deprioritized tools from health tracker.
         // This ensures cross-session deprioritized tools are excluded BEFORE scoring.
@@ -524,21 +493,8 @@ pub(crate) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
             }
         }
         // Dynamic schema restriction: remove tools that were stall-restricted
-        let final_schemas = if restricted_tools.is_empty() {
-            turn_schemas
-        } else {
-            turn_schemas
-                .into_iter()
-                .filter(|s| {
-                    let name = s
-                        .get("function")
-                        .and_then(|f| f.get("name"))
-                        .and_then(|n| n.as_str())
-                        .unwrap_or("");
-                    !restricted_tools.contains(name)
-                })
-                .collect()
-        };
+        let final_schemas =
+            filter_tool_schemas_by_excluded_names(turn_schemas, &restricted_tools);
         payload["edge_tools"] = serde_json::Value::Array(final_schemas);
         if explain != ExplainMode::Off && !restricted_tools.is_empty() {
             eprintln!(

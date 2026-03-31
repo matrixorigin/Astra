@@ -1,10 +1,12 @@
 pub mod activity;
+pub mod boost_domain_hints;
 #[cfg(feature = "bridge-e2e-hooks")]
 pub mod bridge_e2e_hooks;
 pub mod bridge_inprocess;
 pub mod edge_prompt_context;
 pub mod edge_ledger;
 pub mod cache;
+pub mod chat_history_openai;
 pub mod chat_turn_heuristics;
 pub mod cloud;
 pub mod cloud_approval_policy;

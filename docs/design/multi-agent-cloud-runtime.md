@@ -1,7 +1,7 @@
 # Multi-Agent Cloud Runtime Architecture
 
 > **Status**: Living Design Document  
-> **Version**: 1.4.4 (Phase 0 partial: `headless_tool_assembly` in `runtime`; `plan_decompose` + `sync_adapters` → `runtime`; headless SSE loop still in CLI `chat_stream`)  
+> **Version**: 1.4.5 (Phase 0 partial: boost-term domain hints + REPL→OpenAI messages + schema exclude filter in `runtime`; headless SSE loop still in CLI `chat_stream/`)  
 > **Scope**: Edge-cloud state management, multi-agent orchestration, and cloud-scale execution  
 > **Audience**: Core contributors, architecture reviewers
 
@@ -263,7 +263,7 @@ The graph is correct (no cycles), but `mo-agent` being the **only crate that can
 
 ### 4.3 What's Solid and Should Not Change
 
-- **Phase 0 progress (v1.4.4)**: `plan_decompose` and `sync_adapters` live in **`mo-agent-runtime`**; **`resolve_active_llm_model`** lives in **`mo-agent-services`**; headless **`tool_request`** / edge callbacks are consumed in CLI `chat_stream`, with **`headless_tool_assembly`** (cache list, dedup match, stall-guard JSON) in **`runtime`**. Remaining: move the **`chat_stream`** multi-turn loop body to a server handler; **`ReplState`** / **`AppState`** infra largely converged on **`MatrixCloudRuntime`**.
+- **Phase 0 progress (v1.4.5)**: same as v1.4.4, plus **`domain_hints_from_boost_terms`**, **`openai_messages_from_repl_history`**, and **`filter_tool_schemas_by_excluded_names`** in **`runtime`** (CLI **`chat_stream/sse_loop`** calls them). Remaining: move the multi-turn loop body to a server handler; **`ReplState`** / **`AppState`** infra largely converged on **`MatrixCloudRuntime`**.
 - **Local-first journal**: Append-only JSONL is the correct foundation. Fast, crash-safe, auditable.
 - **Sync envelope state machine**: Clean→Dirty→Syncing→Conflict is correct. Extend, don't replace.
 - **DomainAdapter trait**: The trait signature is well-designed. **Learning, Events, Tasks, Templates, and Preferences** now have real [`runtime::sync_adapters`](../../rust/crates/runtime/src/sync_adapters.rs) implementations (see §6.2.1); residual “stub” language in older sections is obsolete for those domains.
@@ -1743,12 +1743,13 @@ mo-agent Orchestrator
 | Extract SSE blank-line event blocks | ✅ Done (slice 8) | Small | **`runtime/src/turn/sse_blocks.rs`** — `drain_complete_sse_event_blocks` (`\n\n` / `\r\n\r\n`); CLI `consume_turn_sse` |
 | Extract chat-turn factual / session heuristics | ✅ Done (slice 9) | Small | **`runtime/src/turn/chat_turn_heuristics.rs`** — `looks_like_factual_query`, `looks_like_live_query_with_context`, `should_force_factual_tool_retry`, `extract_repos_from_memory`, `is_session_not_found_error`; CLI `chat_stream` + `repl_turn` / `command_router` via `main` imports |
 | Extract headless tool round assembly (cache list, stall-guard shape, edge output match) | ✅ Done (slice 10) | Small | **`runtime/src/turn/headless_tool_assembly.rs`** — `CACHEABLE_TOOLS`, `EdgeToolRoundRow`, `take_edge_output_for_tool_call`, `tool_calls_for_stall_guard`; CLI `chat_stream` + `EdgeToolRoundEntry` impl in `stream_render` |
+| Extract boost-term → `DomainHint`, REPL history → OpenAI `messages`, stall schema filter | ✅ Done (slice 11) | Small | **`turn/boost_domain_hints.rs`** (`domain_hints_from_boost_terms`); **`turn/chat_history_openai.rs`** (`openai_messages_from_repl_history`); **`tool_schema_prune`** (`filter_tool_schemas_by_excluded_names`); CLI `chat_stream/sse_loop.rs` |
 | Implement tool execution callback protocol (cloud → edge) | ✅ Core path | Medium | §5.5 `/tools/result`, `tool_request` SSE; `chat_stream` **does not** re-execute tools for that path. |
 | Add `edge_executor_id` to chat turn protocol | ✅ | Small | Thin client + §5.5.2 light edge helpers. |
 | Move `SyncOrchestrator` construction from `ReplState` to `AppState` | ✅ Done | — | **`MatrixCloudRuntime`** bundles `SharedPool` + `IngestionSender` + `SyncOrchestrator`; `ReplState` / `AppState` hold `Option<Arc<MatrixCloudRuntime>>` only (no separate orchestrator field) |
 | Move `IngestionSender` from `ReplState` to server pipeline | ✅ Done | — | Same bundle as row above; journal flush via `enqueue_journal_events` |
 | Remove `matrixone_pool` from `ReplState` (use server `shared_pool`) | ✅ Done | — | Superseded by `MatrixCloudRuntime::shared_pool()`; no `matrixone_pool` field on `ReplState` |
-| Refactor `chat_stream/`: cognitive loop → `runtime`, rendering stays CLI | 🟡 In progress | Large | **Slices 1–10** + **`chat_stream/` submodule split** (boundary: `sse_loop` vs explain vs edge id vs params). Remaining: move loop body to server; `consume_turn_sse` + `bridge_inprocess` convergence |
+| Refactor `chat_stream/`: cognitive loop → `runtime`, rendering stays CLI | 🟡 In progress | Large | **Slices 1–11** + **`chat_stream/` submodule split**. Remaining: move main loop body to server; `consume_turn_sse` + `bridge_inprocess` convergence |
 
 **Success criteria** (unchanged): `mo-agent` CLI can be deleted and replaced with a ~500-line thin client; **not yet met** — `chat_stream` + `ReplState` infra fields remain.
 
@@ -1857,7 +1858,9 @@ mo-agent Orchestrator
 | Tool selector | `runtime/src/tool_selector.rs` | LearnedContext, FallbackSelector, confidence gate | runtime ✅ |
 | Bridge (in-process) | `runtime/src/turn/bridge_inprocess.rs` | Prompt cache, streaming LLM; `sse_data_lines` for LLM byte stream; `resolve_active_llm_model`; `tool_schema_prune` | runtime ✅ (SQL out of bridge) |
 | Edge prompt context | `runtime/src/turn/edge_prompt_context.rs` | Workspace/lang detection; `make_args_preview` uses `tool_argument_hints` for path/command (CLI `chat_stream`) | runtime ✅ |
-| Tool schema prune | `runtime/src/turn/tool_schema_prune.rs` | Tiered OpenAI-style tool definition pruning | runtime ✅ |
+| Tool schema prune | `runtime/src/turn/tool_schema_prune.rs` | Tiered pruning + `filter_tool_schemas_by_excluded_names` (stall-restricted tools) | runtime ✅ |
+| Boost → domain hints | `runtime/src/turn/boost_domain_hints.rs` | `domain_hints_from_boost_terms` → `DomainHint` for selector | runtime ✅ |
+| REPL → OpenAI messages | `runtime/src/turn/chat_history_openai.rs` | `openai_messages_from_repl_history` for `/chat` payload | runtime ✅ |
 | Tool result semantics | `runtime/src/turn/tool_result_semantics.rs` | `is_tool_error`, `is_resource_limit_output`, `tool_dedup_signature` (sec. 5.5 SSE vs `tool_call`) | runtime ✅ |
 | Cloud approval policy | `runtime/src/turn/cloud_approval_policy.rs` | `CLOUD_APPROVAL_REQUIRED_TOOLS`, `CLOUD_APPROVAL_EXECUTE_TOOLS`, `cloud_gated_tool_kind` → CLI classify + cloud gate (sec. 5.5) | runtime ✅ |
 | Tool argument hints | `runtime/src/turn/tool_argument_hints.rs` | Normalize LLM `arguments`; **`path` + `command` only** for hints (approval, CLI, previews) | runtime ✅ |

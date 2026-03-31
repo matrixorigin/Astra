@@ -1,5 +1,7 @@
 //! Progressive tool schema pruning under token pressure (shared by in-process bridge and future clients).
 
+use std::collections::HashSet;
+
 use serde_json::{Value, json};
 
 use crate::prompts::CompactionTier;
@@ -63,6 +65,27 @@ pub fn prune_tool_schemas(tools: &[Value], tier: CompactionTier) -> Vec<Value> {
                 .collect()
         }
     }
+}
+
+/// Drop OpenAI-style tool definitions whose `function.name` is in `excluded` (e.g. stall-restricted tools).
+pub fn filter_tool_schemas_by_excluded_names(
+    schemas: Vec<Value>,
+    excluded: &HashSet<String>,
+) -> Vec<Value> {
+    if excluded.is_empty() {
+        return schemas;
+    }
+    schemas
+        .into_iter()
+        .filter(|s| {
+            let name = s
+                .get("function")
+                .and_then(|f| f.get("name"))
+                .and_then(|n| n.as_str())
+                .unwrap_or("");
+            !excluded.contains(name)
+        })
+        .collect()
 }
 
 /// Truncate a description to the first sentence (period/newline boundary).
@@ -222,6 +245,27 @@ mod tests {
                 .get("command")
                 .is_some()
         );
+    }
+
+    #[test]
+    fn filter_excluded_names_removes_matching_tools() {
+        let tools = vec![
+            make_tool_schema("keep", "x", true),
+            make_tool_schema("drop", "y", true),
+        ];
+        let mut ex = HashSet::new();
+        ex.insert("drop".to_string());
+        let out = filter_tool_schemas_by_excluded_names(tools, &ex);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0]["function"]["name"], "keep");
+    }
+
+    #[test]
+    fn filter_empty_excluded_is_noop() {
+        let tools = vec![make_tool_schema("a", "d", true)];
+        let ex = HashSet::new();
+        let out = filter_tool_schemas_by_excluded_names(tools.clone(), &ex);
+        assert_eq!(out.len(), tools.len());
     }
 
     #[test]
