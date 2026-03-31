@@ -310,10 +310,10 @@ fn extract_discovered_tools(messages: &[Value]) -> Vec<String> {
             .and_then(Value::as_array);
         if let Some(arr) = tools {
             for t in arr {
-                if let Some(s) = t.as_str() {
-                    if !s.is_empty() {
-                        set.insert(s.to_string());
-                    }
+                if let Some(s) = t.as_str()
+                    && !s.is_empty()
+                {
+                    set.insert(s.to_string());
                 }
             }
         }
@@ -547,10 +547,11 @@ mod tests {
 
     #[test]
     fn compaction_carries_discovered_tools_into_new_boundary() {
-        let prior_boundary = CompactBoundary::new(CompactTrigger::Auto, CompactionTier::TrimSchemas)
-            .with_pre_metrics(0, 2)
-            .with_post_count(2)
-            .with_discovered_tools(vec!["mcp__k8s_logs".into()]);
+        let prior_boundary =
+            CompactBoundary::new(CompactTrigger::Auto, CompactionTier::TrimSchemas)
+                .with_pre_metrics(0, 2)
+                .with_post_count(2)
+                .with_discovered_tools(vec!["mcp__k8s_logs".into()]);
         let msgs = vec![
             prior_boundary.to_system_message(),
             tool(&"a".repeat(5000)),

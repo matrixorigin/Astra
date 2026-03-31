@@ -9,11 +9,11 @@ use mo_agent_runtime::bridge::sse_events::{find_sse_frame_end, parse_sse_json_fr
 use mo_agent_runtime::prompts::{CompactionTier, estimate_str_tokens, estimate_tokens};
 use mo_agent_runtime::text_tokenize::{build_tf, tokenize};
 use mo_agent_runtime::tool_registry::ConversationState;
+use mo_agent_runtime::tool_registry::TOOL_CATALOG;
 use mo_agent_runtime::tool_registry::scoring::pre_filter_dynamic;
 use mo_agent_runtime::tool_registry::tool_pool::{
-    select_two_phase, SearchableToolMeta, ToolDenyPredicate, ToolPool, ToolSearchConfig, ToolSource,
+    SearchableToolMeta, ToolDenyPredicate, ToolPool, ToolSearchConfig, ToolSource, select_two_phase,
 };
-use mo_agent_runtime::tool_registry::TOOL_CATALOG;
 use mo_agent_runtime::turn::cloud::compaction::compact_tiered;
 
 // ── Token Estimation ───────────────────────────────────────────────
@@ -154,7 +154,11 @@ fn build_synthetic_pool(n: usize) -> ToolPool<MapStore> {
 
 fn bench_two_phase_tool_pool(c: &mut Criterion) {
     let sizes = [0usize, 1_000, 10_000];
-    let terms = ["matrixorigin".to_string(), "latest".to_string(), "pr".to_string()];
+    let terms = [
+        "matrixorigin".to_string(),
+        "latest".to_string(),
+        "pr".to_string(),
+    ];
     let cfg = ToolSearchConfig {
         max_candidates: 24,
         budget_tokens: 1200,
@@ -166,7 +170,8 @@ fn bench_two_phase_tool_pool(c: &mut Criterion) {
         let pool = build_synthetic_pool(n);
         group.bench_with_input(BenchmarkId::new("index_size", n), &pool, |b, p| {
             b.iter(|| {
-                let out = select_two_phase(black_box(p), black_box(&DenyNone), black_box(&terms), cfg);
+                let out =
+                    select_two_phase(black_box(p), black_box(&DenyNone), black_box(&terms), cfg);
                 black_box(out.len())
             })
         });

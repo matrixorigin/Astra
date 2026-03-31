@@ -39,6 +39,10 @@ pub struct QuirksData {
     pub no_system_message: bool,
     #[serde(default)]
     pub system_as_user_prefix: bool,
+    /// Fallback model name to use when the primary model hits rate limits.
+    /// Must reference an active model in `infra_llm_models`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fallback_model: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -103,6 +107,8 @@ pub struct ResolvedActiveLlmModel {
     pub api_key: String,
     pub base_url: String,
     pub provider: String,
+    /// Fallback model name from quirks (cloud-managed).
+    pub fallback_model: Option<String>,
 }
 
 /// Resolve the active LLM model from the database for in-process / server-side callers.
@@ -110,6 +116,8 @@ pub struct ResolvedActiveLlmModel {
 /// If `preferred` is `Some(name)`, selects that model when `is_active = 1`; otherwise uses
 /// the lexicographically first active model. When `pool` is `None`, opens an ephemeral
 /// single-connection pool from `matrixone`.
+///
+/// Also extracts `fallback_model` from the `quirks` JSON column (cloud-managed config).
 pub async fn resolve_active_llm_model(
     matrixone: &MatrixOneSettings,
     encryptor: &FernetTokenEncryptor,
@@ -131,7 +139,8 @@ pub async fn resolve_active_llm_model(
 
     let row = if let Some(name) = preferred {
         sqlx::query(
-            "SELECT model_name, api_key_encrypted, base_url, provider \
+            "SELECT model_name, api_key_encrypted, base_url, provider, \
+                    IFNULL(CAST(quirks AS CHAR), '{}') AS quirks_json \
              FROM infra_llm_models WHERE model_name = ? AND is_active = 1 LIMIT 1",
         )
         .bind(name)
@@ -144,7 +153,8 @@ pub async fn resolve_active_llm_model(
 
     let row = if row.is_none() {
         sqlx::query(
-            "SELECT model_name, api_key_encrypted, base_url, provider \
+            "SELECT model_name, api_key_encrypted, base_url, provider, \
+                    IFNULL(CAST(quirks AS CHAR), '{}') AS quirks_json \
              FROM infra_llm_models WHERE is_active = 1 ORDER BY model_name LIMIT 1",
         )
         .fetch_optional(pool)
@@ -173,11 +183,25 @@ pub async fn resolve_active_llm_model(
         .decrypt(&encrypted)
         .map_err(|e| format!("Decrypt: {e}"))?;
 
+    // Extract fallback_model from quirks JSON (env var override if set)
+    let fallback_model = {
+        let quirks_json: String = row
+            .try_get("quirks_json")
+            .unwrap_or_else(|_| "{}".to_string());
+        let quirks: QuirksData = serde_json::from_str(&quirks_json).unwrap_or_default();
+        // Env var overrides DB config
+        std::env::var("MO_LLM_FALLBACK_MODEL")
+            .ok()
+            .filter(|v| !v.is_empty())
+            .or(quirks.fallback_model)
+    };
+
     Ok(ResolvedActiveLlmModel {
         model_name,
         api_key,
         base_url,
         provider,
+        fallback_model,
     })
 }
 

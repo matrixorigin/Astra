@@ -139,11 +139,7 @@ use std::sync::OnceLock;
 /// Global rate-limit cooldown tracker (shared across all LLM calls in this process).
 fn rate_limit_cooldown() -> &'static RateLimitCooldown {
     static COOLDOWN: OnceLock<RateLimitCooldown> = OnceLock::new();
-    // Enable fallback if MO_LLM_FALLBACK_ENABLED env var is set
-    let fallback_enabled = std::env::var("MO_LLM_FALLBACK_ENABLED")
-        .map(|v| v == "1" || v.to_lowercase() == "true")
-        .unwrap_or(false);
-    COOLDOWN.get_or_init(|| RateLimitCooldown::new(fallback_enabled))
+    COOLDOWN.get_or_init(RateLimitCooldown::new)
 }
 
 // ── System Prompt Cache ──────────────────────────────────────────────────────
@@ -204,6 +200,7 @@ fn cached_system_prompt(
 ///
 /// Retries up to LLM_MAX_RETRIES times on transient errors (429/5xx/network)
 /// with exponential backoff. Honors rate-limit cooldown state.
+#[allow(clippy::too_many_arguments)]
 async fn call_llm_stream(
     messages: &[Value],
     tools: &[Value],
@@ -212,10 +209,11 @@ async fn call_llm_stream(
     base_url: &str,
     provider: &str,
     max_output_tokens: Option<usize>,
+    has_fallback: bool,
 ) -> Result<impl futures_util::Stream<Item = Bytes> + Send + 'static, String> {
     // Check rate-limit cooldown state before starting
     let cooldown = rate_limit_cooldown();
-    match cooldown.check_request() {
+    match cooldown.check_request(has_fallback) {
         RateLimitAction::Proceed => {}
         RateLimitAction::WaitAndRetry { delay_ms } => {
             mo_agent_core::agent_info!(
@@ -443,7 +441,7 @@ async fn call_llm_stream(
 
         // Record rate-limit errors to cooldown tracker
         if is_rate_limit_status(status) {
-            let action = cooldown.record_429(retry_after_ms);
+            let action = cooldown.record_429(retry_after_ms, has_fallback);
             mo_agent_core::agent_warn!(
                 "llm",
                 "rate limit (429): action={:?}, metrics={:?}",
@@ -459,7 +457,7 @@ async fn call_llm_stream(
         }
 
         if is_overload_status(status) {
-            let action = cooldown.record_529(retry_after_ms);
+            let action = cooldown.record_529(retry_after_ms, has_fallback);
             mo_agent_core::agent_warn!(
                 "llm",
                 "server overload ({status}): action={:?}, metrics={:?}",
@@ -623,12 +621,13 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
 
             // Resolve LLM model (skipped when `test_llm_rounds` drives the turn — feature `bridge-e2e-hooks`).
             let pool_ref = shared_pool.as_deref();
-            let (model_name, api_key, base_url, provider) = if use_e2e_llm {
+            let (model_name, api_key, base_url, provider, has_fallback) = if use_e2e_llm {
                 (
                     "bridge-e2e-mock".to_string(),
                     "unused".to_string(),
                     "http://127.0.0.1:1".to_string(),
                     "openai".to_string(),
+                    false,
                 )
             } else {
                 match mo_agent_services::resolve_active_llm_model(
@@ -639,7 +638,7 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
                 )
                 .await
                 {
-                    Ok(m) => (m.model_name, m.api_key, m.base_url, m.provider),
+                    Ok(m) => (m.model_name, m.api_key, m.base_url, m.provider, m.fallback_model.is_some()),
                     Err(e) => {
                         yield render_sse_map(&build_stream_error_event(&e, "MODEL_NOT_AVAILABLE", false));
                         return;
@@ -873,6 +872,7 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
                         &base_url,
                         &provider,
                         Some(max_output_tokens),
+                        has_fallback,
                     )
                     .await
                     {

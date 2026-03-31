@@ -121,7 +121,10 @@ impl AgenticRunLifecycleService {
         self
     }
 
-    pub fn with_delegation_engine(mut self, engine: Arc<crate::server::delegation_engine::DelegationEngine>) -> Self {
+    pub fn with_delegation_engine(
+        mut self,
+        engine: Arc<crate::server::delegation_engine::DelegationEngine>,
+    ) -> Self {
         self.delegation_engine = Some(engine);
         self
     }

@@ -259,7 +259,8 @@ fn parse_delegation_request(
         .and_then(Value::as_str)
         .ok_or("delegate call missing arguments")?;
 
-    let args: Value = serde_json::from_str(args_str).map_err(|e| format!("invalid delegation JSON: {e}"))?;
+    let args: Value =
+        serde_json::from_str(args_str).map_err(|e| format!("invalid delegation JSON: {e}"))?;
 
     let task = args
         .get("task")
@@ -270,7 +271,10 @@ fn parse_delegation_request(
     let pattern = parse_coordination_pattern(&args)?;
 
     let mut context = std::collections::HashMap::new();
-    context.insert("session_id".to_string(), Value::String(session_id.to_string()));
+    context.insert(
+        "session_id".to_string(),
+        Value::String(session_id.to_string()),
+    );
     if let Some(ctx) = args.get("context").and_then(Value::as_object) {
         for (k, v) in ctx {
             context.insert(k.clone(), v.clone());
@@ -289,7 +293,9 @@ fn parse_delegation_request(
 }
 
 /// Parse a CoordinationPattern from the LLM's delegate arguments.
-fn parse_coordination_pattern(args: &Value) -> Result<mo_agent_services::coordination::CoordinationPattern, String> {
+fn parse_coordination_pattern(
+    args: &Value,
+) -> Result<mo_agent_services::coordination::CoordinationPattern, String> {
     let pattern_type = args
         .get("pattern")
         .and_then(Value::as_str)
@@ -298,15 +304,22 @@ fn parse_coordination_pattern(args: &Value) -> Result<mo_agent_services::coordin
     let agents: Vec<String> = args
         .get("agents")
         .and_then(Value::as_array)
-        .map(|arr| arr.iter().filter_map(Value::as_str).map(String::from).collect())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(Value::as_str)
+                .map(String::from)
+                .collect()
+        })
         .unwrap_or_else(|| vec!["coder".to_string()]);
 
     match pattern_type {
-        "fan_out" => Ok(mo_agent_services::coordination::CoordinationPattern::FanOut {
-            agent_ids: agents,
-            aggregation: mo_agent_services::coordination::AggregationStrategy::AllResults,
-            timeout_sec: 300,
-        }),
+        "fan_out" => Ok(
+            mo_agent_services::coordination::CoordinationPattern::FanOut {
+                agent_ids: agents,
+                aggregation: mo_agent_services::coordination::AggregationStrategy::AllResults,
+                timeout_sec: 300,
+            },
+        ),
         "pipeline" => {
             let stages = agents
                 .into_iter()
@@ -318,20 +331,30 @@ fn parse_coordination_pattern(args: &Value) -> Result<mo_agent_services::coordin
             Ok(mo_agent_services::coordination::CoordinationPattern::Pipeline { stages })
         }
         "adversarial" => {
-            let producer = agents.first().cloned().unwrap_or_else(|| "coder".to_string());
-            let reviewer = agents.get(1).cloned().unwrap_or_else(|| "reviewer".to_string());
+            let producer = agents
+                .first()
+                .cloned()
+                .unwrap_or_else(|| "coder".to_string());
+            let reviewer = agents
+                .get(1)
+                .cloned()
+                .unwrap_or_else(|| "reviewer".to_string());
             let max_rounds = args.get("max_rounds").and_then(Value::as_u64).unwrap_or(2) as u32;
-            Ok(mo_agent_services::coordination::CoordinationPattern::AdversarialReview {
-                producer_id: producer,
-                reviewer_id: reviewer,
-                max_rounds,
-                acceptance_threshold: 0.8,
-            })
+            Ok(
+                mo_agent_services::coordination::CoordinationPattern::AdversarialReview {
+                    producer_id: producer,
+                    reviewer_id: reviewer,
+                    max_rounds,
+                    acceptance_threshold: 0.8,
+                },
+            )
         }
-        _ => Ok(mo_agent_services::coordination::CoordinationPattern::Sequential {
-            agent_ids: agents,
-            stop_on_success: false,
-        }),
+        _ => Ok(
+            mo_agent_services::coordination::CoordinationPattern::Sequential {
+                agent_ids: agents,
+                stop_on_success: false,
+            },
+        ),
     }
 }
 
@@ -356,20 +379,15 @@ async fn partition_and_execute_delegations(
                 .to_string();
 
             match parse_delegation_request(tc, parent_run_id, session_id) {
-                Ok(request) => {
-                    match engine.execute(request, source_agent_id).await {
-                        Ok(result) => {
-                            let summary = format_delegation_result(&result);
-                            delegation_results.push((call_id, summary));
-                        }
-                        Err(e) => {
-                            delegation_results.push((
-                                call_id,
-                                format!("Delegation failed: {e}"),
-                            ));
-                        }
+                Ok(request) => match engine.execute(request, source_agent_id).await {
+                    Ok(result) => {
+                        let summary = format_delegation_result(&result);
+                        delegation_results.push((call_id, summary));
                     }
-                }
+                    Err(e) => {
+                        delegation_results.push((call_id, format!("Delegation failed: {e}")));
+                    }
+                },
                 Err(e) => {
                     delegation_results.push((call_id, format!("Invalid delegation request: {e}")));
                 }
@@ -385,7 +403,10 @@ async fn partition_and_execute_delegations(
 /// Format a DelegationResult as a human-readable summary for the LLM.
 fn format_delegation_result(result: &mo_agent_services::coordination::DelegationResult) -> String {
     let mut parts = Vec::new();
-    parts.push(format!("Delegation {} — status: {}", result.delegation_id, result.status));
+    parts.push(format!(
+        "Delegation {} — status: {}",
+        result.delegation_id, result.status
+    ));
 
     for ar in &result.agent_results {
         let status_icon = if ar.is_success() { "✅" } else { "❌" };
@@ -546,18 +567,19 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
         // ─── Step 3b: Delegation interception ───────────────────────────
         // If a delegation engine is wired, intercept "delegate" tool calls
         // and execute them as multi-agent coordination runs.
-        let (delegation_results, remaining_tool_calls) = if let Some(engine) = &state.delegation_engine {
-            partition_and_execute_delegations(
-                &turn_result.accum.tool_calls,
-                engine,
-                state.current_run_id.as_deref().unwrap_or("unknown"),
-                state.current_session_id.as_deref().unwrap_or("unknown"),
-                "orchestrator",
-            )
-            .await
-        } else {
-            (Vec::new(), turn_result.accum.tool_calls.clone())
-        };
+        let (delegation_results, remaining_tool_calls) =
+            if let Some(engine) = &state.delegation_engine {
+                partition_and_execute_delegations(
+                    &turn_result.accum.tool_calls,
+                    engine,
+                    state.current_run_id.as_deref().unwrap_or("unknown"),
+                    state.current_session_id.as_deref().unwrap_or("unknown"),
+                    "orchestrator",
+                )
+                .await
+            } else {
+                (Vec::new(), turn_result.accum.tool_calls.clone())
+            };
 
         // Inject delegation results into messages + tool_results
         for (call_id, result_text) in &delegation_results {
@@ -1382,7 +1404,10 @@ mod tests {
         let args = json!({"agents": ["coder", "reviewer"]});
         let pattern = super::parse_coordination_pattern(&args).unwrap();
         match pattern {
-            mo_agent_services::coordination::CoordinationPattern::Sequential { agent_ids, stop_on_success } => {
+            mo_agent_services::coordination::CoordinationPattern::Sequential {
+                agent_ids,
+                stop_on_success,
+            } => {
                 assert_eq!(agent_ids, vec!["coder", "reviewer"]);
                 assert!(!stop_on_success);
             }
@@ -1395,7 +1420,11 @@ mod tests {
         let args = json!({"pattern": "fan_out", "agents": ["coder", "writer"]});
         let pattern = super::parse_coordination_pattern(&args).unwrap();
         match pattern {
-            mo_agent_services::coordination::CoordinationPattern::FanOut { agent_ids, timeout_sec, .. } => {
+            mo_agent_services::coordination::CoordinationPattern::FanOut {
+                agent_ids,
+                timeout_sec,
+                ..
+            } => {
                 assert_eq!(agent_ids, vec!["coder", "writer"]);
                 assert_eq!(timeout_sec, 300);
             }
@@ -1419,10 +1448,16 @@ mod tests {
 
     #[test]
     fn parse_coordination_pattern_adversarial() {
-        let args = json!({"pattern": "adversarial", "agents": ["coder", "reviewer"], "max_rounds": 3});
+        let args =
+            json!({"pattern": "adversarial", "agents": ["coder", "reviewer"], "max_rounds": 3});
         let pattern = super::parse_coordination_pattern(&args).unwrap();
         match pattern {
-            mo_agent_services::coordination::CoordinationPattern::AdversarialReview { producer_id, reviewer_id, max_rounds, .. } => {
+            mo_agent_services::coordination::CoordinationPattern::AdversarialReview {
+                producer_id,
+                reviewer_id,
+                max_rounds,
+                ..
+            } => {
                 assert_eq!(producer_id, "coder");
                 assert_eq!(reviewer_id, "reviewer");
                 assert_eq!(max_rounds, 3);
@@ -1467,18 +1502,16 @@ mod tests {
         let result = mo_agent_services::coordination::DelegationResult {
             delegation_id: "del-1".to_string(),
             status: "completed".to_string(),
-            agent_results: vec![
-                mo_agent_services::coordination::AgentResult {
-                    agent_id: "coder".to_string(),
-                    run_id: "run-1".to_string(),
-                    status: "completed".to_string(),
-                    output: Some("implemented feature X".to_string()),
-                    error: None,
-                    prompt_tokens: 100,
-                    completion_tokens: 50,
-                    tool_calls: 3,
-                },
-            ],
+            agent_results: vec![mo_agent_services::coordination::AgentResult {
+                agent_id: "coder".to_string(),
+                run_id: "run-1".to_string(),
+                status: "completed".to_string(),
+                output: Some("implemented feature X".to_string()),
+                error: None,
+                prompt_tokens: 100,
+                completion_tokens: 50,
+                tool_calls: 3,
+            }],
             aggregated_output: Some("All tasks done.".to_string()),
             total_prompt_tokens: 100,
             total_completion_tokens: 50,
@@ -1500,18 +1533,16 @@ mod tests {
         let result = mo_agent_services::coordination::DelegationResult {
             delegation_id: "del-2".to_string(),
             status: "completed".to_string(),
-            agent_results: vec![
-                mo_agent_services::coordination::AgentResult {
-                    agent_id: "writer".to_string(),
-                    run_id: "run-2".to_string(),
-                    status: "completed".to_string(),
-                    output: Some(long_output),
-                    error: None,
-                    prompt_tokens: 200,
-                    completion_tokens: 100,
-                    tool_calls: 1,
-                },
-            ],
+            agent_results: vec![mo_agent_services::coordination::AgentResult {
+                agent_id: "writer".to_string(),
+                run_id: "run-2".to_string(),
+                status: "completed".to_string(),
+                output: Some(long_output),
+                error: None,
+                prompt_tokens: 200,
+                completion_tokens: 100,
+                tool_calls: 1,
+            }],
             aggregated_output: None,
             total_prompt_tokens: 200,
             total_completion_tokens: 100,
@@ -1528,18 +1559,16 @@ mod tests {
         let result = mo_agent_services::coordination::DelegationResult {
             delegation_id: "del-3".to_string(),
             status: "partial_failure".to_string(),
-            agent_results: vec![
-                mo_agent_services::coordination::AgentResult {
-                    agent_id: "coder".to_string(),
-                    run_id: "run-3".to_string(),
-                    status: "failed".to_string(),
-                    output: None,
-                    error: Some("timeout".to_string()),
-                    prompt_tokens: 50,
-                    completion_tokens: 0,
-                    tool_calls: 0,
-                },
-            ],
+            agent_results: vec![mo_agent_services::coordination::AgentResult {
+                agent_id: "coder".to_string(),
+                run_id: "run-3".to_string(),
+                status: "failed".to_string(),
+                output: None,
+                error: Some("timeout".to_string()),
+                prompt_tokens: 50,
+                completion_tokens: 0,
+                tool_calls: 0,
+            }],
             aggregated_output: None,
             total_prompt_tokens: 50,
             total_completion_tokens: 0,
@@ -1569,7 +1598,9 @@ mod tests {
 
     #[tokio::test]
     async fn partition_separates_delegate_from_regular_calls() {
-        use crate::server::delegation_engine::{DelegationEngine, DelegationTracker, StubSubRunExecutor};
+        use crate::server::delegation_engine::{
+            DelegationEngine, DelegationTracker, StubSubRunExecutor,
+        };
         use crate::server::run_engine::RunEngine;
         use mo_agent_services::AgentProfileRegistry;
 
@@ -1627,7 +1658,9 @@ mod tests {
 
     #[tokio::test]
     async fn partition_handles_all_delegate_calls() {
-        use crate::server::delegation_engine::{DelegationEngine, DelegationTracker, StubSubRunExecutor};
+        use crate::server::delegation_engine::{
+            DelegationEngine, DelegationTracker, StubSubRunExecutor,
+        };
         use crate::server::run_engine::RunEngine;
         use mo_agent_services::AgentProfileRegistry;
 
@@ -1657,8 +1690,13 @@ mod tests {
         ];
 
         let (delegation_results, remaining) = super::partition_and_execute_delegations(
-            &tool_calls, &engine, "run-1", "sess-1", "orchestrator"
-        ).await;
+            &tool_calls,
+            &engine,
+            "run-1",
+            "sess-1",
+            "orchestrator",
+        )
+        .await;
 
         assert_eq!(delegation_results.len(), 2);
         assert!(remaining.is_empty());
@@ -1666,7 +1704,9 @@ mod tests {
 
     #[tokio::test]
     async fn partition_handles_invalid_delegation_args_gracefully() {
-        use crate::server::delegation_engine::{DelegationEngine, DelegationTracker, StubSubRunExecutor};
+        use crate::server::delegation_engine::{
+            DelegationEngine, DelegationTracker, StubSubRunExecutor,
+        };
         use crate::server::run_engine::RunEngine;
         use mo_agent_services::AgentProfileRegistry;
 
@@ -1679,19 +1719,26 @@ mod tests {
             Arc::new(StubSubRunExecutor),
         );
 
-        let tool_calls = vec![
-            json!({
-                "id": "bad_call",
-                "function": {"name": "delegate", "arguments": "not valid json!!!"}
-            }),
-        ];
+        let tool_calls = vec![json!({
+            "id": "bad_call",
+            "function": {"name": "delegate", "arguments": "not valid json!!!"}
+        })];
 
         let (delegation_results, remaining) = super::partition_and_execute_delegations(
-            &tool_calls, &engine, "run-1", "sess-1", "orchestrator"
-        ).await;
+            &tool_calls,
+            &engine,
+            "run-1",
+            "sess-1",
+            "orchestrator",
+        )
+        .await;
 
         assert_eq!(delegation_results.len(), 1);
-        assert!(delegation_results[0].1.contains("Invalid delegation request"));
+        assert!(
+            delegation_results[0]
+                .1
+                .contains("Invalid delegation request")
+        );
         assert!(remaining.is_empty());
     }
 

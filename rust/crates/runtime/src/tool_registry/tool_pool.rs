@@ -282,7 +282,10 @@ mod tests {
     #[test]
     fn deny_is_applied_before_materialization() {
         let reg = ToolRegistry::new(mock_schemas());
-        let index = TOOL_CATALOG.iter().map(SearchableToolMeta::from_catalog).collect();
+        let index = TOOL_CATALOG
+            .iter()
+            .map(SearchableToolMeta::from_catalog)
+            .collect();
         let pool = ToolPool { index, store: reg };
         let deny = DenySet(["bash".to_string()].into_iter().collect());
         let out = select_two_phase(
@@ -297,7 +300,11 @@ mod tests {
         );
         let names: Vec<String> = out
             .iter()
-            .filter_map(|s| s.get("function").and_then(|f| f.get("name")).and_then(Value::as_str))
+            .filter_map(|s| {
+                s.get("function")
+                    .and_then(|f| f.get("name"))
+                    .and_then(Value::as_str)
+            })
             .map(|s| s.to_string())
             .collect();
         assert!(!names.contains(&"bash".to_string()));
@@ -306,7 +313,10 @@ mod tests {
     #[test]
     fn budget_is_respected_nonempty() {
         let reg = ToolRegistry::new(mock_schemas());
-        let index = TOOL_CATALOG.iter().map(SearchableToolMeta::from_catalog).collect();
+        let index = TOOL_CATALOG
+            .iter()
+            .map(SearchableToolMeta::from_catalog)
+            .collect();
         let pool = ToolPool { index, store: reg };
         let out = select_two_phase(
             &pool,
@@ -400,8 +410,10 @@ mod tests {
     #[test]
     fn discovered_tools_roundtrip_and_materialize_even_if_not_in_index() {
         let reg = ToolRegistry::new(mock_schemas());
-        let mut index: Vec<SearchableToolMeta> =
-            TOOL_CATALOG.iter().map(SearchableToolMeta::from_catalog).collect();
+        let mut index: Vec<SearchableToolMeta> = TOOL_CATALOG
+            .iter()
+            .map(SearchableToolMeta::from_catalog)
+            .collect();
 
         // A discovered tool that is NOT present in the current index.
         let special = "mcp__special_tool";
@@ -434,7 +446,10 @@ mod tests {
             extra_name: special.to_string(),
             extra_schema: special_schema,
         };
-        let pool = ToolPool { index: index.clone(), store };
+        let pool = ToolPool {
+            index: index.clone(),
+            store,
+        };
 
         // State carries the discovered tool.
         let mut state = ToolSearchState::default();
@@ -496,4 +511,3 @@ mod tests {
         assert_eq!(st.discovered.len(), 3, "should union and dedupe");
     }
 }
-

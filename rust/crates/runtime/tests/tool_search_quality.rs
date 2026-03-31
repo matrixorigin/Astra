@@ -1,9 +1,9 @@
 use mo_agent_runtime::tool_registry::tool_pool::{
-    select_two_phase, SearchableToolMeta, ToolDenyPredicate, ToolPool, ToolSchemaStore,
-    ToolSearchConfig, ToolSource,
+    SearchableToolMeta, ToolDenyPredicate, ToolPool, ToolSchemaStore, ToolSearchConfig, ToolSource,
+    select_two_phase,
 };
-use mo_agent_runtime::tool_registry::{ToolRegistry, TOOL_CATALOG};
-use serde_json::{json, Value};
+use mo_agent_runtime::tool_registry::{TOOL_CATALOG, ToolRegistry};
+use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 
 /// A minimal schema store backed by a HashMap.
@@ -42,7 +42,10 @@ fn build_store_with_synthetic_tools(synthetic_count: usize) -> (MapStore, Vec<Se
     // Built-in catalog schemas + index entries.
     let mut index: Vec<SearchableToolMeta> = Vec::new();
     for meta in TOOL_CATALOG {
-        map.insert(meta.name.to_string(), schema_for(meta.name, meta.description));
+        map.insert(
+            meta.name.to_string(),
+            schema_for(meta.name, meta.description),
+        );
         index.push(SearchableToolMeta::from_catalog(meta));
     }
 
@@ -50,9 +53,8 @@ fn build_store_with_synthetic_tools(synthetic_count: usize) -> (MapStore, Vec<Se
     // for normal queries because they're generic/noisy.
     for i in 0..synthetic_count {
         let name = format!("mcp__synthetic_tool_{i}");
-        let short = format!(
-            "Synthetic MCP tool {i}: generic helper for stuff, things, misc operations"
-        );
+        let short =
+            format!("Synthetic MCP tool {i}: generic helper for stuff, things, misc operations");
         map.insert(name.clone(), schema_for(&name, &short));
         index.push(SearchableToolMeta {
             name,
@@ -114,7 +116,10 @@ fn recall(selected: &[String], ground_truth_used: &[&str]) -> f64 {
         return 1.0;
     }
     let sel: HashSet<&str> = selected.iter().map(|s| s.as_str()).collect();
-    let hits = ground_truth_used.iter().filter(|t| sel.contains(**t)).count();
+    let hits = ground_truth_used
+        .iter()
+        .filter(|t| sel.contains(**t))
+        .count();
     hits as f64 / ground_truth_used.len() as f64
 }
 
@@ -135,6 +140,7 @@ fn tool_search_quality_two_phase_not_worse_than_baseline() {
     let cfg = ToolSearchConfig {
         max_candidates: 24,
         budget_tokens: 1200,
+        max_prior_discovered: 8,
     };
 
     struct Case<'a> {
@@ -203,4 +209,3 @@ fn tool_search_quality_two_phase_not_worse_than_baseline() {
         );
     }
 }
-

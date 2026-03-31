@@ -349,7 +349,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
 
         // ── 1. Resolve LLM model ────────────────────────────────────────
         let pool_ref = self.shared_pool.as_ref().map(|sp| sp.get());
-        let (model_name, api_key, base_url, provider) =
+        let (model_name, api_key, base_url, provider, has_fallback) =
             match mo_agent_services::resolve_active_llm_model(
                 &self.matrixone,
                 self.encryptor.as_ref(),
@@ -358,7 +358,13 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             )
             .await
             {
-                Ok(m) => (m.model_name, m.api_key, m.base_url, m.provider),
+                Ok(m) => (
+                    m.model_name,
+                    m.api_key,
+                    m.base_url,
+                    m.provider,
+                    m.fallback_model.is_some(),
+                ),
                 Err(e) => return Err(format!("Model resolution failed: {e}")),
             };
 
@@ -403,6 +409,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             &base_url,
             &provider,
             Some(max_output_tokens),
+            has_fallback,
         )
         .await
         .map_err(|e| {

@@ -33,10 +33,7 @@ use std::sync::OnceLock;
 /// Global rate-limit cooldown tracker (shared across all LLM calls in this process).
 fn rate_limit_cooldown() -> &'static RateLimitCooldown {
     static COOLDOWN: OnceLock<RateLimitCooldown> = OnceLock::new();
-    let fallback_enabled = std::env::var("MO_LLM_FALLBACK_ENABLED")
-        .map(|v| v == "1" || v.to_lowercase() == "true")
-        .unwrap_or(false);
-    COOLDOWN.get_or_init(|| RateLimitCooldown::new(fallback_enabled))
+    COOLDOWN.get_or_init(RateLimitCooldown::new)
 }
 
 // ── System Prompt Cache ──────────────────────────────────────────────────────
@@ -139,6 +136,7 @@ fn stream_idle_timeout() -> std::time::Duration {
 /// Used by `ServerAgenticLoopHost` for server-side agentic loops.
 ///
 /// Honors rate-limit cooldown state and records 429/529 errors for tracking.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn call_llm_and_collect(
     messages: &[Value],
     tools: &[Value],
@@ -147,10 +145,11 @@ pub(crate) async fn call_llm_and_collect(
     base_url: &str,
     provider: &str,
     max_output_tokens: Option<usize>,
+    has_fallback: bool,
 ) -> Result<LlmCallResult, String> {
     // Check rate-limit cooldown state before starting
     let cooldown = rate_limit_cooldown();
-    match cooldown.check_request() {
+    match cooldown.check_request(has_fallback) {
         RateLimitAction::Proceed => {}
         RateLimitAction::WaitAndRetry { delay_ms } => {
             mo_agent_core::agent_info!(
@@ -276,7 +275,7 @@ pub(crate) async fn call_llm_and_collect(
 
         // Record rate-limit errors to cooldown tracker
         if is_rate_limit_status(status) {
-            let action = cooldown.record_429(retry_after_ms);
+            let action = cooldown.record_429(retry_after_ms, has_fallback);
             mo_agent_core::agent_warn!(
                 "llm",
                 "rate limit (429): action={:?}, metrics={:?}",
@@ -290,7 +289,7 @@ pub(crate) async fn call_llm_and_collect(
         }
 
         if is_overload_status(status) {
-            let action = cooldown.record_529(retry_after_ms);
+            let action = cooldown.record_529(retry_after_ms, has_fallback);
             mo_agent_core::agent_warn!(
                 "llm",
                 "server overload ({status}): action={:?}, metrics={:?}",

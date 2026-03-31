@@ -76,7 +76,7 @@ pub enum RateLimitAction {
     Proceed,
     /// Wait for the specified duration, then retry.
     WaitAndRetry { delay_ms: u64 },
-    /// Use fallback model instead.
+    /// Use fallback model instead (caller resolves from DB).
     UseFallback { reason: CooldownReason },
     /// Reject the request (cooldown active, no fallback available).
     Reject {
@@ -101,6 +101,7 @@ pub struct RateLimitMetrics {
 /// Tracks rate-limit state and manages cooldown periods.
 ///
 /// Thread-safe and lock-free for most operations.
+/// Fallback availability is per-request (cloud-managed via DB), not stored here.
 #[derive(Debug)]
 pub struct RateLimitCooldown {
     state: AtomicU8,
@@ -111,8 +112,6 @@ pub struct RateLimitCooldown {
     cooldowns_triggered: AtomicU64,
     fallbacks_triggered: AtomicU64,
     cooldown_info: Mutex<Option<CooldownInfo>>,
-    /// Whether model fallback is enabled.
-    fallback_enabled: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -124,7 +123,7 @@ struct CooldownInfo {
 
 impl RateLimitCooldown {
     /// Create a new rate-limit cooldown tracker.
-    pub fn new(fallback_enabled: bool) -> Self {
+    pub fn new() -> Self {
         Self {
             state: AtomicU8::new(STATE_ACTIVE),
             total_429_errors: AtomicU64::new(0),
@@ -134,19 +133,13 @@ impl RateLimitCooldown {
             cooldowns_triggered: AtomicU64::new(0),
             fallbacks_triggered: AtomicU64::new(0),
             cooldown_info: Mutex::new(None),
-            fallback_enabled,
         }
-    }
-
-    /// Create with default settings (fallback disabled).
-    pub fn with_defaults() -> Self {
-        Self::new(false)
     }
 
     /// Check if we should proceed with a request.
     ///
-    /// Returns the action to take based on current state.
-    pub fn check_request(&self) -> RateLimitAction {
+    /// `has_fallback`: whether the caller has a fallback model available (from DB config).
+    pub fn check_request(&self, has_fallback: bool) -> RateLimitAction {
         match self.state.load(Ordering::SeqCst) {
             STATE_ACTIVE => RateLimitAction::Proceed,
             STATE_COOLDOWN => {
@@ -157,7 +150,8 @@ impl RateLimitCooldown {
                         drop(info);
                         self.exit_cooldown();
                         RateLimitAction::Proceed
-                    } else if cooldown.fallback_triggered {
+                    } else if has_fallback {
+                        // Fallback available - use it regardless of fallback_triggered
                         RateLimitAction::UseFallback {
                             reason: cooldown.reason,
                         }
@@ -189,31 +183,41 @@ impl RateLimitCooldown {
 
     /// Record a rate-limit error (429).
     ///
-    /// Returns the recommended action.
-    pub fn record_429(&self, retry_after_ms: Option<u64>) -> RateLimitAction {
+    /// `has_fallback`: whether a fallback model is available (from DB quirks).
+    pub fn record_429(&self, retry_after_ms: Option<u64>, has_fallback: bool) -> RateLimitAction {
         self.total_429_errors.fetch_add(1, Ordering::SeqCst);
         let consecutive = self.consecutive_errors.fetch_add(1, Ordering::SeqCst) + 1;
 
-        self.handle_rate_limit_error(consecutive, retry_after_ms, CooldownReason::RateLimit)
+        self.handle_rate_limit_error(
+            consecutive,
+            retry_after_ms,
+            CooldownReason::RateLimit,
+            has_fallback,
+        )
     }
 
     /// Record a server overload error (529 or 503).
     ///
-    /// Returns the recommended action.
-    pub fn record_529(&self, retry_after_ms: Option<u64>) -> RateLimitAction {
+    /// `has_fallback`: whether a fallback model is available (from DB quirks).
+    pub fn record_529(&self, retry_after_ms: Option<u64>, has_fallback: bool) -> RateLimitAction {
         self.total_529_errors.fetch_add(1, Ordering::SeqCst);
         let consecutive = self.consecutive_errors.fetch_add(1, Ordering::SeqCst) + 1;
         let consecutive_529 = self.consecutive_529_errors.fetch_add(1, Ordering::SeqCst) + 1;
 
-        // Check if we should trigger model fallback
-        if self.fallback_enabled && consecutive_529 >= MODEL_FALLBACK_THRESHOLD {
+        // Check if we should trigger model fallback (529-specific threshold)
+        if has_fallback && consecutive_529 >= MODEL_FALLBACK_THRESHOLD {
             self.enter_cooldown_with_fallback(CooldownReason::Overloaded);
             return RateLimitAction::UseFallback {
                 reason: CooldownReason::Overloaded,
             };
         }
 
-        self.handle_rate_limit_error(consecutive, retry_after_ms, CooldownReason::Overloaded)
+        self.handle_rate_limit_error(
+            consecutive,
+            retry_after_ms,
+            CooldownReason::Overloaded,
+            has_fallback,
+        )
     }
 
     /// Handle rate-limit error logic.
@@ -222,6 +226,7 @@ impl RateLimitCooldown {
         consecutive: u64,
         retry_after_ms: Option<u64>,
         reason: CooldownReason,
+        has_fallback: bool,
     ) -> RateLimitAction {
         // Short retry-after: just wait and retry
         if let Some(delay) = retry_after_ms
@@ -235,7 +240,7 @@ impl RateLimitCooldown {
             let cooldown_ms = self.calculate_cooldown_ms(retry_after_ms);
             self.enter_cooldown(cooldown_ms, reason);
 
-            if self.fallback_enabled {
+            if has_fallback {
                 return RateLimitAction::UseFallback { reason };
             } else {
                 return RateLimitAction::Reject {
@@ -376,7 +381,7 @@ impl RateLimitCooldown {
 
 impl Default for RateLimitCooldown {
     fn default() -> Self {
-        Self::with_defaults()
+        Self::new()
     }
 }
 
@@ -413,16 +418,16 @@ mod tests {
 
     #[test]
     fn starts_active() {
-        let rl = RateLimitCooldown::with_defaults();
+        let rl = RateLimitCooldown::new();
         assert_eq!(rl.state(), RateLimitState::Active);
-        assert_eq!(rl.check_request(), RateLimitAction::Proceed);
+        assert_eq!(rl.check_request(false), RateLimitAction::Proceed);
     }
 
     #[test]
     fn success_resets_counters() {
-        let rl = RateLimitCooldown::with_defaults();
-        rl.record_429(None);
-        rl.record_429(None);
+        let rl = RateLimitCooldown::new();
+        rl.record_429(None, false);
+        rl.record_429(None, false);
         assert_eq!(rl.metrics().consecutive_errors, 2);
 
         rl.record_success();
@@ -431,36 +436,37 @@ mod tests {
 
     #[test]
     fn short_retry_after_does_not_enter_cooldown() {
-        let rl = RateLimitCooldown::with_defaults();
-        let action = rl.record_429(Some(5000)); // 5 seconds
+        let rl = RateLimitCooldown::new();
+        let action = rl.record_429(Some(5000), false); // 5 seconds
         assert_eq!(action, RateLimitAction::WaitAndRetry { delay_ms: 5000 });
         assert_eq!(rl.state(), RateLimitState::Active);
     }
 
     #[test]
-    fn consecutive_errors_trigger_cooldown() {
-        let rl = RateLimitCooldown::with_defaults();
+    fn consecutive_errors_trigger_cooldown_no_fallback() {
+        let rl = RateLimitCooldown::new();
 
         // First two errors: wait and retry
-        let action1 = rl.record_429(None);
+        let action1 = rl.record_429(None, false);
         assert!(matches!(action1, RateLimitAction::WaitAndRetry { .. }));
 
-        let action2 = rl.record_429(None);
+        let action2 = rl.record_429(None, false);
         assert!(matches!(action2, RateLimitAction::WaitAndRetry { .. }));
 
         // Third error: enters cooldown (no fallback = reject)
-        let action3 = rl.record_429(None);
+        let action3 = rl.record_429(None, false);
         assert!(matches!(action3, RateLimitAction::Reject { .. }));
         assert!(rl.is_in_cooldown());
     }
 
     #[test]
-    fn fallback_enabled_uses_fallback() {
-        let rl = RateLimitCooldown::new(true); // fallback enabled
+    fn fallback_available_uses_fallback() {
+        let rl = RateLimitCooldown::new();
 
-        rl.record_429(None);
-        rl.record_429(None);
-        let action = rl.record_429(None);
+        // has_fallback = true → should get UseFallback action
+        rl.record_429(None, true);
+        rl.record_429(None, true);
+        let action = rl.record_429(None, true);
 
         assert!(matches!(
             action,
@@ -472,11 +478,11 @@ mod tests {
 
     #[test]
     fn consecutive_529_triggers_fallback() {
-        let rl = RateLimitCooldown::new(true);
+        let rl = RateLimitCooldown::new();
 
-        rl.record_529(None);
-        rl.record_529(None);
-        let action = rl.record_529(None);
+        rl.record_529(None, true);
+        rl.record_529(None, true);
+        let action = rl.record_529(None, true);
 
         assert!(matches!(
             action,
@@ -488,8 +494,19 @@ mod tests {
     }
 
     #[test]
+    fn consecutive_529_no_fallback_rejects() {
+        let rl = RateLimitCooldown::new();
+
+        rl.record_529(None, false);
+        rl.record_529(None, false);
+        let action = rl.record_529(None, false);
+
+        assert!(matches!(action, RateLimitAction::Reject { .. }));
+    }
+
+    #[test]
     fn cooldown_expires() {
-        let rl = RateLimitCooldown::with_defaults();
+        let rl = RateLimitCooldown::new();
 
         // Force short cooldown for testing
         rl.enter_cooldown(50, CooldownReason::RateLimit);
@@ -499,18 +516,34 @@ mod tests {
         std::thread::sleep(Duration::from_millis(100));
 
         // check_request should exit cooldown
-        let action = rl.check_request();
+        let action = rl.check_request(false);
         assert_eq!(action, RateLimitAction::Proceed);
         assert!(!rl.is_in_cooldown());
     }
 
     #[test]
-    fn metrics_tracking() {
-        let rl = RateLimitCooldown::with_defaults();
+    fn cooldown_check_with_fallback() {
+        let rl = RateLimitCooldown::new();
 
-        rl.record_429(None);
-        rl.record_429(None);
-        rl.record_529(None);
+        rl.enter_cooldown(5000, CooldownReason::RateLimit);
+        assert!(rl.is_in_cooldown());
+
+        // Without fallback → Reject
+        let action = rl.check_request(false);
+        assert!(matches!(action, RateLimitAction::Reject { .. }));
+
+        // With fallback → UseFallback
+        let action = rl.check_request(true);
+        assert!(matches!(action, RateLimitAction::UseFallback { .. }));
+    }
+
+    #[test]
+    fn metrics_tracking() {
+        let rl = RateLimitCooldown::new();
+
+        rl.record_429(None, false);
+        rl.record_429(None, false);
+        rl.record_529(None, false);
 
         let m = rl.metrics();
         assert_eq!(m.total_429_errors, 2);
@@ -537,7 +570,7 @@ mod tests {
 
     #[test]
     fn cooldown_remaining_ms_accuracy() {
-        let rl = RateLimitCooldown::with_defaults();
+        let rl = RateLimitCooldown::new();
         assert_eq!(rl.cooldown_remaining_ms(), 0);
 
         rl.enter_cooldown(1000, CooldownReason::RateLimit);
@@ -547,12 +580,12 @@ mod tests {
 
     #[test]
     fn long_retry_after_enters_cooldown() {
-        let rl = RateLimitCooldown::with_defaults();
+        let rl = RateLimitCooldown::new();
 
         // Long retry-after on first error
-        rl.record_429(Some(30_000)); // 30 seconds
-        rl.record_429(Some(30_000));
-        let action = rl.record_429(Some(30_000));
+        rl.record_429(Some(30_000), false); // 30 seconds
+        rl.record_429(Some(30_000), false);
+        let action = rl.record_429(Some(30_000), false);
 
         // Should enter cooldown with the provided duration
         assert!(
