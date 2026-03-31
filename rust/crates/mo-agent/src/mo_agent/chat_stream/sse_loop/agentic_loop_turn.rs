@@ -25,6 +25,7 @@ use mo_agent_runtime::{
     },
     turn::boost_domain_hints::domain_hints_from_boost_terms,
     turn::chat_history_openai::merge_skill_names_track,
+    turn::chat_turn_api_error::chat_turn_http_error_user_message,
     turn::chat_turn_budget_pressure::budget_pressure_for_chat_turn,
     turn::chat_turn_edge_profile::{
         detect_active_system_skills_in_message, read_git_branch_abbrev,
@@ -36,6 +37,7 @@ use mo_agent_runtime::{
         set_payload_tool_results_if_non_empty,
     },
     turn::chat_turn_selection_context::build_agentic_tool_selection_context,
+    turn::chat_turn_step_plan::record_agentic_step_plan_after_payload_prep,
     turn::edge_prompt_context::make_args_preview,
     turn::headless_tool_assembly::{
         CACHEABLE_TOOLS, HeadlessRoundToolIdx, begin_headless_tool_round_opening,
@@ -54,10 +56,18 @@ use mo_agent_runtime::{
         format_headless_tool_duration, record_headless_cacheable_success_and_semantic_hint,
         try_write_light_headless_step_checkpoint,
     },
+    turn::headless_tool_stderr_lines::{
+        headless_stderr_cache_hit_line, headless_stderr_error_preview_line,
+        headless_stderr_resource_limit_blocked, headless_stderr_resource_limit_in_output,
+        headless_stderr_tool_error_detail_line, headless_stderr_tool_error_header,
+        headless_stderr_tool_ok_footer_line, headless_stderr_tool_ok_header,
+        headless_stderr_unknown_tool_detail, headless_stderr_unknown_tool_header,
+    },
     turn::hydrate_reflect::hydrate_reflect_placeholder_if_needed,
     turn::prepare_turn_explain_text::{
         restricted_tools_explain_text, selector_guidance_explain_text,
     },
+    turn::skill_instructions_merge::merge_skill_instruction_bodies_for_chat,
     turn::tool_result_semantics::{is_tool_error, tool_dedup_signature},
     turn::tool_schema_prune::{filter_tool_schemas_by_excluded_names, pin_invoked_tool_schemas},
     turn::turn_guard::TurnGuard,
@@ -283,23 +293,12 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
     eprint_selector_guidance_explain(ctx.explain_stderr, &payload, selection_confidence);
     set_payload_tool_results_if_non_empty(&mut payload, ctx.tool_results);
 
-    {
-        let selected_tool_names: Vec<String> = ctx
-            .telem
-            .first_selection_report
-            .as_ref()
-            .map(|r| r.tools_selected.clone())
-            .unwrap_or_default();
-        let bp = *ctx.telem.first_budget_pressure;
-        let bt = ctx
-            .telem
-            .first_selection_report
-            .as_ref()
-            .map(|r| r.budget_used as u64)
-            .unwrap_or(0);
-        ctx.step_recorder
-            .record_plan(&selected_tool_names, selection_confidence, bp, bt);
-    }
+    record_agentic_step_plan_after_payload_prep(
+        ctx.step_recorder,
+        ctx.telem.first_selection_report.as_ref(),
+        *ctx.telem.first_budget_pressure,
+        selection_confidence,
+    );
 
     if ctx.telem.first_context_assembly_ms.is_none() {
         *ctx.telem.first_context_assembly_ms =
@@ -335,38 +334,34 @@ fn load_skill_instructions_text(
     if selected_skills.is_empty() {
         return None;
     }
-    let mut instructions = Vec::new();
-    let mut activated_skills = Vec::new();
-    if let Ok(mut reg) = skill_registry.try_write() {
-        for skill_name in selected_skills {
-            if let Err(e) = reg.load_instructions(skill_name) {
-                eprintln!(
-                    "  {} Failed to load skill {}: {}",
-                    "⚠".yellow(),
-                    skill_name,
-                    e
-                );
-                continue;
-            }
-            if let Some(skill) = reg.get(skill_name)
-                && let Some(text) = skill.instruction_text()
-            {
-                activated_skills.push(skill_name.clone());
-                instructions.push(format!("## Skill: {skill_name}\n\n{text}"));
-            }
+    let mut reg = skill_registry.try_write().ok()?;
+    let (outcomes, merged, activated_skills) =
+        merge_skill_instruction_bodies_for_chat(selected_skills, |name| {
+            reg.load_instructions(name).map_err(|e| e.to_string())?;
+            Ok(reg
+                .get(name)
+                .and_then(|sk| sk.instruction_text())
+                .map(|t| t.to_string()))
+        });
+    for o in outcomes {
+        if let Err(e) = o.result {
+            eprintln!(
+                "  {} Failed to load skill {}: {}",
+                "⚠".yellow(),
+                o.skill_name,
+                e
+            );
         }
     }
-    if instructions.is_empty() {
-        return None;
-    }
-    if !quiet {
+    let merged = merged?;
+    if !quiet && !activated_skills.is_empty() {
         eprintln!(
             "  {} Using skill: {}",
             "◆".cyan(),
             activated_skills.join(", ").cyan()
         );
     }
-    Some(instructions.join("\n\n---\n\n"))
+    Some(merged)
 }
 
 // ─── Fetch: payload → POST → consume_turn_sse ─────────────────────────────────
@@ -466,7 +461,10 @@ async fn fetch_chat_turn_sse(ctx: ChatTurnSseFetchRequest<'_>) -> Result<TurnRes
     let status = resp.status();
     if !status.is_success() {
         let body = resp.text().await.map_err(|e| e.to_string())?;
-        return Err(format!("API Error ({}): {}", status, compact_or_raw(&body)));
+        return Err(chat_turn_http_error_user_message(
+            status.as_u16(),
+            compact_or_raw(&body).as_str(),
+        ));
     }
 
     let edge_ctx = EdgeSseContext {
@@ -588,7 +586,7 @@ async fn run_headless_tool_round(ctx: HeadlessToolRoundRequest<'_>) {
             && let Some(cached) = idempotency_cache.check(&idem_key)
         {
             if !quiet {
-                eprintln!("{}", format!("  ↻ {name} (cached)").dim());
+                eprintln!("{}", headless_stderr_cache_hit_line(&name).dim());
             }
             let (tool_msg, tr) = headless_idempotency_hit_openai_pair(&id, &name, &cached.output);
             messages.push(tool_msg);
@@ -620,10 +618,10 @@ async fn run_headless_tool_round(ctx: HeadlessToolRoundRequest<'_>) {
         if !valid_tool_names.contains(&name) {
             let err_msg = unknown_local_tool_error_message(&name, valid_tool_names);
             if !quiet {
-                eprintln!("{}", format!("  ✗ {name}").red());
+                eprintln!("{}", headless_stderr_unknown_tool_header(&name).red());
             }
             if !quiet {
-                eprintln!("  {}", format!("└ {err_msg}").dim());
+                eprintln!("{}", headless_stderr_unknown_tool_detail(&err_msg).dim());
             }
             let (tool_msg, err_tr) =
                 headless_unknown_local_tool_openai_pair(&id, &name, valid_tool_names);
@@ -666,17 +664,10 @@ async fn run_headless_tool_round(ctx: HeadlessToolRoundRequest<'_>) {
                 }
                 match sig {
                     HeadlessOutputEnrichSignal::ResourceLimitBlocked { tool } => {
-                        eprintln!(
-                            "{}",
-                            format!("  ⚠ {tool} blocked: system resource limit reached").yellow()
-                        );
+                        eprintln!("{}", headless_stderr_resource_limit_blocked(&tool).yellow());
                     }
                     HeadlessOutputEnrichSignal::ResourceLimitDetectedInOutput { tool } => {
-                        eprintln!(
-                            "{}",
-                            format!("  ⚠ {tool}: resource limit detected in output — tool blocked")
-                                .dim()
-                        );
+                        eprintln!("{}", headless_stderr_resource_limit_in_output(&tool).dim());
                     }
                 }
             },
@@ -737,28 +728,23 @@ async fn run_headless_tool_round(ctx: HeadlessToolRoundRequest<'_>) {
                 None
             };
             if is_err {
-                eprintln!("{}", format!("  ✗ {name} ({duration_str})").red());
+                eprintln!(
+                    "{}",
+                    headless_stderr_tool_error_header(&name, &duration_str).red()
+                );
                 if let Some(first_line) = result_str.lines().next() {
-                    let preview = if first_line.len() > 100 {
-                        format!("{}…", &first_line[..100])
-                    } else {
-                        first_line.to_string()
-                    };
-                    eprintln!("  {}", format!("└ Error: {preview}").dim());
+                    let preview = headless_stderr_error_preview_line(first_line, 100);
+                    eprintln!("{}", headless_stderr_tool_error_detail_line(&preview).dim());
                 }
             } else {
-                eprintln!("{}", format!("  ✓ {name} ({duration_str})").green());
-                match (&detail, &summary) {
-                    (Some(d), Some(s)) => {
-                        eprintln!("  {}", format!("└ {d}  →  {s}").dim());
-                    }
-                    (Some(d), None) => {
-                        eprintln!("  {}", format!("└ {d}").dim());
-                    }
-                    (None, Some(s)) => {
-                        eprintln!("  {}", format!("└ {s}").dim());
-                    }
-                    (None, None) => {}
+                eprintln!(
+                    "{}",
+                    headless_stderr_tool_ok_header(&name, &duration_str).green()
+                );
+                if let Some(line) =
+                    headless_stderr_tool_ok_footer_line(detail.as_deref(), summary.as_deref())
+                {
+                    eprintln!("{}", line.dim());
                 }
             }
         }
