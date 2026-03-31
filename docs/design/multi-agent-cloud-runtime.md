@@ -1,7 +1,7 @@
 # Multi-Agent Cloud Runtime Architecture
 
 > **Status**: Living Design Document  
-> **Version**: 1.4.3 (Phase 0 partial: `plan_decompose` + `sync_adapters` → `runtime`; `resolve_active_llm_model` → `services`; headless `tool_request` assembly in `chat_stream`; doc sync)  
+> **Version**: 1.4.4 (Phase 0 partial: `headless_tool_assembly` in `runtime`; `plan_decompose` + `sync_adapters` → `runtime`; headless SSE loop still in CLI `chat_stream`)  
 > **Scope**: Edge-cloud state management, multi-agent orchestration, and cloud-scale execution  
 > **Audience**: Core contributors, architecture reviewers
 
@@ -263,7 +263,7 @@ The graph is correct (no cycles), but `mo-agent` being the **only crate that can
 
 ### 4.3 What's Solid and Should Not Change
 
-- **Phase 0 progress (v1.4.3)**: `plan_decompose` and `sync_adapters` live in **`mo-agent-runtime`**; **`resolve_active_llm_model`** lives in **`mo-agent-services`**; headless **`tool_request`** / edge callback assembly is implemented in `chat_stream`. Remaining: move **`chat_stream`** loop + **`ReplState`** sync/pool/ingestion to server `AppState`.
+- **Phase 0 progress (v1.4.4)**: `plan_decompose` and `sync_adapters` live in **`mo-agent-runtime`**; **`resolve_active_llm_model`** lives in **`mo-agent-services`**; headless **`tool_request`** / edge callbacks are consumed in CLI `chat_stream`, with **`headless_tool_assembly`** (cache list, dedup match, stall-guard JSON) in **`runtime`**. Remaining: move the **`chat_stream`** multi-turn loop body to a server handler; **`ReplState`** / **`AppState`** infra largely converged on **`MatrixCloudRuntime`**.
 - **Local-first journal**: Append-only JSONL is the correct foundation. Fast, crash-safe, auditable.
 - **Sync envelope state machine**: Clean→Dirty→Syncing→Conflict is correct. Extend, don't replace.
 - **DomainAdapter trait**: The trait signature is well-designed. **Learning, Events, Tasks, Templates, and Preferences** now have real [`runtime::sync_adapters`](../../rust/crates/runtime/src/sync_adapters.rs) implementations (see §6.2.1); residual “stub” language in older sections is obsolete for those domains.
@@ -1742,12 +1742,13 @@ mo-agent Orchestrator
 | Extract SSE `data:` JSON line parser | ✅ Done (slice 7) | Small | **`runtime/src/turn/sse_data_lines.rs`** — `drain_sse_data_lines`, `finish_sse_data_buffer`, `parse_sse_data_json_events`; `bridge_inprocess` stream + lifecycle contract tests |
 | Extract SSE blank-line event blocks | ✅ Done (slice 8) | Small | **`runtime/src/turn/sse_blocks.rs`** — `drain_complete_sse_event_blocks` (`\n\n` / `\r\n\r\n`); CLI `consume_turn_sse` |
 | Extract chat-turn factual / session heuristics | ✅ Done (slice 9) | Small | **`runtime/src/turn/chat_turn_heuristics.rs`** — `looks_like_factual_query`, `looks_like_live_query_with_context`, `should_force_factual_tool_retry`, `extract_repos_from_memory`, `is_session_not_found_error`; CLI `chat_stream` + `repl_turn` / `command_router` via `main` imports |
+| Extract headless tool round assembly (cache list, stall-guard shape, edge output match) | ✅ Done (slice 10) | Small | **`runtime/src/turn/headless_tool_assembly.rs`** — `CACHEABLE_TOOLS`, `EdgeToolRoundRow`, `take_edge_output_for_tool_call`, `tool_calls_for_stall_guard`; CLI `chat_stream` + `EdgeToolRoundEntry` impl in `stream_render` |
 | Implement tool execution callback protocol (cloud → edge) | ✅ Core path | Medium | §5.5 `/tools/result`, `tool_request` SSE; `chat_stream` **does not** re-execute tools for that path. |
 | Add `edge_executor_id` to chat turn protocol | ✅ | Small | Thin client + §5.5.2 light edge helpers. |
 | Move `SyncOrchestrator` construction from `ReplState` to `AppState` | ✅ Done | — | **`MatrixCloudRuntime`** bundles `SharedPool` + `IngestionSender` + `SyncOrchestrator`; `ReplState` / `AppState` hold `Option<Arc<MatrixCloudRuntime>>` only (no separate orchestrator field) |
 | Move `IngestionSender` from `ReplState` to server pipeline | ✅ Done | — | Same bundle as row above; journal flush via `enqueue_journal_events` |
 | Remove `matrixone_pool` from `ReplState` (use server `shared_pool`) | ✅ Done | — | Superseded by `MatrixCloudRuntime::shared_pool()`; no `matrixone_pool` field on `ReplState` |
-| Refactor `chat_stream.rs`: cognitive loop → `runtime`, rendering stays CLI | 🟡 In progress | Large | **Slices 1–9**: factual-query heuristics → **`turn/chat_turn_heuristics.rs`**. Remaining: main multi-turn loop, stall/TurnGuard, headless tool assembly vs `bridge_inprocess` |
+| Refactor `chat_stream.rs`: cognitive loop → `runtime`, rendering stays CLI | 🟡 In progress | Large | **Slices 1–10**: headless match + cache list → **`turn/headless_tool_assembly.rs`**. Remaining: main multi-turn loop body (payload, selector, step recorder), rendering + `consume_turn_sse`, `bridge_inprocess` convergence |
 
 **Success criteria** (unchanged): `mo-agent` CLI can be deleted and replaced with a ~500-line thin client; **not yet met** — `chat_stream` + `ReplState` infra fields remain.
 
@@ -1863,8 +1864,9 @@ mo-agent Orchestrator
 | SSE data JSON lines | `runtime/src/turn/sse_data_lines.rs` | Incremental `data:` line → JSON; `[DONE]`; EOF flush | runtime ✅ |
 | SSE event blocks | `runtime/src/turn/sse_blocks.rs` | Blank-line delimited event text (server / thin-client framing) | runtime ✅ |
 | Chat turn heuristics | `runtime/src/turn/chat_turn_heuristics.rs` | Factual-query guard, session-not-found, repo extraction from memory text | runtime ✅ |
+| Headless tool assembly | `runtime/src/turn/headless_tool_assembly.rs` | `CACHEABLE_TOOLS`, edge row → `tool_call` output match, synthetic stall-guard JSON | runtime ✅ |
 | Bridge (HTTP) | `runtime/src/turn/bridge/mod.rs` | HttpChatTurnBridge, forwards to external service | runtime ✅ |
-| Chat stream | `mo-agent/src/mo_agent/chat_stream.rs` | Multi-turn loop, headless tool assembly (§5.5) | ⚠️ Core loop should move to runtime |
+| Chat stream | `mo-agent/src/mo_agent/chat_stream.rs` | Multi-turn loop orchestration + CLI rendering; imports runtime headless helpers | ⚠️ Core loop should move to runtime |
 | Plan decompose | `runtime/src/plan_decompose.rs` | Long-horizon planning, subtask generation | runtime ✅ |
 | Entity graph | `runtime/src/pipeline/entity.rs` | EntityKnowledge, decayed_confidence | runtime ✅ |
 | Pattern library | `runtime/src/pipeline/pattern.rs` | ToolChainPattern, drift detection | runtime ✅ |

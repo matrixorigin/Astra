@@ -12,6 +12,9 @@ use mo_agent_runtime::turn::chat_turn_heuristics::{
 use mo_agent_runtime::turn::edge_prompt_context::{
     detect_project_languages, detect_workspace_context, make_args_preview,
 };
+use mo_agent_runtime::turn::headless_tool_assembly::{
+    take_edge_output_for_tool_call, tool_calls_for_stall_guard, CACHEABLE_TOOLS,
+};
 use mo_agent_runtime::turn::tool_result_semantics::{
     is_resource_limit_output, is_tool_error, tool_dedup_signature,
 };
@@ -27,55 +30,6 @@ pub(crate) fn edge_executor_instance_id() -> &'static str {
             })
         })
         .as_str()
-}
-
-/// Tools that are idempotent reads — safe to cache across turns.
-/// Side-effectful tools (bash, write_file, mo_query, etc.) must NOT be in this list.
-const CACHEABLE_TOOLS: &[&str] = &[
-    "read_file",
-    "list_dir",
-    "grep",
-    "glob",
-    "symbols",
-    "find_definition",
-    "find_references",
-    "git_status",
-    "git_diff",
-    "git_log",
-    "git_blame",
-    "git_file_history",
-    "git_contributors",
-    "git_log_search",
-    "github_list_prs",
-    "github_get_pr",
-    "github_ci_status",
-    "github_list_issues",
-    "github_get_issue",
-    "get_agent_info",
-];
-
-fn take_edge_output_for_tool_call(
-    name: &str,
-    args: &serde_json::Value,
-    round: &[crate::stream_render::EdgeToolRoundEntry],
-    consumed: &mut [bool],
-    by_sig: &HashMap<String, String>,
-) -> String {
-    let sig = tool_dedup_signature(name, args);
-    for (i, e) in round.iter().enumerate() {
-        if consumed[i] {
-            continue;
-        }
-        if tool_dedup_signature(&e.tool, &e.args) == sig {
-            consumed[i] = true;
-            return e.output.clone();
-        }
-    }
-    by_sig.get(&sig).cloned().unwrap_or_else(|| {
-        format!(
-            "Error: headless edge protocol — expected SSE `tool_request` before assistant `tool_call` for `{name}` (no matching edge execution in this turn)."
-        )
-    })
 }
 
 async fn hydrate_reflect_placeholder_if_needed(
@@ -1189,22 +1143,8 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
             break;
         }
 
-        let tool_calls_for_guard: Vec<serde_json::Value> = if !turn_result.tool_calls.is_empty() {
-            turn_result.tool_calls.clone()
-        } else {
-            turn_result
-                .edge_tool_round
-                .iter()
-                .enumerate()
-                .map(|(i, e)| {
-                    serde_json::json!({
-                        "id": format!("edge-{i}"),
-                        "name": e.tool,
-                        "arguments": e.args.clone(),
-                    })
-                })
-                .collect()
-        };
+        let tool_calls_for_guard =
+            tool_calls_for_stall_guard(&turn_result.tool_calls, &turn_result.edge_tool_round);
 
         // Stall & divergence detection via unified TurnGuard
         {
@@ -1947,60 +1887,6 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
-    // ── Cross-turn dedup: CACHEABLE_TOOLS constant ──
-
-    #[test]
-    fn cacheable_tools_are_all_read_only() {
-        // Ensure no side-effectful tools are in the cacheable list
-        const SIDE_EFFECTFUL: &[&str] = &[
-            "bash",
-            "write_file",
-            "str_replace",
-            "delete_file",
-            "multi_edit",
-            "git_commit",
-            "git_stash",
-            "git_checkout_file",
-            "github_create_issue",
-            "mo_query",
-            "mo_snapshot",
-            "mo_branch",
-            "memory_store",
-            "memory_purge",
-            "memory_correct",
-        ];
-        for tool in CACHEABLE_TOOLS {
-            assert!(
-                !SIDE_EFFECTFUL.contains(tool),
-                "CACHEABLE_TOOLS must not contain side-effectful tool: {tool}"
-            );
-        }
-    }
-
-    #[test]
-    fn cacheable_tools_covers_git_and_github_reads() {
-        // All read-only git/github tools should be cacheable
-        for expected in &[
-            "git_status",
-            "git_diff",
-            "git_log",
-            "git_blame",
-            "read_file",
-            "grep",
-            "glob",
-            "list_dir",
-            "github_list_prs",
-            "github_get_pr",
-        ] {
-            assert!(
-                CACHEABLE_TOOLS.contains(expected),
-                "missing cacheable tool: {expected}"
-            );
-        }
-    }
-
     // ── ToolCallRecord ingestion completeness ──
 
     /// Verify ToolCallRecord can represent all early-exit paths

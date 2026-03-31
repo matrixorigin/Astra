@@ -17,6 +17,7 @@ pub mod execution_state;
 pub mod explain;
 pub mod firewall;
 pub mod history;
+pub mod headless_tool_assembly;
 pub mod history_apply;
 pub mod hook_plans;
 pub mod implicit_feedback;

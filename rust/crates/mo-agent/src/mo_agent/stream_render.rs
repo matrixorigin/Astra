@@ -31,6 +31,18 @@ pub(super) struct EdgeToolRoundEntry {
     pub output: String,
 }
 
+impl mo_agent_runtime::turn::headless_tool_assembly::EdgeToolRoundRow for EdgeToolRoundEntry {
+    fn tool_name(&self) -> &str {
+        &self.tool
+    }
+    fn tool_args(&self) -> &serde_json::Value {
+        &self.args
+    }
+    fn tool_output(&self) -> &str {
+        &self.output
+    }
+}
+
 /// When set, SSE `tool_request` / `approval_required` are handled and posted to the cloud API.
 ///
 /// `perm_manager` must point at the same [`crate::permission_manager::PermissionManager`] used for
