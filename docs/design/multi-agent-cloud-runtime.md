@@ -1,7 +1,7 @@
 # Multi-Agent Cloud Runtime Architecture
 
 > **Status**: Living Design Document  
-> **Version**: 1.4.14 (Phase 0 partial: `chat_stream/sse_loop/` directory module + `run.rs`; headless loop still in CLI)  
+> **Version**: 1.4.15 (Phase 0 partial: `sse_loop` skill load + explain stderr helpers; headless loop still in CLI)  
 > **Scope**: Edge-cloud state management, multi-agent orchestration, and cloud-scale execution  
 > **Audience**: Core contributors, architecture reviewers
 
@@ -102,7 +102,7 @@ rust/crates/
 │   ├── main.rs              # Entry point, REPL loop, session management
 │   ├── edge_tools.rs        # 50 tools: bash, file ops, git (gix), code intel, web, memory
 │   ├── mo_agent/
-│   │   ├── chat_stream/     # `mod.rs` + `sse_loop/` (`run.rs`) + helpers; SSE + stall/budget/guards; headless §5.5
+│   │   ├── chat_stream/     # `mod.rs` + `sse_loop/` (`run.rs`, `skill_instructions_round`, `explain_sidecar`, …); headless §5.5
 │   │   └── repl_turn.rs     # Single turn execution
 │   └── edge_tools/
 │       ├── code_intel.rs    # 10 tree-sitter AST tools
@@ -263,7 +263,7 @@ The graph is correct (no cycles), but `mo-agent` being the **only crate that can
 
 ### 4.3 What's Solid and Should Not Change
 
-- **Phase 0 progress (v1.4.14)**: same as v1.4.13, plus **`chat_stream/sse_loop/`** layout (`mod.rs` + **`run.rs`**) for a cleaner submodule split before further extractions. Remaining: move the multi-turn loop body to a server handler; **`ReplState`** / **`AppState`** infra largely converged on **`MatrixCloudRuntime`**.
+- **Phase 0 progress (v1.4.15)**: same as v1.4.14, plus **`sse_loop/skill_instructions_round.rs`** and **`sse_loop/explain_sidecar.rs`** to shrink **`run.rs`** without changing behavior. Remaining: move the multi-turn loop body to a server handler; **`ReplState`** / **`AppState`** infra largely converged on **`MatrixCloudRuntime`**.
 - **Local-first journal**: Append-only JSONL is the correct foundation. Fast, crash-safe, auditable.
 - **Sync envelope state machine**: Clean→Dirty→Syncing→Conflict is correct. Extend, don't replace.
 - **DomainAdapter trait**: The trait signature is well-designed. **Learning, Events, Tasks, Templates, and Preferences** now have real [`runtime::sync_adapters`](../../rust/crates/runtime/src/sync_adapters.rs) implementations (see §6.2.1); residual “stub” language in older sections is obsolete for those domains.
@@ -432,7 +432,7 @@ A **headless cloud runtime** is an agent runtime that has no UI, no local filesy
 | `MatrixOne pool` | `ReplState` (`main.rs:406`) | `AppState` (already has `shared_pool`) | Duplicate pool in CLI | Small |
 | `IngestionSender` | `ReplState` (`main.rs:402`) | Server-side event pipeline | CLI publishes cloud events directly | Small |
 | `InProcessChatTurnBridge` model SQL | ~~`runtime/turn/`~~ | `services` | ✅ Query/decrypt extracted to `resolve_active_llm_model` | Remaining: pool/settings wiring in bridge |
-| Skill registry + loader | `chat_stream/sse_loop/run.rs` (~`load_instructions`) | `runtime` `SkillService` | Skill loading is cognitive, not CLI | Medium |
+| Skill registry + loader | `chat_stream/sse_loop/skill_instructions_round.rs` + `run.rs` | `runtime` `SkillService` | Skill loading is cognitive, not CLI | Medium |
 
 #### What Stays on Edge (must NOT move)
 
@@ -1754,12 +1754,13 @@ mo-agent Orchestrator
 | Extract injected OpenAI `user` rows (factual retry, intent-drift correction) | ✅ Done (slice 19) | Tiny | **`chat_history_openai`**: `openai_user_content_message`; **`chat_turn_heuristics`**: `openai_factual_tool_retry_user_message`; CLI `sse_loop` |
 | Extract TurnGuard verdict injections → `messages` | ✅ Done (slice 20) | Tiny | **`chat_history_openai`**: `append_openai_user_content_messages`; CLI `sse_loop` |
 | Split `sse_loop.rs` → `sse_loop/mod.rs` + `sse_loop/run.rs` | ✅ Done (slice 21) | Tiny | Mechanical layout only; public path unchanged (`chat_stream::stream_chat_sse`) |
+| Split skill instruction load + explain stderr from `sse_loop/run.rs` | ✅ Done (slice 22) | Tiny | **`sse_loop/skill_instructions_round.rs`**, **`sse_loop/explain_sidecar.rs`** |
 | Implement tool execution callback protocol (cloud → edge) | ✅ Core path | Medium | §5.5 `/tools/result`, `tool_request` SSE; `chat_stream` **does not** re-execute tools for that path. |
 | Add `edge_executor_id` to chat turn protocol | ✅ | Small | Thin client + §5.5.2 light edge helpers. |
 | Move `SyncOrchestrator` construction from `ReplState` to `AppState` | ✅ Done | — | **`MatrixCloudRuntime`** bundles `SharedPool` + `IngestionSender` + `SyncOrchestrator`; `ReplState` / `AppState` hold `Option<Arc<MatrixCloudRuntime>>` only (no separate orchestrator field) |
 | Move `IngestionSender` from `ReplState` to server pipeline | ✅ Done | — | Same bundle as row above; journal flush via `enqueue_journal_events` |
 | Remove `matrixone_pool` from `ReplState` (use server `shared_pool`) | ✅ Done | — | Superseded by `MatrixCloudRuntime::shared_pool()`; no `matrixone_pool` field on `ReplState` |
-| Refactor `chat_stream/`: cognitive loop → `runtime`, rendering stays CLI | 🟡 In progress | Large | **Slices 1–21** + **`sse_loop/`** on-disk split (**`run.rs`**). Remaining: move main loop body to server; `consume_turn_sse` + `bridge_inprocess` convergence |
+| Refactor `chat_stream/`: cognitive loop → `runtime`, rendering stays CLI | 🟡 In progress | Large | **Slices 1–22** + **`sse_loop/`** (`run.rs` + helpers). Remaining: move main loop body to server; `consume_turn_sse` + `bridge_inprocess` convergence |
 
 **Success criteria** (unchanged): `mo-agent` CLI can be deleted and replaced with a ~500-line thin client; **not yet met** — `chat_stream` + `ReplState` infra fields remain.
 

@@ -47,6 +47,10 @@ use crate::{
     ExplainMode, StreamResult, VerdictEvent,
 };
 
+use super::explain_sidecar::{
+    eprint_restricted_tools_explain, eprint_selector_guidance_explain,
+};
+use super::skill_instructions_round::{load_skill_instructions_text, merge_skill_names_track};
 use super::super::{
     edge_executor::edge_executor_instance_id,
     explain_reports::{print_explain_report, print_verdict_report},
@@ -345,46 +349,9 @@ pub(crate) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
             (selected, report, conf)
         };
         
-        // Load skill instructions if LLM selected any skills
-        let skill_instructions: Option<String> = if !selected_skills.is_empty() {
-            let mut instructions = Vec::new();
-            let mut activated_skills = Vec::new();
-            if let Ok(mut reg) = skill_registry.try_write() {
-                for skill_name in &selected_skills {
-                    // Load instructions if not already loaded
-                    if let Err(e) = reg.load_instructions(skill_name) {
-                        eprintln!("  {} Failed to load skill {}: {}", "⚠".yellow(), skill_name, e);
-                        continue;
-                    }
-                    // Get the instruction text
-                    if let Some(skill) = reg.get(skill_name)
-                        && let Some(text) = skill.instruction_text()
-                    {
-                        activated_skills.push(skill_name.clone());
-                        instructions.push(format!("## Skill: {}\n\n{}", skill_name, text));
-                    }
-                }
-            }
-            if instructions.is_empty() {
-                None
-            } else {
-                if !quiet {
-                    eprintln!(
-                        "  {} Using skill: {}",
-                        "◆".cyan(),
-                        activated_skills.join(", ").cyan()
-                    );
-                }
-                Some(instructions.join("\n\n---\n\n"))
-            }
-        } else {
-            None
-        };
-        for skill_name in &selected_skills {
-            if !all_selected_skills.contains(skill_name) {
-                all_selected_skills.push(skill_name.clone());
-            }
-        }
+        let skill_instructions =
+            load_skill_instructions_text(skill_registry, &selected_skills, quiet);
+        merge_skill_names_track(&mut all_selected_skills, &selected_skills);
         
         merge_skill_instructions_into_edge_profile(&mut payload, skill_instructions.as_deref());
         
@@ -409,37 +376,9 @@ pub(crate) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
         let final_schemas =
             filter_tool_schemas_by_excluded_names(turn_schemas, &restricted_tools);
         set_payload_edge_tools(&mut payload, final_schemas);
-        if explain != ExplainMode::Off && !restricted_tools.is_empty() {
-            eprintln!(
-                "{}",
-                format!(
-                    "  ├─ restricted: {} tool(s) filtered [{}]",
-                    restricted_tools.len(),
-                    restricted_tools
-                        .iter()
-                        .cloned()
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                )
-                .dim()
-            );
-        }
-        if explain != ExplainMode::Off
-            && let Some(recommended) = payload["edge_profile"]["recommended_tools"].as_array()
-        {
-            let names: Vec<&str> = recommended.iter().filter_map(|v| v.as_str()).collect();
-            if !names.is_empty() {
-                eprintln!(
-                    "{}",
-                    format!(
-                        "  ├─ guidance: {} (confidence: {:.2})",
-                        names.join(", "),
-                        selection_confidence
-                    )
-                    .dim()
-                );
-            }
-        }
+        let explain_stderr = explain != ExplainMode::Off;
+        eprint_restricted_tools_explain(explain_stderr, &restricted_tools);
+        eprint_selector_guidance_explain(explain_stderr, &payload, selection_confidence);
         set_payload_tool_results_if_non_empty(&mut payload, &tool_results);
 
         // Step recorder: mark plan phase (tool selection done, LLM call about to start)
