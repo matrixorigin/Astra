@@ -383,8 +383,9 @@ impl ToolExecutor {
                 let stderr = String::from_utf8_lossy(&out.stderr);
                 match out.status.code() {
                     Some(0) => {
-                        let result = if text.len() > 20_000 {
-                            let mut t = text[..20_000].to_string();
+                        let limit = self.scaled_output_limit().min(20_000);
+                        let result = if text.len() > limit {
+                            let mut t = text[..text.floor_char_boundary(limit)].to_string();
                             t.push_str("\n[truncated]");
                             t
                         } else {
@@ -478,7 +479,8 @@ impl ToolExecutor {
         let max_bytes = args
             .get("max_bytes")
             .and_then(Value::as_u64)
-            .unwrap_or(10_000) as usize;
+            .map(|n| n as usize)
+            .unwrap_or_else(|| self.scaled_output_limit().min(10_000));
         let timeout_secs = args.get("timeout").and_then(Value::as_u64).unwrap_or(10);
 
         // Use -w to capture HTTP status code and content type for structured reporting

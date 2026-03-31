@@ -152,8 +152,9 @@ impl ToolExecutor {
 
         if !is_ranged {
             let total_lines = content.lines().count();
-            if content.len() > 50_000 {
-                let mut out = content[..50_000].to_string();
+            let max_chars = self.scaled_output_limit();
+            if content.len() > max_chars {
+                let mut out = content[..content.floor_char_boundary(max_chars)].to_string();
                 out.push_str(&format!(
                     "\n[truncated — file has {total_lines} lines, use start_line/end_line or outline=true]"
                 ));
@@ -164,7 +165,7 @@ impl ToolExecutor {
         let lines: Vec<&str> = content.lines().collect();
         let s = start.unwrap_or(1).saturating_sub(1);
         let e = end.unwrap_or(lines.len()).min(lines.len());
-        truncate_output(lines[s..e].join("\n"), global_output_limit())
+        truncate_output(lines[s..e].join("\n"), self.scaled_output_limit())
     }
 
     /// Returns JSON with structured result for reliable parsing
@@ -346,7 +347,10 @@ impl ToolExecutor {
         }
 
         match fs::remove_file(&path) {
-            Ok(_) => format!("Deleted: {}", rel_str),
+            Ok(_) => {
+                self.remove_file_state(&path);
+                format!("Deleted: {}", rel_str)
+            }
             Err(e) => format!("Error deleting file: {e}"),
         }
     }

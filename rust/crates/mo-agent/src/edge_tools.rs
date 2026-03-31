@@ -1283,6 +1283,47 @@ impl ToolExecutor {
             .unwrap_or(false)
     }
 
+    /// Output limit scaled by budget pressure.
+    /// At 0.0 pressure → full limit. At 0.9 → 25% of limit.
+    fn scaled_output_limit(&self) -> usize {
+        let base = tool_output_limit();
+        let pressure = self.get_budget_pressure();
+        let scale = 1.0 - (pressure * 0.75); // 0.0→1.0, 0.6→0.55, 0.9→0.325
+        (base as f64 * scale.max(0.25)) as usize
+    }
+
+    /// Clear all file state (call after compaction to avoid stale dedup).
+    #[allow(dead_code)] // Public API for compaction cleanup
+    pub fn clear_file_state(&self) {
+        if let Ok(mut state) = self.file_state.lock() {
+            state.clear();
+        }
+    }
+
+    /// Remove a single file from state tracking (call after delete).
+    fn remove_file_state(&self, path: &Path) {
+        if let Ok(mut state) = self.file_state.lock() {
+            state.remove(path);
+        }
+    }
+
+    /// Return recently-read file paths sorted by recency (most recent first).
+    /// Used for post-compact file restoration — re-inject the N most recently
+    /// accessed files so the LLM retains working context after compaction.
+    #[allow(dead_code)] // Public API for post-compact file restoration
+    pub fn recently_read_files(&self, max: usize) -> Vec<PathBuf> {
+        if let Ok(state) = self.file_state.lock() {
+            let mut entries: Vec<_> = state
+                .iter()
+                .filter(|(_, fs)| fs.from_read)
+                .collect();
+            entries.sort_by(|a, b| b.1.timestamp_ms.cmp(&a.1.timestamp_ms));
+            entries.into_iter().take(max).map(|(p, _)| p.clone()).collect()
+        } else {
+            Vec::new()
+        }
+    }
+
     /// Configure security sandbox for tool execution.
     #[allow(dead_code)] // Public builder API for library consumers
     pub fn with_sandbox(mut self, policy: SandboxPolicy) -> Self {
