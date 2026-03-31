@@ -47,6 +47,8 @@ mod auth_flow;
 mod chat_stream;
 #[path = "mo_agent/cli_utils.rs"]
 mod cli_utils;
+#[path = "mo_agent/edge_lifecycle.rs"]
+mod edge_lifecycle;
 #[path = "mo_agent/command_router.rs"]
 mod command_router;
 #[path = "mo_agent/permission_manager.rs"]
@@ -83,6 +85,7 @@ use cli_utils::{
     tool_result_summary, truncate_str, urlencoding,
 };
 use command_router::{execute_cli_command, ExitCode};
+use edge_lifecycle::register_and_start_heartbeat;
 use permission_manager::PermissionManager;
 #[cfg(test)]
 use stream_render::{StreamRenderState, TurnResult, dispatch_turn_event_block};
@@ -2879,6 +2882,11 @@ async fn run_chat_repl(
 
     print_repl_banner(profile, &state);
 
+    let mut edge_heartbeat_task: Option<tokio::task::JoinHandle<()>> = None;
+    if let Some(ref tok) = current_access_token(profile) {
+        edge_heartbeat_task = register_and_start_heartbeat(api, tok).await;
+    }
+
     if state.model.as_deref() == Some("⚠ none") {
         eprintln!(
             "  {}  {}",
@@ -3221,6 +3229,10 @@ async fn run_chat_repl(
         }
         // Push preferences to cloud (best-effort)
         try_cloud_push_preferences(&state).await;
+    }
+
+    if let Some(h) = edge_heartbeat_task.take() {
+        h.abort();
     }
 
     let _ = editor.save_history(&hist_path);
