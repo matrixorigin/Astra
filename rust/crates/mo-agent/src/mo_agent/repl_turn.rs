@@ -258,7 +258,7 @@ async fn run_chat_turn(
     // NOTE: Skill selection is now done by LLM during tool selection.
     // The skill_registry is passed to stream_chat_sse for loading instructions
     // when the LLM selects a skill.
-    
+
     tokio::select! {
         result = stream_chat_sse(ChatTurnParams {
             api: ctx.api,

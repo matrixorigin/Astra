@@ -215,7 +215,10 @@ pub(super) async fn handle_state_command(
                                 fact,
                             );
                             let _ = api
-                                .post_memory_store_json(tok, &fact_entry.to_store_payload_with_meta(&fact_meta))
+                                .post_memory_store_json(
+                                    tok,
+                                    &fact_entry.to_store_payload_with_meta(&fact_meta),
+                                )
                                 .await;
                             facts_stored += 1;
                         }
@@ -318,7 +321,10 @@ pub(super) async fn handle_state_command(
                             prompts::memory_proto::SRC_COMPACT,
                         );
                         let _ = api
-                            .post_memory_store_json(tok, &swap_entry.to_store_payload_with_meta(&swap_meta))
+                            .post_memory_store_json(
+                                tok,
+                                &swap_entry.to_store_payload_with_meta(&swap_meta),
+                            )
                             .await;
                     }
                 }
@@ -394,7 +400,9 @@ pub(super) async fn handle_state_command(
                 "history",
                 "performance",
             ];
-            let mut rel = mo_thin_client::paths::chat_session_reflect(&sid).trim_start_matches('/').to_string();
+            let mut rel = mo_thin_client::paths::chat_session_reflect(&sid)
+                .trim_start_matches('/')
+                .to_string();
             let mut query_parts: Vec<String> = Vec::new();
             let mut parts2 = arg.splitn(2, ' ');
             let first = parts2.next().unwrap_or("").trim();
@@ -414,7 +422,10 @@ pub(super) async fn handle_state_command(
             }
             match api.get_authed_path_text(tok, &rel).await {
                 Ok(body) => render_reflect_report(&body, &sid),
-                Err(mo_thin_client::ThinClientError::Api { status, body: err_body }) => {
+                Err(mo_thin_client::ThinClientError::Api {
+                    status,
+                    body: err_body,
+                }) => {
                     eprintln!(
                         "{}",
                         format!("  ✗ API Error ({}): {}", status, compact_or_raw(&err_body)).red()

@@ -101,12 +101,12 @@ pub(super) async fn execute_cli_command(
             let email = prompt_or("Email   ", args.email)?;
             let password = prompt_password_masked("Password", args.password)?;
             api.post_auth_register_json(&serde_json::json!({
-                    "username": username,
-                    "email": email,
-                    "password": password
-                }))
-                .await
-                .map_err(map_thin_err)?;
+                "username": username,
+                "email": email,
+                "password": password
+            }))
+            .await
+            .map_err(map_thin_err)?;
             eprintln!("{}", "  ✓  Registered! Now logging in…".green());
             // Auto-login after register
             do_login(api, profile.as_deref(), &username, &password).await?;
@@ -136,10 +136,7 @@ pub(super) async fn execute_cli_command(
 
         Some(Command::Whoami) => {
             let (_, _, _, token) = get_profile_and_token(profile.as_deref())?;
-            let body = api
-                .get_auth_me_text(&token)
-                .await
-                .map_err(map_thin_err)?;
+            let body = api.get_auth_me_text(&token).await.map_err(map_thin_err)?;
             print_json_or_raw(&body);
             Ok(ExitCode::Success)
         }
@@ -211,7 +208,9 @@ pub(super) async fn execute_cli_command(
         Some(Command::Chat(args)) => {
             // Handle --no-color: set NO_COLOR environment variable for crossterm
             if args.no_color {
-                unsafe { std::env::set_var("NO_COLOR", "1"); }
+                unsafe {
+                    std::env::set_var("NO_COLOR", "1");
+                }
             }
 
             // Determine message source: --stdin, -m, or start REPL
@@ -222,7 +221,9 @@ pub(super) async fn execute_cli_command(
                     .map_err(|e| format!("failed to read stdin: {e}"))?;
                 let msg = buf.trim().to_string();
                 if msg.is_empty() {
-                    return Err("message cannot be empty (stdin was empty or whitespace-only)".to_string());
+                    return Err(
+                        "message cannot be empty (stdin was empty or whitespace-only)".to_string(),
+                    );
                 }
                 msg
             } else if let Some(m) = args.message {
@@ -232,8 +233,7 @@ pub(super) async fn execute_cli_command(
                 m
             } else {
                 // No message → start REPL with optional pre-set session/model
-                run_chat_repl(api, profile.as_deref(), args.model.as_deref())
-                    .await?;
+                run_chat_repl(api, profile.as_deref(), args.model.as_deref()).await?;
                 return Ok(ExitCode::Success);
             };
 
@@ -343,9 +343,9 @@ pub(super) async fn execute_cli_command(
                     &token,
                     &args.session_id,
                     &serde_json::json!({
-                    "sandbox_name": args.sandbox_name,
-                    "mock_mode": args.mock_mode
-                }),
+                        "sandbox_name": args.sandbox_name,
+                        "mock_mode": args.mock_mode
+                    }),
                 )
                 .await
                 .map_err(map_thin_err)?;
@@ -432,10 +432,7 @@ pub(super) async fn execute_cli_command(
 
         Some(Command::Model(ModelCmd::List)) => {
             let (_, _, _, token) = get_profile_and_token(profile.as_deref())?;
-            let body = api
-                .get_models_text(&token)
-                .await
-                .map_err(map_thin_err)?;
+            let body = api.get_models_text(&token).await.map_err(map_thin_err)?;
             print_json_or_raw(&body);
             Ok(ExitCode::Success)
         }
@@ -514,13 +511,13 @@ pub(super) async fn execute_cli_command(
                 .post_skills_register_json(
                     &token,
                     &serde_json::json!({
-                    "skill_id": skill_id,
-                    "skill_name": args.name,
-                    "skill_version": args.version,
-                    "skill_code": skill_code,
-                    "description": args.description,
-                    "metadata": metadata
-                }),
+                        "skill_id": skill_id,
+                        "skill_name": args.name,
+                        "skill_version": args.version,
+                        "skill_code": skill_code,
+                        "description": args.description,
+                        "metadata": metadata
+                    }),
                 )
                 .await
                 .map_err(map_thin_err)?;

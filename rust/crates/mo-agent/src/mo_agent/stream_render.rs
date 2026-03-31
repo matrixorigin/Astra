@@ -110,12 +110,9 @@ async fn flush_pending_edge_work(
                     "Permission denied".to_string()
                 };
                 let sig = mo_agent_runtime::turn::tool_result_semantics::tool_dedup_signature(
-                    &req.tool,
-                    &req.args,
+                    &req.tool, &req.args,
                 );
-                result
-                    .edge_callback_outputs
-                    .insert(sig, output.clone());
+                result.edge_callback_outputs.insert(sig, output.clone());
                 result.edge_tool_round.push(EdgeToolRoundEntry {
                     request_id: req.request_id.clone(),
                     tool: req.tool.clone(),
@@ -321,7 +318,8 @@ pub(super) async fn consume_turn_sse(
     while let Some(chunk) = stream.next().await {
         let Ok(chunk) = chunk else { break };
         buffer.push_str(&String::from_utf8_lossy(&chunk));
-        let blocks = mo_agent_runtime::turn::sse_blocks::drain_complete_sse_event_blocks(&mut buffer);
+        let blocks =
+            mo_agent_runtime::turn::sse_blocks::drain_complete_sse_event_blocks(&mut buffer);
         for event_str in blocks {
             // Capture TTFT on first text content
             if !first_token_recorded
@@ -343,13 +341,7 @@ pub(super) async fn consume_turn_sse(
         }
     }
     if !buffer.trim().is_empty() {
-        dispatch_turn_event_block(
-            &buffer,
-            &mut result,
-            &mut render,
-            quiet,
-            &mut pending_edge,
-        );
+        dispatch_turn_event_block(&buffer, &mut result, &mut render, quiet, &mut pending_edge);
         flush_pending_edge_work(&mut pending_edge, edge.as_ref(), &mut result).await;
     }
 
@@ -690,7 +682,13 @@ mod tests {
     fn invalid_json_ignored() {
         let mut r = TurnResult::new();
         let mut s = StreamRenderState::new();
-        dispatch_turn_event_block("data: {invalid json}\n\n", &mut r, &mut s, true, &mut vec![]);
+        dispatch_turn_event_block(
+            "data: {invalid json}\n\n",
+            &mut r,
+            &mut s,
+            true,
+            &mut vec![],
+        );
         assert!(r.full_text.is_empty());
     }
 

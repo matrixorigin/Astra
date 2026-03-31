@@ -18,7 +18,12 @@ pub(crate) fn load_skill_instructions_text(
     if let Ok(mut reg) = skill_registry.try_write() {
         for skill_name in selected_skills {
             if let Err(e) = reg.load_instructions(skill_name) {
-                eprintln!("  {} Failed to load skill {}: {}", "⚠".yellow(), skill_name, e);
+                eprintln!(
+                    "  {} Failed to load skill {}: {}",
+                    "⚠".yellow(),
+                    skill_name,
+                    e
+                );
                 continue;
             }
             if let Some(skill) = reg.get(skill_name)

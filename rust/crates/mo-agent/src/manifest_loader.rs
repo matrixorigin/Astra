@@ -960,8 +960,16 @@ Apply the suggested changes carefully.
 
         std::fs::write(skill_dir.join("manifest.yaml"), manifest).unwrap();
         std::fs::write(skill_dir.join("SKILL.md"), skill_md).unwrap();
-        std::fs::write(skill_dir.join("templates/report.md"), "# Report\n{{ content }}").unwrap();
-        std::fs::write(skill_dir.join("scripts/analyze.sh"), "#!/bin/bash\necho analyzing").unwrap();
+        std::fs::write(
+            skill_dir.join("templates/report.md"),
+            "# Report\n{{ content }}",
+        )
+        .unwrap();
+        std::fs::write(
+            skill_dir.join("scripts/analyze.sh"),
+            "#!/bin/bash\necho analyzing",
+        )
+        .unwrap();
 
         let skill = load_skill(&skill_dir).unwrap();
 

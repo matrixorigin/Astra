@@ -1,6 +1,6 @@
 use super::*;
 
-use mo_agent_runtime::turn::cloud_approval_policy::{cloud_gated_tool_kind, CloudGatedToolKind};
+use mo_agent_runtime::turn::cloud_approval_policy::{CloudGatedToolKind, cloud_gated_tool_kind};
 use mo_agent_runtime::turn::tool_argument_hints::{
     command_hint_from_args, permission_prompt_primary_detail,
 };

@@ -429,10 +429,7 @@ pub(super) async fn handle_info_command(
             if memoria_key_set {
                 let memoria_base = std::env::var("MEMORIA_BASE_URL")
                     .unwrap_or_else(|_| mo_agent_core::config::DEFAULT_MEMORIA_URL.to_string());
-                let memoria_health = format!(
-                    "{}/health",
-                    memoria_base.trim_end_matches('/')
-                );
+                let memoria_health = format!("{}/health", memoria_base.trim_end_matches('/'));
                 match api.get_url(&memoria_health).await {
                     Ok(r) if r.status().is_success() => {
                         rows.push((true, "memoria", format!("reachable at {memoria_base}")));
@@ -625,11 +622,7 @@ pub(super) async fn handle_info_command(
                 if let Some(ref skills) = ev.selected_skills
                     && !skills.is_empty()
                 {
-                    eprintln!(
-                        "  {} {}",
-                        "Skills:".cyan(),
-                        skills.join(", ").cyan()
-                    );
+                    eprintln!("  {} {}", "Skills:".cyan(), skills.join(", ").cyan());
                 }
                 eprintln!();
 

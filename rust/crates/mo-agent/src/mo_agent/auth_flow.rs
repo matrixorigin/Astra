@@ -54,11 +54,11 @@ pub(super) async fn do_register(
     password: &str,
 ) -> Result<(), String> {
     api.post_auth_register_json(&serde_json::json!({
-            "username": username,
-            "email": email,
-            "password": password,
-        }))
-        .await
-        .map_err(map_thin_err)?;
+        "username": username,
+        "email": email,
+        "password": password,
+    }))
+    .await
+    .map_err(map_thin_err)?;
     Ok(())
 }

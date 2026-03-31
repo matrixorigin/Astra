@@ -23,8 +23,7 @@ pub(super) async fn handle_memory_domain_command(
                         "query": sub_arg,
                         "top_k": 10,
                     });
-                    match api.post_memory_search_json(tok, &payload).await
-                    {
+                    match api.post_memory_search_json(tok, &payload).await {
                         Ok(r) if r.status().is_success() => {
                             let body = r.text().await.unwrap_or_default();
                             if let Ok(arr) = serde_json::from_str::<Vec<serde_json::Value>>(&body) {
@@ -76,8 +75,7 @@ pub(super) async fn handle_memory_domain_command(
                         "query": "user preferences knowledge plans tasks",
                         "top_k": 20,
                     });
-                    match api.post_memory_search_json(tok, &payload).await
-                    {
+                    match api.post_memory_search_json(tok, &payload).await {
                         Ok(r) if r.status().is_success() => {
                             let body = r.text().await.unwrap_or_default();
                             if let Ok(arr) = serde_json::from_str::<Vec<serde_json::Value>>(&body) {
@@ -138,9 +136,7 @@ pub(super) async fn handle_memory_domain_command(
             match subcmd {
                 // Toggle: /plan with no args enters or exits plan mode
                 "" => {
-                    use plan_decompose::{
-                        PlanModeState, format_plan, format_plan_entry_card,
-                    };
+                    use plan_decompose::{PlanModeState, format_plan, format_plan_entry_card};
 
                     // If already in plan mode, exit
                     if state.plan_mode.is_some() {
@@ -195,8 +191,7 @@ pub(super) async fn handle_memory_domain_command(
                         prompts::memory_proto::NS_PLAN,
                         "current goals",
                     );
-                    match api.post_memory_search_json(tok, &payload).await
-                    {
+                    match api.post_memory_search_json(tok, &payload).await {
                         Ok(r) if r.status().is_success() => {
                             let body = r.text().await.unwrap_or_default();
                             if let Ok(arr) = serde_json::from_str::<Vec<serde_json::Value>>(&body) {
@@ -247,7 +242,9 @@ pub(super) async fn handle_memory_domain_command(
                         state.turn,
                         prompts::memory_proto::SRC_USER,
                     );
-                    match api.post_memory_store_json(tok, &entry.to_store_payload_with_meta(&meta)).await
+                    match api
+                        .post_memory_store_json(tok, &entry.to_store_payload_with_meta(&meta))
+                        .await
                     {
                         Ok(r) if r.status().is_success() => {
                             eprintln!("  {} Plan saved to memory.", "✓".green());
@@ -260,8 +257,7 @@ pub(super) async fn handle_memory_domain_command(
                     let payload = prompts::memory_proto::MemoryEntry::purge_payload(
                         prompts::memory_proto::NS_PLAN,
                     );
-                    match api.post_memory_purge_json(tok, &payload).await
-                    {
+                    match api.post_memory_purge_json(tok, &payload).await {
                         Ok(r) if r.status().is_success() => {
                             eprintln!("  {} Plan cleared.", "✓".green());
                         }
@@ -309,8 +305,7 @@ pub(super) async fn handle_memory_domain_command(
                         "edge_tools": [],  // No tools needed for plan generation
                     });
 
-                    match api.post_chat_turn(tok, &payload).await
-                    {
+                    match api.post_chat_turn(tok, &payload).await {
                         Ok(resp) if resp.status().is_success() => {
                             // Collect text from SSE stream
                             let mut full_text = String::new();
@@ -580,8 +575,8 @@ pub(super) async fn handle_memory_domain_command(
                 "load" if !sub_arg.is_empty() => {
                     // Load a specific plan from cloud by task_id (or prefix)
                     if let Some(ref svc) = state.task_service {
-                        use plan_decompose::{PlanModeState, analyze_project, format_plan};
                         use mo_agent_services::TaskService;
+                        use plan_decompose::{PlanModeState, analyze_project, format_plan};
 
                         let user_id = state.ingestion_user_id.as_deref().unwrap_or("local");
                         let query = sub_arg.trim();
@@ -690,10 +685,8 @@ pub(super) async fn handle_memory_domain_command(
                             let project_root = std::env::current_dir()
                                 .unwrap_or_else(|_| std::path::PathBuf::from("."));
                             let context = plan_decompose::analyze_project(&project_root);
-                            let mut ps = plan_decompose::PlanModeState::new(
-                                goal.to_string(),
-                                context,
-                            );
+                            let mut ps =
+                                plan_decompose::PlanModeState::new(goal.to_string(), context);
                             ps.set_plan(plan);
                             state.plan_mode = Some(ps);
                             eprintln!(
@@ -1141,9 +1134,8 @@ pub(super) async fn handle_memory_domain_command(
                                         new_plan,
                                         &format!("Replan: {}", reason.format()),
                                     );
-                                    let _ = ps.save_to_file(
-                                        &plan_decompose::PlanModeState::state_path(),
-                                    );
+                                    let _ = ps
+                                        .save_to_file(&plan_decompose::PlanModeState::state_path());
 
                                     eprintln!();
                                     eprintln!(

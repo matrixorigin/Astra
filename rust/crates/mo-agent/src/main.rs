@@ -47,10 +47,10 @@ mod auth_flow;
 mod chat_stream;
 #[path = "mo_agent/cli_utils.rs"]
 mod cli_utils;
-#[path = "mo_agent/edge_lifecycle.rs"]
-mod edge_lifecycle;
 #[path = "mo_agent/command_router.rs"]
 mod command_router;
+#[path = "mo_agent/edge_lifecycle.rs"]
+mod edge_lifecycle;
 #[path = "mo_agent/permission_manager.rs"]
 mod permission_manager;
 #[path = "mo_agent/repl_runtime.rs"]
@@ -76,16 +76,16 @@ mod stream_render;
 
 use auth_flow::{clear_profile_last_session, do_login, do_register};
 use chat_stream::{ChatTurnParams, stream_chat_sse};
+use cli_utils::{
+    Profile, compact_or_raw, get_profile_and_token, interactive_select, load_credentials,
+    map_thin_err, print_json_or_raw, print_markdown, profile_name, prompt_or,
+    prompt_password_masked, resumable_last_session_id, save_credentials, truncate_str, urlencoding,
+};
+use command_router::{ExitCode, execute_cli_command};
+use edge_lifecycle::register_and_start_heartbeat;
 use mo_agent_runtime::turn::chat_turn_heuristics::{
     is_session_not_found_error, looks_like_live_query_with_context,
 };
-use cli_utils::{
-    Profile, compact_or_raw, get_profile_and_token, interactive_select,
-    load_credentials, map_thin_err, print_json_or_raw, print_markdown, profile_name, prompt_or,
-    prompt_password_masked, resumable_last_session_id, save_credentials, truncate_str, urlencoding,
-};
-use command_router::{execute_cli_command, ExitCode};
-use edge_lifecycle::register_and_start_heartbeat;
 use permission_manager::PermissionManager;
 #[cfg(test)]
 use stream_render::{StreamRenderState, TurnResult, dispatch_turn_event_block};
@@ -2586,10 +2586,7 @@ async fn handle_slash_command(
                 eprintln!("{}", "  Not logged in. Use /login.".yellow());
                 return Ok(false);
             };
-            let body = api
-                .get_models_text(tok)
-                .await
-                .map_err(map_thin_err)?;
+            let body = api.get_models_text(tok).await.map_err(map_thin_err)?;
             {
                 let value: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
                 let models = value
@@ -2844,21 +2841,22 @@ async fn run_chat_repl(
         state.matrix_runtime = match SharedPool::new(&settings).await {
             Ok(pool) => {
                 let user_id = std::env::var("MO_USER_ID").unwrap_or_else(|_| "local".to_string());
-                let th = std::sync::Arc::new(std::sync::Mutex::new(
-                    state.tool_health_entries.clone(),
-                ));
+                let th =
+                    std::sync::Arc::new(std::sync::Mutex::new(state.tool_health_entries.clone()));
                 let lease = std::sync::Arc::new(mo_agent_services::TaskLeaseHoldCache::default());
-                Some(std::sync::Arc::new(mo_agent_runtime::MatrixCloudRuntime::attach(
-                    pool,
-                    profile.unwrap_or("default"),
-                    &user_id,
-                    pipeline_modules.entity_graph.clone(),
-                    pipeline_modules.pattern_library.clone(),
-                    pipeline_modules.calibrator.clone(),
-                    th,
-                    state.cloud_learning_version,
-                    lease,
-                )))
+                Some(std::sync::Arc::new(
+                    mo_agent_runtime::MatrixCloudRuntime::attach(
+                        pool,
+                        profile.unwrap_or("default"),
+                        &user_id,
+                        pipeline_modules.entity_graph.clone(),
+                        pipeline_modules.pattern_library.clone(),
+                        pipeline_modules.calibrator.clone(),
+                        th,
+                        state.cloud_learning_version,
+                        lease,
+                    ),
+                ))
             }
             Err(_) => None,
         };
@@ -2971,13 +2969,8 @@ async fn run_chat_repl(
                     }
                 } else if state.plan_mode.is_some() {
                     // Plan mode: handle input as plan editing
-                    handle_plan_mode_input(
-                        line.clone(),
-                        current_token.as_deref(),
-                        &mut state,
-                        api,
-                    )
-                    .await?;
+                    handle_plan_mode_input(line.clone(), current_token.as_deref(), &mut state, api)
+                        .await?;
 
                     // If plan execution was just triggered, run the auto-execution loop
                     if state.executing_plan.is_some() {
@@ -3411,42 +3404,21 @@ mod tests {
         ));
         assert_eq!(state.explain, ExplainMode::Off);
 
-        let should_exit = handle_slash_command(
-            "/explain",
-            &api,
-            None,
-            &mut state,
-            None,
-            &selector,
-        )
-        .await
-        .expect("slash command should succeed");
+        let should_exit = handle_slash_command("/explain", &api, None, &mut state, None, &selector)
+            .await
+            .expect("slash command should succeed");
         assert!(!should_exit);
         assert_eq!(state.explain, ExplainMode::On);
 
-        let should_exit = handle_slash_command(
-            "/explain",
-            &api,
-            None,
-            &mut state,
-            None,
-            &selector,
-        )
-        .await
-        .expect("slash command should succeed");
+        let should_exit = handle_slash_command("/explain", &api, None, &mut state, None, &selector)
+            .await
+            .expect("slash command should succeed");
         assert!(!should_exit);
         assert_eq!(state.explain, ExplainMode::Verbose);
 
-        let should_exit = handle_slash_command(
-            "/explain",
-            &api,
-            None,
-            &mut state,
-            None,
-            &selector,
-        )
-        .await
-        .expect("slash command should succeed");
+        let should_exit = handle_slash_command("/explain", &api, None, &mut state, None, &selector)
+            .await
+            .expect("slash command should succeed");
         assert!(!should_exit);
         assert_eq!(state.explain, ExplainMode::Off);
     }
@@ -3849,16 +3821,9 @@ mod tests {
             edge_tools::all_tool_schemas(),
         ));
         let mut state = ReplState::default();
-        let exit = handle_slash_command(
-            "/model gpt-4o",
-            &api,
-            None,
-            &mut state,
-            None,
-            &selector,
-        )
-        .await
-        .unwrap();
+        let exit = handle_slash_command("/model gpt-4o", &api, None, &mut state, None, &selector)
+            .await
+            .unwrap();
         assert!(!exit);
         assert_eq!(state.model.as_deref(), Some("gpt-4o"));
     }
@@ -3870,16 +3835,9 @@ mod tests {
             edge_tools::all_tool_schemas(),
         ));
         let mut state = ReplState::default();
-        let exit = handle_slash_command(
-            "/exit",
-            &api,
-            None,
-            &mut state,
-            None,
-            &selector,
-        )
-        .await
-        .unwrap();
+        let exit = handle_slash_command("/exit", &api, None, &mut state, None, &selector)
+            .await
+            .unwrap();
         assert!(exit);
     }
 
@@ -3911,16 +3869,9 @@ mod tests {
         ));
         let mut state = ReplState::default();
         // No health entries — should print "no data" gracefully
-        let exit = handle_slash_command(
-            "/health",
-            &api,
-            None,
-            &mut state,
-            None,
-            &selector,
-        )
-        .await
-        .unwrap();
+        let exit = handle_slash_command("/health", &api, None, &mut state, None, &selector)
+            .await
+            .unwrap();
         assert!(!exit);
     }
 
@@ -3949,16 +3900,9 @@ mod tests {
             ],
             ..Default::default()
         };
-        let exit = handle_slash_command(
-            "/health",
-            &api,
-            None,
-            &mut state,
-            None,
-            &selector,
-        )
-        .await
-        .unwrap();
+        let exit = handle_slash_command("/health", &api, None, &mut state, None, &selector)
+            .await
+            .unwrap();
         assert!(!exit);
     }
 
@@ -3978,16 +3922,9 @@ mod tests {
             }],
             ..Default::default()
         };
-        let exit = handle_slash_command(
-            "/health detail",
-            &api,
-            None,
-            &mut state,
-            None,
-            &selector,
-        )
-        .await
-        .unwrap();
+        let exit = handle_slash_command("/health detail", &api, None, &mut state, None, &selector)
+            .await
+            .unwrap();
         assert!(!exit);
     }
 
@@ -5011,16 +4948,9 @@ total_tokens_out: 500
         let mut state = ReplState::default();
         // No matrix runtime — should show "Offline" in cloud section
         assert!(state.matrix_runtime.is_none());
-        let exit = handle_slash_command(
-            "/health",
-            &api,
-            None,
-            &mut state,
-            None,
-            &selector,
-        )
-        .await
-        .unwrap();
+        let exit = handle_slash_command("/health", &api, None, &mut state, None, &selector)
+            .await
+            .unwrap();
         assert!(!exit);
     }
 

@@ -31,9 +31,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use rmcp::{
+    ClientHandler, Peer, RoleClient,
     model::{CallToolRequestParams, CallToolResult, Tool},
+    serve_client,
     service::ServiceError,
-    serve_client, ClientHandler, Peer, RoleClient,
     transport::TokioChildProcess,
 };
 use tokio::sync::RwLock;
@@ -246,7 +247,9 @@ async fn connect_stdio(
     env: &HashMap<String, String>,
 ) -> Result<McpConnection, McpError> {
     if command.is_empty() {
-        return Err(McpError::InvalidConfig("command cannot be empty".to_string()));
+        return Err(McpError::InvalidConfig(
+            "command cannot be empty".to_string(),
+        ));
     }
 
     // Build the command using tokio::process::Command
@@ -260,8 +263,7 @@ async fn connect_stdio(
     }
 
     // Create child process transport
-    let transport = TokioChildProcess::new(cmd)
-        .map_err(|e| McpError::Spawn(e.to_string()))?;
+    let transport = TokioChildProcess::new(cmd).map_err(|e| McpError::Spawn(e.to_string()))?;
 
     // Connect as MCP client
     let running = serve_client(NoOpClientHandler, transport)
@@ -305,11 +307,12 @@ pub enum McpError {
 /// Convert MCP Tool to mo-agent tool schema format.
 pub fn mcp_tool_to_schema(server_name: &str, tool: &Tool) -> serde_json::Value {
     // input_schema is Arc<JsonObject>, convert to Value
-    let params = serde_json::to_value(tool.input_schema.as_ref())
-        .unwrap_or_else(|_| serde_json::json!({
+    let params = serde_json::to_value(tool.input_schema.as_ref()).unwrap_or_else(|_| {
+        serde_json::json!({
             "type": "object",
             "properties": {},
-        }));
+        })
+    });
     serde_json::json!({
         "type": "function",
         "function": {
@@ -371,19 +374,17 @@ mod tests {
     #[test]
     fn mcp_tool_schema_conversion() {
         use std::sync::Arc;
-        let schema_map: serde_json::Map<String, serde_json::Value> = serde_json::from_value(serde_json::json!({
-            "type": "object",
-            "properties": {
-                "path": {"type": "string"}
-            },
-            "required": ["path"]
-        })).unwrap();
-        
-        let tool = Tool::new(
-            "read_file",
-            "Read a file",
-            Arc::new(schema_map),
-        );
+        let schema_map: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_value(serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"}
+                },
+                "required": ["path"]
+            }))
+            .unwrap();
+
+        let tool = Tool::new("read_file", "Read a file", Arc::new(schema_map));
 
         let schema = mcp_tool_to_schema("filesystem", &tool);
         let func = schema["function"].as_object().unwrap();
@@ -443,7 +444,10 @@ transport:
 
         match config.transport {
             Transport::Stdio { command, args, env } => {
-                assert_eq!(command, vec!["npx", "@modelcontextprotocol/server-filesystem"]);
+                assert_eq!(
+                    command,
+                    vec!["npx", "@modelcontextprotocol/server-filesystem"]
+                );
                 assert_eq!(args, vec!["--root", "/tmp"]);
                 assert_eq!(env.get("DEBUG"), Some(&"true".to_string()));
                 assert_eq!(env.get("LOG_LEVEL"), Some(&"info".to_string()));
@@ -522,23 +526,24 @@ mcp_servers:
     #[test]
     fn mcp_tool_to_schema_complex() {
         use std::sync::Arc;
-        let schema_map: serde_json::Map<String, serde_json::Value> = serde_json::from_value(serde_json::json!({
-            "type": "object",
-            "properties": {
-                "path": {
-                    "type": "string",
-                    "description": "The file path to read"
+        let schema_map: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_value(serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "The file path to read"
+                    },
+                    "encoding": {
+                        "type": "string",
+                        "enum": ["utf8", "base64"],
+                        "default": "utf8"
+                    }
                 },
-                "encoding": {
-                    "type": "string",
-                    "enum": ["utf8", "base64"],
-                    "default": "utf8"
-                }
-            },
-            "required": ["path"],
-            "additionalProperties": false
-        }))
-        .unwrap();
+                "required": ["path"],
+                "additionalProperties": false
+            }))
+            .unwrap();
 
         let tool = Tool::new(
             "read_file",
@@ -556,7 +561,10 @@ mcp_servers:
         assert_eq!(func["name"], "mcp_fs_read_file");
 
         // Description preserved
-        assert_eq!(func["description"], "Read the contents of a file at the specified path");
+        assert_eq!(
+            func["description"],
+            "Read the contents of a file at the specified path"
+        );
 
         // Parameters schema preserved
         let params = func["parameters"].as_object().unwrap();
@@ -570,7 +578,11 @@ mcp_servers:
         use std::sync::Arc;
         let empty_schema: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
 
-        let tool = Tool::new("simple_action", "Performs a simple action", Arc::new(empty_schema));
+        let tool = Tool::new(
+            "simple_action",
+            "Performs a simple action",
+            Arc::new(empty_schema),
+        );
 
         let schema = mcp_tool_to_schema("server", &tool);
         let func = schema["function"].as_object().unwrap();
@@ -627,7 +639,18 @@ mcp_servers:
         assert_eq!(parsed.enabled, original.enabled);
 
         match (original.transport, parsed.transport) {
-            (Transport::Stdio { command: c1, args: a1, env: e1 }, Transport::Stdio { command: c2, args: a2, env: e2 }) => {
+            (
+                Transport::Stdio {
+                    command: c1,
+                    args: a1,
+                    env: e1,
+                },
+                Transport::Stdio {
+                    command: c2,
+                    args: a2,
+                    env: e2,
+                },
+            ) => {
                 assert_eq!(c1, c2);
                 assert_eq!(a1, a2);
                 assert_eq!(e1, e2);

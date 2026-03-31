@@ -50,8 +50,7 @@ pub async fn register_edge_once(api: &ThinClient, token: &str) -> Result<(), Thi
     let transport_id = edge_executor_instance_id();
     let mut body = edge_register_with_capabilities(transport_id);
     enrich_register_body(&mut body);
-    api
-        .post_agents_edge_register(Some(token), Some(transport_id), &body)
+    api.post_agents_edge_register(Some(token), Some(transport_id), &body)
         .await?;
     Ok(())
 }
@@ -64,8 +63,7 @@ async fn send_heartbeat(api: &ThinClient, token: &str) -> Result<(), ThinClientE
     let hb = EdgeHeartbeatRequest {
         edge_agent_id: id.to_string(),
     };
-    api
-        .post_agents_edge_heartbeat(Some(token), Some(id), &hb)
+    api.post_agents_edge_heartbeat(Some(token), Some(id), &hb)
         .await?;
     Ok(())
 }
@@ -186,12 +184,13 @@ mod tests {
             .await;
 
         let api = ThinClient::new(&server.uri(), None).expect("url");
-        register_edge_once(&api, "test-bearer").await.expect("register");
+        register_edge_once(&api, "test-bearer")
+            .await
+            .expect("register");
 
         let received = server.received_requests().await.unwrap();
         assert_eq!(received.len(), 1);
-        let body: serde_json::Value =
-            serde_json::from_slice(&received[0].body).expect("json body");
+        let body: serde_json::Value = serde_json::from_slice(&received[0].body).expect("json body");
         assert!(body.get("edge_agent_id").and_then(|v| v.as_str()).is_some());
         assert!(body.get("capabilities").is_some());
     }
@@ -215,8 +214,7 @@ mod tests {
         register_edge_once(&api, "t").await.expect("register");
 
         let received = server.received_requests().await.unwrap();
-        let body: serde_json::Value =
-            serde_json::from_slice(&received[0].body).expect("json body");
+        let body: serde_json::Value = serde_json::from_slice(&received[0].body).expect("json body");
         assert_eq!(
             body.get("hostname").and_then(|v| v.as_str()),
             Some("unit-test-host")

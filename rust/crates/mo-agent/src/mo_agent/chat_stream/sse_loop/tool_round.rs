@@ -11,8 +11,8 @@ use mo_agent_runtime::{
     semantic_dedup::SemanticDedup,
     turn::edge_prompt_context::make_args_preview,
     turn::headless_tool_assembly::{
-        openai_assistant_with_tool_calls_message, openai_tool_roundtrip_values,
-        take_edge_output_for_tool_call, CACHEABLE_TOOLS,
+        CACHEABLE_TOOLS, openai_assistant_with_tool_calls_message, openai_tool_roundtrip_values,
+        take_edge_output_for_tool_call,
     },
     turn::tool_result_semantics::{is_resource_limit_output, is_tool_error, tool_dedup_signature},
 };
@@ -146,12 +146,7 @@ pub(crate) async fn run_headless_tool_round(ctx: HeadlessToolRoundRequest<'_>) {
             }
             RoundToolItem::Synthetic(i) => {
                 let e = &turn_result.edge_tool_round[*i];
-                (
-                    format!("edge-{i}"),
-                    e.tool.clone(),
-                    e.args.clone(),
-                    true,
-                )
+                (format!("edge-{i}"), e.tool.clone(), e.args.clone(), true)
             }
         };
 
@@ -305,9 +300,9 @@ pub(crate) async fn run_headless_tool_round(ctx: HeadlessToolRoundRequest<'_>) {
 
         if !is_err && !tool_already_restricted && is_resource_limit_output(&result_str) {
             turn_guard.health.record_resource_limit_failure(&name);
-            turn_guard.errors.record_error(
-                mo_agent_runtime::turn::error_recovery::ErrorCategory::ResourceLimit,
-            );
+            turn_guard
+                .errors
+                .record_error(mo_agent_runtime::turn::error_recovery::ErrorCategory::ResourceLimit);
             restricted_tools.insert(name.clone());
             is_err = true;
             resource_limit_recorded = true;

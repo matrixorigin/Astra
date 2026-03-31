@@ -9,23 +9,23 @@ use mo_agent_runtime::{
     tool_registry::{self, apply_selector_hints_to_edge_profile},
     tool_selector,
     turn::boost_domain_hints::domain_hints_from_boost_terms,
-    turn::chat_turn_edge_profile::{detect_active_system_skills_in_message, read_git_branch_abbrev},
-    turn::chat_turn_payload::{
-        chat_turn_base_payload, merge_active_skills_into_edge_profile,
-        merge_skill_instructions_into_edge_profile, set_payload_edge_tools,
-        set_payload_tool_results_if_non_empty, ChatTurnBasePayloadInput,
+    turn::chat_turn_edge_profile::{
+        detect_active_system_skills_in_message, read_git_branch_abbrev,
     },
     turn::chat_turn_heuristics::extract_repos_from_memory,
-    turn::turn_guard::TurnGuard,
+    turn::chat_turn_payload::{
+        ChatTurnBasePayloadInput, chat_turn_base_payload, merge_active_skills_into_edge_profile,
+        merge_skill_instructions_into_edge_profile, set_payload_edge_tools,
+        set_payload_tool_results_if_non_empty,
+    },
     turn::tool_schema_prune::{filter_tool_schemas_by_excluded_names, pin_invoked_tool_schemas},
+    turn::turn_guard::TurnGuard,
 };
 use serde_json::Value;
 
-use super::explain_sidecar::{
-    eprint_restricted_tools_explain, eprint_selector_guidance_explain,
-};
-use super::skill_instructions_round::{load_skill_instructions_text, merge_skill_names_track};
 use super::super::edge_executor::edge_executor_instance_id;
+use super::explain_sidecar::{eprint_restricted_tools_explain, eprint_selector_guidance_explain};
+use super::skill_instructions_round::{load_skill_instructions_text, merge_skill_names_track};
 
 use crate::edge_tools;
 use crate::skill_instructions::SharedSkillRegistry;
@@ -69,9 +69,7 @@ pub(crate) struct PrepareChatTurnRequest<'a> {
     pub telem: PrepareTurnTelemetry<'a>,
 }
 
-pub(crate) async fn prepare_chat_turn_payload(
-    ctx: PrepareChatTurnRequest<'_>,
-) -> Value {
+pub(crate) async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
     let git_branch = read_git_branch_abbrev();
     let mut payload = chat_turn_base_payload(ChatTurnBasePayloadInput {
         messages: ctx.messages,
@@ -99,16 +97,11 @@ pub(crate) async fn prepare_chat_turn_payload(
         tier.budget_pressure()
     };
 
-    let mut boost_terms = mo_agent_runtime::turn::retrieval::extract_boost_terms_from_pairs(
-        ctx.history,
-        ctx.message,
-    );
+    let mut boost_terms =
+        mo_agent_runtime::turn::retrieval::extract_boost_terms_from_pairs(ctx.history, ctx.message);
     {
         let mem_start = Instant::now();
-        let memory_contents = ctx
-            .executor
-            .memory_boost_search(ctx.message, 5)
-            .await;
+        let memory_contents = ctx.executor.memory_boost_search(ctx.message, 5).await;
         let mem_elapsed = mem_start.elapsed().as_millis() as u64;
         if ctx.telem.first_memoria_ms.is_none() {
             *ctx.telem.first_memoria_ms = Some(mem_elapsed);
@@ -147,9 +140,7 @@ pub(crate) async fn prepare_chat_turn_payload(
         &boost_terms,
     );
 
-    let learned_context = ctx
-        .selector
-        .learned_context(ctx.message, ctx.recent_tools);
+    let learned_context = ctx.selector.learned_context(ctx.message, ctx.recent_tools);
     let learned_context_hint = learned_context.prompt_fragment();
     let learned_task_type = learned_context
         .task_archetype
@@ -217,7 +208,12 @@ pub(crate) async fn prepare_chat_turn_payload(
             &sel_result.tool_names,
             budget_pressure,
         );
-        pin_invoked_tool_schemas(&mut selected, &mut report, ctx.tool_results, ctx.all_schemas);
+        pin_invoked_tool_schemas(
+            &mut selected,
+            &mut report,
+            ctx.tool_results,
+            ctx.all_schemas,
+        );
         (selected, report, conf)
     };
 
@@ -240,8 +236,7 @@ pub(crate) async fn prepare_chat_turn_payload(
         &learned_context_hint,
         learned_task_type.as_deref(),
     );
-    let final_schemas =
-        filter_tool_schemas_by_excluded_names(turn_schemas, ctx.restricted_tools);
+    let final_schemas = filter_tool_schemas_by_excluded_names(turn_schemas, ctx.restricted_tools);
     set_payload_edge_tools(&mut payload, final_schemas);
     eprint_restricted_tools_explain(ctx.explain_stderr, ctx.restricted_tools);
     eprint_selector_guidance_explain(ctx.explain_stderr, &payload, selection_confidence);

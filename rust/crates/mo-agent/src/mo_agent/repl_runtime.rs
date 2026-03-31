@@ -60,8 +60,9 @@ pub(super) fn create_tool_selector_with_quality(
         .with_progressive_calibrator(calibrator.clone());
 
     // Initialize skill registry with progressive loading
-    let skill_registry =
-        std::sync::Arc::new(std::sync::RwLock::new(skill_instructions::SkillRegistry::new()));
+    let skill_registry = std::sync::Arc::new(std::sync::RwLock::new(
+        skill_instructions::SkillRegistry::new(),
+    ));
 
     // Discover and register skill metadata from skills/ directories
     let skills_paths = [
@@ -74,10 +75,16 @@ pub(super) fn create_tool_selector_with_quality(
         if skills_path.is_dir()
             && let Ok(mut reg) = skill_registry.write()
         {
-            let registered = skill_instructions::discover_and_register_metadata(skills_path, &mut reg);
+            let registered =
+                skill_instructions::discover_and_register_metadata(skills_path, &mut reg);
             if !registered.is_empty() {
-                eprintln!("  {} Discovered {} skills from {:?}: {:?}", 
-                    "✓".green(), registered.len(), skills_path, registered);
+                eprintln!(
+                    "  {} Discovered {} skills from {:?}: {:?}",
+                    "✓".green(),
+                    registered.len(),
+                    skills_path,
+                    registered
+                );
             }
         }
     }
@@ -137,10 +144,7 @@ pub(super) fn create_tool_selector_with_quality(
 
 /// Quick check whether the server has at least one LLM model configured.
 /// Returns `true` on network errors (optimistic — don't block startup).
-pub(super) async fn check_server_has_models(
-    api: &mo_thin_client::ThinClient,
-    token: &str,
-) -> bool {
+pub(super) async fn check_server_has_models(api: &mo_thin_client::ThinClient, token: &str) -> bool {
     let resp = match api
         .get_models_response_timeout(token, std::time::Duration::from_secs(3))
         .await
@@ -187,9 +191,7 @@ pub(super) async fn try_silent_auth(api: &mo_thin_client::ThinClient, profile: O
 
     // Try refresh_token first
     if let Some(refresh) = prof.and_then(|p| p.refresh_token.as_ref())
-        && try_refresh_token(api, profile, refresh)
-            .await
-            .is_ok()
+        && try_refresh_token(api, profile, refresh).await.is_ok()
     {
         eprintln!("  {} Token refreshed", "✓".green());
         return;

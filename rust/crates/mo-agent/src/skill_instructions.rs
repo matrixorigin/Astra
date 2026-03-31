@@ -83,7 +83,7 @@ impl From<&SkillInstruction> for SkillMetadata {
         // Estimate tokens: ~4 chars per token
         let text = format!("{} {} {:?}", skill.name, skill.description, skill.triggers);
         let metadata_tokens = (text.len() as u32) / 4;
-        
+
         SkillMetadata {
             name: skill.name.clone(),
             description: skill.description.clone(),
@@ -110,36 +110,36 @@ pub enum SkillLoadLevel {
 /// Extracts YAML frontmatter (between `---` markers) and Markdown body.
 pub fn parse_skill_md(content: &str) -> Result<SkillInstruction, String> {
     let content = content.trim();
-    
+
     // Check for YAML frontmatter
     if !content.starts_with("---") {
         return Err("SKILL.md must start with YAML frontmatter (---)".to_string());
     }
-    
+
     // Find the closing frontmatter marker
     let rest = &content[3..];
     let end_marker = rest
         .find("\n---")
         .ok_or("Missing closing frontmatter marker (---)")?;
-    
+
     let yaml_content = &rest[..end_marker].trim();
     let markdown_body = rest[end_marker + 4..].trim();
-    
+
     // Parse YAML frontmatter
     let mut instruction: SkillInstruction = serde_yaml::from_str(yaml_content)
         .map_err(|e| format!("Failed to parse YAML frontmatter: {e}"))?;
-    
+
     // Set the markdown body
     instruction.instructions = markdown_body.to_string();
     instruction.instruction_tokens = (markdown_body.len() as u32) / 4;
-    
+
     Ok(instruction)
 }
 
 /// Load a SKILL.md file from disk.
 pub fn load_skill_md(path: &Path) -> Result<SkillInstruction, String> {
-    let content = std::fs::read_to_string(path)
-        .map_err(|e| format!("Failed to read SKILL.md: {e}"))?;
+    let content =
+        std::fs::read_to_string(path).map_err(|e| format!("Failed to read SKILL.md: {e}"))?;
     parse_skill_md(&content)
 }
 
@@ -151,7 +151,7 @@ pub fn discover_skill_instructions(skills_dir: &Path) -> Vec<(String, std::path:
         Ok(e) => e,
         Err(_) => return skills,
     };
-    
+
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_dir() {
@@ -172,7 +172,7 @@ pub fn discover_skill_instructions(skills_dir: &Path) -> Vec<(String, std::path:
 pub fn load_skill_metadata(skills_dir: &Path) -> Vec<SkillMetadata> {
     let discoveries = discover_skill_instructions(skills_dir);
     let mut metadata = Vec::new();
-    
+
     for (name, path) in discoveries {
         if let Ok(instruction) = load_skill_md(&path) {
             metadata.push(SkillMetadata::from(&instruction));
@@ -251,7 +251,11 @@ Do the thing.
         let content = "Just some markdown without frontmatter.";
         let result = parse_skill_md(content);
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("must start with YAML frontmatter"));
+        assert!(
+            result
+                .unwrap_err()
+                .contains("must start with YAML frontmatter")
+        );
     }
 
     #[test]
@@ -263,7 +267,11 @@ No closing marker here
 "#;
         let result = parse_skill_md(content);
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("Missing closing frontmatter marker"));
+        assert!(
+            result
+                .unwrap_err()
+                .contains("Missing closing frontmatter marker")
+        );
     }
 
     #[test]
@@ -276,7 +284,11 @@ Body
 "#;
         let result = parse_skill_md(content);
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("Failed to parse YAML frontmatter"));
+        assert!(
+            result
+                .unwrap_err()
+                .contains("Failed to parse YAML frontmatter")
+        );
     }
 
     #[test]
@@ -290,7 +302,7 @@ Body
             instructions: "Long instructions here...".to_string(),
             instruction_tokens: 100,
         };
-        
+
         let metadata = SkillMetadata::from(&skill);
         assert_eq!(metadata.name, "test");
         assert_eq!(metadata.description, "Test skill");
@@ -384,7 +396,10 @@ impl ProgressiveSkill {
     }
 
     /// Create with full instructions (Level 2).
-    pub fn from_instructions(instruction: SkillInstruction, skill_dir: Option<std::path::PathBuf>) -> Self {
+    pub fn from_instructions(
+        instruction: SkillInstruction,
+        skill_dir: Option<std::path::PathBuf>,
+    ) -> Self {
         let metadata = SkillMetadata::from(&instruction);
         Self {
             metadata,
@@ -436,8 +451,16 @@ impl ProgressiveSkill {
     /// Total tokens currently loaded.
     pub fn loaded_tokens(&self) -> u32 {
         let metadata_tokens = self.metadata.metadata_tokens;
-        let instruction_tokens = self.instructions.as_ref().map(|i| i.instruction_tokens).unwrap_or(0);
-        let resource_tokens = self.resources.as_ref().map(|r| r.resource_tokens).unwrap_or(0);
+        let instruction_tokens = self
+            .instructions
+            .as_ref()
+            .map(|i| i.instruction_tokens)
+            .unwrap_or(0);
+        let resource_tokens = self
+            .resources
+            .as_ref()
+            .map(|r| r.resource_tokens)
+            .unwrap_or(0);
         metadata_tokens + instruction_tokens + resource_tokens
     }
 
@@ -447,7 +470,9 @@ impl ProgressiveSkill {
             return Ok(());
         }
 
-        let skill_dir = self.skill_dir.as_ref()
+        let skill_dir = self
+            .skill_dir
+            .as_ref()
             .ok_or("No skill directory set for lazy loading")?;
 
         // Try SKILL.md first
@@ -473,7 +498,9 @@ impl ProgressiveSkill {
             return Ok(());
         }
 
-        let skill_dir = self.skill_dir.as_ref()
+        let skill_dir = self
+            .skill_dir
+            .as_ref()
             .ok_or("No skill directory set for lazy loading")?;
 
         let mut resources = SkillResources::default();
@@ -550,7 +577,11 @@ impl SkillRegistry {
     }
 
     /// Register a skill at Level 1 (metadata only).
-    pub fn register_metadata(&mut self, metadata: SkillMetadata, skill_dir: Option<std::path::PathBuf>) -> Result<(), String> {
+    pub fn register_metadata(
+        &mut self,
+        metadata: SkillMetadata,
+        skill_dir: Option<std::path::PathBuf>,
+    ) -> Result<(), String> {
         let tokens = metadata.metadata_tokens;
         if self.metadata_tokens + tokens > self.metadata_budget {
             return Err(format!(
@@ -567,7 +598,11 @@ impl SkillRegistry {
     }
 
     /// Register a skill with full instructions (Level 2).
-    pub fn register_instructions(&mut self, instruction: SkillInstruction, skill_dir: Option<std::path::PathBuf>) {
+    pub fn register_instructions(
+        &mut self,
+        instruction: SkillInstruction,
+        skill_dir: Option<std::path::PathBuf>,
+    ) {
         let name = instruction.name.clone();
         let skill = ProgressiveSkill::from_instructions(instruction, skill_dir);
         // Don't count instruction tokens against metadata budget
@@ -590,7 +625,12 @@ impl SkillRegistry {
         let trigger_lower = trigger.to_lowercase();
         self.skills
             .values()
-            .filter(|s| s.metadata.triggers.iter().any(|t| t.to_lowercase() == trigger_lower))
+            .filter(|s| {
+                s.metadata
+                    .triggers
+                    .iter()
+                    .any(|t| t.to_lowercase() == trigger_lower)
+            })
             .collect()
     }
 
@@ -616,14 +656,18 @@ impl SkillRegistry {
 
     /// Load instructions for a skill (Level 2).
     pub fn load_instructions(&mut self, name: &str) -> Result<(), String> {
-        let skill = self.skills.get_mut(name)
+        let skill = self
+            .skills
+            .get_mut(name)
             .ok_or_else(|| format!("Skill not found: {name}"))?;
         skill.load_instructions()
     }
 
     /// Load resources for a skill (Level 3).
     pub fn load_resources(&mut self, name: &str) -> Result<(), String> {
-        let skill = self.skills.get_mut(name)
+        let skill = self
+            .skills
+            .get_mut(name)
             .ok_or_else(|| format!("Skill not found: {name}"))?;
         skill.load_resources()
     }
@@ -679,7 +723,10 @@ pub fn discover_and_register_metadata(
         {
             let metadata = SkillMetadata::from(&instruction);
             let name = metadata.name.clone();
-            if registry.register_metadata(metadata, Some(skill_dir)).is_ok() {
+            if registry
+                .register_metadata(metadata, Some(skill_dir))
+                .is_ok()
+            {
                 registered.push(name);
             }
         }
@@ -689,23 +736,23 @@ pub fn discover_and_register_metadata(
 }
 
 /// Detect skill triggers in a message and return matching skill names.
-/// 
+///
 /// This function performs word-level matching - triggers must appear as whole words
 /// in the message (case-insensitive). Returns skill names sorted by trigger specificity
 /// (longer triggers first).
 pub fn detect_triggers_in_message(registry: &SkillRegistry, message: &str) -> Vec<String> {
     let message_lower = message.to_lowercase();
     let words: Vec<&str> = message_lower.split_whitespace().collect();
-    
+
     let mut matches: Vec<(String, usize)> = Vec::new();
-    
+
     for skill in registry.all_skills() {
         for trigger in &skill.metadata.triggers {
             let trigger_lower = trigger.to_lowercase();
             // Check if trigger appears as a word in the message
             // Single-word triggers: must match exactly as a word
             // Multi-word triggers (with hyphens/underscores): check word boundary
-            if words.contains(&trigger_lower.as_str()) 
+            if words.contains(&trigger_lower.as_str())
                 || is_word_boundary_match(&message_lower, &trigger_lower)
             {
                 matches.push((skill.name().to_string(), trigger.len()));
@@ -713,7 +760,7 @@ pub fn detect_triggers_in_message(registry: &SkillRegistry, message: &str) -> Ve
             }
         }
     }
-    
+
     // Sort by trigger length (longer = more specific) descending
     matches.sort_by(|a, b| b.1.cmp(&a.1));
     matches.into_iter().map(|(name, _)| name).collect()
@@ -728,7 +775,7 @@ fn is_word_boundary_match(text: &str, pattern: &str) -> bool {
     if pattern.chars().any(is_cjk_char) {
         return text.contains(pattern);
     }
-    
+
     // For ASCII/Latin patterns, use word boundary matching
     let mut search_start = 0;
     while search_start < text.len() {
@@ -736,26 +783,32 @@ fn is_word_boundary_match(text: &str, pattern: &str) -> bool {
         let Some(pos) = search_slice.find(pattern) else {
             break;
         };
-        
+
         let abs_pos = search_start + pos;
         let end_pos = abs_pos + pattern.len();
-        
+
         // Check start boundary (character before match)
         let start_ok = abs_pos == 0 || {
             let prev_slice = &text[..abs_pos];
-            prev_slice.chars().last().is_none_or(|c| !c.is_ascii_alphanumeric())
+            prev_slice
+                .chars()
+                .last()
+                .is_none_or(|c| !c.is_ascii_alphanumeric())
         };
-        
+
         // Check end boundary (character after match)
         let end_ok = end_pos >= text.len() || {
             let next_slice = &text[end_pos..];
-            next_slice.chars().next().is_none_or(|c| !c.is_ascii_alphanumeric())
+            next_slice
+                .chars()
+                .next()
+                .is_none_or(|c| !c.is_ascii_alphanumeric())
         };
-        
+
         if start_ok && end_ok {
             return true;
         }
-        
+
         // Move past this occurrence (properly handle UTF-8)
         search_start = abs_pos + text[abs_pos..].chars().next().map_or(1, |c| c.len_utf8());
     }
@@ -777,7 +830,7 @@ fn is_cjk_char(c: char) -> bool {
 }
 
 /// Load skill instructions for the first matching trigger in a message.
-/// 
+///
 /// Returns the skill name and instruction text if a trigger is found and
 /// instructions can be loaded. This performs lazy loading - instructions
 /// are only read from disk when needed.
@@ -790,15 +843,18 @@ pub fn load_triggered_skill_instructions(
         // Use immutable borrow for detection
         detect_triggers_in_message(registry, message)
     };
-    
+
     // Try to load instructions for the first triggered skill
     for skill_name in triggered {
         // Load instructions if not already loaded
         if let Err(e) = registry.load_instructions(&skill_name) {
-            eprintln!("  ⚠ Failed to load skill instructions for {}: {}", skill_name, e);
+            eprintln!(
+                "  ⚠ Failed to load skill instructions for {}: {}",
+                skill_name, e
+            );
             continue;
         }
-        
+
         // Get the instruction text
         if let Some(skill) = registry.get(&skill_name)
             && let Some(text) = skill.instruction_text()
@@ -806,7 +862,7 @@ pub fn load_triggered_skill_instructions(
             return Some((skill_name, text.to_string()));
         }
     }
-    
+
     None
 }
 
@@ -853,15 +909,19 @@ impl SkillClassificationCache {
     /// Cache a classification result.
     pub fn insert(&mut self, message: &str, skill_name: Option<String>) {
         let key = normalize_message(message);
-        self.entries.insert(key, ClassificationCacheEntry {
-            skill_name,
-            timestamp: Instant::now(),
-        });
+        self.entries.insert(
+            key,
+            ClassificationCacheEntry {
+                skill_name,
+                timestamp: Instant::now(),
+            },
+        );
     }
 
     /// Clear expired entries.
     pub fn cleanup(&mut self) {
-        self.entries.retain(|_, entry| entry.timestamp.elapsed() < self.ttl);
+        self.entries
+            .retain(|_, entry| entry.timestamp.elapsed() < self.ttl);
     }
 }
 
@@ -880,44 +940,92 @@ fn normalize_message(message: &str) -> String {
 /// Commands typically contain imperative verbs, questions, or task-oriented phrases.
 pub fn looks_like_command(message: &str) -> bool {
     let msg_lower = message.to_lowercase();
-    
+
     // Imperative/request indicators
     let command_patterns = [
         // English imperatives
-        "please", "help", "show", "list", "find", "search", "get", "check",
-        "analyze", "evaluate", "review", "debug", "fix", "create", "make",
-        "run", "execute", "start", "stop", "update", "delete", "add",
+        "please",
+        "help",
+        "show",
+        "list",
+        "find",
+        "search",
+        "get",
+        "check",
+        "analyze",
+        "evaluate",
+        "review",
+        "debug",
+        "fix",
+        "create",
+        "make",
+        "run",
+        "execute",
+        "start",
+        "stop",
+        "update",
+        "delete",
+        "add",
         // Chinese imperatives
-        "请", "帮", "查", "找", "看", "显示", "列出", "搜索", "获取",
-        "分析", "评估", "审查", "调试", "修复", "创建", "运行", "执行",
+        "请",
+        "帮",
+        "查",
+        "找",
+        "看",
+        "显示",
+        "列出",
+        "搜索",
+        "获取",
+        "分析",
+        "评估",
+        "审查",
+        "调试",
+        "修复",
+        "创建",
+        "运行",
+        "执行",
         // Question indicators
-        "what", "how", "why", "where", "when", "which", "can you", "could you",
-        "什么", "怎么", "为什么", "哪", "能", "可以",
+        "what",
+        "how",
+        "why",
+        "where",
+        "when",
+        "which",
+        "can you",
+        "could you",
+        "什么",
+        "怎么",
+        "为什么",
+        "哪",
+        "能",
+        "可以",
         // Task suffixes
-        "一下", "吧", "下",
+        "一下",
+        "吧",
+        "下",
     ];
-    
+
     for pattern in &command_patterns {
         if msg_lower.contains(pattern) {
             return true;
         }
     }
-    
+
     // Question mark indicates a question/request
     if message.contains('?') || message.contains('？') {
         return true;
     }
-    
+
     // Very short messages are likely not commands
     if message.len() < 5 {
         return false;
     }
-    
+
     // Messages with code-like content are likely commands
     if message.contains("```") || message.contains("```") {
         return true;
     }
-    
+
     false
 }
 
@@ -932,9 +1040,9 @@ pub fn build_classification_prompt(registry: &SkillRegistry, message: &str) -> S
             ));
         }
     }
-    
+
     format!(
-r#"You are a skill classifier. Given a user message, determine which skill (if any) should handle it.
+        r#"You are a skill classifier. Given a user message, determine which skill (if any) should handle it.
 
 Available skills:
 {skills_desc}
@@ -948,12 +1056,12 @@ Do not explain. Just output the skill name or "none"."#
 /// Parse the LLM's classification response.
 pub fn parse_classification_response(response: &str, registry: &SkillRegistry) -> Option<String> {
     let response_clean = response.trim().to_lowercase();
-    
+
     // Check for "none" response
     if response_clean == "none" || response_clean.is_empty() {
         return None;
     }
-    
+
     // Try to match against known skill names
     for skill in registry.all_skills() {
         let skill_name_lower = skill.metadata.name.to_lowercase();
@@ -961,23 +1069,23 @@ pub fn parse_classification_response(response: &str, registry: &SkillRegistry) -
             return Some(skill.metadata.name.clone());
         }
     }
-    
+
     // If response looks like a skill name but wasn't found, return None
     None
 }
 
 /// Hybrid skill detection: keyword match first, then LLM fallback.
-/// 
+///
 /// This function tries keyword matching first (fast, free), then falls back
 /// to LLM classification for messages that look like commands but didn't
 /// match any keyword triggers.
-/// 
+///
 /// # Arguments
 /// * `registry` - The skill registry
 /// * `message` - User message to classify
 /// * `cache` - Optional classification cache
 /// * `llm_classify` - Async function to call LLM for classification
-/// 
+///
 /// # Returns
 /// The name of the matched skill, or None if no match.
 pub async fn detect_skill_hybrid<F, Fut>(
@@ -995,19 +1103,19 @@ where
     if !keyword_matches.is_empty() {
         return Some(keyword_matches[0].clone());
     }
-    
+
     // Stage 2: Check if message looks like a command
     if !looks_like_command(message) {
         return None;
     }
-    
+
     // Stage 3: Check cache
     if let Some(cache) = cache.as_ref()
         && let Some(cached_result) = cache.get(message)
     {
         return cached_result;
     }
-    
+
     // Stage 4: LLM classification
     let prompt = build_classification_prompt(registry, message);
     match llm_classify(prompt).await {
@@ -1028,10 +1136,7 @@ where
 
 /// Synchronous version of hybrid detection (keyword only, no LLM fallback).
 /// Use this when you can't make async calls.
-pub fn detect_skill_hybrid_sync(
-    registry: &SkillRegistry,
-    message: &str,
-) -> Option<String> {
+pub fn detect_skill_hybrid_sync(registry: &SkillRegistry, message: &str) -> Option<String> {
     // Only keyword match in sync mode
     let keyword_matches = detect_triggers_in_message(registry, message);
     if !keyword_matches.is_empty() {
@@ -1049,7 +1154,7 @@ mod registry_tests {
     #[test]
     fn registry_basic_operations() {
         let mut registry = SkillRegistry::new();
-        
+
         let metadata = SkillMetadata {
             name: "test".to_string(),
             description: "Test skill".to_string(),
@@ -1057,9 +1162,9 @@ mod registry_tests {
             triggers: vec!["test".to_string()],
             metadata_tokens: 50,
         };
-        
+
         registry.register_metadata(metadata, None).unwrap();
-        
+
         assert_eq!(registry.len(), 1);
         assert!(registry.get("test").is_some());
         assert_eq!(registry.metadata_tokens(), 50);
@@ -1068,7 +1173,7 @@ mod registry_tests {
     #[test]
     fn registry_budget_enforcement() {
         let mut registry = SkillRegistry::with_budget(100);
-        
+
         let metadata1 = SkillMetadata {
             name: "skill1".to_string(),
             description: "First".to_string(),
@@ -1076,7 +1181,7 @@ mod registry_tests {
             triggers: vec![],
             metadata_tokens: 60,
         };
-        
+
         let metadata2 = SkillMetadata {
             name: "skill2".to_string(),
             description: "Second".to_string(),
@@ -1084,10 +1189,10 @@ mod registry_tests {
             triggers: vec![],
             metadata_tokens: 60,
         };
-        
+
         registry.register_metadata(metadata1, None).unwrap();
         let result = registry.register_metadata(metadata2, None);
-        
+
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("budget exceeded"));
         assert_eq!(registry.len(), 1);
@@ -1096,30 +1201,40 @@ mod registry_tests {
     #[test]
     fn registry_find_by_trigger() {
         let mut registry = SkillRegistry::new();
-        
-        registry.register_metadata(SkillMetadata {
-            name: "review".to_string(),
-            description: "Code review".to_string(),
-            user_invocable: true,
-            triggers: vec!["review".to_string(), "audit".to_string()],
-            metadata_tokens: 50,
-        }, None).unwrap();
-        
-        registry.register_metadata(SkillMetadata {
-            name: "debug".to_string(),
-            description: "Debug helper".to_string(),
-            user_invocable: true,
-            triggers: vec!["debug".to_string(), "troubleshoot".to_string()],
-            metadata_tokens: 50,
-        }, None).unwrap();
-        
+
+        registry
+            .register_metadata(
+                SkillMetadata {
+                    name: "review".to_string(),
+                    description: "Code review".to_string(),
+                    user_invocable: true,
+                    triggers: vec!["review".to_string(), "audit".to_string()],
+                    metadata_tokens: 50,
+                },
+                None,
+            )
+            .unwrap();
+
+        registry
+            .register_metadata(
+                SkillMetadata {
+                    name: "debug".to_string(),
+                    description: "Debug helper".to_string(),
+                    user_invocable: true,
+                    triggers: vec!["debug".to_string(), "troubleshoot".to_string()],
+                    metadata_tokens: 50,
+                },
+                None,
+            )
+            .unwrap();
+
         let found = registry.find_by_trigger("review");
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].name(), "review");
-        
+
         let found = registry.find_by_trigger("AUDIT"); // case-insensitive
         assert_eq!(found.len(), 1);
-        
+
         let found = registry.find_by_trigger("unknown");
         assert!(found.is_empty());
     }
@@ -1129,7 +1244,7 @@ mod registry_tests {
         let dir = TempDir::new().unwrap();
         let skill_dir = dir.path().join("review");
         std::fs::create_dir_all(&skill_dir).unwrap();
-        
+
         let skill_md = r#"---
 name: review
 description: "Code review skill"
@@ -1144,7 +1259,7 @@ allowed_tools:
 2. Find issues
 "#;
         std::fs::write(skill_dir.join("SKILL.md"), skill_md).unwrap();
-        
+
         // Create at Level 1
         let mut skill = ProgressiveSkill::from_metadata(
             SkillMetadata {
@@ -1156,10 +1271,10 @@ allowed_tools:
             },
             Some(skill_dir),
         );
-        
+
         assert_eq!(skill.load_level, SkillLoadLevel::Metadata);
         assert!(!skill.has_instructions());
-        
+
         // Load to Level 2
         skill.load_instructions().unwrap();
         assert_eq!(skill.load_level, SkillLoadLevel::Instructions);
@@ -1175,7 +1290,7 @@ allowed_tools:
         std::fs::create_dir_all(&skill_dir).unwrap();
         std::fs::create_dir_all(skill_dir.join("templates")).unwrap();
         std::fs::create_dir_all(skill_dir.join("scripts")).unwrap();
-        
+
         let skill_md = r#"---
 name: generator
 description: "Code generator"
@@ -1183,9 +1298,17 @@ description: "Code generator"
 Generate code from templates.
 "#;
         std::fs::write(skill_dir.join("SKILL.md"), skill_md).unwrap();
-        std::fs::write(skill_dir.join("templates/component.tsx"), "export const {{name}} = () => {}").unwrap();
-        std::fs::write(skill_dir.join("scripts/setup.sh"), "#!/bin/bash\necho setup").unwrap();
-        
+        std::fs::write(
+            skill_dir.join("templates/component.tsx"),
+            "export const {{name}} = () => {}",
+        )
+        .unwrap();
+        std::fs::write(
+            skill_dir.join("scripts/setup.sh"),
+            "#!/bin/bash\necho setup",
+        )
+        .unwrap();
+
         let mut skill = ProgressiveSkill::from_metadata(
             SkillMetadata {
                 name: "generator".to_string(),
@@ -1196,11 +1319,11 @@ Generate code from templates.
             },
             Some(skill_dir),
         );
-        
+
         // Load to Level 3
         skill.load_resources().unwrap();
         assert_eq!(skill.load_level, SkillLoadLevel::Resources);
-        
+
         let resources = skill.resources().unwrap();
         assert!(resources.templates.contains_key("component.tsx"));
         assert!(resources.scripts.contains_key("setup.sh"));
@@ -1210,28 +1333,30 @@ Generate code from templates.
     #[test]
     fn discover_and_register_metadata_works() {
         let dir = TempDir::new().unwrap();
-        
+
         // Create two skills
         for name in ["review", "debug"] {
             let skill_dir = dir.path().join(name);
             std::fs::create_dir_all(&skill_dir).unwrap();
-            let content = format!(r#"---
+            let content = format!(
+                r#"---
 name: {name}
 description: "{name} skill"
 triggers:
   - {name}
 ---
 Instructions for {name}.
-"#);
+"#
+            );
             std::fs::write(skill_dir.join("SKILL.md"), content).unwrap();
         }
-        
+
         let mut registry = SkillRegistry::new();
         let registered = discover_and_register_metadata(dir.path(), &mut registry);
-        
+
         assert_eq!(registered.len(), 2);
         assert_eq!(registry.len(), 2);
-        
+
         // Should be at Level 1 only
         let skill = registry.get("review").unwrap();
         assert_eq!(skill.load_level, SkillLoadLevel::Metadata);
@@ -1243,7 +1368,7 @@ Instructions for {name}.
         let dir = TempDir::new().unwrap();
         let skill_dir = dir.path().join("test");
         std::fs::create_dir_all(&skill_dir).unwrap();
-        
+
         let skill_md = r#"---
 name: test
 description: "Test skill with long instructions"
@@ -1252,7 +1377,7 @@ This is a longer instruction text that should contribute to the token count.
 We want to verify that loaded_tokens() returns the correct cumulative total.
 "#;
         std::fs::write(skill_dir.join("SKILL.md"), skill_md).unwrap();
-        
+
         let mut skill = ProgressiveSkill::from_metadata(
             SkillMetadata {
                 name: "test".to_string(),
@@ -1263,11 +1388,11 @@ We want to verify that loaded_tokens() returns the correct cumulative total.
             },
             Some(skill_dir),
         );
-        
+
         // Level 1: metadata only
         let level1_tokens = skill.loaded_tokens();
         assert_eq!(level1_tokens, 30);
-        
+
         // Level 2: instructions loaded
         skill.load_instructions().unwrap();
         let level2_tokens = skill.loaded_tokens();
@@ -1317,71 +1442,91 @@ This is a comprehensive skill that demonstrates the full lifecycle.
         // Phase 1: Discover and register metadata only
         let mut registry = SkillRegistry::with_budget(5000);
         let registered = discover_and_register_metadata(dir.path(), &mut registry);
-        
+
         assert_eq!(registered.len(), 1);
         assert_eq!(registered[0], "my-skill");
-        
+
         let skill = registry.get("my-skill").unwrap();
         assert_eq!(skill.load_level, SkillLoadLevel::Metadata);
         assert!(!skill.has_instructions());
-        
+
         // Phase 2: Load instructions on invocation
         let skill = registry.get_mut("my-skill").unwrap();
         skill.load_instructions().unwrap();
-        
+
         assert_eq!(skill.load_level, SkillLoadLevel::Instructions);
         assert!(skill.has_instructions());
-        assert!(skill.instruction_text().unwrap().contains("My Skill Instructions"));
-        assert_eq!(skill.allowed_tools(), vec!["bash", "read_file", "write_file"]);
-        
+        assert!(
+            skill
+                .instruction_text()
+                .unwrap()
+                .contains("My Skill Instructions")
+        );
+        assert_eq!(
+            skill.allowed_tools(),
+            vec!["bash", "read_file", "write_file"]
+        );
+
         // Phase 3: Load resources on demand
         let skill = registry.get_mut("my-skill").unwrap();
         skill.load_resources().unwrap();
-        
+
         assert_eq!(skill.load_level, SkillLoadLevel::Resources);
         let resources = skill.resources().unwrap();
         assert!(resources.templates.contains_key("config.yaml"));
         assert!(resources.scripts.contains_key("init.sh"));
-        assert!(resources.templates.get("config.yaml").unwrap().contains("key: value"));
+        assert!(
+            resources
+                .templates
+                .get("config.yaml")
+                .unwrap()
+                .contains("key: value")
+        );
     }
 
     #[test]
     fn integration_multiple_skills_budget_tracking() {
         let dir = TempDir::new().unwrap();
-        
+
         // Create 5 skills with different token sizes
         let skills_config = [
             ("small", "Small", 10),
             ("medium", "Medium skill with a longer description", 50),
-            ("large", "Large skill with very detailed description for testing purposes", 100),
+            (
+                "large",
+                "Large skill with very detailed description for testing purposes",
+                100,
+            ),
             ("extra", "Extra skill", 20),
             ("final", "Final skill", 15),
         ];
-        
+
         for (name, desc, _) in &skills_config {
             let skill_dir = dir.path().join(name);
             std::fs::create_dir_all(&skill_dir).unwrap();
-            let content = format!(r#"---
+            let content = format!(
+                r#"---
 name: {name}
 description: "{desc}"
 triggers:
   - {name}
 ---
 Instructions for {name}.
-"#);
+"#
+            );
             std::fs::write(skill_dir.join("SKILL.md"), content).unwrap();
         }
-        
+
         // Register all skills
         let mut registry = SkillRegistry::new();
         discover_and_register_metadata(dir.path(), &mut registry);
-        
+
         assert_eq!(registry.len(), 5);
-        
+
         // Verify total metadata tokens are tracked
         let total_metadata_tokens = registry.metadata_tokens();
         assert!(total_metadata_tokens > 0);
-        
+
         // Verify we can find skills by different triggers
         for (name, _, _) in &skills_config {
             let found = registry.find_by_trigger(name);
@@ -1394,7 +1539,7 @@ Instructions for {name}.
         let dir = TempDir::new().unwrap();
         let skill_dir = dir.path().join("internal");
         std::fs::create_dir_all(&skill_dir).unwrap();
-        
+
         // Skill with no triggers - can only be invoked explicitly
         let skill_md = r#"---
 name: internal
@@ -1404,14 +1549,14 @@ user_invocable: false
 This skill is used internally and should not be triggered by keywords.
 "#;
         std::fs::write(skill_dir.join("SKILL.md"), skill_md).unwrap();
-        
+
         let mut registry = SkillRegistry::new();
         discover_and_register_metadata(dir.path(), &mut registry);
-        
+
         let skill = registry.get("internal").unwrap();
         assert!(!skill.metadata.user_invocable);
         assert!(skill.metadata.triggers.is_empty());
-        
+
         // Should not be found by any trigger
         assert!(registry.find_by_trigger("internal").is_empty());
         assert!(registry.find_by_trigger("helper").is_empty());
@@ -1425,7 +1570,7 @@ This skill is used internally and should not be triggered by keywords.
         // Create empty templates and scripts directories
         std::fs::create_dir_all(skill_dir.join("templates")).unwrap();
         std::fs::create_dir_all(skill_dir.join("scripts")).unwrap();
-        
+
         let skill_md = r#"---
 name: empty-resources
 description: "Skill with empty resource directories"
@@ -1433,7 +1578,7 @@ description: "Skill with empty resource directories"
 This skill has templates/ and scripts/ but they are empty.
 "#;
         std::fs::write(skill_dir.join("SKILL.md"), skill_md).unwrap();
-        
+
         let mut skill = ProgressiveSkill::from_metadata(
             SkillMetadata {
                 name: "empty-resources".to_string(),
@@ -1444,9 +1589,9 @@ This skill has templates/ and scripts/ but they are empty.
             },
             Some(skill_dir),
         );
-        
+
         skill.load_resources().unwrap();
-        
+
         let resources = skill.resources().unwrap();
         assert!(resources.templates.is_empty());
         assert!(resources.scripts.is_empty());
@@ -1459,7 +1604,7 @@ This skill has templates/ and scripts/ but they are empty.
         let skill_dir = dir.path().join("flat");
         std::fs::create_dir_all(skill_dir.join("templates")).unwrap();
         std::fs::create_dir_all(skill_dir.join("scripts")).unwrap();
-        
+
         let skill_md = r#"---
 name: flat
 description: "Skill with flat resource directories"
@@ -1469,8 +1614,12 @@ Flat resources test.
         std::fs::write(skill_dir.join("SKILL.md"), skill_md).unwrap();
         std::fs::write(skill_dir.join("templates/base.tsx"), "// base template").unwrap();
         std::fs::write(skill_dir.join("templates/App.tsx"), "// React App").unwrap();
-        std::fs::write(skill_dir.join("scripts/helper.sh"), "#!/bin/bash\necho helper").unwrap();
-        
+        std::fs::write(
+            skill_dir.join("scripts/helper.sh"),
+            "#!/bin/bash\necho helper",
+        )
+        .unwrap();
+
         let mut skill = ProgressiveSkill::from_metadata(
             SkillMetadata {
                 name: "flat".to_string(),
@@ -1481,9 +1630,9 @@ Flat resources test.
             },
             Some(skill_dir),
         );
-        
+
         skill.load_resources().unwrap();
-        
+
         let resources = skill.resources().unwrap();
         // Only immediate children are loaded (no nested directories)
         assert!(resources.templates.contains_key("base.tsx"));
@@ -1498,7 +1647,7 @@ Flat resources test.
         let dir = TempDir::new().unwrap();
         let skill_dir = dir.path().join("special");
         std::fs::create_dir_all(&skill_dir).unwrap();
-        
+
         let skill_md = r#"---
 name: special
 description: "Handles \"quotes\", newlines\n, and special chars: <>&"
@@ -1508,10 +1657,10 @@ triggers:
 Instructions with special characters: <>&"'
 "#;
         std::fs::write(skill_dir.join("SKILL.md"), skill_md).unwrap();
-        
+
         let content = std::fs::read_to_string(skill_dir.join("SKILL.md")).unwrap();
         let result = parse_skill_md(&content);
-        
+
         assert!(result.is_ok());
         let skill = result.unwrap();
         assert!(skill.description.contains("quotes"));
@@ -1523,7 +1672,7 @@ Instructions with special characters: <>&"'
         let dir = TempDir::new().unwrap();
         let skill_dir = dir.path().join("idempotent");
         std::fs::create_dir_all(skill_dir.join("templates")).unwrap();
-        
+
         let skill_md = r#"---
 name: idempotent
 description: "Test idempotent loading"
@@ -1532,7 +1681,7 @@ Instructions here.
 "#;
         std::fs::write(skill_dir.join("SKILL.md"), skill_md).unwrap();
         std::fs::write(skill_dir.join("templates/test.txt"), "template content").unwrap();
-        
+
         let mut skill = ProgressiveSkill::from_metadata(
             SkillMetadata {
                 name: "idempotent".to_string(),
@@ -1543,34 +1692,35 @@ Instructions here.
             },
             Some(skill_dir),
         );
-        
+
         // Load instructions multiple times - should be idempotent
         skill.load_instructions().unwrap();
         let tokens_after_first = skill.loaded_tokens();
-        
+
         skill.load_instructions().unwrap();
         let tokens_after_second = skill.loaded_tokens();
-        
+
         assert_eq!(tokens_after_first, tokens_after_second);
-        
+
         // Load resources multiple times
         skill.load_resources().unwrap();
         let tokens_after_resources = skill.loaded_tokens();
-        
+
         skill.load_resources().unwrap();
         let tokens_final = skill.loaded_tokens();
-        
+
         assert_eq!(tokens_after_resources, tokens_final);
     }
 
     #[test]
     fn integration_registry_all_skills() {
         let dir = TempDir::new().unwrap();
-        
+
         for name in ["skill-a", "skill-b", "skill-c"] {
             let skill_dir = dir.path().join(name);
             std::fs::create_dir_all(&skill_dir).unwrap();
-            let content = format!(r#"---
+            let content = format!(
+                r#"---
 name: {name}
 description: "Description for {name}"
 user_invocable: true
@@ -1578,16 +1728,17 @@ triggers:
   - {name}
 ---
 Instructions.
-"#);
+"#
+            );
             std::fs::write(skill_dir.join("SKILL.md"), content).unwrap();
         }
-        
+
         let mut registry = SkillRegistry::new();
         discover_and_register_metadata(dir.path(), &mut registry);
-        
+
         let all_skills = registry.all_skills();
         assert_eq!(all_skills.len(), 3);
-        
+
         let names: Vec<_> = all_skills.iter().map(|s| s.name()).collect();
         assert!(names.contains(&"skill-a"));
         assert!(names.contains(&"skill-b"));
@@ -1599,7 +1750,7 @@ Instructions.
         let dir = TempDir::new().unwrap();
         let skill_dir = dir.path().join("case-test");
         std::fs::create_dir_all(&skill_dir).unwrap();
-        
+
         let skill_md = r#"---
 name: case-test
 description: "Test case-insensitive triggers"
@@ -1611,10 +1762,10 @@ triggers:
 Test instructions.
 "#;
         std::fs::write(skill_dir.join("SKILL.md"), skill_md).unwrap();
-        
+
         let mut registry = SkillRegistry::new();
         discover_and_register_metadata(dir.path(), &mut registry);
-        
+
         // All variations should find the skill
         assert_eq!(registry.find_by_trigger("review").len(), 1);
         assert_eq!(registry.find_by_trigger("REVIEW").len(), 1);
@@ -1633,7 +1784,7 @@ Test instructions.
         let dir = TempDir::new().unwrap();
         let skill_dir = dir.path().join("review");
         std::fs::create_dir_all(&skill_dir).unwrap();
-        
+
         let skill_md = r#"---
 name: review
 description: "Code review skill"
@@ -1644,18 +1795,18 @@ triggers:
 Instructions.
 "#;
         std::fs::write(skill_dir.join("SKILL.md"), skill_md).unwrap();
-        
+
         let mut registry = SkillRegistry::new();
         discover_and_register_metadata(dir.path(), &mut registry);
-        
+
         // Should match when trigger appears as word
         let matches = detect_triggers_in_message(&registry, "please review this PR");
         assert_eq!(matches, vec!["review"]);
-        
+
         // Should match case-insensitively
         let matches = detect_triggers_in_message(&registry, "REVIEW the changes");
         assert_eq!(matches, vec!["review"]);
-        
+
         // Should not match partial words
         let matches = detect_triggers_in_message(&registry, "previewing the code");
         assert!(matches.is_empty());
@@ -1664,31 +1815,33 @@ Instructions.
     #[test]
     fn detect_triggers_multiple_skills() {
         let dir = TempDir::new().unwrap();
-        
+
         // Create two skills with different triggers
         for (name, triggers) in [("review", "review"), ("debug", "debug")] {
             let skill_dir = dir.path().join(name);
             std::fs::create_dir_all(&skill_dir).unwrap();
-            let content = format!(r#"---
+            let content = format!(
+                r#"---
 name: {name}
 description: "{name} skill"
 triggers:
   - {triggers}
 ---
 Instructions for {name}.
-"#);
+"#
+            );
             std::fs::write(skill_dir.join("SKILL.md"), content).unwrap();
         }
-        
+
         let mut registry = SkillRegistry::new();
         discover_and_register_metadata(dir.path(), &mut registry);
-        
+
         // Should find both when both triggers present
         let matches = detect_triggers_in_message(&registry, "review and debug this code");
         assert_eq!(matches.len(), 2);
         assert!(matches.contains(&"review".to_string()));
         assert!(matches.contains(&"debug".to_string()));
-        
+
         // Should find only one
         let matches = detect_triggers_in_message(&registry, "please debug this");
         assert_eq!(matches, vec!["debug"]);
@@ -1697,7 +1850,7 @@ Instructions for {name}.
     #[test]
     fn detect_triggers_longer_triggers_first() {
         let dir = TempDir::new().unwrap();
-        
+
         // Create skill with both short and long triggers
         let skill_dir = dir.path().join("review");
         std::fs::create_dir_all(&skill_dir).unwrap();
@@ -1712,10 +1865,10 @@ triggers:
 Instructions.
 "#;
         std::fs::write(skill_dir.join("SKILL.md"), skill_md).unwrap();
-        
+
         let mut registry = SkillRegistry::new();
         discover_and_register_metadata(dir.path(), &mut registry);
-        
+
         // Longer trigger should be detected (security-review vs review)
         let matches = detect_triggers_in_message(&registry, "do a security-review");
         assert_eq!(matches.len(), 1);
@@ -1727,7 +1880,7 @@ Instructions.
         let dir = TempDir::new().unwrap();
         let skill_dir = dir.path().join("myskill");
         std::fs::create_dir_all(&skill_dir).unwrap();
-        
+
         let skill_md = r#"---
 name: myskill
 description: "My skill"
@@ -1740,22 +1893,22 @@ triggers:
 2. Second step
 "#;
         std::fs::write(skill_dir.join("SKILL.md"), skill_md).unwrap();
-        
+
         let mut registry = SkillRegistry::new();
         discover_and_register_metadata(dir.path(), &mut registry);
-        
+
         // Initially at metadata level
         assert!(!registry.get("myskill").unwrap().has_instructions());
-        
+
         // Load via trigger detection
         let result = load_triggered_skill_instructions(&mut registry, "please analyze this");
-        
+
         assert!(result.is_some());
         let (name, text) = result.unwrap();
         assert_eq!(name, "myskill");
         assert!(text.contains("Analysis Steps"));
         assert!(text.contains("First step"));
-        
+
         // Should now have instructions loaded
         assert!(registry.get("myskill").unwrap().has_instructions());
     }
@@ -1765,7 +1918,7 @@ triggers:
         let dir = TempDir::new().unwrap();
         let skill_dir = dir.path().join("review");
         std::fs::create_dir_all(&skill_dir).unwrap();
-        
+
         let skill_md = r#"---
 name: review
 description: "Review skill"
@@ -1775,10 +1928,10 @@ triggers:
 Instructions.
 "#;
         std::fs::write(skill_dir.join("SKILL.md"), skill_md).unwrap();
-        
+
         let mut registry = SkillRegistry::new();
         discover_and_register_metadata(dir.path(), &mut registry);
-        
+
         // No trigger match
         let result = load_triggered_skill_instructions(&mut registry, "hello world");
         assert!(result.is_none());
@@ -1790,7 +1943,7 @@ Instructions.
         let dir = TempDir::new().unwrap();
         let skill_dir = dir.path().join("evaluate_session");
         std::fs::create_dir_all(&skill_dir).unwrap();
-        
+
         // This mirrors the actual skills/evaluate_session/SKILL.md format
         let skill_md = r#"---
 name: evaluate-session
@@ -1822,17 +1975,22 @@ Determine which session to evaluate.
 Query the agent_events table.
 "#;
         std::fs::write(skill_dir.join("SKILL.md"), skill_md).unwrap();
-        
+
         let mut registry = SkillRegistry::new();
         discover_and_register_metadata(dir.path(), &mut registry);
-        
+
         // Verify skill was discovered
         assert_eq!(registry.len(), 1);
-        let skill = registry.get("evaluate-session").expect("skill should exist");
-        assert_eq!(skill.metadata.description, "Agent self-assessment skill that evaluates performance metrics for a session");
+        let skill = registry
+            .get("evaluate-session")
+            .expect("skill should exist");
+        assert_eq!(
+            skill.metadata.description,
+            "Agent self-assessment skill that evaluates performance metrics for a session"
+        );
         assert!(skill.metadata.user_invocable);
         assert_eq!(skill.metadata.triggers.len(), 10);
-        
+
         // Test various trigger phrases - now more precise (session-specific)
         let test_cases = [
             ("evaluate session please", true),
@@ -1843,24 +2001,29 @@ Query the agent_events table.
             ("会话性能怎么样", true),
             ("评估会话效率", true),
             // These should NOT match (too generic)
-            ("evaluate this stock", false),  
+            ("evaluate this stock", false),
             ("评估一下股票", false),
             ("performance review", false),
             ("hello world", false),
         ];
-        
+
         for (message, should_match) in test_cases {
             let matches = detect_triggers_in_message(&registry, message);
             if should_match {
-                assert!(!matches.is_empty(), "Expected trigger match for: {}", message);
+                assert!(
+                    !matches.is_empty(),
+                    "Expected trigger match for: {}",
+                    message
+                );
                 assert_eq!(matches[0], "evaluate-session");
             } else {
                 assert!(matches.is_empty(), "Expected no match for: {}", message);
             }
         }
-        
+
         // Test full load flow
-        let result = load_triggered_skill_instructions(&mut registry, "evaluate my session performance");
+        let result =
+            load_triggered_skill_instructions(&mut registry, "evaluate my session performance");
         assert!(result.is_some());
         let (name, instructions) = result.unwrap();
         assert_eq!(name, "evaluate-session");
@@ -1876,13 +2039,17 @@ Query the agent_events table.
             // Skip if not running from the expected location
             return;
         }
-        
+
         let mut registry = SkillRegistry::new();
         let registered = discover_and_register_metadata(skills_dir, &mut registry);
-        
+
         // We should find at least the example and evaluate_session skills
-        assert!(!registered.is_empty(), "Should find at least 1 skill, found: {:?}", registered);
-        
+        assert!(
+            !registered.is_empty(),
+            "Should find at least 1 skill, found: {:?}",
+            registered
+        );
+
         // Check if evaluate-session was found (if SKILL.md exists)
         if registered.contains(&"evaluate-session".to_string()) {
             let skill = registry.get("evaluate-session").unwrap();
@@ -1906,7 +2073,7 @@ Query the agent_events table.
         assert!(looks_like_command("what is the status?"));
         assert!(looks_like_command("run the tests"));
         assert!(looks_like_command("debug this error"));
-        
+
         // Non-commands should not be detected
         assert!(!looks_like_command("hi"));
         assert!(!looks_like_command("ok"));
@@ -1928,17 +2095,17 @@ Query the agent_events table.
     #[test]
     fn classification_cache_basic() {
         let mut cache = SkillClassificationCache::new(Duration::from_secs(60));
-        
+
         // Insert and retrieve
         cache.insert("test message", Some("skill-a".to_string()));
         assert_eq!(cache.get("test message"), Some(Some("skill-a".to_string())));
-        
+
         // Case insensitive
         assert_eq!(cache.get("TEST MESSAGE"), Some(Some("skill-a".to_string())));
-        
+
         // Non-existent
         assert_eq!(cache.get("other message"), None);
-        
+
         // None values
         cache.insert("no skill", None);
         assert_eq!(cache.get("no skill"), Some(None));
@@ -1949,7 +2116,7 @@ Query the agent_events table.
         let dir = TempDir::new().unwrap();
         let skill_dir = dir.path().join("test-skill");
         std::fs::create_dir_all(&skill_dir).unwrap();
-        
+
         let skill_md = r#"---
 name: test-skill
 description: "A test skill"
@@ -1960,12 +2127,12 @@ triggers:
 Instructions.
 "#;
         std::fs::write(skill_dir.join("SKILL.md"), skill_md).unwrap();
-        
+
         let mut registry = SkillRegistry::new();
         discover_and_register_metadata(dir.path(), &mut registry);
-        
+
         let prompt = build_classification_prompt(&registry, "run a test");
-        
+
         assert!(prompt.contains("test-skill"));
         assert!(prompt.contains("A test skill"));
         assert!(prompt.contains("run a test"));
@@ -1977,7 +2144,7 @@ Instructions.
         let dir = TempDir::new().unwrap();
         let skill_dir = dir.path().join("my-skill");
         std::fs::create_dir_all(&skill_dir).unwrap();
-        
+
         let skill_md = r#"---
 name: my-skill
 description: "My skill"
@@ -1988,26 +2155,38 @@ triggers:
 Instructions.
 "#;
         std::fs::write(skill_dir.join("SKILL.md"), skill_md).unwrap();
-        
+
         let mut registry = SkillRegistry::new();
         discover_and_register_metadata(dir.path(), &mut registry);
-        
+
         // Exact match
-        assert_eq!(parse_classification_response("my-skill", &registry), Some("my-skill".to_string()));
-        
+        assert_eq!(
+            parse_classification_response("my-skill", &registry),
+            Some("my-skill".to_string())
+        );
+
         // With whitespace
-        assert_eq!(parse_classification_response("  my-skill  ", &registry), Some("my-skill".to_string()));
-        
+        assert_eq!(
+            parse_classification_response("  my-skill  ", &registry),
+            Some("my-skill".to_string())
+        );
+
         // Case insensitive
-        assert_eq!(parse_classification_response("MY-SKILL", &registry), Some("my-skill".to_string()));
-        
+        assert_eq!(
+            parse_classification_response("MY-SKILL", &registry),
+            Some("my-skill".to_string())
+        );
+
         // None response
         assert_eq!(parse_classification_response("none", &registry), None);
         assert_eq!(parse_classification_response("NONE", &registry), None);
         assert_eq!(parse_classification_response("", &registry), None);
-        
+
         // Unknown skill
-        assert_eq!(parse_classification_response("unknown-skill", &registry), None);
+        assert_eq!(
+            parse_classification_response("unknown-skill", &registry),
+            None
+        );
     }
 
     #[test]
@@ -2015,7 +2194,7 @@ Instructions.
         let dir = TempDir::new().unwrap();
         let skill_dir = dir.path().join("review");
         std::fs::create_dir_all(&skill_dir).unwrap();
-        
+
         let skill_md = r#"---
 name: review
 description: "Code review skill"
@@ -2027,18 +2206,23 @@ triggers:
 Instructions.
 "#;
         std::fs::write(skill_dir.join("SKILL.md"), skill_md).unwrap();
-        
+
         let mut registry = SkillRegistry::new();
         discover_and_register_metadata(dir.path(), &mut registry);
-        
+
         // English trigger
-        assert_eq!(detect_skill_hybrid_sync(&registry, "please review this"), Some("review".to_string()));
-        
+        assert_eq!(
+            detect_skill_hybrid_sync(&registry, "please review this"),
+            Some("review".to_string())
+        );
+
         // Chinese trigger
-        assert_eq!(detect_skill_hybrid_sync(&registry, "审查一下代码"), Some("review".to_string()));
-        
+        assert_eq!(
+            detect_skill_hybrid_sync(&registry, "审查一下代码"),
+            Some("review".to_string())
+        );
+
         // No match
         assert_eq!(detect_skill_hybrid_sync(&registry, "hello world"), None);
     }
 }
-

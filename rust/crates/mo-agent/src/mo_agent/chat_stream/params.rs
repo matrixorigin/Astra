@@ -1,6 +1,8 @@
 use mo_agent_runtime::{pipeline::persistence::ToolHealthEntry, tool_selector::ToolSelector};
 
-use crate::{permission_manager::PermissionManager, skill_instructions::SharedSkillRegistry, ExplainMode};
+use crate::{
+    ExplainMode, permission_manager::PermissionManager, skill_instructions::SharedSkillRegistry,
+};
 
 /// Parameters for a single agentic chat turn — groups the many arguments
 /// to `stream_chat_sse` into a named struct to reduce cognitive load.
