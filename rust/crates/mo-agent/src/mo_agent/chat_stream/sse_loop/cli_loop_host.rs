@@ -4,7 +4,7 @@
 //! skill registry, terminal rendering) behind the runtime trait so the
 //! multi-turn loop runs in the runtime crate.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -16,7 +16,6 @@ use mo_agent_runtime::{
     turn::agentic_headless_round::HeadlessStderrStyle,
     turn::agentic_loop_host::{AgenticLoopHost, AgenticLoopState, HostTurnResult},
     turn::sse_stream_host::EdgeToolExecResult,
-    turn::tool_result_semantics::tool_dedup_signature,
 };
 use serde_json::Value;
 
@@ -119,15 +118,9 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
             })
             .collect();
 
-        let edge_callback_outputs: HashMap<String, String> = edge_tool_round
-            .iter()
-            .map(|r| (tool_dedup_signature(&r.tool, &r.args), r.output.clone()))
-            .collect();
-
         Ok(HostTurnResult {
             accum: turn_result.core,
             ttft_ms: turn_result.ttft_ms,
-            edge_callback_outputs,
             edge_tool_round,
         })
     }
