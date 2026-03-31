@@ -1064,12 +1064,26 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
                 let memoria_client =
                     crate::turn::cloud::memoria_compact::HttpMemoriaClient::from_env();
 
+                // Build summary client for LLM-based compaction
+                let compact_config = crate::prompts::CompactConfig::from_env();
+                let summary_client = crate::turn::cloud::summary::HttpSummaryClient::new(
+                    crate::turn::cloud::summary::LlmConnParams {
+                        model_name: model_name.clone(),
+                        api_key: api_key.clone(),
+                        base_url: base_url.clone(),
+                        provider: provider.clone(),
+                        max_output_tokens: compact_config.summary_token_budget,
+                    },
+                );
+
                 let compact_result = crate::turn::cloud::memoria_compact::compact_with_memoria(
                     &raw,
                     Some(&session_id),
                     &memoria_config,
                     &memoria_params,
                     memoria_client.as_ref().map(|c| c as &dyn crate::turn::cloud::memoria_compact::MemoriaClient),
+                    Some(&compact_config),
+                    Some(&summary_client as &dyn crate::turn::cloud::summary::SummaryLlmClient),
                 )
                 .await;
 

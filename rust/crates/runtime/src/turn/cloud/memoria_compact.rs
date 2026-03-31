@@ -17,7 +17,8 @@ use serde_json::{Value, json};
 use super::compaction::{
     CompactBoundary, CompactResult, CompactTrigger, compact_tiered_with_result,
 };
-use crate::prompts::CompactionTier;
+use super::summary::SummaryLlmClient;
+use crate::prompts::{CompactConfig, CompactionTier};
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -348,6 +349,8 @@ pub async fn compact_with_memoria(
     config: &MemoriaCompactConfig,
     params: &MemoriaCompactParams,
     client: Option<&dyn MemoriaClient>,
+    compact_config: Option<&CompactConfig>,
+    summary_client: Option<&dyn SummaryLlmClient>,
 ) -> CompactResult {
     // Check if we should attempt Memoria retrieval
     let should_retrieve = params.current_tokens >= config.min_tokens_for_retrieval
@@ -431,6 +434,35 @@ pub async fn compact_with_memoria(
             );
             if let Err(e) = client.store(&store_content, "working", Some(sid)).await {
                 eprintln!("[compact] Failed to store working memory: {e}");
+            }
+        }
+    }
+
+    // Step 6: Optionally generate LLM summary
+    if let Some(cfg) = compact_config
+        && let Some(s_client) = summary_client
+        && cfg.should_summarize(params.tier)
+    {
+        match super::summary::generate_compact_summary(messages, s_client).await {
+            Some(summary) => {
+                let summary_msg = json!({
+                    "role": "user",
+                    "content": format!("[Conversation summary — context compacted]\n\n{summary}"),
+                    "attachment_metadata": { "kind": "compact_summary" }
+                });
+                result.messages.insert(0, summary_msg);
+
+                if let Some(ref mut boundary) = result.boundary {
+                    boundary.summary = Some(format!(
+                        "{}\nLLM summary generated",
+                        boundary.summary.as_deref().unwrap_or("")
+                    ));
+                }
+
+                eprintln!("[compact] LLM summary generated ({} chars)", summary.len());
+            }
+            None => {
+                eprintln!("[compact] LLM summary failed, using truncation only");
             }
         }
     }
@@ -576,6 +608,8 @@ mod tests {
             &config,
             &params,
             None, // No client
+            None, // No compact config
+            None, // No summary client
         )
         .await;
 
@@ -598,8 +632,16 @@ mod tests {
             current_tokens: 1000, // Below threshold
         };
 
-        let result =
-            compact_with_memoria(&msgs, Some("sess1"), &config, &params, Some(&mock)).await;
+        let result = compact_with_memoria(
+            &msgs,
+            Some("sess1"),
+            &config,
+            &params,
+            Some(&mock),
+            None,
+            None,
+        )
+        .await;
 
         // Should not have stored anything
         assert!(mock.stored.lock().unwrap().is_empty());
@@ -632,8 +674,16 @@ mod tests {
             current_tokens: 6000, // Above threshold
         };
 
-        let result =
-            compact_with_memoria(&msgs, Some("sess1"), &config, &params, Some(&mock)).await;
+        let result = compact_with_memoria(
+            &msgs,
+            Some("sess1"),
+            &config,
+            &params,
+            Some(&mock),
+            None,
+            None,
+        )
+        .await;
 
         // Should have injected context message
         assert!(result.messages.len() >= 3);
@@ -666,5 +716,227 @@ mod tests {
         };
         let result = compact_with_memoria_sync(&msgs, Some("sess1"), &config, &params);
         assert_eq!(result.messages.len(), 2);
+    }
+
+    // ── Summary integration tests ────────────────────────────────────────────
+
+    struct MockSummaryClient {
+        response: Mutex<Option<String>>,
+    }
+
+    impl MockSummaryClient {
+        fn success(text: &str) -> Self {
+            Self {
+                response: Mutex::new(Some(text.to_string())),
+            }
+        }
+
+        fn failure() -> Self {
+            Self {
+                response: Mutex::new(None),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl super::super::summary::SummaryLlmClient for MockSummaryClient {
+        async fn summarize(
+            &self,
+            _messages: &[Value],
+        ) -> Result<super::super::summary::SummaryResponse, String> {
+            match self.response.lock().unwrap().as_ref() {
+                Some(text) => Ok(super::super::summary::SummaryResponse {
+                    text: text.clone(),
+                    is_ptl_error: false,
+                }),
+                None => Err("mock failure".to_string()),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn compact_with_summary_when_enabled() {
+        let msgs = vec![
+            user("implement OAuth"),
+            assistant("I'll help with OAuth. Here's a plan..."),
+            user("use JWT instead"),
+            assistant("Sure, switching to JWT tokens for auth."),
+        ];
+        let config = MemoriaCompactConfig {
+            min_tokens_for_retrieval: 100,
+            store_on_compact: false,
+            ..Default::default()
+        };
+        let mock = MockMemoriaClient::new(vec![MemoriaMemory {
+            memory_id: "m1".to_string(),
+            content: "Working on auth module".to_string(),
+            memory_type: "working".to_string(),
+            retrieval_score: Some(0.8),
+        }]);
+        let params = MemoriaCompactParams {
+            budget_chars: 10000,
+            keep_chars: 2000,
+            tier: CompactionTier::AggressivePrune, // Meets summary_min_tier
+            keep_recent_turns: 4,
+            current_tokens: 6000,
+        };
+
+        let compact_config = CompactConfig {
+            enable_summary: true,
+            summary_min_tier: CompactionTier::AggressivePrune,
+            ..Default::default()
+        };
+        let summary_client =
+            MockSummaryClient::success("User discussed OAuth then switched to JWT auth.");
+
+        let result = compact_with_memoria(
+            &msgs,
+            Some("sess1"),
+            &config,
+            &params,
+            Some(&mock),
+            Some(&compact_config),
+            Some(&summary_client as &dyn super::super::summary::SummaryLlmClient),
+        )
+        .await;
+
+        // Should have summary message
+        let has_summary = result.messages.iter().any(|m| {
+            m.get("content")
+                .and_then(Value::as_str)
+                .map(|s| s.contains("[Conversation summary"))
+                .unwrap_or(false)
+        });
+        assert!(has_summary, "should have summary message");
+
+        // Should also have memoria context
+        let has_context = result.messages.iter().any(|m| {
+            m.get("content")
+                .and_then(Value::as_str)
+                .map(|s| s.contains("[Session Context from Memory]"))
+                .unwrap_or(false)
+        });
+        assert!(has_context, "should have memoria context");
+    }
+
+    #[tokio::test]
+    async fn compact_summary_disabled_skips_llm() {
+        let msgs = vec![user("hello"), assistant("hi")];
+        let config = MemoriaCompactConfig::default();
+        let params = MemoriaCompactParams {
+            budget_chars: 10000,
+            keep_chars: 2000,
+            tier: CompactionTier::AggressivePrune,
+            keep_recent_turns: 4,
+            current_tokens: 1000,
+        };
+
+        let compact_config = CompactConfig {
+            enable_summary: false, // Disabled
+            ..Default::default()
+        };
+        let summary_client = MockSummaryClient::success("should not appear");
+
+        let result = compact_with_memoria(
+            &msgs,
+            Some("sess1"),
+            &config,
+            &params,
+            None,
+            Some(&compact_config),
+            Some(&summary_client as &dyn super::super::summary::SummaryLlmClient),
+        )
+        .await;
+
+        let has_summary = result.messages.iter().any(|m| {
+            m.get("content")
+                .and_then(Value::as_str)
+                .map(|s| s.contains("[Conversation summary"))
+                .unwrap_or(false)
+        });
+        assert!(
+            !has_summary,
+            "summary should not be generated when disabled"
+        );
+    }
+
+    #[tokio::test]
+    async fn compact_summary_failure_falls_back() {
+        let msgs = vec![user("hello"), assistant("hi")];
+        let config = MemoriaCompactConfig::default();
+        let params = MemoriaCompactParams {
+            budget_chars: 10000,
+            keep_chars: 2000,
+            tier: CompactionTier::AggressivePrune,
+            keep_recent_turns: 4,
+            current_tokens: 1000,
+        };
+
+        let compact_config = CompactConfig {
+            enable_summary: true,
+            summary_min_tier: CompactionTier::AggressivePrune,
+            ..Default::default()
+        };
+        let summary_client = MockSummaryClient::failure();
+
+        let result = compact_with_memoria(
+            &msgs,
+            Some("sess1"),
+            &config,
+            &params,
+            None,
+            Some(&compact_config),
+            Some(&summary_client as &dyn super::super::summary::SummaryLlmClient),
+        )
+        .await;
+
+        // Should still have the original messages (truncated), no summary
+        assert_eq!(result.messages.len(), 2);
+        let has_summary = result.messages.iter().any(|m| {
+            m.get("content")
+                .and_then(Value::as_str)
+                .map(|s| s.contains("[Conversation summary"))
+                .unwrap_or(false)
+        });
+        assert!(!has_summary, "failed summary should not inject message");
+    }
+
+    #[tokio::test]
+    async fn compact_summary_below_tier_threshold_skips() {
+        let msgs = vec![user("hello"), assistant("hi")];
+        let config = MemoriaCompactConfig::default();
+        let params = MemoriaCompactParams {
+            budget_chars: 10000,
+            keep_chars: 2000,
+            tier: CompactionTier::TrimSchemas, // Below AggressivePrune threshold
+            keep_recent_turns: 4,
+            current_tokens: 1000,
+        };
+
+        let compact_config = CompactConfig {
+            enable_summary: true,
+            summary_min_tier: CompactionTier::AggressivePrune, // Requires AggressivePrune
+            ..Default::default()
+        };
+        let summary_client = MockSummaryClient::success("should not appear");
+
+        let result = compact_with_memoria(
+            &msgs,
+            Some("sess1"),
+            &config,
+            &params,
+            None,
+            Some(&compact_config),
+            Some(&summary_client as &dyn super::super::summary::SummaryLlmClient),
+        )
+        .await;
+
+        let has_summary = result.messages.iter().any(|m| {
+            m.get("content")
+                .and_then(Value::as_str)
+                .map(|s| s.contains("[Conversation summary"))
+                .unwrap_or(false)
+        });
+        assert!(!has_summary, "tier below threshold should skip summary");
     }
 }
