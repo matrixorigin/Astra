@@ -24,6 +24,8 @@ use crate::prompts;
 pub(crate) const LLM_MAX_RETRIES: u32 = 3;
 /// Base delay between retries (doubles each attempt: 1s, 2s, 4s).
 pub(crate) const LLM_RETRY_BASE_MS: u64 = 1000;
+/// Stream idle watchdog: abort streaming if no chunk arrives within this time.
+pub(crate) const STREAM_IDLE_TIMEOUT_MS: u64 = 90_000;
 
 // ── Rate-Limit Cooldown ──────────────────────────────────────────────────────
 use std::sync::OnceLock;
@@ -118,6 +120,16 @@ pub(crate) struct LlmCallResult {
 
 fn turn_timeout_s() -> f64 {
     mo_agent_core::RuntimeLimits::global().turn_timeout_s
+}
+
+fn stream_idle_timeout() -> std::time::Duration {
+    // Allow tests and deployments to override the idle watchdog.
+    // Default: 90s to match Claude Code's stream idle watchdog.
+    let ms = std::env::var("MO_STREAM_IDLE_TIMEOUT_MS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(STREAM_IDLE_TIMEOUT_MS);
+    std::time::Duration::from_millis(ms)
 }
 
 /// Call the LLM streaming API, collect the full response, and return a structured result.
@@ -224,8 +236,32 @@ pub(crate) async fn call_llm_and_collect(
             // Success — record to cooldown tracker
             cooldown.record_success();
             let byte_stream = response.bytes_stream();
-            let result = collect_llm_stream(byte_stream, model_name, started).await;
-            return Ok(result);
+            match collect_llm_stream(byte_stream, model_name, started).await {
+                Ok(result) => return Ok(result),
+                Err(StreamCollectError::IdleTimeout { elapsed_ms }) => {
+                    // Abort streaming and fall back to non-stream request (single response).
+                    mo_agent_core::agent_warn!(
+                        "llm",
+                        "stream idle timeout after {}ms — attempting non-stream fallback",
+                        elapsed_ms
+                    );
+                    return call_llm_nonstream_fallback(
+                        &client,
+                        messages,
+                        tools,
+                        model_name,
+                        api_key,
+                        base_url,
+                        provider,
+                        max_output_tokens,
+                    )
+                    .await;
+                }
+                Err(StreamCollectError::Transport(e)) => {
+                    last_err = format!("LLM stream transport error: {e}");
+                    continue;
+                }
+            }
         }
 
         // Parse retry-after header
@@ -283,7 +319,7 @@ async fn collect_llm_stream(
     stream: impl futures_util::Stream<Item = Result<Bytes, reqwest::Error>> + Unpin + Send + 'static,
     model_name: &str,
     started: Instant,
-) -> LlmCallResult {
+) -> Result<LlmCallResult, StreamCollectError> {
     let mut full_text = String::new();
     let mut reasoning = String::new();
     let mut tool_calls_map: HashMap<usize, Map<String, Value>> = HashMap::new();
@@ -292,7 +328,18 @@ async fn collect_llm_stream(
     let sse = parse_sse_chunks(stream);
     tokio::pin!(sse);
 
-    while let Some(chunk) = sse.next().await {
+    let idle = stream_idle_timeout();
+    loop {
+        let next = tokio::time::timeout(idle, sse.next()).await;
+        let chunk = match next {
+            Ok(v) => v,
+            Err(_elapsed) => {
+                return Err(StreamCollectError::IdleTimeout {
+                    elapsed_ms: idle.as_millis() as u64,
+                });
+            }
+        };
+        let Some(chunk) = chunk else { break };
         // Parse usage from any chunk
         if let Some(u) = chunk.get("usage").and_then(Value::as_object) {
             let prompt = u.get("prompt_tokens").and_then(Value::as_i64);
@@ -385,6 +432,105 @@ async fn collect_llm_stream(
         .map(|(_, v)| Value::Object(v))
         .collect();
 
+    Ok(LlmCallResult {
+        full_text,
+        reasoning,
+        tool_calls,
+        usage,
+        model_used: model_name.to_string(),
+        duration_ms: started.elapsed().as_millis() as u64,
+    })
+}
+
+#[derive(Debug)]
+enum StreamCollectError {
+    IdleTimeout { elapsed_ms: u64 },
+    Transport(String),
+}
+
+async fn call_llm_nonstream_fallback(
+    client: &reqwest::Client,
+    messages: &[Value],
+    tools: &[Value],
+    model_name: &str,
+    api_key: &str,
+    base_url: &str,
+    provider: &str,
+    max_output_tokens: Option<usize>,
+) -> Result<LlmCallResult, String> {
+    let started = Instant::now();
+    let mut body = json!({
+        "model": model_name,
+        "messages": messages,
+        "stream": false,
+    });
+    if let Some(max_out) = max_output_tokens {
+        if provider == "anthropic" || model_name.contains("claude") {
+            body["max_tokens"] = json!(max_out);
+        } else {
+            body["max_completion_tokens"] = json!(max_out);
+        }
+    }
+    if !tools.is_empty() {
+        body["tools"] = Value::Array(tools.to_vec());
+        body["tool_choice"] = Value::String("auto".to_string());
+    }
+
+    let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
+    let mut req = client.post(&url).header("content-type", "application/json");
+    if provider == "anthropic" {
+        req = req
+            .header("x-api-key", api_key)
+            .header("anthropic-version", "2023-06-01");
+    } else {
+        req = req.header("authorization", format!("Bearer {api_key}"));
+    }
+
+    let resp = req.json(&body).send().await.map_err(|e| e.to_string())?;
+    if !resp.status().is_success() {
+        let status = resp.status().as_u16();
+        let text = resp.text().await.unwrap_or_default();
+        return Err(format!("LLM fallback error {status}: {text}"));
+    }
+    let v: Value = resp.json().await.map_err(|e| e.to_string())?;
+    Ok(parse_nonstream_response(&v, model_name, started))
+}
+
+fn parse_nonstream_response(v: &Value, model_name: &str, started: Instant) -> LlmCallResult {
+    let mut full_text = String::new();
+    let mut reasoning = String::new();
+    let mut tool_calls = Vec::new();
+    let mut usage = Map::new();
+
+    if let Some(u) = v.get("usage").and_then(Value::as_object) {
+        if let Some(p) = u.get("prompt_tokens").and_then(Value::as_i64) {
+            usage.insert("prompt".to_string(), Value::from(p));
+        }
+        if let Some(c) = u.get("completion_tokens").and_then(Value::as_i64) {
+            usage.insert("completion".to_string(), Value::from(c));
+        }
+        if let (Some(p), Some(c)) = (
+            u.get("prompt_tokens").and_then(Value::as_i64),
+            u.get("completion_tokens").and_then(Value::as_i64),
+        ) {
+            usage.insert("total".to_string(), Value::from(p + c));
+        }
+    }
+
+    if let Some(choice) = v.get("choices").and_then(Value::as_array).and_then(|a| a.first()) {
+        if let Some(msg) = choice.get("message").and_then(Value::as_object) {
+            if let Some(content) = msg.get("content").and_then(Value::as_str) {
+                full_text = content.to_string();
+            }
+            if let Some(r) = msg.get("reasoning_content").and_then(Value::as_str) {
+                reasoning = r.to_string();
+            }
+            if let Some(tcs) = msg.get("tool_calls").and_then(Value::as_array) {
+                tool_calls = tcs.clone();
+            }
+        }
+    }
+
     LlmCallResult {
         full_text,
         reasoning,
@@ -432,6 +578,8 @@ fn parse_sse_chunks(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures_util::stream;
+    use serde_json::json;
 
     #[test]
     fn classify_llm_error_categories() {
@@ -473,5 +621,39 @@ mod tests {
         assert!(r.full_text.is_empty());
         assert!(r.tool_calls.is_empty());
         assert_eq!(r.duration_ms, 0);
+    }
+
+    #[test]
+    fn parse_nonstream_response_extracts_fields() {
+        let v = json!({
+            "choices": [{
+                "message": {
+                    "content": "hello",
+                    "reasoning_content": "think",
+                    "tool_calls": [{"id":"t1","type":"function","function":{"name":"bash","arguments":"{}"}}]
+                }
+            }],
+            "usage": { "prompt_tokens": 10, "completion_tokens": 5 }
+        });
+        let r = parse_nonstream_response(&v, "test-model", Instant::now());
+        assert_eq!(r.full_text, "hello");
+        assert_eq!(r.reasoning, "think");
+        assert_eq!(r.tool_calls.len(), 1);
+        assert_eq!(r.usage.get("total").and_then(Value::as_i64), Some(15));
+    }
+
+    #[tokio::test]
+    async fn stream_idle_timeout_triggers() {
+        // Keep this test fast: override idle timeout to 1ms.
+        unsafe { std::env::set_var("MO_STREAM_IDLE_TIMEOUT_MS", "1") };
+        // Stream that never yields any bytes (simulates a hung connection).
+        let pending_stream = stream::pending::<Result<Bytes, reqwest::Error>>();
+        let started = Instant::now();
+        let res = collect_llm_stream(pending_stream, "test-model", started).await;
+        assert!(
+            matches!(res, Err(StreamCollectError::IdleTimeout { .. })),
+            "expected idle timeout, got: {res:?}"
+        );
+        unsafe { std::env::remove_var("MO_STREAM_IDLE_TIMEOUT_MS") };
     }
 }
