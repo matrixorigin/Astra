@@ -16,12 +16,17 @@ use mo_agent_runtime::{
     semantic_dedup::SemanticDedup,
     tool_registry::{self, ToolRegistry},
     tool_selector::{self, ToolSelector},
+    turn::agentic_post_tool_policy::{
+        AgenticPostToolPolicyOutcome, AgenticPostToolPolicyRequest, apply_agentic_post_tool_policy,
+    },
+    turn::agentic_stall_preflight::{
+        CliAgenticStallPreflightRequest, apply_cli_agentic_stall_preflight,
+    },
     turn::agentic_turn_ingest::{
         AgenticTurnIngestMut, AgenticTurnIngestOutcome, AgenticTurnStreamSnapshot,
         ingest_agentic_turn_stream,
     },
     turn::boost_domain_hints::domain_hints_from_boost_terms,
-    turn::chat_history_openai::{append_openai_user_content_messages, openai_user_content_message},
     turn::chat_turn_edge_profile::{
         detect_active_system_skills_in_message, read_git_branch_abbrev,
     },
@@ -36,14 +41,9 @@ use mo_agent_runtime::{
         CACHEABLE_TOOLS, openai_assistant_with_tool_calls_message, openai_tool_roundtrip_values,
         take_edge_output_for_tool_call, tool_calls_for_stall_guard,
     },
-    turn::stall::{
-        CLI_AGENTIC_VERDICT_REMAINING_PENALTY_CRITICAL,
-        CLI_AGENTIC_VERDICT_REMAINING_PENALTY_WARNING, IntentDrift, SERVER_STALL_WINDOW,
-        detect_cli_tool_name_stall, detect_intent_drift, round_tool_call_sig_and_names,
-    },
     turn::tool_result_semantics::{is_resource_limit_output, is_tool_error, tool_dedup_signature},
     turn::tool_schema_prune::{filter_tool_schemas_by_excluded_names, pin_invoked_tool_schemas},
-    turn::turn_guard::{TurnGuard, VerdictSeverity},
+    turn::turn_guard::TurnGuard,
 };
 use mo_agent_services::session_journal::ToolCallRecord;
 use serde_json::Value;
@@ -502,207 +502,6 @@ async fn fetch_chat_turn_sse(ctx: ChatTurnSseFetchRequest<'_>) -> Result<TurnRes
     };
 
     Ok(consume_turn_sse(resp, render_md, term_width, quiet, Some(edge_ctx)).await)
-}
-
-// ─── Stall preflight (signatures + name-stall) ────────────────────────────────
-
-struct StallPreflightRequest<'a> {
-    turn_index: u32,
-    tool_calls_for_guard: &'a [Value],
-    turn_sigs: &'a mut Vec<BTreeSet<String>>,
-    turn_tool_names: &'a mut Vec<HashSet<String>>,
-    stall_events: &'a mut Vec<(String, u32)>,
-    turn_guard: &'a mut TurnGuard,
-}
-
-fn apply_stall_preflight(ctx: StallPreflightRequest<'_>) {
-    let StallPreflightRequest {
-        turn_index,
-        tool_calls_for_guard,
-        turn_sigs,
-        turn_tool_names,
-        stall_events,
-        turn_guard,
-    } = ctx;
-
-    let (sig_set, name_set) = round_tool_call_sig_and_names(tool_calls_for_guard);
-    turn_sigs.push(sig_set);
-    turn_tool_names.push(name_set);
-
-    turn_guard.record_tool_calls(tool_calls_for_guard);
-
-    let name_stall = detect_cli_tool_name_stall(turn_tool_names, SERVER_STALL_WINDOW);
-
-    if name_stall {
-        stall_events.push(("name_stall".to_string(), turn_index));
-    }
-}
-
-// ─── Post-tool: intent drift + TurnGuard verdict ─────────────────────────────
-
-struct PostToolTurnRequest<'a> {
-    turn_index: u32,
-    message: &'a str,
-    tool_calls_for_guard: &'a [Value],
-    intent_tool_turns: &'a mut Vec<(Vec<String>, String)>,
-    messages: &'a mut Vec<Value>,
-    stall_events: &'a mut Vec<(String, u32)>,
-    turn_guard: &'a mut TurnGuard,
-    verdict_events: &'a mut Vec<VerdictEvent>,
-    restricted_tools: &'a mut HashSet<String>,
-    remaining_turns: &'a mut usize,
-    step_recorder: &'a mut StepRecorder,
-    current_session_id: Option<&'a String>,
-    max_turns: usize,
-    loop_turn: usize,
-    recent_tools: &'a [String],
-    last_heavy_checkpoint: &'a mut Option<StepCheckpoint>,
-}
-
-enum PostToolTurnOutcome {
-    ProceedEndTurn,
-    RetryLlmClearToolResults,
-    Abort(String),
-}
-
-fn apply_post_tool_turn_policy(ctx: PostToolTurnRequest<'_>) -> PostToolTurnOutcome {
-    let PostToolTurnRequest {
-        turn_index,
-        message,
-        tool_calls_for_guard,
-        intent_tool_turns,
-        messages,
-        stall_events,
-        turn_guard,
-        verdict_events,
-        restricted_tools,
-        remaining_turns,
-        step_recorder,
-        current_session_id,
-        max_turns,
-        loop_turn,
-        recent_tools,
-        last_heavy_checkpoint,
-    } = ctx;
-
-    {
-        let turn_names: Vec<String> = tool_calls_for_guard
-            .iter()
-            .filter_map(|tc| tc.get("name").and_then(|v| v.as_str()).map(String::from))
-            .collect();
-        let turn_args_text: String = tool_calls_for_guard
-            .iter()
-            .filter_map(|tc| {
-                tc.get("arguments")
-                    .map(|v| serde_json::to_string(v).unwrap_or_default())
-            })
-            .collect::<Vec<_>>()
-            .join(" ");
-        intent_tool_turns.push((turn_names, turn_args_text));
-
-        if let IntentDrift::Drifting { correction, .. } =
-            detect_intent_drift(message, intent_tool_turns)
-        {
-            messages.push(openai_user_content_message(&correction));
-            stall_events.push(("intent_drift".to_string(), turn_index));
-        }
-    }
-
-    {
-        let verdict = turn_guard.evaluate();
-
-        if verdict.severity > VerdictSeverity::Healthy {
-            let severity_str = match verdict.severity {
-                VerdictSeverity::Critical => "critical",
-                VerdictSeverity::Warning => "warning",
-                VerdictSeverity::Info => "info",
-                VerdictSeverity::Healthy => unreachable!(),
-            };
-            let health_summary = turn_guard.health.summary();
-            verdict_events.push(VerdictEvent {
-                turn: turn_index,
-                severity: severity_str.to_string(),
-                injections: verdict.injections.clone(),
-                avoid_tools: verdict.avoid_tools.clone(),
-                force_stop: verdict.force_stop,
-                nudge_count: turn_guard.nudge_count,
-                total_errors: turn_guard.errors.total_errors,
-                deprioritized_count: health_summary.deprioritized_count,
-                total_timeouts: health_summary.total_timeouts,
-                total_cache_hits: health_summary.total_cache_hits,
-                flaky_count: health_summary.flaky_count,
-            });
-        }
-
-        append_openai_user_content_messages(messages, &verdict.injections);
-
-        for tool in &verdict.avoid_tools {
-            restricted_tools.insert(tool.clone());
-        }
-
-        match verdict.severity {
-            VerdictSeverity::Critical => {
-                *remaining_turns =
-                    remaining_turns.saturating_sub(CLI_AGENTIC_VERDICT_REMAINING_PENALTY_CRITICAL);
-            }
-            VerdictSeverity::Warning => {
-                *remaining_turns =
-                    remaining_turns.saturating_sub(CLI_AGENTIC_VERDICT_REMAINING_PENALTY_WARNING);
-            }
-            _ => {}
-        }
-
-        let severity_label = match verdict.severity {
-            VerdictSeverity::Critical => "critical",
-            VerdictSeverity::Warning => "warning",
-            VerdictSeverity::Info => "info",
-            VerdictSeverity::Healthy => "healthy",
-        };
-        step_recorder.record_verdict(
-            severity_label,
-            verdict.stall_detected,
-            verdict.is_diverging,
-            verdict.force_stop,
-            verdict.injections.len(),
-        );
-
-        if let Some(sid) = current_session_id
-            && let Some(heavy) = step_recorder.build_heavy_checkpoint(
-                messages,
-                0,
-                max_turns.saturating_sub(loop_turn) as u32,
-                &turn_guard
-                    .health
-                    .deprioritized_tools()
-                    .iter()
-                    .map(|s| s.to_string())
-                    .collect::<Vec<_>>(),
-                recent_tools,
-            )
-        {
-            let cp = StepCheckpoint::Heavy(Box::new(heavy));
-            let _ = step_checkpoint::write_step_checkpoint(
-                sid,
-                step_recorder.summary().checkpoints,
-                &cp,
-            );
-            *last_heavy_checkpoint = Some(cp);
-        }
-
-        if verdict.force_stop {
-            step_recorder.end_turn(true);
-            return PostToolTurnOutcome::Abort(
-                "Agent escalated to critical — too many errors and stalls. Aborting.".to_string(),
-            );
-        }
-
-        if !verdict.injections.is_empty() && verdict.severity >= VerdictSeverity::Warning {
-            step_recorder.end_turn(false);
-            return PostToolTurnOutcome::RetryLlmClearToolResults;
-        }
-    }
-
-    PostToolTurnOutcome::ProceedEndTurn
 }
 
 // ─── Headless tool round (was `tool_round.rs`) ─────────────────────────────────
@@ -1304,7 +1103,7 @@ pub(crate) async fn run_agentic_loop_iteration(
     let tool_calls_for_guard =
         tool_calls_for_stall_guard(&turn_result.tool_calls, &turn_result.edge_tool_round);
 
-    apply_stall_preflight(StallPreflightRequest {
+    apply_cli_agentic_stall_preflight(CliAgenticStallPreflightRequest {
         turn_index: turn_index as u32,
         tool_calls_for_guard: &tool_calls_for_guard,
         turn_sigs,
@@ -1333,7 +1132,7 @@ pub(crate) async fn run_agentic_loop_iteration(
     .await;
     explain_turns.extend(turn_result.explain_turns.iter().cloned());
 
-    match apply_post_tool_turn_policy(PostToolTurnRequest {
+    match apply_agentic_post_tool_policy(AgenticPostToolPolicyRequest {
         turn_index: turn_index as u32,
         message,
         tool_calls_for_guard: &tool_calls_for_guard,
@@ -1351,12 +1150,12 @@ pub(crate) async fn run_agentic_loop_iteration(
         recent_tools,
         last_heavy_checkpoint,
     }) {
-        PostToolTurnOutcome::Abort(e) => Err(e),
-        PostToolTurnOutcome::RetryLlmClearToolResults => {
+        AgenticPostToolPolicyOutcome::Abort(e) => Err(e),
+        AgenticPostToolPolicyOutcome::RetryLlmClearToolResults => {
             tool_results.clear();
             Ok(AgenticLoopTurnExit::ContinueIterating)
         }
-        PostToolTurnOutcome::ProceedEndTurn => {
+        AgenticPostToolPolicyOutcome::ProceedEndTurn => {
             step_recorder.end_turn(false);
             Ok(AgenticLoopTurnExit::ContinueIterating)
         }
@@ -1365,28 +1164,6 @@ pub(crate) async fn run_agentic_loop_iteration(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
-    #[test]
-    fn name_stall_fires_when_last_three_turns_repeat_same_tool_names() {
-        let tc = serde_json::json!({"name":"bash","arguments":{}});
-        let mut turn_sigs = Vec::new();
-        let mut turn_tool_names = Vec::new();
-        let mut stall_events = Vec::new();
-        let mut turn_guard = TurnGuard::new();
-        for i in 0..3u32 {
-            apply_stall_preflight(StallPreflightRequest {
-                turn_index: i,
-                tool_calls_for_guard: std::slice::from_ref(&tc),
-                turn_sigs: &mut turn_sigs,
-                turn_tool_names: &mut turn_tool_names,
-                stall_events: &mut stall_events,
-                turn_guard: &mut turn_guard,
-            });
-        }
-        assert_eq!(stall_events, vec![("name_stall".to_string(), 2)]);
-    }
-
     #[test]
     fn merge_skill_names_track_dedupes() {
         let mut v = vec!["a".into()];

@@ -292,6 +292,9 @@ struct ReplayArgs {
 
 // ══════════════════════════════════════════════════════ SSE Streaming ════
 
+pub(crate) type VerdictEvent =
+    mo_agent_runtime::turn::agentic_verdict_audit::AgenticVerdictAuditEvent;
+
 #[derive(Debug)]
 struct StreamResult {
     session_id: Option<String>,
@@ -336,25 +339,6 @@ struct StreamResult {
     selector_tokens_out: u64,
     /// Memoria search time in milliseconds (subset of context_ms).
     memoria_ms: Option<u64>,
-}
-
-/// Structured audit record for a TurnGuard verdict.
-#[derive(Debug, Clone)]
-struct VerdictEvent {
-    turn: u32,
-    severity: String,
-    injections: Vec<String>,
-    avoid_tools: Vec<String>,
-    force_stop: bool,
-    nudge_count: usize,
-    total_errors: usize,
-    deprioritized_count: usize,
-    /// Timeout-specific failure count (subset of total_errors).
-    total_timeouts: usize,
-    /// Idempotency cache hits (tools skipped, neutral for health).
-    total_cache_hits: usize,
-    /// Number of tools with rehabilitation_count >= 2 (flaky).
-    flaky_count: usize,
 }
 
 // ══════════════════════════════════════════════════════════ REPL State ════
