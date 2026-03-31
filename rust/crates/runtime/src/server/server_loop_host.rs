@@ -254,7 +254,7 @@ impl ServerAgenticLoopHost {
     }
 
     /// Build the LLM message array from loop state.
-    fn build_llm_messages(
+    async fn build_llm_messages(
         &self,
         system_prompt: &str,
         state: &AgenticLoopState,
@@ -282,7 +282,7 @@ impl ServerAgenticLoopHost {
         let tier = budget.compaction_tier(cache_est.total_tokens);
         let budget_chars = budget.effective_input_limit() * 4;
 
-        // Use Memoria-based compaction (sync fallback to pure truncation)
+        // Use Memoria-based compaction (async with HTTP client)
         let memoria_config = crate::turn::cloud::memoria_compact::MemoriaCompactConfig::default();
         let memoria_params = crate::turn::cloud::memoria_compact::MemoriaCompactParams {
             budget_chars,
@@ -292,12 +292,19 @@ impl ServerAgenticLoopHost {
             current_tokens: cache_est.total_tokens,
         };
 
-        let compact_result = crate::turn::cloud::memoria_compact::compact_with_memoria_sync(
+        // Try to create Memoria client from environment
+        let memoria_client = crate::turn::cloud::memoria_compact::HttpMemoriaClient::from_env();
+
+        let compact_result = crate::turn::cloud::memoria_compact::compact_with_memoria(
             &state.messages,
             Some(&self.session_id),
             &memoria_config,
             &memoria_params,
-        );
+            memoria_client
+                .as_ref()
+                .map(|c| c as &dyn crate::turn::cloud::memoria_compact::MemoriaClient),
+        )
+        .await;
 
         llm_messages.extend(compact_result.messages);
         llm_messages
@@ -365,7 +372,9 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             .unwrap_or("");
 
         let system_prompt = self.build_system_prompt(user_content);
-        let llm_messages = self.build_llm_messages(&system_prompt, state, &model_name);
+        let llm_messages = self
+            .build_llm_messages(&system_prompt, state, &model_name)
+            .await;
 
         // ── 3. Call LLM ─────────────────────────────────────────────────
         let budget = crate::prompts::budget_for_model(Some(&model_name));
@@ -700,8 +709,8 @@ mod tests {
         assert!((host.selection_confidence - 0.42).abs() < f64::EPSILON);
     }
 
-    #[test]
-    fn build_llm_messages_includes_system_and_user() {
+    #[tokio::test]
+    async fn build_llm_messages_includes_system_and_user() {
         let host = ServerAgenticLoopHostBuilder::new(
             mock_matrixone(),
             mock_encryptor(),
@@ -716,7 +725,9 @@ mod tests {
             .messages
             .push(json!({"role": "user", "content": "hello"}));
 
-        let msgs = host.build_llm_messages("system prompt text", &state, "gpt-4");
+        let msgs = host
+            .build_llm_messages("system prompt text", &state, "gpt-4")
+            .await;
         assert!(msgs.len() >= 2, "should have system + user messages");
         assert_eq!(msgs[0]["role"], "system");
         assert_eq!(msgs[0]["content"], "system prompt text");

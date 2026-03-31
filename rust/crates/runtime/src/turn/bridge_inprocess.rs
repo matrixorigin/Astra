@@ -686,7 +686,7 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
                 // Use effective input limit as char budget (×4 for char-to-token ratio)
                 let budget_chars = budget.effective_input_limit() * 4;
 
-                // Use Memoria-based compaction (sync fallback to pure truncation)
+                // Use Memoria-based compaction (async with HTTP client)
                 let memoria_config = crate::turn::cloud::memoria_compact::MemoriaCompactConfig::default();
                 let memoria_params = crate::turn::cloud::memoria_compact::MemoriaCompactParams {
                     budget_chars,
@@ -696,12 +696,18 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
                     current_tokens: cache_est.total_tokens,
                 };
 
-                let compact_result = crate::turn::cloud::memoria_compact::compact_with_memoria_sync(
+                // Try to create Memoria client from environment
+                let memoria_client =
+                    crate::turn::cloud::memoria_compact::HttpMemoriaClient::from_env();
+
+                let compact_result = crate::turn::cloud::memoria_compact::compact_with_memoria(
                     &raw,
                     Some(&session_id),
                     &memoria_config,
                     &memoria_params,
-                );
+                    memoria_client.as_ref().map(|c| c as &dyn crate::turn::cloud::memoria_compact::MemoriaClient),
+                )
+                .await;
 
                 (compact_result.messages, tier)
             };

@@ -236,13 +236,14 @@ pub(super) async fn build_server_state(
         )
         .with_pool(shared_pool.clone()),
     );
-    let delegation_engine =
-        Arc::new(crate::server::delegation_engine::DelegationEngine::with_executor(
+    let delegation_engine = Arc::new(
+        crate::server::delegation_engine::DelegationEngine::with_executor(
             Arc::new(tokio::sync::RwLock::new((*profile_registry).clone())),
             Arc::new(run_engine),
             delegation_tracker,
             sub_run_executor,
-        ));
+        ),
+    );
     let state = state
         .with_agent_profile_registry(profile_registry)
         .with_delegation_engine(delegation_engine);

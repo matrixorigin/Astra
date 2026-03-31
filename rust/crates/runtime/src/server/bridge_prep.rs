@@ -206,18 +206,17 @@ pub(super) async fn prepare_chat_turn_bridge_body(
     }
 
     // ── Turn identifiers ────────────────────────────────────────────────
-    let (turn_chain_id, user_query_event_id) = if let Some(session_id) =
-        trusted_session_id.as_deref()
-    {
-        let messages = request.messages_slice();
-        let has_tool_results = request.has_tool_results();
-        let (chain_id, event_id) =
-            prepare_chat_turn_bridge_identifiers(state, session_id, messages, has_tool_results)
-                .await;
-        (Some(chain_id), Some(event_id))
-    } else {
-        (None, None)
-    };
+    let (turn_chain_id, user_query_event_id) =
+        if let Some(session_id) = trusted_session_id.as_deref() {
+            let messages = request.messages_slice();
+            let has_tool_results = request.has_tool_results();
+            let (chain_id, event_id) =
+                prepare_chat_turn_bridge_identifiers(state, session_id, messages, has_tool_results)
+                    .await;
+            (Some(chain_id), Some(event_id))
+        } else {
+            (None, None)
+        };
 
     // ── Cached inputs + tool trimming ───────────────────────────────────
     let tools_changed = if let Some(session_id) = trusted_session_id.as_deref() {
@@ -354,10 +353,7 @@ async fn prepare_chat_turn_bridge_cached_inputs(
         let changed = cached_tools
             .as_ref()
             .is_some_and(|cached| !same_tool_names(cached, &edge_tools));
-        entry.insert(
-            "tools".to_string(),
-            serde_json::Value::Array(edge_tools),
-        );
+        entry.insert("tools".to_string(), serde_json::Value::Array(edge_tools));
         changed
     } else if let Some(cached_tools) = cached_tools {
         request.set_edge_tools(cached_tools);
@@ -383,10 +379,7 @@ fn trim_edge_tools_for_result_turn(request: &mut ChatTurnRequestBody, user_query
     let Some(edge_tools) = request.edge_tools_vec().cloned() else {
         return;
     };
-    let available_tool_names: Vec<&str> = edge_tools
-        .iter()
-        .filter_map(extract_tool_name)
-        .collect();
+    let available_tool_names: Vec<&str> = edge_tools.iter().filter_map(extract_tool_name).collect();
     let Some(subset_names) =
         plan_tool_subset_for_result_turn(&tool_result_names, user_query, &available_tool_names)
     else {
@@ -886,10 +879,7 @@ mod tests {
         assert!(request.execution_state_obj().is_some());
 
         // Forward-compat: unknown fields preserved
-        assert_eq!(
-            serialized.get("custom_field").unwrap(),
-            &json!("preserved")
-        );
+        assert_eq!(serialized.get("custom_field").unwrap(), &json!("preserved"));
     }
 
     #[test]
@@ -905,16 +895,14 @@ mod tests {
 
     #[test]
     fn typed_request_null_session_id() {
-        let request: ChatTurnRequestBody =
-            serde_json::from_str(r#"{"session_id": null}"#).unwrap();
+        let request: ChatTurnRequestBody = serde_json::from_str(r#"{"session_id": null}"#).unwrap();
         assert!(request.session_id_str().is_none());
         assert!(!request.has_non_null_session_id());
     }
 
     #[test]
     fn typed_request_numeric_session_id_handled() {
-        let request: ChatTurnRequestBody =
-            serde_json::from_str(r#"{"session_id": 42}"#).unwrap();
+        let request: ChatTurnRequestBody = serde_json::from_str(r#"{"session_id": 42}"#).unwrap();
         assert!(request.session_id_str().is_none());
         assert!(request.has_non_null_session_id());
     }
@@ -968,10 +956,7 @@ mod tests {
 
     #[test]
     fn extract_tool_name_non_string_name() {
-        assert_eq!(
-            extract_tool_name(&json!({"function": {"name": 42}})),
-            None
-        );
+        assert_eq!(extract_tool_name(&json!({"function": {"name": 42}})), None);
     }
 
     // ── sync_opt_field_with_cache ───────────────────────────────────

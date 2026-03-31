@@ -321,10 +321,13 @@ impl DelegationEngine {
                 .persist_status(&sub_run_id, "running", Some("agent_execution"), None)
                 .await?;
 
-            let profile = reg
-                .get(agent_id)
-                .cloned()
-                .unwrap_or_else(|| AgentProfile::new(agent_id, agent_id, mo_agent_services::coordination::AgentTier::User));
+            let profile = reg.get(agent_id).cloned().unwrap_or_else(|| {
+                AgentProfile::new(
+                    agent_id,
+                    agent_id,
+                    mo_agent_services::coordination::AgentTier::User,
+                )
+            });
 
             configs.push(SubRunConfig {
                 run_id: sub_run_id,
@@ -440,10 +443,13 @@ impl DelegationEngine {
                 .persist_status(&sub_run_id, "running", Some("agent_execution"), None)
                 .await?;
 
-            let profile = reg
-                .get(agent_id)
-                .cloned()
-                .unwrap_or_else(|| AgentProfile::new(agent_id, agent_id, mo_agent_services::coordination::AgentTier::User));
+            let profile = reg.get(agent_id).cloned().unwrap_or_else(|| {
+                AgentProfile::new(
+                    agent_id,
+                    agent_id,
+                    mo_agent_services::coordination::AgentTier::User,
+                )
+            });
 
             let config = SubRunConfig {
                 run_id: sub_run_id.clone(),
@@ -515,14 +521,20 @@ impl DelegationEngine {
         let mut results = Vec::new();
         let mut last_producer_output: Option<String> = None;
 
-        let producer_profile = reg
-            .get(producer_id)
-            .cloned()
-            .unwrap_or_else(|| AgentProfile::new(producer_id, producer_id, mo_agent_services::coordination::AgentTier::System));
-        let reviewer_profile = reg
-            .get(reviewer_id)
-            .cloned()
-            .unwrap_or_else(|| AgentProfile::new(reviewer_id, reviewer_id, mo_agent_services::coordination::AgentTier::System));
+        let producer_profile = reg.get(producer_id).cloned().unwrap_or_else(|| {
+            AgentProfile::new(
+                producer_id,
+                producer_id,
+                mo_agent_services::coordination::AgentTier::System,
+            )
+        });
+        let reviewer_profile = reg.get(reviewer_id).cloned().unwrap_or_else(|| {
+            AgentProfile::new(
+                reviewer_id,
+                reviewer_id,
+                mo_agent_services::coordination::AgentTier::System,
+            )
+        });
         drop(reg);
 
         for round in 0..max_rounds {
@@ -554,22 +566,38 @@ impl DelegationEngine {
                 run_id: prod_run_id.clone(),
                 agent_profile: producer_profile.clone(),
                 task: request.task.clone(),
-                session_id: request.context.get("session_id").and_then(|v| v.as_str()).unwrap_or("delegation").to_string(),
+                session_id: request
+                    .context
+                    .get("session_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("delegation")
+                    .to_string(),
                 user_id: request.user_id.clone(),
                 previous_output: last_producer_output.clone(),
                 context: request.context.clone(),
             };
             let prod_result = match self.executor.execute(prod_config).await {
                 Ok(r) => {
-                    let _ = self.run_engine.persist_status(&prod_run_id, &r.status, None, r.error.as_deref()).await;
+                    let _ = self
+                        .run_engine
+                        .persist_status(&prod_run_id, &r.status, None, r.error.as_deref())
+                        .await;
                     r
                 }
                 Err(e) => {
-                    let _ = self.run_engine.persist_status(&prod_run_id, "failed", None, Some(&e)).await;
+                    let _ = self
+                        .run_engine
+                        .persist_status(&prod_run_id, "failed", None, Some(&e))
+                        .await;
                     AgentResult {
-                        agent_id: producer_id.to_string(), run_id: prod_run_id,
-                        status: "failed".to_string(), output: None, error: Some(e),
-                        prompt_tokens: 0, completion_tokens: 0, tool_calls: 0,
+                        agent_id: producer_id.to_string(),
+                        run_id: prod_run_id,
+                        status: "failed".to_string(),
+                        output: None,
+                        error: Some(e),
+                        prompt_tokens: 0,
+                        completion_tokens: 0,
+                        tool_calls: 0,
                     }
                 }
             };
@@ -603,23 +631,42 @@ impl DelegationEngine {
             let rev_config = SubRunConfig {
                 run_id: rev_run_id.clone(),
                 agent_profile: reviewer_profile.clone(),
-                task: format!("Review this output:\n\n{}", last_producer_output.as_deref().unwrap_or("[no output]")),
-                session_id: request.context.get("session_id").and_then(|v| v.as_str()).unwrap_or("delegation").to_string(),
+                task: format!(
+                    "Review this output:\n\n{}",
+                    last_producer_output.as_deref().unwrap_or("[no output]")
+                ),
+                session_id: request
+                    .context
+                    .get("session_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("delegation")
+                    .to_string(),
                 user_id: request.user_id.clone(),
                 previous_output: last_producer_output.clone(),
                 context: request.context.clone(),
             };
             let rev_result = match self.executor.execute(rev_config).await {
                 Ok(r) => {
-                    let _ = self.run_engine.persist_status(&rev_run_id, &r.status, None, r.error.as_deref()).await;
+                    let _ = self
+                        .run_engine
+                        .persist_status(&rev_run_id, &r.status, None, r.error.as_deref())
+                        .await;
                     r
                 }
                 Err(e) => {
-                    let _ = self.run_engine.persist_status(&rev_run_id, "failed", None, Some(&e)).await;
+                    let _ = self
+                        .run_engine
+                        .persist_status(&rev_run_id, "failed", None, Some(&e))
+                        .await;
                     AgentResult {
-                        agent_id: reviewer_id.to_string(), run_id: rev_run_id,
-                        status: "failed".to_string(), output: None, error: Some(e),
-                        prompt_tokens: 0, completion_tokens: 0, tool_calls: 0,
+                        agent_id: reviewer_id.to_string(),
+                        run_id: rev_run_id,
+                        status: "failed".to_string(),
+                        output: None,
+                        error: Some(e),
+                        prompt_tokens: 0,
+                        completion_tokens: 0,
+                        tool_calls: 0,
                     }
                 }
             };
@@ -963,7 +1010,10 @@ mod tests {
     impl SubRunExecutor for EchoExecutor {
         async fn execute(&self, config: SubRunConfig) -> Result<AgentResult, String> {
             let output = if let Some(prev) = &config.previous_output {
-                format!("[{}] {}: prev={}", config.agent_profile.agent_id, config.task, prev)
+                format!(
+                    "[{}] {}: prev={}",
+                    config.agent_profile.agent_id, config.task, prev
+                )
             } else {
                 format!("[{}] {}", config.agent_profile.agent_id, config.task)
             };
@@ -1014,16 +1064,17 @@ mod tests {
         }
     }
 
-    fn setup_with_executor(executor: Arc<dyn SubRunExecutor>) -> (
+    fn setup_with_executor(
+        executor: Arc<dyn SubRunExecutor>,
+    ) -> (
         Arc<RwLock<AgentProfileRegistry>>,
         Arc<RunEngine>,
         Arc<DelegationTracker>,
         DelegationEngine,
     ) {
         let (reg, engine, tracker) = setup();
-        let de = DelegationEngine::with_executor(
-            reg.clone(), engine.clone(), tracker.clone(), executor,
-        );
+        let de =
+            DelegationEngine::with_executor(reg.clone(), engine.clone(), tracker.clone(), executor);
         (reg, engine, tracker, de)
     }
 
@@ -1138,11 +1189,19 @@ mod tests {
         assert_eq!(result.status, "partial");
         assert_eq!(result.agent_results.len(), 2);
 
-        let coder = result.agent_results.iter().find(|r| r.agent_id == "coder").unwrap();
+        let coder = result
+            .agent_results
+            .iter()
+            .find(|r| r.agent_id == "coder")
+            .unwrap();
         assert_eq!(coder.status, "completed");
         assert!(coder.output.is_some());
 
-        let reviewer = result.agent_results.iter().find(|r| r.agent_id == "reviewer").unwrap();
+        let reviewer = result
+            .agent_results
+            .iter()
+            .find(|r| r.agent_id == "reviewer")
+            .unwrap();
         assert_eq!(reviewer.status, "failed");
         assert!(reviewer.error.is_some());
     }
@@ -1177,7 +1236,7 @@ mod tests {
         }
 
         // Token aggregation across all sub-runs
-        assert_eq!(result.total_prompt_tokens, 40);  // 4 × 10
+        assert_eq!(result.total_prompt_tokens, 40); // 4 × 10
         assert_eq!(result.total_completion_tokens, 80); // 4 × 20
 
         let subs = tracker.get_sub_runs("del-adv").await;
@@ -1197,7 +1256,10 @@ mod tests {
             })
             .await;
 
-        assert_eq!(tracker.get_agent_id("sub-1").await, Some("coder".to_string()));
+        assert_eq!(
+            tracker.get_agent_id("sub-1").await,
+            Some("coder".to_string())
+        );
         assert_eq!(tracker.get_agent_id("parent").await, None);
         assert_eq!(tracker.get_agent_id("nonexistent").await, None);
     }
@@ -1205,10 +1267,7 @@ mod tests {
     #[tokio::test]
     async fn with_executor_constructor_uses_custom_executor() {
         let (reg, engine, tracker) = setup();
-        let de = DelegationEngine::with_executor(
-            reg, engine, tracker,
-            Arc::new(EchoExecutor),
-        );
+        let de = DelegationEngine::with_executor(reg, engine, tracker, Arc::new(EchoExecutor));
 
         let req = fan_out_request(vec!["coder"]);
         let result = de.execute(req, "orch").await.unwrap();
@@ -1232,15 +1291,16 @@ mod tests {
                     status: "completed".to_string(),
                     output: Some(format!("context_present={}", has_key)),
                     error: None,
-                    prompt_tokens: 0, completion_tokens: 0, tool_calls: 0,
+                    prompt_tokens: 0,
+                    completion_tokens: 0,
+                    tool_calls: 0,
                 })
             }
         }
 
         let (reg, engine, tracker) = setup();
-        let de = DelegationEngine::with_executor(
-            reg, engine, tracker, Arc::new(ContextCheckExecutor),
-        );
+        let de =
+            DelegationEngine::with_executor(reg, engine, tracker, Arc::new(ContextCheckExecutor));
 
         let mut ctx = HashMap::new();
         ctx.insert("test_key".to_string(), serde_json::json!("test_value"));

@@ -649,7 +649,10 @@ impl ServerSubRunExecutor {
 
 #[async_trait]
 impl SubRunExecutor for ServerSubRunExecutor {
-    async fn execute(&self, config: SubRunConfig) -> Result<mo_agent_services::coordination::AgentResult, String> {
+    async fn execute(
+        &self,
+        config: SubRunConfig,
+    ) -> Result<mo_agent_services::coordination::AgentResult, String> {
         use crate::pipeline::step_protocol::InMemoryIdempotencyCache;
         use crate::semantic_dedup::SemanticDedup;
         use crate::turn::turn_guard::TurnGuard;
@@ -657,12 +660,18 @@ impl SubRunExecutor for ServerSubRunExecutor {
         // Build edge profile from agent's system prompt and metadata.
         let mut edge_profile = Map::new();
         if let Some(prompt) = &config.agent_profile.system_prompt {
-            edge_profile.insert("system_prompt_override".to_string(), Value::String(prompt.clone()));
+            edge_profile.insert(
+                "system_prompt_override".to_string(),
+                Value::String(prompt.clone()),
+            );
         }
         if let Some(model) = &config.agent_profile.model_override {
             edge_profile.insert("model".to_string(), Value::String(model.clone()));
         }
-        edge_profile.insert("agent_id".to_string(), Value::String(config.agent_profile.agent_id.clone()));
+        edge_profile.insert(
+            "agent_id".to_string(),
+            Value::String(config.agent_profile.agent_id.clone()),
+        );
 
         // Build the host with agent-specific configuration.
         let mut builder = ServerAgenticLoopHostBuilder::new(
