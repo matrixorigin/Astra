@@ -106,4 +106,23 @@ mod tests {
         assert_eq!(v.len(), 1);
         assert!(v[0].is_empty());
     }
+
+    #[test]
+    fn lf_separator_splits_before_crlf_terminated_block() {
+        let mut buf = "event: x\n\ndata: {}\r\n\r\n".to_string();
+        let v = drain_complete_sse_event_blocks(&mut buf);
+        assert_eq!(v.len(), 2);
+        assert_eq!(v[0], "event: x");
+        assert_eq!(v[1], "data: {}");
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn blank_line_buf_splits_utf8_sequence_across_chunks() {
+        let mut b = SseBlankLineUtf8Buf::new();
+        assert!(b.push_lossy_bytes(&[0xC3]).is_empty());
+        let v = b.push_lossy_bytes(&[0xA9, b'd', b':', b' ', b'{', b'}', b'\n', b'\n']);
+        assert_eq!(v.len(), 1);
+        assert!(v[0].contains('}'));
+    }
 }

@@ -7,6 +7,7 @@
 /// | Long-lived stream “stall” / no chunks | [`super::llm_client::stream_idle_timeout`] on SSE `next()` (90s default, `MO_STREAM_IDLE_TIMEOUT_MS`) |
 /// | Recover via one-shot completion | [`super::llm_client::call_llm_nonstream_fallback`] after idle in both `call_llm_and_collect` and [`call_llm_stream`] below |
 /// | User cancel clears in-flight work | HTTP `/chat/turn` passes `CancellationToken`; dropping the SSE body (client disconnect) cancels in-flight LLM byte/SSE consumption in-process |
+/// | Cooldown / 429 wait cannot ignore disconnect | [`super::llm_client::sleep_ms_or_llm_cancel`] on retry backoff + rate-limit waits in [`call_llm_stream`]; initial cooldown wait `select!`s [`wait_until_cancelled_or_pending`](super::llm_client::wait_until_cancelled_or_pending) in the bridge stream |
 /// | Tool permission queue + single resolve | CLI: `mo-agent-cli` `permission_manager`; cloud: edge approval ledger / `POST /tools/result`. Claude’s `PermissionContext` “resolve once” matches ledger single-shot semantics |
 ///
 /// # Legacy Status
@@ -54,6 +55,7 @@ use crate::{
     },
     turn::edge_ledger::{assistant_message_with_tool_calls, ensure_tool_call_ids},
     turn::persist::{build_tool_call_event_payload, build_tool_result_event_payload},
+    turn::llm_client::{sleep_ms_or_llm_cancel, LlmCancel},
     turn::sse_blocks::SseBlankLineUtf8Buf,
     turn::sse_data_lines::{
         drain_sse_data_lines, finish_sse_data_buffer, validate_sse_event_block_json,
@@ -281,6 +283,13 @@ fn cached_system_prompt(
     prompt
 }
 
+fn bridge_llm_cancel(cc: &Option<Arc<CancellationToken>>) -> LlmCancel<'_> {
+    match cc.as_ref() {
+        Some(t) => LlmCancel::Token(t.as_ref()),
+        None => LlmCancel::None,
+    }
+}
+
 /// Call LLM streaming API, yield SSE bytes.
 /// Emits: text_delta, reasoning_delta, tool_call_start, usage SSE events,
 /// then a final `_inprocess_summary` event with full_text/tool_calls/usage/model_used.
@@ -346,7 +355,7 @@ async fn call_llm_stream(
     for attempt in 0..=LLM_MAX_RETRIES {
         if attempt > 0 {
             let delay = LLM_RETRY_BASE_MS * (1 << (attempt - 1));
-            tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+            sleep_ms_or_llm_cancel(delay, bridge_llm_cancel(&client_cancel)).await?;
         }
 
         let mut req = client.post(&url).header("content-type", "application/json");
@@ -629,7 +638,7 @@ async fn call_llm_stream(
 
             // If cooldown says to wait, honor it
             if let RateLimitAction::WaitAndRetry { delay_ms } = action {
-                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                sleep_ms_or_llm_cancel(delay_ms, bridge_llm_cancel(&client_cancel)).await?;
             }
             continue; // Retryable
         }
@@ -645,7 +654,7 @@ async fn call_llm_stream(
 
             // If cooldown says to wait, honor it
             if let RateLimitAction::WaitAndRetry { delay_ms } = action {
-                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                sleep_ms_or_llm_cancel(delay_ms, bridge_llm_cancel(&client_cancel)).await?;
             }
             continue; // Retryable
         }
@@ -841,7 +850,18 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
                         "llm",
                         "rate-limit cooldown: waiting {delay_ms}ms before request"
                     );
-                    tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                    tokio::select! {
+                        biased;
+                        _ = crate::turn::llm_client::wait_until_cancelled_or_pending(cc.as_deref()) => {
+                            yield render_sse_map(&build_stream_error_event(
+                                "Request cancelled (client disconnected)",
+                                "CLIENT_DISCONNECT",
+                                false,
+                            ));
+                            return;
+                        }
+                        _ = tokio::time::sleep(std::time::Duration::from_millis(delay_ms)) => {}
+                    }
                 }
                 RateLimitAction::UseFallback { reason } => {
                     if let Some(ref fb_name) = fallback_model_name {

@@ -270,6 +270,12 @@ impl AgenticRunLifecycleService {
             events_count: run.events.len() as i64,
         }
     }
+
+    #[cfg(test)]
+    pub(crate) async fn test_llm_cancel_token_is_cancelled(&self, run_id: &str) -> Option<bool> {
+        let runs = self.runs.read().await;
+        runs.get(run_id).map(|r| r.llm_cancel_token.is_cancelled())
+    }
 }
 
 #[async_trait]
@@ -1009,6 +1015,21 @@ mod tests {
         let status = ok(svc.get_run_status(run.run_id, "user-1".into()).await);
         assert_eq!(status.status, "cancelled");
         assert_eq!(status.events_count, 2);
+    }
+
+    #[tokio::test]
+    async fn cancel_run_cancels_llm_token_for_inflight_wake() {
+        let svc = test_service();
+        let run = ok(svc.create_run("user-1".into(), test_request("task")).await);
+        assert_eq!(
+            svc.test_llm_cancel_token_is_cancelled(&run.run_id).await,
+            Some(false)
+        );
+        ok(svc.cancel_run(run.run_id.clone(), "user-1".into()).await);
+        assert_eq!(
+            svc.test_llm_cancel_token_is_cancelled(&run.run_id).await,
+            Some(true)
+        );
     }
 
     #[tokio::test]

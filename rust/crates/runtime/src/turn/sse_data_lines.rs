@@ -233,4 +233,22 @@ mod tests {
     fn validate_sse_block_accepts_good_line() {
         assert!(validate_sse_event_block_json("data: {\"t\":1}\n").is_ok());
     }
+
+    #[test]
+    fn validated_json_events_from_block_ok() {
+        let block = "data: {\"a\":1}\ndata: {\"b\":2}\n";
+        let v = validated_json_events_from_sse_block(block).expect("valid");
+        assert_eq!(v, vec![json!({"a": 1}), json!({"b": 2})]);
+    }
+
+    #[test]
+    fn validated_json_events_from_block_rejects_invalid_payload() {
+        let r = validated_json_events_from_sse_block("data: not-json\n");
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn validate_sse_accepts_done_and_empty_data() {
+        assert!(validate_sse_event_block_json("data: [DONE]\ndata: \n").is_ok());
+    }
 }

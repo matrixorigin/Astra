@@ -159,6 +159,18 @@ pub(crate) async fn wait_llm_cancel(cancel: LlmCancel<'_>) {
     }
 }
 
+/// Sleep for rate-limit / cooldown delays unless [`LlmCancel`] fires first (cooperative abort).
+pub(crate) async fn sleep_ms_or_llm_cancel(
+    delay_ms: u64,
+    cancel: LlmCancel<'_>,
+) -> Result<(), String> {
+    tokio::select! {
+        biased;
+        _ = wait_llm_cancel(cancel) => Err("LLM call cancelled".to_string()),
+        _ = tokio::time::sleep(std::time::Duration::from_millis(delay_ms)) => Ok(()),
+    }
+}
+
 /// Per-chunk idle watchdog (Claude Code–style): no SSE JSON for this long → treat as stalled.
 pub(crate) fn stream_idle_timeout() -> std::time::Duration {
     // Allow tests and deployments to override the idle watchdog.
@@ -313,7 +325,7 @@ pub(crate) async fn call_llm_and_collect(
                 cooldown.metrics()
             );
             if let RateLimitAction::WaitAndRetry { delay_ms } = action {
-                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                sleep_ms_or_llm_cancel(delay_ms, cancel).await?;
             }
             continue;
         }
@@ -327,7 +339,7 @@ pub(crate) async fn call_llm_and_collect(
                 cooldown.metrics()
             );
             if let RateLimitAction::WaitAndRetry { delay_ms } = action {
-                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                sleep_ms_or_llm_cancel(delay_ms, cancel).await?;
             }
             continue;
         }
@@ -657,6 +669,26 @@ mod tests {
     use futures_util::stream;
     use serde_json::json;
     use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::Ordering;
+
+    #[tokio::test]
+    async fn sleep_ms_or_llm_cancel_sleeps_when_no_cancel_source() {
+        let r = sleep_ms_or_llm_cancel(8, LlmCancel::None).await;
+        assert!(r.is_ok());
+    }
+
+    #[tokio::test]
+    async fn sleep_ms_or_llm_cancel_aborts_on_token() {
+        let token = CancellationToken::new();
+        let token_for_wait = token.clone();
+        let h = tokio::spawn(async move {
+            sleep_ms_or_llm_cancel(60_000, LlmCancel::Token(&token_for_wait)).await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        token.cancel();
+        let r = h.await.expect("join");
+        assert_eq!(r.expect_err("cancelled"), "LLM call cancelled");
+    }
 
     #[test]
     fn classify_llm_error_categories() {

@@ -1119,4 +1119,38 @@ mod tests {
         // No change — malformed schema ignored
         assert_eq!(host.edge_tools.len(), initial_count);
     }
+
+    // ── llm_cancel_for_state (aligns server loop with AgenticLoopState cancel fields) ──
+
+    #[test]
+    fn llm_cancel_for_state_none_is_never_triggered() {
+        let s = create_test_state();
+        assert!(!super::llm_cancel_for_state(&s).is_triggered());
+    }
+
+    #[test]
+    fn llm_cancel_for_state_flag_and_token_triggers_on_flag() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use tokio_util::sync::CancellationToken;
+
+        let mut s = create_test_state();
+        let flag = Arc::new(AtomicBool::new(true));
+        let token = Arc::new(CancellationToken::new());
+        s.cancel_flag = Some(flag.clone());
+        s.cancel_token = Some(token);
+        assert!(super::llm_cancel_for_state(&s).is_triggered());
+        assert!(flag.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn llm_cancel_for_state_token_only_triggers_when_cancelled() {
+        use tokio_util::sync::CancellationToken;
+
+        let mut s = create_test_state();
+        let token = Arc::new(CancellationToken::new());
+        s.cancel_token = Some(token.clone());
+        assert!(!super::llm_cancel_for_state(&s).is_triggered());
+        token.cancel();
+        assert!(super::llm_cancel_for_state(&s).is_triggered());
+    }
 }
