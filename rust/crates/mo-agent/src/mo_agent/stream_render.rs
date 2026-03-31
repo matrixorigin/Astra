@@ -1,11 +1,14 @@
 use super::*;
 use futures_util::StreamExt;
 use mo_agent_runtime::turn::chat_turn_sse_dispatch::{
-    ChatTurnSseAccum, ChatTurnSseFramer, SseRenderEffect, dispatch_chat_turn_sse_event_block,
+    ChatTurnSseAccum, SseRenderEffect, dispatch_chat_turn_sse_event_block,
 };
 use mo_agent_runtime::turn::sse_edge_stderr_lines::{
     edge_sse_post_approval_fail_line, edge_sse_post_tool_result_fail_line,
     edge_sse_thought_duration_line, edge_sse_tool_request_notice_line,
+};
+use mo_agent_runtime::turn::sse_stream_host::{
+    EdgeApprovalResult, EdgeToolExecResult, NoopSseStreamHost, SseStreamHost, consume_sse_stream,
 };
 use mo_agent_runtime::turn::tool_result_semantics::cloud_tool_result_status_label;
 use std::ops::{Deref, DerefMut};
@@ -54,100 +57,168 @@ pub(super) struct EdgeSseContext<'a> {
     pub _pm: std::marker::PhantomData<&'a mut crate::permission_manager::PermissionManager>,
 }
 
-async fn flush_pending_edge_work(
-    pending: &mut Vec<ChatTurnEdgePending>,
-    edge: Option<&EdgeSseContext<'_>>,
-    result: &mut TurnResult,
-) {
-    if pending.is_empty() {
-        return;
+// ─── CLI SSE stream host ─────────────────────────────────────────────────────
+//
+// Implements the runtime's `SseStreamHost` trait, wiring terminal rendering,
+// local tool execution, and permission prompts into the generic SSE consumer.
+
+/// CLI host for SSE stream consumption.
+///
+/// Delegates protocol parsing to runtime's [`consume_sse_stream`] while handling:
+/// - Terminal rendering (spinners, text deltas) via [`StreamRenderState`]
+/// - Edge tool execution via [`crate::edge_tools::ToolExecutor`]
+/// - Approval prompts via [`crate::permission_manager::PermissionManager`]
+/// - Cloud API posting (tool results, approvals) via [`mo_thin_client::ThinClient`]
+struct CliSseStreamHost<'a> {
+    api: &'a mo_thin_client::ThinClient,
+    token: &'a str,
+    executor_id: &'a str,
+    executor: &'a crate::edge_tools::ToolExecutor,
+    quiet: bool,
+    perm_manager: Option<std::ptr::NonNull<crate::permission_manager::PermissionManager>>,
+    _pm: std::marker::PhantomData<&'a mut crate::permission_manager::PermissionManager>,
+    render: StreamRenderState,
+    /// Collected outputs keyed by dedup signature (for headless tool round assembly).
+    pub edge_callback_outputs: std::collections::HashMap<String, String>,
+    /// Ordered tool executions from this SSE stream.
+    pub edge_tool_round: Vec<EdgeToolRoundEntry>,
+}
+
+// SAFETY: PermissionManager is accessed exclusively through this host during
+// consume_sse_stream, guaranteed by the PhantomData lifetime bound.
+unsafe impl Send for CliSseStreamHost<'_> {}
+
+impl<'a> CliSseStreamHost<'a> {
+    fn from_edge_ctx(ctx: EdgeSseContext<'a>) -> Self {
+        Self {
+            api: ctx.api,
+            token: ctx.token,
+            executor_id: ctx.executor_id,
+            executor: ctx.executor,
+            quiet: ctx.quiet,
+            perm_manager: ctx.perm_manager,
+            _pm: ctx._pm,
+            render: StreamRenderState::new(),
+            edge_callback_outputs: std::collections::HashMap::new(),
+            edge_tool_round: Vec::new(),
+        }
     }
-    let Some(ctx) = edge else {
-        pending.clear();
-        return;
-    };
-    for item in std::mem::take(pending) {
-        match item {
-            ChatTurnEdgePending::ToolRequest {
-                request_id,
-                tool,
-                args,
-            } => {
-                if request_id.is_empty() || tool.is_empty() {
-                    continue;
+}
+
+#[async_trait::async_trait]
+impl SseStreamHost for CliSseStreamHost<'_> {
+    fn on_render_effects(&mut self, effects: Vec<SseRenderEffect>) {
+        if self.quiet {
+            return;
+        }
+        for effect in effects {
+            match effect {
+                SseRenderEffect::StreamText(s) => {
+                    print!("{s}");
+                    let _ = io::stdout().flush();
                 }
-                if !ctx.quiet {
-                    eprintln!(
-                        "{}",
-                        edge_sse_tool_request_notice_line(&tool, &request_id).dim()
-                    );
-                }
-                let allowed = match ctx.perm_manager {
-                    Some(mut ptr) => unsafe { ptr.as_mut().check(&tool, &args) },
-                    None => true,
-                };
-                let start = std::time::Instant::now();
-                let output = if allowed {
-                    ctx.executor.execute(&tool, &args).await
-                } else {
-                    "Permission denied".to_string()
-                };
-                let sig = mo_agent_runtime::turn::tool_result_semantics::tool_dedup_signature(
-                    &tool, &args,
-                );
-                result.edge_callback_outputs.insert(sig, output.clone());
-                result.edge_tool_round.push(EdgeToolRoundEntry {
-                    request_id: request_id.clone(),
-                    tool: tool.clone(),
-                    args: args.clone(),
-                    output: output.clone(),
-                });
-                let status = if !allowed {
-                    "error"
-                } else {
-                    cloud_tool_result_status_label(&output)
-                };
-                let body = mo_thin_client::ToolResultRequest {
-                    request_id,
-                    status: status.to_string(),
-                    output: Some(output),
-                    duration_ms: Some(start.elapsed().as_millis() as u64),
-                };
-                if let Err(e) = ctx
-                    .api
-                    .post_tool_result(Some(ctx.token), Some(ctx.executor_id), &body)
-                    .await
-                    && !ctx.quiet
-                {
-                    eprintln!("{}", edge_sse_post_tool_result_fail_line(e).yellow());
-                }
+                SseRenderEffect::StopThinkingSpinner => self.render.stop_thinking(),
+                SseRenderEffect::StartThinkingSpinner => self.render.start_thinking(),
             }
-            ChatTurnEdgePending::ApprovalRequired {
-                request_id,
-                tool,
-                path,
-            } => {
-                if request_id.is_empty() {
-                    continue;
-                }
-                let decision = match ctx.perm_manager {
-                    Some(mut ptr) => unsafe {
-                        ptr.as_mut()
-                            .resolve_cloud_approval(&tool, path.as_deref(), ctx.quiet)
-                    },
-                    None => mo_thin_client::ApprovalDecision::Deny,
-                };
-                let body = mo_thin_client::ApprovalRespondRequest {
-                    request_id,
-                    decision,
-                    reason: None,
-                };
-                if let Err(e) = ctx.api.post_approval(Some(ctx.token), &body).await
-                    && !ctx.quiet
-                {
-                    eprintln!("{}", edge_sse_post_approval_fail_line(e).yellow());
-                }
-            }
+        }
+    }
+
+    fn on_stream_complete(&mut self) {
+        self.render.stop_thinking();
+    }
+
+    async fn execute_tool(
+        &mut self,
+        request_id: &str,
+        tool: &str,
+        args: &serde_json::Value,
+    ) -> EdgeToolExecResult {
+        if !self.quiet {
+            eprintln!(
+                "{}",
+                edge_sse_tool_request_notice_line(tool, request_id).dim()
+            );
+        }
+        let allowed = match self.perm_manager {
+            Some(mut ptr) => unsafe { ptr.as_mut().check(tool, args) },
+            None => true,
+        };
+        let start = std::time::Instant::now();
+        let output = if allowed {
+            self.executor.execute(tool, args).await
+        } else {
+            "Permission denied".to_string()
+        };
+        let sig = mo_agent_runtime::turn::tool_result_semantics::tool_dedup_signature(tool, args);
+        self.edge_callback_outputs
+            .insert(sig, output.clone());
+        self.edge_tool_round.push(EdgeToolRoundEntry {
+            request_id: request_id.to_string(),
+            tool: tool.to_string(),
+            args: args.clone(),
+            output: output.clone(),
+        });
+        let status = if !allowed {
+            "error"
+        } else {
+            cloud_tool_result_status_label(&output)
+        };
+        let duration_ms = start.elapsed().as_millis() as u64;
+        let body = mo_thin_client::ToolResultRequest {
+            request_id: request_id.to_string(),
+            status: status.to_string(),
+            output: Some(output.clone()),
+            duration_ms: Some(duration_ms),
+        };
+        if let Err(e) = self
+            .api
+            .post_tool_result(Some(self.token), Some(self.executor_id), &body)
+            .await
+            && !self.quiet
+        {
+            eprintln!("{}", edge_sse_post_tool_result_fail_line(e).yellow());
+        }
+        EdgeToolExecResult {
+            request_id: request_id.to_string(),
+            tool: tool.to_string(),
+            args: args.clone(),
+            output,
+            status: status.to_string(),
+            duration_ms,
+        }
+    }
+
+    async fn resolve_approval(
+        &mut self,
+        request_id: &str,
+        tool: &str,
+        path: Option<&str>,
+    ) -> EdgeApprovalResult {
+        let decision = match self.perm_manager {
+            Some(mut ptr) => unsafe {
+                ptr.as_mut()
+                    .resolve_cloud_approval(tool, path, self.quiet)
+            },
+            None => mo_thin_client::ApprovalDecision::Deny,
+        };
+        let decision_str = match &decision {
+            mo_thin_client::ApprovalDecision::Allow => "allow",
+            _ => "deny",
+        };
+        let body = mo_thin_client::ApprovalRespondRequest {
+            request_id: request_id.to_string(),
+            decision,
+            reason: None,
+        };
+        if let Err(e) = self.api.post_approval(Some(self.token), &body).await
+            && !self.quiet
+        {
+            eprintln!("{}", edge_sse_post_approval_fail_line(e).yellow());
+        }
+        EdgeApprovalResult {
+            request_id: request_id.to_string(),
+            decision: decision_str.to_string(),
+            reason: None,
         }
     }
 }
@@ -236,6 +307,7 @@ impl DerefMut for TurnResult {
 }
 
 impl TurnResult {
+    #[cfg(test)]
     pub(super) fn new() -> Self {
         Self {
             core: ChatTurnSseAccum::default(),
@@ -299,6 +371,10 @@ fn apply_sse_render_effects(
 }
 
 /// Consume one /chat/turn SSE stream, render text deltas, collect tool_calls.
+///
+/// Delegates protocol parsing to runtime's [`consume_sse_stream`]; CLI-specific
+/// rendering, tool execution, and approval prompts are handled by [`CliSseStreamHost`].
+///
 /// When `quiet` is true, all terminal output is suppressed but result.full_text is still captured.
 pub(super) async fn consume_turn_sse(
     resp: mo_thin_client::HttpResponse,
@@ -307,41 +383,41 @@ pub(super) async fn consume_turn_sse(
     quiet: bool,
     edge: Option<EdgeSseContext<'_>>,
 ) -> TurnResult {
-    let mut result = TurnResult::new();
-    let mut render = StreamRenderState::new();
-    let mut stream = resp.bytes_stream();
-    let mut framer = ChatTurnSseFramer::new();
-    let mut pending_edge: Vec<ChatTurnEdgePending> = Vec::new();
+    // Convert reqwest byte stream to runtime's generic chunk type
+    let mut byte_stream = Box::pin(
+        resp.bytes_stream()
+            .map(|r| r.map(|b| b.to_vec()).map_err(|e| e.to_string())),
+    );
 
-    while let Some(chunk) = stream.next().await {
-        let Ok(chunk) = chunk else { break };
-        for event_str in framer.push_lossy_bytes(chunk.as_ref()) {
-            let effects =
-                dispatch_chat_turn_sse_event_block(&event_str, &mut result.core, &mut pending_edge);
-            apply_sse_render_effects(effects, &mut render, quiet);
-            flush_pending_edge_work(&mut pending_edge, edge.as_ref(), &mut result).await;
-        }
-    }
-    let tail = framer.take_trailing_dispatch_blob();
-    result.ttft_ms = framer.ttft_ms;
-    if !tail.trim().is_empty() {
-        let effects =
-            dispatch_chat_turn_sse_event_block(&tail, &mut result.core, &mut pending_edge);
-        apply_sse_render_effects(effects, &mut render, quiet);
-        flush_pending_edge_work(&mut pending_edge, edge.as_ref(), &mut result).await;
-    }
+    // Delegate to runtime's generic SSE consumer with the appropriate host
+    let (sse_result, edge_callback_outputs, edge_tool_round) = if let Some(ctx) = edge {
+        let mut host = CliSseStreamHost::from_edge_ctx(ctx);
+        let result = consume_sse_stream(&mut byte_stream, &mut host).await;
+        (result, host.edge_callback_outputs, host.edge_tool_round)
+    } else {
+        let mut host = NoopSseStreamHost;
+        let result = consume_sse_stream(&mut byte_stream, &mut host).await;
+        (
+            result,
+            std::collections::HashMap::new(),
+            Vec::new(),
+        )
+    };
 
-    // Ensure thinking spinner is cleaned up
-    render.stop_thinking();
+    let result = TurnResult {
+        core: sse_result.accum,
+        ttft_ms: sse_result.ttft_ms,
+        edge_callback_outputs,
+        edge_tool_round,
+    };
 
     if quiet {
-        // In quiet mode: text is captured in result.full_text, no terminal output
         return result;
     }
 
-    // Clear raw streamed text and re-render cleanly
+    // ─── Terminal re-render (CLI-specific) ────────────────────────────────
+    // Clear raw streamed text and re-render cleanly with markdown support
     if !result.full_text.is_empty() {
-        // Calculate how many visual lines the raw streamed text occupies
         let tw = term_width.max(1);
         let mut visual_lines = 0usize;
         let mut col = 0usize;
@@ -366,7 +442,6 @@ pub(super) async fn consume_turn_sse(
             )
             .ok();
         } else {
-            // Single-line text: just clear the current line
             execute!(
                 io::stdout(),
                 cursor::MoveToColumn(0),
@@ -376,7 +451,6 @@ pub(super) async fn consume_turn_sse(
         }
 
         if result.has_tool_calls {
-            // Before tool calls: print trimmed text with exactly one trailing newline
             let trimmed = result.full_text.trim();
             if !trimmed.is_empty() {
                 if render_md {
@@ -391,7 +465,6 @@ pub(super) async fn consume_turn_sse(
             println!("{}", result.full_text.trim_end());
         }
     }
-    // If no text at all (pure tool calls on subsequent turns), print nothing
 
     result
 }
