@@ -27,6 +27,7 @@ mod http_helpers;
 mod http_types;
 mod learning_handlers;
 mod meta_handlers;
+mod platform_handlers;
 mod reflect_handlers;
 mod router_builder;
 mod run_handlers;
@@ -34,7 +35,6 @@ mod session_handlers;
 mod state_builder;
 mod task_handlers;
 mod ws_handler;
-mod platform_handlers;
 
 use self::{
     bridge_prep::prepare_chat_turn_bridge_body,

@@ -767,7 +767,10 @@ fn build_combined_catalog(skills: &[SkillCatalogEntry]) -> String {
     if skills_summary.is_empty() {
         tools
     } else {
-        format!("{}\n\n# Skills (select when task matches):\n{}", tools, skills_summary)
+        format!(
+            "{}\n\n# Skills (select when task matches):\n{}",
+            tools, skills_summary
+        )
     }
 }
 
@@ -785,7 +788,10 @@ fn build_tool_select_prompt(
     learned_context: &LearnedContext,
     catalog: &str,
 ) -> Vec<Value> {
-    let system = format!("{}\n\nDynamic tools and skills:\n{}", TOOL_SELECT_SYSTEM, catalog);
+    let system = format!(
+        "{}\n\nDynamic tools and skills:\n{}",
+        TOOL_SELECT_SYSTEM, catalog
+    );
     let mut user_msg = format!("Query: {}", query);
     if !recent_tools.is_empty() {
         user_msg.push_str(&format!("\nRecently used: {:?}", recent_tools));
@@ -966,10 +972,16 @@ impl ToolSelector for LlmToolSelector {
     ) -> SelectionResult {
         // Debug: log skill_names and catalog_summary presence
         if std::env::var("MO_DEBUG_SKILLS").is_ok() {
-            eprintln!("[DEBUG] LlmToolSelector skill_names: {:?}", self.skill_names);
-            eprintln!("[DEBUG] Catalog includes skills: {}", self.catalog_summary.contains("[SKILL]"));
+            eprintln!(
+                "[DEBUG] LlmToolSelector skill_names: {:?}",
+                self.skill_names
+            );
+            eprintln!(
+                "[DEBUG] Catalog includes skills: {}",
+                self.catalog_summary.contains("[SKILL]")
+            );
         }
-        
+
         let messages = build_tool_select_prompt(
             ctx.query,
             ctx.recent_tools,
@@ -980,20 +992,20 @@ impl ToolSelector for LlmToolSelector {
         match self.call_llm(messages).await {
             Ok((text, tin, tout)) => {
                 let names = parse_tool_names_from_llm(&text);
-                
+
                 // Debug: log LLM raw response and parsed names
                 if std::env::var("MO_DEBUG_SKILLS").is_ok() {
                     eprintln!("[DEBUG] LLM raw response: {:?}", text);
                     eprintln!("[DEBUG] LLM parsed names: {:?}", names);
                 }
-                
+
                 let valid_tools: std::collections::HashSet<&str> =
                     TOOL_CATALOG.iter().map(|t| t.name).collect();
-                
+
                 // Separate tools from skills
                 let mut tool_names = Vec::new();
                 let mut selected_skills = Vec::new();
-                
+
                 for name in names {
                     if valid_tools.contains(name.as_str()) {
                         tool_names.push(name);

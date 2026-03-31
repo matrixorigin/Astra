@@ -699,7 +699,8 @@ mod tests {
 
         // Second call with similar output - triggers similarity check
         let output2: String = chinese_chars.repeat(198);
-        let result = tracker.check_and_record("shell_exec", &json!({"command": "echo2"}), &output2, 2);
+        let result =
+            tracker.check_and_record("shell_exec", &json!({"command": "echo2"}), &output2, 2);
 
         // Just verify no panic occurred - similarity result depends on exact truncation
         drop(result);

@@ -150,7 +150,9 @@ pub fn openai_assistant_with_tool_calls_message<T: EdgeToolRoundRow>(
             "tool_calls": items,
         })
     };
-    if !reasoning_content.is_empty() && let Some(obj) = msg.as_object_mut() {
+    if !reasoning_content.is_empty()
+        && let Some(obj) = msg.as_object_mut()
+    {
         obj.insert(
             "reasoning_content".to_string(),
             Value::String(reasoning_content.to_string()),
@@ -343,8 +345,8 @@ mod tests {
         assert_eq!(tc[0]["id"], "call_1");
         assert_eq!(tc[0]["type"], "function");
         assert_eq!(tc[0]["function"]["name"], "read_file");
-        let args: Value = serde_json::from_str(tc[0]["function"]["arguments"].as_str().unwrap())
-            .unwrap();
+        let args: Value =
+            serde_json::from_str(tc[0]["function"]["arguments"].as_str().unwrap()).unwrap();
         assert_eq!(args["path"], "a.rs");
     }
 

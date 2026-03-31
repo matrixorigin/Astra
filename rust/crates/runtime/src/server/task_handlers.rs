@@ -154,7 +154,12 @@ pub(super) async fn create_task_handler(
         .get_task(&task_id)
         .await
         .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, e))?
-        .ok_or_else(|| error_response(StatusCode::INTERNAL_SERVER_ERROR, "task created but not found"))?;
+        .ok_or_else(|| {
+            error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "task created but not found",
+            )
+        })?;
 
     Ok((StatusCode::CREATED, Json(task)))
 }
@@ -178,8 +183,12 @@ pub(super) async fn update_task_status_handler(
         return Err(error_response(StatusCode::NOT_FOUND, "task not found"));
     }
 
-    let status = parse_task_status(&payload.status)
-        .ok_or_else(|| error_response(StatusCode::BAD_REQUEST, format!("invalid status: {}", payload.status)))?;
+    let status = parse_task_status(&payload.status).ok_or_else(|| {
+        error_response(
+            StatusCode::BAD_REQUEST,
+            format!("invalid status: {}", payload.status),
+        )
+    })?;
 
     state
         .task_service
@@ -263,13 +272,7 @@ pub(super) async fn post_task_lease_claim_handler(
     let ttl = body.ttl_sec.unwrap_or(300);
     let result = state
         .task_lease_service
-        .try_claim_lease(
-            &user.user_id,
-            &task_id,
-            &body.edge_agent_id,
-            &edge_id,
-            ttl,
-        )
+        .try_claim_lease(&user.user_id, &task_id, &body.edge_agent_id, &edge_id, ttl)
         .await
         .map_err(|e| error_response(StatusCode::SERVICE_UNAVAILABLE, e))?;
     Ok(Json(
@@ -337,13 +340,7 @@ pub(super) async fn post_task_lease_renew_handler(
     let ttl = body.ttl_sec.unwrap_or(300);
     let view = state
         .task_lease_service
-        .renew_lease(
-            &user.user_id,
-            &task_id,
-            &body.edge_agent_id,
-            &edge_id,
-            ttl,
-        )
+        .renew_lease(&user.user_id, &task_id, &body.edge_agent_id, &edge_id, ttl)
         .await
         .map_err(|e| error_response(StatusCode::SERVICE_UNAVAILABLE, e))?;
     Ok(Json(match view {

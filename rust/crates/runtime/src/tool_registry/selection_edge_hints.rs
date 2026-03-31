@@ -2,15 +2,19 @@
 
 use serde_json::{Value, json};
 
-use super::meta::TOOL_CATALOG;
 use super::SelectionReport;
+use super::meta::TOOL_CATALOG;
 
 /// First `max` selected tool names that are not catalog-pinned (dynamic tools), preserving order.
 pub fn top_unpinned_tool_names_from_report(report: &SelectionReport, max: usize) -> Vec<String> {
     report
         .tools_selected
         .iter()
-        .filter(|n| !TOOL_CATALOG.iter().any(|t| t.pinned && t.name == n.as_str()))
+        .filter(|n| {
+            !TOOL_CATALOG
+                .iter()
+                .any(|t| t.pinned && t.name == n.as_str())
+        })
         .take(max)
         .cloned()
         .collect()
@@ -59,11 +63,7 @@ mod tests {
     #[test]
     fn top_unpinned_skips_pinned() {
         let report = SelectionReport {
-            tools_selected: vec![
-                "read_file".into(),
-                "github_list_prs".into(),
-                "grep".into(),
-            ],
+            tools_selected: vec!["read_file".into(), "github_list_prs".into(), "grep".into()],
             selected_count: 3,
             budget_used: 0,
             budget_total: 0,

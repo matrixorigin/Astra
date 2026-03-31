@@ -14,57 +14,51 @@ use crate::tool_registry::SelectionReport;
 pub fn prune_tool_schemas(tools: &[Value], tier: CompactionTier) -> Vec<Value> {
     match tier {
         CompactionTier::Normal => tools.to_vec(),
-        CompactionTier::TrimSchemas => {
-            tools
-                .iter()
-                .map(|tool| {
-                    let mut t = tool.clone();
-                    if let Some(func) = t.get_mut("function")
-                        && let Some(desc) = func.get("description").and_then(Value::as_str)
-                    {
+        CompactionTier::TrimSchemas => tools
+            .iter()
+            .map(|tool| {
+                let mut t = tool.clone();
+                if let Some(func) = t.get_mut("function")
+                    && let Some(desc) = func.get("description").and_then(Value::as_str)
+                {
+                    let truncated = truncate_to_first_sentence(desc).to_string();
+                    if let Some(obj) = func.as_object_mut() {
+                        obj.insert("description".to_string(), json!(truncated));
+                    }
+                }
+                t
+            })
+            .collect(),
+        CompactionTier::CompactHistory => tools
+            .iter()
+            .map(|tool| {
+                let mut t = tool.clone();
+                if let Some(func) = t.get_mut("function") {
+                    if let Some(desc) = func.get("description").and_then(Value::as_str) {
                         let truncated = truncate_to_first_sentence(desc).to_string();
                         if let Some(obj) = func.as_object_mut() {
                             obj.insert("description".to_string(), json!(truncated));
                         }
                     }
-                    t
-                })
-                .collect()
-        }
-        CompactionTier::CompactHistory => {
-            tools
-                .iter()
-                .map(|tool| {
-                    let mut t = tool.clone();
-                    if let Some(func) = t.get_mut("function") {
-                        if let Some(desc) = func.get("description").and_then(Value::as_str) {
-                            let truncated = truncate_to_first_sentence(desc).to_string();
-                            if let Some(obj) = func.as_object_mut() {
-                                obj.insert("description".to_string(), json!(truncated));
-                            }
-                        }
-                        strip_property_descriptions(func);
+                    strip_property_descriptions(func);
+                }
+                t
+            })
+            .collect(),
+        CompactionTier::AggressivePrune => tools
+            .iter()
+            .map(|tool| {
+                let mut t = tool.clone();
+                if let Some(func) = t.get_mut("function") {
+                    if let Some(obj) = func.as_object_mut() {
+                        obj.remove("description");
                     }
-                    t
-                })
-                .collect()
-        }
-        CompactionTier::AggressivePrune => {
-            tools
-                .iter()
-                .map(|tool| {
-                    let mut t = tool.clone();
-                    if let Some(func) = t.get_mut("function") {
-                        if let Some(obj) = func.as_object_mut() {
-                            obj.remove("description");
-                        }
-                        strip_optional_params(func);
-                        strip_property_descriptions(func);
-                    }
-                    t
-                })
-                .collect()
-        }
+                    strip_optional_params(func);
+                    strip_property_descriptions(func);
+                }
+                t
+            })
+            .collect(),
     }
 }
 
@@ -177,7 +171,9 @@ pub fn pin_invoked_tool_schemas(
     for tr in tool_results {
         if let Some(name) = tr.get("name").and_then(|n| n.as_str())
             && !selected_names.contains(name)
-            && let Some(schema) = all_schemas.iter().find(|s| schema_tool_name(s) == Some(name))
+            && let Some(schema) = all_schemas
+                .iter()
+                .find(|s| schema_tool_name(s) == Some(name))
         {
             selected.push(schema.clone());
             report.tools_selected.push(name.to_string());

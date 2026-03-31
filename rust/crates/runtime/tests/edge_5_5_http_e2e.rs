@@ -6,8 +6,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use axum::{
-    Router,
-    body,
+    Router, body,
     http::{HeaderMap, Request, StatusCode},
 };
 use mo_agent_runtime::{
@@ -86,10 +85,8 @@ impl AuthService for E2eAuth {
         &self,
         headers: &HeaderMap,
     ) -> Result<AuthUserRecord, (StatusCode, axum::Json<ErrorResponse>)> {
-        let ok = headers
-            .get("authorization")
-            .and_then(|v| v.to_str().ok())
-            == Some("Bearer e2e-token");
+        let ok =
+            headers.get("authorization").and_then(|v| v.to_str().ok()) == Some("Bearer e2e-token");
         if ok {
             Ok(AuthUserRecord {
                 user_id: "e2e-user".to_string(),
@@ -129,11 +126,12 @@ fn post_request(path: &str, body: serde_json::Value) -> Request<body::Body> {
         .unwrap()
 }
 
-async fn post_json(app: Router, path: &str, payload: serde_json::Value) -> (StatusCode, serde_json::Value) {
-    let response = app
-        .oneshot(post_request(path, payload))
-        .await
-        .unwrap();
+async fn post_json(
+    app: Router,
+    path: &str,
+    payload: serde_json::Value,
+) -> (StatusCode, serde_json::Value) {
+    let response = app.oneshot(post_request(path, payload)).await.unwrap();
     let status = response.status();
     let bytes = body::to_bytes(response.into_body(), usize::MAX)
         .await
@@ -205,8 +203,9 @@ async fn http_handler_payload_matches_delivery_parser() {
             );
         }
     });
-    let d = deliver_tool_calls_through_edge_ledger(&ledger, "e2e-user", &[tc], Duration::from_secs(2))
-        .await;
+    let d =
+        deliver_tool_calls_through_edge_ledger(&ledger, "e2e-user", &[tc], Duration::from_secs(2))
+            .await;
     assert!(
         d.sse_maps
             .iter()
@@ -217,5 +216,10 @@ async fn http_handler_payload_matches_delivery_parser() {
             .iter()
             .any(|m| m.get("type").and_then(|v| v.as_str()) == Some("tool_request"))
     );
-    assert!(d.tool_messages[0]["content"].as_str().unwrap().contains("ok"));
+    assert!(
+        d.tool_messages[0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("ok")
+    );
 }

@@ -74,7 +74,10 @@ pub fn merge_skill_instructions_into_edge_profile(payload: &mut Value, instructi
         && let Some(ep) = root.get_mut("edge_profile")
         && let Some(ep_obj) = ep.as_object_mut()
     {
-        ep_obj.insert("skill_instructions".to_string(), Value::String(text.to_string()));
+        ep_obj.insert(
+            "skill_instructions".to_string(),
+            Value::String(text.to_string()),
+        );
     }
 }
 
@@ -147,14 +150,23 @@ mod tests {
     fn merge_active_skills_into_edge_profile_inserts_array() {
         let mut p = json!({ "edge_profile": {} });
         merge_active_skills_into_edge_profile(&mut p, &["markdown", "concise"]);
-        assert_eq!(p["edge_profile"]["active_skills"], json!(["markdown", "concise"]));
+        assert_eq!(
+            p["edge_profile"]["active_skills"],
+            json!(["markdown", "concise"])
+        );
     }
 
     #[test]
     fn merge_active_skills_no_op_when_empty() {
         let mut p = json!({ "edge_profile": {} });
         merge_active_skills_into_edge_profile(&mut p, &[]);
-        assert!(p["edge_profile"].as_object().unwrap().get("active_skills").is_none());
+        assert!(
+            p["edge_profile"]
+                .as_object()
+                .unwrap()
+                .get("active_skills")
+                .is_none()
+        );
     }
 
     #[test]
@@ -169,11 +181,13 @@ mod tests {
         let mut p = json!({ "edge_profile": {} });
         merge_skill_instructions_into_edge_profile(&mut p, None);
         merge_skill_instructions_into_edge_profile(&mut p, Some(""));
-        assert!(p["edge_profile"]
-            .as_object()
-            .unwrap()
-            .get("skill_instructions")
-            .is_none());
+        assert!(
+            p["edge_profile"]
+                .as_object()
+                .unwrap()
+                .get("skill_instructions")
+                .is_none()
+        );
     }
 
     #[test]

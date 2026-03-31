@@ -81,7 +81,7 @@ mod tests {
     #[test]
     fn append_openai_user_content_messages_extends_vec() {
         let mut m = vec![json!({"role":"assistant","content":"a"})];
-        append_openai_user_content_messages(&mut m, &[ "n1".into(), "n2".into() ]);
+        append_openai_user_content_messages(&mut m, &["n1".into(), "n2".into()]);
         assert_eq!(m.len(), 3);
         assert_eq!(m[1]["content"], "n1");
         assert_eq!(m[2]["content"], "n2");

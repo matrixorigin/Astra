@@ -64,10 +64,10 @@ mod app_state;
 pub mod bridge;
 pub mod evaluation;
 pub mod introspection;
-pub mod pipeline;
-pub mod prompts;
 pub mod matrix_cloud_runtime;
+pub mod pipeline;
 pub mod plan_decompose;
+pub mod prompts;
 pub mod server;
 pub mod sync_adapters;
 pub mod tool_registry;
@@ -97,9 +97,9 @@ pub use mo_agent_services::{
         AuthTokenRecord, AuthUserRecord, DatabaseAdminAuditReader, DatabaseAdminAuthorizer,
         DatabaseAdminFeedbackStatsReader, DatabaseAdminInitializer, DatabaseAdminTokenReader,
         DatabaseAdminTokenWriter, DatabaseAdminUserRoleManager, DatabaseAuthService,
-        DatabaseSessionService, FernetTokenEncryptor, SessionActivityRecord, SessionCreateRequestData,
-        SessionListFilter, SessionListRecord, SessionRecord, SessionService,
-        SessionUpdateRequestData,
+        DatabaseSessionService, FernetTokenEncryptor, SessionActivityRecord,
+        SessionCreateRequestData, SessionListFilter, SessionListRecord, SessionRecord,
+        SessionService, SessionUpdateRequestData,
     },
     branches::{BranchService, DatabaseBranchService, UnconfiguredBranchService},
     context::{
@@ -125,14 +125,14 @@ pub use mo_agent_services::{
         LearningFeedbackService, UnconfiguredLearningFeedbackService,
     },
     marketplace::{DatabaseMarketplaceService, MarketplaceService, UnconfiguredMarketplaceService},
+    models::{
+        DatabaseModelService, ModelCreateRequestData, ModelRecord, ModelService,
+        ModelUpdateRequestData, PricingData, QuirksData, UnconfiguredModelService,
+    },
     multi_agent::{
         DatabaseEdgeRegistryService, DatabaseTaskLeaseService, EdgeRegistryService,
         TaskLeaseHoldCache, TaskLeaseService, UnconfiguredEdgeRegistryService,
         UnconfiguredTaskLeaseService,
-    },
-    models::{
-        DatabaseModelService, ModelCreateRequestData, ModelRecord, ModelService,
-        ModelUpdateRequestData, PricingData, QuirksData, UnconfiguredModelService,
     },
     reflect::{
         DatabaseReflectService, Diagnosis, ErrorClass, ReflectReport, ReflectService,
@@ -145,15 +145,15 @@ pub use mo_agent_services::{
     },
     sandbox::{DatabaseSandboxService, SandboxRecord, SandboxService, UnconfiguredSandboxService},
     session_journal,
-    task_orchestrator::{
-        MatrixOneTaskService, TaskCreateRequest, TaskRecord, TaskService, TaskStatus,
-        UnconfiguredTaskService,
-    },
     skill_config::{
         DatabaseSkillConfigService, SkillConfigService, UnconfiguredSkillConfigService,
     },
     skills::{DatabaseSkillService, SkillRecord, SkillService, UnconfiguredSkillService},
     streaming::{StreamingService, UnconfiguredStreamingService},
+    task_orchestrator::{
+        MatrixOneTaskService, TaskCreateRequest, TaskRecord, TaskService, TaskStatus,
+        UnconfiguredTaskService,
+    },
     triggers::{DatabaseTriggerService, TriggerRecord, TriggerService, UnconfiguredTriggerService},
     workflows::{
         DatabaseWorkflowService, UnconfiguredWorkflowService, WorkflowDefRecord, WorkflowRunRecord,

@@ -140,9 +140,7 @@ pub(super) async fn build_server_state(
         settings.matrixone.clone(),
     )))
     .with_turn_learning_writer(learning_stack.writer.clone())
-    .with_task_service(Arc::new(
-        MatrixOneTaskService::from_shared(&shared_pool),
-    ))
+    .with_task_service(Arc::new(MatrixOneTaskService::from_shared(&shared_pool)))
     .with_edge_registry_service(Arc::new(DatabaseEdgeRegistryService::from_shared(
         &shared_pool,
     )))
@@ -290,5 +288,4 @@ mod tests {
         assert_eq!(Arc::strong_count(&s.pattern_library), 2);
         assert_eq!(Arc::strong_count(&s.calibrator), 2);
     }
-
 }

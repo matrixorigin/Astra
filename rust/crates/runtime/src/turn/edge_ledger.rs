@@ -61,17 +61,17 @@ pub fn ensure_tool_call_ids(tool_calls: &mut [Value]) {
             .map(|v| v.as_str().map(|s| s.is_empty()).unwrap_or(true))
             .unwrap_or(true);
         if id_empty {
-            obj.insert(
-                "id".to_string(),
-                Value::String(Uuid::now_v7().to_string()),
-            );
+            obj.insert("id".to_string(), Value::String(Uuid::now_v7().to_string()));
         }
     }
 }
 
 pub fn tool_content_from_ledger_entry(entry: &Value) -> String {
     let body = entry.get("body").unwrap_or(entry);
-    let status = body.get("status").and_then(Value::as_str).unwrap_or("unknown");
+    let status = body
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
     let output = body.get("output").and_then(Value::as_str).unwrap_or("");
     if output.is_empty() {
         serde_json::to_string(&json!({"status": status})).unwrap_or_else(|_| status.to_string())
@@ -135,10 +135,7 @@ mod tests {
         ensure_tool_call_ids(&mut calls);
         let id0 = calls[0].get("id").and_then(Value::as_str).unwrap();
         assert!(!id0.is_empty());
-        assert_eq!(
-            calls[1].get("id").and_then(Value::as_str),
-            Some("keep-me")
-        );
+        assert_eq!(calls[1].get("id").and_then(Value::as_str), Some("keep-me"));
     }
 
     #[test]
@@ -155,10 +152,7 @@ mod tests {
         let entry = json!({
             "body": {"status": "error", "output": "boom"}
         });
-        assert_eq!(
-            tool_content_from_ledger_entry(&entry),
-            "status=error\nboom"
-        );
+        assert_eq!(tool_content_from_ledger_entry(&entry), "status=error\nboom");
     }
 
     #[test]
@@ -176,20 +170,14 @@ mod tests {
     fn persist_value_matches_timeout_constant() {
         let tc = json!({"id": "i", "function": {"name": "n", "arguments": "{}"}});
         let v = persist_value_for_ledger_tool_result(&tc, None, true);
-        assert_eq!(
-            v["result"].as_str().unwrap(),
-            MSG_TOOL_LEDGER_TIMEOUT
-        );
+        assert_eq!(v["result"].as_str().unwrap(), MSG_TOOL_LEDGER_TIMEOUT);
     }
 
     #[tokio::test]
     async fn take_ledger_entry_immediate_remove() {
         let ledger = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
         let key = tool_callback_key("u", "1");
-        ledger
-            .lock()
-            .await
-            .insert(key.clone(), json!({"k": 1}));
+        ledger.lock().await.insert(key.clone(), json!({"k": 1}));
         let got = take_ledger_entry(&ledger, &key, Duration::from_secs(1))
             .await
             .unwrap();

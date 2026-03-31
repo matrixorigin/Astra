@@ -5,21 +5,21 @@
 
 use serde_json::Value;
 
-use super::cloud_approval_policy::{cloud_gated_tool_kind, CloudGatedToolKind};
+use super::cloud_approval_policy::{CloudGatedToolKind, cloud_gated_tool_kind};
 
 /// Parse `function.arguments` from an LLM tool call: either a JSON object or a string of JSON.
 pub fn normalize_llm_function_arguments(arguments: &Value) -> Value {
     match arguments {
-        Value::String(s) => serde_json::from_str(s).unwrap_or_else(|_| Value::Object(Default::default())),
+        Value::String(s) => {
+            serde_json::from_str(s).unwrap_or_else(|_| Value::Object(Default::default()))
+        }
         v => v.clone(),
     }
 }
 
 /// Primary filesystem path from tool arguments (`path` only).
 pub fn path_hint_from_args(args: &Value) -> Option<String> {
-    args.get("path")
-        .and_then(Value::as_str)
-        .map(String::from)
+    args.get("path").and_then(Value::as_str).map(String::from)
 }
 
 /// Shell command line from tool arguments (`command` only).

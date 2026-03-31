@@ -94,10 +94,7 @@ mod tests {
     #[test]
     fn drain_multiple_json_lines_in_one_chunk() {
         let mut buf = String::new();
-        let d = drain_sse_data_lines(
-            &mut buf,
-            "data: {\"a\":1}\n\ndata: {\"b\":2}\n",
-        );
+        let d = drain_sse_data_lines(&mut buf, "data: {\"a\":1}\n\ndata: {\"b\":2}\n");
         assert_eq!(d.events, vec![json!({"a": 1}), json!({"b": 2})]);
         assert!(!d.stream_finished);
         assert!(buf.is_empty());

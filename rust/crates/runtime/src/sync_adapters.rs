@@ -427,23 +427,17 @@ impl CloudTransport for MatrixOneTransport {
                 }
             }
             SyncDomain::Preferences => {
-                let map: BTreeMap<String, String> = serde_json::from_slice(&payload.data)
-                    .map_err(|e| {
+                let map: BTreeMap<String, String> =
+                    serde_json::from_slice(&payload.data).map_err(|e| {
                         SyncError::permanent(
                             SyncDomain::Preferences,
                             format!("deserialize preferences pack: {e}"),
                         )
                     })?;
                 for (k, v) in map {
-                    let r = self
-                        .sync_service
-                        .push_preference(user_id, &k, &v)
-                        .await;
+                    let r = self.sync_service.push_preference(user_id, &k, &v).await;
                     if !r.success {
-                        return Err(SyncError::transient(
-                            SyncDomain::Preferences,
-                            r.message,
-                        ));
+                        return Err(SyncError::transient(SyncDomain::Preferences, r.message));
                     }
                 }
                 let ver = std::time::SystemTime::now()
@@ -463,12 +457,13 @@ impl CloudTransport for MatrixOneTransport {
                 "templates are cloud-sourced; edge does not push template packs",
             )),
             SyncDomain::Tasks => {
-                let body: TaskSyncPackBody = serde_json::from_slice(&payload.data).map_err(|e| {
-                    SyncError::permanent(
-                        SyncDomain::Tasks,
-                        format!("deserialize tasks pack: {e}"),
-                    )
-                })?;
+                let body: TaskSyncPackBody =
+                    serde_json::from_slice(&payload.data).map_err(|e| {
+                        SyncError::permanent(
+                            SyncDomain::Tasks,
+                            format!("deserialize tasks pack: {e}"),
+                        )
+                    })?;
                 if body.holder_agent_id != self.tasks_holder_agent_id {
                     return Err(SyncError::permanent(
                         SyncDomain::Tasks,
@@ -803,10 +798,7 @@ impl DomainAdapter for TemplateAdapter {
             ));
         }
         let _: Vec<PlanTemplateSyncRow> = serde_json::from_slice(&payload.data).map_err(|e| {
-            SyncError::permanent(
-                SyncDomain::Templates,
-                format!("invalid template pack: {e}"),
-            )
+            SyncError::permanent(SyncDomain::Templates, format!("invalid template pack: {e}"))
         })?;
         Ok(())
     }
@@ -961,9 +953,7 @@ impl DomainAdapter for PreferenceAdapter {
     }
 
     fn has_dirty_data(&self) -> bool {
-        self.envelope()
-            .sync_state
-            .is_dirty()
+        self.envelope().sync_state.is_dirty()
     }
 
     fn estimated_size(&self) -> usize {
@@ -1029,7 +1019,9 @@ impl DomainAdapter for TaskAdapter {
     }
 
     fn export_full(&self) -> Result<SyncPayload, SyncError> {
-        let held = self.lease_holds.held_task_ids_for_agent(&self.edge_agent_id);
+        let held = self
+            .lease_holds
+            .held_task_ids_for_agent(&self.edge_agent_id);
         let mirror = self
             .mirror
             .lock()
@@ -1073,9 +1065,7 @@ impl DomainAdapter for TaskAdapter {
 
     fn merge_remote(&self, remote: &SyncPayload) -> Result<MergeResult, SyncError> {
         let tasks: Vec<TaskRecord> = serde_json::from_slice(&remote.data)
-            .or_else(|_| {
-                serde_json::from_slice::<TaskSyncPackBody>(&remote.data).map(|b| b.tasks)
-            })
+            .or_else(|_| serde_json::from_slice::<TaskSyncPackBody>(&remote.data).map(|b| b.tasks))
             .map_err(|e| {
                 SyncError::permanent(
                     SyncDomain::Tasks,
@@ -1140,15 +1130,16 @@ impl DomainAdapter for TaskAdapter {
     }
 
     fn has_dirty_data(&self) -> bool {
-        let held = self.lease_holds.held_task_ids_for_agent(&self.edge_agent_id);
+        let held = self
+            .lease_holds
+            .held_task_ids_for_agent(&self.edge_agent_id);
         let Ok(d) = self.dirty.lock() else {
             return false;
         };
         let Ok(m) = self.mirror.lock() else {
             return false;
         };
-        d.iter()
-            .any(|id| held.contains(id) && m.contains_key(id))
+        d.iter().any(|id| held.contains(id) && m.contains_key(id))
     }
 
     fn estimated_size(&self) -> usize {
@@ -1159,7 +1150,9 @@ impl DomainAdapter for TaskAdapter {
     }
 
     fn clear_dirty(&self) -> Result<(), SyncError> {
-        let held = self.lease_holds.held_task_ids_for_agent(&self.edge_agent_id);
+        let held = self
+            .lease_holds
+            .held_task_ids_for_agent(&self.edge_agent_id);
         if let Ok(mut d) = self.dirty.lock() {
             d.retain(|id| !held.contains(id));
         }
@@ -1414,10 +1407,7 @@ mod tests {
 
     #[test]
     fn preference_adapter_export_merge_roundtrip() {
-        let store = Arc::new(Mutex::new(BTreeMap::from([(
-            "k1".into(),
-            "local".into(),
-        )])));
+        let store = Arc::new(Mutex::new(BTreeMap::from([("k1".into(), "local".into())])));
         let adapter = PreferenceAdapter::new(Arc::clone(&store));
         let mut env = adapter.envelope();
         env.mark_dirty();
@@ -1427,10 +1417,7 @@ mod tests {
         let payload = adapter.export_full().unwrap();
         adapter.validate(&payload).unwrap();
 
-        let remote_store = Arc::new(Mutex::new(BTreeMap::from([(
-            "k2".into(),
-            "cloud".into(),
-        )])));
+        let remote_store = Arc::new(Mutex::new(BTreeMap::from([("k2".into(), "cloud".into())])));
         let remote_adapter = PreferenceAdapter::new(remote_store);
         let remote_payload = remote_adapter.export_full().unwrap();
 

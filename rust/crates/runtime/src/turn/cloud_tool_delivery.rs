@@ -10,14 +10,14 @@ use mo_thin_client::ApprovalRespondRequest;
 use serde_json::{Map, Value, json};
 
 use super::cloud_approval_policy::edge_tool_requires_cloud_approval;
-use super::tool_argument_hints::{normalize_llm_function_arguments, path_hint_from_args};
 use super::edge_ledger::{
-    approval_callback_key, persist_value_for_ledger_tool_result, take_ledger_entry,
-    tool_callback_key, tool_content_from_ledger_entry, MSG_TOOL_LEDGER_TIMEOUT,
+    MSG_TOOL_LEDGER_TIMEOUT, approval_callback_key, persist_value_for_ledger_tool_result,
+    take_ledger_entry, tool_callback_key, tool_content_from_ledger_entry,
 };
 use super::stream_events::{
     build_approval_required_event, build_edge_tool_call_event, build_tool_request_event,
 };
+use super::tool_argument_hints::{normalize_llm_function_arguments, path_hint_from_args};
 
 pub const MSG_APPROVAL_LEDGER_TIMEOUT: &str =
     "timed out waiting for edge POST /approval/respond (§5.5 ledger)";
@@ -62,12 +62,11 @@ pub fn parse_cloud_approval_outcome(entry: Option<&Value>) -> CloudApprovalResul
         return CloudApprovalResult::Malformed;
     };
     match req.decision {
-        mo_thin_client::ApprovalDecision::Allow | mo_thin_client::ApprovalDecision::AllowSession => {
-            CloudApprovalResult::Allowed
+        mo_thin_client::ApprovalDecision::Allow
+        | mo_thin_client::ApprovalDecision::AllowSession => CloudApprovalResult::Allowed,
+        mo_thin_client::ApprovalDecision::Deny => {
+            CloudApprovalResult::Denied { reason: req.reason }
         }
-        mo_thin_client::ApprovalDecision::Deny => CloudApprovalResult::Denied {
-            reason: req.reason,
-        },
     }
 }
 
@@ -194,11 +193,12 @@ pub(crate) async fn wait_tool_result_ledger_for_tool(
         "tool_call_id": id,
         "content": content,
     }));
-    out.persist_tool_results.push(persist_value_for_ledger_tool_result(
-        tc,
-        tr_entry.as_ref(),
-        timed_out,
-    ));
+    out.persist_tool_results
+        .push(persist_value_for_ledger_tool_result(
+            tc,
+            tr_entry.as_ref(),
+            timed_out,
+        ));
     out
 }
 
@@ -231,8 +231,11 @@ pub async fn deliver_tool_calls_through_edge_ledger(
 
         if cloud_tool_requires_approval(tc) {
             let path = tool_path_hint(tc);
-            out.sse_maps
-                .push(build_approval_required_event(id, tool_name, path.as_deref()));
+            out.sse_maps.push(build_approval_required_event(
+                id,
+                tool_name,
+                path.as_deref(),
+            ));
             match wait_approval_ledger_for_tool(ledger, user_id, tc, ledger_wait).await {
                 Ok(()) => {}
                 Err(part) => {
@@ -324,7 +327,12 @@ mod tests {
             Some("tool_request")
         );
         assert_eq!(d.tool_messages.len(), 1);
-        assert!(d.tool_messages[0]["content"].as_str().unwrap().contains("file"));
+        assert!(
+            d.tool_messages[0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("file")
+        );
     }
 
     #[tokio::test]
@@ -363,7 +371,12 @@ mod tests {
             Some("b.rs")
         );
         assert_eq!(d.sse_maps.len(), 3);
-        assert!(d.tool_messages[0]["content"].as_str().unwrap().contains("wrote"));
+        assert!(
+            d.tool_messages[0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("wrote")
+        );
     }
 
     #[tokio::test]

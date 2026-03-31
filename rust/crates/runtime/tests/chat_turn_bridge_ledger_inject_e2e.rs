@@ -19,8 +19,7 @@ use mo_agent_runtime::{
     MatrixOneSettings, ServiceInfo, SessionActivityRecord, SessionCreateRequestData,
     SessionListFilter, SessionListRecord, SessionRecord, SessionService, SessionUpdateRequestData,
     TurnToolEventPersistPlan, TurnToolEventWriter, build_app,
-    turn::bridge_inprocess::InProcessChatTurnBridge,
-    turn::edge_ledger::MSG_TOOL_LEDGER_TIMEOUT,
+    turn::bridge_inprocess::InProcessChatTurnBridge, turn::edge_ledger::MSG_TOOL_LEDGER_TIMEOUT,
 };
 use serde_json::json;
 use tokio::sync::Mutex;
@@ -87,9 +86,7 @@ impl AuthService for LedgerE2eAuth {
         &self,
         headers: &HeaderMap,
     ) -> Result<AuthUserRecord, (StatusCode, axum::Json<ErrorResponse>)> {
-        if headers
-            .get("authorization")
-            .and_then(|v| v.to_str().ok())
+        if headers.get("authorization").and_then(|v| v.to_str().ok())
             == Some("Bearer ledger-e2e-token")
         {
             Ok(AuthUserRecord {
@@ -216,9 +213,8 @@ fn matrixone_dummy() -> MatrixOneSettings {
 }
 
 fn ledger_inject_app(capture: ToolPersistCapture) -> Router {
-    let encryptor = Arc::new(
-        FernetTokenEncryptor::new("ledger-e2e-fernet-key").expect("test fernet key"),
-    );
+    let encryptor =
+        Arc::new(FernetTokenEncryptor::new("ledger-e2e-fernet-key").expect("test fernet key"));
     let base = AppState::new(ServiceInfo::default(), Arc::new(StubHealth))
         .with_auth_service(Arc::new(LedgerE2eAuth))
         .with_session_service(Arc::new(LedgerE2eSession))
@@ -313,10 +309,7 @@ async fn chat_turn_tool_request_tools_result_ledger_injects_before_second_round(
         let chunk = chunk.expect("sse chunk");
         acc.extend_from_slice(&chunk);
         let s = String::from_utf8_lossy(&acc);
-        if !posted
-            && s.contains("\"type\":\"tool_request\"")
-            && s.contains("call-ledger-e2e-1")
-        {
+        if !posted && s.contains("\"type\":\"tool_request\"") && s.contains("call-ledger-e2e-1") {
             let (st, body) = post_json(
                 &app,
                 "/tools/result",

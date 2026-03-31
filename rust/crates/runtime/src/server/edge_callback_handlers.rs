@@ -9,9 +9,7 @@ use super::*;
 
 use serde::Deserialize;
 
-use crate::turn::edge_ledger::{
-    LEDGER_MAX_ENTRIES, approval_callback_key, tool_callback_key,
-};
+use crate::turn::edge_ledger::{LEDGER_MAX_ENTRIES, approval_callback_key, tool_callback_key};
 
 fn edge_id_from_headers(headers: &HeaderMap) -> String {
     headers

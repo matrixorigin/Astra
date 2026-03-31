@@ -25,9 +25,7 @@ pub(super) async fn platform_snapshot_handler(
     // Fan out all reads concurrently.
     let (db_healthy, agents_res, sessions_res, events_res) = tokio::join!(
         state.health_checker.database_healthy(),
-        state
-            .agent_service
-            .list_agents(user.user_id.clone()),
+        state.agent_service.list_agents(user.user_id.clone()),
         state.session_service.list_sessions(SessionListFilter {
             user_id: user.user_id.clone(),
             agent_id: None,

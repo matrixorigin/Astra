@@ -168,10 +168,7 @@ pub fn build_approval_required_event(
             "request_id".to_string(),
             Value::String(request_id.to_string()),
         ),
-        (
-            "tool".to_string(),
-            Value::String(tool_name.to_string()),
-        ),
+        ("tool".to_string(), Value::String(tool_name.to_string())),
     ]);
     if let Some(p) = path.filter(|s| !s.is_empty()) {
         m.insert("path".to_string(), Value::String(p.to_string()));
@@ -193,7 +190,10 @@ pub fn build_tool_request_event(tool_call: &Map<String, Value>) -> Map<String, V
         .unwrap_or_else(|| Value::String("?".to_string()));
     let args = edge.get("arguments").cloned().unwrap_or(Value::Null);
     Map::from_iter([
-        ("type".to_string(), Value::String("tool_request".to_string())),
+        (
+            "type".to_string(),
+            Value::String("tool_request".to_string()),
+        ),
         ("request_id".to_string(), Value::String(request_id)),
         ("tool".to_string(), tool),
         ("args".to_string(), args),
@@ -208,7 +208,10 @@ mod tests {
     #[test]
     fn approval_required_includes_optional_path() {
         let ev = build_approval_required_event("a1", "write_file", Some("p/x.rs"));
-        assert_eq!(ev.get("type").and_then(Value::as_str), Some("approval_required"));
+        assert_eq!(
+            ev.get("type").and_then(Value::as_str),
+            Some("approval_required")
+        );
         assert_eq!(ev.get("request_id").and_then(Value::as_str), Some("a1"));
         assert_eq!(ev.get("tool").and_then(Value::as_str), Some("write_file"));
         assert_eq!(ev.get("path").and_then(Value::as_str), Some("p/x.rs"));
@@ -217,10 +220,7 @@ mod tests {
     #[test]
     fn tool_request_event_aligns_request_id_with_tool_call_id() {
         let tc = Map::from_iter([
-            (
-                "id".to_string(),
-                Value::String("call_abc".to_string()),
-            ),
+            ("id".to_string(), Value::String("call_abc".to_string())),
             (
                 "function".to_string(),
                 json!({"name": "bash", "arguments": "{\"cmd\": \"ls\"}"}),

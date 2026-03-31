@@ -7,15 +7,15 @@ use std::sync::{Arc, Mutex};
 
 use mo_agent_core::{MatrixOneSettings, SharedPool};
 use mo_agent_services::{
+    CloudTransport, DomainAdapter, SyncOrchestrator, SyncPolicy, TaskLeaseHoldCache, TaskRecord,
     event_ingestion::{self, IngestionConfig, IngestionEvent},
     session_journal::JournalEvent,
     state_sync::{MatrixOneSyncService, PlanTemplateSyncRow},
-    CloudTransport, DomainAdapter, SyncOrchestrator, SyncPolicy, TaskLeaseHoldCache, TaskRecord,
 };
 
 use crate::pipeline::{
-    calibration::ProgressiveCalibrator, entity::EntityGraph, persistence::ToolHealthEntry,
-    pattern::PatternLibrary,
+    calibration::ProgressiveCalibrator, entity::EntityGraph, pattern::PatternLibrary,
+    persistence::ToolHealthEntry,
 };
 use crate::sync_adapters::{
     EventAdapter, LearningAdapter, MatrixOneTransport, PreferenceAdapter, TaskAdapter,
@@ -85,12 +85,8 @@ impl MatrixCloudRuntime {
             edge_agent_id.as_ref(),
         ));
         let mut orch = SyncOrchestrator::new(transport, user_id.to_string());
-        let learning_adapter = LearningAdapter::new(
-            entity_graph,
-            pattern_library,
-            calibrator,
-            tool_health,
-        );
+        let learning_adapter =
+            LearningAdapter::new(entity_graph, pattern_library, calibrator, tool_health);
         if let Some(v) = cloud_learning_version {
             let mut env = learning_adapter.envelope();
             env.mark_pulled(v as u64);
@@ -208,19 +204,12 @@ pub fn build_sync_orchestrator_with_adapters(
 ) -> SyncOrchestrator {
     let edge_agent_id: Arc<str> = edge_agent_id.into();
     let mut orch = SyncOrchestrator::new(transport, user_id.to_string());
-    let learning_adapter = LearningAdapter::new(
-        entity_graph,
-        pattern_library,
-        calibrator,
-        tool_health,
-    );
+    let learning_adapter =
+        LearningAdapter::new(entity_graph, pattern_library, calibrator, tool_health);
     orch.register(Box::new(learning_adapter), SyncPolicy::learning());
     let preference_store = Arc::new(Mutex::new(BTreeMap::new()));
     let template_cache = Arc::new(Mutex::new(Vec::<PlanTemplateSyncRow>::new()));
-    orch.register(
-        Box::new(EventAdapter::new(ingestion)),
-        SyncPolicy::events(),
-    );
+    orch.register(Box::new(EventAdapter::new(ingestion)), SyncPolicy::events());
     orch.register(
         Box::new(TemplateAdapter::new(Arc::clone(&template_cache))),
         SyncPolicy::templates(),
@@ -284,5 +273,4 @@ mod tests {
         assert!(domains.contains(&SyncDomain::Preferences));
         assert!(domains.contains(&SyncDomain::Tasks));
     }
-
 }

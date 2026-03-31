@@ -443,10 +443,7 @@ pub(super) fn build_router(state: AppState) -> Router {
             "/tasks",
             get(task_handlers::list_tasks_handler).post(task_handlers::create_task_handler),
         )
-        .route(
-            "/tasks/{task_id}",
-            get(task_handlers::get_task_handler),
-        )
+        .route("/tasks/{task_id}", get(task_handlers::get_task_handler))
         .route(
             "/tasks/{task_id}/lease/claim",
             post(task_handlers::post_task_lease_claim_handler),
