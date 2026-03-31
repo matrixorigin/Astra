@@ -36,6 +36,25 @@ pub struct EdgeToolExecResult {
     pub duration_ms: u64,
 }
 
+impl crate::turn::headless_tool_assembly::EdgeToolRoundRow for EdgeToolExecResult {
+    fn tool_name(&self) -> &str {
+        &self.tool
+    }
+    fn tool_args(&self) -> &Value {
+        &self.args
+    }
+    fn tool_output(&self) -> &str {
+        &self.output
+    }
+    fn assistant_tool_call_id(&self, index: usize) -> String {
+        if self.request_id.is_empty() {
+            format!("edge-{index}")
+        } else {
+            self.request_id.clone()
+        }
+    }
+}
+
 /// Result of resolving an approval request via the host.
 #[derive(Debug, Clone)]
 pub struct EdgeApprovalResult {

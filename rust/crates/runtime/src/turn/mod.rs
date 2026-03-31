@@ -1,5 +1,6 @@
 pub mod activity;
 pub mod agentic_headless_round;
+pub mod agentic_loop_host;
 pub mod agentic_post_tool_policy;
 pub mod agentic_prepare_payload;
 pub mod agentic_stall_preflight;
