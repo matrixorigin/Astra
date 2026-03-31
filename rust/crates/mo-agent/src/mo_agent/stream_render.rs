@@ -3,6 +3,7 @@ use futures_util::StreamExt;
 use mo_agent_runtime::turn::chat_turn_sse_dispatch::{
     ChatTurnSseAccum, ChatTurnSseFramer, SseRenderEffect, dispatch_chat_turn_sse_event_block,
 };
+use mo_agent_runtime::turn::tool_result_semantics::cloud_tool_result_status_label;
 use std::ops::{Deref, DerefMut};
 
 pub use mo_agent_runtime::turn::chat_turn_sse_dispatch::ChatTurnEdgePending;
@@ -47,17 +48,6 @@ pub(super) struct EdgeSseContext<'a> {
     pub quiet: bool,
     pub perm_manager: Option<std::ptr::NonNull<crate::permission_manager::PermissionManager>>,
     pub _pm: std::marker::PhantomData<&'a mut crate::permission_manager::PermissionManager>,
-}
-
-fn tool_post_status(output: &str) -> &'static str {
-    if output.starts_with("Error:")
-        || output.starts_with("Unknown tool:")
-        || output.starts_with("Sandbox:")
-    {
-        "error"
-    } else {
-        "success"
-    }
 }
 
 async fn flush_pending_edge_work(
@@ -111,7 +101,7 @@ async fn flush_pending_edge_work(
                 let status = if !allowed {
                     "error"
                 } else {
-                    tool_post_status(&output)
+                    cloud_tool_result_status_label(&output)
                 };
                 let body = mo_thin_client::ToolResultRequest {
                     request_id,

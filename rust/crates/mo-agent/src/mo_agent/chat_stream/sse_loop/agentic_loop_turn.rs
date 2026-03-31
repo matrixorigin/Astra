@@ -39,7 +39,7 @@ use mo_agent_runtime::{
     turn::chat_turn_edge_profile::{
         detect_active_system_skills_in_message, read_git_branch_abbrev,
     },
-    turn::chat_turn_explain_wire::AgenticChatExplainFlags,
+    turn::chat_turn_explain_wire::{AgenticChatExplainFlags, AgenticExplainUiMode},
     turn::chat_turn_heuristics::extract_repos_from_memory,
     turn::chat_turn_payload::{
         ChatTurnBasePayloadInput, chat_turn_base_payload, merge_active_skills_into_edge_profile,
@@ -95,27 +95,6 @@ use crate::{
 };
 
 use super::super::edge_executor::edge_executor_instance_id;
-
-#[must_use]
-fn agentic_explain_flags(explain: ExplainMode) -> AgenticChatExplainFlags {
-    match explain {
-        ExplainMode::Off => AgenticChatExplainFlags {
-            explain_verbose: false,
-            explain_on: false,
-            explain_stderr: false,
-        },
-        ExplainMode::On => AgenticChatExplainFlags {
-            explain_verbose: false,
-            explain_on: true,
-            explain_stderr: true,
-        },
-        ExplainMode::Verbose => AgenticChatExplainFlags {
-            explain_verbose: true,
-            explain_on: false,
-            explain_stderr: true,
-        },
-    }
-}
 
 // ─── Outbound `/chat` JSON body (was `prepare_turn_request.rs`) ───────────────
 
@@ -448,7 +427,11 @@ async fn fetch_chat_turn_sse(ctx: ChatTurnSseFetchRequest<'_>) -> Result<TurnRes
         messages,
         current_session_id,
         model,
-        explain: agentic_explain_flags(explain),
+        explain: AgenticChatExplainFlags::from_explain_ui_mode(match explain {
+            ExplainMode::Off => AgenticExplainUiMode::Off,
+            ExplainMode::On => AgenticExplainUiMode::On,
+            ExplainMode::Verbose => AgenticExplainUiMode::Verbose,
+        }),
         project_root,
         message,
         history,

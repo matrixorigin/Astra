@@ -26,6 +26,22 @@ pub fn is_tool_error(result_str: &str) -> bool {
     result_str.to_lowercase().starts_with("error")
 }
 
+/// `status` string for cloud `POST /tools/result` from edge executor output prefixes.
+///
+/// Matches the CLI convention: `Error:`, `Unknown tool:`, and `Sandbox:` imply `"error"`;
+/// everything else is reported as `"success"` (the body may still describe failure in JSON).
+#[must_use]
+pub fn cloud_tool_result_status_label(output: &str) -> &'static str {
+    if output.starts_with("Error:")
+        || output.starts_with("Unknown tool:")
+        || output.starts_with("Sandbox:")
+    {
+        "error"
+    } else {
+        "success"
+    }
+}
+
 /// Detect OS-level resource exhaustion in tool output that wasn't flagged by [`is_tool_error`].
 ///
 /// Scans **per-line** to avoid false positives in source or large file contents.
@@ -148,6 +164,14 @@ mod tests {
         assert!(!is_tool_error("file contents here"));
         assert!(!is_tool_error("{}"));
         assert!(!is_tool_error("[]"));
+    }
+
+    #[test]
+    fn cloud_tool_result_status_prefixes() {
+        assert_eq!(cloud_tool_result_status_label("ok"), "success");
+        assert_eq!(cloud_tool_result_status_label("Error: x"), "error");
+        assert_eq!(cloud_tool_result_status_label("Unknown tool: y"), "error");
+        assert_eq!(cloud_tool_result_status_label("Sandbox: z"), "error");
     }
 
     #[test]
