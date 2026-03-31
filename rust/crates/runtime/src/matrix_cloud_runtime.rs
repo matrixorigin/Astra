@@ -48,13 +48,16 @@ pub struct MatrixCloudRuntime {
     template_cache: Arc<Mutex<Vec<PlanTemplateSyncRow>>>,
     /// Phase 3: shared with HTTP lease handlers and [`TaskAdapter`] (process-local export filter).
     pub lease_hold_cache: Arc<TaskLeaseHoldCache>,
-    task_mirror: Arc<Mutex<BTreeMap<String, TaskRecord>>>,
-    task_dirty: Arc<Mutex<HashSet<String>>>,
+    /// Phase 3: local task mirror, shared with [`TaskAdapter`] for push sync.
+    pub task_mirror: Arc<Mutex<BTreeMap<String, TaskRecord>>>,
+    /// Phase 3: dirty task IDs pending sync, shared with [`TaskAdapter`].
+    pub task_dirty: Arc<Mutex<HashSet<String>>>,
     edge_agent_id: Arc<str>,
 }
 
 impl MatrixCloudRuntime {
     /// Wire ingestion worker and sync domains to an existing [`SharedPool`].
+    #[allow(clippy::too_many_arguments)]
     pub fn attach(
         shared_pool: SharedPool,
         profile: &str,
@@ -174,10 +177,10 @@ impl MatrixCloudRuntime {
 
     /// Flush and stop the ingestion worker.
     pub fn shutdown_ingestion(&self) {
-        if let Ok(mut g) = self.ingestion.lock() {
-            if let Some(s) = g.take() {
-                s.shutdown();
-            }
+        if let Ok(mut g) = self.ingestion.lock()
+            && let Some(s) = g.take()
+        {
+            s.shutdown();
         }
     }
 
@@ -189,6 +192,7 @@ impl MatrixCloudRuntime {
 }
 
 /// Build a [`SyncOrchestrator`] with all edge sync domains (tests / harness).
+#[allow(clippy::too_many_arguments)]
 pub fn build_sync_orchestrator_with_adapters(
     transport: Arc<dyn CloudTransport>,
     user_id: &str,

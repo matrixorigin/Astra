@@ -370,10 +370,10 @@ pub fn discover_skills(skills_dir: &Path) -> Vec<LoadedSkill> {
     };
     for entry in entries.flatten() {
         let path = entry.path();
-        if path.is_dir() {
-            if let Ok(skill) = load_skill(&path) {
-                skills.push(skill);
-            }
+        if path.is_dir()
+            && let Ok(skill) = load_skill(&path)
+        {
+            skills.push(skill);
         }
     }
     skills

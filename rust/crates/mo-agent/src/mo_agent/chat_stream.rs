@@ -1178,11 +1178,11 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
                         continue;
                     }
                     // Get the instruction text
-                    if let Some(skill) = reg.get(skill_name) {
-                        if let Some(text) = skill.instruction_text() {
-                            activated_skills.push(skill_name.clone());
-                            instructions.push(format!("## Skill: {}\n\n{}", skill_name, text));
-                        }
+                    if let Some(skill) = reg.get(skill_name)
+                        && let Some(text) = skill.instruction_text()
+                    {
+                        activated_skills.push(skill_name.clone());
+                        instructions.push(format!("## Skill: {}\n\n{}", skill_name, text));
                     }
                 }
             }

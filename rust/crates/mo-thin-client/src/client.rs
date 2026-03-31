@@ -71,10 +71,10 @@ impl ThinClient {
     fn auth_headers_for(&self, token_override: Option<&str>) -> HeaderMap {
         let mut h = HeaderMap::new();
         let token = token_override.or(self.bearer_token.as_deref());
-        if let Some(t) = token {
-            if let Ok(v) = HeaderValue::from_str(&format!("Bearer {t}")) {
-                h.insert(header::AUTHORIZATION, v);
-            }
+        if let Some(t) = token
+            && let Ok(v) = HeaderValue::from_str(&format!("Bearer {t}"))
+        {
+            h.insert(header::AUTHORIZATION, v);
         }
         h
     }

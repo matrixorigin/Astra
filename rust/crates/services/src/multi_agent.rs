@@ -28,10 +28,10 @@ impl TaskLeaseHoldCache {
     }
 
     pub fn release_hold(&self, agent_id: &str, task_id: &str) {
-        if let Ok(mut g) = self.inner.lock() {
-            if let Some(set) = g.get_mut(agent_id) {
-                set.remove(task_id);
-            }
+        if let Ok(mut g) = self.inner.lock()
+            && let Some(set) = g.get_mut(agent_id)
+        {
+            set.remove(task_id);
         }
     }
 

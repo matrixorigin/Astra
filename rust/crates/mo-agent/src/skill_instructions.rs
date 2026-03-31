@@ -673,15 +673,14 @@ pub fn discover_and_register_metadata(
         }
 
         let skill_md_path = skill_dir.join("SKILL.md");
-        if skill_md_path.exists() {
-            if let Ok(content) = std::fs::read_to_string(&skill_md_path) {
-                if let Ok(instruction) = parse_skill_md(&content) {
-                    let metadata = SkillMetadata::from(&instruction);
-                    let name = metadata.name.clone();
-                    if registry.register_metadata(metadata, Some(skill_dir)).is_ok() {
-                        registered.push(name);
-                    }
-                }
+        if skill_md_path.exists()
+            && let Ok(content) = std::fs::read_to_string(&skill_md_path)
+            && let Ok(instruction) = parse_skill_md(&content)
+        {
+            let metadata = SkillMetadata::from(&instruction);
+            let name = metadata.name.clone();
+            if registry.register_metadata(metadata, Some(skill_dir)).is_ok() {
+                registered.push(name);
             }
         }
     }
@@ -744,13 +743,13 @@ fn is_word_boundary_match(text: &str, pattern: &str) -> bool {
         // Check start boundary (character before match)
         let start_ok = abs_pos == 0 || {
             let prev_slice = &text[..abs_pos];
-            prev_slice.chars().last().map_or(true, |c| !c.is_ascii_alphanumeric())
+            prev_slice.chars().last().is_none_or(|c| !c.is_ascii_alphanumeric())
         };
         
         // Check end boundary (character after match)
         let end_ok = end_pos >= text.len() || {
             let next_slice = &text[end_pos..];
-            next_slice.chars().next().map_or(true, |c| !c.is_ascii_alphanumeric())
+            next_slice.chars().next().is_none_or(|c| !c.is_ascii_alphanumeric())
         };
         
         if start_ok && end_ok {
@@ -801,10 +800,10 @@ pub fn load_triggered_skill_instructions(
         }
         
         // Get the instruction text
-        if let Some(skill) = registry.get(&skill_name) {
-            if let Some(text) = skill.instruction_text() {
-                return Some((skill_name, text.to_string()));
-            }
+        if let Some(skill) = registry.get(&skill_name)
+            && let Some(text) = skill.instruction_text()
+        {
+            return Some((skill_name, text.to_string()));
         }
     }
     
@@ -843,10 +842,10 @@ impl SkillClassificationCache {
     /// Get a cached classification result if not expired.
     pub fn get(&self, message: &str) -> Option<Option<String>> {
         let key = normalize_message(message);
-        if let Some(entry) = self.entries.get(&key) {
-            if entry.timestamp.elapsed() < self.ttl {
-                return Some(entry.skill_name.clone());
-            }
+        if let Some(entry) = self.entries.get(&key)
+            && entry.timestamp.elapsed() < self.ttl
+        {
+            return Some(entry.skill_name.clone());
         }
         None
     }
@@ -1003,10 +1002,10 @@ where
     }
     
     // Stage 3: Check cache
-    if let Some(cache) = cache.as_ref() {
-        if let Some(cached_result) = cache.get(message) {
-            return cached_result;
-        }
+    if let Some(cache) = cache.as_ref()
+        && let Some(cached_result) = cache.get(message)
+    {
+        return cached_result;
     }
     
     // Stage 4: LLM classification
@@ -1882,7 +1881,7 @@ Query the agent_events table.
         let registered = discover_and_register_metadata(skills_dir, &mut registry);
         
         // We should find at least the example and evaluate_session skills
-        assert!(registered.len() >= 1, "Should find at least 1 skill, found: {:?}", registered);
+        assert!(!registered.is_empty(), "Should find at least 1 skill, found: {:?}", registered);
         
         // Check if evaluate-session was found (if SKILL.md exists)
         if registered.contains(&"evaluate-session".to_string()) {

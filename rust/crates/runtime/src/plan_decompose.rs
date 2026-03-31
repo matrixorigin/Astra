@@ -178,10 +178,10 @@ pub fn analyze_project(root: &Path) -> ProjectContext {
     let git_dir = resolve_git_dir(root);
     if let Some(ref gd) = git_dir {
         let head_file = gd.join("HEAD");
-        if let Ok(head) = std::fs::read_to_string(&head_file) {
-            if let Some(branch) = head.trim().strip_prefix("ref: refs/heads/") {
-                ctx.git_branch = Some(branch.to_string());
-            }
+        if let Ok(head) = std::fs::read_to_string(&head_file)
+            && let Some(branch) = head.trim().strip_prefix("ref: refs/heads/")
+        {
+            ctx.git_branch = Some(branch.to_string());
         }
 
         // Simple heuristic: check if index file exists
@@ -325,15 +325,13 @@ fn resolve_git_dir(root: &Path) -> Option<std::path::PathBuf> {
         return Some(git_path);
     }
     // Worktree: .git is a file containing "gitdir: /path/to/.git/worktrees/name"
-    if git_path.is_file() {
-        if let Ok(content) = std::fs::read_to_string(&git_path) {
-            if let Some(gd) = content.trim().strip_prefix("gitdir: ") {
-                let path = std::path::PathBuf::from(gd);
-                // Validate the path exists and has expected git structure
-                if path.exists() && path.join("HEAD").exists() {
-                    return Some(path);
-                }
-            }
+    if git_path.is_file()
+        && let Ok(content) = std::fs::read_to_string(&git_path)
+        && let Some(gd) = content.trim().strip_prefix("gitdir: ")
+    {
+        let path = std::path::PathBuf::from(gd);
+        if path.exists() && path.join("HEAD").exists() {
+            return Some(path);
         }
     }
     None

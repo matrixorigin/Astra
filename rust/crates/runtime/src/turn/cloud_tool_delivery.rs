@@ -197,7 +197,7 @@ pub(crate) async fn wait_tool_result_ledger_for_tool(
     let timed_out = tr_entry.is_none();
     let content = tr_entry
         .as_ref()
-        .map(|e| tool_content_from_ledger_entry(e))
+        .map(tool_content_from_ledger_entry)
         .unwrap_or_else(|| MSG_TOOL_LEDGER_TIMEOUT.to_string());
     out.tool_messages.push(json!({
         "role": "tool",

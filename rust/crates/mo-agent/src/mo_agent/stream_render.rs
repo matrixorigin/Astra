@@ -706,9 +706,7 @@ mod tests {
         let mut r = TurnResult::new();
         let mut s = StreamRenderState::new();
         let mut pending = Vec::new();
-        let block = concat!(
-            "data: {\"type\":\"tool_request\",\"request_id\":\"tr-1\",\"tool\":\"bash\",\"args\":{\"command\":\"echo x\"}}\n\n",
-        );
+        let block = "data: {\"type\":\"tool_request\",\"request_id\":\"tr-1\",\"tool\":\"bash\",\"args\":{\"command\":\"echo x\"}}\n\n";
         dispatch_turn_event_block(block, &mut r, &mut s, true, &mut pending);
         assert_eq!(pending.len(), 1);
         match &pending[0] {
@@ -726,9 +724,7 @@ mod tests {
         let mut r = TurnResult::new();
         let mut s = StreamRenderState::new();
         let mut pending = Vec::new();
-        let block = concat!(
-            "data: {\"type\":\"approval_required\",\"request_id\":\"ap-1\",\"tool\":\"write_file\",\"path\":\"src/x.rs\"}\n\n",
-        );
+        let block = "data: {\"type\":\"approval_required\",\"request_id\":\"ap-1\",\"tool\":\"write_file\",\"path\":\"src/x.rs\"}\n\n";
         dispatch_turn_event_block(block, &mut r, &mut s, true, &mut pending);
         assert_eq!(pending.len(), 1);
         match &pending[0] {
