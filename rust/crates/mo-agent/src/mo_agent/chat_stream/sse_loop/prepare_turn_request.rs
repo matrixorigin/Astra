@@ -1,9 +1,11 @@
-//! Assemble one outbound `/chat` JSON body: base payload, memory boost, tool selection, `edge_tools`, explain stderr, `record_plan`.
+//! Assemble one outbound `/chat` JSON body: base payload, memory boost, tool selection, `edge_tools`,
+//! explain stderr, skill-instruction merge, `record_plan`.
 
 use std::collections::HashSet;
 use std::path::Path;
 use std::time::Instant;
 
+use crossterm::style::Stylize;
 use mo_agent_runtime::{
     pipeline::step_recorder::StepRecorder,
     tool_registry::{self, apply_selector_hints_to_edge_profile},
@@ -24,8 +26,6 @@ use mo_agent_runtime::{
 use serde_json::Value;
 
 use super::super::edge_executor::edge_executor_instance_id;
-use super::explain_sidecar::{eprint_restricted_tools_explain, eprint_selector_guidance_explain};
-use super::skill_instructions_round::{load_skill_instructions_text, merge_skill_names_track};
 
 use crate::edge_tools;
 use crate::skill_instructions::SharedSkillRegistry;
@@ -266,4 +266,111 @@ pub(crate) async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -
     }
 
     payload
+}
+
+// ─── Explain-mode stderr (was `explain_sidecar.rs`) ──────────────────────────
+
+fn eprint_restricted_tools_explain(show: bool, restricted_tools: &HashSet<String>) {
+    if !show || restricted_tools.is_empty() {
+        return;
+    }
+    eprintln!(
+        "{}",
+        format!(
+            "  ├─ restricted: {} tool(s) filtered [{}]",
+            restricted_tools.len(),
+            restricted_tools
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+        .dim()
+    );
+}
+
+fn eprint_selector_guidance_explain(show: bool, payload: &Value, selection_confidence: f64) {
+    if !show {
+        return;
+    }
+    let Some(recommended) = payload["edge_profile"]["recommended_tools"].as_array() else {
+        return;
+    };
+    let names: Vec<&str> = recommended.iter().filter_map(|v| v.as_str()).collect();
+    if names.is_empty() {
+        return;
+    }
+    eprintln!(
+        "{}",
+        format!(
+            "  ├─ guidance: {} (confidence: {:.2})",
+            names.join(", "),
+            selection_confidence
+        )
+        .dim()
+    );
+}
+
+// ─── Skill instructions for payload (was `skill_instructions_round.rs`) ─────
+
+fn load_skill_instructions_text(
+    skill_registry: &SharedSkillRegistry,
+    selected_skills: &[String],
+    quiet: bool,
+) -> Option<String> {
+    if selected_skills.is_empty() {
+        return None;
+    }
+    let mut instructions = Vec::new();
+    let mut activated_skills = Vec::new();
+    if let Ok(mut reg) = skill_registry.try_write() {
+        for skill_name in selected_skills {
+            if let Err(e) = reg.load_instructions(skill_name) {
+                eprintln!(
+                    "  {} Failed to load skill {}: {}",
+                    "⚠".yellow(),
+                    skill_name,
+                    e
+                );
+                continue;
+            }
+            if let Some(skill) = reg.get(skill_name)
+                && let Some(text) = skill.instruction_text()
+            {
+                activated_skills.push(skill_name.clone());
+                instructions.push(format!("## Skill: {skill_name}\n\n{text}"));
+            }
+        }
+    }
+    if instructions.is_empty() {
+        return None;
+    }
+    if !quiet {
+        eprintln!(
+            "  {} Using skill: {}",
+            "◆".cyan(),
+            activated_skills.join(", ").cyan()
+        );
+    }
+    Some(instructions.join("\n\n---\n\n"))
+}
+
+fn merge_skill_names_track(all_selected: &mut Vec<String>, round_skills: &[String]) {
+    for skill_name in round_skills {
+        if !all_selected.contains(skill_name) {
+            all_selected.push(skill_name.clone());
+        }
+    }
+}
+
+#[cfg(test)]
+mod skill_track_tests {
+    use super::merge_skill_names_track;
+
+    #[test]
+    fn merge_skill_names_track_dedupes() {
+        let mut v = vec!["a".into()];
+        merge_skill_names_track(&mut v, &["b".into(), "a".into()]);
+        assert_eq!(v, vec!["a", "b"]);
+    }
 }

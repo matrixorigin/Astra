@@ -253,9 +253,59 @@ impl Default for ChatTurnSseFramer {
     }
 }
 
+/// Result of parsing a full UTF-8 `/chat/turn`-style SSE body in one shot (tests, fixtures, future headless clients).
+#[derive(Debug)]
+pub struct ParsedChatTurnSseBody {
+    pub accum: ChatTurnSseAccum,
+    pub edge_pending: Vec<ChatTurnEdgePending>,
+    pub render_effects: Vec<SseRenderEffect>,
+    pub ttft_ms: Option<u64>,
+}
+
+/// Parse an entire response body as UTF-8 (valid `str` — use [`String::from_utf8_lossy`] at the boundary if needed).
+pub fn parse_chat_turn_sse_utf8_body(body: &str) -> ParsedChatTurnSseBody {
+    let mut framer = ChatTurnSseFramer::new();
+    let mut accum = ChatTurnSseAccum::default();
+    let mut pending = Vec::new();
+    let mut render_effects = Vec::new();
+    for block in framer.push_lossy_bytes(body.as_bytes()) {
+        render_effects.extend(dispatch_chat_turn_sse_event_block(
+            &block,
+            &mut accum,
+            &mut pending,
+        ));
+    }
+    let tail = framer.take_trailing_dispatch_blob();
+    if !tail.trim().is_empty() {
+        render_effects.extend(dispatch_chat_turn_sse_event_block(
+            &tail,
+            &mut accum,
+            &mut pending,
+        ));
+    }
+    ParsedChatTurnSseBody {
+        accum,
+        edge_pending: pending,
+        render_effects,
+        ttft_ms: framer.ttft_ms,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_utf8_body_roundtrip_text() {
+        let body = format!(
+            "{}{}",
+            sse("text_delta", ",\"content\":\"hi\""),
+            sse("text_delta", ",\"content\":\" there\"")
+        );
+        let p = parse_chat_turn_sse_utf8_body(&body);
+        assert_eq!(p.accum.full_text, "hi there");
+        assert!(p.edge_pending.is_empty());
+    }
 
     fn sse(event_type: &str, extra: &str) -> String {
         format!("data: {{\"type\":\"{event_type}\"{extra}}}\n\n")
