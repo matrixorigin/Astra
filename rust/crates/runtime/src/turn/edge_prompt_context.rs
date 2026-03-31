@@ -2,10 +2,15 @@
 //!
 //! Part of Phase 0: move cognition-adjacent **pure** helpers out of `mo-agent` toward `runtime` so
 //! in-process bridge and thin clients can converge on one implementation.
+//!
+//! [`make_args_preview`] reuses [`super::tool_argument_hints`] for path/command extraction so journal
+//! previews match CLI permission lines and cloud path hints.
 
 use std::path::Path;
 
 use serde_json::{Value, json};
+
+use super::tool_argument_hints::{command_hint_from_args, path_hint_from_args};
 
 /// Build a compact workspace context object for the LLM / server (`edge_profile.workspace`).
 /// Detects project type, key files, and top-level directory structure. Capped implicitly by listing limits.
@@ -117,24 +122,19 @@ pub fn make_args_preview(tool_name: &str, args: &Value) -> Option<String> {
     let max_len = 80;
 
     let preview = match tool_name {
-        "read_file" | "write_file" | "delete_file" | "str_replace" | "multi_edit" => args
-            .get("path")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string()),
+        "read_file" | "write_file" | "delete_file" | "str_replace" | "multi_edit" => {
+            path_hint_from_args(args)
+        }
         "grep" => {
             let pattern = args.get("pattern").and_then(|v| v.as_str()).unwrap_or("?");
-            let path = args.get("path").and_then(|v| v.as_str()).unwrap_or(".");
+            let path = path_hint_from_args(args).unwrap_or_else(|| ".".to_string());
             Some(format!("/{pattern}/ in {path}"))
         }
         "glob" => args
             .get("pattern")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string()),
-        "shell_exec" | "bash" => args
-            .get("command")
-            .or_else(|| args.get("cmd"))
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string()),
+        "shell_exec" | "bash" => command_hint_from_args(args).map(String::from),
         "git_diff" => {
             let base = args.get("base").and_then(|v| v.as_str()).unwrap_or("HEAD");
             let file = args.get("file").and_then(|v| v.as_str());
@@ -185,6 +185,44 @@ pub fn make_args_preview(tool_name: &str, args: &Value) -> Option<String> {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn make_args_preview_file_tool_resolves_file_path_alias() {
+        let v = json!({"file_path": "crates/foo/src/lib.rs"});
+        assert_eq!(
+            make_args_preview("read_file", &v).as_deref(),
+            Some("crates/foo/src/lib.rs")
+        );
+    }
+
+    #[test]
+    fn make_args_preview_grep_uses_shared_path_hints() {
+        let v = json!({"pattern": "TODO", "target_file": "src/main.rs"});
+        assert_eq!(
+            make_args_preview("grep", &v).as_deref(),
+            Some("/TODO/ in src/main.rs")
+        );
+    }
+
+    #[test]
+    fn make_args_preview_bash_falls_back_to_cmd() {
+        let v = json!({"cmd": "cargo test -p mo-agent-runtime"});
+        assert_eq!(
+            make_args_preview("bash", &v).as_deref(),
+            Some("cargo test -p mo-agent-runtime")
+        );
+    }
+
+    #[test]
+    fn make_args_preview_truncates_long_path_with_ellipsis() {
+        let long = "a".repeat(100);
+        let v = json!({"path": long});
+        let prev = make_args_preview("read_file", &v).expect("preview");
+        assert!(prev.ends_with('…'));
+        // 79 ASCII bytes from source + U+2026 (3 UTF-8 bytes) — same rule as pre-refactor.
+        assert_eq!(prev.len(), 82);
+        assert_eq!(prev.chars().count(), 80);
+    }
 
     #[test]
     fn detect_project_languages_finds_cargo_toml() {
