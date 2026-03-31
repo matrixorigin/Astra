@@ -43,7 +43,7 @@ use serde::{Deserialize, Serialize};
 
 #[path = "mo_agent/auth_flow.rs"]
 mod auth_flow;
-#[path = "mo_agent/chat_stream.rs"]
+#[path = "mo_agent/chat_stream/mod.rs"]
 mod chat_stream;
 #[path = "mo_agent/cli_utils.rs"]
 mod cli_utils;
@@ -80,10 +80,9 @@ use mo_agent_runtime::turn::chat_turn_heuristics::{
     is_session_not_found_error, looks_like_live_query_with_context,
 };
 use cli_utils::{
-    Profile, capitalize, compact_or_raw, get_profile_and_token, interactive_select,
+    Profile, compact_or_raw, get_profile_and_token, interactive_select,
     load_credentials, map_thin_err, print_json_or_raw, print_markdown, profile_name, prompt_or,
-    prompt_password_masked, resumable_last_session_id, save_credentials, tool_call_detail,
-    tool_result_summary, truncate_str, urlencoding,
+    prompt_password_masked, resumable_last_session_id, save_credentials, truncate_str, urlencoding,
 };
 use command_router::{execute_cli_command, ExitCode};
 use edge_lifecycle::register_and_start_heartbeat;

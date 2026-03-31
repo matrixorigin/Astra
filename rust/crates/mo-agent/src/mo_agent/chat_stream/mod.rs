@@ -1,0 +1,16 @@
+//! Agentic SSE chat loop — split into submodules for future extraction to `mo-agent-runtime`.
+//!
+//! Public surface for the crate root: `ChatTurnParams`, `stream_chat_sse`, `edge_executor_instance_id`.
+
+mod edge_executor;
+mod explain_reports;
+mod hydrate_reflect;
+mod params;
+mod sse_loop;
+
+#[cfg(test)]
+mod tests;
+
+pub(crate) use edge_executor::edge_executor_instance_id;
+pub(crate) use params::ChatTurnParams;
+pub(crate) use sse_loop::stream_chat_sse;
