@@ -8,10 +8,7 @@ use std::time::Instant;
 use crossterm::style::Stylize;
 use mo_agent_core::agent_warn;
 use mo_agent_runtime::{
-    pipeline::step_checkpoint,
-    pipeline::step_protocol::{
-        CachedToolResult, IdempotencyKey, InMemoryIdempotencyCache, StepCheckpoint,
-    },
+    pipeline::step_protocol::{IdempotencyKey, InMemoryIdempotencyCache, StepCheckpoint},
     pipeline::step_recorder::StepRecorder,
     semantic_dedup::SemanticDedup,
     tool_registry::{self, ToolRegistry},
@@ -27,6 +24,8 @@ use mo_agent_runtime::{
         ingest_agentic_turn_stream,
     },
     turn::boost_domain_hints::domain_hints_from_boost_terms,
+    turn::chat_history_openai::merge_skill_names_track,
+    turn::chat_turn_budget_pressure::budget_pressure_for_chat_turn,
     turn::chat_turn_edge_profile::{
         detect_active_system_skills_in_message, read_git_branch_abbrev,
     },
@@ -39,17 +38,19 @@ use mo_agent_runtime::{
     turn::edge_prompt_context::make_args_preview,
     turn::headless_tool_assembly::{
         CACHEABLE_TOOLS, HeadlessRoundToolIdx, headless_round_tool_indices,
-        headless_timeout_aborted_tool_names, openai_assistant_with_tool_calls_message,
+        idempotency_cache_hit_message, openai_assistant_with_tool_calls_message,
         openai_tool_roundtrip_values, parse_flat_tool_call_event, take_edge_output_for_tool_call,
         tool_calls_for_stall_guard, unknown_local_tool_error_message,
     },
     turn::headless_tool_journal::{
         journal_record_cross_turn_cache_hit, journal_record_duplicate_within_turn,
-        journal_record_unknown_tool,
+        journal_record_executed_tool_call, journal_record_unknown_tool,
     },
     turn::headless_tool_postprocess::{
-        HeadlessOutputEnrichSignal, append_headless_result_quality_feedback,
-        enrich_headless_tool_output_for_errors_and_limits, format_headless_tool_duration,
+        HeadlessCacheableRecordCtx, HeadlessOutputEnrichSignal, HeadlessStepDeadline,
+        append_headless_result_quality_feedback, enrich_headless_tool_output_for_errors_and_limits,
+        format_headless_tool_duration, record_headless_cacheable_success_and_semantic_hint,
+        try_write_light_headless_step_checkpoint,
     },
     turn::hydrate_reflect::hydrate_reflect_placeholder_if_needed,
     turn::tool_result_semantics::{is_tool_error, tool_dedup_signature},
@@ -129,14 +130,7 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
 
     let budget_pressure = {
         let schema_tokens = ctx.selector.registry().total_pinned_token_cost();
-        let estimated = mo_agent_runtime::prompts::estimate_tokens_precise(
-            ctx.messages,
-            schema_tokens as usize,
-            0,
-        );
-        let budget = mo_agent_runtime::prompts::budget_for_model(ctx.model);
-        let tier = budget.compaction_tier(estimated);
-        tier.budget_pressure()
+        budget_pressure_for_chat_turn(ctx.messages, ctx.model, schema_tokens as usize)
     };
 
     let mut boost_terms =
@@ -393,14 +387,6 @@ fn load_skill_instructions_text(
     Some(instructions.join("\n\n---\n\n"))
 }
 
-fn merge_skill_names_track(all_selected: &mut Vec<String>, round_skills: &[String]) {
-    for skill_name in round_skills {
-        if !all_selected.contains(skill_name) {
-            all_selected.push(skill_name.clone());
-        }
-    }
-}
-
 // ─── Fetch: payload → POST → consume_turn_sse ─────────────────────────────────
 
 pub(crate) struct ChatTurnSseFetchRequest<'a> {
@@ -572,26 +558,23 @@ async fn run_headless_tool_round(ctx: HeadlessToolRoundRequest<'_>) {
     let tool_count = indices.len().max(1);
     let mut seen_calls: HashSet<String> = HashSet::new();
     step_recorder.begin_act(tool_count);
-    let step_start_time = std::time::Instant::now();
-    let step_timeout_ms = step_recorder.scheduling().timeout_ms;
+    let step_deadline =
+        HeadlessStepDeadline::from_scheduling_timeout_ms(step_recorder.scheduling().timeout_ms);
     let mut consumed_edge = vec![false; turn_result.edge_tool_round.len()];
     let by_sig: &HashMap<String, String> = &turn_result.edge_callback_outputs;
 
     for item in &indices {
-        let step_elapsed_ms = step_start_time.elapsed().as_millis() as u64;
-        if step_elapsed_ms > step_timeout_ms {
-            let aborted_count = indices.len() - tool_results.len();
-            let aborted_tools = headless_timeout_aborted_tool_names(
-                &indices,
-                tool_results.len(),
-                &turn_result.tool_calls,
-                |i| turn_result.edge_tool_round[i].tool.clone(),
-            );
+        if let Some((aborted_count, aborted_tools)) = step_deadline.step_timeout_abort(
+            &indices,
+            tool_results.len(),
+            &turn_result.tool_calls,
+            |i| turn_result.edge_tool_round[i].tool.clone(),
+        ) {
             agent_warn!(
                 "step",
                 "Step timeout exceeded: {}ms > {}ms, aborting {} tools: {:?}",
-                step_elapsed_ms,
-                step_timeout_ms,
+                step_deadline.elapsed_ms(),
+                step_recorder.scheduling().timeout_ms,
                 aborted_count,
                 aborted_tools
             );
@@ -627,10 +610,7 @@ async fn run_headless_tool_round(ctx: HeadlessToolRoundRequest<'_>) {
         if CACHEABLE_TOOLS.contains(&name.as_str())
             && let Some(cached) = idempotency_cache.check(&idem_key)
         {
-            let cached_note = format!(
-                "(cached from earlier turn — identical call)\n{}",
-                cached.output
-            );
+            let cached_note = idempotency_cache_hit_message(&cached.output);
             if !quiet {
                 eprintln!("{}", format!("  ↻ {name} (cached)").dim());
             }
@@ -734,25 +714,16 @@ async fn run_headless_tool_round(ctx: HeadlessToolRoundRequest<'_>) {
         let args_size = serde_json::to_string(&args)
             .map(|s| s.len() as u32)
             .unwrap_or(0);
-        let result_size = result_str.len() as u32;
         let args_preview = make_args_preview(&name, &args);
         let tool_elapsed = tool_start.elapsed();
-        tool_call_records.push(mo_agent_services::session_journal::ToolCallRecord {
-            name: name.clone(),
-            ok: !is_err,
-            ms: tool_elapsed.as_millis() as u64,
-            error: if is_err {
-                result_str
-                    .lines()
-                    .next()
-                    .map(|l| l.chars().take(200).collect())
-            } else {
-                None
-            },
-            input_bytes: Some(args_size),
-            output_bytes: Some(result_size),
+        tool_call_records.push(journal_record_executed_tool_call(
+            name.clone(),
+            is_err,
+            tool_elapsed.as_millis() as u64,
+            args_size,
+            result_str.as_str(),
             args_preview,
-        });
+        ));
         step_recorder.complete_tool_with_result(
             &name,
             is_err,
@@ -761,31 +732,22 @@ async fn run_headless_tool_round(ctx: HeadlessToolRoundRequest<'_>) {
             &result_str,
         );
 
-        if let Some(sid) = current_session_id
-            && let Some(light) = step_recorder.build_light_checkpoint()
-        {
-            let cp = StepCheckpoint::Light(light);
-            let _ = step_checkpoint::write_step_checkpoint(
-                sid,
-                step_recorder.summary().checkpoints,
-                &cp,
-            );
+        if let Some(sid) = current_session_id {
+            try_write_light_headless_step_checkpoint(sid, step_recorder);
         }
 
         if !is_err && CACHEABLE_TOOLS.contains(&name.as_str()) {
-            let cached_result = CachedToolResult {
-                tool_name: name.clone(),
-                output: result_str.clone(),
-                is_error: false,
-                cached_at: mo_agent_runtime::pipeline::step_protocol::epoch_ms(),
-            };
-            step_recorder.attach_cached_result(cached_result.clone());
-            idempotency_cache.record(&idem_key, cached_result);
-            semantic_dedup.append_near_duplicate_hint_if_any(
-                &mut result_str,
+            record_headless_cacheable_success_and_semantic_hint(
                 &name,
                 &args,
-                turn_index,
+                &idem_key,
+                HeadlessCacheableRecordCtx {
+                    result_str: &mut result_str,
+                    turn_index,
+                    idempotency_cache,
+                    step_recorder,
+                    semantic_dedup,
+                },
             );
         }
 
@@ -1077,10 +1039,12 @@ pub(crate) async fn run_agentic_loop_iteration(
 
 #[cfg(test)]
 mod tests {
+    use mo_agent_runtime::turn::chat_history_openai::merge_skill_names_track;
+
     #[test]
     fn merge_skill_names_track_dedupes() {
         let mut v = vec!["a".into()];
-        super::merge_skill_names_track(&mut v, &["b".into(), "a".into()]);
+        merge_skill_names_track(&mut v, &["b".into(), "a".into()]);
         assert_eq!(v, vec!["a", "b"]);
     }
 }

@@ -48,6 +48,33 @@ pub fn journal_record_unknown_tool(name: String) -> ToolCallRecord {
     }
 }
 
+#[must_use]
+pub fn journal_record_executed_tool_call(
+    name: String,
+    is_err: bool,
+    tool_elapsed_ms: u64,
+    args_size: u32,
+    result_str: &str,
+    args_preview: Option<String>,
+) -> ToolCallRecord {
+    ToolCallRecord {
+        name,
+        ok: !is_err,
+        ms: tool_elapsed_ms,
+        error: if is_err {
+            result_str
+                .lines()
+                .next()
+                .map(|l| l.chars().take(200).collect())
+        } else {
+            None
+        },
+        input_bytes: Some(args_size),
+        output_bytes: Some(result_str.len() as u32),
+        args_preview,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -70,5 +97,13 @@ mod tests {
         let r = journal_record_unknown_tool("nope".into());
         assert!(!r.ok);
         assert_eq!(r.error.as_deref(), Some("unknown_tool: nope"));
+    }
+
+    #[test]
+    fn executed_record_truncates_error_line() {
+        let r =
+            journal_record_executed_tool_call("bash".into(), true, 10, 2, "first line\nrest", None);
+        assert_eq!(r.error.as_deref(), Some("first line"));
+        assert_eq!(r.output_bytes, Some(15));
     }
 }

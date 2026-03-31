@@ -9,6 +9,7 @@ pub mod bridge_e2e_hooks;
 pub mod bridge_inprocess;
 pub mod cache;
 pub mod chat_history_openai;
+pub mod chat_turn_budget_pressure;
 pub mod chat_turn_edge_profile;
 pub mod chat_turn_explain_wire;
 pub mod chat_turn_heuristics;

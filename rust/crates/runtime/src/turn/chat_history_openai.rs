@@ -38,6 +38,15 @@ pub fn append_openai_user_content_messages(messages: &mut Vec<Value>, contents: 
     }
 }
 
+/// Deduplicated append of skill names selected this round (cross-turn telemetry).
+pub fn merge_skill_names_track(all_selected: &mut Vec<String>, round_skills: &[String]) {
+    for skill_name in round_skills {
+        if !all_selected.contains(skill_name) {
+            all_selected.push(skill_name.clone());
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -76,6 +85,13 @@ mod tests {
         let v = openai_user_content_message("fix drift");
         assert_eq!(v["role"], "user");
         assert_eq!(v["content"], "fix drift");
+    }
+
+    #[test]
+    fn merge_skill_names_track_dedupes() {
+        let mut v = vec!["a".into()];
+        merge_skill_names_track(&mut v, &["b".into(), "a".into(), "c".into()]);
+        assert_eq!(v, vec!["a", "b", "c"]);
     }
 
     #[test]

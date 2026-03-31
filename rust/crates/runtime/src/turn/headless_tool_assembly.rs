@@ -83,6 +83,12 @@ pub fn unknown_local_tool_error_message(name: &str, valid_tool_names: &HashSet<S
     format!("Unknown tool '{}'. Available: {}", name, names.join(", "))
 }
 
+/// User-visible `tool` message body when replaying an idempotent cache hit.
+#[must_use]
+pub fn idempotency_cache_hit_message(cached_output: &str) -> String {
+    format!("(cached from earlier turn — identical call)\n{cached_output}")
+}
+
 /// Tools that are idempotent reads — safe to cache across turns.
 /// Side-effectful tools must not appear here.
 pub const CACHEABLE_TOOLS: &[&str] = &[
@@ -392,6 +398,12 @@ mod tests {
         s.insert("alpha".into());
         let m = unknown_local_tool_error_message("foo", &s);
         assert_eq!(m, "Unknown tool 'foo'. Available: alpha, zebra");
+    }
+
+    #[test]
+    fn idempotency_cache_hit_message_shape() {
+        let m = idempotency_cache_hit_message("body");
+        assert_eq!(m, "(cached from earlier turn — identical call)\nbody");
     }
 
     #[test]
