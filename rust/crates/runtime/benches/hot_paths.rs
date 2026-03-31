@@ -10,6 +10,10 @@ use mo_agent_runtime::prompts::{CompactionTier, estimate_str_tokens, estimate_to
 use mo_agent_runtime::text_tokenize::{build_tf, tokenize};
 use mo_agent_runtime::tool_registry::ConversationState;
 use mo_agent_runtime::tool_registry::scoring::pre_filter_dynamic;
+use mo_agent_runtime::tool_registry::tool_pool::{
+    SearchableToolMeta, ToolPool, ToolSearchConfig, ToolSource, ToolDenyPredicate, select_two_phase,
+};
+use mo_agent_runtime::tool_registry::TOOL_CATALOG;
 use mo_agent_runtime::turn::cloud::compaction::compact_tiered;
 
 // ── Token Estimation ───────────────────────────────────────────────
@@ -81,6 +85,89 @@ fn bench_pre_filter_dynamic(c: &mut Criterion) {
         let state = ConversationState::from_message(query, 3);
         group.bench_with_input(BenchmarkId::new(*label, query.len()), query, |b, q| {
             b.iter(|| pre_filter_dynamic(black_box(&state), black_box(q)))
+        });
+    }
+    group.finish();
+}
+
+// ── Two-phase ToolPool selection ─────────────────────────────────────
+
+struct DenyNone;
+impl ToolDenyPredicate for DenyNone {
+    fn denied(&self, _tool_name: &str) -> bool {
+        false
+    }
+}
+
+#[derive(Clone)]
+struct MapStore {
+    map: std::collections::HashMap<String, serde_json::Value>,
+}
+
+impl mo_agent_runtime::tool_registry::tool_pool::ToolSchemaStore for MapStore {
+    fn schema_by_name(&self, name: &str) -> Option<serde_json::Value> {
+        self.map.get(name).cloned()
+    }
+}
+
+fn build_synthetic_pool(n: usize) -> ToolPool<MapStore> {
+    // Include built-in catalog entries first (so pinned tools exist).
+    let mut index: Vec<SearchableToolMeta> = TOOL_CATALOG
+        .iter()
+        .map(SearchableToolMeta::from_catalog)
+        .collect();
+
+    // Add synthetic tools to simulate huge MCP/plugin pools.
+    // Deterministic pseudo-random text without depending on rand crate.
+    for i in 0..n {
+        index.push(SearchableToolMeta {
+            name: format!("mcp__synthetic_tool_{i}"),
+            short: format!("Synthetic tool {i} for searching logs, prs, diffs, memory, code"),
+            intents: vec!["search", "inspect"],
+            estimated_schema_tokens: 40,
+            pinned: false,
+            source: ToolSource::Mcp,
+        });
+    }
+
+    let mut map = std::collections::HashMap::new();
+    // Provide minimal schemas for all tools in the index.
+    for m in &index {
+        map.insert(
+            m.name.clone(),
+            json!({
+                "type":"function",
+                "function": {
+                    "name": m.name,
+                    "description": m.short,
+                    "parameters": {"type":"object","properties":{}}
+                }
+            }),
+        );
+    }
+
+    ToolPool {
+        index,
+        store: MapStore { map },
+    }
+}
+
+fn bench_two_phase_tool_pool(c: &mut Criterion) {
+    let sizes = [0usize, 1_000, 10_000];
+    let terms = ["matrixorigin".to_string(), "latest".to_string(), "pr".to_string()];
+    let cfg = ToolSearchConfig {
+        max_candidates: 24,
+        budget_tokens: 1200,
+    };
+
+    let mut group = c.benchmark_group("tool_pool_two_phase");
+    for n in sizes {
+        let pool = build_synthetic_pool(n);
+        group.bench_with_input(BenchmarkId::new("index_size", n), &pool, |b, p| {
+            b.iter(|| {
+                let out = select_two_phase(black_box(p), black_box(&DenyNone), black_box(&terms), cfg);
+                black_box(out.len())
+            })
         });
     }
     group.finish();
@@ -271,6 +358,7 @@ criterion_group!(
     bench_tokenize,
     bench_build_tf,
     bench_pre_filter_dynamic,
+    bench_two_phase_tool_pool,
     bench_compact_tiered,
     bench_find_sse_frame_end,
     bench_parse_sse_json_frame,

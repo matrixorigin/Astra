@@ -121,18 +121,25 @@ pub fn select_two_phase<S: ToolSchemaStore, D: ToolDenyPredicate>(
         names.push(m.name.clone());
     }
 
-    // Phase 3: materialize + budget gate with ToolRegistry's measured costs.
-    // We reuse ToolRegistry's token-cost approximation: JSON bytes / 4.
+    // Phase 3: materialize + budget gate.
+    //
+    // Budget applies to non-pinned (dynamic) tool schemas only. Pinned tools are
+    // always included (budget-exempt), matching ToolRegistry semantics.
+    //
+    // Token cost approximation: JSON bytes / 4.
     let mut selected = Vec::new();
-    let mut used = 0u32;
+    let mut used_dynamic = 0u32;
     for n in names {
         if let Some(schema) = pool.store.schema_by_name(&n) {
             let cost = (serde_json::to_string(&schema).map(|s| s.len()).unwrap_or(0) / 4) as u32;
-            if used + cost > cfg.budget_tokens && used > 0 {
-                continue;
+            let is_pinned = pool.index.iter().any(|m| m.name == n && m.pinned);
+            if !is_pinned {
+                if used_dynamic + cost > cfg.budget_tokens {
+                    continue;
+                }
+                used_dynamic += cost;
             }
             selected.push(schema);
-            used += cost;
         }
     }
     selected
@@ -230,12 +237,23 @@ mod tests {
             },
         );
         assert!(!out.is_empty());
-        // Approximate token cost sum <= budget + one-tool slack (first tool allowed to exceed if empty).
-        let mut used = 0u32;
+        // Dynamic tool token cost sum must stay within budget.
+        let mut used_dynamic = 0u32;
         for s in &out {
-            used += (serde_json::to_string(s).unwrap().len() / 4) as u32;
+            let name = s
+                .get("function")
+                .and_then(|f| f.get("name"))
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let is_pinned = TOOL_CATALOG.iter().any(|t| t.pinned && t.name == name);
+            if !is_pinned {
+                used_dynamic += (serde_json::to_string(s).unwrap().len() / 4) as u32;
+            }
         }
-        assert!(used <= 200, "used={used} should stay bounded for tiny budget");
+        assert!(
+            used_dynamic <= 50,
+            "dynamic token cost must respect budget: used_dynamic={used_dynamic}"
+        );
     }
 
     // Property tests: deny rules and determinism over random deny-sets.
