@@ -252,6 +252,26 @@ impl SemanticDedup {
         result
     }
 
+    /// Run [`Self::check_and_record`] and append a user-visible hint when output matches a prior call.
+    pub fn append_near_duplicate_hint_if_any(
+        &mut self,
+        result_str: &mut String,
+        tool_name: &str,
+        args: &Value,
+        turn_index: usize,
+    ) {
+        if let Some((prev_turn, reason)) =
+            self.check_and_record(tool_name, args, result_str.as_str(), turn_index)
+        {
+            result_str.push_str(&format!(
+                "\n⚠ Note: this result is similar to a previous {tool_name} call (turn {}, {}). \
+                 Avoid re-fetching the same information.",
+                prev_turn + 1,
+                reason
+            ));
+        }
+    }
+
     /// Number of entries tracked (for diagnostics).
     pub fn param_cache_size(&self) -> usize {
         self.param_cache.len()
@@ -532,6 +552,23 @@ mod tests {
         let (prev_turn, reason) = result2.unwrap();
         assert_eq!(prev_turn, 1);
         assert_eq!(reason, "param_match");
+    }
+
+    #[test]
+    fn append_near_duplicate_hint_inserts_on_second_read_file() {
+        let mut tracker = SemanticDedup::new(0.75);
+        let args = json!({"path": "src/main.rs"});
+        let mut out1 = "fn main() {}".to_string();
+        tracker.append_near_duplicate_hint_if_any(&mut out1, "read_file", &args, 1);
+        assert!(
+            !out1.contains("similar to a previous"),
+            "first recording should not append hint"
+        );
+
+        let mut out2 = "fn main() {}".to_string();
+        tracker.append_near_duplicate_hint_if_any(&mut out2, "read_file", &args, 2);
+        assert!(out2.contains("similar to a previous read_file call"));
+        assert!(out2.contains("param_match"));
     }
 
     #[test]

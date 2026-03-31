@@ -43,7 +43,16 @@ use mo_agent_runtime::{
         openai_tool_roundtrip_values, parse_flat_tool_call_event, take_edge_output_for_tool_call,
         tool_calls_for_stall_guard, unknown_local_tool_error_message,
     },
-    turn::tool_result_semantics::{is_resource_limit_output, is_tool_error, tool_dedup_signature},
+    turn::headless_tool_journal::{
+        journal_record_cross_turn_cache_hit, journal_record_duplicate_within_turn,
+        journal_record_unknown_tool,
+    },
+    turn::headless_tool_postprocess::{
+        HeadlessOutputEnrichSignal, append_headless_result_quality_feedback,
+        enrich_headless_tool_output_for_errors_and_limits, format_headless_tool_duration,
+    },
+    turn::hydrate_reflect::hydrate_reflect_placeholder_if_needed,
+    turn::tool_result_semantics::{is_tool_error, tool_dedup_signature},
     turn::tool_schema_prune::{filter_tool_schemas_by_excluded_names, pin_invoked_tool_schemas},
     turn::turn_guard::TurnGuard,
 };
@@ -60,7 +69,6 @@ use crate::{
 };
 
 use super::super::edge_executor::edge_executor_instance_id;
-use super::super::hydrate_reflect::hydrate_reflect_placeholder_if_needed;
 
 // ─── Outbound `/chat` JSON body (was `prepare_turn_request.rs`) ───────────────
 
@@ -608,15 +616,10 @@ async fn run_headless_tool_round(ctx: HeadlessToolRoundRequest<'_>) {
             let (tool_msg, tr) = openai_tool_roundtrip_values(&id, &name, dup);
             messages.push(tool_msg);
             tool_results.push(tr);
-            tool_call_records.push(mo_agent_services::session_journal::ToolCallRecord {
-                name: name.clone(),
-                ok: true,
-                ms: 0,
-                error: Some("duplicate_within_turn".to_string()),
-                input_bytes: None,
-                output_bytes: None,
-                args_preview: make_args_preview(&name, &args),
-            });
+            tool_call_records.push(journal_record_duplicate_within_turn(
+                name.clone(),
+                make_args_preview(&name, &args),
+            ));
             continue;
         }
 
@@ -638,15 +641,11 @@ async fn run_headless_tool_round(ctx: HeadlessToolRoundRequest<'_>) {
             step_recorder.begin_tool_with_key(&name, &id, Some(&cache_key));
             step_recorder.record_cache_hit(&name, cached.clone());
             turn_guard.record_cache_hit(&name);
-            tool_call_records.push(mo_agent_services::session_journal::ToolCallRecord {
-                name: name.clone(),
-                ok: true,
-                ms: 0,
-                error: Some("cached_cross_turn".to_string()),
-                input_bytes: None,
-                output_bytes: Some(cached.output.len() as u32),
-                args_preview: make_args_preview(&name, &args),
-            });
+            tool_call_records.push(journal_record_cross_turn_cache_hit(
+                name.clone(),
+                cached.output.len() as u32,
+                make_args_preview(&name, &args),
+            ));
             continue;
         }
 
@@ -673,15 +672,7 @@ async fn run_headless_tool_round(ctx: HeadlessToolRoundRequest<'_>) {
             let (tool_msg, err_tr) = openai_tool_roundtrip_values(&id, &name, &err_msg);
             messages.push(tool_msg);
             tool_results.push(err_tr);
-            tool_call_records.push(mo_agent_services::session_journal::ToolCallRecord {
-                name: name.clone(),
-                ok: false,
-                ms: 0,
-                error: Some(format!("unknown_tool: {name}")),
-                input_bytes: None,
-                output_bytes: None,
-                args_preview: None,
-            });
+            tool_call_records.push(journal_record_unknown_tool(name.clone()));
             continue;
         }
 
@@ -705,65 +696,40 @@ async fn run_headless_tool_round(ctx: HeadlessToolRoundRequest<'_>) {
 
         let mut is_err = is_tool_error(&result_str);
         let tool_already_restricted = restricted_tools.contains(&name);
-        let mut resource_limit_recorded = false;
-
-        if is_err && !tool_already_restricted {
-            use mo_agent_runtime::turn::error_recovery::{build_recovery_message, classify_error};
-            let category = classify_error(&result_str);
-
-            if matches!(
-                category,
-                mo_agent_runtime::turn::error_recovery::ErrorCategory::ResourceLimit
-            ) {
-                turn_guard.health.record_resource_limit_failure(&name);
-                turn_guard.errors.record_error(category);
-                restricted_tools.insert(name.clone());
-                resource_limit_recorded = true;
-                if !quiet {
-                    eprintln!(
-                        "{}",
-                        format!("  ⚠ {name} blocked: system resource limit reached").yellow()
-                    );
+        let resource_limit_recorded = enrich_headless_tool_output_for_errors_and_limits(
+            &name,
+            &mut result_str,
+            &mut is_err,
+            tool_already_restricted,
+            turn_guard,
+            restricted_tools,
+            |sig| {
+                if quiet {
+                    return;
                 }
-            }
-
-            if matches!(
-                category,
-                mo_agent_runtime::turn::error_recovery::ErrorCategory::Transient
-            ) {
-                turn_guard.errors.record_retry(false);
-            }
-
-            let deprioritized = turn_guard.health.deprioritized_tools();
-            let recovery_msg = build_recovery_message(&name, &result_str, category, &deprioritized);
-            result_str.push_str(&format!("\n{recovery_msg}"));
-        }
-
-        if !is_err && !tool_already_restricted && is_resource_limit_output(&result_str) {
-            turn_guard.health.record_resource_limit_failure(&name);
-            turn_guard
-                .errors
-                .record_error(mo_agent_runtime::turn::error_recovery::ErrorCategory::ResourceLimit);
-            restricted_tools.insert(name.clone());
-            is_err = true;
-            resource_limit_recorded = true;
-            if !quiet {
-                eprintln!(
-                    "{}",
-                    format!("  ⚠ {name}: resource limit detected in output — tool blocked").dim()
-                );
-            }
-        }
-
-        let result_quality = if resource_limit_recorded {
-            mo_agent_runtime::turn::result_quality::ResultQuality::Error
-        } else {
-            turn_guard.record_tool_result(&name, &result_str)
-        };
-
-        if let Some(feedback) = turn_guard.result_feedback(&name, result_quality) {
-            result_str.push_str(&format!("\n{feedback}"));
-        }
+                match sig {
+                    HeadlessOutputEnrichSignal::ResourceLimitBlocked { tool } => {
+                        eprintln!(
+                            "{}",
+                            format!("  ⚠ {tool} blocked: system resource limit reached").yellow()
+                        );
+                    }
+                    HeadlessOutputEnrichSignal::ResourceLimitDetectedInOutput { tool } => {
+                        eprintln!(
+                            "{}",
+                            format!("  ⚠ {tool}: resource limit detected in output — tool blocked")
+                                .dim()
+                        );
+                    }
+                }
+            },
+        );
+        let _result_quality = append_headless_result_quality_feedback(
+            &name,
+            &mut result_str,
+            resource_limit_recorded,
+            turn_guard,
+        );
 
         let args_size = serde_json::to_string(&args)
             .map(|s| s.len() as u32)
@@ -815,26 +781,16 @@ async fn run_headless_tool_round(ctx: HeadlessToolRoundRequest<'_>) {
             };
             step_recorder.attach_cached_result(cached_result.clone());
             idempotency_cache.record(&idem_key, cached_result);
-            if let Some((prev_turn, reason)) =
-                semantic_dedup.check_and_record(&name, &args, &result_str, turn_index)
-            {
-                let hint = format!(
-                    "\n⚠ Note: this result is similar to a previous {} call (turn {}, {}). \
-                     Avoid re-fetching the same information.",
-                    name,
-                    prev_turn + 1,
-                    reason
-                );
-                result_str.push_str(&hint);
-            }
+            semantic_dedup.append_near_duplicate_hint_if_any(
+                &mut result_str,
+                &name,
+                &args,
+                turn_index,
+            );
         }
 
         if !quiet {
-            let duration_str = if tool_elapsed.as_secs_f64() >= 1.0 {
-                format!("{:.1}s", tool_elapsed.as_secs_f64())
-            } else {
-                format!("{}ms", tool_elapsed.as_millis())
-            };
+            let duration_str = format_headless_tool_duration(tool_elapsed);
             let detail = tool_call_detail(&name, &args);
             let summary = if !is_err {
                 tool_result_summary(&name, &result_str)
