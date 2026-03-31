@@ -167,6 +167,19 @@ pub enum CompactionTier {
     AggressivePrune,
 }
 
+impl CompactionTier {
+    /// Scalar 0.0–0.9 for edge tool output scaling / selection (`chat_stream`, `ToolSelector`).
+    #[must_use]
+    pub fn budget_pressure(self) -> f64 {
+        match self {
+            Self::Normal => 0.0,
+            Self::TrimSchemas => 0.3,
+            Self::CompactHistory => 0.6,
+            Self::AggressivePrune => 0.9,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Context budget
 // ---------------------------------------------------------------------------
@@ -409,6 +422,14 @@ mod tests {
         let limit = b.effective_input_limit();
         let tokens = (limit as f64 * 0.90) as usize;
         assert_eq!(b.compaction_tier(tokens), CompactionTier::AggressivePrune);
+    }
+
+    #[test]
+    fn compaction_tier_budget_pressure_values() {
+        assert_eq!(CompactionTier::Normal.budget_pressure(), 0.0);
+        assert_eq!(CompactionTier::TrimSchemas.budget_pressure(), 0.3);
+        assert_eq!(CompactionTier::CompactHistory.budget_pressure(), 0.6);
+        assert_eq!(CompactionTier::AggressivePrune.budget_pressure(), 0.9);
     }
 
     #[test]

@@ -21,6 +21,7 @@ use mo_agent_runtime::{
     turn::chat_turn_edge_profile::{
         build_base_edge_profile_value, detect_active_system_skills_in_message, read_git_branch_abbrev,
     },
+    turn::chat_turn_explain_wire::chat_turn_explain_field_json,
     turn::chat_turn_heuristics::{
         extract_repos_from_memory, factual_tool_retry_message, should_force_factual_tool_retry,
     },
@@ -165,7 +166,10 @@ pub(crate) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
             "messages": messages,
             "session_id": current_session_id,
             "model": model,
-            "explain": match explain { ExplainMode::Off => serde_json::json!(false), ExplainMode::On => serde_json::json!(true), ExplainMode::Verbose => serde_json::json!("verbose") },
+            "explain": chat_turn_explain_field_json(
+                matches!(explain, ExplainMode::Verbose),
+                matches!(explain, ExplainMode::On),
+            ),
             "edge_executor_id": edge_executor_instance_id(),
             "capabilities": mo_thin_client::builtin_capability_preset(),
             "edge_profile": build_base_edge_profile_value(
@@ -199,12 +203,7 @@ pub(crate) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
             );
             let budget = mo_agent_runtime::prompts::budget_for_model(model);
             let tier = budget.compaction_tier(estimated);
-            match tier {
-                mo_agent_runtime::prompts::CompactionTier::Normal => 0.0,
-                mo_agent_runtime::prompts::CompactionTier::TrimSchemas => 0.3,
-                mo_agent_runtime::prompts::CompactionTier::CompactHistory => 0.6,
-                mo_agent_runtime::prompts::CompactionTier::AggressivePrune => 0.9,
-            }
+            tier.budget_pressure()
         };
 
         // Phase 7.5: Memory-augmented boost terms.
