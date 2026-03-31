@@ -431,8 +431,7 @@ pub(crate) async fn fetch_chat_turn_sse(ctx: ChatTurnSseFetchRequest<'_>) -> Res
         executor_id: edge_executor_instance_id(),
         executor,
         quiet,
-        perm_manager: Some(std::ptr::NonNull::from(&mut *perm_manager)),
-        _pm: std::marker::PhantomData,
+        perm_manager: Some(perm_manager),
     };
 
     Ok(consume_turn_sse(resp, render_md, term_width, quiet, Some(edge_ctx)).await)

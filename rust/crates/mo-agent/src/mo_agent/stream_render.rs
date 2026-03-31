@@ -44,22 +44,14 @@ impl mo_agent_runtime::turn::headless_tool_assembly::EdgeToolRoundRow for EdgeTo
 }
 
 /// When set, SSE `tool_request` / `approval_required` are handled and posted to the cloud API.
-///
-/// `perm_manager` must point at the same [`crate::permission_manager::PermissionManager`] used for
-/// local tool checks; it must not be used elsewhere until [`consume_turn_sse`] returns.
 pub(super) struct EdgeSseContext<'a> {
     pub api: &'a mo_thin_client::ThinClient,
     pub token: &'a str,
     pub executor_id: &'a str,
     pub executor: &'a crate::edge_tools::ToolExecutor,
     pub quiet: bool,
-    pub perm_manager: Option<std::ptr::NonNull<crate::permission_manager::PermissionManager>>,
-    pub _pm: std::marker::PhantomData<&'a mut crate::permission_manager::PermissionManager>,
+    pub perm_manager: Option<&'a mut crate::permission_manager::PermissionManager>,
 }
-
-// SAFETY: Same safety argument as CliSseStreamHost — perm_manager is accessed
-// exclusively through this context during the SSE consumption lifetime.
-unsafe impl Send for EdgeSseContext<'_> {}
 
 // ─── CLI SSE stream host ─────────────────────────────────────────────────────
 //
@@ -79,16 +71,11 @@ struct CliSseStreamHost<'a> {
     executor_id: &'a str,
     executor: &'a crate::edge_tools::ToolExecutor,
     quiet: bool,
-    perm_manager: Option<std::ptr::NonNull<crate::permission_manager::PermissionManager>>,
-    _pm: std::marker::PhantomData<&'a mut crate::permission_manager::PermissionManager>,
+    perm_manager: Option<&'a mut crate::permission_manager::PermissionManager>,
     render: StreamRenderState,
     /// Ordered tool executions from this SSE stream.
     pub edge_tool_round: Vec<EdgeToolRoundEntry>,
 }
-
-// SAFETY: PermissionManager is accessed exclusively through this host during
-// consume_sse_stream, guaranteed by the PhantomData lifetime bound.
-unsafe impl Send for CliSseStreamHost<'_> {}
 
 impl<'a> CliSseStreamHost<'a> {
     fn from_edge_ctx(ctx: EdgeSseContext<'a>) -> Self {
@@ -99,7 +86,6 @@ impl<'a> CliSseStreamHost<'a> {
             executor: ctx.executor,
             quiet: ctx.quiet,
             perm_manager: ctx.perm_manager,
-            _pm: ctx._pm,
             render: StreamRenderState::new(),
             edge_tool_round: Vec::new(),
         }
@@ -140,8 +126,8 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                 edge_sse_tool_request_notice_line(tool, request_id).dim()
             );
         }
-        let allowed = match self.perm_manager {
-            Some(mut ptr) => unsafe { ptr.as_mut().check(tool, args) },
+        let allowed = match &mut self.perm_manager {
+            Some(pm) => pm.check(tool, args),
             None => true,
         };
         let start = std::time::Instant::now();
@@ -192,11 +178,8 @@ impl SseStreamHost for CliSseStreamHost<'_> {
         tool: &str,
         path: Option<&str>,
     ) -> EdgeApprovalResult {
-        let decision = match self.perm_manager {
-            Some(mut ptr) => unsafe {
-                ptr.as_mut()
-                    .resolve_cloud_approval(tool, path, self.quiet)
-            },
+        let decision = match &mut self.perm_manager {
+            Some(pm) => pm.resolve_cloud_approval(tool, path, self.quiet),
             None => mo_thin_client::ApprovalDecision::Deny,
         };
         let decision_str = match &decision {
