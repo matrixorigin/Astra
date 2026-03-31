@@ -1,6 +1,75 @@
 use super::*;
 use futures_util::StreamExt;
 
+/// Cloud → edge callback (§5.5 `tool_request`); drained asynchronously in [`consume_turn_sse`].
+#[derive(Debug, Clone)]
+pub(super) struct PendingToolRequest {
+    pub request_id: String,
+    pub tool: String,
+    pub args: serde_json::Value,
+}
+
+/// When set, SSE `tool_request` events run locally and results are posted to `/tools/result`.
+pub(super) struct EdgeSseContext<'a> {
+    pub api: &'a mo_thin_client::ThinClient,
+    pub token: &'a str,
+    pub executor_id: &'a str,
+    pub executor: &'a crate::edge_tools::ToolExecutor,
+    pub quiet: bool,
+}
+
+fn tool_post_status(output: &str) -> &'static str {
+    if output.starts_with("Error:")
+        || output.starts_with("Unknown tool:")
+        || output.starts_with("Sandbox:")
+    {
+        "error"
+    } else {
+        "success"
+    }
+}
+
+async fn flush_pending_tool_requests(
+    pending: &mut Vec<PendingToolRequest>,
+    edge: Option<&EdgeSseContext<'_>>,
+) {
+    if pending.is_empty() {
+        return;
+    }
+    let Some(ctx) = edge else {
+        pending.clear();
+        return;
+    };
+    for req in pending.drain(..) {
+        if req.request_id.is_empty() || req.tool.is_empty() {
+            continue;
+        }
+        if !ctx.quiet {
+            eprintln!(
+                "{}",
+                format!("  ⚡ tool_request: {} ({})", req.tool, req.request_id).dim()
+            );
+        }
+        let start = std::time::Instant::now();
+        let output = ctx.executor.execute(&req.tool, &req.args).await;
+        let status = tool_post_status(&output);
+        let body = mo_thin_client::ToolResultRequest {
+            request_id: req.request_id,
+            status: status.to_string(),
+            output: Some(output),
+            duration_ms: Some(start.elapsed().as_millis() as u64),
+        };
+        if let Err(e) = ctx
+            .api
+            .post_tool_result(Some(ctx.token), Some(ctx.executor_id), &body)
+            .await
+            && !ctx.quiet
+        {
+            eprintln!("{}", format!("  ! post_tool_result: {e}").yellow());
+        }
+    }
+}
+
 // ═══════════════════════════════════════════════════════════════ Spinner ══
 
 const SPINNER_FRAMES: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
@@ -133,11 +202,13 @@ pub(super) async fn consume_turn_sse(
     render_md: bool,
     term_width: usize,
     quiet: bool,
+    edge: Option<EdgeSseContext<'_>>,
 ) -> TurnResult {
     let mut result = TurnResult::new();
     let mut render = StreamRenderState::new();
     let mut stream = resp.bytes_stream();
     let mut buffer = String::new();
+    let mut pending_tools: Vec<PendingToolRequest> = Vec::new();
 
     // Track time to first token
     let stream_start = std::time::Instant::now();
@@ -159,11 +230,25 @@ pub(super) async fn consume_turn_sse(
                 first_token_recorded = true;
             }
 
-            dispatch_turn_event_block(&event_str, &mut result, &mut render, quiet);
+            dispatch_turn_event_block(
+                &event_str,
+                &mut result,
+                &mut render,
+                quiet,
+                &mut pending_tools,
+            );
+            flush_pending_tool_requests(&mut pending_tools, edge.as_ref()).await;
         }
     }
     if !buffer.trim().is_empty() {
-        dispatch_turn_event_block(&buffer, &mut result, &mut render, quiet);
+        dispatch_turn_event_block(
+            &buffer,
+            &mut result,
+            &mut render,
+            quiet,
+            &mut pending_tools,
+        );
+        flush_pending_tool_requests(&mut pending_tools, edge.as_ref()).await;
     }
 
     // Ensure thinking spinner is cleaned up
@@ -236,6 +321,7 @@ pub(super) fn dispatch_turn_event_block(
     result: &mut TurnResult,
     render: &mut StreamRenderState,
     quiet: bool,
+    pending_tool_requests: &mut Vec<PendingToolRequest>,
 ) {
     for line in block.lines() {
         let Some(data) = line.strip_prefix("data: ") else {
@@ -289,6 +375,29 @@ pub(super) fn dispatch_turn_event_block(
             }
             "tool_call" => {
                 result.tool_calls.push(event.clone());
+            }
+            "tool_request" => {
+                let request_id = event
+                    .get("request_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let tool = event
+                    .get("tool")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let args = event
+                    .get("args")
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!({}));
+                if !request_id.is_empty() && !tool.is_empty() {
+                    pending_tool_requests.push(PendingToolRequest {
+                        request_id,
+                        tool,
+                        args,
+                    });
+                }
             }
             "explain" => {
                 result.explain_turns.push(event.clone());
@@ -353,7 +462,7 @@ mod tests {
             sse("text_delta", ",\"content\":\"hello \""),
             sse("text_delta", ",\"content\":\"world\""),
         );
-        dispatch_turn_event_block(&block, &mut r, &mut s, true);
+        dispatch_turn_event_block(&block, &mut r, &mut s, true, &mut vec![]);
         assert_eq!(r.full_text, "hello world");
     }
 
@@ -366,6 +475,7 @@ mod tests {
             &mut r,
             &mut s,
             true,
+            &mut vec![],
         );
         assert_eq!(r.session_id.as_deref(), Some("abc-123"));
     }
@@ -379,6 +489,7 @@ mod tests {
             &mut r,
             &mut s,
             true,
+            &mut vec![],
         );
         assert!(r.has_usage);
         assert_eq!(r.prompt_tokens, 100);
@@ -394,6 +505,7 @@ mod tests {
             &mut r,
             &mut s,
             true,
+            &mut vec![],
         );
         assert_eq!(r.tool_calls.len(), 1);
         assert_eq!(r.tool_calls[0]["function"]["name"].as_str(), Some("bash"));
@@ -408,6 +520,7 @@ mod tests {
             &mut r,
             &mut s,
             true,
+            &mut vec![],
         );
         assert!(r.has_tool_calls);
     }
@@ -421,6 +534,7 @@ mod tests {
             &mut r,
             &mut s,
             true,
+            &mut vec![],
         );
         assert_eq!(r.error_message.as_deref(), Some("Error: rate limited"));
     }
@@ -434,6 +548,7 @@ mod tests {
             &mut r,
             &mut s,
             true,
+            &mut vec![],
         );
         assert_eq!(r.run_id.as_deref(), Some("run-42"));
     }
@@ -442,7 +557,7 @@ mod tests {
     fn done_marker_ignored() {
         let mut r = TurnResult::new();
         let mut s = StreamRenderState::new();
-        dispatch_turn_event_block("data: [DONE]\n\n", &mut r, &mut s, true);
+        dispatch_turn_event_block("data: [DONE]\n\n", &mut r, &mut s, true, &mut vec![]);
         assert!(r.full_text.is_empty());
     }
 
@@ -450,7 +565,7 @@ mod tests {
     fn invalid_json_ignored() {
         let mut r = TurnResult::new();
         let mut s = StreamRenderState::new();
-        dispatch_turn_event_block("data: {invalid json}\n\n", &mut r, &mut s, true);
+        dispatch_turn_event_block("data: {invalid json}\n\n", &mut r, &mut s, true, &mut vec![]);
         assert!(r.full_text.is_empty());
     }
 
@@ -463,6 +578,7 @@ mod tests {
             &mut r,
             &mut s,
             true,
+            &mut vec![],
         );
         assert_eq!(r.full_text, "complete answer");
     }
@@ -476,7 +592,22 @@ mod tests {
             sse("thinking_delta", ",\"content\":\"step 1\""),
             sse("thinking_delta", ",\"content\":\" step 2\""),
         );
-        dispatch_turn_event_block(&block, &mut r, &mut s, true);
+        dispatch_turn_event_block(&block, &mut r, &mut s, true, &mut vec![]);
         assert_eq!(r.reasoning_content, "step 1 step 2");
+    }
+
+    #[test]
+    fn tool_request_enqueues_pending() {
+        let mut r = TurnResult::new();
+        let mut s = StreamRenderState::new();
+        let mut pending = Vec::new();
+        let block = concat!(
+            "data: {\"type\":\"tool_request\",\"request_id\":\"tr-1\",\"tool\":\"bash\",\"args\":{\"command\":\"echo x\"}}\n\n",
+        );
+        dispatch_turn_event_block(block, &mut r, &mut s, true, &mut pending);
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].request_id, "tr-1");
+        assert_eq!(pending[0].tool, "bash");
+        assert_eq!(pending[0].args["command"], "echo x");
     }
 }

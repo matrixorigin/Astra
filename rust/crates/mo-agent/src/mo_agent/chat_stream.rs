@@ -1,9 +1,24 @@
 use super::*;
+use std::sync::OnceLock;
 
+use crate::stream_render::consume_turn_sse;
 use mo_agent_core::{RuntimeLimits, agent_warn};
 use mo_agent_runtime::pipeline::step_protocol::{
     CachedToolResult, IdempotencyKey, InMemoryIdempotencyCache,
 };
+
+/// Stable id for this process (§5.5 `edge_executor_id`). Override with `MO_EDGE_EXECUTOR_ID`.
+static EDGE_EXECUTOR_INSTANCE_ID: OnceLock<String> = OnceLock::new();
+
+fn edge_executor_instance_id() -> &'static str {
+    EDGE_EXECUTOR_INSTANCE_ID
+        .get_or_init(|| {
+            std::env::var("MO_EDGE_EXECUTOR_ID").unwrap_or_else(|_| {
+                format!("edge-{}", uuid::Uuid::new_v4())
+            })
+        })
+        .as_str()
+}
 
 /// Generate a human-readable preview of tool arguments for observability.
 /// Returns a compact string highlighting the most relevant parameters.
@@ -883,6 +898,8 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
             "session_id": current_session_id,
             "model": model,
             "explain": match explain { ExplainMode::Off => serde_json::json!(false), ExplainMode::On => serde_json::json!(true), ExplainMode::Verbose => serde_json::json!("verbose") },
+            "edge_executor_id": edge_executor_instance_id(),
+            "capabilities": mo_thin_client::builtin_capability_preset(),
             "edge_profile": {
                 "cwd": project_root.to_string_lossy(),
                 "git_branch": git_branch,
@@ -1301,7 +1318,21 @@ pub(super) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
             return Err(format!("API Error ({}): {}", status, compact_or_raw(&body)));
         }
 
-        let turn_result = consume_turn_sse(resp, render_md, term_width, quiet).await;
+        let edge_ctx = crate::stream_render::EdgeSseContext {
+            api,
+            token,
+            executor_id: edge_executor_instance_id(),
+            executor: &executor,
+            quiet,
+        };
+        let turn_result = consume_turn_sse(
+            resp,
+            render_md,
+            term_width,
+            quiet,
+            Some(edge_ctx),
+        )
+        .await;
 
         // Capture TTFT from first turn for observability
         if first_ttft_ms.is_none() {

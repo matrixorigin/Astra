@@ -1,7 +1,7 @@
 # Multi-Agent Cloud Runtime Architecture
 
 > **Status**: Living Design Document  
-> **Version**: 1.4 (§5.5.2 lightweight edge executor + `mo-thin-client::edge`)  
+> **Version**: 1.4.1 (§5.5.2 + CLI `edge_executor_id` / SSE `tool_request` → `post_tool_result`)  
 > **Scope**: Edge-cloud state management, multi-agent orchestration, and cloud-scale execution  
 > **Audience**: Core contributors, architecture reviewers
 
@@ -658,6 +658,8 @@ open SSE (chat/stream with edge_executor_id + capabilities)
 ```
 
 This is the same protocol as CLI/Web/IDE **thin clients**; the edge differs only in **also** executing tools and posting callbacks. Today’s `mo-agent` CLI still bundles thin client + cognitive loop + edge tools — splitting out a **standalone light edge** is the mechanical next step after the server owns `chat_stream` / `plan_decompose` (§5.3).
+
+**CLI wiring (current)**: each `/chat/turn` payload includes `edge_executor_id` (env `MO_EDGE_EXECUTOR_ID` or `edge-{uuid}` per process) and `capabilities` from [`builtin_capability_preset`](../../rust/crates/mo-thin-client/src/edge.rs). [`consume_turn_sse`](../../rust/crates/mo-agent/src/mo_agent/stream_render.rs) parses SSE `tool_request` events, runs [`ToolExecutor::execute`](../../rust/crates/mo-agent/src/edge_tools.rs), and calls [`ThinClient::post_tool_result`](../../rust/crates/mo-thin-client/src/client.rs) (best-effort if the route is not deployed yet). The existing `tool_call` → local execution path remains for today’s server; when the cloud runtime emits only `tool_request`, the legacy path can be retired server-side.
 
 ---
 

@@ -88,7 +88,7 @@ use cli_utils::{
 };
 use command_router::{execute_cli_command, ExitCode};
 use permission_manager::PermissionManager;
-use stream_render::{Spinner, consume_turn_sse};
+use stream_render::Spinner;
 #[cfg(test)]
 use stream_render::{StreamRenderState, TurnResult, dispatch_turn_event_block};
 
@@ -3302,7 +3302,7 @@ mod tests {
         let mut result = TurnResult::new();
         let block = "data: {\"type\":\"explain\",\"total_ms\":7,\"tools_selected\":1,\"tools_available\":2,\"tool_selection\":null,\"tool_selection_fallback\":null,\"steps\":[]}\n\n";
         let mut render = StreamRenderState::new();
-        dispatch_turn_event_block(block, &mut result, &mut render, false);
+        dispatch_turn_event_block(block, &mut result, &mut render, false, &mut vec![]);
         assert_eq!(result.explain_turns.len(), 1);
         assert_eq!(
             result.explain_turns[0].get("type").and_then(|v| v.as_str()),
@@ -3316,7 +3316,7 @@ mod tests {
         let mut render = StreamRenderState::new();
         // thinking_delta (Kimi-k2.5 / Moonshot style)
         let block = "data: {\"type\":\"thinking_delta\",\"content\":\"Let me think...\"}\n\n";
-        dispatch_turn_event_block(block, &mut result, &mut render, false);
+        dispatch_turn_event_block(block, &mut result, &mut render, false, &mut vec![]);
         assert_eq!(result.reasoning_content, "Let me think...");
     }
 
@@ -3326,7 +3326,7 @@ mod tests {
         let mut render = StreamRenderState::new();
         // reasoning_delta (DeepSeek-R1 style)
         let block = "data: {\"type\":\"reasoning_delta\",\"content\":\"Step 1: search PRs\"}\n\n";
-        dispatch_turn_event_block(block, &mut result, &mut render, false);
+        dispatch_turn_event_block(block, &mut result, &mut render, false, &mut vec![]);
         assert_eq!(result.reasoning_content, "Step 1: search PRs");
     }
 
@@ -3338,7 +3338,7 @@ mod tests {
             "data: {\"type\":\"thinking_delta\",\"content\":\"part1\"}\n\n",
             "data: {\"type\":\"thinking_delta\",\"content\":\" part2\"}\n\n",
         );
-        dispatch_turn_event_block(block, &mut result, &mut render, false);
+        dispatch_turn_event_block(block, &mut result, &mut render, false, &mut vec![]);
         assert_eq!(result.reasoning_content, "part1 part2");
     }
 
@@ -3471,7 +3471,7 @@ mod tests {
         let block = "data: {\"type\":\"text_delta\",\"content\":\"hello world\"}\n\n";
         let mut result = TurnResult::new();
         let mut render = StreamRenderState::new();
-        dispatch_turn_event_block(block, &mut result, &mut render, true);
+        dispatch_turn_event_block(block, &mut result, &mut render, true, &mut vec![]);
         assert_eq!(result.full_text, "hello world");
     }
 
