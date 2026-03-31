@@ -2,7 +2,6 @@
 
 use std::{collections::HashSet, path::PathBuf, time::Instant};
 
-use crossterm::style::Stylize;
 use crossterm::terminal;
 use mo_agent_core::RuntimeLimits;
 use mo_agent_runtime::{
@@ -13,18 +12,18 @@ use mo_agent_runtime::{
     turn::headless_tool_assembly::tool_calls_for_stall_guard,
 };
 
-use crate::{ExplainMode, StreamResult, VerdictEvent, edge_tools};
+use crate::{StreamResult, VerdictEvent, edge_tools};
 
-use super::super::{
-    ChatTurnParams,
-    explain_reports::{print_explain_report, print_verdict_report},
-};
+use super::super::ChatTurnParams;
 use super::fetch_chat_turn_sse::{ChatTurnSseFetchRequest, fetch_chat_turn_sse};
 use super::post_tool_round::{
     PostToolTurnOutcome, PostToolTurnRequest, apply_post_tool_turn_policy,
 };
 use super::prepare_turn_request::PrepareTurnTelemetry;
 use super::stall_preflight::{StallPreflightRequest, apply_stall_preflight};
+use super::stream_result_finalize::{
+    StreamLoopSidecarEprint, StreamResultBuild, build_stream_result, eprint_stream_loop_sidecars,
+};
 use super::tool_round::{HeadlessToolRoundRequest, run_headless_tool_round};
 use super::turn_result_ingest::{
     TurnIngestOutcome, TurnResultIngestRequest, ingest_turn_sse_result,
@@ -265,100 +264,37 @@ pub(crate) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
         }
     }
 
-    if explain != ExplainMode::Off && !explain_turns.is_empty() && !quiet {
-        print_explain_report(&explain_turns, explain == ExplainMode::Verbose);
-    }
-    if explain != ExplainMode::Off && !verdict_events.is_empty() && !quiet {
-        print_verdict_report(&verdict_events, explain == ExplainMode::Verbose);
-    }
-
-    let elapsed = start.elapsed().as_secs_f64();
-    let format_footer_tokens = |tokens: u64| -> String {
-        if tokens < 1000 {
-            format!("{}tok", tokens)
-        } else {
-            format!("{:.1}k", tokens as f64 / 1000.0)
-        }
-    };
-    let model_tag = model.unwrap_or("auto");
-    let session_tag = current_session_id
-        .as_deref()
-        .map(|s| if s.len() > 8 { &s[..8] } else { s })
-        .unwrap_or("?");
-    if verbose_mode && !quiet {
-        eprintln!(
-            "{}",
-            format!(
-                "  ⏱ {:.1}s  ↓ {}  ↑ {}  model: {}  session: {}",
-                elapsed,
-                if has_any_usage {
-                    format_footer_tokens(total_completion)
-                } else {
-                    "?".to_string()
-                },
-                if has_any_usage {
-                    format_footer_tokens(total_prompt)
-                } else {
-                    "?".to_string()
-                },
-                model_tag,
-                session_tag,
-            )
-            .dim()
-        );
-    }
-
-    let report = first_selection_report.unwrap_or_else(|| tool_registry::SelectionReport {
-        tools_selected: Vec::new(),
-        selected_count: 0,
-        budget_used: 0,
-        budget_total: 0,
+    eprint_stream_loop_sidecars(StreamLoopSidecarEprint {
+        explain,
+        quiet,
+        verbose_mode,
+        start,
+        model,
+        explain_turns: &explain_turns,
+        verdict_events: &verdict_events,
+        has_any_usage,
+        total_prompt,
+        total_completion,
+        current_session_id: current_session_id.as_deref(),
     });
 
-    // Deduplicate stall events by type (keep only one of each type per user turn).
-    // The internal _turn numbers were used for in-loop deduplication; for journal
-    // output, we normalize all turn numbers to 0 (repl_turn.rs will use state.turn).
-    let deduped_stall_events: Vec<(String, u32)> = {
-        let mut seen = std::collections::HashSet::new();
-        stall_events
-            .into_iter()
-            .filter(|(stall_type, _)| seen.insert(stall_type.clone()))
-            .map(|(stall_type, _)| (stall_type, 0)) // turn will be filled by repl_turn
-            .collect()
-    };
-
-    // Deduplicate verdict events by severity (keep only the first of each severity).
-    // Same rationale: internal turn numbers are loop-internal, not user turns.
-    let deduped_verdict_events: Vec<VerdictEvent> = {
-        let mut seen = std::collections::HashSet::new();
-        verdict_events
-            .into_iter()
-            .filter(|ve| seen.insert(ve.severity.clone()))
-            .map(|mut ve| {
-                ve.turn = 0; // turn will be filled by repl_turn
-                ve
-            })
-            .collect()
-    };
-
-    Ok(StreamResult {
+    Ok(build_stream_result(StreamResultBuild {
+        tool_health_entries,
         session_id: current_session_id,
         run_id: current_run_id,
         full_text: final_text,
         prompt_tokens: total_prompt,
         completion_tokens: total_completion,
         tool_calls_count: total_tool_calls,
-        tools_selected: report.tools_selected,
+        first_selection_report,
         selected_skills: all_selected_skills,
-        tools_used: all_tools_used.into_iter().collect(),
+        tools_used: all_tools_used,
         tool_call_records,
-        budget_used: report.budget_used,
         budget_pressure: first_budget_pressure,
-        stall_events: deduped_stall_events,
-        verdict_events: deduped_verdict_events,
-        step_recorder_summary: Some(step_recorder.summary()),
-        // Export tool health with merged historical entries to preserve unused tools
-        tool_health_export: turn_guard.health.export_merged(tool_health_entries),
+        stall_events,
+        verdict_events,
+        step_recorder: &step_recorder,
+        turn_guard: &turn_guard,
         last_heavy_checkpoint,
         ttft_ms: first_ttft_ms,
         context_ms: first_context_assembly_ms,
@@ -367,5 +303,5 @@ pub(crate) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
         selector_tokens_in,
         selector_tokens_out,
         memoria_ms: first_memoria_ms,
-    })
+    }))
 }

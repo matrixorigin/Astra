@@ -9,6 +9,7 @@ mod prepare_turn_request;
 mod run;
 mod skill_instructions_round;
 mod stall_preflight;
+mod stream_result_finalize;
 mod tool_round;
 mod turn_result_ingest;
 
