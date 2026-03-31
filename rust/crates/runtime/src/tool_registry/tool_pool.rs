@@ -221,6 +221,7 @@ fn overlap_score(terms: &[String], text: &str, name: &str) -> f64 {
 mod tests {
     use super::*;
     use crate::tool_registry::{TOOL_CATALOG, ToolRegistry};
+    use proptest::{prop_assert, prop_assert_eq};
     use serde_json::json;
 
     struct DenyNone;

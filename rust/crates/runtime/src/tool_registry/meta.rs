@@ -20,6 +20,21 @@ pub enum IntentType {
     Database,
 }
 
+impl IntentType {
+    /// Get the snake_case string representation of this intent type.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            IntentType::CodeEdit => "code_edit",
+            IntentType::CodeRead => "code_read",
+            IntentType::Git => "git",
+            IntentType::GitHub => "github",
+            IntentType::Memory => "memory",
+            IntentType::Introspect => "introspect",
+            IntentType::Database => "database",
+        }
+    }
+}
+
 /// Data source scope for tag-based pre-filtering.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

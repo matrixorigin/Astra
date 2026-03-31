@@ -1670,4 +1670,284 @@ mod tests {
         let state = make_state();
         assert!(state.delegation_engine.is_none());
     }
+
+    // ── E2E delegation round-trip tests ─────────────────────────────────────
+
+    /// Helper to build a DelegationEngine with StubSubRunExecutor for tests.
+    fn make_test_delegation_engine() -> Arc<crate::server::delegation_engine::DelegationEngine> {
+        use crate::server::delegation_engine::{DelegationEngine, DelegationTracker, StubSubRunExecutor};
+        use crate::server::run_engine::RunEngine;
+        use mo_agent_services::AgentProfileRegistry;
+        use mo_agent_services::coordination::{AgentProfile, AgentTier};
+
+        let mut registry = AgentProfileRegistry::new();
+        let _ = registry.register(AgentProfile::new("orchestrator", "Orchestrator", AgentTier::Orchestrator));
+        let mut coder = AgentProfile::new("coder", "Coder", AgentTier::System);
+        coder.system_prompt = Some("You are a coder.".to_string());
+        let _ = registry.register(coder);
+        let mut reviewer = AgentProfile::new("reviewer", "Reviewer", AgentTier::System);
+        reviewer.system_prompt = Some("You are a reviewer.".to_string());
+        let _ = registry.register(reviewer);
+
+        let run_store = Arc::new(mo_agent_services::runs::InMemoryRunStateStore::default());
+        Arc::new(DelegationEngine::with_executor(
+            Arc::new(tokio::sync::RwLock::new(registry)),
+            Arc::new(RunEngine::new(run_store)),
+            Arc::new(DelegationTracker::new()),
+            Arc::new(StubSubRunExecutor),
+        ))
+    }
+
+    /// Helper: make a HostTurnResult with server-side tool_calls (like an LLM
+    /// requesting the "delegate" tool).
+    fn delegate_tool_call_result(
+        call_id: &str,
+        args_json: &str,
+        prompt: u64,
+        completion: u64,
+    ) -> HostTurnResult {
+        HostTurnResult {
+            accum: ChatTurnSseAccum {
+                has_tool_calls: true,
+                has_usage: true,
+                prompt_tokens: prompt,
+                completion_tokens: completion,
+                tool_calls: vec![json!({
+                    "id": call_id,
+                    "type": "function",
+                    "function": {
+                        "name": "delegate",
+                        "arguments": args_json,
+                    }
+                })],
+                ..ChatTurnSseAccum::default()
+            },
+            ttft_ms: Some(30),
+            edge_tool_round: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn e2e_delegation_round_trip_through_loop() {
+        // Turn 1: LLM issues a delegate tool call
+        // Turn 2: LLM produces final text after seeing delegation result
+        let turns = vec![
+            delegate_tool_call_result(
+                "call_del_1",
+                r#"{"task": "write unit tests", "agents": ["coder"], "pattern": "sequential"}"#,
+                100,
+                50,
+            ),
+            text_result("Done! Tests written based on delegation results.", 80, 30, None),
+        ];
+
+        let mut host = MockHost::new(turns);
+        let mut state = make_state();
+        state.messages.push(json!({"role": "user", "content": "Please delegate test writing to the coder agent."}));
+        state.current_run_id = Some("test-run-e2e".to_string());
+        state.current_session_id = Some("test-session-e2e".to_string());
+
+        // Wire delegation engine
+        state.delegation_engine = Some(make_test_delegation_engine());
+
+        let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
+        assert!(outcome.is_ok(), "loop should complete: {outcome:?}");
+        assert_eq!(state.final_text, "Done! Tests written based on delegation results.");
+
+        // Verify delegation result was injected into messages
+        let tool_messages: Vec<&Value> = state
+            .messages
+            .iter()
+            .filter(|m| m.get("role").and_then(Value::as_str) == Some("tool"))
+            .collect();
+        assert!(
+            !tool_messages.is_empty(),
+            "delegation result should appear as tool message"
+        );
+
+        // The tool message should reference our call_id
+        let has_delegation_result = tool_messages.iter().any(|m| {
+            m.get("tool_call_id")
+                .and_then(Value::as_str)
+                == Some("call_del_1")
+        });
+        assert!(has_delegation_result, "delegation result should reference call_del_1");
+
+        // Verify the delegation result content mentions delegation status
+        let delegation_content = tool_messages
+            .iter()
+            .find(|m| m.get("tool_call_id").and_then(Value::as_str) == Some("call_del_1"))
+            .and_then(|m| m.get("content").and_then(Value::as_str))
+            .unwrap_or("");
+        assert!(
+            delegation_content.contains("Delegation") || delegation_content.contains("completed"),
+            "delegation result should contain status info, got: {delegation_content}"
+        );
+
+        // Verify token accounting includes both turns
+        assert!(state.total_prompt >= 180, "should accumulate prompt tokens");
+        assert!(state.total_completion >= 80, "should accumulate completion tokens");
+    }
+
+    #[tokio::test]
+    async fn e2e_delegation_mixed_with_regular_tools() {
+        // Turn 1: LLM issues both a delegate call AND a regular tool call
+        // Turn 2: Final text
+        let mut turn1 = delegate_tool_call_result(
+            "call_del_mix",
+            r#"{"task": "review code", "agents": ["reviewer"]}"#,
+            100,
+            50,
+        );
+        // Add a regular edge tool to this turn
+        turn1.edge_tool_round.push(make_edge_tool("bash", "ls output"));
+
+        let turns = vec![
+            turn1,
+            text_result("Mixed delegation + tool complete.", 60, 20, None),
+        ];
+
+        let mut host = MockHost::new(turns).with_valid_tools(&["bash"]);
+        let mut state = make_state();
+        state.messages.push(json!({"role": "user", "content": "review and list files"}));
+        state.current_run_id = Some("run-mix".to_string());
+        state.delegation_engine = Some(make_test_delegation_engine());
+
+        let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
+        assert!(outcome.is_ok());
+        assert_eq!(state.final_text, "Mixed delegation + tool complete.");
+
+        // Both delegation result and edge tool result should be in messages
+        let tool_msgs: Vec<&Value> = state
+            .messages
+            .iter()
+            .filter(|m| m.get("role").and_then(Value::as_str) == Some("tool"))
+            .collect();
+        // At minimum: 1 delegation + potential edge tool messages
+        assert!(!tool_msgs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn e2e_delegation_with_invalid_args_continues_gracefully() {
+        // Turn 1: LLM issues a malformed delegate call
+        // The loop should inject an error result and continue to turn 2
+        let turns = vec![
+            delegate_tool_call_result(
+                "call_bad",
+                "this is not json",
+                100,
+                50,
+            ),
+            text_result("Recovered after bad delegation.", 60, 20, None),
+        ];
+
+        let mut host = MockHost::new(turns);
+        let mut state = make_state();
+        state.messages.push(json!({"role": "user", "content": "delegate something"}));
+        state.delegation_engine = Some(make_test_delegation_engine());
+
+        let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
+        assert!(outcome.is_ok());
+        assert_eq!(state.final_text, "Recovered after bad delegation.");
+
+        // Error message should be injected as tool result
+        let error_msg = state
+            .messages
+            .iter()
+            .find(|m| {
+                m.get("tool_call_id").and_then(Value::as_str) == Some("call_bad")
+            })
+            .and_then(|m| m.get("content").and_then(Value::as_str))
+            .unwrap_or("");
+        assert!(
+            error_msg.contains("Invalid delegation request"),
+            "should contain error: {error_msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn e2e_delegation_fan_out_pattern() {
+        // Test fan_out pattern: multiple agents in parallel
+        let turns = vec![
+            delegate_tool_call_result(
+                "call_fanout",
+                r#"{"task": "implement feature", "agents": ["coder", "reviewer"], "pattern": "fan_out"}"#,
+                150,
+                75,
+            ),
+            text_result("Fan-out complete.", 60, 20, None),
+        ];
+
+        let mut host = MockHost::new(turns);
+        let mut state = make_state();
+        state.messages.push(json!({"role": "user", "content": "implement and review"}));
+        state.current_run_id = Some("run-fanout".to_string());
+        state.delegation_engine = Some(make_test_delegation_engine());
+
+        let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
+        assert!(outcome.is_ok());
+        assert_eq!(state.final_text, "Fan-out complete.");
+
+        // Fan-out result should mention both agents
+        let result_content = state
+            .messages
+            .iter()
+            .find(|m| m.get("tool_call_id").and_then(Value::as_str) == Some("call_fanout"))
+            .and_then(|m| m.get("content").and_then(Value::as_str))
+            .unwrap_or("");
+        assert!(result_content.contains("coder"), "result should mention coder agent");
+        assert!(result_content.contains("reviewer"), "result should mention reviewer agent");
+    }
+
+    #[tokio::test]
+    async fn e2e_no_delegation_engine_passthrough() {
+        // When no delegation engine is wired, delegate tool calls
+        // pass through to the headless round (no interception)
+        let turn1_tool_calls = vec![json!({
+            "id": "call_del_passthrough",
+            "type": "function",
+            "function": {
+                "name": "delegate",
+                "arguments": "{\"task\": \"test\", \"agents\": [\"coder\"]}"
+            }
+        })];
+
+        let turns = vec![
+            server_tool_result(turn1_tool_calls, Vec::new(), 100, 50, Some(20)),
+            text_result("Passed through.", 60, 20, None),
+        ];
+
+        let mut host = MockHost::new(turns).with_valid_tools(&["delegate"]);
+        let mut state = make_state();
+        state.messages.push(json!({"role": "user", "content": "test delegate passthrough"}));
+        // Intentionally leave delegation_engine as None
+        assert!(state.delegation_engine.is_none());
+
+        let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
+        assert!(outcome.is_ok());
+        assert_eq!(state.final_text, "Passed through.");
+    }
+
+    #[tokio::test]
+    async fn e2e_adversarial_delegation_pattern() {
+        let turns = vec![
+            delegate_tool_call_result(
+                "call_adversarial",
+                r#"{"task": "write secure auth", "agents": ["coder", "reviewer"], "pattern": "adversarial", "max_rounds": 2}"#,
+                200,
+                100,
+            ),
+            text_result("Adversarial review complete.", 80, 40, None),
+        ];
+
+        let mut host = MockHost::new(turns);
+        let mut state = make_state();
+        state.messages.push(json!({"role": "user", "content": "write and review auth"}));
+        state.current_run_id = Some("run-adversarial".to_string());
+        state.delegation_engine = Some(make_test_delegation_engine());
+
+        let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
+        assert!(outcome.is_ok());
+        assert_eq!(state.final_text, "Adversarial review complete.");
+    }
 }
