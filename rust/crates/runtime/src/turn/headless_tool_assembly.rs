@@ -89,6 +89,38 @@ pub fn idempotency_cache_hit_message(cached_output: &str) -> String {
     format!("(cached from earlier turn — identical call)\n{cached_output}")
 }
 
+/// `tool` / `tool_results` body when the same signature was already executed this headless round.
+pub const HEADLESS_DUPLICATE_WITHIN_TURN_BODY: &str =
+    "(duplicate call — result same as previous identical call this turn)";
+
+#[must_use]
+pub fn headless_openai_duplicate_within_turn_pair(
+    tool_call_id: &str,
+    tool_name: &str,
+) -> (Value, Value) {
+    openai_tool_roundtrip_values(tool_call_id, tool_name, HEADLESS_DUPLICATE_WITHIN_TURN_BODY)
+}
+
+#[must_use]
+pub fn headless_idempotency_hit_openai_pair(
+    tool_call_id: &str,
+    tool_name: &str,
+    cached_output: &str,
+) -> (Value, Value) {
+    let body = idempotency_cache_hit_message(cached_output);
+    openai_tool_roundtrip_values(tool_call_id, tool_name, body.as_str())
+}
+
+#[must_use]
+pub fn headless_unknown_local_tool_openai_pair(
+    tool_call_id: &str,
+    tool_name: &str,
+    valid_tool_names: &HashSet<String>,
+) -> (Value, Value) {
+    let err = unknown_local_tool_error_message(tool_name, valid_tool_names);
+    openai_tool_roundtrip_values(tool_call_id, tool_name, err.as_str())
+}
+
 /// Tools that are idempotent reads — safe to cache across turns.
 /// Side-effectful tools must not appear here.
 pub const CACHEABLE_TOOLS: &[&str] = &[
@@ -262,6 +294,32 @@ pub fn openai_tool_roundtrip_values(
     (msg, tr)
 }
 
+/// Assistant `tool_calls` message + iteration indices for the headless round loop (§5.5).
+#[derive(Debug, Clone)]
+pub struct HeadlessRoundOpening {
+    pub assistant_message: Value,
+    pub indices: Vec<HeadlessRoundToolIdx>,
+    pub tool_count: usize,
+}
+
+/// Build the assistant message and per-tool indices.
+#[must_use]
+pub fn begin_headless_tool_round_opening<Edge: EdgeToolRoundRow>(
+    server_tool_calls: &[Value],
+    edge_round: &[Edge],
+    reasoning_content: &str,
+) -> HeadlessRoundOpening {
+    let assistant_message =
+        openai_assistant_with_tool_calls_message(server_tool_calls, edge_round, reasoning_content);
+    let indices = headless_round_tool_indices(server_tool_calls.len(), edge_round.len());
+    let tool_count = indices.len().max(1);
+    HeadlessRoundOpening {
+        assistant_message,
+        indices,
+        tool_count,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -404,6 +462,28 @@ mod tests {
     fn idempotency_cache_hit_message_shape() {
         let m = idempotency_cache_hit_message("body");
         assert_eq!(m, "(cached from earlier turn — identical call)\nbody");
+    }
+
+    #[test]
+    fn headless_duplicate_pair_matches_constant_body() {
+        let (msg, tr) = headless_openai_duplicate_within_turn_pair("c1", "bash");
+        assert_eq!(
+            msg["content"].as_str(),
+            Some(HEADLESS_DUPLICATE_WITHIN_TURN_BODY)
+        );
+        assert_eq!(
+            tr["result"].as_str(),
+            Some(HEADLESS_DUPLICATE_WITHIN_TURN_BODY)
+        );
+    }
+
+    #[test]
+    fn begin_headless_opening_counts_server_calls() {
+        let server = vec![json!({"id":"1","name":"bash","arguments":{}})];
+        let edge: Vec<Row> = vec![];
+        let o = begin_headless_tool_round_opening(&server, &edge, "");
+        assert_eq!(o.indices.len(), 1);
+        assert_eq!(o.tool_count, 1);
     }
 
     #[test]

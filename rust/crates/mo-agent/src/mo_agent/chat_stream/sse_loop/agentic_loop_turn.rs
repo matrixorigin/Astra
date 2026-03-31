@@ -35,12 +35,14 @@ use mo_agent_runtime::{
         merge_skill_instructions_into_edge_profile, set_payload_edge_tools,
         set_payload_tool_results_if_non_empty,
     },
+    turn::chat_turn_selection_context::build_agentic_tool_selection_context,
     turn::edge_prompt_context::make_args_preview,
     turn::headless_tool_assembly::{
-        CACHEABLE_TOOLS, HeadlessRoundToolIdx, headless_round_tool_indices,
-        idempotency_cache_hit_message, openai_assistant_with_tool_calls_message,
-        openai_tool_roundtrip_values, parse_flat_tool_call_event, take_edge_output_for_tool_call,
-        tool_calls_for_stall_guard, unknown_local_tool_error_message,
+        CACHEABLE_TOOLS, HeadlessRoundToolIdx, begin_headless_tool_round_opening,
+        headless_idempotency_hit_openai_pair, headless_openai_duplicate_within_turn_pair,
+        headless_unknown_local_tool_openai_pair, openai_tool_roundtrip_values,
+        parse_flat_tool_call_event, take_edge_output_for_tool_call, tool_calls_for_stall_guard,
+        unknown_local_tool_error_message,
     },
     turn::headless_tool_journal::{
         journal_record_cross_turn_cache_hit, journal_record_duplicate_within_turn,
@@ -53,6 +55,9 @@ use mo_agent_runtime::{
         try_write_light_headless_step_checkpoint,
     },
     turn::hydrate_reflect::hydrate_reflect_placeholder_if_needed,
+    turn::prepare_turn_explain_text::{
+        restricted_tools_explain_text, selector_guidance_explain_text,
+    },
     turn::tool_result_semantics::{is_tool_error, tool_dedup_signature},
     turn::tool_schema_prune::{filter_tool_schemas_by_excluded_names, pin_invoked_tool_schemas},
     turn::turn_guard::TurnGuard,
@@ -185,18 +190,18 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
     let mut selected_skills: Vec<String> = Vec::new();
     let (turn_schemas, selection_report, selection_confidence) = if ctx.tool_results.is_empty() {
         let sel_start = Instant::now();
-        let turn_count = ctx.history.len() as u32 + 1;
-        let sel_ctx = tool_selector::SelectionContext {
-            query: ctx.message,
-            turn_count,
-            recent_tools: ctx.recent_tools,
-            budget_tokens: ctx.registry.default_budget(),
-            boost_terms: boost_terms.clone(),
+        let sel_ctx = build_agentic_tool_selection_context(
+            ctx.message,
+            ctx.history.len(),
+            ctx.recent_tools,
+            ctx.registry,
+            boost_terms.clone(),
             budget_pressure,
-            memory_domain_hints: memory_domain_hints.clone(),
-            restricted_tools: restricted_vec.clone(),
-            file_context: ctx.file_context.to_vec(),
-        };
+            memory_domain_hints.clone(),
+            restricted_vec.clone(),
+            ctx.file_context.to_vec(),
+            false,
+        );
         let sel_result = ctx
             .selector
             .select_with_learned_context(&sel_ctx, &learned_context)
@@ -219,18 +224,18 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
         );
         (schemas, report, conf)
     } else {
-        let turn_count = ctx.history.len() as u32 + 1;
-        let sel_ctx = tool_selector::SelectionContext {
-            query: ctx.message,
-            turn_count,
-            recent_tools: ctx.recent_tools,
-            budget_tokens: ctx.registry.default_budget() * 2,
+        let sel_ctx = build_agentic_tool_selection_context(
+            ctx.message,
+            ctx.history.len(),
+            ctx.recent_tools,
+            ctx.registry,
             boost_terms,
             budget_pressure,
             memory_domain_hints,
-            restricted_tools: restricted_vec,
-            file_context: ctx.file_context.to_vec(),
-        };
+            restricted_vec,
+            ctx.file_context.to_vec(),
+            true,
+        );
         let sel_result = ctx
             .selector
             .select_with_learned_context(&sel_ctx, &learned_context)
@@ -305,44 +310,21 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
 }
 
 fn eprint_restricted_tools_explain(show: bool, restricted_tools: &HashSet<String>) {
-    if !show || restricted_tools.is_empty() {
+    if !show {
         return;
     }
-    eprintln!(
-        "{}",
-        format!(
-            "  ├─ restricted: {} tool(s) filtered [{}]",
-            restricted_tools.len(),
-            restricted_tools
-                .iter()
-                .cloned()
-                .collect::<Vec<_>>()
-                .join(", ")
-        )
-        .dim()
-    );
+    if let Some(line) = restricted_tools_explain_text(restricted_tools) {
+        eprintln!("{}", line.dim());
+    }
 }
 
 fn eprint_selector_guidance_explain(show: bool, payload: &Value, selection_confidence: f64) {
     if !show {
         return;
     }
-    let Some(recommended) = payload["edge_profile"]["recommended_tools"].as_array() else {
-        return;
-    };
-    let names: Vec<&str> = recommended.iter().filter_map(|v| v.as_str()).collect();
-    if names.is_empty() {
-        return;
+    if let Some(line) = selector_guidance_explain_text(payload, selection_confidence) {
+        eprintln!("{}", line.dim());
     }
-    eprintln!(
-        "{}",
-        format!(
-            "  ├─ guidance: {} (confidence: {:.2})",
-            names.join(", "),
-            selection_confidence
-        )
-        .dim()
-    );
 }
 
 fn load_skill_instructions_text(
@@ -543,19 +525,15 @@ async fn run_headless_tool_round(ctx: HeadlessToolRoundRequest<'_>) {
 
     tool_results.clear();
 
-    let assistant_tc_msg = openai_assistant_with_tool_calls_message(
+    let opening = begin_headless_tool_round_opening(
         &turn_result.tool_calls,
         &turn_result.edge_tool_round,
-        &turn_result.reasoning_content,
+        turn_result.reasoning_content.as_str(),
     );
-    messages.push(assistant_tc_msg);
+    messages.push(opening.assistant_message);
 
-    let indices = headless_round_tool_indices(
-        turn_result.tool_calls.len(),
-        turn_result.edge_tool_round.len(),
-    );
-
-    let tool_count = indices.len().max(1);
+    let indices = opening.indices;
+    let tool_count = opening.tool_count;
     let mut seen_calls: HashSet<String> = HashSet::new();
     step_recorder.begin_act(tool_count);
     let step_deadline =
@@ -595,8 +573,7 @@ async fn run_headless_tool_round(ctx: HeadlessToolRoundRequest<'_>) {
 
         let call_sig = tool_dedup_signature(&name, &args);
         if !seen_calls.insert(call_sig.clone()) {
-            let dup = "(duplicate call — result same as previous identical call this turn)";
-            let (tool_msg, tr) = openai_tool_roundtrip_values(&id, &name, dup);
+            let (tool_msg, tr) = headless_openai_duplicate_within_turn_pair(&id, &name);
             messages.push(tool_msg);
             tool_results.push(tr);
             tool_call_records.push(journal_record_duplicate_within_turn(
@@ -610,11 +587,10 @@ async fn run_headless_tool_round(ctx: HeadlessToolRoundRequest<'_>) {
         if CACHEABLE_TOOLS.contains(&name.as_str())
             && let Some(cached) = idempotency_cache.check(&idem_key)
         {
-            let cached_note = idempotency_cache_hit_message(&cached.output);
             if !quiet {
                 eprintln!("{}", format!("  ↻ {name} (cached)").dim());
             }
-            let (tool_msg, tr) = openai_tool_roundtrip_values(&id, &name, &cached_note);
+            let (tool_msg, tr) = headless_idempotency_hit_openai_pair(&id, &name, &cached.output);
             messages.push(tool_msg);
             tool_results.push(tr);
             let cache_key = idem_key.cache_key();
@@ -649,7 +625,8 @@ async fn run_headless_tool_round(ctx: HeadlessToolRoundRequest<'_>) {
             if !quiet {
                 eprintln!("  {}", format!("└ {err_msg}").dim());
             }
-            let (tool_msg, err_tr) = openai_tool_roundtrip_values(&id, &name, &err_msg);
+            let (tool_msg, err_tr) =
+                headless_unknown_local_tool_openai_pair(&id, &name, valid_tool_names);
             messages.push(tool_msg);
             tool_results.push(err_tr);
             tool_call_records.push(journal_record_unknown_tool(name.clone()));
