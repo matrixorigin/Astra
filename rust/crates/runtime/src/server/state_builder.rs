@@ -180,7 +180,7 @@ pub(super) async fn build_server_state(
     let run_engine = crate::server::run_engine::RunEngine::new(run_store);
     let run_lifecycle = super::run_lifecycle::AgenticRunLifecycleService::new(
         settings.matrixone.clone(),
-        run_encryptor,
+        run_encryptor.clone(),
         state.edge_callback_ledger.clone(),
     )
     .with_pool(shared_pool.clone())
@@ -188,13 +188,61 @@ pub(super) async fn build_server_state(
     let state = state.with_run_lifecycle_service(Arc::new(run_lifecycle));
 
     // Wire multi-agent coordination: profile registry + delegation engine.
-    let profile_registry = Arc::new(mo_agent_services::AgentProfileRegistry::new());
+    let mut profile_registry = mo_agent_services::AgentProfileRegistry::new();
+    // Register default agent profiles so delegation validation works.
+    {
+        use mo_agent_services::coordination::{AgentProfile, AgentTier};
+        let mut orch = AgentProfile::new("orchestrator", "Orchestrator", AgentTier::Orchestrator);
+        orch.system_prompt = Some(
+            "You are the orchestrator agent. Coordinate sub-agents to complete complex tasks."
+                .to_string(),
+        );
+        let _ = profile_registry.register(orch);
+
+        let mut coder = AgentProfile::new("coder", "Coder", AgentTier::System);
+        coder.system_prompt = Some(
+            "You are a coding agent. Write, edit, and debug code to complete tasks.".to_string(),
+        );
+        coder.skill_filter = vec![
+            "bash".into(),
+            "read_file".into(),
+            "write_file".into(),
+            "str_replace".into(),
+            "git_commit".into(),
+        ];
+        let _ = profile_registry.register(coder);
+
+        let mut reviewer = AgentProfile::new("reviewer", "Reviewer", AgentTier::System);
+        reviewer.system_prompt = Some(
+            "You are a code review agent. Review code for bugs, security, and best practices."
+                .to_string(),
+        );
+        reviewer.skill_filter = vec!["read_file".into(), "bash".into()];
+        let _ = profile_registry.register(reviewer);
+
+        let mut writer = AgentProfile::new("writer", "Writer", AgentTier::User);
+        writer.system_prompt =
+            Some("You are a documentation writer. Create clear, concise docs.".to_string());
+        let _ = profile_registry.register(writer);
+    }
+    let profile_registry = Arc::new(profile_registry);
     let delegation_tracker = Arc::new(crate::server::delegation_engine::DelegationTracker::new());
-    let delegation_engine = Arc::new(crate::server::delegation_engine::DelegationEngine::new(
-        Arc::new(tokio::sync::RwLock::new((*profile_registry).clone())),
-        Arc::new(run_engine),
-        delegation_tracker,
-    ));
+    // Wire a real sub-run executor backed by ServerAgenticLoopHost.
+    let sub_run_executor: Arc<dyn crate::server::delegation_engine::SubRunExecutor> = Arc::new(
+        super::run_lifecycle::ServerSubRunExecutor::new(
+            settings.matrixone.clone(),
+            run_encryptor,
+            state.edge_callback_ledger.clone(),
+        )
+        .with_pool(shared_pool.clone()),
+    );
+    let delegation_engine =
+        Arc::new(crate::server::delegation_engine::DelegationEngine::with_executor(
+            Arc::new(tokio::sync::RwLock::new((*profile_registry).clone())),
+            Arc::new(run_engine),
+            delegation_tracker,
+            sub_run_executor,
+        ));
     let state = state
         .with_agent_profile_registry(profile_registry)
         .with_delegation_engine(delegation_engine);

@@ -612,6 +612,161 @@ impl RunLifecycleService for AgenticRunLifecycleService {
     }
 }
 
+// ─── Sub-Run Executor ───────────────────────────────────────────────────────
+
+use crate::server::delegation_engine::{SubRunConfig, SubRunExecutor};
+
+/// Production sub-run executor backed by [`ServerAgenticLoopHost`].
+///
+/// Creates a real agentic loop for each sub-run with the agent's system prompt,
+/// model, and tool configuration.
+pub struct ServerSubRunExecutor {
+    matrixone: MatrixOneSettings,
+    encryptor: Arc<FernetTokenEncryptor>,
+    shared_pool: Option<SharedPool>,
+    edge_callback_ledger: Arc<TokioMutex<HashMap<String, Value>>>,
+}
+
+impl ServerSubRunExecutor {
+    pub fn new(
+        matrixone: MatrixOneSettings,
+        encryptor: Arc<FernetTokenEncryptor>,
+        edge_callback_ledger: Arc<TokioMutex<HashMap<String, Value>>>,
+    ) -> Self {
+        Self {
+            matrixone,
+            encryptor,
+            shared_pool: None,
+            edge_callback_ledger,
+        }
+    }
+
+    pub fn with_pool(mut self, pool: SharedPool) -> Self {
+        self.shared_pool = Some(pool);
+        self
+    }
+}
+
+#[async_trait]
+impl SubRunExecutor for ServerSubRunExecutor {
+    async fn execute(&self, config: SubRunConfig) -> Result<mo_agent_services::coordination::AgentResult, String> {
+        use crate::pipeline::step_protocol::InMemoryIdempotencyCache;
+        use crate::semantic_dedup::SemanticDedup;
+        use crate::turn::turn_guard::TurnGuard;
+
+        // Build edge profile from agent's system prompt and metadata.
+        let mut edge_profile = Map::new();
+        if let Some(prompt) = &config.agent_profile.system_prompt {
+            edge_profile.insert("system_prompt_override".to_string(), Value::String(prompt.clone()));
+        }
+        if let Some(model) = &config.agent_profile.model_override {
+            edge_profile.insert("model".to_string(), Value::String(model.clone()));
+        }
+        edge_profile.insert("agent_id".to_string(), Value::String(config.agent_profile.agent_id.clone()));
+
+        // Build the host with agent-specific configuration.
+        let mut builder = ServerAgenticLoopHostBuilder::new(
+            self.matrixone.clone(),
+            self.encryptor.clone(),
+            config.user_id.clone(),
+            config.session_id.clone(),
+        )
+        .with_model(config.agent_profile.model_override.clone())
+        .with_edge_profile(edge_profile)
+        .with_edge_callback_ledger(self.edge_callback_ledger.clone());
+
+        if let Some(pool) = &self.shared_pool {
+            builder = builder.with_pool(pool.clone());
+        }
+        let mut host = builder.build();
+
+        // Build the task prompt, incorporating previous output if pipeline.
+        let full_task = if let Some(prev) = &config.previous_output {
+            format!("{}\n\nPrevious agent output:\n{}", config.task, prev)
+        } else {
+            config.task.clone()
+        };
+
+        let user_message = json!({
+            "role": "user",
+            "content": full_task,
+        });
+
+        let mut loop_state = AgenticLoopState {
+            messages: vec![user_message],
+            tool_results: Vec::new(),
+            current_session_id: Some(config.session_id.clone()),
+            current_run_id: Some(config.run_id.clone()),
+            final_text: String::new(),
+            total_prompt: 0,
+            total_completion: 0,
+            total_tool_calls: 0,
+            has_any_usage: false,
+            max_turns: 10,
+            remaining_turns: 10,
+            turn_guard: TurnGuard::new(),
+            restricted_tools: std::collections::HashSet::new(),
+            step_recorder: StepRecorder::new(&config.session_id, &config.run_id),
+            idempotency_cache: InMemoryIdempotencyCache::new(),
+            semantic_dedup: SemanticDedup::new(0.75),
+            turn_sigs: Vec::new(),
+            turn_tool_names: Vec::new(),
+            stall_events: Vec::new(),
+            intent_tool_turns: Vec::new(),
+            verdict_events: Vec::new(),
+            last_heavy_checkpoint: None,
+            tool_call_records: Vec::new(),
+            forced_factual_retry: false,
+            explain_turns: Vec::new(),
+            first_ttft_ms: None,
+            all_tools_used: std::collections::HashSet::new(),
+            first_selection_report: None,
+            first_budget_pressure: 0.0,
+            first_context_assembly_ms: None,
+            first_memoria_ms: None,
+            first_selector_ms: None,
+            first_selector_strategy: None,
+            selector_tokens_in: 0,
+            selector_tokens_out: 0,
+            all_selected_skills: Vec::new(),
+            message: full_task,
+            recent_tools: Vec::new(),
+            api: mo_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap(),
+            api_token: String::new(),
+            cancel_flag: None,
+        };
+
+        let outcome = run_agentic_loop_with_host(&mut host, &mut loop_state).await;
+
+        match outcome {
+            Ok(_) => Ok(mo_agent_services::coordination::AgentResult {
+                agent_id: config.agent_profile.agent_id,
+                run_id: config.run_id,
+                status: "completed".to_string(),
+                output: if loop_state.final_text.is_empty() {
+                    None
+                } else {
+                    Some(loop_state.final_text)
+                },
+                error: None,
+                prompt_tokens: loop_state.total_prompt,
+                completion_tokens: loop_state.total_completion,
+                tool_calls: loop_state.total_tool_calls,
+            }),
+            Err(err) => Ok(mo_agent_services::coordination::AgentResult {
+                agent_id: config.agent_profile.agent_id,
+                run_id: config.run_id,
+                status: "failed".to_string(),
+                output: None,
+                error: Some(err),
+                prompt_tokens: loop_state.total_prompt,
+                completion_tokens: loop_state.total_completion,
+                tool_calls: loop_state.total_tool_calls,
+            }),
+        }
+    }
+}
+
 // ─── Tests ──────────────────────────────────────────────────────────────────
 
 #[cfg(test)]

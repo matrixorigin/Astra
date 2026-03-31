@@ -9,8 +9,8 @@
 //! ```text
 //! Orchestrator run-A
 //!   ├── delegate(FanOut{agent_ids: [s1, s2]})
-//!   │     ├── sub-run-B (agent s1)  ──▶ completed
-//!   │     └── sub-run-C (agent s2)  ──▶ completed
+//!   │     ├── sub-run-B (agent s1)  ──▶ completed ✅
+//!   │     └── sub-run-C (agent s2)  ──▶ completed ✅
 //!   │
 //!   └── aggregate(results) ──▶ merged output
 //! ```
@@ -18,14 +18,66 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use tokio::sync::RwLock;
 
 use mo_agent_services::coordination::{
-    AgentProfileRegistry, AgentResult, AggregationStrategy, CoordinationPattern, DelegationRequest,
-    DelegationResult, aggregate_results,
+    AgentProfile, AgentProfileRegistry, AgentResult, AggregationStrategy, CoordinationPattern,
+    DelegationRequest, DelegationResult, aggregate_results,
 };
 
 use super::run_engine::RunEngine;
+
+// ─── Sub-run Executor Trait ─────────────────────────────────────────────────
+
+/// Configuration for a sub-run spawned by delegation.
+#[derive(Debug, Clone)]
+pub struct SubRunConfig {
+    /// Unique ID for this sub-run.
+    pub run_id: String,
+    /// Agent profile executing this sub-run.
+    pub agent_profile: AgentProfile,
+    /// The task/prompt for this sub-run.
+    pub task: String,
+    /// Parent's session ID (sub-runs share the session lineage).
+    pub session_id: String,
+    /// User ID owning the delegation.
+    pub user_id: String,
+    /// Optional output from previous pipeline stage.
+    pub previous_output: Option<String>,
+    /// Context key-value pairs from the delegation request.
+    pub context: HashMap<String, serde_json::Value>,
+}
+
+/// Trait for executing sub-runs as part of a delegation.
+///
+/// Production implementations use [`ServerAgenticLoopHost`] to run a real
+/// agentic loop. Test implementations return mock results.
+#[async_trait]
+pub trait SubRunExecutor: Send + Sync {
+    /// Execute a sub-run and return the result.
+    async fn execute(&self, config: SubRunConfig) -> Result<AgentResult, String>;
+}
+
+/// No-op executor that immediately returns "completed" results.
+/// Used when no real executor is wired (tests, offline mode).
+pub struct StubSubRunExecutor;
+
+#[async_trait]
+impl SubRunExecutor for StubSubRunExecutor {
+    async fn execute(&self, config: SubRunConfig) -> Result<AgentResult, String> {
+        Ok(AgentResult {
+            agent_id: config.agent_profile.agent_id,
+            run_id: config.run_id,
+            status: "completed".to_string(),
+            output: Some(format!("[stub] completed task: {}", config.task)),
+            error: None,
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            tool_calls: 0,
+        })
+    }
+}
 
 // ─── Sub-run Tracking ───────────────────────────────────────────────────────
 
@@ -107,6 +159,18 @@ impl DelegationTracker {
             .collect()
     }
 
+    /// Get the agent_id for a run. Returns `None` for top-level (non-sub) runs.
+    pub async fn get_agent_id(&self, run_id: &str) -> Option<String> {
+        for records in self.delegations.read().await.values() {
+            for record in records {
+                if record.run_id == run_id {
+                    return Some(record.agent_id.clone());
+                }
+            }
+        }
+        None
+    }
+
     /// Get the full ancestry chain (run_id → parent → grandparent → ...).
     pub async fn get_ancestry(&self, run_id: &str) -> Vec<String> {
         let parents = self.parents.read().await;
@@ -132,7 +196,7 @@ impl Default for DelegationTracker {
 ///
 /// Validates delegation requests against the agent profile registry,
 /// spawns sub-runs via RunEngine, tracks hierarchies via DelegationTracker,
-/// and aggregates results.
+/// and **executes** them via [`SubRunExecutor`].
 pub struct DelegationEngine {
     /// Agent profiles for validation.
     registry: Arc<RwLock<AgentProfileRegistry>>,
@@ -140,6 +204,8 @@ pub struct DelegationEngine {
     run_engine: Arc<RunEngine>,
     /// Tracks parent→child run relationships.
     tracker: Arc<DelegationTracker>,
+    /// Executor for actually running sub-agent loops.
+    executor: Arc<dyn SubRunExecutor>,
 }
 
 impl DelegationEngine {
@@ -152,6 +218,22 @@ impl DelegationEngine {
             registry,
             run_engine,
             tracker,
+            executor: Arc::new(StubSubRunExecutor),
+        }
+    }
+
+    /// Create engine with a real sub-run executor.
+    pub fn with_executor(
+        registry: Arc<RwLock<AgentProfileRegistry>>,
+        run_engine: Arc<RunEngine>,
+        tracker: Arc<DelegationTracker>,
+        executor: Arc<dyn SubRunExecutor>,
+    ) -> Self {
+        Self {
+            registry,
+            run_engine,
+            tracker,
+            executor,
         }
     }
 
@@ -214,17 +296,17 @@ impl DelegationEngine {
         agent_ids: &[String],
         aggregation: &AggregationStrategy,
     ) -> Result<DelegationResult, String> {
-        let mut results = Vec::new();
+        let reg = self.registry.read().await;
 
+        // Build configs + create runs in parallel
+        let mut configs = Vec::new();
         for agent_id in agent_ids {
             let sub_run_id = uuid::Uuid::new_v4().to_string();
 
-            // Create the sub-run in the durable store
             self.run_engine
                 .start_run(&sub_run_id, &request.user_id, &sub_run_id)
                 .await?;
 
-            // Track the hierarchy
             self.tracker
                 .record_sub_run(SubRunRecord {
                     run_id: sub_run_id.clone(),
@@ -235,22 +317,86 @@ impl DelegationEngine {
                 })
                 .await;
 
-            // Mark as completed (actual execution is handled by the agentic loop
-            // when the server wires this up — here we record the structural intent)
             self.run_engine
-                .persist_status(&sub_run_id, "waiting", Some("agent_execution"), None)
+                .persist_status(&sub_run_id, "running", Some("agent_execution"), None)
                 .await?;
 
-            results.push(AgentResult {
-                agent_id: agent_id.clone(),
+            let profile = reg
+                .get(agent_id)
+                .cloned()
+                .unwrap_or_else(|| AgentProfile::new(agent_id, agent_id, mo_agent_services::coordination::AgentTier::User));
+
+            configs.push(SubRunConfig {
                 run_id: sub_run_id,
-                status: "waiting".to_string(),
-                output: None,
-                error: None,
-                prompt_tokens: 0,
-                completion_tokens: 0,
-                tool_calls: 0,
+                agent_profile: profile,
+                task: request.task.clone(),
+                session_id: request
+                    .context
+                    .get("session_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("delegation")
+                    .to_string(),
+                user_id: request.user_id.clone(),
+                previous_output: None,
+                context: request.context.clone(),
             });
+        }
+        drop(reg);
+
+        // Execute all sub-runs in parallel via tokio tasks.
+        let mut handles = Vec::new();
+        for config in configs {
+            let executor = self.executor.clone();
+            let run_engine = self.run_engine.clone();
+            handles.push(tokio::spawn(async move {
+                let run_id = config.run_id.clone();
+                let result = executor.execute(config).await;
+                // Persist final status
+                match &result {
+                    Ok(r) => {
+                        let _ = run_engine
+                            .persist_status(&run_id, &r.status, None, r.error.as_deref())
+                            .await;
+                    }
+                    Err(e) => {
+                        let _ = run_engine
+                            .persist_status(&run_id, "failed", None, Some(e.as_str()))
+                            .await;
+                    }
+                }
+                result
+            }));
+        }
+
+        let mut results = Vec::new();
+        for handle in handles {
+            match handle.await {
+                Ok(Ok(result)) => results.push(result),
+                Ok(Err(e)) => {
+                    results.push(AgentResult {
+                        agent_id: "unknown".to_string(),
+                        run_id: String::new(),
+                        status: "failed".to_string(),
+                        output: None,
+                        error: Some(e),
+                        prompt_tokens: 0,
+                        completion_tokens: 0,
+                        tool_calls: 0,
+                    });
+                }
+                Err(e) => {
+                    results.push(AgentResult {
+                        agent_id: "unknown".to_string(),
+                        run_id: String::new(),
+                        status: "failed".to_string(),
+                        output: None,
+                        error: Some(format!("task join error: {}", e)),
+                        prompt_tokens: 0,
+                        completion_tokens: 0,
+                        tool_calls: 0,
+                    });
+                }
+            }
         }
 
         let aggregated = aggregate_results(aggregation, &results);
@@ -262,13 +408,16 @@ impl DelegationEngine {
     }
 
     /// Sequential / Pipeline: execute agents one after another.
+    /// Pipeline feeds previous output to the next agent.
     async fn execute_sequential(
         &self,
         request: &DelegationRequest,
         agent_ids: &[String],
         stop_on_success: bool,
     ) -> Result<DelegationResult, String> {
+        let reg = self.registry.read().await;
         let mut results = Vec::new();
+        let mut previous_output: Option<String> = None;
 
         for agent_id in agent_ids {
             let sub_run_id = uuid::Uuid::new_v4().to_string();
@@ -288,20 +437,57 @@ impl DelegationEngine {
                 .await;
 
             self.run_engine
-                .persist_status(&sub_run_id, "waiting", Some("agent_execution"), None)
+                .persist_status(&sub_run_id, "running", Some("agent_execution"), None)
                 .await?;
 
-            let result = AgentResult {
-                agent_id: agent_id.clone(),
-                run_id: sub_run_id,
-                status: "waiting".to_string(),
-                output: None,
-                error: None,
-                prompt_tokens: 0,
-                completion_tokens: 0,
-                tool_calls: 0,
+            let profile = reg
+                .get(agent_id)
+                .cloned()
+                .unwrap_or_else(|| AgentProfile::new(agent_id, agent_id, mo_agent_services::coordination::AgentTier::User));
+
+            let config = SubRunConfig {
+                run_id: sub_run_id.clone(),
+                agent_profile: profile,
+                task: request.task.clone(),
+                session_id: request
+                    .context
+                    .get("session_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("delegation")
+                    .to_string(),
+                user_id: request.user_id.clone(),
+                previous_output: previous_output.clone(),
+                context: request.context.clone(),
             };
 
+            let result = match self.executor.execute(config).await {
+                Ok(r) => {
+                    let _ = self
+                        .run_engine
+                        .persist_status(&sub_run_id, &r.status, None, r.error.as_deref())
+                        .await;
+                    r
+                }
+                Err(e) => {
+                    let _ = self
+                        .run_engine
+                        .persist_status(&sub_run_id, "failed", None, Some(&e))
+                        .await;
+                    AgentResult {
+                        agent_id: agent_id.clone(),
+                        run_id: sub_run_id,
+                        status: "failed".to_string(),
+                        output: None,
+                        error: Some(e),
+                        prompt_tokens: 0,
+                        completion_tokens: 0,
+                        tool_calls: 0,
+                    }
+                }
+            };
+
+            // Feed output to the next stage (pipeline semantics).
+            previous_output = result.output.clone();
             let is_success = result.is_success();
             results.push(result);
 
@@ -325,10 +511,22 @@ impl DelegationEngine {
         reviewer_id: &str,
         max_rounds: u32,
     ) -> Result<DelegationResult, String> {
+        let reg = self.registry.read().await;
         let mut results = Vec::new();
+        let mut last_producer_output: Option<String> = None;
+
+        let producer_profile = reg
+            .get(producer_id)
+            .cloned()
+            .unwrap_or_else(|| AgentProfile::new(producer_id, producer_id, mo_agent_services::coordination::AgentTier::System));
+        let reviewer_profile = reg
+            .get(reviewer_id)
+            .cloned()
+            .unwrap_or_else(|| AgentProfile::new(reviewer_id, reviewer_id, mo_agent_services::coordination::AgentTier::System));
+        drop(reg);
 
         for round in 0..max_rounds {
-            // Producer sub-run
+            // ── Producer sub-run ──
             let prod_run_id = uuid::Uuid::new_v4().to_string();
             self.run_engine
                 .start_run(&prod_run_id, &request.user_id, &prod_run_id)
@@ -343,7 +541,7 @@ impl DelegationEngine {
                 })
                 .await;
             self.run_engine
-                .persist_status(&prod_run_id, "waiting", Some("produce"), None)
+                .persist_status(&prod_run_id, "running", Some("produce"), None)
                 .await?;
             self.run_engine
                 .append_event(
@@ -351,18 +549,34 @@ impl DelegationEngine {
                     serde_json::json!({"event_type": "adversarial_round", "data": {"round": round, "role": "producer"}}),
                 )
                 .await?;
-            results.push(AgentResult {
-                agent_id: producer_id.to_string(),
-                run_id: prod_run_id,
-                status: "waiting".to_string(),
-                output: None,
-                error: None,
-                prompt_tokens: 0,
-                completion_tokens: 0,
-                tool_calls: 0,
-            });
 
-            // Reviewer sub-run
+            let prod_config = SubRunConfig {
+                run_id: prod_run_id.clone(),
+                agent_profile: producer_profile.clone(),
+                task: request.task.clone(),
+                session_id: request.context.get("session_id").and_then(|v| v.as_str()).unwrap_or("delegation").to_string(),
+                user_id: request.user_id.clone(),
+                previous_output: last_producer_output.clone(),
+                context: request.context.clone(),
+            };
+            let prod_result = match self.executor.execute(prod_config).await {
+                Ok(r) => {
+                    let _ = self.run_engine.persist_status(&prod_run_id, &r.status, None, r.error.as_deref()).await;
+                    r
+                }
+                Err(e) => {
+                    let _ = self.run_engine.persist_status(&prod_run_id, "failed", None, Some(&e)).await;
+                    AgentResult {
+                        agent_id: producer_id.to_string(), run_id: prod_run_id,
+                        status: "failed".to_string(), output: None, error: Some(e),
+                        prompt_tokens: 0, completion_tokens: 0, tool_calls: 0,
+                    }
+                }
+            };
+            last_producer_output = prod_result.output.clone();
+            results.push(prod_result);
+
+            // ── Reviewer sub-run ──
             let rev_run_id = uuid::Uuid::new_v4().to_string();
             self.run_engine
                 .start_run(&rev_run_id, &request.user_id, &rev_run_id)
@@ -377,7 +591,7 @@ impl DelegationEngine {
                 })
                 .await;
             self.run_engine
-                .persist_status(&rev_run_id, "waiting", Some("review"), None)
+                .persist_status(&rev_run_id, "running", Some("review"), None)
                 .await?;
             self.run_engine
                 .append_event(
@@ -385,16 +599,31 @@ impl DelegationEngine {
                     serde_json::json!({"event_type": "adversarial_round", "data": {"round": round, "role": "reviewer"}}),
                 )
                 .await?;
-            results.push(AgentResult {
-                agent_id: reviewer_id.to_string(),
-                run_id: rev_run_id,
-                status: "waiting".to_string(),
-                output: None,
-                error: None,
-                prompt_tokens: 0,
-                completion_tokens: 0,
-                tool_calls: 0,
-            });
+
+            let rev_config = SubRunConfig {
+                run_id: rev_run_id.clone(),
+                agent_profile: reviewer_profile.clone(),
+                task: format!("Review this output:\n\n{}", last_producer_output.as_deref().unwrap_or("[no output]")),
+                session_id: request.context.get("session_id").and_then(|v| v.as_str()).unwrap_or("delegation").to_string(),
+                user_id: request.user_id.clone(),
+                previous_output: last_producer_output.clone(),
+                context: request.context.clone(),
+            };
+            let rev_result = match self.executor.execute(rev_config).await {
+                Ok(r) => {
+                    let _ = self.run_engine.persist_status(&rev_run_id, &r.status, None, r.error.as_deref()).await;
+                    r
+                }
+                Err(e) => {
+                    let _ = self.run_engine.persist_status(&rev_run_id, "failed", None, Some(&e)).await;
+                    AgentResult {
+                        agent_id: reviewer_id.to_string(), run_id: rev_run_id,
+                        status: "failed".to_string(), output: None, error: Some(e),
+                        prompt_tokens: 0, completion_tokens: 0, tool_calls: 0,
+                    }
+                }
+            };
+            results.push(rev_result);
         }
 
         Ok(DelegationResult::from_results(
@@ -528,11 +757,15 @@ mod tests {
 
         assert_eq!(result.agent_results.len(), 2);
         assert_eq!(result.delegation_id, "del-1");
+        // Stub executor marks runs as completed
+        assert_eq!(result.status, "completed");
 
-        // Verify sub-runs were created in engine
+        // Verify sub-runs were created in engine with final status
         for ar in &result.agent_results {
+            assert_eq!(ar.status, "completed");
+            assert!(ar.output.is_some());
             let run = engine.load_run(&ar.run_id).await.unwrap().unwrap();
-            assert_eq!(run.status, "waiting");
+            assert_eq!(run.status, "completed");
         }
 
         // Verify tracker has the records
@@ -719,5 +952,334 @@ mod tests {
         assert_eq!(subs_b.len(), 1);
         assert_eq!(subs_a[0].agent_id, "coder");
         assert_eq!(subs_b[0].agent_id, "reviewer");
+    }
+
+    // ─── Custom executor for testing ────────────────────────────────────────
+
+    /// Test executor that echoes the task back with agent_id prefix.
+    struct EchoExecutor;
+
+    #[async_trait]
+    impl SubRunExecutor for EchoExecutor {
+        async fn execute(&self, config: SubRunConfig) -> Result<AgentResult, String> {
+            let output = if let Some(prev) = &config.previous_output {
+                format!("[{}] {}: prev={}", config.agent_profile.agent_id, config.task, prev)
+            } else {
+                format!("[{}] {}", config.agent_profile.agent_id, config.task)
+            };
+            Ok(AgentResult {
+                agent_id: config.agent_profile.agent_id,
+                run_id: config.run_id,
+                status: "completed".to_string(),
+                output: Some(output),
+                error: None,
+                prompt_tokens: 10,
+                completion_tokens: 20,
+                tool_calls: 1,
+            })
+        }
+    }
+
+    /// Test executor that fails for specific agents.
+    struct FailingExecutor {
+        fail_agents: Vec<String>,
+    }
+
+    #[async_trait]
+    impl SubRunExecutor for FailingExecutor {
+        async fn execute(&self, config: SubRunConfig) -> Result<AgentResult, String> {
+            if self.fail_agents.contains(&config.agent_profile.agent_id) {
+                Ok(AgentResult {
+                    agent_id: config.agent_profile.agent_id,
+                    run_id: config.run_id,
+                    status: "failed".to_string(),
+                    output: None,
+                    error: Some("intentional test failure".to_string()),
+                    prompt_tokens: 5,
+                    completion_tokens: 0,
+                    tool_calls: 0,
+                })
+            } else {
+                Ok(AgentResult {
+                    agent_id: config.agent_profile.agent_id.clone(),
+                    run_id: config.run_id,
+                    status: "completed".to_string(),
+                    output: Some(format!("[{}] done", config.agent_profile.agent_id)),
+                    error: None,
+                    prompt_tokens: 10,
+                    completion_tokens: 20,
+                    tool_calls: 1,
+                })
+            }
+        }
+    }
+
+    fn setup_with_executor(executor: Arc<dyn SubRunExecutor>) -> (
+        Arc<RwLock<AgentProfileRegistry>>,
+        Arc<RunEngine>,
+        Arc<DelegationTracker>,
+        DelegationEngine,
+    ) {
+        let (reg, engine, tracker) = setup();
+        let de = DelegationEngine::with_executor(
+            reg.clone(), engine.clone(), tracker.clone(), executor,
+        );
+        (reg, engine, tracker, de)
+    }
+
+    #[tokio::test]
+    async fn fan_out_executes_with_custom_executor() {
+        let (_, engine, tracker, de) = setup_with_executor(Arc::new(EchoExecutor));
+
+        let req = fan_out_request(vec!["coder", "reviewer"]);
+        let result = de.execute(req, "orch").await.unwrap();
+
+        assert_eq!(result.status, "completed");
+        assert_eq!(result.agent_results.len(), 2);
+
+        // Both agents should have executed and produced output
+        for ar in &result.agent_results {
+            assert_eq!(ar.status, "completed");
+            assert!(ar.output.as_ref().unwrap().contains("test task"));
+            assert_eq!(ar.prompt_tokens, 10);
+            assert_eq!(ar.completion_tokens, 20);
+            assert_eq!(ar.tool_calls, 1);
+        }
+
+        // Token aggregation
+        assert_eq!(result.total_prompt_tokens, 20);
+        assert_eq!(result.total_completion_tokens, 40);
+        assert_eq!(result.total_tool_calls, 2);
+
+        // Engine persisted final status
+        for ar in &result.agent_results {
+            let run = engine.load_run(&ar.run_id).await.unwrap().unwrap();
+            assert_eq!(run.status, "completed");
+        }
+
+        // Tracker recorded hierarchy
+        let subs = tracker.get_sub_runs("del-1").await;
+        assert_eq!(subs.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn sequential_passes_output_to_next_stage() {
+        let (_, _, _, de) = setup_with_executor(Arc::new(EchoExecutor));
+
+        let req = DelegationRequest {
+            delegation_id: "del-pipe".into(),
+            parent_run_id: "p".into(),
+            task: "build code".into(),
+            pattern: CoordinationPattern::Pipeline {
+                stages: vec![
+                    PipelineStage {
+                        agent_id: "coder".into(),
+                        output_transform: None,
+                    },
+                    PipelineStage {
+                        agent_id: "reviewer".into(),
+                        output_transform: None,
+                    },
+                ],
+            },
+            user_id: "u".into(),
+            depth: 0,
+            context: HashMap::new(),
+        };
+
+        let result = de.execute(req, "orch").await.unwrap();
+        assert_eq!(result.agent_results.len(), 2);
+
+        // First stage has no previous_output
+        let first = &result.agent_results[0];
+        assert_eq!(first.agent_id, "coder");
+        assert!(!first.output.as_ref().unwrap().contains("prev="));
+
+        // Second stage receives first stage's output
+        let second = &result.agent_results[1];
+        assert_eq!(second.agent_id, "reviewer");
+        assert!(second.output.as_ref().unwrap().contains("prev="));
+        assert!(second.output.as_ref().unwrap().contains("[coder]"));
+    }
+
+    #[tokio::test]
+    async fn sequential_stop_on_success_stops_early() {
+        let (_, _, _, de) = setup_with_executor(Arc::new(EchoExecutor));
+
+        let req = DelegationRequest {
+            delegation_id: "del-early".into(),
+            parent_run_id: "p".into(),
+            task: "find answer".into(),
+            pattern: CoordinationPattern::Sequential {
+                agent_ids: vec!["coder".into(), "reviewer".into(), "writer".into()],
+                stop_on_success: true,
+            },
+            user_id: "u".into(),
+            depth: 0,
+            context: HashMap::new(),
+        };
+
+        let result = de.execute(req, "orch").await.unwrap();
+        // First agent succeeds → stops
+        assert_eq!(result.agent_results.len(), 1);
+        assert_eq!(result.agent_results[0].agent_id, "coder");
+    }
+
+    #[tokio::test]
+    async fn fan_out_partial_failure() {
+        let executor = Arc::new(FailingExecutor {
+            fail_agents: vec!["reviewer".to_string()],
+        });
+        let (_, _, _, de) = setup_with_executor(executor);
+
+        let req = fan_out_request(vec!["coder", "reviewer"]);
+        let result = de.execute(req, "orch").await.unwrap();
+
+        assert_eq!(result.status, "partial");
+        assert_eq!(result.agent_results.len(), 2);
+
+        let coder = result.agent_results.iter().find(|r| r.agent_id == "coder").unwrap();
+        assert_eq!(coder.status, "completed");
+        assert!(coder.output.is_some());
+
+        let reviewer = result.agent_results.iter().find(|r| r.agent_id == "reviewer").unwrap();
+        assert_eq!(reviewer.status, "failed");
+        assert!(reviewer.error.is_some());
+    }
+
+    #[tokio::test]
+    async fn adversarial_executes_all_rounds() {
+        let (_, _, tracker, de) = setup_with_executor(Arc::new(EchoExecutor));
+
+        let req = DelegationRequest {
+            delegation_id: "del-adv".into(),
+            parent_run_id: "p".into(),
+            task: "write code".into(),
+            pattern: CoordinationPattern::AdversarialReview {
+                producer_id: "coder".into(),
+                reviewer_id: "reviewer".into(),
+                max_rounds: 2,
+                acceptance_threshold: 0.8,
+            },
+            user_id: "u".into(),
+            depth: 0,
+            context: HashMap::new(),
+        };
+
+        let result = de.execute(req, "orch").await.unwrap();
+        // 2 rounds × (producer + reviewer) = 4
+        assert_eq!(result.agent_results.len(), 4);
+        assert_eq!(result.status, "completed");
+
+        // All agents produced output
+        for ar in &result.agent_results {
+            assert!(ar.output.is_some());
+        }
+
+        // Token aggregation across all sub-runs
+        assert_eq!(result.total_prompt_tokens, 40);  // 4 × 10
+        assert_eq!(result.total_completion_tokens, 80); // 4 × 20
+
+        let subs = tracker.get_sub_runs("del-adv").await;
+        assert_eq!(subs.len(), 4);
+    }
+
+    #[tokio::test]
+    async fn tracker_get_agent_id_returns_correct_id() {
+        let tracker = DelegationTracker::new();
+        tracker
+            .record_sub_run(SubRunRecord {
+                run_id: "sub-1".into(),
+                parent_run_id: "parent".into(),
+                delegation_id: "d1".into(),
+                agent_id: "coder".into(),
+                depth: 1,
+            })
+            .await;
+
+        assert_eq!(tracker.get_agent_id("sub-1").await, Some("coder".to_string()));
+        assert_eq!(tracker.get_agent_id("parent").await, None);
+        assert_eq!(tracker.get_agent_id("nonexistent").await, None);
+    }
+
+    #[tokio::test]
+    async fn with_executor_constructor_uses_custom_executor() {
+        let (reg, engine, tracker) = setup();
+        let de = DelegationEngine::with_executor(
+            reg, engine, tracker,
+            Arc::new(EchoExecutor),
+        );
+
+        let req = fan_out_request(vec!["coder"]);
+        let result = de.execute(req, "orch").await.unwrap();
+        assert_eq!(result.status, "completed");
+        // EchoExecutor returns prompt_tokens=10
+        assert_eq!(result.total_prompt_tokens, 10);
+    }
+
+    #[tokio::test]
+    async fn sub_run_config_passes_context() {
+        /// Executor that checks context is passed through.
+        struct ContextCheckExecutor;
+
+        #[async_trait]
+        impl SubRunExecutor for ContextCheckExecutor {
+            async fn execute(&self, config: SubRunConfig) -> Result<AgentResult, String> {
+                let has_key = config.context.contains_key("test_key");
+                Ok(AgentResult {
+                    agent_id: config.agent_profile.agent_id,
+                    run_id: config.run_id,
+                    status: "completed".to_string(),
+                    output: Some(format!("context_present={}", has_key)),
+                    error: None,
+                    prompt_tokens: 0, completion_tokens: 0, tool_calls: 0,
+                })
+            }
+        }
+
+        let (reg, engine, tracker) = setup();
+        let de = DelegationEngine::with_executor(
+            reg, engine, tracker, Arc::new(ContextCheckExecutor),
+        );
+
+        let mut ctx = HashMap::new();
+        ctx.insert("test_key".to_string(), serde_json::json!("test_value"));
+
+        let req = DelegationRequest {
+            delegation_id: "ctx-test".into(),
+            parent_run_id: "p".into(),
+            task: "check context".into(),
+            pattern: CoordinationPattern::Sequential {
+                agent_ids: vec!["coder".into()],
+                stop_on_success: false,
+            },
+            user_id: "u".into(),
+            depth: 0,
+            context: ctx,
+        };
+
+        let result = de.execute(req, "orch").await.unwrap();
+        assert_eq!(
+            result.agent_results[0].output.as_deref(),
+            Some("context_present=true")
+        );
+    }
+
+    #[tokio::test]
+    async fn stub_executor_returns_completed() {
+        let executor = StubSubRunExecutor;
+        let config = SubRunConfig {
+            run_id: "r1".into(),
+            agent_profile: AgentProfile::new("test", "Test", AgentTier::User),
+            task: "hello world".into(),
+            session_id: "s1".into(),
+            user_id: "u1".into(),
+            previous_output: None,
+            context: HashMap::new(),
+        };
+
+        let result = executor.execute(config).await.unwrap();
+        assert_eq!(result.status, "completed");
+        assert!(result.output.unwrap().contains("hello world"));
     }
 }

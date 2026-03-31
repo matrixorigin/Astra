@@ -20,15 +20,23 @@ pub(super) async fn delegate_run_handler(
         )
     })?;
 
+    // Resolve the source agent identity from the tracker.
+    // Top-level runs (not sub-runs) default to "orchestrator".
+    let source_agent_id = engine
+        .tracker()
+        .get_agent_id(&run_id)
+        .await
+        .unwrap_or_else(|| "orchestrator".to_string());
+
     // Validate the delegation request against the profile registry.
     engine
-        .validate(&request, &run_id)
+        .validate(&request, &source_agent_id)
         .await
         .map_err(|e| error_response(StatusCode::BAD_REQUEST, e))?;
 
     // Execute the delegation.
     let result = engine
-        .execute(request, &run_id)
+        .execute(request, &source_agent_id)
         .await
         .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
