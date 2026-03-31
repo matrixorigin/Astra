@@ -18,14 +18,14 @@ use mo_agent_runtime::{
     tool_selector,
     turn::boost_domain_hints::domain_hints_from_boost_terms,
     turn::chat_history_openai::openai_messages_from_repl_history,
-    turn::chat_turn_edge_profile::{
-        build_base_edge_profile_value, detect_active_system_skills_in_message, read_git_branch_abbrev,
+    turn::chat_turn_edge_profile::{detect_active_system_skills_in_message, read_git_branch_abbrev},
+    turn::chat_turn_payload::{
+        chat_turn_base_payload, merge_active_skills_into_edge_profile, ChatTurnBasePayloadInput,
     },
-    turn::chat_turn_explain_wire::chat_turn_explain_field_json,
     turn::chat_turn_heuristics::{
         extract_repos_from_memory, factual_tool_retry_message, should_force_factual_tool_retry,
     },
-    turn::edge_prompt_context::{detect_project_languages, detect_workspace_context, make_args_preview},
+    turn::edge_prompt_context::{detect_project_languages, make_args_preview},
     turn::tool_schema_prune::{filter_tool_schemas_by_excluded_names, pin_invoked_tool_schemas},
     turn::headless_tool_assembly::{
         openai_assistant_with_tool_calls_message, take_edge_output_for_tool_call,
@@ -161,30 +161,21 @@ pub(crate) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
         // Track context assembly time
         let assembly_start = Instant::now();
 
-        // Build request payload
+        // Build request payload (invariant top-level keys; tools / tool_results added below).
         let git_branch = read_git_branch_abbrev();
-        let mut payload = serde_json::json!({
-            "messages": messages,
-            "session_id": current_session_id,
-            "model": model,
-            "explain": chat_turn_explain_field_json(
-                matches!(explain, ExplainMode::Verbose),
-                matches!(explain, ExplainMode::On),
-            ),
-            "edge_executor_id": edge_executor_instance_id(),
-            "capabilities": mo_thin_client::builtin_capability_preset(),
-            "edge_profile": build_base_edge_profile_value(
-                project_root.to_string_lossy().as_ref(),
-                git_branch,
-                detect_workspace_context(&project_root),
-            ),
+        let mut payload = chat_turn_base_payload(ChatTurnBasePayloadInput {
+            messages: &messages,
+            session_id: current_session_id.as_deref(),
+            model,
+            explain_verbose: matches!(explain, ExplainMode::Verbose),
+            explain_on: matches!(explain, ExplainMode::On),
+            edge_executor_id: edge_executor_instance_id(),
+            capabilities: mo_thin_client::builtin_capability_preset(),
+            project_root: &project_root,
+            git_branch,
         });
-        // Detect active system skills from skill instruction block in the message
-        // and pass them as edge_profile hints so the server system prompt can reference them.
         let active_skills = detect_active_system_skills_in_message(message);
-        if !active_skills.is_empty() {
-            payload["edge_profile"]["active_skills"] = serde_json::json!(active_skills);
-        }
+        merge_active_skills_into_edge_profile(&mut payload, &active_skills);
         // NOTE: Skill instructions are now injected after tool selection (see below)
         // when LLM-based selection chooses a skill.
         

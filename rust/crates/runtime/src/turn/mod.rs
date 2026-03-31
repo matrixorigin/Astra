@@ -9,6 +9,7 @@ pub mod cache;
 pub mod chat_history_openai;
 pub mod chat_turn_edge_profile;
 pub mod chat_turn_explain_wire;
+pub mod chat_turn_payload;
 pub mod chat_turn_heuristics;
 pub mod cloud;
 pub mod cloud_approval_policy;

@@ -1,7 +1,7 @@
 # Multi-Agent Cloud Runtime Architecture
 
 > **Status**: Living Design Document  
-> **Version**: 1.4.9 (Phase 0 partial: memory boost-term merge helpers in `retrieval`; headless SSE loop still in CLI `chat_stream/`)  
+> **Version**: 1.4.10 (Phase 0 partial: `/chat` base payload skeleton in `chat_turn_payload`; headless SSE loop still in CLI `chat_stream/`)  
 > **Scope**: Edge-cloud state management, multi-agent orchestration, and cloud-scale execution  
 > **Audience**: Core contributors, architecture reviewers
 
@@ -263,7 +263,7 @@ The graph is correct (no cycles), but `mo-agent` being the **only crate that can
 
 ### 4.3 What's Solid and Should Not Change
 
-- **Phase 0 progress (v1.4.9)**: same as v1.4.8, plus **`merge_boost_terms_unique`** / **`append_boost_terms_from_ranked_memory`** (`retrieval`) for memory-augmented selector boost terms. Remaining: move the multi-turn loop body to a server handler; **`ReplState`** / **`AppState`** infra largely converged on **`MatrixCloudRuntime`**.
+- **Phase 0 progress (v1.4.10)**: same as v1.4.9, plus **`chat_turn_base_payload`** / **`ChatTurnBasePayloadInput`** and **`merge_active_skills_into_edge_profile`** (`turn/chat_turn_payload.rs`). Remaining: move the multi-turn loop body to a server handler; **`ReplState`** / **`AppState`** infra largely converged on **`MatrixCloudRuntime`**.
 - **Local-first journal**: Append-only JSONL is the correct foundation. Fast, crash-safe, auditable.
 - **Sync envelope state machine**: Clean→Dirty→Syncing→Conflict is correct. Extend, don't replace.
 - **DomainAdapter trait**: The trait signature is well-designed. **Learning, Events, Tasks, Templates, and Preferences** now have real [`runtime::sync_adapters`](../../rust/crates/runtime/src/sync_adapters.rs) implementations (see §6.2.1); residual “stub” language in older sections is obsolete for those domains.
@@ -1749,12 +1749,13 @@ mo-agent Orchestrator
 | Extract response-guard policy + pin invoked tool schemas | ✅ Done (slice 14) | Small | **`turn/response_guard.rs`** (`apply_response_guards`); **`tool_schema_prune::pin_invoked_tool_schemas`**; CLI `sse_loop` |
 | Extract OpenAI assistant message with `tool_calls` (server vs edge round) | ✅ Done (slice 15) | Small | **`headless_tool_assembly`**: `openai_assistant_with_tool_calls_message`, `EdgeToolRoundRow::assistant_tool_call_id`; CLI `sse_loop` + `stream_render` |
 | Extract memory-augmented boost-term merge (ranked memory → terms) | ✅ Done (slice 16) | Tiny | **`retrieval`**: `merge_boost_terms_unique`, `append_boost_terms_from_ranked_memory`; CLI `sse_loop` |
+| Extract `/chat` base JSON payload (messages, session, model, explain, executor, capabilities, `edge_profile` base, active_skills) | ✅ Done (slice 17) | Small | **`turn/chat_turn_payload.rs`**: `ChatTurnBasePayloadInput`, `chat_turn_base_payload`, `merge_active_skills_into_edge_profile`; CLI `sse_loop` |
 | Implement tool execution callback protocol (cloud → edge) | ✅ Core path | Medium | §5.5 `/tools/result`, `tool_request` SSE; `chat_stream` **does not** re-execute tools for that path. |
 | Add `edge_executor_id` to chat turn protocol | ✅ | Small | Thin client + §5.5.2 light edge helpers. |
 | Move `SyncOrchestrator` construction from `ReplState` to `AppState` | ✅ Done | — | **`MatrixCloudRuntime`** bundles `SharedPool` + `IngestionSender` + `SyncOrchestrator`; `ReplState` / `AppState` hold `Option<Arc<MatrixCloudRuntime>>` only (no separate orchestrator field) |
 | Move `IngestionSender` from `ReplState` to server pipeline | ✅ Done | — | Same bundle as row above; journal flush via `enqueue_journal_events` |
 | Remove `matrixone_pool` from `ReplState` (use server `shared_pool`) | ✅ Done | — | Superseded by `MatrixCloudRuntime::shared_pool()`; no `matrixone_pool` field on `ReplState` |
-| Refactor `chat_stream/`: cognitive loop → `runtime`, rendering stays CLI | 🟡 In progress | Large | **Slices 1–16** + **`chat_stream/` submodule split**. Remaining: move main loop body to server; `consume_turn_sse` + `bridge_inprocess` convergence |
+| Refactor `chat_stream/`: cognitive loop → `runtime`, rendering stays CLI | 🟡 In progress | Large | **Slices 1–17** + **`chat_stream/` submodule split**. Remaining: move main loop body to server; `consume_turn_sse` + `bridge_inprocess` convergence |
 
 **Success criteria** (unchanged): `mo-agent` CLI can be deleted and replaced with a ~500-line thin client; **not yet met** — `chat_stream` + `ReplState` infra fields remain.
 
@@ -1869,6 +1870,7 @@ mo-agent Orchestrator
 | Chat turn edge profile | `runtime/src/turn/chat_turn_edge_profile.rs` | Git branch, Memoria env, base `edge_profile` JSON, `active_skills` detection | runtime ✅ |
 | Selector → edge hints | `runtime/src/tool_registry/selection_edge_hints.rs` | `apply_selector_hints_to_edge_profile`, `top_unpinned_tool_names_from_report` | runtime ✅ |
 | Chat explain wire | `runtime/src/turn/chat_turn_explain_wire.rs` | `chat_turn_explain_field_json` → `false` / `true` / `"verbose"` | runtime ✅ |
+| Chat turn base payload | `runtime/src/turn/chat_turn_payload.rs` | `chat_turn_base_payload` + `merge_active_skills_into_edge_profile` for `/chat` body before `edge_tools` | runtime ✅ |
 | Compaction → pressure | `runtime/src/prompts/context.rs` | `CompactionTier::budget_pressure` (0.0 / 0.3 / 0.6 / 0.9) | runtime ✅ |
 | Tool result semantics | `runtime/src/turn/tool_result_semantics.rs` | `is_tool_error`, `is_resource_limit_output`, `tool_dedup_signature` (sec. 5.5 SSE vs `tool_call`) | runtime ✅ |
 | Cloud approval policy | `runtime/src/turn/cloud_approval_policy.rs` | `CLOUD_APPROVAL_REQUIRED_TOOLS`, `CLOUD_APPROVAL_EXECUTE_TOOLS`, `cloud_gated_tool_kind` → CLI classify + cloud gate (sec. 5.5) | runtime ✅ |
