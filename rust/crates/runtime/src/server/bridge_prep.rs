@@ -1,5 +1,122 @@
 use super::*;
 
+// ─── Typed request body ──────────────────────────────────────────────────────
+
+/// Typed representation of the incoming chat turn request payload.
+///
+/// All fields use `Option<serde_json::Value>` for defensive deserialization —
+/// if the client sends a field with an unexpected type (e.g., `"messages": 42`),
+/// the whole request still parses correctly instead of failing outright.
+/// Typed accessor methods provide the same safety as manual `.get()?.as_str()?`
+/// chains but with named fields and compile-time discoverability.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub(super) struct ChatTurnRequestBody {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    session_id: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    agent_id: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    messages: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tool_results: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    edge_tools: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    edge_profile: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    project_rules: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    model: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    execution_state: Option<serde_json::Value>,
+    /// Forward-compatible: preserves unknown fields through round-trip.
+    #[serde(flatten)]
+    extra: HashMap<String, serde_json::Value>,
+}
+
+impl ChatTurnRequestBody {
+    fn session_id_str(&self) -> Option<&str> {
+        self.session_id.as_ref()?.as_str()
+    }
+
+    fn has_non_null_session_id(&self) -> bool {
+        self.session_id.as_ref().is_some_and(|v| !v.is_null())
+    }
+
+    fn agent_id_str(&self) -> Option<String> {
+        self.agent_id.as_ref()?.as_str().map(String::from)
+    }
+
+    fn messages_slice(&self) -> &[serde_json::Value] {
+        self.messages
+            .as_ref()
+            .and_then(|v| v.as_array())
+            .map(|a| a.as_slice())
+            .unwrap_or_default()
+    }
+
+    fn has_tool_results(&self) -> bool {
+        self.tool_results
+            .as_ref()
+            .and_then(|v| v.as_array())
+            .is_some_and(|a| !a.is_empty())
+    }
+
+    fn tool_results_slice(&self) -> &[serde_json::Value] {
+        self.tool_results
+            .as_ref()
+            .and_then(|v| v.as_array())
+            .map(|a| a.as_slice())
+            .unwrap_or_default()
+    }
+
+    fn edge_tools_vec(&self) -> Option<&Vec<serde_json::Value>> {
+        self.edge_tools.as_ref()?.as_array()
+    }
+
+    fn set_edge_tools(&mut self, tools: Vec<serde_json::Value>) {
+        self.edge_tools = Some(serde_json::Value::Array(tools));
+    }
+
+    fn set_session_id(&mut self, id: &str) {
+        self.session_id = Some(serde_json::Value::String(id.to_string()));
+    }
+
+    fn model_str(&self) -> Option<&str> {
+        self.model.as_ref()?.as_str()
+    }
+
+    fn execution_state_obj(&self) -> Option<&serde_json::Map<String, serde_json::Value>> {
+        self.execution_state.as_ref()?.as_object()
+    }
+
+    fn user_query(&self) -> String {
+        extract_latest_user_query(self.messages_slice())
+    }
+
+    fn classify_task(&self) -> Option<String> {
+        let normalized: Vec<_> = self
+            .messages_slice()
+            .iter()
+            .filter_map(serde_json::Value::as_object)
+            .cloned()
+            .collect();
+        classify_task(&normalized)
+    }
+}
+
+// ─── Helpers ─────────────────────────────────────────────────────────────────
+
+/// Extract tool name from an OpenAI-format tool definition.
+///
+/// Handles `{"function": {"name": "bash", ...}}` — the standard format used
+/// in edge_tools arrays. Returns `None` for malformed entries.
+fn extract_tool_name(tool: &serde_json::Value) -> Option<&str> {
+    tool.get("function")?.get("name")?.as_str()
+}
+
+// ─── Prepared result ─────────────────────────────────────────────────────────
+
 pub(super) struct PreparedChatTurnBridgeRequest {
     pub(super) body: Bytes,
     pub(super) trusted_session_id: Option<String>,
@@ -13,91 +130,74 @@ pub(super) struct PreparedChatTurnBridgeRequest {
     pub(super) execution_state_b64: Option<String>,
 }
 
+impl PreparedChatTurnBridgeRequest {
+    /// Create a passthrough result for unparseable or non-object payloads.
+    fn passthrough(body: Bytes) -> Self {
+        Self {
+            body,
+            trusted_session_id: None,
+            turn_chain_id: None,
+            user_query_event_id: None,
+            tools_changed: None,
+            task_hint: None,
+            user_query_b64: None,
+            routing_meta_b64: None,
+            force_intent: None,
+            execution_state_b64: None,
+        }
+    }
+}
+
 pub(super) async fn prepare_chat_turn_bridge_body(
     state: &AppState,
     user: &AuthUserRecord,
     body: Bytes,
 ) -> Result<PreparedChatTurnBridgeRequest, (StatusCode, Json<ErrorResponse>)> {
-    let Ok(mut payload) = serde_json::from_slice::<serde_json::Value>(&body) else {
-        return Ok(PreparedChatTurnBridgeRequest {
-            body,
-            trusted_session_id: None,
-            turn_chain_id: None,
-            user_query_event_id: None,
-            tools_changed: None,
-            task_hint: None,
-            user_query_b64: None,
-            routing_meta_b64: None,
-            force_intent: None,
-            execution_state_b64: None,
-        });
-    };
-    let Some(object) = payload.as_object_mut() else {
-        return Ok(PreparedChatTurnBridgeRequest {
-            body,
-            trusted_session_id: None,
-            turn_chain_id: None,
-            user_query_event_id: None,
-            tools_changed: None,
-            task_hint: None,
-            user_query_b64: None,
-            routing_meta_b64: None,
-            force_intent: None,
-            execution_state_b64: None,
-        });
+    let Ok(mut request) = serde_json::from_slice::<ChatTurnRequestBody>(&body) else {
+        return Ok(PreparedChatTurnBridgeRequest::passthrough(body));
     };
 
-    let (trusted_session_id, trusted_session_created_at) = if let Some(session_id) = object
-        .get("session_id")
-        .and_then(serde_json::Value::as_str)
-        .map(ToString::to_string)
-    {
-        let session = state
-            .session_service
-            .get_session(session_id.clone(), user.user_id.clone())
-            .await
-            .map_err(normalize_chat_turn_session_error)?;
-        (
-            Some(session_id),
-            normalize_session_created_at_for_bridge(&session.created_at),
-        )
-    } else if object
-        .get("session_id")
-        .is_some_and(|value| !value.is_null())
-    {
-        (None, None)
-    } else {
-        let agent_id = object
-            .get("agent_id")
-            .and_then(serde_json::Value::as_str)
-            .map(ToString::to_string);
-        let metadata = agent_id.as_ref().map(|agent_id| {
-            serde_json::Map::from_iter([(
-                "agent_id".to_string(),
-                serde_json::Value::String(agent_id.clone()),
-            )])
-        });
-        let session = state
-            .session_service
-            .create_session(
-                user.user_id.clone(),
-                SessionCreateRequestData {
-                    agent_id,
-                    title: None,
-                    metadata,
-                },
+    // ── Session resolution ──────────────────────────────────────────────
+    let (trusted_session_id, trusted_session_created_at) =
+        if let Some(session_id) = request.session_id_str().map(String::from) {
+            let session = state
+                .session_service
+                .get_session(session_id.clone(), user.user_id.clone())
+                .await
+                .map_err(normalize_chat_turn_session_error)?;
+            (
+                Some(session_id),
+                normalize_session_created_at_for_bridge(&session.created_at),
             )
-            .await?;
+        } else if request.has_non_null_session_id() {
+            (None, None)
+        } else {
+            let agent_id = request.agent_id_str();
+            let metadata = agent_id.as_ref().map(|agent_id| {
+                serde_json::Map::from_iter([(
+                    "agent_id".to_string(),
+                    serde_json::Value::String(agent_id.clone()),
+                )])
+            });
+            let session = state
+                .session_service
+                .create_session(
+                    user.user_id.clone(),
+                    SessionCreateRequestData {
+                        agent_id,
+                        title: None,
+                        metadata,
+                    },
+                )
+                .await?;
 
-        let created_session_id = session.session_id;
-        let created_session_created_at =
-            normalize_session_created_at_for_bridge(&session.created_at);
-        object.insert(
-            "session_id".to_string(),
-            serde_json::Value::String(created_session_id.clone()),
-        );
-        (Some(created_session_id), created_session_created_at)
-    };
+            let created_session_id = session.session_id;
+            let created_session_created_at =
+                normalize_session_created_at_for_bridge(&session.created_at);
+            request.set_session_id(&created_session_id);
+            (Some(created_session_id), created_session_created_at)
+        };
+
     if let (Some(session_id), Some(created_at)) = (
         trusted_session_id.as_deref(),
         trusted_session_created_at.as_deref(),
@@ -105,74 +205,47 @@ pub(super) async fn prepare_chat_turn_bridge_body(
         seed_bridge_session_created_at(state, session_id, created_at).await;
     }
 
-    let (turn_chain_id, user_query_event_id) = if let (Some(session_id), Some(messages)) = (
-        trusted_session_id.as_deref(),
-        object.get("messages").and_then(serde_json::Value::as_array),
-    ) {
-        let has_tool_results = object
-            .get("tool_results")
-            .and_then(serde_json::Value::as_array)
-            .is_some_and(|results| !results.is_empty());
-        let (turn_chain_id, user_query_event_id) =
+    // ── Turn identifiers ────────────────────────────────────────────────
+    let (turn_chain_id, user_query_event_id) = if let Some(session_id) =
+        trusted_session_id.as_deref()
+    {
+        let messages = request.messages_slice();
+        let has_tool_results = request.has_tool_results();
+        let (chain_id, event_id) =
             prepare_chat_turn_bridge_identifiers(state, session_id, messages, has_tool_results)
                 .await;
-        (Some(turn_chain_id), Some(user_query_event_id))
+        (Some(chain_id), Some(event_id))
     } else {
         (None, None)
     };
 
+    // ── Cached inputs + tool trimming ───────────────────────────────────
     let tools_changed = if let Some(session_id) = trusted_session_id.as_deref() {
-        Some(prepare_chat_turn_bridge_cached_inputs(state, session_id, object).await)
+        Some(prepare_chat_turn_bridge_cached_inputs(state, session_id, &mut request).await)
     } else {
         None
     };
-    let user_query = object
-        .get("messages")
-        .and_then(serde_json::Value::as_array)
-        .map(|messages| extract_latest_user_query(messages))
-        .unwrap_or_default();
-    // Tool selection is now handled client-side by ToolRegistry.
-    // The server trusts the client's pre-selected tool set.
-    trim_edge_tools_for_result_turn(object, &user_query);
-    let task_hint = object
-        .get("messages")
-        .and_then(serde_json::Value::as_array)
-        .map(|messages| {
-            let normalized = messages
-                .iter()
-                .filter_map(serde_json::Value::as_object)
-                .cloned()
-                .collect::<Vec<_>>();
-            classify_task(&normalized)
-        })
-        .unwrap_or(None);
-    let user_query_b64 = Some(URL_SAFE.encode(user_query.as_bytes()));
-    let routing_meta_b64 = object
-        .get("model")
-        .and_then(serde_json::Value::as_str)
-        .map(|_| {
-            let meta = serde_json::Value::Object(build_skipped_routing_metadata("model_override"));
-            URL_SAFE.encode(serde_json::to_string(&meta).unwrap_or_default().as_bytes())
-        });
-    let force_intent = detect_correction(&user_query).then_some("question".to_string());
-    let request_execution_state = object
-        .get("execution_state")
-        .and_then(serde_json::Value::as_object);
-    // Tool selection is client-side; server passes through.
-    // Execution state only needed if client sent one.
-    let execution_state_b64 = request_execution_state
-        .is_some()
-        .then(|| {
-            request_execution_state
-                .map(normalize_execution_state)
-                .unwrap_or_else(|| normalize_execution_state(&serde_json::Map::new()))
-        })
-        .filter(|execution_state| !execution_state.is_empty())
-        .map(|execution_state| {
-            URL_SAFE.encode(serde_json::to_string(&execution_state).unwrap_or_default())
-        });
 
-    serde_json::to_vec(&payload)
+    let user_query = request.user_query();
+    // Tool selection is client-side; server trusts pre-selected set.
+    trim_edge_tools_for_result_turn(&mut request, &user_query);
+
+    // ── Metadata extraction ─────────────────────────────────────────────
+    let task_hint = request.classify_task();
+    let user_query_b64 = Some(URL_SAFE.encode(user_query.as_bytes()));
+    let routing_meta_b64 = request.model_str().map(|_| {
+        let meta = serde_json::Value::Object(build_skipped_routing_metadata("model_override"));
+        URL_SAFE.encode(serde_json::to_string(&meta).unwrap_or_default().as_bytes())
+    });
+    let force_intent = detect_correction(&user_query).then_some("question".to_string());
+    let execution_state_b64 = request
+        .execution_state_obj()
+        .map(normalize_execution_state)
+        .filter(|es| !es.is_empty())
+        .map(|es| URL_SAFE.encode(serde_json::to_string(&es).unwrap_or_default()));
+
+    // ── Serialize mutated payload ───────────────────────────────────────
+    serde_json::to_vec(&request)
         .map(Bytes::from)
         .map(|body| PreparedChatTurnBridgeRequest {
             body,
@@ -267,7 +340,7 @@ async fn prepare_chat_turn_bridge_identifiers(
 async fn prepare_chat_turn_bridge_cached_inputs(
     state: &AppState,
     session_id: &str,
-    object: &mut serde_json::Map<String, serde_json::Value>,
+    request: &mut ChatTurnRequestBody,
 ) -> bool {
     let now = current_unix_seconds();
     let mut cache = state.chat_turn_bridge_cache.lock().await;
@@ -277,83 +350,88 @@ async fn prepare_chat_turn_bridge_cached_inputs(
         .and_then(serde_json::Value::as_array)
         .cloned();
 
-    let tools_changed = if let Some(edge_tools) = object
-        .get("edge_tools")
-        .and_then(serde_json::Value::as_array)
-        .cloned()
-    {
+    let tools_changed = if let Some(edge_tools) = request.edge_tools_vec().cloned() {
         let changed = cached_tools
             .as_ref()
             .is_some_and(|cached| !same_tool_names(cached, &edge_tools));
-        entry.insert("tools".to_string(), serde_json::Value::Array(edge_tools));
+        entry.insert(
+            "tools".to_string(),
+            serde_json::Value::Array(edge_tools),
+        );
         changed
     } else if let Some(cached_tools) = cached_tools {
-        object.insert(
-            "edge_tools".to_string(),
-            serde_json::Value::Array(cached_tools.clone()),
-        );
+        request.set_edge_tools(cached_tools);
         false
     } else {
         false
     };
 
-    sync_cached_bridge_field(&mut entry, object, "project_rules");
-    sync_cached_bridge_field(&mut entry, object, "edge_profile");
-    inject_bridge_cache_state(&entry, object);
+    sync_opt_field_with_cache(&mut entry, "project_rules", &mut request.project_rules);
+    sync_opt_field_with_cache(&mut entry, "edge_profile", &mut request.edge_profile);
+    inject_bridge_cache_state_into(&entry, request);
 
     cache.insert(session_id.to_string(), entry, now);
     tools_changed
 }
 
-fn trim_edge_tools_for_result_turn(
-    object: &mut serde_json::Map<String, serde_json::Value>,
-    user_query: &str,
-) {
-    let tool_result_names = object
-        .get("tool_results")
-        .and_then(serde_json::Value::as_array)
-        .map(|tool_results| {
-            tool_results
-                .iter()
-                .map(|tool_result| tool_result.get("name").and_then(serde_json::Value::as_str))
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    let Some(edge_tools) = object
-        .get("edge_tools")
-        .and_then(serde_json::Value::as_array)
-        .cloned()
-    else {
+fn trim_edge_tools_for_result_turn(request: &mut ChatTurnRequestBody, user_query: &str) {
+    let tool_result_names: Vec<Option<&str>> = request
+        .tool_results_slice()
+        .iter()
+        .map(|tr| tr.get("name").and_then(serde_json::Value::as_str))
+        .collect();
+    let Some(edge_tools) = request.edge_tools_vec().cloned() else {
         return;
     };
-    let available_tool_names = edge_tools
+    let available_tool_names: Vec<&str> = edge_tools
         .iter()
-        .filter_map(|tool| {
-            tool.get("function")
-                .and_then(|function| function.get("name"))
-                .and_then(serde_json::Value::as_str)
-        })
-        .collect::<Vec<_>>();
+        .filter_map(extract_tool_name)
+        .collect();
     let Some(subset_names) =
         plan_tool_subset_for_result_turn(&tool_result_names, user_query, &available_tool_names)
     else {
         return;
     };
-    let filtered_edge_tools = edge_tools
+    let filtered = edge_tools
         .into_iter()
         .filter(|tool| {
-            tool.get("function")
-                .and_then(|function| function.get("name"))
-                .and_then(serde_json::Value::as_str)
+            extract_tool_name(tool)
                 .is_some_and(|name| subset_names.iter().any(|candidate| candidate == name))
         })
-        .collect::<Vec<_>>();
-    object.insert(
-        "edge_tools".to_string(),
-        serde_json::Value::Array(filtered_edge_tools),
-    );
+        .collect();
+    request.set_edge_tools(filtered);
 }
 
+/// Sync a typed `Option<Value>` field with a cache entry.
+///
+/// If the field has a non-null value, it's written to the cache.
+/// If the field is absent/null but the cache has a value, it's restored.
+fn sync_opt_field_with_cache(
+    cache_entry: &mut serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    field: &mut Option<serde_json::Value>,
+) {
+    if let Some(value) = field.as_ref().filter(|v| !v.is_null()) {
+        cache_entry.insert(key.to_string(), value.clone());
+    } else if let Some(cached) = cache_entry.get(key).cloned() {
+        *field = Some(cached);
+    }
+}
+
+/// Inject normalized bridge cache state into a typed request body.
+fn inject_bridge_cache_state_into(
+    entry: &serde_json::Map<String, serde_json::Value>,
+    request: &mut ChatTurnRequestBody,
+) {
+    if let Some(bridge_cache_state) = normalize_bridge_cache_entry(entry) {
+        request.extra.insert(
+            "bridge_cache_state".to_string(),
+            serde_json::Value::Object(bridge_cache_state),
+        );
+    }
+}
+
+#[cfg(test)]
 fn sync_cached_bridge_field(
     entry: &mut serde_json::Map<String, serde_json::Value>,
     object: &mut serde_json::Map<String, serde_json::Value>,
@@ -366,6 +444,7 @@ fn sync_cached_bridge_field(
     }
 }
 
+#[cfg(test)]
 fn inject_bridge_cache_state(
     entry: &serde_json::Map<String, serde_json::Value>,
     object: &mut serde_json::Map<String, serde_json::Value>,
@@ -383,12 +462,8 @@ fn same_tool_names(left: &[serde_json::Value], right: &[serde_json::Value]) -> b
     fn names(tools: &[serde_json::Value]) -> Vec<String> {
         let mut names = tools
             .iter()
-            .filter_map(|tool| {
-                tool.get("function")
-                    .and_then(|function| function.get("name"))
-                    .and_then(serde_json::Value::as_str)
-                    .map(ToString::to_string)
-            })
+            .filter_map(extract_tool_name)
+            .map(String::from)
             .collect::<Vec<_>>();
         names.sort();
         names.dedup();
@@ -690,97 +765,299 @@ mod tests {
 
     // ── trim_edge_tools_for_result_turn ─────────────────────────────
 
+    /// Helper to build a ChatTurnRequestBody from a Map for testing.
+    fn request_from_map(map: serde_json::Map<String, serde_json::Value>) -> ChatTurnRequestBody {
+        serde_json::from_value(serde_json::Value::Object(map)).unwrap_or_default()
+    }
+
     #[test]
     fn trim_no_tool_results_returns_early() {
-        let mut object = serde_json::Map::new();
-        object.insert("edge_tools".to_string(), json!([tool_value("bash")]));
-        let original_tools = object.get("edge_tools").cloned();
+        let mut map = serde_json::Map::new();
+        map.insert("edge_tools".to_string(), json!([tool_value("bash")]));
+        let mut request = request_from_map(map);
+        let original_tools = request.edge_tools_vec().cloned();
 
-        trim_edge_tools_for_result_turn(&mut object, "");
+        trim_edge_tools_for_result_turn(&mut request, "");
 
-        // No tool_results, so edge_tools unchanged
-        assert_eq!(object.get("edge_tools"), original_tools.as_ref());
+        assert_eq!(request.edge_tools_vec().cloned(), original_tools);
     }
 
     #[test]
     fn trim_no_edge_tools_returns_early() {
-        let mut object = serde_json::Map::new();
-        object.insert(
+        let mut map = serde_json::Map::new();
+        map.insert(
             "tool_results".to_string(),
             json!([{"name": "bash", "output": "ok"}]),
         );
+        let mut request = request_from_map(map);
 
-        trim_edge_tools_for_result_turn(&mut object, "");
+        trim_edge_tools_for_result_turn(&mut request, "");
 
-        assert!(object.get("edge_tools").is_none());
+        assert!(request.edge_tools_vec().is_none());
     }
 
     #[test]
-    fn trim_does_not_panic_on_empty_object() {
-        let mut object = serde_json::Map::new();
-        trim_edge_tools_for_result_turn(&mut object, "some query");
+    fn trim_does_not_panic_on_empty_request() {
+        let mut request = ChatTurnRequestBody::default();
+        trim_edge_tools_for_result_turn(&mut request, "some query");
     }
 
     #[test]
     fn trim_with_user_query_skips_filtering() {
-        let mut object = serde_json::Map::new();
-        object.insert(
+        let mut map = serde_json::Map::new();
+        map.insert(
             "tool_results".to_string(),
             json!([{"name": "bash", "output": "ok"}]),
         );
-        object.insert(
+        map.insert(
             "edge_tools".to_string(),
             json!([tool_value("bash"), tool_value("grep")]),
         );
+        let mut request = request_from_map(map);
 
-        trim_edge_tools_for_result_turn(&mut object, "what happened?");
+        trim_edge_tools_for_result_turn(&mut request, "what happened?");
 
-        // Non-empty user_query means plan_tool_subset_for_result_turn returns None,
-        // so edge_tools stays unchanged
-        let tools = object.get("edge_tools").unwrap().as_array().unwrap();
+        let tools = request.edge_tools_vec().unwrap();
         assert_eq!(tools.len(), 2);
     }
 
     #[test]
     fn trim_filters_to_used_tools() {
-        let mut object = serde_json::Map::new();
-        object.insert(
+        let mut map = serde_json::Map::new();
+        map.insert(
             "tool_results".to_string(),
             json!([{"name": "bash", "output": "ok"}]),
         );
-        object.insert(
+        map.insert(
             "edge_tools".to_string(),
             json!([tool_value("bash"), tool_value("grep"), tool_value("view")]),
         );
+        let mut request = request_from_map(map);
 
-        trim_edge_tools_for_result_turn(&mut object, "");
+        trim_edge_tools_for_result_turn(&mut request, "");
 
-        let tools = object.get("edge_tools").unwrap().as_array().unwrap();
-        // Only "bash" should remain since it was used in tool_results
+        let tools = request.edge_tools_vec().unwrap();
         assert_eq!(tools.len(), 1);
-        let name = tools[0]
-            .get("function")
-            .unwrap()
-            .get("name")
-            .unwrap()
-            .as_str()
-            .unwrap();
-        assert_eq!(name, "bash");
+        assert_eq!(extract_tool_name(&tools[0]), Some("bash"));
     }
 
     #[test]
     fn trim_empty_tool_results_array_is_no_op() {
-        let mut object = serde_json::Map::new();
-        object.insert("tool_results".to_string(), json!([]));
-        object.insert(
+        let mut map = serde_json::Map::new();
+        map.insert("tool_results".to_string(), json!([]));
+        map.insert(
             "edge_tools".to_string(),
             json!([tool_value("bash"), tool_value("grep")]),
         );
-        let original = object.get("edge_tools").cloned();
+        let original_count = 2;
+        let mut request = request_from_map(map);
 
-        trim_edge_tools_for_result_turn(&mut object, "");
+        trim_edge_tools_for_result_turn(&mut request, "");
 
-        // Empty tool_results → plan_tool_subset returns None → no filtering
-        assert_eq!(object.get("edge_tools"), original.as_ref());
+        assert_eq!(request.edge_tools_vec().unwrap().len(), original_count);
+    }
+
+    // ── ChatTurnRequestBody typed deserialization ────────────────────
+
+    #[test]
+    fn typed_request_round_trip_preserves_all_fields() {
+        let json = json!({
+            "session_id": "sess-123",
+            "agent_id": "agent-1",
+            "messages": [{"role": "user", "content": "hello"}],
+            "tool_results": [{"name": "bash", "output": "ok"}],
+            "edge_tools": [tool_value("bash"), tool_value("grep")],
+            "edge_profile": {"cwd": "/tmp"},
+            "project_rules": {"max_tokens": 1000},
+            "model": "gpt-4",
+            "execution_state": {"pending_tools": []},
+            "custom_field": "preserved"
+        });
+
+        let request: ChatTurnRequestBody = serde_json::from_value(json.clone()).unwrap();
+        let serialized = serde_json::to_value(&request).unwrap();
+
+        assert_eq!(request.session_id_str(), Some("sess-123"));
+        assert_eq!(request.agent_id_str(), Some("agent-1".to_string()));
+        assert_eq!(request.messages_slice().len(), 1);
+        assert!(request.has_tool_results());
+        assert_eq!(request.edge_tools_vec().unwrap().len(), 2);
+        assert_eq!(request.model_str(), Some("gpt-4"));
+        assert!(request.execution_state_obj().is_some());
+
+        // Forward-compat: unknown fields preserved
+        assert_eq!(
+            serialized.get("custom_field").unwrap(),
+            &json!("preserved")
+        );
+    }
+
+    #[test]
+    fn typed_request_empty_json_object() {
+        let request: ChatTurnRequestBody = serde_json::from_str("{}").unwrap();
+        assert!(request.session_id_str().is_none());
+        assert!(!request.has_non_null_session_id());
+        assert!(request.messages_slice().is_empty());
+        assert!(!request.has_tool_results());
+        assert!(request.edge_tools_vec().is_none());
+        assert!(request.model_str().is_none());
+    }
+
+    #[test]
+    fn typed_request_null_session_id() {
+        let request: ChatTurnRequestBody =
+            serde_json::from_str(r#"{"session_id": null}"#).unwrap();
+        assert!(request.session_id_str().is_none());
+        assert!(!request.has_non_null_session_id());
+    }
+
+    #[test]
+    fn typed_request_numeric_session_id_handled() {
+        let request: ChatTurnRequestBody =
+            serde_json::from_str(r#"{"session_id": 42}"#).unwrap();
+        assert!(request.session_id_str().is_none());
+        assert!(request.has_non_null_session_id());
+    }
+
+    #[test]
+    fn typed_request_wrong_type_for_messages() {
+        let request: ChatTurnRequestBody =
+            serde_json::from_str(r#"{"messages": "not-an-array"}"#).unwrap();
+        assert!(request.messages_slice().is_empty());
+    }
+
+    #[test]
+    fn typed_request_set_session_id() {
+        let mut request = ChatTurnRequestBody::default();
+        request.set_session_id("new-sess");
+        assert_eq!(request.session_id_str(), Some("new-sess"));
+    }
+
+    #[test]
+    fn typed_request_set_edge_tools() {
+        let mut request = ChatTurnRequestBody::default();
+        assert!(request.edge_tools_vec().is_none());
+        request.set_edge_tools(vec![tool_value("bash")]);
+        assert_eq!(request.edge_tools_vec().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn typed_request_non_object_json_fails() {
+        assert!(serde_json::from_str::<ChatTurnRequestBody>(r#""hello""#).is_err());
+        assert!(serde_json::from_str::<ChatTurnRequestBody>("42").is_err());
+        assert!(serde_json::from_str::<ChatTurnRequestBody>("[]").is_err());
+        assert!(serde_json::from_str::<ChatTurnRequestBody>("null").is_err());
+    }
+
+    // ── extract_tool_name ───────────────────────────────────────────
+
+    #[test]
+    fn extract_tool_name_standard_format() {
+        assert_eq!(extract_tool_name(&tool_value("bash")), Some("bash"));
+    }
+
+    #[test]
+    fn extract_tool_name_missing_function() {
+        assert_eq!(extract_tool_name(&json!({"type": "custom"})), None);
+    }
+
+    #[test]
+    fn extract_tool_name_missing_name() {
+        assert_eq!(extract_tool_name(&json!({"function": {}})), None);
+    }
+
+    #[test]
+    fn extract_tool_name_non_string_name() {
+        assert_eq!(
+            extract_tool_name(&json!({"function": {"name": 42}})),
+            None
+        );
+    }
+
+    // ── sync_opt_field_with_cache ───────────────────────────────────
+
+    #[test]
+    fn sync_opt_field_writes_to_cache() {
+        let mut entry = serde_json::Map::new();
+        let mut field = Some(json!("rule-value"));
+
+        sync_opt_field_with_cache(&mut entry, "rules", &mut field);
+
+        assert_eq!(entry.get("rules"), Some(&json!("rule-value")));
+        assert_eq!(field, Some(json!("rule-value")));
+    }
+
+    #[test]
+    fn sync_opt_field_restores_from_cache() {
+        let mut entry = serde_json::Map::new();
+        entry.insert("rules".to_string(), json!("cached-value"));
+        let mut field: Option<serde_json::Value> = None;
+
+        sync_opt_field_with_cache(&mut entry, "rules", &mut field);
+
+        assert_eq!(field, Some(json!("cached-value")));
+    }
+
+    #[test]
+    fn sync_opt_field_null_treated_as_absent() {
+        let mut entry = serde_json::Map::new();
+        entry.insert("rules".to_string(), json!("cached-value"));
+        let mut field = Some(serde_json::Value::Null);
+
+        sync_opt_field_with_cache(&mut entry, "rules", &mut field);
+
+        assert_eq!(field, Some(json!("cached-value")));
+    }
+
+    #[test]
+    fn sync_opt_field_neither_has_value() {
+        let mut entry = serde_json::Map::new();
+        let mut field: Option<serde_json::Value> = None;
+
+        sync_opt_field_with_cache(&mut entry, "rules", &mut field);
+
+        assert!(entry.get("rules").is_none());
+        assert!(field.is_none());
+    }
+
+    // ── inject_bridge_cache_state_into ──────────────────────────────
+
+    #[test]
+    fn inject_into_request_adds_bridge_cache_state() {
+        let mut entry = serde_json::Map::new();
+        entry.insert("created_at".to_string(), json!("2024-01-15T10:30:00Z"));
+
+        let mut request = ChatTurnRequestBody::default();
+        inject_bridge_cache_state_into(&entry, &mut request);
+
+        assert!(request.extra.contains_key("bridge_cache_state"));
+        let state = request.extra["bridge_cache_state"].as_object().unwrap();
+        assert!(state.contains_key("created_at"));
+    }
+
+    #[test]
+    fn inject_into_request_empty_entry_is_noop() {
+        let entry = serde_json::Map::new();
+        let mut request = ChatTurnRequestBody::default();
+        inject_bridge_cache_state_into(&entry, &mut request);
+        assert!(!request.extra.contains_key("bridge_cache_state"));
+    }
+
+    // ── passthrough constructor ─────────────────────────────────────
+
+    #[test]
+    fn passthrough_has_all_none_metadata() {
+        let body = Bytes::from_static(b"not-json");
+        let result = PreparedChatTurnBridgeRequest::passthrough(body.clone());
+        assert_eq!(result.body, body);
+        assert!(result.trusted_session_id.is_none());
+        assert!(result.turn_chain_id.is_none());
+        assert!(result.user_query_event_id.is_none());
+        assert!(result.tools_changed.is_none());
+        assert!(result.task_hint.is_none());
+        assert!(result.user_query_b64.is_none());
+        assert!(result.routing_meta_b64.is_none());
+        assert!(result.force_intent.is_none());
+        assert!(result.execution_state_b64.is_none());
     }
 }
