@@ -1,6 +1,7 @@
 use super::*;
 
 use mo_agent_runtime::turn::cloud_approval_policy::{CloudGatedToolKind, cloud_gated_tool_kind};
+use mo_agent_runtime::tool_sandbox::{analyze_command_risks, CommandRisk};
 use mo_agent_runtime::turn::tool_argument_hints::{
     command_hint_from_args, permission_prompt_primary_detail,
 };
@@ -10,6 +11,13 @@ enum SideEffect {
     Read,
     Write,
     Execute,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ExecuteDecision {
+    AllowSilent,
+    Ask,
+    Deny,
 }
 
 pub(super) struct PermissionManager {
@@ -84,17 +92,32 @@ impl PermissionManager {
         }
     }
 
-    fn is_dangerous(name: &str, args: &serde_json::Value) -> bool {
+    fn execute_decision(name: &str, args: &serde_json::Value) -> ExecuteDecision {
         let cmd_str = match cloud_gated_tool_kind(name) {
             Some(CloudGatedToolKind::Execute) => command_hint_from_args(args).unwrap_or(""),
-            _ => return false,
+            _ => return ExecuteDecision::Ask,
         };
         let lower = cmd_str.to_lowercase();
+
+        // Primary signals: AST + heuristic command risks from runtime sandbox.
+        // Hard-deny the highest-risk primitives; everything else falls through to ask/allowlist.
+        let risks = analyze_command_risks(cmd_str);
+        if risks.iter().any(|r| {
+            matches!(
+                r,
+                CommandRisk::PrivilegeEscalation
+                    | CommandRisk::RemoteCodeExecution
+                    | CommandRisk::OutputRedirection
+                    | CommandRisk::Eval
+            )
+        }) {
+            return ExecuteDecision::Deny;
+        }
 
         // Exact substring patterns (original denylist)
         let exact_patterns = ["rm -rf /", ":(){ :|:& };:", "chmod 777 /"];
         if exact_patterns.iter().any(|p| lower.contains(p)) {
-            return true;
+            return ExecuteDecision::Deny;
         }
 
         // Privilege escalation: sudo, doas, pkexec, su -, runuser
@@ -102,18 +125,18 @@ impl PermissionManager {
             .iter()
             .any(|p| lower.contains(p))
         {
-            return true;
+            return ExecuteDecision::Deny;
         }
 
         // Destructive filesystem: rm -rf with paths, find -delete, shred
         if lower.contains("rm -rf") || lower.contains("rm -fr") {
-            return true;
+            return ExecuteDecision::Deny;
         }
         if lower.contains("-delete") && lower.contains("find") {
-            return true;
+            return ExecuteDecision::Deny;
         }
         if lower.contains("shred ") || lower.contains("wipefs") {
-            return true;
+            return ExecuteDecision::Deny;
         }
 
         // Low-level disk: dd, mkfs, fdisk, parted
@@ -121,7 +144,7 @@ impl PermissionManager {
             .iter()
             .any(|p| lower.contains(p))
         {
-            return true;
+            return ExecuteDecision::Deny;
         }
 
         // Pipe to shell interpreter (any variant)
@@ -132,7 +155,7 @@ impl PermissionManager {
             || lower.contains("|sh")
             || lower.contains("|bash")
         {
-            return true;
+            return ExecuteDecision::Deny;
         }
 
         // Command substitution from network (curl/wget piped to eval/sh/bash)
@@ -142,20 +165,28 @@ impl PermissionManager {
                 || lower.contains("`")
                 || lower.contains("$("))
         {
-            return true;
+            return ExecuteDecision::Deny;
         }
 
         // eval/exec with dynamic input
         if lower.starts_with("eval ") || lower.contains("; eval ") || lower.contains("&& eval ") {
-            return true;
+            return ExecuteDecision::Deny;
         }
 
         // Fork bomb variants
         if lower.contains("fork") && lower.contains("bomb") {
-            return true;
+            return ExecuteDecision::Deny;
         }
 
-        false
+        if is_read_only_allowlisted(&lower) {
+            return ExecuteDecision::AllowSilent;
+        }
+
+        ExecuteDecision::Ask
+    }
+
+    fn is_dangerous(name: &str, args: &serde_json::Value) -> bool {
+        matches!(Self::execute_decision(name, args), ExecuteDecision::Deny)
     }
 
     fn format_tool_display(name: &str, args: &serde_json::Value) -> (String, Option<String>) {
@@ -229,11 +260,18 @@ impl PermissionManager {
             return true;
         }
 
-        if Self::is_dangerous(name, args) {
-            eprintln!(
-                "{}",
-                format!("  ✗  DANGEROUS pattern in {name} — denied").red()
-            );
+        if side_effect == SideEffect::Execute {
+            match Self::execute_decision(name, args) {
+                ExecuteDecision::AllowSilent => return true,
+                ExecuteDecision::Deny => {
+                    eprintln!("{}", format!("  ✗  DANGEROUS command in {name} — denied").red());
+                    return false;
+                }
+                ExecuteDecision::Ask => {}
+            }
+        } else if Self::is_dangerous(name, args) {
+            // Belt-and-suspenders (should not trigger for non-execute tools).
+            eprintln!("{}", format!("  ✗  DANGEROUS pattern in {name} — denied").red());
             return false;
         }
 
@@ -264,6 +302,46 @@ impl PermissionManager {
             _ => false,
         }
     }
+}
+
+fn is_read_only_allowlisted(lower_cmd: &str) -> bool {
+    let cmd = lower_cmd.trim();
+    if cmd.is_empty() {
+        return false;
+    }
+
+    // Reject obvious composition primitives: once present, we require an explicit prompt.
+    if cmd.contains('|')
+        || cmd.contains('>')
+        || cmd.contains('<')
+        || cmd.contains("&&")
+        || cmd.contains("||")
+        || cmd.contains(';')
+    {
+        return false;
+    }
+
+    // Minimal allowlist, modeled after Claude Code's "read-only command subsets" idea.
+    // Kept deliberately small to avoid silently allowing write-capable commands.
+    let prefixes = [
+        "git status",
+        "git diff",
+        "git log",
+        "git show",
+        "git rev-parse",
+        "git branch -l",
+        "git branch --list",
+        "rg ",
+        "rg\t",
+        "grep ",
+        "grep\t",
+        "ls",
+        "pwd",
+        "whoami",
+        "uname",
+    ];
+
+    prefixes.iter().any(|p| cmd == *p || cmd.starts_with(p))
 }
 
 #[cfg(test)]
@@ -376,6 +454,35 @@ mod tests {
 
         let cargo = serde_json::json!({"command": "cargo test"});
         assert!(!PermissionManager::is_dangerous("bash", &cargo));
+    }
+
+    #[test]
+    fn execute_allowlist_allows_silently() {
+        let git_status = serde_json::json!({"command": "git status"});
+        assert_eq!(
+            PermissionManager::execute_decision("bash", &git_status),
+            ExecuteDecision::AllowSilent
+        );
+
+        let rg = serde_json::json!({"command": "rg foo src"});
+        assert_eq!(
+            PermissionManager::execute_decision("bash", &rg),
+            ExecuteDecision::AllowSilent
+        );
+    }
+
+    #[test]
+    fn execute_allowlist_rejects_composition_primitives() {
+        let piped = serde_json::json!({"command": "git status | cat"});
+        assert_eq!(
+            PermissionManager::execute_decision("bash", &piped),
+            ExecuteDecision::Ask
+        );
+        let redirected = serde_json::json!({"command": "git status > out.txt"});
+        assert_eq!(
+            PermissionManager::execute_decision("bash", &redirected),
+            ExecuteDecision::Deny
+        );
     }
 
     #[test]
