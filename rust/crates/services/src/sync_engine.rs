@@ -445,6 +445,8 @@ pub enum PushTrigger {
     OnChange,
     /// Push when a specific event occurs (e.g., plan completion).
     OnComplete,
+    /// Domain never pushes (cloud → edge read-only packs).
+    Never,
 }
 
 /// Sync policy for a domain.
@@ -501,7 +503,7 @@ impl SyncPolicy {
     pub fn templates() -> Self {
         Self {
             pull: PullTrigger::SessionStart,
-            push: PushTrigger::OnComplete,
+            push: PushTrigger::Never,
             max_conflict_retries: 2,
             timeout_secs: 5,
             prefer_delta: false,
@@ -1119,6 +1121,12 @@ mod tests {
         let events = SyncPolicy::events();
         assert!(matches!(events.pull, PullTrigger::Never));
         assert!(matches!(events.push, PushTrigger::Batched { .. }));
+
+        let templates = SyncPolicy::templates();
+        assert!(matches!(templates.push, PushTrigger::Never));
+
+        let preferences = SyncPolicy::preferences();
+        assert!(matches!(preferences.push, PushTrigger::OnChange));
     }
 
     #[test]

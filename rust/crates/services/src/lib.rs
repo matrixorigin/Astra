@@ -111,8 +111,8 @@ pub use skill_config::{
 };
 pub use skills::{DatabaseSkillService, SkillRecord, SkillService, UnconfiguredSkillService};
 pub use state_sync::{
-    LocalOnlySyncService, MatrixOneSyncService, StateSyncService, SyncDirection, SyncResult,
-    SyncStatus,
+    LocalOnlySyncService, MatrixOneSyncService, PlanTemplateSyncRow, StateSyncService,
+    SyncDirection, SyncResult, SyncStatus,
 };
 pub use storage::{
     database_user_from_row, ensure_core_schema, log_session_audit, resolve_active_skill_versions,

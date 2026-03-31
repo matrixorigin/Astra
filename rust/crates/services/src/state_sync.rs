@@ -220,6 +220,22 @@ pub struct VersionedSnapshot {
     pub version: i64,
 }
 
+/// One row from `plan_templates`, serialized for edge pull sync.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PlanTemplateSyncRow {
+    pub template_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_id: Option<String>,
+    pub goal_pattern: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_type: Option<String>,
+    pub template_json: String,
+    pub success_rate: f32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub avg_completion_time: Option<i32>,
+    pub use_count: i32,
+}
+
 /// Delta snapshot containing only changed data since last sync.
 ///
 /// Used for incremental sync to reduce network bandwidth.
@@ -355,6 +371,9 @@ pub trait StateSyncService: Send + Sync {
     /// Pull all preferences for a user.
     async fn pull_all_preferences(&self, user_id: &str) -> Result<Vec<(String, String)>, String>;
 
+    /// JSON array of [`PlanTemplateSyncRow`] for the user plus global rows (`user_id IS NULL`).
+    async fn pull_plan_templates_pack(&self, user_id: &str) -> Result<String, String>;
+
     /// Push a delta snapshot containing only changed data.
     ///
     /// Delta sync reduces bandwidth by ~90%: full snapshot is ~40KB, delta is 2-5KB.
@@ -421,6 +440,10 @@ impl StateSyncService for LocalOnlySyncService {
 
     async fn pull_all_preferences(&self, _user_id: &str) -> Result<Vec<(String, String)>, String> {
         Ok(Vec::new())
+    }
+
+    async fn pull_plan_templates_pack(&self, _user_id: &str) -> Result<String, String> {
+        Ok("[]".to_string())
     }
 
     async fn push_delta(
@@ -892,6 +915,61 @@ impl StateSyncService for MatrixOneSyncService {
         Ok(prefs)
     }
 
+    async fn pull_plan_templates_pack(&self, user_id: &str) -> Result<String, String> {
+        let rows = sqlx::query(
+            "SELECT template_id, user_id, goal_pattern, project_type, template_json, \
+             success_rate, avg_completion_time, use_count \
+             FROM plan_templates \
+             WHERE user_id = ? OR user_id IS NULL \
+             ORDER BY updated_at DESC \
+             LIMIT 5000",
+        )
+        .bind(user_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| format!("pull_plan_templates_pack: {e}"))?;
+
+        use sqlx::Row;
+        let mut items: Vec<PlanTemplateSyncRow> = Vec::with_capacity(rows.len());
+        for row in rows {
+            let template_id: String = row
+                .try_get("template_id")
+                .map_err(|e| format!("pull_plan_templates_pack template_id: {e}"))?;
+            let user_id_col: Option<String> = row
+                .try_get("user_id")
+                .map_err(|e| format!("pull_plan_templates_pack user_id: {e}"))?;
+            let goal_pattern: String = row
+                .try_get("goal_pattern")
+                .map_err(|e| format!("pull_plan_templates_pack goal_pattern: {e}"))?;
+            let project_type: Option<String> = row
+                .try_get("project_type")
+                .map_err(|e| format!("pull_plan_templates_pack project_type: {e}"))?;
+            let template_json: String = row
+                .try_get("template_json")
+                .map_err(|e| format!("pull_plan_templates_pack template_json: {e}"))?;
+            let success_rate: f32 = row
+                .try_get::<f64, _>("success_rate")
+                .map_err(|e| format!("pull_plan_templates_pack success_rate: {e}"))? as f32;
+            let avg_completion_time: Option<i32> = row
+                .try_get("avg_completion_time")
+                .map_err(|e| format!("pull_plan_templates_pack avg_completion_time: {e}"))?;
+            let use_count: i32 = row
+                .try_get::<i64, _>("use_count")
+                .map_err(|e| format!("pull_plan_templates_pack use_count: {e}"))? as i32;
+            items.push(PlanTemplateSyncRow {
+                template_id,
+                user_id: user_id_col,
+                goal_pattern,
+                project_type,
+                template_json,
+                success_rate,
+                avg_completion_time,
+                use_count,
+            });
+        }
+        serde_json::to_string(&items).map_err(|e| format!("pull_plan_templates_pack json: {e}"))
+    }
+
     async fn status(&self) -> SyncStatus {
         // Query latest sync timestamps from audit log
         let learning_push = sqlx::query(
@@ -1241,6 +1319,13 @@ mod tests {
         assert!(push.success);
         let pull = svc.pull_preference("user1", "key").await;
         assert!(pull.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn local_only_plan_templates_pack_is_empty_array() {
+        let svc = LocalOnlySyncService;
+        let j = svc.pull_plan_templates_pack("u1").await.unwrap();
+        assert_eq!(j, "[]");
     }
 
     // ── File-based preferences ──

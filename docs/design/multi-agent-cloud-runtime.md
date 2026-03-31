@@ -1727,10 +1727,10 @@ mo-agent Orchestrator
 
 | Task | Status | Effort | Dependency |
 |------|--------|--------|------------|
-| Wire EventAdapter to IngestionSender (`EventAdapter` in `runtime`, sender from CLI/server state) | ✅ Done | Small | Phase 0 — [`MatrixCloudRuntime::attach`](../../rust/crates/runtime/src/matrix_cloud_runtime.rs) passes `sender.clone()` into `EventAdapter::new(Some(...))` |
-| Implement TaskAdapter with lease protocol | ❌ Open | Medium | Phase 0, new `task_leases` table |
-| Implement TemplateAdapter (read-only pull) | ❌ Open | Small | Phase 0 |
-| Implement PreferenceAdapter (bidirectional) | ❌ Open | Small | Phase 0 |
+| Wire EventAdapter to IngestionSender (`EventAdapter` in `runtime`, sender from CLI/server state) | ✅ Done | Small | [`EventAdapter::new(sender)`](../../rust/crates/runtime/src/sync_adapters.rs) + [`IngestionSender::disconnected()`](../../rust/crates/services/src/event_ingestion.rs) for tests |
+| Implement TaskAdapter with lease protocol | ❌ Deferred | Medium | **Phase 3** (`task_leases` + [`TaskService`](../../rust/crates/services/src/task_orchestrator.rs)); stub adapter removed — no fake `DomainAdapter` |
+| Implement TemplateAdapter (read-only pull) | ✅ Done | Small | [`TemplateAdapter`](../../rust/crates/runtime/src/sync_adapters.rs) + [`StateSyncService::pull_plan_templates_pack`](../../rust/crates/services/src/state_sync.rs) + [`MatrixOneTransport`](../../rust/crates/runtime/src/sync_adapters.rs) `Templates` pull; [`PushTrigger::Never`](../../rust/crates/services/src/sync_engine.rs) for templates |
+| Implement PreferenceAdapter (bidirectional) | ✅ Done | Small | [`PreferenceAdapter`](../../rust/crates/runtime/src/sync_adapters.rs) + `MatrixOneTransport` preferences push/pull via `user_preferences` |
 
 ### Phase 2: Durable Long-Running Tasks
 
@@ -1811,7 +1811,7 @@ mo-agent Orchestrator
 | Session restore | `services/src/session_restore.rs` | HybridRestoreService, RestoredSession | services ✅ |
 | Session journal | `services/src/session_journal.rs` | JournalWriter, append-only JSONL | services ✅ |
 | Task orchestrator | `services/src/task_orchestrator.rs` | TaskRecord, TaskCheckpoint, SubtaskPlan | services ✅ |
-| Sync adapters | `runtime/src/sync_adapters.rs` | LearningAdapter (prod), EventAdapter (stub), TaskAdapter (stub) | runtime ✅ |
+| Sync adapters | `runtime/src/sync_adapters.rs` | LearningAdapter, EventAdapter (ingestion), TemplateAdapter (pull cache), PreferenceAdapter (bidirectional); Tasks → Phase 3 lease | runtime ✅ |
 | Active LLM resolution | `services/src/models.rs` | `resolve_active_llm_model`, `ResolvedActiveLlmModel` | services ✅ |
 | Tool selector | `runtime/src/tool_selector.rs` | LearnedContext, FallbackSelector, confidence gate | runtime ✅ |
 | Bridge (in-process) | `runtime/src/turn/bridge_inprocess.rs` | Prompt cache, streaming LLM; calls `resolve_active_llm_model` | runtime ✅ (SQL out of bridge) |

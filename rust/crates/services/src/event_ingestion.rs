@@ -225,6 +225,12 @@ pub struct IngestionSender {
 }
 
 impl IngestionSender {
+    /// Handle with no worker: [`Self::enqueue`] is a no-op (disconnected channel). Tests only.
+    pub fn disconnected() -> Self {
+        let (tx, _rx) = mpsc::channel(1);
+        Self { tx }
+    }
+
     /// Enqueue an event for async ingestion. Non-blocking; drops silently if channel full.
     pub fn enqueue(&self, event: IngestionEvent) {
         let _ = self.tx.try_send(event);

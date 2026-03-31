@@ -5,6 +5,7 @@
 //! Adding this module to `services` would require `services` → `runtime`, which cycles with
 //! `runtime` → `services`.
 
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -15,12 +16,17 @@ use crate::pipeline::pattern::PatternLibrary;
 use crate::pipeline::persistence::{self, LearningSnapshot, ToolHealthEntry};
 
 use mo_agent_services::event_ingestion;
-use mo_agent_services::state_sync::StateSyncService;
+use mo_agent_services::state_sync::{PlanTemplateSyncRow, StateSyncService};
 use mo_agent_services::sync_engine::sha256_checksum;
 use mo_agent_services::{
     CloudTransport, DomainAdapter, MergeResult, PayloadFormat, PullResult, PushResult, SyncDomain,
-    SyncEnvelope, SyncError, SyncPayload, TaskService,
+    SyncEnvelope, SyncError, SyncPayload,
 };
+
+fn payload_sync_version(data: &[u8]) -> u64 {
+    let h = sha256_checksum(data);
+    u64::from_str_radix(&h[..16], 16).unwrap_or(1)
+}
 
 // ─── Learning Adapter ──────────────────────────────────────────────────────────
 
@@ -406,6 +412,42 @@ impl CloudTransport for MatrixOneTransport {
                     Err(SyncError::transient(SyncDomain::Learning, result.message))
                 }
             }
+            SyncDomain::Preferences => {
+                let map: BTreeMap<String, String> = serde_json::from_slice(&payload.data)
+                    .map_err(|e| {
+                        SyncError::permanent(
+                            SyncDomain::Preferences,
+                            format!("deserialize preferences pack: {e}"),
+                        )
+                    })?;
+                for (k, v) in map {
+                    let r = self
+                        .sync_service
+                        .push_preference(user_id, &k, &v)
+                        .await;
+                    if !r.success {
+                        return Err(SyncError::transient(
+                            SyncDomain::Preferences,
+                            r.message,
+                        ));
+                    }
+                }
+                let ver = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                Ok(PushResult {
+                    success: true,
+                    new_version: Some(ver),
+                    is_conflict: false,
+                    remote_payload: None,
+                    message: "ok".to_string(),
+                })
+            }
+            SyncDomain::Templates => Err(SyncError::permanent(
+                SyncDomain::Templates,
+                "templates are cloud-sourced; edge does not push template packs",
+            )),
             other => Err(SyncError::permanent(
                 other,
                 format!("MatrixOneTransport does not support domain {other:?}"),
@@ -450,6 +492,59 @@ impl CloudTransport for MatrixOneTransport {
                     }),
                 }
             }
+            SyncDomain::Preferences => {
+                let rows = self
+                    .sync_service
+                    .pull_all_preferences(user_id)
+                    .await
+                    .map_err(|e| SyncError::transient(SyncDomain::Preferences, e))?;
+                let map: BTreeMap<String, String> = rows.into_iter().collect();
+                let item_count = map.len() as u32;
+                let data = serde_json::to_vec(&map).map_err(|e| {
+                    SyncError::permanent(
+                        SyncDomain::Preferences,
+                        format!("serialize preferences: {e}"),
+                    )
+                })?;
+                let checksum = sha256_checksum(&data);
+                let version = payload_sync_version(&data);
+                Ok(PullResult {
+                    payload: Some(SyncPayload {
+                        data,
+                        format: PayloadFormat::Full,
+                        checksum,
+                        item_count,
+                        compressed: false,
+                    }),
+                    version: Some(version),
+                    message: "ok".to_string(),
+                })
+            }
+            SyncDomain::Templates => {
+                let json = self
+                    .sync_service
+                    .pull_plan_templates_pack(user_id)
+                    .await
+                    .map_err(|e| SyncError::transient(SyncDomain::Templates, e))?;
+                let data = json.into_bytes();
+                let checksum = sha256_checksum(&data);
+                let item_count = serde_json::from_slice::<serde_json::Value>(&data)
+                    .ok()
+                    .and_then(|v| v.as_array().map(|a| a.len() as u32))
+                    .unwrap_or(0);
+                let version = payload_sync_version(&data);
+                Ok(PullResult {
+                    payload: Some(SyncPayload {
+                        data,
+                        format: PayloadFormat::Full,
+                        checksum,
+                        item_count,
+                        compressed: false,
+                    }),
+                    version: Some(version),
+                    message: "ok".to_string(),
+                })
+            }
             other => Err(SyncError::permanent(
                 other,
                 format!("MatrixOneTransport does not support domain {other:?}"),
@@ -470,23 +565,23 @@ impl CloudTransport for MatrixOneTransport {
 
 /// Adapter for the Events domain — write-only (pushed via ingestion, never pulled).
 ///
-/// Events have their own batching mechanism via `EventIngestionWorker`.
-/// This adapter exists primarily for sync state observability.
-///
-/// When `sender` is [`Some`], it is typically a clone of the same [`IngestionSender`] held by
-/// [`crate::matrix_cloud_runtime::MatrixCloudRuntime`] (Phase 1 — shared queue for journal + future hooks).
+/// Shares the same [`event_ingestion::IngestionSender`] as
+/// [`crate::matrix_cloud_runtime::MatrixCloudRuntime::enqueue_journal_events`].
 pub struct EventAdapter {
-    #[allow(dead_code)]
-    sender: Option<event_ingestion::IngestionSender>,
+    sender: event_ingestion::IngestionSender,
     envelope: Arc<Mutex<SyncEnvelope>>,
 }
 
 impl EventAdapter {
-    pub fn new(sender: Option<event_ingestion::IngestionSender>) -> Self {
+    pub fn new(sender: event_ingestion::IngestionSender) -> Self {
         Self {
             sender,
             envelope: Arc::new(Mutex::new(SyncEnvelope::new(SyncDomain::Events))),
         }
+    }
+
+    pub fn ingestion_sender(&self) -> &event_ingestion::IngestionSender {
+        &self.sender
     }
 }
 
@@ -504,7 +599,6 @@ impl DomainAdapter for EventAdapter {
     }
 
     fn export_delta(&self) -> Result<Option<SyncPayload>, SyncError> {
-        // Events use their own batching mechanism via IngestionSender
         Ok(None)
     }
 
@@ -555,39 +649,38 @@ impl DomainAdapter for EventAdapter {
     }
 }
 
-// ─── Task Adapter ──────────────────────────────────────────────────────────────
+// ─── Template Adapter (pull-only cache) ───────────────────────────────────────
 
-/// Adapter for the Tasks domain — wraps `TaskService`.
-///
-/// Tasks sync individually (push on change, pull at session start).
-/// This is primarily a pass-through adapter for observability.
-#[cfg_attr(not(test), allow(dead_code))]
-pub struct TaskAdapter {
-    _task_service: Arc<dyn TaskService>,
+/// Cloud → edge cache of [`PlanTemplateSyncRow`]. Populated by `pull_domain(Templates)`;
+/// edge never pushes template packs ([`SyncPolicy::templates`] uses [`mo_agent_services::sync_engine::PushTrigger::Never`]).
+pub struct TemplateAdapter {
+    cache: Arc<Mutex<Vec<PlanTemplateSyncRow>>>,
     envelope: Arc<Mutex<SyncEnvelope>>,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
-impl TaskAdapter {
-    pub fn new(task_service: Arc<dyn TaskService>) -> Self {
+impl TemplateAdapter {
+    pub fn new(cache: Arc<Mutex<Vec<PlanTemplateSyncRow>>>) -> Self {
         Self {
-            _task_service: task_service,
-            envelope: Arc::new(Mutex::new(SyncEnvelope::new(SyncDomain::Tasks))),
+            cache,
+            envelope: Arc::new(Mutex::new(SyncEnvelope::new(SyncDomain::Templates))),
         }
+    }
+
+    pub fn cache(&self) -> Arc<Mutex<Vec<PlanTemplateSyncRow>>> {
+        Arc::clone(&self.cache)
     }
 }
 
 #[async_trait]
-impl DomainAdapter for TaskAdapter {
+impl DomainAdapter for TemplateAdapter {
     fn domain(&self) -> SyncDomain {
-        SyncDomain::Tasks
+        SyncDomain::Templates
     }
 
     fn export_full(&self) -> Result<SyncPayload, SyncError> {
-        // Tasks sync individually, not as a bulk payload
         Err(SyncError::permanent(
-            SyncDomain::Tasks,
-            "tasks sync individually — full export not applicable",
+            SyncDomain::Templates,
+            "templates domain is pull-only — no edge push payload",
         ))
     }
 
@@ -595,8 +688,23 @@ impl DomainAdapter for TaskAdapter {
         Ok(None)
     }
 
-    fn merge_remote(&self, _remote: &SyncPayload) -> Result<MergeResult, SyncError> {
-        Ok(MergeResult::default())
+    fn merge_remote(&self, remote: &SyncPayload) -> Result<MergeResult, SyncError> {
+        let rows: Vec<PlanTemplateSyncRow> = serde_json::from_slice(&remote.data).map_err(|e| {
+            SyncError::permanent(
+                SyncDomain::Templates,
+                format!("deserialize template pack: {e}"),
+            )
+        })?;
+        let n = rows.len() as u32;
+        if let Ok(mut g) = self.cache.lock() {
+            *g = rows;
+        }
+        Ok(MergeResult {
+            items_added: n,
+            items_updated: 0,
+            items_removed: 0,
+            conflicts_auto_resolved: 0,
+        })
     }
 
     fn resolve_conflict(
@@ -605,12 +713,28 @@ impl DomainAdapter for TaskAdapter {
         _remote: &SyncPayload,
     ) -> Result<SyncPayload, SyncError> {
         Err(SyncError::permanent(
-            SyncDomain::Tasks,
-            "task conflicts are resolved at the individual task level",
+            SyncDomain::Templates,
+            "templates pull-only — no merge conflict resolution",
         ))
     }
 
-    fn validate(&self, _payload: &SyncPayload) -> Result<(), SyncError> {
+    fn validate(&self, payload: &SyncPayload) -> Result<(), SyncError> {
+        let computed = sha256_checksum(&payload.data);
+        if computed != payload.checksum {
+            return Err(SyncError::permanent(
+                SyncDomain::Templates,
+                format!(
+                    "checksum mismatch: expected {}, got {}",
+                    payload.checksum, computed
+                ),
+            ));
+        }
+        let _: Vec<PlanTemplateSyncRow> = serde_json::from_slice(&payload.data).map_err(|e| {
+            SyncError::permanent(
+                SyncDomain::Templates,
+                format!("invalid template pack: {e}"),
+            )
+        })?;
         Ok(())
     }
 
@@ -618,7 +742,7 @@ impl DomainAdapter for TaskAdapter {
         self.envelope
             .lock()
             .map(|e| e.clone())
-            .unwrap_or_else(|_| SyncEnvelope::new(SyncDomain::Tasks))
+            .unwrap_or_else(|_| SyncEnvelope::new(SyncDomain::Templates))
     }
 
     fn set_envelope(&self, envelope: SyncEnvelope) {
@@ -632,7 +756,148 @@ impl DomainAdapter for TaskAdapter {
     }
 
     fn estimated_size(&self) -> usize {
-        0
+        self.cache
+            .lock()
+            .map(|g| g.iter().map(|r| r.template_json.len() + 256).sum())
+            .unwrap_or(0)
+    }
+
+    fn clear_dirty(&self) -> Result<(), SyncError> {
+        Ok(())
+    }
+}
+
+// ─── Preference Adapter ────────────────────────────────────────────────────────
+
+/// Bidirectional preferences: local [`BTreeMap`] merged from cloud on pull, exported on push.
+pub struct PreferenceAdapter {
+    local: Arc<Mutex<BTreeMap<String, String>>>,
+    envelope: Arc<Mutex<SyncEnvelope>>,
+}
+
+impl PreferenceAdapter {
+    pub fn new(local: Arc<Mutex<BTreeMap<String, String>>>) -> Self {
+        Self {
+            local,
+            envelope: Arc::new(Mutex::new(SyncEnvelope::new(SyncDomain::Preferences))),
+        }
+    }
+
+    pub fn store(&self) -> Arc<Mutex<BTreeMap<String, String>>> {
+        Arc::clone(&self.local)
+    }
+}
+
+#[async_trait]
+impl DomainAdapter for PreferenceAdapter {
+    fn domain(&self) -> SyncDomain {
+        SyncDomain::Preferences
+    }
+
+    fn export_full(&self) -> Result<SyncPayload, SyncError> {
+        let map = self
+            .local
+            .lock()
+            .map_err(|e| SyncError::permanent(SyncDomain::Preferences, format!("lock: {e}")))?;
+        let data = serde_json::to_vec(&*map).map_err(|e| {
+            SyncError::permanent(
+                SyncDomain::Preferences,
+                format!("serialize preferences: {e}"),
+            )
+        })?;
+        let item_count = map.len() as u32;
+        let checksum = sha256_checksum(&data);
+        Ok(SyncPayload {
+            data,
+            format: PayloadFormat::Full,
+            checksum,
+            item_count,
+            compressed: false,
+        })
+    }
+
+    fn export_delta(&self) -> Result<Option<SyncPayload>, SyncError> {
+        Ok(None)
+    }
+
+    fn merge_remote(&self, remote: &SyncPayload) -> Result<MergeResult, SyncError> {
+        let remote_map: BTreeMap<String, String> =
+            serde_json::from_slice(&remote.data).map_err(|e| {
+                SyncError::permanent(
+                    SyncDomain::Preferences,
+                    format!("deserialize preferences: {e}"),
+                )
+            })?;
+        let mut added = 0u32;
+        let mut updated = 0u32;
+        if let Ok(mut local) = self.local.lock() {
+            for (k, v) in remote_map {
+                match local.insert(k, v) {
+                    None => added += 1,
+                    Some(_) => updated += 1,
+                }
+            }
+        }
+        Ok(MergeResult {
+            items_added: added,
+            items_updated: updated,
+            items_removed: 0,
+            conflicts_auto_resolved: 0,
+        })
+    }
+
+    fn resolve_conflict(
+        &self,
+        _local: &SyncPayload,
+        remote: &SyncPayload,
+    ) -> Result<SyncPayload, SyncError> {
+        Ok(remote.clone())
+    }
+
+    fn validate(&self, payload: &SyncPayload) -> Result<(), SyncError> {
+        let computed = sha256_checksum(&payload.data);
+        if computed != payload.checksum {
+            return Err(SyncError::permanent(
+                SyncDomain::Preferences,
+                format!(
+                    "checksum mismatch: expected {}, got {}",
+                    payload.checksum, computed
+                ),
+            ));
+        }
+        let _: BTreeMap<String, String> = serde_json::from_slice(&payload.data).map_err(|e| {
+            SyncError::permanent(
+                SyncDomain::Preferences,
+                format!("invalid preferences json: {e}"),
+            )
+        })?;
+        Ok(())
+    }
+
+    fn envelope(&self) -> SyncEnvelope {
+        self.envelope
+            .lock()
+            .map(|e| e.clone())
+            .unwrap_or_else(|_| SyncEnvelope::new(SyncDomain::Preferences))
+    }
+
+    fn set_envelope(&self, envelope: SyncEnvelope) {
+        if let Ok(mut e) = self.envelope.lock() {
+            *e = envelope;
+        }
+    }
+
+    fn has_dirty_data(&self) -> bool {
+        self.envelope()
+            .sync_state
+            .is_dirty()
+    }
+
+    fn estimated_size(&self) -> usize {
+        self.local
+            .lock()
+            .map(|m| m.iter().map(|(k, v)| k.len() + v.len()).sum())
+            .unwrap_or(0)
     }
 
     fn clear_dirty(&self) -> Result<(), SyncError> {
@@ -832,7 +1097,7 @@ mod tests {
 
     #[test]
     fn event_adapter_is_always_clean() {
-        let adapter = EventAdapter::new(None);
+        let adapter = EventAdapter::new(event_ingestion::IngestionSender::disconnected());
         assert_eq!(adapter.domain(), SyncDomain::Events);
         assert!(!adapter.has_dirty_data());
         assert!(adapter.export_full().is_err());
@@ -852,15 +1117,64 @@ mod tests {
     }
 
     #[test]
-    fn task_adapter_passthrough() {
-        let task_svc: Arc<dyn TaskService> = Arc::new(mo_agent_services::LocalTaskService::new(
-            std::path::PathBuf::from("."),
-        ));
-        let adapter = TaskAdapter::new(task_svc);
-        assert_eq!(adapter.domain(), SyncDomain::Tasks);
-        assert!(!adapter.has_dirty_data());
+    fn template_adapter_merge_replaces_cache() {
+        use mo_agent_services::state_sync::PlanTemplateSyncRow;
+
+        let cache = Arc::new(Mutex::new(Vec::<PlanTemplateSyncRow>::new()));
+        let adapter = TemplateAdapter::new(Arc::clone(&cache));
+        let row = PlanTemplateSyncRow {
+            template_id: "t1".into(),
+            user_id: Some("u1".into()),
+            goal_pattern: "fix bug".into(),
+            project_type: Some("rust".into()),
+            template_json: "{}".into(),
+            success_rate: 0.9,
+            avg_completion_time: None,
+            use_count: 3,
+        };
+        let data = serde_json::to_vec(&vec![row.clone()]).unwrap();
+        let checksum = sha256_checksum(&data);
+        let payload = SyncPayload {
+            data,
+            format: PayloadFormat::Full,
+            checksum,
+            item_count: 1,
+            compressed: false,
+        };
+        adapter.validate(&payload).unwrap();
+        adapter.merge_remote(&payload).unwrap();
+        let g = cache.lock().unwrap();
+        assert_eq!(g.len(), 1);
+        assert_eq!(g[0].template_id, "t1");
         assert!(adapter.export_full().is_err());
-        assert!(adapter.export_delta().unwrap().is_none());
-        adapter.clear_dirty().expect("clear_dirty should succeed");
+        assert!(!adapter.has_dirty_data());
+    }
+
+    #[test]
+    fn preference_adapter_export_merge_roundtrip() {
+        let store = Arc::new(Mutex::new(BTreeMap::from([(
+            "k1".into(),
+            "local".into(),
+        )])));
+        let adapter = PreferenceAdapter::new(Arc::clone(&store));
+        let mut env = adapter.envelope();
+        env.mark_dirty();
+        adapter.set_envelope(env);
+        assert!(adapter.has_dirty_data());
+
+        let payload = adapter.export_full().unwrap();
+        adapter.validate(&payload).unwrap();
+
+        let remote_store = Arc::new(Mutex::new(BTreeMap::from([(
+            "k2".into(),
+            "cloud".into(),
+        )])));
+        let remote_adapter = PreferenceAdapter::new(remote_store);
+        let remote_payload = remote_adapter.export_full().unwrap();
+
+        adapter.merge_remote(&remote_payload).unwrap();
+        let g = store.lock().unwrap();
+        assert_eq!(g.get("k1"), Some(&"local".to_string()));
+        assert_eq!(g.get("k2"), Some(&"cloud".to_string()));
     }
 }
