@@ -11,10 +11,16 @@ use crossterm::terminal;
 use mo_agent_core::{RuntimeLimits, agent_warn};
 use mo_agent_runtime::{
     pipeline::step_protocol::{CachedToolResult, IdempotencyKey, InMemoryIdempotencyCache},
-    tool_registry,
+    tool_registry::{
+        self,
+        apply_selector_hints_to_edge_profile,
+    },
     tool_selector,
     turn::boost_domain_hints::domain_hints_from_boost_terms,
     turn::chat_history_openai::openai_messages_from_repl_history,
+    turn::chat_turn_edge_profile::{
+        build_base_edge_profile_value, detect_active_system_skills_in_message, read_git_branch_abbrev,
+    },
     turn::chat_turn_heuristics::{
         extract_repos_from_memory, factual_tool_retry_message, should_force_factual_tool_retry,
     },
@@ -27,9 +33,7 @@ use mo_agent_runtime::{
 };
 
 use crate::{
-    cli_utils::{
-        capitalize, compact_or_raw, tool_call_detail, tool_result_summary,
-    },
+    cli_utils::{compact_or_raw, tool_call_detail, tool_result_summary},
     edge_tools,
     stream_render::consume_turn_sse,
     ExplainMode, StreamResult, VerdictEvent,
@@ -156,19 +160,7 @@ pub(crate) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
         let assembly_start = Instant::now();
 
         // Build request payload
-        let git_branch = std::process::Command::new("git")
-            .args(["rev-parse", "--abbrev-ref", "HEAD"])
-            .output()
-            .ok()
-            .and_then(|o| String::from_utf8(o.stdout).ok())
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty());
-        let memoria_url = std::env::var("MEMORIA_BASE_URL")
-            .unwrap_or_else(|_| mo_agent_core::config::DEFAULT_MEMORIA_URL.to_string());
-        let memoria_key = std::env::var("MEMORIA_API_KEY")
-            .ok()
-            .or_else(|| std::env::var("MEMORIA_MASTER_KEY").ok())
-            .unwrap_or_default();
+        let git_branch = read_git_branch_abbrev();
         let mut payload = serde_json::json!({
             "messages": messages,
             "session_id": current_session_id,
@@ -176,28 +168,17 @@ pub(crate) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
             "explain": match explain { ExplainMode::Off => serde_json::json!(false), ExplainMode::On => serde_json::json!(true), ExplainMode::Verbose => serde_json::json!("verbose") },
             "edge_executor_id": edge_executor_instance_id(),
             "capabilities": mo_thin_client::builtin_capability_preset(),
-            "edge_profile": {
-                "cwd": project_root.to_string_lossy(),
-                "git_branch": git_branch,
-                "memoria_url": memoria_url,
-                "memoria_key": memoria_key,
-                "workspace": detect_workspace_context(&project_root),
-            },
+            "edge_profile": build_base_edge_profile_value(
+                project_root.to_string_lossy().as_ref(),
+                git_branch,
+                detect_workspace_context(&project_root),
+            ),
         });
         // Detect active system skills from skill instruction block in the message
         // and pass them as edge_profile hints so the server system prompt can reference them.
-        {
-            let skill_names: Vec<&str> = ["markdown", "concise"]
-                .iter()
-                .copied()
-                .filter(|name| {
-                    message.contains(&format!("Output Format: {}", capitalize(name)))
-                        || message.contains(&format!("Output Constraint: {}", capitalize(name)))
-                })
-                .collect();
-            if !skill_names.is_empty() {
-                payload["edge_profile"]["active_skills"] = serde_json::json!(skill_names);
-            }
+        let active_skills = detect_active_system_skills_in_message(message);
+        if !active_skills.is_empty() {
+            payload["edge_profile"]["active_skills"] = serde_json::json!(active_skills);
         }
         // NOTE: Skill instructions are now injected after tool selection (see below)
         // when LLM-based selection chooses a skill.
@@ -459,39 +440,14 @@ pub(crate) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
         executor.set_budget_pressure(budget_pressure);
 
         // ── Tool guidance hint: when the selector is confident, tell the server
-        // which dynamic tools scored highest. The server can inject this as a
-        // system prompt hint, biasing the LLM toward the right tools.
-        // Only emitted when confidence >= 0.4 and there are dynamic tools.
-        {
-            use mo_agent_runtime::tool_registry::TOOL_CATALOG;
-            let dynamic_tools: Vec<&str> = first_selection_report
-                .as_ref()
-                .map(|r| {
-                    r.tools_selected
-                        .iter()
-                        .filter(|n| {
-                            !TOOL_CATALOG
-                                .iter()
-                                .any(|t| t.pinned && t.name == n.as_str())
-                        })
-                        .map(|s| s.as_str())
-                        .take(3) // Top 3 dynamic tools (already in score order)
-                        .collect()
-                })
-                .unwrap_or_default();
-            if selection_confidence >= 0.4 && !dynamic_tools.is_empty() {
-                payload["edge_profile"]["recommended_tools"] = serde_json::json!(dynamic_tools);
-                payload["edge_profile"]["selection_confidence"] =
-                    serde_json::json!(selection_confidence);
-            }
-            if !learned_context_hint.is_empty() {
-                payload["edge_profile"]["learned_context_hint"] =
-                    serde_json::json!(learned_context_hint);
-            }
-            if let Some(task_type) = learned_task_type.as_ref() {
-                payload["edge_profile"]["selection_task_type"] = serde_json::json!(task_type);
-            }
-        }
+        // which dynamic tools scored highest (see `apply_selector_hints_to_edge_profile`).
+        apply_selector_hints_to_edge_profile(
+            &mut payload["edge_profile"],
+            first_selection_report.as_ref(),
+            selection_confidence,
+            &learned_context_hint,
+            learned_task_type.as_deref(),
+        );
         // Dynamic schema restriction: remove tools that were stall-restricted
         let final_schemas =
             filter_tool_schemas_by_excluded_names(turn_schemas, &restricted_tools);

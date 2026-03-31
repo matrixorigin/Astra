@@ -52,15 +52,6 @@ pub(super) fn profile_name(cli_profile: Option<&str>, data: &CredentialsFile) ->
         .unwrap_or_else(|| "default".to_string())
 }
 
-/// Capitalize the first letter of a string.
-pub(super) fn capitalize(s: &str) -> String {
-    let mut c = s.chars();
-    match c.next() {
-        None => String::new(),
-        Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
-    }
-}
-
 pub(super) fn get_profile_and_token(
     cli_profile: Option<&str>,
 ) -> Result<(CredentialsFile, String, Profile, String), String> {
@@ -765,23 +756,6 @@ mod tests {
     #[test]
     fn urlencoding_no_change() {
         assert_eq!(urlencoding("simple"), "simple");
-    }
-
-    // ── capitalize ────────────────────────────────────────────────────────────
-
-    #[test]
-    fn capitalize_lowercase() {
-        assert_eq!(capitalize("hello"), "Hello");
-    }
-
-    #[test]
-    fn capitalize_empty() {
-        assert_eq!(capitalize(""), "");
-    }
-
-    #[test]
-    fn capitalize_already_upper() {
-        assert_eq!(capitalize("Hello"), "Hello");
     }
 
     // ── tool_call_detail ──────────────────────────────────────────────────────

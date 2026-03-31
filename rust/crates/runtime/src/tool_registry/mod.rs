@@ -16,6 +16,7 @@ mod meta;
 pub mod plugin;
 mod registry;
 mod report;
+mod selection_edge_hints;
 pub mod scoring;
 pub mod state;
 
@@ -24,6 +25,9 @@ pub use meta::{IntentType, Scope, TOOL_CATALOG, ToolMeta};
 pub use plugin::{PluginRegistry, PluginToolEntry};
 pub use registry::ToolRegistry;
 pub use report::{SelectionFeedback, SelectionReport, ToolQualityTracker};
+pub use selection_edge_hints::{
+    apply_selector_hints_to_edge_profile, top_unpinned_tool_names_from_report,
+};
 pub use scoring::{
     DEFAULT_TOOL_BUDGET_TOKENS, pre_filter_dynamic, pre_filter_dynamic_calibrated,
     pre_filter_dynamic_with_memory, pre_filter_dynamic_with_pressure,
