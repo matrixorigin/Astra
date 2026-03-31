@@ -155,7 +155,8 @@ pub fn estimate_tokens_cache_aware(
 
 /// Compaction urgency tiers — each tier triggers progressively more aggressive
 /// context reduction strategies.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum CompactionTier {
     /// < 60% of effective input limit — no action needed.
     Normal,
@@ -184,6 +185,48 @@ impl CompactionTier {
 // Context budget
 // ---------------------------------------------------------------------------
 
+/// Configuration for LLM-based compaction summary (Phase 2 feature).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct CompactConfig {
+    /// Enable LLM-generated summary instead of pure truncation.
+    /// Defaults to `false` to avoid unexpected API costs.
+    pub enable_summary: bool,
+    /// Maximum tokens to generate for the summary.
+    pub summary_token_budget: usize,
+    /// Maximum PTL retry attempts before falling back to truncation.
+    pub max_ptl_retries: usize,
+    /// Minimum compaction tier that triggers LLM summary.
+    /// Defaults to AggressivePrune (only summarize at highest pressure).
+    pub summary_min_tier: CompactionTier,
+}
+
+impl Default for CompactConfig {
+    fn default() -> Self {
+        Self {
+            enable_summary: false,
+            summary_token_budget: 20_000,
+            max_ptl_retries: 3,
+            summary_min_tier: CompactionTier::AggressivePrune,
+        }
+    }
+}
+
+impl CompactConfig {
+    /// Returns true if LLM summary should be attempted for the given tier.
+    pub fn should_summarize(&self, tier: CompactionTier) -> bool {
+        if !self.enable_summary {
+            return false;
+        }
+        let tier_level = |t: CompactionTier| match t {
+            CompactionTier::Normal => 0,
+            CompactionTier::TrimSchemas => 1,
+            CompactionTier::CompactHistory => 2,
+            CompactionTier::AggressivePrune => 3,
+        };
+        tier_level(tier) >= tier_level(self.summary_min_tier)
+    }
+}
+
 /// Context budget configuration — model-aware limits.
 #[derive(Debug, Clone)]
 pub struct ContextBudget {
@@ -199,6 +242,8 @@ pub struct ContextBudget {
     /// Fraction of model_limit reserved for output generation.
     /// `effective_input_limit = model_limit * (1.0 - output_reserve_ratio)`.
     pub output_reserve_ratio: f64,
+    /// LLM-based compaction summary configuration.
+    pub compact_config: CompactConfig,
 }
 
 impl ContextBudget {
@@ -242,9 +287,11 @@ impl Default for ContextBudget {
             keep_recent_turns: 4,
             memory_budget_chars: 8_000,
             output_reserve_ratio: 0.15,
+            compact_config: CompactConfig::default(),
         }
     }
 }
+
 
 /// Return a ContextBudget tuned for a known model name.
 pub fn budget_for_model(model: Option<&str>) -> ContextBudget {

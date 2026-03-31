@@ -216,10 +216,18 @@ pub use turn::{
     activity::{SessionActivityUpdatePlan, build_session_activity_update_plan},
     cache::SessionCache,
     cloud::{
-        compaction::compact_tiered,
+        attachments::{
+            AttachmentBuilder, FileAttachment, PlanAttachment, PostCompactAttachments,
+            SkillAttachment,
+        },
+        compaction::{
+            CompactBoundary, CompactResult, CompactTrigger, compact_tiered,
+            compact_tiered_with_result, compact_with_summary,
+        },
         history::compact_cloud_loop_history,
         iteration::{CloudLoopIterationPlan, plan_cloud_loop_iteration},
         prefilter::{CloudSkillCandidatePlan, plan_cloud_skill_candidates},
+        summary::{HttpSummaryClient, LlmConnParams, SummaryLlmClient, SummaryResponse},
     },
     complete::build_turn_complete_event,
     counter::count_persisted_turn_events,
