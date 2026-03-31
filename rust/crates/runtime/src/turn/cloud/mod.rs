@@ -7,8 +7,4 @@ pub mod history;
 pub mod iteration;
 pub mod memoria_compact;
 pub mod prefilter;
-pub mod session_memory;
-pub mod sm_compact;
-pub mod sm_extract;
-pub mod sm_service;
 pub mod summary;

@@ -21,14 +21,14 @@ pub enum CompactionEventType {
     Auto,
     /// Manual compaction triggered by user.
     Manual,
-    /// Session memory-based compaction.
-    SessionMemory,
     /// LLM summary generation.
     LlmSummary,
     /// Fallback to pure truncation.
     Fallback,
     /// Time-based tool result clearing.
     TimeBased,
+    /// Memoria-based compaction.
+    Memoria,
 }
 
 impl From<&CompactTrigger> for CompactionEventType {
@@ -103,13 +103,13 @@ impl CompactionEvent {
         }
     }
 
-    /// Create a session memory compaction event.
-    pub fn session_memory(
+    /// Create a Memoria-based compaction event.
+    pub fn memoria(
         pre_tokens: usize,
         post_tokens: usize,
         messages_before: usize,
         messages_after: usize,
-        recovered_files: Vec<String>,
+        memories_retrieved: usize,
     ) -> Self {
         let tokens_saved = pre_tokens.saturating_sub(post_tokens);
         let compression_ratio = if pre_tokens > 0 {
@@ -119,17 +119,17 @@ impl CompactionEvent {
         };
 
         Self {
-            event_type: CompactionEventType::SessionMemory,
-            tier: "session_memory".to_string(),
+            event_type: CompactionEventType::Memoria,
+            tier: "memoria".to_string(),
             pre_tokens,
             post_tokens,
             messages_before,
             messages_after,
             tokens_saved,
             compression_ratio,
-            has_summary: false,
+            has_summary: memories_retrieved > 0,
             cleared_tool_ids: Vec::new(),
-            recovered_files,
+            recovered_files: Vec::new(),
             gap_minutes: None,
             sm_fallback_reason: None,
         }
@@ -556,12 +556,12 @@ mod tests {
     }
 
     #[test]
-    fn session_memory_event() {
-        let event = CompactionEvent::session_memory(2000, 800, 20, 8, vec!["file.rs".to_string()]);
+    fn memoria_event() {
+        let event = CompactionEvent::memoria(2000, 800, 20, 8, 5);
 
-        assert_eq!(event.event_type, CompactionEventType::SessionMemory);
+        assert_eq!(event.event_type, CompactionEventType::Memoria);
         assert_eq!(event.tokens_saved, 1200);
-        assert_eq!(event.recovered_files, vec!["file.rs"]);
+        assert!(event.has_summary); // 5 memories retrieved
     }
 
     #[test]

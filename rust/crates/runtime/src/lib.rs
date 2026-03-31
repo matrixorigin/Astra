@@ -236,16 +236,6 @@ pub use turn::{
             MemoriaMemory, compact_with_memoria, compact_with_memoria_sync,
         },
         prefilter::{CloudSkillCandidatePlan, plan_cloud_skill_candidates},
-        session_memory::{
-            SESSION_MEMORY_SECTIONS, SESSION_MEMORY_TEMPLATE, SessionMemory, SessionMemoryConfig,
-            SessionMemoryState, SmCompactConfig,
-        },
-        sm_compact::{
-            SmCompactOutcome, SmFallbackReason, compact_with_session_memory_fallback,
-            compact_with_session_memory_sync, session_memory_compact,
-        },
-        sm_extract::{build_extraction_prompt, parse_extraction_response},
-        sm_service::{SessionMemoryService, estimate_messages_tokens, get_last_message_id},
         summary::{HttpSummaryClient, LlmConnParams, SummaryLlmClient, SummaryResponse},
     },
     complete::build_turn_complete_event,

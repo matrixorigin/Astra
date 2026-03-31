@@ -8,8 +8,8 @@
 //! 2. **Command sandboxing** — env filtering, resource limits, restricted bash
 //! 3. **Policy engine** — configurable per-session security rules
 
-mod command;
 mod bash_ast;
+mod command;
 mod path;
 mod policy;
 
