@@ -2,6 +2,7 @@ pub mod activity;
 #[cfg(feature = "bridge-e2e-hooks")]
 pub mod bridge_e2e_hooks;
 pub mod bridge_inprocess;
+pub mod edge_prompt_context;
 pub mod edge_ledger;
 pub mod cache;
 pub mod cloud;
@@ -34,6 +35,7 @@ pub mod stall;
 pub mod state;
 pub mod stream_events;
 pub mod tail_persist;
+pub mod tool_schema_prune;
 pub mod task;
 pub mod tool_args_repair;
 pub mod tool_health;

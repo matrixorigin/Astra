@@ -1733,12 +1733,13 @@ mo-agent Orchestrator
 | Move `sync_adapters` out of CLI | ✅ Done | — | **`runtime/src/sync_adapters.rs`** (not `services`: would create `runtime`↔`services` cycle). CLI uses `mo_agent_runtime::sync_adapters`. |
 | Move `plan_decompose` out of CLI | ✅ Done | — | **`runtime/src/plan_decompose.rs`**; CLI `use mo_agent_runtime::plan_decompose`. |
 | Extract active LLM row query + decrypt from `bridge_inprocess` | ✅ Done | — | **`services::resolve_active_llm_model`** (`models.rs`); bridge calls it. |
+| Extract shared edge prompt context + tool schema prune to `runtime` | ✅ Done (slice 1) | Small | **`runtime/src/turn/edge_prompt_context.rs`** (`detect_workspace_context`, `detect_project_languages`, `make_args_preview`); **`runtime/src/turn/tool_schema_prune.rs`** (`prune_tool_schemas`) — used by CLI `chat_stream` + `bridge_inprocess` |
 | Implement tool execution callback protocol (cloud → edge) | ✅ Core path | Medium | §5.5 `/tools/result`, `tool_request` SSE; `chat_stream` **does not** re-execute tools for that path. |
 | Add `edge_executor_id` to chat turn protocol | ✅ | Small | Thin client + §5.5.2 light edge helpers. |
 | Move `SyncOrchestrator` construction from `ReplState` to `AppState` | ❌ Open | Small | Still wired in CLI `main.rs` for REPL session |
 | Move `IngestionSender` from `ReplState` to server pipeline | ❌ Open | Small | |
 | Remove `matrixone_pool` from `ReplState` (use server `shared_pool`) | ❌ Open | Small | `app_state.rs` already has `shared_pool` |
-| Refactor `chat_stream.rs`: cognitive loop → `runtime`, rendering stays CLI | ❌ Open | Large | Largest remaining Phase 0 item |
+| Refactor `chat_stream.rs`: cognitive loop → `runtime`, rendering stays CLI | 🟡 In progress | Large | **Slice 1** landed (shared context + schema prune). Remaining: multi-turn loop, stall/TurnGuard, tool execution vs `bridge_inprocess` convergence |
 
 **Success criteria** (unchanged): `mo-agent` CLI can be deleted and replaced with a ~500-line thin client; **not yet met** — `chat_stream` + `ReplState` infra fields remain.
 
@@ -1845,7 +1846,9 @@ mo-agent Orchestrator
 | Sync adapters | `runtime/src/sync_adapters.rs` | LearningAdapter, EventAdapter (ingestion), TemplateAdapter (pull cache), PreferenceAdapter (bidirectional), TaskAdapter (lease-filtered tasks) | runtime ✅ |
 | Active LLM resolution | `services/src/models.rs` | `resolve_active_llm_model`, `ResolvedActiveLlmModel` | services ✅ |
 | Tool selector | `runtime/src/tool_selector.rs` | LearnedContext, FallbackSelector, confidence gate | runtime ✅ |
-| Bridge (in-process) | `runtime/src/turn/bridge_inprocess.rs` | Prompt cache, streaming LLM; calls `resolve_active_llm_model` | runtime ✅ (SQL out of bridge) |
+| Bridge (in-process) | `runtime/src/turn/bridge_inprocess.rs` | Prompt cache, streaming LLM; calls `resolve_active_llm_model`; uses `tool_schema_prune` | runtime ✅ (SQL out of bridge) |
+| Edge prompt context | `runtime/src/turn/edge_prompt_context.rs` | Shared `edge_profile.workspace` + file-context helpers (CLI `chat_stream` + future clients) | runtime ✅ |
+| Tool schema prune | `runtime/src/turn/tool_schema_prune.rs` | Tiered OpenAI-style tool definition pruning | runtime ✅ |
 | Bridge (HTTP) | `runtime/src/turn/bridge/mod.rs` | HttpChatTurnBridge, forwards to external service | runtime ✅ |
 | Chat stream | `mo-agent/src/mo_agent/chat_stream.rs` | Multi-turn loop, headless tool assembly (§5.5) | ⚠️ Core loop should move to runtime |
 | Plan decompose | `runtime/src/plan_decompose.rs` | Long-horizon planning, subtask generation | runtime ✅ |
