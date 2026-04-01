@@ -8,7 +8,7 @@
 //! Client → POST /chat/stream
 //!   → AgenticRunLifecycleService::stream_chat()
 //!     → ServerAgenticLoopHost + run_agentic_loop_with_host()
-//!       → execute_turn(): resolve model, call LLM, accumulate response
+//!       → execute_turn(): resolve model, cancellable cooldown wait, call LLM, accumulate response
 //!       → headless_tool_round(): execute tools via ledger
 //!       → post_tool_policy(): stall/dedup/guard
 //! ```
@@ -28,6 +28,7 @@ use crate::turn::agentic_loop_host::{AgenticLoopHost, AgenticLoopState, HostTurn
 use crate::turn::chat_turn_sse_dispatch::ChatTurnSseAccum;
 use crate::turn::llm_client::{
     LlmCallResult, LlmCancel, cached_system_prompt, call_llm_and_collect, classify_llm_error,
+    sleep_ms_or_llm_cancel,
 };
 use crate::turn::tool_schema_prune::prune_tool_schemas;
 use crate::{FernetTokenEncryptor, MatrixOneSettings};
@@ -397,7 +398,9 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                     "llm",
                     "rate-limit cooldown: waiting {delay_ms}ms before request"
                 );
-                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                sleep_ms_or_llm_cancel(delay_ms, llm_cancel_for_state(state))
+                    .await
+                    .map_err(|e| e)?;
             }
             RateLimitAction::UseFallback { reason } => {
                 if let Some(ref fb_name) = fallback_model_name {

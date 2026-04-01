@@ -683,6 +683,7 @@ pub(crate) fn parse_openai_sse_json_stream(
 mod tests {
     use super::*;
     use futures_util::stream;
+    use futures_util::StreamExt;
     use serde_json::json;
     use std::sync::atomic::AtomicBool;
     use std::sync::atomic::Ordering;
@@ -704,6 +705,65 @@ mod tests {
         token.cancel();
         let r = h.await.expect("join");
         assert_eq!(r.expect_err("cancelled"), "LLM call cancelled");
+    }
+
+    #[tokio::test]
+    async fn sleep_ms_or_llm_cancel_aborts_on_flag() {
+        let flag = Arc::new(AtomicBool::new(false));
+        let flag_signal = flag.clone();
+        let flag_for_wait = flag.clone();
+        let h = tokio::spawn(async move {
+            sleep_ms_or_llm_cancel(60_000, LlmCancel::Flag(flag_for_wait.as_ref())).await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        flag_signal.store(true, Ordering::SeqCst);
+        let r = h.await.expect("join");
+        assert_eq!(r.expect_err("cancelled"), "LLM call cancelled");
+    }
+
+    #[tokio::test]
+    async fn sleep_ms_or_llm_cancel_aborts_flag_and_token_via_token() {
+        let flag = Arc::new(AtomicBool::new(false));
+        let flag_for_join = flag.clone();
+        let token = CancellationToken::new();
+        let token_for_wait = token.clone();
+        let h = tokio::spawn(async move {
+            sleep_ms_or_llm_cancel(
+                60_000,
+                LlmCancel::FlagAndToken(flag.as_ref(), &token_for_wait),
+            )
+            .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        token.cancel();
+        let r = h.await.expect("join");
+        assert_eq!(r.expect_err("cancelled"), "LLM call cancelled");
+        assert!(!flag_for_join.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn llm_cancel_is_triggered_matrix() {
+        assert!(!LlmCancel::None.is_triggered());
+
+        let flag_off = Arc::new(AtomicBool::new(false));
+        assert!(!LlmCancel::Flag(flag_off.as_ref()).is_triggered());
+        flag_off.store(true, Ordering::SeqCst);
+        assert!(LlmCancel::Flag(flag_off.as_ref()).is_triggered());
+
+        let token = CancellationToken::new();
+        assert!(!LlmCancel::Token(&token).is_triggered());
+        token.cancel();
+        assert!(LlmCancel::Token(&token).is_triggered());
+
+        let flag2 = Arc::new(AtomicBool::new(false));
+        let token2 = CancellationToken::new();
+        assert!(!LlmCancel::FlagAndToken(flag2.as_ref(), &token2).is_triggered());
+        token2.cancel();
+        assert!(LlmCancel::FlagAndToken(flag2.as_ref(), &token2).is_triggered());
+
+        let flag3 = Arc::new(AtomicBool::new(true));
+        let token3 = CancellationToken::new();
+        assert!(LlmCancel::FlagAndToken(flag3.as_ref(), &token3).is_triggered());
     }
 
     #[test]
@@ -765,6 +825,32 @@ mod tests {
         assert_eq!(r.reasoning, "think");
         assert_eq!(r.tool_calls.len(), 1);
         assert_eq!(r.usage.get("total").and_then(Value::as_i64), Some(15));
+    }
+
+    #[tokio::test]
+    async fn parse_openai_sse_json_stream_split_chunks() {
+        let parts: Vec<Result<Bytes, reqwest::Error>> = vec![
+            Ok(Bytes::from("data: ")),
+            Ok(Bytes::from(r#"{"t":1}"#)),
+            Ok(Bytes::from("\n\n")),
+        ];
+        let st = parse_openai_sse_json_stream(stream::iter(parts));
+        tokio::pin!(st);
+        let ev = st.next().await.unwrap().unwrap();
+        assert_eq!(ev, json!({"t": 1}));
+        assert!(st.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn parse_openai_sse_json_stream_done_terminates() {
+        let body = "data: {\"a\":1}\n\ndata: [DONE]\n\n";
+        let parts: Vec<Result<Bytes, reqwest::Error>> =
+            vec![Ok(Bytes::copy_from_slice(body.as_bytes()))];
+        let st = parse_openai_sse_json_stream(stream::iter(parts));
+        tokio::pin!(st);
+        let e1 = st.next().await.unwrap().unwrap();
+        assert_eq!(e1, json!({"a": 1}));
+        assert!(st.next().await.is_none());
     }
 
     #[tokio::test]
