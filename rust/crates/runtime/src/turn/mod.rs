@@ -42,6 +42,8 @@ pub mod headless_tool_journal;
 pub mod headless_tool_postprocess;
 pub mod headless_tool_status_display;
 pub mod headless_tool_stderr_lines;
+pub mod headless_tool_body_preview;
+pub mod tool_result_sanitize;
 pub mod history;
 pub mod history_apply;
 pub mod hook_plans;

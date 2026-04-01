@@ -119,6 +119,11 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
             HeadlessStderrStyle::Red => eprintln!("{}", line.red()),
             HeadlessStderrStyle::Green => eprintln!("{}", line.green()),
             HeadlessStderrStyle::Yellow => eprintln!("{}", line.yellow()),
+            HeadlessStderrStyle::CyanBold => eprintln!("{}", line.cyan().bold()),
+            HeadlessStderrStyle::Magenta => eprintln!("{}", line.magenta()),
+            HeadlessStderrStyle::DiffAdd => eprintln!("{}", line.green()),
+            HeadlessStderrStyle::DiffRemove => eprintln!("{}", line.red()),
+            HeadlessStderrStyle::Normal => eprintln!("{}", line),
         }
         self.pending_clear_lines += 1;
     }

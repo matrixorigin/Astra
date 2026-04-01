@@ -405,14 +405,22 @@ impl ToolExecutor {
             })
             .to_string();
         }
+        let prior_for_diff = if path.exists() {
+            fs::read_to_string(&path).ok()
+        } else {
+            None
+        };
         match fs::write(&path, content) {
             Ok(_) => {
                 // Record write state so subsequent reads/edits know the mtime
                 self.record_write(&path);
+                let old_slice = prior_for_diff.as_deref().unwrap_or("");
+                let cli_diff = cap_cli_unified_diff(unified_diff_raw(old_slice, content, &path));
                 json!({
                     "success": true,
                     "bytes_written": content.len(),
-                    "path": path.to_string_lossy().to_string()
+                    "path": path.to_string_lossy().to_string(),
+                    "_cli_unified_diff": cli_diff,
                 })
                 .to_string()
             }
@@ -503,6 +511,7 @@ impl ToolExecutor {
                             if let Some(fmt_note) = format_result {
                                 result.push_str(&format!("\n{fmt_note}"));
                             }
+                            append_str_replace_cli_unified_diff(&mut result, &content, &new_content, &path);
                             return result;
                         }
                         Err(e) => return format!("Error writing file: {e}"),
@@ -582,6 +591,7 @@ impl ToolExecutor {
                     }
                 }
 
+                append_str_replace_cli_unified_diff(&mut result, &content, &new_content, &path);
                 result
             }
             Err(e) => format!("Error writing file: {e}"),
@@ -719,6 +729,7 @@ impl ToolExecutor {
                     }
                 }
 
+                append_str_replace_cli_unified_diff(&mut result, &content, &working, &path);
                 result
             }
             Err(e) => format!("Error writing file: {e}"),
@@ -1139,8 +1150,22 @@ fn auto_format_file(file_path: &Path, project_root: &Path) -> Option<String> {
 
 // ─── unified diff generation ────────────────────────────────────────────────
 
-/// Generate a unified diff between old and new content for a given file path.
-fn unified_diff(old_content: &str, new_content: &str, path: &std::path::Path) -> String {
+const CLI_UNIFIED_DIFF_MAX_LINES: usize = 400;
+
+fn cap_cli_unified_diff(s: String) -> String {
+    let n = s.lines().count();
+    if n <= CLI_UNIFIED_DIFF_MAX_LINES {
+        return s;
+    }
+    s.lines()
+        .take(CLI_UNIFIED_DIFF_MAX_LINES)
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n... (_cli_unified_diff truncated)\n"
+}
+
+/// Unified diff body (no dry-run banner) for CLI previews and `_cli_unified_diff`.
+fn unified_diff_raw(old_content: &str, new_content: &str, path: &std::path::Path) -> String {
     let fname = path
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
@@ -1205,7 +1230,22 @@ fn unified_diff(old_content: &str, new_content: &str, path: &std::path::Path) ->
         }
     }
 
-    format!("[DRY RUN] Preview of changes (not applied):\n{out}")
+    out
+}
+
+/// Generate a unified diff between old and new content for a given file path.
+fn unified_diff(old_content: &str, new_content: &str, path: &std::path::Path) -> String {
+    format!(
+        "[DRY RUN] Preview of changes (not applied):\n{}",
+        unified_diff_raw(old_content, new_content, path)
+    )
+}
+
+fn append_str_replace_cli_unified_diff(out: &mut String, before: &str, after: &str, path: &Path) {
+    use mo_agent_runtime::turn::tool_result_sanitize::{STR_REPLACE_DIFF_END, STR_REPLACE_DIFF_START};
+    out.push_str(STR_REPLACE_DIFF_START);
+    out.push_str(&cap_cli_unified_diff(unified_diff_raw(before, after, path)));
+    out.push_str(STR_REPLACE_DIFF_END);
 }
 
 // ─── str_replace fuzzy matching ─────────────────────────────────────────────

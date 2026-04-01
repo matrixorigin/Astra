@@ -26,6 +26,7 @@ use super::headless_tool_postprocess::{
     try_write_light_headless_step_checkpoint,
 };
 use super::headless_tool_status_display::{tool_call_detail, tool_result_summary};
+use super::headless_tool_body_preview::emit_headless_tool_body_preview;
 use super::headless_tool_stderr_lines::{
     headless_stderr_cache_hit_line, headless_stderr_error_preview_line,
     headless_stderr_resource_limit_blocked, headless_stderr_resource_limit_in_output,
@@ -33,6 +34,7 @@ use super::headless_tool_stderr_lines::{
     headless_stderr_tool_ok_footer_line, headless_stderr_tool_ok_header,
     headless_stderr_unknown_tool_detail, headless_stderr_unknown_tool_header,
 };
+use super::tool_result_sanitize::tool_result_content_for_model;
 use super::hydrate_reflect::hydrate_reflect_placeholder_if_needed;
 use super::tool_result_semantics::{is_tool_error, tool_dedup_signature};
 use super::turn_guard::TurnGuard;
@@ -48,6 +50,15 @@ pub enum HeadlessStderrStyle {
     Red,
     Green,
     Yellow,
+    /// File / `diff --git` headers (terminal preview).
+    CyanBold,
+    Magenta,
+    /// Unified diff `+` line (not `+++`).
+    DiffAdd,
+    /// Unified diff `-` line (not `---`).
+    DiffRemove,
+    /// Read file body / neutral code line.
+    Normal,
 }
 
 /// Host sink for headless tool round stderr (noop when CLI passes [`NoopHeadlessTerminal`]).
@@ -160,6 +171,7 @@ pub async fn run_agentic_headless_tool_round<E: EdgeToolRoundRow>(
                     HeadlessStderrStyle::Dim,
                     headless_stderr_cache_hit_line(&name),
                 );
+                emit_headless_tool_body_preview(term, quiet, &name, &cached.output, false);
             }
             let (tool_msg, tr) = headless_idempotency_hit_openai_pair(&id, &name, &cached.output);
             messages.push(tool_msg);
@@ -337,7 +349,10 @@ pub async fn run_agentic_headless_tool_round<E: EdgeToolRoundRow>(
             }
         }
 
-        let (tool_msg, tr) = openai_tool_roundtrip_values(&id, &name, &result_str);
+        emit_headless_tool_body_preview(term, quiet, &name, &result_str, is_err);
+
+        let model_result_str = tool_result_content_for_model(&name, &result_str);
+        let (tool_msg, tr) = openai_tool_roundtrip_values(&id, &name, &model_result_str);
         messages.push(tool_msg);
         tool_results.push(tr);
     }
