@@ -694,6 +694,61 @@ mod tests {
         assert!(ingestion.event_type.contains("end"));
     }
 
+    #[test]
+    fn transform_plan_progress_event() {
+        let event = crate::session_journal::JournalEvent::plan_progress(
+            Some("sess-plan"),
+            3,
+            "subtask-1",
+            "Analyze code",
+            "started",
+            33,
+            3,
+            1,
+        );
+        let ingestion = IngestionEvent::from_journal_event(&event, "u1");
+        assert_eq!(ingestion.session_id, "sess-plan");
+        assert_eq!(ingestion.event_type, "plan_progress");
+        // metadata should carry subtask details
+        let meta = ingestion.metadata.unwrap();
+        assert_eq!(meta["subtask_id"], "subtask-1");
+        assert_eq!(meta["action"], "started");
+        assert_eq!(meta["progress_pct"], 33);
+    }
+
+    #[test]
+    fn expand_plan_progress_returns_single_event() {
+        let event = crate::session_journal::JournalEvent::plan_progress(
+            Some("sess-plan"),
+            5,
+            "sub-2",
+            "Run tests",
+            "completed",
+            66,
+            3,
+            2,
+        );
+        let events = IngestionEvent::expand_journal_event(&event, "u1");
+        assert_eq!(
+            events.len(),
+            1,
+            "plan_progress should not be expanded into tool_call sub-events"
+        );
+        assert_eq!(events[0].event_type, "plan_progress");
+    }
+
+    #[test]
+    fn session_end_event_type_matches_insert_batch_check() {
+        // insert_batch checks `event.event_type == "session_end"` to close sessions.
+        // Verify the transform produces exactly that string.
+        let event = crate::session_journal::JournalEvent::session_end(Some("s1"), 5);
+        let ingestion = IngestionEvent::from_journal_event(&event, "u1");
+        assert_eq!(
+            ingestion.event_type, "session_end",
+            "event_type must be exactly 'session_end' for insert_batch session-close logic"
+        );
+    }
+
     // ── expand_journal_event tests ──────────────────────────────────────
 
     #[test]

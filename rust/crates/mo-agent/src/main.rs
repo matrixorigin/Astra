@@ -1835,6 +1835,7 @@ async fn run_plan_execution(
                         plan.items_done() as usize,
                     );
                     let _ = j.append(&evt);
+                    repl_turn::enqueue_ingestion_pub(state, &evt);
                 }
             } else {
                 let blocked: Vec<_> = plan
@@ -2000,6 +2001,7 @@ async fn run_plan_execution(
                     plan.items_done() as usize,
                 );
                 let _ = j.append(&evt);
+                repl_turn::enqueue_ingestion_pub(state, &evt);
             }
 
             // Put plan back before calling handle_chat_input
@@ -2078,6 +2080,7 @@ async fn run_plan_execution(
                         plan.items_done() as usize,
                     );
                     let _ = j.append(&evt);
+                    repl_turn::enqueue_ingestion_pub(state, &evt);
                 }
             }
         }
@@ -2851,6 +2854,18 @@ async fn handle_slash_command(
 
         "/exit" | "/quit" => {
             eprintln!("{}", "  Goodbye.".dim());
+            // Journal + ingestion: session end (same as Ctrl+D path)
+            if let Some(ref j) = state.journal {
+                let end_event = session_journal::JournalEvent::session_end(
+                    state.session_id.as_deref(),
+                    state.turn,
+                );
+                let _ = j.append(&end_event);
+                repl_turn::enqueue_ingestion_pub(state, &end_event);
+            }
+            if let Some(mc) = state.matrix_runtime.as_ref() {
+                mc.shutdown_ingestion();
+            }
             if state.turn > 0
                 && let Some(ref sid) = state.session_id
             {
@@ -3306,6 +3321,18 @@ async fn run_chat_repl(
                 clear_slash_overlay();
                 eprintln!("{}", "  ✗ Input error — exiting session.".red());
                 eprintln!("{}", format!("  ({e})").dim());
+                // Journal + ingestion: session end on error exit
+                if let Some(ref j) = state.journal {
+                    let end_event = session_journal::JournalEvent::session_end(
+                        state.session_id.as_deref(),
+                        state.turn,
+                    );
+                    let _ = j.append(&end_event);
+                    repl_turn::enqueue_ingestion_pub(&state, &end_event);
+                }
+                if let Some(mc) = state.matrix_runtime.as_ref() {
+                    mc.shutdown_ingestion();
+                }
                 break;
             }
         }
@@ -3989,6 +4016,79 @@ mod tests {
             .await
             .unwrap();
         assert!(exit);
+    }
+
+    #[tokio::test]
+    async fn slash_exit_writes_session_end_to_journal() {
+        let api = mo_thin_client::ThinClient::new("http://unused", None).unwrap();
+        let selector = tool_selector::TfIdfSelector::new(tool_registry::ToolRegistry::new(
+            edge_tools::all_tool_schemas(),
+        ));
+
+        let sid = format!("test-exit-end-{}", uuid::Uuid::new_v4());
+        let writer = session_journal::JournalWriter::new(&sid).unwrap();
+        writer
+            .append(&session_journal::JournalEvent::session_start(
+                Some(&sid),
+                None,
+            ))
+            .unwrap();
+
+        let mut state = ReplState::default();
+        state.session_id = Some(sid.clone());
+        state.turn = 3;
+        state.journal = Some(session_journal::JournalWriter::new(&sid).unwrap());
+
+        let exit = handle_slash_command("/exit", &api, None, &mut state, None, &selector)
+            .await
+            .unwrap();
+        assert!(exit);
+
+        // Verify session_end was written to journal
+        let events = session_journal::read_journal(&sid).unwrap();
+        let has_session_end = events
+            .iter()
+            .any(|e| matches!(e.event_type, session_journal::JournalEventType::SessionEnd));
+        assert!(
+            has_session_end,
+            "session_end event must be written to journal on /exit"
+        );
+    }
+
+    #[tokio::test]
+    async fn slash_quit_writes_session_end_to_journal() {
+        let api = mo_thin_client::ThinClient::new("http://unused", None).unwrap();
+        let selector = tool_selector::TfIdfSelector::new(tool_registry::ToolRegistry::new(
+            edge_tools::all_tool_schemas(),
+        ));
+
+        let sid = format!("test-quit-end-{}", uuid::Uuid::new_v4());
+        let writer = session_journal::JournalWriter::new(&sid).unwrap();
+        writer
+            .append(&session_journal::JournalEvent::session_start(
+                Some(&sid),
+                None,
+            ))
+            .unwrap();
+
+        let mut state = ReplState::default();
+        state.session_id = Some(sid.clone());
+        state.turn = 1;
+        state.journal = Some(session_journal::JournalWriter::new(&sid).unwrap());
+
+        let exit = handle_slash_command("/quit", &api, None, &mut state, None, &selector)
+            .await
+            .unwrap();
+        assert!(exit);
+
+        let events = session_journal::read_journal(&sid).unwrap();
+        let has_session_end = events
+            .iter()
+            .any(|e| matches!(e.event_type, session_journal::JournalEventType::SessionEnd));
+        assert!(
+            has_session_end,
+            "session_end event must be written to journal on /quit"
+        );
     }
 
     #[tokio::test]

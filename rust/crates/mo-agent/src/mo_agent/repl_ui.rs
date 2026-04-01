@@ -15,6 +15,7 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/plan history", "Show plan version history"),
     ("/resume", "Resume a previous session: /resume [session_id]"),
     ("/exit", "Exit the REPL"),
+    ("/quit", "Exit the REPL (alias for /exit)"),
     // ── Account ───────────────────────────────────────────────────────────
     ("/login", "Authenticate with the API"),
     ("/register", "Register a new account"),
