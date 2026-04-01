@@ -149,7 +149,8 @@ async fn maybe_auto_compact(
         .dim()
     );
 
-    let mut auto_pm_compact = PermissionManager::new(true);
+    let mut auto_pm_compact =
+        PermissionManager::with_project(true, &std::env::current_dir().unwrap_or_default());
     let compact_result = stream_chat_sse(ChatTurnParams {
         api: ctx.api,
         token,

@@ -446,7 +446,10 @@ impl Default for ReplState {
             context_budget: prompts::ContextBudget::default(),
             journal: None,
             recent_tools: Vec::new(),
-            perm_manager: PermissionManager::new(false),
+            perm_manager: PermissionManager::with_project(
+                false,
+                &std::env::current_dir().unwrap_or_default(),
+            ),
             ingestion_user_id: None,
             matrix_runtime: None,
             learning_snapshot: None,

@@ -38,7 +38,10 @@ pub(super) async fn execute_cli_command(
             let (mut creds, name, _, token) = get_profile_and_token(profile.as_deref())?;
             let session_id = resumable_last_session_id(profile.as_deref());
             let selector = create_tool_selector(api, profile.as_deref());
-            let mut pm = PermissionManager::new(false);
+            let mut pm = PermissionManager::with_project(
+                false,
+                &std::env::current_dir().unwrap_or_default(),
+            );
             let sr = match stream_chat_sse(ChatTurnParams {
                 api,
                 token: &token,
@@ -243,7 +246,10 @@ pub(super) async fn execute_cli_command(
                 .or_else(|| resumable_last_session_id(profile.as_deref()));
             let is_tty = terminal::size().is_ok();
             let selector = create_tool_selector(api, profile.as_deref());
-            let mut pm = PermissionManager::new(args.auto_approve);
+            let mut pm = PermissionManager::with_project(
+                args.auto_approve,
+                &std::env::current_dir().unwrap_or_default(),
+            );
             let explain_mode = if args.explain {
                 ExplainMode::On
             } else {

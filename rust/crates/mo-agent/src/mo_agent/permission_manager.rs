@@ -79,7 +79,6 @@ pub(super) struct PermissionSettings {
 
 impl PermissionSettings {
     /// Load from the project-level settings file (`.kiro/permissions.json`).
-    #[allow(dead_code)] // Used by PermissionManager::with_project (currently test-only)
     pub fn load(project_root: &Path) -> Self {
         let path = project_root.join(".kiro").join("permissions.json");
         match fs::read_to_string(&path) {
@@ -89,7 +88,6 @@ impl PermissionSettings {
     }
 
     /// Save to the project-level settings file.
-    #[allow(dead_code)] // Used by PermissionManager::add_allow_rule (currently test-only)
     pub fn save(&self, project_root: &Path) -> io::Result<()> {
         let dir = project_root.join(".kiro");
         fs::create_dir_all(&dir)?;
@@ -98,7 +96,7 @@ impl PermissionSettings {
         fs::write(path, json)
     }
 
-    #[allow(dead_code)] // Internal helper; used in with_project and add_allow_rule
+    #[allow(dead_code)] // Used in tests and by with_project
     fn parsed_allow_rules(&self) -> Vec<PermissionRule> {
         self.allow
             .iter()
@@ -106,7 +104,7 @@ impl PermissionSettings {
             .collect()
     }
 
-    #[allow(dead_code)] // Internal helper; used in with_project and tests
+    #[allow(dead_code)] // Used in tests and by with_project
     fn parsed_deny_rules(&self) -> Vec<PermissionRule> {
         self.deny.iter().map(|s| PermissionRule::parse(s)).collect()
     }
@@ -116,10 +114,8 @@ pub(super) struct PermissionManager {
     auto_approve: bool,
     session_overrides: HashMap<String, bool>,
     /// Persistent rules loaded from settings file.
-    #[allow(dead_code)] // Used by add_allow_rule (test-only path)
     settings: PermissionSettings,
     /// Project root for settings persistence.
-    #[allow(dead_code)] // Used by add_allow_rule (test-only path)
     project_root: Option<PathBuf>,
     /// Cached parsed rules (invalidated on settings change).
     cached_allow: Vec<PermissionRule>,
@@ -127,6 +123,8 @@ pub(super) struct PermissionManager {
 }
 
 impl PermissionManager {
+    /// Create without loading project settings. Used in tests and internal auto-approved operations.
+    #[cfg(test)]
     pub(super) fn new(auto_approve: bool) -> Self {
         Self {
             auto_approve,
@@ -139,7 +137,7 @@ impl PermissionManager {
     }
 
     /// Create with settings loaded from a project directory.
-    #[allow(dead_code)] // Will be used when permission UI is wired up
+    /// Loads `.kiro/permissions.json` if it exists, applying persistent allow/deny rules.
     pub(super) fn with_project(auto_approve: bool, project_root: &Path) -> Self {
         let settings = PermissionSettings::load(project_root);
         let cached_allow = settings.parsed_allow_rules();
@@ -407,7 +405,6 @@ impl PermissionManager {
     }
 
     /// Add a persistent allow rule and save to disk.
-    #[allow(dead_code)] // Will be used when permission UI is wired up
     pub(super) fn add_allow_rule(&mut self, rule: &str) {
         if !self.settings.allow.contains(&rule.to_string()) {
             self.settings.allow.push(rule.to_string());
@@ -526,9 +523,16 @@ impl PermissionManager {
             'y' => true,
             'a' => {
                 self.session_overrides.insert(name.to_string(), true);
+                // Persist as a project-level allow rule so it survives sessions
+                self.add_allow_rule(name);
+                let scope = if self.project_root.is_some() {
+                    "project"
+                } else {
+                    "session"
+                };
                 eprintln!(
                     "  {}",
-                    format!("  ✓ {name}: auto-approved for session").dim()
+                    format!("  ✓ {name}: always allowed ({scope})").dim()
                 );
                 true
             }

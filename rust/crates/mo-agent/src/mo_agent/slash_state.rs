@@ -109,7 +109,8 @@ pub(super) async fn handle_state_command(
             };
 
             eprintln!("  {}", "Summarizing…".dim());
-            let mut auto_pm = PermissionManager::new(true);
+            let mut auto_pm =
+                PermissionManager::with_project(true, &std::env::current_dir().unwrap_or_default());
             let summary_result = tokio::select! {
                 r = stream_chat_sse(ChatTurnParams {
                     api,
@@ -181,7 +182,10 @@ pub(super) async fn handle_state_command(
                 // Extract structured facts from summary and store each individually
                 if saved_to_memoria {
                     let extract_msg = format!("{}{summary}", prompts::MEMORY_EXTRACTOR_PROMPT);
-                    let mut auto_pm2 = PermissionManager::new(true);
+                    let mut auto_pm2 = PermissionManager::with_project(
+                        true,
+                        &std::env::current_dir().unwrap_or_default(),
+                    );
                     let extract_result = stream_chat_sse(ChatTurnParams {
                         api,
                         token: tok,
@@ -234,7 +238,10 @@ pub(super) async fn handle_state_command(
                                  If no pattern exists, respond with exactly: NONE",
                                 fact_lines.join("\n")
                             );
-                            let mut auto_pm3 = PermissionManager::new(true);
+                            let mut auto_pm3 = PermissionManager::with_project(
+                                true,
+                                &std::env::current_dir().unwrap_or_default(),
+                            );
                             let synth_result = stream_chat_sse(ChatTurnParams {
                                 api,
                                 token: tok,
