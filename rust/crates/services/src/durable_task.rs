@@ -578,6 +578,23 @@ impl TaskBranchService {
     }
 }
 
+/// Validate a snapshot name is safe for SQL embedding (alphanumeric + underscore only).
+fn validate_snapshot_name(name: &str) -> Result<(), String> {
+    if name.is_empty() {
+        return Err("empty snapshot name".into());
+    }
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_')
+    {
+        return Err(format!(
+            "invalid snapshot name '{}': only [a-zA-Z0-9_] allowed",
+            name
+        ));
+    }
+    Ok(())
+}
+
 #[async_trait]
 impl TaskBranchOps for TaskBranchService {
     async fn create_snapshot(
@@ -587,9 +604,7 @@ impl TaskBranchOps for TaskBranchService {
         version: u32,
     ) -> Result<String, String> {
         let name = format!("task_{task_id}_{subtask_id}_v{version}");
-        if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
-            return Err("invalid snapshot name".into());
-        }
+        validate_snapshot_name(&name)?;
         let sql = format!("CREATE SNAPSHOT {name} FOR ACCOUNT");
         sqlx::query(&sql)
             .execute(&self.pool)
@@ -599,6 +614,7 @@ impl TaskBranchOps for TaskBranchService {
     }
 
     async fn diff_since_snapshot(&self, snapshot: &str) -> Result<DiffSummary, String> {
+        validate_snapshot_name(snapshot)?;
         let sql = format!("SELECT COUNT(*) AS cnt FROM mo_diff('{snapshot}', 'CURRENT')");
         let row = sqlx::query(&sql)
             .fetch_one(&self.pool)
@@ -612,6 +628,7 @@ impl TaskBranchOps for TaskBranchService {
     }
 
     async fn rollback_to_snapshot(&self, snapshot: &str) -> Result<(), String> {
+        validate_snapshot_name(snapshot)?;
         let sql = format!("RESTORE ACCOUNT FROM SNAPSHOT {snapshot}");
         sqlx::query(&sql)
             .execute(&self.pool)
@@ -621,6 +638,7 @@ impl TaskBranchOps for TaskBranchService {
     }
 
     async fn cleanup_snapshot(&self, snapshot: &str) -> Result<(), String> {
+        validate_snapshot_name(snapshot)?;
         let sql = format!("DROP SNAPSHOT IF EXISTS {snapshot}");
         sqlx::query(&sql)
             .execute(&self.pool)
@@ -1642,6 +1660,17 @@ impl DurableTaskLifecycle for MatrixOneDurableTaskLifecycle {
             .ok_or_else(|| format!("no contract for task '{task_id}'"))?;
 
         let subtask = Self::find_subtask(&contract, subtask_id)?;
+        // State guard: only verify subtasks ready for verification
+        if !matches!(
+            subtask.stage,
+            SubtaskStage::AwaitingVerification | SubtaskStage::Verifying
+        ) {
+            return Err(format!(
+                "subtask '{}' not ready for verification (stage: {})",
+                subtask_id,
+                subtask.stage.as_str()
+            ));
+        }
         let durable_st = subtask.clone();
 
         // Run verification
@@ -2116,6 +2145,18 @@ impl DurableTaskLifecycle for LocalDurableTaskLifecycle {
             .ok_or_else(|| format!("subtask '{subtask_id}' not found"))?
             .clone();
 
+        // State guard: only verify subtasks ready for verification
+        if !matches!(
+            durable_st.stage,
+            SubtaskStage::AwaitingVerification | SubtaskStage::Verifying
+        ) {
+            return Err(format!(
+                "subtask '{}' not ready for verification (stage: {})",
+                subtask_id,
+                durable_st.stage.as_str()
+            ));
+        }
+
         let runner = VerificationRunner::new(self.work_dir.clone());
         let report = runner.verify_subtask(&durable_st).await;
 
@@ -2124,7 +2165,7 @@ impl DurableTaskLifecycle for LocalDurableTaskLifecycle {
             .subtasks
             .iter_mut()
             .find(|s| s.id == subtask_id)
-            .unwrap();
+            .ok_or_else(|| format!("subtask '{subtask_id}' disappeared during verification"))?;
         if report.all_required_passed {
             subtask.stage = SubtaskStage::Verified;
             // Git4Data: cleanup snapshot after successful verification
@@ -3578,5 +3619,54 @@ mod tests {
         let c = svc.get_contract(&contract.contract_id).await.unwrap().unwrap();
         let diff = c.subtasks[0].diff_summary.as_ref().unwrap();
         assert!(diff.changed_rows >= 1, "should detect changes: {:?}", diff);
+    }
+
+    // ── Security & State Guard Tests ──
+
+    #[test]
+    fn validate_snapshot_name_rejects_injection() {
+        assert!(validate_snapshot_name("task_abc_sub1_v1").is_ok());
+        assert!(validate_snapshot_name("task123").is_ok());
+        // SQL injection attempts
+        assert!(validate_snapshot_name("test'; DROP TABLE--").is_err());
+        assert!(validate_snapshot_name("snap name with spaces").is_err());
+        assert!(validate_snapshot_name("snap;DELETE").is_err());
+        assert!(validate_snapshot_name("").is_err());
+        assert!(validate_snapshot_name("snap/path").is_err());
+        assert!(validate_snapshot_name("snap\x00null").is_err());
+    }
+
+    #[tokio::test]
+    async fn verify_subtask_rejects_wrong_state() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mock = Arc::new(MockBranchOps::new());
+        let svc = make_local_svc_with_mock(&tmp, mock);
+
+        let plan = make_test_plan();
+        let contract = svc
+            .create_contract("u", "s", "test", &plan, TaskScope::default())
+            .await
+            .unwrap();
+
+        // Try to verify a Pending subtask → should fail
+        let err = svc
+            .verify_subtask(&contract.task_id, "sub-1")
+            .await
+            .unwrap_err();
+        assert!(
+            err.contains("not ready for verification"),
+            "unexpected error: {err}"
+        );
+
+        // Begin subtask (now Executing) → still not verifiable
+        svc.begin_subtask(&contract.task_id, "sub-1").await.unwrap();
+        let err = svc
+            .verify_subtask(&contract.task_id, "sub-1")
+            .await
+            .unwrap_err();
+        assert!(
+            err.contains("not ready for verification"),
+            "unexpected error: {err}"
+        );
     }
 }
