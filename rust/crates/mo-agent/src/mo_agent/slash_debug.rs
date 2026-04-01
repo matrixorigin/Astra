@@ -43,8 +43,28 @@ pub(super) fn handle_debug_command(arg: &str, state: &ReplState) {
     // ── Overview ──
     print_overview(&session_id, &turns, &checkpoints);
 
-    if turns.is_empty() {
+    if turns.is_empty() && checkpoints.is_empty() {
         eprintln!("\n  {}", "No turn data yet. Complete a conversation turn first.".dim());
+        return;
+    }
+
+    // If journal has no turns but checkpoints exist, offer checkpoint-only inspection.
+    if turns.is_empty() {
+        eprintln!("\n  {}", "No journal turns (journal may not have been initialized).".dim());
+        eprintln!("  {} checkpoints available — inspecting latest.", checkpoints.len().to_string().green());
+        if let Some(messages) = load_checkpoint_messages(&checkpoints, 0) {
+            let stub = TurnSummary {
+                user_input: messages.first()
+                    .filter(|m| m.get("role").and_then(|v| v.as_str()) == Some("user"))
+                    .and_then(|m| m.get("content").and_then(|v| v.as_str()))
+                    .unwrap_or("(unknown)")
+                    .to_string(),
+                tokens_in: 0, tokens_out: 0, duration_ms: 0, ttft_ms: 0,
+                tool_count: messages.iter().filter(|m| m.get("role").and_then(|v| v.as_str()) == Some("tool")).count(),
+                tools_used: Vec::new(), tool_calls: Vec::new(), selector_strategy: None,
+            };
+            inspect_turn(1, &stub, Some(&messages));
+        }
         return;
     }
 
