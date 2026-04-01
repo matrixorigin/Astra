@@ -541,4 +541,141 @@ mod tests {
         let dir = PathBuf::from("/tmp/nonexistent-debug-session");
         assert!(list_heavy_checkpoints(&dir).is_empty());
     }
+
+    // ── Bug fix: truncate must not panic on multi-byte chars ─────────────
+
+    #[test]
+    fn truncate_multibyte_no_panic() {
+        // The `…` char is 3 bytes. Cutting at byte 80 inside it caused a panic.
+        let s = format!("{}…rest", "x".repeat(79));
+        let t = truncate(&s, 80);
+        assert!(t.contains("truncated"));
+        // Must not panic — that's the test.
+    }
+
+    // ── Bug fix: tool name from tool_call_id ─────────────────────────────
+
+    #[test]
+    fn tool_name_from_tool_call_id() {
+        let msg = serde_json::json!({
+            "role": "tool",
+            "tool_call_id": "git_status:0",
+            "content": "## main"
+        });
+        // Simulate the extraction logic from show_tools
+        let name = msg.get("name")
+            .and_then(|v| v.as_str())
+            .or_else(|| {
+                msg.get("tool_call_id")
+                    .and_then(|v| v.as_str())
+                    .and_then(|id| id.split(':').next())
+            })
+            .unwrap_or("?");
+        assert_eq!(name, "git_status");
+    }
+
+    #[test]
+    fn tool_name_falls_back_to_name_field() {
+        let msg = serde_json::json!({
+            "role": "tool",
+            "name": "bash",
+            "content": "ok"
+        });
+        let name = msg.get("name")
+            .and_then(|v| v.as_str())
+            .or_else(|| {
+                msg.get("tool_call_id")
+                    .and_then(|v| v.as_str())
+                    .and_then(|id| id.split(':').next())
+            })
+            .unwrap_or("?");
+        assert_eq!(name, "bash");
+    }
+
+    // ── Bug fix: short session ID resolution ─────────────────────────────
+
+    #[test]
+    fn resolve_session_id_no_match_returns_input() {
+        // No sessions dir match → returns original input
+        let result = resolve_session_id("zzz-nonexistent-prefix");
+        assert_eq!(result, "zzz-nonexistent-prefix");
+    }
+
+    #[test]
+    fn resolve_session_id_exact_uuid_passthrough() {
+        // Full UUID that doesn't exist → returns as-is (no crash)
+        let fake = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        assert_eq!(resolve_session_id(fake), fake);
+    }
+
+    // ── Bug fix: load_journal_turns parses real entries ───────────────────
+
+    #[test]
+    fn load_journal_turns_parses_turn_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.jsonl");
+        std::fs::write(&path, concat!(
+            r#"{"type":"session_start","ts":"2026-01-01T00:00:00Z","session_id":"s1"}"#, "\n",
+            r#"{"type":"turn","ts":"2026-01-01T00:01:00Z","session_id":"s1","turn":1,"user_input":"hello","assistant_output":"hi","tool_count":2,"tokens_in":100,"tokens_out":50,"duration_ms":5000,"tools_selected":[],"tools_used":["bash","grep"],"budget_used":0,"budget_pressure":0.0,"ttft_ms":1000,"context_ms":200,"selector_strategy":"tfidf","selector_ms":10,"memoria_ms":5}"#, "\n",
+        )).unwrap();
+        let turns = load_journal_turns(&path);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].user_input, "hello");
+        assert_eq!(turns[0].tokens_in, 100);
+        assert_eq!(turns[0].tokens_out, 50);
+        assert_eq!(turns[0].duration_ms, 5000);
+        assert_eq!(turns[0].ttft_ms, 1000);
+        assert_eq!(turns[0].tools_used, vec!["bash", "grep"]);
+    }
+
+    #[test]
+    fn load_journal_turns_skips_non_turn_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.jsonl");
+        std::fs::write(&path, concat!(
+            r#"{"type":"session_start","ts":"2026-01-01T00:00:00Z","session_id":"s1"}"#, "\n",
+            r#"{"type":"checkpoint","ts":"2026-01-01T00:01:00Z","session_id":"s1","turn":1}"#, "\n",
+        )).unwrap();
+        let turns = load_journal_turns(&path);
+        assert!(turns.is_empty());
+    }
+
+    #[test]
+    fn load_journal_turns_handles_missing_tool_calls() {
+        // Turn with tool_count=0 and no tool_calls field — must not fail
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.jsonl");
+        std::fs::write(&path, concat!(
+            r#"{"type":"turn","ts":"2026-01-01T00:01:00Z","session_id":"s1","turn":1,"user_input":"hi","assistant_output":"hello","tool_count":0,"tokens_in":50,"tokens_out":10,"duration_ms":1000,"tools_selected":[],"tools_used":[],"budget_used":0,"budget_pressure":0.0,"ttft_ms":500}"#, "\n",
+        )).unwrap();
+        let turns = load_journal_turns(&path);
+        assert_eq!(turns.len(), 1);
+        assert!(turns[0].tool_calls.is_empty());
+    }
+
+    // ── Bug fix: checkpoint loading ──────────────────────────────────────
+
+    #[test]
+    fn load_checkpoint_messages_returns_none_for_empty() {
+        assert!(load_checkpoint_messages(&[]).is_none());
+    }
+
+    #[test]
+    fn load_checkpoint_messages_parses_heavy_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("000001-heavy.json");
+        std::fs::write(&path, r#"{"Heavy":{"light":{},"messages":[{"role":"user","content":"test"}]}}"#).unwrap();
+        let msgs = load_checkpoint_messages(&[path]).unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0]["role"], "user");
+        assert_eq!(msgs[0]["content"], "test");
+    }
+
+    #[test]
+    fn load_checkpoint_messages_returns_none_for_malformed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("000001-heavy.json");
+        std::fs::write(&path, "not json").unwrap();
+        assert!(load_checkpoint_messages(&[path]).is_none());
+    }
 }

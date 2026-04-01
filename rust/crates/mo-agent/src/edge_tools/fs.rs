@@ -2008,6 +2008,97 @@ type Handler interface {
         );
     }
 
+    // ── Bug fix: pre-read size gate allows ranged reads ──────────────────────
+
+    #[test]
+    fn read_file_size_gate_allows_ranged_read_of_large_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("big.txt");
+        let mut f = std::fs::File::create(&file_path).unwrap();
+        for i in 0..3000 {
+            writeln!(f, "line {i}: {}", "x".repeat(30)).unwrap();
+        }
+        drop(f);
+
+        let executor = test_executor_in(dir.path());
+        // Full read should be rejected
+        let full = executor.read_file(&serde_json::json!({"path": "big.txt"}));
+        assert!(full.contains("too large"), "full read should be rejected: {}", &full[..100.min(full.len())]);
+
+        // Ranged read should succeed
+        let ranged = executor.read_file(&serde_json::json!({"path": "big.txt", "start_line": 1, "end_line": 10}));
+        assert!(!ranged.contains("too large"), "ranged read should succeed");
+        assert!(ranged.contains("line 0"), "should contain first line");
+    }
+
+    #[test]
+    fn read_file_size_gate_allows_outline_of_large_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("big.rs");
+        let mut f = std::fs::File::create(&file_path).unwrap();
+        writeln!(f, "fn main() {{}}").unwrap();
+        for i in 0..3000 {
+            writeln!(f, "// line {i} {}", "x".repeat(30)).unwrap();
+        }
+        drop(f);
+
+        let executor = test_executor_in(dir.path());
+        let outline = executor.read_file(&serde_json::json!({"path": "big.rs", "outline": true}));
+        assert!(!outline.contains("too large"), "outline should bypass size gate");
+    }
+
+    // ── Bug fix: auto-expand respects size gate ──────────────────────────────
+
+    #[test]
+    fn read_file_auto_expand_blocked_for_large_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("big.txt");
+        let mut f = std::fs::File::create(&file_path).unwrap();
+        for i in 0..3000 {
+            writeln!(f, "line {i}: {}", "x".repeat(30)).unwrap();
+        }
+        drop(f);
+
+        let executor = test_executor_in(dir.path());
+        // First ranged read
+        let r1 = executor.read_file(&serde_json::json!({"path": "big.txt", "start_line": 1, "end_line": 5}));
+        assert!(r1.contains("line 0"), "first range should work");
+
+        // Second ranged read — should NOT auto-expand (file too large)
+        let r2 = executor.read_file(&serde_json::json!({"path": "big.txt", "start_line": 10, "end_line": 15}));
+        assert!(!r2.contains("Auto-expanded"), "should NOT auto-expand large file: {}", &r2[..100.min(r2.len())]);
+    }
+
+    // ── Bug fix: ranged reads don't increment read_count ─────────────────────
+
+    #[test]
+    fn read_file_ranged_reads_no_warning() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("big.txt");
+        let mut f = std::fs::File::create(&file_path).unwrap();
+        for i in 0..3000 {
+            writeln!(f, "line {i}: {}", "x".repeat(30)).unwrap();
+        }
+        drop(f);
+
+        let executor = test_executor_in(dir.path());
+        // 5 ranged reads of different sections — should NOT trigger "read 4+ times" warning
+        for start in (1..=50).step_by(10) {
+            executor.read_file(&serde_json::json!({
+                "path": "big.txt",
+                "start_line": start,
+                "end_line": start + 5
+            }));
+        }
+        let last = executor.read_file(&serde_json::json!({
+            "path": "big.txt",
+            "start_line": 60,
+            "end_line": 65
+        }));
+        assert!(!last.contains("read 4+ times"), "ranged reads should not trigger warning");
+        assert!(!last.contains("read 3 times"), "ranged reads should not trigger warning");
+    }
+
     // ── read_file not-found hints ────────────────────────────────────────────
 
     #[test]
