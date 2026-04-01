@@ -65,8 +65,8 @@ impl TerminalDiffSink {
         }
     }
 
-    fn clip(&self, s: &str) -> String {
-        let w = self.width.saturating_sub(1);
+    fn clip_with(&self, s: &str, max_chars: usize) -> String {
+        let w = max_chars.max(1);
         if s.chars().count() <= w {
             return s.to_string();
         }
@@ -81,6 +81,10 @@ impl TerminalDiffSink {
             n += 1;
         }
         out
+    }
+
+    fn clip(&self, s: &str) -> String {
+        self.clip_with(s, self.width.saturating_sub(1))
     }
 
     fn bump(&mut self) -> bool {
@@ -123,28 +127,42 @@ impl DiffSink for TerminalDiffSink {
         if !self.bump() {
             return;
         }
-        let _ = writeln!(io::stdout(), "{}", self.clip(line).magenta());
+        let max_chars = self.width.saturating_sub(3);
+        let _ = write!(io::stdout(), "{}", "│ ".dim());
+        let _ = writeln!(io::stdout(), "{}", self.clip_with(line, max_chars).magenta());
     }
 
     fn add_line(&mut self, line: &str) {
         if !self.bump() {
             return;
         }
-        let _ = writeln!(io::stdout(), "{}", self.clip(line).green());
+        let body = line.strip_prefix('+').unwrap_or(line);
+        let max_body = self.width.saturating_sub(4);
+        let body_clip = self.clip_with(body, max_body);
+        let _ = write!(io::stdout(), "{}", "│ ".dim());
+        let _ = write!(io::stdout(), "{}", "+".green().bold());
+        let _ = writeln!(io::stdout(), "{}", body_clip.green());
     }
 
     fn del_line(&mut self, line: &str) {
         if !self.bump() {
             return;
         }
-        let _ = writeln!(io::stdout(), "{}", self.clip(line).red());
+        let body = line.strip_prefix('-').unwrap_or(line);
+        let max_body = self.width.saturating_sub(4);
+        let body_clip = self.clip_with(body, max_body);
+        let _ = write!(io::stdout(), "{}", "│ ".dim());
+        let _ = write!(io::stdout(), "{}", "-".red().bold());
+        let _ = writeln!(io::stdout(), "{}", body_clip.red());
     }
 
     fn context_line(&mut self, line: &str) {
         if !self.bump() {
             return;
         }
-        let _ = writeln!(io::stdout(), "{}", self.clip(line).dim());
+        let max_chars = self.width.saturating_sub(3);
+        let _ = write!(io::stdout(), "{}", "│ ".dim());
+        let _ = writeln!(io::stdout(), "{}", self.clip_with(line, max_chars).dim());
     }
 }
 

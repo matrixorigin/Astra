@@ -103,6 +103,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
         // flash on screen before the tool results replace it.
         if let Some(md) = &mut self.render.md {
             md.clear_all();
+            self.render.lines_written = 0;
         }
         // Show tool as running (in-place updatable via TerminalRegion).
         let tool_idx = if !self.quiet {
@@ -203,6 +204,9 @@ impl SseStreamHost for CliSseStreamHost<'_> {
 // ═══════════════════════════════════════════════════════════════ Spinner ══
 
 const SPINNER_FRAMES: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+
+/// Skip `● Thought for …` when thinking was shorter than this (reduces stderr churn).
+const MIN_THOUGHT_DURATION_LOG_SECS: f64 = 1.5;
 
 /// A spinner that runs in a background thread.
 pub(super) struct Spinner {
@@ -381,13 +385,14 @@ impl StreamRenderState {
             spinner.stop_clear();
             if let Some(start) = self.thinking_start.take() {
                 let elapsed = start.elapsed().as_secs_f64();
-                // Print thinking duration via stdout so it doesn't interfere
-                // with TerminalRegion cursor tracking.
-                let line = edge_sse_thought_duration_line(elapsed);
-                println!("{}", line.clone().dim());
-                let _ = io::stdout().flush();
-                self.lines_written += 1;
-                self.col = 0;
+                if elapsed >= MIN_THOUGHT_DURATION_LOG_SECS {
+                    // stdout: keep TerminalRegion stderr cursor stable
+                    let line = edge_sse_thought_duration_line(elapsed);
+                    println!("{}", line.dim());
+                    let _ = io::stdout().flush();
+                    self.lines_written += 1;
+                    self.col = 0;
+                }
             }
         }
     }
@@ -702,4 +707,5 @@ mod tests {
         s.track_eprintln(); // ⚡ tool_request: bash
         assert_eq!(s.lines_written, 3);
     }
+
 }

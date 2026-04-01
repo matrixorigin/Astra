@@ -57,6 +57,8 @@ pub enum HeadlessStderrStyle {
     DiffAdd,
     /// Unified diff `-` line (not `---`).
     DiffRemove,
+    /// Unified diff context (` `) and `\ No newline…` meta lines.
+    DiffContext,
     /// Read file body / neutral code line.
     Normal,
 }

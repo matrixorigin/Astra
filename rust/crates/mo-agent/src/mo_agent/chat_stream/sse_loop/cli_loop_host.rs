@@ -120,9 +120,26 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
             HeadlessStderrStyle::Green => eprintln!("{}", line.green()),
             HeadlessStderrStyle::Yellow => eprintln!("{}", line.yellow()),
             HeadlessStderrStyle::CyanBold => eprintln!("{}", line.cyan().bold()),
-            HeadlessStderrStyle::Magenta => eprintln!("{}", line.magenta()),
-            HeadlessStderrStyle::DiffAdd => eprintln!("{}", line.green()),
-            HeadlessStderrStyle::DiffRemove => eprintln!("{}", line.red()),
+            HeadlessStderrStyle::Magenta => {
+                eprint!("{}", "│ ".dim());
+                eprintln!("{}", line.magenta());
+            }
+            HeadlessStderrStyle::DiffAdd => {
+                let body = line.strip_prefix('+').unwrap_or(line.as_str());
+                eprint!("{}", "│ ".dim());
+                eprint!("{}", "+".green().bold());
+                eprintln!("{}", body.green());
+            }
+            HeadlessStderrStyle::DiffRemove => {
+                let body = line.strip_prefix('-').unwrap_or(line.as_str());
+                eprint!("{}", "│ ".dim());
+                eprint!("{}", "-".red().bold());
+                eprintln!("{}", body.red());
+            }
+            HeadlessStderrStyle::DiffContext => {
+                eprint!("{}", "│ ".dim());
+                eprintln!("{}", line.dim());
+            }
             HeadlessStderrStyle::Normal => eprintln!("{}", line),
         }
         self.pending_clear_lines += 1;

@@ -3,8 +3,9 @@
 use super::agentic_headless_round::{HeadlessRoundTerminal, HeadlessStderrStyle};
 use super::tool_result_sanitize::{STR_REPLACE_DIFF_END, STR_REPLACE_DIFF_START};
 
-const READ_PREVIEW_MAX_LINES: usize = 200;
-const DIFF_EMIT_MAX_LINES: usize = 400;
+/// Tighter than before — large reviews should not flood stderr; use `/diff` or open files.
+const READ_PREVIEW_MAX_LINES: usize = 72;
+const DIFF_EMIT_MAX_LINES: usize = 120;
 
 /// After tool OK/error headers, emit read bodies and diffs (no-op when `quiet` or error).
 pub fn emit_headless_tool_body_preview(
@@ -158,6 +159,12 @@ fn diff_line_style(line: &str) -> HeadlessStderrStyle {
     }
     if line.starts_with("@@") {
         return HeadlessStderrStyle::Magenta;
+    }
+    if line.starts_with('\\') {
+        return HeadlessStderrStyle::DiffContext;
+    }
+    if line.starts_with(' ') {
+        return HeadlessStderrStyle::DiffContext;
     }
     if let Some(rest) = line.strip_prefix('-') {
         if rest.starts_with('-') {

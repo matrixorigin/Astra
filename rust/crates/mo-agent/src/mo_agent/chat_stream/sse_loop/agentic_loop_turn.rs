@@ -236,8 +236,12 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
         (selected, report, conf)
     };
 
-    let skill_instructions =
-        load_skill_instructions_text(ctx.skill_registry, &selected_skills, ctx.quiet);
+    let skill_instructions = load_skill_instructions_text(
+        ctx.skill_registry,
+        &selected_skills,
+        ctx.quiet,
+        ctx.explain.explain_verbose,
+    );
     merge_skill_names_track(ctx.telem.all_selected_skills, &selected_skills);
 
     merge_skill_instructions_into_edge_profile(&mut payload, skill_instructions.as_deref());
@@ -262,11 +266,11 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
     if ctx.explain.explain_stderr {
         let (restricted_line, guidance_line) =
             explain_stderr_payload_line_pair(ctx.restricted_tools, &payload, selection_confidence);
-        if let Some(line) = restricted_line {
-            eprintln!("{}", line.dim());
-        }
-        if let Some(line) = guidance_line {
-            eprintln!("{}", line.dim());
+        match (&restricted_line, &guidance_line) {
+            (Some(r), Some(g)) => eprintln!("{}", format!("{r}  ·  {g}").dim()),
+            (Some(r), None) => eprintln!("{}", r.as_str().dim()),
+            (None, Some(g)) => eprintln!("{}", g.as_str().dim()),
+            (None, None) => {}
         }
     }
     set_payload_tool_results_if_non_empty(&mut payload, ctx.tool_results);
@@ -287,6 +291,7 @@ fn load_skill_instructions_text(
     skill_registry: &SharedSkillRegistry,
     selected_skills: &[String],
     quiet: bool,
+    echo_skill_activation: bool,
 ) -> Option<String> {
     if selected_skills.is_empty() {
         return None;
@@ -310,7 +315,7 @@ fn load_skill_instructions_text(
         }
     }
     let merged = merged?;
-    if !quiet && !activated_skills.is_empty() {
+    if !quiet && echo_skill_activation && !activated_skills.is_empty() {
         eprintln!(
             "  {} Using skill: {}",
             "◆".cyan(),

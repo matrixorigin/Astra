@@ -21,7 +21,7 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/register", "Register a new account"),
     ("/logout", "Logout from the API"),
     // ── Observability ─────────────────────────────────────────────────────
-    ("/explain", "Toggle explain mode (show reasoning)"),
+    ("/explain", "Cycle explain: off → on (API) → verbose (+stderr)"),
     ("/turn", "Show current turn details (timing, tokens, tools)"),
     ("/stats", "Session analytics: turns, tokens, errors"),
     ("/tools", "Tool performance: calls, timing, success rate"),

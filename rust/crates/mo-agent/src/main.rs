@@ -1874,31 +1874,29 @@ async fn run_plan_execution(
             return Ok(());
         }
 
-        // Show parallel group information if there are multiple ready subtasks
+        // Show parallel group information if there are multiple ready subtasks (one line).
         if ready.len() > 1 {
             let group_count = analysis.groups.len();
             let parallel_in_first = analysis.groups.first().map(|g| g.len()).unwrap_or(0);
+            let mut parts: Vec<String> = Vec::new();
             if parallel_in_first > 1 {
-                eprintln!(
-                    "\n{}  {} subtasks ready, {} parallel-safe in current group",
-                    "║".cyan(),
+                parts.push(format!(
+                    "{} subtasks ready · {} parallel-safe",
                     ready.len(),
-                    parallel_in_first,
-                );
+                    parallel_in_first
+                ));
             }
             if !analysis.conflicts.is_empty() {
-                eprintln!(
-                    "{}  ⚠ {} file conflict(s) detected — serializing conflicting subtasks",
-                    "║".cyan(),
-                    analysis.conflicts.len(),
-                );
+                parts.push(format!(
+                    "⚠ {} file conflict(s) — serializing",
+                    analysis.conflicts.len()
+                ));
             }
             if group_count > 1 {
-                eprintln!(
-                    "{}  Executing in {} rounds (by parallel-safety groups)",
-                    "║".cyan(),
-                    group_count,
-                );
+                parts.push(format!("{group_count} parallel rounds"));
+            }
+            if !parts.is_empty() {
+                eprintln!("\n{}  {}", "║".cyan(), parts.join(" · "));
             }
         }
 
@@ -1929,8 +1927,13 @@ async fn run_plan_execution(
                 String::new()
             };
 
+            let pending_tail = if remaining > 0 {
+                format!("  ·  {remaining} pending")
+            } else {
+                String::new()
+            };
             eprintln!(
-                "\n{}  Subtask {}/{}{}: {} [{}]",
+                "\n{}  Subtask {}/{}{}: {} [{}]{pending_tail}",
                 "▶".cyan(),
                 done_so_far,
                 total,
@@ -1938,9 +1941,6 @@ async fn run_plan_execution(
                 title,
                 next_id
             );
-            if remaining > 0 {
-                eprintln!("{}  {} remaining after this", "·".dim(), remaining);
-            }
 
             // Step-by-step mode: ask user confirmation before each subtask
             let is_step_by_step = state
