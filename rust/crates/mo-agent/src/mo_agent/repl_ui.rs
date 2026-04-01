@@ -23,6 +23,7 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     // ── Observability ─────────────────────────────────────────────────────
     ("/explain", "Cycle explain: off → on (API) → verbose (+stderr)"),
     ("/turn", "Show current turn details (timing, tokens, tools)"),
+    ("/debug", "Interactive session inspector (messages, tools, injections)"),
     ("/stats", "Session analytics: turns, tokens, errors"),
     ("/tools", "Tool performance: calls, timing, success rate"),
     ("/health", "Tool health dashboard"),
@@ -828,7 +829,7 @@ pub(super) fn print_slash_commands(query: Option<&str>) {
         (
             "🔭",
             "Observability",
-            &["/explain", "/turn", "/stats", "/tools", "/health", "/sync"],
+            &["/explain", "/turn", "/debug", "/stats", "/tools", "/health", "/sync"],
         ),
         (
             "📋",
@@ -1834,7 +1835,7 @@ mod tests {
         // in SLASH_COMMANDS.
         let groups: &[&[&str]] = &[
             &["/help", "/model", "/clear", "/history", "/copy", "/exit"],
-            &["/explain", "/turn", "/stats", "/tools", "/health", "/sync"],
+            &["/explain", "/turn", "/debug", "/stats", "/tools", "/health", "/sync"],
             &[
                 "/session",
                 "/session history",

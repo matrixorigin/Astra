@@ -71,6 +71,8 @@ mod slash_session;
 mod slash_skill;
 #[path = "mo_agent/slash_state.rs"]
 mod slash_state;
+#[path = "mo_agent/slash_debug.rs"]
+mod slash_debug;
 #[path = "mo_agent/stream_render.rs"]
 mod stream_render;
 #[path = "mo_agent/streaming_md.rs"]
@@ -115,6 +117,7 @@ use slash_session::handle_session_command;
 use slash_session::resolve_journal_target_session;
 use slash_skill::handle_skill_command;
 use slash_state::{StateCommandContext, handle_state_command};
+use slash_debug::handle_debug_command;
 
 // ══════════════════════════════════════════════════════════════════════ CLI ══
 
@@ -2785,6 +2788,8 @@ async fn handle_slash_command(
         }
 
         "/session" => handle_session_command(arg, state),
+
+        "/debug" => handle_debug_command(arg, state),
 
         "/history" | "/search" | "/copy" | "/doctor" | "/context" | "/version" | "/rewind"
         | "/turn" => {
