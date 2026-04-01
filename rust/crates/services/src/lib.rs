@@ -5,6 +5,7 @@ pub mod branches;
 pub mod context;
 pub mod coordination;
 pub mod data_versioning;
+pub mod durable_task;
 pub mod decisions;
 pub mod edge_context;
 pub mod evaluation;
@@ -64,6 +65,15 @@ pub use context::{
 pub use coordination::{
     AgentProfile, AgentProfileRegistry, AgentResult, AgentTier, AgentTrigger, AggregationStrategy,
     CoordinationPattern, DelegationRequest, DelegationResult, PipelineStage, aggregate_results,
+};
+pub use durable_task::{
+    ContractAmendment, ContractStatus, DiffSummary, DurableSubtask, DurableTaskLifecycle,
+    LocalDurableTaskLifecycle, MatrixOneDurableTaskLifecycle, NoopTaskLearningBridge,
+    SubtaskDeliverySummary, SubtaskExecutionContext, SubtaskOutcomeSignal, SubtaskStage,
+    SubtaskVerificationReport, TaskBranchService, TaskContract, TaskDeliveryReport,
+    TaskLearningBridge, TaskOutcomeSignal, TaskPatternStats, TaskResumeContext, TaskScope,
+    UnconfiguredDurableTaskLifecycle, VerificationCriterion, VerificationResult,
+    VerificationRunner, VerifierKind, build_outcome_signal,
 };
 pub use data_versioning::{
     DataVersioningService, DatabaseDataVersioningService, UnconfiguredDataVersioningService,

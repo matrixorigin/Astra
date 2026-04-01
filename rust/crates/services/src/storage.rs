@@ -514,6 +514,53 @@ pub async fn ensure_core_schema(settings: &MatrixOneSettings) -> Result<(), sqlx
     .execute(&pool)
     .await?;
 
+    // ── Durable Task System ─────────────────────────────────────────────────
+
+    // Task contracts: verifiable acceptance criteria for long-term tasks
+    query(
+        "CREATE TABLE IF NOT EXISTS task_contracts (
+            contract_id    VARCHAR(36) PRIMARY KEY,
+            task_id        VARCHAR(36) NOT NULL,
+            session_id     VARCHAR(36) NOT NULL,
+            user_id        VARCHAR(36) NOT NULL,
+            goal           TEXT NOT NULL,
+            scope_json     JSON,
+            subtasks_json  JSON NOT NULL,
+            criteria_json  JSON NOT NULL,
+            version        INT NOT NULL DEFAULT 1,
+            status         VARCHAR(20) NOT NULL DEFAULT 'draft',
+            created_at     DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            updated_at     DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            INDEX idx_tc_task (task_id),
+            INDEX idx_tc_user_status (user_id, status)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    // Verification results: audit trail of pass/fail evidence per criterion
+    query(
+        "CREATE TABLE IF NOT EXISTS task_verification_results (
+            result_id      VARCHAR(36) PRIMARY KEY,
+            contract_id    VARCHAR(36) NOT NULL,
+            task_id        VARCHAR(36) NOT NULL,
+            subtask_id     VARCHAR(64) NOT NULL,
+            criterion_id   VARCHAR(64) NOT NULL,
+            session_id     VARCHAR(36) NOT NULL,
+            passed         SMALLINT NOT NULL,
+            evidence       LONGTEXT,
+            expected       TEXT,
+            duration_ms    INT,
+            error_message  TEXT,
+            attempt        INT NOT NULL DEFAULT 1,
+            created_at     DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            INDEX idx_tvr_task_subtask (task_id, subtask_id),
+            INDEX idx_tvr_contract (contract_id, created_at)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
     Ok(())
 }
 
