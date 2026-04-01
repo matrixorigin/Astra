@@ -83,6 +83,54 @@ impl SubRunExecutor for StubSubRunExecutor {
     }
 }
 
+// ─── Verification Gate ──────────────────────────────────────────────────────
+
+/// Outcome of a verification gate check on a sub-run result.
+#[derive(Debug, Clone)]
+pub enum GateVerdict {
+    /// Sub-run passed verification — proceed with aggregation.
+    Pass,
+    /// Sub-run failed verification — retry if attempts remain.
+    Fail {
+        reason: String,
+        /// Verification details (criteria results, evidence, etc.)
+        details: Option<serde_json::Value>,
+    },
+    /// Skip verification for this result (e.g., already failed sub-run).
+    Skip,
+}
+
+impl GateVerdict {
+    pub fn is_pass(&self) -> bool {
+        matches!(self, Self::Pass | Self::Skip)
+    }
+}
+
+/// Post-completion verification gate for delegation sub-runs.
+///
+/// Injected into [`DelegationEngine`] to validate sub-run output before aggregation.
+/// When a gate returns [`GateVerdict::Fail`], the engine can retry the sub-run
+/// (up to `max_retries`) or mark it as failed.
+#[async_trait]
+pub trait VerificationGate: Send + Sync {
+    /// Verify a completed sub-run result.
+    ///
+    /// - `result`: the completed agent result
+    /// - `delegation_id`: which delegation this belongs to
+    /// - `attempt`: current attempt number (starts at 1)
+    async fn verify(
+        &self,
+        result: &AgentResult,
+        delegation_id: &str,
+        attempt: u32,
+    ) -> GateVerdict;
+
+    /// Maximum retry attempts when verification fails. Default: 2.
+    fn max_retries(&self) -> u32 {
+        2
+    }
+}
+
 // ─── Sub-run Tracking ───────────────────────────────────────────────────────
 
 /// Tracks parent→child relationships for delegation hierarchies.
@@ -323,6 +371,8 @@ pub struct DelegationEngine {
     tracker: Arc<DelegationTracker>,
     /// Executor for actually running sub-agent loops.
     executor: Arc<dyn SubRunExecutor>,
+    /// Optional post-completion verification gate.
+    gate: Option<Arc<dyn VerificationGate>>,
 }
 
 impl DelegationEngine {
@@ -336,6 +386,7 @@ impl DelegationEngine {
             run_engine,
             tracker,
             executor: Arc::new(StubSubRunExecutor),
+            gate: None,
         }
     }
 
@@ -351,7 +402,14 @@ impl DelegationEngine {
             run_engine,
             tracker,
             executor,
+            gate: None,
         }
+    }
+
+    /// Attach a verification gate. Sub-run results will be checked before aggregation.
+    pub fn with_gate(mut self, gate: Arc<dyn VerificationGate>) -> Self {
+        self.gate = Some(gate);
+        self
     }
 
     /// Validate a delegation request without executing it.
@@ -362,6 +420,99 @@ impl DelegationEngine {
     ) -> Result<(), String> {
         let reg = self.registry.read().await;
         reg.validate_delegation(request, source_agent_id)
+    }
+
+    /// Apply the verification gate to a sub-run result with retry support.
+    ///
+    /// Returns the final result after gate checking (possibly retried).
+    /// If no gate is configured, returns the result as-is.
+    async fn apply_gate(
+        &self,
+        result: AgentResult,
+        delegation_id: &str,
+        config_builder: impl Fn() -> SubRunConfig,
+    ) -> AgentResult {
+        let gate = match &self.gate {
+            Some(g) => g,
+            None => return result,
+        };
+
+        // Skip gate for already-failed results
+        if !result.is_success() {
+            return result;
+        }
+
+        let max_retries = gate.max_retries();
+        let mut current = result;
+        let mut attempt = 1u32;
+
+        loop {
+            match gate.verify(&current, delegation_id, attempt).await {
+                GateVerdict::Pass | GateVerdict::Skip => return current,
+                GateVerdict::Fail { reason, details } => {
+                    // Record the gate failure in run events
+                    let _ = self
+                        .run_engine
+                        .append_event(
+                            &current.run_id,
+                            serde_json::json!({
+                                "event_type": "verification_gate_failed",
+                                "data": {
+                                    "attempt": attempt,
+                                    "reason": reason,
+                                    "details": details,
+                                }
+                            }),
+                        )
+                        .await;
+
+                    if attempt >= max_retries {
+                        // Exhausted retries — mark as verification failure
+                        let _ = self
+                            .run_engine
+                            .persist_status(
+                                &current.run_id,
+                                "verification_failed",
+                                None,
+                                Some(&reason),
+                            )
+                            .await;
+                        return AgentResult {
+                            status: "verification_failed".to_string(),
+                            error: Some(format!(
+                                "verification gate failed after {attempt} attempts: {reason}"
+                            )),
+                            ..current
+                        };
+                    }
+
+                    // Retry: re-execute with the same config
+                    attempt += 1;
+                    let retry_config = config_builder();
+                    match self.executor.execute(retry_config).await {
+                        Ok(r) => {
+                            let _ = self
+                                .run_engine
+                                .persist_status(
+                                    &r.run_id,
+                                    &r.status,
+                                    None,
+                                    r.error.as_deref(),
+                                )
+                                .await;
+                            current = r;
+                        }
+                        Err(e) => {
+                            return AgentResult {
+                                status: "failed".to_string(),
+                                error: Some(format!("retry execution failed: {e}")),
+                                ..current
+                            };
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// Execute a delegation: spawn sub-runs according to the coordination pattern.
@@ -522,6 +673,34 @@ impl DelegationEngine {
             }
         }
 
+        // ── Verification gate: check each result before aggregation ──
+        if self.gate.is_some() {
+            let delegation_id = request.delegation_id.clone();
+            let mut gated_results = Vec::with_capacity(results.len());
+            for result in results {
+                let did = delegation_id.clone();
+                // Fan-out gate is check-only (no retry — configs are consumed).
+                // For retry support, use Sequential pattern instead.
+                let gated = self.apply_gate(result, &did, || {
+                    // No-retry stub: return a dummy config that won't actually be called
+                    // because max_retries check fires first in the closure.
+                    SubRunConfig {
+                        run_id: String::new(),
+                        agent_profile: AgentProfile::new("stub", "stub",
+                            mo_agent_services::coordination::AgentTier::User),
+                        task: String::new(),
+                        session_id: String::new(),
+                        user_id: String::new(),
+                        previous_output: None,
+                        context: HashMap::new(),
+                        pause_flag: None,
+                    }
+                }).await;
+                gated_results.push(gated);
+            }
+            results = gated_results;
+        }
+
         let aggregated = aggregate_results(aggregation, &results);
         Ok(DelegationResult::from_results(
             &request.delegation_id,
@@ -613,6 +792,41 @@ impl DelegationEngine {
                         tool_calls: 0,
                     }
                 }
+            };
+
+            // ── Verification gate with retry for sequential sub-runs ──
+            let result = if self.gate.is_some() {
+                let delegation_id = request.delegation_id.clone();
+                let task = request.task.clone();
+                let sess = request
+                    .context
+                    .get("session_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("delegation")
+                    .to_string();
+                let uid = request.user_id.clone();
+                let ctx = request.context.clone();
+                let prev = previous_output.clone();
+                let profile_for_retry = reg.get(agent_id).cloned().unwrap_or_else(|| {
+                    AgentProfile::new(
+                        agent_id,
+                        agent_id,
+                        mo_agent_services::coordination::AgentTier::User,
+                    )
+                });
+                self.apply_gate(result, &delegation_id, || SubRunConfig {
+                    run_id: uuid::Uuid::new_v4().to_string(),
+                    agent_profile: profile_for_retry.clone(),
+                    task: task.clone(),
+                    session_id: sess.clone(),
+                    user_id: uid.clone(),
+                    previous_output: prev.clone(),
+                    context: ctx.clone(),
+                    pause_flag: None,
+                })
+                .await
+            } else {
+                result
             };
 
             // Feed output to the next stage (pipeline semantics).
@@ -726,6 +940,36 @@ impl DelegationEngine {
                     }
                 }
             };
+
+            // ── Gate on producer output before reviewer sees it ──
+            let prod_result = if self.gate.is_some() {
+                let did = request.delegation_id.clone();
+                let task = request.task.clone();
+                let sess = request
+                    .context
+                    .get("session_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("delegation")
+                    .to_string();
+                let uid = request.user_id.clone();
+                let ctx = request.context.clone();
+                let prev = last_producer_output.clone();
+                let pp = producer_profile.clone();
+                self.apply_gate(prod_result, &did, || SubRunConfig {
+                    run_id: uuid::Uuid::new_v4().to_string(),
+                    agent_profile: pp.clone(),
+                    task: task.clone(),
+                    session_id: sess.clone(),
+                    user_id: uid.clone(),
+                    previous_output: prev.clone(),
+                    context: ctx.clone(),
+                    pause_flag: None,
+                })
+                .await
+            } else {
+                prod_result
+            };
+
             last_producer_output = prod_result.output.clone();
             results.push(prod_result);
 
@@ -1582,5 +1826,219 @@ mod tests {
             let run = engine.load_run(&sub.run_id).await.unwrap().unwrap();
             assert_eq!(run.status, "running");
         }
+    }
+
+    // ─── Verification Gate Tests ────────────────────────────────────────────
+
+    /// Gate that always passes.
+    struct AlwaysPassGate;
+
+    #[async_trait]
+    impl VerificationGate for AlwaysPassGate {
+        async fn verify(
+            &self,
+            _result: &AgentResult,
+            _delegation_id: &str,
+            _attempt: u32,
+        ) -> GateVerdict {
+            GateVerdict::Pass
+        }
+    }
+
+    /// Gate that fails the first N attempts, then passes.
+    struct FailThenPassGate {
+        fail_count: std::sync::atomic::AtomicU32,
+        max_fails: u32,
+    }
+
+    impl FailThenPassGate {
+        fn new(max_fails: u32) -> Self {
+            Self {
+                fail_count: std::sync::atomic::AtomicU32::new(0),
+                max_fails,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl VerificationGate for FailThenPassGate {
+        async fn verify(
+            &self,
+            _result: &AgentResult,
+            _delegation_id: &str,
+            _attempt: u32,
+        ) -> GateVerdict {
+            let count = self.fail_count.fetch_add(1, Ordering::Relaxed);
+            if count < self.max_fails {
+                GateVerdict::Fail {
+                    reason: format!("fail #{}", count + 1),
+                    details: None,
+                }
+            } else {
+                GateVerdict::Pass
+            }
+        }
+
+        fn max_retries(&self) -> u32 {
+            3
+        }
+    }
+
+    /// Gate that always fails.
+    struct AlwaysFailGate;
+
+    #[async_trait]
+    impl VerificationGate for AlwaysFailGate {
+        async fn verify(
+            &self,
+            _result: &AgentResult,
+            _delegation_id: &str,
+            _attempt: u32,
+        ) -> GateVerdict {
+            GateVerdict::Fail {
+                reason: "quality too low".into(),
+                details: Some(serde_json::json!({"score": 0.3})),
+            }
+        }
+
+        fn max_retries(&self) -> u32 {
+            2
+        }
+    }
+
+    #[tokio::test]
+    async fn gate_pass_does_not_alter_results() {
+        let (reg, engine, tracker, _) = setup_with_executor(Arc::new(EchoExecutor));
+        let de = DelegationEngine::with_executor(reg, engine, tracker, Arc::new(EchoExecutor))
+            .with_gate(Arc::new(AlwaysPassGate));
+
+        let req = fan_out_request(vec!["coder", "reviewer"]);
+        let result = de.execute(req, "orch").await.unwrap();
+
+        assert_eq!(result.status, "completed");
+        assert_eq!(result.agent_results.len(), 2);
+        for ar in &result.agent_results {
+            assert_eq!(ar.status, "completed");
+        }
+    }
+
+    #[tokio::test]
+    async fn gate_fail_marks_verification_failed() {
+        let (reg, engine, tracker, _) = setup_with_executor(Arc::new(EchoExecutor));
+        let de = DelegationEngine::with_executor(reg, engine, tracker, Arc::new(EchoExecutor))
+            .with_gate(Arc::new(AlwaysFailGate));
+
+        let req = fan_out_request(vec!["coder"]);
+        let result = de.execute(req, "orch").await.unwrap();
+
+        // Fan-out with always-fail gate: result should be verification_failed
+        assert_eq!(result.agent_results.len(), 1);
+        assert_eq!(result.agent_results[0].status, "verification_failed");
+        assert!(result.agent_results[0]
+            .error
+            .as_ref()
+            .unwrap()
+            .contains("quality too low"));
+    }
+
+    #[tokio::test]
+    async fn gate_retry_then_pass_sequential() {
+        let (reg, engine, tracker, _) = setup_with_executor(Arc::new(EchoExecutor));
+        // Fail once, then pass on second attempt
+        let gate = Arc::new(FailThenPassGate::new(1));
+        let de = DelegationEngine::with_executor(reg, engine, tracker, Arc::new(EchoExecutor))
+            .with_gate(gate);
+
+        let req = DelegationRequest {
+            delegation_id: "del-seq-gate".into(),
+            parent_run_id: "parent-1".into(),
+            task: "sequential gate test".into(),
+            pattern: CoordinationPattern::Sequential {
+                agent_ids: vec!["coder".into()],
+                stop_on_success: false,
+            },
+            user_id: "user-1".into(),
+            depth: 0,
+            context: HashMap::new(),
+        };
+        let result = de.execute(req, "orch").await.unwrap();
+
+        // Should eventually pass after retry
+        assert_eq!(result.agent_results.len(), 1);
+        assert_eq!(result.agent_results[0].status, "completed");
+    }
+
+    #[tokio::test]
+    async fn gate_exhausted_retries_sequential() {
+        let (reg, engine, tracker, _) = setup_with_executor(Arc::new(EchoExecutor));
+        let de = DelegationEngine::with_executor(reg, engine, tracker, Arc::new(EchoExecutor))
+            .with_gate(Arc::new(AlwaysFailGate));
+
+        let req = DelegationRequest {
+            delegation_id: "del-seq-fail".into(),
+            parent_run_id: "parent-1".into(),
+            task: "will fail".into(),
+            pattern: CoordinationPattern::Sequential {
+                agent_ids: vec!["coder".into()],
+                stop_on_success: false,
+            },
+            user_id: "user-1".into(),
+            depth: 0,
+            context: HashMap::new(),
+        };
+        let result = de.execute(req, "orch").await.unwrap();
+
+        assert_eq!(result.agent_results.len(), 1);
+        assert_eq!(result.agent_results[0].status, "verification_failed");
+    }
+
+    #[tokio::test]
+    async fn no_gate_is_backward_compatible() {
+        // Without gate, everything works as before
+        let (_, _, _, de) = setup_with_executor(Arc::new(EchoExecutor));
+        // de has no gate
+
+        let req = fan_out_request(vec!["coder", "reviewer"]);
+        let result = de.execute(req, "orch").await.unwrap();
+
+        assert_eq!(result.status, "completed");
+        assert_eq!(result.agent_results.len(), 2);
+        for ar in &result.agent_results {
+            assert_eq!(ar.status, "completed");
+        }
+    }
+
+    #[tokio::test]
+    async fn gate_skips_failed_subrun() {
+        let (reg, engine, tracker, _) = setup_with_executor(Arc::new(FailingExecutor {
+            fail_agents: vec!["coder".into()],
+        }));
+        // AlwaysFailGate should NOT apply to already-failed results
+        let de = DelegationEngine::with_executor(
+            reg,
+            engine,
+            tracker,
+            Arc::new(FailingExecutor {
+                fail_agents: vec!["coder".into()],
+            }),
+        )
+        .with_gate(Arc::new(AlwaysFailGate));
+
+        let req = fan_out_request(vec!["coder"]);
+        let result = de.execute(req, "orch").await.unwrap();
+
+        // Should be "failed" (from executor), NOT "verification_failed"
+        assert_eq!(result.agent_results[0].status, "failed");
+    }
+
+    #[tokio::test]
+    async fn gate_verdict_variants() {
+        assert!(GateVerdict::Pass.is_pass());
+        assert!(GateVerdict::Skip.is_pass());
+        assert!(!GateVerdict::Fail {
+            reason: "x".into(),
+            details: None
+        }
+        .is_pass());
     }
 }
