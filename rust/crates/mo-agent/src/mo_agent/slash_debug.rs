@@ -62,7 +62,7 @@ pub(super) fn handle_debug_command(arg: &str, state: &ReplState) {
                 tool_count: messages.iter().filter(|m| m.get("role").and_then(|v| v.as_str()) == Some("tool")).count(),
                 tools_used: Vec::new(), tool_calls: Vec::new(), selector_strategy: None,
             };
-            inspect_turn(1, &stub, Some(&messages));
+            inspect_turn(1, &stub, Some(&messages), &session_id);
         } else {
             eprintln!("  {}", "Failed to load checkpoint data.".yellow());
         }
@@ -90,7 +90,7 @@ pub(super) fn handle_debug_command(arg: &str, state: &ReplState) {
         // Find the heavy checkpoint that covers this turn.
         let messages = load_checkpoint_messages(&checkpoints);
 
-        inspect_turn(turn_n, &turns[turn_n - 1], messages.as_deref());
+        inspect_turn(turn_n, &turns[turn_n - 1], messages.as_deref(), &session_id);
     }
 }
 
@@ -124,7 +124,7 @@ fn print_overview(session_id: &str, turns: &[TurnSummary], checkpoints: &[PathBu
 
 // ── Turn inspector ───────────────────────────────────────────────────────────
 
-fn inspect_turn(turn_n: usize, summary: &TurnSummary, messages: Option<&[serde_json::Value]>) {
+fn inspect_turn(turn_n: usize, summary: &TurnSummary, messages: Option<&[serde_json::Value]>, session_id: &str) {
     eprintln!(
         "\n  {} — {} tool calls, {:.1}s, {}→{}tok",
         format!("Turn {turn_n}").bold(),
@@ -159,7 +159,7 @@ fn inspect_turn(turn_n: usize, summary: &TurnSummary, messages: Option<&[serde_j
             "2" => show_output(messages),
             "3" => show_tools(messages, summary),
             "4" => show_injected(messages),
-            "5" => dump_json(messages, turn_n),
+            "5" => dump_json(messages, session_id, turn_n),
             "6" => show_summary(summary),
             _ => eprintln!("  {}", "Invalid choice".yellow()),
         }
@@ -297,17 +297,18 @@ fn show_injected(messages: Option<&[serde_json::Value]>) {
     eprintln!();
 }
 
-fn dump_json(messages: Option<&[serde_json::Value]>, turn_n: usize) {
+fn dump_json(messages: Option<&[serde_json::Value]>, session_id: &str, turn_n: usize) {
     let Some(msgs) = messages else {
         eprintln!("  {}", "No checkpoint data available".yellow());
         return;
     };
-    let path = format!("/tmp/debug-turn{turn_n}.json");
+    let short = &session_id[..8.min(session_id.len())];
+    let path = std::env::temp_dir().join(format!("debug-{short}-turn{turn_n}.json"));
     match std::fs::write(
         &path,
         serde_json::to_string_pretty(&msgs).unwrap_or_default(),
     ) {
-        Ok(_) => eprintln!("  {} {}", "✓".green(), format!("Written to {path}").dim()),
+        Ok(_) => eprintln!("  {} {}", "✓".green(), format!("Written to {}", path.display()).dim()),
         Err(e) => eprintln!("  {} {}", "✗".red(), e),
     }
 }
