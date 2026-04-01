@@ -126,6 +126,17 @@ impl TerminalRegion {
         }
     }
 
+    /// Take ownership of lines (for transformation) without clearing the terminal.
+    pub(super) fn take_lines(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.lines)
+    }
+
+    /// Detach: forget tracked lines without clearing the terminal.
+    /// The content stays on screen but the region stops managing it.
+    pub(super) fn detach(&mut self) {
+        self.lines.clear();
+    }
+
     /// Remove the last `n` lines from the region.
     #[allow(dead_code)]
     pub(super) fn pop_lines(&mut self, n: usize) {

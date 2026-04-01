@@ -100,8 +100,45 @@ impl StreamingMarkdown {
         self.render_incremental();
     }
 
+    /// Freeze rendered output as dim text and reset for next turn.
+    /// Used for intermediate agentic turns where tool_calls are pending —
+    /// the draft text stays visible (dimmed) like claudecode does.
+    pub(super) fn freeze_and_reset(&mut self) {
+        // Render any buffered content first.
+        self.render_incremental();
+
+        // Dim the stable region in-place.
+        let dimmed: Vec<String> = self
+            .stable_region
+            .take_lines()
+            .into_iter()
+            .map(|l| format!("\x1b[2m{l}\x1b[0m"))
+            .collect();
+        if !dimmed.is_empty() {
+            self.stable_region.update(dimmed);
+        }
+
+        // Dim the unstable region in-place.
+        let dimmed: Vec<String> = self
+            .unstable_region
+            .take_lines()
+            .into_iter()
+            .map(|l| format!("\x1b[2m{l}\x1b[0m"))
+            .collect();
+        if !dimmed.is_empty() {
+            self.unstable_region.update(dimmed);
+        }
+
+        // Detach regions — they stay on screen but we stop tracking them.
+        self.stable_region.detach();
+        self.unstable_region.detach();
+        self.stable_end = 0;
+        self.full_text.clear();
+    }
+
     /// Clear ALL rendered output (stable + unstable).
-    /// Used for intermediate agentic turns where tool_calls are pending.
+    /// Only used when output must be fully removed.
+    #[allow(dead_code)]
     pub(super) fn clear_all(&mut self) {
         self.unstable_region.clear();
         self.stable_region.clear();

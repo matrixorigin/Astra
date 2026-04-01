@@ -98,12 +98,10 @@ impl SseStreamHost for CliSseStreamHost<'_> {
         tool: &str,
         args: &serde_json::Value,
     ) -> EdgeToolExecResult {
-        // Tool request means this is an intermediate turn — clear any
-        // draft text that was rendered during streaming so it doesn't
-        // flash on screen before the tool results replace it.
+        // Tool request means this is an intermediate turn — freeze any
+        // draft text as dim output (claudecode-style) and reset for next turn.
         if let Some(md) = &mut self.render.md {
-            md.clear_all();
-            self.render.lines_written = 0;
+            md.freeze_and_reset();
         }
         // Show tool as running (in-place updatable via TerminalRegion).
         let tool_idx = if !self.quiet {
@@ -513,7 +511,7 @@ pub(super) async fn consume_turn_sse(
     // text so it doesn't leak — the final answer will be rendered later.
     if let Some(md) = &mut md_renderer {
         if result.has_tool_calls {
-            md.clear_all();
+            md.freeze_and_reset();
         } else {
             md.finish();
         }
