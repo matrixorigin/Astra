@@ -3,6 +3,7 @@ pub mod agents;
 pub mod auth;
 pub mod branches;
 pub mod context;
+pub mod contract_generator;
 pub mod coordination;
 pub mod data_versioning;
 pub mod durable_task;
@@ -65,6 +66,10 @@ pub use context::{
 pub use coordination::{
     AgentProfile, AgentProfileRegistry, AgentResult, AgentTier, AgentTrigger, AggregationStrategy,
     CoordinationPattern, DelegationRequest, DelegationResult, PipelineStage, aggregate_results,
+};
+pub use contract_generator::{
+    ContractGenerator, ProjectDetection, detect_build_command, detect_lint_command,
+    detect_test_command,
 };
 pub use durable_task::{
     ContractAmendment, ContractStatus, DiffSummary, DurableSubtask, DurableTaskLifecycle,
