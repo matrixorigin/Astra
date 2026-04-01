@@ -75,6 +75,8 @@ mod slash_state;
 mod stream_render;
 #[path = "mo_agent/streaming_md.rs"]
 mod streaming_md;
+#[path = "mo_agent/terminal_region.rs"]
+mod terminal_region;
 #[path = "mo_agent/diff_presenter.rs"]
 mod diff_presenter;
 

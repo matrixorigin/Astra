@@ -76,7 +76,6 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                 SseRenderEffect::StreamText(s) => {
                     if let Some(md) = &mut self.render.md {
                         md.push(&s);
-                        self.render.lines_written = md.lines_written;
                     } else {
                         print!("{s}");
                         let _ = io::stdout().flush();
@@ -104,7 +103,6 @@ impl SseStreamHost for CliSseStreamHost<'_> {
         // flash on screen before the tool results replace it.
         if let Some(md) = &mut self.render.md {
             md.clear_all();
-            self.render.lines_written = 0;
         }
         if !self.quiet {
             eprintln!(
@@ -308,6 +306,9 @@ pub(super) struct StreamRenderState {
     term_width: usize,
     /// Incremental markdown renderer — `None` when `render_md` is false.
     md: Option<super::streaming_md::StreamingMarkdown>,
+    /// Stderr lines written between tool calls (thinking duration, tool notices).
+    /// Tracked so clear_all can account for them.
+    stderr_lines: usize,
 }
 
 impl StreamRenderState {
@@ -329,6 +330,7 @@ impl StreamRenderState {
             } else {
                 None
             },
+            stderr_lines: 0,
         }
     }
 
@@ -350,9 +352,8 @@ impl StreamRenderState {
 
     /// Account for a full line written via eprintln! (adds 1 line).
     pub(super) fn track_eprintln(&mut self) {
-        if let Some(md) = &mut self.md {
-            md.track_eprintln();
-        } else {
+        self.stderr_lines += 1;
+        if self.md.is_none() {
             self.lines_written += 1;
         }
         self.col = 0;
@@ -390,7 +391,6 @@ fn apply_sse_render_effects(
             SseRenderEffect::StreamText(s) => {
                 if let Some(md) = &mut render.md {
                     md.push(&s);
-                    render.lines_written = md.lines_written;
                 } else {
                     print!("{s}");
                     let _ = io::stdout().flush();
@@ -428,9 +428,6 @@ pub(super) async fn consume_turn_sse(
     let (sse_result, edge_tool_round, mut md_renderer, lines_written) = if let Some(ctx) = edge {
         let mut host = CliSseStreamHost::from_edge_ctx(ctx, term_width, render_md);
         host.render.lines_written = pre_clear_lines;
-        if let Some(md) = &mut host.render.md {
-            md.lines_written = pre_clear_lines;
-        }
         let (result, _abort) = consume_sse_stream(&mut byte_stream, &mut host, idle).await;
         let lw = host.render.lines_written;
         let md = host.render.md.take();
@@ -438,9 +435,6 @@ pub(super) async fn consume_turn_sse(
     } else {
         let mut render = StreamRenderState::with_term_width(term_width, render_md);
         render.lines_written = pre_clear_lines;
-        if let Some(md) = &mut render.md {
-            md.lines_written = pre_clear_lines;
-        }
         let mut host = NoopSseStreamHost;
         let (result, _abort) = consume_sse_stream(&mut byte_stream, &mut host, idle).await;
         let lw = render.lines_written;
