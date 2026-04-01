@@ -1,4 +1,5 @@
 use super::*;
+use crate::permission_manager::PermissionMode;
 use std::io::Read;
 
 /// Exit codes for CLI commands (for scripting integration)
@@ -246,10 +247,18 @@ pub(super) async fn execute_cli_command(
                 .or_else(|| resumable_last_session_id(profile.as_deref()));
             let is_tty = terminal::size().is_ok();
             let selector = create_tool_selector(api, profile.as_deref());
-            let mut pm = PermissionManager::with_project(
-                args.auto_approve,
-                &std::env::current_dir().unwrap_or_default(),
-            );
+            let mut pm = {
+                let project_root = std::env::current_dir().unwrap_or_default();
+                if let Some(ref mode_str) = args.permission_mode {
+                    let mode: PermissionMode = mode_str.parse().unwrap_or_else(|e| {
+                        eprintln!("{}", format!("  ⚠  {e}, defaulting to prompt").yellow());
+                        PermissionMode::Prompt
+                    });
+                    PermissionManager::with_project_mode(mode, &project_root)
+                } else {
+                    PermissionManager::with_project(args.auto_approve, &project_root)
+                }
+            };
             let explain_mode = if args.explain {
                 ExplainMode::On
             } else {

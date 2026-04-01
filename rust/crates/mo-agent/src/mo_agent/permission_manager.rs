@@ -9,6 +9,41 @@ use mo_agent_runtime::turn::tool_argument_hints::{
     command_hint_from_args, path_hint_from_args, permission_prompt_primary_detail,
 };
 
+/// Permission mode controls how tool approval decisions are handled.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum PermissionMode {
+    /// Auto-approve all tools (except bypass-immune safety checks).
+    Auto,
+    /// Prompt the user for write/execute tools (default interactive mode).
+    Prompt,
+    /// Deny all write/execute tools without prompting (CI/headless mode).
+    Deny,
+}
+
+impl std::str::FromStr for PermissionMode {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "auto" => Ok(Self::Auto),
+            "prompt" => Ok(Self::Prompt),
+            "deny" => Ok(Self::Deny),
+            _ => Err(format!(
+                "invalid permission mode '{s}': expected auto, prompt, or deny"
+            )),
+        }
+    }
+}
+
+impl std::fmt::Display for PermissionMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Auto => write!(f, "auto"),
+            Self::Prompt => write!(f, "prompt"),
+            Self::Deny => write!(f, "deny"),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum SideEffect {
     Read,
@@ -111,7 +146,7 @@ impl PermissionSettings {
 }
 
 pub(super) struct PermissionManager {
-    auto_approve: bool,
+    mode: PermissionMode,
     session_overrides: HashMap<String, bool>,
     /// Persistent rules loaded from settings file.
     settings: PermissionSettings,
@@ -126,8 +161,13 @@ impl PermissionManager {
     /// Create without loading project settings. Used in tests and internal auto-approved operations.
     #[cfg(test)]
     pub(super) fn new(auto_approve: bool) -> Self {
+        let mode = if auto_approve {
+            PermissionMode::Auto
+        } else {
+            PermissionMode::Prompt
+        };
         Self {
-            auto_approve,
+            mode,
             session_overrides: HashMap::new(),
             settings: PermissionSettings::default(),
             project_root: None,
@@ -139,11 +179,21 @@ impl PermissionManager {
     /// Create with settings loaded from a project directory.
     /// Loads `.kiro/permissions.json` if it exists, applying persistent allow/deny rules.
     pub(super) fn with_project(auto_approve: bool, project_root: &Path) -> Self {
+        let mode = if auto_approve {
+            PermissionMode::Auto
+        } else {
+            PermissionMode::Prompt
+        };
+        Self::with_project_mode(mode, project_root)
+    }
+
+    /// Create with explicit permission mode and project directory.
+    pub(super) fn with_project_mode(mode: PermissionMode, project_root: &Path) -> Self {
         let settings = PermissionSettings::load(project_root);
         let cached_allow = settings.parsed_allow_rules();
         let cached_deny = settings.parsed_deny_rules();
         Self {
-            auto_approve,
+            mode,
             session_overrides: HashMap::new(),
             settings,
             project_root: Some(project_root.to_path_buf()),
@@ -161,14 +211,16 @@ impl PermissionManager {
     ) -> mo_thin_client::ApprovalDecision {
         use mo_thin_client::ApprovalDecision;
         if quiet {
-            return if self.auto_approve {
+            return if self.mode == PermissionMode::Auto {
                 ApprovalDecision::Allow
             } else {
                 ApprovalDecision::Deny
             };
         }
-        if self.auto_approve {
-            return ApprovalDecision::Allow;
+        match self.mode {
+            PermissionMode::Auto => return ApprovalDecision::Allow,
+            PermissionMode::Deny => return ApprovalDecision::Deny,
+            PermissionMode::Prompt => {}
         }
         if let Some(&allowed) = self.session_overrides.get(tool) {
             return if allowed {
@@ -435,18 +487,26 @@ impl PermissionManager {
             return true;
         }
 
-        // Step 2: Git safety checks (bypass-immune — even auto_approve can't skip these).
+        // Step 2: Git safety checks (bypass-immune — even auto mode can't skip these).
         if side_effect == SideEffect::Execute {
             let git_violations = Self::check_git_safety(args);
             if !git_violations.is_empty() {
                 for v in &git_violations {
                     eprintln!("  {}", format!("⚠  Git safety: {v}").yellow());
                 }
-                // Git safety violations require explicit approval (not auto-approved).
-                if self.auto_approve {
+                // In deny mode, reject git safety violations outright.
+                if self.mode == PermissionMode::Deny {
                     eprintln!(
                         "  {}",
-                        "  Git safety violations require manual approval even in auto-approve mode"
+                        "  Git safety violations denied (--permission-mode=deny)".red()
+                    );
+                    return false;
+                }
+                // Git safety violations require explicit approval (not auto-approved).
+                if self.mode == PermissionMode::Auto {
+                    eprintln!(
+                        "  {}",
+                        "  Git safety violations require manual approval even in auto mode"
                             .yellow()
                     );
                 }
@@ -466,11 +526,17 @@ impl PermissionManager {
         // Step 3: Dangerous file path check (bypass-immune).
         if let Some(warning) = Self::check_dangerous_path(name, args) {
             eprintln!("  {}", warning.yellow());
-            if self.auto_approve {
+            if self.mode == PermissionMode::Deny {
                 eprintln!(
                     "  {}",
-                    "  Sensitive path access requires manual approval even in auto-approve mode"
-                        .yellow()
+                    "  Sensitive path access denied (--permission-mode=deny)".red()
+                );
+                return false;
+            }
+            if self.mode == PermissionMode::Auto {
+                eprintln!(
+                    "  {}",
+                    "  Sensitive path access requires manual approval even in auto mode".yellow()
                 );
             }
             let (header, detail) = Self::format_tool_display(name, args);
@@ -509,9 +575,18 @@ impl PermissionManager {
             return true;
         }
 
-        // Step 6: Auto-approve mode.
-        if self.auto_approve {
-            return true;
+        // Step 6: Permission mode determines final action.
+        match self.mode {
+            PermissionMode::Auto => return true,
+            PermissionMode::Deny => {
+                let (header, _) = Self::format_tool_display(name, args);
+                eprintln!(
+                    "  {}",
+                    format!("  ✗ {header}: denied (--permission-mode=deny)").red()
+                );
+                return false;
+            }
+            PermissionMode::Prompt => {} // fall through to interactive prompt
         }
 
         let (header, detail) = Self::format_tool_display(name, args);
@@ -908,5 +983,82 @@ mod tests {
         let args = serde_json::json!({"command": "git commit --no-verify -m 'skip hooks'"});
         let violations = PermissionManager::check_git_safety(&args);
         assert!(!violations.is_empty());
+    }
+
+    // ── Permission mode ──────────────────────────────────────────────────────
+
+    #[test]
+    fn permission_mode_parse() {
+        assert_eq!(
+            "auto".parse::<PermissionMode>().unwrap(),
+            PermissionMode::Auto
+        );
+        assert_eq!(
+            "prompt".parse::<PermissionMode>().unwrap(),
+            PermissionMode::Prompt
+        );
+        assert_eq!(
+            "deny".parse::<PermissionMode>().unwrap(),
+            PermissionMode::Deny
+        );
+        assert_eq!(
+            "AUTO".parse::<PermissionMode>().unwrap(),
+            PermissionMode::Auto
+        );
+        assert!("invalid".parse::<PermissionMode>().is_err());
+    }
+
+    #[test]
+    fn permission_mode_display() {
+        assert_eq!(PermissionMode::Auto.to_string(), "auto");
+        assert_eq!(PermissionMode::Prompt.to_string(), "prompt");
+        assert_eq!(PermissionMode::Deny.to_string(), "deny");
+    }
+
+    #[test]
+    fn deny_mode_rejects_write_tools() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut pm = PermissionManager::with_project_mode(PermissionMode::Deny, dir.path());
+        let args = serde_json::json!({"path": "test.txt", "content": "hello"});
+        // write_file is a Write side-effect tool — denied in deny mode
+        assert!(!pm.check("write_file", &args));
+    }
+
+    #[test]
+    fn deny_mode_allows_read_tools() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut pm = PermissionManager::with_project_mode(PermissionMode::Deny, dir.path());
+        let args = serde_json::json!({"path": "test.txt"});
+        // read_file is a Read side-effect tool — always allowed
+        assert!(pm.check("read_file", &args));
+    }
+
+    #[test]
+    fn deny_mode_cloud_approval_denied() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut pm = PermissionManager::with_project_mode(PermissionMode::Deny, dir.path());
+        let decision = pm.resolve_cloud_approval("bash", Some("/tmp"), false);
+        assert_eq!(decision, mo_thin_client::ApprovalDecision::Deny);
+    }
+
+    #[test]
+    fn auto_mode_cloud_approval_allowed() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut pm = PermissionManager::with_project_mode(PermissionMode::Auto, dir.path());
+        let decision = pm.resolve_cloud_approval("bash", Some("/tmp"), false);
+        assert_eq!(decision, mo_thin_client::ApprovalDecision::Allow);
+    }
+
+    #[test]
+    fn with_project_mode_loads_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut settings = PermissionSettings::default();
+        settings.deny.push("Bash(rm:*)".to_string());
+        settings.save(dir.path()).unwrap();
+
+        let mut pm = PermissionManager::with_project_mode(PermissionMode::Auto, dir.path());
+        let args = serde_json::json!({"command": "rm -rf /"});
+        // Even in auto mode, deny rules are bypass-immune
+        assert!(!pm.check("bash", &args));
     }
 }
