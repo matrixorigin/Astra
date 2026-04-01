@@ -161,28 +161,31 @@ fn check_force_push(lower: &str, violations: &mut Vec<GitSafetyViolation>) {
     if !lower.contains("push") {
         return;
     }
-    let is_force =
-        lower.contains("--force") || lower.contains(" -f") || lower.contains("--force-with-lease");
+
+    let words: Vec<&str> = lower.split_whitespace().collect();
+
+    // Detect force push flags precisely: --force, --force-with-lease, or bare -f
+    let is_force = words.iter().any(|&w| w == "--force" || w == "--force-with-lease" || w == "-f");
     if !is_force {
         return;
     }
     violations.push(GitSafetyViolation::ForcePush);
 
-    // Check for protected branches (main, master, develop, release/*)
+    // Check for protected branches (main, master, develop, production, staging).
+    // Match whole branch name or the final component after '/' to avoid
+    // false positives on branches like "feature/main-refactor".
     let protected_branches = ["main", "master", "develop", "production", "staging"];
-    let words: Vec<&str> = lower.split_whitespace().collect();
 
-    // Look for branch name after "origin" or after "push"
     for (i, word) in words.iter().enumerate() {
         if *word == "origin" || *word == "push" {
             if let Some(next) = words.get(i + 1) {
-                // Skip flags
                 if next.starts_with('-') {
                     continue;
                 }
-                // Check against protected branches
+                // Extract the final path component (e.g. "main" from "origin/main")
+                let branch_leaf = next.rsplit('/').next().unwrap_or(next);
                 for protected in &protected_branches {
-                    if next.contains(protected) {
+                    if branch_leaf == *protected {
                         violations.push(GitSafetyViolation::ForcePushProtectedBranch {
                             branch: next.to_string(),
                         });
@@ -396,6 +399,52 @@ mod tests {
             v.iter()
                 .any(|v| matches!(v, GitSafetyViolation::CommitAmend))
         );
+    }
+
+
+    // --- Regression: protected branch false positives ---
+
+    #[test]
+    fn no_false_positive_feature_branch_containing_main() {
+        // "feature/main-refactor" contains "main" but is NOT a protected branch
+        let v = validate_git_command("git push --force origin feature/main-refactor");
+        assert!(v.iter().any(|v| matches!(v, GitSafetyViolation::ForcePush)));
+        assert!(!v
+            .iter()
+            .any(|v| matches!(v, GitSafetyViolation::ForcePushProtectedBranch { .. })));
+    }
+
+    #[test]
+    fn no_false_positive_branch_containing_develop() {
+        let v = validate_git_command("git push -f origin feature/develop-ui");
+        assert!(v.iter().any(|v| matches!(v, GitSafetyViolation::ForcePush)));
+        assert!(!v
+            .iter()
+            .any(|v| matches!(v, GitSafetyViolation::ForcePushProtectedBranch { .. })));
+    }
+
+    #[test]
+    fn detects_protected_branch_with_remote_prefix() {
+        // "origin/main" — leaf is "main", should still be caught
+        let v = validate_git_command("git push --force origin origin/main");
+        assert!(v
+            .iter()
+            .any(|v| matches!(v, GitSafetyViolation::ForcePushProtectedBranch { .. })));
+    }
+
+    // --- Regression: -f flag false positives ---
+
+    #[test]
+    fn no_false_positive_follow_tags() {
+        // --follow-tags contains " -f" as substring but is NOT force push
+        let v = validate_git_command("git push --follow-tags origin my-branch");
+        assert!(!v.iter().any(|v| matches!(v, GitSafetyViolation::ForcePush)));
+    }
+
+    #[test]
+    fn no_false_positive_flag_starting_with_f() {
+        let v = validate_git_command("git push -ff origin my-branch");
+        assert!(!v.iter().any(|v| matches!(v, GitSafetyViolation::ForcePush)));
     }
 
     // --- bare repo detection ---
