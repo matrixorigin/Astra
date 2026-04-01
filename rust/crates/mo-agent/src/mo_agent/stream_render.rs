@@ -383,8 +383,11 @@ impl StreamRenderState {
             spinner.stop_clear();
             if let Some(start) = self.thinking_start.take() {
                 let elapsed = start.elapsed().as_secs_f64();
-                if elapsed >= MIN_THOUGHT_DURATION_LOG_SECS {
-                    // stdout: keep TerminalRegion stderr cursor stable
+                if elapsed >= MIN_THOUGHT_DURATION_LOG_SECS && self.md.is_none() {
+                    // In markdown streaming mode, injecting an unmanaged line here
+                    // shifts the cursor below the tracked markdown regions, which
+                    // causes partial clears/residual text on the next tool turn.
+                    // Keep per-round thought timing out of the normal markdown UX.
                     let line = edge_sse_thought_duration_line(elapsed);
                     println!("{}", line.dim());
                     let _ = io::stdout().flush();

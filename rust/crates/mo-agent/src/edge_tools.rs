@@ -1258,7 +1258,11 @@ impl ToolExecutor {
             // Only increment read_count for full (non-partial) reads.
             // Ranged reads of different sections are expected behavior
             // (guided by the size gate), not wasteful repetition.
-            let new_count = if is_partial { prev_count } else { prev_count + 1 };
+            let new_count = if is_partial {
+                prev_count
+            } else {
+                prev_count + 1
+            };
             state.insert(
                 path.to_path_buf(),
                 FileState {
