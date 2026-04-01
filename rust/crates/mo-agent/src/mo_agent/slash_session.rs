@@ -1,8 +1,86 @@
 use std::io::Write;
 
+use chrono::{DateTime, Utc};
 use mo_agent_services::session_workspace;
 
 use super::*;
+
+/// `/home/foo/bar` → `~/bar` when under the user home dir (readability).
+fn tilde_path(abs: &str) -> String {
+    let Some(home) = dirs::home_dir() else {
+        return abs.to_string();
+    };
+    let home = home.to_string_lossy();
+    let home = home.trim_end_matches('/');
+    if abs == home {
+        return "~".to_string();
+    }
+    let prefix = format!("{home}/");
+    if let Some(rest) = abs.strip_prefix(&prefix) {
+        return format!("~/{rest}");
+    }
+    abs.to_string()
+}
+
+/// Short relative age from RFC3339 `updated_at` (for scan-friendly lists).
+fn rel_updated_label(iso: &str) -> Option<String> {
+    let dt = DateTime::parse_from_rfc3339(iso).ok()?.with_timezone(&Utc);
+    let secs = Utc::now().signed_duration_since(dt).num_seconds();
+    let secs = secs.max(0);
+    if secs < 60 {
+        return Some("just now".to_string());
+    }
+    if secs < 3600 {
+        return Some(format!("{}m ago", secs / 60));
+    }
+    if secs < 86_400 {
+        return Some(format!("{}h ago", secs / 3600));
+    }
+    if secs < 86_400 * 7 {
+        return Some(format!("{}d ago", secs / 86_400));
+    }
+    Some(format!("{}d ago", secs / 86_400))
+}
+
+fn format_u64_grouped(n: u64) -> String {
+    let s = n.to_string();
+    let mut out = String::with_capacity(s.len() + s.len() / 3);
+    for (i, c) in s.chars().rev().enumerate() {
+        if i > 0 && i % 3 == 0 {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out.chars().rev().collect()
+}
+
+/// One-line hint for session lists: cwd, git, turns (from `workspace.yaml` if present).
+fn workspace_summary_line(sid: &str) -> String {
+    match session_workspace::read_workspace(sid) {
+        Ok(ws) => {
+            let mut parts: Vec<String> = Vec::new();
+            let cwd = tilde_path(ws.cwd.as_str());
+            parts.push(ellipsize(&cwd, 56));
+            match (&ws.git_branch, &ws.git_head) {
+                (Some(b), Some(h)) => parts.push(format!("{b} @ {h}")),
+                (Some(b), None) => parts.push(b.clone()),
+                (None, Some(h)) => parts.push(format!("@ {h}")),
+                (None, None) => {}
+            }
+            if ws.turn_count > 0 {
+                parts.push(format!("{} turns", ws.turn_count));
+            }
+            if ws.status != "active" {
+                parts.push(ws.status.clone());
+            }
+            if let Some(lbl) = rel_updated_label(ws.updated_at.as_str()) {
+                parts.push(lbl);
+            }
+            parts.join(" · ")
+        }
+        Err(_) => "journal only (no workspace.yaml)".to_string(),
+    }
+}
 
 fn ellipsize(s: &str, max_chars: usize) -> String {
     let t: String = s.chars().take(max_chars).collect();
@@ -16,7 +94,11 @@ fn ellipsize(s: &str, max_chars: usize) -> String {
 /// Print persisted workspace context (`workspace.yaml`).
 fn print_workspace_metadata(ws: &session_workspace::WorkspaceMetadata, sid: &str) {
     eprintln!("  {}", "— workspace (persisted) —".dim());
-    eprintln!("  {:<16} {}", "cwd:".dim(), ws.cwd.as_str().cyan());
+    eprintln!(
+        "  {:<16} {}",
+        "cwd:".dim(),
+        tilde_path(ws.cwd.as_str()).as_str().cyan()
+    );
     let git_line = match (&ws.git_branch, &ws.git_head) {
         (Some(b), Some(h)) => format!("{b} @ {h}"),
         (Some(b), None) => b.clone(),
@@ -29,14 +111,22 @@ fn print_workspace_metadata(ws: &session_workspace::WorkspaceMetadata, sid: &str
             eprintln!(
                 "  {:<16} {}",
                 "repo root:".dim(),
-                root.as_str().dim()
+                tilde_path(root.as_str()).as_str().dim()
             );
         }
     }
     let started = ws.created_at.get(..19).unwrap_or(ws.created_at.as_str());
     eprintln!("  {:<16} {}", "started:".dim(), started.cyan());
     let saved = ws.updated_at.get(..19).unwrap_or(ws.updated_at.as_str());
-    eprintln!("  {:<16} {}", "last saved:".dim(), saved.cyan());
+    let ago = rel_updated_label(ws.updated_at.as_str())
+        .map(|a| format!(" · {a}"))
+        .unwrap_or_default();
+    eprintln!(
+        "  {:<16} {}{}",
+        "last saved:".dim(),
+        saved.cyan(),
+        ago.dim()
+    );
     eprintln!("  {:<16} {}", "status:".dim(), ws.status.as_str().cyan());
     if let Some(ref sum) = ws.summary {
         eprintln!(
@@ -50,8 +140,8 @@ fn print_workspace_metadata(ws: &session_workspace::WorkspaceMetadata, sid: &str
             "  {:<16} {} turns · {} prompt + {} completion tokens",
             "logged:".dim(),
             ws.turn_count.to_string().cyan(),
-            ws.total_tokens_in.to_string().cyan(),
-            ws.total_tokens_out.to_string().cyan(),
+            format_u64_grouped(ws.total_tokens_in).as_str().cyan(),
+            format_u64_grouped(ws.total_tokens_out).as_str().cyan(),
         );
     }
     if let Some(ref goal) = ws.plan_goal {
@@ -89,10 +179,11 @@ fn print_workspace_metadata(ws: &session_workspace::WorkspaceMetadata, sid: &str
         );
     }
     let ws_path = session_workspace::workspace_dir_for(sid).join("workspace.yaml");
+    let ws_disp = ws_path.display().to_string();
     eprintln!(
         "  {:<16} {}",
         "workspace.yaml:".dim(),
-        ws_path.display().to_string().dim()
+        tilde_path(&ws_disp).as_str().dim()
     );
     eprintln!();
 }
@@ -119,12 +210,18 @@ pub(super) fn resolve_journal_target_session(
             "\n{}",
             "─── Available Sessions ──────────────────────────".bold()
         );
+        eprintln!(
+            "  {}",
+            "newest first · path / git / turns from workspace.yaml".dim()
+        );
         let show = sessions.len().min(10);
         for (i, sid) in sessions.iter().take(show).enumerate() {
+            let hint = workspace_summary_line(sid);
             eprintln!(
-                "  {}  {}",
+                "  {}  {}  {}",
                 format!("[{}]", i + 1).cyan().bold(),
-                sid.as_str().cyan()
+                sid.as_str().cyan(),
+                hint.dim()
             );
         }
         eprintln!();
@@ -215,10 +312,11 @@ pub(super) fn handle_session_command(arg: &str, state: &ReplState) {
                 state.run_id.as_deref().unwrap_or("none").cyan()
             );
             if let Some(ref j) = state.journal {
+                let jp = j.path().display().to_string();
                 eprintln!(
                     "  {:<16} {}",
                     "journal:".dim(),
-                    j.path().display().to_string().cyan()
+                    tilde_path(&jp).as_str().cyan()
                 );
             }
             eprintln!();
@@ -485,19 +583,41 @@ pub(super) fn handle_session_command(arg: &str, state: &ReplState) {
         }
         "list" => match session_journal::list_sessions() {
             Ok(sessions) if sessions.is_empty() => {
-                eprintln!("{}", "  No journal files found.".dim());
+                eprintln!("{}", "  No journal files yet.".dim());
+                eprintln!(
+                    "  {}",
+                    "Chat once to create a session, or check ~/.mo-agent/sessions.".dim()
+                );
             }
             Ok(sessions) => {
                 eprintln!(
                     "\n{}",
                     "─── Session Journals ────────────────────────────".bold()
                 );
+                eprintln!(
+                    "  {}",
+                    "sorted A–Z · right column: cwd, git, turns (from workspace.yaml)".dim()
+                );
                 let current = state.session_id.as_deref().unwrap_or("");
                 for sid in &sessions {
                     let marker = if sid == current { " ← current" } else { "" };
-                    eprintln!("  {}{}", sid.as_str().cyan(), marker.green());
+                    let hint = workspace_summary_line(sid);
+                    eprintln!(
+                        "  {}  {}{}",
+                        sid.as_str().cyan(),
+                        hint.dim(),
+                        marker.green()
+                    );
                 }
-                eprintln!("  {} sessions total", sessions.len());
+                eprintln!(
+                    "  {} {}",
+                    sessions.len().to_string().dim(),
+                    if sessions.len() == 1 {
+                        "session total"
+                    } else {
+                        "sessions total"
+                    }
+                );
                 eprintln!();
             }
             Err(e) => eprintln!("{}", format!("  ✗ {e}").red()),
@@ -647,5 +767,18 @@ pub(super) fn handle_session_command(arg: &str, state: &ReplState) {
                 "Usage: /session [history|list|errors|export] [session_id]".dim()
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod session_display_tests {
+    use super::format_u64_grouped;
+
+    #[test]
+    fn format_u64_grouped_commas() {
+        assert_eq!(format_u64_grouped(0), "0");
+        assert_eq!(format_u64_grouped(999), "999");
+        assert_eq!(format_u64_grouped(1000), "1,000");
+        assert_eq!(format_u64_grouped(12_345_678), "12,345,678");
     }
 }
