@@ -374,6 +374,7 @@ pub(super) async fn handle_info_command(
                 false,
                 &std::env::current_dir().unwrap_or_default(),
             );
+            let turn_start = std::time::Instant::now();
             let sr = stream_chat_sse(ChatTurnParams {
                 api,
                 token: tok,
@@ -418,10 +419,22 @@ pub(super) async fn handle_info_command(
                     sr.tool_calls_count,
                     sr.prompt_tokens,
                     sr.completion_tokens,
-                    0, // duration not tracked here
+                    turn_start.elapsed().as_millis() as u64,
                 )
                 .with_tool_calls(sr.tool_call_records)
-                .with_budget_pressure(sr.budget_pressure);
+                .with_budget_pressure(sr.budget_pressure)
+                .with_tool_selection(
+                    sr.tools_selected,
+                    sr.selected_skills,
+                    sr.tools_used.clone(),
+                    sr.budget_used,
+                )
+                .with_ttft(sr.ttft_ms)
+                .with_context_time(sr.context_ms)
+                .with_selector_strategy(sr.selector_strategy)
+                .with_selector_time(sr.selector_ms)
+                .with_selector_tokens(sr.selector_tokens_in, sr.selector_tokens_out)
+                .with_memoria_time(sr.memoria_ms);
                 state.last_turn_event = Some(turn_event.clone());
                 let _ = journal.append(&turn_event);
             }
