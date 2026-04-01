@@ -352,7 +352,7 @@ fn random_tips(logged_in: bool) -> [&'static str; 2] {
         "Ctrl+R to search command history",
         "Alt+Enter for multi-line input",
         "/explain toggles reasoning visibility",
-        "/plan on for plan-only chat (no tools); /plan for structured task breakdown",
+        "/diff for colored unified git diff; /plan on for plan-only chat (no tools)",
         "/stats shows session token usage",
         "/tools shows tool call performance",
         "/health for tool health dashboard",

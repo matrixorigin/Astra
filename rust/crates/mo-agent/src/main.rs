@@ -73,6 +73,8 @@ mod slash_skill;
 mod slash_state;
 #[path = "mo_agent/stream_render.rs"]
 mod stream_render;
+#[path = "mo_agent/diff_presenter.rs"]
+mod diff_presenter;
 
 use auth_flow::{clear_profile_last_session, do_login, do_register};
 use chat_stream::{ChatTurnParams, stream_chat_sse};
@@ -2829,6 +2831,11 @@ async fn handle_slash_command(
 
         "/sync" => {
             handle_sync_command(arg, state);
+        }
+
+        "/diff" => {
+            let root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+            diff_presenter::run_diff_command(&root, arg, cli_utils::terminal_width_usize());
         }
 
         "/learn" => {
