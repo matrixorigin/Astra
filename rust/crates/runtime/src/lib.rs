@@ -145,7 +145,9 @@ pub use mo_agent_services::{
     },
     sandbox::{DatabaseSandboxService, SandboxRecord, SandboxService, UnconfiguredSandboxService},
     session_audit::{
-        DatabaseSessionAuditService, SessionAuditService, UnconfiguredSessionAuditService,
+        AuditSessionListItem, AuditSessionListParams, AuditSessionListResponse, CrossSessionStats,
+        CrossSessionStatsParams, CrossSessionToolAnalytics, DatabaseSessionAuditService,
+        ModelUsageBrief, SessionAuditService, ToolUsageBrief, UnconfiguredSessionAuditService,
     },
     session_journal,
     skill_config::{

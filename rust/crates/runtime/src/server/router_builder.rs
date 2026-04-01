@@ -382,6 +382,19 @@ pub(super) fn build_router(state: AppState) -> Router {
             "/sessions/{session_id}/audit/errors",
             get(audit_handlers::audit_errors_handler),
         )
+        // Cross-session Analytics
+        .route(
+            "/audit/sessions",
+            get(audit_handlers::list_sessions_handler),
+        )
+        .route(
+            "/audit/stats",
+            get(audit_handlers::cross_session_stats_handler),
+        )
+        .route(
+            "/audit/tools",
+            get(audit_handlers::cross_session_tools_handler),
+        )
         // Marketplace
         .route(
             "/marketplace/install",
