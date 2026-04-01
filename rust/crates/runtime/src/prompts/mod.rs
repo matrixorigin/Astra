@@ -22,8 +22,8 @@ pub use skills::{
     builtin_markdown_skill, builtin_system_skills,
 };
 pub use system::{
-    LOW_CONFIDENCE_THRESHOLD, STALL_NUDGE, SYSTEM_PROMPT_BASE, build_main_system_prompt,
-    detect_task_type,
+    CacheScope, LOW_CONFIDENCE_THRESHOLD, PromptSection, STALL_NUDGE, SYSTEM_PROMPT_BASE,
+    build_main_system_prompt, build_system_prompt_sections, detect_task_type, sections_to_string,
 };
 
 #[cfg(test)]

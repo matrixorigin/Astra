@@ -234,55 +234,175 @@ fn rate_limit_cooldown() -> &'static RateLimitCooldown {
 }
 
 // ── System Prompt Cache ──────────────────────────────────────────────────────
-// The system prompt is ~1.2K tokens and identical for most turns within a session
-// (same tool set, same task type, same profile/learned hints). Cache by tool/task/confidence/profile.
+// Two-level cache for static/dynamic prompt boundary:
+// - Global+Session sections are cached by (tool_names, task_type, confidence) — stable within a session
+// - Per-turn profile_desc is NOT cached (changes every turn with skills/memory/environment)
 use std::sync::Mutex;
 
-fn prompt_cache() -> &'static Mutex<HashMap<u64, String>> {
-    static CACHE: OnceLock<Mutex<HashMap<u64, String>>> = OnceLock::new();
+/// Cached prompt sections (Global + Session scoped).
+struct CachedSections {
+    /// Concatenated text of Global+Session sections (for non-Anthropic providers).
+    text: String,
+    /// Individual sections with scope metadata (for Anthropic cache_control).
+    sections: Vec<prompts::PromptSection>,
+}
+
+fn section_cache() -> &'static Mutex<HashMap<u64, CachedSections>> {
+    static CACHE: OnceLock<Mutex<HashMap<u64, CachedSections>>> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn prompt_cache_key(
-    tool_names: &[&str],
-    task_type: Option<&str>,
-    confidence: f64,
-    profile_desc: &str,
-) -> u64 {
+fn section_cache_key(tool_names: &[&str], task_type: Option<&str>, confidence: f64) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     for name in tool_names {
         name.hash(&mut hasher);
     }
     task_type.unwrap_or("none").hash(&mut hasher);
-    // Bucket confidence: 0.0-0.3 = "low", 0.3-1.0 = "normal"
     let bucket = if confidence < 0.3 { "low" } else { "normal" };
     bucket.hash(&mut hasher);
-    profile_desc.hash(&mut hasher);
     hasher.finish()
 }
 
-fn cached_system_prompt(
+/// Build the system message Value for the LLM API.
+///
+/// For Anthropic providers: uses content array with `cache_control` on stable sections,
+/// enabling server-side KV cache reuse across turns.
+///
+/// For other providers (OpenAI, DeepSeek, etc.): uses a single content string.
+fn build_system_message(
     tool_names: &[&str],
     profile_desc: &str,
     confidence: f64,
     task_type: Option<&str>,
-) -> String {
-    let key = prompt_cache_key(tool_names, task_type, confidence, profile_desc);
-    if let Ok(cache) = prompt_cache().lock()
-        && let Some(cached) = cache.get(&key)
-    {
-        return cached.clone();
-    }
-    let prompt = prompts::build_main_system_prompt(tool_names, profile_desc, confidence, task_type);
-    if let Ok(mut cache) = prompt_cache().lock() {
-        // Cap cache size to avoid unbounded growth
-        if cache.len() > 32 {
-            cache.clear();
+    provider: &str,
+    model_name: &str,
+) -> Value {
+    let key = section_cache_key(tool_names, task_type, confidence);
+
+    // Try cache for the stable (Global + Session) sections
+    let cached = if let Ok(cache) = section_cache().lock() {
+        cache
+            .get(&key)
+            .map(|c| (c.text.clone(), c.sections.clone()))
+    } else {
+        None
+    };
+
+    let (stable_text, sections) = cached.unwrap_or_else(|| {
+        // Build all sections (profile_desc is "" for cache — we'll append it separately)
+        let all = prompts::build_system_prompt_sections(tool_names, "", confidence, task_type);
+        // Only cache Global + Session sections (not None-scoped profile)
+        let stable: Vec<prompts::PromptSection> = all
+            .into_iter()
+            .filter(|s| s.scope != prompts::CacheScope::None)
+            .collect();
+        let text = stable
+            .iter()
+            .map(|s| s.text.as_str())
+            .collect::<Vec<_>>()
+            .join("");
+
+        if let Ok(mut cache) = section_cache().lock() {
+            if cache.len() > 32 {
+                cache.clear();
+            }
+            cache.insert(
+                key,
+                CachedSections {
+                    text: text.clone(),
+                    sections: stable.clone(),
+                },
+            );
         }
-        cache.insert(key, prompt.clone());
+        (text, stable)
+    });
+
+    let is_anthropic = provider == "anthropic" || model_name.contains("claude");
+
+    if is_anthropic {
+        // Anthropic: multi-block content with cache_control on stable sections.
+        // Even via OpenAI-compatible proxies, many forward cache_control to the
+        // native Messages API. Proxies that don't will simply ignore the field.
+        let mut blocks: Vec<Value> = Vec::with_capacity(sections.len() + 1);
+        for section in &sections {
+            let cc = match section.scope {
+                prompts::CacheScope::Global | prompts::CacheScope::Session => {
+                    Some(json!({"type": "ephemeral"}))
+                }
+                prompts::CacheScope::None => None,
+            };
+            let mut block = json!({
+                "type": "text",
+                "text": section.text,
+            });
+            if let Some(cc) = cc {
+                block["cache_control"] = cc;
+            }
+            blocks.push(block);
+        }
+        // Dynamic section (profile + per-turn hints) — no cache_control
+        if !profile_desc.is_empty() {
+            blocks.push(json!({
+                "type": "text",
+                "text": profile_desc,
+            }));
+        }
+        json!({
+            "role": "system",
+            "content": blocks,
+        })
+    } else {
+        // OpenAI-compatible: single content string
+        json!({
+            "role": "system",
+            "content": format!("{stable_text}{profile_desc}"),
+        })
     }
-    prompt
+}
+
+/// Add `cache_control` to the last tool schema for Anthropic,
+/// marking the tool definitions as cache-eligible.
+fn annotate_tool_schemas_for_caching(tools: &mut [Value], provider: &str, model_name: &str) {
+    let is_anthropic = provider == "anthropic" || model_name.contains("claude");
+    if !is_anthropic || tools.is_empty() {
+        return;
+    }
+    // Mark last tool definition with cache_control — Anthropic caches the prefix
+    // up to the last cache_control marker
+    if let Some(last) = tools.last_mut() {
+        last["cache_control"] = json!({"type": "ephemeral"});
+    }
+}
+
+/// Add a cache breakpoint on the last conversation message for Anthropic.
+/// This enables turn-to-turn KV cache reuse for the conversation prefix.
+fn add_message_cache_breakpoint(messages: &mut [Value], provider: &str, model_name: &str) {
+    let is_anthropic = provider == "anthropic" || model_name.contains("claude");
+    if !is_anthropic || messages.is_empty() {
+        return;
+    }
+    // Find the last non-system message and add cache_control to it
+    if let Some(last) = messages.iter_mut().rev().find(|m| {
+        m.get("role")
+            .and_then(Value::as_str)
+            .is_some_and(|r| r != "system")
+    }) {
+        // If content is a string, convert to array format for cache_control
+        if last.get("content").is_some_and(Value::is_string) {
+            let text = last["content"].as_str().unwrap_or_default().to_string();
+            last["content"] = json!([{
+                "type": "text",
+                "text": text,
+                "cache_control": {"type": "ephemeral"},
+            }]);
+        } else if let Some(arr) = last.get_mut("content").and_then(Value::as_array_mut) {
+            // Content is already an array — add cache_control to last element
+            if let Some(last_block) = arr.last_mut() {
+                last_block["cache_control"] = json!({"type": "ephemeral"});
+            }
+        }
+    }
 }
 
 fn bridge_llm_cancel(cc: &Option<Arc<CancellationToken>>) -> LlmCancel<'_> {
@@ -1018,13 +1138,6 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
                 .or_else(|| prompts::detect_task_type(user_content_for_signal));
             let profile_with_hints = format!("{profile_desc}{skill_hint}{learned_context_hint}");
 
-            let system_prompt_content = cached_system_prompt(
-                &tool_names,
-                &profile_with_hints,
-                selection_confidence,
-                task_type,
-            );
-
             // ── Memory lifecycle: detect tracking/store signals in user input ──
             // Injects a priority hint into the system prompt so the LLM stores
             // the user's interest immediately rather than exploring the codebase.
@@ -1041,10 +1154,21 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
                 String::new()
             };
 
-            llm_messages.push(json!({
-                "role": "system",
-                "content": format!("{system_prompt_content}{memory_signal_hint}")
-            }));
+            // Build per-turn dynamic content (profile + skills + memory signal)
+            let dynamic_desc = format!("{profile_with_hints}{memory_signal_hint}");
+
+            // Build provider-aware system message with static/dynamic boundary.
+            // Anthropic gets multi-block content with cache_control on stable sections;
+            // OpenAI/others get a single concatenated content string.
+            let system_msg = build_system_message(
+                &tool_names,
+                &dynamic_desc,
+                selection_confidence,
+                task_type,
+                &provider,
+                &model_name,
+            );
+            llm_messages.push(system_msg);
 
             // Merge tool results into messages (handle continuation turns)
             // Client sends complete message history including tool role messages,
@@ -1122,7 +1246,9 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
             let budget = crate::prompts::budget_for_model(Some(&model_name));
             let max_output_tokens =
                 (budget.model_limit as f64 * budget.output_reserve_ratio) as usize;
-            let pruned_tools = prune_tool_schemas(&edge_tools, tier);
+            let mut pruned_tools = prune_tool_schemas(&edge_tools, tier);
+            // Annotate tool schemas with cache_control for Anthropic
+            annotate_tool_schemas_for_caching(&mut pruned_tools, &provider, &model_name);
             let ledger_wait = std::time::Duration::from_secs_f64(turn_timeout_s().max(1.0));
             let max_rounds = crate::turn::routing::max_tool_rounds();
             let round_limit: i64 = if use_e2e_llm {
@@ -1167,6 +1293,8 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
                         let _ = round_val;
                     }
                 } else {
+                    // Add cache breakpoint on last conversation message for Anthropic
+                    add_message_cache_breakpoint(&mut llm_messages, &provider, &model_name);
                     let mut client_stopped = false;
                     let llm_stream = match call_llm_stream(
                         &llm_messages,
@@ -1925,15 +2053,14 @@ mod tests {
     }
 
     #[test]
-    fn prompt_cache_key_includes_profile_context() {
-        let key_plain = prompt_cache_key(&["bash"], Some("implementation"), 0.8, "");
-        let key_learned = prompt_cache_key(
-            &["bash"],
-            Some("implementation"),
-            0.8,
-            "\n\n## Learned Runtime Context\nmatrixorigin => github",
-        );
-        assert_ne!(key_plain, key_learned);
+    fn section_cache_key_varies_by_tools_and_task() {
+        let key1 = section_cache_key(&["bash"], Some("implementation"), 0.8);
+        let key2 = section_cache_key(&["bash", "read_file"], Some("implementation"), 0.8);
+        let key3 = section_cache_key(&["bash"], Some("debugging"), 0.8);
+        let key4 = section_cache_key(&["bash"], Some("implementation"), 0.2);
+        assert_ne!(key1, key2, "different tools should differ");
+        assert_ne!(key1, key3, "different task types should differ");
+        assert_ne!(key1, key4, "different confidence buckets should differ");
     }
 
     #[test]
@@ -1981,5 +2108,152 @@ mod tests {
     fn count_inprocess_persisted_events_skips_failed_tool_events() {
         assert_eq!(count_inprocess_persisted_events(2, 3, false), 2);
         assert_eq!(count_inprocess_persisted_events(2, 3, true), 5);
+    }
+
+    // ── Static/dynamic prompt boundary tests ──
+
+    #[test]
+    fn build_system_message_anthropic_has_cache_control() {
+        let msg = build_system_message(
+            &["bash", "read_file"],
+            "cwd: /test",
+            0.8,
+            Some("implementation"),
+            "anthropic",
+            "claude-sonnet-4-20250514",
+        );
+
+        // Should be multi-block content array
+        let content = msg.get("content").expect("should have content");
+        let blocks = content
+            .as_array()
+            .expect("Anthropic content should be array");
+        assert!(blocks.len() >= 2, "should have at least 2 blocks");
+
+        // First block (Global) should have cache_control
+        let first = &blocks[0];
+        assert!(
+            first.get("cache_control").is_some(),
+            "Global block should have cache_control"
+        );
+        assert_eq!(
+            first["cache_control"]["type"].as_str(),
+            Some("ephemeral"),
+            "cache_control type should be ephemeral"
+        );
+
+        // Last block (profile/dynamic) should NOT have cache_control
+        let last = blocks.last().unwrap();
+        assert!(
+            last.get("cache_control").is_none() || last["cache_control"].is_null(),
+            "dynamic block should not have cache_control"
+        );
+    }
+
+    #[test]
+    fn build_system_message_openai_has_string_content() {
+        let msg = build_system_message(
+            &["bash", "read_file"],
+            "cwd: /test",
+            0.8,
+            None,
+            "openai",
+            "gpt-4",
+        );
+
+        // Should be a single string content
+        let content = msg.get("content").expect("should have content");
+        assert!(content.is_string(), "OpenAI content should be string");
+        assert!(
+            content.as_str().unwrap().contains("cwd: /test"),
+            "should contain profile"
+        );
+    }
+
+    #[test]
+    fn build_system_message_claude_model_triggers_anthropic_format() {
+        // Even if provider is not "anthropic", claude model name should trigger it
+        let msg = build_system_message(
+            &["bash"],
+            "",
+            0.8,
+            None,
+            "openrouter",               // not "anthropic"
+            "claude-sonnet-4-20250514", // but model is claude
+        );
+
+        let content = msg.get("content").expect("should have content");
+        assert!(
+            content.is_array(),
+            "claude model should use array content even through non-anthropic provider"
+        );
+    }
+
+    #[test]
+    fn annotate_tool_schemas_for_caching_adds_cache_control() {
+        let mut tools = vec![
+            json!({"function": {"name": "bash"}}),
+            json!({"function": {"name": "read_file"}}),
+        ];
+        annotate_tool_schemas_for_caching(&mut tools, "anthropic", "claude-sonnet-4-20250514");
+
+        // Only last tool should have cache_control
+        assert!(
+            tools[0].get("cache_control").is_none(),
+            "first tool should not have cache_control"
+        );
+        assert_eq!(
+            tools[1]["cache_control"]["type"].as_str(),
+            Some("ephemeral"),
+            "last tool should have ephemeral cache_control"
+        );
+    }
+
+    #[test]
+    fn annotate_tool_schemas_noop_for_openai() {
+        let mut tools = vec![json!({"function": {"name": "bash"}})];
+        annotate_tool_schemas_for_caching(&mut tools, "openai", "gpt-4");
+        assert!(
+            tools[0].get("cache_control").is_none(),
+            "OpenAI tools should not get cache_control"
+        );
+    }
+
+    #[test]
+    fn add_message_cache_breakpoint_targets_last_non_system() {
+        let mut messages = vec![
+            json!({"role": "system", "content": "sys prompt"}),
+            json!({"role": "user", "content": "hello"}),
+            json!({"role": "assistant", "content": "hi there"}),
+        ];
+        add_message_cache_breakpoint(&mut messages, "anthropic", "claude-sonnet-4-20250514");
+
+        // System message should be untouched
+        assert!(messages[0]["content"].is_string(), "system msg unchanged");
+
+        // Last message (assistant) should have cache_control
+        let last_content = messages[2].get("content").unwrap();
+        let blocks = last_content
+            .as_array()
+            .expect("should be converted to array");
+        assert!(
+            blocks[0].get("cache_control").is_some(),
+            "last msg should have cache_control"
+        );
+    }
+
+    #[test]
+    fn add_message_cache_breakpoint_noop_for_openai() {
+        let mut messages = vec![
+            json!({"role": "system", "content": "sys"}),
+            json!({"role": "user", "content": "hi"}),
+        ];
+        add_message_cache_breakpoint(&mut messages, "openai", "gpt-4");
+
+        // Should remain unchanged
+        assert!(
+            messages[1]["content"].is_string(),
+            "OpenAI msgs should not be modified"
+        );
     }
 }
