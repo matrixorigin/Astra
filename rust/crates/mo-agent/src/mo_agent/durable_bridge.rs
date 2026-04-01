@@ -7,7 +7,7 @@
 use crossterm::style::Stylize;
 use mo_agent_services::{
     ContractGenerator, DurableTaskLifecycle, LocalDurableTaskLifecycle, SubtaskStage,
-    SubtaskVerificationReport, TaskContract, TaskDeliveryReport,
+    SubtaskVerificationReport, TaskContract, TaskDeliveryReport, VerifierKind,
 };
 use std::sync::Arc;
 
@@ -131,20 +131,35 @@ pub async fn on_subtask_complete(
         );
     }
 
-    // 2. Check if this subtask has any verification criteria
-    let has_criteria = durable
+    // 2. Check if this subtask has any *local* verification criteria
+    //    (skip global_only and LlmJudge — those only run in on_plan_complete)
+    let has_local_criteria = durable
         .contract
         .subtasks
         .iter()
         .find(|s| s.id == subtask_id)
-        .map(|s| !s.criteria.is_empty())
+        .map(|s| {
+            s.criteria.iter().any(|c| {
+                !c.global_only
+                    && !matches!(
+                        c.verifier,
+                        mo_agent_services::VerifierKind::LlmJudge { .. }
+                    )
+            })
+        })
         .unwrap_or(false);
 
-    if !has_criteria {
+    if !has_local_criteria {
+        // Silently skip — heavy checks run during global verification
         return true;
     }
 
-    // 3. Run verification
+    // 3. Run lightweight verification with progress indication
+    eprintln!(
+        "  {}  Verifying subtask: {}...",
+        "🔍".cyan(),
+        subtask_id,
+    );
     match durable
         .lifecycle
         .verify_subtask(&task_id, subtask_id)
@@ -231,6 +246,23 @@ pub async fn on_plan_complete(
         "\n{}  Running global verification...",
         "🔬".cyan(),
     );
+
+    // Show what will be checked
+    for c in &durable.contract.global_verification {
+        let cmd_hint = match &c.verifier {
+            mo_agent_services::VerifierKind::BuildPass { cmd } => {
+                format!("build: {cmd}")
+            }
+            mo_agent_services::VerifierKind::TestPass { cmd, .. } => {
+                format!("test: {cmd}")
+            }
+            mo_agent_services::VerifierKind::Command { cmd, .. } => {
+                format!("cmd: {cmd}")
+            }
+            _ => c.description.clone(),
+        };
+        eprintln!("      {} {}", "▸".grey(), cmd_hint);
+    }
 
     match durable.lifecycle.verify_global(&task_id).await {
         Ok(results) => {

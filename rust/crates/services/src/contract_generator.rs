@@ -156,7 +156,7 @@ fn parse_acceptance_to_criteria(
         } else if let Some(c) = try_parse_file_exists_criterion(&crit_id, part, &part_lower) {
             criteria.push(c);
         } else {
-            // Fallback: LLM judge for semantic criteria
+            // Fallback: LLM judge for semantic criteria (deferred — not yet implemented)
             criteria.push(VerificationCriterion {
                 id: crit_id,
                 description: part.to_string(),
@@ -169,6 +169,7 @@ fn parse_acceptance_to_criteria(
                 },
                 required: !lower.contains("optional"),
                 timeout_sec: 60,
+                global_only: true, // LlmJudge not yet implemented; skip in per-subtask
             });
         }
     }
@@ -187,6 +188,7 @@ fn parse_acceptance_to_criteria(
             },
             required: true,
             timeout_sec: 60,
+            global_only: true, // LlmJudge not yet implemented; skip in per-subtask
         });
     }
 
@@ -214,6 +216,7 @@ fn try_parse_test_criterion(
         },
         required: true,
         timeout_sec: 300,
+        global_only: true, // Expensive: only run during global verification
     })
 }
 
@@ -238,6 +241,7 @@ fn try_parse_build_criterion(
         verifier: VerifierKind::BuildPass { cmd },
         required: true,
         timeout_sec: 300,
+        global_only: true, // Expensive: only run during global verification
     })
 }
 
@@ -262,6 +266,7 @@ fn try_parse_file_exists_criterion(
         verifier: VerifierKind::FileExists { paths },
         required: true,
         timeout_sec: 10,
+        global_only: false, // lightweight — run per-subtask
     })
 }
 
@@ -295,6 +300,7 @@ fn try_parse_grep_criterion(
         },
         required: true,
         timeout_sec: 10,
+        global_only: false, // lightweight — run per-subtask
     })
 }
 
@@ -416,6 +422,7 @@ impl ContractGenerator {
                         },
                         required: true,
                         timeout_sec: 10,
+                        global_only: false, // lightweight — run per-subtask
                     });
                 }
                 c
@@ -480,6 +487,7 @@ impl ContractGenerator {
                 verifier: VerifierKind::BuildPass { cmd },
                 required: true,
                 timeout_sec: 600,
+                global_only: true,
             });
         }
 
@@ -494,6 +502,7 @@ impl ContractGenerator {
                 },
                 required: true,
                 timeout_sec: 600,
+                global_only: true,
             });
         }
 
@@ -508,6 +517,7 @@ impl ContractGenerator {
                 },
                 required: false, // advisory, not blocking
                 timeout_sec: 300,
+                global_only: true,
             });
         }
 

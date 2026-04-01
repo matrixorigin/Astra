@@ -225,6 +225,10 @@ pub struct VerificationCriterion {
     /// Max seconds for this verification to run
     #[serde(default = "default_timeout")]
     pub timeout_sec: u32,
+    /// If true, only runs during global verification (not per-subtask).
+    /// Used for expensive checks like full build/test/lint.
+    #[serde(default)]
+    pub global_only: bool,
 }
 
 fn default_true() -> bool {
@@ -325,13 +329,41 @@ impl VerificationRunner {
 
     /// Verify all criteria for a subtask.
     pub async fn verify_subtask(&self, subtask: &DurableSubtask) -> SubtaskVerificationReport {
+        self.verify_subtask_filtered(subtask, false).await
+    }
+
+    /// Verify only lightweight (non-global-only) criteria for a subtask.
+    /// Skips `global_only` criteria and `LlmJudge` (not yet implemented).
+    /// Used during per-subtask verification in the REPL loop for fast feedback.
+    pub async fn verify_subtask_local(&self, subtask: &DurableSubtask) -> SubtaskVerificationReport {
+        self.verify_subtask_filtered(subtask, true).await
+    }
+
+    async fn verify_subtask_filtered(
+        &self,
+        subtask: &DurableSubtask,
+        skip_heavy: bool,
+    ) -> SubtaskVerificationReport {
         let mut results = Vec::new();
-        for criterion in &subtask.criteria {
+        let criteria_to_run: Vec<_> = subtask
+            .criteria
+            .iter()
+            .filter(|c| {
+                if skip_heavy && c.global_only {
+                    return false;
+                }
+                if skip_heavy && matches!(c.verifier, VerifierKind::LlmJudge { .. }) {
+                    return false;
+                }
+                true
+            })
+            .collect();
+
+        for criterion in &criteria_to_run {
             let result = self.run_criterion(criterion).await;
             results.push(result);
         }
-        let all_required_passed = subtask
-            .criteria
+        let all_required_passed = criteria_to_run
             .iter()
             .zip(results.iter())
             .all(|(c, r)| !c.required || r.passed);
@@ -2158,7 +2190,8 @@ impl DurableTaskLifecycle for LocalDurableTaskLifecycle {
         }
 
         let runner = VerificationRunner::new(self.work_dir.clone());
-        let report = runner.verify_subtask(&durable_st).await;
+        // Per-subtask: use local verification (skips global_only & LlmJudge)
+        let report = runner.verify_subtask_local(&durable_st).await;
 
         let snapshot_name = durable_st.snapshot_name.clone();
         let subtask = contract
@@ -2399,6 +2432,7 @@ mod tests {
             },
             required: true,
             timeout_sec: 300,
+            global_only: false,
         };
         let json = serde_json::to_string(&criterion).unwrap();
         let parsed: VerificationCriterion = serde_json::from_str(&json).unwrap();
@@ -2421,6 +2455,7 @@ mod tests {
                         },
                         required: true,
                         timeout_sec: 10,
+                        global_only: false,
                     },
                     VerificationCriterion {
                         id: "build".into(),
@@ -2430,12 +2465,14 @@ mod tests {
                         },
                         required: true,
                         timeout_sec: 120,
+                        global_only: false,
                     },
                 ],
                 require_all: true,
             },
             required: true,
             timeout_sec: 300,
+            global_only: false,
         };
         let json = serde_json::to_string_pretty(&criterion).unwrap();
         let parsed: VerificationCriterion = serde_json::from_str(&json).unwrap();
@@ -2485,6 +2522,7 @@ mod tests {
                     },
                     required: true,
                     timeout_sec: 120,
+                    global_only: false,
                 }],
                 ..Default::default()
             }],
@@ -2518,6 +2556,7 @@ mod tests {
             },
             required: true,
             timeout_sec: 10,
+            global_only: false,
         };
         let result = runner.run_criterion(&criterion).await;
         assert!(result.passed, "file should exist: {:?}", result);
@@ -2531,6 +2570,7 @@ mod tests {
             },
             required: true,
             timeout_sec: 10,
+            global_only: false,
         };
         let result = runner.run_criterion(&criterion).await;
         assert!(!result.passed, "file should NOT exist");
@@ -2551,6 +2591,7 @@ mod tests {
             },
             required: true,
             timeout_sec: 10,
+            global_only: false,
         };
         let result = runner.run_criterion(&criterion).await;
         assert!(result.passed);
@@ -2565,6 +2606,7 @@ mod tests {
             },
             required: true,
             timeout_sec: 10,
+            global_only: false,
         };
         let result = runner.run_criterion(&criterion).await;
         assert!(!result.passed);
@@ -2588,6 +2630,7 @@ mod tests {
             },
             required: true,
             timeout_sec: 10,
+            global_only: false,
         };
         let result = runner.run_criterion(&criterion).await;
         assert!(result.passed);
@@ -2603,6 +2646,7 @@ mod tests {
             },
             required: true,
             timeout_sec: 10,
+            global_only: false,
         };
         let result = runner.run_criterion(&criterion).await;
         assert!(result.passed);
@@ -2623,6 +2667,7 @@ mod tests {
             },
             required: true,
             timeout_sec: 10,
+            global_only: false,
         };
         let result = runner.run_criterion(&criterion).await;
         assert!(result.passed);
@@ -2647,6 +2692,7 @@ mod tests {
                     },
                     required: true,
                     timeout_sec: 10,
+                    global_only: false,
                 },
                 VerificationCriterion {
                     id: "v2".into(),
@@ -2657,6 +2703,7 @@ mod tests {
                     },
                     required: true,
                     timeout_sec: 10,
+                    global_only: false,
                 },
             ],
             ..Default::default()
@@ -2682,6 +2729,7 @@ mod tests {
             },
             required: true,
             timeout_sec: 1, // 1 second timeout
+            global_only: false,
         };
         let result = runner.run_criterion(&criterion).await;
         assert!(!result.passed);
@@ -2890,6 +2938,7 @@ mod tests {
                 },
                 required: true,
                 timeout_sec: 10,
+                global_only: false,
             },
             VerificationCriterion {
                 id: "grep-check".into(),
@@ -2901,6 +2950,7 @@ mod tests {
                 },
                 required: true,
                 timeout_sec: 10,
+                global_only: false,
             },
         ];
         svc.amend_contract(
@@ -3027,6 +3077,7 @@ mod tests {
                         },
                         required: true,
                         timeout_sec: 60,
+                        global_only: false,
                     }],
                     retry_count: 1,
                     files: vec!["src/auth.rs".into()],
@@ -3376,6 +3427,7 @@ mod tests {
             },
             required: true,
             timeout_sec: 10,
+            global_only: false,
         }];
         svc.amend_contract(
             &contract.contract_id,
@@ -3433,6 +3485,7 @@ mod tests {
             },
             required: true,
             timeout_sec: 10,
+            global_only: false,
         }];
         c.subtasks[0].max_retries = 2; // allow 1 retry before abandonment
         svc.amend_contract(
