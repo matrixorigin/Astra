@@ -617,6 +617,77 @@ pub fn count_turns(session_id: &str) -> u32 {
         .count() as u32
 }
 
+/// Quick metadata peek from a journal file — reads only the first few lines.
+///
+/// Returns `(first_user_input, model, timestamp)` without parsing the entire JSONL.
+/// Designed for fast session listing (like claudecode's head/tail extraction).
+pub fn peek_session_meta(session_id: &str) -> Option<SessionPeek> {
+    use std::io::BufRead;
+    let path = journal_dir().join(format!("{session_id}.jsonl"));
+    let file = std::fs::File::open(&path).ok()?;
+    let reader = std::io::BufReader::new(file);
+
+    let mut model: Option<String> = None;
+    let mut first_prompt: Option<String> = None;
+    let mut created_at: Option<String> = None;
+
+    // Read at most 20 lines — enough to find session_start + first turn
+    for line in reader.lines().take(20).map_while(|l| l.ok()) {
+        if created_at.is_none() {
+            // Extract timestamp from first line (any event type)
+            if let Some(ts) = extract_json_str(&line, "\"ts\":\"") {
+                created_at = Some(ts);
+            }
+        }
+        if model.is_none() && line.contains("\"type\":\"session_start\"") {
+            model = extract_json_str(&line, "\"model\":\"");
+        }
+        if first_prompt.is_none() && line.contains("\"type\":\"turn\"") {
+            first_prompt = extract_json_str(&line, "\"user_input\":\"");
+        }
+        if model.is_some() && first_prompt.is_some() {
+            break;
+        }
+    }
+
+    Some(SessionPeek {
+        first_prompt,
+        model,
+        created_at,
+    })
+}
+
+/// Lightweight session metadata from journal head.
+#[derive(Debug, Clone, Default)]
+pub struct SessionPeek {
+    /// First user message (truncated, from first Turn event).
+    pub first_prompt: Option<String>,
+    /// Model from SessionStart event.
+    pub model: Option<String>,
+    /// Timestamp of first event.
+    pub created_at: Option<String>,
+}
+
+/// Fast JSON string field extraction without full parse.
+/// Looks for `"key":"value"` and returns the value (handles simple escapes).
+fn extract_json_str(line: &str, needle: &str) -> Option<String> {
+    let start = line.find(needle)? + needle.len();
+    let rest = &line[start..];
+    // Find closing quote, handling escaped quotes
+    let mut end = 0;
+    let bytes = rest.as_bytes();
+    while end < bytes.len() {
+        if bytes[end] == b'"' && (end == 0 || bytes[end - 1] != b'\\') {
+            break;
+        }
+        end += 1;
+    }
+    if end == 0 || end >= bytes.len() {
+        return None;
+    }
+    Some(rest[..end].replace("\\\"", "\"").replace("\\n", " "))
+}
+
 /// Resolve a session id to an exact journal filename stem.
 ///
 /// Accepts:

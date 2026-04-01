@@ -618,31 +618,107 @@ async fn handle_resume_command(arg: &str, profile: Option<&str>, state: &mut Rep
         }
 
         let sessions = &result[..result.len().min(10)];
+
+        // Enrich with local metadata (workspace + journal peek) — fast, no DB
+        struct SessionDisplay {
+            idx: usize,
+            session_id: String,
+            title: Option<String>,
+            first_prompt: Option<String>,
+            turn_count: u32,
+            model: Option<String>,
+            cwd_short: Option<String>,
+            git_branch: Option<String>,
+            source: String,
+            has_plan: bool,
+            age: String,
+        }
+
+        let mut items: Vec<SessionDisplay> = Vec::new();
+        for (i, s) in sessions.iter().enumerate() {
+            let peek = session_journal::peek_session_meta(&s.session_id);
+            let ws = mo_agent_services::session_workspace::read_workspace(&s.session_id).ok();
+
+            // Title: cloud title > workspace summary > first prompt preview
+            let title = s.title.clone()
+                .or_else(|| ws.as_ref().and_then(|w| w.summary.clone()))
+                .or_else(|| peek.as_ref().and_then(|p| p.first_prompt.clone()));
+
+            let first_prompt = peek.as_ref().and_then(|p| p.first_prompt.clone());
+
+            // Model: cloud > workspace > journal peek
+            let model = s.model.clone()
+                .or_else(|| ws.as_ref().map(|w| w.model.clone()))
+                .or_else(|| peek.as_ref().and_then(|p| p.model.clone()));
+
+            // cwd: shorten to last 2 path components
+            let cwd_short = ws.as_ref().map(|w| {
+                let parts: Vec<&str> = w.cwd.split('/').filter(|s| !s.is_empty()).collect();
+                if parts.len() <= 2 {
+                    w.cwd.clone()
+                } else {
+                    format!("…/{}", parts[parts.len()-2..].join("/"))
+                }
+            });
+
+            let git_branch = s.git_branch.clone()
+                .or_else(|| ws.as_ref().and_then(|w| w.git_branch.clone()));
+
+            let source = if s.restored_from_cloud { "☁".to_string() }
+                else if s.last_status == "local" { "⊙".to_string() }
+                else { s.last_status.clone() };
+
+            let has_plan = ws.as_ref().map_or(false, |w| w.executing_plan_json.is_some());
+
+            // Age: from workspace or journal timestamp
+            let age = ws.as_ref().map(|w| &w.updated_at)
+                .or_else(|| peek.as_ref().and_then(|p| p.created_at.as_ref()))
+                .and_then(|ts| chrono::DateTime::parse_from_rfc3339(ts).ok())
+                .map(|dt| {
+                    let dur = chrono::Utc::now().signed_duration_since(dt);
+                    if dur.num_minutes() < 60 { format!("{}m ago", dur.num_minutes()) }
+                    else if dur.num_hours() < 24 { format!("{}h ago", dur.num_hours()) }
+                    else { format!("{}d ago", dur.num_days()) }
+                })
+                .unwrap_or_default();
+
+            items.push(SessionDisplay {
+                idx: i + 1, session_id: s.session_id.clone(), title, first_prompt,
+                turn_count: s.turn_count, model, cwd_short, git_branch, source, has_plan, age,
+            });
+        }
+
         eprintln!(
             "\n{}",
             "─── Resumable Sessions ──────────────────────────".bold()
         );
-        for (i, s) in sessions.iter().enumerate() {
-            let title = s.title.as_deref().unwrap_or("");
-            let title_part = if title.is_empty() {
-                String::new()
-            } else {
-                format!(" {title}")
-            };
-            let source = if s.restored_from_cloud {
-                "cloud"
-            } else if s.last_status == "local" {
-                "local"
-            } else {
-                &s.last_status
-            };
+        for s in &items {
+            // Line 1: [N]  title or first prompt  (age)
+            let display_text = s.title.as_deref()
+                .or(s.first_prompt.as_deref())
+                .unwrap_or("(no prompt)");
+            let display_truncated: String = display_text.chars().take(60).collect();
+            let plan_badge = if s.has_plan { " 📋" } else { "" };
             eprintln!(
-                "  {}  {}{}  ({} turns, {})",
-                format!("[{}]", i + 1).cyan().bold(),
-                s.session_id.as_str().cyan(),
-                title_part,
+                "  {}  {}{}  {}",
+                format!("[{}]", s.idx).cyan().bold(),
+                display_truncated,
+                plan_badge,
+                s.age.as_str().dim(),
+            );
+            // Line 2: context details
+            let short_id = &s.session_id[..8.min(s.session_id.len())];
+            let model_str = s.model.as_deref().unwrap_or("?");
+            let branch_str = s.git_branch.as_deref().map(|b| format!(" {b}")).unwrap_or_default();
+            let cwd_str = s.cwd_short.as_deref().unwrap_or("");
+            eprintln!(
+                "      {} {} {} turns · {}{} {}",
+                s.source.as_str().dim(),
+                short_id.dim(),
                 s.turn_count,
-                source.dim(),
+                model_str.dim(),
+                branch_str.dim(),
+                cwd_str.dim(),
             );
         }
         eprintln!();
