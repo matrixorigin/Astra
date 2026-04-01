@@ -8,8 +8,8 @@ use mo_agent_runtime::turn::sse_edge_stderr_lines::{
     edge_sse_thought_duration_line, edge_sse_tool_request_notice_line,
 };
 use mo_agent_runtime::turn::sse_stream_host::{
-    EdgeApprovalResult, EdgeToolExecResult, NoopSseStreamHost, SseStreamHost, consume_sse_stream,
-    STREAM_IDLE_TIMEOUT_MS,
+    EdgeApprovalResult, EdgeToolExecResult, NoopSseStreamHost, STREAM_IDLE_TIMEOUT_MS,
+    SseStreamHost, consume_sse_stream,
 };
 use mo_agent_runtime::turn::tool_result_semantics::cloud_tool_result_status_label;
 use std::ops::{Deref, DerefMut};

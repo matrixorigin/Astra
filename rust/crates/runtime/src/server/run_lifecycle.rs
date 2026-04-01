@@ -842,22 +842,20 @@ impl SubRunExecutor for ServerSubRunExecutor {
         let outcome = run_agentic_loop_with_host(&mut host, &mut loop_state).await;
 
         match outcome {
-            Ok(AgenticLoopOutcome::Completed) => {
-                Ok(mo_agent_services::coordination::AgentResult {
-                    agent_id: config.agent_profile.agent_id,
-                    run_id: config.run_id,
-                    status: "completed".to_string(),
-                    output: if loop_state.final_text.is_empty() {
-                        None
-                    } else {
-                        Some(loop_state.final_text)
-                    },
-                    error: None,
-                    prompt_tokens: loop_state.total_prompt,
-                    completion_tokens: loop_state.total_completion,
-                    tool_calls: loop_state.total_tool_calls,
-                })
-            }
+            Ok(AgenticLoopOutcome::Completed) => Ok(mo_agent_services::coordination::AgentResult {
+                agent_id: config.agent_profile.agent_id,
+                run_id: config.run_id,
+                status: "completed".to_string(),
+                output: if loop_state.final_text.is_empty() {
+                    None
+                } else {
+                    Some(loop_state.final_text)
+                },
+                error: None,
+                prompt_tokens: loop_state.total_prompt,
+                completion_tokens: loop_state.total_completion,
+                tool_calls: loop_state.total_tool_calls,
+            }),
             Ok(AgenticLoopOutcome::Cancelled) => {
                 // Cancelled via pause_flag — report as "paused" so the
                 // delegation engine can distinguish from hard errors.

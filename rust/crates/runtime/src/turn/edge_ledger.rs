@@ -18,6 +18,17 @@ pub const DEFAULT_POLL_INTERVAL_MS: u64 = 50;
 pub const MSG_TOOL_LEDGER_TIMEOUT: &str =
     "timed out waiting for edge POST /tools/result (§5.5 ledger)";
 
+/// Returns `true` if any assistant message in `messages` carries a
+/// `reasoning_content` field, indicating a thinking-enabled model session.
+/// When true, **all** subsequent assistant messages must include the field
+/// (even as an empty string) to satisfy the LLM API contract.
+pub fn history_has_reasoning(messages: &[Value]) -> bool {
+    messages.iter().any(|m| {
+        m.get("role").and_then(Value::as_str) == Some("assistant")
+            && m.get("reasoning_content").is_some()
+    })
+}
+
 #[inline]
 pub fn tool_callback_key(user_id: &str, request_id: &str) -> String {
     format!("{user_id}:tool:{request_id}")
@@ -109,11 +120,32 @@ pub fn persist_value_for_ledger_tool_result(
 }
 
 pub fn assistant_message_with_tool_calls(tool_calls: &[Value]) -> Value {
-    json!({
+    assistant_message_with_tool_calls_and_reasoning(tool_calls, "", false)
+}
+
+/// Build an assistant message with tool_calls, optionally including `reasoning_content`.
+///
+/// When `force_reasoning_field` is true, the field is always present (empty string if
+/// `reasoning_content` is blank).  Thinking-enabled models (Claude extended thinking,
+/// Kimi-k2.5, DeepSeek-R1, …) require `reasoning_content` on **every** assistant
+/// message once thinking mode is active — even when the model produced no reasoning
+/// for a particular turn.
+pub fn assistant_message_with_tool_calls_and_reasoning(
+    tool_calls: &[Value],
+    reasoning_content: &str,
+    force_reasoning_field: bool,
+) -> Value {
+    let mut msg = json!({
         "role": "assistant",
         "content": Value::Null,
         "tool_calls": tool_calls,
-    })
+    });
+    if !reasoning_content.is_empty() {
+        msg["reasoning_content"] = Value::String(reasoning_content.to_string());
+    } else if force_reasoning_field {
+        msg["reasoning_content"] = Value::String(String::new());
+    }
+    msg
 }
 
 #[cfg(test)]
@@ -210,5 +242,69 @@ mod tests {
         let got = take_ledger_entry(&ledger, &key, Duration::from_millis(60)).await;
         assert!(got.is_none());
         assert!(started.elapsed() >= Duration::from_millis(50));
+    }
+
+    #[test]
+    fn assistant_message_with_reasoning_includes_field_when_non_empty() {
+        let tc =
+            vec![json!({"id":"c1","type":"function","function":{"name":"bash","arguments":"{}"}})];
+        let msg = assistant_message_with_tool_calls_and_reasoning(&tc, "I should run bash", false);
+        assert_eq!(msg["role"], "assistant");
+        assert_eq!(
+            msg["reasoning_content"].as_str(),
+            Some("I should run bash"),
+            "reasoning_content must be present for thinking models"
+        );
+        assert!(msg["tool_calls"].as_array().unwrap().len() == 1);
+    }
+
+    #[test]
+    fn assistant_message_with_reasoning_omits_field_when_empty() {
+        let tc =
+            vec![json!({"id":"c1","type":"function","function":{"name":"bash","arguments":"{}"}})];
+        let msg = assistant_message_with_tool_calls_and_reasoning(&tc, "", false);
+        assert!(
+            msg.get("reasoning_content").is_none(),
+            "reasoning_content must NOT be present for non-thinking models"
+        );
+    }
+
+    #[test]
+    fn assistant_message_force_reasoning_includes_empty_string() {
+        let tc =
+            vec![json!({"id":"c1","type":"function","function":{"name":"bash","arguments":"{}"}})];
+        let msg = assistant_message_with_tool_calls_and_reasoning(&tc, "", true);
+        assert_eq!(
+            msg["reasoning_content"].as_str(),
+            Some(""),
+            "force_reasoning_field must include empty string for thinking models"
+        );
+    }
+
+    #[test]
+    fn assistant_message_without_reasoning_backward_compat() {
+        let tc =
+            vec![json!({"id":"c1","type":"function","function":{"name":"bash","arguments":"{}"}})];
+        let msg = assistant_message_with_tool_calls(&tc);
+        assert!(msg.get("reasoning_content").is_none());
+        assert_eq!(msg["role"], "assistant");
+    }
+
+    #[test]
+    fn history_has_reasoning_detects_thinking_session() {
+        let messages = vec![
+            json!({"role": "user", "content": "hi"}),
+            json!({"role": "assistant", "content": "hello", "reasoning_content": "thinking..."}),
+        ];
+        assert!(history_has_reasoning(&messages));
+    }
+
+    #[test]
+    fn history_has_reasoning_false_for_non_thinking_session() {
+        let messages = vec![
+            json!({"role": "user", "content": "hi"}),
+            json!({"role": "assistant", "content": "hello"}),
+        ];
+        assert!(!history_has_reasoning(&messages));
     }
 }

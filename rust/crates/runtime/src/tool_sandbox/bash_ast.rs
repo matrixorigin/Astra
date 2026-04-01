@@ -188,11 +188,7 @@ fn analyze_command_invocation(node: Node<'_>, ctx: &mut RiskCtx<'_>) {
     }
     if lower == "chmod" {
         let txt = ctx.text(node);
-        if txt.contains("+s")
-            || txt.contains("u+s")
-            || txt.contains("g+s")
-            || txt.contains("o+s")
-        {
+        if txt.contains("+s") || txt.contains("u+s") || txt.contains("g+s") || txt.contains("o+s") {
             ctx.push(CommandRisk::PrivilegeEscalation);
         }
     }

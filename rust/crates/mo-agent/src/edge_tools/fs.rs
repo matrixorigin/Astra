@@ -52,16 +52,15 @@ impl ToolExecutor {
         // Binary file guard — refuse to read known binary extensions
         if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
             const BINARY_EXTS: &[&str] = &[
-                "png", "jpg", "jpeg", "gif", "bmp", "ico", "webp", "svg",
-                "pdf", "zip", "gz", "tar", "bz2", "xz", "7z", "rar",
-                "exe", "dll", "so", "dylib", "o", "a", "lib",
-                "wasm", "class", "pyc", "pyo",
-                "mp3", "mp4", "avi", "mov", "wav", "flac", "ogg",
-                "ttf", "otf", "woff", "woff2", "eot",
-                "sqlite", "db", "mdb",
+                "png", "jpg", "jpeg", "gif", "bmp", "ico", "webp", "svg", "pdf", "zip", "gz",
+                "tar", "bz2", "xz", "7z", "rar", "exe", "dll", "so", "dylib", "o", "a", "lib",
+                "wasm", "class", "pyc", "pyo", "mp3", "mp4", "avi", "mov", "wav", "flac", "ogg",
+                "ttf", "otf", "woff", "woff2", "eot", "sqlite", "db", "mdb",
             ];
             if BINARY_EXTS.contains(&ext.to_lowercase().as_str()) {
-                return format!("Error: refusing to read binary file (.{ext}). Use bash with appropriate tools (e.g. file, xxd, strings) for binary analysis.");
+                return format!(
+                    "Error: refusing to read binary file (.{ext}). Use bash with appropriate tools (e.g. file, xxd, strings) for binary analysis."
+                );
             }
         }
 

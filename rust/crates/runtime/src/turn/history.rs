@@ -324,11 +324,22 @@ pub fn append_recovered_events(history: &mut Vec<Value>, rows: &[RecoveredEventR
             "llm_response" => {
                 in_tool_batch = false;
                 if !pending_tool_calls.is_empty() {
-                    history.push(json!({
-                        "role": "assistant",
-                        "content": "",
-                        "tool_calls": pending_tool_calls.clone(),
-                    }));
+                    let mut flushed = Map::from_iter([
+                        ("role".to_string(), Value::String("assistant".to_string())),
+                        ("content".to_string(), Value::String(String::new())),
+                        (
+                            "tool_calls".to_string(),
+                            Value::Array(pending_tool_calls.clone()),
+                        ),
+                    ]);
+                    if !pending_reasoning.is_empty() {
+                        flushed.insert(
+                            "reasoning_content".to_string(),
+                            Value::String(pending_reasoning.clone()),
+                        );
+                        pending_reasoning.clear();
+                    }
+                    history.push(Value::Object(flushed));
                     pending_tool_calls.clear();
                 }
 
@@ -794,5 +805,49 @@ mod tests {
         ];
         // target_tail=1 → naive idx=2 (tool), backs up to 0
         assert_eq!(find_tool_call_safe_split(&msgs, 1), 0);
+    }
+
+    /// When an llm_response follows pending tool_calls that had reasoning,
+    /// the flushed assistant message must carry reasoning_content so that
+    /// thinking-enabled models don't reject the history with HTTP 400.
+    #[test]
+    fn append_llm_response_flushes_pending_reasoning_into_tool_call_message() {
+        let mut history = Vec::new();
+        let rows = vec![
+            RecoveredEventRow {
+                event_type: "tool_call".to_string(),
+                content: Some(
+                    r#"{"tool_call_id":"c1","name":"bash","arguments":"{\"cmd\":\"ls\"}"}"#
+                        .to_string(),
+                ),
+                metadata: None,
+                reasoning_content: Some("I need to list files".to_string()),
+            },
+            RecoveredEventRow {
+                event_type: "tool_result".to_string(),
+                content: Some(r#"{"result":"file.txt"}"#.to_string()),
+                metadata: Some(json!({"tool_call_id": "c1", "name": "bash"})),
+                reasoning_content: None,
+            },
+            RecoveredEventRow {
+                event_type: "llm_response".to_string(),
+                content: Some("Here are the files.".to_string()),
+                metadata: None,
+                reasoning_content: None,
+            },
+        ];
+
+        append_recovered_events(&mut history, &rows);
+
+        // assistant(tool_calls) + tool(result) + assistant(text)
+        assert_eq!(history.len(), 3);
+        let tc_msg = &history[0];
+        assert_eq!(tc_msg["role"], "assistant");
+        assert!(tc_msg["tool_calls"].is_array());
+        assert_eq!(
+            tc_msg["reasoning_content"].as_str(),
+            Some("I need to list files"),
+            "flushed assistant tool-call message must carry reasoning_content"
+        );
     }
 }

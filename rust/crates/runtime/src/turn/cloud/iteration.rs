@@ -17,6 +17,22 @@ pub fn plan_cloud_loop_iteration(
     loop_text: &str,
     loop_reasoning: Option<&str>,
 ) -> CloudLoopIterationPlan {
+    plan_cloud_loop_iteration_ext(
+        loop_tool_calls,
+        cloud_skill_names,
+        loop_text,
+        loop_reasoning,
+        false,
+    )
+}
+
+pub fn plan_cloud_loop_iteration_ext(
+    loop_tool_calls: &[Value],
+    cloud_skill_names: &BTreeSet<String>,
+    loop_text: &str,
+    loop_reasoning: Option<&str>,
+    force_reasoning_field: bool,
+) -> CloudLoopIterationPlan {
     let mut cloud_tool_calls = Vec::new();
     let mut edge_tool_calls = Vec::new();
     for tool_call in loop_tool_calls {
@@ -54,6 +70,8 @@ pub fn plan_cloud_loop_iteration(
         }
         if let Some(reasoning) = loop_reasoning.filter(|value| !value.is_empty()) {
             assistant_message["reasoning_content"] = Value::String(reasoning.to_string());
+        } else if force_reasoning_field {
+            assistant_message["reasoning_content"] = Value::String(String::new());
         }
 
         let mut history_message = json!({
@@ -63,6 +81,8 @@ pub fn plan_cloud_loop_iteration(
         });
         if let Some(reasoning) = loop_reasoning.filter(|value| !value.is_empty()) {
             history_message["reasoning_content"] = Value::String(reasoning.to_string());
+        } else if force_reasoning_field {
+            history_message["reasoning_content"] = Value::String(String::new());
         }
         (Some(assistant_message), Some(history_message))
     };

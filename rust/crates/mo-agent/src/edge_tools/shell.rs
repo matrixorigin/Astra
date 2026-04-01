@@ -25,24 +25,51 @@ fn interpret_exit_code(command: &str, code: i32) -> CommandResult {
     match base {
         // grep/rg: 0=matches, 1=no matches, 2+=error
         "grep" | "rg" | "ag" | "ack" => match code {
-            0 => CommandResult { is_error: false, note: None },
-            1 => CommandResult { is_error: false, note: Some("No matches found") },
-            _ => CommandResult { is_error: true, note: None },
+            0 => CommandResult {
+                is_error: false,
+                note: None,
+            },
+            1 => CommandResult {
+                is_error: false,
+                note: Some("No matches found"),
+            },
+            _ => CommandResult {
+                is_error: true,
+                note: None,
+            },
         },
         // diff: 0=identical, 1=differences, 2+=error
         "diff" => match code {
-            0 | 1 => CommandResult { is_error: false, note: None },
-            _ => CommandResult { is_error: true, note: None },
+            0 | 1 => CommandResult {
+                is_error: false,
+                note: None,
+            },
+            _ => CommandResult {
+                is_error: true,
+                note: None,
+            },
         },
         // test/[: 0=true, 1=false, 2+=error
         "test" | "[" => match code {
-            0 | 1 => CommandResult { is_error: false, note: None },
-            _ => CommandResult { is_error: true, note: None },
+            0 | 1 => CommandResult {
+                is_error: false,
+                note: None,
+            },
+            _ => CommandResult {
+                is_error: true,
+                note: None,
+            },
         },
         // find: 0=ok, 1=partial (some dirs inaccessible), 2+=error
         "find" | "fd" => match code {
-            0 | 1 => CommandResult { is_error: false, note: None },
-            _ => CommandResult { is_error: true, note: None },
+            0 | 1 => CommandResult {
+                is_error: false,
+                note: None,
+            },
+            _ => CommandResult {
+                is_error: true,
+                note: None,
+            },
         },
         // Default: only 0 is success
         _ => CommandResult {
@@ -68,26 +95,56 @@ fn destructive_command_warning(command: &str) -> Option<&'static str> {
     // Static patterns checked in order; first match wins.
     static PATTERNS: &[(&str, &str)] = &[
         // Git — data loss
-        ("git reset --hard", "⚠️ Warning: may discard uncommitted changes"),
-        ("git push --force", "⚠️ Warning: may overwrite remote history"),
+        (
+            "git reset --hard",
+            "⚠️ Warning: may discard uncommitted changes",
+        ),
+        (
+            "git push --force",
+            "⚠️ Warning: may overwrite remote history",
+        ),
         ("git push -f", "⚠️ Warning: may overwrite remote history"),
-        ("git clean -f", "⚠️ Warning: may permanently delete untracked files"),
-        ("git checkout -- .", "⚠️ Warning: may discard all working tree changes"),
-        ("git restore -- .", "⚠️ Warning: may discard all working tree changes"),
-        ("git stash drop", "⚠️ Warning: may permanently remove stashed changes"),
-        ("git stash clear", "⚠️ Warning: may permanently remove all stashed changes"),
+        (
+            "git clean -f",
+            "⚠️ Warning: may permanently delete untracked files",
+        ),
+        (
+            "git checkout -- .",
+            "⚠️ Warning: may discard all working tree changes",
+        ),
+        (
+            "git restore -- .",
+            "⚠️ Warning: may discard all working tree changes",
+        ),
+        (
+            "git stash drop",
+            "⚠️ Warning: may permanently remove stashed changes",
+        ),
+        (
+            "git stash clear",
+            "⚠️ Warning: may permanently remove all stashed changes",
+        ),
         ("git branch -D", "⚠️ Warning: may force-delete a branch"),
         // Git — safety bypass
         ("--no-verify", "⚠️ Warning: skipping safety hooks"),
         // File deletion
-        ("rm -rf /", "⚠️ Warning: recursive force-remove from root — extremely dangerous"),
+        (
+            "rm -rf /",
+            "⚠️ Warning: recursive force-remove from root — extremely dangerous",
+        ),
         // Database
         ("DROP TABLE", "⚠️ Warning: may drop database table"),
         ("DROP DATABASE", "⚠️ Warning: may drop entire database"),
         ("TRUNCATE TABLE", "⚠️ Warning: may truncate database table"),
         // Infrastructure
-        ("terraform destroy", "⚠️ Warning: may destroy infrastructure"),
-        ("kubectl delete", "⚠️ Warning: may delete Kubernetes resources"),
+        (
+            "terraform destroy",
+            "⚠️ Warning: may destroy infrastructure",
+        ),
+        (
+            "kubectl delete",
+            "⚠️ Warning: may delete Kubernetes resources",
+        ),
     ];
     for &(pattern, warning) in PATTERNS {
         if command.contains(pattern) {
@@ -588,10 +645,7 @@ impl ToolExecutor {
                     let line_count = text.lines().count();
                     if text.len() > limit {
                         let end = text.floor_char_boundary(limit);
-                        let cut = text[..end]
-                            .rfind('\n')
-                            .map(|pos| pos + 1)
-                            .unwrap_or(end);
+                        let cut = text[..end].rfind('\n').map(|pos| pos + 1).unwrap_or(end);
                         let shown = text[..cut].lines().count();
                         format!(
                             "{}\n[showing {shown} of {line_count} files, truncated]",
@@ -699,7 +753,9 @@ impl ToolExecutor {
                 if let Ok(code) = http_code.parse::<u16>() {
                     if code >= 400 {
                         let reason = match code {
-                            401 | 403 => " (authentication required — look for an MCP tool with authenticated access)",
+                            401 | 403 => {
+                                " (authentication required — look for an MCP tool with authenticated access)"
+                            }
                             404 => " (page not found)",
                             429 => " (rate limited — try again later)",
                             _ => "",
@@ -1770,9 +1826,8 @@ mod tests {
         // Verify the warning function itself works — no need to run actual destructive commands
         let executor = test_executor();
         // Use a command that contains the destructive pattern but is harmless
-        let result = executor.bash(
-            &serde_json::json!({"command": "echo 'git push --force would be dangerous'"}),
-        );
+        let result = executor
+            .bash(&serde_json::json!({"command": "echo 'git push --force would be dangerous'"}));
         assert!(
             result.contains("⚠️"),
             "command containing destructive pattern should have warning: {result}"

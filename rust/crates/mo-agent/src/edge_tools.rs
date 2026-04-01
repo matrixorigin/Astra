@@ -1239,11 +1239,14 @@ impl ToolExecutor {
     fn record_read(&self, path: &Path, is_partial: bool) {
         let ts = Self::file_mtime_ms(path);
         if let Ok(mut state) = self.file_state.lock() {
-            state.insert(path.to_path_buf(), FileState {
-                timestamp_ms: ts,
-                from_read: true,
-                is_partial,
-            });
+            state.insert(
+                path.to_path_buf(),
+                FileState {
+                    timestamp_ms: ts,
+                    from_read: true,
+                    is_partial,
+                },
+            );
         }
     }
 
@@ -1252,11 +1255,14 @@ impl ToolExecutor {
     fn record_write(&self, path: &Path) {
         let ts = Self::file_mtime_ms(path);
         if let Ok(mut state) = self.file_state.lock() {
-            state.insert(path.to_path_buf(), FileState {
-                timestamp_ms: ts,
-                from_read: false,
-                is_partial: false,
-            });
+            state.insert(
+                path.to_path_buf(),
+                FileState {
+                    timestamp_ms: ts,
+                    from_read: false,
+                    is_partial: false,
+                },
+            );
         }
     }
 
@@ -1306,9 +1312,8 @@ impl ToolExecutor {
             .lock()
             .ok()
             .and_then(|s| {
-                s.get(path).map(|fs| {
-                    fs.from_read && !fs.is_partial && fs.timestamp_ms == current_ts
-                })
+                s.get(path)
+                    .map(|fs| fs.from_read && !fs.is_partial && fs.timestamp_ms == current_ts)
             })
             .unwrap_or(false)
     }
@@ -1359,12 +1364,13 @@ impl ToolExecutor {
     #[allow(dead_code)] // Public API for post-compact file restoration
     pub fn recently_read_files(&self, max: usize) -> Vec<PathBuf> {
         if let Ok(state) = self.file_state.lock() {
-            let mut entries: Vec<_> = state
-                .iter()
-                .filter(|(_, fs)| fs.from_read)
-                .collect();
+            let mut entries: Vec<_> = state.iter().filter(|(_, fs)| fs.from_read).collect();
             entries.sort_by(|a, b| b.1.timestamp_ms.cmp(&a.1.timestamp_ms));
-            entries.into_iter().take(max).map(|(p, _)| p.clone()).collect()
+            entries
+                .into_iter()
+                .take(max)
+                .map(|(p, _)| p.clone())
+                .collect()
         } else {
             Vec::new()
         }

@@ -9,10 +9,11 @@ use mo_thin_client::ThinClient;
 use serde_json::Value;
 
 use super::headless_tool_assembly::{
-    CACHEABLE_TOOLS, EdgeToolRoundRow, HeadlessResolvedToolSlot, begin_headless_tool_round_opening,
-    headless_idempotency_hit_openai_pair, headless_openai_duplicate_within_turn_pair,
-    headless_unknown_local_tool_openai_pair, openai_tool_roundtrip_values,
-    resolve_headless_tool_slot, take_edge_output_for_tool_call, unknown_local_tool_error_message,
+    CACHEABLE_TOOLS, EdgeToolRoundRow, HeadlessResolvedToolSlot,
+    begin_headless_tool_round_opening_ext, headless_idempotency_hit_openai_pair,
+    headless_openai_duplicate_within_turn_pair, headless_unknown_local_tool_openai_pair,
+    openai_tool_roundtrip_values, resolve_headless_tool_slot, take_edge_output_for_tool_call,
+    unknown_local_tool_error_message,
 };
 use super::headless_tool_journal::{
     journal_record_cross_turn_cache_hit, journal_record_duplicate_within_turn,
@@ -87,7 +88,17 @@ pub async fn run_agentic_headless_tool_round<E: EdgeToolRoundRow>(
 ) {
     tool_results.clear();
 
-    let opening = begin_headless_tool_round_opening(tool_calls, edge_tool_round, reasoning_content);
+    // Detect thinking-model session: if any prior assistant message has
+    // reasoning_content, force the field on all new assistant messages.
+    let force_reasoning =
+        !reasoning_content.is_empty() || super::edge_ledger::history_has_reasoning(messages);
+
+    let opening = begin_headless_tool_round_opening_ext(
+        tool_calls,
+        edge_tool_round,
+        reasoning_content,
+        force_reasoning,
+    );
     messages.push(opening.assistant_message);
 
     let indices = opening.indices;

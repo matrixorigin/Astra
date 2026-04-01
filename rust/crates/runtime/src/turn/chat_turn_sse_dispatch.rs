@@ -500,7 +500,10 @@ mod tests {
     fn invalid_usage_payload_sets_error() {
         let mut a = ChatTurnSseAccum::default();
         dispatch_chat_turn_sse_event_block("data: {\"type\":\"usage\"}\n\n", &mut a, &mut vec![]);
-        assert_eq!(a.error_message.as_deref(), Some("Error: invalid usage payload"));
+        assert_eq!(
+            a.error_message.as_deref(),
+            Some("Error: invalid usage payload")
+        );
         assert!(!a.has_usage);
     }
 

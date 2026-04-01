@@ -510,7 +510,9 @@ async fn collect_llm_stream(
 #[derive(Debug)]
 #[allow(dead_code)] // Transport variant reserved for future network error handling
 enum StreamCollectError {
-    IdleTimeout { elapsed_ms: u64 },
+    IdleTimeout {
+        elapsed_ms: u64,
+    },
     /// Byte stream error from the HTTP client (e.g. reset, TLS failure).
     Transport(String),
     /// [`LlmCancel`] fired during collection.

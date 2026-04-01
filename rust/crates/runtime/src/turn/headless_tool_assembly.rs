@@ -275,6 +275,25 @@ pub fn openai_assistant_with_tool_calls_message<T: EdgeToolRoundRow>(
     edge_round: &[T],
     reasoning_content: &str,
 ) -> Value {
+    openai_assistant_with_tool_calls_message_ext(
+        server_tool_calls,
+        edge_round,
+        reasoning_content,
+        false,
+    )
+}
+
+/// Extended variant that accepts `force_reasoning_field`.
+///
+/// When `force_reasoning_field` is true the `reasoning_content` key is always
+/// present (empty string when `reasoning_content` is blank).  Thinking-enabled
+/// models require this on every assistant message.
+pub fn openai_assistant_with_tool_calls_message_ext<T: EdgeToolRoundRow>(
+    server_tool_calls: &[Value],
+    edge_round: &[T],
+    reasoning_content: &str,
+    force_reasoning_field: bool,
+) -> Value {
     let mut msg = if !server_tool_calls.is_empty() {
         json!({
             "role": "assistant",
@@ -304,13 +323,20 @@ pub fn openai_assistant_with_tool_calls_message<T: EdgeToolRoundRow>(
             "tool_calls": items,
         })
     };
-    if !reasoning_content.is_empty()
-        && let Some(obj) = msg.as_object_mut()
-    {
-        obj.insert(
-            "reasoning_content".to_string(),
-            Value::String(reasoning_content.to_string()),
-        );
+    if !reasoning_content.is_empty() {
+        if let Some(obj) = msg.as_object_mut() {
+            obj.insert(
+                "reasoning_content".to_string(),
+                Value::String(reasoning_content.to_string()),
+            );
+        }
+    } else if force_reasoning_field {
+        if let Some(obj) = msg.as_object_mut() {
+            obj.insert(
+                "reasoning_content".to_string(),
+                Value::String(String::new()),
+            );
+        }
     }
     msg
 }
@@ -350,8 +376,23 @@ pub fn begin_headless_tool_round_opening<Edge: EdgeToolRoundRow>(
     edge_round: &[Edge],
     reasoning_content: &str,
 ) -> HeadlessRoundOpening {
-    let assistant_message =
-        openai_assistant_with_tool_calls_message(server_tool_calls, edge_round, reasoning_content);
+    begin_headless_tool_round_opening_ext(server_tool_calls, edge_round, reasoning_content, false)
+}
+
+/// Extended variant that accepts `force_reasoning_field` for thinking-model sessions.
+#[must_use]
+pub fn begin_headless_tool_round_opening_ext<Edge: EdgeToolRoundRow>(
+    server_tool_calls: &[Value],
+    edge_round: &[Edge],
+    reasoning_content: &str,
+    force_reasoning_field: bool,
+) -> HeadlessRoundOpening {
+    let assistant_message = openai_assistant_with_tool_calls_message_ext(
+        server_tool_calls,
+        edge_round,
+        reasoning_content,
+        force_reasoning_field,
+    );
     let indices = headless_round_tool_indices(server_tool_calls.len(), edge_round.len());
     let tool_count = indices.len().max(1);
     HeadlessRoundOpening {

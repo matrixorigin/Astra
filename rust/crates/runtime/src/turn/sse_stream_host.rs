@@ -201,10 +201,10 @@ pub async fn consume_sse_stream<H: SseStreamHost>(
 
     (
         SseConsumeResult {
-        accum,
-        ttft_ms,
-        tool_results,
-        approval_results,
+            accum,
+            ttft_ms,
+            tool_results,
+            approval_results,
         },
         abort,
     )
@@ -369,8 +369,8 @@ impl SseStreamHost for RecordingSseStreamHost {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use futures_util::stream;
     use futures_util::StreamExt;
+    use futures_util::stream;
 
     fn sse_event(typ: &str, extra: &str) -> String {
         format!("data: {{\"type\":\"{typ}\"{extra}}}\n\n")
@@ -652,18 +652,21 @@ mod tests {
             .chain(stream::pending::<Result<Vec<u8>, String>>());
 
         let mut host = RecordingSseStreamHost::new();
-        let (result, abort) = consume_sse_stream(
-            &mut stream,
-            &mut host,
-            std::time::Duration::from_millis(5),
-        )
-        .await;
+        let (result, abort) =
+            consume_sse_stream(&mut stream, &mut host, std::time::Duration::from_millis(5)).await;
 
         assert_eq!(abort, Some(SseAbortReason::IdleTimeout));
         assert!(host.stream_completed);
         assert!(result.accum.full_text.is_empty());
         assert!(result.accum.reasoning_content.is_empty());
         assert!(result.accum.tool_calls.is_empty());
-        assert!(result.accum.error_message.as_deref().unwrap_or("").contains("idle timeout"));
+        assert!(
+            result
+                .accum
+                .error_message
+                .as_deref()
+                .unwrap_or("")
+                .contains("idle timeout")
+        );
     }
 }

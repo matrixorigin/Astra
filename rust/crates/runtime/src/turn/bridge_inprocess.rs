@@ -53,7 +53,10 @@ use crate::{
         tool_path_hint_for_delivery, wait_approval_ledger_for_tool,
         wait_tool_result_ledger_for_tool,
     },
-    turn::edge_ledger::{assistant_message_with_tool_calls, ensure_tool_call_ids},
+    turn::edge_ledger::{
+        assistant_message_with_tool_calls_and_reasoning, ensure_tool_call_ids,
+        history_has_reasoning,
+    },
     turn::persist::{build_tool_call_event_payload, build_tool_result_event_payload},
     turn::llm_client::{sleep_ms_or_llm_cancel, LlmCancel},
     turn::sse_blocks::SseBlankLineUtf8Buf,
@@ -137,9 +140,8 @@ fn apply_forward_llm_sse_event(
             }
             Ok(vec![])
         }
-        "text_delta" | "reasoning_delta" | "tool_call_start" | "usage" | "error" | "error_message" => {
-            Ok(vec![render_sse(event)])
-        }
+        "text_delta" | "reasoning_delta" | "tool_call_start" | "usage" | "error"
+        | "error_message" => Ok(vec![render_sse(event)]),
         "warning" => Ok(vec![render_sse(event)]),
         _ => Ok(vec![]),
     }
@@ -1273,7 +1275,11 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
 
                 all_round_tool_calls.extend(loop_tool_calls.iter().cloned());
 
-                llm_messages.push(assistant_message_with_tool_calls(&loop_tool_calls));
+                llm_messages.push(assistant_message_with_tool_calls_and_reasoning(
+                    &loop_tool_calls,
+                    &loop_reasoning,
+                    !reasoning.is_empty() || history_has_reasoning(&llm_messages),
+                ));
                 for tc in loop_tool_calls.iter() {
                     let Some(tc_map) = tc.as_object() else {
                         continue;
