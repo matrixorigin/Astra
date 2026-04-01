@@ -82,7 +82,7 @@ pub fn all_tool_schemas() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "read_file",
-                "description": "Read file contents with optional line range. Output includes line numbers (tab-separated). IMPORTANT: If you are NOT certain the file exists, use list_dir or glob FIRST to verify the path — do NOT guess paths. For files over 500 lines, prefer start_line/end_line or outline=true to read targeted sections. For smaller files, reading the full file is fine. Set outline=true to get only function/class/struct/trait signatures (saves tokens). If you previously read part of a file and request another range, the tool may auto-expand to return the full file to avoid fragmented reads. When using str_replace, provide old_str WITHOUT line numbers — only the actual file content.",
+                "description": "Read file contents with optional line range. Output includes line numbers (tab-separated). IMPORTANT: If you are NOT certain the file exists, use list_dir or glob FIRST to verify the path — do NOT guess paths. Large files (over ~80KB) will return an error when read without a range — use start_line/end_line or outline=true. For files over 500 lines, prefer targeted reads. Set outline=true to get only function/class/struct/trait signatures (saves tokens). If you previously read part of a file and request another range, the tool may auto-expand to return the full file to avoid fragmented reads. When using str_replace, provide old_str WITHOUT line numbers — only the actual file content.",
                 "parameters": {
                     "type": "object",
                     "properties": {

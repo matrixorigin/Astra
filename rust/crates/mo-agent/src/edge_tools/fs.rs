@@ -192,6 +192,27 @@ impl ToolExecutor {
             }
         }
 
+        // Pre-read size gate: check file size before reading.
+        // Large files without a line range should use outline or start_line/end_line.
+        // Inspired by Claude Code's maxSizeBytes (256KB) pre-read check.
+        let has_range = args.get("start_line").is_some() || args.get("end_line").is_some();
+        let has_outline = args.get("outline").and_then(Value::as_bool).unwrap_or(false);
+        if !has_range && !has_outline {
+            if let Ok(meta) = fs::metadata(&path) {
+                let size = meta.len() as usize;
+                let limit = self.scaled_output_limit();
+                if size > limit {
+                    let total_lines = size / 40; // rough estimate
+                    return format!(
+                        "Error: file is too large ({} bytes, ~{} lines). \
+                         Use start_line/end_line to read a specific range, \
+                         or outline=true to see definitions only.",
+                        size, total_lines
+                    );
+                }
+            }
+        }
+
         let content = match fs::read_to_string(&path) {
             Ok(c) => c,
             Err(e) => {
@@ -1958,9 +1979,11 @@ type Handler interface {
         let executor = test_executor_in(dir.path());
         let result = executor.read_file(&serde_json::json!({"path": "big.txt"}));
 
+        // Pre-read size gate: large files without a range return an error
+        // directing the LLM to use start_line/end_line or outline.
         assert!(
-            result.contains("truncated"),
-            "should be truncated: last 100 chars: {}",
+            result.contains("too large") || result.contains("truncated"),
+            "should reject or truncate large file: last 100 chars: {}",
             &result[result.len().saturating_sub(100)..]
         );
         assert!(
