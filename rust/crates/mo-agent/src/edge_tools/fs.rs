@@ -294,10 +294,11 @@ impl ToolExecutor {
                 // Upgrade to full read — future reads will hit can_dedup_read
                 self.record_read(&path, false);
                 let total_lines = content.lines().count();
+                let numbered = add_line_numbers(&content, 1);
                 return format!(
                     "[Auto-expanded to full file — this file was already partially read. \
                      {total_lines} lines total. Avoid reading the same file in many small ranges.]\n\
-                     {content}"
+                     {numbered}"
                 );
             }
         }
@@ -323,7 +324,9 @@ impl ToolExecutor {
             let total_lines = content.lines().count();
             let max_chars = self.scaled_output_limit();
             if content.len() > max_chars {
-                let mut out = content[..content.floor_char_boundary(max_chars)].to_string();
+                let truncated = &content[..content.floor_char_boundary(max_chars)];
+                let numbered = add_line_numbers(truncated, 1);
+                let mut out = numbered;
                 out.push_str(&format!(
                     "\n[truncated — file has {total_lines} lines, use start_line/end_line or outline=true]"
                 ));
@@ -332,15 +335,21 @@ impl ToolExecutor {
                 }
                 return out;
             }
+            let numbered = add_line_numbers(&content, 1);
             if read_warning.is_empty() {
-                return content;
+                return numbered;
             }
-            return format!("{content}{read_warning}");
+            return format!("{numbered}{read_warning}");
         }
         let lines: Vec<&str> = content.lines().collect();
         let s = start.unwrap_or(1).saturating_sub(1);
         let e = end.unwrap_or(lines.len()).min(lines.len());
-        let mut result = truncate_output(lines[s..e].join("\n"), self.scaled_output_limit());
+        let actual_start_line = s + 1; // 1-indexed
+        let slice = lines[s..e].join("\n");
+        let mut result = truncate_output(
+            add_line_numbers(&slice, actual_start_line),
+            self.scaled_output_limit(),
+        );
         if !read_warning.is_empty() {
             result.push_str(read_warning);
         }
@@ -460,6 +469,51 @@ impl ToolExecutor {
         };
         let count = content.matches(old_str).count();
         if count == 0 {
+            // Fallback: try matching with normalized curly/smart quotes.
+            // LLMs and copy-paste from docs/web often produce curly quotes
+            // (U+2018/2019/201C/201D) that don't match the file's ASCII quotes.
+            let norm_count = count_with_quote_normalization(&content, old_str);
+            if norm_count == 1 {
+                // Found exactly one match after quote normalization
+                if let Some(actual) = find_with_quote_normalization(&content, old_str) {
+                    let new_content = content.replacen(actual, new_str, 1);
+                    if dry_run {
+                        return unified_diff(&content, &new_content, &path);
+                    }
+                    match fs::write(&path, &new_content) {
+                        Ok(_) => {
+                            self.record_write(&path);
+                            let format_result = auto_format_file(&path, &self.project_root);
+                            if format_result.is_some() {
+                                self.record_write(&path);
+                            }
+                            let mut result = String::from(
+                                "Replaced successfully (matched after normalizing curly quotes → ASCII)\n",
+                            );
+                            let old_lines: Vec<&str> = actual.lines().collect();
+                            let new_lines: Vec<&str> = new_str.lines().collect();
+                            if old_lines.len().max(new_lines.len()) <= 10 {
+                                for l in &old_lines {
+                                    result.push_str(&format!("- {l}\n"));
+                                }
+                                for l in &new_lines {
+                                    result.push_str(&format!("+ {l}\n"));
+                                }
+                            }
+                            if let Some(fmt_note) = format_result {
+                                result.push_str(&format!("\n{fmt_note}"));
+                            }
+                            return result;
+                        }
+                        Err(e) => return format!("Error writing file: {e}"),
+                    }
+                }
+            } else if norm_count > 1 {
+                return format!(
+                    "Error: old_str found {norm_count} times (after normalizing curly quotes) — must be unique.\n\
+                     Hint: Add more surrounding context to old_str to make it unique.\n"
+                );
+            }
             return str_replace_not_found_hint(&content, old_str);
         }
         if count > 1 && !replace_all {
@@ -1267,6 +1321,67 @@ fn normalize_ws(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+// ─── Line numbers ───────────────────────────────────────────────────────────
+
+/// Add line numbers to content in compact tab-separated format.
+/// Example output: `  1\tline content\n  2\tnext line`
+fn add_line_numbers(content: &str, start_line: usize) -> String {
+    let lines: Vec<&str> = content.split('\n').collect();
+    let max_num = start_line + lines.len().saturating_sub(1);
+    let width = max_num.to_string().len().max(1);
+    lines
+        .iter()
+        .enumerate()
+        .map(|(i, line)| format!("{:>width$}\t{line}", start_line + i))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+// ─── Quote normalization for str_replace fuzzy matching ──────────────────────
+
+/// Normalize curly/smart quotes to straight ASCII quotes.
+/// Handles: ' ' → '  and  " " → "
+fn normalize_quotes(s: &str) -> String {
+    s.replace('\u{2018}', "'") // left single curly
+        .replace('\u{2019}', "'") // right single curly
+        .replace('\u{201C}', "\"") // left double curly
+        .replace('\u{201D}', "\"") // right double curly
+}
+
+/// Find the actual substring in `content` that matches `search` after quote
+/// normalization. Returns the original bytes from `content` (preserving the
+/// file's actual quote characters), or `None` if no match.
+fn find_with_quote_normalization<'a>(content: &'a str, search: &str) -> Option<&'a str> {
+    let norm_search = normalize_quotes(search);
+    let norm_content = normalize_quotes(content);
+
+    let norm_byte_start = norm_content.find(&norm_search)?;
+    // Convert byte offset in normalized → char offset (same in both since
+    // normalization maps each char 1:1, only byte widths differ).
+    let char_start = norm_content[..norm_byte_start].chars().count();
+    let char_len = norm_search.chars().count();
+
+    // Map char offset back to byte positions in the original content.
+    let byte_start = content
+        .char_indices()
+        .nth(char_start)
+        .map(|(i, _)| i)?;
+    let byte_end = content
+        .char_indices()
+        .nth(char_start + char_len)
+        .map(|(i, _)| i)
+        .unwrap_or(content.len());
+
+    Some(&content[byte_start..byte_end])
+}
+
+/// Count occurrences of `search` in `content` after normalizing curly quotes.
+fn count_with_quote_normalization(content: &str, search: &str) -> usize {
+    let norm_search = normalize_quotes(search);
+    let norm_content = normalize_quotes(content);
+    norm_content.matches(&norm_search).count()
+}
+
 fn truncate_str(s: &str, max: usize) -> String {
     if s.len() <= max {
         s.to_string()
@@ -1692,6 +1807,105 @@ type Handler interface {
             msg.contains("lines from old_str exist"),
             "should report partial: {msg}"
         );
+    }
+
+    // ── line numbers ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn add_line_numbers_basic() {
+        assert_eq!(add_line_numbers("a\nb\nc", 1), "1\ta\n2\tb\n3\tc");
+    }
+
+    #[test]
+    fn add_line_numbers_with_offset() {
+        assert_eq!(add_line_numbers("x\ny", 10), "10\tx\n11\ty");
+    }
+
+    #[test]
+    fn add_line_numbers_padding() {
+        // Lines 99-101 should pad to 3 digits
+        assert_eq!(
+            add_line_numbers("a\nb\nc", 99),
+            " 99\ta\n100\tb\n101\tc"
+        );
+    }
+
+    #[test]
+    fn read_file_has_line_numbers() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("numbered.txt");
+        std::fs::write(&file_path, "hello\nworld\nfoo").unwrap();
+
+        let executor = test_executor_in(dir.path());
+        let result = executor.read_file(&serde_json::json!({"path": "numbered.txt"}));
+        assert_eq!(result, "1\thello\n2\tworld\n3\tfoo");
+    }
+
+    #[test]
+    fn read_file_ranged_preserves_line_numbers() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("ranged.txt");
+        std::fs::write(&file_path, "a\nb\nc\nd\ne").unwrap();
+
+        let executor = test_executor_in(dir.path());
+        let result = executor.read_file(&serde_json::json!({
+            "path": "ranged.txt",
+            "start_line": 3,
+            "end_line": 4
+        }));
+        assert_eq!(result, "3\tc\n4\td");
+    }
+
+    // ── quote normalization ──────────────────────────────────────────────────
+
+    #[test]
+    fn normalize_quotes_curly_to_straight() {
+        assert_eq!(normalize_quotes("say \u{201C}hello\u{201D}"), "say \"hello\"");
+        assert_eq!(normalize_quotes("it\u{2019}s"), "it's");
+    }
+
+    #[test]
+    fn find_with_quote_normalization_basic() {
+        let content = "let x = \u{201C}hello\u{201D};";
+        let search = "\"hello\"";
+        let found = find_with_quote_normalization(content, search);
+        assert!(found.is_some(), "should find after normalization");
+        // The returned string should be the ORIGINAL curly quotes from content
+        assert_eq!(found.unwrap(), "\u{201C}hello\u{201D}");
+    }
+
+    #[test]
+    fn find_with_quote_normalization_no_match() {
+        let content = "let x = 42;";
+        assert!(find_with_quote_normalization(content, "\"hello\"").is_none());
+    }
+
+    #[test]
+    fn str_replace_with_curly_quotes() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("curly.rs");
+        // File has straight quotes
+        std::fs::write(&file_path, "let x = \"hello\";").unwrap();
+
+        let executor = test_executor_in(dir.path());
+        executor.read_file(&serde_json::json!({"path": "curly.rs"}));
+        // Model sends curly quotes (common from LLM output)
+        let result = executor.str_replace(&serde_json::json!({
+            "path": "curly.rs",
+            "old_str": "let x = \u{201C}hello\u{201D};",
+            "new_str": "let x = \"world\";"
+        }));
+        assert!(
+            result.contains("Replaced"),
+            "should succeed with quote normalization: {result}"
+        );
+        assert!(
+            result.contains("curly quotes"),
+            "should mention normalization: {result}"
+        );
+        // Verify actual file content
+        let actual = std::fs::read_to_string(&file_path).unwrap();
+        assert_eq!(actual, "let x = \"world\";");
     }
 
     // ── read_file large file truncation hint ─────────────────────────────────

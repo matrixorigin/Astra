@@ -82,7 +82,7 @@ pub fn all_tool_schemas() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "read_file",
-                "description": "Read file contents with optional line range. IMPORTANT: If you are NOT certain the file exists, use list_dir or glob FIRST to verify the path — do NOT guess paths. For files over 500 lines, prefer start_line/end_line or outline=true to read targeted sections. For smaller files, reading the full file is fine. Set outline=true to get only function/class/struct/trait signatures (saves tokens). If you previously read part of a file and request another range, the tool may auto-expand to return the full file to avoid fragmented reads.",
+                "description": "Read file contents with optional line range. Output includes line numbers (tab-separated). IMPORTANT: If you are NOT certain the file exists, use list_dir or glob FIRST to verify the path — do NOT guess paths. For files over 500 lines, prefer start_line/end_line or outline=true to read targeted sections. For smaller files, reading the full file is fine. Set outline=true to get only function/class/struct/trait signatures (saves tokens). If you previously read part of a file and request another range, the tool may auto-expand to return the full file to avoid fragmented reads. When using str_replace, provide old_str WITHOUT line numbers — only the actual file content.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -4392,7 +4392,14 @@ mod tests {
         );
 
         let read_result = executor.read_file(&json!({"path": path}));
-        assert_eq!(read_result, "hello world");
+        assert!(
+            read_result.contains("hello world"),
+            "should contain content: {read_result}"
+        );
+        assert!(
+            read_result.starts_with("1\t"),
+            "should have line numbers: {read_result}"
+        );
     }
 
     #[test]
@@ -4407,7 +4414,10 @@ mod tests {
         assert!(result.contains("Replaced"), "got: {result}");
 
         let content = executor.read_file(&json!({"path": path}));
-        assert_eq!(content, "foo qux baz");
+        assert!(
+            content.contains("foo qux baz"),
+            "should contain replaced content: {content}"
+        );
     }
 
     #[test]
@@ -4468,7 +4478,7 @@ mod tests {
 
         let result =
             executor.read_file(&json!({"path": "lines.txt", "start_line": 2, "end_line": 3}));
-        assert_eq!(result, "line2\nline3");
+        assert_eq!(result, "2\tline2\n3\tline3");
     }
 
     // ── parse_memory_search_contents ──────────────────────────────────────────
@@ -4758,9 +4768,12 @@ mod tests {
         let steps = parsed["steps"].as_array().unwrap();
         assert!(steps.iter().all(|s| s["success"].as_bool().unwrap()));
 
-        // Verify the copy was created with the correct content
+        // Verify the copy was created (content includes line numbers from read_file)
         let copy_content = std::fs::read_to_string(dir.path().join("copy.txt")).unwrap();
-        assert_eq!(copy_content, "variable test!");
+        assert!(
+            copy_content.contains("variable test!"),
+            "copy should contain original text: {copy_content}"
+        );
     }
 
     #[tokio::test]
