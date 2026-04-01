@@ -182,14 +182,14 @@ pub(super) fn history_as_messages(history: &[(String, String)]) -> Vec<serde_jso
     history
         .iter()
         .flat_map(|(user, assistant)| {
-            if user.is_empty() {
-                vec![serde_json::json!({"role":"assistant","content":assistant})]
-            } else {
-                vec![
-                    serde_json::json!({"role":"user","content":user}),
-                    serde_json::json!({"role":"assistant","content":assistant}),
-                ]
+            let mut pair = Vec::with_capacity(2);
+            if !user.is_empty() {
+                pair.push(serde_json::json!({"role":"user","content":user}));
             }
+            if !assistant.is_empty() {
+                pair.push(serde_json::json!({"role":"assistant","content":assistant}));
+            }
+            pair
         })
         .collect()
 }

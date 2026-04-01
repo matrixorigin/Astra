@@ -520,14 +520,14 @@ pub(super) async fn handle_info_command(
                 .history
                 .iter()
                 .flat_map(|(u, a)| {
-                    if u.is_empty() {
-                        vec![serde_json::json!({"role":"assistant","content":a})]
-                    } else {
-                        vec![
-                            serde_json::json!({"role":"user","content":u}),
-                            serde_json::json!({"role":"assistant","content":a}),
-                        ]
+                    let mut pair = Vec::with_capacity(2);
+                    if !u.is_empty() {
+                        pair.push(serde_json::json!({"role":"user","content":u}));
                     }
+                    if !a.is_empty() {
+                        pair.push(serde_json::json!({"role":"assistant","content":a}));
+                    }
+                    pair
                 })
                 .collect();
             let est_tokens = prompts::estimate_tokens(&est_messages);

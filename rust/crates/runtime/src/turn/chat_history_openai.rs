@@ -11,14 +11,14 @@ pub fn openai_messages_from_repl_history(
     let mut messages: Vec<Value> = history
         .iter()
         .flat_map(|(u, a)| {
-            if u.is_empty() {
-                vec![json!({"role": "assistant", "content": a})]
-            } else {
-                vec![
-                    json!({"role": "user", "content": u}),
-                    json!({"role": "assistant", "content": a}),
-                ]
+            let mut pair = Vec::with_capacity(2);
+            if !u.is_empty() {
+                pair.push(json!({"role": "user", "content": u}));
             }
+            if !a.is_empty() {
+                pair.push(json!({"role": "assistant", "content": a}));
+            }
+            pair
         })
         .collect();
     messages.push(json!({"role": "user", "content": current_user_message}));
@@ -101,5 +101,30 @@ mod tests {
         assert_eq!(m.len(), 3);
         assert_eq!(m[1]["content"], "n1");
         assert_eq!(m[2]["content"], "n2");
+    }
+
+    #[test]
+    fn empty_assistant_is_filtered_out() {
+        // Interrupted turn: user sent message but assistant response is empty.
+        // Must not produce {"role":"assistant","content":""} — LLM API rejects it.
+        let m = openai_messages_from_repl_history(
+            &[("question".into(), String::new())],
+            "retry",
+        );
+        assert_eq!(m.len(), 2);
+        assert_eq!(m[0]["role"], "user");
+        assert_eq!(m[0]["content"], "question");
+        assert_eq!(m[1]["role"], "user");
+        assert_eq!(m[1]["content"], "retry");
+    }
+
+    #[test]
+    fn both_empty_pair_is_skipped() {
+        let m = openai_messages_from_repl_history(
+            &[(String::new(), String::new())],
+            "hi",
+        );
+        assert_eq!(m.len(), 1);
+        assert_eq!(m[0]["content"], "hi");
     }
 }
