@@ -210,6 +210,243 @@ fn run_command_with_cleanup(
     child.wait_with_output().map_err(|e| format!("Error: {e}"))
 }
 
+// ---------------------------------------------------------------------------
+// Streaming output support — inspired by Claude Code's ShellCommand.ts
+// ---------------------------------------------------------------------------
+
+/// Maximum output size before truncation (30K chars, matching Claude Code's default).
+#[allow(dead_code)] // Will be used when streaming shell output is wired up
+const MAX_OUTPUT_CHARS: usize = 30_000;
+
+/// Size watchdog poll interval for backgrounded tasks.
+#[allow(dead_code)] // Will be used when streaming shell output is wired up
+const SIZE_WATCHDOG_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Execute a command with streaming output and optional auto-backgrounding on timeout.
+///
+/// Inspired by Claude Code's `ShellCommandImpl`:
+/// - Streams stdout/stderr incrementally via `on_output` callback
+/// - On timeout: backgrounds the process instead of killing it (if `allow_background` is true)
+/// - Watchdog kills backgrounded processes after 30 minutes
+///
+/// Returns (output_text, exit_code, was_backgrounded).
+#[allow(dead_code)] // Will be wired up when shell output streaming is implemented
+fn run_command_streaming(
+    cmd: &mut Command,
+    timeout_secs: f64,
+    allow_background: bool,
+    on_output: Option<&dyn Fn(&str)>,
+) -> Result<StreamingResult, String> {
+    use std::io::Read;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+
+    let mut child = cmd.spawn().map_err(|e| format!("Error: {e}"))?;
+
+    let mut stdout = child.stdout.take().ok_or("Failed to capture stdout")?;
+    let mut stderr = child.stderr.take().ok_or("Failed to capture stderr")?;
+
+    // Read output in a separate thread to avoid blocking.
+    let (tx, rx) = std::sync::mpsc::channel::<OutputChunk>();
+    let tx2 = tx.clone();
+
+    let stdout_thread = std::thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        loop {
+            match stdout.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    let s = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let _ = tx.send(OutputChunk::Stdout(s));
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let stderr_thread = std::thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        loop {
+            match stderr.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    let s = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let _ = tx2.send(OutputChunk::Stderr(s));
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let mut output = String::new();
+    let mut truncated = false;
+    let deadline = std::time::Instant::now() + Duration::from_secs_f64(timeout_secs);
+
+    loop {
+        // Drain available output chunks.
+        while let Ok(chunk) = rx.try_recv() {
+            let text = match &chunk {
+                OutputChunk::Stdout(s) | OutputChunk::Stderr(s) => s.as_str(),
+            };
+            if !truncated {
+                if output.len() + text.len() > MAX_OUTPUT_CHARS {
+                    let remaining = MAX_OUTPUT_CHARS.saturating_sub(output.len());
+                    // Find a valid UTF-8 boundary for truncation.
+                    let safe_end = text
+                        .char_indices()
+                        .take_while(|(i, _)| *i <= remaining)
+                        .last()
+                        .map(|(i, c)| i + c.len_utf8())
+                        .unwrap_or(0);
+                    output.push_str(&text[..safe_end]);
+                    output.push_str("\n... [output truncated] ...");
+                    truncated = true;
+                } else {
+                    output.push_str(text);
+                }
+            }
+            if let Some(cb) = on_output {
+                cb(text);
+            }
+        }
+
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                // Process exited — drain remaining output.
+                let _ = stdout_thread.join();
+                let _ = stderr_thread.join();
+                while let Ok(chunk) = rx.try_recv() {
+                    let text = match &chunk {
+                        OutputChunk::Stdout(s) | OutputChunk::Stderr(s) => s.as_str(),
+                    };
+                    if !truncated && output.len() + text.len() <= MAX_OUTPUT_CHARS {
+                        output.push_str(text);
+                    }
+                    if let Some(cb) = on_output {
+                        cb(text);
+                    }
+                }
+                return Ok(StreamingResult {
+                    output,
+                    exit_code: status.code().unwrap_or(-1),
+                    backgrounded: false,
+                });
+            }
+            Ok(None) => {
+                if std::time::Instant::now() > deadline {
+                    if allow_background {
+                        // Auto-background: detach and start size watchdog.
+                        let pid = child.id();
+                        output.push_str(&format!(
+                            "\n[Command timed out after {timeout_secs}s — backgrounded as PID {pid}]"
+                        ));
+                        // Spawn watchdog thread to kill if output grows too large.
+                        std::thread::spawn(move || {
+                            size_watchdog(child, stdout_thread, stderr_thread);
+                        });
+                        return Ok(StreamingResult {
+                            output,
+                            exit_code: -1,
+                            backgrounded: true,
+                        });
+                    } else {
+                        // Hard kill.
+                        #[cfg(unix)]
+                        {
+                            let pid = child.id();
+                            let _ = Command::new("kill")
+                                .args(["-9", &format!("-{pid}")])
+                                .output();
+                        }
+                        #[cfg(not(unix))]
+                        {
+                            let _ = child.kill();
+                        }
+                        let _ = child.wait();
+                        let _ = stdout_thread.join();
+                        let _ = stderr_thread.join();
+                        output
+                            .push_str(&format!("\nError: command timed out after {timeout_secs}s"));
+                        return Ok(StreamingResult {
+                            output,
+                            exit_code: 143, // SIGTERM
+                            backgrounded: false,
+                        });
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(e) => return Err(format!("Error: {e}")),
+        }
+    }
+}
+
+/// Result from streaming command execution.
+#[allow(dead_code)]
+struct StreamingResult {
+    output: String,
+    exit_code: i32,
+    backgrounded: bool,
+}
+
+#[allow(dead_code)]
+enum OutputChunk {
+    Stdout(String),
+    Stderr(String),
+}
+
+/// Time-limit watchdog for backgrounded processes.
+/// Kills the process after 30 minutes to prevent indefinite resource consumption.
+/// Inspired by Claude Code's background task management.
+#[allow(dead_code)]
+fn size_watchdog(
+    mut child: std::process::Child,
+    stdout_thread: std::thread::JoinHandle<()>,
+    stderr_thread: std::thread::JoinHandle<()>,
+) {
+    let start = std::time::Instant::now();
+    // Give backgrounded process up to 30 minutes.
+    let max_duration = Duration::from_secs(30 * 60);
+
+    loop {
+        std::thread::sleep(SIZE_WATCHDOG_INTERVAL);
+
+        // Check if process has exited.
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) => {}
+            Err(_) => break,
+        }
+
+        // Kill if running too long.
+        if start.elapsed() > max_duration {
+            #[cfg(unix)]
+            {
+                let pid = child.id();
+                let _ = Command::new("kill")
+                    .args(["-9", &format!("-{pid}")])
+                    .output();
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = child.kill();
+            }
+            let _ = child.wait();
+            break;
+        }
+    }
+
+    // Clean up threads.
+    let _ = stdout_thread.join();
+    let _ = stderr_thread.join();
+}
+
 const DEFAULT_SEARCH_EXCLUDE_DIRS: &[&str] = &[
     ".git",
     "target",

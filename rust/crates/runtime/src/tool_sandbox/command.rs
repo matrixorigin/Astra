@@ -61,7 +61,8 @@ pub fn sandbox_command(
 /// Build a restricted bash command string with resource limits.
 ///
 /// Wraps the user's command with `ulimit` and timeout restrictions
-/// for Standard/Strict modes.
+/// for Standard/Strict modes. Also applies shell hardening (extglob disable,
+/// IFS reset, stdin redirect) for Standard+ modes.
 pub fn wrap_command_with_limits(policy: &SandboxPolicy, user_command: &str) -> String {
     if policy.mode == SandboxMode::Permissive {
         return user_command.to_string();
@@ -86,17 +87,16 @@ pub fn wrap_command_with_limits(policy: &SandboxPolicy, user_command: &str) -> S
     // Core dump disabled
     parts.push("ulimit -c 0".to_string());
 
-    if parts.is_empty() {
-        user_command.to_string()
-    } else {
-        parts.push(user_command.to_string());
-        parts.join(" && ")
-    }
+    let config = super::shell_hardening::ShellHardeningConfig::default();
+    let hardened = super::shell_hardening::build_hardened_command(&config, user_command);
+    parts.push(hardened);
+    parts.join(" && ")
 }
 
 /// Filter environment variables according to policy.
 ///
 /// Returns the filtered environment as a key-value map.
+/// In Standard+ modes, also scrubs known secret environment variables.
 pub fn filter_environment(policy: &SandboxPolicy) -> HashMap<String, String> {
     let current_env: HashMap<String, String> = std::env::vars().collect();
 
@@ -119,6 +119,9 @@ pub fn filter_environment(policy: &SandboxPolicy) -> HashMap<String, String> {
             "/usr/local/bin:/usr/bin:/bin".to_string(),
         );
     }
+
+    // Scrub secrets from the filtered environment (defense in depth).
+    super::shell_hardening::scrub_secrets_from_env(&mut filtered);
 
     filtered
 }
@@ -303,9 +306,12 @@ mod tests {
         assert!(wrapped.contains("ulimit -v"), "should limit memory");
         assert!(wrapped.contains("ulimit -c 0"), "should disable core dumps");
         assert!(
-            wrapped.ends_with("echo hello"),
-            "should end with user command"
+            wrapped.contains("echo hello"),
+            "should contain user command"
         );
+        // Shell hardening should be applied in Standard+ modes.
+        assert!(wrapped.contains("extglob"), "should disable extglob");
+        assert!(wrapped.contains("IFS="), "should reset IFS");
     }
 
     #[test]

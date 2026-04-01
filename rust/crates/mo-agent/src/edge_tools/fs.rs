@@ -117,7 +117,7 @@ impl ToolExecutor {
 
         // Device file blocking — prevent hangs on infinite/blocking device files
         {
-            let path_str_lower = path.to_string_lossy();
+            let path_str_lower = path.to_string_lossy().to_lowercase();
             const BLOCKED_DEVICE_PATHS: &[&str] = &[
                 "/dev/zero",
                 "/dev/random",
@@ -150,6 +150,15 @@ impl ToolExecutor {
             // Image files: return base64 for vision models
             const IMAGE_EXTS: &[&str] = &["png", "jpg", "jpeg", "gif", "bmp", "webp"];
             if IMAGE_EXTS.contains(&ext_lower.as_str()) {
+                // Check file size before reading — base64 inflates by ~33%
+                if let Ok(meta) = fs::metadata(&path)
+                    && meta.len() > 1_500_000
+                {
+                    return format!(
+                        "Error: image too large ({} bytes). Use bash to resize first.",
+                        meta.len()
+                    );
+                }
                 match fs::read(&path) {
                     Ok(bytes) => {
                         use base64::Engine;
@@ -162,13 +171,6 @@ impl ToolExecutor {
                             "webp" => "image/webp",
                             _ => "application/octet-stream",
                         };
-                        // Cap at ~2MB encoded (prevents context bloat)
-                        if b64.len() > 2_000_000 {
-                            return format!(
-                                "Error: image too large ({} bytes). Use bash to resize first.",
-                                bytes.len()
-                            );
-                        }
                         self.record_read(&path, false);
                         return format!("data:{mime};base64,{b64}");
                     }
