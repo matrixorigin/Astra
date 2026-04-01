@@ -43,6 +43,11 @@ pub(super) fn handle_debug_command(arg: &str, state: &ReplState) {
     // ── Overview ──
     print_overview(&session_id, &turns, &checkpoints);
 
+    if turns.is_empty() {
+        eprintln!("\n  {}", "No turn data yet. Complete a conversation turn first.".dim());
+        return;
+    }
+
     // ── Interactive loop ──
     loop {
         eprint!("\n  Which turn? [1-{}, q to quit]: ", turns.len().max(1));
