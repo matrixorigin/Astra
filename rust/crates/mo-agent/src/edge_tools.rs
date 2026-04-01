@@ -41,6 +41,10 @@ mod shell;
 
 // ─── Tool schema ─────────────────────────────────────────────────────────────
 
+/// Maximum number of entries in the file state cache. When exceeded, the
+/// entry with the oldest timestamp is evicted.
+const MAX_FILE_STATE_ENTRIES: usize = 200;
+
 /// Tracks the last-read state of a file for staleness detection and dedup.
 /// Inspired by Claude Code's readFileState mechanism.
 #[derive(Debug, Clone)]
@@ -114,7 +118,8 @@ pub fn all_tool_schemas() -> Vec<Value> {
                         "path": {"type": "string", "description": "File path relative to project root"},
                         "old_str": {"type": "string", "description": "Exact string to replace"},
                         "new_str": {"type": "string", "description": "Replacement string"},
-                        "dry_run": {"type": "boolean", "description": "If true, show unified diff without applying changes (default: false)"}
+                        "dry_run": {"type": "boolean", "description": "If true, show unified diff without applying changes (default: false)"},
+                        "replace_all": {"type": "boolean", "description": "If true, replace ALL occurrences of old_str (default: false, requires unique match)"}
                     },
                     "required": ["path", "old_str", "new_str"]
                 }
@@ -190,7 +195,9 @@ pub fn all_tool_schemas() -> Vec<Value> {
                         "case_sensitive": {"type": "boolean", "description": "Case sensitive (default false)"},
                         "context_lines": {"type": "integer", "description": "Lines of context before and after each match (like grep -C)"},
                         "max_matches": {"type": "integer", "description": "Max matches per file (limits output, saves tokens)"},
-                        "scope_context": {"type": "boolean", "description": "Annotate each match with its containing function/class name (tree-sitter)"}
+                        "scope_context": {"type": "boolean", "description": "Annotate each match with its containing function/class name (tree-sitter)"},
+                        "output_mode": {"type": "string", "enum": ["content", "files_with_matches", "count"], "description": "Output mode: 'content' (default, matching lines), 'files_with_matches' (file paths only), 'count' (match counts per file)"},
+                        "offset": {"type": "integer", "description": "Skip first N result lines (for pagination)"}
                     },
                     "required": ["pattern"]
                 }
@@ -1247,6 +1254,15 @@ impl ToolExecutor {
                     is_partial,
                 },
             );
+            // LRU eviction: keep at most MAX_FILE_STATE_ENTRIES
+            if state.len() > MAX_FILE_STATE_ENTRIES
+                && let Some(oldest_key) = state
+                    .iter()
+                    .min_by_key(|(_, fs)| fs.timestamp_ms)
+                    .map(|(k, _)| k.clone())
+            {
+                state.remove(&oldest_key);
+            }
         }
     }
 
@@ -1263,6 +1279,15 @@ impl ToolExecutor {
                     is_partial: false,
                 },
             );
+            // LRU eviction: keep at most MAX_FILE_STATE_ENTRIES
+            if state.len() > MAX_FILE_STATE_ENTRIES
+                && let Some(oldest_key) = state
+                    .iter()
+                    .min_by_key(|(_, fs)| fs.timestamp_ms)
+                    .map(|(k, _)| k.clone())
+            {
+                state.remove(&oldest_key);
+            }
         }
     }
 

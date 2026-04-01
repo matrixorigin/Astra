@@ -1,8 +1,71 @@
 use super::*;
 
+/// Check if a path is a UNC path (Windows network path that could leak NTLM credentials).
+fn is_unc_path(path: &str) -> bool {
+    path.starts_with("\\\\") || path.starts_with("//")
+}
+
+/// Check if a path is a dangerous/sensitive file that should warn the user.
+fn is_dangerous_write_target(rel_path: &str) -> Option<&'static str> {
+    const DANGEROUS_FILES: &[(&str, &str)] = &[
+        (
+            ".gitconfig",
+            "Git configuration — changes affect all git operations",
+        ),
+        (
+            ".gitmodules",
+            "Git submodule config — can change repository references",
+        ),
+        (
+            ".bashrc",
+            "Bash startup — changes affect all future shell sessions",
+        ),
+        (
+            ".bash_profile",
+            "Bash login — changes affect all future login sessions",
+        ),
+        (
+            ".zshrc",
+            "Zsh startup — changes affect all future shell sessions",
+        ),
+        (
+            ".zprofile",
+            "Zsh login — changes affect all future login sessions",
+        ),
+        (
+            ".profile",
+            "Shell profile — changes affect all future sessions",
+        ),
+        (
+            ".ssh/config",
+            "SSH config — changes affect all SSH connections",
+        ),
+        (
+            ".ssh/authorized_keys",
+            "SSH keys — changes affect server access",
+        ),
+        (".npmrc", "NPM config — can change registry or auth tokens"),
+        (".env", "Environment variables — may contain secrets"),
+    ];
+    let filename = rel_path.rsplit('/').next().unwrap_or(rel_path);
+    for (name, reason) in DANGEROUS_FILES {
+        if filename == *name || rel_path.ends_with(name) {
+            return Some(reason);
+        }
+    }
+    // Check dangerous directories
+    if rel_path.starts_with(".git/") || rel_path.contains("/.git/") {
+        return Some("Git internals — corruption risk");
+    }
+    None
+}
+
 impl ToolExecutor {
     /// Resolve a tool-provided path, enforcing sandbox boundary when active.
     pub(crate) fn resolve(&self, path: &str) -> PathBuf {
+        if is_unc_path(path) {
+            return self.project_root.clone();
+        }
         let p = Path::new(path);
         let resolved = if p.is_absolute() {
             p.to_path_buf()
@@ -24,6 +87,9 @@ impl ToolExecutor {
 
     /// Resolve path with explicit error when sandbox blocks it.
     pub(crate) fn resolve_checked(&self, path: &str) -> Result<PathBuf, String> {
+        if is_unc_path(path) {
+            return Err("Error: UNC/network paths are not supported (security risk)".to_string());
+        }
         let p = Path::new(path);
         let resolved = if p.is_absolute() {
             p.to_path_buf()
@@ -49,15 +115,75 @@ impl ToolExecutor {
             Err(e) => return e,
         };
 
-        // Binary file guard — refuse to read known binary extensions
-        if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-            const BINARY_EXTS: &[&str] = &[
-                "png", "jpg", "jpeg", "gif", "bmp", "ico", "webp", "svg", "pdf", "zip", "gz",
-                "tar", "bz2", "xz", "7z", "rar", "exe", "dll", "so", "dylib", "o", "a", "lib",
-                "wasm", "class", "pyc", "pyo", "mp3", "mp4", "avi", "mov", "wav", "flac", "ogg",
-                "ttf", "otf", "woff", "woff2", "eot", "sqlite", "db", "mdb",
+        // Device file blocking — prevent hangs on infinite/blocking device files
+        {
+            let path_str_lower = path.to_string_lossy();
+            const BLOCKED_DEVICE_PATHS: &[&str] = &[
+                "/dev/zero",
+                "/dev/random",
+                "/dev/urandom",
+                "/dev/full",
+                "/dev/stdin",
+                "/dev/tty",
+                "/dev/console",
+                "/dev/stdout",
+                "/dev/stderr",
+                "/dev/null",
             ];
-            if BINARY_EXTS.contains(&ext.to_lowercase().as_str()) {
+            for blocked in BLOCKED_DEVICE_PATHS {
+                if path_str_lower.starts_with(blocked) {
+                    return format!(
+                        "Error: refusing to read device file '{}' (would block or produce infinite output)",
+                        blocked
+                    );
+                }
+            }
+            if path_str_lower.starts_with("/proc/") && path_str_lower.contains("/fd/") {
+                return "Error: refusing to read /proc fd paths (would block)".to_string();
+            }
+        }
+
+        // Binary file guard — refuse to read known binary extensions, but allow images
+        if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+            let ext_lower = ext.to_lowercase();
+
+            // Image files: return base64 for vision models
+            const IMAGE_EXTS: &[&str] = &["png", "jpg", "jpeg", "gif", "bmp", "webp"];
+            if IMAGE_EXTS.contains(&ext_lower.as_str()) {
+                match fs::read(&path) {
+                    Ok(bytes) => {
+                        use base64::Engine;
+                        let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                        let mime = match ext_lower.as_str() {
+                            "png" => "image/png",
+                            "jpg" | "jpeg" => "image/jpeg",
+                            "gif" => "image/gif",
+                            "bmp" => "image/bmp",
+                            "webp" => "image/webp",
+                            _ => "application/octet-stream",
+                        };
+                        // Cap at ~2MB encoded (prevents context bloat)
+                        if b64.len() > 2_000_000 {
+                            return format!(
+                                "Error: image too large ({} bytes). Use bash to resize first.",
+                                bytes.len()
+                            );
+                        }
+                        self.record_read(&path, false);
+                        return format!("data:{mime};base64,{b64}");
+                    }
+                    Err(e) => return format!("Error reading image: {e}"),
+                }
+            }
+
+            // Other binary files: block
+            const BINARY_EXTS: &[&str] = &[
+                "svg", "pdf", "zip", "gz", "tar", "bz2", "xz", "7z", "rar", "exe", "dll", "so",
+                "dylib", "o", "a", "lib", "wasm", "class", "pyc", "pyo", "mp3", "mp4", "avi",
+                "mov", "wav", "flac", "ogg", "ttf", "otf", "woff", "woff2", "eot", "sqlite", "db",
+                "mdb", "ico",
+            ];
+            if BINARY_EXTS.contains(&ext_lower.as_str()) {
                 return format!(
                     "Error: refusing to read binary file (.{ext}). Use bash with appropriate tools (e.g. file, xxd, strings) for binary analysis."
                 );
@@ -183,6 +309,16 @@ impl ToolExecutor {
             None => return json!({ "success": false, "error": "missing 'content'" }).to_string(),
         };
 
+        // Dangerous file guard
+        let rel = path.strip_prefix(&self.project_root).unwrap_or(&path);
+        let rel_str = rel.to_string_lossy();
+        if let Some(warning) = is_dangerous_write_target(&rel_str) {
+            return json!({
+                "success": false,
+                "error": format!("⚠️ Warning: writing to sensitive file '{}' — {}. If intentional, use bash 'echo ... > file' to bypass this guard.", rel_str, warning)
+            }).to_string();
+        }
+
         // Staleness check: if file exists, it must have been read first and not modified since
         if path.exists() {
             if let Err(e) = self.check_staleness(&path) {
@@ -237,10 +373,27 @@ impl ToolExecutor {
             Some(s) => s,
             None => return "Error: missing 'new_str'".to_string(),
         };
+        if old_str == new_str {
+            return "Error: old_str and new_str are identical — no change needed".to_string();
+        }
         let dry_run = args
             .get("dry_run")
             .and_then(Value::as_bool)
             .unwrap_or(false);
+        let replace_all = args
+            .get("replace_all")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+
+        // Dangerous file guard
+        let rel = path.strip_prefix(&self.project_root).unwrap_or(&path);
+        let rel_str = rel.to_string_lossy();
+        if let Some(warning) = is_dangerous_write_target(&rel_str) {
+            return format!(
+                "⚠️ Warning: writing to sensitive file '{}' — {}. If intentional, use bash 'echo ... > file' to bypass this guard.",
+                rel_str, warning
+            );
+        }
 
         // Staleness check
         if let Err(e) = self.check_staleness(&path) {
@@ -255,11 +408,15 @@ impl ToolExecutor {
         if count == 0 {
             return str_replace_not_found_hint(&content, old_str);
         }
-        if count > 1 {
+        if count > 1 && !replace_all {
             return str_replace_ambiguous_hint(&content, old_str, count);
         }
 
-        let new_content = content.replacen(old_str, new_str, 1);
+        let new_content = if replace_all {
+            content.replace(old_str, new_str)
+        } else {
+            content.replacen(old_str, new_str, 1)
+        };
 
         // Dry run: show unified diff without writing
         if dry_run {
@@ -300,6 +457,9 @@ impl ToolExecutor {
                 };
                 if let Some(fmt_note) = format_result {
                     result.push_str(&format!("\n{fmt_note}"));
+                }
+                if replace_all && count > 1 {
+                    result = format!("Replaced {count} occurrences\n{result}");
                 }
 
                 // Scope context: show where in the code structure this edit landed
@@ -395,6 +555,11 @@ impl ToolExecutor {
                 Some(s) => s,
                 None => return format!("Error: edit[{i}] missing 'new_str'"),
             };
+            if old_str == new_str {
+                return format!(
+                    "Error: edit[{i}] old_str and new_str are identical — no change needed"
+                );
+            }
             let count = working.matches(old_str).count();
             if count == 0 {
                 return format!(
@@ -2017,5 +2182,71 @@ type Handler interface {
         assert!(result.contains("Applied 2 edit(s)"), "result: {result}");
         assert!(result.contains("📍"), "should show scope: {result}");
         assert!(result.contains("main"), "should mention fn main: {result}");
+    }
+
+    #[test]
+    fn test_is_dangerous_write_target() {
+        assert!(is_dangerous_write_target(".bashrc").is_some());
+        assert!(is_dangerous_write_target(".git/config").is_some());
+        assert!(is_dangerous_write_target(".env").is_some());
+        assert!(is_dangerous_write_target("src/main.rs").is_none());
+        assert!(is_dangerous_write_target("README.md").is_none());
+    }
+
+    #[test]
+    fn test_is_unc_path() {
+        assert!(is_unc_path("\\\\server\\share"));
+        assert!(is_unc_path("//server/share"));
+        assert!(!is_unc_path("/home/user/file"));
+        assert!(!is_unc_path("src/main.rs"));
+    }
+
+    #[test]
+    fn test_str_replace_identity_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = test_executor_in(dir.path());
+        let test_file = dir.path().join("test.txt");
+        std::fs::write(&test_file, "hello world").unwrap();
+        // Read it first
+        exe.read_file(&json!({"path": test_file.to_str().unwrap()}));
+        let result = exe.str_replace(&json!({
+            "path": test_file.to_str().unwrap(),
+            "old_str": "hello",
+            "new_str": "hello"
+        }));
+        assert!(
+            result.contains("identical"),
+            "should reject identical: {result}"
+        );
+    }
+
+    #[test]
+    fn test_str_replace_all() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = test_executor_in(dir.path());
+        let test_file = dir.path().join("test.txt");
+        std::fs::write(&test_file, "foo bar foo baz foo").unwrap();
+        exe.read_file(&json!({"path": test_file.to_str().unwrap()}));
+        let result = exe.str_replace(&json!({
+            "path": test_file.to_str().unwrap(),
+            "old_str": "foo",
+            "new_str": "qux",
+            "replace_all": true
+        }));
+        assert!(
+            result.contains("Replaced 3 occurrences"),
+            "should report count: {result}"
+        );
+        let content = std::fs::read_to_string(&test_file).unwrap();
+        assert_eq!(content, "qux bar qux baz qux");
+    }
+
+    #[test]
+    fn test_resolve_checked_blocks_unc() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = test_executor_in(dir.path());
+        assert!(exe.resolve_checked("\\\\server\\share").is_err());
+        assert!(exe.resolve_checked("//server/share").is_err());
+        assert!(exe.resolve_checked("src/main.rs").is_ok());
     }
 }

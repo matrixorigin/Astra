@@ -543,9 +543,20 @@ impl ToolExecutor {
             .get("scope_context")
             .and_then(Value::as_bool)
             .unwrap_or(false);
+        let output_mode = args
+            .get("output_mode")
+            .and_then(Value::as_str)
+            .unwrap_or("content");
+        let offset = args.get("offset").and_then(Value::as_u64).unwrap_or(0) as usize;
+
+        let grep_flags = match output_mode {
+            "files_with_matches" => "-rlHE",
+            "count" => "-rcHE",
+            _ => "-rnHE",
+        };
 
         let mut cmd = Command::new("grep");
-        cmd.arg("-rnHE"); // -H forces filename display, -E enables extended regex
+        cmd.arg(grep_flags);
         if !case_sensitive {
             cmd.arg("-i");
         }
@@ -563,17 +574,43 @@ impl ToolExecutor {
         // Use 30s timeout for grep (large repos can take time)
         match run_command_with_cleanup(&mut cmd, 30.0) {
             Ok(out) => {
-                let text = String::from_utf8_lossy(&out.stdout);
+                let raw_text = String::from_utf8_lossy(&out.stdout);
                 let stderr = String::from_utf8_lossy(&out.stderr);
                 match out.status.code() {
                     Some(0) => {
+                        // For count mode, filter out zero-count lines
+                        let text = if output_mode == "count" {
+                            raw_text
+                                .lines()
+                                .filter(|line| !line.ends_with(":0"))
+                                .collect::<Vec<_>>()
+                                .join("\n")
+                        } else {
+                            raw_text.to_string()
+                        };
+
+                        // Apply offset for pagination
+                        let text = if offset > 0 {
+                            let lines: Vec<&str> = text.lines().collect();
+                            if offset >= lines.len() {
+                                return format!(
+                                    "No more results (offset {} >= {} lines)",
+                                    offset,
+                                    lines.len()
+                                );
+                            }
+                            lines[offset..].join("\n")
+                        } else {
+                            text
+                        };
+
                         let limit = self.scaled_output_limit().min(20_000);
                         let result = if text.len() > limit {
                             let mut t = text[..text.floor_char_boundary(limit)].to_string();
                             t.push_str("\n[truncated]");
                             t
                         } else {
-                            text.to_string()
+                            text
                         };
 
                         if scope_context {
