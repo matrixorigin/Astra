@@ -458,6 +458,8 @@ struct ReplState {
     tool_health_entries: Vec<mo_agent_runtime::pipeline::persistence::ToolHealthEntry>,
     /// Last successfully synced tool health snapshot, used to compute deltas.
     synced_tool_health_entries: Vec<mo_agent_runtime::pipeline::persistence::ToolHealthEntry>,
+    /// Plan-only chat (`/plan on`): normal REPL turns omit edge tools; model plans without executing.
+    chat_plan_only: bool,
     /// Plan Mode state — when Some, REPL is in interactive plan editing mode.
     plan_mode: Option<plan_decompose::PlanModeState>,
     /// Plan being auto-executed — subtasks sent sequentially through chat.
@@ -521,6 +523,7 @@ impl Default for ReplState {
             task_service: None,
             tool_health_entries: Vec::new(),
             synced_tool_health_entries: Vec::new(),
+            chat_plan_only: false,
             plan_mode: None,
             executing_plan: None,
             plan_execution_config: None,
@@ -2959,6 +2962,8 @@ async fn run_chat_repl(
             format!("{} ", "plan>".yellow().bold())
         } else if state.executing_plan.is_some() {
             format!("{} ", "⏸>".yellow().bold())
+        } else if state.chat_plan_only {
+            format!("{} ", "plan·".yellow().bold())
         } else {
             format!("{} ", "❯".cyan().bold())
         };
@@ -3724,6 +3729,7 @@ mod tests {
             recent_tools: &[],
             tool_health_entries: &[],
             skill_registry: crate::skill_instructions::empty_registry(),
+            plan_only_chat: false,
         })
         .await
         .unwrap();
@@ -3765,6 +3771,7 @@ mod tests {
             recent_tools: &[],
             tool_health_entries: &[],
             skill_registry: crate::skill_instructions::empty_registry(),
+            plan_only_chat: false,
         })
         .await;
         assert!(result.is_err());
@@ -3822,6 +3829,7 @@ mod tests {
             recent_tools: &[],
             tool_health_entries: &[],
             skill_registry: crate::skill_instructions::empty_registry(),
+            plan_only_chat: false,
         })
         .await
         .unwrap();

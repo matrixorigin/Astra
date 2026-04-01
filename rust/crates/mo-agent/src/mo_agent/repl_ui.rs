@@ -7,7 +7,9 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/clear", "Start a new session"),
     ("/history", "Show conversation turns"),
     ("/copy", "Copy last response to clipboard"),
-    ("/plan", "Toggle plan mode (enter/exit)"),
+    ("/plan", "Structured plan editor: enter/exit (no args)"),
+    ("/plan on", "Plan-only chat: no tools until /plan off"),
+    ("/plan off", "Exit plan-only chat (restore tools)"),
     ("/plan list", "List plan history"),
     ("/plan history", "Show plan version history"),
     ("/resume", "Resume a previous session: /resume [session_id]"),
@@ -310,7 +312,7 @@ fn slash_argument_hint(command: &str) -> Option<&'static str> {
         "/skill validate" | "/skill config" => Some("<name>"),
         "/skill system" => Some("<name|list>"),
         "/memory" => Some("[list|search <q>|inspect <id>]"),
-        "/plan" => Some("[enter <goal>|auto <goal>|resume|exit|decompose|show|set|clear]"),
+        "/plan" => Some("[on|off|enter <goal>|auto|resume|exit|decompose|show|set|clear]"),
         "/task" => Some("[list|add <title>|done <id>|status <id>]"),
         "/resume" => Some("[session_id]"),
         "/stats" => Some("[history]"),
@@ -1788,6 +1790,8 @@ mod tests {
         assert!(!rows.is_empty());
         assert!(rows.iter().any(|(cmd, _)| *cmd == "/plan list"));
         assert!(rows.iter().any(|(cmd, _)| *cmd == "/plan history"));
+        assert!(rows.iter().any(|(cmd, _)| *cmd == "/plan on"));
+        assert!(rows.iter().any(|(cmd, _)| *cmd == "/plan off"));
     }
 
     // ── Pending-execute lifecycle ────────────────────────────────────────

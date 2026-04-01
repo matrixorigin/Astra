@@ -1,6 +1,22 @@
 use super::*;
 use mo_agent_runtime::plan_decompose;
 
+fn eprint_plan_json_parse_failed(full_text: &str, err: &str) {
+    eprintln!("  {} Failed to parse plan: {}", "✗".red(), err);
+    let prev = plan_decompose::plan_response_parse_error_preview(full_text, 10, 700);
+    if !prev.is_empty() {
+        eprintln!("  {}", "Model reply:".dim());
+        for line in prev.lines() {
+            eprintln!("    {}", line.dim());
+        }
+    }
+    eprintln!(
+        "  {}",
+        "Tip: Plan decomposition expects JSON only. For git/files without JSON plans, exit plan mode (`exit`) or `/plan off` and use normal chat with tools."
+            .dim()
+    );
+}
+
 pub(super) async fn handle_memory_domain_command(
     cmd: &str,
     arg: &str,
@@ -127,12 +143,52 @@ pub(super) async fn handle_memory_domain_command(
         }
 
         "/plan" => {
+            let subcmd = arg.split_whitespace().next().unwrap_or("");
+            let sub_arg = arg.strip_prefix(subcmd).unwrap_or("").trim();
+            match subcmd {
+                "on" => {
+                    if state.plan_mode.is_some() {
+                        eprintln!(
+                            "  {} Leave structured plan mode first (`exit` or `/plan`), then `/plan on`.",
+                            "⚠".yellow()
+                        );
+                        return Ok(());
+                    }
+                    if state.chat_plan_only {
+                        eprintln!(
+                            "  {}",
+                            "Plan-only chat is already on. Use `/plan off` to disable.".dim()
+                        );
+                        return Ok(());
+                    }
+                    state.chat_plan_only = true;
+                    eprintln!(
+                        "  {} Plan-only chat ON — edge tools disabled; model answers with plans only.",
+                        "📋".cyan()
+                    );
+                    eprintln!(
+                        "  {}",
+                        "  `/plan off` restores normal tool use. `/plan` (no args) opens the structured plan editor."
+                            .dim()
+                    );
+                    return Ok(());
+                }
+                "off" => {
+                    if !state.chat_plan_only {
+                        eprintln!("  {}", "Plan-only chat was not active.".dim());
+                        return Ok(());
+                    }
+                    state.chat_plan_only = false;
+                    eprintln!("  {} Plan-only chat OFF — normal agent mode.", "←".cyan());
+                    return Ok(());
+                }
+                _ => {}
+            }
+
             let Some(tok) = token else {
                 eprintln!("{}", "  Not logged in. Use /login.".yellow());
                 return Ok(());
             };
-            let subcmd = arg.split_whitespace().next().unwrap_or("");
-            let sub_arg = arg.strip_prefix(subcmd).unwrap_or("").trim();
             match subcmd {
                 // Toggle: /plan with no args enters or exits plan mode
                 "" => {
@@ -163,6 +219,7 @@ pub(super) async fn handle_memory_domain_command(
 
                     // Restore saved plan or create new
                     if let Some(plan) = saved_plan {
+                        state.chat_plan_only = false;
                         state.plan_mode = Some(plan);
                         if let Some(ref ps) = state.plan_mode {
                             eprintln!(
@@ -179,6 +236,7 @@ pub(super) async fn handle_memory_domain_command(
                         let project_root = std::env::current_dir()
                             .unwrap_or_else(|_| std::path::PathBuf::from("."));
                         let context = plan_decompose::analyze_project(&project_root);
+                        state.chat_plan_only = false;
                         state.plan_mode = Some(PlanModeState::new(String::new(), context));
                         eprintln!(
                             "  {} Entered plan mode. Describe your goal to start planning.",
@@ -347,11 +405,7 @@ pub(super) async fn handle_memory_domain_command(
                                     eprint!("{}", plan_decompose::format_plan(&plan));
                                 }
                                 Err(e) => {
-                                    eprintln!(
-                                        "{}",
-                                        format!("  ✗ Could not parse plan: {e}").yellow()
-                                    );
-                                    eprintln!("  The response may still be useful — see above.");
+                                    eprint_plan_json_parse_failed(&full_text, &e);
                                 }
                             }
                         }
@@ -466,6 +520,8 @@ pub(super) async fn handle_memory_domain_command(
                             if let Ok(ref p) = plan_result {
                                 let formatted = format_plan(p);
                                 eprintln!("{formatted}");
+                            } else if let Err(ref e) = plan_result {
+                                eprint_plan_json_parse_failed(&full_text, &e.to_string());
                             }
 
                             eprintln!();
@@ -1168,7 +1224,7 @@ pub(super) async fn handle_memory_domain_command(
                                     );
                                 }
                                 Err(e) => {
-                                    eprintln!("  {} Failed to parse replan: {}", "✗".red(), e);
+                                    eprint_plan_json_parse_failed(&full_text, &e.to_string());
                                 }
                             }
                         }
@@ -1273,13 +1329,10 @@ pub(super) async fn handle_memory_domain_command(
                                     state.executing_plan = Some(plan);
                                 }
                                 Err(e) => {
+                                    eprint_plan_json_parse_failed(&full_text, &e.to_string());
                                     eprintln!(
-                                        "{}",
-                                        format!("  ✗ Could not parse plan: {e}").yellow()
-                                    );
-                                    eprintln!(
-                                        "  Try '/plan enter {}' for interactive mode.",
-                                        sub_arg
+                                        "  {}",
+                                        format!("Try '/plan enter {sub_arg}' for interactive mode.").dim()
                                     );
                                 }
                             }
@@ -1293,7 +1346,7 @@ pub(super) async fn handle_memory_domain_command(
                     }
                 }
                 _ => {
-                    eprintln!("  Usage: /plan [list | history]");
+                    eprintln!("  Usage: /plan [on | off | list | history | …]");
                     eprintln!("  In plan mode, just describe your goal - no commands needed.");
                 }
             }
@@ -1425,7 +1478,7 @@ pub async fn handle_plan_mode_input(
                         eprintln!("    Or describe changes to modify the plan");
                     }
                     Err(e) => {
-                        eprintln!("  {} Failed to parse plan: {}", "✗".red(), e);
+                        eprint_plan_json_parse_failed(&full_text, &e.to_string());
                     }
                 }
             }
@@ -1616,7 +1669,7 @@ pub async fn handle_plan_mode_input(
                                     eprintln!("    Or describe changes to modify the plan");
                                 }
                                 Err(e) => {
-                                    eprintln!("  {} Failed to parse plan: {}", "✗".red(), e);
+                                    eprint_plan_json_parse_failed(&full_text, &e.to_string());
                                 }
                             }
                         }

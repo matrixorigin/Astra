@@ -46,14 +46,12 @@ struct CliSseStreamHost<'a> {
     quiet: bool,
     perm_manager: Option<&'a mut crate::permission_manager::PermissionManager>,
     render: StreamRenderState,
-    /// When true (markdown final render), skip live `print!` of `text_delta` to avoid a clear+redraw flash.
-    suppress_stdout_stream: bool,
     /// Ordered tool executions from this SSE stream.
     pub edge_tool_round: Vec<EdgeToolExecResult>,
 }
 
 impl<'a> CliSseStreamHost<'a> {
-    fn from_edge_ctx(ctx: EdgeSseContext<'a>, term_width: usize, suppress_stdout_stream: bool) -> Self {
+    fn from_edge_ctx(ctx: EdgeSseContext<'a>, term_width: usize) -> Self {
         Self {
             api: ctx.api,
             token: ctx.token,
@@ -62,7 +60,6 @@ impl<'a> CliSseStreamHost<'a> {
             quiet: ctx.quiet,
             perm_manager: ctx.perm_manager,
             render: StreamRenderState::with_term_width(term_width),
-            suppress_stdout_stream,
             edge_tool_round: Vec::new(),
         }
     }
@@ -77,11 +74,9 @@ impl SseStreamHost for CliSseStreamHost<'_> {
         for effect in effects {
             match effect {
                 SseRenderEffect::StreamText(s) => {
-                    if !self.suppress_stdout_stream {
-                        print!("{s}");
-                        let _ = io::stdout().flush();
-                        self.render.track_output(&s);
-                    }
+                    print!("{s}");
+                    let _ = io::stdout().flush();
+                    self.render.track_output(&s);
                 }
                 SseRenderEffect::StopThinkingSpinner => self.render.stop_thinking(),
                 SseRenderEffect::StartThinkingSpinner => self.render.start_thinking(),
@@ -401,11 +396,9 @@ pub(super) async fn consume_turn_sse(
 
     // Delegate to runtime's generic SSE consumer with the appropriate host
     let idle = std::time::Duration::from_millis(STREAM_IDLE_TIMEOUT_MS);
-    // Markdown final pass uses termimad; streaming the same text to stdout first causes a visible
-    // clear+redraw (and line-count drift vs unicode wrap). Suppress live text_delta when render_md.
-    let suppress_stdout_stream = render_md && !quiet;
+    // Stream `text_delta` live; final markdown pass may clear/redraw for termimad formatting.
     let (sse_result, edge_tool_round, lines_written) = if let Some(ctx) = edge {
-        let mut host = CliSseStreamHost::from_edge_ctx(ctx, term_width, suppress_stdout_stream);
+        let mut host = CliSseStreamHost::from_edge_ctx(ctx, term_width);
         host.render.lines_written = pre_clear_lines;
         let (result, _abort) = consume_sse_stream(&mut byte_stream, &mut host, idle).await;
         let lw = host.render.lines_written;

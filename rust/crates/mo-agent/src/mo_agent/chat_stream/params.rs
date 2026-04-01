@@ -23,4 +23,6 @@ pub(crate) struct ChatTurnParams<'a> {
     pub(crate) tool_health_entries: &'a [ToolHealthEntry],
     /// Skill registry for loading instructions when LLM selects a skill.
     pub(crate) skill_registry: &'a SharedSkillRegistry,
+    /// When true, omit edge tools and inject plan-only system instructions (CLI `/plan on`).
+    pub(crate) plan_only_chat: bool,
 }

@@ -19,6 +19,15 @@ use std::path::Path;
 // Re-export task types from services
 pub use mo_agent_services::task_orchestrator::{SubtaskPlan, TaskPlan, TaskStatus};
 
+/// First `messages[]` row (`role: system`) when the CLI enables **plan-only chat** (`/plan on`).
+/// Edge tools are omitted from the payload; the model should reason and answer with a plan only.
+pub const CHAT_PLAN_ONLY_SYSTEM: &str = "You are in **plan-only** mode.\n\n\
+Rules:\n\
+- Produce a clear, actionable plan: ordered steps, dependencies, risks, and verification.\n\
+- Do **not** assume any tools or shell commands will run. Do not offer to read files, search the repo, or run builds unless the user leaves plan-only mode.\n\
+- If critical information is missing, ask concise questions before the plan.\n\
+- Prefer sections: Goal, Assumptions, Steps, Verification.\n";
+
 /// Project context gathered for plan decomposition.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ProjectContext {
@@ -437,6 +446,14 @@ pub fn decomposition_prompt(goal: &str, context: &ProjectContext) -> String {
 
     prompt.push_str(&format!("\n## Goal\n{goal}\n"));
 
+    prompt.push_str(
+        "\n## Decomposition phase (read carefully)\n\
+You are in **plan-decomposition** mode: you do **not** have shell, git, read_file, or other tools in this request.\n\
+**Never refuse** the goal because tools are unavailable. Assume a human or the main agent **will** run commands later.\n\
+- For goals like \"review the latest commit\", \"check CI\", or \"what changed\": emit subtasks whose descriptions name the exact commands to run (e.g. `git log -1 --stat`, `git show HEAD`) and what to look for in the output.\n\
+- Your reply must be **only** the JSON specified below (or the clarification JSON array). **Do not** end with conversational refusals such as \"I don't have tools\" without including valid JSON.\n\n",
+    );
+
     prompt.push_str(r#"
 ## Instructions
 First, assess if you have enough information to create a precise plan. If the goal is ambiguous or you need clarification, ask 1-3 focused questions INSTEAD of generating a plan.
@@ -492,6 +509,30 @@ Return ONLY this JSON:
 ```"#);
 
     prompt
+}
+
+/// First lines of model text when plan JSON parsing failed (for CLI hints).
+pub fn plan_response_parse_error_preview(
+    response: &str,
+    max_lines: usize,
+    max_chars: usize,
+) -> String {
+    let t = response.trim();
+    if t.is_empty() {
+        return String::new();
+    }
+    let capped: String = t.chars().take(max_chars).collect();
+    let excerpt = capped
+        .lines()
+        .take(max_lines)
+        .collect::<Vec<_>>()
+        .join("\n");
+    let truncated = t.chars().count() > max_chars || t.lines().count() > max_lines;
+    if truncated && !excerpt.is_empty() {
+        format!("{excerpt}\n…")
+    } else {
+        excerpt
+    }
 }
 
 /// Parse LLM response into a TaskPlan.
@@ -3132,6 +3173,18 @@ Done!"#;
             prompt.contains("Add logging"),
             "should include goal: {prompt}"
         );
+        assert!(
+            prompt.contains("Never refuse") && prompt.contains("plan-decomposition"),
+            "should require JSON despite no tools in this phase: {prompt}"
+        );
+    }
+
+    #[test]
+    fn plan_response_parse_error_preview_truncates() {
+        let s = "a\nb\nc\nd\ne\nf";
+        let p = plan_response_parse_error_preview(s, 3, 100);
+        assert!(p.contains('a') && p.contains('b') && p.contains('c'));
+        assert!(p.contains('…'));
     }
 
     #[test]

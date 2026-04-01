@@ -14,6 +14,7 @@ use std::time::Instant;
 
 use mo_agent_core::RuntimeLimits;
 use mo_agent_runtime::{
+    plan_decompose::CHAT_PLAN_ONLY_SYSTEM,
     pipeline::step_protocol::InMemoryIdempotencyCache,
     pipeline::step_recorder::StepRecorder,
     semantic_dedup::SemanticDedup,
@@ -30,6 +31,7 @@ use mo_agent_runtime::{
 use crate::{StreamResult, cli_utils::terminal_width_usize, edge_tools};
 
 use super::ChatTurnParams;
+use serde_json::json;
 use agentic_sse_loop::{
     StreamLoopSidecarEprint, StreamResultBuild, build_stream_result, eprint_stream_loop_sidecars,
 };
@@ -42,12 +44,23 @@ pub(crate) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
     let file_context = detect_project_languages(&project_root);
     let executor =
         edge_tools::ToolExecutor::new(&project_root).with_cloud(p.api.api_origin(), p.token);
-    let all_schemas = edge_tools::all_tool_schemas();
+    let mut messages = openai_messages_from_repl_history(p.history, p.message);
+    let all_schemas = if p.plan_only_chat {
+        messages.insert(
+            0,
+            json!({
+                "role": "system",
+                "content": CHAT_PLAN_ONLY_SYSTEM,
+            }),
+        );
+        Vec::new()
+    } else {
+        edge_tools::all_tool_schemas()
+    };
     let registry = ToolRegistry::new(all_schemas.clone());
     let valid_tool_names = openai_tool_names_from_schemas(&all_schemas);
 
     let current_session_id = p.session_id.map(|s| s.to_string());
-    let messages = openai_messages_from_repl_history(p.history, p.message);
 
     let turn_guard = if p.tool_health_entries.is_empty() {
         TurnGuard::new()
