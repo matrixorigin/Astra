@@ -1255,13 +1255,17 @@ impl ToolExecutor {
         let ts = Self::file_mtime_ms(path);
         if let Ok(mut state) = self.file_state.lock() {
             let prev_count = state.get(path).map(|fs| fs.read_count).unwrap_or(0);
+            // Only increment read_count for full (non-partial) reads.
+            // Ranged reads of different sections are expected behavior
+            // (guided by the size gate), not wasteful repetition.
+            let new_count = if is_partial { prev_count } else { prev_count + 1 };
             state.insert(
                 path.to_path_buf(),
                 FileState {
                     timestamp_ms: ts,
                     from_read: true,
                     is_partial,
-                    read_count: prev_count + 1,
+                    read_count: new_count,
                 },
             );
             // LRU eviction: keep at most MAX_FILE_STATE_ENTRIES
