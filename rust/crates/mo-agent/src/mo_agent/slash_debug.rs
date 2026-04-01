@@ -221,7 +221,15 @@ fn show_tools(messages: Option<&[serde_json::Value]>, summary: &TurnSummary) {
             if role != "tool" {
                 continue;
             }
-            let name = m.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+            let name = m.get("name")
+                .and_then(|v| v.as_str())
+                .or_else(|| {
+                    // Fall back to tool_call_id (e.g. "git_status:0" → "git_status")
+                    m.get("tool_call_id")
+                        .and_then(|v| v.as_str())
+                        .and_then(|id| id.split(':').next())
+                })
+                .unwrap_or("?");
             let content = m.get("content").and_then(|v| v.as_str()).unwrap_or("");
             eprintln!(
                 "  {} {}",
