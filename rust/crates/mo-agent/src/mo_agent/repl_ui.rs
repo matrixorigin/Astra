@@ -7,7 +7,14 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/clear", "Start a new session"),
     ("/history", "Show conversation turns"),
     ("/copy", "Copy last response to clipboard"),
-    ("/diff", "Colored git diff vs HEAD (staged, stat, show <rev>)"),
+    (
+        "/review",
+        "Review local changes or a commit: /review [latest|<rev>|working]",
+    ),
+    (
+        "/diff",
+        "Colored git diff vs HEAD (staged, stat, show <rev>)",
+    ),
     ("/plan", "Structured plan editor: enter/exit (no args)"),
     ("/plan on", "Plan-only chat: no tools until /plan off"),
     ("/plan off", "Exit plan-only chat (restore tools)"),
@@ -21,9 +28,15 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/register", "Register a new account"),
     ("/logout", "Logout from the API"),
     // ── Observability ─────────────────────────────────────────────────────
-    ("/explain", "Cycle explain: off → on (API) → verbose (+stderr)"),
+    (
+        "/explain",
+        "Cycle explain: off → on (API) → verbose (+stderr)",
+    ),
     ("/turn", "Show current turn details (timing, tokens, tools)"),
-    ("/debug", "Interactive session inspector (messages, tools, injections)"),
+    (
+        "/debug",
+        "Interactive session inspector (messages, tools, injections)",
+    ),
     ("/stats", "Session analytics: turns, tokens, errors"),
     ("/tools", "Tool performance: calls, timing, success rate"),
     ("/health", "Tool health dashboard"),
@@ -32,11 +45,17 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     // ── Advanced ──────────────────────────────────────────────────────────
     ("/doctor", "Run diagnostics"),
     ("/version", "Show version info"),
-    ("/session", "Session info: cwd, git, workspace.yaml, REPL state"),
+    (
+        "/session",
+        "Session info: cwd, git, workspace.yaml, REPL state",
+    ),
     ("/session history", "View session conversation history"),
     ("/session errors", "View session errors"),
     ("/session export", "Export session data"),
-    ("/session list", "All journals + cwd / git / age from workspace"),
+    (
+        "/session list",
+        "All journals + cwd / git / age from workspace",
+    ),
     ("/skill", "Skill management: /skill [list|new|dev|test]"),
 ];
 
@@ -308,6 +327,7 @@ fn slash_argument_hint(command: &str) -> Option<&'static str> {
         "/search" => Some("<pattern|files <glob>|review <pattern>>"),
         "/search files" => Some("<glob>"),
         "/search review" => Some("<pattern>"),
+        "/review" => Some("[latest|<rev>|working]"),
         "/skill" => Some("[list|new|test|dev|doctor|validate|config|system]"),
         "/skill new" => Some("<name>"),
         "/skill test" => Some("<name> [json_args]"),
@@ -829,7 +849,9 @@ pub(super) fn print_slash_commands(query: Option<&str>) {
         (
             "🔭",
             "Observability",
-            &["/explain", "/turn", "/debug", "/stats", "/tools", "/health", "/sync"],
+            &[
+                "/explain", "/turn", "/debug", "/stats", "/tools", "/health", "/sync",
+            ],
         ),
         (
             "📋",
@@ -1835,7 +1857,9 @@ mod tests {
         // in SLASH_COMMANDS.
         let groups: &[&[&str]] = &[
             &["/help", "/model", "/clear", "/history", "/copy", "/exit"],
-            &["/explain", "/turn", "/debug", "/stats", "/tools", "/health", "/sync"],
+            &[
+                "/explain", "/turn", "/debug", "/stats", "/tools", "/health", "/sync",
+            ],
             &[
                 "/session",
                 "/session history",

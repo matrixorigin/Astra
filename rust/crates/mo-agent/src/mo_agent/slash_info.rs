@@ -216,6 +216,34 @@ fn review_search(executor: &edge_tools::ToolExecutor, pattern: &str) -> String {
     }
 }
 
+fn build_review_prompt(arg: &str) -> String {
+    let target = match arg.trim() {
+        "" | "latest" => "HEAD",
+        "working" => "WORKING_TREE",
+        other => other,
+    };
+    format!(
+        "You are an expert code reviewer working in the current local git repository.\n\
+\n\
+Review target: {target}\n\
+\n\
+Follow this process:\n\
+1. Identify the review target.\n\
+   - If target is `HEAD`, inspect the latest commit with `git_log` and `git_show`.\n\
+   - If target is `WORKING_TREE`, inspect uncommitted changes with `git_status` and `git_diff`.\n\
+   - Otherwise inspect the specified revision with `git_show`.\n\
+2. Read only the files needed to verify important findings.\n\
+3. Produce a concise review focused on correctness, regressions, missing tests, and risky assumptions.\n\
+4. Do not invent issues. If nothing material is wrong, say LGTM and mention any residual risk.\n\
+\n\
+Output format:\n\
+- Summary\n\
+- Findings\n\
+- Verification notes\n\
+- Verdict\n"
+    )
+}
+
 pub(super) async fn handle_info_command(
     cmd: &str,
     arg: &str,
@@ -333,6 +361,49 @@ pub(super) async fn handle_info_command(
                 eprintln!("  {line}");
             }
             eprintln!();
+        }
+
+        "/review" => {
+            let Some(tok) = token else {
+                eprintln!("{}", "  Not logged in. Use /login.".yellow());
+                return Ok(());
+            };
+            let prompt = build_review_prompt(arg);
+            let selector = crate::repl_runtime::create_tool_selector(api, None);
+            let mut pm = PermissionManager::with_project(
+                false,
+                &std::env::current_dir().unwrap_or_default(),
+            );
+            let sr = stream_chat_sse(ChatTurnParams {
+                api,
+                token: tok,
+                message: &prompt,
+                session_id: state.session_id.as_deref(),
+                model: state.model.as_deref(),
+                explain: state.explain,
+                render_md: terminal::size().is_ok(),
+                history: &state.history,
+                perm_manager: &mut pm,
+                verbose_mode: state.verbose_mode,
+                quiet: false,
+                selector: &*selector.0,
+                recent_tools: &state.recent_tools,
+                tool_health_entries: &state.tool_health_entries,
+                skill_registry: crate::skill_instructions::empty_registry(),
+                plan_only_chat: false,
+            })
+            .await?;
+            if let Some(session_id) = sr.session_id {
+                state.session_id = Some(session_id);
+            }
+            state.last_response = Some(sr.full_text.clone());
+            state
+                .history
+                .push((format!("/review {arg}").trim().to_string(), sr.full_text));
+            state.turn += 1;
+            state.total_prompt_tokens += sr.prompt_tokens;
+            state.total_completion_tokens += sr.completion_tokens;
+            state.recent_tools = sr.tools_used;
         }
 
         "/copy" => match &state.last_response {
@@ -1088,5 +1159,21 @@ mod tests {
         assert!(formatted.contains("Scope: 2 changed files"));
         assert!(formatted.contains("No matches found in changed files"));
         assert!(formatted.contains("Tip: use /search <pattern>"));
+    }
+
+    #[test]
+    fn build_review_prompt_defaults_to_head() {
+        let prompt = build_review_prompt("");
+        assert!(prompt.contains("Review target: HEAD"));
+        assert!(prompt.contains("git_log"));
+        assert!(prompt.contains("git_show"));
+    }
+
+    #[test]
+    fn build_review_prompt_supports_working_tree() {
+        let prompt = build_review_prompt("working");
+        assert!(prompt.contains("Review target: WORKING_TREE"));
+        assert!(prompt.contains("git_status"));
+        assert!(prompt.contains("git_diff"));
     }
 }

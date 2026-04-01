@@ -1346,7 +1346,7 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
                             );
                             let memoria_client = crate::turn::cloud::memoria_compact::HttpMemoriaClient::from_env();
                             let memoria_config = crate::turn::cloud::memoria_compact::MemoriaCompactConfig::default();
-                            
+
                             // Get original messages (exclude system message at index 0)
                             let original_msgs: Vec<Value> = llm_messages.iter().skip(1).cloned().collect();
                             let compact_result = crate::turn::cloud::memoria_compact::compact_with_memoria(
@@ -1359,7 +1359,7 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
                                 Some(&summary_client as &dyn crate::turn::cloud::summary::SummaryLlmClient),
                             )
                             .await;
-                            
+
                             // Rebuild llm_messages with compacted content
                             let system_msg = llm_messages.first().cloned();
                             llm_messages.clear();
@@ -1367,11 +1367,11 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
                                 llm_messages.push(sys);
                             }
                             llm_messages.extend(compact_result.messages);
-                            
+
                             // Also prune tool schemas more aggressively
                             pruned_tools = prune_tool_schemas(&edge_tools, crate::prompts::CompactionTier::AggressivePrune);
                             annotate_tool_schemas_for_caching(&mut pruned_tools, &provider, &model_name);
-                            
+
                             // Retry LLM call
                             match call_llm_stream(
                                 &llm_messages,

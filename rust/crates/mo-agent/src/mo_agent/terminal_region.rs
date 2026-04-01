@@ -75,7 +75,11 @@ impl TerminalRegion {
         // Rewrite from first_diff to end of new content.
         for line in &new_lines[first_diff..] {
             // Clear the line first (in case new line is shorter than old).
-            execute!(io::stdout(), terminal::Clear(terminal::ClearType::CurrentLine)).ok();
+            execute!(
+                io::stdout(),
+                terminal::Clear(terminal::ClearType::CurrentLine)
+            )
+            .ok();
             println!("{line}");
         }
 
@@ -124,17 +128,6 @@ impl TerminalRegion {
             let _ = io::stdout().flush();
             self.lines.clear();
         }
-    }
-
-    /// Take ownership of lines (for transformation) without clearing the terminal.
-    pub(super) fn take_lines(&mut self) -> Vec<String> {
-        std::mem::take(&mut self.lines)
-    }
-
-    /// Detach: forget tracked lines without clearing the terminal.
-    /// The content stays on screen but the region stops managing it.
-    pub(super) fn detach(&mut self) {
-        self.lines.clear();
     }
 
     /// Remove the last `n` lines from the region.

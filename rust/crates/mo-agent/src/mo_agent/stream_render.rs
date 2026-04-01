@@ -98,10 +98,10 @@ impl SseStreamHost for CliSseStreamHost<'_> {
         tool: &str,
         args: &serde_json::Value,
     ) -> EdgeToolExecResult {
-        // Tool request means this is an intermediate turn — freeze any
-        // draft text as dim output (claudecode-style) and reset for next turn.
+        // Tool request means the current text is only an intermediate draft.
+        // Drop it so the terminal shows the final answer once, not every draft.
         if let Some(md) = &mut self.render.md {
-            md.freeze_and_reset();
+            md.discard_and_reset();
         }
         // Show tool as running (in-place updatable via TerminalRegion).
         let tool_idx = if !self.quiet {
@@ -505,14 +505,11 @@ pub(super) async fn consume_turn_sse(
     }
 
     // ─── Finalize incremental markdown ───────────────────────────────────
-    // When markdown rendering is active, the text was already rendered
-    // incrementally during streaming.  Just finalize the last unstable block.
-    // When tool_calls are pending (intermediate turn), clear the streamed
-    // text so it doesn't leak — the final answer will be rendered later.
+    // When markdown rendering is active, text was already rendered during
+    // streaming. Intermediate drafts are discarded when tool execution starts,
+    // so only finalize turns that truly completed without more tool work.
     if let Some(md) = &mut md_renderer {
-        if result.has_tool_calls {
-            md.freeze_and_reset();
-        } else {
+        if !result.has_tool_calls {
             md.finish();
         }
     } else if result.has_tool_calls && lines_written > 0 {
@@ -705,5 +702,4 @@ mod tests {
         s.track_eprintln(); // ⚡ tool_request: bash
         assert_eq!(s.lines_written, 3);
     }
-
 }

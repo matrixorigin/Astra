@@ -374,8 +374,8 @@ pub(crate) fn print_markdown_width(text: &str, width: Option<usize>) {
     let w = width.unwrap_or_else(terminal_width_usize).max(20);
     let mut skin = termimad::MadSkin::default();
     // Use crossterm colors so they match our existing palette
-    use termimad::crossterm::style::Color;
     use termimad::FmtText;
+    use termimad::crossterm::style::Color;
     skin.bold.set_fg(Color::Cyan);
     skin.italic.set_fg(Color::Yellow);
     skin.inline_code.set_fg(Color::Green);

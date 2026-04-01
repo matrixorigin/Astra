@@ -107,10 +107,7 @@ mod tests {
     fn empty_assistant_is_filtered_out() {
         // Interrupted turn: user sent message but assistant response is empty.
         // Must not produce {"role":"assistant","content":""} — LLM API rejects it.
-        let m = openai_messages_from_repl_history(
-            &[("question".into(), String::new())],
-            "retry",
-        );
+        let m = openai_messages_from_repl_history(&[("question".into(), String::new())], "retry");
         assert_eq!(m.len(), 2);
         assert_eq!(m[0]["role"], "user");
         assert_eq!(m[0]["content"], "question");
@@ -120,10 +117,7 @@ mod tests {
 
     #[test]
     fn both_empty_pair_is_skipped() {
-        let m = openai_messages_from_repl_history(
-            &[(String::new(), String::new())],
-            "hi",
-        );
+        let m = openai_messages_from_repl_history(&[(String::new(), String::new())], "hi");
         assert_eq!(m.len(), 1);
         assert_eq!(m[0]["content"], "hi");
     }

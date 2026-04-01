@@ -4,9 +4,7 @@ use std::collections::{BTreeSet, HashSet};
 
 use serde_json::Value;
 
-use super::stall::{
-    SERVER_STALL_WINDOW, detect_cli_tool_name_stall, round_tool_call_sig_and_names,
-};
+use super::stall::{detect_cli_tool_name_stall, round_tool_call_sig_and_names};
 use super::turn_guard::TurnGuard;
 
 #[derive(Debug)]
@@ -35,7 +33,7 @@ pub fn apply_cli_agentic_stall_preflight(ctx: CliAgenticStallPreflightRequest<'_
 
     turn_guard.record_tool_calls(tool_calls_for_guard);
 
-    if detect_cli_tool_name_stall(turn_tool_names, SERVER_STALL_WINDOW) {
+    if detect_cli_tool_name_stall(turn_tool_names, turn_guard.stall_window()) {
         stall_events.push(("name_stall".to_string(), turn_index));
     }
 }

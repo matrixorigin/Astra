@@ -9,6 +9,117 @@ use serde_json::Value;
 
 use super::chat_history_openai::openai_user_content_message;
 
+const DEFAULT_STALL_WINDOW: usize = 3;
+const DEFAULT_EXPLORATION_ROUND_BUDGET: usize = 5;
+const ANALYSIS_STALL_WINDOW: usize = 4;
+const ANALYSIS_EXPLORATION_ROUND_BUDGET: usize = 8;
+
+const MUTATING_TERMS: &[&str] = &[
+    "fix",
+    "修",
+    "修改代码",
+    "implement",
+    "write",
+    "edit",
+    "change code",
+    "change the code",
+    "update code",
+    "create",
+    "add ",
+    "remove",
+    "delete",
+    "patch",
+    "refactor",
+    "apply",
+    "rename",
+    "重构",
+    "实现",
+    "新增",
+    "删除",
+    "更新",
+    "修复",
+];
+
+const ANALYSIS_TERMS: &[&str] = &[
+    "review",
+    "code review",
+    "commit review",
+    "审查",
+    "看一眼",
+    "what changed",
+    "changed",
+    "what's in the commit",
+    "summarize",
+    "summary",
+    "explain",
+    "inspect",
+    "analyze",
+    "search",
+    "status",
+    "diff",
+    "show",
+    "read",
+    "list",
+    "latest commit",
+    "看看",
+    "解释",
+    "分析",
+    "总结",
+    "搜索",
+    "列出",
+];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TaskExecutionProfile {
+    pub mutates_workspace: bool,
+    pub verification_required: bool,
+    pub allow_factual_retry: bool,
+    pub exploration_round_budget: usize,
+    pub stall_window: usize,
+}
+
+impl Default for TaskExecutionProfile {
+    fn default() -> Self {
+        Self {
+            mutates_workspace: false,
+            verification_required: false,
+            allow_factual_retry: true,
+            exploration_round_budget: DEFAULT_EXPLORATION_ROUND_BUDGET,
+            stall_window: DEFAULT_STALL_WINDOW,
+        }
+    }
+}
+
+fn contains_any_keyword(q: &str, keywords: &[&str]) -> bool {
+    keywords.iter().any(|kw| q.contains(kw))
+}
+
+#[must_use]
+pub fn infer_task_execution_profile(input: &str) -> TaskExecutionProfile {
+    let q = input.to_lowercase();
+    let has_mutating = contains_any_keyword(&q, MUTATING_TERMS);
+    let has_analysis = contains_any_keyword(&q, ANALYSIS_TERMS);
+    if has_mutating {
+        TaskExecutionProfile {
+            mutates_workspace: true,
+            verification_required: true,
+            allow_factual_retry: true,
+            exploration_round_budget: DEFAULT_EXPLORATION_ROUND_BUDGET,
+            stall_window: DEFAULT_STALL_WINDOW,
+        }
+    } else if has_analysis {
+        TaskExecutionProfile {
+            mutates_workspace: false,
+            verification_required: false,
+            allow_factual_retry: false,
+            exploration_round_budget: ANALYSIS_EXPLORATION_ROUND_BUDGET,
+            stall_window: ANALYSIS_STALL_WINDOW,
+        }
+    } else {
+        TaskExecutionProfile::default()
+    }
+}
+
 /// Cloud API returned no such session (case-insensitive substring match).
 pub fn is_session_not_found_error(error: &str) -> bool {
     error.to_lowercase().contains("session not found")
@@ -67,6 +178,19 @@ pub fn looks_like_factual_query(input: &str) -> bool {
     has_github || has_memory || has_git_live || has_code || has_web
 }
 
+/// Detect requests that are likely to mutate the workspace and therefore
+/// benefit from verification stop hooks before the agent completes.
+///
+/// The default should be conservative in the user's favor: read-only tasks
+/// (review, explain, search, summarize, inspect) should not be forced through
+/// an extra verification round, while implementation/editing tasks should.
+pub fn looks_like_mutating_task(input: &str) -> bool {
+    let q = input.to_lowercase();
+    let has_mutating = contains_any_keyword(&q, MUTATING_TERMS);
+    let has_read_only = contains_any_keyword(&q, ANALYSIS_TERMS);
+    has_mutating || !has_read_only
+}
+
 fn recent_tools_imply_live_domain(recent_tools: &[String]) -> bool {
     recent_tools.iter().any(|tool| {
         tool.starts_with("github_")
@@ -106,12 +230,14 @@ pub fn looks_like_live_query_with_context(input: &str, recent_tools: &[String]) 
 }
 
 pub fn should_force_factual_tool_retry(
+    profile: TaskExecutionProfile,
     input: &str,
     recent_tools: &[String],
     total_tool_calls: u32,
     already_retried: bool,
 ) -> bool {
-    !already_retried
+    profile.allow_factual_retry
+        && !already_retried
         && total_tool_calls == 0
         && looks_like_live_query_with_context(input, recent_tools)
 }
@@ -223,6 +349,42 @@ mod tests {
     }
 
     #[test]
+    fn mutating_task_detection_distinguishes_read_only_flows() {
+        assert!(!looks_like_mutating_task("review 最新的commit"));
+        assert!(!looks_like_mutating_task(
+            "what changed in the latest commit?"
+        ));
+        assert!(!looks_like_mutating_task("explain this diff"));
+        assert!(looks_like_mutating_task(
+            "review the latest commit and fix any issues"
+        ));
+        assert!(looks_like_mutating_task("implement the feature"));
+    }
+
+    #[test]
+    fn task_execution_profile_relaxes_analysis_loops() {
+        let profile = infer_task_execution_profile("review 最新的commit");
+        assert!(!profile.mutates_workspace);
+        assert!(!profile.verification_required);
+        assert!(!profile.allow_factual_retry);
+        assert_eq!(profile.stall_window, ANALYSIS_STALL_WINDOW);
+        assert_eq!(
+            profile.exploration_round_budget,
+            ANALYSIS_EXPLORATION_ROUND_BUDGET
+        );
+
+        let profile = infer_task_execution_profile("implement the feature");
+        assert!(profile.mutates_workspace);
+        assert!(profile.verification_required);
+        assert!(profile.allow_factual_retry);
+        assert_eq!(profile.stall_window, DEFAULT_STALL_WINDOW);
+        assert_eq!(
+            profile.exploration_round_budget,
+            DEFAULT_EXPLORATION_ROUND_BUDGET
+        );
+    }
+
+    #[test]
     fn factual_query_rejects_general_questions() {
         assert!(!looks_like_factual_query("what is Rust?"));
         assert!(!looks_like_factual_query("explain monads"));
@@ -234,24 +396,40 @@ mod tests {
     fn force_retry_only_for_first_zero_tool_factual_answer() {
         let none: Vec<String> = vec![];
         assert!(should_force_factual_tool_retry(
+            TaskExecutionProfile::default(),
             "最新的一个ci?",
             &none,
             0,
             false
         ));
         assert!(!should_force_factual_tool_retry(
+            TaskExecutionProfile::default(),
             "最新的一个ci?",
             &none,
             1,
             false
         ));
         assert!(!should_force_factual_tool_retry(
+            TaskExecutionProfile::default(),
             "最新的一个ci?",
             &none,
             0,
             true
         ));
-        assert!(!should_force_factual_tool_retry("hello", &none, 0, false));
+        assert!(!should_force_factual_tool_retry(
+            infer_task_execution_profile("review 最新的commit"),
+            "最新的一个ci?",
+            &none,
+            0,
+            false
+        ));
+        assert!(!should_force_factual_tool_retry(
+            TaskExecutionProfile::default(),
+            "hello",
+            &none,
+            0,
+            false
+        ));
     }
 
     #[test]

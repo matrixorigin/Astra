@@ -25,9 +25,7 @@ pub fn emit_headless_tool_body_preview(
         "git_diff" => emit_plain_diffish_preview(term, result_str),
         "multi_edit" => {
             emit_str_replace_or_dry_run_diff_preview(term, result_str);
-            if !result_str.contains(STR_REPLACE_DIFF_START)
-                && !result_str.contains("--- a/")
-            {
+            if !result_str.contains(STR_REPLACE_DIFF_START) && !result_str.contains("--- a/") {
                 emit_plain_diffish_preview(term, result_str);
             }
         }

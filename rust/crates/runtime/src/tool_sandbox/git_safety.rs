@@ -165,7 +165,9 @@ fn check_force_push(lower: &str, violations: &mut Vec<GitSafetyViolation>) {
     let words: Vec<&str> = lower.split_whitespace().collect();
 
     // Detect force push flags precisely: --force, --force-with-lease, or bare -f
-    let is_force = words.iter().any(|&w| w == "--force" || w == "--force-with-lease" || w == "-f");
+    let is_force = words
+        .iter()
+        .any(|&w| w == "--force" || w == "--force-with-lease" || w == "-f");
     if !is_force {
         return;
     }
@@ -177,20 +179,20 @@ fn check_force_push(lower: &str, violations: &mut Vec<GitSafetyViolation>) {
     let protected_branches = ["main", "master", "develop", "production", "staging"];
 
     for (i, word) in words.iter().enumerate() {
-        if *word == "origin" || *word == "push" {
-            if let Some(next) = words.get(i + 1) {
-                if next.starts_with('-') {
-                    continue;
-                }
-                // Extract the final path component (e.g. "main" from "origin/main")
-                let branch_leaf = next.rsplit('/').next().unwrap_or(next);
-                for protected in &protected_branches {
-                    if branch_leaf == *protected {
-                        violations.push(GitSafetyViolation::ForcePushProtectedBranch {
-                            branch: next.to_string(),
-                        });
-                        return;
-                    }
+        if (*word == "origin" || *word == "push")
+            && let Some(next) = words.get(i + 1)
+        {
+            if next.starts_with('-') {
+                continue;
+            }
+            // Extract the final path component (e.g. "main" from "origin/main")
+            let branch_leaf = next.rsplit('/').next().unwrap_or(next);
+            for protected in &protected_branches {
+                if branch_leaf == *protected {
+                    violations.push(GitSafetyViolation::ForcePushProtectedBranch {
+                        branch: next.to_string(),
+                    });
+                    return;
                 }
             }
         }
@@ -348,9 +350,10 @@ mod tests {
 
         // Feature branch should not trigger protected branch violation
         let v = validate_git_command("git push --force origin feature/my-feature");
-        assert!(!v
-            .iter()
-            .any(|v| matches!(v, GitSafetyViolation::ForcePushProtectedBranch { .. })));
+        assert!(
+            !v.iter()
+                .any(|v| matches!(v, GitSafetyViolation::ForcePushProtectedBranch { .. }))
+        );
     }
 
     // --- cd + git compound ---
@@ -401,7 +404,6 @@ mod tests {
         );
     }
 
-
     // --- Regression: protected branch false positives ---
 
     #[test]
@@ -409,27 +411,30 @@ mod tests {
         // "feature/main-refactor" contains "main" but is NOT a protected branch
         let v = validate_git_command("git push --force origin feature/main-refactor");
         assert!(v.iter().any(|v| matches!(v, GitSafetyViolation::ForcePush)));
-        assert!(!v
-            .iter()
-            .any(|v| matches!(v, GitSafetyViolation::ForcePushProtectedBranch { .. })));
+        assert!(
+            !v.iter()
+                .any(|v| matches!(v, GitSafetyViolation::ForcePushProtectedBranch { .. }))
+        );
     }
 
     #[test]
     fn no_false_positive_branch_containing_develop() {
         let v = validate_git_command("git push -f origin feature/develop-ui");
         assert!(v.iter().any(|v| matches!(v, GitSafetyViolation::ForcePush)));
-        assert!(!v
-            .iter()
-            .any(|v| matches!(v, GitSafetyViolation::ForcePushProtectedBranch { .. })));
+        assert!(
+            !v.iter()
+                .any(|v| matches!(v, GitSafetyViolation::ForcePushProtectedBranch { .. }))
+        );
     }
 
     #[test]
     fn detects_protected_branch_with_remote_prefix() {
         // "origin/main" — leaf is "main", should still be caught
         let v = validate_git_command("git push --force origin origin/main");
-        assert!(v
-            .iter()
-            .any(|v| matches!(v, GitSafetyViolation::ForcePushProtectedBranch { .. })));
+        assert!(
+            v.iter()
+                .any(|v| matches!(v, GitSafetyViolation::ForcePushProtectedBranch { .. }))
+        );
     }
 
     // --- Regression: -f flag false positives ---

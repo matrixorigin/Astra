@@ -8496,7 +8496,10 @@ mod turnguard_e2e_proofs {
 
         // Second consecutive Critical → force_stop
         let verdict2 = guard.evaluate();
-        assert!(verdict2.force_stop, "second consecutive Critical SHOULD force_stop");
+        assert!(
+            verdict2.force_stop,
+            "second consecutive Critical SHOULD force_stop"
+        );
     }
 
     // ── Scenario P: Healthy session produces minimal verdict ─────────────────

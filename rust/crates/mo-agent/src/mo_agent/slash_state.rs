@@ -77,10 +77,7 @@ pub(super) async fn handle_state_command(
             };
             eprintln!("  Explain mode: {}", s);
             if matches!(state.explain, ExplainMode::On) {
-                eprintln!(
-                    "{}",
-                    "  (verbose: selector + skill lines on stderr)".dim()
-                );
+                eprintln!("{}", "  (verbose: selector + skill lines on stderr)".dim());
             }
             if let Some(ref j) = state.journal {
                 let explain_val = match state.explain {

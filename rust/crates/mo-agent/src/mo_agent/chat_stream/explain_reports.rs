@@ -22,9 +22,7 @@ fn scrub_explain_content_preview(raw: &str, max_chars: usize) -> Option<String> 
         .lines()
         .filter(|l| {
             let s = l.trim_start();
-            s.chars()
-                .next()
-                .is_some_and(|c| c.is_ascii_digit())
+            s.chars().next().is_some_and(|c| c.is_ascii_digit())
         })
         .count();
     if digit_prefix_lines >= 4 {

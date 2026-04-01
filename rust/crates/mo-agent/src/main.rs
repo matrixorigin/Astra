@@ -49,6 +49,8 @@ mod chat_stream;
 mod cli_utils;
 #[path = "mo_agent/command_router.rs"]
 mod command_router;
+#[path = "mo_agent/diff_presenter.rs"]
+mod diff_presenter;
 #[path = "mo_agent/edge_lifecycle.rs"]
 mod edge_lifecycle;
 #[path = "mo_agent/permission_manager.rs"]
@@ -61,6 +63,8 @@ mod repl_turn;
 mod repl_ui;
 #[path = "mo_agent/slash_account.rs"]
 mod slash_account;
+#[path = "mo_agent/slash_debug.rs"]
+mod slash_debug;
 #[path = "mo_agent/slash_info.rs"]
 mod slash_info;
 #[path = "mo_agent/slash_memory.rs"]
@@ -71,23 +75,19 @@ mod slash_session;
 mod slash_skill;
 #[path = "mo_agent/slash_state.rs"]
 mod slash_state;
-#[path = "mo_agent/slash_debug.rs"]
-mod slash_debug;
 #[path = "mo_agent/stream_render.rs"]
 mod stream_render;
 #[path = "mo_agent/streaming_md.rs"]
 mod streaming_md;
 #[path = "mo_agent/terminal_region.rs"]
 mod terminal_region;
-#[path = "mo_agent/diff_presenter.rs"]
-mod diff_presenter;
 
 use auth_flow::{clear_profile_last_session, do_login, do_register};
 use chat_stream::{ChatTurnParams, stream_chat_sse};
 use cli_utils::{
     Profile, compact_or_raw, get_profile_and_token, interactive_select, load_credentials,
-    map_thin_err, print_json_or_raw, profile_name, prompt_or,
-    prompt_password_masked, resumable_last_session_id, save_credentials, truncate_str, urlencoding,
+    map_thin_err, print_json_or_raw, profile_name, prompt_or, prompt_password_masked,
+    resumable_last_session_id, save_credentials, truncate_str, urlencoding,
 };
 use command_router::{ExitCode, execute_cli_command};
 use edge_lifecycle::register_and_start_heartbeat;
@@ -110,6 +110,7 @@ use repl_ui::{
     suggest_commands, take_slash_pending_execute,
 };
 use slash_account::handle_account_command;
+use slash_debug::handle_debug_command;
 use slash_info::handle_info_command;
 use slash_memory::{handle_memory_domain_command, handle_plan_mode_input};
 use slash_session::handle_session_command;
@@ -117,7 +118,6 @@ use slash_session::handle_session_command;
 use slash_session::resolve_journal_target_session;
 use slash_skill::handle_skill_command;
 use slash_state::{StateCommandContext, handle_state_command};
-use slash_debug::handle_debug_command;
 
 // ══════════════════════════════════════════════════════════════════════ CLI ══
 
@@ -649,14 +649,18 @@ async fn handle_resume_command(arg: &str, profile: Option<&str>, state: &mut Rep
             let ws = mo_agent_services::session_workspace::read_workspace(&s.session_id).ok();
 
             // Title: cloud title > workspace summary > first prompt preview
-            let title = s.title.clone()
+            let title = s
+                .title
+                .clone()
                 .or_else(|| ws.as_ref().and_then(|w| w.summary.clone()))
                 .or_else(|| peek.as_ref().and_then(|p| p.first_prompt.clone()));
 
             let first_prompt = peek.as_ref().and_then(|p| p.first_prompt.clone());
 
             // Model: cloud > workspace > journal peek
-            let model = s.model.clone()
+            let model = s
+                .model
+                .clone()
                 .or_else(|| ws.as_ref().map(|w| w.model.clone()))
                 .or_else(|| peek.as_ref().and_then(|p| p.model.clone()));
 
@@ -666,34 +670,55 @@ async fn handle_resume_command(arg: &str, profile: Option<&str>, state: &mut Rep
                 if parts.len() <= 2 {
                     w.cwd.clone()
                 } else {
-                    format!("…/{}", parts[parts.len()-2..].join("/"))
+                    format!("…/{}", parts[parts.len() - 2..].join("/"))
                 }
             });
 
-            let git_branch = s.git_branch.clone()
+            let git_branch = s
+                .git_branch
+                .clone()
                 .or_else(|| ws.as_ref().and_then(|w| w.git_branch.clone()));
 
-            let source = if s.restored_from_cloud { "☁".to_string() }
-                else if s.last_status == "local" { "⊙".to_string() }
-                else { s.last_status.clone() };
+            let source = if s.restored_from_cloud {
+                "☁".to_string()
+            } else if s.last_status == "local" {
+                "⊙".to_string()
+            } else {
+                s.last_status.clone()
+            };
 
-            let has_plan = ws.as_ref().map_or(false, |w| w.executing_plan_json.is_some());
+            let has_plan = ws.as_ref().is_some_and(|w| w.executing_plan_json.is_some());
 
             // Age: from workspace or journal timestamp
-            let age = ws.as_ref().map(|w| &w.updated_at)
+            let age = ws
+                .as_ref()
+                .map(|w| &w.updated_at)
                 .or_else(|| peek.as_ref().and_then(|p| p.created_at.as_ref()))
                 .and_then(|ts| chrono::DateTime::parse_from_rfc3339(ts).ok())
                 .map(|dt| {
                     let dur = chrono::Utc::now().signed_duration_since(dt);
-                    if dur.num_minutes() < 60 { format!("{}m ago", dur.num_minutes()) }
-                    else if dur.num_hours() < 24 { format!("{}h ago", dur.num_hours()) }
-                    else { format!("{}d ago", dur.num_days()) }
+                    if dur.num_minutes() < 60 {
+                        format!("{}m ago", dur.num_minutes())
+                    } else if dur.num_hours() < 24 {
+                        format!("{}h ago", dur.num_hours())
+                    } else {
+                        format!("{}d ago", dur.num_days())
+                    }
                 })
                 .unwrap_or_default();
 
             items.push(SessionDisplay {
-                idx: i + 1, session_id: s.session_id.clone(), title, first_prompt,
-                turn_count: s.turn_count, model, cwd_short, git_branch, source, has_plan, age,
+                idx: i + 1,
+                session_id: s.session_id.clone(),
+                title,
+                first_prompt,
+                turn_count: s.turn_count,
+                model,
+                cwd_short,
+                git_branch,
+                source,
+                has_plan,
+                age,
             });
         }
 
@@ -703,7 +728,9 @@ async fn handle_resume_command(arg: &str, profile: Option<&str>, state: &mut Rep
         );
         for s in &items {
             // Line 1: [N]  title or first prompt  (age)
-            let display_text = s.title.as_deref()
+            let display_text = s
+                .title
+                .as_deref()
                 .or(s.first_prompt.as_deref())
                 .unwrap_or("(no prompt)");
             let display_truncated: String = display_text.chars().take(60).collect();
@@ -718,7 +745,11 @@ async fn handle_resume_command(arg: &str, profile: Option<&str>, state: &mut Rep
             // Line 2: context details
             let short_id = &s.session_id[..8.min(s.session_id.len())];
             let model_str = s.model.as_deref().unwrap_or("?");
-            let branch_str = s.git_branch.as_deref().map(|b| format!(" {b}")).unwrap_or_default();
+            let branch_str = s
+                .git_branch
+                .as_deref()
+                .map(|b| format!(" {b}"))
+                .unwrap_or_default();
             let cwd_str = s.cwd_short.as_deref().unwrap_or("");
             eprintln!(
                 "      {} {} {} turns · {}{} {}",
@@ -2791,8 +2822,8 @@ async fn handle_slash_command(
 
         "/debug" => handle_debug_command(arg, state),
 
-        "/history" | "/search" | "/copy" | "/doctor" | "/context" | "/version" | "/rewind"
-        | "/turn" => {
+        "/history" | "/search" | "/review" | "/copy" | "/doctor" | "/context" | "/version"
+        | "/rewind" | "/turn" => {
             handle_info_command(cmd, arg, api, state, token).await?;
         }
 
@@ -3562,6 +3593,12 @@ mod tests {
     }
 
     #[test]
+    fn resolve_review_command() {
+        let resolved = resolve_slash_command("/review").expect("/review should resolve");
+        assert_eq!(resolved, "/review");
+    }
+
+    #[test]
     fn resolve_journal_target_session_uses_active_session_without_argument() {
         let state = ReplState {
             session_id: Some("sess-123".to_string()),
@@ -4039,10 +4076,12 @@ mod tests {
             ))
             .unwrap();
 
-        let mut state = ReplState::default();
-        state.session_id = Some(sid.clone());
-        state.turn = 3;
-        state.journal = Some(session_journal::JournalWriter::new(&sid).unwrap());
+        let mut state = ReplState {
+            session_id: Some(sid.clone()),
+            turn: 3,
+            journal: Some(session_journal::JournalWriter::new(&sid).unwrap()),
+            ..ReplState::default()
+        };
 
         let exit = handle_slash_command("/exit", &api, None, &mut state, None, &selector)
             .await
@@ -4076,10 +4115,12 @@ mod tests {
             ))
             .unwrap();
 
-        let mut state = ReplState::default();
-        state.session_id = Some(sid.clone());
-        state.turn = 1;
-        state.journal = Some(session_journal::JournalWriter::new(&sid).unwrap());
+        let mut state = ReplState {
+            session_id: Some(sid.clone()),
+            turn: 1,
+            journal: Some(session_journal::JournalWriter::new(&sid).unwrap()),
+            ..ReplState::default()
+        };
 
         let exit = handle_slash_command("/quit", &api, None, &mut state, None, &selector)
             .await

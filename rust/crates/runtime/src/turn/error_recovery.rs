@@ -292,6 +292,16 @@ pub fn build_recovery_message(
         msg.push_str(&format!(" Alternatives: [{}].", alternatives.join(", ")));
     }
 
+    let error_lower = error_str.to_lowercase();
+    if tool_name == "read_file" && error_lower.contains("file is too large") {
+        msg.push_str(
+            " For large files, do NOT switch to bash. Retry read_file with \
+             start_line/end_line for a narrow range, or outline=true to inspect definitions first.",
+        );
+    } else if tool_name == "read_file" && error_lower.contains("is a directory") {
+        msg.push_str(" Use list_dir for directories instead of retrying read_file.");
+    }
+
     msg
 }
 
@@ -631,6 +641,19 @@ mod tests {
             build_recovery_message("mo_query", "not installed", ErrorCategory::Unavailable, &[]);
         assert!(msg.contains("not available"));
         assert!(msg.contains("alternative"));
+    }
+
+    #[test]
+    fn recovery_message_guides_large_read_file_back_to_read_file() {
+        let msg = build_recovery_message(
+            "read_file",
+            "Error: file is too large (97716 bytes, ~2442 lines). Use start_line/end_line to read a specific range, or outline=true to see definitions only.",
+            ErrorCategory::Unknown,
+            &[],
+        );
+        assert!(msg.contains("do NOT switch to bash"));
+        assert!(msg.contains("start_line/end_line"));
+        assert!(msg.contains("outline=true"));
     }
 
     // ── Escalation ──

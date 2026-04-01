@@ -1332,7 +1332,10 @@ pub(super) async fn handle_memory_domain_command(
                                     eprint_plan_json_parse_failed(&full_text, &e.to_string());
                                     eprintln!(
                                         "  {}",
-                                        format!("Try '/plan enter {sub_arg}' for interactive mode.").dim()
+                                        format!(
+                                            "Try '/plan enter {sub_arg}' for interactive mode."
+                                        )
+                                        .dim()
                                     );
                                 }
                             }

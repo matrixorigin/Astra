@@ -196,20 +196,24 @@ impl ToolExecutor {
         // Large files without a line range should use outline or start_line/end_line.
         // Inspired by Claude Code's maxSizeBytes (256KB) pre-read check.
         let has_range = args.get("start_line").is_some() || args.get("end_line").is_some();
-        let has_outline = args.get("outline").and_then(Value::as_bool).unwrap_or(false);
-        if !has_range && !has_outline {
-            if let Ok(meta) = fs::metadata(&path) {
-                let size = meta.len() as usize;
-                let limit = self.scaled_output_limit();
-                if size > limit {
-                    let total_lines = size / 40; // rough estimate
-                    return format!(
-                        "Error: file is too large ({} bytes, ~{} lines). \
-                         Use start_line/end_line to read a specific range, \
-                         or outline=true to see definitions only.",
-                        size, total_lines
-                    );
-                }
+        let has_outline = args
+            .get("outline")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if !has_range
+            && !has_outline
+            && let Ok(meta) = fs::metadata(&path)
+        {
+            let size = meta.len() as usize;
+            let limit = self.scaled_output_limit();
+            if size > limit {
+                let total_lines = size / 40; // rough estimate
+                return format!(
+                    "Error: file is too large ({} bytes, ~{} lines). \
+                     Use start_line/end_line to read a specific range, \
+                     or outline=true to see definitions only.",
+                    size, total_lines
+                );
             }
         }
 
@@ -532,7 +536,12 @@ impl ToolExecutor {
                             if let Some(fmt_note) = format_result {
                                 result.push_str(&format!("\n{fmt_note}"));
                             }
-                            append_str_replace_cli_unified_diff(&mut result, &content, &new_content, &path);
+                            append_str_replace_cli_unified_diff(
+                                &mut result,
+                                &content,
+                                &new_content,
+                                &path,
+                            );
                             return result;
                         }
                         Err(e) => return format!("Error writing file: {e}"),
@@ -1263,7 +1272,9 @@ fn unified_diff(old_content: &str, new_content: &str, path: &std::path::Path) ->
 }
 
 fn append_str_replace_cli_unified_diff(out: &mut String, before: &str, after: &str, path: &Path) {
-    use mo_agent_runtime::turn::tool_result_sanitize::{STR_REPLACE_DIFF_END, STR_REPLACE_DIFF_START};
+    use mo_agent_runtime::turn::tool_result_sanitize::{
+        STR_REPLACE_DIFF_END, STR_REPLACE_DIFF_START,
+    };
     out.push_str(STR_REPLACE_DIFF_START);
     out.push_str(&cap_cli_unified_diff(unified_diff_raw(before, after, path)));
     out.push_str(STR_REPLACE_DIFF_END);

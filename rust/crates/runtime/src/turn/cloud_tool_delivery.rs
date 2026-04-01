@@ -313,15 +313,18 @@ pub async fn deliver_tool_calls_concurrent(
         out.sse_maps.extend(sse_maps_through_tool_request(tc));
     }
     if !read_only.is_empty() {
-        let futs: Vec<_> = read_only
-            .iter()
-            .map(|tc| {
-                let ledger = ledger.clone();
-                let uid = user_id.to_owned();
-                let tc = (*tc).clone();
-                async move { wait_tool_result_ledger_for_tool(&ledger, &uid, &tc, ledger_wait).await }
-            })
-            .collect();
+        let futs: Vec<_> =
+            read_only
+                .iter()
+                .map(|tc| {
+                    let ledger = ledger.clone();
+                    let uid = user_id.to_owned();
+                    let tc = (*tc).clone();
+                    async move {
+                        wait_tool_result_ledger_for_tool(&ledger, &uid, &tc, ledger_wait).await
+                    }
+                })
+                .collect();
         for tail in futures_util::future::join_all(futs).await {
             out.tool_messages.extend(tail.tool_messages);
             out.persist_tool_results.extend(tail.persist_tool_results);
@@ -543,7 +546,9 @@ mod tests {
 
         // All 3 tool results present
         assert_eq!(d.tool_messages.len(), 3);
-        let contents: Vec<&str> = d.tool_messages.iter()
+        let contents: Vec<&str> = d
+            .tool_messages
+            .iter()
             .map(|m| m["content"].as_str().unwrap())
             .collect();
         assert!(contents.iter().any(|c| c.contains("wrote_b")));
@@ -551,7 +556,12 @@ mod tests {
         assert!(contents.iter().any(|c| c.contains("content_2")));
 
         // Write tool result comes first (sequential), reads come after (concurrent)
-        assert!(d.tool_messages[0]["content"].as_str().unwrap().contains("wrote_b"));
+        assert!(
+            d.tool_messages[0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("wrote_b")
+        );
     }
 
     #[tokio::test]
@@ -588,14 +598,32 @@ mod tests {
 
         assert_eq!(d.tool_messages.len(), 3);
         // Results are in original tool_call order (r1, r2, r3) regardless of arrival order
-        assert!(d.tool_messages[0]["content"].as_str().unwrap().contains("c1"));
-        assert!(d.tool_messages[1]["content"].as_str().unwrap().contains("c2"));
-        assert!(d.tool_messages[2]["content"].as_str().unwrap().contains("c3"));
+        assert!(
+            d.tool_messages[0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("c1")
+        );
+        assert!(
+            d.tool_messages[1]["content"]
+                .as_str()
+                .unwrap()
+                .contains("c2")
+        );
+        assert!(
+            d.tool_messages[2]["content"]
+                .as_str()
+                .unwrap()
+                .contains("c3")
+        );
 
         // If sequential, would take ~30ms (10+10+10). Concurrent should be ~30ms too
         // since they're staggered, but the key point is all 3 complete.
         // Just sanity-check it didn't take absurdly long.
-        assert!(elapsed < Duration::from_secs(1), "took too long: {elapsed:?}");
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "took too long: {elapsed:?}"
+        );
     }
 
     #[tokio::test]
@@ -630,7 +658,17 @@ mod tests {
 
         // 2 tool messages: denied write + successful read
         assert_eq!(d.tool_messages.len(), 2);
-        assert!(d.tool_messages[0]["content"].as_str().unwrap().contains("user_denied"));
-        assert!(d.tool_messages[1]["content"].as_str().unwrap().contains("read_ok"));
+        assert!(
+            d.tool_messages[0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("user_denied")
+        );
+        assert!(
+            d.tool_messages[1]["content"]
+                .as_str()
+                .unwrap()
+                .contains("read_ok")
+        );
     }
 }

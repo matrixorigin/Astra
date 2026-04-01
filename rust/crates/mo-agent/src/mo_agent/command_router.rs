@@ -546,7 +546,6 @@ pub(super) async fn execute_cli_command(
         }
 
         // ── Audit commands ──────────────────────────────────────────────────
-
         Some(Command::Audit(AuditCmd::List(args))) => {
             let (_, _, _, token) = get_profile_and_token(profile.as_deref())?;
             let mut q: Vec<(&str, String)> = vec![
@@ -620,12 +619,8 @@ pub(super) async fn execute_cli_command(
         Some(Command::Audit(AuditCmd::Tools(args))) => {
             let (_, _, _, token) = get_profile_and_token(profile.as_deref())?;
             let body = if let Some(ref sid) = args.session_id {
-                api.get_bearer_path_query_text(
-                    &token,
-                    &paths::session_audit_tools(sid),
-                    &[],
-                )
-                .await
+                api.get_bearer_path_query_text(&token, &paths::session_audit_tools(sid), &[])
+                    .await
             } else {
                 let mut q: Vec<(&str, String)> = Vec::new();
                 if let Some(ref s) = args.since {

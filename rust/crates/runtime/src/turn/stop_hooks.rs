@@ -73,8 +73,16 @@ mod tests {
     #[test]
     fn multiple_hooks_listed() {
         let hooks = vec![
-            StopHook { label: "check".into(), command: "cargo check".into(), working_dir: None },
-            StopHook { label: "lint".into(), command: "cargo clippy".into(), working_dir: None },
+            StopHook {
+                label: "check".into(),
+                command: "cargo check".into(),
+                working_dir: None,
+            },
+            StopHook {
+                label: "lint".into(),
+                command: "cargo clippy".into(),
+                working_dir: None,
+            },
         ];
         let msg = build_stop_hook_prompt(&hooks).unwrap();
         let content = msg["content"].as_str().unwrap();

@@ -15,6 +15,7 @@ use super::headless_tool_assembly::{
     openai_tool_roundtrip_values, resolve_headless_tool_slot, take_edge_output_for_tool_call,
     unknown_local_tool_error_message,
 };
+use super::headless_tool_body_preview::emit_headless_tool_body_preview;
 use super::headless_tool_journal::{
     journal_record_cross_turn_cache_hit, journal_record_duplicate_within_turn,
     journal_record_executed_tool_call, journal_record_unknown_tool,
@@ -26,7 +27,6 @@ use super::headless_tool_postprocess::{
     try_write_light_headless_step_checkpoint,
 };
 use super::headless_tool_status_display::{tool_call_detail, tool_result_summary};
-use super::headless_tool_body_preview::emit_headless_tool_body_preview;
 use super::headless_tool_stderr_lines::{
     headless_stderr_cache_hit_line, headless_stderr_error_preview_line,
     headless_stderr_resource_limit_blocked, headless_stderr_resource_limit_in_output,
@@ -34,8 +34,8 @@ use super::headless_tool_stderr_lines::{
     headless_stderr_tool_ok_footer_line, headless_stderr_tool_ok_header,
     headless_stderr_unknown_tool_detail, headless_stderr_unknown_tool_header,
 };
-use super::tool_result_sanitize::tool_result_content_for_model;
 use super::hydrate_reflect::hydrate_reflect_placeholder_if_needed;
+use super::tool_result_sanitize::tool_result_content_for_model;
 use super::tool_result_semantics::{is_tool_error, tool_dedup_signature};
 use super::turn_guard::TurnGuard;
 use crate::pipeline::step_protocol::{IdempotencyKey, InMemoryIdempotencyCache};

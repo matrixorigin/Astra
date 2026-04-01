@@ -71,14 +71,12 @@ impl TerminalDiffSink {
             return s.to_string();
         }
         let mut out = String::new();
-        let mut n = 0usize;
-        for ch in s.chars() {
+        for (n, ch) in s.chars().enumerate() {
             if n + 1 >= w {
                 out.push('…');
                 break;
             }
             out.push(ch);
-            n += 1;
         }
         out
     }
@@ -129,7 +127,11 @@ impl DiffSink for TerminalDiffSink {
         }
         let max_chars = self.width.saturating_sub(3);
         let _ = write!(io::stdout(), "{}", "│ ".dim());
-        let _ = writeln!(io::stdout(), "{}", self.clip_with(line, max_chars).magenta());
+        let _ = writeln!(
+            io::stdout(),
+            "{}",
+            self.clip_with(line, max_chars).magenta()
+        );
     }
 
     fn add_line(&mut self, line: &str) {
@@ -331,7 +333,10 @@ pub(crate) fn fetch_git_show_patch(repo_root: &Path, rev: &str) -> Result<String
     git_output(repo_root, &args)
 }
 
-pub(crate) fn fetch_git_diff_stat_head(repo_root: &Path, paths: &[String]) -> Result<String, String> {
+pub(crate) fn fetch_git_diff_stat_head(
+    repo_root: &Path,
+    paths: &[String],
+) -> Result<String, String> {
     if !is_git_repo(repo_root) {
         return Err("not a git repository (or git not installed)".into());
     }
@@ -360,9 +365,18 @@ pub(crate) fn parse_diff_args(arg: &str) -> (DiffScope, Vec<String>) {
         return (DiffScope::VsHead, vec![]);
     }
     match tokens[0] {
-        "staged" => (DiffScope::Staged, tokens[1..].iter().map(|s| s.to_string()).collect()),
-        "unstaged" | "patch" => (DiffScope::Unstaged, tokens[1..].iter().map(|s| s.to_string()).collect()),
-        "stat" => (DiffScope::StatHead, tokens[1..].iter().map(|s| s.to_string()).collect()),
+        "staged" => (
+            DiffScope::Staged,
+            tokens[1..].iter().map(|s| s.to_string()).collect(),
+        ),
+        "unstaged" | "patch" => (
+            DiffScope::Unstaged,
+            tokens[1..].iter().map(|s| s.to_string()).collect(),
+        ),
+        "stat" => (
+            DiffScope::StatHead,
+            tokens[1..].iter().map(|s| s.to_string()).collect(),
+        ),
         "show" => {
             let rev = tokens.get(1).map(|s| s.to_string()).unwrap_or_default();
             let paths = if tokens.len() > 2 {
@@ -372,17 +386,17 @@ pub(crate) fn parse_diff_args(arg: &str) -> (DiffScope, Vec<String>) {
             };
             (DiffScope::Show { rev }, paths)
         }
-        _ => (DiffScope::VsHead, tokens.iter().map(|s| s.to_string()).collect()),
+        _ => (
+            DiffScope::VsHead,
+            tokens.iter().map(|s| s.to_string()).collect(),
+        ),
     }
 }
 
 /// Entry: print diff for cwd. Uses `git` binary for true unified diffs (line-accurate review).
 pub(crate) fn run_diff_command(repo_root: &Path, arg: &str, term_width: usize) {
     let t = arg.trim();
-    if matches!(
-        t.split_whitespace().next(),
-        Some("help" | "-h" | "--help")
-    ) {
+    if matches!(t.split_whitespace().next(), Some("help" | "-h" | "--help")) {
         print_diff_usage();
         return;
     }
@@ -393,13 +407,9 @@ pub(crate) fn run_diff_command(repo_root: &Path, arg: &str, term_width: usize) {
     match scope {
         DiffScope::Show { rev } if rev.is_empty() => {
             eprintln!("{}", "  Usage: /diff show <rev> [paths…]".yellow());
-            return;
         }
         DiffScope::Show { rev } => {
-            eprintln!(
-                "{}",
-                format!("  ─── git show {rev} ───").dim()
-            );
+            eprintln!("{}", format!("  ─── git show {rev} ───").dim());
             match fetch_git_show_patch(repo_root, &rev) {
                 Ok(text) => {
                     let stats = summarize_unified_diff(&text);
@@ -412,7 +422,6 @@ pub(crate) fn run_diff_command(repo_root: &Path, arg: &str, term_width: usize) {
                 }
                 Err(e) => eprintln!("{}", format!("  ✗ {e}").red()),
             }
-            return;
         }
         DiffScope::StatHead => {
             eprintln!("{}", "  ─── git diff HEAD --stat ───".dim());
@@ -429,7 +438,6 @@ pub(crate) fn run_diff_command(repo_root: &Path, arg: &str, term_width: usize) {
                 }
                 Err(e) => eprintln!("{}", format!("  ✗ {e}").red()),
             }
-            return;
         }
         _ => {
             let label = match scope {
@@ -465,14 +473,22 @@ pub(crate) fn run_diff_command(repo_root: &Path, arg: &str, term_width: usize) {
 
 fn print_diff_usage() {
     eprintln!();
-    eprintln!("{}", "  /diff — review changes (unified diff, colored)".cyan().bold());
+    eprintln!(
+        "{}",
+        "  /diff — review changes (unified diff, colored)"
+            .cyan()
+            .bold()
+    );
     eprintln!(
         "{}",
         "  /diff              all local changes vs HEAD (staged + unstaged)".dim()
     );
     eprintln!("{}", "  /diff staged       staged vs HEAD".dim());
     eprintln!("{}", "  /diff unstaged     unstaged only".dim());
-    eprintln!("{}", "  /diff stat         short file list + line counts".dim());
+    eprintln!(
+        "{}",
+        "  /diff stat         short file list + line counts".dim()
+    );
     eprintln!("{}", "  /diff show <rev>   single-commit patch".dim());
     eprintln!(
         "{}",
@@ -495,7 +511,10 @@ mod tests {
             self.0.push(format!("H:{line}"));
         }
         fn stats_line(&mut self, stats: DiffStats) {
-            self.0.push(format!("S:{}+{}-{}", stats.files, stats.lines_added, stats.lines_removed));
+            self.0.push(format!(
+                "S:{}+{}-{}",
+                stats.files, stats.lines_added, stats.lines_removed
+            ));
         }
         fn meta(&mut self, line: &str) {
             self.0.push(format!("M:{line}"));

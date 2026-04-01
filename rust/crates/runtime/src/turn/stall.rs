@@ -165,6 +165,13 @@ fn tool_names_from_sigs(sigs: &BTreeSet<String>) -> Vec<String> {
 /// Detect if the agent is diverging: last N rounds used ONLY exploration tools
 /// (bash, list_dir, read_file, grep, glob) with no productive tool calls.
 pub fn detect_divergence(tool_sigs: &[BTreeSet<String>]) -> DivergenceStatus {
+    detect_divergence_with_budget(tool_sigs, MAX_EXPLORATION_ROUNDS)
+}
+
+pub fn detect_divergence_with_budget(
+    tool_sigs: &[BTreeSet<String>],
+    exploration_round_budget: usize,
+) -> DivergenceStatus {
     if tool_sigs.is_empty() {
         return DivergenceStatus::Healthy;
     }
@@ -187,7 +194,7 @@ pub fn detect_divergence(tool_sigs: &[BTreeSet<String>]) -> DivergenceStatus {
 
     match consecutive_exploration {
         0 => DivergenceStatus::Healthy,
-        n if n >= MAX_EXPLORATION_ROUNDS => DivergenceStatus::Diverging(n),
+        n if n >= exploration_round_budget => DivergenceStatus::Diverging(n),
         n => DivergenceStatus::Exploring(n),
     }
 }

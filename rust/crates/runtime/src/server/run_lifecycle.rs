@@ -174,6 +174,7 @@ impl AgenticRunLifecycleService {
     ) -> AgenticLoopState {
         use crate::pipeline::step_protocol::InMemoryIdempotencyCache;
         use crate::semantic_dedup::SemanticDedup;
+        use crate::turn::chat_turn_heuristics::infer_task_execution_profile;
         use crate::turn::turn_guard::TurnGuard;
 
         let user_message = json!({
@@ -182,6 +183,7 @@ impl AgenticRunLifecycleService {
         });
 
         let max_turns = request.max_candidates.max(1) as usize;
+        let task_profile = infer_task_execution_profile(&request.message);
 
         AgenticLoopState {
             messages: vec![user_message],
@@ -195,7 +197,7 @@ impl AgenticRunLifecycleService {
             has_any_usage: false,
             max_turns,
             remaining_turns: max_turns,
-            turn_guard: TurnGuard::new(),
+            turn_guard: TurnGuard::with_profile(task_profile),
             restricted_tools: std::collections::HashSet::new(),
             step_recorder: StepRecorder::new(session_id, run_id),
             idempotency_cache: InMemoryIdempotencyCache::new(),
@@ -222,6 +224,7 @@ impl AgenticRunLifecycleService {
             all_selected_skills: Vec::new(),
             message: request.message.clone(),
             recent_tools: Vec::new(),
+            task_profile,
             api: mo_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap(),
             api_token: String::new(),
             cancel_flag: None,
@@ -836,6 +839,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
             all_selected_skills: Vec::new(),
             message: full_task,
             recent_tools: Vec::new(),
+            task_profile: crate::turn::chat_turn_heuristics::TaskExecutionProfile::default(),
             api: mo_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap(),
             api_token: String::new(),
             cancel_flag: config.pause_flag.clone(),

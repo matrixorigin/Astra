@@ -10,7 +10,7 @@ use mo_agent_core::agent_warn;
 use serde_json::Value;
 
 use super::chat_turn_heuristics::{
-    openai_factual_tool_retry_user_message, should_force_factual_tool_retry,
+    TaskExecutionProfile, openai_factual_tool_retry_user_message, should_force_factual_tool_retry,
 };
 use super::chat_turn_sse_dispatch::ChatTurnSseAccum;
 use super::response_guard::apply_response_guards;
@@ -51,6 +51,7 @@ pub fn agentic_turn_stream_snapshot_from_sse_accum<'a>(
 
 /// Mutable agentic-loop fields updated by [`ingest_agentic_turn_stream`].
 pub struct AgenticTurnIngestMut<'a> {
+    pub task_profile: TaskExecutionProfile,
     pub first_ttft_ms: &'a mut Option<u64>,
     pub current_session_id: &'a mut Option<String>,
     pub current_run_id: &'a mut Option<String>,
@@ -167,6 +168,7 @@ pub fn ingest_agentic_turn_stream(
     let round_has_edge_work = !snap.tool_calls.is_empty() || edge_round_len > 0;
     if !round_has_edge_work {
         if should_force_factual_tool_retry(
+            st.task_profile,
             message,
             recent_tools,
             *st.total_tool_calls,
@@ -227,6 +229,7 @@ mod tests {
 
         fn ingest_mut(&mut self) -> AgenticTurnIngestMut<'_> {
             AgenticTurnIngestMut {
+                task_profile: TaskExecutionProfile::default(),
                 first_ttft_ms: &mut self.first_ttft_ms,
                 current_session_id: &mut self.current_session_id,
                 current_run_id: &mut self.current_run_id,

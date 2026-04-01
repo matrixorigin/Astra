@@ -14,14 +14,15 @@ use std::time::Instant;
 
 use mo_agent_core::RuntimeLimits;
 use mo_agent_runtime::{
-    plan_decompose::CHAT_PLAN_ONLY_SYSTEM,
     pipeline::step_protocol::InMemoryIdempotencyCache,
     pipeline::step_recorder::StepRecorder,
+    plan_decompose::CHAT_PLAN_ONLY_SYSTEM,
     semantic_dedup::SemanticDedup,
     tool_registry::ToolRegistry,
     turn::agentic_loop_host::{AgenticLoopState, run_agentic_loop_with_host},
     turn::agentic_turn_telemetry::step_recorder_chat_ephemeral_run_id,
     turn::chat_history_openai::openai_messages_from_repl_history,
+    turn::chat_turn_heuristics::{TaskExecutionProfile, infer_task_execution_profile},
     turn::edge_prompt_context::detect_project_languages,
     turn::tool_health::ToolHealthTracker,
     turn::tool_schema_prune::openai_tool_names_from_schemas,
@@ -31,17 +32,21 @@ use mo_agent_runtime::{
 use crate::{StreamResult, cli_utils::terminal_width_usize, edge_tools};
 
 use super::ChatTurnParams;
-use serde_json::json;
 use agentic_sse_loop::{
     StreamLoopSidecarEprint, StreamResultBuild, build_stream_result, eprint_stream_loop_sidecars,
 };
 use cli_loop_host::CliAgenticLoopHost;
+use serde_json::json;
 
 /// Auto-detect stop hooks from project root based on build system markers.
 fn detect_stop_hooks(
     project_root: &std::path::Path,
+    task_profile: TaskExecutionProfile,
 ) -> Vec<mo_agent_runtime::turn::stop_hooks::StopHook> {
     use mo_agent_runtime::turn::stop_hooks::StopHook;
+    if !task_profile.verification_required {
+        return Vec::new();
+    }
     let dir = project_root.to_string_lossy().to_string();
     let mut hooks = Vec::new();
 
@@ -60,16 +65,15 @@ fn detect_stop_hooks(
         });
     }
     // Node: package.json with "build" script → npm run build
-    if project_root.join("package.json").exists() {
-        if let Ok(content) = std::fs::read_to_string(project_root.join("package.json")) {
-            if content.contains("\"build\"") {
-                hooks.push(StopHook {
-                    label: "npm-build".into(),
-                    command: "npm run build 2>&1 | tail -20".into(),
-                    working_dir: Some(dir.clone()),
-                });
-            }
-        }
+    if project_root.join("package.json").exists()
+        && let Ok(content) = std::fs::read_to_string(project_root.join("package.json"))
+        && content.contains("\"build\"")
+    {
+        hooks.push(StopHook {
+            label: "npm-build".into(),
+            command: "npm run build 2>&1 | tail -20".into(),
+            working_dir: Some(dir.clone()),
+        });
     }
     // Go: go.mod → go vet
     if project_root.join("go.mod").exists() {
@@ -107,12 +111,13 @@ pub(crate) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
     let valid_tool_names = openai_tool_names_from_schemas(&all_schemas);
 
     let current_session_id = p.session_id.map(|s| s.to_string());
+    let task_profile = infer_task_execution_profile(p.message);
 
     let turn_guard = if p.tool_health_entries.is_empty() {
-        TurnGuard::new()
+        TurnGuard::with_profile(task_profile)
     } else {
         let health = ToolHealthTracker::from_entries(p.tool_health_entries);
-        TurnGuard::with_health(health)
+        TurnGuard::with_health_and_profile(health, task_profile)
     };
 
     let max_turns = RuntimeLimits::global().max_turns;
@@ -186,12 +191,13 @@ pub(crate) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
         all_selected_skills: Vec::new(),
         message: p.message.to_string(),
         recent_tools: p.recent_tools.to_vec(),
+        task_profile,
         api: p.api.clone(),
         api_token: p.token.to_string(),
         cancel_flag: None,
         cancel_token: None,
         delegation_engine: None,
-        stop_hooks: detect_stop_hooks(&project_root),
+        stop_hooks: detect_stop_hooks(&project_root, task_profile),
         stop_hook_runs: 0,
         consecutive_same_error: 0,
         last_error_category: None,
@@ -241,4 +247,34 @@ pub(crate) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
         selector_tokens_out: state.selector_tokens_out,
         memoria_ms: state.first_memoria_ms,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::detect_stop_hooks;
+    use mo_agent_runtime::turn::chat_turn_heuristics::infer_task_execution_profile;
+    use std::path::Path;
+
+    #[test]
+    fn read_only_requests_skip_stop_hooks() {
+        let hooks = detect_stop_hooks(
+            Path::new("."),
+            infer_task_execution_profile("review 最新的commit"),
+        );
+        assert!(hooks.is_empty());
+        let hooks = detect_stop_hooks(
+            Path::new("."),
+            infer_task_execution_profile("explain this diff"),
+        );
+        assert!(hooks.is_empty());
+    }
+
+    #[test]
+    fn mutating_requests_keep_stop_hooks() {
+        let hooks = detect_stop_hooks(
+            Path::new("."),
+            infer_task_execution_profile("implement a fix for the failing test"),
+        );
+        assert!(!hooks.is_empty());
+    }
 }

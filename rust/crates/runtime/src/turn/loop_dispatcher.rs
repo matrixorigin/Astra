@@ -189,6 +189,7 @@ mod tests {
     use crate::semantic_dedup::SemanticDedup;
     use crate::turn::agentic_headless_round::HeadlessStderrStyle;
     use crate::turn::agentic_loop_host::HostTurnResult;
+    use crate::turn::chat_turn_heuristics::TaskExecutionProfile;
     use crate::turn::chat_turn_sse_dispatch::ChatTurnSseAccum;
     use crate::turn::turn_guard::TurnGuard;
     use async_trait::async_trait;
@@ -290,6 +291,7 @@ mod tests {
             all_selected_skills: Vec::new(),
             message: message.to_string(),
             recent_tools: Vec::new(),
+            task_profile: TaskExecutionProfile::default(),
             api: mo_thin_client::ThinClient::new("http://localhost:1", None).unwrap(),
             api_token: "test".to_string(),
             cancel_flag: None,

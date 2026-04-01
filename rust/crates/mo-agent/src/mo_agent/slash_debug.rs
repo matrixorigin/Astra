@@ -14,7 +14,10 @@ pub(super) fn handle_debug_command(arg: &str, state: &ReplState) {
         match &state.session_id {
             Some(id) => id.clone(),
             None => {
-                eprintln!("{}", "  No active session. Usage: /debug <session_id>".yellow());
+                eprintln!(
+                    "{}",
+                    "  No active session. Usage: /debug <session_id>".yellow()
+                );
                 return;
             }
         }
@@ -30,7 +33,10 @@ pub(super) fn handle_debug_command(arg: &str, state: &ReplState) {
     let checkpoints = list_heavy_checkpoints(&base);
 
     if turns.is_empty() && checkpoints.is_empty() {
-        eprintln!("{}", format!("  No data found for session {session_id}").yellow());
+        eprintln!(
+            "{}",
+            format!("  No data found for session {session_id}").yellow()
+        );
         return;
     }
 
@@ -67,8 +73,7 @@ pub(super) fn handle_debug_command(arg: &str, state: &ReplState) {
 fn print_overview(session_id: &str, turns: &[TurnSummary], checkpoints: &[PathBuf]) {
     let short_id = &session_id[..8.min(session_id.len())];
     eprintln!(
-        "\n  {} session {} ({} turns, {} checkpoints)\n",
-        "🔍".to_string(),
+        "\n  🔍 session {} ({} turns, {} checkpoints)\n",
         short_id.cyan(),
         turns.len().to_string().green(),
         checkpoints.len().to_string().dim(),
@@ -104,7 +109,11 @@ fn inspect_turn(turn_n: usize, summary: &TurnSummary, messages: Option<&[serde_j
     );
 
     let has_msgs = messages.is_some();
-    eprintln!("  {} input    — LLM input messages{}", "[1]".cyan(), if has_msgs { "" } else { " (no checkpoint)" });
+    eprintln!(
+        "  {} input    — LLM input messages{}",
+        "[1]".cyan(),
+        if has_msgs { "" } else { " (no checkpoint)" }
+    );
     eprintln!("  {} output   — LLM response", "[2]".cyan());
     eprintln!("  {} tools    — tool calls + results", "[3]".cyan());
     eprintln!("  {} injected — runtime-injected messages", "[4]".cyan());
@@ -162,22 +171,26 @@ fn show_output(messages: Option<&[serde_json::Value]>) {
             continue;
         }
         // Reasoning content
-        if let Some(reasoning) = m.get("reasoning_content").and_then(|v| v.as_str()) {
-            if !reasoning.is_empty() {
-                eprintln!("  {} {}", "[thinking]".dim(), truncate(reasoning, 500));
-            }
+        if let Some(reasoning) = m.get("reasoning_content").and_then(|v| v.as_str())
+            && !reasoning.is_empty()
+        {
+            eprintln!("  {} {}", "[thinking]".dim(), truncate(reasoning, 500));
         }
         // Text content
-        if let Some(content) = m.get("content").and_then(|v| v.as_str()) {
-            if !content.is_empty() {
-                eprintln!("  {} {}", "[text]".green(), truncate(content, 500));
-            }
+        if let Some(content) = m.get("content").and_then(|v| v.as_str())
+            && !content.is_empty()
+        {
+            eprintln!("  {} {}", "[text]".green(), truncate(content, 500));
         }
         // Tool calls
         if let Some(tc) = m.get("tool_calls").and_then(|v| v.as_array()) {
             let names: Vec<&str> = tc
                 .iter()
-                .filter_map(|t| t.get("function").and_then(|f| f.get("name")).and_then(|n| n.as_str()))
+                .filter_map(|t| {
+                    t.get("function")
+                        .and_then(|f| f.get("name"))
+                        .and_then(|n| n.as_str())
+                })
                 .collect();
             if !names.is_empty() {
                 eprintln!("  {} {}", "[tool_calls]".yellow(), names.join(", "));
@@ -210,7 +223,11 @@ fn show_tools(messages: Option<&[serde_json::Value]>, summary: &TurnSummary) {
             }
             let name = m.get("name").and_then(|v| v.as_str()).unwrap_or("?");
             let content = m.get("content").and_then(|v| v.as_str()).unwrap_or("");
-            eprintln!("  {} {}", format!("[{name}]").cyan(), truncate(content, 200));
+            eprintln!(
+                "  {} {}",
+                format!("[{name}]").cyan(),
+                truncate(content, 200)
+            );
         }
     }
     eprintln!();
@@ -233,7 +250,11 @@ fn show_injected(messages: Option<&[serde_json::Value]>) {
             || content.contains("⚠️");
         if is_injected {
             found = true;
-            eprintln!("  {} {}", format!("[{role}]").yellow(), truncate(content, 400));
+            eprintln!(
+                "  {} {}",
+                format!("[{role}]").yellow(),
+                truncate(content, 400)
+            );
         }
     }
     if !found {
@@ -248,7 +269,10 @@ fn dump_json(messages: Option<&[serde_json::Value]>, turn_n: usize) {
         return;
     };
     let path = format!("/tmp/debug-turn{turn_n}.json");
-    match std::fs::write(&path, serde_json::to_string_pretty(&msgs).unwrap_or_default()) {
+    match std::fs::write(
+        &path,
+        serde_json::to_string_pretty(&msgs).unwrap_or_default(),
+    ) {
         Ok(_) => eprintln!("  {} {}", "✓".green(), format!("Written to {path}").dim()),
         Err(e) => eprintln!("  {} {}", "✗".red(), e),
     }
@@ -260,7 +284,11 @@ fn show_summary(summary: &TurnSummary) {
     eprintln!("  tokens:   {}→{}", summary.tokens_in, summary.tokens_out);
     eprintln!("  duration: {:.1}s", summary.duration_ms as f64 / 1000.0);
     eprintln!("  ttft:     {}ms", summary.ttft_ms);
-    eprintln!("  tools:    {} calls ({})", summary.tool_count, summary.tools_used.join(", "));
+    eprintln!(
+        "  tools:    {} calls ({})",
+        summary.tool_count,
+        summary.tools_used.join(", ")
+    );
     if let Some(ref sel) = summary.selector_strategy {
         eprintln!("  selector: {}", sel);
     }
@@ -327,16 +355,29 @@ fn load_journal_turns(path: &PathBuf) -> Vec<TurnSummary> {
                             Some(ToolCallSummary {
                                 name: tc.get("name")?.as_str()?.to_string(),
                                 ok: tc.get("ok")?.as_bool()?,
-                                input_bytes: tc.get("input_bytes").and_then(|v| v.as_u64()).unwrap_or(0),
-                                output_bytes: tc.get("output_bytes").and_then(|v| v.as_u64()).unwrap_or(0),
-                                args_preview: tc.get("args_preview").and_then(|v| v.as_str()).map(String::from),
+                                input_bytes: tc
+                                    .get("input_bytes")
+                                    .and_then(|v| v.as_u64())
+                                    .unwrap_or(0),
+                                output_bytes: tc
+                                    .get("output_bytes")
+                                    .and_then(|v| v.as_u64())
+                                    .unwrap_or(0),
+                                args_preview: tc
+                                    .get("args_preview")
+                                    .and_then(|v| v.as_str())
+                                    .map(String::from),
                             })
                         })
                         .collect()
                 })
                 .unwrap_or_default();
             Some(TurnSummary {
-                user_input: v.get("user_input").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                user_input: v
+                    .get("user_input")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
                 tokens_in: v.get("tokens_in").and_then(|v| v.as_u64()).unwrap_or(0),
                 tokens_out: v.get("tokens_out").and_then(|v| v.as_u64()).unwrap_or(0),
                 duration_ms: v.get("duration_ms").and_then(|v| v.as_u64()).unwrap_or(0),
@@ -345,16 +386,23 @@ fn load_journal_turns(path: &PathBuf) -> Vec<TurnSummary> {
                 tools_used: v
                     .get("tools_used")
                     .and_then(|v| v.as_array())
-                    .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|v| v.as_str().map(String::from))
+                            .collect()
+                    })
                     .unwrap_or_default(),
                 tool_calls,
-                selector_strategy: v.get("selector_strategy").and_then(|v| v.as_str()).map(String::from),
+                selector_strategy: v
+                    .get("selector_strategy")
+                    .and_then(|v| v.as_str())
+                    .map(String::from),
             })
         })
         .collect()
 }
 
-fn list_heavy_checkpoints(session_dir: &PathBuf) -> Vec<PathBuf> {
+fn list_heavy_checkpoints(session_dir: &Path) -> Vec<PathBuf> {
     let cp_dir = session_dir.join("step_checkpoints");
     let Ok(entries) = std::fs::read_dir(&cp_dir) else {
         return Vec::new();
@@ -372,7 +420,10 @@ fn list_heavy_checkpoints(session_dir: &PathBuf) -> Vec<PathBuf> {
     paths
 }
 
-fn load_checkpoint_messages(checkpoints: &[PathBuf], _turn_n: usize) -> Option<Vec<serde_json::Value>> {
+fn load_checkpoint_messages(
+    checkpoints: &[PathBuf],
+    _turn_n: usize,
+) -> Option<Vec<serde_json::Value>> {
     // Use the last heavy checkpoint (it has the most complete message history).
     // TODO: map turn numbers to specific checkpoints when multiple turns exist.
     let path = checkpoints.last()?;

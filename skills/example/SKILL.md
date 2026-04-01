@@ -23,9 +23,11 @@ When asked to review code, follow this structured approach:
 
 First, gather information about the changes:
 
-```bash
-git diff --stat HEAD~1
-```
+- Prefer git-aware tools like `git_diff` / `git_blame` over shell commands.
+- Start with a diff/stat view of the target changes, then read only the files
+  needed to verify important findings.
+- If a file is too large for `read_file`, use `outline=true` or a focused
+  `start_line` / `end_line` range instead of falling back to `bash`.
 
 - Identify which files were changed and why
 - Check the commit message for context

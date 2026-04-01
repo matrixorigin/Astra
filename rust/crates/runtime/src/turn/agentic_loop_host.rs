@@ -75,6 +75,7 @@ use crate::turn::agentic_turn_ingest::{
     map_ingest_outcome_to_iteration_control,
 };
 use crate::turn::agentic_verdict_audit::AgenticVerdictAuditEvent;
+use crate::turn::chat_turn_heuristics::TaskExecutionProfile;
 use crate::turn::chat_turn_sse_dispatch::ChatTurnSseAccum;
 use crate::turn::sse_stream_host::EdgeToolExecResult;
 use crate::turn::stall::CLI_AGENTIC_TURN_BUDGET_STALL_ABORT_MSG;
@@ -203,6 +204,7 @@ pub struct AgenticLoopState {
     // ── Host-provided context (read-only by runtime) ──
     pub message: String,
     pub recent_tools: Vec<String>,
+    pub task_profile: TaskExecutionProfile,
 
     // ── API context (for cloud tool delivery) ──
     pub api: mo_thin_client::ThinClient,
@@ -556,6 +558,7 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
             &state.recent_tools,
             quiet,
             AgenticTurnIngestMut {
+                task_profile: state.task_profile,
                 first_ttft_ms: &mut state.first_ttft_ms,
                 current_session_id: &mut state.current_session_id,
                 current_run_id: &mut state.current_run_id,
@@ -577,18 +580,20 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
                 // The prompt instructs the LLM to run checks, fix failures, and
                 // re-run until passing — all within the normal tool loop.
                 // Runtime does not inspect results; it trusts the LLM's tool cycle.
-                if state.stop_hook_runs == 0 {
-                    if let Some(prompt) = crate::turn::stop_hooks::build_stop_hook_prompt(&state.stop_hooks) {
-                        state.stop_hook_runs = 1;
-                        if !quiet {
-                            host.emit_headless_line(
-                                HeadlessStderrStyle::Yellow,
-                                "⚠ Verification required, continuing…".to_string(),
-                            );
-                        }
-                        state.messages.push(prompt);
-                        continue;
+                if state.task_profile.verification_required
+                    && state.stop_hook_runs == 0
+                    && let Some(prompt) =
+                        crate::turn::stop_hooks::build_stop_hook_prompt(&state.stop_hooks)
+                {
+                    state.stop_hook_runs = 1;
+                    if !quiet {
+                        host.emit_headless_line(
+                            HeadlessStderrStyle::Yellow,
+                            "⚠ Verification required, continuing…".to_string(),
+                        );
                     }
+                    state.messages.push(prompt);
+                    continue;
                 }
                 return Ok(AgenticLoopOutcome::Completed);
             }
@@ -701,11 +706,18 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
         // inject a strategy-change nudge.
         {
             // Compare error counts before/after this turn's tool round.
-            let turn_errors = state.turn_guard.errors.total_errors
+            let turn_errors = state
+                .turn_guard
+                .errors
+                .total_errors
                 .saturating_sub(errors_before_round);
             if turn_errors > 0 {
                 // Find the category that grew most this turn.
-                let dominant = state.turn_guard.errors.errors_by_category.iter()
+                let dominant = state
+                    .turn_guard
+                    .errors
+                    .errors_by_category
+                    .iter()
                     .filter_map(|(cat, &count)| {
                         let before = errors_by_cat_before.get(cat).copied().unwrap_or(0);
                         let delta = count.saturating_sub(before);
@@ -720,7 +732,8 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
                     state.last_error_category = dominant;
                 }
                 if state.consecutive_same_error >= CONSECUTIVE_ERROR_BUDGET {
-                    let cat_name = state.last_error_category
+                    let cat_name = state
+                        .last_error_category
                         .map(|c| format!("{c:?}"))
                         .unwrap_or_else(|| "Unknown".into());
                     state.messages.push(serde_json::json!({
@@ -971,6 +984,7 @@ mod tests {
             all_selected_skills: Vec::new(),
             message: "test query".to_string(),
             recent_tools: Vec::new(),
+            task_profile: TaskExecutionProfile::default(),
             api: mo_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap(),
             api_token: String::new(),
             cancel_flag: None,

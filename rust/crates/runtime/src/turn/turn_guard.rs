@@ -10,6 +10,7 @@
 
 use std::collections::{BTreeSet, HashSet};
 
+use crate::turn::chat_turn_heuristics::TaskExecutionProfile;
 use crate::turn::error_recovery::{self, EscalationLevel, SessionErrorSummary};
 use crate::turn::result_quality::{self, ResultQuality};
 use crate::turn::stall::{self, DivergenceStatus, StallReflection};
@@ -49,6 +50,7 @@ pub enum VerdictSeverity {
 /// Accumulates signals across turns and composes non-happy-path decisions.
 #[derive(Debug, Clone)]
 pub struct TurnGuard {
+    task_profile: TaskExecutionProfile,
     /// Per-turn tool call signatures for stall/divergence detection.
     pub tool_sigs: Vec<BTreeSet<String>>,
     /// How many stall nudges have been sent this session.
@@ -76,7 +78,12 @@ pub fn merge_deprioritized_tools_into_restricted(
 
 impl TurnGuard {
     pub fn new() -> Self {
+        Self::with_profile(TaskExecutionProfile::default())
+    }
+
+    pub fn with_profile(task_profile: TaskExecutionProfile) -> Self {
         Self {
+            task_profile,
             tool_sigs: Vec::new(),
             nudge_count: 0,
             health: ToolHealthTracker::new(),
@@ -88,16 +95,32 @@ impl TurnGuard {
 
     /// Create from a pre-existing health tracker (e.g., cross-session restore).
     pub fn with_health(health: ToolHealthTracker) -> Self {
+        Self::with_health_and_profile(health, TaskExecutionProfile::default())
+    }
+
+    pub fn with_health_and_profile(
+        health: ToolHealthTracker,
+        task_profile: TaskExecutionProfile,
+    ) -> Self {
         Self {
+            task_profile,
             health,
-            ..Self::new()
+            ..Self::with_profile(task_profile)
         }
+    }
+
+    pub fn stall_window(&self) -> usize {
+        self.task_profile.stall_window
     }
 
     /// Record tool call signatures for this turn.
     pub fn record_tool_calls(&mut self, tool_calls: &[serde_json::Value]) {
         // Window must be large enough for both stall detection and divergence detection.
-        let window = stall::SERVER_STALL_WINDOW.max(stall::MAX_EXPLORATION_ROUNDS) + 2;
+        let window = self
+            .task_profile
+            .stall_window
+            .max(self.task_profile.exploration_round_budget)
+            + 2;
         stall::record_server_tool_signatures(&mut self.tool_sigs, tool_calls, window);
     }
 
@@ -155,8 +178,7 @@ impl TurnGuard {
         let mut severity = VerdictSeverity::Healthy;
 
         // 1. Stall detection
-        let stall_detected =
-            stall::detect_server_stall(&self.tool_sigs, stall::SERVER_STALL_WINDOW);
+        let stall_detected = stall::detect_server_stall(&self.tool_sigs, self.stall_window());
 
         if stall_detected {
             let deprioritized = self.health.deprioritized_tools();
@@ -178,7 +200,10 @@ impl TurnGuard {
         // 2. Divergence detection
         // Only increment nudge_count if stall wasn't already detected this turn
         // (both detect overlapping patterns; counting both inflates escalation).
-        let divergence = stall::detect_divergence(&self.tool_sigs);
+        let divergence = stall::detect_divergence_with_budget(
+            &self.tool_sigs,
+            self.task_profile.exploration_round_budget,
+        );
         if let DivergenceStatus::Diverging(_) = divergence {
             injections.push(stall::DIVERGENCE_CORRECTION.to_string());
             if !stall_detected {
@@ -305,8 +330,14 @@ impl TurnGuard {
             } else {
                 // First Critical: restrict to read-only tools
                 let write_tools = [
-                    "bash", "write_file", "str_replace", "create_file", "edit_file",
-                    "exec", "run_command", "shell",
+                    "bash",
+                    "write_file",
+                    "str_replace",
+                    "create_file",
+                    "edit_file",
+                    "exec",
+                    "run_command",
+                    "shell",
                 ];
                 for t in &write_tools {
                     avoid_tools.insert(t.to_string());

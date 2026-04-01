@@ -123,8 +123,7 @@ pub(crate) fn is_context_window_error(lower: &str) -> bool {
         || lower.contains("too many tokens")
         || lower.contains("input is too long")
         || lower.contains("context window")
-        || lower.contains("max_tokens")
-            && (lower.contains("exceed") || lower.contains("limit"))
+        || lower.contains("max_tokens") && (lower.contains("exceed") || lower.contains("limit"))
 }
 
 /// Prefix for context-window errors that callers can detect.

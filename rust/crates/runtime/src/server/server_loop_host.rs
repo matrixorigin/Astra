@@ -950,6 +950,7 @@ mod tests {
         use crate::pipeline::step_protocol::InMemoryIdempotencyCache;
         use crate::pipeline::step_recorder::StepRecorder;
         use crate::semantic_dedup::SemanticDedup;
+        use crate::turn::chat_turn_heuristics::TaskExecutionProfile;
         use crate::turn::turn_guard::TurnGuard;
 
         AgenticLoopState {
@@ -991,6 +992,7 @@ mod tests {
             all_selected_skills: Vec::new(),
             message: "test query".to_string(),
             recent_tools: Vec::new(),
+            task_profile: TaskExecutionProfile::default(),
             api: mo_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap(),
             api_token: "test-token".to_string(),
             cancel_flag: None,

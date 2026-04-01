@@ -106,14 +106,14 @@ fn print_workspace_metadata(ws: &session_workspace::WorkspaceMetadata, sid: &str
         (None, None) => "(no git at session start)".to_string(),
     };
     eprintln!("  {:<16} {}", "git:".dim(), git_line.cyan());
-    if let Some(ref root) = ws.git_root {
-        if root != &ws.cwd {
-            eprintln!(
-                "  {:<16} {}",
-                "repo root:".dim(),
-                tilde_path(root.as_str()).as_str().dim()
-            );
-        }
+    if let Some(ref root) = ws.git_root
+        && root != &ws.cwd
+    {
+        eprintln!(
+            "  {:<16} {}",
+            "repo root:".dim(),
+            tilde_path(root.as_str()).as_str().dim()
+        );
     }
     let started = ws.created_at.get(..19).unwrap_or(ws.created_at.as_str());
     eprintln!("  {:<16} {}", "started:".dim(), started.cyan());
@@ -129,11 +129,7 @@ fn print_workspace_metadata(ws: &session_workspace::WorkspaceMetadata, sid: &str
     );
     eprintln!("  {:<16} {}", "status:".dim(), ws.status.as_str().cyan());
     if let Some(ref sum) = ws.summary {
-        eprintln!(
-            "  {:<16} {}",
-            "summary:".dim(),
-            ellipsize(sum, 80).dim()
-        );
+        eprintln!("  {:<16} {}", "summary:".dim(), ellipsize(sum, 80).dim());
     }
     if ws.turn_count > 0 || ws.total_tokens_in > 0 || ws.total_tokens_out > 0 {
         eprintln!(
@@ -261,11 +257,7 @@ pub(super) fn handle_session_command(arg: &str, state: &ReplState) {
                 if let Some(ref ws) = persisted_ws {
                     print_workspace_metadata(ws, sid);
                     if ws.model != mdl {
-                        eprintln!(
-                            "  {:<16} {}",
-                            "started as:".dim(),
-                            ws.model.as_str().dim()
-                        );
+                        eprintln!("  {:<16} {}", "started as:".dim(), ws.model.as_str().dim());
                     }
                 } else {
                     eprintln!(
@@ -288,18 +280,10 @@ pub(super) fn handle_session_command(arg: &str, state: &ReplState) {
                         ws.turn_count.to_string().cyan()
                     );
                 } else {
-                    eprintln!(
-                        "  {:<16} {}",
-                        "turns:".dim(),
-                        state.turn.to_string().cyan()
-                    );
+                    eprintln!("  {:<16} {}", "turns:".dim(), state.turn.to_string().cyan());
                 }
             } else {
-                eprintln!(
-                    "  {:<16} {}",
-                    "turns:".dim(),
-                    state.turn.to_string().cyan()
-                );
+                eprintln!("  {:<16} {}", "turns:".dim(), state.turn.to_string().cyan());
             }
             eprintln!(
                 "  {:<16} {}",
