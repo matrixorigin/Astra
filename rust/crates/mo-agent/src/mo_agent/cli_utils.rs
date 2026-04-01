@@ -369,6 +369,7 @@ pub(crate) fn terminal_width_usize() -> usize {
 }
 
 /// Render markdown with explicit wrap width so it matches [`StreamRenderState`] line accounting.
+#[allow(dead_code)]
 pub(crate) fn print_markdown_width(text: &str, width: Option<usize>) {
     let w = width.unwrap_or_else(terminal_width_usize).max(20);
     let mut skin = termimad::MadSkin::default();

@@ -73,6 +73,8 @@ mod slash_skill;
 mod slash_state;
 #[path = "mo_agent/stream_render.rs"]
 mod stream_render;
+#[path = "mo_agent/streaming_md.rs"]
+mod streaming_md;
 #[path = "mo_agent/diff_presenter.rs"]
 mod diff_presenter;
 

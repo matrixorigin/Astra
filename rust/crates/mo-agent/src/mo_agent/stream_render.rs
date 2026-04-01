@@ -51,7 +51,7 @@ struct CliSseStreamHost<'a> {
 }
 
 impl<'a> CliSseStreamHost<'a> {
-    fn from_edge_ctx(ctx: EdgeSseContext<'a>, term_width: usize) -> Self {
+    fn from_edge_ctx(ctx: EdgeSseContext<'a>, term_width: usize, render_md: bool) -> Self {
         Self {
             api: ctx.api,
             token: ctx.token,
@@ -59,7 +59,7 @@ impl<'a> CliSseStreamHost<'a> {
             executor: ctx.executor,
             quiet: ctx.quiet,
             perm_manager: ctx.perm_manager,
-            render: StreamRenderState::with_term_width(term_width),
+            render: StreamRenderState::with_term_width(term_width, render_md),
             edge_tool_round: Vec::new(),
         }
     }
@@ -74,9 +74,14 @@ impl SseStreamHost for CliSseStreamHost<'_> {
         for effect in effects {
             match effect {
                 SseRenderEffect::StreamText(s) => {
-                    print!("{s}");
-                    let _ = io::stdout().flush();
-                    self.render.track_output(&s);
+                    if let Some(md) = &mut self.render.md {
+                        md.push(&s);
+                        self.render.lines_written = md.lines_written;
+                    } else {
+                        print!("{s}");
+                        let _ = io::stdout().flush();
+                        self.render.track_output(&s);
+                    }
                 }
                 SseRenderEffect::StopThinkingSpinner => self.render.stop_thinking(),
                 SseRenderEffect::StartThinkingSpinner => self.render.start_thinking(),
@@ -294,21 +299,29 @@ pub(super) struct StreamRenderState {
     col: usize,
     /// Terminal width for wrap calculation.
     term_width: usize,
+    /// Incremental markdown renderer — `None` when `render_md` is false.
+    md: Option<super::streaming_md::StreamingMarkdown>,
 }
 
 impl StreamRenderState {
     #[cfg(test)]
     pub(super) fn new() -> Self {
-        Self::with_term_width(80)
+        Self::with_term_width(80, false)
     }
 
-    fn with_term_width(tw: usize) -> Self {
+    fn with_term_width(tw: usize, render_md: bool) -> Self {
+        let w = tw.max(1);
         Self {
             thinking_start: None,
             thinking_spinner: None,
             lines_written: 0,
             col: 0,
-            term_width: tw.max(1),
+            term_width: w,
+            md: if render_md {
+                Some(super::streaming_md::StreamingMarkdown::new(w))
+            } else {
+                None
+            },
         }
     }
 
@@ -330,7 +343,11 @@ impl StreamRenderState {
 
     /// Account for a full line written via eprintln! (adds 1 line).
     pub(super) fn track_eprintln(&mut self) {
-        self.lines_written += 1;
+        if let Some(md) = &mut self.md {
+            md.track_eprintln();
+        } else {
+            self.lines_written += 1;
+        }
         self.col = 0;
     }
 
@@ -364,9 +381,14 @@ fn apply_sse_render_effects(
     for effect in effects {
         match effect {
             SseRenderEffect::StreamText(s) => {
-                print!("{s}");
-                let _ = io::stdout().flush();
-                render.track_output(&s);
+                if let Some(md) = &mut render.md {
+                    md.push(&s);
+                    render.lines_written = md.lines_written;
+                } else {
+                    print!("{s}");
+                    let _ = io::stdout().flush();
+                    render.track_output(&s);
+                }
             }
             SseRenderEffect::StopThinkingSpinner => render.stop_thinking(),
             SseRenderEffect::StartThinkingSpinner => render.start_thinking(),
@@ -396,20 +418,27 @@ pub(super) async fn consume_turn_sse(
 
     // Delegate to runtime's generic SSE consumer with the appropriate host
     let idle = std::time::Duration::from_millis(STREAM_IDLE_TIMEOUT_MS);
-    // Stream `text_delta` live; final markdown pass may clear/redraw for termimad formatting.
-    let (sse_result, edge_tool_round, lines_written) = if let Some(ctx) = edge {
-        let mut host = CliSseStreamHost::from_edge_ctx(ctx, term_width);
+    let (sse_result, edge_tool_round, mut md_renderer, lines_written) = if let Some(ctx) = edge {
+        let mut host = CliSseStreamHost::from_edge_ctx(ctx, term_width, render_md);
         host.render.lines_written = pre_clear_lines;
+        if let Some(md) = &mut host.render.md {
+            md.lines_written = pre_clear_lines;
+        }
         let (result, _abort) = consume_sse_stream(&mut byte_stream, &mut host, idle).await;
         let lw = host.render.lines_written;
-        (result, host.edge_tool_round, lw)
+        let md = host.render.md.take();
+        (result, host.edge_tool_round, md, lw)
     } else {
-        let mut render = StreamRenderState::with_term_width(term_width);
+        let mut render = StreamRenderState::with_term_width(term_width, render_md);
         render.lines_written = pre_clear_lines;
+        if let Some(md) = &mut render.md {
+            md.lines_written = pre_clear_lines;
+        }
         let mut host = NoopSseStreamHost;
         let (result, _abort) = consume_sse_stream(&mut byte_stream, &mut host, idle).await;
         let lw = render.lines_written;
-        (result, Vec::new(), lw)
+        let md = render.md.take();
+        (result, Vec::new(), md, lw)
     };
 
     let result = TurnResult {
@@ -422,10 +451,19 @@ pub(super) async fn consume_turn_sse(
         return result;
     }
 
-    // ─── Terminal re-render (CLI-specific) ────────────────────────────────
-    // Clear ALL output produced during streaming (text deltas, thinking
-    // duration lines, tool-request notices) so the re-render starts clean.
-    if lines_written > 0 {
+    // ─── Finalize incremental markdown ───────────────────────────────────
+    // When markdown rendering is active, the text was already rendered
+    // incrementally during streaming.  Just finalize the last unstable block.
+    // When tool_calls are pending (intermediate turn), clear the streamed
+    // text so it doesn't leak — the final answer will be rendered later.
+    if let Some(md) = &mut md_renderer {
+        if result.has_tool_calls {
+            md.clear_all();
+        } else {
+            md.finish();
+        }
+    } else if result.has_tool_calls && lines_written > 0 {
+        // Non-markdown, intermediate turn — clear raw streamed text.
         execute!(
             io::stdout(),
             cursor::MoveUp(lines_written as u16),
@@ -433,20 +471,10 @@ pub(super) async fn consume_turn_sse(
             terminal::Clear(terminal::ClearType::FromCursorDown)
         )
         .ok();
-    } else if !result.full_text.is_empty() {
-        execute!(
-            io::stdout(),
-            cursor::MoveToColumn(0),
-            terminal::Clear(terminal::ClearType::CurrentLine)
-        )
-        .ok();
-    }
-
-    if should_rerender_text(result.has_tool_calls) && !result.full_text.is_empty() {
-        if render_md {
-            crate::cli_utils::print_markdown_width(&result.full_text, Some(term_width));
-        } else {
-            println!("{}", result.full_text.trim_end());
+    } else if !result.full_text.is_empty() && !result.has_tool_calls {
+        // Non-markdown final turn: raw text was already printed via StreamText.
+        if !result.full_text.ends_with('\n') {
+            println!();
         }
     }
 
@@ -458,6 +486,7 @@ pub(super) async fn consume_turn_sse(
 /// Returns `false` when tool calls are pending — the text is an intermediate
 /// draft that would leak into the terminal and never be cleared by subsequent
 /// agentic-loop turns.
+#[allow(dead_code)]
 fn should_rerender_text(has_tool_calls: bool) -> bool {
     !has_tool_calls
 }
@@ -600,7 +629,7 @@ mod tests {
 
     #[test]
     fn track_output_counts_wraps() {
-        let mut s = StreamRenderState::with_term_width(10);
+        let mut s = StreamRenderState::with_term_width(10, false);
         // 20 chars = 2 wraps on a 10-col terminal
         s.track_output("12345678901234567890");
         assert_eq!(s.lines_written, 2);
@@ -616,7 +645,7 @@ mod tests {
 
     #[test]
     fn track_mixed_stdout_stderr_lines() {
-        let mut s = StreamRenderState::with_term_width(80);
+        let mut s = StreamRenderState::with_term_width(80, false);
         // Simulate: thinking line (stderr) + streamed text (stdout) + tool_request (stderr)
         s.track_eprintln(); // ● Thought for 1.4s
         s.track_output("Let me review the code\n"); // text_delta
