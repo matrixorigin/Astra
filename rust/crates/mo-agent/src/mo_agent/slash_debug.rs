@@ -22,7 +22,7 @@ pub(super) fn handle_debug_command(arg: &str, state: &ReplState) {
             }
         }
     } else {
-        arg.trim().to_string()
+        resolve_session_id(arg.trim())
     };
 
     let base = session_dir(&session_id);
@@ -309,6 +309,32 @@ fn show_summary(summary: &TurnSummary) {
 }
 
 // ── Data loading ─────────────────────────────────────────────────────────────
+
+/// Resolve a (possibly short) session ID to a full UUID by prefix match.
+fn resolve_session_id(input: &str) -> String {
+    let sessions_dir = dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".mo-agent")
+        .join("sessions");
+    if let Ok(entries) = std::fs::read_dir(&sessions_dir) {
+        let matches: Vec<String> = entries
+            .filter_map(|e| e.ok())
+            .filter_map(|e| {
+                let name = e.file_name().to_string_lossy().to_string();
+                // Match directories (session data) by prefix
+                if e.path().is_dir() && name.starts_with(input) {
+                    Some(name)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        if matches.len() == 1 {
+            return matches.into_iter().next().unwrap();
+        }
+    }
+    input.to_string()
+}
 
 fn session_dir(session_id: &str) -> PathBuf {
     dirs::home_dir()
