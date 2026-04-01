@@ -393,17 +393,38 @@ pub(super) async fn handle_info_command(
                 plan_only_chat: false,
             })
             .await?;
-            if let Some(session_id) = sr.session_id {
-                state.session_id = Some(session_id);
+            if let Some(session_id) = sr.session_id.as_deref() {
+                crate::repl_turn::initialize_journal_pub(state, session_id);
+                state.session_id = Some(session_id.to_string());
             }
             state.last_response = Some(sr.full_text.clone());
+            let review_input = format!("/review {arg}").trim().to_string();
             state
                 .history
-                .push((format!("/review {arg}").trim().to_string(), sr.full_text));
+                .push((review_input.clone(), sr.full_text.clone()));
             state.turn += 1;
             state.total_prompt_tokens += sr.prompt_tokens;
             state.total_completion_tokens += sr.completion_tokens;
-            state.recent_tools = sr.tools_used;
+            state.recent_tools = sr.tools_used.clone();
+
+            // Write turn event to journal (same as normal chat turns).
+            if let Some(journal) = state.journal.as_ref() {
+                let turn_event = mo_agent_services::session_journal::JournalEvent::turn(
+                    state.session_id.as_deref(),
+                    state.turn,
+                    state.model.as_deref(),
+                    &review_input,
+                    &sr.full_text,
+                    sr.tool_calls_count,
+                    sr.prompt_tokens,
+                    sr.completion_tokens,
+                    0, // duration not tracked here
+                )
+                .with_tool_calls(sr.tool_call_records)
+                .with_budget_pressure(sr.budget_pressure);
+                state.last_turn_event = Some(turn_event.clone());
+                let _ = journal.append(&turn_event);
+            }
         }
 
         "/copy" => match &state.last_response {
