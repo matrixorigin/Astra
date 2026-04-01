@@ -5,7 +5,7 @@ use mo_agent_runtime::turn::chat_turn_sse_dispatch::{
 };
 use mo_agent_runtime::turn::sse_edge_stderr_lines::{
     edge_sse_post_approval_fail_line, edge_sse_post_tool_result_fail_line,
-    edge_sse_thought_duration_line, edge_sse_tool_request_notice_line,
+    edge_sse_thought_duration_line,
 };
 use mo_agent_runtime::turn::sse_stream_host::{
     EdgeApprovalResult, EdgeToolExecResult, NoopSseStreamHost, STREAM_IDLE_TIMEOUT_MS,
@@ -104,13 +104,12 @@ impl SseStreamHost for CliSseStreamHost<'_> {
         if let Some(md) = &mut self.render.md {
             md.clear_all();
         }
-        if !self.quiet {
-            eprintln!(
-                "{}",
-                edge_sse_tool_request_notice_line(tool, request_id).dim()
-            );
-            self.render.track_eprintln();
-        }
+        // Show tool as running (in-place updatable via TerminalRegion).
+        let tool_idx = if !self.quiet {
+            Some(self.render.tool_start(tool))
+        } else {
+            None
+        };
         let allowed = match &mut self.perm_manager {
             Some(pm) => pm.check(tool, args),
             None => true,
@@ -127,6 +126,10 @@ impl SseStreamHost for CliSseStreamHost<'_> {
             cloud_tool_result_status_label(&output)
         };
         let duration_ms = start.elapsed().as_millis() as u64;
+        // Update tool line to show completion.
+        if let Some(idx) = tool_idx {
+            self.render.tool_done(idx, tool, status, duration_ms);
+        }
         self.edge_tool_round.push(EdgeToolExecResult {
             request_id: request_id.to_string(),
             tool: tool.to_string(),
@@ -307,8 +310,12 @@ pub(super) struct StreamRenderState {
     /// Incremental markdown renderer — `None` when `render_md` is false.
     md: Option<super::streaming_md::StreamingMarkdown>,
     /// Stderr lines written between tool calls (thinking duration, tool notices).
-    /// Tracked so clear_all can account for them.
+    #[allow(dead_code)]
     stderr_lines: usize,
+    /// Tool status region for in-place updates (⚡ running → ✓ done).
+    tool_region: super::terminal_region::TerminalRegion,
+    /// Tool status lines (one per tool).
+    tool_lines: Vec<String>,
 }
 
 impl StreamRenderState {
@@ -331,6 +338,8 @@ impl StreamRenderState {
                 None
             },
             stderr_lines: 0,
+            tool_region: super::terminal_region::TerminalRegion::new(),
+            tool_lines: Vec::new(),
         }
     }
 
@@ -351,6 +360,7 @@ impl StreamRenderState {
     }
 
     /// Account for a full line written via eprintln! (adds 1 line).
+    #[allow(dead_code)]
     pub(super) fn track_eprintln(&mut self) {
         self.stderr_lines += 1;
         if self.md.is_none() {
@@ -371,10 +381,44 @@ impl StreamRenderState {
             spinner.stop_clear();
             if let Some(start) = self.thinking_start.take() {
                 let elapsed = start.elapsed().as_secs_f64();
-                eprintln!("{}", edge_sse_thought_duration_line(elapsed).dim());
-                self.track_eprintln();
+                // Print thinking duration via stdout so it doesn't interfere
+                // with TerminalRegion cursor tracking.
+                let line = edge_sse_thought_duration_line(elapsed);
+                println!("{}", line.clone().dim());
+                let _ = io::stdout().flush();
+                self.lines_written += 1;
+                self.col = 0;
             }
         }
+    }
+
+    /// Show a tool as "running" and return its index for later update.
+    fn tool_start(&mut self, tool: &str) -> usize {
+        let idx = self.tool_lines.len();
+        let line = format!("  ⚡ {tool} …");
+        self.tool_lines.push(line);
+        self.tool_region.update(self.tool_lines.clone());
+        idx
+    }
+
+    /// Update a tool line to show completion status.
+    fn tool_done(&mut self, idx: usize, tool: &str, status: &str, duration_ms: u64) {
+        let (icon, suffix) = if status == "error" {
+            ("✗", format!(" ({duration_ms}ms) error"))
+        } else {
+            ("✓", format!(" ({duration_ms}ms)"))
+        };
+        if idx < self.tool_lines.len() {
+            self.tool_lines[idx] = format!("  {icon} {tool}{suffix}");
+            self.tool_region.update(self.tool_lines.clone());
+        }
+    }
+
+    /// Clear tool status region (for intermediate turns before next SSE stream).
+    #[allow(dead_code)]
+    fn clear_tool_region(&mut self) {
+        self.tool_region.clear();
+        self.tool_lines.clear();
     }
 }
 
@@ -427,14 +471,19 @@ pub(super) async fn consume_turn_sse(
     let idle = std::time::Duration::from_millis(STREAM_IDLE_TIMEOUT_MS);
     let (sse_result, edge_tool_round, mut md_renderer, lines_written) = if let Some(ctx) = edge {
         let mut host = CliSseStreamHost::from_edge_ctx(ctx, term_width, render_md);
-        host.render.lines_written = pre_clear_lines;
+        // pre_clear_lines only applies to non-md fallback path.
+        if host.render.md.is_none() {
+            host.render.lines_written = pre_clear_lines;
+        }
         let (result, _abort) = consume_sse_stream(&mut byte_stream, &mut host, idle).await;
         let lw = host.render.lines_written;
         let md = host.render.md.take();
         (result, host.edge_tool_round, md, lw)
     } else {
         let mut render = StreamRenderState::with_term_width(term_width, render_md);
-        render.lines_written = pre_clear_lines;
+        if render.md.is_none() {
+            render.lines_written = pre_clear_lines;
+        }
         let mut host = NoopSseStreamHost;
         let (result, _abort) = consume_sse_stream(&mut byte_stream, &mut host, idle).await;
         let lw = render.lines_written;
