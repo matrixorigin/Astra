@@ -777,6 +777,10 @@ mod tests {
         assert_eq!(classify_llm_error("connection refused"), "transport");
         assert_eq!(classify_llm_error("401 unauthorized"), "permission");
         assert_eq!(classify_llm_error("something went wrong"), "internal");
+        assert_eq!(
+            classify_llm_error("LLM stream transport error: connection reset"),
+            "transport"
+        );
     }
 
     #[test]
@@ -851,6 +855,68 @@ mod tests {
         let e1 = st.next().await.unwrap().unwrap();
         assert_eq!(e1, json!({"a": 1}));
         assert!(st.next().await.is_none());
+    }
+
+    async fn sample_reqwest_stream_error() -> reqwest::Error {
+        reqwest::Client::builder()
+            .no_proxy()
+            .timeout(std::time::Duration::from_secs(2))
+            .build()
+            .unwrap()
+            .get("http://127.0.0.1:1/")
+            .send()
+            .await
+            .expect_err("connection to closed port should fail")
+    }
+
+    #[tokio::test]
+    async fn parse_openai_sse_json_stream_surfaces_byte_stream_error() {
+        let err = sample_reqwest_stream_error().await;
+        let parts: Vec<Result<Bytes, reqwest::Error>> = vec![Err(err)];
+        let st = parse_openai_sse_json_stream(stream::iter(parts));
+        tokio::pin!(st);
+        let r = st.next().await.expect("one item");
+        let msg = r.expect_err("transport");
+        assert!(!msg.is_empty());
+        assert!(st.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn parse_openai_sse_json_stream_event_then_transport_error() {
+        let err = sample_reqwest_stream_error().await;
+        let parts: Vec<Result<Bytes, reqwest::Error>> = vec![
+            Ok(Bytes::from("data: {\"x\":1}\n\n")),
+            Err(err),
+        ];
+        let st = parse_openai_sse_json_stream(stream::iter(parts));
+        tokio::pin!(st);
+        assert_eq!(st.next().await.unwrap().unwrap(), json!({"x": 1}));
+        assert!(st.next().await.unwrap().is_err());
+        assert!(st.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn parse_openai_sse_json_stream_tail_flush_without_final_blank_line() {
+        let parts: Vec<Result<Bytes, reqwest::Error>> = vec![Ok(Bytes::from("data: {\"z\":9}"))];
+        let st = parse_openai_sse_json_stream(stream::iter(parts));
+        tokio::pin!(st);
+        let ev = st.next().await.unwrap().unwrap();
+        assert_eq!(ev, json!({"z": 9}));
+        assert!(st.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn collect_llm_stream_surfaces_transport_error() {
+        unsafe { std::env::set_var("MO_STREAM_IDLE_TIMEOUT_MS", "60000") };
+        let err = sample_reqwest_stream_error().await;
+        let byte_stream = stream::iter(vec![Err(err)]);
+        let started = Instant::now();
+        let res = collect_llm_stream(byte_stream, "test-model", started, LlmCancel::None).await;
+        assert!(
+            matches!(res, Err(StreamCollectError::Transport(_))),
+            "expected transport error, got: {res:?}"
+        );
+        unsafe { std::env::remove_var("MO_STREAM_IDLE_TIMEOUT_MS") };
     }
 
     #[tokio::test]
