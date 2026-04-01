@@ -144,6 +144,9 @@ pub use mo_agent_services::{
         RunListRecord, RunStatusRecord,
     },
     sandbox::{DatabaseSandboxService, SandboxRecord, SandboxService, UnconfiguredSandboxService},
+    session_audit::{
+        DatabaseSessionAuditService, SessionAuditService, UnconfiguredSessionAuditService,
+    },
     session_journal,
     skill_config::{
         DatabaseSkillConfigService, SkillConfigService, UnconfiguredSkillConfigService,

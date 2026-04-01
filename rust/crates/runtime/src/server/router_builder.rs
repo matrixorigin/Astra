@@ -361,6 +361,27 @@ pub(super) fn build_router(state: AppState) -> Router {
             "/sessions/{session_id}/replay/compare",
             get(replay::compare_replay_handler),
         )
+        // Session Audit
+        .route(
+            "/sessions/{session_id}/audit/summary",
+            get(audit_handlers::audit_summary_handler),
+        )
+        .route(
+            "/sessions/{session_id}/audit/turns",
+            get(audit_handlers::audit_turns_handler),
+        )
+        .route(
+            "/sessions/{session_id}/audit/turns/{turn}",
+            get(audit_handlers::audit_turn_detail_handler),
+        )
+        .route(
+            "/sessions/{session_id}/audit/tools",
+            get(audit_handlers::audit_tools_handler),
+        )
+        .route(
+            "/sessions/{session_id}/audit/errors",
+            get(audit_handlers::audit_errors_handler),
+        )
         // Marketplace
         .route(
             "/marketplace/install",

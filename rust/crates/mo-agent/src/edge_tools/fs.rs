@@ -1342,10 +1342,8 @@ fn add_line_numbers(content: &str, start_line: usize) -> String {
 /// Normalize curly/smart quotes to straight ASCII quotes.
 /// Handles: ' ' → '  and  " " → "
 fn normalize_quotes(s: &str) -> String {
-    s.replace('\u{2018}', "'") // left single curly
-        .replace('\u{2019}', "'") // right single curly
-        .replace('\u{201C}', "\"") // left double curly
-        .replace('\u{201D}', "\"") // right double curly
+    s.replace(['\u{2018}', '\u{2019}'], "'") // curly single → straight
+        .replace(['\u{201C}', '\u{201D}'], "\"") // curly double → straight
 }
 
 /// Find the actual substring in `content` that matches `search` after quote
@@ -1362,10 +1360,7 @@ fn find_with_quote_normalization<'a>(content: &'a str, search: &str) -> Option<&
     let char_len = norm_search.chars().count();
 
     // Map char offset back to byte positions in the original content.
-    let byte_start = content
-        .char_indices()
-        .nth(char_start)
-        .map(|(i, _)| i)?;
+    let byte_start = content.char_indices().nth(char_start).map(|(i, _)| i)?;
     let byte_end = content
         .char_indices()
         .nth(char_start + char_len)
@@ -1824,10 +1819,7 @@ type Handler interface {
     #[test]
     fn add_line_numbers_padding() {
         // Lines 99-101 should pad to 3 digits
-        assert_eq!(
-            add_line_numbers("a\nb\nc", 99),
-            " 99\ta\n100\tb\n101\tc"
-        );
+        assert_eq!(add_line_numbers("a\nb\nc", 99), " 99\ta\n100\tb\n101\tc");
     }
 
     #[test]
@@ -1860,7 +1852,10 @@ type Handler interface {
 
     #[test]
     fn normalize_quotes_curly_to_straight() {
-        assert_eq!(normalize_quotes("say \u{201C}hello\u{201D}"), "say \"hello\"");
+        assert_eq!(
+            normalize_quotes("say \u{201C}hello\u{201D}"),
+            "say \"hello\""
+        );
         assert_eq!(normalize_quotes("it\u{2019}s"), "it's");
     }
 

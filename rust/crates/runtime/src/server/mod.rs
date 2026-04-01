@@ -19,6 +19,7 @@ use uuid::Uuid;
 use super::*;
 
 mod admin_handlers;
+mod audit_handlers;
 mod auth_handlers;
 mod bridge_prep;
 mod chat_handlers;

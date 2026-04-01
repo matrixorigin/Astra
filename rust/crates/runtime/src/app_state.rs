@@ -44,6 +44,7 @@ pub struct AppState {
     pub(crate) data_versioning_service: Arc<dyn DataVersioningService>,
     pub(crate) marketplace_service: Arc<dyn MarketplaceService>,
     pub(crate) replay_service: Arc<dyn ReplayService>,
+    pub(crate) session_audit_service: Arc<dyn SessionAuditService>,
     pub(crate) streaming_service: Arc<dyn StreamingService>,
     pub(crate) skill_service: Arc<dyn SkillService>,
     pub(crate) skill_config_service: Arc<dyn SkillConfigService>,
@@ -122,6 +123,7 @@ impl AppState {
             data_versioning_service: Arc::new(UnconfiguredDataVersioningService),
             marketplace_service: Arc::new(UnconfiguredMarketplaceService),
             replay_service: Arc::new(UnconfiguredReplayService),
+            session_audit_service: Arc::new(UnconfiguredSessionAuditService),
             streaming_service: Arc::new(UnconfiguredStreamingService),
             skill_service: Arc::new(UnconfiguredSkillService),
             skill_config_service: Arc::new(UnconfiguredSkillConfigService),
@@ -277,6 +279,14 @@ impl AppState {
 
     pub fn with_replay_service(mut self, replay_service: Arc<dyn ReplayService>) -> Self {
         self.replay_service = replay_service;
+        self
+    }
+
+    pub fn with_session_audit_service(
+        mut self,
+        session_audit_service: Arc<dyn SessionAuditService>,
+    ) -> Self {
+        self.session_audit_service = session_audit_service;
         self
     }
 
