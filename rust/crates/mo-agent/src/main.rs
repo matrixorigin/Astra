@@ -2102,6 +2102,9 @@ fn merge_learning_snapshot(
         std::sync::Mutex<mo_agent_runtime::pipeline::calibration::ProgressiveCalibrator>,
     >,
 ) {
+    if json.trim().is_empty() {
+        return;
+    }
     match serde_json::from_str::<mo_agent_runtime::pipeline::persistence::LearningSnapshot>(json) {
         Ok(snapshot) => {
             mo_agent_runtime::pipeline::persistence::merge_into_modules(
