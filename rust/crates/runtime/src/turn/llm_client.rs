@@ -920,6 +920,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn collect_llm_stream_aggregates_delta_text_reasoning_usage() {
+        unsafe { std::env::set_var("MO_STREAM_IDLE_TIMEOUT_MS", "60000") };
+        let d1 = json!({"choices":[{"delta":{"content":"Hi ","reasoning_content":"R"}}]});
+        let d2 = json!({"choices":[{"delta":{"content":"there"}}]});
+        let u = json!({"usage":{"prompt_tokens":3,"completion_tokens":4}});
+        let body = format!(
+            "data: {}\n\ndata: {}\n\ndata: {}\n\n",
+            d1.to_string(),
+            d2.to_string(),
+            u.to_string()
+        );
+        let stream = stream::iter(vec![Ok(Bytes::from(body))]);
+        let res = collect_llm_stream(
+            stream,
+            "gpt-test",
+            Instant::now(),
+            LlmCancel::None,
+        )
+        .await
+        .expect("collect");
+        assert_eq!(res.full_text, "Hi there");
+        assert_eq!(res.reasoning, "R");
+        assert_eq!(res.usage.get("prompt").and_then(Value::as_i64), Some(3));
+        assert_eq!(res.usage.get("completion").and_then(Value::as_i64), Some(4));
+        assert_eq!(res.usage.get("total").and_then(Value::as_i64), Some(7));
+        assert_eq!(res.model_used, "gpt-test");
+        assert!(res.tool_calls.is_empty());
+        unsafe { std::env::remove_var("MO_STREAM_IDLE_TIMEOUT_MS") };
+    }
+
+    #[tokio::test]
+    async fn collect_llm_stream_merges_tool_call_argument_chunks() {
+        unsafe { std::env::set_var("MO_STREAM_IDLE_TIMEOUT_MS", "60000") };
+        let c1 = json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"bash","arguments":"{\"foo"}}]}}]});
+        let c2 = json!({"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\":\"bar\"}"}}]}}]});
+        let body = format!(
+            "data: {}\n\ndata: {}\n\n",
+            c1.to_string(),
+            c2.to_string()
+        );
+        let stream = stream::iter(vec![Ok(Bytes::from(body))]);
+        let res = collect_llm_stream(stream, "m", Instant::now(), LlmCancel::None)
+            .await
+            .expect("collect");
+        assert_eq!(res.tool_calls.len(), 1);
+        let args = res.tool_calls[0]["function"]["arguments"]
+            .as_str()
+            .expect("arguments string");
+        let parsed: Value = serde_json::from_str(args).expect("valid merged JSON args");
+        assert_eq!(parsed, json!({"foo":"bar"}));
+        assert_eq!(
+            res.tool_calls[0]["function"]["name"].as_str(),
+            Some("bash")
+        );
+        unsafe { std::env::remove_var("MO_STREAM_IDLE_TIMEOUT_MS") };
+    }
+
+    #[tokio::test]
     async fn stream_idle_timeout_triggers() {
         // Keep this test fast: override idle timeout to 1ms.
         unsafe { std::env::set_var("MO_STREAM_IDLE_TIMEOUT_MS", "1") };
