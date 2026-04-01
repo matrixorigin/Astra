@@ -56,6 +56,9 @@ struct FileState {
     from_read: bool,
     /// True if the last read was a partial view (outline, line range).
     is_partial: bool,
+    /// How many times this file has been read (any range).
+    /// Used for escalating warnings when the model loops on the same file.
+    read_count: u32,
 }
 
 pub fn all_tool_schemas() -> Vec<Value> {
@@ -1246,12 +1249,14 @@ impl ToolExecutor {
     fn record_read(&self, path: &Path, is_partial: bool) {
         let ts = Self::file_mtime_ms(path);
         if let Ok(mut state) = self.file_state.lock() {
+            let prev_count = state.get(path).map(|fs| fs.read_count).unwrap_or(0);
             state.insert(
                 path.to_path_buf(),
                 FileState {
                     timestamp_ms: ts,
                     from_read: true,
                     is_partial,
+                    read_count: prev_count + 1,
                 },
             );
             // LRU eviction: keep at most MAX_FILE_STATE_ENTRIES
@@ -1277,6 +1282,7 @@ impl ToolExecutor {
                     timestamp_ms: ts,
                     from_read: false,
                     is_partial: false,
+                    read_count: 0,
                 },
             );
             // LRU eviction: keep at most MAX_FILE_STATE_ENTRIES
@@ -1328,7 +1334,12 @@ impl ToolExecutor {
     }
 
     /// Check if we can dedup a read (previous op was a full read, unchanged mtime).
+    /// Respects `MO_DEDUP_DISABLED=1` env var killswitch (inspired by Claude Code's
+    /// `tengu_read_dedup_killswitch` feature flag).
     fn can_dedup_read(&self, path: &Path) -> bool {
+        if std::env::var("MO_DEDUP_DISABLED").is_ok_and(|v| v == "1" || v == "true") {
+            return false;
+        }
         let current_ts = Self::file_mtime_ms(path);
         if current_ts == 0 {
             return false;
@@ -1341,6 +1352,15 @@ impl ToolExecutor {
                     .map(|fs| fs.from_read && !fs.is_partial && fs.timestamp_ms == current_ts)
             })
             .unwrap_or(false)
+    }
+
+    /// How many times this file has been read in the current session.
+    fn file_read_count(&self, path: &Path) -> u32 {
+        self.file_state
+            .lock()
+            .ok()
+            .and_then(|s| s.get(path).map(|fs| fs.read_count))
+            .unwrap_or(0)
     }
 
     /// Check if a file was previously partially read (outline or line range) and

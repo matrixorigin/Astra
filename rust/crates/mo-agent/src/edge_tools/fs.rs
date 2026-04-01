@@ -266,12 +266,23 @@ impl ToolExecutor {
 
         let is_ranged = start.is_some() || end.is_some();
 
-        // Dedup: if same file, same range, unchanged mtime → skip re-sending
-        if !is_ranged && self.can_dedup_read(&path) {
-            return format!(
-                "[File unchanged since last read — refer to the earlier read_file result for {}]",
-                path_str
-            );
+        // Dedup: if file was fully read before and hasn't changed, return stub.
+        // Works for both ranged and non-ranged reads — once the model has the
+        // full file content, any further reads are wasteful.
+        if self.can_dedup_read(&path) {
+            let msg = if is_ranged {
+                format!(
+                    "[File already fully read and unchanged — refer to the earlier \
+                     read_file result for {path_str}. Do not re-read the same file \
+                     in multiple small ranges.]"
+                )
+            } else {
+                format!(
+                    "[File unchanged since last read — refer to the earlier \
+                     read_file result for {path_str}]"
+                )
+            };
+            return msg;
         }
 
         // Auto-expand: if same file was previously read in a different range
@@ -294,6 +305,20 @@ impl ToolExecutor {
         // Record the read state
         self.record_read(&path, is_ranged);
 
+        // Escalating warning when the same file is read too many times.
+        // Inspired by Claude Code's dedup stub behavior: train the model
+        // to stop re-reading by making the cost of repetition visible.
+        let read_count = self.file_read_count(&path);
+        let read_warning = if read_count >= 4 {
+            "\n\n⚠ WARNING: This file has been read 4+ times this session. You already \
+             have this content — stop re-reading and use the information from earlier reads."
+        } else if read_count >= 3 {
+            "\n\n⚠ Note: This file has been read 3 times. Consider using content from \
+             earlier reads instead of requesting more ranges."
+        } else {
+            ""
+        };
+
         if !is_ranged {
             let total_lines = content.lines().count();
             let max_chars = self.scaled_output_limit();
@@ -302,14 +327,24 @@ impl ToolExecutor {
                 out.push_str(&format!(
                     "\n[truncated — file has {total_lines} lines, use start_line/end_line or outline=true]"
                 ));
+                if !read_warning.is_empty() {
+                    out.push_str(read_warning);
+                }
                 return out;
             }
-            return content;
+            if read_warning.is_empty() {
+                return content;
+            }
+            return format!("{content}{read_warning}");
         }
         let lines: Vec<&str> = content.lines().collect();
         let s = start.unwrap_or(1).saturating_sub(1);
         let e = end.unwrap_or(lines.len()).min(lines.len());
-        truncate_output(lines[s..e].join("\n"), self.scaled_output_limit())
+        let mut result = truncate_output(lines[s..e].join("\n"), self.scaled_output_limit());
+        if !read_warning.is_empty() {
+            result.push_str(read_warning);
+        }
+        result
     }
 
     /// Returns JSON with structured result for reliable parsing
