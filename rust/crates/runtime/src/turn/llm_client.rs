@@ -99,7 +99,9 @@ pub(crate) fn cached_system_prompt(
 /// Classify an LLM error message into a category for SSE error events.
 pub(crate) fn classify_llm_error(msg: &str) -> &'static str {
     let lower = msg.to_lowercase();
-    if lower.contains("rate") || lower.contains("429") {
+    if is_context_window_error(&lower) {
+        "context_window"
+    } else if lower.contains("rate") || lower.contains("429") {
         "rate_limit"
     } else if lower.contains("timeout") || lower.contains("timed out") {
         "timeout"
@@ -112,6 +114,21 @@ pub(crate) fn classify_llm_error(msg: &str) -> &'static str {
         "internal"
     }
 }
+
+/// Detect context-window / prompt-too-long errors in API responses.
+pub(crate) fn is_context_window_error(lower: &str) -> bool {
+    lower.contains("context_length_exceeded")
+        || lower.contains("maximum context length")
+        || lower.contains("prompt is too long")
+        || lower.contains("too many tokens")
+        || lower.contains("input is too long")
+        || lower.contains("context window")
+        || lower.contains("max_tokens")
+            && (lower.contains("exceed") || lower.contains("limit"))
+}
+
+/// Prefix for context-window errors that callers can detect.
+pub(crate) const CONTEXT_WINDOW_ERROR_PREFIX: &str = "[CONTEXT_WINDOW] ";
 
 /// Collected result from a single LLM streaming call.
 #[derive(Debug, Clone, Default)]
@@ -366,6 +383,12 @@ pub(crate) async fn call_llm_and_collect(
         // Other 5xx errors are retryable
         if status >= 500 {
             continue;
+        }
+
+        // Context-window errors get a special prefix so callers can
+        // detect them and trigger auto-compaction + retry.
+        if status == 400 && is_context_window_error(&text.to_lowercase()) {
+            return Err(format!("{CONTEXT_WINDOW_ERROR_PREFIX}{last_err}"));
         }
 
         return Err(last_err);

@@ -358,7 +358,7 @@ mod tests {
         let b = ContextBudget::default();
         assert_eq!(b.model_limit, 128_000);
         assert!((b.compact_threshold - 0.75).abs() < 0.01);
-        assert_eq!(b.keep_recent_turns, 4);
+        assert_eq!(b.keep_recent_turns, 6);
     }
 
     #[test]

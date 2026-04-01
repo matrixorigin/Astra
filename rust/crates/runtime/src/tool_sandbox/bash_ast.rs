@@ -218,6 +218,14 @@ fn analyze_command_invocation(node: Node<'_>, ctx: &mut RiskCtx<'_>) {
     if lower == "eval" {
         ctx.push(CommandRisk::Eval);
     }
+
+    // Zsh dangerous builtins (AST may parse these as simple commands)
+    if matches!(
+        lower.as_str(),
+        "zmodload" | "sysopen" | "ztcp" | "zsocket" | "zselect"
+    ) {
+        ctx.push(CommandRisk::ZshDangerous(format!("{lower} builtin")));
+    }
 }
 
 fn command_name(node: Node<'_>, ctx: &RiskCtx<'_>) -> Option<String> {

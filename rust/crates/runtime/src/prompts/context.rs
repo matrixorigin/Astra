@@ -199,24 +199,24 @@ impl CompactionTier {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct CompactConfig {
     /// Enable LLM-generated summary instead of pure truncation.
-    /// Defaults to `false` to avoid unexpected API costs.
+    /// Defaults to `true`. Set `MO_COMPACT_SUMMARY_ENABLED=false` to disable.
     pub enable_summary: bool,
     /// Maximum tokens to generate for the summary.
     pub summary_token_budget: usize,
     /// Maximum PTL retry attempts before falling back to truncation.
     pub max_ptl_retries: usize,
     /// Minimum compaction tier that triggers LLM summary.
-    /// Defaults to AggressivePrune (only summarize at highest pressure).
+    /// Defaults to CompactHistory (75%+ context usage).
     pub summary_min_tier: CompactionTier,
 }
 
 impl Default for CompactConfig {
     fn default() -> Self {
         Self {
-            enable_summary: false,
+            enable_summary: true,
             summary_token_budget: 20_000,
             max_ptl_retries: 3,
-            summary_min_tier: CompactionTier::AggressivePrune,
+            summary_min_tier: CompactionTier::CompactHistory,
         }
     }
 }
@@ -224,14 +224,14 @@ impl Default for CompactConfig {
 impl CompactConfig {
     /// Build config from environment variables.
     ///
-    /// - `MO_COMPACT_SUMMARY_ENABLED` — "true" or "1" enables LLM summary (default: false)
-    /// - `MO_COMPACT_SUMMARY_MIN_TIER` — minimum tier: "trim", "compact", "aggressive" (default: aggressive)
+    /// - `MO_COMPACT_SUMMARY_ENABLED` — "false" or "0" disables LLM summary (default: true)
+    /// - `MO_COMPACT_SUMMARY_MIN_TIER` — minimum tier: "trim", "compact", "aggressive" (default: compact)
     /// - `MO_COMPACT_SUMMARY_TOKEN_BUDGET` — max output tokens for summary (default: 20000)
     pub fn from_env() -> Self {
         let enable_summary = std::env::var("MO_COMPACT_SUMMARY_ENABLED")
             .ok()
-            .map(|v| v == "true" || v == "1")
-            .unwrap_or(false);
+            .map(|v| v != "false" && v != "0")
+            .unwrap_or(true);
 
         let summary_min_tier = std::env::var("MO_COMPACT_SUMMARY_MIN_TIER")
             .ok()
@@ -241,7 +241,7 @@ impl CompactConfig {
                 "aggressive" | "aggressiveprune" => Some(CompactionTier::AggressivePrune),
                 _ => None,
             })
-            .unwrap_or(CompactionTier::AggressivePrune);
+            .unwrap_or(CompactionTier::CompactHistory);
 
         let summary_token_budget = std::env::var("MO_COMPACT_SUMMARY_TOKEN_BUDGET")
             .ok()
@@ -328,7 +328,7 @@ impl Default for ContextBudget {
         Self {
             model_limit: 128_000,
             compact_threshold: 0.75,
-            keep_recent_turns: 4,
+            keep_recent_turns: 6,
             memory_budget_chars: 8_000,
             output_reserve_ratio: 0.15,
             compact_config: CompactConfig::default(),
@@ -614,7 +614,7 @@ mod tests {
         let b = ContextBudget::default();
         assert_eq!(b.model_limit, 128_000);
         assert!((b.compact_threshold - 0.75).abs() < f64::EPSILON);
-        assert_eq!(b.keep_recent_turns, 4);
+        assert_eq!(b.keep_recent_turns, 6);
         assert_eq!(b.memory_budget_chars, 8_000);
     }
 

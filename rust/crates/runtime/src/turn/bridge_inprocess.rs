@@ -787,6 +787,15 @@ async fn call_llm_stream(
         }
 
         // 4xx (except 429) is not retryable — fail immediately
+        // Context-window errors get a special prefix so callers can detect and
+        // trigger auto-compaction + retry.
+        if status == 400 && crate::turn::llm_client::is_context_window_error(&text.to_lowercase()) {
+            return Err(format!(
+                "{}{}",
+                crate::turn::llm_client::CONTEXT_WINDOW_ERROR_PREFIX,
+                last_err
+            ));
+        }
         return Err(last_err);
     }
 
@@ -1310,6 +1319,85 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
                     .await
                     {
                         Ok(s) => s,
+                        Err(e) if e.starts_with(crate::turn::llm_client::CONTEXT_WINDOW_ERROR_PREFIX) => {
+                            // Context-window error: force aggressive compaction and retry once
+                            mo_agent_core::agent_warn!(
+                                "bridge",
+                                "context window exceeded — forcing aggressive compaction and retrying"
+                            );
+                            // Re-compact with AggressivePrune tier
+                            let budget = crate::prompts::budget_for_model(Some(&model_name));
+                            let aggressive_params = crate::turn::cloud::memoria_compact::MemoriaCompactParams {
+                                budget_chars: budget.effective_input_limit() * 3, // tighter budget
+                                keep_chars: 1_000, // more aggressive truncation
+                                tier: crate::prompts::CompactionTier::AggressivePrune,
+                                keep_recent_turns: 4, // keep fewer turns
+                                current_tokens: budget.effective_input_limit(), // assume we're at limit
+                            };
+                            let compact_config = crate::prompts::CompactConfig::from_env();
+                            let summary_client = crate::turn::cloud::summary::HttpSummaryClient::new(
+                                crate::turn::cloud::summary::LlmConnParams {
+                                    model_name: model_name.clone(),
+                                    api_key: api_key.clone(),
+                                    base_url: base_url.clone(),
+                                    provider: provider.clone(),
+                                    max_output_tokens: compact_config.summary_token_budget,
+                                },
+                            );
+                            let memoria_client = crate::turn::cloud::memoria_compact::HttpMemoriaClient::from_env();
+                            let memoria_config = crate::turn::cloud::memoria_compact::MemoriaCompactConfig::default();
+                            
+                            // Get original messages (exclude system message at index 0)
+                            let original_msgs: Vec<Value> = llm_messages.iter().skip(1).cloned().collect();
+                            let compact_result = crate::turn::cloud::memoria_compact::compact_with_memoria(
+                                &original_msgs,
+                                Some(&session_id),
+                                &memoria_config,
+                                &aggressive_params,
+                                memoria_client.as_ref().map(|c| c as &dyn crate::turn::cloud::memoria_compact::MemoriaClient),
+                                Some(&compact_config),
+                                Some(&summary_client as &dyn crate::turn::cloud::summary::SummaryLlmClient),
+                            )
+                            .await;
+                            
+                            // Rebuild llm_messages with compacted content
+                            let system_msg = llm_messages.first().cloned();
+                            llm_messages.clear();
+                            if let Some(sys) = system_msg {
+                                llm_messages.push(sys);
+                            }
+                            llm_messages.extend(compact_result.messages);
+                            
+                            // Also prune tool schemas more aggressively
+                            pruned_tools = prune_tool_schemas(&edge_tools, crate::prompts::CompactionTier::AggressivePrune);
+                            annotate_tool_schemas_for_caching(&mut pruned_tools, &provider, &model_name);
+                            
+                            // Retry LLM call
+                            match call_llm_stream(
+                                &llm_messages,
+                                &pruned_tools,
+                                &model_name,
+                                &api_key,
+                                &base_url,
+                                &provider,
+                                Some(max_output_tokens / 2), // reduce output budget too
+                                has_fallback,
+                                cc.clone(),
+                            )
+                            .await
+                            {
+                                Ok(s) => s,
+                                Err(e2) => {
+                                    let kind = classify_llm_error(&e2);
+                                    yield render_sse_map(&build_stream_error_event(
+                                        &format!("Context window exceeded even after aggressive compaction: {e2}"),
+                                        kind,
+                                        false, // not retryable
+                                    ));
+                                    return;
+                                }
+                            }
+                        }
                         Err(e) => {
                             let kind = classify_llm_error(&e);
                             yield render_sse_map(&build_stream_error_event(&e, kind, kind != "internal"));

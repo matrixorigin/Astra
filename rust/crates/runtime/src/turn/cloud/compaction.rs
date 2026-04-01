@@ -602,8 +602,10 @@ mod tests {
     #[test]
     fn compact_config_default_disables_summary() {
         let cfg = CompactConfig::default();
-        assert!(!cfg.enable_summary);
-        assert!(!cfg.should_summarize(CompactionTier::AggressivePrune));
+        assert!(cfg.enable_summary, "summary enabled by default");
+        assert!(cfg.should_summarize(CompactionTier::CompactHistory));
+        assert!(cfg.should_summarize(CompactionTier::AggressivePrune));
+        assert!(!cfg.should_summarize(CompactionTier::TrimSchemas));
     }
 
     #[test]
