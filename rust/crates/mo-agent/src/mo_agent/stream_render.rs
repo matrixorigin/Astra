@@ -99,6 +99,13 @@ impl SseStreamHost for CliSseStreamHost<'_> {
         tool: &str,
         args: &serde_json::Value,
     ) -> EdgeToolExecResult {
+        // Tool request means this is an intermediate turn — clear any
+        // draft text that was rendered during streaming so it doesn't
+        // flash on screen before the tool results replace it.
+        if let Some(md) = &mut self.render.md {
+            md.clear_all();
+            self.render.lines_written = 0;
+        }
         if !self.quiet {
             eprintln!(
                 "{}",
