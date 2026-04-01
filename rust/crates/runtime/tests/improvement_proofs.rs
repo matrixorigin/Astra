@@ -3210,14 +3210,9 @@ mod stall_enforcement_proofs {
                 s.insert("grep:{}".to_string());
                 s
             },
-            {
-                let mut s = BTreeSet::new();
-                s.insert("glob:{}".to_string());
-                s
-            },
         ];
         assert!(!detect_server_stall(&div_sigs, 2)); // different tools each turn
-        assert_eq!(detect_divergence(&div_sigs), DivergenceStatus::Exploring(5));
+        assert_eq!(detect_divergence(&div_sigs), DivergenceStatus::Exploring(4));
     }
 }
 
@@ -4714,18 +4709,18 @@ mod runtime_limits_proofs {
         // These were previously scattered across 6+ files as raw constants.
         // Now centralized with env-var override capability.
         let d = RuntimeLimits::default();
-        assert_eq!(d.max_turns, 25, "was MAX_TURNS in chat_stream.rs");
-        assert_eq!(d.max_tool_rounds, 10, "was MAX_TOOL_ROUNDS in routing.rs");
+        assert_eq!(d.max_turns, 50, "was MAX_TURNS in chat_stream.rs");
+        assert_eq!(d.max_tool_rounds, 15, "was MAX_TOOL_ROUNDS in routing.rs");
         assert!(
-            (d.turn_timeout_s - 240.0).abs() < f64::EPSILON,
+            (d.turn_timeout_s - 300.0).abs() < f64::EPSILON,
             "was TURN_TIMEOUT_S in bridge_inprocess.rs"
         );
         assert_eq!(
-            d.global_output_limit, 50_000,
+            d.global_output_limit, 200_000,
             "was GLOBAL_OUTPUT_LIMIT in edge_tools.rs"
         );
         assert_eq!(
-            d.tool_output_limit, 20_000,
+            d.tool_output_limit, 80_000,
             "was DEFAULT_TOOL_OUTPUT_LIMIT in edge_tools.rs"
         );
         assert_eq!(

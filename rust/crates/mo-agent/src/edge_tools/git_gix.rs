@@ -12,7 +12,7 @@ use serde_json::Value;
 
 use super::truncate_output;
 
-const DIFF_LIMIT: usize = 12_000; // ~3K tokens; was 20K
+const DIFF_LIMIT: usize = 40_000; // ~10K tokens — diff is the primary input for code review
 const SHOW_LIMIT: usize = 16_000; // ~4K tokens; was 30K
 
 fn tool_output_limit() -> usize {
@@ -20,10 +20,11 @@ fn tool_output_limit() -> usize {
 }
 
 /// Scale a base output limit by budget pressure.
-/// pressure=0.0 → 100% of base, pressure=0.6 → 52%, pressure=0.9 → 28%.
-/// Never goes below 20% of base (minimum useful output).
+/// pressure=0.0 → 100% of base, pressure=0.6 → 70%, pressure=0.9 → 46%.
+/// Never goes below 40% of base — aggressive truncation on git diffs
+/// forces bash fallbacks which waste a tool round.
 fn pressure_scaled_limit(base: usize, pressure: f64) -> usize {
-    let scale = (1.0 - pressure * 0.8).max(0.2);
+    let scale = (1.0 - pressure * 0.6).max(0.4);
     (base as f64 * scale) as usize
 }
 
@@ -2319,20 +2320,23 @@ mod tests {
     fn pressure_scaled_limit_moderate_pressure_reduces() {
         let limit = super::pressure_scaled_limit(12_000, 0.6);
         assert!(limit < 12_000, "moderate pressure should reduce limit");
-        assert!(limit > 2_400, "should stay above 20% minimum");
-        assert_eq!(limit, 6_240);
+        assert!(limit > 4_800, "should stay above 40% minimum");
+        // scale = 1.0 - 0.6*0.6 = 0.64 → 12000 * 0.64 = 7680
+        assert_eq!(limit, 7_680);
     }
 
     #[test]
     fn pressure_scaled_limit_max_pressure_reaches_floor() {
         let limit = super::pressure_scaled_limit(12_000, 1.0);
-        assert_eq!(limit, 2_400);
+        // scale = 1.0 - 1.0*0.6 = 0.4 → 12000 * 0.4 = 4800
+        assert_eq!(limit, 4_800);
     }
 
     #[test]
-    fn pressure_scaled_limit_never_goes_below_twenty_percent() {
+    fn pressure_scaled_limit_never_goes_below_forty_percent() {
         let limit = super::pressure_scaled_limit(10_000, 1.5);
-        assert_eq!(limit, 2_000);
+        // scale = max(1.0 - 1.5*0.6, 0.4) = max(0.1, 0.4) = 0.4 → 4000
+        assert_eq!(limit, 4_000);
     }
 
     #[test]

@@ -349,6 +349,9 @@ pub(crate) struct ChatTurnSseFetchRequest<'a> {
     pub assembly_start: Instant,
     pub telem: PrepareTurnTelemetry<'a>,
     pub perm_manager: &'a mut PermissionManager,
+    /// Lines from the previous headless tool round that must be cleared
+    /// before the next SSE stream starts rendering.
+    pub pre_clear_lines: usize,
 }
 
 pub(crate) async fn fetch_chat_turn_sse(
@@ -381,6 +384,7 @@ pub(crate) async fn fetch_chat_turn_sse(
         assembly_start,
         telem,
         perm_manager,
+        pre_clear_lines,
     } = ctx;
 
     let payload = prepare_chat_turn_payload(PrepareChatTurnRequest {
@@ -436,7 +440,7 @@ pub(crate) async fn fetch_chat_turn_sse(
         perm_manager: Some(perm_manager),
     };
 
-    Ok(consume_turn_sse(resp, render_md, term_width, quiet, Some(edge_ctx)).await)
+    Ok(consume_turn_sse(resp, render_md, term_width, quiet, Some(edge_ctx), pre_clear_lines).await)
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────────

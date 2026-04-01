@@ -106,6 +106,38 @@ pub fn semantic_call_key(tool_name: &str, args: &Value) -> Option<String> {
             ))
         }
         // Non-cacheable tools (bash, write_file, web_fetch, etc.) — no semantic key
+        // Analysis tools: key on target symbol/file
+        "symbols" | "find_definition" | "find_references" => {
+            let path = arg_str(args, "file").or_else(|| arg_str(args, "path"))?;
+            let symbol = arg_str(args, "symbol").unwrap_or("");
+            Some(format!("{}:{}:{}", tool_name, normalize_path(path), symbol))
+        }
+        "symbol_search" => {
+            let query = arg_str(args, "query").unwrap_or("");
+            Some(format!("symbol_search:{}", query.to_lowercase()))
+        }
+        "hover_info" => {
+            let file = arg_str(args, "file")?;
+            let line = args.get("line").and_then(Value::as_u64).unwrap_or(0);
+            let col = args.get("column").and_then(Value::as_u64).unwrap_or(0);
+            Some(format!("hover_info:{}:{}:{}", normalize_path(file), line, col))
+        }
+        "call_graph" => {
+            let symbol = arg_str(args, "symbol")?;
+            let file = arg_str(args, "file").unwrap_or("");
+            let callers = args.get("callers").and_then(Value::as_bool).unwrap_or(false);
+            Some(format!("call_graph:{}:{}:callers={}", symbol, normalize_path(file), callers))
+        }
+        "type_hierarchy" | "dead_code" | "extract_members" => {
+            let file = arg_str(args, "file").or_else(|| arg_str(args, "path")).unwrap_or(".");
+            Some(format!("{}:{}", tool_name, normalize_path(file)))
+        }
+        // Memory tools: key on query
+        "memory_search" => {
+            let query = arg_str(args, "query").unwrap_or("");
+            Some(format!("memory_search:{}", query.to_lowercase()))
+        }
+        "memory_profile" => Some("memory_profile".to_string()),
         _ => None,
     }
 }

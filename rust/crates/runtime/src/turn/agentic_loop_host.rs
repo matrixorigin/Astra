@@ -515,7 +515,11 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
         }
 
         if state.remaining_turns == 0 {
-            return Err(CLI_AGENTIC_TURN_BUDGET_STALL_ABORT_MSG.to_string());
+            return Err(format!(
+                "{} ({} turns used)",
+                CLI_AGENTIC_TURN_BUDGET_STALL_ABORT_MSG,
+                state.max_turns
+            ));
         }
         state.remaining_turns = state.remaining_turns.saturating_sub(1);
         state.step_recorder.begin_turn(turn_index as u32);

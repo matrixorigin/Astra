@@ -51,7 +51,7 @@ struct CliSseStreamHost<'a> {
 }
 
 impl<'a> CliSseStreamHost<'a> {
-    fn from_edge_ctx(ctx: EdgeSseContext<'a>) -> Self {
+    fn from_edge_ctx(ctx: EdgeSseContext<'a>, term_width: usize) -> Self {
         Self {
             api: ctx.api,
             token: ctx.token,
@@ -59,7 +59,7 @@ impl<'a> CliSseStreamHost<'a> {
             executor: ctx.executor,
             quiet: ctx.quiet,
             perm_manager: ctx.perm_manager,
-            render: StreamRenderState::new(),
+            render: StreamRenderState::with_term_width(term_width),
             edge_tool_round: Vec::new(),
         }
     }
@@ -76,6 +76,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                 SseRenderEffect::StreamText(s) => {
                     print!("{s}");
                     let _ = io::stdout().flush();
+                    self.render.track_output(&s);
                 }
                 SseRenderEffect::StopThinkingSpinner => self.render.stop_thinking(),
                 SseRenderEffect::StartThinkingSpinner => self.render.start_thinking(),
@@ -98,6 +99,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                 "{}",
                 edge_sse_tool_request_notice_line(tool, request_id).dim()
             );
+            self.render.track_eprintln();
         }
         let allowed = match &mut self.perm_manager {
             Some(pm) => pm.check(tool, args),
@@ -147,7 +149,20 @@ impl SseStreamHost for CliSseStreamHost<'_> {
         path: Option<&str>,
     ) -> EdgeApprovalResult {
         let decision = match &mut self.perm_manager {
-            Some(pm) => pm.resolve_cloud_approval(tool, path, self.quiet),
+            Some(pm) => {
+                let d = pm.resolve_cloud_approval(tool, path, self.quiet);
+                if !self.quiet {
+                    // Cloud approval prompt emits 2-4 lines to stderr
+                    // (header + optional path + prompt + optional confirmation).
+                    self.render.lines_written += if path.is_some_and(|p| !p.is_empty()) {
+                        4
+                    } else {
+                        3
+                    };
+                    self.render.col = 0;
+                }
+                d
+            }
             None => mo_thin_client::ApprovalDecision::Deny,
         };
         let decision_str = match &decision {
@@ -268,14 +283,51 @@ impl TurnResult {
 pub(super) struct StreamRenderState {
     thinking_start: Option<Instant>,
     thinking_spinner: Option<Spinner>,
+    /// Lines written to the terminal during streaming (stdout + stderr).
+    /// Used by the re-render pass to clear all streamed output.
+    pub(super) lines_written: usize,
+    /// Current column position for wrap tracking.
+    col: usize,
+    /// Terminal width for wrap calculation.
+    term_width: usize,
 }
 
 impl StreamRenderState {
+    #[cfg(test)]
     pub(super) fn new() -> Self {
+        Self::with_term_width(80)
+    }
+
+    fn with_term_width(tw: usize) -> Self {
         Self {
             thinking_start: None,
             thinking_spinner: None,
+            lines_written: 0,
+            col: 0,
+            term_width: tw.max(1),
         }
+    }
+
+    /// Account for text written to the terminal (stdout or stderr).
+    pub(super) fn track_output(&mut self, text: &str) {
+        for ch in text.chars() {
+            if ch == '\n' {
+                self.lines_written += 1;
+                self.col = 0;
+            } else {
+                self.col += 1;
+                if self.col >= self.term_width {
+                    self.lines_written += 1;
+                    self.col = 0;
+                }
+            }
+        }
+    }
+
+    /// Account for a full line written via eprintln! (adds 1 line).
+    pub(super) fn track_eprintln(&mut self) {
+        self.lines_written += 1;
+        self.col = 0;
     }
 
     fn start_thinking(&mut self) {
@@ -291,6 +343,7 @@ impl StreamRenderState {
             if let Some(start) = self.thinking_start.take() {
                 let elapsed = start.elapsed().as_secs_f64();
                 eprintln!("{}", edge_sse_thought_duration_line(elapsed).dim());
+                self.track_eprintln();
             }
         }
     }
@@ -309,6 +362,7 @@ fn apply_sse_render_effects(
             SseRenderEffect::StreamText(s) => {
                 print!("{s}");
                 let _ = io::stdout().flush();
+                render.track_output(&s);
             }
             SseRenderEffect::StopThinkingSpinner => render.stop_thinking(),
             SseRenderEffect::StartThinkingSpinner => render.start_thinking(),
@@ -328,6 +382,7 @@ pub(super) async fn consume_turn_sse(
     term_width: usize,
     quiet: bool,
     edge: Option<EdgeSseContext<'_>>,
+    pre_clear_lines: usize,
 ) -> TurnResult {
     // Convert reqwest byte stream to runtime's generic chunk type
     let mut byte_stream = Box::pin(
@@ -337,14 +392,19 @@ pub(super) async fn consume_turn_sse(
 
     // Delegate to runtime's generic SSE consumer with the appropriate host
     let idle = std::time::Duration::from_millis(STREAM_IDLE_TIMEOUT_MS);
-    let (sse_result, edge_tool_round) = if let Some(ctx) = edge {
-        let mut host = CliSseStreamHost::from_edge_ctx(ctx);
+    let (sse_result, edge_tool_round, lines_written) = if let Some(ctx) = edge {
+        let mut host = CliSseStreamHost::from_edge_ctx(ctx, term_width);
+        host.render.lines_written = pre_clear_lines;
         let (result, _abort) = consume_sse_stream(&mut byte_stream, &mut host, idle).await;
-        (result, host.edge_tool_round)
+        let lw = host.render.lines_written;
+        (result, host.edge_tool_round, lw)
     } else {
+        let mut render = StreamRenderState::with_term_width(term_width);
+        render.lines_written = pre_clear_lines;
         let mut host = NoopSseStreamHost;
         let (result, _abort) = consume_sse_stream(&mut byte_stream, &mut host, idle).await;
-        (result, Vec::new())
+        let lw = render.lines_written;
+        (result, Vec::new(), lw)
     };
 
     let result = TurnResult {
@@ -358,50 +418,27 @@ pub(super) async fn consume_turn_sse(
     }
 
     // ─── Terminal re-render (CLI-specific) ────────────────────────────────
-    // Clear raw streamed text and re-render cleanly with markdown support
-    if !result.full_text.is_empty() {
-        let tw = term_width.max(1);
-        let mut visual_lines = 0usize;
-        let mut col = 0usize;
-        for ch in result.full_text.chars() {
-            if ch == '\n' {
-                visual_lines += 1;
-                col = 0;
-            } else {
-                col += 1;
-                if col >= tw {
-                    visual_lines += 1;
-                    col = 0;
-                }
-            }
-        }
-        if visual_lines > 0 {
-            execute!(
-                io::stdout(),
-                cursor::MoveUp(visual_lines as u16),
-                cursor::MoveToColumn(0),
-                terminal::Clear(terminal::ClearType::FromCursorDown)
-            )
-            .ok();
-        } else {
-            execute!(
-                io::stdout(),
-                cursor::MoveToColumn(0),
-                terminal::Clear(terminal::ClearType::CurrentLine)
-            )
-            .ok();
-        }
+    // Clear ALL output produced during streaming (text deltas, thinking
+    // duration lines, tool-request notices) so the re-render starts clean.
+    if lines_written > 0 {
+        execute!(
+            io::stdout(),
+            cursor::MoveUp(lines_written as u16),
+            cursor::MoveToColumn(0),
+            terminal::Clear(terminal::ClearType::FromCursorDown)
+        )
+        .ok();
+    } else if !result.full_text.is_empty() {
+        execute!(
+            io::stdout(),
+            cursor::MoveToColumn(0),
+            terminal::Clear(terminal::ClearType::CurrentLine)
+        )
+        .ok();
+    }
 
-        if result.has_tool_calls {
-            let trimmed = result.full_text.trim();
-            if !trimmed.is_empty() {
-                if render_md {
-                    print_markdown(trimmed);
-                } else {
-                    println!("{trimmed}");
-                }
-            }
-        } else if render_md {
+    if should_rerender_text(result.has_tool_calls) && !result.full_text.is_empty() {
+        if render_md {
             print_markdown(&result.full_text);
         } else {
             println!("{}", result.full_text.trim_end());
@@ -409,6 +446,15 @@ pub(super) async fn consume_turn_sse(
     }
 
     result
+}
+
+/// Whether the re-render pass should print the accumulated text.
+///
+/// Returns `false` when tool calls are pending — the text is an intermediate
+/// draft that would leak into the terminal and never be cleared by subsequent
+/// agentic-loop turns.
+fn should_rerender_text(has_tool_calls: bool) -> bool {
+    !has_tool_calls
 }
 
 /// Used by `main` test module and stream_render unit tests; production path is [`consume_turn_sse`].
@@ -488,5 +534,88 @@ mod tests {
             }
             _ => panic!("expected ApprovalRequired"),
         }
+    }
+
+    // ── Regression: intermediate draft text must not leak ─────────────
+
+    #[test]
+    fn rerender_suppressed_when_tool_calls_present() {
+        // When the LLM returns text + tool_calls (intermediate turn),
+        // the re-render must NOT print the draft text.
+        assert!(!should_rerender_text(true));
+    }
+
+    #[test]
+    fn rerender_allowed_when_no_tool_calls() {
+        // Final turn (no tool_calls) — text should be rendered.
+        assert!(should_rerender_text(false));
+    }
+
+    #[test]
+    fn dispatch_turn_complete_with_tool_calls_sets_flag() {
+        // Verify that turn_complete with has_tool_calls=true flows through
+        // to TurnResult so the re-render gate works end-to-end.
+        let mut r = TurnResult::new();
+        let mut s = StreamRenderState::new();
+        let block = format!(
+            "{}{}",
+            sse("text_delta", ",\"content\":\"draft review text\""),
+            sse("turn_complete", ",\"has_tool_calls\":true"),
+        );
+        dispatch_turn_event_block(&block, &mut r, &mut s, true, &mut vec![]);
+        assert_eq!(r.full_text, "draft review text");
+        assert!(r.has_tool_calls);
+        // The gate must suppress re-render for this result.
+        assert!(!should_rerender_text(r.has_tool_calls));
+    }
+
+    #[test]
+    fn dispatch_turn_complete_without_tool_calls_allows_rerender() {
+        let mut r = TurnResult::new();
+        let mut s = StreamRenderState::new();
+        let block = format!(
+            "{}{}",
+            sse("text_delta", ",\"content\":\"final answer\""),
+            sse("turn_complete", ",\"has_tool_calls\":false"),
+        );
+        dispatch_turn_event_block(&block, &mut r, &mut s, true, &mut vec![]);
+        assert_eq!(r.full_text, "final answer");
+        assert!(!r.has_tool_calls);
+        assert!(should_rerender_text(r.has_tool_calls));
+    }
+
+    // ── Line tracking ────────────────────────────────────────────────
+
+    #[test]
+    fn track_output_counts_newlines() {
+        let mut s = StreamRenderState::new();
+        s.track_output("hello\nworld\n");
+        assert_eq!(s.lines_written, 2);
+    }
+
+    #[test]
+    fn track_output_counts_wraps() {
+        let mut s = StreamRenderState::with_term_width(10);
+        // 20 chars = 2 wraps on a 10-col terminal
+        s.track_output("12345678901234567890");
+        assert_eq!(s.lines_written, 2);
+    }
+
+    #[test]
+    fn track_eprintln_increments_line() {
+        let mut s = StreamRenderState::new();
+        s.track_eprintln();
+        s.track_eprintln();
+        assert_eq!(s.lines_written, 2);
+    }
+
+    #[test]
+    fn track_mixed_stdout_stderr_lines() {
+        let mut s = StreamRenderState::with_term_width(80);
+        // Simulate: thinking line (stderr) + streamed text (stdout) + tool_request (stderr)
+        s.track_eprintln(); // ● Thought for 1.4s
+        s.track_output("Let me review the code\n"); // text_delta
+        s.track_eprintln(); // ⚡ tool_request: bash
+        assert_eq!(s.lines_written, 3);
     }
 }

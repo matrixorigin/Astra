@@ -302,7 +302,8 @@ mod tests {
     fn standard_adds_ulimits() {
         let p = SandboxPolicy::for_project("/tmp");
         let wrapped = wrap_command_with_limits(&p, "echo hello");
-        assert!(wrapped.contains("ulimit -u"), "should limit processes");
+        // Standard mode: no ulimit -u (max_processes=0) to avoid fork failures
+        assert!(!wrapped.contains("ulimit -u"), "Standard should NOT limit processes");
         assert!(wrapped.contains("ulimit -v"), "should limit memory");
         assert!(wrapped.contains("ulimit -c 0"), "should disable core dumps");
         assert!(
@@ -322,13 +323,12 @@ mod tests {
         let w_standard = wrap_command_with_limits(&standard, "ls");
         let w_strict = wrap_command_with_limits(&strict, "ls");
 
-        // Both should have ulimits
+        // Standard has memory + file + core limits but no process limit
         assert!(w_standard.contains("ulimit"));
-        assert!(w_strict.contains("ulimit"));
+        assert!(!w_standard.contains("ulimit -u"), "Standard: no process limit");
 
-        // Strict should have lower process limit
-        assert!(w_strict.contains("ulimit -u 32"));
-        assert!(w_standard.contains("ulimit -u 64"));
+        // Strict has process limit too
+        assert!(w_strict.contains("ulimit -u 512"));
     }
 
     // ── Risk analysis ────────────────────────────────────────────────────

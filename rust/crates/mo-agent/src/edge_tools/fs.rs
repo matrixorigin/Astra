@@ -274,6 +274,23 @@ impl ToolExecutor {
             );
         }
 
+        // Auto-expand: if same file was previously read in a different range
+        // (partial read, mtime unchanged) and file fits in output budget,
+        // return the full file to eliminate fragmented multi-range reads.
+        if is_ranged && self.was_partially_read_unchanged(&path) {
+            let max_chars = self.scaled_output_limit();
+            if content.len() <= max_chars {
+                // Upgrade to full read — future reads will hit can_dedup_read
+                self.record_read(&path, false);
+                let total_lines = content.lines().count();
+                return format!(
+                    "[Auto-expanded to full file — this file was already partially read. \
+                     {total_lines} lines total. Avoid reading the same file in many small ranges.]\n\
+                     {content}"
+                );
+            }
+        }
+
         // Record the read state
         self.record_read(&path, is_ranged);
 

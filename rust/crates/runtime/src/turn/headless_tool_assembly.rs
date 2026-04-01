@@ -172,6 +172,12 @@ pub const CACHEABLE_TOOLS: &[&str] = &[
     "symbols",
     "find_definition",
     "find_references",
+    "symbol_search",
+    "hover_info",
+    "call_graph",
+    "type_hierarchy",
+    "dead_code",
+    "extract_members",
     "git_status",
     "git_diff",
     "git_log",
@@ -184,6 +190,7 @@ pub const CACHEABLE_TOOLS: &[&str] = &[
     "github_ci_status",
     "github_list_issues",
     "github_get_issue",
+    "github_repo_stats",
     "get_agent_info",
 ];
 

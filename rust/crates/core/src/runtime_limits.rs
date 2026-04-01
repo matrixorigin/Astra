@@ -43,11 +43,11 @@ pub struct RuntimeLimits {
 impl Default for RuntimeLimits {
     fn default() -> Self {
         Self {
-            max_turns: 25,
-            max_tool_rounds: 10,
-            turn_timeout_s: 240.0,
-            global_output_limit: 50_000,
-            tool_output_limit: 20_000,
+            max_turns: 50,
+            max_tool_rounds: 15,
+            turn_timeout_s: 300.0,
+            global_output_limit: 200_000,
+            tool_output_limit: 80_000,
             max_tool_retries: 2,
             retry_base_ms: 500,
             max_retrieved: 6,
@@ -111,11 +111,11 @@ mod tests {
     #[test]
     fn defaults_match_original_constants() {
         let d = RuntimeLimits::default();
-        assert_eq!(d.max_turns, 25);
-        assert_eq!(d.max_tool_rounds, 10);
-        assert!((d.turn_timeout_s - 240.0).abs() < f64::EPSILON);
-        assert_eq!(d.global_output_limit, 50_000);
-        assert_eq!(d.tool_output_limit, 20_000);
+        assert_eq!(d.max_turns, 50);
+        assert_eq!(d.max_tool_rounds, 15);
+        assert!((d.turn_timeout_s - 300.0).abs() < f64::EPSILON);
+        assert_eq!(d.global_output_limit, 200_000);
+        assert_eq!(d.tool_output_limit, 80_000);
         assert_eq!(d.max_tool_retries, 2);
         assert_eq!(d.retry_base_ms, 500);
         assert_eq!(d.max_retrieved, 6);

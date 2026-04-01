@@ -9,18 +9,29 @@ pub const SERVER_STALL_WINDOW: usize = 3;
 
 /// User-visible error when the agentic loop exhausts the per-request remaining-turn budget (stall guard).
 pub const CLI_AGENTIC_TURN_BUDGET_STALL_ABORT_MSG: &str =
-    "Turn budget exhausted due to repeated stalls. Aborting.";
+    "Turn budget exhausted. To increase, set MO_MAX_TURNS=100 (current default: 50).";
 
 /// Tools considered "exploration" — low-value if used repeatedly without
 /// a "productive" tool call in between.
-const EXPLORATION_TOOLS: &[&str] = &["bash", "list_dir", "read_file", "glob", "grep"];
+const EXPLORATION_TOOLS: &[&str] = &[
+    "bash",
+    "list_dir",
+    "read_file",
+    "glob",
+    "grep",
+    "symbol_search",
+    "hover_info",
+    "call_graph",
+    "find_definition",
+    "find_references",
+    "symbols",
+];
 
 /// Maximum consecutive exploration-only rounds before triggering correction.
-/// Raised from 5→8: coding agents routinely need 6-8 rounds of
-/// grep→read_file→list_dir to understand a codebase before acting.
-/// 5 was too aggressive — sessions doing legitimate investigation got
-/// flagged as diverging prematurely.
-pub const MAX_EXPLORATION_ROUNDS: usize = 8;
+/// Lowered from 8→5: with auto-expanding read_file (full-file on 2nd+ ranged
+/// read), agents need fewer exploration rounds. 8 was too permissive — allowed
+/// long sequences of fragmented reads before any correction.
+pub const MAX_EXPLORATION_ROUNDS: usize = 5;
 
 pub fn canonical_tool_args(raw: &str) -> String {
     match serde_json::from_str::<Value>(raw) {
@@ -557,28 +568,28 @@ mod tests {
 
     #[test]
     fn divergence_exploring_two() {
-        // With MAX_EXPLORATION_ROUNDS=8, two consecutive exploration rounds → Exploring(2)
+        // With MAX_EXPLORATION_ROUNDS=5, two consecutive exploration rounds → Exploring(2)
         let sigs = make_sigs(&[&["github_list_prs"], &["bash"], &["list_dir"]]);
         assert_eq!(detect_divergence(&sigs), DivergenceStatus::Exploring(2));
     }
 
     #[test]
     fn divergence_exploring_three() {
-        // 3 consecutive exploration rounds → still Exploring (threshold is 8)
+        // 3 consecutive exploration rounds → still Exploring (threshold is 5)
         let sigs = make_sigs(&[&["bash"], &["list_dir"], &["read_file"]]);
         assert_eq!(detect_divergence(&sigs), DivergenceStatus::Exploring(3));
     }
 
     #[test]
     fn divergence_exploring_four() {
-        // 4 consecutive exploration rounds → still Exploring (threshold is 8)
+        // 4 consecutive exploration rounds → still Exploring (threshold is 5)
         let sigs = make_sigs(&[&["bash"], &["list_dir"], &["grep"], &["read_file"]]);
         assert_eq!(detect_divergence(&sigs), DivergenceStatus::Exploring(4));
     }
 
     #[test]
-    fn divergence_exploring_five_and_seven() {
-        // 5-7 consecutive exploration rounds → still Exploring (threshold is 8)
+    fn divergence_detected_at_five() {
+        // 5 consecutive exploration rounds → Diverging (hits threshold)
         let sigs = make_sigs(&[
             &["bash"],
             &["list_dir"],
@@ -586,22 +597,12 @@ mod tests {
             &["read_file"],
             &["glob"],
         ]);
-        assert_eq!(detect_divergence(&sigs), DivergenceStatus::Exploring(5));
-        let sigs7 = make_sigs(&[
-            &["bash"],
-            &["list_dir"],
-            &["grep"],
-            &["read_file"],
-            &["glob"],
-            &["bash"],
-            &["grep"],
-        ]);
-        assert_eq!(detect_divergence(&sigs7), DivergenceStatus::Exploring(7));
+        assert_eq!(detect_divergence(&sigs), DivergenceStatus::Diverging(5));
     }
 
     #[test]
     fn divergence_detected_at_eight() {
-        // 8 consecutive exploration rounds → Diverging (hits threshold)
+        // 8 consecutive exploration rounds → Diverging (well past threshold)
         let sigs = make_sigs(&[
             &["bash"],
             &["list_dir"],
@@ -634,7 +635,7 @@ mod tests {
     #[test]
     fn divergence_reset_by_productive() {
         // Productive tool in the middle resets the counter;
-        // only 2 exploration rounds at the end → Exploring(2) (below threshold of 8)
+        // only 2 exploration rounds at the end → Exploring(2) (below threshold of 5)
         let sigs = make_sigs(&[
             &["bash"],
             &["list_dir"],
@@ -653,7 +654,7 @@ mod tests {
 
     #[test]
     fn divergence_multi_tool_exploration_only() {
-        // 3 rounds of multi-tool exploration → Exploring(3), below threshold of 8
+        // 3 rounds of multi-tool exploration → Exploring(3), below threshold of 5
         let sigs = make_sigs(&[
             &["bash", "grep"],
             &["list_dir", "read_file"],
@@ -664,18 +665,15 @@ mod tests {
 
     #[test]
     fn divergence_multi_tool_exploration_at_threshold() {
-        // 8 rounds of multi-tool exploration → Diverging(8)
+        // 5 rounds of multi-tool exploration → Diverging(5)
         let sigs = make_sigs(&[
             &["bash", "grep"],
             &["list_dir", "read_file"],
             &["bash", "glob"],
             &["grep", "read_file"],
             &["bash", "list_dir"],
-            &["grep", "glob"],
-            &["read_file", "bash"],
-            &["list_dir", "grep"],
         ]);
-        assert_eq!(detect_divergence(&sigs), DivergenceStatus::Diverging(8));
+        assert_eq!(detect_divergence(&sigs), DivergenceStatus::Diverging(5));
     }
 
     /// Regression test for session f9903b97: grep→read_file→grep→grep is

@@ -41,7 +41,13 @@ pub struct SandboxPolicy {
     pub network_allowed: bool,
 
     /// Maximum number of processes a sandboxed command can spawn.
-    /// 0 = unlimited (Permissive), typical: 64 (Standard), 32 (Strict).
+    /// 0 = unlimited (Permissive/Standard). Strict mode uses 512.
+    ///
+    /// NOTE: `ulimit -u` sets RLIMIT_NPROC which counts ALL processes
+    /// for the user (UID-wide), not per-process. If the user already
+    /// has N processes, the child shell can only fork (limit - N) more.
+    /// Values below the user's current process count cause immediate
+    /// fork failures ("Resource temporarily unavailable").
     pub max_processes: u32,
 
     /// Maximum memory in bytes a sandboxed command can use.
@@ -99,7 +105,7 @@ impl SandboxPolicy {
             max_execution_secs: 30.0,
             max_output_bytes: 20_000,
             network_allowed: true,
-            max_processes: 64,
+            max_processes: 0, // Standard mode: no ulimit -u (too fragile)
             max_memory_bytes: 512 * 1024 * 1024, // 512 MB
         }
     }
@@ -130,7 +136,7 @@ impl SandboxPolicy {
             max_execution_secs: 15.0,
             max_output_bytes: 10_000,
             network_allowed: false,
-            max_processes: 32,
+            max_processes: 512, // Strict: high enough to avoid fork failures
             max_memory_bytes: 256 * 1024 * 1024, // 256 MB
         }
     }
@@ -171,7 +177,7 @@ mod tests {
         let p = SandboxPolicy::for_project("/home/user/project");
         assert_eq!(p.mode, SandboxMode::Standard);
         assert_eq!(p.max_execution_secs, 30.0);
-        assert_eq!(p.max_processes, 64);
+        assert_eq!(p.max_processes, 0); // Standard: no ulimit -u
         assert!(p.network_allowed);
         assert!(p.is_path_allowed(std::path::Path::new("/home/user/project/src")));
         assert!(p.is_path_allowed(std::path::Path::new("/tmp/build")));
@@ -190,7 +196,7 @@ mod tests {
         let p = SandboxPolicy::strict("/home/user/project");
         assert_eq!(p.mode, SandboxMode::Strict);
         assert!(!p.network_allowed);
-        assert_eq!(p.max_processes, 32);
+        assert_eq!(p.max_processes, 512);
         assert!(p.is_path_allowed(std::path::Path::new("/tmp/x")));
         assert!(!p.is_path_allowed(std::path::Path::new("/var/tmp/x")));
     }

@@ -64,7 +64,7 @@ pub fn all_tool_schemas() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "bash",
-                "description": "Execute a shell command in the project root. Use for builds, tests, installs, git operations, or any CLI task. Can run curl to fetch URLs, call GitHub API, or access any network resource.",
+                "description": "Execute a shell command in the project root. Use for builds, tests, installs, git operations, or any CLI task. Can run curl to fetch URLs, call GitHub API, or access any network resource. Timeout varies by command type (5-30s); set timeout parameter to override.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -79,7 +79,7 @@ pub fn all_tool_schemas() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "read_file",
-                "description": "Read file contents with optional line range. IMPORTANT: If you are NOT certain the file exists, use list_dir or glob FIRST to verify the path — do NOT guess paths. ALWAYS use start_line/end_line for large files instead of reading the whole file. Prefer targeted reads over full file reads. Set outline=true to get only function/class/struct signatures (saves tokens).",
+                "description": "Read file contents with optional line range. IMPORTANT: If you are NOT certain the file exists, use list_dir or glob FIRST to verify the path — do NOT guess paths. For files over 500 lines, prefer start_line/end_line or outline=true to read targeted sections. For smaller files, reading the full file is fine. Set outline=true to get only function/class/struct/trait signatures (saves tokens). If you previously read part of a file and request another range, the tool may auto-expand to return the full file to avoid fragmented reads.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -185,7 +185,7 @@ pub fn all_tool_schemas() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "grep",
-                "description": "Search for a pattern in files. Returns matching lines with file:line context. Use scope_context=true to see which function/class each match is in.",
+                "description": "Search for a pattern in files. Returns matching lines with file:line context (output truncated to ~20KB). Use scope_context=true to see which function/class each match is in. For large codebases, narrow path or pattern for complete results.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -438,7 +438,7 @@ pub fn all_tool_schemas() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "call_graph",
-                "description": "Analyze function call relationships. Shows what a function calls (outgoing) and optionally what calls it (incoming/callers). When callers=true with scope='project', scans all project files to find callers across the codebase.",
+                "description": "Analyze function call relationships. Shows what a function calls (outgoing) and optionally what calls it (incoming/callers). With callers=true and scope='project', scans up to 300 files — can be slow on large codebases. Use scope='file' for fast single-file results.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -557,7 +557,7 @@ pub fn all_tool_schemas() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "run_build_test",
-                "description": "Run a build or test command with structured error parsing. Returns structured errors with file:line:col locations AND auto-reads surrounding source code for each error location, so you can fix issues in one shot without additional read_file calls. Use this instead of raw bash for build/test commands. Set auto_fix=true to automatically apply trivial fixes (unused imports/variables) and re-run. Set report_only=true to preview what auto-fix would do without applying.",
+                "description": "Run a build or test command with structured error parsing. Returns structured errors with file:line:col locations AND auto-reads surrounding source code for each error location, so you can fix issues in one shot without additional read_file calls. Use this instead of raw bash for build/test commands. Set auto_fix=true to automatically apply trivial fixes (unused imports/variables) and re-run. Set report_only=true to preview what auto-fix would do without applying. Note: has side effects (builds artifacts, updates caches) — results are never cached.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -576,7 +576,7 @@ pub fn all_tool_schemas() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "mo_query",
-                "description": "Execute a SQL query against MatrixOne database. Returns formatted table results. Use for data exploration, schema inspection, and analytics queries.",
+                "description": "Execute a SQL query against MatrixOne database. Returns formatted table results (truncated to ~20KB). Destructive operations (DELETE, DROP, TRUNCATE) are blocked by default — pass allow_destructive=true to confirm. Use for data exploration, schema inspection, and analytics queries.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -809,7 +809,7 @@ pub fn all_tool_schemas() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "web_fetch",
-                "description": "Fetch a URL and return its content. Use for reading web pages, APIs, documentation, or any HTTP resource. Safer and simpler than bash+curl.",
+                "description": "Fetch a URL and return its content (truncated to ~10KB by default). Use for reading web pages, APIs, documentation, or any HTTP resource. Safer and simpler than bash+curl. Set max_bytes to fetch more content.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -1343,6 +1343,24 @@ impl ToolExecutor {
             .unwrap_or(false)
     }
 
+    /// Check if a file was previously partially read (outline or line range) and
+    /// hasn't been modified since. Used to auto-expand subsequent ranged reads
+    /// to the full file, eliminating fragmented multi-range read patterns.
+    fn was_partially_read_unchanged(&self, path: &Path) -> bool {
+        let current_ts = Self::file_mtime_ms(path);
+        if current_ts == 0 {
+            return false;
+        }
+        self.file_state
+            .lock()
+            .ok()
+            .and_then(|s| {
+                s.get(path)
+                    .map(|fs| fs.from_read && fs.is_partial && fs.timestamp_ms == current_ts)
+            })
+            .unwrap_or(false)
+    }
+
     /// Output limit scaled by budget pressure.
     /// At 0.0 pressure → full limit. At 0.9 → 25% of limit.
     /// Also applies aggregate output pressure: when cumulative tool output
@@ -1534,7 +1552,12 @@ impl ToolExecutor {
                     Err(e) => format!("Error: Invalid chain format: {e}"),
                 }
             }
-            _ => format!("Unknown tool: {name}"),
+            _ => format!(
+                "Unknown tool: {name}. Available tools: bash, read_file, write_file, str_replace, \
+                 list_dir, grep, glob, symbols, find_definition, find_references, git_status, \
+                 git_diff, git_log, git_show, git_blame, call_graph, run_build_test, web_fetch, \
+                 mo_query, memory_search, memory_profile"
+            ),
         };
         // Normalize empty output, then apply global safety net
         let output = normalize_empty_output(output, name);

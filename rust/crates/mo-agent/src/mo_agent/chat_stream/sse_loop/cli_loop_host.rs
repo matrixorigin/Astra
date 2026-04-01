@@ -51,6 +51,9 @@ pub(crate) struct CliAgenticLoopHost<'a> {
     pub file_context: Vec<String>,
     pub perm_manager: &'a mut PermissionManager,
     pub valid_tool_names: HashSet<String>,
+    /// Lines written to stderr between SSE turns (headless tool output, etc.)
+    /// that the next `consume_turn_sse` must clear before streaming.
+    pub pending_clear_lines: usize,
 }
 
 #[async_trait]
@@ -60,6 +63,7 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
         state: &mut AgenticLoopState,
     ) -> Result<HostTurnResult, String> {
         let assembly_start = Instant::now();
+        let pre_clear = std::mem::take(&mut self.pending_clear_lines);
 
         let turn_result = fetch_chat_turn_sse(ChatTurnSseFetchRequest {
             api: self.api,
@@ -98,6 +102,7 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
                 all_selected_skills: &mut state.all_selected_skills,
             },
             perm_manager: self.perm_manager,
+            pre_clear_lines: pre_clear,
         })
         .await?;
 
@@ -115,6 +120,7 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
             HeadlessStderrStyle::Green => eprintln!("{}", line.green()),
             HeadlessStderrStyle::Yellow => eprintln!("{}", line.yellow()),
         }
+        self.pending_clear_lines += 1;
     }
 
     fn is_quiet(&self) -> bool {

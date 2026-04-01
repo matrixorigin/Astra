@@ -62,8 +62,13 @@ fn mo_execute_sql(sql: &str, database: Option<&str>) -> String {
             } else {
                 let result = stdout.to_string();
                 if result.len() > 20_000 {
+                    let rows_shown = result[..20_000].matches('\n').count();
+                    let total_rows = result.matches('\n').count();
                     let mut t = result[..20_000].to_string();
-                    t.push_str("\n[truncated]");
+                    t.push_str(&format!(
+                        "\n[truncated at 20KB: showing ~{} of {} rows. Use LIMIT to narrow results.]",
+                        rows_shown, total_rows
+                    ));
                     t
                 } else {
                     result

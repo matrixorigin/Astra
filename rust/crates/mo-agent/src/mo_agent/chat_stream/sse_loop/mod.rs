@@ -84,6 +84,7 @@ pub(crate) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
         file_context,
         perm_manager: p.perm_manager,
         valid_tool_names,
+        pending_clear_lines: 0,
     };
 
     let mut state = AgenticLoopState {
