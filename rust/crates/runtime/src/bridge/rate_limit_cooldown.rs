@@ -377,6 +377,16 @@ impl RateLimitCooldown {
             0
         }
     }
+
+    /// Reset process-global cooldown state for unit tests (parallel-safe when each test calls this first).
+    #[cfg(test)]
+    pub fn reset_for_tests(&self) {
+        self.state.store(STATE_ACTIVE, Ordering::SeqCst);
+        self.consecutive_errors.store(0, Ordering::SeqCst);
+        self.consecutive_529_errors.store(0, Ordering::SeqCst);
+        let mut info = self.cooldown_info.lock().expect("cooldown mutex");
+        *info = None;
+    }
 }
 
 impl Default for RateLimitCooldown {
@@ -597,5 +607,18 @@ mod tests {
     fn reason_as_str() {
         assert_eq!(CooldownReason::RateLimit.as_str(), "rate_limit");
         assert_eq!(CooldownReason::Overloaded.as_str(), "overloaded");
+    }
+
+    #[test]
+    fn reset_for_tests_clears_cooldown_and_counters() {
+        let rl = RateLimitCooldown::new();
+        rl.record_429(None, false);
+        rl.record_429(None, false);
+        rl.record_429(None, false);
+        assert!(rl.is_in_cooldown());
+        rl.reset_for_tests();
+        assert!(!rl.is_in_cooldown());
+        assert_eq!(rl.metrics().consecutive_errors, 0);
+        assert_eq!(rl.check_request(false), RateLimitAction::Proceed);
     }
 }

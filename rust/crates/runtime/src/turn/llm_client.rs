@@ -42,6 +42,11 @@ fn rate_limit_cooldown() -> &'static RateLimitCooldown {
     COOLDOWN.get_or_init(RateLimitCooldown::new)
 }
 
+#[cfg(test)]
+fn reset_rate_limit_cooldown_for_tests() {
+    rate_limit_cooldown().reset_for_tests();
+}
+
 // ── System Prompt Cache ──────────────────────────────────────────────────────
 use std::sync::Mutex;
 
@@ -684,11 +689,16 @@ pub(crate) fn parse_openai_sse_json_stream(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::Router;
+    use axum::body::Body;
+    use axum::extract::State;
+    use axum::response::Response;
+    use axum::routing::post;
     use futures_util::stream;
     use futures_util::StreamExt;
     use serde_json::json;
-    use std::sync::atomic::AtomicBool;
-    use std::sync::atomic::Ordering;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
     #[tokio::test]
     async fn sleep_ms_or_llm_cancel_sleeps_when_no_cancel_source() {
@@ -1073,5 +1083,125 @@ mod tests {
         );
         assert!(!flag_for_join.load(Ordering::SeqCst));
         unsafe { std::env::remove_var("MO_STREAM_IDLE_TIMEOUT_MS") };
+    }
+
+    #[derive(Clone)]
+    struct Hit(Arc<AtomicU32>);
+
+    async fn spawn_local_http_server(app: Router) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock llm listener");
+        let addr = listener.local_addr().expect("local_addr");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("mock serve");
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+        format!("http://{addr}")
+    }
+
+    async fn mock_429_retry_zero_then_sse(State(Hit(c)): State<Hit>) -> Response {
+        let n = c.fetch_add(1, Ordering::SeqCst);
+        if n == 0 {
+            Response::builder()
+                .status(429)
+                .header("retry-after", "0")
+                .body(Body::from("rate limited"))
+                .unwrap()
+        } else {
+            let payload = json!({"choices":[{"delta":{"content":"after-429"}}]});
+            let body = format!("data: {}\n\n", payload);
+            Response::builder()
+                .status(200)
+                .header("content-type", "text/event-stream")
+                .body(Body::from(body))
+                .unwrap()
+        }
+    }
+
+    async fn mock_429_retry_two_seconds(State(Hit(c)): State<Hit>) -> Response {
+        c.fetch_add(1, Ordering::SeqCst);
+        Response::builder()
+            .status(429)
+            .header("retry-after", "2")
+            .body(Body::from("slow"))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn collect_llm_stream_decodes_lossy_utf8_inside_json_string() {
+        unsafe { std::env::set_var("MO_STREAM_IDLE_TIMEOUT_MS", "60000") };
+        let mut v: Vec<u8> = Vec::new();
+        v.extend_from_slice(br#"data: {"choices":[{"delta":{"content":"a"#);
+        v.push(0xff);
+        v.extend_from_slice(br#""}}]}"#);
+        v.extend_from_slice(b"\n\n");
+        let stream = stream::iter(vec![Ok(Bytes::from(v))]);
+        let res = collect_llm_stream(stream, "m", Instant::now(), LlmCancel::None)
+            .await
+            .expect("collect");
+        assert_eq!(res.full_text, "a\u{FFFD}");
+        unsafe { std::env::remove_var("MO_STREAM_IDLE_TIMEOUT_MS") };
+    }
+
+    #[tokio::test]
+    async fn call_llm_and_collect_retries_after_429_retry_after_zero() {
+        unsafe { std::env::set_var("MO_STREAM_IDLE_TIMEOUT_MS", "60000") };
+        reset_rate_limit_cooldown_for_tests();
+        let hits = Arc::new(AtomicU32::new(0));
+        let app = Router::new()
+            .route("/chat/completions", post(mock_429_retry_zero_then_sse))
+            .with_state(Hit(hits.clone()));
+        let base = spawn_local_http_server(app).await;
+        let messages = vec![json!({"role":"user","content":"x"})];
+        let res = call_llm_and_collect(
+            &messages,
+            &[],
+            "m",
+            "k",
+            &base,
+            "openai",
+            None,
+            false,
+            LlmCancel::None,
+        )
+        .await
+        .expect("llm ok");
+        assert_eq!(res.full_text, "after-429");
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+        unsafe { std::env::remove_var("MO_STREAM_IDLE_TIMEOUT_MS") };
+    }
+
+    #[tokio::test]
+    async fn call_llm_and_collect_cancel_during_429_backoff_sleep() {
+        reset_rate_limit_cooldown_for_tests();
+        let hits = Arc::new(AtomicU32::new(0));
+        let app = Router::new()
+            .route("/chat/completions", post(mock_429_retry_two_seconds))
+            .with_state(Hit(hits.clone()));
+        let base = spawn_local_http_server(app).await;
+        let token = CancellationToken::new();
+        let token_for_call = token.clone();
+        let messages = vec![json!({"role":"user","content":"x"})];
+        let base_clone = base.clone();
+        let handle = tokio::spawn(async move {
+            call_llm_and_collect(
+                &messages,
+                &[],
+                "m",
+                "k",
+                &base_clone,
+                "openai",
+                None,
+                false,
+                LlmCancel::Token(&token_for_call),
+            )
+            .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+        token.cancel();
+        let err = handle.await.expect("join").expect_err("cancelled");
+        assert_eq!(err, "LLM call cancelled");
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
     }
 }

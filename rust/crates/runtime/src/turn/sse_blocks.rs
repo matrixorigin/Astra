@@ -125,4 +125,16 @@ mod tests {
         assert_eq!(v.len(), 1);
         assert!(v[0].contains('}'));
     }
+
+    #[test]
+    fn blank_line_buf_lossy_replaces_invalid_utf8_inside_line() {
+        let mut v: Vec<u8> = Vec::new();
+        v.extend_from_slice(b"data: {\"x\":\"");
+        v.push(0xff);
+        v.extend_from_slice(b"\"}\n\n");
+        let mut b = SseBlankLineUtf8Buf::new();
+        let blocks = b.push_lossy_bytes(&v);
+        assert_eq!(blocks.len(), 1);
+        assert!(blocks[0].contains('\u{FFFD}'));
+    }
 }
