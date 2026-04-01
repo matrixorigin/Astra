@@ -227,20 +227,19 @@ fn build_review_prompt(arg: &str) -> String {
 \n\
 Review target: {target}\n\
 \n\
-Follow this process:\n\
-1. Identify the review target.\n\
-   - If target is `HEAD`, inspect the latest commit with `git_log` and `git_show`.\n\
-   - If target is `WORKING_TREE`, inspect uncommitted changes with `git_status` and `git_diff`.\n\
-   - Otherwise inspect the specified revision with `git_show`.\n\
-2. Read only the files needed to verify important findings.\n\
-3. Produce a concise review focused on correctness, regressions, missing tests, and risky assumptions.\n\
-4. Do not invent issues. If nothing material is wrong, say LGTM and mention any residual risk.\n\
+Process:\n\
+1. Get the diff:\n\
+   - HEAD → `git_show` (gives you the full diff already)\n\
+   - WORKING_TREE → `git_diff`\n\
+   - Other → `git_show <rev>`\n\
+2. Review the diff directly. Do NOT read entire files.\n\
+   Only use `read_file` with `start_line`/`end_line` if you need \
+   ~10 lines of surrounding context to verify a specific finding.\n\
+3. If you need to understand a function signature or type, use \
+   `read_file` with `outline=true` instead of reading the whole file.\n\
+4. Produce a concise review. Do not invent issues.\n\
 \n\
-Output format:\n\
-- Summary\n\
-- Findings\n\
-- Verification notes\n\
-- Verdict\n"
+Output: Summary → Findings → Verification → Verdict\n"
     )
 }
 
@@ -1199,15 +1198,14 @@ mod tests {
     fn build_review_prompt_defaults_to_head() {
         let prompt = build_review_prompt("");
         assert!(prompt.contains("Review target: HEAD"));
-        assert!(prompt.contains("git_log"));
         assert!(prompt.contains("git_show"));
+        assert!(prompt.contains("Do NOT read entire files"));
     }
 
     #[test]
     fn build_review_prompt_supports_working_tree() {
         let prompt = build_review_prompt("working");
         assert!(prompt.contains("Review target: WORKING_TREE"));
-        assert!(prompt.contains("git_status"));
         assert!(prompt.contains("git_diff"));
     }
 }
