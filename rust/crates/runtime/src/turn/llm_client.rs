@@ -147,9 +147,7 @@ impl LlmCancel<'_> {
             LlmCancel::None => false,
             LlmCancel::Token(t) => t.is_cancelled(),
             LlmCancel::Flag(f) => f.load(Ordering::Relaxed),
-            LlmCancel::FlagAndToken(f, t) => {
-                f.load(Ordering::Relaxed) || t.is_cancelled()
-            }
+            LlmCancel::FlagAndToken(f, t) => f.load(Ordering::Relaxed) || t.is_cancelled(),
         }
     }
 }
@@ -694,8 +692,8 @@ mod tests {
     use axum::extract::State;
     use axum::response::Response;
     use axum::routing::post;
-    use futures_util::stream;
     use futures_util::StreamExt;
+    use futures_util::stream;
     use serde_json::json;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -896,10 +894,8 @@ mod tests {
     #[tokio::test]
     async fn parse_openai_sse_json_stream_event_then_transport_error() {
         let err = sample_reqwest_stream_error().await;
-        let parts: Vec<Result<Bytes, reqwest::Error>> = vec![
-            Ok(Bytes::from("data: {\"x\":1}\n\n")),
-            Err(err),
-        ];
+        let parts: Vec<Result<Bytes, reqwest::Error>> =
+            vec![Ok(Bytes::from("data: {\"x\":1}\n\n")), Err(err)];
         let st = parse_openai_sse_json_stream(stream::iter(parts));
         tokio::pin!(st);
         assert_eq!(st.next().await.unwrap().unwrap(), json!({"x": 1}));
@@ -937,21 +933,11 @@ mod tests {
         let d1 = json!({"choices":[{"delta":{"content":"Hi ","reasoning_content":"R"}}]});
         let d2 = json!({"choices":[{"delta":{"content":"there"}}]});
         let u = json!({"usage":{"prompt_tokens":3,"completion_tokens":4}});
-        let body = format!(
-            "data: {}\n\ndata: {}\n\ndata: {}\n\n",
-            d1.to_string(),
-            d2.to_string(),
-            u.to_string()
-        );
+        let body = format!("data: {d1}\n\ndata: {d2}\n\ndata: {u}\n\n");
         let stream = stream::iter(vec![Ok(Bytes::from(body))]);
-        let res = collect_llm_stream(
-            stream,
-            "gpt-test",
-            Instant::now(),
-            LlmCancel::None,
-        )
-        .await
-        .expect("collect");
+        let res = collect_llm_stream(stream, "gpt-test", Instant::now(), LlmCancel::None)
+            .await
+            .expect("collect");
         assert_eq!(res.full_text, "Hi there");
         assert_eq!(res.reasoning, "R");
         assert_eq!(res.usage.get("prompt").and_then(Value::as_i64), Some(3));
@@ -967,11 +953,7 @@ mod tests {
         unsafe { std::env::set_var("MO_STREAM_IDLE_TIMEOUT_MS", "60000") };
         let c1 = json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"bash","arguments":"{\"foo"}}]}}]});
         let c2 = json!({"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\":\"bar\"}"}}]}}]});
-        let body = format!(
-            "data: {}\n\ndata: {}\n\n",
-            c1.to_string(),
-            c2.to_string()
-        );
+        let body = format!("data: {c1}\n\ndata: {c2}\n\n");
         let stream = stream::iter(vec![Ok(Bytes::from(body))]);
         let res = collect_llm_stream(stream, "m", Instant::now(), LlmCancel::None)
             .await
@@ -982,10 +964,7 @@ mod tests {
             .expect("arguments string");
         let parsed: Value = serde_json::from_str(args).expect("valid merged JSON args");
         assert_eq!(parsed, json!({"foo":"bar"}));
-        assert_eq!(
-            res.tool_calls[0]["function"]["name"].as_str(),
-            Some("bash")
-        );
+        assert_eq!(res.tool_calls[0]["function"]["name"].as_str(), Some("bash"));
         unsafe { std::env::remove_var("MO_STREAM_IDLE_TIMEOUT_MS") };
     }
 

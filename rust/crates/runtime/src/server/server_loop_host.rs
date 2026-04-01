@@ -415,9 +415,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                     "llm",
                     "rate-limit cooldown: waiting {delay_ms}ms before request"
                 );
-                sleep_ms_or_llm_cancel(delay_ms, llm_cancel_for_state(state))
-                    .await
-                    .map_err(|e| e)?;
+                sleep_ms_or_llm_cancel(delay_ms, llm_cancel_for_state(state)).await?;
             }
             RateLimitAction::UseFallback { reason } => {
                 if let Some(ref fb_name) = fallback_model_name {

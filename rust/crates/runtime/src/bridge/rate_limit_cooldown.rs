@@ -620,6 +620,8 @@ mod tests {
         assert!(!rl.is_in_cooldown());
         assert_eq!(rl.metrics().consecutive_errors, 0);
         assert_eq!(rl.check_request(false), RateLimitAction::Proceed);
+    }
+
     // ── Fallback model resolution integration tests ──────────────────────────
 
     #[test]

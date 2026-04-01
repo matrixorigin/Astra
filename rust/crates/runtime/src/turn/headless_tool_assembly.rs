@@ -330,13 +330,11 @@ pub fn openai_assistant_with_tool_calls_message_ext<T: EdgeToolRoundRow>(
                 Value::String(reasoning_content.to_string()),
             );
         }
-    } else if force_reasoning_field {
-        if let Some(obj) = msg.as_object_mut() {
-            obj.insert(
-                "reasoning_content".to_string(),
-                Value::String(String::new()),
-            );
-        }
+    } else if force_reasoning_field && let Some(obj) = msg.as_object_mut() {
+        obj.insert(
+            "reasoning_content".to_string(),
+            Value::String(String::new()),
+        );
     }
     msg
 }

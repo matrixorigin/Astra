@@ -82,7 +82,7 @@ fn interpret_exit_code(command: &str, code: i32) -> CommandResult {
 /// Extract the base command name from the last segment of a pipeline.
 fn last_pipeline_command(command: &str) -> &str {
     let last = command.rsplit('|').next().unwrap_or(command);
-    last.trim().split_whitespace().next().unwrap_or("")
+    last.split_whitespace().next().unwrap_or("")
 }
 
 // ---------------------------------------------------------------------------
@@ -787,18 +787,18 @@ impl ToolExecutor {
                 };
 
                 // HTTP error codes
-                if let Ok(code) = http_code.parse::<u16>() {
-                    if code >= 400 {
-                        let reason = match code {
-                            401 | 403 => {
-                                " (authentication required — look for an MCP tool with authenticated access)"
-                            }
-                            404 => " (page not found)",
-                            429 => " (rate limited — try again later)",
-                            _ => "",
-                        };
-                        return format!("Error: HTTP {code}{reason}\nURL: {url}");
-                    }
+                if let Ok(code) = http_code.parse::<u16>()
+                    && code >= 400
+                {
+                    let reason = match code {
+                        401 | 403 => {
+                            " (authentication required — look for an MCP tool with authenticated access)"
+                        }
+                        404 => " (page not found)",
+                        429 => " (rate limited — try again later)",
+                        _ => "",
+                    };
+                    return format!("Error: HTTP {code}{reason}\nURL: {url}");
                 }
 
                 let mut result = body.to_string();
