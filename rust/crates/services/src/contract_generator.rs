@@ -435,6 +435,7 @@ impl ContractGenerator {
             retry_count: 0,
             snapshot_name: None,
             data_branch: None,
+            diff_summary: None,
         }
     }
 
