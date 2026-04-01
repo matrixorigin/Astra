@@ -27,7 +27,7 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     // ── Advanced ──────────────────────────────────────────────────────────
     ("/doctor", "Run diagnostics"),
     ("/version", "Show version info"),
-    ("/session", "Show current session info"),
+    ("/session", "Session info: cwd, git, workspace.yaml, REPL state"),
     ("/session history", "View session conversation history"),
     ("/session errors", "View session errors"),
     ("/session export", "Export session data"),

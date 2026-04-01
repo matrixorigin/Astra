@@ -1,6 +1,101 @@
 use std::io::Write;
 
+use mo_agent_services::session_workspace;
+
 use super::*;
+
+fn ellipsize(s: &str, max_chars: usize) -> String {
+    let t: String = s.chars().take(max_chars).collect();
+    if s.chars().count() > max_chars {
+        format!("{t}…")
+    } else {
+        t
+    }
+}
+
+/// Print persisted workspace context (`workspace.yaml`).
+fn print_workspace_metadata(ws: &session_workspace::WorkspaceMetadata, sid: &str) {
+    eprintln!("  {}", "— workspace (persisted) —".dim());
+    eprintln!("  {:<16} {}", "cwd:".dim(), ws.cwd.as_str().cyan());
+    let git_line = match (&ws.git_branch, &ws.git_head) {
+        (Some(b), Some(h)) => format!("{b} @ {h}"),
+        (Some(b), None) => b.clone(),
+        (None, Some(h)) => format!("(detached) @ {h}"),
+        (None, None) => "(no git at session start)".to_string(),
+    };
+    eprintln!("  {:<16} {}", "git:".dim(), git_line.cyan());
+    if let Some(ref root) = ws.git_root {
+        if root != &ws.cwd {
+            eprintln!(
+                "  {:<16} {}",
+                "repo root:".dim(),
+                root.as_str().dim()
+            );
+        }
+    }
+    let started = ws.created_at.get(..19).unwrap_or(ws.created_at.as_str());
+    eprintln!("  {:<16} {}", "started:".dim(), started.cyan());
+    let saved = ws.updated_at.get(..19).unwrap_or(ws.updated_at.as_str());
+    eprintln!("  {:<16} {}", "last saved:".dim(), saved.cyan());
+    eprintln!("  {:<16} {}", "status:".dim(), ws.status.as_str().cyan());
+    if let Some(ref sum) = ws.summary {
+        eprintln!(
+            "  {:<16} {}",
+            "summary:".dim(),
+            ellipsize(sum, 80).dim()
+        );
+    }
+    if ws.turn_count > 0 || ws.total_tokens_in > 0 || ws.total_tokens_out > 0 {
+        eprintln!(
+            "  {:<16} {} turns · {} prompt + {} completion tokens",
+            "logged:".dim(),
+            ws.turn_count.to_string().cyan(),
+            ws.total_tokens_in.to_string().cyan(),
+            ws.total_tokens_out.to_string().cyan(),
+        );
+    }
+    if let Some(ref goal) = ws.plan_goal {
+        eprintln!(
+            "  {:<16} {}",
+            "plan goal:".dim(),
+            ellipsize(goal, 72).cyan()
+        );
+    }
+    if ws.plan_execution_rounds > 0 {
+        eprintln!(
+            "  {:<16} {}",
+            "plan rounds:".dim(),
+            ws.plan_execution_rounds.to_string().cyan()
+        );
+    }
+    if !ws.checkpoints.is_empty() {
+        let preview: Vec<String> = ws
+            .checkpoints
+            .iter()
+            .take(6)
+            .map(|t| format!("T{t}"))
+            .collect();
+        let joined = preview.join(", ");
+        let tail = if ws.checkpoints.len() > 6 {
+            format!(" … (+{} more)", ws.checkpoints.len() - 6)
+        } else {
+            String::new()
+        };
+        eprintln!(
+            "  {:<16} {}{}",
+            "checkpoints:".dim(),
+            joined.cyan(),
+            tail.dim()
+        );
+    }
+    let ws_path = session_workspace::workspace_dir_for(sid).join("workspace.yaml");
+    eprintln!(
+        "  {:<16} {}",
+        "workspace.yaml:".dim(),
+        ws_path.display().to_string().dim()
+    );
+    eprintln!();
+}
 
 pub(super) fn resolve_journal_target_session(
     sub_arg: &str,
@@ -61,22 +156,67 @@ pub(super) fn handle_session_command(arg: &str, state: &ReplState) {
                 "\n{}",
                 "─── Session ─────────────────────────────────────".bold()
             );
-            eprintln!("  {:<14} {}", "session_id:".dim(), sid.cyan());
-            eprintln!("  {:<14} {}", "model:".dim(), mdl.cyan());
-            eprintln!("  {:<14} {}", "turns:".dim(), state.turn.to_string().cyan());
+            eprintln!("  {:<16} {}", "session_id:".dim(), sid.cyan());
+            let persisted_ws = (sid != "none")
+                .then(|| session_workspace::read_workspace(sid).ok())
+                .flatten();
+            if sid != "none" {
+                if let Some(ref ws) = persisted_ws {
+                    print_workspace_metadata(ws, sid);
+                    if ws.model != mdl {
+                        eprintln!(
+                            "  {:<16} {}",
+                            "started as:".dim(),
+                            ws.model.as_str().dim()
+                        );
+                    }
+                } else {
+                    eprintln!(
+                        "  {}",
+                        "— no workspace.yaml yet (cwd/git after journal init) —".dim()
+                    );
+                    eprintln!();
+                }
+            } else {
+                eprintln!();
+            }
+            eprintln!("  {}", "— this REPL —".dim());
+            eprintln!("  {:<16} {}", "model:".dim(), mdl.cyan());
+            if let Some(ref ws) = persisted_ws {
+                if ws.turn_count != state.turn {
+                    eprintln!(
+                        "  {:<16} {} repl · {} logged",
+                        "turns:".dim(),
+                        state.turn.to_string().cyan(),
+                        ws.turn_count.to_string().cyan()
+                    );
+                } else {
+                    eprintln!(
+                        "  {:<16} {}",
+                        "turns:".dim(),
+                        state.turn.to_string().cyan()
+                    );
+                }
+            } else {
+                eprintln!(
+                    "  {:<16} {}",
+                    "turns:".dim(),
+                    state.turn.to_string().cyan()
+                );
+            }
             eprintln!(
-                "  {:<14} {}",
+                "  {:<16} {}",
                 "explain:".dim(),
                 state.explain.to_string().cyan()
             );
             eprintln!(
-                "  {:<14} {}",
+                "  {:<16} {}",
                 "run_id:".dim(),
                 state.run_id.as_deref().unwrap_or("none").cyan()
             );
             if let Some(ref j) = state.journal {
                 eprintln!(
-                    "  {:<14} {}",
+                    "  {:<16} {}",
                     "journal:".dim(),
                     j.path().display().to_string().cyan()
                 );
