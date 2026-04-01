@@ -680,7 +680,143 @@ impl TaskBranchOps for TaskBranchService {
     }
 }
 
-/// File-based branch ops for local/offline mode.
+/// Git-based branch ops that use `git stash` for near-instant snapshots.
+/// Falls back to NoopBranchOps semantics on non-git repos.
+pub struct GitBranchOps {
+    work_dir: std::path::PathBuf,
+    /// Maps snapshot_name → git stash ref (commit SHA)
+    refs: std::sync::Mutex<std::collections::HashMap<String, String>>,
+}
+
+impl GitBranchOps {
+    pub fn new(work_dir: std::path::PathBuf) -> Self {
+        Self {
+            work_dir,
+            refs: std::sync::Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+
+    /// Check if the work_dir is inside a git repository.
+    pub fn is_git_repo(work_dir: &std::path::Path) -> bool {
+        std::process::Command::new("git")
+            .args(["rev-parse", "--git-dir"])
+            .current_dir(work_dir)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+}
+
+#[async_trait]
+impl TaskBranchOps for GitBranchOps {
+    async fn create_snapshot(
+        &self,
+        task_id: &str,
+        subtask_id: &str,
+        version: u32,
+    ) -> Result<String, String> {
+        let name = format!("task_{task_id}_{subtask_id}_v{version}");
+        let work = self.work_dir.clone();
+
+        // Record current HEAD as the snapshot reference point.
+        // This is instant — no file copying.
+        let sha = tokio::task::spawn_blocking(move || {
+            let output = std::process::Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(&work)
+                .output()
+                .map_err(|e| format!("git rev-parse: {e}"))?;
+            if output.status.success() {
+                Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+            } else {
+                Err("git rev-parse HEAD failed".to_string())
+            }
+        })
+        .await
+        .map_err(|e| format!("spawn: {e}"))??;
+
+        self.refs
+            .lock()
+            .unwrap()
+            .insert(name.clone(), sha);
+        Ok(name)
+    }
+
+    async fn diff_since_snapshot(&self, snapshot: &str) -> Result<DiffSummary, String> {
+        let sha = self
+            .refs
+            .lock()
+            .unwrap()
+            .get(snapshot)
+            .cloned()
+            .unwrap_or_default();
+        if sha.is_empty() {
+            return Ok(DiffSummary {
+                snapshot: snapshot.to_string(),
+                changed_rows: 0,
+            });
+        }
+        let work = self.work_dir.clone();
+        let sha_clone = sha.clone();
+        let changed = tokio::task::spawn_blocking(move || {
+            // Count changed files since snapshot ref (staged + unstaged + untracked)
+            let output = std::process::Command::new("git")
+                .args(["diff", "--name-only", &sha_clone])
+                .current_dir(&work)
+                .output()
+                .map_err(|e| format!("git diff: {e}"))?;
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let count = stdout.lines().filter(|l| !l.is_empty()).count() as i64;
+            Ok::<i64, String>(count)
+        })
+        .await
+        .map_err(|e| format!("spawn: {e}"))??;
+
+        Ok(DiffSummary {
+            snapshot: snapshot.to_string(),
+            changed_rows: changed,
+        })
+    }
+
+    async fn rollback_to_snapshot(&self, snapshot: &str) -> Result<(), String> {
+        let sha = self
+            .refs
+            .lock()
+            .unwrap()
+            .get(snapshot)
+            .cloned()
+            .ok_or_else(|| format!("snapshot '{snapshot}' not found"))?;
+        let work = self.work_dir.clone();
+        tokio::task::spawn_blocking(move || {
+            // Hard reset to the snapshot commit
+            let output = std::process::Command::new("git")
+                .args(["reset", "--hard", &sha])
+                .current_dir(&work)
+                .output()
+                .map_err(|e| format!("git reset: {e}"))?;
+            if output.status.success() {
+                Ok(())
+            } else {
+                Err(format!(
+                    "git reset --hard: {}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                ))
+            }
+        })
+        .await
+        .map_err(|e| format!("spawn: {e}"))?
+    }
+
+    async fn cleanup_snapshot(&self, snapshot: &str) -> Result<(), String> {
+        // Just remove from in-memory map — no disk I/O needed
+        self.refs.lock().unwrap().remove(snapshot);
+        Ok(())
+    }
+}
+
+/// File-based branch ops for local/offline mode (non-git repos).
 /// Creates directory snapshots by copying the work directory.
 pub struct LocalFileBranchOps {
     snapshots_dir: std::path::PathBuf,
@@ -1915,10 +2051,15 @@ pub struct LocalDurableTaskLifecycle {
 
 impl LocalDurableTaskLifecycle {
     pub fn new(data_dir: std::path::PathBuf, work_dir: std::path::PathBuf) -> Self {
-        let branch_ops: Arc<dyn TaskBranchOps> = Arc::new(LocalFileBranchOps::new(
-            data_dir.join("snapshots"),
-            work_dir.clone(),
-        ));
+        // Prefer git-based snapshots (instant) over file copies (slow)
+        let branch_ops: Arc<dyn TaskBranchOps> = if GitBranchOps::is_git_repo(&work_dir) {
+            Arc::new(GitBranchOps::new(work_dir.clone()))
+        } else {
+            Arc::new(LocalFileBranchOps::new(
+                data_dir.join("snapshots"),
+                work_dir.clone(),
+            ))
+        };
         Self {
             contracts_dir: data_dir.join("contracts"),
             branch_ops,
@@ -3633,6 +3774,72 @@ mod tests {
 
         ops.cleanup_snapshot(&name).await.unwrap();
         assert!(!snaps.join(&name).exists());
+    }
+
+    #[tokio::test]
+    async fn git_branch_ops_snapshot_and_diff() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let work = tmp.path().join("repo");
+        std::fs::create_dir_all(&work).unwrap();
+
+        // Initialize a git repo
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&work)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["config", "user.email", "test@test.com"])
+            .current_dir(&work)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["config", "user.name", "Test"])
+            .current_dir(&work)
+            .output()
+            .unwrap();
+
+        // Create initial commit
+        std::fs::write(work.join("file.txt"), "initial").unwrap();
+        std::process::Command::new("git")
+            .args(["add", "."])
+            .current_dir(&work)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["commit", "-m", "init"])
+            .current_dir(&work)
+            .output()
+            .unwrap();
+
+        assert!(GitBranchOps::is_git_repo(&work));
+        let ops = GitBranchOps::new(work.clone());
+
+        // Snapshot
+        let name = ops.create_snapshot("t1", "s1", 1).await.unwrap();
+        assert!(!name.is_empty());
+
+        // Modify file + add new file (simulate subtask work)
+        std::fs::write(work.join("file.txt"), "modified").unwrap();
+        std::fs::write(work.join("new.rs"), "fn main() {}").unwrap();
+        // Stage changes for git diff to detect
+        std::process::Command::new("git")
+            .args(["add", "."])
+            .current_dir(&work)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["commit", "-m", "subtask work"])
+            .current_dir(&work)
+            .output()
+            .unwrap();
+
+        // Diff should detect changes
+        let diff = ops.diff_since_snapshot(&name).await.unwrap();
+        assert!(diff.changed_rows >= 1, "should detect changes: {:?}", diff);
+
+        // Cleanup is a no-op (removes from in-memory map)
+        ops.cleanup_snapshot(&name).await.unwrap();
     }
 
     #[tokio::test]

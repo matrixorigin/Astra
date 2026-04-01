@@ -143,7 +143,7 @@ pub async fn on_subtask_complete(
                 !c.global_only
                     && !matches!(
                         c.verifier,
-                        mo_agent_services::VerifierKind::LlmJudge { .. }
+                        VerifierKind::LlmJudge { .. }
                     )
             })
         })
@@ -250,13 +250,13 @@ pub async fn on_plan_complete(
     // Show what will be checked
     for c in &durable.contract.global_verification {
         let cmd_hint = match &c.verifier {
-            mo_agent_services::VerifierKind::BuildPass { cmd } => {
+            VerifierKind::BuildPass { cmd } => {
                 format!("build: {cmd}")
             }
-            mo_agent_services::VerifierKind::TestPass { cmd, .. } => {
+            VerifierKind::TestPass { cmd, .. } => {
                 format!("test: {cmd}")
             }
-            mo_agent_services::VerifierKind::Command { cmd, .. } => {
+            VerifierKind::Command { cmd, .. } => {
                 format!("cmd: {cmd}")
             }
             _ => c.description.clone(),
