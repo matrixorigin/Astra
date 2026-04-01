@@ -227,6 +227,10 @@ impl AgenticRunLifecycleService {
             cancel_flag: None,
             cancel_token: None,
             delegation_engine: None,
+            stop_hooks: Vec::new(),
+            stop_hook_runs: 0,
+            consecutive_same_error: 0,
+            last_error_category: None,
         }
     }
 
@@ -837,6 +841,10 @@ impl SubRunExecutor for ServerSubRunExecutor {
             cancel_flag: config.pause_flag.clone(),
             cancel_token: None,
             delegation_engine: None,
+            stop_hooks: Vec::new(),
+            stop_hook_runs: 0,
+            consecutive_same_error: 0,
+            last_error_category: None,
         };
 
         let outcome = run_agentic_loop_with_host(&mut host, &mut loop_state).await;

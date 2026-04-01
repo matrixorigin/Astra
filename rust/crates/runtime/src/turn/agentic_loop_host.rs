@@ -219,7 +219,24 @@ pub struct AgenticLoopState {
     /// When set, the loop intercepts `delegate` tool calls and routes them
     /// through the delegation engine instead of the headless tool round.
     pub delegation_engine: Option<Arc<crate::server::delegation_engine::DelegationEngine>>,
+
+    // ── Stop hooks ──
+    /// Verification commands run before the loop is allowed to complete.
+    /// If any hook fails, its output is injected and the loop continues.
+    pub stop_hooks: Vec<crate::turn::stop_hooks::StopHook>,
+    /// How many times stop hooks have fired (prevents infinite hook loops).
+    pub stop_hook_runs: u32,
+
+    // ── Error budget ──
+    /// Consecutive turns where the same error category dominated.
+    /// Reset when a turn succeeds or a different error category appears.
+    pub consecutive_same_error: u32,
+    /// The error category from the last turn (for streak detection).
+    pub last_error_category: Option<crate::turn::error_recovery::ErrorCategory>,
 }
+
+/// Consecutive same-category error turns before forcing a strategy change.
+const CONSECUTIVE_ERROR_BUDGET: u32 = 3;
 
 // ─── Loop exit ───────────────────────────────────────────────────────────────
 
@@ -555,10 +572,29 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
         )) {
             AgenticIngestIterationControl::Fatal(e) => return Err(e),
             AgenticIngestIterationControl::BreakLoop => {
+                // Agent produced final text with no tool calls — it thinks it's done.
+                // Inject verification prompt once when the agent first tries to complete.
+                // The prompt instructs the LLM to run checks, fix failures, and
+                // re-run until passing — all within the normal tool loop.
+                // Runtime does not inspect results; it trusts the LLM's tool cycle.
+                if state.stop_hook_runs == 0 {
+                    if let Some(prompt) = crate::turn::stop_hooks::build_stop_hook_prompt(&state.stop_hooks) {
+                        state.stop_hook_runs = 1;
+                        if !quiet {
+                            host.emit_headless_line(
+                                HeadlessStderrStyle::Yellow,
+                                "⚠ Verification required, continuing…".to_string(),
+                            );
+                        }
+                        state.messages.push(prompt);
+                        continue;
+                    }
+                }
                 return Ok(AgenticLoopOutcome::Completed);
             }
             AgenticIngestIterationControl::ContinueIterating => {
-                return Ok(AgenticLoopOutcome::Completed);
+                // Ingest injected a nudge (e.g. factual retry). Continue the loop.
+                continue;
             }
             AgenticIngestIterationControl::ProceedWithToolCalls => {}
         }
@@ -610,6 +646,10 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
         };
 
         // ─── Step 4: Headless tool round ────────────────────────────────
+        // Snapshot error counts before the round for per-turn delta tracking.
+        let errors_before_round = state.turn_guard.errors.total_errors;
+        let errors_by_cat_before = state.turn_guard.errors.errors_by_category.clone();
+
         struct HostTerminalAdapter<'a, H: AgenticLoopHost>(&'a mut H);
         impl<H: AgenticLoopHost> HeadlessRoundTerminal for HostTerminalAdapter<'_, H> {
             fn emit_line(&mut self, style: HeadlessStderrStyle, line: String) {
@@ -654,6 +694,54 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
             &mut state.explain_turns,
             turn_result.accum.explain_turns.as_slice(),
         );
+
+        // ─── Step 4b: Error budget tracking ─────────────────────────────
+        // Track consecutive turns dominated by the same error category.
+        // If the agent keeps hitting the same error N turns in a row,
+        // inject a strategy-change nudge.
+        {
+            // Compare error counts before/after this turn's tool round.
+            let turn_errors = state.turn_guard.errors.total_errors
+                .saturating_sub(errors_before_round);
+            if turn_errors > 0 {
+                // Find the category that grew most this turn.
+                let dominant = state.turn_guard.errors.errors_by_category.iter()
+                    .filter_map(|(cat, &count)| {
+                        let before = errors_by_cat_before.get(cat).copied().unwrap_or(0);
+                        let delta = count.saturating_sub(before);
+                        if delta > 0 { Some((*cat, delta)) } else { None }
+                    })
+                    .max_by_key(|(_, delta)| *delta)
+                    .map(|(cat, _)| cat);
+                if dominant == state.last_error_category {
+                    state.consecutive_same_error += 1;
+                } else {
+                    state.consecutive_same_error = 1;
+                    state.last_error_category = dominant;
+                }
+                if state.consecutive_same_error >= CONSECUTIVE_ERROR_BUDGET {
+                    let cat_name = state.last_error_category
+                        .map(|c| format!("{c:?}"))
+                        .unwrap_or_else(|| "Unknown".into());
+                    state.messages.push(serde_json::json!({
+                        "role": "user",
+                        "content": format!(
+                            "🔄 ERROR BUDGET EXHAUSTED: You've hit {cat_name} errors \
+                             {n} turns in a row. Your current approach is not working. \
+                             STOP repeating the same strategy. You MUST try a fundamentally \
+                             different approach: different tool, different file, different \
+                             method. If you cannot make progress, explain what's blocking you.",
+                            n = state.consecutive_same_error,
+                        )
+                    }));
+                    state.consecutive_same_error = 0; // Reset after nudge
+                }
+            } else {
+                // Successful turn — reset streak.
+                state.consecutive_same_error = 0;
+                state.last_error_category = None;
+            }
+        }
 
         // ─── Step 5: Post-tool policy ───────────────────────────────────
         match map_post_tool_policy_outcome(apply_agentic_post_tool_policy(
@@ -888,6 +976,10 @@ mod tests {
             cancel_flag: None,
             cancel_token: None,
             delegation_engine: None,
+            stop_hooks: Vec::new(),
+            stop_hook_runs: 0,
+            consecutive_same_error: 0,
+            last_error_category: None,
         }
     }
 

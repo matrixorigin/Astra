@@ -996,6 +996,10 @@ mod tests {
             cancel_flag: None,
             cancel_token: None,
             delegation_engine: None,
+            stop_hooks: Vec::new(),
+            stop_hook_runs: 0,
+            consecutive_same_error: 0,
+            last_error_category: None,
         }
     }
 

@@ -72,6 +72,7 @@ pub mod sse_edge_stderr_lines;
 pub mod sse_stream_host;
 pub mod stall;
 pub mod state;
+pub mod stop_hooks;
 pub mod stream_events;
 pub mod tail_persist;
 pub mod task;

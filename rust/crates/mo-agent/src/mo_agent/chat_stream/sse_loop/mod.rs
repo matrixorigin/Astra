@@ -37,6 +37,52 @@ use agentic_sse_loop::{
 };
 use cli_loop_host::CliAgenticLoopHost;
 
+/// Auto-detect stop hooks from project root based on build system markers.
+fn detect_stop_hooks(
+    project_root: &std::path::Path,
+) -> Vec<mo_agent_runtime::turn::stop_hooks::StopHook> {
+    use mo_agent_runtime::turn::stop_hooks::StopHook;
+    let dir = project_root.to_string_lossy().to_string();
+    let mut hooks = Vec::new();
+
+    // Rust: prefer rust/Cargo.toml (nested workspace) over root Cargo.toml
+    if project_root.join("rust/Cargo.toml").exists() {
+        hooks.push(StopHook {
+            label: "cargo-check".into(),
+            command: "cargo check --manifest-path rust/Cargo.toml --quiet 2>&1 | head -30".into(),
+            working_dir: Some(dir.clone()),
+        });
+    } else if project_root.join("Cargo.toml").exists() {
+        hooks.push(StopHook {
+            label: "cargo-check".into(),
+            command: "cargo check --quiet 2>&1 | head -30".into(),
+            working_dir: Some(dir.clone()),
+        });
+    }
+    // Node: package.json with "build" script → npm run build
+    if project_root.join("package.json").exists() {
+        if let Ok(content) = std::fs::read_to_string(project_root.join("package.json")) {
+            if content.contains("\"build\"") {
+                hooks.push(StopHook {
+                    label: "npm-build".into(),
+                    command: "npm run build 2>&1 | tail -20".into(),
+                    working_dir: Some(dir.clone()),
+                });
+            }
+        }
+    }
+    // Go: go.mod → go vet
+    if project_root.join("go.mod").exists() {
+        hooks.push(StopHook {
+            label: "go-vet".into(),
+            command: "go vet ./... 2>&1 | head -30".into(),
+            working_dir: Some(dir),
+        });
+    }
+
+    hooks
+}
+
 pub(crate) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResult, String> {
     let start = Instant::now();
     let term_width = terminal_width_usize();
@@ -145,6 +191,10 @@ pub(crate) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
         cancel_flag: None,
         cancel_token: None,
         delegation_engine: None,
+        stop_hooks: detect_stop_hooks(&project_root),
+        stop_hook_runs: 0,
+        consecutive_same_error: 0,
+        last_error_category: None,
     };
 
     // ─── Run the runtime loop ────────────────────────────────────────────
