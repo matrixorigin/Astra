@@ -143,6 +143,9 @@ enum Command {
     Model(ModelCmd),
     #[command(subcommand)]
     Skill(SkillCmd),
+    /// Session audit: mo-agent audit list/show/turns/tools
+    #[command(subcommand)]
+    Audit(AuditCmd),
     /// Direct message: mo-agent "your question here"
     #[command(external_subcommand)]
     Message(Vec<String>),
@@ -287,6 +290,65 @@ struct ReplayArgs {
     mock_mode: bool,
     #[arg(long)]
     compare: bool,
+}
+
+#[derive(Subcommand, Debug)]
+enum AuditCmd {
+    /// List sessions with filters (status, model, since/until)
+    List(AuditListArgs),
+    /// Show audit summary for a session
+    Show(AuditShowArgs),
+    /// List turns in a session (paginated)
+    Turns(AuditTurnsArgs),
+    /// Show tool analytics for a session (or cross-session)
+    Tools(AuditToolsArgs),
+}
+
+#[derive(Args, Debug)]
+struct AuditListArgs {
+    #[arg(long)]
+    status: Option<String>,
+    #[arg(long)]
+    model: Option<String>,
+    #[arg(long)]
+    since: Option<String>,
+    #[arg(long)]
+    until: Option<String>,
+    #[arg(long)]
+    min_turns: Option<u32>,
+    #[arg(long, default_value = "created")]
+    sort: String,
+    #[arg(long, default_value_t = 20)]
+    limit: u32,
+    #[arg(long, default_value_t = 1)]
+    page: u32,
+}
+
+#[derive(Args, Debug)]
+struct AuditShowArgs {
+    session_id: String,
+}
+
+#[derive(Args, Debug)]
+struct AuditTurnsArgs {
+    session_id: String,
+    /// Show detail for a specific turn number
+    #[arg(long)]
+    turn: Option<u32>,
+    #[arg(long, default_value_t = 1)]
+    page: u32,
+    #[arg(long, default_value_t = 20)]
+    per_page: u32,
+}
+
+#[derive(Args, Debug)]
+struct AuditToolsArgs {
+    /// Session ID; omit for cross-session tool analytics
+    session_id: Option<String>,
+    #[arg(long)]
+    since: Option<String>,
+    #[arg(long)]
+    until: Option<String>,
 }
 
 // ═══════════════════════════════════════════════════════ Credentials ══════

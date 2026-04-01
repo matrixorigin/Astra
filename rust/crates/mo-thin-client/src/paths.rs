@@ -152,3 +152,44 @@ pub fn model_check(model_name: &str) -> String {
 pub fn skill_versions(skill_name: &str) -> String {
     format!("/skills/{skill_name}/versions")
 }
+
+// ── Session Audit paths ─────────────────────────────────────────────────────
+
+/// `GET /audit/sessions` — cross-session list with filters.
+pub const AUDIT_SESSIONS: &str = "/audit/sessions";
+
+/// `GET /audit/stats` — aggregate stats across sessions.
+pub const AUDIT_STATS: &str = "/audit/stats";
+
+/// `GET /audit/tools` — cross-session tool analytics.
+pub const AUDIT_TOOLS: &str = "/audit/tools";
+
+/// `GET /sessions/{id}/audit/summary`
+#[inline]
+pub fn session_audit_summary(session_id: &str) -> String {
+    format!("/sessions/{session_id}/audit/summary")
+}
+
+/// `GET /sessions/{id}/audit/turns`
+#[inline]
+pub fn session_audit_turns(session_id: &str) -> String {
+    format!("/sessions/{session_id}/audit/turns")
+}
+
+/// `GET /sessions/{id}/audit/turns/{n}`
+#[inline]
+pub fn session_audit_turn_detail(session_id: &str, turn: u32) -> String {
+    format!("/sessions/{session_id}/audit/turns/{turn}")
+}
+
+/// `GET /sessions/{id}/audit/tools`
+#[inline]
+pub fn session_audit_tools(session_id: &str) -> String {
+    format!("/sessions/{session_id}/audit/tools")
+}
+
+/// `GET /sessions/{id}/audit/errors`
+#[inline]
+pub fn session_audit_errors(session_id: &str) -> String {
+    format!("/sessions/{session_id}/audit/errors")
+}

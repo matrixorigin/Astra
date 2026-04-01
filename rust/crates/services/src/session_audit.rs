@@ -902,10 +902,16 @@ impl SessionAuditService for DatabaseSessionAuditService {
         params: &AuditSessionListParams,
     ) -> AuditResult<AuditSessionListResponse> {
         let pool = self.get_pool().await.map_err(internal_error)?;
+        let per_page = params.per_page.clamp(1, 100);
+        let page = params.page.max(1);
 
-        // Build dynamic WHERE clause
+        // Build WHERE with all filters pushed into SQL (including min_turns and model)
+        // via a subquery that pre-aggregates event stats per session.
+        let mut having_parts: Vec<String> = Vec::new();
         let mut where_parts: Vec<String> = vec!["s.user_id = ?".into()];
         let mut bind_values: Vec<String> = vec![user_id.into()];
+        // Extra binds for the HAVING clause (appended after main binds)
+        let mut having_bind_values: Vec<String> = Vec::new();
 
         if let Some(ref status) = params.status {
             where_parts.push("s.status = ?".into());
@@ -919,142 +925,119 @@ impl SessionAuditService for DatabaseSessionAuditService {
             where_parts.push("s.created_at <= ?".into());
             bind_values.push(until.clone());
         }
+        if let Some(min) = params.min_turns {
+            having_parts.push("turn_count >= ?".into());
+            having_bind_values.push(min.to_string());
+        }
+        if let Some(ref model) = params.model {
+            // "session ever used this model" — not MAX which picks lexicographic max
+            having_parts.push("SUM(CASE WHEN e.llm_model_used = ? THEN 1 ELSE 0 END) > 0".into());
+            having_bind_values.push(model.clone());
+        }
 
         let where_clause = where_parts.join(" AND ");
+        let having_clause = if having_parts.is_empty() {
+            String::new()
+        } else {
+            format!("HAVING {}", having_parts.join(" AND "))
+        };
 
-        // Count total matching sessions
-        let count_sql =
-            format!("SELECT COUNT(*) as cnt FROM agent_sessions s WHERE {where_clause}");
-        let mut count_q = sqlx::query(&count_sql);
+        // Sort column (references aliases from the SELECT)
+        let sort_col = match params.sort.as_str() {
+            "turns" => "turn_count",
+            "tokens" => "tokens_in + tokens_out",
+            "duration" => "duration_secs",
+            _ => "s.created_at",
+        };
+        let order_dir = if params.order == "asc" { "ASC" } else { "DESC" };
+        let offset = (page.saturating_sub(1)) * per_page;
+
+        // Single query: JOIN + GROUP BY to get stats, model, and counts in one pass.
+        // The CTE computes per-session aggregates; outer query handles pagination.
+        let data_sql = format!(
+            "SELECT \
+               s.session_id, s.status, s.created_at, s.ended_at, \
+               COUNT(CASE WHEN e.event_type = 'turn' THEN 1 END) AS turn_count, \
+               COALESCE(SUM(CASE WHEN e.token_usage IS NOT NULL THEN JSON_EXTRACT(e.token_usage, '$.input') END), 0) AS tokens_in, \
+               COALESCE(SUM(CASE WHEN e.token_usage IS NOT NULL THEN JSON_EXTRACT(e.token_usage, '$.output') END), 0) AS tokens_out, \
+               COUNT(CASE WHEN e.event_type IN ('tool_call', 'tool_error') THEN 1 END) AS tool_calls, \
+               COUNT(CASE WHEN e.event_type IN ('turn_error', 'error', 'tool_error') THEN 1 END) AS error_count, \
+               MIN(e.created_at) AS first_ts, \
+               MAX(e.created_at) AS last_ts, \
+               MAX(CASE WHEN e.llm_model_used IS NOT NULL THEN e.llm_model_used END) AS model, \
+               TIMESTAMPDIFF(SECOND, s.created_at, COALESCE(s.ended_at, NOW())) AS duration_secs \
+             FROM agent_sessions s \
+             LEFT JOIN agent_events e ON e.session_id = s.session_id AND e.user_id = s.user_id \
+             WHERE {where_clause} \
+             GROUP BY s.session_id, s.status, s.created_at, s.ended_at \
+             {having_clause} \
+             ORDER BY {sort_col} {order_dir} \
+             LIMIT ? OFFSET ?"
+        );
+
+        let mut q = sqlx::query(&data_sql);
         for v in &bind_values {
-            count_q = count_q.bind(v);
+            q = q.bind(v);
         }
-        let total: u32 = count_q
+        for v in &having_bind_values {
+            q = q.bind(v);
+        }
+        q = q.bind(per_page as i64).bind(offset as i64);
+        let rows = q.fetch_all(&pool).await.map_err(internal_error)?;
+
+        let sessions: Vec<AuditSessionListItem> = rows
+            .iter()
+            .map(|row| {
+                let first_ts: Option<String> = row.try_get("first_ts").ok();
+                let last_ts: Option<String> = row.try_get("last_ts").ok();
+                let duration = compute_duration_secs(first_ts.as_deref(), last_ts.as_deref());
+                AuditSessionListItem {
+                    session_id: row.try_get("session_id").unwrap_or_default(),
+                    status: row.try_get("status").unwrap_or_default(),
+                    turn_count: row.try_get::<i64, _>("turn_count").unwrap_or(0) as u32,
+                    tokens_in: row.try_get::<i64, _>("tokens_in").unwrap_or(0) as u64,
+                    tokens_out: row.try_get::<i64, _>("tokens_out").unwrap_or(0) as u64,
+                    tool_calls_total: row.try_get::<i64, _>("tool_calls").unwrap_or(0) as u32,
+                    error_count: row.try_get::<i64, _>("error_count").unwrap_or(0) as u32,
+                    model: row.try_get::<String, _>("model").ok(),
+                    duration_secs: duration,
+                    created_at: row.try_get("created_at").unwrap_or_default(),
+                    ended_at: row.try_get("ended_at").ok(),
+                }
+            })
+            .collect();
+
+        // Count total matching (same WHERE + HAVING, no LIMIT)
+        let count_sql = format!(
+            "SELECT COUNT(*) AS cnt FROM (\
+               SELECT s.session_id, \
+                 COUNT(CASE WHEN e.event_type = 'turn' THEN 1 END) AS turn_count \
+               FROM agent_sessions s \
+               LEFT JOIN agent_events e ON e.session_id = s.session_id AND e.user_id = s.user_id \
+               WHERE {where_clause} \
+               GROUP BY s.session_id \
+               {having_clause}\
+             ) sub"
+        );
+        let mut cq = sqlx::query(&count_sql);
+        for v in &bind_values {
+            cq = cq.bind(v);
+        }
+        for v in &having_bind_values {
+            cq = cq.bind(v);
+        }
+        let total = cq
             .fetch_one(&pool)
             .await
             .map_err(internal_error)?
             .try_get::<i64, _>("cnt")
             .unwrap_or(0) as u32;
 
-        // Build sort clause
-        let sort_col = match params.sort.as_str() {
-            "turns" => "event_count",
-            "tokens" => "event_count", // approximate; true sort needs subquery
-            "duration" => "TIMESTAMPDIFF(SECOND, s.created_at, COALESCE(s.ended_at, NOW()))",
-            _ => "s.created_at",
-        };
-        let order_dir = if params.order == "asc" { "ASC" } else { "DESC" };
-
-        let offset = (params.page.saturating_sub(1)) * params.per_page;
-        let list_sql = format!(
-            "SELECT s.session_id, s.status, s.event_count, s.created_at, s.ended_at \
-             FROM agent_sessions s \
-             WHERE {where_clause} \
-             ORDER BY {sort_col} {order_dir} \
-             LIMIT ? OFFSET ?",
-        );
-        let mut list_q = sqlx::query(&list_sql);
-        for v in &bind_values {
-            list_q = list_q.bind(v);
-        }
-        list_q = list_q.bind(params.per_page as i64).bind(offset as i64);
-
-        let rows = list_q.fetch_all(&pool).await.map_err(internal_error)?;
-
-        let mut sessions = Vec::with_capacity(rows.len());
-        for row in &rows {
-            let sid: String = row.try_get("session_id").unwrap_or_default();
-            let status: String = row.try_get("status").unwrap_or_default();
-            let created_at: String = row.try_get("created_at").unwrap_or_default();
-            let ended_at: Option<String> = row.try_get("ended_at").ok();
-
-            // Fetch per-session event stats in one query
-            let stats_row = query(
-                "SELECT \
-                   COUNT(CASE WHEN event_type = 'turn' THEN 1 END) as turn_count, \
-                   COALESCE(SUM(CASE WHEN token_usage IS NOT NULL THEN JSON_EXTRACT(token_usage, '$.input') END), 0) as tokens_in, \
-                   COALESCE(SUM(CASE WHEN token_usage IS NOT NULL THEN JSON_EXTRACT(token_usage, '$.output') END), 0) as tokens_out, \
-                   COUNT(CASE WHEN event_type IN ('tool_call', 'tool_error') THEN 1 END) as tool_calls, \
-                   COUNT(CASE WHEN event_type IN ('turn_error', 'error', 'tool_error') THEN 1 END) as error_count, \
-                   MIN(created_at) as first_ts, MAX(created_at) as last_ts \
-                 FROM agent_events \
-                 WHERE session_id = ? AND user_id = ?",
-            )
-            .bind(&sid)
-            .bind(user_id)
-            .fetch_one(&pool)
-            .await
-            .map_err(internal_error)?;
-
-            let turn_count = stats_row.try_get::<i64, _>("turn_count").unwrap_or(0) as u32;
-
-            // Apply min_turns filter (post-query since it needs event stats)
-            if let Some(min) = params.min_turns
-                && turn_count < min
-            {
-                continue;
-            }
-
-            // Apply model filter
-            let model: Option<String> = if params.model.is_some() {
-                let m_row = query(
-                    "SELECT DISTINCT llm_model_used FROM agent_events \
-                     WHERE session_id = ? AND user_id = ? AND llm_model_used IS NOT NULL \
-                     LIMIT 1",
-                )
-                .bind(&sid)
-                .bind(user_id)
-                .fetch_optional(&pool)
-                .await
-                .map_err(internal_error)?;
-                let model_val = m_row
-                    .as_ref()
-                    .and_then(|r| r.try_get::<String, _>("llm_model_used").ok());
-                if let Some(ref filter_model) = params.model
-                    && model_val.as_deref() != Some(filter_model.as_str())
-                {
-                    continue;
-                }
-                model_val
-            } else {
-                // Get model for display
-                let m_row = query(
-                    "SELECT DISTINCT llm_model_used FROM agent_events \
-                     WHERE session_id = ? AND user_id = ? AND llm_model_used IS NOT NULL \
-                     LIMIT 1",
-                )
-                .bind(&sid)
-                .bind(user_id)
-                .fetch_optional(&pool)
-                .await
-                .map_err(internal_error)?;
-                m_row.and_then(|r| r.try_get::<String, _>("llm_model_used").ok())
-            };
-
-            let first_ts: Option<String> = stats_row.try_get("first_ts").ok();
-            let last_ts: Option<String> = stats_row.try_get("last_ts").ok();
-            let duration = compute_duration_secs(first_ts.as_deref(), last_ts.as_deref());
-
-            sessions.push(AuditSessionListItem {
-                session_id: sid,
-                status,
-                turn_count,
-                tokens_in: stats_row.try_get::<i64, _>("tokens_in").unwrap_or(0) as u64,
-                tokens_out: stats_row.try_get::<i64, _>("tokens_out").unwrap_or(0) as u64,
-                tool_calls_total: stats_row.try_get::<i64, _>("tool_calls").unwrap_or(0) as u32,
-                error_count: stats_row.try_get::<i64, _>("error_count").unwrap_or(0) as u32,
-                model,
-                duration_secs: duration,
-                created_at,
-                ended_at,
-            });
-        }
-
         Ok(AuditSessionListResponse {
             sessions,
             total,
-            page: params.page,
-            per_page: params.per_page,
+            page,
+            per_page,
         })
     }
 
@@ -1065,7 +1048,8 @@ impl SessionAuditService for DatabaseSessionAuditService {
     ) -> AuditResult<CrossSessionStats> {
         let pool = self.get_pool().await.map_err(internal_error)?;
 
-        // Build time-range filter
+        // Build time-range filter — all aggregates use agent_events.created_at
+        // so numerator and denominator share the same time window.
         let mut where_parts: Vec<String> = vec!["e.user_id = ?".into()];
         let mut bind_values: Vec<String> = vec![user_id.into()];
         if let Some(ref since) = params.since {
@@ -1078,35 +1062,10 @@ impl SessionAuditService for DatabaseSessionAuditService {
         }
         let where_clause = where_parts.join(" AND ");
 
-        // Session count
-        let mut s_where: Vec<String> = vec!["s.user_id = ?".into()];
-        let mut s_bind: Vec<String> = vec![user_id.into()];
-        if let Some(ref since) = params.since {
-            s_where.push("s.created_at >= ?".into());
-            s_bind.push(since.clone());
-        }
-        if let Some(ref until) = params.until {
-            s_where.push("s.created_at <= ?".into());
-            s_bind.push(until.clone());
-        }
-        let s_where_clause = s_where.join(" AND ");
-
-        let session_count_sql =
-            format!("SELECT COUNT(*) as cnt FROM agent_sessions s WHERE {s_where_clause}");
-        let mut sq = sqlx::query(&session_count_sql);
-        for v in &s_bind {
-            sq = sq.bind(v);
-        }
-        let session_count = sq
-            .fetch_one(&pool)
-            .await
-            .map_err(internal_error)?
-            .try_get::<i64, _>("cnt")
-            .unwrap_or(0) as u32;
-
-        // Aggregate event stats
+        // Aggregate event stats — session_count derived from same event rows
         let agg_sql = format!(
             "SELECT \
+               COUNT(DISTINCT e.session_id) as session_count, \
                COUNT(CASE WHEN event_type = 'turn' THEN 1 END) as total_turns, \
                COALESCE(SUM(CASE WHEN token_usage IS NOT NULL THEN JSON_EXTRACT(token_usage, '$.input') END), 0) as tokens_in, \
                COALESCE(SUM(CASE WHEN token_usage IS NOT NULL THEN JSON_EXTRACT(token_usage, '$.output') END), 0) as tokens_out, \
@@ -1122,6 +1081,8 @@ impl SessionAuditService for DatabaseSessionAuditService {
             aq = aq.bind(v);
         }
         let agg = aq.fetch_one(&pool).await.map_err(internal_error)?;
+
+        let session_count = agg.try_get::<i64, _>("session_count").unwrap_or(0) as u32;
 
         let total_turns = agg.try_get::<i64, _>("total_turns").unwrap_or(0) as u32;
         let tokens_in = agg.try_get::<i64, _>("tokens_in").unwrap_or(0) as u64;
@@ -1230,75 +1191,84 @@ impl SessionAuditService for DatabaseSessionAuditService {
         }
         let where_clause = where_parts.join(" AND ");
 
+        // Single query: aggregate stats + last_error via LEFT JOIN on a
+        // ROW_NUMBER() subquery that picks the most recent tool_error per tool.
         let sql = format!(
             "SELECT \
-               JSON_EXTRACT(metadata, '$.tool_name') as tool_name, \
-               COUNT(*) as total_calls, \
-               COUNT(CASE WHEN event_type = 'tool_call' THEN 1 END) as total_success, \
-               COUNT(CASE WHEN event_type = 'tool_error' THEN 1 END) as total_failures, \
-               COALESCE(AVG(JSON_EXTRACT(metadata, '$.duration_ms')), 0) as avg_ms, \
-               COALESCE(MAX(JSON_EXTRACT(metadata, '$.duration_ms')), 0) as max_ms, \
-               COUNT(DISTINCT session_id) as sessions_used \
-             FROM agent_events e \
-             WHERE {where_clause} AND event_type IN ('tool_call', 'tool_error') \
-             GROUP BY tool_name \
-             ORDER BY total_calls DESC"
+               agg.tool_name, agg.total_calls, agg.total_success, agg.total_failures, \
+               agg.avg_ms, agg.max_ms, agg.sessions_used, \
+               le.content AS last_error \
+             FROM (\
+               SELECT \
+                 JSON_EXTRACT(metadata, '$.tool_name') AS tool_name, \
+                 COUNT(*) AS total_calls, \
+                 COUNT(CASE WHEN event_type = 'tool_call' THEN 1 END) AS total_success, \
+                 COUNT(CASE WHEN event_type = 'tool_error' THEN 1 END) AS total_failures, \
+                 COALESCE(AVG(JSON_EXTRACT(metadata, '$.duration_ms')), 0) AS avg_ms, \
+                 COALESCE(MAX(JSON_EXTRACT(metadata, '$.duration_ms')), 0) AS max_ms, \
+                 COUNT(DISTINCT session_id) AS sessions_used \
+               FROM agent_events e \
+               WHERE {where_clause} AND event_type IN ('tool_call', 'tool_error') \
+               GROUP BY tool_name \
+             ) agg \
+             LEFT JOIN (\
+               SELECT tool_name, content FROM (\
+                 SELECT \
+                   JSON_EXTRACT(metadata, '$.tool_name') AS tool_name, \
+                   content, \
+                   ROW_NUMBER() OVER (PARTITION BY JSON_EXTRACT(metadata, '$.tool_name') ORDER BY created_at DESC) AS rn \
+                 FROM agent_events e \
+                 WHERE {where_clause} AND event_type = 'tool_error'\
+               ) ranked WHERE rn = 1\
+             ) le ON le.tool_name = agg.tool_name \
+             ORDER BY agg.total_calls DESC"
         );
         let mut q = sqlx::query(&sql);
+        // Bind values appear 3 times: agg subquery, ranked subquery, outer is just joins
+        for v in &bind_values {
+            q = q.bind(v);
+        }
         for v in &bind_values {
             q = q.bind(v);
         }
         let rows = q.fetch_all(&pool).await.map_err(internal_error)?;
 
-        let mut result: Vec<CrossSessionToolAnalytics> = Vec::with_capacity(rows.len());
-        for row in &rows {
-            let name: String = row.try_get("tool_name").unwrap_or_default();
-            let name = name.trim_matches('"').to_string();
-            let total_calls = row.try_get::<i64, _>("total_calls").unwrap_or(0) as u32;
-            let total_success = row.try_get::<i64, _>("total_success").unwrap_or(0) as u32;
-            let total_failures = row.try_get::<i64, _>("total_failures").unwrap_or(0) as u32;
+        let result: Vec<CrossSessionToolAnalytics> = rows
+            .iter()
+            .map(|row| {
+                let name: String = row.try_get("tool_name").unwrap_or_default();
+                let name = name.trim_matches('"').to_string();
+                let total_calls = row.try_get::<i64, _>("total_calls").unwrap_or(0) as u32;
+                let total_success = row.try_get::<i64, _>("total_success").unwrap_or(0) as u32;
+                let total_failures = row.try_get::<i64, _>("total_failures").unwrap_or(0) as u32;
+                let last_error = row
+                    .try_get::<String, _>("last_error")
+                    .ok()
+                    .filter(|s| !s.is_empty());
 
-            // Get last error for this tool
-            let err_sql = format!(
-                "SELECT content FROM agent_events e \
-                 WHERE {where_clause} AND event_type = 'tool_error' \
-                   AND JSON_EXTRACT(metadata, '$.tool_name') = ? \
-                 ORDER BY created_at DESC LIMIT 1"
-            );
-            let mut eq = sqlx::query(&err_sql);
-            for v in &bind_values {
-                eq = eq.bind(v);
-            }
-            eq = eq.bind(&name);
-            let last_error = eq
-                .fetch_optional(&pool)
-                .await
-                .map_err(internal_error)?
-                .and_then(|r| r.try_get::<String, _>("content").ok())
-                .filter(|s| !s.is_empty());
-
-            result.push(CrossSessionToolAnalytics {
-                name,
-                total_calls,
-                total_success,
-                total_failures,
-                success_rate: if total_calls > 0 {
-                    total_success as f64 / total_calls as f64
-                } else {
-                    0.0
-                },
-                avg_duration_ms: row
-                    .try_get::<f64, _>("avg_ms")
-                    .or_else(|_| row.try_get::<i64, _>("avg_ms").map(|v| v as f64))
-                    .unwrap_or(0.0),
-                max_duration_ms: row
-                    .try_get::<i64, _>("max_ms")
-                    .or_else(|_| row.try_get::<f64, _>("max_ms").map(|v| v as i64))
-                    .unwrap_or(0) as u64,
-                sessions_used_in: row.try_get::<i64, _>("sessions_used").unwrap_or(0) as u32,
-                last_error,
-            });
-        }
+                CrossSessionToolAnalytics {
+                    name,
+                    total_calls,
+                    total_success,
+                    total_failures,
+                    success_rate: if total_calls > 0 {
+                        total_success as f64 / total_calls as f64
+                    } else {
+                        0.0
+                    },
+                    avg_duration_ms: row
+                        .try_get::<f64, _>("avg_ms")
+                        .or_else(|_| row.try_get::<i64, _>("avg_ms").map(|v| v as f64))
+                        .unwrap_or(0.0),
+                    max_duration_ms: row
+                        .try_get::<i64, _>("max_ms")
+                        .or_else(|_| row.try_get::<f64, _>("max_ms").map(|v| v as i64))
+                        .unwrap_or(0) as u64,
+                    sessions_used_in: row.try_get::<i64, _>("sessions_used").unwrap_or(0) as u32,
+                    last_error,
+                }
+            })
+            .collect();
 
         Ok(result)
     }

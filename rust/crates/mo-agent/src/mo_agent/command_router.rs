@@ -1,5 +1,6 @@
 use super::*;
 use crate::permission_manager::PermissionMode;
+use mo_thin_client::paths;
 use std::io::Read;
 
 /// Exit codes for CLI commands (for scripting integration)
@@ -536,6 +537,103 @@ pub(super) async fn execute_cli_command(
                 )
                 .await
                 .map_err(map_thin_err)?;
+            print_json_or_raw(&body);
+            Ok(ExitCode::Success)
+        }
+
+        // ── Audit commands ──────────────────────────────────────────────────
+
+        Some(Command::Audit(AuditCmd::List(args))) => {
+            let (_, _, _, token) = get_profile_and_token(profile.as_deref())?;
+            let mut q: Vec<(&str, String)> = vec![
+                ("page", args.page.to_string()),
+                ("per_page", args.limit.to_string()),
+                ("sort", args.sort.clone()),
+            ];
+            if let Some(ref s) = args.status {
+                q.push(("status", s.clone()));
+            }
+            if let Some(ref m) = args.model {
+                q.push(("model", m.clone()));
+            }
+            if let Some(ref s) = args.since {
+                q.push(("since", s.clone()));
+            }
+            if let Some(ref u) = args.until {
+                q.push(("until", u.clone()));
+            }
+            if let Some(mt) = args.min_turns {
+                q.push(("min_turns", mt.to_string()));
+            }
+            let body = api
+                .get_bearer_path_query_text(&token, paths::AUDIT_SESSIONS, &q)
+                .await
+                .map_err(map_thin_err)?;
+            print_json_or_raw(&body);
+            Ok(ExitCode::Success)
+        }
+
+        Some(Command::Audit(AuditCmd::Show(args))) => {
+            let (_, _, _, token) = get_profile_and_token(profile.as_deref())?;
+            let body = api
+                .get_bearer_path_query_text(
+                    &token,
+                    &paths::session_audit_summary(&args.session_id),
+                    &[],
+                )
+                .await
+                .map_err(map_thin_err)?;
+            print_json_or_raw(&body);
+            Ok(ExitCode::Success)
+        }
+
+        Some(Command::Audit(AuditCmd::Turns(args))) => {
+            let (_, _, _, token) = get_profile_and_token(profile.as_deref())?;
+            let body = if let Some(turn) = args.turn {
+                api.get_bearer_path_query_text(
+                    &token,
+                    &paths::session_audit_turn_detail(&args.session_id, turn),
+                    &[],
+                )
+                .await
+            } else {
+                let q = vec![
+                    ("page", args.page.to_string()),
+                    ("per_page", args.per_page.to_string()),
+                ];
+                api.get_bearer_path_query_text(
+                    &token,
+                    &paths::session_audit_turns(&args.session_id),
+                    &q,
+                )
+                .await
+            }
+            .map_err(map_thin_err)?;
+            print_json_or_raw(&body);
+            Ok(ExitCode::Success)
+        }
+
+        Some(Command::Audit(AuditCmd::Tools(args))) => {
+            let (_, _, _, token) = get_profile_and_token(profile.as_deref())?;
+            let body = if let Some(ref sid) = args.session_id {
+                api.get_bearer_path_query_text(
+                    &token,
+                    &paths::session_audit_tools(sid),
+                    &[],
+                )
+                .await
+            } else {
+                let mut q: Vec<(&str, String)> = Vec::new();
+                if let Some(ref s) = args.since {
+                    q.push(("since", s.clone()));
+                }
+                if let Some(ref u) = args.until {
+                    q.push(("until", u.clone()));
+                }
+                api.get_bearer_path_query_text(&token, paths::AUDIT_TOOLS, &q)
+                    .await
+            }
+            .map_err(map_thin_err)?;
             print_json_or_raw(&body);
             Ok(ExitCode::Success)
         }
