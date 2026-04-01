@@ -120,16 +120,31 @@ pub fn semantic_call_key(tool_name: &str, args: &Value) -> Option<String> {
             let file = arg_str(args, "file")?;
             let line = args.get("line").and_then(Value::as_u64).unwrap_or(0);
             let col = args.get("column").and_then(Value::as_u64).unwrap_or(0);
-            Some(format!("hover_info:{}:{}:{}", normalize_path(file), line, col))
+            Some(format!(
+                "hover_info:{}:{}:{}",
+                normalize_path(file),
+                line,
+                col
+            ))
         }
         "call_graph" => {
             let symbol = arg_str(args, "symbol")?;
             let file = arg_str(args, "file").unwrap_or("");
-            let callers = args.get("callers").and_then(Value::as_bool).unwrap_or(false);
-            Some(format!("call_graph:{}:{}:callers={}", symbol, normalize_path(file), callers))
+            let callers = args
+                .get("callers")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            Some(format!(
+                "call_graph:{}:{}:callers={}",
+                symbol,
+                normalize_path(file),
+                callers
+            ))
         }
         "type_hierarchy" | "dead_code" | "extract_members" => {
-            let file = arg_str(args, "file").or_else(|| arg_str(args, "path")).unwrap_or(".");
+            let file = arg_str(args, "file")
+                .or_else(|| arg_str(args, "path"))
+                .unwrap_or(".");
             Some(format!("{}:{}", tool_name, normalize_path(file)))
         }
         // Memory tools: key on query

@@ -940,6 +940,12 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
                 if let Some(branch) = edge_profile.get("git_branch").and_then(Value::as_str) {
                     parts.push(format!("git_branch: {branch}"));
                 }
+                // Inject rich environment context (OS, shell, git status, etc.)
+                let env_section = edge_profile
+                    .get("environment_context")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
                 // Prefetch memories relevant to the current user message.
                 // Injected every turn — cost is bounded by top_k and relevance
                 // (typically 1-3 matches, ~100 tokens). This ensures LLM always
@@ -963,7 +969,16 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
                         parts.push(section);
                     }
                 }
-                if parts.is_empty() { String::new() } else { format!("\n\n# Project Profile\n{}", parts.join("\n")) }
+                if parts.is_empty() && env_section.is_empty() {
+                    String::new()
+                } else {
+                    let base = if parts.is_empty() {
+                        String::new()
+                    } else {
+                        format!("\n\n# Project Profile\n{}", parts.join("\n"))
+                    };
+                    format!("{base}{env_section}")
+                }
             };
             // Read active skill hints from edge_profile (injected by CLI)
             let skill_hint = edge_profile

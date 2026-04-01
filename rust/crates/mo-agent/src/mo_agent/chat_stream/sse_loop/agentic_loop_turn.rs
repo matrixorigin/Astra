@@ -440,7 +440,15 @@ pub(crate) async fn fetch_chat_turn_sse(
         perm_manager: Some(perm_manager),
     };
 
-    Ok(consume_turn_sse(resp, render_md, term_width, quiet, Some(edge_ctx), pre_clear_lines).await)
+    Ok(consume_turn_sse(
+        resp,
+        render_md,
+        term_width,
+        quiet,
+        Some(edge_ctx),
+        pre_clear_lines,
+    )
+    .await)
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────────

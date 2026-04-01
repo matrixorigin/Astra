@@ -31,12 +31,18 @@ pub fn build_base_edge_profile_value(
     workspace: Value,
 ) -> Value {
     let (memoria_url, memoria_key) = memoria_env_for_edge_profile();
+
+    // Collect environment context for the LLM
+    let env_context =
+        crate::turn::edge_prompt_context::build_environment_context(std::path::Path::new(cwd));
+
     json!({
         "cwd": cwd,
         "git_branch": git_branch,
         "memoria_url": memoria_url,
         "memoria_key": memoria_key,
         "workspace": workspace,
+        "environment_context": env_context,
     })
 }
 
@@ -74,6 +80,16 @@ mod tests {
         assert!(v.get("memoria_url").is_some());
         assert!(v.get("memoria_key").is_some());
         assert_eq!(v["workspace"]["k"], 1);
+        // Environment context is now included
+        assert!(
+            v.get("environment_context").is_some(),
+            "should include environment_context"
+        );
+        let env_ctx = v["environment_context"].as_str().unwrap();
+        assert!(
+            env_ctx.contains("## Environment"),
+            "environment_context should have section header"
+        );
     }
 
     #[test]

@@ -117,6 +117,65 @@ pub fn detect_project_languages(root: &Path) -> Vec<String> {
     langs
 }
 
+/// Build a human-readable environment context string for the system prompt.
+/// Includes OS, architecture, shell, CWD, git branch/status, and terminal info.
+/// This gives the LLM awareness of the runtime environment for better tool usage.
+pub fn build_environment_context(project_root: &Path) -> String {
+    let mut lines = Vec::new();
+
+    // OS and architecture
+    lines.push(format!(
+        "- Platform: {} ({})",
+        std::env::consts::OS,
+        std::env::consts::ARCH
+    ));
+
+    // Shell
+    let shell = std::env::var("SHELL")
+        .or_else(|_| std::env::var("COMSPEC"))
+        .unwrap_or_default();
+    if !shell.is_empty() {
+        let shell_name = std::path::Path::new(&shell)
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or(shell);
+        lines.push(format!("- Shell: {shell_name}"));
+    }
+
+    // CWD
+    lines.push(format!("- CWD: {}", project_root.display()));
+
+    // Git branch and status (best-effort, non-blocking)
+    if let Ok(output) = std::process::Command::new("git")
+        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .current_dir(project_root)
+        .output()
+        && let Ok(branch) = String::from_utf8(output.stdout)
+    {
+        let branch = branch.trim();
+        if !branch.is_empty() {
+            // Check if repo is dirty
+            let dirty = std::process::Command::new("git")
+                .args(["status", "--porcelain", "--untracked-files=no"])
+                .current_dir(project_root)
+                .output()
+                .ok()
+                .and_then(|o| String::from_utf8(o.stdout).ok())
+                .map(|s| !s.trim().is_empty())
+                .unwrap_or(false);
+            let status = if dirty { " (dirty)" } else { "" };
+            lines.push(format!("- Git branch: {branch}{status}"));
+        }
+    }
+
+    // Home directory
+    if let Ok(home) = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")) {
+        lines.push(format!("- Home: {home}"));
+    }
+
+    format!("\n\n## Environment\n{}", lines.join("\n"))
+}
+
 /// Compact preview of tool arguments for observability (journal, stderr).
 pub fn make_args_preview(tool_name: &str, args: &Value) -> Option<String> {
     let max_len = 80;
@@ -325,5 +384,55 @@ mod tests {
             "should skip node_modules"
         );
         assert!(dir_strs.contains(&"src/"), "should include src/");
+    }
+
+    // ── build_environment_context tests ──────────────────────────────────
+
+    #[test]
+    fn environment_context_contains_platform() {
+        let tmp = tempdir().unwrap();
+        let ctx = build_environment_context(tmp.path());
+        assert!(ctx.contains("## Environment"), "should have section header");
+        assert!(ctx.contains("- Platform:"), "should contain platform info");
+        assert!(
+            ctx.contains(std::env::consts::OS),
+            "should contain current OS"
+        );
+    }
+
+    #[test]
+    fn environment_context_contains_cwd() {
+        let tmp = tempdir().unwrap();
+        let ctx = build_environment_context(tmp.path());
+        assert!(ctx.contains("- CWD:"), "should contain CWD line");
+        let tmp_str = tmp.path().to_string_lossy();
+        assert!(
+            ctx.contains(&*tmp_str),
+            "should contain actual CWD path: {ctx}"
+        );
+    }
+
+    #[test]
+    fn environment_context_in_git_repo() {
+        // Use the actual repo root (we know it's a git repo)
+        let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|p| p.parent())
+            .unwrap();
+        let ctx = build_environment_context(repo_root);
+        assert!(
+            ctx.contains("- Git branch:"),
+            "should detect git branch in repo: {ctx}"
+        );
+    }
+
+    #[test]
+    fn environment_context_no_git_in_temp() {
+        let tmp = tempdir().unwrap();
+        let ctx = build_environment_context(tmp.path());
+        assert!(
+            !ctx.contains("- Git branch:"),
+            "temp dir should not have git branch"
+        );
     }
 }
