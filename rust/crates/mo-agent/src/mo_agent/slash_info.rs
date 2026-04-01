@@ -227,34 +227,24 @@ fn build_review_prompt(arg: &str) -> String {
 \n\
 Review target: {target}\n\
 \n\
-<<<<<<< HEAD
 Process:\n\
 1. Get the diff:\n\
-   - HEAD → `git_show` (gives you the full diff already)\n\
-   - WORKING_TREE → `git_diff`\n\
-   - Other → `git_show <rev>`\n\
+   - HEAD -> `git_show` (gives you the full diff already)\n\
+   - WORKING_TREE -> `git_diff`\n\
+   - Other -> `git_show <rev>`\n\
 2. Review the diff directly. Do NOT read entire files.\n\
    Only use `read_file` with `start_line`/`end_line` if you need \
    ~10 lines of surrounding context to verify a specific finding.\n\
 3. If you need to understand a function signature or type, use \
    `read_file` with `outline=true` instead of reading the whole file.\n\
-4. Produce a concise review. Do not invent issues.\n\
-\n\
-Output: Summary → Findings → Verification → Verdict\n"
-=======
-Use the git-aware tools first and read only the files needed to verify important findings.\n\
-- If target is `HEAD`, inspect the latest commit with `git_log` and `git_show`.\n\
-- If target is `WORKING_TREE`, inspect uncommitted changes with `git_status` and `git_diff`.\n\
-- Otherwise inspect the specified revision with `git_show`.\n\
-- Prefer `read_file`/`grep`/`glob` over `bash` unless a shell command is truly necessary.\n\
-- Ignore pure formatting churn and avoid commenting on environment-only failures unrelated to the reviewed change.\n\
-- Do not narrate your process, do not repeat the diff, and do not output XML-like tags such as `<reflect>`.\n\
+4. Prefer `read_file`/`grep`/`glob` over `bash` unless a shell command is truly necessary.\n\
+5. Ignore pure formatting churn and environment-only failures unrelated to the reviewed change.\n\
+6. Do not narrate your process, do not repeat the diff, and do not output XML-like tags such as `<reflect>`.\n\
 \n\
 Output format:\n\
 - Findings: 0-3 bullets, only material issues.\n\
 - Verdict: `LGTM` or `Needs changes`, with one short sentence.\n\
-- If nothing material is wrong, say `LGTM` and briefly mention residual risk only if it is real.\n"
->>>>>>> 403beef0 (Make review rendering final-only)
+- If nothing material is wrong, say `LGTM` and mention residual risk only if it is real.\n"
     )
 }
 
@@ -409,11 +399,10 @@ pub(super) async fn handle_info_command(
                 plan_only_chat: false,
             })
             .await?;
-<<<<<<< HEAD
             if let Some(session_id) = sr.session_id.as_deref() {
                 crate::repl_turn::initialize_journal_pub(state, session_id);
                 state.session_id = Some(session_id.to_string());
-=======
+            }
             if !sr.full_text.trim().is_empty() {
                 crate::cli_utils::print_markdown_width(
                     &sr.full_text,
@@ -422,10 +411,6 @@ pub(super) async fn handle_info_command(
                 if !sr.full_text.ends_with('\n') {
                     println!();
                 }
-            }
-            if let Some(session_id) = sr.session_id {
-                state.session_id = Some(session_id);
->>>>>>> 403beef0 (Make review rendering final-only)
             }
             state.last_response = Some(sr.full_text.clone());
             let review_input = format!("/review {arg}").trim().to_string();
@@ -1229,11 +1214,8 @@ mod tests {
         let prompt = build_review_prompt("");
         assert!(prompt.contains("Review target: HEAD"));
         assert!(prompt.contains("git_show"));
-<<<<<<< HEAD
         assert!(prompt.contains("Do NOT read entire files"));
-=======
         assert!(prompt.contains("Do not narrate your process"));
->>>>>>> 403beef0 (Make review rendering final-only)
     }
 
     #[test]
