@@ -63,6 +63,9 @@ pub struct WorkspaceMetadata {
     /// Number of parallel execution rounds completed.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub plan_execution_rounds: usize,
+    /// Active durable task contract (JSON-serialized TaskContract).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub contract_json: Option<String>,
 }
 
 impl WorkspaceMetadata {
@@ -136,6 +139,7 @@ impl WorkspaceMetadata {
             plan_goal: None,
             plan_config_json: None,
             plan_execution_rounds: 0,
+            contract_json: None,
         }
     }
 
@@ -166,6 +170,7 @@ impl WorkspaceMetadata {
             plan_goal: None,
             plan_config_json: None,
             plan_execution_rounds: 0,
+            contract_json: None,
         }
     }
 

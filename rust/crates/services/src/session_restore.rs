@@ -71,6 +71,9 @@ pub struct RestoredSession {
     /// Number of parallel execution rounds completed.
     #[serde(default)]
     pub plan_execution_rounds: usize,
+    /// Active durable task contract (JSON-serialized TaskContract).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contract_json: Option<String>,
 }
 
 /// A restored checkpoint entry (lightweight, for listing).
@@ -326,6 +329,7 @@ impl SessionRestoreService for HybridRestoreService {
                 plan_goal: ws.plan_goal,
                 plan_config_json: ws.plan_config_json,
                 plan_execution_rounds: ws.plan_execution_rounds,
+                contract_json: ws.contract_json,
                 ..Default::default()
             }));
         }

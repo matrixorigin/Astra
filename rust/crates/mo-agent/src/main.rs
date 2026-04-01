@@ -51,6 +51,8 @@ mod cli_utils;
 mod command_router;
 #[path = "mo_agent/diff_presenter.rs"]
 mod diff_presenter;
+#[path = "mo_agent/durable_bridge.rs"]
+mod durable_bridge;
 #[path = "mo_agent/edge_lifecycle.rs"]
 mod edge_lifecycle;
 #[path = "mo_agent/permission_manager.rs"]
@@ -500,6 +502,8 @@ struct ReplState {
     /// Skill classification cache for LLM-based skill detection.
     #[allow(dead_code)]
     skill_classification_cache: skill_instructions::SkillClassificationCache,
+    /// Active durable-task contract for plan execution verification.
+    durable_task_state: Option<durable_bridge::DurableTaskState>,
 }
 
 impl Default for ReplState {
@@ -550,6 +554,7 @@ impl Default for ReplState {
                 mcp_client::McpClientManager::new(),
             )),
             skill_classification_cache: skill_instructions::SkillClassificationCache::default(),
+            durable_task_state: None,
         }
     }
 }
@@ -981,6 +986,21 @@ async fn handle_resume_command(arg: &str, profile: Option<&str>, state: &mut Rep
                 state.plan_execution_config = serde_json::from_str(json).ok();
             }
             state.plan_execution_rounds = restored.plan_execution_rounds;
+
+            // Restore durable task contract if present
+            if let Some(ref json) = restored.contract_json {
+                if let Ok(contract) = serde_json::from_str::<mo_agent_services::TaskContract>(json)
+                {
+                    let work_dir = std::env::current_dir().unwrap_or_default();
+                    let session_dir =
+                        mo_agent_services::session_workspace::workspace_dir_for(&session_id);
+                    let lifecycle = durable_bridge::create_local_lifecycle(&session_dir, &work_dir);
+                    state.durable_task_state = Some(durable_bridge::DurableTaskState {
+                        contract,
+                        lifecycle,
+                    });
+                }
+            }
 
             // Re-initialize journal for the resumed session
             repl_turn::initialize_journal_pub(state, &session_id);
@@ -1818,6 +1838,43 @@ async fn run_plan_execution(
 ) -> Result<(), String> {
     use mo_agent_services::task_orchestrator::TaskStatus;
 
+    // ─── Generate durable contract on first entry ────────────────────────────
+    if state.durable_task_state.is_none() {
+        if let Some(ref plan) = state.executing_plan {
+            let goal = state
+                .executing_plan_goal
+                .as_deref()
+                .unwrap_or("Plan execution");
+            let user_id = state.ingestion_user_id.as_deref().unwrap_or("local");
+            let session_id = state.session_id.as_deref().unwrap_or("unknown");
+            let work_dir = std::env::current_dir().unwrap_or_default();
+
+            // Create session-local lifecycle for contract persistence + verification
+            let session_dir = state
+                .session_id
+                .as_ref()
+                .map(|sid| mo_agent_services::session_workspace::workspace_dir_for(sid))
+                .unwrap_or_else(|| work_dir.join(".mo-session"));
+            let lifecycle = durable_bridge::create_local_lifecycle(&session_dir, &work_dir);
+
+            if let Some(contract) = durable_bridge::generate_contract(
+                &lifecycle,
+                plan,
+                goal,
+                user_id,
+                session_id,
+                &work_dir,
+            )
+            .await
+            {
+                state.durable_task_state = Some(durable_bridge::DurableTaskState {
+                    contract,
+                    lifecycle,
+                });
+            }
+        }
+    }
+
     loop {
         // Take the plan out of state to avoid borrow conflicts
         let mut plan = match state.executing_plan.take() {
@@ -1855,6 +1912,11 @@ async fn run_plan_execution(
                 let summary = plan_decompose::PlanExecutionSummary::from_plan(&plan, &goal, rounds);
                 eprintln!();
                 eprint!("{}", summary.format());
+
+                // Durable task: run global verification + delivery report
+                if let Some(ref mut durable) = state.durable_task_state {
+                    let _ = durable_bridge::on_plan_complete(durable).await;
+                }
 
                 // Journal: plan complete
                 if let Some(ref mut j) = state.journal {
@@ -1904,6 +1966,7 @@ async fn run_plan_execution(
                 state.plan_execution_config = None;
                 state.executing_plan_goal = None;
                 state.plan_execution_rounds = 0;
+                state.durable_task_state = None;
             }
             return Ok(());
         }
@@ -1946,6 +2009,11 @@ async fn run_plan_execution(
                 let title = st.title.clone();
                 (prompt, title)
             };
+
+            // Durable task: snapshot before execution
+            if let Some(ref durable) = state.durable_task_state {
+                durable_bridge::on_subtask_begin(durable, next_id).await;
+            }
 
             let remaining = plan
                 .subtasks
@@ -2096,19 +2164,47 @@ async fn run_plan_execution(
             if let Some(st) = plan.subtasks.iter_mut().find(|s| s.id == *next_id)
                 && st.status == TaskStatus::InProgress
             {
-                st.status = TaskStatus::Completed;
+                // Durable task: run verification before marking completed
+                let verification_passed = if let Some(ref mut durable) =
+                    state.durable_task_state
+                {
+                    durable_bridge::on_subtask_complete(durable, next_id).await
+                } else {
+                    true
+                };
+
+                if verification_passed {
+                    st.status = TaskStatus::Completed;
+                } else {
+                    // Verification failed — mark as failed so it can be retried
+                    // by the plan execution loop on the next iteration
+                    eprintln!(
+                        "  {}  Subtask verification failed, will retry: {}",
+                        "↻".yellow(),
+                        st.title,
+                    );
+                    st.status = TaskStatus::Pending;
+                }
+
                 let title = st.title.clone();
                 let pct = plan.progress_pct();
-                eprintln!("\n{}  Subtask done: {} ({}%)", "✓".green(), title, pct);
+                if verification_passed {
+                    eprintln!("\n{}  Subtask done: {} ({}%)", "✓".green(), title, pct);
+                }
 
-                // Journal: subtask completed
+                // Journal: subtask completed (or verification-failed)
+                let journal_status = if verification_passed {
+                    "completed"
+                } else {
+                    "verification_failed"
+                };
                 if let Some(ref mut j) = state.journal {
                     let evt = mo_agent_services::session_journal::JournalEvent::plan_progress(
                         state.session_id.as_deref(),
                         state.turn,
                         next_id,
                         &title,
-                        "completed",
+                        journal_status,
                         pct,
                         plan.subtasks.len(),
                         plan.items_done() as usize,

@@ -372,6 +372,12 @@ fn apply_turn_success(
                 .and_then(|c| serde_json::to_string(c).ok());
             ws.plan_execution_rounds = state.plan_execution_rounds;
 
+            // Persist durable task contract for session resume
+            ws.contract_json = state
+                .durable_task_state
+                .as_ref()
+                .and_then(|d| serde_json::to_string(&d.contract).ok());
+
             // Check if checkpoint is due
             if mo_agent_services::session_checkpoint::should_checkpoint(
                 ws.turn_count,
