@@ -152,14 +152,25 @@ pub fn retry_base_ms() -> u64 {
 }
 
 /// Determine if and how to retry a failed tool call.
+///
+/// Uses exponential backoff with deterministic jitter to prevent
+/// thundering-herd when multiple tool calls fail simultaneously.
+/// Jitter formula: `base * 2^attempt + (attempt * 7 + 3) % base`
 pub fn should_retry(category: ErrorCategory, attempt: usize) -> Option<u64> {
     if attempt >= max_tool_retries() {
         return None;
     }
     match category {
         ErrorCategory::Transient => {
-            // Exponential backoff: 500ms, 1000ms, …
-            Some(retry_base_ms() * (1 << attempt))
+            let base = retry_base_ms();
+            // Exponential backoff + deterministic jitter
+            let backoff = base * (1 << attempt);
+            let jitter = if base > 0 {
+                ((attempt as u64) * 7 + 3) % base
+            } else {
+                0
+            };
+            Some(backoff + jitter)
         }
         // All other categories: don't retry
         _ => None,
@@ -228,7 +239,7 @@ pub fn suggest_alternatives(failed_tool: &str, deprioritized: &[&str]) -> Vec<St
 /// and actionable guidance.
 pub fn build_recovery_message(
     tool_name: &str,
-    _error_str: &str,
+    error_str: &str,
     category: ErrorCategory,
     deprioritized: &[&str],
 ) -> String {
@@ -266,7 +277,14 @@ pub fn build_recovery_message(
              Do NOT retry — reduce system load or try a different approach.",
             tool_name
         ),
-        ErrorCategory::Unknown => format!("⚠ {} failed with an unclassified error.", tool_name),
+        ErrorCategory::Unknown => {
+            eprintln!(
+                "[error_recovery] unclassified error for tool '{}': {}",
+                tool_name,
+                error_str.chars().take(200).collect::<String>()
+            );
+            format!("⚠ {} failed with an unclassified error.", tool_name)
+        }
     };
 
     if !alternatives.is_empty() {
@@ -524,12 +542,14 @@ mod tests {
 
     #[test]
     fn retry_transient_first_attempt() {
-        assert_eq!(should_retry(ErrorCategory::Transient, 0), Some(500));
+        // base=500, attempt=0: 500*1 + (0*7+3)%500 = 503
+        assert_eq!(should_retry(ErrorCategory::Transient, 0), Some(503));
     }
 
     #[test]
     fn retry_transient_second_attempt() {
-        assert_eq!(should_retry(ErrorCategory::Transient, 1), Some(1000));
+        // base=500, attempt=1: 500*2 + (1*7+3)%500 = 1010
+        assert_eq!(should_retry(ErrorCategory::Transient, 1), Some(1010));
     }
 
     #[test]

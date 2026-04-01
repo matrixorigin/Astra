@@ -829,15 +829,22 @@ mod chat_stream_turnguard_e2e {
             "pure nudges without errors must NOT force_stop"
         );
 
-        // Phase 4: add tool errors to couple with nudges → Critical + force_stop
+        // Phase 4: add tool errors to couple with nudges → first Critical → restricted
         guard.record_tool_result("bash", "error: no such file");
         guard.record_tool_result("bash", "error: not found");
         let v = guard.evaluate();
         assert_eq!(v.severity, VerdictSeverity::Critical);
-        assert!(v.force_stop, "nudges + 2 errors → Critical → force_stop");
+        assert!(
+            !v.force_stop,
+            "first Critical → restricted, not force_stop (progressive degradation)"
+        );
+
+        // Phase 5: second consecutive Critical → force_stop
+        let v2 = guard.evaluate();
+        assert!(v2.force_stop, "second consecutive Critical → force_stop");
     }
 
-    /// Critical + 6 nudges → force_stop=true even without stall (error-only path).
+    /// Critical + 6 nudges → progressive degradation: 1st restricted, 2nd force_stop.
     #[test]
     fn force_stop_from_errors_and_nudges() {
         let mut guard = TurnGuard::new();
@@ -851,9 +858,17 @@ mod chat_stream_turnguard_e2e {
             guard.record_tool_result("t2", "Error: fail");
         }
 
+        // First Critical → restricted (progressive degradation)
         let v = guard.evaluate();
         assert_eq!(v.severity, VerdictSeverity::Critical);
-        assert!(v.force_stop, "6 nudges + Critical from errors → force_stop");
+        assert!(
+            !v.force_stop,
+            "first Critical → restricted, not force_stop (progressive degradation)"
+        );
+
+        // Second consecutive Critical → force_stop
+        let v2 = guard.evaluate();
+        assert!(v2.force_stop, "second consecutive Critical → force_stop");
     }
 
     /// Budget depletion: Warning=-2, Critical=-5.

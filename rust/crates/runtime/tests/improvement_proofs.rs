@@ -2983,8 +2983,11 @@ mod error_recovery_proofs {
     fn transient_retry_policy_uses_exponential_backoff() {
         let d0 = should_retry(ErrorCategory::Transient, 0).unwrap();
         let d1 = should_retry(ErrorCategory::Transient, 1).unwrap();
-        assert_eq!(d0, 500); // 500ms
-        assert_eq!(d1, 1000); // 1000ms
+        // Exponential backoff with deterministic jitter:
+        // attempt 0: 500*1 + (0*7+3)%500 = 503
+        // attempt 1: 500*2 + (1*7+3)%500 = 1010
+        assert_eq!(d0, 503);
+        assert_eq!(d1, 1010);
         assert!(d1 > d0, "backoff should increase");
         assert!(
             should_retry(ErrorCategory::Transient, 2).is_none(),
@@ -7949,14 +7952,22 @@ mod turnguard_e2e_proofs {
             "Pure stalls without errors must NOT force_stop"
         );
 
-        // Now add actual errors to couple with nudges → Critical + force_stop
+        // Now add actual errors to couple with nudges → Critical
+        // Progressive degradation: first Critical → restricted, second → force_stop
         guard.record_tool_result("bash", "error: command not found");
         guard.record_tool_result("bash", "error: no such file or directory");
+        let v_first_critical = guard.evaluate();
+        assert_eq!(v_first_critical.severity, VerdictSeverity::Critical);
+        assert!(
+            !v_first_critical.force_stop,
+            "first Critical should restrict tools, not force_stop (progressive degradation)"
+        );
+
+        // Second consecutive Critical → force_stop
         let v_final = guard.evaluate();
-        assert_eq!(v_final.severity, VerdictSeverity::Critical);
         assert!(
             v_final.force_stop,
-            "nudges + errors → Critical + force_stop"
+            "second consecutive Critical → force_stop"
         );
     }
 
@@ -8472,13 +8483,20 @@ mod turnguard_e2e_proofs {
             "3 nudges + 1 error should NOT force_stop (need 2+ errors)"
         );
 
-        // Now at 3 nudges + 2 errors → Critical + force_stop
+        // Now at 3 nudges + 2 errors → first Critical → restricted (progressive degradation)
         guard
             .errors
             .record_error(mo_agent_runtime::turn::error_recovery::ErrorCategory::Unknown);
         let verdict = guard.evaluate();
         assert_eq!(verdict.severity, VerdictSeverity::Critical);
-        assert!(verdict.force_stop, "3 nudges + 2 errors SHOULD force_stop");
+        assert!(
+            !verdict.force_stop,
+            "first Critical should restrict tools, not force_stop (progressive degradation)"
+        );
+
+        // Second consecutive Critical → force_stop
+        let verdict2 = guard.evaluate();
+        assert!(verdict2.force_stop, "second consecutive Critical SHOULD force_stop");
     }
 
     // ── Scenario P: Healthy session produces minimal verdict ─────────────────

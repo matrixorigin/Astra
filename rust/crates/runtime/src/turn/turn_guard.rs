@@ -59,6 +59,9 @@ pub struct TurnGuard {
     pub errors: SessionErrorSummary,
     /// The last stall reflection sent (for nudge-ignore detection).
     last_reflection: Option<StallReflection>,
+    /// Consecutive turns at Critical escalation. Progressive degradation:
+    /// 1st Critical → restrict to read-only tools, 2nd → force stop.
+    critical_turns: usize,
 }
 
 /// Insert deprioritized tool names from [`TurnGuard`] into the selector restriction set (CLI parity).
@@ -79,6 +82,7 @@ impl TurnGuard {
             health: ToolHealthTracker::new(),
             errors: SessionErrorSummary::new(),
             last_reflection: None,
+            critical_turns: 0,
         }
     }
 
@@ -283,10 +287,35 @@ impl TurnGuard {
             };
         }
 
-        // Force stop when escalation is Critical. Previously required
-        // nudge_count >= 3 as well, but this missed error-path escalation
-        // (10+ errors, scattered across tools, no stall nudges).
-        let force_stop = escalation == EscalationLevel::Critical;
+        // Force stop uses progressive degradation instead of immediate termination.
+        // First Critical: inject strong warning + restrict to read-only, but continue.
+        // Second Critical: force stop — the agent had a chance and didn't recover.
+        let force_stop = if escalation == EscalationLevel::Critical {
+            self.critical_turns += 1;
+            if self.critical_turns >= 2 {
+                true // second consecutive Critical → force stop
+            } else {
+                // First Critical: restrict to read-only tools
+                let write_tools = [
+                    "bash", "write_file", "str_replace", "create_file", "edit_file",
+                    "exec", "run_command", "shell",
+                ];
+                for t in &write_tools {
+                    avoid_tools.insert(t.to_string());
+                }
+                injections.push(
+                    "🚨 SESSION CRITICAL: Restricting to read-only tools for this turn. \
+                     You MUST make progress or answer the user. \
+                     If the next turn also fails, the session will be terminated."
+                        .to_string(),
+                );
+                false
+            }
+        } else {
+            // Reset critical counter when escalation drops below Critical
+            self.critical_turns = 0;
+            false
+        };
 
         let is_diverging = matches!(divergence, DivergenceStatus::Diverging(_));
 
@@ -616,12 +645,28 @@ mod tests {
             "pure stalls without errors should not force_stop"
         );
 
-        // 3 nudges + 2 errors → Critical → force_stop
+        // 3 nudges + 2 errors → first Critical → restricted, NOT force_stop
         for _ in 0..2 {
             guard.record_tool_result("test_tool", "Error: something failed");
         }
         let v = guard.evaluate();
-        assert!(v.force_stop, "stalls + errors should force_stop");
+        assert!(
+            !v.force_stop,
+            "first Critical should restrict tools, not force_stop (progressive degradation)"
+        );
+        assert_eq!(v.severity, VerdictSeverity::Critical);
+        // Should restrict write tools
+        assert!(
+            v.avoid_tools.contains(&"bash".to_string()),
+            "first Critical should restrict bash"
+        );
+
+        // Second consecutive Critical → force_stop
+        let v2 = guard.evaluate();
+        assert!(
+            v2.force_stop,
+            "second consecutive Critical should force_stop"
+        );
     }
 
     #[test]
@@ -791,11 +836,19 @@ mod tests {
             guard.record_tool_calls(std::slice::from_ref(&call));
         }
         let verdict = guard.evaluate();
+        // First Critical → progressive degradation (restricted, not stopped)
         assert!(
-            verdict.force_stop,
-            "Critical from errors alone (no nudges) must trigger force_stop"
+            !verdict.force_stop,
+            "first Critical should NOT force_stop (progressive degradation)"
         );
         assert_eq!(verdict.severity, super::VerdictSeverity::Critical);
+
+        // Second evaluate → force_stop
+        let verdict2 = guard.evaluate();
+        assert!(
+            verdict2.force_stop,
+            "second consecutive Critical must force_stop"
+        );
     }
 
     // ── Divergence increments nudge_count (Fix) ──
