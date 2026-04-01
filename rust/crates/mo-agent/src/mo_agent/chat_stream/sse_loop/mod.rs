@@ -12,7 +12,6 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 use std::time::Instant;
 
-use crossterm::terminal;
 use mo_agent_core::RuntimeLimits;
 use mo_agent_runtime::{
     pipeline::step_protocol::InMemoryIdempotencyCache,
@@ -28,7 +27,7 @@ use mo_agent_runtime::{
     turn::turn_guard::TurnGuard,
 };
 
-use crate::{StreamResult, edge_tools};
+use crate::{StreamResult, cli_utils::terminal_width_usize, edge_tools};
 
 use super::ChatTurnParams;
 use agentic_sse_loop::{
@@ -38,7 +37,7 @@ use cli_loop_host::CliAgenticLoopHost;
 
 pub(crate) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResult, String> {
     let start = Instant::now();
-    let term_width = terminal::size().map(|(w, _)| w as usize).unwrap_or(80);
+    let term_width = terminal_width_usize();
     let project_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let file_context = detect_project_languages(&project_root);
     let executor =

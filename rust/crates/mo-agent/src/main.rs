@@ -78,7 +78,7 @@ use auth_flow::{clear_profile_last_session, do_login, do_register};
 use chat_stream::{ChatTurnParams, stream_chat_sse};
 use cli_utils::{
     Profile, compact_or_raw, get_profile_and_token, interactive_select, load_credentials,
-    map_thin_err, print_json_or_raw, print_markdown, profile_name, prompt_or,
+    map_thin_err, print_json_or_raw, profile_name, prompt_or,
     prompt_password_masked, resumable_last_session_id, save_credentials, truncate_str, urlencoding,
 };
 use command_router::{ExitCode, execute_cli_command};

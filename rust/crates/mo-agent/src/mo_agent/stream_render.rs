@@ -46,12 +46,14 @@ struct CliSseStreamHost<'a> {
     quiet: bool,
     perm_manager: Option<&'a mut crate::permission_manager::PermissionManager>,
     render: StreamRenderState,
+    /// When true (markdown final render), skip live `print!` of `text_delta` to avoid a clear+redraw flash.
+    suppress_stdout_stream: bool,
     /// Ordered tool executions from this SSE stream.
     pub edge_tool_round: Vec<EdgeToolExecResult>,
 }
 
 impl<'a> CliSseStreamHost<'a> {
-    fn from_edge_ctx(ctx: EdgeSseContext<'a>, term_width: usize) -> Self {
+    fn from_edge_ctx(ctx: EdgeSseContext<'a>, term_width: usize, suppress_stdout_stream: bool) -> Self {
         Self {
             api: ctx.api,
             token: ctx.token,
@@ -60,6 +62,7 @@ impl<'a> CliSseStreamHost<'a> {
             quiet: ctx.quiet,
             perm_manager: ctx.perm_manager,
             render: StreamRenderState::with_term_width(term_width),
+            suppress_stdout_stream,
             edge_tool_round: Vec::new(),
         }
     }
@@ -74,9 +77,11 @@ impl SseStreamHost for CliSseStreamHost<'_> {
         for effect in effects {
             match effect {
                 SseRenderEffect::StreamText(s) => {
-                    print!("{s}");
-                    let _ = io::stdout().flush();
-                    self.render.track_output(&s);
+                    if !self.suppress_stdout_stream {
+                        print!("{s}");
+                        let _ = io::stdout().flush();
+                        self.render.track_output(&s);
+                    }
                 }
                 SseRenderEffect::StopThinkingSpinner => self.render.stop_thinking(),
                 SseRenderEffect::StartThinkingSpinner => self.render.start_thinking(),
@@ -228,8 +233,12 @@ impl Spinner {
         if let Some(h) = self.handle.take() {
             let _ = h.join();
         }
-        // Clear the spinner line
-        eprint!("\r{}\r", " ".repeat(80));
+        // Clear the spinner line (match real terminal width — hard-coded 80 left ghost chars on wide terms)
+        let w = crossterm::terminal::size()
+            .map(|(c, _)| c as usize)
+            .unwrap_or(80)
+            .clamp(20, 512);
+        eprint!("\r{}\r", " ".repeat(w));
         let _ = io::stderr().flush();
     }
 }
@@ -392,8 +401,11 @@ pub(super) async fn consume_turn_sse(
 
     // Delegate to runtime's generic SSE consumer with the appropriate host
     let idle = std::time::Duration::from_millis(STREAM_IDLE_TIMEOUT_MS);
+    // Markdown final pass uses termimad; streaming the same text to stdout first causes a visible
+    // clear+redraw (and line-count drift vs unicode wrap). Suppress live text_delta when render_md.
+    let suppress_stdout_stream = render_md && !quiet;
     let (sse_result, edge_tool_round, lines_written) = if let Some(ctx) = edge {
-        let mut host = CliSseStreamHost::from_edge_ctx(ctx, term_width);
+        let mut host = CliSseStreamHost::from_edge_ctx(ctx, term_width, suppress_stdout_stream);
         host.render.lines_written = pre_clear_lines;
         let (result, _abort) = consume_sse_stream(&mut byte_stream, &mut host, idle).await;
         let lw = host.render.lines_written;
@@ -439,7 +451,7 @@ pub(super) async fn consume_turn_sse(
 
     if should_rerender_text(result.has_tool_calls) && !result.full_text.is_empty() {
         if render_md {
-            print_markdown(&result.full_text);
+            crate::cli_utils::print_markdown_width(&result.full_text, Some(term_width));
         } else {
             println!("{}", result.full_text.trim_end());
         }

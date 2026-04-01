@@ -12,6 +12,35 @@ use mo_agent_runtime::turn::explain_report_lines::{
 
 use crate::VerdictEvent;
 
+/// Verbose explain `content_preview` can echo tool-shaped dumps (e.g. read_file line grids). Omit those.
+fn scrub_explain_content_preview(raw: &str, max_chars: usize) -> Option<String> {
+    let t = raw.trim();
+    if t.is_empty() {
+        return None;
+    }
+    let digit_prefix_lines = t
+        .lines()
+        .filter(|l| {
+            let s = l.trim_start();
+            s.chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_digit())
+        })
+        .count();
+    if digit_prefix_lines >= 4 {
+        return None;
+    }
+    let lower = t.to_ascii_lowercase();
+    if lower.contains("\"read_file\"") && t.contains('{') {
+        return None;
+    }
+    let mut out: String = t.chars().take(max_chars).collect();
+    if t.chars().count() > max_chars {
+        out.push('…');
+    }
+    Some(out)
+}
+
 pub(super) fn print_explain_report(turns: &[serde_json::Value], verbose: bool) {
     eprintln!("\n{}", EXPLAIN_REPORT_HEADER.dim());
     let mut total_ms = 0i64;
@@ -258,8 +287,12 @@ pub(super) fn print_explain_report(turns: &[serde_json::Value], verbose: bool) {
             }
         }
         if verbose {
-            if let Some(preview) = turn.get("content_preview").and_then(|v| v.as_str()) {
-                eprintln!("{}", explain_content_preview_line(preview).dim());
+            if let Some(preview) = turn
+                .get("content_preview")
+                .and_then(|v| v.as_str())
+                .and_then(|p| scrub_explain_content_preview(p, 220))
+            {
+                eprintln!("{}", explain_content_preview_line(preview.as_str()).dim());
             }
             if let Some(phase_timing) = turn.get("phase_timing").and_then(|v| v.as_array()) {
                 for entry in phase_timing {
@@ -347,4 +380,28 @@ pub(super) fn print_verdict_report(verdict_events: &[VerdictEvent], verbose: boo
         }
     }
     eprintln!("{}", REPORT_SEPARATOR_LINE.dim());
+}
+
+#[cfg(test)]
+mod explain_preview_tests {
+    use super::scrub_explain_content_preview;
+
+    #[test]
+    fn scrub_drops_numbered_line_grids() {
+        let raw = "    1|a\n    2|b\n    3|c\n    4|d\n";
+        assert!(scrub_explain_content_preview(raw, 80).is_none());
+    }
+
+    #[test]
+    fn scrub_drops_read_file_json_snippet() {
+        let raw = r#"{"tool":"read_file","path":"x"}"#;
+        assert!(scrub_explain_content_preview(raw, 80).is_none());
+    }
+
+    #[test]
+    fn scrub_keeps_short_prose() {
+        let raw = "Here is a concise summary of the change.";
+        let s = scrub_explain_content_preview(raw, 80).expect("some");
+        assert!(s.contains("concise"));
+    }
 }

@@ -792,7 +792,9 @@ pub(super) fn print_slash_commands(query: Option<&str>) {
         }
     };
 
-    let width = 68;
+    let width = crate::cli_utils::terminal_width_usize()
+        .saturating_sub(8)
+        .clamp(48, 132);
     let bar = "─".repeat(width);
 
     // Header
@@ -880,7 +882,9 @@ pub(super) fn print_slash_commands(query: Option<&str>) {
 }
 
 pub(super) fn print_keyboard_shortcuts() {
-    let width = 68;
+    let width = crate::cli_utils::terminal_width_usize()
+        .saturating_sub(8)
+        .clamp(48, 132);
     let bar = "─".repeat(width);
 
     eprintln!();
