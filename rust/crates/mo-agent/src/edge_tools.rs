@@ -1104,6 +1104,10 @@ pub struct ToolExecutor {
     /// more aggressively. Inspired by Claude Code's
     /// `MAX_TOOL_RESULTS_PER_MESSAGE_CHARS` (200K).
     aggregate_output_bytes: std::sync::atomic::AtomicUsize,
+    /// URL fetch cache: LRU-style cache mapping URL → (response, timestamp).
+    /// Returns cached response for repeated fetches within TTL (15 minutes).
+    /// Prevents wasting tokens re-fetching the same documentation pages.
+    url_cache: std::sync::Mutex<HashMap<String, (String, std::time::Instant)>>,
 }
 
 /// Extract owner/repo from git remote URLs in the given directory.
@@ -1177,6 +1181,7 @@ impl ToolExecutor {
             memoria_fail_count: std::sync::atomic::AtomicU32::new(0),
             file_state: std::sync::Mutex::new(HashMap::new()),
             aggregate_output_bytes: std::sync::atomic::AtomicUsize::new(0),
+            url_cache: std::sync::Mutex::new(HashMap::new()),
         }
     }
 

@@ -615,7 +615,10 @@ impl MemoriaForwarder for ReqwestMemoriaForwarder {
         body: serde_json::Value,
     ) -> Result<serde_json::Value, String> {
         let url = format!("{}{}", self.base_url, endpoint);
-        let client = reqwest::Client::new();
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .map_err(|e| format!("Memoria client build error: {e}"))?;
         let resp = client
             .post(&url)
             .header("Authorization", format!("Bearer {}", self.master_key))

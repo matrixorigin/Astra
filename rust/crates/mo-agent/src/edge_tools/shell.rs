@@ -956,11 +956,28 @@ impl ToolExecutor {
             .unwrap_or_else(|| self.scaled_output_limit().min(10_000));
         let timeout_secs = args.get("timeout").and_then(Value::as_u64).unwrap_or(10);
 
+        // URL cache: return cached response if fetched within TTL (15 minutes).
+        // Prevents token waste when the LLM re-fetches the same documentation page.
+        const URL_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+        const URL_CACHE_MAX_ENTRIES: usize = 50;
+        if let Ok(cache) = self.url_cache.lock()
+            && let Some((cached_response, cached_at)) = cache.get(url)
+            && cached_at.elapsed() < URL_CACHE_TTL
+        {
+            return format!(
+                "[Cached response from {}s ago — content unchanged]\n{}",
+                cached_at.elapsed().as_secs(),
+                cached_response
+            );
+        }
+
         // Use -w to capture HTTP status code and content type for structured reporting
         let mut cmd = Command::new("curl");
         cmd.args([
             "-sS",
             "-L",
+            "--max-redirs",
+            "5",
             "--max-time",
             &timeout_secs.to_string(),
             "--max-filesize",
@@ -998,7 +1015,7 @@ impl ToolExecutor {
                     (raw.as_ref(), None)
                 };
 
-                let (http_code, _content_type, final_url) = if let Some(meta) = meta_line {
+                let (http_code, content_type, final_url) = if let Some(meta) = meta_line {
                     let parts: Vec<&str> = meta.splitn(4, ' ').collect();
                     (
                         parts.first().copied().unwrap_or("?"),
@@ -1008,6 +1025,23 @@ impl ToolExecutor {
                 } else {
                     ("?", "?", "")
                 };
+
+                // Reject binary content types (images, audio, video, etc.)
+                let ct_lower = content_type.to_lowercase();
+                if ct_lower.starts_with("image/")
+                    || ct_lower.starts_with("audio/")
+                    || ct_lower.starts_with("video/")
+                    || ct_lower.starts_with("application/octet-stream")
+                    || ct_lower.starts_with("application/zip")
+                    || ct_lower.starts_with("application/gzip")
+                    || ct_lower.starts_with("application/pdf")
+                {
+                    return format!(
+                        "Error: URL returned binary content ({content_type}). \
+                         web_fetch only supports text content. \
+                         Use bash+curl with specific flags if you need to download binary files."
+                    );
+                }
 
                 // Detect cross-host redirect
                 let redirected = if !final_url.is_empty() && final_url != url {
@@ -1023,16 +1057,24 @@ impl ToolExecutor {
                     None
                 };
 
-                // HTTP error codes
+                // HTTP error codes with actionable hints
                 if let Ok(code) = http_code.parse::<u16>()
                     && code >= 400
                 {
                     let reason = match code {
-                        401 | 403 => {
-                            " (authentication required — look for an MCP tool with authenticated access)"
+                        401 => {
+                            " (authentication required — look for an MCP tool with authenticated access or set auth headers via bash+curl)"
                         }
-                        404 => " (page not found)",
-                        429 => " (rate limited — try again later)",
+                        403 => {
+                            " (forbidden — access permanently denied. Try a different URL or approach; do NOT retry)"
+                        }
+                        404 => " (page not found — verify the URL is correct)",
+                        429 => {
+                            " (rate limited — wait at least 30 seconds before retrying this URL)"
+                        }
+                        500 | 502 | 503 | 504 => {
+                            " (server error — this is transient, you may retry once after a brief wait)"
+                        }
                         _ => "",
                     };
                     return format!("Error: HTTP {code}{reason}\nURL: {url}");
@@ -1057,6 +1099,24 @@ impl ToolExecutor {
                 }
                 if !footer.is_empty() {
                     result.push_str(&footer);
+                }
+
+                // Store successful response in cache
+                if let Ok(mut cache) = self.url_cache.lock() {
+                    // Evict expired entries when cache is full
+                    if cache.len() >= URL_CACHE_MAX_ENTRIES {
+                        cache.retain(|_, (_, ts)| ts.elapsed() < URL_CACHE_TTL);
+                    }
+                    // If still full after eviction, remove oldest
+                    if cache.len() >= URL_CACHE_MAX_ENTRIES
+                        && let Some(oldest) = cache
+                            .iter()
+                            .min_by_key(|(_, (_, t))| *t)
+                            .map(|(k, _)| k.clone())
+                    {
+                        cache.remove(&oldest);
+                    }
+                    cache.insert(url.to_string(), (result.clone(), std::time::Instant::now()));
                 }
 
                 result

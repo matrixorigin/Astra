@@ -442,7 +442,25 @@ pub(super) async fn handle_info_command(
                         ));
                     }
                     Err(_) => {
-                        rows.push((false, "memoria", format!("unreachable ({memoria_base})")));
+                        // When https fails, probe http to give an actionable hint
+                        let hint = if memoria_base.starts_with("https://") {
+                            let http_url = memoria_base.replacen("https://", "http://", 1);
+                            let http_health = format!("{}/health", http_url.trim_end_matches('/'));
+                            if api
+                                .get_url(&http_health)
+                                .await
+                                .is_ok_and(|r| r.status().is_success())
+                            {
+                                format!(
+                                    "reachable over http, not https — set MEMORIA_BASE_URL={http_url}"
+                                )
+                            } else {
+                                format!("unreachable ({memoria_base})")
+                            }
+                        } else {
+                            format!("unreachable ({memoria_base})")
+                        };
+                        rows.push((false, "memoria", hint));
                     }
                 }
             } else {

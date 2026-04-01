@@ -116,7 +116,10 @@ impl HttpMemoriaClient {
         Self {
             base_url,
             api_key,
-            http: reqwest::Client::new(),
+            http: reqwest::Client::builder()
+                .no_proxy()
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new()),
         }
     }
 
