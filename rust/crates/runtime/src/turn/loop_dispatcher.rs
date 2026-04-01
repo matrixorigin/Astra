@@ -195,6 +195,7 @@ mod tests {
     use serde_json::json;
     use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
+    use tokio_util::sync::CancellationToken;
 
     // ── Test host ────────────────────────────────────────────────────────────
 
@@ -292,6 +293,7 @@ mod tests {
             api: mo_thin_client::ThinClient::new("http://localhost:1", None).unwrap(),
             api_token: "test".to_string(),
             cancel_flag: None,
+            cancel_token: None,
             delegation_engine: None,
         }
     }
@@ -320,6 +322,18 @@ mod tests {
         let mut state = test_state("cancel me");
         let flag = Arc::new(AtomicBool::new(true));
         state.cancel_flag = Some(flag);
+        let outcome = dispatcher.dispatch(&mut host, &mut state).await;
+        assert!(matches!(outcome, DispatchOutcome::Cancelled));
+    }
+
+    #[tokio::test]
+    async fn dispatch_cancelled_via_token() {
+        let dispatcher = LoopDispatcher::new();
+        let mut host = TestHost::completed_after_one_turn("never reached");
+        let mut state = test_state("cancel via token");
+        let token = Arc::new(CancellationToken::new());
+        token.cancel();
+        state.cancel_token = Some(token);
         let outcome = dispatcher.dispatch(&mut host, &mut state).await;
         assert!(matches!(outcome, DispatchOutcome::Cancelled));
     }

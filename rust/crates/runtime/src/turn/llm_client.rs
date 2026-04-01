@@ -130,9 +130,10 @@ fn turn_timeout_s() -> f64 {
 pub(crate) enum LlmCancel<'a> {
     None,
     /// Cooperative cancel when the caller already owns a [`CancellationToken`].
-    #[allow(dead_code)] // Agentic loop wires [`Flag`]; bridge/WS can use this without duplicating state.
     Token(&'a CancellationToken),
     Flag(&'a AtomicBool),
+    /// User cancel (`AtomicBool`) plus a [`CancellationToken`] for immediate wake during LLM I/O.
+    FlagAndToken(&'a AtomicBool, &'a CancellationToken),
 }
 
 impl LlmCancel<'_> {
@@ -141,6 +142,9 @@ impl LlmCancel<'_> {
             LlmCancel::None => false,
             LlmCancel::Token(t) => t.is_cancelled(),
             LlmCancel::Flag(f) => f.load(Ordering::Relaxed),
+            LlmCancel::FlagAndToken(f, t) => {
+                f.load(Ordering::Relaxed) || t.is_cancelled()
+            }
         }
     }
 }
@@ -154,6 +158,18 @@ pub(crate) async fn wait_llm_cancel(cancel: LlmCancel<'_>) {
             const POLL: std::time::Duration = std::time::Duration::from_millis(50);
             while !f.load(Ordering::Relaxed) {
                 tokio::time::sleep(POLL).await;
+            }
+        }
+        LlmCancel::FlagAndToken(f, t) => {
+            const POLL: std::time::Duration = std::time::Duration::from_millis(50);
+            tokio::select! {
+                biased;
+                _ = t.cancelled() => {}
+                _ = async {
+                    while !f.load(Ordering::Relaxed) {
+                        tokio::time::sleep(POLL).await;
+                    }
+                } => {}
             }
         }
     }
@@ -815,6 +831,35 @@ mod tests {
             matches!(res, Err(StreamCollectError::Cancelled)),
             "expected cancel, got: {res:?}"
         );
+        unsafe { std::env::remove_var("MO_STREAM_IDLE_TIMEOUT_MS") };
+    }
+
+    #[tokio::test]
+    async fn collect_llm_stream_flag_and_token_cancels_on_token() {
+        unsafe { std::env::set_var("MO_STREAM_IDLE_TIMEOUT_MS", "60000") };
+        let flag = Arc::new(AtomicBool::new(false));
+        let flag_for_join = flag.clone();
+        let token = CancellationToken::new();
+        let token_signal = token.clone();
+        let pending_stream = stream::pending::<Result<Bytes, reqwest::Error>>();
+        let started = Instant::now();
+        let handle = tokio::spawn(async move {
+            collect_llm_stream(
+                pending_stream,
+                "test-model",
+                started,
+                LlmCancel::FlagAndToken(flag.as_ref(), &token_signal),
+            )
+            .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        token.cancel();
+        let res = handle.await.expect("join");
+        assert!(
+            matches!(res, Err(StreamCollectError::Cancelled)),
+            "expected cancel, got: {res:?}"
+        );
+        assert!(!flag_for_join.load(Ordering::SeqCst));
         unsafe { std::env::remove_var("MO_STREAM_IDLE_TIMEOUT_MS") };
     }
 }

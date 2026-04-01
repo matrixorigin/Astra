@@ -130,6 +130,7 @@ pub(crate) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
         api: p.api.clone(),
         api_token: p.token.to_string(),
         cancel_flag: None,
+        cancel_token: None,
         delegation_engine: None,
     };
 

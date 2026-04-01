@@ -17,6 +17,7 @@ use axum::Json;
 use axum::http::StatusCode;
 use serde_json::{Map, Value, json};
 use tokio::sync::{Mutex as TokioMutex, RwLock};
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use mo_agent_core::{ErrorResponse, SharedPool, error_response};
@@ -68,6 +69,8 @@ struct RunState {
     status: RunStatus,
     events: Vec<Value>,
     cancel_flag: Arc<AtomicBool>,
+    /// Cancelled together with `cancel_flag` on `cancel_run` for low-latency LLM abort.
+    llm_cancel_token: Arc<CancellationToken>,
     #[allow(dead_code)]
     started_at: Instant,
     waiting_for: Option<String>,
@@ -222,6 +225,7 @@ impl AgenticRunLifecycleService {
             api: mo_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap(),
             api_token: String::new(),
             cancel_flag: None,
+            cancel_token: None,
             delegation_engine: None,
         }
     }
@@ -293,6 +297,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             .unwrap_or_else(|| Uuid::new_v4().to_string());
 
         let cancel_flag = Arc::new(AtomicBool::new(false));
+        let llm_cancel_token = Arc::new(CancellationToken::new());
         let run_state = RunState {
             run_id: run_id.clone(),
             session_id: session_id.clone(),
@@ -300,6 +305,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             status: RunStatus::Running,
             events: vec![json!({"event_type": "run_started", "data": {}})],
             cancel_flag: cancel_flag.clone(),
+            llm_cancel_token: llm_cancel_token.clone(),
             started_at: Instant::now(),
             waiting_for: None,
         };
@@ -316,6 +322,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         let mut host = self.build_host(&user_id, &session_id, &request, edge_tools, edge_profile);
         let mut loop_state = self.build_initial_state(&request, &session_id, &run_id);
         loop_state.cancel_flag = Some(cancel_flag);
+        loop_state.cancel_token = Some(llm_cancel_token);
         loop_state.delegation_engine = self.delegation_engine.clone();
 
         // Clone handles we need inside the spawned task.
@@ -377,6 +384,10 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                         .cancel_flag
                         .as_ref()
                         .is_some_and(|f| f.load(Ordering::Relaxed))
+                        || loop_state
+                            .cancel_token
+                            .as_ref()
+                            .is_some_and(|t| t.is_cancelled())
                         || err.contains("LLM call cancelled");
                     if user_cancelled {
                         events.push(json!({
@@ -549,6 +560,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         }
         if run.status == RunStatus::Running {
             run.cancel_flag.store(true, Ordering::SeqCst);
+            run.llm_cancel_token.cancel();
             run.status = RunStatus::Cancelled;
             run.events.push(json!({
                 "event_type": "run_finished",
@@ -823,6 +835,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
             api: mo_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap(),
             api_token: String::new(),
             cancel_flag: config.pause_flag.clone(),
+            cancel_token: None,
             delegation_engine: None,
         };
 
@@ -1177,6 +1190,7 @@ mod tests {
         assert_eq!(state.max_turns, 5);
         assert_eq!(state.remaining_turns, 5);
         assert_eq!(state.message, "write a test");
+        assert!(state.cancel_token.is_none());
     }
 
     #[test]

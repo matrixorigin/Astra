@@ -80,6 +80,7 @@ use crate::turn::sse_stream_host::EdgeToolExecResult;
 use crate::turn::stall::CLI_AGENTIC_TURN_BUDGET_STALL_ABORT_MSG;
 use crate::turn::tool_result_semantics::tool_dedup_signature;
 use crate::turn::turn_guard::TurnGuard;
+use tokio_util::sync::CancellationToken;
 
 // ─── Host turn result ────────────────────────────────────────────────────────
 
@@ -210,6 +211,8 @@ pub struct AgenticLoopState {
     // ── Cancellation ──
     /// Shared flag checked between turns. Set externally (e.g. by cancel_run).
     pub cancel_flag: Option<Arc<AtomicBool>>,
+    /// Optional token cancelled with user cancel for immediate LLM/stream wake.
+    pub cancel_token: Option<Arc<CancellationToken>>,
 
     // ── Delegation ──
     /// Optional delegation engine for multi-agent coordination.
@@ -227,7 +230,7 @@ pub enum AgenticLoopOutcome {
     Completed,
     /// Loop aborted due to a fatal error.
     Error(String),
-    /// Loop was cancelled externally via cancel_flag.
+    /// Loop was cancelled externally via `cancel_flag` or `cancel_token`.
     Cancelled,
     /// Loop is waiting for external input (tool approval, user resume, webhook).
     /// The caller should provide the requested input and re-invoke the loop.
@@ -503,6 +506,10 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
             .cancel_flag
             .as_ref()
             .is_some_and(|f| f.load(Ordering::Relaxed))
+            || state
+                .cancel_token
+                .as_ref()
+                .is_some_and(|t| t.is_cancelled())
         {
             return Ok(AgenticLoopOutcome::Cancelled);
         }
@@ -876,6 +883,7 @@ mod tests {
             api: mo_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap(),
             api_token: String::new(),
             cancel_flag: None,
+            cancel_token: None,
             delegation_engine: None,
         }
     }

@@ -40,6 +40,15 @@ fn rate_limit_cooldown() -> &'static RateLimitCooldown {
     COOLDOWN.get_or_init(RateLimitCooldown::new)
 }
 
+fn llm_cancel_for_state(state: &AgenticLoopState) -> LlmCancel<'_> {
+    match (&state.cancel_flag, &state.cancel_token) {
+        (Some(f), Some(t)) => LlmCancel::FlagAndToken(f.as_ref(), t.as_ref()),
+        (Some(f), None) => LlmCancel::Flag(f.as_ref()),
+        (None, Some(t)) => LlmCancel::Token(t.as_ref()),
+        (None, None) => LlmCancel::None,
+    }
+}
+
 /// Server-side host for the runtime agentic loop.
 ///
 /// Each turn:
@@ -476,10 +485,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         let tier = budget.compaction_tier(cache_est.total_tokens);
         let pruned_tools = prune_tool_schemas(&self.edge_tools, tier);
 
-        let llm_cancel = match &state.cancel_flag {
-            Some(f) => LlmCancel::Flag(f.as_ref()),
-            None => LlmCancel::None,
-        };
+        let llm_cancel = llm_cancel_for_state(state);
         let result = call_llm_and_collect(
             &llm_messages,
             &pruned_tools,
@@ -956,6 +962,7 @@ mod tests {
             api: mo_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap(),
             api_token: "test-token".to_string(),
             cancel_flag: None,
+            cancel_token: None,
             delegation_engine: None,
         }
     }
