@@ -1128,6 +1128,52 @@ mod tests {
             .unwrap()
     }
 
+    async fn mock_529_retry_zero_then_sse(State(Hit(c)): State<Hit>) -> Response {
+        let n = c.fetch_add(1, Ordering::SeqCst);
+        if n == 0 {
+            Response::builder()
+                .status(529)
+                .header("retry-after", "0")
+                .body(Body::from("overload"))
+                .unwrap()
+        } else {
+            let payload = json!({"choices":[{"delta":{"content":"after-529"}}]});
+            let body = format!("data: {}\n\n", payload);
+            Response::builder()
+                .status(200)
+                .header("content-type", "text/event-stream")
+                .body(Body::from(body))
+                .unwrap()
+        }
+    }
+
+    async fn mock_503_retry_zero_then_sse(State(Hit(c)): State<Hit>) -> Response {
+        let n = c.fetch_add(1, Ordering::SeqCst);
+        if n == 0 {
+            Response::builder()
+                .status(503)
+                .header("retry-after", "0")
+                .body(Body::from("unavailable"))
+                .unwrap()
+        } else {
+            let payload = json!({"choices":[{"delta":{"content":"after-503"}}]});
+            let body = format!("data: {}\n\n", payload);
+            Response::builder()
+                .status(200)
+                .header("content-type", "text/event-stream")
+                .body(Body::from(body))
+                .unwrap()
+        }
+    }
+
+    async fn mock_500_once(State(Hit(c)): State<Hit>) -> Response {
+        c.fetch_add(1, Ordering::SeqCst);
+        Response::builder()
+            .status(500)
+            .body(Body::from("server error"))
+            .unwrap()
+    }
+
     #[tokio::test]
     async fn collect_llm_stream_decodes_lossy_utf8_inside_json_string() {
         unsafe { std::env::set_var("MO_STREAM_IDLE_TIMEOUT_MS", "60000") };
@@ -1199,6 +1245,95 @@ mod tests {
             .await
         });
         tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+        token.cancel();
+        let err = handle.await.expect("join").expect_err("cancelled");
+        assert_eq!(err, "LLM call cancelled");
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn call_llm_and_collect_retries_after_529_retry_after_zero() {
+        unsafe { std::env::set_var("MO_STREAM_IDLE_TIMEOUT_MS", "60000") };
+        reset_rate_limit_cooldown_for_tests();
+        let hits = Arc::new(AtomicU32::new(0));
+        let app = Router::new()
+            .route("/chat/completions", post(mock_529_retry_zero_then_sse))
+            .with_state(Hit(hits.clone()));
+        let base = spawn_local_http_server(app).await;
+        let messages = vec![json!({"role":"user","content":"x"})];
+        let res = call_llm_and_collect(
+            &messages,
+            &[],
+            "m",
+            "k",
+            &base,
+            "openai",
+            None,
+            false,
+            LlmCancel::None,
+        )
+        .await
+        .expect("llm ok");
+        assert_eq!(res.full_text, "after-529");
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+        unsafe { std::env::remove_var("MO_STREAM_IDLE_TIMEOUT_MS") };
+    }
+
+    #[tokio::test]
+    async fn call_llm_and_collect_retries_after_503_retry_after_zero() {
+        unsafe { std::env::set_var("MO_STREAM_IDLE_TIMEOUT_MS", "60000") };
+        reset_rate_limit_cooldown_for_tests();
+        let hits = Arc::new(AtomicU32::new(0));
+        let app = Router::new()
+            .route("/chat/completions", post(mock_503_retry_zero_then_sse))
+            .with_state(Hit(hits.clone()));
+        let base = spawn_local_http_server(app).await;
+        let messages = vec![json!({"role":"user","content":"x"})];
+        let res = call_llm_and_collect(
+            &messages,
+            &[],
+            "m",
+            "k",
+            &base,
+            "openai",
+            None,
+            false,
+            LlmCancel::None,
+        )
+        .await
+        .expect("llm ok");
+        assert_eq!(res.full_text, "after-503");
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+        unsafe { std::env::remove_var("MO_STREAM_IDLE_TIMEOUT_MS") };
+    }
+
+    #[tokio::test]
+    async fn call_llm_and_collect_cancel_during_exponential_backoff_after_500() {
+        reset_rate_limit_cooldown_for_tests();
+        let hits = Arc::new(AtomicU32::new(0));
+        let app = Router::new()
+            .route("/chat/completions", post(mock_500_once))
+            .with_state(Hit(hits.clone()));
+        let base = spawn_local_http_server(app).await;
+        let token = CancellationToken::new();
+        let token_for_call = token.clone();
+        let messages = vec![json!({"role":"user","content":"x"})];
+        let base_clone = base.clone();
+        let handle = tokio::spawn(async move {
+            call_llm_and_collect(
+                &messages,
+                &[],
+                "m",
+                "k",
+                &base_clone,
+                "openai",
+                None,
+                false,
+                LlmCancel::Token(&token_for_call),
+            )
+            .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         token.cancel();
         let err = handle.await.expect("join").expect_err("cancelled");
         assert_eq!(err, "LLM call cancelled");
