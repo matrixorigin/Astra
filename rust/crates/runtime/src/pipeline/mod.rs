@@ -29,6 +29,7 @@ pub mod step_checkpoint;
 pub mod step_protocol;
 pub mod step_recorder;
 pub mod step_restore;
+pub mod task_learning;
 
 pub use engine::*;
 pub use event::*;
