@@ -1525,53 +1525,66 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
                     &loop_reasoning,
                     !reasoning.is_empty() || history_has_reasoning(&llm_messages),
                 ));
+                // ── Tool delivery: approval tools sequential, read-only concurrent ──
+                let mut read_only_tcs: Vec<Value> = Vec::new();
                 for tc in loop_tool_calls.iter() {
-                    let Some(tc_map) = tc.as_object() else {
+                    let Some(tc_map) = tc.as_object() else { continue };
+                    if !cloud_tool_requires_approval_for_delivery(tc) {
+                        read_only_tcs.push(tc.clone());
                         continue;
-                    };
+                    }
+                    // Sequential: approval → wait → request → wait
                     let id = tc_map.get("id").and_then(Value::as_str).unwrap_or("");
                     let tool_name = tc_map
                         .get("function")
                         .and_then(|f| f.get("name"))
                         .and_then(Value::as_str)
                         .unwrap_or("");
-
-                    if cloud_tool_requires_approval_for_delivery(tc) {
-                        let path = tool_path_hint_for_delivery(tc);
-                        yield render_sse_map(&build_approval_required_event(
-                            id,
-                            tool_name,
-                            path.as_deref(),
-                        ));
-                        match wait_approval_ledger_for_tool(
-                            &edge_callback_ledger,
-                            &user_id,
-                            tc,
-                            ledger_wait,
-                        )
-                        .await
-                        {
-                            Ok(()) => {}
-                            Err(part) => {
-                                merged_tool_results.extend(part.persist_tool_results);
-                                llm_messages.extend(part.tool_messages);
-                                continue;
-                            }
+                    let path = tool_path_hint_for_delivery(tc);
+                    yield render_sse_map(&build_approval_required_event(
+                        id, tool_name, path.as_deref(),
+                    ));
+                    match wait_approval_ledger_for_tool(
+                        &edge_callback_ledger, &user_id, tc, ledger_wait,
+                    ).await {
+                        Ok(()) => {}
+                        Err(part) => {
+                            merged_tool_results.extend(part.persist_tool_results);
+                            llm_messages.extend(part.tool_messages);
+                            continue;
                         }
                     }
-
                     for m in sse_maps_through_tool_request(tc) {
                         yield render_sse_map(&m);
                     }
                     let tail = wait_tool_result_ledger_for_tool(
-                        &edge_callback_ledger,
-                        &user_id,
-                        tc,
-                        ledger_wait,
-                    )
-                    .await;
+                        &edge_callback_ledger, &user_id, tc, ledger_wait,
+                    ).await;
                     merged_tool_results.extend(tail.persist_tool_results);
                     llm_messages.extend(tail.tool_messages);
+                }
+                // Read-only: yield all tool_request SSEs first so edge can
+                // start executing in parallel, then join_all on ledger waits.
+                if !read_only_tcs.is_empty() {
+                    for tc in &read_only_tcs {
+                        for m in sse_maps_through_tool_request(tc) {
+                            yield render_sse_map(&m);
+                        }
+                    }
+                    let futs: Vec<_> = read_only_tcs.iter().map(|tc| {
+                        let ledger = edge_callback_ledger.clone();
+                        let uid = user_id.clone();
+                        let tc = tc.clone();
+                        async move {
+                            wait_tool_result_ledger_for_tool(
+                                &ledger, &uid, &tc, ledger_wait,
+                            ).await
+                        }
+                    }).collect();
+                    for tail in futures_util::future::join_all(futs).await {
+                        merged_tool_results.extend(tail.persist_tool_results);
+                        llm_messages.extend(tail.tool_messages);
+                    }
                 }
             }
 

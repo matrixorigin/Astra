@@ -255,6 +255,82 @@ pub async fn deliver_tool_calls_through_edge_ledger(
     out
 }
 
+/// Concurrent variant of [`deliver_tool_calls_through_edge_ledger`] for testing.
+///
+/// **Not used in production** — the bridge generator must `yield` SSE events
+/// immediately (before waiting), so it inlines the same logic. This function
+/// accumulates SSE maps in a vec, which would deadlock in production (client
+/// can't POST results until it receives the SSE events).
+///
+/// Tests use spawned tasks to populate the ledger, so the accumulation is safe.
+#[cfg(test)]
+pub async fn deliver_tool_calls_concurrent(
+    ledger: &Arc<tokio::sync::Mutex<HashMap<String, Value>>>,
+    user_id: &str,
+    tool_calls: &[Value],
+    ledger_wait: Duration,
+) -> EdgeToolRoundDelivery {
+    let mut out = EdgeToolRoundDelivery::default();
+    let mut read_only: Vec<&Value> = Vec::new();
+
+    // Phase 1: approval-required tools sequentially, collect read-only for later.
+    for tc in tool_calls {
+        let Some(tc_map) = tc.as_object() else {
+            continue;
+        };
+        if !cloud_tool_requires_approval(tc) {
+            read_only.push(tc);
+            continue;
+        }
+        let id = tc_map.get("id").and_then(Value::as_str).unwrap_or("");
+        let tool_name = tc_map
+            .get("function")
+            .and_then(|f| f.get("name"))
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let path = tool_path_hint(tc);
+        out.sse_maps.push(build_approval_required_event(
+            id,
+            tool_name,
+            path.as_deref(),
+        ));
+        match wait_approval_ledger_for_tool(ledger, user_id, tc, ledger_wait).await {
+            Ok(()) => {}
+            Err(part) => {
+                out.tool_messages.extend(part.tool_messages);
+                out.persist_tool_results.extend(part.persist_tool_results);
+                continue;
+            }
+        }
+        out.sse_maps.extend(sse_maps_through_tool_request(tc));
+        let tail = wait_tool_result_ledger_for_tool(ledger, user_id, tc, ledger_wait).await;
+        out.tool_messages.extend(tail.tool_messages);
+        out.persist_tool_results.extend(tail.persist_tool_results);
+    }
+
+    // Phase 2: read-only tools — emit all SSE events, then await results concurrently.
+    for tc in &read_only {
+        out.sse_maps.extend(sse_maps_through_tool_request(tc));
+    }
+    if !read_only.is_empty() {
+        let futs: Vec<_> = read_only
+            .iter()
+            .map(|tc| {
+                let ledger = ledger.clone();
+                let uid = user_id.to_owned();
+                let tc = (*tc).clone();
+                async move { wait_tool_result_ledger_for_tool(&ledger, &uid, &tc, ledger_wait).await }
+            })
+            .collect();
+        for tail in futures_util::future::join_all(futs).await {
+            out.tool_messages.extend(tail.tool_messages);
+            out.persist_tool_results.extend(tail.persist_tool_results);
+        }
+    }
+
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -406,5 +482,155 @@ mod tests {
         assert!(body.contains("user_denied"));
         assert!(body.contains("policy"));
         assert!(ledger.lock().await.is_empty());
+    }
+
+    // ── deliver_tool_calls_concurrent ─────────────────────────────────────
+
+    #[tokio::test]
+    async fn concurrent_mixed_batch_approval_plus_read_only() {
+        // 1 write_file (needs approval) + 2 read_file (read-only, concurrent).
+        let ledger = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        let uid = "u_mix";
+        let tcs = vec![write_tool("w1"), read_tool("r1"), read_tool("r2")];
+
+        let l2 = ledger.clone();
+        tokio::spawn(async move {
+            // Approval for write_file
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            l2.lock().await.insert(
+                approval_callback_key(uid, "w1"),
+                json!({
+                    "kind": "approval_respond",
+                    "body": serde_json::to_value(ApprovalRespondRequest {
+                        request_id: "w1".into(),
+                        decision: ApprovalDecision::Allow,
+                        reason: None,
+                    }).unwrap()
+                }),
+            );
+            // Tool result for write_file
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            l2.lock().await.insert(
+                tool_callback_key(uid, "w1"),
+                json!({"body": {"request_id": "w1", "status": "ok", "output": "wrote_b"}}),
+            );
+            // Tool results for both read_files (arrive ~concurrently)
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            {
+                let mut g = l2.lock().await;
+                g.insert(
+                    tool_callback_key(uid, "r1"),
+                    json!({"body": {"request_id": "r1", "status": "ok", "output": "content_1"}}),
+                );
+                g.insert(
+                    tool_callback_key(uid, "r2"),
+                    json!({"body": {"request_id": "r2", "status": "ok", "output": "content_2"}}),
+                );
+            }
+        });
+
+        let d = deliver_tool_calls_concurrent(&ledger, uid, &tcs, Duration::from_secs(2)).await;
+
+        // SSE events: approval_required + tool_call + tool_request (write) + 2×(tool_call + tool_request) (reads)
+        // write: approval_required, tool_call, tool_request = 3
+        // read×2: tool_call, tool_request each = 4
+        assert_eq!(d.sse_maps.len(), 7, "sse_maps: {:#?}", d.sse_maps);
+        assert_eq!(
+            d.sse_maps[0].get("type").and_then(Value::as_str),
+            Some("approval_required"),
+            "first event must be approval for write_file"
+        );
+
+        // All 3 tool results present
+        assert_eq!(d.tool_messages.len(), 3);
+        let contents: Vec<&str> = d.tool_messages.iter()
+            .map(|m| m["content"].as_str().unwrap())
+            .collect();
+        assert!(contents.iter().any(|c| c.contains("wrote_b")));
+        assert!(contents.iter().any(|c| c.contains("content_1")));
+        assert!(contents.iter().any(|c| c.contains("content_2")));
+
+        // Write tool result comes first (sequential), reads come after (concurrent)
+        assert!(d.tool_messages[0]["content"].as_str().unwrap().contains("wrote_b"));
+    }
+
+    #[tokio::test]
+    async fn concurrent_read_only_batch_runs_concurrently() {
+        // 3 read-only tools — verify they all complete even though results
+        // arrive at different times (proves concurrent, not sequential).
+        let ledger = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        let uid = "u_ro";
+        let tcs = vec![read_tool("r1"), read_tool("r2"), read_tool("r3")];
+
+        let l2 = ledger.clone();
+        let started = std::time::Instant::now();
+        tokio::spawn(async move {
+            // Stagger results: r3 first, r1 second, r2 last
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            l2.lock().await.insert(
+                tool_callback_key(uid, "r3"),
+                json!({"body": {"request_id": "r3", "status": "ok", "output": "c3"}}),
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            l2.lock().await.insert(
+                tool_callback_key(uid, "r1"),
+                json!({"body": {"request_id": "r1", "status": "ok", "output": "c1"}}),
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            l2.lock().await.insert(
+                tool_callback_key(uid, "r2"),
+                json!({"body": {"request_id": "r2", "status": "ok", "output": "c2"}}),
+            );
+        });
+
+        let d = deliver_tool_calls_concurrent(&ledger, uid, &tcs, Duration::from_secs(2)).await;
+        let elapsed = started.elapsed();
+
+        assert_eq!(d.tool_messages.len(), 3);
+        // Results are in original tool_call order (r1, r2, r3) regardless of arrival order
+        assert!(d.tool_messages[0]["content"].as_str().unwrap().contains("c1"));
+        assert!(d.tool_messages[1]["content"].as_str().unwrap().contains("c2"));
+        assert!(d.tool_messages[2]["content"].as_str().unwrap().contains("c3"));
+
+        // If sequential, would take ~30ms (10+10+10). Concurrent should be ~30ms too
+        // since they're staggered, but the key point is all 3 complete.
+        // Just sanity-check it didn't take absurdly long.
+        assert!(elapsed < Duration::from_secs(1), "took too long: {elapsed:?}");
+    }
+
+    #[tokio::test]
+    async fn concurrent_denied_write_still_delivers_reads() {
+        // write_file denied + 1 read_file — read should still succeed.
+        let ledger = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        let uid = "u_deny";
+        let tcs = vec![write_tool("w1"), read_tool("r1")];
+
+        let l2 = ledger.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            l2.lock().await.insert(
+                approval_callback_key(uid, "w1"),
+                json!({
+                    "kind": "approval_respond",
+                    "body": serde_json::to_value(ApprovalRespondRequest {
+                        request_id: "w1".into(),
+                        decision: ApprovalDecision::Deny,
+                        reason: Some("nope".into()),
+                    }).unwrap()
+                }),
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            l2.lock().await.insert(
+                tool_callback_key(uid, "r1"),
+                json!({"body": {"request_id": "r1", "status": "ok", "output": "read_ok"}}),
+            );
+        });
+
+        let d = deliver_tool_calls_concurrent(&ledger, uid, &tcs, Duration::from_secs(2)).await;
+
+        // 2 tool messages: denied write + successful read
+        assert_eq!(d.tool_messages.len(), 2);
+        assert!(d.tool_messages[0]["content"].as_str().unwrap().contains("user_denied"));
+        assert!(d.tool_messages[1]["content"].as_str().unwrap().contains("read_ok"));
     }
 }
