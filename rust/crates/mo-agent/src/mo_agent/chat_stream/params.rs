@@ -18,6 +18,9 @@ pub(crate) struct ChatTurnParams<'a> {
     pub(crate) perm_manager: &'a mut PermissionManager,
     pub(crate) verbose_mode: bool,
     pub(crate) quiet: bool,
+    /// When true, suppress incremental UI (spinner/tool status/draft markdown)
+    /// and only surface the final accumulated answer after the loop completes.
+    pub(crate) suppress_intermediate_output: bool,
     pub(crate) selector: &'a dyn ToolSelector,
     pub(crate) recent_tools: &'a [String],
     pub(crate) tool_health_entries: &'a [ToolHealthEntry],

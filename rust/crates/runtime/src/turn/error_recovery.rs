@@ -124,6 +124,7 @@ pub fn classify_error(error_str: &str) -> ErrorCategory {
 
     // Invalid args: parse error, missing field, type mismatch
     if lower.contains("invalid")
+        || lower.contains("file is too large")
         || lower.contains("parse error")
         || lower.contains("missing")
         || lower.contains("expected")
@@ -503,6 +504,12 @@ mod tests {
         );
         assert_eq!(
             classify_error("missing required field 'path'"),
+            ErrorCategory::InvalidArgs
+        );
+        assert_eq!(
+            classify_error(
+                "Error: file is too large (97716 bytes, ~2442 lines). Use start_line/end_line to read a specific range, or outline=true to see definitions only."
+            ),
             ErrorCategory::InvalidArgs
         );
     }

@@ -39,6 +39,7 @@ pub(crate) struct CliAgenticLoopHost<'a> {
     pub render_md: bool,
     pub term_width: usize,
     pub quiet: bool,
+    pub suppress_intermediate_output: bool,
     pub message: &'a str,
     pub history: &'a [(String, String)],
     pub recent_tools: &'a [String],
@@ -73,6 +74,7 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
             render_md: self.render_md,
             term_width: self.term_width,
             quiet: self.quiet,
+            suppress_intermediate_output: self.suppress_intermediate_output,
             message: self.message,
             history: self.history,
             recent_tools: self.recent_tools,
@@ -114,6 +116,9 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
     }
 
     fn emit_headless_line(&mut self, style: HeadlessStderrStyle, line: String) {
+        if self.suppress_intermediate_output {
+            return;
+        }
         match style {
             HeadlessStderrStyle::Dim => eprintln!("{}", line.dim()),
             HeadlessStderrStyle::Red => eprintln!("{}", line.red()),

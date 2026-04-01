@@ -335,6 +335,7 @@ pub(crate) struct ChatTurnSseFetchRequest<'a> {
     pub render_md: bool,
     pub term_width: usize,
     pub quiet: bool,
+    pub suppress_intermediate_output: bool,
     pub message: &'a str,
     pub history: &'a [(String, String)],
     pub recent_tools: &'a [String],
@@ -370,6 +371,7 @@ pub(crate) async fn fetch_chat_turn_sse(
         render_md,
         term_width,
         quiet,
+        suppress_intermediate_output,
         message,
         history,
         recent_tools,
@@ -450,6 +452,7 @@ pub(crate) async fn fetch_chat_turn_sse(
         render_md,
         term_width,
         quiet,
+        suppress_intermediate_output,
         Some(edge_ctx),
         pre_clear_lines,
     )

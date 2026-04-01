@@ -7,6 +7,13 @@ pub(super) fn create_tool_selector(
     create_tool_selector_with_quality(api, profile, None, None)
 }
 
+pub(super) fn create_tool_selector_quiet(
+    api: &mo_thin_client::ThinClient,
+    profile: Option<&str>,
+) -> (Box<dyn tool_selector::ToolSelector>, PipelineModules) {
+    create_tool_selector_with_quality_internal(api, profile, None, None, false)
+}
+
 /// Shared pipeline learning modules — kept accessible for cross-session persistence.
 pub(super) struct PipelineModules {
     pub entity_graph:
@@ -29,6 +36,24 @@ pub(super) fn create_tool_selector_with_quality(
     confidence_calibrator: Option<
         std::sync::Arc<mo_agent_runtime::turn::routing_metrics::ConfidenceCalibrator>,
     >,
+) -> (Box<dyn tool_selector::ToolSelector>, PipelineModules) {
+    create_tool_selector_with_quality_internal(
+        api,
+        profile,
+        quality_tracker,
+        confidence_calibrator,
+        true,
+    )
+}
+
+fn create_tool_selector_with_quality_internal(
+    api: &mo_thin_client::ThinClient,
+    profile: Option<&str>,
+    quality_tracker: Option<std::sync::Arc<std::sync::Mutex<tool_registry::ToolQualityTracker>>>,
+    confidence_calibrator: Option<
+        std::sync::Arc<mo_agent_runtime::turn::routing_metrics::ConfidenceCalibrator>,
+    >,
+    announce_skills: bool,
 ) -> (Box<dyn tool_selector::ToolSelector>, PipelineModules) {
     use mo_agent_runtime::pipeline::{
         calibration::ProgressiveCalibrator, entity::EntityGraph, pattern::PatternLibrary,
@@ -77,7 +102,7 @@ pub(super) fn create_tool_selector_with_quality(
         {
             let registered =
                 skill_instructions::discover_and_register_metadata(skills_path, &mut reg);
-            if !registered.is_empty() {
+            if announce_skills && !registered.is_empty() {
                 eprintln!(
                     "  {} Discovered {} skills from {:?}: {:?}",
                     "✓".green(),

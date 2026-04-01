@@ -401,6 +401,11 @@ impl StreamRenderState {
     /// Show a tool as "running" and return its index for later update.
     fn tool_start(&mut self, tool: &str) -> usize {
         let idx = self.tool_lines.len();
+        if self.md.is_some() {
+            eprintln!("  ⚡ {tool} …");
+            self.stderr_lines += 1;
+            return idx;
+        }
         let line = format!("  ⚡ {tool} …");
         self.tool_lines.push(line);
         self.tool_region.update(self.tool_lines.clone());
@@ -414,6 +419,11 @@ impl StreamRenderState {
         } else {
             ("✓", format!(" ({duration_ms}ms)"))
         };
+        if self.md.is_some() {
+            eprintln!("  {icon} {tool}{suffix}");
+            self.stderr_lines += 1;
+            return;
+        }
         if idx < self.tool_lines.len() {
             self.tool_lines[idx] = format!("  {icon} {tool}{suffix}");
             self.tool_region.update(self.tool_lines.clone());
@@ -464,6 +474,7 @@ pub(super) async fn consume_turn_sse(
     render_md: bool,
     term_width: usize,
     quiet: bool,
+    suppress_intermediate_output: bool,
     edge: Option<EdgeSseContext<'_>>,
     pre_clear_lines: usize,
 ) -> TurnResult {
@@ -476,7 +487,11 @@ pub(super) async fn consume_turn_sse(
     // Delegate to runtime's generic SSE consumer with the appropriate host
     let idle = std::time::Duration::from_millis(STREAM_IDLE_TIMEOUT_MS);
     let (sse_result, edge_tool_round, mut md_renderer, lines_written) = if let Some(ctx) = edge {
-        let mut host = CliSseStreamHost::from_edge_ctx(ctx, term_width, render_md);
+        let mut host = CliSseStreamHost::from_edge_ctx(
+            ctx,
+            term_width,
+            render_md && !suppress_intermediate_output,
+        );
         // pre_clear_lines only applies to non-md fallback path.
         if host.render.md.is_none() {
             host.render.lines_written = pre_clear_lines;
@@ -486,7 +501,10 @@ pub(super) async fn consume_turn_sse(
         let md = host.render.md.take();
         (result, host.edge_tool_round, md, lw)
     } else {
-        let mut render = StreamRenderState::with_term_width(term_width, render_md);
+        let mut render = StreamRenderState::with_term_width(
+            term_width,
+            render_md && !suppress_intermediate_output,
+        );
         if render.md.is_none() {
             render.lines_written = pre_clear_lines;
         }
@@ -503,7 +521,7 @@ pub(super) async fn consume_turn_sse(
         edge_tool_round,
     };
 
-    if quiet {
+    if quiet || suppress_intermediate_output {
         return result;
     }
 
@@ -512,7 +530,15 @@ pub(super) async fn consume_turn_sse(
     // streaming. Intermediate drafts are discarded when tool execution starts,
     // so only finalize turns that truly completed without more tool work.
     if let Some(md) = &mut md_renderer {
-        if !result.has_tool_calls {
+        if result.has_tool_calls {
+            // Some intermediate turns do not invoke the edge `execute_tool()`
+            // callback before the stream ends (for example, when tool calls are
+            // consumed by the later headless tool round). In those cases the
+            // draft prose would otherwise remain on screen and then be repeated
+            // by a later final answer. Always discard markdown drafts for any
+            // turn that still has pending tool work.
+            md.discard_and_reset();
+        } else {
             md.finish();
         }
     } else if result.has_tool_calls && lines_written > 0 {

@@ -135,6 +135,7 @@ pub(crate) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
         render_md: p.render_md,
         term_width,
         quiet: p.quiet,
+        suppress_intermediate_output: p.suppress_intermediate_output,
         message: p.message,
         history: p.history,
         recent_tools: p.recent_tools,
@@ -209,7 +210,7 @@ pub(crate) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
     // ─── Finalize ────────────────────────────────────────────────────────
     eprint_stream_loop_sidecars(StreamLoopSidecarEprint {
         explain: p.explain,
-        quiet: p.quiet,
+        quiet: p.quiet || p.suppress_intermediate_output,
         verbose_mode: p.verbose_mode,
         start,
         model: p.model,
