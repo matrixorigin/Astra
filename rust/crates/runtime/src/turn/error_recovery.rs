@@ -278,10 +278,11 @@ pub fn build_recovery_message(
             tool_name
         ),
         ErrorCategory::Unknown => {
-            eprintln!(
-                "[error_recovery] unclassified error for tool '{}': {}",
-                tool_name,
-                error_str.chars().take(200).collect::<String>()
+            mo_agent_core::agent_tool_event!(
+                "error_recovery",
+                "unclassified_error",
+                tool = tool_name,
+                error = &error_str.chars().take(200).collect::<String>()
             );
             format!("⚠ {} failed with an unclassified error.", tool_name)
         }

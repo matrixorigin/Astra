@@ -16,6 +16,8 @@ pub enum GitSafetyViolation {
     HookSkipFlag { flag: &'static str },
     /// Force push detected (`--force`, `-f`, `--force-with-lease`).
     ForcePush,
+    /// Force push to a protected branch (main, master, develop).
+    ForcePushProtectedBranch { branch: String },
     /// Compound command chains `cd` with `git` (bare repo attack vector).
     CdGitCompound,
     /// `git -c` used (arbitrary config = code execution via core.fsmonitor, diff.external, etc.).
@@ -44,6 +46,9 @@ impl std::fmt::Display for GitSafetyViolation {
                 write!(f, "hook-skip flag '{flag}' requires explicit user approval")
             }
             Self::ForcePush => write!(f, "force push requires explicit user approval"),
+            Self::ForcePushProtectedBranch { branch } => {
+                write!(f, "force push to protected branch '{branch}' blocked")
+            }
             Self::CdGitCompound => {
                 write!(
                     f,
@@ -156,8 +161,36 @@ fn check_force_push(lower: &str, violations: &mut Vec<GitSafetyViolation>) {
     if !lower.contains("push") {
         return;
     }
-    if lower.contains("--force") || lower.contains(" -f") || lower.contains("--force-with-lease") {
-        violations.push(GitSafetyViolation::ForcePush);
+    let is_force =
+        lower.contains("--force") || lower.contains(" -f") || lower.contains("--force-with-lease");
+    if !is_force {
+        return;
+    }
+    violations.push(GitSafetyViolation::ForcePush);
+
+    // Check for protected branches (main, master, develop, release/*)
+    let protected_branches = ["main", "master", "develop", "production", "staging"];
+    let words: Vec<&str> = lower.split_whitespace().collect();
+
+    // Look for branch name after "origin" or after "push"
+    for (i, word) in words.iter().enumerate() {
+        if *word == "origin" || *word == "push" {
+            if let Some(next) = words.get(i + 1) {
+                // Skip flags
+                if next.starts_with('-') {
+                    continue;
+                }
+                // Check against protected branches
+                for protected in &protected_branches {
+                    if next.contains(protected) {
+                        violations.push(GitSafetyViolation::ForcePushProtectedBranch {
+                            branch: next.to_string(),
+                        });
+                        return;
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -296,6 +329,25 @@ mod tests {
     fn blocks_force_push_short() {
         let v = validate_git_command("git push -f origin main");
         assert!(v.iter().any(|v| matches!(v, GitSafetyViolation::ForcePush)));
+    }
+
+    #[test]
+    fn blocks_force_push_protected_branch() {
+        let v = validate_git_command("git push --force origin main");
+        assert!(v
+            .iter()
+            .any(|v| matches!(v, GitSafetyViolation::ForcePushProtectedBranch { branch } if branch == "main")));
+
+        let v = validate_git_command("git push --force origin master");
+        assert!(v
+            .iter()
+            .any(|v| matches!(v, GitSafetyViolation::ForcePushProtectedBranch { branch } if branch == "master")));
+
+        // Feature branch should not trigger protected branch violation
+        let v = validate_git_command("git push --force origin feature/my-feature");
+        assert!(!v
+            .iter()
+            .any(|v| matches!(v, GitSafetyViolation::ForcePushProtectedBranch { .. })));
     }
 
     // --- cd + git compound ---

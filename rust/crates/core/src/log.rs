@@ -57,6 +57,48 @@ macro_rules! agent_persist_fail {
     };
 }
 
+/// Structured tool event log with key=value fields.
+/// Used for tool errors, retries, and escalations.
+///
+/// # Example
+/// ```ignore
+/// agent_tool_event!("runtime", "tool_error",
+///     tool = "bash",
+///     category = "Transient",
+///     attempt = 1,
+///     error = "timeout"
+/// );
+/// ```
+#[macro_export]
+macro_rules! agent_tool_event {
+    ($component:expr, $event:expr, $($key:ident = $val:expr),+ $(,)?) => {
+        eprint!("[{}] TOOL_EVENT event={}", $component, $event);
+        $(eprint!(" {}={}", stringify!($key), $val);)+
+        eprintln!();
+    };
+}
+
+/// Structured escalation event log.
+/// Used when turn guard escalates to Warning or Critical.
+///
+/// # Example
+/// ```ignore
+/// agent_escalation!("turnguard",
+///     severity = "Critical",
+///     nudge_count = 5,
+///     error_count = 3,
+///     force_stop = true
+/// );
+/// ```
+#[macro_export]
+macro_rules! agent_escalation {
+    ($component:expr, $($key:ident = $val:expr),+ $(,)?) => {
+        eprint!("[{}] ESCALATION", $component);
+        $(eprint!(" {}={}", stringify!($key), $val);)+
+        eprintln!();
+    };
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -70,5 +112,26 @@ mod tests {
     #[test]
     fn persist_fail_macro_formats_kv() {
         agent_persist_fail!("bridge", session = "abc123", events = 42, error = "timeout");
+    }
+
+    #[test]
+    fn tool_event_macro_formats_kv() {
+        agent_tool_event!(
+            "runtime",
+            "tool_error",
+            tool = "bash",
+            category = "Transient",
+            attempt = 1
+        );
+    }
+
+    #[test]
+    fn escalation_macro_formats_kv() {
+        agent_escalation!(
+            "turnguard",
+            severity = "Critical",
+            nudge_count = 5,
+            force_stop = true
+        );
     }
 }
