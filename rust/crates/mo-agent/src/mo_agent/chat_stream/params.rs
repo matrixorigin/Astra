@@ -36,4 +36,6 @@ pub(crate) struct ChatTurnParams<'a> {
     /// Optional delegation engine for multi-agent coordination with verification gates.
     pub(crate) delegation_engine:
         Option<Arc<mo_agent_runtime::server::delegation_engine::DelegationEngine>>,
+    /// Optional cancellation token for interrupting SSE streaming mid-flight.
+    pub(crate) cancel_token: Option<Arc<tokio_util::sync::CancellationToken>>,
 }

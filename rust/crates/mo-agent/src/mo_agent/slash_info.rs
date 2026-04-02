@@ -740,6 +740,7 @@ pub(super) async fn handle_info_command(
                 is_plan_subtask: false,
                 plan_subtask_id: None,
                 delegation_engine: None,
+                cancel_token: None,
             })
             .await?;
             if let Some(session_id) = sr.session_id.as_deref() {

@@ -70,6 +70,7 @@ pub(super) async fn execute_cli_command(
                 is_plan_subtask: false,
                 plan_subtask_id: None,
                 delegation_engine: None,
+                cancel_token: None,
             })
             .await
             {
@@ -97,6 +98,7 @@ pub(super) async fn execute_cli_command(
                         is_plan_subtask: false,
                         plan_subtask_id: None,
                         delegation_engine: None,
+                        cancel_token: None,
                     })
                     .await?
                 }
@@ -307,6 +309,7 @@ pub(super) async fn execute_cli_command(
                 is_plan_subtask: false,
                 plan_subtask_id: None,
                 delegation_engine: None,
+                cancel_token: None,
             })
             .await
             {
@@ -334,6 +337,7 @@ pub(super) async fn execute_cli_command(
                         is_plan_subtask: false,
                         plan_subtask_id: None,
                         delegation_engine: None,
+                        cancel_token: None,
                     })
                     .await?
                 }

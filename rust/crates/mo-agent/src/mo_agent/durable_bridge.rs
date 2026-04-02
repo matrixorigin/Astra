@@ -704,12 +704,12 @@ pub fn create_gate_for_subtask(
     subtask_id: &str,
     work_dir: std::path::PathBuf,
 ) -> Option<Arc<dyn VerificationGate>> {
-    let subtask = durable.contract.subtasks.iter().find(|s| s.id == subtask_id)?;
-    let non_global: Vec<_> = subtask
-        .criteria
+    let subtask = durable
+        .contract
+        .subtasks
         .iter()
-        .filter(|c| !c.global_only)
-        .collect();
+        .find(|s| s.id == subtask_id)?;
+    let non_global: Vec<_> = subtask.criteria.iter().filter(|c| !c.global_only).collect();
     if non_global.is_empty() {
         return None;
     }
@@ -1173,22 +1173,70 @@ mod tests {
         #[async_trait]
         impl DurableTaskLifecycle for StubLifecycle {
             async fn create_contract(
-                &self, _: &str, _: &str, _: &str,
+                &self,
+                _: &str,
+                _: &str,
+                _: &str,
                 _: &mo_agent_services::task_orchestrator::TaskPlan,
                 _: TaskScope,
-            ) -> Result<TaskContract, String> { Err("stub".into()) }
-            async fn amend_contract(&self, _: &str, _: mo_agent_services::ContractAmendment) -> Result<TaskContract, String> { Err("stub".into()) }
-            async fn get_contract(&self, _: &str) -> Result<Option<TaskContract>, String> { Ok(None) }
-            async fn begin_subtask(&self, _: &str, _: &str) -> Result<mo_agent_services::SubtaskExecutionContext, String> { Err("stub".into()) }
-            async fn complete_subtask_execution(&self, _: &str, _: &str) -> Result<(), String> { Ok(()) }
-            async fn fail_subtask(&self, _: &str, _: &str, _: &str) -> Result<(), String> { Ok(()) }
-            async fn verify_subtask(&self, _: &str, _: &str) -> Result<SubtaskVerificationReport, String> { Err("stub".into()) }
-            async fn verify_global(&self, _: &str) -> Result<Vec<VerificationResult>, String> { Err("stub".into()) }
-            async fn pause_task(&self, _: &str) -> Result<(), String> { Ok(()) }
-            async fn resume_task(&self, _: &str, _: &str) -> Result<mo_agent_services::TaskResumeContext, String> { Err("stub".into()) }
-            async fn deliver_task(&self, _: &str) -> Result<mo_agent_services::TaskDeliveryReport, String> { Err("stub".into()) }
-            async fn snapshot_task_state(&self, _: &str) -> Result<String, String> { Err("stub".into()) }
-            async fn rollback_task(&self, _: &str, _: &str) -> Result<(), String> { Err("stub".into()) }
+            ) -> Result<TaskContract, String> {
+                Err("stub".into())
+            }
+            async fn amend_contract(
+                &self,
+                _: &str,
+                _: mo_agent_services::ContractAmendment,
+            ) -> Result<TaskContract, String> {
+                Err("stub".into())
+            }
+            async fn get_contract(&self, _: &str) -> Result<Option<TaskContract>, String> {
+                Ok(None)
+            }
+            async fn begin_subtask(
+                &self,
+                _: &str,
+                _: &str,
+            ) -> Result<mo_agent_services::SubtaskExecutionContext, String> {
+                Err("stub".into())
+            }
+            async fn complete_subtask_execution(&self, _: &str, _: &str) -> Result<(), String> {
+                Ok(())
+            }
+            async fn fail_subtask(&self, _: &str, _: &str, _: &str) -> Result<(), String> {
+                Ok(())
+            }
+            async fn verify_subtask(
+                &self,
+                _: &str,
+                _: &str,
+            ) -> Result<SubtaskVerificationReport, String> {
+                Err("stub".into())
+            }
+            async fn verify_global(&self, _: &str) -> Result<Vec<VerificationResult>, String> {
+                Err("stub".into())
+            }
+            async fn pause_task(&self, _: &str) -> Result<(), String> {
+                Ok(())
+            }
+            async fn resume_task(
+                &self,
+                _: &str,
+                _: &str,
+            ) -> Result<mo_agent_services::TaskResumeContext, String> {
+                Err("stub".into())
+            }
+            async fn deliver_task(
+                &self,
+                _: &str,
+            ) -> Result<mo_agent_services::TaskDeliveryReport, String> {
+                Err("stub".into())
+            }
+            async fn snapshot_task_state(&self, _: &str) -> Result<String, String> {
+                Err("stub".into())
+            }
+            async fn rollback_task(&self, _: &str, _: &str) -> Result<(), String> {
+                Err("stub".into())
+            }
         }
 
         let durable = DurableTaskState {
@@ -1201,9 +1249,16 @@ mod tests {
         assert!(gate.is_none());
 
         // Existing subtask with criteria → Some
-        let has_criteria = durable.contract.subtasks.iter().any(|s| !s.criteria.is_empty());
+        let has_criteria = durable
+            .contract
+            .subtasks
+            .iter()
+            .any(|s| !s.criteria.is_empty());
         if has_criteria {
-            let id = durable.contract.subtasks.iter()
+            let id = durable
+                .contract
+                .subtasks
+                .iter()
                 .find(|s| !s.criteria.is_empty())
                 .unwrap()
                 .id

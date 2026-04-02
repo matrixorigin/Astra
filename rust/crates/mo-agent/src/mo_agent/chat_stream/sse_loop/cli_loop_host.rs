@@ -109,6 +109,7 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
             pre_clear_lines: pre_clear,
             is_plan_subtask: self.is_plan_subtask,
             plan_subtask_id: self.plan_subtask_id,
+            cancel_token: state.cancel_token.as_deref(),
         })
         .await?;
 

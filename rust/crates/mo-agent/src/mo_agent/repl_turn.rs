@@ -264,6 +264,7 @@ async fn maybe_auto_compact(
         is_plan_subtask: false,
         plan_subtask_id: None,
         delegation_engine: None,
+        cancel_token: None,
     })
     .await;
 
@@ -365,6 +366,10 @@ async fn run_chat_turn(
     // The skill_registry is passed to stream_chat_sse for loading instructions
     // when the LLM selects a skill.
 
+    // Create a cancellation token that can interrupt SSE streaming mid-flight.
+    let cancel_token = std::sync::Arc::new(tokio_util::sync::CancellationToken::new());
+    let cancel_token_for_signal = cancel_token.clone();
+
     tokio::select! {
         result = stream_chat_sse(ChatTurnParams {
             api: ctx.api,
@@ -387,8 +392,11 @@ async fn run_chat_turn(
             is_plan_subtask: state.current_plan_subtask_id.is_some(),
             plan_subtask_id: state.current_plan_subtask_id.as_deref(),
             delegation_engine: state.delegation_engine.clone(),
+            cancel_token: Some(cancel_token),
         }) => TurnAttempt::Completed(Box::new(result)),
         _ = tokio::signal::ctrl_c() => {
+            // Trigger cancellation to interrupt any in-flight SSE streaming.
+            cancel_token_for_signal.cancel();
             eprintln!("\n{}", "  Interrupted.".dim());
             TurnAttempt::Interrupted
         }

@@ -2093,15 +2093,14 @@ async fn run_plan_execution(
                 let registry = std::sync::Arc::new(tokio::sync::RwLock::new(
                     mo_agent_services::AgentProfileRegistry::new(),
                 ));
-                let run_store = std::sync::Arc::new(
-                    mo_agent_services::runs::InMemoryRunStateStore::default(),
-                );
+                let run_store =
+                    std::sync::Arc::new(mo_agent_services::runs::InMemoryRunStateStore::default());
                 let engine =
                     mo_agent_runtime::server::delegation_engine::DelegationEngine::with_executor(
                         registry,
-                        std::sync::Arc::new(
-                            mo_agent_runtime::server::run_engine::RunEngine::new(run_store),
-                        ),
+                        std::sync::Arc::new(mo_agent_runtime::server::run_engine::RunEngine::new(
+                            run_store,
+                        )),
                         std::sync::Arc::new(
                             mo_agent_runtime::server::delegation_engine::DelegationTracker::new(),
                         ),
@@ -4518,6 +4517,7 @@ mod tests {
             is_plan_subtask: false,
             plan_subtask_id: None,
             delegation_engine: None,
+            cancel_token: None,
         })
         .await
         .unwrap();
@@ -4564,6 +4564,7 @@ mod tests {
             is_plan_subtask: false,
             plan_subtask_id: None,
             delegation_engine: None,
+            cancel_token: None,
         })
         .await;
         assert!(result.is_err());
@@ -4626,6 +4627,7 @@ mod tests {
             is_plan_subtask: false,
             plan_subtask_id: None,
             delegation_engine: None,
+            cancel_token: None,
         })
         .await
         .unwrap();

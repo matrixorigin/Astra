@@ -2368,16 +2368,11 @@ mod tests {
 
     #[test]
     fn clone_with_gate_shares_components() {
-        let run_store =
-            Arc::new(mo_agent_services::runs::InMemoryRunStateStore::default());
-        let registry = Arc::new(tokio::sync::RwLock::new(
-            AgentProfileRegistry::new(),
-        ));
-        let run_engine =
-            Arc::new(crate::server::run_engine::RunEngine::new(run_store));
+        let run_store = Arc::new(mo_agent_services::runs::InMemoryRunStateStore::default());
+        let registry = Arc::new(tokio::sync::RwLock::new(AgentProfileRegistry::new()));
+        let run_engine = Arc::new(crate::server::run_engine::RunEngine::new(run_store));
         let tracker = Arc::new(DelegationTracker::new());
-        let executor: Arc<dyn SubRunExecutor> =
-            Arc::new(StubSubRunExecutor);
+        let executor: Arc<dyn SubRunExecutor> = Arc::new(StubSubRunExecutor);
 
         let engine = DelegationEngine::with_executor(
             registry.clone(),
@@ -2391,12 +2386,7 @@ mod tests {
         struct PassGate;
         #[async_trait::async_trait]
         impl VerificationGate for PassGate {
-            async fn verify(
-                &self,
-                _: &AgentResult,
-                _: &str,
-                _: u32,
-            ) -> GateVerdict {
+            async fn verify(&self, _: &AgentResult, _: &str, _: u32) -> GateVerdict {
                 GateVerdict::Pass
             }
         }

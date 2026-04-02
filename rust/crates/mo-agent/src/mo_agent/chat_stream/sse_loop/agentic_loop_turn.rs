@@ -387,6 +387,8 @@ pub(crate) struct ChatTurnSseFetchRequest<'a> {
     pub pre_clear_lines: usize,
     pub is_plan_subtask: bool,
     pub plan_subtask_id: Option<&'a str>,
+    /// Optional cancellation token for interrupting SSE streaming.
+    pub cancel_token: Option<&'a tokio_util::sync::CancellationToken>,
 }
 
 pub(crate) async fn fetch_chat_turn_sse(
@@ -423,6 +425,7 @@ pub(crate) async fn fetch_chat_turn_sse(
         pre_clear_lines,
         is_plan_subtask,
         plan_subtask_id,
+        cancel_token,
     } = ctx;
 
     let payload = prepare_chat_turn_payload(PrepareChatTurnRequest {
@@ -489,7 +492,7 @@ pub(crate) async fn fetch_chat_turn_sse(
         suppress_intermediate_output,
         Some(edge_ctx),
         pre_clear_lines,
-        None, // cancel_token - not yet wired through
+        cancel_token,
     )
     .await)
 }
