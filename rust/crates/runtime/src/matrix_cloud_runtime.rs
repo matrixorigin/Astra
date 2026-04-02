@@ -158,6 +158,16 @@ impl MatrixCloudRuntime {
         &self.shared_pool
     }
 
+    /// Create a [`CloudLlmJudge`] backed by this runtime's database pool.
+    ///
+    /// Returns `None` if cloud LLM environment variables are not configured.
+    /// The judge persists evaluation results directly to the `task_verification_results` table.
+    pub fn create_cloud_llm_judge(&self) -> Option<mo_agent_services::CloudLlmJudge> {
+        let config = mo_agent_services::CloudLlmConfig::from_env()?;
+        let pool = self.shared_pool.get().clone();
+        Some(mo_agent_services::CloudLlmJudge::new(config, Some(pool)))
+    }
+
     /// Clone the ingestion sender for use in other subsystems (e.g., durable task lifecycle).
     /// Returns `None` if ingestion is shut down or lock is poisoned.
     pub fn clone_ingestion_sender(

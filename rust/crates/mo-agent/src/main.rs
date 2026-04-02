@@ -994,7 +994,7 @@ async fn handle_resume_command(arg: &str, profile: Option<&str>, state: &mut Rep
                 let work_dir = std::env::current_dir().unwrap_or_default();
                 let session_dir =
                     mo_agent_services::session_workspace::workspace_dir_for(&session_id);
-                let lifecycle = durable_bridge::create_local_lifecycle_with_sender(
+                let lifecycle = durable_bridge::create_local_lifecycle_full(
                     &session_dir,
                     &work_dir,
                     state
@@ -1003,6 +1003,14 @@ async fn handle_resume_command(arg: &str, profile: Option<&str>, state: &mut Rep
                         .and_then(|mc| mc.clone_ingestion_sender()),
                     Some(&session_id),
                     state.ingestion_user_id.as_deref(),
+                    state
+                        .matrix_runtime
+                        .as_ref()
+                        .and_then(|mc| mc.create_cloud_llm_judge())
+                        .map(|j| {
+                            std::sync::Arc::new(j)
+                                as std::sync::Arc<dyn mo_agent_services::LlmJudge>
+                        }),
                 );
                 state.durable_task_state = Some(durable_bridge::DurableTaskState {
                     contract,
@@ -1864,7 +1872,7 @@ async fn run_plan_execution(
             .as_ref()
             .map(|sid| mo_agent_services::session_workspace::workspace_dir_for(sid))
             .unwrap_or_else(|| work_dir.join(".mo-session"));
-        let lifecycle = durable_bridge::create_local_lifecycle_with_sender(
+        let lifecycle = durable_bridge::create_local_lifecycle_full(
             &session_dir,
             &work_dir,
             state
@@ -1873,6 +1881,11 @@ async fn run_plan_execution(
                 .and_then(|mc| mc.clone_ingestion_sender()),
             Some(session_id),
             Some(user_id),
+            state
+                .matrix_runtime
+                .as_ref()
+                .and_then(|mc| mc.create_cloud_llm_judge())
+                .map(|j| std::sync::Arc::new(j) as std::sync::Arc<dyn mo_agent_services::LlmJudge>),
         );
 
         if let Some(contract) = durable_bridge::generate_contract(

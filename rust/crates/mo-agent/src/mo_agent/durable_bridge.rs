@@ -483,10 +483,11 @@ pub fn create_local_lifecycle(
     session_dir: &std::path::Path,
     work_dir: &std::path::Path,
 ) -> Arc<dyn DurableTaskLifecycle> {
-    create_local_lifecycle_with_sender(session_dir, work_dir, None, None, None)
+    create_local_lifecycle_full(session_dir, work_dir, None, None, None, None)
 }
 
 /// Like [`create_local_lifecycle`] but also wires cloud event streaming.
+#[allow(dead_code)] // Public API — callers without cloud judge use this shorthand
 pub fn create_local_lifecycle_with_sender(
     session_dir: &std::path::Path,
     work_dir: &std::path::Path,
@@ -494,12 +495,31 @@ pub fn create_local_lifecycle_with_sender(
     session_id: Option<&str>,
     user_id: Option<&str>,
 ) -> Arc<dyn DurableTaskLifecycle> {
+    create_local_lifecycle_full(session_dir, work_dir, sender, session_id, user_id, None)
+}
+
+/// Full lifecycle creation with optional cloud LLM judge.
+///
+/// When `cloud_judge` is provided, it's used for semantic (LlmJudge) verification
+/// instead of the edge-side HttpLlmJudge. The cloud judge persists results directly
+/// to the cloud database and doesn't consume the edge context window.
+pub fn create_local_lifecycle_full(
+    session_dir: &std::path::Path,
+    work_dir: &std::path::Path,
+    sender: Option<mo_agent_services::event_ingestion::IngestionSender>,
+    session_id: Option<&str>,
+    user_id: Option<&str>,
+    cloud_judge: Option<Arc<dyn mo_agent_services::LlmJudge>>,
+) -> Arc<dyn DurableTaskLifecycle> {
     let contracts_dir = session_dir.join("contracts");
     let _ = std::fs::create_dir_all(&contracts_dir);
     let mut lifecycle = LocalDurableTaskLifecycle::new(contracts_dir, work_dir.to_path_buf());
 
-    // Wire up LLM judge for semantic verification (if API key available)
-    if let Some(judge) = HttpLlmJudge::from_env() {
+    // Wire up LLM judge: prefer cloud judge (persists results, separate quota)
+    // over edge-side HttpLlmJudge (uses edge API key + context window)
+    if let Some(judge) = cloud_judge {
+        lifecycle.set_llm_judge(judge);
+    } else if let Some(judge) = HttpLlmJudge::from_env() {
         lifecycle.set_llm_judge(Arc::new(judge));
     }
 

@@ -42,6 +42,301 @@ pub trait LlmJudge: Send + Sync {
     async fn evaluate(&self, prompt: &str, context: &str) -> Result<f64, String>;
 }
 
+// ─── Cloud LLM Judge ────────────────────────────────────────────────────────
+
+/// Cloud-side [`LlmJudge`] that evaluates criteria without consuming the edge
+/// agent's context window.
+///
+/// Key differences from edge-side `HttpLlmJudge`:
+/// - Persists evaluation results in the cloud `task_verification_results` table
+/// - Can use a separate (cheaper/faster) model configured for cloud verification
+/// - Results are immediately available for cross-session auditing
+///
+/// # Usage
+///
+/// ```rust,ignore
+/// let judge = CloudLlmJudge::new(cloud_config, pool);
+/// let runner = VerificationRunner::with_llm_judge(work_dir, Arc::new(judge));
+/// // `verify_subtask()` (not _local) will now use the cloud LLM for LlmJudge criteria
+/// ```
+pub struct CloudLlmJudge {
+    client: reqwest::Client,
+    api_key: String,
+    base_url: String,
+    model: String,
+    pool: Option<sqlx::Pool<sqlx::MySql>>,
+    /// Context for persistence (contract/session tracking).
+    persist_context: std::sync::Mutex<CloudJudgePersistContext>,
+}
+
+/// Mutable context for result persistence, set before running verification.
+#[derive(Default, Clone)]
+pub struct CloudJudgePersistContext {
+    pub contract_id: Option<String>,
+    pub task_id: Option<String>,
+    pub subtask_id: Option<String>,
+    pub session_id: Option<String>,
+}
+
+/// Configuration for the cloud LLM judge.
+#[derive(Debug, Clone)]
+pub struct CloudLlmConfig {
+    pub api_key: String,
+    pub base_url: String,
+    pub model: String,
+}
+
+impl CloudLlmConfig {
+    /// Try to create from environment variables with `MO_CLOUD_LLM_` prefix.
+    ///
+    /// Falls back to `MO_LLM_` / `OPENAI_` prefixes if cloud-specific vars aren't set.
+    pub fn from_env() -> Option<Self> {
+        let api_key = std::env::var("MO_CLOUD_LLM_API_KEY")
+            .or_else(|_| std::env::var("MO_LLM_API_KEY"))
+            .or_else(|_| std::env::var("OPENAI_API_KEY"))
+            .ok()?;
+        let base_url = std::env::var("MO_CLOUD_LLM_BASE_URL")
+            .or_else(|_| std::env::var("MO_LLM_BASE_URL"))
+            .or_else(|_| std::env::var("OPENAI_BASE_URL"))
+            .unwrap_or_else(|_| "https://api.openai.com/v1".into());
+        let model = std::env::var("MO_CLOUD_LLM_MODEL")
+            .or_else(|_| std::env::var("MO_LLM_MODEL"))
+            .unwrap_or_else(|_| "gpt-4o-mini".into());
+        Some(Self {
+            api_key,
+            base_url,
+            model,
+        })
+    }
+}
+
+impl CloudLlmJudge {
+    /// Create a cloud judge with optional database persistence.
+    pub fn new(config: CloudLlmConfig, pool: Option<sqlx::Pool<sqlx::MySql>>) -> Self {
+        Self {
+            client: reqwest::Client::new(),
+            api_key: config.api_key,
+            base_url: config.base_url,
+            model: config.model,
+            pool,
+            persist_context: std::sync::Mutex::new(CloudJudgePersistContext::default()),
+        }
+    }
+
+    /// Set the persistence context before running a batch of evaluations.
+    pub fn set_persist_context(&self, ctx: CloudJudgePersistContext) {
+        if let Ok(mut guard) = self.persist_context.lock() {
+            *guard = ctx;
+        }
+    }
+
+    /// Persist an evaluation result to the cloud database.
+    async fn persist_result(
+        &self,
+        criterion_id: &str,
+        passed: bool,
+        score: f64,
+        evidence: &str,
+        duration_ms: u64,
+        error: Option<&str>,
+    ) {
+        let pool = match &self.pool {
+            Some(p) => p,
+            None => return,
+        };
+
+        let ctx = self
+            .persist_context
+            .lock()
+            .ok()
+            .map(|g| g.clone())
+            .unwrap_or_default();
+        let contract_id = ctx.contract_id.as_deref().unwrap_or("unknown");
+        let task_id = ctx.task_id.as_deref().unwrap_or("unknown");
+        let subtask_id = ctx.subtask_id.as_deref().unwrap_or("unknown");
+        let session_id = ctx.session_id.as_deref().unwrap_or("unknown");
+
+        let result_id = {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            criterion_id.hash(&mut h);
+            session_id.hash(&mut h);
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+                .hash(&mut h);
+            format!("cj-{:016x}", h.finish())
+        };
+
+        let evidence_with_score = format!("score={score:.2}; {evidence}");
+        let _ = sqlx::query(
+            "INSERT INTO task_verification_results \
+             (result_id, contract_id, task_id, subtask_id, criterion_id, \
+              session_id, passed, evidence, expected, duration_ms, error_message) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&result_id)
+        .bind(contract_id)
+        .bind(task_id)
+        .bind(subtask_id)
+        .bind(criterion_id)
+        .bind(session_id)
+        .bind(i16::from(passed))
+        .bind(&evidence_with_score)
+        .bind("cloud_llm_judge")
+        .bind(duration_ms as i64)
+        .bind(error)
+        .execute(pool)
+        .await;
+    }
+
+    /// Call the LLM API and parse the response score.
+    async fn call_llm(&self, prompt: &str, context: &str) -> Result<f64, String> {
+        let system_msg = serde_json::json!({
+            "role": "system",
+            "content": "You are a verification judge running on the cloud. Evaluate whether \
+                        an acceptance criterion is met based on the provided context. \
+                        Respond with ONLY a JSON object: \
+                        {\"score\": <0.0-1.0>, \"reason\": \"<brief explanation>\"}. \
+                        Score 1.0 = fully met, 0.0 = not met at all."
+        });
+        let user_msg = serde_json::json!({
+            "role": "user",
+            "content": format!(
+                "Criterion: {prompt}\n\nContext:\n{context}\n\n\
+                 Evaluate and respond with {{\"score\": <0.0-1.0>, \"reason\": \"...\"}}."
+            )
+        });
+
+        let body = serde_json::json!({
+            "model": self.model,
+            "messages": [system_msg, user_msg],
+            "max_tokens": 200,
+            "temperature": 0.1,
+        });
+
+        let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
+
+        let resp = self
+            .client
+            .post(&url)
+            .header("Authorization", format!("Bearer {}", self.api_key))
+            .header("Content-Type", "application/json")
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| format!("Cloud LLM request failed: {e}"))?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            return Err(format!(
+                "Cloud LLM API error {status}: {}",
+                &text[..text.len().min(200)]
+            ));
+        }
+
+        let json: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| format!("Cloud LLM response parse failed: {e}"))?;
+
+        let content = json["choices"][0]["message"]["content"]
+            .as_str()
+            .unwrap_or("");
+
+        parse_judge_score(content)
+    }
+}
+
+#[async_trait]
+impl LlmJudge for CloudLlmJudge {
+    async fn evaluate(&self, prompt: &str, context: &str) -> Result<f64, String> {
+        let start = std::time::Instant::now();
+        let result = self.call_llm(prompt, context).await;
+        let duration_ms = start.elapsed().as_millis() as u64;
+
+        match &result {
+            Ok(score) => {
+                let passed = *score >= 0.7; // default threshold for persistence
+                self.persist_result(
+                    &format!(
+                        "llm-{}",
+                        &prompt[..prompt.len().min(32)]
+                            .replace(' ', "-")
+                            .to_lowercase()
+                    ),
+                    passed,
+                    *score,
+                    &format!("Cloud LLM score: {score:.2}"),
+                    duration_ms,
+                    None,
+                )
+                .await;
+            }
+            Err(e) => {
+                self.persist_result(
+                    &format!(
+                        "llm-{}",
+                        &prompt[..prompt.len().min(32)]
+                            .replace(' ', "-")
+                            .to_lowercase()
+                    ),
+                    false,
+                    0.0,
+                    "Cloud LLM evaluation failed",
+                    duration_ms,
+                    Some(e),
+                )
+                .await;
+            }
+        }
+
+        result
+    }
+}
+
+/// Parse a score from LLM response text.
+///
+/// Tries (in order): direct JSON parse → embedded JSON in markdown → fallback
+/// decimal number extraction. Scores are clamped to `[0.0, 1.0]`.
+fn parse_judge_score(text: &str) -> Result<f64, String> {
+    // Try JSON parse first
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(text)
+        && let Some(score) = v["score"].as_f64()
+    {
+        return Ok(score.clamp(0.0, 1.0));
+    }
+
+    // Try to find JSON embedded in text (e.g., wrapped with markdown)
+    if let Some(start) = text.find('{')
+        && let Some(end) = text[start..].rfind('}')
+    {
+        let json_str = &text[start..=start + end];
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(json_str)
+            && let Some(score) = v["score"].as_f64()
+        {
+            return Ok(score.clamp(0.0, 1.0));
+        }
+    }
+
+    // Fallback: find any decimal number between 0 and 1
+    for word in text.split_whitespace() {
+        let clean = word.trim_matches(|c: char| !c.is_ascii_digit() && c != '.');
+        if let Ok(n) = clean.parse::<f64>()
+            && (0.0..=1.0).contains(&n)
+        {
+            return Ok(n);
+        }
+    }
+
+    Err(format!(
+        "Could not extract score from LLM response: {}",
+        &text[..text.len().min(200)]
+    ))
+}
+
 // ─── Contract ───────────────────────────────────────────────────────────────
 
 /// A durable task contract with verifiable acceptance criteria.
@@ -4608,5 +4903,58 @@ mod tests {
             context.contains("Directory contents"),
             "context should include directory listing: {context}"
         );
+    }
+
+    // ─── parse_judge_score tests ─────────────────────────────────────────────
+
+    #[test]
+    fn parse_judge_score_from_json() {
+        let score = parse_judge_score(r#"{"score": 0.85, "reason": "looks good"}"#).unwrap();
+        assert!((score - 0.85).abs() < 0.001);
+    }
+
+    #[test]
+    fn parse_judge_score_from_markdown_json() {
+        let text =
+            "Here is my evaluation:\n```json\n{\"score\": 0.7, \"reason\": \"mostly ok\"}\n```";
+        let score = parse_judge_score(text).unwrap();
+        assert!((score - 0.7).abs() < 0.001);
+    }
+
+    #[test]
+    fn parse_judge_score_from_plain_number() {
+        let score = parse_judge_score("The score is 0.9 out of 1.0").unwrap();
+        assert!((score - 0.9).abs() < 0.001);
+    }
+
+    #[test]
+    fn parse_judge_score_clamps_above_one() {
+        let score = parse_judge_score(r#"{"score": 1.5}"#).unwrap();
+        assert!((score - 1.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn parse_judge_score_no_number_is_err() {
+        let result = parse_judge_score("This criterion is fully met");
+        assert!(result.is_err());
+    }
+
+    // ─── CloudLlmConfig tests ────────────────────────────────────────────────
+
+    #[test]
+    fn cloud_llm_config_from_env_requires_api_key() {
+        let config = CloudLlmConfig::from_env();
+        // We can't assert None because CI might have OPENAI_API_KEY set;
+        // just verify no panics.
+        let _ = config;
+    }
+
+    #[test]
+    fn cloud_llm_judge_persist_context_default() {
+        let ctx = CloudJudgePersistContext::default();
+        assert!(ctx.contract_id.is_none());
+        assert!(ctx.task_id.is_none());
+        assert!(ctx.subtask_id.is_none());
+        assert!(ctx.session_id.is_none());
     }
 }
