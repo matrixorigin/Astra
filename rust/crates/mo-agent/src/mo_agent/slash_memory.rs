@@ -44,6 +44,52 @@ fn eprint_plan_json_parse_failed(full_text: &str, err: &str) {
     );
 }
 
+/// Show a colored diff between old and new plan.
+fn eprint_plan_diff(old: &plan_decompose::TaskPlan, new: &plan_decompose::TaskPlan) {
+    use std::collections::HashMap;
+    let old_map: HashMap<&str, &plan_decompose::SubtaskPlan> =
+        old.subtasks.iter().map(|s| (s.id.as_str(), s)).collect();
+    let new_map: HashMap<&str, &plan_decompose::SubtaskPlan> =
+        new.subtasks.iter().map(|s| (s.id.as_str(), s)).collect();
+
+    let mut has_changes = false;
+
+    // Removed subtasks
+    for st in &old.subtasks {
+        if !new_map.contains_key(st.id.as_str()) {
+            eprintln!("  {} {}", "-".red(), format!("{} {}", st.id, st.title).red());
+            has_changes = true;
+        }
+    }
+    // Added subtasks
+    for st in &new.subtasks {
+        if !old_map.contains_key(st.id.as_str()) {
+            eprintln!("  {} {}", "+".green(), format!("{} {}", st.id, st.title).green());
+            has_changes = true;
+        }
+    }
+    // Modified subtasks
+    for st in &new.subtasks {
+        if let Some(old_st) = old_map.get(st.id.as_str()) {
+            let changed = st.title != old_st.title
+                || st.description != old_st.description
+                || st.files != old_st.files
+                || st.effort != old_st.effort;
+            if changed {
+                eprintln!("  {} {}", "~".yellow(), format!("{} {}", st.id, st.title).dim());
+                if st.title != old_st.title {
+                    eprintln!("      title: {} → {}", old_st.title.as_str().red(), st.title.as_str().green());
+                }
+                has_changes = true;
+            }
+        }
+    }
+
+    if !has_changes {
+        eprintln!("  {}", "(no structural changes)".dim());
+    }
+}
+
 /// Render a formatted plan string line-by-line with progressive reveal animation.
 fn eprint_plan_progressive(formatted: &str) {
     use std::io::Write;
@@ -2057,13 +2103,16 @@ pub async fn handle_plan_mode_input(
             // Try to parse plan update from LLM response
             let plan_updated = if !full_text.is_empty() {
                 match parse_plan_response(&full_text) {
-                    Ok(plan) => {
-                        plan_state.set_plan(plan.clone());
+                    Ok(new_plan) => {
+                        let old_plan = plan_state.plan.clone();
+                        plan_state.set_plan(new_plan.clone());
                         plan_state.modified = true;
                         let _ = plan_state.save_to_file(&PlanModeState::state_path());
                         eprintln!("{}  Plan updated!", "✓".green());
                         eprintln!();
-                        eprint_plan_progressive(&format_plan(&plan));
+                        eprint_plan_diff(&old_plan, &new_plan);
+                        eprintln!();
+                        eprint_plan_progressive(&format_plan(&new_plan));
                         true
                     }
                     Err(_) => false, // No valid plan JSON — treat as conversational response

@@ -84,3 +84,4 @@ review/
 # VCR cassettes (optional - commit them for CI)
 # fixtures/vcr_cassettes/*.yaml
 *.spec
+.mo-session/
