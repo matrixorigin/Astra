@@ -11,6 +11,7 @@ use std::{
     env, fs,
     path::{Path, PathBuf},
     process::{Command, Stdio},
+    sync::atomic::{AtomicBool, Ordering},
     time::Duration,
 };
 
@@ -36,6 +37,8 @@ mod git_gix;
 mod github;
 #[path = "edge_tools/mo_tools.rs"]
 mod mo_tools;
+#[path = "edge_tools/passive_cargo_check.rs"]
+mod passive_cargo_check;
 #[path = "edge_tools/shell.rs"]
 mod shell;
 
@@ -1108,6 +1111,9 @@ pub struct ToolExecutor {
     /// Returns cached response for repeated fetches within TTL (15 minutes).
     /// Prevents wasting tokens re-fetching the same documentation pages.
     url_cache: std::sync::Mutex<HashMap<String, (String, std::time::Instant)>>,
+    /// After a `.rs` file is written under a Rust workspace, set so the next
+    /// `/chat` turn with `tool_results` can run passive `cargo check` and inject diagnostics.
+    passive_cargo_pending: AtomicBool,
 }
 
 /// Extract owner/repo from git remote URLs in the given directory.
@@ -1182,6 +1188,7 @@ impl ToolExecutor {
             file_state: std::sync::Mutex::new(HashMap::new()),
             aggregate_output_bytes: std::sync::atomic::AtomicUsize::new(0),
             url_cache: std::sync::Mutex::new(HashMap::new()),
+            passive_cargo_pending: AtomicBool::new(false),
         }
     }
 
@@ -1190,6 +1197,21 @@ impl ToolExecutor {
         self.cloud_base = Some(base.into());
         self.cloud_token = Some(token.into());
         self
+    }
+
+    /// Run passive `cargo check` if a Rust file was edited and this turn includes tool results;
+    /// returns extra `messages` entries to merge into the chat payload.
+    pub(crate) async fn take_passive_workspace_diagnostic_messages(
+        &self,
+        project_root: &Path,
+        tool_results_nonempty: bool,
+    ) -> Vec<Value> {
+        passive_cargo_check::take_passive_cargo_messages(
+            &self.passive_cargo_pending,
+            project_root,
+            tool_results_nonempty,
+        )
+        .await
     }
 
     /// Add a preferred repo for disambiguation (e.g. from memory or recent usage).
@@ -1287,6 +1309,9 @@ impl ToolExecutor {
     /// Record file state after a write/edit (full content known).
     /// Uses from_read=false to distinguish from reads — dedup won't fire after writes.
     fn record_write(&self, path: &Path) {
+        if passive_cargo_check::should_schedule_passive_cargo(&self.project_root, path) {
+            self.passive_cargo_pending.store(true, Ordering::SeqCst);
+        }
         let ts = Self::file_mtime_ms(path);
         if let Ok(mut state) = self.file_state.lock() {
             state.insert(

@@ -32,7 +32,7 @@ base64.workspace = true
 sqlx.workspace = true
 termimad = "0.23"
 thiserror.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["macros", "net", "process", "rt-multi-thread", "signal"] }
 uuid.workspace = true
 gix = { version = "0.81.0", features = ["status", "blame", "mailmap", "revision"] }
 tree-sitter = "0.24"

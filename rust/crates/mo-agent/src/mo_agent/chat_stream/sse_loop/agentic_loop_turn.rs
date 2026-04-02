@@ -111,6 +111,24 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
     let active_skills = detect_active_system_skills_in_message(ctx.message);
     merge_active_skills_into_edge_profile(&mut payload, &active_skills);
 
+    let passive_msgs = ctx
+        .executor
+        .take_passive_workspace_diagnostic_messages(
+            ctx.project_root,
+            !ctx.tool_results.is_empty(),
+        )
+        .await;
+    if !passive_msgs.is_empty() {
+        if let Some(root) = payload.as_object_mut()
+            && let Some(messages) = root.get_mut("messages")
+            && let Some(arr) = messages.as_array_mut()
+        {
+            for m in passive_msgs {
+                arr.push(m);
+            }
+        }
+    }
+
     let budget_pressure = {
         let schema_tokens = ctx.selector.registry().total_pinned_token_cost();
         budget_pressure_for_chat_turn(ctx.messages, ctx.model, schema_tokens as usize)
