@@ -348,13 +348,23 @@ pub(super) async fn handle_state_command(
                     }
                 }
 
-                let context_entry = (
-                    String::new(),
-                    format!("[Prior context — {trimmed_count} turns compacted]\n\n{summary}"),
+                let anchor = crate::repl_turn::fetch_compact_memory_anchor_snippet(
+                    api,
+                    tok,
+                    state.session_id.as_deref(),
+                    &summary,
+                )
+                .await;
+                let assistant_text = crate::repl_turn::compact_assistant_message(
+                    trimmed_count,
+                    &summary,
+                    anchor.as_deref(),
                 );
+                let context_entry = (String::new(), assistant_text);
                 let mut new_hist = vec![context_entry];
                 new_hist.extend_from_slice(&state.history[trimmed_count..]);
                 state.history = new_hist;
+                state.recent_tools.clear();
             }
 
             // Print the summary box
@@ -387,6 +397,13 @@ pub(super) async fn handle_state_command(
                 state.history.len(),
                 mem_note,
             );
+            if state.plan_mode.is_some() || state.executing_plan.is_some() {
+                eprintln!(
+                    "{}",
+                    "  Tip: Plan context was shortened — if steps feel stale, refresh `/plan` or your plan view."
+                        .dim()
+                );
+            }
             // Journal: log compact event
             if let Some(ref j) = state.journal {
                 let _ = j.append(&session_journal::JournalEvent::compact(

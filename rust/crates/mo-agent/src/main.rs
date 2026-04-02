@@ -495,10 +495,11 @@ struct ReplState {
     pattern_library: Option<
         std::sync::Arc<std::sync::Mutex<mo_agent_runtime::pipeline::pattern::PatternLibrary>>,
     >,
-    /// Shared entity graph for learning feedback loop.
-    entity_graph:
-        Option<std::sync::Arc<std::sync::Mutex<mo_agent_runtime::pipeline::entity::EntityGraph>>>,
-    /// Shared calibrator for learning feedback loop.
+    /// Shared entity graph (learning feedback loop + post-login cloud pull).
+    entity_graph: Option<
+        std::sync::Arc<std::sync::Mutex<mo_agent_runtime::pipeline::entity::EntityGraph>>,
+    >,
+    /// Shared calibrator (learning feedback loop + post-login cloud pull).
     calibrator: Option<
         std::sync::Arc<
             std::sync::Mutex<mo_agent_runtime::pipeline::calibration::ProgressiveCalibrator>,
@@ -2392,6 +2393,8 @@ fn merge_learning_snapshot(
 struct CloudPullResult {
     tool_health: Vec<mo_agent_runtime::pipeline::persistence::ToolHealthEntry>,
     version: Option<i64>,
+    /// True when MatrixOne was reachable and versioned pull was attempted (may return no row).
+    cloud_reachable: bool,
 }
 
 /// Try to pull learning state from MatrixOne and merge into live modules.
@@ -2415,6 +2418,7 @@ async fn try_cloud_pull(
             return CloudPullResult {
                 tool_health: Vec::new(),
                 version: None,
+                cloud_reachable: false,
             };
         }
     };
@@ -2442,17 +2446,20 @@ async fn try_cloud_pull(
             CloudPullResult {
                 tool_health: cloud_health,
                 version: Some(versioned.version),
+                cloud_reachable: true,
             }
         }
         Ok(None) => CloudPullResult {
             tool_health: Vec::new(),
             version: None,
+            cloud_reachable: true,
         },
         Err(e) => {
             eprintln!("{}", format!("  ⚠ Cloud pull skipped: {e}").dim());
             CloudPullResult {
                 tool_health: Vec::new(),
                 version: None,
+                cloud_reachable: true,
             }
         }
     }
@@ -2659,11 +2666,11 @@ async fn try_cloud_push_delta(
 }
 
 /// Pull user preferences from cloud at session start.
-/// Merges cloud preferences into local state (cloud-wins).
-async fn try_cloud_pull_preferences(state: &mut ReplState) {
+/// Merges cloud preferences into local state (cloud-wins). Returns keys merged (for journal audit).
+async fn try_cloud_pull_preferences(state: &mut ReplState) -> Vec<String> {
     let pool = match try_connect_matrixone().await {
         Some(p) => p,
-        None => return,
+        None => return Vec::new(),
     };
     let svc = mo_agent_services::state_sync::MatrixOneSyncService::new(pool);
     let user_id = std::env::var("MO_USER_ID").unwrap_or_else(|_| "local".to_string());
@@ -2672,6 +2679,7 @@ async fn try_cloud_pull_preferences(state: &mut ReplState) {
     {
         Ok(prefs) if !prefs.is_empty() => {
             use mo_agent_services::state_sync::pref_keys;
+            let keys: Vec<String> = prefs.iter().map(|(k, _)| k.clone()).collect();
             for (key, value) in &prefs {
                 if key.as_str() == pref_keys::EXPLAIN_MODE {
                     state.explain = match value.as_str() {
@@ -2685,12 +2693,101 @@ async fn try_cloud_pull_preferences(state: &mut ReplState) {
                 "{}",
                 format!("  ✓ Pulled {} preferences from cloud", prefs.len()).dim()
             );
+            keys
         }
-        Ok(_) => {} // no cloud prefs yet
+        Ok(_) => Vec::new(), // no cloud prefs yet
         Err(e) => {
             eprintln!("{}", format!("  ⚠ Preference pull skipped: {e}").dim());
+            Vec::new()
         }
     }
+}
+
+fn cloud_pull_warrants_sync_marker(pull: &CloudPullResult, pref_keys: &[String]) -> bool {
+    pull.cloud_reachable
+        && (pull.version.is_some()
+            || !pull.tool_health.is_empty()
+            || !pref_keys.is_empty())
+}
+
+/// When set to `1`, `repl_startup` also journals a sync marker if MatrixOne was reachable but
+/// returned no learning rows, tool health, or preferences (audit / connectivity proof).
+const MO_JOURNAL_CLOUD_EMPTY_ACK: &str = "MO_JOURNAL_CLOUD_EMPTY_ACK";
+
+fn cloud_pull_empty_ack_desired_for_source(source: &str) -> bool {
+    if source == "post_login" {
+        return true;
+    }
+    std::env::var(MO_JOURNAL_CLOUD_EMPTY_ACK).ok().as_deref() == Some("1")
+}
+
+fn should_append_cloud_pull_journal(
+    pull: &CloudPullResult,
+    pref_keys: &[String],
+    source: &str,
+) -> bool {
+    if !pull.cloud_reachable {
+        return false;
+    }
+    if cloud_pull_warrants_sync_marker(pull, pref_keys) {
+        return true;
+    }
+    cloud_pull_empty_ack_desired_for_source(source)
+}
+
+fn append_cloud_pull_sync_journal(
+    state: &ReplState,
+    profile: &str,
+    source: &str,
+    pull: &CloudPullResult,
+    pref_keys: &[String],
+) {
+    if !should_append_cloud_pull_journal(pull, pref_keys, source) {
+        return;
+    }
+    let Some(sid) = state.session_id.as_deref() else {
+        return;
+    };
+    let reachable_empty_ack =
+        pull.cloud_reachable && !cloud_pull_warrants_sync_marker(pull, pref_keys);
+    let evt = session_journal::JournalEvent::cloud_pull_sync_marker(
+        Some(sid),
+        profile,
+        source,
+        pull.version,
+        pull.version.is_some(),
+        pull.tool_health.len(),
+        pref_keys,
+        reachable_empty_ack,
+    );
+    let Ok(writer) = session_journal::JournalWriter::new(sid) else {
+        return;
+    };
+    if writer.append(&evt).is_ok() {
+        repl_turn::enqueue_ingestion_pub(state, &evt);
+    }
+}
+
+pub(crate) async fn post_auth_cloud_resync(profile: Option<&str>, state: &mut ReplState) {
+    let profile_name = profile.unwrap_or("default");
+    let (Some(eg), Some(pl), Some(cal)) = (
+        state.entity_graph.as_ref(),
+        state.pattern_library.as_ref(),
+        state.calibrator.as_ref(),
+    ) else {
+        return;
+    };
+    let pull = try_cloud_pull(profile_name, eg, pl, cal).await;
+    state.cloud_learning_version = pull.version.or(state.cloud_learning_version);
+    if !pull.tool_health.is_empty() {
+        let (merged, _, _) = mo_agent_runtime::pipeline::persistence::merge_tool_health(
+            &state.tool_health_entries,
+            &pull.tool_health,
+        );
+        state.tool_health_entries = merged;
+    }
+    let pref_keys = try_cloud_pull_preferences(state).await;
+    append_cloud_pull_sync_journal(state, profile_name, "post_login", &pull, &pref_keys);
 }
 
 /// Push user preferences to cloud at session end.
@@ -3048,7 +3145,7 @@ async fn handle_slash_command(
         }
 
         "/register" | "/login" | "/logout" | "/memory-setup" => {
-            handle_account_command(cmd, arg, api, profile).await?;
+            handle_account_command(cmd, arg, api, profile, state).await?;
         }
 
         "/clear" | "/explain" | "/verbose" | "/compact" | "/reflect" => {
@@ -3179,9 +3276,8 @@ async fn run_chat_repl(
     );
 
     // Load cross-session learning state (entity graph, patterns, calibration, tool health)
-    let mut cross_session_health_entries;
-    {
-        let profile_name = profile.unwrap_or("default");
+    let profile_name = profile.unwrap_or("default");
+    let (cross_session_health_entries, cloud_pull_result, pref_keys_after_pull) = {
         let loaded = mo_agent_runtime::pipeline::persistence::load_learning_state(
             profile_name,
             &pipeline_modules.entity_graph,
@@ -3192,7 +3288,7 @@ async fn run_chat_repl(
             eprintln!("{}", "  ✓ Loaded learning state from prior sessions".dim());
         }
         // Load tool health for cross-session error budgets
-        cross_session_health_entries =
+        let mut cross_session_health_entries =
             mo_agent_runtime::pipeline::persistence::load_tool_health(profile_name);
         state.synced_tool_health_entries =
             mo_agent_runtime::pipeline::persistence::load_synced_tool_health(profile_name);
@@ -3239,8 +3335,13 @@ async fn run_chat_repl(
             }
         }
         // Try to pull user preferences from cloud
-        try_cloud_pull_preferences(&mut state).await;
-    }
+        let pref_keys = try_cloud_pull_preferences(&mut state).await;
+        (
+            cross_session_health_entries,
+            cloud_pull_result,
+            pref_keys,
+        )
+    };
     state.tool_health_entries = cross_session_health_entries.clone();
     if state.synced_tool_health_entries.is_empty() {
         state.synced_tool_health_entries = cross_session_health_entries;
@@ -3281,7 +3382,15 @@ async fn run_chat_repl(
     state.skill_registry = pipeline_modules.skill_registry.clone();
     state.mcp_manager = pipeline_modules.mcp_manager.clone();
 
-    let profile_name_str = profile.unwrap_or("default").to_string();
+    append_cloud_pull_sync_journal(
+        &state,
+        profile_name,
+        "repl_startup",
+        &cloud_pull_result,
+        &pref_keys_after_pull,
+    );
+
+    let profile_name_str = profile_name.to_string();
 
     // Pre-flight: check if server has any LLM models configured
     if let Some(token) = current_access_token(profile) {
@@ -3901,6 +4010,24 @@ mod tests {
         );
         assert_eq!(messages[1]["role"], "user");
         assert_eq!(messages[2]["role"], "assistant");
+    }
+
+    #[test]
+    fn compact_assistant_message_optional_session_memory_anchor() {
+        let with_anchor = repl_turn::compact_assistant_message(
+            3,
+            "Summary body",
+            Some("- [fact] one\n- [fact] two"),
+        );
+        assert!(with_anchor.contains("[Session memory anchor]"));
+        assert!(with_anchor.contains("[fact] one"));
+        assert!(with_anchor.contains("[Prior context — 3 turns compacted]"));
+        assert!(with_anchor.contains("Summary body"));
+
+        let no_anchor = repl_turn::compact_assistant_message(2, "Only summary", None);
+        assert!(!no_anchor.contains("[Session memory anchor]"));
+        assert!(no_anchor.contains("[Prior context — 2 turns compacted]"));
+        assert!(no_anchor.contains("Only summary"));
     }
 
     #[test]
@@ -5492,6 +5619,147 @@ total_tokens_out: 500
         );
     }
 
+    #[test]
+    fn cloud_pull_warrants_sync_marker_only_when_reachable_and_nonempty() {
+        let dead = CloudPullResult {
+            tool_health: Vec::new(),
+            version: None,
+            cloud_reachable: false,
+        };
+        assert!(!cloud_pull_warrants_sync_marker(&dead, &[]));
+        let offline_version = CloudPullResult {
+            tool_health: Vec::new(),
+            version: Some(9),
+            cloud_reachable: false,
+        };
+        assert!(!cloud_pull_warrants_sync_marker(&offline_version, &[]));
+        let online_empty = CloudPullResult {
+            tool_health: Vec::new(),
+            version: None,
+            cloud_reachable: true,
+        };
+        assert!(!cloud_pull_warrants_sync_marker(&online_empty, &[]));
+        let online_version = CloudPullResult {
+            tool_health: Vec::new(),
+            version: Some(3),
+            cloud_reachable: true,
+        };
+        assert!(cloud_pull_warrants_sync_marker(&online_version, &[]));
+        assert!(cloud_pull_warrants_sync_marker(
+            &online_empty,
+            &["explain_mode".into()]
+        ));
+    }
+
+    #[test]
+    fn should_append_cloud_pull_journal_post_login_reachable_empty() {
+        let pull = CloudPullResult {
+            tool_health: Vec::new(),
+            version: None,
+            cloud_reachable: true,
+        };
+        assert!(should_append_cloud_pull_journal(&pull, &[], "post_login"));
+    }
+
+    #[test]
+    fn should_append_cloud_pull_journal_repl_startup_empty_without_env() {
+        let pull = CloudPullResult {
+            tool_health: Vec::new(),
+            version: None,
+            cloud_reachable: true,
+        };
+        assert!(!should_append_cloud_pull_journal(&pull, &[], "repl_startup"));
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn should_append_repl_startup_when_empty_ack_env_set() {
+        let pull = CloudPullResult {
+            tool_health: Vec::new(),
+            version: None,
+            cloud_reachable: true,
+        };
+        unsafe {
+            std::env::remove_var(super::MO_JOURNAL_CLOUD_EMPTY_ACK);
+        }
+        assert!(!should_append_cloud_pull_journal(&pull, &[], "repl_startup"));
+        unsafe {
+            std::env::set_var(super::MO_JOURNAL_CLOUD_EMPTY_ACK, "1");
+        }
+        assert!(should_append_cloud_pull_journal(&pull, &[], "repl_startup"));
+        unsafe {
+            std::env::remove_var(super::MO_JOURNAL_CLOUD_EMPTY_ACK);
+        }
+    }
+
+    #[test]
+    fn append_cloud_pull_sync_journal_skips_without_session_id() {
+        let pull = CloudPullResult {
+            tool_health: Vec::new(),
+            version: Some(1),
+            cloud_reachable: true,
+        };
+        let state = ReplState::default();
+        append_cloud_pull_sync_journal(&state, "default", "repl_startup", &pull, &[]);
+    }
+
+    #[test]
+    fn append_cloud_pull_sync_journal_writes_sync_marker_jsonl() {
+        let sid = format!("test-cloud-pull-journal-{}", uuid::Uuid::new_v4());
+        let mut state = ReplState::default();
+        state.session_id = Some(sid.clone());
+        let pull = CloudPullResult {
+            tool_health: Vec::new(),
+            version: Some(99),
+            cloud_reachable: true,
+        };
+        let prefs = vec!["explain_mode".to_string()];
+        append_cloud_pull_sync_journal(&state, "work", "repl_startup", &pull, &prefs);
+        let events = session_journal::read_journal(&sid).expect("read journal");
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].event_type,
+            session_journal::JournalEventType::SyncMarker
+        );
+        let cp = events[0]
+            .metadata
+            .as_ref()
+            .and_then(|m| m.get("cloud_pull"))
+            .expect("cloud_pull");
+        assert_eq!(cp.get("profile").and_then(|v| v.as_str()), Some("work"));
+        assert_eq!(cp.get("learning_version").and_then(|v| v.as_i64()), Some(99));
+        assert_eq!(
+            cp.get("reachable_empty_ack").and_then(|v| v.as_bool()),
+            Some(false)
+        );
+        std::fs::remove_file(session_journal::journal_file_path(&sid)).ok();
+    }
+
+    #[test]
+    fn append_cloud_pull_post_login_reachable_empty_writes_marker() {
+        let sid = format!("test-cloud-pull-empty-{}", uuid::Uuid::new_v4());
+        let mut state = ReplState::default();
+        state.session_id = Some(sid.clone());
+        let pull = CloudPullResult {
+            tool_health: Vec::new(),
+            version: None,
+            cloud_reachable: true,
+        };
+        append_cloud_pull_sync_journal(&state, "default", "post_login", &pull, &[]);
+        let events = session_journal::read_journal(&sid).expect("read journal");
+        assert_eq!(events.len(), 1);
+        let cp = events[0]
+            .metadata
+            .as_ref()
+            .and_then(|m| m.get("cloud_pull"))
+            .expect("cloud_pull");
+        assert_eq!(
+            cp.get("reachable_empty_ack").and_then(|v| v.as_bool()),
+            Some(true)
+        );
+        std::fs::remove_file(session_journal::journal_file_path(&sid)).ok();
+    }
+
     #[tokio::test]
     async fn try_cloud_pull_returns_empty_without_matrixone() {
         unsafe {
@@ -5514,6 +5782,10 @@ total_tokens_out: 500
         assert!(
             result.version.is_none(),
             "Without MatrixOne, cloud pull should return no version"
+        );
+        assert!(
+            !result.cloud_reachable,
+            "Without MatrixOne, cloud should be unreachable"
         );
     }
 
@@ -5567,7 +5839,8 @@ total_tokens_out: 500
         }
         let mut state = ReplState::default();
         // Should not panic (was the original bug)
-        try_cloud_pull_preferences(&mut state).await;
+        let keys = try_cloud_pull_preferences(&mut state).await;
+        assert!(keys.is_empty());
     }
 
     #[tokio::test]

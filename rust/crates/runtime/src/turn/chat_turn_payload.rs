@@ -83,6 +83,44 @@ pub fn merge_skill_instructions_into_edge_profile(payload: &mut Value, instructi
     }
 }
 
+/// Deduped skill names that affected this `/chat` request: selector-chosen registry skills,
+/// message-detected system skills ([`super::chat_turn_edge_profile::detect_active_system_skills_in_message`]),
+/// and registry skills whose instruction bodies were merged successfully.
+pub fn merge_invoked_skills_into_edge_profile(payload: &mut Value, invoked_skills: &[String]) {
+    if invoked_skills.is_empty() {
+        return;
+    }
+    if let Some(root) = payload.as_object_mut()
+        && let Some(ep) = root.get_mut("edge_profile")
+        && let Some(ep_obj) = ep.as_object_mut()
+    {
+        ep_obj.insert(
+            "invoked_skills".to_string(),
+            json!(invoked_skills),
+        );
+    }
+}
+
+/// Shallow-merge top-level keys from `extensions` into `edge_profile` (cloud–edge audit / lineage).
+///
+/// `extensions` must be a JSON object. Non-object values are ignored.
+pub fn merge_edge_profile_extensions(payload: &mut Value, extensions: &Value) {
+    let Some(ext_obj) = extensions.as_object() else {
+        return;
+    };
+    if ext_obj.is_empty() {
+        return;
+    }
+    if let Some(root) = payload.as_object_mut()
+        && let Some(ep) = root.get_mut("edge_profile")
+        && let Some(ep_obj) = ep.as_object_mut()
+    {
+        for (k, v) in ext_obj {
+            ep_obj.insert(k.clone(), v.clone());
+        }
+    }
+}
+
 /// Dynamic tool schemas for this turn (`edge_tools`).
 pub fn set_payload_edge_tools(payload: &mut Value, schemas: Vec<Value>) {
     if let Some(obj) = payload.as_object_mut() {
@@ -200,6 +238,51 @@ mod tests {
                 .unwrap()
                 .get("skill_instructions")
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn merge_invoked_skills_into_edge_profile_inserts_array() {
+        let mut p = json!({ "edge_profile": {} });
+        merge_invoked_skills_into_edge_profile(&mut p, &["markdown".into(), "bash".into()]);
+        assert_eq!(
+            p["edge_profile"]["invoked_skills"],
+            json!(["markdown", "bash"])
+        );
+    }
+
+    #[test]
+    fn merge_invoked_skills_no_op_when_empty() {
+        let mut p = json!({ "edge_profile": {} });
+        merge_invoked_skills_into_edge_profile(&mut p, &[]);
+        assert!(
+            p["edge_profile"]
+                .as_object()
+                .unwrap()
+                .get("invoked_skills")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn merge_edge_profile_extensions_merges_objects() {
+        let mut p = json!({ "edge_profile": { "cwd": "/tmp", "k": 1 } });
+        merge_edge_profile_extensions(
+            &mut p,
+            &json!({
+                "session_lineage": { "parent_session_id": "abc" },
+                "edge_policy": { "permission_mode": "prompt" }
+            }),
+        );
+        assert_eq!(p["edge_profile"]["cwd"], "/tmp");
+        assert_eq!(p["edge_profile"]["k"], 1);
+        assert_eq!(
+            p["edge_profile"]["session_lineage"]["parent_session_id"],
+            "abc"
+        );
+        assert_eq!(
+            p["edge_profile"]["edge_policy"]["permission_mode"],
+            "prompt"
         );
     }
 

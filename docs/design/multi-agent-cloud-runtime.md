@@ -148,6 +148,32 @@ rust/crates/
 └── checkpoints/         # Numbered checkpoint snapshots
 ```
 
+#### Journal: `sync_marker` after MatrixOne cloud pull
+
+When the CLI pulls **learning** (versioned snapshot) and/or **preferences** from MatrixOne, it may append a `JournalEvent` of type **`sync_marker`** to `~/.mo-agent/sessions/{session_id}.jsonl`. Structured fields live under **`metadata.cloud_pull`**.
+
+| Field | Meaning |
+|-------|---------|
+| `profile` | Credential profile name (e.g. `default`) |
+| `source` | `repl_startup` (REPL init, after cloud pull + prefs) or `post_login` (after successful `/login` or register→auto-login) |
+| `learning_version` | Cloud row version after pull, if any |
+| `learning_snapshot_merged` | Whether a versioned learning snapshot was merged in that pull |
+| `tool_health_rows_from_cloud` | Number of tool-health entries carried in that pull payload |
+| `preference_keys_merged` | Preference keys applied locally (cloud-wins merge) |
+| `reachable_empty_ack` | `true` when MatrixOne was **reachable** but **nothing** was merged (no version, no tool-health rows, no preference keys) — records **connectivity / empty-cloud** for audit |
+
+**When a line is written**
+
+1. **Substantive pull** (reachable and at least one of: learning `version`, non-empty tool health from snapshot, or non-empty preference keys): append with `reachable_empty_ack: false` (requires a **session id** and writable journal).
+2. **`post_login` + reachable + empty**: still append, with **`reachable_empty_ack: true`** — infrequent, ties auth refresh to a successful cloud round-trip.
+3. **`repl_startup` + reachable + empty**: by default **omit** (avoids noise on every REPL open). Opt in with environment variable **`MO_JOURNAL_CLOUD_EMPTY_ACK=1`** to append the same empty-ack marker as in (2).
+
+The human-readable `user_input` line on the event includes `cloud_pull`, profile, version, preference count, and the suffix ` empty_ack` when `reachable_empty_ack` is true (easy `grep`).
+
+When **`matrix_runtime`** is attached, the same event is **enqueued for event ingestion** so `agent_events` metadata can include `cloud_pull` (see `services::event_ingestion.rs`).
+
+**Code**: `mo-agent` `main.rs` — `append_cloud_pull_sync_journal`, `post_auth_cloud_resync`, `should_append_cloud_pull_journal`; `mo-agent-services` `session_journal::JournalEvent::cloud_pull_sync_marker`.
+
 #### Learning State (per-user, per-profile)
 ```rust
 EntityGraph {

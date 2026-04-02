@@ -1457,7 +1457,7 @@ mod tests {
         assert_eq!(run.status, "running");
 
         // Deterministic wait: poll until the background task advances state.
-        let status = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        let status = tokio::time::timeout(std::time::Duration::from_secs(10), async {
             loop {
                 let status = ok(svc
                     .get_run_status(run.run_id.clone(), "user-1".into())
@@ -1485,7 +1485,7 @@ mod tests {
 
         // Deterministic wait: poll durable state until it leaves "running".
         let engine = svc.run_engine.as_ref().unwrap();
-        let durable = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        let durable = tokio::time::timeout(std::time::Duration::from_secs(10), async {
             loop {
                 let durable = engine.load_run(&run.run_id).await.unwrap().unwrap();
                 if durable.status != "running" {

@@ -330,6 +330,40 @@ pub mod state_delta {
     }
 }
 
+/// Parent session linkage when forking or branching a session (edge-local audit + cloud sync).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionLineage {
+    pub parent_session_id: String,
+    /// Last turn number included from the parent at fork time (for replay boundaries).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub forked_after_turn: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+}
+
+/// Correlates this session or event with multi-agent / handoff workflows.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CoordinationMeta {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_role: Option<String>,
+    /// Shared id across forked sessions, sub-agents, or cloud-orchestrated steps.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub correlation_id: Option<String>,
+}
+
+/// Edge permission / cloud policy fingerprint at a point in time (for cloud–edge audit alignment).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EdgePolicySnapshot {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub permission_mode: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cloud_policy_version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rules_fingerprint: Option<String>,
+}
+
 /// Per-tool-call audit record, embedded in turn events for granular tracking.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolCallRecord {
@@ -450,6 +484,15 @@ pub struct JournalEvent {
     /// Memoria search time in milliseconds (subset of context_ms).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub memoria_ms: Option<u64>,
+    /// Fork / branch lineage (also set on `session_fork` events).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_lineage: Option<SessionLineage>,
+    /// Multi-agent or handoff correlation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coordination: Option<CoordinationMeta>,
+    /// Edge policy snapshot for cloud–edge audit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub edge_policy: Option<EdgePolicySnapshot>,
 }
 
 /// Event type discriminator.
@@ -478,6 +521,10 @@ pub enum JournalEventType {
     TurnGuardVerdict,
     /// Plan execution progress (subtask started, completed, plan done).
     PlanProgress,
+    /// Forked from another session — records lineage for audit and sync.
+    SessionFork,
+    /// Cloud–edge policy ack, agent handoff, or other sync metadata (lightweight).
+    SyncMarker,
 }
 
 /// Writer that appends events to a session journal file.
@@ -560,6 +607,12 @@ pub fn list_sessions() -> std::io::Result<Vec<String>> {
     }
     sessions.sort();
     Ok(sessions)
+}
+
+/// Path to the JSONL journal file for a session.
+#[must_use]
+pub fn journal_file_path(session_id: &str) -> PathBuf {
+    journal_dir().join(format!("{session_id}.jsonl"))
 }
 
 /// List local session IDs sorted by file modification time (most recent first).
@@ -789,6 +842,9 @@ impl JournalEvent {
             selector_tokens_in: None,
             selector_tokens_out: None,
             memoria_ms: None,
+            session_lineage: None,
+            coordination: None,
+            edge_policy: None,
         }
     }
 
@@ -796,6 +852,71 @@ impl JournalEvent {
     pub fn session_start(session_id: Option<&str>, model: Option<&str>) -> Self {
         let mut evt = Self::base(JournalEventType::SessionStart, session_id);
         evt.model = model.map(|s| s.to_string());
+        evt
+    }
+
+    /// Record that this session was forked from `lineage.parent_session_id`.
+    pub fn session_fork(
+        session_id: Option<&str>,
+        lineage: SessionLineage,
+        label_note: Option<&str>,
+    ) -> Self {
+        let mut evt = Self::base(JournalEventType::SessionFork, session_id);
+        evt.session_lineage = Some(lineage);
+        if let Some(n) = label_note.filter(|s| !s.is_empty()) {
+            evt.user_input = Some(truncate(n, 200));
+        }
+        evt
+    }
+
+    /// Cloud–edge sync or multi-agent coordination marker (policy version, correlation id, etc.).
+    pub fn sync_marker(
+        session_id: Option<&str>,
+        policy: Option<EdgePolicySnapshot>,
+        coordination: Option<CoordinationMeta>,
+        note: Option<&str>,
+    ) -> Self {
+        let mut evt = Self::base(JournalEventType::SyncMarker, session_id);
+        evt.edge_policy = policy;
+        evt.coordination = coordination;
+        if let Some(n) = note.filter(|s| !s.is_empty()) {
+            evt.user_input = Some(truncate(n, 200));
+        }
+        evt
+    }
+
+    /// After a successful MatrixOne pull of learning / preferences (startup or post-login audit).
+    ///
+    /// Structured fields live under `metadata.cloud_pull` for analytics; `user_input` holds a short
+    /// human-readable summary for export and grep.
+    pub fn cloud_pull_sync_marker(
+        session_id: Option<&str>,
+        profile: &str,
+        source: &str,
+        learning_version: Option<i64>,
+        learning_snapshot_merged: bool,
+        tool_health_rows_from_cloud: usize,
+        preference_keys_merged: &[String],
+        reachable_empty_ack: bool,
+    ) -> Self {
+        let note = format!(
+            "cloud_pull {source} profile={profile} learning_v={:?} prefs={}{}",
+            learning_version,
+            preference_keys_merged.len(),
+            if reachable_empty_ack { " empty_ack" } else { "" }
+        );
+        let mut evt = Self::sync_marker(session_id, None, None, Some(note.as_str()));
+        evt.metadata = Some(serde_json::json!({
+            "cloud_pull": {
+                "profile": profile,
+                "source": source,
+                "learning_version": learning_version,
+                "learning_snapshot_merged": learning_snapshot_merged,
+                "tool_health_rows_from_cloud": tool_health_rows_from_cloud,
+                "preference_keys_merged": preference_keys_merged,
+                "reachable_empty_ack": reachable_empty_ack,
+            }
+        }));
         evt
     }
 
@@ -1081,6 +1202,122 @@ mod tests {
         assert!(json.contains("\"model\":\"gpt-4\""));
         // Shouldn't have null fields
         assert!(!json.contains("\"turn\""));
+    }
+
+    #[test]
+    fn journal_event_session_fork_round_trip() {
+        let lineage = SessionLineage {
+            parent_session_id: "parent-uuid".into(),
+            forked_after_turn: Some(3),
+            label: Some("try plan B".into()),
+        };
+        let evt = JournalEvent::session_fork(Some("child-uuid"), lineage, Some("note"));
+        let json = serde_json::to_string(&evt).unwrap();
+        assert!(json.contains("\"type\":\"session_fork\""));
+        let parsed: JournalEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.event_type, JournalEventType::SessionFork);
+        assert!(parsed.session_lineage.is_some());
+    }
+
+    #[test]
+    fn journal_event_cloud_pull_sync_marker_round_trip() {
+        let keys = vec!["explain_mode".to_string()];
+        let evt = JournalEvent::cloud_pull_sync_marker(
+            Some("sid-1"),
+            "work",
+            "repl_startup",
+            Some(42),
+            true,
+            3,
+            &keys,
+            false,
+        );
+        assert_eq!(evt.event_type, JournalEventType::SyncMarker);
+        let json = serde_json::to_string(&evt).unwrap();
+        assert!(json.contains("\"type\":\"sync_marker\""));
+        assert!(json.contains("\"cloud_pull\""));
+        let parsed: JournalEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.event_type, JournalEventType::SyncMarker);
+        let meta = parsed.metadata.expect("metadata");
+        let cp = meta.get("cloud_pull").expect("cloud_pull");
+        assert_eq!(cp.get("profile").and_then(|v| v.as_str()), Some("work"));
+        assert_eq!(cp.get("source").and_then(|v| v.as_str()), Some("repl_startup"));
+        assert_eq!(cp.get("learning_version").and_then(|v| v.as_i64()), Some(42));
+        assert_eq!(
+            cp.get("learning_snapshot_merged").and_then(|v| v.as_bool()),
+            Some(true)
+        );
+        assert_eq!(
+            cp.get("tool_health_rows_from_cloud").and_then(|v| v.as_u64()),
+            Some(3)
+        );
+        let pref = cp
+            .get("preference_keys_merged")
+            .and_then(|v| v.as_array())
+            .expect("prefs array");
+        assert_eq!(pref.len(), 1);
+        assert_eq!(pref[0].as_str(), Some("explain_mode"));
+        assert_eq!(
+            cp.get("reachable_empty_ack").and_then(|v| v.as_bool()),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn journal_event_cloud_pull_sync_marker_empty_ack_round_trip() {
+        let evt = JournalEvent::cloud_pull_sync_marker(
+            Some("s-empty"),
+            "default",
+            "post_login",
+            None,
+            false,
+            0,
+            &[],
+            true,
+        );
+        let json = serde_json::to_string(&evt).unwrap();
+        assert!(json.contains("\"reachable_empty_ack\":true"));
+        let parsed: JournalEvent = serde_json::from_str(&json).unwrap();
+        let cp = parsed
+            .metadata
+            .as_ref()
+            .and_then(|m| m.get("cloud_pull"))
+            .unwrap();
+        assert_eq!(
+            cp.get("reachable_empty_ack").and_then(|v| v.as_bool()),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn cloud_pull_sync_marker_append_to_journal_file() {
+        let sid = format!("test-cloud-pull-{}", uuid::Uuid::new_v4());
+        let writer = JournalWriter::new(&sid).unwrap();
+        let evt = JournalEvent::cloud_pull_sync_marker(
+            Some(&sid),
+            "default",
+            "post_login",
+            None,
+            false,
+            0,
+            &[],
+            true,
+        );
+        writer.append(&evt).unwrap();
+        let events = read_journal(&sid).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, JournalEventType::SyncMarker);
+        let cp = events[0]
+            .metadata
+            .as_ref()
+            .and_then(|m| m.get("cloud_pull"))
+            .expect("cloud_pull");
+        assert_eq!(cp.get("source").and_then(|v| v.as_str()), Some("post_login"));
+        assert_eq!(
+            cp.get("reachable_empty_ack").and_then(|v| v.as_bool()),
+            Some(true)
+        );
+        std::fs::remove_file(writer.path()).ok();
     }
 
     #[test]

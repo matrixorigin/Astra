@@ -26,6 +26,7 @@ pub mod sandbox;
 pub mod session_analytics;
 pub mod session_audit;
 pub mod session_checkpoint;
+pub mod session_fork;
 pub mod session_journal;
 pub mod session_restore;
 pub mod session_workspace;
@@ -166,3 +167,4 @@ pub use workflows::{
     DatabaseWorkflowService, UnconfiguredWorkflowService, WorkflowDefRecord, WorkflowRunRecord,
     WorkflowService,
 };
+pub use session_fork::{ForkSessionOptions, ForkSessionResult, fork_local_session};

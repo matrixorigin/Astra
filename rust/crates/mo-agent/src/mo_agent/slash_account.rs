@@ -1,10 +1,12 @@
 use super::*;
+use crate::post_auth_cloud_resync;
 
 pub(super) async fn handle_account_command(
     cmd: &str,
     arg: &str,
     api: &mo_thin_client::ThinClient,
     profile: Option<&str>,
+    state: &mut super::ReplState,
 ) -> Result<(), String> {
     match cmd {
         "/register" => {
@@ -19,7 +21,10 @@ pub(super) async fn handle_account_command(
                 Ok(_) => {
                     eprintln!("{}", "  \u{2713}  Registered! Logging in…".green());
                     match do_login(api, profile, &username, &password).await {
-                        Ok(_) => eprintln!("{}", "  \u{2713}  Logged in".green()),
+                        Ok(_) => {
+                            eprintln!("{}", "  \u{2713}  Logged in".green());
+                            post_auth_cloud_resync(profile, state).await;
+                        }
                         Err(e) => {
                             eprintln!("{}", format!("  \u{2717}  Login failed: {}", e).red())
                         }
@@ -33,7 +38,10 @@ pub(super) async fn handle_account_command(
             let username = prompt_or("Username", None)?;
             let password = prompt_password_masked("Password", None)?;
             match do_login(api, profile, &username, &password).await {
-                Ok(_) => eprintln!("{}", "  \u{2713}  Logged in".green()),
+                Ok(_) => {
+                    eprintln!("{}", "  \u{2713}  Logged in".green());
+                    post_auth_cloud_resync(profile, state).await;
+                }
                 Err(e) => eprintln!("{}", format!("  \u{2717}  Login failed: {}", e).red()),
             }
         }

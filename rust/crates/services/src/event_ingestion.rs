@@ -69,6 +69,42 @@ pub struct IngestionEvent {
     pub causal_chain_id: Option<String>,
 }
 
+fn merged_metadata_from_journal_event(
+    event: &crate::session_journal::JournalEvent,
+) -> Option<serde_json::Value> {
+    let has_extra = event.session_lineage.is_some()
+        || event.coordination.is_some()
+        || event.edge_policy.is_some();
+    if !has_extra && event.metadata.is_none() {
+        return None;
+    }
+    let mut obj = serde_json::Map::new();
+    if let Some(ref m) = event.metadata {
+        match m {
+            serde_json::Value::Object(map) => obj.extend(map.clone()),
+            other => {
+                obj.insert("legacy_metadata".to_string(), other.clone());
+            }
+        }
+    }
+    if let Some(ref l) = event.session_lineage {
+        if let Ok(v) = serde_json::to_value(l) {
+            obj.insert("session_lineage".to_string(), v);
+        }
+    }
+    if let Some(ref c) = event.coordination {
+        if let Ok(v) = serde_json::to_value(c) {
+            obj.insert("coordination".to_string(), v);
+        }
+    }
+    if let Some(ref p) = event.edge_policy {
+        if let Ok(v) = serde_json::to_value(p) {
+            obj.insert("edge_policy".to_string(), v);
+        }
+    }
+    Some(serde_json::Value::Object(obj))
+}
+
 impl IngestionEvent {
     /// Transform a JournalEvent into an IngestionEvent for cloud push.
     ///
@@ -123,6 +159,11 @@ impl IngestionEvent {
             _ => None,
         };
 
+        let causal_chain_id = event
+            .coordination
+            .as_ref()
+            .and_then(|c| c.correlation_id.clone());
+
         Self {
             event_id,
             session_id,
@@ -132,10 +173,10 @@ impl IngestionEvent {
             token_usage,
             llm_model_used: event.model.clone(),
             skill_name: None,
-            metadata: event.metadata.clone(),
+            metadata: merged_metadata_from_journal_event(event),
             created_at: event.ts.clone(),
             parent_event_id: None,
-            causal_chain_id: None,
+            causal_chain_id,
         }
     }
 
@@ -590,7 +631,107 @@ mod tests {
             selector_tokens_in: None,
             selector_tokens_out: None,
             memoria_ms: None,
+            session_lineage: None,
+            coordination: None,
+            edge_policy: None,
         }
+    }
+
+    #[test]
+    fn transform_sync_marker_cloud_pull_metadata_in_ingestion() {
+        use crate::session_journal::JournalEvent;
+        let keys = vec!["explain_mode".to_string()];
+        let journal = JournalEvent::cloud_pull_sync_marker(
+            Some("sess-sync"),
+            "default",
+            "repl_startup",
+            Some(7),
+            true,
+            2,
+            &keys,
+            false,
+        );
+        let ingestion = IngestionEvent::from_journal_event(&journal, "user-z");
+        assert!(ingestion.event_type.contains("sync"));
+        assert_eq!(ingestion.session_id, "sess-sync");
+        let meta = ingestion.metadata.expect("metadata");
+        let cp = meta.get("cloud_pull").expect("cloud_pull blob");
+        assert_eq!(cp.get("learning_version").and_then(|v| v.as_i64()), Some(7));
+        assert_eq!(
+            cp.get("preference_keys_merged")
+                .and_then(|v| v.as_array())
+                .map(|a| a.len()),
+            Some(1)
+        );
+        assert_eq!(
+            cp.get("reachable_empty_ack").and_then(|v| v.as_bool()),
+            Some(false)
+        );
+        assert!(ingestion.content.as_deref().unwrap_or("").contains("cloud_pull"));
+    }
+
+    #[test]
+    fn transform_sync_marker_preserves_reachable_empty_ack() {
+        use crate::session_journal::JournalEvent;
+        let journal = JournalEvent::cloud_pull_sync_marker(
+            Some("s-empty"),
+            "default",
+            "post_login",
+            None,
+            false,
+            0,
+            &[],
+            true,
+        );
+        let ingestion = IngestionEvent::from_journal_event(&journal, "u1");
+        let cp = ingestion
+            .metadata
+            .as_ref()
+            .and_then(|m| m.get("cloud_pull"))
+            .expect("cloud_pull");
+        assert_eq!(
+            cp.get("reachable_empty_ack").and_then(|v| v.as_bool()),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn merged_metadata_cloud_pull_only_no_lineage_still_emits_object() {
+        use crate::session_journal::JournalEvent;
+        let journal = JournalEvent::cloud_pull_sync_marker(
+            Some("s1"),
+            "p",
+            "post_login",
+            None,
+            false,
+            0,
+            &[],
+            true,
+        );
+        let merged = super::merged_metadata_from_journal_event(&journal);
+        let obj = merged.expect("expected metadata");
+        assert!(obj.get("cloud_pull").is_some());
+    }
+
+    #[test]
+    fn transform_includes_lineage_coordination_in_metadata_and_causal_chain() {
+        use crate::session_journal::{CoordinationMeta, SessionLineage};
+        let mut journal = make_turn_event();
+        journal.coordination = Some(CoordinationMeta {
+            agent_id: Some("agent-a".into()),
+            agent_role: Some("worker".into()),
+            correlation_id: Some("corr-chain-1".into()),
+        });
+        journal.session_lineage = Some(SessionLineage {
+            parent_session_id: "parent-sid".into(),
+            forked_after_turn: Some(4),
+            label: Some("branch".into()),
+        });
+        let ingestion = IngestionEvent::from_journal_event(&journal, "user-1");
+        assert_eq!(ingestion.causal_chain_id.as_deref(), Some("corr-chain-1"));
+        let meta = ingestion.metadata.expect("metadata");
+        assert!(meta.get("coordination").is_some());
+        assert!(meta.get("session_lineage").is_some());
     }
 
     #[test]

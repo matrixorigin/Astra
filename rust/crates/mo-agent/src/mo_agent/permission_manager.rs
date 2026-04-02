@@ -10,7 +10,7 @@ use mo_agent_runtime::turn::tool_argument_hints::{
 };
 
 /// Permission mode controls how tool approval decisions are handled.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(super) enum PermissionMode {
     /// Auto-approve all tools (except bypass-immune safety checks).
     Auto,
@@ -60,7 +60,7 @@ enum ExecuteDecision {
 
 /// A permission rule loaded from settings or added at runtime.
 /// Format: `ToolName` or `ToolName(pattern:*)` for prefix matching.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(super) struct PermissionRule {
     pub tool: String,
     pub pattern: Option<String>,
@@ -158,6 +158,24 @@ pub(super) struct PermissionManager {
 }
 
 impl PermissionManager {
+    /// Label + stable fingerprint of loaded rules (for `edge_profile` / cloud audit).
+    pub(super) fn edge_audit_summary(&self) -> (String, String) {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let mut h = DefaultHasher::new();
+        self.mode.hash(&mut h);
+        for rule in &self.cached_allow {
+            rule.hash(&mut h);
+        }
+        for rule in &self.cached_deny {
+            rule.hash(&mut h);
+        }
+        (
+            self.mode.to_string(),
+            format!("{:016x}", h.finish()),
+        )
+    }
+
     /// Create without loading project settings. Used in tests and internal auto-approved operations.
     #[cfg(test)]
     pub(super) fn new(auto_approve: bool) -> Self {

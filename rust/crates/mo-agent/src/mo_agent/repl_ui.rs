@@ -55,6 +55,7 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/session history", "View session conversation history"),
     ("/session errors", "View session errors"),
     ("/session export", "Export session data"),
+    ("/session fork", "Fork session — copy journal + new id (multi-agent / experiments)"),
     (
         "/session list",
         "All journals + cwd / git / age from workspace",
@@ -326,6 +327,7 @@ fn slash_argument_hint(command: &str) -> Option<&'static str> {
     match command {
         "/model" => Some("<name>"),
         "/session history" | "/session errors" | "/session export" => Some("<session_id|prefix>"),
+        "/session fork" => Some("[parent_id] [label]"),
         "/rewind" => Some("<turn>"),
         "/search" => Some("<pattern|files <glob>|review <pattern>>"),
         "/search files" => Some("<glob>"),
@@ -864,6 +866,7 @@ pub(super) fn print_slash_commands(query: Option<&str>) {
                 "/session history",
                 "/session errors",
                 "/session export",
+                "/session fork",
                 "/session list",
                 "/resume",
                 "/plan",
@@ -1868,6 +1871,7 @@ mod tests {
                 "/session history",
                 "/session errors",
                 "/session export",
+                "/session fork",
                 "/session list",
                 "/resume",
                 "/plan",

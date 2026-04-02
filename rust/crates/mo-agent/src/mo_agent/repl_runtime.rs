@@ -324,18 +324,23 @@ pub(super) fn initialize_repl_state(
 }
 
 #[derive(Debug, Default, PartialEq)]
-struct RestoredSessionState {
-    history: Vec<(String, String)>,
-    turn: u32,
-    recent_tools: Vec<String>,
-    total_prompt_tokens: u64,
-    total_completion_tokens: u64,
+pub struct RestoredSessionState {
+    pub history: Vec<(String, String)>,
+    pub turn: u32,
+    pub recent_tools: Vec<String>,
+    pub total_prompt_tokens: u64,
+    pub total_completion_tokens: u64,
 }
 
 /// Rebuild `(user_msg, assistant_msg)` history from the session journal.
 /// Only `Turn` events with both user_input and assistant_output are included.
 pub(super) fn restore_history_from_journal(session_id: &str) -> Vec<(String, String)> {
     restore_session_state_from_journal(session_id).history
+}
+
+/// Full session counters + history from local JSONL (used after `/session fork`).
+pub fn session_state_from_journal(session_id: &str) -> RestoredSessionState {
+    restore_session_state_from_journal(session_id)
 }
 
 fn restore_session_state_from_journal(session_id: &str) -> RestoredSessionState {

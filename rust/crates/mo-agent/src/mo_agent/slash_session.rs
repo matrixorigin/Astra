@@ -1,9 +1,10 @@
 use std::io::Write;
 
 use chrono::{DateTime, Utc};
-use mo_agent_services::session_workspace;
+use mo_agent_services::{fork_local_session, session_journal, session_workspace, ForkSessionOptions};
 
 use super::*;
+use crate::repl_runtime;
 
 /// `/home/foo/bar` → `~/bar` when under the user home dir (readability).
 fn tilde_path(abs: &str) -> String {
@@ -82,6 +83,43 @@ fn workspace_summary_line(sid: &str) -> String {
     }
 }
 
+/// Resolve parent session id and optional label for `/session fork`.
+fn parse_fork_source(arg: &str, state: &ReplState) -> Result<(String, Option<String>), String> {
+    let arg = arg.trim();
+    if arg.is_empty() {
+        return state
+            .session_id
+            .clone()
+            .filter(|s| !s.is_empty())
+            .map(|s| Ok((s, None)))
+            .unwrap_or_else(|| {
+                Err(
+                    "no active session — use `/session fork <parent_session_id> [label]`".to_string(),
+                )
+            });
+    }
+    let parts: Vec<&str> = arg.split_whitespace().collect();
+    let head = parts[0];
+    let tail = if parts.len() > 1 {
+        Some(parts[1..].join(" "))
+    } else {
+        None
+    };
+    match session_journal::resolve_session_id(head) {
+        Ok(sid) => Ok((sid, tail)),
+        Err(_) => state
+            .session_id
+            .clone()
+            .filter(|s| !s.is_empty())
+            .map(|sid| Ok((sid, Some(arg.to_string()))))
+            .unwrap_or_else(|| {
+                Err(format!(
+                    "unknown session id or prefix '{head}' (and no active session to fork from)"
+                ))
+            }),
+    }
+}
+
 fn ellipsize(s: &str, max_chars: usize) -> String {
     let t: String = s.chars().take(max_chars).collect();
     if s.chars().count() > max_chars {
@@ -114,6 +152,22 @@ fn print_workspace_metadata(ws: &session_workspace::WorkspaceMetadata, sid: &str
             "repo root:".dim(),
             tilde_path(root.as_str()).as_str().dim()
         );
+    }
+    if let Some(ref p) = ws.parent_session_id {
+        eprintln!(
+            "  {:<16} {}",
+            "forked from:".dim(),
+            format!("{p} (turn {} on parent)", ws.forked_at_turn.unwrap_or(0)).cyan()
+        );
+        if let Some(ref n) = ws.fork_note {
+            eprintln!("  {:<16} {}", "fork note:".dim(), n.as_str().cyan());
+        }
+    }
+    if let Some(ref c) = ws.correlation_id {
+        eprintln!("  {:<16} {}", "correlation:".dim(), c.as_str().cyan());
+    }
+    if let Some(ref r) = ws.agent_role {
+        eprintln!("  {:<16} {}", "agent role:".dim(), r.as_str().cyan());
     }
     let started = ws.created_at.get(..19).unwrap_or(ws.created_at.as_str());
     eprintln!("  {:<16} {}", "started:".dim(), started.cyan());
@@ -235,7 +289,7 @@ pub(super) fn resolve_journal_target_session(
     }
 }
 
-pub(super) fn handle_session_command(arg: &str, state: &ReplState) {
+pub(super) fn handle_session_command(arg: &str, state: &mut ReplState) {
     let (sub_cmd, sub_arg) = match arg.find(char::is_whitespace) {
         Some(pos) => (arg[..pos].trim(), arg[pos..].trim()),
         None => (arg.trim(), ""),
@@ -306,9 +360,54 @@ pub(super) fn handle_session_command(arg: &str, state: &ReplState) {
             eprintln!();
             eprintln!(
                 "  {}",
-                "Subcommands: /session history · errors · export · list".dim()
+                "Subcommands: /session history · errors · export · list · fork".dim()
             );
             eprintln!();
+        }
+        "fork" => {
+            let (parent_id, label) = match parse_fork_source(sub_arg, state) {
+                Ok(x) => x,
+                Err(msg) => {
+                    eprintln!("{}", msg.red());
+                    return;
+                }
+            };
+            match fork_local_session(ForkSessionOptions {
+                parent_session_id: parent_id.clone(),
+                new_session_id: None,
+                label: label.clone(),
+            }) {
+                Ok(res) => {
+                    let new_sid = res.new_session_id.clone();
+                    eprintln!(
+                        "  {} New session {} (fork of {})",
+                        "✓".green(),
+                        new_sid.as_str().cyan(),
+                        parent_id.dim()
+                    );
+                    eprintln!(
+                        "  {}",
+                        format!("{} journal events copied (excl. session end/start)", res.events_copied)
+                            .dim()
+                    );
+                    let st = repl_runtime::session_state_from_journal(&new_sid);
+                    state.session_id = Some(new_sid.clone());
+                    state.journal = session_journal::JournalWriter::new(&new_sid).ok();
+                    state.history = st.history;
+                    state.turn = st.turn;
+                    state.total_prompt_tokens = st.total_prompt_tokens;
+                    state.total_completion_tokens = st.total_completion_tokens;
+                    state.recent_tools = st.recent_tools;
+                    state.last_turn_event = None;
+                    state.run_id = None;
+                    eprintln!(
+                        "  {}",
+                        "REPL context is now the forked session (same history; new cloud lineage)."
+                            .dim()
+                    );
+                }
+                Err(e) => eprintln!("{}", format!("  ✗ {e}").red()),
+            }
         }
         "history" => {
             // Read journal for this session or a specified session
@@ -533,6 +632,42 @@ pub(super) fn handle_session_command(arg: &str, state: &ReplState) {
                                     pct,
                                 );
                             }
+                            session_journal::JournalEventType::SessionFork => {
+                                let parent = evt
+                                    .session_lineage
+                                    .as_ref()
+                                    .map(|l| l.parent_session_id.as_str())
+                                    .unwrap_or("?");
+                                let note = evt.user_input.as_deref().unwrap_or("");
+                                eprintln!(
+                                    "  {} {} fork ← {} {}",
+                                    ts_short.dim(),
+                                    "⎇".cyan(),
+                                    parent.cyan(),
+                                    note.dim()
+                                );
+                            }
+                            session_journal::JournalEventType::SyncMarker => {
+                                let ver = evt
+                                    .edge_policy
+                                    .as_ref()
+                                    .and_then(|p| p.cloud_policy_version.as_deref())
+                                    .unwrap_or("-");
+                                let corr = evt
+                                    .coordination
+                                    .as_ref()
+                                    .and_then(|c| c.correlation_id.as_deref())
+                                    .unwrap_or("-");
+                                let note = evt.user_input.as_deref().unwrap_or("");
+                                eprintln!(
+                                    "  {} {} sync policy:{} corr:{} {}",
+                                    ts_short.dim(),
+                                    "⇄".dim(),
+                                    ver.dim(),
+                                    corr.dim(),
+                                    note.dim()
+                                );
+                            }
                         }
                     }
                     // Summary stats
@@ -729,6 +864,23 @@ pub(super) fn handle_session_command(arg: &str, state: &ReplState) {
                                             evt.turn.unwrap_or(0),
                                         ));
                             }
+                            session_journal::JournalEventType::SessionFork => {
+                                let parent = evt
+                                    .session_lineage
+                                    .as_ref()
+                                    .map(|l| l.parent_session_id.as_str())
+                                    .unwrap_or("?");
+                                md.push_str(&format!(
+                                    "### Session fork\n- **Time:** {ts_short}\n- **Parent:** {parent}\n- **Note:** {}\n\n",
+                                    evt.user_input.as_deref().unwrap_or(""),
+                                ));
+                            }
+                            session_journal::JournalEventType::SyncMarker => {
+                                md.push_str(&format!(
+                                    "### Sync marker\n- **Time:** {ts_short}\n- **Note:** {}\n\n",
+                                    evt.user_input.as_deref().unwrap_or(""),
+                                ));
+                            }
                             _ => {}
                         }
                     }
@@ -748,7 +900,7 @@ pub(super) fn handle_session_command(arg: &str, state: &ReplState) {
             eprintln!("{}", format!("  Unknown subcommand: {other}").red());
             eprintln!(
                 "  {}",
-                "Usage: /session [history|list|errors|export] [session_id]".dim()
+                "Usage: /session [history|list|errors|export|fork] [session_id] […]".dim()
             );
         }
     }

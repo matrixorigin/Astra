@@ -19,6 +19,95 @@ pub(super) fn enqueue_ingestion_pub(state: &ReplState, event: &session_journal::
     enqueue_ingestion(state, event);
 }
 
+/// Pull a few Memoria hits after compact so the shortened context keeps **session-relevant**
+/// recall (similar in spirit to Claude Code keeping session memory as an anchor).
+const COMPACT_ANCHOR_QUERY_MAX: usize = 220;
+const COMPACT_ANCHOR_TOP_K: u32 = 5;
+const COMPACT_ANCHOR_MAX_LINES: usize = 4;
+const COMPACT_ANCHOR_LINE_MAX: usize = 140;
+const COMPACT_ANCHOR_TOTAL_MAX: usize = 700;
+
+pub(super) async fn fetch_compact_memory_anchor_snippet(
+    api: &mo_thin_client::ThinClient,
+    token: &str,
+    session_id: Option<&str>,
+    summary_seed: &str,
+) -> Option<String> {
+    let seed: String = summary_seed
+        .lines()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or(summary_seed)
+        .chars()
+        .take(COMPACT_ANCHOR_QUERY_MAX)
+        .collect();
+    let seed = seed.trim();
+    if seed.is_empty() {
+        return None;
+    }
+    let mut q = String::new();
+    if let Some(sid) = session_id.filter(|s| !s.is_empty()) {
+        q.push_str(sid);
+        q.push(' ');
+    }
+    q.push_str(seed);
+    let payload = serde_json::json!({
+        "query": q,
+        "top_k": COMPACT_ANCHOR_TOP_K,
+    });
+    let resp = api.post_memory_search_json(token, &payload).await.ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let body = resp.text().await.ok()?;
+    let arr: Vec<serde_json::Value> = serde_json::from_str(&body).ok()?;
+    if arr.is_empty() {
+        return None;
+    }
+    let mut lines: Vec<String> = Vec::new();
+    let mut total = 0usize;
+    for m in arr.iter().take(COMPACT_ANCHOR_MAX_LINES) {
+        let content = m.get("content").and_then(|v| v.as_str()).unwrap_or("");
+        let line = if let Some(entry) = prompts::memory_proto::MemoryEntry::parse(content)
+        {
+            entry.display_line()
+        } else {
+            let mtype = m
+                .get("memory_type")
+                .and_then(|v| v.as_str())
+                .unwrap_or("note");
+            let preview: String = content.chars().take(100).collect();
+            format!("[{mtype}] {preview}")
+        };
+        let line: String = line.chars().take(COMPACT_ANCHOR_LINE_MAX).collect();
+        if line.trim().is_empty() {
+            continue;
+        }
+        let next_len = total + line.len() + 1;
+        if next_len > COMPACT_ANCHOR_TOTAL_MAX {
+            break;
+        }
+        total = next_len;
+        lines.push(format!("- {line}"));
+    }
+    if lines.is_empty() {
+        return None;
+    }
+    Some(lines.join("\n"))
+}
+
+pub(super) fn compact_assistant_message(trimmed: usize, summary: &str, anchor: Option<&str>) -> String {
+    let mut out = String::new();
+    if let Some(a) = anchor.filter(|s| !s.trim().is_empty()) {
+        out.push_str("[Session memory anchor]\n");
+        out.push_str(a.trim());
+        out.push_str("\n\n");
+    }
+    out.push_str(&format!(
+        "[Prior context — {trimmed} turns compacted]\n\n{summary}"
+    ));
+    out
+}
+
 enum TurnAttempt {
     Completed(Box<Result<StreamResult, String>>),
     Interrupted,
@@ -214,13 +303,19 @@ async fn apply_auto_compact_result(
         return Ok(());
     }
 
-    let summary_entry = (
-        String::new(),
-        format!("[Prior context — {trimmed} turns compacted]\n\n{summary}"),
-    );
+    let anchor = fetch_compact_memory_anchor_snippet(
+        ctx.api,
+        token,
+        state.session_id.as_deref(),
+        &summary,
+    )
+    .await;
+    let assistant_text = compact_assistant_message(trimmed, &summary, anchor.as_deref());
+    let summary_entry = (String::new(), assistant_text);
     let mut new_history = vec![summary_entry];
     new_history.extend_from_slice(&state.history[trimmed..]);
     state.history = new_history;
+    state.recent_tools.clear();
 
     let entry = prompts::memory_proto::MemoryEntry::new(
         prompts::memory_proto::NS_EPISODE,
@@ -248,6 +343,13 @@ async fn apply_auto_compact_result(
         )
         .green()
     );
+    if state.plan_mode.is_some() || state.executing_plan.is_some() {
+        eprintln!(
+            "{}",
+            "  Tip: Plan context was shortened — if steps feel stale, refresh `/plan`."
+                .dim()
+        );
+    }
 
     Ok(())
 }

@@ -66,6 +66,19 @@ pub struct WorkspaceMetadata {
     /// Active durable task contract (JSON-serialized TaskContract).
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub contract_json: Option<String>,
+    /// Set when this session was forked from another local session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_session_id: Option<String>,
+    /// Turn count on the parent at fork time (audit boundary).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forked_at_turn: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fork_note: Option<String>,
+    /// Correlates this session with multi-agent / cloud-orchestrated work.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub correlation_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_role: Option<String>,
 }
 
 impl WorkspaceMetadata {
@@ -140,6 +153,11 @@ impl WorkspaceMetadata {
             plan_config_json: None,
             plan_execution_rounds: 0,
             contract_json: None,
+            parent_session_id: None,
+            forked_at_turn: None,
+            fork_note: None,
+            correlation_id: None,
+            agent_role: None,
         }
     }
 
@@ -171,6 +189,11 @@ impl WorkspaceMetadata {
             plan_config_json: None,
             plan_execution_rounds: 0,
             contract_json: None,
+            parent_session_id: None,
+            forked_at_turn: None,
+            fork_note: None,
+            correlation_id: None,
+            agent_role: None,
         }
     }
 
@@ -326,6 +349,23 @@ mod tests {
         assert_eq!(parsed.checkpoints, vec![1]);
         assert_eq!(parsed.status, "completed");
         assert_eq!(parsed.summary, Some("Done".to_string()));
+    }
+
+    #[test]
+    fn workspace_fork_and_coordination_round_trip() {
+        let mut ws = WorkspaceMetadata::with_context("child", "gpt-4", "/proj", Some("main"));
+        ws.parent_session_id = Some("parent-uuid".into());
+        ws.forked_at_turn = Some(7);
+        ws.fork_note = Some("experiment".into());
+        ws.correlation_id = Some("corr-abc".into());
+        ws.agent_role = Some("planner".into());
+        let yaml = serde_yaml::to_string(&ws).unwrap();
+        let parsed: WorkspaceMetadata = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(parsed.parent_session_id.as_deref(), Some("parent-uuid"));
+        assert_eq!(parsed.forked_at_turn, Some(7));
+        assert_eq!(parsed.fork_note.as_deref(), Some("experiment"));
+        assert_eq!(parsed.correlation_id.as_deref(), Some("corr-abc"));
+        assert_eq!(parsed.agent_role.as_deref(), Some("planner"));
     }
 
     #[test]

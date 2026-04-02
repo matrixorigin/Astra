@@ -132,6 +132,10 @@ mo-agent chat --user-id alice --session-id <id>
 printf "turn 1\nturn 2\nturn 3\n" | mo-agent chat --user-id alice
 ```
 
+## Related: mo-agent CLI local journal (JSONL)
+
+The interactive **`mo-agent`** REPL keeps an append-only **`{session_id}.jsonl`** under `~/.mo-agent/sessions/` (turns, config changes, and other audit events). After a successful MatrixOne **learning / preferences** pull at REPL startup or after **`/login`**, the CLI may append a **`sync_marker`** line whose structured payload lives in **`metadata.cloud_pull`** (including **`reachable_empty_ack`** when the cloud was reachable but returned nothing to merge, and optional **`MO_JOURNAL_CLOUD_EMPTY_ACK=1`** for the same on startup). Full field list and semantics: [multi-agent-cloud-runtime.md](./multi-agent-cloud-runtime.md) — subsection **Journal: `sync_marker` after MatrixOne cloud pull** under **§3.2 State Model**.
+
 ## Implementation Checklist
 
 - [x] `agent_sessions` table has `updated_at` (auto-refreshed via `onupdate=func.now()`)
