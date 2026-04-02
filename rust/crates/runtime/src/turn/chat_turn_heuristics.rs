@@ -16,8 +16,8 @@ const ANALYSIS_EXPLORATION_ROUND_BUDGET: usize = 8;
 
 const MUTATING_TERMS: &[&str] = &[
     "fix",
-    "修",
     "修改代码",
+    "修改文件",
     "implement",
     "write",
     "edit",
@@ -36,8 +36,10 @@ const MUTATING_TERMS: &[&str] = &[
     "实现",
     "新增",
     "删除",
-    "更新",
+    "更新代码",
+    "更新文件",
     "修复",
+    "修正",
 ];
 
 const ANALYSIS_TERMS: &[&str] = &[
@@ -45,7 +47,13 @@ const ANALYSIS_TERMS: &[&str] = &[
     "code review",
     "commit review",
     "审查",
+    "评审",
+    "审阅",
     "看一眼",
+    "看一下",
+    "看改动",
+    "看修改",
+    "看变更",
     "what changed",
     "changed",
     "what's in the commit",
@@ -99,7 +107,10 @@ pub fn infer_task_execution_profile(input: &str) -> TaskExecutionProfile {
     let q = input.to_lowercase();
     let has_mutating = contains_any_keyword(&q, MUTATING_TERMS);
     let has_analysis = contains_any_keyword(&q, ANALYSIS_TERMS);
-    if has_mutating {
+    // When both mutating and analysis terms are present, analysis wins —
+    // the user is asking to *review/inspect* something that involves changes,
+    // not asking to *make* changes. E.g. "评审当前修改" = review changes.
+    if has_mutating && !has_analysis {
         TaskExecutionProfile {
             mutates_workspace: true,
             verification_required: true,
@@ -111,9 +122,18 @@ pub fn infer_task_execution_profile(input: &str) -> TaskExecutionProfile {
         TaskExecutionProfile {
             mutates_workspace: false,
             verification_required: false,
-            allow_factual_retry: false,
+            allow_factual_retry: true,
             exploration_round_budget: ANALYSIS_EXPLORATION_ROUND_BUDGET,
             stall_window: ANALYSIS_STALL_WINDOW,
+        }
+    } else if has_mutating {
+        // Mutating without analysis context
+        TaskExecutionProfile {
+            mutates_workspace: true,
+            verification_required: true,
+            allow_factual_retry: true,
+            exploration_round_budget: DEFAULT_EXPLORATION_ROUND_BUDGET,
+            stall_window: DEFAULT_STALL_WINDOW,
         }
     } else {
         TaskExecutionProfile::default()
@@ -175,7 +195,35 @@ pub fn looks_like_factual_query(input: &str) -> bool {
     let has_code = code_keywords.iter().any(|kw| q.contains(kw));
     let web_keywords = ["http", "url", "api ", "endpoint", "fetch", "download"];
     let has_web = web_keywords.iter().any(|kw| q.contains(kw));
-    has_github || has_memory || has_git_live || has_code || has_web
+
+    // Workspace-state queries: anything asking about local changes, diffs,
+    // file contents, or repo state that the model cannot know without tools.
+    let workspace_keywords = [
+        "review",
+        "diff",
+        "changes",
+        "changed",
+        "local",
+        "改动",
+        "修改",
+        "变更",
+        "审查",
+        "审阅",
+        "评审",
+        "看一下",
+        "看看",
+        "什么文件",
+        "哪些文件",
+        "this repo",
+        "this project",
+        "codebase",
+        "这个项目",
+        "这个仓库",
+        "代码库",
+    ];
+    let has_workspace = workspace_keywords.iter().any(|kw| q.contains(kw));
+
+    has_github || has_memory || has_git_live || has_code || has_web || has_workspace
 }
 
 /// Detect requests that are likely to mutate the workspace and therefore
@@ -188,7 +236,12 @@ pub fn looks_like_mutating_task(input: &str) -> bool {
     let q = input.to_lowercase();
     let has_mutating = contains_any_keyword(&q, MUTATING_TERMS);
     let has_read_only = contains_any_keyword(&q, ANALYSIS_TERMS);
-    has_mutating || !has_read_only
+    // Analysis context overrides mutating terms — user is reviewing/inspecting
+    // something that involves changes, not requesting changes themselves.
+    if has_read_only {
+        return false;
+    }
+    has_mutating
 }
 
 fn recent_tools_imply_live_domain(recent_tools: &[String]) -> bool {
@@ -244,13 +297,16 @@ pub fn should_force_factual_tool_retry(
 
 pub fn factual_tool_retry_message(original_query: &str) -> String {
     format!(
-        "Runtime correction: your previous draft answered a live/factual query without using tools. Retry this turn from scratch and call at least one tool before answering.\n\
+        "Runtime correction: your previous response answered without using any tools. \
+This query requires live data from the workspace, repository, or external sources \
+that you cannot know from training data alone. Retry from scratch and call tools first.\n\
 \n\
-- For GitHub live data prefer github_ci_status / github_list_prs / github_list_issues / github_repo_stats.\n\
-- For memory contents use memory_search or memory_profile.\n\
-- For workspace change status use git_status or git_diff.\n\
-- Do NOT fall back to bash when a dedicated GitHub or memory tool exists.\n\
-- If repo was omitted before, infer it from the user's text or recent conversation. Bare names like 'memoria' and 'matrixone' are allowed.\n\
+- For workspace state: git_status, git_diff, read_file, grep, glob.\n\
+- For GitHub data: github_ci_status, github_list_prs, github_list_issues, github_repo_stats.\n\
+- For memory: memory_search, memory_profile.\n\
+- Prefer dedicated tools over bash.\n\
+\n\
+Discard your previous draft and gather evidence with tools before answering.\n\
 \n\
 Original user query: {original_query}"
     )
@@ -355,10 +411,17 @@ mod tests {
             "what changed in the latest commit?"
         ));
         assert!(!looks_like_mutating_task("explain this diff"));
-        assert!(looks_like_mutating_task(
+        // Analysis context overrides even when mutating terms are present
+        assert!(!looks_like_mutating_task(
             "review the latest commit and fix any issues"
         ));
+        assert!(!looks_like_mutating_task("评审当前修改"));
+        assert!(!looks_like_mutating_task("审查修改"));
+        assert!(!looks_like_mutating_task("看一下修改"));
+        // Pure mutating without analysis context
         assert!(looks_like_mutating_task("implement the feature"));
+        assert!(looks_like_mutating_task("fix the bug"));
+        assert!(looks_like_mutating_task("修复这个问题"));
     }
 
     #[test]
@@ -366,7 +429,7 @@ mod tests {
         let profile = infer_task_execution_profile("review 最新的commit");
         assert!(!profile.mutates_workspace);
         assert!(!profile.verification_required);
-        assert!(!profile.allow_factual_retry);
+        assert!(profile.allow_factual_retry);
         assert_eq!(profile.stall_window, ANALYSIS_STALL_WINDOW);
         assert_eq!(
             profile.exploration_round_budget,
@@ -382,6 +445,42 @@ mod tests {
             profile.exploration_round_budget,
             DEFAULT_EXPLORATION_ROUND_BUDGET
         );
+    }
+
+    #[test]
+    fn chinese_review_queries_get_analysis_profile() {
+        // Root cause bug: "评审当前修改" was classified as mutating because
+        // single-char "修" in MUTATING_TERMS matched the "修" in "修改".
+        // Now fixed: "修" removed from MUTATING_TERMS; "评审" added to ANALYSIS_TERMS.
+        let cases = [
+            "评审当前修改",
+            "审查修改",
+            "审阅代码修改",
+            "看一下修改",
+            "看改动",
+            "看看变更",
+        ];
+        for input in &cases {
+            let profile = infer_task_execution_profile(input);
+            assert!(
+                !profile.verification_required,
+                "{input:?} should NOT require verification"
+            );
+            assert!(
+                !profile.mutates_workspace,
+                "{input:?} should NOT be classified as mutating"
+            );
+        }
+    }
+
+    #[test]
+    fn analysis_wins_over_mutating_when_both_present() {
+        // "review and fix" → analysis wins (user is reviewing, not just fixing)
+        let profile = infer_task_execution_profile("review the code and fix issues");
+        assert!(!profile.verification_required);
+        // Pure mutating still works
+        let profile = infer_task_execution_profile("fix the compilation error");
+        assert!(profile.verification_required);
     }
 
     #[test]
@@ -416,7 +515,8 @@ mod tests {
             0,
             true
         ));
-        assert!(!should_force_factual_tool_retry(
+        // Analysis tasks now also allow factual retry
+        assert!(should_force_factual_tool_retry(
             infer_task_execution_profile("review 最新的commit"),
             "最新的一个ci?",
             &none,
@@ -433,6 +533,30 @@ mod tests {
     }
 
     #[test]
+    fn workspace_queries_detected_as_factual() {
+        // Any query about workspace state should be detected as needing tools
+        assert!(looks_like_factual_query("review local changes"));
+        assert!(looks_like_factual_query("what changed"));
+        assert!(looks_like_factual_query("评审当前修改"));
+        assert!(looks_like_factual_query("看改动"));
+        assert!(looks_like_factual_query("diff the code"));
+        assert!(looks_like_factual_query("what's in this repo"));
+        assert!(looks_like_factual_query("这个项目有什么"));
+        // Generic non-workspace queries should NOT trigger
+        assert!(!looks_like_factual_query("hello"));
+        assert!(!looks_like_factual_query("explain quicksort"));
+        assert!(!looks_like_factual_query("write a poem"));
+    }
+
+    #[test]
+    fn analysis_tasks_allow_factual_retry() {
+        let profile = infer_task_execution_profile("review local changes");
+        assert!(profile.allow_factual_retry);
+        let profile2 = infer_task_execution_profile("explain this function");
+        assert!(profile2.allow_factual_retry);
+    }
+
+    #[test]
     fn contextual_live_query_detects_short_followup() {
         let recent = vec!["github_ci_status".to_string()];
         assert!(looks_like_live_query_with_context("最新的", &recent));
@@ -444,9 +568,10 @@ mod tests {
     fn factual_retry_message_guides_toward_dedicated_tools() {
         let msg = factual_tool_retry_message("memoria 最新的一个ci?");
         assert!(msg.contains("github_ci_status"));
-        assert!(msg.contains("github_repo_stats"));
+        assert!(msg.contains("git_status"));
+        assert!(msg.contains("read_file"));
         assert!(msg.contains("memoria"));
-        assert!(msg.contains("Do NOT fall back to bash"));
+        assert!(msg.contains("Discard your previous draft"));
     }
 
     #[test]
