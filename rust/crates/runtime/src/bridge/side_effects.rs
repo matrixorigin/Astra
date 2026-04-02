@@ -1277,3 +1277,284 @@ pub(super) async fn sync_bridge_state_event(
     cache.insert(session_id.to_string(), entry.clone(), now);
     entry
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    /// Helper: convert a `serde_json::Value::Object` into its inner `Map`.
+    fn to_map(value: serde_json::Value) -> serde_json::Map<String, serde_json::Value> {
+        match value {
+            serde_json::Value::Object(m) => m,
+            _ => panic!("expected an object"),
+        }
+    }
+
+    // ──────────────────────────────────────────────────────────
+    // take_bridge_prompt_fingerprints
+    // ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn fingerprints_empty_map() {
+        let mut map = serde_json::Map::new();
+        let result = take_bridge_prompt_fingerprints(&mut map);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn fingerprints_missing_key() {
+        let mut map = to_map(json!({"unrelated": "value"}));
+        let result = take_bridge_prompt_fingerprints(&mut map);
+        assert!(result.is_empty());
+        // key was not removed because it didn't exist; other keys untouched
+        assert!(map.contains_key("unrelated"));
+    }
+
+    #[test]
+    fn fingerprints_non_array_value() {
+        let mut map = to_map(json!({"prompt_fingerprints": "not-an-array"}));
+        let result = take_bridge_prompt_fingerprints(&mut map);
+        assert!(result.is_empty());
+        // the key is still consumed (removed) even though it wasn't an array
+        assert!(!map.contains_key("prompt_fingerprints"));
+    }
+
+    #[test]
+    fn fingerprints_null_value() {
+        let mut map = to_map(json!({"prompt_fingerprints": null}));
+        let result = take_bridge_prompt_fingerprints(&mut map);
+        assert!(result.is_empty());
+        assert!(!map.contains_key("prompt_fingerprints"));
+    }
+
+    #[test]
+    fn fingerprints_empty_array() {
+        let mut map = to_map(json!({"prompt_fingerprints": []}));
+        let result = take_bridge_prompt_fingerprints(&mut map);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn fingerprints_valid_strings() {
+        let mut map = to_map(json!({"prompt_fingerprints": ["abc", "def", "ghi"]}));
+        let result = take_bridge_prompt_fingerprints(&mut map);
+        assert_eq!(result, vec!["abc", "def", "ghi"]);
+        assert!(!map.contains_key("prompt_fingerprints"));
+    }
+
+    #[test]
+    fn fingerprints_skips_non_string_items() {
+        let mut map = to_map(json!({"prompt_fingerprints": ["a", 42, null, "b", true]}));
+        let result = take_bridge_prompt_fingerprints(&mut map);
+        assert_eq!(result, vec!["a", "b"]);
+    }
+
+    // ──────────────────────────────────────────────────────────
+    // take_bridge_side_effect_inputs
+    // ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn side_effect_inputs_empty_map() {
+        let mut map = serde_json::Map::new();
+        let result = take_bridge_side_effect_inputs(&mut map);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn side_effect_inputs_direct_object() {
+        let inner = json!({"messages": [1,2,3], "full_text": "hello"});
+        let mut map = to_map(json!({"side_effect_inputs": inner}));
+        let result = take_bridge_side_effect_inputs(&mut map).unwrap();
+        assert_eq!(result.get("messages").unwrap(), &json!([1, 2, 3]));
+        assert_eq!(result.get("full_text").unwrap(), &json!("hello"));
+        assert!(!map.contains_key("side_effect_inputs"));
+    }
+
+    #[test]
+    fn side_effect_inputs_direct_non_object_returns_none_then_falls_through() {
+        // If "side_effect_inputs" is a string, the .as_object() fails,
+        // so it falls through to individual-key extraction which also finds nothing.
+        let mut map = to_map(json!({"side_effect_inputs": "not-an-object"}));
+        let result = take_bridge_side_effect_inputs(&mut map);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn side_effect_inputs_individual_keys_single() {
+        let mut map = to_map(json!({"side_effect_full_text": "hello world"}));
+        let result = take_bridge_side_effect_inputs(&mut map).unwrap();
+        assert_eq!(result.get("full_text").unwrap(), &json!("hello world"));
+        assert_eq!(result.len(), 1);
+        assert!(!map.contains_key("side_effect_full_text"));
+    }
+
+    #[test]
+    fn side_effect_inputs_individual_keys_multiple() {
+        let mut map = to_map(json!({
+            "side_effect_messages": [{"role": "user"}],
+            "side_effect_model_used": "gpt-4",
+            "side_effect_agent_id": "agent-1",
+            "side_effect_session_start": true,
+        }));
+        let result = take_bridge_side_effect_inputs(&mut map).unwrap();
+        assert_eq!(result.len(), 4);
+        assert_eq!(result.get("messages").unwrap(), &json!([{"role": "user"}]));
+        assert_eq!(result.get("model_used").unwrap(), &json!("gpt-4"));
+        assert_eq!(result.get("agent_id").unwrap(), &json!("agent-1"));
+        assert_eq!(result.get("session_start").unwrap(), &json!(true));
+        assert!(map.is_empty());
+    }
+
+    #[test]
+    fn side_effect_inputs_all_known_keys() {
+        let mut map = to_map(json!({
+            "side_effect_messages": [],
+            "side_effect_tool_results": [],
+            "side_effect_full_text": "",
+            "side_effect_cloud_tool_calls": [],
+            "side_effect_edge_tool_calls": [],
+            "side_effect_reasoning_content": "",
+            "side_effect_cloud_tool_results": [],
+            "side_effect_context_capture_id": "cap-1",
+            "side_effect_model_used": "m",
+            "side_effect_token_usage": {},
+            "side_effect_llm_params": {},
+            "side_effect_agent_id": "a",
+            "side_effect_routing_meta": {},
+            "side_effect_tool_quality_assessments": [],
+            "side_effect_sections": [],
+            "side_effect_session_start": false,
+        }));
+        let result = take_bridge_side_effect_inputs(&mut map).unwrap();
+        assert_eq!(result.len(), 16);
+        assert!(map.is_empty());
+    }
+
+    #[test]
+    fn side_effect_inputs_ignores_unknown_keys() {
+        let mut map = to_map(json!({
+            "side_effect_full_text": "hi",
+            "some_other_key": "ignored",
+        }));
+        let result = take_bridge_side_effect_inputs(&mut map).unwrap();
+        assert_eq!(result.len(), 1);
+        // "some_other_key" remains in bridge_state
+        assert!(map.contains_key("some_other_key"));
+    }
+
+    #[test]
+    fn side_effect_inputs_direct_object_takes_priority_over_individual() {
+        let mut map = to_map(json!({
+            "side_effect_inputs": {"messages": "from-direct"},
+            "side_effect_messages": "from-individual",
+        }));
+        let result = take_bridge_side_effect_inputs(&mut map).unwrap();
+        assert_eq!(result.get("messages").unwrap(), &json!("from-direct"));
+        // individual key is NOT consumed when direct object is found
+        assert!(map.contains_key("side_effect_messages"));
+    }
+
+    #[test]
+    fn side_effect_inputs_null_values_are_collected() {
+        let mut map = to_map(json!({
+            "side_effect_full_text": null,
+        }));
+        let result = take_bridge_side_effect_inputs(&mut map).unwrap();
+        assert_eq!(result.get("full_text").unwrap(), &json!(null));
+    }
+
+    // ──────────────────────────────────────────────────────────
+    // take_bridge_tail_update_args
+    // ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn tail_update_args_empty_map() {
+        let mut map = serde_json::Map::new();
+        let result = take_bridge_tail_update_args(&mut map);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn tail_update_args_direct_object() {
+        let inner = json!({"full_text": "txt", "tool_calls": []});
+        let mut map = to_map(json!({"tail_update_args": inner}));
+        let result = take_bridge_tail_update_args(&mut map).unwrap();
+        assert_eq!(result.get("full_text").unwrap(), &json!("txt"));
+        assert_eq!(result.get("tool_calls").unwrap(), &json!([]));
+        assert!(!map.contains_key("tail_update_args"));
+    }
+
+    #[test]
+    fn tail_update_args_direct_non_object_falls_through() {
+        // "tail_update_args" is a string → .as_object() fails, falls through.
+        // No "tail_full_text" either → returns None.
+        let mut map = to_map(json!({"tail_update_args": "bad"}));
+        let result = take_bridge_tail_update_args(&mut map);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn tail_update_args_minimal_full_text_only() {
+        let mut map = to_map(json!({"tail_full_text": "response text"}));
+        let result = take_bridge_tail_update_args(&mut map).unwrap();
+        assert_eq!(result.get("full_text").unwrap(), &json!("response text"));
+        assert_eq!(result.len(), 1);
+    }
+
+    #[test]
+    fn tail_update_args_full_text_with_optional_keys() {
+        let mut map = to_map(json!({
+            "tail_full_text": "text",
+            "tail_tool_calls": [{"id": "tc1"}],
+            "tail_reasoning_content": "thought",
+            "tail_cloud_loop_history": [1, 2],
+        }));
+        let result = take_bridge_tail_update_args(&mut map).unwrap();
+        assert_eq!(result.len(), 4);
+        assert_eq!(result.get("full_text").unwrap(), &json!("text"));
+        assert_eq!(
+            result.get("tool_calls").unwrap(),
+            &json!([{"id": "tc1"}])
+        );
+        assert_eq!(
+            result.get("reasoning_content").unwrap(),
+            &json!("thought")
+        );
+        assert_eq!(
+            result.get("cloud_loop_history").unwrap(),
+            &json!([1, 2])
+        );
+        assert!(map.is_empty());
+    }
+
+    #[test]
+    fn tail_update_args_missing_full_text_returns_none() {
+        // Has optional keys but no required "tail_full_text"
+        let mut map = to_map(json!({
+            "tail_tool_calls": [{"id": "tc1"}],
+            "tail_reasoning_content": "thought",
+        }));
+        let result = take_bridge_tail_update_args(&mut map);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn tail_update_args_direct_takes_priority() {
+        let mut map = to_map(json!({
+            "tail_update_args": {"full_text": "direct"},
+            "tail_full_text": "individual",
+        }));
+        let result = take_bridge_tail_update_args(&mut map).unwrap();
+        assert_eq!(result.get("full_text").unwrap(), &json!("direct"));
+        // individual key is NOT consumed
+        assert!(map.contains_key("tail_full_text"));
+    }
+
+    #[test]
+    fn tail_update_args_null_full_text_is_accepted() {
+        let mut map = to_map(json!({"tail_full_text": null}));
+        let result = take_bridge_tail_update_args(&mut map).unwrap();
+        assert_eq!(result.get("full_text").unwrap(), &json!(null));
+    }
+}

@@ -1113,4 +1113,554 @@ mod tests {
             "3 identical tool calls across rounds must trigger stall"
         );
     }
+
+    // ══════════════════════════════════════════════════════════════════════
+    //  canonical_tool_args
+    // ══════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn canonical_tool_args_normalizes_whitespace() {
+        let raw = r#"{  "path" :  "src/main.rs" ,  "line": 42 }"#;
+        let canonical = canonical_tool_args(raw);
+        assert_eq!(canonical, r#"{"line":42,"path":"src/main.rs"}"#);
+    }
+
+    #[test]
+    fn canonical_tool_args_invalid_json_returns_raw() {
+        let raw = "not json at all";
+        assert_eq!(canonical_tool_args(raw), raw);
+    }
+
+    #[test]
+    fn canonical_tool_args_empty_string() {
+        assert_eq!(canonical_tool_args(""), "");
+    }
+
+    #[test]
+    fn canonical_tool_args_nested_objects_and_arrays() {
+        let raw = r#"{"a": [1, 2, {"b": 3}]}"#;
+        let canonical = canonical_tool_args(raw);
+        assert_eq!(canonical, r#"{"a":[1,2,{"b":3}]}"#);
+    }
+
+    #[test]
+    fn canonical_tool_args_key_ordering_normalized() {
+        let raw_a = r#"{"z": 1, "a": 2}"#;
+        let raw_b = r#"{"a": 2, "z": 1}"#;
+        assert_eq!(canonical_tool_args(raw_a), canonical_tool_args(raw_b));
+    }
+
+    #[test]
+    fn canonical_tool_args_plain_string_value() {
+        let raw = r#""hello""#;
+        assert_eq!(canonical_tool_args(raw), r#""hello""#);
+    }
+
+    #[test]
+    fn canonical_tool_args_number_value() {
+        assert_eq!(canonical_tool_args("42"), "42");
+    }
+
+    #[test]
+    fn canonical_tool_args_empty_object() {
+        assert_eq!(canonical_tool_args("{}"), "{}");
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    //  server_tool_call_signature — edge cases
+    // ══════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn signature_empty_tool_calls() {
+        let sigs = server_tool_call_signature(&[]);
+        assert!(sigs.is_empty());
+    }
+
+    #[test]
+    fn signature_multiple_tool_calls_returns_set() {
+        let tool_calls = vec![
+            serde_json::json!({"function": {"name": "bash", "arguments": r#"{"cmd":"ls"}"#}}),
+            serde_json::json!({"function": {"name": "read_file", "arguments": r#"{"path":"a.rs"}"#}}),
+        ];
+        let sigs = server_tool_call_signature(&tool_calls);
+        assert_eq!(sigs.len(), 2);
+    }
+
+    #[test]
+    fn signature_dedup_identical_tool_calls() {
+        let tc = serde_json::json!({"function": {"name": "bash", "arguments": r#"{"cmd":"ls"}"#}});
+        let sigs = server_tool_call_signature(&[tc.clone(), tc]);
+        assert_eq!(sigs.len(), 1, "BTreeSet should dedup identical signatures");
+    }
+
+    #[test]
+    fn signature_missing_name_field() {
+        let tool_calls = vec![serde_json::json!({"function": {"arguments": r#"{"x":1}"#}})];
+        let sigs = server_tool_call_signature(&tool_calls);
+        assert_eq!(sigs.len(), 1);
+        let sig = sigs.iter().next().unwrap();
+        assert!(sig.starts_with(':'), "missing name should produce empty prefix");
+    }
+
+    #[test]
+    fn signature_missing_arguments_field() {
+        let tool_calls = vec![serde_json::json!({"function": {"name": "bash"}})];
+        let sigs = server_tool_call_signature(&tool_calls);
+        let sig = sigs.iter().next().unwrap();
+        assert!(sig.starts_with("bash:"));
+    }
+
+    #[test]
+    fn signature_completely_empty_object() {
+        let tool_calls = vec![serde_json::json!({})];
+        let sigs = server_tool_call_signature(&tool_calls);
+        assert_eq!(sigs.len(), 1);
+        // Falls through to flat branch: empty name, empty args
+        let sig = sigs.iter().next().unwrap();
+        assert!(sig.starts_with(':'));
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    //  record_server_tool_signatures
+    // ══════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn record_sigs_empty_tool_calls_clears_history() {
+        let mut sigs = vec![BTreeSet::from(["bash:{}".to_string()])];
+        record_server_tool_signatures(&mut sigs, &[], 5);
+        assert!(sigs.is_empty());
+    }
+
+    #[test]
+    fn record_sigs_window_trims_oldest() {
+        let mut sigs: Vec<BTreeSet<String>> = Vec::new();
+        let calls = vec![serde_json::json!({"name": "bash", "arguments": {"cmd": "ls"}})];
+        for _ in 0..5 {
+            record_server_tool_signatures(&mut sigs, &calls, 3);
+        }
+        assert_eq!(sigs.len(), 3, "should trim to window size");
+    }
+
+    #[test]
+    fn record_sigs_single_call() {
+        let mut sigs: Vec<BTreeSet<String>> = Vec::new();
+        let calls = vec![serde_json::json!({"name": "grep", "arguments": {"pattern": "foo"}})];
+        record_server_tool_signatures(&mut sigs, &calls, 5);
+        assert_eq!(sigs.len(), 1);
+        assert!(sigs[0].iter().any(|s| s.contains("grep")));
+    }
+
+    #[test]
+    fn record_sigs_exactly_at_window_no_trim() {
+        let mut sigs: Vec<BTreeSet<String>> = Vec::new();
+        let calls = vec![serde_json::json!({"name": "bash", "arguments": {}})];
+        for _ in 0..3 {
+            record_server_tool_signatures(&mut sigs, &calls, 3);
+        }
+        assert_eq!(sigs.len(), 3, "exactly at window should not over-trim");
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    //  detect_server_stall — additional cases
+    // ══════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn stall_empty_input() {
+        assert!(!detect_server_stall(&[], 3));
+    }
+
+    #[test]
+    fn stall_detected_in_longer_history() {
+        // Varied history followed by 3 identical → stall
+        let sigs = make_sigs(&[&["grep"], &["list_dir"], &["bash"], &["bash"], &["bash"]]);
+        assert!(detect_server_stall(&sigs, 3));
+    }
+
+    #[test]
+    fn stall_not_detected_when_last_entry_differs() {
+        let sigs = make_sigs(&[&["bash"], &["bash"], &["grep"]]);
+        assert!(!detect_server_stall(&sigs, 3));
+    }
+
+    #[test]
+    fn stall_multi_tool_identical_rounds() {
+        // Multi-tool rounds that are identical
+        let round: BTreeSet<String> = ["bash:{}".to_string(), "grep:{}".to_string()]
+            .into_iter()
+            .collect();
+        let sigs = vec![round.clone(), round.clone(), round];
+        assert!(detect_server_stall(&sigs, 3));
+    }
+
+    #[test]
+    fn stall_multi_tool_one_round_differs() {
+        let round_a: BTreeSet<String> = ["bash:{}".to_string(), "grep:{}".to_string()]
+            .into_iter()
+            .collect();
+        let round_b: BTreeSet<String> = ["bash:{}".to_string(), "list_dir:{}".to_string()]
+            .into_iter()
+            .collect();
+        let sigs = vec![round_a.clone(), round_b, round_a];
+        assert!(!detect_server_stall(&sigs, 3));
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    //  detect_cli_tool_name_stall — additional cases
+    // ══════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn cli_name_stall_empty_input() {
+        assert!(!detect_cli_tool_name_stall(&[], 3));
+    }
+
+    #[test]
+    fn cli_name_stall_single_entry() {
+        let one: HashSet<String> = HashSet::from_iter([String::from("bash")]);
+        assert!(!detect_cli_tool_name_stall(&[one], 3));
+    }
+
+    #[test]
+    fn cli_name_stall_multi_tool_identical_sets() {
+        let set: HashSet<String> =
+            HashSet::from_iter(["bash".to_string(), "read_file".to_string()]);
+        let v = vec![set.clone(), set.clone(), set];
+        assert!(detect_cli_tool_name_stall(&v, 3));
+    }
+
+    #[test]
+    fn cli_name_stall_window_of_one() {
+        let one: HashSet<String> = HashSet::from_iter([String::from("bash")]);
+        assert!(detect_cli_tool_name_stall(&[one], 1));
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    //  detect_divergence_with_budget — custom budgets
+    // ══════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn divergence_with_budget_2_triggers_at_2() {
+        let sigs = make_sigs(&[&["bash"], &["read_file"]]);
+        assert_eq!(
+            detect_divergence_with_budget(&sigs, 2),
+            DivergenceStatus::Diverging(2)
+        );
+    }
+
+    #[test]
+    fn divergence_with_budget_2_exploring_at_1() {
+        let sigs = make_sigs(&[&["github_list_prs"], &["bash"]]);
+        assert_eq!(
+            detect_divergence_with_budget(&sigs, 2),
+            DivergenceStatus::Exploring(1)
+        );
+    }
+
+    #[test]
+    fn divergence_with_budget_1_triggers_immediately() {
+        let sigs = make_sigs(&[&["bash"]]);
+        assert_eq!(
+            detect_divergence_with_budget(&sigs, 1),
+            DivergenceStatus::Diverging(1)
+        );
+    }
+
+    #[test]
+    fn divergence_with_budget_larger_than_history() {
+        let sigs = make_sigs(&[&["bash"], &["read_file"]]);
+        assert_eq!(
+            detect_divergence_with_budget(&sigs, 10),
+            DivergenceStatus::Exploring(2)
+        );
+    }
+
+    #[test]
+    fn divergence_with_budget_empty_sigs() {
+        assert_eq!(
+            detect_divergence_with_budget(&[], 5),
+            DivergenceStatus::Healthy
+        );
+    }
+
+    #[test]
+    fn divergence_empty_sig_set_breaks_chain() {
+        // An empty sig set in the middle should break the consecutive chain
+        let mut sigs = make_sigs(&[&["bash"], &["read_file"]]);
+        sigs.push(BTreeSet::new()); // empty round
+        sigs.extend(make_sigs(&[&["bash"]]));
+        assert_eq!(detect_divergence(&sigs), DivergenceStatus::Exploring(1));
+    }
+
+    #[test]
+    fn divergence_non_exploration_tool_breaks_chain() {
+        // A single productive tool among exploration breaks the chain
+        let sigs = make_sigs(&[
+            &["bash"],
+            &["read_file"],
+            &["write_file"], // productive!
+            &["bash"],
+            &["grep"],
+        ]);
+        assert_eq!(detect_divergence(&sigs), DivergenceStatus::Exploring(2));
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    //  detect_nudge_ignored — additional cases
+    // ══════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn nudge_ignored_all_tools_violated() {
+        let avoid = vec!["bash".to_string(), "grep".to_string()];
+        let used: HashSet<String> =
+            HashSet::from_iter(["bash".to_string(), "grep".to_string()]);
+        let mut ignored = detect_nudge_ignored(&avoid, &used);
+        ignored.sort();
+        assert_eq!(ignored, vec!["bash".to_string(), "grep".to_string()]);
+    }
+
+    #[test]
+    fn nudge_ignored_empty_current_tools() {
+        let avoid = vec!["bash".to_string()];
+        let used: HashSet<String> = HashSet::new();
+        assert!(detect_nudge_ignored(&avoid, &used).is_empty());
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    //  build_stall_reflection — additional cases
+    // ══════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn reflection_empty_sigs() {
+        let reflection = build_stall_reflection(&[], &[], 0);
+        assert!(!reflection.what_happened.is_empty());
+        assert!(reflection.confidence > 0.0);
+    }
+
+    #[test]
+    fn reflection_single_sig() {
+        let sigs = make_sigs(&[&["bash"]]);
+        let reflection = build_stall_reflection(&sigs, &[], 0);
+        assert!(!reflection.what_happened.is_empty());
+    }
+
+    #[test]
+    fn reflection_non_exploration_escalation_with_nudge() {
+        let sigs = make_sigs(&[
+            &["github_list_prs"],
+            &["github_list_prs"],
+            &["github_list_prs"],
+        ]);
+        let r = build_stall_reflection(&sigs, &[], 1);
+        assert!(
+            r.what_to_try.contains("STOP"),
+            "nudge_count=1 should escalate: {}",
+            r.what_to_try
+        );
+        assert!(r.confidence <= 0.7);
+    }
+
+    #[test]
+    fn reflection_generic_stall_with_nudge_escalation() {
+        // Few occurrences of each tool → generic stall path
+        let sigs = make_sigs(&[&["tool_a"], &["tool_b"]]);
+        let r0 = build_stall_reflection(&sigs, &[], 0);
+        let r1 = build_stall_reflection(&sigs, &[], 1);
+        assert!(
+            r1.what_to_try.contains("FINAL WARNING"),
+            "second nudge on generic stall should escalate"
+        );
+        assert!(r1.confidence < r0.confidence);
+    }
+
+    #[test]
+    fn reflection_avoid_tools_dedup_with_error_tools() {
+        // top_tool is already in error_tools — should not duplicate
+        let sigs = make_sigs(&[&["bash"], &["bash"], &["bash"]]);
+        let r = build_stall_reflection(&sigs, &["bash"], 0);
+        let bash_count = r.avoid_tools.iter().filter(|t| *t == "bash").count();
+        assert_eq!(bash_count, 1, "bash should appear only once in avoid_tools");
+    }
+
+    #[test]
+    fn reflection_window_caps_at_six() {
+        // 10 rounds but only 6 should be analyzed
+        let sigs = make_sigs(&[
+            &["bash"],
+            &["bash"],
+            &["bash"],
+            &["bash"],
+            &["bash"],
+            &["bash"],
+            &["bash"],
+            &["bash"],
+            &["bash"],
+            &["bash"],
+        ]);
+        let r = build_stall_reflection(&sigs, &[], 0);
+        // "6 turns" in the what_happened string (window caps at 6)
+        assert!(r.what_happened.contains("6"), "window should cap at 6: {}", r.what_happened);
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    //  StallReflection::to_nudge_message — additional format tests
+    // ══════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn nudge_message_without_avoid_tools() {
+        let r = StallReflection {
+            what_happened: "test".to_string(),
+            why: "because".to_string(),
+            what_to_try: "something".to_string(),
+            confidence: 0.5,
+            avoid_tools: vec![],
+        };
+        let msg = r.to_nudge_message();
+        assert!(!msg.contains("Avoid these tools"));
+    }
+
+    #[test]
+    fn nudge_message_with_multiple_avoid_tools() {
+        let r = StallReflection {
+            what_happened: "test".to_string(),
+            why: "because".to_string(),
+            what_to_try: "something".to_string(),
+            confidence: 0.5,
+            avoid_tools: vec!["bash".to_string(), "grep".to_string(), "list_dir".to_string()],
+        };
+        let msg = r.to_nudge_message();
+        assert!(msg.contains("bash, grep, list_dir"));
+    }
+
+    #[test]
+    fn nudge_message_contains_all_sections() {
+        let r = StallReflection {
+            what_happened: "WHAT".to_string(),
+            why: "WHY".to_string(),
+            what_to_try: "TRY".to_string(),
+            confidence: 0.9,
+            avoid_tools: vec!["tool_x".to_string()],
+        };
+        let msg = r.to_nudge_message();
+        assert!(msg.contains("WHAT"));
+        assert!(msg.contains("WHY"));
+        assert!(msg.contains("TRY"));
+        assert!(msg.contains("tool_x"));
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    //  detect_intent_drift — additional cases
+    // ══════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn intent_drift_empty_turns() {
+        assert_eq!(detect_intent_drift("review commit", &[]), IntentDrift::OnTask);
+    }
+
+    #[test]
+    fn intent_drift_all_on_task_git_tools() {
+        let turns = make_intent_turns(&[
+            (&["git_log"], ""),
+            (&["git_diff"], "abc"),
+            (&["git_show"], "def"),
+            (&["bash"], r#"git blame file.rs"#),
+        ]);
+        assert_eq!(detect_intent_drift("review commit diff", &turns), IntentDrift::OnTask);
+    }
+
+    #[test]
+    fn intent_drift_long_query_truncated_in_correction() {
+        // Build a long query with real keywords (>=2 chars each)
+        let long_query = "deploy kubernetes cluster ".repeat(20); // 500 chars
+        let turns = make_intent_turns(&[
+            (&["write_file"], "random"),
+            (&["write_file"], "random"),
+            (&["write_file"], "random"),
+        ]);
+        if let IntentDrift::Drifting { correction, .. } =
+            detect_intent_drift(&long_query, &turns)
+        {
+            // Correction should contain the query truncated to 100 chars
+            assert!(correction.len() < long_query.len() + 200);
+            assert!(correction.contains("INTENT DRIFT"));
+        } else {
+            panic!("Expected Drifting for unrelated tools");
+        }
+    }
+
+    #[test]
+    fn intent_drift_short_keywords_filtered() {
+        // Query with only 1-char words should be treated as empty → OnTask
+        let turns = make_intent_turns(&[
+            (&["write_file"], "x"),
+            (&["write_file"], "y"),
+            (&["write_file"], "z"),
+        ]);
+        assert_eq!(detect_intent_drift("a b c", &turns), IntentDrift::OnTask);
+    }
+
+    #[test]
+    fn intent_drift_always_on_task_tools_at_end() {
+        // Off-task tools then a meta-tool at the very end → resets counter
+        let turns = make_intent_turns(&[
+            (&["write_file"], "random"),
+            (&["write_file"], "random"),
+            (&["reflect"], "anything"),
+        ]);
+        assert_eq!(detect_intent_drift("review commit", &turns), IntentDrift::OnTask);
+    }
+
+    #[test]
+    fn intent_drift_exactly_at_window_boundary() {
+        // Exactly INTENT_DRIFT_WINDOW off-task turns → triggers drift
+        let mut turns = Vec::new();
+        for _ in 0..INTENT_DRIFT_WINDOW {
+            turns.push((vec!["write_file".to_string()], "random".to_string()));
+        }
+        assert!(matches!(
+            detect_intent_drift("review commit", &turns),
+            IntentDrift::Drifting { .. }
+        ));
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    //  round_tool_call_sig_and_names — additional cases
+    // ══════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn round_sig_and_names_empty_calls() {
+        let (sigs, names) = round_tool_call_sig_and_names(&[]);
+        assert!(sigs.is_empty());
+        assert!(names.is_empty());
+    }
+
+    #[test]
+    fn round_sig_and_names_multiple_tools() {
+        let calls = vec![
+            serde_json::json!({"name": "bash", "arguments": {"cmd": "ls"}}),
+            serde_json::json!({"name": "read_file", "arguments": {"path": "a.rs"}}),
+        ];
+        let (sigs, names) = round_tool_call_sig_and_names(&calls);
+        assert_eq!(sigs.len(), 2);
+        assert!(names.contains("bash"));
+        assert!(names.contains("read_file"));
+    }
+
+    #[test]
+    fn round_sig_and_names_dedup_names() {
+        // Two calls to bash with different args → 2 sigs but 1 unique name
+        let calls = vec![
+            serde_json::json!({"name": "bash", "arguments": {"cmd": "ls"}}),
+            serde_json::json!({"name": "bash", "arguments": {"cmd": "pwd"}}),
+        ];
+        let (sigs, names) = round_tool_call_sig_and_names(&calls);
+        assert_eq!(sigs.len(), 2, "different args → different sigs");
+        assert_eq!(names.len(), 1, "same tool name → one entry in HashSet");
+    }
+
+    #[test]
+    fn round_sig_and_names_missing_fields() {
+        let calls = vec![serde_json::json!({})];
+        let (sigs, names) = round_tool_call_sig_and_names(&calls);
+        assert_eq!(sigs.len(), 1);
+        assert!(names.contains(""));
+    }
 }

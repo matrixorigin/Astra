@@ -1986,4 +1986,185 @@ mod tests {
             "low confidence advisory should be in session section"
         );
     }
+
+    // ── Confidence boundary ──────────────────────────────────────
+
+    #[test]
+    fn prompt_no_low_confidence_at_exact_threshold() {
+        // Uses strict `<`, so exactly-at-threshold should NOT trigger.
+        let p = build_main_system_prompt(&["bash"], "", LOW_CONFIDENCE_THRESHOLD, None);
+        assert!(
+            !p.contains("Low-Confidence"),
+            "confidence == threshold (strict <) should NOT trigger advisory"
+        );
+    }
+
+    #[test]
+    fn prompt_low_confidence_at_zero() {
+        let p = build_main_system_prompt(&["bash"], "", 0.0, None);
+        assert!(p.contains("Low-Confidence"));
+    }
+
+    // ── Code-navigation sub-tool guidance ────────────────────────
+
+    #[test]
+    fn prompt_call_graph_guidance_when_present() {
+        let p = build_main_system_prompt(&["call_graph", "find_definition"], "", 0.5, None);
+        assert!(p.contains("call_graph"), "should mention call_graph tool");
+        assert!(p.contains("callers=true"), "should describe callers mode");
+        assert!(
+            p.contains("scope='project'"),
+            "should describe project scope"
+        );
+    }
+
+    #[test]
+    fn prompt_rename_symbol_guidance_when_present() {
+        let p = build_main_system_prompt(&["rename_symbol"], "", 0.5, None);
+        assert!(p.contains("rename_symbol"));
+        assert!(p.contains("AST-validated"));
+        assert!(p.contains("dry_run=true"));
+    }
+
+    #[test]
+    fn prompt_dead_code_extract_members_type_hierarchy() {
+        let p = build_main_system_prompt(
+            &["dead_code", "extract_members", "type_hierarchy"],
+            "",
+            0.5,
+            None,
+        );
+        assert!(p.contains("dead_code"));
+        assert!(p.contains("Find unused symbols"));
+        assert!(p.contains("extract_members"));
+        assert!(p.contains("fields+methods"));
+        assert!(p.contains("type_hierarchy"));
+        assert!(p.contains("implements trait"));
+    }
+
+    // ── Editing strategy (multi_edit) ────────────────────────────
+
+    #[test]
+    fn prompt_multi_edit_includes_editing_strategy() {
+        let p = build_main_system_prompt(&["multi_edit"], "", 0.5, None);
+        assert!(p.contains("Editing Strategy"));
+        assert!(p.contains("multi_edit"));
+        assert!(p.contains("atomic"));
+        assert!(p.contains("delete_file"));
+    }
+
+    #[test]
+    fn prompt_editing_strategy_absent_without_multi_edit() {
+        let p = build_main_system_prompt(&["bash", "read_file"], "", 0.5, None);
+        assert!(!p.contains("Editing Strategy"));
+    }
+
+    // ── Unknown task type ────────────────────────────────────────
+
+    #[test]
+    fn prompt_unknown_task_type_no_task_strategy() {
+        let p = build_main_system_prompt(&["bash"], "", 0.5, Some("nonexistent_type"));
+        assert!(p.contains("Core Rules"), "base content should be present");
+        assert!(!p.contains("Code Review Strategy"));
+        assert!(!p.contains("Debugging Strategy"));
+        assert!(!p.contains("Exploration Strategy"));
+        assert!(!p.contains("Implementation Strategy"));
+        assert!(!p.contains("Refactoring Strategy"));
+        assert!(!p.contains("Testing Strategy"));
+        assert!(!p.contains("Documentation Strategy"));
+        assert!(!p.contains("Performance Strategy"));
+        assert!(!p.contains("Analysis Strategy"));
+        assert!(!p.contains("Deployment Strategy"));
+    }
+
+    // ── Search strategy with only read_file ──────────────────────
+
+    #[test]
+    fn prompt_search_strategy_with_only_read_file() {
+        let p = build_main_system_prompt(&["read_file"], "", 0.5, None);
+        assert!(
+            p.contains("Search Strategy"),
+            "read_file alone should trigger search strategy"
+        );
+    }
+
+    // ── git_ vs github_ tool distinction ─────────────────────────
+
+    #[test]
+    fn prompt_git_prefix_without_github_omits_github_rule() {
+        let p = build_main_system_prompt(&["git_diff", "git_log"], "", 0.5, None);
+        assert!(
+            p.contains("specific tools"),
+            "git_ prefix triggers tool preference"
+        );
+        assert!(
+            !p.contains("GitHub data"),
+            "should NOT have GitHub-specific rule without github_ tools"
+        );
+    }
+
+    #[test]
+    fn prompt_github_tools_trigger_both_rules() {
+        let p = build_main_system_prompt(&["github_list_prs"], "", 0.5, None);
+        assert!(
+            p.contains("specific tools"),
+            "github_ triggers preference rule"
+        );
+        assert!(
+            p.contains("GitHub data"),
+            "github_ triggers GitHub-specific rule"
+        );
+    }
+
+    // ── Profile desc in no-tools path ────────────────────────────
+
+    #[test]
+    fn prompt_no_tools_includes_profile_desc() {
+        let p = build_main_system_prompt(&[], "\n## Project: MyApp\n", 0.5, None);
+        assert!(p.contains("NO tools available"));
+        assert!(p.contains("Project: MyApp"));
+    }
+
+    // ── sections_to_string edge case ─────────────────────────────
+
+    #[test]
+    fn sections_to_string_empty_input() {
+        let result = sections_to_string(&[]);
+        assert!(result.is_empty(), "empty sections should produce empty string");
+    }
+
+    // ── All code-nav tools in session scope ──────────────────────
+
+    #[test]
+    fn sections_all_code_nav_tools_in_session_scope() {
+        let tools = vec![
+            "find_definition",
+            "find_references",
+            "call_graph",
+            "rename_symbol",
+            "dead_code",
+            "extract_members",
+            "type_hierarchy",
+        ];
+        let sections = build_system_prompt_sections(&tools, "", 0.8, None);
+        let session = &sections[1];
+        assert!(session.text.contains("Code Navigation"));
+        assert!(session.text.contains("call_graph"));
+        assert!(session.text.contains("rename_symbol"));
+        assert!(session.text.contains("dead_code"));
+        assert!(session.text.contains("extract_members"));
+        assert!(session.text.contains("type_hierarchy"));
+    }
+
+    // ── Empty-tools + empty-profile section behavior ─────────────
+
+    #[test]
+    fn sections_empty_tools_empty_profile_still_has_profile_section() {
+        // Empty-tools code path always returns a profile section (even empty).
+        let sections = build_system_prompt_sections(&[], "", 0.5, None);
+        assert_eq!(sections.len(), 2, "empty tools path always returns 2 sections");
+        assert_eq!(sections[0].scope, CacheScope::Global);
+        assert_eq!(sections[1].scope, CacheScope::None);
+        assert!(sections[1].text.is_empty());
+    }
 }
