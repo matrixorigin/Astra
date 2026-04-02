@@ -48,6 +48,7 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     // ── Advanced ──────────────────────────────────────────────────────────
     ("/doctor", "Run diagnostics"),
     ("/version", "Show version info"),
+    ("/ux", "Demo Cursor-style input UX (fixed input box)"),
     (
         "/session",
         "Session info: cwd, git, workspace.yaml, REPL state",

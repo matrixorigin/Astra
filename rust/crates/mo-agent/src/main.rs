@@ -1857,6 +1857,113 @@ fn format_bytes(bytes: u64) -> String {
     }
 }
 
+// ═══════════════════════════════════════════════ Cursor-style UX Demo ═════
+
+/// Demo of Cursor-style UX with fixed input box and status bar.
+///
+/// This demonstrates the event_loop module's capabilities:
+/// - Fixed input box at bottom
+/// - Status bar above input
+/// - Non-blocking input (can type while "thinking")
+///
+/// Type 'exit' or press Ctrl+D to exit the demo.
+fn run_cursor_style_demo() {
+    use event_loop::{EventLoopRunner, StatusMode};
+    use std::time::Duration;
+
+    eprintln!();
+    eprintln!("  {} Cursor-style UX Demo", "🎨".cyan());
+    eprintln!(
+        "  {} Input box stays at bottom, status bar above",
+        "→".dim()
+    );
+    eprintln!("  {} Type 'exit' or Ctrl+D to exit demo", "→".dim());
+    eprintln!();
+
+    // Enter raw mode for event-driven input.
+    if let Err(e) = EventLoopRunner::enter_raw_mode() {
+        eprintln!("  {} Failed to enter raw mode: {}", "✗".red(), e);
+        return;
+    }
+
+    let result = (|| -> std::io::Result<()> {
+        let mut runner = EventLoopRunner::new()?;
+        runner.set_model("demo");
+        runner.set_session(Some("cursor-demo"));
+        runner.set_mode(StatusMode::Normal);
+        runner.set_tokens(1234, 567);
+
+        // Initial render.
+        runner.render()?;
+
+        loop {
+            // Poll for input (50ms timeout).
+            match runner.poll_command(Duration::from_millis(50))? {
+                Some(cmd) if cmd == "exit" || cmd == "/exit" => {
+                    break;
+                }
+                Some(cmd) if cmd.is_empty() => {
+                    // Empty input, continue.
+                }
+                Some(cmd) => {
+                    // Simulate "thinking" for the command.
+                    runner.set_busy(true);
+                    runner.status.is_thinking = true;
+                    runner.render()?;
+
+                    // Print the command (scroll output above input).
+                    runner.layout.move_to_status()?;
+                    crossterm::execute!(
+                        std::io::stdout(),
+                        crossterm::cursor::MoveUp(1),
+                        crossterm::cursor::MoveToColumn(0)
+                    )?;
+                    println!("{}  You typed: {}", "❯".cyan(), cmd.as_str().green());
+
+                    // Simulate thinking delay.
+                    std::thread::sleep(Duration::from_millis(500));
+
+                    // Print response.
+                    println!("{}  Echo: {}", "●".yellow(), &cmd);
+
+                    // Update tokens.
+                    runner.set_tokens(
+                        runner.status.tokens.0 + cmd.len() as u64,
+                        runner.status.tokens.1 + cmd.len() as u64,
+                    );
+
+                    runner.set_busy(false);
+                    runner.render()?;
+                }
+                None => {
+                    // Check for cancellation.
+                    if runner.cancel_token.is_cancelled() {
+                        runner.cancel_token.reset();
+                        runner.set_busy(false);
+                        runner.render()?;
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    })();
+
+    // Exit raw mode.
+    let _ = EventLoopRunner::exit_raw_mode();
+
+    // Clear the fixed layout.
+    print!("\x1b[2J\x1b[H"); // Clear screen and move to top.
+    let _ = std::io::Write::flush(&mut std::io::stdout());
+
+    if let Err(e) = result {
+        eprintln!("  {} Demo error: {}", "✗".red(), e);
+    } else {
+        eprintln!();
+        eprintln!("  {} Cursor-style UX demo ended.", "✓".green());
+    }
+}
+
 // ═══════════════════════════════════════════════ Plan Auto-Execution ═════
 
 /// Build a [`TaskLearningBridge`] from ReplState's shared pipeline components.
@@ -3285,6 +3392,10 @@ async fn handle_slash_command(
 
         "/learn" => {
             handle_learn_command(arg, state);
+        }
+
+        "/ux" => {
+            run_cursor_style_demo();
         }
 
         "/exit" | "/quit" => {
