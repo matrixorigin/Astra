@@ -148,6 +148,51 @@ pub fn assistant_message_with_tool_calls_and_reasoning(
     msg
 }
 
+/// Strip `reasoning_content` values from older assistant messages to reduce token usage.
+///
+/// Thinking-model sessions accumulate large reasoning chains on every assistant message.
+/// Since the LLM gains no benefit from re-reading old reasoning, we clear the value
+/// (replace with empty string) on all assistant messages **except** the last one.
+/// The field is kept (as empty string) so thinking-model API contracts are satisfied.
+///
+/// **Only affects the in-flight messages array** — heavy checkpoints and persisted events
+/// retain the full reasoning for debugging and audit.
+pub fn strip_stale_reasoning(messages: &mut [Value]) {
+    // Find index of the last assistant message that has non-empty reasoning.
+    let last_reasoning_idx = messages
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(_, m)| {
+            m.get("role").and_then(Value::as_str) == Some("assistant")
+                && m.get("reasoning_content")
+                    .and_then(Value::as_str)
+                    .is_some_and(|s| !s.is_empty())
+        })
+        .map(|(i, _)| i);
+
+    let Some(last_idx) = last_reasoning_idx else {
+        return; // No reasoning in history — nothing to strip.
+    };
+
+    for (i, msg) in messages.iter_mut().enumerate() {
+        if i >= last_idx {
+            break;
+        }
+        if msg.get("role").and_then(Value::as_str) != Some("assistant") {
+            continue;
+        }
+        if msg
+            .get("reasoning_content")
+            .and_then(Value::as_str)
+            .is_some_and(|s| !s.is_empty())
+        {
+            // Replace with empty string (keep field for API compat).
+            msg["reasoning_content"] = Value::String(String::new());
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -306,5 +351,57 @@ mod tests {
             json!({"role": "assistant", "content": "hello"}),
         ];
         assert!(!history_has_reasoning(&messages));
+    }
+
+    // ── strip_stale_reasoning tests ──────────────────────────────────────
+
+    #[test]
+    fn strip_stale_reasoning_clears_old_keeps_latest() {
+        let mut msgs = vec![
+            json!({"role": "user", "content": "q1"}),
+            json!({"role": "assistant", "content": null, "reasoning_content": "think1", "tool_calls": []}),
+            json!({"role": "tool", "tool_call_id": "t1", "content": "r1"}),
+            json!({"role": "user", "content": "q2"}),
+            json!({"role": "assistant", "content": null, "reasoning_content": "think2", "tool_calls": []}),
+            json!({"role": "tool", "tool_call_id": "t2", "content": "r2"}),
+        ];
+        strip_stale_reasoning(&mut msgs);
+        // First assistant: reasoning cleared to empty
+        assert_eq!(msgs[1]["reasoning_content"].as_str(), Some(""));
+        // Second assistant: reasoning preserved
+        assert_eq!(msgs[4]["reasoning_content"].as_str(), Some("think2"));
+    }
+
+    #[test]
+    fn strip_stale_reasoning_noop_without_reasoning() {
+        let mut msgs = vec![
+            json!({"role": "user", "content": "hi"}),
+            json!({"role": "assistant", "content": "hello"}),
+        ];
+        let original = msgs.clone();
+        strip_stale_reasoning(&mut msgs);
+        assert_eq!(msgs, original);
+    }
+
+    #[test]
+    fn strip_stale_reasoning_noop_single_reasoning() {
+        let mut msgs = vec![
+            json!({"role": "user", "content": "hi"}),
+            json!({"role": "assistant", "reasoning_content": "deep thought", "content": "42"}),
+        ];
+        strip_stale_reasoning(&mut msgs);
+        assert_eq!(msgs[1]["reasoning_content"].as_str(), Some("deep thought"));
+    }
+
+    #[test]
+    fn strip_stale_reasoning_preserves_empty_field() {
+        let mut msgs = vec![
+            json!({"role": "assistant", "reasoning_content": "", "content": "a"}),
+            json!({"role": "assistant", "reasoning_content": "real", "content": "b"}),
+        ];
+        strip_stale_reasoning(&mut msgs);
+        // Already-empty field stays empty (not removed).
+        assert_eq!(msgs[0]["reasoning_content"].as_str(), Some(""));
+        assert_eq!(msgs[1]["reasoning_content"].as_str(), Some("real"));
     }
 }

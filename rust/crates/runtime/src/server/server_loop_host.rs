@@ -343,6 +343,8 @@ impl ServerAgenticLoopHost {
         .await;
 
         llm_messages.extend(compact_result.messages);
+        // Strip old reasoning to reduce input tokens (see edge_ledger::strip_stale_reasoning).
+        crate::turn::edge_ledger::strip_stale_reasoning(&mut llm_messages);
         llm_messages
     }
 

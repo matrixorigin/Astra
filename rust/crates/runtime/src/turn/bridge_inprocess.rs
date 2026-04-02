@@ -1243,6 +1243,12 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
 
             llm_messages.extend(merged_messages);
 
+            // Strip old reasoning_content from history messages to reduce token
+            // usage. Keeps the field (as empty string) for thinking-model API
+            // compat; only the most recent assistant reasoning is preserved.
+            // Heavy checkpoints and persisted events retain full reasoning.
+            super::edge_ledger::strip_stale_reasoning(&mut llm_messages);
+
             // Cloud loop: every tool round waits on §5.5 ledger (`POST /tools/result`) then continues LLM.
             let mut merged_tool_results: Vec<Value> = tool_results.clone();
 
