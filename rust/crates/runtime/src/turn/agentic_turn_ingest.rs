@@ -117,7 +117,9 @@ pub fn ingest_agentic_turn_stream(
     if snap.run_id.is_some() {
         *st.current_run_id = snap.run_id.clone();
     }
-    if !snap.full_text.is_empty() {
+    let round_has_edge_work = !snap.tool_calls.is_empty() || edge_round_len > 0;
+
+    if !snap.full_text.is_empty() && !round_has_edge_work {
         *st.final_text = snap.full_text.to_string();
 
         let guard = apply_response_guards(st.final_text.as_str(), snap.tool_calls, &[], message);
@@ -165,7 +167,6 @@ pub fn ingest_agentic_turn_stream(
         return AgenticTurnIngestOutcome::Fatal(err.clone());
     }
 
-    let round_has_edge_work = !snap.tool_calls.is_empty() || edge_round_len > 0;
     if !round_has_edge_work {
         if should_force_factual_tool_retry(
             st.task_profile,
@@ -402,5 +403,191 @@ mod tests {
         );
         assert_eq!(out, AgenticTurnIngestOutcome::HasToolCalls);
         assert!(pack.all_tools_used.contains("read_file"));
+    }
+
+    #[test]
+    fn tool_turn_draft_text_does_not_replace_final_text() {
+        let tcs = vec![json!({"name": "bash", "arguments": {}})];
+        let snap = AgenticTurnStreamSnapshot {
+            ttft_ms: None,
+            session_id: &None,
+            run_id: &None,
+            full_text: "draft summary that should not stick",
+            tool_calls: &tcs,
+            prompt_tokens: 1,
+            completion_tokens: 2,
+            has_usage: true,
+            error_message: &None,
+        };
+        let mut pack = Pack::new();
+        pack.final_text = "previous stable answer".to_string();
+        let out = ingest_agentic_turn_stream(
+            &snap,
+            0,
+            |_| String::new(),
+            "hi",
+            &[],
+            true,
+            pack.ingest_mut(),
+        );
+        assert_eq!(out, AgenticTurnIngestOutcome::HasToolCalls);
+        assert_eq!(pack.final_text, "previous stable answer");
+    }
+
+    // ─── Factual retry injection tests ──────────────────────────────────────
+
+    #[test]
+    fn factual_retry_injects_nudge_and_clears_text() {
+        // When LLM answers a live-data query with zero tool calls,
+        // ingest should inject a retry nudge and return Continue.
+        let snap = AgenticTurnStreamSnapshot {
+            ttft_ms: Some(50),
+            session_id: &None,
+            run_id: &None,
+            full_text: "Here are your recent PRs: ...",
+            tool_calls: &[],
+            prompt_tokens: 100,
+            completion_tokens: 200,
+            has_usage: true,
+            error_message: &None,
+        };
+        let mut pack = Pack::new();
+        let out = ingest_agentic_turn_stream(
+            &snap,
+            0,
+            |_| String::new(),
+            "show me the latest PR",
+            &[],
+            true,
+            pack.ingest_mut(),
+        );
+        assert_eq!(out, AgenticTurnIngestOutcome::Continue);
+        assert!(pack.forced_factual_retry, "flag should be set");
+        assert!(pack.final_text.is_empty(), "text should be cleared");
+        assert_eq!(pack.messages.len(), 1, "nudge message should be injected");
+        let nudge = &pack.messages[0];
+        assert_eq!(nudge["role"], "user");
+        assert!(
+            nudge["content"]
+                .as_str()
+                .unwrap()
+                .contains("Runtime correction"),
+        );
+    }
+
+    #[test]
+    fn factual_retry_does_not_fire_twice() {
+        let snap = AgenticTurnStreamSnapshot {
+            ttft_ms: None,
+            session_id: &None,
+            run_id: &None,
+            full_text: "fabricated answer",
+            tool_calls: &[],
+            prompt_tokens: 10,
+            completion_tokens: 20,
+            has_usage: true,
+            error_message: &None,
+        };
+        let mut pack = Pack::new();
+        pack.forced_factual_retry = true; // already retried once
+        let out = ingest_agentic_turn_stream(
+            &snap,
+            0,
+            |_| String::new(),
+            "show me the latest PR",
+            &[],
+            true,
+            pack.ingest_mut(),
+        );
+        // Should break, not retry again
+        assert_eq!(out, AgenticTurnIngestOutcome::Break);
+        assert!(pack.messages.is_empty(), "no nudge on second attempt");
+    }
+
+    #[test]
+    fn factual_retry_skipped_when_tools_were_called() {
+        let snap = AgenticTurnStreamSnapshot {
+            ttft_ms: None,
+            session_id: &None,
+            run_id: &None,
+            full_text: "Based on the PR data...",
+            tool_calls: &[],
+            prompt_tokens: 10,
+            completion_tokens: 20,
+            has_usage: true,
+            error_message: &None,
+        };
+        let mut pack = Pack::new();
+        pack.total_tool_calls = 3; // tools were called in a previous round
+        let out = ingest_agentic_turn_stream(
+            &snap,
+            0,
+            |_| String::new(),
+            "show me the latest PR",
+            &[],
+            true,
+            pack.ingest_mut(),
+        );
+        assert_eq!(out, AgenticTurnIngestOutcome::Break);
+        assert!(!pack.forced_factual_retry);
+        assert!(pack.messages.is_empty());
+    }
+
+    #[test]
+    fn factual_retry_skipped_for_non_live_queries() {
+        let snap = AgenticTurnStreamSnapshot {
+            ttft_ms: None,
+            session_id: &None,
+            run_id: &None,
+            full_text: "Rust is a systems programming language...",
+            tool_calls: &[],
+            prompt_tokens: 10,
+            completion_tokens: 50,
+            has_usage: true,
+            error_message: &None,
+        };
+        let mut pack = Pack::new();
+        let out = ingest_agentic_turn_stream(
+            &snap,
+            0,
+            |_| String::new(),
+            "what is Rust?",
+            &[],
+            true,
+            pack.ingest_mut(),
+        );
+        // General knowledge question — no retry
+        assert_eq!(out, AgenticTurnIngestOutcome::Break);
+        assert!(!pack.forced_factual_retry);
+        assert!(pack.messages.is_empty());
+    }
+
+    #[test]
+    fn factual_retry_works_for_chinese_workspace_queries() {
+        let snap = AgenticTurnStreamSnapshot {
+            ttft_ms: None,
+            session_id: &None,
+            run_id: &None,
+            full_text: "代码看起来很好...",
+            tool_calls: &[],
+            prompt_tokens: 50,
+            completion_tokens: 100,
+            has_usage: true,
+            error_message: &None,
+        };
+        let mut pack = Pack::new();
+        let out = ingest_agentic_turn_stream(
+            &snap,
+            0,
+            |_| String::new(),
+            "评审当前修改",
+            &[],
+            true,
+            pack.ingest_mut(),
+        );
+        assert_eq!(out, AgenticTurnIngestOutcome::Continue);
+        assert!(pack.forced_factual_retry);
+        assert!(pack.final_text.is_empty());
+        assert_eq!(pack.messages.len(), 1);
     }
 }
