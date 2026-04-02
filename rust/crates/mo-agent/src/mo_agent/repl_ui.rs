@@ -180,9 +180,9 @@ const SLASH_FIRST_TOKEN_COMPLETIONS: &[(&str, &[(&str, &str)])] = &[
     (
         "/learn",
         &[
-            ("stats", "Learning summary (default)"),
             ("drift", "Drifting pattern detection"),
             ("explore", "Exploration opportunities"),
+            ("stats", "Learning summary (default)"),
         ],
     ),
     (
@@ -192,7 +192,125 @@ const SLASH_FIRST_TOKEN_COMPLETIONS: &[(&str, &[(&str, &str)])] = &[
             ("working", "Review working tree vs HEAD"),
         ],
     ),
+    (
+        "/skill",
+        &[
+            ("config", "Open skill config"),
+            ("dev", "Skill dev mode"),
+            ("doctor", "Skill diagnostics"),
+            ("list", "List skills"),
+            ("new", "Create skill"),
+            ("system", "System skill helpers"),
+            ("test", "Run skill test"),
+            ("validate", "Validate skill manifest"),
+        ],
+    ),
+    (
+        "/plan",
+        &[
+            ("auto", "Auto plan execution (needs args)"),
+            ("clear", "Clear plan from memory"),
+            ("cloud", "Cloud plan actions"),
+            ("decompose", "Decompose goal into subtasks"),
+            ("enter", "Enter plan with goal text"),
+            ("exit", "Exit structured plan mode"),
+            ("history", "Plan version history"),
+            ("list", "List plan history"),
+            ("off", "Plan-only chat off"),
+            ("on", "Plan-only chat on"),
+            ("parallel", "Parallel subtask hints"),
+            ("recommend", "Plan recommendations"),
+            ("replan", "Replan from memory"),
+            ("resume", "Resume saved plan"),
+            ("set", "Set active plan text"),
+            ("show", "Show plan from memory"),
+            ("stats", "Plan stats"),
+            ("timeline", "Plan timeline"),
+        ],
+    ),
+    (
+        "/task",
+        &[
+            ("add", "Create task (needs title)"),
+            ("done", "Mark task done (needs id/query)"),
+            ("list", "List tasks"),
+            ("status", "Task status (needs id/query)"),
+        ],
+    ),
+    (
+        "/memory",
+        &[("list", "List memories"), ("search", "Search memories (needs query)")],
+    ),
+    (
+        "/session",
+        &[
+            ("errors", "Session errors"),
+            ("export", "Export session"),
+            ("fork", "Fork session"),
+            ("history", "Session conversation history"),
+            ("list", "List journals"),
+        ],
+    ),
+    (
+        "/diff",
+        &[
+            ("help", "Diff usage"),
+            ("patch", "Unstaged diff alias"),
+            ("show", "git show <rev> (needs rev)"),
+            ("staged", "Staged vs HEAD"),
+            ("stat", "Diff stat vs HEAD"),
+            ("unstaged", "Unstaged only"),
+        ],
+    ),
 ];
+
+fn slash_first_token_option_list(cmd_word: &str) -> Option<&'static [(&'static str, &'static str)]> {
+    let trimmed = cmd_word.trim();
+    if !trimmed.starts_with('/') {
+        return None;
+    }
+    let lowered = trimmed.to_ascii_lowercase();
+    if let Some((_, opts)) = SLASH_FIRST_TOKEN_COMPLETIONS
+        .iter()
+        .find(|(k, _)| *k == lowered.as_str())
+    {
+        return Some(*opts);
+    }
+    let resolved = resolve_slash_command(&lowered).ok()?;
+    SLASH_FIRST_TOKEN_COMPLETIONS
+        .iter()
+        .find(|(k, _)| *k == resolved)
+        .map(|(_, v)| *v)
+}
+
+fn token_prefix_matches(tok: &str, partial: &str) -> bool {
+    let partial_lc = partial.to_ascii_lowercase();
+    tok.to_ascii_lowercase().starts_with(&partial_lc)
+}
+
+/// Cursor at end of line, no whitespace yet: Tab offers ` <subcommand>` insertions.
+fn slash_bare_command_trailing_completions(line: &str, pos: usize) -> Option<(usize, Vec<Pair>)> {
+    if pos != line.len() {
+        return None;
+    }
+    if line.contains(char::is_whitespace) {
+        return None;
+    }
+    let options = slash_first_token_option_list(line)?;
+    let start = line.len();
+    let mut matches: Vec<Pair> = options
+        .iter()
+        .map(|(tok, desc)| Pair {
+            display: format!("{:<15}  {}", tok, desc),
+            replacement: format!(" {}", tok),
+        })
+        .collect();
+    if matches.is_empty() {
+        return None;
+    }
+    matches.sort_by(|a, b| a.replacement.cmp(&b.replacement));
+    Some((start, matches))
+}
 
 /// Returns `(replacement_start_byte, candidates)` when the cursor is completing the first argument
 /// word after a registered slash command (e.g. `/stats ` → `history`).
@@ -204,10 +322,7 @@ fn slash_first_token_completions(line: &str, pos: usize) -> Option<(usize, Vec<P
     if !cmd.starts_with('/') {
         return None;
     }
-    let options = SLASH_FIRST_TOKEN_COMPLETIONS
-        .iter()
-        .find(|(c, _)| *c == cmd)?
-        .1;
+    let options = slash_first_token_option_list(cmd)?;
 
     let tail = prefix.get(space_idx + 1..)?;
     let leading_ws = tail.len() - tail.trim_start().len();
@@ -227,7 +342,7 @@ fn slash_first_token_completions(line: &str, pos: usize) -> Option<(usize, Vec<P
     let partial = token_raw;
     let mut matches: Vec<Pair> = options
         .iter()
-        .filter(|(tok, _)| tok.starts_with(partial))
+        .filter(|(tok, _)| token_prefix_matches(tok, partial))
         .map(|(tok, desc)| Pair {
             display: format!("{:<15}  {}", tok, desc),
             replacement: (*tok).to_string(),
@@ -1308,6 +1423,9 @@ impl Completer for ReplHelper {
 
             let safe_pos = pos.min(line.len());
             let before_cursor = &line[..safe_pos];
+            if let Some((start, pairs)) = slash_bare_command_trailing_completions(line, safe_pos) {
+                return Ok((start, pairs));
+            }
             if let Some((start, pairs)) = slash_first_token_completions(line, safe_pos) {
                 return Ok((start, pairs));
             }
@@ -1543,6 +1661,33 @@ mod tests {
     fn first_token_skips_when_cursor_past_first_arg() {
         let line = "/stats history more";
         assert!(slash_first_token_completions(line, line.len()).is_none());
+    }
+
+    #[test]
+    fn first_token_resolves_command_prefix() {
+        let line = "/stat ";
+        let (start, pairs) = slash_first_token_completions(line, line.len()).expect("completions");
+        assert_eq!(start, line.len());
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0].replacement, "history");
+    }
+
+    #[test]
+    fn first_token_partial_is_case_insensitive() {
+        let line = "/stats H";
+        let (start, pairs) = slash_first_token_completions(line, line.len()).expect("completions");
+        assert_eq!(&line[start..], "H");
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0].replacement, "history");
+    }
+
+    #[test]
+    fn bare_command_tab_inserts_space_then_token() {
+        let line = "/stats";
+        let (start, pairs) =
+            slash_bare_command_trailing_completions(line, line.len()).expect("completions");
+        assert_eq!(start, line.len());
+        assert!(pairs.iter().any(|p| p.replacement == " history"));
     }
 
     // ── Multi-line (Validator) ────────────────────────────────────────────────
