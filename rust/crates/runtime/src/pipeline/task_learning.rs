@@ -324,6 +324,85 @@ impl TaskLearningBridge for PipelineTaskLearningBridge {
             avg_verification_pass_rate: avg_quality,
         }))
     }
+
+    async fn learn_from_verification(
+        &self,
+        signal: &mo_agent_services::durable_task::VerificationLearningSignal,
+    ) -> Result<(), String> {
+        // 1. PatternLibrary: record per-verifier-kind outcome patterns
+        //    This lets the library track which verification strategies work/fail
+        //    for different subtask types.
+        if let Some(pl) = &self.pattern_library {
+            let mut lib = pl.lock().unwrap_or_else(|e| e.into_inner());
+
+            // Record each criterion's verifier kind as a "tool pattern"
+            let verifier_tools: Vec<String> = signal
+                .criteria_results
+                .iter()
+                .map(|c| format!("verify:{}", c.verifier_kind))
+                .collect();
+
+            if !verifier_tools.is_empty() {
+                let quality = signal.pass_rate;
+                lib.record_outcome(
+                    &verifier_tools,
+                    parse_task_type(None), // default task type
+                    None,                  // domain not available at verification time
+                    signal.all_passed,
+                    quality,
+                    None, // no user feedback at verification time
+                );
+            }
+        }
+
+        // 2. ProgressiveCalibrator: record verification-level correction signal
+        //    Failed verifications after retry indicate the task type needs higher
+        //    confidence thresholds.
+        if !signal.all_passed
+            && signal.attempt > 1
+            && let Some(pc) = &self.calibrator
+        {
+            let mut cal = pc.lock().unwrap_or_else(|e| e.into_inner());
+            let intent = format!("verify_{}", signal.subtask_id);
+            // Verification failure on retry = implicit correction needed
+            cal.record(
+                &intent,
+                None,
+                parse_task_type(None),
+                true, // was_corrected
+                None,
+            );
+        }
+
+        // 3. EntityGraph: learn from files involved in failed verifications
+        //    Files that frequently fail verification get associated with "verify" tools.
+        if !signal.all_passed
+            && let Some(eg) = &self.entity_graph
+        {
+            let mut graph = eg.lock().unwrap_or_else(|e| e.into_inner());
+            let failed_verifiers: Vec<String> = signal
+                .criteria_results
+                .iter()
+                .filter(|c| !c.passed)
+                .map(|c| format!("verify:{}", c.verifier_kind))
+                .collect();
+            for file in &signal.files {
+                if let Some(stem) = std::path::Path::new(file)
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                {
+                    graph.learn(
+                        stem,
+                        DomainHint::Code, // files are always code domain
+                        &failed_verifiers,
+                        None,
+                    );
+                }
+            }
+        }
+
+        Ok(())
+    }
 }
 
 // ─── Tests ──────────────────────────────────────────────────────────────────

@@ -1500,6 +1500,20 @@ pub trait TaskLearningBridge: Send + Sync {
     /// 4. Extract reusable templates from successful contracts
     async fn learn_from_task_outcome(&self, signal: &TaskOutcomeSignal) -> Result<(), String>;
 
+    /// Record a real-time verification result for incremental learning.
+    ///
+    /// Called after each subtask verification (not just at delivery). Allows the
+    /// learning system to detect failure patterns early and adjust tool routing
+    /// before the task completes.
+    ///
+    /// Default: no-op (override in real implementations).
+    async fn learn_from_verification(
+        &self,
+        _signal: &VerificationLearningSignal,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
     /// Extract a reusable plan template from a successful task contract.
     ///
     /// If the contract's pattern is novel enough, store it for future plan generation.
@@ -1526,6 +1540,34 @@ pub trait TaskLearningBridge: Send + Sync {
         &self,
         goal_pattern: &str,
     ) -> Result<Option<TaskPatternStats>, String>;
+}
+
+/// Signal emitted after each subtask verification for incremental learning.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VerificationLearningSignal {
+    pub task_id: String,
+    pub subtask_id: String,
+    pub subtask_title: String,
+    pub goal: String,
+    /// True if all required criteria passed.
+    pub all_passed: bool,
+    /// Number of criteria that passed / total criteria.
+    pub pass_rate: f64,
+    /// Which attempt this was (1-based).
+    pub attempt: u32,
+    /// Individual criterion results for fine-grained pattern learning.
+    pub criteria_results: Vec<CriterionLearningResult>,
+    /// Files involved in the subtask (for entity extraction).
+    pub files: Vec<String>,
+}
+
+/// Per-criterion result for learning.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CriterionLearningResult {
+    pub criterion_id: String,
+    pub verifier_kind: String,
+    pub passed: bool,
+    pub duration_ms: u64,
 }
 
 /// Historical performance stats for a task pattern.
@@ -2620,6 +2662,8 @@ pub struct LocalDurableTaskLifecycle {
     event_sender: Option<IngestionSender>,
     session_id: String,
     user_id: String,
+    /// Learning bridge for feeding verification patterns into the learning system.
+    learning_bridge: Option<Arc<dyn TaskLearningBridge>>,
 }
 
 impl LocalDurableTaskLifecycle {
@@ -2641,6 +2685,7 @@ impl LocalDurableTaskLifecycle {
             event_sender: None,
             session_id: String::new(),
             user_id: String::new(),
+            learning_bridge: None,
         }
     }
 
@@ -2658,6 +2703,7 @@ impl LocalDurableTaskLifecycle {
             event_sender: None,
             session_id: String::new(),
             user_id: String::new(),
+            learning_bridge: None,
         }
     }
 
@@ -2675,6 +2721,11 @@ impl LocalDurableTaskLifecycle {
     pub fn set_session_context(&mut self, session_id: &str, user_id: &str) {
         self.session_id = session_id.to_string();
         self.user_id = user_id.to_string();
+    }
+
+    /// Set the learning bridge for feeding verification patterns into learning.
+    pub fn set_learning_bridge(&mut self, bridge: Arc<dyn TaskLearningBridge>) {
+        self.learning_bridge = Some(bridge);
     }
 
     /// Emit a verification-related event to the cloud event stream.
@@ -3041,6 +3092,44 @@ impl DurableTaskLifecycle for LocalDurableTaskLifecycle {
             }
         }
         self.save_local(&contract)?;
+
+        // Feed verification result into learning system for real-time pattern detection
+        if let Some(bridge) = &self.learning_bridge {
+            let passed_count = report.results.iter().filter(|r| r.passed).count();
+            let total_count = report.results.len();
+            let criteria_results: Vec<CriterionLearningResult> = durable_st
+                .criteria
+                .iter()
+                .zip(report.results.iter())
+                .map(|(c, r)| CriterionLearningResult {
+                    criterion_id: c.id.clone(),
+                    verifier_kind: format!("{:?}", c.verifier)
+                        .split_whitespace()
+                        .next()
+                        .unwrap_or("unknown")
+                        .to_string(),
+                    passed: r.passed,
+                    duration_ms: r.duration_ms,
+                })
+                .collect();
+            let signal = VerificationLearningSignal {
+                task_id: task_id.to_string(),
+                subtask_id: subtask_id.to_string(),
+                subtask_title: durable_st.title.clone(),
+                goal: contract.goal.clone(),
+                all_passed: report.all_required_passed,
+                pass_rate: if total_count > 0 {
+                    passed_count as f64 / total_count as f64
+                } else {
+                    1.0
+                },
+                attempt: durable_st.retry_count + 1,
+                criteria_results,
+                files: durable_st.files.clone(),
+            };
+            let _ = bridge.learn_from_verification(&signal).await;
+        }
+
         Ok(report)
     }
 
@@ -3166,7 +3255,7 @@ impl DurableTaskLifecycle for LocalDurableTaskLifecycle {
             }),
         );
 
-        Ok(TaskDeliveryReport {
+        let report = TaskDeliveryReport {
             task_id: task_id.to_string(),
             contract_id: contract.contract_id.clone(),
             goal: contract.goal.clone(),
@@ -3177,7 +3266,27 @@ impl DurableTaskLifecycle for LocalDurableTaskLifecycle {
             total_verifications,
             risks: Vec::new(),
             timestamp: chrono::Utc::now().to_rfc3339(),
-        })
+        };
+
+        // Feed completed task into learning system for pattern extraction
+        if let Some(bridge) = &self.learning_bridge {
+            let outcome = build_outcome_signal(
+                &contract,
+                &report,
+                Vec::new(), // tools_used — populated by caller if available
+                None,       // user_rating — populated post-delivery
+                None,       // domain_hint
+                None,       // task_type
+            );
+            let _ = bridge.learn_from_task_outcome(&outcome).await;
+
+            // Extract reusable template from successful contracts
+            if contract.status == ContractStatus::Completed {
+                let _ = bridge.extract_template(&contract, &report).await;
+            }
+        }
+
+        Ok(report)
     }
 
     async fn snapshot_task_state(&self, task_id: &str) -> Result<String, String> {

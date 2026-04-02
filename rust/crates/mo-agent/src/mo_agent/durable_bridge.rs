@@ -483,7 +483,7 @@ pub fn create_local_lifecycle(
     session_dir: &std::path::Path,
     work_dir: &std::path::Path,
 ) -> Arc<dyn DurableTaskLifecycle> {
-    create_local_lifecycle_full(session_dir, work_dir, None, None, None, None)
+    create_local_lifecycle_full(session_dir, work_dir, None, None, None, None, None)
 }
 
 /// Like [`create_local_lifecycle`] but also wires cloud event streaming.
@@ -495,7 +495,15 @@ pub fn create_local_lifecycle_with_sender(
     session_id: Option<&str>,
     user_id: Option<&str>,
 ) -> Arc<dyn DurableTaskLifecycle> {
-    create_local_lifecycle_full(session_dir, work_dir, sender, session_id, user_id, None)
+    create_local_lifecycle_full(
+        session_dir,
+        work_dir,
+        sender,
+        session_id,
+        user_id,
+        None,
+        None,
+    )
 }
 
 /// Full lifecycle creation with optional cloud LLM judge.
@@ -510,6 +518,7 @@ pub fn create_local_lifecycle_full(
     session_id: Option<&str>,
     user_id: Option<&str>,
     cloud_judge: Option<Arc<dyn mo_agent_services::LlmJudge>>,
+    learning_bridge: Option<Arc<dyn mo_agent_services::TaskLearningBridge>>,
 ) -> Arc<dyn DurableTaskLifecycle> {
     let contracts_dir = session_dir.join("contracts");
     let _ = std::fs::create_dir_all(&contracts_dir);
@@ -529,6 +538,11 @@ pub fn create_local_lifecycle_full(
     }
     if let (Some(sid), Some(uid)) = (session_id, user_id) {
         lifecycle.set_session_context(sid, uid);
+    }
+
+    // Wire up learning bridge for verification → learning feedback loop
+    if let Some(bridge) = learning_bridge {
+        lifecycle.set_learning_bridge(bridge);
     }
 
     Arc::new(lifecycle)

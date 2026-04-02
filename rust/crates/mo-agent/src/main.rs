@@ -1011,6 +1011,7 @@ async fn handle_resume_command(arg: &str, profile: Option<&str>, state: &mut Rep
                             std::sync::Arc::new(j)
                                 as std::sync::Arc<dyn mo_agent_services::LlmJudge>
                         }),
+                    None, // learning_bridge — wired when pipeline components are shared
                 );
                 state.durable_task_state = Some(durable_bridge::DurableTaskState {
                     contract,
@@ -1886,6 +1887,7 @@ async fn run_plan_execution(
                 .as_ref()
                 .and_then(|mc| mc.create_cloud_llm_judge())
                 .map(|j| std::sync::Arc::new(j) as std::sync::Arc<dyn mo_agent_services::LlmJudge>),
+            None, // learning_bridge — wired when pipeline components are shared
         );
 
         if let Some(contract) = durable_bridge::generate_contract(
