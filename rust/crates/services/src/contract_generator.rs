@@ -615,6 +615,12 @@ fn extract_file_paths(text: &str) -> Vec<String> {
     text.split_whitespace()
         .map(|w| w.trim_matches(|c: char| c == '`' || c == '\'' || c == '"' || c == ','))
         .filter(|w| {
+            // Exclude shebangs and interpreter paths (#!/bin/bash, /usr/bin/env, etc.)
+            if w.starts_with("#!") || w.starts_with("/usr/") || w.starts_with("/bin/")
+                || w.starts_with("/sbin/") || w.starts_with("/etc/")
+            {
+                return false;
+            }
             w.contains('/')
                 || w.contains('\\')
                 || extensions.iter().any(|ext| w.ends_with(ext))
@@ -1134,6 +1140,21 @@ mod tests {
     fn extract_file_paths_with_quotes() {
         let paths = extract_file_paths("create `src/new.rs` file");
         assert_eq!(paths, vec!["src/new.rs"]);
+    }
+
+    #[test]
+    fn extract_file_paths_excludes_shebangs_and_system_paths() {
+        // Shebangs should not be extracted as file paths
+        let paths = extract_file_paths("contains shebang #!/bin/bash and file /tmp/script.sh");
+        assert_eq!(paths, vec!["/tmp/script.sh"]);
+
+        // System interpreter paths
+        let paths = extract_file_paths("uses /usr/bin/env python and creates src/main.py");
+        assert_eq!(paths, vec!["src/main.py"]);
+
+        // /bin/sh etc.
+        let paths = extract_file_paths("script uses /bin/sh");
+        assert!(paths.is_empty());
     }
 
     #[test]
