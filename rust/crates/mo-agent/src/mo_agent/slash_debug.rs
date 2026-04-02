@@ -1,6 +1,6 @@
 use super::*;
 use std::io::{self, BufRead, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Interactive debug inspector for session turns.
 ///
@@ -9,6 +9,11 @@ use std::path::PathBuf;
 ///    → full messages array (the actual LLM input/output)
 /// 2. Journal JSONL: `~/.mo-agent/sessions/<id>.jsonl`
 ///    → turn summaries, tool calls, timing, token counts
+///
+/// **Per-turn view:** journal turn *T* is paired with the *T*-th heavy checkpoint file (sorted by
+/// numeric prefix). UI and JSON dumps show **message delta** (suffix after shared prefix with the
+/// previous heavy snapshot), not the entire accumulated history. If there are fewer heavy files
+/// than journal turns, the latest heavy file is used and a warning is recorded.
 pub(super) fn handle_debug_command(arg: &str, state: &ReplState) {
     let session_id = if arg.is_empty() {
         match &state.session_id {
@@ -40,6 +45,18 @@ pub(super) fn handle_debug_command(arg: &str, state: &ReplState) {
         return;
     }
 
+    if !turns.is_empty() && !checkpoints.is_empty() && turns.len() != checkpoints.len() {
+        eprintln!(
+            "  {}",
+            format!(
+                "Note: {} journal turns vs {} heavy checkpoints — pairing by index; deltas use adjacent heavy files.",
+                turns.len(),
+                checkpoints.len()
+            )
+            .dim()
+        );
+    }
+
     // ── Overview ──
     print_overview(&session_id, &turns, &checkpoints);
 
@@ -50,19 +67,32 @@ pub(super) fn handle_debug_command(arg: &str, state: &ReplState) {
             return;
         }
         eprintln!("\n  {}", "No journal turns (journal may not have been initialized).".dim());
-        eprintln!("  {} checkpoints available — inspecting latest.", checkpoints.len().to_string().green());
-        if let Some(messages) = load_checkpoint_messages(&checkpoints) {
+        eprintln!("  {} checkpoints available — inspecting latest segment.", checkpoints.len().to_string().green());
+        if let Some(view) = build_turn_messages_view(checkpoints.len(), &checkpoints) {
             let stub = TurnSummary {
-                user_input: messages.first()
-                    .filter(|m| m.get("role").and_then(|v| v.as_str()) == Some("user"))
+                journal_turn: None,
+                user_input: view
+                    .delta
+                    .iter()
+                    .chain(view.full.iter())
+                    .find(|m| m.get("role").and_then(|v| v.as_str()) == Some("user"))
                     .and_then(|m| m.get("content").and_then(|v| v.as_str()))
                     .unwrap_or("(unknown)")
                     .to_string(),
-                tokens_in: 0, tokens_out: 0, duration_ms: 0, ttft_ms: 0,
-                tool_count: messages.iter().filter(|m| m.get("role").and_then(|v| v.as_str()) == Some("tool")).count(),
-                tools_used: Vec::new(), tool_calls: Vec::new(), selector_strategy: None,
+                tokens_in: 0,
+                tokens_out: 0,
+                duration_ms: 0,
+                ttft_ms: 0,
+                tool_count: view
+                    .delta
+                    .iter()
+                    .filter(|m| m.get("role").and_then(|v| v.as_str()) == Some("tool"))
+                    .count(),
+                tools_used: Vec::new(),
+                tool_calls: Vec::new(),
+                selector_strategy: None,
             };
-            inspect_turn(1, &stub, Some(&messages), &session_id);
+            inspect_turn(1, &stub, Some(&view), &session_id);
         } else {
             eprintln!("  {}", "Failed to load checkpoint data.".yellow());
         }
@@ -87,10 +117,15 @@ pub(super) fn handle_debug_command(arg: &str, state: &ReplState) {
             continue;
         }
 
-        // Find the heavy checkpoint that covers this turn.
-        let messages = load_checkpoint_messages(&checkpoints);
-
-        inspect_turn(turn_n, &turns[turn_n - 1], messages.as_deref(), &session_id);
+        let view = build_turn_messages_view(turn_n, &checkpoints);
+        if view.is_none() {
+            eprintln!(
+                "  {}",
+                "No heavy checkpoint messages for this turn.".yellow()
+            );
+            continue;
+        }
+        inspect_turn(turn_n, &turns[turn_n - 1], view.as_ref(), &session_id);
     }
 }
 
@@ -122,32 +157,144 @@ fn print_overview(session_id: &str, turns: &[TurnSummary], checkpoints: &[PathBu
     }
 }
 
+// ── Turn messages (heavy checkpoints) ───────────────────────────────────────
+
+/// Heavy snapshots for one journal turn: full history at end of segment plus message delta vs previous heavy file.
+struct TurnMessagesView {
+    delta: Vec<serde_json::Value>,
+    full: Vec<serde_json::Value>,
+    after_path: PathBuf,
+    before_path: Option<PathBuf>,
+    warning: Option<String>,
+}
+
+fn checkpoint_numeric_prefix(path: &Path) -> Option<u32> {
+    path.file_name()?
+        .to_str()?
+        .split_once('-')?
+        .0
+        .parse()
+        .ok()
+}
+
+fn load_messages_from_heavy_path(path: &Path) -> Option<Vec<serde_json::Value>> {
+    let content = std::fs::read_to_string(path).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&content).ok()?;
+    v.get("Heavy")
+        .and_then(|h| h.get("messages"))
+        .and_then(|m| m.as_array())
+        .cloned()
+}
+
+fn message_delta(
+    before: &[serde_json::Value],
+    after: &[serde_json::Value],
+) -> Vec<serde_json::Value> {
+    let mut i = 0;
+    let n = before.len().min(after.len());
+    while i < n && before[i] == after[i] {
+        i += 1;
+    }
+    after[i..].to_vec()
+}
+
+fn build_turn_messages_view(turn_n: usize, checkpoints: &[PathBuf]) -> Option<TurnMessagesView> {
+    if checkpoints.is_empty() {
+        return None;
+    }
+    let warning = if turn_n > checkpoints.len() {
+        Some(format!(
+            "Journal ordinal {} exceeds {} heavy checkpoint(s); using latest heavy file and delta vs the previous one.",
+            turn_n,
+            checkpoints.len()
+        ))
+    } else {
+        None
+    };
+    let after_idx = if turn_n > checkpoints.len() {
+        checkpoints.len() - 1
+    } else {
+        turn_n - 1
+    };
+    let after_path = checkpoints.get(after_idx)?.clone();
+    let full = load_messages_from_heavy_path(&after_path)?;
+    let (before_path, before_msgs) = if after_idx > 0 {
+        let bp = checkpoints[after_idx - 1].clone();
+        let bm = load_messages_from_heavy_path(&bp).unwrap_or_default();
+        (Some(bp), bm)
+    } else {
+        (None, Vec::new())
+    };
+    let delta = message_delta(&before_msgs, &full);
+    Some(TurnMessagesView {
+        delta,
+        full,
+        after_path,
+        before_path,
+        warning,
+    })
+}
+
 // ── Turn inspector ───────────────────────────────────────────────────────────
 
-fn inspect_turn(turn_n: usize, summary: &TurnSummary, messages: Option<&[serde_json::Value]>, session_id: &str) {
+fn inspect_turn(
+    turn_n: usize,
+    summary: &TurnSummary,
+    view: Option<&TurnMessagesView>,
+    session_id: &str,
+) {
+    let journal_tag = summary
+        .journal_turn
+        .map(|t| format!(" (journal #{t})"))
+        .unwrap_or_default();
     eprintln!(
-        "\n  {} — {} tool calls, {:.1}s, {}→{}tok",
+        "\n  {}{} — {} tool calls, {:.1}s, {}→{}tok",
         format!("Turn {turn_n}").bold(),
+        journal_tag,
         summary.tool_count,
         summary.duration_ms as f64 / 1000.0,
         summary.tokens_in,
         summary.tokens_out,
     );
 
-    let has_msgs = messages.is_some();
+    if let Some(w) = view.and_then(|v| v.warning.as_deref()) {
+        eprintln!("  {}", w.yellow());
+    }
+
+    let has_msgs = view.is_some();
     eprintln!(
-        "  {} input    — LLM input messages{}",
+        "  {} input    — LLM input ({} only){}",
         "[1]".cyan(),
+        "delta".green(),
         if has_msgs { "" } else { " (no checkpoint)" }
     );
-    eprintln!("  {} output   — LLM response", "[2]".cyan());
-    eprintln!("  {} tools    — tool calls + results", "[3]".cyan());
-    eprintln!("  {} injected — runtime-injected messages", "[4]".cyan());
-    eprintln!("  {} json     — dump raw checkpoint to /tmp", "[5]".cyan());
+    eprintln!(
+        "  {} output   — LLM response ({})",
+        "[2]".cyan(),
+        "delta".green()
+    );
+    eprintln!(
+        "  {} tools    — tool calls + results ({})",
+        "[3]".cyan(),
+        "delta".green()
+    );
+    eprintln!(
+        "  {} injected — runtime-injected ({})",
+        "[4]".cyan(),
+        "delta".green()
+    );
+    eprintln!(
+        "  {} json     — structured delta dump (pretty) → /tmp",
+        "[5]".cyan()
+    );
+    eprintln!(
+        "  {} full json — entire snapshot after this segment → /tmp",
+        "[7]".cyan()
+    );
     eprintln!("  {} summary  — journal turn summary", "[6]".cyan());
 
     loop {
-        eprint!("  What to inspect? [1-6, b to go back]: ");
+        eprint!("  What to inspect? [1-6, 7, b to go back]: ");
         io::stderr().flush().ok();
         let Some(line) = read_line() else { return };
         let line = line.trim().to_lowercase();
@@ -155,23 +302,32 @@ fn inspect_turn(turn_n: usize, summary: &TurnSummary, messages: Option<&[serde_j
             return;
         }
         match line.as_str() {
-            "1" => show_input(messages),
-            "2" => show_output(messages),
-            "3" => show_tools(messages, summary),
-            "4" => show_injected(messages),
-            "5" => dump_json(messages, session_id, turn_n),
+            "1" => show_input(view),
+            "2" => show_output(view),
+            "3" => show_tools(view, summary),
+            "4" => show_injected(view),
+            "5" => dump_turn_json(view, summary, session_id, turn_n, false),
             "6" => show_summary(summary),
+            "7" => dump_turn_json(view, summary, session_id, turn_n, true),
             _ => eprintln!("  {}", "Invalid choice".yellow()),
         }
     }
 }
 
-fn show_input(messages: Option<&[serde_json::Value]>) {
-    let Some(msgs) = messages else {
+fn show_input(view: Option<&TurnMessagesView>) {
+    let Some(v) = view else {
         eprintln!("  {}", "No checkpoint data available".yellow());
         return;
     };
-    eprintln!("\n  {}", "── LLM Input ──".bold());
+    if v.delta.is_empty() {
+        eprintln!(
+            "  {}",
+            "(delta empty — no new messages vs previous heavy checkpoint)".dim()
+        );
+        return;
+    }
+    let msgs = v.delta.as_slice();
+    eprintln!("\n  {}", "── LLM Input (delta) ──".bold());
     for m in msgs {
         let role = m.get("role").and_then(|v| v.as_str()).unwrap_or("?");
         if role == "assistant" || role == "tool" {
@@ -185,12 +341,20 @@ fn show_input(messages: Option<&[serde_json::Value]>) {
     eprintln!();
 }
 
-fn show_output(messages: Option<&[serde_json::Value]>) {
-    let Some(msgs) = messages else {
+fn show_output(view: Option<&TurnMessagesView>) {
+    let Some(v) = view else {
         eprintln!("  {}", "No checkpoint data available".yellow());
         return;
     };
-    eprintln!("\n  {}", "── LLM Output ──".bold());
+    if v.delta.is_empty() {
+        eprintln!(
+            "  {}",
+            "(delta empty — no new messages vs previous heavy checkpoint)".dim()
+        );
+        return;
+    }
+    let msgs = v.delta.as_slice();
+    eprintln!("\n  {}", "── LLM Output (delta) ──".bold());
     for m in msgs {
         let role = m.get("role").and_then(|v| v.as_str()).unwrap_or("?");
         if role != "assistant" {
@@ -226,7 +390,7 @@ fn show_output(messages: Option<&[serde_json::Value]>) {
     eprintln!();
 }
 
-fn show_tools(messages: Option<&[serde_json::Value]>, summary: &TurnSummary) {
+fn show_tools(view: Option<&TurnMessagesView>, summary: &TurnSummary) {
     eprintln!("\n  {}", "── Tool Calls ──".bold());
     // From journal (always available)
     for tc in &summary.tool_calls {
@@ -239,10 +403,10 @@ fn show_tools(messages: Option<&[serde_json::Value]>, summary: &TurnSummary) {
             truncate(preview, 80).dim(),
         );
     }
-    // From checkpoint messages (full content)
-    if let Some(msgs) = messages {
-        eprintln!("\n  {}", "── Tool Results (from checkpoint) ──".dim());
-        for m in msgs {
+    // From checkpoint delta (this segment only)
+    if let Some(v) = view {
+        eprintln!("\n  {}", "── Tool Results (checkpoint delta) ──".dim());
+        for m in &v.delta {
             let role = m.get("role").and_then(|v| v.as_str()).unwrap_or("?");
             if role != "tool" {
                 continue;
@@ -267,12 +431,20 @@ fn show_tools(messages: Option<&[serde_json::Value]>, summary: &TurnSummary) {
     eprintln!();
 }
 
-fn show_injected(messages: Option<&[serde_json::Value]>) {
-    let Some(msgs) = messages else {
+fn show_injected(view: Option<&TurnMessagesView>) {
+    let Some(v) = view else {
         eprintln!("  {}", "No checkpoint data available".yellow());
         return;
     };
-    eprintln!("\n  {}", "── Injected Messages ──".bold());
+    if v.delta.is_empty() {
+        eprintln!(
+            "  {}",
+            "(delta empty — no new messages vs previous heavy checkpoint)".dim()
+        );
+        return;
+    }
+    let msgs = v.delta.as_slice();
+    eprintln!("\n  {}", "── Injected Messages (delta) ──".bold());
     let mut found = false;
     for m in msgs {
         let role = m.get("role").and_then(|v| v.as_str()).unwrap_or("?");
@@ -297,20 +469,78 @@ fn show_injected(messages: Option<&[serde_json::Value]>) {
     eprintln!();
 }
 
-fn dump_json(messages: Option<&[serde_json::Value]>, session_id: &str, turn_n: usize) {
-    let Some(msgs) = messages else {
+fn dump_turn_json(
+    view: Option<&TurnMessagesView>,
+    summary: &TurnSummary,
+    session_id: &str,
+    turn_n: usize,
+    full_snapshot: bool,
+) {
+    let Some(v) = view else {
         eprintln!("  {}", "No checkpoint data available".yellow());
         return;
     };
     let short = &session_id[..8.min(session_id.len())];
-    let path = std::env::temp_dir().join(format!("debug-{short}-turn{turn_n}.json"));
-    match std::fs::write(
-        &path,
-        serde_json::to_string_pretty(&msgs).unwrap_or_default(),
-    ) {
-        Ok(_) => eprintln!("  {} {}", "✓".green(), format!("Written to {}", path.display()).dim()),
+    let suffix = if full_snapshot { "-full" } else { "" };
+    let path = std::env::temp_dir().join(format!("debug-{short}-turn{turn_n}{suffix}.json"));
+
+    let payload = if full_snapshot {
+        serde_json::json!({
+            "schema": "mo-agent-debug-turn-full-v1",
+            "session_id": session_id,
+            "inspect": {
+                "journal_turn_ordinal": turn_n,
+                "journal_turn_field": summary.journal_turn,
+                "checkpoint_after": file_name_str(&v.after_path),
+                "checkpoint_before": v.before_path.as_ref().and_then(|p| file_name_str(p)),
+                "message_count": v.full.len(),
+            },
+            "warning": v.warning,
+            "messages": v.full,
+        })
+    } else {
+        serde_json::json!({
+            "schema": "mo-agent-debug-turn-delta-v1",
+            "session_id": session_id,
+            "inspect": {
+                "journal_turn_ordinal": turn_n,
+                "journal_turn_field": summary.journal_turn,
+                "checkpoint_after": file_name_str(&v.after_path),
+                "checkpoint_before": v.before_path.as_ref().and_then(|p| file_name_str(p)),
+                "delta_message_count": v.delta.len(),
+                "full_message_count": v.full.len(),
+            },
+            "warning": v.warning,
+            "journal_turn_summary": {
+                "user_input": summary.user_input,
+                "tokens_in": summary.tokens_in,
+                "tokens_out": summary.tokens_out,
+                "duration_ms": summary.duration_ms,
+                "ttft_ms": summary.ttft_ms,
+                "tool_count": summary.tool_count,
+                "tools_used": summary.tools_used,
+                "selector_strategy": summary.selector_strategy,
+            },
+            "messages_delta": v.delta,
+        })
+    };
+
+    match serde_json::to_string_pretty(&payload) {
+        Ok(s) => match std::fs::write(&path, s) {
+            Ok(()) => eprintln!(
+                "  {} {}",
+                "✓".green(),
+                format!("Written to {}", path.display()).dim()
+            ),
+            Err(e) => eprintln!("  {} {}", "✗".red(), e),
+        },
         Err(e) => eprintln!("  {} {}", "✗".red(), e),
     }
+}
+
+fn file_name_str(p: &Path) -> Option<String> {
+    p.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
 }
 
 fn show_summary(summary: &TurnSummary) {
@@ -376,6 +606,8 @@ fn session_journal_path(session_id: &str) -> PathBuf {
 
 #[derive(Debug)]
 struct TurnSummary {
+    /// `turn` field from the journal line when present (1-based session turn counter).
+    journal_turn: Option<u32>,
     user_input: String,
     tokens_in: u64,
     tokens_out: u64,
@@ -434,6 +666,7 @@ fn load_journal_turns(path: &PathBuf) -> Vec<TurnSummary> {
                 })
                 .unwrap_or_default();
             Some(TurnSummary {
+                journal_turn: v.get("turn").and_then(|t| t.as_u64()).map(|u| u as u32),
                 user_input: v
                     .get("user_input")
                     .and_then(|v| v.as_str())
@@ -477,19 +710,8 @@ fn list_heavy_checkpoints(session_dir: &Path) -> Vec<PathBuf> {
                 .is_some_and(|n| n.ends_with("-heavy.json"))
         })
         .collect();
-    paths.sort();
+    paths.sort_by_key(|p| checkpoint_numeric_prefix(p).unwrap_or(0));
     paths
-}
-
-fn load_checkpoint_messages(checkpoints: &[PathBuf]) -> Option<Vec<serde_json::Value>> {
-    // Use the last heavy checkpoint (it has the most complete message history).
-    let path = checkpoints.last()?;
-    let content = std::fs::read_to_string(path).ok()?;
-    let v: serde_json::Value = serde_json::from_str(&content).ok()?;
-    v.get("Heavy")
-        .and_then(|h| h.get("messages"))
-        .and_then(|m| m.as_array())
-        .cloned()
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -517,6 +739,7 @@ fn truncate(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn truncate_short() {
@@ -627,6 +850,7 @@ mod tests {
         assert_eq!(turns[0].duration_ms, 5000);
         assert_eq!(turns[0].ttft_ms, 1000);
         assert_eq!(turns[0].tools_used, vec!["bash", "grep"]);
+        assert_eq!(turns[0].journal_turn, Some(1));
     }
 
     #[test]
@@ -652,31 +876,97 @@ mod tests {
         let turns = load_journal_turns(&path);
         assert_eq!(turns.len(), 1);
         assert!(turns[0].tool_calls.is_empty());
+        assert_eq!(turns[0].journal_turn, Some(1));
     }
 
-    // ── Bug fix: checkpoint loading ──────────────────────────────────────
+    // ── Heavy checkpoint loading & deltas ───────────────────────────────
 
     #[test]
-    fn load_checkpoint_messages_returns_none_for_empty() {
-        assert!(load_checkpoint_messages(&[]).is_none());
-    }
-
-    #[test]
-    fn load_checkpoint_messages_parses_heavy_json() {
+    fn load_messages_from_heavy_path_parses() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("000001-heavy.json");
-        std::fs::write(&path, r#"{"Heavy":{"light":{},"messages":[{"role":"user","content":"test"}]}}"#).unwrap();
-        let msgs = load_checkpoint_messages(&[path]).unwrap();
+        std::fs::write(
+            &path,
+            r#"{"Heavy":{"light":{},"messages":[{"role":"user","content":"test"}]}}"#,
+        )
+        .unwrap();
+        let msgs = load_messages_from_heavy_path(&path).unwrap();
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0]["role"], "user");
         assert_eq!(msgs[0]["content"], "test");
     }
 
     #[test]
-    fn load_checkpoint_messages_returns_none_for_malformed() {
+    fn load_messages_from_heavy_path_malformed() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("000001-heavy.json");
         std::fs::write(&path, "not json").unwrap();
-        assert!(load_checkpoint_messages(&[path]).is_none());
+        assert!(load_messages_from_heavy_path(&path).is_none());
+    }
+
+    #[test]
+    fn message_delta_strips_shared_prefix() {
+        let a = vec![json!({"role":"user","content":"a"}), json!({"role":"assistant","content":"b"})];
+        let b = vec![
+            json!({"role":"user","content":"a"}),
+            json!({"role":"assistant","content":"b"}),
+            json!({"role":"user","content":"c"}),
+        ];
+        let d = message_delta(&a, &b);
+        assert_eq!(d.len(), 1);
+        assert_eq!(d[0]["content"], "c");
+    }
+
+    #[test]
+    fn list_heavy_checkpoints_sorts_by_numeric_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let cp = dir.path().join("step_checkpoints");
+        std::fs::create_dir_all(&cp).unwrap();
+        std::fs::write(cp.join("000010-heavy.json"), "{}").unwrap();
+        std::fs::write(cp.join("000002-heavy.json"), "{}").unwrap();
+        let listed = list_heavy_checkpoints(dir.path());
+        assert_eq!(
+            listed
+                .iter()
+                .filter_map(|p| p.file_name().and_then(|n| n.to_str()))
+                .collect::<Vec<_>>(),
+            vec!["000002-heavy.json", "000010-heavy.json"]
+        );
+    }
+
+    #[test]
+    fn build_turn_messages_view_second_turn_is_delta_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let m0 = vec![json!({"role":"user","content":"hi"})];
+        let m1 = vec![
+            json!({"role":"user","content":"hi"}),
+            json!({"role":"assistant","content":"yo"}),
+        ];
+        let cp = dir.path().join("step_checkpoints");
+        std::fs::create_dir_all(&cp).unwrap();
+        let p0 = cp.join("000001-heavy.json");
+        let p1 = cp.join("000002-heavy.json");
+        std::fs::write(
+            &p0,
+            format!(
+                r#"{{"Heavy":{{"light":{{}},"messages":{}}}}}"#,
+                serde_json::to_string(&m0).unwrap()
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            &p1,
+            format!(
+                r#"{{"Heavy":{{"light":{{}},"messages":{}}}}}"#,
+                serde_json::to_string(&m1).unwrap()
+            ),
+        )
+        .unwrap();
+        let mut cps = list_heavy_checkpoints(dir.path());
+        assert_eq!(cps.len(), 2);
+        let v = build_turn_messages_view(2, &cps).expect("view");
+        assert_eq!(v.delta.len(), 1);
+        assert_eq!(v.full.len(), 2);
+        assert_eq!(v.warning, None);
     }
 }
