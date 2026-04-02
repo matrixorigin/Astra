@@ -101,7 +101,7 @@ pub fn build_main_system_prompt(
          ## Coding Discipline\n\
          - **Read before write**: understand existing patterns, naming conventions, and imports before editing.\n\
          - **Surgical edits**: change only what's needed. Don't rewrite unrelated code.\n\
-         - **Verify after changes**: run build/test commands to confirm nothing broke.\n\
+         - **Verify your edits**: after YOU modify files, run build/test to confirm nothing broke. Skip this for read-only tasks.\n\
          - **Undo on failure**: if a change causes errors and you can't fix them, revert it.\n\
          - **One concern per edit**: each str_replace should address one logical change.\n\
          - **Imports and dependencies**: when adding new functionality, add required imports/deps.\n\n\
@@ -116,7 +116,13 @@ pub fn build_main_system_prompt(
          - Use glob to narrow candidates before grep.\n\
          - Request only the data you need — avoid fetching entire files when a section suffices.\n\
          - Summarize findings concisely. Show relevant code, not the whole file.\n\
-         - If you've already fetched something, reference it from history — don't re-fetch.\n\n\
+         - If you've already fetched something, reference it from history — don't re-fetch.\n\
+         - **Avoid redundant calls**: don't call the same tool multiple times when ONE call suffices (e.g., git_diff once covers all files).\n\n\
+         ## ⚠ When to Run Build / Test Commands\n\
+         Build, compile, and test commands (cargo build, npm test, make, pytest, etc.) are EXPENSIVE.\n\
+         - **Run them ONLY to verify YOUR changes** — after you edited or created files.\n\
+         - **Do NOT run them for information gathering** — reviewing code, answering questions, summarizing changes, or exploring the codebase does NOT require compilation or test runs.\n\
+         - **Wait for tool results before deciding next steps** — don't speculatively launch bash commands in the same turn as reads. Read first, then decide if bash is needed.\n\n\
          ## Plan Execution\n\
          When executing a subtask from a decomposed plan:\n\
          - **Focus on the subtask**: implement ONLY what's described. Don't scope-creep.\n\
@@ -258,13 +264,44 @@ pub fn build_main_system_prompt(
             prompt.push_str(
                 "\n\
               ## Code Review Strategy\n\
-              1. Get the diff: git_diff ONCE. Do NOT re-call with same args.\n\
-              2. Identify changed files and understand the scope of changes.\n\
-              3. For each significant change, read surrounding context (targeted line ranges, not full files).\n\
-              4. Evaluate in order: **correctness** → **security** → **edge cases** → **performance** → **test coverage**.\n\
-              5. Skip style nits unless they cause bugs.\n\
-              6. If something is unclear, read the test file or call site before flagging.\n\
-              7. Present findings grouped by severity: 🔴 must-fix, 🟡 should-fix, 💡 suggestion.\n",
+              ### CRITICAL: Evidence BEFORE conclusions\n\
+              You MUST gather evidence first, then form conclusions. NEVER write a summary or verdict \
+              before you have examined the diff. Do NOT output review text in the same turn as your \
+              first tool call — wait for tool results.\n\
+              \n\
+              ### Process\n\
+              1. **Get the diff**: call git_status + git_diff in ONE parallel turn. \
+              ONLY use git_diff with `path` if the output shows \"[truncated]\". \
+              The first git_diff returns the COMPLETE diff — do NOT re-fetch the same content with path filters.\n\
+              2. **Identify scope**: from the diff, list changed files and categorize (logic, test, config, formatting).\n\
+              3. **Read targeted context**: for files with non-trivial logic changes, call read_file with \
+              start_line/end_line for ~30 lines around the change, or outline=true for large files. \
+              NEVER read_file on a whole large file — if it fails with 'too large', retry with line ranges or outline=true.\n\
+              4. **Evaluate**: correctness → security → edge cases → performance → test coverage. Skip pure style nits.\n\
+              5. **If a read_file fails**: degrade your conclusion for that file. Say \"could not verify\" — do NOT claim it is fine.\n\
+              \n\
+              ### Output Format\n\
+              Summary:\n\
+              - 1–3 bullets: what the change does and overall risk level.\n\
+              \n\
+              Findings:\n\
+              - 0–5 findings, only material issues. Each: file:line, what's wrong, suggested fix.\n\
+              - If no material issues, say \"None\".\n\
+              - Group by severity: 🔴 must-fix, 🟡 should-fix, 💡 suggestion.\n\
+              \n\
+              Verification:\n\
+              - State what you checked (files read, diff shape, risk areas inspected).\n\
+              - If any file could not be read, say so explicitly.\n\
+              \n\
+              Verdict:\n\
+              - LGTM or Needs changes, with one sentence.\n\
+              - NEVER say LGTM if you had read_file errors on logic-changed files.\n\
+              \n\
+              ### Anti-patterns (NEVER do these)\n\
+              - Do NOT write a review summary in the same response where you call git_diff.\n\
+              - Do NOT say \"tests look good\" without reading at least one test file.\n\
+              - Do NOT output `<reflect>`, `<think>`, or other XML-like tags in your final response.\n\
+              - Do NOT claim full confidence when evidence is incomplete.\n",
             );
         }
         Some("debugging") => {
@@ -513,7 +550,7 @@ pub fn build_system_prompt_sections(
          ## Coding Discipline\n\
          - **Read before write**: understand existing patterns, naming conventions, and imports before editing.\n\
          - **Surgical edits**: change only what's needed. Don't rewrite unrelated code.\n\
-         - **Verify after changes**: run build/test commands to confirm nothing broke.\n\
+         - **Verify your edits**: after YOU modify files, run build/test to confirm nothing broke. Skip this for read-only tasks.\n\
          - **Undo on failure**: if a change causes errors and you can't fix them, revert it.\n\
          - **One concern per edit**: each str_replace should address one logical change.\n\
          - **Imports and dependencies**: when adding new functionality, add required imports/deps.\n\n\
@@ -528,7 +565,13 @@ pub fn build_system_prompt_sections(
          - Use glob to narrow candidates before grep.\n\
          - Request only the data you need — avoid fetching entire files when a section suffices.\n\
          - Summarize findings concisely. Show relevant code, not the whole file.\n\
-         - If you've already fetched something, reference it from history — don't re-fetch.\n\n\
+         - If you've already fetched something, reference it from history — don't re-fetch.\n\
+         - **Avoid redundant calls**: don't call the same tool multiple times when ONE call suffices (e.g., git_diff once covers all files).\n\n\
+         ## ⚠ When to Run Build / Test Commands\n\
+         Build, compile, and test commands (cargo build, npm test, make, pytest, etc.) are EXPENSIVE.\n\
+         - **Run them ONLY to verify YOUR changes** — after you edited or created files.\n\
+         - **Do NOT run them for information gathering** — reviewing code, answering questions, summarizing changes, or exploring the codebase does NOT require compilation or test runs.\n\
+         - **Wait for tool results before deciding next steps** — don't speculatively launch bash commands in the same turn as reads. Read first, then decide if bash is needed.\n\n\
          ## Plan Execution\n\
          When executing a subtask from a decomposed plan:\n\
          - **Focus on the subtask**: implement ONLY what's described. Don't scope-creep.\n\
@@ -671,13 +714,44 @@ pub fn build_system_prompt_sections(
             session_section.push_str(
                 "\n\
               ## Code Review Strategy\n\
-              1. Get the diff: git_diff ONCE. Do NOT re-call with same args.\n\
-              2. Identify changed files and understand the scope of changes.\n\
-              3. For each significant change, read surrounding context (targeted line ranges, not full files).\n\
-              4. Evaluate in order: **correctness** → **security** → **edge cases** → **performance** → **test coverage**.\n\
-              5. Skip style nits unless they cause bugs.\n\
-              6. If something is unclear, read the test file or call site before flagging.\n\
-              7. Present findings grouped by severity: 🔴 must-fix, 🟡 should-fix, 💡 suggestion.\n",
+              ### CRITICAL: Evidence BEFORE conclusions\n\
+              You MUST gather evidence first, then form conclusions. NEVER write a summary or verdict \
+              before you have examined the diff. Do NOT output review text in the same turn as your \
+              first tool call — wait for tool results.\n\
+              \n\
+              ### Process\n\
+              1. **Get the diff**: call git_status + git_diff in ONE parallel turn. \
+              ONLY use git_diff with `path` if the output shows \"[truncated]\". \
+              The first git_diff returns the COMPLETE diff — do NOT re-fetch the same content with path filters.\n\
+              2. **Identify scope**: from the diff, list changed files and categorize (logic, test, config, formatting).\n\
+              3. **Read targeted context**: for files with non-trivial logic changes, call read_file with \
+              start_line/end_line for ~30 lines around the change, or outline=true for large files. \
+              NEVER read_file on a whole large file — if it fails with 'too large', retry with line ranges or outline=true.\n\
+              4. **Evaluate**: correctness → security → edge cases → performance → test coverage. Skip pure style nits.\n\
+              5. **If a read_file fails**: degrade your conclusion for that file. Say \"could not verify\" — do NOT claim it is fine.\n\
+              \n\
+              ### Output Format\n\
+              Summary:\n\
+              - 1–3 bullets: what the change does and overall risk level.\n\
+              \n\
+              Findings:\n\
+              - 0–5 findings, only material issues. Each: file:line, what's wrong, suggested fix.\n\
+              - If no material issues, say \"None\".\n\
+              - Group by severity: 🔴 must-fix, 🟡 should-fix, 💡 suggestion.\n\
+              \n\
+              Verification:\n\
+              - State what you checked (files read, diff shape, risk areas inspected).\n\
+              - If any file could not be read, say so explicitly.\n\
+              \n\
+              Verdict:\n\
+              - LGTM or Needs changes, with one sentence.\n\
+              - NEVER say LGTM if you had read_file errors on logic-changed files.\n\
+              \n\
+              ### Anti-patterns (NEVER do these)\n\
+              - Do NOT write a review summary in the same response where you call git_diff.\n\
+              - Do NOT say \"tests look good\" without reading at least one test file.\n\
+              - Do NOT output `<reflect>`, `<think>`, or other XML-like tags in your final response.\n\
+              - Do NOT claim full confidence when evidence is incomplete.\n",
             );
         }
         Some("debugging") => {
@@ -894,9 +968,19 @@ const TASK_TYPE_KEYWORDS: &[(&str, &[&str])] = &[
             "PR",
             "pull request",
             "diff",
+            "local changes",
+            "changes",
+            "commit review",
+            "check the diff",
+            "check diff",
             "评审",
             "审查",
             "代码审查",
+            "看改动",
+            "审阅",
+            "看看改了什么",
+            "本地改动",
+            "看一下改动",
         ],
     ),
     (
@@ -1114,6 +1198,11 @@ mod tests {
         assert_eq!(detect_task_type("review this PR"), Some("code_review"));
         assert_eq!(detect_task_type("code review please"), Some("code_review"));
         assert_eq!(detect_task_type("check the diff"), Some("code_review"));
+        assert_eq!(
+            detect_task_type("review local changes"),
+            Some("code_review")
+        );
+        assert_eq!(detect_task_type("look at the changes"), Some("code_review"));
     }
 
     #[test]
@@ -1121,6 +1210,9 @@ mod tests {
         assert_eq!(detect_task_type("评审一下这个代码"), Some("code_review"));
         assert_eq!(detect_task_type("帮我审查代码"), Some("code_review"));
         assert_eq!(detect_task_type("代码审查"), Some("code_review"));
+        assert_eq!(detect_task_type("看改动"), Some("code_review"));
+        assert_eq!(detect_task_type("看看改了什么"), Some("code_review"));
+        assert_eq!(detect_task_type("审阅本地改动"), Some("code_review"));
     }
 
     #[test]
@@ -1313,9 +1405,13 @@ mod tests {
     fn prompt_code_review_strategy() {
         let p = build_main_system_prompt(&["git_diff"], "", 0.5, Some("code_review"));
         assert!(p.contains("Code Review Strategy"));
-        assert!(p.contains("git_diff ONCE"));
-        assert!(p.contains("correctness"));
-        assert!(p.contains("security"));
+        assert!(p.contains("Evidence BEFORE conclusions"));
+        assert!(p.contains("NEVER write a summary or verdict"));
+        assert!(p.contains("read_file"));
+        assert!(p.contains("outline=true"));
+        assert!(p.contains("could not verify"));
+        assert!(p.contains("NEVER say LGTM"));
+        assert!(p.contains("Anti-patterns"));
         assert!(p.contains("must-fix"));
     }
 
@@ -1388,7 +1484,7 @@ mod tests {
         assert!(p.contains("Coding Discipline"));
         assert!(p.contains("Read before write"));
         assert!(p.contains("Surgical edits"));
-        assert!(p.contains("Verify after changes"));
+        assert!(p.contains("Verify your edits"));
     }
 
     #[test]
@@ -1403,6 +1499,20 @@ mod tests {
         let p = build_main_system_prompt(&["bash"], "", 0.5, None);
         assert!(p.contains("Token Efficiency"));
         assert!(p.contains("targeted reads"));
+    }
+
+    #[test]
+    fn prompt_includes_build_test_guidance() {
+        let p = build_main_system_prompt(&["bash"], "", 0.5, None);
+        assert!(p.contains("When to Run Build / Test"));
+        assert!(
+            p.contains("ONLY to verify YOUR changes"),
+            "should restrict build/test to post-edit verification"
+        );
+        assert!(
+            p.contains("Do NOT run them for information gathering"),
+            "should discourage speculative build/test"
+        );
     }
 
     #[test]

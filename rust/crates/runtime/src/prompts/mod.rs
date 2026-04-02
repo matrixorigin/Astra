@@ -221,13 +221,13 @@ mod tests {
             1.0,
             None,
         );
-        // Full prompt with all sections should be under ~2150 tokens (~8600 chars)
+        // Full prompt with all sections should be under ~2350 tokens (~9400 chars)
         // Enhanced prompt adds: Planning Protocol, Context Strategy, Discovery Before Access,
-        // Coding Discipline, Parallel Tool Calls, Token Efficiency, Plan Execution.
-        // The extra ~50 tokens for discovery-first discipline pay for themselves in fewer path errors.
+        // Coding Discipline, Parallel Tool Calls, Token Efficiency, Build/Test Guidance,
+        // Plan Execution.
         assert!(
-            p.len() < 8600,
-            "compressed prompt should be under 8600 chars, got {}",
+            p.len() < 9400,
+            "compressed prompt should be under 9400 chars, got {}",
             p.len()
         );
     }
@@ -753,8 +753,8 @@ mod tests {
             "code_review task_type should inject review strategy"
         );
         assert!(
-            p.contains("git_diff ONCE"),
-            "review strategy should mention single diff call"
+            p.contains("Evidence BEFORE conclusions"),
+            "review strategy should emphasize evidence-first approach"
         );
     }
 
@@ -908,8 +908,8 @@ mod tests {
         assert!(p.contains("## Memory Rules"));
         // Budget: full prompt should still be reasonable
         assert!(
-            p.len() < 12500,
-            "full toolset prompt should be under 12500 chars, got {}",
+            p.len() < 14700,
+            "full toolset prompt should be under 14700 chars, got {}",
             p.len()
         );
     }
