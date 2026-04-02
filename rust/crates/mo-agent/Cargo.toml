@@ -33,6 +33,7 @@ sqlx.workspace = true
 termimad = "0.23"
 thiserror.workspace = true
 tokio = { workspace = true, features = ["macros", "net", "process", "rt-multi-thread", "signal"] }
+tokio-util.workspace = true
 uuid.workspace = true
 url = "2.5"
 gix = { version = "0.81.0", features = ["status", "blame", "mailmap", "revision"] }

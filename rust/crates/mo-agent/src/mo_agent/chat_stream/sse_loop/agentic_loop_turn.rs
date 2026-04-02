@@ -489,6 +489,7 @@ pub(crate) async fn fetch_chat_turn_sse(
         suppress_intermediate_output,
         Some(edge_ctx),
         pre_clear_lines,
+        None, // cancel_token - not yet wired through
     )
     .await)
 }

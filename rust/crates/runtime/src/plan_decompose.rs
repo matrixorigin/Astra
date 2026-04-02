@@ -1746,10 +1746,7 @@ pub fn parse_plan_paused_user_line(line: &str) -> Option<PlanPausedUserAction> {
         return None;
     }
     let tl = t.to_ascii_lowercase();
-    if matches!(
-        tl.as_str(),
-        "correct clear" | "note clear" | "adjust clear"
-    ) {
+    if matches!(tl.as_str(), "correct clear" | "note clear" | "adjust clear") {
         return Some(PlanPausedUserAction::ClearCorrections);
     }
 
@@ -1781,14 +1778,14 @@ pub fn parse_plan_paused_user_line(line: &str) -> Option<PlanPausedUserAction> {
     None
 }
 
-pub fn resolve_rewind_start_index(plan: &TaskPlan, anchor: &PlanRewindAnchor) -> Result<usize, String> {
+pub fn resolve_rewind_start_index(
+    plan: &TaskPlan,
+    anchor: &PlanRewindAnchor,
+) -> Result<usize, String> {
     match anchor {
         PlanRewindAnchor::OneBased(n) => {
             if *n == 0 || *n > plan.subtasks.len() {
-                return Err(format!(
-                    "subtask index must be 1..={}",
-                    plan.subtasks.len()
-                ));
+                return Err(format!("subtask index must be 1..={}", plan.subtasks.len()));
             }
             Ok(*n - 1)
         }
@@ -1824,7 +1821,10 @@ pub fn rewind_plan_from_subtask(plan: &mut TaskPlan, start_idx: usize) -> usize 
     for st in plan.subtasks.iter_mut().skip(start_idx) {
         if matches!(
             st.status,
-            TaskStatus::Completed | TaskStatus::InProgress | TaskStatus::Paused | TaskStatus::Failed
+            TaskStatus::Completed
+                | TaskStatus::InProgress
+                | TaskStatus::Paused
+                | TaskStatus::Failed
         ) {
             st.status = TaskStatus::Pending;
             n += 1;

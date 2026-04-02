@@ -85,6 +85,8 @@ pub struct SseConsumeResult {
 pub enum SseAbortReason {
     IdleTimeout,
     TransportError,
+    /// User-initiated cancellation via [`CancellationToken`].
+    Cancelled,
 }
 
 // ─── Host trait ──────────────────────────────────────────────────────────────
@@ -144,6 +146,22 @@ pub async fn consume_sse_stream<H: SseStreamHost>(
     host: &mut H,
     idle_timeout: std::time::Duration,
 ) -> (SseConsumeResult, Option<SseAbortReason>) {
+    consume_sse_stream_cancellable(chunks, host, idle_timeout, None).await
+}
+
+/// Consume an SSE byte stream with optional cancellation support.
+///
+/// Like [`consume_sse_stream`] but accepts an optional [`tokio_util::sync::CancellationToken`]
+/// that can interrupt the stream consumption mid-flight. When cancelled:
+/// - Returns `SseAbortReason::Cancelled`
+/// - Tombstones partial state (same as idle timeout)
+/// - Stops the thinking spinner
+pub async fn consume_sse_stream_cancellable<H: SseStreamHost>(
+    chunks: &mut (dyn futures_util::Stream<Item = Result<Vec<u8>, String>> + Unpin + Send),
+    host: &mut H,
+    idle_timeout: std::time::Duration,
+    cancel_token: Option<&tokio_util::sync::CancellationToken>,
+) -> (SseConsumeResult, Option<SseAbortReason>) {
     use futures_util::StreamExt;
 
     let mut accum = ChatTurnSseAccum::default();
@@ -155,8 +173,21 @@ pub async fn consume_sse_stream<H: SseStreamHost>(
 
     let idle = idle_timeout;
     loop {
-        let next = tokio::time::timeout(idle, chunks.next()).await;
-        let chunk = match next {
+        // Use tokio::select! to allow cancellation to interrupt the stream read.
+        let chunk_result = if let Some(token) = cancel_token {
+            tokio::select! {
+                biased;
+                _ = token.cancelled() => {
+                    abort = Some(SseAbortReason::Cancelled);
+                    break;
+                }
+                next = tokio::time::timeout(idle, chunks.next()) => next,
+            }
+        } else {
+            tokio::time::timeout(idle, chunks.next()).await
+        };
+
+        let chunk = match chunk_result {
             Ok(v) => v,
             Err(_) => {
                 abort = Some(SseAbortReason::IdleTimeout);
@@ -176,16 +207,23 @@ pub async fn consume_sse_stream<H: SseStreamHost>(
         }
     }
 
-    if abort == Some(SseAbortReason::IdleTimeout) {
-        // Tombstone: discard partial state to avoid dirty/half-applied deltas.
+    // Tombstone on abort (timeout or cancellation).
+    if matches!(
+        abort,
+        Some(SseAbortReason::IdleTimeout) | Some(SseAbortReason::Cancelled)
+    ) {
         accum.full_text.clear();
         accum.reasoning_content.clear();
         accum.tool_calls.clear();
         pending.clear();
-        accum.error_message = Some(format!(
-            "Error: stream idle timeout after {}ms",
-            idle.as_millis()
-        ));
+        let msg = match abort {
+            Some(SseAbortReason::IdleTimeout) => {
+                format!("Error: stream idle timeout after {}ms", idle.as_millis())
+            }
+            Some(SseAbortReason::Cancelled) => "Cancelled by user".to_string(),
+            _ => "Unknown abort".to_string(),
+        };
+        accum.error_message = Some(msg);
         host.on_render_effects(vec![SseRenderEffect::StopThinkingSpinner]);
     }
 
@@ -667,6 +705,46 @@ mod tests {
                 .as_deref()
                 .unwrap_or("")
                 .contains("idle timeout")
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_aborts_and_tombstones_state() {
+        let events = sse_event("text_delta", ",\"content\":\"partial\"");
+        // First chunk yields partial text, then the stream never yields again.
+        let mut stream = stream::iter(chunks_from_sse(&events))
+            .chain(stream::pending::<Result<Vec<u8>, String>>());
+
+        let cancel_token = tokio_util::sync::CancellationToken::new();
+        let token_for_cancel = cancel_token.clone();
+
+        // Spawn a task that cancels after 5ms.
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            token_for_cancel.cancel();
+        });
+
+        let mut host = RecordingSseStreamHost::new();
+        let (result, abort) = consume_sse_stream_cancellable(
+            &mut stream,
+            &mut host,
+            std::time::Duration::from_millis(60_000), // Long timeout - won't fire
+            Some(&cancel_token),
+        )
+        .await;
+
+        assert_eq!(abort, Some(SseAbortReason::Cancelled));
+        assert!(host.stream_completed);
+        assert!(result.accum.full_text.is_empty());
+        assert!(result.accum.reasoning_content.is_empty());
+        assert!(result.accum.tool_calls.is_empty());
+        assert!(
+            result
+                .accum
+                .error_message
+                .as_deref()
+                .unwrap_or("")
+                .contains("Cancelled")
         );
     }
 }

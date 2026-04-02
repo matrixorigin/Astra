@@ -2807,6 +2807,7 @@ dependencies = [
  "termimad",
  "thiserror 1.0.69",
  "tokio",
+ "tokio-util",
  "tree-sitter",
  "tree-sitter-cpp",
  "tree-sitter-go",

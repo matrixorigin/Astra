@@ -57,7 +57,7 @@ pub struct InputBuffer {
     /// Cursor position in the text.
     cursor_pos: usize,
     /// Command history.
-    history: Vec<String>,
+    pub history: Vec<String>,
     /// Current history index (None = editing new input).
     history_index: Option<usize>,
     /// Saved input when browsing history.

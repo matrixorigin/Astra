@@ -9,7 +9,7 @@ use mo_agent_runtime::turn::sse_edge_stderr_lines::{
 };
 use mo_agent_runtime::turn::sse_stream_host::{
     EdgeApprovalResult, EdgeToolExecResult, NoopSseStreamHost, STREAM_IDLE_TIMEOUT_MS,
-    SseStreamHost, consume_sse_stream,
+    SseStreamHost, consume_sse_stream_cancellable,
 };
 use mo_agent_runtime::turn::tool_result_semantics::cloud_tool_result_status_label;
 use serde_json::Value;
@@ -1027,10 +1027,13 @@ fn apply_sse_render_effects(
 
 /// Consume one /chat/turn SSE stream, render text deltas, collect tool_calls.
 ///
-/// Delegates protocol parsing to runtime's [`consume_sse_stream`]; CLI-specific
+/// Delegates protocol parsing to runtime's [`consume_sse_stream_cancellable`]; CLI-specific
 /// rendering, tool execution, and approval prompts are handled by [`CliSseStreamHost`].
 ///
 /// When `quiet` is true, all terminal output is suppressed but result.full_text is still captured.
+///
+/// If `cancel_token` is provided, the stream can be cancelled mid-flight by triggering the token.
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn consume_turn_sse(
     resp: mo_thin_client::HttpResponse,
     render_md: bool,
@@ -1039,6 +1042,7 @@ pub(super) async fn consume_turn_sse(
     suppress_intermediate_output: bool,
     edge: Option<EdgeSseContext<'_>>,
     pre_clear_lines: usize,
+    cancel_token: Option<&tokio_util::sync::CancellationToken>,
 ) -> TurnResult {
     // Convert reqwest byte stream to runtime's generic chunk type
     let mut byte_stream = Box::pin(
@@ -1059,7 +1063,9 @@ pub(super) async fn consume_turn_sse(
             if host.render.md.is_none() {
                 host.render.lines_written = pre_clear_lines;
             }
-            let (result, _abort) = consume_sse_stream(&mut byte_stream, &mut host, idle).await;
+            let (result, _abort) =
+                consume_sse_stream_cancellable(&mut byte_stream, &mut host, idle, cancel_token)
+                    .await;
             let lw = host.render.lines_written;
             let md = host.render.md.take();
             let pending = std::mem::take(&mut host.xml_tag_buffer);
@@ -1073,7 +1079,9 @@ pub(super) async fn consume_turn_sse(
                 render.lines_written = pre_clear_lines;
             }
             let mut host = NoopSseStreamHost;
-            let (result, _abort) = consume_sse_stream(&mut byte_stream, &mut host, idle).await;
+            let (result, _abort) =
+                consume_sse_stream_cancellable(&mut byte_stream, &mut host, idle, cancel_token)
+                    .await;
             let lw = render.lines_written;
             let md = render.md.take();
             (result, Vec::new(), md, lw, String::new())

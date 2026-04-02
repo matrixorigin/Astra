@@ -49,6 +49,8 @@ mod chat_stream;
 mod cli_utils;
 #[path = "mo_agent/command_router.rs"]
 mod command_router;
+#[path = "mo_agent/cursor_repl.rs"]
+mod cursor_repl;
 #[path = "mo_agent/diff_presenter.rs"]
 mod diff_presenter;
 #[path = "mo_agent/durable_bridge.rs"]
@@ -3765,10 +3767,7 @@ async fn run_chat_repl(
                             match action {
                                 plan_decompose::PlanPausedUserAction::ClearCorrections => {
                                     state.plan_execution_corrections.clear();
-                                    eprintln!(
-                                        "{}",
-                                        "  Cleared stacked operator guidance.".dim()
-                                    );
+                                    eprintln!("{}", "  Cleared stacked operator guidance.".dim());
                                 }
                                 plan_decompose::PlanPausedUserAction::Correction(s) => {
                                     state.plan_execution_corrections.push(s);
@@ -3780,12 +3779,14 @@ async fn run_chat_repl(
                                 }
                                 plan_decompose::PlanPausedUserAction::Rewind(anchor) => {
                                     if let Some(plan) = state.executing_plan.as_mut() {
-                                        match plan_decompose::resolve_rewind_start_index(plan, &anchor)
-                                        {
+                                        match plan_decompose::resolve_rewind_start_index(
+                                            plan, &anchor,
+                                        ) {
                                             Ok(idx) => {
-                                                let reset = plan_decompose::rewind_plan_from_subtask(
-                                                    plan, idx,
-                                                );
+                                                let reset =
+                                                    plan_decompose::rewind_plan_from_subtask(
+                                                        plan, idx,
+                                                    );
                                                 eprintln!(
                                                     "{}  Rewound from step {} — {} subtask(s) set back to pending. Type continue to resume.",
                                                     "↩".cyan(),
