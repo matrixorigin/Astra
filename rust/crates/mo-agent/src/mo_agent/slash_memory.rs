@@ -2095,3 +2095,233 @@ fn extract_goal_pattern(goal: &str) -> String {
         result.join(" ")
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- Empty / whitespace-only input ---
+
+    #[test]
+    fn extract_goal_pattern_empty_string_returns_wildcard() {
+        assert_eq!(extract_goal_pattern(""), "*");
+    }
+
+    #[test]
+    fn extract_goal_pattern_whitespace_only_returns_wildcard() {
+        assert_eq!(extract_goal_pattern("   "), "*");
+    }
+
+    // --- Task verbs are preserved ---
+
+    #[test]
+    fn extract_goal_pattern_preserves_task_verbs() {
+        let verbs = [
+            "add",
+            "fix",
+            "implement",
+            "create",
+            "update",
+            "refactor",
+            "remove",
+            "delete",
+            "optimize",
+            "improve",
+            "migrate",
+            "integrate",
+            "test",
+            "document",
+            "configure",
+        ];
+        for verb in verbs {
+            assert_eq!(
+                extract_goal_pattern(verb),
+                verb,
+                "verb '{verb}' should be preserved"
+            );
+        }
+    }
+
+    // --- Domain words are preserved ---
+
+    #[test]
+    fn extract_goal_pattern_preserves_domain_words() {
+        let domain_words = [
+            "api", "endpoint", "database", "file", "module", "function", "class", "test",
+            "config", "error", "logging", "auth", "user", "data", "cache", "queue",
+        ];
+        for word in domain_words {
+            assert_eq!(
+                extract_goal_pattern(word),
+                word,
+                "domain word '{word}' should be preserved"
+            );
+        }
+    }
+
+    // --- Stop words are preserved ---
+
+    #[test]
+    fn extract_goal_pattern_preserves_stop_words() {
+        let stop_words = ["for", "to", "in", "with", "from", "by", "the", "a", "an"];
+        for word in stop_words {
+            assert_eq!(
+                extract_goal_pattern(word),
+                word,
+                "stop word '{word}' should be preserved"
+            );
+        }
+    }
+
+    // --- Short words (≤4 chars) preserved as-is ---
+
+    #[test]
+    fn extract_goal_pattern_preserves_short_words() {
+        // "foo" (3 chars), "bar" (3), "baz" (3), "quux" (4) — all ≤4
+        assert_eq!(extract_goal_pattern("foo"), "foo");
+        assert_eq!(extract_goal_pattern("bar"), "bar");
+        assert_eq!(extract_goal_pattern("quux"), "quux");
+        // exactly 4 chars
+        assert_eq!(extract_goal_pattern("abcd"), "abcd");
+    }
+
+    // --- Long words (>4 chars) not in any preserved list → wildcard ---
+
+    #[test]
+    fn extract_goal_pattern_replaces_long_unknown_words() {
+        // "hello" is 5 chars and not in any preserved list
+        assert_eq!(extract_goal_pattern("hello"), "*");
+        assert_eq!(extract_goal_pattern("foobar"), "*");
+        assert_eq!(extract_goal_pattern("something"), "*");
+    }
+
+    // --- Identifiers with `.`, `/`, `_` replaced with wildcard ---
+
+    #[test]
+    fn extract_goal_pattern_replaces_dotted_identifiers() {
+        assert_eq!(extract_goal_pattern("file.rs"), "*");
+        assert_eq!(extract_goal_pattern("main.go"), "*");
+    }
+
+    #[test]
+    fn extract_goal_pattern_replaces_slash_identifiers() {
+        assert_eq!(extract_goal_pattern("src/lib"), "*");
+        assert_eq!(extract_goal_pattern("a/b/c"), "*");
+    }
+
+    #[test]
+    fn extract_goal_pattern_replaces_underscore_identifiers() {
+        assert_eq!(extract_goal_pattern("my_var"), "*");
+        assert_eq!(extract_goal_pattern("connection_pool"), "*");
+    }
+
+    // --- Consecutive wildcards collapsed ---
+
+    #[test]
+    fn extract_goal_pattern_collapses_consecutive_wildcards() {
+        // Three long unknown words in a row should produce a single "*"
+        assert_eq!(extract_goal_pattern("alpha bravo charlie"), "*");
+    }
+
+    #[test]
+    fn extract_goal_pattern_collapses_mixed_wildcard_sources() {
+        // identifier + long word → two wildcard sources, collapsed to one "*"
+        assert_eq!(extract_goal_pattern("file.rs foobar"), "*");
+    }
+
+    #[test]
+    fn extract_goal_pattern_does_not_collapse_non_consecutive_wildcards() {
+        // wildcard, preserved word, wildcard → "* fix *"
+        assert_eq!(extract_goal_pattern("hello fix world"), "* fix *");
+    }
+
+    // --- Case insensitivity ---
+
+    #[test]
+    fn extract_goal_pattern_normalizes_uppercase_to_lowercase() {
+        assert_eq!(extract_goal_pattern("FIX"), "fix");
+        assert_eq!(extract_goal_pattern("API"), "api");
+        assert_eq!(extract_goal_pattern("Implement"), "implement");
+    }
+
+    #[test]
+    fn extract_goal_pattern_mixed_case_preserved_words() {
+        assert_eq!(extract_goal_pattern("Add API Endpoint"), "add api endpoint");
+    }
+
+    // --- Real-world mixed goals ---
+
+    #[test]
+    fn extract_goal_pattern_implement_user_authentication_api() {
+        // "implement" = verb, "user" = domain, "authentication" = 14 chars unknown → "*",
+        // "api" = domain
+        assert_eq!(
+            extract_goal_pattern("implement user authentication API"),
+            "implement user * api"
+        );
+    }
+
+    #[test]
+    fn extract_goal_pattern_fix_database_connection_pool_timeout() {
+        // "fix" = verb, "database" = domain, "connection_pool" has `_` → "*",
+        // "timeout" = 7 chars unknown → "*", consecutive wildcards collapsed
+        assert_eq!(
+            extract_goal_pattern("fix database connection_pool timeout"),
+            "fix database *"
+        );
+    }
+
+    #[test]
+    fn extract_goal_pattern_add_feature_to_module() {
+        // "add" = verb, "feature" = 7 chars unknown → "*", "x" ≤4 kept,
+        // "to" = stop, "module" = domain, "y" ≤4 kept
+        assert_eq!(
+            extract_goal_pattern("add feature X to module Y"),
+            "add * x to module y"
+        );
+    }
+
+    #[test]
+    fn extract_goal_pattern_fix_bug_in_file_rs() {
+        // "fix" = verb, "bug" = 3 chars ≤4, "in" = stop, "file.rs" has `.` → "*"
+        assert_eq!(extract_goal_pattern("fix bug in file.rs"), "fix bug in *");
+    }
+
+    #[test]
+    fn extract_goal_pattern_refactor_logging_for_error_handling() {
+        // "refactor" = verb, "logging" = domain, "for" = stop, "error" = domain,
+        // "handling" = 8 chars unknown → "*"
+        assert_eq!(
+            extract_goal_pattern("refactor logging for error handling"),
+            "refactor logging for error *"
+        );
+    }
+
+    #[test]
+    fn extract_goal_pattern_create_cache_config_for_queue() {
+        // "create" = verb, "cache" = domain, "config" = domain, "for" = stop, "queue" = domain
+        assert_eq!(
+            extract_goal_pattern("create cache config for queue"),
+            "create cache config for queue"
+        );
+    }
+
+    #[test]
+    fn extract_goal_pattern_migrate_data_from_old_db() {
+        // "migrate" = verb, "data" = domain, "from" = stop, "old" = 3 chars, "db" = 2 chars
+        assert_eq!(
+            extract_goal_pattern("migrate data from old db"),
+            "migrate data from old db"
+        );
+    }
+
+    #[test]
+    fn extract_goal_pattern_optimize_function_with_memoization() {
+        // "optimize" = verb, "function" = domain, "with" = stop,
+        // "memoization" = 11 chars unknown → "*"
+        assert_eq!(
+            extract_goal_pattern("optimize function with memoization"),
+            "optimize function with *"
+        );
+    }
+}

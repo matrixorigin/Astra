@@ -1305,4 +1305,256 @@ mod tests {
             .unwrap();
         assert_eq!(v["status"], "granted");
     }
+
+    // ── Constructor validation ──────────────────────────────────────────
+
+    #[test]
+    fn new_with_valid_url_succeeds() {
+        let c = ThinClient::new("https://api.example.com", None);
+        assert!(c.is_ok());
+    }
+
+    #[test]
+    fn new_with_trailing_slash_succeeds() {
+        let c = ThinClient::new("https://api.example.com/", None);
+        assert!(c.is_ok());
+    }
+
+    #[test]
+    fn new_with_invalid_url_returns_error() {
+        let err = ThinClient::new("not a url", None).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("invalid base URL"), "{msg}");
+    }
+
+    #[test]
+    fn new_stores_bearer_token() {
+        let c = ThinClient::new("https://x.io", Some("secret".into())).unwrap();
+        assert_eq!(c.bearer_token.as_deref(), Some("secret"));
+    }
+
+    #[test]
+    fn new_without_bearer_token() {
+        let c = ThinClient::new("https://x.io", None).unwrap();
+        assert!(c.bearer_token.is_none());
+    }
+
+    // ── api_origin() trailing-slash handling ─────────────────────────────
+
+    #[test]
+    fn api_origin_strips_trailing_slash() {
+        let c = ThinClient::new("https://api.example.com/", None).unwrap();
+        assert_eq!(c.api_origin(), "https://api.example.com");
+    }
+
+    #[test]
+    fn api_origin_without_trailing_slash() {
+        let c = ThinClient::new("https://api.example.com", None).unwrap();
+        // Url::parse adds a trailing slash for scheme://host, so api_origin strips it
+        assert!(!c.api_origin().ends_with('/'));
+    }
+
+    // ── bearer_headers() ────────────────────────────────────────────────
+
+    #[test]
+    fn bearer_headers_format() {
+        let h = ThinClient::bearer_headers("my-tok").unwrap();
+        assert_eq!(
+            h.get(header::AUTHORIZATION).unwrap().to_str().unwrap(),
+            "Bearer my-tok"
+        );
+    }
+
+    #[test]
+    fn bearer_headers_rejects_non_ascii_token() {
+        // Header values must be visible ASCII; newlines are rejected.
+        let res = ThinClient::bearer_headers("bad\ntoken");
+        assert!(res.is_err());
+    }
+
+    // ── Error paths via wiremock ─────────────────────────────────────────
+
+    #[tokio::test]
+    async fn wiremock_401_returns_api_error() {
+        let srv = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/health"))
+            .respond_with(ResponseTemplate::new(401).set_body_string("unauthorized"))
+            .mount(&srv)
+            .await;
+
+        let client = ThinClient::new(&srv.uri(), None).unwrap();
+        let err = client
+            .get_bearer_path_query_text("tok", "/health", &[])
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("401"), "{msg}");
+        assert!(msg.contains("unauthorized"), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn wiremock_500_returns_api_error() {
+        let srv = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/sessions"))
+            .respond_with(
+                ResponseTemplate::new(500).set_body_string("internal server error"),
+            )
+            .mount(&srv)
+            .await;
+
+        let client = ThinClient::new(&srv.uri(), Some("tok".into())).unwrap();
+        let err = client
+            .create_session(
+                None,
+                &SessionCreateRequest {
+                    title: Some("t".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("500"), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn wiremock_empty_body_returns_null() {
+        let srv = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/sessions"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(""))
+            .mount(&srv)
+            .await;
+
+        let client = ThinClient::new(&srv.uri(), Some("tok".into())).unwrap();
+        let v = client
+            .create_session(
+                None,
+                &SessionCreateRequest {
+                    title: Some("t".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert!(v.is_null(), "expected Null for empty body, got {v}");
+    }
+
+    // ── Bearer override precedence ──────────────────────────────────────
+
+    #[tokio::test]
+    async fn bearer_override_takes_precedence_over_default() {
+        let srv = MockServer::start().await;
+        // Only match when the override token is used
+        Mock::given(method("POST"))
+            .and(path("/chat/stream"))
+            .and(header("authorization", "Bearer override-tok"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(
+                    "data: {\"type\":\"text_delta\",\"content\":\"ok\"}\n\n",
+                ),
+            )
+            .expect(1)
+            .mount(&srv)
+            .await;
+
+        let client = ThinClient::new(&srv.uri(), Some("default-tok".into())).unwrap();
+        let req = ChatStreamRequest::new("hi");
+        let evs = client
+            .chat_stream_collect(&req, Some("override-tok"))
+            .await
+            .unwrap();
+        assert_eq!(evs.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn default_bearer_used_when_no_override() {
+        let srv = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/stream"))
+            .and(header("authorization", "Bearer default-tok"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(
+                    "data: {\"type\":\"text_delta\",\"content\":\"ok\"}\n\n",
+                ),
+            )
+            .expect(1)
+            .mount(&srv)
+            .await;
+
+        let client = ThinClient::new(&srv.uri(), Some("default-tok".into())).unwrap();
+        let req = ChatStreamRequest::new("hi");
+        let evs = client.chat_stream_collect(&req, None).await.unwrap();
+        assert_eq!(evs.len(), 1);
+    }
+
+    // ── 429 retry logic ─────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn retry_429_succeeds_on_second_attempt() {
+        let srv = MockServer::start().await;
+        // First call → 429, second call → 200
+        Mock::given(method("POST"))
+            .and(path("/chat/turn"))
+            .and(header("authorization", "Bearer t"))
+            .respond_with(ResponseTemplate::new(429).set_body_string("rate limited"))
+            .up_to_n_times(1)
+            .mount(&srv)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/turn"))
+            .and(header("authorization", "Bearer t"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("ok"))
+            .mount(&srv)
+            .await;
+
+        let client = ThinClient::new(&srv.uri(), None).unwrap();
+        let payload = serde_json::json!({"msg": "hello"});
+        let resp = client
+            .post_chat_turn_retry_429("t", &payload, 3, true)
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 200);
+    }
+
+    #[tokio::test]
+    async fn retry_429_exhausts_all_attempts() {
+        let srv = MockServer::start().await;
+        // Always return 429
+        Mock::given(method("POST"))
+            .and(path("/chat/turn"))
+            .respond_with(ResponseTemplate::new(429).set_body_string("rate limited"))
+            .mount(&srv)
+            .await;
+
+        let client = ThinClient::new(&srv.uri(), None).unwrap();
+        let payload = serde_json::json!({"msg": "hello"});
+        // With max_attempts=1, there is no retry — the 429 response is returned as-is.
+        let resp = client
+            .post_chat_turn_retry_429("t", &payload, 1, true)
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 429);
+    }
+
+    #[tokio::test]
+    async fn retry_429_returns_ok_on_non_429_immediately() {
+        let srv = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/turn"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("ok"))
+            .expect(1)
+            .mount(&srv)
+            .await;
+
+        let client = ThinClient::new(&srv.uri(), None).unwrap();
+        let payload = serde_json::json!({"msg": "hello"});
+        let resp = client
+            .post_chat_turn_retry_429("t", &payload, 5, true)
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 200);
+    }
 }
