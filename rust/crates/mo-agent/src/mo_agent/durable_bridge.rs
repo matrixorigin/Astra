@@ -4,10 +4,14 @@
 //! so plan execution can show contract generation, verification results, and delivery
 //! reports in a user-friendly way.
 
+use async_trait::async_trait;
 use crossterm::style::Stylize;
+use mo_agent_runtime::{GateVerdict, VerificationGate};
+use mo_agent_services::coordination::AgentResult;
 use mo_agent_services::{
-    ContractAmendment, ContractGenerator, DurableTaskLifecycle, LocalDurableTaskLifecycle,
-    SubtaskStage, SubtaskVerificationReport, TaskContract, TaskDeliveryReport, VerifierKind,
+    ContractAmendment, ContractGenerator, DurableSubtask, DurableTaskLifecycle,
+    LocalDurableTaskLifecycle, SubtaskStage, SubtaskVerificationReport, TaskContract,
+    TaskDeliveryReport, VerificationRunner, VerifierKind,
 };
 use std::sync::Arc;
 
@@ -510,6 +514,153 @@ pub fn create_local_lifecycle_with_sender(
     Arc::new(lifecycle)
 }
 
+// ─── Delegation Verification Gate ────────────────────────────────────────────
+
+/// A [`VerificationGate`] that runs durable task verification criteria against
+/// delegation sub-run results.
+///
+/// When a delegation sub-run completes, this gate runs the associated subtask's
+/// acceptance criteria (build/test/grep/file checks) and returns [`GateVerdict::Pass`]
+/// only if all required criteria pass. On failure, it returns details about which
+/// criteria failed so the delegation engine can retry.
+///
+/// This bridges the durable task verification system into the delegation quality
+/// control loop, ensuring sub-runs don't bypass acceptance checks.
+pub struct ContractVerificationGate {
+    /// Criteria to verify after the sub-run completes.
+    criteria: Vec<mo_agent_services::VerificationCriterion>,
+    /// Subtask ID for labeling results.
+    subtask_id: String,
+    /// Runner that executes command/file/grep verifications.
+    runner: VerificationRunner,
+    /// Maximum retries before giving up (overrides VerificationGate default).
+    max_retry: u32,
+}
+
+#[allow(dead_code)] // Public API — used when delegation is wired to plan execution
+impl ContractVerificationGate {
+    /// Create a gate from a [`DurableSubtask`]'s criteria.
+    ///
+    /// The gate will run all non-global criteria when `verify()` is called.
+    pub fn from_subtask(subtask: &DurableSubtask, work_dir: std::path::PathBuf) -> Self {
+        Self {
+            criteria: subtask
+                .criteria
+                .iter()
+                .filter(|c| !c.global_only)
+                .cloned()
+                .collect(),
+            subtask_id: subtask.id.clone(),
+            runner: VerificationRunner::new(work_dir),
+            max_retry: subtask.max_retries,
+        }
+    }
+
+    /// Create a gate from explicit criteria (for testing or custom pipelines).
+    pub fn from_criteria(
+        criteria: Vec<mo_agent_services::VerificationCriterion>,
+        subtask_id: String,
+        work_dir: std::path::PathBuf,
+        max_retry: u32,
+    ) -> Self {
+        Self {
+            criteria,
+            subtask_id,
+            runner: VerificationRunner::new(work_dir),
+            max_retry,
+        }
+    }
+
+    /// Attach an LLM judge for semantic criteria.
+    pub fn with_llm_judge(mut self, judge: Arc<dyn mo_agent_services::LlmJudge>) -> Self {
+        self.runner.llm_judge = Some(judge);
+        self
+    }
+}
+
+#[async_trait]
+impl VerificationGate for ContractVerificationGate {
+    async fn verify(
+        &self,
+        _result: &AgentResult,
+        _delegation_id: &str,
+        _attempt: u32,
+    ) -> GateVerdict {
+        if self.criteria.is_empty() {
+            return GateVerdict::Skip;
+        }
+
+        // Build a temporary DurableSubtask to run verification through the runner.
+        let subtask = DurableSubtask {
+            id: self.subtask_id.clone(),
+            title: String::new(),
+            description: None,
+            depends_on: Vec::new(),
+            effort: None,
+            files: Vec::new(),
+            stage: SubtaskStage::AwaitingVerification,
+            criteria: self.criteria.clone(),
+            max_retries: self.max_retry,
+            retry_count: 0,
+            snapshot_name: None,
+            data_branch: None,
+            diff_summary: None,
+            last_verification: None,
+        };
+
+        let report = self.runner.verify_subtask_local(&subtask).await;
+
+        if report.all_required_passed {
+            GateVerdict::Pass
+        } else {
+            let failed: Vec<_> = report
+                .results
+                .iter()
+                .filter(|r| !r.passed)
+                .map(|r| {
+                    serde_json::json!({
+                        "criterion": r.criterion_id,
+                        "expected": r.expected,
+                        "evidence": r.evidence,
+                        "error": r.error,
+                    })
+                })
+                .collect();
+
+            let reasons: Vec<_> = report
+                .results
+                .iter()
+                .filter(|r| !r.passed)
+                .map(|r| {
+                    format!(
+                        "{}: expected [{}], got [{}]",
+                        r.criterion_id, r.expected, r.evidence
+                    )
+                })
+                .collect();
+
+            GateVerdict::Fail {
+                reason: format!(
+                    "Subtask '{}' failed {}/{} criteria: {}",
+                    self.subtask_id,
+                    failed.len(),
+                    self.criteria.len(),
+                    reasons.join("; ")
+                ),
+                details: Some(serde_json::json!({
+                    "subtask_id": self.subtask_id,
+                    "report": report,
+                    "failed_criteria": failed,
+                })),
+            }
+        }
+    }
+
+    fn max_retries(&self) -> u32 {
+        self.max_retry
+    }
+}
+
 // ─── LLM Judge Implementation ────────────────────────────────────────────────
 
 /// Concrete [`LlmJudge`] that calls an OpenAI-compatible chat completions API.
@@ -788,5 +939,166 @@ mod tests {
     fn parse_judge_score_no_number() {
         let result = parse_judge_score("This criterion is fully met");
         assert!(result.is_err());
+    }
+
+    // ─── ContractVerificationGate tests ──────────────────────────────────────
+
+    fn make_agent_result() -> mo_agent_services::coordination::AgentResult {
+        mo_agent_services::coordination::AgentResult {
+            agent_id: "test-agent".into(),
+            run_id: "run-1".into(),
+            status: "completed".into(),
+            output: Some("done".into()),
+            error: None,
+            prompt_tokens: 100,
+            completion_tokens: 50,
+            tool_calls: 3,
+        }
+    }
+
+    #[tokio::test]
+    async fn gate_skip_when_no_criteria() {
+        let gate = ContractVerificationGate::from_criteria(
+            vec![],
+            "s1".into(),
+            std::path::PathBuf::from("/tmp"),
+            2,
+        );
+        let verdict = gate.verify(&make_agent_result(), "deleg-1", 1).await;
+        assert!(matches!(verdict, mo_agent_runtime::GateVerdict::Skip));
+    }
+
+    #[tokio::test]
+    async fn gate_pass_when_file_exists() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let file_path = tmp.path().join("output.txt");
+        std::fs::write(&file_path, "hello").unwrap();
+
+        let criteria = vec![mo_agent_services::VerificationCriterion {
+            id: "file-check".into(),
+            description: "Output file exists".into(),
+            verifier: VerifierKind::FileExists {
+                paths: vec!["output.txt".into()],
+            },
+            required: true,
+            timeout_sec: 10,
+            global_only: false,
+        }];
+
+        let gate = ContractVerificationGate::from_criteria(
+            criteria,
+            "s1".into(),
+            tmp.path().to_path_buf(),
+            2,
+        );
+        let verdict = gate.verify(&make_agent_result(), "deleg-1", 1).await;
+        assert!(matches!(verdict, mo_agent_runtime::GateVerdict::Pass));
+    }
+
+    #[tokio::test]
+    async fn gate_fail_when_file_missing() {
+        let tmp = tempfile::TempDir::new().unwrap();
+
+        let criteria = vec![mo_agent_services::VerificationCriterion {
+            id: "file-check".into(),
+            description: "Output file exists".into(),
+            verifier: VerifierKind::FileExists {
+                paths: vec!["missing.txt".into()],
+            },
+            required: true,
+            timeout_sec: 10,
+            global_only: false,
+        }];
+
+        let gate = ContractVerificationGate::from_criteria(
+            criteria,
+            "s1".into(),
+            tmp.path().to_path_buf(),
+            1,
+        );
+        let verdict = gate.verify(&make_agent_result(), "deleg-1", 1).await;
+        match verdict {
+            mo_agent_runtime::GateVerdict::Fail { reason, details } => {
+                assert!(reason.contains("s1"));
+                assert!(reason.contains("failed"));
+                assert!(details.is_some());
+            }
+            _ => panic!("Expected Fail verdict, got {:?}", verdict),
+        }
+    }
+
+    #[tokio::test]
+    async fn gate_skips_global_only_criteria() {
+        let subtask = DurableSubtask {
+            id: "s1".into(),
+            title: "Test".into(),
+            description: None,
+            depends_on: vec![],
+            effort: None,
+            files: vec![],
+            stage: SubtaskStage::AwaitingVerification,
+            criteria: vec![
+                mo_agent_services::VerificationCriterion {
+                    id: "local-check".into(),
+                    description: "Local check".into(),
+                    verifier: VerifierKind::FileExists {
+                        paths: vec!["nonexistent.txt".into()],
+                    },
+                    required: false, // optional — won't cause failure
+                    timeout_sec: 10,
+                    global_only: false,
+                },
+                mo_agent_services::VerificationCriterion {
+                    id: "global-check".into(),
+                    description: "Build check".into(),
+                    verifier: VerifierKind::BuildPass {
+                        cmd: "false".into(), // would fail if run
+                    },
+                    required: true,
+                    timeout_sec: 10,
+                    global_only: true, // should be filtered out by from_subtask
+                },
+            ],
+            max_retries: 2,
+            retry_count: 0,
+            snapshot_name: None,
+            data_branch: None,
+            diff_summary: None,
+            last_verification: None,
+        };
+
+        let gate =
+            ContractVerificationGate::from_subtask(&subtask, std::path::PathBuf::from("/tmp"));
+        // Only the non-global, non-required criterion is included → Pass
+        let verdict = gate.verify(&make_agent_result(), "deleg-1", 1).await;
+        assert!(
+            matches!(verdict, mo_agent_runtime::GateVerdict::Pass),
+            "Expected Pass (global_only criterion filtered out), got {:?}",
+            verdict
+        );
+    }
+
+    #[test]
+    fn gate_max_retries_from_subtask() {
+        let subtask = DurableSubtask {
+            id: "s1".into(),
+            title: "Test".into(),
+            description: None,
+            depends_on: vec![],
+            effort: None,
+            files: vec![],
+            stage: SubtaskStage::AwaitingVerification,
+            criteria: vec![],
+            max_retries: 5,
+            retry_count: 0,
+            snapshot_name: None,
+            data_branch: None,
+            diff_summary: None,
+            last_verification: None,
+        };
+
+        let gate =
+            ContractVerificationGate::from_subtask(&subtask, std::path::PathBuf::from("/tmp"));
+        assert_eq!(VerificationGate::max_retries(&gate), 5);
     }
 }

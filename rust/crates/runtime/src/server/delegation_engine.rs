@@ -407,6 +407,19 @@ impl DelegationEngine {
         self
     }
 
+    /// Dynamically set the verification gate (e.g., per-subtask criteria during plan execution).
+    ///
+    /// Unlike [`with_gate`] (builder pattern), this mutates the engine in place so callers
+    /// can swap gates between delegation calls without rebuilding the engine.
+    pub fn set_gate(&mut self, gate: Arc<dyn VerificationGate>) {
+        self.gate = Some(gate);
+    }
+
+    /// Remove the current verification gate (sub-runs will bypass verification).
+    pub fn clear_gate(&mut self) {
+        self.gate = None;
+    }
+
     /// Validate a delegation request without executing it.
     pub async fn validate(
         &self,
