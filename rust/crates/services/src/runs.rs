@@ -132,10 +132,18 @@ pub struct DurableRunRecord {
     pub run_id: String,
     pub user_id: String,
     pub session_id: String,
+    /// Parent run ID for delegation sub-runs.
+    pub parent_run_id: Option<String>,
+    /// Delegation ID this run belongs to.
+    pub delegation_id: Option<String>,
+    /// Agent profile ID executing this run.
+    pub agent_id: Option<String>,
     pub status: String,
     pub waiting_for: Option<String>,
     pub checkpoint_json: Option<String>,
     pub error_message: Option<String>,
+    /// Number of verification-gate retry attempts.
+    pub retry_count: u32,
     pub total_prompt_tokens: u64,
     pub total_completion_tokens: u64,
     pub total_tool_calls: u32,
@@ -191,6 +199,12 @@ pub trait RunStateStore: Send + Sync {
 
     /// Find runs in WAITING status (for resume engine).
     async fn find_waiting_runs(&self) -> Result<Vec<DurableRunRecord>, String>;
+
+    /// Find all sub-runs belonging to a delegation.
+    async fn find_sub_runs(&self, delegation_id: &str) -> Result<Vec<DurableRunRecord>, String>;
+
+    /// Update the retry count for a run (verification gate retries).
+    async fn update_retry_count(&self, run_id: &str, retry_count: u32) -> Result<bool, String>;
 }
 
 /// In-memory run state store for tests and single-process deployments.
@@ -314,6 +328,26 @@ impl RunStateStore for InMemoryRunStateStore {
             .filter(|r| r.status == "waiting")
             .cloned()
             .collect())
+    }
+
+    async fn find_sub_runs(&self, delegation_id: &str) -> Result<Vec<DurableRunRecord>, String> {
+        let runs = self.runs.read().await;
+        Ok(runs
+            .values()
+            .filter(|r| r.delegation_id.as_deref() == Some(delegation_id))
+            .cloned()
+            .collect())
+    }
+
+    async fn update_retry_count(&self, run_id: &str, retry_count: u32) -> Result<bool, String> {
+        let mut runs = self.runs.write().await;
+        if let Some(run) = runs.get_mut(run_id) {
+            run.retry_count = retry_count;
+            run.updated_at = chrono::Utc::now().to_rfc3339();
+            Ok(true)
+        } else {
+            Ok(false)
+        }
     }
 }
 

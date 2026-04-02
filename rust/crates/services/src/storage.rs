@@ -511,10 +511,14 @@ pub async fn ensure_core_schema(settings: &MatrixOneSettings) -> Result<(), sqlx
             run_id VARCHAR(36) PRIMARY KEY,
             user_id VARCHAR(36) NOT NULL,
             session_id VARCHAR(36) NOT NULL,
+            parent_run_id VARCHAR(36) NULL,
+            delegation_id VARCHAR(36) NULL,
+            agent_id VARCHAR(64) NULL,
             status VARCHAR(20) NOT NULL DEFAULT 'running',
             waiting_for VARCHAR(200) NULL,
             checkpoint_json LONGTEXT NULL,
             error_message TEXT NULL,
+            retry_count INT NOT NULL DEFAULT 0,
             total_prompt_tokens BIGINT NOT NULL DEFAULT 0,
             total_completion_tokens BIGINT NOT NULL DEFAULT 0,
             total_tool_calls INT NOT NULL DEFAULT 0,
@@ -523,7 +527,9 @@ pub async fn ensure_core_schema(settings: &MatrixOneSettings) -> Result<(), sqlx
             completed_at DATETIME(6) NULL,
             INDEX idx_runs_user_status (user_id, status),
             INDEX idx_runs_user_updated (user_id, updated_at),
-            INDEX idx_runs_session (session_id)
+            INDEX idx_runs_session (session_id),
+            INDEX idx_runs_parent (parent_run_id),
+            INDEX idx_runs_delegation (delegation_id)
         )",
     )
     .execute(&pool)

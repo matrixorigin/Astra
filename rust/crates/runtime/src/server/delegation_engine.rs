@@ -144,6 +144,11 @@ pub struct SubRunRecord {
 }
 
 /// In-memory tracker for delegation hierarchies and pause state.
+///
+/// Hierarchy data is now also persisted in the `agent_runs` table via
+/// `parent_run_id`, `delegation_id`, and `agent_id` columns.
+/// On startup, call `load_from_run_records()` to rebuild the in-memory
+/// state from durable records.
 pub struct DelegationTracker {
     /// delegation_id → sub-run records
     delegations: RwLock<HashMap<String, Vec<SubRunRecord>>>,
@@ -159,6 +164,47 @@ impl DelegationTracker {
             delegations: RwLock::new(HashMap::new()),
             parents: RwLock::new(HashMap::new()),
             pause_flags: RwLock::new(HashMap::new()),
+        }
+    }
+
+    /// Rebuild in-memory hierarchy from durable run records.
+    ///
+    /// Called at startup to recover delegation state after a crash.
+    /// Only records with `parent_run_id` set are considered (sub-runs).
+    pub async fn load_from_run_records(
+        &self,
+        records: &[mo_agent_services::runs::DurableRunRecord],
+    ) {
+        let mut delegations = self.delegations.write().await;
+        let mut parents = self.parents.write().await;
+        let mut pause_flags = self.pause_flags.write().await;
+
+        for rec in records {
+            let (Some(parent_run_id), Some(delegation_id)) =
+                (&rec.parent_run_id, &rec.delegation_id)
+            else {
+                continue; // Skip root runs
+            };
+
+            let sub = SubRunRecord {
+                run_id: rec.run_id.clone(),
+                parent_run_id: parent_run_id.clone(),
+                delegation_id: delegation_id.clone(),
+                agent_id: rec.agent_id.clone().unwrap_or_default(),
+                depth: 0, // Depth not stored in DB; 0 is safe for recovered records
+            };
+
+            delegations
+                .entry(delegation_id.clone())
+                .or_default()
+                .push(sub);
+            parents.insert(rec.run_id.clone(), parent_run_id.clone());
+
+            // Re-create pause flags for paused sub-runs
+            if rec.status == "paused" {
+                let flag = Arc::new(AtomicBool::new(true));
+                pause_flags.insert(rec.run_id.clone(), flag);
+            }
         }
     }
 
@@ -458,6 +504,12 @@ impl DelegationEngine {
             match gate.verify(&current, delegation_id, attempt).await {
                 GateVerdict::Pass | GateVerdict::Skip => return current,
                 GateVerdict::Fail { reason, details } => {
+                    // Persist retry count to durable store for crash recovery
+                    let _ = self
+                        .run_engine
+                        .persist_retry_count(&current.run_id, attempt)
+                        .await;
+
                     // Record the gate failure in run events
                     let _ = self
                         .run_engine
@@ -573,9 +625,21 @@ impl DelegationEngine {
         let mut configs = Vec::new();
         for agent_id in agent_ids {
             let sub_run_id = uuid::Uuid::new_v4().to_string();
+            let session_id = request
+                .context
+                .get("session_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("delegation");
 
             self.run_engine
-                .start_run(&sub_run_id, &request.user_id, &sub_run_id)
+                .start_run_ext(
+                    &sub_run_id,
+                    &request.user_id,
+                    session_id,
+                    Some(&request.parent_run_id),
+                    Some(&request.delegation_id),
+                    Some(agent_id),
+                )
                 .await?;
 
             self.tracker
@@ -731,9 +795,21 @@ impl DelegationEngine {
 
         for agent_id in agent_ids {
             let sub_run_id = uuid::Uuid::new_v4().to_string();
+            let session_id = request
+                .context
+                .get("session_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("delegation");
 
             self.run_engine
-                .start_run(&sub_run_id, &request.user_id, &sub_run_id)
+                .start_run_ext(
+                    &sub_run_id,
+                    &request.user_id,
+                    session_id,
+                    Some(&request.parent_run_id),
+                    Some(&request.delegation_id),
+                    Some(agent_id),
+                )
                 .await?;
 
             self.tracker
@@ -885,8 +961,20 @@ impl DelegationEngine {
         for round in 0..max_rounds {
             // ── Producer sub-run ──
             let prod_run_id = uuid::Uuid::new_v4().to_string();
+            let session_id = request
+                .context
+                .get("session_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("delegation");
             self.run_engine
-                .start_run(&prod_run_id, &request.user_id, &prod_run_id)
+                .start_run_ext(
+                    &prod_run_id,
+                    &request.user_id,
+                    session_id,
+                    Some(&request.parent_run_id),
+                    Some(&request.delegation_id),
+                    Some(producer_id),
+                )
                 .await?;
             self.tracker
                 .record_sub_run(SubRunRecord {
@@ -984,7 +1072,14 @@ impl DelegationEngine {
             // ── Reviewer sub-run ──
             let rev_run_id = uuid::Uuid::new_v4().to_string();
             self.run_engine
-                .start_run(&rev_run_id, &request.user_id, &rev_run_id)
+                .start_run_ext(
+                    &rev_run_id,
+                    &request.user_id,
+                    session_id,
+                    Some(&request.parent_run_id),
+                    Some(&request.delegation_id),
+                    Some(reviewer_id),
+                )
                 .await?;
             self.tracker
                 .record_sub_run(SubRunRecord {
@@ -1127,7 +1222,7 @@ impl DelegationEngine {
 mod tests {
     use super::*;
     use mo_agent_services::coordination::{AgentProfile, AgentTier, PipelineStage};
-    use mo_agent_services::runs::InMemoryRunStateStore;
+    use mo_agent_services::runs::{InMemoryRunStateStore, RunStateStore};
 
     fn setup() -> (
         Arc<RwLock<AgentProfileRegistry>>,
@@ -2052,5 +2147,205 @@ mod tests {
             }
             .is_pass()
         );
+    }
+
+    // ── Persistence tests ────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn start_run_ext_persists_delegation_metadata() {
+        let store = Arc::new(InMemoryRunStateStore::new());
+        let engine = RunEngine::new(store.clone());
+
+        engine
+            .start_run_ext(
+                "sub-1",
+                "user-1",
+                "sess-1",
+                Some("parent-1"),
+                Some("del-1"),
+                Some("coder"),
+            )
+            .await
+            .unwrap();
+
+        let record = store.load_run("sub-1").await.unwrap().unwrap();
+        assert_eq!(record.parent_run_id.as_deref(), Some("parent-1"));
+        assert_eq!(record.delegation_id.as_deref(), Some("del-1"));
+        assert_eq!(record.agent_id.as_deref(), Some("coder"));
+        assert_eq!(record.session_id, "sess-1");
+    }
+
+    #[tokio::test]
+    async fn start_run_backward_compat_sets_none() {
+        let store = Arc::new(InMemoryRunStateStore::new());
+        let engine = RunEngine::new(store.clone());
+
+        engine.start_run("run-1", "user-1", "sess-1").await.unwrap();
+
+        let record = store.load_run("run-1").await.unwrap().unwrap();
+        assert!(record.parent_run_id.is_none());
+        assert!(record.delegation_id.is_none());
+        assert!(record.agent_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn find_sub_runs_by_delegation_id() {
+        let store = Arc::new(InMemoryRunStateStore::new());
+        let engine = RunEngine::new(store.clone());
+
+        // Create a root run and two sub-runs in different delegations
+        engine.start_run("root", "u1", "s1").await.unwrap();
+        engine
+            .start_run_ext(
+                "sub-a",
+                "u1",
+                "s1",
+                Some("root"),
+                Some("del-1"),
+                Some("coder"),
+            )
+            .await
+            .unwrap();
+        engine
+            .start_run_ext(
+                "sub-b",
+                "u1",
+                "s1",
+                Some("root"),
+                Some("del-1"),
+                Some("reviewer"),
+            )
+            .await
+            .unwrap();
+        engine
+            .start_run_ext(
+                "sub-c",
+                "u1",
+                "s1",
+                Some("root"),
+                Some("del-2"),
+                Some("writer"),
+            )
+            .await
+            .unwrap();
+
+        let del1_runs = engine.find_sub_runs("del-1").await.unwrap();
+        assert_eq!(del1_runs.len(), 2);
+
+        let del2_runs = engine.find_sub_runs("del-2").await.unwrap();
+        assert_eq!(del2_runs.len(), 1);
+        assert_eq!(del2_runs[0].agent_id.as_deref(), Some("writer"));
+    }
+
+    #[tokio::test]
+    async fn persist_and_read_retry_count() {
+        let store = Arc::new(InMemoryRunStateStore::new());
+        let engine = RunEngine::new(store.clone());
+
+        engine.start_run("run-1", "u1", "s1").await.unwrap();
+        assert_eq!(
+            store.load_run("run-1").await.unwrap().unwrap().retry_count,
+            0
+        );
+
+        engine.persist_retry_count("run-1", 2).await.unwrap();
+        assert_eq!(
+            store.load_run("run-1").await.unwrap().unwrap().retry_count,
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn load_from_run_records_rebuilds_tracker() {
+        use mo_agent_services::runs::DurableRunRecord;
+
+        let records = vec![
+            DurableRunRecord {
+                run_id: "sub-1".into(),
+                user_id: "u1".into(),
+                session_id: "s1".into(),
+                parent_run_id: Some("parent-1".into()),
+                delegation_id: Some("del-1".into()),
+                agent_id: Some("coder".into()),
+                status: "completed".into(),
+                waiting_for: None,
+                checkpoint_json: None,
+                error_message: None,
+                retry_count: 0,
+                total_prompt_tokens: 0,
+                total_completion_tokens: 0,
+                total_tool_calls: 0,
+                events: vec![],
+                created_at: "2026-01-01T00:00:00Z".into(),
+                updated_at: "2026-01-01T00:00:00Z".into(),
+            },
+            DurableRunRecord {
+                run_id: "sub-2".into(),
+                user_id: "u1".into(),
+                session_id: "s1".into(),
+                parent_run_id: Some("parent-1".into()),
+                delegation_id: Some("del-1".into()),
+                agent_id: Some("reviewer".into()),
+                status: "paused".into(),
+                waiting_for: None,
+                checkpoint_json: None,
+                error_message: None,
+                retry_count: 1,
+                total_prompt_tokens: 0,
+                total_completion_tokens: 0,
+                total_tool_calls: 0,
+                events: vec![],
+                created_at: "2026-01-01T00:00:00Z".into(),
+                updated_at: "2026-01-01T00:00:00Z".into(),
+            },
+            // Root run — should be skipped
+            DurableRunRecord {
+                run_id: "root-run".into(),
+                user_id: "u1".into(),
+                session_id: "s1".into(),
+                parent_run_id: None,
+                delegation_id: None,
+                agent_id: None,
+                status: "completed".into(),
+                waiting_for: None,
+                checkpoint_json: None,
+                error_message: None,
+                retry_count: 0,
+                total_prompt_tokens: 0,
+                total_completion_tokens: 0,
+                total_tool_calls: 0,
+                events: vec![],
+                created_at: "2026-01-01T00:00:00Z".into(),
+                updated_at: "2026-01-01T00:00:00Z".into(),
+            },
+        ];
+
+        let tracker = DelegationTracker::new();
+        tracker.load_from_run_records(&records).await;
+
+        // Hierarchy rebuilt
+        let subs = tracker.get_sub_runs("del-1").await;
+        assert_eq!(subs.len(), 2);
+        assert!(tracker.is_sub_run("sub-1").await);
+        assert!(tracker.is_sub_run("sub-2").await);
+        assert!(!tracker.is_sub_run("root-run").await);
+
+        // Parent links rebuilt
+        assert_eq!(
+            tracker.get_parent("sub-1").await.as_deref(),
+            Some("parent-1")
+        );
+        assert_eq!(
+            tracker.get_agent_id("sub-1").await.as_deref(),
+            Some("coder")
+        );
+
+        // Paused sub-run gets pause flag
+        let flag = tracker.get_pause_flag("sub-2").await;
+        assert!(flag.is_some());
+        assert!(flag.unwrap().load(Ordering::SeqCst)); // paused = true
+
+        // Completed sub-run has no pause flag
+        assert!(tracker.get_pause_flag("sub-1").await.is_none());
     }
 }

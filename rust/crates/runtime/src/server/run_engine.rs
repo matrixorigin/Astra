@@ -64,15 +64,33 @@ impl RunEngine {
         user_id: &str,
         session_id: &str,
     ) -> Result<(), String> {
+        self.start_run_ext(run_id, user_id, session_id, None, None, None)
+            .await
+    }
+
+    /// Extended version of `start_run` with delegation metadata.
+    pub async fn start_run_ext(
+        &self,
+        run_id: &str,
+        user_id: &str,
+        session_id: &str,
+        parent_run_id: Option<&str>,
+        delegation_id: Option<&str>,
+        agent_id: Option<&str>,
+    ) -> Result<(), String> {
         let now = chrono::Utc::now().to_rfc3339();
         let record = DurableRunRecord {
             run_id: run_id.to_string(),
             user_id: user_id.to_string(),
             session_id: session_id.to_string(),
+            parent_run_id: parent_run_id.map(ToString::to_string),
+            delegation_id: delegation_id.map(ToString::to_string),
+            agent_id: agent_id.map(ToString::to_string),
             status: "running".to_string(),
             waiting_for: None,
             checkpoint_json: None,
             error_message: None,
+            retry_count: 0,
             total_prompt_tokens: 0,
             total_completion_tokens: 0,
             total_tool_calls: 0,
@@ -131,6 +149,23 @@ impl RunEngine {
     /// Find all runs in WAITING status (for the resume engine to re-evaluate).
     pub async fn find_waiting_runs(&self) -> Result<Vec<DurableRunRecord>, String> {
         self.store.find_waiting_runs().await
+    }
+
+    /// Find all sub-runs belonging to a delegation.
+    pub async fn find_sub_runs(
+        &self,
+        delegation_id: &str,
+    ) -> Result<Vec<DurableRunRecord>, String> {
+        self.store.find_sub_runs(delegation_id).await
+    }
+
+    /// Persist the verification-gate retry count for a run.
+    pub async fn persist_retry_count(
+        &self,
+        run_id: &str,
+        retry_count: u32,
+    ) -> Result<bool, String> {
+        self.store.update_retry_count(run_id, retry_count).await
     }
 
     /// Recover active runs after a crash/restart.
