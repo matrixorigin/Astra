@@ -25,3 +25,7 @@ This document compares **interactive context control** with Claude Code (CC) and
 ## Environment (related)
 
 - **`MO_JOURNAL_CLOUD_EMPTY_ACK=1`**: REPL 启动时若 Matrix 可达但 pull 无数据，仍写 `sync_marker`（默认不写以免噪音）。详见 `multi-agent-cloud-runtime.md`。
+
+## Related: large tool catalogs
+
+- Claude Code **`ToolSearchTool`** vs mo-agent（runtime **`ToolPool`** / 两阶段 vs **CLI 未暴露搜索工具**）：见 [tool-discovery-claude-code.md](./tool-discovery-claude-code.md)。
