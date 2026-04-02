@@ -151,13 +151,19 @@ fn parse_acceptance_to_criteria(
             criteria.push(c);
         } else if let Some(c) = try_parse_build_criterion(&crit_id, part, &part_lower, det) {
             criteria.push(c);
+        } else if let Some(c) = try_parse_no_warnings_criterion(&crit_id, part, &part_lower, det) {
+            criteria.push(c);
         } else if let Some(c) = try_parse_grep_criterion(&crit_id, part, &part_lower) {
+            criteria.push(c);
+        } else if let Some(c) = try_parse_function_exists_criterion(&crit_id, part, &part_lower) {
             criteria.push(c);
         } else if let Some(c) = try_parse_file_exists_criterion(&crit_id, part, &part_lower) {
             criteria.push(c);
         } else if let Some(c) = try_parse_command_output_criterion(&crit_id, part, &part_lower) {
             criteria.push(c);
         } else if let Some(c) = try_parse_permission_criterion(&crit_id, part, &part_lower) {
+            criteria.push(c);
+        } else if let Some(c) = try_parse_flexible_grep_criterion(&crit_id, part, &part_lower) {
             criteria.push(c);
         } else {
             // Fallback: LLM judge for semantic criteria (deferred — not yet implemented)
@@ -414,11 +420,186 @@ fn try_parse_permission_criterion(
     })
 }
 
-/// Extract file paths from a string (heuristic: words containing '/' or known extensions).
+/// Match "no warnings" / "zero warnings" / "clean compile" patterns.
+///
+/// Uses the project's build command with a pipe to `grep -c warning` or similar.
+/// Covers acceptance criteria like:
+/// - "No compiler warnings"
+/// - "Code compiles with zero warnings"
+/// - "Clean build (no warnings)"
+fn try_parse_no_warnings_criterion(
+    id: &str,
+    desc: &str,
+    lower: &str,
+    det: &ProjectDetection,
+) -> Option<VerificationCriterion> {
+    let has_warning = lower.contains("warning");
+    let has_negative = lower.contains("no ")
+        || lower.contains("zero")
+        || lower.contains("0 ")
+        || lower.contains("without")
+        || lower.contains("clean");
+
+    if !has_warning || !has_negative {
+        return None;
+    }
+
+    let build_cmd = detect_build_command(det)?;
+
+    // Build a command that fails if warnings are present in stderr.
+    // Redirect stderr to stdout so we can grep both streams.
+    let cmd = format!("{build_cmd} 2>&1 | grep -ci 'warning' | grep -q '^0$'");
+
+    Some(VerificationCriterion {
+        id: id.to_string(),
+        description: desc.to_string(),
+        verifier: VerifierKind::Command {
+            cmd,
+            expected_exit: 0,
+        },
+        required: true,
+        timeout_sec: 300,
+        global_only: true, // build is expensive — global only
+    })
+}
+
+/// Match "Function X exists in file Y" or "Module exports X" patterns.
+///
+/// Generates a `GrepCheck` that searches for the symbol name in the specified file.
+/// Covers acceptance criteria like:
+/// - "Function authenticate exists in src/auth.rs"
+/// - "src/config.ts exports createUser"
+/// - "File src/models.py defines class User"
+fn try_parse_function_exists_criterion(
+    id: &str,
+    desc: &str,
+    lower: &str,
+) -> Option<VerificationCriterion> {
+    let has_symbol_kind = lower.contains("function")
+        || lower.contains("class")
+        || lower.contains("struct")
+        || lower.contains("enum")
+        || lower.contains("trait")
+        || lower.contains("interface")
+        || lower.contains("const ")
+        || lower.contains("export");
+    let has_existence = lower.contains("exist")
+        || lower.contains("define")
+        || lower.contains("declare")
+        || lower.contains("export")
+        || lower.contains("has a ");
+
+    if !has_symbol_kind || !has_existence {
+        return None;
+    }
+
+    let paths = extract_file_paths(desc);
+    if paths.is_empty() {
+        return None;
+    }
+
+    // Try to find the symbol name: first from quoted strings, then from words
+    // immediately following symbol keywords.
+    let quoted = extract_quoted_strings(desc);
+    let symbol = if !quoted.is_empty() {
+        quoted[0].clone()
+    } else {
+        // Look for the word right after "function"/"class"/"struct" etc.
+        let keywords = [
+            "function ", "class ", "struct ", "enum ", "trait ", "interface ", "const ",
+        ];
+        let mut found = None;
+        for kw in &keywords {
+            if let Some(pos) = lower.find(kw) {
+                let after = &desc[pos + kw.len()..];
+                if let Some(word) = after.split_whitespace().next() {
+                    let clean = word.trim_matches(|c: char| !c.is_alphanumeric() && c != '_');
+                    if !clean.is_empty() {
+                        found = Some(clean.to_string());
+                        break;
+                    }
+                }
+            }
+        }
+        found?
+    };
+
+    Some(VerificationCriterion {
+        id: id.to_string(),
+        description: desc.to_string(),
+        verifier: VerifierKind::GrepCheck {
+            file: paths[0].clone(),
+            pattern: symbol,
+            should_match: true,
+        },
+        required: true,
+        timeout_sec: 10,
+        global_only: false,
+    })
+}
+
+/// Flexible grep: matches "file X should have Y", "X includes Y", "Y in X" etc.
+///
+/// This is a looser variant of `try_parse_grep_criterion` that doesn't require
+/// the exact "in file" / "contain" keywords. It catches patterns like:
+/// - "src/config.ts includes the string 'API_KEY'"
+/// - "Makefile should have a 'test' target"
+/// - "File src/models.py should have 'class User'"
+fn try_parse_flexible_grep_criterion(
+    id: &str,
+    desc: &str,
+    lower: &str,
+) -> Option<VerificationCriterion> {
+    let paths = extract_file_paths(desc);
+    let quoted = extract_quoted_strings(desc);
+
+    // Need both a file and a pattern to search for
+    if paths.is_empty() || quoted.is_empty() {
+        return None;
+    }
+
+    // Must have some verb indicating containment/presence
+    let has_verb = lower.contains("has ")
+        || lower.contains("have ")
+        || lower.contains("include")
+        || lower.contains("contain")
+        || lower.contains("should")
+        || lower.contains("with ");
+
+    if !has_verb {
+        return None;
+    }
+
+    let should_match = !lower.contains("not have")
+        && !lower.contains("should not")
+        && !lower.contains("shouldn't")
+        && !lower.contains("not contain")
+        && !lower.contains("not include");
+
+    Some(VerificationCriterion {
+        id: id.to_string(),
+        description: desc.to_string(),
+        verifier: VerifierKind::GrepCheck {
+            file: paths[0].clone(),
+            pattern: quoted[0].clone(),
+            should_match,
+        },
+        required: true,
+        timeout_sec: 10,
+        global_only: false,
+    })
+}
+
+/// Extract file paths from a string (heuristic: words containing '/' or known extensions/names).
 fn extract_file_paths(text: &str) -> Vec<String> {
     let extensions = [
         ".rs", ".py", ".ts", ".tsx", ".js", ".jsx", ".go", ".java", ".rb", ".cpp", ".c", ".h",
         ".toml", ".yaml", ".yml", ".json", ".sql", ".md", ".txt", ".sh",
+    ];
+    // Well-known filenames without extensions
+    let known_names = [
+        "Makefile", "Dockerfile", "Vagrantfile", "Gemfile", "Rakefile", "Procfile",
+        "CMakeLists", "Justfile",
     ];
 
     text.split_whitespace()
@@ -427,6 +608,7 @@ fn extract_file_paths(text: &str) -> Vec<String> {
             w.contains('/')
                 || w.contains('\\')
                 || extensions.iter().any(|ext| w.ends_with(ext))
+                || known_names.iter().any(|name| *w == *name)
         })
         .map(String::from)
         .collect()
@@ -1097,5 +1279,159 @@ mod tests {
         assert!(!c.is_empty());
         let has_perm = c.iter().any(|c| matches!(&c.verifier, VerifierKind::Command { .. }));
         assert!(has_perm, "should detect permission pattern with chmod keyword");
+    }
+
+    #[test]
+    fn parse_no_warnings_criterion() {
+        let det = rust_detection();
+
+        // "No compiler warnings"
+        let c = parse_acceptance_to_criteria("No compiler warnings", "s1", &det);
+        assert_eq!(c.len(), 1);
+        match &c[0].verifier {
+            VerifierKind::Command { cmd, expected_exit } => {
+                assert!(cmd.contains("cargo build"), "should use project build cmd");
+                assert!(cmd.contains("warning"), "should grep for warning");
+                assert_eq!(*expected_exit, 0);
+            }
+            other => panic!("expected Command, got {:?}", other),
+        }
+        assert!(c[0].global_only, "no-warnings check should be global_only");
+
+        // "Zero warnings in build output"
+        let c = parse_acceptance_to_criteria("Zero warnings in build output", "s2", &det);
+        assert!(!c.is_empty());
+        assert!(c.iter().any(|c| matches!(&c.verifier, VerifierKind::Command { .. })));
+
+        // "Code compiles with clean output without warnings"
+        let c = parse_acceptance_to_criteria(
+            "Code compiles with clean output without warnings",
+            "s3",
+            &det,
+        );
+        assert!(!c.is_empty());
+        assert!(c.iter().any(|c| matches!(&c.verifier, VerifierKind::Command { .. })));
+    }
+
+    #[test]
+    fn parse_no_warnings_needs_project_detection() {
+        // Without project detection, no build command → fallback to LlmJudge
+        let det = ProjectDetection::default();
+        let c = parse_acceptance_to_criteria("No compiler warnings", "s1", &det);
+        assert_eq!(c.len(), 1);
+        assert!(
+            matches!(&c[0].verifier, VerifierKind::LlmJudge { .. }),
+            "without build cmd, should fall to LlmJudge"
+        );
+    }
+
+    #[test]
+    fn parse_function_exists_criterion() {
+        let det = ProjectDetection::default();
+
+        // "Function authenticate exists in src/auth.rs"
+        let c = parse_acceptance_to_criteria(
+            "Function authenticate exists in src/auth.rs",
+            "s1",
+            &det,
+        );
+        assert_eq!(c.len(), 1);
+        match &c[0].verifier {
+            VerifierKind::GrepCheck {
+                file,
+                pattern,
+                should_match,
+            } => {
+                assert_eq!(file, "src/auth.rs");
+                assert_eq!(pattern, "authenticate");
+                assert!(*should_match);
+            }
+            other => panic!("expected GrepCheck, got {:?}", other),
+        }
+
+        // "src/models.py defines class User"
+        let c = parse_acceptance_to_criteria(
+            "src/models.py defines class User",
+            "s2",
+            &det,
+        );
+        assert!(!c.is_empty());
+        let has_grep = c
+            .iter()
+            .any(|c| matches!(&c.verifier, VerifierKind::GrepCheck { .. }));
+        assert!(has_grep, "should detect class existence as grep");
+
+        // "Module src/config.ts exports function createUser"
+        let c = parse_acceptance_to_criteria(
+            "Module src/config.ts exports function createUser",
+            "s3",
+            &det,
+        );
+        assert!(!c.is_empty());
+        let has_grep = c
+            .iter()
+            .any(|c| matches!(&c.verifier, VerifierKind::GrepCheck { .. }));
+        assert!(has_grep, "should detect export existence as grep");
+    }
+
+    #[test]
+    fn parse_flexible_grep_criterion() {
+        let det = ProjectDetection::default();
+
+        // "src/config.ts includes the string 'API_KEY'"
+        let c = parse_acceptance_to_criteria(
+            "src/config.ts includes the string 'API_KEY'",
+            "s1",
+            &det,
+        );
+        assert_eq!(c.len(), 1);
+        match &c[0].verifier {
+            VerifierKind::GrepCheck {
+                file,
+                pattern,
+                should_match,
+            } => {
+                assert_eq!(file, "src/config.ts");
+                assert_eq!(pattern, "API_KEY");
+                assert!(*should_match);
+            }
+            other => panic!("expected GrepCheck, got {:?}", other),
+        }
+
+        // "Makefile should have a 'test' target" — "makefile" contains "file",
+        // so file_exists parser catches it first. Use a path instead:
+        let c = parse_acceptance_to_criteria(
+            "build/config.yaml should have 'debug: true'",
+            "s2",
+            &det,
+        );
+        assert!(!c.is_empty());
+        match &c[0].verifier {
+            VerifierKind::GrepCheck {
+                file,
+                pattern,
+                should_match,
+            } => {
+                assert_eq!(file, "build/config.yaml");
+                assert_eq!(pattern, "debug: true");
+                assert!(*should_match);
+            }
+            other => panic!("expected GrepCheck, got {:?}", other),
+        }
+
+        // Negative grep with "should not"
+        let c = parse_acceptance_to_criteria(
+            "src/auth.rs should not have 'unwrap()'",
+            "s3",
+            &det,
+        );
+        assert!(!c.is_empty());
+        let grep = c
+            .iter()
+            .find(|c| matches!(&c.verifier, VerifierKind::GrepCheck { .. }));
+        assert!(grep.is_some(), "should detect negative flexible grep");
+        if let VerifierKind::GrepCheck { should_match, .. } = &grep.unwrap().verifier {
+            assert!(!should_match, "should be negated");
+        }
     }
 }
