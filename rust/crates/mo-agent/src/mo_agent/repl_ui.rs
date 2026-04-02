@@ -239,7 +239,10 @@ const SLASH_FIRST_TOKEN_COMPLETIONS: &[(&str, &[(&str, &str)])] = &[
     ),
     (
         "/memory",
-        &[("list", "List memories"), ("search", "Search memories (needs query)")],
+        &[
+            ("list", "List memories"),
+            ("search", "Search memories (needs query)"),
+        ],
     ),
     (
         "/session",
@@ -264,7 +267,9 @@ const SLASH_FIRST_TOKEN_COMPLETIONS: &[(&str, &[(&str, &str)])] = &[
     ),
 ];
 
-fn slash_first_token_option_list(cmd_word: &str) -> Option<&'static [(&'static str, &'static str)]> {
+fn slash_first_token_option_list(
+    cmd_word: &str,
+) -> Option<&'static [(&'static str, &'static str)]> {
     let trimmed = cmd_word.trim();
     if !trimmed.starts_with('/') {
         return None;

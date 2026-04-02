@@ -858,19 +858,28 @@ impl StreamRenderState {
     /// Update a tool line to show completion status with Cursor-style summary.
     fn tool_done(&mut self, idx: usize, tool: &str, status: &str, duration_ms: u64, output: &str) {
         let output_summary = self.format_output_summary(tool, output, status);
+        // Include duration in the summary for tools that took >100ms
+        let duration_note = if duration_ms >= 100 {
+            format!(" ({duration_ms}ms)")
+        } else {
+            String::new()
+        };
         // Cursor-style format: original description with result appended
         let line = if status == "error" {
             let err_msg = output_summary.unwrap_or_else(|| "failed".to_string());
-            format!("  ✗ {tool} ({duration_ms}ms) {err_msg}")
+            format!("  ✗ {tool}{duration_note} {err_msg}")
         } else {
             match output_summary {
-                Some(summary) => format!("    {summary}"),
-                None => format!("    Done ({duration_ms}ms)"),
+                Some(summary) => format!("    {summary}{duration_note}"),
+                None if duration_ms >= 100 => format!("    Done{duration_note}"),
+                None => String::new(), // No summary line for fast tools with no output
             }
         };
         if self.md.is_some() {
-            eprintln!("{line}");
-            self.stderr_lines += 1;
+            if !line.is_empty() {
+                eprintln!("{line}");
+                self.stderr_lines += 1;
+            }
             return;
         }
         if idx < self.tool_lines.len() {
@@ -881,10 +890,12 @@ impl StreamRenderState {
                 if first.ends_with(" …") {
                     self.tool_lines[idx] = first.trim_end_matches(" …").to_string();
                 }
-                // Add summary line
-                let insert_pos = idx + 1;
-                if insert_pos <= self.tool_lines.len() {
-                    self.tool_lines.insert(insert_pos, line);
+                // Add summary line if non-empty
+                if !line.is_empty() {
+                    let insert_pos = idx + 1;
+                    if insert_pos <= self.tool_lines.len() {
+                        self.tool_lines.insert(insert_pos, line);
+                    }
                 }
             } else {
                 self.tool_lines[idx] = line;
