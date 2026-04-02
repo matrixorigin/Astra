@@ -718,7 +718,7 @@ fn render_slash_overlay_header(filter: Option<&str>, inner_width: usize) -> Stri
 fn slash_overlay_footer_summary(total: usize, start: usize, end: usize) -> String {
     if total > 0 {
         format!(
-            " {}/{} shown  ·  ↑↓ move  ·  →/Tab accept  ·  Enter run  ·  ← edit  ·  Esc close ",
+            " {}/{} shown  ·  ↑↓ highlight  ·  Tab complete  ·  → accept  ·  Enter run  ·  ← edit  ·  Esc close ",
             end - start,
             total
         )
@@ -1169,7 +1169,8 @@ pub(super) fn print_keyboard_shortcuts() {
             "Slash Picker",
             &[
                 ("/", "Open picker"),
-                ("Tab / ↑↓", "Navigate options"),
+                ("Tab", "Complete using highlighted option"),
+                ("↑ / ↓", "Move highlight"),
                 ("Enter", "Execute selected"),
                 ("→ / Space", "Accept + continue"),
                 ("Esc", "Dismiss"),
@@ -1298,19 +1299,41 @@ impl ConditionalEventHandler for SlashStartCompleteHandler {
                 nav!(1);
             }
             RlKeyEvent(RlKeyCode::Tab, _) if in_slash && active => {
+                // Tab = apply the **highlighted** row to the input (readline-style), not ↓.
+                // Use ↑/↓ to change highlight, then Tab to complete to that command.
+                if ctx.pos() != ctx.line().len() {
+                    return None;
+                }
                 let rows = picker_rows_for_filter();
                 let current = ctx.line();
                 let selected = get_slash_picker_selected();
                 let selected_cmd = rows.get(selected).map(|(cmd, _)| *cmd);
-                let exact_selected = selected_cmd == Some(current);
-                if rows.len() == 1 || exact_selected {
-                    clear_slash_overlay();
-                    if let Some(edit) = accepted_slash_edit(current, selected_cmd, true) {
-                        return Some(apply_accepted_slash_edit(edit));
+
+                if let Some(edit) = accepted_slash_edit(current, selected_cmd, true) {
+                    match edit {
+                        AcceptedSlashEdit::KeepLine => {
+                            if rows.len() > 1 {
+                                let _ = move_picker_selection(1);
+                                let filter = get_slash_filter();
+                                render_slash_overlay(filter.as_deref());
+                                return Some(RlCmd::Noop);
+                            }
+                            clear_slash_overlay();
+                            return Some(RlCmd::Move(RlMovement::EndOfLine));
+                        }
+                        _ => {
+                            clear_slash_overlay();
+                            return Some(apply_accepted_slash_edit(edit));
+                        }
                     }
+                }
+
+                if rows.len() > 1 {
+                    nav!(1);
+                } else {
+                    clear_slash_overlay();
                     return Some(RlCmd::Move(RlMovement::EndOfLine));
                 }
-                nav!(1);
             }
             RlKeyEvent(RlKeyCode::BackTab, _) if in_slash && active => {
                 nav!(-1);
