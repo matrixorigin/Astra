@@ -574,11 +574,11 @@ impl StreamRenderState {
     /// Format a preview of tool arguments (single line, max ~60 chars).
     fn format_tool_arg_preview(&self, tool: &str, args: &Value) -> Option<String> {
         match tool {
-            "bash" | "shell" => args
+            "bash" => args
                 .get("command")
                 .and_then(Value::as_str)
                 .map(|cmd| truncate_line(cmd, 60)),
-            "read_file" | "view_file" => {
+            "read_file" => {
                 let path = args.get("path").and_then(Value::as_str).unwrap_or("");
                 let start = args.get("start_line").and_then(Value::as_u64);
                 let end = args.get("end_line").and_then(Value::as_u64);
@@ -588,22 +588,130 @@ impl StreamRenderState {
                     _ => Some(truncate_line(path, 60)),
                 }
             }
-            "write_file" | "create_file" | "edit_file" => args
+            "write_file" | "delete_file" => args
                 .get("path")
                 .and_then(Value::as_str)
                 .map(|p| truncate_line(p, 60)),
-            "grep" | "search" => args
+            "str_replace" | "multi_edit" => args
+                .get("path")
+                .and_then(Value::as_str)
+                .map(|p| truncate_line(p, 60)),
+            "list_dir" => {
+                let path = args.get("path").and_then(Value::as_str).unwrap_or(".");
+                let depth = args.get("depth").and_then(Value::as_u64);
+                match depth {
+                    Some(d) => Some(format!("{} (depth {})", truncate_line(path, 50), d)),
+                    None => Some(truncate_line(path, 60)),
+                }
+            }
+            "grep" => {
+                let pattern = args.get("pattern").and_then(Value::as_str).unwrap_or("");
+                let glob_filter = args.get("glob").and_then(Value::as_str);
+                let path = args.get("path").and_then(Value::as_str);
+                let mut preview = format!("/{}/", truncate_line(pattern, 30));
+                if let Some(g) = glob_filter {
+                    preview.push_str(&format!(" {}", truncate_line(g, 20)));
+                } else if let Some(p) = path {
+                    preview.push_str(&format!(" in {}", truncate_line(p, 20)));
+                }
+                Some(preview)
+            }
+            "glob" => args
                 .get("pattern")
                 .and_then(Value::as_str)
-                .map(|p| format!("/{}/", truncate_line(p, 50))),
-            "git_log" | "git_show" | "git_diff" => {
-                // Show ref/sha if present
-                args.get("ref")
-                    .or_else(|| args.get("sha"))
-                    .or_else(|| args.get("commit"))
-                    .and_then(Value::as_str)
-                    .map(|s| truncate_line(s, 20))
+                .map(|p| truncate_line(p, 60)),
+            "git_log" => {
+                let n = args.get("n").and_then(Value::as_u64);
+                let branch = args.get("branch").and_then(Value::as_str);
+                match (n, branch) {
+                    (Some(n), Some(b)) => Some(format!("-{n} {b}")),
+                    (Some(n), None) => Some(format!("-{n}")),
+                    (None, Some(b)) => Some(truncate_line(b, 20)),
+                    _ => None,
+                }
             }
+            "git_show" | "git_blame" | "git_file_history" => args
+                .get("commit")
+                .or_else(|| args.get("ref"))
+                .or_else(|| args.get("path"))
+                .and_then(Value::as_str)
+                .map(|s| truncate_line(s, 20)),
+            "git_diff" => {
+                let staged = args.get("staged").and_then(Value::as_bool).unwrap_or(false);
+                let path = args.get("path").and_then(Value::as_str);
+                match (staged, path) {
+                    (true, Some(p)) => Some(format!("--staged {}", truncate_line(p, 45))),
+                    (true, None) => Some("--staged".to_string()),
+                    (false, Some(p)) => Some(truncate_line(p, 60)),
+                    _ => None,
+                }
+            }
+            "git_commit" => args
+                .get("message")
+                .and_then(Value::as_str)
+                .map(|m| format!("-m \"{}\"", truncate_line(m, 50))),
+            "git_stash" => args
+                .get("action")
+                .and_then(Value::as_str)
+                .map(|a| a.to_string()),
+            "find_definition" | "find_references" | "symbol_search" | "hover_info" => args
+                .get("symbol")
+                .and_then(Value::as_str)
+                .map(|s| truncate_line(s, 40)),
+            "call_graph" | "type_hierarchy" => {
+                let symbol = args.get("symbol").and_then(Value::as_str).unwrap_or("");
+                let depth = args.get("depth").and_then(Value::as_u64);
+                match depth {
+                    Some(d) => Some(format!("{} (depth {})", truncate_line(symbol, 40), d)),
+                    None => Some(truncate_line(symbol, 50)),
+                }
+            }
+            "symbols" => args
+                .get("path")
+                .and_then(Value::as_str)
+                .map(|p| truncate_line(p, 60)),
+            "run_build_test" => args
+                .get("command")
+                .and_then(Value::as_str)
+                .map(|c| truncate_line(c, 60)),
+            "web_fetch" => args
+                .get("url")
+                .and_then(Value::as_str)
+                .map(|u| truncate_line(u, 60)),
+            "github_get_pr" | "github_get_issue" => {
+                let owner = args.get("owner").and_then(Value::as_str).unwrap_or("");
+                let repo = args.get("repo").and_then(Value::as_str).unwrap_or("");
+                let number = args
+                    .get("number")
+                    .or_else(|| args.get("pr_number"))
+                    .or_else(|| args.get("issue_number"))
+                    .and_then(Value::as_u64);
+                match number {
+                    Some(n) => Some(format!("{owner}/{repo}#{n}")),
+                    None => Some(format!("{owner}/{repo}")),
+                }
+            }
+            "github_list_prs" | "github_list_issues" | "github_repo_stats" | "github_ci_status" => {
+                let owner = args.get("owner").and_then(Value::as_str).unwrap_or("");
+                let repo = args.get("repo").and_then(Value::as_str).unwrap_or("");
+                Some(format!("{owner}/{repo}"))
+            }
+            "mo_query" => args
+                .get("query")
+                .and_then(Value::as_str)
+                .map(|q| truncate_line(q, 60)),
+            "mo_snapshot" | "mo_branch" => args
+                .get("action")
+                .and_then(Value::as_str)
+                .map(|a| a.to_string()),
+            "memory_retrieve" | "memory_search" => args
+                .get("query")
+                .and_then(Value::as_str)
+                .map(|q| truncate_line(q, 50)),
+            "memory_store" => args
+                .get("content")
+                .and_then(Value::as_str)
+                .map(|c| truncate_line(c, 50)),
             _ => None,
         }
     }
