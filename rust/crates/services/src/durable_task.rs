@@ -5758,4 +5758,367 @@ Time:        3.456 s
             "ANY mode should fail if all sub-criteria fail"
         );
     }
+
+    // ─── SubtaskStage state machine tests ───────────────────────────────────
+
+    #[test]
+    fn subtask_stage_terminal_states() {
+        assert!(SubtaskStage::Completed.is_terminal());
+        assert!(
+            SubtaskStage::Skipped {
+                reason: "n/a".into()
+            }
+            .is_terminal()
+        );
+        assert!(
+            SubtaskStage::Abandoned {
+                reason: "n/a".into()
+            }
+            .is_terminal()
+        );
+
+        // Non-terminal
+        assert!(!SubtaskStage::Pending.is_terminal());
+        assert!(!SubtaskStage::Executing.is_terminal());
+        assert!(!SubtaskStage::Verified.is_terminal());
+        assert!(!SubtaskStage::AwaitingVerification.is_terminal());
+        assert!(!SubtaskStage::Verifying.is_terminal());
+        assert!(!SubtaskStage::VerificationFailed { results: vec![] }.is_terminal());
+    }
+
+    #[test]
+    fn subtask_stage_success_states() {
+        assert!(SubtaskStage::Completed.is_success());
+        assert!(SubtaskStage::Verified.is_success());
+
+        assert!(!SubtaskStage::Pending.is_success());
+        assert!(!SubtaskStage::Executing.is_success());
+        assert!(!SubtaskStage::Abandoned { reason: "x".into() }.is_success());
+        assert!(!SubtaskStage::Skipped { reason: "x".into() }.is_success());
+    }
+
+    #[test]
+    fn subtask_stage_can_start() {
+        assert!(SubtaskStage::Pending.can_start());
+        assert!(SubtaskStage::VerificationFailed { results: vec![] }.can_start());
+
+        assert!(!SubtaskStage::Executing.can_start());
+        assert!(!SubtaskStage::Completed.can_start());
+        assert!(!SubtaskStage::Verified.can_start());
+        assert!(!SubtaskStage::Blocked { reason: "x".into() }.can_start());
+    }
+
+    #[test]
+    fn subtask_stage_as_str_roundtrip() {
+        let stages = vec![
+            SubtaskStage::Pending,
+            SubtaskStage::Blocked {
+                reason: "dep".into(),
+            },
+            SubtaskStage::Executing,
+            SubtaskStage::ExecutionFailed {
+                error: "err".into(),
+            },
+            SubtaskStage::AwaitingVerification,
+            SubtaskStage::Verifying,
+            SubtaskStage::VerificationFailed { results: vec![] },
+            SubtaskStage::Verified,
+            SubtaskStage::Completed,
+            SubtaskStage::Skipped {
+                reason: "skip".into(),
+            },
+            SubtaskStage::Abandoned {
+                reason: "give up".into(),
+            },
+        ];
+        let expected_strs = vec![
+            "pending",
+            "blocked",
+            "executing",
+            "execution_failed",
+            "awaiting_verification",
+            "verifying",
+            "verification_failed",
+            "verified",
+            "completed",
+            "skipped",
+            "abandoned",
+        ];
+        for (stage, expected) in stages.iter().zip(expected_strs.iter()) {
+            assert_eq!(stage.as_str(), *expected, "as_str() for {:?}", stage);
+        }
+    }
+
+    #[test]
+    fn subtask_stage_serde_roundtrip() {
+        let stage = SubtaskStage::VerificationFailed {
+            results: vec![VerificationResult {
+                criterion_id: "c1".into(),
+                passed: false,
+                evidence: "nope".into(),
+                expected: "yes".into(),
+                duration_ms: 100,
+                error: None,
+            }],
+        };
+        let json = serde_json::to_string(&stage).unwrap();
+        let parsed: SubtaskStage = serde_json::from_str(&json).unwrap();
+        assert_eq!(stage, parsed);
+    }
+
+    // ─── validate_snapshot_name tests ───────────────────────────────────────
+
+    #[test]
+    fn validate_snapshot_name_accepts_valid() {
+        assert!(validate_snapshot_name("task_123_sub1_v1").is_ok());
+        assert!(validate_snapshot_name("abc").is_ok());
+        assert!(validate_snapshot_name("A_B_C").is_ok());
+    }
+
+    #[test]
+    fn validate_snapshot_name_rejects_invalid() {
+        assert!(validate_snapshot_name("").is_err());
+        assert!(validate_snapshot_name("has spaces").is_err());
+        assert!(validate_snapshot_name("has-dashes").is_err());
+        assert!(validate_snapshot_name("path/sep").is_err());
+        assert!(validate_snapshot_name("special!char").is_err());
+    }
+
+    // ─── extract_paths_from_text tests ──────────────────────────────────────
+
+    #[test]
+    fn extract_paths_finds_source_files() {
+        let text = "Modified `src/main.rs` and tests/test.py for the feature";
+        let paths = extract_paths_from_text(text);
+        assert!(paths.contains(&"src/main.rs".to_string()));
+        assert!(paths.contains(&"tests/test.py".to_string()));
+    }
+
+    #[test]
+    fn extract_paths_finds_config_files() {
+        let text = "Updated Cargo.toml, config.yaml and schema.json";
+        let paths = extract_paths_from_text(text);
+        assert!(paths.contains(&"Cargo.toml".to_string()));
+        assert!(paths.contains(&"config.yaml".to_string()));
+        assert!(paths.contains(&"schema.json".to_string()));
+    }
+
+    #[test]
+    fn extract_paths_returns_empty_for_no_paths() {
+        let text = "This is just a plain description with no file references";
+        let paths = extract_paths_from_text(text);
+        assert!(paths.is_empty());
+    }
+
+    // ─── build_outcome_signal tests ─────────────────────────────────────────
+
+    #[test]
+    fn build_outcome_signal_basic() {
+        let contract = TaskContract {
+            contract_id: "c1".into(),
+            task_id: "t1".into(),
+            goal: "Implement auth".into(),
+            scope: TaskScope::default(),
+            subtasks: vec![
+                DurableSubtask {
+                    id: "s1".into(),
+                    title: "Auth module".into(),
+                    stage: SubtaskStage::Completed,
+                    criteria: vec![VerificationCriterion {
+                        id: "cr1".into(),
+                        description: "build passes".into(),
+                        verifier: VerifierKind::BuildPass { cmd: "true".into() },
+                        required: true,
+                        timeout_sec: 30,
+                        global_only: false,
+                    }],
+                    files: vec!["src/auth.rs".into()],
+                    ..DurableSubtask::default()
+                },
+                DurableSubtask {
+                    id: "s2".into(),
+                    title: "Tests".into(),
+                    stage: SubtaskStage::Completed,
+                    criteria: vec![],
+                    ..DurableSubtask::default()
+                },
+            ],
+            global_verification: vec![],
+            version: 1,
+            status: ContractStatus::Completed,
+            created_at: "now".into(),
+            updated_at: "now".into(),
+        };
+        let report = TaskDeliveryReport {
+            task_id: "t1".into(),
+            contract_id: "c1".into(),
+            goal: "Implement auth".into(),
+            subtask_summaries: vec![
+                SubtaskDeliverySummary {
+                    id: "s1".into(),
+                    title: "Auth module".into(),
+                    stage: "completed".into(),
+                    criteria_passed: 1,
+                    criteria_total: 1,
+                    retry_count: 0,
+                },
+                SubtaskDeliverySummary {
+                    id: "s2".into(),
+                    title: "Tests".into(),
+                    stage: "completed".into(),
+                    criteria_passed: 0,
+                    criteria_total: 0,
+                    retry_count: 0,
+                },
+            ],
+            global_verification: vec![],
+            total_turns: 5,
+            total_tokens: 10000,
+            total_verifications: 1,
+            risks: vec![],
+            timestamp: "now".into(),
+        };
+
+        let signal =
+            build_outcome_signal(&contract, &report, vec!["bash".into()], None, None, None);
+        assert!(signal.success);
+        assert_eq!(signal.goal, "Implement auth");
+        assert_eq!(signal.subtask_outcomes.len(), 2);
+        assert_eq!(signal.tools_used, vec!["bash"]);
+        assert_eq!(signal.total_turns, 5);
+
+        // s1 has 1 criterion, all passed → pass_rate = 1.0
+        let s1 = &signal.subtask_outcomes[0];
+        assert!(s1.success);
+        assert!((s1.verification_pass_rate.unwrap() - 1.0).abs() < 0.001);
+        assert_eq!(s1.files_modified, vec!["src/auth.rs"]);
+
+        // s2 has no criteria → pass_rate = None
+        let s2 = &signal.subtask_outcomes[1];
+        assert!(s2.verification_pass_rate.is_none());
+    }
+
+    #[test]
+    fn build_outcome_signal_failure_case() {
+        let contract = TaskContract {
+            contract_id: "c2".into(),
+            task_id: "t2".into(),
+            goal: "Fix bug".into(),
+            scope: TaskScope::default(),
+            subtasks: vec![DurableSubtask {
+                id: "s1".into(),
+                title: "Fix".into(),
+                stage: SubtaskStage::Abandoned {
+                    reason: "too hard".into(),
+                },
+                retry_count: 2,
+                criteria: vec![
+                    VerificationCriterion {
+                        id: "cr1".into(),
+                        description: "build".into(),
+                        verifier: VerifierKind::BuildPass { cmd: "true".into() },
+                        required: true,
+                        timeout_sec: 30,
+                        global_only: false,
+                    },
+                    VerificationCriterion {
+                        id: "cr2".into(),
+                        description: "test".into(),
+                        verifier: VerifierKind::TestPass {
+                            cmd: "true".into(),
+                            min_pass_rate: 1.0,
+                        },
+                        required: true,
+                        timeout_sec: 30,
+                        global_only: false,
+                    },
+                ],
+                ..DurableSubtask::default()
+            }],
+            global_verification: vec![],
+            version: 1,
+            status: ContractStatus::Active,
+            created_at: "now".into(),
+            updated_at: "now".into(),
+        };
+        let report = TaskDeliveryReport {
+            task_id: "t2".into(),
+            contract_id: "c2".into(),
+            goal: "Fix bug".into(),
+            subtask_summaries: vec![SubtaskDeliverySummary {
+                id: "s1".into(),
+                title: "Fix".into(),
+                stage: "abandoned".into(),
+                criteria_passed: 1,
+                criteria_total: 2,
+                retry_count: 2,
+            }],
+            global_verification: vec![],
+            total_turns: 10,
+            total_tokens: 20000,
+            total_verifications: 3,
+            risks: vec![],
+            timestamp: "now".into(),
+        };
+
+        let signal = build_outcome_signal(
+            &contract,
+            &report,
+            vec![],
+            Some(30),
+            Some("code".into()),
+            None,
+        );
+        assert!(!signal.success, "abandoned task should not be success");
+        assert_eq!(signal.total_retries, 2);
+        assert_eq!(signal.user_rating, Some(30));
+        assert_eq!(signal.domain_hint, Some("code".into()));
+
+        let s1 = &signal.subtask_outcomes[0];
+        assert!(!s1.success);
+        assert_eq!(s1.retry_count, 2);
+        // 1 passed out of 2 criteria → 0.5
+        assert!((s1.verification_pass_rate.unwrap() - 0.5).abs() < 0.001);
+    }
+
+    // ─── truncate tests ─────────────────────────────────────────────────────
+
+    #[test]
+    fn truncate_short_string_unchanged() {
+        assert_eq!(truncate("hello", 10), "hello");
+    }
+
+    #[test]
+    fn truncate_long_string_cut() {
+        let result = truncate("hello world", 5);
+        assert!(result.starts_with("hello"));
+        assert!(result.contains("[truncated]"));
+    }
+
+    // ─── MatrixOneDurableTaskLifecycle integration test scaffold ────────────
+
+    /// MatrixOneDurableTaskLifecycle requires a real MySQL/MatrixOne connection.
+    /// This test documents the integration test structure; run manually with:
+    ///   DATABASE_URL=mysql://user:pass@host/db cargo test matrixone_lifecycle --ignored
+    #[tokio::test]
+    #[ignore = "requires real MatrixOne/MySQL database"]
+    async fn matrixone_lifecycle_create_and_verify() {
+        // This would test the full create_contract → begin_subtask → verify → deliver flow
+        // against a real database. The LocalDurableTaskLifecycle tests in this file cover
+        // the equivalent logic paths with file-based storage.
+        //
+        // To run:
+        // 1. Start MatrixOne or MySQL
+        // 2. Create the task_contracts + verification_results tables (see schema above)
+        // 3. Set DATABASE_URL env var
+        // 4. cargo test matrixone_lifecycle --ignored
+        //
+        // let pool = sqlx::MySqlPool::connect(&std::env::var("DATABASE_URL").unwrap()).await.unwrap();
+        // let tmp = tempfile::TempDir::new().unwrap();
+        // let mut svc = MatrixOneDurableTaskLifecycle::new(pool, tmp.path().to_path_buf());
+        // svc.set_session_context("test-session", "test-user");
+        // let plan = make_test_plan();
+        // let contract = svc.create_contract("test-user", "test-session", "test goal", &plan, TaskScope::default()).await.unwrap();
+        // ... verify subtasks, deliver, etc.
+    }
 }
