@@ -495,6 +495,15 @@ struct ReplState {
     pattern_library: Option<
         std::sync::Arc<std::sync::Mutex<mo_agent_runtime::pipeline::pattern::PatternLibrary>>,
     >,
+    /// Shared entity graph for learning feedback loop.
+    entity_graph:
+        Option<std::sync::Arc<std::sync::Mutex<mo_agent_runtime::pipeline::entity::EntityGraph>>>,
+    /// Shared calibrator for learning feedback loop.
+    calibrator: Option<
+        std::sync::Arc<
+            std::sync::Mutex<mo_agent_runtime::pipeline::calibration::ProgressiveCalibrator>,
+        >,
+    >,
     /// Skill registry for progressive loading and context injection.
     skill_registry: std::sync::Arc<std::sync::RwLock<skill_instructions::SkillRegistry>>,
     /// MCP client manager for external tool servers.
@@ -547,6 +556,8 @@ impl Default for ReplState {
             cloud_learning_version: None,
             last_turn_event: None,
             pattern_library: None,
+            entity_graph: None,
+            calibrator: None,
             skill_registry: std::sync::Arc::new(std::sync::RwLock::new(
                 skill_instructions::SkillRegistry::new(),
             )),
@@ -1011,7 +1022,7 @@ async fn handle_resume_command(arg: &str, profile: Option<&str>, state: &mut Rep
                             std::sync::Arc::new(j)
                                 as std::sync::Arc<dyn mo_agent_services::LlmJudge>
                         }),
-                    None, // learning_bridge — wired when pipeline components are shared
+                    build_learning_bridge(state),
                 );
                 state.durable_task_state = Some(durable_bridge::DurableTaskState {
                     contract,
@@ -1842,6 +1853,24 @@ fn format_bytes(bytes: u64) -> String {
 
 // ═══════════════════════════════════════════════ Plan Auto-Execution ═════
 
+/// Build a [`TaskLearningBridge`] from ReplState's shared pipeline components.
+///
+/// Returns `None` if any of the required learning modules (entity_graph,
+/// pattern_library, calibrator) are not yet initialized.
+fn build_learning_bridge(
+    state: &ReplState,
+) -> Option<std::sync::Arc<dyn mo_agent_services::TaskLearningBridge>> {
+    let eg = state.entity_graph.as_ref()?;
+    let pl = state.pattern_library.as_ref()?;
+    let cal = state.calibrator.as_ref()?;
+    let bridge = mo_agent_runtime::pipeline::task_learning::PipelineTaskLearningBridge::from_shared(
+        eg.clone(),
+        pl.clone(),
+        cal.clone(),
+    );
+    Some(std::sync::Arc::new(bridge))
+}
+
 /// Run the plan auto-execution loop: iterate through ready subtasks,
 /// send each as a chat message, mark done, continue until all done or blocked.
 ///
@@ -1887,7 +1916,7 @@ async fn run_plan_execution(
                 .as_ref()
                 .and_then(|mc| mc.create_cloud_llm_judge())
                 .map(|j| std::sync::Arc::new(j) as std::sync::Arc<dyn mo_agent_services::LlmJudge>),
-            None, // learning_bridge — wired when pipeline components are shared
+            build_learning_bridge(state),
         );
 
         if let Some(contract) = durable_bridge::generate_contract(
@@ -3244,8 +3273,10 @@ async fn run_chat_repl(
         };
     }
 
-    // Store pattern library reference for /learn command
+    // Store pipeline learning modules for /learn command and learning feedback loop
     state.pattern_library = Some(pipeline_modules.pattern_library.clone());
+    state.entity_graph = Some(pipeline_modules.entity_graph.clone());
+    state.calibrator = Some(pipeline_modules.calibrator.clone());
     // Store skill registry and MCP manager from pipeline initialization
     state.skill_registry = pipeline_modules.skill_registry.clone();
     state.mcp_manager = pipeline_modules.mcp_manager.clone();
