@@ -443,6 +443,7 @@ impl ContractGenerator {
             snapshot_name: None,
             data_branch: None,
             diff_summary: None,
+            last_verification: None,
         }
     }
 

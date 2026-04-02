@@ -120,6 +120,9 @@ pub struct DurableSubtask {
     /// Diff summary captured after execution (vs pre-execution snapshot)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub diff_summary: Option<DiffSummary>,
+    /// Last verification result (populated after verify_subtask runs)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_verification: Option<SubtaskVerificationReport>,
 }
 
 impl Default for DurableSubtask {
@@ -138,6 +141,7 @@ impl Default for DurableSubtask {
             snapshot_name: None,
             data_branch: None,
             diff_summary: None,
+            last_verification: None,
         }
     }
 }
@@ -1647,6 +1651,7 @@ impl DurableTaskLifecycle for MatrixOneDurableTaskLifecycle {
                 snapshot_name: None,
                 data_branch: None,
                 diff_summary: None,
+                last_verification: None,
             })
             .collect();
 
@@ -1862,6 +1867,8 @@ impl DurableTaskLifecycle for MatrixOneDurableTaskLifecycle {
         // Update stage + git4data actions
         let snapshot_name = durable_st.snapshot_name.clone();
         let subtask = Self::find_subtask_mut(&mut contract, subtask_id)?;
+        // Store verification results for delivery report
+        subtask.last_verification = Some(report.clone());
         if report.all_required_passed {
             subtask.stage = SubtaskStage::Verified;
             // Git4Data: cleanup snapshot after successful verification
@@ -1973,13 +1980,20 @@ impl DurableTaskLifecycle for MatrixOneDurableTaskLifecycle {
             .subtasks
             .iter()
             .map(|s| {
-                let criteria_total = s.criteria.len() as u32;
+                let (passed, total) = match &s.last_verification {
+                    Some(report) => {
+                        let passed = report.results.iter().filter(|r| r.passed).count() as u32;
+                        let total = report.results.len() as u32;
+                        (passed, total)
+                    }
+                    None => (0, s.criteria.len() as u32),
+                };
                 SubtaskDeliverySummary {
                     id: s.id.clone(),
                     title: s.title.clone(),
                     stage: s.stage.as_str().to_string(),
-                    criteria_passed: 0, // filled from verification_history
-                    criteria_total,
+                    criteria_passed: passed,
+                    criteria_total: total,
                     retry_count: s.retry_count,
                 }
             })
@@ -2340,6 +2354,8 @@ impl DurableTaskLifecycle for LocalDurableTaskLifecycle {
             .iter_mut()
             .find(|s| s.id == subtask_id)
             .ok_or_else(|| format!("subtask '{subtask_id}' disappeared during verification"))?;
+        // Store verification results for delivery report
+        subtask.last_verification = Some(report.clone());
         if report.all_required_passed {
             subtask.stage = SubtaskStage::Verified;
             // Git4Data: cleanup snapshot after successful verification
@@ -2418,13 +2434,30 @@ impl DurableTaskLifecycle for LocalDurableTaskLifecycle {
         let summaries: Vec<SubtaskDeliverySummary> = contract
             .subtasks
             .iter()
-            .map(|s| SubtaskDeliverySummary {
-                id: s.id.clone(),
-                title: s.title.clone(),
-                stage: s.stage.as_str().to_string(),
-                criteria_passed: 0,
-                criteria_total: s.criteria.len() as u32,
-                retry_count: s.retry_count,
+            .map(|s| {
+                let (passed, total) = match &s.last_verification {
+                    Some(report) => {
+                        let passed = report.results.iter().filter(|r| r.passed).count() as u32;
+                        let total = report.results.len() as u32;
+                        (passed, total)
+                    }
+                    None => {
+                        // No verification ran: count only locally-runnable criteria
+                        let local = s.criteria.iter().filter(|c| {
+                            !c.global_only
+                                && !matches!(c.verifier, VerifierKind::LlmJudge { .. })
+                        }).count() as u32;
+                        (0, local)
+                    }
+                };
+                SubtaskDeliverySummary {
+                    id: s.id.clone(),
+                    title: s.title.clone(),
+                    stage: s.stage.as_str().to_string(),
+                    criteria_passed: passed,
+                    criteria_total: total,
+                    retry_count: s.retry_count,
+                }
             })
             .collect();
 
