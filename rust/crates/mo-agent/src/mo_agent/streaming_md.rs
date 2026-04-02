@@ -55,11 +55,6 @@ impl StreamingMarkdown {
             self.stable_end = self.stable_end.min(self.full_text.len());
         }
 
-        // Don't render until we have at least one complete block boundary.
-        if self.stable_end == 0 && find_last_block_boundary(&self.full_text) == 0 {
-            return;
-        }
-
         // Throttle: only re-render on newlines or large deltas.
         if !delta.contains('\n') && delta.len() < 20 {
             return;
@@ -135,12 +130,18 @@ fn rendered_to_lines(rendered: &str) -> Vec<String> {
 }
 
 /// Strip LLM thinking/reflect XML tags from text in-place.
-fn strip_xml_tags_inplace(text: &mut String) {
-    const TAGS: &[&str] = &["reflect", "thinking", "inner_monologue"];
+///
+/// Handles:
+/// - Matched pairs: `<think>content</think>` → removed entirely
+/// - Unclosed opening tags: `<think>trailing` → truncated at tag start
+/// - Lone closing tags: `</think>` without matching open → removed
+pub(super) fn strip_xml_tags_inplace(text: &mut String) {
+    const TAGS: &[&str] = &["reflect", "thinking", "think", "inner_monologue"];
     let mut changed = false;
     for tag in TAGS {
         let open = format!("<{tag}>");
         let close = format!("</{tag}>");
+        // Strip matched pairs first.
         while let Some(start) = text.find(&open) {
             if let Some(end) = text[start..].find(&close) {
                 let remove_end = start + end + close.len();
@@ -157,12 +158,127 @@ fn strip_xml_tags_inplace(text: &mut String) {
                 break;
             }
         }
+        // Strip any remaining lone closing tags (model may leak `</think>`
+        // without a matching opening tag in the same text block).
+        while let Some(pos) = text.find(&close) {
+            let remove_end = pos + close.len();
+            let remove_end = if text.as_bytes().get(remove_end) == Some(&b'\n') {
+                remove_end + 1
+            } else {
+                remove_end
+            };
+            text.drain(pos..remove_end);
+            changed = true;
+        }
     }
     if changed {
         while text.contains("\n\n\n") {
             *text = text.replace("\n\n\n", "\n\n");
         }
     }
+}
+
+/// Strip leading narration from text in-place.
+///
+/// LLMs sometimes prepend phrases like "Now I have enough context..." before
+/// the actual answer.  This function removes such preambles by detecting:
+/// - Lines starting with common narration patterns
+/// - Keeps content starting from markdown structure (headers, bold, lists)
+pub(super) fn strip_leading_narration(text: &mut String) {
+    // Patterns that indicate narration (case-insensitive matching)
+    const NARRATION_STARTS: &[&str] = &[
+        "now i have",
+        "now let me",
+        "let me ",
+        "i'll ",
+        "i will ",
+        "i need to",
+        "i can see",
+        "i can now",
+        "based on ",
+        "looking at ",
+    ];
+
+    // Patterns that indicate actual content (should NOT be stripped)
+    const CONTENT_MARKERS: &[&str] = &[
+        "**",     // Bold (common for headers like **Summary**)
+        "# ",     // Markdown header
+        "## ",    // Markdown header
+        "### ",   // Markdown header
+        "- ",     // List item
+        "* ",     // List item
+        "1. ",    // Numbered list
+        "```",    // Code block
+        "| ",     // Table
+        "---",    // Horizontal rule
+        "___",    // Horizontal rule
+    ];
+
+    // If text starts with content marker, don't touch it
+    let trimmed = text.trim_start();
+    for marker in CONTENT_MARKERS {
+        if trimmed.starts_with(marker) {
+            return;
+        }
+    }
+
+    // Check if we start with narration
+    let lower = trimmed.to_lowercase();
+    let mut is_narration = false;
+    for pattern in NARRATION_STARTS {
+        if lower.starts_with(pattern) {
+            is_narration = true;
+            break;
+        }
+    }
+
+    if !is_narration {
+        return;
+    }
+
+    // Find the first content marker and strip everything before it
+    let mut earliest_content = None;
+    for marker in CONTENT_MARKERS {
+        if let Some(pos) = text.find(marker) {
+            match earliest_content {
+                None => earliest_content = Some(pos),
+                Some(prev) if pos < prev => earliest_content = Some(pos),
+                _ => {}
+            }
+        }
+    }
+
+    if let Some(pos) = earliest_content {
+        // Find the start of the line containing the content marker
+        let line_start = text[..pos].rfind('\n').map(|p| p + 1).unwrap_or(0);
+        if line_start > 0 {
+            text.drain(..line_start);
+        }
+    }
+}
+
+/// Returns `true` when `text` contains an opened but not-yet-closed XML tag
+/// from the known set of LLM thinking tags.  Used to suppress premature
+/// rendering of text that will be stripped once the closing tag arrives.
+pub(super) fn has_open_xml_tag(text: &str) -> bool {
+    const TAGS: &[&str] = &["reflect", "thinking", "think", "inner_monologue"];
+    for tag in TAGS {
+        let open = format!("<{tag}>");
+        let close = format!("</{tag}>");
+        // Walk all opens; if any isn't matched by a close, we have an open tag.
+        let mut search_from = 0;
+        loop {
+            let Some(start) = text[search_from..].find(&open) else {
+                break;
+            };
+            let abs = search_from + start;
+            if text[abs..].find(&close).is_none() {
+                return true;
+            }
+            search_from = abs + open.len();
+        }
+    }
+    false
 }
 
 fn make_skin() -> MadSkin {
@@ -266,6 +382,22 @@ mod tests {
     }
 
     #[test]
+    fn push_renders_unstable_text_before_first_block_boundary() {
+        let mut sm = StreamingMarkdown::new(80);
+        sm.push("this is a long opening line");
+        assert_eq!(sm.stable_end, 0);
+        assert!(sm.unstable_region.height() > 0);
+    }
+
+    #[test]
+    fn push_renders_on_newline_without_paragraph_break() {
+        let mut sm = StreamingMarkdown::new(80);
+        sm.push("Summary:\n");
+        assert_eq!(sm.stable_end, 0);
+        assert!(sm.unstable_region.height() > 0);
+    }
+
+    #[test]
     fn strip_reflect_tags() {
         let mut s = "before\n<reflect>thinking here</reflect>\nafter".to_string();
         strip_xml_tags_inplace(&mut s);
@@ -277,5 +409,95 @@ mod tests {
         let mut s = "text before <reflect>partial thinking".to_string();
         strip_xml_tags_inplace(&mut s);
         assert_eq!(s, "text before ");
+    }
+
+    #[test]
+    fn strip_think_tags() {
+        let mut s = "before\n<think>\nlong thinking block\n</think>\nafter".to_string();
+        strip_xml_tags_inplace(&mut s);
+        assert_eq!(s, "before\nafter");
+    }
+
+    #[test]
+    fn strip_partial_think_tag() {
+        let mut s = "text <think>still thinking...".to_string();
+        strip_xml_tags_inplace(&mut s);
+        assert_eq!(s, "text ");
+    }
+
+    #[test]
+    fn has_open_xml_tag_detects_think() {
+        assert!(has_open_xml_tag("<think>some content"));
+        assert!(!has_open_xml_tag("<think>some content</think>"));
+        assert!(!has_open_xml_tag("no tags here"));
+    }
+
+    #[test]
+    fn has_open_xml_tag_detects_reflect() {
+        assert!(has_open_xml_tag("text <reflect>partial"));
+        assert!(!has_open_xml_tag("text <reflect>done</reflect>"));
+    }
+
+    #[test]
+    fn has_open_xml_tag_handles_multiple_tags() {
+        assert!(!has_open_xml_tag("<think>a</think><think>b</think>"));
+        assert!(has_open_xml_tag("<think>a</think><think>still open"));
+    }
+
+    #[test]
+    fn strip_lone_closing_think_tag() {
+        let mut s = "some reasoning content\n</think>\nactual response".to_string();
+        strip_xml_tags_inplace(&mut s);
+        assert_eq!(s, "some reasoning content\nactual response");
+    }
+
+    #[test]
+    fn strip_lone_closing_reflect_tag() {
+        let mut s = "draft output</reflect>final".to_string();
+        strip_xml_tags_inplace(&mut s);
+        assert_eq!(s, "draft outputfinal");
+    }
+
+    #[test]
+    fn strip_lone_closing_tag_with_matched_pair() {
+        // Matched pair stripped first, then lone closing tag stripped.
+        let mut s = "<think>hidden</think>visible</think>more".to_string();
+        strip_xml_tags_inplace(&mut s);
+        assert_eq!(s, "visiblemore");
+    }
+
+    #[test]
+    fn strip_leading_narration_removes_preamble() {
+        let mut s = "Now I have enough context.\n\n**Summary**: The change is good.".to_string();
+        strip_leading_narration(&mut s);
+        assert_eq!(s, "**Summary**: The change is good.");
+    }
+
+    #[test]
+    fn strip_leading_narration_preserves_content_start() {
+        let mut s = "**Summary**: The change is good.".to_string();
+        strip_leading_narration(&mut s);
+        assert_eq!(s, "**Summary**: The change is good.");
+    }
+
+    #[test]
+    fn strip_leading_narration_removes_let_me() {
+        let mut s = "Let me analyze this.\n\n# Review\n\nLooks good.".to_string();
+        strip_leading_narration(&mut s);
+        assert_eq!(s, "# Review\n\nLooks good.");
+    }
+
+    #[test]
+    fn strip_leading_narration_keeps_non_narration() {
+        let mut s = "This PR adds a new feature.\n\n**Details**: ...".to_string();
+        strip_leading_narration(&mut s);
+        assert_eq!(s, "This PR adds a new feature.\n\n**Details**: ...");
+    }
+
+    #[test]
+    fn strip_leading_narration_handles_list_content() {
+        let mut s = "Based on my analysis:\n\n- Item 1\n- Item 2".to_string();
+        strip_leading_narration(&mut s);
+        assert_eq!(s, "- Item 1\n- Item 2");
     }
 }
