@@ -161,6 +161,7 @@ pub(crate) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
         workspace_root_hint: Some(project_root.to_string_lossy().into_owned()),
         consecutive_same_error: 0,
         last_error_category: None,
+        checkpoint_gate: None,
     };
 
     // ─── Run the runtime loop ────────────────────────────────────────────

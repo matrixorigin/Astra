@@ -253,6 +253,7 @@ impl AgenticRunLifecycleService {
             workspace_root_hint,
             consecutive_same_error: 0,
             last_error_category: None,
+            checkpoint_gate: None,
         }
     }
 
@@ -890,6 +891,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
             workspace_root_hint,
             consecutive_same_error: 0,
             last_error_category: None,
+            checkpoint_gate: config.checkpoint_gate.clone(),
         };
 
         let outcome = run_agentic_loop_with_host(&mut host, &mut loop_state).await;

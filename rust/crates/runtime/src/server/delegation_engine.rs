@@ -32,7 +32,7 @@ use super::run_engine::RunEngine;
 // ─── Sub-run Executor Trait ─────────────────────────────────────────────────
 
 /// Configuration for a sub-run spawned by delegation.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct SubRunConfig {
     /// Unique ID for this sub-run.
     pub run_id: String,
@@ -51,6 +51,23 @@ pub struct SubRunConfig {
     /// Cooperative pause flag — checked between turns by the sub-run loop.
     /// When set to `true`, the sub-run should yield with status "paused".
     pub pause_flag: Option<Arc<AtomicBool>>,
+    /// Mid-execution checkpoint gate — abort early if contract criteria are violated.
+    pub checkpoint_gate: Option<Arc<dyn CheckpointGate>>,
+}
+
+impl std::fmt::Debug for SubRunConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SubRunConfig")
+            .field("run_id", &self.run_id)
+            .field("agent_profile", &self.agent_profile)
+            .field("task", &self.task)
+            .field("session_id", &self.session_id)
+            .field("user_id", &self.user_id)
+            .field("previous_output", &self.previous_output)
+            .field("pause_flag", &self.pause_flag.is_some())
+            .field("checkpoint_gate", &self.checkpoint_gate.is_some())
+            .finish()
+    }
 }
 
 /// Trait for executing sub-runs as part of a delegation.
@@ -123,6 +140,36 @@ pub trait VerificationGate: Send + Sync {
     /// Maximum retry attempts when verification fails. Default: 2.
     fn max_retries(&self) -> u32 {
         2
+    }
+}
+
+// ─── Checkpoint Gate (Mid-Execution Fail-Fast) ──────────────────────────────
+
+/// Mid-execution checkpoint gate — checked between turns during a sub-run.
+///
+/// Unlike [`VerificationGate`] (which runs AFTER the sub-run completes),
+/// a `CheckpointGate` is checked every N turns DURING execution. When it
+/// returns `false`, the sub-run is aborted immediately, saving time on
+/// clearly divergent executions.
+///
+/// Piggybacks on the existing cooperative-pause mechanism in the agentic loop.
+#[async_trait]
+pub trait CheckpointGate: Send + Sync {
+    /// Called every `checkpoint_frequency()` turns during sub-run execution.
+    ///
+    /// Returns `true` to continue, `false` to abort.
+    /// `turn_index` is the current turn number (0-based).
+    /// `total_tool_calls` is the cumulative tool call count so far.
+    async fn check(
+        &self,
+        run_id: &str,
+        turn_index: u32,
+        total_tool_calls: u32,
+    ) -> Result<bool, String>;
+
+    /// How many turns between checkpoint checks. Default: 3.
+    fn checkpoint_frequency(&self) -> u32 {
+        3
     }
 }
 
@@ -707,6 +754,7 @@ impl DelegationEngine {
                 previous_output: None,
                 context: request.context.clone(),
                 pause_flag: Some(pause_flag),
+                checkpoint_gate: None,
             });
         }
         drop(reg);
@@ -792,6 +840,7 @@ impl DelegationEngine {
                             previous_output: None,
                             context: HashMap::new(),
                             pause_flag: None,
+                            checkpoint_gate: None,
                         }
                     })
                     .await;
@@ -877,6 +926,7 @@ impl DelegationEngine {
                 previous_output: previous_output.clone(),
                 context: request.context.clone(),
                 pause_flag: Some(pause_flag),
+                checkpoint_gate: None,
             };
 
             let result = match self.executor.execute(config).await {
@@ -934,6 +984,7 @@ impl DelegationEngine {
                     previous_output: prev.clone(),
                     context: ctx.clone(),
                     pause_flag: None,
+                    checkpoint_gate: None,
                 })
                 .await
             } else {
@@ -1037,6 +1088,7 @@ impl DelegationEngine {
                 previous_output: last_producer_output.clone(),
                 context: request.context.clone(),
                 pause_flag: Some(prod_pause.clone()),
+                checkpoint_gate: None,
             };
             let prod_result = match self.executor.execute(prod_config).await {
                 Ok(r) => {
@@ -1087,6 +1139,7 @@ impl DelegationEngine {
                     previous_output: prev.clone(),
                     context: ctx.clone(),
                     pause_flag: None,
+                    checkpoint_gate: None,
                 })
                 .await
             } else {
@@ -1145,6 +1198,7 @@ impl DelegationEngine {
                 previous_output: last_producer_output.clone(),
                 context: request.context.clone(),
                 pause_flag: Some(rev_pause),
+                checkpoint_gate: None,
             };
             let rev_result = match self.executor.execute(rev_config).await {
                 Ok(r) => {
@@ -1894,6 +1948,7 @@ mod tests {
             previous_output: None,
             context: HashMap::new(),
             pause_flag: None,
+            checkpoint_gate: None,
         };
 
         let result = executor.execute(config).await.unwrap();

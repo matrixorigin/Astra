@@ -244,6 +244,11 @@ pub struct AgenticLoopState {
     pub consecutive_same_error: u32,
     /// The error category from the last turn (for streak detection).
     pub last_error_category: Option<crate::turn::error_recovery::ErrorCategory>,
+
+    // ── Mid-execution checkpoint gate ──
+    /// Optional checkpoint gate checked every N turns during delegation sub-runs.
+    /// When the gate returns `false`, the loop aborts with `Cancelled`.
+    pub checkpoint_gate: Option<Arc<dyn crate::server::delegation_engine::CheckpointGate>>,
 }
 
 /// Consecutive same-category error turns before forcing a strategy change.
@@ -835,6 +840,31 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
             }
         }
 
+        // ─── Step 4b: Checkpoint gate (mid-execution fail-fast) ─────────
+        if let Some(ref gate) = state.checkpoint_gate {
+            let freq = gate.checkpoint_frequency();
+            if freq > 0 && (turn_index as u32 + 1).is_multiple_of(freq) {
+                let run_id = state
+                    .current_run_id
+                    .as_deref()
+                    .unwrap_or("unknown");
+                match gate
+                    .check(run_id, turn_index as u32, state.total_tool_calls)
+                    .await
+                {
+                    Ok(true) => { /* continue */ }
+                    Ok(false) => {
+                        state.step_recorder.end_turn(true);
+                        return Ok(AgenticLoopOutcome::Cancelled);
+                    }
+                    Err(e) => {
+                        // Gate error is non-fatal — log and continue
+                        eprintln!("[checkpoint-gate] check error: {e}");
+                    }
+                }
+            }
+        }
+
         // ─── Step 5: Post-tool policy ───────────────────────────────────
         match map_post_tool_policy_outcome(apply_agentic_post_tool_policy(
             AgenticPostToolPolicyRequest {
@@ -1078,6 +1108,7 @@ mod tests {
             workspace_root_hint: None,
             consecutive_same_error: 0,
             last_error_category: None,
+            checkpoint_gate: None,
         }
     }
 

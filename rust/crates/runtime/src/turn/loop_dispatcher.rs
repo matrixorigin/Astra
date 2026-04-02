@@ -304,6 +304,7 @@ mod tests {
             workspace_root_hint: None,
             consecutive_same_error: 0,
             last_error_category: None,
+            checkpoint_gate: None,
         }
     }
 

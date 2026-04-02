@@ -739,6 +739,125 @@ pub fn create_gate_for_subtask(
     )))
 }
 
+// ─── Mid-Execution Checkpoint Gate ───────────────────────────────────────────
+
+/// A [`CheckpointGate`] that runs lightweight verifier checks during execution.
+///
+/// Uses only quick, non-destructive criteria (file-exists, grep) as
+/// early-termination signals. Long-running checks (build, test) are deferred
+/// to the post-completion [`ContractVerificationGate`].
+#[allow(dead_code)]
+pub struct ContractCheckpointGate {
+    /// Quick criteria (file-exists / grep only) extracted from the subtask.
+    quick_criteria: Vec<mo_agent_services::VerificationCriterion>,
+    subtask_id: String,
+    runner: VerificationRunner,
+    frequency: u32,
+}
+
+impl ContractCheckpointGate {
+    /// Build from a [`DurableSubtask`], keeping only instant-verifiable criteria.
+    pub fn from_subtask(
+        subtask: &DurableSubtask,
+        work_dir: std::path::PathBuf,
+        frequency: u32,
+    ) -> Self {
+        let quick_criteria = subtask
+            .criteria
+            .iter()
+            .filter(|c| !c.global_only)
+            .filter(|c| {
+                matches!(
+                    c.verifier,
+                    VerifierKind::FileExists { .. } | VerifierKind::GrepCheck { .. }
+                )
+            })
+            .cloned()
+            .collect();
+        Self {
+            quick_criteria,
+            subtask_id: subtask.id.clone(),
+            runner: VerificationRunner::new(work_dir),
+            frequency,
+        }
+    }
+
+    /// Returns `true` if this gate has any quick criteria to check.
+    pub fn has_checks(&self) -> bool {
+        !self.quick_criteria.is_empty()
+    }
+}
+
+#[async_trait]
+impl mo_agent_runtime::server::delegation_engine::CheckpointGate for ContractCheckpointGate {
+    async fn check(
+        &self,
+        _run_id: &str,
+        _turn_index: u32,
+        _total_tool_calls: u32,
+    ) -> Result<bool, String> {
+        if self.quick_criteria.is_empty() {
+            return Ok(true);
+        }
+
+        let temp_subtask = DurableSubtask {
+            id: self.subtask_id.clone(),
+            title: String::new(),
+            description: None,
+            depends_on: Vec::new(),
+            effort: None,
+            files: Vec::new(),
+            stage: SubtaskStage::Executing,
+            criteria: self.quick_criteria.clone(),
+            max_retries: 0,
+            retry_count: 0,
+            snapshot_name: None,
+            data_branch: None,
+            diff_summary: None,
+            last_verification: None,
+            tools_used: Vec::new(),
+        };
+
+        let report = self.runner.verify_subtask_local(&temp_subtask).await;
+
+        // If any *required* quick criterion explicitly failed (not errored), abort.
+        let hard_fail = report.results.iter().any(|r| {
+            !r.passed && r.error.is_none() && {
+                self.quick_criteria
+                    .iter()
+                    .any(|c| c.id == r.criterion_id && c.required)
+            }
+        });
+
+        Ok(!hard_fail)
+    }
+
+    fn checkpoint_frequency(&self) -> u32 {
+        self.frequency
+    }
+}
+
+/// Create a [`ContractCheckpointGate`] for a subtask, if it has quick criteria.
+#[allow(dead_code)]
+pub fn create_checkpoint_gate_for_subtask(
+    durable: &DurableTaskState,
+    subtask_id: &str,
+    work_dir: std::path::PathBuf,
+    frequency: u32,
+) -> Option<Arc<dyn mo_agent_runtime::server::delegation_engine::CheckpointGate>> {
+    let subtask = durable
+        .contract
+        .subtasks
+        .iter()
+        .find(|s| s.id == subtask_id)?;
+    let gate = ContractCheckpointGate::from_subtask(subtask, work_dir, frequency);
+    if gate.has_checks() {
+        Some(Arc::new(gate))
+    } else {
+        None
+    }
+}
+
 // ─── LLM Judge Implementation ────────────────────────────────────────────────
 
 /// Concrete [`LlmJudge`] that calls an OpenAI-compatible chat completions API.
