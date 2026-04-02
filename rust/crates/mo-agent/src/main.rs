@@ -2031,6 +2031,19 @@ async fn run_plan_execution(
             .map(|st| st.id.clone())
             .collect();
         for st_id in &in_progress_ids {
+            // Record tools used during this subtask's execution into the contract.
+            if let Some(ref mut durable) = state.durable_task_state
+                && let Some(ds) = durable
+                    .contract
+                    .subtasks
+                    .iter_mut()
+                    .find(|s| s.id == *st_id)
+                && ds.tools_used.is_empty()
+                && !state.recent_tools.is_empty()
+            {
+                ds.tools_used = state.recent_tools.clone();
+            }
+
             let verification_passed = if let Some(ref mut durable) = state.durable_task_state {
                 durable_bridge::on_subtask_complete(durable, st_id).await
             } else {

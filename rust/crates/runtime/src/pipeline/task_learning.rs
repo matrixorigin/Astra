@@ -606,6 +606,8 @@ mod tests {
             status: mo_agent_services::durable_task::ContractStatus::Completed,
             created_at: "2026-04-01".into(),
             updated_at: "2026-04-01".into(),
+            domain_hint: None,
+            task_type: None,
         };
         let report = TaskDeliveryReport {
             task_id: "t1".into(),
@@ -886,6 +888,8 @@ mod tests {
             status: mo_agent_services::durable_task::ContractStatus::Completed,
             created_at: "2026-04-01".into(),
             updated_at: "2026-04-01".into(),
+            domain_hint: None,
+            task_type: None,
         };
         let report = TaskDeliveryReport {
             task_id: "t1".into(),

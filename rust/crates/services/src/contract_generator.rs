@@ -732,6 +732,8 @@ impl ContractGenerator {
             status: ContractStatus::Draft,
             created_at: now.clone(),
             updated_at: now,
+            domain_hint: None,
+            task_type: None,
         })
     }
 

@@ -477,6 +477,12 @@ pub struct TaskContract {
     pub status: ContractStatus,
     pub created_at: String,
     pub updated_at: String,
+    /// Routing domain hint (e.g. "database", "web") — set during plan generation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub domain_hint: Option<String>,
+    /// Routing task type (e.g. "code_generation", "debugging") — set during plan generation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_type: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -2139,6 +2145,8 @@ impl MatrixOneDurableTaskLifecycle {
             status: ContractStatus::parse(&status_str),
             created_at,
             updated_at,
+            domain_hint: None,
+            task_type: None,
         })
     }
 
@@ -2369,6 +2377,8 @@ impl DurableTaskLifecycle for MatrixOneDurableTaskLifecycle {
             status: ContractStatus::Draft,
             created_at: now.clone(),
             updated_at: now,
+            domain_hint: None,
+            task_type: None,
         };
 
         self.persist_contract_with_user(&contract, user_id, session_id)
@@ -3046,6 +3056,8 @@ impl DurableTaskLifecycle for LocalDurableTaskLifecycle {
             status: ContractStatus::Draft,
             created_at: now.clone(),
             updated_at: now,
+            domain_hint: None,
+            task_type: None,
         };
         self.save_local(&contract)?;
         Ok(contract)
@@ -3456,13 +3468,21 @@ impl DurableTaskLifecycle for LocalDurableTaskLifecycle {
 
         // Feed completed task into learning system for pattern extraction
         if let Some(bridge) = &self.learning_bridge {
+            // Collect all tools used across subtasks for task-level signal.
+            let all_tools: Vec<String> = contract
+                .subtasks
+                .iter()
+                .flat_map(|s| s.tools_used.iter().cloned())
+                .collect::<std::collections::HashSet<_>>()
+                .into_iter()
+                .collect();
             let outcome = build_outcome_signal(
                 &contract,
                 &report,
-                Vec::new(), // tools_used — populated by caller if available
-                None,       // user_rating — populated post-delivery
-                None,       // domain_hint
-                None,       // task_type
+                all_tools,
+                None, // user_rating — populated post-delivery feedback
+                contract.domain_hint.clone(),
+                contract.task_type.clone(),
             );
             let _ = bridge.learn_from_task_outcome(&outcome).await;
 
@@ -3696,6 +3716,8 @@ mod tests {
             status: ContractStatus::Active,
             created_at: "2026-04-01T00:00:00Z".into(),
             updated_at: "2026-04-01T00:00:00Z".into(),
+            domain_hint: None,
+            task_type: None,
         };
         let json = serde_json::to_string(&contract).unwrap();
         let parsed: TaskContract = serde_json::from_str(&json).unwrap();
@@ -4292,6 +4314,8 @@ mod tests {
             status: ContractStatus::Completed,
             created_at: "2026-04-01".into(),
             updated_at: "2026-04-01".into(),
+            domain_hint: None,
+            task_type: None,
         };
 
         let report = TaskDeliveryReport {
@@ -5984,6 +6008,8 @@ Time:        3.456 s
             status: ContractStatus::Completed,
             created_at: "now".into(),
             updated_at: "now".into(),
+            domain_hint: None,
+            task_type: None,
         };
         let report = TaskDeliveryReport {
             task_id: "t1".into(),
@@ -6076,6 +6102,8 @@ Time:        3.456 s
             status: ContractStatus::Active,
             created_at: "now".into(),
             updated_at: "now".into(),
+            domain_hint: None,
+            task_type: None,
         };
         let report = TaskDeliveryReport {
             task_id: "t2".into(),
