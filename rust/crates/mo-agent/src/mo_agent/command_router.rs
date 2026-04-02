@@ -30,12 +30,7 @@ pub(super) async fn execute_cli_command(
     match command {
         // No subcommand → interactive REPL (Codex-style default)
         None | Some(Command::Interactive) => {
-            // Check for Cursor-style UX mode.
-            if cursor_repl::is_cursor_ux_enabled() {
-                cursor_repl::run_cursor_style_repl(api, profile.as_deref(), None).await?;
-            } else {
-                run_chat_repl(api, profile.as_deref(), None).await?;
-            }
+            run_chat_repl(api, profile.as_deref(), None).await?;
             Ok(ExitCode::Success)
         }
 
