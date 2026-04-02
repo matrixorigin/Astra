@@ -55,6 +55,7 @@ use async_trait::async_trait;
 use mo_agent_services::session_journal::ToolCallRecord;
 use serde_json::Value;
 
+use crate::pipeline::step_checkpoint;
 use crate::pipeline::step_protocol::{InMemoryIdempotencyCache, StepCheckpoint};
 use crate::pipeline::step_recorder::StepRecorder;
 use crate::semantic_dedup::SemanticDedup;
@@ -532,6 +533,40 @@ pub fn delegate_tool_schema() -> Value {
 
 // ─── Runtime loop ────────────────────────────────────────────────────────────
 
+/// Best-effort heavy checkpoint write.
+///
+/// Several early-exit paths in the agentic loop (text-only responses, stop-hook
+/// injection, factual-retry nudges) skip the main post-tool-policy checkpoint.
+/// This helper ensures those paths still persist the accumulated messages so that
+/// `/debug` turn inspection and session recovery have accurate per-iteration state.
+fn try_write_heavy_checkpoint(state: &mut AgenticLoopState) {
+    let Some(sid) = state.current_session_id.as_ref() else {
+        return;
+    };
+    let Some(heavy) = state.step_recorder.build_heavy_checkpoint(
+        &state.messages,
+        0,
+        state.remaining_turns as u32,
+        &state
+            .turn_guard
+            .health
+            .deprioritized_tools()
+            .iter()
+            .map(|s| s.to_string())
+            .collect::<Vec<_>>(),
+        &state.recent_tools,
+    ) else {
+        return;
+    };
+    let cp = StepCheckpoint::Heavy(Box::new(heavy));
+    let _ = step_checkpoint::write_step_checkpoint(
+        sid,
+        state.step_recorder.summary().checkpoints,
+        &cp,
+    );
+    state.last_heavy_checkpoint = Some(cp);
+}
+
 /// Run the multi-turn agentic loop using the provided host.
 ///
 /// This is the runtime-portable entry point. The host handles all
@@ -621,12 +656,15 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
                         );
                     }
                     state.messages.push(prompt);
+                    try_write_heavy_checkpoint(state);
                     continue;
                 }
+                try_write_heavy_checkpoint(state);
                 return Ok(AgenticLoopOutcome::Completed);
             }
             AgenticIngestIterationControl::ContinueIterating => {
                 // Ingest injected a nudge (e.g. factual retry). Continue the loop.
+                try_write_heavy_checkpoint(state);
                 continue;
             }
             AgenticIngestIterationControl::ProceedWithToolCalls => {}
@@ -830,6 +868,8 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
             }
         }
     }
+    // Loop exhausted max_turns without explicit break — write final state.
+    try_write_heavy_checkpoint(state);
     Ok(AgenticLoopOutcome::Completed)
 }
 
