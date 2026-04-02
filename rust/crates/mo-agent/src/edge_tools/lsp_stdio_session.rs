@@ -1,12 +1,5 @@
-//! Optional **rust-analyzer** over stdio (LSP): sync edited `.rs` files, collect
-//! `textDocument/publishDiagnostics`, inject on the next `tool_results` turn.
-//!
-//! claudecode loads many language servers from **plugins** (`getAllLspServers` →
-//! `getPluginLspServers`); each plugin contributes `command` / args / extension map.
-//! Here we only wire **rust-analyzer** for Rust workspaces, opt-in via env.
-//!
-//! - Enable: `MO_AGENT_LSP_RUST=1|true|on|yes`
-//! - Binary: `MO_AGENT_RUST_ANALYZER_CMD` (default `rust-analyzer`)
+//! Generic stdio LSP client: Content-Length framing, `initialize` / `initialized`,
+//! background reader for `textDocument/publishDiagnostics` and minimal server requests.
 
 use std::collections::HashMap;
 use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
@@ -14,38 +7,53 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
 
 use serde_json::{Value, json};
-use tokio::time::sleep;
 use url::Url;
 
-const MAX_LSP_DIAG_BATCHES: usize = 32;
-const MAX_LSP_LINES_PER_MESSAGE: usize = 120;
-const POST_SYNC_DRAIN_MS: u64 = 80;
+pub(crate) const MAX_LSP_DIAG_BATCHES: usize = 32;
+pub(crate) const MAX_LSP_LINES_PER_MESSAGE: usize = 120;
 
-fn lsp_rust_enabled() -> bool {
-    match std::env::var("MO_AGENT_LSP_RUST") {
-        Ok(v) => {
-            let v = v.trim().to_lowercase();
-            v == "1" || v == "true" || v == "on" || v == "yes"
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum LanguageIdPolicy {
+    Fixed(&'static str),
+    /// `.ts` → `typescript`, `.tsx` → `typescriptreact`
+    TypeScript,
+}
+
+impl LanguageIdPolicy {
+    fn language_id(self, path: &Path) -> Option<String> {
+        match self {
+            Self::Fixed(s) => Some(s.to_string()),
+            Self::TypeScript => match path.extension()?.to_str()? {
+                "ts" => Some("typescript".into()),
+                "tsx" => Some("typescriptreact".into()),
+                _ => None,
+            },
         }
-        Err(_) => false,
     }
 }
 
-fn rust_analyzer_cmd() -> String {
-    std::env::var("MO_AGENT_RUST_ANALYZER_CMD")
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| "rust-analyzer".to_string())
+/// How to launch one language server (one OS process per [`LspStdioSession`]).
+pub(crate) struct LspSpawnSpec {
+    pub command: String,
+    pub args: Vec<String>,
+    pub diagnostic_title: &'static str,
+    pub attachment_source: &'static str,
+    pub language_policy: LanguageIdPolicy,
 }
 
-#[must_use]
-pub(crate) fn should_use_rust_analyzer(project_root: &Path, edited: &Path) -> bool {
-    lsp_rust_enabled()
-        && edited.extension().and_then(|e| e.to_str()) == Some("rs")
-        && project_root.join("Cargo.toml").is_file()
+type StdinShared = Arc<Mutex<BufWriter<std::process::ChildStdin>>>;
+
+pub(crate) struct LspStdioSession {
+    diagnostic_title: &'static str,
+    attachment_source: &'static str,
+    language_policy: LanguageIdPolicy,
+    _root: PathBuf,
+    _child: Mutex<Option<Child>>,
+    stdin: StdinShared,
+    versions: Mutex<HashMap<String, i32>>,
+    pending_diags: Arc<Mutex<Vec<Value>>>,
 }
 
 fn write_frame(mut w: impl Write, v: &Value) -> io::Result<()> {
@@ -85,7 +93,7 @@ fn read_frame<R: BufRead>(r: &mut R) -> io::Result<Value> {
     serde_json::from_slice(&buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
 
-fn path_to_uri(path: &Path) -> Option<String> {
+pub(crate) fn path_to_uri(path: &Path) -> Option<String> {
     let abs = std::fs::canonicalize(path).ok()?;
     Url::from_file_path(&abs).ok().map(|u| u.as_str().to_string())
 }
@@ -98,22 +106,65 @@ fn workspace_uri(root: &Path) -> String {
         .unwrap_or_else(|| format!("file://{}", abs.display()))
 }
 
-type StdinShared = Arc<Mutex<BufWriter<std::process::ChildStdin>>>;
-
-/// Shared session (stdio LSP); created lazily from [`super::ToolExecutor`].
-pub(crate) struct RustAnalyzerSession {
-    _root: PathBuf,
-    _child: Mutex<Option<Child>>,
-    stdin: StdinShared,
-    versions: Mutex<HashMap<String, i32>>,
-    pending_diags: Arc<Mutex<Vec<Value>>>,
+fn send_lsp_response(stdin: &StdinShared, id: &Value, result: Value) -> io::Result<()> {
+    let msg = json!({ "jsonrpc": "2.0", "id": id, "result": result });
+    let mut w = stdin
+        .lock()
+        .map_err(|_| io::Error::new(io::ErrorKind::Other, "stdin mutex poisoned"))?;
+    write_frame(&mut *w, &msg)
 }
 
-impl RustAnalyzerSession {
-    /// Spawn `rust-analyzer`, run `initialize` / `initialized`, then start a reader thread.
-    pub fn try_spawn(root: PathBuf) -> io::Result<Option<Arc<Self>>> {
-        let cmd = rust_analyzer_cmd();
-        let mut child = match Command::new(&cmd)
+fn reader_loop(mut reader: BufReader<std::process::ChildStdout>, stdin: StdinShared, pending: Arc<Mutex<Vec<Value>>>) {
+    loop {
+        let msg = match read_frame(&mut reader) {
+            Ok(m) => m,
+            Err(_) => break,
+        };
+        if let Some(method) = msg.get("method").and_then(|m| m.as_str()) {
+            if method == "textDocument/publishDiagnostics" {
+                if let Some(p) = msg.get("params").cloned() {
+                    if let Ok(mut g) = pending.lock() {
+                        g.push(p);
+                        if g.len() > MAX_LSP_DIAG_BATCHES * 2 {
+                            let drain = g.len() - MAX_LSP_DIAG_BATCHES;
+                            g.drain(0..drain);
+                        }
+                    }
+                }
+                continue;
+            }
+            if let Some(id) = msg.get("id") {
+                let result = match method {
+                    "workspace/configuration" => {
+                        let n = msg
+                            .pointer("/params/items")
+                            .and_then(|x| x.as_array())
+                            .map(|a| a.len())
+                            .unwrap_or(0);
+                        Value::Array(vec![Value::Null; n])
+                    }
+                    "client/registerCapability" | "client/unregisterCapability" => Value::Null,
+                    "window/workDoneProgress/create" => Value::Null,
+                    _ => Value::Null,
+                };
+                let _ = send_lsp_response(&stdin, id, result);
+            }
+        }
+    }
+}
+
+impl LspStdioSession {
+    pub fn try_spawn(root: PathBuf, spec: LspSpawnSpec) -> io::Result<Option<Arc<Self>>> {
+        let LspSpawnSpec {
+            command,
+            args,
+            diagnostic_title,
+            attachment_source,
+            language_policy,
+        } = spec;
+
+        let mut child = match Command::new(&command)
+            .args(&args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -204,6 +255,9 @@ impl RustAnalyzerSession {
         });
 
         Ok(Some(Arc::new(Self {
+            diagnostic_title,
+            attachment_source,
+            language_policy,
             _root: root,
             _child: Mutex::new(Some(child)),
             stdin,
@@ -221,8 +275,10 @@ impl RustAnalyzerSession {
         write_frame(&mut *w, &msg)
     }
 
-    /// Re-read disk and push LSP sync + `didSave` (triggers analysis / diagnostics).
     pub fn sync_document_from_disk(&self, path: &Path) -> io::Result<()> {
+        let Some(lang) = self.language_policy.language_id(path) else {
+            return Ok(());
+        };
         let Some(uri) = path_to_uri(path) else {
             return Ok(());
         };
@@ -240,7 +296,7 @@ impl RustAnalyzerSession {
                 json!({
                     "textDocument": {
                         "uri": uri.clone(),
-                        "languageId": "rust",
+                        "languageId": lang,
                         "version": 1,
                         "text": text
                     }
@@ -266,14 +322,6 @@ impl RustAnalyzerSession {
         Ok(())
     }
 
-    fn send_response(stdin: &StdinShared, id: &Value, result: Value) -> io::Result<()> {
-        let msg = json!({ "jsonrpc": "2.0", "id": id, "result": result });
-        let mut w = stdin
-            .lock()
-            .map_err(|_| io::Error::new(io::ErrorKind::Other, "stdin mutex poisoned"))?;
-        write_frame(&mut *w, &msg)
-    }
-
     pub fn take_formatted_diagnostic_messages(&self) -> Vec<Value> {
         let mut batches = match self.pending_diags.lock() {
             Ok(mut g) => std::mem::take(&mut *g),
@@ -285,6 +333,8 @@ impl RustAnalyzerSession {
         if batches.len() > MAX_LSP_DIAG_BATCHES {
             batches.truncate(MAX_LSP_DIAG_BATCHES);
         }
+        let title = self.diagnostic_title;
+        let source = self.attachment_source;
         let mut lines: Vec<String> = Vec::new();
         for params in batches {
             if let Some(uri) = params.get("uri").and_then(|u| u.as_str()) {
@@ -328,190 +378,22 @@ impl RustAnalyzerSession {
         }
         vec![json!({
             "role": "user",
-            "content": format!("<new-diagnostics>\nrust-analyzer (LSP) diagnostics:\n\n{body}\n</new-diagnostics>"),
+            "content": format!("<new-diagnostics>\n{title} (LSP) diagnostics:\n\n{body}\n</new-diagnostics>"),
             "attachment_metadata": {
                 "kind": "passive_workspace_diagnostics",
-                "source": "rust_analyzer_lsp",
+                "source": source,
             }
         })]
     }
 }
 
-impl Drop for RustAnalyzerSession {
+impl Drop for LspStdioSession {
     fn drop(&mut self) {
         if let Ok(mut c) = self._child.lock() {
             if let Some(mut ch) = c.take() {
                 let _ = ch.kill();
                 let _ = ch.wait();
             }
-        }
-    }
-}
-
-fn reader_loop(mut reader: BufReader<std::process::ChildStdout>, stdin: StdinShared, pending: Arc<Mutex<Vec<Value>>>) {
-    loop {
-        let msg = match read_frame(&mut reader) {
-            Ok(m) => m,
-            Err(_) => break,
-        };
-        if let Some(method) = msg.get("method").and_then(|m| m.as_str()) {
-            if method == "textDocument/publishDiagnostics" {
-                if let Some(p) = msg.get("params").cloned() {
-                    if let Ok(mut g) = pending.lock() {
-                        g.push(p);
-                        if g.len() > MAX_LSP_DIAG_BATCHES * 2 {
-                            let drain = g.len() - MAX_LSP_DIAG_BATCHES;
-                            g.drain(0..drain);
-                        }
-                    }
-                }
-                continue;
-            }
-            if let Some(id) = msg.get("id") {
-                let result = match method {
-                    "workspace/configuration" => {
-                        let n = msg
-                            .pointer("/params/items")
-                            .and_then(|x| x.as_array())
-                            .map(|a| a.len())
-                            .unwrap_or(0);
-                        Value::Array(vec![Value::Null; n])
-                    }
-                    "client/registerCapability" | "client/unregisterCapability" => Value::Null,
-                    _ => Value::Null,
-                };
-                let _ = RustAnalyzerSession::send_response(&stdin, id, result);
-            }
-        }
-    }
-}
-
-/// Ensure session exists, then sync one file from disk.
-pub(crate) fn sync_after_write(session_slot: &Mutex<Option<Arc<RustAnalyzerSession>>>, root: &Path, path: &Path) {
-    if !should_use_rust_analyzer(root, path) {
-        return;
-    }
-    let sess = {
-        let mut slot = match session_slot.lock() {
-            Ok(s) => s,
-            Err(_) => return,
-        };
-        if slot.is_none() {
-            match RustAnalyzerSession::try_spawn(root.to_path_buf()) {
-                Ok(Some(s)) => *slot = Some(Arc::clone(&s)),
-                Ok(None) | Err(_) => return,
-            }
-        }
-        slot.as_ref().map(Arc::clone)
-    };
-    let Some(sess) = sess else {
-        return;
-    };
-    let _ = sess.sync_document_from_disk(path);
-}
-
-pub(crate) async fn take_rust_analyzer_messages(
-    session_slot: &Mutex<Option<Arc<RustAnalyzerSession>>>,
-    tool_results_nonempty: bool,
-) -> Vec<Value> {
-    if !lsp_rust_enabled() || !tool_results_nonempty {
-        return Vec::new();
-    }
-    let sess = match session_slot.lock() {
-        Ok(g) => g.as_ref().map(Arc::clone),
-        Err(_) => return Vec::new(),
-    };
-    let Some(sess) = sess else {
-        return Vec::new();
-    };
-    sleep(Duration::from_millis(POST_SYNC_DRAIN_MS)).await;
-    sess.take_formatted_diagnostic_messages()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn should_use_requires_env_rs_and_cargo() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        std::fs::write(
-            root.join("Cargo.toml"),
-            "[package]\nname=\"x\"\nversion=\"0.1.0\"\nedition=\"2021\"\n",
-        )
-        .unwrap();
-        assert!(!should_use_rust_analyzer(root, Path::new("src/a.rs")));
-        struct SetEnv;
-        impl Drop for SetEnv {
-            fn drop(&mut self) {
-                unsafe {
-                    std::env::remove_var("MO_AGENT_LSP_RUST");
-                }
-            }
-        }
-        unsafe {
-            std::env::set_var("MO_AGENT_LSP_RUST", "1");
-        }
-        let _g = SetEnv;
-        assert!(should_use_rust_analyzer(root, Path::new("src/a.rs")));
-        assert!(!should_use_rust_analyzer(root, Path::new("src/a.ts")));
-    }
-
-    #[tokio::test]
-    async fn no_session_means_no_messages() {
-        let slot = Mutex::new(None);
-        let v = take_rust_analyzer_messages(&slot, true).await;
-        assert!(v.is_empty());
-    }
-
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn spawn_sync_and_drain_smoke() {
-        let Ok(status) = Command::new(rust_analyzer_cmd())
-            .arg("--version")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-        else {
-            return;
-        };
-        if !status.success() {
-            return;
-        }
-        struct SetEnv;
-        impl Drop for SetEnv {
-            fn drop(&mut self) {
-                unsafe {
-                    std::env::remove_var("MO_AGENT_LSP_RUST");
-                }
-            }
-        }
-        unsafe {
-            std::env::set_var("MO_AGENT_LSP_RUST", "1");
-        }
-        let _g = SetEnv;
-
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().to_path_buf();
-        std::fs::write(
-            root.join("Cargo.toml"),
-            "[package]\nname=\"ra_smoke\"\nversion=\"0.1.0\"\nedition=\"2021\"\n",
-        )
-        .unwrap();
-        std::fs::create_dir_all(root.join("src")).unwrap();
-        std::fs::write(root.join("src/lib.rs"), "pub fn f() -> i32 { 1 }\n").unwrap();
-
-        let sess = match RustAnalyzerSession::try_spawn(root.clone()) {
-            Ok(Some(s)) => s,
-            Ok(None) | Err(_) => return,
-        };
-        sess.sync_document_from_disk(&root.join("src/lib.rs")).expect("sync");
-        sleep(Duration::from_millis(500)).await;
-        let msgs = sess.take_formatted_diagnostic_messages();
-        // May be empty if analysis clean; if non-empty, must be LSP-shaped.
-        for m in msgs {
-            assert!(m["content"].as_str().unwrap().contains("rust-analyzer"));
         }
     }
 }

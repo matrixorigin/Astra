@@ -41,8 +41,10 @@ mod mo_tools;
 mod passive_cargo_check;
 #[path = "edge_tools/passive_tsc_check.rs"]
 mod passive_tsc_check;
-#[path = "edge_tools/passive_rust_analyzer.rs"]
-mod passive_rust_analyzer;
+#[path = "edge_tools/lsp_stdio_session.rs"]
+mod lsp_stdio_session;
+#[path = "edge_tools/passive_lsp.rs"]
+mod passive_lsp;
 #[path = "edge_tools/shell.rs"]
 mod shell;
 
@@ -1120,8 +1122,8 @@ pub struct ToolExecutor {
     passive_cargo_pending: AtomicBool,
     /// After `.ts` / `.tsx` edits when `tsconfig.json` exists, run passive `tsc --noEmit`.
     passive_tsc_pending: AtomicBool,
-    /// Optional rust-analyzer stdio session (`MO_AGENT_LSP_RUST=1`).
-    rust_analyzer_session: std::sync::Mutex<Option<std::sync::Arc<passive_rust_analyzer::RustAnalyzerSession>>>,
+    /// Optional passive LSP sessions (rust-analyzer, typescript-language-server).
+    passive_lsp: passive_lsp::PassiveLspManager,
 }
 
 /// Extract owner/repo from git remote URLs in the given directory.
@@ -1198,7 +1200,7 @@ impl ToolExecutor {
             url_cache: std::sync::Mutex::new(HashMap::new()),
             passive_cargo_pending: AtomicBool::new(false),
             passive_tsc_pending: AtomicBool::new(false),
-            rust_analyzer_session: std::sync::Mutex::new(None),
+            passive_lsp: passive_lsp::PassiveLspManager::new(),
         }
     }
 
@@ -1216,11 +1218,10 @@ impl ToolExecutor {
         project_root: &Path,
         tool_results_nonempty: bool,
     ) -> Vec<Value> {
-        let mut out = passive_rust_analyzer::take_rust_analyzer_messages(
-            &self.rust_analyzer_session,
-            tool_results_nonempty,
-        )
-        .await;
+        let mut out = self
+            .passive_lsp
+            .take_diagnostic_messages(tool_results_nonempty)
+            .await;
         out.extend(
             passive_cargo_check::take_passive_cargo_messages(
                 &self.passive_cargo_pending,
@@ -1341,7 +1342,7 @@ impl ToolExecutor {
         if passive_tsc_check::should_schedule_passive_tsc(&self.project_root, path) {
             self.passive_tsc_pending.store(true, Ordering::SeqCst);
         }
-        passive_rust_analyzer::sync_after_write(&self.rust_analyzer_session, &self.project_root, path);
+        self.passive_lsp.sync_after_write(&self.project_root, path);
         let ts = Self::file_mtime_ms(path);
         if let Ok(mut state) = self.file_state.lock() {
             state.insert(
