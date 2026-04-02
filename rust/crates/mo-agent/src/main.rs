@@ -988,18 +988,17 @@ async fn handle_resume_command(arg: &str, profile: Option<&str>, state: &mut Rep
             state.plan_execution_rounds = restored.plan_execution_rounds;
 
             // Restore durable task contract if present
-            if let Some(ref json) = restored.contract_json {
-                if let Ok(contract) = serde_json::from_str::<mo_agent_services::TaskContract>(json)
-                {
-                    let work_dir = std::env::current_dir().unwrap_or_default();
-                    let session_dir =
-                        mo_agent_services::session_workspace::workspace_dir_for(&session_id);
-                    let lifecycle = durable_bridge::create_local_lifecycle(&session_dir, &work_dir);
-                    state.durable_task_state = Some(durable_bridge::DurableTaskState {
-                        contract,
-                        lifecycle,
-                    });
-                }
+            if let Some(ref json) = restored.contract_json
+                && let Ok(contract) = serde_json::from_str::<mo_agent_services::TaskContract>(json)
+            {
+                let work_dir = std::env::current_dir().unwrap_or_default();
+                let session_dir =
+                    mo_agent_services::session_workspace::workspace_dir_for(&session_id);
+                let lifecycle = durable_bridge::create_local_lifecycle(&session_dir, &work_dir);
+                state.durable_task_state = Some(durable_bridge::DurableTaskState {
+                    contract,
+                    lifecycle,
+                });
             }
 
             // Re-initialize journal for the resumed session
@@ -1839,39 +1838,34 @@ async fn run_plan_execution(
     use mo_agent_services::task_orchestrator::TaskStatus;
 
     // ─── Generate durable contract on first entry ────────────────────────────
-    if state.durable_task_state.is_none() {
-        if let Some(ref plan) = state.executing_plan {
-            let goal = state
-                .executing_plan_goal
-                .as_deref()
-                .unwrap_or("Plan execution");
-            let user_id = state.ingestion_user_id.as_deref().unwrap_or("local");
-            let session_id = state.session_id.as_deref().unwrap_or("unknown");
-            let work_dir = std::env::current_dir().unwrap_or_default();
+    if state.durable_task_state.is_none()
+        && let Some(ref plan) = state.executing_plan
+    {
+        let goal = state
+            .executing_plan_goal
+            .as_deref()
+            .unwrap_or("Plan execution");
+        let user_id = state.ingestion_user_id.as_deref().unwrap_or("local");
+        let session_id = state.session_id.as_deref().unwrap_or("unknown");
+        let work_dir = std::env::current_dir().unwrap_or_default();
 
-            // Create session-local lifecycle for contract persistence + verification
-            let session_dir = state
-                .session_id
-                .as_ref()
-                .map(|sid| mo_agent_services::session_workspace::workspace_dir_for(sid))
-                .unwrap_or_else(|| work_dir.join(".mo-session"));
-            let lifecycle = durable_bridge::create_local_lifecycle(&session_dir, &work_dir);
+        // Create session-local lifecycle for contract persistence + verification
+        let session_dir = state
+            .session_id
+            .as_ref()
+            .map(|sid| mo_agent_services::session_workspace::workspace_dir_for(sid))
+            .unwrap_or_else(|| work_dir.join(".mo-session"));
+        let lifecycle = durable_bridge::create_local_lifecycle(&session_dir, &work_dir);
 
-            if let Some(contract) = durable_bridge::generate_contract(
-                &lifecycle,
-                plan,
-                goal,
-                user_id,
-                session_id,
-                &work_dir,
-            )
-            .await
-            {
-                state.durable_task_state = Some(durable_bridge::DurableTaskState {
-                    contract,
-                    lifecycle,
-                });
-            }
+        if let Some(contract) = durable_bridge::generate_contract(
+            &lifecycle, plan, goal, user_id, session_id, &work_dir,
+        )
+        .await
+        {
+            state.durable_task_state = Some(durable_bridge::DurableTaskState {
+                contract,
+                lifecycle,
+            });
         }
     }
 
@@ -2215,9 +2209,7 @@ async fn run_plan_execution(
                 && st.status == TaskStatus::InProgress
             {
                 // Durable task: run verification before marking completed
-                let verification_passed = if let Some(ref mut durable) =
-                    state.durable_task_state
-                {
+                let verification_passed = if let Some(ref mut durable) = state.durable_task_state {
                     durable_bridge::on_subtask_complete(durable, next_id).await
                 } else {
                     true

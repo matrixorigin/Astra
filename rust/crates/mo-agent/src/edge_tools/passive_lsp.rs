@@ -125,15 +125,15 @@ impl PassiveLspManager {
 
     pub fn sync_after_write(&self, root: &Path, path: &Path) {
         let root_buf = root.to_path_buf();
-        if should_use_rust_lsp(root, path) {
-            if let Some(s) = ensure_session(&self.rust, root_buf.clone(), rust_spawn_spec()) {
-                let _ = s.sync_document_from_disk(path);
-            }
+        if should_use_rust_lsp(root, path)
+            && let Some(s) = ensure_session(&self.rust, root_buf.clone(), rust_spawn_spec())
+        {
+            let _ = s.sync_document_from_disk(path);
         }
-        if should_use_typescript_lsp(root, path) {
-            if let Some(s) = ensure_session(&self.typescript, root_buf, typescript_spawn_spec()) {
-                let _ = s.sync_document_from_disk(path);
-            }
+        if should_use_typescript_lsp(root, path)
+            && let Some(s) = ensure_session(&self.typescript, root_buf, typescript_spawn_spec())
+        {
+            let _ = s.sync_document_from_disk(path);
         }
     }
 
@@ -143,19 +143,17 @@ impl PassiveLspManager {
         }
         sleep(Duration::from_millis(POST_SYNC_DRAIN_MS)).await;
         let mut out = Vec::new();
-        if lsp_rust_enabled() {
-            if let Ok(g) = self.rust.lock() {
-                if let Some(s) = g.as_ref() {
-                    out.extend(s.take_formatted_diagnostic_messages());
-                }
-            }
+        if lsp_rust_enabled()
+            && let Ok(g) = self.rust.lock()
+            && let Some(s) = g.as_ref()
+        {
+            out.extend(s.take_formatted_diagnostic_messages());
         }
-        if lsp_typescript_enabled() {
-            if let Ok(g) = self.typescript.lock() {
-                if let Some(s) = g.as_ref() {
-                    out.extend(s.take_formatted_diagnostic_messages());
-                }
-            }
+        if lsp_typescript_enabled()
+            && let Ok(g) = self.typescript.lock()
+            && let Some(s) = g.as_ref()
+        {
+            out.extend(s.take_formatted_diagnostic_messages());
         }
         out
     }
@@ -263,7 +261,8 @@ mod tests {
             Ok(Some(s)) => s,
             Ok(None) | Err(_) => return,
         };
-        sess.sync_document_from_disk(&root.join("src/lib.rs")).expect("sync");
+        sess.sync_document_from_disk(&root.join("src/lib.rs"))
+            .expect("sync");
         sleep(Duration::from_millis(500)).await;
         let msgs = sess.take_formatted_diagnostic_messages();
         for m in msgs {
@@ -299,11 +298,17 @@ mod tests {
             Ok(Some(s)) => s,
             Ok(None) | Err(_) => return,
         };
-        sess.sync_document_from_disk(&root.join("ok.ts")).expect("sync");
+        sess.sync_document_from_disk(&root.join("ok.ts"))
+            .expect("sync");
         sleep(Duration::from_millis(400)).await;
         let msgs = sess.take_formatted_diagnostic_messages();
         for m in msgs {
-            assert!(m["content"].as_str().unwrap().contains("typescript-language-server"));
+            assert!(
+                m["content"]
+                    .as_str()
+                    .unwrap()
+                    .contains("typescript-language-server")
+            );
         }
     }
 }

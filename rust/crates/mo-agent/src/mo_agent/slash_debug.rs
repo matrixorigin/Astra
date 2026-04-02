@@ -63,11 +63,20 @@ pub(super) fn handle_debug_command(arg: &str, state: &ReplState) {
     // If journal has no turns but checkpoints exist, offer checkpoint-only inspection.
     if turns.is_empty() {
         if checkpoints.is_empty() {
-            eprintln!("\n  {}", "No turn data yet. Complete a conversation turn first.".dim());
+            eprintln!(
+                "\n  {}",
+                "No turn data yet. Complete a conversation turn first.".dim()
+            );
             return;
         }
-        eprintln!("\n  {}", "No journal turns (journal may not have been initialized).".dim());
-        eprintln!("  {} checkpoints available — inspecting latest segment.", checkpoints.len().to_string().green());
+        eprintln!(
+            "\n  {}",
+            "No journal turns (journal may not have been initialized).".dim()
+        );
+        eprintln!(
+            "  {} checkpoints available — inspecting latest segment.",
+            checkpoints.len().to_string().green()
+        );
         if let Some(view) = build_turn_messages_view(checkpoints.len(), &checkpoints) {
             let stub = TurnSummary {
                 journal_turn: None,
@@ -169,12 +178,7 @@ struct TurnMessagesView {
 }
 
 fn checkpoint_numeric_prefix(path: &Path) -> Option<u32> {
-    path.file_name()?
-        .to_str()?
-        .split_once('-')?
-        .0
-        .parse()
-        .ok()
+    path.file_name()?.to_str()?.split_once('-')?.0.parse().ok()
 }
 
 fn load_messages_from_heavy_path(path: &Path) -> Option<Vec<serde_json::Value>> {
@@ -411,7 +415,8 @@ fn show_tools(view: Option<&TurnMessagesView>, summary: &TurnSummary) {
             if role != "tool" {
                 continue;
             }
-            let name = m.get("name")
+            let name = m
+                .get("name")
                 .and_then(|v| v.as_str())
                 .or_else(|| {
                     // Fall back to tool_call_id (e.g. "git_status:0" → "git_status")
@@ -539,8 +544,7 @@ fn dump_turn_json(
 }
 
 fn file_name_str(p: &Path) -> Option<String> {
-    p.file_name()
-        .map(|n| n.to_string_lossy().into_owned())
+    p.file_name().map(|n| n.to_string_lossy().into_owned())
 }
 
 fn show_summary(summary: &TurnSummary) {
@@ -787,7 +791,8 @@ mod tests {
             "content": "## main"
         });
         // Simulate the extraction logic from show_tools
-        let name = msg.get("name")
+        let name = msg
+            .get("name")
             .and_then(|v| v.as_str())
             .or_else(|| {
                 msg.get("tool_call_id")
@@ -805,7 +810,8 @@ mod tests {
             "name": "bash",
             "content": "ok"
         });
-        let name = msg.get("name")
+        let name = msg
+            .get("name")
             .and_then(|v| v.as_str())
             .or_else(|| {
                 msg.get("tool_call_id")
@@ -857,10 +863,16 @@ mod tests {
     fn load_journal_turns_skips_non_turn_entries() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.jsonl");
-        std::fs::write(&path, concat!(
-            r#"{"type":"session_start","ts":"2026-01-01T00:00:00Z","session_id":"s1"}"#, "\n",
-            r#"{"type":"checkpoint","ts":"2026-01-01T00:01:00Z","session_id":"s1","turn":1}"#, "\n",
-        )).unwrap();
+        std::fs::write(
+            &path,
+            concat!(
+                r#"{"type":"session_start","ts":"2026-01-01T00:00:00Z","session_id":"s1"}"#,
+                "\n",
+                r#"{"type":"checkpoint","ts":"2026-01-01T00:01:00Z","session_id":"s1","turn":1}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
         let turns = load_journal_turns(&path);
         assert!(turns.is_empty());
     }
@@ -906,7 +918,10 @@ mod tests {
 
     #[test]
     fn message_delta_strips_shared_prefix() {
-        let a = vec![json!({"role":"user","content":"a"}), json!({"role":"assistant","content":"b"})];
+        let a = vec![
+            json!({"role":"user","content":"a"}),
+            json!({"role":"assistant","content":"b"}),
+        ];
         let b = vec![
             json!({"role":"user","content":"a"}),
             json!({"role":"assistant","content":"b"}),
@@ -962,7 +977,7 @@ mod tests {
             ),
         )
         .unwrap();
-        let mut cps = list_heavy_checkpoints(dir.path());
+        let cps = list_heavy_checkpoints(dir.path());
         assert_eq!(cps.len(), 2);
         let v = build_turn_messages_view(2, &cps).expect("view");
         assert_eq!(v.delta.len(), 1);

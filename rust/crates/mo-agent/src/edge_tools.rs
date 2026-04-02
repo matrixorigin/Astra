@@ -35,16 +35,16 @@ mod fs_tools;
 mod git_gix;
 #[path = "edge_tools/github.rs"]
 mod github;
+#[path = "edge_tools/lsp_stdio_session.rs"]
+mod lsp_stdio_session;
 #[path = "edge_tools/mo_tools.rs"]
 mod mo_tools;
 #[path = "edge_tools/passive_cargo_check.rs"]
 mod passive_cargo_check;
-#[path = "edge_tools/passive_tsc_check.rs"]
-mod passive_tsc_check;
-#[path = "edge_tools/lsp_stdio_session.rs"]
-mod lsp_stdio_session;
 #[path = "edge_tools/passive_lsp.rs"]
 mod passive_lsp;
+#[path = "edge_tools/passive_tsc_check.rs"]
+mod passive_tsc_check;
 #[path = "edge_tools/shell.rs"]
 mod shell;
 

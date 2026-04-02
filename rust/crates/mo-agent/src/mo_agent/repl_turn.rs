@@ -170,7 +170,8 @@ async fn maybe_auto_compact(
         skill_registry: &state.skill_registry,
         plan_only_chat: false,
         is_plan_subtask: false,
-    })    .await;
+    })
+    .await;
 
     if let Ok(result) = compact_result {
         apply_auto_compact_result(state, ctx, token, result).await?;

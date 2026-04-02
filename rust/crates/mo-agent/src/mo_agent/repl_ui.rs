@@ -32,7 +32,10 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
         "/explain",
         "Cycle explain: off → on (API) → verbose (+stderr)",
     ),
-    ("/turn", "Show turn trace (/turn [n] = journal turn #n or nth turn)"),
+    (
+        "/turn",
+        "Show turn trace (/turn [n] = journal turn #n or nth turn)",
+    ),
     (
         "/debug",
         "Interactive session inspector (messages, tools, injections)",

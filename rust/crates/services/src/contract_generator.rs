@@ -280,11 +280,7 @@ fn try_parse_file_exists_criterion(
     })
 }
 
-fn try_parse_grep_criterion(
-    id: &str,
-    desc: &str,
-    lower: &str,
-) -> Option<VerificationCriterion> {
+fn try_parse_grep_criterion(id: &str, desc: &str, lower: &str) -> Option<VerificationCriterion> {
     // Match "contains X in file Y" or "file Y should contain X"
     let has_contain = lower.contains("contain") || lower.contains("include");
     let has_file_ref = lower.contains("in file") || lower.contains("in the file");
@@ -510,7 +506,13 @@ fn try_parse_function_exists_criterion(
     } else {
         // Look for the word right after "function"/"class"/"struct" etc.
         let keywords = [
-            "function ", "class ", "struct ", "enum ", "trait ", "interface ", "const ",
+            "function ",
+            "class ",
+            "struct ",
+            "enum ",
+            "trait ",
+            "interface ",
+            "const ",
         ];
         let mut found = None;
         for kw in &keywords {
@@ -608,23 +610,32 @@ fn extract_file_paths(text: &str) -> Vec<String> {
     ];
     // Well-known filenames without extensions
     let known_names = [
-        "Makefile", "Dockerfile", "Vagrantfile", "Gemfile", "Rakefile", "Procfile",
-        "CMakeLists", "Justfile",
+        "Makefile",
+        "Dockerfile",
+        "Vagrantfile",
+        "Gemfile",
+        "Rakefile",
+        "Procfile",
+        "CMakeLists",
+        "Justfile",
     ];
 
     text.split_whitespace()
         .map(|w| w.trim_matches(|c: char| c == '`' || c == '\'' || c == '"' || c == ','))
         .filter(|w| {
             // Exclude shebangs and interpreter paths (#!/bin/bash, /usr/bin/env, etc.)
-            if w.starts_with("#!") || w.starts_with("/usr/") || w.starts_with("/bin/")
-                || w.starts_with("/sbin/") || w.starts_with("/etc/")
+            if w.starts_with("#!")
+                || w.starts_with("/usr/")
+                || w.starts_with("/bin/")
+                || w.starts_with("/sbin/")
+                || w.starts_with("/etc/")
             {
                 return false;
             }
             w.contains('/')
                 || w.contains('\\')
                 || extensions.iter().any(|ext| w.ends_with(ext))
-                || known_names.iter().any(|name| *w == *name)
+                || known_names.contains(w)
         })
         .map(String::from)
         .collect()
@@ -721,10 +732,7 @@ impl ContractGenerator {
                 if !sp.files.is_empty() {
                     c.push(VerificationCriterion {
                         id: format!("{}-files", sp.id),
-                        description: format!(
-                            "Modified files exist: {}",
-                            sp.files.join(", ")
-                        ),
+                        description: format!("Modified files exist: {}", sp.files.join(", ")),
                         verifier: VerifierKind::FileExists {
                             paths: sp.files.clone(),
                         },
@@ -937,10 +945,7 @@ mod tests {
         };
         assert_eq!(detect_build_command(&det), Some("go build ./...".into()));
         assert_eq!(detect_test_command(&det), Some("go test ./...".into()));
-        assert_eq!(
-            detect_lint_command(&det),
-            Some("golangci-lint run".into())
-        );
+        assert_eq!(detect_lint_command(&det), Some("golangci-lint run".into()));
     }
 
     #[test]
@@ -961,9 +966,10 @@ mod tests {
         assert!(!s0.criteria.is_empty(), "should have acceptance criteria");
 
         // Check that "tests pass" was parsed into TestPass verifier
-        let has_test_verifier = s0.criteria.iter().any(|c| {
-            matches!(c.verifier, VerifierKind::TestPass { .. })
-        });
+        let has_test_verifier = s0
+            .criteria
+            .iter()
+            .any(|c| matches!(c.verifier, VerifierKind::TestPass { .. }));
         assert!(
             has_test_verifier,
             "should parse 'tests pass' into TestPass verifier"
@@ -981,9 +987,10 @@ mod tests {
         // Second subtask: "build succeeds" → BuildPass
         let s1 = &contract.subtasks[1];
         assert_eq!(s1.depends_on, vec!["auth-module"]);
-        let has_build_verifier = s1.criteria.iter().any(|c| {
-            matches!(c.verifier, VerifierKind::BuildPass { .. })
-        });
+        let has_build_verifier = s1
+            .criteria
+            .iter()
+            .any(|c| matches!(c.verifier, VerifierKind::BuildPass { .. }));
         assert!(
             has_build_verifier,
             "should parse 'build succeeds' into BuildPass verifier"
@@ -1091,7 +1098,10 @@ mod tests {
             &det,
         );
         assert_eq!(criteria.len(), 3);
-        assert!(matches!(criteria[0].verifier, VerifierKind::TestPass { .. }));
+        assert!(matches!(
+            criteria[0].verifier,
+            VerifierKind::TestPass { .. }
+        ));
         assert!(matches!(
             criteria[1].verifier,
             VerifierKind::BuildPass { .. }
@@ -1105,8 +1115,7 @@ mod tests {
     #[test]
     fn parse_acceptance_fallback_to_llm_judge() {
         let det = rust_detection();
-        let criteria =
-            parse_acceptance_to_criteria("code follows existing patterns", "s1", &det);
+        let criteria = parse_acceptance_to_criteria("code follows existing patterns", "s1", &det);
         assert_eq!(criteria.len(), 1);
         assert!(matches!(
             criteria[0].verifier,
@@ -1172,18 +1181,19 @@ mod tests {
             ..Default::default()
         }];
         let scope = cg.infer_scope("add a feature", &subtasks);
-        assert!(scope
-            .out_of_scope
-            .iter()
-            .any(|s| s.contains("Deployment")));
-        assert!(scope
-            .out_of_scope
-            .iter()
-            .any(|s| s.contains("Documentation")));
-        assert!(scope
-            .assumptions
-            .iter()
-            .any(|s| s.contains("Rust toolchain")));
+        assert!(scope.out_of_scope.iter().any(|s| s.contains("Deployment")));
+        assert!(
+            scope
+                .out_of_scope
+                .iter()
+                .any(|s| s.contains("Documentation"))
+        );
+        assert!(
+            scope
+                .assumptions
+                .iter()
+                .any(|s| s.contains("Rust toolchain"))
+        );
     }
 
     #[test]
@@ -1191,10 +1201,7 @@ mod tests {
         let cg = ContractGenerator::new(rust_detection());
         let subtasks = vec![];
         let scope = cg.infer_scope("deploy the service", &subtasks);
-        assert!(!scope
-            .out_of_scope
-            .iter()
-            .any(|s| s.contains("Deployment")));
+        assert!(!scope.out_of_scope.iter().any(|s| s.contains("Deployment")));
     }
 
     #[test]
@@ -1213,7 +1220,10 @@ mod tests {
         let has_file = c1
             .iter()
             .any(|c| matches!(&c.verifier, VerifierKind::FileExists { .. }));
-        assert!(has_file, "should detect FileExists verifier for acceptance text with 'file exists'");
+        assert!(
+            has_file,
+            "should detect FileExists verifier for acceptance text with 'file exists'"
+        );
 
         // Subtask 2: "ls -l shows executable permissions" → Permission verifier
         let c2 = parse_acceptance_to_criteria(
@@ -1225,8 +1235,14 @@ mod tests {
         let has_perm = c2
             .iter()
             .any(|c| matches!(&c.verifier, VerifierKind::Command { .. }));
-        assert!(has_perm, "should detect Command verifier for permission check");
-        assert!(!c2[0].global_only, "permission check should run per-subtask");
+        assert!(
+            has_perm,
+            "should detect Command verifier for permission check"
+        );
+        assert!(
+            !c2[0].global_only,
+            "permission check should run per-subtask"
+        );
 
         // Subtask 3: "Running the script produces 'hello world!'" → CommandOutput
         let c3 = parse_acceptance_to_criteria(
@@ -1238,8 +1254,14 @@ mod tests {
         let has_cmd_output = c3
             .iter()
             .any(|c| matches!(&c.verifier, VerifierKind::CommandOutput { .. }));
-        assert!(has_cmd_output, "should detect CommandOutput verifier for script execution check");
-        assert!(!c3[0].global_only, "command output check should run per-subtask");
+        assert!(
+            has_cmd_output,
+            "should detect CommandOutput verifier for script execution check"
+        );
+        assert!(
+            !c3[0].global_only,
+            "command output check should run per-subtask"
+        );
     }
 
     #[test]
@@ -1247,11 +1269,7 @@ mod tests {
         let det = ProjectDetection::default();
 
         // "Command /tmp/foo outputs 'bar'"
-        let c = parse_acceptance_to_criteria(
-            "Command /tmp/foo outputs 'bar'",
-            "s1",
-            &det,
-        );
+        let c = parse_acceptance_to_criteria("Command /tmp/foo outputs 'bar'", "s1", &det);
         assert_eq!(c.len(), 1);
         match &c[0].verifier {
             VerifierKind::CommandOutput { cmd, contains, .. } => {
@@ -1262,11 +1280,7 @@ mod tests {
         }
 
         // "/tmp/script prints 'hello world'"
-        let c = parse_acceptance_to_criteria(
-            "/tmp/script prints 'hello world'",
-            "s2",
-            &det,
-        );
+        let c = parse_acceptance_to_criteria("/tmp/script prints 'hello world'", "s2", &det);
         assert_eq!(c.len(), 1);
         assert!(matches!(&c[0].verifier, VerifierKind::CommandOutput { .. }));
 
@@ -1277,7 +1291,9 @@ mod tests {
             &det,
         );
         assert!(!c.is_empty());
-        let has_cmd = c.iter().any(|c| matches!(&c.verifier, VerifierKind::CommandOutput { .. }));
+        let has_cmd = c
+            .iter()
+            .any(|c| matches!(&c.verifier, VerifierKind::CommandOutput { .. }));
         assert!(has_cmd, "should detect command output pattern");
 
         // Backtick-quoted command path should NOT appear in contains list
@@ -1290,7 +1306,11 @@ mod tests {
         match &c[0].verifier {
             VerifierKind::CommandOutput { cmd, contains, .. } => {
                 assert_eq!(cmd, "/tmp/hiworld");
-                assert_eq!(contains, &["hi world"], "path should not be in contains list");
+                assert_eq!(
+                    contains,
+                    &["hi world"],
+                    "path should not be in contains list"
+                );
             }
             other => panic!("expected CommandOutput, got {:?}", other),
         }
@@ -1317,14 +1337,15 @@ mod tests {
         }
 
         // "chmod +x applied, x bit set on /tmp/bar"
-        let c = parse_acceptance_to_criteria(
-            "chmod +x applied, x bit set on /tmp/bar",
-            "s2",
-            &det,
-        );
+        let c = parse_acceptance_to_criteria("chmod +x applied, x bit set on /tmp/bar", "s2", &det);
         assert!(!c.is_empty());
-        let has_perm = c.iter().any(|c| matches!(&c.verifier, VerifierKind::Command { .. }));
-        assert!(has_perm, "should detect permission pattern with chmod keyword");
+        let has_perm = c
+            .iter()
+            .any(|c| matches!(&c.verifier, VerifierKind::Command { .. }));
+        assert!(
+            has_perm,
+            "should detect permission pattern with chmod keyword"
+        );
     }
 
     #[test]
@@ -1347,7 +1368,10 @@ mod tests {
         // "Zero warnings in build output"
         let c = parse_acceptance_to_criteria("Zero warnings in build output", "s2", &det);
         assert!(!c.is_empty());
-        assert!(c.iter().any(|c| matches!(&c.verifier, VerifierKind::Command { .. })));
+        assert!(
+            c.iter()
+                .any(|c| matches!(&c.verifier, VerifierKind::Command { .. }))
+        );
 
         // "Code compiles with clean output without warnings"
         let c = parse_acceptance_to_criteria(
@@ -1356,7 +1380,10 @@ mod tests {
             &det,
         );
         assert!(!c.is_empty());
-        assert!(c.iter().any(|c| matches!(&c.verifier, VerifierKind::Command { .. })));
+        assert!(
+            c.iter()
+                .any(|c| matches!(&c.verifier, VerifierKind::Command { .. }))
+        );
     }
 
     #[test]
@@ -1376,11 +1403,8 @@ mod tests {
         let det = ProjectDetection::default();
 
         // "Function authenticate exists in src/auth.rs"
-        let c = parse_acceptance_to_criteria(
-            "Function authenticate exists in src/auth.rs",
-            "s1",
-            &det,
-        );
+        let c =
+            parse_acceptance_to_criteria("Function authenticate exists in src/auth.rs", "s1", &det);
         assert_eq!(c.len(), 1);
         match &c[0].verifier {
             VerifierKind::GrepCheck {
@@ -1396,11 +1420,7 @@ mod tests {
         }
 
         // "src/models.py defines class User"
-        let c = parse_acceptance_to_criteria(
-            "src/models.py defines class User",
-            "s2",
-            &det,
-        );
+        let c = parse_acceptance_to_criteria("src/models.py defines class User", "s2", &det);
         assert!(!c.is_empty());
         let has_grep = c
             .iter()
@@ -1425,11 +1445,8 @@ mod tests {
         let det = ProjectDetection::default();
 
         // "src/config.ts includes the string 'API_KEY'"
-        let c = parse_acceptance_to_criteria(
-            "src/config.ts includes the string 'API_KEY'",
-            "s1",
-            &det,
-        );
+        let c =
+            parse_acceptance_to_criteria("src/config.ts includes the string 'API_KEY'", "s1", &det);
         assert_eq!(c.len(), 1);
         match &c[0].verifier {
             VerifierKind::GrepCheck {
@@ -1446,11 +1463,8 @@ mod tests {
 
         // "Makefile should have a 'test' target" — "makefile" contains "file",
         // so file_exists parser catches it first. Use a path instead:
-        let c = parse_acceptance_to_criteria(
-            "build/config.yaml should have 'debug: true'",
-            "s2",
-            &det,
-        );
+        let c =
+            parse_acceptance_to_criteria("build/config.yaml should have 'debug: true'", "s2", &det);
         assert!(!c.is_empty());
         match &c[0].verifier {
             VerifierKind::GrepCheck {
@@ -1466,11 +1480,7 @@ mod tests {
         }
 
         // Negative grep with "should not"
-        let c = parse_acceptance_to_criteria(
-            "src/auth.rs should not have 'unwrap()'",
-            "s3",
-            &det,
-        );
+        let c = parse_acceptance_to_criteria("src/auth.rs should not have 'unwrap()'", "s3", &det);
         assert!(!c.is_empty());
         let grep = c
             .iter()

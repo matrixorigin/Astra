@@ -6,8 +6,8 @@ pub mod context;
 pub mod contract_generator;
 pub mod coordination;
 pub mod data_versioning;
-pub mod durable_task;
 pub mod decisions;
+pub mod durable_task;
 pub mod edge_context;
 pub mod evaluation;
 pub mod event_ingestion;
@@ -63,22 +63,13 @@ pub use context::{
     ContextService, DatabaseContextService, SnapshotCreateRequestData, SnapshotListFilter,
     SnapshotListRecord, SnapshotRecord, UnconfiguredContextService,
 };
-pub use coordination::{
-    AgentProfile, AgentProfileRegistry, AgentResult, AgentTier, AgentTrigger, AggregationStrategy,
-    CoordinationPattern, DelegationRequest, DelegationResult, PipelineStage, aggregate_results,
-};
 pub use contract_generator::{
     ContractGenerator, ProjectDetection, detect_build_command, detect_lint_command,
     detect_test_command,
 };
-pub use durable_task::{
-    ContractAmendment, ContractStatus, DiffSummary, DurableSubtask, DurableTaskLifecycle,
-    LocalDurableTaskLifecycle, MatrixOneDurableTaskLifecycle, NoopTaskLearningBridge,
-    SubtaskDeliverySummary, SubtaskExecutionContext, SubtaskOutcomeSignal, SubtaskStage,
-    SubtaskVerificationReport, TaskBranchService, TaskContract, TaskDeliveryReport,
-    TaskLearningBridge, TaskOutcomeSignal, TaskPatternStats, TaskResumeContext, TaskScope,
-    UnconfiguredDurableTaskLifecycle, VerificationCriterion, VerificationResult,
-    VerificationRunner, VerifierKind, LlmJudge, build_outcome_signal,
+pub use coordination::{
+    AgentProfile, AgentProfileRegistry, AgentResult, AgentTier, AgentTrigger, AggregationStrategy,
+    CoordinationPattern, DelegationRequest, DelegationResult, PipelineStage, aggregate_results,
 };
 pub use data_versioning::{
     DataVersioningService, DatabaseDataVersioningService, UnconfiguredDataVersioningService,
@@ -86,6 +77,15 @@ pub use data_versioning::{
 pub use decisions::{
     DatabaseDecisionService, DecisionCreateRequestData, DecisionListFilter, DecisionListRecord,
     DecisionRecord, DecisionService, DecisionWithContextRecord, UnconfiguredDecisionService,
+};
+pub use durable_task::{
+    ContractAmendment, ContractStatus, DiffSummary, DurableSubtask, DurableTaskLifecycle, LlmJudge,
+    LocalDurableTaskLifecycle, MatrixOneDurableTaskLifecycle, NoopTaskLearningBridge,
+    SubtaskDeliverySummary, SubtaskExecutionContext, SubtaskOutcomeSignal, SubtaskStage,
+    SubtaskVerificationReport, TaskBranchService, TaskContract, TaskDeliveryReport,
+    TaskLearningBridge, TaskOutcomeSignal, TaskPatternStats, TaskResumeContext, TaskScope,
+    UnconfiguredDurableTaskLifecycle, VerificationCriterion, VerificationResult,
+    VerificationRunner, VerifierKind, build_outcome_signal,
 };
 pub use edge_context::{EdgeContext, EdgeProfile, EdgeSkillRef};
 pub use evaluation::{DatabaseEvaluationService, EvaluationService, UnconfiguredEvaluationService};

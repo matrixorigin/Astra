@@ -118,12 +118,7 @@ pub trait VerificationGate: Send + Sync {
     /// - `result`: the completed agent result
     /// - `delegation_id`: which delegation this belongs to
     /// - `attempt`: current attempt number (starts at 1)
-    async fn verify(
-        &self,
-        result: &AgentResult,
-        delegation_id: &str,
-        attempt: u32,
-    ) -> GateVerdict;
+    async fn verify(&self, result: &AgentResult, delegation_id: &str, attempt: u32) -> GateVerdict;
 
     /// Maximum retry attempts when verification fails. Default: 2.
     fn max_retries(&self) -> u32 {
@@ -493,12 +488,7 @@ impl DelegationEngine {
                         Ok(r) => {
                             let _ = self
                                 .run_engine
-                                .persist_status(
-                                    &r.run_id,
-                                    &r.status,
-                                    None,
-                                    r.error.as_deref(),
-                                )
+                                .persist_status(&r.run_id, &r.status, None, r.error.as_deref())
                                 .await;
                             current = r;
                         }
@@ -681,21 +671,26 @@ impl DelegationEngine {
                 let did = delegation_id.clone();
                 // Fan-out gate is check-only (no retry — configs are consumed).
                 // For retry support, use Sequential pattern instead.
-                let gated = self.apply_gate(result, &did, || {
-                    // No-retry stub: return a dummy config that won't actually be called
-                    // because max_retries check fires first in the closure.
-                    SubRunConfig {
-                        run_id: String::new(),
-                        agent_profile: AgentProfile::new("stub", "stub",
-                            mo_agent_services::coordination::AgentTier::User),
-                        task: String::new(),
-                        session_id: String::new(),
-                        user_id: String::new(),
-                        previous_output: None,
-                        context: HashMap::new(),
-                        pause_flag: None,
-                    }
-                }).await;
+                let gated = self
+                    .apply_gate(result, &did, || {
+                        // No-retry stub: return a dummy config that won't actually be called
+                        // because max_retries check fires first in the closure.
+                        SubRunConfig {
+                            run_id: String::new(),
+                            agent_profile: AgentProfile::new(
+                                "stub",
+                                "stub",
+                                mo_agent_services::coordination::AgentTier::User,
+                            ),
+                            task: String::new(),
+                            session_id: String::new(),
+                            user_id: String::new(),
+                            previous_output: None,
+                            context: HashMap::new(),
+                            pause_flag: None,
+                        }
+                    })
+                    .await;
                 gated_results.push(gated);
             }
             results = gated_results;
@@ -1934,11 +1929,13 @@ mod tests {
         // Fan-out with always-fail gate: result should be verification_failed
         assert_eq!(result.agent_results.len(), 1);
         assert_eq!(result.agent_results[0].status, "verification_failed");
-        assert!(result.agent_results[0]
-            .error
-            .as_ref()
-            .unwrap()
-            .contains("quality too low"));
+        assert!(
+            result.agent_results[0]
+                .error
+                .as_ref()
+                .unwrap()
+                .contains("quality too low")
+        );
     }
 
     #[tokio::test]
@@ -2035,10 +2032,12 @@ mod tests {
     async fn gate_verdict_variants() {
         assert!(GateVerdict::Pass.is_pass());
         assert!(GateVerdict::Skip.is_pass());
-        assert!(!GateVerdict::Fail {
-            reason: "x".into(),
-            details: None
-        }
-        .is_pass());
+        assert!(
+            !GateVerdict::Fail {
+                reason: "x".into(),
+                details: None
+            }
+            .is_pass()
+        );
     }
 }

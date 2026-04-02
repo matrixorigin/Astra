@@ -1,0 +1,189 @@
+{
+  "contract_id": "cf11b6d6-1d14-4749-8e09-5896b7a81161",
+  "task_id": "2a60ccab-b1ec-47e9-b91b-84725df76c0e",
+  "goal": "在/tmp下面写一个hiyz shell脚本，生成hi yangzhou",
+  "scope": {
+    "in_scope": [
+      "Create hiyz shell script",
+      "Make script executable",
+      "Test script execution"
+    ],
+    "out_of_scope": [
+      "Deployment and CI/CD changes",
+      "Documentation updates"
+    ],
+    "assumptions": [
+      "Project builds successfully before changes"
+    ]
+  },
+  "subtasks": [
+    {
+      "id": "create-hiyz-script",
+      "title": "Create hiyz shell script",
+      "description": "Create a new shell script at /tmp/hiyz containing a shebang line (#!/bin/bash or #!/bin/sh) and an echo command that outputs 'hi yangzhou'. The script should be a single file with minimal content.",
+      "depends_on": [],
+      "effort": "small",
+      "files": [
+        "/tmp/hiyz"
+      ],
+      "stage": {
+        "state": "verified"
+      },
+      "criteria": [
+        {
+          "id": "create-hiyz-script-ac0",
+          "description": "File /tmp/hiyz exists and contains the text 'hi yangzhou' in the echo command",
+          "verifier": {
+            "kind": "file_exists",
+            "paths": [
+              "/tmp/hiyz"
+            ]
+          },
+          "required": true,
+          "timeout_sec": 10,
+          "global_only": false
+        }
+      ],
+      "max_retries": 2,
+      "retry_count": 0,
+      "snapshot_name": "task_2a60ccab-b1ec-47e9-b91b-84725df76c0e_create-hiyz-script_v2",
+      "diff_summary": {
+        "snapshot": "task_2a60ccab-b1ec-47e9-b91b-84725df76c0e_create-hiyz-script_v2",
+        "changed_rows": 0
+      },
+      "last_verification": {
+        "subtask_id": "create-hiyz-script",
+        "all_required_passed": true,
+        "results": [
+          {
+            "criterion_id": "create-hiyz-script-ac0",
+            "passed": true,
+            "evidence": "all 1 files exist",
+            "expected": "files exist: [\"/tmp/hiyz\"]",
+            "duration_ms": 0
+          }
+        ],
+        "timestamp": "2026-04-02T05:37:02.887769461+00:00"
+      }
+    },
+    {
+      "id": "set-execute-permission",
+      "title": "Make script executable",
+      "description": "Run chmod +x /tmp/hiyz to grant execute permissions to the script so it can be run directly.",
+      "depends_on": [
+        "create-hiyz-script"
+      ],
+      "effort": "small",
+      "files": [
+        "/tmp/hiyz"
+      ],
+      "stage": {
+        "state": "verified"
+      },
+      "criteria": [
+        {
+          "id": "set-execute-permission-ac0",
+          "description": "ls -l /tmp/hiyz shows executable permissions (x bits set)",
+          "verifier": {
+            "kind": "command",
+            "cmd": "test -x /tmp/hiyz",
+            "expected_exit": 0
+          },
+          "required": true,
+          "timeout_sec": 10,
+          "global_only": false
+        }
+      ],
+      "max_retries": 2,
+      "retry_count": 0,
+      "snapshot_name": "task_2a60ccab-b1ec-47e9-b91b-84725df76c0e_set-execute-permission_v2",
+      "diff_summary": {
+        "snapshot": "task_2a60ccab-b1ec-47e9-b91b-84725df76c0e_set-execute-permission_v2",
+        "changed_rows": 0
+      },
+      "last_verification": {
+        "subtask_id": "set-execute-permission",
+        "all_required_passed": true,
+        "results": [
+          {
+            "criterion_id": "set-execute-permission-ac0",
+            "passed": true,
+            "evidence": "",
+            "expected": "exit code == 0",
+            "duration_ms": 0
+          }
+        ],
+        "timestamp": "2026-04-02T05:37:37.866275581+00:00"
+      }
+    },
+    {
+      "id": "verify-script-execution",
+      "title": "Test script execution",
+      "description": "Execute the script by running /tmp/hiyz and verify it outputs exactly 'hi yangzhou' to stdout.",
+      "depends_on": [
+        "set-execute-permission"
+      ],
+      "effort": "small",
+      "stage": {
+        "state": "verified"
+      },
+      "criteria": [
+        {
+          "id": "verify-script-execution-ac0",
+          "description": "Running /tmp/hiyz produces output 'hi yangzhou' without errors",
+          "verifier": {
+            "kind": "command_output",
+            "cmd": "/tmp/hiyz",
+            "contains": [
+              "hi yangzhou"
+            ],
+            "not_contains": [
+              "error"
+            ]
+          },
+          "required": true,
+          "timeout_sec": 30,
+          "global_only": false
+        }
+      ],
+      "max_retries": 2,
+      "retry_count": 0,
+      "snapshot_name": "task_2a60ccab-b1ec-47e9-b91b-84725df76c0e_verify-script-execution_v2",
+      "diff_summary": {
+        "snapshot": "task_2a60ccab-b1ec-47e9-b91b-84725df76c0e_verify-script-execution_v2",
+        "changed_rows": 0
+      },
+      "last_verification": {
+        "subtask_id": "verify-script-execution",
+        "all_required_passed": true,
+        "results": [
+          {
+            "criterion_id": "verify-script-execution-ac0",
+            "passed": true,
+            "evidence": "hi yangzhou\n",
+            "expected": "contains: [\"hi yangzhou\"], not_contains: [\"error\"]",
+            "duration_ms": 1
+          }
+        ],
+        "timestamp": "2026-04-02T05:37:59.282850626+00:00"
+      }
+    }
+  ],
+  "global_verification": [
+    {
+      "id": "global-build",
+      "description": "Full project builds without errors",
+      "verifier": {
+        "kind": "build_pass",
+        "cmd": "make"
+      },
+      "required": true,
+      "timeout_sec": 600,
+      "global_only": true
+    }
+  ],
+  "version": 2,
+  "status": "completed",
+  "created_at": "2026-04-02T05:36:20.639215516+00:00",
+  "updated_at": "2026-04-02T05:37:59.308382936+00:00"
+}

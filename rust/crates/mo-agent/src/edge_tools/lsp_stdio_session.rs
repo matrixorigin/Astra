@@ -79,15 +79,14 @@ fn read_frame<R: BufRead>(r: &mut R) -> io::Result<Value> {
             break;
         }
         if let Some(rest) = line.strip_prefix("Content-Length:") {
-            len = Some(
-                rest
-                    .trim()
-                    .parse()
-                    .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "bad Content-Length"))?,
-            );
+            len =
+                Some(rest.trim().parse().map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidData, "bad Content-Length")
+                })?);
         }
     }
-    let n = len.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing Content-Length"))?;
+    let n =
+        len.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing Content-Length"))?;
     let mut buf = vec![0u8; n];
     r.read_exact(&mut buf)?;
     serde_json::from_slice(&buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
@@ -95,7 +94,9 @@ fn read_frame<R: BufRead>(r: &mut R) -> io::Result<Value> {
 
 pub(crate) fn path_to_uri(path: &Path) -> Option<String> {
     let abs = std::fs::canonicalize(path).ok()?;
-    Url::from_file_path(&abs).ok().map(|u| u.as_str().to_string())
+    Url::from_file_path(&abs)
+        .ok()
+        .map(|u| u.as_str().to_string())
 }
 
 fn workspace_uri(root: &Path) -> String {
@@ -110,25 +111,25 @@ fn send_lsp_response(stdin: &StdinShared, id: &Value, result: Value) -> io::Resu
     let msg = json!({ "jsonrpc": "2.0", "id": id, "result": result });
     let mut w = stdin
         .lock()
-        .map_err(|_| io::Error::new(io::ErrorKind::Other, "stdin mutex poisoned"))?;
+        .map_err(|_| io::Error::other("stdin mutex poisoned"))?;
     write_frame(&mut *w, &msg)
 }
 
-fn reader_loop(mut reader: BufReader<std::process::ChildStdout>, stdin: StdinShared, pending: Arc<Mutex<Vec<Value>>>) {
-    loop {
-        let msg = match read_frame(&mut reader) {
-            Ok(m) => m,
-            Err(_) => break,
-        };
+fn reader_loop(
+    mut reader: BufReader<std::process::ChildStdout>,
+    stdin: StdinShared,
+    pending: Arc<Mutex<Vec<Value>>>,
+) {
+    while let Ok(msg) = read_frame(&mut reader) {
         if let Some(method) = msg.get("method").and_then(|m| m.as_str()) {
             if method == "textDocument/publishDiagnostics" {
-                if let Some(p) = msg.get("params").cloned() {
-                    if let Ok(mut g) = pending.lock() {
-                        g.push(p);
-                        if g.len() > MAX_LSP_DIAG_BATCHES * 2 {
-                            let drain = g.len() - MAX_LSP_DIAG_BATCHES;
-                            g.drain(0..drain);
-                        }
+                if let Some(p) = msg.get("params").cloned()
+                    && let Ok(mut g) = pending.lock()
+                {
+                    g.push(p);
+                    if g.len() > MAX_LSP_DIAG_BATCHES * 2 {
+                        let drain = g.len() - MAX_LSP_DIAG_BATCHES;
+                        g.drain(0..drain);
                     }
                 }
                 continue;
@@ -222,7 +223,7 @@ impl LspStdioSession {
         {
             let mut w = stdin
                 .lock()
-                .map_err(|_| io::Error::new(io::ErrorKind::Other, "stdin mutex poisoned"))?;
+                .map_err(|_| io::Error::other("stdin mutex poisoned"))?;
             write_frame(&mut *w, &init)?;
         }
 
@@ -243,7 +244,7 @@ impl LspStdioSession {
         {
             let mut w = stdin
                 .lock()
-                .map_err(|_| io::Error::new(io::ErrorKind::Other, "stdin mutex poisoned"))?;
+                .map_err(|_| io::Error::other("stdin mutex poisoned"))?;
             write_frame(&mut *w, &initialized)?;
         }
 
@@ -271,7 +272,7 @@ impl LspStdioSession {
         let mut w = self
             .stdin
             .lock()
-            .map_err(|_| io::Error::new(io::ErrorKind::Other, "stdin mutex poisoned"))?;
+            .map_err(|_| io::Error::other("stdin mutex poisoned"))?;
         write_frame(&mut *w, &msg)
     }
 
@@ -286,7 +287,7 @@ impl LspStdioSession {
         let mut versions = self
             .versions
             .lock()
-            .map_err(|_| io::Error::new(io::ErrorKind::Other, "versions mutex poisoned"))?;
+            .map_err(|_| io::Error::other("versions mutex poisoned"))?;
         let is_open = versions.contains_key(&uri);
         if !is_open {
             versions.insert(uri.clone(), 1);
@@ -389,11 +390,11 @@ impl LspStdioSession {
 
 impl Drop for LspStdioSession {
     fn drop(&mut self) {
-        if let Ok(mut c) = self._child.lock() {
-            if let Some(mut ch) = c.take() {
-                let _ = ch.kill();
-                let _ = ch.wait();
-            }
+        if let Ok(mut c) = self._child.lock()
+            && let Some(mut ch) = c.take()
+        {
+            let _ = ch.kill();
+            let _ = ch.wait();
         }
     }
 }

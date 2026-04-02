@@ -58,21 +58,11 @@ pub struct TaskContract {
     pub updated_at: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TaskScope {
     pub in_scope: Vec<String>,
     pub out_of_scope: Vec<String>,
     pub assumptions: Vec<String>,
-}
-
-impl Default for TaskScope {
-    fn default() -> Self {
-        Self {
-            in_scope: Vec::new(),
-            out_of_scope: Vec::new(),
-            assumptions: Vec::new(),
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -170,9 +160,10 @@ impl Default for DurableSubtask {
 // ─── Subtask State Machine ──────────────────────────────────────────────────
 
 /// Full lifecycle state for a durable subtask.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum SubtaskStage {
+    #[default]
     Pending,
     Blocked {
         reason: String,
@@ -194,12 +185,6 @@ pub enum SubtaskStage {
     Abandoned {
         reason: String,
     },
-}
-
-impl Default for SubtaskStage {
-    fn default() -> Self {
-        Self::Pending
-    }
 }
 
 impl SubtaskStage {
@@ -373,7 +358,10 @@ impl VerificationRunner {
     /// Verify only lightweight (non-global-only) criteria for a subtask.
     /// Skips `global_only` criteria and `LlmJudge` (not yet implemented).
     /// Used during per-subtask verification in the REPL loop for fast feedback.
-    pub async fn verify_subtask_local(&self, subtask: &DurableSubtask) -> SubtaskVerificationReport {
+    pub async fn verify_subtask_local(
+        &self,
+        subtask: &DurableSubtask,
+    ) -> SubtaskVerificationReport {
         self.verify_subtask_filtered(subtask, true).await
     }
 
@@ -419,7 +407,8 @@ impl VerificationRunner {
         let start = std::time::Instant::now();
         let timeout = std::time::Duration::from_secs(criterion.timeout_sec as u64);
 
-        let result = tokio::time::timeout(timeout, self.execute_verifier(&criterion.verifier)).await;
+        let result =
+            tokio::time::timeout(timeout, self.execute_verifier(&criterion.verifier)).await;
 
         let duration_ms = start.elapsed().as_millis() as u64;
 
@@ -514,8 +503,8 @@ impl VerificationRunner {
                 should_match,
             } => {
                 let full = self.work_dir.join(file);
-                let content = std::fs::read_to_string(&full)
-                    .map_err(|e| format!("read {file}: {e}"))?;
+                let content =
+                    std::fs::read_to_string(&full).map_err(|e| format!("read {file}: {e}"))?;
                 let found = content.contains(pattern);
                 let passed = found == *should_match;
                 let evidence = if found {
@@ -603,7 +592,11 @@ impl VerificationRunner {
                     .collect::<Vec<_>>()
                     .join(", ");
                 let logic = if *require_all { "ALL" } else { "ANY" };
-                Ok((passed, evidence, format!("{logic} of {} criteria", criteria.len())))
+                Ok((
+                    passed,
+                    evidence,
+                    format!("{logic} of {} criteria", criteria.len()),
+                ))
             }
         }
     }
@@ -619,23 +612,27 @@ impl VerificationRunner {
         parts.push(format!("Work directory: {}", dir.display()));
 
         // 1. Git diff (uncommitted changes) — most relevant for "did the code change correctly?"
-        if let Ok(diff) = Self::git_diff(&dir).await {
-            if !diff.is_empty() {
-                parts.push(format!("## Recent changes (git diff):\n```\n{}\n```", truncate(&diff, 4096)));
-            }
+        if let Ok(diff) = Self::git_diff(&dir).await
+            && !diff.is_empty()
+        {
+            parts.push(format!(
+                "## Recent changes (git diff):\n```\n{}\n```",
+                truncate(&diff, 4096)
+            ));
         }
 
         // 2. Extract file paths mentioned in the prompt and include snippets
         let mentioned_files = extract_paths_from_text(prompt);
         for path_str in mentioned_files.iter().take(3) {
             let full_path = dir.join(path_str);
-            if full_path.exists() && full_path.is_file() {
-                if let Ok(content) = std::fs::read_to_string(&full_path) {
-                    parts.push(format!(
-                        "## File: {path_str}\n```\n{}\n```",
-                        truncate(&content, 2048)
-                    ));
-                }
+            if full_path.exists()
+                && full_path.is_file()
+                && let Ok(content) = std::fs::read_to_string(&full_path)
+            {
+                parts.push(format!(
+                    "## File: {path_str}\n```\n{}\n```",
+                    truncate(&content, 2048)
+                ));
             }
         }
 
@@ -673,23 +670,18 @@ impl VerificationRunner {
 /// Extract file paths from text (heuristic: words with '/' or known extensions).
 fn extract_paths_from_text(text: &str) -> Vec<String> {
     let extensions = [
-        ".rs", ".py", ".ts", ".tsx", ".js", ".jsx", ".go", ".java", ".rb",
-        ".cpp", ".c", ".h", ".toml", ".yaml", ".yml", ".json", ".sql", ".sh",
+        ".rs", ".py", ".ts", ".tsx", ".js", ".jsx", ".go", ".java", ".rb", ".cpp", ".c", ".h",
+        ".toml", ".yaml", ".yml", ".json", ".sql", ".sh",
     ];
     text.split_whitespace()
         .map(|w| w.trim_matches(|c: char| c == '`' || c == '\'' || c == '"' || c == ','))
-        .filter(|w| {
-            w.contains('/') || extensions.iter().any(|ext| w.ends_with(ext))
-        })
+        .filter(|w| w.contains('/') || extensions.iter().any(|ext| w.ends_with(ext)))
         .map(String::from)
         .collect()
 }
 
 /// Run a shell command via spawn_blocking (no tokio::process feature needed).
-async fn run_shell_cmd(
-    cmd: &str,
-    dir: &std::path::Path,
-) -> Result<(i32, String, String), String> {
+async fn run_shell_cmd(cmd: &str, dir: &std::path::Path) -> Result<(i32, String, String), String> {
     let cmd = cmd.to_string();
     let dir = dir.to_path_buf();
     tokio::task::spawn_blocking(move || {
@@ -723,8 +715,12 @@ fn truncate(s: &str, max: usize) -> String {
 #[async_trait]
 pub trait TaskBranchOps: Send + Sync {
     /// Create a snapshot before subtask execution (for rollback).
-    async fn create_snapshot(&self, task_id: &str, subtask_id: &str, version: u32)
-        -> Result<String, String>;
+    async fn create_snapshot(
+        &self,
+        task_id: &str,
+        subtask_id: &str,
+        version: u32,
+    ) -> Result<String, String>;
 
     /// Diff agent's work against a pre-execution snapshot.
     async fn diff_since_snapshot(&self, snapshot: &str) -> Result<DiffSummary, String>;
@@ -752,10 +748,7 @@ fn validate_snapshot_name(name: &str) -> Result<(), String> {
     if name.is_empty() {
         return Err("empty snapshot name".into());
     }
-    if !name
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '_')
-    {
+    if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
         return Err(format!(
             "invalid snapshot name '{}': only [a-zA-Z0-9_] allowed",
             name
@@ -874,10 +867,7 @@ impl TaskBranchOps for GitBranchOps {
         .await
         .map_err(|e| format!("spawn: {e}"))??;
 
-        self.refs
-            .lock()
-            .unwrap()
-            .insert(name.clone(), sha);
+        self.refs.lock().unwrap().insert(name.clone(), sha);
         Ok(name)
     }
 
@@ -1071,9 +1061,7 @@ fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> Result<()
     if !src.exists() {
         return Ok(());
     }
-    for entry in
-        std::fs::read_dir(src).map_err(|e| format!("readdir {}: {e}", src.display()))?
-    {
+    for entry in std::fs::read_dir(src).map_err(|e| format!("readdir {}: {e}", src.display()))? {
         let entry = entry.map_err(|e| format!("entry: {e}"))?;
         let src_path = entry.path();
         let dst_path = dst.join(entry.file_name());
@@ -1087,17 +1075,12 @@ fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> Result<()
     Ok(())
 }
 
-fn count_changed_files(
-    snap: &std::path::Path,
-    work: &std::path::Path,
-) -> Result<i64, String> {
+fn count_changed_files(snap: &std::path::Path, work: &std::path::Path) -> Result<i64, String> {
     if !snap.exists() || !work.exists() {
         return Ok(0);
     }
     let mut changed = 0i64;
-    for entry in
-        std::fs::read_dir(work).map_err(|e| format!("readdir {}: {e}", work.display()))?
-    {
+    for entry in std::fs::read_dir(work).map_err(|e| format!("readdir {}: {e}", work.display()))? {
         let entry = entry.map_err(|e| format!("entry: {e}"))?;
         let work_path = entry.path();
         let snap_path = snap.join(entry.file_name());
@@ -1283,10 +1266,7 @@ impl TaskLearningBridge for NoopTaskLearningBridge {
     ) -> Result<Vec<String>, String> {
         Ok(Vec::new())
     }
-    async fn task_pattern_stats(
-        &self,
-        _pattern: &str,
-    ) -> Result<Option<TaskPatternStats>, String> {
+    async fn task_pattern_stats(&self, _pattern: &str) -> Result<Option<TaskPatternStats>, String> {
         Ok(None)
     }
 }
@@ -1304,10 +1284,7 @@ pub fn build_outcome_signal(
         .subtasks
         .iter()
         .map(|s| {
-            let summary = report
-                .subtask_summaries
-                .iter()
-                .find(|sum| sum.id == s.id);
+            let summary = report.subtask_summaries.iter().find(|sum| sum.id == s.id);
             let pass_rate = if s.criteria.is_empty() {
                 None
             } else {
@@ -1460,8 +1437,7 @@ pub struct MatrixOneDurableTaskLifecycle {
 
 impl MatrixOneDurableTaskLifecycle {
     pub fn new(pool: sqlx::Pool<sqlx::MySql>, work_dir: std::path::PathBuf) -> Self {
-        let branch_ops: Arc<dyn TaskBranchOps> =
-            Arc::new(TaskBranchService::new(pool.clone()));
+        let branch_ops: Arc<dyn TaskBranchOps> = Arc::new(TaskBranchService::new(pool.clone()));
         Self {
             pool,
             branch_ops,
@@ -1588,8 +1564,8 @@ impl MatrixOneDurableTaskLifecycle {
     async fn persist_contract(&self, contract: &TaskContract) -> Result<(), String> {
         let scope_json =
             serde_json::to_string(&contract.scope).map_err(|e| format!("scope json: {e}"))?;
-        let subtasks_json = serde_json::to_string(&contract.subtasks)
-            .map_err(|e| format!("subtasks json: {e}"))?;
+        let subtasks_json =
+            serde_json::to_string(&contract.subtasks).map_err(|e| format!("subtasks json: {e}"))?;
         let criteria_json = serde_json::to_string(&contract.global_verification)
             .map_err(|e| format!("criteria json: {e}"))?;
 
@@ -1605,8 +1581,8 @@ impl MatrixOneDurableTaskLifecycle {
         )
         .bind(&contract.contract_id)
         .bind(&contract.task_id)
-        .bind("")  // session_id filled by caller context
-        .bind("")  // user_id filled by caller context
+        .bind("") // session_id filled by caller context
+        .bind("") // user_id filled by caller context
         .bind(&contract.goal)
         .bind(&scope_json)
         .bind(&subtasks_json)
@@ -1627,8 +1603,8 @@ impl MatrixOneDurableTaskLifecycle {
     ) -> Result<(), String> {
         let scope_json =
             serde_json::to_string(&contract.scope).map_err(|e| format!("scope json: {e}"))?;
-        let subtasks_json = serde_json::to_string(&contract.subtasks)
-            .map_err(|e| format!("subtasks json: {e}"))?;
+        let subtasks_json =
+            serde_json::to_string(&contract.subtasks).map_err(|e| format!("subtasks json: {e}"))?;
         let criteria_json = serde_json::to_string(&contract.global_verification)
             .map_err(|e| format!("criteria json: {e}"))?;
 
@@ -2000,7 +1976,7 @@ impl DurableTaskLifecycle for MatrixOneDurableTaskLifecycle {
                 .save_verification_result(
                     task_id,
                     &contract.contract_id,
-                    "",  // session from context
+                    "", // session from context
                     subtask_id,
                     r,
                     durable_st.retry_count + 1,
@@ -2016,10 +1992,10 @@ impl DurableTaskLifecycle for MatrixOneDurableTaskLifecycle {
         if report.all_required_passed {
             subtask.stage = SubtaskStage::Verified;
             // Git4Data: cleanup snapshot after successful verification
-            if let Some(snap) = &snapshot_name {
-                if let Err(e) = self.branch_ops.cleanup_snapshot(snap).await {
-                    eprintln!("warn: snapshot cleanup failed for {subtask_id}: {e}");
-                }
+            if let Some(snap) = &snapshot_name
+                && let Err(e) = self.branch_ops.cleanup_snapshot(snap).await
+            {
+                eprintln!("warn: snapshot cleanup failed for {subtask_id}: {e}");
             }
         } else {
             subtask.retry_count += 1;
@@ -2035,10 +2011,7 @@ impl DurableTaskLifecycle for MatrixOneDurableTaskLifecycle {
                     }
                 }
                 subtask.stage = SubtaskStage::Abandoned {
-                    reason: format!(
-                        "verification failed after {} attempts",
-                        subtask.retry_count
-                    ),
+                    reason: format!("verification failed after {} attempts", subtask.retry_count),
                 };
             } else {
                 subtask.stage = SubtaskStage::VerificationFailed {
@@ -2065,7 +2038,10 @@ impl DurableTaskLifecycle for MatrixOneDurableTaskLifecycle {
             .collect();
         if !unverified.is_empty() {
             let ids: Vec<&str> = unverified.iter().map(|s| s.id.as_str()).collect();
-            return Err(format!("subtasks not ready for global verification: {:?}", ids));
+            return Err(format!(
+                "subtasks not ready for global verification: {:?}",
+                ids
+            ));
         }
 
         let runner = self.runner();
@@ -2278,8 +2254,7 @@ impl LocalDurableTaskLifecycle {
     fn save_local(&self, contract: &TaskContract) -> Result<(), String> {
         std::fs::create_dir_all(&self.contracts_dir)
             .map_err(|e| format!("mkdir contracts: {e}"))?;
-        let json =
-            serde_json::to_string_pretty(contract).map_err(|e| format!("serialize: {e}"))?;
+        let json = serde_json::to_string_pretty(contract).map_err(|e| format!("serialize: {e}"))?;
         let path = self.contract_path(&contract.contract_id);
         let tmp = path.with_extension("json.tmp");
         std::fs::write(&tmp, &json).map_err(|e| format!("write: {e}"))?;
@@ -2292,17 +2267,20 @@ impl LocalDurableTaskLifecycle {
         if !self.contracts_dir.exists() {
             return Ok(None);
         }
-        let entries = std::fs::read_dir(&self.contracts_dir)
-            .map_err(|e| format!("readdir: {e}"))?;
+        let entries =
+            std::fs::read_dir(&self.contracts_dir).map_err(|e| format!("readdir: {e}"))?;
         for entry in entries.flatten() {
-            if entry.path().extension().map(|e| e == "json").unwrap_or(false) {
-                if let Ok(data) = std::fs::read_to_string(entry.path()) {
-                    if let Ok(c) = serde_json::from_str::<TaskContract>(&data) {
-                        if c.task_id == task_id && c.status != ContractStatus::Abandoned {
-                            return Ok(Some(c));
-                        }
-                    }
-                }
+            if entry
+                .path()
+                .extension()
+                .map(|e| e == "json")
+                .unwrap_or(false)
+                && let Ok(data) = std::fs::read_to_string(entry.path())
+                && let Ok(c) = serde_json::from_str::<TaskContract>(&data)
+                && c.task_id == task_id
+                && c.status != ContractStatus::Abandoned
+            {
+                return Ok(Some(c));
             }
         }
         Ok(None)
@@ -2610,10 +2588,14 @@ impl DurableTaskLifecycle for LocalDurableTaskLifecycle {
                     }
                     None => {
                         // No verification ran: count only locally-runnable criteria
-                        let local = s.criteria.iter().filter(|c| {
-                            !c.global_only
-                                && !matches!(c.verifier, VerifierKind::LlmJudge { .. })
-                        }).count() as u32;
+                        let local = s
+                            .criteria
+                            .iter()
+                            .filter(|c| {
+                                !c.global_only
+                                    && !matches!(c.verifier, VerifierKind::LlmJudge { .. })
+                            })
+                            .count() as u32;
                         (0, local)
                     }
                 };
@@ -2676,21 +2658,22 @@ pub struct UnconfiguredDurableTaskLifecycle;
 #[async_trait]
 impl DurableTaskLifecycle for UnconfiguredDurableTaskLifecycle {
     async fn create_contract(
-        &self, _: &str, _: &str, _: &str, _: &TaskPlan, _: TaskScope,
+        &self,
+        _: &str,
+        _: &str,
+        _: &str,
+        _: &TaskPlan,
+        _: TaskScope,
     ) -> Result<TaskContract, String> {
         Err("durable task service not configured".into())
     }
-    async fn amend_contract(
-        &self, _: &str, _: ContractAmendment,
-    ) -> Result<TaskContract, String> {
+    async fn amend_contract(&self, _: &str, _: ContractAmendment) -> Result<TaskContract, String> {
         Err("durable task service not configured".into())
     }
     async fn get_contract(&self, _: &str) -> Result<Option<TaskContract>, String> {
         Err("durable task service not configured".into())
     }
-    async fn begin_subtask(
-        &self, _: &str, _: &str,
-    ) -> Result<SubtaskExecutionContext, String> {
+    async fn begin_subtask(&self, _: &str, _: &str) -> Result<SubtaskExecutionContext, String> {
         Err("durable task service not configured".into())
     }
     async fn complete_subtask_execution(&self, _: &str, _: &str) -> Result<(), String> {
@@ -2699,9 +2682,7 @@ impl DurableTaskLifecycle for UnconfiguredDurableTaskLifecycle {
     async fn fail_subtask(&self, _: &str, _: &str, _: &str) -> Result<(), String> {
         Err("durable task service not configured".into())
     }
-    async fn verify_subtask(
-        &self, _: &str, _: &str,
-    ) -> Result<SubtaskVerificationReport, String> {
+    async fn verify_subtask(&self, _: &str, _: &str) -> Result<SubtaskVerificationReport, String> {
         Err("durable task service not configured".into())
     }
     async fn verify_global(&self, _: &str) -> Result<Vec<VerificationResult>, String> {
@@ -2710,9 +2691,7 @@ impl DurableTaskLifecycle for UnconfiguredDurableTaskLifecycle {
     async fn pause_task(&self, _: &str) -> Result<(), String> {
         Err("durable task service not configured".into())
     }
-    async fn resume_task(
-        &self, _: &str, _: &str,
-    ) -> Result<TaskResumeContext, String> {
+    async fn resume_task(&self, _: &str, _: &str) -> Result<TaskResumeContext, String> {
         Err("durable task service not configured".into())
     }
     async fn deliver_task(&self, _: &str) -> Result<TaskDeliveryReport, String> {
@@ -2742,9 +2721,7 @@ mod tests {
         let stage = SubtaskStage::Executing;
         assert!(!stage.can_start());
 
-        let stage = SubtaskStage::VerificationFailed {
-            results: vec![],
-        };
+        let stage = SubtaskStage::VerificationFailed { results: vec![] };
         assert!(stage.can_start()); // can retry
 
         let stage = SubtaskStage::Completed;
@@ -2840,14 +2817,14 @@ mod tests {
     fn subtask_stage_as_str() {
         assert_eq!(SubtaskStage::Pending.as_str(), "pending");
         assert_eq!(SubtaskStage::Executing.as_str(), "executing");
-        assert_eq!(SubtaskStage::AwaitingVerification.as_str(), "awaiting_verification");
+        assert_eq!(
+            SubtaskStage::AwaitingVerification.as_str(),
+            "awaiting_verification"
+        );
         assert_eq!(SubtaskStage::Verified.as_str(), "verified");
         assert_eq!(SubtaskStage::Completed.as_str(), "completed");
         assert_eq!(
-            SubtaskStage::Abandoned {
-                reason: "x".into()
-            }
-            .as_str(),
+            SubtaskStage::Abandoned { reason: "x".into() }.as_str(),
             "abandoned"
         );
     }
@@ -2964,7 +2941,11 @@ mod tests {
     #[tokio::test]
     async fn verification_runner_grep_check() {
         let tmp = tempfile::TempDir::new().unwrap();
-        std::fs::write(tmp.path().join("code.rs"), "fn main() { println!(\"hello\"); }").unwrap();
+        std::fs::write(
+            tmp.path().join("code.rs"),
+            "fn main() { println!(\"hello\"); }",
+        )
+        .unwrap();
 
         let runner = VerificationRunner::new(tmp.path().to_path_buf());
 
@@ -3146,14 +3127,17 @@ mod tests {
     #[tokio::test]
     async fn local_lifecycle_create_and_get() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let svc = LocalDurableTaskLifecycle::new(
-            tmp.path().join("data"),
-            tmp.path().join("work"),
-        );
+        let svc = LocalDurableTaskLifecycle::new(tmp.path().join("data"), tmp.path().join("work"));
 
         let plan = make_test_plan();
         let contract = svc
-            .create_contract("user-1", "session-1", "Build something", &plan, TaskScope::default())
+            .create_contract(
+                "user-1",
+                "session-1",
+                "Build something",
+                &plan,
+                TaskScope::default(),
+            )
             .await
             .unwrap();
 
@@ -3173,10 +3157,7 @@ mod tests {
         let work = tmp.path().join("work");
         std::fs::create_dir_all(&work).unwrap();
 
-        let svc = LocalDurableTaskLifecycle::new(
-            tmp.path().join("data"),
-            work.clone(),
-        );
+        let svc = LocalDurableTaskLifecycle::new(tmp.path().join("data"), work.clone());
 
         let plan = make_test_plan();
         let contract = svc
@@ -3194,17 +3175,18 @@ mod tests {
             .unwrap();
 
         // Check state persisted
-        let c = svc.get_contract(&contract.contract_id).await.unwrap().unwrap();
+        let c = svc
+            .get_contract(&contract.contract_id)
+            .await
+            .unwrap()
+            .unwrap();
         assert!(matches!(c.subtasks[0].stage, SubtaskStage::Verified));
     }
 
     #[tokio::test]
     async fn local_lifecycle_fail_subtask() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let svc = LocalDurableTaskLifecycle::new(
-            tmp.path().join("data"),
-            tmp.path().join("work"),
-        );
+        let svc = LocalDurableTaskLifecycle::new(tmp.path().join("data"), tmp.path().join("work"));
 
         let plan = make_test_plan();
         let contract = svc
@@ -3217,17 +3199,21 @@ mod tests {
             .await
             .unwrap();
 
-        let c = svc.get_contract(&contract.contract_id).await.unwrap().unwrap();
-        assert!(matches!(c.subtasks[0].stage, SubtaskStage::ExecutionFailed { .. }));
+        let c = svc
+            .get_contract(&contract.contract_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            c.subtasks[0].stage,
+            SubtaskStage::ExecutionFailed { .. }
+        ));
     }
 
     #[tokio::test]
     async fn local_lifecycle_amend_contract() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let svc = LocalDurableTaskLifecycle::new(
-            tmp.path().join("data"),
-            tmp.path().join("work"),
-        );
+        let svc = LocalDurableTaskLifecycle::new(tmp.path().join("data"), tmp.path().join("work"));
 
         let plan = make_test_plan();
         let contract = svc
@@ -3315,38 +3301,53 @@ mod tests {
         .unwrap();
 
         // Execute flow: begin → complete → verify
-        svc.begin_subtask(&contract.task_id, "check-sub").await.unwrap();
+        svc.begin_subtask(&contract.task_id, "check-sub")
+            .await
+            .unwrap();
         svc.complete_subtask_execution(&contract.task_id, "check-sub")
             .await
             .unwrap();
 
-        let report = svc.verify_subtask(&contract.task_id, "check-sub").await.unwrap();
-        assert!(report.all_required_passed, "should pass: {:?}", report.results);
+        let report = svc
+            .verify_subtask(&contract.task_id, "check-sub")
+            .await
+            .unwrap();
+        assert!(
+            report.all_required_passed,
+            "should pass: {:?}",
+            report.results
+        );
         assert_eq!(report.results.len(), 2);
 
         // Check stage is Verified
-        let c = svc.get_contract(&contract.contract_id).await.unwrap().unwrap();
+        let c = svc
+            .get_contract(&contract.contract_id)
+            .await
+            .unwrap()
+            .unwrap();
         assert!(matches!(c.subtasks[0].stage, SubtaskStage::Verified));
     }
 
     #[tokio::test]
     async fn local_lifecycle_deliver() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let svc = LocalDurableTaskLifecycle::new(
-            tmp.path().join("data"),
-            tmp.path().join("work"),
-        );
+        let svc = LocalDurableTaskLifecycle::new(tmp.path().join("data"), tmp.path().join("work"));
 
         let plan = make_test_plan();
-        let contract = svc.create_contract("u", "s", "deliver test", &plan, TaskScope::default())
+        let contract = svc
+            .create_contract("u", "s", "deliver test", &plan, TaskScope::default())
             .await
             .unwrap();
 
         // Complete both subtasks (no criteria → auto-verified)
         svc.begin_subtask(&contract.task_id, "sub-1").await.unwrap();
-        svc.complete_subtask_execution(&contract.task_id, "sub-1").await.unwrap();
+        svc.complete_subtask_execution(&contract.task_id, "sub-1")
+            .await
+            .unwrap();
         svc.begin_subtask(&contract.task_id, "sub-2").await.unwrap();
-        svc.complete_subtask_execution(&contract.task_id, "sub-2").await.unwrap();
+        svc.complete_subtask_execution(&contract.task_id, "sub-2")
+            .await
+            .unwrap();
 
         let report = svc.deliver_task(&contract.task_id).await.unwrap();
         assert_eq!(report.goal, "deliver test");
@@ -3356,19 +3357,20 @@ mod tests {
     #[tokio::test]
     async fn local_lifecycle_resume() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let svc = LocalDurableTaskLifecycle::new(
-            tmp.path().join("data"),
-            tmp.path().join("work"),
-        );
+        let svc = LocalDurableTaskLifecycle::new(tmp.path().join("data"), tmp.path().join("work"));
 
         let plan = make_test_plan();
-        let contract = svc.create_contract("u", "s", "resume test", &plan, TaskScope::default())
+        let contract = svc
+            .create_contract("u", "s", "resume test", &plan, TaskScope::default())
             .await
             .unwrap();
 
         svc.begin_subtask(&contract.task_id, "sub-1").await.unwrap();
 
-        let ctx = svc.resume_task(&contract.task_id, "new-session").await.unwrap();
+        let ctx = svc
+            .resume_task(&contract.task_id, "new-session")
+            .await
+            .unwrap();
         assert_eq!(ctx.active_subtask, Some("sub-1".into()));
         assert_eq!(ctx.contract.subtasks.len(), 2);
     }
@@ -3401,7 +3403,13 @@ mod tests {
             task_type: Some("code".into()),
         };
         assert!(bridge.learn_from_task_outcome(&signal).await.is_ok());
-        assert!(bridge.suggest_tools("test", None, None).await.unwrap().is_empty());
+        assert!(
+            bridge
+                .suggest_tools("test", None, None)
+                .await
+                .unwrap()
+                .is_empty()
+        );
         assert!(bridge.task_pattern_stats("test").await.unwrap().is_none());
     }
 
@@ -3551,9 +3559,9 @@ mod tests {
     #[derive(Debug, Default)]
     struct BranchOpsLog {
         snapshots_created: Vec<(String, String, u32)>, // (task_id, subtask_id, version)
-        diffs_requested: Vec<String>,                   // snapshot names
-        rollbacks: Vec<String>,                         // snapshot names
-        cleanups: Vec<String>,                          // snapshot names
+        diffs_requested: Vec<String>,                  // snapshot names
+        rollbacks: Vec<String>,                        // snapshot names
+        cleanups: Vec<String>,                         // snapshot names
     }
 
     struct MockBranchOps {
@@ -3612,11 +3620,11 @@ mod tests {
                 return Err("mock snapshot failure".into());
             }
             let name = format!("task_{task_id}_{subtask_id}_v{version}");
-            self.log
-                .lock()
-                .unwrap()
-                .snapshots_created
-                .push((task_id.into(), subtask_id.into(), version));
+            self.log.lock().unwrap().snapshots_created.push((
+                task_id.into(),
+                subtask_id.into(),
+                version,
+            ));
             Ok(name)
         }
 
@@ -3657,11 +3665,7 @@ mod tests {
     ) -> LocalDurableTaskLifecycle {
         let work = tmp.path().join("work");
         std::fs::create_dir_all(&work).unwrap();
-        LocalDurableTaskLifecycle::with_branch_ops(
-            tmp.path().join("data"),
-            mock,
-            work,
-        )
+        LocalDurableTaskLifecycle::with_branch_ops(tmp.path().join("data"), mock, work)
     }
 
     #[tokio::test]
@@ -3692,8 +3696,15 @@ mod tests {
         assert!(snap_name.contains("sub-1"));
 
         // snapshot_name is persisted in contract
-        let c = svc.get_contract(&contract.contract_id).await.unwrap().unwrap();
-        assert_eq!(c.subtasks[0].snapshot_name.as_deref(), Some(snap_name.as_str()));
+        let c = svc
+            .get_contract(&contract.contract_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            c.subtasks[0].snapshot_name.as_deref(),
+            Some(snap_name.as_str())
+        );
     }
 
     #[tokio::test]
@@ -3713,7 +3724,11 @@ mod tests {
         assert!(ctx.snapshot_name.is_none());
 
         // subtask still transitions to Executing
-        let c = svc.get_contract(&contract.contract_id).await.unwrap().unwrap();
+        let c = svc
+            .get_contract(&contract.contract_id)
+            .await
+            .unwrap()
+            .unwrap();
         assert!(matches!(c.subtasks[0].stage, SubtaskStage::Executing));
     }
 
@@ -3739,7 +3754,11 @@ mod tests {
         assert_eq!(log.diffs_requested.len(), 1);
 
         // Diff summary is persisted
-        let c = svc.get_contract(&contract.contract_id).await.unwrap().unwrap();
+        let c = svc
+            .get_contract(&contract.contract_id)
+            .await
+            .unwrap()
+            .unwrap();
         let diff = c.subtasks[0].diff_summary.as_ref().unwrap();
         assert_eq!(diff.changed_rows, 42);
     }
@@ -3752,11 +3771,8 @@ mod tests {
         std::fs::write(work.join("output.txt"), "hello").unwrap();
 
         let mock = Arc::new(MockBranchOps::new());
-        let svc = LocalDurableTaskLifecycle::with_branch_ops(
-            tmp.path().join("data"),
-            mock.clone(),
-            work,
-        );
+        let svc =
+            LocalDurableTaskLifecycle::with_branch_ops(tmp.path().join("data"), mock.clone(), work);
 
         // Create plan with a single subtask with file-exists criterion
         let mut plan = make_test_plan();
@@ -3767,7 +3783,11 @@ mod tests {
             .unwrap();
 
         // Amend to add criteria
-        let mut c = svc.get_contract(&contract.contract_id).await.unwrap().unwrap();
+        let mut c = svc
+            .get_contract(&contract.contract_id)
+            .await
+            .unwrap()
+            .unwrap();
         c.subtasks[0].criteria = vec![VerificationCriterion {
             id: "f1".into(),
             description: "output exists".into(),
@@ -3795,7 +3815,10 @@ mod tests {
         svc.complete_subtask_execution(&contract.task_id, "sub-1")
             .await
             .unwrap();
-        let report = svc.verify_subtask(&contract.task_id, "sub-1").await.unwrap();
+        let report = svc
+            .verify_subtask(&contract.task_id, "sub-1")
+            .await
+            .unwrap();
         assert!(report.all_required_passed);
 
         // Snapshot should be cleaned up on success
@@ -3811,11 +3834,8 @@ mod tests {
         std::fs::create_dir_all(&work).unwrap();
 
         let mock = Arc::new(MockBranchOps::new());
-        let svc = LocalDurableTaskLifecycle::with_branch_ops(
-            tmp.path().join("data"),
-            mock.clone(),
-            work,
-        );
+        let svc =
+            LocalDurableTaskLifecycle::with_branch_ops(tmp.path().join("data"), mock.clone(), work);
 
         let mut plan = make_test_plan();
         plan.subtasks.truncate(1);
@@ -3825,7 +3845,11 @@ mod tests {
             .unwrap();
 
         // Add a criterion that will always fail
-        let mut c = svc.get_contract(&contract.contract_id).await.unwrap().unwrap();
+        let mut c = svc
+            .get_contract(&contract.contract_id)
+            .await
+            .unwrap()
+            .unwrap();
         c.subtasks[0].criteria = vec![VerificationCriterion {
             id: "missing".into(),
             description: "nonexistent file".into(),
@@ -3854,12 +3878,22 @@ mod tests {
         svc.complete_subtask_execution(&contract.task_id, "sub-1")
             .await
             .unwrap();
-        let report = svc.verify_subtask(&contract.task_id, "sub-1").await.unwrap();
+        let report = svc
+            .verify_subtask(&contract.task_id, "sub-1")
+            .await
+            .unwrap();
         assert!(!report.all_required_passed);
 
         // First failure: retry_count < max_retries → VerificationFailed, no rollback
-        let c = svc.get_contract(&contract.contract_id).await.unwrap().unwrap();
-        assert!(matches!(c.subtasks[0].stage, SubtaskStage::VerificationFailed { .. }));
+        let c = svc
+            .get_contract(&contract.contract_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            c.subtasks[0].stage,
+            SubtaskStage::VerificationFailed { .. }
+        ));
         assert_eq!(mock.log().rollbacks.len(), 0);
 
         // Re-execute and verify again (will fail again → max retries → abandoned + rollback)
@@ -3867,16 +3901,29 @@ mod tests {
         svc.complete_subtask_execution(&contract.task_id, "sub-1")
             .await
             .unwrap();
-        let report2 = svc.verify_subtask(&contract.task_id, "sub-1").await.unwrap();
+        let report2 = svc
+            .verify_subtask(&contract.task_id, "sub-1")
+            .await
+            .unwrap();
         assert!(!report2.all_required_passed);
 
         // Second failure: retry_count >= max_retries → Abandoned + rollback + cleanup
-        let c = svc.get_contract(&contract.contract_id).await.unwrap().unwrap();
-        assert!(matches!(c.subtasks[0].stage, SubtaskStage::Abandoned { .. }));
+        let c = svc
+            .get_contract(&contract.contract_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            c.subtasks[0].stage,
+            SubtaskStage::Abandoned { .. }
+        ));
 
         let log = mock.log();
-        assert!(log.rollbacks.len() >= 1, "should have rolled back");
-        assert!(log.cleanups.len() >= 1, "should have cleaned up after rollback");
+        assert!(!log.rollbacks.is_empty(), "should have rolled back");
+        assert!(
+            !log.cleanups.is_empty(),
+            "should have cleaned up after rollback"
+        );
     }
 
     #[tokio::test]
@@ -4059,10 +4106,7 @@ mod tests {
         // Initial file
         std::fs::write(work.join("data.txt"), "initial").unwrap();
 
-        let svc = LocalDurableTaskLifecycle::new(
-            tmp.path().join("data"),
-            work.clone(),
-        );
+        let svc = LocalDurableTaskLifecycle::new(tmp.path().join("data"), work.clone());
 
         let mut plan = make_test_plan();
         plan.subtasks.truncate(1);
@@ -4084,7 +4128,11 @@ mod tests {
             .await
             .unwrap();
 
-        let c = svc.get_contract(&contract.contract_id).await.unwrap().unwrap();
+        let c = svc
+            .get_contract(&contract.contract_id)
+            .await
+            .unwrap()
+            .unwrap();
         let diff = c.subtasks[0].diff_summary.as_ref().unwrap();
         assert!(diff.changed_rows >= 1, "should detect changes: {:?}", diff);
     }
@@ -4272,7 +4320,11 @@ mod tests {
         // Create a file that the prompt references
         let src_dir = tmp.path().join("src");
         std::fs::create_dir_all(&src_dir).unwrap();
-        std::fs::write(src_dir.join("auth.rs"), "pub fn authenticate() { /* ... */ }").unwrap();
+        std::fs::write(
+            src_dir.join("auth.rs"),
+            "pub fn authenticate() { /* ... */ }",
+        )
+        .unwrap();
 
         let judge = Arc::new(ContextCapturingJudge {
             captured: std::sync::Mutex::new(None),

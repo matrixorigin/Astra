@@ -146,9 +146,19 @@ mod tests {
     fn should_schedule_requires_rs_and_cargo_toml() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        assert!(!should_schedule_passive_cargo(root, Path::new("src/lib.rs")));
-        std::fs::write(root.join("Cargo.toml"), "[package]\nname=\"x\"\nversion=\"0.1.0\"\nedition=\"2021\"\n").unwrap();
-        assert!(should_schedule_passive_cargo(root, Path::new("src/main.rs")));
+        assert!(!should_schedule_passive_cargo(
+            root,
+            Path::new("src/lib.rs")
+        ));
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname=\"x\"\nversion=\"0.1.0\"\nedition=\"2021\"\n",
+        )
+        .unwrap();
+        assert!(should_schedule_passive_cargo(
+            root,
+            Path::new("src/main.rs")
+        ));
         assert!(!should_schedule_passive_cargo(root, Path::new("src/x.go")));
     }
 
@@ -188,10 +198,7 @@ mod tests {
         let msgs = take_passive_cargo_messages(&pending, root, true).await;
         assert_eq!(msgs.len(), 1);
         let content = msgs[0]["content"].as_str().unwrap();
-        assert!(
-            content.contains("<new-diagnostics>"),
-            "content={content:?}"
-        );
+        assert!(content.contains("<new-diagnostics>"), "content={content:?}");
         assert!(
             content.contains("error") || content.contains("mismatch"),
             "expected rustc hint, content={content:?}"

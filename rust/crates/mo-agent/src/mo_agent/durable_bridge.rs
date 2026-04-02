@@ -33,18 +33,13 @@ pub async fn generate_contract(
     session_id: &str,
     work_dir: &std::path::Path,
 ) -> Option<TaskContract> {
-    let detection =
-        mo_agent_services::ProjectDetection::detect(work_dir);
+    let detection = mo_agent_services::ProjectDetection::detect(work_dir);
     let cg = ContractGenerator::new(detection);
 
     let contract = match cg.generate(goal, plan, None) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!(
-                "  {}  Contract generation skipped: {}",
-                "⚠".yellow(),
-                e
-            );
+            eprintln!("  {}  Contract generation skipped: {}", "⚠".yellow(), e);
             return None;
         }
     };
@@ -76,22 +71,14 @@ pub async fn generate_contract(
                     Some(amended)
                 }
                 Err(e) => {
-                    eprintln!(
-                        "  {}  Criteria injection failed: {}",
-                        "⚠".yellow(),
-                        e,
-                    );
+                    eprintln!("  {}  Criteria injection failed: {}", "⚠".yellow(), e,);
                     display_contract_summary(&persisted);
                     Some(persisted)
                 }
             }
         }
         Err(e) => {
-            eprintln!(
-                "  {}  Contract persistence failed: {}",
-                "⚠".yellow(),
-                e
-            );
+            eprintln!("  {}  Contract persistence failed: {}", "⚠".yellow(), e);
             // Return the in-memory contract anyway so verification still works
             display_contract_summary(&contract);
             Some(contract)
@@ -128,10 +115,7 @@ pub fn subtask_retries_exhausted(durable: &DurableTaskState, subtask_id: &str) -
 }
 
 /// Call when a subtask transitions Pending → Executing (snapshot).
-pub async fn on_subtask_begin(
-    durable: &DurableTaskState,
-    subtask_id: &str,
-) {
+pub async fn on_subtask_begin(durable: &DurableTaskState, subtask_id: &str) {
     if let Err(e) = durable
         .lifecycle
         .begin_subtask(&durable.contract.task_id, subtask_id)
@@ -149,10 +133,7 @@ pub async fn on_subtask_begin(
 /// Call when a subtask's chat turn completes (diff capture + verification).
 ///
 /// Returns `true` if verification passed (or no criteria), `false` if failed.
-pub async fn on_subtask_complete(
-    durable: &mut DurableTaskState,
-    subtask_id: &str,
-) -> bool {
+pub async fn on_subtask_complete(durable: &mut DurableTaskState, subtask_id: &str) -> bool {
     let task_id = durable.contract.task_id.clone();
 
     // 1. Complete execution (captures diff)
@@ -177,13 +158,9 @@ pub async fn on_subtask_complete(
         .iter()
         .find(|s| s.id == subtask_id)
         .map(|s| {
-            s.criteria.iter().any(|c| {
-                !c.global_only
-                    && !matches!(
-                        c.verifier,
-                        VerifierKind::LlmJudge { .. }
-                    )
-            })
+            s.criteria
+                .iter()
+                .any(|c| !c.global_only && !matches!(c.verifier, VerifierKind::LlmJudge { .. }))
         })
         .unwrap_or(false);
 
@@ -193,16 +170,8 @@ pub async fn on_subtask_complete(
     }
 
     // 3. Run lightweight verification with progress indication
-    eprintln!(
-        "  {}  Verifying subtask: {}...",
-        "🔍".cyan(),
-        subtask_id,
-    );
-    match durable
-        .lifecycle
-        .verify_subtask(&task_id, subtask_id)
-        .await
-    {
+    eprintln!("  {}  Verifying subtask: {}...", "🔍".cyan(), subtask_id,);
+    match durable.lifecycle.verify_subtask(&task_id, subtask_id).await {
         Ok(report) => {
             display_verification_report(&report);
 
@@ -272,11 +241,7 @@ fn display_verification_report(report: &SubtaskVerificationReport) {
         } else {
             let evidence: String = r.evidence.trim().chars().take(120).collect();
             let expected: String = r.expected.chars().take(80).collect();
-            eprintln!(
-                "      {} {}",
-                "✘".red(),
-                r.criterion_id,
-            );
+            eprintln!("      {} {}", "✘".red(), r.criterion_id,);
             if !evidence.is_empty() {
                 eprintln!("        got: {}", evidence.yellow());
             }
@@ -294,15 +259,10 @@ fn display_verification_report(report: &SubtaskVerificationReport) {
 
 /// Run global verification (build/test/lint) after all subtasks complete.
 /// Returns `true` if all required global checks pass.
-pub async fn on_plan_complete(
-    durable: &mut DurableTaskState,
-) -> bool {
+pub async fn on_plan_complete(durable: &mut DurableTaskState) -> bool {
     let task_id = durable.contract.task_id.clone();
 
-    eprintln!(
-        "\n{}  Running global verification...",
-        "🔬".cyan(),
-    );
+    eprintln!("\n{}  Running global verification...", "🔬".cyan(),);
 
     // Show what will be checked
     for c in &durable.contract.global_verification {
@@ -334,20 +294,12 @@ pub async fn on_plan_complete(
                 format!("{}", icon.red())
             };
 
-            eprintln!(
-                "  {}  Global checks: {}/{} passed",
-                styled, passed, total,
-            );
+            eprintln!("  {}  Global checks: {}/{} passed", styled, passed, total,);
 
             for r in &results {
                 if !r.passed {
                     let evidence = r.evidence.chars().take(120).collect::<String>();
-                    eprintln!(
-                        "      {} {} — {}",
-                        "✘".red(),
-                        r.criterion_id,
-                        evidence,
-                    );
+                    eprintln!("      {} {} — {}", "✘".red(), r.criterion_id, evidence,);
                 }
             }
 
@@ -355,22 +307,14 @@ pub async fn on_plan_complete(
                 // Deliver the task
                 match durable.lifecycle.deliver_task(&task_id).await {
                     Ok(report) => display_delivery_report(&report),
-                    Err(e) => eprintln!(
-                        "  {}  Delivery report failed: {}",
-                        "⚠".yellow(),
-                        e,
-                    ),
+                    Err(e) => eprintln!("  {}  Delivery report failed: {}", "⚠".yellow(), e,),
                 }
             }
 
             all_passed
         }
         Err(e) => {
-            eprintln!(
-                "  {}  Global verification error: {}",
-                "⚠".yellow(),
-                e,
-            );
+            eprintln!("  {}  Global verification error: {}", "⚠".yellow(), e,);
             true // Don't block plan on verification infra failure
         }
     }
@@ -386,17 +330,28 @@ fn display_delivery_report(report: &TaskDeliveryReport) {
     let fully_delivered = all_subtasks_verified && all_global_passed;
 
     let total_retries: u32 = report.subtask_summaries.iter().map(|s| s.retry_count).sum();
-    let criteria_passed: u32 = report.subtask_summaries.iter().map(|s| s.criteria_passed).sum();
-    let criteria_total: u32 = report.subtask_summaries.iter().map(|s| s.criteria_total).sum();
-    let global_passed = report.global_verification.iter().filter(|r| r.passed).count();
+    let criteria_passed: u32 = report
+        .subtask_summaries
+        .iter()
+        .map(|s| s.criteria_passed)
+        .sum();
+    let criteria_total: u32 = report
+        .subtask_summaries
+        .iter()
+        .map(|s| s.criteria_total)
+        .sum();
+    let global_passed = report
+        .global_verification
+        .iter()
+        .filter(|r| r.passed)
+        .count();
     let global_total = report.global_verification.len();
 
     // ─── Header ──────────────────────────────────────────────────────────────
     eprintln!();
     eprintln!(
         "{}",
-        "╔══════════════════════════════════════════════════════════╗"
-            .cyan()
+        "╔══════════════════════════════════════════════════════════╗".cyan()
     );
 
     // Goal (truncate if too long)
@@ -419,8 +374,7 @@ fn display_delivery_report(report: &TaskDeliveryReport) {
     // ─── Subtask Results ─────────────────────────────────────────────────────
     eprintln!(
         "{}",
-        "╠══════════════════════════════════════════════════════════╣"
-            .cyan()
+        "╠══════════════════════════════════════════════════════════╣".cyan()
     );
 
     for sub in &report.subtask_summaries {
@@ -450,8 +404,7 @@ fn display_delivery_report(report: &TaskDeliveryReport) {
     if !report.global_verification.is_empty() {
         eprintln!(
             "{}",
-            "╠──────────────────────────────────────────────────────────╣"
-                .cyan()
+            "╠──────────────────────────────────────────────────────────╣".cyan()
         );
         eprintln!(
             "{}  🔬 Global checks: {}/{}",
@@ -471,21 +424,14 @@ fn display_delivery_report(report: &TaskDeliveryReport) {
             } else {
                 String::new()
             };
-            eprintln!(
-                "{}      {} {}{}",
-                "║".cyan(),
-                styled,
-                r.criterion_id,
-                dur,
-            );
+            eprintln!("{}      {} {}{}", "║".cyan(), styled, r.criterion_id, dur,);
         }
     }
 
     // ─── Metrics ─────────────────────────────────────────────────────────────
     eprintln!(
         "{}",
-        "╠──────────────────────────────────────────────────────────╣"
-            .cyan()
+        "╠──────────────────────────────────────────────────────────╣".cyan()
     );
 
     let mut metrics = Vec::new();
@@ -505,8 +451,7 @@ fn display_delivery_report(report: &TaskDeliveryReport) {
     if !report.risks.is_empty() {
         eprintln!(
             "{}",
-            "╠──────────────────────────────────────────────────────────╣"
-                .cyan()
+            "╠──────────────────────────────────────────────────────────╣".cyan()
         );
         for risk in &report.risks {
             eprintln!("{}  ⚠ {}", "║".cyan(), risk.clone().yellow());
@@ -516,8 +461,7 @@ fn display_delivery_report(report: &TaskDeliveryReport) {
     // ─── Footer ──────────────────────────────────────────────────────────────
     eprintln!(
         "{}",
-        "╚══════════════════════════════════════════════════════════╝"
-            .cyan()
+        "╚══════════════════════════════════════════════════════════╝".cyan()
     );
 }
 
@@ -578,8 +522,7 @@ impl HttpLlmJudge {
         let base_url = std::env::var("MO_LLM_BASE_URL")
             .or_else(|_| std::env::var("OPENAI_BASE_URL"))
             .unwrap_or_else(|_| "https://api.openai.com/v1".into());
-        let model = std::env::var("MO_LLM_MODEL")
-            .unwrap_or_else(|_| "gpt-4o-mini".into());
+        let model = std::env::var("MO_LLM_MODEL").unwrap_or_else(|_| "gpt-4o-mini".into());
         Some(Self::new(api_key, base_url, model))
     }
 }
@@ -609,10 +552,7 @@ impl mo_agent_services::LlmJudge for HttpLlmJudge {
             "temperature": 0.1,
         });
 
-        let url = format!(
-            "{}/chat/completions",
-            self.base_url.trim_end_matches('/')
-        );
+        let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
 
         let resp = self
             .client
@@ -627,7 +567,10 @@ impl mo_agent_services::LlmJudge for HttpLlmJudge {
         if !resp.status().is_success() {
             let status = resp.status();
             let text = resp.text().await.unwrap_or_default();
-            return Err(format!("LLM API error {status}: {}", &text[..text.len().min(200)]));
+            return Err(format!(
+                "LLM API error {status}: {}",
+                &text[..text.len().min(200)]
+            ));
         }
 
         let json: serde_json::Value = resp
@@ -651,31 +594,31 @@ impl mo_agent_services::LlmJudge for HttpLlmJudge {
 /// a decimal number in the text.
 fn parse_judge_score(text: &str) -> Result<f64, String> {
     // Try JSON parse first
-    if let Ok(v) = serde_json::from_str::<serde_json::Value>(text) {
-        if let Some(score) = v["score"].as_f64() {
-            return Ok(score.clamp(0.0, 1.0));
-        }
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(text)
+        && let Some(score) = v["score"].as_f64()
+    {
+        return Ok(score.clamp(0.0, 1.0));
     }
 
     // Try to find JSON embedded in text (e.g., wrapped with markdown)
-    if let Some(start) = text.find('{') {
-        if let Some(end) = text[start..].rfind('}') {
-            let json_str = &text[start..=start + end];
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(json_str) {
-                if let Some(score) = v["score"].as_f64() {
-                    return Ok(score.clamp(0.0, 1.0));
-                }
-            }
+    if let Some(start) = text.find('{')
+        && let Some(end) = text[start..].rfind('}')
+    {
+        let json_str = &text[start..=start + end];
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(json_str)
+            && let Some(score) = v["score"].as_f64()
+        {
+            return Ok(score.clamp(0.0, 1.0));
         }
     }
 
     // Fallback: find any decimal number between 0 and 1
     for word in text.split_whitespace() {
         let clean = word.trim_matches(|c: char| !c.is_ascii_digit() && c != '.');
-        if let Ok(n) = clean.parse::<f64>() {
-            if (0.0..=1.0).contains(&n) {
-                return Ok(n);
-            }
+        if let Ok(n) = clean.parse::<f64>()
+            && (0.0..=1.0).contains(&n)
+        {
+            return Ok(n);
         }
     }
 
@@ -800,7 +743,8 @@ mod tests {
 
     #[test]
     fn parse_judge_score_json_in_markdown() {
-        let text = "Here is my evaluation:\n```json\n{\"score\": 0.7, \"reason\": \"mostly ok\"}\n```";
+        let text =
+            "Here is my evaluation:\n```json\n{\"score\": 0.7, \"reason\": \"mostly ok\"}\n```";
         let score = parse_judge_score(text).unwrap();
         assert!((score - 0.7).abs() < 0.001);
     }

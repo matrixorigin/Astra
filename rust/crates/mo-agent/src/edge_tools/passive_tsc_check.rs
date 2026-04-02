@@ -134,6 +134,7 @@ pub(crate) async fn take_passive_tsc_messages(
     ))]
 }
 
+#[allow(dead_code)]
 fn tsc_available() -> bool {
     std::process::Command::new("tsc")
         .arg("--version")
@@ -156,7 +157,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         assert!(!should_schedule_passive_tsc(root, Path::new("a.ts")));
-        std::fs::write(root.join("tsconfig.json"), "{\"compilerOptions\":{\"strict\":true}}\n").unwrap();
+        std::fs::write(
+            root.join("tsconfig.json"),
+            "{\"compilerOptions\":{\"strict\":true}}\n",
+        )
+        .unwrap();
         assert!(should_schedule_passive_tsc(root, Path::new("src/index.ts")));
         assert!(should_schedule_passive_tsc(root, Path::new("src/App.tsx")));
         assert!(!should_schedule_passive_tsc(root, Path::new("src/x.js")));
@@ -185,21 +190,14 @@ mod tests {
             r#"{"compilerOptions":{"strict":true,"noEmit":true},"include":["*.ts"]}"#,
         )
         .unwrap();
-        std::fs::write(
-            root.join("bad.ts"),
-            "const x: string = 42;\n",
-        )
-        .unwrap();
+        std::fs::write(root.join("bad.ts"), "const x: string = 42;\n").unwrap();
 
         let pending = AtomicBool::new(true);
         let msgs = take_passive_tsc_messages(&pending, root, true).await;
         assert_eq!(msgs.len(), 1);
         let c = msgs[0]["content"].as_str().unwrap();
         assert!(c.contains("<new-diagnostics>"), "{c}");
-        assert!(
-            c.contains("error TS") || c.contains("TypeScript"),
-            "{c}"
-        );
+        assert!(c.contains("error TS") || c.contains("TypeScript"), "{c}");
         assert!(!pending.load(Ordering::SeqCst));
     }
 
@@ -250,7 +248,8 @@ mod tests {
             .take_passive_workspace_diagnostic_messages(root, true)
             .await;
         assert!(
-            msgs.iter().any(|m| m["attachment_metadata"]["source"] == "tsc_no_emit"),
+            msgs.iter()
+                .any(|m| m["attachment_metadata"]["source"] == "tsc_no_emit"),
             "{msgs:?}"
         );
     }

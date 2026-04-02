@@ -58,9 +58,7 @@ fn detect_stop_hooks(
 
     // Detect available project tools (used as context hints, not hardcoded commands)
     let mut tool_hints = Vec::new();
-    if project_root.join("rust/Cargo.toml").exists() {
-        tool_hints.push("Rust/Cargo (cargo check, cargo test)");
-    } else if project_root.join("Cargo.toml").exists() {
+    if project_root.join("rust/Cargo.toml").exists() || project_root.join("Cargo.toml").exists() {
         tool_hints.push("Rust/Cargo (cargo check, cargo test)");
     }
     if project_root.join("package.json").exists() {

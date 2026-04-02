@@ -2024,10 +2024,15 @@ type Handler interface {
         let executor = test_executor_in(dir.path());
         // Full read should be rejected
         let full = executor.read_file(&serde_json::json!({"path": "big.txt"}));
-        assert!(full.contains("too large"), "full read should be rejected: {}", &full[..100.min(full.len())]);
+        assert!(
+            full.contains("too large"),
+            "full read should be rejected: {}",
+            &full[..100.min(full.len())]
+        );
 
         // Ranged read should succeed
-        let ranged = executor.read_file(&serde_json::json!({"path": "big.txt", "start_line": 1, "end_line": 10}));
+        let ranged = executor
+            .read_file(&serde_json::json!({"path": "big.txt", "start_line": 1, "end_line": 10}));
         assert!(!ranged.contains("too large"), "ranged read should succeed");
         assert!(ranged.contains("line 0"), "should contain first line");
     }
@@ -2045,7 +2050,10 @@ type Handler interface {
 
         let executor = test_executor_in(dir.path());
         let outline = executor.read_file(&serde_json::json!({"path": "big.rs", "outline": true}));
-        assert!(!outline.contains("too large"), "outline should bypass size gate");
+        assert!(
+            !outline.contains("too large"),
+            "outline should bypass size gate"
+        );
     }
 
     // ── Bug fix: auto-expand respects size gate ──────────────────────────────
@@ -2062,12 +2070,18 @@ type Handler interface {
 
         let executor = test_executor_in(dir.path());
         // First ranged read
-        let r1 = executor.read_file(&serde_json::json!({"path": "big.txt", "start_line": 1, "end_line": 5}));
+        let r1 = executor
+            .read_file(&serde_json::json!({"path": "big.txt", "start_line": 1, "end_line": 5}));
         assert!(r1.contains("line 0"), "first range should work");
 
         // Second ranged read — should NOT auto-expand (file too large)
-        let r2 = executor.read_file(&serde_json::json!({"path": "big.txt", "start_line": 10, "end_line": 15}));
-        assert!(!r2.contains("Auto-expanded"), "should NOT auto-expand large file: {}", &r2[..100.min(r2.len())]);
+        let r2 = executor
+            .read_file(&serde_json::json!({"path": "big.txt", "start_line": 10, "end_line": 15}));
+        assert!(
+            !r2.contains("Auto-expanded"),
+            "should NOT auto-expand large file: {}",
+            &r2[..100.min(r2.len())]
+        );
     }
 
     // ── Bug fix: ranged reads don't increment read_count ─────────────────────
@@ -2096,8 +2110,14 @@ type Handler interface {
             "start_line": 60,
             "end_line": 65
         }));
-        assert!(!last.contains("read 4+ times"), "ranged reads should not trigger warning");
-        assert!(!last.contains("read 3 times"), "ranged reads should not trigger warning");
+        assert!(
+            !last.contains("read 4+ times"),
+            "ranged reads should not trigger warning"
+        );
+        assert!(
+            !last.contains("read 3 times"),
+            "ranged reads should not trigger warning"
+        );
     }
 
     // ── read_file not-found hints ────────────────────────────────────────────

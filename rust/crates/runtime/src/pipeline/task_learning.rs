@@ -15,7 +15,7 @@ use mo_agent_services::durable_task::{
 };
 
 use crate::pipeline::calibration::ProgressiveCalibrator;
-use crate::pipeline::entity::{extract_entities, EntityGraph};
+use crate::pipeline::entity::{EntityGraph, extract_entities};
 use crate::pipeline::pattern::PatternLibrary;
 use crate::pipeline::routing::{DomainHint, TaskType};
 
@@ -110,34 +110,33 @@ impl TaskLearningBridge for PipelineTaskLearningBridge {
         let feedback = signal.user_rating.map(|r| r as i64);
 
         // 1. EntityGraph: learn entity → domain → tools associations
-        if signal.success {
-            if let Some(eg) = &self.entity_graph {
-                let mut graph = eg.lock().unwrap_or_else(|e| e.into_inner());
-                // Extract entities from the task goal
-                let entities = extract_entities(&signal.goal);
+        if signal.success
+            && let Some(eg) = &self.entity_graph
+        {
+            let mut graph = eg.lock().unwrap_or_else(|e| e.into_inner());
+            // Extract entities from the task goal
+            let entities = extract_entities(&signal.goal);
+            if let Some(d) = domain {
+                for entity in &entities {
+                    graph.learn(entity, d, &signal.tools_used, feedback);
+                }
+            }
+            // Also learn from subtask titles (finer-grained entities)
+            for sub in &signal.subtask_outcomes {
+                let sub_entities = extract_entities(&sub.title);
                 if let Some(d) = domain {
-                    for entity in &entities {
-                        graph.learn(entity, d, &signal.tools_used, feedback);
+                    for entity in &sub_entities {
+                        graph.learn(entity, d, &sub.tools_used, feedback);
                     }
                 }
-                // Also learn from subtask titles (finer-grained entities)
-                for sub in &signal.subtask_outcomes {
-                    let sub_entities = extract_entities(&sub.title);
-                    if let Some(d) = domain {
-                        for entity in &sub_entities {
-                            graph.learn(entity, d, &sub.tools_used, feedback);
-                        }
-                    }
-                    // Learn from file paths as entities
-                    for file in &sub.files_modified {
-                        if let Some(stem) = std::path::Path::new(file)
-                            .file_stem()
-                            .and_then(|s| s.to_str())
-                        {
-                            if let Some(d) = domain {
-                                graph.learn(stem, d, &sub.tools_used, feedback);
-                            }
-                        }
+                // Learn from file paths as entities
+                for file in &sub.files_modified {
+                    if let Some(stem) = std::path::Path::new(file)
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        && let Some(d) = domain
+                    {
+                        graph.learn(stem, d, &sub.tools_used, feedback);
                     }
                 }
             }
@@ -162,9 +161,9 @@ impl TaskLearningBridge for PipelineTaskLearningBridge {
             // Also record per-subtask patterns (if they have distinct tools)
             for sub in &signal.subtask_outcomes {
                 if !sub.tools_used.is_empty() {
-                    let sub_quality = sub
-                        .verification_pass_rate
-                        .unwrap_or(if sub.success { 0.7 } else { 0.2 });
+                    let sub_quality =
+                        sub.verification_pass_rate
+                            .unwrap_or(if sub.success { 0.7 } else { 0.2 });
                     lib.record_outcome(
                         &sub.tools_used,
                         task_type,
@@ -204,7 +203,8 @@ impl TaskLearningBridge for PipelineTaskLearningBridge {
         }
 
         // Build a template signature from the subtask structure
-        let subtask_titles: Vec<&str> = contract.subtasks.iter().map(|s| s.title.as_str()).collect();
+        let subtask_titles: Vec<&str> =
+            contract.subtasks.iter().map(|s| s.title.as_str()).collect();
         let template_name = format!(
             "learned_{}",
             contract
@@ -292,7 +292,9 @@ impl TaskLearningBridge for PipelineTaskLearningBridge {
             .iter()
             .filter(|p| {
                 let sig_lower = p.signature.to_lowercase();
-                entities.iter().any(|e| sig_lower.contains(&e.to_lowercase()))
+                entities
+                    .iter()
+                    .any(|e| sig_lower.contains(&e.to_lowercase()))
             })
             .collect();
 
@@ -338,17 +340,15 @@ mod tests {
             success,
             user_rating: Some(85),
             tools_used: vec!["read_file".into(), "str_replace".into(), "bash".into()],
-            subtask_outcomes: vec![
-                mo_agent_services::durable_task::SubtaskOutcomeSignal {
-                    subtask_id: "s1".into(),
-                    title: "add JWT module".into(),
-                    success: true,
-                    retry_count: 0,
-                    tools_used: vec!["read_file".into(), "str_replace".into()],
-                    verification_pass_rate: Some(1.0),
-                    files_modified: vec!["src/auth.rs".into()],
-                },
-            ],
+            subtask_outcomes: vec![mo_agent_services::durable_task::SubtaskOutcomeSignal {
+                subtask_id: "s1".into(),
+                title: "add JWT module".into(),
+                success: true,
+                retry_count: 0,
+                tools_used: vec!["read_file".into(), "str_replace".into()],
+                verification_pass_rate: Some(1.0),
+                files_modified: vec!["src/auth.rs".into()],
+            }],
             total_verification_attempts: 1,
             total_retries: 0,
             total_turns: 5,
@@ -363,11 +363,7 @@ mod tests {
         let pl = Arc::new(Mutex::new(PatternLibrary::new()));
         let cal = Arc::new(Mutex::new(ProgressiveCalibrator::new(0.7)));
 
-        let bridge = PipelineTaskLearningBridge::from_shared(
-            eg.clone(),
-            pl.clone(),
-            cal.clone(),
-        );
+        let bridge = PipelineTaskLearningBridge::from_shared(eg.clone(), pl.clone(), cal.clone());
 
         let signal = make_signal(true);
         bridge.learn_from_task_outcome(&signal).await.unwrap();
@@ -376,13 +372,19 @@ mod tests {
         {
             let graph = eg.lock().unwrap();
             // "jwt" and "auth" should be extracted from "implement JWT auth"
-            assert!(graph.len() > 0, "entity graph should have learned entities");
+            assert!(
+                !graph.is_empty(),
+                "entity graph should have learned entities"
+            );
         }
 
         // Verify pattern library was updated
         {
             let lib = pl.lock().unwrap();
-            assert!(lib.len() > 0, "pattern library should have recorded outcome");
+            assert!(
+                !lib.is_empty(),
+                "pattern library should have recorded outcome"
+            );
         }
 
         // Verify calibrator was updated
@@ -401,11 +403,7 @@ mod tests {
         let pl = Arc::new(Mutex::new(PatternLibrary::new()));
         let cal = Arc::new(Mutex::new(ProgressiveCalibrator::new(0.7)));
 
-        let bridge = PipelineTaskLearningBridge::from_shared(
-            eg.clone(),
-            pl.clone(),
-            cal.clone(),
-        );
+        let bridge = PipelineTaskLearningBridge::from_shared(eg.clone(), pl.clone(), cal.clone());
 
         let signal = make_signal(false);
         bridge.learn_from_task_outcome(&signal).await.unwrap();
@@ -413,13 +411,20 @@ mod tests {
         // Failed tasks should NOT update entity graph (only on success)
         {
             let graph = eg.lock().unwrap();
-            assert_eq!(graph.len(), 0, "entity graph should NOT learn from failures");
+            assert_eq!(
+                graph.len(),
+                0,
+                "entity graph should NOT learn from failures"
+            );
         }
 
         // But pattern library SHOULD record failures
         {
             let lib = pl.lock().unwrap();
-            assert!(lib.len() > 0, "pattern library should record failures too");
+            assert!(
+                !lib.is_empty(),
+                "pattern library should record failures too"
+            );
         }
     }
 
@@ -496,21 +501,32 @@ mod tests {
         };
 
         let result = bridge.extract_template(&contract, &report).await.unwrap();
-        assert!(result.is_none(), "single subtask should not produce template");
+        assert!(
+            result.is_none(),
+            "single subtask should not produce template"
+        );
 
         // Multi-subtask success → template extracted
         let mut contract2 = contract.clone();
-        contract2.subtasks.push(mo_agent_services::durable_task::DurableSubtask {
-            id: "s2".into(),
-            title: "second".into(),
-            stage: mo_agent_services::durable_task::SubtaskStage::Verified,
-            ..Default::default()
-        });
+        contract2
+            .subtasks
+            .push(mo_agent_services::durable_task::DurableSubtask {
+                id: "s2".into(),
+                title: "second".into(),
+                stage: mo_agent_services::durable_task::SubtaskStage::Verified,
+                ..Default::default()
+            });
 
         let result = bridge.extract_template(&contract2, &report).await.unwrap();
-        assert!(result.is_some(), "multi-subtask success should produce template");
+        assert!(
+            result.is_some(),
+            "multi-subtask success should produce template"
+        );
         let tmpl = result.unwrap();
-        assert!(tmpl.contains("learned_"), "template should have learned_ prefix");
+        assert!(
+            tmpl.contains("learned_"),
+            "template should have learned_ prefix"
+        );
     }
 
     #[tokio::test]
@@ -520,7 +536,13 @@ mod tests {
         // All operations should succeed with empty/default results
         let signal = make_signal(true);
         assert!(bridge.learn_from_task_outcome(&signal).await.is_ok());
-        assert!(bridge.suggest_tools("test", None, None).await.unwrap().is_empty());
+        assert!(
+            bridge
+                .suggest_tools("test", None, None)
+                .await
+                .unwrap()
+                .is_empty()
+        );
         assert!(bridge.task_pattern_stats("test").await.unwrap().is_none());
     }
 
@@ -532,7 +554,10 @@ mod tests {
         assert_eq!(parse_task_type(Some("bogus")), TaskType::Unknown);
 
         assert_eq!(parse_domain_hint(Some("github")), Some(DomainHint::GitHub));
-        assert_eq!(parse_domain_hint(Some("database")), Some(DomainHint::Database));
+        assert_eq!(
+            parse_domain_hint(Some("database")),
+            Some(DomainHint::Database)
+        );
         assert_eq!(parse_domain_hint(Some("web")), Some(DomainHint::Web));
         assert!(parse_domain_hint(None).is_none());
         assert!(parse_domain_hint(Some("bogus")).is_none());

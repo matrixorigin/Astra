@@ -113,19 +113,15 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
 
     let passive_msgs = ctx
         .executor
-        .take_passive_workspace_diagnostic_messages(
-            ctx.project_root,
-            !ctx.tool_results.is_empty(),
-        )
+        .take_passive_workspace_diagnostic_messages(ctx.project_root, !ctx.tool_results.is_empty())
         .await;
-    if !passive_msgs.is_empty() {
-        if let Some(root) = payload.as_object_mut()
-            && let Some(messages) = root.get_mut("messages")
-            && let Some(arr) = messages.as_array_mut()
-        {
-            for m in passive_msgs {
-                arr.push(m);
-            }
+    if !passive_msgs.is_empty()
+        && let Some(root) = payload.as_object_mut()
+        && let Some(messages) = root.get_mut("messages")
+        && let Some(arr) = messages.as_array_mut()
+    {
+        for m in passive_msgs {
+            arr.push(m);
         }
     }
 
