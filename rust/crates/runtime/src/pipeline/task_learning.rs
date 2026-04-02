@@ -22,10 +22,13 @@ use crate::pipeline::routing::{DomainHint, TaskType};
 /// Concrete implementation of [`TaskLearningBridge`] backed by pipeline learning modules.
 ///
 /// Mirrors the builder pattern of [`PipelineLearningWriter`] — all modules are optional.
+/// When `cloud_pool` is set, extracted templates are persisted to the `plan_templates` table.
 pub struct PipelineTaskLearningBridge {
     entity_graph: Option<Arc<Mutex<EntityGraph>>>,
     pattern_library: Option<Arc<Mutex<PatternLibrary>>>,
     calibrator: Option<Arc<Mutex<ProgressiveCalibrator>>>,
+    cloud_pool: Option<sqlx::Pool<sqlx::MySql>>,
+    user_id: Option<String>,
 }
 
 impl PipelineTaskLearningBridge {
@@ -34,6 +37,8 @@ impl PipelineTaskLearningBridge {
             entity_graph: None,
             pattern_library: None,
             calibrator: None,
+            cloud_pool: None,
+            user_id: None,
         }
     }
 
@@ -52,6 +57,13 @@ impl PipelineTaskLearningBridge {
         self
     }
 
+    /// Set cloud pool + user_id for persisting extracted templates to `plan_templates`.
+    pub fn with_cloud_pool(mut self, pool: sqlx::Pool<sqlx::MySql>, user_id: &str) -> Self {
+        self.cloud_pool = Some(pool);
+        self.user_id = Some(user_id.to_string());
+        self
+    }
+
     /// Build from the same shared modules used by PipelineLearningWriter.
     pub fn from_shared(
         entity_graph: Arc<Mutex<EntityGraph>>,
@@ -62,6 +74,8 @@ impl PipelineTaskLearningBridge {
             entity_graph: Some(entity_graph),
             pattern_library: Some(pattern_library),
             calibrator: Some(calibrator),
+            cloud_pool: None,
+            user_id: None,
         }
     }
 }
@@ -231,7 +245,33 @@ impl TaskLearningBridge for PipelineTaskLearningBridge {
             "global_verification_count": contract.global_verification.len(),
         });
 
-        Ok(Some(template_json.to_string()))
+        let json_str = template_json.to_string();
+
+        // Persist to plan_templates table if cloud pool is available
+        if let (Some(pool), Some(user_id)) = (&self.cloud_pool, &self.user_id) {
+            let template_id = uuid::Uuid::new_v4().to_string();
+            let goal_pattern: String = contract
+                .goal
+                .to_lowercase()
+                .chars()
+                .take(500)
+                .collect();
+            let _ = sqlx::query(
+                "INSERT INTO plan_templates (template_id, user_id, goal_pattern, template_json, success_rate, use_count) \
+                 VALUES (?, ?, ?, ?, 1.0, 0) \
+                 ON DUPLICATE KEY UPDATE template_json = VALUES(template_json), \
+                 success_rate = LEAST(success_rate + 0.1, 1.0), updated_at = NOW(6)",
+            )
+            .bind(&template_id)
+            .bind(user_id)
+            .bind(&goal_pattern)
+            .bind(&json_str)
+            .execute(pool)
+            .await
+            .map_err(|e| format!("template persist: {e}"));
+        }
+
+        Ok(Some(json_str))
     }
 
     async fn suggest_tools(
