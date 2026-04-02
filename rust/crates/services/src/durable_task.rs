@@ -556,7 +556,7 @@ impl VerificationRunner {
                 pass_threshold,
             } => {
                 if let Some(judge) = &self.llm_judge {
-                    let context = format!("Work directory: {}", self.work_dir.display());
+                    let context = self.build_judge_context(prompt).await;
                     match judge.evaluate(prompt, &context).await {
                         Ok(score) => {
                             let passed = score >= *pass_threshold;
@@ -607,6 +607,82 @@ impl VerificationRunner {
             }
         }
     }
+
+    /// Build rich context for LLM judge evaluation.
+    ///
+    /// Gathers: git diff (recent changes), relevant file snippets, directory listing.
+    /// Capped at ~8KB to stay within token budgets.
+    async fn build_judge_context(&self, prompt: &str) -> String {
+        let mut parts = Vec::new();
+        let dir = self.work_dir.clone();
+
+        parts.push(format!("Work directory: {}", dir.display()));
+
+        // 1. Git diff (uncommitted changes) — most relevant for "did the code change correctly?"
+        if let Ok(diff) = Self::git_diff(&dir).await {
+            if !diff.is_empty() {
+                parts.push(format!("## Recent changes (git diff):\n```\n{}\n```", truncate(&diff, 4096)));
+            }
+        }
+
+        // 2. Extract file paths mentioned in the prompt and include snippets
+        let mentioned_files = extract_paths_from_text(prompt);
+        for path_str in mentioned_files.iter().take(3) {
+            let full_path = dir.join(path_str);
+            if full_path.exists() && full_path.is_file() {
+                if let Ok(content) = std::fs::read_to_string(&full_path) {
+                    parts.push(format!(
+                        "## File: {path_str}\n```\n{}\n```",
+                        truncate(&content, 2048)
+                    ));
+                }
+            }
+        }
+
+        // 3. Directory listing (top-level) for orientation
+        if let Ok(entries) = std::fs::read_dir(&dir) {
+            let listing: Vec<String> = entries
+                .filter_map(|e| e.ok())
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .take(30)
+                .collect();
+            if !listing.is_empty() {
+                parts.push(format!("## Directory contents:\n{}", listing.join(", ")));
+            }
+        }
+
+        parts.join("\n\n")
+    }
+
+    /// Get git diff for uncommitted changes.
+    async fn git_diff(dir: &std::path::Path) -> Result<String, String> {
+        let dir = dir.to_path_buf();
+        tokio::task::spawn_blocking(move || {
+            let output = std::process::Command::new("git")
+                .args(["diff", "--stat", "--no-color", "HEAD"])
+                .current_dir(&dir)
+                .output()
+                .map_err(|e| format!("git diff failed: {e}"))?;
+            Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+        })
+        .await
+        .map_err(|e| format!("spawn: {e}"))?
+    }
+}
+
+/// Extract file paths from text (heuristic: words with '/' or known extensions).
+fn extract_paths_from_text(text: &str) -> Vec<String> {
+    let extensions = [
+        ".rs", ".py", ".ts", ".tsx", ".js", ".jsx", ".go", ".java", ".rb",
+        ".cpp", ".c", ".h", ".toml", ".yaml", ".yml", ".json", ".sql", ".sh",
+    ];
+    text.split_whitespace()
+        .map(|w| w.trim_matches(|c: char| c == '`' || c == '\'' || c == '"' || c == ','))
+        .filter(|w| {
+            w.contains('/') || extensions.iter().any(|ext| w.ends_with(ext))
+        })
+        .map(String::from)
+        .collect()
 }
 
 /// Run a shell command via spawn_blocking (no tokio::process feature needed).
@@ -4059,6 +4135,19 @@ mod tests {
         }
     }
 
+    /// Mock that captures the context string for inspection.
+    struct ContextCapturingJudge {
+        captured: std::sync::Mutex<Option<String>>,
+    }
+
+    #[async_trait]
+    impl LlmJudge for ContextCapturingJudge {
+        async fn evaluate(&self, _prompt: &str, context: &str) -> Result<f64, String> {
+            *self.captured.lock().unwrap() = Some(context.to_string());
+            Ok(0.9)
+        }
+    }
+
     #[tokio::test]
     async fn llm_judge_passes_when_score_above_threshold() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -4158,5 +4247,49 @@ mod tests {
         let result = runner.run_criterion(&criterion).await;
         assert!(!result.passed, "API error → should fail");
         assert!(result.evidence.contains("rate limited"));
+    }
+
+    #[tokio::test]
+    async fn llm_judge_context_includes_file_contents() {
+        let tmp = tempfile::TempDir::new().unwrap();
+
+        // Create a file that the prompt references
+        let src_dir = tmp.path().join("src");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        std::fs::write(src_dir.join("auth.rs"), "pub fn authenticate() { /* ... */ }").unwrap();
+
+        let judge = Arc::new(ContextCapturingJudge {
+            captured: std::sync::Mutex::new(None),
+        });
+        let runner = VerificationRunner::with_llm_judge(tmp.path().to_path_buf(), judge.clone());
+
+        let criterion = VerificationCriterion {
+            id: "ctx-1".into(),
+            description: "check auth quality".into(),
+            verifier: VerifierKind::LlmJudge {
+                prompt: "Does src/auth.rs follow best practices?".into(),
+                pass_threshold: 0.5,
+            },
+            required: true,
+            timeout_sec: 30,
+            global_only: true,
+        };
+
+        let result = runner.run_criterion(&criterion).await;
+        assert!(result.passed);
+
+        let context = judge.captured.lock().unwrap().clone().unwrap();
+        assert!(
+            context.contains("authenticate"),
+            "context should include file contents: {context}"
+        );
+        assert!(
+            context.contains("src/auth.rs"),
+            "context should reference the file path: {context}"
+        );
+        assert!(
+            context.contains("Directory contents"),
+            "context should include directory listing: {context}"
+        );
     }
 }
