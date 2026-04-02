@@ -638,7 +638,9 @@ async fn handle_chat_message_via_bridge(
     // base64 URL-safe encoding guarantees valid header chars
     bridge_headers.insert(
         HeaderName::from_static("x-mo-username-b64"),
-        HeaderValue::from_str(&username_b64).expect("base64 is always valid header value"),
+        // URL-safe base64 guarantees valid header chars; fallback is defensive only.
+        HeaderValue::from_str(&username_b64)
+            .unwrap_or_else(|_| HeaderValue::from_static("unknown")),
     );
     bridge_headers.insert(
         HeaderName::from_static("x-mo-bridge-capabilities"),
