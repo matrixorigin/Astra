@@ -55,6 +55,8 @@ mod diff_presenter;
 mod durable_bridge;
 #[path = "mo_agent/edge_lifecycle.rs"]
 mod edge_lifecycle;
+#[path = "mo_agent/event_loop.rs"]
+mod event_loop;
 #[path = "mo_agent/permission_manager.rs"]
 mod permission_manager;
 #[path = "mo_agent/repl_runtime.rs"]
