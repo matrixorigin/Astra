@@ -155,6 +155,10 @@ fn parse_acceptance_to_criteria(
             criteria.push(c);
         } else if let Some(c) = try_parse_file_exists_criterion(&crit_id, part, &part_lower) {
             criteria.push(c);
+        } else if let Some(c) = try_parse_command_output_criterion(&crit_id, part, &part_lower) {
+            criteria.push(c);
+        } else if let Some(c) = try_parse_permission_criterion(&crit_id, part, &part_lower) {
+            criteria.push(c);
         } else {
             // Fallback: LLM judge for semantic criteria (deferred — not yet implemented)
             criteria.push(VerificationCriterion {
@@ -297,6 +301,112 @@ fn try_parse_grep_criterion(
             file: paths[0].clone(),
             pattern: quoted[0].clone(),
             should_match: !lower.contains("not contain") && !lower.contains("should not"),
+        },
+        required: true,
+        timeout_sec: 10,
+        global_only: false, // lightweight — run per-subtask
+    })
+}
+
+/// Match "Command X outputs 'Y'" or "Running X produces 'Y'" patterns.
+///
+/// Generates a `CommandOutput` verifier that runs the command and checks stdout
+/// contains the expected string. Covers acceptance criteria like:
+/// - "Command /tmp/hellosh outputs 'hello china'"
+/// - "Running the script produces 'hello world!' output"
+/// - "/tmp/foo prints 'bar'"
+fn try_parse_command_output_criterion(
+    id: &str,
+    desc: &str,
+    lower: &str,
+) -> Option<VerificationCriterion> {
+    let has_output_keyword = lower.contains("output")
+        || lower.contains("produce")
+        || lower.contains("print")
+        || lower.contains("return");
+    let has_run_keyword = lower.contains("run")
+        || lower.contains("execut")
+        || lower.contains("command")
+        || lower.contains("script");
+
+    if !has_output_keyword && !has_run_keyword {
+        return None;
+    }
+
+    // Need at least a file path (the command) OR a quoted expected output
+    let paths = extract_file_paths(desc);
+    let quoted = extract_quoted_strings(desc);
+
+    if paths.is_empty() && quoted.is_empty() {
+        return None;
+    }
+
+    // Build the command: prefer file path, fallback to first word after "run"/"execute"
+    let cmd = if !paths.is_empty() {
+        paths[0].clone()
+    } else {
+        return None; // Can't determine what command to run
+    };
+
+    // Build expected output check
+    let contains: Vec<String> = quoted.clone();
+    let not_contains = if lower.contains("without error") || lower.contains("no error") {
+        vec!["error".to_string()]
+    } else {
+        vec![]
+    };
+
+    // Only create verifier if we have something to check
+    if contains.is_empty() && not_contains.is_empty() {
+        return None;
+    }
+
+    Some(VerificationCriterion {
+        id: id.to_string(),
+        description: desc.to_string(),
+        verifier: VerifierKind::CommandOutput {
+            cmd,
+            contains,
+            not_contains,
+        },
+        required: true,
+        timeout_sec: 30,
+        global_only: false, // lightweight — run per-subtask
+    })
+}
+
+/// Match permission/executable criteria.
+///
+/// Generates a `Command` verifier using `test -x <file>` (exit 0 = executable).
+/// Covers acceptance criteria like:
+/// - "Script has executable permissions (ls -l shows x bits)"
+/// - "ls -l shows executable permissions"
+/// - "File is executable"
+fn try_parse_permission_criterion(
+    id: &str,
+    desc: &str,
+    lower: &str,
+) -> Option<VerificationCriterion> {
+    let has_perm_keyword = lower.contains("permission")
+        || lower.contains("executable")
+        || lower.contains("chmod")
+        || lower.contains("x bit");
+
+    if !has_perm_keyword {
+        return None;
+    }
+
+    let paths = extract_file_paths(desc);
+    if paths.is_empty() {
+        return None;
+    }
+
+    Some(VerificationCriterion {
+        id: id.to_string(),
+        description: desc.to_string(),
+        verifier: VerifierKind::Command {
+            cmd: format!("test -x {}", paths[0]),
+            expected_exit: 0,
         },
         required: true,
         timeout_sec: 10,
@@ -892,21 +1002,100 @@ mod tests {
             .any(|c| matches!(&c.verifier, VerifierKind::FileExists { .. }));
         assert!(has_file, "should detect FileExists verifier for acceptance text with 'file exists'");
 
-        // Subtask 2: "ls -l shows executable permissions"
+        // Subtask 2: "ls -l shows executable permissions" → Permission verifier
         let c2 = parse_acceptance_to_criteria(
-            "ls -l shows executable permissions (x bits set) on the file",
+            "Script has executable permissions (ls -l shows x bits) on /tmp/helloworld.sh",
             "make-exec",
             &det,
         );
-        // This falls to LlmJudge since no keyword matcher covers "permissions"
         assert!(!c2.is_empty(), "should have at least one criterion");
+        let has_perm = c2
+            .iter()
+            .any(|c| matches!(&c.verifier, VerifierKind::Command { .. }));
+        assert!(has_perm, "should detect Command verifier for permission check");
+        assert!(!c2[0].global_only, "permission check should run per-subtask");
 
-        // Subtask 3: "Running the script produces 'hello world!'"
+        // Subtask 3: "Running the script produces 'hello world!'" → CommandOutput
         let c3 = parse_acceptance_to_criteria(
-            "Running the script produces 'hello world!' output without errors",
+            "Running /tmp/helloworld.sh produces 'hello world!' output without errors",
             "verify-exec",
             &det,
         );
         assert!(!c3.is_empty(), "should have at least one criterion");
+        let has_cmd_output = c3
+            .iter()
+            .any(|c| matches!(&c.verifier, VerifierKind::CommandOutput { .. }));
+        assert!(has_cmd_output, "should detect CommandOutput verifier for script execution check");
+        assert!(!c3[0].global_only, "command output check should run per-subtask");
+    }
+
+    #[test]
+    fn parse_command_output_criterion() {
+        let det = ProjectDetection::default();
+
+        // "Command /tmp/foo outputs 'bar'"
+        let c = parse_acceptance_to_criteria(
+            "Command /tmp/foo outputs 'bar'",
+            "s1",
+            &det,
+        );
+        assert_eq!(c.len(), 1);
+        match &c[0].verifier {
+            VerifierKind::CommandOutput { cmd, contains, .. } => {
+                assert_eq!(cmd, "/tmp/foo");
+                assert_eq!(contains, &["bar"]);
+            }
+            other => panic!("expected CommandOutput, got {:?}", other),
+        }
+
+        // "/tmp/script prints 'hello world'"
+        let c = parse_acceptance_to_criteria(
+            "/tmp/script prints 'hello world'",
+            "s2",
+            &det,
+        );
+        assert_eq!(c.len(), 1);
+        assert!(matches!(&c[0].verifier, VerifierKind::CommandOutput { .. }));
+
+        // "execute /tmp/run and output should contain 'done'"
+        let c = parse_acceptance_to_criteria(
+            "execute /tmp/run and output should contain 'done'",
+            "s3",
+            &det,
+        );
+        assert!(!c.is_empty());
+        let has_cmd = c.iter().any(|c| matches!(&c.verifier, VerifierKind::CommandOutput { .. }));
+        assert!(has_cmd, "should detect command output pattern");
+    }
+
+    #[test]
+    fn parse_permission_criterion() {
+        let det = ProjectDetection::default();
+
+        // "Script has executable permissions on /tmp/foo.sh"
+        let c = parse_acceptance_to_criteria(
+            "Script has executable permissions on /tmp/foo.sh",
+            "s1",
+            &det,
+        );
+        assert_eq!(c.len(), 1);
+        match &c[0].verifier {
+            VerifierKind::Command { cmd, expected_exit } => {
+                assert!(cmd.contains("test -x"), "cmd should use test -x");
+                assert!(cmd.contains("/tmp/foo.sh"));
+                assert_eq!(*expected_exit, 0);
+            }
+            other => panic!("expected Command, got {:?}", other),
+        }
+
+        // "chmod +x applied, x bit set on /tmp/bar"
+        let c = parse_acceptance_to_criteria(
+            "chmod +x applied, x bit set on /tmp/bar",
+            "s2",
+            &det,
+        );
+        assert!(!c.is_empty());
+        let has_perm = c.iter().any(|c| matches!(&c.verifier, VerifierKind::Command { .. }));
+        assert!(has_perm, "should detect permission pattern with chmod keyword");
     }
 }
