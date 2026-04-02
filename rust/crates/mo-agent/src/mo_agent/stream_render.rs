@@ -552,7 +552,7 @@ impl StreamRenderState {
     fn tool_start(&mut self, tool: &str, args: &Value) -> usize {
         let idx = self.tool_lines.len();
         let description = self.format_tool_description(tool, args);
-        let line = format!("  ⬢ {description} …");
+        let line = format!("  {} {} …", "⬢".cyan(), description);
         if self.md.is_some() {
             eprintln!("{line}");
             self.stderr_lines += 1;
@@ -858,22 +858,20 @@ impl StreamRenderState {
     /// Update a tool line to show completion status with Cursor-style summary.
     fn tool_done(&mut self, idx: usize, tool: &str, status: &str, duration_ms: u64, output: &str) {
         let output_summary = self.format_output_summary(tool, output, status);
-        // Include duration in the summary for tools that took >100ms
-        let duration_note = if duration_ms >= 100 {
-            format!(" ({duration_ms}ms)")
-        } else {
-            String::new()
-        };
+        let duration_suffix = format_duration_suffix(duration_ms);
         // Cursor-style format: original description with result appended
-        let line = if status == "error" {
+        let (icon, line) = if status == "error" {
             let err_msg = output_summary.unwrap_or_else(|| "failed".to_string());
-            format!("  ✗ {tool}{duration_note} {err_msg}")
+            (
+                format!("{}", "✗".red()),
+                format!("    {}", err_msg.red()),
+            )
         } else {
-            match output_summary {
-                Some(summary) => format!("    {summary}{duration_note}"),
-                None if duration_ms >= 100 => format!("    Done{duration_note}"),
-                None => String::new(), // No summary line for fast tools with no output
-            }
+            let summary_line = match output_summary {
+                Some(summary) => format!("    {}", summary.dim()),
+                None => String::new(),
+            };
+            (format!("{}", "⬢".green()), summary_line)
         };
         if self.md.is_some() {
             if !line.is_empty() {
@@ -883,14 +881,26 @@ impl StreamRenderState {
             return;
         }
         if idx < self.tool_lines.len() {
-            // For success: append summary as second line, keep the original description
             if status != "error" {
-                // Update the first line to remove "…" spinner
+                // Update the first line: swap icon to green ⬢, remove spinner, append duration
                 let first = &self.tool_lines[idx];
-                if first.ends_with(" …") {
-                    self.tool_lines[idx] = first.trim_end_matches(" …").to_string();
-                }
-                // Add summary line if non-empty
+                let base = if first.ends_with(" …") {
+                    first.trim_end_matches(" …").to_string()
+                } else {
+                    first.clone()
+                };
+                // Replace cyan ⬢ with green ⬢
+                let base = base.replacen(
+                    &format!("{}", "⬢".cyan()),
+                    &icon,
+                    1,
+                );
+                let dur = if duration_suffix.is_empty() {
+                    String::new()
+                } else {
+                    format!("{}", duration_suffix.dim())
+                };
+                self.tool_lines[idx] = format!("{base}{dur}");
                 if !line.is_empty() {
                     let insert_pos = idx + 1;
                     if insert_pos <= self.tool_lines.len() {
@@ -898,57 +908,209 @@ impl StreamRenderState {
                     }
                 }
             } else {
-                self.tool_lines[idx] = line;
+                // Error: replace entire line with red icon
+                let first = &self.tool_lines[idx];
+                let base = if first.ends_with(" …") {
+                    first.trim_end_matches(" …").to_string()
+                } else {
+                    first.clone()
+                };
+                let base = base.replacen(
+                    &format!("{}", "⬢".cyan()),
+                    &icon,
+                    1,
+                );
+                self.tool_lines[idx] = base;
+                if !line.is_empty() {
+                    let insert_pos = idx + 1;
+                    if insert_pos <= self.tool_lines.len() {
+                        self.tool_lines.insert(insert_pos, line);
+                    }
+                }
             }
             self.tool_region.update(self.tool_lines.clone());
         }
     }
 
-    /// Format a summary of tool output (single line, max ~50 chars).
+    /// Format a detailed summary of tool output.
+    /// Returns multiple lines for richer context — Cursor-style.
     fn format_output_summary(&self, tool: &str, output: &str, status: &str) -> Option<String> {
         if status == "error" {
             let first_line = output.lines().next().unwrap_or("").trim();
-            return Some(truncate_line(first_line, 50));
+            return Some(truncate_line(first_line, 60));
         }
         let line_count = output.lines().count();
         let byte_size = output.len();
         match tool {
-            "bash" | "shell" => {
-                if line_count <= 1 && byte_size < 50 {
-                    let trimmed = output.trim();
-                    if trimmed.is_empty() {
-                        None
-                    } else {
-                        Some(truncate_line(trimmed, 50))
-                    }
-                } else {
-                    Some(format!("{line_count} lines"))
+            "bash" | "shell" | "run_build_test" => {
+                if output.trim().is_empty() {
+                    return None;
                 }
+                // Show first few meaningful lines of output
+                let meaningful: Vec<&str> = output
+                    .lines()
+                    .map(|l| l.trim())
+                    .filter(|l| !l.is_empty())
+                    .take(3)
+                    .collect();
+                if meaningful.is_empty() {
+                    return None;
+                }
+                let mut parts: Vec<String> = meaningful
+                    .iter()
+                    .map(|l| truncate_line(l, 60))
+                    .collect();
+                let remaining = line_count.saturating_sub(3);
+                if remaining > 0 {
+                    parts.push(format!("… +{remaining} more lines"));
+                }
+                Some(parts.join("\n    "))
             }
-            "read_file" | "view_file" => Some(format!("{line_count} lines")),
+            "read_file" | "view_file" => {
+                Some(format!("{line_count} lines, {}", format_byte_size(byte_size)))
+            }
             "git_log" => {
-                // Count commits (lines starting with a hash-like pattern)
-                let commits = output.lines().filter(|l| !l.trim().is_empty()).count();
-                Some(format!("{commits} commits"))
+                // Show first few commit summaries
+                let commits: Vec<&str> = output
+                    .lines()
+                    .filter(|l| !l.trim().is_empty())
+                    .take(3)
+                    .collect();
+                let total = output.lines().filter(|l| !l.trim().is_empty()).count();
+                let mut parts: Vec<String> = commits
+                    .iter()
+                    .map(|l| truncate_line(l, 60))
+                    .collect();
+                let remaining = total.saturating_sub(3);
+                if remaining > 0 {
+                    parts.push(format!("… +{remaining} more"));
+                }
+                Some(parts.join("\n    "))
             }
             "git_show" | "git_diff" => {
                 let additions = output.lines().filter(|l| l.starts_with('+')).count();
                 let deletions = output.lines().filter(|l| l.starts_with('-')).count();
-                if additions > 0 || deletions > 0 {
-                    Some(format!("+{additions} -{deletions}"))
+                // Extract changed file names only from +++ b/ lines (not diff --git headers)
+                let files: Vec<&str> = output
+                    .lines()
+                    .filter_map(|l| l.strip_prefix("+++ b/"))
+                    .filter(|f| !f.is_empty() && *f != "/dev/null")
+                    .take(5)
+                    .collect();
+                let total_files = output
+                    .lines()
+                    .filter(|l| l.starts_with("+++ b/") && !l.contains("/dev/null"))
+                    .count();
+                let stat = if additions > 0 || deletions > 0 {
+                    format!("{} {}", format!("+{additions}").green(), format!("-{deletions}").red())
                 } else {
-                    Some(format!("{line_count} lines"))
+                    format!("{line_count} lines")
+                };
+                if files.is_empty() {
+                    Some(stat)
+                } else {
+                    let mut summary = format!("{stat} in {total_files} file(s)");
+                    for f in &files {
+                        summary.push_str(&format!("\n      {}", shorten_path(f, 50)));
+                    }
+                    let remaining = total_files.saturating_sub(5);
+                    if remaining > 0 {
+                        summary.push_str(&format!("\n      … +{remaining} more"));
+                    }
+                    Some(summary)
                 }
             }
             "grep" | "search" => {
-                let matches = output.lines().count();
-                Some(format!("{matches} matches"))
+                let match_lines: Vec<&str> = output.lines().collect();
+                let total = match_lines.len();
+                // Extract unique file names from grep output (file:line:content format)
+                let mut files: Vec<&str> = Vec::new();
+                for line in match_lines.iter().take(50) {
+                    if let Some(colon_pos) = line.find(':') {
+                        let file = &line[..colon_pos];
+                        if !files.contains(&file) {
+                            files.push(file);
+                        }
+                    }
+                }
+                if files.is_empty() {
+                    Some(format!("{total} matches"))
+                } else {
+                    let file_count = files.len();
+                    let shown: Vec<String> = files
+                        .iter()
+                        .take(3)
+                        .map(|f| shorten_path(f, 45))
+                        .collect();
+                    let mut summary = format!("{total} matches in {file_count} file(s)");
+                    for f in &shown {
+                        summary.push_str(&format!("\n      {f}"));
+                    }
+                    let remaining = file_count.saturating_sub(3);
+                    if remaining > 0 {
+                        summary.push_str(&format!("\n      … +{remaining} more files"));
+                    }
+                    Some(summary)
+                }
+            }
+            "write_file" | "str_replace" | "multi_edit" | "delete_file" => {
+                if tool == "delete_file" {
+                    return Some("deleted".to_string());
+                }
+                // Extract unified diff from str_replace/multi_edit output
+                let diff_block = extract_cli_diff_block(output);
+                if let Some(diff) = diff_block {
+                    let colored = colorize_diff_summary(diff, 5);
+                    if !colored.is_empty() {
+                        return Some(colored);
+                    }
+                }
+                // Fallback: check if output itself looks like a diff
+                if output.lines().any(|l| l.starts_with("+++ ") || l.starts_with("--- ")) {
+                    let colored = colorize_diff_summary(output, 5);
+                    if !colored.is_empty() {
+                        return Some(colored);
+                    }
+                }
+                if output.trim().is_empty() {
+                    Some("done".to_string())
+                } else {
+                    Some(truncate_line(output.trim(), 60))
+                }
+            }
+            "list_dir" => {
+                let entries = output.lines().filter(|l| !l.trim().is_empty()).count();
+                Some(format!("{entries} entries"))
+            }
+            "glob" => {
+                let files: Vec<&str> = output.lines().filter(|l| !l.trim().is_empty()).collect();
+                let total = files.len();
+                if total == 0 {
+                    Some("no matches".to_string())
+                } else {
+                    let shown: Vec<String> = files
+                        .iter()
+                        .take(3)
+                        .map(|f| shorten_path(f.trim(), 50))
+                        .collect();
+                    let mut summary = format!("{total} file(s)");
+                    for f in &shown {
+                        summary.push_str(&format!("\n      {f}"));
+                    }
+                    let remaining = total.saturating_sub(3);
+                    if remaining > 0 {
+                        summary.push_str(&format!("\n      … +{remaining} more"));
+                    }
+                    Some(summary)
+                }
             }
             _ => {
                 if line_count > 1 {
                     Some(format!("{line_count} lines"))
-                } else {
+                } else if output.trim().is_empty() {
                     None
+                } else {
+                    Some(truncate_line(output.trim(), 60))
                 }
             }
         }
@@ -959,6 +1121,88 @@ impl StreamRenderState {
     fn clear_tool_region(&mut self) {
         self.tool_region.clear();
         self.tool_lines.clear();
+    }
+}
+
+/// Extract the unified diff block from str_replace/multi_edit output.
+fn extract_cli_diff_block(output: &str) -> Option<&str> {
+    let start_marker = "<<<MO_AGENT_UNIFIED_DIFF>>>";
+    let end_marker = "<<<END_MO_AGENT_UNIFIED_DIFF>>>";
+    let start = output.find(start_marker)?;
+    let after = &output[start + start_marker.len()..];
+    let end = after.find(end_marker).unwrap_or(after.len());
+    let block = after[..end].trim();
+    if block.is_empty() { None } else { Some(block) }
+}
+
+/// Colorize a unified diff into a compact summary with green +lines and red -lines.
+fn colorize_diff_summary(diff: &str, max_lines: usize) -> String {
+    let mut parts = Vec::new();
+    let mut shown = 0usize;
+    let mut total_add = 0usize;
+    let mut total_del = 0usize;
+    for line in diff.lines() {
+        if line.starts_with('+') && !line.starts_with("+++ ") {
+            total_add += 1;
+            if shown < max_lines {
+                parts.push(format!("{}", truncate_line(line, 60).green()));
+                shown += 1;
+            }
+        } else if line.starts_with('-') && !line.starts_with("--- ") {
+            total_del += 1;
+            if shown < max_lines {
+                parts.push(format!("{}", truncate_line(line, 60).red()));
+                shown += 1;
+            }
+        }
+    }
+    let remaining = (total_add + total_del).saturating_sub(max_lines);
+    if remaining > 0 {
+        parts.push(format!(
+            "… {} {} (+{total_add} -{total_del} total)",
+            format!("+{remaining}").dim(),
+            "more".dim(),
+        ));
+    }
+    if parts.is_empty() {
+        return String::new();
+    }
+    parts.join("\n    ")
+}
+
+/// Format byte size as human-friendly string.
+fn format_byte_size(bytes: usize) -> String {
+    if bytes < 1024 {
+        format!("{bytes}B")
+    } else if bytes < 1024 * 1024 {
+        format!("{:.1}KB", bytes as f64 / 1024.0)
+    } else {
+        format!("{:.1}MB", bytes as f64 / (1024.0 * 1024.0))
+    }
+}
+
+/// Format duration as a human-friendly suffix for the tool description line.
+/// Only shown for durations ≥ 1s. Returns e.g. " 3.2s", " 1m 4s", " 12m 30s".
+fn format_duration_suffix(ms: u64) -> String {
+    if ms < 1_000 {
+        return String::new();
+    }
+    let secs = ms / 1_000;
+    if secs < 60 {
+        let frac = (ms % 1_000) / 100;
+        if frac > 0 {
+            format!(" {secs}.{frac}s")
+        } else {
+            format!(" {secs}s")
+        }
+    } else {
+        let m = secs / 60;
+        let s = secs % 60;
+        if s > 0 {
+            format!(" {m}m {s}s")
+        } else {
+            format!(" {m}m")
+        }
     }
 }
 
