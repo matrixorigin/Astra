@@ -5066,4 +5066,167 @@ mod tests {
         assert!(ctx.subtask_id.is_none());
         assert!(ctx.session_id.is_none());
     }
+
+    // ─── Learning Bridge Integration Tests ──────────────────────────────────
+
+    /// A mock learning bridge that records all calls for assertion.
+    struct RecordingLearningBridge {
+        verification_calls: std::sync::Mutex<Vec<VerificationLearningSignal>>,
+        outcome_calls: std::sync::Mutex<Vec<TaskOutcomeSignal>>,
+        template_calls: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl RecordingLearningBridge {
+        fn new() -> Self {
+            Self {
+                verification_calls: std::sync::Mutex::new(Vec::new()),
+                outcome_calls: std::sync::Mutex::new(Vec::new()),
+                template_calls: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl TaskLearningBridge for RecordingLearningBridge {
+        async fn learn_from_task_outcome(&self, signal: &TaskOutcomeSignal) -> Result<(), String> {
+            self.outcome_calls.lock().unwrap().push(signal.clone());
+            Ok(())
+        }
+        async fn extract_template(
+            &self,
+            contract: &TaskContract,
+            _report: &TaskDeliveryReport,
+        ) -> Result<Option<String>, String> {
+            self.template_calls
+                .lock()
+                .unwrap()
+                .push(contract.goal.clone());
+            Ok(Some("mock-template".into()))
+        }
+        async fn suggest_tools(
+            &self,
+            _: &str,
+            _: Option<&str>,
+            _: Option<&str>,
+        ) -> Result<Vec<String>, String> {
+            Ok(vec![])
+        }
+        async fn task_pattern_stats(&self, _: &str) -> Result<Option<TaskPatternStats>, String> {
+            Ok(None)
+        }
+        async fn learn_from_verification(
+            &self,
+            signal: &VerificationLearningSignal,
+        ) -> Result<(), String> {
+            self.verification_calls.lock().unwrap().push(signal.clone());
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn verify_subtask_invokes_learning_bridge() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let work = tmp.path().join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        let mut svc = LocalDurableTaskLifecycle::new(tmp.path().join("data"), work.clone());
+
+        let recorder = std::sync::Arc::new(RecordingLearningBridge::new());
+        svc.set_learning_bridge(recorder.clone());
+
+        // Create contract with a FileExists criterion
+        let plan = make_test_plan();
+        let mut contract = svc
+            .create_contract("u", "s", "test learning", &plan, TaskScope::default())
+            .await
+            .unwrap();
+
+        // Add a criterion that will pass
+        let target = work.join("output.txt");
+        std::fs::write(&target, "hello").unwrap();
+        contract.subtasks[0].criteria.push(VerificationCriterion {
+            id: "file-check".into(),
+            description: "output.txt exists".into(),
+            verifier: VerifierKind::FileExists {
+                paths: vec![target.to_string_lossy().to_string()],
+            },
+            required: true,
+            timeout_sec: 30,
+            global_only: false,
+        });
+        svc.save_local(&contract).unwrap();
+
+        // Execute subtask lifecycle
+        svc.begin_subtask(&contract.task_id, "sub-1").await.unwrap();
+        svc.complete_subtask_execution(&contract.task_id, "sub-1")
+            .await
+            .unwrap();
+
+        // Verify should trigger learning
+        let report = svc
+            .verify_subtask(&contract.task_id, "sub-1")
+            .await
+            .unwrap();
+        assert!(report.all_required_passed);
+
+        // Check that learning bridge was called
+        let calls = recorder.verification_calls.lock().unwrap();
+        assert_eq!(calls.len(), 1, "learning bridge should be called once");
+        assert_eq!(calls[0].subtask_id, "sub-1");
+        assert!(calls[0].all_passed);
+        assert_eq!(calls[0].attempt, 1);
+        assert!(!calls[0].criteria_results.is_empty());
+    }
+
+    #[tokio::test]
+    async fn deliver_task_invokes_learning_bridge() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut svc =
+            LocalDurableTaskLifecycle::new(tmp.path().join("data"), tmp.path().join("work"));
+
+        let recorder = std::sync::Arc::new(RecordingLearningBridge::new());
+        svc.set_learning_bridge(recorder.clone());
+
+        let plan = make_test_plan();
+        let contract = svc
+            .create_contract(
+                "u",
+                "s",
+                "deliver learning test",
+                &plan,
+                TaskScope::default(),
+            )
+            .await
+            .unwrap();
+
+        // Complete both subtasks (no criteria → auto-verified)
+        svc.begin_subtask(&contract.task_id, "sub-1").await.unwrap();
+        svc.complete_subtask_execution(&contract.task_id, "sub-1")
+            .await
+            .unwrap();
+        svc.begin_subtask(&contract.task_id, "sub-2").await.unwrap();
+        svc.complete_subtask_execution(&contract.task_id, "sub-2")
+            .await
+            .unwrap();
+
+        let report = svc.deliver_task(&contract.task_id).await.unwrap();
+        assert_eq!(report.goal, "deliver learning test");
+
+        // Check that outcome learning was called
+        let outcome_calls = recorder.outcome_calls.lock().unwrap();
+        assert_eq!(
+            outcome_calls.len(),
+            1,
+            "learn_from_task_outcome should be called"
+        );
+        assert!(outcome_calls[0].success);
+        assert_eq!(outcome_calls[0].goal, "deliver learning test");
+
+        // Check that template extraction was called
+        let template_calls = recorder.template_calls.lock().unwrap();
+        assert_eq!(
+            template_calls.len(),
+            1,
+            "extract_template should be called for completed contracts"
+        );
+    }
 }

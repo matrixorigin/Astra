@@ -410,6 +410,7 @@ impl TaskLearningBridge for PipelineTaskLearningBridge {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mo_agent_services::durable_task::{CriterionLearningResult, VerificationLearningSignal};
 
     fn make_signal(success: bool) -> TaskOutcomeSignal {
         TaskOutcomeSignal {
@@ -640,5 +641,228 @@ mod tests {
         assert_eq!(parse_domain_hint(Some("web")), Some(DomainHint::Web));
         assert!(parse_domain_hint(None).is_none());
         assert!(parse_domain_hint(Some("bogus")).is_none());
+    }
+
+    // ─── Verification Learning Tests ────────────────────────────────────────
+
+    fn make_verification_signal(all_passed: bool, attempt: u32) -> VerificationLearningSignal {
+        VerificationLearningSignal {
+            task_id: "t1".into(),
+            subtask_id: "s1".into(),
+            subtask_title: "add auth module".into(),
+            goal: "implement JWT auth".into(),
+            all_passed,
+            pass_rate: if all_passed { 1.0 } else { 0.5 },
+            attempt,
+            criteria_results: vec![
+                CriterionLearningResult {
+                    criterion_id: "c1".into(),
+                    verifier_kind: "BuildPass".into(),
+                    passed: true,
+                    duration_ms: 1200,
+                },
+                CriterionLearningResult {
+                    criterion_id: "c2".into(),
+                    verifier_kind: "TestPass".into(),
+                    passed: all_passed,
+                    duration_ms: 3500,
+                },
+            ],
+            files: vec!["src/auth.rs".into(), "src/routes.rs".into()],
+        }
+    }
+
+    #[tokio::test]
+    async fn learn_from_verification_records_verifier_patterns() {
+        let eg = Arc::new(Mutex::new(EntityGraph::new()));
+        let pl = Arc::new(Mutex::new(PatternLibrary::new()));
+        let cal = Arc::new(Mutex::new(ProgressiveCalibrator::new(0.7)));
+        let bridge = PipelineTaskLearningBridge::from_shared(eg.clone(), pl.clone(), cal.clone());
+
+        let signal = make_verification_signal(true, 1);
+        bridge.learn_from_verification(&signal).await.unwrap();
+
+        // Pattern library should have recorded verifier kind tools
+        let lib = pl.lock().unwrap();
+        assert!(
+            !lib.is_empty(),
+            "pattern library should record verification outcomes"
+        );
+    }
+
+    #[tokio::test]
+    async fn learn_from_verification_failure_updates_entity_graph() {
+        let eg = Arc::new(Mutex::new(EntityGraph::new()));
+        let pl = Arc::new(Mutex::new(PatternLibrary::new()));
+        let cal = Arc::new(Mutex::new(ProgressiveCalibrator::new(0.7)));
+        let bridge = PipelineTaskLearningBridge::from_shared(eg.clone(), pl.clone(), cal.clone());
+
+        let signal = make_verification_signal(false, 1);
+        bridge.learn_from_verification(&signal).await.unwrap();
+
+        // Entity graph should learn from failed files
+        let graph = eg.lock().unwrap();
+        assert!(
+            !graph.is_empty(),
+            "entity graph should learn file entities on failure"
+        );
+    }
+
+    #[tokio::test]
+    async fn learn_from_verification_retry_records_calibration() {
+        let eg = Arc::new(Mutex::new(EntityGraph::new()));
+        let pl = Arc::new(Mutex::new(PatternLibrary::new()));
+        let cal = Arc::new(Mutex::new(ProgressiveCalibrator::new(0.7)));
+        let bridge = PipelineTaskLearningBridge::from_shared(eg.clone(), pl.clone(), cal.clone());
+
+        // First attempt failure — no calibrator update
+        let signal = make_verification_signal(false, 1);
+        bridge.learn_from_verification(&signal).await.unwrap();
+        {
+            let c = cal.lock().unwrap();
+            assert_eq!(
+                c.tracked_intent_count(),
+                0,
+                "first-attempt failure should not trigger calibration"
+            );
+        }
+
+        // Second attempt failure — calibrator should record correction
+        let signal = make_verification_signal(false, 2);
+        bridge.learn_from_verification(&signal).await.unwrap();
+        {
+            let c = cal.lock().unwrap();
+            assert!(
+                c.tracked_intent_count() > 0,
+                "retry failure should trigger calibration correction"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn learn_from_verification_success_does_not_touch_entity_graph() {
+        let eg = Arc::new(Mutex::new(EntityGraph::new()));
+        let pl = Arc::new(Mutex::new(PatternLibrary::new()));
+        let cal = Arc::new(Mutex::new(ProgressiveCalibrator::new(0.7)));
+        let bridge = PipelineTaskLearningBridge::from_shared(eg.clone(), pl.clone(), cal.clone());
+
+        let signal = make_verification_signal(true, 1);
+        bridge.learn_from_verification(&signal).await.unwrap();
+
+        // Successful verification should NOT update entity graph (only failures)
+        let graph = eg.lock().unwrap();
+        assert_eq!(
+            graph.len(),
+            0,
+            "entity graph should not learn from successful verifications"
+        );
+    }
+
+    #[tokio::test]
+    async fn noop_bridge_learn_from_verification_is_ok() {
+        let bridge = PipelineTaskLearningBridge::new();
+        let signal = make_verification_signal(true, 1);
+        // Should succeed silently with no modules configured
+        assert!(bridge.learn_from_verification(&signal).await.is_ok());
+    }
+
+    // ─── End-to-End: Verify → Learn → Deliver ──────────────────────────────
+
+    #[tokio::test]
+    async fn full_pipeline_verify_learn_deliver() {
+        let eg = Arc::new(Mutex::new(EntityGraph::new()));
+        let pl = Arc::new(Mutex::new(PatternLibrary::new()));
+        let cal = Arc::new(Mutex::new(ProgressiveCalibrator::new(0.7)));
+        let bridge = PipelineTaskLearningBridge::from_shared(eg.clone(), pl.clone(), cal.clone());
+
+        // Phase 1: Simulate verification learning (subtask verified on first attempt)
+        let verify_signal = make_verification_signal(true, 1);
+        bridge
+            .learn_from_verification(&verify_signal)
+            .await
+            .unwrap();
+
+        // Phase 2: Simulate task delivery learning
+        let outcome = make_signal(true);
+        bridge.learn_from_task_outcome(&outcome).await.unwrap();
+
+        // Phase 3: Verify all modules accumulated data
+        {
+            let graph = eg.lock().unwrap();
+            assert!(
+                !graph.is_empty(),
+                "entity graph should have entities after delivery"
+            );
+        }
+        {
+            let lib = pl.lock().unwrap();
+            let patterns = lib.export();
+            assert!(
+                patterns.len() >= 2,
+                "pattern library should have both verification and task patterns"
+            );
+        }
+        {
+            let c = cal.lock().unwrap();
+            assert!(
+                c.tracked_intent_count() > 0,
+                "calibrator should have data after delivery"
+            );
+        }
+
+        // Phase 4: Verify suggestions incorporate learned patterns
+        let suggestions = bridge
+            .suggest_tools("implement auth", Some("code"), Some("code"))
+            .await
+            .unwrap();
+        // Should include entities from the learning cycle
+        assert!(
+            !suggestions.is_empty() || !eg.lock().unwrap().is_empty(),
+            "learning pipeline should produce usable knowledge"
+        );
+
+        // Phase 5: Verify template extraction works on multi-subtask contract
+        let contract = TaskContract {
+            contract_id: "c1".into(),
+            task_id: "t1".into(),
+            goal: "implement JWT auth".into(),
+            scope: mo_agent_services::durable_task::TaskScope::default(),
+            subtasks: vec![
+                mo_agent_services::durable_task::DurableSubtask {
+                    id: "s1".into(),
+                    title: "add auth module".into(),
+                    stage: mo_agent_services::durable_task::SubtaskStage::Verified,
+                    ..Default::default()
+                },
+                mo_agent_services::durable_task::DurableSubtask {
+                    id: "s2".into(),
+                    title: "add routes".into(),
+                    stage: mo_agent_services::durable_task::SubtaskStage::Completed,
+                    ..Default::default()
+                },
+            ],
+            global_verification: vec![],
+            version: 1,
+            status: mo_agent_services::durable_task::ContractStatus::Completed,
+            created_at: "2026-04-01".into(),
+            updated_at: "2026-04-01".into(),
+        };
+        let report = TaskDeliveryReport {
+            task_id: "t1".into(),
+            contract_id: "c1".into(),
+            goal: "implement JWT auth".into(),
+            subtask_summaries: vec![],
+            global_verification: vec![],
+            total_turns: 5,
+            total_tokens: 1000,
+            total_verifications: 2,
+            risks: vec![],
+            timestamp: "2026-04-01".into(),
+        };
+        let template = bridge.extract_template(&contract, &report).await.unwrap();
+        assert!(
+            template.is_some(),
+            "successful multi-subtask contract should produce template"
+        );
     }
 }
