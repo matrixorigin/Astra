@@ -517,6 +517,11 @@ struct ReplState {
     durable_task_state: Option<durable_bridge::DurableTaskState>,
     /// Stacked operator notes while plan execution is paused (`correct` / `note` at ⏸>).
     plan_execution_corrections: Vec<String>,
+    /// Delegation engine for multi-agent coordination during plan execution.
+    /// Constructed when plan execution starts and a durable contract is available;
+    /// the verification gate is swapped per-subtask via `clone_with_gate`.
+    delegation_engine:
+        Option<std::sync::Arc<mo_agent_runtime::server::delegation_engine::DelegationEngine>>,
 }
 
 impl Default for ReplState {
@@ -571,6 +576,7 @@ impl Default for ReplState {
             skill_classification_cache: skill_instructions::SkillClassificationCache::default(),
             durable_task_state: None,
             plan_execution_corrections: Vec::new(),
+            delegation_engine: None,
         }
     }
 }
@@ -2077,6 +2083,32 @@ async fn run_plan_execution(
                 contract,
                 lifecycle,
             });
+
+            // Construct a delegation engine for plan execution with verification gates.
+            // Uses StubSubRunExecutor — when a CliSubRunExecutor is wired in the
+            // future, this will enable real delegation with acceptance-criteria gates.
+            if state.delegation_engine.is_none() {
+                let registry = std::sync::Arc::new(tokio::sync::RwLock::new(
+                    mo_agent_services::AgentProfileRegistry::new(),
+                ));
+                let run_store = std::sync::Arc::new(
+                    mo_agent_services::runs::InMemoryRunStateStore::default(),
+                );
+                let engine =
+                    mo_agent_runtime::server::delegation_engine::DelegationEngine::with_executor(
+                        registry,
+                        std::sync::Arc::new(
+                            mo_agent_runtime::server::run_engine::RunEngine::new(run_store),
+                        ),
+                        std::sync::Arc::new(
+                            mo_agent_runtime::server::delegation_engine::DelegationTracker::new(),
+                        ),
+                        std::sync::Arc::new(
+                            mo_agent_runtime::server::delegation_engine::StubSubRunExecutor,
+                        ),
+                    );
+                state.delegation_engine = Some(std::sync::Arc::new(engine));
+            }
         }
     }
 
@@ -2272,6 +2304,19 @@ async fn run_plan_execution(
             // Durable task: snapshot before execution
             if let Some(ref durable) = state.durable_task_state {
                 durable_bridge::on_subtask_begin(durable, next_id).await;
+
+                // Attach a verification gate for this subtask's acceptance criteria.
+                // The delegation engine will check sub-run results against these
+                // criteria before aggregation, retrying on failure.
+                if let Some(ref base_engine) = state.delegation_engine {
+                    let work_dir = std::env::current_dir().unwrap_or_default();
+                    if let Some(gate) =
+                        durable_bridge::create_gate_for_subtask(durable, next_id, work_dir)
+                    {
+                        state.delegation_engine =
+                            Some(std::sync::Arc::new(base_engine.clone_with_gate(gate)));
+                    }
+                }
             }
 
             let remaining = plan
@@ -4471,6 +4516,7 @@ mod tests {
             plan_only_chat: false,
             is_plan_subtask: false,
             plan_subtask_id: None,
+            delegation_engine: None,
         })
         .await
         .unwrap();
@@ -4516,6 +4562,7 @@ mod tests {
             plan_only_chat: false,
             is_plan_subtask: false,
             plan_subtask_id: None,
+            delegation_engine: None,
         })
         .await;
         assert!(result.is_err());
@@ -4577,6 +4624,7 @@ mod tests {
             plan_only_chat: false,
             is_plan_subtask: false,
             plan_subtask_id: None,
+            delegation_engine: None,
         })
         .await
         .unwrap();

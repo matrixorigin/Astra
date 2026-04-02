@@ -466,6 +466,21 @@ impl DelegationEngine {
         self.gate = None;
     }
 
+    /// Create a new engine sharing the same components but with a different gate.
+    ///
+    /// All `Arc`-wrapped internals (registry, run_engine, tracker, executor) are
+    /// cheaply cloned (pointer bumps).  Use this when the engine is behind an
+    /// `Arc` and `set_gate` cannot be called because `&mut self` is unavailable.
+    pub fn clone_with_gate(&self, gate: Arc<dyn VerificationGate>) -> Self {
+        Self {
+            registry: self.registry.clone(),
+            run_engine: self.run_engine.clone(),
+            tracker: self.tracker.clone(),
+            executor: self.executor.clone(),
+            gate: Some(gate),
+        }
+    }
+
     /// Validate a delegation request without executing it.
     pub async fn validate(
         &self,
@@ -2347,5 +2362,46 @@ mod tests {
 
         // Completed sub-run has no pause flag
         assert!(tracker.get_pause_flag("sub-1").await.is_none());
+    }
+
+    // ─── clone_with_gate ─────────────────────────────────────────────────
+
+    #[test]
+    fn clone_with_gate_shares_components() {
+        let run_store =
+            Arc::new(mo_agent_services::runs::InMemoryRunStateStore::default());
+        let registry = Arc::new(tokio::sync::RwLock::new(
+            AgentProfileRegistry::new(),
+        ));
+        let run_engine =
+            Arc::new(crate::server::run_engine::RunEngine::new(run_store));
+        let tracker = Arc::new(DelegationTracker::new());
+        let executor: Arc<dyn SubRunExecutor> =
+            Arc::new(StubSubRunExecutor);
+
+        let engine = DelegationEngine::with_executor(
+            registry.clone(),
+            run_engine.clone(),
+            tracker.clone(),
+            executor.clone(),
+        );
+        assert!(engine.gate.is_none());
+
+        // Clone with a gate — the new engine shares the same Arc components.
+        struct PassGate;
+        #[async_trait::async_trait]
+        impl VerificationGate for PassGate {
+            async fn verify(
+                &self,
+                _: &AgentResult,
+                _: &str,
+                _: u32,
+            ) -> GateVerdict {
+                GateVerdict::Pass
+            }
+        }
+
+        let gated = engine.clone_with_gate(Arc::new(PassGate));
+        assert!(gated.gate.is_some());
     }
 }

@@ -1,4 +1,5 @@
 use mo_agent_runtime::{pipeline::persistence::ToolHealthEntry, tool_selector::ToolSelector};
+use std::sync::Arc;
 
 use crate::{
     ExplainMode, permission_manager::PermissionManager, skill_instructions::SharedSkillRegistry,
@@ -32,4 +33,7 @@ pub(crate) struct ChatTurnParams<'a> {
     pub(crate) is_plan_subtask: bool,
     /// Sent on `/chat/turn` JSON so cloud can classify the turn like local `is_plan_subtask`.
     pub(crate) plan_subtask_id: Option<&'a str>,
+    /// Optional delegation engine for multi-agent coordination with verification gates.
+    pub(crate) delegation_engine:
+        Option<Arc<mo_agent_runtime::server::delegation_engine::DelegationEngine>>,
 }

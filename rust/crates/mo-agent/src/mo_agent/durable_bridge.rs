@@ -567,7 +567,6 @@ pub struct ContractVerificationGate {
     max_retry: u32,
 }
 
-#[allow(dead_code)] // Public API — used when delegation is wired to plan execution
 impl ContractVerificationGate {
     /// Create a gate from a [`DurableSubtask`]'s criteria.
     ///
@@ -587,6 +586,7 @@ impl ContractVerificationGate {
     }
 
     /// Create a gate from explicit criteria (for testing or custom pipelines).
+    #[allow(dead_code)]
     pub fn from_criteria(
         criteria: Vec<mo_agent_services::VerificationCriterion>,
         subtask_id: String,
@@ -602,6 +602,7 @@ impl ContractVerificationGate {
     }
 
     /// Attach an LLM judge for semantic criteria.
+    #[allow(dead_code)]
     pub fn with_llm_judge(mut self, judge: Arc<dyn mo_agent_services::LlmJudge>) -> Self {
         self.runner.llm_judge = Some(judge);
         self
@@ -690,6 +691,31 @@ impl VerificationGate for ContractVerificationGate {
     fn max_retries(&self) -> u32 {
         self.max_retry
     }
+}
+
+// ─── Gate factory for plan-execution integration ─────────────────────────────
+
+/// Create a [`ContractVerificationGate`] for a specific subtask.
+///
+/// Returns `None` when the subtask has no (non-global) criteria — the
+/// delegation engine will skip gate checking in that case.
+pub fn create_gate_for_subtask(
+    durable: &DurableTaskState,
+    subtask_id: &str,
+    work_dir: std::path::PathBuf,
+) -> Option<Arc<dyn VerificationGate>> {
+    let subtask = durable.contract.subtasks.iter().find(|s| s.id == subtask_id)?;
+    let non_global: Vec<_> = subtask
+        .criteria
+        .iter()
+        .filter(|c| !c.global_only)
+        .collect();
+    if non_global.is_empty() {
+        return None;
+    }
+    Some(Arc::new(ContractVerificationGate::from_subtask(
+        subtask, work_dir,
+    )))
 }
 
 // ─── LLM Judge Implementation ────────────────────────────────────────────────
@@ -1133,5 +1159,57 @@ mod tests {
         let gate =
             ContractVerificationGate::from_subtask(&subtask, std::path::PathBuf::from("/tmp"));
         assert_eq!(VerificationGate::max_retries(&gate), 5);
+    }
+
+    #[test]
+    fn create_gate_for_subtask_returns_none_for_unknown_id() {
+        let plan = make_test_plan();
+        let detection = mo_agent_services::ProjectDetection::detect(std::path::Path::new("/tmp"));
+        let cg = ContractGenerator::new(detection);
+        let contract = cg.generate("Build foo", &plan, None).unwrap();
+
+        // Build a DurableTaskState with a stub lifecycle.
+        struct StubLifecycle;
+        #[async_trait]
+        impl DurableTaskLifecycle for StubLifecycle {
+            async fn create_contract(
+                &self, _: &str, _: &str, _: &str,
+                _: &mo_agent_services::task_orchestrator::TaskPlan,
+                _: TaskScope,
+            ) -> Result<TaskContract, String> { Err("stub".into()) }
+            async fn amend_contract(&self, _: &str, _: mo_agent_services::ContractAmendment) -> Result<TaskContract, String> { Err("stub".into()) }
+            async fn get_contract(&self, _: &str) -> Result<Option<TaskContract>, String> { Ok(None) }
+            async fn begin_subtask(&self, _: &str, _: &str) -> Result<mo_agent_services::SubtaskExecutionContext, String> { Err("stub".into()) }
+            async fn complete_subtask_execution(&self, _: &str, _: &str) -> Result<(), String> { Ok(()) }
+            async fn fail_subtask(&self, _: &str, _: &str, _: &str) -> Result<(), String> { Ok(()) }
+            async fn verify_subtask(&self, _: &str, _: &str) -> Result<SubtaskVerificationReport, String> { Err("stub".into()) }
+            async fn verify_global(&self, _: &str) -> Result<Vec<VerificationResult>, String> { Err("stub".into()) }
+            async fn pause_task(&self, _: &str) -> Result<(), String> { Ok(()) }
+            async fn resume_task(&self, _: &str, _: &str) -> Result<mo_agent_services::TaskResumeContext, String> { Err("stub".into()) }
+            async fn deliver_task(&self, _: &str) -> Result<mo_agent_services::TaskDeliveryReport, String> { Err("stub".into()) }
+            async fn snapshot_task_state(&self, _: &str) -> Result<String, String> { Err("stub".into()) }
+            async fn rollback_task(&self, _: &str, _: &str) -> Result<(), String> { Err("stub".into()) }
+        }
+
+        let durable = DurableTaskState {
+            contract,
+            lifecycle: Arc::new(StubLifecycle),
+        };
+
+        // Non-existent subtask → None
+        let gate = create_gate_for_subtask(&durable, "nonexistent", "/tmp".into());
+        assert!(gate.is_none());
+
+        // Existing subtask with criteria → Some
+        let has_criteria = durable.contract.subtasks.iter().any(|s| !s.criteria.is_empty());
+        if has_criteria {
+            let id = durable.contract.subtasks.iter()
+                .find(|s| !s.criteria.is_empty())
+                .unwrap()
+                .id
+                .clone();
+            let gate = create_gate_for_subtask(&durable, &id, "/tmp".into());
+            assert!(gate.is_some());
+        }
     }
 }

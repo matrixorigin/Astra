@@ -263,6 +263,7 @@ async fn maybe_auto_compact(
         plan_only_chat: false,
         is_plan_subtask: false,
         plan_subtask_id: None,
+        delegation_engine: None,
     })
     .await;
 
@@ -385,6 +386,7 @@ async fn run_chat_turn(
             plan_only_chat: state.chat_plan_only && state.current_plan_subtask_id.is_none(),
             is_plan_subtask: state.current_plan_subtask_id.is_some(),
             plan_subtask_id: state.current_plan_subtask_id.as_deref(),
+            delegation_engine: state.delegation_engine.clone(),
         }) => TurnAttempt::Completed(Box::new(result)),
         _ = tokio::signal::ctrl_c() => {
             eprintln!("\n{}", "  Interrupted.".dim());

@@ -135,6 +135,7 @@ pub(super) async fn handle_state_command(
                     plan_only_chat: false,
                     is_plan_subtask: false,
                     plan_subtask_id: None,
+                    delegation_engine: None,
                 }) => r,
                 _ = tokio::signal::ctrl_c() => {
                     eprintln!("{}", "  Interrupted.".dim());
@@ -213,6 +214,7 @@ pub(super) async fn handle_state_command(
                         plan_only_chat: false,
                         is_plan_subtask: false,
                         plan_subtask_id: None,
+                        delegation_engine: None,
                     })
                     .await;
 
@@ -273,6 +275,7 @@ pub(super) async fn handle_state_command(
                                 plan_only_chat: false,
                                 is_plan_subtask: false,
                                 plan_subtask_id: None,
+                                delegation_engine: None,
                             })
                             .await;
                             if let Ok(sr2) = synth_result {
