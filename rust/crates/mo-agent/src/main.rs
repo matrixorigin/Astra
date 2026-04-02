@@ -2680,12 +2680,38 @@ async fn try_cloud_pull_preferences(state: &mut ReplState) -> Vec<String> {
             use mo_agent_services::state_sync::pref_keys;
             let keys: Vec<String> = prefs.iter().map(|(k, _)| k.clone()).collect();
             for (key, value) in &prefs {
-                if key.as_str() == pref_keys::EXPLAIN_MODE {
-                    state.explain = match value.as_str() {
-                        "on" => ExplainMode::On,
-                        "verbose" => ExplainMode::Verbose,
-                        _ => ExplainMode::Off,
-                    };
+                match key.as_str() {
+                    pref_keys::EXPLAIN_MODE => {
+                        state.explain = match value.as_str() {
+                            "on" => ExplainMode::On,
+                            "verbose" => ExplainMode::Verbose,
+                            _ => ExplainMode::Off,
+                        };
+                    }
+                    pref_keys::BLOCKED_TOOLS => {
+                        // Merge cloud-persisted blocked tools into tool_health_entries
+                        if let Ok(tools) = serde_json::from_str::<Vec<String>>(value) {
+                            let existing: std::collections::HashSet<String> = state
+                                .tool_health_entries
+                                .iter()
+                                .map(|e| e.name.clone())
+                                .collect();
+                            for tool_name in tools {
+                                if !existing.contains(&tool_name) {
+                                    state.tool_health_entries.push(
+                                        mo_agent_runtime::pipeline::persistence::ToolHealthEntry {
+                                            name: tool_name,
+                                            total_calls: 3,
+                                            total_failures: 3,
+                                            failure_rate: 1.0,
+                                            last_updated_epoch: 0,
+                                        },
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
                 }
             }
             eprintln!(
@@ -2796,7 +2822,20 @@ async fn try_cloud_push_preferences(state: &ReplState) {
     let svc = mo_agent_services::state_sync::MatrixOneSyncService::new(pool);
     let user_id = std::env::var("MO_USER_ID").unwrap_or_else(|_| "local".to_string());
     use mo_agent_services::state_sync::{StateSyncService, pref_keys};
-    let prefs = [(pref_keys::EXPLAIN_MODE, state.explain.to_string())];
+
+    // Collect blocked/deprioritized tools from health entries
+    let blocked: Vec<String> = state
+        .tool_health_entries
+        .iter()
+        .filter(|e| e.failure_rate >= 1.0)
+        .map(|e| e.name.clone())
+        .collect();
+    let blocked_json = serde_json::to_string(&blocked).unwrap_or_else(|_| "[]".to_string());
+
+    let prefs = [
+        (pref_keys::EXPLAIN_MODE, state.explain.to_string()),
+        (pref_keys::BLOCKED_TOOLS, blocked_json),
+    ];
     let mut synced = 0u32;
     for (key, value) in &prefs {
         let result = svc.push_preference(&user_id, key, value).await;

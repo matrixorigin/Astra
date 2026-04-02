@@ -847,11 +847,39 @@ impl StateSyncService for MatrixOneSyncService {
     async fn push_preference(&self, user_id: &str, key: &str, value: &str) -> SyncResult {
         let pref_id = uuid::Uuid::new_v4().to_string();
 
+        // Read current value + version for audit trail
+        let old_row = sqlx::query(
+            "SELECT pref_value, version FROM user_preferences WHERE user_id = ? AND pref_key = ?",
+        )
+        .bind(user_id)
+        .bind(key)
+        .fetch_optional(&self.pool)
+        .await
+        .ok()
+        .flatten();
+
+        let (old_value, old_version): (Option<String>, Option<i32>) = {
+            use sqlx::Row;
+            match &old_row {
+                Some(row) => (row.try_get("pref_value").ok(), row.try_get("version").ok()),
+                None => (None, None),
+            }
+        };
+
+        // Skip write if value unchanged
+        if old_value.as_deref() == Some(value) {
+            return SyncResult::ok(SyncDirection::Push, "preference", 0);
+        }
+
+        let new_version = old_version.unwrap_or(0) + 1;
+
+        // Upsert with version increment
         let update_result = sqlx::query(
-            "UPDATE user_preferences SET pref_value = ?, updated_at = NOW() \
+            "UPDATE user_preferences SET pref_value = ?, version = ?, updated_at = NOW() \
              WHERE user_id = ? AND pref_key = ?",
         )
         .bind(value)
+        .bind(new_version)
         .bind(user_id)
         .bind(key)
         .execute(&self.pool)
@@ -861,13 +889,14 @@ impl StateSyncService for MatrixOneSyncService {
             Ok(r) if r.rows_affected() > 0 => Ok(r),
             Ok(_) => {
                 let inserted = sqlx::query(
-                    "INSERT INTO user_preferences (pref_id, user_id, pref_key, pref_value, updated_at) \
-                     VALUES (?, ?, ?, ?, NOW())",
+                    "INSERT INTO user_preferences (pref_id, user_id, pref_key, pref_value, version, updated_at) \
+                     VALUES (?, ?, ?, ?, ?, NOW())",
                 )
                 .bind(&pref_id)
                 .bind(user_id)
                 .bind(key)
                 .bind(value)
+                .bind(new_version)
                 .execute(&self.pool)
                 .await;
 
@@ -875,10 +904,11 @@ impl StateSyncService for MatrixOneSyncService {
                     Ok(r) => Ok(r),
                     Err(e) if is_duplicate_key_error(&e) => {
                         sqlx::query(
-                            "UPDATE user_preferences SET pref_value = ?, updated_at = NOW() \
+                            "UPDATE user_preferences SET pref_value = ?, version = ?, updated_at = NOW() \
                              WHERE user_id = ? AND pref_key = ?",
                         )
                         .bind(value)
+                        .bind(new_version)
                         .bind(user_id)
                         .bind(key)
                         .execute(&self.pool)
@@ -889,6 +919,25 @@ impl StateSyncService for MatrixOneSyncService {
             }
             Err(e) => Err(e),
         };
+
+        // Write audit trail (best-effort, don't fail the push)
+        if result.is_ok() {
+            let history_id = uuid::Uuid::new_v4().to_string();
+            let _ = sqlx::query(
+                "INSERT INTO user_preference_history \
+                 (history_id, user_id, pref_key, old_value, new_value, old_version, new_version, source) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, 'edge')",
+            )
+            .bind(&history_id)
+            .bind(user_id)
+            .bind(key)
+            .bind(&old_value)
+            .bind(value)
+            .bind(old_version)
+            .bind(new_version)
+            .execute(&self.pool)
+            .await;
+        }
 
         match result {
             Ok(_) => SyncResult::ok(SyncDirection::Push, "preference", 1),
@@ -1287,6 +1336,8 @@ pub mod pref_keys {
     pub const CHECKPOINT_INTERVAL: &str = "checkpoint_interval";
     pub const FOCUS_ENTITIES: &str = "focus_entities";
     pub const LANGUAGE: &str = "language";
+    /// JSON array of persistently blocked tool names (survives across sessions).
+    pub const BLOCKED_TOOLS: &str = "blocked_tools";
 }
 
 // ─── File-based Preference Store ────────────────────────────────────────────

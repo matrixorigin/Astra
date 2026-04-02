@@ -291,8 +291,27 @@ pub async fn ensure_core_schema(settings: &MatrixOneSettings) -> Result<(), sqlx
             user_id VARCHAR(36) NOT NULL,
             pref_key VARCHAR(100) NOT NULL,
             pref_value LONGTEXT NOT NULL,
+            version INT NOT NULL DEFAULT 1,
             updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             UNIQUE KEY idx_prefs_user_key (user_id, pref_key)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    // Preference change history for audit trail and rollback
+    query(
+        "CREATE TABLE IF NOT EXISTS user_preference_history (
+            history_id VARCHAR(36) PRIMARY KEY,
+            user_id VARCHAR(36) NOT NULL,
+            pref_key VARCHAR(100) NOT NULL,
+            old_value LONGTEXT NULL,
+            new_value LONGTEXT NOT NULL,
+            old_version INT NULL,
+            new_version INT NOT NULL,
+            source VARCHAR(50) NOT NULL DEFAULT 'edge',
+            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            INDEX idx_pref_history_user_key (user_id, pref_key, created_at)
         )",
     )
     .execute(&pool)
