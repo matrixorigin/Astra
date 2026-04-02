@@ -548,25 +548,20 @@ impl StreamRenderState {
         }
     }
 
-    /// Show a tool as "running" with optional argument preview.
+    /// Show a tool as "running" with optional argument preview (single line).
     fn tool_start(&mut self, tool: &str, args: &Value) -> usize {
         let idx = self.tool_lines.len();
         let arg_preview = self.format_tool_arg_preview(tool, args);
+        let line = match &arg_preview {
+            Some(preview) => format!("  ● {tool} {preview} …"),
+            None => format!("  ● {tool} …"),
+        };
         if self.md.is_some() {
-            eprintln!("  ⚡ {tool} …");
-            if let Some(preview) = &arg_preview {
-                eprintln!("  │ {preview}");
-            }
-            self.stderr_lines += if arg_preview.is_some() { 2 } else { 1 };
+            eprintln!("{line}");
+            self.stderr_lines += 1;
             return idx;
         }
-        let mut lines_to_add = vec![format!("  ⚡ {tool} …")];
-        if let Some(preview) = arg_preview {
-            lines_to_add.push(format!("  │ {preview}"));
-        }
-        for line in lines_to_add {
-            self.tool_lines.push(line);
-        }
+        self.tool_lines.push(line);
         self.tool_region.update(self.tool_lines.clone());
         idx
     }
@@ -716,37 +711,25 @@ impl StreamRenderState {
         }
     }
 
-    /// Update a tool line to show completion status with optional output summary.
+    /// Update a tool line to show completion status with optional output summary (single line).
     fn tool_done(&mut self, idx: usize, tool: &str, status: &str, duration_ms: u64, output: &str) {
-        let (icon, suffix) = if status == "error" {
-            ("✗", format!(" ({duration_ms}ms) error"))
-        } else {
-            ("✓", format!(" ({duration_ms}ms)"))
-        };
+        let icon = if status == "error" { "✗" } else { "✓" };
         let output_summary = self.format_output_summary(tool, output, status);
-        if self.md.is_some() {
-            eprintln!("  {icon} {tool}{suffix}");
-            if let Some(summary) = &output_summary {
-                eprintln!("  └ {summary}");
+        // Compact single-line format: ✓ tool args (Xms) → summary
+        let line = match &output_summary {
+            Some(summary) if status == "error" => {
+                format!("  {icon} {tool} ({duration_ms}ms) error: {summary}")
             }
-            self.stderr_lines += if output_summary.is_some() { 2 } else { 1 };
+            Some(summary) => format!("  {icon} {tool} ({duration_ms}ms) → {summary}"),
+            None => format!("  {icon} {tool} ({duration_ms}ms)"),
+        };
+        if self.md.is_some() {
+            eprintln!("{line}");
+            self.stderr_lines += 1;
             return;
         }
         if idx < self.tool_lines.len() {
-            self.tool_lines[idx] = format!("  {icon} {tool}{suffix}");
-            if let Some(summary) = output_summary {
-                // Insert summary line after the tool line
-                let insert_pos = (idx + 1).min(self.tool_lines.len());
-                // Check if there's already a preview line for this tool (from tool_start)
-                // If so, replace it; otherwise insert
-                if insert_pos < self.tool_lines.len()
-                    && self.tool_lines[insert_pos].starts_with("  │")
-                {
-                    self.tool_lines[insert_pos] = format!("  └ {summary}");
-                } else {
-                    self.tool_lines.insert(insert_pos, format!("  └ {summary}"));
-                }
-            }
+            self.tool_lines[idx] = line;
             self.tool_region.update(self.tool_lines.clone());
         }
     }
