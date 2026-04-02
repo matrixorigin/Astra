@@ -201,17 +201,17 @@ pub(super) fn strip_leading_narration(text: &mut String) {
 
     // Patterns that indicate actual content (should NOT be stripped)
     const CONTENT_MARKERS: &[&str] = &[
-        "**",     // Bold (common for headers like **Summary**)
-        "# ",     // Markdown header
-        "## ",    // Markdown header
-        "### ",   // Markdown header
-        "- ",     // List item
-        "* ",     // List item
-        "1. ",    // Numbered list
-        "```",    // Code block
-        "| ",     // Table
-        "---",    // Horizontal rule
-        "___",    // Horizontal rule
+        "**",   // Bold (common for headers like **Summary**)
+        "# ",   // Markdown header
+        "## ",  // Markdown header
+        "### ", // Markdown header
+        "- ",   // List item
+        "* ",   // List item
+        "1. ",  // Numbered list
+        "```",  // Code block
+        "| ",   // Table
+        "---",  // Horizontal rule
+        "___",  // Horizontal rule
     ];
 
     // If text starts with content marker, don't touch it

@@ -552,14 +552,14 @@ pub(crate) fn git_diff(project_root: &Path, args: &Value, pressure: f64) -> Stri
     // If a ref is given, do a tree-to-tree diff (HEAD vs ref)
     if let Some(ref_str) = git_ref {
         // With path filter, use CLI for tree-to-tree as well
-        if let Some(p) = path_filter {
-            if let Some(result) = diff_via_git_cli(
+        if let Some(p) = path_filter
+            && let Some(result) = diff_via_git_cli(
                 project_root,
                 &["diff", ref_str, "--no-ext-diff", "--no-color", "--", p],
                 limit,
-            ) {
-                return result;
-            }
+            )
+        {
+            return result;
         }
         return diff_tree_to_tree_str(&repo, ref_str, limit);
     }
@@ -586,8 +586,7 @@ pub(crate) fn git_diff(project_root: &Path, args: &Value, pressure: f64) -> Stri
     } else {
         vec!["diff", "HEAD", "--no-ext-diff", "--no-color"]
     };
-    diff_via_git_cli(project_root, &cli_args, limit)
-        .unwrap_or_else(|| diff_worktree(&repo, limit))
+    diff_via_git_cli(project_root, &cli_args, limit).unwrap_or_else(|| diff_worktree(&repo, limit))
 }
 
 fn diff_via_git_cli(project_root: &Path, args: &[&str], limit: usize) -> Option<String> {
@@ -2555,8 +2554,11 @@ mod tests {
     fn diff_via_git_cli_returns_none_for_bad_args() {
         let root = repo_root();
         // Invalid ref should make git fail → returns None
-        let result =
-            diff_via_git_cli(&root, &["diff", "not_a_valid_ref_xyzzy", "--no-ext-diff"], 8000);
+        let result = diff_via_git_cli(
+            &root,
+            &["diff", "not_a_valid_ref_xyzzy", "--no-ext-diff"],
+            8000,
+        );
         assert!(result.is_none(), "bad ref should return None for fallback");
     }
 

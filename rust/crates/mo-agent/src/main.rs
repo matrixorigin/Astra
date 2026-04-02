@@ -5709,7 +5709,7 @@ total_tokens_out: 500
         let sid = format!("test-cloud-pull-journal-{}", uuid::Uuid::new_v4());
         let state = ReplState {
             session_id: Some(sid.clone()),
-            ..ReplState::default()
+            ..Default::default()
         };
         let pull = CloudPullResult {
             tool_health: Vec::new(),
@@ -5746,7 +5746,7 @@ total_tokens_out: 500
         let sid = format!("test-cloud-pull-empty-{}", uuid::Uuid::new_v4());
         let state = ReplState {
             session_id: Some(sid.clone()),
-            ..ReplState::default()
+            ..Default::default()
         };
         let pull = CloudPullResult {
             tool_health: Vec::new(),

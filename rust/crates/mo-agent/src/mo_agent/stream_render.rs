@@ -12,6 +12,7 @@ use mo_agent_runtime::turn::sse_stream_host::{
     SseStreamHost, consume_sse_stream,
 };
 use mo_agent_runtime::turn::tool_result_semantics::cloud_tool_result_status_label;
+use std::io::IsTerminal;
 use std::ops::{Deref, DerefMut};
 
 pub use mo_agent_runtime::turn::chat_turn_sse_dispatch::ChatTurnEdgePending;
@@ -23,6 +24,7 @@ pub(super) struct EdgeSseContext<'a> {
     pub executor_id: &'a str,
     pub executor: &'a crate::edge_tools::ToolExecutor,
     pub quiet: bool,
+    pub suppress_intermediate_output: bool,
     pub perm_manager: Option<&'a mut crate::permission_manager::PermissionManager>,
 }
 
@@ -44,10 +46,19 @@ struct CliSseStreamHost<'a> {
     executor_id: &'a str,
     executor: &'a crate::edge_tools::ToolExecutor,
     quiet: bool,
+    suppress_intermediate_output: bool,
     perm_manager: Option<&'a mut crate::permission_manager::PermissionManager>,
     render: StreamRenderState,
+    /// Once this turn has emitted or requested tool work, hide any further prose
+    /// so we don't flash an intermediate draft that will be invalidated.
+    tool_work_detected: bool,
     /// Ordered tool executions from this SSE stream.
     pub edge_tool_round: Vec<EdgeToolExecResult>,
+    // ── XML tag suppression ────────────────────────────────────────────
+    /// Text accumulated while inside an open `<think>`/`<reflect>` tag.
+    /// Flushed (after stripping the tags) once the closing tag arrives.
+    /// Empty when not inside a tag — text goes directly to the renderer.
+    xml_tag_buffer: String,
 }
 
 impl<'a> CliSseStreamHost<'a> {
@@ -58,29 +69,140 @@ impl<'a> CliSseStreamHost<'a> {
             executor_id: ctx.executor_id,
             executor: ctx.executor,
             quiet: ctx.quiet,
+            suppress_intermediate_output: ctx.suppress_intermediate_output,
             perm_manager: ctx.perm_manager,
             render: StreamRenderState::with_term_width(term_width, render_md),
+            tool_work_detected: false,
             edge_tool_round: Vec::new(),
+            xml_tag_buffer: String::new(),
         }
     }
+
+    /// Push text to the active renderer (markdown or raw stdout).
+    fn render_text(&mut self, s: &str) {
+        if let Some(md) = &mut self.render.md {
+            md.push(s);
+        } else {
+            print!("{s}");
+            let _ = io::stdout().flush();
+            self.render.track_output(s);
+        }
+    }
+
+    /// Accept a text delta, suppressing content inside XML thinking tags.
+    /// Text outside tags is rendered immediately (preserving streaming UX).
+    /// Handles tags split across SSE chunks by holding back partial `<…` tails.
+    fn push_text(&mut self, s: &str) {
+        self.xml_tag_buffer.push_str(s);
+
+        // Fast path: no tag markers at all.
+        if !self.xml_tag_buffer.contains('<') {
+            let buf = std::mem::take(&mut self.xml_tag_buffer);
+            self.render_text(&buf);
+            return;
+        }
+
+        // Check if there's an open thinking tag.
+        if super::streaming_md::has_open_xml_tag(&self.xml_tag_buffer) {
+            // Still inside a tag — keep buffering, don't render.
+            return;
+        }
+
+        // Check for a potential incomplete thinking tag at the end of the buffer.
+        // Only hold back if the tail could plausibly become one of our known tags.
+        if let Some(last_lt) = self.xml_tag_buffer.rfind('<') {
+            let tail = &self.xml_tag_buffer[last_lt..];
+            if !tail.contains('>') && could_become_thinking_tag(tail) {
+                // Potential partial tag — split: flush before, hold tail.
+                let before = self.xml_tag_buffer[..last_lt].to_string();
+                let held = self.xml_tag_buffer[last_lt..].to_string();
+                self.xml_tag_buffer = held;
+                if !before.is_empty() {
+                    let mut buf = before;
+                    super::streaming_md::strip_xml_tags_inplace(&mut buf);
+                    if !buf.is_empty() {
+                        self.render_text(&buf);
+                    }
+                }
+                return;
+            }
+        }
+
+        // Tag is closed (or there was never one).  Strip and flush.
+        let mut buf = std::mem::take(&mut self.xml_tag_buffer);
+        super::streaming_md::strip_xml_tags_inplace(&mut buf);
+        if !buf.is_empty() {
+            self.render_text(&buf);
+        }
+    }
+}
+
+/// Returns true if `partial` could become one of our known thinking tags.
+/// E.g., "<", "<t", "<th", "<thi", "</", "</t", "</think" etc.
+fn could_become_thinking_tag(partial: &str) -> bool {
+    const PREFIXES: &[&str] = &[
+        "<t",
+        "<th",
+        "<thi",
+        "<thin",
+        "<think",
+        "<r",
+        "<re",
+        "<ref",
+        "<refl",
+        "<refle",
+        "<reflec",
+        "<reflect",
+        "<i",
+        "<in",
+        "<inn",
+        "<inne",
+        "<inner",
+        "<inner_",
+        "</t",
+        "</th",
+        "</thi",
+        "</thin",
+        "</think",
+        "</r",
+        "</re",
+        "</ref",
+        "</refl",
+        "</refle",
+        "</reflec",
+        "</reflect",
+        "</i",
+        "</in",
+        "</inn",
+        "</inne",
+        "</inner",
+        "</inner_",
+    ];
+    // Also match bare "<" or "</" which could become anything
+    if partial == "<" || partial == "</" {
+        return true;
+    }
+    PREFIXES
+        .iter()
+        .any(|p| p.starts_with(partial) || partial.starts_with(p))
 }
 
 #[async_trait::async_trait]
 impl SseStreamHost for CliSseStreamHost<'_> {
     fn on_render_effects(&mut self, effects: Vec<SseRenderEffect>) {
-        if self.quiet {
+        if self.quiet || self.suppress_intermediate_output {
             return;
         }
         for effect in effects {
             match effect {
                 SseRenderEffect::StreamText(s) => {
-                    if let Some(md) = &mut self.render.md {
-                        md.push(&s);
-                    } else {
-                        print!("{s}");
-                        let _ = io::stdout().flush();
-                        self.render.track_output(&s);
+                    // When tool_work_detected, buffer text instead of discarding.
+                    // It will be rendered at stream completion if it's the final answer.
+                    if self.tool_work_detected {
+                        self.xml_tag_buffer.push_str(&s);
+                        continue;
                     }
+                    self.push_text(&s);
                 }
                 SseRenderEffect::StopThinkingSpinner => self.render.stop_thinking(),
                 SseRenderEffect::StartThinkingSpinner => self.render.start_thinking(),
@@ -98,13 +220,30 @@ impl SseStreamHost for CliSseStreamHost<'_> {
         tool: &str,
         args: &serde_json::Value,
     ) -> EdgeToolExecResult {
-        // Tool request means the current text is only an intermediate draft.
-        // Drop it so the terminal shows the final answer once, not every draft.
-        if let Some(md) = &mut self.render.md {
-            md.discard_and_reset();
+        // Clear text that was rendered or buffered BEFORE the first tool call
+        // (intermediate draft). After first tool, keep buffering new text.
+        if !self.tool_work_detected {
+            self.tool_work_detected = true;
+            // Discard any XML-tag-buffered text that was never rendered.
+            self.xml_tag_buffer.clear();
+
+            // Clear text that WAS already rendered (intermediate draft).
+            if let Some(md) = &mut self.render.md {
+                md.discard_and_reset();
+            } else if self.render.lines_written > 0 && io::stdout().is_terminal() {
+                execute!(
+                    io::stdout(),
+                    cursor::MoveUp(self.render.lines_written as u16),
+                    cursor::MoveToColumn(0),
+                    terminal::Clear(terminal::ClearType::FromCursorDown)
+                )
+                .ok();
+                self.render.lines_written = 0;
+                self.render.col = 0;
+            }
         }
         // Show tool as running (in-place updatable via TerminalRegion).
-        let tool_idx = if !self.quiet {
+        let tool_idx = if !self.quiet && !self.suppress_intermediate_output {
             Some(self.render.tool_start(tool))
         } else {
             None
@@ -148,6 +287,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
             .post_tool_result(Some(self.token), Some(self.executor_id), &body)
             .await
             && !self.quiet
+            && !self.suppress_intermediate_output
         {
             eprintln!("{}", edge_sse_post_tool_result_fail_line(e).yellow());
         }
@@ -188,6 +328,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
         };
         if let Err(e) = self.api.post_approval(Some(self.token), &body).await
             && !self.quiet
+            && !self.suppress_intermediate_output
         {
             eprintln!("{}", edge_sse_post_approval_fail_line(e).yellow());
         }
@@ -202,6 +343,9 @@ impl SseStreamHost for CliSseStreamHost<'_> {
 // ═══════════════════════════════════════════════════════════════ Spinner ══
 
 const SPINNER_FRAMES: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+
+/// Don't show a spinner for very short pauses; they feel like visual noise.
+const SPINNER_SHOW_DELAY_MS: u64 = 350;
 
 /// Skip `● Thought for …` when thinking was shorter than this (reduces stderr churn).
 const MIN_THOUGHT_DURATION_LOG_SECS: f64 = 1.5;
@@ -218,6 +362,10 @@ impl Spinner {
         let stop = Arc::new(AtomicBool::new(false));
         let stop2 = stop.clone();
         let handle = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(SPINNER_SHOW_DELAY_MS));
+            if stop2.load(Ordering::Relaxed) {
+                return;
+            }
             let mut idx = 0usize;
             while !stop2.load(Ordering::Relaxed) {
                 let frame = SPINNER_FRAMES[idx % SPINNER_FRAMES.len()];
@@ -486,73 +634,85 @@ pub(super) async fn consume_turn_sse(
 
     // Delegate to runtime's generic SSE consumer with the appropriate host
     let idle = std::time::Duration::from_millis(STREAM_IDLE_TIMEOUT_MS);
-    let (sse_result, edge_tool_round, mut md_renderer, lines_written) = if let Some(ctx) = edge {
-        let mut host = CliSseStreamHost::from_edge_ctx(
-            ctx,
-            term_width,
-            render_md && !suppress_intermediate_output,
-        );
-        // pre_clear_lines only applies to non-md fallback path.
-        if host.render.md.is_none() {
-            host.render.lines_written = pre_clear_lines;
-        }
-        let (result, _abort) = consume_sse_stream(&mut byte_stream, &mut host, idle).await;
-        let lw = host.render.lines_written;
-        let md = host.render.md.take();
-        (result, host.edge_tool_round, md, lw)
-    } else {
-        let mut render = StreamRenderState::with_term_width(
-            term_width,
-            render_md && !suppress_intermediate_output,
-        );
-        if render.md.is_none() {
-            render.lines_written = pre_clear_lines;
-        }
-        let mut host = NoopSseStreamHost;
-        let (result, _abort) = consume_sse_stream(&mut byte_stream, &mut host, idle).await;
-        let lw = render.lines_written;
-        let md = render.md.take();
-        (result, Vec::new(), md, lw)
-    };
+    let (sse_result, edge_tool_round, mut md_renderer, lines_written, pending_xml_buffer) =
+        if let Some(ctx) = edge {
+            let mut host = CliSseStreamHost::from_edge_ctx(
+                ctx,
+                term_width,
+                render_md && !suppress_intermediate_output,
+            );
+            // pre_clear_lines only applies to non-md fallback path.
+            if host.render.md.is_none() {
+                host.render.lines_written = pre_clear_lines;
+            }
+            let (result, _abort) = consume_sse_stream(&mut byte_stream, &mut host, idle).await;
+            let lw = host.render.lines_written;
+            let md = host.render.md.take();
+            let pending = std::mem::take(&mut host.xml_tag_buffer);
+            (result, host.edge_tool_round, md, lw, pending)
+        } else {
+            let mut render = StreamRenderState::with_term_width(
+                term_width,
+                render_md && !suppress_intermediate_output,
+            );
+            if render.md.is_none() {
+                render.lines_written = pre_clear_lines;
+            }
+            let mut host = NoopSseStreamHost;
+            let (result, _abort) = consume_sse_stream(&mut byte_stream, &mut host, idle).await;
+            let lw = render.lines_written;
+            let md = render.md.take();
+            (result, Vec::new(), md, lw, String::new())
+        };
 
-    let result = TurnResult {
+    let mut result = TurnResult {
         core: sse_result.accum,
         ttft_ms: sse_result.ttft_ms,
         edge_tool_round,
     };
+    super::streaming_md::strip_xml_tags_inplace(&mut result.full_text);
+    super::streaming_md::strip_leading_narration(&mut result.full_text);
 
     if quiet || suppress_intermediate_output {
         return result;
     }
 
     // ─── Finalize incremental markdown ───────────────────────────────────
-    // When markdown rendering is active, text was already rendered during
-    // streaming. Intermediate drafts are discarded when tool execution starts,
-    // so only finalize turns that truly completed without more tool work.
-    if let Some(md) = &mut md_renderer {
-        if result.has_tool_calls {
-            // Some intermediate turns do not invoke the edge `execute_tool()`
-            // callback before the stream ends (for example, when tool calls are
-            // consumed by the later headless tool round). In those cases the
-            // draft prose would otherwise remain on screen and then be repeated
-            // by a later final answer. Always discard markdown drafts for any
-            // turn that still has pending tool work.
+    // Tool turns: discard ALL text (both rendered and buffered) — it's
+    // intermediate thinking that will be superseded by subsequent turns.
+    // Non-tool turns: the buffered text is the final answer — render it.
+    if result.has_tool_calls {
+        // Tool turn — discard everything
+        if let Some(md) = &mut md_renderer {
             md.discard_and_reset();
-        } else {
-            md.finish();
+        } else if lines_written > 0 && io::stdout().is_terminal() {
+            execute!(
+                io::stdout(),
+                cursor::MoveUp(lines_written as u16),
+                cursor::MoveToColumn(0),
+                terminal::Clear(terminal::ClearType::FromCursorDown)
+            )
+            .ok();
         }
-    } else if result.has_tool_calls && lines_written > 0 {
-        // Non-markdown, intermediate turn — clear raw streamed text.
-        execute!(
-            io::stdout(),
-            cursor::MoveUp(lines_written as u16),
-            cursor::MoveToColumn(0),
-            terminal::Clear(terminal::ClearType::FromCursorDown)
-        )
-        .ok();
-    } else if !result.full_text.is_empty() && !result.has_tool_calls {
-        // Non-markdown final turn: raw text was already printed via StreamText.
-        if !result.full_text.ends_with('\n') {
+        // pending_xml_buffer is discarded implicitly (not rendered)
+    } else {
+        // Final turn — render any pending buffer, then finalize
+        if !pending_xml_buffer.is_empty() {
+            let mut buf = pending_xml_buffer;
+            super::streaming_md::strip_xml_tags_inplace(&mut buf);
+            super::streaming_md::strip_leading_narration(&mut buf);
+            if !buf.is_empty() {
+                if let Some(md) = &mut md_renderer {
+                    md.push(&buf);
+                } else {
+                    print!("{buf}");
+                    let _ = io::stdout().flush();
+                }
+            }
+        }
+        if let Some(md) = &mut md_renderer {
+            md.finish();
+        } else if !result.full_text.is_empty() && !result.full_text.ends_with('\n') {
             println!();
         }
     }
@@ -697,6 +857,20 @@ mod tests {
         assert!(should_rerender_text(r.has_tool_calls));
     }
 
+    #[test]
+    fn final_text_cleanup_strips_reflect_tags() {
+        let mut text = "before\n<reflect>hidden</reflect>\nafter".to_string();
+        super::streaming_md::strip_xml_tags_inplace(&mut text);
+        assert_eq!(text, "before\nafter");
+    }
+
+    #[test]
+    fn final_text_cleanup_strips_think_tags() {
+        let mut text = "before\n<think>\nlong thinking block\n</think>\nafter".to_string();
+        super::streaming_md::strip_xml_tags_inplace(&mut text);
+        assert_eq!(text, "before\nafter");
+    }
+
     // ── Line tracking ────────────────────────────────────────────────
 
     #[test]
@@ -730,5 +904,34 @@ mod tests {
         s.track_output("Let me review the code\n"); // text_delta
         s.track_eprintln(); // ⚡ tool_request: bash
         assert_eq!(s.lines_written, 3);
+    }
+
+    // ── Partial tag detection ────────────────────────────────────────
+
+    #[test]
+    fn could_become_thinking_tag_matches_known_prefixes() {
+        assert!(could_become_thinking_tag("<"));
+        assert!(could_become_thinking_tag("</"));
+        assert!(could_become_thinking_tag("<t"));
+        assert!(could_become_thinking_tag("<th"));
+        assert!(could_become_thinking_tag("<thi"));
+        assert!(could_become_thinking_tag("<thin"));
+        assert!(could_become_thinking_tag("<think"));
+        assert!(could_become_thinking_tag("</think"));
+        assert!(could_become_thinking_tag("<r"));
+        assert!(could_become_thinking_tag("<ref"));
+        assert!(could_become_thinking_tag("</reflect"));
+    }
+
+    #[test]
+    fn could_become_thinking_tag_rejects_other_tags() {
+        // HTML tags that aren't thinking tags
+        assert!(!could_become_thinking_tag("<co")); // <code>
+        assert!(!could_become_thinking_tag("<p"));
+        assert!(!could_become_thinking_tag("<div"));
+        assert!(!could_become_thinking_tag("<span"));
+        assert!(!could_become_thinking_tag("</code"));
+        assert!(!could_become_thinking_tag("<a"));
+        assert!(!could_become_thinking_tag("<b"));
     }
 }

@@ -31,7 +31,6 @@ use mo_agent_runtime::{
     turn::chat_turn_heuristics::extract_repos_from_memory,
     turn::chat_turn_payload::{
         ChatTurnBasePayloadInput, chat_turn_base_payload, merge_active_skills_into_edge_profile,
-        merge_edge_profile_extensions, merge_invoked_skills_into_edge_profile,
         merge_skill_instructions_into_edge_profile, set_payload_tool_results_if_non_empty,
     },
     turn::chat_turn_selection_context::build_agentic_tool_selection_context,
@@ -44,7 +43,7 @@ use mo_agent_runtime::{
     turn::tool_schema_prune::pin_invoked_tool_schemas,
     turn::turn_guard::{TurnGuard, merge_deprioritized_tools_into_restricted},
 };
-use mo_agent_services::session_workspace;
+use serde_json::Value;
 
 use crate::{
     ExplainMode,
@@ -54,7 +53,6 @@ use crate::{
     skill_instructions::SharedSkillRegistry,
     stream_render::{EdgeSseContext, TurnResult, consume_turn_sse},
 };
-use serde_json::{Map, Value, json};
 
 use super::super::edge_executor::edge_executor_instance_id;
 
@@ -95,7 +93,6 @@ struct PrepareChatTurnRequest<'a> {
     file_context: &'a [String],
     assembly_start: Instant,
     telem: PrepareTurnTelemetry<'a>,
-    perm_manager: &'a PermissionManager,
 }
 
 async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
@@ -253,23 +250,15 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
         (selected, report, conf)
     };
 
-    let active_skill_names: Vec<String> = active_skills.iter().map(|s| (*s).to_string()).collect();
-    let (skill_instructions, activated_skill_names) = load_skill_instructions_text(
+    let skill_instructions = load_skill_instructions_text(
         ctx.skill_registry,
         &selected_skills,
         ctx.quiet,
         ctx.explain.explain_verbose,
     );
-    let mut invoked_this_turn: Vec<String> = Vec::new();
-    merge_skill_names_track(&mut invoked_this_turn, &selected_skills);
-    merge_skill_names_track(&mut invoked_this_turn, &active_skill_names);
-    merge_skill_names_track(&mut invoked_this_turn, &activated_skill_names);
-    merge_skill_names_track(ctx.telem.all_selected_skills, &invoked_this_turn);
-    merge_invoked_skills_into_edge_profile(&mut payload, invoked_this_turn.as_slice());
+    merge_skill_names_track(ctx.telem.all_selected_skills, &selected_skills);
 
     merge_skill_instructions_into_edge_profile(&mut payload, skill_instructions.as_deref());
-
-    merge_edge_cloud_audit_into_payload(&mut payload, ctx.current_session_id, ctx.perm_manager);
 
     capture_first_selection_report_if_empty(
         ctx.telem.first_selection_report,
@@ -312,67 +301,16 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
     payload
 }
 
-/// Session fork / multi-agent fields from `workspace.yaml` plus edge permission fingerprint for the server.
-fn merge_edge_cloud_audit_into_payload(
-    payload: &mut Value,
-    session_id: Option<&str>,
-    perm: &PermissionManager,
-) {
-    let mut ext = Map::new();
-
-    if let Some(sid) = session_id.filter(|s| !s.is_empty())
-        && let Ok(ws) = session_workspace::read_workspace(sid)
-    {
-        let mut lin = Map::new();
-        if let Some(ref p) = ws.parent_session_id {
-            lin.insert("parent_session_id".into(), json!(p));
-        }
-        if let Some(t) = ws.forked_at_turn {
-            lin.insert("forked_at_turn".into(), json!(t));
-        }
-        if let Some(ref n) = ws.fork_note {
-            lin.insert("fork_note".into(), json!(n));
-        }
-        if !lin.is_empty() {
-            ext.insert("session_lineage".into(), Value::Object(lin));
-        }
-
-        let mut coo = Map::new();
-        if let Some(ref c) = ws.correlation_id {
-            coo.insert("correlation_id".into(), json!(c));
-        }
-        if let Some(ref a) = ws.agent_role {
-            coo.insert("agent_role".into(), json!(a));
-        }
-        if !coo.is_empty() {
-            ext.insert("coordination".into(), Value::Object(coo));
-        }
-    }
-
-    let (mode, fp) = perm.edge_audit_summary();
-    ext.insert(
-        "edge_policy".into(),
-        json!({
-            "permission_mode": mode,
-            "rules_fingerprint": fp,
-        }),
-    );
-
-    merge_edge_profile_extensions(payload, &Value::Object(ext));
-}
-
 fn load_skill_instructions_text(
     skill_registry: &SharedSkillRegistry,
     selected_skills: &[String],
     quiet: bool,
     echo_skill_activation: bool,
-) -> (Option<String>, Vec<String>) {
+) -> Option<String> {
     if selected_skills.is_empty() {
-        return (None, Vec::new());
+        return None;
     }
-    let Some(mut reg) = skill_registry.try_write().ok() else {
-        return (None, Vec::new());
-    };
+    let mut reg = skill_registry.try_write().ok()?;
     let (outcomes, merged, activated_skills) =
         merge_skill_instruction_bodies_for_chat(selected_skills, |name| {
             reg.load_instructions(name).map_err(|e| e.to_string())?;
@@ -390,9 +328,7 @@ fn load_skill_instructions_text(
             );
         }
     }
-    let Some(merged) = merged else {
-        return (None, activated_skills);
-    };
+    let merged = merged?;
     if !quiet && echo_skill_activation && !activated_skills.is_empty() {
         eprintln!(
             "  {} Using skill: {}",
@@ -400,7 +336,7 @@ fn load_skill_instructions_text(
             skill_instruction_activated_names_csv(activated_skills.as_slice()).cyan()
         );
     }
-    (Some(merged), activated_skills)
+    Some(merged)
 }
 
 // ─── Fetch: payload → POST → consume_turn_sse ─────────────────────────────────
@@ -498,7 +434,6 @@ pub(crate) async fn fetch_chat_turn_sse(
         file_context,
         assembly_start,
         telem,
-        perm_manager,
     })
     .await;
 
@@ -523,6 +458,7 @@ pub(crate) async fn fetch_chat_turn_sse(
         executor_id: edge_executor_instance_id(),
         executor,
         quiet,
+        suppress_intermediate_output,
         perm_manager: Some(perm_manager),
     };
 

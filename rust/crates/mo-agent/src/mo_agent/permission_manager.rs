@@ -159,6 +159,7 @@ pub(super) struct PermissionManager {
 
 impl PermissionManager {
     /// Label + stable fingerprint of loaded rules (for `edge_profile` / cloud audit).
+    #[allow(dead_code)]
     pub(super) fn edge_audit_summary(&self) -> (String, String) {
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
