@@ -559,6 +559,9 @@ impl StepRecorder {
                 .current_step
                 .as_ref()
                 .and_then(|s| s.execution.memory_context.clone()),
+            delegation_id: None,
+            delegation_pattern: None,
+            delegation_sub_run_summaries: Vec::new(),
         })
     }
 

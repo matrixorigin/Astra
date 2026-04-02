@@ -15,6 +15,7 @@ pub fn journal_record_duplicate_within_turn(
         input_bytes: None,
         output_bytes: None,
         args_preview,
+        result_preview: None,
     }
 }
 
@@ -32,6 +33,7 @@ pub fn journal_record_cross_turn_cache_hit(
         input_bytes: None,
         output_bytes: Some(output_len),
         args_preview,
+        result_preview: None,
     }
 }
 
@@ -45,6 +47,7 @@ pub fn journal_record_unknown_tool(name: String) -> ToolCallRecord {
         input_bytes: None,
         output_bytes: None,
         args_preview: None,
+        result_preview: None,
     }
 }
 
@@ -57,21 +60,32 @@ pub fn journal_record_executed_tool_call(
     result_str: &str,
     args_preview: Option<String>,
 ) -> ToolCallRecord {
+    // Truncate to 500 chars for cloud audit (up from 200, multi-line)
+    let preview: String = result_str.chars().take(500).collect();
+    let result_preview = if preview.is_empty() {
+        None
+    } else {
+        Some(if result_str.chars().count() > 500 {
+            format!("{preview}…")
+        } else {
+            preview
+        })
+    };
+
     ToolCallRecord {
         name,
         ok: !is_err,
         ms: tool_elapsed_ms,
         error: if is_err {
-            result_str
-                .lines()
-                .next()
-                .map(|l| l.chars().take(200).collect())
+            // Keep up to 500 chars of error (multi-line) for better diagnostics
+            Some(result_str.chars().take(500).collect())
         } else {
             None
         },
         input_bytes: Some(args_size),
         output_bytes: Some(result_str.len() as u32),
         args_preview,
+        result_preview,
     }
 }
 
@@ -100,10 +114,31 @@ mod tests {
     }
 
     #[test]
-    fn executed_record_truncates_error_line() {
+    fn executed_record_truncates_error_to_500_chars() {
         let r =
             journal_record_executed_tool_call("bash".into(), true, 10, 2, "first line\nrest", None);
-        assert_eq!(r.error.as_deref(), Some("first line"));
+        // Now keeps multi-line errors (up to 500 chars)
+        assert_eq!(r.error.as_deref(), Some("first line\nrest"));
         assert_eq!(r.output_bytes, Some(15));
+        // result_preview also populated for errors
+        assert_eq!(r.result_preview.as_deref(), Some("first line\nrest"));
+    }
+
+    #[test]
+    fn executed_record_result_preview_truncates_long_output() {
+        let long_output = "x".repeat(600);
+        let r = journal_record_executed_tool_call("grep".into(), false, 5, 10, &long_output, None);
+        assert!(r.ok);
+        assert!(r.error.is_none());
+        let preview = r.result_preview.unwrap();
+        assert_eq!(preview.chars().count(), 501); // 500 + "…"
+        assert!(preview.ends_with('…'));
+    }
+
+    #[test]
+    fn executed_record_error_truncates_at_500_chars() {
+        let long_error = "E".repeat(600);
+        let r = journal_record_executed_tool_call("bash".into(), true, 5, 10, &long_error, None);
+        assert_eq!(r.error.unwrap().len(), 500);
     }
 }

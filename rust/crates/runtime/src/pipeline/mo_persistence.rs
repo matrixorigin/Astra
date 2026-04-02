@@ -109,6 +109,9 @@ impl MatrixOneCheckpointWriter {
                     recent_tools: Vec::new(),
                     learning_snapshot_id: None,
                     memory_context: step.execution.memory_context.clone(),
+                    delegation_id: None,
+                    delegation_pattern: None,
+                    delegation_sub_run_summaries: Vec::new(),
                 };
                 StepCheckpoint::Heavy(Box::new(heavy))
             }
@@ -593,6 +596,9 @@ mod tests {
             recent_tools: vec!["read_file".to_string()],
             learning_snapshot_id: Some("snap-1".to_string()),
             memory_context: None,
+            delegation_id: None,
+            delegation_pattern: None,
+            delegation_sub_run_summaries: Vec::new(),
         };
         let cp = StepCheckpoint::Heavy(Box::new(heavy));
         let json = serde_json::to_string(&cp).unwrap();

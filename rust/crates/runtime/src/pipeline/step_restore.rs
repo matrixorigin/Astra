@@ -462,6 +462,9 @@ mod tests {
             recent_tools: vec!["git_status".to_string()],
             learning_snapshot_id: Some("snap-123".to_string()),
             memory_context: None,
+            delegation_id: None,
+            delegation_pattern: None,
+            delegation_sub_run_summaries: Vec::new(),
         }
     }
 

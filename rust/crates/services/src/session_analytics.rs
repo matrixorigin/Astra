@@ -288,6 +288,7 @@ mod tests {
                 input_bytes: None,
                 output_bytes: None,
                 args_preview: None,
+                result_preview: None,
             },
             crate::session_journal::ToolCallRecord {
                 name: "grep".into(),
@@ -297,6 +298,7 @@ mod tests {
                 input_bytes: None,
                 output_bytes: None,
                 args_preview: None,
+                result_preview: None,
             },
             crate::session_journal::ToolCallRecord {
                 name: "write_file".into(),
@@ -306,6 +308,7 @@ mod tests {
                 input_bytes: None,
                 output_bytes: None,
                 args_preview: None,
+                result_preview: None,
             },
         ]);
         let stats = compute_session_stats("s1", &[turn]);
@@ -369,6 +372,7 @@ mod tests {
             input_bytes: None,
             output_bytes: None,
             args_preview: None,
+            result_preview: None,
         }
     }
 

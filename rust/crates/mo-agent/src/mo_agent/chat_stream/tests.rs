@@ -16,6 +16,7 @@ fn tool_call_record_covers_early_exit_paths() {
         input_bytes: None,
         output_bytes: None,
         args_preview: Some("src/main.rs".to_string()),
+        result_preview: None,
     };
     assert!(dup.ok);
     assert_eq!(dup.ms, 0);
@@ -29,6 +30,7 @@ fn tool_call_record_covers_early_exit_paths() {
         input_bytes: None,
         output_bytes: Some(500),
         args_preview: Some("/TODO/ in src/".to_string()),
+        result_preview: None,
     };
     assert!(cached.ok);
 
@@ -41,6 +43,7 @@ fn tool_call_record_covers_early_exit_paths() {
         input_bytes: None,
         output_bytes: None,
         args_preview: None,
+        result_preview: None,
     };
     assert!(!unknown.ok);
     assert!(unknown.error.as_ref().unwrap().starts_with("unknown_tool:"));
@@ -54,6 +57,7 @@ fn tool_call_record_covers_early_exit_paths() {
         input_bytes: None,
         output_bytes: None,
         args_preview: Some("rm -rf /".to_string()),
+        result_preview: None,
     };
     assert!(!denied.ok);
 
@@ -79,6 +83,7 @@ fn tool_call_record_json_roundtrip() {
         input_bytes: Some(100),
         output_bytes: Some(5000),
         args_preview: Some("https://example.com".to_string()),
+        result_preview: None,
     };
     let json = serde_json::to_string(&original).unwrap();
     let restored: ToolCallRecord = serde_json::from_str(&json).unwrap();

@@ -821,9 +821,31 @@ pub struct HeavyCheckpoint {
     pub learning_snapshot_id: Option<String>,
     /// Memory context snapshot (for auditing)
     pub memory_context: Option<MemoryContext>,
+    /// Active delegation ID (if running inside a delegation)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delegation_id: Option<String>,
+    /// Delegation pattern (fan_out, sequential, adversarial)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delegation_pattern: Option<String>,
+    /// Completed sub-run summaries for delegation recovery
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub delegation_sub_run_summaries: Vec<DelegationSubRunSummary>,
 }
 
 /// Unified checkpoint type (stored in Step)
+/// Summary of a completed delegation sub-run, stored in HeavyCheckpoint for recovery.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DelegationSubRunSummary {
+    pub run_id: String,
+    pub agent_id: String,
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+    pub tool_calls: u32,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum StepCheckpoint {
     Light(LightCheckpoint),
@@ -875,6 +897,9 @@ impl StepCheckpoint {
             recent_tools: Vec::new(),
             learning_snapshot_id: None,
             memory_context: None,
+            delegation_id: None,
+            delegation_pattern: None,
+            delegation_sub_run_summaries: Vec::new(),
         }))
     }
 
@@ -2840,6 +2865,9 @@ mod tests {
             recent_tools: vec![],
             learning_snapshot_id: None,
             memory_context: None,
+            delegation_id: None,
+            delegation_pattern: None,
+            delegation_sub_run_summaries: Vec::new(),
         }));
         let err = cp.validate().unwrap_err();
         assert!(matches!(err, ProtocolError::CheckpointCorrupt(_)));
@@ -2867,6 +2895,9 @@ mod tests {
             recent_tools: vec![],
             learning_snapshot_id: None,
             memory_context: None,
+            delegation_id: None,
+            delegation_pattern: None,
+            delegation_sub_run_summaries: Vec::new(),
         }));
         assert!(cp.validate().is_ok());
     }

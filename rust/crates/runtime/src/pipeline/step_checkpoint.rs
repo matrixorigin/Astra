@@ -414,6 +414,9 @@ mod tests {
             recent_tools: vec!["grep".to_string(), "read_file".to_string()],
             learning_snapshot_id: None,
             memory_context: None,
+            delegation_id: None,
+            delegation_pattern: None,
+            delegation_sub_run_summaries: Vec::new(),
         }
     }
 

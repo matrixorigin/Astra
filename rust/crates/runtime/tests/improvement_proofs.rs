@@ -4971,6 +4971,9 @@ mod file_event_store_proofs {
             recent_tools: vec!["read_file".to_string()],
             learning_snapshot_id: None,
             memory_context: None,
+            delegation_id: None,
+            delegation_pattern: None,
+            delegation_sub_run_summaries: Vec::new(),
         };
         let ckpt = StepCheckpoint::Heavy(Box::new(heavy));
         write_step_checkpoint(&sid, 1, &ckpt).unwrap();
@@ -6114,6 +6117,9 @@ mod crash_recovery_proofs {
                 cluster_insights: vec![],
                 snapshot_id: None,
             }),
+            delegation_id: None,
+            delegation_pattern: None,
+            delegation_sub_run_summaries: Vec::new(),
         };
 
         // Serialize → deserialize roundtrip
@@ -6156,6 +6162,9 @@ mod crash_recovery_proofs {
             recent_tools: vec![],
             learning_snapshot_id: None,
             memory_context: None,
+            delegation_id: None,
+            delegation_pattern: None,
+            delegation_sub_run_summaries: Vec::new(),
         };
 
         // Simulate: slots 0,1 completed; slot 2 failed; slot 3 running; slot 4 pending
@@ -6303,6 +6312,9 @@ mod crash_recovery_proofs {
             recent_tools: vec![],
             learning_snapshot_id: None,
             memory_context: None,
+            delegation_id: None,
+            delegation_pattern: None,
+            delegation_sub_run_summaries: Vec::new(),
         };
 
         // Strict should reject
@@ -6980,6 +6992,9 @@ mod checkpoint_cloud_persistence_proofs {
             recent_tools: vec!["grep".to_string(), "read_file".to_string()],
             learning_snapshot_id: Some("snap-xyz".to_string()),
             memory_context: None,
+            delegation_id: None,
+            delegation_pattern: None,
+            delegation_sub_run_summaries: Vec::new(),
         }
     }
 
@@ -7098,6 +7113,9 @@ mod checkpoint_cloud_persistence_proofs {
             recent_tools: Vec::new(),
             learning_snapshot_id: None,
             memory_context: None,
+            delegation_id: None,
+            delegation_pattern: None,
+            delegation_sub_run_summaries: Vec::new(),
         }));
         let json = serde_json::to_string(&cp).unwrap();
         let restored: StepCheckpoint = serde_json::from_str(&json).unwrap();

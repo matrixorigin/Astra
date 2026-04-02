@@ -674,6 +674,70 @@ pub(super) fn handle_session_command(arg: &str, state: &mut ReplState) {
                                     note.dim()
                                 );
                             }
+                            session_journal::JournalEventType::DelegationStarted => {
+                                let pattern = evt
+                                    .metadata
+                                    .as_ref()
+                                    .and_then(|m| m.get("pattern"))
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("?");
+                                let count = evt
+                                    .metadata
+                                    .as_ref()
+                                    .and_then(|m| m.get("agent_count"))
+                                    .and_then(|v| v.as_u64())
+                                    .unwrap_or(0);
+                                eprintln!(
+                                    "  {} {} delegation started ({}, {} agents)",
+                                    ts_short.dim(),
+                                    "⑂".cyan(),
+                                    pattern,
+                                    count,
+                                );
+                            }
+                            session_journal::JournalEventType::DelegationSubRunCompleted => {
+                                let agent = evt
+                                    .metadata
+                                    .as_ref()
+                                    .and_then(|m| m.get("agent_id"))
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("?");
+                                let status = evt
+                                    .metadata
+                                    .as_ref()
+                                    .and_then(|m| m.get("status"))
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("?");
+                                let icon = if status == "completed" { "✓" } else { "✗" };
+                                eprintln!(
+                                    "  {} {} sub-run {} → {}",
+                                    ts_short.dim(),
+                                    icon.cyan(),
+                                    agent,
+                                    status,
+                                );
+                            }
+                            session_journal::JournalEventType::DelegationCompleted => {
+                                let succeeded = evt
+                                    .metadata
+                                    .as_ref()
+                                    .and_then(|m| m.get("succeeded"))
+                                    .and_then(|v| v.as_u64())
+                                    .unwrap_or(0);
+                                let failed = evt
+                                    .metadata
+                                    .as_ref()
+                                    .and_then(|m| m.get("failed"))
+                                    .and_then(|v| v.as_u64())
+                                    .unwrap_or(0);
+                                eprintln!(
+                                    "  {} {} delegation done ({} ok, {} failed)",
+                                    ts_short.dim(),
+                                    "⑂".green(),
+                                    succeeded,
+                                    failed,
+                                );
+                            }
                         }
                     }
                     // Summary stats

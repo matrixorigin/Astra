@@ -373,7 +373,7 @@ pub struct ToolCallRecord {
     pub ok: bool,
     /// Execution time in milliseconds.
     pub ms: u64,
-    /// Error message if the call failed.
+    /// Error message if the call failed (first 500 chars).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     /// Input size in bytes (arguments/parameters).
@@ -385,6 +385,9 @@ pub struct ToolCallRecord {
     /// Preview of tool arguments (truncated to ~80 chars).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub args_preview: Option<String>,
+    /// Preview of tool result (truncated to 500 chars) for cloud audit trail.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result_preview: Option<String>,
 }
 
 /// A single journal event (one line in the JSONL file).
@@ -525,6 +528,12 @@ pub enum JournalEventType {
     SessionFork,
     /// Cloud–edge policy ack, agent handoff, or other sync metadata (lightweight).
     SyncMarker,
+    /// Delegation group started (sub-run group spawned).
+    DelegationStarted,
+    /// A single sub-run within a delegation completed.
+    DelegationSubRunCompleted,
+    /// Delegation completed (all sub-runs done, results aggregated).
+    DelegationCompleted,
 }
 
 /// Writer that appends events to a session journal file.
@@ -1180,6 +1189,67 @@ impl JournalEvent {
         }));
         evt
     }
+
+    /// Delegation started event — emitted when a delegation group is spawned.
+    pub fn delegation_started(
+        session_id: Option<&str>,
+        delegation_id: &str,
+        parent_run_id: &str,
+        pattern: &str,
+        agent_ids: &[String],
+    ) -> Self {
+        let mut evt = Self::base(JournalEventType::DelegationStarted, session_id);
+        evt.metadata = Some(serde_json::json!({
+            "delegation_id": delegation_id,
+            "parent_run_id": parent_run_id,
+            "pattern": pattern,
+            "agent_ids": agent_ids,
+            "agent_count": agent_ids.len(),
+        }));
+        evt
+    }
+
+    /// Delegation sub-run completed event — emitted when a single sub-run finishes.
+    pub fn delegation_sub_run_completed(
+        session_id: Option<&str>,
+        delegation_id: &str,
+        sub_run_id: &str,
+        agent_id: &str,
+        status: &str,
+        error: Option<&str>,
+    ) -> Self {
+        let mut evt = Self::base(JournalEventType::DelegationSubRunCompleted, session_id);
+        evt.metadata = Some(serde_json::json!({
+            "delegation_id": delegation_id,
+            "sub_run_id": sub_run_id,
+            "agent_id": agent_id,
+            "status": status,
+            "error": error,
+        }));
+        evt
+    }
+
+    /// Delegation completed event — emitted when all sub-runs finish and results aggregate.
+    pub fn delegation_completed(
+        session_id: Option<&str>,
+        delegation_id: &str,
+        pattern: &str,
+        total_sub_runs: usize,
+        succeeded: usize,
+        failed: usize,
+        aggregated_status: &str,
+    ) -> Self {
+        let mut evt = Self::base(JournalEventType::DelegationCompleted, session_id);
+        evt.metadata = Some(serde_json::json!({
+            "delegation_id": delegation_id,
+            "pattern": pattern,
+            "total_sub_runs": total_sub_runs,
+            "succeeded": succeeded,
+            "failed": failed,
+            "aggregated_status": aggregated_status,
+        }));
+        evt
+    }
 }
 
 /// Truncate a string to max chars (for journal size control).
@@ -1578,6 +1648,7 @@ mod tests {
             input_bytes: None,
             output_bytes: None,
             args_preview: Some("owner/repo".into()),
+            result_preview: None,
         };
         let json = serde_json::to_string(&record).unwrap();
         assert!(json.contains("\"ok\":true"));
@@ -1599,6 +1670,7 @@ mod tests {
             input_bytes: None,
             output_bytes: None,
             args_preview: None,
+            result_preview: None,
         };
         let json = serde_json::to_string(&record).unwrap();
         assert!(json.contains("\"ok\":false"));
@@ -1635,6 +1707,7 @@ mod tests {
             input_bytes: None,
             output_bytes: None,
             args_preview: Some("owner/repo".into()),
+            result_preview: None,
         }]);
         let json = serde_json::to_string(&evt).unwrap();
         let parsed: JournalEvent = serde_json::from_str(&json).unwrap();
@@ -1682,6 +1755,7 @@ mod tests {
                 input_bytes: None,
                 output_bytes: None,
                 args_preview: None,
+                result_preview: None,
             })
             .collect();
         let json = serde_json::to_string(&records).unwrap();
@@ -1701,6 +1775,7 @@ mod tests {
             input_bytes: None,
             output_bytes: None,
             args_preview: None,
+            result_preview: None,
         };
         let json = serde_json::to_string(&record).unwrap();
         let parsed: ToolCallRecord = serde_json::from_str(&json).unwrap();
@@ -1717,6 +1792,7 @@ mod tests {
             input_bytes: None,
             output_bytes: None,
             args_preview: None,
+            result_preview: None,
         };
         let json = serde_json::to_string(&record).unwrap();
         let parsed: ToolCallRecord = serde_json::from_str(&json).unwrap();
@@ -2172,5 +2248,55 @@ mod tests {
         for (_, path) in &created {
             let _ = std::fs::remove_file(path);
         }
+    }
+
+    #[test]
+    fn delegation_started_event_builder() {
+        let agents = vec!["agent-a".to_string(), "agent-b".to_string()];
+        let evt =
+            JournalEvent::delegation_started(Some("s1"), "del-1", "run-parent", "fan_out", &agents);
+        assert_eq!(evt.event_type, JournalEventType::DelegationStarted);
+        let meta = evt.metadata.as_ref().unwrap();
+        assert_eq!(meta["delegation_id"], "del-1");
+        assert_eq!(meta["pattern"], "fan_out");
+        assert_eq!(meta["agent_count"], 2);
+    }
+
+    #[test]
+    fn delegation_sub_run_completed_event_builder() {
+        let evt = JournalEvent::delegation_sub_run_completed(
+            Some("s1"),
+            "del-1",
+            "run-sub-1",
+            "agent-a",
+            "completed",
+            None,
+        );
+        assert_eq!(evt.event_type, JournalEventType::DelegationSubRunCompleted);
+        let meta = evt.metadata.as_ref().unwrap();
+        assert_eq!(meta["agent_id"], "agent-a");
+        assert_eq!(meta["status"], "completed");
+        assert!(meta["error"].is_null());
+    }
+
+    #[test]
+    fn delegation_completed_event_builder() {
+        let evt =
+            JournalEvent::delegation_completed(Some("s1"), "del-1", "fan_out", 3, 2, 1, "partial");
+        assert_eq!(evt.event_type, JournalEventType::DelegationCompleted);
+        let meta = evt.metadata.as_ref().unwrap();
+        assert_eq!(meta["succeeded"], 2);
+        assert_eq!(meta["failed"], 1);
+        assert_eq!(meta["aggregated_status"], "partial");
+    }
+
+    #[test]
+    fn delegation_events_serialize_roundtrip() {
+        let agents = vec!["a1".to_string()];
+        let evt = JournalEvent::delegation_started(Some("s1"), "d1", "r1", "sequential", &agents);
+        let json = serde_json::to_string(&evt).unwrap();
+        let parsed: JournalEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.event_type, JournalEventType::DelegationStarted);
+        assert!(json.contains("\"delegation_id\":\"d1\""));
     }
 }
