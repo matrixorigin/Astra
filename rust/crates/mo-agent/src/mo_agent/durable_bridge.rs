@@ -467,13 +467,28 @@ fn display_delivery_report(report: &TaskDeliveryReport) {
 
 // ─── Lifecycle factory ───────────────────────────────────────────────────────
 
-/// Create a [`LocalDurableTaskLifecycle`] for the current working directory.
+/// Create a [`LocalDurableTaskLifecycle`] with optional cloud event streaming.
 ///
 /// Uses the session directory as the persistence root and the cwd as the work_dir
-/// for the embedded [`VerificationRunner`].
+/// for the embedded [`VerificationRunner`]. When an `IngestionSender` is provided,
+/// verification events are streamed to the cloud asynchronously (local-first with
+/// cloud event streaming).
+/// Convenience wrapper without cloud event streaming (used in tests).
+#[cfg(test)]
 pub fn create_local_lifecycle(
     session_dir: &std::path::Path,
     work_dir: &std::path::Path,
+) -> Arc<dyn DurableTaskLifecycle> {
+    create_local_lifecycle_with_sender(session_dir, work_dir, None, None, None)
+}
+
+/// Like [`create_local_lifecycle`] but also wires cloud event streaming.
+pub fn create_local_lifecycle_with_sender(
+    session_dir: &std::path::Path,
+    work_dir: &std::path::Path,
+    sender: Option<mo_agent_services::event_ingestion::IngestionSender>,
+    session_id: Option<&str>,
+    user_id: Option<&str>,
 ) -> Arc<dyn DurableTaskLifecycle> {
     let contracts_dir = session_dir.join("contracts");
     let _ = std::fs::create_dir_all(&contracts_dir);
@@ -482,6 +497,14 @@ pub fn create_local_lifecycle(
     // Wire up LLM judge for semantic verification (if API key available)
     if let Some(judge) = HttpLlmJudge::from_env() {
         lifecycle.set_llm_judge(Arc::new(judge));
+    }
+
+    // Wire up cloud event streaming (if sender available)
+    if let Some(s) = sender {
+        lifecycle.set_event_sender(s);
+    }
+    if let (Some(sid), Some(uid)) = (session_id, user_id) {
+        lifecycle.set_session_context(sid, uid);
     }
 
     Arc::new(lifecycle)

@@ -18,6 +18,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
+use crate::event_ingestion::{IngestionEvent, IngestionSender};
 use crate::task_orchestrator::{TaskCheckpoint, TaskPlan};
 
 // ─── LLM Judge Trait ────────────────────────────────────────────────────────
@@ -1433,6 +1434,11 @@ pub struct MatrixOneDurableTaskLifecycle {
     branch_ops: Arc<dyn TaskBranchOps>,
     work_dir: std::path::PathBuf,
     llm_judge: Option<Arc<dyn LlmJudge>>,
+    event_sender: Option<IngestionSender>,
+    /// Session ID for event attribution.
+    session_id: String,
+    /// User ID for event attribution.
+    user_id: String,
 }
 
 impl MatrixOneDurableTaskLifecycle {
@@ -1443,6 +1449,9 @@ impl MatrixOneDurableTaskLifecycle {
             branch_ops,
             work_dir,
             llm_judge: None,
+            event_sender: None,
+            session_id: String::new(),
+            user_id: String::new(),
         }
     }
 
@@ -1461,6 +1470,9 @@ impl MatrixOneDurableTaskLifecycle {
             branch_ops,
             work_dir,
             llm_judge: None,
+            event_sender: None,
+            session_id: String::new(),
+            user_id: String::new(),
         }
     }
 
@@ -1469,11 +1481,58 @@ impl MatrixOneDurableTaskLifecycle {
         self.llm_judge = Some(judge);
     }
 
+    /// Set the event sender for pushing verification events to the cloud stream.
+    pub fn set_event_sender(&mut self, sender: IngestionSender) {
+        self.event_sender = Some(sender);
+    }
+
+    /// Set session context for event attribution.
+    pub fn set_session_context(&mut self, session_id: &str, user_id: &str) {
+        self.session_id = session_id.to_string();
+        self.user_id = user_id.to_string();
+    }
+
     fn runner(&self) -> VerificationRunner {
         match &self.llm_judge {
             Some(j) => VerificationRunner::with_llm_judge(self.work_dir.clone(), j.clone()),
             None => VerificationRunner::new(self.work_dir.clone()),
         }
+    }
+
+    /// Emit a verification-related event to the cloud event stream.
+    /// No-op if event_sender is not configured.
+    fn emit_event(&self, event_type: &str, metadata: serde_json::Value) {
+        let Some(sender) = &self.event_sender else {
+            return;
+        };
+        let event_id = {
+            use std::collections::hash_map::DefaultHasher;
+            use std::hash::{Hash, Hasher};
+            let mut hasher = DefaultHasher::new();
+            self.session_id.hash(&mut hasher);
+            event_type.hash(&mut hasher);
+            chrono::Utc::now().timestamp_nanos_opt().hash(&mut hasher);
+            format!("vfy-{:016x}", hasher.finish())
+        };
+        let content = metadata
+            .get("subtask_id")
+            .and_then(|v| v.as_str())
+            .map(|id| format!("{event_type}: {id}"))
+            .unwrap_or_else(|| event_type.to_string());
+        sender.enqueue(IngestionEvent {
+            event_id,
+            session_id: self.session_id.clone(),
+            user_id: self.user_id.clone(),
+            event_type: event_type.to_string(),
+            content: Some(content),
+            token_usage: None,
+            llm_model_used: None,
+            skill_name: None,
+            metadata: Some(metadata),
+            created_at: chrono::Utc::now().to_rfc3339(),
+            parent_event_id: None,
+            causal_chain_id: None,
+        });
     }
 
     // ── Private Helpers ──
@@ -1877,6 +1936,17 @@ impl DurableTaskLifecycle for MatrixOneDurableTaskLifecycle {
 
         subtask.stage = SubtaskStage::Executing;
         self.persist_contract(&contract).await?;
+
+        self.emit_event(
+            "subtask_started",
+            serde_json::json!({
+                "task_id": task_id,
+                "subtask_id": subtask_id,
+                "title": ctx.title,
+                "criteria_count": ctx.criteria.len(),
+            }),
+        );
+
         Ok(ctx)
     }
 
@@ -1966,6 +2036,16 @@ impl DurableTaskLifecycle for MatrixOneDurableTaskLifecycle {
         }
         let durable_st = subtask.clone();
 
+        self.emit_event(
+            "verification_started",
+            serde_json::json!({
+                "task_id": task_id,
+                "subtask_id": subtask_id,
+                "criteria_count": durable_st.criteria.len(),
+                "attempt": durable_st.retry_count + 1,
+            }),
+        );
+
         // Run verification
         let runner = self.runner();
         let report = runner.verify_subtask(&durable_st).await;
@@ -1976,7 +2056,7 @@ impl DurableTaskLifecycle for MatrixOneDurableTaskLifecycle {
                 .save_verification_result(
                     task_id,
                     &contract.contract_id,
-                    "", // session from context
+                    &self.session_id,
                     subtask_id,
                     r,
                     durable_st.retry_count + 1,
@@ -2021,6 +2101,27 @@ impl DurableTaskLifecycle for MatrixOneDurableTaskLifecycle {
         }
 
         self.persist_contract(&contract).await?;
+
+        // Emit verification result event
+        let passed_count = report.results.iter().filter(|r| r.passed).count();
+        let total_count = report.results.len();
+        let event_type = if report.all_required_passed {
+            "verification_passed"
+        } else {
+            "verification_failed"
+        };
+        self.emit_event(
+            event_type,
+            serde_json::json!({
+                "task_id": task_id,
+                "subtask_id": subtask_id,
+                "passed": passed_count,
+                "total": total_count,
+                "all_required_passed": report.all_required_passed,
+                "attempt": durable_st.retry_count + 1,
+            }),
+        );
+
         Ok(report)
     }
 
@@ -2044,12 +2145,32 @@ impl DurableTaskLifecycle for MatrixOneDurableTaskLifecycle {
             ));
         }
 
+        self.emit_event(
+            "global_verification_started",
+            serde_json::json!({
+                "task_id": task_id,
+                "criteria_count": contract.global_verification.len(),
+            }),
+        );
+
         let runner = self.runner();
         let mut results = Vec::new();
         for criterion in &contract.global_verification {
             let result = runner.run_criterion(criterion).await;
             results.push(result);
         }
+
+        let all_passed = results.iter().all(|r| r.passed);
+        self.emit_event(
+            "global_verification_completed",
+            serde_json::json!({
+                "task_id": task_id,
+                "passed": results.iter().filter(|r| r.passed).count(),
+                "total": results.len(),
+                "all_passed": all_passed,
+            }),
+        );
+
         Ok(results)
     }
 
@@ -2164,6 +2285,16 @@ impl DurableTaskLifecycle for MatrixOneDurableTaskLifecycle {
         contract.updated_at = chrono::Utc::now().to_rfc3339();
         self.persist_contract(&contract).await?;
 
+        self.emit_event("task_delivered", serde_json::json!({
+            "task_id": task_id,
+            "contract_id": report.contract_id,
+            "goal": report.goal,
+            "subtasks_completed": report.subtask_summaries.len(),
+            "total_verifications": report.total_verifications,
+            "global_checks_passed": report.global_verification.iter().filter(|r| r.passed).count(),
+            "global_checks_total": report.global_verification.len(),
+        }));
+
         Ok(report)
     }
 
@@ -2190,6 +2321,10 @@ pub struct LocalDurableTaskLifecycle {
     branch_ops: Arc<dyn TaskBranchOps>,
     work_dir: std::path::PathBuf,
     llm_judge: Option<Arc<dyn LlmJudge>>,
+    /// Optional cloud event sender for pushing verification events.
+    event_sender: Option<IngestionSender>,
+    session_id: String,
+    user_id: String,
 }
 
 impl LocalDurableTaskLifecycle {
@@ -2208,6 +2343,9 @@ impl LocalDurableTaskLifecycle {
             branch_ops,
             work_dir,
             llm_judge: None,
+            event_sender: None,
+            session_id: String::new(),
+            user_id: String::new(),
         }
     }
 
@@ -2222,12 +2360,62 @@ impl LocalDurableTaskLifecycle {
             branch_ops,
             work_dir,
             llm_judge: None,
+            event_sender: None,
+            session_id: String::new(),
+            user_id: String::new(),
         }
     }
 
     /// Set the LLM judge for semantic verification.
     pub fn set_llm_judge(&mut self, judge: Arc<dyn LlmJudge>) {
         self.llm_judge = Some(judge);
+    }
+
+    /// Set the event sender for pushing verification events to the cloud stream.
+    pub fn set_event_sender(&mut self, sender: IngestionSender) {
+        self.event_sender = Some(sender);
+    }
+
+    /// Set session context for event attribution.
+    pub fn set_session_context(&mut self, session_id: &str, user_id: &str) {
+        self.session_id = session_id.to_string();
+        self.user_id = user_id.to_string();
+    }
+
+    /// Emit a verification-related event to the cloud event stream.
+    /// No-op if event_sender is not configured.
+    fn emit_event(&self, event_type: &str, metadata: serde_json::Value) {
+        let Some(sender) = &self.event_sender else {
+            return;
+        };
+        let event_id = {
+            use std::collections::hash_map::DefaultHasher;
+            use std::hash::{Hash, Hasher};
+            let mut hasher = DefaultHasher::new();
+            self.session_id.hash(&mut hasher);
+            event_type.hash(&mut hasher);
+            chrono::Utc::now().timestamp_nanos_opt().hash(&mut hasher);
+            format!("vfy-{:016x}", hasher.finish())
+        };
+        let content = metadata
+            .get("subtask_id")
+            .and_then(|v| v.as_str())
+            .map(|id| format!("{event_type}: {id}"))
+            .unwrap_or_else(|| event_type.to_string());
+        sender.enqueue(IngestionEvent {
+            event_id,
+            session_id: self.session_id.clone(),
+            user_id: self.user_id.clone(),
+            event_type: event_type.to_string(),
+            content: Some(content),
+            token_usage: None,
+            llm_model_used: None,
+            skill_name: None,
+            metadata: Some(metadata),
+            created_at: chrono::Utc::now().to_rfc3339(),
+            parent_event_id: None,
+            causal_chain_id: None,
+        });
     }
 
     fn make_runner(&self) -> VerificationRunner {
@@ -2402,6 +2590,14 @@ impl DurableTaskLifecycle for LocalDurableTaskLifecycle {
         };
         subtask.stage = SubtaskStage::Executing;
         self.save_local(&contract)?;
+        self.emit_event(
+            "subtask_started",
+            serde_json::json!({
+                "task_id": task_id,
+                "subtask_id": subtask_id,
+                "contract_id": contract.contract_id,
+            }),
+        );
         Ok(ctx)
     }
 
@@ -2489,9 +2685,34 @@ impl DurableTaskLifecycle for LocalDurableTaskLifecycle {
             ));
         }
 
+        self.emit_event(
+            "verification_started",
+            serde_json::json!({
+                "task_id": task_id,
+                "subtask_id": subtask_id,
+                "contract_id": contract.contract_id,
+            }),
+        );
+
         let runner = self.make_runner();
         // Per-subtask: use local verification (skips global_only & LlmJudge)
         let report = runner.verify_subtask_local(&durable_st).await;
+
+        let event_type = if report.all_required_passed {
+            "verification_passed"
+        } else {
+            "verification_failed"
+        };
+        self.emit_event(
+            event_type,
+            serde_json::json!({
+                "task_id": task_id,
+                "subtask_id": subtask_id,
+                "contract_id": contract.contract_id,
+                "passed": report.all_required_passed,
+                "results_count": report.results.len(),
+            }),
+        );
 
         let snapshot_name = durable_st.snapshot_name.clone();
         let subtask = contract
@@ -2532,11 +2753,29 @@ impl DurableTaskLifecycle for LocalDurableTaskLifecycle {
         let contract = self
             .find_by_task(task_id)?
             .ok_or_else(|| format!("no contract for task '{task_id}'"))?;
+        self.emit_event(
+            "global_verification_started",
+            serde_json::json!({
+                "task_id": task_id,
+                "contract_id": contract.contract_id,
+                "criteria_count": contract.global_verification.len(),
+            }),
+        );
         let runner = self.make_runner();
         let mut results = Vec::new();
         for c in &contract.global_verification {
             results.push(runner.run_criterion(c).await);
         }
+        let all_passed = results.iter().all(|r| r.passed);
+        self.emit_event(
+            "global_verification_completed",
+            serde_json::json!({
+                "task_id": task_id,
+                "contract_id": contract.contract_id,
+                "all_passed": all_passed,
+                "results_count": results.len(),
+            }),
+        );
         Ok(results)
     }
 
@@ -2621,6 +2860,16 @@ impl DurableTaskLifecycle for LocalDurableTaskLifecycle {
         contract.status = ContractStatus::Completed;
         contract.updated_at = chrono::Utc::now().to_rfc3339();
         self.save_local(&contract)?;
+
+        self.emit_event(
+            "task_delivered",
+            serde_json::json!({
+                "task_id": task_id,
+                "contract_id": contract.contract_id,
+                "goal": contract.goal,
+                "total_verifications": total_verifications,
+            }),
+        );
 
         Ok(TaskDeliveryReport {
             task_id: task_id.to_string(),

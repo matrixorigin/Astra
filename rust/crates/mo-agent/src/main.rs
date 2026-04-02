@@ -994,7 +994,16 @@ async fn handle_resume_command(arg: &str, profile: Option<&str>, state: &mut Rep
                 let work_dir = std::env::current_dir().unwrap_or_default();
                 let session_dir =
                     mo_agent_services::session_workspace::workspace_dir_for(&session_id);
-                let lifecycle = durable_bridge::create_local_lifecycle(&session_dir, &work_dir);
+                let lifecycle = durable_bridge::create_local_lifecycle_with_sender(
+                    &session_dir,
+                    &work_dir,
+                    state
+                        .matrix_runtime
+                        .as_ref()
+                        .and_then(|mc| mc.clone_ingestion_sender()),
+                    Some(&session_id),
+                    state.ingestion_user_id.as_deref(),
+                );
                 state.durable_task_state = Some(durable_bridge::DurableTaskState {
                     contract,
                     lifecycle,
@@ -1855,7 +1864,16 @@ async fn run_plan_execution(
             .as_ref()
             .map(|sid| mo_agent_services::session_workspace::workspace_dir_for(sid))
             .unwrap_or_else(|| work_dir.join(".mo-session"));
-        let lifecycle = durable_bridge::create_local_lifecycle(&session_dir, &work_dir);
+        let lifecycle = durable_bridge::create_local_lifecycle_with_sender(
+            &session_dir,
+            &work_dir,
+            state
+                .matrix_runtime
+                .as_ref()
+                .and_then(|mc| mc.clone_ingestion_sender()),
+            Some(session_id),
+            Some(user_id),
+        );
 
         if let Some(contract) = durable_bridge::generate_contract(
             &lifecycle, plan, goal, user_id, session_id, &work_dir,

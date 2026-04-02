@@ -169,6 +169,12 @@ impl HybridRestoreService {
                     _ => (None, None, None, 0),
                 };
 
+                // Load active contract from task_contracts table
+                let contract_json = Self::load_cloud_contract(pool, session_id)
+                    .await
+                    .ok()
+                    .flatten();
+
                 Ok(Some(RestoredSession {
                     session_id: session_id.to_string(),
                     turn_count: event_count as u32,
@@ -179,8 +185,75 @@ impl HybridRestoreService {
                     plan_goal,
                     plan_config_json: plan_config,
                     plan_execution_rounds: plan_rounds,
+                    contract_json,
                     ..Default::default()
                 }))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Load the active contract for this session from cloud task_contracts table.
+    /// Returns the contract as serialized JSON (matching local workspace format).
+    async fn load_cloud_contract(
+        pool: &sqlx::Pool<sqlx::MySql>,
+        session_id: &str,
+    ) -> Result<Option<String>, String> {
+        let row = sqlx::query(
+            "SELECT contract_id, task_id, goal, scope_json, subtasks_json, \
+             criteria_json, version, status, \
+             CAST(created_at AS CHAR) AS created_at, \
+             CAST(updated_at AS CHAR) AS updated_at \
+             FROM task_contracts \
+             WHERE session_id = ? AND status = 'active' \
+             ORDER BY updated_at DESC LIMIT 1",
+        )
+        .bind(session_id)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| format!("load_cloud_contract: {e}"))?;
+
+        match row {
+            Some(row) => {
+                use sqlx::Row;
+                // Reconstruct contract as JSON matching TaskContract serde format
+                let contract_id: String = row.try_get("contract_id").map_err(|e| e.to_string())?;
+                let task_id: String = row.try_get("task_id").map_err(|e| e.to_string())?;
+                let goal: String = row.try_get("goal").map_err(|e| e.to_string())?;
+                let version: i32 = row.try_get("version").unwrap_or(1);
+                let status: String = row.try_get("status").unwrap_or_default();
+                let created_at: String = row.try_get("created_at").unwrap_or_default();
+                let updated_at: String = row.try_get("updated_at").unwrap_or_default();
+                let scope_json: Option<String> = row.try_get("scope_json").ok().flatten();
+                let subtasks_json: String =
+                    row.try_get("subtasks_json").map_err(|e| e.to_string())?;
+                let criteria_json: String =
+                    row.try_get("criteria_json").map_err(|e| e.to_string())?;
+
+                // Parse sub-objects so serde round-trips correctly
+                let scope: serde_json::Value = scope_json
+                    .as_deref()
+                    .and_then(|j| serde_json::from_str(j).ok())
+                    .unwrap_or(serde_json::json!({}));
+                let subtasks: serde_json::Value = serde_json::from_str(&subtasks_json)
+                    .map_err(|e| format!("parse subtasks: {e}"))?;
+                let criteria: serde_json::Value = serde_json::from_str(&criteria_json)
+                    .map_err(|e| format!("parse criteria: {e}"))?;
+
+                let contract = serde_json::json!({
+                    "contract_id": contract_id,
+                    "task_id": task_id,
+                    "goal": goal,
+                    "scope": scope,
+                    "subtasks": subtasks,
+                    "global_verification": criteria,
+                    "version": version,
+                    "status": status,
+                    "created_at": created_at,
+                    "updated_at": updated_at,
+                });
+
+                Ok(Some(contract.to_string()))
             }
             None => Ok(None),
         }

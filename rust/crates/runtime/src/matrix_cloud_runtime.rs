@@ -158,6 +158,14 @@ impl MatrixCloudRuntime {
         &self.shared_pool
     }
 
+    /// Clone the ingestion sender for use in other subsystems (e.g., durable task lifecycle).
+    /// Returns `None` if ingestion is shut down or lock is poisoned.
+    pub fn clone_ingestion_sender(
+        &self,
+    ) -> Option<mo_agent_services::event_ingestion::IngestionSender> {
+        self.ingestion.lock().ok()?.as_ref().cloned()
+    }
+
     /// Expand a journal event and enqueue for async DB flush (no-op if ingestion shut down).
     pub fn enqueue_journal_events(&self, user_id: &str, event: &JournalEvent) {
         let Ok(guard) = self.ingestion.lock() else {
