@@ -2158,6 +2158,14 @@ impl DurableTaskLifecycle for MatrixOneDurableTaskLifecycle {
             Vec::new()
         };
 
+        let total_retries: u32 = contract.subtasks.iter().map(|s| s.retry_count).sum();
+        let total_verifications = contract
+            .subtasks
+            .iter()
+            .filter(|s| s.last_verification.is_some())
+            .count() as u32
+            + total_retries;
+
         let report = TaskDeliveryReport {
             task_id: task_id.to_string(),
             contract_id: contract.contract_id.clone(),
@@ -2166,7 +2174,7 @@ impl DurableTaskLifecycle for MatrixOneDurableTaskLifecycle {
             global_verification: global_results,
             total_turns: 0,
             total_tokens: 0,
-            total_verifications: 0,
+            total_verifications,
             risks: contract
                 .scope
                 .assumptions
@@ -2620,6 +2628,14 @@ impl DurableTaskLifecycle for LocalDurableTaskLifecycle {
             })
             .collect();
 
+        let total_retries: u32 = contract.subtasks.iter().map(|s| s.retry_count).sum();
+        let total_verifications = contract
+            .subtasks
+            .iter()
+            .filter(|s| s.last_verification.is_some())
+            .count() as u32
+            + total_retries;
+
         contract.status = ContractStatus::Completed;
         contract.updated_at = chrono::Utc::now().to_rfc3339();
         self.save_local(&contract)?;
@@ -2632,7 +2648,7 @@ impl DurableTaskLifecycle for LocalDurableTaskLifecycle {
             global_verification: Vec::new(),
             total_turns: 0,
             total_tokens: 0,
-            total_verifications: 0,
+            total_verifications,
             risks: Vec::new(),
             timestamp: chrono::Utc::now().to_rfc3339(),
         })

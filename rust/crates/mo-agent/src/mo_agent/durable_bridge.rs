@@ -257,17 +257,35 @@ fn display_verification_report(report: &SubtaskVerificationReport) {
         styled_icon, passed, total, report.subtask_id,
     );
 
-    // Show individual failures
+    // Show individual results (both pass and fail for transparency)
     for r in &report.results {
-        if !r.passed {
-            let label = r.criterion_id.as_str();
-            let evidence = r.evidence.chars().take(120).collect::<String>();
+        if r.passed {
+            let evidence: String = r.evidence.trim().chars().take(80).collect();
+            if !evidence.is_empty() {
+                eprintln!(
+                    "      {} {} — {}",
+                    "✔".green(),
+                    r.criterion_id.clone().dark_grey(),
+                    evidence.dark_grey(),
+                );
+            }
+        } else {
+            let evidence: String = r.evidence.trim().chars().take(120).collect();
+            let expected: String = r.expected.chars().take(80).collect();
             eprintln!(
-                "      {} {} — {}",
+                "      {} {}",
                 "✘".red(),
-                label,
-                evidence,
+                r.criterion_id,
             );
+            if !evidence.is_empty() {
+                eprintln!("        got: {}", evidence.yellow());
+            }
+            if !expected.is_empty() {
+                eprintln!("        expected: {}", expected);
+            }
+            if let Some(ref err) = r.error {
+                eprintln!("        error: {}", err.clone().red());
+            }
         }
     }
 }
@@ -360,33 +378,45 @@ pub async fn on_plan_complete(
 
 /// Pretty-print the final delivery report.
 fn display_delivery_report(report: &TaskDeliveryReport) {
-    let all_verified = report
+    let all_subtasks_verified = report
         .subtask_summaries
         .iter()
         .all(|s| s.criteria_passed == s.criteria_total);
+    let all_global_passed = report.global_verification.iter().all(|r| r.passed);
+    let fully_delivered = all_subtasks_verified && all_global_passed;
 
+    let total_retries: u32 = report.subtask_summaries.iter().map(|s| s.retry_count).sum();
+    let criteria_passed: u32 = report.subtask_summaries.iter().map(|s| s.criteria_passed).sum();
+    let criteria_total: u32 = report.subtask_summaries.iter().map(|s| s.criteria_total).sum();
+    let global_passed = report.global_verification.iter().filter(|r| r.passed).count();
+    let global_total = report.global_verification.len();
+
+    // ─── Header ──────────────────────────────────────────────────────────────
     eprintln!();
     eprintln!(
         "{}",
         "╔══════════════════════════════════════════════════════════╗"
             .cyan()
     );
+
+    // Goal (truncate if too long)
+    let goal_display: String = report.goal.chars().take(50).collect();
     eprintln!(
         "{}  Task: {}",
         "║".cyan(),
-        report.goal,
+        goal_display.clone().white().bold(),
     );
-    let status_icon = if all_verified { "✅" } else { "⚠️" };
-    eprintln!(
-        "{}  Status: {} {}",
-        "║".cyan(),
-        status_icon,
-        if all_verified {
-            "Delivered"
-        } else {
-            "Partial"
-        },
-    );
+
+    let (status_icon, status_text) = if fully_delivered {
+        ("✅", "Delivered".green().bold())
+    } else if all_subtasks_verified {
+        ("⚠️", "Partial (global checks failed)".yellow().bold())
+    } else {
+        ("⚠️", "Partial".yellow().bold())
+    };
+    eprintln!("{}  Status: {} {}", "║".cyan(), status_icon, status_text);
+
+    // ─── Subtask Results ─────────────────────────────────────────────────────
     eprintln!(
         "{}",
         "╠══════════════════════════════════════════════════════════╣"
@@ -396,19 +426,94 @@ fn display_delivery_report(report: &TaskDeliveryReport) {
     for sub in &report.subtask_summaries {
         let verified = sub.criteria_passed == sub.criteria_total;
         let icon = if verified { "✅" } else { "⚠️" };
-        let criteria_info = format!(
-            "{}/{} criteria",
-            sub.criteria_passed, sub.criteria_total
-        );
+        let criteria_info = format!("{}/{} criteria", sub.criteria_passed, sub.criteria_total);
+        let retry_info = if sub.retry_count > 0 {
+            format!(" ↻{}", sub.retry_count)
+        } else {
+            String::new()
+        };
         eprintln!(
-            "{}  {} {} ({})",
+            "{}  {} {} ({}{})",
             "║".cyan(),
             icon,
             sub.title,
-            criteria_info,
+            if verified {
+                criteria_info.green().to_string()
+            } else {
+                criteria_info.yellow().to_string()
+            },
+            retry_info,
         );
     }
 
+    // ─── Global Verification ─────────────────────────────────────────────────
+    if !report.global_verification.is_empty() {
+        eprintln!(
+            "{}",
+            "╠──────────────────────────────────────────────────────────╣"
+                .cyan()
+        );
+        eprintln!(
+            "{}  🔬 Global checks: {}/{}",
+            "║".cyan(),
+            global_passed,
+            global_total,
+        );
+        for r in &report.global_verification {
+            let icon = if r.passed { "✔" } else { "✘" };
+            let styled = if r.passed {
+                format!("{}", icon.green())
+            } else {
+                format!("{}", icon.red())
+            };
+            let dur = if r.duration_ms > 0 {
+                format!(" ({:.1}s)", r.duration_ms as f64 / 1000.0)
+            } else {
+                String::new()
+            };
+            eprintln!(
+                "{}      {} {}{}",
+                "║".cyan(),
+                styled,
+                r.criterion_id,
+                dur,
+            );
+        }
+    }
+
+    // ─── Metrics ─────────────────────────────────────────────────────────────
+    eprintln!(
+        "{}",
+        "╠──────────────────────────────────────────────────────────╣"
+            .cyan()
+    );
+
+    let mut metrics = Vec::new();
+    metrics.push(format!(
+        "📊 {}/{} criteria passed",
+        criteria_passed, criteria_total
+    ));
+    if total_retries > 0 {
+        metrics.push(format!("↻ {} retries", total_retries));
+    }
+    if report.total_verifications > 0 {
+        metrics.push(format!("🔍 {} verifications", report.total_verifications));
+    }
+    eprintln!("{}  {}", "║".cyan(), metrics.join("  ·  "));
+
+    // ─── Risks / Assumptions ─────────────────────────────────────────────────
+    if !report.risks.is_empty() {
+        eprintln!(
+            "{}",
+            "╠──────────────────────────────────────────────────────────╣"
+                .cyan()
+        );
+        for risk in &report.risks {
+            eprintln!("{}  ⚠ {}", "║".cyan(), risk.clone().yellow());
+        }
+    }
+
+    // ─── Footer ──────────────────────────────────────────────────────────────
     eprintln!(
         "{}",
         "╚══════════════════════════════════════════════════════════╝"
