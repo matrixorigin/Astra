@@ -690,6 +690,22 @@ impl StreamRenderState {
                 let repo = args.get("repo").and_then(Value::as_str).unwrap_or("");
                 format!("List PRs in {owner}/{repo}")
             }
+            // Memory tools with natural verbs
+            "memory_retrieve" => {
+                let query = args.get("query").and_then(Value::as_str).unwrap_or("");
+                format!("Recall \"{}\"", truncate_line(query, 45))
+            }
+            "memory_store" => {
+                let content = args.get("content").and_then(Value::as_str).unwrap_or("");
+                format!("Remember \"{}\"", truncate_line(content, 40))
+            }
+            "memory_search" => {
+                let query = args.get("query").and_then(Value::as_str).unwrap_or("");
+                format!("Search memory \"{}\"", truncate_line(query, 40))
+            }
+            "memory_purge" => "Forget memory".to_string(),
+            "memory_correct" => "Update memory".to_string(),
+            "memory_profile" => "Check profile".to_string(),
             _ => tool.to_string(),
         }
     }
