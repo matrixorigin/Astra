@@ -118,6 +118,27 @@ pub fn subtask_retries_exhausted(durable: &DurableTaskState, subtask_id: &str) -
         .unwrap_or(false)
 }
 
+/// Extract the latest verification results for a subtask as a JSON value
+/// suitable for journaling. Returns `None` if the subtask has no results.
+pub fn subtask_verification_json(
+    durable: &DurableTaskState,
+    subtask_id: &str,
+) -> Option<serde_json::Value> {
+    let sub = durable.contract.subtasks.iter().find(|s| s.id == subtask_id)?;
+    match &sub.stage {
+        SubtaskStage::Verified => Some(serde_json::json!({
+            "stage": "verified",
+            "retry_count": sub.retry_count,
+        })),
+        SubtaskStage::VerificationFailed { results } => Some(serde_json::json!({
+            "stage": "verification_failed",
+            "retry_count": sub.retry_count,
+            "criteria": results,
+        })),
+        _ => None,
+    }
+}
+
 /// Call when a subtask transitions Pending → Executing (snapshot).
 pub async fn on_subtask_begin(durable: &DurableTaskState, subtask_id: &str) {
     if let Err(e) = durable

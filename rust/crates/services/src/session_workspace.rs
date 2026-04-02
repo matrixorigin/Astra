@@ -66,6 +66,9 @@ pub struct WorkspaceMetadata {
     /// Active durable task contract (JSON-serialized TaskContract).
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub contract_json: Option<String>,
+    /// Operator corrections injected during plan pause (persisted for crash recovery).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub plan_corrections: Vec<String>,
     /// Set when this session was forked from another local session.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_session_id: Option<String>,
@@ -153,6 +156,7 @@ impl WorkspaceMetadata {
             plan_config_json: None,
             plan_execution_rounds: 0,
             contract_json: None,
+            plan_corrections: Vec::new(),
             parent_session_id: None,
             forked_at_turn: None,
             fork_note: None,
@@ -160,8 +164,6 @@ impl WorkspaceMetadata {
             agent_role: None,
         }
     }
-
-    /// Create metadata with explicit values (for testing).
     pub fn with_context(
         session_id: &str,
         model: &str,
@@ -189,6 +191,7 @@ impl WorkspaceMetadata {
             plan_config_json: None,
             plan_execution_rounds: 0,
             contract_json: None,
+            plan_corrections: Vec::new(),
             parent_session_id: None,
             forked_at_turn: None,
             fork_note: None,

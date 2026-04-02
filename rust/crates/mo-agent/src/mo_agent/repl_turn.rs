@@ -492,6 +492,9 @@ fn apply_turn_success(
                 .as_ref()
                 .and_then(|d| serde_json::to_string(&d.contract).ok());
 
+            // Persist operator corrections so they survive a crash mid-plan
+            ws.plan_corrections = state.plan_execution_corrections.clone();
+
             // Check if checkpoint is due
             if mo_agent_services::session_checkpoint::should_checkpoint(
                 ws.turn_count,

@@ -738,6 +738,28 @@ pub(super) fn handle_session_command(arg: &str, state: &mut ReplState) {
                                     failed,
                                 );
                             }
+                            session_journal::JournalEventType::VerificationCompleted => {
+                                let scope = evt
+                                    .metadata
+                                    .as_ref()
+                                    .and_then(|m| m.get("scope"))
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("subtask");
+                                let passed = evt
+                                    .metadata
+                                    .as_ref()
+                                    .and_then(|m| m.get("passed"))
+                                    .and_then(|v| v.as_bool())
+                                    .unwrap_or(false);
+                                let icon = if passed { "✓".green() } else { "✗".red() };
+                                eprintln!(
+                                    "  {} {} {} verification {}",
+                                    ts_short.dim(),
+                                    icon,
+                                    scope,
+                                    if passed { "passed" } else { "failed" },
+                                );
+                            }
                         }
                     }
                     // Summary stats

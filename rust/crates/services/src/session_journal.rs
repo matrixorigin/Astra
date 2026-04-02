@@ -534,6 +534,8 @@ pub enum JournalEventType {
     DelegationSubRunCompleted,
     /// Delegation completed (all sub-runs done, results aggregated).
     DelegationCompleted,
+    /// Subtask or plan verification completed (acceptance-criteria gate result).
+    VerificationCompleted,
 }
 
 /// Writer that appends events to a session journal file.
@@ -1186,6 +1188,26 @@ impl JournalEvent {
             "progress_pct": progress_pct,
             "total_subtasks": total_subtasks,
             "completed_subtasks": completed_subtasks,
+        }));
+        evt
+    }
+
+    /// Verification completed — emitted after subtask or global verification.
+    pub fn verification_completed(
+        session_id: Option<&str>,
+        turn: u32,
+        subtask_id: &str,
+        scope: &str, // "subtask" | "global"
+        passed: bool,
+        results: &serde_json::Value,
+    ) -> Self {
+        let mut evt = Self::base(JournalEventType::VerificationCompleted, session_id);
+        evt.turn = Some(turn);
+        evt.metadata = Some(serde_json::json!({
+            "subtask_id": subtask_id,
+            "scope": scope,
+            "passed": passed,
+            "results": results,
         }));
         evt
     }

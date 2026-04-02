@@ -74,6 +74,9 @@ pub struct RestoredSession {
     /// Active durable task contract (JSON-serialized TaskContract).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub contract_json: Option<String>,
+    /// Operator corrections stacked during plan pause (restored for crash recovery).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub plan_corrections: Vec<String>,
 }
 
 /// A restored checkpoint entry (lightweight, for listing).
@@ -420,6 +423,7 @@ impl SessionRestoreService for HybridRestoreService {
                 plan_config_json: ws.plan_config_json,
                 plan_execution_rounds: ws.plan_execution_rounds,
                 contract_json: ws.contract_json,
+                plan_corrections: ws.plan_corrections,
                 ..Default::default()
             }));
         }

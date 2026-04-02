@@ -1007,6 +1007,9 @@ async fn handle_resume_command(arg: &str, profile: Option<&str>, state: &mut Rep
             }
             state.plan_execution_rounds = restored.plan_execution_rounds;
 
+            // Restore operator corrections stacked during plan pause
+            state.plan_execution_corrections = restored.plan_corrections;
+
             // Restore durable task contract if present
             if let Some(ref json) = restored.contract_json
                 && let Ok(contract) = serde_json::from_str::<mo_agent_services::TaskContract>(json)
@@ -2024,6 +2027,26 @@ async fn run_plan_execution(
             } else {
                 true
             };
+
+            // Journal: persist verification result so it survives crashes
+            if let Some(ref durable) = state.durable_task_state
+                && let Some(results_json) =
+                    durable_bridge::subtask_verification_json(durable, st_id)
+                && let Some(ref mut j) = state.journal
+            {
+                let evt =
+                    mo_agent_services::session_journal::JournalEvent::verification_completed(
+                        state.session_id.as_deref(),
+                        state.turn,
+                        st_id,
+                        "subtask",
+                        verification_passed,
+                        &results_json,
+                    );
+                let _ = j.append(&evt);
+                repl_turn::enqueue_ingestion_pub(state, &evt);
+            }
+
             if let Some(st) = plan.subtasks.iter_mut().find(|s| s.id == *st_id) {
                 if verification_passed {
                     st.status = TaskStatus::Completed;
@@ -2060,6 +2083,30 @@ async fn run_plan_execution(
             eprintln!("\n{}  Subtask done: {} ({}%)", "✓".green(), title, pct);
         }
 
+        // Force checkpoint after verification state changes to prevent data loss.
+        // Normal checkpoints only fire every CHECKPOINT_INTERVAL turns, leaving a
+        // window where verification results could be lost on crash.
+        if !in_progress_ids.is_empty()
+            && let (Some(sid), Some(durable)) =
+                (state.session_id.as_deref(), &state.durable_task_state)
+        {
+            let cp = mo_agent_services::session_checkpoint::Checkpoint {
+                number: 0, // placeholder — will be overwritten by write_checkpoint
+                turn: state.turn,
+                title: format!("Verification checkpoint (turn {})", state.turn),
+                summary: format!(
+                    "Post-verification: {} subtask(s) checked",
+                    in_progress_ids.len()
+                ),
+                tools_used: vec![],
+                total_tokens: 0,
+                had_stalls: false,
+                error_count: 0,
+                contract_state_json: serde_json::to_string(&durable.contract).ok(),
+            };
+            let _ = mo_agent_services::session_checkpoint::write_checkpoint(sid, &cp);
+        }
+
         // Analyze parallelism for the current state
         let analysis = plan_decompose::analyze_parallelism(&plan);
         let ready = plan.ready_subtasks();
@@ -2084,6 +2131,26 @@ async fn run_plan_execution(
                 } else {
                     true
                 };
+
+                // Journal: persist global verification result
+                if let Some(ref durable) = state.durable_task_state {
+                    let results_json = serde_json::json!({
+                        "global_verification": durable.contract.global_verification,
+                    });
+                    if let Some(ref mut j) = state.journal {
+                        let evt =
+                            mo_agent_services::session_journal::JournalEvent::verification_completed(
+                                state.session_id.as_deref(),
+                                state.turn,
+                                "",
+                                "global",
+                                global_passed,
+                                &results_json,
+                            );
+                        let _ = j.append(&evt);
+                        repl_turn::enqueue_ingestion_pub(state, &evt);
+                    }
+                }
 
                 if !global_passed {
                     eprintln!(
@@ -2373,6 +2440,24 @@ async fn run_plan_execution(
                 } else {
                     true
                 };
+
+                // Journal: persist verification result
+                if let Some(ref durable) = state.durable_task_state
+                    && let Some(results_json) =
+                        durable_bridge::subtask_verification_json(durable, next_id)
+                    && let Some(ref mut j) = state.journal
+                {
+                    let evt = mo_agent_services::session_journal::JournalEvent::verification_completed(
+                        state.session_id.as_deref(),
+                        state.turn,
+                        next_id,
+                        "subtask",
+                        verification_passed,
+                        &results_json,
+                    );
+                    let _ = j.append(&evt);
+                    repl_turn::enqueue_ingestion_pub(state, &evt);
+                }
 
                 if verification_passed {
                     st.status = TaskStatus::Completed;
