@@ -1065,7 +1065,8 @@ async fn handle_resume_command(arg: &str, profile: Option<&str>, state: &mut Rep
                 }
                 eprintln!(
                     "     {}",
-                    "Say \"continue\" or \"resume\" to pick up where you left off.".dim()
+                    "Say continue / resume / next / go to pick up; slash lines keep the plan; any other line abandons it."
+                        .dim()
                 );
             }
         }
@@ -1871,6 +1872,32 @@ fn build_learning_bridge(
     Some(std::sync::Arc::new(bridge))
 }
 
+/// Shown after Ctrl+C pauses plan auto-execution (interrupt is not sent to the model).
+fn eprint_plan_execution_paused_hints() {
+    eprintln!("{}", "  What you can do:".dim());
+    eprintln!(
+        "    {}",
+        "continue · resume · next · go · 继续 — resume execution from this point".dim()
+    );
+    eprintln!(
+        "    {}",
+        "Lines starting with / — run a slash command; the paused plan stays in memory".dim()
+    );
+    eprintln!(
+        "    {}",
+        "Any other message — abandons the plan and sends it as a normal chat turn".dim()
+    );
+    eprintln!(
+        "    {}",
+        "Step-by-step mode: at \"Execute this subtask?\", use skip to defer one subtask".dim()
+    );
+    eprintln!(
+        "    {}",
+        "To replan or change focus (e.g. pause testing): abandon with a normal message, adjust, then start a new plan — or use /plan while still in structured plan mode if available."
+            .dim()
+    );
+}
+
 /// Run the plan auto-execution loop: iterate through ready subtasks,
 /// send each as a chat message, mark done, continue until all done or blocked.
 ///
@@ -2254,7 +2281,11 @@ async fn run_plan_execution(
                         pct,
                         remaining_count
                     );
-                    eprintln!("{}  Say \"continue\" to resume execution.", "💡".cyan());
+                    eprintln!(
+                        "{}  (Interrupt is not sent to the model; this subtask is still in progress.)",
+                        "ℹ".dim()
+                    );
+                    eprint_plan_execution_paused_hints();
                 }
                 state.last_turn_interrupted = false;
                 return Ok(());
