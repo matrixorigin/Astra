@@ -6,8 +6,8 @@
 
 use crossterm::style::Stylize;
 use mo_agent_services::{
-    ContractGenerator, DurableTaskLifecycle, LocalDurableTaskLifecycle, SubtaskStage,
-    SubtaskVerificationReport, TaskContract, TaskDeliveryReport, VerifierKind,
+    ContractAmendment, ContractGenerator, DurableTaskLifecycle, LocalDurableTaskLifecycle,
+    SubtaskStage, SubtaskVerificationReport, TaskContract, TaskDeliveryReport, VerifierKind,
 };
 use std::sync::Arc;
 
@@ -49,15 +49,42 @@ pub async fn generate_contract(
         }
     };
 
-    // Persist via lifecycle
+    // Persist via lifecycle: create_contract builds a bare skeleton, then we
+    // amend it with the criteria ContractGenerator produced.
     let scope = contract.scope.clone();
+    let generated_subtasks = contract.subtasks.clone();
+    let generated_global = contract.global_verification.clone();
+
     match lifecycle
         .create_contract(user_id, session_id, goal, plan, scope)
         .await
     {
         Ok(persisted) => {
-            display_contract_summary(&persisted);
-            Some(persisted)
+            // Inject generated criteria via amend (create_contract builds empty criteria)
+            let amendment = ContractAmendment {
+                reason: "inject generated verification criteria".into(),
+                updated_subtasks: Some(generated_subtasks),
+                updated_global_verification: Some(generated_global),
+                updated_scope: None,
+            };
+            match lifecycle
+                .amend_contract(&persisted.contract_id, amendment)
+                .await
+            {
+                Ok(amended) => {
+                    display_contract_summary(&amended);
+                    Some(amended)
+                }
+                Err(e) => {
+                    eprintln!(
+                        "  {}  Criteria injection failed: {}",
+                        "⚠".yellow(),
+                        e,
+                    );
+                    display_contract_summary(&persisted);
+                    Some(persisted)
+                }
+            }
         }
         Err(e) => {
             eprintln!(

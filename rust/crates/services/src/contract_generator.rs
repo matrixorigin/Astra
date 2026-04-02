@@ -872,4 +872,40 @@ mod tests {
             .iter()
             .any(|s| s.contains("Deployment")));
     }
+
+    #[test]
+    fn parse_helloworld_acceptance_text() {
+        let det = ProjectDetection::default();
+        // Subtask 1: "File exists at /tmp/helloworld.sh containing ..."
+        let c1 = parse_acceptance_to_criteria(
+            "File exists at /tmp/helloworld.sh containing 'echo \"hello world!\"' or similar",
+            "create-script",
+            &det,
+        );
+        assert!(
+            !c1.is_empty(),
+            "should parse at least one criterion for 'File exists ...'"
+        );
+        let has_file = c1
+            .iter()
+            .any(|c| matches!(&c.verifier, VerifierKind::FileExists { .. }));
+        assert!(has_file, "should detect FileExists verifier for acceptance text with 'file exists'");
+
+        // Subtask 2: "ls -l shows executable permissions"
+        let c2 = parse_acceptance_to_criteria(
+            "ls -l shows executable permissions (x bits set) on the file",
+            "make-exec",
+            &det,
+        );
+        // This falls to LlmJudge since no keyword matcher covers "permissions"
+        assert!(!c2.is_empty(), "should have at least one criterion");
+
+        // Subtask 3: "Running the script produces 'hello world!'"
+        let c3 = parse_acceptance_to_criteria(
+            "Running the script produces 'hello world!' output without errors",
+            "verify-exec",
+            &det,
+        );
+        assert!(!c3.is_empty(), "should have at least one criterion");
+    }
 }
