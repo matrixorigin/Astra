@@ -44,6 +44,23 @@ fn eprint_plan_json_parse_failed(full_text: &str, err: &str) {
     );
 }
 
+/// Render a formatted plan string line-by-line with progressive reveal animation.
+fn eprint_plan_progressive(formatted: &str) {
+    use std::io::Write;
+    // Box border lines render instantly, content lines have a small stagger
+    for line in formatted.lines() {
+        let is_border = line.starts_with('┌')
+            || line.starts_with('└')
+            || line.starts_with("──")
+            || line.trim().is_empty();
+        eprintln!("{line}");
+        if !is_border {
+            let _ = std::io::stderr().flush();
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+    }
+}
+
 pub(super) async fn handle_memory_domain_command(
     cmd: &str,
     arg: &str,
@@ -1486,7 +1503,10 @@ pub async fn handle_plan_mode_input(
                 let mut stream = r.bytes_stream();
                 use futures_util::StreamExt;
 
-                eprintln!("  {} Thinking...", "🧠".cyan());
+                eprintln!();
+                let regen_spinner = super::stream_render::Spinner::start(
+                    "Regenerating plan".to_string(),
+                );
 
                 while let Some(chunk) = stream.next().await {
                     if let Ok(bytes) = chunk {
@@ -1501,6 +1521,7 @@ pub async fn handle_plan_mode_input(
                         }
                     }
                 }
+                regen_spinner.stop_clear();
 
                 // Parse and set plan (no clarification check in regeneration)
                 match parse_plan_response(&full_text) {
@@ -1509,7 +1530,7 @@ pub async fn handle_plan_mode_input(
                         let _ = plan_state.save_to_file(&PlanModeState::state_path());
 
                         eprintln!();
-                        eprintln!("{}", format_plan(&plan_state.plan));
+                        eprint_plan_progressive(&format_plan(&plan_state.plan));
                         eprintln!();
                         eprintln!("  {} Commands:", "💡".cyan());
                         eprintln!("    'go' or 'execute' → Run the plan");
@@ -1619,6 +1640,7 @@ pub async fn handle_plan_mode_input(
                         let mut in_thinking = false;
                         let mut in_plan_json = false;
                         let mut chars_since_nl = 0;
+                        let mut parse_spinner: Option<super::stream_render::Spinner> = None;
 
                         while let Some(chunk) = stream.next().await {
                             if let Ok(bytes) = chunk {
@@ -1639,17 +1661,19 @@ pub async fn handle_plan_mode_input(
                                             // Detect start of JSON plan
                                             if ch == '{' && !in_thinking && !in_plan_json {
                                                 in_plan_json = true;
-                                                eprintln!();
-                                                eprintln!();
-                                                eprint!("  {} Parsing plan", "⚙".dim());
+                                                if in_thinking {
+                                                    eprintln!();
+                                                    in_thinking = false;
+                                                }
+                                                parse_spinner = Some(
+                                                    super::stream_render::Spinner::start(
+                                                        "Parsing plan".to_string(),
+                                                    ),
+                                                );
                                                 continue;
                                             }
 
                                             if in_plan_json {
-                                                // Show progress dots during JSON parsing
-                                                if ch == ',' || ch == '}' {
-                                                    eprint!(".");
-                                                }
                                                 continue;
                                             }
 
@@ -1672,7 +1696,12 @@ pub async fn handle_plan_mode_input(
                                 }
                             }
                         }
-                        eprintln!();
+                        if let Some(sp) = parse_spinner.take() {
+                            sp.stop_clear();
+                        }
+                        if in_thinking {
+                            eprintln!();
+                        }
 
                         // Check for clarification questions first
                         if let Some(questions) = detect_clarification_questions(&full_text) {
@@ -1701,7 +1730,7 @@ pub async fn handle_plan_mode_input(
                                     let _ = plan_state.save_to_file(&PlanModeState::state_path());
 
                                     eprintln!();
-                                    eprintln!("{}", format_plan(&plan_state.plan));
+                                    eprint_plan_progressive(&format_plan(&plan_state.plan));
                                     eprintln!();
                                     eprintln!("  {} Commands:", "💡".cyan());
                                     eprintln!("    'go' or 'execute' → Run the plan");
