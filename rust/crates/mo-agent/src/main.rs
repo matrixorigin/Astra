@@ -513,6 +513,8 @@ struct ReplState {
     skill_classification_cache: skill_instructions::SkillClassificationCache,
     /// Active durable-task contract for plan execution verification.
     durable_task_state: Option<durable_bridge::DurableTaskState>,
+    /// Stacked operator notes while plan execution is paused (`correct` / `note` at ⏸>).
+    plan_execution_corrections: Vec<String>,
 }
 
 impl Default for ReplState {
@@ -566,6 +568,7 @@ impl Default for ReplState {
             )),
             skill_classification_cache: skill_instructions::SkillClassificationCache::default(),
             durable_task_state: None,
+            plan_execution_corrections: Vec::new(),
         }
     }
 }
@@ -1065,7 +1068,7 @@ async fn handle_resume_command(arg: &str, profile: Option<&str>, state: &mut Rep
                 }
                 eprintln!(
                     "     {}",
-                    "Say continue / resume / next / go to pick up; slash lines keep the plan; any other line abandons it."
+                    "Say continue / resume / next / go to pick up; correct … / rewind N to adjust; slash lines keep the plan; any other line abandons it."
                         .dim()
                 );
             }
@@ -1893,7 +1896,17 @@ fn eprint_plan_execution_paused_hints() {
     );
     eprintln!(
         "    {}",
-        "To replan or change focus (e.g. pause testing): abandon with a normal message, adjust, then start a new plan — or use /plan while still in structured plan mode if available."
+        "correct … / note … / adjust … — stack guidance for upcoming subtasks (correct clear to drop)"
+            .dim()
+    );
+    eprintln!(
+        "    {}",
+        "rewind N · restart N · redo from N — reset step N and all later steps (1-based list order)"
+            .dim()
+    );
+    eprintln!(
+        "    {}",
+        "rewind <id-prefix> — same, anchored by subtask id (prefix must match exactly one id)"
             .dim()
     );
 }
@@ -2100,6 +2113,7 @@ async fn run_plan_execution(
                 state.executing_plan_goal = None;
                 state.plan_execution_rounds = 0;
                 state.durable_task_state = None;
+                state.plan_execution_corrections.clear();
             }
             return Ok(());
         }
@@ -2138,7 +2152,10 @@ async fn run_plan_execution(
             let (prompt, title) = {
                 let st = plan.subtasks.iter_mut().find(|s| s.id == *next_id).unwrap();
                 st.status = TaskStatus::InProgress;
-                let prompt = plan_decompose::format_subtask_prompt(st);
+                let prompt = plan_decompose::format_subtask_prompt_with_operator_notes(
+                    st,
+                    &state.plan_execution_corrections,
+                );
                 let title = st.title.clone();
                 (prompt, title)
             };
@@ -2206,6 +2223,7 @@ async fn run_plan_execution(
                         }
                         "abort" | "stop" | "q" => {
                             eprintln!("{}  Plan execution aborted by user.", "⏹".red());
+                            state.plan_execution_corrections.clear();
                             return Ok(());
                         }
                         _ => {
@@ -3584,12 +3602,53 @@ async fn run_chat_repl(
                     )
                     .await?;
                 } else {
-                    // If there's a paused plan but user sends a different message,
-                    // abandon the plan and process as normal chat
-                    if state.executing_plan.is_some() && !plan_decompose::is_resume_command(&line) {
+                    if state.executing_plan.is_some() {
+                        if let Some(action) = plan_decompose::parse_plan_paused_user_line(&line) {
+                            match action {
+                                plan_decompose::PlanPausedUserAction::ClearCorrections => {
+                                    state.plan_execution_corrections.clear();
+                                    eprintln!(
+                                        "{}",
+                                        "  Cleared stacked operator guidance.".dim()
+                                    );
+                                }
+                                plan_decompose::PlanPausedUserAction::Correction(s) => {
+                                    state.plan_execution_corrections.push(s);
+                                    eprintln!(
+                                        "{}  Recorded guidance ({}). It will prefix each upcoming subtask. Type continue when ready.",
+                                        "💡".cyan(),
+                                        state.plan_execution_corrections.len(),
+                                    );
+                                }
+                                plan_decompose::PlanPausedUserAction::Rewind(anchor) => {
+                                    if let Some(plan) = state.executing_plan.as_mut() {
+                                        match plan_decompose::resolve_rewind_start_index(plan, &anchor)
+                                        {
+                                            Ok(idx) => {
+                                                let reset = plan_decompose::rewind_plan_from_subtask(
+                                                    plan, idx,
+                                                );
+                                                eprintln!(
+                                                    "{}  Rewound from step {} — {} subtask(s) set back to pending. Type continue to resume.",
+                                                    "↩".cyan(),
+                                                    idx + 1,
+                                                    reset,
+                                                );
+                                            }
+                                            Err(e) => {
+                                                eprintln!("{}", format!("  ✗ {e}").red());
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            continue;
+                        }
+                        // Paused plan: any other non-resume line abandons and becomes normal chat
                         let plan = state.executing_plan.take().unwrap();
                         let done = plan.items_done();
                         let total = plan.subtasks.len();
+                        state.plan_execution_corrections.clear();
                         if done < total as u32 {
                             eprintln!(
                                 "{}  Plan abandoned ({}/{} done). Processing as normal chat.",

@@ -1326,6 +1326,7 @@ pub(super) async fn handle_memory_domain_command(
                                     });
                                     state.executing_plan_goal = Some(sub_arg.to_string());
                                     state.plan_execution_rounds = 0;
+                                    state.plan_execution_corrections.clear();
                                     state.executing_plan = Some(plan);
                                 }
                                 Err(e) => {
@@ -1840,6 +1841,7 @@ pub async fn handle_plan_mode_input(
         state.plan_execution_rounds = 0;
 
         // Store plan for auto-execution and exit plan mode
+        state.plan_execution_corrections.clear();
         state.executing_plan = Some(plan);
         PlanModeState::clear_saved_state();
         state.plan_mode = None;
@@ -1871,6 +1873,7 @@ pub async fn handle_plan_mode_input(
         state.executing_plan_goal = Some(goal);
         state.plan_execution_rounds = 0;
 
+        state.plan_execution_corrections.clear();
         state.executing_plan = Some(plan);
         PlanModeState::clear_saved_state();
         state.plan_mode = None;

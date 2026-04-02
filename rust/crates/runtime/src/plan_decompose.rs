@@ -1690,6 +1690,149 @@ pub fn is_resume_command(input: &str) -> bool {
     )
 }
 
+// ── Paused plan: operator corrections + rewind ─────────────────────────────
+
+/// Case-insensitive ASCII prefix strip (`prefix` must be ASCII).
+fn strip_prefix_ci<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
+    let s = s.trim_start();
+    if s.len() < prefix.len() {
+        return None;
+    }
+    let head = s.get(..prefix.len())?;
+    if !head.eq_ignore_ascii_case(prefix) {
+        return None;
+    }
+    Some(s.get(prefix.len()..)?.trim_start())
+}
+
+/// Where to rewind when re-running part of a plan (1-based index or id prefix).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlanRewindAnchor {
+    /// 1-based index in `plan.subtasks` order (as shown during execution).
+    OneBased(usize),
+    /// Exact id or unique prefix of `SubtaskPlan.id`.
+    IdPrefix(String),
+}
+
+/// Lines typed at `⏸>` (paused execution) that adjust the plan without abandoning it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlanPausedUserAction {
+    /// Stack guidance to inject into upcoming subtask prompts.
+    Correction(String),
+    /// Drop all stacked guidance.
+    ClearCorrections,
+    /// Mark this subtask and all following ones pending again.
+    Rewind(PlanRewindAnchor),
+}
+
+fn parse_rewind_anchor_rest(rest: &str) -> Option<PlanRewindAnchor> {
+    let rest = rest.trim();
+    if rest.is_empty() {
+        return None;
+    }
+    if let Ok(n) = rest.parse::<usize>() {
+        if n == 0 {
+            return None;
+        }
+        return Some(PlanRewindAnchor::OneBased(n));
+    }
+    Some(PlanRewindAnchor::IdPrefix(rest.to_string()))
+}
+
+/// Parse `correct …`, `rewind N`, `restart from …`, etc. Returns `None` for normal chat.
+pub fn parse_plan_paused_user_line(line: &str) -> Option<PlanPausedUserAction> {
+    let t = line.trim();
+    if t.is_empty() {
+        return None;
+    }
+    let tl = t.to_ascii_lowercase();
+    if matches!(
+        tl.as_str(),
+        "correct clear" | "note clear" | "adjust clear"
+    ) {
+        return Some(PlanPausedUserAction::ClearCorrections);
+    }
+
+    if let Some(rest) = strip_prefix_ci(t, "rewind ") {
+        return parse_rewind_anchor_rest(rest).map(PlanPausedUserAction::Rewind);
+    }
+    if let Some(rest) = strip_prefix_ci(t, "restart from ") {
+        return parse_rewind_anchor_rest(rest).map(PlanPausedUserAction::Rewind);
+    }
+    if let Some(rest) = strip_prefix_ci(t, "redo from ") {
+        return parse_rewind_anchor_rest(rest).map(PlanPausedUserAction::Rewind);
+    }
+    if let Some(rest) = strip_prefix_ci(t, "restart ") {
+        return parse_rewind_anchor_rest(rest).map(PlanPausedUserAction::Rewind);
+    }
+    if let Some(rest) = strip_prefix_ci(t, "redo ") {
+        return parse_rewind_anchor_rest(rest).map(PlanPausedUserAction::Rewind);
+    }
+
+    for p in ["correct ", "note ", "adjust "] {
+        if let Some(rest) = strip_prefix_ci(t, p) {
+            if rest.is_empty() {
+                return None;
+            }
+            return Some(PlanPausedUserAction::Correction(rest.to_string()));
+        }
+    }
+
+    None
+}
+
+pub fn resolve_rewind_start_index(plan: &TaskPlan, anchor: &PlanRewindAnchor) -> Result<usize, String> {
+    match anchor {
+        PlanRewindAnchor::OneBased(n) => {
+            if *n == 0 || *n > plan.subtasks.len() {
+                return Err(format!(
+                    "subtask index must be 1..={}",
+                    plan.subtasks.len()
+                ));
+            }
+            Ok(*n - 1)
+        }
+        PlanRewindAnchor::IdPrefix(s) => {
+            let q = s.trim();
+            if q.is_empty() {
+                return Err("empty subtask id".into());
+            }
+            let matches: Vec<usize> = plan
+                .subtasks
+                .iter()
+                .enumerate()
+                .filter(|(_, st)| st.id == q || st.id.starts_with(q))
+                .map(|(i, _)| i)
+                .collect();
+            match matches.len() {
+                0 => Err(format!("no subtask id matches {q:?}")),
+                1 => Ok(matches[0]),
+                _ => Err(format!(
+                    "ambiguous id {:?} ({} matches); use a longer prefix or `rewind N` (1-based)",
+                    q,
+                    matches.len()
+                )),
+            }
+        }
+    }
+}
+
+/// Set `start_idx` and all following subtasks (in plan order) to pending if they were in progress.
+/// Returns how many subtasks were reset.
+pub fn rewind_plan_from_subtask(plan: &mut TaskPlan, start_idx: usize) -> usize {
+    let mut n = 0usize;
+    for st in plan.subtasks.iter_mut().skip(start_idx) {
+        if matches!(
+            st.status,
+            TaskStatus::Completed | TaskStatus::InProgress | TaskStatus::Paused | TaskStatus::Failed
+        ) {
+            st.status = TaskStatus::Pending;
+            n += 1;
+        }
+    }
+    n
+}
+
 /// Format a subtask as a rich prompt for the LLM to execute.
 ///
 /// Includes the task title, description, files to modify, and acceptance criteria.
@@ -1718,6 +1861,24 @@ pub fn format_subtask_prompt(subtask: &SubtaskPlan) -> String {
     );
 
     prompt
+}
+
+/// Same as [`format_subtask_prompt`] but prefixes stacked operator notes (pause / correct …).
+pub fn format_subtask_prompt_with_operator_notes(
+    subtask: &SubtaskPlan,
+    operator_notes: &[String],
+) -> String {
+    let body = format_subtask_prompt(subtask);
+    if operator_notes.is_empty() {
+        return body;
+    }
+    let mut block = String::from(
+        "[Operator guidance — follow for this subtask unless unsafe; reconcile with the task text.]\n",
+    );
+    for (i, note) in operator_notes.iter().enumerate() {
+        block.push_str(&format!("{}. {}\n", i + 1, note));
+    }
+    format!("{block}\n{body}")
 }
 
 // ─── Plan Execution Config & Preview ─────────────────────────────────────────
@@ -4016,6 +4177,69 @@ Done!"#;
         assert!(!is_resume_command("fix the bug"));
         assert!(!is_resume_command("continue with something else"));
         assert!(!is_resume_command(""));
+    }
+
+    #[test]
+    fn parse_plan_paused_corrections_and_rewind() {
+        assert_eq!(
+            parse_plan_paused_user_line("correct skip tests for now"),
+            Some(PlanPausedUserAction::Correction(
+                "skip tests for now".into()
+            ))
+        );
+        assert_eq!(
+            parse_plan_paused_user_line("note use feature flags"),
+            Some(PlanPausedUserAction::Correction("use feature flags".into()))
+        );
+        assert_eq!(
+            parse_plan_paused_user_line("correct clear"),
+            Some(PlanPausedUserAction::ClearCorrections)
+        );
+        assert_eq!(
+            parse_plan_paused_user_line("rewind 2"),
+            Some(PlanPausedUserAction::Rewind(PlanRewindAnchor::OneBased(2)))
+        );
+        assert_eq!(
+            parse_plan_paused_user_line("restart from st-a"),
+            Some(PlanPausedUserAction::Rewind(PlanRewindAnchor::IdPrefix(
+                "st-a".into()
+            )))
+        );
+        assert!(parse_plan_paused_user_line("hello").is_none());
+    }
+
+    #[test]
+    fn rewind_plan_resets_suffix() {
+        let mut plan = TaskPlan {
+            subtasks: vec![
+                SubtaskPlan {
+                    id: "1".into(),
+                    title: "a".into(),
+                    status: TaskStatus::Completed,
+                    ..Default::default()
+                },
+                SubtaskPlan {
+                    id: "2".into(),
+                    title: "b".into(),
+                    status: TaskStatus::Completed,
+                    ..Default::default()
+                },
+                SubtaskPlan {
+                    id: "3".into(),
+                    title: "c".into(),
+                    status: TaskStatus::InProgress,
+                    ..Default::default()
+                },
+            ],
+            notes: None,
+        };
+        let idx = resolve_rewind_start_index(&plan, &PlanRewindAnchor::OneBased(2)).unwrap();
+        assert_eq!(idx, 1);
+        let n = rewind_plan_from_subtask(&mut plan, idx);
+        assert_eq!(n, 2);
+        assert_eq!(plan.subtasks[0].status, TaskStatus::Completed);
+        assert_eq!(plan.subtasks[1].status, TaskStatus::Pending);
+        assert_eq!(plan.subtasks[2].status, TaskStatus::Pending);
     }
 
     // ═══════════════════════════ Plan Versioning Tests ════════════════════════
