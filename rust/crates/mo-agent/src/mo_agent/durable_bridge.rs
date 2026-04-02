@@ -422,6 +422,148 @@ pub fn create_local_lifecycle(
     ))
 }
 
+// ─── LLM Judge Implementation ────────────────────────────────────────────────
+
+/// Concrete [`LlmJudge`] that calls an OpenAI-compatible chat completions API.
+///
+/// Sends a structured prompt asking the LLM to evaluate a criterion and return
+/// a confidence score. Parses the response to extract a 0.0–1.0 score.
+pub struct HttpLlmJudge {
+    client: reqwest::Client,
+    api_key: String,
+    base_url: String,
+    model: String,
+}
+
+impl HttpLlmJudge {
+    pub fn new(api_key: String, base_url: String, model: String) -> Self {
+        Self {
+            client: reqwest::Client::new(),
+            api_key,
+            base_url,
+            model,
+        }
+    }
+
+    /// Try to create from environment variables.
+    ///
+    /// Looks for `MO_LLM_API_KEY` / `OPENAI_API_KEY` / `ANTHROPIC_API_KEY`,
+    /// `MO_LLM_BASE_URL` / `OPENAI_BASE_URL`, and `MO_LLM_MODEL`.
+    pub fn from_env() -> Option<Self> {
+        let api_key = std::env::var("MO_LLM_API_KEY")
+            .or_else(|_| std::env::var("OPENAI_API_KEY"))
+            .or_else(|_| std::env::var("ANTHROPIC_API_KEY"))
+            .ok()?;
+        let base_url = std::env::var("MO_LLM_BASE_URL")
+            .or_else(|_| std::env::var("OPENAI_BASE_URL"))
+            .unwrap_or_else(|_| "https://api.openai.com/v1".into());
+        let model = std::env::var("MO_LLM_MODEL")
+            .unwrap_or_else(|_| "gpt-4o-mini".into());
+        Some(Self::new(api_key, base_url, model))
+    }
+}
+
+#[async_trait::async_trait]
+impl mo_agent_services::LlmJudge for HttpLlmJudge {
+    async fn evaluate(&self, prompt: &str, context: &str) -> Result<f64, String> {
+        let system_msg = serde_json::json!({
+            "role": "system",
+            "content": "You are a verification judge. Evaluate whether an acceptance criterion \
+                        is met based on the provided context. Respond with ONLY a JSON object: \
+                        {\"score\": <0.0-1.0>, \"reason\": \"<brief explanation>\"}. \
+                        Score 1.0 = fully met, 0.0 = not met at all."
+        });
+        let user_msg = serde_json::json!({
+            "role": "user",
+            "content": format!(
+                "Criterion: {prompt}\n\nContext:\n{context}\n\n\
+                 Evaluate and respond with {{\"score\": <0.0-1.0>, \"reason\": \"...\"}}."
+            )
+        });
+
+        let body = serde_json::json!({
+            "model": self.model,
+            "messages": [system_msg, user_msg],
+            "max_tokens": 200,
+            "temperature": 0.1,
+        });
+
+        let url = format!(
+            "{}/chat/completions",
+            self.base_url.trim_end_matches('/')
+        );
+
+        let resp = self
+            .client
+            .post(&url)
+            .header("Authorization", format!("Bearer {}", self.api_key))
+            .header("Content-Type", "application/json")
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| format!("LLM request failed: {e}"))?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            return Err(format!("LLM API error {status}: {}", &text[..text.len().min(200)]));
+        }
+
+        let json: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| format!("LLM response parse failed: {e}"))?;
+
+        // Extract the assistant's response text
+        let content = json["choices"][0]["message"]["content"]
+            .as_str()
+            .unwrap_or("");
+
+        // Parse the score from the response
+        parse_judge_score(content)
+    }
+}
+
+/// Extract a 0.0–1.0 score from LLM judge response text.
+///
+/// Tries JSON parsing first (`{"score": 0.8}`), then falls back to finding
+/// a decimal number in the text.
+fn parse_judge_score(text: &str) -> Result<f64, String> {
+    // Try JSON parse first
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(text) {
+        if let Some(score) = v["score"].as_f64() {
+            return Ok(score.clamp(0.0, 1.0));
+        }
+    }
+
+    // Try to find JSON embedded in text (e.g., wrapped with markdown)
+    if let Some(start) = text.find('{') {
+        if let Some(end) = text[start..].rfind('}') {
+            let json_str = &text[start..=start + end];
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(json_str) {
+                if let Some(score) = v["score"].as_f64() {
+                    return Ok(score.clamp(0.0, 1.0));
+                }
+            }
+        }
+    }
+
+    // Fallback: find any decimal number between 0 and 1
+    for word in text.split_whitespace() {
+        let clean = word.trim_matches(|c: char| !c.is_ascii_digit() && c != '.');
+        if let Ok(n) = clean.parse::<f64>() {
+            if (0.0..=1.0).contains(&n) {
+                return Ok(n);
+            }
+        }
+    }
+
+    Err(format!(
+        "Could not extract score from LLM response: {}",
+        &text[..text.len().min(200)]
+    ))
+}
+
 // ─── Tests ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -527,5 +669,36 @@ mod tests {
 
         assert!(!contract.contract_id.is_empty());
         assert_eq!(contract.subtasks.len(), 2);
+    }
+
+    #[test]
+    fn parse_judge_score_json() {
+        let score = parse_judge_score(r#"{"score": 0.85, "reason": "looks good"}"#).unwrap();
+        assert!((score - 0.85).abs() < 0.001);
+    }
+
+    #[test]
+    fn parse_judge_score_json_in_markdown() {
+        let text = "Here is my evaluation:\n```json\n{\"score\": 0.7, \"reason\": \"mostly ok\"}\n```";
+        let score = parse_judge_score(text).unwrap();
+        assert!((score - 0.7).abs() < 0.001);
+    }
+
+    #[test]
+    fn parse_judge_score_plain_number() {
+        let score = parse_judge_score("The score is 0.9 out of 1.0").unwrap();
+        assert!((score - 0.9).abs() < 0.001);
+    }
+
+    #[test]
+    fn parse_judge_score_clamped() {
+        let score = parse_judge_score(r#"{"score": 1.5}"#).unwrap();
+        assert!((score - 1.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn parse_judge_score_no_number() {
+        let result = parse_judge_score("This criterion is fully met");
+        assert!(result.is_err());
     }
 }

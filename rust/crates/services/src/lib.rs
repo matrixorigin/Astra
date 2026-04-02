@@ -78,7 +78,7 @@ pub use durable_task::{
     SubtaskVerificationReport, TaskBranchService, TaskContract, TaskDeliveryReport,
     TaskLearningBridge, TaskOutcomeSignal, TaskPatternStats, TaskResumeContext, TaskScope,
     UnconfiguredDurableTaskLifecycle, VerificationCriterion, VerificationResult,
-    VerificationRunner, VerifierKind, build_outcome_signal,
+    VerificationRunner, VerifierKind, LlmJudge, build_outcome_signal,
 };
 pub use data_versioning::{
     DataVersioningService, DatabaseDataVersioningService, UnconfiguredDataVersioningService,

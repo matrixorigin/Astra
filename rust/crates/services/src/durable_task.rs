@@ -20,6 +20,27 @@ use serde::{Deserialize, Serialize};
 
 use crate::task_orchestrator::{TaskCheckpoint, TaskPlan};
 
+// ─── LLM Judge Trait ────────────────────────────────────────────────────────
+
+/// Trait for LLM-based semantic verification.
+///
+/// Implementors call an LLM with the criterion prompt and return a confidence
+/// score (0.0–1.0). The `VerificationRunner` compares the score against
+/// `pass_threshold` to determine pass/fail.
+///
+/// This trait lives in `services` so that higher-level crates (`runtime`,
+/// `mo-agent`) can provide concrete implementations with access to LLM APIs.
+#[async_trait]
+pub trait LlmJudge: Send + Sync {
+    /// Evaluate a verification criterion using an LLM.
+    ///
+    /// `prompt` — the evaluation question (from `VerifierKind::LlmJudge`)
+    /// `context` — optional extra context (e.g. git diff, file contents)
+    ///
+    /// Returns `Ok(score)` where score is 0.0–1.0, or `Err(message)` on failure.
+    async fn evaluate(&self, prompt: &str, context: &str) -> Result<f64, String>;
+}
+
 // ─── Contract ───────────────────────────────────────────────────────────────
 
 /// A durable task contract with verifiable acceptance criteria.
@@ -322,13 +343,26 @@ pub struct SubtaskVerificationReport {
 // ─── Verification Runner ────────────────────────────────────────────────────
 
 /// Executes verification criteria (edge-side: commands, files, grep, build/test).
+/// When an `LlmJudge` implementation is provided, also handles semantic verification.
 pub struct VerificationRunner {
     pub work_dir: std::path::PathBuf,
+    pub llm_judge: Option<Arc<dyn LlmJudge>>,
 }
 
 impl VerificationRunner {
     pub fn new(work_dir: std::path::PathBuf) -> Self {
-        Self { work_dir }
+        Self {
+            work_dir,
+            llm_judge: None,
+        }
+    }
+
+    /// Create a runner with LLM judge support for semantic verification.
+    pub fn with_llm_judge(work_dir: std::path::PathBuf, judge: Arc<dyn LlmJudge>) -> Self {
+        Self {
+            work_dir,
+            llm_judge: Some(judge),
+        }
     }
 
     /// Verify all criteria for a subtask.
@@ -517,12 +551,35 @@ impl VerificationRunner {
                 ))
             }
 
-            VerifierKind::LlmJudge { prompt, .. } => {
-                Ok((
-                    false,
-                    "LLM judge must run on cloud".into(),
-                    format!("LLM evaluation: {}", truncate(prompt, 200)),
-                ))
+            VerifierKind::LlmJudge {
+                prompt,
+                pass_threshold,
+            } => {
+                if let Some(judge) = &self.llm_judge {
+                    let context = format!("Work directory: {}", self.work_dir.display());
+                    match judge.evaluate(prompt, &context).await {
+                        Ok(score) => {
+                            let passed = score >= *pass_threshold;
+                            Ok((
+                                passed,
+                                format!("LLM score: {score:.2} (threshold: {pass_threshold:.2})"),
+                                format!("LLM evaluation: {}", truncate(prompt, 200)),
+                            ))
+                        }
+                        Err(e) => Ok((
+                            false,
+                            format!("LLM judge error: {e}"),
+                            format!("LLM evaluation: {}", truncate(prompt, 200)),
+                        )),
+                    }
+                } else {
+                    // No LLM judge available — skip with informative message
+                    Ok((
+                        false,
+                        "LLM judge not available (no provider configured)".into(),
+                        format!("LLM evaluation: {}", truncate(prompt, 200)),
+                    ))
+                }
             }
 
             VerifierKind::Composite {
@@ -1322,6 +1379,7 @@ pub struct MatrixOneDurableTaskLifecycle {
     pool: sqlx::Pool<sqlx::MySql>,
     branch_ops: Arc<dyn TaskBranchOps>,
     work_dir: std::path::PathBuf,
+    llm_judge: Option<Arc<dyn LlmJudge>>,
 }
 
 impl MatrixOneDurableTaskLifecycle {
@@ -1332,6 +1390,7 @@ impl MatrixOneDurableTaskLifecycle {
             pool,
             branch_ops,
             work_dir,
+            llm_judge: None,
         }
     }
 
@@ -1349,11 +1408,20 @@ impl MatrixOneDurableTaskLifecycle {
             pool,
             branch_ops,
             work_dir,
+            llm_judge: None,
         }
     }
 
+    /// Set the LLM judge for semantic verification.
+    pub fn set_llm_judge(&mut self, judge: Arc<dyn LlmJudge>) {
+        self.llm_judge = Some(judge);
+    }
+
     fn runner(&self) -> VerificationRunner {
-        VerificationRunner::new(self.work_dir.clone())
+        match &self.llm_judge {
+            Some(j) => VerificationRunner::with_llm_judge(self.work_dir.clone(), j.clone()),
+            None => VerificationRunner::new(self.work_dir.clone()),
+        }
     }
 
     // ── Private Helpers ──
@@ -2061,6 +2129,7 @@ pub struct LocalDurableTaskLifecycle {
     contracts_dir: std::path::PathBuf,
     branch_ops: Arc<dyn TaskBranchOps>,
     work_dir: std::path::PathBuf,
+    llm_judge: Option<Arc<dyn LlmJudge>>,
 }
 
 impl LocalDurableTaskLifecycle {
@@ -2078,6 +2147,7 @@ impl LocalDurableTaskLifecycle {
             contracts_dir: data_dir.join("contracts"),
             branch_ops,
             work_dir,
+            llm_judge: None,
         }
     }
 
@@ -2091,6 +2161,19 @@ impl LocalDurableTaskLifecycle {
             contracts_dir: data_dir.join("contracts"),
             branch_ops,
             work_dir,
+            llm_judge: None,
+        }
+    }
+
+    /// Set the LLM judge for semantic verification.
+    pub fn set_llm_judge(&mut self, judge: Arc<dyn LlmJudge>) {
+        self.llm_judge = Some(judge);
+    }
+
+    fn make_runner(&self) -> VerificationRunner {
+        match &self.llm_judge {
+            Some(j) => VerificationRunner::with_llm_judge(self.work_dir.clone(), j.clone()),
+            None => VerificationRunner::new(self.work_dir.clone()),
         }
     }
 
@@ -2344,7 +2427,7 @@ impl DurableTaskLifecycle for LocalDurableTaskLifecycle {
             ));
         }
 
-        let runner = VerificationRunner::new(self.work_dir.clone());
+        let runner = self.make_runner();
         // Per-subtask: use local verification (skips global_only & LlmJudge)
         let report = runner.verify_subtask_local(&durable_st).await;
 
@@ -2387,7 +2470,7 @@ impl DurableTaskLifecycle for LocalDurableTaskLifecycle {
         let contract = self
             .find_by_task(task_id)?
             .ok_or_else(|| format!("no contract for task '{task_id}'"))?;
-        let runner = VerificationRunner::new(self.work_dir.clone());
+        let runner = self.make_runner();
         let mut results = Vec::new();
         for c in &contract.global_verification {
             results.push(runner.run_criterion(c).await);
@@ -3961,5 +4044,119 @@ mod tests {
             err.contains("not ready for verification"),
             "unexpected error: {err}"
         );
+    }
+
+    // ── LlmJudge trait tests ──
+
+    struct MockLlmJudge {
+        fixed_score: f64,
+    }
+
+    #[async_trait]
+    impl LlmJudge for MockLlmJudge {
+        async fn evaluate(&self, _prompt: &str, _context: &str) -> Result<f64, String> {
+            Ok(self.fixed_score)
+        }
+    }
+
+    #[tokio::test]
+    async fn llm_judge_passes_when_score_above_threshold() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let judge = Arc::new(MockLlmJudge { fixed_score: 0.85 });
+        let runner = VerificationRunner::with_llm_judge(tmp.path().to_path_buf(), judge);
+
+        let criterion = VerificationCriterion {
+            id: "llm-1".into(),
+            description: "code quality is good".into(),
+            verifier: VerifierKind::LlmJudge {
+                prompt: "Is the code quality good?".into(),
+                pass_threshold: 0.7,
+            },
+            required: true,
+            timeout_sec: 30,
+            global_only: true,
+        };
+
+        let result = runner.run_criterion(&criterion).await;
+        assert!(result.passed, "score 0.85 >= threshold 0.7 should pass");
+        assert!(result.evidence.contains("0.85"));
+        assert!(result.error.is_none());
+    }
+
+    #[tokio::test]
+    async fn llm_judge_fails_when_score_below_threshold() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let judge = Arc::new(MockLlmJudge { fixed_score: 0.3 });
+        let runner = VerificationRunner::with_llm_judge(tmp.path().to_path_buf(), judge);
+
+        let criterion = VerificationCriterion {
+            id: "llm-2".into(),
+            description: "tests are comprehensive".into(),
+            verifier: VerifierKind::LlmJudge {
+                prompt: "Are tests comprehensive?".into(),
+                pass_threshold: 0.7,
+            },
+            required: true,
+            timeout_sec: 30,
+            global_only: true,
+        };
+
+        let result = runner.run_criterion(&criterion).await;
+        assert!(!result.passed, "score 0.3 < threshold 0.7 should fail");
+        assert!(result.evidence.contains("0.30"));
+    }
+
+    #[tokio::test]
+    async fn llm_judge_without_provider_returns_false() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let runner = VerificationRunner::new(tmp.path().to_path_buf());
+
+        let criterion = VerificationCriterion {
+            id: "llm-3".into(),
+            description: "semantic check".into(),
+            verifier: VerifierKind::LlmJudge {
+                prompt: "Is the code clean?".into(),
+                pass_threshold: 0.7,
+            },
+            required: true,
+            timeout_sec: 30,
+            global_only: true,
+        };
+
+        let result = runner.run_criterion(&criterion).await;
+        assert!(!result.passed, "no judge configured → should fail");
+        assert!(result.evidence.contains("not available"));
+    }
+
+    struct FailingLlmJudge;
+
+    #[async_trait]
+    impl LlmJudge for FailingLlmJudge {
+        async fn evaluate(&self, _prompt: &str, _context: &str) -> Result<f64, String> {
+            Err("API rate limited".into())
+        }
+    }
+
+    #[tokio::test]
+    async fn llm_judge_handles_api_error_gracefully() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let judge: Arc<dyn LlmJudge> = Arc::new(FailingLlmJudge);
+        let runner = VerificationRunner::with_llm_judge(tmp.path().to_path_buf(), judge);
+
+        let criterion = VerificationCriterion {
+            id: "llm-4".into(),
+            description: "check quality".into(),
+            verifier: VerifierKind::LlmJudge {
+                prompt: "Is quality high?".into(),
+                pass_threshold: 0.7,
+            },
+            required: true,
+            timeout_sec: 30,
+            global_only: true,
+        };
+
+        let result = runner.run_criterion(&criterion).await;
+        assert!(!result.passed, "API error → should fail");
+        assert!(result.evidence.contains("rate limited"));
     }
 }
