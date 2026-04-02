@@ -116,6 +116,17 @@ fn display_contract_summary(contract: &TaskContract) {
 
 // ─── Subtask lifecycle hooks ─────────────────────────────────────────────────
 
+/// Check whether a subtask has exhausted its retry budget.
+pub fn subtask_retries_exhausted(durable: &DurableTaskState, subtask_id: &str) -> bool {
+    durable
+        .contract
+        .subtasks
+        .iter()
+        .find(|s| s.id == subtask_id)
+        .map(|s| s.retry_count >= s.max_retries)
+        .unwrap_or(false)
+}
+
 /// Call when a subtask transitions Pending → Executing (snapshot).
 pub async fn on_subtask_begin(
     durable: &DurableTaskState,
@@ -205,6 +216,7 @@ pub async fn on_subtask_complete(
                 if report.all_required_passed {
                     sub.stage = SubtaskStage::Verified;
                 } else {
+                    sub.retry_count += 1;
                     sub.stage = SubtaskStage::VerificationFailed {
                         results: report.results.clone(),
                     };

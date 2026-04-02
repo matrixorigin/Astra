@@ -1882,12 +1882,50 @@ async fn run_plan_execution(
             None => return Ok(()),
         };
 
-        // Mark any in-progress subtasks as completed (just finished by previous chat turn)
+        // Mark any in-progress subtasks as completed (just finished by previous chat turn).
+        // Run verification if durable contract is active to avoid bypassing the gate.
         let mut completed_titles: Vec<String> = Vec::new();
-        for st in plan.subtasks.iter_mut() {
-            if st.status == TaskStatus::InProgress {
-                st.status = TaskStatus::Completed;
-                completed_titles.push(st.title.clone());
+        let in_progress_ids: Vec<String> = plan
+            .subtasks
+            .iter()
+            .filter(|st| st.status == TaskStatus::InProgress)
+            .map(|st| st.id.clone())
+            .collect();
+        for st_id in &in_progress_ids {
+            let verification_passed = if let Some(ref mut durable) = state.durable_task_state {
+                durable_bridge::on_subtask_complete(durable, st_id).await
+            } else {
+                true
+            };
+            if let Some(st) = plan.subtasks.iter_mut().find(|s| s.id == *st_id) {
+                if verification_passed {
+                    st.status = TaskStatus::Completed;
+                    completed_titles.push(st.title.clone());
+                } else if let Some(ref durable) = state.durable_task_state {
+                    if durable_bridge::subtask_retries_exhausted(durable, st_id) {
+                        eprintln!(
+                            "  {}  Subtask verification failed after max retries, forcing complete: {}",
+                            "⚠".yellow(),
+                            st.title,
+                        );
+                        st.status = TaskStatus::Completed;
+                        completed_titles.push(st.title.clone());
+                    } else {
+                        eprintln!(
+                            "  {}  Subtask verification failed, will retry: {}",
+                            "↻".yellow(),
+                            st.title,
+                        );
+                        st.status = TaskStatus::Pending;
+                    }
+                } else {
+                    eprintln!(
+                        "  {}  Subtask verification failed, will retry: {}",
+                        "↻".yellow(),
+                        st.title,
+                    );
+                    st.status = TaskStatus::Pending;
+                }
             }
         }
         for title in &completed_titles {
@@ -1914,8 +1952,20 @@ async fn run_plan_execution(
                 eprint!("{}", summary.format());
 
                 // Durable task: run global verification + delivery report
-                if let Some(ref mut durable) = state.durable_task_state {
-                    let _ = durable_bridge::on_plan_complete(durable).await;
+                let global_passed = if let Some(ref mut durable) = state.durable_task_state {
+                    durable_bridge::on_plan_complete(durable).await
+                } else {
+                    true
+                };
+
+                if !global_passed {
+                    eprintln!(
+                        "\n{}  Global verification failed. Plan remains active for fixes.",
+                        "⚠".yellow()
+                    );
+                    // Don't mark as complete — keep plan active so user can fix and retry
+                    state.executing_plan = Some(plan);
+                    return Ok(());
                 }
 
                 // Journal: plan complete
@@ -2175,9 +2225,24 @@ async fn run_plan_execution(
 
                 if verification_passed {
                     st.status = TaskStatus::Completed;
+                } else if let Some(ref durable) = state.durable_task_state {
+                    if durable_bridge::subtask_retries_exhausted(durable, next_id) {
+                        // Exhausted retry budget — force complete to unblock the plan
+                        eprintln!(
+                            "  {}  Subtask verification failed after max retries, forcing complete: {}",
+                            "⚠".yellow(),
+                            st.title,
+                        );
+                        st.status = TaskStatus::Completed;
+                    } else {
+                        eprintln!(
+                            "  {}  Subtask verification failed, will retry: {}",
+                            "↻".yellow(),
+                            st.title,
+                        );
+                        st.status = TaskStatus::Pending;
+                    }
                 } else {
-                    // Verification failed — mark as failed so it can be retried
-                    // by the plan execution loop on the next iteration
                     eprintln!(
                         "  {}  Subtask verification failed, will retry: {}",
                         "↻".yellow(),
