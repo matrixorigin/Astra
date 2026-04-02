@@ -372,8 +372,16 @@ impl ToolExecutor {
             return format!("{numbered}{read_warning}");
         }
         let lines: Vec<&str> = content.lines().collect();
-        let s = start.unwrap_or(1).saturating_sub(1);
+        let s = start.unwrap_or(1).saturating_sub(1).min(lines.len());
         let e = end.unwrap_or(lines.len()).min(lines.len());
+        if s >= e {
+            return format!(
+                "(empty range: start_line {} >= end_line {} or file has only {} lines)",
+                s + 1,
+                e,
+                lines.len()
+            );
+        }
         let actual_start_line = s + 1; // 1-indexed
         let slice = lines[s..e].join("\n");
         let mut result = truncate_output(
