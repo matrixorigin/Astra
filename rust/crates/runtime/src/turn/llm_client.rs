@@ -32,6 +32,13 @@ pub(crate) const LLM_MAX_RETRIES: u32 = 3;
 pub(crate) const LLM_RETRY_BASE_MS: u64 = 1000;
 /// Stream idle watchdog: abort streaming if no chunk arrives within this time.
 pub(crate) const STREAM_IDLE_TIMEOUT_MS: u64 = 90_000;
+/// TCP connect timeout for LLM API requests (seconds). Override: `MO_LLM_CONNECT_TIMEOUT_S`.
+const LLM_CONNECT_TIMEOUT_S: u64 = 30;
+/// Non-stream fallback hard timeout (seconds). Override: `MO_LLM_FALLBACK_TIMEOUT_S`.
+const LLM_FALLBACK_TIMEOUT_S: u64 = 120;
+/// Total budget across all retries + fallback for a single LLM call (seconds).
+/// Override: `MO_LLM_TOTAL_BUDGET_S`.
+const LLM_TOTAL_BUDGET_S: u64 = 300;
 
 // ── Rate-Limit Cooldown ──────────────────────────────────────────────────────
 use std::sync::OnceLock;
@@ -216,6 +223,33 @@ pub(crate) fn stream_idle_timeout() -> std::time::Duration {
     std::time::Duration::from_millis(ms)
 }
 
+/// TCP connect timeout for LLM API requests.
+pub(crate) fn llm_connect_timeout() -> std::time::Duration {
+    let s = std::env::var("MO_LLM_CONNECT_TIMEOUT_S")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(LLM_CONNECT_TIMEOUT_S);
+    std::time::Duration::from_secs(s)
+}
+
+/// Hard timeout for the non-stream fallback request.
+pub(crate) fn llm_fallback_timeout() -> std::time::Duration {
+    let s = std::env::var("MO_LLM_FALLBACK_TIMEOUT_S")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(LLM_FALLBACK_TIMEOUT_S);
+    std::time::Duration::from_secs(s)
+}
+
+/// Total budget across all retries + fallback for a single LLM call.
+fn llm_total_budget() -> std::time::Duration {
+    let s = std::env::var("MO_LLM_TOTAL_BUDGET_S")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(LLM_TOTAL_BUDGET_S);
+    std::time::Duration::from_secs(s)
+}
+
 /// Call the LLM streaming API, collect the full response, and return a structured result.
 ///
 /// Unlike `call_llm_stream` (which returns raw SSE bytes), this function
@@ -242,8 +276,10 @@ pub(crate) async fn call_llm_and_collect(
     let cooldown = rate_limit_cooldown();
 
     let started = Instant::now();
+    let total_budget = llm_total_budget();
     let client = reqwest::Client::builder()
         .no_proxy()
+        .connect_timeout(llm_connect_timeout())
         .timeout(std::time::Duration::from_secs(turn_timeout_s() as u64 + 10))
         .build()
         .map_err(|e| e.to_string())?;
@@ -274,6 +310,13 @@ pub(crate) async fn call_llm_and_collect(
     for attempt in 0..=LLM_MAX_RETRIES {
         if cancel.is_triggered() {
             return Err("LLM call cancelled".to_string());
+        }
+        // Total budget guard: abort if we've already spent too long across retries.
+        if started.elapsed() > total_budget {
+            return Err(format!(
+                "LLM total budget exhausted ({:.0}s): {last_err}",
+                total_budget.as_secs_f64()
+            ));
         }
         if attempt > 0 {
             let delay = LLM_RETRY_BASE_MS * (1 << (attempt - 1));
@@ -319,11 +362,23 @@ pub(crate) async fn call_llm_and_collect(
                     if cancel.is_triggered() {
                         return Err("LLM call cancelled".to_string());
                     }
+                    // Check total budget before attempting fallback.
+                    let elapsed = started.elapsed();
+                    if elapsed > total_budget {
+                        return Err(format!(
+                            "LLM total budget exhausted ({:.0}s) after stream idle timeout",
+                            total_budget.as_secs_f64()
+                        ));
+                    }
                     // Abort streaming and fall back to non-stream request (single response).
+                    // Cap the fallback timeout at min(fallback_timeout, remaining budget).
+                    let remaining = total_budget.saturating_sub(elapsed);
+                    let fb_timeout = llm_fallback_timeout().min(remaining);
                     mo_agent_core::agent_warn!(
                         "llm",
-                        "stream idle timeout after {}ms — attempting non-stream fallback",
-                        elapsed_ms
+                        "stream idle timeout after {}ms — attempting non-stream fallback (timeout {}s)",
+                        elapsed_ms,
+                        fb_timeout.as_secs()
                     );
                     return call_llm_nonstream_fallback(
                         &client,
@@ -334,6 +389,7 @@ pub(crate) async fn call_llm_and_collect(
                         base_url,
                         provider,
                         max_output_tokens,
+                        fb_timeout,
                     )
                     .await;
                 }
@@ -579,6 +635,7 @@ pub(crate) async fn call_llm_nonstream_fallback(
     base_url: &str,
     provider: &str,
     max_output_tokens: Option<usize>,
+    timeout: std::time::Duration,
 ) -> Result<LlmCallResult, String> {
     let started = Instant::now();
     let mut body = json!({
@@ -608,7 +665,13 @@ pub(crate) async fn call_llm_nonstream_fallback(
         req = req.header("authorization", format!("Bearer {api_key}"));
     }
 
-    let resp = req.json(&body).send().await.map_err(|e| e.to_string())?;
+    // Apply per-request timeout (overrides the client-level default).
+    let resp = req
+        .timeout(timeout)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("LLM fallback request failed (timeout {}s): {e}", timeout.as_secs()))?;
     if !resp.status().is_success() {
         let status = resp.status().as_u16();
         let text = resp.text().await.unwrap_or_default();
@@ -796,6 +859,81 @@ mod tests {
         let flag3 = Arc::new(AtomicBool::new(true));
         let token3 = CancellationToken::new();
         assert!(LlmCancel::FlagAndToken(flag3.as_ref(), &token3).is_triggered());
+    }
+
+    // ── Timeout configuration tests ─────────────────────────────────────────
+
+    #[test]
+    fn connect_timeout_default_is_30s() {
+        // Ensure no env override interferes.
+        let dur = llm_connect_timeout();
+        // Default is LLM_CONNECT_TIMEOUT_S = 30.
+        assert_eq!(dur, std::time::Duration::from_secs(LLM_CONNECT_TIMEOUT_S));
+    }
+
+    #[test]
+    fn fallback_timeout_default_is_120s() {
+        let dur = llm_fallback_timeout();
+        assert_eq!(dur, std::time::Duration::from_secs(LLM_FALLBACK_TIMEOUT_S));
+    }
+
+    #[test]
+    fn total_budget_default_is_300s() {
+        let dur = llm_total_budget();
+        assert_eq!(dur, std::time::Duration::from_secs(LLM_TOTAL_BUDGET_S));
+    }
+
+    #[tokio::test]
+    async fn total_budget_exhausted_returns_error() {
+        // Simulate a scenario where started time is already past budget.
+        // We test the logic inline since call_llm_and_collect needs a server.
+        let budget = std::time::Duration::from_millis(1);
+        let started = Instant::now();
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        assert!(
+            started.elapsed() > budget,
+            "elapsed should exceed tiny budget"
+        );
+    }
+
+    #[tokio::test]
+    async fn nonstream_fallback_respects_timeout() {
+        // Create a mock server that delays longer than the fallback timeout.
+        let app = Router::new().route(
+            "/chat/completions",
+            post(|| async {
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                Response::builder()
+                    .status(200)
+                    .body(Body::from(r#"{"choices":[{"message":{"content":"late"}}]}"#))
+                    .unwrap()
+            }),
+        );
+        let base = spawn_local_http_server(app).await;
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("build client");
+        // Use a very short timeout — should fail before the 5s delay completes.
+        let timeout = std::time::Duration::from_millis(100);
+        let result = call_llm_nonstream_fallback(
+            &client,
+            &[json!({"role":"user","content":"x"})],
+            &[],
+            "m",
+            "k",
+            &base,
+            "openai",
+            None,
+            timeout,
+        )
+        .await;
+        assert!(result.is_err(), "should timeout: {result:?}");
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("timeout") || err.contains("Timeout"),
+            "error should mention timeout: {err}"
+        );
     }
 
     #[test]

@@ -442,6 +442,7 @@ async fn call_llm_stream(
 
     let client = reqwest::Client::builder()
         .no_proxy()
+        .connect_timeout(crate::turn::llm_client::llm_connect_timeout())
         .timeout(std::time::Duration::from_secs(turn_timeout_s() as u64 + 10))
         .build()
         .map_err(|e| e.to_string())?;
@@ -552,6 +553,7 @@ async fn call_llm_stream(
                                     tool_calls_map.clear();
                                     full_text.clear();
                                     reasoning.clear();
+                                    let fb_timeout = crate::turn::llm_client::llm_fallback_timeout();
                                     match crate::turn::llm_client::call_llm_nonstream_fallback(
                                         &client_for_fallback,
                                         &messages_for_fallback,
@@ -561,6 +563,7 @@ async fn call_llm_stream(
                                         &base_url_for_fallback,
                                         &provider_for_fallback,
                                         max_out_for_fallback,
+                                        fb_timeout,
                                     )
                                     .await
                                     {
