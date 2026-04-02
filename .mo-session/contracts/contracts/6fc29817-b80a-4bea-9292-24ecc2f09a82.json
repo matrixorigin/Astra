@@ -1,0 +1,119 @@
+{
+  "contract_id": "6fc29817-b80a-4bea-9292-24ecc2f09a82",
+  "task_id": "f4e2c043-3f7a-42b5-981f-1b8253d0a84c",
+  "goal": "在/tmp目录下生成一个简单的输入放大效果html",
+  "scope": {
+    "in_scope": [
+      "Create input amplification HTML file",
+      "Verify HTML file exists and is valid"
+    ],
+    "out_of_scope": [
+      "Deployment and CI/CD changes",
+      "Documentation updates"
+    ],
+    "assumptions": [
+      "Project builds successfully before changes"
+    ]
+  },
+  "subtasks": [
+    {
+      "id": "create-html-file",
+      "title": "Create input amplification HTML file",
+      "description": "Create /tmp/input-amplify.html with an input field that demonstrates text amplification effect - text grows larger as user types, with smooth CSS transitions and a live preview area showing the amplified text",
+      "depends_on": [],
+      "effort": "small",
+      "files": [
+        "/tmp/input-amplify.html"
+      ],
+      "stage": {
+        "state": "awaiting_verification"
+      },
+      "criteria": [
+        {
+          "id": "create-html-file-ac0",
+          "description": "Open file in browser, type in input field, see text scale up smoothly with visual amplification effect",
+          "verifier": {
+            "kind": "llm_judge",
+            "prompt": "Evaluate whether the following acceptance criterion is met: \"Open file in browser, type in input field, see text scale up smoothly with visual amplification effect\". Respond with a score from 0.0 to 1.0.",
+            "pass_threshold": 0.7
+          },
+          "required": true,
+          "timeout_sec": 60,
+          "global_only": true
+        }
+      ],
+      "max_retries": 2,
+      "retry_count": 0,
+      "snapshot_name": "task_f4e2c043-3f7a-42b5-981f-1b8253d0a84c_create-html-file_v2",
+      "diff_summary": {
+        "snapshot": "task_f4e2c043-3f7a-42b5-981f-1b8253d0a84c_create-html-file_v2",
+        "changed_rows": 2
+      }
+    },
+    {
+      "id": "verify-file-creation",
+      "title": "Verify HTML file exists and is valid",
+      "description": "Run 'ls -la /tmp/input-amplify.html' to confirm file exists, then optionally open in browser to test the effect works correctly",
+      "depends_on": [
+        "create-html-file"
+      ],
+      "effort": "small",
+      "stage": {
+        "state": "verified"
+      },
+      "criteria": [
+        {
+          "id": "verify-file-creation-ac0",
+          "description": "File exists at /tmp/input-amplify.html with non-zero size, HTML is well-formed",
+          "verifier": {
+            "kind": "file_exists",
+            "paths": [
+              "/tmp/input-amplify.html"
+            ]
+          },
+          "required": true,
+          "timeout_sec": 10,
+          "global_only": false
+        }
+      ],
+      "max_retries": 2,
+      "retry_count": 0,
+      "snapshot_name": "task_f4e2c043-3f7a-42b5-981f-1b8253d0a84c_verify-file-creation_v2",
+      "diff_summary": {
+        "snapshot": "task_f4e2c043-3f7a-42b5-981f-1b8253d0a84c_verify-file-creation_v2",
+        "changed_rows": 2
+      },
+      "last_verification": {
+        "subtask_id": "verify-file-creation",
+        "all_required_passed": true,
+        "results": [
+          {
+            "criterion_id": "verify-file-creation-ac0",
+            "passed": true,
+            "evidence": "all 1 files exist",
+            "expected": "files exist: [\"/tmp/input-amplify.html\"]",
+            "duration_ms": 0
+          }
+        ],
+        "timestamp": "2026-04-02T17:26:20.868260858+00:00"
+      }
+    }
+  ],
+  "global_verification": [
+    {
+      "id": "global-build",
+      "description": "Full project builds without errors",
+      "verifier": {
+        "kind": "build_pass",
+        "cmd": "make"
+      },
+      "required": true,
+      "timeout_sec": 600,
+      "global_only": true
+    }
+  ],
+  "version": 2,
+  "status": "completed",
+  "created_at": "2026-04-02T17:24:52.956594399+00:00",
+  "updated_at": "2026-04-02T17:26:20.896362097+00:00"
+}

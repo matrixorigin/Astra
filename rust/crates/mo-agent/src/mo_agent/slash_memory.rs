@@ -1997,6 +1997,10 @@ pub async fn handle_plan_mode_input(
             let mut event_types: Vec<String> = Vec::new();
             use futures_util::StreamExt;
 
+            let modify_spinner = super::stream_render::Spinner::start(
+                "Updating plan".to_string(),
+            );
+
             while let Some(chunk) = stream.next().await {
                 if let Ok(bytes) = chunk {
                     let event_str = String::from_utf8_lossy(&bytes);
@@ -2018,13 +2022,14 @@ pub async fn handle_plan_mode_input(
                                         full_text.push_str(content);
                                     }
                                 } else if event_type == "error" {
-                                    // Show error messages from the server
                                     if let Some(msg) = json
                                         .get("message")
                                         .or_else(|| json.get("error"))
                                         .and_then(|v| v.as_str())
                                     {
-                                        eprintln!("\r  {} Server error: {}", "✗".red(), msg);
+                                        modify_spinner.stop_clear();
+                                        eprintln!("  {} Server error: {}", "✗".red(), msg);
+                                        return Ok(());
                                     }
                                 }
                             }
@@ -2033,8 +2038,7 @@ pub async fn handle_plan_mode_input(
                 }
             }
 
-            // Clear thinking indicator
-            eprint!("\r                    \r");
+            modify_spinner.stop_clear();
 
             // Debug: show response info
             if full_text.is_empty() {
@@ -2056,12 +2060,10 @@ pub async fn handle_plan_mode_input(
                     Ok(plan) => {
                         plan_state.set_plan(plan.clone());
                         plan_state.modified = true;
-                        // Save updated state for recovery
                         let _ = plan_state.save_to_file(&PlanModeState::state_path());
                         eprintln!("{}  Plan updated!", "✓".green());
                         eprintln!();
-                        let formatted = format_plan(&plan);
-                        eprintln!("{formatted}");
+                        eprint_plan_progressive(&format_plan(&plan));
                         true
                     }
                     Err(_) => false, // No valid plan JSON — treat as conversational response
