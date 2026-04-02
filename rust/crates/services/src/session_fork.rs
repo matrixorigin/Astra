@@ -4,7 +4,7 @@
 //! parent's `session_start` / `session_end`), and a new `workspace.yaml` with parent linkage.
 
 use crate::session_journal::{
-    JournalEvent, JournalEventType, JournalWriter, SessionLineage, read_journal, journal_file_path,
+    JournalEvent, JournalEventType, JournalWriter, SessionLineage, journal_file_path, read_journal,
 };
 use crate::session_workspace::{self, WorkspaceMetadata};
 
@@ -55,7 +55,9 @@ pub fn fork_local_session(opts: ForkSessionOptions) -> Result<ForkSessionResult,
     let model = events
         .iter()
         .find_map(|e| {
-            (e.event_type == JournalEventType::SessionStart).then_some(e.model.clone()).flatten()
+            (e.event_type == JournalEventType::SessionStart)
+                .then_some(e.model.clone())
+                .flatten()
         })
         .or_else(|| events.iter().find_map(|e| e.model.clone()));
 
@@ -103,9 +105,8 @@ pub fn fork_local_session(opts: ForkSessionOptions) -> Result<ForkSessionResult,
         writer.append(evt).map_err(|e| e.to_string())?;
     }
 
-    let mut ws = session_workspace::read_workspace(&parent).unwrap_or_else(|_| {
-        WorkspaceMetadata::new(&parent, model.as_deref().unwrap_or("default"))
-    });
+    let mut ws = session_workspace::read_workspace(&parent)
+        .unwrap_or_else(|_| WorkspaceMetadata::new(&parent, model.as_deref().unwrap_or("default")));
     ws.session_id = new_id.clone();
     ws.parent_session_id = Some(parent.clone());
     ws.fork_note = opts.label.clone();

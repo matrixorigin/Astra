@@ -760,6 +760,7 @@ impl ContractGenerator {
             data_branch: None,
             diff_summary: None,
             last_verification: None,
+            tools_used: Vec::new(),
         }
     }
 

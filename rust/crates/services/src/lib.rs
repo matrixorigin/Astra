@@ -138,6 +138,7 @@ pub use runs::{
 pub use sandbox::{
     DatabaseSandboxService, SandboxRecord, SandboxService, UnconfiguredSandboxService,
 };
+pub use session_fork::{ForkSessionOptions, ForkSessionResult, fork_local_session};
 pub use skill_config::{
     DatabaseSkillConfigService, SkillConfigService, UnconfiguredSkillConfigService,
 };
@@ -167,4 +168,3 @@ pub use workflows::{
     DatabaseWorkflowService, UnconfiguredWorkflowService, WorkflowDefRecord, WorkflowRunRecord,
     WorkflowService,
 };
-pub use session_fork::{ForkSessionOptions, ForkSessionResult, fork_local_session};

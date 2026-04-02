@@ -360,11 +360,7 @@ fn display_delivery_report(report: &TaskDeliveryReport) {
 
     // Goal (truncate if too long)
     let goal_display: String = report.goal.chars().take(50).collect();
-    eprintln!(
-        "{}  Task: {}",
-        "║".cyan(),
-        goal_display.clone().white().bold(),
-    );
+    eprintln!("{}  Task: {}", "║".cyan(), goal_display.white().bold(),);
 
     let (status_icon, status_text) = if fully_delivered {
         ("✅", "Delivered".green().bold())
@@ -640,6 +636,7 @@ impl VerificationGate for ContractVerificationGate {
             data_branch: None,
             diff_summary: None,
             last_verification: None,
+            tools_used: Vec::new(),
         };
 
         let report = self.runner.verify_subtask_local(&subtask).await;
@@ -1099,6 +1096,7 @@ mod tests {
             data_branch: None,
             diff_summary: None,
             last_verification: None,
+            tools_used: vec![],
         };
 
         let gate =
@@ -1129,6 +1127,7 @@ mod tests {
             data_branch: None,
             diff_summary: None,
             last_verification: None,
+            tools_used: vec![],
         };
 
         let gate =

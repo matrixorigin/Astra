@@ -889,6 +889,7 @@ impl JournalEvent {
     ///
     /// Structured fields live under `metadata.cloud_pull` for analytics; `user_input` holds a short
     /// human-readable summary for export and grep.
+    #[allow(clippy::too_many_arguments)]
     pub fn cloud_pull_sync_marker(
         session_id: Option<&str>,
         profile: &str,
@@ -903,7 +904,11 @@ impl JournalEvent {
             "cloud_pull {source} profile={profile} learning_v={:?} prefs={}{}",
             learning_version,
             preference_keys_merged.len(),
-            if reachable_empty_ack { " empty_ack" } else { "" }
+            if reachable_empty_ack {
+                " empty_ack"
+            } else {
+                ""
+            }
         );
         let mut evt = Self::sync_marker(session_id, None, None, Some(note.as_str()));
         evt.metadata = Some(serde_json::json!({
@@ -1241,14 +1246,21 @@ mod tests {
         let meta = parsed.metadata.expect("metadata");
         let cp = meta.get("cloud_pull").expect("cloud_pull");
         assert_eq!(cp.get("profile").and_then(|v| v.as_str()), Some("work"));
-        assert_eq!(cp.get("source").and_then(|v| v.as_str()), Some("repl_startup"));
-        assert_eq!(cp.get("learning_version").and_then(|v| v.as_i64()), Some(42));
+        assert_eq!(
+            cp.get("source").and_then(|v| v.as_str()),
+            Some("repl_startup")
+        );
+        assert_eq!(
+            cp.get("learning_version").and_then(|v| v.as_i64()),
+            Some(42)
+        );
         assert_eq!(
             cp.get("learning_snapshot_merged").and_then(|v| v.as_bool()),
             Some(true)
         );
         assert_eq!(
-            cp.get("tool_health_rows_from_cloud").and_then(|v| v.as_u64()),
+            cp.get("tool_health_rows_from_cloud")
+                .and_then(|v| v.as_u64()),
             Some(3)
         );
         let pref = cp
@@ -1312,7 +1324,10 @@ mod tests {
             .as_ref()
             .and_then(|m| m.get("cloud_pull"))
             .expect("cloud_pull");
-        assert_eq!(cp.get("source").and_then(|v| v.as_str()), Some("post_login"));
+        assert_eq!(
+            cp.get("source").and_then(|v| v.as_str()),
+            Some("post_login")
+        );
         assert_eq!(
             cp.get("reachable_empty_ack").and_then(|v| v.as_bool()),
             Some(true)

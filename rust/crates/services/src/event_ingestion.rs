@@ -87,20 +87,20 @@ fn merged_metadata_from_journal_event(
             }
         }
     }
-    if let Some(ref l) = event.session_lineage {
-        if let Ok(v) = serde_json::to_value(l) {
-            obj.insert("session_lineage".to_string(), v);
-        }
+    if let Some(ref l) = event.session_lineage
+        && let Ok(v) = serde_json::to_value(l)
+    {
+        obj.insert("session_lineage".to_string(), v);
     }
-    if let Some(ref c) = event.coordination {
-        if let Ok(v) = serde_json::to_value(c) {
-            obj.insert("coordination".to_string(), v);
-        }
+    if let Some(ref c) = event.coordination
+        && let Ok(v) = serde_json::to_value(c)
+    {
+        obj.insert("coordination".to_string(), v);
     }
-    if let Some(ref p) = event.edge_policy {
-        if let Ok(v) = serde_json::to_value(p) {
-            obj.insert("edge_policy".to_string(), v);
-        }
+    if let Some(ref p) = event.edge_policy
+        && let Ok(v) = serde_json::to_value(p)
+    {
+        obj.insert("edge_policy".to_string(), v);
     }
     Some(serde_json::Value::Object(obj))
 }
@@ -667,7 +667,13 @@ mod tests {
             cp.get("reachable_empty_ack").and_then(|v| v.as_bool()),
             Some(false)
         );
-        assert!(ingestion.content.as_deref().unwrap_or("").contains("cloud_pull"));
+        assert!(
+            ingestion
+                .content
+                .as_deref()
+                .unwrap_or("")
+                .contains("cloud_pull")
+        );
     }
 
     #[test]

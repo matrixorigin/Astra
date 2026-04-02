@@ -9,7 +9,6 @@ use std::path::Path;
 use std::time::Instant;
 
 use crossterm::style::Stylize;
-use mo_agent_services::session_workspace;
 use mo_agent_runtime::{
     pipeline::step_recorder::StepRecorder,
     tool_registry::{self, ToolRegistry},
@@ -45,6 +44,7 @@ use mo_agent_runtime::{
     turn::tool_schema_prune::pin_invoked_tool_schemas,
     turn::turn_guard::{TurnGuard, merge_deprioritized_tools_into_restricted},
 };
+use mo_agent_services::session_workspace;
 
 use crate::{
     ExplainMode,
@@ -269,11 +269,7 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
 
     merge_skill_instructions_into_edge_profile(&mut payload, skill_instructions.as_deref());
 
-    merge_edge_cloud_audit_into_payload(
-        &mut payload,
-        ctx.current_session_id,
-        ctx.perm_manager,
-    );
+    merge_edge_cloud_audit_into_payload(&mut payload, ctx.current_session_id, ctx.perm_manager);
 
     capture_first_selection_report_if_empty(
         ctx.telem.first_selection_report,
@@ -324,32 +320,32 @@ fn merge_edge_cloud_audit_into_payload(
 ) {
     let mut ext = Map::new();
 
-    if let Some(sid) = session_id.filter(|s| !s.is_empty()) {
-        if let Ok(ws) = session_workspace::read_workspace(sid) {
-            let mut lin = Map::new();
-            if let Some(ref p) = ws.parent_session_id {
-                lin.insert("parent_session_id".into(), json!(p));
-            }
-            if let Some(t) = ws.forked_at_turn {
-                lin.insert("forked_at_turn".into(), json!(t));
-            }
-            if let Some(ref n) = ws.fork_note {
-                lin.insert("fork_note".into(), json!(n));
-            }
-            if !lin.is_empty() {
-                ext.insert("session_lineage".into(), Value::Object(lin));
-            }
+    if let Some(sid) = session_id.filter(|s| !s.is_empty())
+        && let Ok(ws) = session_workspace::read_workspace(sid)
+    {
+        let mut lin = Map::new();
+        if let Some(ref p) = ws.parent_session_id {
+            lin.insert("parent_session_id".into(), json!(p));
+        }
+        if let Some(t) = ws.forked_at_turn {
+            lin.insert("forked_at_turn".into(), json!(t));
+        }
+        if let Some(ref n) = ws.fork_note {
+            lin.insert("fork_note".into(), json!(n));
+        }
+        if !lin.is_empty() {
+            ext.insert("session_lineage".into(), Value::Object(lin));
+        }
 
-            let mut coo = Map::new();
-            if let Some(ref c) = ws.correlation_id {
-                coo.insert("correlation_id".into(), json!(c));
-            }
-            if let Some(ref a) = ws.agent_role {
-                coo.insert("agent_role".into(), json!(a));
-            }
-            if !coo.is_empty() {
-                ext.insert("coordination".into(), Value::Object(coo));
-            }
+        let mut coo = Map::new();
+        if let Some(ref c) = ws.correlation_id {
+            coo.insert("correlation_id".into(), json!(c));
+        }
+        if let Some(ref a) = ws.agent_role {
+            coo.insert("agent_role".into(), json!(a));
+        }
+        if !coo.is_empty() {
+            ext.insert("coordination".into(), Value::Object(coo));
         }
     }
 

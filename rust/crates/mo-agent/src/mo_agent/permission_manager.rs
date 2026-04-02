@@ -170,10 +170,7 @@ impl PermissionManager {
         for rule in &self.cached_deny {
             rule.hash(&mut h);
         }
-        (
-            self.mode.to_string(),
-            format!("{:016x}", h.finish()),
-        )
+        (self.mode.to_string(), format!("{:016x}", h.finish()))
     }
 
     /// Create without loading project settings. Used in tests and internal auto-approved operations.

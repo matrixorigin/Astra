@@ -55,7 +55,10 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/session history", "View session conversation history"),
     ("/session errors", "View session errors"),
     ("/session export", "Export session data"),
-    ("/session fork", "Fork session — copy journal + new id (multi-agent / experiments)"),
+    (
+        "/session fork",
+        "Fork session — copy journal + new id (multi-agent / experiments)",
+    ),
     (
         "/session list",
         "All journals + cwd / git / age from workspace",

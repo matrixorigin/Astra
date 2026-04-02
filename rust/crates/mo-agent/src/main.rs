@@ -496,9 +496,8 @@ struct ReplState {
         std::sync::Arc<std::sync::Mutex<mo_agent_runtime::pipeline::pattern::PatternLibrary>>,
     >,
     /// Shared entity graph (learning feedback loop + post-login cloud pull).
-    entity_graph: Option<
-        std::sync::Arc<std::sync::Mutex<mo_agent_runtime::pipeline::entity::EntityGraph>>,
-    >,
+    entity_graph:
+        Option<std::sync::Arc<std::sync::Mutex<mo_agent_runtime::pipeline::entity::EntityGraph>>>,
     /// Shared calibrator (learning feedback loop + post-login cloud pull).
     calibrator: Option<
         std::sync::Arc<
@@ -2705,9 +2704,7 @@ async fn try_cloud_pull_preferences(state: &mut ReplState) -> Vec<String> {
 
 fn cloud_pull_warrants_sync_marker(pull: &CloudPullResult, pref_keys: &[String]) -> bool {
     pull.cloud_reachable
-        && (pull.version.is_some()
-            || !pull.tool_health.is_empty()
-            || !pref_keys.is_empty())
+        && (pull.version.is_some() || !pull.tool_health.is_empty() || !pref_keys.is_empty())
 }
 
 /// When set to `1`, `repl_startup` also journals a sync marker if MatrixOne was reachable but
@@ -3336,11 +3333,7 @@ async fn run_chat_repl(
         }
         // Try to pull user preferences from cloud
         let pref_keys = try_cloud_pull_preferences(&mut state).await;
-        (
-            cross_session_health_entries,
-            cloud_pull_result,
-            pref_keys,
-        )
+        (cross_session_health_entries, cloud_pull_result, pref_keys)
     };
     state.tool_health_entries = cross_session_health_entries.clone();
     if state.synced_tool_health_entries.is_empty() {
@@ -5668,7 +5661,11 @@ total_tokens_out: 500
             version: None,
             cloud_reachable: true,
         };
-        assert!(!should_append_cloud_pull_journal(&pull, &[], "repl_startup"));
+        assert!(!should_append_cloud_pull_journal(
+            &pull,
+            &[],
+            "repl_startup"
+        ));
     }
 
     #[serial_test::serial]
@@ -5682,7 +5679,11 @@ total_tokens_out: 500
         unsafe {
             std::env::remove_var(super::MO_JOURNAL_CLOUD_EMPTY_ACK);
         }
-        assert!(!should_append_cloud_pull_journal(&pull, &[], "repl_startup"));
+        assert!(!should_append_cloud_pull_journal(
+            &pull,
+            &[],
+            "repl_startup"
+        ));
         unsafe {
             std::env::set_var(super::MO_JOURNAL_CLOUD_EMPTY_ACK, "1");
         }
@@ -5706,8 +5707,10 @@ total_tokens_out: 500
     #[test]
     fn append_cloud_pull_sync_journal_writes_sync_marker_jsonl() {
         let sid = format!("test-cloud-pull-journal-{}", uuid::Uuid::new_v4());
-        let mut state = ReplState::default();
-        state.session_id = Some(sid.clone());
+        let state = ReplState {
+            session_id: Some(sid.clone()),
+            ..ReplState::default()
+        };
         let pull = CloudPullResult {
             tool_health: Vec::new(),
             version: Some(99),
@@ -5727,7 +5730,10 @@ total_tokens_out: 500
             .and_then(|m| m.get("cloud_pull"))
             .expect("cloud_pull");
         assert_eq!(cp.get("profile").and_then(|v| v.as_str()), Some("work"));
-        assert_eq!(cp.get("learning_version").and_then(|v| v.as_i64()), Some(99));
+        assert_eq!(
+            cp.get("learning_version").and_then(|v| v.as_i64()),
+            Some(99)
+        );
         assert_eq!(
             cp.get("reachable_empty_ack").and_then(|v| v.as_bool()),
             Some(false)
@@ -5738,8 +5744,10 @@ total_tokens_out: 500
     #[test]
     fn append_cloud_pull_post_login_reachable_empty_writes_marker() {
         let sid = format!("test-cloud-pull-empty-{}", uuid::Uuid::new_v4());
-        let mut state = ReplState::default();
-        state.session_id = Some(sid.clone());
+        let state = ReplState {
+            session_id: Some(sid.clone()),
+            ..ReplState::default()
+        };
         let pull = CloudPullResult {
             tool_health: Vec::new(),
             version: None,

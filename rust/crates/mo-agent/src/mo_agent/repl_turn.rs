@@ -67,8 +67,7 @@ pub(super) async fn fetch_compact_memory_anchor_snippet(
     let mut total = 0usize;
     for m in arr.iter().take(COMPACT_ANCHOR_MAX_LINES) {
         let content = m.get("content").and_then(|v| v.as_str()).unwrap_or("");
-        let line = if let Some(entry) = prompts::memory_proto::MemoryEntry::parse(content)
-        {
+        let line = if let Some(entry) = prompts::memory_proto::MemoryEntry::parse(content) {
             entry.display_line()
         } else {
             let mtype = m
@@ -95,7 +94,11 @@ pub(super) async fn fetch_compact_memory_anchor_snippet(
     Some(lines.join("\n"))
 }
 
-pub(super) fn compact_assistant_message(trimmed: usize, summary: &str, anchor: Option<&str>) -> String {
+pub(super) fn compact_assistant_message(
+    trimmed: usize,
+    summary: &str,
+    anchor: Option<&str>,
+) -> String {
     let mut out = String::new();
     if let Some(a) = anchor.filter(|s| !s.trim().is_empty()) {
         out.push_str("[Session memory anchor]\n");
@@ -303,13 +306,9 @@ async fn apply_auto_compact_result(
         return Ok(());
     }
 
-    let anchor = fetch_compact_memory_anchor_snippet(
-        ctx.api,
-        token,
-        state.session_id.as_deref(),
-        &summary,
-    )
-    .await;
+    let anchor =
+        fetch_compact_memory_anchor_snippet(ctx.api, token, state.session_id.as_deref(), &summary)
+            .await;
     let assistant_text = compact_assistant_message(trimmed, &summary, anchor.as_deref());
     let summary_entry = (String::new(), assistant_text);
     let mut new_history = vec![summary_entry];
@@ -346,8 +345,7 @@ async fn apply_auto_compact_result(
     if state.plan_mode.is_some() || state.executing_plan.is_some() {
         eprintln!(
             "{}",
-            "  Tip: Plan context was shortened — if steps feel stale, refresh `/plan`."
-                .dim()
+            "  Tip: Plan context was shortened — if steps feel stale, refresh `/plan`.".dim()
         );
     }
 

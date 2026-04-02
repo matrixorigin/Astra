@@ -94,10 +94,7 @@ pub fn merge_invoked_skills_into_edge_profile(payload: &mut Value, invoked_skill
         && let Some(ep) = root.get_mut("edge_profile")
         && let Some(ep_obj) = ep.as_object_mut()
     {
-        ep_obj.insert(
-            "invoked_skills".to_string(),
-            json!(invoked_skills),
-        );
+        ep_obj.insert("invoked_skills".to_string(), json!(invoked_skills));
     }
 }
 

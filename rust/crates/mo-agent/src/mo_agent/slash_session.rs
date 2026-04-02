@@ -1,7 +1,9 @@
 use std::io::Write;
 
 use chrono::{DateTime, Utc};
-use mo_agent_services::{fork_local_session, session_journal, session_workspace, ForkSessionOptions};
+use mo_agent_services::{
+    ForkSessionOptions, fork_local_session, session_journal, session_workspace,
+};
 
 use super::*;
 use crate::repl_runtime;
@@ -94,7 +96,8 @@ fn parse_fork_source(arg: &str, state: &ReplState) -> Result<(String, Option<Str
             .map(|s| Ok((s, None)))
             .unwrap_or_else(|| {
                 Err(
-                    "no active session — use `/session fork <parent_session_id> [label]`".to_string(),
+                    "no active session — use `/session fork <parent_session_id> [label]`"
+                        .to_string(),
                 )
             });
     }
@@ -387,8 +390,11 @@ pub(super) fn handle_session_command(arg: &str, state: &mut ReplState) {
                     );
                     eprintln!(
                         "  {}",
-                        format!("{} journal events copied (excl. session end/start)", res.events_copied)
-                            .dim()
+                        format!(
+                            "{} journal events copied (excl. session end/start)",
+                            res.events_copied
+                        )
+                        .dim()
                     );
                     let st = repl_runtime::session_state_from_journal(&new_sid);
                     state.session_id = Some(new_sid.clone());

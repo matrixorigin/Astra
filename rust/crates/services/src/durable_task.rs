@@ -555,6 +555,9 @@ pub struct DurableSubtask {
     /// Last verification result (populated after verify_subtask runs)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_verification: Option<SubtaskVerificationReport>,
+    /// Tools used during this subtask's execution (populated by REPL)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tools_used: Vec<String>,
 }
 
 impl Default for DurableSubtask {
@@ -574,6 +577,7 @@ impl Default for DurableSubtask {
             data_branch: None,
             diff_summary: None,
             last_verification: None,
+            tools_used: Vec::new(),
         }
     }
 }
@@ -1484,7 +1488,9 @@ pub struct NoopBranchOps;
 #[async_trait]
 impl TaskBranchOps for NoopBranchOps {
     async fn create_snapshot(&self, _: &str, _: &str, _: u32) -> Result<String, String> {
-        Ok(String::new()) // empty name signals "no snapshot"
+        // Returns empty name to signal "no snapshot" — callers handle this gracefully.
+        // Intentionally silent: NoopBranchOps is used when no DB backend is configured.
+        Ok(String::new())
     }
     async fn diff_since_snapshot(&self, snapshot: &str) -> Result<DiffSummary, String> {
         Ok(DiffSummary {
@@ -1726,7 +1732,11 @@ pub struct TaskPatternStats {
     pub pattern: String,
     pub total_attempts: u32,
     pub success_rate: f64,
+    /// Average retries per task. Currently 0.0 — requires per-task retry tracking
+    /// in the pattern library (future: record from TaskOutcomeSignal.total_retries).
     pub avg_retries: f64,
+    /// Average turns per task. Currently 0.0 — requires per-task turn tracking
+    /// in the pattern library (future: record from TaskOutcomeSignal.total_turns).
     pub avg_turns: f64,
     pub avg_verification_pass_rate: f64,
 }
@@ -1785,7 +1795,7 @@ pub fn build_outcome_signal(
                 title: s.title.clone(),
                 success: s.stage.is_success(),
                 retry_count: s.retry_count,
-                tools_used: Vec::new(), // per-subtask tools not tracked yet
+                tools_used: s.tools_used.clone(),
                 verification_pass_rate: pass_rate,
                 files_modified: s.files.clone(),
             }
@@ -2318,6 +2328,7 @@ impl DurableTaskLifecycle for MatrixOneDurableTaskLifecycle {
                 data_branch: None,
                 diff_summary: None,
                 last_verification: None,
+                tools_used: Vec::new(),
             })
             .collect();
 
