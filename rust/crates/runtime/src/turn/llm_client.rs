@@ -666,12 +666,12 @@ pub(crate) async fn call_llm_nonstream_fallback(
     }
 
     // Apply per-request timeout (overrides the client-level default).
-    let resp = req
-        .timeout(timeout)
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| format!("LLM fallback request failed (timeout {}s): {e}", timeout.as_secs()))?;
+    let resp = req.timeout(timeout).json(&body).send().await.map_err(|e| {
+        format!(
+            "LLM fallback request failed (timeout {}s): {e}",
+            timeout.as_secs()
+        )
+    })?;
     if !resp.status().is_success() {
         let status = resp.status().as_u16();
         let text = resp.text().await.unwrap_or_default();
@@ -905,7 +905,9 @@ mod tests {
                 tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                 Response::builder()
                     .status(200)
-                    .body(Body::from(r#"{"choices":[{"message":{"content":"late"}}]}"#))
+                    .body(Body::from(
+                        r#"{"choices":[{"message":{"content":"late"}}]}"#,
+                    ))
                     .unwrap()
             }),
         );

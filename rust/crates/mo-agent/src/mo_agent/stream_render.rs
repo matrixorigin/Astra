@@ -12,6 +12,7 @@ use mo_agent_runtime::turn::sse_stream_host::{
     SseStreamHost, consume_sse_stream,
 };
 use mo_agent_runtime::turn::tool_result_semantics::cloud_tool_result_status_label;
+use serde_json::Value;
 use std::io::IsTerminal;
 use std::ops::{Deref, DerefMut};
 
@@ -244,7 +245,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
         }
         // Show tool as running (in-place updatable via TerminalRegion).
         let tool_idx = if !self.quiet && !self.suppress_intermediate_output {
-            Some(self.render.tool_start(tool))
+            Some(self.render.tool_start(tool, args))
         } else {
             None
         };
@@ -266,7 +267,8 @@ impl SseStreamHost for CliSseStreamHost<'_> {
         let duration_ms = start.elapsed().as_millis() as u64;
         // Update tool line to show completion.
         if let Some(idx) = tool_idx {
-            self.render.tool_done(idx, tool, status, duration_ms);
+            self.render
+                .tool_done(idx, tool, status, duration_ms, &output);
         }
         self.edge_tool_round.push(EdgeToolExecResult {
             request_id: request_id.to_string(),
@@ -546,35 +548,148 @@ impl StreamRenderState {
         }
     }
 
-    /// Show a tool as "running" and return its index for later update.
-    fn tool_start(&mut self, tool: &str) -> usize {
+    /// Show a tool as "running" with optional argument preview.
+    fn tool_start(&mut self, tool: &str, args: &Value) -> usize {
         let idx = self.tool_lines.len();
+        let arg_preview = self.format_tool_arg_preview(tool, args);
         if self.md.is_some() {
             eprintln!("  ⚡ {tool} …");
-            self.stderr_lines += 1;
+            if let Some(preview) = &arg_preview {
+                eprintln!("  │ {preview}");
+            }
+            self.stderr_lines += if arg_preview.is_some() { 2 } else { 1 };
             return idx;
         }
-        let line = format!("  ⚡ {tool} …");
-        self.tool_lines.push(line);
+        let mut lines_to_add = vec![format!("  ⚡ {tool} …")];
+        if let Some(preview) = arg_preview {
+            lines_to_add.push(format!("  │ {preview}"));
+        }
+        for line in lines_to_add {
+            self.tool_lines.push(line);
+        }
         self.tool_region.update(self.tool_lines.clone());
         idx
     }
 
-    /// Update a tool line to show completion status.
-    fn tool_done(&mut self, idx: usize, tool: &str, status: &str, duration_ms: u64) {
+    /// Format a preview of tool arguments (single line, max ~60 chars).
+    fn format_tool_arg_preview(&self, tool: &str, args: &Value) -> Option<String> {
+        match tool {
+            "bash" | "shell" => args
+                .get("command")
+                .and_then(Value::as_str)
+                .map(|cmd| truncate_line(cmd, 60)),
+            "read_file" | "view_file" => {
+                let path = args.get("path").and_then(Value::as_str).unwrap_or("");
+                let start = args.get("start_line").and_then(Value::as_u64);
+                let end = args.get("end_line").and_then(Value::as_u64);
+                match (start, end) {
+                    (Some(s), Some(e)) => Some(format!("{path}:{s}-{e}")),
+                    (Some(s), None) => Some(format!("{path}:{s}-")),
+                    _ => Some(truncate_line(path, 60)),
+                }
+            }
+            "write_file" | "create_file" | "edit_file" => args
+                .get("path")
+                .and_then(Value::as_str)
+                .map(|p| truncate_line(p, 60)),
+            "grep" | "search" => args
+                .get("pattern")
+                .and_then(Value::as_str)
+                .map(|p| format!("/{}/", truncate_line(p, 50))),
+            "git_log" | "git_show" | "git_diff" => {
+                // Show ref/sha if present
+                args.get("ref")
+                    .or_else(|| args.get("sha"))
+                    .or_else(|| args.get("commit"))
+                    .and_then(Value::as_str)
+                    .map(|s| truncate_line(s, 20))
+            }
+            _ => None,
+        }
+    }
+
+    /// Update a tool line to show completion status with optional output summary.
+    fn tool_done(&mut self, idx: usize, tool: &str, status: &str, duration_ms: u64, output: &str) {
         let (icon, suffix) = if status == "error" {
             ("✗", format!(" ({duration_ms}ms) error"))
         } else {
             ("✓", format!(" ({duration_ms}ms)"))
         };
+        let output_summary = self.format_output_summary(tool, output, status);
         if self.md.is_some() {
             eprintln!("  {icon} {tool}{suffix}");
-            self.stderr_lines += 1;
+            if let Some(summary) = &output_summary {
+                eprintln!("  └ {summary}");
+            }
+            self.stderr_lines += if output_summary.is_some() { 2 } else { 1 };
             return;
         }
         if idx < self.tool_lines.len() {
             self.tool_lines[idx] = format!("  {icon} {tool}{suffix}");
+            if let Some(summary) = output_summary {
+                // Insert summary line after the tool line
+                let insert_pos = (idx + 1).min(self.tool_lines.len());
+                // Check if there's already a preview line for this tool (from tool_start)
+                // If so, replace it; otherwise insert
+                if insert_pos < self.tool_lines.len()
+                    && self.tool_lines[insert_pos].starts_with("  │")
+                {
+                    self.tool_lines[insert_pos] = format!("  └ {summary}");
+                } else {
+                    self.tool_lines.insert(insert_pos, format!("  └ {summary}"));
+                }
+            }
             self.tool_region.update(self.tool_lines.clone());
+        }
+    }
+
+    /// Format a summary of tool output (single line, max ~50 chars).
+    fn format_output_summary(&self, tool: &str, output: &str, status: &str) -> Option<String> {
+        if status == "error" {
+            let first_line = output.lines().next().unwrap_or("").trim();
+            return Some(truncate_line(first_line, 50));
+        }
+        let line_count = output.lines().count();
+        let byte_size = output.len();
+        match tool {
+            "bash" | "shell" => {
+                if line_count <= 1 && byte_size < 50 {
+                    let trimmed = output.trim();
+                    if trimmed.is_empty() {
+                        None
+                    } else {
+                        Some(truncate_line(trimmed, 50))
+                    }
+                } else {
+                    Some(format!("{line_count} lines"))
+                }
+            }
+            "read_file" | "view_file" => Some(format!("{line_count} lines")),
+            "git_log" => {
+                // Count commits (lines starting with a hash-like pattern)
+                let commits = output.lines().filter(|l| !l.trim().is_empty()).count();
+                Some(format!("{commits} commits"))
+            }
+            "git_show" | "git_diff" => {
+                let additions = output.lines().filter(|l| l.starts_with('+')).count();
+                let deletions = output.lines().filter(|l| l.starts_with('-')).count();
+                if additions > 0 || deletions > 0 {
+                    Some(format!("+{additions} -{deletions}"))
+                } else {
+                    Some(format!("{line_count} lines"))
+                }
+            }
+            "grep" | "search" => {
+                let matches = output.lines().count();
+                Some(format!("{matches} matches"))
+            }
+            _ => {
+                if line_count > 1 {
+                    Some(format!("{line_count} lines"))
+                } else {
+                    None
+                }
+            }
         }
     }
 
@@ -583,6 +698,18 @@ impl StreamRenderState {
     fn clear_tool_region(&mut self) {
         self.tool_region.clear();
         self.tool_lines.clear();
+    }
+}
+
+/// Truncate a string to max_chars, adding "…" if truncated.
+fn truncate_line(s: &str, max_chars: usize) -> String {
+    // Take first line only
+    let line = s.lines().next().unwrap_or(s);
+    if line.chars().count() <= max_chars {
+        line.to_string()
+    } else {
+        let truncated: String = line.chars().take(max_chars.saturating_sub(1)).collect();
+        format!("{truncated}…")
     }
 }
 
