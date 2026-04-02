@@ -33,6 +33,9 @@ pub struct Checkpoint {
     pub had_stalls: bool,
     /// Number of errors since last checkpoint.
     pub error_count: u32,
+    /// Serialized durable task contract state (JSON) — enables verification
+    /// context to survive session interruption and cloud-based restore.
+    pub contract_state_json: Option<String>,
 }
 
 impl Checkpoint {
@@ -178,6 +181,7 @@ mod tests {
             total_tokens: 5000,
             had_stalls: false,
             error_count: 0,
+            contract_state_json: None,
         };
         let md = cp.to_markdown();
         assert!(md.contains("# Checkpoint 1 — Turn 5"));
@@ -198,6 +202,7 @@ mod tests {
             total_tokens: 10000,
             had_stalls: true,
             error_count: 3,
+            contract_state_json: None,
         };
         let md = cp.to_markdown();
         assert!(md.contains("⚠ Stalls detected"));
@@ -225,6 +230,7 @@ mod tests {
             total_tokens: 1000,
             had_stalls: false,
             error_count: 0,
+            contract_state_json: None,
         };
 
         // Write checkpoint directly to temp dir
@@ -250,6 +256,7 @@ mod tests {
             total_tokens: 500,
             had_stalls: false,
             error_count: 0,
+            contract_state_json: None,
         };
         let md = cp.to_markdown();
         assert!(md.contains("Tools used: none"));

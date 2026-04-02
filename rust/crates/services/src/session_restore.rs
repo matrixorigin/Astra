@@ -84,6 +84,9 @@ pub struct RestoredCheckpoint {
     pub title: String,
     pub summary: String,
     pub total_tokens: u64,
+    /// Contract state at this checkpoint (for verification context restore).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contract_state_json: Option<String>,
 }
 
 // ─── Session Restore Trait ──────────────────────────────────────────────────
@@ -170,10 +173,20 @@ impl HybridRestoreService {
                 };
 
                 // Load active contract from task_contracts table
-                let contract_json = Self::load_cloud_contract(pool, session_id)
+                let mut contract_json = Self::load_cloud_contract(pool, session_id)
                     .await
                     .ok()
                     .flatten();
+
+                // Fallback: try latest checkpoint's contract state
+                if contract_json.is_none()
+                    && let Ok(ckpts) = self.cloud_checkpoints(session_id).await
+                {
+                    contract_json = ckpts
+                        .iter()
+                        .rev()
+                        .find_map(|c| c.contract_state_json.clone());
+                }
 
                 Ok(Some(RestoredSession {
                     session_id: session_id.to_string(),
@@ -337,7 +350,7 @@ impl HybridRestoreService {
         };
 
         let rows = sqlx::query(
-            "SELECT number, turn, title, summary, total_tokens \
+            "SELECT number, turn, title, summary, total_tokens, contract_state_json \
              FROM session_checkpoints WHERE session_id = ? ORDER BY number",
         )
         .bind(session_id)
@@ -355,6 +368,10 @@ impl HybridRestoreService {
                     title: row.try_get("title").ok()?,
                     summary: row.try_get("summary").unwrap_or_default(),
                     total_tokens: row.try_get::<i64, _>("total_tokens").unwrap_or(0) as u64,
+                    contract_state_json: row
+                        .try_get::<Option<String>, _>("contract_state_json")
+                        .ok()
+                        .flatten(),
                 })
             })
             .collect();
@@ -433,6 +450,7 @@ impl SessionRestoreService for HybridRestoreService {
                             title,
                             summary: String::new(),
                             total_tokens: 0,
+                            contract_state_json: None,
                         })
                     } else {
                         None
@@ -463,12 +481,17 @@ impl SessionRestoreService for HybridRestoreService {
 
         match target {
             Some(ckpt) => {
-                // Return session state rewound to checkpoint turn
+                // Use contract state from checkpoint if the session doesn't have one
+                let contract_json = session
+                    .contract_json
+                    .or_else(|| ckpt.contract_state_json.clone());
+
                 Ok(Some(RestoredSession {
                     turn_count: ckpt.turn,
                     total_tokens_in: ckpt.total_tokens,
                     total_tokens_out: 0,
                     checkpoint_count: checkpoint_number,
+                    contract_json,
                     ..session
                 }))
             }
@@ -533,7 +556,7 @@ pub async fn push_checkpoint_to_cloud(
     let updated = sqlx::query(
         "UPDATE session_checkpoints SET \
             turn = ?, title = ?, summary = ?, tools_json = ?, total_tokens = ?, \
-            had_stalls = ?, error_count = ? \
+            had_stalls = ?, error_count = ?, contract_state_json = ? \
          WHERE session_id = ? AND number = ?",
     )
     .bind(checkpoint.turn as i32)
@@ -543,6 +566,7 @@ pub async fn push_checkpoint_to_cloud(
     .bind(checkpoint.total_tokens as i64)
     .bind(if checkpoint.had_stalls { 1i32 } else { 0 })
     .bind(checkpoint.error_count as i32)
+    .bind(&checkpoint.contract_state_json)
     .bind(session_id)
     .bind(checkpoint.number as i32)
     .execute(pool)
@@ -553,8 +577,8 @@ pub async fn push_checkpoint_to_cloud(
         let inserted = sqlx::query(
             "INSERT INTO session_checkpoints \
              (checkpoint_id, session_id, user_id, number, turn, title, summary, \
-              tools_json, total_tokens, had_stalls, error_count, created_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())",
+              tools_json, total_tokens, had_stalls, error_count, contract_state_json, created_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())",
         )
         .bind(&checkpoint_id)
         .bind(session_id)
@@ -567,6 +591,7 @@ pub async fn push_checkpoint_to_cloud(
         .bind(checkpoint.total_tokens as i64)
         .bind(if checkpoint.had_stalls { 1i32 } else { 0 })
         .bind(checkpoint.error_count as i32)
+        .bind(&checkpoint.contract_state_json)
         .execute(pool)
         .await;
 
@@ -575,7 +600,7 @@ pub async fn push_checkpoint_to_cloud(
                 sqlx::query(
                     "UPDATE session_checkpoints SET \
                         turn = ?, title = ?, summary = ?, tools_json = ?, total_tokens = ?, \
-                        had_stalls = ?, error_count = ? \
+                        had_stalls = ?, error_count = ?, contract_state_json = ? \
                      WHERE session_id = ? AND number = ?",
                 )
                 .bind(checkpoint.turn as i32)
@@ -585,6 +610,7 @@ pub async fn push_checkpoint_to_cloud(
                 .bind(checkpoint.total_tokens as i64)
                 .bind(if checkpoint.had_stalls { 1i32 } else { 0 })
                 .bind(checkpoint.error_count as i32)
+                .bind(&checkpoint.contract_state_json)
                 .bind(session_id)
                 .bind(checkpoint.number as i32)
                 .execute(pool)
@@ -842,6 +868,7 @@ mod tests {
             title: "Phase A complete".into(),
             summary: "Finished token efficiency work".into(),
             total_tokens: 50000,
+            contract_state_json: None,
         };
         let json = serde_json::to_string(&c).unwrap();
         let loaded: RestoredCheckpoint = serde_json::from_str(&json).unwrap();
@@ -925,6 +952,7 @@ mod tests {
                 title: "First".into(),
                 summary: String::new(),
                 total_tokens: 1000,
+                contract_state_json: None,
             },
             RestoredCheckpoint {
                 number: 2,
@@ -932,6 +960,7 @@ mod tests {
                 title: "Second".into(),
                 summary: String::new(),
                 total_tokens: 3000,
+                contract_state_json: None,
             },
         ];
         assert!(ckpts[0].turn < ckpts[1].turn);
@@ -1039,6 +1068,7 @@ mod tests {
             total_tokens: 50_000,
             had_stalls: true,
             error_count: 1,
+            contract_state_json: Some(r#"{"contract_id":"c1"}"#.to_string()),
         };
         assert_eq!(ckpt.number, 3);
         assert_eq!(ckpt.turn, 15);
@@ -1056,6 +1086,7 @@ mod tests {
             title: "Checkpoint after refactor".into(),
             summary: "All tests passing after auth refactor".into(),
             total_tokens: 120_000,
+            contract_state_json: None,
         };
         // Verify the fields needed for /rewind from cloud
         assert_eq!(ckpt.number, 7);

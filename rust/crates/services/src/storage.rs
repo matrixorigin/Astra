@@ -459,6 +459,7 @@ pub async fn ensure_core_schema(settings: &MatrixOneSettings) -> Result<(), sqlx
             summary LONGTEXT NULL,
             tools_json JSON NULL,
             state_json LONGTEXT NULL,
+            contract_state_json LONGTEXT NULL,
             total_tokens BIGINT NOT NULL DEFAULT 0,
             had_stalls SMALLINT NOT NULL DEFAULT 0,
             error_count INT NOT NULL DEFAULT 0,
@@ -470,6 +471,20 @@ pub async fn ensure_core_schema(settings: &MatrixOneSettings) -> Result<(), sqlx
     )
     .execute(&pool)
     .await?;
+
+    // Migration: add contract_state_json column for verification context in checkpoints.
+    if let Err(e) =
+        query("ALTER TABLE session_checkpoints ADD COLUMN contract_state_json LONGTEXT NULL")
+            .execute(&pool)
+            .await
+    {
+        let msg = e.to_string();
+        if !msg.to_lowercase().contains("duplicate")
+            && !msg.to_lowercase().contains("already exists")
+        {
+            return Err(e);
+        }
+    }
 
     // Step Protocol idempotency cache
     query(

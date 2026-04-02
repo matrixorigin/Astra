@@ -401,6 +401,10 @@ fn apply_turn_success(
                     total_tokens: ws.total_tokens_in + ws.total_tokens_out,
                     had_stalls: false,
                     error_count: 0,
+                    contract_state_json: state
+                        .durable_task_state
+                        .as_ref()
+                        .and_then(|d| serde_json::to_string(&d.contract).ok()),
                 };
                 let _ = mo_agent_services::session_checkpoint::write_checkpoint(sid, &cp);
 
