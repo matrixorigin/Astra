@@ -354,8 +354,12 @@ fn try_parse_command_output_criterion(
         return None; // Can't determine what command to run
     };
 
-    // Build expected output check
-    let contains: Vec<String> = quoted.clone();
+    // Build expected output check — exclude the command path itself from expected output
+    let contains: Vec<String> = quoted
+        .iter()
+        .filter(|q| *q != &cmd && !paths.contains(q))
+        .cloned()
+        .collect();
     let not_contains = if lower.contains("without error") || lower.contains("no error") {
         vec!["error".to_string()]
     } else {
@@ -576,12 +580,18 @@ fn try_parse_flexible_grep_criterion(
         && !lower.contains("not contain")
         && !lower.contains("not include");
 
+    // Filter out quoted strings that are themselves file paths (avoid using the path as a grep pattern)
+    let pattern_candidates: Vec<&String> = quoted.iter().filter(|q| !paths.contains(q)).collect();
+    if pattern_candidates.is_empty() {
+        return None;
+    }
+
     Some(VerificationCriterion {
         id: id.to_string(),
         description: desc.to_string(),
         verifier: VerifierKind::GrepCheck {
             file: paths[0].clone(),
-            pattern: quoted[0].clone(),
+            pattern: pattern_candidates[0].clone(),
             should_match,
         },
         required: true,
@@ -1248,6 +1258,21 @@ mod tests {
         assert!(!c.is_empty());
         let has_cmd = c.iter().any(|c| matches!(&c.verifier, VerifierKind::CommandOutput { .. }));
         assert!(has_cmd, "should detect command output pattern");
+
+        // Backtick-quoted command path should NOT appear in contains list
+        let c = parse_acceptance_to_criteria(
+            "Command `/tmp/hiworld` outputs exactly 'hi world' and exits with code 0",
+            "s4",
+            &det,
+        );
+        assert_eq!(c.len(), 1);
+        match &c[0].verifier {
+            VerifierKind::CommandOutput { cmd, contains, .. } => {
+                assert_eq!(cmd, "/tmp/hiworld");
+                assert_eq!(contains, &["hi world"], "path should not be in contains list");
+            }
+            other => panic!("expected CommandOutput, got {:?}", other),
+        }
     }
 
     #[test]
