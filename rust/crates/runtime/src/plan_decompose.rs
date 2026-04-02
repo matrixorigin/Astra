@@ -748,14 +748,13 @@ fn extract_json(response: &str) -> String {
 /// Format a TaskPlan for display.
 pub fn format_plan(plan: &TaskPlan) -> String {
     let mut out = String::new();
-
-    out.push_str("┌── Plan ──────────────────────────────────────────\n");
+    let wrap_width = 70; // max content width inside the plan box
 
     if let Some(ref notes) = plan.notes {
-        out.push_str("│ ");
-        out.push_str(notes);
+        for line in wrap_text(notes, wrap_width) {
+            out.push_str(&format!("  {}\n", line));
+        }
         out.push('\n');
-        out.push_str("│\n");
     }
 
     // Build dependency graph visualization
@@ -780,33 +779,50 @@ pub fn format_plan(plan: &TaskPlan) -> String {
             _ => "",
         };
 
-        out.push_str(&format!(
-            "│ {} {}{} {}\n",
-            status_icon, st.id, effort_badge, st.title
-        ));
+        // Step header: icon + id + effort + title
+        let header = format!("{}{} {}", st.id, effort_badge, st.title);
+        let header_lines = wrap_text(&header, wrap_width - 4);
+        for (j, line) in header_lines.iter().enumerate() {
+            if j == 0 {
+                out.push_str(&format!("  {} {}\n", status_icon, line));
+            } else {
+                out.push_str(&format!("    {}\n", line));
+            }
+        }
 
+        // Description — wrapped and indented
         if let Some(ref desc) = st.description {
-            out.push_str(&format!("│     └─ {}\n", desc));
+            for line in wrap_text(desc, wrap_width - 6) {
+                out.push_str(&format!("      {}\n", line));
+            }
         }
 
+        // Files
         if !st.files.is_empty() {
-            out.push_str(&format!("│     📁 {}\n", st.files.join(", ")));
+            let files_str = st.files.join(", ");
+            for line in wrap_text(&format!("📁 {}", files_str), wrap_width - 6) {
+                out.push_str(&format!("      {}\n", line));
+            }
         }
 
+        // Acceptance criteria
         if let Some(ref acc) = st.acceptance {
-            out.push_str(&format!("│     ✅ {}\n", acc));
+            for line in wrap_text(&format!("✅ {}", acc), wrap_width - 6) {
+                out.push_str(&format!("      {}\n", line));
+            }
         }
 
+        // Dependencies
         if !st.depends_on.is_empty() {
-            out.push_str(&format!("│     deps: {}\n", st.depends_on.join(", ")));
+            out.push_str(&format!("      deps: {}\n", st.depends_on.join(", ")));
         }
 
         if i < plan.subtasks.len() - 1 {
-            out.push_str("│\n");
+            out.push('\n');
         }
     }
 
-    out.push_str("└─────────────────────────────────────────────────\n");
+    out.push_str("  ─────────────────────────────────────────\n");
 
     // Effort summary
     let small = plan
@@ -850,6 +866,36 @@ pub fn format_plan(plan: &TaskPlan) -> String {
     }
 
     out
+}
+
+/// Wrap text to fit within a given width, breaking at word boundaries.
+fn wrap_text(text: &str, width: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    for paragraph in text.split('\n') {
+        if paragraph.is_empty() {
+            lines.push(String::new());
+            continue;
+        }
+        let mut current = String::new();
+        for word in paragraph.split_whitespace() {
+            if current.is_empty() {
+                current = word.to_string();
+            } else if current.chars().count() + 1 + word.chars().count() <= width {
+                current.push(' ');
+                current.push_str(word);
+            } else {
+                lines.push(current);
+                current = word.to_string();
+            }
+        }
+        if !current.is_empty() {
+            lines.push(current);
+        }
+    }
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+    lines
 }
 
 // ─── Plan Mode State ─────────────────────────────────────────────────────────
@@ -1310,61 +1356,41 @@ pub fn format_plan_entry_card(
 ) -> String {
     let mut out = String::new();
 
-    out.push_str("┌─────────────────────────────────────────────────────┐\n");
-    out.push_str("│  📋 Plan Mode                                        │\n");
-    out.push_str("│  ─────────────────────────────────────────────────  │\n");
-
     if let Some(ps) = active_plan {
-        // Show active plan summary
         let pct = ps.plan.progress_pct();
+        let goal_display = if ps.goal.is_empty() {
+            "(no goal set)".to_string()
+        } else {
+            truncate_str(&ps.goal, 50)
+        };
 
-        out.push_str(&format!(
-            "│  Active: \"{}\" ({}% done)        \n",
-            truncate_str(&ps.goal, 35),
-            pct
-        ));
+        out.push_str(&format!("  📋 Plan Mode — {} ({}% done)\n", goal_display, pct));
+        out.push('\n');
 
-        // Show task tree (max 4 items)
-        for (i, st) in ps.plan.subtasks.iter().take(4).enumerate() {
+        for st in ps.plan.subtasks.iter().take(4) {
             let icon = match st.status {
                 TaskStatus::Completed => "✓",
                 TaskStatus::InProgress => "→",
                 _ => "○",
             };
-            let prefix = if i < 3 { "├─" } else { "└─" };
-            out.push_str(&format!(
-                "│    {} {} {}                            \n",
-                prefix,
-                icon,
-                truncate_str(&st.title, 30)
-            ));
+            out.push_str(&format!("     {} {}\n", icon, truncate_str(&st.title, 50)));
         }
         if ps.plan.subtasks.len() > 4 {
-            out.push_str(&format!(
-                "│    └─ ... and {} more                  \n",
-                ps.plan.subtasks.len() - 4
-            ));
+            out.push_str(&format!("     … and {} more\n", ps.plan.subtasks.len() - 4));
         }
 
-        out.push_str("│                                                      │\n");
-        out.push_str("│  Options: [1] continue  [2] restart  [3] new  [4] exit │\n");
+        out.push('\n');
+        out.push_str("  [1] continue  [2] restart  [3] new  [4] exit\n");
     } else if let Some(paused) = paused_plan {
-        // Show paused plan
         let pct = paused.progress_pct();
-        out.push_str(&format!(
-            "│  ⏸ Paused plan: {}% complete               │\n",
-            pct
-        ));
-        out.push_str("│                                                      │\n");
-        out.push_str("│  Options: [1] resume  [2] new  [3] exit              │\n");
+        out.push_str(&format!("  📋 Plan Mode — ⏸ paused ({}% done)\n", pct));
+        out.push('\n');
+        out.push_str("  [1] resume  [2] new  [3] exit\n");
     } else {
-        // No active plan
-        out.push_str("│  No active plan.                                     │\n");
-        out.push_str("│                                                      │\n");
-        out.push_str("│  Describe what you want to do:                       │\n");
+        out.push_str("  📋 Plan Mode\n");
+        out.push('\n');
+        out.push_str("  Describe what you want to do:\n");
     }
-
-    out.push_str("└─────────────────────────────────────────────────────┘\n");
 
     out
 }
@@ -5461,7 +5487,7 @@ Done!"#;
     #[test]
     fn plan_entry_card_no_active_plan() {
         let card = format_plan_entry_card(None, None);
-        assert!(card.contains("No active plan"));
+        assert!(card.contains("Plan Mode"));
         assert!(card.contains("Describe what you want"));
     }
 

@@ -47,14 +47,10 @@ fn eprint_plan_json_parse_failed(full_text: &str, err: &str) {
 /// Render a formatted plan string line-by-line with progressive reveal animation.
 fn eprint_plan_progressive(formatted: &str) {
     use std::io::Write;
-    // Box border lines render instantly, content lines have a small stagger
     for line in formatted.lines() {
-        let is_border = line.starts_with('┌')
-            || line.starts_with('└')
-            || line.starts_with("──")
-            || line.trim().is_empty();
+        let is_separator = line.trim_start().starts_with('─') || line.trim().is_empty();
         eprintln!("{line}");
-        if !is_border {
+        if !is_separator {
             let _ = std::io::stderr().flush();
             std::thread::sleep(std::time::Duration::from_millis(25));
         }
@@ -1658,8 +1654,8 @@ pub async fn handle_plan_mode_input(
 
                                         // Stream thinking process to user (before JSON)
                                         for ch in content.chars() {
-                                            // Detect start of JSON plan
-                                            if ch == '{' && !in_thinking && !in_plan_json {
+                                            // Detect start of JSON plan (or code fence before JSON)
+                                            if ch == '{' && !in_plan_json {
                                                 in_plan_json = true;
                                                 if in_thinking {
                                                     eprintln!();
@@ -1675,6 +1671,21 @@ pub async fn handle_plan_mode_input(
 
                                             if in_plan_json {
                                                 continue;
+                                            }
+
+                                            // Detect ```json or ``` code fence — suppress it
+                                            if ch == '`' {
+                                                chars_since_nl += 1;
+                                                continue;
+                                            }
+
+                                            // Skip lines that look like code fence labels (e.g. "json")
+                                            if !in_thinking && chars_since_nl == 0 {
+                                                // Check if this is a code fence label line
+                                                let rest = content.trim();
+                                                if rest == "json" || rest == "```json" || rest.starts_with("```") {
+                                                    break; // skip entire chunk
+                                                }
                                             }
 
                                             // Stream thinking text
