@@ -190,6 +190,10 @@ pub async fn run_agentic_headless_tool_round<E: EdgeToolRoundRow>(
             continue;
         }
 
+        // Edge tools (synthetic_idx.is_some()) were already displayed during SSE.
+        // Skip redundant output for these.
+        let is_edge_tool = synthetic_idx.is_some();
+
         let mut result_str = if let Some(i) = synthetic_idx {
             edge_tool_round[i].tool_output().to_string()
         } else {
@@ -318,7 +322,8 @@ pub async fn run_agentic_headless_tool_round<E: EdgeToolRoundRow>(
             );
         }
 
-        if !quiet {
+        // Skip redundant display for edge tools (already shown during SSE stream).
+        if !quiet && !is_edge_tool {
             let duration_str = format_headless_tool_duration(tool_elapsed);
             let detail = tool_call_detail(&name, &args);
             let summary = if !is_err {
@@ -351,7 +356,10 @@ pub async fn run_agentic_headless_tool_round<E: EdgeToolRoundRow>(
             }
         }
 
-        emit_headless_tool_body_preview(term, quiet, &name, &result_str, is_err);
+        // Also skip body preview for edge tools.
+        if !is_edge_tool {
+            emit_headless_tool_body_preview(term, quiet, &name, &result_str, is_err);
+        }
 
         let model_result_str = tool_result_content_for_model(&name, &result_str);
         let (tool_msg, tr) = openai_tool_roundtrip_values(&id, &name, &model_result_str);
