@@ -297,6 +297,131 @@ impl LlmJudge for CloudLlmJudge {
     }
 }
 
+/// Parse test output from common test frameworks and return (passed, failed).
+///
+/// Recognizes patterns from: Rust (cargo test), Python (pytest), Node (jest/mocha),
+/// Go, Java (JUnit/Maven), and generic "N passed, M failed" output.
+/// Returns `None` if no recognizable test summary is found.
+fn parse_test_output(output: &str) -> Option<(u64, u64)> {
+    // We scan lines in reverse because final summaries appear last.
+    // Collect all lines so we can iterate from the end.
+    let lines: Vec<&str> = output.lines().collect();
+
+    for line in lines.iter().rev() {
+        let line = line.trim();
+
+        // Rust / cargo test: "test result: ok. 42 passed; 1 failed; 0 ignored"
+        if line.starts_with("test result:") {
+            let passed = extract_number_before(line, "passed");
+            let failed = extract_number_before(line, "failed");
+            if passed.is_some() || failed.is_some() {
+                return Some((passed.unwrap_or(0), failed.unwrap_or(0)));
+            }
+        }
+
+        // pytest: "10 passed, 2 failed" or "10 passed" or "2 failed"
+        // Also handles "10 passed, 1 warning" etc.
+        if (line.contains(" passed") || line.contains(" failed"))
+            && (line.starts_with('=') || line.starts_with("FAILED") || line.contains("passed"))
+        {
+            let passed = extract_number_before(line, "passed");
+            let failed = extract_number_before(line, "failed");
+            if passed.is_some() || failed.is_some() {
+                return Some((passed.unwrap_or(0), failed.unwrap_or(0)));
+            }
+        }
+
+        // Jest / Vitest: "Tests:  2 failed, 10 passed, 12 total"
+        if line.starts_with("Tests:") && line.contains("total") {
+            let passed = extract_number_before(line, "passed");
+            let failed = extract_number_before(line, "failed");
+            if passed.is_some() || failed.is_some() {
+                return Some((passed.unwrap_or(0), failed.unwrap_or(0)));
+            }
+        }
+
+        // Go: "ok" or "FAIL" with "--- FAIL:" counted
+        if line.starts_with("ok") && line.contains("\t") {
+            // Go test passed — count FAIL lines in entire output
+            let fail_count = output
+                .lines()
+                .filter(|l| l.trim_start().starts_with("--- FAIL:"))
+                .count() as u64;
+            let pass_count = output
+                .lines()
+                .filter(|l| l.trim_start().starts_with("--- PASS:"))
+                .count() as u64;
+            // If we found specific pass/fail markers, use them
+            if pass_count > 0 || fail_count > 0 {
+                return Some((pass_count, fail_count));
+            }
+        }
+
+        // JUnit / Maven: "Tests run: 10, Failures: 2, Errors: 1, Skipped: 0"
+        if line.contains("Tests run:") && line.contains("Failures:") {
+            let total = extract_number_after(line, "Tests run:");
+            let failures = extract_number_after(line, "Failures:");
+            let errors = extract_number_after(line, "Errors:");
+            if let Some(t) = total {
+                let f = failures.unwrap_or(0) + errors.unwrap_or(0);
+                return Some((t.saturating_sub(f), f));
+            }
+        }
+
+        // Generic: "N tests passed, M tests failed" or "N passing, M failing"
+        // (mocha/jasmine: these can be on separate lines, so we handle per-line)
+        if line.contains("passing")
+            && let Some(p) = extract_number_before(line, "passing")
+        {
+            let failed = lines.iter().rev().find_map(|l| {
+                if l.contains("failing") {
+                    extract_number_before(l.trim(), "failing")
+                } else {
+                    None
+                }
+            });
+            return Some((p, failed.unwrap_or(0)));
+        }
+        if line.contains("failing")
+            && let Some(f) = extract_number_before(line, "failing")
+        {
+            let passed = lines.iter().rev().find_map(|l| {
+                if l.contains("passing") {
+                    extract_number_before(l.trim(), "passing")
+                } else {
+                    None
+                }
+            });
+            return Some((passed.unwrap_or(0), f));
+        }
+    }
+
+    None
+}
+
+/// Extract the number immediately before a keyword, e.g. "42 passed" → 42
+fn extract_number_before(line: &str, keyword: &str) -> Option<u64> {
+    let idx = line.find(keyword)?;
+    let before = line[..idx].trim();
+    // Take the last whitespace-separated token before the keyword
+    let num_str = before
+        .rsplit_once(|c: char| !c.is_ascii_digit())
+        .map_or(before, |(_, n)| n);
+    num_str.parse().ok()
+}
+
+/// Extract the number immediately after a keyword (with optional colon/space),
+/// e.g. "Tests run: 10" → 10
+fn extract_number_after(line: &str, keyword: &str) -> Option<u64> {
+    let idx = line.find(keyword)?;
+    let after = line[idx + keyword.len()..].trim_start_matches([' ', ':']);
+    let num_str = after
+        .split(|c: char| !c.is_ascii_digit())
+        .next()
+        .unwrap_or("");
+    num_str.parse().ok()
+}
+
 /// Parse a score from LLM response text.
 ///
 /// Tries (in order): direct JSON parse → embedded JSON in markdown → fallback
@@ -826,12 +951,37 @@ impl VerificationRunner {
             VerifierKind::TestPass { cmd, min_pass_rate } => {
                 let cmd = cmd.clone();
                 let dir = self.work_dir.clone();
-                let (_code, stdout, stderr) = run_shell_cmd(&cmd, &dir).await?;
+                let (code, stdout, stderr) = run_shell_cmd(&cmd, &dir).await?;
                 let combined = format!("{stdout}\n{stderr}");
-                let passed = _code == 0;
+
+                // Try to parse structured test output for actual pass rate
+                let (passed, evidence) = if let Some((p, f)) = parse_test_output(&combined) {
+                    let total = p + f;
+                    let rate = if total > 0 {
+                        p as f64 / total as f64
+                    } else {
+                        0.0
+                    };
+                    let meets_threshold = rate >= *min_pass_rate;
+                    let detail = format!(
+                        "{p} passed, {f} failed ({:.0}% pass rate, threshold {:.0}%)\n{}",
+                        rate * 100.0,
+                        min_pass_rate * 100.0,
+                        truncate(&combined, 3800),
+                    );
+                    (meets_threshold, detail)
+                } else {
+                    // Fallback: if we can't parse output, use exit code
+                    let detail = format!(
+                        "exit code {code} (could not parse test counts)\n{}",
+                        truncate(&combined, 3900),
+                    );
+                    (code == 0, detail)
+                };
+
                 Ok((
                     passed,
-                    truncate(&combined, 4096),
+                    truncate(&evidence, 4096),
                     format!("pass rate >= {:.0}%", min_pass_rate * 100.0),
                 ))
             }
@@ -5227,6 +5377,385 @@ mod tests {
             template_calls.len(),
             1,
             "extract_template should be called for completed contracts"
+        );
+    }
+
+    // ─── parse_test_output tests ────────────────────────────────────────────
+
+    #[test]
+    fn parse_test_output_rust_cargo() {
+        let output = r#"
+running 42 tests
+test foo ... ok
+test bar ... ok
+test baz ... FAILED
+
+test result: ok. 41 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out
+"#;
+        let (p, f) = parse_test_output(output).unwrap();
+        assert_eq!(p, 41);
+        assert_eq!(f, 1);
+    }
+
+    #[test]
+    fn parse_test_output_pytest() {
+        let output = "===== 10 passed, 2 failed in 1.23s =====";
+        let (p, f) = parse_test_output(output).unwrap();
+        assert_eq!(p, 10);
+        assert_eq!(f, 2);
+    }
+
+    #[test]
+    fn parse_test_output_pytest_all_pass() {
+        let output = "===== 15 passed in 0.50s =====";
+        let (p, f) = parse_test_output(output).unwrap();
+        assert_eq!(p, 15);
+        assert_eq!(f, 0);
+    }
+
+    #[test]
+    fn parse_test_output_jest() {
+        let output = r#"
+Test Suites: 1 failed, 4 passed, 5 total
+Tests:       2 failed, 10 passed, 12 total
+Snapshots:   0 total
+Time:        3.456 s
+"#;
+        let (p, f) = parse_test_output(output).unwrap();
+        assert_eq!(p, 10);
+        assert_eq!(f, 2);
+    }
+
+    #[test]
+    fn parse_test_output_junit_maven() {
+        let output = "Tests run: 25, Failures: 3, Errors: 1, Skipped: 2";
+        let (p, f) = parse_test_output(output).unwrap();
+        assert_eq!(p, 21); // 25 - 3 - 1
+        assert_eq!(f, 4); // 3 + 1
+    }
+
+    #[test]
+    fn parse_test_output_mocha_passing_failing() {
+        let output = "  8 passing (120ms)\n  1 failing";
+        let (p, f) = parse_test_output(output).unwrap();
+        assert_eq!(p, 8);
+        assert_eq!(f, 1);
+    }
+
+    #[test]
+    fn parse_test_output_unrecognized_returns_none() {
+        let output = "Hello world, this is not test output.";
+        assert!(parse_test_output(output).is_none());
+    }
+
+    // ─── BuildPass verifier tests ───────────────────────────────────────────
+
+    #[tokio::test]
+    async fn buildpass_verifier_success() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let runner = VerificationRunner::new(tmp.path().to_path_buf());
+        let criterion = VerificationCriterion {
+            id: "build-ok".into(),
+            description: "build passes".into(),
+            verifier: VerifierKind::BuildPass {
+                cmd: "echo 'build ok'".into(),
+            },
+            required: true,
+            timeout_sec: 10,
+            global_only: false,
+        };
+        let result = runner.run_criterion(&criterion).await;
+        assert!(result.passed);
+        assert_eq!(result.expected, "exit code == 0");
+    }
+
+    #[tokio::test]
+    async fn buildpass_verifier_failure() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let runner = VerificationRunner::new(tmp.path().to_path_buf());
+        let criterion = VerificationCriterion {
+            id: "build-fail".into(),
+            description: "build fails".into(),
+            verifier: VerifierKind::BuildPass {
+                cmd: "echo 'error: something wrong' >&2; exit 1".into(),
+            },
+            required: true,
+            timeout_sec: 10,
+            global_only: false,
+        };
+        let result = runner.run_criterion(&criterion).await;
+        assert!(!result.passed);
+        assert!(result.evidence.contains("error: something wrong"));
+    }
+
+    // ─── TestPass verifier tests ────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn testpass_verifier_uses_parsed_rate_not_just_exit_code() {
+        // This is the P0 bug scenario: exit code 0 but low pass rate
+        let tmp = tempfile::TempDir::new().unwrap();
+        let runner = VerificationRunner::new(tmp.path().to_path_buf());
+        let criterion = VerificationCriterion {
+            id: "test-rate".into(),
+            description: "tests with pass rate".into(),
+            verifier: VerifierKind::TestPass {
+                // Exit 0 but report 5 passed, 5 failed → 50% pass rate
+                cmd: "echo 'test result: ok. 5 passed; 5 failed; 0 ignored'; exit 0".into(),
+                min_pass_rate: 0.9, // require 90%
+            },
+            required: true,
+            timeout_sec: 10,
+            global_only: false,
+        };
+        let result = runner.run_criterion(&criterion).await;
+        // Despite exit 0, should FAIL because 50% < 90%
+        assert!(
+            !result.passed,
+            "TestPass should fail when pass rate (50%) < min_pass_rate (90%), even if exit code is 0"
+        );
+        assert!(result.evidence.contains("50%"));
+    }
+
+    #[tokio::test]
+    async fn testpass_verifier_passes_when_rate_met() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let runner = VerificationRunner::new(tmp.path().to_path_buf());
+        let criterion = VerificationCriterion {
+            id: "test-ok".into(),
+            description: "all tests pass".into(),
+            verifier: VerifierKind::TestPass {
+                cmd: "echo 'test result: ok. 10 passed; 0 failed; 0 ignored'".into(),
+                min_pass_rate: 1.0,
+            },
+            required: true,
+            timeout_sec: 10,
+            global_only: false,
+        };
+        let result = runner.run_criterion(&criterion).await;
+        assert!(result.passed);
+        assert!(result.evidence.contains("100%"));
+    }
+
+    #[tokio::test]
+    async fn testpass_verifier_fallback_to_exit_code() {
+        // When output can't be parsed, fall back to exit code
+        let tmp = tempfile::TempDir::new().unwrap();
+        let runner = VerificationRunner::new(tmp.path().to_path_buf());
+        let criterion = VerificationCriterion {
+            id: "test-fallback".into(),
+            description: "unparseable output".into(),
+            verifier: VerifierKind::TestPass {
+                cmd: "echo 'all good'; exit 0".into(),
+                min_pass_rate: 1.0,
+            },
+            required: true,
+            timeout_sec: 10,
+            global_only: false,
+        };
+        let result = runner.run_criterion(&criterion).await;
+        assert!(result.passed, "should pass via exit code fallback");
+        assert!(result.evidence.contains("could not parse test counts"));
+    }
+
+    #[tokio::test]
+    async fn testpass_verifier_fallback_exit_nonzero() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let runner = VerificationRunner::new(tmp.path().to_path_buf());
+        let criterion = VerificationCriterion {
+            id: "test-fallback-fail".into(),
+            description: "unparseable + exit 1".into(),
+            verifier: VerifierKind::TestPass {
+                cmd: "echo 'kaboom'; exit 1".into(),
+                min_pass_rate: 1.0,
+            },
+            required: true,
+            timeout_sec: 10,
+            global_only: false,
+        };
+        let result = runner.run_criterion(&criterion).await;
+        assert!(!result.passed, "should fail via exit code fallback");
+    }
+
+    // ─── Composite verifier tests ───────────────────────────────────────────
+
+    #[tokio::test]
+    async fn composite_all_pass() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let runner = VerificationRunner::new(tmp.path().to_path_buf());
+        let criterion = VerificationCriterion {
+            id: "comp-all".into(),
+            description: "all must pass".into(),
+            verifier: VerifierKind::Composite {
+                criteria: vec![
+                    VerificationCriterion {
+                        id: "a".into(),
+                        description: "a".into(),
+                        verifier: VerifierKind::Command {
+                            cmd: "true".into(),
+                            expected_exit: 0,
+                        },
+                        required: true,
+                        timeout_sec: 10,
+                        global_only: false,
+                    },
+                    VerificationCriterion {
+                        id: "b".into(),
+                        description: "b".into(),
+                        verifier: VerifierKind::Command {
+                            cmd: "true".into(),
+                            expected_exit: 0,
+                        },
+                        required: true,
+                        timeout_sec: 10,
+                        global_only: false,
+                    },
+                ],
+                require_all: true,
+            },
+            required: true,
+            timeout_sec: 30,
+            global_only: false,
+        };
+        let result = runner.run_criterion(&criterion).await;
+        assert!(result.passed);
+        assert!(result.evidence.contains("a: ✓"));
+        assert!(result.evidence.contains("b: ✓"));
+    }
+
+    #[tokio::test]
+    async fn composite_all_one_fails() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let runner = VerificationRunner::new(tmp.path().to_path_buf());
+        let criterion = VerificationCriterion {
+            id: "comp-all-fail".into(),
+            description: "one fails in ALL mode".into(),
+            verifier: VerifierKind::Composite {
+                criteria: vec![
+                    VerificationCriterion {
+                        id: "ok".into(),
+                        description: "ok".into(),
+                        verifier: VerifierKind::Command {
+                            cmd: "true".into(),
+                            expected_exit: 0,
+                        },
+                        required: true,
+                        timeout_sec: 10,
+                        global_only: false,
+                    },
+                    VerificationCriterion {
+                        id: "fail".into(),
+                        description: "fail".into(),
+                        verifier: VerifierKind::Command {
+                            cmd: "false".into(),
+                            expected_exit: 0,
+                        },
+                        required: true,
+                        timeout_sec: 10,
+                        global_only: false,
+                    },
+                ],
+                require_all: true,
+            },
+            required: true,
+            timeout_sec: 30,
+            global_only: false,
+        };
+        let result = runner.run_criterion(&criterion).await;
+        assert!(
+            !result.passed,
+            "ALL mode should fail if any sub-criterion fails"
+        );
+        assert!(result.evidence.contains("ok: ✓"));
+        assert!(result.evidence.contains("fail: ✗"));
+    }
+
+    #[tokio::test]
+    async fn composite_any_one_passes() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let runner = VerificationRunner::new(tmp.path().to_path_buf());
+        let criterion = VerificationCriterion {
+            id: "comp-any".into(),
+            description: "one passes in ANY mode".into(),
+            verifier: VerifierKind::Composite {
+                criteria: vec![
+                    VerificationCriterion {
+                        id: "fail1".into(),
+                        description: "fail".into(),
+                        verifier: VerifierKind::Command {
+                            cmd: "false".into(),
+                            expected_exit: 0,
+                        },
+                        required: true,
+                        timeout_sec: 10,
+                        global_only: false,
+                    },
+                    VerificationCriterion {
+                        id: "ok1".into(),
+                        description: "ok".into(),
+                        verifier: VerifierKind::Command {
+                            cmd: "true".into(),
+                            expected_exit: 0,
+                        },
+                        required: true,
+                        timeout_sec: 10,
+                        global_only: false,
+                    },
+                ],
+                require_all: false,
+            },
+            required: true,
+            timeout_sec: 30,
+            global_only: false,
+        };
+        let result = runner.run_criterion(&criterion).await;
+        assert!(
+            result.passed,
+            "ANY mode should pass if at least one sub-criterion passes"
+        );
+    }
+
+    #[tokio::test]
+    async fn composite_any_all_fail() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let runner = VerificationRunner::new(tmp.path().to_path_buf());
+        let criterion = VerificationCriterion {
+            id: "comp-any-fail".into(),
+            description: "all fail in ANY mode".into(),
+            verifier: VerifierKind::Composite {
+                criteria: vec![
+                    VerificationCriterion {
+                        id: "f1".into(),
+                        description: "f".into(),
+                        verifier: VerifierKind::Command {
+                            cmd: "false".into(),
+                            expected_exit: 0,
+                        },
+                        required: true,
+                        timeout_sec: 10,
+                        global_only: false,
+                    },
+                    VerificationCriterion {
+                        id: "f2".into(),
+                        description: "f".into(),
+                        verifier: VerifierKind::Command {
+                            cmd: "false".into(),
+                            expected_exit: 0,
+                        },
+                        required: true,
+                        timeout_sec: 10,
+                        global_only: false,
+                    },
+                ],
+                require_all: false,
+            },
+            required: true,
+            timeout_sec: 30,
+            global_only: false,
+        };
+        let result = runner.run_criterion(&criterion).await;
+        assert!(
+            !result.passed,
+            "ANY mode should fail if all sub-criteria fail"
         );
     }
 }
