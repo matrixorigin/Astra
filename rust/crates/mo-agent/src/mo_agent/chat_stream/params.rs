@@ -28,7 +28,8 @@ pub(crate) struct ChatTurnParams<'a> {
     pub(crate) skill_registry: &'a SharedSkillRegistry,
     /// When true, omit edge tools and inject plan-only system instructions (CLI `/plan on`).
     pub(crate) plan_only_chat: bool,
-    /// When true, this turn is executing a plan subtask — skip stop hooks
-    /// (durable task system handles global verification at plan completion).
+    /// When true, this turn is executing a plan subtask — `when: task_completed` stop hooks apply.
     pub(crate) is_plan_subtask: bool,
+    /// Sent on `/chat/turn` JSON so cloud can classify the turn like local `is_plan_subtask`.
+    pub(crate) plan_subtask_id: Option<&'a str>,
 }

@@ -299,6 +299,9 @@ mod tests {
             delegation_engine: None,
             stop_hooks: Vec::new(),
             stop_hook_runs: 0,
+            teammate_idle_hooks: Vec::new(),
+            teammate_idle_hook_runs: 0,
+            workspace_root_hint: None,
             consecutive_same_error: 0,
             last_error_category: None,
         }

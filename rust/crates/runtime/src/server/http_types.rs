@@ -43,6 +43,11 @@ pub(super) struct ChatRequest {
     pub(super) max_candidates: u32,
     #[serde(default)]
     pub(super) explain: bool,
+    /// Durable plan subtask id — merged into `context` for cloud stop-hooks (`when: task_completed`).
+    #[serde(default)]
+    pub(super) plan_subtask_id: Option<String>,
+    #[serde(default)]
+    pub(super) is_plan_subtask: Option<bool>,
 }
 
 #[derive(Deserialize, Default)]
@@ -570,13 +575,30 @@ impl From<AuthTokenRecord> for AuthTokenResponse {
     }
 }
 
-pub(super) fn chat_request_into_data(request: ChatRequest) -> ChatRequestData {
+pub(super) fn chat_request_into_data(mut request: ChatRequest) -> ChatRequestData {
+    let mut context = request.context.take();
+    if request.plan_subtask_id.is_some() || request.is_plan_subtask == Some(true) {
+        let ctx = context.get_or_insert_with(serde_json::Map::new);
+        if let Some(id) = request
+            .plan_subtask_id
+            .take()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+        {
+            ctx.entry("plan_subtask_id".to_string())
+                .or_insert(serde_json::Value::String(id));
+        }
+        if request.is_plan_subtask == Some(true) {
+            ctx.entry("is_plan_subtask".to_string())
+                .or_insert(serde_json::Value::Bool(true));
+        }
+    }
     ChatRequestData {
         message: request.message,
         session_id: request.session_id,
         agent_id: request.agent_id,
         model: request.model,
-        context: request.context,
+        context,
         max_candidates: request.max_candidates,
         explain: request.explain,
     }
@@ -1509,6 +1531,8 @@ mod tests {
             context: Some(ctx.clone()),
             max_candidates: 3,
             explain: true,
+            plan_subtask_id: None,
+            is_plan_subtask: None,
         };
         let data = chat_request_into_data(req);
         assert_eq!(data.message, "hello");
@@ -1531,5 +1555,24 @@ mod tests {
         assert!(data.context.is_none());
         assert_eq!(data.max_candidates, 5);
         assert!(!data.explain);
+    }
+
+    #[test]
+    fn chat_request_into_data_merges_plan_subtask_into_context() {
+        let req = ChatRequest {
+            message: "do step".into(),
+            session_id: None,
+            agent_id: None,
+            model: None,
+            context: None,
+            max_candidates: 5,
+            explain: false,
+            plan_subtask_id: Some("sub-42".into()),
+            is_plan_subtask: Some(true),
+        };
+        let data = chat_request_into_data(req);
+        let ctx = data.context.unwrap();
+        assert_eq!(ctx.get("plan_subtask_id").and_then(|v| v.as_str()), Some("sub-42"));
+        assert_eq!(ctx.get("is_plan_subtask").and_then(|v| v.as_bool()), Some(true));
     }
 }

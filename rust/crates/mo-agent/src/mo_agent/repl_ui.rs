@@ -168,6 +168,84 @@ pub(super) fn completion_candidates(prefix: &str) -> Vec<(&'static str, &'static
     rows
 }
 
+/// Static first-token completions after `/<cmd> ` (Tab in the REPL). Keep in sync with
+/// `slash_argument_hint` and the corresponding handlers in `main.rs`.
+const SLASH_FIRST_TOKEN_COMPLETIONS: &[(&str, &[(&str, &str)])] = &[
+    (
+        "/stats",
+        &[("history", "Aggregate stats across recent sessions")],
+    ),
+    (
+        "/health",
+        &[("detail", "Per-tool health breakdown")],
+    ),
+    (
+        "/sync",
+        &[("log", "Recent sync event log")],
+    ),
+    (
+        "/learn",
+        &[
+            ("stats", "Learning summary (default)"),
+            ("drift", "Drifting pattern detection"),
+            ("explore", "Exploration opportunities"),
+        ],
+    ),
+    (
+        "/review",
+        &[
+            ("latest", "Review HEAD (default)"),
+            ("working", "Review working tree vs HEAD"),
+        ],
+    ),
+];
+
+/// Returns `(replacement_start_byte, candidates)` when the cursor is completing the first argument
+/// word after a registered slash command (e.g. `/stats ` → `history`).
+fn slash_first_token_completions(line: &str, pos: usize) -> Option<(usize, Vec<Pair>)> {
+    let pos = pos.min(line.len());
+    let prefix = line.get(..pos)?;
+    let space_idx = prefix.find(' ')?;
+    let cmd = prefix.get(..space_idx)?.trim();
+    if !cmd.starts_with('/') {
+        return None;
+    }
+    let options = SLASH_FIRST_TOKEN_COMPLETIONS
+        .iter()
+        .find(|(c, _)| *c == cmd)?
+        .1;
+
+    let tail = prefix.get(space_idx + 1..)?;
+    let leading_ws = tail.len() - tail.trim_start().len();
+    let arg_start = space_idx + 1 + leading_ws;
+    let trimmed = tail.get(leading_ws..)?;
+
+    let first_space = trimmed.find(' ');
+    let token_raw = first_space.map_or(trimmed, |ix| trimmed.get(..ix).unwrap_or(""));
+
+    if let Some(ix) = first_space {
+        let token_end = arg_start + ix;
+        if pos > token_end {
+            return None;
+        }
+    }
+
+    let partial = token_raw;
+    let mut matches: Vec<Pair> = options
+        .iter()
+        .filter(|(tok, _)| tok.starts_with(partial))
+        .map(|(tok, desc)| Pair {
+            display: format!("{:<15}  {}", tok, desc),
+            replacement: (*tok).to_string(),
+        })
+        .collect();
+    if matches.is_empty() {
+        return None;
+    }
+    matches.sort_by(|a, b| a.replacement.cmp(&b.replacement));
+    Some((arg_start, matches))
+}
+
 fn filtered_slash_rows(query: Option<&str>) -> Vec<(&'static str, &'static str)> {
     let mut rows = completion_candidates("/");
     rows.retain(|(cmd, _)| *cmd != "/" && !is_command_alias(cmd));
@@ -1236,6 +1314,9 @@ impl Completer for ReplHelper {
 
             let safe_pos = pos.min(line.len());
             let before_cursor = &line[..safe_pos];
+            if let Some((start, pairs)) = slash_first_token_completions(line, safe_pos) {
+                return Ok((start, pairs));
+            }
             let Some(prefix) = slash_completion_query(before_cursor) else {
                 return Ok((pos, vec![]));
             };
@@ -1432,6 +1513,42 @@ mod tests {
     fn completion_candidates_for_prefix() {
         let candidates = completion_candidates("/he");
         assert!(candidates.iter().any(|(cmd, _)| *cmd == "/help"));
+    }
+
+    // ── slash_first_token_completions (Tab after `/cmd `) ─────────────────────
+
+    #[test]
+    fn first_token_complete_stats_empty_suffix() {
+        let line = "/stats ";
+        let (start, pairs) = slash_first_token_completions(line, line.len()).expect("completions");
+        assert_eq!(start, line.len(), "replacement starts after trailing space");
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0].replacement, "history");
+    }
+
+    #[test]
+    fn first_token_complete_stats_prefix() {
+        let line = "/stats hi";
+        let (start, pairs) = slash_first_token_completions(line, line.len()).expect("completions");
+        assert_eq!(&line[start..], "hi");
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0].replacement, "history");
+    }
+
+    #[test]
+    fn first_token_complete_learn_multiple_sorted() {
+        let line = "/learn ";
+        let (_start, pairs) = slash_first_token_completions(line, line.len()).expect("completions");
+        assert_eq!(pairs.len(), 3);
+        assert_eq!(pairs[0].replacement, "drift");
+        assert_eq!(pairs[1].replacement, "explore");
+        assert_eq!(pairs[2].replacement, "stats");
+    }
+
+    #[test]
+    fn first_token_skips_when_cursor_past_first_arg() {
+        let line = "/stats history more";
+        assert!(slash_first_token_completions(line, line.len()).is_none());
     }
 
     // ── Multi-line (Validator) ────────────────────────────────────────────────

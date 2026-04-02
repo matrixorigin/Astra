@@ -224,10 +224,18 @@ pub struct AgenticLoopState {
 
     // ── Stop hooks ──
     /// Verification commands run before the loop is allowed to complete.
+    /// For plan subtasks, populated from declarative `when: task_completed` hooks.
     /// If any hook fails, its output is injected and the loop continues.
     pub stop_hooks: Vec<crate::turn::stop_hooks::StopHook>,
     /// How many times stop hooks have fired (prevents infinite hook loops).
     pub stop_hook_runs: u32,
+    /// Hooks with `when: teammate_idle` — injected once after a `delegate` round returns.
+    pub teammate_idle_hooks: Vec<crate::turn::stop_hooks::StopHook>,
+    /// How many times teammate-idle hooks have fired (at most once per loop).
+    pub teammate_idle_hook_runs: u32,
+    /// Edge/chat project root (`git_root` or `cwd`) for enriching `delegate` sub-run context
+    /// so server-side sub-runs load `.mo-agent/stop-hooks.yaml` from the same tree.
+    pub workspace_root_hint: Option<String>,
 
     // ── Error budget ──
     /// Consecutive turns where the same error category dominated.
@@ -380,6 +388,24 @@ fn parse_coordination_pattern(
     }
 }
 
+/// If the LLM did not pass `cwd` / `git_root` in `delegate` args, inherit the parent run root.
+fn merge_workspace_hint_into_delegation_request(
+    request: &mut mo_agent_services::coordination::DelegationRequest,
+    hint: Option<&str>,
+) {
+    let Some(root) = hint.map(str::trim).filter(|s| !s.is_empty()) else {
+        return;
+    };
+    let c = &mut request.context;
+    if c.contains_key("git_root")
+        || c.contains_key("workspace_root")
+        || c.contains_key("cwd")
+    {
+        return;
+    }
+    c.insert("cwd".to_string(), Value::String(root.to_string()));
+}
+
 /// Partition tool calls into delegation calls and remaining calls,
 /// execute delegations, and return results as (call_id, result_text) pairs.
 async fn partition_and_execute_delegations(
@@ -388,6 +414,7 @@ async fn partition_and_execute_delegations(
     parent_run_id: &str,
     session_id: &str,
     source_agent_id: &str,
+    workspace_hint: Option<&str>,
 ) -> (Vec<(String, String)>, Vec<Value>) {
     let mut delegation_results = Vec::new();
     let mut remaining = Vec::new();
@@ -401,15 +428,18 @@ async fn partition_and_execute_delegations(
                 .to_string();
 
             match parse_delegation_request(tc, parent_run_id, session_id) {
-                Ok(request) => match engine.execute(request, source_agent_id).await {
-                    Ok(result) => {
-                        let summary = format_delegation_result(&result);
-                        delegation_results.push((call_id, summary));
+                Ok(mut request) => {
+                    merge_workspace_hint_into_delegation_request(&mut request, workspace_hint);
+                    match engine.execute(request, source_agent_id).await {
+                        Ok(result) => {
+                            let summary = format_delegation_result(&result);
+                            delegation_results.push((call_id, summary));
+                        }
+                        Err(e) => {
+                            delegation_results.push((call_id, format!("Delegation failed: {e}")));
+                        }
                     }
-                    Err(e) => {
-                        delegation_results.push((call_id, format!("Delegation failed: {e}")));
-                    }
-                },
+                }
                 Err(e) => {
                     delegation_results.push((call_id, format!("Invalid delegation request: {e}")));
                 }
@@ -580,8 +610,9 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
                 // The prompt instructs the LLM to run checks, fix failures, and
                 // re-run until passing — all within the normal tool loop.
                 // Runtime does not inspect results; it trusts the LLM's tool cycle.
-                if state.task_profile.verification_required
-                    && state.stop_hook_runs == 0
+                // Inject whenever `stop_hooks` is non-empty (declarative and/or auto-detect).
+                // Read-only turns omit auto-detect but may still carry declarative hooks.
+                if state.stop_hook_runs == 0
                     && let Some(prompt) =
                         crate::turn::stop_hooks::build_stop_hook_prompt(&state.stop_hooks)
                 {
@@ -626,6 +657,7 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
                     state.current_run_id.as_deref().unwrap_or("unknown"),
                     state.current_session_id.as_deref().unwrap_or("unknown"),
                     "orchestrator",
+                    state.workspace_root_hint.as_deref(),
                 )
                 .await
             } else {
@@ -641,6 +673,22 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
             });
             state.messages.push(tool_msg.clone());
             state.tool_results.push(tool_msg);
+        }
+
+        if !delegation_results.is_empty()
+            && state.teammate_idle_hook_runs == 0
+            && let Some(prompt) = crate::turn::stop_hooks::build_teammate_idle_hook_prompt(
+                &state.teammate_idle_hooks,
+            )
+        {
+            state.teammate_idle_hook_runs = 1;
+            if !quiet {
+                host.emit_headless_line(
+                    HeadlessStderrStyle::Yellow,
+                    "⚠ Teammate-round verification…".to_string(),
+                );
+            }
+            state.messages.push(prompt);
         }
 
         // Use remaining (non-delegation) tool calls for headless round
@@ -992,6 +1040,9 @@ mod tests {
             delegation_engine: None,
             stop_hooks: Vec::new(),
             stop_hook_runs: 0,
+            teammate_idle_hooks: Vec::new(),
+            teammate_idle_hook_runs: 0,
+            workspace_root_hint: None,
             consecutive_same_error: 0,
             last_error_category: None,
         }
@@ -1760,6 +1811,7 @@ mod tests {
             "test-run",
             "test-session",
             "orchestrator",
+            None,
         )
         .await;
 
@@ -1812,6 +1864,7 @@ mod tests {
             "run-1",
             "sess-1",
             "orchestrator",
+            None,
         )
         .await;
 
@@ -1847,6 +1900,7 @@ mod tests {
             "run-1",
             "sess-1",
             "orchestrator",
+            None,
         )
         .await;
 

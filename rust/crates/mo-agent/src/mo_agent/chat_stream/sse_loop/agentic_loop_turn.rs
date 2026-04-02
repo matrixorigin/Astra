@@ -43,7 +43,7 @@ use mo_agent_runtime::{
     turn::tool_schema_prune::pin_invoked_tool_schemas,
     turn::turn_guard::{TurnGuard, merge_deprioritized_tools_into_restricted},
 };
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use crate::{
     ExplainMode,
@@ -93,6 +93,8 @@ struct PrepareChatTurnRequest<'a> {
     file_context: &'a [String],
     assembly_start: Instant,
     telem: PrepareTurnTelemetry<'a>,
+    is_plan_subtask: bool,
+    plan_subtask_id: Option<&'a str>,
 }
 
 async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
@@ -298,6 +300,21 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
 
     record_first_latency_ms_since(ctx.telem.first_context_assembly_ms, ctx.assembly_start);
 
+    if ctx.is_plan_subtask || ctx.plan_subtask_id.is_some() {
+        if let Some(root) = payload.as_object_mut() {
+            if ctx.is_plan_subtask {
+                root.insert("is_plan_subtask".into(), json!(true));
+            }
+            if let Some(id) = ctx
+                .plan_subtask_id
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                root.insert("plan_subtask_id".into(), json!(id));
+            }
+        }
+    }
+
     payload
 }
 
@@ -372,6 +389,8 @@ pub(crate) struct ChatTurnSseFetchRequest<'a> {
     /// Lines from the previous headless tool round that must be cleared
     /// before the next SSE stream starts rendering.
     pub pre_clear_lines: usize,
+    pub is_plan_subtask: bool,
+    pub plan_subtask_id: Option<&'a str>,
 }
 
 pub(crate) async fn fetch_chat_turn_sse(
@@ -406,6 +425,8 @@ pub(crate) async fn fetch_chat_turn_sse(
         telem,
         perm_manager,
         pre_clear_lines,
+        is_plan_subtask,
+        plan_subtask_id,
     } = ctx;
 
     let payload = prepare_chat_turn_payload(PrepareChatTurnRequest {
@@ -434,6 +455,8 @@ pub(crate) async fn fetch_chat_turn_sse(
         file_context,
         assembly_start,
         telem,
+        is_plan_subtask,
+        plan_subtask_id,
     })
     .await;
 

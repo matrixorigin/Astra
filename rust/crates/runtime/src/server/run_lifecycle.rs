@@ -175,6 +175,9 @@ impl AgenticRunLifecycleService {
         use crate::pipeline::step_protocol::InMemoryIdempotencyCache;
         use crate::semantic_dedup::SemanticDedup;
         use crate::turn::chat_turn_heuristics::infer_task_execution_profile;
+        use crate::turn::stop_hooks_yaml::{
+            detect_turn_hook_sets, is_plan_subtask_from_chat_context, project_root_for_stop_hooks,
+        };
         use crate::turn::turn_guard::TurnGuard;
 
         let user_message = json!({
@@ -184,6 +187,20 @@ impl AgenticRunLifecycleService {
 
         let max_turns = request.max_candidates.max(1) as usize;
         let task_profile = infer_task_execution_profile(&request.message);
+        let edge_ctx = Self::extract_edge_context(request);
+        let project_root_buf = project_root_for_stop_hooks(&edge_ctx);
+        let hook_sets = project_root_buf
+            .as_ref()
+            .map(|root| {
+                detect_turn_hook_sets(
+                    root.as_path(),
+                    task_profile,
+                    is_plan_subtask_from_chat_context(&request.context),
+                )
+            })
+            .unwrap_or_default();
+        let workspace_root_hint =
+            project_root_buf.map(|p| p.to_string_lossy().into_owned());
 
         AgenticLoopState {
             messages: vec![user_message],
@@ -230,8 +247,11 @@ impl AgenticRunLifecycleService {
             cancel_flag: None,
             cancel_token: None,
             delegation_engine: None,
-            stop_hooks: Vec::new(),
+            stop_hooks: hook_sets.stop_hooks,
             stop_hook_runs: 0,
+            teammate_idle_hooks: hook_sets.teammate_idle_hooks,
+            teammate_idle_hook_runs: 0,
+            workspace_root_hint,
             consecutive_same_error: 0,
             last_error_category: None,
         }
@@ -754,6 +774,11 @@ impl SubRunExecutor for ServerSubRunExecutor {
     ) -> Result<mo_agent_services::coordination::AgentResult, String> {
         use crate::pipeline::step_protocol::InMemoryIdempotencyCache;
         use crate::semantic_dedup::SemanticDedup;
+        use crate::turn::chat_turn_heuristics::infer_task_execution_profile;
+        use crate::turn::stop_hooks_yaml::{
+            detect_turn_hook_sets, is_plan_subtask_from_delegation_context,
+            project_root_from_delegation_context,
+        };
         use crate::turn::turn_guard::TurnGuard;
 
         // Build edge profile from agent's system prompt and metadata.
@@ -800,6 +825,21 @@ impl SubRunExecutor for ServerSubRunExecutor {
             "content": full_task,
         });
 
+        let task_profile = infer_task_execution_profile(&full_task);
+        let project_root_buf = project_root_from_delegation_context(&config.context);
+        let hook_sets = project_root_buf
+            .as_ref()
+            .map(|root| {
+                detect_turn_hook_sets(
+                    root.as_path(),
+                    task_profile,
+                    is_plan_subtask_from_delegation_context(&config.context),
+                )
+            })
+            .unwrap_or_default();
+        let workspace_root_hint =
+            project_root_buf.map(|p| p.to_string_lossy().into_owned());
+
         let mut loop_state = AgenticLoopState {
             messages: vec![user_message],
             tool_results: Vec::new(),
@@ -839,14 +879,17 @@ impl SubRunExecutor for ServerSubRunExecutor {
             all_selected_skills: Vec::new(),
             message: full_task,
             recent_tools: Vec::new(),
-            task_profile: crate::turn::chat_turn_heuristics::TaskExecutionProfile::default(),
+            task_profile,
             api: mo_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap(),
             api_token: String::new(),
             cancel_flag: config.pause_flag.clone(),
             cancel_token: None,
             delegation_engine: None,
-            stop_hooks: Vec::new(),
+            stop_hooks: hook_sets.stop_hooks,
             stop_hook_runs: 0,
+            teammate_idle_hooks: hook_sets.teammate_idle_hooks,
+            teammate_idle_hook_runs: 0,
+            workspace_root_hint,
             consecutive_same_error: 0,
             last_error_category: None,
         };
@@ -1210,6 +1253,32 @@ mod tests {
         req.max_candidates = 0;
         let state = svc.build_initial_state(&req, "s", "r");
         assert_eq!(state.max_turns, 1);
+    }
+
+    #[test]
+    fn build_initial_state_loads_stop_hooks_from_edge_profile_cwd() {
+        let dir = tempfile::tempdir().unwrap();
+        let mo = dir.path().join(".mo-agent");
+        std::fs::create_dir_all(&mo).unwrap();
+        std::fs::write(
+            mo.join("stop-hooks.yaml"),
+            "version: 1\nauto_detect: false\nhooks:\n  - label: cloud_hook\n    command: true\n",
+        )
+        .unwrap();
+
+        let svc = test_service();
+        let mut req = test_request("implement a fix");
+        req.context = Some(serde_json::json!({
+            "edge_profile": { "cwd": dir.path().to_str().unwrap() }
+        }).as_object().unwrap().clone());
+
+        let state = svc.build_initial_state(&req, "s", "r");
+        assert_eq!(state.stop_hooks.len(), 1);
+        assert_eq!(state.stop_hooks[0].label, "cloud_hook");
+        assert_eq!(
+            state.workspace_root_hint.as_deref(),
+            Some(dir.path().to_str().unwrap())
+        );
     }
 
     #[test]

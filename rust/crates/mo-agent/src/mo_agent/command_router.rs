@@ -63,6 +63,7 @@ pub(super) async fn execute_cli_command(
                 skill_registry: crate::skill_instructions::empty_registry(),
                 plan_only_chat: false,
                 is_plan_subtask: false,
+                plan_subtask_id: None,
             })
             .await
             {
@@ -88,6 +89,7 @@ pub(super) async fn execute_cli_command(
                         skill_registry: crate::skill_instructions::empty_registry(),
                         plan_only_chat: false,
                         is_plan_subtask: false,
+                        plan_subtask_id: None,
                     })
                     .await?
                 }
@@ -296,6 +298,7 @@ pub(super) async fn execute_cli_command(
                 skill_registry: crate::skill_instructions::empty_registry(),
                 plan_only_chat: false,
                 is_plan_subtask: false,
+                plan_subtask_id: None,
             })
             .await
             {
@@ -321,6 +324,7 @@ pub(super) async fn execute_cli_command(
                         skill_registry: crate::skill_instructions::empty_registry(),
                         plan_only_chat: false,
                         is_plan_subtask: false,
+                        plan_subtask_id: None,
                     })
                     .await?
                 }

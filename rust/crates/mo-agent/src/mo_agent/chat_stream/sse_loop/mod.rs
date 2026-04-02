@@ -22,8 +22,9 @@ use mo_agent_runtime::{
     turn::agentic_loop_host::{AgenticLoopState, run_agentic_loop_with_host},
     turn::agentic_turn_telemetry::step_recorder_chat_ephemeral_run_id,
     turn::chat_history_openai::openai_messages_from_repl_history,
-    turn::chat_turn_heuristics::{TaskExecutionProfile, infer_task_execution_profile},
+    turn::chat_turn_heuristics::infer_task_execution_profile,
     turn::edge_prompt_context::detect_project_languages,
+    turn::stop_hooks_yaml::detect_turn_hook_sets,
     turn::tool_health::ToolHealthTracker,
     turn::tool_schema_prune::openai_tool_names_from_schemas,
     turn::turn_guard::TurnGuard,
@@ -37,57 +38,6 @@ use agentic_sse_loop::{
 };
 use cli_loop_host::CliAgenticLoopHost;
 use serde_json::json;
-
-/// Auto-detect stop hooks from project root based on build system markers.
-fn detect_stop_hooks(
-    project_root: &std::path::Path,
-    task_profile: TaskExecutionProfile,
-    is_plan_subtask: bool,
-) -> Vec<mo_agent_runtime::turn::stop_hooks::StopHook> {
-    use mo_agent_runtime::turn::stop_hooks::StopHook;
-
-    // Plan subtasks skip stop hooks — the durable task system runs
-    // global verification (build/test/lint) once at plan completion.
-    if is_plan_subtask {
-        return Vec::new();
-    }
-
-    if !task_profile.verification_required {
-        return Vec::new();
-    }
-
-    // Detect available project tools (used as context hints, not hardcoded commands)
-    let mut tool_hints = Vec::new();
-    if project_root.join("rust/Cargo.toml").exists() || project_root.join("Cargo.toml").exists() {
-        tool_hints.push("Rust/Cargo (cargo check, cargo test)");
-    }
-    if project_root.join("package.json").exists() {
-        tool_hints.push("Node.js/npm (npm run build, npm test)");
-    }
-    if project_root.join("go.mod").exists() {
-        tool_hints.push("Go (go vet, go test)");
-    }
-    if project_root.join("pyproject.toml").exists() || project_root.join("setup.py").exists() {
-        tool_hints.push("Python (pytest, mypy, ruff)");
-    }
-
-    if tool_hints.is_empty() {
-        return Vec::new();
-    }
-
-    // Single smart hook: LLM decides what to verify based on its own changes
-    let tools_list = tool_hints.join(", ");
-    vec![StopHook {
-        label: "verify-changes".into(),
-        command: format!(
-            "Based on the files you actually modified, run ONLY the relevant checks. \
-             Available tools: {tools_list}. \
-             Skip checks unrelated to your changes. \
-             If you only modified files outside the project (e.g. /tmp), skip all project checks."
-        ),
-        working_dir: Some(project_root.to_string_lossy().to_string()),
-    }]
-}
 
 pub(crate) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResult, String> {
     let start = Instant::now();
@@ -151,7 +101,11 @@ pub(crate) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
         perm_manager: p.perm_manager,
         valid_tool_names,
         pending_clear_lines: 0,
+        is_plan_subtask: p.is_plan_subtask,
+        plan_subtask_id: p.plan_subtask_id,
     };
+
+    let hook_sets = detect_turn_hook_sets(&project_root, task_profile, p.is_plan_subtask);
 
     let mut state = AgenticLoopState {
         messages,
@@ -200,8 +154,11 @@ pub(crate) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
         cancel_flag: None,
         cancel_token: None,
         delegation_engine: None,
-        stop_hooks: detect_stop_hooks(&project_root, task_profile, p.is_plan_subtask),
+        stop_hooks: hook_sets.stop_hooks,
         stop_hook_runs: 0,
+        teammate_idle_hooks: hook_sets.teammate_idle_hooks,
+        teammate_idle_hook_runs: 0,
+        workspace_root_hint: Some(project_root.to_string_lossy().into_owned()),
         consecutive_same_error: 0,
         last_error_category: None,
     };
@@ -254,46 +211,124 @@ pub(crate) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
 
 #[cfg(test)]
 mod tests {
-    use super::detect_stop_hooks;
+    use super::detect_turn_hook_sets;
     use mo_agent_runtime::turn::chat_turn_heuristics::infer_task_execution_profile;
     use std::path::Path;
+    use tempfile::tempdir;
 
     #[test]
     fn read_only_requests_skip_stop_hooks() {
-        let hooks = detect_stop_hooks(
+        let s = detect_turn_hook_sets(
             Path::new("."),
             infer_task_execution_profile("review 最新的commit"),
             false,
         );
-        assert!(hooks.is_empty());
-        let hooks = detect_stop_hooks(
+        assert!(s.stop_hooks.is_empty());
+        let s = detect_turn_hook_sets(
             Path::new("."),
             infer_task_execution_profile("explain this diff"),
             false,
         );
-        assert!(hooks.is_empty());
+        assert!(s.stop_hooks.is_empty());
     }
 
     #[test]
     fn mutating_requests_keep_stop_hooks() {
-        let hooks = detect_stop_hooks(
+        let s = detect_turn_hook_sets(
             Path::new("."),
             infer_task_execution_profile("implement a fix for the failing test"),
             false,
         );
         // Smart hook returns a single "verify-changes" entry (if project detected)
         // or empty (if no project markers in cwd)
-        // Either is acceptable — the key behavior is it's not hardcoded commands
-        let _ = hooks;
+        let _ = s.stop_hooks;
     }
 
     #[test]
-    fn plan_subtask_skips_stop_hooks() {
-        let hooks = detect_stop_hooks(
-            Path::new("."),
-            infer_task_execution_profile("implement a fix for the failing test"),
-            true, // plan subtask
+    fn plan_subtask_ignores_when_stop_uses_task_completed() {
+        let dir = tempdir().unwrap();
+        let mo = dir.path().join(".mo-agent");
+        std::fs::create_dir_all(&mo).unwrap();
+        std::fs::write(
+            mo.join("stop-hooks.yaml"),
+            r#"version: 1
+auto_detect: false
+hooks:
+  - label: global
+    command: echo stop
+    when: stop
+  - label: sub
+    command: echo task
+    when: task_completed
+"#,
+        )
+        .unwrap();
+        let prof = infer_task_execution_profile("implement the subtask");
+        let s = detect_turn_hook_sets(dir.path(), prof, true);
+        assert_eq!(s.stop_hooks.len(), 1);
+        assert_eq!(s.stop_hooks[0].label, "sub");
+    }
+
+    #[test]
+    fn plan_subtask_empty_without_task_completed_hooks() {
+        let dir = tempdir().unwrap();
+        let mo = dir.path().join(".mo-agent");
+        std::fs::create_dir_all(&mo).unwrap();
+        std::fs::write(
+            mo.join("stop-hooks.yaml"),
+            "version: 1\nauto_detect: false\nhooks:\n  - label: only_stop\n    command: true\n    when: stop\n",
+        )
+        .unwrap();
+        let prof = infer_task_execution_profile("implement the subtask");
+        let s = detect_turn_hook_sets(dir.path(), prof, true);
+        assert!(s.stop_hooks.is_empty());
+    }
+
+    #[test]
+    fn teammate_idle_hooks_loaded_alongside_stop() {
+        let dir = tempdir().unwrap();
+        let mo = dir.path().join(".mo-agent");
+        std::fs::create_dir_all(&mo).unwrap();
+        std::fs::write(
+            mo.join("stop-hooks.yaml"),
+            r#"version: 1
+auto_detect: false
+hooks:
+  - label: fin
+    command: cargo check
+    when: stop
+  - label: after_delegate
+    command: ./scripts/sync-check.sh
+    when: teammate_idle
+"#,
+        )
+        .unwrap();
+        let s = detect_turn_hook_sets(
+            dir.path(),
+            infer_task_execution_profile("fix the bug"),
+            false,
         );
-        assert!(hooks.is_empty(), "plan subtasks should skip stop hooks");
+        assert_eq!(s.stop_hooks.len(), 1);
+        assert_eq!(s.teammate_idle_hooks.len(), 1);
+        assert_eq!(s.teammate_idle_hooks[0].label, "after_delegate");
+    }
+
+    #[test]
+    fn declarative_stop_hooks_apply_on_read_only_turn() {
+        let dir = tempdir().unwrap();
+        let mo = dir.path().join(".mo-agent");
+        std::fs::create_dir_all(&mo).unwrap();
+        std::fs::write(
+            mo.join("stop-hooks.yaml"),
+            "version: 1\nauto_detect: false\nhooks:\n  - label: audit\n    command: ./scripts/audit.sh\n",
+        )
+        .unwrap();
+        let s = detect_turn_hook_sets(
+            dir.path(),
+            infer_task_execution_profile("explain this file"),
+            false,
+        );
+        assert_eq!(s.stop_hooks.len(), 1);
+        assert_eq!(s.stop_hooks[0].label, "audit");
     }
 }

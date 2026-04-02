@@ -46,6 +46,33 @@ pub fn build_stop_hook_prompt(hooks: &[StopHook]) -> Option<serde_json::Value> {
     }))
 }
 
+/// Same as [`build_stop_hook_prompt`], but framed for post-delegation / teammate rounds.
+pub fn build_teammate_idle_hook_prompt(hooks: &[StopHook]) -> Option<serde_json::Value> {
+    if hooks.is_empty() {
+        return None;
+    }
+    let commands: Vec<String> = hooks
+        .iter()
+        .map(|h| {
+            if let Some(dir) = &h.working_dir {
+                format!("- `{}` (in `{dir}`) — {}", h.command, h.label)
+            } else {
+                format!("- `{}` — {}", h.command, h.label)
+            }
+        })
+        .collect();
+    Some(serde_json::json!({
+        "role": "user",
+        "content": format!(
+            "⚠️ TEAMMATE ROUND COMPLETE: Delegated agents have returned. Before continuing, run these checks using the bash tool:\n\
+             {}\n\n\
+             If any check fails, fix the issues and re-run the failing check. \
+             Then proceed with your plan.",
+            commands.join("\n")
+        )
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -88,5 +115,18 @@ mod tests {
         let content = msg["content"].as_str().unwrap();
         assert!(content.contains("cargo check"));
         assert!(content.contains("cargo clippy"));
+    }
+
+    #[test]
+    fn teammate_idle_prompt_differs() {
+        let hooks = vec![StopHook {
+            label: "sync-check".into(),
+            command: "make verify".into(),
+            working_dir: None,
+        }];
+        let msg = build_teammate_idle_hook_prompt(&hooks).unwrap();
+        let content = msg["content"].as_str().unwrap();
+        assert!(content.contains("TEAMMATE ROUND"));
+        assert!(content.contains("make verify"));
     }
 }

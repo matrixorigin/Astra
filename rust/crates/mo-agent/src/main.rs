@@ -4228,6 +4228,7 @@ mod tests {
             skill_registry: crate::skill_instructions::empty_registry(),
             plan_only_chat: false,
             is_plan_subtask: false,
+            plan_subtask_id: None,
         })
         .await
         .unwrap();
@@ -4272,6 +4273,7 @@ mod tests {
             skill_registry: crate::skill_instructions::empty_registry(),
             plan_only_chat: false,
             is_plan_subtask: false,
+            plan_subtask_id: None,
         })
         .await;
         assert!(result.is_err());
@@ -4332,6 +4334,7 @@ mod tests {
             skill_registry: crate::skill_instructions::empty_registry(),
             plan_only_chat: false,
             is_plan_subtask: false,
+            plan_subtask_id: None,
         })
         .await
         .unwrap();

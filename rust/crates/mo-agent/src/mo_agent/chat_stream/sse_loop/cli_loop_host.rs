@@ -55,6 +55,8 @@ pub(crate) struct CliAgenticLoopHost<'a> {
     /// Lines written to stderr between SSE turns (headless tool output, etc.)
     /// that the next `consume_turn_sse` must clear before streaming.
     pub pending_clear_lines: usize,
+    pub is_plan_subtask: bool,
+    pub plan_subtask_id: Option<&'a str>,
 }
 
 #[async_trait]
@@ -105,6 +107,8 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
             },
             perm_manager: self.perm_manager,
             pre_clear_lines: pre_clear,
+            is_plan_subtask: self.is_plan_subtask,
+            plan_subtask_id: self.plan_subtask_id,
         })
         .await?;
 

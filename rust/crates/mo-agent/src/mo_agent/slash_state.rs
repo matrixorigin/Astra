@@ -134,6 +134,7 @@ pub(super) async fn handle_state_command(
                     skill_registry: crate::skill_instructions::empty_registry(),
                     plan_only_chat: false,
                     is_plan_subtask: false,
+                    plan_subtask_id: None,
                 }) => r,
                 _ = tokio::signal::ctrl_c() => {
                     eprintln!("{}", "  Interrupted.".dim());
@@ -211,6 +212,7 @@ pub(super) async fn handle_state_command(
                         skill_registry: crate::skill_instructions::empty_registry(),
                         plan_only_chat: false,
                         is_plan_subtask: false,
+                        plan_subtask_id: None,
                     })
                     .await;
 
@@ -270,6 +272,7 @@ pub(super) async fn handle_state_command(
                                 skill_registry: crate::skill_instructions::empty_registry(),
                                 plan_only_chat: false,
                                 is_plan_subtask: false,
+                                plan_subtask_id: None,
                             })
                             .await;
                             if let Ok(sr2) = synth_result {

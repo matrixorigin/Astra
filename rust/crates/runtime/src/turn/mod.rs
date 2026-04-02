@@ -72,6 +72,7 @@ pub mod sse_stream_host;
 pub mod stall;
 pub mod state;
 pub mod stop_hooks;
+pub mod stop_hooks_yaml;
 pub mod stream_events;
 pub mod tail_persist;
 pub mod task;

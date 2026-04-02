@@ -22,6 +22,11 @@ pub struct ChatStreamRequest {
     pub max_candidates: u32,
     #[serde(default)]
     pub explain: bool,
+    /// Forwarded into server `context` for stop-hooks (`when: task_completed`) on cloud runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_subtask_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub is_plan_subtask: Option<bool>,
     /// Design §5.5 — identifies which edge executor should run tool callbacks.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub edge_executor_id: Option<String>,
@@ -44,6 +49,8 @@ impl ChatStreamRequest {
             context: None,
             max_candidates: default_max_candidates(),
             explain: false,
+            plan_subtask_id: None,
+            is_plan_subtask: None,
             edge_executor_id: None,
             capabilities: Vec::new(),
         }
@@ -376,6 +383,8 @@ mod tests {
             context: None,
             max_candidates: 3,
             explain: true,
+            plan_subtask_id: Some("t1".into()),
+            is_plan_subtask: Some(true),
             edge_executor_id: Some("edge-1".into()),
             capabilities: vec!["bash".into(), "fs".into()],
         };
