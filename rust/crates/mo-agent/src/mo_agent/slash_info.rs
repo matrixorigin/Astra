@@ -738,6 +738,7 @@ pub(super) async fn handle_info_command(
                 tool_health_entries: &state.tool_health_entries,
                 skill_registry: crate::skill_instructions::empty_registry(),
                 plan_only_chat: false,
+                is_plan_subtask: false,
             })
             .await?;
             if let Some(session_id) = sr.session_id.as_deref() {

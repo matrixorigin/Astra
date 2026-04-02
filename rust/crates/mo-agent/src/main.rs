@@ -3986,6 +3986,7 @@ mod tests {
             tool_health_entries: &[],
             skill_registry: crate::skill_instructions::empty_registry(),
             plan_only_chat: false,
+            is_plan_subtask: false,
         })
         .await
         .unwrap();
@@ -4029,6 +4030,7 @@ mod tests {
             tool_health_entries: &[],
             skill_registry: crate::skill_instructions::empty_registry(),
             plan_only_chat: false,
+            is_plan_subtask: false,
         })
         .await;
         assert!(result.is_err());
@@ -4088,6 +4090,7 @@ mod tests {
             tool_health_entries: &[],
             skill_registry: crate::skill_instructions::empty_registry(),
             plan_only_chat: false,
+            is_plan_subtask: false,
         })
         .await
         .unwrap();

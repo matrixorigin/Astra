@@ -169,8 +169,8 @@ async fn maybe_auto_compact(
         tool_health_entries: &[],
         skill_registry: &state.skill_registry,
         plan_only_chat: false,
-    })
-    .await;
+        is_plan_subtask: false,
+    })    .await;
 
     if let Ok(result) = compact_result {
         apply_auto_compact_result(state, ctx, token, result).await?;
@@ -281,6 +281,7 @@ async fn run_chat_turn(
             tool_health_entries: &state.tool_health_entries,
             skill_registry: &state.skill_registry,
             plan_only_chat: state.chat_plan_only && state.current_plan_subtask_id.is_none(),
+            is_plan_subtask: state.current_plan_subtask_id.is_some(),
         }) => TurnAttempt::Completed(Box::new(result)),
         _ = tokio::signal::ctrl_c() => {
             eprintln!("\n{}", "  Interrupted.".dim());

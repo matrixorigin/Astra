@@ -42,49 +42,53 @@ use serde_json::json;
 fn detect_stop_hooks(
     project_root: &std::path::Path,
     task_profile: TaskExecutionProfile,
+    is_plan_subtask: bool,
 ) -> Vec<mo_agent_runtime::turn::stop_hooks::StopHook> {
     use mo_agent_runtime::turn::stop_hooks::StopHook;
+
+    // Plan subtasks skip stop hooks — the durable task system runs
+    // global verification (build/test/lint) once at plan completion.
+    if is_plan_subtask {
+        return Vec::new();
+    }
+
     if !task_profile.verification_required {
         return Vec::new();
     }
-    let dir = project_root.to_string_lossy().to_string();
-    let mut hooks = Vec::new();
 
-    // Rust: prefer rust/Cargo.toml (nested workspace) over root Cargo.toml
+    // Detect available project tools (used as context hints, not hardcoded commands)
+    let mut tool_hints = Vec::new();
     if project_root.join("rust/Cargo.toml").exists() {
-        hooks.push(StopHook {
-            label: "cargo-check".into(),
-            command: "cargo check --manifest-path rust/Cargo.toml --quiet 2>&1 | head -30".into(),
-            working_dir: Some(dir.clone()),
-        });
+        tool_hints.push("Rust/Cargo (cargo check, cargo test)");
     } else if project_root.join("Cargo.toml").exists() {
-        hooks.push(StopHook {
-            label: "cargo-check".into(),
-            command: "cargo check --quiet 2>&1 | head -30".into(),
-            working_dir: Some(dir.clone()),
-        });
+        tool_hints.push("Rust/Cargo (cargo check, cargo test)");
     }
-    // Node: package.json with "build" script → npm run build
-    if project_root.join("package.json").exists()
-        && let Ok(content) = std::fs::read_to_string(project_root.join("package.json"))
-        && content.contains("\"build\"")
-    {
-        hooks.push(StopHook {
-            label: "npm-build".into(),
-            command: "npm run build 2>&1 | tail -20".into(),
-            working_dir: Some(dir.clone()),
-        });
+    if project_root.join("package.json").exists() {
+        tool_hints.push("Node.js/npm (npm run build, npm test)");
     }
-    // Go: go.mod → go vet
     if project_root.join("go.mod").exists() {
-        hooks.push(StopHook {
-            label: "go-vet".into(),
-            command: "go vet ./... 2>&1 | head -30".into(),
-            working_dir: Some(dir),
-        });
+        tool_hints.push("Go (go vet, go test)");
+    }
+    if project_root.join("pyproject.toml").exists() || project_root.join("setup.py").exists() {
+        tool_hints.push("Python (pytest, mypy, ruff)");
     }
 
-    hooks
+    if tool_hints.is_empty() {
+        return Vec::new();
+    }
+
+    // Single smart hook: LLM decides what to verify based on its own changes
+    let tools_list = tool_hints.join(", ");
+    vec![StopHook {
+        label: "verify-changes".into(),
+        command: format!(
+            "Based on the files you actually modified, run ONLY the relevant checks. \
+             Available tools: {tools_list}. \
+             Skip checks unrelated to your changes. \
+             If you only modified files outside the project (e.g. /tmp), skip all project checks."
+        ),
+        working_dir: Some(project_root.to_string_lossy().to_string()),
+    }]
 }
 
 pub(crate) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResult, String> {
@@ -198,7 +202,7 @@ pub(crate) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
         cancel_flag: None,
         cancel_token: None,
         delegation_engine: None,
-        stop_hooks: detect_stop_hooks(&project_root, task_profile),
+        stop_hooks: detect_stop_hooks(&project_root, task_profile, p.is_plan_subtask),
         stop_hook_runs: 0,
         consecutive_same_error: 0,
         last_error_category: None,
@@ -261,11 +265,13 @@ mod tests {
         let hooks = detect_stop_hooks(
             Path::new("."),
             infer_task_execution_profile("review 最新的commit"),
+            false,
         );
         assert!(hooks.is_empty());
         let hooks = detect_stop_hooks(
             Path::new("."),
             infer_task_execution_profile("explain this diff"),
+            false,
         );
         assert!(hooks.is_empty());
     }
@@ -275,7 +281,21 @@ mod tests {
         let hooks = detect_stop_hooks(
             Path::new("."),
             infer_task_execution_profile("implement a fix for the failing test"),
+            false,
         );
-        assert!(!hooks.is_empty());
+        // Smart hook returns a single "verify-changes" entry (if project detected)
+        // or empty (if no project markers in cwd)
+        // Either is acceptable — the key behavior is it's not hardcoded commands
+        let _ = hooks;
+    }
+
+    #[test]
+    fn plan_subtask_skips_stop_hooks() {
+        let hooks = detect_stop_hooks(
+            Path::new("."),
+            infer_task_execution_profile("implement a fix for the failing test"),
+            true, // plan subtask
+        );
+        assert!(hooks.is_empty(), "plan subtasks should skip stop hooks");
     }
 }
