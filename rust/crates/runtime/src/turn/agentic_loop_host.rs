@@ -559,11 +559,8 @@ fn try_write_heavy_checkpoint(state: &mut AgenticLoopState) {
         return;
     };
     let cp = StepCheckpoint::Heavy(Box::new(heavy));
-    let _ = step_checkpoint::write_step_checkpoint(
-        sid,
-        state.step_recorder.summary().checkpoints,
-        &cp,
-    );
+    let _ =
+        step_checkpoint::write_step_checkpoint(sid, state.step_recorder.summary().checkpoints, &cp);
     state.last_heavy_checkpoint = Some(cp);
 }
 

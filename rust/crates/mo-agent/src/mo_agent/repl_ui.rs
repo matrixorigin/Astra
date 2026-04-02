@@ -2042,7 +2042,8 @@ mod tests {
         assert!(plain.starts_with('╰'));
         assert!(plain.ends_with('╯'));
         assert!(plain.contains("10/12 shown"));
-        assert!(plain.contains("→/Tab accept"));
+        assert!(plain.contains("Tab complete"));
+        assert!(plain.contains("→ accept"));
         assert!(plain.contains("Enter run"));
         assert!(plain.contains("← edit"));
         assert!(plain.contains("Esc close"));
