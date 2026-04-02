@@ -2309,14 +2309,18 @@ async fn run_plan_execution(
                 // Attach a verification gate for this subtask's acceptance criteria.
                 // The delegation engine will check sub-run results against these
                 // criteria before aggregation, retrying on failure.
+                //
+                // Always clone from the *original* gate-less engine to prevent a
+                // previous subtask's gate from leaking into the next subtask when
+                // `create_gate_for_subtask` returns None.
                 if let Some(ref base_engine) = state.delegation_engine {
                     let work_dir = std::env::current_dir().unwrap_or_default();
-                    if let Some(gate) =
-                        durable_bridge::create_gate_for_subtask(durable, next_id, work_dir)
-                    {
-                        state.delegation_engine =
-                            Some(std::sync::Arc::new(base_engine.clone_with_gate(gate)));
-                    }
+                    state.delegation_engine = Some(std::sync::Arc::new(
+                        match durable_bridge::create_gate_for_subtask(durable, next_id, work_dir) {
+                            Some(gate) => base_engine.clone_with_gate(gate),
+                            None => base_engine.clone_without_gate(),
+                        },
+                    ));
                 }
             }
 
