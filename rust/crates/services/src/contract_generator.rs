@@ -32,6 +32,8 @@ pub struct ProjectDetection {
     pub has_go_mod: bool,
     pub has_makefile: bool,
     pub has_jest_config: bool,
+    /// True when `test_*.py` or `*_test.py` files exist (bare Python project)
+    pub has_test_py: bool,
     /// Override: if set, used as-is
     pub build_cmd_override: Option<String>,
     /// Override: if set, used as-is
@@ -43,6 +45,18 @@ pub struct ProjectDetection {
 impl ProjectDetection {
     /// Auto-detect from filesystem at given root.
     pub fn detect(root: &std::path::Path) -> Self {
+        let has_test_py = root
+            .read_dir()
+            .ok()
+            .map(|entries| {
+                entries.filter_map(|e| e.ok()).any(|e| {
+                    let n = e.file_name();
+                    let name = n.to_string_lossy();
+                    (name.starts_with("test_") || name.ends_with("_test.py"))
+                        && name.ends_with(".py")
+                })
+            })
+            .unwrap_or(false);
         Self {
             has_cargo_toml: root.join("Cargo.toml").exists(),
             has_package_json: root.join("package.json").exists(),
@@ -52,6 +66,7 @@ impl ProjectDetection {
             has_makefile: root.join("Makefile").exists(),
             has_jest_config: root.join("jest.config.js").exists()
                 || root.join("jest.config.ts").exists(),
+            has_test_py,
             build_cmd_override: None,
             test_cmd_override: None,
             lint_cmd_override: None,
@@ -90,7 +105,7 @@ pub fn detect_test_command(det: &ProjectDetection) -> Option<String> {
         } else {
             Some("npm test".into())
         }
-    } else if det.has_pyproject_toml || det.has_setup_py {
+    } else if det.has_pyproject_toml || det.has_setup_py || det.has_test_py {
         Some("pytest".into())
     } else if det.has_go_mod {
         Some("go test ./...".into())
@@ -936,6 +951,29 @@ mod tests {
         assert_eq!(detect_build_command(&det), None);
         assert_eq!(detect_test_command(&det), Some("pytest".into()));
         assert_eq!(detect_lint_command(&det), Some("ruff check .".into()));
+    }
+
+    #[test]
+    fn detect_test_cmd_bare_python() {
+        // Bare Python project: only test_*.py files, no pyproject.toml or setup.py
+        let det = ProjectDetection {
+            has_test_py: true,
+            ..Default::default()
+        };
+        assert_eq!(detect_build_command(&det), None);
+        assert_eq!(detect_test_command(&det), Some("pytest".into()));
+    }
+
+    #[test]
+    fn detect_bare_python_from_filesystem() {
+        let tmp = std::env::temp_dir().join(format!("detect-py-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(tmp.join("main.py"), "def add(a,b): return a+b\n").unwrap();
+        std::fs::write(tmp.join("test_main.py"), "def test_add(): pass\n").unwrap();
+        let det = ProjectDetection::detect(&tmp);
+        assert!(det.has_test_py, "should detect test_*.py files");
+        assert_eq!(detect_test_command(&det), Some("pytest".into()));
+        std::fs::remove_dir_all(&tmp).ok();
     }
 
     #[test]

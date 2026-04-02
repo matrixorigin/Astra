@@ -184,6 +184,7 @@ pub(super) fn strip_xml_tags_inplace(text: &mut String) {
 /// the actual answer.  This function removes such preambles by detecting:
 /// - Lines starting with common narration patterns
 /// - Keeps content starting from markdown structure (headers, bold, lists)
+#[allow(dead_code)]
 pub(super) fn strip_leading_narration(text: &mut String) {
     // Patterns that indicate narration (case-insensitive matching)
     const NARRATION_STARTS: &[&str] = &[
@@ -260,6 +261,7 @@ pub(super) fn strip_leading_narration(text: &mut String) {
 /// Returns `true` when `text` contains an opened but not-yet-closed XML tag
 /// from the known set of LLM thinking tags.  Used to suppress premature
 /// rendering of text that will be stripped once the closing tag arrives.
+#[allow(dead_code)]
 pub(super) fn has_open_xml_tag(text: &str) -> bool {
     const TAGS: &[&str] = &["reflect", "thinking", "think", "inner_monologue"];
     for tag in TAGS {

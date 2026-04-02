@@ -1508,6 +1508,25 @@ impl TaskBranchOps for NoopBranchOps {
 
 // ── Filesystem helpers for LocalFileBranchOps ──
 
+/// Directories to skip during snapshot copy / diff — these are either internal
+/// state, VCS data, or build artifacts that should never be part of a snapshot.
+const SNAPSHOT_EXCLUDED_DIRS: &[&str] = &[
+    ".mo-session",
+    ".git",
+    "target",
+    "node_modules",
+    "__pycache__",
+    ".venv",
+    "dist",
+    "build",
+    ".tox",
+];
+
+fn is_snapshot_excluded(name: &std::ffi::OsStr) -> bool {
+    name.to_str()
+        .is_some_and(|n| SNAPSHOT_EXCLUDED_DIRS.contains(&n))
+}
+
 fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> Result<(), String> {
     std::fs::create_dir_all(dst).map_err(|e| format!("mkdir {}: {e}", dst.display()))?;
     if !src.exists() {
@@ -1518,6 +1537,9 @@ fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> Result<()
         let src_path = entry.path();
         let dst_path = dst.join(entry.file_name());
         if src_path.is_dir() {
+            if is_snapshot_excluded(&entry.file_name()) {
+                continue;
+            }
             copy_dir_recursive(&src_path, &dst_path)?;
         } else {
             std::fs::copy(&src_path, &dst_path)
@@ -1537,6 +1559,9 @@ fn count_changed_files(snap: &std::path::Path, work: &std::path::Path) -> Result
         let work_path = entry.path();
         let snap_path = snap.join(entry.file_name());
         if work_path.is_dir() {
+            if is_snapshot_excluded(&entry.file_name()) {
+                continue;
+            }
             changed += count_changed_files(&snap_path, &work_path)?;
         } else if !snap_path.exists() {
             changed += 1; // new file
@@ -6104,6 +6129,51 @@ Time:        3.456 s
         let result = truncate("hello world", 5);
         assert!(result.starts_with("hello"));
         assert!(result.contains("[truncated]"));
+    }
+
+    // ─── Snapshot exclusion tests ─────────────────────────────────────────────
+
+    #[test]
+    fn snapshot_excludes_mo_session_dir() {
+        let tmp = std::env::temp_dir().join(format!("snap-excl-{}", uuid::Uuid::new_v4()));
+        let src = tmp.join("src");
+        std::fs::create_dir_all(src.join(".mo-session/contracts/deep")).unwrap();
+        std::fs::write(src.join(".mo-session/contracts/deep/data.json"), "{}").unwrap();
+        std::fs::create_dir_all(src.join(".git/objects")).unwrap();
+        std::fs::write(src.join(".git/objects/abc"), "blob").unwrap();
+        std::fs::create_dir_all(src.join("target/debug")).unwrap();
+        std::fs::write(src.join("target/debug/bin"), "elf").unwrap();
+        std::fs::write(src.join("main.py"), "print('hi')").unwrap();
+        std::fs::create_dir_all(src.join("lib")).unwrap();
+        std::fs::write(src.join("lib/util.py"), "x=1").unwrap();
+
+        let dst = tmp.join("snapshot");
+        copy_dir_recursive(&src, &dst).unwrap();
+
+        // Source files ARE copied
+        assert!(dst.join("main.py").exists());
+        assert!(dst.join("lib/util.py").exists());
+        // Excluded dirs are NOT copied
+        assert!(
+            !dst.join(".mo-session").exists(),
+            ".mo-session should be excluded"
+        );
+        assert!(!dst.join(".git").exists(), ".git should be excluded");
+        assert!(!dst.join("target").exists(), "target should be excluded");
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn snapshot_exclusion_helper() {
+        assert!(is_snapshot_excluded(std::ffi::OsStr::new(".mo-session")));
+        assert!(is_snapshot_excluded(std::ffi::OsStr::new(".git")));
+        assert!(is_snapshot_excluded(std::ffi::OsStr::new("target")));
+        assert!(is_snapshot_excluded(std::ffi::OsStr::new("node_modules")));
+        assert!(is_snapshot_excluded(std::ffi::OsStr::new("__pycache__")));
+        assert!(!is_snapshot_excluded(std::ffi::OsStr::new("src")));
+        assert!(!is_snapshot_excluded(std::ffi::OsStr::new("lib")));
+        assert!(!is_snapshot_excluded(std::ffi::OsStr::new("main.py")));
     }
 
     // ─── MatrixOneDurableTaskLifecycle integration test scaffold ────────────
