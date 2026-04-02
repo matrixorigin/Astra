@@ -175,14 +175,8 @@ const SLASH_FIRST_TOKEN_COMPLETIONS: &[(&str, &[(&str, &str)])] = &[
         "/stats",
         &[("history", "Aggregate stats across recent sessions")],
     ),
-    (
-        "/health",
-        &[("detail", "Per-tool health breakdown")],
-    ),
-    (
-        "/sync",
-        &[("log", "Recent sync event log")],
-    ),
+    ("/health", &[("detail", "Per-tool health breakdown")]),
+    ("/sync", &[("log", "Recent sync event log")]),
     (
         "/learn",
         &[

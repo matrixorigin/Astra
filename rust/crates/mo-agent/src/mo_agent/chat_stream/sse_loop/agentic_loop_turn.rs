@@ -300,18 +300,14 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
 
     record_first_latency_ms_since(ctx.telem.first_context_assembly_ms, ctx.assembly_start);
 
-    if ctx.is_plan_subtask || ctx.plan_subtask_id.is_some() {
-        if let Some(root) = payload.as_object_mut() {
-            if ctx.is_plan_subtask {
-                root.insert("is_plan_subtask".into(), json!(true));
-            }
-            if let Some(id) = ctx
-                .plan_subtask_id
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-            {
-                root.insert("plan_subtask_id".into(), json!(id));
-            }
+    if (ctx.is_plan_subtask || ctx.plan_subtask_id.is_some())
+        && let Some(root) = payload.as_object_mut()
+    {
+        if ctx.is_plan_subtask {
+            root.insert("is_plan_subtask".into(), json!(true));
+        }
+        if let Some(id) = ctx.plan_subtask_id.map(str::trim).filter(|s| !s.is_empty()) {
+            root.insert("plan_subtask_id".into(), json!(id));
         }
     }
 

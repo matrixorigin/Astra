@@ -175,9 +175,7 @@ fn load_declarative_config(project_root: &Path) -> FileRoot {
 }
 
 fn resolve_working_dir(project_root: &Path, wd: Option<&str>) -> String {
-    let rel = wd
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty() && *s != ".");
+    let rel = wd.map(|s| s.trim()).filter(|s| !s.is_empty() && *s != ".");
     let Some(rel) = rel else {
         return project_root.to_string_lossy().into_owned();
     };
@@ -220,11 +218,7 @@ fn normalize_when(raw: &str) -> String {
     raw.trim().to_lowercase().replace('-', "_")
 }
 
-fn declarative_hooks_for_when(
-    project_root: &Path,
-    cfg: &FileRoot,
-    phase: &str,
-) -> Vec<StopHook> {
+fn declarative_hooks_for_when(project_root: &Path, cfg: &FileRoot, phase: &str) -> Vec<StopHook> {
     let want = normalize_when(phase);
     let mut out = Vec::new();
     for h in &cfg.hooks {
@@ -254,7 +248,10 @@ fn declarative_stop_hooks(project_root: &Path, cfg: &FileRoot) -> Vec<StopHook> 
     declarative_hooks_for_when(project_root, cfg, "stop")
 }
 
-fn auto_detect_verify_changes_hook(project_root: &Path, task_profile: TaskExecutionProfile) -> Vec<StopHook> {
+fn auto_detect_verify_changes_hook(
+    project_root: &Path,
+    task_profile: TaskExecutionProfile,
+) -> Vec<StopHook> {
     if !task_profile.verification_required {
         return Vec::new();
     }
@@ -297,8 +294,7 @@ pub fn detect_turn_hook_sets(
     is_plan_subtask: bool,
 ) -> TurnHookSets {
     let cfg = load_declarative_config(project_root);
-    let teammate_idle_hooks =
-        declarative_hooks_for_when(project_root, &cfg, "teammate_idle");
+    let teammate_idle_hooks = declarative_hooks_for_when(project_root, &cfg, "teammate_idle");
 
     if is_plan_subtask {
         let mut hooks = declarative_hooks_for_when(project_root, &cfg, "task_completed");

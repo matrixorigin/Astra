@@ -397,10 +397,7 @@ fn merge_workspace_hint_into_delegation_request(
         return;
     };
     let c = &mut request.context;
-    if c.contains_key("git_root")
-        || c.contains_key("workspace_root")
-        || c.contains_key("cwd")
-    {
+    if c.contains_key("git_root") || c.contains_key("workspace_root") || c.contains_key("cwd") {
         return;
     }
     c.insert("cwd".to_string(), Value::String(root.to_string()));
@@ -677,9 +674,8 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
 
         if !delegation_results.is_empty()
             && state.teammate_idle_hook_runs == 0
-            && let Some(prompt) = crate::turn::stop_hooks::build_teammate_idle_hook_prompt(
-                &state.teammate_idle_hooks,
-            )
+            && let Some(prompt) =
+                crate::turn::stop_hooks::build_teammate_idle_hook_prompt(&state.teammate_idle_hooks)
         {
             state.teammate_idle_hook_runs = 1;
             if !quiet {

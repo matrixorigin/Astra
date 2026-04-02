@@ -199,8 +199,7 @@ impl AgenticRunLifecycleService {
                 )
             })
             .unwrap_or_default();
-        let workspace_root_hint =
-            project_root_buf.map(|p| p.to_string_lossy().into_owned());
+        let workspace_root_hint = project_root_buf.map(|p| p.to_string_lossy().into_owned());
 
         AgenticLoopState {
             messages: vec![user_message],
@@ -837,8 +836,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
                 )
             })
             .unwrap_or_default();
-        let workspace_root_hint =
-            project_root_buf.map(|p| p.to_string_lossy().into_owned());
+        let workspace_root_hint = project_root_buf.map(|p| p.to_string_lossy().into_owned());
 
         let mut loop_state = AgenticLoopState {
             messages: vec![user_message],
@@ -1268,9 +1266,14 @@ mod tests {
 
         let svc = test_service();
         let mut req = test_request("implement a fix");
-        req.context = Some(serde_json::json!({
-            "edge_profile": { "cwd": dir.path().to_str().unwrap() }
-        }).as_object().unwrap().clone());
+        req.context = Some(
+            serde_json::json!({
+                "edge_profile": { "cwd": dir.path().to_str().unwrap() }
+            })
+            .as_object()
+            .unwrap()
+            .clone(),
+        );
 
         let state = svc.build_initial_state(&req, "s", "r");
         assert_eq!(state.stop_hooks.len(), 1);

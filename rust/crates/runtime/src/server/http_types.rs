@@ -1572,7 +1572,13 @@ mod tests {
         };
         let data = chat_request_into_data(req);
         let ctx = data.context.unwrap();
-        assert_eq!(ctx.get("plan_subtask_id").and_then(|v| v.as_str()), Some("sub-42"));
-        assert_eq!(ctx.get("is_plan_subtask").and_then(|v| v.as_bool()), Some(true));
+        assert_eq!(
+            ctx.get("plan_subtask_id").and_then(|v| v.as_str()),
+            Some("sub-42")
+        );
+        assert_eq!(
+            ctx.get("is_plan_subtask").and_then(|v| v.as_bool()),
+            Some(true)
+        );
     }
 }

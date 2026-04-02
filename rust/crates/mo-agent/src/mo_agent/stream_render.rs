@@ -548,14 +548,11 @@ impl StreamRenderState {
         }
     }
 
-    /// Show a tool as "running" with optional argument preview (single line).
+    /// Show a tool as "running" with Cursor-style description (single line).
     fn tool_start(&mut self, tool: &str, args: &Value) -> usize {
         let idx = self.tool_lines.len();
-        let arg_preview = self.format_tool_arg_preview(tool, args);
-        let line = match &arg_preview {
-            Some(preview) => format!("  ● {tool} {preview} …"),
-            None => format!("  ● {tool} …"),
-        };
+        let description = self.format_tool_description(tool, args);
+        let line = format!("  ⬢ {description} …");
         if self.md.is_some() {
             eprintln!("{line}");
             self.stderr_lines += 1;
@@ -566,8 +563,139 @@ impl StreamRenderState {
         idx
     }
 
-    /// Format a preview of tool arguments (single line, max ~60 chars).
-    fn format_tool_arg_preview(&self, tool: &str, args: &Value) -> Option<String> {
+    /// Format a Cursor-style tool description: "Grepped pattern in path", "Read file lines X-Y"
+    fn format_tool_description(&self, tool: &str, args: &Value) -> String {
+        match tool {
+            "bash" => {
+                let cmd = args.get("command").and_then(Value::as_str).unwrap_or("");
+                format!("$ {}", truncate_line(cmd, 55))
+            }
+            "read_file" => {
+                let path = args.get("path").and_then(Value::as_str).unwrap_or("");
+                let start = args.get("start_line").and_then(Value::as_u64);
+                let end = args.get("end_line").and_then(Value::as_u64);
+                let short_path = shorten_path(path, 40);
+                match (start, end) {
+                    (Some(s), Some(e)) => format!("Read {short_path} lines {s}-{e}"),
+                    (Some(s), None) => format!("Read {short_path} from line {s}"),
+                    _ => format!("Read {short_path}"),
+                }
+            }
+            "write_file" => {
+                let path = args.get("path").and_then(Value::as_str).unwrap_or("");
+                format!("Write {}", shorten_path(path, 50))
+            }
+            "str_replace" | "multi_edit" => {
+                let path = args.get("path").and_then(Value::as_str).unwrap_or("");
+                format!("Edit {}", shorten_path(path, 50))
+            }
+            "delete_file" => {
+                let path = args.get("path").and_then(Value::as_str).unwrap_or("");
+                format!("Delete {}", shorten_path(path, 50))
+            }
+            "list_dir" => {
+                let path = args.get("path").and_then(Value::as_str).unwrap_or(".");
+                format!("List {}", shorten_path(path, 50))
+            }
+            "grep" => {
+                let pattern = args.get("pattern").and_then(Value::as_str).unwrap_or("");
+                let glob_filter = args.get("glob").and_then(Value::as_str);
+                let path = args.get("path").and_then(Value::as_str);
+                let short_pattern = truncate_line(pattern, 25);
+                match (glob_filter, path) {
+                    (Some(g), _) => format!("Grep \"{short_pattern}\" in {g}"),
+                    (None, Some(p)) => {
+                        format!("Grep \"{short_pattern}\" in {}", shorten_path(p, 25))
+                    }
+                    _ => format!("Grep \"{short_pattern}\""),
+                }
+            }
+            "glob" => {
+                let pattern = args.get("pattern").and_then(Value::as_str).unwrap_or("");
+                format!("Glob {}", truncate_line(pattern, 50))
+            }
+            "git_status" => "Git status".to_string(),
+            "git_log" => {
+                let n = args.get("n").and_then(Value::as_u64);
+                let branch = args.get("branch").and_then(Value::as_str);
+                match (n, branch) {
+                    (Some(n), Some(b)) => format!("Git log -{n} {b}"),
+                    (Some(n), None) => format!("Git log -{n}"),
+                    (None, Some(b)) => format!("Git log {b}"),
+                    _ => "Git log".to_string(),
+                }
+            }
+            "git_show" => {
+                let commit = args
+                    .get("commit")
+                    .or_else(|| args.get("ref"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                format!("Git show {}", truncate_line(commit, 12))
+            }
+            "git_diff" => {
+                let staged = args.get("staged").and_then(Value::as_bool).unwrap_or(false);
+                let path = args.get("path").and_then(Value::as_str);
+                match (staged, path) {
+                    (true, Some(p)) => format!("Git diff --staged {}", shorten_path(p, 35)),
+                    (true, None) => "Git diff --staged".to_string(),
+                    (false, Some(p)) => format!("Git diff {}", shorten_path(p, 40)),
+                    _ => "Git diff".to_string(),
+                }
+            }
+            "git_blame" => {
+                let path = args.get("path").and_then(Value::as_str).unwrap_or("");
+                format!("Git blame {}", shorten_path(path, 45))
+            }
+            "git_commit" => {
+                let msg = args.get("message").and_then(Value::as_str).unwrap_or("");
+                format!("Git commit \"{}\"", truncate_line(msg, 40))
+            }
+            "find_definition" => {
+                let symbol = args.get("symbol").and_then(Value::as_str).unwrap_or("");
+                format!("Find definition of {}", truncate_line(symbol, 35))
+            }
+            "find_references" => {
+                let symbol = args.get("symbol").and_then(Value::as_str).unwrap_or("");
+                format!("Find references to {}", truncate_line(symbol, 35))
+            }
+            "symbol_search" => {
+                let symbol = args.get("symbol").and_then(Value::as_str).unwrap_or("");
+                format!("Search symbol {}", truncate_line(symbol, 40))
+            }
+            "symbols" => {
+                let path = args.get("path").and_then(Value::as_str).unwrap_or("");
+                format!("Get symbols in {}", shorten_path(path, 40))
+            }
+            "call_graph" => {
+                let symbol = args.get("symbol").and_then(Value::as_str).unwrap_or("");
+                format!("Call graph for {}", truncate_line(symbol, 40))
+            }
+            "run_build_test" => {
+                let cmd = args.get("command").and_then(Value::as_str).unwrap_or("");
+                format!("$ {}", truncate_line(cmd, 55))
+            }
+            "web_fetch" => {
+                let url = args.get("url").and_then(Value::as_str).unwrap_or("");
+                format!("Fetch {}", truncate_line(url, 50))
+            }
+            "github_get_pr" => {
+                let owner = args.get("owner").and_then(Value::as_str).unwrap_or("");
+                let repo = args.get("repo").and_then(Value::as_str).unwrap_or("");
+                let num = args.get("pr_number").and_then(Value::as_u64).unwrap_or(0);
+                format!("Get PR {owner}/{repo}#{num}")
+            }
+            "github_list_prs" => {
+                let owner = args.get("owner").and_then(Value::as_str).unwrap_or("");
+                let repo = args.get("repo").and_then(Value::as_str).unwrap_or("");
+                format!("List PRs in {owner}/{repo}")
+            }
+            _ => tool.to_string(),
+        }
+    }
+
+    /// Shorten a path by keeping the last N chars with leading "..."
+    fn _format_tool_arg_preview_unused(&self, tool: &str, args: &Value) -> Option<String> {
         match tool {
             "bash" => args
                 .get("command")
@@ -711,17 +839,18 @@ impl StreamRenderState {
         }
     }
 
-    /// Update a tool line to show completion status with optional output summary (single line).
+    /// Update a tool line to show completion status with Cursor-style summary.
     fn tool_done(&mut self, idx: usize, tool: &str, status: &str, duration_ms: u64, output: &str) {
-        let icon = if status == "error" { "✗" } else { "✓" };
         let output_summary = self.format_output_summary(tool, output, status);
-        // Compact single-line format: ✓ tool args (Xms) → summary
-        let line = match &output_summary {
-            Some(summary) if status == "error" => {
-                format!("  {icon} {tool} ({duration_ms}ms) error: {summary}")
+        // Cursor-style format: original description with result appended
+        let line = if status == "error" {
+            let err_msg = output_summary.unwrap_or_else(|| "failed".to_string());
+            format!("  ✗ {tool} ({duration_ms}ms) {err_msg}")
+        } else {
+            match output_summary {
+                Some(summary) => format!("    {summary}"),
+                None => format!("    Done ({duration_ms}ms)"),
             }
-            Some(summary) => format!("  {icon} {tool} ({duration_ms}ms) → {summary}"),
-            None => format!("  {icon} {tool} ({duration_ms}ms)"),
         };
         if self.md.is_some() {
             eprintln!("{line}");
@@ -729,7 +858,21 @@ impl StreamRenderState {
             return;
         }
         if idx < self.tool_lines.len() {
-            self.tool_lines[idx] = line;
+            // For success: append summary as second line, keep the original description
+            if status != "error" {
+                // Update the first line to remove "…" spinner
+                let first = &self.tool_lines[idx];
+                if first.ends_with(" …") {
+                    self.tool_lines[idx] = first.trim_end_matches(" …").to_string();
+                }
+                // Add summary line
+                let insert_pos = idx + 1;
+                if insert_pos <= self.tool_lines.len() {
+                    self.tool_lines.insert(insert_pos, line);
+                }
+            } else {
+                self.tool_lines[idx] = line;
+            }
             self.tool_region.update(self.tool_lines.clone());
         }
     }
@@ -802,6 +945,32 @@ fn truncate_line(s: &str, max_chars: usize) -> String {
         let truncated: String = line.chars().take(max_chars.saturating_sub(1)).collect();
         format!("{truncated}…")
     }
+}
+
+/// Shorten a path by keeping the filename and truncating dir prefix with "...".
+fn shorten_path(path: &str, max_chars: usize) -> String {
+    if path.chars().count() <= max_chars {
+        return path.to_string();
+    }
+    // Keep the filename (last component)
+    let parts: Vec<&str> = path.split('/').collect();
+    if parts.is_empty() {
+        return truncate_line(path, max_chars);
+    }
+    let filename = parts.last().unwrap_or(&"");
+    if filename.chars().count() >= max_chars.saturating_sub(4) {
+        // Filename itself is too long, just truncate
+        return truncate_line(filename, max_chars);
+    }
+    // Try to keep one parent dir
+    if parts.len() >= 2 {
+        let parent = parts[parts.len() - 2];
+        let short = format!(".../{parent}/{filename}");
+        if short.chars().count() <= max_chars {
+            return short;
+        }
+    }
+    format!(".../{filename}")
 }
 
 fn apply_sse_render_effects(
