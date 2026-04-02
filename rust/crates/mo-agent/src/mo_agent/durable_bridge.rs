@@ -416,10 +416,14 @@ pub fn create_local_lifecycle(
 ) -> Arc<dyn DurableTaskLifecycle> {
     let contracts_dir = session_dir.join("contracts");
     let _ = std::fs::create_dir_all(&contracts_dir);
-    Arc::new(LocalDurableTaskLifecycle::new(
-        contracts_dir,
-        work_dir.to_path_buf(),
-    ))
+    let mut lifecycle = LocalDurableTaskLifecycle::new(contracts_dir, work_dir.to_path_buf());
+
+    // Wire up LLM judge for semantic verification (if API key available)
+    if let Some(judge) = HttpLlmJudge::from_env() {
+        lifecycle.set_llm_judge(Arc::new(judge));
+    }
+
+    Arc::new(lifecycle)
 }
 
 // ─── LLM Judge Implementation ────────────────────────────────────────────────
