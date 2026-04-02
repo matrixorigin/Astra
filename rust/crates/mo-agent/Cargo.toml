@@ -34,6 +34,7 @@ termimad = "0.23"
 thiserror.workspace = true
 tokio = { workspace = true, features = ["macros", "net", "process", "rt-multi-thread", "signal"] }
 uuid.workspace = true
+url = "2.5"
 gix = { version = "0.81.0", features = ["status", "blame", "mailmap", "revision"] }
 tree-sitter = "0.24"
 tree-sitter-rust = "0.23"
