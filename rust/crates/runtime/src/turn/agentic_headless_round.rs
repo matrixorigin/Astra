@@ -190,9 +190,11 @@ pub async fn run_agentic_headless_tool_round<E: EdgeToolRoundRow>(
             continue;
         }
 
-        // Edge tools (synthetic_idx.is_some()) were already displayed during SSE.
-        // Skip redundant output for these.
-        let is_edge_tool = synthetic_idx.is_some();
+        // Track whether this tool was executed at the edge (already displayed during SSE).
+        // There are two ways a tool can be an edge tool:
+        // 1. synthetic_idx.is_some() - synthetic edge slot
+        // 2. take_edge_output_for_tool_call consumes an edge result - server tool matched to edge
+        let consumed_before = consumed_edge.iter().filter(|&&c| c).count();
 
         let mut result_str = if let Some(i) = synthetic_idx {
             edge_tool_round[i].tool_output().to_string()
@@ -205,6 +207,10 @@ pub async fn run_agentic_headless_tool_round<E: EdgeToolRoundRow>(
                 by_sig,
             )
         };
+
+        let consumed_after = consumed_edge.iter().filter(|&&c| c).count();
+        // If synthetic or if we just consumed an edge result, this was an edge tool
+        let is_edge_tool = synthetic_idx.is_some() || consumed_after > consumed_before;
 
         if !valid_tool_names.contains(&name) {
             let err_msg = unknown_local_tool_error_message(&name, valid_tool_names);
