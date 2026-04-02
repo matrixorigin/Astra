@@ -547,19 +547,63 @@ pub(crate) fn git_diff(project_root: &Path, args: &Value, pressure: f64) -> Stri
 
     let staged = args.get("staged").and_then(Value::as_bool).unwrap_or(false);
     let git_ref = args.get("ref").and_then(Value::as_str);
+    let path_filter = args.get("path").and_then(Value::as_str);
 
     // If a ref is given, do a tree-to-tree diff (HEAD vs ref)
     if let Some(ref_str) = git_ref {
+        // With path filter, use CLI for tree-to-tree as well
+        if let Some(p) = path_filter {
+            if let Some(result) = diff_via_git_cli(
+                project_root,
+                &["diff", ref_str, "--no-ext-diff", "--no-color", "--", p],
+                limit,
+            ) {
+                return result;
+            }
+        }
         return diff_tree_to_tree_str(&repo, ref_str, limit);
     }
 
     // If staged, do index-to-HEAD diff
     if staged {
-        return diff_index_to_head(&repo, limit);
+        let cli_args: Vec<&str> = if let Some(p) = path_filter {
+            vec!["diff", "--cached", "--no-ext-diff", "--no-color", "--", p]
+        } else {
+            vec!["diff", "--cached", "--no-ext-diff", "--no-color"]
+        };
+        let result = diff_via_git_cli(project_root, &cli_args, limit)
+            .unwrap_or_else(|| diff_index_to_head(&repo, limit));
+        if result == "No changes" {
+            return "No staged changes".to_string();
+        }
+        return result;
     }
 
-    // Default: worktree changes (unstaged) using status iterator
-    diff_worktree(&repo, limit)
+    // Default: show full local patch vs HEAD so review flows don't need to fall
+    // back to bash just to recover actual diff hunks from summary-only output.
+    let cli_args: Vec<&str> = if let Some(p) = path_filter {
+        vec!["diff", "HEAD", "--no-ext-diff", "--no-color", "--", p]
+    } else {
+        vec!["diff", "HEAD", "--no-ext-diff", "--no-color"]
+    };
+    diff_via_git_cli(project_root, &cli_args, limit)
+        .unwrap_or_else(|| diff_worktree(&repo, limit))
+}
+
+fn diff_via_git_cli(project_root: &Path, args: &[&str], limit: usize) -> Option<String> {
+    let out = std::process::Command::new("git")
+        .args(args)
+        .current_dir(project_root)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    if stdout.trim().is_empty() {
+        return Some("No changes".to_string());
+    }
+    Some(truncate_diff_at(stdout, limit.min(tool_output_limit())))
 }
 
 /// Diff between two tree-ish refs (e.g., HEAD vs a branch/commit).
@@ -656,7 +700,9 @@ fn diff_tree_to_tree_str(repo: &gix::Repository, ref_str: &str, limit: usize) ->
     if out.is_empty() {
         "No changes".to_string()
     } else {
-        out.push_str(&format!("\n{count} file(s) changed"));
+        out.push_str(&format!(
+            "\n{count} file(s) changed (summary only — use `git diff` for full patch)"
+        ));
         truncate_diff_at(out, limit)
     }
 }
@@ -825,7 +871,9 @@ fn diff_worktree(repo: &gix::Repository, limit: usize) -> String {
     if out.is_empty() {
         "No changes".to_string()
     } else {
-        out.push_str(&format!("\n{count} file(s) changed"));
+        out.push_str(&format!(
+            "\n{count} file(s) changed (summary only — use `git diff` for full patch)"
+        ));
         truncate_diff_at(out, limit)
     }
 }
@@ -2498,6 +2546,61 @@ mod tests {
         assert!(
             result.contains("Restored") || result.contains("Error"),
             "should restore or report error: {result}"
+        );
+    }
+
+    // ─── git CLI fallback behavior tests ────────────────────────────────────
+
+    #[test]
+    fn diff_via_git_cli_returns_none_for_bad_args() {
+        let root = repo_root();
+        // Invalid ref should make git fail → returns None
+        let result =
+            diff_via_git_cli(&root, &["diff", "not_a_valid_ref_xyzzy", "--no-ext-diff"], 8000);
+        assert!(result.is_none(), "bad ref should return None for fallback");
+    }
+
+    #[test]
+    fn diff_via_git_cli_returns_no_changes_for_empty_diff() {
+        let root = repo_root();
+        // HEAD vs HEAD has no diff
+        let result = diff_via_git_cli(
+            &root,
+            &["diff", "HEAD", "HEAD", "--no-ext-diff", "--no-color"],
+            8000,
+        );
+        assert_eq!(
+            result,
+            Some("No changes".to_string()),
+            "HEAD vs HEAD should be empty diff"
+        );
+    }
+
+    #[test]
+    fn gix_worktree_fallback_annotates_summary_only() {
+        // diff_worktree output (when it has entries) should tell the user
+        // that it's summary-only so the LLM knows to call bash git diff.
+        let root = repo_root();
+        let repo = open_repo(&root).expect("repo should open");
+        let result = diff_worktree(&repo, 100_000);
+        if result != "No changes" {
+            assert!(
+                result.contains("summary only"),
+                "gix fallback should annotate summary-only output: {result}"
+            );
+        }
+    }
+
+    #[test]
+    fn diff_via_git_cli_returns_none_for_nonexistent_dir() {
+        let result = diff_via_git_cli(
+            Path::new("/nonexistent_dir_xyz"),
+            &["diff", "--no-ext-diff"],
+            8000,
+        );
+        assert!(
+            result.is_none(),
+            "nonexistent dir should return None for fallback"
         );
     }
 }

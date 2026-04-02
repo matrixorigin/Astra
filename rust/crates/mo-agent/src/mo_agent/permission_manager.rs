@@ -493,10 +493,6 @@ impl PermissionManager {
         }
 
         if let Some(&allowed) = self.session_overrides.get(name) {
-            if allowed {
-                let (header, _) = Self::format_tool_display(name, args);
-                eprintln!("  {}", format!("{header}  ✓").dim());
-            }
             return allowed;
         }
 
@@ -588,8 +584,6 @@ impl PermissionManager {
 
         // Step 5: Persistent allow rules.
         if self.check_allow_rules(name, args) {
-            let (header, _) = Self::format_tool_display(name, args);
-            eprintln!("  {}", format!("{header}  ✓ (rule)").dim());
             return true;
         }
 

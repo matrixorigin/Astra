@@ -41,7 +41,7 @@ pub struct SandboxPolicy {
     pub network_allowed: bool,
 
     /// Maximum number of processes a sandboxed command can spawn.
-    /// 0 = unlimited (Permissive/Standard). Strict mode uses 512.
+    /// 0 = unlimited (Permissive). Standard uses 2 GB, Strict uses 256 MB.
     ///
     /// NOTE: `ulimit -u` sets RLIMIT_NPROC which counts ALL processes
     /// for the user (UID-wide), not per-process. If the user already
@@ -51,7 +51,7 @@ pub struct SandboxPolicy {
     pub max_processes: u32,
 
     /// Maximum memory in bytes a sandboxed command can use.
-    /// 0 = unlimited. Typical: 512 MB.
+    /// 0 = unlimited. Standard: 2 GB, Strict: 256 MB.
     pub max_memory_bytes: u64,
 }
 
@@ -106,7 +106,7 @@ impl SandboxPolicy {
             max_output_bytes: 20_000,
             network_allowed: true,
             max_processes: 0, // Standard mode: no ulimit -u (too fragile)
-            max_memory_bytes: 512 * 1024 * 1024, // 512 MB
+            max_memory_bytes: 2 * 1024 * 1024 * 1024, // 2 GB — cargo builds need ~1-2 GB
         }
     }
 
