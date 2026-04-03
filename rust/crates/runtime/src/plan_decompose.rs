@@ -670,7 +670,57 @@ pub fn parse_plan_response(response: &str) -> Result<TaskPlan, String> {
     // Try to extract JSON from the response (may be wrapped in markdown)
     let json_str = extract_json(response);
 
-    // Parse the JSON
+    // First, try to parse as generic JSON to provide better error messages
+    let parsed_value: serde_json::Value = match serde_json::from_str(&json_str) {
+        Ok(v) => v,
+        Err(e) => {
+            // Check if the response looks like it contains no valid JSON
+            if !json_str.contains('{') && !json_str.contains('[') {
+                return Err(
+                    "No JSON found in response. Model returned plain text instead of JSON plan."
+                        .to_string(),
+                );
+            }
+            return Err(format!("Invalid JSON syntax: {e}"));
+        }
+    };
+
+    // Check if it's an object with the expected structure
+    if let Some(obj) = parsed_value.as_object() {
+        if !obj.contains_key("subtasks") {
+            // Provide helpful message about what's missing
+            let keys: Vec<_> = obj.keys().take(5).collect();
+            return Err(format!(
+                "JSON object missing 'subtasks' field. Found keys: {:?}. \
+                 Expected format: {{\"subtasks\": [...], \"notes\": \"...\"}}",
+                keys
+            ));
+        }
+        if !obj.get("subtasks").is_some_and(|v| v.is_array()) {
+            return Err(
+                "'subtasks' must be an array. Expected format: {\"subtasks\": [...]}".to_string(),
+            );
+        }
+    } else if parsed_value.is_array() {
+        // This might be a clarification question array - caller should handle this
+        return Err(
+            "Response is a JSON array (likely clarification questions). Use parse_clarification_response() instead."
+                .to_string(),
+        );
+    } else {
+        return Err(format!(
+            "Expected JSON object with 'subtasks' field, got: {}",
+            match &parsed_value {
+                serde_json::Value::Null => "null",
+                serde_json::Value::Bool(_) => "boolean",
+                serde_json::Value::Number(_) => "number",
+                serde_json::Value::String(_) => "string",
+                _ => "unknown",
+            }
+        ));
+    }
+
+    // Now parse with the proper type
     let parsed: PlanResponse =
         serde_json::from_str(&json_str).map_err(|e| format!("Invalid plan JSON: {e}"))?;
 
