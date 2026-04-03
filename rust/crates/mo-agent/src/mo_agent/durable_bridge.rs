@@ -200,9 +200,11 @@ pub async fn on_subtask_complete(durable: &mut DurableTaskState, subtask_id: &st
         return true;
     }
 
-    // 3. Run lightweight verification with progress indication
-    eprintln!("  {}  Verifying subtask: {}...", "🔍".cyan(), subtask_id,);
-    match durable.lifecycle.verify_subtask(&task_id, subtask_id).await {
+    // 3. Run lightweight verification with progress indication + spinner
+    let spinner = super::stream_render::Spinner::start(format!("🔍 Verifying: {subtask_id}"));
+    let result = durable.lifecycle.verify_subtask(&task_id, subtask_id).await;
+    spinner.stop_clear();
+    match result {
         Ok(report) => {
             display_verification_report(&report);
 
@@ -259,20 +261,38 @@ fn display_verification_report(report: &SubtaskVerificationReport) {
 
     // Show individual results (both pass and fail for transparency)
     for r in &report.results {
+        let dur_tag = if r.duration_ms > 0 {
+            format!(" ({:.1}s)", r.duration_ms as f64 / 1000.0)
+        } else {
+            String::new()
+        };
         if r.passed {
-            let evidence: String = r.evidence.trim().chars().take(80).collect();
+            let evidence: String = r.evidence.trim().chars().take(120).collect();
             if !evidence.is_empty() {
                 eprintln!(
-                    "      {} {} — {}",
+                    "      {} {} — {}{}",
                     "✔".green(),
                     r.criterion_id.clone().dark_grey(),
                     evidence.dark_grey(),
+                    dur_tag.dark_grey(),
+                );
+            } else {
+                eprintln!(
+                    "      {} {}{}",
+                    "✔".green(),
+                    r.criterion_id.clone().dark_grey(),
+                    dur_tag.dark_grey(),
                 );
             }
         } else {
-            let evidence: String = r.evidence.trim().chars().take(120).collect();
-            let expected: String = r.expected.chars().take(80).collect();
-            eprintln!("      {} {}", "✘".red(), r.criterion_id,);
+            let evidence: String = r.evidence.trim().chars().take(200).collect();
+            let expected: String = r.expected.chars().take(120).collect();
+            eprintln!(
+                "      {} {}{}",
+                "✘".red(),
+                r.criterion_id,
+                dur_tag.dark_grey(),
+            );
             if !evidence.is_empty() {
                 eprintln!("        got: {}", evidence.yellow());
             }
@@ -312,7 +332,12 @@ pub async fn on_plan_complete(durable: &mut DurableTaskState) -> bool {
         eprintln!("      {} {}", "▸".grey(), cmd_hint);
     }
 
-    match durable.lifecycle.verify_global(&task_id).await {
+    let spinner =
+        super::stream_render::Spinner::start("🔬 Running global checks".into());
+    let verify_result = durable.lifecycle.verify_global(&task_id).await;
+    spinner.stop_clear();
+
+    match verify_result {
         Ok(results) => {
             let passed = results.iter().filter(|r| r.passed).count();
             let total = results.len();
@@ -327,10 +352,29 @@ pub async fn on_plan_complete(durable: &mut DurableTaskState) -> bool {
 
             eprintln!("  {}  Global checks: {}/{} passed", styled, passed, total,);
 
+            // Show ALL results — passes and failures — for full transparency
             for r in &results {
-                if !r.passed {
-                    let evidence = r.evidence.chars().take(120).collect::<String>();
-                    eprintln!("      {} {} — {}", "✘".red(), r.criterion_id, evidence,);
+                let dur_tag = if r.duration_ms > 0 {
+                    format!(" ({:.1}s)", r.duration_ms as f64 / 1000.0)
+                } else {
+                    String::new()
+                };
+                if r.passed {
+                    eprintln!(
+                        "      {} {}{}",
+                        "✔".green(),
+                        r.criterion_id.clone().dark_grey(),
+                        dur_tag.dark_grey(),
+                    );
+                } else {
+                    let evidence = r.evidence.chars().take(200).collect::<String>();
+                    eprintln!(
+                        "      {} {} — {}{}",
+                        "✘".red(),
+                        r.criterion_id,
+                        evidence,
+                        dur_tag.dark_grey(),
+                    );
                 }
             }
 
@@ -381,15 +425,26 @@ fn display_delivery_report(report: &TaskDeliveryReport) {
         .count();
     let global_total = report.global_verification.len();
 
+    // Determine box width based on terminal (min 58, max 80)
+    let box_width = crossterm::terminal::size()
+        .map(|(c, _)| (c as usize).clamp(58, 80))
+        .unwrap_or(58);
+    let bar = "═".repeat(box_width - 2);
+    let dash = "─".repeat(box_width - 2);
+
     // ─── Header ──────────────────────────────────────────────────────────────
     eprintln!();
-    eprintln!(
-        "{}",
-        "╔══════════════════════════════════════════════════════════╗".cyan()
-    );
+    eprintln!("{}", format!("╔{bar}╗").cyan());
 
-    // Goal (truncate if too long)
-    let goal_display: String = report.goal.chars().take(50).collect();
+    // Goal — use most of the box width instead of hard 50-char truncation
+    let goal_max = box_width.saturating_sub(12); // "║  Task: " + pad
+    let goal_display: String = if report.goal.chars().count() > goal_max {
+        let mut g: String = report.goal.chars().take(goal_max - 1).collect();
+        g.push('…');
+        g
+    } else {
+        report.goal.clone()
+    };
     eprintln!("{}  Task: {}", "║".cyan(), goal_display.white().bold(),);
 
     let (status_icon, status_text) = if fully_delivered {
@@ -402,10 +457,7 @@ fn display_delivery_report(report: &TaskDeliveryReport) {
     eprintln!("{}  Status: {} {}", "║".cyan(), status_icon, status_text);
 
     // ─── Subtask Results ─────────────────────────────────────────────────────
-    eprintln!(
-        "{}",
-        "╠══════════════════════════════════════════════════════════╣".cyan()
-    );
+    eprintln!("{}", format!("╠{bar}╣").cyan());
 
     for sub in &report.subtask_summaries {
         let verified = sub.criteria_passed == sub.criteria_total;
@@ -416,8 +468,13 @@ fn display_delivery_report(report: &TaskDeliveryReport) {
         } else {
             String::new()
         };
+        let stage_info = if !sub.stage.is_empty() && sub.stage != "verified" {
+            format!("  [{}]", sub.stage)
+        } else {
+            String::new()
+        };
         eprintln!(
-            "{}  {} {} ({}{})",
+            "{}  {} {} ({}{}{})",
             "║".cyan(),
             icon,
             sub.title,
@@ -427,15 +484,13 @@ fn display_delivery_report(report: &TaskDeliveryReport) {
                 criteria_info.yellow().to_string()
             },
             retry_info,
+            stage_info.dark_grey(),
         );
     }
 
     // ─── Global Verification ─────────────────────────────────────────────────
     if !report.global_verification.is_empty() {
-        eprintln!(
-            "{}",
-            "╠──────────────────────────────────────────────────────────╣".cyan()
-        );
+        eprintln!("{}", format!("╠{dash}╣").cyan());
         eprintln!(
             "{}  🔬 Global checks: {}/{}",
             "║".cyan(),
@@ -459,10 +514,7 @@ fn display_delivery_report(report: &TaskDeliveryReport) {
     }
 
     // ─── Metrics ─────────────────────────────────────────────────────────────
-    eprintln!(
-        "{}",
-        "╠──────────────────────────────────────────────────────────╣".cyan()
-    );
+    eprintln!("{}", format!("╠{dash}╣").cyan());
 
     let mut metrics = Vec::new();
     metrics.push(format!(
@@ -477,22 +529,44 @@ fn display_delivery_report(report: &TaskDeliveryReport) {
     }
     eprintln!("{}  {}", "║".cyan(), metrics.join("  ·  "));
 
+    // Execution effort (turns, tokens, timestamp)
+    let mut effort = Vec::new();
+    if report.total_turns > 0 {
+        effort.push(format!("{} turns", report.total_turns));
+    }
+    if report.total_tokens > 0 {
+        let tok_display = if report.total_tokens >= 1000 {
+            format!("{:.1}k tokens", report.total_tokens as f64 / 1000.0)
+        } else {
+            format!("{} tokens", report.total_tokens)
+        };
+        effort.push(tok_display);
+    }
+    if !effort.is_empty() {
+        eprintln!(
+            "{}  {}",
+            "║".cyan(),
+            format!("⚡ {}", effort.join(", ")).dark_grey(),
+        );
+    }
+    if !report.timestamp.is_empty() {
+        eprintln!(
+            "{}  {}",
+            "║".cyan(),
+            format!("🕐 {}", report.timestamp).dark_grey(),
+        );
+    }
+
     // ─── Risks / Assumptions ─────────────────────────────────────────────────
     if !report.risks.is_empty() {
-        eprintln!(
-            "{}",
-            "╠──────────────────────────────────────────────────────────╣".cyan()
-        );
+        eprintln!("{}", format!("╠{dash}╣").cyan());
         for risk in &report.risks {
             eprintln!("{}  ⚠ {}", "║".cyan(), risk.clone().yellow());
         }
     }
 
     // ─── Footer ──────────────────────────────────────────────────────────────
-    eprintln!(
-        "{}",
-        "╚══════════════════════════════════════════════════════════╝".cyan()
-    );
+    eprintln!("{}", format!("╚{bar}╝").cyan());
 }
 
 // ─── Post-delivery user feedback ─────────────────────────────────────────────

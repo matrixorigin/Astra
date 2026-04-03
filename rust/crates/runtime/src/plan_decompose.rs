@@ -2162,6 +2162,9 @@ impl PlanExecutionSummary {
         if self.failed > 0 {
             out.push_str(&format!("│ Failed:    {}\n", self.failed));
         }
+        if self.paused > 0 {
+            out.push_str(&format!("│ Paused:    {}\n", self.paused));
+        }
         if self.parallel_rounds > 0 {
             out.push_str(&format!(
                 "│ Rounds:    {} (parallel-aware)\n",

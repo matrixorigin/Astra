@@ -416,7 +416,7 @@ const MIN_TERM_WIDTH: usize = 20;
 const MAX_TERM_WIDTH: usize = 512;
 
 /// Clear the current stderr line (carriage return + spaces + carriage return).
-fn clear_stderr_line() {
+pub(super) fn clear_stderr_line() {
     let w = crossterm::terminal::size()
         .map(|(c, _)| c as usize)
         .unwrap_or(80)
