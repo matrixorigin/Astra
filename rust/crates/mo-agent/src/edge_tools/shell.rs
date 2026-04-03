@@ -71,6 +71,21 @@ fn interpret_exit_code(command: &str, code: i32) -> CommandResult {
                 note: None,
             },
         },
+        // pkill/pgrep/killall: 0=matched, 1=no match, 2=syntax error, 3=fatal
+        "pkill" | "pgrep" | "killall" => match code {
+            0 => CommandResult {
+                is_error: false,
+                note: None,
+            },
+            1 => CommandResult {
+                is_error: false,
+                note: Some("No processes matched"),
+            },
+            _ => CommandResult {
+                is_error: true,
+                note: None,
+            },
+        },
         // Default: only 0 is success
         _ => CommandResult {
             is_error: code != 0,
