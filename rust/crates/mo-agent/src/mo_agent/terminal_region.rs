@@ -3,6 +3,10 @@
 //! Maintains a list of lines currently displayed on the terminal.
 //! On update, diffs old vs new lines and only rewrites changed lines.
 //! This eliminates flicker and enables Ink-style atomic updates.
+//!
+//! **Note on terminal wrapping:** When a line exceeds terminal width,
+//! the terminal wraps it to multiple physical rows. This module tracks
+//! physical rows to ensure correct cursor positioning during updates.
 
 use std::io::{self, Write};
 
@@ -14,19 +18,57 @@ use crossterm::{cursor, execute, terminal};
 /// when content changes — like a simplified React reconciler for
 /// terminal lines.
 pub(super) struct TerminalRegion {
-    /// Lines currently displayed on the terminal.
-    lines: Vec<String>,
+    /// Lines currently displayed, each with its physical row count.
+    lines: Vec<LineEntry>,
+    /// Cached terminal width for wrap calculations.
+    term_width: u16,
+}
+
+/// A line entry with its content and calculated physical row count.
+struct LineEntry {
+    content: String,
+    /// Number of physical terminal rows this line occupies.
+    physical_rows: usize,
 }
 
 impl TerminalRegion {
     pub(super) fn new() -> Self {
-        Self { lines: Vec::new() }
+        let term_width = terminal::size().map(|(w, _)| w).unwrap_or(80);
+        Self {
+            lines: Vec::new(),
+            term_width,
+        }
     }
 
-    /// Number of lines currently on screen.
+    /// Number of logical lines currently on screen.
     #[allow(dead_code)]
     pub(super) fn height(&self) -> usize {
         self.lines.len()
+    }
+
+    /// Total physical rows occupied by all lines.
+    fn total_physical_rows(&self) -> usize {
+        self.lines.iter().map(|e| e.physical_rows).sum()
+    }
+
+    /// Calculate physical rows for a line based on current terminal width.
+    fn calc_physical_rows(&self, line: &str) -> usize {
+        if self.term_width == 0 {
+            return 1;
+        }
+        let visible_width = visible_char_width(line);
+        if visible_width == 0 {
+            return 1; // empty line still takes 1 row
+        }
+        // Ceiling division: how many rows needed
+        visible_width.div_ceil(self.term_width as usize)
+    }
+
+    /// Refresh terminal width (call on resize or before update).
+    fn refresh_term_width(&mut self) {
+        if let Ok((w, _)) = terminal::size() {
+            self.term_width = w;
+        }
     }
 
     /// Replace the entire region with new content.
@@ -35,6 +77,9 @@ impl TerminalRegion {
     /// If new content is shorter, clears leftover lines.
     /// If new content is longer, appends new lines.
     pub(super) fn update(&mut self, new_lines: Vec<String>) {
+        // Refresh terminal width in case of resize
+        self.refresh_term_width();
+
         if self.lines.is_empty() && new_lines.is_empty() {
             return;
         }
@@ -44,11 +89,17 @@ impl TerminalRegion {
 
         if old_len == 0 {
             // First render — just print everything.
-            for line in &new_lines {
+            let mut entries = Vec::with_capacity(new_len);
+            for line in new_lines {
                 println!("{line}");
+                let rows = self.calc_physical_rows(&line);
+                entries.push(LineEntry {
+                    content: line,
+                    physical_rows: rows,
+                });
             }
             let _ = io::stdout().flush();
-            self.lines = new_lines;
+            self.lines = entries;
             return;
         }
 
@@ -57,7 +108,7 @@ impl TerminalRegion {
             .lines
             .iter()
             .zip(new_lines.iter())
-            .position(|(old, new)| old != new)
+            .position(|(old, new)| old.content != *new)
             .unwrap_or(old_len.min(new_len));
 
         // Nothing changed and same length — no-op.
@@ -65,35 +116,37 @@ impl TerminalRegion {
             return;
         }
 
-        // Move cursor up to the first differing line.
-        let lines_up = old_len - first_diff;
-        if lines_up > 0 {
-            execute!(io::stdout(), cursor::MoveUp(lines_up as u16)).ok();
+        // Calculate physical rows to move up (from end to first_diff)
+        let rows_up: usize = self.lines[first_diff..]
+            .iter()
+            .map(|e| e.physical_rows)
+            .sum();
+        if rows_up > 0 {
+            execute!(io::stdout(), cursor::MoveUp(rows_up as u16)).ok();
         }
         execute!(io::stdout(), cursor::MoveToColumn(0)).ok();
 
-        // Rewrite from first_diff to end of new content.
-        for line in &new_lines[first_diff..] {
-            // Clear the line first (in case new line is shorter than old).
-            execute!(
-                io::stdout(),
-                terminal::Clear(terminal::ClearType::CurrentLine)
-            )
-            .ok();
-            println!("{line}");
-        }
+        // Clear from cursor down (removes all old content from first_diff onwards)
+        execute!(
+            io::stdout(),
+            terminal::Clear(terminal::ClearType::FromCursorDown)
+        )
+        .ok();
 
-        // If new content is shorter, clear remaining old lines.
-        if new_len < old_len {
-            execute!(
-                io::stdout(),
-                terminal::Clear(terminal::ClearType::FromCursorDown)
-            )
-            .ok();
+        // Truncate old lines to first_diff
+        self.lines.truncate(first_diff);
+
+        // Print new lines from first_diff onwards
+        for line in &new_lines[first_diff..] {
+            println!("{line}");
+            let rows = self.calc_physical_rows(line);
+            self.lines.push(LineEntry {
+                content: line.clone(),
+                physical_rows: rows,
+            });
         }
 
         let _ = io::stdout().flush();
-        self.lines = new_lines;
     }
 
     /// Append lines without diffing (for content that only grows).
@@ -101,7 +154,11 @@ impl TerminalRegion {
     pub(super) fn append(&mut self, new_lines: &[String]) {
         for line in new_lines {
             println!("{line}");
-            self.lines.push(line.clone());
+            let rows = self.calc_physical_rows(line);
+            self.lines.push(LineEntry {
+                content: line.clone(),
+                physical_rows: rows,
+            });
         }
         let _ = io::stdout().flush();
     }
@@ -111,16 +168,20 @@ impl TerminalRegion {
     pub(super) fn append_line(&mut self, line: String) {
         println!("{line}");
         let _ = io::stdout().flush();
-        self.lines.push(line);
+        let rows = self.calc_physical_rows(&line);
+        self.lines.push(LineEntry {
+            content: line,
+            physical_rows: rows,
+        });
     }
 
     /// Clear the entire region from the terminal.
     pub(super) fn clear(&mut self) {
-        let n = self.lines.len();
-        if n > 0 {
+        let rows = self.total_physical_rows();
+        if rows > 0 {
             execute!(
                 io::stdout(),
-                cursor::MoveUp(n as u16),
+                cursor::MoveUp(rows as u16),
                 cursor::MoveToColumn(0),
                 terminal::Clear(terminal::ClearType::FromCursorDown)
             )
@@ -130,14 +191,18 @@ impl TerminalRegion {
         }
     }
 
-    /// Remove the last `n` lines from the region.
+    /// Remove the last `n` logical lines from the region.
     #[allow(dead_code)]
     pub(super) fn pop_lines(&mut self, n: usize) {
         let n = n.min(self.lines.len());
         if n > 0 {
+            let rows_to_remove: usize = self.lines[self.lines.len() - n..]
+                .iter()
+                .map(|e| e.physical_rows)
+                .sum();
             execute!(
                 io::stdout(),
-                cursor::MoveUp(n as u16),
+                cursor::MoveUp(rows_to_remove as u16),
                 cursor::MoveToColumn(0),
                 terminal::Clear(terminal::ClearType::FromCursorDown)
             )
@@ -148,6 +213,37 @@ impl TerminalRegion {
     }
 }
 
+/// Calculate visible character width of a string (stripping ANSI codes).
+///
+/// Uses a simple heuristic: ASCII chars = 1 width, others (CJK, emoji) = 2 width.
+fn visible_char_width(s: &str) -> usize {
+    let stripped = strip_ansi_codes(s);
+    stripped
+        .chars()
+        .map(|c| if c.is_ascii() { 1 } else { 2 })
+        .sum()
+}
+
+/// Strip ANSI escape sequences from a string.
+fn strip_ansi_codes(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+    while let Some(ch) = chars.next() {
+        // ESC [ ... m  (SGR sequence)
+        if ch == '\u{1b}' && matches!(chars.peek(), Some('[')) {
+            let _ = chars.next(); // consume '['
+            for c in chars.by_ref() {
+                if ('@'..='~').contains(&c) {
+                    break;
+                }
+            }
+            continue;
+        }
+        out.push(ch);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -156,6 +252,45 @@ mod tests {
     fn new_region_is_empty() {
         let r = TerminalRegion::new();
         assert_eq!(r.height(), 0);
+    }
+
+    #[test]
+    fn strip_ansi_codes_removes_colors() {
+        let colored = "\x1b[31mred\x1b[0m text";
+        assert_eq!(strip_ansi_codes(colored), "red text");
+    }
+
+    #[test]
+    fn visible_width_handles_cjk() {
+        assert_eq!(visible_char_width("hello"), 5);
+        assert_eq!(visible_char_width("你好"), 4); // 2 chars * 2 width
+        assert_eq!(visible_char_width("hi你好"), 6); // 2 + 4
+    }
+
+    #[test]
+    fn visible_width_ignores_ansi() {
+        let colored = "\x1b[32mgreen\x1b[0m";
+        assert_eq!(visible_char_width(colored), 5);
+    }
+
+    #[test]
+    fn calc_physical_rows_handles_wrap() {
+        let mut r = TerminalRegion::new();
+        r.term_width = 10;
+        assert_eq!(r.calc_physical_rows("hello"), 1);
+        assert_eq!(r.calc_physical_rows("hello world!!"), 2); // 13 chars, wraps
+        assert_eq!(r.calc_physical_rows("12345678901234567890"), 2); // exactly 20
+        assert_eq!(r.calc_physical_rows("123456789012345678901"), 3); // 21 chars
+    }
+
+    #[test]
+    fn calc_physical_rows_with_cjk() {
+        let mut r = TerminalRegion::new();
+        r.term_width = 10;
+        // "你好" = 4 visible width, fits in 10
+        assert_eq!(r.calc_physical_rows("你好"), 1);
+        // "你好你好你好" = 12 visible width, wraps to 2 rows
+        assert_eq!(r.calc_physical_rows("你好你好你好"), 2);
     }
 
     #[test]
