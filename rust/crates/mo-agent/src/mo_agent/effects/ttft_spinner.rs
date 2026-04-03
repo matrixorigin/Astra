@@ -42,8 +42,9 @@ impl TtftWaitLineSpinner {
             eprint!("{}", time_part.dim());
             eprint!(" {}", label.dim());
             eprint!(" {}", format!("{frame}").yellow());
-            if visible < w {
-                eprint!("{}", " ".repeat(w - visible));
+            // Leave 1 char margin to avoid terminal auto-wrap at exact line width
+            if visible + 1 < w {
+                eprint!("{}", " ".repeat(w - visible - 1));
             }
             let _ = io::stderr().flush();
         }
@@ -66,8 +67,9 @@ impl TtftWaitLineSpinner {
                 eprint!("{}", time_part.dim());
                 eprint!(" {}", label.dim());
                 eprint!(" {}", format!("{frame}").yellow());
-                if visible < w {
-                    eprint!("{}", " ".repeat(w - visible));
+                // Leave 1 char margin to avoid terminal auto-wrap at exact line width
+                if visible + 1 < w {
+                    eprint!("{}", " ".repeat(w - visible - 1));
                 }
                 let _ = io::stderr().flush();
             }

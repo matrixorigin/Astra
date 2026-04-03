@@ -63,7 +63,8 @@ const MAX_TERM_WIDTH: usize = 512;
 /// Clear the current stderr line (carriage return + spaces + carriage return).
 pub fn clear_stderr_line() {
     let w = term_width();
-    eprint!("\r{}\r", " ".repeat(w));
+    // Leave 1 char margin to avoid terminal auto-wrap at exact line width
+    eprint!("\r{}\r", " ".repeat(w.saturating_sub(1)));
     let _ = io::stderr().flush();
 }
 

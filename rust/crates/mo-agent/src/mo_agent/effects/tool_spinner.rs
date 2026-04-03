@@ -59,8 +59,9 @@ impl ToolRunningLineSpinner {
             eprint!(" {}", label.dim());
             eprint!(" {}", detail.as_str().dim());
             eprint!(" {}", format!("{frame}").yellow());
-            if visible < w {
-                eprint!("{}", " ".repeat(w - visible));
+            // Leave 1 char margin to avoid terminal auto-wrap at exact line width
+            if visible + 1 < w {
+                eprint!("{}", " ".repeat(w - visible - 1));
             }
             let _ = io::stderr().flush();
         }
@@ -92,8 +93,9 @@ impl ToolRunningLineSpinner {
                 eprint!(" {}", label.dim());
                 eprint!(" {}", detail_for_thread.as_str().dim());
                 eprint!(" {}", format!("{frame}").yellow());
-                if visible < w {
-                    eprint!("{}", " ".repeat(w - visible));
+                // Leave 1 char margin to avoid terminal auto-wrap at exact line width
+                if visible + 1 < w {
+                    eprint!("{}", " ".repeat(w - visible - 1));
                 }
                 let _ = io::stderr().flush();
             }

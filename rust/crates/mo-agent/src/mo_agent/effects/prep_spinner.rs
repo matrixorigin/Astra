@@ -120,7 +120,7 @@ impl PlanAssembleLineSpinner {
                     .as_ref()
                     .is_some_and(|r| r.load(Ordering::Acquire))
                 {
-                    eprint!("\r{}\r", " ".repeat(w));
+                    eprint!("\r{}\r", " ".repeat(w.saturating_sub(1)));
                     let _ = io::stderr().flush();
                     return;
                 }
@@ -135,8 +135,9 @@ impl PlanAssembleLineSpinner {
                             );
                             let visible = line.chars().count();
                             eprint!("\r{}", line);
-                            if visible < w {
-                                eprint!("{}", " ".repeat(w - visible));
+                            // Leave 1 char margin to avoid terminal auto-wrap at exact line width
+                            if visible + 1 < w {
+                                eprint!("{}", " ".repeat(w - visible - 1));
                             }
                             let _ = io::stderr().flush();
                         }
@@ -171,8 +172,9 @@ impl PlanAssembleLineSpinner {
                         eprint!("{}", time_part.dim());
                         eprint!(" {}", phase_raw.dim());
                         eprint!(" {}", format!("{frame}").yellow());
-                        if visible < w {
-                            eprint!("{}", " ".repeat(w - visible));
+                        // Leave 1 char margin to avoid terminal auto-wrap at exact line width
+                        if visible + 1 < w {
+                            eprint!("{}", " ".repeat(w - visible - 1));
                         }
                         let _ = io::stderr().flush();
                         last_shown_sec = Some(sec);
@@ -194,7 +196,8 @@ impl PlanAssembleLineSpinner {
             let _ = h.join();
         }
         let w = term_width();
-        eprint!("\r{}\r", " ".repeat(w));
+        // Leave 1 char margin to avoid terminal auto-wrap at exact line width
+        eprint!("\r{}\r", " ".repeat(w.saturating_sub(1)));
         let _ = io::stderr().flush();
     }
 }
