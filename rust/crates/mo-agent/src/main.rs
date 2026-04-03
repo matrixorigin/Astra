@@ -6,7 +6,6 @@ use std::{
     path::{Path, PathBuf},
     process::{Command as SysCommand, Stdio},
     sync::{Mutex, OnceLock},
-    time::Instant,
 };
 
 use clap::{Args, Parser, Subcommand};

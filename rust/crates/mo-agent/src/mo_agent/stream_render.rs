@@ -23,7 +23,8 @@ use std::borrow::Cow;
 use std::io::{IsTerminal, Write};
 use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::Instant;
 
 pub use mo_agent_runtime::turn::chat_turn_sse_dispatch::ChatTurnEdgePending;
 
@@ -304,6 +305,9 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                 self.render.col = 0;
             }
         }
+        // `tool_request` does not emit StopThinking; clear the thinking stderr line so it does
+        // not fight the running-tool spinner (`\r` on the same fd).
+        self.render.stop_thinking();
         // Show tool as running (in-place updatable via TerminalRegion).
         let tool_idx = if !self.quiet && !self.suppress_intermediate_output {
             Some(self.render.tool_start(tool, args))
@@ -329,7 +333,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
         // Update tool line to show completion.
         if let Some(idx) = tool_idx {
             self.render
-                .tool_done(idx, tool, status, duration_ms, &output);
+                .tool_done(idx, tool, args, status, duration_ms, &output);
         }
         self.edge_tool_round.push(EdgeToolExecResult {
             request_id: request_id.to_string(),
@@ -578,6 +582,188 @@ impl Drop for TtftWaitLineSpinner {
             let _ = h.join();
         }
     }
+}
+
+/// stderr `\r` status while a tool runs (markdown mode — same layout as TTFT wait line).
+struct ToolRunningLineSpinner {
+    stop: Arc<AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl ToolRunningLineSpinner {
+    fn start(description: String) -> Self {
+        if !io::stderr().is_terminal() {
+            return Self {
+                stop: Arc::new(AtomicBool::new(true)),
+                handle: None,
+            };
+        }
+        let detail = truncate_cli_status_detail(&description, 48);
+        let t0 = Instant::now();
+        let w = term_width();
+        let label = "Running…";
+        {
+            let time_part = format!("{:>3}s", 0u64);
+            let frame = SPINNER_FRAMES[0];
+            let visible = 2
+                + time_part.chars().count()
+                + 1
+                + label.chars().count()
+                + 1
+                + detail.chars().count()
+                + 1
+                + 1;
+            eprint!("\r  ");
+            eprint!("{}", time_part.dim());
+            eprint!(" {}", label.dim());
+            eprint!(" {}", detail.as_str().dim());
+            eprint!(" {}", format!("{frame}").yellow());
+            if visible < w {
+                eprint!("{}", " ".repeat(w - visible));
+            }
+            let _ = io::stderr().flush();
+        }
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop2 = stop.clone();
+        let detail_for_thread = detail.clone();
+        let handle = std::thread::spawn(move || {
+            let tick = std::time::Duration::from_millis(50);
+            let mut spin_idx = 1usize;
+            while !stop2.load(Ordering::Relaxed) {
+                if !interruptible_sleep(tick, &stop2) {
+                    return;
+                }
+                let sec = t0.elapsed().as_secs();
+                let frame = SPINNER_FRAMES[spin_idx % SPINNER_FRAMES.len()];
+                spin_idx += 1;
+                let time_part = format!("{:>3}s", sec);
+                let visible = 2
+                    + time_part.chars().count()
+                    + 1
+                    + label.chars().count()
+                    + 1
+                    + detail_for_thread.chars().count()
+                    + 1
+                    + 1;
+                eprint!("\r  ");
+                eprint!("{}", time_part.dim());
+                eprint!(" {}", label.dim());
+                eprint!(" {}", detail_for_thread.as_str().dim());
+                eprint!(" {}", format!("{frame}").yellow());
+                if visible < w {
+                    eprint!("{}", " ".repeat(w - visible));
+                }
+                let _ = io::stderr().flush();
+            }
+        });
+        Self {
+            stop,
+            handle: Some(handle),
+        }
+    }
+
+    fn stop_clear(mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+        clear_stderr_line();
+    }
+}
+
+impl Drop for ToolRunningLineSpinner {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
+}
+
+/// Tool lines drawn with [`TerminalRegion`] (non-markdown CLI).
+struct ToolRegionState {
+    region: super::terminal_region::TerminalRegion,
+    lines: Vec<String>,
+}
+
+/// Animates the trailing braille on the current running tool line (stdout).
+struct ToolStdoutLineAnim {
+    stop: Arc<AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl ToolStdoutLineAnim {
+    fn start(ui: Arc<Mutex<ToolRegionState>>, idx: usize, description: String) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop2 = stop.clone();
+        let handle = std::thread::spawn(move || {
+            {
+                let mut g = ui.lock().unwrap();
+                if idx < g.lines.len() {
+                    let frame = SPINNER_FRAMES[0];
+                    g.lines[idx] = format!(
+                        "  {} {} {}",
+                        "⬢".cyan(),
+                        description,
+                        format!("{frame}").yellow()
+                    );
+                    let lines = g.lines.clone();
+                    g.region.update(lines);
+                }
+            }
+            let mut spin_idx = 1usize;
+            while !stop2.load(Ordering::Relaxed) {
+                if !interruptible_sleep(std::time::Duration::from_millis(50), &stop2) {
+                    return;
+                }
+                let mut g = ui.lock().unwrap();
+                if idx >= g.lines.len() {
+                    return;
+                }
+                let frame = SPINNER_FRAMES[spin_idx % SPINNER_FRAMES.len()];
+                spin_idx += 1;
+                g.lines[idx] = format!(
+                    "  {} {} {}",
+                    "⬢".cyan(),
+                    description,
+                    format!("{frame}").yellow()
+                );
+                let lines = g.lines.clone();
+                g.region.update(lines);
+            }
+        });
+        Self {
+            stop,
+            handle: Some(handle),
+        }
+    }
+
+    fn stop_join(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
+}
+
+impl Drop for ToolStdoutLineAnim {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
+}
+
+fn truncate_cli_status_detail(s: &str, max_chars: usize) -> String {
+    let t = s.trim();
+    if t.chars().count() <= max_chars {
+        return t.to_string();
+    }
+    format!(
+        "{}…",
+        t.chars().take(max_chars.saturating_sub(1)).collect::<String>()
+    )
 }
 
 /// Which kind of spinner is shown in the single "thinking" stderr slot.
@@ -1014,10 +1200,12 @@ pub(super) struct StreamRenderState {
     /// Stderr lines written between tool calls (thinking duration, tool notices).
     #[allow(dead_code)]
     stderr_lines: usize,
-    /// Tool status region for in-place updates (⚡ running → ✓ done).
-    tool_region: super::terminal_region::TerminalRegion,
-    /// Tool status lines (one per tool).
-    tool_lines: Vec<String>,
+    /// Tool status region + lines (non-markdown); mutex so a worker thread can animate the running line.
+    tool_ui: Arc<Mutex<ToolRegionState>>,
+    /// stderr `\r` line while a tool runs (markdown streaming UX).
+    tool_stderr_running: Option<ToolRunningLineSpinner>,
+    /// Braille animation on the current running tool row (non-markdown).
+    tool_stdout_anim: Option<ToolStdoutLineAnim>,
     /// When true, do not paint the stderr reasoning viewport (plan-only / hidden assistant text).
     /// Avoids broken in-place redraw when other stderr lines (e.g. project context) were printed first,
     /// and keeps plan decomposition output readable. Reasoning is still accumulated for the API.
@@ -1046,9 +1234,25 @@ impl StreamRenderState {
                 None
             },
             stderr_lines: 0,
-            tool_region: super::terminal_region::TerminalRegion::new(),
-            tool_lines: Vec::new(),
+            tool_ui: Arc::new(Mutex::new(ToolRegionState {
+                region: super::terminal_region::TerminalRegion::new(),
+                lines: Vec::new(),
+            })),
+            tool_stderr_running: None,
+            tool_stdout_anim: None,
             suppress_reasoning_viewport,
+        }
+    }
+
+    fn stop_tool_stderr_running(&mut self) {
+        if let Some(s) = self.tool_stderr_running.take() {
+            s.stop_clear();
+        }
+    }
+
+    fn stop_tool_stdout_anim(&mut self) {
+        if let Some(mut a) = self.tool_stdout_anim.take() {
+            a.stop_join();
         }
     }
 
@@ -1155,16 +1359,33 @@ impl StreamRenderState {
 
     /// Show a tool as "running" with Cursor-style description (single line).
     fn tool_start(&mut self, tool: &str, args: &Value) -> usize {
-        let idx = self.tool_lines.len();
         let description = self.format_tool_description(tool, args);
-        let line = format!("  {} {} …", "⬢".cyan(), description);
         if self.md.is_some() {
-            eprintln!("{line}");
-            self.stderr_lines += 1;
-            return idx;
+            self.stop_tool_stderr_running();
+            if io::stderr().is_terminal() {
+                self.tool_stderr_running = Some(ToolRunningLineSpinner::start(description));
+            } else {
+                let line = format!("  {} {} …", "⬢".cyan(), description);
+                eprintln!("{line}");
+                self.stderr_lines += 1;
+            }
+            return 0;
         }
-        self.tool_lines.push(line);
-        self.tool_region.update(self.tool_lines.clone());
+        self.stop_tool_stdout_anim();
+        let idx = {
+            let mut g = self.tool_ui.lock().unwrap();
+            let idx = g.lines.len();
+            let line = format!("  {} {} …", "⬢".cyan(), description);
+            g.lines.push(line);
+            let lines = g.lines.clone();
+            g.region.update(lines);
+            idx
+        };
+        self.tool_stdout_anim = Some(ToolStdoutLineAnim::start(
+            self.tool_ui.clone(),
+            idx,
+            description,
+        ));
         idx
     }
 
@@ -1461,7 +1682,15 @@ impl StreamRenderState {
     }
 
     /// Update a tool line to show completion status with Cursor-style summary.
-    fn tool_done(&mut self, idx: usize, tool: &str, status: &str, duration_ms: u64, output: &str) {
+    fn tool_done(
+        &mut self,
+        idx: usize,
+        tool: &str,
+        args: &Value,
+        status: &str,
+        duration_ms: u64,
+        output: &str,
+    ) {
         let output_summary = self.format_output_summary(tool, output, status);
         let duration_suffix = format_duration_suffix(duration_ms);
         // Cursor-style format: original description with result appended
@@ -1476,53 +1705,47 @@ impl StreamRenderState {
             (format!("{}", "⬢".green()), summary_line)
         };
         if self.md.is_some() {
+            self.stop_tool_stderr_running();
             if !line.is_empty() {
                 eprintln!("{line}");
                 self.stderr_lines += 1;
             }
             return;
         }
-        if idx < self.tool_lines.len() {
+        self.stop_tool_stdout_anim();
+        let description = self.format_tool_description(tool, args);
+        let mut g = self.tool_ui.lock().unwrap();
+        if idx < g.lines.len() {
             if status != "error" {
-                // Update the first line: swap icon to green ⬢, remove spinner, append duration
-                let first = &self.tool_lines[idx];
-                let base = if first.ends_with(" …") {
-                    first.trim_end_matches(" …").to_string()
-                } else {
-                    first.clone()
-                };
-                // Replace cyan ⬢ with green ⬢
-                let base = base.replacen(&format!("{}", "⬢".cyan()), &icon, 1);
+                // Rebuild the row from tool+args so we drop any trailing braille from the animator.
+                let base_row = format!("  {} {}", "⬢".cyan(), description);
+                let base = base_row.replacen(&format!("{}", "⬢".cyan()), &icon, 1);
                 let dur = if duration_suffix.is_empty() {
                     String::new()
                 } else {
                     format!("{}", duration_suffix.dim())
                 };
-                self.tool_lines[idx] = format!("{base}{dur}");
+                g.lines[idx] = format!("{base}{dur}");
                 if !line.is_empty() {
                     let insert_pos = idx + 1;
-                    if insert_pos <= self.tool_lines.len() {
-                        self.tool_lines.insert(insert_pos, line);
+                    if insert_pos <= g.lines.len() {
+                        g.lines.insert(insert_pos, line);
                     }
                 }
             } else {
-                // Error: replace entire line with red icon
-                let first = &self.tool_lines[idx];
-                let base = if first.ends_with(" …") {
-                    first.trim_end_matches(" …").to_string()
-                } else {
-                    first.clone()
-                };
-                let base = base.replacen(&format!("{}", "⬢".cyan()), &icon, 1);
-                self.tool_lines[idx] = base;
+                // Error: replace icon with ✗, keep description
+                let base_row = format!("  {} {}", "⬢".cyan(), description);
+                let base = base_row.replacen(&format!("{}", "⬢".cyan()), &icon, 1);
+                g.lines[idx] = base;
                 if !line.is_empty() {
                     let insert_pos = idx + 1;
-                    if insert_pos <= self.tool_lines.len() {
-                        self.tool_lines.insert(insert_pos, line);
+                    if insert_pos <= g.lines.len() {
+                        g.lines.insert(insert_pos, line);
                     }
                 }
             }
-            self.tool_region.update(self.tool_lines.clone());
+            let lines = g.lines.clone();
+            g.region.update(lines);
         }
     }
 
@@ -1721,8 +1944,10 @@ impl StreamRenderState {
     /// Clear tool status region (for intermediate turns before next SSE stream).
     #[allow(dead_code)]
     fn clear_tool_region(&mut self) {
-        self.tool_region.clear();
-        self.tool_lines.clear();
+        self.stop_tool_stdout_anim();
+        let mut g = self.tool_ui.lock().unwrap();
+        g.region.clear();
+        g.lines.clear();
     }
 }
 
