@@ -719,6 +719,181 @@ pub async fn resolve_active_skill_versions(
     Ok(versions)
 }
 
+// ─── Expired Data Cleanup ────────────────────────────────────────────────────
+
+/// Result of a single table cleanup operation.
+#[derive(Debug, Clone)]
+pub struct CleanupResult {
+    pub table: &'static str,
+    pub rows_deleted: u64,
+}
+
+/// Configuration for data retention policies.
+pub struct RetentionPolicy {
+    /// Max age in days for expired/revoked refresh tokens (default: 7)
+    pub refresh_token_days: u32,
+    /// Max age in days for expired auth tokens (default: 30)
+    pub auth_token_days: u32,
+    /// Max age in days for expired task leases (default: 7)
+    pub task_lease_days: u32,
+    /// Max age in days for idempotency cache entries (default: 3)
+    pub idempotency_cache_days: u32,
+    /// Max age in days for sync log entries (default: 30)
+    pub sync_log_days: u32,
+    /// Max age in days for audit logs (default: 90)
+    pub audit_log_days: u32,
+}
+
+impl Default for RetentionPolicy {
+    fn default() -> Self {
+        Self {
+            refresh_token_days: 7,
+            auth_token_days: 30,
+            task_lease_days: 7,
+            idempotency_cache_days: 3,
+            sync_log_days: 30,
+            audit_log_days: 90,
+        }
+    }
+}
+
+/// Purge expired data across all tables with TTL/expiry semantics.
+///
+/// Returns a list of per-table cleanup results showing how many rows were deleted.
+/// Each DELETE uses a LIMIT to avoid long-running locks; callers should invoke
+/// repeatedly until all results show 0 rows deleted for a full sweep.
+pub async fn cleanup_expired_data(
+    pool: &sqlx::Pool<MySql>,
+    policy: &RetentionPolicy,
+) -> Vec<CleanupResult> {
+    const BATCH_LIMIT: u32 = 1000;
+    let mut results = Vec::new();
+
+    // 1. Expired + revoked refresh tokens
+    let deleted = sqlx::query(
+        "DELETE FROM auth_refresh_tokens \
+         WHERE (expires_at < NOW(6) OR is_revoked = 1) \
+           AND created_at < DATE_SUB(NOW(6), INTERVAL ? DAY) \
+         LIMIT ?",
+    )
+    .bind(policy.refresh_token_days)
+    .bind(BATCH_LIMIT)
+    .execute(pool)
+    .await
+    .map(|r| r.rows_affected())
+    .unwrap_or(0);
+    results.push(CleanupResult {
+        table: "auth_refresh_tokens",
+        rows_deleted: deleted,
+    });
+
+    // 2. Expired or inactive auth tokens
+    let deleted = sqlx::query(
+        "DELETE FROM auth_tokens \
+         WHERE is_active = 0 \
+           AND created_at < DATE_SUB(NOW(6), INTERVAL ? DAY) \
+         LIMIT ?",
+    )
+    .bind(policy.auth_token_days)
+    .bind(BATCH_LIMIT)
+    .execute(pool)
+    .await
+    .map(|r| r.rows_affected())
+    .unwrap_or(0);
+    results.push(CleanupResult {
+        table: "auth_tokens (inactive)",
+        rows_deleted: deleted,
+    });
+
+    // Also clean expired auth tokens (those with expires_at in the past)
+    let deleted = sqlx::query(
+        "DELETE FROM auth_tokens \
+         WHERE expires_at IS NOT NULL \
+           AND expires_at < DATE_SUB(NOW(6), INTERVAL ? DAY) \
+         LIMIT ?",
+    )
+    .bind(policy.auth_token_days)
+    .bind(BATCH_LIMIT)
+    .execute(pool)
+    .await
+    .map(|r| r.rows_affected())
+    .unwrap_or(0);
+    results.push(CleanupResult {
+        table: "auth_tokens (expired)",
+        rows_deleted: deleted,
+    });
+
+    // 3. Expired task leases
+    let deleted = sqlx::query(
+        "DELETE FROM task_leases \
+         WHERE expires_at < DATE_SUB(NOW(6), INTERVAL ? DAY) \
+         LIMIT ?",
+    )
+    .bind(policy.task_lease_days)
+    .bind(BATCH_LIMIT)
+    .execute(pool)
+    .await
+    .map(|r| r.rows_affected())
+    .unwrap_or(0);
+    results.push(CleanupResult {
+        table: "task_leases",
+        rows_deleted: deleted,
+    });
+
+    // 4. Stale idempotency cache entries
+    let deleted = sqlx::query(
+        "DELETE FROM step_idempotency_cache \
+         WHERE created_at < DATE_SUB(NOW(6), INTERVAL ? DAY) \
+         LIMIT ?",
+    )
+    .bind(policy.idempotency_cache_days)
+    .bind(BATCH_LIMIT)
+    .execute(pool)
+    .await
+    .map(|r| r.rows_affected())
+    .unwrap_or(0);
+    results.push(CleanupResult {
+        table: "step_idempotency_cache",
+        rows_deleted: deleted,
+    });
+
+    // 5. Old sync log entries
+    let deleted = sqlx::query(
+        "DELETE FROM session_sync_log \
+         WHERE created_at < DATE_SUB(NOW(6), INTERVAL ? DAY) \
+         LIMIT ?",
+    )
+    .bind(policy.sync_log_days)
+    .bind(BATCH_LIMIT)
+    .execute(pool)
+    .await
+    .map(|r| r.rows_affected())
+    .unwrap_or(0);
+    results.push(CleanupResult {
+        table: "session_sync_log",
+        rows_deleted: deleted,
+    });
+
+    // 6. Old audit logs
+    let deleted = sqlx::query(
+        "DELETE FROM auth_audit_logs \
+         WHERE created_at < DATE_SUB(NOW(6), INTERVAL ? DAY) \
+         LIMIT ?",
+    )
+    .bind(policy.audit_log_days)
+    .bind(BATCH_LIMIT)
+    .execute(pool)
+    .await
+    .map(|r| r.rows_affected())
+    .unwrap_or(0);
+    results.push(CleanupResult {
+        table: "auth_audit_logs",
+        rows_deleted: deleted,
+    });
+
+    results
+}
+
 #[cfg(test)]
 mod tests {
     use super::is_missing_skills_registry_message;

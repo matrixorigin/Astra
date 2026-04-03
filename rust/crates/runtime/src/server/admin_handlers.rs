@@ -150,3 +150,35 @@ pub(super) async fn admin_revoke_role_handler(
 
     Ok(Json(AdminUserRoleResponse::from(result)))
 }
+
+/// POST /admin/cleanup — trigger immediate expired data cleanup.
+pub(super) async fn admin_cleanup_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    state.admin_authorizer.require_admin(&headers).await?;
+
+    let pool = state
+        .shared_pool
+        .as_ref()
+        .ok_or_else(|| internal_error("database pool not available"))?;
+
+    let policy = mo_agent_services::RetentionPolicy::default();
+    let results = mo_agent_services::cleanup_expired_data(pool.get(), &policy).await;
+
+    let total: u64 = results.iter().map(|r| r.rows_deleted).sum();
+    let details: Vec<serde_json::Value> = results
+        .iter()
+        .map(|r| {
+            serde_json::json!({
+                "table": r.table,
+                "rows_deleted": r.rows_deleted,
+            })
+        })
+        .collect();
+
+    Ok(Json(serde_json::json!({
+        "total_deleted": total,
+        "tables": details,
+    })))
+}

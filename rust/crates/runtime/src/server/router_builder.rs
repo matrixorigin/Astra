@@ -140,6 +140,10 @@ pub(super) fn build_router(state: AppState) -> Router {
                 .post(admin_handlers::admin_create_token_handler),
         )
         .route(
+            "/admin/cleanup",
+            post(admin_handlers::admin_cleanup_handler),
+        )
+        .route(
             "/api/v1/learning/health",
             get(learning_handlers::learning_health_handler),
         )

@@ -72,6 +72,46 @@ pub async fn serve(addr: SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
     let settings = AppSettings::from_env()?;
     let state = state_builder::build_server_state(settings).await?;
 
+    // Spawn periodic expired data cleanup (runs every 6 hours)
+    if let Some(ref pool) = state.shared_pool {
+        spawn_data_cleanup(pool.clone());
+    }
+
     axum::serve(listener, build_app(state)).await?;
     Ok(())
+}
+
+/// Spawn a background task that periodically cleans up expired data.
+fn spawn_data_cleanup(pool: mo_agent_core::SharedPool) {
+    use mo_agent_services::RetentionPolicy;
+    use std::time::Duration;
+
+    let cleanup_interval = Duration::from_secs(
+        std::env::var("MO_CLEANUP_INTERVAL_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(6 * 3600), // default: 6 hours
+    );
+
+    tokio::spawn(async move {
+        let policy = RetentionPolicy::default();
+        let mut interval = tokio::time::interval(cleanup_interval);
+        interval.tick().await; // skip immediate first tick
+        loop {
+            interval.tick().await;
+            let results = mo_agent_services::cleanup_expired_data(pool.get(), &policy).await;
+            let total: u64 = results.iter().map(|r| r.rows_deleted).sum();
+            if total > 0 {
+                eprintln!(
+                    "[cleanup] Purged {total} expired rows: {}",
+                    results
+                        .iter()
+                        .filter(|r| r.rows_deleted > 0)
+                        .map(|r| format!("{}={}", r.table, r.rows_deleted))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+            }
+        }
+    });
 }
