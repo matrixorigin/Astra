@@ -94,17 +94,30 @@ async fn collect_sse_text(resp: reqwest::Response, stream_to_stderr: bool) -> Ss
 /// Enrich a `ProjectContext` with learned plan templates from cloud storage.
 ///
 /// Best-effort: returns quietly if no cloud connection or query fails.
+/// When `verbose` is true, shows a message when searching (useful for debugging).
 async fn enrich_with_templates(
     context: &mut plan_decompose::ProjectContext,
     matrix_runtime: Option<&std::sync::Arc<mo_agent_runtime::MatrixCloudRuntime>>,
     user_id: Option<&str>,
     goal: &str,
+    verbose: bool,
 ) {
     let Some(mc) = matrix_runtime else {
+        if verbose {
+            eprintln!(
+                "  {} No cloud connection — skipping template search",
+                "⋯".dim()
+            );
+        }
         return;
     };
     let pool = mc.shared_pool().get();
     let uid = user_id.unwrap_or("anonymous");
+
+    if verbose {
+        eprintln!("  {} Searching for similar plan templates...", "⋯".dim());
+    }
+
     let templates = plan_decompose::query_similar_templates(pool, uid, goal, 3).await;
     if !templates.is_empty() {
         eprintln!(
@@ -114,6 +127,8 @@ async fn enrich_with_templates(
             if templates.len() == 1 { "" } else { "s" }
         );
         context.prior_templates = templates;
+    } else if verbose {
+        eprintln!("  {} No matching templates found", "⋯".dim());
     }
 }
 
@@ -460,6 +475,7 @@ pub(super) async fn handle_memory_domain_command(
                         state.matrix_runtime.as_ref(),
                         state.ingestion_user_id.as_deref(),
                         sub_arg,
+                        state.verbose_mode,
                     )
                     .await;
 
@@ -554,6 +570,7 @@ pub(super) async fn handle_memory_domain_command(
                         state.matrix_runtime.as_ref(),
                         state.ingestion_user_id.as_deref(),
                         sub_arg,
+                        state.verbose_mode,
                     )
                     .await;
 
@@ -1380,6 +1397,7 @@ pub(super) async fn handle_memory_domain_command(
                         state.matrix_runtime.as_ref(),
                         state.ingestion_user_id.as_deref(),
                         sub_arg,
+                        state.verbose_mode,
                     )
                     .await;
                     let prompt = decomposition_prompt(sub_arg, &context);
@@ -1553,6 +1571,7 @@ pub async fn handle_plan_mode_input(
             state.matrix_runtime.as_ref(),
             state.ingestion_user_id.as_deref(),
             &goal_with_context,
+            state.verbose_mode,
         )
         .await;
         let prompt = decomposition_prompt(&goal_with_context, &plan_state.context);
@@ -1688,6 +1707,7 @@ pub async fn handle_plan_mode_input(
                     state.matrix_runtime.as_ref(),
                     state.ingestion_user_id.as_deref(),
                     &goal,
+                    state.verbose_mode,
                 )
                 .await;
                 let prompt = decomposition_prompt(&goal, &plan_state.context);
