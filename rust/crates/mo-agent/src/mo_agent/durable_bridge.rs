@@ -399,7 +399,7 @@ pub async fn on_plan_complete(durable: &mut DurableTaskState) -> bool {
 }
 
 /// Pretty-print the final delivery report.
-fn display_delivery_report(report: &TaskDeliveryReport) {
+pub(super) fn display_delivery_report(report: &TaskDeliveryReport) {
     let all_subtasks_verified = report
         .subtask_summaries
         .iter()
@@ -571,7 +571,7 @@ fn display_delivery_report(report: &TaskDeliveryReport) {
 
 /// Save the delivery report as JSON to the working directory.
 /// Prints the file path on success (dim grey, non-intrusive).
-fn save_delivery_report_json(report: &TaskDeliveryReport) {
+pub(super) fn save_delivery_report_json(report: &TaskDeliveryReport) {
     let filename = format!(
         ".mo-delivery-{}.json",
         report.contract_id.chars().take(8).collect::<String>()

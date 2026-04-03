@@ -1315,6 +1315,27 @@ pub(super) async fn handle_info_command(
             }
         }
 
+        "/report" => {
+            // Check active durable task state first, then fallback to last saved report
+            let report = state
+                .durable_task_state
+                .as_ref()
+                .and_then(|d| d.last_report.as_ref())
+                .or(state.last_delivery_report.as_ref());
+
+            if let Some(report) = report {
+                super::durable_bridge::display_delivery_report(report);
+                if arg.trim() == "save" || arg.trim() == "json" {
+                    super::durable_bridge::save_delivery_report_json(report);
+                }
+            } else {
+                eprintln!(
+                    "{}",
+                    "  No delivery report available. Complete a plan with /plan first.".dim()
+                );
+            }
+        }
+
         _ => unreachable!("unexpected info command: {cmd}"),
     }
 

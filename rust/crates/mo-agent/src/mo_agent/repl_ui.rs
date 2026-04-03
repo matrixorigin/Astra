@@ -65,6 +65,10 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
         "All journals + cwd / git / age from workspace",
     ),
     ("/skill", "Skill management: /skill [list|new|dev|test]"),
+    (
+        "/report",
+        "Show last delivery report (/report save = re-export JSON)",
+    ),
 ];
 
 fn command_matches_filter(command: &str, desc: &str, filter: &str) -> bool {
@@ -1066,6 +1070,7 @@ pub(super) fn print_slash_commands(query: Option<&str>) {
                 "/session list",
                 "/resume",
                 "/plan",
+                "/report",
             ],
         ),
         ("🧠", "Skills", &["/skill"]),

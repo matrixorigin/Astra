@@ -509,6 +509,8 @@ struct ReplState {
     skill_classification_cache: skill_instructions::SkillClassificationCache,
     /// Active durable-task contract for plan execution verification.
     durable_task_state: Option<durable_bridge::DurableTaskState>,
+    /// Last delivery report — kept after plan completion so `/report` works post-plan.
+    last_delivery_report: Option<mo_agent_services::durable_task::TaskDeliveryReport>,
     /// Stacked operator notes while plan execution is paused (`correct` / `note` at ⏸>).
     plan_execution_corrections: Vec<String>,
     /// Delegation engine for multi-agent coordination during plan execution.
@@ -569,6 +571,7 @@ impl Default for ReplState {
             )),
             skill_classification_cache: skill_instructions::SkillClassificationCache::default(),
             durable_task_state: None,
+            last_delivery_report: None,
             plan_execution_corrections: Vec::new(),
             delegation_engine: None,
         }
@@ -2313,6 +2316,12 @@ async fn run_plan_execution(
 
             // Clean up execution state (if fully done)
             if pct == 100 {
+                // Preserve the delivery report for /report command before clearing durable state
+                if let Some(ref durable) = state.durable_task_state
+                    && let Some(ref report) = durable.last_report
+                {
+                    state.last_delivery_report = Some(report.clone());
+                }
                 state.plan_execution_config = None;
                 state.executing_plan_goal = None;
                 state.plan_execution_rounds = 0;
@@ -3505,7 +3514,7 @@ async fn handle_slash_command(
         "/debug" => handle_debug_command(arg, state),
 
         "/history" | "/search" | "/review" | "/copy" | "/doctor" | "/context" | "/version"
-        | "/rewind" | "/turn" => {
+        | "/rewind" | "/turn" | "/report" => {
             handle_info_command(cmd, arg, api, state, token).await?;
         }
 
