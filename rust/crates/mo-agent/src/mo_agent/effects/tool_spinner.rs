@@ -72,7 +72,8 @@ impl ToolRunningLineSpinner {
         let handle = std::thread::spawn(move || {
             let tick = std::time::Duration::from_millis(50);
             let mut spin_idx = 1usize;
-            while !stop2.load(Ordering::Relaxed) {
+            // Use Acquire to pair with Release in stop_clear()/Drop
+            while !stop2.load(Ordering::Acquire) {
                 if !interruptible_sleep(tick, &stop2) {
                     return;
                 }
@@ -108,7 +109,8 @@ impl ToolRunningLineSpinner {
 
     /// Stop the spinner and clear its line.
     pub fn stop_clear(mut self) {
-        self.stop.store(true, Ordering::Relaxed);
+        // Use Release to pair with Acquire in the spinner thread
+        self.stop.store(true, Ordering::Release);
         if let Some(h) = self.handle.take() {
             let _ = h.join();
         }
@@ -118,10 +120,13 @@ impl ToolRunningLineSpinner {
 
 impl Drop for ToolRunningLineSpinner {
     fn drop(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
+        // Use Release to pair with Acquire in the spinner thread
+        self.stop.store(true, Ordering::Release);
         if let Some(h) = self.handle.take() {
             let _ = h.join();
         }
+        // Clear line on drop too (e.g., panic unwind)
+        clear_stderr_line();
     }
 }
 
@@ -155,7 +160,8 @@ impl ToolStdoutLineAnim {
                 }
             }
             let mut spin_idx = 1usize;
-            while !stop2.load(Ordering::Relaxed) {
+            // Use Acquire to pair with Release in stop_join()/Drop
+            while !stop2.load(Ordering::Acquire) {
                 if !interruptible_sleep(std::time::Duration::from_millis(50), &stop2) {
                     return;
                 }
@@ -183,7 +189,8 @@ impl ToolStdoutLineAnim {
 
     /// Stop the animation and wait for thread to exit.
     pub fn stop_join(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
+        // Use Release to pair with Acquire in the spinner thread
+        self.stop.store(true, Ordering::Release);
         if let Some(h) = self.handle.take() {
             let _ = h.join();
         }
@@ -192,7 +199,8 @@ impl ToolStdoutLineAnim {
 
 impl Drop for ToolStdoutLineAnim {
     fn drop(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
+        // Use Release to pair with Acquire in the spinner thread
+        self.stop.store(true, Ordering::Release);
         if let Some(h) = self.handle.take() {
             let _ = h.join();
         }

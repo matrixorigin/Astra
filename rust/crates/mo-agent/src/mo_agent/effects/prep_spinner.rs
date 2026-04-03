@@ -117,7 +117,8 @@ impl PlanAssembleLineSpinner {
             let w = term_width();
             let mut last_shown_sec: Option<u64> = None;
             let mut spin_idx = 0usize;
-            while !stop2.load(Ordering::Relaxed) {
+            // Use Acquire to pair with Release in stop_clear()/Drop
+            while !stop2.load(Ordering::Acquire) {
                 // `Release` store in `fetch_chat_turn_sse` after successful POST headers.
                 if line_release
                     .as_ref()
@@ -183,7 +184,10 @@ impl PlanAssembleLineSpinner {
                         last_shown_sec = Some(sec);
                     }
                 }
-                std::thread::sleep(tick);
+                // Use interruptible sleep so stop_clear() doesn't block waiting for tick
+                if !interruptible_sleep(tick, &stop2) {
+                    return;
+                }
             }
         });
         Self {
@@ -194,10 +198,16 @@ impl PlanAssembleLineSpinner {
 
     /// Stop the spinner and clear its line.
     pub fn stop_clear(mut self) {
-        self.stop.store(true, Ordering::Relaxed);
+        // Use Release to pair with Acquire in the spinner thread
+        self.stop.store(true, Ordering::Release);
         if let Some(h) = self.handle.take() {
             let _ = h.join();
         }
+        Self::clear_line();
+    }
+
+    /// Clear the spinner line on stderr.
+    fn clear_line() {
         let w = term_width();
         // Leave 1 char margin to avoid terminal auto-wrap at exact line width
         eprint!("\r{}\r", " ".repeat(w.saturating_sub(1)));
@@ -207,9 +217,12 @@ impl PlanAssembleLineSpinner {
 
 impl Drop for PlanAssembleLineSpinner {
     fn drop(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
+        // Use Release to pair with Acquire in the spinner thread
+        self.stop.store(true, Ordering::Release);
         if let Some(h) = self.handle.take() {
             let _ = h.join();
         }
+        // Clear line on drop too (e.g., panic unwind) to avoid residual spinner
+        Self::clear_line();
     }
 }

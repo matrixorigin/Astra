@@ -121,7 +121,6 @@ fn readline_thread_main(
     use crate::repl_ui::take_slash_pending_execute;
 
     while let Ok(req) = req_rx.recv() {
-
         match req {
             ReadlineRequest::ReadLine(prompt) => {
                 let result = editor.readline(&prompt);

@@ -39,7 +39,8 @@ impl Spinner {
                 return;
             }
             let mut idx = 0usize;
-            while !stop2.load(Ordering::Relaxed) {
+            // Use Acquire to pair with Release in stop_clear()/Drop
+            while !stop2.load(Ordering::Acquire) {
                 let frame = SPINNER_FRAMES[idx % SPINNER_FRAMES.len()];
                 eprint!(
                     "\r  {} {}",
@@ -48,7 +49,10 @@ impl Spinner {
                 );
                 let _ = io::stderr().flush();
                 idx += 1;
-                std::thread::sleep(std::time::Duration::from_millis(80));
+                // Use interruptible sleep so stop_clear() doesn't block
+                if !interruptible_sleep(std::time::Duration::from_millis(80), &stop2) {
+                    return;
+                }
             }
         });
         Self {
@@ -59,7 +63,8 @@ impl Spinner {
 
     /// Stop the spinner and clear its line.
     pub fn stop_clear(mut self) {
-        self.stop.store(true, Ordering::Relaxed);
+        // Use Release to pair with Acquire in the spinner thread
+        self.stop.store(true, Ordering::Release);
         if let Some(h) = self.handle.take() {
             let _ = h.join();
         }
@@ -69,9 +74,12 @@ impl Spinner {
 
 impl Drop for Spinner {
     fn drop(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
+        // Use Release to pair with Acquire in the spinner thread
+        self.stop.store(true, Ordering::Release);
         if let Some(h) = self.handle.take() {
             let _ = h.join();
         }
+        // Clear line on drop too (e.g., panic unwind)
+        clear_stderr_line();
     }
 }

@@ -78,17 +78,18 @@ pub fn term_width() -> usize {
 
 /// Sleep for the given duration, but wake early if `stop` becomes true.
 /// Returns true if sleep completed normally, false if interrupted early.
+/// Uses Acquire ordering to pair with Release in stop_clear()/Drop.
 pub fn interruptible_sleep(duration: std::time::Duration, stop: &AtomicBool) -> bool {
     let poll = std::time::Duration::from_millis(INTERRUPTIBLE_POLL_MS);
     let deadline = std::time::Instant::now() + duration;
     while std::time::Instant::now() < deadline {
-        if stop.load(Ordering::Relaxed) {
+        if stop.load(Ordering::Acquire) {
             return false;
         }
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
         std::thread::sleep(remaining.min(poll));
     }
-    !stop.load(Ordering::Relaxed)
+    !stop.load(Ordering::Acquire)
 }
 
 /// Which kind of spinner is shown in the single "thinking" stderr slot.
