@@ -1043,6 +1043,8 @@ pub struct RetentionPolicy {
     pub sync_log_days: u32,
     /// Max age in days for audit logs (default: 90)
     pub audit_log_days: u32,
+    /// Max age in days for agent events (default: 90)
+    pub event_days: u32,
 }
 
 impl Default for RetentionPolicy {
@@ -1054,6 +1056,7 @@ impl Default for RetentionPolicy {
             idempotency_cache_days: 3,
             sync_log_days: 30,
             audit_log_days: 90,
+            event_days: 90,
         }
     }
 }
@@ -1189,6 +1192,23 @@ pub async fn cleanup_expired_data(
     .unwrap_or(0);
     results.push(CleanupResult {
         table: "auth_audit_logs",
+        rows_deleted: deleted,
+    });
+
+    // 7. Old agent events
+    let deleted = sqlx::query(
+        "DELETE FROM agent_events \
+         WHERE created_at < DATE_SUB(NOW(6), INTERVAL ? DAY) \
+         LIMIT ?",
+    )
+    .bind(policy.event_days)
+    .bind(BATCH_LIMIT)
+    .execute(pool)
+    .await
+    .map(|r| r.rows_affected())
+    .unwrap_or(0);
+    results.push(CleanupResult {
+        table: "agent_events",
         rows_deleted: deleted,
     });
 

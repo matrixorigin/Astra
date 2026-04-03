@@ -576,17 +576,11 @@ fn save_delivery_report_json(report: &TaskDeliveryReport) {
         ".mo-delivery-{}.json",
         report.contract_id.chars().take(8).collect::<String>()
     );
-    let path = std::env::current_dir()
-        .unwrap_or_default()
-        .join(&filename);
+    let path = std::env::current_dir().unwrap_or_default().join(&filename);
     match serde_json::to_string_pretty(report) {
         Ok(json) => {
             if let Err(e) = std::fs::write(&path, &json) {
-                eprintln!(
-                    "  {}  Could not save report: {}",
-                    "⚠".yellow(),
-                    e,
-                );
+                eprintln!("  {}  Could not save report: {}", "⚠".yellow(), e,);
             } else {
                 eprintln!(
                     "  {}",
@@ -595,11 +589,7 @@ fn save_delivery_report_json(report: &TaskDeliveryReport) {
             }
         }
         Err(e) => {
-            eprintln!(
-                "  {}  Could not serialize report: {}",
-                "⚠".yellow(),
-                e,
-            );
+            eprintln!("  {}  Could not serialize report: {}", "⚠".yellow(), e,);
         }
     }
 }
