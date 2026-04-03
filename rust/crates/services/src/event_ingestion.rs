@@ -419,6 +419,12 @@ impl EventIngestionWorker {
             return Ok(());
         }
 
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| format!("begin tx: {e}"))?;
+
         // Multi-row INSERT IGNORE — single round-trip for the whole batch
         let placeholders: Vec<String> = (0..events.len())
             .map(|_| "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)".to_string())
@@ -450,7 +456,7 @@ impl EventIngestionWorker {
         }
 
         query
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await
             .map_err(|e| format!("batch insert ({} events): {e}", events.len()))?;
 
@@ -466,7 +472,7 @@ impl EventIngestionWorker {
             )
             .bind(*count as i64)
             .bind(*session_id)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await
             .map_err(|e| format!("event_count update for {session_id}: {e}"))?;
         }
@@ -479,11 +485,15 @@ impl EventIngestionWorker {
                      WHERE session_id = ? AND status != 'ended'",
                 )
                 .bind(&event.session_id)
-                .execute(&self.pool)
+                .execute(&mut *tx)
                 .await
                 .map_err(|e| format!("session close for {}: {e}", event.session_id))?;
             }
         }
+
+        tx.commit()
+            .await
+            .map_err(|e| format!("commit tx: {e}"))?;
 
         Ok(())
     }

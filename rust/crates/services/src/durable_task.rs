@@ -2233,40 +2233,6 @@ impl MatrixOneDurableTaskLifecycle {
         Ok(())
     }
 
-    async fn save_verification_result(
-        &self,
-        task_id: &str,
-        contract_id: &str,
-        session_id: &str,
-        subtask_id: &str,
-        result: &VerificationResult,
-        attempt: u32,
-    ) -> Result<(), String> {
-        let result_id = uuid::Uuid::new_v4().to_string();
-        sqlx::query(
-            "INSERT INTO task_verification_results \
-             (result_id, contract_id, task_id, subtask_id, criterion_id, \
-              session_id, passed, evidence, expected, duration_ms, error_message, attempt) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        )
-        .bind(&result_id)
-        .bind(contract_id)
-        .bind(task_id)
-        .bind(subtask_id)
-        .bind(&result.criterion_id)
-        .bind(session_id)
-        .bind(if result.passed { 1i32 } else { 0i32 })
-        .bind(&result.evidence)
-        .bind(&result.expected)
-        .bind(result.duration_ms as i64)
-        .bind(&result.error)
-        .bind(attempt as i32)
-        .execute(&self.pool)
-        .await
-        .map_err(|e| format!("save_verification: {e}"))?;
-        Ok(())
-    }
-
     async fn load_verification_history(
         &self,
         task_id: &str,
@@ -2594,18 +2560,36 @@ impl DurableTaskLifecycle for MatrixOneDurableTaskLifecycle {
         let runner = self.runner();
         let report = runner.verify_subtask(&durable_st).await;
 
-        // Persist each result
+        // Persist verification results + contract update atomically
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| format!("begin tx: {e}"))?;
+
         for r in &report.results {
-            let _ = self
-                .save_verification_result(
-                    task_id,
-                    &contract.contract_id,
-                    &self.session_id,
-                    subtask_id,
-                    r,
-                    durable_st.retry_count + 1,
-                )
-                .await;
+            let result_id = uuid::Uuid::new_v4().to_string();
+            sqlx::query(
+                "INSERT INTO task_verification_results \
+                 (result_id, contract_id, task_id, subtask_id, criterion_id, \
+                  session_id, passed, evidence, expected, duration_ms, error_message, attempt) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&result_id)
+            .bind(&contract.contract_id)
+            .bind(task_id)
+            .bind(subtask_id)
+            .bind(&r.criterion_id)
+            .bind(&self.session_id)
+            .bind(if r.passed { 1i32 } else { 0i32 })
+            .bind(&r.evidence)
+            .bind(&r.expected)
+            .bind(r.duration_ms as i64)
+            .bind(&r.error)
+            .bind((durable_st.retry_count + 1) as i32)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| format!("save_verification in tx: {e}"))?;
         }
 
         // Update stage + git4data actions
@@ -2644,7 +2628,43 @@ impl DurableTaskLifecycle for MatrixOneDurableTaskLifecycle {
             }
         }
 
-        self.persist_contract(&contract).await?;
+        // Persist contract update inside the same transaction
+        {
+            let scope_json = serde_json::to_string(&contract.scope)
+                .map_err(|e| format!("scope json: {e}"))?;
+            let subtasks_json = serde_json::to_string(&contract.subtasks)
+                .map_err(|e| format!("subtasks json: {e}"))?;
+            let criteria_json = serde_json::to_string(&contract.global_verification)
+                .map_err(|e| format!("criteria json: {e}"))?;
+
+            sqlx::query(
+                "INSERT INTO task_contracts \
+                 (contract_id, task_id, session_id, user_id, goal, scope_json, \
+                  subtasks_json, criteria_json, version, status, created_at, updated_at) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), NOW()) \
+                 ON DUPLICATE KEY UPDATE \
+                 subtasks_json = VALUES(subtasks_json), criteria_json = VALUES(criteria_json), \
+                 scope_json = VALUES(scope_json), version = VALUES(version), \
+                 status = VALUES(status), updated_at = NOW()",
+            )
+            .bind(&contract.contract_id)
+            .bind(&contract.task_id)
+            .bind("")
+            .bind("")
+            .bind(&contract.goal)
+            .bind(&scope_json)
+            .bind(&subtasks_json)
+            .bind(&criteria_json)
+            .bind(contract.version as i32)
+            .bind(contract.status.as_str())
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| format!("persist_contract in tx: {e}"))?;
+        }
+
+        tx.commit()
+            .await
+            .map_err(|e| format!("commit verify tx: {e}"))?;
 
         // Emit verification result event
         let passed_count = report.results.iter().filter(|r| r.passed).count();
