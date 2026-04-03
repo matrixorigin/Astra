@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use axum::{Json, http::StatusCode};
 use serde::{Deserialize, Serialize};
-use sqlx::{MySql, QueryBuilder, Row, query};
+use sqlx::{Acquire, MySql, QueryBuilder, Row, query};
 use uuid::Uuid;
 
 use mo_agent_core::{
@@ -164,9 +164,13 @@ impl EventService for DatabaseEventService {
     ) -> Result<EventRecord, (StatusCode, Json<ErrorResponse>)> {
         let pool = self.get_pool().await.map_err(internal_error)?;
 
+        // Start transaction for atomicity of INSERT event + UPDATE session
+        let mut conn = pool.acquire().await.map_err(internal_error)?;
+        let mut tx = conn.begin().await.map_err(internal_error)?;
+
         let session_row = query("SELECT user_id FROM agent_sessions WHERE session_id = ?")
             .bind(&request.session_id)
-            .fetch_optional(&pool)
+            .fetch_optional(&mut *tx)
             .await
             .map_err(internal_error)?;
         let session_row = session_row.ok_or_else(|| {
@@ -226,16 +230,17 @@ impl EventService for DatabaseEventService {
         .bind(&metadata_str)
         .bind(&meta_tool_name)
         .bind(meta_duration_ms)
-        .execute(&pool)
+        .execute(&mut *tx)
         .await
         .map_err(internal_error)?;
 
-        let _ = query(
+        query(
             "UPDATE agent_sessions SET event_count = event_count + 1, updated_at = NOW() WHERE session_id = ?",
         )
         .bind(&request.session_id)
-        .execute(&pool)
-        .await;
+        .execute(&mut *tx)
+        .await
+        .map_err(internal_error)?;
 
         let select_sql = format!(
             "SELECT {} FROM agent_events WHERE event_id = ?",
@@ -243,11 +248,15 @@ impl EventService for DatabaseEventService {
         );
         let row = query(&select_sql)
             .bind(&event_id)
-            .fetch_one(&pool)
+            .fetch_one(&mut *tx)
             .await
             .map_err(internal_error)?;
 
-        Self::event_record_from_row(row)
+        let result = Self::event_record_from_row(row)?;
+
+        tx.commit().await.map_err(internal_error)?;
+
+        Ok(result)
     }
 
     async fn list_events(

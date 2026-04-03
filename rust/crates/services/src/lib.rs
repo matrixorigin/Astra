@@ -79,6 +79,7 @@ pub use decisions::{
     DatabaseDecisionService, DecisionCreateRequestData, DecisionListFilter, DecisionListRecord,
     DecisionRecord, DecisionService, DecisionWithContextRecord, UnconfiguredDecisionService,
 };
+pub use durable_task::OutputSink;
 pub use durable_task::{
     CloudJudgePersistContext, CloudLlmConfig, CloudLlmJudge, ContractAmendment, ContractStatus,
     CriterionLearningResult, DiffSummary, DurableSubtask, DurableTaskLifecycle, LlmJudge,
@@ -89,7 +90,6 @@ pub use durable_task::{
     UnconfiguredDurableTaskLifecycle, VerificationCriterion, VerificationLearningSignal,
     VerificationResult, VerificationRunner, VerifierKind, build_outcome_signal,
 };
-pub use durable_task::OutputSink;
 pub use edge_context::{EdgeContext, EdgeProfile, EdgeSkillRef};
 pub use evaluation::{DatabaseEvaluationService, EvaluationService, UnconfiguredEvaluationService};
 pub use events::{
