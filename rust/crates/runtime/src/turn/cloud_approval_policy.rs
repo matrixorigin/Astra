@@ -19,6 +19,209 @@ pub const CLOUD_APPROVAL_REQUIRED_TOOLS: &[&str] = &[
 /// Subset of [`CLOUD_APPROVAL_REQUIRED_TOOLS`] that take a shell `command` argument (CLI ▶).
 pub const CLOUD_APPROVAL_EXECUTE_TOOLS: &[&str] = &["bash", "exec", "run_command", "shell"];
 
+/// Read-only shell commands that can run concurrently without user approval.
+/// These commands only read data and don't modify system state.
+const READ_ONLY_COMMANDS: &[&str] = &[
+    // File viewing
+    "cat",
+    "head",
+    "tail",
+    "wc",
+    "stat",
+    "ls",
+    "ll",
+    "tree",
+    "file",
+    // Git read-only
+    "git status",
+    "git log",
+    "git diff",
+    "git show",
+    "git branch",
+    "git ls-files",
+    "git rev-parse",
+    "git describe",
+    "git remote",
+    "git config --get",
+    "git config --list",
+    "git tag",
+    "git stash list",
+    // Search tools
+    "grep",
+    "find",
+    "fd",
+    "rg",
+    "ag",
+    "ack",
+    "locate",
+    // System info
+    "pwd",
+    "which",
+    "type",
+    "uname",
+    "id",
+    "df",
+    "du",
+    "free",
+    "uptime",
+    "whoami",
+    "hostname",
+    "env",
+    "printenv",
+    "date",
+    "cal",
+    "nproc",
+    // Text processing (no output redirection)
+    "cut",
+    "paste",
+    "tr",
+    "sort",
+    "uniq",
+    "nl",
+    "column",
+    "fmt",
+    "fold",
+    "expand",
+    // Path tools
+    "basename",
+    "dirname",
+    "realpath",
+    "readlink",
+    // Misc safe
+    "echo",
+    "printf",
+    "true",
+    "false",
+    "test",
+    "expr",
+    "seq",
+    "sleep",
+    // Rust/Cargo read-only
+    "cargo check",
+    "cargo clippy",
+    "cargo fmt --check",
+    "cargo test --no-run",
+    "rustfmt --check",
+    // Node/npm read-only
+    "npm list",
+    "npm ls",
+    "npm outdated",
+    "npm audit",
+    "node --version",
+    "npm --version",
+    // Python read-only
+    "python --version",
+    "python3 --version",
+    "pip list",
+    "pip3 list",
+    "pip freeze",
+    "pip3 freeze",
+];
+
+/// Patterns that indicate a command has side effects (not read-only).
+const WRITE_INDICATORS: &[&str] = &[
+    // Output redirection
+    ">",
+    ">>",
+    // Pipe to potentially dangerous commands
+    "| tee ",
+    "| xargs ",
+    "| sh",
+    "| bash",
+    "| sudo",
+    // Git write operations
+    "git add",
+    "git commit",
+    "git push",
+    "git pull",
+    "git merge",
+    "git rebase",
+    "git reset",
+    "git checkout",
+    "git stash pop",
+    "git stash apply",
+    "git stash drop",
+    "git stash clear",
+    "git clean",
+    "git rm",
+    "git mv",
+    // File operations
+    "rm ",
+    "mv ",
+    "cp ",
+    "mkdir ",
+    "rmdir ",
+    "touch ",
+    "chmod ",
+    "chown ",
+    "ln ",
+    // Package managers (install/modify)
+    "npm install",
+    "npm i ",
+    "npm uninstall",
+    "npm update",
+    "pip install",
+    "pip3 install",
+    "pip uninstall",
+    "cargo install",
+    "cargo build",
+    "cargo run",
+    "cargo clean",
+    "apt install",
+    "apt-get install",
+    "brew install",
+    // Dangerous
+    "sudo ",
+    "su ",
+    "eval ",
+    "exec ",
+];
+
+/// Check if a bash command is read-only (safe for concurrent execution).
+///
+/// Returns `true` if the command appears to only read data without side effects.
+/// Used to allow read-only bash commands to run concurrently without user approval.
+///
+/// # Algorithm
+/// 1. Check for write indicators (redirection, dangerous commands)
+/// 2. Match against known read-only command prefixes
+/// 3. Default to false (require approval) for unknown commands
+pub fn bash_command_is_read_only(command: &str) -> bool {
+    let cmd = command.trim();
+
+    // Empty command is not read-only (edge case)
+    if cmd.is_empty() {
+        return false;
+    }
+
+    // Check for write indicators first
+    for indicator in WRITE_INDICATORS {
+        if cmd.contains(indicator) {
+            return false;
+        }
+    }
+
+    // Check if command starts with a known read-only command
+    // Handle both direct commands and cd-prefixed commands
+    let effective_cmd = if cmd.starts_with("cd ") && cmd.contains("&&") {
+        // Extract command after `cd ... && `
+        cmd.split("&&").nth(1).map(str::trim).unwrap_or(cmd)
+    } else {
+        cmd
+    };
+
+    for ro_cmd in READ_ONLY_COMMANDS {
+        if let Some(rest) = effective_cmd.strip_prefix(ro_cmd) {
+            // Ensure it's a word boundary (not a prefix of a longer command)
+            if rest.is_empty() || rest.starts_with(' ') || rest.starts_with('\n') {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
 /// Kind of side effect for tools gated before edge execution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CloudGatedToolKind {
@@ -116,5 +319,95 @@ mod tests {
                 }
             }
         }
+    }
+
+    // ── bash_command_is_read_only tests ──
+
+    #[test]
+    fn bash_read_only_commands() {
+        // Simple read-only commands
+        assert!(bash_command_is_read_only("ls"));
+        assert!(bash_command_is_read_only("ls -la"));
+        assert!(bash_command_is_read_only("cat file.txt"));
+        assert!(bash_command_is_read_only("head -n 10 file.txt"));
+        assert!(bash_command_is_read_only("tail -f log.txt"));
+        assert!(bash_command_is_read_only("wc -l file.txt"));
+        assert!(bash_command_is_read_only("pwd"));
+        assert!(bash_command_is_read_only("whoami"));
+        assert!(bash_command_is_read_only("date"));
+
+        // Git read-only
+        assert!(bash_command_is_read_only("git status"));
+        assert!(bash_command_is_read_only("git log --oneline"));
+        assert!(bash_command_is_read_only("git diff HEAD"));
+        assert!(bash_command_is_read_only("git show abc123"));
+        assert!(bash_command_is_read_only("git branch -a"));
+        assert!(bash_command_is_read_only("git ls-files"));
+
+        // Search tools
+        assert!(bash_command_is_read_only("grep -r pattern ."));
+        assert!(bash_command_is_read_only("find . -name '*.rs'"));
+        assert!(bash_command_is_read_only("rg pattern"));
+
+        // Cargo/npm read-only
+        assert!(bash_command_is_read_only("cargo check"));
+        assert!(bash_command_is_read_only("cargo clippy"));
+        assert!(bash_command_is_read_only("npm list"));
+
+        // cd-prefixed commands
+        assert!(bash_command_is_read_only("cd project && ls"));
+        assert!(bash_command_is_read_only("cd /tmp && cat file.txt"));
+    }
+
+    #[test]
+    fn bash_write_commands_not_read_only() {
+        // File operations
+        assert!(!bash_command_is_read_only("rm file.txt"));
+        assert!(!bash_command_is_read_only("mv a.txt b.txt"));
+        assert!(!bash_command_is_read_only("cp a.txt b.txt"));
+        assert!(!bash_command_is_read_only("mkdir dir"));
+        assert!(!bash_command_is_read_only("touch file.txt"));
+
+        // Git write operations
+        assert!(!bash_command_is_read_only("git add ."));
+        assert!(!bash_command_is_read_only("git commit -m 'msg'"));
+        assert!(!bash_command_is_read_only("git push origin main"));
+        assert!(!bash_command_is_read_only("git checkout main"));
+        assert!(!bash_command_is_read_only("git reset --hard"));
+
+        // Output redirection
+        assert!(!bash_command_is_read_only("ls > output.txt"));
+        assert!(!bash_command_is_read_only("echo hello >> file.txt"));
+
+        // Package installation
+        assert!(!bash_command_is_read_only("npm install package"));
+        assert!(!bash_command_is_read_only("pip install package"));
+        assert!(!bash_command_is_read_only("cargo build"));
+
+        // Dangerous commands
+        assert!(!bash_command_is_read_only("sudo rm -rf /"));
+        assert!(!bash_command_is_read_only("eval 'echo bad'"));
+    }
+
+    #[test]
+    fn bash_pipe_to_dangerous_commands() {
+        assert!(!bash_command_is_read_only("ls | tee output.txt"));
+        assert!(!bash_command_is_read_only("echo test | xargs rm"));
+        assert!(!bash_command_is_read_only("cat script.sh | bash"));
+    }
+
+    #[test]
+    fn bash_empty_command() {
+        assert!(!bash_command_is_read_only(""));
+        assert!(!bash_command_is_read_only("   "));
+    }
+
+    #[test]
+    fn bash_unknown_commands_not_read_only() {
+        // Unknown commands should require approval (conservative)
+        assert!(!bash_command_is_read_only("custom_script.sh"));
+        assert!(!bash_command_is_read_only("./run.sh"));
+        assert!(!bash_command_is_read_only("make"));
+        assert!(!bash_command_is_read_only("docker run image"));
     }
 }
