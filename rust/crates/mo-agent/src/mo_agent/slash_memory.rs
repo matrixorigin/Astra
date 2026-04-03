@@ -1,5 +1,95 @@
 use super::*;
+use futures_util::StreamExt;
 use mo_agent_runtime::plan_decompose;
+
+/// Outcome of collecting text from an SSE stream.
+struct SseTextResult {
+    text: String,
+    event_count: usize,
+    /// For debugging: distinct event types seen (e.g., `["text_delta", "error"]`)
+    event_types: Vec<String>,
+}
+
+/// Collect text content from an SSE stream response.
+///
+/// Parses `data: {...}` lines, extracts `text_delta` content into `text`, and reports errors.
+/// If `stream_to_stderr` is true, prints text deltas as they arrive.
+async fn collect_sse_text(resp: reqwest::Response, stream_to_stderr: bool) -> SseTextResult {
+    let mut result = SseTextResult {
+        text: String::new(),
+        event_count: 0,
+        event_types: Vec::new(),
+    };
+    let mut buffer = String::new();
+    let mut stream = resp.bytes_stream();
+
+    while let Some(chunk) = stream.next().await {
+        let Ok(bytes) = chunk else { break };
+        buffer.push_str(&String::from_utf8_lossy(&bytes));
+
+        // Parse SSE events (each ends with "\n\n")
+        while let Some(event_end) = buffer.find("\n\n") {
+            let event_str = buffer[..event_end].to_string();
+            buffer = buffer[event_end + 2..].to_string();
+
+            for line in event_str.lines() {
+                if let Some(data) = line.strip_prefix("data: ") {
+                    result.event_count += 1;
+                    if let Ok(json) = serde_json::from_str::<serde_json::Value>(data) {
+                        let event_type = json
+                            .get("type")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("unknown");
+
+                        if !result.event_types.contains(&event_type.to_string()) {
+                            result.event_types.push(event_type.to_string());
+                        }
+
+                        match event_type {
+                            "text_delta" => {
+                                if let Some(content) = json.get("content").and_then(|v| v.as_str())
+                                {
+                                    result.text.push_str(content);
+                                    if stream_to_stderr {
+                                        eprint!("{}", content);
+                                    }
+                                }
+                            }
+                            "error" => {
+                                if let Some(msg) = json
+                                    .get("message")
+                                    .or_else(|| json.get("error"))
+                                    .and_then(|v| v.as_str())
+                                {
+                                    eprintln!("\r  {} Server error: {}", "✗".red(), msg);
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Process any remaining data in buffer
+    for line in buffer.lines() {
+        if let Some(data) = line.strip_prefix("data: ") {
+            result.event_count += 1;
+            if let Ok(json) = serde_json::from_str::<serde_json::Value>(data)
+                && json.get("type").and_then(|v| v.as_str()) == Some("text_delta")
+                && let Some(content) = json.get("content").and_then(|v| v.as_str())
+            {
+                result.text.push_str(content);
+                if stream_to_stderr {
+                    eprint!("{}", content);
+                }
+            }
+        }
+    }
+
+    result
+}
 
 /// Enrich a `ProjectContext` with learned plan templates from cloud storage.
 ///
@@ -400,47 +490,17 @@ pub(super) async fn handle_memory_domain_command(
 
                     match api.post_chat_turn(tok, &payload).await {
                         Ok(resp) if resp.status().is_success() => {
-                            // Collect text from SSE stream
-                            let mut full_text = String::new();
-                            let mut stream = resp.bytes_stream();
-                            let mut buffer = String::new();
-
-                            use futures_util::StreamExt;
-                            while let Some(chunk) = stream.next().await {
-                                let Ok(chunk) = chunk else { break };
-                                buffer.push_str(&String::from_utf8_lossy(&chunk));
-
-                                // Parse SSE events
-                                while let Some(event_end) = buffer.find("\n\n") {
-                                    let event_str = buffer[..event_end].to_string();
-                                    buffer = buffer[event_end + 2..].to_string();
-
-                                    // Extract text_delta content from SSE data
-                                    for line in event_str.lines() {
-                                        if let Some(data) = line.strip_prefix("data: ")
-                                            && let Ok(json) =
-                                                serde_json::from_str::<serde_json::Value>(data)
-                                            && json.get("type").and_then(|v| v.as_str())
-                                                == Some("text_delta")
-                                            && let Some(content) =
-                                                json.get("content").and_then(|v| v.as_str())
-                                        {
-                                            full_text.push_str(content);
-                                            eprint!("{}", content); // Stream output
-                                        }
-                                    }
-                                }
-                            }
+                            let sse_result = collect_sse_text(resp, true).await;
                             eprintln!(); // End streaming output
 
                             // Parse the plan from the response
-                            match plan_decompose::parse_plan_response(&full_text) {
+                            match plan_decompose::parse_plan_response(&sse_result.text) {
                                 Ok(plan) => {
                                     eprintln!();
                                     eprint!("{}", plan_decompose::format_plan(&plan));
                                 }
                                 Err(e) => {
-                                    eprint_plan_json_parse_failed(&full_text, &e);
+                                    eprint_plan_json_parse_failed(&sse_result.text, &e);
                                 }
                             }
                         }
@@ -1980,68 +2040,28 @@ pub async fn handle_plan_mode_input(
 
     match resp {
         Ok(r) if r.status().is_success() => {
-            let mut full_text = String::new();
-            let mut stream = r.bytes_stream();
-            let mut event_count = 0;
-            let mut event_types: Vec<String> = Vec::new();
-            use futures_util::StreamExt;
-
-            while let Some(chunk) = stream.next().await {
-                if let Ok(bytes) = chunk {
-                    let event_str = String::from_utf8_lossy(&bytes);
-                    for line in event_str.lines() {
-                        if let Some(data) = line.strip_prefix("data: ") {
-                            event_count += 1;
-                            if let Ok(json) = serde_json::from_str::<serde_json::Value>(data) {
-                                let event_type = json
-                                    .get("type")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("unknown");
-                                if !event_types.contains(&event_type.to_string()) {
-                                    event_types.push(event_type.to_string());
-                                }
-                                if event_type == "text_delta" {
-                                    if let Some(content) =
-                                        json.get("content").and_then(|v| v.as_str())
-                                    {
-                                        full_text.push_str(content);
-                                    }
-                                } else if event_type == "error" {
-                                    // Show error messages from the server
-                                    if let Some(msg) = json
-                                        .get("message")
-                                        .or_else(|| json.get("error"))
-                                        .and_then(|v| v.as_str())
-                                    {
-                                        eprintln!("\r  {} Server error: {}", "✗".red(), msg);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+            let sse_result = collect_sse_text(r, false).await;
 
             // Clear thinking indicator
             eprint!("\r                    \r");
 
             // Debug: show response info
-            if full_text.is_empty() {
-                if event_count == 0 {
+            if sse_result.text.is_empty() {
+                if sse_result.event_count == 0 {
                     eprintln!("  {} No SSE events received from server", "⚠".yellow());
                 } else {
                     eprintln!(
                         "  {} {} events (types: {}) but no text",
                         "⚠".yellow(),
-                        event_count,
-                        event_types.join(", ")
+                        sse_result.event_count,
+                        sse_result.event_types.join(", ")
                     );
                 }
             }
 
             // Try to parse plan update from LLM response
-            let plan_updated = if !full_text.is_empty() {
-                match parse_plan_response(&full_text) {
+            let plan_updated = if !sse_result.text.is_empty() {
+                match parse_plan_response(&sse_result.text) {
                     Ok(plan) => {
                         plan_state.set_plan(plan.clone());
                         plan_state.modified = true;
@@ -2060,14 +2080,14 @@ pub async fn handle_plan_mode_input(
             };
 
             // Show the LLM text response (skip if we already displayed the plan)
-            if !full_text.is_empty() && !plan_updated {
+            if !sse_result.text.is_empty() && !plan_updated {
                 eprintln!();
-                eprintln!("{}", full_text.trim());
+                eprintln!("{}", sse_result.text.trim());
             }
 
             // Update history with assistant response
             if let Some(last) = plan_state.history.last_mut() {
-                last.1 = full_text.chars().take(500).collect();
+                last.1 = sse_result.text.chars().take(500).collect();
             }
         }
         Ok(r) => {
