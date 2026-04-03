@@ -253,6 +253,156 @@ impl PlanOutputSink for StderrSink {
     }
 }
 
+// ─── Channel Sink (background execution) ─────────────────────────────────────
+
+/// Sends plan progress as [`PlanUpdate`] messages through an mpsc channel.
+/// Used when plan execution runs as a background task.
+pub struct ChannelSink {
+    tx: tokio::sync::mpsc::UnboundedSender<PlanUpdate>,
+}
+
+impl ChannelSink {
+    pub fn new(tx: tokio::sync::mpsc::UnboundedSender<PlanUpdate>) -> Self {
+        Self { tx }
+    }
+
+    fn send(&self, update: PlanUpdate) {
+        // Best-effort — if receiver dropped, we silently discard.
+        let _ = self.tx.send(update);
+    }
+}
+
+impl PlanOutputSink for ChannelSink {
+    fn subtask_started(
+        &self,
+        _progress_bar: &str,
+        index: usize,
+        total: usize,
+        _group_label: &str,
+        title: &str,
+        id: &str,
+    ) {
+        self.send(PlanUpdate::SubtaskStarted {
+            id: id.to_string(),
+            title: title.to_string(),
+            index,
+            total,
+        });
+    }
+
+    fn subtask_completed(&self, title: &str, pct: u32, elapsed: Option<Duration>) {
+        self.send(PlanUpdate::SubtaskCompleted {
+            id: String::new(),
+            title: title.to_string(),
+            pct,
+            elapsed,
+            verification_passed: true,
+        });
+    }
+
+    fn subtask_verification_failed(&self, title: &str, retries_exhausted: bool) {
+        self.send(PlanUpdate::SubtaskRetry {
+            id: String::new(),
+            title: title.to_string(),
+            retries_exhausted,
+        });
+    }
+
+    fn plan_completed(&self, _summary: &str, elapsed: Duration) {
+        self.send(PlanUpdate::PlanCompleted { pct: 100, elapsed });
+    }
+
+    fn plan_paused(&self, pct: u32, remaining: usize, elapsed: Duration, _blocked_ids: &str) {
+        self.send(PlanUpdate::PlanPaused {
+            pct,
+            remaining,
+            elapsed,
+        });
+    }
+
+    fn global_verification_failed(&self) {
+        self.send(PlanUpdate::GlobalVerificationFailed);
+    }
+
+    fn parallel_info(&self, parts: &[String]) {
+        if !parts.is_empty() {
+            let ready = parts.len();
+            self.send(PlanUpdate::ParallelGroupInfo {
+                ready,
+                parallel_safe: ready,
+                conflicts: 0,
+                groups: 1,
+            });
+        }
+    }
+
+    fn step_prompt(&self, title: &str) {
+        self.send(PlanUpdate::StepByStepPrompt {
+            title: title.to_string(),
+        });
+    }
+
+    fn step_skipped(&self, _title: &str) {}
+    fn step_aborted(&self) {}
+    fn step_proceeding(&self) {}
+
+    fn interrupted_pause(&self, pct: u32, remaining: usize) {
+        self.send(PlanUpdate::PlanPaused {
+            pct,
+            remaining,
+            elapsed: Duration::ZERO,
+        });
+    }
+
+    fn replan_suggestion(&self, _text: &str) {}
+}
+
+// ─── Plan Executor Handle ────────────────────────────────────────────────────
+
+/// Handle held by the REPL to interact with a background plan executor.
+///
+/// - `update_rx`: receive progress/completion updates from the executor
+/// - `cmd_tx`: send pause/resume/cancel commands to the executor
+pub struct PlanExecutorHandle {
+    pub update_rx: tokio::sync::mpsc::UnboundedReceiver<PlanUpdate>,
+    pub cmd_tx: tokio::sync::mpsc::UnboundedSender<PlanCommand>,
+}
+
+/// Create a linked pair of channels for plan executor ↔ REPL communication.
+///
+/// Returns `(handle, update_tx, cmd_rx)`:
+/// - `handle` goes to the REPL loop
+/// - `update_tx` is wrapped in a `ChannelSink` for the executor
+/// - `cmd_rx` goes to the executor to receive commands
+pub fn create_plan_channels() -> (
+    PlanExecutorHandle,
+    tokio::sync::mpsc::UnboundedSender<PlanUpdate>,
+    tokio::sync::mpsc::UnboundedReceiver<PlanCommand>,
+) {
+    let (update_tx, update_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+    (PlanExecutorHandle { update_rx, cmd_tx }, update_tx, cmd_rx)
+}
+
+impl PlanExecutorHandle {
+    /// Non-blocking check: try to receive a plan update without waiting.
+    pub fn try_recv(&mut self) -> Option<PlanUpdate> {
+        self.update_rx.try_recv().ok()
+    }
+
+    /// Send a command to the plan executor.
+    pub fn send_command(&self, cmd: PlanCommand) -> Result<(), String> {
+        self.cmd_tx
+            .send(cmd)
+            .map_err(|e| format!("plan executor channel closed: {e}"))
+    }
+
+    /// Check if the executor has finished (channel closed).
+    pub fn is_finished(&self) -> bool {
+        self.update_rx.is_closed()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -277,8 +427,61 @@ mod tests {
 
     #[test]
     fn stderr_sink_implements_trait() {
-        // Compile-time check that StderrSink implements PlanOutputSink
         fn _assert_sink(_s: &dyn PlanOutputSink) {}
         _assert_sink(&StderrSink);
+    }
+
+    #[test]
+    fn channel_sink_implements_trait() {
+        fn _assert_sink(_s: &dyn PlanOutputSink) {}
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let sink = ChannelSink::new(tx);
+        _assert_sink(&sink);
+    }
+
+    #[test]
+    fn channel_sink_sends_updates() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let sink = ChannelSink::new(tx);
+
+        sink.subtask_started("progress", 1, 5, "", "Add tests", "s1");
+        sink.plan_completed("summary", Duration::from_secs(30));
+        sink.global_verification_failed();
+
+        // Verify we got 3 updates
+        let u1 = rx.try_recv().unwrap();
+        assert!(matches!(u1, PlanUpdate::SubtaskStarted { index: 1, total: 5, .. }));
+        let u2 = rx.try_recv().unwrap();
+        assert!(matches!(u2, PlanUpdate::PlanCompleted { pct: 100, .. }));
+        let u3 = rx.try_recv().unwrap();
+        assert!(matches!(u3, PlanUpdate::GlobalVerificationFailed));
+    }
+
+    #[test]
+    fn create_plan_channels_creates_linked_pair() {
+        let (mut handle, update_tx, mut cmd_rx) = create_plan_channels();
+
+        // Executor → REPL
+        update_tx
+            .send(PlanUpdate::PlanCompleted {
+                pct: 100,
+                elapsed: Duration::from_secs(10),
+            })
+            .unwrap();
+        let update = handle.try_recv().unwrap();
+        assert!(matches!(update, PlanUpdate::PlanCompleted { pct: 100, .. }));
+
+        // REPL → Executor
+        handle.send_command(PlanCommand::Pause).unwrap();
+        let cmd = cmd_rx.try_recv().unwrap();
+        assert!(matches!(cmd, PlanCommand::Pause));
+    }
+
+    #[test]
+    fn handle_is_finished_when_sender_dropped() {
+        let (handle, update_tx, _cmd_rx) = create_plan_channels();
+        assert!(!handle.is_finished());
+        drop(update_tx);
+        assert!(handle.is_finished());
     }
 }
