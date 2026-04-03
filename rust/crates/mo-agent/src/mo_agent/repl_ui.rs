@@ -180,7 +180,7 @@ const SLASH_FIRST_TOKEN_COMPLETIONS: &[(&str, &[(&str, &str)])] = &[
         &[("history", "Aggregate stats across recent sessions")],
     ),
     ("/health", &[("detail", "Per-tool health breakdown")]),
-    ("/sync", &[("log", "Recent sync event log"), ("push", "Force push dirty domains to cloud")]),
+    ("/sync", &[("log", "Recent sync event log"), ("push", "Force push dirty domains to cloud"), ("pull", "Pull all domains from cloud")]),
     (
         "/learn",
         &[
@@ -545,7 +545,7 @@ fn slash_argument_hint(command: &str) -> Option<&'static str> {
         "/resume" => Some("[session_id]"),
         "/stats" => Some("[history]"),
         "/health" => Some("[detail]"),
-        "/sync" => Some("[log|push]"),
+        "/sync" => Some("[log|push|pull]"),
         _ => None,
     }
 }

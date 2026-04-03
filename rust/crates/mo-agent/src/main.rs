@@ -1572,13 +1572,18 @@ fn format_sync_age(ts: &str) -> String {
 }
 
 /// Handle `/sync` command — show unified sync state across all domains.
-/// Subcommands: `/sync push` (force push dirty domains), `/sync log` (event history).
+/// Subcommands: `/sync push`, `/sync pull`, `/sync log`.
 async fn handle_sync_command(arg: &str, state: &ReplState) {
     let sub = arg.trim();
 
     // /sync push — force-push all dirty domains
     if sub == "push" {
         return handle_sync_push(state).await;
+    }
+
+    // /sync pull — force-pull all pullable domains from cloud
+    if sub == "pull" {
+        return handle_sync_pull(state).await;
     }
 
     let show_log = sub == "log";
@@ -1689,7 +1694,7 @@ async fn handle_sync_command(arg: &str, state: &ReplState) {
     } else {
         eprintln!(
             "\n  {}",
-            "Use /sync log for event history, /sync push to force push.".dim()
+            "Use /sync log | push | pull".dim()
         );
     }
 
@@ -1787,6 +1792,107 @@ async fn handle_sync_push(state: &ReplState) {
     } else {
         eprintln!(
             "  {} pushed, {} failed.",
+            format!("{ok_count} ✓").green(),
+            format!("{fail_count} ✗").red(),
+        );
+    }
+
+    eprintln!(
+        "{}",
+        "────────────────────────────────────────────────".dim()
+    );
+    eprintln!();
+}
+
+/// Force-pull all pullable domains from cloud (skips write-only domains like Events).
+async fn handle_sync_pull(state: &ReplState) {
+    eprintln!(
+        "\n{}",
+        "─── Sync Pull ──────────────────────────────────".bold()
+    );
+
+    let Some(mc) = state.matrix_runtime.as_ref() else {
+        eprintln!(
+            "  {} {}",
+            "○".dim(),
+            "No cloud connection — nothing to pull.".dim()
+        );
+        eprintln!(
+            "{}",
+            "────────────────────────────────────────────────".dim()
+        );
+        eprintln!();
+        return;
+    };
+
+    let mut orch = mc.sync_orchestrator_lock().await;
+    eprintln!("  Pulling from cloud...\n");
+
+    let results = orch.pull_all().await;
+    drop(orch);
+
+    if results.is_empty() {
+        eprintln!("  {} {}", "○".dim(), "No pullable domains configured.");
+        eprintln!(
+            "{}",
+            "────────────────────────────────────────────────".dim()
+        );
+        eprintln!();
+        return;
+    }
+
+    let mut ok_count = 0usize;
+    let mut fail_count = 0usize;
+    for r in &results {
+        if r.success {
+            ok_count += 1;
+            let version_str = r
+                .version
+                .map(|v| format!("v{v}"))
+                .unwrap_or_else(|| "-".into());
+            let merge_str = r
+                .merge
+                .as_ref()
+                .map(|m| {
+                    let total = m.items_added + m.items_updated;
+                    if total > 0 {
+                        format!(" (+{} added, ~{} updated)", m.items_added, m.items_updated)
+                    } else {
+                        String::new()
+                    }
+                })
+                .unwrap_or_default();
+            eprintln!(
+                "  {} {:<14} {}{} ({}ms)",
+                "✓".green(),
+                format!("{}", r.domain).cyan(),
+                version_str.dim(),
+                merge_str.dim(),
+                r.duration_ms,
+            );
+        } else {
+            fail_count += 1;
+            let err = r.error.as_deref().unwrap_or("unknown error");
+            eprintln!(
+                "  {} {:<14} {}",
+                "✗".red(),
+                format!("{}", r.domain).cyan(),
+                err.red(),
+            );
+        }
+    }
+
+    eprintln!();
+    if fail_count == 0 {
+        eprintln!(
+            "  {} {} domain{} pulled successfully.",
+            "✓".green().bold(),
+            ok_count,
+            if ok_count == 1 { "" } else { "s" }
+        );
+    } else {
+        eprintln!(
+            "  {} pulled, {} failed.",
             format!("{ok_count} ✓").green(),
             format!("{fail_count} ✗").red(),
         );
