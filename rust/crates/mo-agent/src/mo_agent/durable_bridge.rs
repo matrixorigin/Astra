@@ -382,6 +382,7 @@ pub async fn on_plan_complete(durable: &mut DurableTaskState) -> bool {
                 match durable.lifecycle.deliver_task(&task_id).await {
                     Ok(report) => {
                         display_delivery_report(&report);
+                        save_delivery_report_json(&report);
                         durable.last_report = Some(report);
                     }
                     Err(e) => eprintln!("  {}  Delivery report failed: {}", "⚠".yellow(), e,),
@@ -566,6 +567,41 @@ fn display_delivery_report(report: &TaskDeliveryReport) {
 
     // ─── Footer ──────────────────────────────────────────────────────────────
     eprintln!("{}", format!("╚{bar}╝").cyan());
+}
+
+/// Save the delivery report as JSON to the working directory.
+/// Prints the file path on success (dim grey, non-intrusive).
+fn save_delivery_report_json(report: &TaskDeliveryReport) {
+    let filename = format!(
+        ".mo-delivery-{}.json",
+        report.contract_id.chars().take(8).collect::<String>()
+    );
+    let path = std::env::current_dir()
+        .unwrap_or_default()
+        .join(&filename);
+    match serde_json::to_string_pretty(report) {
+        Ok(json) => {
+            if let Err(e) = std::fs::write(&path, &json) {
+                eprintln!(
+                    "  {}  Could not save report: {}",
+                    "⚠".yellow(),
+                    e,
+                );
+            } else {
+                eprintln!(
+                    "  {}",
+                    format!("📄 Report saved: {}", path.display()).dark_grey(),
+                );
+            }
+        }
+        Err(e) => {
+            eprintln!(
+                "  {}  Could not serialize report: {}",
+                "⚠".yellow(),
+                e,
+            );
+        }
+    }
 }
 
 // ─── Post-delivery user feedback ─────────────────────────────────────────────
