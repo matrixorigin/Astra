@@ -213,10 +213,26 @@ pub fn merge_tool_results_into_history(
     consumed
 }
 
+/// Check if any assistant message in the history has reasoning_content.
+/// When thinking is enabled, ALL assistant messages with tool_calls must have
+/// this field (even empty string) or the API returns 400.
+fn history_has_reasoning(history: &[Value]) -> bool {
+    history.iter().any(|m| {
+        m.get("role").and_then(Value::as_str) == Some("assistant")
+            && m.get("reasoning_content").is_some()
+    })
+}
+
 pub fn append_recovered_events(history: &mut Vec<Value>, rows: &[RecoveredEventRow]) {
     let mut pending_tool_calls: Vec<Value> = Vec::new();
     let mut pending_reasoning = String::new();
     let mut in_tool_batch = false;
+
+    // Detect if thinking is enabled: check existing history OR incoming rows
+    let force_reasoning_field = history_has_reasoning(history)
+        || rows
+            .iter()
+            .any(|r| r.reasoning_content.as_ref().is_some_and(|s| !s.is_empty()));
 
     for row in rows {
         let content = row.content.clone().unwrap_or_default();
@@ -275,32 +291,42 @@ pub fn append_recovered_events(history: &mut Vec<Value>, rows: &[RecoveredEventR
                             Value::Array(pending_tool_calls.clone()),
                         ),
                     ]);
-                    if !pending_reasoning.is_empty() {
+                    // When thinking is enabled, ALL assistant+tool_calls messages must have reasoning_content
+                    if force_reasoning_field || !pending_reasoning.is_empty() {
                         assistant.insert(
                             "reasoning_content".to_string(),
-                            Value::String(pending_reasoning.clone()),
+                            Value::String(std::mem::take(&mut pending_reasoning)),
                         );
                     }
                     history.push(Value::Object(assistant));
                     pending_tool_calls.clear();
-                    pending_reasoning.clear();
                     in_tool_batch = true;
                 } else if !in_tool_batch {
                     if tool_call_id.is_empty() {
                         continue;
                     }
-                    history.push(json!({
-                        "role": "assistant",
-                        "content": "",
-                        "tool_calls": [{
-                            "id": tool_call_id,
-                            "type": "function",
-                            "function": {
-                                "name": tool_name,
-                                "arguments": "{}",
-                            },
-                        }],
-                    }));
+                    let mut orphan = Map::from_iter([
+                        ("role".to_string(), Value::String("assistant".to_string())),
+                        ("content".to_string(), Value::String(String::new())),
+                        (
+                            "tool_calls".to_string(),
+                            json!([{
+                                "id": tool_call_id,
+                                "type": "function",
+                                "function": {
+                                    "name": tool_name,
+                                    "arguments": "{}",
+                                },
+                            }]),
+                        ),
+                    ]);
+                    if force_reasoning_field {
+                        orphan.insert(
+                            "reasoning_content".to_string(),
+                            Value::String(String::new()),
+                        );
+                    }
+                    history.push(Value::Object(orphan));
                     in_tool_batch = true;
                 }
 
@@ -332,12 +358,12 @@ pub fn append_recovered_events(history: &mut Vec<Value>, rows: &[RecoveredEventR
                             Value::Array(pending_tool_calls.clone()),
                         ),
                     ]);
-                    if !pending_reasoning.is_empty() {
+                    // When thinking is enabled, ALL assistant+tool_calls messages must have reasoning_content
+                    if force_reasoning_field || !pending_reasoning.is_empty() {
                         flushed.insert(
                             "reasoning_content".to_string(),
-                            Value::String(pending_reasoning.clone()),
+                            Value::String(std::mem::take(&mut pending_reasoning)),
                         );
-                        pending_reasoning.clear();
                     }
                     history.push(Value::Object(flushed));
                     pending_tool_calls.clear();
@@ -365,7 +391,8 @@ pub fn append_recovered_events(history: &mut Vec<Value>, rows: &[RecoveredEventR
             ("content".to_string(), Value::String(String::new())),
             ("tool_calls".to_string(), Value::Array(pending_tool_calls)),
         ]);
-        if !pending_reasoning.is_empty() {
+        // When thinking is enabled, ALL assistant+tool_calls messages must have reasoning_content
+        if force_reasoning_field || !pending_reasoning.is_empty() {
             assistant.insert(
                 "reasoning_content".to_string(),
                 Value::String(pending_reasoning),

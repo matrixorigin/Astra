@@ -1945,11 +1945,7 @@ fn format_plan_progress(
         0
     };
     let empty = bar_width - filled;
-    let bar = format!(
-        "{}{}",
-        "█".repeat(filled),
-        "░".repeat(empty),
-    );
+    let bar = format!("{}{}", "█".repeat(filled), "░".repeat(empty),);
 
     let elapsed_str = format_duration_short(elapsed);
 
@@ -2170,7 +2166,11 @@ async fn run_plan_execution(
                 })
                 .unwrap_or_default();
             eprintln!(
-                "\n{}  Subtask done: {} ({}%){}", "✓".green(), title, pct, elapsed_str.dim()
+                "\n{}  Subtask done: {} ({}%){}",
+                "✓".green(),
+                title,
+                pct,
+                elapsed_str.dim()
             );
         }
 
@@ -2638,7 +2638,10 @@ async fn run_plan_execution(
                         .unwrap_or_default();
                     eprintln!(
                         "\n{}  Subtask done: {} ({}%){}",
-                        "✓".green(), title, pct, elapsed_str.dim()
+                        "✓".green(),
+                        title,
+                        pct,
+                        elapsed_str.dim()
                     );
                 }
 
