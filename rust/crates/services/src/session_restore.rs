@@ -513,7 +513,7 @@ impl SessionRestoreService for HybridRestoreService {
         };
 
         let rows = sqlx::query(
-            "SELECT session_id, title, status, event_count, metadata, updated_at \
+            "SELECT session_id, title, status, event_count \
              FROM agent_sessions \
              WHERE user_id = ? AND status IN ('active', 'paused') \
              ORDER BY updated_at DESC LIMIT 20",

@@ -634,37 +634,25 @@ impl SessionAuditService for DatabaseSessionAuditService {
         self.verify_session_owner(&pool, session_id, user_id)
             .await?;
 
-        // Find the turn event. metadata JSON contains the turn number.
-        let rows = query(
+        // Find the turn event by position (LIMIT/OFFSET) — turns are ordered by created_at.
+        // This avoids fetching the full event content for every turn in the session.
+        let offset = turn.saturating_sub(1);
+        let row = query(
             "SELECT event_id, content, token_usage, llm_model_used, metadata, created_at \
              FROM agent_events \
              WHERE session_id = ? AND user_id = ? AND event_type = 'turn' \
-             ORDER BY created_at ASC",
+             ORDER BY created_at ASC \
+             LIMIT 1 OFFSET ?",
         )
         .bind(session_id)
         .bind(user_id)
-        .fetch_all(&pool)
+        .bind(offset)
+        .fetch_optional(&pool)
         .await
         .map_err(internal_error)?;
 
-        // Find the row matching the requested turn number
-        let mut matched_row = None;
-        for (i, row) in rows.iter().enumerate() {
-            let meta: String = row.try_get("metadata").unwrap_or_default();
-            let meta_json: serde_json::Value =
-                serde_json::from_str(&meta).unwrap_or(serde_json::Value::Null);
-            let turn_num = meta_json
-                .get("turn")
-                .and_then(|v| v.as_u64())
-                .unwrap_or((i + 1) as u64) as u32;
-            if turn_num == turn {
-                matched_row = Some(row);
-                break;
-            }
-        }
-
         let row =
-            matched_row.ok_or_else(|| error_response(StatusCode::NOT_FOUND, "Turn not found"))?;
+            row.ok_or_else(|| error_response(StatusCode::NOT_FOUND, "Turn not found"))?;
 
         let event_id: String = row.try_get("event_id").unwrap_or_default();
         let content: String = row.try_get("content").unwrap_or_default();
