@@ -106,6 +106,20 @@ fn render_sse_map(event: &Map<String, Value>) -> Bytes {
     render_sse(&Value::Object(event.clone()))
 }
 
+/// Returns `true` if `name` looks like a valid tool function name.
+///
+/// LLM providers sometimes return malformed tool calls when the model leaks XML-style
+/// thinking tags (e.g., `<reflect>`) into tool call blocks. We reject names that:
+/// - are empty
+/// - contain `<` or `>` (XML artifact)
+/// - contain whitespace
+fn is_valid_tool_name(name: &str) -> bool {
+    !name.is_empty()
+        && !name.contains('<')
+        && !name.contains('>')
+        && !name.chars().any(char::is_whitespace)
+}
+
 /// Maps one parsed JSON event from the in-process LLM SSE stream to bytes forwarded to the HTTP client.
 fn apply_forward_llm_sse_event(
     event: &Value,
@@ -706,12 +720,17 @@ async fn call_llm_stream(
                                             .or_insert_with(|| json!({}));
                                         let Some(f) = f.as_object_mut() else { continue; };
                                         if let Some(name) = func.get("name").and_then(Value::as_str)
-                                            && !name.is_empty() {
+                                            && is_valid_tool_name(name) {
                                                 let is_new = f.get("name").and_then(Value::as_str).unwrap_or("").is_empty();
                                                 f.insert("name".to_string(), Value::String(name.to_string()));
                                                 if is_new {
                                                     yield render_sse(&json!({"type": "tool_call_start", "name": name}));
                                                 }
+                                            } else if let Some(bad_name) = func.get("name").and_then(Value::as_str) {
+                                                mo_agent_core::agent_warn!(
+                                                    "llm",
+                                                    "dropped malformed tool_call with invalid name: {bad_name:?}"
+                                                );
                                             }
                                         if let Some(args) = func.get("arguments").and_then(Value::as_str) {
                                             let existing = f
@@ -2372,5 +2391,35 @@ mod tests {
             messages[1]["content"].is_string(),
             "OpenAI msgs should not be modified"
         );
+    }
+
+    // ── is_valid_tool_name ───────────────────────────────────────────────────
+
+    #[test]
+    fn is_valid_tool_name_rejects_xml_artifacts() {
+        // Malformed names from LLM leaking XML thinking tags
+        assert!(!is_valid_tool_name("reflect>"));
+        assert!(!is_valid_tool_name("<reflect"));
+        assert!(!is_valid_tool_name("<think>"));
+        assert!(!is_valid_tool_name("</think>"));
+        assert!(!is_valid_tool_name("foo<bar"));
+        assert!(!is_valid_tool_name("foo>bar"));
+    }
+
+    #[test]
+    fn is_valid_tool_name_rejects_empty_and_whitespace() {
+        assert!(!is_valid_tool_name(""));
+        assert!(!is_valid_tool_name("tool name"));
+        assert!(!is_valid_tool_name("tool\tname"));
+        assert!(!is_valid_tool_name("tool\nname"));
+    }
+
+    #[test]
+    fn is_valid_tool_name_accepts_valid_names() {
+        assert!(is_valid_tool_name("bash"));
+        assert!(is_valid_tool_name("str_replace"));
+        assert!(is_valid_tool_name("read_file"));
+        assert!(is_valid_tool_name("list_dir"));
+        assert!(is_valid_tool_name("github-mcp-server-search_code"));
     }
 }

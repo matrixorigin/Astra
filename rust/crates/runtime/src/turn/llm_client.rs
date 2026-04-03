@@ -54,6 +54,20 @@ fn reset_rate_limit_cooldown_for_tests() {
     rate_limit_cooldown().reset_for_tests();
 }
 
+/// Returns `true` if `name` looks like a valid tool function name.
+///
+/// LLM providers sometimes return malformed tool calls when the model leaks XML-style
+/// thinking tags (e.g., `<reflect>`) into tool call blocks. We reject names that:
+/// - are empty
+/// - contain `<` or `>` (XML artifact)
+/// - contain whitespace
+fn is_valid_tool_name(name: &str) -> bool {
+    !name.is_empty()
+        && !name.contains('<')
+        && !name.contains('>')
+        && !name.chars().any(char::is_whitespace)
+}
+
 // ── System Prompt Cache ──────────────────────────────────────────────────────
 use std::sync::Mutex;
 
@@ -554,9 +568,14 @@ async fn collect_llm_stream(
                         continue;
                     };
                     if let Some(name) = func.get("name").and_then(Value::as_str)
-                        && !name.is_empty()
+                        && is_valid_tool_name(name)
                     {
                         f.insert("name".to_string(), Value::String(name.to_string()));
+                    } else if let Some(bad_name) = func.get("name").and_then(Value::as_str) {
+                        mo_agent_core::agent_warn!(
+                            "llm",
+                            "dropped malformed tool_call with invalid name: {bad_name:?}"
+                        );
                     }
                     if let Some(args) = func.get("arguments").and_then(Value::as_str) {
                         let existing = f

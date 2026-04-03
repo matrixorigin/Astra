@@ -2538,15 +2538,20 @@ mod sandbox_proofs {
         }
     }
 
-    // ── Command wrapping (resource limits) ──────────────────────────────────
+    // ── Command wrapping (shell hardening) ───────────────────────────────────
+    // NOTE: ulimits were removed (see sandbox policy.rs) because:
+    // - RLIMIT_NPROC is UID-wide, not per-process, causing fork failures
+    // - Resource control now relies on concurrent tool limits + timeouts
+    // These tests verify that shell hardening is still applied.
 
     #[test]
-    fn command_wrapped_with_ulimits() {
+    fn command_wrapped_with_shell_hardening() {
         let policy = SandboxPolicy::for_project("/tmp/test");
         let wrapped = wrap_command_with_limits(&policy, "echo hello");
+        // Shell hardening: disable extglob, reset IFS, redirect stdin
         assert!(
-            wrapped.contains("ulimit"),
-            "should wrap with ulimits: {wrapped}"
+            wrapped.contains("extglob") || wrapped.contains("IFS"),
+            "should apply shell hardening: {wrapped}"
         );
         assert!(
             wrapped.contains("echo hello"),
@@ -2555,15 +2560,22 @@ mod sandbox_proofs {
     }
 
     #[test]
-    fn strict_policy_has_tighter_limits() {
+    fn both_policies_apply_shell_hardening() {
         let standard = SandboxPolicy::for_project("/tmp/test");
         let strict = SandboxPolicy::strict("/tmp/test");
 
         let standard_wrapped = wrap_command_with_limits(&standard, "cmd");
         let strict_wrapped = wrap_command_with_limits(&strict, "cmd");
 
-        assert!(standard_wrapped.contains("ulimit"));
-        assert!(strict_wrapped.contains("ulimit"));
+        // Both policies should include shell hardening (no ulimits anymore)
+        assert!(
+            standard_wrapped.contains("extglob") || standard_wrapped.contains("IFS"),
+            "standard should have shell hardening"
+        );
+        assert!(
+            strict_wrapped.contains("extglob") || strict_wrapped.contains("IFS"),
+            "strict should have shell hardening"
+        );
     }
 
     // ── Environment isolation ───────────────────────────────────────────────
