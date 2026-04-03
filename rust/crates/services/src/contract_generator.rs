@@ -734,6 +734,7 @@ impl ContractGenerator {
             updated_at: now,
             domain_hint: None,
             task_type: None,
+            last_global_results: Vec::new(),
         })
     }
 

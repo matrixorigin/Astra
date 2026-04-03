@@ -369,6 +369,9 @@ impl TaskLearningBridge for PipelineTaskLearningBridge {
         &self,
         signal: &mo_agent_services::durable_task::VerificationLearningSignal,
     ) -> Result<(), String> {
+        let task_type = parse_task_type(signal.task_type.as_deref());
+        let domain = parse_domain_hint(signal.domain_hint.as_deref());
+
         // 1. PatternLibrary: record per-verifier-kind outcome patterns
         //    This lets the library track which verification strategies work/fail
         //    for different subtask types.
@@ -386,8 +389,8 @@ impl TaskLearningBridge for PipelineTaskLearningBridge {
                 let quality = signal.pass_rate;
                 lib.record_outcome(
                     &verifier_tools,
-                    parse_task_type(None), // default task type
-                    None,                  // domain not available at verification time
+                    task_type,
+                    domain,
                     signal.all_passed,
                     quality,
                     None, // no user feedback at verification time
@@ -407,8 +410,8 @@ impl TaskLearningBridge for PipelineTaskLearningBridge {
             // Verification failure on retry = implicit correction needed
             cal.record(
                 &intent,
-                None,
-                parse_task_type(None),
+                domain,
+                task_type,
                 true, // was_corrected
                 None,
             );
@@ -608,6 +611,7 @@ mod tests {
             updated_at: "2026-04-01".into(),
             domain_hint: None,
             task_type: None,
+            last_global_results: Vec::new(),
         };
         let report = TaskDeliveryReport {
             task_id: "t1".into(),
@@ -711,6 +715,8 @@ mod tests {
                 },
             ],
             files: vec!["src/auth.rs".into(), "src/routes.rs".into()],
+            domain_hint: None,
+            task_type: None,
         }
     }
 
@@ -890,6 +896,7 @@ mod tests {
             updated_at: "2026-04-01".into(),
             domain_hint: None,
             task_type: None,
+            last_global_results: Vec::new(),
         };
         let report = TaskDeliveryReport {
             task_id: "t1".into(),

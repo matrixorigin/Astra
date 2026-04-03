@@ -483,6 +483,9 @@ pub struct TaskContract {
     /// Routing task type (e.g. "code_generation", "debugging") — set during plan generation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task_type: Option<String>,
+    /// Results of the most recent global verification run.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub last_global_results: Vec<VerificationResult>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -1746,6 +1749,12 @@ pub struct VerificationLearningSignal {
     pub criteria_results: Vec<CriterionLearningResult>,
     /// Files involved in the subtask (for entity extraction).
     pub files: Vec<String>,
+    /// Domain hint from the task contract (e.g. "github", "code").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub domain_hint: Option<String>,
+    /// Task type from the task contract (e.g. "code", "fetch").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_type: Option<String>,
 }
 
 /// Per-criterion result for learning.
@@ -2147,6 +2156,7 @@ impl MatrixOneDurableTaskLifecycle {
             updated_at,
             domain_hint: None,
             task_type: None,
+            last_global_results: Vec::new(),
         })
     }
 
@@ -2379,6 +2389,7 @@ impl DurableTaskLifecycle for MatrixOneDurableTaskLifecycle {
             updated_at: now,
             domain_hint: None,
             task_type: None,
+            last_global_results: Vec::new(),
         };
 
         self.persist_contract_with_user(&contract, user_id, session_id)
@@ -3058,6 +3069,7 @@ impl DurableTaskLifecycle for LocalDurableTaskLifecycle {
             updated_at: now,
             domain_hint: None,
             task_type: None,
+            last_global_results: Vec::new(),
         };
         self.save_local(&contract)?;
         Ok(contract)
@@ -3324,6 +3336,8 @@ impl DurableTaskLifecycle for LocalDurableTaskLifecycle {
                 attempt: durable_st.retry_count + 1,
                 criteria_results,
                 files: durable_st.files.clone(),
+                domain_hint: contract.domain_hint.clone(),
+                task_type: contract.task_type.clone(),
             };
             let _ = bridge.learn_from_verification(&signal).await;
         }
@@ -3332,7 +3346,7 @@ impl DurableTaskLifecycle for LocalDurableTaskLifecycle {
     }
 
     async fn verify_global(&self, task_id: &str) -> Result<Vec<VerificationResult>, String> {
-        let contract = self
+        let mut contract = self
             .find_by_task(task_id)?
             .ok_or_else(|| format!("no contract for task '{task_id}'"))?;
         self.emit_event(
@@ -3358,6 +3372,52 @@ impl DurableTaskLifecycle for LocalDurableTaskLifecycle {
                 "results_count": results.len(),
             }),
         );
+
+        // Persist global results on contract so deliver_task() can include them
+        contract.last_global_results = results.clone();
+        let _ = self.save_local(&contract);
+
+        // Feed global verification into learning system
+        if !results.is_empty()
+            && let Some(bridge) = &self.learning_bridge
+        {
+            let passed_count = results.iter().filter(|r| r.passed).count();
+            let total_count = results.len();
+            let criteria_results: Vec<CriterionLearningResult> = contract
+                .global_verification
+                .iter()
+                .zip(results.iter())
+                .map(|(c, r)| CriterionLearningResult {
+                    criterion_id: c.id.clone(),
+                    verifier_kind: format!("{:?}", c.verifier)
+                        .split_whitespace()
+                        .next()
+                        .unwrap_or("unknown")
+                        .to_string(),
+                    passed: r.passed,
+                    duration_ms: r.duration_ms,
+                })
+                .collect();
+            let signal = VerificationLearningSignal {
+                task_id: task_id.to_string(),
+                subtask_id: "__global__".to_string(),
+                subtask_title: "Global verification".to_string(),
+                goal: contract.goal.clone(),
+                all_passed,
+                pass_rate: if total_count > 0 {
+                    passed_count as f64 / total_count as f64
+                } else {
+                    1.0
+                },
+                attempt: 1,
+                criteria_results,
+                files: Vec::new(),
+                domain_hint: contract.domain_hint.clone(),
+                task_type: contract.task_type.clone(),
+            };
+            let _ = bridge.learn_from_verification(&signal).await;
+        }
+
         Ok(results)
     }
 
@@ -3458,7 +3518,7 @@ impl DurableTaskLifecycle for LocalDurableTaskLifecycle {
             contract_id: contract.contract_id.clone(),
             goal: contract.goal.clone(),
             subtask_summaries: summaries,
-            global_verification: Vec::new(),
+            global_verification: contract.last_global_results.clone(),
             total_turns: 0,
             total_tokens: 0,
             total_verifications,
@@ -3718,6 +3778,7 @@ mod tests {
             updated_at: "2026-04-01T00:00:00Z".into(),
             domain_hint: None,
             task_type: None,
+            last_global_results: Vec::new(),
         };
         let json = serde_json::to_string(&contract).unwrap();
         let parsed: TaskContract = serde_json::from_str(&json).unwrap();
@@ -4316,6 +4377,7 @@ mod tests {
             updated_at: "2026-04-01".into(),
             domain_hint: None,
             task_type: None,
+            last_global_results: Vec::new(),
         };
 
         let report = TaskDeliveryReport {
@@ -6010,6 +6072,7 @@ Time:        3.456 s
             updated_at: "now".into(),
             domain_hint: None,
             task_type: None,
+            last_global_results: Vec::new(),
         };
         let report = TaskDeliveryReport {
             task_id: "t1".into(),
@@ -6104,6 +6167,7 @@ Time:        3.456 s
             updated_at: "now".into(),
             domain_hint: None,
             task_type: None,
+            last_global_results: Vec::new(),
         };
         let report = TaskDeliveryReport {
             task_id: "t2".into(),
