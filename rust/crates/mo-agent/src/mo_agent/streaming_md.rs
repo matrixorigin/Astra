@@ -95,6 +95,13 @@ impl StreamingMarkdown {
         self.render_incremental();
     }
 
+    /// Temporarily clear the unstable region without losing buffered content.
+    /// Call this before external stdout output that would desync cursor tracking.
+    /// The unstable region will be re-rendered on the next push().
+    pub(super) fn pause_unstable(&mut self) {
+        self.unstable_region.clear();
+    }
+
     /// Drop any intermediate draft before the next tool round.
     /// For multi-turn tool workflows we only want the final answer to remain
     /// visible; preserving draft prose makes reviews appear duplicated.

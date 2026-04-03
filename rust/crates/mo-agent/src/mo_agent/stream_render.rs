@@ -96,6 +96,11 @@ impl<'a> CliSseStreamHost<'a> {
 
     /// Push text to the active renderer (markdown or raw stdout).
     fn render_text(&mut self, s: &str) {
+        // If thinking pane is active, clear it before markdown/text output
+        // to prevent cursor desync between independent TerminalRegions.
+        if let Some(mut pane) = self.render.thinking_pane.take() {
+            pane.clear();
+        }
         if let Some(md) = &mut self.render.md {
             md.push(s);
         } else {
@@ -1312,9 +1317,13 @@ impl StreamRenderState {
         }
         self.thinking_start.get_or_insert_with(Instant::now);
         let rows = thinking_viewport_rows();
-        // ThinkingPreviewPane now uses stdout (via TerminalRegion), sharing the
-        // same cursor coordinate space as StreamingMarkdown. No more conflicts.
+        // ThinkingPreviewPane and StreamingMarkdown both use stdout (TerminalRegion).
+        // Before updating thinking pane, pause markdown's unstable region to avoid
+        // cursor desync between independent regions.
         if rows > 0 && io::stdout().is_terminal() {
+            if let Some(md) = &mut self.md {
+                md.pause_unstable();
+            }
             if self.thinking_pane.is_none() {
                 self.thinking_pane = Some(ThinkingPreviewPane::new(rows, self.term_width));
             }
