@@ -2792,6 +2792,7 @@ dependencies = [
  "mo-agent-runtime",
  "mo-agent-services",
  "mo-thin-client",
+ "nix 0.31.2",
  "regex",
  "reqwest",
  "rmcp",

@@ -601,10 +601,19 @@ impl ToolExecutor {
 
         let mut child = child_cmd.spawn().map_err(|e| format!("Error: {e}"))?;
 
+        // Take ownership of stdout/stderr handles before the wait loop.
+        // This allows us to read available output even if background processes keep pipes open.
+        let stdout_handle = child.stdout.take();
+        let stderr_handle = child.stderr.take();
+
         let deadline = std::time::Instant::now() + Duration::from_secs_f64(timeout_secs);
+        let exit_status;
         loop {
             match child.try_wait() {
-                Ok(Some(_)) => break,
+                Ok(Some(status)) => {
+                    exit_status = status;
+                    break;
+                }
                 Ok(None) => {
                     if std::time::Instant::now() > deadline {
                         // Kill entire process group (bash + all children)
@@ -630,7 +639,98 @@ impl ToolExecutor {
             }
         }
 
-        child.wait_with_output().map_err(|e| format!("Error: {e}"))
+        // Read available output with a short timeout. Don't use wait_with_output()
+        // because it blocks until ALL pipe handles are closed. When the command
+        // spawns background processes (e.g., `python app.py &`), those processes
+        // inherit the pipes and keep them open indefinitely, causing a hang.
+        //
+        // Solution: Set pipes to non-blocking mode and read until timeout.
+        use std::io::Read;
+        let read_timeout = Duration::from_millis(500);
+
+        // Helper to read from a pipe with timeout using non-blocking I/O
+        fn read_with_timeout(mut pipe: std::process::ChildStdout, timeout: Duration) -> Vec<u8> {
+            #[cfg(unix)]
+            {
+                use std::os::unix::io::{AsRawFd, BorrowedFd};
+                // Set non-blocking mode
+                let fd = pipe.as_raw_fd();
+                // SAFETY: pipe is valid and we're not closing it
+                let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
+                if let Ok(flags) = nix::fcntl::fcntl(borrowed, nix::fcntl::FcntlArg::F_GETFL) {
+                    let new_flags = nix::fcntl::OFlag::from_bits_truncate(flags)
+                        | nix::fcntl::OFlag::O_NONBLOCK;
+                    let _ = nix::fcntl::fcntl(borrowed, nix::fcntl::FcntlArg::F_SETFL(new_flags));
+                }
+            }
+
+            let deadline = std::time::Instant::now() + timeout;
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 4096];
+            loop {
+                if std::time::Instant::now() > deadline {
+                    break;
+                }
+                match pipe.read(&mut chunk) {
+                    Ok(0) => break, // EOF
+                    Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        // No data available right now, wait a bit
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(_) => break,
+                }
+            }
+            buf
+        }
+
+        fn read_stderr_with_timeout(
+            mut pipe: std::process::ChildStderr,
+            timeout: Duration,
+        ) -> Vec<u8> {
+            #[cfg(unix)]
+            {
+                use std::os::unix::io::{AsRawFd, BorrowedFd};
+                let fd = pipe.as_raw_fd();
+                let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
+                if let Ok(flags) = nix::fcntl::fcntl(borrowed, nix::fcntl::FcntlArg::F_GETFL) {
+                    let new_flags = nix::fcntl::OFlag::from_bits_truncate(flags)
+                        | nix::fcntl::OFlag::O_NONBLOCK;
+                    let _ = nix::fcntl::fcntl(borrowed, nix::fcntl::FcntlArg::F_SETFL(new_flags));
+                }
+            }
+
+            let deadline = std::time::Instant::now() + timeout;
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 4096];
+            loop {
+                if std::time::Instant::now() > deadline {
+                    break;
+                }
+                match pipe.read(&mut chunk) {
+                    Ok(0) => break, // EOF
+                    Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(_) => break,
+                }
+            }
+            buf
+        }
+
+        let stdout_buf = stdout_handle
+            .map(|h| read_with_timeout(h, read_timeout))
+            .unwrap_or_default();
+        let stderr_buf = stderr_handle
+            .map(|h| read_stderr_with_timeout(h, read_timeout))
+            .unwrap_or_default();
+
+        Ok(std::process::Output {
+            status: exit_status,
+            stdout: stdout_buf,
+            stderr: stderr_buf,
+        })
     }
 
     pub(crate) fn bash(&self, args: &Value) -> String {
@@ -1432,6 +1532,35 @@ mod tests {
         assert!(
             r.contains("timed out"),
             "explicit timeout should override tier"
+        );
+    }
+
+    /// Background commands (with &) should not block indefinitely.
+    /// The bash shell exits immediately, but background child processes keep
+    /// stdout/stderr pipes open. We must not wait for pipes to close.
+    #[test]
+    fn bash_background_command_does_not_block() {
+        let executor = test_executor();
+        let start = std::time::Instant::now();
+        // This command starts a long-running background process and exits immediately.
+        // Without the fix, wait_with_output() would block until sleep finishes (60s).
+        let result = executor.bash(&serde_json::json!({
+            "command": "echo started && sleep 60 &",
+            "timeout": 5.0
+        }));
+        let elapsed = start.elapsed();
+        // Should complete in ~1 second (500ms read timeout + overhead), not 60s
+        assert!(
+            elapsed.as_secs() < 3,
+            "background command blocked for {elapsed:?}, should return quickly"
+        );
+        assert!(
+            result.contains("started"),
+            "should capture output before background: {result}"
+        );
+        assert!(
+            !result.contains("timed out"),
+            "should not timeout: {result}"
         );
     }
 
