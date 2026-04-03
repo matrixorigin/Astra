@@ -463,6 +463,97 @@ impl Drop for Spinner {
     }
 }
 
+/// Pre-TTFT wait on stderr: same rhythm as [`PlanAssembleLineSpinner`] chat prep (`Ns` + label + trailing braille).
+pub(super) struct TtftWaitLineSpinner {
+    stop: Arc<AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl TtftWaitLineSpinner {
+    pub(super) fn start() -> Self {
+        if !io::stderr().is_terminal() {
+            return Self {
+                stop: Arc::new(AtomicBool::new(true)),
+                handle: None,
+            };
+        }
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop2 = stop.clone();
+        let handle = std::thread::spawn(move || {
+            let t0 = std::time::Instant::now();
+            std::thread::sleep(std::time::Duration::from_millis(SPINNER_SHOW_DELAY_MS));
+            if stop2.load(Ordering::Relaxed) {
+                return;
+            }
+            let tick = std::time::Duration::from_millis(50);
+            let w = crossterm::terminal::size()
+                .map(|(c, _)| c as usize)
+                .unwrap_or(80)
+                .clamp(20, 512);
+            let mut spin_idx = 0usize;
+            while !stop2.load(Ordering::Relaxed) {
+                spin_idx += 1;
+                let sec = t0.elapsed().as_secs();
+                let frame = SPINNER_FRAMES[spin_idx % SPINNER_FRAMES.len()];
+                let label = "Waiting for stream";
+                let time_part = format!("{:>3}s", sec);
+                let visible =
+                    2 + time_part.chars().count() + 1 + label.chars().count() + 1 + 1;
+                eprint!("\r  ");
+                eprint!("{}", time_part.dim());
+                eprint!(" {}", label.dim());
+                eprint!(" {}", format!("{frame}").yellow());
+                if visible < w {
+                    eprint!("{}", " ".repeat(w - visible));
+                }
+                let _ = io::stderr().flush();
+                std::thread::sleep(tick);
+            }
+        });
+        Self {
+            stop,
+            handle: Some(handle),
+        }
+    }
+
+    pub(super) fn stop_clear(mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+        let w = crossterm::terminal::size()
+            .map(|(c, _)| c as usize)
+            .unwrap_or(80)
+            .clamp(20, 512);
+        eprint!("\r{}\r", " ".repeat(w));
+        let _ = io::stderr().flush();
+    }
+}
+
+impl Drop for TtftWaitLineSpinner {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
+}
+
+/// Which spinner is shown in the single “thinking” stderr slot (classic prefix+braille vs TTFT elapsed line).
+enum ThinkingSpinnerSlot {
+    Classic(Spinner),
+    TtftWait(TtftWaitLineSpinner),
+}
+
+impl ThinkingSpinnerSlot {
+    fn stop_clear(self) {
+        match self {
+            Self::Classic(s) => s.stop_clear(),
+            Self::TtftWait(s) => s.stop_clear(),
+        }
+    }
+}
+
 /// Shared label for [`PlanAssembleLineSpinner`] while building a normal-chat `/chat/turn` payload.
 pub(crate) type ChatPrepPhaseLabel = Arc<RwLock<String>>;
 
@@ -865,7 +956,7 @@ pub(super) struct StreamRenderState {
     /// True while showing the pre-TTFT “waiting for model” spinner (skip thought-duration log).
     waiting_for_first_sse: bool,
     thinking_start: Option<Instant>,
-    thinking_spinner: Option<Spinner>,
+    thinking_spinner: Option<ThinkingSpinnerSlot>,
     /// stderr preview for `reasoning_delta`: grows until viewport cap, then tail + hidden count (see `MO_AGENT_THINKING_VIEWPORT_LINES`).
     thinking_pane: Option<ThinkingPreviewPane>,
     /// Lines written to the terminal during streaming (stdout + stderr).
@@ -954,7 +1045,7 @@ impl StreamRenderState {
         }
         self.waiting_for_first_sse = true;
         self.thinking_start.get_or_insert_with(Instant::now);
-        self.thinking_spinner = Some(Spinner::start("  Waiting for stream".to_string()));
+        self.thinking_spinner = Some(ThinkingSpinnerSlot::TtftWait(TtftWaitLineSpinner::start()));
     }
 
     fn start_thinking(&mut self) {
@@ -969,7 +1060,9 @@ impl StreamRenderState {
         let rows = thinking_viewport_rows();
         let use_pane = rows > 0 && io::stderr().is_terminal() && !self.suppress_reasoning_viewport;
         if !use_pane && io::stderr().is_terminal() {
-            self.thinking_spinner = Some(Spinner::start("  Thinking".to_string()));
+            self.thinking_spinner = Some(ThinkingSpinnerSlot::Classic(Spinner::start(
+                "  Thinking".to_string(),
+            )));
         }
     }
 
