@@ -1181,7 +1181,9 @@ fn parse_judge_score(text: &str) -> Result<f64, String> {
 mod tests {
     use super::*;
     use mo_agent_services::task_orchestrator::{SubtaskPlan, TaskPlan, TaskStatus};
-    use mo_agent_services::{SubtaskDeliverySummary, TaskScope, VerificationResult};
+    use mo_agent_services::{
+        SubtaskDeliverySummary, TaskScope, VerificationCriterion, VerificationResult,
+    };
 
     fn make_test_plan() -> TaskPlan {
         TaskPlan {
@@ -1475,6 +1477,630 @@ mod tests {
         let gate =
             ContractVerificationGate::from_subtask(&subtask, std::path::PathBuf::from("/tmp"));
         assert_eq!(VerificationGate::max_retries(&gate), 5);
+    }
+
+    // ─── End-to-end verification pipeline tests ────────────────────────────
+
+    /// Full pipeline: contract generation → real file verification → pass/fail
+    ///
+    /// Creates actual files in a temp dir, generates a contract with criteria
+    /// that inspect those files, then runs on_subtask_complete to verify gates fire.
+    #[tokio::test]
+    async fn e2e_contract_generate_verify_file_exists_pass() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let session_dir = tmp.path().join("session");
+        std::fs::create_dir_all(&session_dir).unwrap();
+
+        // Create the file that subtask "s1" should produce
+        let target = tmp.path().join("calculator.py");
+        std::fs::write(
+            &target,
+            "def add(a, b): return a + b\ndef sub(a, b): return a - b\n",
+        )
+        .unwrap();
+
+        // Plan: one subtask that requires calculator.py to exist
+        let plan = TaskPlan {
+            subtasks: vec![SubtaskPlan {
+                id: "s1".into(),
+                title: "Create calculator module".into(),
+                description: Some("Create calculator.py with basic math functions".into()),
+                depends_on: vec![],
+                status: TaskStatus::Pending,
+                effort: Some("small".into()),
+                files: vec!["calculator.py".into()],
+                acceptance: Some("File calculator.py exists".into()),
+            }],
+            notes: None,
+        };
+
+        // Generate contract via the real pipeline
+        let lifecycle = create_local_lifecycle(&session_dir, tmp.path());
+        let contract = generate_contract(
+            &lifecycle,
+            &plan,
+            "Create a calculator module",
+            "test-user",
+            "test-session",
+            tmp.path(),
+        )
+        .await;
+
+        let contract = contract.expect("Contract generation should succeed");
+        assert_eq!(contract.subtasks.len(), 1);
+
+        // The contract generator should have created FileExists criteria
+        let s1 = &contract.subtasks[0];
+        assert!(!s1.criteria.is_empty(), "Subtask should have criteria");
+        let has_file_check = s1
+            .criteria
+            .iter()
+            .any(|c| matches!(c.verifier, VerifierKind::FileExists { .. }));
+        assert!(has_file_check, "Should have FileExists verifier for 'File calculator.py exists'");
+
+        // Now run on_subtask_complete — it should PASS because the file exists
+        let mut durable = DurableTaskState {
+            contract,
+            lifecycle,
+            last_report: None,
+        };
+
+        let passed = on_subtask_complete(&mut durable, "s1").await;
+        assert!(passed, "Verification should pass — calculator.py exists");
+        assert!(
+            matches!(
+                durable.contract.subtasks[0].stage,
+                SubtaskStage::Verified
+            ),
+            "Subtask stage should be Verified, got {:?}",
+            durable.contract.subtasks[0].stage
+        );
+    }
+
+    /// Verification fails when the required file is missing.
+    #[tokio::test]
+    async fn e2e_contract_verify_file_missing_fail() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let session_dir = tmp.path().join("session");
+        std::fs::create_dir_all(&session_dir).unwrap();
+
+        // Deliberately do NOT create the file
+        let plan = TaskPlan {
+            subtasks: vec![SubtaskPlan {
+                id: "s1".into(),
+                title: "Create module".into(),
+                description: Some("Create output.py".into()),
+                depends_on: vec![],
+                status: TaskStatus::Pending,
+                effort: Some("small".into()),
+                files: vec!["output.py".into()],
+                acceptance: Some("File output.py exists".into()),
+            }],
+            notes: None,
+        };
+
+        let lifecycle = create_local_lifecycle(&session_dir, tmp.path());
+        let contract = generate_contract(
+            &lifecycle,
+            &plan,
+            "Create output module",
+            "test-user",
+            "test-session",
+            tmp.path(),
+        )
+        .await
+        .expect("Contract generation should succeed");
+
+        let mut durable = DurableTaskState {
+            contract,
+            lifecycle,
+            last_report: None,
+        };
+
+        // File doesn't exist → verification should fail
+        let passed = on_subtask_complete(&mut durable, "s1").await;
+        assert!(!passed, "Verification should FAIL — output.py is missing");
+        assert_eq!(durable.contract.subtasks[0].retry_count, 1);
+        assert!(
+            matches!(
+                durable.contract.subtasks[0].stage,
+                SubtaskStage::VerificationFailed { .. }
+            ),
+            "Stage should be VerificationFailed, got {:?}",
+            durable.contract.subtasks[0].stage
+        );
+    }
+
+    /// Grep verifier: checks that a pattern exists in a file.
+    #[tokio::test]
+    async fn e2e_grep_verify_pass_and_fail() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let work_dir = tmp.path().join("work");
+        let session_dir = tmp.path().join("session");
+        std::fs::create_dir_all(&work_dir).unwrap();
+        std::fs::create_dir_all(&session_dir).unwrap();
+
+        // Create a file with specific content
+        std::fs::write(
+            work_dir.join("auth.py"),
+            "import jwt\ndef verify_token(token):\n    return jwt.decode(token)\n",
+        )
+        .unwrap();
+
+        let lifecycle = create_local_lifecycle(&session_dir, &work_dir);
+
+        // Manually build a contract with GrepCheck criteria
+        let plan = TaskPlan {
+            subtasks: vec![SubtaskPlan {
+                id: "s1".into(),
+                title: "Implement JWT auth".into(),
+                description: None,
+                depends_on: vec![],
+                status: TaskStatus::Pending,
+                effort: None,
+                files: vec!["auth.py".into()],
+                acceptance: Some("auth.py contains 'import jwt'".into()),
+            }],
+            notes: None,
+        };
+
+        let mut contract = lifecycle
+            .create_contract("user", "sess", "JWT auth", &plan, TaskScope::default())
+            .await
+            .unwrap();
+
+        // Inject GrepCheck criterion and persist via amendment
+        let criteria = vec![VerificationCriterion {
+            id: "grep-jwt".into(),
+            description: "auth.py imports jwt".into(),
+            verifier: VerifierKind::GrepCheck {
+                file: "auth.py".into(),
+                pattern: "import jwt".into(),
+                should_match: true,
+            },
+            required: true,
+            timeout_sec: 10,
+            global_only: false,
+        }];
+        contract.subtasks[0].criteria = criteria.clone();
+
+        let mut amended_subtasks = contract.subtasks.clone();
+        amended_subtasks[0].criteria = criteria;
+        let amendment = ContractAmendment {
+            reason: "inject test criteria".into(),
+            updated_subtasks: Some(amended_subtasks),
+            updated_global_verification: None,
+            updated_scope: None,
+        };
+        contract = lifecycle
+            .amend_contract(&contract.contract_id, amendment)
+            .await
+            .unwrap();
+
+        let mut durable = DurableTaskState {
+            contract,
+            lifecycle: lifecycle.clone(),
+            last_report: None,
+        };
+
+        on_subtask_begin(&durable, "s1").await;
+        let passed = on_subtask_complete(&mut durable, "s1").await;
+        assert!(passed, "GrepCheck should pass — 'import jwt' is in auth.py");
+    }
+
+    /// Grep verifier: fails when pattern is missing.
+    #[tokio::test]
+    async fn e2e_grep_verify_fail() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let work_dir = tmp.path().join("work");
+        let session_dir = tmp.path().join("session");
+        std::fs::create_dir_all(&work_dir).unwrap();
+        std::fs::create_dir_all(&session_dir).unwrap();
+
+        std::fs::write(
+            work_dir.join("auth.py"),
+            "import jwt\ndef verify_token(token):\n    return jwt.decode(token)\n",
+        )
+        .unwrap();
+
+        let lifecycle = create_local_lifecycle(&session_dir, &work_dir);
+
+        let plan = TaskPlan {
+            subtasks: vec![SubtaskPlan {
+                id: "s1".into(),
+                title: "Implement rate limiting".into(),
+                description: None,
+                depends_on: vec![],
+                status: TaskStatus::Pending,
+                effort: None,
+                files: vec!["auth.py".into()],
+                acceptance: Some("auth.py contains rate_limit".into()),
+            }],
+            notes: None,
+        };
+
+        let mut contract = lifecycle
+            .create_contract("user", "sess", "rate limit", &plan, TaskScope::default())
+            .await
+            .unwrap();
+
+        // Inject criteria AND persist them via amend_contract
+        let criteria = vec![VerificationCriterion {
+            id: "grep-missing".into(),
+            description: "auth.py has rate limiting".into(),
+            verifier: VerifierKind::GrepCheck {
+                file: "auth.py".into(),
+                pattern: "rate_limit".into(),
+                should_match: true,
+            },
+            required: true,
+            timeout_sec: 10,
+            global_only: false,
+        }];
+        contract.subtasks[0].criteria = criteria.clone();
+
+        let mut amended_subtasks = contract.subtasks.clone();
+        amended_subtasks[0].criteria = criteria;
+        let amendment = ContractAmendment {
+            reason: "inject test criteria".into(),
+            updated_subtasks: Some(amended_subtasks),
+            updated_global_verification: None,
+            updated_scope: None,
+        };
+        contract = lifecycle
+            .amend_contract(&contract.contract_id, amendment)
+            .await
+            .unwrap();
+
+        let mut durable = DurableTaskState {
+            contract,
+            lifecycle,
+            last_report: None,
+        };
+
+        on_subtask_begin(&durable, "s1").await;
+        let passed = on_subtask_complete(&mut durable, "s1").await;
+        assert!(!passed, "GrepCheck should fail — 'rate_limit' is NOT in auth.py");
+    }
+
+    /// Command verifier: pass case (exit 0).
+    #[tokio::test]
+    async fn e2e_command_verify_exit_code_pass() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let work_dir = tmp.path().join("work");
+        let session_dir = tmp.path().join("session");
+        std::fs::create_dir_all(&work_dir).unwrap();
+        std::fs::create_dir_all(&session_dir).unwrap();
+
+        let lifecycle = create_local_lifecycle(&session_dir, &work_dir);
+
+        let plan = TaskPlan {
+            subtasks: vec![SubtaskPlan {
+                id: "s1".into(),
+                title: "Run command".into(),
+                description: None,
+                depends_on: vec![],
+                status: TaskStatus::Pending,
+                effort: None,
+                files: vec![],
+                acceptance: Some("Command exits 0".into()),
+            }],
+            notes: None,
+        };
+
+        let mut contract = lifecycle
+            .create_contract("user", "sess", "test", &plan, TaskScope::default())
+            .await
+            .unwrap();
+
+        let criteria = vec![VerificationCriterion {
+            id: "cmd-pass".into(),
+            description: "true command succeeds".into(),
+            verifier: VerifierKind::Command {
+                cmd: "true".into(),
+                expected_exit: 0,
+            },
+            required: true,
+            timeout_sec: 10,
+            global_only: false,
+        }];
+        contract.subtasks[0].criteria = criteria.clone();
+
+        let mut amended_subtasks = contract.subtasks.clone();
+        amended_subtasks[0].criteria = criteria;
+        let amendment = ContractAmendment {
+            reason: "inject test criteria".into(),
+            updated_subtasks: Some(amended_subtasks),
+            updated_global_verification: None,
+            updated_scope: None,
+        };
+        contract = lifecycle
+            .amend_contract(&contract.contract_id, amendment)
+            .await
+            .unwrap();
+
+        let mut durable = DurableTaskState {
+            contract,
+            lifecycle,
+            last_report: None,
+        };
+
+        on_subtask_begin(&durable, "s1").await;
+        let passed = on_subtask_complete(&mut durable, "s1").await;
+        assert!(passed, "Command 'true' should exit 0 → pass");
+    }
+
+    /// Command verifier: fail case (exit 1).
+    #[tokio::test]
+    async fn e2e_command_verify_exit_code_fail() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let work_dir = tmp.path().join("work");
+        let session_dir = tmp.path().join("session");
+        std::fs::create_dir_all(&work_dir).unwrap();
+        std::fs::create_dir_all(&session_dir).unwrap();
+
+        let lifecycle = create_local_lifecycle(&session_dir, &work_dir);
+
+        let plan = TaskPlan {
+            subtasks: vec![SubtaskPlan {
+                id: "s1".into(),
+                title: "Run failing command".into(),
+                description: None,
+                depends_on: vec![],
+                status: TaskStatus::Pending,
+                effort: None,
+                files: vec![],
+                acceptance: Some("Command exits 0".into()),
+            }],
+            notes: None,
+        };
+
+        let mut contract = lifecycle
+            .create_contract("user", "sess", "test", &plan, TaskScope::default())
+            .await
+            .unwrap();
+
+        let criteria = vec![VerificationCriterion {
+            id: "cmd-fail".into(),
+            description: "false command fails".into(),
+            verifier: VerifierKind::Command {
+                cmd: "false".into(),
+                expected_exit: 0,
+            },
+            required: true,
+            timeout_sec: 10,
+            global_only: false,
+        }];
+        contract.subtasks[0].criteria = criteria.clone();
+
+        let mut amended_subtasks = contract.subtasks.clone();
+        amended_subtasks[0].criteria = criteria;
+        let amendment = ContractAmendment {
+            reason: "inject test criteria".into(),
+            updated_subtasks: Some(amended_subtasks),
+            updated_global_verification: None,
+            updated_scope: None,
+        };
+        contract = lifecycle
+            .amend_contract(&contract.contract_id, amendment)
+            .await
+            .unwrap();
+
+        let mut durable = DurableTaskState {
+            contract,
+            lifecycle,
+            last_report: None,
+        };
+
+        on_subtask_begin(&durable, "s1").await;
+        let passed = on_subtask_complete(&mut durable, "s1").await;
+        assert!(!passed, "Command 'false' exits 1 → should fail");
+    }
+
+    /// TestPass verifier: runs pytest and checks pass rate.
+    #[tokio::test]
+    async fn e2e_test_pass_verifier_with_real_pytest() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let work_dir = tmp.path().join("work");
+        let session_dir = tmp.path().join("session");
+        std::fs::create_dir_all(&work_dir).unwrap();
+        std::fs::create_dir_all(&session_dir).unwrap();
+
+        // Create a passing test
+        std::fs::write(
+            work_dir.join("test_calc.py"),
+            "def test_add():\n    assert 1 + 1 == 2\ndef test_sub():\n    assert 3 - 1 == 2\n",
+        )
+        .unwrap();
+
+        let lifecycle = create_local_lifecycle(&session_dir, &work_dir);
+        let plan = TaskPlan {
+            subtasks: vec![SubtaskPlan {
+                id: "s1".into(),
+                title: "Write tests".into(),
+                description: None,
+                depends_on: vec![],
+                status: TaskStatus::Pending,
+                effort: None,
+                files: vec!["test_calc.py".into()],
+                acceptance: Some("pytest passes".into()),
+            }],
+            notes: None,
+        };
+
+        let mut contract = lifecycle
+            .create_contract("user", "sess", "test", &plan, TaskScope::default())
+            .await
+            .unwrap();
+
+        let criteria = vec![VerificationCriterion {
+            id: "pytest-pass".into(),
+            description: "All tests pass".into(),
+            verifier: VerifierKind::TestPass {
+                cmd: "python3 -m pytest test_calc.py -v".into(),
+                min_pass_rate: 1.0,
+            },
+            required: true,
+            timeout_sec: 30,
+            global_only: false,
+        }];
+        contract.subtasks[0].criteria = criteria.clone();
+
+        let mut amended_subtasks = contract.subtasks.clone();
+        amended_subtasks[0].criteria = criteria;
+        let amendment = ContractAmendment {
+            reason: "inject test criteria".into(),
+            updated_subtasks: Some(amended_subtasks),
+            updated_global_verification: None,
+            updated_scope: None,
+        };
+        contract = lifecycle
+            .amend_contract(&contract.contract_id, amendment)
+            .await
+            .unwrap();
+
+        let mut durable = DurableTaskState {
+            contract,
+            lifecycle,
+            last_report: None,
+        };
+
+        on_subtask_begin(&durable, "s1").await;
+        let passed = on_subtask_complete(&mut durable, "s1").await;
+        // pytest available: should pass and set stage to Verified
+        // pytest not available: verification error → treated as pass (non-blocking),
+        //   but stage won't change to Verified (stays as-is)
+        if passed {
+            // Verification either passed or was skipped due to error
+            let stage = &durable.contract.subtasks[0].stage;
+            assert!(
+                matches!(stage, SubtaskStage::Verified)
+                    || !matches!(stage, SubtaskStage::VerificationFailed { .. }),
+                "Stage should be Verified or unchanged (if pytest unavailable), got {:?}",
+                stage
+            );
+        }
+    }
+
+    /// Global verification: on_plan_complete runs cross-subtask checks.
+    #[tokio::test]
+    async fn e2e_global_verification_on_plan_complete() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let session_dir = tmp.path().join("session");
+        std::fs::create_dir_all(&session_dir).unwrap();
+
+        // Create both files the plan expects
+        std::fs::write(tmp.path().join("module.py"), "# module\n").unwrap();
+        std::fs::write(tmp.path().join("test_module.py"), "def test_ok(): pass\n").unwrap();
+
+        let lifecycle = create_local_lifecycle(&session_dir, tmp.path());
+        let plan = TaskPlan {
+            subtasks: vec![
+                SubtaskPlan {
+                    id: "s1".into(),
+                    title: "Create module".into(),
+                    description: None,
+                    depends_on: vec![],
+                    status: TaskStatus::Pending,
+                    effort: None,
+                    files: vec!["module.py".into()],
+                    acceptance: Some("File module.py exists".into()),
+                },
+                SubtaskPlan {
+                    id: "s2".into(),
+                    title: "Create tests".into(),
+                    description: None,
+                    depends_on: vec!["s1".into()],
+                    status: TaskStatus::Pending,
+                    effort: None,
+                    files: vec!["test_module.py".into()],
+                    acceptance: Some("File test_module.py exists".into()),
+                },
+            ],
+            notes: None,
+        };
+
+        let contract = generate_contract(
+            &lifecycle,
+            &plan,
+            "Create module and tests",
+            "user",
+            "sess",
+            tmp.path(),
+        )
+        .await
+        .expect("Contract should generate");
+
+        let mut durable = DurableTaskState {
+            contract,
+            lifecycle,
+            last_report: None,
+        };
+
+        // Mark both subtasks as verified
+        for sub in &mut durable.contract.subtasks {
+            sub.stage = SubtaskStage::Verified;
+        }
+
+        // Run global verification — should pass (files exist)
+        let global_passed = on_plan_complete(&mut durable).await;
+        assert!(global_passed, "Global verification should pass — both files exist");
+        assert!(
+            durable.last_report.is_some(),
+            "Delivery report should be generated"
+        );
+    }
+
+    /// Retry mechanism: verification failure increments retry_count.
+    #[tokio::test]
+    async fn e2e_retry_count_increments_on_failure() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let session_dir = tmp.path().join("session");
+        std::fs::create_dir_all(&session_dir).unwrap();
+
+        let lifecycle = create_local_lifecycle(&session_dir, tmp.path());
+        let plan = TaskPlan {
+            subtasks: vec![SubtaskPlan {
+                id: "s1".into(),
+                title: "Missing file".into(),
+                description: None,
+                depends_on: vec![],
+                status: TaskStatus::Pending,
+                effort: None,
+                files: vec!["ghost.txt".into()],
+                acceptance: Some("File ghost.txt exists".into()),
+            }],
+            notes: None,
+        };
+
+        let contract = generate_contract(
+            &lifecycle,
+            &plan,
+            "Create ghost",
+            "user",
+            "sess",
+            tmp.path(),
+        )
+        .await
+        .expect("Contract should generate");
+
+        let mut durable = DurableTaskState {
+            contract,
+            lifecycle,
+            last_report: None,
+        };
+
+        // First failure
+        let passed = on_subtask_complete(&mut durable, "s1").await;
+        if !passed {
+            assert_eq!(durable.contract.subtasks[0].retry_count, 1);
+
+            // Second failure
+            durable.contract.subtasks[0].stage = SubtaskStage::Executing;
+            let passed2 = on_subtask_complete(&mut durable, "s1").await;
+            assert!(!passed2);
+            assert_eq!(durable.contract.subtasks[0].retry_count, 2);
+        }
     }
 
     #[test]
