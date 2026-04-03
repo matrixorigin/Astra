@@ -5,7 +5,10 @@
 //! `fetch_chat_turn_sse` for use by [`super::cli_loop_host::CliAgenticLoopHost`].
 
 use std::collections::HashSet;
+use std::io::IsTerminal;
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use crossterm::style::Stylize;
@@ -51,10 +54,38 @@ use crate::{
     edge_tools::ToolExecutor,
     permission_manager::PermissionManager,
     skill_instructions::SharedSkillRegistry,
-    stream_render::{EdgeSseContext, TurnResult, consume_turn_sse},
+    stream_render::{
+        ChatPrepPhaseLabel, ChatTurnPrepLineGuard, EdgeSseContext, TurnResult, consume_turn_sse,
+    },
 };
 
 use super::super::edge_executor::edge_executor_instance_id;
+
+/// Per-phase stderr timings for `/chat/turn`. Enable with `MO_AGENT_CHAT_TURN_TIMING=1`
+/// or `MO_DEBUG=1`.
+pub(crate) fn chat_turn_timing_stderr_enabled() -> bool {
+    std::env::var("MO_AGENT_CHAT_TURN_TIMING")
+        .is_ok_and(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        || std::env::var("MO_DEBUG").is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+}
+
+fn log_chat_turn_timing_phase(timing: bool, label: &str, mark: &mut Instant) {
+    if !timing {
+        return;
+    }
+    let ms = mark.elapsed().as_millis();
+    eprintln!("{}", format!("  [chat-turn timing] {label}: {ms}ms").dim());
+    *mark = Instant::now();
+}
+
+/// Updates the live stderr prep line (`Ns  Phase… ⠿`, braille animates at end) for normal chat.
+fn touch_prep_ui_phase(phase: &Option<ChatPrepPhaseLabel>, label: &str) {
+    if let Some(a) = phase
+        && let Ok(mut w) = a.write()
+    {
+        *w = label.to_string();
+    }
+}
 
 // ─── Outbound `/chat` JSON body (was `prepare_turn_request.rs`) ───────────────
 
@@ -95,9 +126,19 @@ struct PrepareChatTurnRequest<'a> {
     telem: PrepareTurnTelemetry<'a>,
     is_plan_subtask: bool,
     plan_subtask_id: Option<&'a str>,
+    /// When true, emit `[chat-turn timing] …` lines to stderr (see `chat_turn_timing_stderr_enabled`).
+    timing_phases: bool,
+    /// Normal chat: human-readable step shown after the elapsed second count on stderr.
+    prep_ui_phase: Option<ChatPrepPhaseLabel>,
 }
 
 async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
+    let timing = ctx.timing_phases;
+    let mut mark = Instant::now();
+    let prep_wall = mark;
+
+    touch_prep_ui_phase(&ctx.prep_ui_phase, "Starting…");
+
     let git_branch = read_git_branch_abbrev();
     let mut payload = chat_turn_base_payload(ChatTurnBasePayloadInput {
         messages: ctx.messages,
@@ -113,6 +154,7 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
     let active_skills = detect_active_system_skills_in_message(ctx.message);
     merge_active_skills_into_edge_profile(&mut payload, &active_skills);
 
+    touch_prep_ui_phase(&ctx.prep_ui_phase, "Reading workspace…");
     let passive_msgs = ctx
         .executor
         .take_passive_workspace_diagnostic_messages(ctx.project_root, !ctx.tool_results.is_empty())
@@ -126,6 +168,9 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
             arr.push(m);
         }
     }
+    log_chat_turn_timing_phase(timing, "base_payload_passive_workspace", &mut mark);
+
+    touch_prep_ui_phase(&ctx.prep_ui_phase, "Recalling memory…");
 
     let budget_pressure = {
         let schema_tokens = ctx.selector.registry().total_pinned_token_cost();
@@ -155,6 +200,9 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
             );
         }
     }
+    log_chat_turn_timing_phase(timing, "memory_boost_search", &mut mark);
+
+    touch_prep_ui_phase(&ctx.prep_ui_phase, "Preparing tools…");
 
     let memory_domain_hints = domain_hints_from_boost_terms(&boost_terms);
     merge_deprioritized_tools_into_restricted(ctx.turn_guard, ctx.restricted_tools);
@@ -174,6 +222,7 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
     let mut selected_skills: Vec<String> = Vec::new();
     let (turn_schemas, selection_report, selection_confidence) = if ctx.tool_results.is_empty() {
         let sel_start = Instant::now();
+        touch_prep_ui_phase(&ctx.prep_ui_phase, "Scanning context…");
         let sel_ctx = build_agentic_tool_selection_context(
             ctx.message,
             ctx.history.len(),
@@ -186,10 +235,12 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
             ctx.file_context.to_vec(),
             false,
         );
+        touch_prep_ui_phase(&ctx.prep_ui_phase, "Thinking…");
         let sel_result = ctx
             .selector
             .select_with_learned_context(&sel_ctx, &learned_context)
             .await;
+        touch_prep_ui_phase(&ctx.prep_ui_phase, "Loading schemas…");
         record_first_selector_latency_and_strategy(
             ctx.telem.first_selector_ms,
             ctx.telem.first_selector_strategy,
@@ -212,6 +263,7 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
         );
         (schemas, report, conf)
     } else {
+        touch_prep_ui_phase(&ctx.prep_ui_phase, "Continuing…");
         let sel_ctx = build_agentic_tool_selection_context(
             ctx.message,
             ctx.history.len(),
@@ -224,10 +276,12 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
             ctx.file_context.to_vec(),
             true,
         );
+        touch_prep_ui_phase(&ctx.prep_ui_phase, "Thinking…");
         let sel_result = ctx
             .selector
             .select_with_learned_context(&sel_ctx, &learned_context)
             .await;
+        touch_prep_ui_phase(&ctx.prep_ui_phase, "Loading schemas…");
         accumulate_selector_token_usage(
             ctx.telem.selector_tokens_in,
             ctx.telem.selector_tokens_out,
@@ -251,6 +305,9 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
         );
         (selected, report, conf)
     };
+    log_chat_turn_timing_phase(timing, "tool_selector_resolve_schemas", &mut mark);
+
+    touch_prep_ui_phase(&ctx.prep_ui_phase, "Merging skills…");
 
     let skill_instructions = load_skill_instructions_text(
         ctx.skill_registry,
@@ -279,6 +336,10 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
         learned_context_hint.as_str(),
         learned_task_type.as_deref(),
     );
+    log_chat_turn_timing_phase(timing, "skill_merge_attach_edge_tools", &mut mark);
+
+    touch_prep_ui_phase(&ctx.prep_ui_phase, "Finishing up…");
+
     if ctx.explain.explain_stderr {
         let (restricted_line, guidance_line) =
             explain_stderr_payload_line_pair(ctx.restricted_tools, &payload, selection_confidence);
@@ -309,6 +370,18 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
         if let Some(id) = ctx.plan_subtask_id.map(str::trim).filter(|s| !s.is_empty()) {
             root.insert("plan_subtask_id".into(), json!(id));
         }
+    }
+
+    log_chat_turn_timing_phase(timing, "finalize_payload_records", &mut mark);
+    if timing {
+        eprintln!(
+            "{}",
+            format!(
+                "  [chat-turn timing] prepare_payload_wall_total: {}ms",
+                prep_wall.elapsed().as_millis()
+            )
+            .dim()
+        );
     }
 
     payload
@@ -363,6 +436,8 @@ pub(crate) struct ChatTurnSseFetchRequest<'a> {
     pub term_width: usize,
     pub quiet: bool,
     pub suppress_intermediate_output: bool,
+    /// When true, do not paint assistant `text_delta` (plan JSON etc.); `full_text` still accumulates.
+    pub hide_streaming_assistant_text: bool,
     pub message: &'a str,
     pub history: &'a [(String, String)],
     pub recent_tools: &'a [String],
@@ -389,6 +464,81 @@ pub(crate) struct ChatTurnSseFetchRequest<'a> {
     pub plan_subtask_id: Option<&'a str>,
     /// Optional cancellation token for interrupting SSE streaming.
     pub cancel_token: Option<&'a tokio_util::sync::CancellationToken>,
+    /// Plan-only: release the payload-phase stderr line before SSE consumes the body.
+    pub plan_assemble_line_release: Option<Arc<AtomicBool>>,
+}
+
+/// stderr prep line + timing toggles for [`fetch_chat_turn_sse`].
+struct ChatTurnSseFetchUi {
+    timing: bool,
+    show_prep_line: bool,
+    prep_ui_phase: Option<ChatPrepPhaseLabel>,
+}
+
+fn chat_turn_sse_fetch_ui(
+    quiet: bool,
+    suppress_intermediate_output: bool,
+    plan_assemble_line_release: Option<&Arc<AtomicBool>>,
+) -> ChatTurnSseFetchUi {
+    let timing = chat_turn_timing_stderr_enabled();
+    if timing {
+        eprintln!(
+            "{}",
+            "  [chat-turn timing] starting prepare_chat_turn_payload…".dim()
+        );
+    }
+
+    // Normal chat: one stderr status line during payload + HTTP (plan mode uses the outer
+    // `PlanAssembleLineSpinner` + `plan_assemble_line_release` instead). Disabled with timing
+    // stderr lines to avoid `\r` / `eprintln!` fighting.
+    let show_prep_line = !quiet
+        && !suppress_intermediate_output
+        && std::io::stderr().is_terminal()
+        && !timing
+        && plan_assemble_line_release.is_none();
+
+    let prep_ui_phase = if show_prep_line {
+        Some(Arc::new(std::sync::RwLock::new("Starting…".to_string())))
+    } else {
+        None
+    };
+
+    ChatTurnSseFetchUi {
+        timing,
+        show_prep_line,
+        prep_ui_phase,
+    }
+}
+
+/// Build JSON payload (with optional prep line), POST `/chat/turn`, return the HTTP response body stream handle.
+async fn chat_turn_post_payload_after_prepare(
+    api: &mo_thin_client::ThinClient,
+    token: &str,
+    quiet: bool,
+    ui: &ChatTurnSseFetchUi,
+    prepare: PrepareChatTurnRequest<'_>,
+) -> Result<mo_thin_client::HttpResponse, String> {
+    let _prep_line =
+        ChatTurnPrepLineGuard::maybe_start(ui.show_prep_line, ui.prep_ui_phase.clone());
+    let payload = prepare_chat_turn_payload(prepare).await;
+
+    touch_prep_ui_phase(&ui.prep_ui_phase, "Sending…");
+    let http_mark = Instant::now();
+    let resp = api
+        .post_chat_turn_retry_429(token, &payload, CHAT_TURN_POST_MAX_RETRIES, quiet)
+        .await
+        .map_err(|e| e.to_string())?;
+    if ui.timing {
+        eprintln!(
+            "{}",
+            format!(
+                "  [chat-turn timing] http_post_until_response_object: {}ms",
+                http_mark.elapsed().as_millis()
+            )
+            .dim()
+        );
+    }
+    Ok(resp)
 }
 
 pub(crate) async fn fetch_chat_turn_sse(
@@ -403,6 +553,7 @@ pub(crate) async fn fetch_chat_turn_sse(
         term_width,
         quiet,
         suppress_intermediate_output,
+        hide_streaming_assistant_text,
         message,
         history,
         recent_tools,
@@ -426,43 +577,53 @@ pub(crate) async fn fetch_chat_turn_sse(
         is_plan_subtask,
         plan_subtask_id,
         cancel_token,
+        plan_assemble_line_release,
     } = ctx;
 
-    let payload = prepare_chat_turn_payload(PrepareChatTurnRequest {
-        messages,
-        current_session_id,
-        model,
-        explain: AgenticChatExplainFlags::from_explain_ui_mode(match explain {
-            ExplainMode::Off => AgenticExplainUiMode::Off,
-            ExplainMode::On => AgenticExplainUiMode::On,
-            ExplainMode::Verbose => AgenticExplainUiMode::Verbose,
-        }),
-        project_root,
-        message,
-        history,
-        recent_tools,
-        executor,
-        selector,
-        registry,
-        tool_results,
-        all_schemas,
-        turn_guard,
-        restricted_tools,
-        step_recorder,
-        skill_registry,
+    let ui = chat_turn_sse_fetch_ui(
         quiet,
-        file_context,
-        assembly_start,
-        telem,
-        is_plan_subtask,
-        plan_subtask_id,
-    })
-    .await;
+        suppress_intermediate_output,
+        plan_assemble_line_release.as_ref(),
+    );
 
-    let resp = api
-        .post_chat_turn_retry_429(token, &payload, CHAT_TURN_POST_MAX_RETRIES, quiet)
-        .await
-        .map_err(|e| e.to_string())?;
+    let resp = chat_turn_post_payload_after_prepare(
+        api,
+        token,
+        quiet,
+        &ui,
+        PrepareChatTurnRequest {
+            messages,
+            current_session_id,
+            model,
+            explain: AgenticChatExplainFlags::from_explain_ui_mode(match explain {
+                ExplainMode::Off => AgenticExplainUiMode::Off,
+                ExplainMode::On => AgenticExplainUiMode::On,
+                ExplainMode::Verbose => AgenticExplainUiMode::Verbose,
+            }),
+            project_root,
+            message,
+            history,
+            recent_tools,
+            executor,
+            selector,
+            registry,
+            tool_results,
+            all_schemas,
+            turn_guard,
+            restricted_tools,
+            step_recorder,
+            skill_registry,
+            quiet,
+            file_context,
+            assembly_start,
+            telem,
+            is_plan_subtask,
+            plan_subtask_id,
+            timing_phases: ui.timing,
+            prep_ui_phase: ui.prep_ui_phase.clone(),
+        },
+    )
+    .await?;
 
     let status = resp.status();
     if !status.is_success() {
@@ -474,6 +635,14 @@ pub(crate) async fn fetch_chat_turn_sse(
         ));
     }
 
+    // Paired with `Acquire` load in `PlanAssembleLineSpinner`: publish "HTTP response ready"
+    // so the spinner thread always sees POST completion before SSE consumes the body (UI only).
+    if let Some(flag) = plan_assemble_line_release.as_ref() {
+        flag.store(true, Ordering::Release);
+    }
+
+    let show_reasoning_preview = hide_streaming_assistant_text;
+
     let edge_ctx = EdgeSseContext {
         api,
         token,
@@ -481,10 +650,13 @@ pub(crate) async fn fetch_chat_turn_sse(
         executor,
         quiet,
         suppress_intermediate_output,
+        hide_streaming_assistant_text,
+        show_reasoning_preview,
         perm_manager: Some(perm_manager),
     };
 
-    Ok(consume_turn_sse(
+    let sse_mark = Instant::now();
+    let turn = consume_turn_sse(
         resp,
         render_md,
         term_width,
@@ -494,7 +666,20 @@ pub(crate) async fn fetch_chat_turn_sse(
         pre_clear_lines,
         cancel_token,
     )
-    .await)
+    .await;
+    if ui.timing {
+        eprintln!(
+            "{}",
+            format!(
+                "  [chat-turn timing] sse_consume_total: {}ms  ttft_ms: {:?}",
+                sse_mark.elapsed().as_millis(),
+                turn.ttft_ms
+            )
+            .dim()
+        );
+    }
+
+    Ok(turn)
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────────
@@ -510,3 +695,7 @@ mod tests {
         assert_eq!(v, vec!["a", "b"]);
     }
 }
+
+// Note: Environment variable parsing tests for `chat_turn_timing_stderr_enabled` were removed
+// because unsafe `std::env::set_var` is unsound in multi-threaded programs. The function's
+// logic is trivial (pattern matching on env var values) and not worth testing with unsafe code.

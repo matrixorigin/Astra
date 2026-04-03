@@ -6,6 +6,8 @@
 
 use std::collections::HashSet;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::time::Instant;
 
 use async_trait::async_trait;
@@ -40,6 +42,7 @@ pub(crate) struct CliAgenticLoopHost<'a> {
     pub term_width: usize,
     pub quiet: bool,
     pub suppress_intermediate_output: bool,
+    pub hide_streaming_assistant_text: bool,
     pub message: &'a str,
     pub history: &'a [(String, String)],
     pub recent_tools: &'a [String],
@@ -57,6 +60,7 @@ pub(crate) struct CliAgenticLoopHost<'a> {
     pub pending_clear_lines: usize,
     pub is_plan_subtask: bool,
     pub plan_subtask_id: Option<&'a str>,
+    pub plan_assemble_line_release: Option<Arc<AtomicBool>>,
 }
 
 #[async_trait]
@@ -77,6 +81,7 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
             term_width: self.term_width,
             quiet: self.quiet,
             suppress_intermediate_output: self.suppress_intermediate_output,
+            hide_streaming_assistant_text: self.hide_streaming_assistant_text,
             message: self.message,
             history: self.history,
             recent_tools: self.recent_tools,
@@ -110,6 +115,7 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
             is_plan_subtask: self.is_plan_subtask,
             plan_subtask_id: self.plan_subtask_id,
             cancel_token: state.cancel_token.as_deref(),
+            plan_assemble_line_release: self.plan_assemble_line_release.clone(),
         })
         .await?;
 

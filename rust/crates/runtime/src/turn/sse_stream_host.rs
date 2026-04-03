@@ -111,6 +111,14 @@ pub trait SseStreamHost: Send {
     /// Called when the SSE stream ends. Host should clean up any active UI state.
     fn on_stream_complete(&mut self);
 
+    /// Called once before the consumer blocks waiting for the first SSE chunk (TTFT gap).
+    /// CLI: may show a short “waiting for model” spinner on stderr.
+    fn on_before_sse_read_loop(&mut self) {}
+
+    /// Called when the first decodable SSE event block is produced from the byte stream.
+    /// CLI: dismiss the TTFT “waiting” spinner before handling render effects.
+    fn on_first_sse_frame(&mut self) {}
+
     /// Execute a tool request that arrived via `tool_request` SSE event.
     /// Returns the execution result (output, status, duration).
     async fn execute_tool(
@@ -170,6 +178,9 @@ pub async fn consume_sse_stream_cancellable<H: SseStreamHost>(
     let mut tool_results: Vec<EdgeToolExecResult> = Vec::new();
     let mut approval_results: Vec<EdgeApprovalResult> = Vec::new();
     let mut abort: Option<SseAbortReason> = None;
+    let mut first_sse_frame_seen = false;
+
+    host.on_before_sse_read_loop();
 
     let idle = idle_timeout;
     loop {
@@ -200,6 +211,10 @@ pub async fn consume_sse_stream_cancellable<H: SseStreamHost>(
             break;
         };
         for event_str in framer.push_lossy_bytes(&bytes) {
+            if !first_sse_frame_seen {
+                first_sse_frame_seen = true;
+                host.on_first_sse_frame();
+            }
             let effects = dispatch_chat_turn_sse_event_block(&event_str, &mut accum, &mut pending);
             host.on_render_effects(effects);
             flush_pending_via_host(&mut pending, host, &mut tool_results, &mut approval_results)
@@ -230,6 +245,9 @@ pub async fn consume_sse_stream_cancellable<H: SseStreamHost>(
     let tail = framer.take_trailing_dispatch_blob();
     let ttft_ms = framer.ttft_ms;
     if !tail.trim().is_empty() {
+        if !first_sse_frame_seen {
+            host.on_first_sse_frame();
+        }
         let effects = dispatch_chat_turn_sse_event_block(&tail, &mut accum, &mut pending);
         host.on_render_effects(effects);
         flush_pending_via_host(&mut pending, host, &mut tool_results, &mut approval_results).await;

@@ -31,6 +31,19 @@ pub enum ErrorCategory {
     Unknown,
 }
 
+/// True when the error comes from the Edge workspace guard: existing paths must be
+/// read (fully, when required) before overwrite / patch. Keep in sync with
+/// `mo-agent` `ToolExecutor` / `check_staleness` / `was_fully_read` messages.
+fn is_workspace_read_before_write_error(lower: &str) -> bool {
+    lower.contains("not been read yet")
+        || lower.contains("read it first before")
+        || lower.contains("only partially read")
+        || (lower.contains("partially read") && lower.contains("write"))
+        || lower.contains("modified since last read")
+        || lower.contains("read it again before")
+        || lower.contains("read the full file before overwriting")
+}
+
 /// Classify a tool error string into an actionable category.
 pub fn classify_error(error_str: &str) -> ErrorCategory {
     let lower = error_str.to_lowercase();
@@ -132,6 +145,11 @@ pub fn classify_error(error_str: &str) -> ErrorCategory {
         || lower.contains("type mismatch")
         || lower.contains("malformed")
     {
+        return ErrorCategory::InvalidArgs;
+    }
+
+    // Edge workspace policy: must read on-disk file (fully when overwriting) before write/patch.
+    if is_workspace_read_before_write_error(&lower) {
         return ErrorCategory::InvalidArgs;
     }
 
@@ -245,6 +263,7 @@ pub fn build_recovery_message(
     deprioritized: &[&str],
 ) -> String {
     let alternatives = suggest_alternatives(tool_name, deprioritized);
+    let error_lower = error_str.to_lowercase();
 
     let mut msg = match category {
         ErrorCategory::Transient => format!(
@@ -279,21 +298,38 @@ pub fn build_recovery_message(
             tool_name
         ),
         ErrorCategory::Unknown => {
-            mo_agent_core::agent_tool_event!(
+            mo_agent_core::agent_debug!(
                 "error_recovery",
-                "unclassified_error",
-                tool = tool_name,
-                error = &error_str.chars().take(200).collect::<String>()
+                "unclassified_error tool={} error={}",
+                tool_name,
+                error_str.chars().take(200).collect::<String>()
             );
-            format!("⚠ {} failed with an unclassified error.", tool_name)
+            format!(
+                "⚠ {} failed with an unexpected error. Check the tool output and adjust; \
+                 enable MO_DEBUG=1 or RUST_LOG for a structured log line.",
+                tool_name
+            )
         }
     };
+
+    if category == ErrorCategory::InvalidArgs
+        && matches!(
+            tool_name,
+            "write_file" | "str_replace" | "multi_edit" | "apply_patch"
+        )
+        && is_workspace_read_before_write_error(&error_lower)
+    {
+        msg = format!(
+            "⚠ {} was blocked by workspace safety: the path must be read in this session before you edit it. \
+             For existing files, call read_file on that exact path first (use a full read before write_file overwrite); \
+             if the file changed on disk since your last read, read it again. Then retry.",
+            tool_name
+        );
+    }
 
     if !alternatives.is_empty() {
         msg.push_str(&format!(" Alternatives: [{}].", alternatives.join(", ")));
     }
-
-    let error_lower = error_str.to_lowercase();
     if tool_name == "read_file" && error_lower.contains("file is too large") {
         msg.push_str(
             " For large files, do NOT switch to bash. Retry read_file with \
@@ -497,6 +533,28 @@ mod tests {
     }
 
     #[test]
+    fn classify_workspace_read_before_write_guard() {
+        assert_eq!(
+            classify_error(
+                "File exists but has not been read yet. Read it first before writing/editing."
+            ),
+            ErrorCategory::InvalidArgs
+        );
+        assert_eq!(
+            classify_error(
+                "File was only partially read (outline or line range). Read the full file before overwriting."
+            ),
+            ErrorCategory::InvalidArgs
+        );
+        assert_eq!(
+            classify_error(
+                "File has been modified since last read (by user or linter). Read it again before editing."
+            ),
+            ErrorCategory::InvalidArgs
+        );
+    }
+
+    #[test]
     fn classify_invalid_args() {
         assert_eq!(
             classify_error("invalid JSON in arguments"),
@@ -633,6 +691,16 @@ mod tests {
         let msg = build_recovery_message("git_log", "timeout", ErrorCategory::Transient, &[]);
         assert!(msg.contains("git_diff"));
         assert!(msg.contains("Alternatives"));
+    }
+
+    #[test]
+    fn recovery_message_write_file_read_guard_is_actionable() {
+        let err = "File exists but has not been read yet. Read it first before writing/editing.";
+        let cat = classify_error(err);
+        assert_eq!(cat, ErrorCategory::InvalidArgs);
+        let msg = build_recovery_message("write_file", err, cat, &[]);
+        assert!(msg.contains("read_file"));
+        assert!(msg.contains("workspace safety"));
     }
 
     #[test]

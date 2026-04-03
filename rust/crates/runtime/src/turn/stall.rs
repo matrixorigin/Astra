@@ -1199,7 +1199,10 @@ mod tests {
         let sigs = server_tool_call_signature(&tool_calls);
         assert_eq!(sigs.len(), 1);
         let sig = sigs.iter().next().unwrap();
-        assert!(sig.starts_with(':'), "missing name should produce empty prefix");
+        assert!(
+            sig.starts_with(':'),
+            "missing name should produce empty prefix"
+        );
     }
 
     #[test]
@@ -1410,8 +1413,7 @@ mod tests {
     #[test]
     fn nudge_ignored_all_tools_violated() {
         let avoid = vec!["bash".to_string(), "grep".to_string()];
-        let used: HashSet<String> =
-            HashSet::from_iter(["bash".to_string(), "grep".to_string()]);
+        let used: HashSet<String> = HashSet::from_iter(["bash".to_string(), "grep".to_string()]);
         let mut ignored = detect_nudge_ignored(&avoid, &used);
         ignored.sort();
         assert_eq!(ignored, vec!["bash".to_string(), "grep".to_string()]);
@@ -1497,7 +1499,11 @@ mod tests {
         ]);
         let r = build_stall_reflection(&sigs, &[], 0);
         // "6 turns" in the what_happened string (window caps at 6)
-        assert!(r.what_happened.contains("6"), "window should cap at 6: {}", r.what_happened);
+        assert!(
+            r.what_happened.contains("6"),
+            "window should cap at 6: {}",
+            r.what_happened
+        );
     }
 
     // ══════════════════════════════════════════════════════════════════════
@@ -1524,7 +1530,11 @@ mod tests {
             why: "because".to_string(),
             what_to_try: "something".to_string(),
             confidence: 0.5,
-            avoid_tools: vec!["bash".to_string(), "grep".to_string(), "list_dir".to_string()],
+            avoid_tools: vec![
+                "bash".to_string(),
+                "grep".to_string(),
+                "list_dir".to_string(),
+            ],
         };
         let msg = r.to_nudge_message();
         assert!(msg.contains("bash, grep, list_dir"));
@@ -1552,7 +1562,10 @@ mod tests {
 
     #[test]
     fn intent_drift_empty_turns() {
-        assert_eq!(detect_intent_drift("review commit", &[]), IntentDrift::OnTask);
+        assert_eq!(
+            detect_intent_drift("review commit", &[]),
+            IntentDrift::OnTask
+        );
     }
 
     #[test]
@@ -1563,7 +1576,10 @@ mod tests {
             (&["git_show"], "def"),
             (&["bash"], r#"git blame file.rs"#),
         ]);
-        assert_eq!(detect_intent_drift("review commit diff", &turns), IntentDrift::OnTask);
+        assert_eq!(
+            detect_intent_drift("review commit diff", &turns),
+            IntentDrift::OnTask
+        );
     }
 
     #[test]
@@ -1575,9 +1591,7 @@ mod tests {
             (&["write_file"], "random"),
             (&["write_file"], "random"),
         ]);
-        if let IntentDrift::Drifting { correction, .. } =
-            detect_intent_drift(&long_query, &turns)
-        {
+        if let IntentDrift::Drifting { correction, .. } = detect_intent_drift(&long_query, &turns) {
             // Correction should contain the query truncated to 100 chars
             assert!(correction.len() < long_query.len() + 200);
             assert!(correction.contains("INTENT DRIFT"));
@@ -1605,7 +1619,10 @@ mod tests {
             (&["write_file"], "random"),
             (&["reflect"], "anything"),
         ]);
-        assert_eq!(detect_intent_drift("review commit", &turns), IntentDrift::OnTask);
+        assert_eq!(
+            detect_intent_drift("review commit", &turns),
+            IntentDrift::OnTask
+        );
     }
 
     #[test]

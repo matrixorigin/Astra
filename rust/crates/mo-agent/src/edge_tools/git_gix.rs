@@ -538,8 +538,47 @@ pub(crate) fn git_blame(project_root: &Path, args: &Value) -> String {
 
 // ─── git_diff ───────────────────────────────────────────────────────────────
 
+/// `git diff … --stat` via the real `git` CLI (same sources as full diff, no bash).
+fn git_diff_stat_cli(project_root: &Path, args: &Value, limit: usize) -> String {
+    let staged = args.get("staged").and_then(Value::as_bool).unwrap_or(false);
+    let git_ref = args.get("ref").and_then(Value::as_str);
+    let path_filter = args.get("path").and_then(Value::as_str);
+
+    if staged && git_ref.is_some() {
+        return "Error: git_diff: use either staged:true or ref, not both".to_string();
+    }
+
+    let mut parts: Vec<String> = vec!["diff".into()];
+    if staged {
+        parts.push("--cached".into());
+    } else if let Some(r) = git_ref {
+        parts.push(r.to_string());
+        if path_filter.is_none() {
+            parts.push("HEAD".into());
+        }
+    } else {
+        parts.push("HEAD".into());
+    }
+    parts.extend(["--stat".into(), "--no-color".into()]);
+    if let Some(p) = path_filter {
+        parts.push("--".into());
+        parts.push(p.to_string());
+    }
+
+    let cmd_refs: Vec<&str> = parts.iter().map(|s| s.as_str()).collect();
+    diff_via_git_cli(project_root, &cmd_refs, limit).unwrap_or_else(|| "No changes".to_string())
+}
+
 pub(crate) fn git_diff(project_root: &Path, args: &Value, pressure: f64) -> String {
     let limit = pressure_scaled_limit(DIFF_LIMIT, pressure);
+    let stat_only = args
+        .get("stat_only")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if stat_only {
+        return git_diff_stat_cli(project_root, args, limit);
+    }
+
     let repo = match open_repo(project_root) {
         Ok(r) => r,
         Err(e) => return e,
@@ -1827,6 +1866,33 @@ mod tests {
             !result.starts_with("Error:"),
             "default diff should work: {result}"
         );
+    }
+
+    #[test]
+    fn git_diff_stat_only_smoke() {
+        let root = repo_root();
+        let result = git_diff(&root, &json!({"stat_only": true}), 0.0);
+        assert!(
+            !result.starts_with("Error:"),
+            "stat_only should use git CLI without repo open errors: {result}"
+        );
+        assert!(
+            result.contains('|')
+                || result.to_lowercase().contains("file")
+                || result == "No changes",
+            "expected stat-style summary: {result}"
+        );
+    }
+
+    #[test]
+    fn git_diff_stat_only_rejects_staged_with_ref() {
+        let root = repo_root();
+        let result = git_diff(
+            &root,
+            &json!({"stat_only": true, "staged": true, "ref": "HEAD~1"}),
+            0.0,
+        );
+        assert!(result.contains("not both"), "{result}");
     }
 
     // ─── git_show enhanced tests ────────────────────────────────────────────

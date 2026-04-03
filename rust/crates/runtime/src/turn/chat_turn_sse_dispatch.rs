@@ -46,6 +46,8 @@ pub enum ChatTurnEdgePending {
 pub enum SseRenderEffect {
     StopThinkingSpinner,
     StartThinkingSpinner,
+    /// Incremental reasoning chunk for a compact terminal preview (CLI).
+    ThinkingPreviewChunk(String),
     StreamText(String),
 }
 
@@ -75,6 +77,9 @@ fn apply_one_event(
             effects.push(SseRenderEffect::StartThinkingSpinner);
             if let Some(chunk) = event.get("content").and_then(|v| v.as_str()) {
                 accum.reasoning_content.push_str(chunk);
+                if !chunk.is_empty() {
+                    effects.push(SseRenderEffect::ThinkingPreviewChunk(chunk.to_string()));
+                }
             }
         }
         "thinking_done" | "reasoning_done" => {
@@ -330,6 +335,26 @@ mod tests {
         let efx = dispatch_chat_turn_sse_event_block(&block, &mut a, &mut vec![]);
         assert_eq!(a.full_text, "hello world");
         assert!(!efx.is_empty());
+    }
+
+    #[test]
+    fn reasoning_delta_emits_preview_chunks() {
+        let mut a = ChatTurnSseAccum::default();
+        let block = format!(
+            "{}{}",
+            sse("reasoning_delta", ",\"content\":\"hello\""),
+            sse("reasoning_delta", ",\"content\":\" z\"")
+        );
+        let efx = dispatch_chat_turn_sse_event_block(&block, &mut a, &mut vec![]);
+        assert_eq!(a.reasoning_content, "hello z");
+        let chunks: Vec<&str> = efx
+            .iter()
+            .filter_map(|e| match e {
+                SseRenderEffect::ThinkingPreviewChunk(s) => Some(s.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(chunks, vec!["hello", " z"]);
     }
 
     #[test]

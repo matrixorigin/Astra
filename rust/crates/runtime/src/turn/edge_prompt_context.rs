@@ -176,10 +176,12 @@ pub fn build_environment_context(project_root: &Path) -> String {
     format!("\n\n## Environment\n{}", lines.join("\n"))
 }
 
+/// Max Unicode scalar values (`char`s) kept before appending `…` (U+2026).
+/// Char-based truncation avoids splitting UTF-8 bytes (which would panic on e.g. CJK).
+const MAX_ARGS_PREVIEW_CHARS: usize = 79;
+
 /// Compact preview of tool arguments for observability (journal, stderr).
 pub fn make_args_preview(tool_name: &str, args: &Value) -> Option<String> {
-    let max_len = 80;
-
     let preview = match tool_name {
         "read_file" | "write_file" | "delete_file" | "str_replace" | "multi_edit" => {
             path_hint_from_args(args)
@@ -232,8 +234,9 @@ pub fn make_args_preview(tool_name: &str, args: &Value) -> Option<String> {
     };
 
     preview.map(|s| {
-        if s.len() > max_len {
-            format!("{}…", &s[..max_len - 1])
+        if s.chars().count() > MAX_ARGS_PREVIEW_CHARS {
+            let body: String = s.chars().take(MAX_ARGS_PREVIEW_CHARS).collect();
+            format!("{body}…")
         } else {
             s
         }
@@ -278,9 +281,21 @@ mod tests {
         let v = json!({"path": long});
         let prev = make_args_preview("read_file", &v).expect("preview");
         assert!(prev.ends_with('…'));
-        // 79 ASCII bytes from source + U+2026 (3 UTF-8 bytes) — same rule as pre-refactor.
+        // 79 ASCII chars from source + U+2026 (3 UTF-8 bytes).
         assert_eq!(prev.len(), 82);
         assert_eq!(prev.chars().count(), 80);
+    }
+
+    #[test]
+    fn make_args_preview_truncates_utf8_on_char_boundary() {
+        // Long ASCII + CJK: old byte-based slice could panic inside a multibyte char.
+        let cmd = format!("{}{}", "a".repeat(30), "在".repeat(50));
+        let v = json!({"command": cmd});
+        let prev = make_args_preview("bash", &v).expect("preview");
+        assert!(prev.ends_with('…'));
+        assert_eq!(prev.chars().count(), 80);
+        let expected = format!("{}{}", "a".repeat(30), "在".repeat(49));
+        assert_eq!(prev.strip_suffix('…'), Some(expected.as_str()));
     }
 
     #[test]

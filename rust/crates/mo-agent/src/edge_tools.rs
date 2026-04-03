@@ -76,7 +76,7 @@ pub fn all_tool_schemas() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "bash",
-                "description": "Execute a shell command in the project root. Use for builds, tests, installs, git operations, or any CLI task. Can run curl to fetch URLs, call GitHub API, or access any network resource. Timeout varies by command type (5-30s); set timeout parameter to override.",
+                "description": "Execute a shell command in the project root. Use for builds, tests, installs, and other CLI tasks. For read-only git inspection use git_status, git_diff (full patch or stat_only:true for per-file counts), git_show, git_log — do NOT use bash for `git status`, `git diff`, or `git log` when those tools apply. Can run curl, GitHub API, etc. Timeout varies (5-30s); override with timeout.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -242,12 +242,14 @@ pub fn all_tool_schemas() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "git_diff",
-                "description": "Show git diff of WORKING TREE changes. For reviewing a specific commit, use git_show instead.",
+                "description": "Show git diff of working tree / index vs HEAD (or two-tree diff when `ref` is set without `path`). For commit review use git_show. Use stat_only:true for `git diff --stat`-style per-file line counts without full hunks — prefer this over bash.",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "ref": {"type": "string", "description": "Git ref to diff against (optional)"},
-                        "staged": {"type": "boolean", "description": "Show staged changes (default false)"}
+                        "ref": {"type": "string", "description": "Git ref to diff against (optional). With `path`: diff working tree vs this ref for that path. Without `path`: diff between this ref and HEAD (two-tree)."},
+                        "staged": {"type": "boolean", "description": "Show staged changes vs HEAD (default false). Do not combine with `ref`."},
+                        "path": {"type": "string", "description": "Limit diff to one file (optional)"},
+                        "stat_only": {"type": "boolean", "description": "If true, return only per-file insert/delete counts (--stat). Default false (full unified diff)."}
                     },
                     "required": []
                 }

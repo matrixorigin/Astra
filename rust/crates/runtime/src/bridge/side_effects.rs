@@ -1513,18 +1513,9 @@ mod tests {
         let result = take_bridge_tail_update_args(&mut map).unwrap();
         assert_eq!(result.len(), 4);
         assert_eq!(result.get("full_text").unwrap(), &json!("text"));
-        assert_eq!(
-            result.get("tool_calls").unwrap(),
-            &json!([{"id": "tc1"}])
-        );
-        assert_eq!(
-            result.get("reasoning_content").unwrap(),
-            &json!("thought")
-        );
-        assert_eq!(
-            result.get("cloud_loop_history").unwrap(),
-            &json!([1, 2])
-        );
+        assert_eq!(result.get("tool_calls").unwrap(), &json!([{"id": "tc1"}]));
+        assert_eq!(result.get("reasoning_content").unwrap(), &json!("thought"));
+        assert_eq!(result.get("cloud_loop_history").unwrap(), &json!([1, 2]));
         assert!(map.is_empty());
     }
 

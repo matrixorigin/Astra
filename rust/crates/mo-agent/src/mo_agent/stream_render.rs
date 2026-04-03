@@ -1,4 +1,10 @@
 use super::*;
+use crossterm::{
+    QueueableCommand,
+    cursor::MoveUp,
+    style::Stylize,
+    terminal::{Clear, ClearType},
+};
 use futures_util::StreamExt;
 use mo_agent_runtime::turn::chat_turn_sse_dispatch::{
     ChatTurnSseAccum, SseRenderEffect, dispatch_chat_turn_sse_event_block,
@@ -13,8 +19,11 @@ use mo_agent_runtime::turn::sse_stream_host::{
 };
 use mo_agent_runtime::turn::tool_result_semantics::cloud_tool_result_status_label;
 use serde_json::Value;
-use std::io::IsTerminal;
+use std::borrow::Cow;
+use std::io::{IsTerminal, Write};
 use std::ops::{Deref, DerefMut};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, RwLock};
 
 pub use mo_agent_runtime::turn::chat_turn_sse_dispatch::ChatTurnEdgePending;
 
@@ -26,6 +35,10 @@ pub(super) struct EdgeSseContext<'a> {
     pub executor: &'a crate::edge_tools::ToolExecutor,
     pub quiet: bool,
     pub suppress_intermediate_output: bool,
+    /// Skip `StreamText` effects only (reasoning preview / spinners still run).
+    pub hide_streaming_assistant_text: bool,
+    /// When hiding assistant text (plan-only), still show `reasoning_delta` in the thinking viewport.
+    pub show_reasoning_preview: bool,
     pub perm_manager: Option<&'a mut crate::permission_manager::PermissionManager>,
 }
 
@@ -48,6 +61,7 @@ struct CliSseStreamHost<'a> {
     executor: &'a crate::edge_tools::ToolExecutor,
     quiet: bool,
     suppress_intermediate_output: bool,
+    hide_streaming_assistant_text: bool,
     perm_manager: Option<&'a mut crate::permission_manager::PermissionManager>,
     render: StreamRenderState,
     /// Once this turn has emitted or requested tool work, hide any further prose
@@ -71,8 +85,13 @@ impl<'a> CliSseStreamHost<'a> {
             executor: ctx.executor,
             quiet: ctx.quiet,
             suppress_intermediate_output: ctx.suppress_intermediate_output,
+            hide_streaming_assistant_text: ctx.hide_streaming_assistant_text,
             perm_manager: ctx.perm_manager,
-            render: StreamRenderState::with_term_width(term_width, render_md),
+            render: StreamRenderState::with_term_width(
+                term_width,
+                render_md,
+                ctx.hide_streaming_assistant_text && !ctx.show_reasoning_preview,
+            ),
             tool_work_detected: false,
             edge_tool_round: Vec::new(),
             xml_tag_buffer: String::new(),
@@ -190,23 +209,65 @@ fn could_become_thinking_tag(partial: &str) -> bool {
 
 #[async_trait::async_trait]
 impl SseStreamHost for CliSseStreamHost<'_> {
+    fn on_before_sse_read_loop(&mut self) {
+        if self.quiet || self.suppress_intermediate_output {
+            return;
+        }
+        self.render.start_waiting_for_model();
+    }
+
+    fn on_first_sse_frame(&mut self) {
+        if self.quiet || self.suppress_intermediate_output {
+            return;
+        }
+        self.render.stop_thinking();
+    }
+
     fn on_render_effects(&mut self, effects: Vec<SseRenderEffect>) {
         if self.quiet || self.suppress_intermediate_output {
             return;
         }
-        for effect in effects {
-            match effect {
+        let mut i = 0usize;
+        while i < effects.len() {
+            match &effects[i] {
+                SseRenderEffect::StopThinkingSpinner => {
+                    // `text_delta` emits Stop then StreamText; in plan-only mode we stream the
+                    // assistant body into the reasoning viewport — skipping Stop avoids clearing
+                    // the pane on every token.
+                    let skip = self.hide_streaming_assistant_text
+                        && i + 1 < effects.len()
+                        && matches!(&effects[i + 1], SseRenderEffect::StreamText(_));
+                    if !skip {
+                        self.render.stop_thinking();
+                    }
+                    i += 1;
+                }
                 SseRenderEffect::StreamText(s) => {
+                    if self.hide_streaming_assistant_text {
+                        if !s.is_empty() {
+                            self.render.push_thinking_preview_chunk(s);
+                        }
+                        i += 1;
+                        continue;
+                    }
                     // When tool_work_detected, buffer text instead of discarding.
                     // It will be rendered at stream completion if it's the final answer.
                     if self.tool_work_detected {
-                        self.xml_tag_buffer.push_str(&s);
+                        self.xml_tag_buffer.push_str(s);
+                        i += 1;
                         continue;
                     }
-                    self.push_text(&s);
+                    self.push_text(s);
+                    i += 1;
                 }
-                SseRenderEffect::StopThinkingSpinner => self.render.stop_thinking(),
-                SseRenderEffect::StartThinkingSpinner => self.render.start_thinking(),
+                SseRenderEffect::StartThinkingSpinner => {
+                    self.render.start_thinking();
+                    i += 1;
+                }
+                SseRenderEffect::ThinkingPreviewChunk(s) => {
+                    self.render.push_thinking_preview_chunk(s);
+                    i += 1;
+                }
             }
         }
     }
@@ -302,21 +363,11 @@ impl SseStreamHost for CliSseStreamHost<'_> {
         tool: &str,
         path: Option<&str>,
     ) -> EdgeApprovalResult {
+        // `resolve_cloud_approval` writes to stderr only. Never bump `lines_written` here:
+        // that counter drives stdout `MoveUp` when clearing streamed text before the first
+        // tool line; mixing in stderr line counts caused a large blank gap after prompts.
         let decision = match &mut self.perm_manager {
-            Some(pm) => {
-                let d = pm.resolve_cloud_approval(tool, path, self.quiet);
-                if !self.quiet {
-                    // Cloud approval prompt emits 2-4 lines to stderr
-                    // (header + optional path + prompt + optional confirmation).
-                    self.render.lines_written += if path.is_some_and(|p| !p.is_empty()) {
-                        4
-                    } else {
-                        3
-                    };
-                    self.render.col = 0;
-                }
-                d
-            }
+            Some(pm) => pm.resolve_cloud_approval(tool, path, self.quiet),
             None => mo_thin_client::ApprovalDecision::Deny,
         };
         let decision_str = match &decision {
@@ -412,6 +463,365 @@ impl Drop for Spinner {
     }
 }
 
+/// Shared label for [`PlanAssembleLineSpinner`] while building a normal-chat `/chat/turn` payload.
+pub(crate) type ChatPrepPhaseLabel = Arc<RwLock<String>>;
+
+/// Which copy to show on the single-line stderr “seconds” status (plan vs normal chat prep).
+#[derive(Clone, Copy)]
+pub(crate) enum SecStatusLineKind {
+    PlanAssemble,
+    /// Normal `/chat/turn`: payload assembly + tool schemas + POST until response headers.
+    ChatRequestPrep,
+}
+
+/// One stderr line, updated in place with elapsed whole seconds.
+/// Used for plan-only assemble and for normal-chat request prep (before SSE read loop).
+pub(crate) struct PlanAssembleLineSpinner {
+    stop: Arc<AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+/// RAII: clears [`PlanAssembleLineSpinner`] when dropped (covers prepare/HTTP errors).
+pub(crate) struct ChatTurnPrepLineGuard(Option<PlanAssembleLineSpinner>);
+
+impl ChatTurnPrepLineGuard {
+    pub(crate) fn maybe_start(show: bool, phase: Option<ChatPrepPhaseLabel>) -> Self {
+        Self(if show {
+            Some(PlanAssembleLineSpinner::start_chat_request_prep_line(
+                phase.expect("prep phase label when show_prep_line"),
+            ))
+        } else {
+            None
+        })
+    }
+}
+
+impl Drop for ChatTurnPrepLineGuard {
+    fn drop(&mut self) {
+        if let Some(s) = self.0.take() {
+            s.stop_clear();
+        }
+    }
+}
+
+impl PlanAssembleLineSpinner {
+    #[allow(dead_code)]
+    pub(crate) fn start() -> Self {
+        Self::start_with_origin(std::time::Instant::now())
+    }
+
+    /// Same as [`Self::start`], but elapsed seconds are measured from `origin` (e.g. plan> session start).
+    #[allow(dead_code)]
+    pub(crate) fn start_with_origin(origin: std::time::Instant) -> Self {
+        Self::start_with_origin_release(origin, None)
+    }
+
+    /// Like [`Self::start_with_origin`], but when `line_release` is set and becomes `true`, the thread
+    /// clears the status line and exits (so SSE can use `Waiting for model` / reasoning preview).
+    pub(crate) fn start_with_origin_release(
+        origin: std::time::Instant,
+        line_release: Option<Arc<AtomicBool>>,
+    ) -> Self {
+        Self::start_with_origin_release_kind(
+            origin,
+            line_release,
+            SecStatusLineKind::PlanAssemble,
+            None,
+        )
+    }
+
+    /// Normal chat: payload + HTTP until response object (cleared before SSE / “Waiting for model”).
+    /// `phase` is updated by the payload builder so the line shows *what* is running, not only elapsed time.
+    pub(crate) fn start_chat_request_prep_line(phase: ChatPrepPhaseLabel) -> Self {
+        Self::start_with_origin_release_kind(
+            std::time::Instant::now(),
+            None,
+            SecStatusLineKind::ChatRequestPrep,
+            Some(phase),
+        )
+    }
+
+    fn start_with_origin_release_kind(
+        origin: std::time::Instant,
+        line_release: Option<Arc<AtomicBool>>,
+        kind: SecStatusLineKind,
+        chat_prep_phase: Option<ChatPrepPhaseLabel>,
+    ) -> Self {
+        if !io::stderr().is_terminal() {
+            return Self {
+                stop: Arc::new(AtomicBool::new(true)),
+                handle: None,
+            };
+        }
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop2 = stop.clone();
+        let handle = std::thread::spawn(move || {
+            let t0 = origin;
+            std::thread::sleep(std::time::Duration::from_millis(SPINNER_SHOW_DELAY_MS));
+            if stop2.load(Ordering::Relaxed) {
+                return;
+            }
+            let poll_phase =
+                matches!(kind, SecStatusLineKind::ChatRequestPrep) && chat_prep_phase.is_some();
+            let tick = if line_release.is_some() || poll_phase {
+                std::time::Duration::from_millis(50)
+            } else {
+                std::time::Duration::from_millis(200)
+            };
+            let w = crossterm::terminal::size()
+                .map(|(c, _)| c as usize)
+                .unwrap_or(80)
+                .clamp(20, 512);
+            let mut last_shown_sec: Option<u64> = None;
+            let mut spin_idx = 0usize;
+            while !stop2.load(Ordering::Relaxed) {
+                // `Release` store in `fetch_chat_turn_sse` after successful POST headers.
+                if line_release
+                    .as_ref()
+                    .is_some_and(|r| r.load(Ordering::Acquire))
+                {
+                    eprint!("\r{}\r", " ".repeat(w));
+                    let _ = io::stderr().flush();
+                    return;
+                }
+                let sec = t0.elapsed().as_secs();
+                match kind {
+                    SecStatusLineKind::PlanAssemble => {
+                        if last_shown_sec != Some(sec) {
+                            last_shown_sec = Some(sec);
+                            let line = format!(
+                                "  ⋯ Assembling plan · {:>3}s  (build · network · server · first token)",
+                                sec
+                            );
+                            let visible = line.chars().count();
+                            eprint!("\r{}", line);
+                            if visible < w {
+                                eprint!("{}", " ".repeat(w - visible));
+                            }
+                            let _ = io::stderr().flush();
+                        }
+                    }
+                    SecStatusLineKind::ChatRequestPrep => {
+                        spin_idx += 1;
+                        let frame = SPINNER_FRAMES[spin_idx % SPINNER_FRAMES.len()];
+                        let phase_raw: String = chat_prep_phase
+                            .as_ref()
+                            .and_then(|p| p.read().ok())
+                            .map(|g| {
+                                let t = g.trim();
+                                if t.is_empty() {
+                                    return "Working…".to_string();
+                                }
+                                let max = 42usize;
+                                if t.chars().count() > max {
+                                    format!(
+                                        "{}…",
+                                        t.chars().take(max.saturating_sub(1)).collect::<String>()
+                                    )
+                                } else {
+                                    t.to_string()
+                                }
+                            })
+                            .unwrap_or_else(|| "Working…".to_string());
+                        let time_part = format!("{:>3}s", sec);
+                        // Phase + elapsed first; braille animation trails at the end (like "Thinking ⠹").
+                        let visible =
+                            2 + time_part.chars().count() + 1 + phase_raw.chars().count() + 1 + 1;
+                        eprint!("\r  ");
+                        eprint!("{}", time_part.dim());
+                        eprint!(" {}", phase_raw.dim());
+                        eprint!(" {}", format!("{frame}").yellow());
+                        if visible < w {
+                            eprint!("{}", " ".repeat(w - visible));
+                        }
+                        let _ = io::stderr().flush();
+                        last_shown_sec = Some(sec);
+                    }
+                }
+                std::thread::sleep(tick);
+            }
+        });
+        Self {
+            stop,
+            handle: Some(handle),
+        }
+    }
+
+    pub(crate) fn stop_clear(mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+        let w = crossterm::terminal::size()
+            .map(|(c, _)| c as usize)
+            .unwrap_or(80)
+            .clamp(20, 512);
+        eprint!("\r{}\r", " ".repeat(w));
+        let _ = io::stderr().flush();
+    }
+}
+
+impl Drop for PlanAssembleLineSpinner {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
+}
+
+// ─── Reasoning preview (fixed-height stderr viewport) ─────────────────────────
+
+/// Visible **content** rows for `thinking_delta` / `reasoning_delta` (`0` = spinner only).
+/// When there are more visual lines than this, a Cursor-style `... (N lines hidden above)` row is prepended.
+fn thinking_viewport_rows() -> usize {
+    std::env::var("MO_AGENT_THINKING_VIEWPORT_LINES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .map(|n: usize| n.min(24))
+        .unwrap_or(6)
+}
+
+/// Split one logical line into fixed-width visual rows (UTF-8 safe).
+fn wrap_line_to_width(line: &str, w: usize) -> Vec<String> {
+    if w == 0 {
+        return vec![line.to_string()];
+    }
+    let chars: Vec<char> = line.chars().collect();
+    if chars.is_empty() {
+        return vec![String::new()];
+    }
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i < chars.len() {
+        let end = (i + w).min(chars.len());
+        out.push(chars[i..end].iter().collect());
+        i = end;
+    }
+    out
+}
+
+/// Expand buffer into visual rows (preserve newlines; wrap long lines). Works for pretty-printed JSON.
+fn buffer_to_visual_lines(buffer: &str, w: usize) -> Vec<String> {
+    let mut out = Vec::new();
+    if buffer.is_empty() {
+        return out;
+    }
+    for raw_line in buffer.replace('\r', "\n").split('\n') {
+        let line = raw_line.trim_end_matches([' ', '\t']);
+        if line.is_empty() {
+            out.push(String::new());
+            continue;
+        }
+        out.extend(wrap_line_to_width(line, w));
+    }
+    out
+}
+
+/// Redraw a stderr window: optional “hidden lines” header + tail rows (JSON / reasoning friendly).
+struct ThinkingPreviewPane {
+    body_rows: usize,
+    width: usize,
+    buffer: String,
+    started: bool,
+    last_drawn_rows: usize,
+}
+
+impl ThinkingPreviewPane {
+    fn new(body_rows: usize, width: usize) -> Self {
+        Self {
+            body_rows: body_rows.max(1),
+            width: width.max(20),
+            buffer: String::new(),
+            started: false,
+            last_drawn_rows: 0,
+        }
+    }
+
+    fn push_chunk(&mut self, chunk: &str) {
+        self.buffer.push_str(chunk);
+        const CAP: usize = 48 * 1024;
+        if self.buffer.len() > CAP {
+            let overflow = self.buffer.len() - CAP / 2;
+            self.buffer.drain(..overflow);
+        }
+        self.redraw();
+    }
+
+    /// Always returns one header slot + exactly `body_rows` body lines so redraw uses a stable
+    /// line count (avoids MoveUp/clear mismatch when hidden-line count toggles the header on/off).
+    fn build_frame(&self) -> (String, Vec<String>) {
+        let w = self.width.saturating_sub(6).max(12);
+        let visual = buffer_to_visual_lines(&self.buffer, w);
+        let cap = self.body_rows;
+        let hidden = visual.len().saturating_sub(cap);
+        let body: Vec<String> = if visual.is_empty() {
+            vec![String::new(); cap]
+        } else if visual.len() <= cap {
+            let mut b = visual;
+            while b.len() < cap {
+                b.insert(0, String::new());
+            }
+            b
+        } else {
+            visual[visual.len() - cap..].to_vec()
+        };
+        let header = if hidden > 0 {
+            format!("... ({hidden} lines hidden above)")
+        } else {
+            String::new()
+        };
+        (header, body)
+    }
+
+    fn redraw(&mut self) {
+        use crossterm::style::Stylize;
+        let (header, body) = self.build_frame();
+        // One reserved row for the header strip + body — constant across redraws.
+        let total = 1 + body.len();
+        let mut err = io::stderr().lock();
+        if self.started {
+            for _ in 0..self.last_drawn_rows {
+                let _ = err.queue(MoveUp(1));
+                let _ = err.queue(Clear(ClearType::CurrentLine));
+            }
+        }
+        let _ = err.queue(Clear(ClearType::CurrentLine));
+        if header.is_empty() {
+            let _ = writeln!(err);
+        } else {
+            let _ = writeln!(err, "{}", format!("  {header}").dim());
+        }
+        for line in &body {
+            let _ = err.queue(Clear(ClearType::CurrentLine));
+            if line.is_empty() {
+                let _ = writeln!(err);
+            } else {
+                let _ = writeln!(err, "{}", format!("  ◇ {line}").dim());
+            }
+        }
+        let _ = err.flush();
+        self.last_drawn_rows = total;
+        self.started = true;
+    }
+
+    fn clear(&mut self) {
+        if !self.started {
+            self.buffer.clear();
+            return;
+        }
+        let mut err = io::stderr().lock();
+        for _ in 0..self.last_drawn_rows {
+            let _ = err.queue(MoveUp(1));
+            let _ = err.queue(Clear(ClearType::CurrentLine));
+        }
+        let _ = err.flush();
+        self.started = false;
+        self.last_drawn_rows = 0;
+        self.buffer.clear();
+    }
+}
+
 // ─── Turn result from one /chat/turn SSE stream ───────────────────────────────
 
 /// One turn: core fields from [`ChatTurnSseAccum`] plus CLI-only edge bookkeeping and TTFT.
@@ -450,8 +860,12 @@ impl TurnResult {
 
 /// Live rendering state tracked across SSE chunks within one turn.
 pub(super) struct StreamRenderState {
+    /// True while showing the pre-TTFT “waiting for model” spinner (skip thought-duration log).
+    waiting_for_first_sse: bool,
     thinking_start: Option<Instant>,
     thinking_spinner: Option<Spinner>,
+    /// stderr preview for `reasoning_delta`: Cursor-style tail + `... (N lines hidden above)` (see `MO_AGENT_THINKING_VIEWPORT_LINES`).
+    thinking_pane: Option<ThinkingPreviewPane>,
     /// Lines written to the terminal during streaming (stdout + stderr).
     /// Used by the re-render pass to clear all streamed output.
     pub(super) lines_written: usize,
@@ -468,19 +882,25 @@ pub(super) struct StreamRenderState {
     tool_region: super::terminal_region::TerminalRegion,
     /// Tool status lines (one per tool).
     tool_lines: Vec<String>,
+    /// When true, do not paint the stderr reasoning viewport (plan-only / hidden assistant text).
+    /// Avoids broken in-place redraw when other stderr lines (e.g. project context) were printed first,
+    /// and keeps plan decomposition output readable. Reasoning is still accumulated for the API.
+    suppress_reasoning_viewport: bool,
 }
 
 impl StreamRenderState {
     #[cfg(test)]
     pub(super) fn new() -> Self {
-        Self::with_term_width(80, false)
+        Self::with_term_width(80, false, false)
     }
 
-    fn with_term_width(tw: usize, render_md: bool) -> Self {
+    fn with_term_width(tw: usize, render_md: bool, suppress_reasoning_viewport: bool) -> Self {
         let w = tw.max(1);
         Self {
+            waiting_for_first_sse: false,
             thinking_start: None,
             thinking_spinner: None,
+            thinking_pane: None,
             lines_written: 0,
             col: 0,
             term_width: w,
@@ -492,6 +912,7 @@ impl StreamRenderState {
             stderr_lines: 0,
             tool_region: super::terminal_region::TerminalRegion::new(),
             tool_lines: Vec::new(),
+            suppress_reasoning_viewport,
         }
     }
 
@@ -521,29 +942,75 @@ impl StreamRenderState {
         self.col = 0;
     }
 
+    /// Spinner during HTTP/TTFB before any SSE event is decoded (reuses stderr spinner slot).
+    fn start_waiting_for_model(&mut self) {
+        if self.thinking_spinner.is_some() || self.thinking_pane.is_some() {
+            return;
+        }
+        if !io::stderr().is_terminal() {
+            return;
+        }
+        self.waiting_for_first_sse = true;
+        self.thinking_start.get_or_insert_with(Instant::now);
+        self.thinking_spinner = Some(Spinner::start("  Waiting for stream".to_string()));
+    }
+
     fn start_thinking(&mut self) {
-        if self.thinking_spinner.is_none() {
-            self.thinking_start = Some(Instant::now());
-            self.thinking_spinner = Some(Spinner::start("  ● Thinking".to_string()));
+        if self.thinking_pane.is_some() {
+            return;
+        }
+        self.waiting_for_first_sse = false;
+        if let Some(spinner) = self.thinking_spinner.take() {
+            spinner.stop_clear();
+        }
+        self.thinking_start.get_or_insert_with(Instant::now);
+        let rows = thinking_viewport_rows();
+        let use_pane = rows > 0 && io::stderr().is_terminal() && !self.suppress_reasoning_viewport;
+        if !use_pane && io::stderr().is_terminal() {
+            self.thinking_spinner = Some(Spinner::start("  Thinking".to_string()));
+        }
+    }
+
+    fn push_thinking_preview_chunk(&mut self, chunk: &str) {
+        if chunk.is_empty() || self.suppress_reasoning_viewport {
+            return;
+        }
+        self.thinking_start.get_or_insert_with(Instant::now);
+        let rows = thinking_viewport_rows();
+        if rows > 0 && io::stderr().is_terminal() {
+            if self.thinking_pane.is_none() {
+                self.thinking_pane = Some(ThinkingPreviewPane::new(rows, self.term_width));
+            }
+            if let Some(pane) = &mut self.thinking_pane {
+                pane.push_chunk(chunk);
+            }
         }
     }
 
     fn stop_thinking(&mut self) {
+        if let Some(mut pane) = self.thinking_pane.take() {
+            pane.clear();
+        }
         if let Some(spinner) = self.thinking_spinner.take() {
             spinner.stop_clear();
-            if let Some(start) = self.thinking_start.take() {
-                let elapsed = start.elapsed().as_secs_f64();
-                if elapsed >= MIN_THOUGHT_DURATION_LOG_SECS && self.md.is_none() {
-                    // In markdown streaming mode, injecting an unmanaged line here
-                    // shifts the cursor below the tracked markdown regions, which
-                    // causes partial clears/residual text on the next tool turn.
-                    // Keep per-round thought timing out of the normal markdown UX.
-                    let line = edge_sse_thought_duration_line(elapsed);
-                    println!("{}", line.dim());
-                    let _ = io::stdout().flush();
-                    self.lines_written += 1;
-                    self.col = 0;
-                }
+        }
+        let skip_thought_duration_log = self.waiting_for_first_sse;
+        self.waiting_for_first_sse = false;
+        if let Some(start) = self.thinking_start.take() {
+            let elapsed = start.elapsed().as_secs_f64();
+            if !skip_thought_duration_log
+                && elapsed >= MIN_THOUGHT_DURATION_LOG_SECS
+                && self.md.is_none()
+            {
+                // In markdown streaming mode, injecting an unmanaged line here
+                // shifts the cursor below the tracked markdown regions, which
+                // causes partial clears/residual text on the next tool turn.
+                // Keep per-round thought timing out of the normal markdown UX.
+                let line = edge_sse_thought_duration_line(elapsed);
+                println!("{}", line.dim());
+                let _ = io::stdout().flush();
+                self.lines_written += 1;
+                self.col = 0;
             }
         }
     }
@@ -862,10 +1329,7 @@ impl StreamRenderState {
         // Cursor-style format: original description with result appended
         let (icon, line) = if status == "error" {
             let err_msg = output_summary.unwrap_or_else(|| "failed".to_string());
-            (
-                format!("{}", "✗".red()),
-                format!("    {}", err_msg.red()),
-            )
+            (format!("{}", "✗".red()), format!("    {}", err_msg.red()))
         } else {
             let summary_line = match output_summary {
                 Some(summary) => format!("    {}", summary.dim()),
@@ -890,11 +1354,7 @@ impl StreamRenderState {
                     first.clone()
                 };
                 // Replace cyan ⬢ with green ⬢
-                let base = base.replacen(
-                    &format!("{}", "⬢".cyan()),
-                    &icon,
-                    1,
-                );
+                let base = base.replacen(&format!("{}", "⬢".cyan()), &icon, 1);
                 let dur = if duration_suffix.is_empty() {
                     String::new()
                 } else {
@@ -915,11 +1375,7 @@ impl StreamRenderState {
                 } else {
                     first.clone()
                 };
-                let base = base.replacen(
-                    &format!("{}", "⬢".cyan()),
-                    &icon,
-                    1,
-                );
+                let base = base.replacen(&format!("{}", "⬢".cyan()), &icon, 1);
                 self.tool_lines[idx] = base;
                 if !line.is_empty() {
                     let insert_pos = idx + 1;
@@ -956,19 +1412,18 @@ impl StreamRenderState {
                 if meaningful.is_empty() {
                     return None;
                 }
-                let mut parts: Vec<String> = meaningful
-                    .iter()
-                    .map(|l| truncate_line(l, 60))
-                    .collect();
+                let mut parts: Vec<String> =
+                    meaningful.iter().map(|l| truncate_line(l, 60)).collect();
                 let remaining = line_count.saturating_sub(3);
                 if remaining > 0 {
                     parts.push(format!("… +{remaining} more lines"));
                 }
                 Some(parts.join("\n    "))
             }
-            "read_file" | "view_file" => {
-                Some(format!("{line_count} lines, {}", format_byte_size(byte_size)))
-            }
+            "read_file" | "view_file" => Some(format!(
+                "{line_count} lines, {}",
+                format_byte_size(byte_size)
+            )),
             "git_log" => {
                 // Show first few commit summaries
                 let commits: Vec<&str> = output
@@ -977,10 +1432,7 @@ impl StreamRenderState {
                     .take(3)
                     .collect();
                 let total = output.lines().filter(|l| !l.trim().is_empty()).count();
-                let mut parts: Vec<String> = commits
-                    .iter()
-                    .map(|l| truncate_line(l, 60))
-                    .collect();
+                let mut parts: Vec<String> = commits.iter().map(|l| truncate_line(l, 60)).collect();
                 let remaining = total.saturating_sub(3);
                 if remaining > 0 {
                     parts.push(format!("… +{remaining} more"));
@@ -1002,7 +1454,11 @@ impl StreamRenderState {
                     .filter(|l| l.starts_with("+++ b/") && !l.contains("/dev/null"))
                     .count();
                 let stat = if additions > 0 || deletions > 0 {
-                    format!("{} {}", format!("+{additions}").green(), format!("-{deletions}").red())
+                    format!(
+                        "{} {}",
+                        format!("+{additions}").green(),
+                        format!("-{deletions}").red()
+                    )
                 } else {
                     format!("{line_count} lines")
                 };
@@ -1037,11 +1493,8 @@ impl StreamRenderState {
                     Some(format!("{total} matches"))
                 } else {
                     let file_count = files.len();
-                    let shown: Vec<String> = files
-                        .iter()
-                        .take(3)
-                        .map(|f| shorten_path(f, 45))
-                        .collect();
+                    let shown: Vec<String> =
+                        files.iter().take(3).map(|f| shorten_path(f, 45)).collect();
                     let mut summary = format!("{total} matches in {file_count} file(s)");
                     for f in &shown {
                         summary.push_str(&format!("\n      {f}"));
@@ -1057,20 +1510,31 @@ impl StreamRenderState {
                 if tool == "delete_file" {
                     return Some("deleted".to_string());
                 }
-                // Extract unified diff from str_replace/multi_edit output
+                // str_replace: sentinel-wrapped diff; write_file: JSON `_cli_unified_diff` (same as headless preview).
                 let diff_block = extract_cli_diff_block(output);
-                if let Some(diff) = diff_block {
-                    let colored = colorize_diff_summary(diff, 5);
+                if let Some(ref diff) = diff_block {
+                    let colored = colorize_diff_summary(diff.as_ref(), 5);
                     if !colored.is_empty() {
                         return Some(colored);
                     }
                 }
                 // Fallback: check if output itself looks like a diff
-                if output.lines().any(|l| l.starts_with("+++ ") || l.starts_with("--- ")) {
+                if output
+                    .lines()
+                    .any(|l| l.starts_with("+++ ") || l.starts_with("--- "))
+                {
                     let colored = colorize_diff_summary(output, 5);
                     if !colored.is_empty() {
                         return Some(colored);
                     }
+                }
+                if tool == "write_file"
+                    && let Ok(v) = serde_json::from_str::<Value>(output.trim())
+                    && v.get("success").and_then(|s| s.as_bool()) == Some(true)
+                {
+                    let bytes =
+                        v.get("bytes_written").and_then(|b| b.as_u64()).unwrap_or(0) as usize;
+                    return Some(format!("{} written", format_byte_size(bytes)));
                 }
                 if output.trim().is_empty() {
                     Some("done".to_string())
@@ -1124,15 +1588,24 @@ impl StreamRenderState {
     }
 }
 
-/// Extract the unified diff block from str_replace/multi_edit output.
-fn extract_cli_diff_block(output: &str) -> Option<&str> {
+/// Unified diff for CLI summaries: `str_replace` / `multi_edit` sentinels, or `write_file` JSON field.
+fn extract_cli_diff_block(output: &str) -> Option<Cow<'_, str>> {
     let start_marker = "<<<MO_AGENT_UNIFIED_DIFF>>>";
     let end_marker = "<<<END_MO_AGENT_UNIFIED_DIFF>>>";
-    let start = output.find(start_marker)?;
-    let after = &output[start + start_marker.len()..];
-    let end = after.find(end_marker).unwrap_or(after.len());
-    let block = after[..end].trim();
-    if block.is_empty() { None } else { Some(block) }
+    if let Some(start) = output.find(start_marker) {
+        let after = &output[start + start_marker.len()..];
+        let end = after.find(end_marker).unwrap_or(after.len());
+        let block = after[..end].trim();
+        if !block.is_empty() {
+            return Some(Cow::Borrowed(block));
+        }
+    }
+    let v = serde_json::from_str::<Value>(output.trim()).ok()?;
+    let diff = v.get("_cli_unified_diff")?.as_str()?;
+    if diff.is_empty() {
+        return None;
+    }
+    Some(Cow::Owned(diff.to_string()))
 }
 
 /// Colorize a unified diff into a compact summary with green +lines and red -lines.
@@ -1265,6 +1738,7 @@ fn apply_sse_render_effects(
             }
             SseRenderEffect::StopThinkingSpinner => render.stop_thinking(),
             SseRenderEffect::StartThinkingSpinner => render.start_thinking(),
+            SseRenderEffect::ThinkingPreviewChunk(s) => render.push_thinking_preview_chunk(&s),
         }
     }
 }
@@ -1318,6 +1792,7 @@ pub(super) async fn consume_turn_sse(
             let mut render = StreamRenderState::with_term_width(
                 term_width,
                 render_md && !suppress_intermediate_output,
+                false,
             );
             if render.md.is_none() {
                 render.lines_written = pre_clear_lines;
@@ -1548,7 +2023,7 @@ mod tests {
 
     #[test]
     fn track_output_counts_wraps() {
-        let mut s = StreamRenderState::with_term_width(10, false);
+        let mut s = StreamRenderState::with_term_width(10, false, false);
         // 20 chars = 2 wraps on a 10-col terminal
         s.track_output("12345678901234567890");
         assert_eq!(s.lines_written, 2);
@@ -1564,7 +2039,7 @@ mod tests {
 
     #[test]
     fn track_mixed_stdout_stderr_lines() {
-        let mut s = StreamRenderState::with_term_width(80, false);
+        let mut s = StreamRenderState::with_term_width(80, false, false);
         // Simulate: thinking line (stderr) + streamed text (stdout) + tool_request (stderr)
         s.track_eprintln(); // ● Thought for 1.4s
         s.track_output("Let me review the code\n"); // text_delta
@@ -1599,5 +2074,53 @@ mod tests {
         assert!(!could_become_thinking_tag("</code"));
         assert!(!could_become_thinking_tag("<a"));
         assert!(!could_become_thinking_tag("<b"));
+    }
+
+    // ── Thinking preview (JSON / reasoning viewport) ───────────────
+
+    #[test]
+    fn buffer_to_visual_lines_preserves_pretty_json_structure() {
+        let s = "[\n  {\n    \"question\": \"Q?\",\n    \"options\": [\"a\"]\n  }\n]";
+        let lines = super::buffer_to_visual_lines(s, 100);
+        assert!(lines.iter().any(|l| l.contains('[')));
+        assert!(lines.iter().any(|l| l.contains("\"question\"")));
+    }
+
+    #[test]
+    fn wrap_line_to_width_is_utf8_safe() {
+        let rows = super::wrap_line_to_width("在/tmp下面", 2);
+        assert!(rows.iter().all(|r| r.chars().count() <= 2));
+        assert_eq!(rows.join(""), "在/tmp下面");
+    }
+
+    #[test]
+    fn hidden_line_count_matches_cursor_style_overflow() {
+        let visual = super::buffer_to_visual_lines("a\nb\nc\nd\ne", 80);
+        assert_eq!(visual.len(), 5);
+        let body_cap = 3usize;
+        assert_eq!(visual.len().saturating_sub(body_cap), 2);
+        assert_eq!(visual[visual.len() - body_cap..], ["c", "d", "e"]);
+    }
+
+    #[test]
+    fn extract_cli_diff_from_write_file_json() {
+        let diff_body = "--- a/x.js\n+++ b/x.js\n@@ -1,1 +1,1 @@\n-old\n+new\n";
+        let out = serde_json::json!({
+            "success": true,
+            "bytes_written": 3u32,
+            "path": "/tmp/x.js",
+            "_cli_unified_diff": diff_body,
+        })
+        .to_string();
+        let got = super::extract_cli_diff_block(&out).expect("diff");
+        assert_eq!(got.as_ref(), diff_body);
+    }
+
+    #[test]
+    fn extract_cli_diff_sentinel_wrapped() {
+        let embedded = "+++ b/f\n+ok\n";
+        let out = format!("<<<MO_AGENT_UNIFIED_DIFF>>>{embedded}<<<END_MO_AGENT_UNIFIED_DIFF>>>");
+        let got = super::extract_cli_diff_block(&out).expect("diff");
+        assert_eq!(got.as_ref(), embedded.trim());
     }
 }

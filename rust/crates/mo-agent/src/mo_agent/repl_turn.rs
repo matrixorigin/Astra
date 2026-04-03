@@ -1,4 +1,41 @@
+use std::future::Future;
+use std::io::IsTerminal;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::time::Instant;
+
 use super::*;
+
+/// Plan-only turns can sit quiet for a long time (payload assembly, HTTP, queue, TTFR).
+/// Show one in-place stderr line (`PlanAssembleLineSpinner`) instead of spamming new lines.
+///
+/// When `MO_AGENT_CHAT_TURN_TIMING` / `MO_DEBUG` emit `[chat-turn timing]` lines to stderr, the
+/// spinner is disabled — those lines use newlines and would fight the `\r` status line.
+///
+/// `plan_line_release`: when `Some`, shows `PlanAssembleLineSpinner` and passes the same `Arc` to
+/// `/chat/turn` fetch so the line is cleared before SSE (`Waiting for model` + reasoning preview).
+/// The flag uses `Release` (after successful POST) / `Acquire` (spinner poll) — enough for this
+/// boolean handoff; no payload is communicated through the atomic.
+async fn plan_only_llm_heartbeat_wrap<F, T>(
+    assemble_elapsed_origin: Option<Instant>,
+    plan_line_release: Option<Arc<AtomicBool>>,
+    inner: F,
+) -> T
+where
+    F: Future<Output = T>,
+{
+    if plan_line_release.is_none() {
+        return inner.await;
+    }
+    let origin = assemble_elapsed_origin.unwrap_or_else(Instant::now);
+    let spinner = crate::stream_render::PlanAssembleLineSpinner::start_with_origin_release(
+        origin,
+        plan_line_release.clone(),
+    );
+    let out = inner.await;
+    spinner.stop_clear();
+    out
+}
 
 pub(super) struct ReplTurnContext<'a> {
     pub(super) api: &'a mo_thin_client::ThinClient,
@@ -261,10 +298,12 @@ async fn maybe_auto_compact(
         tool_health_entries: &[],
         skill_registry: &state.skill_registry,
         plan_only_chat: false,
+        hide_streaming_assistant_text: false,
         is_plan_subtask: false,
         plan_subtask_id: None,
         delegation_engine: None,
         cancel_token: None,
+        plan_assemble_line_release: None,
     })
     .await;
 
@@ -355,6 +394,127 @@ async fn apply_auto_compact_result(
     Ok(())
 }
 
+/// Outcome of a single-shot plan LLM call (`plan_only_chat` + same REPL history as normal chat).
+pub(super) enum PlanOnlyLlmOutcome {
+    Ok(Box<StreamResult>),
+    Err(String),
+    Interrupted,
+}
+
+/// Same post-turn accounting as normal chat (`apply_turn_success`), except the caller supplies
+/// the `user_line` shown in journal/history (e.g. user goal vs internal decomposition prompt).
+pub(super) fn apply_plan_only_stream_artifacts(
+    state: &mut ReplState,
+    profile: Option<&str>,
+    selector: &dyn tool_selector::ToolSelector,
+    result: &StreamResult,
+    user_line: &str,
+    turn_start: Instant,
+) {
+    if let Some(session_id) = result.session_id.as_deref() {
+        persist_last_session_id(profile, session_id);
+        initialize_journal(state, session_id);
+        state.session_id = Some(session_id.to_string());
+        state.run_id = result.run_id.clone();
+    }
+
+    state.turn += 1;
+    state.total_prompt_tokens += result.prompt_tokens;
+    state.total_completion_tokens += result.completion_tokens;
+    state.last_response = Some(result.full_text.clone());
+    state
+        .history
+        .push((user_line.to_string(), result.full_text.clone()));
+    state.recent_tools = result.tools_used.clone();
+
+    if !result.tool_health_export.is_empty() {
+        state.tool_health_entries = result.tool_health_export.clone();
+    }
+
+    commit_turn_journal_workspace_and_sidecars(state, user_line, result, turn_start);
+    record_selector_turn_outcome(state, selector, user_line, result);
+
+    if result.tool_calls_count == 0
+        && looks_like_live_query_with_context(user_line, &state.recent_tools)
+    {
+        eprintln!(
+            "{}",
+            "  ⚠ Warning: This answer was generated without tool calls. Data may be hallucinated."
+                .yellow()
+        );
+    }
+}
+
+/// Plan-mode LLM turn: same `/chat/turn` + SSE path as normal chat (`consume_turn_sse`), including
+/// `openai_messages_from_repl_history(history, message)` with the current REPL history snapshot,
+/// plus `plan_only_chat` (no write tools), cancellation, usage, and reasoning/thinking handling.
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn run_plan_only_llm_turn(
+    state: &mut ReplState,
+    ctx: &ReplTurnContext<'_>,
+    token: &str,
+    message: &str,
+    session_id: Option<&str>,
+    suppress_intermediate_output: bool,
+    render_md: bool,
+    quiet: bool,
+) -> PlanOnlyLlmOutcome {
+    let history_snapshot = state.history.clone();
+    let cancel_token = std::sync::Arc::new(tokio_util::sync::CancellationToken::new());
+    let cancel_token_for_signal = cancel_token.clone();
+
+    let assemble_elapsed_origin = state.plan_mode.as_mut().map(|pm| {
+        *pm.assemble_wall_start
+            .get_or_insert_with(std::time::Instant::now)
+    });
+
+    let stderr_timing = crate::chat_stream::chat_turn_timing_stderr_enabled();
+    let enable_plan_line = !quiet
+        && !suppress_intermediate_output
+        && std::io::stderr().is_terminal()
+        && !stderr_timing;
+    let plan_line_release = enable_plan_line.then(|| Arc::new(AtomicBool::new(false)));
+
+    plan_only_llm_heartbeat_wrap(assemble_elapsed_origin, plan_line_release.clone(), async {
+        tokio::select! {
+            result = stream_chat_sse(ChatTurnParams {
+                api: ctx.api,
+                token,
+                message,
+                session_id,
+                model: state.model.as_deref(),
+                explain: state.explain,
+                render_md,
+                history: &history_snapshot,
+                perm_manager: &mut state.perm_manager,
+                verbose_mode: state.verbose_mode,
+                quiet,
+                suppress_intermediate_output,
+                selector: ctx.selector,
+                recent_tools: &state.recent_tools,
+                tool_health_entries: &state.tool_health_entries,
+                skill_registry: &state.skill_registry,
+                plan_only_chat: true,
+                hide_streaming_assistant_text: true,
+                is_plan_subtask: false,
+                plan_subtask_id: None,
+                delegation_engine: state.delegation_engine.clone(),
+                cancel_token: Some(cancel_token),
+                plan_assemble_line_release: plan_line_release.clone(),
+            }) => match result {
+                Ok(r) => PlanOnlyLlmOutcome::Ok(Box::new(r)),
+                Err(e) => PlanOnlyLlmOutcome::Err(e),
+            },
+            _ = tokio::signal::ctrl_c() => {
+                cancel_token_for_signal.cancel();
+                eprintln!("\n{}", "  Interrupted.".dim());
+                PlanOnlyLlmOutcome::Interrupted
+            }
+        }
+    })
+    .await
+}
+
 async fn run_chat_turn(
     state: &mut ReplState,
     ctx: &ReplTurnContext<'_>,
@@ -389,10 +549,12 @@ async fn run_chat_turn(
             tool_health_entries: &state.tool_health_entries,
             skill_registry: &state.skill_registry,
             plan_only_chat: state.chat_plan_only && state.current_plan_subtask_id.is_none(),
+            hide_streaming_assistant_text: false,
             is_plan_subtask: state.current_plan_subtask_id.is_some(),
             plan_subtask_id: state.current_plan_subtask_id.as_deref(),
             delegation_engine: state.delegation_engine.clone(),
             cancel_token: Some(cancel_token),
+            plan_assemble_line_release: None,
         }) => TurnAttempt::Completed(Box::new(result)),
         _ = tokio::signal::ctrl_c() => {
             // Trigger cancellation to interrupt any in-flight SSE streaming.
@@ -403,35 +565,14 @@ async fn run_chat_turn(
     }
 }
 
-fn apply_turn_success(
+/// After `state.turn` has been incremented: journal turn row, workspace + checkpoints,
+/// stall/verdict/step sidecars. Shared by normal chat and plan-only LLM turns.
+fn commit_turn_journal_workspace_and_sidecars(
     state: &mut ReplState,
-    selector: &dyn tool_selector::ToolSelector,
-    profile: Option<&str>,
     line: &str,
-    result: StreamResult,
+    result: &StreamResult,
     turn_start: Instant,
 ) {
-    if let Some(session_id) = result.session_id.as_deref() {
-        persist_last_session_id(profile, session_id);
-        initialize_journal(state, session_id);
-        state.session_id = Some(session_id.to_string());
-        state.run_id = result.run_id.clone();
-    }
-
-    state.turn += 1;
-    state.total_prompt_tokens += result.prompt_tokens;
-    state.total_completion_tokens += result.completion_tokens;
-    state.last_response = Some(result.full_text.clone());
-    state
-        .history
-        .push((line.to_string(), result.full_text.clone()));
-    state.recent_tools = result.tools_used.clone();
-
-    // Persist tool health for cross-session error budgets
-    if !result.tool_health_export.is_empty() {
-        state.tool_health_entries = result.tool_health_export.clone();
-    }
-
     if let Some(journal) = state.journal.as_ref() {
         let turn_event = session_journal::JournalEvent::turn(
             state.session_id.as_deref(),
@@ -683,51 +824,87 @@ fn apply_turn_success(
             enqueue_ingestion(state, &recorder_event);
         }
     }
+}
 
-    // Record turn outcome for pipeline learning (entity graph, patterns, calibration)
-    {
-        use mo_agent_runtime::pipeline::evaluation::{ToolCallInfo, evaluate_turn};
-        use mo_agent_runtime::pipeline::routing::RoutingEngine;
-        let routing = RoutingEngine::analyze(line, state.turn, &state.recent_tools, &[], vec![]);
-        let is_live_query = looks_like_live_query_with_context(line, &state.recent_tools);
+fn record_selector_turn_outcome(
+    state: &mut ReplState,
+    selector: &dyn tool_selector::ToolSelector,
+    line: &str,
+    result: &StreamResult,
+) {
+    use mo_agent_runtime::pipeline::evaluation::{ToolCallInfo, evaluate_turn};
+    use mo_agent_runtime::pipeline::routing::RoutingEngine;
+    let routing = RoutingEngine::analyze(line, state.turn, &state.recent_tools, &[], vec![]);
+    let is_live_query = looks_like_live_query_with_context(line, &state.recent_tools);
 
-        // Build ToolCallInfo from audit records
-        let tool_infos: Vec<ToolCallInfo> = result
-            .tool_call_records
-            .iter()
-            .map(|r| ToolCallInfo {
-                name: r.name.clone(),
-                ok: r.ok,
-                ms: r.ms,
-                error: r.error.clone(),
-                output_bytes: r.output_bytes,
-            })
-            .collect();
+    let tool_infos: Vec<ToolCallInfo> = result
+        .tool_call_records
+        .iter()
+        .map(|r| ToolCallInfo {
+            name: r.name.clone(),
+            ok: r.ok,
+            ms: r.ms,
+            error: r.error.clone(),
+            output_bytes: r.output_bytes,
+        })
+        .collect();
 
-        let has_verdict_warning = result
-            .verdict_events
-            .iter()
-            .any(|v| v.severity == "Warning" || v.severity == "Critical");
+    let has_verdict_warning = result
+        .verdict_events
+        .iter()
+        .any(|v| v.severity == "Warning" || v.severity == "Critical");
 
-        let eval = evaluate_turn(
-            &tool_infos,
-            result.stall_events.len(),
-            has_verdict_warning,
-            result.budget_pressure,
-            is_live_query,
-        );
+    let eval = evaluate_turn(
+        &tool_infos,
+        result.stall_events.len(),
+        has_verdict_warning,
+        result.budget_pressure,
+        is_live_query,
+    );
 
-        selector.record_outcome(
-            line,
-            &result.tools_used,
-            routing.task_type,
-            routing.domain_hint,
-            eval.success,
-            eval.quality,
-            false,
-            None, // user_feedback_score — populated later via /api/v1/learning/feedback
-        );
+    selector.record_outcome(
+        line,
+        &result.tools_used,
+        routing.task_type,
+        routing.domain_hint,
+        eval.success,
+        eval.quality,
+        false,
+        None,
+    );
+}
+
+fn apply_turn_success(
+    state: &mut ReplState,
+    selector: &dyn tool_selector::ToolSelector,
+    profile: Option<&str>,
+    line: &str,
+    result: StreamResult,
+    turn_start: Instant,
+) {
+    if let Some(session_id) = result.session_id.as_deref() {
+        persist_last_session_id(profile, session_id);
+        initialize_journal(state, session_id);
+        state.session_id = Some(session_id.to_string());
+        state.run_id = result.run_id.clone();
     }
+
+    state.turn += 1;
+    state.total_prompt_tokens += result.prompt_tokens;
+    state.total_completion_tokens += result.completion_tokens;
+    state.last_response = Some(result.full_text.clone());
+    state
+        .history
+        .push((line.to_string(), result.full_text.clone()));
+    state.recent_tools = result.tools_used.clone();
+
+    // Persist tool health for cross-session error budgets
+    if !result.tool_health_export.is_empty() {
+        state.tool_health_entries = result.tool_health_export.clone();
+    }
+
+    commit_turn_journal_workspace_and_sidecars(state, line, &result, turn_start);
+    record_selector_turn_outcome(state, selector, line, &result);
 
     if result.tool_calls_count == 0 && looks_like_live_query_with_context(line, &state.recent_tools)
     {

@@ -5,10 +5,7 @@ use std::{
     io::{self, Write},
     path::{Path, PathBuf},
     process::{Command as SysCommand, Stdio},
-    sync::{
-        Arc, Mutex, OnceLock,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::{Mutex, OnceLock},
     time::Instant,
 };
 
@@ -3436,7 +3433,7 @@ async fn handle_slash_command(
         }
 
         "/memory" | "/plan" => {
-            handle_memory_domain_command(cmd, arg, api, state, token).await?;
+            handle_memory_domain_command(cmd, arg, api, state, token, profile, selector).await?;
         }
 
         "/task" => {
@@ -3761,8 +3758,15 @@ async fn run_chat_repl(
                     }
                 } else if state.plan_mode.is_some() {
                     // Plan mode: handle input as plan editing
-                    handle_plan_mode_input(line.clone(), current_token.as_deref(), &mut state, api)
-                        .await?;
+                    handle_plan_mode_input(
+                        line.clone(),
+                        current_token.as_deref(),
+                        &mut state,
+                        api,
+                        profile,
+                        &*selector,
+                    )
+                    .await?;
 
                     // If plan execution was just triggered, run the auto-execution loop
                     if state.executing_plan.is_some() {
@@ -3889,6 +3893,8 @@ async fn run_chat_repl(
                                     current_token.as_deref(),
                                     &mut state,
                                     api,
+                                    profile,
+                                    &*selector,
                                 )
                                 .await?;
                             } else {
@@ -4542,10 +4548,12 @@ mod tests {
             tool_health_entries: &[],
             skill_registry: crate::skill_instructions::empty_registry(),
             plan_only_chat: false,
+            hide_streaming_assistant_text: false,
             is_plan_subtask: false,
             plan_subtask_id: None,
             delegation_engine: None,
             cancel_token: None,
+            plan_assemble_line_release: None,
         })
         .await
         .unwrap();
@@ -4589,10 +4597,12 @@ mod tests {
             tool_health_entries: &[],
             skill_registry: crate::skill_instructions::empty_registry(),
             plan_only_chat: false,
+            hide_streaming_assistant_text: false,
             is_plan_subtask: false,
             plan_subtask_id: None,
             delegation_engine: None,
             cancel_token: None,
+            plan_assemble_line_release: None,
         })
         .await;
         assert!(result.is_err());
@@ -4603,7 +4613,7 @@ mod tests {
     #[tokio::test]
     async fn stream_chat_sse_with_tool_call_loop() {
         // Mock server: first call returns a tool call, second call returns text.
-        let call_count = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let call_count = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
         let cc = call_count.clone();
         let app = Router::new().route(
             "/chat/turn",
@@ -4652,10 +4662,12 @@ mod tests {
             tool_health_entries: &[],
             skill_registry: crate::skill_instructions::empty_registry(),
             plan_only_chat: false,
+            hide_streaming_assistant_text: false,
             is_plan_subtask: false,
             plan_subtask_id: None,
             delegation_engine: None,
             cancel_token: None,
+            plan_assemble_line_release: None,
         })
         .await
         .unwrap();
@@ -4974,12 +4986,17 @@ mod tests {
             ..Default::default()
         };
         // This should not panic or error
+        let selector = tool_selector::TfIdfSelector::new(tool_registry::ToolRegistry::new(
+            edge_tools::all_tool_schemas(),
+        ));
         let result = handle_memory_domain_command(
             "/memory",
             "search rust preferences",
             &api,
             &mut state,
             Some("fake-token"),
+            None,
+            &selector,
         )
         .await;
         assert!(result.is_ok());

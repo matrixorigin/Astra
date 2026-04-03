@@ -100,6 +100,7 @@ pub fn build_main_system_prompt(
          Guessing paths wastes turns. Discover first, then read.\n\n\
          ## Coding Discipline\n\
          - **Read before write**: understand existing patterns, naming conventions, and imports before editing.\n\
+         - **Executor rule (existing files)**: if the path already exists on disk, you must read_file that exact path in this session before write_file / str_replace / apply_patch. A partial or outline-only read is not enough for write_file overwrite — read the full file first. If the file changed on disk since your last read, read it again.\n\
          - **Surgical edits**: change only what's needed. Don't rewrite unrelated code.\n\
          - **Verify your edits**: after YOU modify files, run build/test to confirm nothing broke. Skip this for read-only tasks.\n\
          - **Undo on failure**: if a change causes errors and you can't fix them, revert it.\n\
@@ -138,7 +139,7 @@ pub fn build_main_system_prompt(
     // ── Tool selection guidance: prefer specific tools over bash ──
     if has_git || has_github {
         prompt.push_str(
-            "7. Use specific tools (git_diff, git_log, github_list_prs) for git/GitHub queries — NOT bash.\n",
+            "7. Git/GitHub: use git_status, git_diff (stat_only:true ≈ `git diff --stat`), git_show, git_log, github_* — NOT bash for `git status`/`git diff`/`git log` when those tools apply.\n",
         );
     }
 
@@ -549,6 +550,7 @@ pub fn build_system_prompt_sections(
          Guessing paths wastes turns. Discover first, then read.\n\n\
          ## Coding Discipline\n\
          - **Read before write**: understand existing patterns, naming conventions, and imports before editing.\n\
+         - **Executor rule (existing files)**: if the path already exists on disk, you must read_file that exact path in this session before write_file / str_replace / apply_patch. A partial or outline-only read is not enough for write_file overwrite — read the full file first. If the file changed on disk since your last read, read it again.\n\
          - **Surgical edits**: change only what's needed. Don't rewrite unrelated code.\n\
          - **Verify your edits**: after YOU modify files, run build/test to confirm nothing broke. Skip this for read-only tasks.\n\
          - **Undo on failure**: if a change causes errors and you can't fix them, revert it.\n\
@@ -601,7 +603,7 @@ pub fn build_system_prompt_sections(
 
     if has_git || has_github {
         session_section.push_str(
-            "7. Use specific tools (git_diff, git_log, github_list_prs) for git/GitHub queries — NOT bash.\n",
+            "7. Git/GitHub: use git_status, git_diff (stat_only:true ≈ `git diff --stat`), git_show, git_log, github_* — NOT bash for `git status`/`git diff`/`git log` when those tools apply.\n",
         );
     }
     if has_github {
@@ -1483,6 +1485,7 @@ mod tests {
         let p = build_main_system_prompt(&["bash"], "", 0.5, None);
         assert!(p.contains("Coding Discipline"));
         assert!(p.contains("Read before write"));
+        assert!(p.contains("Executor rule (existing files)"));
         assert!(p.contains("Surgical edits"));
         assert!(p.contains("Verify your edits"));
     }
@@ -1545,7 +1548,7 @@ mod tests {
     #[test]
     fn prompt_git_tool_preference_over_bash() {
         let p = build_main_system_prompt(&["git_diff", "git_log", "bash"], "", 0.5, None);
-        assert!(p.contains("specific tools"));
+        assert!(p.contains("git_status, git_diff"));
         assert!(p.contains("NOT bash"));
     }
 
@@ -2094,7 +2097,7 @@ mod tests {
     fn prompt_git_prefix_without_github_omits_github_rule() {
         let p = build_main_system_prompt(&["git_diff", "git_log"], "", 0.5, None);
         assert!(
-            p.contains("specific tools"),
+            p.contains("git_status, git_diff"),
             "git_ prefix triggers tool preference"
         );
         assert!(
@@ -2106,10 +2109,7 @@ mod tests {
     #[test]
     fn prompt_github_tools_trigger_both_rules() {
         let p = build_main_system_prompt(&["github_list_prs"], "", 0.5, None);
-        assert!(
-            p.contains("specific tools"),
-            "github_ triggers preference rule"
-        );
+        assert!(p.contains("github_*"), "github_ triggers preference rule");
         assert!(
             p.contains("GitHub data"),
             "github_ triggers GitHub-specific rule"
@@ -2130,7 +2130,10 @@ mod tests {
     #[test]
     fn sections_to_string_empty_input() {
         let result = sections_to_string(&[]);
-        assert!(result.is_empty(), "empty sections should produce empty string");
+        assert!(
+            result.is_empty(),
+            "empty sections should produce empty string"
+        );
     }
 
     // ── All code-nav tools in session scope ──────────────────────
@@ -2162,7 +2165,11 @@ mod tests {
     fn sections_empty_tools_empty_profile_still_has_profile_section() {
         // Empty-tools code path always returns a profile section (even empty).
         let sections = build_system_prompt_sections(&[], "", 0.5, None);
-        assert_eq!(sections.len(), 2, "empty tools path always returns 2 sections");
+        assert_eq!(
+            sections.len(),
+            2,
+            "empty tools path always returns 2 sections"
+        );
         assert_eq!(sections[0].scope, CacheScope::Global);
         assert_eq!(sections[1].scope, CacheScope::None);
         assert!(sections[1].text.is_empty());

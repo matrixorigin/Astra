@@ -230,7 +230,7 @@ Review target: {target}\n\
 Process:\n\
 1. Get the diff:\n\
    - HEAD -> `git_show` (gives you the full diff already)\n\
-   - WORKING_TREE -> `git_diff`\n\
+   - WORKING_TREE -> `git_diff` (use `stat_only:true` if you only need per-file +/- counts)\n\
    - Other -> `git_show <rev>`\n\
 2. Review the diff directly. Do NOT read entire files.\n\
    Only use `read_file` with `start_line`/`end_line` if you need \
@@ -737,10 +737,12 @@ pub(super) async fn handle_info_command(
                 tool_health_entries: &state.tool_health_entries,
                 skill_registry: crate::skill_instructions::empty_registry(),
                 plan_only_chat: false,
+                hide_streaming_assistant_text: false,
                 is_plan_subtask: false,
                 plan_subtask_id: None,
                 delegation_engine: None,
                 cancel_token: None,
+                plan_assemble_line_release: None,
             })
             .await?;
             if let Some(session_id) = sr.session_id.as_deref() {
@@ -1292,6 +1294,7 @@ mod tests {
         let prompt = build_review_prompt("working");
         assert!(prompt.contains("Review target: WORKING_TREE"));
         assert!(prompt.contains("git_diff"));
+        assert!(prompt.contains("stat_only:true"));
         assert!(prompt.contains("Prefer `read_file`/`grep`/`glob` over `bash`"));
     }
 }

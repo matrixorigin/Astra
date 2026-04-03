@@ -39,6 +39,8 @@ use agentic_sse_loop::{
 use cli_loop_host::CliAgenticLoopHost;
 use serde_json::json;
 
+pub(crate) use agentic_loop_turn::chat_turn_timing_stderr_enabled;
+
 pub(crate) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResult, String> {
     let start = Instant::now();
     let term_width = terminal_width_usize();
@@ -63,7 +65,12 @@ pub(crate) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
     let valid_tool_names = openai_tool_names_from_schemas(&all_schemas);
 
     let current_session_id = p.session_id.map(|s| s.to_string());
-    let task_profile = infer_task_execution_profile(p.message);
+    let mut task_profile = infer_task_execution_profile(p.message);
+    // Plan-only turns have no tools; factual retry would inject a useless "call tools" nudge and
+    // spurious "↻ … corrective retry" when the decomposition prompt mentions repo/context words.
+    if p.plan_only_chat {
+        task_profile.allow_factual_retry = false;
+    }
 
     let turn_guard = if p.tool_health_entries.is_empty() {
         TurnGuard::with_profile(task_profile)
@@ -88,6 +95,7 @@ pub(crate) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
         term_width,
         quiet: p.quiet,
         suppress_intermediate_output: p.suppress_intermediate_output,
+        hide_streaming_assistant_text: p.hide_streaming_assistant_text,
         message: p.message,
         history: p.history,
         recent_tools: p.recent_tools,
@@ -103,6 +111,7 @@ pub(crate) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
         pending_clear_lines: 0,
         is_plan_subtask: p.is_plan_subtask,
         plan_subtask_id: p.plan_subtask_id,
+        plan_assemble_line_release: p.plan_assemble_line_release.clone(),
     };
 
     let hook_sets = detect_turn_hook_sets(&project_root, task_profile, p.is_plan_subtask);

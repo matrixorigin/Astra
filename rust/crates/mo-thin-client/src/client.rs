@@ -1398,9 +1398,7 @@ mod tests {
         let srv = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/sessions"))
-            .respond_with(
-                ResponseTemplate::new(500).set_body_string("internal server error"),
-            )
+            .respond_with(ResponseTemplate::new(500).set_body_string("internal server error"))
             .mount(&srv)
             .await;
 
@@ -1452,9 +1450,8 @@ mod tests {
             .and(path("/chat/stream"))
             .and(header("authorization", "Bearer override-tok"))
             .respond_with(
-                ResponseTemplate::new(200).set_body_string(
-                    "data: {\"type\":\"text_delta\",\"content\":\"ok\"}\n\n",
-                ),
+                ResponseTemplate::new(200)
+                    .set_body_string("data: {\"type\":\"text_delta\",\"content\":\"ok\"}\n\n"),
             )
             .expect(1)
             .mount(&srv)
@@ -1476,9 +1473,8 @@ mod tests {
             .and(path("/chat/stream"))
             .and(header("authorization", "Bearer default-tok"))
             .respond_with(
-                ResponseTemplate::new(200).set_body_string(
-                    "data: {\"type\":\"text_delta\",\"content\":\"ok\"}\n\n",
-                ),
+                ResponseTemplate::new(200)
+                    .set_body_string("data: {\"type\":\"text_delta\",\"content\":\"ok\"}\n\n"),
             )
             .expect(1)
             .mount(&srv)

@@ -221,13 +221,13 @@ mod tests {
             1.0,
             None,
         );
-        // Full prompt with all sections should be under ~2350 tokens (~9400 chars)
+        // Full prompt with all sections should be under ~2500 tokens (~10000 chars)
         // Enhanced prompt adds: Planning Protocol, Context Strategy, Discovery Before Access,
-        // Coding Discipline, Parallel Tool Calls, Token Efficiency, Build/Test Guidance,
-        // Plan Execution.
+        // Coding Discipline (including Executor rule), Parallel Tool Calls, Token Efficiency,
+        // Build/Test Guidance, Plan Execution.
         assert!(
-            p.len() < 9400,
-            "compressed prompt should be under 9400 chars, got {}",
+            p.len() < 10000,
+            "compressed prompt should be under 10000 chars, got {}",
             p.len()
         );
     }
@@ -906,10 +906,10 @@ mod tests {
         assert!(p.contains("## Build & Test Loop"));
         assert!(p.contains("## Git Workflow"));
         assert!(p.contains("## Memory Rules"));
-        // Budget: full prompt should still be reasonable
+        // Budget: full prompt should still be reasonable (allows for Executor rule addition)
         assert!(
-            p.len() < 14700,
-            "full toolset prompt should be under 14700 chars, got {}",
+            p.len() < 15200,
+            "full toolset prompt should be under 15200 chars, got {}",
             p.len()
         );
     }

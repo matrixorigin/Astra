@@ -62,10 +62,12 @@ pub(super) async fn execute_cli_command(
                 tool_health_entries: &[],
                 skill_registry: crate::skill_instructions::empty_registry(),
                 plan_only_chat: false,
+                hide_streaming_assistant_text: false,
                 is_plan_subtask: false,
                 plan_subtask_id: None,
                 delegation_engine: None,
                 cancel_token: None,
+                plan_assemble_line_release: None,
             })
             .await
             {
@@ -90,10 +92,12 @@ pub(super) async fn execute_cli_command(
                         tool_health_entries: &[],
                         skill_registry: crate::skill_instructions::empty_registry(),
                         plan_only_chat: false,
+                        hide_streaming_assistant_text: false,
                         is_plan_subtask: false,
                         plan_subtask_id: None,
                         delegation_engine: None,
                         cancel_token: None,
+                        plan_assemble_line_release: None,
                     })
                     .await?
                 }
@@ -301,10 +305,12 @@ pub(super) async fn execute_cli_command(
                 tool_health_entries: &[],
                 skill_registry: crate::skill_instructions::empty_registry(),
                 plan_only_chat: false,
+                hide_streaming_assistant_text: false,
                 is_plan_subtask: false,
                 plan_subtask_id: None,
                 delegation_engine: None,
                 cancel_token: None,
+                plan_assemble_line_release: None,
             })
             .await
             {
@@ -329,10 +335,12 @@ pub(super) async fn execute_cli_command(
                         tool_health_entries: &[],
                         skill_registry: crate::skill_instructions::empty_registry(),
                         plan_only_chat: false,
+                        hide_streaming_assistant_text: false,
                         is_plan_subtask: false,
                         plan_subtask_id: None,
                         delegation_engine: None,
                         cancel_token: None,
+                        plan_assemble_line_release: None,
                     })
                     .await?
                 }

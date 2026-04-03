@@ -15,6 +15,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::path::Path;
+use std::time::Instant;
 
 // Re-export task types from services
 pub use mo_agent_services::task_orchestrator::{SubtaskPlan, TaskPlan, TaskStatus};
@@ -735,6 +736,17 @@ fn extract_json(response: &str) -> String {
         }
     }
 
+    // Raw top-level JSON array (e.g. clarification questions) — must run before `{`…`}` slice,
+    // otherwise we would clip the first `{` inside the array and break parsing.
+    let trim = response.trim();
+    if trim.starts_with('[')
+        && serde_json::from_str::<serde_json::Value>(trim)
+            .ok()
+            .is_some_and(|v| v.is_array())
+    {
+        return trim.to_string();
+    }
+
     // Look for raw JSON object
     if let Some(start) = response.find('{')
         && let Some(end) = response.rfind('}')
@@ -922,6 +934,9 @@ pub struct PlanModeState {
     /// Execution timeline tracking all events
     #[serde(default)]
     pub timeline: ExecutionTimeline,
+    /// Wall-clock origin for CLI "Assembling plan · Ns" (plan> session; not serialized).
+    #[serde(skip)]
+    pub assemble_wall_start: Option<Instant>,
 }
 
 impl PlanModeState {
@@ -936,6 +951,7 @@ impl PlanModeState {
             version_history: PlanVersionHistory::default(),
             pending_clarifications: None,
             timeline: ExecutionTimeline::default(),
+            assemble_wall_start: Some(Instant::now()),
         }
     }
 
@@ -1364,7 +1380,10 @@ pub fn format_plan_entry_card(
             truncate_str(&ps.goal, 50)
         };
 
-        out.push_str(&format!("  📋 Plan Mode — {} ({}% done)\n", goal_display, pct));
+        out.push_str(&format!(
+            "  📋 Plan Mode — {} ({}% done)\n",
+            goal_display, pct
+        ));
         out.push('\n');
 
         for st in ps.plan.subtasks.iter().take(4) {
@@ -1438,12 +1457,15 @@ pub fn parse_plan_entry_choice(input: &str, has_active: bool, has_paused: bool) 
     PlanEntryChoice::Goal(trimmed.to_string())
 }
 
-/// Truncate a string to max length, adding "..." if truncated.
+/// Truncate to at most `max_len` Unicode scalar values (`.chars()`), appending `"..."` if truncated.
 fn truncate_str(s: &str, max_len: usize) -> String {
-    if s.len() <= max_len {
+    let n = s.chars().count();
+    if n <= max_len {
         s.to_string()
     } else {
-        format!("{}...", &s[..max_len.saturating_sub(3)])
+        let take_n = max_len.saturating_sub(3).max(1);
+        let truncated: String = s.chars().take(take_n).collect();
+        format!("{truncated}...")
     }
 }
 
@@ -1586,9 +1608,27 @@ impl PendingClarifications {
 /// Detect if LLM response contains clarification questions.
 /// Returns parsed questions if found, None otherwise.
 pub fn detect_clarification_questions(llm_text: &str) -> Option<Vec<ClarificationQuestion>> {
-    // Look for JSON array of questions or structured question format
+    // JSON array in ```json``` / ``` fences, or raw array — same extraction as plan JSON
+    let extracted = extract_json(llm_text);
+    let t = extracted.trim();
+    if t.starts_with('[')
+        && let Ok(questions) = serde_json::from_str::<Vec<ClarificationQuestion>>(t)
+        && !questions.is_empty()
+    {
+        return Some(questions);
+    }
 
-    // Try JSON array format first
+    // Whole message is only a JSON array (no fence)
+    let trim_full = llm_text.trim();
+    if trim_full.starts_with('[')
+        && trim_full != t
+        && let Ok(questions) = serde_json::from_str::<Vec<ClarificationQuestion>>(trim_full)
+        && !questions.is_empty()
+    {
+        return Some(questions);
+    }
+
+    // Legacy: compact `[{"question"` without newlines (old detector)
     if let Some(start) = llm_text.find("[{\"question\"")
         && let Some(end) = llm_text[start..].rfind(']')
     {
@@ -1636,26 +1676,28 @@ pub fn format_project_context(ctx: &ProjectContext) -> String {
 
     out.push_str("  📁 Project Context\n");
 
-    // Type detection
-    let project_type = if ctx.entry_points.contains(&"Cargo.toml".to_string()) {
-        "Rust"
+    // Type detection (human-readable — avoid "Unknown workspace (unknown)" confusion)
+    let stack_label = if ctx.entry_points.contains(&"Cargo.toml".to_string()) {
+        "Rust (Cargo.toml)"
     } else if ctx.entry_points.contains(&"package.json".to_string()) {
-        "Node.js"
+        "Node.js (package.json)"
     } else if ctx.entry_points.contains(&"pyproject.toml".to_string())
         || ctx.entry_points.contains(&"setup.py".to_string())
     {
-        "Python"
+        "Python (pyproject / setuptools)"
     } else if ctx.entry_points.contains(&"go.mod".to_string()) {
-        "Go"
+        "Go (go.mod)"
     } else {
-        "Unknown"
+        "Unrecognized (no Cargo.toml, package.json, go.mod, or pyproject at scan roots)"
     };
 
-    let test_cmd = ctx.test_framework.as_deref().unwrap_or("unknown");
-    out.push_str(&format!(
-        "  ├─ Type: {} workspace ({})\n",
-        project_type, test_cmd
-    ));
+    let test_hint = ctx
+        .test_framework
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or("not inferred — check README or CI");
+    out.push_str(&format!("  ├─ Stack: {stack_label}\n"));
+    out.push_str(&format!("  ├─ Tests: {test_hint}\n"));
 
     // Languages
     if !ctx.languages.is_empty() {
@@ -3402,6 +3444,18 @@ mod tests {
             ctx.languages.contains(&"Rust".to_string()),
             "should detect Rust: {:?}",
             ctx.languages
+        );
+    }
+
+    #[test]
+    fn truncate_str_respects_utf8_char_boundaries() {
+        let s = "在/tmp 下面构建一个js的网页，用户输入，展示绚丽的动态效果";
+        let t = truncate_str(s, 20);
+        assert!(t.ends_with("..."));
+        assert!(
+            t.chars().count() <= 20,
+            "got {} chars: {t:?}",
+            t.chars().count()
         );
     }
 
@@ -5548,7 +5602,7 @@ Done!"#;
         };
 
         let formatted = format_project_context(&ctx);
-        assert!(formatted.contains("Rust workspace"));
+        assert!(formatted.contains("Rust (Cargo.toml)"));
         assert!(formatted.contains("cargo test"));
         assert!(formatted.contains("42"));
         assert!(formatted.contains("main"));
@@ -5719,6 +5773,38 @@ Done!"#;
         assert_eq!(qs.len(), 1);
         assert_eq!(qs[0].question, "Which auth method?");
         assert_eq!(qs[0].options, vec!["JWT", "Session"]);
+    }
+
+    /// Pretty-printed array inside a ```json fence (plan mode often emits this).
+    #[test]
+    fn detect_clarification_pretty_json_in_fence() {
+        let llm_text = r#"Here are a few questions:
+
+```json
+[
+  {
+    "question": "用户输入的类型是什么？",
+    "options": ["文本输入", "鼠标/触摸交互", "两者都要"],
+    "default": 2,
+    "category": "scope"
+  },
+  {
+    "question": "期望的动态效果风格是什么？",
+    "options": ["粒子特效", "流体/波浪动画"],
+    "default": 0,
+    "category": "approach"
+  }
+]
+```
+"#;
+
+        let questions = detect_clarification_questions(llm_text);
+        assert!(questions.is_some());
+        let qs = questions.unwrap();
+        assert_eq!(qs.len(), 2);
+        assert!(qs[0].question.contains("用户输入"));
+        assert_eq!(qs[0].default, Some(2));
+        assert_eq!(qs[1].category, ClarificationCategory::Approach);
     }
 
     #[test]

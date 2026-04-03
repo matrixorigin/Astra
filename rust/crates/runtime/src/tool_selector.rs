@@ -13,8 +13,8 @@
 //!   Handles semantic understanding natively — "matrixone呢？" after a PR query
 //!   is trivial for an LLM but impossible for heuristics.
 //!
-//! - [`FallbackSelector`]: Tries LLM first (accurate), falls back to TF-IDF (fast)
-//!   if the LLM call fails or times out.
+//! - [`FallbackSelector`]: Runs TF-IDF first, then may call LLM (primary) for skills or when
+//!   confidence is low; if the LLM yields nothing usable, falls back to the TF-IDF result.
 //!
 //! # Design rationale
 //!
@@ -1177,7 +1177,11 @@ impl ToolSelector for FallbackSelector {
         if !result.failed && (!result.tool_names.is_empty() || !result.selected_skills.is_empty()) {
             result
         } else {
-            fast_result
+            let mut r = fast_result;
+            // Primary (usually LLM) did run — its latency is in the outer wall clock even though
+            // we discard its output and keep TF-IDF. Trace should not read as "pure tfidf_routed".
+            r.strategy = "tfidf_routed_after_llm";
+            r
         }
     }
 
@@ -2071,7 +2075,8 @@ mod tests {
         }
 
         let primary = Box::new(EmptySelector);
-        let fallback = Box::new(FixedSelector(vec!["memory_search".into()]));
+        // Use a catalog tool that is not pinned so `has_dynamic_tools` is true and primary runs.
+        let fallback = Box::new(FixedSelector(vec!["github_list_prs".into()]));
         let selector = FallbackSelector::new(primary, fallback);
 
         let ctx = SelectionContext {
@@ -2086,8 +2091,8 @@ mod tests {
             file_context: vec![],
         };
         let result = selector.select(&ctx).await;
-        assert_eq!(result.strategy, "tfidf");
-        assert_eq!(result.tool_names, vec!["memory_search"]);
+        assert_eq!(result.strategy, "tfidf_routed_after_llm");
+        assert_eq!(result.tool_names, vec!["github_list_prs"]);
     }
 
     #[tokio::test]
