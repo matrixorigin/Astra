@@ -705,6 +705,13 @@ pub fn create_local_lifecycle_full(
         lifecycle.set_learning_bridge(bridge);
     }
 
+    // Wire up live output streaming — tees build/test stderr to the terminal
+    // with dim grey styling so it's visible but doesn't dominate the output.
+    lifecycle.set_output_sink(Arc::new(|line: &str| {
+        use crossterm::style::Stylize;
+        eprintln!("      {}", line.dark_grey());
+    }));
+
     Arc::new(lifecycle)
 }
 

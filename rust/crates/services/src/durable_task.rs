@@ -761,11 +761,16 @@ pub struct SubtaskVerificationReport {
 
 // ─── Verification Runner ────────────────────────────────────────────────────
 
+/// Callback type for streaming command output lines to the caller (e.g. terminal).
+pub type OutputSink = Arc<dyn Fn(&str) + Send + Sync>;
+
 /// Executes verification criteria (edge-side: commands, files, grep, build/test).
 /// When an `LlmJudge` implementation is provided, also handles semantic verification.
+/// When an `output_sink` is provided, streams command stderr/stdout lines live.
 pub struct VerificationRunner {
     pub work_dir: std::path::PathBuf,
     pub llm_judge: Option<Arc<dyn LlmJudge>>,
+    pub output_sink: Option<OutputSink>,
 }
 
 impl VerificationRunner {
@@ -773,6 +778,7 @@ impl VerificationRunner {
         Self {
             work_dir,
             llm_judge: None,
+            output_sink: None,
         }
     }
 
@@ -781,7 +787,14 @@ impl VerificationRunner {
         Self {
             work_dir,
             llm_judge: Some(judge),
+            output_sink: None,
         }
+    }
+
+    /// Set an output sink that receives live command output lines.
+    pub fn with_output_sink(mut self, sink: OutputSink) -> Self {
+        self.output_sink = Some(sink);
+        self
     }
 
     /// Verify all criteria for a subtask.
@@ -878,12 +891,13 @@ impl VerificationRunner {
         &self,
         verifier: &VerifierKind,
     ) -> Result<(bool, String, String), String> {
+        let sink = &self.output_sink;
         match verifier {
             VerifierKind::Command { cmd, expected_exit } => {
                 let cmd = cmd.clone();
                 let expected = *expected_exit;
                 let dir = self.work_dir.clone();
-                let (code, stdout, stderr) = run_shell_cmd(&cmd, &dir).await?;
+                let (code, stdout, stderr) = run_shell_cmd(&cmd, &dir, sink).await?;
                 let evidence = if stderr.is_empty() {
                     stdout
                 } else {
@@ -903,7 +917,7 @@ impl VerificationRunner {
             } => {
                 let cmd = cmd.clone();
                 let dir = self.work_dir.clone();
-                let (_code, stdout, _stderr) = run_shell_cmd(&cmd, &dir).await?;
+                let (_code, stdout, _stderr) = run_shell_cmd(&cmd, &dir, sink).await?;
                 let has_all = contains.iter().all(|s| stdout.contains(s));
                 let has_none = not_contains.iter().all(|s| !stdout.contains(s));
                 let passed = has_all && has_none;
@@ -957,14 +971,14 @@ impl VerificationRunner {
             VerifierKind::BuildPass { cmd } => {
                 let cmd = cmd.clone();
                 let dir = self.work_dir.clone();
-                let (code, _stdout, stderr) = run_shell_cmd(&cmd, &dir).await?;
+                let (code, _stdout, stderr) = run_shell_cmd(&cmd, &dir, sink).await?;
                 Ok((code == 0, truncate(&stderr, 4096), "exit code == 0".into()))
             }
 
             VerifierKind::TestPass { cmd, min_pass_rate } => {
                 let cmd = cmd.clone();
                 let dir = self.work_dir.clone();
-                let (code, stdout, stderr) = run_shell_cmd(&cmd, &dir).await?;
+                let (code, stdout, stderr) = run_shell_cmd(&cmd, &dir, sink).await?;
                 let combined = format!("{stdout}\n{stderr}");
 
                 // Try to parse structured test output for actual pass rate
@@ -1139,8 +1153,94 @@ fn extract_paths_from_text(text: &str) -> Vec<String> {
         .collect()
 }
 
-/// Run a shell command via spawn_blocking (no tokio::process feature needed).
-async fn run_shell_cmd(cmd: &str, dir: &std::path::Path) -> Result<(i32, String, String), String> {
+/// Run a shell command, optionally streaming output lines to a sink.
+///
+/// When `sink` is provided, uses `tokio::process::Command` to stream stderr
+/// lines live (for build/test feedback). Otherwise, falls back to the
+/// blocking `std::process::Command::output()` path.
+async fn run_shell_cmd(
+    cmd: &str,
+    dir: &std::path::Path,
+    sink: &Option<OutputSink>,
+) -> Result<(i32, String, String), String> {
+    if let Some(sink) = sink {
+        run_shell_cmd_streaming(cmd, dir, sink).await
+    } else {
+        run_shell_cmd_buffered(cmd, dir).await
+    }
+}
+
+/// Streaming variant: pipes stderr line-by-line to the sink while accumulating output.
+async fn run_shell_cmd_streaming(
+    cmd: &str,
+    dir: &std::path::Path,
+    sink: &OutputSink,
+) -> Result<(i32, String, String), String> {
+    use tokio::io::{AsyncBufReadExt, BufReader};
+    use tokio::process::Command;
+
+    let mut child = Command::new("sh")
+        .arg("-c")
+        .arg(cmd)
+        .current_dir(dir)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("spawn failed: {e}"))?;
+
+    let stderr_pipe = child.stderr.take();
+    let stdout_pipe = child.stdout.take();
+
+    // Stream stderr lines to the sink while accumulating
+    let sink2 = sink.clone();
+    let stderr_handle = tokio::spawn(async move {
+        let mut acc = String::new();
+        if let Some(pipe) = stderr_pipe {
+            let mut lines = BufReader::new(pipe).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                sink2(&line);
+                acc.push_str(&line);
+                acc.push('\n');
+            }
+        }
+        acc
+    });
+
+    // Also stream stdout lines
+    let sink3 = sink.clone();
+    let stdout_handle = tokio::spawn(async move {
+        let mut acc = String::new();
+        if let Some(pipe) = stdout_pipe {
+            let mut lines = BufReader::new(pipe).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                sink3(&line);
+                acc.push_str(&line);
+                acc.push('\n');
+            }
+        }
+        acc
+    });
+
+    let status = child
+        .wait()
+        .await
+        .map_err(|e| format!("wait failed: {e}"))?;
+
+    let stderr = stderr_handle
+        .await
+        .map_err(|e| format!("stderr join: {e}"))?;
+    let stdout = stdout_handle
+        .await
+        .map_err(|e| format!("stdout join: {e}"))?;
+
+    Ok((status.code().unwrap_or(-1), stdout, stderr))
+}
+
+/// Original blocking variant (no streaming).
+async fn run_shell_cmd_buffered(
+    cmd: &str,
+    dir: &std::path::Path,
+) -> Result<(i32, String, String), String> {
     let cmd = cmd.to_string();
     let dir = dir.to_path_buf();
     tokio::task::spawn_blocking(move || {
@@ -2891,6 +2991,8 @@ pub struct LocalDurableTaskLifecycle {
     user_id: String,
     /// Learning bridge for feeding verification patterns into the learning system.
     learning_bridge: Option<Arc<dyn TaskLearningBridge>>,
+    /// Optional callback that receives live command output lines during verification.
+    output_sink: Option<OutputSink>,
 }
 
 impl LocalDurableTaskLifecycle {
@@ -2913,6 +3015,7 @@ impl LocalDurableTaskLifecycle {
             session_id: String::new(),
             user_id: String::new(),
             learning_bridge: None,
+            output_sink: None,
         }
     }
 
@@ -2931,6 +3034,7 @@ impl LocalDurableTaskLifecycle {
             session_id: String::new(),
             user_id: String::new(),
             learning_bridge: None,
+            output_sink: None,
         }
     }
 
@@ -2953,6 +3057,11 @@ impl LocalDurableTaskLifecycle {
     /// Set the learning bridge for feeding verification patterns into learning.
     pub fn set_learning_bridge(&mut self, bridge: Arc<dyn TaskLearningBridge>) {
         self.learning_bridge = Some(bridge);
+    }
+
+    /// Set the output sink for streaming live command output during verification.
+    pub fn set_output_sink(&mut self, sink: OutputSink) {
+        self.output_sink = Some(sink);
     }
 
     /// Emit a verification-related event to the cloud event stream.
@@ -2992,10 +3101,14 @@ impl LocalDurableTaskLifecycle {
     }
 
     fn make_runner(&self) -> VerificationRunner {
-        match &self.llm_judge {
+        let mut runner = match &self.llm_judge {
             Some(j) => VerificationRunner::with_llm_judge(self.work_dir.clone(), j.clone()),
             None => VerificationRunner::new(self.work_dir.clone()),
+        };
+        if let Some(ref sink) = self.output_sink {
+            runner.output_sink = Some(sink.clone());
         }
+        runner
     }
 
     fn contract_path(&self, contract_id: &str) -> std::path::PathBuf {
