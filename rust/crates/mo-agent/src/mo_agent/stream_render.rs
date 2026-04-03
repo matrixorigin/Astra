@@ -1025,7 +1025,9 @@ fn buffer_to_visual_lines(buffer: &str, w: usize) -> Vec<String> {
     if buffer.is_empty() {
         return out;
     }
-    for raw_line in buffer.replace('\r', "\n").split('\n') {
+    // Normalize line endings: \r\n -> \n, standalone \r -> \n
+    let normalized = buffer.replace("\r\n", "\n").replace('\r', "\n");
+    for raw_line in normalized.split('\n') {
         let line = raw_line.trim_end_matches([' ', '\t']);
         if line.is_empty() {
             out.push(String::new());
@@ -2474,6 +2476,25 @@ mod tests {
         let lines = super::buffer_to_visual_lines(s, 100);
         assert!(lines.iter().any(|l| l.contains('[')));
         assert!(lines.iter().any(|l| l.contains("\"question\"")));
+    }
+
+    #[test]
+    fn buffer_to_visual_lines_handles_crlf() {
+        // Windows-style \r\n should become single newline
+        let s = "line1\r\nline2\r\nline3";
+        let lines = super::buffer_to_visual_lines(s, 100);
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[0], "line1");
+        assert_eq!(lines[1], "line2");
+        assert_eq!(lines[2], "line3");
+    }
+
+    #[test]
+    fn buffer_to_visual_lines_handles_mixed_line_endings() {
+        // Mix of \r\n, \n, and \r
+        let s = "a\r\nb\nc\rd";
+        let lines = super::buffer_to_visual_lines(s, 100);
+        assert_eq!(lines.len(), 4);
     }
 
     #[test]

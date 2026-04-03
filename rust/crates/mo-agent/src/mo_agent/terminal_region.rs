@@ -177,6 +177,8 @@ impl TerminalRegion {
 
     /// Clear the entire region from the terminal.
     pub(super) fn clear(&mut self) {
+        // Refresh width in case terminal was resized
+        self.refresh_term_width();
         let rows = self.total_physical_rows();
         if rows > 0 {
             execute!(
@@ -194,6 +196,7 @@ impl TerminalRegion {
     /// Remove the last `n` logical lines from the region.
     #[allow(dead_code)]
     pub(super) fn pop_lines(&mut self, n: usize) {
+        self.refresh_term_width();
         let n = n.min(self.lines.len());
         if n > 0 {
             let rows_to_remove: usize = self.lines[self.lines.len() - n..]
@@ -215,29 +218,83 @@ impl TerminalRegion {
 
 /// Calculate visible character width of a string (stripping ANSI codes).
 ///
-/// Uses a simple heuristic: ASCII chars = 1 width, others (CJK, emoji) = 2 width.
+/// Uses a heuristic:
+/// - ASCII printable chars (0x20-0x7E) = 1 width
+/// - Control chars (0x00-0x1F, 0x7F) = 0 width
+/// - Zero-width Unicode (combining marks, etc.) = 0 width
+/// - CJK, emoji, etc. = 2 width
 fn visible_char_width(s: &str) -> usize {
     let stripped = strip_ansi_codes(s);
-    stripped
-        .chars()
-        .map(|c| if c.is_ascii() { 1 } else { 2 })
-        .sum()
+    stripped.chars().map(char_display_width).sum()
+}
+
+/// Estimate display width of a single character.
+fn char_display_width(c: char) -> usize {
+    match c {
+        // ASCII control characters (including tab, backspace)
+        '\x00'..='\x1f' | '\x7f' => 0,
+        // ASCII printable
+        '\x20'..='\x7e' => 1,
+        // Common zero-width Unicode ranges
+        '\u{200B}'..='\u{200F}' => 0, // Zero-width space, joiners, marks
+        '\u{2060}'..='\u{2064}' => 0, // Word joiner, invisible operators
+        '\u{FEFF}' => 0,              // BOM / zero-width no-break space
+        '\u{FE00}'..='\u{FE0F}' => 0, // Variation selectors
+        // Combining diacritical marks
+        '\u{0300}'..='\u{036F}' => 0,
+        '\u{1AB0}'..='\u{1AFF}' => 0,
+        '\u{1DC0}'..='\u{1DFF}' => 0,
+        '\u{20D0}'..='\u{20FF}' => 0,
+        '\u{FE20}'..='\u{FE2F}' => 0,
+        // Everything else (CJK, emoji, etc.) = 2
+        _ => 2,
+    }
 }
 
 /// Strip ANSI escape sequences from a string.
+///
+/// Handles:
+/// - SGR sequences: ESC [ ... m (colors, styles)
+/// - CSI sequences: ESC [ ... @ through ~ (cursor movement, clear, etc.)
+/// - OSC sequences: ESC ] ... BEL or ST (window title, etc.)
 fn strip_ansi_codes(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
     let mut chars = input.chars().peekable();
     while let Some(ch) = chars.next() {
-        // ESC [ ... m  (SGR sequence)
-        if ch == '\u{1b}' && matches!(chars.peek(), Some('[')) {
-            let _ = chars.next(); // consume '['
-            for c in chars.by_ref() {
-                if ('@'..='~').contains(&c) {
-                    break;
+        if ch == '\u{1b}' {
+            match chars.peek() {
+                // CSI sequence: ESC [ ... (final byte in @-~)
+                Some('[') => {
+                    let _ = chars.next(); // consume '['
+                    for c in chars.by_ref() {
+                        if ('@'..='~').contains(&c) {
+                            break;
+                        }
+                    }
+                    continue;
                 }
+                // OSC sequence: ESC ] ... (terminated by BEL or ESC \)
+                Some(']') => {
+                    let _ = chars.next(); // consume ']'
+                    while let Some(c) = chars.next() {
+                        if c == '\x07' {
+                            // BEL
+                            break;
+                        }
+                        if c == '\u{1b}' && matches!(chars.peek(), Some('\\')) {
+                            let _ = chars.next(); // consume '\'
+                            break;
+                        }
+                    }
+                    continue;
+                }
+                // Other single-char escapes (ESC c, ESC D, etc.)
+                Some(c) if ('@'..='_').contains(c) => {
+                    let _ = chars.next();
+                    continue;
+                }
+                _ => {}
             }
-            continue;
         }
         out.push(ch);
     }
@@ -327,5 +384,36 @@ mod tests {
             .position(|(o, n)| o != n)
             .unwrap_or(old.len().min(new.len()));
         assert_eq!(first_diff, 2);
+    }
+
+    #[test]
+    fn char_width_zero_width_chars() {
+        // Zero-width space
+        assert_eq!(char_display_width('\u{200B}'), 0);
+        // Combining acute accent
+        assert_eq!(char_display_width('\u{0301}'), 0);
+        // Control char (backspace)
+        assert_eq!(char_display_width('\x08'), 0);
+        // Tab
+        assert_eq!(char_display_width('\t'), 0);
+    }
+
+    #[test]
+    fn strip_ansi_handles_osc_sequences() {
+        // OSC sequence with BEL terminator
+        let osc = "\x1b]0;Window Title\x07text";
+        assert_eq!(strip_ansi_codes(osc), "text");
+        // OSC sequence with ST terminator
+        let osc_st = "\x1b]0;Title\x1b\\text";
+        assert_eq!(strip_ansi_codes(osc_st), "text");
+    }
+
+    #[test]
+    fn strip_ansi_handles_csi_cursor() {
+        // Cursor movement sequences
+        let cursor_up = "\x1b[5Atext";
+        assert_eq!(strip_ansi_codes(cursor_up), "text");
+        let clear_line = "\x1b[2Ktext";
+        assert_eq!(strip_ansi_codes(clear_line), "text");
     }
 }
