@@ -1692,10 +1692,7 @@ async fn handle_sync_command(arg: &str, state: &ReplState) {
             }
         }
     } else {
-        eprintln!(
-            "\n  {}",
-            "Use /sync log | push | pull".dim()
-        );
+        eprintln!("\n  {}", "Use /sync log | push | pull".dim());
     }
 
     eprintln!(
@@ -1735,7 +1732,7 @@ async fn handle_sync_push(state: &ReplState) {
         .filter(|(_, s)| s.is_dirty())
         .count();
     if dirty_count == 0 {
-        eprintln!("  {} {}", "✓".green(), "All domains clean — nothing to push.");
+        eprintln!("  {} All domains clean — nothing to push.", "✓".green());
         eprintln!(
             "{}",
             "────────────────────────────────────────────────".dim()
@@ -1832,7 +1829,7 @@ async fn handle_sync_pull(state: &ReplState) {
     drop(orch);
 
     if results.is_empty() {
-        eprintln!("  {} {}", "○".dim(), "No pullable domains configured.");
+        eprintln!("  {} No pullable domains configured.", "○".dim());
         eprintln!(
             "{}",
             "────────────────────────────────────────────────".dim()
@@ -6519,22 +6516,34 @@ total_tokens_out: 500
 
     #[test]
     fn format_duration_short_zero() {
-        assert_eq!(format_duration_short(std::time::Duration::from_secs(0)), "0s");
+        assert_eq!(
+            format_duration_short(std::time::Duration::from_secs(0)),
+            "0s"
+        );
     }
 
     #[test]
     fn format_duration_short_seconds() {
-        assert_eq!(format_duration_short(std::time::Duration::from_secs(45)), "45s");
+        assert_eq!(
+            format_duration_short(std::time::Duration::from_secs(45)),
+            "45s"
+        );
     }
 
     #[test]
     fn format_duration_short_minutes() {
-        assert_eq!(format_duration_short(std::time::Duration::from_secs(92)), "1m32s");
+        assert_eq!(
+            format_duration_short(std::time::Duration::from_secs(92)),
+            "1m32s"
+        );
     }
 
     #[test]
     fn format_duration_short_hours() {
-        assert_eq!(format_duration_short(std::time::Duration::from_secs(7500)), "2h5m");
+        assert_eq!(
+            format_duration_short(std::time::Duration::from_secs(7500)),
+            "2h5m"
+        );
     }
 
     #[test]

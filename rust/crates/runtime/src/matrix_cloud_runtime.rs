@@ -199,9 +199,7 @@ impl MatrixCloudRuntime {
         }
     }
 
-    pub async fn sync_orchestrator_lock(
-        &self,
-    ) -> tokio::sync::MutexGuard<'_, SyncOrchestrator> {
+    pub async fn sync_orchestrator_lock(&self) -> tokio::sync::MutexGuard<'_, SyncOrchestrator> {
         self.sync_orchestrator.lock().await
     }
 }

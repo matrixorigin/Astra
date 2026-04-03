@@ -40,11 +40,7 @@ fn make_lifecycle(tmp: &tempfile::TempDir) -> LocalDurableTaskLifecycle {
     let work = tmp.path().join("work");
     std::fs::create_dir_all(&work).unwrap();
     let data = tmp.path().join("data");
-    LocalDurableTaskLifecycle::with_branch_ops(
-        data,
-        Arc::new(NoopBranchOps),
-        work,
-    )
+    LocalDurableTaskLifecycle::with_branch_ops(data, Arc::new(NoopBranchOps), work)
 }
 
 // ─── Tests ──────────────────────────────────────────────────────────────
@@ -57,7 +53,13 @@ async fn e2e_contract_create_verify_deliver() {
 
     // 1. Create contract
     let contract = svc
-        .create_contract("user1", "sess1", "Create hello.txt with greeting", &make_plan(), TaskScope::default())
+        .create_contract(
+            "user1",
+            "sess1",
+            "Create hello.txt with greeting",
+            &make_plan(),
+            TaskScope::default(),
+        )
         .await
         .unwrap();
     assert_eq!(contract.subtasks.len(), 2);
@@ -76,7 +78,11 @@ async fn e2e_contract_create_verify_deliver() {
         .unwrap();
 
     // 4. If subtask has criteria, verify it; otherwise it auto-transitions to Verified
-    let sub1 = contract.subtasks.iter().find(|s| s.id == "create-file").unwrap();
+    let sub1 = contract
+        .subtasks
+        .iter()
+        .find(|s| s.id == "create-file")
+        .unwrap();
     if !sub1.criteria.is_empty() {
         let report = svc.verify_subtask(&task_id, "create-file").await.unwrap();
         let any_passed = report.results.iter().any(|r| r.passed);
@@ -111,7 +117,13 @@ async fn e2e_verify_subtask_fails_when_file_missing() {
     let svc = make_lifecycle(&tmp);
 
     let contract = svc
-        .create_contract("u", "s", "Create missing.txt", &make_plan(), TaskScope::default())
+        .create_contract(
+            "u",
+            "s",
+            "Create missing.txt",
+            &make_plan(),
+            TaskScope::default(),
+        )
         .await
         .unwrap();
     let task_id = contract.task_id.clone();
@@ -123,7 +135,11 @@ async fn e2e_verify_subtask_fails_when_file_missing() {
         .unwrap();
 
     // Check if criteria were generated — if not, auto-verified
-    let sub1 = contract.subtasks.iter().find(|s| s.id == "create-file").unwrap();
+    let sub1 = contract
+        .subtasks
+        .iter()
+        .find(|s| s.id == "create-file")
+        .unwrap();
     if !sub1.criteria.is_empty() {
         // Verify should succeed structurally (returns report), but may have failures
         let report = svc.verify_subtask(&task_id, "create-file").await.unwrap();
@@ -139,7 +155,13 @@ async fn e2e_delivery_report_serializes_to_json() {
     let work_dir = tmp.path().join("work");
 
     let contract = svc
-        .create_contract("u", "s", "Test delivery JSON", &make_plan(), TaskScope::default())
+        .create_contract(
+            "u",
+            "s",
+            "Test delivery JSON",
+            &make_plan(),
+            TaskScope::default(),
+        )
         .await
         .unwrap();
     let task_id = contract.task_id.clone();
@@ -147,11 +169,15 @@ async fn e2e_delivery_report_serializes_to_json() {
     // Execute both subtasks
     std::fs::write(work_dir.join("hello.txt"), "Hello, World!").unwrap();
     svc.begin_subtask(&task_id, "create-file").await.unwrap();
-    svc.complete_subtask_execution(&task_id, "create-file").await.unwrap();
+    svc.complete_subtask_execution(&task_id, "create-file")
+        .await
+        .unwrap();
     let _ = svc.verify_subtask(&task_id, "create-file").await;
 
     svc.begin_subtask(&task_id, "verify-content").await.unwrap();
-    svc.complete_subtask_execution(&task_id, "verify-content").await.unwrap();
+    svc.complete_subtask_execution(&task_id, "verify-content")
+        .await
+        .unwrap();
     let _ = svc.verify_subtask(&task_id, "verify-content").await;
 
     // Deliver + serialize
@@ -164,7 +190,10 @@ async fn e2e_delivery_report_serializes_to_json() {
     // Roundtrip
     let parsed: TaskDeliveryReport = serde_json::from_str(&json).unwrap();
     assert_eq!(parsed.task_id, report.task_id);
-    assert_eq!(parsed.subtask_summaries.len(), report.subtask_summaries.len());
+    assert_eq!(
+        parsed.subtask_summaries.len(),
+        report.subtask_summaries.len()
+    );
 }
 
 #[tokio::test]
@@ -172,7 +201,7 @@ async fn verify_global_on_empty_contract_succeeds() {
     let tmp = tempfile::TempDir::new().unwrap();
     let svc = make_lifecycle(&tmp);
 
-    use mo_agent_services::task_orchestrator::{TaskPlan, SubtaskPlan, TaskStatus};
+    use mo_agent_services::task_orchestrator::{SubtaskPlan, TaskPlan, TaskStatus};
     let empty_plan = TaskPlan {
         subtasks: vec![SubtaskPlan {
             id: "only".into(),
@@ -204,7 +233,13 @@ async fn begin_subtask_wrong_state_is_error() {
     let svc = make_lifecycle(&tmp);
 
     let contract = svc
-        .create_contract("u", "s", "Test state checks", &make_plan(), TaskScope::default())
+        .create_contract(
+            "u",
+            "s",
+            "Test state checks",
+            &make_plan(),
+            TaskScope::default(),
+        )
         .await
         .unwrap();
 
