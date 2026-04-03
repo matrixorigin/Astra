@@ -59,6 +59,8 @@ mod effects;
 mod permission_manager;
 #[path = "mo_agent/plan_executor.rs"]
 mod plan_executor;
+#[path = "mo_agent/readline_actor.rs"]
+mod readline_actor;
 #[path = "mo_agent/repl_runtime.rs"]
 mod repl_runtime;
 #[path = "mo_agent/repl_turn.rs"]
@@ -111,7 +113,7 @@ use repl_turn::{ReplTurnContext, handle_chat_input};
 use repl_ui::{
     ReplHelper, SlashStartCompleteHandler, clear_slash_overlay, history_path,
     is_slash_picker_active, print_keyboard_shortcuts, print_slash_commands, resolve_slash_command,
-    suggest_commands, take_slash_pending_execute,
+    suggest_commands,
 };
 use slash_account::handle_account_command;
 use slash_debug::handle_debug_command;
@@ -2275,9 +2277,7 @@ async fn start_and_monitor_background_plan(
     let handle = plan_executor::spawn_plan_executor(ctx, selector);
     state.plan_handle = Some(handle);
 
-    // ── Monitor loop: poll updates + Ctrl-C handling ─────────────────
-    plan_monitoring_loop(state).await;
-
+    eprintln!("{}", "  🔄 Plan executing in background — you can keep typing.".dim());
     Ok(())
 }
 
@@ -2285,7 +2285,8 @@ async fn start_and_monitor_background_plan(
 /// handling completion/pause/error.  Returns when the plan finishes,
 /// pauses, or encounters an error.
 ///
-/// Ctrl-C is intercepted and forwarded as [`PlanCommand::Pause`].
+/// **Legacy**: Superseded by `display_plan_updates_live()` which uses ExternalPrinter.
+#[allow(dead_code)]
 async fn plan_monitoring_loop(state: &mut ReplState) {
     use plan_executor::{PlanCommand, PlanUpdate};
 
@@ -2386,7 +2387,111 @@ async fn plan_monitoring_loop(state: &mut ReplState) {
     }
 }
 
-/// Run the plan auto-execution loop: iterate through ready subtasks,
+/// Drain plan updates from the background executor and display them via
+/// `ExternalPrinter`, which safely redraws the rustyline prompt. Called
+/// inside the `select!` loop while the user is at the readline prompt.
+fn display_plan_updates_live(
+    state: &mut ReplState,
+    printer: &std::sync::Mutex<readline_actor::BoxedPrinter>,
+) {
+    use plan_executor::PlanUpdate;
+
+    let handle = match state.plan_handle.as_mut() {
+        Some(h) => h,
+        None => return,
+    };
+
+    while let Some(update) = handle.try_recv() {
+        let msg = match update {
+            PlanUpdate::SubtaskStarted {
+                title,
+                index,
+                total,
+                ..
+            } => {
+                format!("\n▸  [{index}/{total}] {title}")
+            }
+            PlanUpdate::SubtaskCompleted {
+                id,
+                verification_passed,
+                elapsed,
+                ..
+            } => {
+                let dur = elapsed
+                    .map(|d| format!(" ({})", format_duration_short(d)))
+                    .unwrap_or_default();
+                if verification_passed {
+                    format!("  ✅ {id}{dur}")
+                } else {
+                    format!("  ⚠ {id} — verification failed{dur}")
+                }
+            }
+            PlanUpdate::SubtaskTurnResult {
+                subtask_id,
+                prompt_tokens,
+                completion_tokens,
+                ..
+            } => {
+                state.total_prompt_tokens += prompt_tokens;
+                state.total_completion_tokens += completion_tokens;
+                state.turn += 1;
+                state.current_plan_subtask_id = Some(subtask_id);
+                continue; // No visible output for token accounting
+            }
+            PlanUpdate::PlanProgress {
+                done,
+                total,
+                elapsed,
+                ..
+            } => {
+                let pct = if total > 0 { done * 100 / total } else { 0 };
+                format!(
+                    "  📊 {done}/{total} ({pct}%) — {}",
+                    format_duration_short(elapsed),
+                )
+            }
+            PlanUpdate::PlanCompleted { pct, elapsed } => {
+                let msg = format!(
+                    "\n🏁  Plan complete — {pct}% verified in {}",
+                    format_duration_short(elapsed),
+                );
+                state.executing_plan = None;
+                state.current_plan_subtask_id = None;
+                state.plan_handle = None;
+                // Print before returning — handle is gone
+                if let Ok(mut p) = printer.lock() {
+                    let _ = p.print(msg);
+                }
+                return;
+            }
+            PlanUpdate::PlanError { error } => {
+                let msg = format!("\n❌  Plan error: {error}");
+                state.executing_plan = None;
+                state.current_plan_subtask_id = None;
+                state.plan_handle = None;
+                if let Ok(mut p) = printer.lock() {
+                    let _ = p.print(msg);
+                }
+                return;
+            }
+            PlanUpdate::PlanPaused {
+                pct,
+                remaining,
+                elapsed,
+            } => {
+                format!(
+                    "\n⏸  Plan paused — {pct}% done, {remaining} remaining ({})",
+                    format_duration_short(elapsed),
+                )
+            }
+            _ => continue, // LlmStreaming, ToolCall — future use
+        };
+
+        if let Ok(mut p) = printer.lock() {
+            let _ = p.print(msg);
+        }
+    }
+}
 /// send each as a chat message, mark done, continue until all done or blocked.
 ///
 /// Uses a take-modify-put pattern to avoid borrow conflicts with handle_chat_input.
@@ -3999,7 +4104,10 @@ async fn run_chat_repl(
     // auth will prompt "Not logged in. Use /login."
     try_silent_auth(api, profile).await;
 
-    let (mut editor, hist_path) = build_repl_editor()?;
+    let (editor, hist_path) = build_repl_editor()?;
+    let (mut readline, ext_printer) = readline_actor::ReadlineActor::spawn(editor)?;
+    // Wrap ext_printer in Mutex so plan_monitoring_loop can use it.
+    let ext_printer = std::sync::Mutex::new(ext_printer);
     let mut state = initialize_repl_state(profile, initial_model);
     // Session-scoped quality tracker: tools that work well get boosted over time
     let quality_tracker = std::sync::Arc::new(std::sync::Mutex::new(
@@ -4166,15 +4274,57 @@ async fn run_chat_repl(
             format!("{} ", "plan>".yellow().bold())
         } else if state.executing_plan.is_some() {
             format!("{} ", "⏸>".yellow().bold())
+        } else if state.plan_handle.is_some() {
+            format!("{} ", "🔄>".cyan().bold())
         } else if state.chat_plan_only {
             format!("{} ", "plan·".yellow().bold())
         } else {
             format!("{} ", "❯".cyan().bold())
         };
 
-        let readline = tokio::task::block_in_place(|| editor.readline(&prompt_str));
+        // ── Send readline request to actor thread ────────────────────
+        readline.request_readline(prompt_str);
 
-        match readline {
+        // ── Select: readline response OR background plan updates ─────
+        let readline_result: Result<String, ReadlineError>;
+        let mut pending_execute: Option<String> = None;
+
+        loop {
+            tokio::select! {
+                biased;
+
+                // Readline thread returned a result
+                resp = readline.recv() => {
+                    match resp {
+                        Some(readline_actor::ReadlineResponse::Line { result, pending_execute: pe }) => {
+                            readline_result = result;
+                            pending_execute = pe;
+                            break;
+                        }
+                        None => {
+                            // Readline thread exited unexpectedly
+                            readline_result = Err(ReadlineError::Eof);
+                            break;
+                        }
+                    }
+                }
+
+                // Background plan update available (only polls if handle exists)
+                _ = async {
+                    if state.plan_handle.is_some() {
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await
+                    } else {
+                        std::future::pending::<()>().await
+                    }
+                } => {
+                    // Drain plan updates and display via ExternalPrinter
+                    display_plan_updates_live(&mut state, &ext_printer);
+                }
+            }
+        }
+
+        // ── Process readline result ──────────────────────────────────
+        match readline_result {
             Ok(line) => {
                 clear_slash_overlay();
                 // Multi-line: strip continuation backslashes and join lines
@@ -4188,13 +4338,13 @@ async fn run_chat_repl(
                 if line.is_empty() {
                     continue;
                 }
-                let _ = editor.add_history_entry(line.as_str());
+                readline.add_history(line.clone());
 
                 if line.starts_with('/') {
                     // If Enter was pressed in the picker, the selected command is
-                    // stored in pending-execute.  Use it instead of the raw line.
-                    let pending = take_slash_pending_execute();
-                    let dispatch_line = pending.as_deref().unwrap_or(&line);
+                    // stored in pending-execute (captured by readline actor thread).
+                    let dispatch_line_owned = pending_execute.unwrap_or_else(|| line.clone());
+                    let dispatch_line = dispatch_line_owned.as_str();
                     let should_exit = handle_slash_command(
                         dispatch_line,
                         api,
@@ -4551,7 +4701,7 @@ async fn run_chat_repl(
         h.abort();
     }
 
-    let _ = editor.save_history(&hist_path);
+    readline.shutdown(hist_path);
     Ok(())
 }
 
