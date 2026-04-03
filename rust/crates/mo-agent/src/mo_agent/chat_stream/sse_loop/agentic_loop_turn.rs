@@ -521,8 +521,7 @@ async fn chat_turn_post_payload_after_prepare(
     ui: &ChatTurnSseFetchUi,
     prepare: PrepareChatTurnRequest<'_>,
 ) -> Result<(mo_thin_client::HttpResponse, ChatTurnPrepLineGuard), String> {
-    let prep_line =
-        ChatTurnPrepLineGuard::maybe_start(ui.show_prep_line, ui.prep_ui_phase.clone());
+    let prep_line = ChatTurnPrepLineGuard::maybe_start(ui.show_prep_line, ui.prep_ui_phase.clone());
     let payload = prepare_chat_turn_payload(prepare).await;
 
     touch_prep_ui_phase(&ui.prep_ui_phase, "Sending…");

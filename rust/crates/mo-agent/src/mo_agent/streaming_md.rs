@@ -39,7 +39,7 @@ impl StreamingMarkdown {
     }
 
     /// Total lines currently on screen (stable + unstable).
-    #[allow(dead_code)]
+    #[allow(dead_code)] // Used when tuning stderr/stdout cursor accounting; keep for future UX work.
     pub(super) fn height(&self) -> usize {
         self.stable_region.height() + self.unstable_region.height()
     }

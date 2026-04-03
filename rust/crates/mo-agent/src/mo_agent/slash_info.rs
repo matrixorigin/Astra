@@ -101,6 +101,119 @@ fn run_git_lines(project_root: &std::path::Path, args: &[&str]) -> Vec<String> {
     }
 }
 
+fn run_git_stdout(project_root: &std::path::Path, args: &[&str]) -> String {
+    match SysCommand::new("git")
+        .args(args)
+        .current_dir(project_root)
+        .output()
+    {
+        Ok(output) if output.status.success() => {
+            String::from_utf8_lossy(&output.stdout).replace("\r\n", "\n")
+        }
+        _ => String::new(),
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReviewGitTarget<'a> {
+    Head,
+    WorkingTree,
+    Rev(&'a str),
+}
+
+fn parse_review_git_target(arg: &str) -> ReviewGitTarget<'_> {
+    let a = arg.trim();
+    if a.is_empty() {
+        return ReviewGitTarget::Head;
+    }
+    match a.to_ascii_lowercase().as_str() {
+        "latest" | "latest commit" | "last" | "last commit" | "head" | "head commit" | "tip"
+        | "current commit" => ReviewGitTarget::Head,
+        "working" | "working tree" | "worktree" | "working-tree" | "local" | "local changes"
+        | "dirty" | "wt" => ReviewGitTarget::WorkingTree,
+        _ => ReviewGitTarget::Rev(a),
+    }
+}
+
+const REVIEW_PREFETCH_MAX: usize = 12_000;
+
+fn prefetch_review_git_stat(project_root: &std::path::Path, target: ReviewGitTarget<'_>) -> String {
+    let mut out = String::new();
+    match target {
+        ReviewGitTarget::Head => {
+            let header = run_git_stdout(
+                project_root,
+                &["show", "--no-patch", "--format=Commit %H%n%s", "HEAD"],
+            );
+            if !header.trim().is_empty() {
+                out.push_str(header.trim_end());
+                out.push('\n');
+            }
+            let stat = run_git_stdout(project_root, &["show", "--stat", "HEAD"]);
+            if !stat.trim().is_empty() {
+                out.push_str(stat.trim_end());
+                out.push('\n');
+            }
+        }
+        ReviewGitTarget::WorkingTree => {
+            let staged = run_git_stdout(project_root, &["diff", "--cached", "--stat"]);
+            let unstaged = run_git_stdout(project_root, &["diff", "--stat"]);
+            if !staged.trim().is_empty() {
+                out.push_str("Staged:\n");
+                out.push_str(&staged);
+                if !staged.ends_with('\n') {
+                    out.push('\n');
+                }
+            }
+            if !unstaged.trim().is_empty() {
+                out.push_str("Unstaged:\n");
+                out.push_str(&unstaged);
+                if !unstaged.ends_with('\n') {
+                    out.push('\n');
+                }
+            }
+            if out.trim().is_empty() {
+                let untracked = run_git_lines(
+                    project_root,
+                    &["ls-files", "--others", "--exclude-standard"],
+                );
+                if !untracked.is_empty() {
+                    out.push_str("Untracked files (no line counts):\n");
+                    for u in untracked.iter().take(40) {
+                        out.push_str(u);
+                        out.push('\n');
+                    }
+                    if untracked.len() > 40 {
+                        out.push_str(&format!("... +{} more\n", untracked.len() - 40));
+                    }
+                }
+            }
+        }
+        ReviewGitTarget::Rev(rev) => {
+            let stat = run_git_stdout(project_root, &["show", "--stat", rev]);
+            if !stat.trim().is_empty() {
+                out.push_str(stat.trim_end());
+                out.push('\n');
+            }
+        }
+    }
+
+    let trimmed = out.trim();
+    if trimmed.is_empty() {
+        return "(no diff stat available — repo may be clean or not a git checkout)\n".to_string();
+    }
+    let mut s = trimmed.to_string();
+    if s.len() > REVIEW_PREFETCH_MAX {
+        s.truncate(REVIEW_PREFETCH_MAX);
+        s.push_str("\n[truncated]");
+    }
+    s
+}
+
+fn fence_prefetch_block(raw: &str) -> String {
+    raw.replace("```", "'''")
+}
+
 fn parse_review_match(line: &str) -> Option<ReviewMatch<'_>> {
     let mut parts = line.splitn(3, ':');
     let path = parts.next()?.trim();
@@ -216,16 +329,24 @@ fn review_search(executor: &edge_tools::ToolExecutor, pattern: &str) -> String {
     }
 }
 
-fn build_review_prompt(arg: &str) -> String {
-    let target = match arg.trim() {
-        "" | "latest" => "HEAD",
-        "working" => "WORKING_TREE",
-        other => other,
+fn build_review_prompt(arg: &str, project_root: &std::path::Path) -> String {
+    let git_target = parse_review_git_target(arg);
+    let target_line = match git_target {
+        ReviewGitTarget::Head => "HEAD".to_string(),
+        ReviewGitTarget::WorkingTree => "WORKING_TREE".to_string(),
+        ReviewGitTarget::Rev(r) => r.to_string(),
     };
+    let prefetched = prefetch_review_git_stat(project_root, git_target);
+    let fenced = fence_prefetch_block(&prefetched);
     format!(
         "You are an expert code reviewer working in the current local git repository.\n\
 \n\
-Review target: {target}\n\
+Review target: {target_line}\n\
+\n\
+Pre-fetched `git` summary (authoritative; do not repeat it; never reformat these lines as markdown pipe tables — they break the terminal):\n\
+```text\n\
+{fenced}\n\
+```\n\
 \n\
 Process:\n\
 1. Get the diff:\n\
@@ -239,7 +360,8 @@ Process:\n\
    `read_file` with `outline=true` instead of reading the whole file.\n\
 4. Prefer `read_file`/`grep`/`glob` over `bash` unless a shell command is truly necessary.\n\
 5. Ignore pure formatting churn and environment-only failures unrelated to the reviewed change.\n\
-6. Do not narrate your process, do not repeat the diff, and do not output XML-like tags such as `<reflect>`.\n\
+6. Do not narrate your process, do not repeat the diff or the pre-fetched stat block, and do not output XML-like tags such as `<reflect>`.\n\
+7. In your answer, avoid markdown tables and lines dominated by `|` characters.\n\
 \n\
 Output format:\n\
 - Findings: 0-3 bullets, only material issues.\n\
@@ -712,12 +834,19 @@ pub(super) async fn handle_info_command(
                 eprintln!("{}", "  Not logged in. Use /login.".yellow());
                 return Ok(());
             };
-            let prompt = build_review_prompt(arg);
-            let selector = crate::repl_runtime::create_tool_selector_quiet(api, None);
-            let mut pm = PermissionManager::with_project(
-                false,
-                &std::env::current_dir().unwrap_or_default(),
+            let project_root = std::env::current_dir().unwrap_or_default();
+            let prompt = build_review_prompt(arg, &project_root);
+            let review_label = if arg.trim().is_empty() {
+                "HEAD".to_string()
+            } else {
+                arg.trim().to_string()
+            };
+            eprintln!(
+                "\n{}",
+                format!("─── Review · {review_label} ─────────────────────────────────────").bold()
             );
+            let selector = crate::repl_runtime::create_tool_selector_quiet(api, None);
+            let mut pm = PermissionManager::with_project(false, &project_root);
             let turn_start = std::time::Instant::now();
             let sr = stream_chat_sse(ChatTurnParams {
                 api,
@@ -726,12 +855,12 @@ pub(super) async fn handle_info_command(
                 session_id: state.session_id.as_deref(),
                 model: state.model.as_deref(),
                 explain: state.explain,
-                render_md: false,
+                render_md: true,
                 history: &state.history,
                 perm_manager: &mut pm,
                 verbose_mode: state.verbose_mode,
                 quiet: false,
-                suppress_intermediate_output: true,
+                suppress_intermediate_output: false,
                 selector: &*selector.0,
                 recent_tools: &state.recent_tools,
                 tool_health_entries: &state.tool_health_entries,
@@ -748,15 +877,6 @@ pub(super) async fn handle_info_command(
             if let Some(session_id) = sr.session_id.as_deref() {
                 crate::repl_turn::initialize_journal_pub(state, session_id);
                 state.session_id = Some(session_id.to_string());
-            }
-            if !sr.full_text.trim().is_empty() {
-                crate::cli_utils::print_markdown_width(
-                    &sr.full_text,
-                    Some(crate::cli_utils::terminal_width_usize()),
-                );
-                if !sr.full_text.ends_with('\n') {
-                    println!();
-                }
             }
             state.last_response = Some(sr.full_text.clone());
             let review_input = format!("/review {arg}").trim().to_string();
@@ -1282,19 +1402,57 @@ mod tests {
 
     #[test]
     fn build_review_prompt_defaults_to_head() {
-        let prompt = build_review_prompt("");
+        let tmp = std::env::temp_dir();
+        let prompt = super::build_review_prompt("", &tmp);
         assert!(prompt.contains("Review target: HEAD"));
         assert!(prompt.contains("git_show"));
         assert!(prompt.contains("Do NOT read entire files"));
         assert!(prompt.contains("Do not narrate your process"));
+        assert!(prompt.contains("Pre-fetched"));
+        assert!(prompt.contains("```text"));
     }
 
     #[test]
     fn build_review_prompt_supports_working_tree() {
-        let prompt = build_review_prompt("working");
+        let tmp = std::env::temp_dir();
+        let prompt = super::build_review_prompt("working", &tmp);
         assert!(prompt.contains("Review target: WORKING_TREE"));
         assert!(prompt.contains("git_diff"));
         assert!(prompt.contains("stat_only:true"));
         assert!(prompt.contains("Prefer `read_file`/`grep`/`glob` over `bash`"));
+    }
+
+    #[test]
+    fn build_review_prompt_local_changes_maps_to_working_tree() {
+        let tmp = std::env::temp_dir();
+        let prompt = super::build_review_prompt("local changes", &tmp);
+        assert!(prompt.contains("Review target: WORKING_TREE"));
+    }
+
+    #[test]
+    fn parse_review_git_target_accepts_common_aliases() {
+        use super::{ReviewGitTarget, parse_review_git_target};
+        assert_eq!(parse_review_git_target(""), ReviewGitTarget::Head);
+        assert_eq!(parse_review_git_target("latest"), ReviewGitTarget::Head);
+        assert_eq!(
+            parse_review_git_target("latest commit"),
+            ReviewGitTarget::Head
+        );
+        assert_eq!(
+            parse_review_git_target("last commit"),
+            ReviewGitTarget::Head
+        );
+        assert_eq!(
+            parse_review_git_target("local changes"),
+            ReviewGitTarget::WorkingTree
+        );
+        assert_eq!(
+            parse_review_git_target("LOCAL"),
+            ReviewGitTarget::WorkingTree
+        );
+        assert_eq!(
+            parse_review_git_target("abc123"),
+            ReviewGitTarget::Rev("abc123")
+        );
     }
 }

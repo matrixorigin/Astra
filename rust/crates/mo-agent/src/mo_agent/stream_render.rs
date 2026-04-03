@@ -762,7 +762,9 @@ fn truncate_cli_status_detail(s: &str, max_chars: usize) -> String {
     }
     format!(
         "{}…",
-        t.chars().take(max_chars.saturating_sub(1)).collect::<String>()
+        t.chars()
+            .take(max_chars.saturating_sub(1))
+            .collect::<String>()
     )
 }
 
@@ -1706,10 +1708,25 @@ impl StreamRenderState {
         };
         if self.md.is_some() {
             self.stop_tool_stderr_running();
+            // Keep the same tool label as the in-flight spinner (`Git show …`, `Git diff …`) so
+            // stderr is not only anonymous +/- counts and paths.
+            let description = self.format_tool_description(tool, args);
+            let dur_display = if duration_suffix.is_empty() {
+                String::new()
+            } else {
+                format!("{}", duration_suffix.dim())
+            };
+            let mut out_lines = 1usize;
+            if status == "error" {
+                eprintln!("  {} {}{}", "✗".red(), description, dur_display);
+            } else {
+                eprintln!("  {} {}{}", "⬢".green(), description, dur_display);
+            }
             if !line.is_empty() {
                 eprintln!("{line}");
-                self.stderr_lines += 1;
+                out_lines = out_lines.saturating_add(line.matches('\n').count() + 1);
             }
+            self.stderr_lines = self.stderr_lines.saturating_add(out_lines);
             return;
         }
         self.stop_tool_stdout_anim();
@@ -1801,8 +1818,15 @@ impl StreamRenderState {
                 Some(parts.join("\n    "))
             }
             "git_show" | "git_diff" => {
-                let additions = output.lines().filter(|l| l.starts_with('+')).count();
-                let deletions = output.lines().filter(|l| l.starts_with('-')).count();
+                // Ignore diff file headers (`+++ b/…`, `--- a/…`) so counts match real hunks.
+                let additions = output
+                    .lines()
+                    .filter(|l| l.starts_with('+') && !l.starts_with("+++"))
+                    .count();
+                let deletions = output
+                    .lines()
+                    .filter(|l| l.starts_with('-') && !l.starts_with("---"))
+                    .count();
                 // Extract changed file names only from +++ b/ lines (not diff --git headers)
                 let files: Vec<&str> = output
                     .lines()

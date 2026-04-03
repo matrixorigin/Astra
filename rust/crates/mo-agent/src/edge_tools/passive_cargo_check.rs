@@ -179,6 +179,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn injects_on_compile_error_after_tool_round() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -207,6 +208,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn tool_executor_write_file_triggers_passive_flush() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -238,6 +240,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn no_message_when_check_passes() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
