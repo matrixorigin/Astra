@@ -15,7 +15,8 @@ pub mod sse_events;
 
 use self::circuit_breaker::{BridgeHealthMetrics, CircuitBreaker};
 pub use self::rate_limit_cooldown::{
-    CooldownReason, RateLimitAction, RateLimitCooldown, RateLimitMetrics, RateLimitState,
+    CooldownReason, PerModelCooldown, RateLimitAction, RateLimitCooldown, RateLimitMetrics,
+    RateLimitState,
 };
 
 /// Header allow-list predicate: only `x-mo-*` and `authorization` headers

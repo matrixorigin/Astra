@@ -52,6 +52,8 @@ pub(super) struct EdgeSseContext<'a> {
     /// When hiding assistant text (plan-only), still show `reasoning_delta` in the thinking viewport.
     pub show_reasoning_preview: bool,
     pub perm_manager: Option<&'a mut crate::permission_manager::PermissionManager>,
+    /// Optional cancellation token to abort SSE stream on auth failure.
+    pub cancel_token: Option<&'a tokio_util::sync::CancellationToken>,
 }
 
 // ─── CLI SSE stream host ─────────────────────────────────────────────────────
@@ -86,6 +88,8 @@ struct CliSseStreamHost<'a> {
     /// Flushed (after stripping the tags) once the closing tag arrives.
     /// Empty when not inside a tag — text goes directly to the renderer.
     xml_tag_buffer: String,
+    /// Optional cancellation token to abort SSE stream on auth failure.
+    cancel_token: Option<&'a tokio_util::sync::CancellationToken>,
 }
 
 impl<'a> CliSseStreamHost<'a> {
@@ -107,6 +111,7 @@ impl<'a> CliSseStreamHost<'a> {
             tool_work_detected: false,
             edge_tool_round: Vec::new(),
             xml_tag_buffer: String::new(),
+            cancel_token: ctx.cancel_token,
         }
     }
 
@@ -365,14 +370,33 @@ impl SseStreamHost for CliSseStreamHost<'_> {
             output: Some(output),
             duration_ms: Some(duration_ms),
         };
-        if let Err(e) = self
+        let post_result = self
             .api
             .post_tool_result(Some(self.token), Some(self.executor_id), &body)
-            .await
-            && !self.quiet
-            && !self.suppress_intermediate_output
-        {
-            eprintln!("{}", edge_sse_post_tool_result_fail_line(e).yellow());
+            .await;
+
+        if let Err(ref e) = post_result {
+            // Check if this is a 401 Unauthorized - session is invalid, abort SSE stream
+            let is_auth_failure = matches!(
+                e,
+                mo_thin_client::ThinClientError::Api { status, .. }
+                    if status.as_u16() == 401
+            );
+
+            if is_auth_failure {
+                // Cancel the SSE stream immediately - don't wait for idle timeout
+                if let Some(token) = self.cancel_token {
+                    token.cancel();
+                }
+                if !self.quiet {
+                    eprintln!(
+                        "{}",
+                        "Session expired. Please re-authenticate with `mo-agent auth login`.".red()
+                    );
+                }
+            } else if !self.quiet && !self.suppress_intermediate_output {
+                eprintln!("{}", edge_sse_post_tool_result_fail_line(e).yellow());
+            }
         }
         self.edge_tool_round.last().unwrap().clone()
     }
@@ -399,11 +423,30 @@ impl SseStreamHost for CliSseStreamHost<'_> {
             decision,
             reason: None,
         };
-        if let Err(e) = self.api.post_approval(Some(self.token), &body).await
-            && !self.quiet
-            && !self.suppress_intermediate_output
-        {
-            eprintln!("{}", edge_sse_post_approval_fail_line(e).yellow());
+        let post_result = self.api.post_approval(Some(self.token), &body).await;
+
+        if let Err(ref e) = post_result {
+            // Check if this is a 401 Unauthorized - session is invalid, abort SSE stream
+            let is_auth_failure = matches!(
+                e,
+                mo_thin_client::ThinClientError::Api { status, .. }
+                    if status.as_u16() == 401
+            );
+
+            if is_auth_failure {
+                // Cancel the SSE stream immediately - don't wait for idle timeout
+                if let Some(token) = self.cancel_token {
+                    token.cancel();
+                }
+                if !self.quiet {
+                    eprintln!(
+                        "{}",
+                        "Session expired. Please re-authenticate with `mo-agent auth login`.".red()
+                    );
+                }
+            } else if !self.quiet && !self.suppress_intermediate_output {
+                eprintln!("{}", edge_sse_post_approval_fail_line(e).yellow());
+            }
         }
         EdgeApprovalResult {
             request_id: request_id.to_string(),

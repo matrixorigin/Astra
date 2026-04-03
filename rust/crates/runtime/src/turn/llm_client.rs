@@ -21,7 +21,7 @@ use super::sse_data_lines::{
     drain_sse_data_lines, finish_sse_data_buffer, json_events_from_sse_event_block,
 };
 use crate::bridge::rate_limit_cooldown::{
-    RateLimitAction, RateLimitCooldown, is_overload_status, is_rate_limit_status,
+    PerModelCooldown, RateLimitAction, is_overload_status, is_rate_limit_status,
     parse_retry_after_ms,
 };
 use crate::prompts;
@@ -43,10 +43,10 @@ const LLM_TOTAL_BUDGET_S: u64 = 300;
 // ── Rate-Limit Cooldown ──────────────────────────────────────────────────────
 use std::sync::OnceLock;
 
-/// Global rate-limit cooldown tracker (shared across all LLM calls in this process).
-fn rate_limit_cooldown() -> &'static RateLimitCooldown {
-    static COOLDOWN: OnceLock<RateLimitCooldown> = OnceLock::new();
-    COOLDOWN.get_or_init(RateLimitCooldown::new)
+/// Per-model rate-limit cooldown tracker.
+fn rate_limit_cooldown() -> &'static PerModelCooldown {
+    static COOLDOWN: OnceLock<PerModelCooldown> = OnceLock::new();
+    COOLDOWN.get_or_init(PerModelCooldown::new)
 }
 
 #[cfg(test)]
@@ -288,6 +288,7 @@ pub(crate) async fn call_llm_and_collect(
     cancel: LlmCancel<'_>,
 ) -> Result<LlmCallResult, String> {
     let cooldown = rate_limit_cooldown();
+    let model_key = model_name;
 
     let started = Instant::now();
     let total_budget = llm_total_budget();
@@ -361,7 +362,7 @@ pub(crate) async fn call_llm_and_collect(
         let status = response.status().as_u16();
         if response.status().is_success() {
             // Success — record to cooldown tracker
-            cooldown.record_success();
+            cooldown.with(model_key, |c| c.record_success());
             let byte_stream = response.bytes_stream();
             match collect_llm_stream(byte_stream, model_name, started, cancel).await {
                 Ok(result) => return Ok(result),
@@ -422,12 +423,12 @@ pub(crate) async fn call_llm_and_collect(
 
         // Record rate-limit errors to cooldown tracker
         if is_rate_limit_status(status) {
-            let action = cooldown.record_429(retry_after_ms, has_fallback);
+            let action = cooldown.with(model_key, |c| c.record_429(retry_after_ms, has_fallback));
             mo_agent_core::agent_warn!(
                 "llm",
-                "rate limit (429): action={:?}, metrics={:?}",
+                "rate limit (429) on {}: action={:?}",
+                model_key,
                 action,
-                cooldown.metrics()
             );
             if let RateLimitAction::WaitAndRetry { delay_ms } = action {
                 sleep_ms_or_llm_cancel(delay_ms, cancel).await?;
@@ -436,12 +437,12 @@ pub(crate) async fn call_llm_and_collect(
         }
 
         if is_overload_status(status) {
-            let action = cooldown.record_529(retry_after_ms, has_fallback);
+            let action = cooldown.with(model_key, |c| c.record_529(retry_after_ms, has_fallback));
             mo_agent_core::agent_warn!(
                 "llm",
-                "server overload ({status}): action={:?}, metrics={:?}",
+                "server overload ({status}) on {}: action={:?}",
+                model_key,
                 action,
-                cooldown.metrics()
             );
             if let RateLimitAction::WaitAndRetry { delay_ms } = action {
                 sleep_ms_or_llm_cancel(delay_ms, cancel).await?;

@@ -22,7 +22,7 @@ use async_trait::async_trait;
 use serde_json::{Map, Value, json};
 use tokio::sync::Mutex as TokioMutex;
 
-use crate::bridge::rate_limit_cooldown::{RateLimitAction, RateLimitCooldown};
+use crate::bridge::rate_limit_cooldown::{PerModelCooldown, RateLimitAction};
 use crate::turn::agentic_headless_round::HeadlessStderrStyle;
 use crate::turn::agentic_loop_host::{AgenticLoopHost, AgenticLoopState, HostTurnResult};
 use crate::turn::chat_turn_sse_dispatch::ChatTurnSseAccum;
@@ -35,10 +35,10 @@ use crate::{FernetTokenEncryptor, MatrixOneSettings};
 use mo_agent_core::SharedPool;
 
 // ── Rate-Limit Cooldown ──────────────────────────────────────────────────────
-/// Global rate-limit cooldown tracker (shared with llm_client).
-fn rate_limit_cooldown() -> &'static RateLimitCooldown {
-    static COOLDOWN: OnceLock<RateLimitCooldown> = OnceLock::new();
-    COOLDOWN.get_or_init(RateLimitCooldown::new)
+/// Per-model rate-limit cooldown tracker (shared with llm_client).
+fn rate_limit_cooldown() -> &'static PerModelCooldown {
+    static COOLDOWN: OnceLock<PerModelCooldown> = OnceLock::new();
+    COOLDOWN.get_or_init(PerModelCooldown::new)
 }
 
 fn llm_cancel_for_state(state: &AgenticLoopState) -> LlmCancel<'_> {
@@ -410,7 +410,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
 
         // ── 1b. Check rate-limit cooldown and handle fallback model resolution ──
         let cooldown = rate_limit_cooldown();
-        match cooldown.check_request(has_fallback) {
+        match cooldown.with(&model_name, |c| c.check_request(has_fallback)) {
             RateLimitAction::Proceed => {}
             RateLimitAction::WaitAndRetry { delay_ms } => {
                 mo_agent_core::agent_info!(

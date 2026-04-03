@@ -241,15 +241,15 @@ const LLM_RETRY_BASE_MS: u64 = 1000;
 
 // ── Rate-Limit Cooldown ──────────────────────────────────────────────────────
 use crate::bridge::rate_limit_cooldown::{
-    RateLimitAction, RateLimitCooldown, is_overload_status, is_rate_limit_status,
+    PerModelCooldown, RateLimitAction, is_overload_status, is_rate_limit_status,
     parse_retry_after_ms,
 };
 use std::sync::OnceLock;
 
-/// Global rate-limit cooldown tracker (shared across all LLM calls in this process).
-fn rate_limit_cooldown() -> &'static RateLimitCooldown {
-    static COOLDOWN: OnceLock<RateLimitCooldown> = OnceLock::new();
-    COOLDOWN.get_or_init(RateLimitCooldown::new)
+/// Per-model rate-limit cooldown tracker.
+fn rate_limit_cooldown() -> &'static PerModelCooldown {
+    static COOLDOWN: OnceLock<PerModelCooldown> = OnceLock::new();
+    COOLDOWN.get_or_init(PerModelCooldown::new)
 }
 
 // ── System Prompt Cache ──────────────────────────────────────────────────────
@@ -458,6 +458,7 @@ async fn call_llm_stream(
     client_cancel: Option<Arc<CancellationToken>>,
 ) -> Result<impl futures_util::Stream<Item = Bytes> + Send + 'static, String> {
     let cooldown = rate_limit_cooldown();
+    let model_key = model_name;
 
     let client = reqwest::Client::builder()
         .no_proxy()
@@ -522,7 +523,7 @@ async fn call_llm_stream(
         let status = response.status().as_u16();
         if response.status().is_success() {
             // Success — record to cooldown tracker and return the stream
-            cooldown.record_success();
+            cooldown.with(model_key, |c| c.record_success());
             let byte_stream = response.bytes_stream();
             let model_name = model_name.to_string();
 
@@ -777,12 +778,12 @@ async fn call_llm_stream(
 
         // Record rate-limit errors to cooldown tracker
         if is_rate_limit_status(status) {
-            let action = cooldown.record_429(retry_after_ms, has_fallback);
+            let action = cooldown.with(model_key, |c| c.record_429(retry_after_ms, has_fallback));
             mo_agent_core::agent_warn!(
                 "llm",
-                "rate limit (429): action={:?}, metrics={:?}",
+                "rate limit (429) on {}: action={:?}",
+                model_key,
                 action,
-                cooldown.metrics()
             );
 
             // If cooldown says to wait, honor it
@@ -793,12 +794,12 @@ async fn call_llm_stream(
         }
 
         if is_overload_status(status) {
-            let action = cooldown.record_529(retry_after_ms, has_fallback);
+            let action = cooldown.with(model_key, |c| c.record_529(retry_after_ms, has_fallback));
             mo_agent_core::agent_warn!(
                 "llm",
-                "server overload ({status}): action={:?}, metrics={:?}",
+                "server overload ({status}) on {}: action={:?}",
+                model_key,
                 action,
-                cooldown.metrics()
             );
 
             // If cooldown says to wait, honor it
@@ -1001,7 +1002,7 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
 
             // Check rate-limit cooldown and handle fallback model resolution
             let cooldown = rate_limit_cooldown();
-            match cooldown.check_request(has_fallback) {
+            match cooldown.with(&model_name, |c| c.check_request(has_fallback)) {
                 RateLimitAction::Proceed => {}
                 RateLimitAction::WaitAndRetry { delay_ms } => {
                     mo_agent_core::agent_info!(

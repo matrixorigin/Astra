@@ -7,17 +7,18 @@
 //!
 //! This prevents wasting tokens and time on retry loops during rate-limit events.
 
+use std::collections::HashMap;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
-/// Default cooldown duration (10 minutes) when retry-after is unknown or too long.
-const DEFAULT_COOLDOWN_MS: u64 = 10 * 60 * 1000; // 10 minutes
+/// Default cooldown duration (2 minutes) when retry-after is unknown or too long.
+const DEFAULT_COOLDOWN_MS: u64 = 2 * 60 * 1000; // 2 minutes
 
-/// Maximum cooldown duration (30 minutes).
-const MAX_COOLDOWN_MS: u64 = 30 * 60 * 1000; // 30 minutes
+/// Maximum cooldown duration (5 minutes).
+const MAX_COOLDOWN_MS: u64 = 5 * 60 * 1000; // 5 minutes
 
 /// If retry-after is less than this, retry immediately without entering cooldown.
 const SHORT_RETRY_THRESHOLD_MS: u64 = 20 * 1000; // 20 seconds
@@ -418,6 +419,46 @@ pub fn is_rate_limit_status(status: u16) -> bool {
 /// Check if an HTTP status code indicates a server overload.
 pub fn is_overload_status(status: u16) -> bool {
     status == 529 || status == 503
+}
+
+// ── Per-Model Cooldown Registry ──────────────────────────────────────────────
+
+/// Per-model rate-limit cooldown registry.
+///
+/// Each model gets its own independent cooldown tracker so that a 429 on one
+/// model does not block requests to other models.
+pub struct PerModelCooldown {
+    map: Mutex<HashMap<String, RateLimitCooldown>>,
+}
+
+impl PerModelCooldown {
+    pub fn new() -> Self {
+        Self {
+            map: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Get or create a cooldown tracker for the given model, then run `f` on it.
+    pub fn with<F, R>(&self, model: &str, f: F) -> R
+    where
+        F: FnOnce(&RateLimitCooldown) -> R,
+    {
+        let mut map = self.map.lock().expect("per-model cooldown mutex");
+        let entry = map.entry(model.to_string()).or_default();
+        f(entry)
+    }
+
+    #[cfg(test)]
+    pub fn reset_for_tests(&self) {
+        let mut map = self.map.lock().expect("per-model cooldown mutex");
+        map.clear();
+    }
+}
+
+impl Default for PerModelCooldown {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────

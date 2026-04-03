@@ -656,6 +656,7 @@ pub(crate) async fn fetch_chat_turn_sse(
         hide_streaming_assistant_text,
         show_reasoning_preview,
         perm_manager: Some(perm_manager),
+        cancel_token,
     };
 
     let sse_mark = Instant::now();
