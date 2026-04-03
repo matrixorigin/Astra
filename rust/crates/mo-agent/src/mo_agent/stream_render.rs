@@ -1345,6 +1345,13 @@ impl StreamRenderState {
     /// Show a tool as "running" with Cursor-style description (single line).
     fn tool_start(&mut self, tool: &str, args: &Value) -> usize {
         let description = self.format_tool_description(tool, args);
+        // Always clear thinking pane before tool output, regardless of mode.
+        // ThinkingPreviewPane uses stdout (TerminalRegion), so any output to
+        // stdout or stderr will desync its cursor tracking.
+        if let Some(mut pane) = self.thinking_pane.take() {
+            pane.clear();
+        }
+        self.suppress_reasoning_viewport = true;
         if self.md.is_some() {
             self.stop_tool_stderr_running();
             if io::stderr().is_terminal() {
@@ -1356,13 +1363,6 @@ impl StreamRenderState {
             }
             return 0;
         }
-        // Clear thinking pane before tool output. Since both use TerminalRegion (stdout),
-        // they share cursor state. Clear thinking pane to avoid stale content above tools.
-        // Suppress further viewport creation so tool status updates don't get interleaved.
-        if let Some(mut pane) = self.thinking_pane.take() {
-            pane.clear();
-        }
-        self.suppress_reasoning_viewport = true;
         self.stop_tool_stdout_anim();
         let idx = {
             let mut g = self.tool_ui.lock().unwrap();
@@ -2502,6 +2502,15 @@ mod tests {
         let (h, b) = p.build_frame();
         assert_eq!(h, "... (2 lines hidden above)");
         assert_eq!(b, vec!["c".to_string(), "d".to_string()]);
+    }
+
+    #[test]
+    fn colored_string_equality() {
+        use crossterm::style::Stylize;
+        // Verify that .dim() produces consistent output for comparison
+        let s1 = format!("  {} {}", "◇".dim(), "test".dim());
+        let s2 = format!("  {} {}", "◇".dim(), "test".dim());
+        assert_eq!(s1, s2, "colored strings should be equal");
     }
 
     #[test]
