@@ -124,7 +124,10 @@ impl TaskLearningBridge for PipelineTaskLearningBridge {
         let feedback = signal.user_rating.map(|r| r as i64);
 
         // 1. EntityGraph: learn entity → domain → tools associations
+        // Guard: skip entity learning if no tools were used (prevents
+        // inflating observation_count/confidence with empty data)
         if signal.success
+            && !signal.tools_used.is_empty()
             && let Some(eg) = &self.entity_graph
         {
             let mut graph = eg.lock().unwrap_or_else(|e| e.into_inner());
@@ -137,6 +140,9 @@ impl TaskLearningBridge for PipelineTaskLearningBridge {
             }
             // Also learn from subtask titles (finer-grained entities)
             for sub in &signal.subtask_outcomes {
+                if sub.tools_used.is_empty() {
+                    continue;
+                }
                 let sub_entities = extract_entities(&sub.title);
                 if let Some(d) = domain {
                     for entity in &sub_entities {
@@ -186,8 +192,22 @@ impl TaskLearningBridge for PipelineTaskLearningBridge {
                         sub_quality,
                         feedback,
                     );
+                    lib.record_effort(
+                        &sub.tools_used,
+                        task_type,
+                        sub.retry_count,
+                        0, // per-subtask turns not tracked
+                    );
                 }
             }
+
+            // Record effort metrics for the top-level tool chain
+            lib.record_effort(
+                &signal.tools_used,
+                task_type,
+                signal.total_retries,
+                signal.total_turns,
+            );
         }
 
         // 3. ProgressiveCalibrator: record task-level correction data
@@ -355,12 +375,26 @@ impl TaskLearningBridge for PipelineTaskLearningBridge {
             0.0
         };
 
+        // Compute weighted-average retries and turns from pattern-level accumulators
+        let avg_retries = if total_attempts > 0 {
+            let total_retries: u32 = matching.iter().map(|p| p.total_retries).sum();
+            total_retries as f64 / total_attempts as f64
+        } else {
+            0.0
+        };
+        let avg_turns = if total_attempts > 0 {
+            let total_turns: u32 = matching.iter().map(|p| p.total_turns).sum();
+            total_turns as f64 / total_attempts as f64
+        } else {
+            0.0
+        };
+
         Ok(Some(TaskPatternStats {
             pattern: goal_pattern.to_string(),
             total_attempts,
             success_rate,
-            avg_retries: 0.0, // not tracked at pattern level
-            avg_turns: 0.0,   // not tracked at pattern level
+            avg_retries,
+            avg_turns,
             avg_verification_pass_rate: avg_quality,
         }))
     }

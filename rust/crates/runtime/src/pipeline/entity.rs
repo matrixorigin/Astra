@@ -329,6 +329,37 @@ impl EntityGraph {
         self.entities.is_empty()
     }
 
+    /// Remove entities whose decayed confidence falls below `min_confidence`.
+    ///
+    /// Returns the number of entities pruned. Also cleans alias_index
+    /// and dirty_entities for removed entries.
+    pub fn prune(&mut self, min_confidence: f64) -> usize {
+        let stale_keys: Vec<String> = self
+            .entities
+            .iter()
+            .filter(|(_, e)| e.decayed_confidence() < min_confidence)
+            .map(|(k, _)| k.clone())
+            .collect();
+
+        let count = stale_keys.len();
+        for key in &stale_keys {
+            if let Some(entity) = self.entities.remove(key) {
+                self.dirty_entities.remove(key);
+                // Clean alias_index for all aliases pointing to this entity
+                for alias in &entity.aliases {
+                    let lower = alias.to_lowercase();
+                    if self.alias_index.get(&lower) == Some(key) {
+                        self.alias_index.remove(&lower);
+                    }
+                }
+                // Also remove the canonical name from alias_index if present
+                self.alias_index.remove(key);
+            }
+        }
+
+        count
+    }
+
     /// Resolve an entity name through the alias index.
     fn resolve(&self, entity: &str) -> String {
         let lower = entity.to_lowercase();

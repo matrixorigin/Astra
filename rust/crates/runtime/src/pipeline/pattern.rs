@@ -71,6 +71,12 @@ pub struct ToolChainPattern {
     /// Capped at DRIFT_WINDOW_SIZE entries.
     #[serde(default)]
     recent_outcomes: Vec<bool>,
+    /// Cumulative retries across all recorded tasks (for computing average).
+    #[serde(default)]
+    pub total_retries: u32,
+    /// Cumulative execution turns across all recorded tasks (for computing average).
+    #[serde(default)]
+    pub total_turns: u32,
 }
 
 impl ToolChainPattern {
@@ -90,6 +96,8 @@ impl ToolChainPattern {
             quality_sum: 0.0,
             last_used_at: current_timestamp(),
             recent_outcomes: Vec::new(),
+            total_retries: 0,
+            total_turns: 0,
         }
     }
 
@@ -119,6 +127,24 @@ impl ToolChainPattern {
     /// Used for ranking pattern suggestions.
     pub fn score(&self) -> f64 {
         self.success_rate() * 0.6 + self.avg_quality() * 0.4
+    }
+
+    /// Average retries per task (0.0 if no observations).
+    pub fn avg_retries(&self) -> f64 {
+        let total = self.total_count();
+        if total == 0 {
+            return 0.0;
+        }
+        self.total_retries as f64 / total as f64
+    }
+
+    /// Average execution turns per task (0.0 if no observations).
+    pub fn avg_turns(&self) -> f64 {
+        let total = self.total_count();
+        if total == 0 {
+            return 0.0;
+        }
+        self.total_turns as f64 / total as f64
     }
 
     /// Time-decayed score: applies exponential decay based on staleness.
@@ -311,6 +337,59 @@ impl PatternLibrary {
 
         // Mark as dirty for delta sync
         self.dirty_patterns.insert(key);
+    }
+
+    /// Record effort metrics (retries, turns) for an existing pattern.
+    ///
+    /// Called separately from `record_outcome()` to avoid changing that
+    /// method's signature across 90+ call sites. Only task-learning callers
+    /// that have retry/turn data need to call this.
+    pub fn record_effort(
+        &mut self,
+        tools: &[String],
+        task_type: TaskType,
+        retries: u32,
+        turns: u32,
+    ) {
+        if tools.is_empty() {
+            return;
+        }
+        let sig = compute_signature(tools);
+        let key = pattern_key(&sig, task_type);
+        if let Some(pattern) = self.patterns.get_mut(&key) {
+            pattern.total_retries += retries;
+            pattern.total_turns += turns;
+            self.dirty_patterns.insert(key);
+        }
+    }
+
+    /// Remove patterns whose decayed score falls below `min_score`.
+    ///
+    /// Returns the number of patterns pruned. Cleans up type_index,
+    /// domain_index, and dirty_patterns for removed entries.
+    pub fn prune(&mut self, min_score: f64) -> usize {
+        let stale_keys: Vec<String> = self
+            .patterns
+            .iter()
+            .filter(|(_, p)| p.decayed_score() < min_score)
+            .map(|(k, _)| k.clone())
+            .collect();
+
+        let count = stale_keys.len();
+        for key in &stale_keys {
+            self.patterns.remove(key);
+            self.dirty_patterns.remove(key);
+        }
+
+        // Clean indices
+        for keys in self.type_index.values_mut() {
+            keys.retain(|k| !stale_keys.contains(k));
+        }
+        for keys in self.domain_index.values_mut() {
+            keys.retain(|k| !stale_keys.contains(k));
+        }
+
+        count
     }
 
     /// Suggest best patterns for a task type + optional domain filter.
