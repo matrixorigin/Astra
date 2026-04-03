@@ -453,8 +453,8 @@ impl SessionAuditService for DatabaseSessionAuditService {
         // Token usage aggregation for turn events
         let token_row = query(
             "SELECT \
-               COALESCE(SUM(JSON_EXTRACT(token_usage, '$.input')), 0) AS tokens_in, \
-               COALESCE(SUM(JSON_EXTRACT(token_usage, '$.output')), 0) AS tokens_out \
+               COALESCE(SUM(token_input), 0) AS tokens_in, \
+               COALESCE(SUM(token_output), 0) AS tokens_out \
              FROM agent_events \
              WHERE session_id = ? AND user_id = ? AND event_type = 'turn' AND token_usage IS NOT NULL",
         )
@@ -958,8 +958,8 @@ impl SessionAuditService for DatabaseSessionAuditService {
             "SELECT \
                s.session_id, s.status, s.created_at, s.ended_at, \
                COUNT(CASE WHEN e.event_type = 'turn' THEN 1 END) AS turn_count, \
-               COALESCE(SUM(CASE WHEN e.token_usage IS NOT NULL THEN JSON_EXTRACT(e.token_usage, '$.input') END), 0) AS tokens_in, \
-               COALESCE(SUM(CASE WHEN e.token_usage IS NOT NULL THEN JSON_EXTRACT(e.token_usage, '$.output') END), 0) AS tokens_out, \
+               COALESCE(SUM(e.token_input), 0) AS tokens_in, \
+               COALESCE(SUM(e.token_output), 0) AS tokens_out, \
                COUNT(CASE WHEN e.event_type IN ('tool_call', 'tool_error') THEN 1 END) AS tool_calls, \
                COUNT(CASE WHEN e.event_type IN ('turn_error', 'error', 'tool_error') THEN 1 END) AS error_count, \
                MIN(e.created_at) AS first_ts, \
@@ -1067,8 +1067,8 @@ impl SessionAuditService for DatabaseSessionAuditService {
             "SELECT \
                COUNT(DISTINCT e.session_id) as session_count, \
                COUNT(CASE WHEN event_type = 'turn' THEN 1 END) as total_turns, \
-               COALESCE(SUM(CASE WHEN token_usage IS NOT NULL THEN JSON_EXTRACT(token_usage, '$.input') END), 0) as tokens_in, \
-               COALESCE(SUM(CASE WHEN token_usage IS NOT NULL THEN JSON_EXTRACT(token_usage, '$.output') END), 0) as tokens_out, \
+               COALESCE(SUM(token_input), 0) as tokens_in, \
+               COALESCE(SUM(token_output), 0) as tokens_out, \
                COUNT(CASE WHEN event_type IN ('tool_call', 'tool_error') THEN 1 END) as total_tool_calls, \
                COUNT(CASE WHEN event_type = 'tool_error' THEN 1 END) as total_tool_failures, \
                COUNT(CASE WHEN event_type IN ('turn_error', 'error') THEN 1 END) as total_errors, \
@@ -1095,7 +1095,7 @@ impl SessionAuditService for DatabaseSessionAuditService {
         // Top tools (by usage count)
         let tools_sql = format!(
             "SELECT \
-               JSON_EXTRACT(metadata, '$.tool_name') as tool_name, \
+               meta_tool_name as tool_name, \
                COUNT(*) as cnt, \
                COUNT(CASE WHEN event_type = 'tool_call' THEN 1 END) as ok_cnt \
              FROM agent_events e \
@@ -1129,7 +1129,7 @@ impl SessionAuditService for DatabaseSessionAuditService {
             "SELECT \
                llm_model_used as model, \
                COUNT(DISTINCT session_id) as sess_cnt, \
-               COALESCE(SUM(JSON_EXTRACT(token_usage, '$.total')), 0) as total_tokens \
+               COALESCE(SUM(token_total), 0) as total_tokens \
              FROM agent_events e \
              WHERE {where_clause} AND llm_model_used IS NOT NULL \
              GROUP BY model \
@@ -1200,12 +1200,12 @@ impl SessionAuditService for DatabaseSessionAuditService {
                le.content AS last_error \
              FROM (\
                SELECT \
-                 JSON_EXTRACT(metadata, '$.tool_name') AS tool_name, \
+                 meta_tool_name AS tool_name, \
                  COUNT(*) AS total_calls, \
                  COUNT(CASE WHEN event_type = 'tool_call' THEN 1 END) AS total_success, \
                  COUNT(CASE WHEN event_type = 'tool_error' THEN 1 END) AS total_failures, \
-                 COALESCE(AVG(JSON_EXTRACT(metadata, '$.duration_ms')), 0) AS avg_ms, \
-                 COALESCE(MAX(JSON_EXTRACT(metadata, '$.duration_ms')), 0) AS max_ms, \
+                 COALESCE(AVG(meta_duration_ms), 0) AS avg_ms, \
+                 COALESCE(MAX(meta_duration_ms), 0) AS max_ms, \
                  COUNT(DISTINCT session_id) AS sessions_used \
                FROM agent_events e \
                WHERE {where_clause} AND event_type IN ('tool_call', 'tool_error') \
@@ -1214,9 +1214,9 @@ impl SessionAuditService for DatabaseSessionAuditService {
              LEFT JOIN (\
                SELECT tool_name, content FROM (\
                  SELECT \
-                   JSON_EXTRACT(metadata, '$.tool_name') AS tool_name, \
+                   meta_tool_name AS tool_name, \
                    content, \
-                   ROW_NUMBER() OVER (PARTITION BY JSON_EXTRACT(metadata, '$.tool_name') ORDER BY created_at DESC) AS rn \
+                   ROW_NUMBER() OVER (PARTITION BY meta_tool_name ORDER BY created_at DESC) AS rn \
                  FROM agent_events e \
                  WHERE {where_clause} AND event_type = 'tool_error'\
                ) ranked WHERE rn = 1\
