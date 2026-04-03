@@ -37,7 +37,12 @@ use axum::body::Body;
 use axum::body::Bytes;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::Response;
-use futures_util::StreamExt;
+use futures_util::{StreamExt, stream};
+
+/// Maximum number of read-only tools to execute concurrently.
+/// Prevents resource exhaustion from parallel tool execution.
+/// Matches Claude Code's default `CLAUDE_CODE_MAX_TOOL_USE_CONCURRENCY`.
+const MAX_CONCURRENT_READ_ONLY_TOOLS: usize = 10;
 use serde_json::{Map, Value, json};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -1580,17 +1585,19 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
                             yield render_sse_map(&m);
                         }
                     }
-                    let futs: Vec<_> = read_only_tcs.iter().map(|tc| {
+                    // Use buffer_unordered to limit concurrent tool executions.
+                    // This prevents resource exhaustion when many tools are called.
+                    let tool_stream = stream::iter(read_only_tcs.into_iter().map(|tc| {
                         let ledger = edge_callback_ledger.clone();
                         let uid = user_id.clone();
-                        let tc = tc.clone();
                         async move {
                             wait_tool_result_ledger_for_tool(
                                 &ledger, &uid, &tc, ledger_wait,
                             ).await
                         }
-                    }).collect();
-                    for tail in futures_util::future::join_all(futs).await {
+                    })).buffer_unordered(MAX_CONCURRENT_READ_ONLY_TOOLS);
+                    tokio::pin!(tool_stream);
+                    while let Some(tail) = tool_stream.next().await {
                         merged_tool_results.extend(tail.persist_tool_results);
                         llm_messages.extend(tail.tool_messages);
                     }
