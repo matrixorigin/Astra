@@ -14,11 +14,16 @@ use mo_agent_runtime::turn::sse_stream_host::{
 };
 use mo_agent_runtime::turn::tool_result_semantics::cloud_tool_result_status_label;
 use serde_json::Value;
-use std::borrow::Cow;
 use std::io::{IsTerminal, Write};
 use std::ops::{Deref, DerefMut};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
+
+// CLI formatting utilities
+use super::cli_formatting::{
+    colorize_diff_summary, extract_cli_diff_block, format_byte_size, format_duration_suffix,
+    shorten_path, truncate_line,
+};
 
 // Effects module types
 use super::effects::{
@@ -1250,135 +1255,6 @@ impl StreamRenderState {
         g.region.clear();
         g.lines.clear();
     }
-}
-
-/// Unified diff for CLI summaries: `str_replace` / `multi_edit` sentinels, or `write_file` JSON field.
-fn extract_cli_diff_block(output: &str) -> Option<Cow<'_, str>> {
-    let start_marker = "<<<MO_AGENT_UNIFIED_DIFF>>>";
-    let end_marker = "<<<END_MO_AGENT_UNIFIED_DIFF>>>";
-    if let Some(start) = output.find(start_marker) {
-        let after = &output[start + start_marker.len()..];
-        let end = after.find(end_marker).unwrap_or(after.len());
-        let block = after[..end].trim();
-        if !block.is_empty() {
-            return Some(Cow::Borrowed(block));
-        }
-    }
-    let v = serde_json::from_str::<Value>(output.trim()).ok()?;
-    let diff = v.get("_cli_unified_diff")?.as_str()?;
-    if diff.is_empty() {
-        return None;
-    }
-    Some(Cow::Owned(diff.to_string()))
-}
-
-/// Colorize a unified diff into a compact summary with green +lines and red -lines.
-fn colorize_diff_summary(diff: &str, max_lines: usize) -> String {
-    let mut parts = Vec::new();
-    let mut shown = 0usize;
-    let mut total_add = 0usize;
-    let mut total_del = 0usize;
-    for line in diff.lines() {
-        if line.starts_with('+') && !line.starts_with("+++ ") {
-            total_add += 1;
-            if shown < max_lines {
-                parts.push(format!("{}", truncate_line(line, 60).green()));
-                shown += 1;
-            }
-        } else if line.starts_with('-') && !line.starts_with("--- ") {
-            total_del += 1;
-            if shown < max_lines {
-                parts.push(format!("{}", truncate_line(line, 60).red()));
-                shown += 1;
-            }
-        }
-    }
-    let remaining = (total_add + total_del).saturating_sub(max_lines);
-    if remaining > 0 {
-        parts.push(format!(
-            "… {} {} (+{total_add} -{total_del} total)",
-            format!("+{remaining}").dim(),
-            "more".dim(),
-        ));
-    }
-    if parts.is_empty() {
-        return String::new();
-    }
-    parts.join("\n    ")
-}
-
-/// Format byte size as human-friendly string.
-fn format_byte_size(bytes: usize) -> String {
-    if bytes < 1024 {
-        format!("{bytes}B")
-    } else if bytes < 1024 * 1024 {
-        format!("{:.1}KB", bytes as f64 / 1024.0)
-    } else {
-        format!("{:.1}MB", bytes as f64 / (1024.0 * 1024.0))
-    }
-}
-
-/// Format duration as a human-friendly suffix for the tool description line.
-/// Only shown for durations ≥ 1s. Returns e.g. " 3.2s", " 1m 4s", " 12m 30s".
-fn format_duration_suffix(ms: u64) -> String {
-    if ms < 1_000 {
-        return String::new();
-    }
-    let secs = ms / 1_000;
-    if secs < 60 {
-        let frac = (ms % 1_000) / 100;
-        if frac > 0 {
-            format!(" {secs}.{frac}s")
-        } else {
-            format!(" {secs}s")
-        }
-    } else {
-        let m = secs / 60;
-        let s = secs % 60;
-        if s > 0 {
-            format!(" {m}m {s}s")
-        } else {
-            format!(" {m}m")
-        }
-    }
-}
-
-/// Truncate a string to max_chars, adding "…" if truncated.
-fn truncate_line(s: &str, max_chars: usize) -> String {
-    // Take first line only
-    let line = s.lines().next().unwrap_or(s);
-    if line.chars().count() <= max_chars {
-        line.to_string()
-    } else {
-        let truncated: String = line.chars().take(max_chars.saturating_sub(1)).collect();
-        format!("{truncated}…")
-    }
-}
-
-/// Shorten a path by keeping the filename and truncating dir prefix with "...".
-fn shorten_path(path: &str, max_chars: usize) -> String {
-    if path.chars().count() <= max_chars {
-        return path.to_string();
-    }
-    // Keep the filename (last component)
-    let parts: Vec<&str> = path.split('/').collect();
-    if parts.is_empty() {
-        return truncate_line(path, max_chars);
-    }
-    let filename = parts.last().unwrap_or(&"");
-    if filename.chars().count() >= max_chars.saturating_sub(4) {
-        // Filename itself is too long, just truncate
-        return truncate_line(filename, max_chars);
-    }
-    // Try to keep one parent dir
-    if parts.len() >= 2 {
-        let parent = parts[parts.len() - 2];
-        let short = format!(".../{parent}/{filename}");
-        if short.chars().count() <= max_chars {
-            return short;
-        }
-    }
-    format!(".../{filename}")
 }
 
 fn apply_sse_render_effects(

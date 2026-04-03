@@ -41,6 +41,8 @@ use serde::{Deserialize, Serialize};
 mod auth_flow;
 #[path = "mo_agent/chat_stream/mod.rs"]
 mod chat_stream;
+#[path = "mo_agent/cli_formatting.rs"]
+mod cli_formatting;
 #[path = "mo_agent/cli_utils.rs"]
 mod cli_utils;
 #[path = "mo_agent/command_router.rs"]
