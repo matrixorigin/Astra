@@ -520,6 +520,10 @@ struct ReplState {
     /// the verification gate is swapped per-subtask via `clone_with_gate`.
     delegation_engine:
         Option<std::sync::Arc<mo_agent_runtime::server::delegation_engine::DelegationEngine>>,
+    /// Handle for communicating with a background plan executor (Phase 3+).
+    /// When Some, a plan is running in the background and the REPL can
+    /// poll for updates via `plan_handle.try_recv()`.
+    plan_handle: Option<plan_executor::PlanExecutorHandle>,
 }
 
 impl Default for ReplState {
@@ -576,6 +580,7 @@ impl Default for ReplState {
             last_delivery_report: None,
             plan_execution_corrections: Vec::new(),
             delegation_engine: None,
+            plan_handle: None,
         }
     }
 }

@@ -313,6 +313,14 @@ pub(super) async fn handle_memory_domain_command(
                     eprintln!("  {} Plan-only chat OFF — normal agent mode.", "←".cyan());
                     return Ok(());
                 }
+                "status" => {
+                    handle_plan_status(state);
+                    return Ok(());
+                }
+                "pause" => {
+                    handle_plan_pause(state);
+                    return Ok(());
+                }
                 _ => {}
             }
 
@@ -2198,6 +2206,89 @@ fn extract_goal_pattern(goal: &str) -> String {
         "*".to_string()
     } else {
         result.join(" ")
+    }
+}
+
+// ─── /plan status|pause helpers ──────────────────────────────────────────────
+
+fn handle_plan_status(state: &ReplState) {
+    if let Some(ref plan) = state.executing_plan {
+        let pct = plan.progress_pct();
+        let total = plan.subtasks.len();
+        let done = plan.items_done() as usize;
+        let pending = total.saturating_sub(done);
+        let in_progress = plan
+            .subtasks
+            .iter()
+            .filter(|s| s.status == mo_agent_runtime::plan_decompose::TaskStatus::InProgress)
+            .count();
+
+        eprintln!("\n{}  Plan Status", "📋".cyan());
+        eprintln!("{}", "─".repeat(45).dim());
+
+        if let Some(ref goal) = state.executing_plan_goal {
+            eprintln!("  Goal: {}", goal.as_str().cyan());
+        }
+        eprintln!("  Progress: {}%  ({}/{} subtasks done)", pct, done, total);
+        if in_progress > 0 {
+            eprintln!("  In progress: {}", in_progress);
+        }
+        eprintln!("  Remaining:  {}", pending);
+
+        // Show individual subtask status
+        eprintln!();
+        for st in &plan.subtasks {
+            let icon = match st.status {
+                mo_agent_runtime::plan_decompose::TaskStatus::Completed => "✓".green().to_string(),
+                mo_agent_runtime::plan_decompose::TaskStatus::InProgress => {
+                    "▶".yellow().to_string()
+                }
+                mo_agent_runtime::plan_decompose::TaskStatus::Pending => "○".dim().to_string(),
+                mo_agent_runtime::plan_decompose::TaskStatus::Paused => "⏸".yellow().to_string(),
+                mo_agent_runtime::plan_decompose::TaskStatus::Failed => "✗".red().to_string(),
+                mo_agent_runtime::plan_decompose::TaskStatus::Cancelled => "⊘".dim().to_string(),
+            };
+            eprintln!("  {} {} [{}]", icon, st.title, st.id.as_str().dim());
+        }
+        eprintln!("{}", "─".repeat(45).dim());
+
+        if pct < 100 {
+            eprintln!(
+                "  {} Type 'continue' to resume or a message to add guidance",
+                "💡".cyan()
+            );
+        }
+    } else if let Some(ref ps) = state.plan_mode {
+        eprintln!("\n{}  Plan Mode (editing)", "📋".cyan());
+        if !ps.goal.is_empty() {
+            eprintln!("  Goal: {}", ps.goal.as_str().cyan());
+        }
+        if !ps.plan.subtasks.is_empty() {
+            eprintln!(
+                "  Subtasks: {} ({}% done)",
+                ps.plan.subtasks.len(),
+                ps.plan.progress_pct()
+            );
+        } else {
+            eprintln!("  No plan generated yet");
+        }
+    } else {
+        eprintln!("  {} No active plan. Use /plan enter <goal> to create one.", "⚠".yellow());
+    }
+}
+
+fn handle_plan_pause(state: &mut ReplState) {
+    if state.executing_plan.is_some() {
+        // Signal the running plan to pause after current subtask
+        // Currently, plan execution is synchronous, so this just sets a flag
+        // that run_plan_execution checks between subtasks.
+        state.last_turn_interrupted = true;
+        eprintln!(
+            "  {} Pause requested. Plan will pause after current subtask completes.",
+            "⏸".yellow()
+        );
+    } else {
+        eprintln!("  {} No plan is currently executing.", "⚠".yellow());
     }
 }
 
