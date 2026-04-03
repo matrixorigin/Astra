@@ -510,15 +510,18 @@ fn chat_turn_sse_fetch_ui(
     }
 }
 
-/// Build JSON payload (with optional prep line), POST `/chat/turn`, return the HTTP response body stream handle.
+/// Build JSON payload (with optional prep line), POST `/chat/turn`, return response + prep guard.
+///
+/// The caller must drop [`ChatTurnPrepLineGuard`] when entering SSE consume (`consume_turn_sse`)
+/// or on early error after reading the body, so the stderr status line stays through TTFB.
 async fn chat_turn_post_payload_after_prepare(
     api: &mo_thin_client::ThinClient,
     token: &str,
     quiet: bool,
     ui: &ChatTurnSseFetchUi,
     prepare: PrepareChatTurnRequest<'_>,
-) -> Result<mo_thin_client::HttpResponse, String> {
-    let _prep_line =
+) -> Result<(mo_thin_client::HttpResponse, ChatTurnPrepLineGuard), String> {
+    let prep_line =
         ChatTurnPrepLineGuard::maybe_start(ui.show_prep_line, ui.prep_ui_phase.clone());
     let payload = prepare_chat_turn_payload(prepare).await;
 
@@ -538,7 +541,7 @@ async fn chat_turn_post_payload_after_prepare(
             .dim()
         );
     }
-    Ok(resp)
+    Ok((resp, prep_line))
 }
 
 pub(crate) async fn fetch_chat_turn_sse(
@@ -586,7 +589,7 @@ pub(crate) async fn fetch_chat_turn_sse(
         plan_assemble_line_release.as_ref(),
     );
 
-    let resp = chat_turn_post_payload_after_prepare(
+    let (resp, prep_line) = chat_turn_post_payload_after_prepare(
         api,
         token,
         quiet,
@@ -627,6 +630,7 @@ pub(crate) async fn fetch_chat_turn_sse(
 
     let status = resp.status();
     if !status.is_success() {
+        drop(prep_line);
         let body = resp.text().await.map_err(|e| e.to_string())?;
         return Err(chat_turn_http_error_with_compact_body(
             status.as_u16(),
@@ -657,6 +661,7 @@ pub(crate) async fn fetch_chat_turn_sse(
 
     let sse_mark = Instant::now();
     let turn = consume_turn_sse(
+        prep_line,
         resp,
         render_md,
         term_width,

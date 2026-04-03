@@ -515,25 +515,35 @@ impl TtftWaitLineSpinner {
                 handle: None,
             };
         }
+        let t0 = std::time::Instant::now();
+        let w = term_width();
+        let label = "Waiting for stream";
+        // Paint immediately: prep line just cleared and the first SSE byte may take seconds.
+        {
+            let time_part = format!("{:>3}s", 0u64);
+            let frame = SPINNER_FRAMES[0];
+            let visible = 2 + time_part.chars().count() + 1 + label.chars().count() + 1 + 1;
+            eprint!("\r  ");
+            eprint!("{}", time_part.dim());
+            eprint!(" {}", label.dim());
+            eprint!(" {}", format!("{frame}").yellow());
+            if visible < w {
+                eprint!("{}", " ".repeat(w - visible));
+            }
+            let _ = io::stderr().flush();
+        }
         let stop = Arc::new(AtomicBool::new(false));
         let stop2 = stop.clone();
         let handle = std::thread::spawn(move || {
-            let t0 = std::time::Instant::now();
-            // Interruptible delay — can wake early if stop is set
-            if !interruptible_sleep(
-                std::time::Duration::from_millis(SPINNER_SHOW_DELAY_MS),
-                &stop2,
-            ) {
-                return;
-            }
             let tick = std::time::Duration::from_millis(50);
-            let w = term_width();
-            let mut spin_idx = 0usize;
+            let mut spin_idx = 1usize;
             while !stop2.load(Ordering::Relaxed) {
-                spin_idx += 1;
+                if !interruptible_sleep(tick, &stop2) {
+                    return;
+                }
                 let sec = t0.elapsed().as_secs();
                 let frame = SPINNER_FRAMES[spin_idx % SPINNER_FRAMES.len()];
-                let label = "Waiting for stream";
+                spin_idx += 1;
                 let time_part = format!("{:>3}s", sec);
                 let visible = 2 + time_part.chars().count() + 1 + label.chars().count() + 1 + 1;
                 eprint!("\r  ");
@@ -544,7 +554,6 @@ impl TtftWaitLineSpinner {
                     eprint!("{}", " ".repeat(w - visible));
                 }
                 let _ = io::stderr().flush();
-                std::thread::sleep(tick);
             }
         });
         Self {
@@ -1882,6 +1891,7 @@ fn apply_sse_render_effects(
 /// If `cancel_token` is provided, the stream can be cancelled mid-flight by triggering the token.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn consume_turn_sse(
+    prep_line: ChatTurnPrepLineGuard,
     resp: mo_thin_client::HttpResponse,
     render_md: bool,
     term_width: usize,
@@ -1891,6 +1901,10 @@ pub(super) async fn consume_turn_sse(
     pre_clear_lines: usize,
     cancel_token: Option<&tokio_util::sync::CancellationToken>,
 ) -> TurnResult {
+    // Release the payload/HTTP prep line here so TTFT (`on_before_sse_read_loop`) can take over
+    // on the same stderr row without a multi‑hundred‑ms blank gap.
+    drop(prep_line);
+
     // Convert reqwest byte stream to runtime's generic chunk type
     let mut byte_stream = Box::pin(
         resp.bytes_stream()
