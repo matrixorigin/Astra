@@ -85,3 +85,4 @@ review/
 # fixtures/vcr_cassettes/*.yaml
 *.spec
 .mo-session/
+rust/budget-app/
