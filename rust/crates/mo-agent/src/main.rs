@@ -2317,7 +2317,7 @@ async fn run_plan_execution_with_sink(
 
         // Mark any in-progress subtasks as completed (just finished by previous chat turn).
         // Run verification if durable contract is active to avoid bypassing the gate.
-        let mut completed_titles: Vec<String> = Vec::new();
+        let mut completed_items: Vec<(String, String)> = Vec::new(); // (id, title)
         let in_progress_ids: Vec<String> = plan
             .subtasks
             .iter()
@@ -2365,30 +2365,30 @@ async fn run_plan_execution_with_sink(
             if let Some(st) = plan.subtasks.iter_mut().find(|s| s.id == *st_id) {
                 if verification_passed {
                     st.status = TaskStatus::Completed;
-                    completed_titles.push(st.title.clone());
+                    completed_items.push((st_id.clone(), st.title.clone()));
                 } else if let Some(ref durable) = state.durable_task_state {
                     if durable_bridge::subtask_retries_exhausted(durable, st_id) {
-                        sink.subtask_verification_failed(&st.title, true);
+                        sink.subtask_verification_failed(st_id, &st.title, true);
                         st.status = TaskStatus::Completed;
-                        completed_titles.push(st.title.clone());
+                        completed_items.push((st_id.clone(), st.title.clone()));
                     } else {
-                        sink.subtask_verification_failed(&st.title, false);
+                        sink.subtask_verification_failed(st_id, &st.title, false);
                         st.status = TaskStatus::Pending;
                     }
                 } else {
-                    sink.subtask_verification_failed(&st.title, false);
+                    sink.subtask_verification_failed(st_id, &st.title, false);
                     st.status = TaskStatus::Pending;
                 }
             }
         }
-        for title in &completed_titles {
+        for (id, title) in &completed_items {
             let pct = plan.progress_pct();
             let elapsed = subtask_start.map(|s| {
                 let d = s.elapsed();
                 subtask_durations.push(d);
                 d
             });
-            sink.subtask_completed(title, pct, elapsed);
+            sink.subtask_completed(id, title, pct, elapsed);
         }
 
         // Force checkpoint after verification state changes to prevent data loss.
@@ -2800,14 +2800,14 @@ async fn run_plan_execution_with_sink(
                 } else if let Some(ref durable) = state.durable_task_state {
                     if durable_bridge::subtask_retries_exhausted(durable, next_id) {
                         // Exhausted retry budget — force complete to unblock the plan
-                        sink.subtask_verification_failed(&st.title, true);
+                        sink.subtask_verification_failed(next_id, &st.title, true);
                         st.status = TaskStatus::Completed;
                     } else {
-                        sink.subtask_verification_failed(&st.title, false);
+                        sink.subtask_verification_failed(next_id, &st.title, false);
                         st.status = TaskStatus::Pending;
                     }
                 } else {
-                    sink.subtask_verification_failed(&st.title, false);
+                    sink.subtask_verification_failed(next_id, &st.title, false);
                     st.status = TaskStatus::Pending;
                 }
 
@@ -2819,7 +2819,7 @@ async fn run_plan_execution_with_sink(
                         subtask_durations.push(d);
                         d
                     });
-                    sink.subtask_completed(&title, pct, elapsed);
+                    sink.subtask_completed(next_id, &title, pct, elapsed);
                 }
 
                 // Journal: subtask completed (or verification-failed)

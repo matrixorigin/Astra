@@ -93,10 +93,10 @@ pub trait PlanOutputSink {
     );
 
     /// A subtask completed (verification passed).
-    fn subtask_completed(&self, title: &str, pct: u32, elapsed: Option<Duration>);
+    fn subtask_completed(&self, id: &str, title: &str, pct: u32, elapsed: Option<Duration>);
 
     /// Subtask verification failed — will retry or force complete.
-    fn subtask_verification_failed(&self, title: &str, retries_exhausted: bool);
+    fn subtask_verification_failed(&self, id: &str, title: &str, retries_exhausted: bool);
 
     /// Plan completed at 100%.
     fn plan_completed(&self, summary: &str, elapsed: Duration);
@@ -157,7 +157,7 @@ impl PlanOutputSink for StderrSink {
         );
     }
 
-    fn subtask_completed(&self, title: &str, pct: u32, elapsed: Option<Duration>) {
+    fn subtask_completed(&self, _id: &str, title: &str, pct: u32, elapsed: Option<Duration>) {
         let elapsed_str = elapsed
             .map(|d| format!(" ({})", super::format_duration_short(d)))
             .unwrap_or_default();
@@ -170,7 +170,7 @@ impl PlanOutputSink for StderrSink {
         );
     }
 
-    fn subtask_verification_failed(&self, title: &str, retries_exhausted: bool) {
+    fn subtask_verification_failed(&self, _id: &str, title: &str, retries_exhausted: bool) {
         if retries_exhausted {
             eprintln!(
                 "  {}  Subtask verification failed after max retries, forcing complete: {}",
@@ -257,10 +257,12 @@ impl PlanOutputSink for StderrSink {
 
 /// Sends plan progress as [`PlanUpdate`] messages through an mpsc channel.
 /// Used when plan execution runs as a background task.
+#[allow(dead_code)]
 pub struct ChannelSink {
     tx: tokio::sync::mpsc::UnboundedSender<PlanUpdate>,
 }
 
+#[allow(dead_code)]
 impl ChannelSink {
     pub fn new(tx: tokio::sync::mpsc::UnboundedSender<PlanUpdate>) -> Self {
         Self { tx }
@@ -290,9 +292,9 @@ impl PlanOutputSink for ChannelSink {
         });
     }
 
-    fn subtask_completed(&self, title: &str, pct: u32, elapsed: Option<Duration>) {
+    fn subtask_completed(&self, id: &str, title: &str, pct: u32, elapsed: Option<Duration>) {
         self.send(PlanUpdate::SubtaskCompleted {
-            id: String::new(),
+            id: id.to_string(),
             title: title.to_string(),
             pct,
             elapsed,
@@ -300,9 +302,9 @@ impl PlanOutputSink for ChannelSink {
         });
     }
 
-    fn subtask_verification_failed(&self, title: &str, retries_exhausted: bool) {
+    fn subtask_verification_failed(&self, id: &str, title: &str, retries_exhausted: bool) {
         self.send(PlanUpdate::SubtaskRetry {
-            id: String::new(),
+            id: id.to_string(),
             title: title.to_string(),
             retries_exhausted,
         });
@@ -363,6 +365,7 @@ impl PlanOutputSink for ChannelSink {
 ///
 /// - `update_rx`: receive progress/completion updates from the executor
 /// - `cmd_tx`: send pause/resume/cancel commands to the executor
+#[allow(dead_code)]
 pub struct PlanExecutorHandle {
     pub update_rx: tokio::sync::mpsc::UnboundedReceiver<PlanUpdate>,
     pub cmd_tx: tokio::sync::mpsc::UnboundedSender<PlanCommand>,
@@ -374,6 +377,7 @@ pub struct PlanExecutorHandle {
 /// - `handle` goes to the REPL loop
 /// - `update_tx` is wrapped in a `ChannelSink` for the executor
 /// - `cmd_rx` goes to the executor to receive commands
+#[allow(dead_code)]
 pub fn create_plan_channels() -> (
     PlanExecutorHandle,
     tokio::sync::mpsc::UnboundedSender<PlanUpdate>,
@@ -384,6 +388,7 @@ pub fn create_plan_channels() -> (
     (PlanExecutorHandle { update_rx, cmd_tx }, update_tx, cmd_rx)
 }
 
+#[allow(dead_code)]
 impl PlanExecutorHandle {
     /// Non-blocking check: try to receive a plan update without waiting.
     pub fn try_recv(&mut self) -> Option<PlanUpdate> {
@@ -450,7 +455,14 @@ mod tests {
 
         // Verify we got 3 updates
         let u1 = rx.try_recv().unwrap();
-        assert!(matches!(u1, PlanUpdate::SubtaskStarted { index: 1, total: 5, .. }));
+        assert!(matches!(
+            u1,
+            PlanUpdate::SubtaskStarted {
+                index: 1,
+                total: 5,
+                ..
+            }
+        ));
         let u2 = rx.try_recv().unwrap();
         assert!(matches!(u2, PlanUpdate::PlanCompleted { pct: 100, .. }));
         let u3 = rx.try_recv().unwrap();
