@@ -1874,18 +1874,16 @@ fn build_learning_bridge(
     let eg = state.entity_graph.as_ref()?;
     let pl = state.pattern_library.as_ref()?;
     let cal = state.calibrator.as_ref()?;
-    let mut bridge = mo_agent_runtime::pipeline::task_learning::PipelineTaskLearningBridge::from_shared(
-        eg.clone(),
-        pl.clone(),
-        cal.clone(),
-    );
+    let mut bridge =
+        mo_agent_runtime::pipeline::task_learning::PipelineTaskLearningBridge::from_shared(
+            eg.clone(),
+            pl.clone(),
+            cal.clone(),
+        );
     // Wire cloud pool for template persistence
     if let Some(mc) = &state.matrix_runtime {
         let pool = mc.shared_pool().get().clone();
-        let user_id = state
-            .ingestion_user_id
-            .as_deref()
-            .unwrap_or("anonymous");
+        let user_id = state.ingestion_user_id.as_deref().unwrap_or("anonymous");
         bridge = bridge.with_cloud_pool(pool, user_id);
     }
     Some(std::sync::Arc::new(bridge))
@@ -2055,15 +2053,14 @@ async fn run_plan_execution(
                     durable_bridge::subtask_verification_json(durable, st_id)
                 && let Some(ref mut j) = state.journal
             {
-                let evt =
-                    mo_agent_services::session_journal::JournalEvent::verification_completed(
-                        state.session_id.as_deref(),
-                        state.turn,
-                        st_id,
-                        "subtask",
-                        verification_passed,
-                        &results_json,
-                    );
+                let evt = mo_agent_services::session_journal::JournalEvent::verification_completed(
+                    state.session_id.as_deref(),
+                    state.turn,
+                    st_id,
+                    "subtask",
+                    verification_passed,
+                    &results_json,
+                );
                 let _ = j.append(&evt);
                 repl_turn::enqueue_ingestion_pub(state, &evt);
             }
@@ -2498,14 +2495,15 @@ async fn run_plan_execution(
                         durable_bridge::subtask_verification_json(durable, next_id)
                     && let Some(ref mut j) = state.journal
                 {
-                    let evt = mo_agent_services::session_journal::JournalEvent::verification_completed(
-                        state.session_id.as_deref(),
-                        state.turn,
-                        next_id,
-                        "subtask",
-                        verification_passed,
-                        &results_json,
-                    );
+                    let evt =
+                        mo_agent_services::session_journal::JournalEvent::verification_completed(
+                            state.session_id.as_deref(),
+                            state.turn,
+                            next_id,
+                            "subtask",
+                            verification_passed,
+                            &results_json,
+                        );
                     let _ = j.append(&evt);
                     repl_turn::enqueue_ingestion_pub(state, &evt);
                 }
@@ -3433,7 +3431,7 @@ async fn handle_slash_command(
         }
 
         "/memory" | "/plan" => {
-            handle_memory_domain_command(cmd, arg, api, state, token, profile, selector).await?;
+            handle_memory_domain_command(cmd, arg, api, state, token).await?;
         }
 
         "/task" => {
@@ -3758,15 +3756,8 @@ async fn run_chat_repl(
                     }
                 } else if state.plan_mode.is_some() {
                     // Plan mode: handle input as plan editing
-                    handle_plan_mode_input(
-                        line.clone(),
-                        current_token.as_deref(),
-                        &mut state,
-                        api,
-                        profile,
-                        &*selector,
-                    )
-                    .await?;
+                    handle_plan_mode_input(line.clone(), current_token.as_deref(), &mut state, api)
+                        .await?;
 
                     // If plan execution was just triggered, run the auto-execution loop
                     if state.executing_plan.is_some() {
@@ -3893,8 +3884,6 @@ async fn run_chat_repl(
                                     current_token.as_deref(),
                                     &mut state,
                                     api,
-                                    profile,
-                                    &*selector,
                                 )
                                 .await?;
                             } else {
@@ -4986,17 +4975,12 @@ mod tests {
             ..Default::default()
         };
         // This should not panic or error
-        let selector = tool_selector::TfIdfSelector::new(tool_registry::ToolRegistry::new(
-            edge_tools::all_tool_schemas(),
-        ));
         let result = handle_memory_domain_command(
             "/memory",
             "search rust preferences",
             &api,
             &mut state,
             Some("fake-token"),
-            None,
-            &selector,
         )
         .await;
         assert!(result.is_ok());

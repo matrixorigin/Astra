@@ -844,10 +844,7 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
         if let Some(ref gate) = state.checkpoint_gate {
             let freq = gate.checkpoint_frequency();
             if freq > 0 && (turn_index as u32 + 1).is_multiple_of(freq) {
-                let run_id = state
-                    .current_run_id
-                    .as_deref()
-                    .unwrap_or("unknown");
+                let run_id = state.current_run_id.as_deref().unwrap_or("unknown");
                 match gate
                     .check(run_id, turn_index as u32, state.total_tool_calls)
                     .await

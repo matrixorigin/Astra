@@ -126,7 +126,11 @@ pub fn subtask_verification_json(
     durable: &DurableTaskState,
     subtask_id: &str,
 ) -> Option<serde_json::Value> {
-    let sub = durable.contract.subtasks.iter().find(|s| s.id == subtask_id)?;
+    let sub = durable
+        .contract
+        .subtasks
+        .iter()
+        .find(|s| s.id == subtask_id)?;
     match &sub.stage {
         SubtaskStage::Verified => Some(serde_json::json!({
             "stage": "verified",
@@ -503,10 +507,7 @@ pub async fn collect_user_feedback(
     let report = durable.last_report.as_ref()?;
 
     eprintln!();
-    eprint!(
-        "  {} ",
-        "Rate this delivery (1-5, Enter to skip):".bold()
-    );
+    eprint!("  {} ", "Rate this delivery (1-5, Enter to skip):".bold());
     std::io::Write::flush(&mut std::io::stderr()).ok();
 
     let mut input = String::new();

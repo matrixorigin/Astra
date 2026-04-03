@@ -39,8 +39,6 @@ use agentic_sse_loop::{
 use cli_loop_host::CliAgenticLoopHost;
 use serde_json::json;
 
-pub(crate) use agentic_loop_turn::chat_turn_timing_stderr_enabled;
-
 pub(crate) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResult, String> {
     let start = Instant::now();
     let term_width = terminal_width_usize();

@@ -614,18 +614,19 @@ pub async fn query_similar_templates(
         let use_count: i32 = sqlx::Row::try_get(row, "use_count").unwrap_or(0);
 
         // Parse subtask_titles from template_json
-        let subtask_titles = if let Ok(json) = serde_json::from_str::<serde_json::Value>(&template_json) {
-            json.get("subtask_titles")
-                .and_then(|v| v.as_array())
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|v| v.as_str().map(String::from))
-                        .collect()
-                })
-                .unwrap_or_default()
-        } else {
-            Vec::new()
-        };
+        let subtask_titles =
+            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&template_json) {
+                json.get("subtask_titles")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|v| v.as_str().map(String::from))
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
 
         if subtask_titles.is_empty() {
             continue;
@@ -3953,18 +3954,16 @@ Done!"#;
         let ctx = ProjectContext {
             root: "/test".into(),
             languages: vec!["Rust".into()],
-            prior_templates: vec![
-                PlanTemplateHint {
-                    goal_pattern: "add jwt authentication".into(),
-                    subtask_titles: vec![
-                        "Create auth module".into(),
-                        "Add middleware".into(),
-                        "Write tests".into(),
-                    ],
-                    success_rate: 0.95,
-                    use_count: 3,
-                },
-            ],
+            prior_templates: vec![PlanTemplateHint {
+                goal_pattern: "add jwt authentication".into(),
+                subtask_titles: vec![
+                    "Create auth module".into(),
+                    "Add middleware".into(),
+                    "Write tests".into(),
+                ],
+                success_rate: 0.95,
+                use_count: 3,
+            }],
             ..Default::default()
         };
 
@@ -3981,14 +3980,8 @@ Done!"#;
             prompt.contains("Create auth module"),
             "should include subtask titles"
         );
-        assert!(
-            prompt.contains("95%"),
-            "should include success rate"
-        );
-        assert!(
-            prompt.contains("3 times"),
-            "should include use count"
-        );
+        assert!(prompt.contains("95%"), "should include success rate");
+        assert!(prompt.contains("3 times"), "should include use count");
     }
 
     #[test]

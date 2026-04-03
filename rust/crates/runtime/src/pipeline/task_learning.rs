@@ -270,12 +270,7 @@ impl TaskLearningBridge for PipelineTaskLearningBridge {
         // Persist to plan_templates table if cloud pool is available
         if let (Some(pool), Some(user_id)) = (&self.cloud_pool, &self.user_id) {
             let template_id = uuid::Uuid::new_v4().to_string();
-            let goal_pattern: String = contract
-                .goal
-                .to_lowercase()
-                .chars()
-                .take(500)
-                .collect();
+            let goal_pattern: String = contract.goal.to_lowercase().chars().take(500).collect();
             let _ = sqlx::query(
                 "INSERT INTO plan_templates (template_id, user_id, goal_pattern, template_json, success_rate, use_count) \
                  VALUES (?, ?, ?, ?, 1.0, 0) \
@@ -443,10 +438,7 @@ impl TaskLearningBridge for PipelineTaskLearningBridge {
             let intent = format!("verify_{}", signal.subtask_id);
             // Verification failure on retry = implicit correction needed
             cal.record(
-                &intent,
-                domain,
-                task_type,
-                true, // was_corrected
+                &intent, domain, task_type, true, // was_corrected
                 None,
             );
         }
