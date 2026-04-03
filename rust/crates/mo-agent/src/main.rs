@@ -2271,14 +2271,100 @@ async fn start_and_monitor_background_plan(
     api: &mo_thin_client::ThinClient,
     profile: Option<&str>,
 ) -> Result<(), String> {
+    // ── Generate durable contract if not already present ─────────
+    ensure_durable_task_state(state).await;
+
     // ── Extract context & spawn ──────────────────────────────────────
     let ctx = take_plan_context(state, api, current_token, profile)?;
     let selector = create_background_selector();
     let handle = plan_executor::spawn_plan_executor(ctx, selector);
     state.plan_handle = Some(handle);
 
-    eprintln!("{}", "  🔄 Plan executing in background — you can keep typing.".dim());
+    eprintln!(
+        "{}",
+        "  🔄 Plan executing in background — you can keep typing.".dim()
+    );
     Ok(())
+}
+
+/// Initialize `durable_task_state` on `ReplState` if it's `None` and a plan
+/// is ready for execution.  This generates a [`TaskContract`] with structured
+/// verification criteria so the background executor can gate subtask completion.
+async fn ensure_durable_task_state(state: &mut ReplState) {
+    if state.durable_task_state.is_some() {
+        return;
+    }
+    let plan = match state.executing_plan.as_ref() {
+        Some(p) => p,
+        None => return,
+    };
+
+    let goal = state
+        .executing_plan_goal
+        .as_deref()
+        .unwrap_or("Plan execution");
+    let user_id = state.ingestion_user_id.as_deref().unwrap_or("local");
+    let session_id = state.session_id.as_deref().unwrap_or("unknown");
+    let work_dir = std::env::current_dir().unwrap_or_default();
+
+    // Create session-local lifecycle for contract persistence + verification
+    let session_dir = state
+        .session_id
+        .as_ref()
+        .map(|sid| mo_agent_services::session_workspace::workspace_dir_for(sid))
+        .unwrap_or_else(|| work_dir.join(".mo-session"));
+    let lifecycle = durable_bridge::create_local_lifecycle_full(
+        &session_dir,
+        &work_dir,
+        state
+            .matrix_runtime
+            .as_ref()
+            .and_then(|mc| mc.clone_ingestion_sender()),
+        Some(session_id),
+        Some(user_id),
+        state
+            .matrix_runtime
+            .as_ref()
+            .and_then(|mc| mc.create_cloud_llm_judge())
+            .map(|j| {
+                std::sync::Arc::new(j) as std::sync::Arc<dyn mo_agent_services::LlmJudge>
+            }),
+        build_learning_bridge(state),
+    );
+
+    if let Some(contract) =
+        durable_bridge::generate_contract(&lifecycle, plan, goal, user_id, session_id, &work_dir)
+            .await
+    {
+        state.durable_task_state = Some(durable_bridge::DurableTaskState {
+            contract,
+            lifecycle,
+            last_report: None,
+        });
+
+        // Construct a delegation engine for plan execution with verification gates.
+        if state.delegation_engine.is_none() {
+            let registry = std::sync::Arc::new(tokio::sync::RwLock::new(
+                mo_agent_services::AgentProfileRegistry::new(),
+            ));
+            let run_store =
+                std::sync::Arc::new(mo_agent_services::runs::InMemoryRunStateStore::default());
+            let engine =
+                mo_agent_runtime::server::delegation_engine::DelegationEngine::with_executor(
+                    registry,
+                    std::sync::Arc::new(mo_agent_runtime::server::run_engine::RunEngine::new(
+                        run_store,
+                    )),
+                    std::sync::Arc::new(
+                        mo_agent_runtime::server::delegation_engine::DelegationTracker::new(),
+                    ),
+                    std::sync::Arc::new(
+                        mo_agent_runtime::server::delegation_engine::StubSubRunExecutor,
+                    ),
+                );
+            state.delegation_engine = Some(std::sync::Arc::new(engine));
+        }
+    }
 }
 
 /// Poll the background plan executor for updates, printing progress and
@@ -2540,77 +2626,7 @@ async fn run_plan_execution_with_sink(
     let mut subtask_start: Option<std::time::Instant> = None;
 
     // ─── Generate durable contract on first entry ────────────────────────────
-    if state.durable_task_state.is_none()
-        && let Some(ref plan) = state.executing_plan
-    {
-        let goal = state
-            .executing_plan_goal
-            .as_deref()
-            .unwrap_or("Plan execution");
-        let user_id = state.ingestion_user_id.as_deref().unwrap_or("local");
-        let session_id = state.session_id.as_deref().unwrap_or("unknown");
-        let work_dir = std::env::current_dir().unwrap_or_default();
-
-        // Create session-local lifecycle for contract persistence + verification
-        let session_dir = state
-            .session_id
-            .as_ref()
-            .map(|sid| mo_agent_services::session_workspace::workspace_dir_for(sid))
-            .unwrap_or_else(|| work_dir.join(".mo-session"));
-        let lifecycle = durable_bridge::create_local_lifecycle_full(
-            &session_dir,
-            &work_dir,
-            state
-                .matrix_runtime
-                .as_ref()
-                .and_then(|mc| mc.clone_ingestion_sender()),
-            Some(session_id),
-            Some(user_id),
-            state
-                .matrix_runtime
-                .as_ref()
-                .and_then(|mc| mc.create_cloud_llm_judge())
-                .map(|j| std::sync::Arc::new(j) as std::sync::Arc<dyn mo_agent_services::LlmJudge>),
-            build_learning_bridge(state),
-        );
-
-        if let Some(contract) = durable_bridge::generate_contract(
-            &lifecycle, plan, goal, user_id, session_id, &work_dir,
-        )
-        .await
-        {
-            state.durable_task_state = Some(durable_bridge::DurableTaskState {
-                contract,
-                lifecycle,
-                last_report: None,
-            });
-
-            // Construct a delegation engine for plan execution with verification gates.
-            // Uses StubSubRunExecutor — when a CliSubRunExecutor is wired in the
-            // future, this will enable real delegation with acceptance-criteria gates.
-            if state.delegation_engine.is_none() {
-                let registry = std::sync::Arc::new(tokio::sync::RwLock::new(
-                    mo_agent_services::AgentProfileRegistry::new(),
-                ));
-                let run_store =
-                    std::sync::Arc::new(mo_agent_services::runs::InMemoryRunStateStore::default());
-                let engine =
-                    mo_agent_runtime::server::delegation_engine::DelegationEngine::with_executor(
-                        registry,
-                        std::sync::Arc::new(mo_agent_runtime::server::run_engine::RunEngine::new(
-                            run_store,
-                        )),
-                        std::sync::Arc::new(
-                            mo_agent_runtime::server::delegation_engine::DelegationTracker::new(),
-                        ),
-                        std::sync::Arc::new(
-                            mo_agent_runtime::server::delegation_engine::StubSubRunExecutor,
-                        ),
-                    );
-                state.delegation_engine = Some(std::sync::Arc::new(engine));
-            }
-        }
-    }
+    ensure_durable_task_state(state).await;
 
     loop {
         // Take the plan out of state to avoid borrow conflicts
@@ -4414,7 +4430,7 @@ async fn run_chat_repl(
                                 Some(std::mem::take(&mut state.plan_execution_corrections))
                             },
                         });
-                        plan_monitoring_loop(&mut state).await;
+                        // Updates will appear via display_plan_updates_live in the select! loop
                     } else {
                         start_and_monitor_background_plan(
                             &mut state,
