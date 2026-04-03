@@ -2220,10 +2220,7 @@ fn take_plan_context(
     current_token: Option<&str>,
     profile: Option<&str>,
 ) -> Result<plan_executor::BackgroundPlanContext, String> {
-    let plan = state
-        .executing_plan
-        .take()
-        .ok_or("No plan to execute")?;
+    let plan = state.executing_plan.take().ok_or("No plan to execute")?;
     let token = current_token
         .ok_or("Not logged in — cannot start background plan")?
         .to_string();

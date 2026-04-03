@@ -3,7 +3,7 @@
 //! - [`PlanAssembleLineSpinner`]: Shows progress during plan assembly
 //! - [`ChatTurnPrepLineGuard`]: RAII guard for chat request preparation
 
-use super::{SPINNER_FRAMES, SPINNER_SHOW_DELAY_MS, term_width};
+use super::{SPINNER_FRAMES, SPINNER_SHOW_DELAY_MS, interruptible_sleep, term_width};
 use crossterm::style::Stylize;
 use std::io::{self, IsTerminal, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -100,8 +100,11 @@ impl PlanAssembleLineSpinner {
         let stop2 = stop.clone();
         let handle = std::thread::spawn(move || {
             let t0 = origin;
-            std::thread::sleep(std::time::Duration::from_millis(SPINNER_SHOW_DELAY_MS));
-            if stop2.load(Ordering::Relaxed) {
+            // Use interruptible sleep so stop_clear() doesn't block waiting for this delay
+            if !interruptible_sleep(
+                std::time::Duration::from_millis(SPINNER_SHOW_DELAY_MS),
+                &stop2,
+            ) {
                 return;
             }
             let poll_phase =

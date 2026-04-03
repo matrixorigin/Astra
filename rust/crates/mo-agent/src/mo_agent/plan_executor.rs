@@ -431,8 +431,8 @@ use mo_agent_runtime::plan_decompose;
 use mo_agent_runtime::tool_selector::ToolSelector;
 use mo_agent_services::task_orchestrator::{TaskPlan, TaskStatus};
 
-use crate::skill_instructions::SharedSkillRegistry;
 use crate::StreamResult;
+use crate::skill_instructions::SharedSkillRegistry;
 
 use super::chat_stream::ChatTurnParams;
 use super::durable_bridge;
@@ -721,12 +721,12 @@ async fn plan_executor_task(
                     }
 
                     // Run verification
-                    let verification_passed =
-                        if let Some(ref mut durable) = ctx.durable_task_state {
-                            durable_bridge::on_subtask_complete(durable, next_id).await
-                        } else {
-                            true
-                        };
+                    let verification_passed = if let Some(ref mut durable) = ctx.durable_task_state
+                    {
+                        durable_bridge::on_subtask_complete(durable, next_id).await
+                    } else {
+                        true
+                    };
 
                     // Update subtask status
                     if let Some(st) = ctx.plan.subtasks.iter_mut().find(|s| s.id == *next_id) {
