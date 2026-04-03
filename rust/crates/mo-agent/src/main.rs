@@ -2316,7 +2316,7 @@ async fn plan_monitoring_loop(state: &mut ReplState) {
                             eprintln!(
                                 "\n{}  [{}/{}] {}",
                                 "▸".cyan(),
-                                index + 1,
+                                index,
                                 total,
                                 title.bold(),
                             );
