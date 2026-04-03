@@ -1,10 +1,5 @@
 use super::*;
-use crossterm::{
-    QueueableCommand,
-    cursor::MoveUp,
-    style::Stylize,
-    terminal::{Clear, ClearType},
-};
+use crossterm::style::Stylize;
 use futures_util::StreamExt;
 use mo_agent_runtime::turn::chat_turn_sse_dispatch::{
     ChatTurnSseAccum, SseRenderEffect, dispatch_chat_turn_sse_event_block,
@@ -1042,12 +1037,17 @@ fn buffer_to_visual_lines(buffer: &str, w: usize) -> Vec<String> {
 }
 
 /// Redraw a stderr window: grows with content until `body_rows`, then tail + hidden count.
+/// Thinking preview pane using TerminalRegion for flicker-free stdout rendering.
+///
+/// Unlike the old stderr-based implementation, this uses stdout + TerminalRegion
+/// so it shares the same cursor coordinate space as StreamingMarkdown. This
+/// prevents the cursor desync issues that caused duplicate lines.
 struct ThinkingPreviewPane {
     body_rows: usize,
     width: usize,
     buffer: String,
-    started: bool,
-    last_drawn_rows: usize,
+    /// Region for diff-based updates (stdout).
+    region: super::terminal_region::TerminalRegion,
 }
 
 impl ThinkingPreviewPane {
@@ -1056,8 +1056,7 @@ impl ThinkingPreviewPane {
             body_rows: body_rows.max(1),
             width: width.max(20),
             buffer: String::new(),
-            started: false,
-            last_drawn_rows: 0,
+            region: super::terminal_region::TerminalRegion::new(),
         }
     }
 
@@ -1092,57 +1091,37 @@ impl ThinkingPreviewPane {
         (header, body)
     }
 
+    /// Redraw using TerminalRegion (stdout) for flicker-free diff-based updates.
     fn redraw(&mut self) {
         use crossterm::style::Stylize;
         let (header, body) = self.build_frame();
-        let header_lines = usize::from(!header.is_empty());
-        let total = header_lines + body.len();
-        let mut err = io::stderr().lock();
-        if self.started {
-            for _ in 0..self.last_drawn_rows {
-                let _ = err.queue(MoveUp(1));
-                let _ = err.queue(Clear(ClearType::CurrentLine));
-            }
-        }
-        if total == 0 {
-            let _ = err.flush();
-            self.last_drawn_rows = 0;
-            self.started = false;
+        if header.is_empty() && body.is_empty() {
+            self.region.update(Vec::new());
             return;
         }
-        if !self.started {
-            let _ = err.queue(Clear(ClearType::CurrentLine));
-        }
+        let mut lines = Vec::with_capacity(body.len() + 1);
         if !header.is_empty() {
-            let _ = writeln!(err, "{}", format!("  {header}").dim());
+            lines.push(format!("  {}", header.dim()));
         }
-        for line in &body {
-            let _ = err.queue(Clear(ClearType::CurrentLine));
+        for line in body {
             if line.is_empty() {
-                let _ = writeln!(err);
+                lines.push(String::new());
             } else {
-                let _ = writeln!(err, "{}", format!("  ◇ {line}").dim());
+                lines.push(format!("  {} {}", "◇".dim(), line.dim()));
             }
         }
-        let _ = err.flush();
-        self.last_drawn_rows = total;
-        self.started = true;
+        self.region.update(lines);
     }
 
     fn clear(&mut self) {
-        if !self.started {
-            self.buffer.clear();
-            return;
-        }
-        let mut err = io::stderr().lock();
-        for _ in 0..self.last_drawn_rows {
-            let _ = err.queue(MoveUp(1));
-            let _ = err.queue(Clear(ClearType::CurrentLine));
-        }
-        let _ = err.flush();
-        self.started = false;
-        self.last_drawn_rows = 0;
+        self.region.clear();
         self.buffer.clear();
+    }
+
+    /// Return the number of lines currently displayed.
+    #[allow(dead_code)]
+    fn height(&self) -> usize {
+        self.region.height()
     }
 }
 
@@ -1307,11 +1286,9 @@ impl StreamRenderState {
         }
         self.thinking_start.get_or_insert_with(Instant::now);
         let rows = thinking_viewport_rows();
-        // In markdown mode, use spinner instead of pane to avoid stdout/stderr cursor conflicts.
-        let use_pane = rows > 0
-            && io::stderr().is_terminal()
-            && !self.suppress_reasoning_viewport
-            && self.md.is_none();
+        // ThinkingPreviewPane now uses stdout (via TerminalRegion), so it works
+        // in both markdown and non-markdown modes without cursor conflicts.
+        let use_pane = rows > 0 && io::stdout().is_terminal() && !self.suppress_reasoning_viewport;
         if !use_pane && io::stderr().is_terminal() {
             self.thinking_spinner = Some(ThinkingSpinnerKind::Classic(Spinner::start(
                 "  Thinking".to_string(),
@@ -1323,15 +1300,11 @@ impl StreamRenderState {
         if chunk.is_empty() || self.suppress_reasoning_viewport {
             return;
         }
-        // In markdown mode, TerminalRegion uses stdout for cursor control while
-        // ThinkingPreviewPane uses stderr. Using both causes cursor desync and
-        // duplicate output. Disable thinking pane in markdown mode.
-        if self.md.is_some() {
-            return;
-        }
         self.thinking_start.get_or_insert_with(Instant::now);
         let rows = thinking_viewport_rows();
-        if rows > 0 && io::stderr().is_terminal() {
+        // ThinkingPreviewPane now uses stdout (via TerminalRegion), sharing the
+        // same cursor coordinate space as StreamingMarkdown. No more conflicts.
+        if rows > 0 && io::stdout().is_terminal() {
             if self.thinking_pane.is_none() {
                 self.thinking_pane = Some(ThinkingPreviewPane::new(rows, self.term_width));
             }
@@ -1383,10 +1356,9 @@ impl StreamRenderState {
             }
             return 0;
         }
-        // Clear thinking pane before tool output to avoid cursor desync.
-        // ThinkingPreviewPane uses MoveUp(N) for in-place redraw; if tool output
-        // is interleaved, the cursor position becomes wrong and causes duplicate lines.
-        // Suppress further viewport creation for this turn.
+        // Clear thinking pane before tool output. Since both use TerminalRegion (stdout),
+        // they share cursor state. Clear thinking pane to avoid stale content above tools.
+        // Suppress further viewport creation so tool status updates don't get interleaved.
         if let Some(mut pane) = self.thinking_pane.take() {
             pane.clear();
         }

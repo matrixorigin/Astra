@@ -191,11 +191,7 @@ impl PlanOutputSink for StderrSink {
         eprint!("{summary}");
         eprintln!(
             "{}",
-            format!(
-                "  Total elapsed: {}",
-                super::format_duration_short(elapsed)
-            )
-            .dim()
+            format!("  Total elapsed: {}", super::format_duration_short(elapsed)).dim()
         );
     }
 

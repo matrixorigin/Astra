@@ -2494,7 +2494,12 @@ async fn run_plan_execution_with_sink(
                     .filter(|s| s.status == TaskStatus::Pending)
                     .map(|s| s.id.as_str())
                     .collect();
-                sink.plan_paused(pct, blocked.len(), plan_start.elapsed(), &blocked.join(", "));
+                sink.plan_paused(
+                    pct,
+                    blocked.len(),
+                    plan_start.elapsed(),
+                    &blocked.join(", "),
+                );
 
                 // Detect and suggest replan
                 let failed: Vec<(&str, &str)> = vec![];
@@ -2637,7 +2642,14 @@ async fn run_plan_execution_with_sink(
                 avg_dur,
                 plan_start.elapsed(),
             );
-            sink.subtask_started(&progress, done_so_far as usize, total, &group_label, &title, next_id);
+            sink.subtask_started(
+                &progress,
+                done_so_far as usize,
+                total,
+                &group_label,
+                &title,
+                next_id,
+            );
 
             // Start timing for this subtask
             subtask_start = Some(std::time::Instant::now());
