@@ -1307,7 +1307,11 @@ impl StreamRenderState {
         }
         self.thinking_start.get_or_insert_with(Instant::now);
         let rows = thinking_viewport_rows();
-        let use_pane = rows > 0 && io::stderr().is_terminal() && !self.suppress_reasoning_viewport;
+        // In markdown mode, use spinner instead of pane to avoid stdout/stderr cursor conflicts.
+        let use_pane = rows > 0
+            && io::stderr().is_terminal()
+            && !self.suppress_reasoning_viewport
+            && self.md.is_none();
         if !use_pane && io::stderr().is_terminal() {
             self.thinking_spinner = Some(ThinkingSpinnerKind::Classic(Spinner::start(
                 "  Thinking".to_string(),
@@ -1317,6 +1321,12 @@ impl StreamRenderState {
 
     fn push_thinking_preview_chunk(&mut self, chunk: &str) {
         if chunk.is_empty() || self.suppress_reasoning_viewport {
+            return;
+        }
+        // In markdown mode, TerminalRegion uses stdout for cursor control while
+        // ThinkingPreviewPane uses stderr. Using both causes cursor desync and
+        // duplicate output. Disable thinking pane in markdown mode.
+        if self.md.is_some() {
             return;
         }
         self.thinking_start.get_or_insert_with(Instant::now);
