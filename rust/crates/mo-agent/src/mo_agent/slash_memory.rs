@@ -2273,7 +2273,10 @@ fn handle_plan_status(state: &ReplState) {
             eprintln!("  No plan generated yet");
         }
     } else {
-        eprintln!("  {} No active plan. Use /plan enter <goal> to create one.", "⚠".yellow());
+        eprintln!(
+            "  {} No active plan. Use /plan enter <goal> to create one.",
+            "⚠".yellow()
+        );
     }
 }
 

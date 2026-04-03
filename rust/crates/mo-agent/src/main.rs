@@ -51,6 +51,8 @@ mod diff_presenter;
 mod durable_bridge;
 #[path = "mo_agent/edge_lifecycle.rs"]
 mod edge_lifecycle;
+#[path = "mo_agent/effects/mod.rs"]
+mod effects;
 #[path = "mo_agent/permission_manager.rs"]
 mod permission_manager;
 #[path = "mo_agent/plan_executor.rs"]
@@ -523,6 +525,7 @@ struct ReplState {
     /// Handle for communicating with a background plan executor (Phase 3+).
     /// When Some, a plan is running in the background and the REPL can
     /// poll for updates via `plan_handle.try_recv()`.
+    #[allow(dead_code)]
     plan_handle: Option<plan_executor::PlanExecutorHandle>,
 }
 

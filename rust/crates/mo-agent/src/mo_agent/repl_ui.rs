@@ -550,7 +550,9 @@ fn slash_argument_hint(command: &str) -> Option<&'static str> {
         "/skill system" => Some("<name|list>"),
         "/memory" => Some("[list|search <q>|inspect <id>]"),
         "/diff" => Some("[staged|unstaged|stat|show <rev>|help|<paths…>]"),
-        "/plan" => Some("[on|off|status|pause|resume|enter <goal>|auto|exit|decompose|show|set|clear]"),
+        "/plan" => {
+            Some("[on|off|status|pause|resume|enter <goal>|auto|exit|decompose|show|set|clear]")
+        }
         "/task" => Some("[list|add <title>|done <id>|status <id>]"),
         "/resume" => Some("[session_id]"),
         "/stats" => Some("[history]"),
