@@ -1373,6 +1373,14 @@ impl StreamRenderState {
             }
             return 0;
         }
+        // Clear thinking pane before tool output to avoid cursor desync.
+        // ThinkingPreviewPane uses MoveUp(N) for in-place redraw; if tool output
+        // is interleaved, the cursor position becomes wrong and causes duplicate lines.
+        // Suppress further viewport creation for this turn.
+        if let Some(mut pane) = self.thinking_pane.take() {
+            pane.clear();
+        }
+        self.suppress_reasoning_viewport = true;
         self.stop_tool_stdout_anim();
         let idx = {
             let mut g = self.tool_ui.lock().unwrap();
