@@ -400,8 +400,49 @@ const SPINNER_FRAMES: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦
 /// Don't show a spinner for very short pauses; they feel like visual noise.
 const SPINNER_SHOW_DELAY_MS: u64 = 350;
 
+/// Poll interval for interruptible delays (allows early exit on stop signal).
+const INTERRUPTIBLE_POLL_MS: u64 = 20;
+
 /// Skip `● Thought for …` when thinking was shorter than this (reduces stderr churn).
 const MIN_THOUGHT_DURATION_LOG_SECS: f64 = 1.5;
+
+/// Minimum terminal width for clear-line operations.
+const MIN_TERM_WIDTH: usize = 20;
+/// Maximum terminal width for clear-line operations (avoid huge allocations).
+const MAX_TERM_WIDTH: usize = 512;
+
+/// Clear the current stderr line (carriage return + spaces + carriage return).
+fn clear_stderr_line() {
+    let w = crossterm::terminal::size()
+        .map(|(c, _)| c as usize)
+        .unwrap_or(80)
+        .clamp(MIN_TERM_WIDTH, MAX_TERM_WIDTH);
+    eprint!("\r{}\r", " ".repeat(w));
+    let _ = io::stderr().flush();
+}
+
+/// Return terminal width, clamped to reasonable bounds.
+fn term_width() -> usize {
+    crossterm::terminal::size()
+        .map(|(c, _)| c as usize)
+        .unwrap_or(80)
+        .clamp(MIN_TERM_WIDTH, MAX_TERM_WIDTH)
+}
+
+/// Sleep for the given duration, but wake early if `stop` becomes true.
+/// Returns true if sleep completed normally, false if interrupted early.
+fn interruptible_sleep(duration: std::time::Duration, stop: &AtomicBool) -> bool {
+    let poll = std::time::Duration::from_millis(INTERRUPTIBLE_POLL_MS);
+    let deadline = std::time::Instant::now() + duration;
+    while std::time::Instant::now() < deadline {
+        if stop.load(Ordering::Relaxed) {
+            return false;
+        }
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        std::thread::sleep(remaining.min(poll));
+    }
+    !stop.load(Ordering::Relaxed)
+}
 
 /// A spinner that runs in a background thread.
 pub(super) struct Spinner {
@@ -415,8 +456,11 @@ impl Spinner {
         let stop = Arc::new(AtomicBool::new(false));
         let stop2 = stop.clone();
         let handle = std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_millis(SPINNER_SHOW_DELAY_MS));
-            if stop2.load(Ordering::Relaxed) {
+            // Interruptible delay — can wake early if stop is set
+            if !interruptible_sleep(
+                std::time::Duration::from_millis(SPINNER_SHOW_DELAY_MS),
+                &stop2,
+            ) {
                 return;
             }
             let mut idx = 0usize;
@@ -444,13 +488,7 @@ impl Spinner {
         if let Some(h) = self.handle.take() {
             let _ = h.join();
         }
-        // Clear the spinner line (match real terminal width — hard-coded 80 left ghost chars on wide terms)
-        let w = crossterm::terminal::size()
-            .map(|(c, _)| c as usize)
-            .unwrap_or(80)
-            .clamp(20, 512);
-        eprint!("\r{}\r", " ".repeat(w));
-        let _ = io::stderr().flush();
+        clear_stderr_line();
     }
 }
 
@@ -481,15 +519,15 @@ impl TtftWaitLineSpinner {
         let stop2 = stop.clone();
         let handle = std::thread::spawn(move || {
             let t0 = std::time::Instant::now();
-            std::thread::sleep(std::time::Duration::from_millis(SPINNER_SHOW_DELAY_MS));
-            if stop2.load(Ordering::Relaxed) {
+            // Interruptible delay — can wake early if stop is set
+            if !interruptible_sleep(
+                std::time::Duration::from_millis(SPINNER_SHOW_DELAY_MS),
+                &stop2,
+            ) {
                 return;
             }
             let tick = std::time::Duration::from_millis(50);
-            let w = crossterm::terminal::size()
-                .map(|(c, _)| c as usize)
-                .unwrap_or(80)
-                .clamp(20, 512);
+            let w = term_width();
             let mut spin_idx = 0usize;
             while !stop2.load(Ordering::Relaxed) {
                 spin_idx += 1;
@@ -520,12 +558,7 @@ impl TtftWaitLineSpinner {
         if let Some(h) = self.handle.take() {
             let _ = h.join();
         }
-        let w = crossterm::terminal::size()
-            .map(|(c, _)| c as usize)
-            .unwrap_or(80)
-            .clamp(20, 512);
-        eprint!("\r{}\r", " ".repeat(w));
-        let _ = io::stderr().flush();
+        clear_stderr_line();
     }
 }
 
@@ -538,13 +571,15 @@ impl Drop for TtftWaitLineSpinner {
     }
 }
 
-/// Which spinner is shown in the single “thinking” stderr slot (classic prefix+braille vs TTFT elapsed line).
-enum ThinkingSpinnerSlot {
+/// Which kind of spinner is shown in the single "thinking" stderr slot.
+enum ThinkingSpinnerKind {
+    /// Classic prefix+braille spinner (e.g., "  🔧 read_file ⣾").
     Classic(Spinner),
+    /// TTFT elapsed line spinner (e.g., "  3s Waiting for stream ⣾").
     TtftWait(TtftWaitLineSpinner),
 }
 
-impl ThinkingSpinnerSlot {
+impl ThinkingSpinnerKind {
     fn stop_clear(self) {
         match self {
             Self::Classic(s) => s.stop_clear(),
@@ -955,7 +990,7 @@ pub(super) struct StreamRenderState {
     /// True while showing the pre-TTFT “waiting for model” spinner (skip thought-duration log).
     waiting_for_first_sse: bool,
     thinking_start: Option<Instant>,
-    thinking_spinner: Option<ThinkingSpinnerSlot>,
+    thinking_spinner: Option<ThinkingSpinnerKind>,
     /// stderr preview for `reasoning_delta`: grows until viewport cap, then tail + hidden count (see `MO_AGENT_THINKING_VIEWPORT_LINES`).
     thinking_pane: Option<ThinkingPreviewPane>,
     /// Lines written to the terminal during streaming (stdout + stderr).
@@ -1044,7 +1079,7 @@ impl StreamRenderState {
         }
         self.waiting_for_first_sse = true;
         self.thinking_start.get_or_insert_with(Instant::now);
-        self.thinking_spinner = Some(ThinkingSpinnerSlot::TtftWait(TtftWaitLineSpinner::start()));
+        self.thinking_spinner = Some(ThinkingSpinnerKind::TtftWait(TtftWaitLineSpinner::start()));
     }
 
     fn start_thinking(&mut self) {
@@ -1059,7 +1094,7 @@ impl StreamRenderState {
         let rows = thinking_viewport_rows();
         let use_pane = rows > 0 && io::stderr().is_terminal() && !self.suppress_reasoning_viewport;
         if !use_pane && io::stderr().is_terminal() {
-            self.thinking_spinner = Some(ThinkingSpinnerSlot::Classic(Spinner::start(
+            self.thinking_spinner = Some(ThinkingSpinnerKind::Classic(Spinner::start(
                 "  Thinking".to_string(),
             )));
         }
