@@ -17,6 +17,7 @@ use crossterm::style::Stylize;
 
 /// Events emitted by the plan executor through the mpsc channel.
 #[derive(Debug, Clone)]
+#[allow(dead_code)] // Fields read by REPL monitoring loop via pattern match
 pub enum PlanUpdate {
     SubtaskStarted {
         id: String,
@@ -79,6 +80,7 @@ pub enum PlanUpdate {
 
 /// Commands sent from the REPL to a background plan executor.
 #[derive(Debug, Clone)]
+#[allow(dead_code)] // Variants used progressively as features are wired
 pub enum PlanCommand {
     Pause,
     Resume {
@@ -413,6 +415,7 @@ impl PlanExecutorHandle {
     }
 
     /// Check if the executor has finished (channel closed).
+    #[allow(dead_code)]
     pub fn is_finished(&self) -> bool {
         self.update_rx.is_closed()
     }
@@ -439,6 +442,7 @@ use super::permission_manager::PermissionManager;
 ///
 /// All fields are owned (no lifetimes) so the struct is `Send + 'static`.
 /// Created by [`spawn_plan_executor`] which takes these fields from ReplState.
+#[allow(dead_code)] // Some fields reserved for future plan features
 pub(super) struct BackgroundPlanContext {
     pub api: mo_thin_client::ThinClient,
     pub token: String,
@@ -706,7 +710,7 @@ async fn plan_executor_task(
                     });
 
                     // Update recent_tools from result
-                    let used: Vec<String> = result.tools_used.iter().cloned().collect();
+                    let used: Vec<String> = result.tools_used.to_vec();
                     if !used.is_empty() {
                         ctx.recent_tools = used;
                     }

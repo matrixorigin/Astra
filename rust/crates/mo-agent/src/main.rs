@@ -524,10 +524,9 @@ struct ReplState {
     /// the verification gate is swapped per-subtask via `clone_with_gate`.
     delegation_engine:
         Option<std::sync::Arc<mo_agent_runtime::server::delegation_engine::DelegationEngine>>,
-    /// Handle for communicating with a background plan executor (Phase 3+).
+    /// Handle for communicating with a background plan executor.
     /// When Some, a plan is running in the background and the REPL can
     /// poll for updates via `plan_handle.try_recv()`.
-    #[allow(dead_code)]
     plan_handle: Option<plan_executor::PlanExecutorHandle>,
 }
 
@@ -2208,10 +2207,197 @@ pub(crate) fn format_duration_short(d: std::time::Duration) -> String {
     }
 }
 
+// ═══════════════════════════════════ Background Plan Execution Wiring ═════
+
+/// Extract a [`BackgroundPlanContext`] from the current REPL state.
+///
+/// Moves the active plan, durable task state, and corrections out of `state`
+/// (using `take()`), and clones the remaining fields needed by the background
+/// executor.  On success `state.executing_plan` will be `None`.
+fn take_plan_context(
+    state: &mut ReplState,
+    api: &mo_thin_client::ThinClient,
+    current_token: Option<&str>,
+    profile: Option<&str>,
+) -> Result<plan_executor::BackgroundPlanContext, String> {
+    let plan = state
+        .executing_plan
+        .take()
+        .ok_or("No plan to execute")?;
+    let token = current_token
+        .ok_or("Not logged in — cannot start background plan")?
+        .to_string();
+
+    Ok(plan_executor::BackgroundPlanContext {
+        api: api.clone(),
+        token,
+        profile: profile.map(|p| p.to_string()),
+        model: state.model.clone(),
+        plan,
+        plan_goal: state.executing_plan_goal.clone(),
+        plan_corrections: std::mem::take(&mut state.plan_execution_corrections),
+        history: state.history.clone(),
+        session_id: state.session_id.clone(),
+        recent_tools: state.recent_tools.clone(),
+        tool_health_entries: state.tool_health_entries.clone(),
+        skill_registry: state.skill_registry.clone(),
+        delegation_engine: state.delegation_engine.clone(),
+        durable_task_state: state.durable_task_state.take(),
+        workspace_root: std::env::current_dir().unwrap_or_default(),
+    })
+}
+
+/// Create a fresh `Box<dyn ToolSelector>` for the background plan executor.
+///
+/// The selector is independent of the REPL's selector so the background task
+/// does not share mutable TF-IDF state with foreground turns.
+fn create_background_selector() -> Box<dyn tool_selector::ToolSelector> {
+    let all_schemas = edge_tools::all_tool_schemas();
+    let mut registry = tool_registry::ToolRegistry::new(all_schemas);
+    let mut plugin_registry = tool_registry::PluginRegistry::new();
+    manifest_loader::load_skills_directory(&mut plugin_registry);
+    registry.register_plugins(&plugin_registry);
+    Box::new(tool_selector::TfIdfSelector::new(registry))
+}
+
+/// Spawn a background plan executor and enter a monitoring loop that displays
+/// progress until the plan completes, pauses, or errors.
+///
+/// This replaces the old synchronous `run_plan_execution`: the actual execution
+/// happens in a spawned `tokio` task, while this function polls updates and
+/// forwards Ctrl-C as a pause command.
+async fn start_and_monitor_background_plan(
+    state: &mut ReplState,
+    current_token: Option<&str>,
+    api: &mo_thin_client::ThinClient,
+    profile: Option<&str>,
+) -> Result<(), String> {
+    // ── Extract context & spawn ──────────────────────────────────────
+    let ctx = take_plan_context(state, api, current_token, profile)?;
+    let selector = create_background_selector();
+    let handle = plan_executor::spawn_plan_executor(ctx, selector);
+    state.plan_handle = Some(handle);
+
+    // ── Monitor loop: poll updates + Ctrl-C handling ─────────────────
+    plan_monitoring_loop(state).await;
+
+    Ok(())
+}
+
+/// Poll the background plan executor for updates, printing progress and
+/// handling completion/pause/error.  Returns when the plan finishes,
+/// pauses, or encounters an error.
+///
+/// Ctrl-C is intercepted and forwarded as [`PlanCommand::Pause`].
+async fn plan_monitoring_loop(state: &mut ReplState) {
+    use plan_executor::{PlanCommand, PlanUpdate};
+
+    loop {
+        let handle = match state.plan_handle.as_mut() {
+            Some(h) => h,
+            None => return,
+        };
+
+        tokio::select! {
+            biased;
+
+            // ── Ctrl-C → Pause ───────────────────────────────────────
+            _ = tokio::signal::ctrl_c() => {
+                let _ = handle.send_command(PlanCommand::Pause);
+                eprintln!("\n{}  Sending pause to background plan...", "⏸".yellow());
+            }
+
+            // ── Poll channel with short sleep ────────────────────────
+            _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {
+                // Drain all available updates
+                while let Some(update) = handle.try_recv() {
+                    match update {
+                        PlanUpdate::SubtaskStarted { title, index, total, .. } => {
+                            eprintln!(
+                                "\n{}  [{}/{}] {}",
+                                "▸".cyan(),
+                                index + 1,
+                                total,
+                                title.bold(),
+                            );
+                        }
+                        PlanUpdate::SubtaskCompleted { id, verification_passed, elapsed, .. } => {
+                            let dur = elapsed
+                                .map(|d| format!(" ({})", format_duration_short(d)))
+                                .unwrap_or_default();
+                            if verification_passed {
+                                eprintln!("  {} {}{}", "✅".green(), id, dur.dim());
+                            } else {
+                                eprintln!("  {} {} — verification failed{}", "⚠".yellow(), id, dur.dim());
+                            }
+                        }
+                        PlanUpdate::SubtaskTurnResult { subtask_id, prompt_tokens, completion_tokens, .. } => {
+                            state.total_prompt_tokens += prompt_tokens;
+                            state.total_completion_tokens += completion_tokens;
+                            state.turn += 1;
+                            state.current_plan_subtask_id = Some(subtask_id);
+                        }
+                        PlanUpdate::PlanProgress { done, total, elapsed, .. } => {
+                            let pct = if total > 0 { done * 100 / total } else { 0 };
+                            eprintln!(
+                                "  📊 {}/{} ({}%) — {}",
+                                done,
+                                total,
+                                pct,
+                                format_duration_short(elapsed).dim(),
+                            );
+                        }
+                        PlanUpdate::PlanCompleted { pct, elapsed } => {
+                            eprintln!(
+                                "\n{}  Plan complete — {}% verified in {}",
+                                "🏁".green(),
+                                pct,
+                                format_duration_short(elapsed),
+                            );
+                            state.executing_plan = None;
+                            state.current_plan_subtask_id = None;
+                            state.plan_handle = None;
+                            return;
+                        }
+                        PlanUpdate::PlanError { error } => {
+                            eprintln!(
+                                "\n{}  Plan error: {}",
+                                "❌".red(),
+                                error,
+                            );
+                            state.executing_plan = None;
+                            state.current_plan_subtask_id = None;
+                            state.plan_handle = None;
+                            return;
+                        }
+                        PlanUpdate::PlanPaused { pct, remaining, elapsed } => {
+                            eprintln!(
+                                "\n{}  Plan paused — {}% done, {} remaining ({})",
+                                "⏸".yellow(),
+                                pct,
+                                remaining,
+                                format_duration_short(elapsed),
+                            );
+                            // Don't clear the handle — user can resume
+                            return;
+                        }
+                        _ => {} // LlmStreaming, ToolCall, etc. — future use
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Run the plan auto-execution loop: iterate through ready subtasks,
 /// send each as a chat message, mark done, continue until all done or blocked.
 ///
 /// Uses a take-modify-put pattern to avoid borrow conflicts with handle_chat_input.
+///
+/// **Legacy**: Kept as a synchronous fallback. The primary path now uses
+/// [`start_and_monitor_background_plan`] which spawns the executor in a
+/// separate tokio task.
+#[allow(dead_code)]
 async fn run_plan_execution(
     state: &mut ReplState,
     current_token: Option<&str>,
@@ -2230,6 +2416,7 @@ async fn run_plan_execution(
     .await
 }
 
+#[allow(dead_code)]
 async fn run_plan_execution_with_sink(
     state: &mut ReplState,
     current_token: Option<&str>,
@@ -4033,14 +4220,13 @@ async fn run_chat_repl(
                         );
                     }
 
-                    // If /plan auto triggered execution, start the auto-execution loop
+                    // If /plan auto triggered execution, start the background executor
                     if state.executing_plan.is_some() && state.plan_mode.is_none() {
-                        run_plan_execution(
+                        start_and_monitor_background_plan(
                             &mut state,
                             current_token.as_deref(),
                             api,
                             profile,
-                            &*selector,
                         )
                         .await?;
                     }
@@ -4049,14 +4235,13 @@ async fn run_chat_repl(
                     handle_plan_mode_input(line.clone(), current_token.as_deref(), &mut state, api)
                         .await?;
 
-                    // If plan execution was just triggered, run the auto-execution loop
+                    // If plan execution was just triggered, start the background executor
                     if state.executing_plan.is_some() {
-                        run_plan_execution(
+                        start_and_monitor_background_plan(
                             &mut state,
                             current_token.as_deref(),
                             api,
                             profile,
-                            &*selector,
                         )
                         .await?;
                     }
@@ -4065,14 +4250,26 @@ async fn run_chat_repl(
                     // Resume paused plan execution
                     eprintln!();
                     eprintln!("{}  Resuming plan execution...", "▶".cyan());
-                    run_plan_execution(
-                        &mut state,
-                        current_token.as_deref(),
-                        api,
-                        profile,
-                        &*selector,
-                    )
-                    .await?;
+                    // If the background handle still exists (paused task waiting for
+                    // Resume command), send Resume. Otherwise spawn a fresh executor.
+                    if let Some(ref handle) = state.plan_handle {
+                        let _ = handle.send_command(plan_executor::PlanCommand::Resume {
+                            corrections: if state.plan_execution_corrections.is_empty() {
+                                None
+                            } else {
+                                Some(std::mem::take(&mut state.plan_execution_corrections))
+                            },
+                        });
+                        plan_monitoring_loop(&mut state).await;
+                    } else {
+                        start_and_monitor_background_plan(
+                            &mut state,
+                            current_token.as_deref(),
+                            api,
+                            profile,
+                        )
+                        .await?;
+                    }
                 } else {
                     if state.executing_plan.is_some() {
                         if let Some(action) = plan_decompose::parse_plan_paused_user_line(&line) {
