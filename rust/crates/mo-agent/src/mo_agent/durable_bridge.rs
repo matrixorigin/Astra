@@ -21,6 +21,8 @@ use std::sync::Arc;
 pub struct DurableTaskState {
     pub contract: TaskContract,
     pub lifecycle: Arc<dyn DurableTaskLifecycle>,
+    /// Delivery report from the most recent `on_plan_complete()` call (if successful).
+    pub last_report: Option<TaskDeliveryReport>,
 }
 
 // ─── Contract generation ─────────────────────────────────────────────────────
@@ -331,7 +333,10 @@ pub async fn on_plan_complete(durable: &mut DurableTaskState) -> bool {
             if all_passed {
                 // Deliver the task
                 match durable.lifecycle.deliver_task(&task_id).await {
-                    Ok(report) => display_delivery_report(&report),
+                    Ok(report) => {
+                        display_delivery_report(&report);
+                        durable.last_report = Some(report);
+                    }
                     Err(e) => eprintln!("  {}  Delivery report failed: {}", "⚠".yellow(), e,),
                 }
             }
@@ -484,6 +489,70 @@ fn display_delivery_report(report: &TaskDeliveryReport) {
         "{}",
         "╚══════════════════════════════════════════════════════════╝".cyan()
     );
+}
+
+// ─── Post-delivery user feedback ─────────────────────────────────────────────
+
+/// Prompt the user for a 1–5 rating and feed it back into the learning pipeline.
+///
+/// Returns the raw rating (1–5) if the user provided one, or `None` if skipped.
+pub async fn collect_user_feedback(
+    durable: &DurableTaskState,
+    learning_bridge: Option<&std::sync::Arc<dyn mo_agent_services::TaskLearningBridge>>,
+) -> Option<u8> {
+    let report = durable.last_report.as_ref()?;
+
+    eprintln!();
+    eprint!(
+        "  {} ",
+        "Rate this delivery (1-5, Enter to skip):".bold()
+    );
+    std::io::Write::flush(&mut std::io::stderr()).ok();
+
+    let mut input = String::new();
+    if std::io::stdin().read_line(&mut input).is_err() {
+        return None;
+    }
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let rating: u8 = match trimmed.parse() {
+        Ok(r) if (1..=5).contains(&r) => r,
+        _ => {
+            eprintln!("  {}", "Skipped (expected 1-5).".dim());
+            return None;
+        }
+    };
+
+    let stars = "★".repeat(rating as usize);
+    let empty = "☆".repeat(5 - rating as usize);
+    eprintln!("  {} {}{}", "📊".cyan(), stars.yellow(), empty.dim());
+
+    // Convert 1-5 → 0-100 scale for learning pipeline
+    let rating_100 = (rating as u16 * 20).min(100) as u8;
+
+    if let Some(bridge) = learning_bridge {
+        let all_tools: Vec<String> = durable
+            .contract
+            .subtasks
+            .iter()
+            .flat_map(|s| s.tools_used.iter().cloned())
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
+            .collect();
+        let outcome = mo_agent_services::durable_task::build_outcome_signal(
+            &durable.contract,
+            report,
+            all_tools,
+            Some(rating_100),
+            durable.contract.domain_hint.clone(),
+            durable.contract.task_type.clone(),
+        );
+        let _ = bridge.learn_from_task_outcome(&outcome).await;
+    }
+
+    Some(rating)
 }
 
 // ─── Lifecycle factory ───────────────────────────────────────────────────────
@@ -1382,6 +1451,7 @@ mod tests {
         let durable = DurableTaskState {
             contract,
             lifecycle: Arc::new(StubLifecycle),
+            last_report: None,
         };
 
         // Non-existent subtask → None

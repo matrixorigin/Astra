@@ -1039,6 +1039,7 @@ async fn handle_resume_command(arg: &str, profile: Option<&str>, state: &mut Rep
                 state.durable_task_state = Some(durable_bridge::DurableTaskState {
                     contract,
                     lifecycle,
+                    last_report: None,
                 });
             }
 
@@ -1985,6 +1986,7 @@ async fn run_plan_execution(
             state.durable_task_state = Some(durable_bridge::DurableTaskState {
                 contract,
                 lifecycle,
+                last_report: None,
             });
 
             // Construct a delegation engine for plan execution with verification gates.
@@ -2198,6 +2200,12 @@ async fn run_plan_execution(
                     );
                     let _ = j.append(&evt);
                     repl_turn::enqueue_ingestion_pub(state, &evt);
+                }
+
+                // Collect user feedback on completed delivery
+                if let Some(ref durable) = state.durable_task_state {
+                    let bridge = build_learning_bridge(state);
+                    durable_bridge::collect_user_feedback(durable, bridge.as_ref()).await;
                 }
             } else {
                 let blocked: Vec<_> = plan
