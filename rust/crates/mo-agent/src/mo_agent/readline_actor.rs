@@ -64,11 +64,14 @@ impl ReadlineActor {
     /// `ExternalPrinter` that can print messages while readline blocks.
     pub fn spawn(
         mut editor: Editor<ReplHelper, FileHistory>,
-    ) -> Result<(Self, BoxedPrinter), String> {
+    ) -> Result<(Self, Option<BoxedPrinter>), String> {
         // Create the external printer BEFORE moving editor to the thread.
-        let ext_printer = editor
+        // May fail on non-TTY (e.g. piped input) — in that case we simply
+        // won't have live plan update printing during readline.
+        let ext_printer: Option<BoxedPrinter> = editor
             .create_external_printer()
-            .map_err(|e| format!("failed to create external printer: {e}"))?;
+            .ok()
+            .map(|p| Box::new(p) as BoxedPrinter);
 
         // Channels: sync mpsc for requests (main→thread), tokio mpsc for responses (thread→main).
         let (req_tx, req_rx) = std::sync::mpsc::channel::<ReadlineRequest>();
@@ -81,7 +84,7 @@ impl ReadlineActor {
             })
             .map_err(|e| format!("failed to spawn readline thread: {e}"))?;
 
-        Ok((Self { req_tx, resp_rx }, Box::new(ext_printer)))
+        Ok((Self { req_tx, resp_rx }, ext_printer))
     }
 
     /// Request the thread to read a line with the given prompt.

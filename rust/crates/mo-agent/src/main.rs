@@ -2392,9 +2392,21 @@ async fn plan_monitoring_loop(state: &mut ReplState) {
 /// inside the `select!` loop while the user is at the readline prompt.
 fn display_plan_updates_live(
     state: &mut ReplState,
-    printer: &std::sync::Mutex<readline_actor::BoxedPrinter>,
+    printer: &std::sync::Mutex<Option<readline_actor::BoxedPrinter>>,
 ) {
     use plan_executor::PlanUpdate;
+
+    // Print via ExternalPrinter if available, otherwise eprintln!.
+    let print_msg = |printer: &std::sync::Mutex<Option<readline_actor::BoxedPrinter>>,
+                     msg: String| {
+        if let Ok(mut guard) = printer.lock()
+            && let Some(ref mut p) = *guard
+        {
+            let _ = p.print(msg);
+        } else {
+            eprintln!("{msg}");
+        }
+    };
 
     let handle = match state.plan_handle.as_mut() {
         Some(h) => h,
@@ -2458,10 +2470,7 @@ fn display_plan_updates_live(
                 state.executing_plan = None;
                 state.current_plan_subtask_id = None;
                 state.plan_handle = None;
-                // Print before returning — handle is gone
-                if let Ok(mut p) = printer.lock() {
-                    let _ = p.print(msg);
-                }
+                print_msg(printer, msg);
                 return;
             }
             PlanUpdate::PlanError { error } => {
@@ -2469,9 +2478,7 @@ fn display_plan_updates_live(
                 state.executing_plan = None;
                 state.current_plan_subtask_id = None;
                 state.plan_handle = None;
-                if let Ok(mut p) = printer.lock() {
-                    let _ = p.print(msg);
-                }
+                print_msg(printer, msg);
                 return;
             }
             PlanUpdate::PlanPaused {
@@ -2487,9 +2494,7 @@ fn display_plan_updates_live(
             _ => continue, // LlmStreaming, ToolCall — future use
         };
 
-        if let Ok(mut p) = printer.lock() {
-            let _ = p.print(msg);
-        }
+        print_msg(printer, msg);
     }
 }
 /// send each as a chat message, mark done, continue until all done or blocked.
@@ -4106,8 +4111,10 @@ async fn run_chat_repl(
 
     let (editor, hist_path) = build_repl_editor()?;
     let (mut readline, ext_printer) = readline_actor::ReadlineActor::spawn(editor)?;
-    // Wrap ext_printer in Mutex so plan_monitoring_loop can use it.
-    let ext_printer = std::sync::Mutex::new(ext_printer);
+    // Wrap ext_printer in Mutex so display_plan_updates_live can use it.
+    // None when no TTY (e.g. piped) — plan updates fall back to eprintln!.
+    let ext_printer: std::sync::Mutex<Option<readline_actor::BoxedPrinter>> =
+        std::sync::Mutex::new(ext_printer);
     let mut state = initialize_repl_state(profile, initial_model);
     // Session-scoped quality tracker: tools that work well get boosted over time
     let quality_tracker = std::sync::Arc::new(std::sync::Mutex::new(
