@@ -11,12 +11,18 @@ fn format_bytes(bytes: u32) -> String {
 }
 
 fn copy_to_clipboard(text: &str) -> bool {
-    let candidates: &[(&str, &[&str])] = &[
-        ("xclip", &["-selection", "clipboard"]),
+    // Try Wayland first (if WAYLAND_DISPLAY is set), then X11 tools, then macOS.
+    let wayland = std::env::var("WAYLAND_DISPLAY").is_ok();
+    let mut candidates: Vec<(&str, &[&str])> = Vec::new();
+    if wayland {
+        candidates.push(("wl-copy", &[]));
+    }
+    candidates.extend_from_slice(&[
+        ("xclip", &["-selection", "clipboard"] as &[&str]),
         ("xsel", &["--clipboard", "--input"]),
         ("pbcopy", &[]),
-    ];
-    for (cmd, args) in candidates {
+    ]);
+    for (cmd, args) in &candidates {
         if let Ok(mut child) = SysCommand::new(cmd)
             .args(*args)
             .stdin(Stdio::piped())
