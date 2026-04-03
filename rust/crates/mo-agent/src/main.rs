@@ -1924,6 +1924,66 @@ fn eprint_plan_execution_paused_hints() {
     );
 }
 
+/// Format a progress bar line for plan execution.
+///
+/// Example: `[████████░░░░] 3/7 (42%) · ~2m14s remaining`
+fn format_plan_progress(
+    done: usize,
+    total: usize,
+    avg_duration: Option<std::time::Duration>,
+    elapsed: std::time::Duration,
+) -> String {
+    let bar_width = 16;
+    let pct = if total > 0 {
+        (done as f64 / total as f64 * 100.0) as u32
+    } else {
+        0
+    };
+    let filled = if total > 0 {
+        (done * bar_width) / total
+    } else {
+        0
+    };
+    let empty = bar_width - filled;
+    let bar = format!(
+        "{}{}",
+        "█".repeat(filled),
+        "░".repeat(empty),
+    );
+
+    let elapsed_str = format_duration_short(elapsed);
+
+    let eta_str = if done > 0 {
+        if let Some(avg) = avg_duration {
+            let remaining = total.saturating_sub(done);
+            let eta = avg * remaining as u32;
+            format!(" · ~{} remaining", format_duration_short(eta))
+        } else {
+            String::new()
+        }
+    } else {
+        String::new()
+    };
+
+    format!("[{bar}] {done}/{total} ({pct}%) · {elapsed_str} elapsed{eta_str}")
+}
+
+/// Format a Duration as a short human-readable string (e.g., "1m32s", "45s", "2h5m").
+fn format_duration_short(d: std::time::Duration) -> String {
+    let secs = d.as_secs();
+    if secs >= 3600 {
+        let h = secs / 3600;
+        let m = (secs % 3600) / 60;
+        format!("{h}h{m}m")
+    } else if secs >= 60 {
+        let m = secs / 60;
+        let s = secs % 60;
+        format!("{m}m{s}s")
+    } else {
+        format!("{secs}s")
+    }
+}
+
 /// Run the plan auto-execution loop: iterate through ready subtasks,
 /// send each as a chat message, mark done, continue until all done or blocked.
 ///
@@ -1936,6 +1996,11 @@ async fn run_plan_execution(
     selector: &dyn tool_selector::ToolSelector,
 ) -> Result<(), String> {
     use mo_agent_services::task_orchestrator::TaskStatus;
+
+    // ─── Plan execution timing & progress tracking ───────────────────────────
+    let plan_start = std::time::Instant::now();
+    let mut subtask_durations: Vec<std::time::Duration> = Vec::new();
+    let mut subtask_start: Option<std::time::Instant> = None;
 
     // ─── Generate durable contract on first entry ────────────────────────────
     if state.durable_task_state.is_none()
@@ -2097,7 +2162,16 @@ async fn run_plan_execution(
         }
         for title in &completed_titles {
             let pct = plan.progress_pct();
-            eprintln!("\n{}  Subtask done: {} ({}%)", "✓".green(), title, pct);
+            let elapsed_str = subtask_start
+                .map(|s| {
+                    let d = s.elapsed();
+                    subtask_durations.push(d);
+                    format!(" ({})", format_duration_short(d))
+                })
+                .unwrap_or_default();
+            eprintln!(
+                "\n{}  Subtask done: {} ({}%){}", "✓".green(), title, pct, elapsed_str.dim()
+            );
         }
 
         // Force checkpoint after verification state changes to prevent data loss.
@@ -2141,6 +2215,14 @@ async fn run_plan_execution(
                 let summary = plan_decompose::PlanExecutionSummary::from_plan(&plan, &goal, rounds);
                 eprintln!();
                 eprint!("{}", summary.format());
+                eprintln!(
+                    "{}",
+                    format!(
+                        "  Total elapsed: {}",
+                        format_duration_short(plan_start.elapsed())
+                    )
+                    .dim()
+                );
 
                 // Durable task: run global verification + delivery report
                 let global_passed = if let Some(ref mut durable) = state.durable_task_state {
@@ -2208,10 +2290,11 @@ async fn run_plan_execution(
                     .map(|s| s.id.as_str())
                     .collect();
                 eprintln!(
-                    "\n{}  Plan execution paused at {}%. Blocked: {}",
+                    "\n{}  Plan execution paused at {}%. Blocked: {}  {}",
                     "⏸".yellow(),
                     pct,
-                    blocked.join(", ")
+                    blocked.join(", "),
+                    format!("({})", format_duration_short(plan_start.elapsed())).dim(),
                 );
 
                 // Detect and suggest replan
@@ -2327,11 +2410,6 @@ async fn run_plan_execution(
                 }
             }
 
-            let remaining = plan
-                .subtasks
-                .iter()
-                .filter(|s| s.status == TaskStatus::Pending)
-                .count();
             let done_so_far = plan.items_done() + 1;
             let total = plan.subtasks.len();
 
@@ -2341,20 +2419,33 @@ async fn run_plan_execution(
                 String::new()
             };
 
-            let pending_tail = if remaining > 0 {
-                format!("  ·  {remaining} pending")
+            // Compute average duration from completed subtasks for ETA
+            let avg_dur = if subtask_durations.is_empty() {
+                None
             } else {
-                String::new()
+                let sum: std::time::Duration = subtask_durations.iter().sum();
+                Some(sum / subtask_durations.len() as u32)
             };
+            let progress = format_plan_progress(
+                done_so_far.saturating_sub(1) as usize,
+                total,
+                avg_dur,
+                plan_start.elapsed(),
+            );
             eprintln!(
-                "\n{}  Subtask {}/{}{}: {} [{}]{pending_tail}",
+                "\n{}  {}\n{}  Subtask {}/{}{}: {} [{}]",
+                "◆".cyan(),
+                progress.dim(),
                 "▶".cyan(),
                 done_so_far,
                 total,
                 group_label,
                 title,
-                next_id
+                next_id,
             );
+
+            // Start timing for this subtask
+            subtask_start = Some(std::time::Instant::now());
 
             // Step-by-step mode: ask user confirmation before each subtask
             let is_step_by_step = state
@@ -2538,7 +2629,17 @@ async fn run_plan_execution(
                 let title = st.title.clone();
                 let pct = plan.progress_pct();
                 if verification_passed {
-                    eprintln!("\n{}  Subtask done: {} ({}%)", "✓".green(), title, pct);
+                    let elapsed_str = subtask_start
+                        .map(|s| {
+                            let d = s.elapsed();
+                            subtask_durations.push(d);
+                            format!(" ({})", format_duration_short(d))
+                        })
+                        .unwrap_or_default();
+                    eprintln!(
+                        "\n{}  Subtask done: {} ({}%){}",
+                        "✓".green(), title, pct, elapsed_str.dim()
+                    );
                 }
 
                 // Journal: subtask completed (or verification-failed)
