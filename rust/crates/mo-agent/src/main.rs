@@ -1572,8 +1572,16 @@ fn format_sync_age(ts: &str) -> String {
 }
 
 /// Handle `/sync` command — show unified sync state across all domains.
-fn handle_sync_command(arg: &str, state: &ReplState) {
-    let show_log = arg.trim() == "log";
+/// Subcommands: `/sync push` (force push dirty domains), `/sync log` (event history).
+async fn handle_sync_command(arg: &str, state: &ReplState) {
+    let sub = arg.trim();
+
+    // /sync push — force-push all dirty domains
+    if sub == "push" {
+        return handle_sync_push(state).await;
+    }
+
+    let show_log = sub == "log";
 
     eprintln!(
         "\n{}",
@@ -1593,7 +1601,7 @@ fn handle_sync_command(arg: &str, state: &ReplState) {
         eprintln!();
         return;
     };
-    let orch = mc.sync_orchestrator_lock();
+    let orch = mc.sync_orchestrator_lock().await;
 
     // Cloud availability
     let cloud_status = if orch.is_cloud_available() {
@@ -1679,7 +1687,109 @@ fn handle_sync_command(arg: &str, state: &ReplState) {
             }
         }
     } else {
-        eprintln!("\n  {}", "Use /sync log for event history.".dim());
+        eprintln!(
+            "\n  {}",
+            "Use /sync log for event history, /sync push to force push.".dim()
+        );
+    }
+
+    eprintln!(
+        "{}",
+        "────────────────────────────────────────────────".dim()
+    );
+    eprintln!();
+}
+
+/// Force-push all dirty sync domains to cloud.
+async fn handle_sync_push(state: &ReplState) {
+    eprintln!(
+        "\n{}",
+        "─── Sync Push ──────────────────────────────────".bold()
+    );
+
+    let Some(mc) = state.matrix_runtime.as_ref() else {
+        eprintln!(
+            "  {} {}",
+            "○".dim(),
+            "No cloud connection — nothing to push.".dim()
+        );
+        eprintln!(
+            "{}",
+            "────────────────────────────────────────────────".dim()
+        );
+        eprintln!();
+        return;
+    };
+
+    let mut orch = mc.sync_orchestrator_lock().await;
+
+    // Check dirty count before push
+    let dirty_count = orch
+        .status_summary()
+        .iter()
+        .filter(|(_, s)| s.is_dirty())
+        .count();
+    if dirty_count == 0 {
+        eprintln!("  {} {}", "✓".green(), "All domains clean — nothing to push.");
+        eprintln!(
+            "{}",
+            "────────────────────────────────────────────────".dim()
+        );
+        eprintln!();
+        return;
+    }
+
+    eprintln!(
+        "  Pushing {} dirty domain{}...\n",
+        dirty_count,
+        if dirty_count == 1 { "" } else { "s" }
+    );
+
+    let results = orch.push_dirty().await;
+    drop(orch); // release lock before printing
+
+    let mut ok_count = 0usize;
+    let mut fail_count = 0usize;
+    for r in &results {
+        if r.success {
+            ok_count += 1;
+            let version_str = r
+                .version
+                .map(|v| format!("v{v}"))
+                .unwrap_or_else(|| "-".into());
+            eprintln!(
+                "  {} {:<14} {} ({}ms)",
+                "✓".green(),
+                format!("{}", r.domain).cyan(),
+                version_str.dim(),
+                r.duration_ms,
+            );
+        } else {
+            fail_count += 1;
+            let err = r.error.as_deref().unwrap_or("unknown error");
+            eprintln!(
+                "  {} {:<14} {}",
+                "✗".red(),
+                format!("{}", r.domain).cyan(),
+                err.red(),
+            );
+        }
+    }
+
+    eprintln!();
+    if fail_count == 0 {
+        eprintln!(
+            "  {} {} domain{} pushed successfully.",
+            "✓".green().bold(),
+            ok_count,
+            if ok_count == 1 { "" } else { "s" }
+        );
+    } else {
+        eprintln!(
+            "  {} pushed, {} failed.",
+            format!("{ok_count} ✓").green(),
+            format!("{fail_count} ✗").red(),
+        );
     }
 
     eprintln!(
@@ -3567,7 +3677,7 @@ async fn handle_slash_command(
         }
 
         "/sync" => {
-            handle_sync_command(arg, state);
+            handle_sync_command(arg, state).await;
         }
 
         "/diff" => {
@@ -4042,7 +4152,7 @@ async fn run_chat_repl(
                             state.cloud_learning_version = Some(new_version);
                             // Update orchestrator envelope to reflect the push
                             if let Some(ref mc) = state.matrix_runtime {
-                                let orch = mc.sync_orchestrator_lock();
+                                let orch = mc.sync_orchestrator_lock().await;
                                 if let Some(mut env) =
                                     orch.envelope(mo_agent_services::SyncDomain::Learning)
                                 {

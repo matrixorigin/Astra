@@ -4,6 +4,7 @@
 
 use std::collections::{BTreeMap, HashSet};
 use std::sync::{Arc, Mutex};
+use tokio::sync::Mutex as TokioMutex;
 
 use mo_agent_core::{MatrixOneSettings, SharedPool};
 use mo_agent_services::{
@@ -41,7 +42,7 @@ pub fn matrix_settings_from_env() -> MatrixOneSettings {
 pub struct MatrixCloudRuntime {
     shared_pool: SharedPool,
     ingestion: Mutex<Option<mo_agent_services::event_ingestion::IngestionSender>>,
-    sync_orchestrator: Mutex<SyncOrchestrator>,
+    sync_orchestrator: TokioMutex<SyncOrchestrator>,
     /// Edge preference map (same `Arc` as [`PreferenceAdapter`] inside the orchestrator).
     preference_store: Arc<Mutex<BTreeMap<String, String>>>,
     /// Cached plan templates from last `pull_domain(Templates)`.
@@ -122,7 +123,7 @@ impl MatrixCloudRuntime {
         Self {
             shared_pool,
             ingestion: Mutex::new(Some(sender)),
-            sync_orchestrator: Mutex::new(orch),
+            sync_orchestrator: TokioMutex::new(orch),
             preference_store,
             template_cache,
             lease_hold_cache,
@@ -198,10 +199,10 @@ impl MatrixCloudRuntime {
         }
     }
 
-    pub fn sync_orchestrator_lock(&self) -> std::sync::MutexGuard<'_, SyncOrchestrator> {
-        self.sync_orchestrator
-            .lock()
-            .expect("sync orchestrator mutex poisoned")
+    pub async fn sync_orchestrator_lock(
+        &self,
+    ) -> tokio::sync::MutexGuard<'_, SyncOrchestrator> {
+        self.sync_orchestrator.lock().await
     }
 }
 

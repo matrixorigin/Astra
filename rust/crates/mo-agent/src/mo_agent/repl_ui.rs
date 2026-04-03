@@ -44,7 +44,7 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/tools", "Tool performance: calls, timing, success rate"),
     ("/health", "Tool health dashboard"),
     ("/learn", "Learning insights: patterns, drift, exploration"),
-    ("/sync", "Cloud sync status across all domains"),
+    ("/sync", "Cloud sync status and push"),
     // ── Advanced ──────────────────────────────────────────────────────────
     ("/doctor", "Run diagnostics"),
     ("/version", "Show version info"),
@@ -180,7 +180,7 @@ const SLASH_FIRST_TOKEN_COMPLETIONS: &[(&str, &[(&str, &str)])] = &[
         &[("history", "Aggregate stats across recent sessions")],
     ),
     ("/health", &[("detail", "Per-tool health breakdown")]),
-    ("/sync", &[("log", "Recent sync event log")]),
+    ("/sync", &[("log", "Recent sync event log"), ("push", "Force push dirty domains to cloud")]),
     (
         "/learn",
         &[
@@ -545,7 +545,7 @@ fn slash_argument_hint(command: &str) -> Option<&'static str> {
         "/resume" => Some("[session_id]"),
         "/stats" => Some("[history]"),
         "/health" => Some("[detail]"),
-        "/sync" => Some("[log]"),
+        "/sync" => Some("[log|push]"),
         _ => None,
     }
 }
