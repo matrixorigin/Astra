@@ -497,8 +497,7 @@ impl TtftWaitLineSpinner {
                 let frame = SPINNER_FRAMES[spin_idx % SPINNER_FRAMES.len()];
                 let label = "Waiting for stream";
                 let time_part = format!("{:>3}s", sec);
-                let visible =
-                    2 + time_part.chars().count() + 1 + label.chars().count() + 1 + 1;
+                let visible = 2 + time_part.chars().count() + 1 + label.chars().count() + 1 + 1;
                 eprint!("\r  ");
                 eprint!("{}", time_part.dim());
                 eprint!(" {}", label.dim());

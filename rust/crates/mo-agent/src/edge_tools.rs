@@ -76,7 +76,7 @@ pub fn all_tool_schemas() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "bash",
-                "description": "Execute a shell command in the project root. Use for builds, tests, installs, and other CLI tasks. For read-only git inspection use git_status, git_diff (full patch or stat_only:true for per-file counts), git_show, git_log — do NOT use bash for `git status`, `git diff`, or `git log` when those tools apply. Can run curl, GitHub API, etc. Timeout varies (5-30s); override with timeout.",
+                "description": "Execute a shell command in the project root. Use for builds, tests, installs, and other CLI tasks. FORBIDDEN for git inspection — NEVER use bash for `git status`, `git diff`, `git log`, `git show`, or similar git commands. Use git_status, git_diff, git_log, git_show tools instead. Can run curl, GitHub API, etc. Timeout varies (5-30s); override with timeout.",
                 "parameters": {
                     "type": "object",
                     "properties": {
