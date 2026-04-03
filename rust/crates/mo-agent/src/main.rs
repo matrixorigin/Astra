@@ -374,7 +374,7 @@ pub(crate) type VerdictEvent =
     mo_agent_runtime::turn::agentic_verdict_audit::AgenticVerdictAuditEvent;
 
 #[derive(Debug)]
-struct StreamResult {
+pub(crate) struct StreamResult {
     session_id: Option<String>,
     run_id: Option<String>,
     full_text: String,
@@ -2155,7 +2155,7 @@ fn eprint_plan_execution_paused_hints() {
 /// Format a progress bar line for plan execution.
 ///
 /// Example: `[████████░░░░] 3/7 (42%) · ~2m14s remaining`
-fn format_plan_progress(
+pub(crate) fn format_plan_progress(
     done: usize,
     total: usize,
     avg_duration: Option<std::time::Duration>,
@@ -2193,7 +2193,7 @@ fn format_plan_progress(
 }
 
 /// Format a Duration as a short human-readable string (e.g., "1m32s", "45s", "2h5m").
-fn format_duration_short(d: std::time::Duration) -> String {
+pub(crate) fn format_duration_short(d: std::time::Duration) -> String {
     let secs = d.as_secs();
     if secs >= 3600 {
         let h = secs / 3600;

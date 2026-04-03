@@ -2,19 +2,21 @@
 //!
 //! Provides the [`PlanOutputSink`] trait to decouple plan execution progress
 //! reporting from the terminal. The default [`StderrSink`] writes directly to
-//! stderr (current behavior); a future channel-based sink will route updates
-//! through `tokio::sync::mpsc` for background execution.
+//! stderr (current behavior); [`ChannelSink`] routes updates through
+//! `tokio::sync::mpsc` for background execution.
+//!
+//! The [`spawn_plan_executor`] function extracts owned data from the REPL,
+//! spawns a `tokio` task that iterates subtasks via `stream_chat_sse`, and
+//! returns a [`PlanExecutorHandle`] for the REPL to poll for updates.
 
 use std::time::Duration;
 
 use crossterm::style::Stylize;
 
-// ─── Plan Update Events (future channel protocol) ────────────────────────────
+// ─── Plan Update Events (channel protocol) ───────────────────────────────────
 
-/// Events emitted by the plan executor. Currently unused (sink trait used
-/// instead), but defines the wire format for the Phase 2 channel protocol.
+/// Events emitted by the plan executor through the mpsc channel.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub enum PlanUpdate {
     SubtaskStarted {
         id: String,
@@ -59,11 +61,24 @@ pub enum PlanUpdate {
     StepByStepPrompt {
         title: String,
     },
+    /// A subtask's LLM turn completed — carries the StreamResult fields
+    /// needed by the REPL to update history, journal, etc.
+    SubtaskTurnResult {
+        subtask_id: String,
+        full_text: String,
+        prompt_tokens: u64,
+        completion_tokens: u64,
+        tool_calls_count: u32,
+        session_id: Option<String>,
+    },
+    /// Fatal error in the background executor.
+    PlanError {
+        error: String,
+    },
 }
 
-/// Commands sent from the REPL to a background plan executor (Phase 2+).
+/// Commands sent from the REPL to a background plan executor.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub enum PlanCommand {
     Pause,
     Resume {
@@ -257,12 +272,10 @@ impl PlanOutputSink for StderrSink {
 
 /// Sends plan progress as [`PlanUpdate`] messages through an mpsc channel.
 /// Used when plan execution runs as a background task.
-#[allow(dead_code)]
 pub struct ChannelSink {
     tx: tokio::sync::mpsc::UnboundedSender<PlanUpdate>,
 }
 
-#[allow(dead_code)]
 impl ChannelSink {
     pub fn new(tx: tokio::sync::mpsc::UnboundedSender<PlanUpdate>) -> Self {
         Self { tx }
@@ -365,7 +378,6 @@ impl PlanOutputSink for ChannelSink {
 ///
 /// - `update_rx`: receive progress/completion updates from the executor
 /// - `cmd_tx`: send pause/resume/cancel commands to the executor
-#[allow(dead_code)]
 pub struct PlanExecutorHandle {
     pub update_rx: tokio::sync::mpsc::UnboundedReceiver<PlanUpdate>,
     pub cmd_tx: tokio::sync::mpsc::UnboundedSender<PlanCommand>,
@@ -377,7 +389,6 @@ pub struct PlanExecutorHandle {
 /// - `handle` goes to the REPL loop
 /// - `update_tx` is wrapped in a `ChannelSink` for the executor
 /// - `cmd_rx` goes to the executor to receive commands
-#[allow(dead_code)]
 pub fn create_plan_channels() -> (
     PlanExecutorHandle,
     tokio::sync::mpsc::UnboundedSender<PlanUpdate>,
@@ -388,7 +399,6 @@ pub fn create_plan_channels() -> (
     (PlanExecutorHandle { update_rx, cmd_tx }, update_tx, cmd_rx)
 }
 
-#[allow(dead_code)]
 impl PlanExecutorHandle {
     /// Non-blocking check: try to receive a plan update without waiting.
     pub fn try_recv(&mut self) -> Option<PlanUpdate> {
@@ -405,6 +415,398 @@ impl PlanExecutorHandle {
     /// Check if the executor has finished (channel closed).
     pub fn is_finished(&self) -> bool {
         self.update_rx.is_closed()
+    }
+}
+
+// ─── Background Plan Execution ───────────────────────────────────────────────
+
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use mo_agent_runtime::pipeline::persistence::ToolHealthEntry;
+use mo_agent_runtime::plan_decompose;
+use mo_agent_runtime::tool_selector::ToolSelector;
+use mo_agent_services::task_orchestrator::{TaskPlan, TaskStatus};
+
+use crate::skill_instructions::SharedSkillRegistry;
+use crate::StreamResult;
+
+use super::chat_stream::ChatTurnParams;
+use super::durable_bridge;
+use super::permission_manager::PermissionManager;
+
+/// Owned state extracted from ReplState for the background plan executor task.
+///
+/// All fields are owned (no lifetimes) so the struct is `Send + 'static`.
+/// Created by [`spawn_plan_executor`] which takes these fields from ReplState.
+pub(super) struct BackgroundPlanContext {
+    pub api: mo_thin_client::ThinClient,
+    pub token: String,
+    pub profile: Option<String>,
+    pub model: Option<String>,
+    pub plan: TaskPlan,
+    pub plan_goal: Option<String>,
+    pub plan_corrections: Vec<String>,
+    pub history: Vec<(String, String)>,
+    pub session_id: Option<String>,
+    pub recent_tools: Vec<String>,
+    pub tool_health_entries: Vec<ToolHealthEntry>,
+    pub skill_registry: SharedSkillRegistry,
+    pub delegation_engine:
+        Option<Arc<mo_agent_runtime::server::delegation_engine::DelegationEngine>>,
+    pub durable_task_state: Option<durable_bridge::DurableTaskState>,
+    pub workspace_root: PathBuf,
+}
+
+/// Spawn a background plan executor task.
+///
+/// Extracts the plan and related context from `ctx`, creates the executor
+/// channels, and spawns a `tokio` task that iterates subtasks.
+///
+/// Returns a [`PlanExecutorHandle`] for the REPL to poll for updates and
+/// send commands. The `TaskPlan` is moved into the spawned task and will
+/// be returned via `PlanUpdate::PlanCompleted` when execution finishes.
+pub(super) fn spawn_plan_executor(
+    ctx: BackgroundPlanContext,
+    selector: Box<dyn ToolSelector>,
+) -> PlanExecutorHandle {
+    let (handle, update_tx, cmd_rx) = create_plan_channels();
+
+    tokio::spawn(async move {
+        plan_executor_task(ctx, selector, update_tx, cmd_rx).await;
+    });
+
+    handle
+}
+
+/// The background plan executor task body.
+///
+/// Iterates over plan subtask groups in dependency order. For each subtask:
+/// 1. Sends `PlanUpdate::SubtaskStarted`
+/// 2. Calls `stream_chat_sse` to execute the LLM turn with tools
+/// 3. Runs verification (if durable contract is active)
+/// 4. Sends `PlanUpdate::SubtaskCompleted` or `SubtaskRetry`
+/// 5. Checks command channel for Pause/Cancel between subtasks
+///
+/// On completion, sends `PlanUpdate::PlanCompleted`. On error, sends
+/// `PlanUpdate::PlanError`.
+async fn plan_executor_task(
+    mut ctx: BackgroundPlanContext,
+    selector: Box<dyn ToolSelector>,
+    update_tx: tokio::sync::mpsc::UnboundedSender<PlanUpdate>,
+    mut cmd_rx: tokio::sync::mpsc::UnboundedReceiver<PlanCommand>,
+) {
+    use super::chat_stream::stream_chat_sse;
+
+    let plan_start = std::time::Instant::now();
+    let mut subtask_durations: Vec<Duration> = Vec::new();
+    let sink = ChannelSink::new(update_tx.clone());
+
+    // Create a fresh PermissionManager in auto-approve mode for background execution.
+    let mut perm_manager = PermissionManager::with_project(true, &ctx.workspace_root);
+
+    loop {
+        // ── Check for commands before starting next round ─────────────
+        if let Ok(cmd) = cmd_rx.try_recv() {
+            match cmd {
+                PlanCommand::Pause => {
+                    let pct = ctx.plan.progress_pct();
+                    let remaining = ctx
+                        .plan
+                        .subtasks
+                        .iter()
+                        .filter(|s| s.status == TaskStatus::Pending)
+                        .count();
+                    sink.interrupted_pause(pct, remaining);
+                    // Wait for Resume or Cancel
+                    loop {
+                        match cmd_rx.recv().await {
+                            Some(PlanCommand::Resume { corrections }) => {
+                                if let Some(c) = corrections {
+                                    ctx.plan_corrections = c;
+                                }
+                                break;
+                            }
+                            Some(PlanCommand::Cancel) | None => {
+                                let _ = update_tx.send(PlanUpdate::PlanError {
+                                    error: "Plan cancelled by user".into(),
+                                });
+                                return;
+                            }
+                            _ => {} // ignore Status etc. while paused
+                        }
+                    }
+                }
+                PlanCommand::Cancel => {
+                    let _ = update_tx.send(PlanUpdate::PlanError {
+                        error: "Plan cancelled by user".into(),
+                    });
+                    return;
+                }
+                _ => {} // Status, UserInput handled elsewhere
+            }
+        }
+
+        // ── Find ready subtasks ──────────────────────────────────────
+        let analysis = plan_decompose::analyze_parallelism(&ctx.plan);
+        let ready = ctx.plan.ready_subtasks();
+
+        if ready.is_empty() {
+            let pct = ctx.plan.progress_pct();
+            if pct == 100 {
+                // Durable task: run global verification
+                let _global_passed = if let Some(ref mut durable) = ctx.durable_task_state {
+                    durable_bridge::on_plan_complete(durable).await
+                } else {
+                    true
+                };
+
+                let _ = update_tx.send(PlanUpdate::PlanCompleted {
+                    pct: 100,
+                    elapsed: plan_start.elapsed(),
+                });
+            } else {
+                let blocked: Vec<_> = ctx
+                    .plan
+                    .subtasks
+                    .iter()
+                    .filter(|s| s.status == TaskStatus::Pending)
+                    .map(|s| s.id.as_str())
+                    .collect();
+                sink.plan_paused(
+                    pct,
+                    blocked.len(),
+                    plan_start.elapsed(),
+                    &blocked.join(", "),
+                );
+            }
+            return;
+        }
+
+        // ── Show parallel group info ─────────────────────────────────
+        if ready.len() > 1 {
+            let group_count = analysis.groups.len();
+            let parallel_in_first = analysis.groups.first().map(|g| g.len()).unwrap_or(0);
+            let mut parts: Vec<String> = Vec::new();
+            if parallel_in_first > 1 {
+                parts.push(format!(
+                    "{} subtasks ready · {} parallel-safe",
+                    ready.len(),
+                    parallel_in_first
+                ));
+            }
+            if !analysis.conflicts.is_empty() {
+                parts.push(format!(
+                    "⚠ {} file conflict(s) — serializing",
+                    analysis.conflicts.len()
+                ));
+            }
+            if group_count > 1 {
+                parts.push(format!("{group_count} parallel rounds"));
+            }
+            sink.parallel_info(&parts);
+        }
+
+        // ── Execute first parallel group ─────────────────────────────
+        let exec_group = analysis.groups.first().cloned().unwrap_or_default();
+        let group_size = exec_group.len();
+
+        for (group_idx, next_id) in exec_group.iter().enumerate() {
+            // Prepare subtask prompt
+            let (prompt, title) = {
+                let st = ctx
+                    .plan
+                    .subtasks
+                    .iter_mut()
+                    .find(|s| s.id == *next_id)
+                    .unwrap();
+                st.status = TaskStatus::InProgress;
+                let prompt = plan_decompose::format_subtask_prompt_with_operator_notes(
+                    st,
+                    &ctx.plan_corrections,
+                );
+                (prompt, st.title.clone())
+            };
+
+            // Durable task: snapshot before execution
+            if let Some(ref durable) = ctx.durable_task_state {
+                durable_bridge::on_subtask_begin(durable, next_id).await;
+            }
+
+            let done_so_far = ctx.plan.items_done() + 1;
+            let total = ctx.plan.subtasks.len();
+            let group_label = if group_size > 1 {
+                format!(" [{}/{}]", group_idx + 1, group_size)
+            } else {
+                String::new()
+            };
+            let progress = super::format_plan_progress(
+                done_so_far.saturating_sub(1) as usize,
+                total,
+                if subtask_durations.is_empty() {
+                    None
+                } else {
+                    let sum: Duration = subtask_durations.iter().sum();
+                    Some(sum / subtask_durations.len() as u32)
+                },
+                plan_start.elapsed(),
+            );
+            sink.subtask_started(
+                &progress,
+                done_so_far as usize,
+                total,
+                &group_label,
+                &title,
+                next_id,
+            );
+
+            let subtask_start = std::time::Instant::now();
+
+            // Create cancellation token for this subtask
+            let cancel_token = Arc::new(tokio_util::sync::CancellationToken::new());
+
+            // Execute the subtask via stream_chat_sse
+            let turn_result: Result<StreamResult, String> = stream_chat_sse(ChatTurnParams {
+                api: &ctx.api,
+                token: &ctx.token,
+                message: &prompt,
+                session_id: ctx.session_id.as_deref(),
+                model: ctx.model.as_deref(),
+                explain: crate::ExplainMode::Off,
+                render_md: false,
+                history: &ctx.history,
+                perm_manager: &mut perm_manager,
+                verbose_mode: false,
+                quiet: true,
+                suppress_intermediate_output: true,
+                selector: &*selector,
+                recent_tools: &ctx.recent_tools,
+                tool_health_entries: &ctx.tool_health_entries,
+                skill_registry: &ctx.skill_registry,
+                plan_only_chat: false,
+                hide_streaming_assistant_text: true,
+                is_plan_subtask: true,
+                plan_subtask_id: Some(next_id),
+                delegation_engine: ctx.delegation_engine.clone(),
+                cancel_token: Some(cancel_token),
+                plan_assemble_line_release: None,
+            })
+            .await;
+
+            match turn_result {
+                Ok(result) => {
+                    // Send turn result back to REPL for history/journal updates
+                    let _ = update_tx.send(PlanUpdate::SubtaskTurnResult {
+                        subtask_id: next_id.clone(),
+                        full_text: result.full_text.clone(),
+                        prompt_tokens: result.prompt_tokens,
+                        completion_tokens: result.completion_tokens,
+                        tool_calls_count: result.tool_calls_count,
+                        session_id: result.session_id.clone(),
+                    });
+
+                    // Update recent_tools from result
+                    let used: Vec<String> = result.tools_used.iter().cloned().collect();
+                    if !used.is_empty() {
+                        ctx.recent_tools = used;
+                    }
+
+                    // Update session ID if the LLM allocated one
+                    if result.session_id.is_some() && ctx.session_id.is_none() {
+                        ctx.session_id = result.session_id;
+                    }
+
+                    // Run verification
+                    let verification_passed =
+                        if let Some(ref mut durable) = ctx.durable_task_state {
+                            durable_bridge::on_subtask_complete(durable, next_id).await
+                        } else {
+                            true
+                        };
+
+                    // Update subtask status
+                    if let Some(st) = ctx.plan.subtasks.iter_mut().find(|s| s.id == *next_id) {
+                        if verification_passed {
+                            st.status = TaskStatus::Completed;
+                            let elapsed = subtask_start.elapsed();
+                            subtask_durations.push(elapsed);
+                            sink.subtask_completed(
+                                next_id,
+                                &title,
+                                ctx.plan.progress_pct(),
+                                Some(elapsed),
+                            );
+                        } else if let Some(ref durable) = ctx.durable_task_state {
+                            if durable_bridge::subtask_retries_exhausted(durable, next_id) {
+                                sink.subtask_verification_failed(next_id, &title, true);
+                                st.status = TaskStatus::Completed;
+                            } else {
+                                sink.subtask_verification_failed(next_id, &title, false);
+                                st.status = TaskStatus::Pending;
+                            }
+                        } else {
+                            sink.subtask_verification_failed(next_id, &title, false);
+                            st.status = TaskStatus::Pending;
+                        }
+                    }
+                }
+                Err(err) => {
+                    // LLM turn failed — mark subtask as pending for retry
+                    if let Some(st) = ctx.plan.subtasks.iter_mut().find(|s| s.id == *next_id) {
+                        st.status = TaskStatus::Pending;
+                    }
+                    let _ = update_tx.send(PlanUpdate::PlanError {
+                        error: format!("Subtask '{}' failed: {}", next_id, err),
+                    });
+                    return;
+                }
+            }
+
+            // Check for pause/cancel between subtasks within a group
+            if let Ok(cmd) = cmd_rx.try_recv() {
+                match cmd {
+                    PlanCommand::Pause | PlanCommand::Cancel => {
+                        let pct = ctx.plan.progress_pct();
+                        let remaining = ctx
+                            .plan
+                            .subtasks
+                            .iter()
+                            .filter(|s| {
+                                s.status == TaskStatus::Pending
+                                    || s.status == TaskStatus::InProgress
+                            })
+                            .count();
+                        sink.interrupted_pause(pct, remaining);
+                        if matches!(cmd, PlanCommand::Cancel) {
+                            let _ = update_tx.send(PlanUpdate::PlanError {
+                                error: "Plan cancelled by user".into(),
+                            });
+                            return;
+                        }
+                        // For Pause: wait for resume
+                        loop {
+                            match cmd_rx.recv().await {
+                                Some(PlanCommand::Resume { corrections }) => {
+                                    if let Some(c) = corrections {
+                                        ctx.plan_corrections = c;
+                                    }
+                                    break;
+                                }
+                                Some(PlanCommand::Cancel) | None => {
+                                    let _ = update_tx.send(PlanUpdate::PlanError {
+                                        error: "Plan cancelled by user".into(),
+                                    });
+                                    return;
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        // Loop continues — will find next ready group
     }
 }
 
@@ -495,5 +897,30 @@ mod tests {
         assert!(!handle.is_finished());
         drop(update_tx);
         assert!(handle.is_finished());
+    }
+
+    #[test]
+    fn plan_update_new_variants_constructible() {
+        let _ = PlanUpdate::SubtaskTurnResult {
+            subtask_id: "s1".into(),
+            full_text: "Done.".into(),
+            prompt_tokens: 100,
+            completion_tokens: 50,
+            tool_calls_count: 3,
+            session_id: Some("sess-1".into()),
+        };
+        let _ = PlanUpdate::PlanError {
+            error: "timeout".into(),
+        };
+    }
+
+    #[test]
+    fn background_plan_context_fields_compile() {
+        // Verify BackgroundPlanContext is constructible with expected field types.
+        // We can't construct a real one in unit tests (needs real ThinClient),
+        // but we can verify the struct layout at compile time.
+        fn _assert_send<T: Send>() {}
+        // BackgroundPlanContext must be Send for tokio::spawn
+        _assert_send::<BackgroundPlanContext>();
     }
 }
