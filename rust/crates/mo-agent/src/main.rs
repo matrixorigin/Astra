@@ -6300,4 +6300,65 @@ total_tokens_out: 500
         // Should not panic (was the original bug)
         try_cloud_push_preferences(&state).await;
     }
+
+    #[test]
+    fn format_duration_short_zero() {
+        assert_eq!(format_duration_short(std::time::Duration::from_secs(0)), "0s");
+    }
+
+    #[test]
+    fn format_duration_short_seconds() {
+        assert_eq!(format_duration_short(std::time::Duration::from_secs(45)), "45s");
+    }
+
+    #[test]
+    fn format_duration_short_minutes() {
+        assert_eq!(format_duration_short(std::time::Duration::from_secs(92)), "1m32s");
+    }
+
+    #[test]
+    fn format_duration_short_hours() {
+        assert_eq!(format_duration_short(std::time::Duration::from_secs(7500)), "2h5m");
+    }
+
+    #[test]
+    fn format_plan_progress_empty() {
+        let s = format_plan_progress(0, 0, None, std::time::Duration::from_secs(0));
+        assert!(s.contains("0/0 (0%)"));
+        assert!(s.contains("0s elapsed"));
+    }
+
+    #[test]
+    fn format_plan_progress_first_subtask() {
+        let s = format_plan_progress(0, 5, None, std::time::Duration::from_secs(10));
+        assert!(s.contains("0/5 (0%)"));
+        assert!(s.contains("10s elapsed"));
+        // No ETA when done==0
+        assert!(!s.contains("remaining"));
+    }
+
+    #[test]
+    fn format_plan_progress_midway_with_eta() {
+        let avg = Some(std::time::Duration::from_secs(60));
+        let s = format_plan_progress(3, 7, avg, std::time::Duration::from_secs(180));
+        assert!(s.contains("3/7 (42%)"));
+        assert!(s.contains("3m0s elapsed"));
+        assert!(s.contains("~4m0s remaining")); // 4 remaining × 60s avg
+    }
+
+    #[test]
+    fn format_plan_progress_complete() {
+        let avg = Some(std::time::Duration::from_secs(30));
+        let s = format_plan_progress(5, 5, avg, std::time::Duration::from_secs(150));
+        assert!(s.contains("5/5 (100%)"));
+        // 0 remaining → "~0s remaining"
+        assert!(s.contains("remaining"));
+    }
+
+    #[test]
+    fn format_plan_progress_bar_fills() {
+        // At 50% with 16-width bar, should have 8 filled + 8 empty
+        let s = format_plan_progress(3, 6, None, std::time::Duration::from_secs(0));
+        assert!(s.contains("████████░░░░░░░░"));
+    }
 }

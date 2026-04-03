@@ -83,9 +83,9 @@ pub use durable_task::OutputSink;
 pub use durable_task::{
     CloudJudgePersistContext, CloudLlmConfig, CloudLlmJudge, ContractAmendment, ContractStatus,
     CriterionLearningResult, DiffSummary, DurableSubtask, DurableTaskLifecycle, LlmJudge,
-    LocalDurableTaskLifecycle, MatrixOneDurableTaskLifecycle, NoopTaskLearningBridge,
-    SubtaskDeliverySummary, SubtaskExecutionContext, SubtaskOutcomeSignal, SubtaskStage,
-    SubtaskVerificationReport, TaskBranchService, TaskContract, TaskDeliveryReport,
+    LocalDurableTaskLifecycle, MatrixOneDurableTaskLifecycle, NoopBranchOps,
+    NoopTaskLearningBridge, SubtaskDeliverySummary, SubtaskExecutionContext, SubtaskOutcomeSignal,
+    SubtaskStage, SubtaskVerificationReport, TaskBranchService, TaskContract, TaskDeliveryReport,
     TaskLearningBridge, TaskOutcomeSignal, TaskPatternStats, TaskResumeContext, TaskScope,
     UnconfiguredDurableTaskLifecycle, VerificationCriterion, VerificationLearningSignal,
     VerificationResult, VerificationRunner, VerifierKind, build_outcome_signal,
