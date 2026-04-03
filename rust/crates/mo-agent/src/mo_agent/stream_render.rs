@@ -670,10 +670,11 @@ impl Drop for PlanAssembleLineSpinner {
     }
 }
 
-// ─── Reasoning preview (fixed-height stderr viewport) ─────────────────────────
+// ─── Reasoning preview (stderr viewport, Cursor-style grow-then-tail) ─────────
 
-/// Visible **content** rows for `thinking_delta` / `reasoning_delta` (`0` = spinner only).
-/// When there are more visual lines than this, a Cursor-style `... (N lines hidden above)` row is prepended.
+/// Max **content** rows for `thinking_delta` / `reasoning_delta` (`0` = spinner only).
+/// While under this cap the pane **grows downward** (no blank padding). Past the cap, the top
+/// folds away and a `... (N lines hidden above)` header appears above the tail.
 fn thinking_viewport_rows() -> usize {
     std::env::var("MO_AGENT_THINKING_VIEWPORT_LINES")
         .ok()
@@ -718,7 +719,7 @@ fn buffer_to_visual_lines(buffer: &str, w: usize) -> Vec<String> {
     out
 }
 
-/// Redraw a stderr window: optional “hidden lines” header + tail rows (JSON / reasoning friendly).
+/// Redraw a stderr window: grows with content until `body_rows`, then tail + hidden count.
 struct ThinkingPreviewPane {
     body_rows: usize,
     width: usize,
@@ -748,21 +749,16 @@ impl ThinkingPreviewPane {
         self.redraw();
     }
 
-    /// Always returns one header slot + exactly `body_rows` body lines so redraw uses a stable
-    /// line count (avoids MoveUp/clear mismatch when hidden-line count toggles the header on/off).
     fn build_frame(&self) -> (String, Vec<String>) {
         let w = self.width.saturating_sub(6).max(12);
         let visual = buffer_to_visual_lines(&self.buffer, w);
         let cap = self.body_rows;
+        if visual.is_empty() {
+            return (String::new(), Vec::new());
+        }
         let hidden = visual.len().saturating_sub(cap);
-        let body: Vec<String> = if visual.is_empty() {
-            vec![String::new(); cap]
-        } else if visual.len() <= cap {
-            let mut b = visual;
-            while b.len() < cap {
-                b.insert(0, String::new());
-            }
-            b
+        let body: Vec<String> = if hidden == 0 {
+            visual
         } else {
             visual[visual.len() - cap..].to_vec()
         };
@@ -777,8 +773,8 @@ impl ThinkingPreviewPane {
     fn redraw(&mut self) {
         use crossterm::style::Stylize;
         let (header, body) = self.build_frame();
-        // One reserved row for the header strip + body — constant across redraws.
-        let total = 1 + body.len();
+        let header_lines = usize::from(!header.is_empty());
+        let total = header_lines + body.len();
         let mut err = io::stderr().lock();
         if self.started {
             for _ in 0..self.last_drawn_rows {
@@ -786,10 +782,16 @@ impl ThinkingPreviewPane {
                 let _ = err.queue(Clear(ClearType::CurrentLine));
             }
         }
-        let _ = err.queue(Clear(ClearType::CurrentLine));
-        if header.is_empty() {
-            let _ = writeln!(err);
-        } else {
+        if total == 0 {
+            let _ = err.flush();
+            self.last_drawn_rows = 0;
+            self.started = false;
+            return;
+        }
+        if !self.started {
+            let _ = err.queue(Clear(ClearType::CurrentLine));
+        }
+        if !header.is_empty() {
             let _ = writeln!(err, "{}", format!("  {header}").dim());
         }
         for line in &body {
@@ -864,7 +866,7 @@ pub(super) struct StreamRenderState {
     waiting_for_first_sse: bool,
     thinking_start: Option<Instant>,
     thinking_spinner: Option<Spinner>,
-    /// stderr preview for `reasoning_delta`: Cursor-style tail + `... (N lines hidden above)` (see `MO_AGENT_THINKING_VIEWPORT_LINES`).
+    /// stderr preview for `reasoning_delta`: grows until viewport cap, then tail + hidden count (see `MO_AGENT_THINKING_VIEWPORT_LINES`).
     thinking_pane: Option<ThinkingPreviewPane>,
     /// Lines written to the terminal during streaming (stdout + stderr).
     /// Used by the re-render pass to clear all streamed output.
@@ -2100,6 +2102,26 @@ mod tests {
         let body_cap = 3usize;
         assert_eq!(visual.len().saturating_sub(body_cap), 2);
         assert_eq!(visual[visual.len() - body_cap..], ["c", "d", "e"]);
+    }
+
+    #[test]
+    fn thinking_preview_pane_no_top_padding_before_cap() {
+        let mut p = super::ThinkingPreviewPane::new(4, 80);
+        p.buffer = "line1\nline2".into();
+        let (h, b) = p.build_frame();
+        assert!(h.is_empty(), "no hidden header while under cap");
+        assert_eq!(b.len(), 2);
+        assert_eq!(b[0], "line1");
+        assert_eq!(b[1], "line2");
+    }
+
+    #[test]
+    fn thinking_preview_pane_tail_and_header_after_cap() {
+        let mut p = super::ThinkingPreviewPane::new(2, 80);
+        p.buffer = "a\nb\nc\nd".into();
+        let (h, b) = p.build_frame();
+        assert_eq!(h, "... (2 lines hidden above)");
+        assert_eq!(b, vec!["c".to_string(), "d".to_string()]);
     }
 
     #[test]
