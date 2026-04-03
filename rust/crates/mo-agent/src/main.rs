@@ -53,6 +53,8 @@ mod durable_bridge;
 mod edge_lifecycle;
 #[path = "mo_agent/permission_manager.rs"]
 mod permission_manager;
+#[path = "mo_agent/plan_executor.rs"]
+mod plan_executor;
 #[path = "mo_agent/repl_runtime.rs"]
 mod repl_runtime;
 #[path = "mo_agent/repl_turn.rs"]
@@ -2207,6 +2209,25 @@ async fn run_plan_execution(
     profile: Option<&str>,
     selector: &dyn tool_selector::ToolSelector,
 ) -> Result<(), String> {
+    run_plan_execution_with_sink(
+        state,
+        current_token,
+        api,
+        profile,
+        selector,
+        &plan_executor::StderrSink,
+    )
+    .await
+}
+
+async fn run_plan_execution_with_sink(
+    state: &mut ReplState,
+    current_token: Option<&str>,
+    api: &mo_thin_client::ThinClient,
+    profile: Option<&str>,
+    selector: &dyn tool_selector::ToolSelector,
+    sink: &dyn plan_executor::PlanOutputSink,
+) -> Result<(), String> {
     use mo_agent_services::task_orchestrator::TaskStatus;
 
     // ─── Plan execution timing & progress tracking ───────────────────────────
@@ -2347,47 +2368,27 @@ async fn run_plan_execution(
                     completed_titles.push(st.title.clone());
                 } else if let Some(ref durable) = state.durable_task_state {
                     if durable_bridge::subtask_retries_exhausted(durable, st_id) {
-                        eprintln!(
-                            "  {}  Subtask verification failed after max retries, forcing complete: {}",
-                            "⚠".yellow(),
-                            st.title,
-                        );
+                        sink.subtask_verification_failed(&st.title, true);
                         st.status = TaskStatus::Completed;
                         completed_titles.push(st.title.clone());
                     } else {
-                        eprintln!(
-                            "  {}  Subtask verification failed, will retry: {}",
-                            "↻".yellow(),
-                            st.title,
-                        );
+                        sink.subtask_verification_failed(&st.title, false);
                         st.status = TaskStatus::Pending;
                     }
                 } else {
-                    eprintln!(
-                        "  {}  Subtask verification failed, will retry: {}",
-                        "↻".yellow(),
-                        st.title,
-                    );
+                    sink.subtask_verification_failed(&st.title, false);
                     st.status = TaskStatus::Pending;
                 }
             }
         }
         for title in &completed_titles {
             let pct = plan.progress_pct();
-            let elapsed_str = subtask_start
-                .map(|s| {
-                    let d = s.elapsed();
-                    subtask_durations.push(d);
-                    format!(" ({})", format_duration_short(d))
-                })
-                .unwrap_or_default();
-            eprintln!(
-                "\n{}  Subtask done: {} ({}%){}",
-                "✓".green(),
-                title,
-                pct,
-                elapsed_str.dim()
-            );
+            let elapsed = subtask_start.map(|s| {
+                let d = s.elapsed();
+                subtask_durations.push(d);
+                d
+            });
+            sink.subtask_completed(title, pct, elapsed);
         }
 
         // Force checkpoint after verification state changes to prevent data loss.
@@ -2429,16 +2430,7 @@ async fn run_plan_execution(
 
             if pct == 100 {
                 let summary = plan_decompose::PlanExecutionSummary::from_plan(&plan, &goal, rounds);
-                eprintln!();
-                eprint!("{}", summary.format());
-                eprintln!(
-                    "{}",
-                    format!(
-                        "  Total elapsed: {}",
-                        format_duration_short(plan_start.elapsed())
-                    )
-                    .dim()
-                );
+                sink.plan_completed(&summary.format(), plan_start.elapsed());
 
                 // Durable task: run global verification + delivery report
                 let global_passed = if let Some(ref mut durable) = state.durable_task_state {
@@ -2468,10 +2460,7 @@ async fn run_plan_execution(
                 }
 
                 if !global_passed {
-                    eprintln!(
-                        "\n{}  Global verification failed. Plan remains active for fixes.",
-                        "⚠".yellow()
-                    );
+                    sink.global_verification_failed();
                     // Don't mark as complete — keep plan active so user can fix and retry
                     state.executing_plan = Some(plan);
                     return Ok(());
@@ -2505,13 +2494,7 @@ async fn run_plan_execution(
                     .filter(|s| s.status == TaskStatus::Pending)
                     .map(|s| s.id.as_str())
                     .collect();
-                eprintln!(
-                    "\n{}  Plan execution paused at {}%. Blocked: {}  {}",
-                    "⏸".yellow(),
-                    pct,
-                    blocked.join(", "),
-                    format!("({})", format_duration_short(plan_start.elapsed())).dim(),
-                );
+                sink.plan_paused(pct, blocked.len(), plan_start.elapsed(), &blocked.join(", "));
 
                 // Detect and suggest replan
                 let failed: Vec<(&str, &str)> = vec![];
@@ -2520,7 +2503,7 @@ async fn run_plan_execution(
                     state.plan_execution_rounds,
                     &failed,
                 ) {
-                    eprintln!("{}", plan_decompose::format_replan_suggestion(&suggestion));
+                    sink.replan_suggestion(&plan_decompose::format_replan_suggestion(&suggestion));
                 }
 
                 // Keep plan for potential resume
@@ -2566,7 +2549,7 @@ async fn run_plan_execution(
                 parts.push(format!("{group_count} parallel rounds"));
             }
             if !parts.is_empty() {
-                eprintln!("\n{}  {}", "║".cyan(), parts.join(" · "));
+                sink.parallel_info(&parts);
             }
         }
 
@@ -2654,17 +2637,7 @@ async fn run_plan_execution(
                 avg_dur,
                 plan_start.elapsed(),
             );
-            eprintln!(
-                "\n{}  {}\n{}  Subtask {}/{}{}: {} [{}]",
-                "◆".cyan(),
-                progress.dim(),
-                "▶".cyan(),
-                done_so_far,
-                total,
-                group_label,
-                title,
-                next_id,
-            );
+            sink.subtask_started(&progress, done_so_far as usize, total, &group_label, &title, next_id);
 
             // Start timing for this subtask
             subtask_start = Some(std::time::Instant::now());
@@ -2677,8 +2650,7 @@ async fn run_plan_execution(
                 .unwrap_or(false);
 
             if is_step_by_step {
-                eprintln!();
-                eprintln!("{}  Execute this subtask? (y/n/skip/abort)", "❓".yellow());
+                sink.step_prompt(&title);
                 // Put plan back before waiting for input
                 state.executing_plan = Some(plan);
 
@@ -2688,7 +2660,7 @@ async fn run_plan_execution(
                     let response = input.trim().to_lowercase();
                     match response.as_str() {
                         "n" | "no" | "skip" => {
-                            eprintln!("{}  Skipping subtask: {}", "→".cyan(), title);
+                            sink.step_skipped(&title);
                             // Take plan back, mark as skipped (keep as pending), continue
                             plan = state.executing_plan.take().unwrap();
                             if let Some(st) = plan.subtasks.iter_mut().find(|s| s.id == *next_id) {
@@ -2697,13 +2669,13 @@ async fn run_plan_execution(
                             continue;
                         }
                         "abort" | "stop" | "q" => {
-                            eprintln!("{}  Plan execution aborted by user.", "⏹".red());
+                            sink.step_aborted();
                             state.plan_execution_corrections.clear();
                             return Ok(());
                         }
                         _ => {
                             // Proceed with execution
-                            eprintln!("{}  Proceeding...", "→".cyan());
+                            sink.step_proceeding();
                         }
                     }
                 }
@@ -2768,16 +2740,7 @@ async fn run_plan_execution(
                             s.status == TaskStatus::Pending || s.status == TaskStatus::InProgress
                         })
                         .count();
-                    eprintln!(
-                        "\n{}  Plan paused (Ctrl+C). {}% done, {} subtasks remaining.",
-                        "⏸".yellow(),
-                        pct,
-                        remaining_count
-                    );
-                    eprintln!(
-                        "{}  (Interrupt is not sent to the model; this subtask is still in progress.)",
-                        "ℹ".dim()
-                    );
+                    sink.interrupted_pause(pct, remaining_count);
                     eprint_plan_execution_paused_hints();
                 }
                 state.last_turn_interrupted = false;
@@ -2825,46 +2788,26 @@ async fn run_plan_execution(
                 } else if let Some(ref durable) = state.durable_task_state {
                     if durable_bridge::subtask_retries_exhausted(durable, next_id) {
                         // Exhausted retry budget — force complete to unblock the plan
-                        eprintln!(
-                            "  {}  Subtask verification failed after max retries, forcing complete: {}",
-                            "⚠".yellow(),
-                            st.title,
-                        );
+                        sink.subtask_verification_failed(&st.title, true);
                         st.status = TaskStatus::Completed;
                     } else {
-                        eprintln!(
-                            "  {}  Subtask verification failed, will retry: {}",
-                            "↻".yellow(),
-                            st.title,
-                        );
+                        sink.subtask_verification_failed(&st.title, false);
                         st.status = TaskStatus::Pending;
                     }
                 } else {
-                    eprintln!(
-                        "  {}  Subtask verification failed, will retry: {}",
-                        "↻".yellow(),
-                        st.title,
-                    );
+                    sink.subtask_verification_failed(&st.title, false);
                     st.status = TaskStatus::Pending;
                 }
 
                 let title = st.title.clone();
                 let pct = plan.progress_pct();
                 if verification_passed {
-                    let elapsed_str = subtask_start
-                        .map(|s| {
-                            let d = s.elapsed();
-                            subtask_durations.push(d);
-                            format!(" ({})", format_duration_short(d))
-                        })
-                        .unwrap_or_default();
-                    eprintln!(
-                        "\n{}  Subtask done: {} ({}%){}",
-                        "✓".green(),
-                        title,
-                        pct,
-                        elapsed_str.dim()
-                    );
+                    let elapsed = subtask_start.map(|s| {
+                        let d = s.elapsed();
+                        subtask_durations.push(d);
+                        d
+                    });
+                    sink.subtask_completed(&title, pct, elapsed);
                 }
 
                 // Journal: subtask completed (or verification-failed)
