@@ -2630,8 +2630,8 @@ impl DurableTaskLifecycle for MatrixOneDurableTaskLifecycle {
 
         // Persist contract update inside the same transaction
         {
-            let scope_json = serde_json::to_string(&contract.scope)
-                .map_err(|e| format!("scope json: {e}"))?;
+            let scope_json =
+                serde_json::to_string(&contract.scope).map_err(|e| format!("scope json: {e}"))?;
             let subtasks_json = serde_json::to_string(&contract.subtasks)
                 .map_err(|e| format!("subtasks json: {e}"))?;
             let criteria_json = serde_json::to_string(&contract.global_verification)

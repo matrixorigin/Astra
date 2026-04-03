@@ -491,9 +491,7 @@ impl EventIngestionWorker {
             }
         }
 
-        tx.commit()
-            .await
-            .map_err(|e| format!("commit tx: {e}"))?;
+        tx.commit().await.map_err(|e| format!("commit tx: {e}"))?;
 
         Ok(())
     }

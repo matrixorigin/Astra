@@ -378,8 +378,18 @@ impl TurnAuxiliaryEventWriter for DatabaseTurnAuxiliaryEventWriter {
         let pool = self.get_pool().await.map_err(|error| error.to_string())?;
         let mut tx = pool.begin().await.map_err(|error| error.to_string())?;
         for event in events {
-            let meta_tool_name = event.metadata.as_ref().and_then(|v| v.get("tool_name")).and_then(|v| v.as_str()).map(|s| s.to_string());
-            let meta_duration_ms = event.metadata.as_ref().and_then(|v| v.get("duration_ms")).and_then(|v| v.as_i64()).map(|v| v as i32);
+            let meta_tool_name = event
+                .metadata
+                .as_ref()
+                .and_then(|v| v.get("tool_name"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let meta_duration_ms = event
+                .metadata
+                .as_ref()
+                .and_then(|v| v.get("duration_ms"))
+                .and_then(|v| v.as_i64())
+                .map(|v| v as i32);
             let metadata_json = event.metadata.map(|metadata| metadata.to_string());
             query(
                 "INSERT INTO agent_events \

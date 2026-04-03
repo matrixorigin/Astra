@@ -651,8 +651,7 @@ impl SessionAuditService for DatabaseSessionAuditService {
         .await
         .map_err(internal_error)?;
 
-        let row =
-            row.ok_or_else(|| error_response(StatusCode::NOT_FOUND, "Turn not found"))?;
+        let row = row.ok_or_else(|| error_response(StatusCode::NOT_FOUND, "Turn not found"))?;
 
         let event_id: String = row.try_get("event_id").unwrap_or_default();
         let content: String = row.try_get("content").unwrap_or_default();

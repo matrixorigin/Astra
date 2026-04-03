@@ -195,8 +195,18 @@ impl EventService for DatabaseEventService {
         let agent_id = request.agent_id.unwrap_or_else(|| "system".to_string());
         let agent_version = request.agent_version.unwrap_or_else(|| "1.0.0".to_string());
 
-        let meta_tool_name = request.metadata.as_ref().and_then(|v| v.get("tool_name")).and_then(|v| v.as_str()).map(|s| s.to_string());
-        let meta_duration_ms = request.metadata.as_ref().and_then(|v| v.get("duration_ms")).and_then(|v| v.as_i64()).map(|v| v as i32);
+        let meta_tool_name = request
+            .metadata
+            .as_ref()
+            .and_then(|v| v.get("tool_name"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let meta_duration_ms = request
+            .metadata
+            .as_ref()
+            .and_then(|v| v.get("duration_ms"))
+            .and_then(|v| v.as_i64())
+            .map(|v| v as i32);
 
         query(
             "INSERT INTO agent_events \
