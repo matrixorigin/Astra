@@ -8,6 +8,10 @@ use std::sync::Mutex;
 
 use crate::task_orchestrator::{AGENT_TASK_SELECT_COLUMNS, MatrixOneTaskService, TaskRecord};
 
+/// Default maximum number of tasks to return in a pack pull.
+/// Can be overridden per-call using `pull_tasks_pack_mysql_with_limit`.
+pub const DEFAULT_TASKS_PACK_LIMIT: u32 = 2000;
+
 // ─── Hold cache (process-local hint for lease-aware TaskAdapter export) ───────
 
 /// Best-effort map of which task IDs this process has successfully leased for each `agent_id`.
@@ -54,8 +58,17 @@ pub async fn pull_tasks_pack_mysql(
     pool: &sqlx::Pool<sqlx::MySql>,
     user_id: &str,
 ) -> Result<String, String> {
+    pull_tasks_pack_mysql_with_limit(pool, user_id, DEFAULT_TASKS_PACK_LIMIT).await
+}
+
+/// Pull tasks pack with a configurable limit.
+pub async fn pull_tasks_pack_mysql_with_limit(
+    pool: &sqlx::Pool<sqlx::MySql>,
+    user_id: &str,
+    limit: u32,
+) -> Result<String, String> {
     let q = format!(
-        "SELECT {AGENT_TASK_SELECT_COLUMNS} FROM agent_tasks WHERE user_id = ? ORDER BY updated_at DESC LIMIT 2000"
+        "SELECT {AGENT_TASK_SELECT_COLUMNS} FROM agent_tasks WHERE user_id = ? ORDER BY updated_at DESC LIMIT {limit}"
     );
     let rows = sqlx::query(&q)
         .bind(user_id)
