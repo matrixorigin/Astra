@@ -1410,7 +1410,9 @@ pub(super) async fn consume_turn_sse(
     // Tool turns: discard ALL text (both rendered and buffered) — it's
     // intermediate thinking that will be superseded by subsequent turns.
     // Non-tool turns: the buffered text is the final answer — render it.
-    if result.has_tool_calls {
+    // Check both server-side tool_calls AND edge tools (git, grep, etc.)
+    let has_any_tool_work = result.has_tool_calls || !result.edge_tool_round.is_empty();
+    if has_any_tool_work {
         // Tool turn — discard everything
         if let Some(md) = &mut md_renderer {
             md.discard_and_reset();
