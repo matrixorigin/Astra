@@ -378,12 +378,15 @@ impl TurnAuxiliaryEventWriter for DatabaseTurnAuxiliaryEventWriter {
         let pool = self.get_pool().await.map_err(|error| error.to_string())?;
         let mut tx = pool.begin().await.map_err(|error| error.to_string())?;
         for event in events {
+            let meta_tool_name = event.metadata.as_ref().and_then(|v| v.get("tool_name")).and_then(|v| v.as_str()).map(|s| s.to_string());
+            let meta_duration_ms = event.metadata.as_ref().and_then(|v| v.get("duration_ms")).and_then(|v| v.as_i64()).map(|v| v as i32);
             let metadata_json = event.metadata.map(|metadata| metadata.to_string());
             query(
                 "INSERT INTO agent_events \
                  (event_id, session_id, user_id, agent_id, agent_version, event_type, content, \
-                  parent_event_id, causal_chain_id, `metadata`, reasoning_content, created_at) \
-                 VALUES (?, ?, ?, 'dev-agent', '0.1.0', ?, ?, ?, ?, ?, ?, NOW())",
+                  parent_event_id, causal_chain_id, `metadata`, reasoning_content, \
+                  meta_tool_name, meta_duration_ms, created_at) \
+                 VALUES (?, ?, ?, 'dev-agent', '0.1.0', ?, ?, ?, ?, ?, ?, ?, ?, NOW())",
             )
             .bind(event.event_id)
             .bind(event.session_id)
@@ -394,6 +397,8 @@ impl TurnAuxiliaryEventWriter for DatabaseTurnAuxiliaryEventWriter {
             .bind(event.causal_chain_id)
             .bind(metadata_json)
             .bind(event.reasoning_content)
+            .bind(meta_tool_name)
+            .bind(meta_duration_ms)
             .execute(&mut *tx)
             .await
             .map_err(|error| error.to_string())?;

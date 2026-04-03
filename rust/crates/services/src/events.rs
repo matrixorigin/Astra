@@ -195,11 +195,14 @@ impl EventService for DatabaseEventService {
         let agent_id = request.agent_id.unwrap_or_else(|| "system".to_string());
         let agent_version = request.agent_version.unwrap_or_else(|| "1.0.0".to_string());
 
+        let meta_tool_name = request.metadata.as_ref().and_then(|v| v.get("tool_name")).and_then(|v| v.as_str()).map(|s| s.to_string());
+        let meta_duration_ms = request.metadata.as_ref().and_then(|v| v.get("duration_ms")).and_then(|v| v.as_i64()).map(|v| v as i32);
+
         query(
             "INSERT INTO agent_events \
              (event_id, session_id, user_id, agent_id, agent_version, event_type, content, \
-              parent_event_id, causal_chain_id, `metadata`, created_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())",
+              parent_event_id, causal_chain_id, `metadata`, meta_tool_name, meta_duration_ms, created_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())",
         )
         .bind(&event_id)
         .bind(&request.session_id)
@@ -211,6 +214,8 @@ impl EventService for DatabaseEventService {
         .bind(&request.parent_event_id)
         .bind(&causal_chain_id)
         .bind(&metadata_str)
+        .bind(&meta_tool_name)
+        .bind(meta_duration_ms)
         .execute(&pool)
         .await
         .map_err(internal_error)?;

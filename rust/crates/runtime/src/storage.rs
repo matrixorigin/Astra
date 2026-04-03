@@ -17,8 +17,9 @@ pub(crate) async fn insert_core_turn_event(
     query(
         "INSERT INTO agent_events \
          (event_id, session_id, user_id, agent_id, agent_version, event_type, content, \
-          parent_event_id, causal_chain_id, token_usage, llm_model_used, llm_params, reasoning_content, created_at) \
-         VALUES (?, ?, ?, 'dev-agent', '0.1.0', ?, ?, ?, ?, ?, ?, ?, ?, NOW())",
+          parent_event_id, causal_chain_id, token_usage, llm_model_used, llm_params, reasoning_content, \
+          token_input, token_output, token_total, created_at) \
+         VALUES (?, ?, ?, 'dev-agent', '0.1.0', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())",
     )
     .bind(&event.event_id)
     .bind(&event.session_id)
@@ -31,6 +32,9 @@ pub(crate) async fn insert_core_turn_event(
     .bind(&event.llm_model_used)
     .bind(event.llm_params.as_ref().map(serde_json::Value::to_string))
     .bind(&event.reasoning_content)
+    .bind(event.token_usage.as_ref().and_then(|v| v.get("input")).and_then(|v| v.as_i64()))
+    .bind(event.token_usage.as_ref().and_then(|v| v.get("output")).and_then(|v| v.as_i64()))
+    .bind(event.token_usage.as_ref().and_then(|v| v.get("total")).and_then(|v| v.as_i64()))
     .execute(&mut **tx)
     .await?;
     Ok(())
@@ -44,8 +48,9 @@ pub(crate) async fn insert_tool_turn_event(
     query(
         "INSERT INTO agent_events \
          (event_id, session_id, user_id, agent_id, agent_version, event_type, content, \
-          parent_event_id, causal_chain_id, metadata, skill_name, skill_version, reasoning_content, created_at) \
-         VALUES (?, ?, ?, 'dev-agent', '0.1.0', ?, ?, ?, ?, ?, ?, ?, ?, NOW())",
+          parent_event_id, causal_chain_id, metadata, skill_name, skill_version, reasoning_content, \
+          meta_tool_name, meta_duration_ms, created_at) \
+         VALUES (?, ?, ?, 'dev-agent', '0.1.0', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())",
     )
     .bind(&event.event_id)
     .bind(&event.session_id)
@@ -58,6 +63,8 @@ pub(crate) async fn insert_tool_turn_event(
     .bind(&event.skill_name)
     .bind(skill_version.cloned().or_else(|| event.skill_version.clone()))
     .bind(&event.reasoning_content)
+    .bind(event.metadata.as_ref().and_then(|v| v.get("tool_name")).and_then(|v| v.as_str()))
+    .bind(event.metadata.as_ref().and_then(|v| v.get("duration_ms")).and_then(|v| v.as_i64()).map(|v| v as i32))
     .execute(&mut **tx)
     .await?;
     Ok(())

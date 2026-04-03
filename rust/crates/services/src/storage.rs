@@ -152,11 +152,11 @@ pub async fn ensure_core_schema(settings: &MatrixOneSettings) -> Result<(), sqlx
             skill_name VARCHAR(255) NULL,
             skill_version VARCHAR(64) NULL,
             reasoning_content LONGTEXT NULL,
-            token_input  BIGINT GENERATED ALWAYS AS (JSON_EXTRACT(token_usage, '$.input'))  STORED,
-            token_output BIGINT GENERATED ALWAYS AS (JSON_EXTRACT(token_usage, '$.output')) STORED,
-            token_total  BIGINT GENERATED ALWAYS AS (JSON_EXTRACT(token_usage, '$.total'))  STORED,
-            meta_tool_name VARCHAR(255) GENERATED ALWAYS AS (JSON_UNQUOTE(JSON_EXTRACT(metadata, '$.tool_name'))) STORED,
-            meta_duration_ms INT GENERATED ALWAYS AS (JSON_EXTRACT(metadata, '$.duration_ms')) STORED,
+            token_input  BIGINT NULL,
+            token_output BIGINT NULL,
+            token_total  BIGINT NULL,
+            meta_tool_name VARCHAR(255) NULL,
+            meta_duration_ms INT NULL,
             created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             INDEX idx_agent_events_session_created (session_id, created_at),
             INDEX idx_agent_events_session_type_created (session_id, event_type, created_at),
@@ -168,35 +168,6 @@ pub async fn ensure_core_schema(settings: &MatrixOneSettings) -> Result<(), sqlx
     )
     .execute(&pool)
     .await?;
-
-    // Migration: add generated columns to existing agent_events tables.
-    for ddl in [
-        "ALTER TABLE agent_events ADD COLUMN token_input BIGINT GENERATED ALWAYS AS (JSON_EXTRACT(token_usage, '$.input')) STORED",
-        "ALTER TABLE agent_events ADD COLUMN token_output BIGINT GENERATED ALWAYS AS (JSON_EXTRACT(token_usage, '$.output')) STORED",
-        "ALTER TABLE agent_events ADD COLUMN token_total BIGINT GENERATED ALWAYS AS (JSON_EXTRACT(token_usage, '$.total')) STORED",
-        "ALTER TABLE agent_events ADD COLUMN meta_tool_name VARCHAR(255) GENERATED ALWAYS AS (JSON_UNQUOTE(JSON_EXTRACT(metadata, '$.tool_name'))) STORED",
-        "ALTER TABLE agent_events ADD COLUMN meta_duration_ms INT GENERATED ALWAYS AS (JSON_EXTRACT(metadata, '$.duration_ms')) STORED",
-    ] {
-        if let Err(e) = query(ddl).execute(&pool).await {
-            let msg = e.to_string().to_lowercase();
-            if !msg.contains("duplicate") && !msg.contains("already exists") {
-                return Err(e);
-            }
-        }
-    }
-    // Index on meta_tool_name for existing tables (CREATE INDEX IF NOT EXISTS not standard;
-    // ignore duplicate-key errors).
-    if let Err(e) = query(
-        "CREATE INDEX idx_agent_events_tool_name ON agent_events (meta_tool_name)",
-    )
-    .execute(&pool)
-    .await
-    {
-        let msg = e.to_string().to_lowercase();
-        if !msg.contains("duplicate") && !msg.contains("already exists") {
-            return Err(e);
-        }
-    }
 
     // Context / decisions / evaluation essentials used by turn persistence
     query(
