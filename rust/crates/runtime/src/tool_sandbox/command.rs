@@ -58,39 +58,25 @@ pub fn sandbox_command(
     Ok(())
 }
 
-/// Build a restricted bash command string with resource limits.
+/// Build a restricted bash command string.
 ///
-/// Wraps the user's command with `ulimit` and timeout restrictions
-/// for Standard/Strict modes. Also applies shell hardening (extglob disable,
-/// IFS reset, stdin redirect) for Standard+ modes.
+/// Applies shell hardening (extglob disable, IFS reset, stdin redirect)
+/// for Standard+ modes.
+///
+/// Note: ulimit-based resource limits were removed to match Claude Code's
+/// approach (relies on timeouts and concurrent tool limits instead).
+/// ulimit -u is UID-wide and caused false-positive fork failures.
 pub fn wrap_command_with_limits(policy: &SandboxPolicy, user_command: &str) -> String {
     if policy.mode == SandboxMode::Permissive {
         return user_command.to_string();
     }
 
-    let mut parts = Vec::new();
-
-    // Process limit
-    if policy.max_processes > 0 {
-        parts.push(format!("ulimit -u {}", policy.max_processes));
-    }
-
-    // Memory limit (in KB for ulimit -v)
-    if policy.max_memory_bytes > 0 {
-        let kb = policy.max_memory_bytes / 1024;
-        parts.push(format!("ulimit -v {kb}"));
-    }
-
-    // File size limit (prevent filling disk): 100 MB
-    parts.push("ulimit -f 102400".to_string());
-
-    // Core dump disabled
-    parts.push("ulimit -c 0".to_string());
-
+    // Only apply shell hardening, no ulimit restrictions.
+    // Resource control is handled at the orchestration layer:
+    // - Concurrent tool execution limit (MAX_CONCURRENT_READ_ONLY_TOOLS = 10)
+    // - Per-command timeouts (max_execution_secs)
     let config = super::shell_hardening::ShellHardeningConfig::default();
-    let hardened = super::shell_hardening::build_hardened_command(&config, user_command);
-    parts.push(hardened);
-    parts.join(" && ")
+    super::shell_hardening::build_hardened_command(&config, user_command)
 }
 
 /// Filter environment variables according to policy.
@@ -327,16 +313,14 @@ mod tests {
     }
 
     #[test]
-    fn standard_adds_ulimits() {
+    fn standard_applies_shell_hardening() {
         let p = SandboxPolicy::for_project("/tmp");
         let wrapped = wrap_command_with_limits(&p, "echo hello");
-        // Standard mode: no ulimit -u (max_processes=0) to avoid fork failures
+        // No ulimit restrictions (removed to match Claude Code approach)
         assert!(
-            !wrapped.contains("ulimit -u"),
-            "Standard should NOT limit processes"
+            !wrapped.contains("ulimit"),
+            "should NOT contain ulimit (removed)"
         );
-        assert!(wrapped.contains("ulimit -v"), "should limit memory");
-        assert!(wrapped.contains("ulimit -c 0"), "should disable core dumps");
         assert!(
             wrapped.contains("echo hello"),
             "should contain user command"
@@ -347,22 +331,26 @@ mod tests {
     }
 
     #[test]
-    fn strict_limits_are_tighter() {
+    fn strict_also_applies_shell_hardening() {
         let standard = SandboxPolicy::for_project("/tmp");
         let strict = SandboxPolicy::strict("/tmp");
 
         let w_standard = wrap_command_with_limits(&standard, "ls");
         let w_strict = wrap_command_with_limits(&strict, "ls");
 
-        // Standard has memory + file + core limits but no process limit
-        assert!(w_standard.contains("ulimit"));
+        // Both should apply shell hardening, not ulimit
         assert!(
-            !w_standard.contains("ulimit -u"),
-            "Standard: no process limit"
+            !w_standard.contains("ulimit"),
+            "Standard: no ulimit restrictions"
+        );
+        assert!(
+            !w_strict.contains("ulimit"),
+            "Strict: no ulimit restrictions"
         );
 
-        // Strict has process limit too
-        assert!(w_strict.contains("ulimit -u 512"));
+        // Both should have shell hardening
+        assert!(w_standard.contains("extglob"), "Standard: shell hardening");
+        assert!(w_strict.contains("extglob"), "Strict: shell hardening");
     }
 
     // ── Risk analysis ────────────────────────────────────────────────────

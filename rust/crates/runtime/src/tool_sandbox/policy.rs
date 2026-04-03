@@ -9,11 +9,19 @@ pub enum SandboxMode {
     Permissive,
     /// Path boundary enforcement + env filtering. No OS-level isolation.
     Standard,
-    /// Full isolation: Standard + resource limits + restricted shell.
+    /// Full isolation: Standard + restricted shell.
     Strict,
 }
 
 /// Configurable security policy for tool execution.
+///
+/// Note: ulimit-based resource limits (max_processes, max_memory_bytes) were
+/// removed to match Claude Code's approach. Resource control now relies on:
+/// - Concurrent tool execution limit (MAX_CONCURRENT_READ_ONLY_TOOLS = 10)
+/// - Per-command timeouts (max_execution_secs)
+///
+/// ulimit -u is UID-wide and caused false-positive fork failures when the
+/// user already had many processes running.
 #[derive(Debug, Clone)]
 pub struct SandboxPolicy {
     /// Security enforcement level.
@@ -39,20 +47,6 @@ pub struct SandboxPolicy {
     /// Whether to allow network access from bash commands.
     /// When false, adds `--network=none` to unshare (Strict mode only).
     pub network_allowed: bool,
-
-    /// Maximum number of processes a sandboxed command can spawn.
-    /// 0 = unlimited (Permissive). Standard uses 2 GB, Strict uses 256 MB.
-    ///
-    /// NOTE: `ulimit -u` sets RLIMIT_NPROC which counts ALL processes
-    /// for the user (UID-wide), not per-process. If the user already
-    /// has N processes, the child shell can only fork (limit - N) more.
-    /// Values below the user's current process count cause immediate
-    /// fork failures ("Resource temporarily unavailable").
-    pub max_processes: u32,
-
-    /// Maximum memory in bytes a sandboxed command can use.
-    /// 0 = unlimited. Standard: 2 GB, Strict: 256 MB.
-    pub max_memory_bytes: u64,
 }
 
 /// Baseline environment variables always allowed in Standard+ modes.
@@ -105,8 +99,6 @@ impl SandboxPolicy {
             max_execution_secs: 30.0,
             max_output_bytes: 20_000,
             network_allowed: true,
-            max_processes: 0, // Standard mode: no ulimit -u (too fragile)
-            max_memory_bytes: 2 * 1024 * 1024 * 1024, // 2 GB — cargo builds need ~1-2 GB
         }
     }
 
@@ -120,8 +112,6 @@ impl SandboxPolicy {
             max_execution_secs: 30.0,
             max_output_bytes: 20_000,
             network_allowed: true,
-            max_processes: 0,
-            max_memory_bytes: 0,
         }
     }
 
@@ -136,8 +126,6 @@ impl SandboxPolicy {
             max_execution_secs: 15.0,
             max_output_bytes: 10_000,
             network_allowed: false,
-            max_processes: 512, // Strict: high enough to avoid fork failures
-            max_memory_bytes: 256 * 1024 * 1024, // 256 MB
         }
     }
 
@@ -177,7 +165,6 @@ mod tests {
         let p = SandboxPolicy::for_project("/home/user/project");
         assert_eq!(p.mode, SandboxMode::Standard);
         assert_eq!(p.max_execution_secs, 30.0);
-        assert_eq!(p.max_processes, 0); // Standard: no ulimit -u
         assert!(p.network_allowed);
         assert!(p.is_path_allowed(std::path::Path::new("/home/user/project/src")));
         assert!(p.is_path_allowed(std::path::Path::new("/tmp/build")));
@@ -196,7 +183,6 @@ mod tests {
         let p = SandboxPolicy::strict("/home/user/project");
         assert_eq!(p.mode, SandboxMode::Strict);
         assert!(!p.network_allowed);
-        assert_eq!(p.max_processes, 512);
         assert!(p.is_path_allowed(std::path::Path::new("/tmp/x")));
         assert!(!p.is_path_allowed(std::path::Path::new("/var/tmp/x")));
     }
