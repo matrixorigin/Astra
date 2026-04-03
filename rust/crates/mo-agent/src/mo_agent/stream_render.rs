@@ -1065,7 +1065,15 @@ impl ThinkingPreviewPane {
         const CAP: usize = 48 * 1024;
         if self.buffer.len() > CAP {
             let overflow = self.buffer.len() - CAP / 2;
-            self.buffer.drain(..overflow);
+            // Find the next valid UTF-8 char boundary after the overflow point
+            // to avoid splitting multi-byte characters.
+            let drain_end = self
+                .buffer
+                .char_indices()
+                .map(|(i, _)| i)
+                .find(|&i| i >= overflow)
+                .unwrap_or(overflow);
+            self.buffer.drain(..drain_end);
         }
         self.redraw();
     }
@@ -2511,6 +2519,22 @@ mod tests {
         let s1 = format!("  {} {}", "◇".dim(), "test".dim());
         let s2 = format!("  {} {}", "◇".dim(), "test".dim());
         assert_eq!(s1, s2, "colored strings should be equal");
+    }
+
+    #[test]
+    fn thinking_pane_buffer_truncation_is_utf8_safe() {
+        let mut pane = super::ThinkingPreviewPane::new(3, 80);
+        // Create a string with multi-byte UTF-8 characters
+        let chinese = "中文测试内容";
+        // Repeat enough times to exceed the 48KB cap
+        let repeated = chinese.repeat(10000); // ~60KB of UTF-8 content
+        pane.push_chunk(&repeated);
+        // After truncation, the buffer should still be valid UTF-8
+        // (this would panic if we split a multi-byte char)
+        assert!(pane.buffer.is_char_boundary(0));
+        assert!(pane.buffer.is_char_boundary(pane.buffer.len()));
+        // Verify we can iterate chars without panicking
+        let _: usize = pane.buffer.chars().count();
     }
 
     #[test]
