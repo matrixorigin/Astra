@@ -59,6 +59,24 @@ pub struct ProjectContext {
     /// Key directories detected (src/, tests/, lib/, etc.)
     #[serde(default)]
     pub key_directories: Vec<String>,
+    /// Successful plan templates from prior tasks (injected into LLM prompt).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub prior_templates: Vec<PlanTemplateHint>,
+}
+
+/// A lightweight hint from a previously successful plan template.
+///
+/// Injected into the decomposition prompt so the LLM can leverage learned patterns.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlanTemplateHint {
+    /// Original goal pattern that was successfully completed.
+    pub goal_pattern: String,
+    /// Subtask titles from the successful plan.
+    pub subtask_titles: Vec<String>,
+    /// Success rate (0.0–1.0).
+    pub success_rate: f64,
+    /// Number of times this template was used.
+    pub use_count: u32,
 }
 
 /// Scan project root to gather context for planning.
@@ -444,6 +462,27 @@ pub fn decomposition_prompt(goal: &str, context: &ProjectContext) -> String {
         }
     }
 
+    // Prior successful templates — helps the LLM leverage learned patterns
+    if !context.prior_templates.is_empty() {
+        prompt.push_str("\n## Learned Patterns from Similar Past Tasks\n");
+        prompt.push_str("The following plans were successfully completed for similar goals. Use them as reference (adapt, don't copy blindly):\n\n");
+        for (i, tmpl) in context.prior_templates.iter().enumerate() {
+            prompt.push_str(&format!(
+                "### Pattern {} (success rate: {:.0}%, used {} time{})\n",
+                i + 1,
+                tmpl.success_rate * 100.0,
+                tmpl.use_count,
+                if tmpl.use_count == 1 { "" } else { "s" }
+            ));
+            prompt.push_str(&format!("- Goal: {}\n", tmpl.goal_pattern));
+            prompt.push_str("- Subtask structure:\n");
+            for title in &tmpl.subtask_titles {
+                prompt.push_str(&format!("  - {title}\n"));
+            }
+            prompt.push('\n');
+        }
+    }
+
     prompt.push_str(&format!("\n## Goal\n{goal}\n"));
 
     prompt.push_str(
@@ -511,7 +550,96 @@ Return ONLY this JSON:
     prompt
 }
 
-/// First lines of model text when plan JSON parsing failed (for CLI hints).
+/// Query the `plan_templates` table for templates whose goal matches the given goal.
+///
+/// Uses keyword-based matching: extracts significant words from the goal and searches
+/// for templates containing any of them. Returns up to `limit` results sorted by
+/// relevance (success_rate × use_count).
+pub async fn query_similar_templates(
+    pool: &sqlx::Pool<sqlx::MySql>,
+    user_id: &str,
+    goal: &str,
+    limit: usize,
+) -> Vec<PlanTemplateHint> {
+    // Extract keywords from goal (skip short words)
+    let keywords: Vec<String> = goal
+        .to_lowercase()
+        .split(|c: char| !c.is_alphanumeric() && c != '-' && c != '_')
+        .filter(|w| w.len() >= 3)
+        .map(String::from)
+        .collect();
+
+    if keywords.is_empty() {
+        return Vec::new();
+    }
+
+    // Build LIKE conditions for keyword matching
+    let like_clauses: Vec<String> = keywords
+        .iter()
+        .take(6) // cap at 6 keywords to avoid huge queries
+        .map(|kw| format!("goal_pattern LIKE '%{kw}%'"))
+        .collect();
+    let where_clause = like_clauses.join(" OR ");
+
+    let query = format!(
+        "SELECT goal_pattern, template_json, success_rate, use_count \
+         FROM plan_templates \
+         WHERE user_id = ? AND ({where_clause}) \
+         ORDER BY (success_rate * use_count) DESC \
+         LIMIT ?",
+    );
+
+    let rows = match sqlx::query(&query)
+        .bind(user_id)
+        .bind(limit as i64)
+        .fetch_all(pool)
+        .await
+    {
+        Ok(rows) => rows,
+        Err(_) => return Vec::new(),
+    };
+
+    let mut hints = Vec::new();
+    for row in &rows {
+        let goal_pattern: String = match sqlx::Row::try_get(row, "goal_pattern") {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let template_json: String = match sqlx::Row::try_get(row, "template_json") {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let success_rate: f32 = sqlx::Row::try_get(row, "success_rate").unwrap_or(0.0);
+        let use_count: i32 = sqlx::Row::try_get(row, "use_count").unwrap_or(0);
+
+        // Parse subtask_titles from template_json
+        let subtask_titles = if let Ok(json) = serde_json::from_str::<serde_json::Value>(&template_json) {
+            json.get("subtask_titles")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+
+        if subtask_titles.is_empty() {
+            continue;
+        }
+
+        hints.push(PlanTemplateHint {
+            goal_pattern,
+            subtask_titles,
+            success_rate: success_rate as f64,
+            use_count: use_count as u32,
+        });
+    }
+
+    hints
+}
 pub fn plan_response_parse_error_preview(
     response: &str,
     max_lines: usize,
@@ -3708,6 +3836,7 @@ Done!"#;
             ],
             git_branch: Some("feature/auth".to_string()),
             test_framework: Some("jest".to_string()),
+            prior_templates: vec![],
         };
 
         let prompt = decomposition_prompt("Add user authentication", &ctx);
@@ -3737,6 +3866,81 @@ Done!"#;
             prompt.contains("acceptance"),
             "should ask for acceptance: {prompt}"
         );
+    }
+
+    #[test]
+    fn decomposition_prompt_includes_prior_templates() {
+        let ctx = ProjectContext {
+            root: "/test".into(),
+            languages: vec!["Rust".into()],
+            prior_templates: vec![
+                PlanTemplateHint {
+                    goal_pattern: "add jwt authentication".into(),
+                    subtask_titles: vec![
+                        "Create auth module".into(),
+                        "Add middleware".into(),
+                        "Write tests".into(),
+                    ],
+                    success_rate: 0.95,
+                    use_count: 3,
+                },
+            ],
+            ..Default::default()
+        };
+
+        let prompt = decomposition_prompt("Add OAuth login", &ctx);
+        assert!(
+            prompt.contains("Learned Patterns"),
+            "should include templates section"
+        );
+        assert!(
+            prompt.contains("add jwt authentication"),
+            "should include template goal"
+        );
+        assert!(
+            prompt.contains("Create auth module"),
+            "should include subtask titles"
+        );
+        assert!(
+            prompt.contains("95%"),
+            "should include success rate"
+        );
+        assert!(
+            prompt.contains("3 times"),
+            "should include use count"
+        );
+    }
+
+    #[test]
+    fn decomposition_prompt_omits_empty_templates() {
+        let ctx = ProjectContext {
+            root: "/test".into(),
+            languages: vec!["Rust".into()],
+            prior_templates: vec![],
+            ..Default::default()
+        };
+
+        let prompt = decomposition_prompt("Add feature", &ctx);
+        assert!(
+            !prompt.contains("Learned Patterns"),
+            "should not include templates section when empty"
+        );
+    }
+
+    #[test]
+    fn plan_template_hint_serde_roundtrip() {
+        let hint = PlanTemplateHint {
+            goal_pattern: "test goal".into(),
+            subtask_titles: vec!["step 1".into(), "step 2".into()],
+            success_rate: 0.8,
+            use_count: 5,
+        };
+        let json = serde_json::to_string(&hint).unwrap();
+        let deserialized: PlanTemplateHint = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.goal_pattern, "test goal");
+        assert_eq!(deserialized.subtask_titles.len(), 2);
+        assert!((deserialized.success_rate - 0.8).abs() < 0.001);
+        assert_eq!(deserialized.use_count, 5);
     }
 
     #[test]

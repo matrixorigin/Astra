@@ -1,6 +1,33 @@
 use super::*;
 use mo_agent_runtime::plan_decompose;
 
+/// Enrich a `ProjectContext` with learned plan templates from cloud storage.
+///
+/// Best-effort: returns quietly if no cloud connection or query fails.
+async fn enrich_with_templates(
+    context: &mut plan_decompose::ProjectContext,
+    matrix_runtime: Option<&std::sync::Arc<mo_agent_runtime::MatrixCloudRuntime>>,
+    user_id: Option<&str>,
+    goal: &str,
+) {
+    let Some(mc) = matrix_runtime else {
+        return;
+    };
+    let pool = mc.shared_pool().get();
+    let uid = user_id.unwrap_or("anonymous");
+    let templates =
+        plan_decompose::query_similar_templates(pool, uid, goal, 3).await;
+    if !templates.is_empty() {
+        eprintln!(
+            "  {} Found {} learned template{}",
+            "📋".cyan(),
+            templates.len(),
+            if templates.len() == 1 { "" } else { "s" }
+        );
+        context.prior_templates = templates;
+    }
+}
+
 fn eprint_plan_json_parse_failed(full_text: &str, err: &str) {
     eprintln!("  {} Failed to parse plan: {}", "✗".red(), err);
     let prev = plan_decompose::plan_response_parse_error_preview(full_text, 10, 700);
@@ -328,7 +355,7 @@ pub(super) async fn handle_memory_domain_command(
                     let project_root =
                         std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
                     eprintln!("  {} Analyzing project structure...", "⋯".dim());
-                    let context = plan_decompose::analyze_project(&project_root);
+                    let mut context = plan_decompose::analyze_project(&project_root);
 
                     eprintln!(
                         "  {} {} languages, {} files, {}",
@@ -337,6 +364,9 @@ pub(super) async fn handle_memory_domain_command(
                         context.source_file_count,
                         context.entry_points.join(", ")
                     );
+
+                    // Enrich with learned templates from cloud
+                    enrich_with_templates(&mut context, state.matrix_runtime.as_ref(), state.ingestion_user_id.as_deref(), sub_arg).await;
 
                     // Generate the decomposition prompt
                     let prompt = plan_decompose::decomposition_prompt(sub_arg, &context);
@@ -451,7 +481,10 @@ pub(super) async fn handle_memory_domain_command(
                     let project_root =
                         std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
                     eprintln!("  {} Analyzing project...", "⋯".dim());
-                    let context = analyze_project(&project_root);
+                    let mut context = analyze_project(&project_root);
+
+                    // Enrich with learned templates from cloud
+                    enrich_with_templates(&mut context, state.matrix_runtime.as_ref(), state.ingestion_user_id.as_deref(), sub_arg).await;
 
                     // Generate initial decomposition prompt
                     let prompt = decomposition_prompt(sub_arg, &context);
@@ -1270,7 +1303,8 @@ pub(super) async fn handle_memory_domain_command(
                     let project_root =
                         std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
                     eprintln!("  {} Analyzing project...", "⋯".dim());
-                    let context = analyze_project(&project_root);
+                    let mut context = analyze_project(&project_root);
+                    enrich_with_templates(&mut context, state.matrix_runtime.as_ref(), state.ingestion_user_id.as_deref(), sub_arg).await;
                     let prompt = decomposition_prompt(sub_arg, &context);
                     eprintln!(
                         "  {} Decomposing and auto-executing: {}",
@@ -1437,6 +1471,7 @@ pub async fn handle_plan_mode_input(
             return Ok(());
         };
 
+        enrich_with_templates(&mut plan_state.context, state.matrix_runtime.as_ref(), state.ingestion_user_id.as_deref(), &goal_with_context).await;
         let prompt = decomposition_prompt(&goal_with_context, &plan_state.context);
         let payload = serde_json::json!({
             "messages": [{"role": "user", "content": prompt}],
@@ -1565,6 +1600,7 @@ pub async fn handle_plan_mode_input(
                 eprintln!("  {} Thinking...", "🧠".cyan());
                 eprintln!();
 
+                enrich_with_templates(&mut plan_state.context, state.matrix_runtime.as_ref(), state.ingestion_user_id.as_deref(), &goal).await;
                 let prompt = decomposition_prompt(&goal, &plan_state.context);
                 let payload = serde_json::json!({
                     "messages": [{"role": "user", "content": prompt}],
