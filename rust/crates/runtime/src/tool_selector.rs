@@ -1072,11 +1072,25 @@ impl ToolSelector for LlmToolSelector {
 pub struct FallbackSelector {
     primary: Box<dyn ToolSelector>,
     fallback: Box<dyn ToolSelector>,
+    /// Optional progressive calibrator for dynamic confidence thresholds.
+    progressive_calibrator: Option<Arc<Mutex<ProgressiveCalibrator>>>,
 }
 
 impl FallbackSelector {
     pub fn new(primary: Box<dyn ToolSelector>, fallback: Box<dyn ToolSelector>) -> Self {
-        Self { primary, fallback }
+        Self {
+            primary,
+            fallback,
+            progressive_calibrator: None,
+        }
+    }
+
+    pub fn with_progressive_calibrator(
+        mut self,
+        calibrator: Arc<Mutex<ProgressiveCalibrator>>,
+    ) -> Self {
+        self.progressive_calibrator = Some(calibrator);
+        self
     }
 }
 
@@ -1113,8 +1127,34 @@ impl ToolSelector for FallbackSelector {
                 .any(|t| t.pinned && t.name == n.as_str())
         });
 
-        // High confidence with dynamic tools → trust TF-IDF
-        if fast_result.confidence >= 0.7 && has_dynamic_tools {
+        // High confidence with dynamic tools → trust TF-IDF.
+        // Use calibrated threshold if available, otherwise default 0.7.
+        let threshold = self
+            .progressive_calibrator
+            .as_ref()
+            .and_then(|cal| cal.lock().ok())
+            .map(|locked| {
+                let task_type = learned_context
+                    .task_archetype
+                    .unwrap_or(crate::pipeline::routing::TaskType::Unknown);
+                let intent = format!("{task_type:?}").to_lowercase();
+                let domain = learned_context
+                    .entity_hints
+                    .first()
+                    .and_then(|h| match h.as_str() {
+                        "github" => Some(crate::pipeline::routing::DomainHint::GitHub),
+                        "git" => Some(crate::pipeline::routing::DomainHint::Git),
+                        "code" => Some(crate::pipeline::routing::DomainHint::Code),
+                        "memory" => Some(crate::pipeline::routing::DomainHint::Memory),
+                        "web" => Some(crate::pipeline::routing::DomainHint::Web),
+                        "system" => Some(crate::pipeline::routing::DomainHint::System),
+                        "database" => Some(crate::pipeline::routing::DomainHint::Database),
+                        _ => None,
+                    });
+                locked.calibrated_threshold(&intent, domain, task_type)
+            })
+            .unwrap_or(0.7);
+        if fast_result.confidence >= threshold && has_dynamic_tools {
             return fast_result;
         }
 

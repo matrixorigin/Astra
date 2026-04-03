@@ -141,6 +141,9 @@ fn create_tool_selector_with_quality_internal(
         }
     };
 
+    // Clone calibrator for FallbackSelector before moving into PipelineModules
+    let calibrator_for_selector = calibrator.clone();
+
     let modules = PipelineModules {
         entity_graph,
         pattern_library,
@@ -156,10 +159,10 @@ fn create_tool_selector_with_quality_internal(
             // Register skills with LLM selector so it can include them in selection
             let llm = tool_selector::LlmToolSelector::new(api.clone(), tok.to_string())
                 .with_skills(skill_catalog);
-            Box::new(tool_selector::FallbackSelector::new(
-                Box::new(llm),
-                Box::new(tfidf),
-            ))
+            Box::new(
+                tool_selector::FallbackSelector::new(Box::new(llm), Box::new(tfidf))
+                    .with_progressive_calibrator(calibrator_for_selector),
+            )
         }
         None => Box::new(tfidf),
     };

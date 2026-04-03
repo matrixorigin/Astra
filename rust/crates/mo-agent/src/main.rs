@@ -2272,11 +2272,35 @@ async fn run_plan_execution(
             let (prompt, title) = {
                 let st = plan.subtasks.iter_mut().find(|s| s.id == *next_id).unwrap();
                 st.status = TaskStatus::InProgress;
-                let prompt = plan_decompose::format_subtask_prompt_with_operator_notes(
+                let mut prompt = plan_decompose::format_subtask_prompt_with_operator_notes(
                     st,
                     &state.plan_execution_corrections,
                 );
                 let title = st.title.clone();
+
+                // Inject learned tool suggestions into the subtask prompt
+                if let Some(bridge) = build_learning_bridge(state) {
+                    let domain_hint = state
+                        .durable_task_state
+                        .as_ref()
+                        .and_then(|d| d.contract.domain_hint.clone());
+                    let task_type = state
+                        .durable_task_state
+                        .as_ref()
+                        .and_then(|d| d.contract.task_type.clone());
+                    if let Ok(suggestions) = bridge
+                        .suggest_tools(&title, domain_hint.as_deref(), task_type.as_deref())
+                        .await
+                        && !suggestions.is_empty()
+                    {
+                        let hint = format!(
+                            "[Tool hints from learned patterns: {}]\n\n",
+                            suggestions.join(", ")
+                        );
+                        prompt = format!("{hint}{prompt}");
+                    }
+                }
+
                 (prompt, title)
             };
 
