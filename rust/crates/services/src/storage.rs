@@ -607,6 +607,301 @@ pub async fn ensure_core_schema(settings: &MatrixOneSettings) -> Result<(), sqlx
     .execute(&pool)
     .await?;
 
+    // ─── Skill management tables ─────────────────────────────────────────────────
+
+    query(
+        "CREATE TABLE IF NOT EXISTS skill_installations (
+            installation_id  VARCHAR(36) PRIMARY KEY,
+            user_id          VARCHAR(36) NOT NULL,
+            skill_name       VARCHAR(128) NOT NULL,
+            skill_version    VARCHAR(32) NOT NULL,
+            status           VARCHAR(32) NOT NULL DEFAULT 'active',
+            previous_version VARCHAR(32),
+            installed_at     DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            updated_at       DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
+            UNIQUE INDEX idx_si_user_skill (user_id, skill_name),
+            INDEX idx_si_status (status)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    query(
+        "CREATE TABLE IF NOT EXISTS skill_settings (
+            setting_id    VARCHAR(36) PRIMARY KEY,
+            skill_id      VARCHAR(36),
+            skill_name    VARCHAR(128) NOT NULL,
+            setting_name  VARCHAR(128) NOT NULL,
+            setting_value TEXT,
+            is_secret     SMALLINT NOT NULL DEFAULT 0,
+            scope_type    VARCHAR(32) NOT NULL DEFAULT 'global',
+            scope_id      VARCHAR(36),
+            updated_by    VARCHAR(36),
+            created_at    DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            updated_at    DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
+            UNIQUE INDEX idx_ss_skill_setting_scope (skill_name, setting_name, scope_type, scope_id),
+            INDEX idx_ss_skill (skill_name)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    query(
+        "CREATE TABLE IF NOT EXISTS skill_resource_bindings (
+            binding_id    VARCHAR(36) PRIMARY KEY,
+            user_id       VARCHAR(36) NOT NULL,
+            skill_name    VARCHAR(128) NOT NULL,
+            resource_type VARCHAR(64) NOT NULL,
+            resource_key  VARCHAR(128) NOT NULL,
+            binding_name  VARCHAR(128) NOT NULL,
+            binding_value TEXT,
+            is_secret     SMALLINT NOT NULL DEFAULT 0,
+            updated_by    VARCHAR(36),
+            created_at    DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            updated_at    DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
+            INDEX idx_srb_user_skill (user_id, skill_name),
+            INDEX idx_srb_resource (resource_type, resource_key)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    query(
+        "CREATE TABLE IF NOT EXISTS skill_user_credentials (
+            credential_id   VARCHAR(36) PRIMARY KEY,
+            user_id         VARCHAR(36) NOT NULL,
+            skill_name      VARCHAR(128) NOT NULL,
+            credential_name VARCHAR(128) NOT NULL,
+            value_encrypted TEXT NOT NULL,
+            created_at      DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            updated_at      DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
+            UNIQUE INDEX idx_suc_user_skill_cred (user_id, skill_name, credential_name)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    // ─── Workflow tables ─────────────────────────────────────────────────────────
+
+    query(
+        "CREATE TABLE IF NOT EXISTS wf_definitions (
+            workflow_id  VARCHAR(36) PRIMARY KEY,
+            name         VARCHAR(128) NOT NULL,
+            version      VARCHAR(32) NOT NULL DEFAULT '1.0.0',
+            description  TEXT,
+            definition   LONGTEXT NOT NULL,
+            is_active    SMALLINT NOT NULL DEFAULT 1,
+            created_at   DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            updated_at   DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
+            INDEX idx_wfd_name (name),
+            INDEX idx_wfd_active (is_active)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    query(
+        "CREATE TABLE IF NOT EXISTS wf_runs (
+            run_id           VARCHAR(36) PRIMARY KEY,
+            workflow_id      VARCHAR(36) NOT NULL,
+            agent_run_id     VARCHAR(36),
+            status           VARCHAR(32) NOT NULL DEFAULT 'pending',
+            waiting_for      VARCHAR(128),
+            current_step_idx INT NOT NULL DEFAULT 0,
+            step_results     LONGTEXT,
+            error            TEXT,
+            created_at       DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            updated_at       DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
+            INDEX idx_wfr_workflow (workflow_id),
+            INDEX idx_wfr_status (status),
+            INDEX idx_wfr_agent_run (agent_run_id)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    query(
+        "CREATE TABLE IF NOT EXISTS wf_triggers (
+            trigger_id   VARCHAR(36) PRIMARY KEY,
+            user_id      VARCHAR(36) NOT NULL,
+            agent_id     VARCHAR(36),
+            trigger_type VARCHAR(32) NOT NULL,
+            name         VARCHAR(128) NOT NULL,
+            user_input   TEXT,
+            context      LONGTEXT,
+            cron_expr    VARCHAR(64),
+            secret       VARCHAR(128),
+            session_id   VARCHAR(36),
+            is_active    SMALLINT NOT NULL DEFAULT 1,
+            created_at   DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            updated_at   DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
+            INDEX idx_wft_user (user_id),
+            INDEX idx_wft_type (trigger_type),
+            INDEX idx_wft_active (is_active)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    // ─── Agent management tables ─────────────────────────────────────────────────
+
+    query(
+        "CREATE TABLE IF NOT EXISTS agent_agents (
+            agent_id       VARCHAR(36) PRIMARY KEY,
+            agent_name     VARCHAR(128) NOT NULL,
+            agent_type     VARCHAR(64) NOT NULL DEFAULT 'general',
+            owner_user_id  VARCHAR(36) NOT NULL,
+            is_active      SMALLINT NOT NULL DEFAULT 1,
+            agent_config   LONGTEXT,
+            data_source    TEXT,
+            created_at     DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            updated_at     DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
+            UNIQUE INDEX idx_aa_owner_name (owner_user_id, agent_name),
+            INDEX idx_aa_type (agent_type)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    // ─── Infrastructure tables ───────────────────────────────────────────────────
+
+    query(
+        "CREATE TABLE IF NOT EXISTS infra_sandbox_metadata (
+            sandbox_name VARCHAR(128) PRIMARY KEY,
+            user_id      VARCHAR(36) NOT NULL,
+            description  TEXT,
+            created_by   VARCHAR(36),
+            status       VARCHAR(32) NOT NULL DEFAULT 'active',
+            created_at   DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            updated_at   DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
+            INDEX idx_ism_user (user_id),
+            INDEX idx_ism_status (status)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    // ─── Memory and knowledge tables ─────────────────────────────────────────────
+
+    query(
+        "CREATE TABLE IF NOT EXISTS mem_memories (
+            memory_id          VARCHAR(36) PRIMARY KEY,
+            user_id            VARCHAR(36) NOT NULL,
+            content            TEXT NOT NULL,
+            memory_type        VARCHAR(32) NOT NULL DEFAULT 'semantic',
+            is_active          SMALLINT NOT NULL DEFAULT 1,
+            initial_confidence DECIMAL(5,4) DEFAULT 0.5,
+            observed_at        DATETIME(6),
+            created_at         DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            updated_at         DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
+            INDEX idx_mm_user (user_id),
+            INDEX idx_mm_type (memory_type),
+            INDEX idx_mm_active (is_active)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    query(
+        "CREATE TABLE IF NOT EXISTS sk_knowledge_entries (
+            entry_id     VARCHAR(36) PRIMARY KEY,
+            skill_name   VARCHAR(128) NOT NULL,
+            user_id      VARCHAR(36),
+            entry_type   VARCHAR(64) NOT NULL,
+            content      LONGTEXT NOT NULL,
+            metadata     LONGTEXT,
+            is_active    SMALLINT NOT NULL DEFAULT 1,
+            created_at   DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            updated_at   DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
+            INDEX idx_ske_skill (skill_name),
+            INDEX idx_ske_user (user_id),
+            INDEX idx_ske_type (entry_type)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    // ─── Data versioning tables ──────────────────────────────────────────────────
+
+    query(
+        "CREATE TABLE IF NOT EXISTS data_versioning_checkpoints (
+            checkpoint_id   VARCHAR(36) PRIMARY KEY,
+            checkpoint_name VARCHAR(128) NOT NULL,
+            user_id         VARCHAR(36) NOT NULL,
+            description     TEXT,
+            created_at      DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            UNIQUE INDEX idx_dvc_user_name (user_id, checkpoint_name)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    // ─── Evaluation tables ───────────────────────────────────────────────────────
+
+    query(
+        "CREATE TABLE IF NOT EXISTS eval_gate_results (
+            gate_id         VARCHAR(36) PRIMARY KEY,
+            change_type     VARCHAR(64) NOT NULL,
+            change_id       VARCHAR(64) NOT NULL,
+            sessions_tested INT NOT NULL DEFAULT 0,
+            error_rate      DECIMAL(5,4),
+            score_delta     DECIMAL(5,4),
+            passed          SMALLINT NOT NULL DEFAULT 0,
+            created_at      DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            INDEX idx_egr_change (change_type, change_id),
+            INDEX idx_egr_passed (passed)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    query(
+        "CREATE TABLE IF NOT EXISTS eval_quality_assessments (
+            assessment_id VARCHAR(36) PRIMARY KEY,
+            target_id     VARCHAR(64) NOT NULL,
+            score         DECIMAL(5,4) NOT NULL,
+            step_count    INT NOT NULL DEFAULT 0,
+            level         VARCHAR(32) NOT NULL DEFAULT 'unknown',
+            created_at    DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            updated_at    DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
+            INDEX idx_eqa_target (target_id),
+            INDEX idx_eqa_level (level)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    query(
+        "CREATE TABLE IF NOT EXISTS eval_user_feedback (
+            feedback_id   VARCHAR(36) PRIMARY KEY,
+            user_id       VARCHAR(36) NOT NULL,
+            session_id    VARCHAR(36),
+            turn_id       VARCHAR(36),
+            feedback_type VARCHAR(64) NOT NULL,
+            rating        INT,
+            comment       TEXT,
+            created_at    DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            INDEX idx_euf_user (user_id),
+            INDEX idx_euf_session (session_id),
+            INDEX idx_euf_type (feedback_type)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    query(
+        "CREATE TABLE IF NOT EXISTS governance_runs (
+            run_id     VARCHAR(36) PRIMARY KEY,
+            task_name  VARCHAR(128) NOT NULL,
+            result     LONGTEXT,
+            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            INDEX idx_gr_task (task_name),
+            INDEX idx_gr_created (created_at)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
     Ok(())
 }
 

@@ -332,8 +332,7 @@ pub async fn on_plan_complete(durable: &mut DurableTaskState) -> bool {
         eprintln!("      {} {}", "▸".grey(), cmd_hint);
     }
 
-    let spinner =
-        super::stream_render::Spinner::start("🔬 Running global checks".into());
+    let spinner = super::stream_render::Spinner::start("🔬 Running global checks".into());
     let verify_result = durable.lifecycle.verify_global(&task_id).await;
     spinner.stop_clear();
 
