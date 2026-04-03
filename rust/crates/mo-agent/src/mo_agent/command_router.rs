@@ -227,8 +227,12 @@ pub(super) async fn execute_cli_command(
         }
 
         Some(Command::Chat(args)) => {
-            // Handle --no-color: set NO_COLOR environment variable for crossterm
-            if args.no_color {
+            // Handle --no-color or non-terminal stderr: disable ANSI colors via NO_COLOR env.
+            // crossterm checks NO_COLOR to suppress escape sequences globally.
+            if args.no_color
+                || (!std::io::IsTerminal::is_terminal(&std::io::stderr())
+                    && std::env::var("NO_COLOR").is_err())
+            {
                 unsafe {
                     std::env::set_var("NO_COLOR", "1");
                 }
