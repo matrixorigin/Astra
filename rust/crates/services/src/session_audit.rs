@@ -394,16 +394,21 @@ impl SessionAuditService for DatabaseSessionAuditService {
         session_id: &str,
     ) -> AuditResult<SessionAuditSummary> {
         let pool = self.get_pool().await.map_err(internal_error)?;
-        self.verify_session_owner(&pool, session_id, user_id)
-            .await?;
 
-        // Get session metadata from agent_sessions
-        let sess_row =
-            query("SELECT status, created_at, ended_at FROM agent_sessions WHERE session_id = ?")
-                .bind(session_id)
-                .fetch_one(&pool)
-                .await
-                .map_err(internal_error)?;
+        // Single round-trip: session row + owner check (replaces verify_session_owner + session SELECT).
+        let sess_row = query(
+            "SELECT user_id, status, created_at, ended_at FROM agent_sessions WHERE session_id = ?",
+        )
+        .bind(session_id)
+        .fetch_optional(&pool)
+        .await
+        .map_err(internal_error)?;
+
+        let sess_row = sess_row.ok_or_else(|| error_response(StatusCode::NOT_FOUND, "Session not found"))?;
+        let owner: String = sess_row.try_get("user_id").map_err(internal_error)?;
+        if owner != user_id {
+            return Err(error_response(StatusCode::NOT_FOUND, "Session not found"));
+        }
 
         let status: String = sess_row.try_get("status").unwrap_or_default();
         let created_at: String = sess_row
@@ -411,95 +416,68 @@ impl SessionAuditService for DatabaseSessionAuditService {
             .unwrap_or_default();
         let ended_at: Option<String> = sess_row.try_get("ended_at").ok();
 
-        // Aggregate counts by event_type from agent_events
-        let rows = query(
-            "SELECT event_type, COUNT(*) as cnt \
-             FROM agent_events \
-             WHERE session_id = ? AND user_id = ? \
-             GROUP BY event_type",
-        )
-        .bind(session_id)
-        .bind(user_id)
-        .fetch_all(&pool)
-        .await
-        .map_err(internal_error)?;
-
-        let mut turn_count: u32 = 0;
-        let mut error_count: u32 = 0;
-        let mut stall_count: u32 = 0;
-        let mut checkpoint_count: u32 = 0;
-        let mut compact_count: u32 = 0;
-        let mut tool_calls_total: u32 = 0;
-        let mut tool_calls_failed: u32 = 0;
-
-        for row in &rows {
-            let et: String = row.try_get("event_type").unwrap_or_default();
-            let cnt: i64 = row.try_get("cnt").unwrap_or(0);
-            match et.as_str() {
-                "turn" => turn_count = cnt as u32,
-                "turn_error" => error_count = cnt as u32,
-                "stall_detected" => stall_count = cnt as u32,
-                "checkpoint" => checkpoint_count = cnt as u32,
-                "compact" => compact_count = cnt as u32,
-                "tool_call" => tool_calls_total += cnt as u32,
-                "tool_error" => {
-                    tool_calls_failed = cnt as u32;
-                    tool_calls_total += cnt as u32;
-                }
-                _ => {}
-            }
-        }
-
-        // Token usage aggregation for turn events
-        let token_row = query(
+        // One pass over agent_events: counts, tokens, duration bounds, distinct models.
+        // MatrixOne rejects `SEPARATOR CHAR(31)`; embed the unit-separator as a literal (same as MySQL).
+        const MODEL_SEP: char = '\u{001f}';
+        let metrics_row = query(&format!(
             "SELECT \
-               COALESCE(SUM(token_input), 0) AS tokens_in, \
-               COALESCE(SUM(token_output), 0) AS tokens_out \
-             FROM agent_events \
-             WHERE session_id = ? AND user_id = ? AND event_type = 'turn' AND token_usage IS NOT NULL",
-        )
-        .bind(session_id)
-        .bind(user_id)
-        .fetch_one(&pool)
-        .await
-        .map_err(internal_error)?;
-
-        let tokens_in: i64 = token_row.try_get("tokens_in").unwrap_or(0);
-        let tokens_out: i64 = token_row.try_get("tokens_out").unwrap_or(0);
-
-        // Distinct models used
-        let model_rows = query(
-            "SELECT DISTINCT llm_model_used FROM agent_events \
-             WHERE session_id = ? AND user_id = ? AND llm_model_used IS NOT NULL",
-        )
-        .bind(session_id)
-        .bind(user_id)
-        .fetch_all(&pool)
-        .await
-        .map_err(internal_error)?;
-
-        let models_used: Vec<String> = model_rows
-            .iter()
-            .filter_map(|r| r.try_get::<String, _>("llm_model_used").ok())
-            .collect();
-
-        // Duration: difference between first and last event
-        let dur_row = query(
-            "SELECT \
+               COUNT(CASE WHEN event_type = 'turn' THEN 1 END) AS turn_count, \
+               COUNT(CASE WHEN event_type = 'turn_error' THEN 1 END) AS error_count, \
+               COUNT(CASE WHEN event_type = 'stall_detected' THEN 1 END) AS stall_count, \
+               COUNT(CASE WHEN event_type = 'checkpoint' THEN 1 END) AS checkpoint_count, \
+               COUNT(CASE WHEN event_type = 'compact' THEN 1 END) AS compact_count, \
+               COUNT(CASE WHEN event_type = 'tool_call' THEN 1 END) \
+                 + COUNT(CASE WHEN event_type = 'tool_error' THEN 1 END) AS tool_calls_total, \
+               COUNT(CASE WHEN event_type = 'tool_error' THEN 1 END) AS tool_calls_failed, \
+               COALESCE(SUM(CASE WHEN event_type = 'turn' AND token_usage IS NOT NULL \
+                 THEN COALESCE(token_input, 0) ELSE 0 END), 0) AS tokens_in, \
+               COALESCE(SUM(CASE WHEN event_type = 'turn' AND token_usage IS NOT NULL \
+                 THEN COALESCE(token_output, 0) ELSE 0 END), 0) AS tokens_out, \
                MIN(created_at) AS first_at, \
-               MAX(created_at) AS last_at \
-             FROM agent_events \
-             WHERE session_id = ? AND user_id = ?",
-        )
+               MAX(created_at) AS last_at, \
+               (SELECT GROUP_CONCAT(m ORDER BY m SEPARATOR '{sep}') \
+                  FROM (SELECT DISTINCT llm_model_used AS m FROM agent_events e3 \
+                        WHERE e3.session_id = ? AND e3.user_id = ? \
+                          AND e3.llm_model_used IS NOT NULL) t) AS models_concat \
+             FROM agent_events e \
+             WHERE e.session_id = ? AND e.user_id = ?",
+            sep = MODEL_SEP,
+        ))
+        .bind(session_id)
+        .bind(user_id)
         .bind(session_id)
         .bind(user_id)
         .fetch_one(&pool)
         .await
         .map_err(internal_error)?;
 
-        let first_at: Option<String> = dur_row.try_get("first_at").ok();
-        let last_at: Option<String> = dur_row.try_get("last_at").ok();
+        let turn_count: u32 = metrics_row.try_get::<i64, _>("turn_count").unwrap_or(0) as u32;
+        let error_count: u32 = metrics_row.try_get::<i64, _>("error_count").unwrap_or(0) as u32;
+        let stall_count: u32 = metrics_row.try_get::<i64, _>("stall_count").unwrap_or(0) as u32;
+        let checkpoint_count: u32 = metrics_row.try_get::<i64, _>("checkpoint_count").unwrap_or(0) as u32;
+        let compact_count: u32 = metrics_row.try_get::<i64, _>("compact_count").unwrap_or(0) as u32;
+        let tool_calls_total: u32 = metrics_row.try_get::<i64, _>("tool_calls_total").unwrap_or(0) as u32;
+        let tool_calls_failed: u32 = metrics_row.try_get::<i64, _>("tool_calls_failed").unwrap_or(0) as u32;
+
+        let tokens_in: i64 = metrics_row.try_get("tokens_in").unwrap_or(0);
+        let tokens_out: i64 = metrics_row.try_get("tokens_out").unwrap_or(0);
+
+        let first_at: Option<String> = metrics_row.try_get("first_at").ok();
+        let last_at: Option<String> = metrics_row.try_get("last_at").ok();
         let duration_secs = compute_duration_secs(first_at.as_deref(), last_at.as_deref());
+
+        let models_used: Vec<String> = metrics_row
+            .try_get::<String, _>("models_concat")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .map(|s| {
+                s.split(MODEL_SEP)
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(String::from)
+                    .collect()
+            })
+            .unwrap_or_default();
 
         Ok(SessionAuditSummary {
             session_id: session_id.to_string(),
@@ -761,81 +739,87 @@ impl SessionAuditService for DatabaseSessionAuditService {
         self.verify_session_owner(&pool, session_id, user_id)
             .await?;
 
-        // Query tool_call and tool_error events, extract tool_name and duration from metadata
+        // Aggregate on materialized meta_tool_name / meta_duration_ms (same pattern as
+        // get_cross_session_tools); last_error from the latest tool_error row content.
         let rows = query(
-            "SELECT event_type, metadata \
-             FROM agent_events \
-             WHERE session_id = ? AND user_id = ? \
-               AND event_type IN ('tool_call', 'tool_error') \
-             ORDER BY created_at ASC",
+            "SELECT \
+               agg.tool_name, agg.total_calls, agg.total_success, agg.total_failures, \
+               agg.avg_ms, agg.max_ms, agg.total_duration_ms, \
+               le.content AS last_error \
+             FROM (\
+               SELECT \
+                 meta_tool_name AS tool_name, \
+                 COUNT(*) AS total_calls, \
+                 COUNT(CASE WHEN event_type = 'tool_call' THEN 1 END) AS total_success, \
+                 COUNT(CASE WHEN event_type = 'tool_error' THEN 1 END) AS total_failures, \
+                 COALESCE(AVG(meta_duration_ms), 0) AS avg_ms, \
+                 COALESCE(MAX(meta_duration_ms), 0) AS max_ms, \
+                 COALESCE(SUM(meta_duration_ms), 0) AS total_duration_ms \
+               FROM agent_events \
+               WHERE session_id = ? AND user_id = ? \
+                 AND event_type IN ('tool_call', 'tool_error') \
+               GROUP BY tool_name \
+             ) agg \
+             LEFT JOIN (\
+               SELECT tool_name, content FROM (\
+                 SELECT \
+                   meta_tool_name AS tool_name, \
+                   content, \
+                   ROW_NUMBER() OVER (PARTITION BY meta_tool_name ORDER BY created_at DESC) AS rn \
+                 FROM agent_events \
+                 WHERE session_id = ? AND user_id = ? AND event_type = 'tool_error'\
+               ) ranked WHERE rn = 1\
+             ) le ON le.tool_name = agg.tool_name \
+             ORDER BY agg.total_duration_ms DESC",
         )
+        .bind(session_id)
+        .bind(user_id)
         .bind(session_id)
         .bind(user_id)
         .fetch_all(&pool)
         .await
         .map_err(internal_error)?;
 
-        let mut tools: std::collections::HashMap<String, ToolAnalytics> =
-            std::collections::HashMap::new();
-
-        for row in &rows {
-            let et: String = row.try_get("event_type").unwrap_or_default();
-            let meta_str: String = row.try_get("metadata").unwrap_or_default();
-            let meta: serde_json::Value =
-                serde_json::from_str(&meta_str).unwrap_or(serde_json::Value::Null);
-
-            let tool_name = meta
-                .get("tool_name")
-                .and_then(|v| v.as_str())
-                .unwrap_or("unknown")
-                .to_string();
-            let duration_ms = meta
-                .get("duration_ms")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0);
-            let ok = et == "tool_call";
-            let error_msg = meta.get("error").and_then(|v| v.as_str()).map(String::from);
-
-            let entry = tools
-                .entry(tool_name.clone())
-                .or_insert_with(|| ToolAnalytics {
-                    name: tool_name,
-                    call_count: 0,
-                    success_count: 0,
-                    fail_count: 0,
-                    success_rate: 0.0,
-                    avg_duration_ms: 0.0,
-                    max_duration_ms: 0,
-                    total_duration_ms: 0,
-                    last_error: None,
-                });
-
-            entry.call_count += 1;
-            if ok {
-                entry.success_count += 1;
-            } else {
-                entry.fail_count += 1;
-                if error_msg.is_some() {
-                    entry.last_error = error_msg;
+        let result: Vec<ToolAnalytics> = rows
+            .iter()
+            .filter_map(|row| {
+                let mut name: String = row.try_get("tool_name").unwrap_or_default();
+                name = name.trim_matches('"').to_string();
+                if name.is_empty() {
+                    name = "unknown".into();
                 }
-            }
-            entry.total_duration_ms += duration_ms;
-            entry.max_duration_ms = entry.max_duration_ms.max(duration_ms);
-        }
-
-        let mut result: Vec<ToolAnalytics> = tools
-            .into_values()
-            .map(|mut t| {
-                if t.call_count > 0 {
-                    t.success_rate = t.success_count as f64 / t.call_count as f64;
-                    t.avg_duration_ms = t.total_duration_ms as f64 / t.call_count as f64;
+                let total_calls = row.try_get::<i64, _>("total_calls").unwrap_or(0) as u32;
+                if total_calls == 0 {
+                    return None;
                 }
-                t
+                let total_success = row.try_get::<i64, _>("total_success").unwrap_or(0) as u32;
+                let total_failures = row.try_get::<i64, _>("total_failures").unwrap_or(0) as u32;
+                let total_duration_ms = row.try_get::<i64, _>("total_duration_ms").unwrap_or(0) as u64;
+                let last_error = row
+                    .try_get::<String, _>("last_error")
+                    .ok()
+                    .filter(|s| !s.is_empty());
+
+                Some(ToolAnalytics {
+                    name,
+                    call_count: total_calls,
+                    success_count: total_success,
+                    fail_count: total_failures,
+                    success_rate: total_success as f64 / total_calls as f64,
+                    avg_duration_ms: row
+                        .try_get::<f64, _>("avg_ms")
+                        .or_else(|_| row.try_get::<i64, _>("avg_ms").map(|v| v as f64))
+                        .unwrap_or(0.0),
+                    max_duration_ms: row
+                        .try_get::<i64, _>("max_ms")
+                        .or_else(|_| row.try_get::<f64, _>("max_ms").map(|v| v as i64))
+                        .unwrap_or(0) as u64,
+                    total_duration_ms,
+                    last_error,
+                })
             })
             .collect();
 
-        // Sort by total duration descending (heaviest tools first)
-        result.sort_by(|a, b| b.total_duration_ms.cmp(&a.total_duration_ms));
         Ok(result)
     }
 

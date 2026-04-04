@@ -160,6 +160,7 @@ pub async fn ensure_core_schema(settings: &MatrixOneSettings) -> Result<(), sqlx
             created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             INDEX idx_agent_events_session_created (session_id, created_at),
             INDEX idx_agent_events_session_type_created (session_id, event_type, created_at),
+            INDEX idx_agent_events_session_parent (session_id, parent_event_id),
             INDEX idx_agent_events_user_created (user_id, created_at),
             INDEX idx_agent_events_causal_chain_id (causal_chain_id),
             INDEX idx_agent_events_skill_created (skill_name, created_at),
@@ -168,6 +169,19 @@ pub async fn ensure_core_schema(settings: &MatrixOneSettings) -> Result<(), sqlx
     )
     .execute(&pool)
     .await?;
+
+    // Child events (tool_call / tool_error) are fetched by parent turn via parent_event_id.
+    if let Err(e) = query(
+        "CREATE INDEX idx_agent_events_session_parent ON agent_events (session_id, parent_event_id)",
+    )
+    .execute(&pool)
+    .await
+    {
+        let msg = e.to_string().to_lowercase();
+        if !msg.contains("duplicate") && !msg.contains("already exists") {
+            return Err(e);
+        }
+    }
 
     // Context / decisions / evaluation essentials used by turn persistence
     query(
