@@ -536,6 +536,9 @@ struct ReplState {
     /// The REPL readline handler interprets the next line as y/n and
     /// sends the bool through this oneshot.
     pending_approval: Option<tokio::sync::oneshot::Sender<bool>>,
+    /// True while plan display is in the middle of printing streaming LLM tokens.
+    /// Used to insert a newline before the next non-token event.
+    plan_in_token_stream: bool,
 }
 
 impl Default for ReplState {
@@ -595,6 +598,7 @@ impl Default for ReplState {
             delegation_engine: None,
             plan_handle: None,
             pending_approval: None,
+            plan_in_token_stream: false,
         }
     }
 }
@@ -2459,9 +2463,26 @@ fn display_plan_updates_live(
 ) {
     use plan_executor::PlanUpdate;
 
+    // Helper: if we were in the middle of streaming tokens, close that stream
+    // with a newline before printing anything else.
+    let end_token_stream =
+        |in_stream: &mut bool, spinner: &mut Option<effects::PlanActivitySpinner>| {
+            if *in_stream {
+                *in_stream = false;
+                // Stop spinner (if any) and newline to close the streamed text
+                if let Some(s) = spinner.take() {
+                    s.stop_clear();
+                }
+                eprintln!();
+            }
+        };
+
     // Print via eprintln! (readline is not active during this call).
     // Always stops the active spinner first to clear its \r line.
-    let print_line = |spinner: &mut Option<effects::PlanActivitySpinner>, msg: String| {
+    let print_line = |spinner: &mut Option<effects::PlanActivitySpinner>,
+                      in_stream: &mut bool,
+                      msg: String| {
+        end_token_stream(in_stream, spinner);
         // Stop spinner before printing to avoid garbled output
         if let Some(s) = spinner.take() {
             s.stop_clear();
@@ -2561,7 +2582,7 @@ fn display_plan_updates_live(
                 if let Some(tx) = state.pending_approval.take() {
                     let _ = tx.send(false);
                 }
-                print_line(plan_spinner, msg);
+                print_line(plan_spinner, &mut state.plan_in_token_stream, msg);
                 return;
             }
             PlanUpdate::PlanError { error } => {
@@ -2581,7 +2602,7 @@ fn display_plan_updates_live(
                 if let Some(tx) = state.pending_approval.take() {
                     let _ = tx.send(false);
                 }
-                print_line(plan_spinner, msg);
+                print_line(plan_spinner, &mut state.plan_in_token_stream, msg);
                 return;
             }
             PlanUpdate::PlanPaused {
@@ -2662,7 +2683,7 @@ fn display_plan_updates_live(
                         (format!("  {icon} {name} ({dur}){summary}"), None)
                     }
                     StreamEvent::WaitingForModel => {
-                        // Don't print a line — just start the spinner
+                        end_token_stream(&mut state.plan_in_token_stream, plan_spinner);
                         if let Some(s) = plan_spinner.take() {
                             s.stop_clear();
                         }
@@ -2673,7 +2694,7 @@ fn display_plan_updates_live(
                         continue;
                     }
                     StreamEvent::ModelResponding => {
-                        // Replace spinner with "Model responding" spinner
+                        end_token_stream(&mut state.plan_in_token_stream, plan_spinner);
                         if let Some(s) = plan_spinner.take() {
                             s.stop_clear();
                         }
@@ -2684,7 +2705,7 @@ fn display_plan_updates_live(
                         continue;
                     }
                     StreamEvent::Thinking(true) => {
-                        // Replace spinner with "Thinking" spinner
+                        end_token_stream(&mut state.plan_in_token_stream, plan_spinner);
                         if let Some(s) = plan_spinner.take() {
                             s.stop_clear();
                         }
@@ -2694,7 +2715,28 @@ fn display_plan_updates_live(
                         ));
                         continue;
                     }
-                    // Skip noisy events: individual tokens, thinking chunks, status lines
+                    StreamEvent::Token(text) => {
+                        // Stream LLM text tokens inline — stop spinner on first token
+                        if !state.plan_in_token_stream {
+                            if let Some(s) = plan_spinner.take() {
+                                s.stop_clear();
+                            }
+                            state.plan_in_token_stream = true;
+                            // Dim indent prefix for streaming text
+                            eprint!("    ");
+                        }
+                        eprint!("{text}");
+                        continue;
+                    }
+                    StreamEvent::StatusLine(line) => {
+                        end_token_stream(&mut state.plan_in_token_stream, plan_spinner);
+                        if let Some(s) = plan_spinner.take() {
+                            s.stop_clear();
+                        }
+                        eprintln!("    {line}");
+                        continue;
+                    }
+                    // ThinkingChunk, Thinking(false) — skip
                     _ => continue,
                 }
             }
@@ -2717,19 +2759,19 @@ fn display_plan_updates_live(
                     detail.as_deref().unwrap_or(""),
                     reason,
                 );
-                print_line(plan_spinner, msg);
+                print_line(plan_spinner, &mut state.plan_in_token_stream, msg);
                 // Store the response channel for the REPL readline handler.
                 // The next user input line will be interpreted as y/n/a to resolve this.
                 state.pending_approval = Some(response_tx);
                 let prompt_msg = "   Type y(es) to approve, n(o) to deny:".to_string();
-                print_line(plan_spinner, prompt_msg);
+                print_line(plan_spinner, &mut state.plan_in_token_stream, prompt_msg);
                 continue;
             }
             _ => continue, // ParallelGroupInfo, StepByStepPrompt — future use
         };
 
         // Print the message (stops spinner internally)
-        print_line(plan_spinner, msg);
+        print_line(plan_spinner, &mut state.plan_in_token_stream, msg);
 
         // Optionally start a new spinner after the printed line
         if let Some(label) = post_spinner {
