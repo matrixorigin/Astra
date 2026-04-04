@@ -1306,23 +1306,30 @@ pub trait TaskBranchOps: Send + Sync {
 }
 
 /// Production implementation: MatrixOne git4data snapshots.
+///
+/// Uses database-level snapshots for fine-grained rollback:
+///   CREATE SNAPSHOT name FOR DATABASE db;
+///   RESTORE ACCOUNT acc DATABASE db FROM SNAPSHOT name;
+///   DROP SNAPSHOT IF EXISTS name;
 pub struct TaskBranchService {
     pool: sqlx::Pool<sqlx::MySql>,
+    /// MatrixOne account name (e.g. "sys") — required for RESTORE ACCOUNT.
     account: String,
+    /// Database to snapshot. When set, uses database-level snapshots;
+    /// otherwise falls back to account-level.
+    database: Option<String>,
 }
 
 impl TaskBranchService {
-    pub fn new(pool: sqlx::Pool<sqlx::MySql>) -> Self {
-        Self {
-            pool,
-            account: "sys".to_string(),
-        }
-    }
-
-    pub fn with_account(pool: sqlx::Pool<sqlx::MySql>, account: impl Into<String>) -> Self {
+    pub fn new(
+        pool: sqlx::Pool<sqlx::MySql>,
+        account: impl Into<String>,
+        database: Option<String>,
+    ) -> Self {
         Self {
             pool,
             account: account.into(),
+            database,
         }
     }
 }
@@ -1365,7 +1372,11 @@ impl TaskBranchOps for TaskBranchService {
     ) -> Result<String, String> {
         let name = sanitize_snapshot_name(&format!("task_{task_id}_{subtask_id}_v{version}"));
         validate_snapshot_name(&name)?;
-        let sql = format!("CREATE SNAPSHOT {name} FOR ACCOUNT {}", self.account);
+        let sql = if let Some(ref db) = self.database {
+            format!("CREATE SNAPSHOT {name} FOR DATABASE {db}")
+        } else {
+            format!("CREATE SNAPSHOT {name} FOR ACCOUNT")
+        };
         sqlx::query(&sql)
             .execute(&self.pool)
             .await
@@ -1389,7 +1400,17 @@ impl TaskBranchOps for TaskBranchService {
 
     async fn rollback_to_snapshot(&self, snapshot: &str) -> Result<(), String> {
         validate_snapshot_name(snapshot)?;
-        let sql = format!("RESTORE ACCOUNT FROM SNAPSHOT {snapshot}");
+        let sql = if let Some(ref db) = self.database {
+            format!(
+                "RESTORE ACCOUNT {} DATABASE {db} FROM SNAPSHOT {snapshot}",
+                self.account
+            )
+        } else {
+            format!(
+                "RESTORE ACCOUNT {} FROM SNAPSHOT {snapshot}",
+                self.account
+            )
+        };
         sqlx::query(&sql)
             .execute(&self.pool)
             .await
@@ -1424,10 +1445,12 @@ impl GitBranchOps {
         }
     }
 
-    /// Check if the work_dir is inside a git repository.
+    /// Check if the work_dir is inside a git repository with at least one commit.
     pub fn is_git_repo(work_dir: &std::path::Path) -> bool {
+        // Verify HEAD exists (repo has at least one commit) — prevents false positives
+        // from bare/empty repos (e.g. stray `.git` dirs in /tmp).
         std::process::Command::new("git")
-            .args(["rev-parse", "--git-dir"])
+            .args(["rev-parse", "HEAD"])
             .current_dir(work_dir)
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
@@ -2123,7 +2146,33 @@ pub struct MatrixOneDurableTaskLifecycle {
 
 impl MatrixOneDurableTaskLifecycle {
     pub fn new(pool: sqlx::Pool<sqlx::MySql>, work_dir: std::path::PathBuf) -> Self {
-        let branch_ops: Arc<dyn TaskBranchOps> = Arc::new(TaskBranchService::new(pool.clone()));
+        // Default: account-level snapshot (account "sys", no database filter)
+        let branch_ops: Arc<dyn TaskBranchOps> =
+            Arc::new(TaskBranchService::new(pool.clone(), "sys", None));
+        Self {
+            pool,
+            branch_ops,
+            work_dir,
+            llm_judge: None,
+            event_sender: None,
+            session_id: String::new(),
+            user_id: String::new(),
+            learning_bridge: None,
+            output_sink: None,
+        }
+    }
+
+    /// Create with database-level snapshots for finer granularity.
+    pub fn with_database(
+        pool: sqlx::Pool<sqlx::MySql>,
+        work_dir: std::path::PathBuf,
+        account: impl Into<String>,
+        database: impl Into<String>,
+    ) -> Self {
+        let account = account.into();
+        let database = database.into();
+        let branch_ops: Arc<dyn TaskBranchOps> =
+            Arc::new(TaskBranchService::new(pool.clone(), account, Some(database)));
         Self {
             pool,
             branch_ops,
