@@ -10,6 +10,7 @@ mod cli_loop_host;
 
 use std::collections::HashSet;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Instant;
 
 use astra_core::RuntimeLimits;
@@ -24,6 +25,7 @@ use astra_runtime::{
     turn::chat_history_openai::openai_messages_from_repl_history,
     turn::chat_turn_heuristics::infer_task_execution_profile,
     turn::edge_prompt_context::detect_project_languages,
+    turn::skill_tool::SkillResolver,
     turn::stop_hooks_yaml::detect_turn_hook_sets,
     turn::tool_health::ToolHealthTracker,
     turn::tool_schema_prune::openai_tool_names_from_schemas,
@@ -163,6 +165,16 @@ pub(crate) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
         cancel_flag: None,
         cancel_token: p.cancel_token.clone(),
         delegation_engine: p.delegation_engine,
+        skill_resolver: {
+            let resolver =
+                crate::skill_instructions::CliSkillResolver::new(Arc::clone(p.skill_registry));
+            let skills = resolver.available_skills();
+            if skills.is_empty() {
+                None
+            } else {
+                Some(Arc::new(resolver) as Arc<dyn astra_runtime::turn::skill_tool::SkillResolver>)
+            }
+        },
         stop_hooks: hook_sets.stop_hooks,
         stop_hook_runs: 0,
         teammate_idle_hooks: hook_sets.teammate_idle_hooks,

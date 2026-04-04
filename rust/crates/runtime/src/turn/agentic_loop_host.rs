@@ -223,6 +223,12 @@ pub struct AgenticLoopState {
     /// through the delegation engine instead of the headless tool round.
     pub delegation_engine: Option<Arc<crate::server::delegation_engine::DelegationEngine>>,
 
+    // ── Skills ──
+    /// Optional skill resolver for executing skills as tool calls.
+    /// When set, the loop injects a `skill` tool schema and intercepts
+    /// `skill` calls, returning resolved instructions as tool results.
+    pub skill_resolver: Option<Arc<dyn crate::turn::skill_tool::SkillResolver>>,
+
     // ── Stop hooks ──
     /// Verification commands run before the loop is allowed to complete.
     /// For plan subtasks, populated from declarative `when: task_completed` hooks.
@@ -581,6 +587,14 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
         host.inject_tool_schema(delegate_tool_schema());
     }
 
+    // ─── Preamble: auto-inject skill tool when skills are available ──────
+    if let Some(resolver) = &state.skill_resolver {
+        let skills = resolver.available_skills();
+        if !skills.is_empty() {
+            host.inject_tool_schema(crate::turn::skill_tool::skill_tool_schema(&skills));
+        }
+    }
+
     for turn_index in 0..state.max_turns {
         // ─── Cancel check (cooperative) ─────────────────────────────────
         if state
@@ -731,6 +745,37 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
         } else {
             &remaining_tool_calls
         };
+
+        // ─── Step 3c: Skill interception ─────────────────────────────────
+        // If a skill resolver is wired, intercept "skill" tool calls and
+        // return resolved instructions as tool results.
+        let (skill_results, post_skill_tool_calls);
+        let effective_tool_calls = if let Some(resolver) = &state.skill_resolver {
+            let (sr, remaining) = crate::turn::skill_tool::partition_and_execute_skills(
+                effective_tool_calls,
+                resolver.as_ref(),
+            )
+            .await;
+            skill_results = sr;
+            post_skill_tool_calls = remaining;
+            &post_skill_tool_calls
+        } else {
+            skill_results = Vec::new();
+            // No skill resolver — pass through unchanged
+            post_skill_tool_calls = effective_tool_calls.to_vec();
+            &post_skill_tool_calls
+        };
+
+        // Inject skill results into messages + tool_results
+        for (call_id, result_text) in &skill_results {
+            let tool_msg = serde_json::json!({
+                "role": "tool",
+                "tool_call_id": call_id,
+                "content": result_text,
+            });
+            state.messages.push(tool_msg.clone());
+            state.tool_results.push(tool_msg);
+        }
 
         // ─── Step 4: Headless tool round ────────────────────────────────
         // Snapshot error counts before the round for per-turn delta tracking.
@@ -1096,6 +1141,7 @@ mod tests {
             cancel_flag: None,
             cancel_token: None,
             delegation_engine: None,
+            skill_resolver: None,
             stop_hooks: Vec::new(),
             stop_hook_runs: 0,
             teammate_idle_hooks: Vec::new(),

@@ -1000,6 +1000,7 @@ mod tests {
             cancel_flag: None,
             cancel_token: None,
             delegation_engine: None,
+            skill_resolver: None,
             stop_hooks: Vec::new(),
             stop_hook_runs: 0,
             teammate_idle_hooks: Vec::new(),

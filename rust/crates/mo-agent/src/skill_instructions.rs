@@ -1296,6 +1296,77 @@ pub fn detect_skill_hybrid_sync(registry: &SkillRegistry, message: &str) -> Opti
     }
 }
 
+// ─── CLI SkillResolver ──────────────────────────────────────────────────────
+
+/// CLI-side [`SkillResolver`](astra_runtime::turn::skill_tool::SkillResolver)
+/// implementation that wraps a [`SharedSkillRegistry`].
+///
+/// When the LLM calls the `skill` tool, this resolver:
+/// 1. Looks up the skill by name in the registry
+/// 2. Lazy-loads instructions (Level 2) if only metadata was loaded
+/// 3. Returns the resolved instructions for injection into the conversation
+pub struct CliSkillResolver {
+    registry: SharedSkillRegistry,
+}
+
+impl CliSkillResolver {
+    pub fn new(registry: SharedSkillRegistry) -> Self {
+        Self { registry }
+    }
+}
+
+impl astra_runtime::turn::skill_tool::SkillResolver for CliSkillResolver {
+    fn resolve(
+        &self,
+        name: &str,
+    ) -> Result<astra_runtime::turn::skill_tool::ResolvedSkill, String> {
+        let mut reg = self
+            .registry
+            .write()
+            .map_err(|e| format!("skill registry lock poisoned: {e}"))?;
+
+        let skill = reg
+            .get_mut(name)
+            .ok_or_else(|| format!("unknown skill: {name}"))?;
+
+        // Lazy-load instructions if only metadata was loaded
+        skill.load_instructions()?;
+
+        let instruction = skill
+            .instructions()
+            .ok_or_else(|| format!("skill '{name}' has no instructions after loading"))?;
+
+        Ok(astra_runtime::turn::skill_tool::ResolvedSkill {
+            name: name.to_string(),
+            instructions: instruction.instructions.clone(),
+            model: instruction.model.clone(),
+            max_tokens: if instruction.max_tokens > 0 {
+                Some(instruction.max_tokens)
+            } else {
+                None
+            },
+            allowed_tools: instruction.allowed_tools.clone(),
+        })
+    }
+
+    fn available_skills(&self) -> Vec<astra_runtime::turn::skill_tool::SkillToolInfo> {
+        let reg = match self.registry.read() {
+            Ok(r) => r,
+            Err(_) => return Vec::new(),
+        };
+
+        reg.all_skills()
+            .iter()
+            .filter(|s| s.metadata.user_invocable)
+            .map(|s| astra_runtime::turn::skill_tool::SkillToolInfo {
+                name: s.name().to_string(),
+                description: s.description().to_string(),
+                when_to_use: s.metadata.when_to_use.clone(),
+            })
+            .collect()
+    }
+}
+
 #[cfg(test)]
 mod registry_tests {
     use super::*;

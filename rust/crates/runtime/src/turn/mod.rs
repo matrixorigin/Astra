@@ -64,6 +64,7 @@ pub mod routing_metrics;
 pub(crate) mod services;
 pub mod session_cache;
 pub mod skill_instructions_merge;
+pub mod skill_tool;
 pub mod snapshot;
 pub mod sse_blocks;
 pub mod sse_data_lines;
