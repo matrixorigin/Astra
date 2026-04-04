@@ -1308,11 +1308,22 @@ pub trait TaskBranchOps: Send + Sync {
 /// Production implementation: MatrixOne git4data snapshots.
 pub struct TaskBranchService {
     pool: sqlx::Pool<sqlx::MySql>,
+    account: String,
 }
 
 impl TaskBranchService {
     pub fn new(pool: sqlx::Pool<sqlx::MySql>) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            account: "sys".to_string(),
+        }
+    }
+
+    pub fn with_account(pool: sqlx::Pool<sqlx::MySql>, account: impl Into<String>) -> Self {
+        Self {
+            pool,
+            account: account.into(),
+        }
     }
 }
 
@@ -1354,7 +1365,7 @@ impl TaskBranchOps for TaskBranchService {
     ) -> Result<String, String> {
         let name = sanitize_snapshot_name(&format!("task_{task_id}_{subtask_id}_v{version}"));
         validate_snapshot_name(&name)?;
-        let sql = format!("CREATE SNAPSHOT {name} FOR ACCOUNT");
+        let sql = format!("CREATE SNAPSHOT {name} FOR ACCOUNT {}", self.account);
         sqlx::query(&sql)
             .execute(&self.pool)
             .await
