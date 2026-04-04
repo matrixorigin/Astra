@@ -1254,19 +1254,31 @@ impl StreamRenderState {
                         }
                     }
                 }
+                // Show actual match content (first 5 matches with highlighting)
+                let preview_lines: Vec<String> = match_lines
+                    .iter()
+                    .take(5)
+                    .map(|line| {
+                        // Parse "file:line:content" or "file:content" format
+                        let truncated = truncate_line(line, 65);
+                        highlight_code_line(&truncated)
+                    })
+                    .collect();
+
                 if files.is_empty() {
                     Some(format!("{total} matches"))
                 } else {
                     let file_count = files.len();
-                    let shown: Vec<String> =
-                        files.iter().take(3).map(|f| shorten_path(f, 45)).collect();
                     let mut summary = format!("{total} matches in {file_count} file(s)");
-                    for f in &shown {
-                        summary.push_str(&format!("\n      {f}"));
+                    for line in &preview_lines {
+                        summary.push_str(&format!("\n    {line}"));
                     }
-                    let remaining = file_count.saturating_sub(3);
+                    let remaining = total.saturating_sub(5);
                     if remaining > 0 {
-                        summary.push_str(&format!("\n      … +{remaining} more files"));
+                        summary.push_str(&format!(
+                            "\n    {}",
+                            format!("… +{remaining} more matches").dim()
+                        ));
                     }
                     Some(summary)
                 }
@@ -1317,18 +1329,27 @@ impl StreamRenderState {
                 if total == 0 {
                     Some("no matches".to_string())
                 } else {
+                    // Show file paths with dim styling for directory parts
                     let shown: Vec<String> = files
                         .iter()
-                        .take(3)
-                        .map(|f| shorten_path(f.trim(), 50))
+                        .take(5)
+                        .map(|f| {
+                            let path = f.trim();
+                            if let Some(last_slash) = path.rfind('/') {
+                                format!("{}{}", path[..=last_slash].dim(), &path[last_slash + 1..])
+                            } else {
+                                path.to_string()
+                            }
+                        })
                         .collect();
                     let mut summary = format!("{total} file(s)");
                     for f in &shown {
-                        summary.push_str(&format!("\n      {f}"));
+                        summary.push_str(&format!("\n    {f}"));
                     }
-                    let remaining = total.saturating_sub(3);
+                    let remaining = total.saturating_sub(5);
                     if remaining > 0 {
-                        summary.push_str(&format!("\n      … +{remaining} more"));
+                        summary
+                            .push_str(&format!("\n    {}", format!("… +{remaining} more").dim()));
                     }
                     Some(summary)
                 }
