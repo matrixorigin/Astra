@@ -2,11 +2,11 @@
 
 use std::time::Duration;
 
-use crossterm::style::Stylize;
-use mo_thin_client::{
+use astra_thin_client::{
     EdgeHeartbeatRequest, EdgeRegisterRequest, ThinClient, ThinClientError,
     edge_register_with_capabilities,
 };
+use crossterm::style::Stylize;
 
 use crate::chat_stream::edge_executor_instance_id;
 
@@ -106,7 +106,7 @@ pub async fn register_and_start_heartbeat(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mo_thin_client::MO_EDGE_ID_HEADER;
+    use astra_thin_client::MO_EDGE_ID_HEADER;
     use serial_test::serial;
     use wiremock::matchers::{header_exists, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};

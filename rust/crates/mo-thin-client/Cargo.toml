@@ -1,8 +1,8 @@
 [package]
-name = "mo-thin-client"
+name = "astra-thin-client"
 version.workspace = true
 edition.workspace = true
-description = "Stateless HTTP + SSE client for the mo-agent thin client protocol"
+description = "Stateless HTTP + SSE client for the Astra thin client protocol"
 
 [dependencies]
 async-stream = { workspace = true }

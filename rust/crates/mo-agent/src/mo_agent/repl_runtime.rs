@@ -1,14 +1,14 @@
 use super::*;
 
 pub(super) fn create_tool_selector(
-    api: &mo_thin_client::ThinClient,
+    api: &astra_thin_client::ThinClient,
     profile: Option<&str>,
 ) -> (Box<dyn tool_selector::ToolSelector>, PipelineModules) {
     create_tool_selector_with_quality(api, profile, None, None)
 }
 
 pub(super) fn create_tool_selector_quiet(
-    api: &mo_thin_client::ThinClient,
+    api: &astra_thin_client::ThinClient,
     profile: Option<&str>,
 ) -> (Box<dyn tool_selector::ToolSelector>, PipelineModules) {
     create_tool_selector_with_quality_internal(api, profile, None, None, false)
@@ -17,11 +17,11 @@ pub(super) fn create_tool_selector_quiet(
 /// Shared pipeline learning modules — kept accessible for cross-session persistence.
 pub(super) struct PipelineModules {
     pub entity_graph:
-        std::sync::Arc<std::sync::Mutex<mo_agent_runtime::pipeline::entity::EntityGraph>>,
+        std::sync::Arc<std::sync::Mutex<astra_runtime::pipeline::entity::EntityGraph>>,
     pub pattern_library:
-        std::sync::Arc<std::sync::Mutex<mo_agent_runtime::pipeline::pattern::PatternLibrary>>,
+        std::sync::Arc<std::sync::Mutex<astra_runtime::pipeline::pattern::PatternLibrary>>,
     pub calibrator: std::sync::Arc<
-        std::sync::Mutex<mo_agent_runtime::pipeline::calibration::ProgressiveCalibrator>,
+        std::sync::Mutex<astra_runtime::pipeline::calibration::ProgressiveCalibrator>,
     >,
     /// Skill registry for progressive loading.
     pub skill_registry: std::sync::Arc<std::sync::RwLock<skill_instructions::SkillRegistry>>,
@@ -30,11 +30,11 @@ pub(super) struct PipelineModules {
 }
 
 pub(super) fn create_tool_selector_with_quality(
-    api: &mo_thin_client::ThinClient,
+    api: &astra_thin_client::ThinClient,
     profile: Option<&str>,
     quality_tracker: Option<std::sync::Arc<std::sync::Mutex<tool_registry::ToolQualityTracker>>>,
     confidence_calibrator: Option<
-        std::sync::Arc<mo_agent_runtime::turn::routing_metrics::ConfidenceCalibrator>,
+        std::sync::Arc<astra_runtime::turn::routing_metrics::ConfidenceCalibrator>,
     >,
 ) -> (Box<dyn tool_selector::ToolSelector>, PipelineModules) {
     create_tool_selector_with_quality_internal(
@@ -47,15 +47,15 @@ pub(super) fn create_tool_selector_with_quality(
 }
 
 fn create_tool_selector_with_quality_internal(
-    api: &mo_thin_client::ThinClient,
+    api: &astra_thin_client::ThinClient,
     profile: Option<&str>,
     quality_tracker: Option<std::sync::Arc<std::sync::Mutex<tool_registry::ToolQualityTracker>>>,
     confidence_calibrator: Option<
-        std::sync::Arc<mo_agent_runtime::turn::routing_metrics::ConfidenceCalibrator>,
+        std::sync::Arc<astra_runtime::turn::routing_metrics::ConfidenceCalibrator>,
     >,
     announce_skills: bool,
 ) -> (Box<dyn tool_selector::ToolSelector>, PipelineModules) {
-    use mo_agent_runtime::pipeline::{
+    use astra_runtime::pipeline::{
         calibration::ProgressiveCalibrator, entity::EntityGraph, pattern::PatternLibrary,
     };
 
@@ -172,7 +172,10 @@ fn create_tool_selector_with_quality_internal(
 
 /// Quick check whether the server has at least one LLM model configured.
 /// Returns `true` on network errors (optimistic — don't block startup).
-pub(super) async fn check_server_has_models(api: &mo_thin_client::ThinClient, token: &str) -> bool {
+pub(super) async fn check_server_has_models(
+    api: &astra_thin_client::ThinClient,
+    token: &str,
+) -> bool {
     let resp = match api
         .get_models_response_timeout(token, std::time::Duration::from_secs(3))
         .await
@@ -196,7 +199,7 @@ pub(super) async fn check_server_has_models(api: &mo_thin_client::ThinClient, to
 /// Best-effort silent auth: validate existing token or try refresh.
 /// Never blocks or prompts — just ensures credentials are fresh if possible.
 /// Clears stale credentials when the server rejects them.
-pub(super) async fn try_silent_auth(api: &mo_thin_client::ThinClient, profile: Option<&str>) {
+pub(super) async fn try_silent_auth(api: &astra_thin_client::ThinClient, profile: Option<&str>) {
     let creds = load_credentials();
     let name = profile_name(profile, &creds);
     let prof = creds.profiles.get(&name);
@@ -237,7 +240,7 @@ pub(super) async fn try_silent_auth(api: &mo_thin_client::ThinClient, profile: O
 
 /// Try to refresh an expired access token using the stored refresh_token.
 async fn try_refresh_token(
-    api: &mo_thin_client::ThinClient,
+    api: &astra_thin_client::ThinClient,
     profile: Option<&str>,
     refresh_token: &str,
 ) -> Result<(), String> {
@@ -301,7 +304,7 @@ pub(super) fn initialize_repl_state(
 
         // Enrich with step checkpoint data if available (blocked tools, progress)
         if let Ok(Some(heavy)) =
-            mo_agent_runtime::pipeline::step_checkpoint::read_latest_heavy_checkpoint(sid)
+            astra_runtime::pipeline::step_checkpoint::read_latest_heavy_checkpoint(sid)
         {
             // Merge blocked tools from checkpoint (tools that were deprioritized)
             if !heavy.blocked_tools.is_empty() && state.recent_tools.is_empty() {
@@ -319,9 +322,9 @@ pub(super) fn initialize_repl_state(
         .unwrap_or_else(|| std::path::PathBuf::from("."))
         .join(".astra")
         .join("tasks");
-    state.task_service = Some(std::sync::Arc::new(
-        mo_agent_services::LocalTaskService::new(tasks_dir),
-    ));
+    state.task_service = Some(std::sync::Arc::new(astra_services::LocalTaskService::new(
+        tasks_dir,
+    )));
 
     state
 }

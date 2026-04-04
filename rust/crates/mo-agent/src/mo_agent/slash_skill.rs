@@ -2,7 +2,7 @@ use super::*;
 
 pub(super) async fn handle_skill_command(
     arg: &str,
-    api: &mo_thin_client::ThinClient,
+    api: &astra_thin_client::ThinClient,
     state: &mut ReplState,
     token: Option<&str>,
 ) -> Result<(), String> {

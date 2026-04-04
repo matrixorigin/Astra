@@ -1,7 +1,7 @@
 //! Non-happy-path integration tests proving control mechanisms actually work.
 
 mod circuit_breaker_integration {
-    use mo_agent_runtime::bridge::circuit_breaker::CircuitBreaker;
+    use astra_runtime::bridge::circuit_breaker::CircuitBreaker;
     use std::time::Duration;
 
     /// Proves CB fast-rejects after threshold failures (as wired in forward())
@@ -45,7 +45,7 @@ mod circuit_breaker_integration {
 }
 
 mod stall_detection {
-    use mo_agent_runtime::turn::stall::{SERVER_STALL_WINDOW, detect_server_stall};
+    use astra_runtime::turn::stall::{SERVER_STALL_WINDOW, detect_server_stall};
     use std::collections::BTreeSet;
 
     /// Proves stall detector catches repetitive tool calls
@@ -77,7 +77,7 @@ mod stall_detection {
 }
 
 mod turn_limits {
-    use mo_agent_runtime::turn::routing::MAX_TOOL_ROUNDS;
+    use astra_runtime::turn::routing::MAX_TOOL_ROUNDS;
 
     /// Proves MAX_TOOL_ROUNDS is set to a reasonable value
     #[test]
@@ -90,7 +90,7 @@ mod turn_limits {
 // ── Turn Guard Integration ──────────────────────────────────────────────────
 
 mod turn_guard_integration {
-    use mo_agent_runtime::turn::turn_guard::{TurnGuard, VerdictSeverity};
+    use astra_runtime::turn::turn_guard::{TurnGuard, VerdictSeverity};
     use serde_json::json;
 
     fn tool_call(name: &str, args: &str) -> serde_json::Value {
@@ -230,8 +230,8 @@ mod turn_guard_integration {
     /// Proves: cross-session health respects minimum call threshold
     #[test]
     fn cross_session_min_calls_protection() {
-        use mo_agent_runtime::pipeline::persistence::ToolHealthEntry;
-        use mo_agent_runtime::turn::tool_health::ToolHealthTracker;
+        use astra_runtime::pipeline::persistence::ToolHealthEntry;
+        use astra_runtime::turn::tool_health::ToolHealthTracker;
 
         // Tool A: 3 calls, 100% failure → NOT deprioritized (too few calls)
         // Tool B: 10 calls, 60% failure → deprioritized (enough data)
@@ -279,7 +279,7 @@ mod turn_guard_integration {
 // ── Input Guard Integration ─────────────────────────────────────────────────
 
 mod input_guards {
-    use mo_agent_runtime::tool_registry::state::ConversationState;
+    use astra_runtime::tool_registry::state::ConversationState;
 
     #[test]
     fn empty_query_is_conversational() {
@@ -352,7 +352,7 @@ mod input_guards {
 // ── Result Quality Integration ──────────────────────────────────────────────
 
 mod result_quality_integration {
-    use mo_agent_runtime::turn::result_quality::{ResultQuality, classify_result};
+    use astra_runtime::turn::result_quality::{ResultQuality, classify_result};
 
     #[test]
     fn real_world_github_error() {
@@ -393,7 +393,7 @@ mod result_quality_integration {
 // ── Error Recovery Integration ──────────────────────────────────────────────
 
 mod error_recovery_integration {
-    use mo_agent_runtime::turn::error_recovery::*;
+    use astra_runtime::turn::error_recovery::*;
 
     #[test]
     fn full_recovery_flow() {
@@ -453,11 +453,11 @@ mod error_recovery_integration {
 // but the SIDE EFFECTS that chat_stream applies (restricted_tools, budget, messages).
 
 mod chat_stream_turnguard_e2e {
-    use mo_agent_runtime::pipeline::persistence::ToolHealthEntry;
-    use mo_agent_runtime::tool_selector::ToolSelector;
-    use mo_agent_runtime::turn::result_quality::ResultQuality;
-    use mo_agent_runtime::turn::tool_health::ToolHealthTracker;
-    use mo_agent_runtime::turn::turn_guard::{TurnGuard, TurnVerdict, VerdictSeverity};
+    use astra_runtime::pipeline::persistence::ToolHealthEntry;
+    use astra_runtime::tool_selector::ToolSelector;
+    use astra_runtime::turn::result_quality::ResultQuality;
+    use astra_runtime::turn::tool_health::ToolHealthTracker;
+    use astra_runtime::turn::turn_guard::{TurnGuard, TurnVerdict, VerdictSeverity};
     use serde_json::json;
     use std::collections::HashSet;
 
@@ -955,8 +955,8 @@ mod chat_stream_turnguard_e2e {
     /// TurnGuard created with pre-existing health data preserves deprioritization.
     #[test]
     fn cross_session_health_preserved() {
-        use mo_agent_runtime::pipeline::persistence::ToolHealthEntry;
-        use mo_agent_runtime::turn::tool_health::ToolHealthTracker;
+        use astra_runtime::pipeline::persistence::ToolHealthEntry;
+        use astra_runtime::turn::tool_health::ToolHealthTracker;
 
         let entries = vec![ToolHealthEntry {
             name: "flaky_tool".to_string(),
@@ -1206,8 +1206,8 @@ mod chat_stream_turnguard_e2e {
     /// deprioritized tool appears in restricted_tools → TfIdfSelector excludes it.
     #[tokio::test]
     async fn cross_session_deprioritized_tool_excluded_from_selector() {
-        use mo_agent_runtime::tool_registry::ToolRegistry;
-        use mo_agent_runtime::tool_selector::{SelectionContext, TfIdfSelector};
+        use astra_runtime::tool_registry::ToolRegistry;
+        use astra_runtime::tool_selector::{SelectionContext, TfIdfSelector};
 
         // --- Session 1: tool fails and gets deprioritized ---
         let mut guard1 = TurnGuard::new();
@@ -1249,7 +1249,7 @@ mod chat_stream_turnguard_e2e {
         assert!(restricted.contains(&"github_ci_status".to_string()));
 
         // TfIdfSelector should exclude the restricted tool
-        let schemas: Vec<serde_json::Value> = mo_agent_runtime::tool_registry::TOOL_CATALOG
+        let schemas: Vec<serde_json::Value> = astra_runtime::tool_registry::TOOL_CATALOG
             .iter()
             .map(|t| {
                 serde_json::json!({
@@ -1368,8 +1368,8 @@ mod chat_stream_turnguard_e2e {
     /// Multiple tools with mixed health: only the truly unreliable ones are restricted.
     #[tokio::test]
     async fn cross_session_mixed_health_selective_exclusion() {
-        use mo_agent_runtime::tool_registry::ToolRegistry;
-        use mo_agent_runtime::tool_selector::{SelectionContext, TfIdfSelector};
+        use astra_runtime::tool_registry::ToolRegistry;
+        use astra_runtime::tool_selector::{SelectionContext, TfIdfSelector};
 
         let entries = vec![
             ToolHealthEntry {
@@ -1419,7 +1419,7 @@ mod chat_stream_turnguard_e2e {
         );
 
         // Selector proof: query that matches all three GitHub tools
-        let schemas: Vec<serde_json::Value> = mo_agent_runtime::tool_registry::TOOL_CATALOG
+        let schemas: Vec<serde_json::Value> = astra_runtime::tool_registry::TOOL_CATALOG
             .iter()
             .map(|t| {
                 serde_json::json!({

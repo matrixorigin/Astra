@@ -1,5 +1,4 @@
-use crossterm::style::Stylize;
-use mo_agent_runtime::turn::explain_report_lines::{
+use astra_runtime::turn::explain_report_lines::{
     EXPLAIN_REPORT_HEADER, REPORT_SEPARATOR_LINE, VERDICT_REPORT_HEADER,
     explain_auxiliary_llm_call_line, explain_auxiliary_llm_header_line,
     explain_content_preview_line, explain_l0_profile_line, explain_l1_retrieval_line,
@@ -9,6 +8,7 @@ use mo_agent_runtime::turn::explain_report_lines::{
     explain_turn_summary_line, verdict_avoid_tools_line, verdict_event_summary_line,
     verdict_injection_count_line, verdict_injection_preview_line, verdict_severity_icon,
 };
+use crossterm::style::Stylize;
 
 use crate::VerdictEvent;
 

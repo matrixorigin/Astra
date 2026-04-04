@@ -20,9 +20,9 @@ use tokio::sync::{Mutex as TokioMutex, RwLock};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use mo_agent_core::{ErrorResponse, SharedPool, error_response};
-use mo_agent_services::EdgeContext;
-use mo_agent_services::runs::{
+use astra_core::{ErrorResponse, SharedPool, error_response};
+use astra_services::EdgeContext;
+use astra_services::runs::{
     CancelRunRecord, ChatRequestData, ChatRunRecord, ChatStreamRecord, RunLifecycleService,
     RunListRecord, RunMutationRecord, RunStatusRecord,
 };
@@ -241,7 +241,7 @@ impl AgenticRunLifecycleService {
             message: request.message.clone(),
             recent_tools: Vec::new(),
             task_profile,
-            api: mo_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap(),
+            api: astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap(),
             api_token: String::new(),
             cancel_flag: None,
             cancel_token: None,
@@ -771,7 +771,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
     async fn execute(
         &self,
         config: SubRunConfig,
-    ) -> Result<mo_agent_services::coordination::AgentResult, String> {
+    ) -> Result<astra_services::coordination::AgentResult, String> {
         use crate::pipeline::step_protocol::InMemoryIdempotencyCache;
         use crate::semantic_dedup::SemanticDedup;
         use crate::turn::chat_turn_heuristics::infer_task_execution_profile;
@@ -879,7 +879,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
             message: full_task,
             recent_tools: Vec::new(),
             task_profile,
-            api: mo_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap(),
+            api: astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap(),
             api_token: String::new(),
             cancel_flag: config.pause_flag.clone(),
             cancel_token: None,
@@ -897,7 +897,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
         let outcome = run_agentic_loop_with_host(&mut host, &mut loop_state).await;
 
         match outcome {
-            Ok(AgenticLoopOutcome::Completed) => Ok(mo_agent_services::coordination::AgentResult {
+            Ok(AgenticLoopOutcome::Completed) => Ok(astra_services::coordination::AgentResult {
                 agent_id: config.agent_profile.agent_id,
                 run_id: config.run_id,
                 status: "completed".to_string(),
@@ -914,7 +914,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
             Ok(AgenticLoopOutcome::Cancelled) => {
                 // Cancelled via pause_flag — report as "paused" so the
                 // delegation engine can distinguish from hard errors.
-                Ok(mo_agent_services::coordination::AgentResult {
+                Ok(astra_services::coordination::AgentResult {
                     agent_id: config.agent_profile.agent_id,
                     run_id: config.run_id,
                     status: "paused".to_string(),
@@ -930,7 +930,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
                 })
             }
             Ok(AgenticLoopOutcome::Waiting(reason)) => {
-                Ok(mo_agent_services::coordination::AgentResult {
+                Ok(astra_services::coordination::AgentResult {
                     agent_id: config.agent_profile.agent_id,
                     run_id: config.run_id,
                     status: "waiting".to_string(),
@@ -942,7 +942,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
                 })
             }
             Ok(AgenticLoopOutcome::Error(err)) | Err(err) => {
-                Ok(mo_agent_services::coordination::AgentResult {
+                Ok(astra_services::coordination::AgentResult {
                     agent_id: config.agent_profile.agent_id,
                     run_id: config.run_id,
                     status: "failed".to_string(),
@@ -1395,7 +1395,7 @@ mod tests {
 
     fn test_service_with_engine() -> AgenticRunLifecycleService {
         use crate::server::run_engine::RunEngine;
-        use mo_agent_services::runs::InMemoryRunStateStore;
+        use astra_services::runs::InMemoryRunStateStore;
 
         let engine = RunEngine::new(Arc::new(InMemoryRunStateStore::new()));
         AgenticRunLifecycleService::new(

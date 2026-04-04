@@ -2,13 +2,13 @@
 //!
 //! Tests the full path: contract creation → subtask execution → verification → delivery.
 
-use mo_agent_services::durable_task::*;
+use astra_services::durable_task::*;
 use std::sync::Arc;
 
 // ─── Helpers ────────────────────────────────────────────────────────────
 
-fn make_plan() -> mo_agent_services::task_orchestrator::TaskPlan {
-    use mo_agent_services::task_orchestrator::{SubtaskPlan, TaskPlan, TaskStatus};
+fn make_plan() -> astra_services::task_orchestrator::TaskPlan {
+    use astra_services::task_orchestrator::{SubtaskPlan, TaskPlan, TaskStatus};
     TaskPlan {
         subtasks: vec![
             SubtaskPlan {
@@ -201,7 +201,7 @@ async fn verify_global_on_empty_contract_succeeds() {
     let tmp = tempfile::TempDir::new().unwrap();
     let svc = make_lifecycle(&tmp);
 
-    use mo_agent_services::task_orchestrator::{SubtaskPlan, TaskPlan, TaskStatus};
+    use astra_services::task_orchestrator::{SubtaskPlan, TaskPlan, TaskStatus};
     let empty_plan = TaskPlan {
         subtasks: vec![SubtaskPlan {
             id: "only".into(),

@@ -1,6 +1,6 @@
 use std::{fs, path::PathBuf};
 
-use mo_agent_runtime::build_firewall_verification_plan;
+use astra_runtime::build_firewall_verification_plan;
 use serde::Deserialize;
 use serde_json::{Map, Value};
 

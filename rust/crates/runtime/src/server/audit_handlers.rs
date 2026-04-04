@@ -1,5 +1,5 @@
 use super::*;
-use mo_agent_services::session_audit::{
+use astra_services::session_audit::{
     AuditSessionListParams, CrossSessionStatsParams, TurnListParams,
 };
 

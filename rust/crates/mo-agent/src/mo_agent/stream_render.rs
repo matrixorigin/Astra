@@ -1,18 +1,18 @@
 use super::*;
-use crossterm::style::Stylize;
-use futures_util::StreamExt;
-use mo_agent_runtime::turn::chat_turn_sse_dispatch::{
+use astra_runtime::turn::chat_turn_sse_dispatch::{
     ChatTurnSseAccum, SseRenderEffect, dispatch_chat_turn_sse_event_block,
 };
-use mo_agent_runtime::turn::sse_edge_stderr_lines::{
+use astra_runtime::turn::sse_edge_stderr_lines::{
     edge_sse_post_approval_fail_line, edge_sse_post_tool_result_fail_line,
     edge_sse_thought_duration_line,
 };
-use mo_agent_runtime::turn::sse_stream_host::{
+use astra_runtime::turn::sse_stream_host::{
     EdgeApprovalResult, EdgeToolExecResult, NoopSseStreamHost, STREAM_IDLE_TIMEOUT_MS,
     SseStreamHost, consume_sse_stream_cancellable,
 };
-use mo_agent_runtime::turn::tool_result_semantics::cloud_tool_result_status_label;
+use astra_runtime::turn::tool_result_semantics::cloud_tool_result_status_label;
+use crossterm::style::Stylize;
+use futures_util::StreamExt;
 use serde_json::Value;
 use std::io::{IsTerminal, Write};
 use std::ops::{Deref, DerefMut};
@@ -31,7 +31,7 @@ use super::effects::{
     thinking_viewport_rows,
 };
 
-pub use mo_agent_runtime::turn::chat_turn_sse_dispatch::ChatTurnEdgePending;
+pub use astra_runtime::turn::chat_turn_sse_dispatch::ChatTurnEdgePending;
 
 // Re-export effects types for callers
 pub(crate) use super::effects::{ChatPrepPhaseLabel, ChatTurnPrepLineGuard};
@@ -41,7 +41,7 @@ pub(super) use super::effects::{
 
 /// When set, SSE `tool_request` / `approval_required` are handled and posted to the cloud API.
 pub(super) struct EdgeSseContext<'a> {
-    pub api: &'a mo_thin_client::ThinClient,
+    pub api: &'a astra_thin_client::ThinClient,
     pub token: &'a str,
     pub executor_id: &'a str,
     pub executor: &'a crate::edge_tools::ToolExecutor,
@@ -67,9 +67,9 @@ pub(super) struct EdgeSseContext<'a> {
 /// - Terminal rendering (spinners, text deltas) via [`StreamRenderState`]
 /// - Edge tool execution via [`crate::edge_tools::ToolExecutor`]
 /// - Approval prompts via [`crate::permission_manager::PermissionManager`]
-/// - Cloud API posting (tool results, approvals) via [`mo_thin_client::ThinClient`]
+/// - Cloud API posting (tool results, approvals) via [`astra_thin_client::ThinClient`]
 struct CliSseStreamHost<'a> {
-    api: &'a mo_thin_client::ThinClient,
+    api: &'a astra_thin_client::ThinClient,
     token: &'a str,
     executor_id: &'a str,
     executor: &'a crate::edge_tools::ToolExecutor,
@@ -364,7 +364,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
             status: status.to_string(),
             duration_ms,
         });
-        let body = mo_thin_client::ToolResultRequest {
+        let body = astra_thin_client::ToolResultRequest {
             request_id: request_id.to_string(),
             status: status.to_string(),
             output: Some(output),
@@ -379,7 +379,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
             // Check if this is a 401 Unauthorized - session is invalid, abort SSE stream
             let is_auth_failure = matches!(
                 e,
-                mo_thin_client::ThinClientError::Api { status, .. }
+                astra_thin_client::ThinClientError::Api { status, .. }
                     if status.as_u16() == 401
             );
 
@@ -412,13 +412,13 @@ impl SseStreamHost for CliSseStreamHost<'_> {
         // tool line; mixing in stderr line counts caused a large blank gap after prompts.
         let decision = match &mut self.perm_manager {
             Some(pm) => pm.resolve_cloud_approval(tool, path, self.quiet),
-            None => mo_thin_client::ApprovalDecision::Deny,
+            None => astra_thin_client::ApprovalDecision::Deny,
         };
         let decision_str = match &decision {
-            mo_thin_client::ApprovalDecision::Allow => "allow",
+            astra_thin_client::ApprovalDecision::Allow => "allow",
             _ => "deny",
         };
-        let body = mo_thin_client::ApprovalRespondRequest {
+        let body = astra_thin_client::ApprovalRespondRequest {
             request_id: request_id.to_string(),
             decision,
             reason: None,
@@ -429,7 +429,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
             // Check if this is a 401 Unauthorized - session is invalid, abort SSE stream
             let is_auth_failure = matches!(
                 e,
-                mo_thin_client::ThinClientError::Api { status, .. }
+                astra_thin_client::ThinClientError::Api { status, .. }
                     if status.as_u16() == 401
             );
 
@@ -1337,7 +1337,7 @@ fn apply_sse_render_effects(
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn consume_turn_sse(
     prep_line: ChatTurnPrepLineGuard,
-    resp: mo_thin_client::HttpResponse,
+    resp: astra_thin_client::HttpResponse,
     render_md: bool,
     term_width: usize,
     quiet: bool,

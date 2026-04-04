@@ -1,11 +1,11 @@
+use astra_runtime::{
+    AppState, HealthChecker, PERSIST_FAIL_COUNT, PERSIST_OK_COUNT, ServiceInfo, build_app,
+};
 /// Contract tests for fire-and-forget persistence failure counters.
 ///
 /// Verifies that PERSIST_FAIL_COUNT and PERSIST_OK_COUNT are observable
 /// and that the health endpoint exposes them.
 use axum::{Router, http::StatusCode};
-use mo_agent_runtime::{
-    AppState, HealthChecker, PERSIST_FAIL_COUNT, PERSIST_OK_COUNT, ServiceInfo, build_app,
-};
 use std::sync::{Arc, atomic::Ordering};
 use tower::util::ServiceExt;
 

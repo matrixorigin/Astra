@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
+use astra_runtime::{AppState, HealthChecker, ServiceInfo, SharedPool};
 use async_trait::async_trait;
-use mo_agent_runtime::{AppState, HealthChecker, ServiceInfo, SharedPool};
 
 #[derive(Clone)]
 struct StubHealthChecker;

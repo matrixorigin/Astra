@@ -1,4 +1,4 @@
-pub use mo_agent_services::storage::*;
+pub use astra_services::storage::*;
 
 use std::time::Duration;
 

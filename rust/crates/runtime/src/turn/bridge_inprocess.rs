@@ -76,7 +76,7 @@ use crate::{
 const TOOL_RESULT_AUDIT_CHARS: usize = 4000;
 
 fn turn_timeout_s() -> f64 {
-    mo_agent_core::RuntimeLimits::global().turn_timeout_s
+    astra_core::RuntimeLimits::global().turn_timeout_s
 }
 
 fn count_inprocess_persisted_events(
@@ -96,7 +96,7 @@ fn render_sse(event: &Value) -> Bytes {
     match serde_json::to_string(event) {
         Ok(s) => Bytes::from(format!("data: {s}\n\n")),
         Err(e) => {
-            mo_agent_core::agent_error!("sse", "serialization failed: {e}");
+            astra_core::agent_error!("sse", "serialization failed: {e}");
             Bytes::from("event: error\ndata: {\"error\":\"internal serialization failure\"}\n\n")
         }
     }
@@ -551,7 +551,7 @@ async fn call_llm_stream(
                     tokio::select! {
                         biased;
                         _ = crate::turn::llm_client::wait_until_cancelled_or_pending(cc.as_deref()) => {
-                            mo_agent_core::agent_warn!(
+                            astra_core::agent_warn!(
                                 "llm",
                                 "in-process LLM SSE cancelled (client disconnect)"
                             );
@@ -565,7 +565,7 @@ async fn call_llm_stream(
                             let chunk = match next {
                                 Ok(c) => c,
                                 Err(_) => {
-                                    mo_agent_core::agent_warn!(
+                                    astra_core::agent_warn!(
                                         "llm",
                                         "in-process stream idle after {}ms — attempting non-stream fallback",
                                         idle_dur.as_millis()
@@ -638,7 +638,7 @@ async fn call_llm_stream(
                             let chunk = match item {
                                 Ok(v) => v,
                                 Err(e) => {
-                                    mo_agent_core::agent_warn!(
+                                    astra_core::agent_warn!(
                                         "llm",
                                         "in-process stream transport error: {e}"
                                     );
@@ -728,7 +728,7 @@ async fn call_llm_stream(
                                                     yield render_sse(&json!({"type": "tool_call_start", "name": name}));
                                                 }
                                             } else if let Some(bad_name) = func.get("name").and_then(Value::as_str) {
-                                                mo_agent_core::agent_warn!(
+                                                astra_core::agent_warn!(
                                                     "llm",
                                                     "dropped malformed tool_call with invalid name: {bad_name:?}"
                                                 );
@@ -779,7 +779,7 @@ async fn call_llm_stream(
         // Record rate-limit errors to cooldown tracker
         if is_rate_limit_status(status) {
             let action = cooldown.with(model_key, |c| c.record_429(retry_after_ms, has_fallback));
-            mo_agent_core::agent_warn!(
+            astra_core::agent_warn!(
                 "llm",
                 "rate limit (429) on {}: action={:?}",
                 model_key,
@@ -795,7 +795,7 @@ async fn call_llm_stream(
 
         if is_overload_status(status) {
             let action = cooldown.with(model_key, |c| c.record_529(retry_after_ms, has_fallback));
-            mo_agent_core::agent_warn!(
+            astra_core::agent_warn!(
                 "llm",
                 "server overload ({status}) on {}: action={:?}",
                 model_key,
@@ -983,7 +983,7 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
                     None::<String>,
                 )
             } else {
-                match mo_agent_services::resolve_active_llm_model(
+                match astra_services::resolve_active_llm_model(
                     &matrixone,
                     encryptor.as_ref(),
                     model_override.as_deref(),
@@ -1005,7 +1005,7 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
             match cooldown.with(&model_name, |c| c.check_request(has_fallback)) {
                 RateLimitAction::Proceed => {}
                 RateLimitAction::WaitAndRetry { delay_ms } => {
-                    mo_agent_core::agent_info!(
+                    astra_core::agent_info!(
                         "llm",
                         "rate-limit cooldown: waiting {delay_ms}ms before request"
                     );
@@ -1024,14 +1024,14 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
                 }
                 RateLimitAction::UseFallback { reason } => {
                     if let Some(ref fb_name) = fallback_model_name {
-                        mo_agent_core::agent_info!(
+                        astra_core::agent_info!(
                             "llm",
                             "rate-limit cooldown: switching to fallback model '{}' ({})",
                             fb_name,
                             reason.as_str()
                         );
                         // Resolve fallback model credentials
-                        match mo_agent_services::resolve_active_llm_model(
+                        match astra_services::resolve_active_llm_model(
                             &matrixone,
                             encryptor.as_ref(),
                             Some(fb_name.as_str()),
@@ -1046,7 +1046,7 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
                                 provider = fb.provider;
                             }
                             Err(e) => {
-                                mo_agent_core::agent_warn!(
+                                astra_core::agent_warn!(
                                     "llm",
                                     "fallback model '{}' resolution failed: {}",
                                     fb_name,
@@ -1056,7 +1056,7 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
                             }
                         }
                     } else {
-                        mo_agent_core::agent_warn!(
+                        astra_core::agent_warn!(
                             "llm",
                             "rate-limit cooldown: fallback requested ({}) but no fallback configured",
                             reason.as_str()
@@ -1355,7 +1355,7 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
                         Ok(s) => s,
                         Err(e) if e.starts_with(crate::turn::llm_client::CONTEXT_WINDOW_ERROR_PREFIX) => {
                             // Context-window error: force aggressive compaction and retry once
-                            mo_agent_core::agent_warn!(
+                            astra_core::agent_warn!(
                                 "bridge",
                                 "context window exceeded — forcing aggressive compaction and retrying"
                             );
@@ -1447,7 +1447,7 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
                         tokio::select! {
                             biased;
                             _ = crate::turn::llm_client::wait_until_cancelled_or_pending(cc.as_deref()) => {
-                                mo_agent_core::agent_warn!(
+                                astra_core::agent_warn!(
                                     "bridge",
                                     "chat turn cancelled — stopping LLM byte forward"
                                 );
@@ -1472,7 +1472,7 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
                                             }
                                         }
                                         Err(msg) => {
-                                            mo_agent_core::agent_warn!("bridge", "in-process LLM SSE block invalid: {msg}");
+                                            astra_core::agent_warn!("bridge", "in-process LLM SSE block invalid: {msg}");
                                             yield render_sse_map(&build_stream_error_event(
                                                 &msg,
                                                 "SSE_PARSE_ERROR",
@@ -1511,7 +1511,7 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
                             }
                         }
                         Err(msg) => {
-                            mo_agent_core::agent_warn!("bridge", "in-process LLM SSE tail invalid: {msg}");
+                            astra_core::agent_warn!("bridge", "in-process LLM SSE tail invalid: {msg}");
                             yield render_sse_map(&build_stream_error_event(
                                 &msg,
                                 "SSE_PARSE_ERROR",
@@ -1743,7 +1743,7 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
                 let core_outcome = match writer.persist(persist_plan).await {
                     Ok(outcome) => outcome,
                     Err(e) => {
-                        mo_agent_core::agent_persist_fail!("bridge",
+                        astra_core::agent_persist_fail!("bridge",
                             session = sid,
                             core_events = core_event_count,
                             tool_events = tool_event_count,
@@ -1756,7 +1756,7 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
                 let tool_events_persisted = match tool_event_plan {
                     Some(plan) => {
                         if let Err(e) = tool_writer.persist(plan).await {
-                            mo_agent_core::agent_persist_fail!("bridge",
+                            astra_core::agent_persist_fail!("bridge",
                                 session = sid,
                                 stage = "tool_events",
                                 count = tool_event_count,
@@ -1786,7 +1786,7 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
                     last_event_id,
                 };
                 if let Err(e) = sa_writer.update_session_activity(&sid, plan).await {
-                    mo_agent_core::agent_persist_fail!("bridge",
+                    astra_core::agent_persist_fail!("bridge",
                         session = sid,
                         stage = "activity",
                         elapsed = format!("{:?}", persist_start.elapsed()),
@@ -2098,7 +2098,7 @@ async fn fetch_memories(base_url: &str, api_key: &str, query: &str, user_id: &st
     {
         Ok(r) => r,
         Err(e) => {
-            mo_agent_core::agent_error!("memory", "fetch error: {e:#}");
+            astra_core::agent_error!("memory", "fetch error: {e:#}");
             return String::new();
         }
     };

@@ -1,12 +1,12 @@
-use mo_agent_services::events::*;
+use astra_services::events::*;
 
 use crate::AppState;
+use astra_core::ErrorResponse;
 use axum::{
     Json,
     extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
 };
-use mo_agent_core::ErrorResponse;
 
 pub async fn create_event_handler(
     State(state): State<AppState>,

@@ -17,7 +17,7 @@ const DECAY_BASE: f64 = 0.95;
 /// Maximum number of top-scored messages to include in retrieval output.
 /// Override with `MO_MAX_RETRIEVED` env var.
 fn max_retrieved() -> usize {
-    mo_agent_core::RuntimeLimits::global().max_retrieved
+    astra_core::RuntimeLimits::global().max_retrieved
 }
 
 // ── TF-IDF helpers ───────────────────────────────────────────────────────────

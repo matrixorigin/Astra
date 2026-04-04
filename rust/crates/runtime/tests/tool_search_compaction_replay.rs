@@ -1,9 +1,9 @@
-use mo_agent_runtime::prompts::CompactionTier;
-use mo_agent_runtime::tool_registry::tool_pool::{
+use astra_runtime::prompts::CompactionTier;
+use astra_runtime::tool_registry::tool_pool::{
     ToolDenyPredicate, ToolPool, ToolSchemaStore, ToolSearchConfig, ToolSearchState,
     restore_state_from_messages, select_two_phase_with_state,
 };
-use mo_agent_runtime::turn::cloud::compaction::compact_tiered_with_result;
+use astra_runtime::turn::cloud::compaction::compact_tiered_with_result;
 use serde_json::{Value, json};
 
 struct DenyNone;

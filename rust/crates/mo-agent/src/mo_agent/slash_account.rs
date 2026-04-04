@@ -4,7 +4,7 @@ use crate::post_auth_cloud_resync;
 pub(super) async fn handle_account_command(
     cmd: &str,
     arg: &str,
-    api: &mo_thin_client::ThinClient,
+    api: &astra_thin_client::ThinClient,
     profile: Option<&str>,
     state: &mut super::ReplState,
 ) -> Result<(), String> {

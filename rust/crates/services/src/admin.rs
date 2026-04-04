@@ -1,9 +1,9 @@
+use astra_core::ErrorResponse;
 use async_trait::async_trait;
 use axum::{
     Json,
     http::{HeaderMap, StatusCode},
 };
-use mo_agent_core::ErrorResponse;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AuthenticatedUser {

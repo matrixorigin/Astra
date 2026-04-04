@@ -1,6 +1,6 @@
 use std::sync::OnceLock;
 
-use mo_agent_runtime::turn::edge_executor_id::random_edge_executor_instance_id;
+use astra_runtime::turn::edge_executor_id::random_edge_executor_instance_id;
 
 /// Stable id for this process (§5.5 `edge_executor_id`). Override with `MO_EDGE_EXECUTOR_ID`.
 static EDGE_EXECUTOR_INSTANCE_ID: OnceLock<String> = OnceLock::new();

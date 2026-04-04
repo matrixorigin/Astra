@@ -1,6 +1,6 @@
 use std::{fs, path::PathBuf};
 
-use mo_agent_runtime::build_snapshot_link_plan;
+use astra_runtime::build_snapshot_link_plan;
 use serde::Deserialize;
 use serde_json::Value;
 

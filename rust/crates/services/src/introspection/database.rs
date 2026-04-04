@@ -3,7 +3,7 @@ use axum::http::StatusCode;
 use serde_json::Value;
 use sqlx::{Row, query};
 
-use mo_agent_core::{
+use astra_core::{
     MatrixOneSettings, SharedPool, connect_matrixone, error_response, internal_error,
 };
 

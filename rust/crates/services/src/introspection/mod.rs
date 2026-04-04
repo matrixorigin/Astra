@@ -14,7 +14,7 @@ use axum::{Json, http::StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use mo_agent_core::{ErrorResponse, internal_error};
+use astra_core::{ErrorResponse, internal_error};
 
 // ── Response types ───────────────────────────────────────────────────────────
 

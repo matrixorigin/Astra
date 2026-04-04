@@ -5,11 +5,9 @@
 //! 2. Boost terms improve TF-IDF scoring for relevant tools
 //! 3. The pipeline handles edge cases gracefully (empty history, CJK, etc.)
 
-use mo_agent_runtime::tool_registry::ToolRegistry;
-use mo_agent_runtime::tool_selector::{SelectionContext, TfIdfSelector, ToolSelector};
-use mo_agent_runtime::turn::retrieval::{
-    extract_boost_terms_from_pairs, extract_entity_boost_terms,
-};
+use astra_runtime::tool_registry::ToolRegistry;
+use astra_runtime::tool_selector::{SelectionContext, TfIdfSelector, ToolSelector};
+use astra_runtime::turn::retrieval::{extract_boost_terms_from_pairs, extract_entity_boost_terms};
 use serde_json::{Map, Value};
 
 fn github_history_message(content: &str) -> Map<String, Value> {

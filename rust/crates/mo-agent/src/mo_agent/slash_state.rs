@@ -1,7 +1,7 @@
 use super::*;
 
 pub(super) struct StateCommandContext<'a> {
-    pub(super) api: &'a mo_thin_client::ThinClient,
+    pub(super) api: &'a astra_thin_client::ThinClient,
     pub(super) profile: Option<&'a str>,
     pub(super) token: Option<&'a str>,
     pub(super) selector: &'a dyn tool_selector::ToolSelector,
@@ -451,7 +451,7 @@ pub(super) async fn handle_state_command(
                 "history",
                 "performance",
             ];
-            let mut rel = mo_thin_client::paths::chat_session_reflect(&sid)
+            let mut rel = astra_thin_client::paths::chat_session_reflect(&sid)
                 .trim_start_matches('/')
                 .to_string();
             let mut query_parts: Vec<String> = Vec::new();
@@ -473,7 +473,7 @@ pub(super) async fn handle_state_command(
             }
             match api.get_authed_path_text(tok, &rel).await {
                 Ok(body) => render_reflect_report(&body, &sid),
-                Err(mo_thin_client::ThinClientError::Api {
+                Err(astra_thin_client::ThinClientError::Api {
                     status,
                     body: err_body,
                 }) => {

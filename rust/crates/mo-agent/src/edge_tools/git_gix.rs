@@ -1069,7 +1069,7 @@ struct CommitDoc {
 
 /// Score commit messages against a query using TF-IDF cosine similarity.
 fn score_commits(query: &str, commits: &[CommitDoc]) -> Vec<(usize, f64)> {
-    let query_tokens = mo_agent_runtime::text_tokenize::tokenize(query);
+    let query_tokens = astra_runtime::text_tokenize::tokenize(query);
     if query_tokens.is_empty() || commits.is_empty() {
         return Vec::new();
     }
@@ -1194,7 +1194,7 @@ pub(crate) fn git_log_search(project_root: &Path, args: &Value) -> String {
                 .map(|l| String::from_utf8_lossy(l).to_string())
                 .unwrap_or_default()
         };
-        let tokens = mo_agent_runtime::text_tokenize::tokenize(&message);
+        let tokens = astra_runtime::text_tokenize::tokenize(&message);
 
         commits.push(CommitDoc {
             hash,
@@ -2224,14 +2224,14 @@ mod tests {
                 author: "test".into(),
                 date: "2024".into(),
                 message: "fix bug in parser".into(),
-                tokens: mo_agent_runtime::text_tokenize::tokenize("fix bug in parser"),
+                tokens: astra_runtime::text_tokenize::tokenize("fix bug in parser"),
             },
             CommitDoc {
                 hash: "b".into(),
                 author: "test".into(),
                 date: "2024".into(),
                 message: "add new feature".into(),
-                tokens: mo_agent_runtime::text_tokenize::tokenize("add new feature"),
+                tokens: astra_runtime::text_tokenize::tokenize("add new feature"),
             },
         ];
         let result = score_commits("fix", &commits);

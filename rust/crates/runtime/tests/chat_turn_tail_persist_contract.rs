@@ -1,6 +1,6 @@
 use std::{fs, path::PathBuf};
 
-use mo_agent_runtime::{build_cached_assistant_message, build_persist_thread_args};
+use astra_runtime::{build_cached_assistant_message, build_persist_thread_args};
 use serde::Deserialize;
 use serde_json::{Map, Value};
 

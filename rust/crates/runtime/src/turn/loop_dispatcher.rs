@@ -292,7 +292,7 @@ mod tests {
             message: message.to_string(),
             recent_tools: Vec::new(),
             task_profile: TaskExecutionProfile::default(),
-            api: mo_thin_client::ThinClient::new("http://localhost:1", None).unwrap(),
+            api: astra_thin_client::ThinClient::new("http://localhost:1", None).unwrap(),
             api_token: "test".to_string(),
             cancel_flag: None,
             cancel_token: None,

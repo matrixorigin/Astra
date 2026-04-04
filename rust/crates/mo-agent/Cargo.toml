@@ -8,10 +8,10 @@ name = "astra"
 path = "src/main.rs"
 
 [dependencies]
-mo-agent-core.workspace = true
-mo-agent-services.workspace = true
-mo-agent-runtime.workspace = true
-mo-thin-client.workspace = true
+astra-core.workspace = true
+astra-services.workspace = true
+astra-runtime.workspace = true
+astra-thin-client.workspace = true
 async-trait.workspace = true
 axum.workspace = true
 chrono.workspace = true

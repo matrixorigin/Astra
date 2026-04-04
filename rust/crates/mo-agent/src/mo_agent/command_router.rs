@@ -1,6 +1,6 @@
 use super::*;
 use crate::permission_manager::PermissionMode;
-use mo_thin_client::paths;
+use astra_thin_client::paths;
 use std::io::Read;
 
 /// Exit codes for CLI commands (for scripting integration)
@@ -25,7 +25,7 @@ impl From<ExitCode> for i32 {
 pub(super) async fn execute_cli_command(
     command: Option<Command>,
     profile: Option<String>,
-    api: &mo_thin_client::ThinClient,
+    api: &astra_thin_client::ThinClient,
 ) -> Result<ExitCode, String> {
     match command {
         // No subcommand → interactive REPL (Codex-style default)

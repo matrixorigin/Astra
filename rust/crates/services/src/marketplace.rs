@@ -5,7 +5,7 @@ use sqlx::{Row, query};
 use uuid::Uuid;
 
 use crate::auth::FernetTokenEncryptor;
-use mo_agent_core::{
+use astra_core::{
     ErrorResponse, MatrixOneSettings, SharedPool, connect_matrixone, error_response, internal_error,
 };
 

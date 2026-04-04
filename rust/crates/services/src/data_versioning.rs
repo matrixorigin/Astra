@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::{Row, query};
 use std::collections::HashSet;
 
-use mo_agent_core::{
+use astra_core::{
     ErrorResponse, MatrixOneSettings, SharedPool, connect_matrixone, error_response, internal_error,
 };
 

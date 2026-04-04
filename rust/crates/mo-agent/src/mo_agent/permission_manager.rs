@@ -1,11 +1,11 @@
 use super::*;
 
-use mo_agent_runtime::tool_sandbox::{
+use astra_runtime::tool_sandbox::{
     CommandRisk, GitSafetyViolation, analyze_command_risks, is_dangerous_file_path,
     validate_git_command,
 };
-use mo_agent_runtime::turn::cloud_approval_policy::{CloudGatedToolKind, cloud_gated_tool_kind};
-use mo_agent_runtime::turn::tool_argument_hints::{
+use astra_runtime::turn::cloud_approval_policy::{CloudGatedToolKind, cloud_gated_tool_kind};
+use astra_runtime::turn::tool_argument_hints::{
     command_hint_from_args, path_hint_from_args, permission_prompt_primary_detail,
 };
 
@@ -224,8 +224,8 @@ impl PermissionManager {
         tool: &str,
         path: Option<&str>,
         quiet: bool,
-    ) -> mo_thin_client::ApprovalDecision {
-        use mo_thin_client::ApprovalDecision;
+    ) -> astra_thin_client::ApprovalDecision {
+        use astra_thin_client::ApprovalDecision;
         if quiet {
             return if self.mode == PermissionMode::Auto {
                 ApprovalDecision::Allow
@@ -682,7 +682,7 @@ mod tests {
         let mut pm = PermissionManager::new(false);
         assert!(matches!(
             pm.resolve_cloud_approval("write_file", Some("x.rs"), true),
-            mo_thin_client::ApprovalDecision::Deny
+            astra_thin_client::ApprovalDecision::Deny
         ));
     }
 
@@ -691,7 +691,7 @@ mod tests {
         let mut pm = PermissionManager::new(true);
         assert!(matches!(
             pm.resolve_cloud_approval("write_file", Some("x.rs"), true),
-            mo_thin_client::ApprovalDecision::Allow
+            astra_thin_client::ApprovalDecision::Allow
         ));
     }
 
@@ -1048,7 +1048,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut pm = PermissionManager::with_project_mode(PermissionMode::Deny, dir.path());
         let decision = pm.resolve_cloud_approval("bash", Some("/tmp"), false);
-        assert_eq!(decision, mo_thin_client::ApprovalDecision::Deny);
+        assert_eq!(decision, astra_thin_client::ApprovalDecision::Deny);
     }
 
     #[test]
@@ -1056,7 +1056,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut pm = PermissionManager::with_project_mode(PermissionMode::Auto, dir.path());
         let decision = pm.resolve_cloud_approval("bash", Some("/tmp"), false);
-        assert_eq!(decision, mo_thin_client::ApprovalDecision::Allow);
+        assert_eq!(decision, astra_thin_client::ApprovalDecision::Allow);
     }
 
     #[test]

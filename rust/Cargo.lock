@@ -123,11 +123,11 @@ dependencies = [
 name = "astra-admin-cli"
 version = "0.1.0"
 dependencies = [
+ "astra-thin-client",
  "clap",
  "crossterm 0.27.0",
  "dirs",
  "dotenvy",
- "mo-thin-client",
  "rpassword",
  "rustyline",
  "serde",
@@ -140,6 +140,10 @@ dependencies = [
 name = "astra-cli"
 version = "0.1.0"
 dependencies = [
+ "astra-core",
+ "astra-runtime",
+ "astra-services",
+ "astra-thin-client",
  "async-trait",
  "axum",
  "base64",
@@ -150,10 +154,6 @@ dependencies = [
  "dotenvy",
  "futures-util",
  "gix",
- "mo-agent-core",
- "mo-agent-runtime",
- "mo-agent-services",
- "mo-thin-client",
  "nix 0.31.2",
  "regex",
  "reqwest",
@@ -181,6 +181,93 @@ dependencies = [
  "tree-sitter-typescript",
  "url",
  "uuid",
+ "wiremock",
+]
+
+[[package]]
+name = "astra-core"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "dotenvy",
+ "serde",
+ "sqlx",
+ "tokio",
+]
+
+[[package]]
+name = "astra-runtime"
+version = "0.1.0"
+dependencies = [
+ "astra-core",
+ "astra-services",
+ "astra-thin-client",
+ "async-stream",
+ "async-trait",
+ "axum",
+ "base64",
+ "chrono",
+ "criterion",
+ "dirs",
+ "dotenvy",
+ "futures-util",
+ "proptest",
+ "regex",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "sha2",
+ "sqlx",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "tower",
+ "tower-http",
+ "tree-sitter",
+ "tree-sitter-bash",
+ "uuid",
+]
+
+[[package]]
+name = "astra-services"
+version = "0.1.0"
+dependencies = [
+ "astra-core",
+ "async-trait",
+ "axum",
+ "base64",
+ "bcrypt",
+ "chrono",
+ "dirs",
+ "dotenvy",
+ "fernet",
+ "flate2",
+ "jsonwebtoken",
+ "regex",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "sha2",
+ "sqlx",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
+name = "astra-thin-client"
+version = "0.1.0"
+dependencies = [
+ "async-stream",
+ "futures-util",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
  "wiremock",
 ]
 
@@ -2820,93 +2907,6 @@ dependencies = [
  "libc",
  "wasi",
  "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "mo-agent-core"
-version = "0.1.0"
-dependencies = [
- "axum",
- "dotenvy",
- "serde",
- "sqlx",
- "tokio",
-]
-
-[[package]]
-name = "mo-agent-runtime"
-version = "0.1.0"
-dependencies = [
- "async-stream",
- "async-trait",
- "axum",
- "base64",
- "chrono",
- "criterion",
- "dirs",
- "dotenvy",
- "futures-util",
- "mo-agent-core",
- "mo-agent-services",
- "mo-thin-client",
- "proptest",
- "regex",
- "reqwest",
- "serde",
- "serde_json",
- "serde_yaml",
- "sha2",
- "sqlx",
- "tempfile",
- "tokio",
- "tokio-util",
- "tower",
- "tower-http",
- "tree-sitter",
- "tree-sitter-bash",
- "uuid",
-]
-
-[[package]]
-name = "mo-agent-services"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "axum",
- "base64",
- "bcrypt",
- "chrono",
- "dirs",
- "dotenvy",
- "fernet",
- "flate2",
- "jsonwebtoken",
- "mo-agent-core",
- "regex",
- "reqwest",
- "serde",
- "serde_json",
- "serde_yaml",
- "sha2",
- "sqlx",
- "tempfile",
- "thiserror 1.0.69",
- "tokio",
- "uuid",
-]
-
-[[package]]
-name = "mo-thin-client"
-version = "0.1.0"
-dependencies = [
- "async-stream",
- "futures-util",
- "reqwest",
- "serde",
- "serde_json",
- "thiserror 1.0.69",
- "tokio",
- "wiremock",
 ]
 
 [[package]]

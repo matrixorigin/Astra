@@ -3,7 +3,7 @@
 //! Tests the full loop: Plan → Execute → Evaluate → Reflect → Plan (retry)
 //! ensuring goal-gradient budget and structured self-correction work end-to-end.
 
-use mo_agent_runtime::pipeline::{
+use astra_runtime::pipeline::{
     engine::{ExecutionEngine, PipelineStage, StageAction, StageRegistry},
     event::{EventKind, EventLog},
     stages::{evaluate::EvaluateStage, reflect::ReflectStage},

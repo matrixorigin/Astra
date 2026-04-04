@@ -5,7 +5,7 @@ use sqlx::Row;
 use std::collections::HashMap;
 
 use crate::auth::FernetTokenEncryptor;
-use mo_agent_core::{
+use astra_core::{
     ErrorResponse, MatrixOneSettings, SharedPool, connect_matrixone, error_response, internal_error,
 };
 

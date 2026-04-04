@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
 
-use mo_agent_services::edge_context::EdgeContext;
+use astra_services::edge_context::EdgeContext;
 use serde::Deserialize;
 use serde_json::Map;
 use serde_json::Value;
@@ -144,14 +144,14 @@ fn load_declarative_config(project_root: &Path) -> FileRoot {
         let raw = match std::fs::read_to_string(&path) {
             Ok(s) => s,
             Err(e) => {
-                mo_agent_core::agent_warn!("stop_hooks", "read {}: {e}", path.display());
+                astra_core::agent_warn!("stop_hooks", "read {}: {e}", path.display());
                 return FileRoot::default();
             }
         };
         match serde_yaml::from_str::<FileRoot>(&raw) {
             Ok(cfg) => {
                 if cfg.version != 1 {
-                    mo_agent_core::agent_warn!(
+                    astra_core::agent_warn!(
                         "stop_hooks",
                         "{}: unsupported version {}, expected 1 — using defaults",
                         path.display(),
@@ -162,7 +162,7 @@ fn load_declarative_config(project_root: &Path) -> FileRoot {
                 return cfg;
             }
             Err(e) => {
-                mo_agent_core::agent_warn!(
+                astra_core::agent_warn!(
                     "stop_hooks",
                     "parse {}: {e} — ignoring declarative hooks",
                     path.display()
@@ -196,7 +196,7 @@ fn resolve_working_dir(project_root: &Path, wd: Option<&str>) -> String {
         if can.starts_with(&root) {
             return can.to_string_lossy().into_owned();
         }
-        mo_agent_core::agent_warn!(
+        astra_core::agent_warn!(
             "stop_hooks",
             "working_dir '{rel}' escapes project root — using project root"
         );
@@ -206,7 +206,7 @@ fn resolve_working_dir(project_root: &Path, wd: Option<&str>) -> String {
     if acc.starts_with(project_root) {
         acc.to_string_lossy().into_owned()
     } else {
-        mo_agent_core::agent_warn!(
+        astra_core::agent_warn!(
             "stop_hooks",
             "working_dir '{rel}' could not be anchored — using project root"
         );
@@ -231,7 +231,7 @@ fn declarative_hooks_for_when(project_root: &Path, cfg: &FileRoot, phase: &str) 
         let label = h.label.trim();
         let command = h.command.trim();
         if label.is_empty() || command.is_empty() {
-            mo_agent_core::agent_warn!("stop_hooks", "skip hook with empty label or command");
+            astra_core::agent_warn!("stop_hooks", "skip hook with empty label or command");
             continue;
         }
         let wd = resolve_working_dir(project_root, h.working_dir.as_deref());

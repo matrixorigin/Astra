@@ -1,5 +1,5 @@
 [package]
-name = "mo-agent-core"
+name = "astra-core"
 version.workspace = true
 edition.workspace = true
 

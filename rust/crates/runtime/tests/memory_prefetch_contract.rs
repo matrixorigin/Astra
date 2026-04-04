@@ -1,9 +1,9 @@
+use astra_runtime::turn::bridge_inprocess::prefetch_memories;
 /// End-to-end contract tests for memory prefetch in InProcessBridge.
 ///
 /// Uses a real HTTP mock server to simulate Memoria API responses,
 /// then verifies the full prefetch pipeline produces correct output.
 use axum::{Json, Router, routing::post};
-use mo_agent_runtime::turn::bridge_inprocess::prefetch_memories;
 use serde_json::json;
 use tokio::net::TcpListener;
 

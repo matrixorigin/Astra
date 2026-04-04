@@ -3,12 +3,12 @@
 /// the test will fail with 404 instead of the expected status.
 use std::sync::Arc;
 
+use astra_runtime::{AppState, HealthChecker, ServiceInfo, build_app};
 use async_trait::async_trait;
 use axum::{
     Router, body,
     http::{Request, StatusCode},
 };
-use mo_agent_runtime::{AppState, HealthChecker, ServiceInfo, build_app};
 use tower::util::ServiceExt;
 
 #[derive(Clone)]

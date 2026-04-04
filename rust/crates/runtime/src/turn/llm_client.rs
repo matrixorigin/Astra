@@ -185,7 +185,7 @@ pub(crate) struct LlmCallResult {
 }
 
 fn turn_timeout_s() -> f64 {
-    mo_agent_core::RuntimeLimits::global().turn_timeout_s
+    astra_core::RuntimeLimits::global().turn_timeout_s
 }
 
 /// Cooperative cancellation for [`call_llm_and_collect`] / [`collect_llm_stream`].
@@ -410,7 +410,7 @@ pub(crate) async fn call_llm_and_collect(
                     // Cap the fallback timeout at min(fallback_timeout, remaining budget).
                     let remaining = total_budget.saturating_sub(elapsed);
                     let fb_timeout = llm_fallback_timeout().min(remaining);
-                    mo_agent_core::agent_warn!(
+                    astra_core::agent_warn!(
                         "llm",
                         "stream idle timeout after {}ms — attempting non-stream fallback (timeout {}s)",
                         elapsed_ms,
@@ -445,7 +445,7 @@ pub(crate) async fn call_llm_and_collect(
         // Record rate-limit errors to cooldown tracker
         if is_rate_limit_status(status) {
             let action = cooldown.with(model_key, |c| c.record_429(retry_after_ms, has_fallback));
-            mo_agent_core::agent_warn!(
+            astra_core::agent_warn!(
                 "llm",
                 "rate limit (429) on {}: action={:?}",
                 model_key,
@@ -459,7 +459,7 @@ pub(crate) async fn call_llm_and_collect(
 
         if is_overload_status(status) {
             let action = cooldown.with(model_key, |c| c.record_529(retry_after_ms, has_fallback));
-            mo_agent_core::agent_warn!(
+            astra_core::agent_warn!(
                 "llm",
                 "server overload ({status}) on {}: action={:?}",
                 model_key,
@@ -594,7 +594,7 @@ async fn collect_llm_stream(
                     {
                         f.insert("name".to_string(), Value::String(name.to_string()));
                     } else if let Some(bad_name) = func.get("name").and_then(Value::as_str) {
-                        mo_agent_core::agent_warn!(
+                        astra_core::agent_warn!(
                             "llm",
                             "dropped malformed tool_call with invalid name: {bad_name:?}"
                         );

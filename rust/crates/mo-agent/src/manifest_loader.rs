@@ -29,8 +29,8 @@
 //!     required: ["resource"]
 //! ```
 
-use mo_agent_runtime::tool_registry::plugin::{PluginRegistry, PluginToolEntry};
-use mo_agent_runtime::tool_registry::{IntentType, Scope};
+use astra_runtime::tool_registry::plugin::{PluginRegistry, PluginToolEntry};
+use astra_runtime::tool_registry::{IntentType, Scope};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::path::Path;
@@ -623,7 +623,7 @@ depends_on: []
             registry.register(entry).unwrap();
         }
 
-        let query = mo_agent_runtime::text_tokenize::tokenize("show kubernetes pods");
+        let query = astra_runtime::text_tokenize::tokenize("show kubernetes pods");
         let scores = registry.score_all(&query);
         assert!(!scores.is_empty());
         assert_eq!(scores[0].1, "kubectl_get");

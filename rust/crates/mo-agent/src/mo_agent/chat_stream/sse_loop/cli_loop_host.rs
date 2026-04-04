@@ -10,14 +10,14 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::Instant;
 
-use async_trait::async_trait;
-use crossterm::style::Stylize;
-use mo_agent_runtime::{
+use astra_runtime::{
     tool_registry::ToolRegistry,
     tool_selector::ToolSelector,
     turn::agentic_headless_round::HeadlessStderrStyle,
     turn::agentic_loop_host::{AgenticLoopHost, AgenticLoopState, HostTurnResult},
 };
+use async_trait::async_trait;
+use crossterm::style::Stylize;
 use serde_json::Value;
 
 use crate::{
@@ -34,7 +34,7 @@ use super::agentic_loop_turn::{
 /// Holds all CLI-specific dependencies; the runtime loop calls `execute_turn()`
 /// which delegates to the existing `fetch_chat_turn_sse` pipeline.
 pub(crate) struct CliAgenticLoopHost<'a> {
-    pub api: &'a mo_thin_client::ThinClient,
+    pub api: &'a astra_thin_client::ThinClient,
     pub token: &'a str,
     pub model: Option<&'a str>,
     pub explain: ExplainMode,

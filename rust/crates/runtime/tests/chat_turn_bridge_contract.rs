@@ -1,16 +1,6 @@
 use std::{fs, path::PathBuf, sync::Arc};
 
-use async_trait::async_trait;
-use axum::{
-    Router,
-    body::{self, Body, Bytes},
-    extract::State,
-    http::{HeaderMap, Request, StatusCode},
-    response::Response,
-    routing::post,
-};
-use base64::{Engine as _, engine::general_purpose::URL_SAFE};
-use mo_agent_runtime::{
+use astra_runtime::{
     AppState, AuthLoginRequestData, AuthRefreshRequestData, AuthRegisterRequestData, AuthService,
     AuthUserRecord, ChatTurnBridge, ErrorResponse, HealthChecker, ServiceInfo,
     SessionActivityRecord, SessionActivityUpdatePlan, SessionCache, SessionCreateRequestData,
@@ -21,6 +11,16 @@ use mo_agent_runtime::{
     TurnReflectionLessonWriter, TurnReflectionMark, TurnReflectionStateStore,
     TurnSessionActivityWriter, TurnToolEventPersistPlan, TurnToolEventWriter, build_app,
 };
+use async_trait::async_trait;
+use axum::{
+    Router,
+    body::{self, Body, Bytes},
+    extract::State,
+    http::{HeaderMap, Request, StatusCode},
+    response::Response,
+    routing::post,
+};
+use base64::{Engine as _, engine::general_purpose::URL_SAFE};
 use serde::Deserialize;
 use tokio::sync::Mutex;
 use tower::util::ServiceExt;
@@ -62,14 +62,14 @@ impl AuthService for StubAuthService {
     async fn login(
         &self,
         _request: AuthLoginRequestData,
-    ) -> Result<mo_agent_runtime::AuthTokenRecord, (StatusCode, axum::Json<ErrorResponse>)> {
+    ) -> Result<astra_runtime::AuthTokenRecord, (StatusCode, axum::Json<ErrorResponse>)> {
         unreachable!()
     }
 
     async fn refresh(
         &self,
         _request: AuthRefreshRequestData,
-    ) -> Result<mo_agent_runtime::AuthTokenRecord, (StatusCode, axum::Json<ErrorResponse>)> {
+    ) -> Result<astra_runtime::AuthTokenRecord, (StatusCode, axum::Json<ErrorResponse>)> {
         unreachable!()
     }
 

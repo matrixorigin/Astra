@@ -3,7 +3,7 @@ use crate::turn::services::{
     NoopTurnAuxiliaryEventWriter, NoopTurnCoreEventWriter, NoopTurnHookDbWriter,
     NoopTurnSessionActivityWriter, NoopTurnToolEventWriter,
 };
-use mo_agent_services::auth;
+use astra_services::auth;
 
 const DEFAULT_NAME: &str = "Agent Engine API";
 const DEFAULT_VERSION: &str = "0.1.0";
@@ -82,13 +82,13 @@ pub struct AppState {
     pub memoria_master_key: Option<String>,
     pub memoria_forwarder: Arc<dyn MemoriaForwarder>,
     pub shared_pool: Option<SharedPool>,
-    /// Matrix pool + journal ingestion + [`mo_agent_services::SyncOrchestrator`] (learning/events).
+    /// Matrix pool + journal ingestion + [`astra_services::SyncOrchestrator`] (learning/events).
     pub(crate) matrix_cloud_runtime: Option<Arc<crate::matrix_cloud_runtime::MatrixCloudRuntime>>,
     /// Edge §5.5 callbacks (`/tools/result`, `/approval/respond`); keys via [`crate::turn::edge_ledger`].
     pub(crate) edge_callback_ledger:
         Arc<tokio::sync::Mutex<std::collections::HashMap<String, serde_json::Value>>>,
     /// Multi-agent profile registry — defines agent tiers, delegation rules.
-    pub(crate) agent_profile_registry: Arc<mo_agent_services::AgentProfileRegistry>,
+    pub(crate) agent_profile_registry: Arc<astra_services::AgentProfileRegistry>,
     /// Delegation engine — coordinates multi-agent runs.
     pub(crate) delegation_engine: Option<Arc<crate::server::delegation_engine::DelegationEngine>>,
 }
@@ -165,7 +165,7 @@ impl AppState {
             edge_callback_ledger: Arc::new(tokio::sync::Mutex::new(
                 std::collections::HashMap::new(),
             )),
-            agent_profile_registry: Arc::new(mo_agent_services::AgentProfileRegistry::new()),
+            agent_profile_registry: Arc::new(astra_services::AgentProfileRegistry::new()),
             delegation_engine: None,
         }
     }
@@ -547,7 +547,7 @@ impl AppState {
 
     pub fn with_agent_profile_registry(
         mut self,
-        registry: Arc<mo_agent_services::AgentProfileRegistry>,
+        registry: Arc<astra_services::AgentProfileRegistry>,
     ) -> Self {
         self.agent_profile_registry = registry;
         self
@@ -562,7 +562,7 @@ impl AppState {
     }
 
     /// Access the agent profile registry.
-    pub fn agent_profile_registry(&self) -> &mo_agent_services::AgentProfileRegistry {
+    pub fn agent_profile_registry(&self) -> &astra_services::AgentProfileRegistry {
         &self.agent_profile_registry
     }
 

@@ -1740,7 +1740,7 @@ mod tests {
 
     #[test]
     fn resolve_checked_with_permissive_sandbox_allows_all() {
-        use mo_agent_runtime::tool_sandbox::SandboxPolicy;
+        use astra_runtime::tool_sandbox::SandboxPolicy;
         let dir = tempfile::tempdir().unwrap();
         let mut executor = ToolExecutor::new(dir.path());
         // Permissive policy → all paths allowed
@@ -1751,7 +1751,7 @@ mod tests {
 
     #[test]
     fn resolve_checked_with_sandbox_blocks_escape() {
-        use mo_agent_runtime::tool_sandbox::SandboxPolicy;
+        use astra_runtime::tool_sandbox::SandboxPolicy;
         let dir = tempfile::tempdir().unwrap();
         let mut executor = ToolExecutor::new(dir.path());
         let mut policy = SandboxPolicy::strict(dir.path());

@@ -4,15 +4,15 @@
 //! so plan execution can show contract generation, verification results, and delivery
 //! reports in a user-friendly way.
 
-use async_trait::async_trait;
-use crossterm::style::Stylize;
-use mo_agent_runtime::{GateVerdict, VerificationGate};
-use mo_agent_services::coordination::AgentResult;
-use mo_agent_services::{
+use astra_runtime::{GateVerdict, VerificationGate};
+use astra_services::coordination::AgentResult;
+use astra_services::{
     ContractAmendment, ContractGenerator, DurableSubtask, DurableTaskLifecycle,
     LocalDurableTaskLifecycle, SubtaskStage, SubtaskVerificationReport, TaskContract,
     TaskDeliveryReport, VerificationRunner, VerifierKind,
 };
+use async_trait::async_trait;
+use crossterm::style::Stylize;
 use std::sync::Arc;
 
 /// Build a reqwest client that skips the system proxy for localhost/loopback URLs.
@@ -47,13 +47,13 @@ pub struct DurableTaskState {
 /// plan execution proceeds without contract-backed verification.
 pub async fn generate_contract(
     lifecycle: &Arc<dyn DurableTaskLifecycle>,
-    plan: &mo_agent_services::task_orchestrator::TaskPlan,
+    plan: &astra_services::task_orchestrator::TaskPlan,
     goal: &str,
     user_id: &str,
     session_id: &str,
     work_dir: &std::path::Path,
 ) -> Option<TaskContract> {
-    let detection = mo_agent_services::ProjectDetection::detect(work_dir);
+    let detection = astra_services::ProjectDetection::detect(work_dir);
     let cg = ContractGenerator::new(detection);
 
     let contract = match cg.generate(goal, plan, None) {
@@ -615,7 +615,7 @@ pub(super) fn save_delivery_report_json(report: &TaskDeliveryReport) {
 /// Returns the raw rating (1–5) if the user provided one, or `None` if skipped.
 pub async fn collect_user_feedback(
     durable: &DurableTaskState,
-    learning_bridge: Option<&std::sync::Arc<dyn mo_agent_services::TaskLearningBridge>>,
+    learning_bridge: Option<&std::sync::Arc<dyn astra_services::TaskLearningBridge>>,
 ) -> Option<u8> {
     let report = durable.last_report.as_ref()?;
 
@@ -655,7 +655,7 @@ pub async fn collect_user_feedback(
             .collect::<std::collections::HashSet<_>>()
             .into_iter()
             .collect();
-        let outcome = mo_agent_services::durable_task::build_outcome_signal(
+        let outcome = astra_services::durable_task::build_outcome_signal(
             &durable.contract,
             report,
             all_tools,
@@ -691,7 +691,7 @@ pub fn create_local_lifecycle(
 pub fn create_local_lifecycle_with_sender(
     session_dir: &std::path::Path,
     work_dir: &std::path::Path,
-    sender: Option<mo_agent_services::event_ingestion::IngestionSender>,
+    sender: Option<astra_services::event_ingestion::IngestionSender>,
     session_id: Option<&str>,
     user_id: Option<&str>,
 ) -> Arc<dyn DurableTaskLifecycle> {
@@ -714,11 +714,11 @@ pub fn create_local_lifecycle_with_sender(
 pub fn create_local_lifecycle_full(
     session_dir: &std::path::Path,
     work_dir: &std::path::Path,
-    sender: Option<mo_agent_services::event_ingestion::IngestionSender>,
+    sender: Option<astra_services::event_ingestion::IngestionSender>,
     session_id: Option<&str>,
     user_id: Option<&str>,
-    cloud_judge: Option<Arc<dyn mo_agent_services::LlmJudge>>,
-    learning_bridge: Option<Arc<dyn mo_agent_services::TaskLearningBridge>>,
+    cloud_judge: Option<Arc<dyn astra_services::LlmJudge>>,
+    learning_bridge: Option<Arc<dyn astra_services::TaskLearningBridge>>,
 ) -> Arc<dyn DurableTaskLifecycle> {
     let contracts_dir = session_dir.join("contracts");
     let _ = std::fs::create_dir_all(&contracts_dir);
@@ -769,7 +769,7 @@ pub fn create_local_lifecycle_full(
 /// control loop, ensuring sub-runs don't bypass acceptance checks.
 pub struct ContractVerificationGate {
     /// Criteria to verify after the sub-run completes.
-    criteria: Vec<mo_agent_services::VerificationCriterion>,
+    criteria: Vec<astra_services::VerificationCriterion>,
     /// Subtask ID for labeling results.
     subtask_id: String,
     /// Runner that executes command/file/grep verifications.
@@ -799,7 +799,7 @@ impl ContractVerificationGate {
     /// Create a gate from explicit criteria (for testing or custom pipelines).
     #[allow(dead_code)]
     pub fn from_criteria(
-        criteria: Vec<mo_agent_services::VerificationCriterion>,
+        criteria: Vec<astra_services::VerificationCriterion>,
         subtask_id: String,
         work_dir: std::path::PathBuf,
         max_retry: u32,
@@ -814,7 +814,7 @@ impl ContractVerificationGate {
 
     /// Attach an LLM judge for semantic criteria.
     #[allow(dead_code)]
-    pub fn with_llm_judge(mut self, judge: Arc<dyn mo_agent_services::LlmJudge>) -> Self {
+    pub fn with_llm_judge(mut self, judge: Arc<dyn astra_services::LlmJudge>) -> Self {
         self.runner.llm_judge = Some(judge);
         self
     }
@@ -939,7 +939,7 @@ pub fn create_gate_for_subtask(
 #[allow(dead_code)]
 pub struct ContractCheckpointGate {
     /// Quick criteria (file-exists / grep only) extracted from the subtask.
-    quick_criteria: Vec<mo_agent_services::VerificationCriterion>,
+    quick_criteria: Vec<astra_services::VerificationCriterion>,
     subtask_id: String,
     runner: VerificationRunner,
     frequency: u32,
@@ -979,7 +979,7 @@ impl ContractCheckpointGate {
 }
 
 #[async_trait]
-impl mo_agent_runtime::server::delegation_engine::CheckpointGate for ContractCheckpointGate {
+impl astra_runtime::server::delegation_engine::CheckpointGate for ContractCheckpointGate {
     async fn check(
         &self,
         _run_id: &str,
@@ -1034,7 +1034,7 @@ pub fn create_checkpoint_gate_for_subtask(
     subtask_id: &str,
     work_dir: std::path::PathBuf,
     frequency: u32,
-) -> Option<Arc<dyn mo_agent_runtime::server::delegation_engine::CheckpointGate>> {
+) -> Option<Arc<dyn astra_runtime::server::delegation_engine::CheckpointGate>> {
     let subtask = durable
         .contract
         .subtasks
@@ -1090,7 +1090,7 @@ impl HttpLlmJudge {
 }
 
 #[async_trait::async_trait]
-impl mo_agent_services::LlmJudge for HttpLlmJudge {
+impl astra_services::LlmJudge for HttpLlmJudge {
     async fn evaluate(&self, prompt: &str, context: &str) -> Result<f64, String> {
         let system_msg = serde_json::json!({
             "role": "system",
@@ -1195,8 +1195,8 @@ fn parse_judge_score(text: &str) -> Result<f64, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mo_agent_services::task_orchestrator::{SubtaskPlan, TaskPlan, TaskStatus};
-    use mo_agent_services::{
+    use astra_services::task_orchestrator::{SubtaskPlan, TaskPlan, TaskStatus};
+    use astra_services::{
         SubtaskDeliverySummary, TaskScope, VerificationCriterion, VerificationResult,
     };
 
@@ -1231,7 +1231,7 @@ mod tests {
     #[test]
     fn contract_summary_display_does_not_panic() {
         let plan = make_test_plan();
-        let detection = mo_agent_services::ProjectDetection::detect(std::path::Path::new("/tmp"));
+        let detection = astra_services::ProjectDetection::detect(std::path::Path::new("/tmp"));
         let cg = ContractGenerator::new(detection);
         let contract = cg.generate("Build foo", &plan, None).unwrap();
 
@@ -1333,8 +1333,8 @@ mod tests {
 
     // ─── ContractVerificationGate tests ──────────────────────────────────────
 
-    fn make_agent_result() -> mo_agent_services::coordination::AgentResult {
-        mo_agent_services::coordination::AgentResult {
+    fn make_agent_result() -> astra_services::coordination::AgentResult {
+        astra_services::coordination::AgentResult {
             agent_id: "test-agent".into(),
             run_id: "run-1".into(),
             status: "completed".into(),
@@ -1355,7 +1355,7 @@ mod tests {
             2,
         );
         let verdict = gate.verify(&make_agent_result(), "deleg-1", 1).await;
-        assert!(matches!(verdict, mo_agent_runtime::GateVerdict::Skip));
+        assert!(matches!(verdict, astra_runtime::GateVerdict::Skip));
     }
 
     #[tokio::test]
@@ -1364,7 +1364,7 @@ mod tests {
         let file_path = tmp.path().join("output.txt");
         std::fs::write(&file_path, "hello").unwrap();
 
-        let criteria = vec![mo_agent_services::VerificationCriterion {
+        let criteria = vec![astra_services::VerificationCriterion {
             id: "file-check".into(),
             description: "Output file exists".into(),
             verifier: VerifierKind::FileExists {
@@ -1382,14 +1382,14 @@ mod tests {
             2,
         );
         let verdict = gate.verify(&make_agent_result(), "deleg-1", 1).await;
-        assert!(matches!(verdict, mo_agent_runtime::GateVerdict::Pass));
+        assert!(matches!(verdict, astra_runtime::GateVerdict::Pass));
     }
 
     #[tokio::test]
     async fn gate_fail_when_file_missing() {
         let tmp = tempfile::TempDir::new().unwrap();
 
-        let criteria = vec![mo_agent_services::VerificationCriterion {
+        let criteria = vec![astra_services::VerificationCriterion {
             id: "file-check".into(),
             description: "Output file exists".into(),
             verifier: VerifierKind::FileExists {
@@ -1408,7 +1408,7 @@ mod tests {
         );
         let verdict = gate.verify(&make_agent_result(), "deleg-1", 1).await;
         match verdict {
-            mo_agent_runtime::GateVerdict::Fail { reason, details } => {
+            astra_runtime::GateVerdict::Fail { reason, details } => {
                 assert!(reason.contains("s1"));
                 assert!(reason.contains("failed"));
                 assert!(details.is_some());
@@ -1428,7 +1428,7 @@ mod tests {
             files: vec![],
             stage: SubtaskStage::AwaitingVerification,
             criteria: vec![
-                mo_agent_services::VerificationCriterion {
+                astra_services::VerificationCriterion {
                     id: "local-check".into(),
                     description: "Local check".into(),
                     verifier: VerifierKind::FileExists {
@@ -1438,7 +1438,7 @@ mod tests {
                     timeout_sec: 10,
                     global_only: false,
                 },
-                mo_agent_services::VerificationCriterion {
+                astra_services::VerificationCriterion {
                     id: "global-check".into(),
                     description: "Build check".into(),
                     verifier: VerifierKind::BuildPass {
@@ -1463,7 +1463,7 @@ mod tests {
         // Only the non-global, non-required criterion is included → Pass
         let verdict = gate.verify(&make_agent_result(), "deleg-1", 1).await;
         assert!(
-            matches!(verdict, mo_agent_runtime::GateVerdict::Pass),
+            matches!(verdict, astra_runtime::GateVerdict::Pass),
             "Expected Pass (global_only criterion filtered out), got {:?}",
             verdict
         );
@@ -2127,7 +2127,7 @@ mod tests {
     #[test]
     fn create_gate_for_subtask_returns_none_for_unknown_id() {
         let plan = make_test_plan();
-        let detection = mo_agent_services::ProjectDetection::detect(std::path::Path::new("/tmp"));
+        let detection = astra_services::ProjectDetection::detect(std::path::Path::new("/tmp"));
         let cg = ContractGenerator::new(detection);
         let contract = cg.generate("Build foo", &plan, None).unwrap();
 
@@ -2140,7 +2140,7 @@ mod tests {
                 _: &str,
                 _: &str,
                 _: &str,
-                _: &mo_agent_services::task_orchestrator::TaskPlan,
+                _: &astra_services::task_orchestrator::TaskPlan,
                 _: TaskScope,
             ) -> Result<TaskContract, String> {
                 Err("stub".into())
@@ -2148,7 +2148,7 @@ mod tests {
             async fn amend_contract(
                 &self,
                 _: &str,
-                _: mo_agent_services::ContractAmendment,
+                _: astra_services::ContractAmendment,
             ) -> Result<TaskContract, String> {
                 Err("stub".into())
             }
@@ -2159,7 +2159,7 @@ mod tests {
                 &self,
                 _: &str,
                 _: &str,
-            ) -> Result<mo_agent_services::SubtaskExecutionContext, String> {
+            ) -> Result<astra_services::SubtaskExecutionContext, String> {
                 Err("stub".into())
             }
             async fn complete_subtask_execution(&self, _: &str, _: &str) -> Result<(), String> {
@@ -2185,13 +2185,13 @@ mod tests {
                 &self,
                 _: &str,
                 _: &str,
-            ) -> Result<mo_agent_services::TaskResumeContext, String> {
+            ) -> Result<astra_services::TaskResumeContext, String> {
                 Err("stub".into())
             }
             async fn deliver_task(
                 &self,
                 _: &str,
-            ) -> Result<mo_agent_services::TaskDeliveryReport, String> {
+            ) -> Result<astra_services::TaskDeliveryReport, String> {
                 Err("stub".into())
             }
             async fn snapshot_task_state(&self, _: &str) -> Result<String, String> {

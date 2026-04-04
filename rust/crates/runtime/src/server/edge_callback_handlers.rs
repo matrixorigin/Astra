@@ -22,7 +22,7 @@ fn edge_id_from_headers(headers: &HeaderMap) -> String {
 pub(super) async fn post_tool_result_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(body): Json<mo_thin_client::ToolResultRequest>,
+    Json(body): Json<astra_thin_client::ToolResultRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
     let user = state.auth_service.current_user(&headers).await?;
     let edge_id = edge_id_from_headers(&headers);
@@ -49,7 +49,7 @@ pub(super) async fn post_tool_result_handler(
 pub(super) async fn post_approval_respond_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(body): Json<mo_thin_client::ApprovalRespondRequest>,
+    Json(body): Json<astra_thin_client::ApprovalRespondRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
     let user = state.auth_service.current_user(&headers).await?;
     let key = approval_callback_key(&user.user_id, &body.request_id);

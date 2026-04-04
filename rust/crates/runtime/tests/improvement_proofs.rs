@@ -12,7 +12,7 @@
 // ═══════════════════════════════════════════════════════════════════════════════
 
 mod token_efficiency {
-    use mo_agent_runtime::prompts::{
+    use astra_runtime::prompts::{
         CompactionTier, ContextBudget, budget_for_model, estimate_tokens,
         estimate_tokens_cache_aware,
     };
@@ -505,8 +505,7 @@ mod memory_awareness {
 
         // Simple query: "fix bug" — doesn't need much context
         let simple_query = "fix bug";
-        let adaptive_simple =
-            mo_agent_runtime::turn::retrieval::adaptive_budget_chars(simple_query);
+        let adaptive_simple = astra_runtime::turn::retrieval::adaptive_budget_chars(simple_query);
         assert!(
             adaptive_simple < fixed_budget,
             "Simple query should use LESS budget: {} vs fixed {}. Saves {}%",
@@ -517,8 +516,7 @@ mod memory_awareness {
 
         // Complex code query: needs more context
         let complex_query = "impl AsyncTrait for MyService { fn handle(&self, req: Request) -> Result<Response, Error> { /* need to see similar patterns */ }";
-        let adaptive_complex =
-            mo_agent_runtime::turn::retrieval::adaptive_budget_chars(complex_query);
+        let adaptive_complex = astra_runtime::turn::retrieval::adaptive_budget_chars(complex_query);
         assert!(
             adaptive_complex > fixed_budget,
             "Complex code query should use MORE budget: {} vs fixed {}. Gets {}% more context",
@@ -542,8 +540,8 @@ mod memory_awareness {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 mod skill_accuracy {
-    use mo_agent_runtime::tool_registry::{SelectionFeedback, SelectionReport, ToolQualityTracker};
-    use mo_agent_runtime::turn::routing_metrics::{
+    use astra_runtime::tool_registry::{SelectionFeedback, SelectionReport, ToolQualityTracker};
+    use astra_runtime::turn::routing_metrics::{
         ConfidenceCalibrator, DisambiguationAction, disambiguate_intents,
     };
 
@@ -781,7 +779,7 @@ mod skill_accuracy {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 mod edge_cloud_bridge {
-    use mo_agent_runtime::bridge::circuit_breaker::{BridgeHealthMetrics, CircuitBreaker};
+    use astra_runtime::bridge::circuit_breaker::{BridgeHealthMetrics, CircuitBreaker};
     use std::time::Duration;
 
     // ── 4a. Circuit breaker prevents cascade failures ─────────────────────
@@ -981,7 +979,7 @@ mod edge_cloud_bridge {
             if strict_parse(frame).is_some() {
                 old_successes += 1;
             }
-            if mo_agent_runtime::bridge::sse_events::parse_sse_json_frame_resilient(frame).is_ok() {
+            if astra_runtime::bridge::sse_events::parse_sse_json_frame_resilient(frame).is_ok() {
                 new_successes += 1;
             }
         }
@@ -1008,11 +1006,11 @@ mod edge_cloud_bridge {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 mod selection_feedback_loop {
-    use mo_agent_runtime::tool_registry::{
+    use astra_runtime::tool_registry::{
         ConversationState, IntentType, SelectionFeedback, TOOL_CATALOG, ToolQualityTracker,
         pre_filter_dynamic, pre_filter_dynamic_with_quality,
     };
-    use mo_agent_runtime::turn::routing_metrics::DisambiguationAction;
+    use astra_runtime::turn::routing_metrics::DisambiguationAction;
 
     /// PROOF: Quality tracker boost_factor actually changes tool ranking.
     /// Old: all tools scored equally regardless of history.
@@ -1175,11 +1173,11 @@ mod selection_feedback_loop {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 mod systemic_selection {
-    use mo_agent_runtime::prompts::{LOW_CONFIDENCE_THRESHOLD, build_main_system_prompt};
-    use mo_agent_runtime::tool_registry::{
+    use astra_runtime::prompts::{LOW_CONFIDENCE_THRESHOLD, build_main_system_prompt};
+    use astra_runtime::tool_registry::{
         ConversationState, IntentType, TOOL_CATALOG, pre_filter_dynamic,
     };
-    use mo_agent_runtime::tool_selector::compute_selection_confidence;
+    use astra_runtime::tool_selector::compute_selection_confidence;
 
     // ── 7.1 Adaptive Threshold ──────────────────────────────────────────────
 
@@ -1396,8 +1394,8 @@ mod systemic_selection {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 mod memory_domain_scoring {
-    use mo_agent_runtime::pipeline::routing::DomainHint;
-    use mo_agent_runtime::tool_registry::{
+    use astra_runtime::pipeline::routing::DomainHint;
+    use astra_runtime::tool_registry::{
         ConversationState, IntentType, TOOL_CATALOG, pre_filter_dynamic,
         pre_filter_dynamic_with_memory,
     };
@@ -1608,10 +1606,10 @@ mod memory_domain_scoring {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 mod non_happy_path {
-    use mo_agent_runtime::turn::stall::{
+    use astra_runtime::turn::stall::{
         DivergenceStatus, build_stall_reflection, detect_divergence, detect_server_stall,
     };
-    use mo_agent_runtime::turn::tool_health::ToolHealthTracker;
+    use astra_runtime::turn::tool_health::ToolHealthTracker;
     use std::collections::BTreeSet;
 
     fn make_sigs(rounds: &[&[&str]]) -> Vec<BTreeSet<String>> {
@@ -1804,8 +1802,8 @@ mod non_happy_path {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 mod git_deep_mining {
-    use mo_agent_runtime::text_tokenize;
-    use mo_agent_runtime::tool_registry::{IntentType, TOOL_CATALOG, tfidf_score};
+    use astra_runtime::text_tokenize;
+    use astra_runtime::tool_registry::{IntentType, TOOL_CATALOG, tfidf_score};
 
     // ── D.1: Git tools are in the catalog with correct metadata ──
 
@@ -1950,9 +1948,9 @@ mod git_deep_mining {
 // ── Phase D.5-D.7: MatrixOne Convergence Tool Proof Tests ──────────────────
 
 mod mo_convergence {
-    use mo_agent_runtime::pipeline::routing::DomainHint;
-    use mo_agent_runtime::text_tokenize;
-    use mo_agent_runtime::tool_registry::{IntentType, TOOL_CATALOG, tfidf_score};
+    use astra_runtime::pipeline::routing::DomainHint;
+    use astra_runtime::text_tokenize;
+    use astra_runtime::tool_registry::{IntentType, TOOL_CATALOG, tfidf_score};
 
     fn find_tool_idx(name: &str) -> usize {
         TOOL_CATALOG.iter().position(|t| t.name == name).unwrap()
@@ -2083,9 +2081,9 @@ mod mo_convergence {
 // ── Phase E: Extensibility Proof Tests ──────────────────────────────────────
 
 mod extensibility {
-    use mo_agent_runtime::text_tokenize;
-    use mo_agent_runtime::tool_registry::chain::resolve_args;
-    use mo_agent_runtime::tool_registry::{
+    use astra_runtime::text_tokenize;
+    use astra_runtime::tool_registry::chain::resolve_args;
+    use astra_runtime::tool_registry::{
         ChainContext, IntentType, PluginRegistry, PluginToolEntry, Scope, TOOL_CATALOG, ToolChain,
     };
     use serde_json::json;
@@ -2264,13 +2262,13 @@ mod extensibility {
 // ── Phase F: Edge-Cloud State Convergence Proof Tests ───────────────────────
 
 mod state_convergence {
-    use mo_agent_runtime::pipeline::calibration::ProgressiveCalibrator;
-    use mo_agent_runtime::pipeline::entity::EntityGraph;
-    use mo_agent_runtime::pipeline::pattern::PatternLibrary;
-    use mo_agent_runtime::pipeline::persistence::{
+    use astra_runtime::pipeline::calibration::ProgressiveCalibrator;
+    use astra_runtime::pipeline::entity::EntityGraph;
+    use astra_runtime::pipeline::pattern::PatternLibrary;
+    use astra_runtime::pipeline::persistence::{
         LearningSnapshot, export_from_modules, merge_into_modules, save_snapshot_to,
     };
-    use mo_agent_runtime::pipeline::routing::{DomainHint, TaskType};
+    use astra_runtime::pipeline::routing::{DomainHint, TaskType};
     use std::sync::{Arc, Mutex};
 
     #[allow(clippy::type_complexity)]
@@ -2479,7 +2477,7 @@ mod state_convergence {
 // ════════════════════════════════════════════════════════════════════════════════
 #[cfg(test)]
 mod sandbox_proofs {
-    use mo_agent_runtime::tool_sandbox::{
+    use astra_runtime::tool_sandbox::{
         CommandRisk, SandboxMode, SandboxPolicy, analyze_command_risks, sandbox_command,
         validate_path, wrap_command_with_limits,
     };
@@ -2681,7 +2679,7 @@ fn budget_pressure_70_percent_scaling() {
 
 #[test]
 fn tool_health_export_import_roundtrip() {
-    use mo_agent_runtime::turn::tool_health::ToolHealthTracker;
+    use astra_runtime::turn::tool_health::ToolHealthTracker;
 
     let mut tracker = ToolHealthTracker::new();
     // Simulate a tool with failures (need 5+ calls for cross-session deprioritization)
@@ -2831,7 +2829,7 @@ fn schema_pruning_strips_optional_params() {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 mod semantic_dedup_proofs {
-    use mo_agent_runtime::semantic_dedup::{SemanticDedup, output_similarity, semantic_call_key};
+    use astra_runtime::semantic_dedup::{SemanticDedup, output_similarity, semantic_call_key};
     use serde_json::json;
 
     #[test]
@@ -2967,7 +2965,7 @@ mod semantic_dedup_proofs {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 mod error_recovery_proofs {
-    use mo_agent_runtime::turn::error_recovery::*;
+    use astra_runtime::turn::error_recovery::*;
 
     #[test]
     fn error_classification_handles_real_world_messages() {
@@ -3098,7 +3096,7 @@ mod error_recovery_proofs {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 mod stall_enforcement_proofs {
-    use mo_agent_runtime::turn::stall::*;
+    use astra_runtime::turn::stall::*;
     use std::collections::HashSet;
 
     #[test]
@@ -3322,13 +3320,13 @@ mod turn_budget_decay_proofs {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 mod learning_improves_selection {
-    use mo_agent_runtime::pipeline::calibration::ProgressiveCalibrator;
-    use mo_agent_runtime::pipeline::entity::EntityGraph;
-    use mo_agent_runtime::pipeline::pattern::PatternLibrary;
-    use mo_agent_runtime::pipeline::persistence::{export_from_modules, merge_into_modules};
-    use mo_agent_runtime::pipeline::routing::{DomainHint, TaskType};
-    use mo_agent_runtime::tool_registry::{TOOL_CATALOG, ToolRegistry};
-    use mo_agent_runtime::tool_selector::{SelectionContext, TfIdfSelector, ToolSelector};
+    use astra_runtime::pipeline::calibration::ProgressiveCalibrator;
+    use astra_runtime::pipeline::entity::EntityGraph;
+    use astra_runtime::pipeline::pattern::PatternLibrary;
+    use astra_runtime::pipeline::persistence::{export_from_modules, merge_into_modules};
+    use astra_runtime::pipeline::routing::{DomainHint, TaskType};
+    use astra_runtime::tool_registry::{TOOL_CATALOG, ToolRegistry};
+    use astra_runtime::tool_selector::{SelectionContext, TfIdfSelector, ToolSelector};
     use serde_json::json;
     use std::sync::{Arc, Mutex};
 
@@ -3722,7 +3720,7 @@ mod learning_improves_selection {
         // Export → Import roundtrip
         let snapshot = export_from_modules(&eg1, &pl1, &cal1);
         let json = serde_json::to_string_pretty(&snapshot).unwrap();
-        let restored: mo_agent_runtime::pipeline::persistence::LearningSnapshot =
+        let restored: astra_runtime::pipeline::persistence::LearningSnapshot =
             serde_json::from_str(&json).unwrap();
 
         // Import into fresh modules
@@ -3794,8 +3792,8 @@ mod learning_improves_selection {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 mod adaptive_threshold_proofs {
-    use mo_agent_runtime::tool_registry::ConversationState;
-    use mo_agent_runtime::tool_registry::scoring::pre_filter_dynamic;
+    use astra_runtime::tool_registry::ConversationState;
+    use astra_runtime::tool_registry::scoring::pre_filter_dynamic;
 
     fn base_state() -> ConversationState {
         ConversationState {
@@ -3945,7 +3943,7 @@ mod adaptive_threshold_proofs {
         let result = pre_filter_dynamic(&state, "show git log and github PRs");
 
         // Should have both Git and GitHub tools due to intent diversity
-        use mo_agent_runtime::tool_registry::{IntentType, TOOL_CATALOG};
+        use astra_runtime::tool_registry::{IntentType, TOOL_CATALOG};
         let has_github = result
             .iter()
             .any(|(idx, _)| TOOL_CATALOG[*idx].intents.contains(&IntentType::GitHub));
@@ -3964,9 +3962,9 @@ mod adaptive_threshold_proofs {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 mod partial_trigger_proofs {
-    use mo_agent_runtime::tool_registry::ConversationState;
-    use mo_agent_runtime::tool_registry::TOOL_CATALOG;
-    use mo_agent_runtime::tool_registry::scoring::pre_filter_dynamic;
+    use astra_runtime::tool_registry::ConversationState;
+    use astra_runtime::tool_registry::TOOL_CATALOG;
+    use astra_runtime::tool_registry::scoring::pre_filter_dynamic;
 
     fn base_state() -> ConversationState {
         ConversationState {
@@ -4098,10 +4096,10 @@ mod partial_trigger_proofs {
 // Proves that the tool guidance mechanism correctly identifies
 // high-confidence dynamic tools to recommend to the LLM.
 mod tool_guidance_proofs {
-    use mo_agent_runtime::pipeline::routing::RoutingEngine;
-    use mo_agent_runtime::tool_registry::{TOOL_CATALOG, scoring::pre_filter_dynamic};
+    use astra_runtime::pipeline::routing::RoutingEngine;
+    use astra_runtime::tool_registry::{TOOL_CATALOG, scoring::pre_filter_dynamic};
 
-    use mo_agent_runtime::tool_registry::ConversationState;
+    use astra_runtime::tool_registry::ConversationState;
 
     fn base_state() -> ConversationState {
         ConversationState::default()
@@ -4284,7 +4282,7 @@ mod tool_guidance_proofs {
 // ═══════════════════════════════ Plugin→Registry Wiring Tests ════════════
 
 mod plugin_registry_wiring {
-    use mo_agent_runtime::tool_registry::{PluginRegistry, PluginToolEntry, ToolRegistry};
+    use astra_runtime::tool_registry::{PluginRegistry, PluginToolEntry, ToolRegistry};
     use serde_json::json;
 
     fn make_registry() -> ToolRegistry {
@@ -4306,7 +4304,7 @@ mod plugin_registry_wiring {
             triggers: vec![name.to_string()],
             pinned: false,
             intents: vec![],
-            scope: mo_agent_runtime::tool_registry::Scope::Local,
+            scope: astra_runtime::tool_registry::Scope::Local,
             schema: json!({
                 "type": "function",
                 "function": {
@@ -4413,7 +4411,7 @@ mod plugin_registry_wiring {
     ///      tools, respecting budget limits.
     #[test]
     fn plugin_tools_included_in_budget_selection() {
-        use mo_agent_runtime::pipeline::routing::RoutingEngine;
+        use astra_runtime::pipeline::routing::RoutingEngine;
 
         // Create registry with minimal schemas + a plugin
         let mut registry = ToolRegistry::new(vec![]);
@@ -4457,10 +4455,8 @@ mod plugin_registry_wiring {
 // ═══════════════════════════════ ToolChain Catalog Tests ═════════════════
 
 mod tool_chain_catalog {
-    use mo_agent_runtime::tool_registry::TOOL_CATALOG;
-    use mo_agent_runtime::tool_registry::chain::{
-        ChainContext, ChainStep, ToolChain, resolve_args,
-    };
+    use astra_runtime::tool_registry::TOOL_CATALOG;
+    use astra_runtime::tool_registry::chain::{ChainContext, ChainStep, ToolChain, resolve_args};
     use serde_json::json;
 
     #[test]
@@ -4555,7 +4551,7 @@ mod tool_chain_catalog {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 mod security_safety_gaps {
-    use mo_agent_runtime::tool_sandbox::SandboxPolicy;
+    use astra_runtime::tool_sandbox::SandboxPolicy;
 
     /// PROOF: Sandbox defaults to Standard, not None.
     ///
@@ -4572,7 +4568,7 @@ mod security_safety_gaps {
         assert!(
             matches!(
                 policy.mode,
-                mo_agent_runtime::tool_sandbox::SandboxMode::Standard
+                astra_runtime::tool_sandbox::SandboxMode::Standard
             ),
             "for_project() should produce Standard mode, not Permissive"
         );
@@ -4583,7 +4579,7 @@ mod security_safety_gaps {
     fn standard_sandbox_blocks_path_escape() {
         let policy = SandboxPolicy::for_project("/tmp/test_project");
         // /etc/passwd is outside project root → should fail
-        let result = mo_agent_runtime::tool_sandbox::validate_path(&policy, "/etc/passwd");
+        let result = astra_runtime::tool_sandbox::validate_path(&policy, "/etc/passwd");
         assert!(result.is_err(), "standard sandbox should block /etc/passwd");
     }
 
@@ -4594,7 +4590,7 @@ mod security_safety_gaps {
         let policy = SandboxPolicy::for_project(dir.path());
         // Create a file inside the project
         std::fs::write(dir.path().join("test.txt"), "ok").unwrap();
-        let result = mo_agent_runtime::tool_sandbox::validate_path(
+        let result = astra_runtime::tool_sandbox::validate_path(
             &policy,
             dir.path().join("test.txt").to_str().unwrap(),
         );
@@ -4607,7 +4603,7 @@ mod security_safety_gaps {
     /// PROOF: ToolChain.validate() catches unknown tools.
     #[test]
     fn chain_validation_rejects_unknown_tools() {
-        use mo_agent_runtime::tool_registry::ToolChain;
+        use astra_runtime::tool_registry::ToolChain;
         let chain = ToolChain::new("bad_chain", "Uses nonexistent tool")
             .step("definitely_not_a_tool", serde_json::json!({}));
 
@@ -4624,7 +4620,7 @@ mod security_safety_gaps {
     /// PROOF: ToolChain.validate() accepts known tools.
     #[test]
     fn chain_validation_accepts_known_tools() {
-        use mo_agent_runtime::tool_registry::ToolChain;
+        use astra_runtime::tool_registry::ToolChain;
         let chain = ToolChain::new("good_chain", "Uses real tools")
             .step("bash", serde_json::json!({"command": "echo hi"}))
             .step("read_file", serde_json::json!({"path": "out.txt"}));
@@ -4664,7 +4660,7 @@ mod security_safety_gaps {
     /// PROOF: Preference constants are well-defined for cloud sync.
     #[test]
     fn preference_keys_are_defined() {
-        use mo_agent_services::state_sync::pref_keys;
+        use astra_services::state_sync::pref_keys;
         // All preference keys should be non-empty strings
         assert!(!pref_keys::EXPLAIN_MODE.is_empty());
         assert!(!pref_keys::DEFAULT_MODEL.is_empty());
@@ -4681,8 +4677,8 @@ mod security_safety_gaps {
     ///      in production. This test proves the mechanism works.
     #[test]
     fn pattern_library_suggest_returns_relevant() {
-        use mo_agent_runtime::pipeline::pattern::PatternLibrary;
-        use mo_agent_runtime::pipeline::routing::TaskType;
+        use astra_runtime::pipeline::pattern::PatternLibrary;
+        use astra_runtime::pipeline::routing::TaskType;
         let mut lib = PatternLibrary::new();
         // Record some patterns
         let tools: Vec<String> = vec!["git_log".into(), "read_file".into(), "bash".into()];
@@ -4717,7 +4713,7 @@ mod security_safety_gaps {
 /// and that they can be overridden via environment variables.
 #[cfg(test)]
 mod runtime_limits_proofs {
-    use mo_agent_core::RuntimeLimits;
+    use astra_core::RuntimeLimits;
 
     #[test]
     fn defaults_match_original_scattered_constants() {
@@ -4763,7 +4759,7 @@ mod runtime_limits_proofs {
     fn dev_password_constant_is_centralized() {
         // Previously "111" was hardcoded in mo_tools.rs, config.rs, repl_turn.rs
         // Now a single constant in runtime_limits.
-        assert_eq!(mo_agent_core::DEV_MATRIXONE_PASSWORD, "111");
+        assert_eq!(astra_core::DEV_MATRIXONE_PASSWORD, "111");
     }
 }
 
@@ -4772,7 +4768,7 @@ mod runtime_limits_proofs {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 mod idempotency_cache_proofs {
-    use mo_agent_runtime::pipeline::step_protocol::{
+    use astra_runtime::pipeline::step_protocol::{
         CachedToolResult, IdempotencyKey, InMemoryIdempotencyCache, epoch_ms,
     };
     use serde_json::json;
@@ -4917,8 +4913,8 @@ mod idempotency_cache_proofs {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 mod file_event_store_proofs {
-    use mo_agent_runtime::pipeline::step_checkpoint::*;
-    use mo_agent_runtime::pipeline::step_protocol::*;
+    use astra_runtime::pipeline::step_checkpoint::*;
+    use astra_runtime::pipeline::step_protocol::*;
     use serde_json::json;
 
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -5039,7 +5035,7 @@ mod file_event_store_proofs {
 
     #[test]
     fn recorder_with_persistence_writes_events_to_disk() {
-        use mo_agent_runtime::pipeline::step_recorder::StepRecorder;
+        use astra_runtime::pipeline::step_recorder::StepRecorder;
 
         let sid = test_session();
         {
@@ -5066,8 +5062,8 @@ mod file_event_store_proofs {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 mod scheduling_contract_proofs {
-    use mo_agent_runtime::pipeline::step_protocol::*;
-    use mo_agent_runtime::pipeline::step_recorder::StepRecorder;
+    use astra_runtime::pipeline::step_protocol::*;
+    use astra_runtime::pipeline::step_recorder::StepRecorder;
 
     #[test]
     fn recorder_perceive_populates_step_payload() {
@@ -5187,8 +5183,8 @@ mod scheduling_contract_proofs {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 mod slot_integration_proofs {
-    use mo_agent_runtime::pipeline::step_protocol::*;
-    use mo_agent_runtime::pipeline::step_recorder::StepRecorder;
+    use astra_runtime::pipeline::step_protocol::*;
+    use astra_runtime::pipeline::step_recorder::StepRecorder;
 
     #[test]
     fn begin_tool_with_key_populates_idempotency_key() {
@@ -5380,15 +5376,15 @@ mod slot_integration_proofs {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 mod hardening_proofs {
-    use mo_agent_runtime::pipeline::persistence::{
+    use astra_runtime::pipeline::persistence::{
         LearningSnapshot, ToolHealthEntry, load_snapshot_from, save_snapshot_to,
     };
-    use mo_agent_runtime::turn::response_guard::{
+    use astra_runtime::turn::response_guard::{
         QualityReport, check_response_quality, find_hallucinated_tools, find_malformed_args,
         is_prompt_leaked, is_repetition_loop,
     };
-    use mo_agent_runtime::turn::tool_health::ToolHealthTracker;
-    use mo_agent_runtime::turn::turn_guard::TurnGuard;
+    use astra_runtime::turn::tool_health::ToolHealthTracker;
+    use astra_runtime::turn::turn_guard::TurnGuard;
 
     // ── Response Guard ──
 
@@ -5612,7 +5608,7 @@ mod hardening_proofs {
     #[test]
     fn sse_render_handles_valid_json() {
         let event = serde_json::json!({"type": "message", "text": "hello"});
-        let bytes = mo_agent_runtime::bridge::sse_events::render_sse_json(event);
+        let bytes = astra_runtime::bridge::sse_events::render_sse_json(event);
         let output = String::from_utf8(bytes).unwrap();
         assert!(output.starts_with("data: "));
         assert!(output.ends_with("\n\n"));
@@ -5623,7 +5619,7 @@ mod hardening_proofs {
 
     #[test]
     fn circuit_breaker_survives_normal_usage() {
-        let cb = mo_agent_runtime::bridge::circuit_breaker::CircuitBreaker::new(
+        let cb = astra_runtime::bridge::circuit_breaker::CircuitBreaker::new(
             3,
             std::time::Duration::from_secs(1),
             1,
@@ -5646,7 +5642,7 @@ mod hardening_proofs {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 mod token_efficiency_deep {
-    use mo_agent_runtime::prompts::{
+    use astra_runtime::prompts::{
         CompactionTier, estimate_str_tokens, estimate_tokens, estimate_tokens_precise,
     };
     use serde_json::json;
@@ -5799,7 +5795,7 @@ mod token_efficiency_deep {
 
     #[test]
     fn schema_detail_levels_are_progressively_smaller() {
-        use mo_agent_runtime::turn::bridge_inprocess::bridge_inprocess_test_helpers::prune_tool_schemas_pub;
+        use astra_runtime::turn::bridge_inprocess::bridge_inprocess_test_helpers::prune_tool_schemas_pub;
 
         let tools: Vec<serde_json::Value> = (0..5)
             .map(|i| {
@@ -5857,7 +5853,7 @@ mod token_efficiency_deep {
 
     #[test]
     fn compact_history_strips_property_descriptions() {
-        use mo_agent_runtime::turn::bridge_inprocess::bridge_inprocess_test_helpers::prune_tool_schemas_pub;
+        use astra_runtime::turn::bridge_inprocess::bridge_inprocess_test_helpers::prune_tool_schemas_pub;
 
         let tools = vec![make_tool_schema(
             "write_file",
@@ -5884,8 +5880,8 @@ mod token_efficiency_deep {
 
     #[test]
     fn pressure_floor_excludes_marginal_tools() {
-        use mo_agent_runtime::tool_registry::scoring::pre_filter_dynamic_with_pressure;
-        use mo_agent_runtime::tool_registry::state::ConversationState;
+        use astra_runtime::tool_registry::scoring::pre_filter_dynamic_with_pressure;
+        use astra_runtime::tool_registry::state::ConversationState;
 
         let state = ConversationState {
             is_fetch: true,
@@ -5922,10 +5918,10 @@ mod token_efficiency_deep {
 
     #[test]
     fn zero_pressure_matches_unpressured() {
-        use mo_agent_runtime::tool_registry::scoring::{
+        use astra_runtime::tool_registry::scoring::{
             pre_filter_dynamic_with_memory, pre_filter_dynamic_with_pressure,
         };
-        use mo_agent_runtime::tool_registry::state::ConversationState;
+        use astra_runtime::tool_registry::state::ConversationState;
 
         let state = ConversationState {
             is_github: true,
@@ -5949,8 +5945,8 @@ mod token_efficiency_deep {
 
     #[test]
     fn moderate_pressure_reduces_tools_gradually() {
-        use mo_agent_runtime::tool_registry::scoring::pre_filter_dynamic_with_pressure;
-        use mo_agent_runtime::tool_registry::state::ConversationState;
+        use astra_runtime::tool_registry::scoring::pre_filter_dynamic_with_pressure;
+        use astra_runtime::tool_registry::state::ConversationState;
 
         let state = ConversationState {
             is_fetch: true,
@@ -5997,7 +5993,7 @@ mod token_efficiency_deep {
             json!({"role": "assistant", "content": "short recent response"}),
         ];
 
-        let compacted = mo_agent_runtime::turn::cloud::compaction::compact_tiered(
+        let compacted = astra_runtime::turn::cloud::compaction::compact_tiered(
             &msgs,
             100, // force compaction by setting very low budget
             2000,
@@ -6037,7 +6033,7 @@ mod token_efficiency_deep {
             json!({"role": "assistant", "content": "a".repeat(10_000)}),
         ];
 
-        let result = mo_agent_runtime::turn::cloud::compaction::compact_tiered(
+        let result = astra_runtime::turn::cloud::compaction::compact_tiered(
             &msgs,
             100,
             2000,
@@ -6092,8 +6088,8 @@ mod token_efficiency_deep {
 // ─── Step Protocol: Crash Recovery ───────────────────────────────────────────
 
 mod crash_recovery_proofs {
-    use mo_agent_runtime::pipeline::step_protocol::*;
-    use mo_agent_runtime::pipeline::step_restore::*;
+    use astra_runtime::pipeline::step_protocol::*;
+    use astra_runtime::pipeline::step_restore::*;
 
     // ── Version validation ──
 
@@ -6349,7 +6345,7 @@ mod crash_recovery_proofs {
 
     #[test]
     fn recorder_complete_tool_with_result_includes_output_in_event() {
-        use mo_agent_runtime::pipeline::step_recorder::StepRecorder;
+        use astra_runtime::pipeline::step_recorder::StepRecorder;
 
         let mut rec = StepRecorder::new("test-session", "task-1");
         rec.begin_turn(1);
@@ -6378,7 +6374,7 @@ mod crash_recovery_proofs {
 
     #[test]
     fn recorder_complete_tool_backward_compatible() {
-        use mo_agent_runtime::pipeline::step_recorder::StepRecorder;
+        use astra_runtime::pipeline::step_recorder::StepRecorder;
 
         // Original complete_tool() should still work without output
         let mut rec = StepRecorder::new("test-session", "task-1");
@@ -6429,14 +6425,14 @@ mod crash_recovery_proofs {
 
 // ─── Protocol hygiene proofs ────────────────────────────────────────────────
 mod protocol_hygiene_proofs {
-    use mo_agent_runtime::pipeline::step_protocol::*;
+    use astra_runtime::pipeline::step_protocol::*;
 
     /// StepEventDag was deleted — production binary uses FileBackedEventStore only.
     /// Verify FileBackedEventStore implements the full StepEventStore trait,
     /// including DAG traversal methods (ancestors/descendants/leaves).
     #[test]
     fn file_event_store_implements_full_trait() {
-        use mo_agent_runtime::pipeline::step_checkpoint::FileBackedEventStore;
+        use astra_runtime::pipeline::step_checkpoint::FileBackedEventStore;
         let mut store = FileBackedEventStore::empty("test-hygiene");
 
         let e1 = StepEvent {
@@ -6517,8 +6513,8 @@ mod protocol_hygiene_proofs {
 
 // ─── Scheduling contract proofs ─────────────────────────────────────────────
 mod scheduling_wiring_proofs {
-    use mo_agent_core::RuntimeLimits;
-    use mo_agent_runtime::pipeline::step_protocol::SchedulingContract;
+    use astra_core::RuntimeLimits;
+    use astra_runtime::pipeline::step_protocol::SchedulingContract;
 
     /// Default contract has sane values.
     #[test]
@@ -6639,8 +6635,8 @@ mod scheduling_wiring_proofs {
 //         double-count prevention, health scoring accuracy.
 // =============================================================================
 mod turnguard_step_integration_proofs {
-    use mo_agent_runtime::turn::tool_health::ToolHealthTracker;
-    use mo_agent_runtime::turn::turn_guard::TurnGuard;
+    use astra_runtime::turn::tool_health::ToolHealthTracker;
+    use astra_runtime::turn::turn_guard::TurnGuard;
 
     // --- ToolHealth record_timeout ---
 
@@ -6864,7 +6860,7 @@ mod turnguard_step_integration_proofs {
 
     #[test]
     fn cache_duplication_triggers_warning_at_threshold() {
-        use mo_agent_runtime::turn::turn_guard::VerdictSeverity;
+        use astra_runtime::turn::turn_guard::VerdictSeverity;
         let mut guard = TurnGuard::new();
         // 3 cache hits on the same tool → wasteful
         guard.record_cache_hit("read_file");
@@ -6902,7 +6898,7 @@ mod turnguard_step_integration_proofs {
 
     #[test]
     fn timeout_only_errors_do_not_escalate_to_critical() {
-        use mo_agent_runtime::turn::turn_guard::VerdictSeverity;
+        use astra_runtime::turn::turn_guard::VerdictSeverity;
         let mut guard = TurnGuard::new();
         // 5 timeouts would trigger Critical if counted as regular errors (>= 5 errors)
         for _ in 0..5 {
@@ -6919,7 +6915,7 @@ mod turnguard_step_integration_proofs {
 
     #[test]
     fn mixed_timeout_and_bug_errors_escalate_normally() {
-        use mo_agent_runtime::turn::turn_guard::VerdictSeverity;
+        use astra_runtime::turn::turn_guard::VerdictSeverity;
         let mut guard = TurnGuard::new();
         // 3 real failures (not timeouts)
         guard.record_tool_result("bash", "error: command not found");
@@ -6939,7 +6935,7 @@ mod turnguard_step_integration_proofs {
 
     #[test]
     fn evaluate_combines_all_new_signals() {
-        use mo_agent_runtime::turn::turn_guard::VerdictSeverity;
+        use astra_runtime::turn::turn_guard::VerdictSeverity;
         let mut guard = TurnGuard::new();
 
         // Scenario: timeout-dominant tool + cache waste + real error
@@ -6968,7 +6964,7 @@ mod turnguard_step_integration_proofs {
 //         StepCheckpoint::Heavy carries full conversation state for recovery.
 // =============================================================================
 mod checkpoint_cloud_persistence_proofs {
-    use mo_agent_runtime::pipeline::step_protocol::{
+    use astra_runtime::pipeline::step_protocol::{
         ExecutionCursor, HeavyCheckpoint, LightCheckpoint, StepAction, StepCheckpoint,
     };
 
@@ -7245,7 +7241,7 @@ mod checkpoint_cloud_persistence_proofs {
 // ══════════════════════════════════════════════════════════════════════════
 
 mod health_summary_auditability_proofs {
-    use mo_agent_runtime::turn::tool_health::ToolHealthTracker;
+    use astra_runtime::turn::tool_health::ToolHealthTracker;
 
     #[test]
     fn summary_includes_timeouts_and_cache_hits() {
@@ -7346,10 +7342,10 @@ mod health_summary_auditability_proofs {
 // ══════════════════════════════════════════════════════════════════════════
 
 mod learning_sync_cloud_proofs {
-    use mo_agent_runtime::pipeline::calibration::ProgressiveCalibrator;
-    use mo_agent_runtime::pipeline::entity::EntityGraph;
-    use mo_agent_runtime::pipeline::pattern::PatternLibrary;
-    use mo_agent_runtime::pipeline::persistence::{
+    use astra_runtime::pipeline::calibration::ProgressiveCalibrator;
+    use astra_runtime::pipeline::entity::EntityGraph;
+    use astra_runtime::pipeline::pattern::PatternLibrary;
+    use astra_runtime::pipeline::persistence::{
         LearningSnapshot, ToolHealthEntry, export_from_modules, export_from_modules_with_health,
     };
     use std::sync::{Arc, Mutex};
@@ -7424,7 +7420,7 @@ mod learning_sync_cloud_proofs {
 
     #[test]
     fn health_merge_timestamp_based_conflict_resolution() {
-        use mo_agent_runtime::pipeline::persistence::merge_tool_health;
+        use astra_runtime::pipeline::persistence::merge_tool_health;
 
         // Local: bash updated at epoch 1000
         let local = vec![ToolHealthEntry {
@@ -7486,8 +7482,8 @@ mod learning_sync_cloud_proofs {
 // ══════════════════════════════════════════════════════════════════════════
 
 mod health_dashboard_proofs {
-    use mo_agent_runtime::pipeline::persistence::ToolHealthEntry;
-    use mo_agent_runtime::turn::tool_health::ToolHealthTracker;
+    use astra_runtime::pipeline::persistence::ToolHealthEntry;
+    use astra_runtime::turn::tool_health::ToolHealthTracker;
 
     #[test]
     fn from_entries_roundtrip_preserves_health_data() {
@@ -7592,7 +7588,7 @@ mod health_dashboard_proofs {
 }
 
 mod cloud_sync_status_proofs {
-    use mo_agent_services::state_sync::SyncStatus;
+    use astra_services::state_sync::SyncStatus;
 
     #[test]
     fn sync_status_default_is_no_history() {
@@ -7670,7 +7666,7 @@ mod cloud_sync_status_proofs {
 }
 
 mod timestamp_merge_proofs {
-    use mo_agent_runtime::pipeline::persistence::{ToolHealthEntry, merge_tool_health};
+    use astra_runtime::pipeline::persistence::{ToolHealthEntry, merge_tool_health};
 
     #[test]
     fn cloud_newer_timestamp_wins_over_local() {
@@ -7863,10 +7859,10 @@ mod timestamp_merge_proofs {
 
     #[test]
     fn snapshot_epoch_set_on_export() {
-        use mo_agent_runtime::pipeline::calibration::ProgressiveCalibrator;
-        use mo_agent_runtime::pipeline::entity::EntityGraph;
-        use mo_agent_runtime::pipeline::pattern::PatternLibrary;
-        use mo_agent_runtime::pipeline::persistence::export_from_modules_with_health;
+        use astra_runtime::pipeline::calibration::ProgressiveCalibrator;
+        use astra_runtime::pipeline::entity::EntityGraph;
+        use astra_runtime::pipeline::pattern::PatternLibrary;
+        use astra_runtime::pipeline::persistence::export_from_modules_with_health;
         use std::sync::{Arc, Mutex};
 
         let eg = Arc::new(Mutex::new(EntityGraph::new()));
@@ -7882,7 +7878,7 @@ mod timestamp_merge_proofs {
 
     #[test]
     fn last_updated_epoch_set_on_health_export() {
-        use mo_agent_runtime::turn::tool_health::ToolHealthTracker;
+        use astra_runtime::turn::tool_health::ToolHealthTracker;
 
         let mut tracker = ToolHealthTracker::new();
         tracker.record_success("bash");
@@ -7908,7 +7904,7 @@ mod timestamp_merge_proofs {
     fn snapshot_epoch_backward_compat_deserialization() {
         // Old format without snapshot_epoch should deserialize with default 0
         let json = r#"{"version":1,"entities":[],"patterns":[],"calibration":null}"#;
-        let snapshot: mo_agent_runtime::pipeline::persistence::LearningSnapshot =
+        let snapshot: astra_runtime::pipeline::persistence::LearningSnapshot =
             serde_json::from_str(json).unwrap();
         assert_eq!(snapshot.snapshot_epoch, 0, "missing field defaults to 0");
     }
@@ -7922,9 +7918,9 @@ mod timestamp_merge_proofs {
 // Each test simulates a realistic agent session (record_* → evaluate() cycles).
 // =============================================================================
 mod turnguard_e2e_proofs {
-    use mo_agent_runtime::pipeline::persistence::ToolHealthEntry;
-    use mo_agent_runtime::turn::tool_health::ToolHealthTracker;
-    use mo_agent_runtime::turn::turn_guard::{TurnGuard, VerdictSeverity};
+    use astra_runtime::pipeline::persistence::ToolHealthEntry;
+    use astra_runtime::turn::tool_health::ToolHealthTracker;
+    use astra_runtime::turn::turn_guard::{TurnGuard, VerdictSeverity};
     use serde_json::json;
 
     fn tc(name: &str, args: &str) -> serde_json::Value {
@@ -8266,7 +8262,7 @@ mod turnguard_e2e_proofs {
     // and produce correct health tracking.
     #[test]
     fn result_quality_drives_health_tracking_correctly() {
-        use mo_agent_runtime::turn::result_quality::ResultQuality;
+        use astra_runtime::turn::result_quality::ResultQuality;
         let mut guard = TurnGuard::new();
 
         // Success result
@@ -8435,7 +8431,7 @@ mod turnguard_e2e_proofs {
     // escalation regardless of category.
     #[test]
     fn mixed_error_categories_accumulate_for_escalation() {
-        use mo_agent_runtime::turn::error_recovery::ErrorCategory;
+        use astra_runtime::turn::error_recovery::ErrorCategory;
         let mut guard = TurnGuard::new();
 
         // Record enough non-auth errors to trigger Warning (need 5+ actionable)
@@ -8505,7 +8501,7 @@ mod turnguard_e2e_proofs {
         guard.nudge_count = 3;
         guard
             .errors
-            .record_error(mo_agent_runtime::turn::error_recovery::ErrorCategory::Unknown);
+            .record_error(astra_runtime::turn::error_recovery::ErrorCategory::Unknown);
 
         let verdict = guard.evaluate();
         assert!(
@@ -8516,7 +8512,7 @@ mod turnguard_e2e_proofs {
         // Now at 3 nudges + 2 errors → first Critical → restricted (progressive degradation)
         guard
             .errors
-            .record_error(mo_agent_runtime::turn::error_recovery::ErrorCategory::Unknown);
+            .record_error(astra_runtime::turn::error_recovery::ErrorCategory::Unknown);
         let verdict = guard.evaluate();
         assert_eq!(verdict.severity, VerdictSeverity::Critical);
         assert!(
@@ -8575,10 +8571,10 @@ mod turnguard_e2e_proofs {
 // pipeline: tools that frequently succeed together get boosted in subsequent turns.
 
 mod co_occurrence_scoring_proofs {
-    use mo_agent_runtime::pipeline::pattern::PatternLibrary;
-    use mo_agent_runtime::pipeline::routing::{DomainHint, TaskType};
-    use mo_agent_runtime::tool_registry::scoring::pre_filter_dynamic_with_cooccurrence;
-    use mo_agent_runtime::tool_registry::state::ConversationState;
+    use astra_runtime::pipeline::pattern::PatternLibrary;
+    use astra_runtime::pipeline::routing::{DomainHint, TaskType};
+    use astra_runtime::tool_registry::scoring::pre_filter_dynamic_with_cooccurrence;
+    use astra_runtime::tool_registry::state::ConversationState;
     use std::collections::HashMap;
 
     fn tools(names: &[&str]) -> Vec<String> {
@@ -8631,7 +8627,7 @@ mod co_occurrence_scoring_proofs {
 
         // Find read_file score in both
         let find_score = |results: &[(usize, f64)], name: &str| -> Option<f64> {
-            use mo_agent_runtime::tool_registry::TOOL_CATALOG;
+            use astra_runtime::tool_registry::TOOL_CATALOG;
             results
                 .iter()
                 .find(|(idx, _)| TOOL_CATALOG[*idx].name == name)
@@ -8785,8 +8781,8 @@ mod co_occurrence_scoring_proofs {
     /// tools that co-occur with recent_tools should score higher than without.
     #[tokio::test]
     async fn proof_co_occurrence_flows_through_tfidf_selector_e2e() {
-        use mo_agent_runtime::tool_registry::{TOOL_CATALOG, ToolRegistry};
-        use mo_agent_runtime::tool_selector::{SelectionContext, TfIdfSelector, ToolSelector};
+        use astra_runtime::tool_registry::{TOOL_CATALOG, ToolRegistry};
+        use astra_runtime::tool_selector::{SelectionContext, TfIdfSelector, ToolSelector};
         use std::sync::{Arc, Mutex};
 
         let schemas: Vec<serde_json::Value> = TOOL_CATALOG
@@ -8873,11 +8869,11 @@ mod co_occurrence_scoring_proofs {
 // ── File-context scoring proofs ──────────────────────────────────────────────
 
 mod file_context_scoring_proofs {
-    use mo_agent_runtime::tool_registry::TOOL_CATALOG;
-    use mo_agent_runtime::tool_registry::scoring::{
+    use astra_runtime::tool_registry::TOOL_CATALOG;
+    use astra_runtime::tool_registry::scoring::{
         pre_filter_dynamic, pre_filter_dynamic_with_file_context,
     };
-    use mo_agent_runtime::tool_registry::state::ConversationState;
+    use astra_runtime::tool_registry::state::ConversationState;
     use std::collections::HashMap;
 
     fn tool_name(idx: usize) -> &'static str {
@@ -8961,8 +8957,8 @@ mod file_context_scoring_proofs {
     /// File context flows through TfIdfSelector E2E
     #[tokio::test]
     async fn proof_file_context_flows_through_selector_e2e() {
-        use mo_agent_runtime::tool_registry::ToolRegistry;
-        use mo_agent_runtime::tool_selector::{SelectionContext, TfIdfSelector, ToolSelector};
+        use astra_runtime::tool_registry::ToolRegistry;
+        use astra_runtime::tool_selector::{SelectionContext, TfIdfSelector, ToolSelector};
 
         let schemas: Vec<serde_json::Value> = TOOL_CATALOG
             .iter()

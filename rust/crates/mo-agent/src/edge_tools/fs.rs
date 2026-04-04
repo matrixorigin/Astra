@@ -1285,9 +1285,7 @@ fn unified_diff(old_content: &str, new_content: &str, path: &std::path::Path) ->
 }
 
 fn append_str_replace_cli_unified_diff(out: &mut String, before: &str, after: &str, path: &Path) {
-    use mo_agent_runtime::turn::tool_result_sanitize::{
-        STR_REPLACE_DIFF_END, STR_REPLACE_DIFF_START,
-    };
+    use astra_runtime::turn::tool_result_sanitize::{STR_REPLACE_DIFF_END, STR_REPLACE_DIFF_START};
     out.push_str(STR_REPLACE_DIFF_START);
     out.push_str(&cap_cli_unified_diff(unified_diff_raw(before, after, path)));
     out.push_str(STR_REPLACE_DIFF_END);

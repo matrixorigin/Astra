@@ -77,11 +77,11 @@ pub mod turn;
 
 // ── Re-exports: core primitives ──────────────────────────────────────────────
 
-pub use mo_agent_core::*;
+pub use astra_core::*;
 
-// ── Re-exports: service layer (via mo_agent_services) ────────────────────────
+// ── Re-exports: service layer (via astra_services) ────────────────────────
 
-pub use mo_agent_services::{
+pub use astra_services::{
     admin::{
         AdminAuditFilter, AdminAuditReader, AdminAuditRecord, AdminAuthorizer,
         AdminFeedbackStatsFilter, AdminFeedbackStatsReader, AdminFeedbackStatsRecord,
@@ -167,7 +167,7 @@ pub use mo_agent_services::{
     },
 };
 
-pub(crate) use mo_agent_services::runs::{
+pub(crate) use astra_services::runs::{
     RunMutationRecord, UnconfiguredRunLifecycleService, transform_run_event_for_client,
 };
 

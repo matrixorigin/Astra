@@ -1,6 +1,6 @@
 //! `ToolCallRecord` rows for headless early-exit paths (duplicate, cache hit, unknown tool).
 
-use mo_agent_services::session_journal::ToolCallRecord;
+use astra_services::session_journal::ToolCallRecord;
 
 #[must_use]
 pub fn journal_record_duplicate_within_turn(

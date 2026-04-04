@@ -15,10 +15,10 @@ use crate::pipeline::entity::EntityGraph;
 use crate::pipeline::pattern::PatternLibrary;
 use crate::pipeline::persistence::{self, LearningSnapshot, ToolHealthEntry};
 
-use mo_agent_services::event_ingestion;
-use mo_agent_services::state_sync::{PlanTemplateSyncRow, StateSyncService};
-use mo_agent_services::sync_engine::sha256_checksum;
-use mo_agent_services::{
+use astra_services::event_ingestion;
+use astra_services::state_sync::{PlanTemplateSyncRow, StateSyncService};
+use astra_services::sync_engine::sha256_checksum;
+use astra_services::{
     CloudTransport, DomainAdapter, MergeResult, PayloadFormat, PullResult, PushResult, SyncDomain,
     SyncEnvelope, SyncError, SyncPayload, TaskLeaseHoldCache, TaskRecord,
 };
@@ -714,7 +714,7 @@ impl DomainAdapter for EventAdapter {
 // ─── Template Adapter (pull-only cache) ───────────────────────────────────────
 
 /// Cloud → edge cache of [`PlanTemplateSyncRow`]. Populated by `pull_domain(Templates)`;
-/// edge never pushes template packs ([`SyncPolicy::templates`] uses [`mo_agent_services::sync_engine::PushTrigger::Never`]).
+/// edge never pushes template packs ([`SyncPolicy::templates`] uses [`astra_services::sync_engine::PushTrigger::Never`]).
 ///
 /// Diagnostics: set environment variable `MO_SYNC_DEBUG=1` to print one line to stderr whenever
 /// [`DomainAdapter::merge_remote`] replaces the template cache after a successful pull.
@@ -1165,7 +1165,7 @@ impl DomainAdapter for TaskAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mo_agent_services::NoopTransport;
+    use astra_services::NoopTransport;
 
     fn make_test_learning_adapter() -> LearningAdapter {
         let entity_graph = Arc::new(Mutex::new(EntityGraph::default()));
@@ -1373,7 +1373,7 @@ mod tests {
 
     #[test]
     fn template_adapter_merge_replaces_cache() {
-        use mo_agent_services::state_sync::PlanTemplateSyncRow;
+        use astra_services::state_sync::PlanTemplateSyncRow;
 
         let cache = Arc::new(Mutex::new(Vec::<PlanTemplateSyncRow>::new()));
         let adapter = TemplateAdapter::new(Arc::clone(&cache));
@@ -1429,7 +1429,7 @@ mod tests {
 
     #[test]
     fn task_adapter_export_requires_lease_hold() {
-        use mo_agent_services::TaskStatus;
+        use astra_services::TaskStatus;
 
         let mirror = Arc::new(Mutex::new(BTreeMap::new()));
         let dirty = Arc::new(Mutex::new(HashSet::new()));

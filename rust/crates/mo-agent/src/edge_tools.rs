@@ -15,10 +15,10 @@ use std::{
     time::Duration,
 };
 
-use chrono::{DateTime, Utc};
-use mo_agent_runtime::tool_sandbox::{
+use astra_runtime::tool_sandbox::{
     SandboxMode, SandboxPolicy, sandbox_command, validate_path, wrap_command_with_limits,
 };
+use chrono::{DateTime, Utc};
 use reqwest::{Client, Method, StatusCode};
 use serde_json::{Value, json};
 
@@ -917,12 +917,12 @@ pub fn all_tool_schemas() -> Vec<Value> {
 /// Global output size limit. Individual tools may have tighter limits.
 /// Override with `MO_GLOBAL_OUTPUT_LIMIT` env var.
 fn global_output_limit() -> usize {
-    mo_agent_core::RuntimeLimits::global().global_output_limit
+    astra_core::RuntimeLimits::global().global_output_limit
 }
 /// Per-tool default output limit for tools without explicit truncation.
 /// Override with `MO_TOOL_OUTPUT_LIMIT` env var.
 fn tool_output_limit() -> usize {
-    mo_agent_core::RuntimeLimits::global().tool_output_limit
+    astra_core::RuntimeLimits::global().tool_output_limit
 }
 
 /// Per-turn aggregate output budget (bytes). When cumulative tool output
@@ -1178,7 +1178,7 @@ impl ToolExecutor {
     pub fn new(project_root: impl Into<PathBuf>) -> Self {
         let root: PathBuf = project_root.into();
         let preferred_repos = detect_git_remote_repos(&root);
-        let sandbox = mo_agent_runtime::tool_sandbox::SandboxPolicy::for_project(&root);
+        let sandbox = astra_runtime::tool_sandbox::SandboxPolicy::for_project(&root);
         Self {
             project_root: root,
             cloud_base: None,
@@ -1254,7 +1254,7 @@ impl ToolExecutor {
             }
             Err(poisoned) => {
                 // Recover from poisoned mutex — clear and re-add
-                mo_agent_core::agent_warn!("preferred_repos", "recovering from poisoned mutex");
+                astra_core::agent_warn!("preferred_repos", "recovering from poisoned mutex");
                 let mut repos = poisoned.into_inner();
                 repos.clear();
                 repos.push(normalized);
@@ -1280,7 +1280,7 @@ impl ToolExecutor {
         match self.preferred_repos.lock() {
             Ok(r) => r.clone(),
             Err(poisoned) => {
-                mo_agent_core::agent_warn!(
+                astra_core::agent_warn!(
                     "preferred_repos",
                     "recovering from poisoned mutex on read"
                 );
@@ -1622,12 +1622,12 @@ impl ToolExecutor {
                 }).to_string()
             }
             "run_chain" => {
-                match serde_json::from_value::<mo_agent_runtime::tool_registry::ToolChain>(
+                match serde_json::from_value::<astra_runtime::tool_registry::ToolChain>(
                     args.clone(),
                 ) {
                     Ok(chain) => {
                         // Validate chain steps reference known tools
-                        let known: Vec<&str> = mo_agent_runtime::tool_registry::TOOL_CATALOG
+                        let known: Vec<&str> = astra_runtime::tool_registry::TOOL_CATALOG
                             .iter()
                             .map(|t| t.name)
                             .collect();
@@ -3954,10 +3954,10 @@ impl ToolExecutor {
     /// Execution stops on the first error unless the step has a skip condition.
     pub fn execute_chain(
         &self,
-        chain: &mo_agent_runtime::tool_registry::ToolChain,
+        chain: &astra_runtime::tool_registry::ToolChain,
         input: Value,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = String> + Send + '_>> {
-        use mo_agent_runtime::tool_registry::chain::{ChainContext, resolve_args};
+        use astra_runtime::tool_registry::chain::{ChainContext, resolve_args};
 
         let chain_name = chain.name.clone();
         let steps = chain.steps.clone();
@@ -4051,7 +4051,7 @@ impl ToolExecutor {
             return vec![];
         }
         let base = std::env::var("MEMORIA_BASE_URL")
-            .unwrap_or_else(|_| mo_agent_core::config::DEFAULT_MEMORIA_URL.to_string());
+            .unwrap_or_else(|_| astra_core::config::DEFAULT_MEMORIA_URL.to_string());
         let key = match std::env::var("MEMORIA_API_KEY")
             .ok()
             .or_else(|| std::env::var("MEMORIA_MASTER_KEY").ok())
@@ -4115,7 +4115,7 @@ impl ToolExecutor {
             )
         } else {
             let base = std::env::var("MEMORIA_BASE_URL")
-                .unwrap_or_else(|_| mo_agent_core::config::DEFAULT_MEMORIA_URL.to_string());
+                .unwrap_or_else(|_| astra_core::config::DEFAULT_MEMORIA_URL.to_string());
             let key = match std::env::var("MEMORIA_API_KEY")
                 .ok()
                 .or_else(|| std::env::var("MEMORIA_MASTER_KEY").ok())
@@ -4738,7 +4738,7 @@ mod tests {
 
     #[tokio::test]
     async fn chain_write_read_roundtrip() {
-        use mo_agent_runtime::tool_registry::ToolChain;
+        use astra_runtime::tool_registry::ToolChain;
 
         let dir = tempfile::tempdir().unwrap();
         let executor = ToolExecutor::new(dir.path());
@@ -4778,7 +4778,7 @@ mod tests {
 
     #[tokio::test]
     async fn chain_stops_on_error() {
-        use mo_agent_runtime::tool_registry::ToolChain;
+        use astra_runtime::tool_registry::ToolChain;
 
         let dir = tempfile::tempdir().unwrap();
         let executor = ToolExecutor::new(dir.path());
@@ -4807,7 +4807,7 @@ mod tests {
 
     #[tokio::test]
     async fn chain_variable_substitution_end_to_end() {
-        use mo_agent_runtime::tool_registry::ToolChain;
+        use astra_runtime::tool_registry::ToolChain;
 
         let dir = tempfile::tempdir().unwrap();
         let executor = ToolExecutor::new(dir.path());
@@ -4849,8 +4849,8 @@ mod tests {
 
     #[tokio::test]
     async fn chain_skip_condition_end_to_end() {
-        use mo_agent_runtime::tool_registry::ToolChain;
-        use mo_agent_runtime::tool_registry::chain::ChainStep;
+        use astra_runtime::tool_registry::ToolChain;
+        use astra_runtime::tool_registry::chain::ChainStep;
 
         let dir = tempfile::tempdir().unwrap();
         let executor = ToolExecutor::new(dir.path());

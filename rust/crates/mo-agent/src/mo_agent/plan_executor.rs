@@ -426,10 +426,10 @@ impl PlanExecutorHandle {
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use mo_agent_runtime::pipeline::persistence::ToolHealthEntry;
-use mo_agent_runtime::plan_decompose;
-use mo_agent_runtime::tool_selector::ToolSelector;
-use mo_agent_services::task_orchestrator::{TaskPlan, TaskStatus};
+use astra_runtime::pipeline::persistence::ToolHealthEntry;
+use astra_runtime::plan_decompose;
+use astra_runtime::tool_selector::ToolSelector;
+use astra_services::task_orchestrator::{TaskPlan, TaskStatus};
 
 use crate::StreamResult;
 use crate::skill_instructions::SharedSkillRegistry;
@@ -444,7 +444,7 @@ use super::permission_manager::PermissionManager;
 /// Created by [`spawn_plan_executor`] which takes these fields from ReplState.
 #[allow(dead_code)] // Some fields reserved for future plan features
 pub(super) struct BackgroundPlanContext {
-    pub api: mo_thin_client::ThinClient,
+    pub api: astra_thin_client::ThinClient,
     pub token: String,
     pub profile: Option<String>,
     pub model: Option<String>,
@@ -456,8 +456,7 @@ pub(super) struct BackgroundPlanContext {
     pub recent_tools: Vec<String>,
     pub tool_health_entries: Vec<ToolHealthEntry>,
     pub skill_registry: SharedSkillRegistry,
-    pub delegation_engine:
-        Option<Arc<mo_agent_runtime::server::delegation_engine::DelegationEngine>>,
+    pub delegation_engine: Option<Arc<astra_runtime::server::delegation_engine::DelegationEngine>>,
     pub durable_task_state: Option<durable_bridge::DurableTaskState>,
     pub workspace_root: PathBuf,
 }

@@ -173,7 +173,7 @@ impl TurnCoreEventWriter for DatabaseTurnCoreEventWriter {
         if let Some(snapshot_link_plan) = plan.snapshot_link_plan.as_ref()
             && let Err(error) = update_snapshot_llm_ids(&pool, snapshot_link_plan).await
         {
-            mo_agent_core::agent_error!("bridge", "snapshot link update failed: {error}");
+            astra_core::agent_error!("bridge", "snapshot link update failed: {error}");
         }
         let outcome = TurnCorePersistOutcome {
             llm_response_event_id: plan.llm_response_event.map(|event| event.event_id),

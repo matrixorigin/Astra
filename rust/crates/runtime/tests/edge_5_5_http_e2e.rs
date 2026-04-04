@@ -1,19 +1,19 @@
 //! End-to-end: §5.5 HTTP handlers write into the same ledger the bridge consumes, keys match
-//! [`mo_agent_runtime::turn::edge_ledger`], and `take_ledger_entry` removes rows.
+//! [`astra_runtime::turn::edge_ledger`], and `take_ledger_entry` removes rows.
 
 use std::sync::Arc;
 use std::time::Duration;
 
-use async_trait::async_trait;
-use axum::{
-    Router, body,
-    http::{HeaderMap, Request, StatusCode},
-};
-use mo_agent_runtime::{
+use astra_runtime::{
     AppState, AuthLoginRequestData, AuthRefreshRequestData, AuthRegisterRequestData, AuthService,
     AuthTokenRecord, AuthUserRecord, ErrorResponse, HealthChecker, ServiceInfo, build_app,
     turn::cloud_tool_delivery::deliver_tool_calls_through_edge_ledger,
     turn::edge_ledger::{approval_callback_key, take_ledger_entry, tool_callback_key},
+};
+use async_trait::async_trait;
+use axum::{
+    Router, body,
+    http::{HeaderMap, Request, StatusCode},
 };
 use serde_json::json;
 use tower::util::ServiceExt;

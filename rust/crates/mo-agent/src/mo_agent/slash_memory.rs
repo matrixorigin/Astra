@@ -1,6 +1,6 @@
 use super::*;
+use astra_runtime::plan_decompose;
 use futures_util::StreamExt;
-use mo_agent_runtime::plan_decompose;
 
 /// Outcome of collecting text from an SSE stream.
 struct SseTextResult {
@@ -97,7 +97,7 @@ async fn collect_sse_text(resp: reqwest::Response, stream_to_stderr: bool) -> Ss
 /// When `verbose` is true, shows a message when searching (useful for debugging).
 async fn enrich_with_templates(
     context: &mut plan_decompose::ProjectContext,
-    matrix_runtime: Option<&std::sync::Arc<mo_agent_runtime::MatrixCloudRuntime>>,
+    matrix_runtime: Option<&std::sync::Arc<astra_runtime::MatrixCloudRuntime>>,
     user_id: Option<&str>,
     goal: &str,
     verbose: bool,
@@ -151,7 +151,7 @@ fn eprint_plan_json_parse_failed(full_text: &str, err: &str) {
 pub(super) async fn handle_memory_domain_command(
     cmd: &str,
     arg: &str,
-    api: &mo_thin_client::ThinClient,
+    api: &astra_thin_client::ThinClient,
     state: &mut ReplState,
     token: Option<&str>,
 ) -> Result<(), String> {
@@ -706,7 +706,7 @@ pub(super) async fn handle_memory_domain_command(
                 "cloud" => {
                     // List or load plans from cloud
                     if let Some(ref svc) = state.task_service {
-                        use mo_agent_services::TaskService;
+                        use astra_services::TaskService;
                         let user_id = state.ingestion_user_id.as_deref().unwrap_or("local");
 
                         match svc.list_tasks(user_id, None).await {
@@ -724,10 +724,10 @@ pub(super) async fn handle_memory_domain_command(
                                     eprintln!("{}", "─".repeat(50));
                                     for t in &with_plans {
                                         let icon = match t.status {
-                                            mo_agent_services::TaskStatus::Completed => "✓",
-                                            mo_agent_services::TaskStatus::Failed => "✗",
-                                            mo_agent_services::TaskStatus::InProgress => "▶",
-                                            mo_agent_services::TaskStatus::Paused => "⏸",
+                                            astra_services::TaskStatus::Completed => "✓",
+                                            astra_services::TaskStatus::Failed => "✗",
+                                            astra_services::TaskStatus::InProgress => "▶",
+                                            astra_services::TaskStatus::Paused => "⏸",
                                             _ => "○",
                                         };
                                         let short_id = &t.task_id[..8.min(t.task_id.len())];
@@ -760,7 +760,7 @@ pub(super) async fn handle_memory_domain_command(
                 "load" if !sub_arg.is_empty() => {
                     // Load a specific plan from cloud by task_id (or prefix)
                     if let Some(ref svc) = state.task_service {
-                        use mo_agent_services::TaskService;
+                        use astra_services::TaskService;
                         use plan_decompose::{PlanModeState, analyze_project, format_plan};
 
                         let user_id = state.ingestion_user_id.as_deref().unwrap_or("local");
@@ -912,7 +912,7 @@ pub(super) async fn handle_memory_domain_command(
 
                     // Find the task to rate - use the most recent task for current goal
                     if let Some(ref svc) = state.task_service {
-                        use mo_agent_services::{TaskOutcome, TaskService};
+                        use astra_services::{TaskOutcome, TaskService};
                         let user_id = state.ingestion_user_id.as_deref().unwrap_or("local");
 
                         // Find task by current plan goal or executing plan goal
@@ -1036,7 +1036,7 @@ pub(super) async fn handle_memory_domain_command(
 
                     if let Some(goal) = query_goal {
                         if let Some(ref svc) = state.task_service {
-                            use mo_agent_services::TaskService;
+                            use astra_services::TaskService;
                             let user_id = state.ingestion_user_id.as_deref().unwrap_or("local");
                             let project_type = state
                                 .plan_mode
@@ -1114,7 +1114,7 @@ pub(super) async fn handle_memory_domain_command(
 
                     if let Some(pattern) = query_pattern {
                         if let Some(ref svc) = state.task_service {
-                            use mo_agent_services::TaskService;
+                            use astra_services::TaskService;
                             let user_id = state.ingestion_user_id.as_deref().unwrap_or("local");
 
                             match svc.get_learning_stats(user_id, &pattern).await {
@@ -1275,7 +1275,7 @@ pub(super) async fn handle_memory_domain_command(
                             .subtasks
                             .iter()
                             .filter(|s| {
-                                s.status == mo_agent_services::task_orchestrator::TaskStatus::Failed
+                                s.status == astra_services::task_orchestrator::TaskStatus::Failed
                             })
                             .map(|s| {
                                 (
@@ -1367,7 +1367,7 @@ pub(super) async fn handle_memory_domain_command(
 
                     // Increment replan count in cloud if available
                     if let Some(ref svc) = state.task_service {
-                        use mo_agent_services::TaskService;
+                        use astra_services::TaskService;
                         let user_id = state.ingestion_user_id.as_deref().unwrap_or("local");
                         if let Ok(tasks) = svc.list_tasks(user_id, None).await
                             && let Some(task) = tasks.iter().find(|t| t.title == ps.goal)
@@ -1504,7 +1504,7 @@ pub async fn handle_plan_mode_input(
     input: String,
     token: Option<&str>,
     state: &mut ReplState,
-    api: &mo_thin_client::ThinClient,
+    api: &astra_thin_client::ThinClient,
 ) -> Result<(), String> {
     use plan_decompose::{
         ClarificationAnswer, PendingClarifications, PlanEntryChoice, PlanModeState,
@@ -1859,7 +1859,7 @@ pub async fn handle_plan_mode_input(
 
                 // Sync progress to cloud if available
                 if let Some(ref svc) = state.task_service {
-                    use mo_agent_services::TaskService;
+                    use astra_services::TaskService;
                     let user_id = state.ingestion_user_id.as_deref().unwrap_or("local");
                     let goal = &plan_state.goal;
 
@@ -1886,7 +1886,7 @@ pub async fn handle_plan_mode_input(
                     eprintln!("  {} All tasks complete!", "🎉".green());
                     // Complete the cloud task
                     if let Some(ref svc) = state.task_service {
-                        use mo_agent_services::TaskService;
+                        use astra_services::TaskService;
                         let user_id = state.ingestion_user_id.as_deref().unwrap_or("local");
                         let goal = &plan_state.goal;
                         if let Ok(tasks) = svc.list_tasks(user_id, None).await
@@ -1938,7 +1938,7 @@ pub async fn handle_plan_mode_input(
 
         // Persist to task service if available
         if let Some(ref svc) = state.task_service {
-            use mo_agent_services::{TaskCreateRequest, TaskService};
+            use astra_services::{TaskCreateRequest, TaskService};
             let user_id = state.ingestion_user_id.as_deref().unwrap_or("local");
             let session_id = state.session_id.as_deref().unwrap_or("no-session");
 
@@ -2220,7 +2220,7 @@ fn handle_plan_status(state: &ReplState) {
         let in_progress = plan
             .subtasks
             .iter()
-            .filter(|s| s.status == mo_agent_runtime::plan_decompose::TaskStatus::InProgress)
+            .filter(|s| s.status == astra_runtime::plan_decompose::TaskStatus::InProgress)
             .count();
 
         eprintln!("\n{}  Plan Status", "📋".cyan());
@@ -2239,14 +2239,12 @@ fn handle_plan_status(state: &ReplState) {
         eprintln!();
         for st in &plan.subtasks {
             let icon = match st.status {
-                mo_agent_runtime::plan_decompose::TaskStatus::Completed => "✓".green().to_string(),
-                mo_agent_runtime::plan_decompose::TaskStatus::InProgress => {
-                    "▶".yellow().to_string()
-                }
-                mo_agent_runtime::plan_decompose::TaskStatus::Pending => "○".dim().to_string(),
-                mo_agent_runtime::plan_decompose::TaskStatus::Paused => "⏸".yellow().to_string(),
-                mo_agent_runtime::plan_decompose::TaskStatus::Failed => "✗".red().to_string(),
-                mo_agent_runtime::plan_decompose::TaskStatus::Cancelled => "⊘".dim().to_string(),
+                astra_runtime::plan_decompose::TaskStatus::Completed => "✓".green().to_string(),
+                astra_runtime::plan_decompose::TaskStatus::InProgress => "▶".yellow().to_string(),
+                astra_runtime::plan_decompose::TaskStatus::Pending => "○".dim().to_string(),
+                astra_runtime::plan_decompose::TaskStatus::Paused => "⏸".yellow().to_string(),
+                astra_runtime::plan_decompose::TaskStatus::Failed => "✗".red().to_string(),
+                astra_runtime::plan_decompose::TaskStatus::Cancelled => "⊘".dim().to_string(),
             };
             eprintln!("  {} {} [{}]", icon, st.title, st.id.as_str().dim());
         }

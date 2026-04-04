@@ -383,7 +383,7 @@ impl MatrixOneTaskService {
         Self { pool }
     }
 
-    pub fn from_shared(shared: &mo_agent_core::SharedPool) -> Self {
+    pub fn from_shared(shared: &astra_core::SharedPool) -> Self {
         Self {
             pool: shared.get().clone(),
         }

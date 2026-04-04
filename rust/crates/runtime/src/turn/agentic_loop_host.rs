@@ -51,8 +51,8 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use astra_services::session_journal::ToolCallRecord;
 use async_trait::async_trait;
-use mo_agent_services::session_journal::ToolCallRecord;
 use serde_json::Value;
 
 use crate::pipeline::step_checkpoint;
@@ -208,7 +208,7 @@ pub struct AgenticLoopState {
     pub task_profile: TaskExecutionProfile,
 
     // ── API context (for cloud tool delivery) ──
-    pub api: mo_thin_client::ThinClient,
+    pub api: astra_thin_client::ThinClient,
     pub api_token: String,
 
     // ── Cancellation ──
@@ -288,7 +288,7 @@ fn parse_delegation_request(
     tool_call: &Value,
     parent_run_id: &str,
     session_id: &str,
-) -> Result<mo_agent_services::coordination::DelegationRequest, String> {
+) -> Result<astra_services::coordination::DelegationRequest, String> {
     let args_str = tool_call
         .get("function")
         .and_then(|f| f.get("arguments"))
@@ -317,7 +317,7 @@ fn parse_delegation_request(
         }
     }
 
-    Ok(mo_agent_services::coordination::DelegationRequest {
+    Ok(astra_services::coordination::DelegationRequest {
         delegation_id: uuid::Uuid::new_v4().to_string(),
         parent_run_id: parent_run_id.to_string(),
         task,
@@ -331,7 +331,7 @@ fn parse_delegation_request(
 /// Parse a CoordinationPattern from the LLM's delegate arguments.
 fn parse_coordination_pattern(
     args: &Value,
-) -> Result<mo_agent_services::coordination::CoordinationPattern, String> {
+) -> Result<astra_services::coordination::CoordinationPattern, String> {
     let pattern_type = args
         .get("pattern")
         .and_then(Value::as_str)
@@ -349,22 +349,20 @@ fn parse_coordination_pattern(
         .unwrap_or_else(|| vec!["coder".to_string()]);
 
     match pattern_type {
-        "fan_out" => Ok(
-            mo_agent_services::coordination::CoordinationPattern::FanOut {
-                agent_ids: agents,
-                aggregation: mo_agent_services::coordination::AggregationStrategy::AllResults,
-                timeout_sec: 300,
-            },
-        ),
+        "fan_out" => Ok(astra_services::coordination::CoordinationPattern::FanOut {
+            agent_ids: agents,
+            aggregation: astra_services::coordination::AggregationStrategy::AllResults,
+            timeout_sec: 300,
+        }),
         "pipeline" => {
             let stages = agents
                 .into_iter()
-                .map(|id| mo_agent_services::coordination::PipelineStage {
+                .map(|id| astra_services::coordination::PipelineStage {
                     agent_id: id,
                     output_transform: None,
                 })
                 .collect();
-            Ok(mo_agent_services::coordination::CoordinationPattern::Pipeline { stages })
+            Ok(astra_services::coordination::CoordinationPattern::Pipeline { stages })
         }
         "adversarial" => {
             let producer = agents
@@ -377,7 +375,7 @@ fn parse_coordination_pattern(
                 .unwrap_or_else(|| "reviewer".to_string());
             let max_rounds = args.get("max_rounds").and_then(Value::as_u64).unwrap_or(2) as u32;
             Ok(
-                mo_agent_services::coordination::CoordinationPattern::AdversarialReview {
+                astra_services::coordination::CoordinationPattern::AdversarialReview {
                     producer_id: producer,
                     reviewer_id: reviewer,
                     max_rounds,
@@ -386,7 +384,7 @@ fn parse_coordination_pattern(
             )
         }
         _ => Ok(
-            mo_agent_services::coordination::CoordinationPattern::Sequential {
+            astra_services::coordination::CoordinationPattern::Sequential {
                 agent_ids: agents,
                 stop_on_success: false,
             },
@@ -396,7 +394,7 @@ fn parse_coordination_pattern(
 
 /// If the LLM did not pass `cwd` / `git_root` in `delegate` args, inherit the parent run root.
 fn merge_workspace_hint_into_delegation_request(
-    request: &mut mo_agent_services::coordination::DelegationRequest,
+    request: &mut astra_services::coordination::DelegationRequest,
     hint: Option<&str>,
 ) {
     let Some(root) = hint.map(str::trim).filter(|s| !s.is_empty()) else {
@@ -456,7 +454,7 @@ async fn partition_and_execute_delegations(
 }
 
 /// Format a DelegationResult as a human-readable summary for the LLM.
-fn format_delegation_result(result: &mo_agent_services::coordination::DelegationResult) -> String {
+fn format_delegation_result(result: &astra_services::coordination::DelegationResult) -> String {
     let mut parts = Vec::new();
     parts.push(format!(
         "Delegation {} — status: {}",
@@ -1093,7 +1091,7 @@ mod tests {
             message: "test query".to_string(),
             recent_tools: Vec::new(),
             task_profile: TaskExecutionProfile::default(),
-            api: mo_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap(),
+            api: astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap(),
             api_token: String::new(),
             cancel_flag: None,
             cancel_token: None,
@@ -1633,7 +1631,7 @@ mod tests {
         let args = json!({"agents": ["coder", "reviewer"]});
         let pattern = super::parse_coordination_pattern(&args).unwrap();
         match pattern {
-            mo_agent_services::coordination::CoordinationPattern::Sequential {
+            astra_services::coordination::CoordinationPattern::Sequential {
                 agent_ids,
                 stop_on_success,
             } => {
@@ -1649,7 +1647,7 @@ mod tests {
         let args = json!({"pattern": "fan_out", "agents": ["coder", "writer"]});
         let pattern = super::parse_coordination_pattern(&args).unwrap();
         match pattern {
-            mo_agent_services::coordination::CoordinationPattern::FanOut {
+            astra_services::coordination::CoordinationPattern::FanOut {
                 agent_ids,
                 timeout_sec,
                 ..
@@ -1666,7 +1664,7 @@ mod tests {
         let args = json!({"pattern": "pipeline", "agents": ["coder", "reviewer"]});
         let pattern = super::parse_coordination_pattern(&args).unwrap();
         match pattern {
-            mo_agent_services::coordination::CoordinationPattern::Pipeline { stages } => {
+            astra_services::coordination::CoordinationPattern::Pipeline { stages } => {
                 assert_eq!(stages.len(), 2);
                 assert_eq!(stages[0].agent_id, "coder");
                 assert_eq!(stages[1].agent_id, "reviewer");
@@ -1681,7 +1679,7 @@ mod tests {
             json!({"pattern": "adversarial", "agents": ["coder", "reviewer"], "max_rounds": 3});
         let pattern = super::parse_coordination_pattern(&args).unwrap();
         match pattern {
-            mo_agent_services::coordination::CoordinationPattern::AdversarialReview {
+            astra_services::coordination::CoordinationPattern::AdversarialReview {
                 producer_id,
                 reviewer_id,
                 max_rounds,
@@ -1728,10 +1726,10 @@ mod tests {
 
     #[test]
     fn format_delegation_result_includes_status_and_agents() {
-        let result = mo_agent_services::coordination::DelegationResult {
+        let result = astra_services::coordination::DelegationResult {
             delegation_id: "del-1".to_string(),
             status: "completed".to_string(),
-            agent_results: vec![mo_agent_services::coordination::AgentResult {
+            agent_results: vec![astra_services::coordination::AgentResult {
                 agent_id: "coder".to_string(),
                 run_id: "run-1".to_string(),
                 status: "completed".to_string(),
@@ -1759,10 +1757,10 @@ mod tests {
     #[test]
     fn format_delegation_result_truncates_long_output() {
         let long_output = "x".repeat(1000);
-        let result = mo_agent_services::coordination::DelegationResult {
+        let result = astra_services::coordination::DelegationResult {
             delegation_id: "del-2".to_string(),
             status: "completed".to_string(),
-            agent_results: vec![mo_agent_services::coordination::AgentResult {
+            agent_results: vec![astra_services::coordination::AgentResult {
                 agent_id: "writer".to_string(),
                 run_id: "run-2".to_string(),
                 status: "completed".to_string(),
@@ -1785,10 +1783,10 @@ mod tests {
 
     #[test]
     fn format_delegation_result_shows_errors() {
-        let result = mo_agent_services::coordination::DelegationResult {
+        let result = astra_services::coordination::DelegationResult {
             delegation_id: "del-3".to_string(),
             status: "partial_failure".to_string(),
-            agent_results: vec![mo_agent_services::coordination::AgentResult {
+            agent_results: vec![astra_services::coordination::AgentResult {
                 agent_id: "coder".to_string(),
                 run_id: "run-3".to_string(),
                 status: "failed".to_string(),
@@ -1831,15 +1829,15 @@ mod tests {
             DelegationEngine, DelegationTracker, StubSubRunExecutor,
         };
         use crate::server::run_engine::RunEngine;
-        use mo_agent_services::AgentProfileRegistry;
+        use astra_services::AgentProfileRegistry;
 
         // Create a delegation engine with stub executor
         let mut registry = AgentProfileRegistry::new();
         {
-            use mo_agent_services::coordination::{AgentProfile, AgentTier};
+            use astra_services::coordination::{AgentProfile, AgentTier};
             let _ = registry.register(AgentProfile::new("coder", "Coder", AgentTier::System));
         }
-        let run_store = Arc::new(mo_agent_services::runs::InMemoryRunStateStore::default());
+        let run_store = Arc::new(astra_services::runs::InMemoryRunStateStore::default());
         let engine = DelegationEngine::with_executor(
             Arc::new(tokio::sync::RwLock::new(registry)),
             Arc::new(RunEngine::new(run_store)),
@@ -1892,15 +1890,15 @@ mod tests {
             DelegationEngine, DelegationTracker, StubSubRunExecutor,
         };
         use crate::server::run_engine::RunEngine;
-        use mo_agent_services::AgentProfileRegistry;
+        use astra_services::AgentProfileRegistry;
 
         let mut registry = AgentProfileRegistry::new();
         {
-            use mo_agent_services::coordination::{AgentProfile, AgentTier};
+            use astra_services::coordination::{AgentProfile, AgentTier};
             let _ = registry.register(AgentProfile::new("coder", "Coder", AgentTier::System));
             let _ = registry.register(AgentProfile::new("reviewer", "Reviewer", AgentTier::System));
         }
-        let run_store = Arc::new(mo_agent_services::runs::InMemoryRunStateStore::default());
+        let run_store = Arc::new(astra_services::runs::InMemoryRunStateStore::default());
         let engine = DelegationEngine::with_executor(
             Arc::new(tokio::sync::RwLock::new(registry)),
             Arc::new(RunEngine::new(run_store)),
@@ -1939,10 +1937,10 @@ mod tests {
             DelegationEngine, DelegationTracker, StubSubRunExecutor,
         };
         use crate::server::run_engine::RunEngine;
-        use mo_agent_services::AgentProfileRegistry;
+        use astra_services::AgentProfileRegistry;
 
         let registry = AgentProfileRegistry::new();
-        let run_store = Arc::new(mo_agent_services::runs::InMemoryRunStateStore::default());
+        let run_store = Arc::new(astra_services::runs::InMemoryRunStateStore::default());
         let engine = DelegationEngine::with_executor(
             Arc::new(tokio::sync::RwLock::new(registry)),
             Arc::new(RunEngine::new(run_store)),
@@ -1988,8 +1986,8 @@ mod tests {
             DelegationEngine, DelegationTracker, StubSubRunExecutor,
         };
         use crate::server::run_engine::RunEngine;
-        use mo_agent_services::AgentProfileRegistry;
-        use mo_agent_services::coordination::{AgentProfile, AgentTier};
+        use astra_services::AgentProfileRegistry;
+        use astra_services::coordination::{AgentProfile, AgentTier};
 
         let mut registry = AgentProfileRegistry::new();
         let _ = registry.register(AgentProfile::new(
@@ -2004,7 +2002,7 @@ mod tests {
         reviewer.system_prompt = Some("You are a reviewer.".to_string());
         let _ = registry.register(reviewer);
 
-        let run_store = Arc::new(mo_agent_services::runs::InMemoryRunStateStore::default());
+        let run_store = Arc::new(astra_services::runs::InMemoryRunStateStore::default());
         Arc::new(DelegationEngine::with_executor(
             Arc::new(tokio::sync::RwLock::new(registry)),
             Arc::new(RunEngine::new(run_store)),

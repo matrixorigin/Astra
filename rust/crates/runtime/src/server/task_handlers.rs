@@ -1,5 +1,5 @@
 use super::*;
-use mo_agent_services::session_journal;
+use astra_services::session_journal;
 
 // ─── Query parameters ───────────────────────────────────────────────────────
 
@@ -19,7 +19,7 @@ pub(super) struct TaskProgressQuery {
 
 #[derive(Serialize)]
 pub(super) struct TaskListResponse {
-    pub tasks: Vec<mo_agent_services::TaskRecord>,
+    pub tasks: Vec<astra_services::TaskRecord>,
     pub total: usize,
 }
 
@@ -36,7 +36,7 @@ pub(super) struct PlanProgressEventResponse {
 
 #[derive(Serialize)]
 pub(super) struct TaskProgressResponse {
-    pub task: mo_agent_services::TaskRecord,
+    pub task: astra_services::TaskRecord,
     pub progress_events: Vec<PlanProgressEventResponse>,
 }
 
@@ -67,7 +67,7 @@ pub(super) async fn get_task_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(task_id): Path<String>,
-) -> Result<Json<mo_agent_services::TaskRecord>, (StatusCode, Json<ErrorResponse>)> {
+) -> Result<Json<astra_services::TaskRecord>, (StatusCode, Json<ErrorResponse>)> {
     let _user = state.auth_service.current_user(&headers).await?;
 
     let user = state.auth_service.current_user(&headers).await?;
@@ -130,10 +130,10 @@ pub(super) async fn create_task_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(payload): Json<CreateTaskRequest>,
-) -> Result<(StatusCode, Json<mo_agent_services::TaskRecord>), (StatusCode, Json<ErrorResponse>)> {
+) -> Result<(StatusCode, Json<astra_services::TaskRecord>), (StatusCode, Json<ErrorResponse>)> {
     let user = state.auth_service.current_user(&headers).await?;
 
-    let req = mo_agent_services::TaskCreateRequest {
+    let req = astra_services::TaskCreateRequest {
         title: payload.title,
         description: payload.description,
         plan: None,
@@ -368,14 +368,14 @@ pub(super) struct UpdateStatusRequest {
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
-fn parse_task_status(s: &str) -> Option<mo_agent_services::TaskStatus> {
+fn parse_task_status(s: &str) -> Option<astra_services::TaskStatus> {
     match s {
-        "pending" => Some(mo_agent_services::TaskStatus::Pending),
-        "in_progress" => Some(mo_agent_services::TaskStatus::InProgress),
-        "paused" => Some(mo_agent_services::TaskStatus::Paused),
-        "completed" => Some(mo_agent_services::TaskStatus::Completed),
-        "failed" => Some(mo_agent_services::TaskStatus::Failed),
-        "cancelled" => Some(mo_agent_services::TaskStatus::Cancelled),
+        "pending" => Some(astra_services::TaskStatus::Pending),
+        "in_progress" => Some(astra_services::TaskStatus::InProgress),
+        "paused" => Some(astra_services::TaskStatus::Paused),
+        "completed" => Some(astra_services::TaskStatus::Completed),
+        "failed" => Some(astra_services::TaskStatus::Failed),
+        "cancelled" => Some(astra_services::TaskStatus::Cancelled),
         _ => None,
     }
 }

@@ -92,8 +92,8 @@ pub async fn serve(addr: SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// Spawn a background task that periodically cleans up expired data.
-fn spawn_data_cleanup(pool: mo_agent_core::SharedPool) {
-    use mo_agent_services::RetentionPolicy;
+fn spawn_data_cleanup(pool: astra_core::SharedPool) {
+    use astra_services::RetentionPolicy;
     use std::time::Duration;
 
     let cleanup_interval = Duration::from_secs(
@@ -109,7 +109,7 @@ fn spawn_data_cleanup(pool: mo_agent_core::SharedPool) {
         interval.tick().await; // skip immediate first tick
         loop {
             interval.tick().await;
-            let results = mo_agent_services::cleanup_expired_data(pool.get(), &policy).await;
+            let results = astra_services::cleanup_expired_data(pool.get(), &policy).await;
             let total: u64 = results.iter().map(|r| r.rows_deleted).sum();
             if total > 0 {
                 eprintln!(

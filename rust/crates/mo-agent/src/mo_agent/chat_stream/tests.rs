@@ -5,7 +5,7 @@
 /// DB ingestion captures 100% of tool_calls.
 #[test]
 fn tool_call_record_covers_early_exit_paths() {
-    use mo_agent_services::session_journal::ToolCallRecord;
+    use astra_services::session_journal::ToolCallRecord;
 
     // Duplicate within turn
     let dup = ToolCallRecord {
@@ -73,7 +73,7 @@ fn tool_call_record_covers_early_exit_paths() {
 /// ToolCallRecord round-trips through JSON correctly.
 #[test]
 fn tool_call_record_json_roundtrip() {
-    use mo_agent_services::session_journal::ToolCallRecord;
+    use astra_services::session_journal::ToolCallRecord;
 
     let original = ToolCallRecord {
         name: "web_fetch".to_string(),

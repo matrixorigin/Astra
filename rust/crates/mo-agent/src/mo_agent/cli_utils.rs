@@ -104,9 +104,9 @@ pub(super) fn read_api_error(status: u16, body: &str) -> String {
     format!("request failed ({status}): {}", compact_or_raw(body))
 }
 
-pub(super) fn map_thin_err(e: mo_thin_client::ThinClientError) -> String {
+pub(super) fn map_thin_err(e: astra_thin_client::ThinClientError) -> String {
     match e {
-        mo_thin_client::ThinClientError::Api { status, body } => {
+        astra_thin_client::ThinClientError::Api { status, body } => {
             read_api_error(status.as_u16(), &body)
         }
         other => other.to_string(),
@@ -383,7 +383,7 @@ pub(crate) fn print_markdown_width(text: &str, width: Option<usize>) {
     print!("{}", fmt);
 }
 
-pub(super) use mo_agent_runtime::turn::headless_tool_status_display::truncate_str;
+pub(super) use astra_runtime::turn::headless_tool_status_display::truncate_str;
 
 pub(super) fn urlencoding(s: &str) -> String {
     s.chars()

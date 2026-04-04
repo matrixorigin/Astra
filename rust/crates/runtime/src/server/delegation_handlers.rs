@@ -1,5 +1,5 @@
 use super::*;
-use mo_agent_services::{DelegationRequest, DelegationResult};
+use astra_services::{DelegationRequest, DelegationResult};
 
 /// POST /chat/runs/{run_id}/delegate
 ///

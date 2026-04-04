@@ -1,12 +1,12 @@
-pub use mo_agent_services::marketplace::*;
+pub use astra_services::marketplace::*;
 
 use crate::AppState;
+use astra_core::ErrorResponse;
 use axum::{
     Json,
     extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
 };
-use mo_agent_core::ErrorResponse;
 
 pub async fn install_skill_handler(
     State(state): State<AppState>,

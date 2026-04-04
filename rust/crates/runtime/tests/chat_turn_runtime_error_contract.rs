@@ -1,6 +1,6 @@
 use std::{fs, path::PathBuf};
 
-use mo_agent_runtime::build_runtime_error_event;
+use astra_runtime::build_runtime_error_event;
 use serde::Deserialize;
 use serde_json::{Map, Value};
 

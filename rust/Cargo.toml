@@ -14,10 +14,10 @@ version = "0.1.0"
 edition = "2024"
 
 [workspace.dependencies]
-mo-agent-core = { path = "crates/core" }
-mo-agent-services = { path = "crates/services" }
-mo-agent-runtime = { path = "crates/runtime" }
-mo-thin-client = { path = "crates/mo-thin-client" }
+astra-core = { path = "crates/core" }
+astra-services = { path = "crates/services" }
+astra-runtime = { path = "crates/runtime" }
+astra-thin-client = { path = "crates/mo-thin-client" }
 async-stream = "0.3.6"
 async-trait = "0.1.89"
 axum = { version = "0.8.6", features = ["ws"] }

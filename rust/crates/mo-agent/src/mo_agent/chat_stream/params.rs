@@ -1,4 +1,4 @@
-use mo_agent_runtime::{pipeline::persistence::ToolHealthEntry, tool_selector::ToolSelector};
+use astra_runtime::{pipeline::persistence::ToolHealthEntry, tool_selector::ToolSelector};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
@@ -9,7 +9,7 @@ use crate::{
 /// Parameters for a single agentic chat turn — groups the many arguments
 /// to `stream_chat_sse` into a named struct to reduce cognitive load.
 pub(crate) struct ChatTurnParams<'a> {
-    pub(crate) api: &'a mo_thin_client::ThinClient,
+    pub(crate) api: &'a astra_thin_client::ThinClient,
     pub(crate) token: &'a str,
     pub(crate) message: &'a str,
     pub(crate) session_id: Option<&'a str>,
@@ -39,7 +39,7 @@ pub(crate) struct ChatTurnParams<'a> {
     pub(crate) plan_subtask_id: Option<&'a str>,
     /// Optional delegation engine for multi-agent coordination with verification gates.
     pub(crate) delegation_engine:
-        Option<Arc<mo_agent_runtime::server::delegation_engine::DelegationEngine>>,
+        Option<Arc<astra_runtime::server::delegation_engine::DelegationEngine>>,
     /// Optional cancellation token for interrupting SSE streaming mid-flight.
     pub(crate) cancel_token: Option<Arc<tokio_util::sync::CancellationToken>>,
     /// Plan-only: set to `true` after HTTP 200 so the payload-phase stderr line spinner can exit

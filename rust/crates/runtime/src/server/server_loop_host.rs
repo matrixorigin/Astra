@@ -32,7 +32,7 @@ use crate::turn::llm_client::{
 };
 use crate::turn::tool_schema_prune::prune_tool_schemas;
 use crate::{FernetTokenEncryptor, MatrixOneSettings};
-use mo_agent_core::SharedPool;
+use astra_core::SharedPool;
 
 // ── Rate-Limit Cooldown ──────────────────────────────────────────────────────
 /// Per-model rate-limit cooldown tracker (shared with llm_client).
@@ -389,7 +389,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         // Also capture fallback_model name for rate-limit-triggered fallback.
         let pool_ref = self.shared_pool.as_ref().map(|sp| sp.get());
         let (mut model_name, mut api_key, mut base_url, mut provider, fallback_model_name) =
-            match mo_agent_services::resolve_active_llm_model(
+            match astra_services::resolve_active_llm_model(
                 &self.matrixone,
                 self.encryptor.as_ref(),
                 self.model_override.as_deref(),
@@ -413,7 +413,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         match cooldown.with(&model_name, |c| c.check_request(has_fallback)) {
             RateLimitAction::Proceed => {}
             RateLimitAction::WaitAndRetry { delay_ms } => {
-                mo_agent_core::agent_info!(
+                astra_core::agent_info!(
                     "llm",
                     "rate-limit cooldown: waiting {delay_ms}ms before request"
                 );
@@ -421,14 +421,14 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             }
             RateLimitAction::UseFallback { reason } => {
                 if let Some(ref fb_name) = fallback_model_name {
-                    mo_agent_core::agent_info!(
+                    astra_core::agent_info!(
                         "llm",
                         "rate-limit cooldown: switching to fallback model '{}' ({})",
                         fb_name,
                         reason.as_str()
                     );
                     // Resolve fallback model credentials
-                    match mo_agent_services::resolve_active_llm_model(
+                    match astra_services::resolve_active_llm_model(
                         &self.matrixone,
                         self.encryptor.as_ref(),
                         Some(fb_name.as_str()),
@@ -443,7 +443,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                             provider = fb.provider;
                         }
                         Err(e) => {
-                            mo_agent_core::agent_warn!(
+                            astra_core::agent_warn!(
                                 "llm",
                                 "fallback model '{}' resolution failed: {}",
                                 fb_name,
@@ -453,7 +453,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                         }
                     }
                 } else {
-                    mo_agent_core::agent_warn!(
+                    astra_core::agent_warn!(
                         "llm",
                         "rate-limit cooldown: fallback requested ({}) but no fallback configured",
                         reason.as_str()
@@ -995,7 +995,7 @@ mod tests {
             message: "test query".to_string(),
             recent_tools: Vec::new(),
             task_profile: TaskExecutionProfile::default(),
-            api: mo_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap(),
+            api: astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap(),
             api_token: "test-token".to_string(),
             cancel_flag: None,
             cancel_token: None,

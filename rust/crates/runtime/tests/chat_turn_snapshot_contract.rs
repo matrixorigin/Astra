@@ -1,6 +1,6 @@
 use std::{fs, path::PathBuf};
 
-use mo_agent_runtime::build_session_history_snapshot;
+use astra_runtime::build_session_history_snapshot;
 use serde::Deserialize;
 use serde_json::{Map, Value};
 

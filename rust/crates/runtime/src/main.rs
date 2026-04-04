@@ -6,6 +6,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_else(|_| "0.0.0.0:8000".to_string())
         .parse()?;
 
-    mo_agent_runtime::serve(addr).await?;
+    astra_runtime::serve(addr).await?;
     Ok(())
 }

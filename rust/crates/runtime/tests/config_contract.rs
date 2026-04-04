@@ -1,6 +1,6 @@
 use std::{collections::HashMap, fs, path::PathBuf};
 
-use mo_agent_runtime::config::AppSettings;
+use astra_runtime::config::AppSettings;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Deserialize)]

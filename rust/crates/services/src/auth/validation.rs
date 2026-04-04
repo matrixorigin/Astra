@@ -1,6 +1,6 @@
 use super::AuthRegisterRequestData;
+use astra_core::{ErrorResponse, error_response};
 use axum::{Json, http::StatusCode};
-use mo_agent_core::{ErrorResponse, error_response};
 
 pub(super) fn validate_register_request(
     request: &AuthRegisterRequestData,

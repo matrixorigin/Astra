@@ -1,6 +1,6 @@
 //! SSE **event** framing: blocks separated by a blank line (`\n\n` or `\r\n\r\n`).
 //!
-//! Matches mo-agent HTTP streams and [`mo_thin_client::sse::SseParser`] boundaries. Distinct from
+//! Matches mo-agent HTTP streams and [`astra_thin_client::sse::SseParser`] boundaries. Distinct from
 //! [`super::sse_data_lines`] (OpenAI-style `data:` per `\n` without requiring `\n\n`).
 //!
 //! [`SseBlankLineUtf8Buf`] is the shared incremental buffer used by [`super::chat_turn_sse_dispatch::ChatTurnSseFramer`]

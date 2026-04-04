@@ -1,8 +1,8 @@
 use std::{borrow::Cow, fs, path::PathBuf};
 
+use astra_thin_client::ThinClient;
+use astra_thin_client::paths;
 use crossterm::style::Stylize;
-use mo_thin_client::ThinClient;
-use mo_thin_client::paths;
 use rustyline::{
     CompletionType, Config, Context, Editor, Helper,
     completion::{Completer, Pair},

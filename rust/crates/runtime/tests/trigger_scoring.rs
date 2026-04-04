@@ -4,7 +4,7 @@
 //! without requiring embedding models. Each test verifies that the right tools are
 //! selected for both English and Chinese queries.
 
-use mo_agent_runtime::tool_registry::{
+use astra_runtime::tool_registry::{
     TOOL_CATALOG, scoring::pre_filter_dynamic, state::ConversationState,
 };
 
@@ -262,7 +262,7 @@ mod recall_first {
         let has_github = results.iter().any(|&(idx, _)| {
             TOOL_CATALOG[idx]
                 .intents
-                .contains(&mo_agent_runtime::tool_registry::IntentType::GitHub)
+                .contains(&astra_runtime::tool_registry::IntentType::GitHub)
         });
         assert!(
             has_github,
@@ -277,7 +277,7 @@ mod recall_first {
         let has_git = results.iter().any(|&(idx, _)| {
             TOOL_CATALOG[idx]
                 .intents
-                .contains(&mo_agent_runtime::tool_registry::IntentType::Git)
+                .contains(&astra_runtime::tool_registry::IntentType::Git)
         });
         assert!(has_git, "Git intent query should include a Git tool");
     }

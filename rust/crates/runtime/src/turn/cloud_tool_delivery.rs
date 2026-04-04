@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use mo_thin_client::ApprovalRespondRequest;
+use astra_thin_client::ApprovalRespondRequest;
 use serde_json::{Map, Value, json};
 
 use super::cloud_approval_policy::{bash_command_is_read_only, edge_tool_requires_cloud_approval};
@@ -74,9 +74,9 @@ pub fn parse_cloud_approval_outcome(entry: Option<&Value>) -> CloudApprovalResul
         return CloudApprovalResult::Malformed;
     };
     match req.decision {
-        mo_thin_client::ApprovalDecision::Allow
-        | mo_thin_client::ApprovalDecision::AllowSession => CloudApprovalResult::Allowed,
-        mo_thin_client::ApprovalDecision::Deny => {
+        astra_thin_client::ApprovalDecision::Allow
+        | astra_thin_client::ApprovalDecision::AllowSession => CloudApprovalResult::Allowed,
+        astra_thin_client::ApprovalDecision::Deny => {
             CloudApprovalResult::Denied { reason: req.reason }
         }
     }
@@ -349,7 +349,7 @@ pub async fn deliver_tool_calls_concurrent(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mo_thin_client::ApprovalDecision;
+    use astra_thin_client::ApprovalDecision;
 
     fn read_tool(id: &str) -> Value {
         json!({

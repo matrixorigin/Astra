@@ -1,6 +1,6 @@
 use std::{fs, path::PathBuf};
 
-use mo_agent_runtime::{build_observer_messages, should_run_observer};
+use astra_runtime::{build_observer_messages, should_run_observer};
 use serde::Deserialize;
 use serde_json::{Map, Value};
 

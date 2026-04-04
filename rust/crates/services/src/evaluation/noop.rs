@@ -3,7 +3,7 @@ use async_trait::async_trait;
 use super::service::EvaluationService;
 use super::types::*;
 use super::utils::ServiceResult;
-use mo_agent_core::internal_error;
+use astra_core::internal_error;
 
 pub struct UnconfiguredEvaluationService;
 

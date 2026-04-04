@@ -3,7 +3,7 @@ use axum::{Json, http::StatusCode};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use mo_agent_core::{ErrorResponse, error_response, internal_error};
+use astra_core::{ErrorResponse, error_response, internal_error};
 
 // ── Data types ───────────────────────────────────────────────────────────────
 

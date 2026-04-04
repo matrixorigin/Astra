@@ -3,9 +3,9 @@
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
-use mo_agent_core::agent_warn;
-use mo_agent_services::session_journal::ToolCallRecord;
-use mo_thin_client::ThinClient;
+use astra_core::agent_warn;
+use astra_services::session_journal::ToolCallRecord;
+use astra_thin_client::ThinClient;
 use serde_json::Value;
 
 use super::headless_tool_assembly::{

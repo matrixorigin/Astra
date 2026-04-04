@@ -1,10 +1,10 @@
 use std::sync::Arc;
 
+use astra_runtime::{AppState, HealthChecker, ServiceInfo, build_app};
 use axum::{
     body,
     http::{Request, StatusCode},
 };
-use mo_agent_runtime::{AppState, HealthChecker, ServiceInfo, build_app};
 use tower::util::ServiceExt;
 
 #[derive(Clone)]

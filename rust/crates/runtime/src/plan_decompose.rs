@@ -18,7 +18,7 @@ use std::path::Path;
 use std::time::Instant;
 
 // Re-export task types from services
-pub use mo_agent_services::task_orchestrator::{SubtaskPlan, TaskPlan, TaskStatus};
+pub use astra_services::task_orchestrator::{SubtaskPlan, TaskPlan, TaskStatus};
 
 /// First `messages[]` row (`role: system`) when the CLI enables **plan-only chat** (`/plan on`).
 /// Edge tools are omitted from the payload; the model should reason and answer with a plan only.
@@ -3022,7 +3022,7 @@ pub fn detect_replan_needed(
     execution_rounds: usize,
     failed_subtasks: &[(&str, &str)], // (subtask_id, error_message)
 ) -> Option<ReplanSuggestion> {
-    use mo_agent_services::task_orchestrator::TaskStatus;
+    use astra_services::task_orchestrator::TaskStatus;
 
     // 1. Check for failed subtasks
     if let Some((id, error)) = failed_subtasks.first() {
@@ -3096,7 +3096,7 @@ pub fn generate_replan_prompt(
     reason: &ReplanReason,
     context: &ProjectContext,
 ) -> String {
-    use mo_agent_services::task_orchestrator::TaskStatus;
+    use astra_services::task_orchestrator::TaskStatus;
 
     let mut prompt = String::with_capacity(2048);
 
@@ -6147,7 +6147,7 @@ Done!"#;
 
     #[test]
     fn detect_replan_deadlock() {
-        use mo_agent_services::task_orchestrator::{SubtaskPlan, TaskPlan, TaskStatus};
+        use astra_services::task_orchestrator::{SubtaskPlan, TaskPlan, TaskStatus};
 
         // Create plan with circular dependency (a -> b -> a)
         let plan = TaskPlan {
@@ -6181,7 +6181,7 @@ Done!"#;
 
     #[test]
     fn detect_replan_failed_subtask() {
-        use mo_agent_services::task_orchestrator::{SubtaskPlan, TaskPlan, TaskStatus};
+        use astra_services::task_orchestrator::{SubtaskPlan, TaskPlan, TaskStatus};
 
         let plan = TaskPlan {
             subtasks: vec![SubtaskPlan {
@@ -6205,7 +6205,7 @@ Done!"#;
 
     #[test]
     fn detect_replan_none_for_healthy_plan() {
-        use mo_agent_services::task_orchestrator::{SubtaskPlan, TaskPlan, TaskStatus};
+        use astra_services::task_orchestrator::{SubtaskPlan, TaskPlan, TaskStatus};
 
         let plan = TaskPlan {
             subtasks: vec![

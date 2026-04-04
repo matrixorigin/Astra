@@ -1,9 +1,9 @@
-use mo_agent_core::{JwtSettings, MatrixOneSettings, SharedPool};
+use astra_core::{JwtSettings, MatrixOneSettings, SharedPool};
 /// Contract tests for SharedPool migration in auth and session services.
 ///
 /// Verifies that DatabaseAuthService and DatabaseSessionService accept
 /// a SharedPool and use it instead of creating new connections.
-use mo_agent_services::auth::{DatabaseAuthService, DatabaseSessionService};
+use astra_services::auth::{DatabaseAuthService, DatabaseSessionService};
 
 fn dummy_settings() -> MatrixOneSettings {
     MatrixOneSettings {

@@ -8,7 +8,7 @@ use axum::{Json, http::StatusCode};
 use serde::{Deserialize, Serialize};
 use sqlx::{Row, query};
 
-use mo_agent_core::{
+use astra_core::{
     ErrorResponse, MatrixOneSettings, SharedPool, connect_matrixone, error_response, internal_error,
 };
 

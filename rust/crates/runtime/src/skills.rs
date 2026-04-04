@@ -1,12 +1,12 @@
-pub use mo_agent_services::skills::*;
+pub use astra_services::skills::*;
 
 use crate::AppState;
+use astra_core::ErrorResponse;
 use axum::{
     Json,
     extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
 };
-use mo_agent_core::ErrorResponse;
 
 pub async fn register_skill_handler(
     State(state): State<AppState>,

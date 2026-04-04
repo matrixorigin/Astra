@@ -1,6 +1,6 @@
 use std::{fs, path::PathBuf};
 
-use mo_agent_runtime::{build_routing_metadata, build_skipped_routing_metadata};
+use astra_runtime::{build_routing_metadata, build_skipped_routing_metadata};
 use serde::Deserialize;
 use serde_json::{Map, Value};
 

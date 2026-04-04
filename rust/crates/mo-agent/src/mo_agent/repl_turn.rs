@@ -3,7 +3,7 @@ use std::time::Instant;
 use super::*;
 
 pub(super) struct ReplTurnContext<'a> {
-    pub(super) api: &'a mo_thin_client::ThinClient,
+    pub(super) api: &'a astra_thin_client::ThinClient,
     pub(super) profile: Option<&'a str>,
     pub(super) selector: &'a dyn tool_selector::ToolSelector,
 }
@@ -30,7 +30,7 @@ const COMPACT_ANCHOR_LINE_MAX: usize = 140;
 const COMPACT_ANCHOR_TOTAL_MAX: usize = 700;
 
 pub(super) async fn fetch_compact_memory_anchor_snippet(
-    api: &mo_thin_client::ThinClient,
+    api: &astra_thin_client::ThinClient,
     token: &str,
     session_id: Option<&str>,
     summary_seed: &str,
@@ -338,7 +338,7 @@ async fn apply_auto_compact_result(
         .post_memory_store_json(token, &entry.to_store_payload_with_meta(&meta))
         .await
     {
-        mo_agent_core::agent_warn!("repl_turn", "failed to persist compacted memory: {e}");
+        astra_core::agent_warn!("repl_turn", "failed to persist compacted memory: {e}");
     }
 
     eprintln!(
@@ -449,13 +449,13 @@ fn commit_turn_journal_workspace_and_sidecars(
         state.last_turn_event = Some(turn_event.clone());
 
         if let Err(e) = journal.append(&turn_event) {
-            mo_agent_core::agent_warn!("journal", "failed to write turn event: {e}");
+            astra_core::agent_warn!("journal", "failed to write turn event: {e}");
         }
         enqueue_ingestion(state, &turn_event);
 
         // Update workspace metadata per-turn
         if let Some(sid) = state.session_id.as_deref()
-            && let Ok(mut ws) = mo_agent_services::session_workspace::read_workspace(sid)
+            && let Ok(mut ws) = astra_services::session_workspace::read_workspace(sid)
         {
             ws.record_turn(result.prompt_tokens, result.completion_tokens);
 
@@ -481,12 +481,12 @@ fn commit_turn_journal_workspace_and_sidecars(
             ws.plan_corrections = state.plan_execution_corrections.clone();
 
             // Check if checkpoint is due
-            if mo_agent_services::session_checkpoint::should_checkpoint(
+            if astra_services::session_checkpoint::should_checkpoint(
                 ws.turn_count,
-                mo_agent_services::session_checkpoint::CHECKPOINT_INTERVAL,
+                astra_services::session_checkpoint::CHECKPOINT_INTERVAL,
             ) {
                 ws.record_checkpoint();
-                let cp = mo_agent_services::session_checkpoint::Checkpoint {
+                let cp = astra_services::session_checkpoint::Checkpoint {
                     number: ws.checkpoints.len() as u32,
                     turn: ws.turn_count,
                     title: format!("Turn {} checkpoint", ws.turn_count),
@@ -506,7 +506,7 @@ fn commit_turn_journal_workspace_and_sidecars(
                         .as_ref()
                         .and_then(|d| serde_json::to_string(&d.contract).ok()),
                 };
-                let _ = mo_agent_services::session_checkpoint::write_checkpoint(sid, &cp);
+                let _ = astra_services::session_checkpoint::write_checkpoint(sid, &cp);
 
                 // Push checkpoint to MatrixOne for cross-device availability
                 if let Some(ref mc) = state.matrix_runtime {
@@ -516,7 +516,7 @@ fn commit_turn_journal_workspace_and_sidecars(
                     let user_id_owned = user_id.to_string();
                     let cp_clone = cp.clone();
                     tokio::spawn(async move {
-                        let _ = mo_agent_services::session_restore::push_checkpoint_to_cloud(
+                        let _ = astra_services::session_restore::push_checkpoint_to_cloud(
                             &pool,
                             &sid_owned,
                             &user_id_owned,
@@ -552,13 +552,13 @@ fn commit_turn_journal_workspace_and_sidecars(
                     .unwrap_or(0);
                 // Extract metadata from the checkpoint for column storage
                 let (tier, turn, title, tools_json): (String, u32, String, String) = match step_cp {
-                    mo_agent_runtime::pipeline::step_protocol::StepCheckpoint::Light(l) => (
+                    astra_runtime::pipeline::step_protocol::StepCheckpoint::Light(l) => (
                         "light".to_string(),
                         0u32,
                         format!("step:{}", l.step_id),
                         "[]".to_string(),
                     ),
-                    mo_agent_runtime::pipeline::step_protocol::StepCheckpoint::Heavy(h) => {
+                    astra_runtime::pipeline::step_protocol::StepCheckpoint::Heavy(h) => {
                         let tools = serde_json::to_string(&h.recent_tools)
                             .unwrap_or_else(|_| "[]".to_string());
                         (
@@ -570,7 +570,7 @@ fn commit_turn_journal_workspace_and_sidecars(
                     }
                 };
                 tokio::spawn(async move {
-                    let _ = mo_agent_services::session_restore::push_step_checkpoint_to_cloud(
+                    let _ = astra_services::session_restore::push_step_checkpoint_to_cloud(
                         &pool,
                         &sid_owned,
                         &user_id_owned,
@@ -587,9 +587,9 @@ fn commit_turn_journal_workspace_and_sidecars(
 
             // Push plan state to cloud at checkpoint boundaries
             if let Some(ref mc) = state.matrix_runtime
-                && mo_agent_services::session_checkpoint::should_checkpoint(
+                && astra_services::session_checkpoint::should_checkpoint(
                     ws.turn_count,
-                    mo_agent_services::session_checkpoint::CHECKPOINT_INTERVAL,
+                    astra_services::session_checkpoint::CHECKPOINT_INTERVAL,
                 )
             {
                 let pool = mc.shared_pool().get().clone();
@@ -599,7 +599,7 @@ fn commit_turn_journal_workspace_and_sidecars(
                 let config = ws.plan_config_json.clone();
                 let rounds = ws.plan_execution_rounds;
                 tokio::spawn(async move {
-                    let _ = mo_agent_services::session_restore::push_plan_state_to_cloud(
+                    let _ = astra_services::session_restore::push_plan_state_to_cloud(
                         &pool,
                         &sid_owned,
                         plan_json.as_deref(),
@@ -611,7 +611,7 @@ fn commit_turn_journal_workspace_and_sidecars(
                 });
             }
 
-            let _ = mo_agent_services::session_workspace::write_workspace(&ws);
+            let _ = astra_services::session_workspace::write_workspace(&ws);
         }
 
         // Log stall events to journal (use state.turn for user turn, not internal loop turn)
@@ -676,8 +676,8 @@ fn record_selector_turn_outcome(
     line: &str,
     result: &StreamResult,
 ) {
-    use mo_agent_runtime::pipeline::evaluation::{ToolCallInfo, evaluate_turn};
-    use mo_agent_runtime::pipeline::routing::RoutingEngine;
+    use astra_runtime::pipeline::evaluation::{ToolCallInfo, evaluate_turn};
+    use astra_runtime::pipeline::routing::RoutingEngine;
     let routing = RoutingEngine::analyze(line, state.turn, &state.recent_tools, &[], vec![]);
     let is_live_query = looks_like_live_query_with_context(line, &state.recent_tools);
 
@@ -787,11 +787,11 @@ fn initialize_journal(state: &mut ReplState, session_id: &str) {
     }
 
     // Initialize workspace metadata alongside journal
-    let ws = mo_agent_services::session_workspace::WorkspaceMetadata::new(
+    let ws = astra_services::session_workspace::WorkspaceMetadata::new(
         session_id,
         state.model.as_deref().unwrap_or("default"),
     );
-    let _ = mo_agent_services::session_workspace::write_workspace(&ws);
+    let _ = astra_services::session_workspace::write_workspace(&ws);
 }
 
 fn report_turn_error(state: &ReplState, line: &str, error: &str, turn_start: Instant) {

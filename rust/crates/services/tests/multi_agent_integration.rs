@@ -1,4 +1,4 @@
-//! MySQL / MatrixOne integration tests for [`mo_agent_services::multi_agent`].
+//! MySQL / MatrixOne integration tests for [`astra_services::multi_agent`].
 //!
 //! ```text
 //! MO_AGENT_MULTI_AGENT_IT=1 cargo test -p mo-agent-services multi_agent_integration -- --ignored
@@ -6,13 +6,13 @@
 //!
 //! Uses `MATRIXONE_*` env vars (after `dotenvy`) with the same defaults as local dev (`127.0.0.1:6001`, …).
 
-use mo_agent_core::{DEV_MATRIXONE_PASSWORD, MatrixOneSettings, SharedPool};
-use mo_agent_services::multi_agent::{
+use astra_core::{DEV_MATRIXONE_PASSWORD, MatrixOneSettings, SharedPool};
+use astra_services::multi_agent::{
     DatabaseEdgeRegistryService, DatabaseTaskLeaseService, EdgeRegistryService, LeaseClaimResult,
     TaskLeaseHoldCache, TaskLeaseService, push_tasks_pack_held_mysql,
 };
-use mo_agent_services::storage::ensure_core_schema;
-use mo_agent_services::task_orchestrator::{TaskRecord, TaskStatus};
+use astra_services::storage::ensure_core_schema;
+use astra_services::task_orchestrator::{TaskRecord, TaskStatus};
 use sqlx::Row;
 use std::sync::Arc;
 use tokio::sync::Barrier;

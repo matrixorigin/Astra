@@ -11,7 +11,7 @@
 //! 4. Passive response when memory is empty — agent asks instead of acting
 //!    Fix: system prompt now instructs proactive store + "DO NOT ask, just store"
 
-use mo_agent_runtime::{
+use astra_runtime::{
     prompts::memory_lifecycle::{detect_store_signal, detect_tracking_intent, suggest_namespace},
     tool_registry::{
         IntentType, TOOL_CATALOG, scoring::pre_filter_dynamic, state::ConversationState,
@@ -273,7 +273,7 @@ mod recency_cross_contamination {
 // Verify the memory rules appear correctly in built prompts
 
 mod system_prompt_memory_rules {
-    use mo_agent_runtime::prompts::build_main_system_prompt;
+    use astra_runtime::prompts::build_main_system_prompt;
 
     #[test]
     fn memory_section_present_when_memory_tools_selected() {

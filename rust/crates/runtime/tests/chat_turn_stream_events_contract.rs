@@ -1,6 +1,6 @@
 use std::{fs, path::PathBuf};
 
-use mo_agent_runtime::{
+use astra_runtime::{
     build_edge_tool_call_event, build_firewall_warning_event, build_stream_error_event,
 };
 use serde::Deserialize;

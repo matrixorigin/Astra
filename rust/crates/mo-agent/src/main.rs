@@ -8,6 +8,9 @@ use std::{
     sync::{Mutex, OnceLock},
 };
 
+use astra_core::SharedPool;
+use astra_runtime::{plan_decompose, prompts, tool_registry, tool_selector};
+use astra_services::session_journal;
 use clap::{Args, Parser, Subcommand};
 use crossterm::{
     cursor,
@@ -16,9 +19,6 @@ use crossterm::{
     style::Stylize,
     terminal,
 };
-use mo_agent_core::SharedPool;
-use mo_agent_runtime::{plan_decompose, prompts, tool_registry, tool_selector};
-use mo_agent_services::session_journal;
 
 mod edge_tools;
 mod manifest_loader;
@@ -88,6 +88,9 @@ mod streaming_md;
 #[path = "mo_agent/terminal_region.rs"]
 mod terminal_region;
 
+use astra_runtime::turn::chat_turn_heuristics::{
+    is_session_not_found_error, looks_like_live_query_with_context,
+};
 use auth_flow::{clear_profile_last_session, do_login, do_register};
 use chat_stream::{ChatTurnParams, stream_chat_sse};
 use cli_utils::{
@@ -97,9 +100,6 @@ use cli_utils::{
 };
 use command_router::{ExitCode, execute_cli_command};
 use edge_lifecycle::register_and_start_heartbeat;
-use mo_agent_runtime::turn::chat_turn_heuristics::{
-    is_session_not_found_error, looks_like_live_query_with_context,
-};
 use permission_manager::PermissionManager;
 #[cfg(test)]
 use stream_render::{StreamRenderState, TurnResult, dispatch_turn_event_block};
@@ -372,8 +372,7 @@ struct AuditToolsArgs {
 
 // ══════════════════════════════════════════════════════ SSE Streaming ════
 
-pub(crate) type VerdictEvent =
-    mo_agent_runtime::turn::agentic_verdict_audit::AgenticVerdictAuditEvent;
+pub(crate) type VerdictEvent = astra_runtime::turn::agentic_verdict_audit::AgenticVerdictAuditEvent;
 
 #[derive(Debug)]
 pub(crate) struct StreamResult {
@@ -390,7 +389,7 @@ pub(crate) struct StreamResult {
     /// Tool names actually invoked by LLM across all turns.
     tools_used: Vec<String>,
     /// Per-tool-call audit records: name, ok, ms, error.
-    tool_call_records: Vec<mo_agent_services::session_journal::ToolCallRecord>,
+    tool_call_records: Vec<astra_services::session_journal::ToolCallRecord>,
     /// Token budget used by selected dynamic tools.
     budget_used: u32,
     /// Token budget pressure (0.0-0.9) from compaction tier.
@@ -401,11 +400,11 @@ pub(crate) struct StreamResult {
     /// nudge_count, total_errors, deprioritized_count). Only non-Healthy verdicts.
     verdict_events: Vec<VerdictEvent>,
     /// Step Protocol recorder summary for debugging and audit.
-    step_recorder_summary: Option<mo_agent_runtime::pipeline::step_recorder::RecorderSummary>,
+    step_recorder_summary: Option<astra_runtime::pipeline::step_recorder::RecorderSummary>,
     /// Exported tool health entries from this turn's TurnGuard (for cross-session persistence).
-    tool_health_export: Vec<mo_agent_runtime::pipeline::persistence::ToolHealthEntry>,
+    tool_health_export: Vec<astra_runtime::pipeline::persistence::ToolHealthEntry>,
     /// Last heavy checkpoint built during the agentic loop (for cloud persistence).
-    last_heavy_checkpoint: Option<mo_agent_runtime::pipeline::step_protocol::StepCheckpoint>,
+    last_heavy_checkpoint: Option<astra_runtime::pipeline::step_protocol::StepCheckpoint>,
     /// Time to first token in milliseconds.
     ttft_ms: Option<u64>,
     /// Context assembly time in milliseconds.
@@ -464,21 +463,21 @@ struct ReplState {
     /// User ID for event ingestion attribution.
     ingestion_user_id: Option<String>,
     /// Matrix pool + journal ingestion + sync orchestrator (None if MatrixOne unavailable).
-    matrix_runtime: Option<std::sync::Arc<mo_agent_runtime::MatrixCloudRuntime>>,
+    matrix_runtime: Option<std::sync::Arc<astra_runtime::MatrixCloudRuntime>>,
     /// Learning snapshot restored from cloud (to be merged into learning modules).
     learning_snapshot: Option<String>,
     /// Local task service for /task commands.
-    task_service: Option<std::sync::Arc<mo_agent_services::LocalTaskService>>,
+    task_service: Option<std::sync::Arc<astra_services::LocalTaskService>>,
     /// Cross-session tool health data for error budget persistence.
-    tool_health_entries: Vec<mo_agent_runtime::pipeline::persistence::ToolHealthEntry>,
+    tool_health_entries: Vec<astra_runtime::pipeline::persistence::ToolHealthEntry>,
     /// Last successfully synced tool health snapshot, used to compute deltas.
-    synced_tool_health_entries: Vec<mo_agent_runtime::pipeline::persistence::ToolHealthEntry>,
+    synced_tool_health_entries: Vec<astra_runtime::pipeline::persistence::ToolHealthEntry>,
     /// Plan-only chat (`/plan on`): normal REPL turns omit edge tools; model plans without executing.
     chat_plan_only: bool,
     /// Plan Mode state — when Some, REPL is in interactive plan editing mode.
     plan_mode: Option<plan_decompose::PlanModeState>,
     /// Plan being auto-executed — subtasks sent sequentially through chat.
-    executing_plan: Option<mo_agent_services::task_orchestrator::TaskPlan>,
+    executing_plan: Option<astra_services::task_orchestrator::TaskPlan>,
     /// Configuration for current plan execution (step-by-step, auto-execute, etc.).
     plan_execution_config: Option<plan_decompose::PlanExecutionConfig>,
     /// Goal text for the executing plan (for summary generation).
@@ -496,16 +495,15 @@ struct ReplState {
     /// Last turn's journal event — for /turn command display.
     last_turn_event: Option<session_journal::JournalEvent>,
     /// Shared pattern library reference for /learn command.
-    pattern_library: Option<
-        std::sync::Arc<std::sync::Mutex<mo_agent_runtime::pipeline::pattern::PatternLibrary>>,
-    >,
+    pattern_library:
+        Option<std::sync::Arc<std::sync::Mutex<astra_runtime::pipeline::pattern::PatternLibrary>>>,
     /// Shared entity graph (learning feedback loop + post-login cloud pull).
     entity_graph:
-        Option<std::sync::Arc<std::sync::Mutex<mo_agent_runtime::pipeline::entity::EntityGraph>>>,
+        Option<std::sync::Arc<std::sync::Mutex<astra_runtime::pipeline::entity::EntityGraph>>>,
     /// Shared calibrator (learning feedback loop + post-login cloud pull).
     calibrator: Option<
         std::sync::Arc<
-            std::sync::Mutex<mo_agent_runtime::pipeline::calibration::ProgressiveCalibrator>,
+            std::sync::Mutex<astra_runtime::pipeline::calibration::ProgressiveCalibrator>,
         >,
     >,
     /// Skill registry for progressive loading and context injection.
@@ -518,14 +516,14 @@ struct ReplState {
     /// Active durable-task contract for plan execution verification.
     durable_task_state: Option<durable_bridge::DurableTaskState>,
     /// Last delivery report — kept after plan completion so `/report` works post-plan.
-    last_delivery_report: Option<mo_agent_services::durable_task::TaskDeliveryReport>,
+    last_delivery_report: Option<astra_services::durable_task::TaskDeliveryReport>,
     /// Stacked operator notes while plan execution is paused (`correct` / `note` at ⏸>).
     plan_execution_corrections: Vec<String>,
     /// Delegation engine for multi-agent coordination during plan execution.
     /// Constructed when plan execution starts and a durable contract is available;
     /// the verification gate is swapped per-subtask via `clone_with_gate`.
     delegation_engine:
-        Option<std::sync::Arc<mo_agent_runtime::server::delegation_engine::DelegationEngine>>,
+        Option<std::sync::Arc<astra_runtime::server::delegation_engine::DelegationEngine>>,
     /// Handle for communicating with a background plan executor.
     /// When Some, a plan is running in the background and the REPL can
     /// poll for updates via `plan_handle.try_recv()`.
@@ -598,7 +596,7 @@ impl Default for ReplState {
 // ═══════════════════════════════════════════════════════════ Resume ═══════
 
 async fn handle_resume_command(arg: &str, profile: Option<&str>, state: &mut ReplState) {
-    use mo_agent_services::session_restore::{HybridRestoreService, SessionRestoreService};
+    use astra_services::session_restore::{HybridRestoreService, SessionRestoreService};
 
     let user_id = state.ingestion_user_id.as_deref().unwrap_or("local");
     let svc = match &state.matrix_runtime {
@@ -619,13 +617,13 @@ async fn handle_resume_command(arg: &str, profile: Option<&str>, state: &mut Rep
         // Build merged map: session_id → RestoredSession (cloud wins on metadata)
         let mut merged: std::collections::HashMap<
             String,
-            mo_agent_services::session_restore::RestoredSession,
+            astra_services::session_restore::RestoredSession,
         > = std::collections::HashMap::new();
 
         // Insert local sessions first (lower priority)
         for sid in &local_ids {
             merged.entry(sid.clone()).or_insert_with(|| {
-                mo_agent_services::session_restore::RestoredSession {
+                astra_services::session_restore::RestoredSession {
                     session_id: sid.clone(),
                     turn_count: session_journal::count_turns(sid),
                     last_status: "local".to_string(),
@@ -683,7 +681,7 @@ async fn handle_resume_command(arg: &str, profile: Option<&str>, state: &mut Rep
         let mut items: Vec<SessionDisplay> = Vec::new();
         for (i, s) in sessions.iter().enumerate() {
             let peek = session_journal::peek_session_meta(&s.session_id);
-            let ws = mo_agent_services::session_workspace::read_workspace(&s.session_id).ok();
+            let ws = astra_services::session_workspace::read_workspace(&s.session_id).ok();
 
             // Title: cloud title > workspace summary > first prompt preview
             let title = s
@@ -864,20 +862,20 @@ async fn handle_resume_command(arg: &str, profile: Option<&str>, state: &mut Rep
 
             // Merge step checkpoint data if available (with migration support)
             let registry =
-                mo_agent_runtime::pipeline::step_protocol::MigrationRegistry::with_defaults();
+                astra_runtime::pipeline::step_protocol::MigrationRegistry::with_defaults();
             if let Ok(Some(step_restored)) =
-                mo_agent_runtime::pipeline::step_restore::restore_session_with_migrations(
+                astra_runtime::pipeline::step_restore::restore_session_with_migrations(
                     &restored.session_id,
                     &registry,
                 )
             {
                 let summary =
-                    mo_agent_runtime::pipeline::step_restore::restore_summary(&step_restored);
+                    astra_runtime::pipeline::step_restore::restore_summary(&step_restored);
                 // Merge blocked tools from checkpoint into health entries
                 for tool in &step_restored.blocked_tools {
                     if !state.tool_health_entries.iter().any(|e| e.name == *tool) {
                         state.tool_health_entries.push(
-                            mo_agent_runtime::pipeline::persistence::ToolHealthEntry {
+                            astra_runtime::pipeline::persistence::ToolHealthEntry {
                                 name: tool.clone(),
                                 total_calls: 3,
                                 total_failures: 3,
@@ -892,7 +890,7 @@ async fn handle_resume_command(arg: &str, profile: Option<&str>, state: &mut Rep
                 }
                 eprintln!("  {} {}", "↻".cyan(), summary.dim());
             } else if let Ok(Some(heavy)) =
-                mo_agent_runtime::pipeline::step_checkpoint::read_latest_heavy_checkpoint(
+                astra_runtime::pipeline::step_checkpoint::read_latest_heavy_checkpoint(
                     &restored.session_id,
                 )
             {
@@ -904,7 +902,7 @@ async fn handle_resume_command(arg: &str, profile: Option<&str>, state: &mut Rep
                 // Cloud fallback: pull heavy checkpoint from MatrixOne
                 // (different device, local files not available)
                 let pool = mc.shared_pool().get();
-                match mo_agent_services::session_restore::pull_step_checkpoint_from_cloud(
+                match astra_services::session_restore::pull_step_checkpoint_from_cloud(
                     pool,
                     &restored.session_id,
                 )
@@ -912,18 +910,16 @@ async fn handle_resume_command(arg: &str, profile: Option<&str>, state: &mut Rep
                 {
                     Ok(Some(state_json)) => {
                         match serde_json::from_str::<
-                            mo_agent_runtime::pipeline::step_protocol::StepCheckpoint,
+                            astra_runtime::pipeline::step_protocol::StepCheckpoint,
                         >(&state_json)
                         {
-                            Ok(
-                                mo_agent_runtime::pipeline::step_protocol::StepCheckpoint::Heavy(
-                                    heavy,
-                                ),
-                            ) => {
+                            Ok(astra_runtime::pipeline::step_protocol::StepCheckpoint::Heavy(
+                                heavy,
+                            )) => {
                                 for tool in &heavy.blocked_tools {
                                     if !state.tool_health_entries.iter().any(|e| e.name == *tool) {
                                         state.tool_health_entries.push(
-                                            mo_agent_runtime::pipeline::persistence::ToolHealthEntry {
+                                            astra_runtime::pipeline::persistence::ToolHealthEntry {
                                                 name: tool.clone(),
                                                 total_calls: 3,
                                                 total_failures: 3,
@@ -1024,11 +1020,10 @@ async fn handle_resume_command(arg: &str, profile: Option<&str>, state: &mut Rep
 
             // Restore durable task contract if present
             if let Some(ref json) = restored.contract_json
-                && let Ok(contract) = serde_json::from_str::<mo_agent_services::TaskContract>(json)
+                && let Ok(contract) = serde_json::from_str::<astra_services::TaskContract>(json)
             {
                 let work_dir = std::env::current_dir().unwrap_or_default();
-                let session_dir =
-                    mo_agent_services::session_workspace::workspace_dir_for(&session_id);
+                let session_dir = astra_services::session_workspace::workspace_dir_for(&session_id);
                 let lifecycle = durable_bridge::create_local_lifecycle_full(
                     &session_dir,
                     &work_dir,
@@ -1043,8 +1038,7 @@ async fn handle_resume_command(arg: &str, profile: Option<&str>, state: &mut Rep
                         .as_ref()
                         .and_then(|mc| mc.create_cloud_llm_judge())
                         .map(|j| {
-                            std::sync::Arc::new(j)
-                                as std::sync::Arc<dyn mo_agent_services::LlmJudge>
+                            std::sync::Arc::new(j) as std::sync::Arc<dyn astra_services::LlmJudge>
                         }),
                     build_learning_bridge(state),
                 );
@@ -1142,7 +1136,7 @@ async fn handle_resume_command(arg: &str, profile: Option<&str>, state: &mut Rep
 // ═══════════════════════════════════════════════════════ Stats ════════════
 
 fn handle_stats_command(arg: &str, state: &ReplState) {
-    use mo_agent_services::session_analytics;
+    use astra_services::session_analytics;
 
     match arg {
         "history" => {
@@ -1272,7 +1266,7 @@ fn handle_stats_command(arg: &str, state: &ReplState) {
 // ═══════════════════════════════════════════════ Tool Profile ═════════════
 
 fn handle_tools_command(state: &ReplState) {
-    use mo_agent_services::session_analytics;
+    use astra_services::session_analytics;
 
     let sid = match &state.session_id {
         Some(s) => s.clone(),
@@ -1333,7 +1327,7 @@ fn handle_tools_command(state: &ReplState) {
 }
 
 async fn handle_health_command(arg: &str, state: &ReplState) {
-    use mo_agent_runtime::turn::tool_health::ToolHealthTracker;
+    use astra_runtime::turn::tool_health::ToolHealthTracker;
 
     let detail = arg.trim() == "detail";
 
@@ -1482,10 +1476,10 @@ async fn handle_health_command(arg: &str, state: &ReplState) {
             eprintln!("  {}", "Set MATRIXONE_HOST to enable cloud sync.".dim());
         }
         Some(mc) => {
-            let svc = mo_agent_services::state_sync::MatrixOneSyncService::new(
+            let svc = astra_services::state_sync::MatrixOneSyncService::new(
                 mc.shared_pool().get().clone(),
             );
-            let sync_status = mo_agent_services::state_sync::StateSyncService::status(&svc).await;
+            let sync_status = astra_services::state_sync::StateSyncService::status(&svc).await;
             display_sync_status(&sync_status);
         }
     }
@@ -1498,7 +1492,7 @@ async fn handle_health_command(arg: &str, state: &ReplState) {
 }
 
 /// Render cloud sync status section.
-fn display_sync_status(status: &mo_agent_services::SyncStatus) {
+fn display_sync_status(status: &astra_services::SyncStatus) {
     // Connection confirmed — show details
     let overall = if status.last_error.is_some() {
         "⚠ Error".yellow().to_string()
@@ -1644,12 +1638,12 @@ async fn handle_sync_command(arg: &str, state: &ReplState) {
     domains.sort_by_key(|(d, _)| format!("{d}"));
     for (domain, sync_state) in &domains {
         let state_str = match sync_state {
-            mo_agent_services::SyncState::Clean => "✓ clean".green().to_string(),
-            mo_agent_services::SyncState::Dirty => "● dirty".yellow().to_string(),
-            mo_agent_services::SyncState::Syncing => "↻ syncing".cyan().to_string(),
-            mo_agent_services::SyncState::Pulling => "↓ pulling".cyan().to_string(),
-            mo_agent_services::SyncState::Conflict { .. } => "⚠ conflict".red().to_string(),
-            mo_agent_services::SyncState::Error { retry_count, .. } => {
+            astra_services::SyncState::Clean => "✓ clean".green().to_string(),
+            astra_services::SyncState::Dirty => "● dirty".yellow().to_string(),
+            astra_services::SyncState::Syncing => "↻ syncing".cyan().to_string(),
+            astra_services::SyncState::Pulling => "↓ pulling".cyan().to_string(),
+            astra_services::SyncState::Conflict { .. } => "⚠ conflict".red().to_string(),
+            astra_services::SyncState::Error { retry_count, .. } => {
                 format!("✗ error({})", retry_count).red().to_string()
             }
         };
@@ -1917,7 +1911,7 @@ async fn handle_sync_pull(state: &ReplState) {
 
 /// Handle `/learn` command — show learning insights, drift detection, exploration.
 fn handle_learn_command(arg: &str, state: &ReplState) {
-    use mo_agent_runtime::pipeline::pattern::ExplorationReason;
+    use astra_runtime::pipeline::pattern::ExplorationReason;
 
     let lib = match &state.pattern_library {
         Some(pl) => pl.lock().unwrap(),
@@ -2098,12 +2092,12 @@ fn format_bytes(bytes: u64) -> String {
 /// pattern_library, calibrator) are not yet initialized.
 fn build_learning_bridge(
     state: &ReplState,
-) -> Option<std::sync::Arc<dyn mo_agent_services::TaskLearningBridge>> {
+) -> Option<std::sync::Arc<dyn astra_services::TaskLearningBridge>> {
     let eg = state.entity_graph.as_ref()?;
     let pl = state.pattern_library.as_ref()?;
     let cal = state.calibrator.as_ref()?;
     let mut bridge =
-        mo_agent_runtime::pipeline::task_learning::PipelineTaskLearningBridge::from_shared(
+        astra_runtime::pipeline::task_learning::PipelineTaskLearningBridge::from_shared(
             eg.clone(),
             pl.clone(),
             cal.clone(),
@@ -2218,7 +2212,7 @@ pub(crate) fn format_duration_short(d: std::time::Duration) -> String {
 /// executor.  On success `state.executing_plan` will be `None`.
 fn take_plan_context(
     state: &mut ReplState,
-    api: &mo_thin_client::ThinClient,
+    api: &astra_thin_client::ThinClient,
     current_token: Option<&str>,
     profile: Option<&str>,
 ) -> Result<plan_executor::BackgroundPlanContext, String> {
@@ -2268,7 +2262,7 @@ fn create_background_selector() -> Box<dyn tool_selector::ToolSelector> {
 async fn start_and_monitor_background_plan(
     state: &mut ReplState,
     current_token: Option<&str>,
-    api: &mo_thin_client::ThinClient,
+    api: &astra_thin_client::ThinClient,
     profile: Option<&str>,
 ) -> Result<(), String> {
     // ── Generate durable contract if not already present ─────────
@@ -2311,7 +2305,7 @@ async fn ensure_durable_task_state(state: &mut ReplState) {
     let session_dir = state
         .session_id
         .as_ref()
-        .map(|sid| mo_agent_services::session_workspace::workspace_dir_for(sid))
+        .map(|sid| astra_services::session_workspace::workspace_dir_for(sid))
         .unwrap_or_else(|| work_dir.join(".mo-session"));
     let lifecycle = durable_bridge::create_local_lifecycle_full(
         &session_dir,
@@ -2326,7 +2320,7 @@ async fn ensure_durable_task_state(state: &mut ReplState) {
             .matrix_runtime
             .as_ref()
             .and_then(|mc| mc.create_cloud_llm_judge())
-            .map(|j| std::sync::Arc::new(j) as std::sync::Arc<dyn mo_agent_services::LlmJudge>),
+            .map(|j| std::sync::Arc::new(j) as std::sync::Arc<dyn astra_services::LlmJudge>),
         build_learning_bridge(state),
     );
 
@@ -2343,23 +2337,18 @@ async fn ensure_durable_task_state(state: &mut ReplState) {
         // Construct a delegation engine for plan execution with verification gates.
         if state.delegation_engine.is_none() {
             let registry = std::sync::Arc::new(tokio::sync::RwLock::new(
-                mo_agent_services::AgentProfileRegistry::new(),
+                astra_services::AgentProfileRegistry::new(),
             ));
             let run_store =
-                std::sync::Arc::new(mo_agent_services::runs::InMemoryRunStateStore::default());
-            let engine =
-                mo_agent_runtime::server::delegation_engine::DelegationEngine::with_executor(
-                    registry,
-                    std::sync::Arc::new(mo_agent_runtime::server::run_engine::RunEngine::new(
-                        run_store,
-                    )),
-                    std::sync::Arc::new(
-                        mo_agent_runtime::server::delegation_engine::DelegationTracker::new(),
-                    ),
-                    std::sync::Arc::new(
-                        mo_agent_runtime::server::delegation_engine::StubSubRunExecutor,
-                    ),
-                );
+                std::sync::Arc::new(astra_services::runs::InMemoryRunStateStore::default());
+            let engine = astra_runtime::server::delegation_engine::DelegationEngine::with_executor(
+                registry,
+                std::sync::Arc::new(astra_runtime::server::run_engine::RunEngine::new(run_store)),
+                std::sync::Arc::new(
+                    astra_runtime::server::delegation_engine::DelegationTracker::new(),
+                ),
+                std::sync::Arc::new(astra_runtime::server::delegation_engine::StubSubRunExecutor),
+            );
             state.delegation_engine = Some(std::sync::Arc::new(engine));
         }
     }
@@ -2592,7 +2581,7 @@ fn display_plan_updates_live(
 async fn run_plan_execution(
     state: &mut ReplState,
     current_token: Option<&str>,
-    api: &mo_thin_client::ThinClient,
+    api: &astra_thin_client::ThinClient,
     profile: Option<&str>,
     selector: &dyn tool_selector::ToolSelector,
 ) -> Result<(), String> {
@@ -2611,12 +2600,12 @@ async fn run_plan_execution(
 async fn run_plan_execution_with_sink(
     state: &mut ReplState,
     current_token: Option<&str>,
-    api: &mo_thin_client::ThinClient,
+    api: &astra_thin_client::ThinClient,
     profile: Option<&str>,
     selector: &dyn tool_selector::ToolSelector,
     sink: &dyn plan_executor::PlanOutputSink,
 ) -> Result<(), String> {
-    use mo_agent_services::task_orchestrator::TaskStatus;
+    use astra_services::task_orchestrator::TaskStatus;
 
     // ─── Plan execution timing & progress tracking ───────────────────────────
     let plan_start = std::time::Instant::now();
@@ -2668,7 +2657,7 @@ async fn run_plan_execution_with_sink(
                     durable_bridge::subtask_verification_json(durable, st_id)
                 && let Some(ref mut j) = state.journal
             {
-                let evt = mo_agent_services::session_journal::JournalEvent::verification_completed(
+                let evt = astra_services::session_journal::JournalEvent::verification_completed(
                     state.session_id.as_deref(),
                     state.turn,
                     st_id,
@@ -2716,7 +2705,7 @@ async fn run_plan_execution_with_sink(
             && let (Some(sid), Some(durable)) =
                 (state.session_id.as_deref(), &state.durable_task_state)
         {
-            let cp = mo_agent_services::session_checkpoint::Checkpoint {
+            let cp = astra_services::session_checkpoint::Checkpoint {
                 number: 0, // placeholder — will be overwritten by write_checkpoint
                 turn: state.turn,
                 title: format!("Verification checkpoint (turn {})", state.turn),
@@ -2730,7 +2719,7 @@ async fn run_plan_execution_with_sink(
                 error_count: 0,
                 contract_state_json: serde_json::to_string(&durable.contract).ok(),
             };
-            let _ = mo_agent_services::session_checkpoint::write_checkpoint(sid, &cp);
+            let _ = astra_services::session_checkpoint::write_checkpoint(sid, &cp);
         }
 
         // Analyze parallelism for the current state
@@ -2764,7 +2753,7 @@ async fn run_plan_execution_with_sink(
                     });
                     if let Some(ref mut j) = state.journal {
                         let evt =
-                            mo_agent_services::session_journal::JournalEvent::verification_completed(
+                            astra_services::session_journal::JournalEvent::verification_completed(
                                 state.session_id.as_deref(),
                                 state.turn,
                                 "",
@@ -2786,7 +2775,7 @@ async fn run_plan_execution_with_sink(
 
                 // Journal: plan complete
                 if let Some(ref mut j) = state.journal {
-                    let evt = mo_agent_services::session_journal::JournalEvent::plan_progress(
+                    let evt = astra_services::session_journal::JournalEvent::plan_progress(
                         state.session_id.as_deref(),
                         state.turn,
                         "",
@@ -3020,7 +3009,7 @@ async fn run_plan_execution_with_sink(
 
             // Journal: subtask started
             if let Some(ref mut j) = state.journal {
-                let evt = mo_agent_services::session_journal::JournalEvent::plan_progress(
+                let evt = astra_services::session_journal::JournalEvent::plan_progress(
                     state.session_id.as_deref(),
                     state.turn,
                     next_id,
@@ -3100,15 +3089,14 @@ async fn run_plan_execution_with_sink(
                         durable_bridge::subtask_verification_json(durable, next_id)
                     && let Some(ref mut j) = state.journal
                 {
-                    let evt =
-                        mo_agent_services::session_journal::JournalEvent::verification_completed(
-                            state.session_id.as_deref(),
-                            state.turn,
-                            next_id,
-                            "subtask",
-                            verification_passed,
-                            &results_json,
-                        );
+                    let evt = astra_services::session_journal::JournalEvent::verification_completed(
+                        state.session_id.as_deref(),
+                        state.turn,
+                        next_id,
+                        "subtask",
+                        verification_passed,
+                        &results_json,
+                    );
                     let _ = j.append(&evt);
                     repl_turn::enqueue_ingestion_pub(state, &evt);
                 }
@@ -3147,7 +3135,7 @@ async fn run_plan_execution_with_sink(
                     "verification_failed"
                 };
                 if let Some(ref mut j) = state.journal {
-                    let evt = mo_agent_services::session_journal::JournalEvent::plan_progress(
+                    let evt = astra_services::session_journal::JournalEvent::plan_progress(
                         state.session_id.as_deref(),
                         state.turn,
                         next_id,
@@ -3175,22 +3163,20 @@ async fn run_plan_execution_with_sink(
 
 fn merge_learning_snapshot(
     json: &str,
-    entity_graph: &std::sync::Arc<
-        std::sync::Mutex<mo_agent_runtime::pipeline::entity::EntityGraph>,
-    >,
+    entity_graph: &std::sync::Arc<std::sync::Mutex<astra_runtime::pipeline::entity::EntityGraph>>,
     pattern_library: &std::sync::Arc<
-        std::sync::Mutex<mo_agent_runtime::pipeline::pattern::PatternLibrary>,
+        std::sync::Mutex<astra_runtime::pipeline::pattern::PatternLibrary>,
     >,
     calibrator: &std::sync::Arc<
-        std::sync::Mutex<mo_agent_runtime::pipeline::calibration::ProgressiveCalibrator>,
+        std::sync::Mutex<astra_runtime::pipeline::calibration::ProgressiveCalibrator>,
     >,
 ) {
     if json.trim().is_empty() {
         return;
     }
-    match serde_json::from_str::<mo_agent_runtime::pipeline::persistence::LearningSnapshot>(json) {
+    match serde_json::from_str::<astra_runtime::pipeline::persistence::LearningSnapshot>(json) {
         Ok(snapshot) => {
-            mo_agent_runtime::pipeline::persistence::merge_into_modules(
+            astra_runtime::pipeline::persistence::merge_into_modules(
                 &snapshot,
                 entity_graph,
                 pattern_library,
@@ -3219,7 +3205,7 @@ fn merge_learning_snapshot(
 
 /// Result from cloud pull including tool health and version for optimistic locking.
 struct CloudPullResult {
-    tool_health: Vec<mo_agent_runtime::pipeline::persistence::ToolHealthEntry>,
+    tool_health: Vec<astra_runtime::pipeline::persistence::ToolHealthEntry>,
     version: Option<i64>,
     /// True when MatrixOne was reachable and versioned pull was attempted (may return no row).
     cloud_reachable: bool,
@@ -3230,14 +3216,12 @@ struct CloudPullResult {
 /// Returns tool health entries and cloud version for optimistic locking.
 async fn try_cloud_pull(
     profile_name: &str,
-    entity_graph: &std::sync::Arc<
-        std::sync::Mutex<mo_agent_runtime::pipeline::entity::EntityGraph>,
-    >,
+    entity_graph: &std::sync::Arc<std::sync::Mutex<astra_runtime::pipeline::entity::EntityGraph>>,
     pattern_library: &std::sync::Arc<
-        std::sync::Mutex<mo_agent_runtime::pipeline::pattern::PatternLibrary>,
+        std::sync::Mutex<astra_runtime::pipeline::pattern::PatternLibrary>,
     >,
     calibrator: &std::sync::Arc<
-        std::sync::Mutex<mo_agent_runtime::pipeline::calibration::ProgressiveCalibrator>,
+        std::sync::Mutex<astra_runtime::pipeline::calibration::ProgressiveCalibrator>,
     >,
 ) -> CloudPullResult {
     let pool = match try_connect_matrixone().await {
@@ -3250,9 +3234,9 @@ async fn try_cloud_pull(
             };
         }
     };
-    let svc = mo_agent_services::state_sync::MatrixOneSyncService::new(pool);
+    let svc = astra_services::state_sync::MatrixOneSyncService::new(pool);
     let user_id = std::env::var("MO_USER_ID").unwrap_or_else(|_| "local".to_string());
-    match mo_agent_services::state_sync::StateSyncService::pull_learning_versioned(
+    match astra_services::state_sync::StateSyncService::pull_learning_versioned(
         &svc,
         &user_id,
         profile_name,
@@ -3262,7 +3246,7 @@ async fn try_cloud_pull(
         Ok(Some(versioned)) => {
             // Parse snapshot to extract tool health before merging entities/patterns
             let cloud_health = serde_json::from_str::<
-                mo_agent_runtime::pipeline::persistence::LearningSnapshot,
+                astra_runtime::pipeline::persistence::LearningSnapshot,
             >(&versioned.json)
             .map(|s| s.tool_health)
             .unwrap_or_default();
@@ -3298,23 +3282,21 @@ async fn try_cloud_pull(
 /// On conflict, the caller should pull fresh data and retry.
 async fn try_cloud_push_versioned(
     profile_name: &str,
-    entity_graph: &std::sync::Arc<
-        std::sync::Mutex<mo_agent_runtime::pipeline::entity::EntityGraph>,
-    >,
+    entity_graph: &std::sync::Arc<std::sync::Mutex<astra_runtime::pipeline::entity::EntityGraph>>,
     pattern_library: &std::sync::Arc<
-        std::sync::Mutex<mo_agent_runtime::pipeline::pattern::PatternLibrary>,
+        std::sync::Mutex<astra_runtime::pipeline::pattern::PatternLibrary>,
     >,
     calibrator: &std::sync::Arc<
-        std::sync::Mutex<mo_agent_runtime::pipeline::calibration::ProgressiveCalibrator>,
+        std::sync::Mutex<astra_runtime::pipeline::calibration::ProgressiveCalibrator>,
     >,
-    tool_health: &[mo_agent_runtime::pipeline::persistence::ToolHealthEntry],
+    tool_health: &[astra_runtime::pipeline::persistence::ToolHealthEntry],
     expected_version: Option<i64>,
 ) -> Option<i64> {
     let pool = match try_connect_matrixone().await {
         Some(p) => p,
         None => return None,
     };
-    let snapshot = mo_agent_runtime::pipeline::persistence::export_from_modules_with_health(
+    let snapshot = astra_runtime::pipeline::persistence::export_from_modules_with_health(
         entity_graph,
         pattern_library,
         calibrator,
@@ -3324,9 +3306,9 @@ async fn try_cloud_push_versioned(
         Ok(j) => j,
         Err(_) => return None,
     };
-    let svc = mo_agent_services::state_sync::MatrixOneSyncService::new(pool);
+    let svc = astra_services::state_sync::MatrixOneSyncService::new(pool);
     let user_id = std::env::var("MO_USER_ID").unwrap_or_else(|_| "local".to_string());
-    let result = mo_agent_services::state_sync::StateSyncService::push_learning_versioned(
+    let result = astra_services::state_sync::StateSyncService::push_learning_versioned(
         &svc,
         &user_id,
         profile_name,
@@ -3347,10 +3329,9 @@ async fn try_cloud_push_versioned(
     }
 
     if result.success {
-        if let Err(e) = mo_agent_runtime::pipeline::persistence::save_synced_tool_health(
-            profile_name,
-            tool_health,
-        ) {
+        if let Err(e) =
+            astra_runtime::pipeline::persistence::save_synced_tool_health(profile_name, tool_health)
+        {
             eprintln!(
                 "{}",
                 format!("  ⚠ Tool-health sync metadata not saved: {e}").dim()
@@ -3376,25 +3357,23 @@ async fn try_cloud_push_versioned(
 /// Returns the new cloud version if successful, None otherwise.
 async fn try_cloud_push_delta(
     profile_name: &str,
-    entity_graph: &std::sync::Arc<
-        std::sync::Mutex<mo_agent_runtime::pipeline::entity::EntityGraph>,
-    >,
+    entity_graph: &std::sync::Arc<std::sync::Mutex<astra_runtime::pipeline::entity::EntityGraph>>,
     pattern_library: &std::sync::Arc<
-        std::sync::Mutex<mo_agent_runtime::pipeline::pattern::PatternLibrary>,
+        std::sync::Mutex<astra_runtime::pipeline::pattern::PatternLibrary>,
     >,
     calibrator: &std::sync::Arc<
-        std::sync::Mutex<mo_agent_runtime::pipeline::calibration::ProgressiveCalibrator>,
+        std::sync::Mutex<astra_runtime::pipeline::calibration::ProgressiveCalibrator>,
     >,
-    tool_health_entries: &[mo_agent_runtime::pipeline::persistence::ToolHealthEntry],
-    synced_tool_health_entries: &mut Vec<mo_agent_runtime::pipeline::persistence::ToolHealthEntry>,
+    tool_health_entries: &[astra_runtime::pipeline::persistence::ToolHealthEntry],
+    synced_tool_health_entries: &mut Vec<astra_runtime::pipeline::persistence::ToolHealthEntry>,
     expected_version: Option<i64>,
 ) -> Option<i64> {
-    let learning_dirty = mo_agent_runtime::pipeline::persistence::has_dirty_learning_data(
+    let learning_dirty = astra_runtime::pipeline::persistence::has_dirty_learning_data(
         entity_graph,
         pattern_library,
         calibrator,
     );
-    let tool_health_deltas = mo_agent_runtime::pipeline::persistence::export_tool_health_delta(
+    let tool_health_deltas = astra_runtime::pipeline::persistence::export_tool_health_delta(
         tool_health_entries,
         synced_tool_health_entries,
     );
@@ -3403,12 +3382,12 @@ async fn try_cloud_push_delta(
         return expected_version;
     }
 
-    let mut delta = mo_agent_runtime::pipeline::persistence::export_dirty_learning_from_modules(
+    let mut delta = astra_runtime::pipeline::persistence::export_dirty_learning_from_modules(
         entity_graph,
         pattern_library,
         calibrator,
     )
-    .unwrap_or(mo_agent_runtime::pipeline::persistence::DeltaSnapshot {
+    .unwrap_or(astra_runtime::pipeline::persistence::DeltaSnapshot {
         baseline_epoch: 0,
         entity_deltas: Vec::new(),
         pattern_deltas: Vec::new(),
@@ -3430,10 +3409,10 @@ async fn try_cloud_push_delta(
         None => return None,
     };
 
-    let svc = mo_agent_services::state_sync::MatrixOneSyncService::new(pool);
+    let svc = astra_services::state_sync::MatrixOneSyncService::new(pool);
     let user_id = std::env::var("MO_USER_ID").unwrap_or_else(|_| "local".to_string());
 
-    let result = mo_agent_services::state_sync::StateSyncService::push_delta(
+    let result = astra_services::state_sync::StateSyncService::push_delta(
         &svc,
         &user_id,
         profile_name,
@@ -3451,13 +3430,13 @@ async fn try_cloud_push_delta(
     }
 
     if result.success {
-        mo_agent_runtime::pipeline::persistence::clear_dirty_learning_in_modules(
+        astra_runtime::pipeline::persistence::clear_dirty_learning_in_modules(
             entity_graph,
             pattern_library,
             calibrator,
         );
         *synced_tool_health_entries = tool_health_entries.to_vec();
-        if let Err(e) = mo_agent_runtime::pipeline::persistence::save_synced_tool_health(
+        if let Err(e) = astra_runtime::pipeline::persistence::save_synced_tool_health(
             profile_name,
             synced_tool_health_entries,
         ) {
@@ -3500,13 +3479,11 @@ async fn try_cloud_pull_preferences(state: &mut ReplState) -> Vec<String> {
         Some(p) => p,
         None => return Vec::new(),
     };
-    let svc = mo_agent_services::state_sync::MatrixOneSyncService::new(pool);
+    let svc = astra_services::state_sync::MatrixOneSyncService::new(pool);
     let user_id = std::env::var("MO_USER_ID").unwrap_or_else(|_| "local".to_string());
-    match mo_agent_services::state_sync::StateSyncService::pull_all_preferences(&svc, &user_id)
-        .await
-    {
+    match astra_services::state_sync::StateSyncService::pull_all_preferences(&svc, &user_id).await {
         Ok(prefs) if !prefs.is_empty() => {
-            use mo_agent_services::state_sync::pref_keys;
+            use astra_services::state_sync::pref_keys;
             let keys: Vec<String> = prefs.iter().map(|(k, _)| k.clone()).collect();
             for (key, value) in &prefs {
                 match key.as_str() {
@@ -3528,7 +3505,7 @@ async fn try_cloud_pull_preferences(state: &mut ReplState) -> Vec<String> {
                             for tool_name in tools {
                                 if !existing.contains(&tool_name) {
                                     state.tool_health_entries.push(
-                                        mo_agent_runtime::pipeline::persistence::ToolHealthEntry {
+                                        astra_runtime::pipeline::persistence::ToolHealthEntry {
                                             name: tool_name,
                                             total_calls: 3,
                                             total_failures: 3,
@@ -3632,7 +3609,7 @@ pub(crate) async fn post_auth_cloud_resync(profile: Option<&str>, state: &mut Re
     let pull = try_cloud_pull(profile_name, eg, pl, cal).await;
     state.cloud_learning_version = pull.version.or(state.cloud_learning_version);
     if !pull.tool_health.is_empty() {
-        let (merged, _, _) = mo_agent_runtime::pipeline::persistence::merge_tool_health(
+        let (merged, _, _) = astra_runtime::pipeline::persistence::merge_tool_health(
             &state.tool_health_entries,
             &pull.tool_health,
         );
@@ -3648,9 +3625,9 @@ async fn try_cloud_push_preferences(state: &ReplState) {
         Some(p) => p,
         None => return,
     };
-    let svc = mo_agent_services::state_sync::MatrixOneSyncService::new(pool);
+    let svc = astra_services::state_sync::MatrixOneSyncService::new(pool);
     let user_id = std::env::var("MO_USER_ID").unwrap_or_else(|_| "local".to_string());
-    use mo_agent_services::state_sync::{StateSyncService, pref_keys};
+    use astra_services::state_sync::{StateSyncService, pref_keys};
 
     // Collect blocked/deprioritized tools from health entries
     let blocked: Vec<String> = state
@@ -3699,7 +3676,7 @@ async fn try_connect_matrixone() -> Option<sqlx::Pool<sqlx::MySql>> {
 // ═══════════════════════════════════════════════════════ Task Commands ════
 
 async fn handle_task_command(arg: &str, state: &mut ReplState) {
-    use mo_agent_services::{TaskCreateRequest, TaskService, TaskStatus};
+    use astra_services::{TaskCreateRequest, TaskService, TaskStatus};
 
     let svc = match &state.task_service {
         Some(s) => s.clone(),
@@ -3858,7 +3835,7 @@ async fn handle_task_command(arg: &str, state: &mut ReplState) {
 
 /// Find a task by prefix match on task_id or substring match on title.
 async fn find_task_by_query(
-    svc: &dyn mo_agent_services::TaskService,
+    svc: &dyn astra_services::TaskService,
     user_id: &str,
     query: &str,
 ) -> Result<Option<String>, String> {
@@ -3886,7 +3863,7 @@ async fn find_task_by_query(
 /// Returns `true` when the REPL should exit.
 async fn handle_slash_command(
     line: &str,
-    api: &mo_thin_client::ThinClient,
+    api: &astra_thin_client::ThinClient,
     profile: Option<&str>,
     state: &mut ReplState,
     token: Option<&str>,
@@ -4114,7 +4091,7 @@ async fn handle_slash_command(
 // ═══════════════════════════════════════════════════════════════ REPL ════
 
 async fn run_chat_repl(
-    api: &mo_thin_client::ThinClient,
+    api: &astra_thin_client::ThinClient,
     profile: Option<&str>,
     initial_model: Option<&str>,
 ) -> Result<(), String> {
@@ -4135,9 +4112,8 @@ async fn run_chat_repl(
         tool_registry::ToolQualityTracker::new(),
     ));
     // Session-scoped confidence calibrator: thresholds adapt to correction rates
-    let confidence_calibrator = std::sync::Arc::new(
-        mo_agent_runtime::turn::routing_metrics::ConfidenceCalibrator::default(),
-    );
+    let confidence_calibrator =
+        std::sync::Arc::new(astra_runtime::turn::routing_metrics::ConfidenceCalibrator::default());
     let (selector, pipeline_modules) = create_tool_selector_with_quality(
         api,
         profile,
@@ -4148,7 +4124,7 @@ async fn run_chat_repl(
     // Load cross-session learning state (entity graph, patterns, calibration, tool health)
     let profile_name = profile.unwrap_or("default");
     let (cross_session_health_entries, cloud_pull_result, pref_keys_after_pull) = {
-        let loaded = mo_agent_runtime::pipeline::persistence::load_learning_state(
+        let loaded = astra_runtime::pipeline::persistence::load_learning_state(
             profile_name,
             &pipeline_modules.entity_graph,
             &pipeline_modules.pattern_library,
@@ -4159,9 +4135,9 @@ async fn run_chat_repl(
         }
         // Load tool health for cross-session error budgets
         let mut cross_session_health_entries =
-            mo_agent_runtime::pipeline::persistence::load_tool_health(profile_name);
+            astra_runtime::pipeline::persistence::load_tool_health(profile_name);
         state.synced_tool_health_entries =
-            mo_agent_runtime::pipeline::persistence::load_synced_tool_health(profile_name);
+            astra_runtime::pipeline::persistence::load_synced_tool_health(profile_name);
         if !cross_session_health_entries.is_empty() {
             eprintln!(
                 "{}",
@@ -4185,7 +4161,7 @@ async fn run_chat_repl(
         // Merge cloud tool health: timestamp-based conflict resolution
         if !cloud_pull_result.tool_health.is_empty() {
             let (merged, cloud_wins, cloud_only) =
-                mo_agent_runtime::pipeline::persistence::merge_tool_health(
+                astra_runtime::pipeline::persistence::merge_tool_health(
                     &cross_session_health_entries,
                     &cloud_pull_result.tool_health,
                 );
@@ -4215,15 +4191,15 @@ async fn run_chat_repl(
 
     // ── Matrix pool + ingestion + sync orchestrator (single bundle) ─────────
     {
-        let settings = mo_agent_runtime::matrix_settings_from_env();
+        let settings = astra_runtime::matrix_settings_from_env();
         state.matrix_runtime = match SharedPool::new(&settings).await {
             Ok(pool) => {
                 let user_id = std::env::var("MO_USER_ID").unwrap_or_else(|_| "local".to_string());
                 let th =
                     std::sync::Arc::new(std::sync::Mutex::new(state.tool_health_entries.clone()));
-                let lease = std::sync::Arc::new(mo_agent_services::TaskLeaseHoldCache::default());
+                let lease = std::sync::Arc::new(astra_services::TaskLeaseHoldCache::default());
                 Some(std::sync::Arc::new(
-                    mo_agent_runtime::MatrixCloudRuntime::attach(
+                    astra_runtime::MatrixCloudRuntime::attach(
                         pool,
                         profile.unwrap_or("default"),
                         &user_id,
@@ -4582,9 +4558,9 @@ async fn run_chat_repl(
                     // to prevent data loss on crash (every CHECKPOINT_INTERVAL turns)
                     if state.matrix_runtime.is_some()
                         && state.turn > 0
-                        && state.turn.is_multiple_of(
-                            mo_agent_services::session_checkpoint::CHECKPOINT_INTERVAL,
-                        )
+                        && state
+                            .turn
+                            .is_multiple_of(astra_services::session_checkpoint::CHECKPOINT_INTERVAL)
                     {
                         // Use delta push at checkpoints to reduce sync bandwidth.
                         // Final session-end sync still uses full push for convergence.
@@ -4604,13 +4580,10 @@ async fn run_chat_repl(
                             if let Some(ref mc) = state.matrix_runtime {
                                 let orch = mc.sync_orchestrator_lock().await;
                                 if let Some(mut env) =
-                                    orch.envelope(mo_agent_services::SyncDomain::Learning)
+                                    orch.envelope(astra_services::SyncDomain::Learning)
                                 {
                                     env.mark_synced(new_version as u64);
-                                    orch.update_envelope(
-                                        mo_agent_services::SyncDomain::Learning,
-                                        env,
-                                    );
+                                    orch.update_envelope(astra_services::SyncDomain::Learning, env);
                                 }
                             }
                         }
@@ -4678,7 +4651,7 @@ async fn run_chat_repl(
     // Save cross-session learning state (including tool health)
     {
         let profile_name = profile.unwrap_or("default");
-        if let Err(e) = mo_agent_runtime::pipeline::persistence::save_learning_state_with_health(
+        if let Err(e) = astra_runtime::pipeline::persistence::save_learning_state_with_health(
             profile_name,
             &pipeline_modules.entity_graph,
             &pipeline_modules.pattern_library,
@@ -4722,7 +4695,7 @@ async fn run_chat_repl(
                 expected_version = pull_result.version;
                 // Merge tool health from cloud pull
                 if !pull_result.tool_health.is_empty() {
-                    let (merged, _, _) = mo_agent_runtime::pipeline::persistence::merge_tool_health(
+                    let (merged, _, _) = astra_runtime::pipeline::persistence::merge_tool_health(
                         &state.tool_health_entries,
                         &pull_result.tool_health,
                     );
@@ -4750,7 +4723,7 @@ async fn main() {
     dotenvy::dotenv().ok();
     let cli = Cli::parse();
     let base = cli.api_url.trim_end_matches('/').to_string();
-    let api = mo_thin_client::ThinClient::new(&base, None).expect("valid API URL");
+    let api = astra_thin_client::ThinClient::new(&base, None).expect("valid API URL");
 
     // Set MEMORIA_API_KEY from credentials if not already set
     if std::env::var("MEMORIA_API_KEY").is_err() {
@@ -4913,8 +4886,8 @@ mod tests {
 
     #[tokio::test]
     async fn slash_explain_toggles_state() {
-        let api =
-            mo_thin_client::ThinClient::new("http://127.0.0.1:8000", None).expect("test API URL");
+        let api = astra_thin_client::ThinClient::new("http://127.0.0.1:8000", None)
+            .expect("test API URL");
         let mut state = ReplState::default();
         let selector = tool_selector::TfIdfSelector::new(tool_registry::ToolRegistry::new(
             edge_tools::all_tool_schemas(),
@@ -5106,7 +5079,7 @@ mod tests {
             }),
         );
         let base = spawn_mock(app).await;
-        let api = mo_thin_client::ThinClient::new(&base, None).unwrap();
+        let api = astra_thin_client::ThinClient::new(&base, None).unwrap();
         let result = do_login(&api, Some("__test__"), "user1", "pass1").await;
         assert_eq!(result.unwrap(), "tok-abc");
     }
@@ -5124,7 +5097,7 @@ mod tests {
             }),
         );
         let base = spawn_mock(app).await;
-        let api = mo_thin_client::ThinClient::new(&base, None).unwrap();
+        let api = astra_thin_client::ThinClient::new(&base, None).unwrap();
         let result = do_login(&api, Some("test-profile"), "user1", "wrong").await;
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("401"));
@@ -5138,7 +5111,7 @@ mod tests {
             post(|| async { axum::Json(serde_json::json!({"ok": true})) }),
         );
         let base = spawn_mock(app).await;
-        let api = mo_thin_client::ThinClient::new(&base, None).unwrap();
+        let api = astra_thin_client::ThinClient::new(&base, None).unwrap();
         let result = do_register(&api, "newuser", "a@b.com", "pass").await;
         assert!(result.is_ok());
     }
@@ -5156,7 +5129,7 @@ mod tests {
             }),
         );
         let base = spawn_mock(app).await;
-        let api = mo_thin_client::ThinClient::new(&base, None).unwrap();
+        let api = astra_thin_client::ThinClient::new(&base, None).unwrap();
         let result = do_register(&api, "taken", "a@b.com", "pass").await;
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("409"));
@@ -5187,7 +5160,7 @@ mod tests {
             }),
         );
         let base = spawn_mock(app).await;
-        let api = mo_thin_client::ThinClient::new(&base, None).unwrap();
+        let api = astra_thin_client::ThinClient::new(&base, None).unwrap();
         let registry = tool_registry::ToolRegistry::new(edge_tools::all_tool_schemas());
         let selector = tool_selector::TfIdfSelector::new(registry);
         let mut pm = PermissionManager::new(true);
@@ -5236,7 +5209,7 @@ mod tests {
             }),
         );
         let base = spawn_mock(app).await;
-        let api = mo_thin_client::ThinClient::new(&base, None).unwrap();
+        let api = astra_thin_client::ThinClient::new(&base, None).unwrap();
         let registry = tool_registry::ToolRegistry::new(edge_tools::all_tool_schemas());
         let selector = tool_selector::TfIdfSelector::new(registry);
         let mut pm = PermissionManager::new(true);
@@ -5301,7 +5274,7 @@ mod tests {
             }),
         );
         let base = spawn_mock(app).await;
-        let api = mo_thin_client::ThinClient::new(&base, None).unwrap();
+        let api = astra_thin_client::ThinClient::new(&base, None).unwrap();
         let registry = tool_registry::ToolRegistry::new(edge_tools::all_tool_schemas());
         let selector = tool_selector::TfIdfSelector::new(registry);
         let mut pm = PermissionManager::new(true); // auto-approve
@@ -5347,7 +5320,7 @@ mod tests {
             post(|| async { axum::Json(serde_json::json!({"session_id": "new-sess-42"})) }),
         );
         let base = spawn_mock(app).await;
-        let api = mo_thin_client::ThinClient::new(&base, None).unwrap();
+        let api = astra_thin_client::ThinClient::new(&base, None).unwrap();
         let selector = tool_selector::TfIdfSelector::new(tool_registry::ToolRegistry::new(
             edge_tools::all_tool_schemas(),
         ));
@@ -5375,7 +5348,7 @@ mod tests {
 
     #[tokio::test]
     async fn slash_model_with_arg_sets_model() {
-        let api = mo_thin_client::ThinClient::new("http://unused", None).unwrap();
+        let api = astra_thin_client::ThinClient::new("http://unused", None).unwrap();
         let selector = tool_selector::TfIdfSelector::new(tool_registry::ToolRegistry::new(
             edge_tools::all_tool_schemas(),
         ));
@@ -5389,7 +5362,7 @@ mod tests {
 
     #[tokio::test]
     async fn slash_exit_returns_true() {
-        let api = mo_thin_client::ThinClient::new("http://unused", None).unwrap();
+        let api = astra_thin_client::ThinClient::new("http://unused", None).unwrap();
         let selector = tool_selector::TfIdfSelector::new(tool_registry::ToolRegistry::new(
             edge_tools::all_tool_schemas(),
         ));
@@ -5402,7 +5375,7 @@ mod tests {
 
     #[tokio::test]
     async fn slash_exit_writes_session_end_to_journal() {
-        let api = mo_thin_client::ThinClient::new("http://unused", None).unwrap();
+        let api = astra_thin_client::ThinClient::new("http://unused", None).unwrap();
         let selector = tool_selector::TfIdfSelector::new(tool_registry::ToolRegistry::new(
             edge_tools::all_tool_schemas(),
         ));
@@ -5441,7 +5414,7 @@ mod tests {
 
     #[tokio::test]
     async fn slash_quit_writes_session_end_to_journal() {
-        let api = mo_thin_client::ThinClient::new("http://unused", None).unwrap();
+        let api = astra_thin_client::ThinClient::new("http://unused", None).unwrap();
         let selector = tool_selector::TfIdfSelector::new(tool_registry::ToolRegistry::new(
             edge_tools::all_tool_schemas(),
         ));
@@ -5479,7 +5452,7 @@ mod tests {
 
     #[tokio::test]
     async fn slash_unknown_command_does_not_crash() {
-        let api = mo_thin_client::ThinClient::new("http://unused", None).unwrap();
+        let api = astra_thin_client::ThinClient::new("http://unused", None).unwrap();
         let selector = tool_selector::TfIdfSelector::new(tool_registry::ToolRegistry::new(
             edge_tools::all_tool_schemas(),
         ));
@@ -5499,7 +5472,7 @@ mod tests {
 
     #[tokio::test]
     async fn slash_health_does_not_crash_empty() {
-        let api = mo_thin_client::ThinClient::new("http://unused", None).unwrap();
+        let api = astra_thin_client::ThinClient::new("http://unused", None).unwrap();
         let selector = tool_selector::TfIdfSelector::new(tool_registry::ToolRegistry::new(
             edge_tools::all_tool_schemas(),
         ));
@@ -5513,20 +5486,20 @@ mod tests {
 
     #[tokio::test]
     async fn slash_health_with_entries_does_not_crash() {
-        let api = mo_thin_client::ThinClient::new("http://unused", None).unwrap();
+        let api = astra_thin_client::ThinClient::new("http://unused", None).unwrap();
         let selector = tool_selector::TfIdfSelector::new(tool_registry::ToolRegistry::new(
             edge_tools::all_tool_schemas(),
         ));
         let mut state = ReplState {
             tool_health_entries: vec![
-                mo_agent_runtime::pipeline::persistence::ToolHealthEntry {
+                astra_runtime::pipeline::persistence::ToolHealthEntry {
                     name: "bash".into(),
                     total_calls: 15,
                     total_failures: 3,
                     failure_rate: 0.2,
                     last_updated_epoch: 0,
                 },
-                mo_agent_runtime::pipeline::persistence::ToolHealthEntry {
+                astra_runtime::pipeline::persistence::ToolHealthEntry {
                     name: "grep".into(),
                     total_calls: 8,
                     total_failures: 0,
@@ -5544,12 +5517,12 @@ mod tests {
 
     #[tokio::test]
     async fn slash_health_detail_mode() {
-        let api = mo_thin_client::ThinClient::new("http://unused", None).unwrap();
+        let api = astra_thin_client::ThinClient::new("http://unused", None).unwrap();
         let selector = tool_selector::TfIdfSelector::new(tool_registry::ToolRegistry::new(
             edge_tools::all_tool_schemas(),
         ));
         let mut state = ReplState {
-            tool_health_entries: vec![mo_agent_runtime::pipeline::persistence::ToolHealthEntry {
+            tool_health_entries: vec![astra_runtime::pipeline::persistence::ToolHealthEntry {
                 name: "bash".into(),
                 total_calls: 10,
                 total_failures: 5,
@@ -5574,7 +5547,7 @@ mod tests {
             get(|| async { axum::Json(serde_json::json!({"status": "ok"})) }),
         );
         let base = spawn_mock(app).await;
-        let api = mo_thin_client::ThinClient::new(&base, None).unwrap();
+        let api = astra_thin_client::ThinClient::new(&base, None).unwrap();
         let result = execute_cli_command(
             Some(Command::Health),
             Some("nonexistent-profile".to_string()),
@@ -5641,7 +5614,7 @@ mod tests {
             }),
         );
         let base = spawn_mock(app).await;
-        let api = mo_thin_client::ThinClient::new(&base, None).unwrap();
+        let api = astra_thin_client::ThinClient::new(&base, None).unwrap();
         let mut state = ReplState {
             session_id: Some("sess-1".to_string()),
             ..Default::default()
@@ -5660,17 +5633,17 @@ mod tests {
 
     // ── find_task_by_query ────────────────────────────────────────────────────
 
-    use mo_agent_services::TaskService as _;
+    use astra_services::TaskService as _;
 
     #[tokio::test]
     async fn find_task_by_id_prefix() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let svc = mo_agent_services::LocalTaskService::new(tmp.path().to_path_buf());
+        let svc = astra_services::LocalTaskService::new(tmp.path().to_path_buf());
         let tid = svc
             .create_task(
                 "u1",
                 "s1",
-                mo_agent_services::TaskCreateRequest {
+                astra_services::TaskCreateRequest {
                     title: "Build auth".into(),
                     ..Default::default()
                 },
@@ -5691,11 +5664,11 @@ mod tests {
     #[tokio::test]
     async fn find_task_by_title_substring() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let svc = mo_agent_services::LocalTaskService::new(tmp.path().to_path_buf());
+        let svc = astra_services::LocalTaskService::new(tmp.path().to_path_buf());
         svc.create_task(
             "u1",
             "s1",
-            mo_agent_services::TaskCreateRequest {
+            astra_services::TaskCreateRequest {
                 title: "Refactor authentication module".into(),
                 ..Default::default()
             },
@@ -5716,7 +5689,7 @@ mod tests {
     #[tokio::test]
     async fn find_task_not_found() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let svc = mo_agent_services::LocalTaskService::new(tmp.path().to_path_buf());
+        let svc = astra_services::LocalTaskService::new(tmp.path().to_path_buf());
         let found = find_task_by_query(&svc, "u1", "nonexistent").await.unwrap();
         assert!(found.is_none());
     }
@@ -5724,11 +5697,11 @@ mod tests {
     #[tokio::test]
     async fn find_task_wrong_user() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let svc = mo_agent_services::LocalTaskService::new(tmp.path().to_path_buf());
+        let svc = astra_services::LocalTaskService::new(tmp.path().to_path_buf());
         svc.create_task(
             "user-a",
             "s1",
-            mo_agent_services::TaskCreateRequest {
+            astra_services::TaskCreateRequest {
                 title: "Private task".into(),
                 ..Default::default()
             },
@@ -5746,7 +5719,7 @@ mod tests {
     #[tokio::test]
     async fn resume_local_restore_rejects_unowned_session() {
         let _creds = isolate_credentials();
-        use mo_agent_services::session_restore::SessionRestoreService;
+        use astra_services::session_restore::SessionRestoreService;
         use session_journal::JournalWriter;
 
         // Create a session with both journal AND workspace (what restore_session needs)
@@ -5795,7 +5768,7 @@ total_tokens_out: 3
         std::fs::write(ws_dir.join("workspace.yaml"), ws_content).unwrap();
 
         // Now restore_session should find it
-        let svc = mo_agent_services::session_restore::HybridRestoreService::local_only();
+        let svc = astra_services::session_restore::HybridRestoreService::local_only();
         let result = svc.restore_session(&sid).await.unwrap();
         assert!(
             result.is_some(),
@@ -5814,7 +5787,7 @@ total_tokens_out: 3
 
     #[tokio::test]
     async fn resume_restores_learning_snapshot() {
-        use mo_agent_services::session_restore::RestoredSession;
+        use astra_services::session_restore::RestoredSession;
 
         // Create a mock RestoredSession with learning snapshot
         let restored = RestoredSession {
@@ -5854,7 +5827,7 @@ total_tokens_out: 3
 
     #[tokio::test]
     async fn resume_local_restore_has_no_learning_snapshot() {
-        use mo_agent_services::session_restore::RestoredSession;
+        use astra_services::session_restore::RestoredSession;
 
         // Local restore should not have learning snapshot
         let restored = RestoredSession {
@@ -5880,7 +5853,7 @@ total_tokens_out: 3
 
     #[tokio::test]
     async fn resume_handles_empty_learning_snapshot() {
-        use mo_agent_services::session_restore::RestoredSession;
+        use astra_services::session_restore::RestoredSession;
 
         // Empty string should be treated as None
         let restored = RestoredSession {
@@ -5903,7 +5876,7 @@ total_tokens_out: 3
 
     #[tokio::test]
     async fn resume_handles_invalid_learning_json() {
-        use mo_agent_services::session_restore::RestoredSession;
+        use astra_services::session_restore::RestoredSession;
 
         // Invalid JSON should still be stored (will fail at merge time)
         let restored = RestoredSession {
@@ -5919,7 +5892,7 @@ total_tokens_out: 3
     #[tokio::test]
     async fn resume_handles_malformed_workspace_yaml() {
         let _creds = isolate_credentials();
-        use mo_agent_services::session_restore::SessionRestoreService;
+        use astra_services::session_restore::SessionRestoreService;
 
         let sid = format!("test-malformed-{}", uuid::Uuid::new_v4());
 
@@ -5943,7 +5916,7 @@ total_tokens_out: 3
         std::fs::write(ws_dir.join("workspace.yaml"), "invalid: yaml: content: [").unwrap();
 
         // Should return None for malformed workspace
-        let svc = mo_agent_services::session_restore::HybridRestoreService::local_only();
+        let svc = astra_services::session_restore::HybridRestoreService::local_only();
         let result = svc.restore_session(&sid).await.unwrap();
         assert!(
             result.is_none(),
@@ -5954,7 +5927,7 @@ total_tokens_out: 3
     #[tokio::test]
     async fn resume_handles_missing_workspace() {
         let _creds = isolate_credentials();
-        use mo_agent_services::session_restore::SessionRestoreService;
+        use astra_services::session_restore::SessionRestoreService;
 
         // Only journal, no workspace → should fall back to cloud (which returns None)
         let sid = format!("test-no-ws-{}", uuid::Uuid::new_v4());
@@ -5967,7 +5940,7 @@ total_tokens_out: 3
             .unwrap();
         drop(writer);
 
-        let svc = mo_agent_services::session_restore::HybridRestoreService::local_only();
+        let svc = astra_services::session_restore::HybridRestoreService::local_only();
         let result = svc.restore_session(&sid).await.unwrap();
         assert!(
             result.is_none(),
@@ -5979,7 +5952,7 @@ total_tokens_out: 3
 
     #[tokio::test]
     async fn resume_full_flow_cloud_restore() {
-        use mo_agent_services::session_restore::RestoredSession;
+        use astra_services::session_restore::RestoredSession;
 
         // Simulate a complete cloud restore scenario
         let restored = RestoredSession {
@@ -6039,7 +6012,7 @@ total_tokens_out: 3
     #[tokio::test]
     async fn resume_lists_checkpoints_for_session() {
         let _creds = isolate_credentials();
-        use mo_agent_services::session_restore::SessionRestoreService;
+        use astra_services::session_restore::SessionRestoreService;
 
         let sid = format!("test-checkpoints-{}", uuid::Uuid::new_v4());
 
@@ -6076,7 +6049,7 @@ total_tokens_out: 500
         .unwrap();
 
         // List checkpoints should return empty (no checkpoints created yet)
-        let svc = mo_agent_services::session_restore::HybridRestoreService::local_only();
+        let svc = astra_services::session_restore::HybridRestoreService::local_only();
         let ckpts = svc.list_checkpoints(&sid).await.unwrap();
         assert!(ckpts.is_empty(), "no checkpoints created yet");
     }
@@ -6085,7 +6058,7 @@ total_tokens_out: 500
 
     #[test]
     fn merge_learning_valid_snapshot() {
-        use mo_agent_runtime::pipeline::{calibration, entity, pattern};
+        use astra_runtime::pipeline::{calibration, entity, pattern};
 
         let json = serde_json::json!({
             "version": 1,
@@ -6140,7 +6113,7 @@ total_tokens_out: 500
 
     #[test]
     fn merge_learning_invalid_json_does_not_panic() {
-        use mo_agent_runtime::pipeline::{calibration, entity, pattern};
+        use astra_runtime::pipeline::{calibration, entity, pattern};
 
         let eg = std::sync::Arc::new(std::sync::Mutex::new(entity::EntityGraph::new()));
         let pl = std::sync::Arc::new(std::sync::Mutex::new(pattern::PatternLibrary::new()));
@@ -6158,7 +6131,7 @@ total_tokens_out: 500
 
     #[test]
     fn merge_learning_empty_snapshot() {
-        use mo_agent_runtime::pipeline::{calibration, entity, pattern};
+        use astra_runtime::pipeline::{calibration, entity, pattern};
 
         let json = serde_json::json!({
             "version": 1,
@@ -6182,7 +6155,7 @@ total_tokens_out: 500
 
     #[test]
     fn merge_learning_idempotent() {
-        use mo_agent_runtime::pipeline::{calibration, entity, pattern};
+        use astra_runtime::pipeline::{calibration, entity, pattern};
 
         let json = serde_json::json!({
             "version": 1,
@@ -6218,7 +6191,7 @@ total_tokens_out: 500
 
     #[test]
     fn merge_learning_multiple_entities_and_patterns() {
-        use mo_agent_runtime::pipeline::{calibration, entity, pattern};
+        use astra_runtime::pipeline::{calibration, entity, pattern};
 
         let json = serde_json::json!({
             "version": 1,
@@ -6277,7 +6250,7 @@ total_tokens_out: 500
     #[test]
     fn stats_current_session_reads_journal() {
         let _creds = isolate_credentials();
-        use mo_agent_services::session_analytics;
+        use astra_services::session_analytics;
 
         // Create a real journal with known events
         let sid = format!("test-stats-{}", uuid::Uuid::new_v4());
@@ -6338,7 +6311,7 @@ total_tokens_out: 500
     #[test]
     fn stats_history_aggregates_multiple_sessions() {
         let _creds = isolate_credentials();
-        use mo_agent_services::session_analytics;
+        use astra_services::session_analytics;
 
         // Create two sessions
         let sid1 = format!("test-stats-hist-a-{}", uuid::Uuid::new_v4());
@@ -6412,7 +6385,7 @@ total_tokens_out: 500
     #[test]
     fn tools_reads_tool_calls_from_journal() {
         let _creds = isolate_credentials();
-        use mo_agent_services::session_analytics;
+        use astra_services::session_analytics;
 
         let sid = format!("test-tools-calls-{}", uuid::Uuid::new_v4());
         let writer = session_journal::JournalWriter::new(&sid).unwrap();
@@ -6560,14 +6533,14 @@ total_tokens_out: 500
 
     #[test]
     fn display_sync_status_no_crash_all_none() {
-        let status = mo_agent_services::SyncStatus::default();
+        let status = astra_services::SyncStatus::default();
         // Just verify no panic — output goes to stderr
         display_sync_status(&status);
     }
 
     #[test]
     fn display_sync_status_no_crash_full_data() {
-        let status = mo_agent_services::SyncStatus {
+        let status = astra_services::SyncStatus {
             learning_last_push: Some(chrono::Utc::now().to_rfc3339()),
             learning_last_pull: Some(chrono::Utc::now().to_rfc3339()),
             preferences_last_sync: Some(chrono::Utc::now().to_rfc3339()),
@@ -6580,7 +6553,7 @@ total_tokens_out: 500
 
     #[tokio::test]
     async fn slash_health_offline_shows_cloud_section() {
-        let api = mo_thin_client::ThinClient::new("http://unused", None).unwrap();
+        let api = astra_thin_client::ThinClient::new("http://unused", None).unwrap();
         let selector = tool_selector::TfIdfSelector::new(tool_registry::ToolRegistry::new(
             edge_tools::all_tool_schemas(),
         ));
@@ -6774,13 +6747,13 @@ total_tokens_out: 500
             std::env::remove_var("MATRIXONE_HOST");
         }
         let eg = std::sync::Arc::new(std::sync::Mutex::new(
-            mo_agent_runtime::pipeline::entity::EntityGraph::new(),
+            astra_runtime::pipeline::entity::EntityGraph::new(),
         ));
         let pl = std::sync::Arc::new(std::sync::Mutex::new(
-            mo_agent_runtime::pipeline::pattern::PatternLibrary::new(),
+            astra_runtime::pipeline::pattern::PatternLibrary::new(),
         ));
         let cal = std::sync::Arc::new(std::sync::Mutex::new(
-            mo_agent_runtime::pipeline::calibration::ProgressiveCalibrator::new(0.15),
+            astra_runtime::pipeline::calibration::ProgressiveCalibrator::new(0.15),
         ));
         let result = try_cloud_pull("default", &eg, &pl, &cal).await;
         assert!(
@@ -6803,13 +6776,13 @@ total_tokens_out: 500
             std::env::remove_var("MATRIXONE_HOST");
         }
         let eg = std::sync::Arc::new(std::sync::Mutex::new(
-            mo_agent_runtime::pipeline::entity::EntityGraph::new(),
+            astra_runtime::pipeline::entity::EntityGraph::new(),
         ));
         let pl = std::sync::Arc::new(std::sync::Mutex::new(
-            mo_agent_runtime::pipeline::pattern::PatternLibrary::new(),
+            astra_runtime::pipeline::pattern::PatternLibrary::new(),
         ));
         let cal = std::sync::Arc::new(std::sync::Mutex::new(
-            mo_agent_runtime::pipeline::calibration::ProgressiveCalibrator::new(0.15),
+            astra_runtime::pipeline::calibration::ProgressiveCalibrator::new(0.15),
         ));
         // Should not panic (was the original bug)
         // Use versioned API (None = new snapshot or unconditional push)
@@ -6822,18 +6795,18 @@ total_tokens_out: 500
             std::env::remove_var("MATRIXONE_HOST");
         }
         let eg = std::sync::Arc::new(std::sync::Mutex::new(
-            mo_agent_runtime::pipeline::entity::EntityGraph::new(),
+            astra_runtime::pipeline::entity::EntityGraph::new(),
         ));
         let pl = std::sync::Arc::new(std::sync::Mutex::new(
-            mo_agent_runtime::pipeline::pattern::PatternLibrary::new(),
+            astra_runtime::pipeline::pattern::PatternLibrary::new(),
         ));
         let cal = std::sync::Arc::new(std::sync::Mutex::new(
-            mo_agent_runtime::pipeline::calibration::ProgressiveCalibrator::new(0.15),
+            astra_runtime::pipeline::calibration::ProgressiveCalibrator::new(0.15),
         ));
         let mut synced = Vec::new();
         eg.lock().unwrap().learn(
             "rust",
-            mo_agent_runtime::pipeline::routing::DomainHint::Code,
+            astra_runtime::pipeline::routing::DomainHint::Code,
             &[],
             None,
         );

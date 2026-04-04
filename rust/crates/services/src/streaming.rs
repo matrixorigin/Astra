@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use axum::{Json, http::StatusCode};
 use serde::{Deserialize, Serialize};
 
-use mo_agent_core::{ErrorResponse, internal_error};
+use astra_core::{ErrorResponse, internal_error};
 
 // ── Data types ───────────────────────────────────────────────────────────────
 

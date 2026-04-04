@@ -10,7 +10,7 @@ pub(super) fn clear_profile_last_session(profile: Option<&str>) -> Result<(), St
 }
 
 pub(super) async fn do_login(
-    api: &mo_thin_client::ThinClient,
+    api: &astra_thin_client::ThinClient,
     profile: Option<&str>,
     username: &str,
     password: &str,
@@ -48,7 +48,7 @@ pub(super) async fn do_login(
 }
 
 pub(super) async fn do_register(
-    api: &mo_thin_client::ThinClient,
+    api: &astra_thin_client::ThinClient,
     username: &str,
     email: &str,
     password: &str,

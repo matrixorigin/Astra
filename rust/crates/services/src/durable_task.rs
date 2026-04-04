@@ -2106,7 +2106,7 @@ impl MatrixOneDurableTaskLifecycle {
         }
     }
 
-    pub fn from_shared(shared: &mo_agent_core::SharedPool, work_dir: std::path::PathBuf) -> Self {
+    pub fn from_shared(shared: &astra_core::SharedPool, work_dir: std::path::PathBuf) -> Self {
         Self::new(shared.get().clone(), work_dir)
     }
 

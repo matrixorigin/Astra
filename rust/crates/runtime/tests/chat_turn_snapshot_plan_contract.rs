@@ -1,6 +1,6 @@
 use std::{fs, path::PathBuf};
 
-use mo_agent_runtime::should_persist_session_history_snapshot;
+use astra_runtime::should_persist_session_history_snapshot;
 use serde::Deserialize;
 
 #[derive(Deserialize)]

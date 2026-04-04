@@ -4,8 +4,7 @@
 use std::collections::HashSet;
 use std::time::Instant;
 
-use crossterm::style::Stylize;
-use mo_agent_runtime::{
+use astra_runtime::{
     pipeline::persistence::ToolHealthEntry,
     pipeline::step_protocol::StepCheckpoint,
     pipeline::step_recorder::StepRecorder,
@@ -13,7 +12,8 @@ use mo_agent_runtime::{
     turn::agentic_turn_telemetry::{format_token_count_compact, session_id_footer_abbrev},
     turn::turn_guard::TurnGuard,
 };
-use mo_agent_services::session_journal::ToolCallRecord;
+use astra_services::session_journal::ToolCallRecord;
+use crossterm::style::Stylize;
 use serde_json::Value;
 
 use crate::{ExplainMode, StreamResult, VerdictEvent};

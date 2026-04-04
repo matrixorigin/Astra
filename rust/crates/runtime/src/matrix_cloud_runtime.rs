@@ -6,8 +6,8 @@ use std::collections::{BTreeMap, HashSet};
 use std::sync::{Arc, Mutex};
 use tokio::sync::Mutex as TokioMutex;
 
-use mo_agent_core::{MatrixOneSettings, SharedPool};
-use mo_agent_services::{
+use astra_core::{MatrixOneSettings, SharedPool};
+use astra_services::{
     CloudTransport, DomainAdapter, SyncOrchestrator, SyncPolicy, TaskLeaseHoldCache, TaskRecord,
     event_ingestion::{self, IngestionConfig, IngestionEvent},
     session_journal::JournalEvent,
@@ -33,7 +33,7 @@ pub fn matrix_settings_from_env() -> MatrixOneSettings {
             .unwrap_or(6001),
         user: std::env::var("MATRIXONE_USER").unwrap_or_else(|_| "root".into()),
         password: std::env::var("MATRIXONE_PASSWORD")
-            .unwrap_or_else(|_| mo_agent_core::DEV_MATRIXONE_PASSWORD.into()),
+            .unwrap_or_else(|_| astra_core::DEV_MATRIXONE_PASSWORD.into()),
         database: std::env::var("MATRIXONE_DATABASE").unwrap_or_else(|_| "astra_runtime".into()),
     }
 }
@@ -41,7 +41,7 @@ pub fn matrix_settings_from_env() -> MatrixOneSettings {
 /// Pool + ingestion + unified sync orchestrator. Safe to share behind `Arc`.
 pub struct MatrixCloudRuntime {
     shared_pool: SharedPool,
-    ingestion: Mutex<Option<mo_agent_services::event_ingestion::IngestionSender>>,
+    ingestion: Mutex<Option<astra_services::event_ingestion::IngestionSender>>,
     sync_orchestrator: TokioMutex<SyncOrchestrator>,
     /// Edge preference map (same `Arc` as [`PreferenceAdapter`] inside the orchestrator).
     preference_store: Arc<Mutex<BTreeMap<String, String>>>,
@@ -163,17 +163,17 @@ impl MatrixCloudRuntime {
     ///
     /// Returns `None` if cloud LLM environment variables are not configured.
     /// The judge persists evaluation results directly to the `task_verification_results` table.
-    pub fn create_cloud_llm_judge(&self) -> Option<mo_agent_services::CloudLlmJudge> {
-        let config = mo_agent_services::CloudLlmConfig::from_env()?;
+    pub fn create_cloud_llm_judge(&self) -> Option<astra_services::CloudLlmJudge> {
+        let config = astra_services::CloudLlmConfig::from_env()?;
         let pool = self.shared_pool.get().clone();
-        Some(mo_agent_services::CloudLlmJudge::new(config, Some(pool)))
+        Some(astra_services::CloudLlmJudge::new(config, Some(pool)))
     }
 
     /// Clone the ingestion sender for use in other subsystems (e.g., durable task lifecycle).
     /// Returns `None` if ingestion is shut down or lock is poisoned.
     pub fn clone_ingestion_sender(
         &self,
-    ) -> Option<mo_agent_services::event_ingestion::IngestionSender> {
+    ) -> Option<astra_services::event_ingestion::IngestionSender> {
         self.ingestion.lock().ok()?.as_ref().cloned()
     }
 
@@ -213,7 +213,7 @@ pub fn build_sync_orchestrator_with_adapters(
     pattern_library: Arc<Mutex<PatternLibrary>>,
     calibrator: Arc<Mutex<ProgressiveCalibrator>>,
     tool_health: Arc<Mutex<Vec<ToolHealthEntry>>>,
-    ingestion: mo_agent_services::event_ingestion::IngestionSender,
+    ingestion: astra_services::event_ingestion::IngestionSender,
     lease_hold_cache: Arc<TaskLeaseHoldCache>,
     task_mirror: Arc<Mutex<BTreeMap<String, TaskRecord>>>,
     task_dirty: Arc<Mutex<HashSet<String>>>,
@@ -250,7 +250,7 @@ pub fn build_sync_orchestrator_with_adapters(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mo_agent_services::{NoopTransport, SyncDomain, event_ingestion::IngestionSender};
+    use astra_services::{NoopTransport, SyncDomain, event_ingestion::IngestionSender};
 
     #[test]
     fn matrix_settings_from_env_non_empty() {

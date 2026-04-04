@@ -33,7 +33,7 @@
 
 use std::sync::Arc;
 
-use mo_agent_services::runs::{DurableRunRecord, RunStateStore};
+use astra_services::runs::{DurableRunRecord, RunStateStore};
 
 /// Durable run execution engine.
 ///
@@ -203,7 +203,7 @@ impl RunEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mo_agent_services::runs::InMemoryRunStateStore;
+    use astra_services::runs::InMemoryRunStateStore;
 
     fn test_engine() -> RunEngine {
         RunEngine::new(Arc::new(InMemoryRunStateStore::new()))

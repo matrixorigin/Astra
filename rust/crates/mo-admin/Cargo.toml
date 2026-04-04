@@ -8,7 +8,7 @@ name = "astra-admin"
 path = "src/main.rs"
 
 [dependencies]
-mo-thin-client.workspace = true
+astra-thin-client.workspace = true
 clap = { version = "4.5.38", features = ["derive"] }
 crossterm = "0.27"
 dirs = "6.0.0"

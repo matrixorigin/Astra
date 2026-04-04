@@ -5,16 +5,16 @@
 use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
 use serde_json::json;
 
-use mo_agent_runtime::bridge::sse_events::{find_sse_frame_end, parse_sse_json_frame};
-use mo_agent_runtime::prompts::{CompactionTier, estimate_str_tokens, estimate_tokens};
-use mo_agent_runtime::text_tokenize::{build_tf, tokenize};
-use mo_agent_runtime::tool_registry::ConversationState;
-use mo_agent_runtime::tool_registry::TOOL_CATALOG;
-use mo_agent_runtime::tool_registry::scoring::pre_filter_dynamic;
-use mo_agent_runtime::tool_registry::tool_pool::{
+use astra_runtime::bridge::sse_events::{find_sse_frame_end, parse_sse_json_frame};
+use astra_runtime::prompts::{CompactionTier, estimate_str_tokens, estimate_tokens};
+use astra_runtime::text_tokenize::{build_tf, tokenize};
+use astra_runtime::tool_registry::ConversationState;
+use astra_runtime::tool_registry::TOOL_CATALOG;
+use astra_runtime::tool_registry::scoring::pre_filter_dynamic;
+use astra_runtime::tool_registry::tool_pool::{
     SearchableToolMeta, ToolDenyPredicate, ToolPool, ToolSearchConfig, ToolSource, select_two_phase,
 };
-use mo_agent_runtime::turn::cloud::compaction::compact_tiered;
+use astra_runtime::turn::cloud::compaction::compact_tiered;
 
 // ── Token Estimation ───────────────────────────────────────────────
 
@@ -104,7 +104,7 @@ struct MapStore {
     map: std::collections::HashMap<String, serde_json::Value>,
 }
 
-impl mo_agent_runtime::tool_registry::tool_pool::ToolSchemaStore for MapStore {
+impl astra_runtime::tool_registry::tool_pool::ToolSchemaStore for MapStore {
     fn schema_by_name(&self, name: &str) -> Option<serde_json::Value> {
         self.map.get(name).cloned()
     }

@@ -1,8 +1,8 @@
 use std::fs;
 
+use astra_thin_client::ThinClient;
+use astra_thin_client::paths;
 use clap::Parser;
-use mo_thin_client::ThinClient;
-use mo_thin_client::paths;
 
 mod cli_args;
 mod credentials;
@@ -293,7 +293,7 @@ async fn main() -> Result<(), String> {
                     .await
                 {
                     Ok(_) => println!("loaded model: {model_name}"),
-                    Err(mo_thin_client::ThinClientError::Api { body, .. })
+                    Err(astra_thin_client::ThinClientError::Api { body, .. })
                         if body.contains("already exists") =>
                     {
                         println!("skipped (already exists): {model_name}");

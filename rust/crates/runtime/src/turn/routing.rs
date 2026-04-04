@@ -3,7 +3,7 @@ use serde_json::{Map, Value, json};
 /// Maximum tool execution rounds per turn. Reads from `MO_MAX_TOOL_ROUNDS` env
 /// var at process start, defaulting to 10.
 pub fn max_tool_rounds() -> i64 {
-    mo_agent_core::RuntimeLimits::global().max_tool_rounds
+    astra_core::RuntimeLimits::global().max_tool_rounds
 }
 
 /// Compile-time constant for tests that need `const` assertions.

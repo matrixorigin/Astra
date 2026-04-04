@@ -430,7 +430,7 @@ async fn handle_chat_message(
     model: Option<String>,
     context: Option<serde_json::Map<String, serde_json::Value>>,
 ) {
-    use mo_agent_services::runs::ChatRequestData;
+    use astra_services::runs::ChatRequestData;
 
     let request = ChatRequestData {
         message: content.to_string(),
@@ -773,7 +773,7 @@ async fn stream_sse_response_as_ws(
                 tokio::select! {
                     biased;
                     _ = t.cancelled() => {
-                        mo_agent_core::agent_warn!("ws", "bridge response stream cancelled");
+                        astra_core::agent_warn!("ws", "bridge response stream cancelled");
                         return;
                     }
                     n = stream.next() => n,

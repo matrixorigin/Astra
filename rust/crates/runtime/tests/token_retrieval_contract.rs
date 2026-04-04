@@ -68,7 +68,7 @@ fn load_contract() -> Contract {
 
 #[test]
 fn token_estimation_matches_contract() {
-    use mo_agent_runtime::prompts::estimate_tokens;
+    use astra_runtime::prompts::estimate_tokens;
 
     let contract = load_contract();
     for case in &contract.token_estimation_cases {
@@ -88,7 +88,7 @@ fn token_estimation_matches_contract() {
 
 #[test]
 fn context_budget_model_limits_match_contract() {
-    use mo_agent_runtime::prompts::budget_for_model;
+    use astra_runtime::prompts::budget_for_model;
 
     let contract = load_contract();
     for case in &contract.context_budget_cases {
@@ -112,7 +112,7 @@ fn context_budget_model_limits_match_contract() {
 
 #[test]
 fn effective_input_limit_less_than_model_limit() {
-    use mo_agent_runtime::prompts::budget_for_model;
+    use astra_runtime::prompts::budget_for_model;
 
     let contract = load_contract();
     for case in &contract.context_budget_cases {
@@ -139,7 +139,7 @@ fn effective_input_limit_less_than_model_limit() {
 
 #[test]
 fn compaction_tiers_match_contract() {
-    use mo_agent_runtime::prompts::{CompactionTier, budget_for_model};
+    use astra_runtime::prompts::{CompactionTier, budget_for_model};
 
     let contract = load_contract();
     let budget = budget_for_model(Some("gpt-4o"));
@@ -172,7 +172,7 @@ fn compaction_tiers_match_contract() {
 
 #[test]
 fn retrieval_extraction_matches_contract() {
-    use mo_agent_runtime::turn::retrieval::{RETRIEVAL_BUDGET_CHARS, rule_based_extraction};
+    use astra_runtime::turn::retrieval::{RETRIEVAL_BUDGET_CHARS, rule_based_extraction};
     use serde_json::Map;
 
     let contract = load_contract();
@@ -216,7 +216,7 @@ fn retrieval_extraction_matches_contract() {
 
 #[test]
 fn adaptive_budget_matches_contract() {
-    use mo_agent_runtime::turn::retrieval::adaptive_budget_chars;
+    use astra_runtime::turn::retrieval::adaptive_budget_chars;
 
     let contract = load_contract();
     for case in &contract.adaptive_budget_cases {

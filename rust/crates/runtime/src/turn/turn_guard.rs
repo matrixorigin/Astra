@@ -317,7 +317,7 @@ impl TurnGuard {
         // Second Critical: force stop — the agent had a chance and didn't recover.
         let force_stop = if escalation == EscalationLevel::Critical {
             self.critical_turns += 1;
-            mo_agent_core::agent_escalation!(
+            astra_core::agent_escalation!(
                 "turnguard",
                 severity = "Critical",
                 nudge_count = self.nudge_count,

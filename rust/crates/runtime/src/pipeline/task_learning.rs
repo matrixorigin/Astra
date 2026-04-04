@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 
-use mo_agent_services::durable_task::{
+use astra_services::durable_task::{
     TaskContract, TaskDeliveryReport, TaskLearningBridge, TaskOutcomeSignal, TaskPatternStats,
 };
 
@@ -396,7 +396,7 @@ impl TaskLearningBridge for PipelineTaskLearningBridge {
 
     async fn learn_from_verification(
         &self,
-        signal: &mo_agent_services::durable_task::VerificationLearningSignal,
+        signal: &astra_services::durable_task::VerificationLearningSignal,
     ) -> Result<(), String> {
         let task_type = parse_task_type(signal.task_type.as_deref());
         let domain = parse_domain_hint(signal.domain_hint.as_deref());
@@ -479,7 +479,7 @@ impl TaskLearningBridge for PipelineTaskLearningBridge {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mo_agent_services::durable_task::{CriterionLearningResult, VerificationLearningSignal};
+    use astra_services::durable_task::{CriterionLearningResult, VerificationLearningSignal};
 
     fn make_signal(success: bool) -> TaskOutcomeSignal {
         TaskOutcomeSignal {
@@ -489,7 +489,7 @@ mod tests {
             success,
             user_rating: Some(85),
             tools_used: vec!["read_file".into(), "str_replace".into(), "bash".into()],
-            subtask_outcomes: vec![mo_agent_services::durable_task::SubtaskOutcomeSignal {
+            subtask_outcomes: vec![astra_services::durable_task::SubtaskOutcomeSignal {
                 subtask_id: "s1".into(),
                 title: "add JWT module".into(),
                 success: true,
@@ -623,16 +623,16 @@ mod tests {
             contract_id: "c1".into(),
             task_id: "t1".into(),
             goal: "test".into(),
-            scope: mo_agent_services::durable_task::TaskScope::default(),
-            subtasks: vec![mo_agent_services::durable_task::DurableSubtask {
+            scope: astra_services::durable_task::TaskScope::default(),
+            subtasks: vec![astra_services::durable_task::DurableSubtask {
                 id: "s1".into(),
                 title: "only one".into(),
-                stage: mo_agent_services::durable_task::SubtaskStage::Completed,
+                stage: astra_services::durable_task::SubtaskStage::Completed,
                 ..Default::default()
             }],
             global_verification: vec![],
             version: 1,
-            status: mo_agent_services::durable_task::ContractStatus::Completed,
+            status: astra_services::durable_task::ContractStatus::Completed,
             created_at: "2026-04-01".into(),
             updated_at: "2026-04-01".into(),
             domain_hint: None,
@@ -662,10 +662,10 @@ mod tests {
         let mut contract2 = contract.clone();
         contract2
             .subtasks
-            .push(mo_agent_services::durable_task::DurableSubtask {
+            .push(astra_services::durable_task::DurableSubtask {
                 id: "s2".into(),
                 title: "second".into(),
-                stage: mo_agent_services::durable_task::SubtaskStage::Verified,
+                stage: astra_services::durable_task::SubtaskStage::Verified,
                 ..Default::default()
             });
 
@@ -900,24 +900,24 @@ mod tests {
             contract_id: "c1".into(),
             task_id: "t1".into(),
             goal: "implement JWT auth".into(),
-            scope: mo_agent_services::durable_task::TaskScope::default(),
+            scope: astra_services::durable_task::TaskScope::default(),
             subtasks: vec![
-                mo_agent_services::durable_task::DurableSubtask {
+                astra_services::durable_task::DurableSubtask {
                     id: "s1".into(),
                     title: "add auth module".into(),
-                    stage: mo_agent_services::durable_task::SubtaskStage::Verified,
+                    stage: astra_services::durable_task::SubtaskStage::Verified,
                     ..Default::default()
                 },
-                mo_agent_services::durable_task::DurableSubtask {
+                astra_services::durable_task::DurableSubtask {
                     id: "s2".into(),
                     title: "add routes".into(),
-                    stage: mo_agent_services::durable_task::SubtaskStage::Completed,
+                    stage: astra_services::durable_task::SubtaskStage::Completed,
                     ..Default::default()
                 },
             ],
             global_verification: vec![],
             version: 1,
-            status: mo_agent_services::durable_task::ContractStatus::Completed,
+            status: astra_services::durable_task::ContractStatus::Completed,
             created_at: "2026-04-01".into(),
             updated_at: "2026-04-01".into(),
             domain_hint: None,

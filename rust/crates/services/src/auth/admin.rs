@@ -8,14 +8,14 @@ use crate::admin::{
     AdminTokenWriter, AdminUserRoleManager, AdminUserRoleRecord, AdminUserRoleRequestData,
     AuthenticatedUser,
 };
+use astra_core::{
+    ErrorResponse, JwtSettings, MatrixOneSettings, SharedPool, bearer_token, connect_matrixone,
+    error_response, internal_error,
+};
 use async_trait::async_trait;
 use axum::{
     Json,
     http::{HeaderMap, StatusCode},
-};
-use mo_agent_core::{
-    ErrorResponse, JwtSettings, MatrixOneSettings, SharedPool, bearer_token, connect_matrixone,
-    error_response, internal_error,
 };
 use sqlx::{MySql, QueryBuilder, Row, query};
 use uuid::Uuid;

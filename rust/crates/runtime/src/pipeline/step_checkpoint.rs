@@ -77,7 +77,7 @@ pub fn read_latest_heavy_checkpoint(session_id: &str) -> std::io::Result<Option<
         .filter_map(|e| match e {
             Ok(entry) => Some(entry),
             Err(err) => {
-                mo_agent_core::agent_warn!(
+                astra_core::agent_warn!(
                     "checkpoint",
                     "Failed to read checkpoint dir entry: {}",
                     err
@@ -116,7 +116,7 @@ pub fn read_latest_light_checkpoint(session_id: &str) -> std::io::Result<Option<
         .filter_map(|e| match e {
             Ok(entry) => Some(entry),
             Err(err) => {
-                mo_agent_core::agent_warn!(
+                astra_core::agent_warn!(
                     "checkpoint",
                     "Failed to read checkpoint dir entry: {}",
                     err
@@ -154,7 +154,7 @@ pub fn list_checkpoints(session_id: &str) -> std::io::Result<Vec<(u32, Checkpoin
         let entry = match entry {
             Ok(e) => e,
             Err(err) => {
-                mo_agent_core::agent_warn!(
+                astra_core::agent_warn!(
                     "checkpoint",
                     "Failed to read dir entry during list: {}",
                     err
@@ -185,7 +185,7 @@ fn prune_light_checkpoints(dir: &Path) -> std::io::Result<()> {
         .filter_map(|e| match e {
             Ok(entry) => Some(entry),
             Err(err) => {
-                mo_agent_core::agent_warn!(
+                astra_core::agent_warn!(
                     "checkpoint",
                     "Failed to read dir entry during prune: {}",
                     err
@@ -205,7 +205,7 @@ fn prune_light_checkpoints(dir: &Path) -> std::io::Result<()> {
     let to_remove = light_files.len() - MAX_LIGHT_CHECKPOINTS;
     for entry in light_files.into_iter().take(to_remove) {
         if let Err(err) = std::fs::remove_file(entry.path()) {
-            mo_agent_core::agent_warn!(
+            astra_core::agent_warn!(
                 "checkpoint",
                 "Failed to prune light checkpoint {:?}: {}",
                 entry.file_name(),
@@ -309,7 +309,7 @@ impl FileBackedEventStore {
 impl StepEventStore for FileBackedEventStore {
     fn append(&mut self, event: StepEvent) {
         if let Err(err) = self.persist_event(&event) {
-            mo_agent_core::agent_warn!(
+            astra_core::agent_warn!(
                 "event_store",
                 "Failed to persist step event {}: {}",
                 event.event_id,

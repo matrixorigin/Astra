@@ -209,7 +209,7 @@ impl DatabaseEdgeRegistryService {
         Self { pool }
     }
 
-    pub fn from_shared(shared: &mo_agent_core::SharedPool) -> Self {
+    pub fn from_shared(shared: &astra_core::SharedPool) -> Self {
         Self {
             pool: shared.get().clone(),
         }
@@ -397,7 +397,7 @@ impl DatabaseTaskLeaseService {
     }
 
     pub fn from_shared(
-        shared: &mo_agent_core::SharedPool,
+        shared: &astra_core::SharedPool,
         hold_cache: std::sync::Arc<TaskLeaseHoldCache>,
     ) -> Self {
         Self {

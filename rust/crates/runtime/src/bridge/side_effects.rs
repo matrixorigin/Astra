@@ -10,7 +10,7 @@ pub static PERSIST_OK_COUNT: AtomicU64 = AtomicU64::new(0);
 /// Increment the failure counter and log the error.
 fn record_persist_failure(context: &str, error: &impl std::fmt::Display) {
     PERSIST_FAIL_COUNT.fetch_add(1, Ordering::Relaxed);
-    mo_agent_core::agent_error!("persist", "{context}: {error}");
+    astra_core::agent_error!("persist", "{context}: {error}");
 }
 
 /// Increment the success counter.
@@ -722,7 +722,7 @@ async fn resolve_reflection_transfer(
         Ok(Some(mark)) => mark.reflect_output,
         Ok(None) => String::new(),
         Err(error) => {
-            mo_agent_core::agent_error!("bridge", "reflection state pop failed: {error}");
+            astra_core::agent_error!("bridge", "reflection state pop failed: {error}");
             String::new()
         }
     };

@@ -1,12 +1,12 @@
-pub use mo_agent_services::skill_config::*;
+pub use astra_services::skill_config::*;
 
 use crate::AppState;
+use astra_core::{ErrorResponse, error_response};
 use axum::{
     Json,
     extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
 };
-use mo_agent_core::{ErrorResponse, error_response};
 
 fn extract_user_id(headers: &HeaderMap) -> Result<String, (StatusCode, Json<ErrorResponse>)> {
     headers

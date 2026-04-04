@@ -1,6 +1,6 @@
 use std::{fs, path::PathBuf};
 
-use mo_agent_runtime::compact_cloud_loop_history;
+use astra_runtime::compact_cloud_loop_history;
 use serde::Deserialize;
 use serde_json::Value;
 

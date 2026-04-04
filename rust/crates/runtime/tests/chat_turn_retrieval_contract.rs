@@ -1,6 +1,6 @@
 use std::{fs, path::PathBuf};
 
-use mo_agent_runtime::{format_retrieved_events, rule_based_extraction};
+use astra_runtime::{format_retrieved_events, rule_based_extraction};
 use serde::Deserialize;
 use serde_json::{Map, Value};
 

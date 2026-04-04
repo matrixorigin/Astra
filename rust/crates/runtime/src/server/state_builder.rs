@@ -179,14 +179,14 @@ pub(super) async fn build_server_state(
     // Attach RunEngine for durable persistence of run state.
     let run_encryptor =
         Arc::new(FernetTokenEncryptor::from_env().map_err(Box::<dyn std::error::Error>::from)?);
-    let run_store = Arc::new(mo_agent_services::runs::InMemoryRunStateStore::default());
+    let run_store = Arc::new(astra_services::runs::InMemoryRunStateStore::default());
     let run_engine = crate::server::run_engine::RunEngine::new(run_store);
 
     // Wire multi-agent coordination: profile registry + delegation engine.
-    let mut profile_registry = mo_agent_services::AgentProfileRegistry::new();
+    let mut profile_registry = astra_services::AgentProfileRegistry::new();
     // Register default agent profiles so delegation validation works.
     {
-        use mo_agent_services::coordination::{AgentProfile, AgentTier};
+        use astra_services::coordination::{AgentProfile, AgentTier};
         let mut orch = AgentProfile::new("orchestrator", "Orchestrator", AgentTier::Orchestrator);
         orch.system_prompt = Some(
             "You are the orchestrator agent. Coordinate sub-agents to complete complex tasks."

@@ -1,7 +1,7 @@
 use axum::{Json, http::StatusCode};
 
 use super::types::QualityTrendPoint;
-use mo_agent_core::ErrorResponse;
+use astra_core::ErrorResponse;
 
 pub type ServiceResult<T> = Result<T, (StatusCode, Json<ErrorResponse>)>;
 

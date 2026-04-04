@@ -12,8 +12,8 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 use std::time::Instant;
 
-use mo_agent_core::RuntimeLimits;
-use mo_agent_runtime::{
+use astra_core::RuntimeLimits;
+use astra_runtime::{
     pipeline::step_protocol::InMemoryIdempotencyCache,
     pipeline::step_recorder::StepRecorder,
     plan_decompose::CHAT_PLAN_ONLY_SYSTEM,
@@ -131,7 +131,7 @@ pub(crate) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
         step_recorder,
         idempotency_cache: InMemoryIdempotencyCache::new(),
         semantic_dedup: SemanticDedup::new(
-            mo_agent_runtime::semantic_dedup::DEFAULT_SIMILARITY_THRESHOLD,
+            astra_runtime::semantic_dedup::DEFAULT_SIMILARITY_THRESHOLD,
         ),
         turn_sigs: Vec::new(),
         turn_tool_names: Vec::new(),
@@ -220,7 +220,7 @@ pub(crate) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
 #[cfg(test)]
 mod tests {
     use super::detect_turn_hook_sets;
-    use mo_agent_runtime::turn::chat_turn_heuristics::infer_task_execution_profile;
+    use astra_runtime::turn::chat_turn_heuristics::infer_task_execution_profile;
     use std::path::Path;
     use tempfile::tempdir;
 

@@ -11,8 +11,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
-use crossterm::style::Stylize;
-use mo_agent_runtime::{
+use astra_runtime::{
     pipeline::step_recorder::StepRecorder,
     tool_registry::{self, ToolRegistry},
     tool_selector::{self, ToolSelector},
@@ -46,6 +45,7 @@ use mo_agent_runtime::{
     turn::tool_schema_prune::pin_invoked_tool_schemas,
     turn::turn_guard::{TurnGuard, merge_deprioritized_tools_into_restricted},
 };
+use crossterm::style::Stylize;
 use serde_json::{Value, json};
 
 use crate::{
@@ -147,7 +147,7 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
         explain_verbose: ctx.explain.explain_verbose,
         explain_on: ctx.explain.explain_on,
         edge_executor_id: edge_executor_instance_id(),
-        capabilities: mo_thin_client::builtin_capability_preset(),
+        capabilities: astra_thin_client::builtin_capability_preset(),
         project_root: ctx.project_root,
         git_branch,
     });
@@ -178,7 +178,7 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
     };
 
     let mut boost_terms =
-        mo_agent_runtime::turn::retrieval::extract_boost_terms_from_pairs(ctx.history, ctx.message);
+        astra_runtime::turn::retrieval::extract_boost_terms_from_pairs(ctx.history, ctx.message);
     {
         let mem_start = Instant::now();
         let memory_contents = ctx.executor.memory_boost_search(ctx.message, 5).await;
@@ -189,11 +189,9 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
                     ctx.executor.add_preferred_repo(&repo);
                 }
             }
-            let ranked = mo_agent_runtime::turn::retrieval::rank_memory_results(
-                ctx.message,
-                &memory_contents,
-            );
-            mo_agent_runtime::turn::retrieval::append_boost_terms_from_ranked_memory(
+            let ranked =
+                astra_runtime::turn::retrieval::rank_memory_results(ctx.message, &memory_contents);
+            astra_runtime::turn::retrieval::append_boost_terms_from_ranked_memory(
                 &mut boost_terms,
                 ctx.message,
                 &ranked,
@@ -428,7 +426,7 @@ fn load_skill_instructions_text(
 // ─── Fetch: payload → POST → consume_turn_sse ─────────────────────────────────
 
 pub(crate) struct ChatTurnSseFetchRequest<'a> {
-    pub api: &'a mo_thin_client::ThinClient,
+    pub api: &'a astra_thin_client::ThinClient,
     pub token: &'a str,
     pub model: Option<&'a str>,
     pub explain: ExplainMode,
@@ -449,7 +447,7 @@ pub(crate) struct ChatTurnSseFetchRequest<'a> {
     pub current_session_id: Option<&'a str>,
     pub tool_results: &'a [Value],
     pub all_schemas: &'a [Value],
-    pub turn_guard: &'a mo_agent_runtime::turn::turn_guard::TurnGuard,
+    pub turn_guard: &'a astra_runtime::turn::turn_guard::TurnGuard,
     pub restricted_tools: &'a mut HashSet<String>,
     pub step_recorder: &'a mut StepRecorder,
     pub skill_registry: &'a SharedSkillRegistry,
@@ -515,12 +513,12 @@ fn chat_turn_sse_fetch_ui(
 /// The caller must drop [`ChatTurnPrepLineGuard`] when entering SSE consume (`consume_turn_sse`)
 /// or on early error after reading the body, so the stderr status line stays through TTFB.
 async fn chat_turn_post_payload_after_prepare(
-    api: &mo_thin_client::ThinClient,
+    api: &astra_thin_client::ThinClient,
     token: &str,
     quiet: bool,
     ui: &ChatTurnSseFetchUi,
     prepare: PrepareChatTurnRequest<'_>,
-) -> Result<(mo_thin_client::HttpResponse, ChatTurnPrepLineGuard), String> {
+) -> Result<(astra_thin_client::HttpResponse, ChatTurnPrepLineGuard), String> {
     let prep_line = ChatTurnPrepLineGuard::maybe_start(ui.show_prep_line, ui.prep_ui_phase.clone());
     let payload = prepare_chat_turn_payload(prepare).await;
 
@@ -691,7 +689,7 @@ pub(crate) async fn fetch_chat_turn_sse(
 
 #[cfg(test)]
 mod tests {
-    use mo_agent_runtime::turn::chat_history_openai::merge_skill_names_track;
+    use astra_runtime::turn::chat_history_openai::merge_skill_names_track;
 
     #[test]
     fn merge_skill_names_track_dedupes() {

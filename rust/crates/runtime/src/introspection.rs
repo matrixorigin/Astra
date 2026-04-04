@@ -1,6 +1,6 @@
 //! Introspection API — cloud-side data for `get_agent_info` tool.
 //!
-//! Types, trait, scoring, and database implementation live in `mo_agent_services::introspection`.
+//! Types, trait, scoring, and database implementation live in `astra_services::introspection`.
 //! This module re-exports them and adds HTTP handler functions.
 
 use axum::{
@@ -14,7 +14,7 @@ use serde_json::Value;
 use crate::{AppState, ErrorResponse};
 
 // Re-export everything from the services crate — single source of truth.
-pub use mo_agent_services::introspection::*;
+pub use astra_services::introspection::*;
 
 // ── Query parameter types (runtime-only) ─────────────────────────────────────
 

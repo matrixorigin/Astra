@@ -19,13 +19,13 @@
 //!  10. Mixed intent
 //!  11. Edge cases (short, long, emoji, URL, numbers)
 
-use mo_agent_runtime::pipeline::routing::DomainHint;
-use mo_agent_runtime::tool_registry::ToolRegistry;
-use mo_agent_runtime::tool_registry::{
+use astra_runtime::pipeline::routing::DomainHint;
+use astra_runtime::tool_registry::ToolRegistry;
+use astra_runtime::tool_registry::{
     ConversationState, IntentType, TOOL_CATALOG, pre_filter_dynamic,
 };
-use mo_agent_runtime::tool_selector::compute_selection_confidence;
-use mo_agent_runtime::tool_selector::{SelectionContext, TfIdfSelector, ToolSelector};
+use astra_runtime::tool_selector::compute_selection_confidence;
+use astra_runtime::tool_selector::{SelectionContext, TfIdfSelector, ToolSelector};
 
 // ─── Test helpers ────────────────────────────────────────────────────────────
 

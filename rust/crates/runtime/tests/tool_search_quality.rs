@@ -1,8 +1,8 @@
-use mo_agent_runtime::tool_registry::tool_pool::{
+use astra_runtime::tool_registry::tool_pool::{
     SearchableToolMeta, ToolDenyPredicate, ToolPool, ToolSchemaStore, ToolSearchConfig, ToolSource,
     select_two_phase,
 };
-use mo_agent_runtime::tool_registry::{TOOL_CATALOG, ToolRegistry};
+use astra_runtime::tool_registry::{TOOL_CATALOG, ToolRegistry};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 
@@ -181,7 +181,7 @@ fn tool_search_quality_two_phase_not_worse_than_baseline() {
         let baseline_waste = dynamic_token_cost_sum(&baseline_schemas);
 
         // Two-phase: search over huge pool, then materialize and budget gate.
-        let terms = mo_agent_runtime::text_tokenize::tokenize(c.query);
+        let terms = astra_runtime::text_tokenize::tokenize(c.query);
         let two_phase_schemas = select_two_phase(&pool, &DenySyntheticNoise, &terms, cfg);
         let two_phase_names = extract_tool_names(&two_phase_schemas);
         let two_phase_recall = recall(&two_phase_names, c.used);

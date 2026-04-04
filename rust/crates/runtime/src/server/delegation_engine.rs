@@ -22,7 +22,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use async_trait::async_trait;
 use tokio::sync::RwLock;
 
-use mo_agent_services::coordination::{
+use astra_services::coordination::{
     AgentProfile, AgentProfileRegistry, AgentResult, AggregationStrategy, CoordinationPattern,
     DelegationRequest, DelegationResult, aggregate_results,
 };
@@ -218,10 +218,7 @@ impl DelegationTracker {
     ///
     /// Called at startup to recover delegation state after a crash.
     /// Only records with `parent_run_id` set are considered (sub-runs).
-    pub async fn load_from_run_records(
-        &self,
-        records: &[mo_agent_services::runs::DurableRunRecord],
-    ) {
+    pub async fn load_from_run_records(&self, records: &[astra_services::runs::DurableRunRecord]) {
         let mut delegations = self.delegations.write().await;
         let mut parents = self.parents.write().await;
         let mut pause_flags = self.pause_flags.write().await;
@@ -736,7 +733,7 @@ impl DelegationEngine {
                 AgentProfile::new(
                     agent_id,
                     agent_id,
-                    mo_agent_services::coordination::AgentTier::User,
+                    astra_services::coordination::AgentTier::User,
                 )
             });
 
@@ -832,7 +829,7 @@ impl DelegationEngine {
                             agent_profile: AgentProfile::new(
                                 "stub",
                                 "stub",
-                                mo_agent_services::coordination::AgentTier::User,
+                                astra_services::coordination::AgentTier::User,
                             ),
                             task: String::new(),
                             session_id: String::new(),
@@ -908,7 +905,7 @@ impl DelegationEngine {
                 AgentProfile::new(
                     agent_id,
                     agent_id,
-                    mo_agent_services::coordination::AgentTier::User,
+                    astra_services::coordination::AgentTier::User,
                 )
             });
 
@@ -972,7 +969,7 @@ impl DelegationEngine {
                     AgentProfile::new(
                         agent_id,
                         agent_id,
-                        mo_agent_services::coordination::AgentTier::User,
+                        astra_services::coordination::AgentTier::User,
                     )
                 });
                 self.apply_gate(result, &delegation_id, || SubRunConfig {
@@ -1024,14 +1021,14 @@ impl DelegationEngine {
             AgentProfile::new(
                 producer_id,
                 producer_id,
-                mo_agent_services::coordination::AgentTier::System,
+                astra_services::coordination::AgentTier::System,
             )
         });
         let reviewer_profile = reg.get(reviewer_id).cloned().unwrap_or_else(|| {
             AgentProfile::new(
                 reviewer_id,
                 reviewer_id,
-                mo_agent_services::coordination::AgentTier::System,
+                astra_services::coordination::AgentTier::System,
             )
         });
         drop(reg);
@@ -1302,8 +1299,8 @@ impl DelegationEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mo_agent_services::coordination::{AgentProfile, AgentTier, PipelineStage};
-    use mo_agent_services::runs::{InMemoryRunStateStore, RunStateStore};
+    use astra_services::coordination::{AgentProfile, AgentTier, PipelineStage};
+    use astra_services::runs::{InMemoryRunStateStore, RunStateStore};
 
     fn setup() -> (
         Arc<RwLock<AgentProfileRegistry>>,
@@ -2339,7 +2336,7 @@ mod tests {
 
     #[tokio::test]
     async fn load_from_run_records_rebuilds_tracker() {
-        use mo_agent_services::runs::DurableRunRecord;
+        use astra_services::runs::DurableRunRecord;
 
         let records = vec![
             DurableRunRecord {
@@ -2435,7 +2432,7 @@ mod tests {
 
     #[test]
     fn clone_with_gate_shares_components() {
-        let run_store = Arc::new(mo_agent_services::runs::InMemoryRunStateStore::default());
+        let run_store = Arc::new(astra_services::runs::InMemoryRunStateStore::default());
         let registry = Arc::new(tokio::sync::RwLock::new(AgentProfileRegistry::new()));
         let run_engine = Arc::new(crate::server::run_engine::RunEngine::new(run_store));
         let tracker = Arc::new(DelegationTracker::new());

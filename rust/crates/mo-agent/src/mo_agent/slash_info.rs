@@ -719,7 +719,7 @@ fn print_turn_trace(ev: &session_journal::JournalEvent) {
 pub(super) async fn handle_info_command(
     cmd: &str,
     arg: &str,
-    api: &mo_thin_client::ThinClient,
+    api: &astra_thin_client::ThinClient,
     state: &mut ReplState,
     token: Option<&str>,
 ) -> Result<(), String> {
@@ -896,7 +896,7 @@ pub(super) async fn handle_info_command(
 
             // Write turn event to journal (same as normal chat turns).
             if let Some(journal) = state.journal.as_ref() {
-                let turn_event = mo_agent_services::session_journal::JournalEvent::turn(
+                let turn_event = astra_services::session_journal::JournalEvent::turn(
                     state.session_id.as_deref(),
                     state.turn,
                     state.model.as_deref(),
@@ -983,12 +983,12 @@ pub(super) async fn handle_info_command(
                         let un = v.get("username").and_then(|u| u.as_str()).unwrap_or("?");
                         rows.push((true, "auth", format!("logged in as {un}")));
                     }
-                    Err(mo_thin_client::ThinClientError::Api { status, .. })
+                    Err(astra_thin_client::ThinClientError::Api { status, .. })
                         if status.as_u16() == 401 =>
                     {
                         rows.push((false, "auth", "token expired — run /login".to_string()));
                     }
-                    Err(mo_thin_client::ThinClientError::Api { status, .. }) => {
+                    Err(astra_thin_client::ThinClientError::Api { status, .. }) => {
                         rows.push((false, "auth", format!("HTTP {status}")));
                     }
                     Err(e) => {
@@ -1019,7 +1019,7 @@ pub(super) async fn handle_info_command(
                 .is_ok();
             if memoria_key_set {
                 let memoria_base = std::env::var("MEMORIA_BASE_URL")
-                    .unwrap_or_else(|_| mo_agent_core::config::DEFAULT_MEMORIA_URL.to_string());
+                    .unwrap_or_else(|_| astra_core::config::DEFAULT_MEMORIA_URL.to_string());
                 let memoria_health = format!("{}/health", memoria_base.trim_end_matches('/'));
                 match api.get_url(&memoria_health).await {
                     Ok(r) if r.status().is_success() => {

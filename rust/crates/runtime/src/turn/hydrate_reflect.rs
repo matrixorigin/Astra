@@ -1,6 +1,6 @@
 //! Replace `reflect` placeholder output with a real session reflect fetch when needed (headless path).
 
-use mo_thin_client::{ThinClient, ThinClientError};
+use astra_thin_client::{ThinClient, ThinClientError};
 use serde_json::Value;
 
 /// Minimal query-value encoding for reflect URL (matches legacy CLI behavior).
@@ -30,7 +30,7 @@ pub fn reflect_hydration_rel_path(session_id: &str, args: &Value) -> String {
         qp.push(format!("question={}", reflect_query_encode(question)));
     }
     qp.push(format!("last_n={last_n}"));
-    let path = mo_thin_client::paths::chat_session_reflect(session_id);
+    let path = astra_thin_client::paths::chat_session_reflect(session_id);
     let base = path.trim_start_matches('/');
     format!("{base}?{}", qp.join("&"))
 }

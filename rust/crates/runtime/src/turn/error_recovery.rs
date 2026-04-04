@@ -161,13 +161,13 @@ pub fn classify_error(error_str: &str) -> ErrorCategory {
 /// Maximum retries for transient errors on a single tool call.
 /// Override with `MO_MAX_TOOL_RETRIES` env var.
 pub fn max_tool_retries() -> usize {
-    mo_agent_core::RuntimeLimits::global().max_tool_retries
+    astra_core::RuntimeLimits::global().max_tool_retries
 }
 
 /// Base delay for retry backoff (milliseconds).
 /// Override with `MO_RETRY_BASE_MS` env var.
 pub fn retry_base_ms() -> u64 {
-    mo_agent_core::RuntimeLimits::global().retry_base_ms
+    astra_core::RuntimeLimits::global().retry_base_ms
 }
 
 /// Determine if and how to retry a failed tool call.
@@ -298,7 +298,7 @@ pub fn build_recovery_message(
             tool_name
         ),
         ErrorCategory::Unknown => {
-            mo_agent_core::agent_debug!(
+            astra_core::agent_debug!(
                 "error_recovery",
                 "unclassified_error tool={} error={}",
                 tool_name,

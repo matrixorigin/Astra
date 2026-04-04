@@ -13,13 +13,13 @@
 
 use std::collections::BTreeSet;
 
-use mo_agent_runtime::{
+use astra_runtime::{
     DIVERGENCE_CORRECTION, DivergenceStatus, detect_divergence,
     tool_registry::{IntentType, TOOL_CATALOG},
 };
 
 // Re-export internal functions for testing
-use mo_agent_runtime::tool_registry::state::word_boundary_match;
+use astra_runtime::tool_registry::state::word_boundary_match;
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // SECTION 1: Universal Stemming — ALL matches by RULE, not by keyword
@@ -276,7 +276,7 @@ mod universal_stemming {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 mod recall_first {
-    use mo_agent_runtime::tool_registry::{scoring::pre_filter_dynamic, state::ConversationState};
+    use astra_runtime::tool_registry::{scoring::pre_filter_dynamic, state::ConversationState};
 
     const MIN_RECALL_TOOLS: usize = 3;
 
@@ -338,11 +338,11 @@ mod recall_first {
     #[test]
     fn diversity_github_intent_present() {
         use super::*;
-        let state = mo_agent_runtime::tool_registry::state::ConversationState::from_message(
+        let state = astra_runtime::tool_registry::state::ConversationState::from_message(
             "show me the github issues",
             1,
         );
-        let results = mo_agent_runtime::tool_registry::scoring::pre_filter_dynamic(
+        let results = astra_runtime::tool_registry::scoring::pre_filter_dynamic(
             &state,
             "show me the github issues",
         );
@@ -358,11 +358,11 @@ mod recall_first {
     #[test]
     fn diversity_git_intent_present() {
         use super::*;
-        let state = mo_agent_runtime::tool_registry::state::ConversationState::from_message(
+        let state = astra_runtime::tool_registry::state::ConversationState::from_message(
             "show me the git diff",
             1,
         );
-        let results = mo_agent_runtime::tool_registry::scoring::pre_filter_dynamic(
+        let results = astra_runtime::tool_registry::scoring::pre_filter_dynamic(
             &state,
             "show me the git diff",
         );
@@ -511,19 +511,15 @@ mod divergence_detection {
 
     #[test]
     fn turn_complete_event_healthy() {
-        let event = mo_agent_runtime::build_turn_complete_event(
-            true,
-            false,
-            &DivergenceStatus::Healthy,
-            None,
-        );
+        let event =
+            astra_runtime::build_turn_complete_event(true, false, &DivergenceStatus::Healthy, None);
         assert_eq!(event.get("has_tool_calls").unwrap(), true);
         assert!(event.get("divergence_detected").is_none());
     }
 
     #[test]
     fn turn_complete_event_diverging_stops_tool_calls() {
-        let event = mo_agent_runtime::build_turn_complete_event(
+        let event = astra_runtime::build_turn_complete_event(
             true,
             false,
             &DivergenceStatus::Diverging(4),
@@ -537,7 +533,7 @@ mod divergence_detection {
 
     #[test]
     fn turn_complete_event_exploring_does_not_stop() {
-        let event = mo_agent_runtime::build_turn_complete_event(
+        let event = astra_runtime::build_turn_complete_event(
             true,
             false,
             &DivergenceStatus::Exploring(2),
@@ -554,7 +550,7 @@ mod divergence_detection {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 mod invariants {
-    use mo_agent_runtime::tool_registry::{scoring::pre_filter_dynamic, state::ConversationState};
+    use astra_runtime::tool_registry::{scoring::pre_filter_dynamic, state::ConversationState};
 
     /// INVARIANT: Pinned tools are never in the dynamic selection.
     /// They're always included separately.
@@ -572,10 +568,10 @@ mod invariants {
             let results = pre_filter_dynamic(&state, q);
             for &(idx, _) in &results {
                 assert!(
-                    !mo_agent_runtime::tool_registry::TOOL_CATALOG[idx].pinned,
+                    !astra_runtime::tool_registry::TOOL_CATALOG[idx].pinned,
                     "Dynamic results for '{}' should not contain pinned tool '{}'",
                     q,
-                    mo_agent_runtime::tool_registry::TOOL_CATALOG[idx].name,
+                    astra_runtime::tool_registry::TOOL_CATALOG[idx].name,
                 );
             }
         }

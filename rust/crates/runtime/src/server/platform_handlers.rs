@@ -1,7 +1,7 @@
 use super::*;
 use crate::bridge::side_effects::{PERSIST_FAIL_COUNT, PERSIST_OK_COUNT};
-use mo_agent_services::agents::AgentListResponse;
-use mo_agent_services::events::EventListResponse;
+use astra_services::agents::AgentListResponse;
+use astra_services::events::EventListResponse;
 use std::sync::atomic::Ordering;
 
 /// Aggregated platform snapshot returned by `GET /platform/snapshot`.

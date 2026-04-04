@@ -567,7 +567,7 @@ impl JournalWriter {
                 || e.raw_os_error() == Some(28) // ENOSPC
                 || e.to_string().contains("No space")
             {
-                mo_agent_core::agent_error!("journal", "disk full, journal event lost");
+                astra_core::agent_error!("journal", "disk full, journal event lost");
             }
             return Err(e);
         }
