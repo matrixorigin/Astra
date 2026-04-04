@@ -1317,6 +1317,14 @@ impl TaskBranchService {
 }
 
 /// Validate a snapshot name is safe for SQL embedding (alphanumeric + underscore only).
+/// Sanitize a snapshot name to only contain `[a-zA-Z0-9_]`.
+/// Replaces any other character (notably `-`) with `_`.
+fn sanitize_snapshot_name(raw: &str) -> String {
+    raw.chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' })
+        .collect()
+}
+
 fn validate_snapshot_name(name: &str) -> Result<(), String> {
     if name.is_empty() {
         return Err("empty snapshot name".into());
@@ -1338,7 +1346,7 @@ impl TaskBranchOps for TaskBranchService {
         subtask_id: &str,
         version: u32,
     ) -> Result<String, String> {
-        let name = format!("task_{task_id}_{subtask_id}_v{version}");
+        let name = sanitize_snapshot_name(&format!("task_{task_id}_{subtask_id}_v{version}"));
         validate_snapshot_name(&name)?;
         let sql = format!("CREATE SNAPSHOT {name} FOR ACCOUNT");
         sqlx::query(&sql)
@@ -1420,7 +1428,7 @@ impl TaskBranchOps for GitBranchOps {
         subtask_id: &str,
         version: u32,
     ) -> Result<String, String> {
-        let name = format!("task_{task_id}_{subtask_id}_v{version}");
+        let name = sanitize_snapshot_name(&format!("task_{task_id}_{subtask_id}_v{version}"));
         let work = self.work_dir.clone();
 
         // Record current HEAD as the snapshot reference point.
@@ -1544,7 +1552,7 @@ impl TaskBranchOps for LocalFileBranchOps {
         subtask_id: &str,
         version: u32,
     ) -> Result<String, String> {
-        let name = format!("task_{task_id}_{subtask_id}_v{version}");
+        let name = sanitize_snapshot_name(&format!("task_{task_id}_{subtask_id}_v{version}"));
         let snap_path = self.snapshot_path(&name);
         let work = self.work_dir.clone();
         let snap = snap_path.clone();
@@ -4780,7 +4788,7 @@ mod tests {
             if self.fail_snapshot {
                 return Err("mock snapshot failure".into());
             }
-            let name = format!("task_{task_id}_{subtask_id}_v{version}");
+            let name = sanitize_snapshot_name(&format!("task_{task_id}_{subtask_id}_v{version}"));
             self.log.lock().unwrap().snapshots_created.push((
                 task_id.into(),
                 subtask_id.into(),
@@ -4853,8 +4861,10 @@ mod tests {
         // snapshot_name is populated in context
         assert!(ctx.snapshot_name.is_some());
         let snap_name = ctx.snapshot_name.unwrap();
-        assert!(snap_name.contains(&contract.task_id));
-        assert!(snap_name.contains("sub-1"));
+        // Hyphens in task_id/subtask_id are sanitized to underscores in snapshot names
+        let sanitized_id = contract.task_id.replace('-', "_");
+        assert!(snap_name.contains(&sanitized_id));
+        assert!(snap_name.contains("sub_1"));
 
         // snapshot_name is persisted in contract
         let c = svc
@@ -5311,6 +5321,23 @@ mod tests {
         assert!(validate_snapshot_name("").is_err());
         assert!(validate_snapshot_name("snap/path").is_err());
         assert!(validate_snapshot_name("snap\x00null").is_err());
+    }
+
+    #[test]
+    fn sanitize_snapshot_name_replaces_hyphens() {
+        // UUID-based task IDs have hyphens that must be replaced
+        assert_eq!(
+            sanitize_snapshot_name("task_abc-def_sub-1_v1"),
+            "task_abc_def_sub_1_v1"
+        );
+        // Already clean names pass through unchanged
+        assert_eq!(
+            sanitize_snapshot_name("task_abc_sub1_v1"),
+            "task_abc_sub1_v1"
+        );
+        // Sanitized names must pass validation
+        let sanitized = sanitize_snapshot_name("task_7bfcf9b1-1234_api-auth_v2");
+        assert!(validate_snapshot_name(&sanitized).is_ok());
     }
 
     #[tokio::test]
