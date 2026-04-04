@@ -11,6 +11,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
+use crate::theme;
+
 use astra_runtime::{
     pipeline::step_recorder::StepRecorder,
     tool_registry::{self, ToolRegistry},
@@ -407,7 +409,7 @@ fn load_skill_instructions_text(
         if let Err(e) = o.result {
             eprintln!(
                 "  {} {}",
-                "⚠".yellow(),
+                theme::icon_warn(),
                 skill_instruction_load_failed_message(o.skill_name.as_str(), e.as_str())
             );
         }

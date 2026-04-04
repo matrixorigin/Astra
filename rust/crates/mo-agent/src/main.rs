@@ -842,7 +842,7 @@ async fn handle_resume_command(arg: &str, profile: Option<&str>, state: &mut Rep
             if resolved != arg {
                 eprintln!(
                     "  {} Resolved {} → {}",
-                    "✓".green(),
+                    theme::icon_ok(),
                     arg.cyan(),
                     resolved.as_str().cyan()
                 );
@@ -980,7 +980,7 @@ async fn handle_resume_command(arg: &str, profile: Option<&str>, state: &mut Rep
                             Err(e) => {
                                 eprintln!(
                                     "  {} Cloud checkpoint corrupted, skipping",
-                                    "⚠".yellow()
+                                    theme::icon_warn()
                                 );
                                 eprintln!("{}", format!("     ({e})").dim());
                             }
@@ -988,7 +988,7 @@ async fn handle_resume_command(arg: &str, profile: Option<&str>, state: &mut Rep
                     }
                     Ok(None) => {} // No cloud checkpoint available
                     Err(e) => {
-                        eprintln!("  {} Cloud checkpoint unavailable", "⚠".yellow());
+                        eprintln!("  {} Cloud checkpoint unavailable", theme::icon_warn());
                         eprintln!("{}", format!("     ({e})").dim());
                     }
                 }
@@ -1099,7 +1099,7 @@ async fn handle_resume_command(arg: &str, profile: Option<&str>, state: &mut Rep
             };
             eprintln!(
                 "  {} Resumed session {} ({}, {} turns, {} checkpoints)",
-                "✓".green(),
+                theme::icon_ok(),
                 &session_id[..8.min(session_id.len())].cyan(),
                 source,
                 restored.turn_count,
@@ -1149,7 +1149,7 @@ async fn handle_resume_command(arg: &str, profile: Option<&str>, state: &mut Rep
                     state.history = repl_runtime::restore_history_from_journal(&session_id);
                     eprintln!(
                         "  {} Restored {} turns from journal {}. Next message starts a new session.",
-                        "✓".green(),
+                        theme::icon_ok(),
                         turn_count,
                         &session_id[..8.min(session_id.len())].cyan(),
                     );
@@ -1778,7 +1778,10 @@ async fn handle_sync_push(state: &ReplState) {
         .filter(|(_, s)| s.is_dirty())
         .count();
     if dirty_count == 0 {
-        eprintln!("  {} All domains clean — nothing to push.", "✓".green());
+        eprintln!(
+            "  {} All domains clean — nothing to push.",
+            theme::icon_ok()
+        );
         eprintln!(
             "{}",
             "────────────────────────────────────────────────".dim()
@@ -1807,7 +1810,7 @@ async fn handle_sync_push(state: &ReplState) {
                 .unwrap_or_else(|| "-".into());
             eprintln!(
                 "  {} {:<14} {} ({}ms)",
-                "✓".green(),
+                theme::icon_ok(),
                 format!("{}", r.domain).cyan(),
                 version_str.dim(),
                 r.duration_ms,
@@ -1817,7 +1820,7 @@ async fn handle_sync_push(state: &ReplState) {
             let err = r.error.as_deref().unwrap_or("unknown error");
             eprintln!(
                 "  {} {:<14} {}",
-                "✗".red(),
+                theme::icon_err(),
                 format!("{}", r.domain).cyan(),
                 err.red(),
             );
@@ -1907,7 +1910,7 @@ async fn handle_sync_pull(state: &ReplState) {
                 .unwrap_or_default();
             eprintln!(
                 "  {} {:<14} {}{} ({}ms)",
-                "✓".green(),
+                theme::icon_ok(),
                 format!("{}", r.domain).cyan(),
                 version_str.dim(),
                 merge_str.dim(),
@@ -1918,7 +1921,7 @@ async fn handle_sync_pull(state: &ReplState) {
             let err = r.error.as_deref().unwrap_or("unknown error");
             eprintln!(
                 "  {} {:<14} {}",
-                "✗".red(),
+                theme::icon_err(),
                 format!("{}", r.domain).cyan(),
                 err.red(),
             );
@@ -2029,9 +2032,13 @@ fn handle_learn_command(arg: &str, state: &ReplState) {
                 "─── Drift Detection ────────────────────────────".bold()
             );
             if reports.is_empty() {
-                eprintln!("  {} No drifting patterns detected", "✓".green());
+                eprintln!("  {} No drifting patterns detected", theme::icon_ok());
             } else {
-                eprintln!("  {} {} pattern(s) drifting:", "⚠".yellow(), reports.len());
+                eprintln!(
+                    "  {} {} pattern(s) drifting:",
+                    theme::icon_warn(),
+                    reports.len()
+                );
                 eprintln!();
                 for r in &reports {
                     let severity = if r.is_critical {
@@ -2070,7 +2077,10 @@ fn handle_learn_command(arg: &str, state: &ReplState) {
                 "─── Exploration Opportunities ──────────────────".bold()
             );
             if opps.is_empty() {
-                eprintln!("  {} All domains have sufficient confidence", "✓".green());
+                eprintln!(
+                    "  {} All domains have sufficient confidence",
+                    theme::icon_ok()
+                );
             } else {
                 for opp in &opps {
                     let reason_str = match opp.reason {
@@ -2761,7 +2771,7 @@ fn display_plan_updates_live(
                 }
                 let msg = format!(
                     "\n{}  {} — {}\n   {}\n   Reason: {}",
-                    "⚠".yellow(),
+                    theme::icon_warn(),
                     tool,
                     header,
                     detail.as_deref().unwrap_or(""),
@@ -2877,7 +2887,7 @@ fn merge_learning_snapshot(
             if n > 0 {
                 eprintln!(
                     "  {} Merged learning: {} entities, {} patterns",
-                    "✓".green(),
+                    theme::icon_ok(),
                     snapshot.entities.len(),
                     snapshot.patterns.len(),
                 );
@@ -3447,7 +3457,7 @@ async fn handle_task_command(arg: &str, state: &mut ReplState) {
                     let short = &tid[..8.min(tid.len())];
                     eprintln!(
                         "  {} Task created: {} ({})",
-                        "✓".green(),
+                        theme::icon_ok(),
                         sub_arg,
                         short.dim()
                     );
@@ -3459,7 +3469,7 @@ async fn handle_task_command(arg: &str, state: &mut ReplState) {
             // Find task by prefix match on task_id or title
             match find_task_by_query(&*svc, user_id, sub_arg).await {
                 Ok(Some(tid)) => match svc.complete_task(&tid).await {
-                    Ok(()) => eprintln!("  {} Task completed: {}", "✓".green(), sub_arg),
+                    Ok(()) => eprintln!("  {} Task completed: {}", theme::icon_ok(), sub_arg),
                     Err(e) => eprintln!("{}", format!("  ✗ {e}").red()),
                 },
                 Ok(None) => {
@@ -3938,7 +3948,7 @@ async fn run_chat_repl(
     {
         eprintln!(
             "  {}  {} {}",
-            "⚠".yellow(),
+            theme::icon_warn(),
             "HTTP proxy detected:".yellow(),
             proxy.dim()
         );
@@ -3956,7 +3966,7 @@ async fn run_chat_repl(
     if state.model.as_deref() == Some("⚠ none") {
         eprintln!(
             "  {}  {}",
-            "⚠".yellow(),
+            theme::icon_warn(),
             "No LLM model configured on server. Run: astra-admin model add".yellow()
         );
         eprintln!();
@@ -4029,15 +4039,18 @@ async fn run_chat_repl(
                     if approved || denied {
                         let _ = tx.send(approved);
                         if approved {
-                            eprintln!("  {} Approved", "✓".green());
+                            eprintln!("  {} Approved", theme::icon_ok());
                         } else {
-                            eprintln!("  {} Denied", "✗".red());
+                            eprintln!("  {} Denied", theme::icon_err());
                         }
                         continue;
                     } else {
                         // Unrecognized — treat as deny and fall through
                         let _ = tx.send(false);
-                        eprintln!("  {} Unrecognized response, treating as denied", "✗".red());
+                        eprintln!(
+                            "  {} Unrecognized response, treating as denied",
+                            theme::icon_err()
+                        );
                         // Fall through to normal input handling
                     }
                 }
@@ -4297,7 +4310,7 @@ async fn run_chat_repl(
                         if let Some(tx) = state.pending_approval.take() {
                             let _ = tx.send(false);
                         }
-                        eprintln!("\n{}  Cancelling plan execution…", "✗".red());
+                        eprintln!("\n{}  Cancelling plan execution…", theme::icon_err());
                     } else {
                         // First Ctrl+C → pause
                         let _ = handle.send_command(plan_executor::PlanCommand::Pause);

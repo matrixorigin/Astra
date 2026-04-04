@@ -13,6 +13,8 @@ use std::time::Duration;
 
 use crossterm::style::Stylize;
 
+use crate::theme;
+
 // ─── Plan Update Events (channel protocol) ───────────────────────────────────
 
 /// Events emitted by the plan executor through the mpsc channel.
@@ -218,7 +220,7 @@ impl PlanOutputSink for StderrSink {
             .unwrap_or_default();
         eprintln!(
             "\n{}  Subtask done: {} ({}%){}",
-            "✓".green(),
+            theme::icon_ok(),
             title,
             pct,
             elapsed_str.dim()
@@ -238,7 +240,7 @@ impl PlanOutputSink for StderrSink {
         if retries_exhausted {
             eprintln!(
                 "  {}  Verification failed (attempt {}/{}){}: {}",
-                "⚠".yellow(),
+                theme::icon_warn(),
                 attempt,
                 max_retries,
                 hint,
@@ -268,7 +270,7 @@ impl PlanOutputSink for StderrSink {
     fn global_verification_failed(&self) {
         eprintln!(
             "\n{}  Global verification failed. Plan remains active for fixes.",
-            "⚠".yellow()
+            theme::icon_warn()
         );
     }
 

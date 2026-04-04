@@ -612,7 +612,11 @@ fn print_turn_trace(ev: &session_journal::JournalEvent) {
         for (i, tc) in calls.iter().enumerate() {
             let is_last = i == calls.len() - 1;
             let branch = if is_last { "└─" } else { "├─" };
-            let status = if tc.ok { "✓".green() } else { "✗".red() };
+            let status = if tc.ok {
+                theme::icon_ok()
+            } else {
+                theme::icon_err()
+            };
 
             // Build I/O size annotation
             let io_info = match (tc.input_bytes, tc.output_bytes) {

@@ -1153,7 +1153,7 @@ impl StreamRenderState {
         // Cursor-style format: original description with result appended
         let (icon, line) = if status == "error" {
             let err_msg = output_summary.unwrap_or_else(|| "failed".to_string());
-            (format!("{}", "✗".red()), format!("    {}", err_msg.red()))
+            (theme::icon_err(), format!("    {}", err_msg.red()))
         } else {
             let summary_line = match output_summary {
                 Some(summary) => format!("    {}", summary.dim()),
@@ -1174,7 +1174,7 @@ impl StreamRenderState {
             };
             let mut out_lines = 1usize;
             if status == "error" {
-                eprintln!("  {} {}{}", "✗".red(), description, dur_display);
+                eprintln!("  {} {}{}", theme::icon_err(), description, dur_display);
             } else {
                 eprintln!("  {} {}{}", "⬢".green(), description, dur_display);
             }

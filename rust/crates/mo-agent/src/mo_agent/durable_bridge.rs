@@ -15,6 +15,8 @@ use async_trait::async_trait;
 use crossterm::style::Stylize;
 use std::sync::Arc;
 
+use crate::theme;
+
 /// Build a reqwest client that skips the system proxy for localhost/loopback URLs.
 /// External URLs use the default proxy from `HTTP_PROXY`/`HTTPS_PROXY` env vars.
 fn build_client_for_url(url: &str) -> reqwest::Client {
@@ -59,7 +61,11 @@ pub async fn generate_contract(
     let contract = match cg.generate(goal, plan, None) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("  {}  Contract generation skipped: {}", "⚠".yellow(), e);
+            eprintln!(
+                "  {}  Contract generation skipped: {}",
+                theme::icon_warn(),
+                e
+            );
             return None;
         }
     };
@@ -91,14 +97,18 @@ pub async fn generate_contract(
                     Some(amended)
                 }
                 Err(e) => {
-                    eprintln!("  {}  Criteria injection failed: {}", "⚠".yellow(), e,);
+                    eprintln!("  {}  Criteria injection failed: {}", theme::icon_warn(), e,);
                     display_contract_summary(&persisted);
                     Some(persisted)
                 }
             }
         }
         Err(e) => {
-            eprintln!("  {}  Contract persistence failed: {}", "⚠".yellow(), e);
+            eprintln!(
+                "  {}  Contract persistence failed: {}",
+                theme::icon_warn(),
+                e
+            );
             // Return the in-memory contract anyway so verification still works
             display_contract_summary(&contract);
             Some(contract)
@@ -169,7 +179,7 @@ pub async fn on_subtask_begin(durable: &DurableTaskState, subtask_id: &str) {
     {
         eprintln!(
             "  {}  Snapshot skipped for {}: {}",
-            "⚠".yellow(),
+            theme::icon_warn(),
             subtask_id,
             e,
         );
@@ -190,7 +200,7 @@ pub async fn on_subtask_complete(durable: &mut DurableTaskState, subtask_id: &st
     {
         eprintln!(
             "  {}  Diff capture failed for {}: {}",
-            "⚠".yellow(),
+            theme::icon_warn(),
             subtask_id,
             e,
         );
@@ -245,7 +255,7 @@ pub async fn on_subtask_complete(durable: &mut DurableTaskState, subtask_id: &st
         Err(e) => {
             eprintln!(
                 "  {}  Verification error for {}: {}",
-                "⚠".yellow(),
+                theme::icon_warn(),
                 subtask_id,
                 e,
             );
@@ -400,14 +410,14 @@ pub async fn on_plan_complete(durable: &mut DurableTaskState) -> bool {
                         save_delivery_report_json(&report);
                         durable.last_report = Some(report);
                     }
-                    Err(e) => eprintln!("  {}  Delivery report failed: {}", "⚠".yellow(), e,),
+                    Err(e) => eprintln!("  {}  Delivery report failed: {}", theme::icon_warn(), e,),
                 }
             }
 
             all_passed
         }
         Err(e) => {
-            eprintln!("  {}  Global verification error: {}", "⚠".yellow(), e,);
+            eprintln!("  {}  Global verification error: {}", theme::icon_warn(), e,);
             true // Don't block plan on verification infra failure
         }
     }
@@ -595,7 +605,7 @@ pub(super) fn save_delivery_report_json(report: &TaskDeliveryReport) {
     match serde_json::to_string_pretty(report) {
         Ok(json) => {
             if let Err(e) = std::fs::write(&path, &json) {
-                eprintln!("  {}  Could not save report: {}", "⚠".yellow(), e,);
+                eprintln!("  {}  Could not save report: {}", theme::icon_warn(), e,);
             } else {
                 eprintln!(
                     "  {}",
@@ -604,7 +614,11 @@ pub(super) fn save_delivery_report_json(report: &TaskDeliveryReport) {
             }
         }
         Err(e) => {
-            eprintln!("  {}  Could not serialize report: {}", "⚠".yellow(), e,);
+            eprintln!(
+                "  {}  Could not serialize report: {}",
+                theme::icon_warn(),
+                e,
+            );
         }
     }
 }

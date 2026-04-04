@@ -421,7 +421,7 @@ pub(super) async fn handle_state_command(
             };
             eprintln!(
                 "  {} {} turns compacted · {} turns in context{}",
-                "✓".green(),
+                theme::icon_ok(),
                 trimmed_count,
                 state.history.len(),
                 mem_note,

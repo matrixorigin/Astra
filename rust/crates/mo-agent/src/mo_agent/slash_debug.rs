@@ -398,7 +398,11 @@ fn show_tools(view: Option<&TurnMessagesView>, summary: &TurnSummary) {
     eprintln!("\n  {}", "── Tool Calls ──".bold());
     // From journal (always available)
     for tc in &summary.tool_calls {
-        let status = if tc.ok { "✓".green() } else { "✗".red() };
+        let status = if tc.ok {
+            theme::icon_ok()
+        } else {
+            theme::icon_err()
+        };
         let preview = tc.args_preview.as_deref().unwrap_or("");
         eprintln!(
             "  {status} {} {}  {}",
@@ -534,12 +538,12 @@ fn dump_turn_json(
         Ok(s) => match std::fs::write(&path, s) {
             Ok(()) => eprintln!(
                 "  {} {}",
-                "✓".green(),
+                theme::icon_ok(),
                 format!("Written to {}", path.display()).dim()
             ),
-            Err(e) => eprintln!("  {} {}", "✗".red(), e),
+            Err(e) => eprintln!("  {} {}", theme::icon_err(), e),
         },
-        Err(e) => eprintln!("  {} {}", "✗".red(), e),
+        Err(e) => eprintln!("  {} {}", theme::icon_err(), e),
     }
 }
 

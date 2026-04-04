@@ -382,7 +382,7 @@ pub(super) fn handle_session_command(arg: &str, state: &mut ReplState) {
                     let new_sid = res.new_session_id.clone();
                     eprintln!(
                         "  {} New session {} (fork of {})",
-                        "✓".green(),
+                        theme::icon_ok(),
                         new_sid.as_str().cyan(),
                         parent_id.dim()
                     );
@@ -429,7 +429,7 @@ pub(super) fn handle_session_command(arg: &str, state: &mut ReplState) {
             if resolved_prefix {
                 eprintln!(
                     "  {} Resolved {} → {}",
-                    "✓".green(),
+                    theme::icon_ok(),
                     sub_arg.cyan(),
                     target_sid.as_str().cyan()
                 );
@@ -492,7 +492,7 @@ pub(super) fn handle_session_command(arg: &str, state: &mut ReplState) {
                                             .collect::<String>();
                                         eprintln!(
                                             "    {} {} ({}ms) {}",
-                                            "✗".red(),
+                                            theme::icon_err(),
                                             tc.name,
                                             tc.ms,
                                             err_preview.dim(),
@@ -504,7 +504,7 @@ pub(super) fn handle_session_command(arg: &str, state: &mut ReplState) {
                                 eprintln!(
                                     "  {} {} T{} error: {}",
                                     ts_short.dim(),
-                                    "✗".red(),
+                                    theme::icon_err(),
                                     evt.turn.unwrap_or(0),
                                     evt.error.as_deref().unwrap_or("unknown").red(),
                                 );
@@ -531,7 +531,7 @@ pub(super) fn handle_session_command(arg: &str, state: &mut ReplState) {
                                 eprintln!(
                                     "  {} {} {}",
                                     ts_short.dim(),
-                                    "✗".red(),
+                                    theme::icon_err(),
                                     evt.error.as_deref().unwrap_or("unknown error").red(),
                                 );
                             }
@@ -547,7 +547,7 @@ pub(super) fn handle_session_command(arg: &str, state: &mut ReplState) {
                                 eprintln!(
                                     "  {} {} T{} stall: {}",
                                     ts_short.dim(),
-                                    "⚠".yellow(),
+                                    theme::icon_warn(),
                                     evt.turn.unwrap_or(0),
                                     evt.stall_type.as_deref().unwrap_or("unknown").yellow(),
                                 );
@@ -749,7 +749,11 @@ pub(super) fn handle_session_command(arg: &str, state: &mut ReplState) {
                                     .and_then(|m| m.get("passed"))
                                     .and_then(|v| v.as_bool())
                                     .unwrap_or(false);
-                                let icon = if passed { "✓".green() } else { "✗".red() };
+                                let icon = if passed {
+                                    theme::icon_ok()
+                                } else {
+                                    theme::icon_err()
+                                };
                                 eprintln!(
                                     "  {} {} {} verification {}",
                                     ts_short.dim(),
@@ -843,7 +847,7 @@ pub(super) fn handle_session_command(arg: &str, state: &mut ReplState) {
             if resolved_prefix {
                 eprintln!(
                     "  {} Resolved {} → {}",
-                    "✓".green(),
+                    theme::icon_ok(),
                     sub_arg.cyan(),
                     target_sid.as_str().cyan()
                 );
@@ -898,7 +902,7 @@ pub(super) fn handle_session_command(arg: &str, state: &mut ReplState) {
             if resolved_prefix {
                 eprintln!(
                     "  {} Resolved {} → {}",
-                    "✓".green(),
+                    theme::icon_ok(),
                     sub_arg.cyan(),
                     target_sid.as_str().cyan()
                 );
@@ -977,7 +981,9 @@ pub(super) fn handle_session_command(arg: &str, state: &mut ReplState) {
                     let export_path =
                         format!("session-{}.md", &target_sid[..8.min(target_sid.len())]);
                     match std::fs::write(&export_path, &md) {
-                        Ok(_) => eprintln!("  {} Exported to {}", "✓".green(), export_path.cyan()),
+                        Ok(_) => {
+                            eprintln!("  {} Exported to {}", theme::icon_ok(), export_path.cyan())
+                        }
                         Err(e) => {
                             eprintln!("{}", format!("  ✗ Failed to write: {e}").red())
                         }

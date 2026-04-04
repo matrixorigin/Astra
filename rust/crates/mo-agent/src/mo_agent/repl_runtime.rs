@@ -105,7 +105,7 @@ fn create_tool_selector_with_quality_internal(
             if announce_skills && !registered.is_empty() {
                 eprintln!(
                     "  {} Discovered {} skills from {:?}: {:?}",
-                    "✓".green(),
+                    theme::icon_ok(),
                     registered.len(),
                     skills_path,
                     registered
@@ -224,7 +224,7 @@ pub(super) async fn try_silent_auth(api: &astra_thin_client::ThinClient, profile
     if let Some(refresh) = prof.and_then(|p| p.refresh_token.as_ref())
         && try_refresh_token(api, profile, refresh).await.is_ok()
     {
-        eprintln!("  {} Token refreshed", "✓".green());
+        eprintln!("  {} Token refreshed", theme::icon_ok());
         return;
     }
 

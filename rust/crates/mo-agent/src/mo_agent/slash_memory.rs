@@ -61,7 +61,7 @@ async fn collect_sse_text(resp: reqwest::Response, stream_to_stderr: bool) -> Ss
                                     .or_else(|| json.get("error"))
                                     .and_then(|v| v.as_str())
                                 {
-                                    eprintln!("\r  {} Server error: {}", "✗".red(), msg);
+                                    eprintln!("\r  {} Server error: {}", theme::icon_err(), msg);
                                 }
                             }
                             _ => {}
@@ -133,7 +133,7 @@ async fn enrich_with_templates(
 }
 
 fn eprint_plan_json_parse_failed(full_text: &str, err: &str) {
-    eprintln!("  {} Failed to parse plan: {}", "✗".red(), err);
+    eprintln!("  {} Failed to parse plan: {}", theme::icon_err(), err);
     let prev = plan_decompose::plan_response_parse_error_preview(full_text, 10, 700);
     if !prev.is_empty() {
         eprintln!("  {}", "Model reply:".dim());
@@ -281,7 +281,7 @@ pub(super) async fn handle_memory_domain_command(
                     if state.plan_mode.is_some() {
                         eprintln!(
                             "  {} Leave structured plan mode first (`exit` or `/plan`), then `/plan on`.",
-                            "⚠".yellow()
+                            theme::icon_warn()
                         );
                         return Ok(());
                     }
@@ -339,7 +339,7 @@ pub(super) async fn handle_memory_domain_command(
                         if let Some(ref ps) = state.plan_mode
                             && let Err(e) = ps.save_to_file(&PlanModeState::state_path())
                         {
-                            eprintln!("  {} Failed to save plan state: {e}", "⚠".yellow());
+                            eprintln!("  {} Failed to save plan state: {e}", theme::icon_warn());
                         }
                         state.plan_mode = None;
                         eprintln!("  {} Exited plan mode", "←".cyan());
@@ -444,7 +444,7 @@ pub(super) async fn handle_memory_domain_command(
                         .await
                     {
                         Ok(r) if r.status().is_success() => {
-                            eprintln!("  {} Plan saved to memory.", "✓".green());
+                            eprintln!("  {} Plan saved to memory.", theme::icon_ok());
                         }
                         Ok(r) => eprintln!("{}", format!("  ✗ Failed ({})", r.status()).red()),
                         Err(e) => eprintln!("{}", format!("  ✗ Unreachable: {e}").red()),
@@ -456,7 +456,7 @@ pub(super) async fn handle_memory_domain_command(
                     );
                     match api.post_memory_purge_json(tok, &payload).await {
                         Ok(r) if r.status().is_success() => {
-                            eprintln!("  {} Plan cleared.", "✓".green());
+                            eprintln!("  {} Plan cleared.", theme::icon_ok());
                         }
                         Ok(r) => eprintln!("{}", format!("  ✗ Failed ({})", r.status()).red()),
                         Err(e) => eprintln!("{}", format!("  ✗ Unreachable: {e}").red()),
@@ -471,7 +471,7 @@ pub(super) async fn handle_memory_domain_command(
 
                     eprintln!(
                         "  {} {} languages, {} files, {}",
-                        "✓".green(),
+                        theme::icon_ok(),
                         context.languages.len(),
                         context.source_file_count,
                         context.entry_points.join(", ")
@@ -562,7 +562,7 @@ pub(super) async fn handle_memory_domain_command(
                     };
 
                     let Some(tok) = token else {
-                        eprintln!("  {} Not logged in. Run /login first.", "✗".red());
+                        eprintln!("  {} Not logged in. Run /login first.", theme::icon_err());
                         return Ok(());
                     };
 
@@ -690,7 +690,7 @@ pub(super) async fn handle_memory_domain_command(
                             );
                         }
                         Err(_) => {
-                            eprintln!("  {} No saved plan state to resume", "⚠".yellow());
+                            eprintln!("  {} No saved plan state to resume", theme::icon_warn());
                         }
                     }
                 }
@@ -698,7 +698,7 @@ pub(super) async fn handle_memory_domain_command(
                     if state.plan_mode.is_some() {
                         state.plan_mode = None;
                         plan_decompose::PlanModeState::clear_saved_state();
-                        eprintln!("  {} Exited plan mode", "✓".green());
+                        eprintln!("  {} Exited plan mode", theme::icon_ok());
                     } else {
                         eprintln!("  ⚠️ Not in plan mode");
                     }
@@ -717,7 +717,7 @@ pub(super) async fn handle_memory_domain_command(
                                 if with_plans.is_empty() {
                                     eprintln!(
                                         "  {} No cloud plans found. Use /plan auto <goal> to create one.",
-                                        "⚠".yellow()
+                                        theme::icon_warn()
                                     );
                                 } else {
                                     eprintln!("\n{}  Cloud Plans", "☁️".cyan());
@@ -753,7 +753,10 @@ pub(super) async fn handle_memory_domain_command(
                             Err(e) => eprintln!("{}", format!("  ✗ {e}").red()),
                         }
                     } else {
-                        eprintln!("  {} Cloud not available. Use /login first.", "⚠".yellow());
+                        eprintln!(
+                            "  {} Cloud not available. Use /login first.",
+                            theme::icon_warn()
+                        );
                     }
                 }
                 "load" if !sub_arg.is_empty() => {
@@ -780,14 +783,14 @@ pub(super) async fn handle_memory_domain_command(
                                         else {
                                             eprintln!(
                                                 "  {} Failed to load task details.",
-                                                "✗".red()
+                                                theme::icon_err()
                                             );
                                             return Ok(());
                                         };
                                         let Some(plan) = task.plan.as_ref() else {
                                             eprintln!(
                                                 "  {} Task '{}' has no plan",
-                                                "⚠".yellow(),
+                                                theme::icon_warn(),
                                                 query
                                             );
                                             return Ok(());
@@ -819,7 +822,7 @@ pub(super) async fn handle_memory_domain_command(
                                     None => {
                                         eprintln!(
                                             "  {} No task found matching '{}'",
-                                            "⚠".yellow(),
+                                            theme::icon_warn(),
                                             query
                                         );
                                         eprintln!(
@@ -832,7 +835,10 @@ pub(super) async fn handle_memory_domain_command(
                             Err(e) => eprintln!("{}", format!("  ✗ {e}").red()),
                         }
                     } else {
-                        eprintln!("  {} Cloud not available. Use /login first.", "⚠".yellow());
+                        eprintln!(
+                            "  {} Cloud not available. Use /login first.",
+                            theme::icon_warn()
+                        );
                     }
                 }
                 "list" => {
@@ -869,7 +875,7 @@ pub(super) async fn handle_memory_domain_command(
                         Some(plan) => {
                             eprintln!(
                                 "  {} Template '{}' instantiated with {} subtasks",
-                                "✓".green(),
+                                theme::icon_ok(),
                                 name,
                                 plan.subtasks.len()
                             );
@@ -894,7 +900,7 @@ pub(super) async fn handle_memory_domain_command(
                                 .collect();
                             eprintln!(
                                 "  {} Template '{}' not found. Available: {}",
-                                "⚠".yellow(),
+                                theme::icon_warn(),
                                 name,
                                 names.join(", ")
                             );
@@ -906,14 +912,14 @@ pub(super) async fn handle_memory_domain_command(
                     let rating_str = sub_arg.trim();
 
                     if rating_str == "skip" {
-                        eprintln!("  {} Feedback skipped", "⚠".yellow());
+                        eprintln!("  {} Feedback skipped", theme::icon_warn());
                         return Ok(());
                     }
 
                     let rating: u8 = match rating_str.parse() {
                         Ok(r) if (1..=5).contains(&r) => r,
                         _ => {
-                            eprintln!("  {} Rating must be 1-5 (or 'skip')", "⚠".yellow());
+                            eprintln!("  {} Rating must be 1-5 (or 'skip')", theme::icon_warn());
                             return Ok(());
                         }
                     };
@@ -970,7 +976,7 @@ pub(super) async fn handle_memory_domain_command(
                                                     + &"☆".repeat(5 - rating as usize);
                                                 eprintln!(
                                                     "  {} Feedback recorded: {} ({})",
-                                                    "✓".green(),
+                                                    theme::icon_ok(),
                                                     stars.yellow(),
                                                     outcome.as_str()
                                                 );
@@ -998,7 +1004,7 @@ pub(super) async fn handle_memory_domain_command(
                                                         Err(e) => {
                                                             eprintln!(
                                                                 "  {} Template extraction failed: {}",
-                                                                "⚠".yellow(),
+                                                                theme::icon_warn(),
                                                                 e
                                                             );
                                                         }
@@ -1008,7 +1014,7 @@ pub(super) async fn handle_memory_domain_command(
                                             Err(e) => {
                                                 eprintln!(
                                                     "  {} Could not record feedback: {}",
-                                                    "⚠".yellow(),
+                                                    theme::icon_warn(),
                                                     e
                                                 );
                                             }
@@ -1016,20 +1022,20 @@ pub(super) async fn handle_memory_domain_command(
                                     } else {
                                         eprintln!(
                                             "  {} No task found for current goal",
-                                            "⚠".yellow()
+                                            theme::icon_warn()
                                         );
                                     }
                                 }
                                 Err(e) => eprintln!("{}", format!("  ✗ {e}").red()),
                             }
                         } else {
-                            eprintln!("  {} No active plan to rate", "⚠".yellow());
+                            eprintln!("  {} No active plan to rate", theme::icon_warn());
                         }
                     } else {
                         // Store rating locally
                         eprintln!(
                             "  {} Rating {} recorded locally (cloud sync not available)",
-                            "✓".green(),
+                            theme::icon_ok(),
                             "★".repeat(rating as usize).yellow()
                         );
                     }
@@ -1106,10 +1112,10 @@ pub(super) async fn handle_memory_domain_command(
                                 Err(e) => eprintln!("{}", format!("  ✗ {e}").red()),
                             }
                         } else {
-                            eprintln!("  {} Cloud service not available", "⚠".yellow());
+                            eprintln!("  {} Cloud service not available", theme::icon_warn());
                         }
                     } else {
-                        eprintln!("  {} Usage: /plan recommend <goal>", "⚠".yellow());
+                        eprintln!("  {} Usage: /plan recommend <goal>", theme::icon_warn());
                     }
                 }
                 "stats" => {
@@ -1161,10 +1167,10 @@ pub(super) async fn handle_memory_domain_command(
                                 Err(e) => eprintln!("{}", format!("  ✗ {e}").red()),
                             }
                         } else {
-                            eprintln!("  {} Cloud service not available", "⚠".yellow());
+                            eprintln!("  {} Cloud service not available", theme::icon_warn());
                         }
                     } else {
-                        eprintln!("  {} Usage: /plan stats <pattern>", "⚠".yellow());
+                        eprintln!("  {} Usage: /plan stats <pattern>", theme::icon_warn());
                     }
                 }
                 "history" => {
@@ -1174,7 +1180,7 @@ pub(super) async fn handle_memory_domain_command(
                     } else {
                         eprintln!(
                             "  {} Not in plan mode. Use /plan enter <goal> first.",
-                            "⚠".yellow()
+                            theme::icon_warn()
                         );
                     }
                 }
@@ -1202,7 +1208,7 @@ pub(super) async fn handle_memory_domain_command(
                             }
                         }
                     } else {
-                        eprintln!("  {} Not in plan mode.", "⚠".yellow());
+                        eprintln!("  {} Not in plan mode.", theme::icon_warn());
                     }
                 }
                 "diff" if !sub_arg.is_empty() => {
@@ -1214,7 +1220,7 @@ pub(super) async fn handle_memory_domain_command(
                             {
                                 match ps.version_history.diff_versions(from, to) {
                                     Ok(diff) => eprintln!("{}", diff.format()),
-                                    Err(e) => eprintln!("  {} {}", "⚠".yellow(), e),
+                                    Err(e) => eprintln!("  {} {}", theme::icon_warn(), e),
                                 }
                             } else {
                                 eprintln!("  Usage: /plan diff <from_version> <to_version>");
@@ -1223,7 +1229,7 @@ pub(super) async fn handle_memory_domain_command(
                             eprintln!("  Usage: /plan diff <from_version> <to_version>");
                         }
                     } else {
-                        eprintln!("  {} Not in plan mode.", "⚠".yellow());
+                        eprintln!("  {} Not in plan mode.", theme::icon_warn());
                     }
                 }
                 "rollback" if !sub_arg.is_empty() => {
@@ -1231,16 +1237,16 @@ pub(super) async fn handle_memory_domain_command(
                         if let Ok(version) = sub_arg.trim().parse::<u32>() {
                             match ps.rollback_to_version(version) {
                                 Ok(msg) => {
-                                    eprintln!("  {} {}", "✓".green(), msg);
+                                    eprintln!("  {} {}", theme::icon_ok(), msg);
                                     eprintln!("{}", plan_decompose::format_plan(&ps.plan));
                                 }
-                                Err(e) => eprintln!("  {} {}", "⚠".yellow(), e),
+                                Err(e) => eprintln!("  {} {}", theme::icon_warn(), e),
                             }
                         } else {
                             eprintln!("  Usage: /plan rollback <version_number>");
                         }
                     } else {
-                        eprintln!("  {} Not in plan mode.", "⚠".yellow());
+                        eprintln!("  {} Not in plan mode.", theme::icon_warn());
                     }
                 }
                 "replan" => {
@@ -1255,20 +1261,23 @@ pub(super) async fn handle_memory_domain_command(
                         if state.executing_plan.is_some() {
                             eprintln!(
                                 "  {} Replan from executing plan not yet supported",
-                                "⚠".yellow()
+                                theme::icon_warn()
                             );
                             eprintln!(
                                 "  {} Pause execution first with Ctrl+C, then enter plan mode",
                                 "💡".cyan()
                             );
                         } else {
-                            eprintln!("  {} Not in plan mode. Use /plan first.", "⚠".yellow());
+                            eprintln!(
+                                "  {} Not in plan mode. Use /plan first.",
+                                theme::icon_warn()
+                            );
                         }
                         return Ok(());
                     };
 
                     let Some(tok) = token else {
-                        eprintln!("  {} Not logged in. Run /login first.", "✗".red());
+                        eprintln!("  {} Not logged in. Run /login first.", theme::icon_err());
                         return Ok(());
                     };
 
@@ -1346,7 +1355,7 @@ pub(super) async fn handle_memory_domain_command(
                                     eprintln!();
                                     eprintln!(
                                         "  {} Plan updated (v{} → v{})",
-                                        "✓".green(),
+                                        theme::icon_ok(),
                                         old_version,
                                         ps.version_history.current_version
                                     );
@@ -1366,10 +1375,10 @@ pub(super) async fn handle_memory_domain_command(
                             }
                         }
                         Ok(r) => {
-                            eprintln!("  {} LLM call failed ({})", "✗".red(), r.status());
+                            eprintln!("  {} LLM call failed ({})", theme::icon_err(), r.status());
                         }
                         Err(e) => {
-                            eprintln!("  {} Request failed: {}", "✗".red(), e);
+                            eprintln!("  {} Request failed: {}", theme::icon_err(), e);
                         }
                     }
 
@@ -1389,7 +1398,7 @@ pub(super) async fn handle_memory_domain_command(
                         let analysis = plan_decompose::analyze_parallelism(&ps.plan);
                         eprintln!("{}", plan_decompose::format_parallelism(&analysis));
                     } else {
-                        eprintln!("  {} Not in plan mode.", "⚠".yellow());
+                        eprintln!("  {} Not in plan mode.", theme::icon_warn());
                     }
                 }
                 "auto" if !sub_arg.is_empty() => {
@@ -1400,7 +1409,7 @@ pub(super) async fn handle_memory_domain_command(
                     };
 
                     let Some(tok) = token else {
-                        eprintln!("  {} Not logged in. Run /login first.", "✗".red());
+                        eprintln!("  {} Not logged in. Run /login first.", theme::icon_err());
                         return Ok(());
                     };
 
@@ -1539,14 +1548,14 @@ pub async fn handle_plan_mode_input(
             ClarificationAnswer::Selected(idx) => {
                 let selected = &question.options[idx];
                 pending.record_answer(selected.clone());
-                eprintln!("  {} Selected: {}", "✓".green(), selected);
+                eprintln!("  {} Selected: {}", theme::icon_ok(), selected);
             }
             ClarificationAnswer::Freeform(text) => {
                 pending.record_answer(text.clone());
-                eprintln!("  {} Answer: {}", "✓".green(), text);
+                eprintln!("  {} Answer: {}", theme::icon_ok(), text);
             }
             ClarificationAnswer::Invalid(msg) => {
-                eprintln!("  {} {}", "✗".red(), msg);
+                eprintln!("  {} {}", theme::icon_err(), msg);
                 eprintln!();
                 eprint!("{}", format_clarification_question(&question));
                 return Ok(());
@@ -1578,7 +1587,7 @@ pub async fn handle_plan_mode_input(
         plan_state.pending_clarifications = None;
 
         let Some(tok) = token else {
-            eprintln!("  {} Not logged in. Run /login first.", "✗".red());
+            eprintln!("  {} Not logged in. Run /login first.", theme::icon_err());
             return Ok(());
         };
 
@@ -1640,10 +1649,10 @@ pub async fn handle_plan_mode_input(
                 }
             }
             Ok(r) => {
-                eprintln!("  {} LLM call failed ({})", "✗".red(), r.status());
+                eprintln!("  {} LLM call failed ({})", theme::icon_err(), r.status());
             }
             Err(e) => {
-                eprintln!("  {} Request failed: {}", "✗".red(), e);
+                eprintln!("  {} Request failed: {}", theme::icon_err(), e);
             }
         }
 
@@ -1703,7 +1712,7 @@ pub async fn handle_plan_mode_input(
             PlanEntryChoice::Goal(goal) => {
                 // User provided a goal - generate plan
                 let Some(tok) = token else {
-                    eprintln!("  {} Not logged in. Run /login first.", "✗".red());
+                    eprintln!("  {} Not logged in. Run /login first.", theme::icon_err());
                     return Ok(());
                 };
 
@@ -1840,10 +1849,10 @@ pub async fn handle_plan_mode_input(
                         }
                     }
                     Ok(r) => {
-                        eprintln!("  {} LLM call failed ({})", "✗".red(), r.status());
+                        eprintln!("  {} LLM call failed ({})", theme::icon_err(), r.status());
                     }
                     Err(e) => {
-                        eprintln!("  {} Request failed: {}", "✗".red(), e);
+                        eprintln!("  {} Request failed: {}", theme::icon_err(), e);
                     }
                 }
 
@@ -1861,7 +1870,7 @@ pub async fn handle_plan_mode_input(
                 let pct = plan_state.plan.progress_pct();
                 let done_count = plan_state.plan.items_done();
                 let total_count = plan_state.plan.subtasks.len();
-                eprintln!("  {} Completed: {} ({}%)", "✓".green(), title, pct);
+                eprintln!("  {} Completed: {} ({}%)", theme::icon_ok(), title, pct);
                 // Save updated state locally
                 let _ = plan_state.save_to_file(&PlanModeState::state_path());
 
@@ -1911,7 +1920,7 @@ pub async fn handle_plan_mode_input(
                     );
                 }
             }
-            Err(e) => eprintln!("  {} {}", "⚠".yellow(), e),
+            Err(e) => eprintln!("  {} {}", theme::icon_warn(), e),
         }
         return Ok(());
     }
@@ -1977,11 +1986,16 @@ pub async fn handle_plan_mode_input(
             {
                 Ok(tid) => {
                     let short = &tid[..8.min(tid.len())];
-                    eprintln!("{}  Task created: {} ({})", "✓".green(), goal, short.dim());
+                    eprintln!(
+                        "{}  Task created: {} ({})",
+                        theme::icon_ok(),
+                        goal,
+                        short.dim()
+                    );
                     eprintln!("{}  Track progress: /task status {}", "💡".cyan(), short);
                 }
                 Err(e) => {
-                    eprintln!("{}  Could not persist task: {}", "⚠".yellow(), e);
+                    eprintln!("{}  Could not persist task: {}", theme::icon_warn(), e);
                 }
             }
         }
@@ -2084,11 +2098,14 @@ pub async fn handle_plan_mode_input(
             // Debug: show response info
             if sse_result.text.is_empty() {
                 if sse_result.event_count == 0 {
-                    eprintln!("  {} No SSE events received from server", "⚠".yellow());
+                    eprintln!(
+                        "  {} No SSE events received from server",
+                        theme::icon_warn()
+                    );
                 } else {
                     eprintln!(
                         "  {} {} events (types: {}) but no text",
-                        "⚠".yellow(),
+                        theme::icon_warn(),
                         sse_result.event_count,
                         sse_result.event_types.join(", ")
                     );
@@ -2103,7 +2120,7 @@ pub async fn handle_plan_mode_input(
                         plan_state.modified = true;
                         // Save updated state for recovery
                         let _ = plan_state.save_to_file(&PlanModeState::state_path());
-                        eprintln!("{}  Plan updated!", "✓".green());
+                        eprintln!("{}  Plan updated!", theme::icon_ok());
                         eprintln!();
                         let formatted = format_plan(&plan);
                         eprintln!("{formatted}");
@@ -2281,7 +2298,7 @@ fn handle_plan_status(state: &ReplState) {
     } else {
         eprintln!(
             "  {} No active plan. Use /plan enter <goal> to create one.",
-            "⚠".yellow()
+            theme::icon_warn()
         );
     }
 }
@@ -2297,7 +2314,7 @@ fn handle_plan_pause(state: &mut ReplState) {
             "⏸".yellow()
         );
     } else {
-        eprintln!("  {} No plan is currently executing.", "⚠".yellow());
+        eprintln!("  {} No plan is currently executing.", theme::icon_warn());
     }
 }
 
