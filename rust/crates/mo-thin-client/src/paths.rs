@@ -132,6 +132,9 @@ pub fn context_capture(context_capture_id: &str) -> String {
 /// Non-streaming chat routing helper (server `chat_route_handler`).
 pub const CHAT_ROUTE: &str = "/chat/route";
 
+/// Lightweight LLM proxy for verification judge / edge components.
+pub const COMPLETIONS: &str = "/v1/chat/completions";
+
 // ── Admin API (`astra-admin-cli` → same server) ───────────────────────────────
 
 pub const ADMIN_INIT: &str = "/admin/init";

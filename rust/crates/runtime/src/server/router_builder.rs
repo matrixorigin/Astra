@@ -30,6 +30,11 @@ pub(super) fn build_router(state: AppState) -> Router {
         .route("/chat/stream", post(chat_handlers::chat_stream_handler))
         .route("/chat/turn", post(chat_handlers::chat_turn_handler))
         .route("/chat/route", post(chat_handlers::chat_route_handler))
+        // Lightweight LLM proxy for verification judge / edge components
+        .route(
+            "/v1/chat/completions",
+            post(completions::completions_handler),
+        )
         // §5.5 edge callbacks (thin client / headless orchestration)
         .route(
             "/tools/result",

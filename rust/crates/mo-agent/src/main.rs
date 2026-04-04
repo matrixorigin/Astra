@@ -1059,6 +1059,7 @@ async fn handle_resume_command(arg: &str, profile: Option<&str>, state: &mut Rep
                         state.ingestion_user_id.as_deref(),
                         cloud_judge,
                         learning,
+                        None, // no server proxy during session restore
                     )
                 } else {
                     let session_dir =
@@ -1071,6 +1072,7 @@ async fn handle_resume_command(arg: &str, profile: Option<&str>, state: &mut Rep
                         state.ingestion_user_id.as_deref(),
                         cloud_judge,
                         learning,
+                        None, // no server proxy during session restore
                     )
                 };
                 state.durable_task_state = Some(durable_bridge::DurableTaskState {
@@ -2321,7 +2323,7 @@ async fn start_and_monitor_background_plan(
     profile: Option<&str>,
 ) -> Result<(), String> {
     // ── Generate durable contract if not already present ─────────
-    ensure_durable_task_state(state).await;
+    ensure_durable_task_state(state, Some(api), current_token).await;
 
     // ── Extract context & spawn ──────────────────────────────────────
     let ctx = take_plan_context(state, api, current_token, profile)?;
@@ -2339,7 +2341,11 @@ async fn start_and_monitor_background_plan(
 /// Initialize `durable_task_state` on `ReplState` if it's `None` and a plan
 /// is ready for execution.  This generates a [`TaskContract`] with structured
 /// verification criteria so the background executor can gate subtask completion.
-async fn ensure_durable_task_state(state: &mut ReplState) {
+async fn ensure_durable_task_state(
+    state: &mut ReplState,
+    api: Option<&astra_thin_client::ThinClient>,
+    token: Option<&str>,
+) {
     if state.durable_task_state.is_some() {
         return;
     }
@@ -2355,6 +2361,18 @@ async fn ensure_durable_task_state(state: &mut ReplState) {
     let user_id = state.ingestion_user_id.as_deref().unwrap_or("local");
     let session_id = state.session_id.as_deref().unwrap_or("unknown");
     let work_dir = std::env::current_dir().unwrap_or_default();
+
+    // Build server proxy judge from ThinClient (zero-config fallback)
+    let server_proxy_judge: Option<std::sync::Arc<dyn astra_services::LlmJudge>> =
+        if let (Some(a), Some(t)) = (api, token) {
+            Some(std::sync::Arc::new(durable_bridge::ServerProxyLlmJudge::new(
+                a.clone(),
+                t.to_string(),
+                state.model.clone(),
+            )))
+        } else {
+            None
+        };
 
     // Prefer cloud-backed lifecycle when MatrixOne pool is available;
     // fall back to local filesystem persistence otherwise.
@@ -2382,6 +2400,7 @@ async fn ensure_durable_task_state(state: &mut ReplState) {
             Some(user_id),
             cloud_judge,
             learning,
+            server_proxy_judge,
         )
     } else {
         let session_dir = state
@@ -2397,6 +2416,7 @@ async fn ensure_durable_task_state(state: &mut ReplState) {
             Some(user_id),
             cloud_judge,
             learning,
+            server_proxy_judge,
         )
     };
 

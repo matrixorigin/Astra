@@ -685,7 +685,7 @@ pub fn create_local_lifecycle(
     session_dir: &std::path::Path,
     work_dir: &std::path::Path,
 ) -> Arc<dyn DurableTaskLifecycle> {
-    create_local_lifecycle_full(session_dir, work_dir, None, None, None, None, None)
+    create_local_lifecycle_full(session_dir, work_dir, None, None, None, None, None, None)
 }
 
 /// Like [`create_local_lifecycle`] but also wires cloud event streaming.
@@ -705,6 +705,7 @@ pub fn create_local_lifecycle_with_sender(
         user_id,
         None,
         None,
+        None,
     )
 }
 
@@ -713,6 +714,7 @@ pub fn create_local_lifecycle_with_sender(
 /// When `cloud_judge` is provided, it's used for semantic (LlmJudge) verification
 /// instead of the edge-side HttpLlmJudge. The cloud judge persists results directly
 /// to the cloud database and doesn't consume the edge context window.
+#[allow(clippy::too_many_arguments)]
 pub fn create_local_lifecycle_full(
     session_dir: &std::path::Path,
     work_dir: &std::path::Path,
@@ -721,17 +723,19 @@ pub fn create_local_lifecycle_full(
     user_id: Option<&str>,
     cloud_judge: Option<Arc<dyn astra_services::LlmJudge>>,
     learning_bridge: Option<Arc<dyn astra_services::TaskLearningBridge>>,
+    server_proxy_judge: Option<Arc<dyn astra_services::LlmJudge>>,
 ) -> Arc<dyn DurableTaskLifecycle> {
     let contracts_dir = session_dir.join("contracts");
     let _ = std::fs::create_dir_all(&contracts_dir);
     let mut lifecycle = LocalDurableTaskLifecycle::new(contracts_dir, work_dir.to_path_buf());
 
-    // Wire up LLM judge: prefer cloud judge (persists results, separate quota)
-    // over edge-side HttpLlmJudge (uses edge API key + context window)
+    // Wire up LLM judge (priority: cloud > env-var HTTP > server proxy)
     if let Some(judge) = cloud_judge {
         lifecycle.set_llm_judge(judge);
     } else if let Some(judge) = HttpLlmJudge::from_env() {
         lifecycle.set_llm_judge(Arc::new(judge));
+    } else if let Some(judge) = server_proxy_judge {
+        lifecycle.set_llm_judge(judge);
     }
 
     // Wire up cloud event streaming (if sender available)
@@ -760,6 +764,7 @@ pub fn create_local_lifecycle_full(
 /// Like [`create_local_lifecycle_full`] but uses the cloud-backed
 /// [`MatrixOneDurableTaskLifecycle`] so that contracts and verification
 /// results are persisted to the MatrixOne database.
+#[allow(clippy::too_many_arguments)]
 pub fn create_cloud_lifecycle_full(
     pool: sqlx::Pool<sqlx::MySql>,
     work_dir: &std::path::Path,
@@ -768,6 +773,7 @@ pub fn create_cloud_lifecycle_full(
     user_id: Option<&str>,
     cloud_judge: Option<Arc<dyn astra_services::LlmJudge>>,
     learning_bridge: Option<Arc<dyn astra_services::TaskLearningBridge>>,
+    server_proxy_judge: Option<Arc<dyn astra_services::LlmJudge>>,
 ) -> Arc<dyn DurableTaskLifecycle> {
     let mut lifecycle = MatrixOneDurableTaskLifecycle::new(pool, work_dir.to_path_buf());
 
@@ -775,6 +781,8 @@ pub fn create_cloud_lifecycle_full(
         lifecycle.set_llm_judge(judge);
     } else if let Some(judge) = HttpLlmJudge::from_env() {
         lifecycle.set_llm_judge(Arc::new(judge));
+    } else if let Some(judge) = server_proxy_judge {
+        lifecycle.set_llm_judge(judge);
     }
 
     if let Some(s) = sender {
@@ -1231,6 +1239,66 @@ fn parse_judge_score(text: &str) -> Result<f64, String> {
         "Could not extract score from LLM response: {}",
         &text[..text.len().min(200)]
     ))
+}
+
+// ─── Server Proxy LLM Judge ──────────────────────────────────────────────────
+
+/// [`LlmJudge`] that routes through the API server's `/v1/chat/completions` proxy.
+///
+/// Uses the same authentication (bearer token) and model resolution as the main
+/// agent. No separate API keys or env vars required — the server decrypts the
+/// model credentials and forwards to the upstream LLM provider.
+pub struct ServerProxyLlmJudge {
+    api: astra_thin_client::ThinClient,
+    token: String,
+    model: Option<String>,
+}
+
+impl ServerProxyLlmJudge {
+    pub fn new(api: astra_thin_client::ThinClient, token: String, model: Option<String>) -> Self {
+        Self { api, token, model }
+    }
+}
+
+#[async_trait::async_trait]
+impl astra_services::LlmJudge for ServerProxyLlmJudge {
+    async fn evaluate(&self, prompt: &str, context: &str) -> Result<f64, String> {
+        let system_msg = serde_json::json!({
+            "role": "system",
+            "content": "You are a verification judge. Evaluate whether an acceptance criterion \
+                        is met based on the provided context. Respond with ONLY a JSON object: \
+                        {\"score\": <0.0-1.0>, \"reason\": \"<brief explanation>\"}. \
+                        Score 1.0 = fully met, 0.0 = not met at all."
+        });
+        let user_msg = serde_json::json!({
+            "role": "user",
+            "content": format!(
+                "Criterion: {prompt}\n\nContext:\n{context}\n\n\
+                 Evaluate and respond with {{\"score\": <0.0-1.0>, \"reason\": \"...\"}}."
+            )
+        });
+
+        let mut body = serde_json::json!({
+            "messages": [system_msg, user_msg],
+            "max_tokens": 200,
+            "temperature": 0.1,
+        });
+        if let Some(ref m) = self.model {
+            body["model"] = serde_json::json!(m);
+        }
+
+        let resp = self
+            .api
+            .post_completions(&self.token, &body)
+            .await
+            .map_err(|e| format!("Server proxy judge error: {e}"))?;
+
+        let content = resp["choices"][0]["message"]["content"]
+            .as_str()
+            .unwrap_or("");
+
+        parse_judge_score(content)
+    }
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────────

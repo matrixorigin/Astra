@@ -718,6 +718,28 @@ impl ThinClient {
         Self::text_or_api(resp).await
     }
 
+    /// `POST /v1/chat/completions` — lightweight LLM proxy for verification judge.
+    ///
+    /// Returns the raw JSON response from the server's completions proxy.
+    /// The server resolves the active model, decrypts the API key, and forwards
+    /// to the upstream LLM provider.
+    pub async fn post_completions(
+        &self,
+        token: &str,
+        body: &Value,
+    ) -> Result<Value, ThinClientError> {
+        let url = self.url(paths::COMPLETIONS)?;
+        let resp = self
+            .http
+            .post(url)
+            .headers(Self::bearer_headers(token)?)
+            .timeout(std::time::Duration::from_secs(120))
+            .json(body)
+            .send()
+            .await?;
+        Self::json_or_error(resp).await
+    }
+
     // ── Reflect / decision trace ─────────────────────────────────────────────
 
     /// `path_with_query` is relative to origin, e.g. `chat/session/sid/reflect?focus=auto`.

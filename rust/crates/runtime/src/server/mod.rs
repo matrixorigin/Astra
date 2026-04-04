@@ -50,6 +50,7 @@ use self::{
 };
 
 mod chat_route;
+mod completions;
 
 pub fn build_app(state: AppState) -> Router {
     let cors = CorsLayer::new()
