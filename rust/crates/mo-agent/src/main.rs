@@ -87,6 +87,8 @@ mod stream_render;
 mod streaming_md;
 #[path = "mo_agent/terminal_region.rs"]
 mod terminal_region;
+#[path = "mo_agent/theme.rs"]
+mod theme;
 
 use astra_runtime::turn::chat_turn_heuristics::{
     is_session_not_found_error, looks_like_live_query_with_context,
@@ -3975,15 +3977,15 @@ async fn run_chat_repl(
             eprintln!("  \u{1f527} {}", format!("Skill dev: {sname}").cyan().dim());
         }
         let prompt_str = if state.plan_mode.is_some() {
-            "\x1b[1;33mplan>\x1b[0m ".to_string()
+            theme::PROMPT_PLAN.to_string()
         } else if state.executing_plan.is_some() {
-            "\x1b[1;33mpause>\x1b[0m ".to_string()
+            theme::PROMPT_PAUSE.to_string()
         } else if state.plan_handle.is_some() {
-            "\x1b[1;36mbg>\x1b[0m ".to_string()
+            theme::PROMPT_BG.to_string()
         } else if state.chat_plan_only {
-            "\x1b[1;33mplan.\x1b[0m ".to_string()
+            theme::PROMPT_PLAN_ONLY.to_string()
         } else {
-            "\x1b[1;36m>\x1b[0m ".to_string()
+            theme::PROMPT_DEFAULT.to_string()
         };
 
         // ── Send readline request to actor thread ────────────────────

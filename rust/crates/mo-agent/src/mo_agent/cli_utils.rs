@@ -222,7 +222,7 @@ pub(super) fn interactive_select(
 
             // Clear previous render
             for _ in 0..prev_rendered_lines {
-                eprint!("\x1b[A\x1b[2K");
+                eprint!("{}", super::theme::CURSOR_UP_CLEAR);
             }
             let _ = io::stderr().flush();
 
@@ -354,7 +354,7 @@ pub(super) fn interactive_select(
 
     // Clean up: clear the picker display and restore terminal
     for _ in 0..prev_rendered_lines {
-        eprint!("\x1b[A\x1b[2K");
+        eprint!("{}", super::theme::CURSOR_UP_CLEAR);
     }
     let _ = io::stderr().flush();
     terminal::disable_raw_mode().ok();
