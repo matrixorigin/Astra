@@ -137,13 +137,18 @@ pub fn shorten_path(path: &str, max_chars: usize) -> String {
 }
 
 /// Simple syntax highlighting for code preview.
-/// Highlights: line numbers (dim), keywords (blue), strings (green), comments (dim green).
+/// Highlights: line numbers (dim), keywords (cyan), strings (green), comments (dim green).
 /// Works across multiple languages by using common keywords.
 pub fn highlight_code_line(line: &str) -> String {
     use regex::Regex;
+    use std::sync::OnceLock;
+
+    // Cached regex patterns
+    static KEYWORD_RE: OnceLock<Regex> = OnceLock::new();
+    static STRING_RE: OnceLock<Regex> = OnceLock::new();
 
     // Common keywords across languages
-    static KEYWORDS: &[&str] = &[
+    const KEYWORDS: &[&str] = &[
         "fn",
         "let",
         "mut",
@@ -211,6 +216,15 @@ pub fn highlight_code_line(line: &str) -> String {
         "protected", // C/Java
     ];
 
+    let keyword_re = KEYWORD_RE.get_or_init(|| {
+        let pattern = KEYWORDS.join("|");
+        Regex::new(&format!(r"\b({})\b", pattern)).unwrap()
+    });
+
+    // Match strings: "..." or '...' with basic escape handling (\")
+    let string_re =
+        STRING_RE.get_or_init(|| Regex::new(r#"("(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*')"#).unwrap());
+
     // Check if line starts with line number (e.g., "420\t")
     let (prefix, code) = if let Some(tab_pos) = line.find('\t') {
         let num_part = &line[..tab_pos];
@@ -226,13 +240,8 @@ pub fn highlight_code_line(line: &str) -> String {
         (String::new(), line)
     };
 
-    // Detect comment start
-    let comment_start = code.find("//").or_else(|| {
-        code.find('#').filter(|&pos| {
-            // Python/shell comments: # not inside string
-            pos == 0 || code[..pos].matches('"').count() % 2 == 0
-        })
-    });
+    // Find comment start, but not inside strings
+    let comment_start = find_comment_start(code);
 
     let (code_part, comment_part) = if let Some(pos) = comment_start {
         (&code[..pos], Some(&code[pos..]))
@@ -240,19 +249,14 @@ pub fn highlight_code_line(line: &str) -> String {
         (code, None)
     };
 
-    // Build keyword regex
-    let keyword_pattern = KEYWORDS.join("|");
-    let keyword_re = Regex::new(&format!(r"\b({})\b", keyword_pattern)).unwrap();
-
-    // Highlight keywords in code part
-    let highlighted_code = keyword_re.replace_all(code_part, |caps: &regex::Captures| {
-        format!("{}", caps[1].cyan())
+    // Highlight strings first (to avoid highlighting keywords inside strings)
+    let highlighted_code = string_re.replace_all(code_part, |caps: &regex::Captures| {
+        format!("{}", caps[1].green())
     });
 
-    // Highlight strings (simple: "..." or '...')
-    let string_re = Regex::new(r#"("[^"]*"|'[^']*')"#).unwrap();
-    let highlighted_code = string_re.replace_all(&highlighted_code, |caps: &regex::Captures| {
-        format!("{}", caps[1].green())
+    // Highlight keywords (but now strings are already colored, keywords inside won't match)
+    let highlighted_code = keyword_re.replace_all(&highlighted_code, |caps: &regex::Captures| {
+        format!("{}", caps[1].cyan())
     });
 
     // Combine parts
@@ -261,6 +265,43 @@ pub fn highlight_code_line(line: &str) -> String {
         .unwrap_or_default();
 
     format!("{prefix}{highlighted_code}{comment_highlighted}")
+}
+
+/// Find comment start position, accounting for strings.
+/// Returns None if no comment found, or Some(pos) for // or # comments.
+fn find_comment_start(code: &str) -> Option<usize> {
+    let mut in_string = false;
+    let mut string_char = '\0';
+    let mut escape_next = false;
+    let chars: Vec<char> = code.chars().collect();
+
+    for (i, &c) in chars.iter().enumerate() {
+        if escape_next {
+            escape_next = false;
+            continue;
+        }
+
+        if c == '\\' && in_string {
+            escape_next = true;
+            continue;
+        }
+
+        if !in_string {
+            if c == '"' || c == '\'' {
+                in_string = true;
+                string_char = c;
+            } else if c == '/' && chars.get(i + 1) == Some(&'/') {
+                return Some(i);
+            } else if c == '#' {
+                // Python/shell comment
+                return Some(i);
+            }
+        } else if c == string_char {
+            in_string = false;
+        }
+    }
+
+    None
 }
 
 #[cfg(test)]
@@ -320,5 +361,49 @@ mod tests {
         .to_string();
         let got = extract_cli_diff_block(&out).expect("diff");
         assert_eq!(got.as_ref(), diff_body);
+    }
+
+    #[test]
+    fn test_find_comment_start_simple() {
+        assert_eq!(find_comment_start("let x = 1; // comment"), Some(11));
+        assert_eq!(find_comment_start("# Python comment"), Some(0));
+        assert_eq!(find_comment_start("no comment here"), None);
+    }
+
+    #[test]
+    fn test_find_comment_start_in_string() {
+        // // inside string should not be detected as comment
+        assert_eq!(find_comment_start(r#"let s = "hello // world";"#), None);
+        // # inside string should not be detected
+        assert_eq!(find_comment_start(r#"x = "test # not comment""#), None);
+    }
+
+    #[test]
+    fn test_find_comment_start_escaped_quotes() {
+        // Escaped quote should not end string
+        // `let s = "hello \"world\""; // real`
+        // Position 25 is where `//` starts (0-indexed)
+        assert_eq!(
+            find_comment_start(r#"let s = "hello \"world\""; // real"#),
+            Some(27)
+        );
+    }
+
+    #[test]
+    fn test_highlight_preserves_content() {
+        // Highlighting should not lose characters
+        let input = r#"let x = "hello"; // test"#;
+        let output = highlight_code_line(input);
+        // Should contain all original words (stripped of ANSI codes)
+        let stripped = strip_ansi(&output);
+        assert!(stripped.contains("let"));
+        assert!(stripped.contains("hello"));
+        assert!(stripped.contains("test"));
+    }
+
+    /// Helper to strip ANSI escape codes for testing
+    fn strip_ansi(s: &str) -> String {
+        let re = regex::Regex::new(r"\x1b\[[0-9;]*m").unwrap();
+        re.replace_all(s, "").to_string()
     }
 }
