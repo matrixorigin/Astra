@@ -846,6 +846,52 @@ pub struct DelegationSubRunSummary {
     pub tool_calls: u32,
 }
 
+/// A named breakpoint — an addressable point in the execution timeline.
+/// Wraps a `HeavyCheckpoint` with additional metadata for resume/fork.
+///
+/// The optional `composite_snapshot` replaces the old flat fields with a
+/// unified bag-of-references model. When present, `tool_health_entries`,
+/// `learning_snapshot_epoch` etc. are still populated for backward compat.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BreakpointInfo {
+    /// Unique identifier for this breakpoint.
+    pub breakpoint_id: String,
+    /// Session ID this breakpoint belongs to.
+    pub session_id: String,
+    /// Turn number at the time of breakpoint.
+    pub turn_number: u32,
+    /// Checkpoint number (maps to step_checkpoints/<NNN>-heavy.json).
+    pub checkpoint_number: u32,
+    /// Human-readable label (auto-generated or user-provided).
+    pub label: String,
+    /// ISO 8601 timestamp.
+    pub created_at: String,
+    /// Tool health state at this point (for cross-session persistence).
+    pub tool_health_entries: Vec<crate::pipeline::persistence::ToolHealthEntry>,
+    /// Correction history from TurnGuard at this point.
+    pub correction_history_json: Option<String>,
+    /// Learning snapshot identifier (profile name + epoch).
+    pub learning_snapshot_epoch: Option<u64>,
+    /// Composite snapshot — unified bag-of-references across state dimensions.
+    /// When present, this is the canonical source; the flat fields above are kept
+    /// for backward compatibility.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub composite_snapshot: Option<astra_core::composite_snapshot::CompositeSnapshot>,
+}
+
+/// Index of all breakpoints in a session.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct BreakpointIndex {
+    pub breakpoints: Vec<BreakpointInfo>,
+}
+
+// ─── Composite Snapshot (re-exported from astra-core) ────────────────────────
+
+pub use astra_core::composite_snapshot::{
+    CompositeSnapshot, CompositeSnapshotIndex, DataSnapshotRef, MemorySnapshotRef, SnapshotRef,
+    SnapshotSpec,
+};
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum StepCheckpoint {
     Light(LightCheckpoint),

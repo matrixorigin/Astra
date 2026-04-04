@@ -308,6 +308,8 @@ mod tests {
             consecutive_same_error: 0,
             last_error_category: None,
             checkpoint_gate: None,
+            data_snapshot_provider: None,
+            last_composite_snapshot: None,
         }
     }
 

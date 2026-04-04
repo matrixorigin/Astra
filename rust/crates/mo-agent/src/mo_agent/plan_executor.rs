@@ -958,34 +958,35 @@ async fn plan_executor_task(
             });
 
             // Execute the subtask via stream_chat_sse
-            let turn_result: Result<StreamResult, String> = stream_chat_sse(ChatTurnParams {
-                api: &ctx.api,
-                token: &ctx.token,
-                message: &prompt,
-                session_id: ctx.session_id.as_deref(),
-                model: ctx.model.as_deref(),
-                explain: crate::ExplainMode::Off,
-                render_md: false,
-                history: &ctx.history,
-                perm_manager: &mut perm_manager,
-                verbose_mode: false,
-                quiet: true,
-                suppress_intermediate_output: true,
-                selector: &*selector,
-                recent_tools: &ctx.recent_tools,
-                tool_health_entries: &ctx.tool_health_entries,
-                skill_registry: &ctx.skill_registry,
-                plan_only_chat: false,
-                hide_streaming_assistant_text: true,
-                is_plan_subtask: true,
-                plan_subtask_id: Some(next_id),
-                delegation_engine: ctx.delegation_engine.clone(),
-                cancel_token: Some(cancel_token),
-                plan_assemble_line_release: None,
-                stream_event_tx: Some(stream_tx),
-                approval_request_tx: Some(approval_tx),
-            })
-            .await;
+            let turn_result: Result<StreamResult, crate::TurnFailure> =
+                stream_chat_sse(ChatTurnParams {
+                    api: &ctx.api,
+                    token: &ctx.token,
+                    message: &prompt,
+                    session_id: ctx.session_id.as_deref(),
+                    model: ctx.model.as_deref(),
+                    explain: crate::ExplainMode::Off,
+                    render_md: false,
+                    history: &ctx.history,
+                    perm_manager: &mut perm_manager,
+                    verbose_mode: false,
+                    quiet: true,
+                    suppress_intermediate_output: true,
+                    selector: &*selector,
+                    recent_tools: &ctx.recent_tools,
+                    tool_health_entries: &ctx.tool_health_entries,
+                    skill_registry: &ctx.skill_registry,
+                    plan_only_chat: false,
+                    hide_streaming_assistant_text: true,
+                    is_plan_subtask: true,
+                    plan_subtask_id: Some(next_id),
+                    delegation_engine: ctx.delegation_engine.clone(),
+                    cancel_token: Some(cancel_token),
+                    plan_assemble_line_release: None,
+                    stream_event_tx: Some(stream_tx),
+                    approval_request_tx: Some(approval_tx),
+                })
+                .await;
 
             // The stream_chat_sse call is done; drop the senders by ending the forwarders.
             stream_forwarder.abort();
@@ -1152,22 +1153,38 @@ async fn plan_executor_task(
                         }
                     }
                 }
-                Err(err) => {
+                Err(failure) => {
                     // LLM turn failed — mark subtask as pending for retry
                     if let Some(st) = ctx.plan.subtasks.iter_mut().find(|s| s.id == *next_id) {
                         st.status = TaskStatus::Pending;
                     }
-                    let event = session_journal::JournalEvent::turn_error(
+                    let mut event = session_journal::JournalEvent::turn_error(
                         ctx.session_id.as_deref(),
                         ctx.turn,
                         ctx.model.as_deref(),
                         &format!("plan_subtask:{}", next_id),
-                        &err,
+                        &failure.error,
                         0,
                     );
+                    // Enrich with partial data from the failed subtask turn
+                    if !failure.partial.tool_call_records.is_empty() {
+                        event.tool_calls = Some(failure.partial.tool_call_records.clone());
+                    }
+                    if failure.partial.prompt_tokens > 0 {
+                        event.tokens_in = Some(failure.partial.prompt_tokens);
+                    }
+                    if failure.partial.completion_tokens > 0 {
+                        event.tokens_out = Some(failure.partial.completion_tokens);
+                    }
+                    if failure.partial.tool_calls_count > 0 {
+                        event.tool_count = Some(failure.partial.tool_calls_count);
+                    }
+                    if !failure.partial.tools_used.is_empty() {
+                        event.tools_used = Some(failure.partial.tools_used.clone());
+                    }
                     emit_event(&update_tx, &ctx, event);
                     let _ = update_tx.send(PlanUpdate::PlanError {
-                        error: format!("Subtask '{}' failed: {}", next_id, err),
+                        error: format!("Subtask '{}' failed: {}", next_id, failure.error),
                     });
                     return;
                 }

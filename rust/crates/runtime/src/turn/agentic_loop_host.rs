@@ -262,6 +262,14 @@ pub struct AgenticLoopState {
     /// Optional checkpoint gate checked every N turns during delegation sub-runs.
     /// When the gate returns `false`, the loop aborts with `Cancelled`.
     pub checkpoint_gate: Option<Arc<dyn crate::server::delegation_engine::CheckpointGate>>,
+
+    // ── Composite Snapshot ──
+    /// Optional data snapshot provider for building composite snapshots.
+    /// When set, heavy checkpoints will also capture a data dimension.
+    pub data_snapshot_provider:
+        Option<Arc<dyn astra_core::composite_snapshot::DataSnapshotProvider>>,
+    /// Most recent composite snapshot created for this session.
+    pub last_composite_snapshot: Option<astra_core::composite_snapshot::CompositeSnapshot>,
 }
 
 /// Consecutive same-category error turns before forcing a strategy change.
@@ -559,6 +567,7 @@ fn try_write_heavy_checkpoint(state: &mut AgenticLoopState) {
     let Some(sid) = state.current_session_id.as_ref() else {
         return;
     };
+    let ckpt_num = state.step_recorder.summary().checkpoints;
     let Some(heavy) = state.step_recorder.build_heavy_checkpoint(
         &state.messages,
         0,
@@ -575,9 +584,94 @@ fn try_write_heavy_checkpoint(state: &mut AgenticLoopState) {
         return;
     };
     let cp = StepCheckpoint::Heavy(Box::new(heavy));
-    let _ =
-        step_checkpoint::write_step_checkpoint(sid, state.step_recorder.summary().checkpoints, &cp);
+    let _ = step_checkpoint::write_step_checkpoint(sid, ckpt_num, &cp);
+
+    let turn = (state.max_turns - state.remaining_turns) as u32;
+    let snapshot = astra_core::composite_snapshot::CompositeSnapshotBuilder::new(sid.clone(), turn)
+        .label(format!("checkpoint-t{turn}"))
+        .session_state(format!("{:06}-heavy.json", ckpt_num))
+        .workspace_state(sid.clone())
+        .build();
+
+    let mut index = step_checkpoint::read_composite_snapshot_index(sid).unwrap_or_default();
+    index.snapshots.push(snapshot.clone());
+    let _ = step_checkpoint::write_composite_snapshot_index(sid, &index);
+
+    state.last_composite_snapshot = Some(snapshot);
     state.last_heavy_checkpoint = Some(cp);
+}
+
+/// Build a full composite snapshot asynchronously (with data provider).
+///
+/// Call this at strategic points (breakpoints, plan boundaries, user request)
+/// where the async data snapshot is worth the cost.
+#[allow(dead_code)]
+async fn build_full_composite_snapshot(
+    state: &mut AgenticLoopState,
+) -> Option<astra_core::composite_snapshot::CompositeSnapshot> {
+    let sid = state.current_session_id.as_ref()?;
+    let turn = (state.max_turns - state.remaining_turns) as u32;
+    let ckpt_num = state.step_recorder.summary().checkpoints;
+
+    let mut builder =
+        astra_core::composite_snapshot::CompositeSnapshotBuilder::new(sid.clone(), turn)
+            .label(format!("full-snapshot-t{turn}"))
+            .session_state(format!("{:06}-heavy.json", ckpt_num))
+            .workspace_state(sid.clone());
+
+    // Include memory/learning snapshot if available.
+    // The learning snapshot epoch is tracked on the step recorder.
+    {
+        let epoch = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        builder = builder.memory_snapshot(astra_core::composite_snapshot::MemorySnapshotRef {
+            profile: "default".to_string(),
+            epoch,
+            path: None,
+        });
+    }
+
+    if let Ok(output) = tokio::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .await
+        && output.status.success()
+    {
+        let sha = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if sha.len() >= 7 {
+            builder = builder.git_commit(sha);
+        }
+    }
+
+    if let Some(provider) = &state.data_snapshot_provider {
+        let context = astra_core::composite_snapshot::SnapshotContext {
+            session_id: sid.clone(),
+            turn,
+            label: Some(format!("turn-{turn}")),
+            task_type: None,
+            databases: None,
+        };
+        match provider.create_snapshot(&context).await {
+            Ok(Some(ds)) => {
+                builder = builder.data_snapshot(ds);
+            }
+            Ok(None) => {}
+            Err(e) => {
+                astra_core::agent_warn!("snapshot", "Data snapshot failed: {e}");
+            }
+        }
+    }
+
+    let snapshot = builder.build();
+
+    let mut index = step_checkpoint::read_composite_snapshot_index(sid).unwrap_or_default();
+    index.snapshots.push(snapshot.clone());
+    let _ = step_checkpoint::write_composite_snapshot_index(sid, &index);
+
+    state.last_composite_snapshot = Some(snapshot.clone());
+    Some(snapshot)
 }
 
 /// Run the multi-turn agentic loop using the provided host.
@@ -656,7 +750,10 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
                 messages: &mut state.messages,
             },
         )) {
-            AgenticIngestIterationControl::Fatal(e) => return Err(e),
+            AgenticIngestIterationControl::Fatal(e) => {
+                try_write_heavy_checkpoint(state);
+                return Err(e);
+            }
             AgenticIngestIterationControl::BreakLoop => {
                 // Agent produced final text with no tool calls — it thinks it's done.
                 // Inject verification prompt once when the agent first tries to complete.
@@ -1171,6 +1268,8 @@ mod tests {
             consecutive_same_error: 0,
             last_error_category: None,
             checkpoint_gate: None,
+            data_snapshot_provider: None,
+            last_composite_snapshot: None,
         }
     }
 

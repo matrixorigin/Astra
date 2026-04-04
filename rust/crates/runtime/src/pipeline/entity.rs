@@ -68,6 +68,11 @@ impl EntityKnowledge {
         self.confidence * decay
     }
 
+    /// Time decay factor (0.0–1.0) based on staleness.
+    pub fn time_decay_factor(&self) -> f64 {
+        entity_time_decay_factor(self.last_observed_at)
+    }
+
     /// Update the last_observed_at timestamp to now.
     pub fn touch(&mut self) {
         self.last_observed_at = current_entity_timestamp();
@@ -177,6 +182,18 @@ impl EntityGraph {
 
         // Mark as dirty for delta sync
         self.dirty_entities.insert(key);
+    }
+
+    /// Record that an entity-tool association failed.
+    ///
+    /// Reduces confidence for the entity mapping (dampened by 0.8×, floored at 0.1).
+    /// Does nothing if the entity is unknown — we don't create entries from failures.
+    pub fn record_failure(&mut self, entity_name: &str, _tools_used: &[String]) {
+        let resolved = self.resolve(entity_name);
+        if let Some(ek) = self.entities.get_mut(&resolved) {
+            ek.confidence = (ek.confidence * 0.8).max(0.1);
+            self.dirty_entities.insert(resolved);
+        }
     }
 
     /// Register an alias for an entity.
@@ -329,6 +346,26 @@ impl EntityGraph {
         self.entities.is_empty()
     }
 
+    /// Report health metrics for the entity graph.
+    pub fn health_report(&self) -> EntityGraphHealth {
+        let total = self.entities.len();
+        let low_confidence = self
+            .entities
+            .values()
+            .filter(|e| e.decayed_confidence() < 0.3)
+            .count();
+        let stale = self
+            .entities
+            .values()
+            .filter(|e| e.time_decay_factor() < 0.3)
+            .count();
+        EntityGraphHealth {
+            total_entities: total,
+            low_confidence,
+            stale_entities: stale,
+        }
+    }
+
     /// Remove entities whose decayed confidence falls below `min_confidence`.
     ///
     /// Returns the number of entities pruned. Also cleans alias_index
@@ -365,6 +402,14 @@ impl EntityGraph {
         let lower = entity.to_lowercase();
         self.alias_index.get(&lower).cloned().unwrap_or(lower)
     }
+}
+
+/// Health metrics for the entity graph.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct EntityGraphHealth {
+    pub total_entities: usize,
+    pub low_confidence: usize,
+    pub stale_entities: usize,
 }
 
 // ─── Entity Extraction ───────────────────────────────────────────────────────

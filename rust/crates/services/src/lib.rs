@@ -51,6 +51,10 @@ pub use agents::{
     AgentCreateRequestData, AgentListItem, AgentListRecord, AgentRecord, AgentService,
     AgentUpdateRequestData, DatabaseAgentService, UnconfiguredAgentService,
 };
+pub use astra_core::composite_snapshot::{
+    CompositeSnapshot, CompositeSnapshotIndex, DataSnapshotRef, MemorySnapshotRef, SnapshotRef,
+    SnapshotSpec,
+};
 pub use auth::{
     AuthLoginRequestData, AuthRefreshRequestData, AuthRegisterRequestData, AuthService,
     AuthTokenRecord, AuthUserRecord, DatabaseAdminAuditReader, DatabaseAdminAuthorizer,
@@ -139,7 +143,11 @@ pub use runs::{
 pub use sandbox::{
     DatabaseSandboxService, SandboxRecord, SandboxService, UnconfiguredSandboxService,
 };
-pub use session_fork::{ForkSessionOptions, ForkSessionResult, fork_local_session};
+pub use session_fork::{
+    CrossBranchLearning, DataBranchOptions, ExploreOptions, ExploreResult, ForkSessionOptions,
+    ForkSessionResult, TuneConfig, TuneExperimentResult, TuneSweepResult,
+    create_exploration_branches, fork_local_session,
+};
 pub use skill_config::{
     DatabaseSkillConfigService, SkillConfigService, UnconfiguredSkillConfigService,
 };

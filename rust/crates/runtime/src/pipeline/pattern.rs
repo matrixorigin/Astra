@@ -199,6 +199,11 @@ impl ToolChainPattern {
     pub fn is_drifting(&self) -> bool {
         self.drift_score().is_some_and(|s| s >= 1.0)
     }
+
+    /// Time decay factor (0.0–1.0) for this pattern based on staleness.
+    pub fn time_decay_factor(&self) -> f64 {
+        time_decay_factor(self.last_used_at)
+    }
 }
 
 /// Calculate time decay factor (0.0–1.0) based on staleness.
@@ -337,6 +342,31 @@ impl PatternLibrary {
 
         // Mark as dirty for delta sync
         self.dirty_patterns.insert(key);
+    }
+
+    /// Record a tool chain failure for an existing pattern.
+    ///
+    /// Unlike `record_outcome(success=false)`, this does NOT create a new pattern
+    /// if one doesn't exist — patterns are only created on first success.
+    /// This is the counterpart to the success-only entity learning path.
+    pub fn record_failure(
+        &mut self,
+        tools: &[String],
+        task_type: TaskType,
+        domain: Option<DomainHint>,
+    ) {
+        let _ = domain; // reserved for future per-domain failure tracking
+        if tools.is_empty() {
+            return;
+        }
+        let sig = compute_signature(tools);
+        let key = pattern_key(&sig, task_type);
+        if let Some(pattern) = self.patterns.get_mut(&key) {
+            pattern.failure_count += 1;
+            pattern.push_outcome(false);
+            pattern.touch();
+            self.dirty_patterns.insert(key);
+        }
     }
 
     /// Record effort metrics (retries, turns) for an existing pattern.
@@ -817,6 +847,28 @@ impl PatternLibrary {
         opportunities
     }
 
+    /// Report health metrics for the pattern library.
+    pub fn health_report(&self) -> PatternLibraryHealth {
+        let total = self.patterns.len();
+        let drifting = self.patterns.values().filter(|p| p.is_drifting()).count();
+        let decayed = self
+            .patterns
+            .values()
+            .filter(|p| p.time_decay_factor() < 0.5)
+            .count();
+        let low_quality = self
+            .patterns
+            .values()
+            .filter(|p| p.score() < 0.3 && p.total_count() >= 5)
+            .count();
+        PatternLibraryHealth {
+            total_patterns: total,
+            drifting_patterns: drifting,
+            heavily_decayed: decayed,
+            low_quality,
+        }
+    }
+
     /// Get a learning summary for display (e.g., /learn stats).
     pub fn learning_summary(&self) -> LearningSummary {
         let total_patterns = self.patterns.len();
@@ -907,6 +959,15 @@ pub struct ExplorationOpportunity {
     /// Tools already tried in this area.
     pub known_tools: Vec<String>,
     pub pattern_count: usize,
+}
+
+/// Health metrics for the pattern library.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct PatternLibraryHealth {
+    pub total_patterns: usize,
+    pub drifting_patterns: usize,
+    pub heavily_decayed: usize,
+    pub low_quality: usize,
 }
 
 /// Summary statistics for the learning pipeline.

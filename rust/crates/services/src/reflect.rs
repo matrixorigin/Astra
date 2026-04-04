@@ -1,5 +1,6 @@
 use astra_core::{
-    ErrorResponse, MatrixOneSettings, SharedPool, connect_matrixone, error_response, internal_error,
+    ErrorResponse, MatrixOneSettings, SharedPool, composite_snapshot::CompositeSnapshotIndex,
+    connect_matrixone, error_response, internal_error,
 };
 use async_trait::async_trait;
 use axum::{Json, http::StatusCode};
@@ -107,6 +108,243 @@ pub struct DecisionAgg {
     pub decision_type: String,
     pub cnt: i64,
     pub models_used: i64,
+}
+
+/// Data completeness assessment for a reflection report.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DataCompleteness {
+    /// Number of events found in local journal.
+    pub journal_events: u32,
+    /// Number of events found in cloud DB (0 if offline/unavailable).
+    pub cloud_events: u32,
+    /// Events in journal but missing from cloud (potential ingestion drops).
+    pub missing_from_cloud: u32,
+    /// Confidence score (0.0 = no data, 1.0 = complete).
+    pub confidence: f64,
+    /// Human-readable warnings about data gaps.
+    pub warnings: Vec<String>,
+}
+
+/// Assess data completeness by comparing local journal to cloud event count.
+pub fn assess_data_completeness(
+    session_id: &str,
+    cloud_event_count: Option<u32>,
+) -> DataCompleteness {
+    let journal_events = match crate::session_journal::read_journal(session_id) {
+        Ok(events) => events.len() as u32,
+        Err(_) => 0,
+    };
+    let cloud_events = cloud_event_count.unwrap_or(0);
+    let missing = journal_events.saturating_sub(cloud_events);
+    let confidence = if journal_events == 0 {
+        0.0
+    } else if cloud_events == 0 {
+        0.5 // local-only, no cloud verification
+    } else {
+        1.0 - (missing as f64 / journal_events as f64).min(1.0)
+    };
+    let mut warnings = Vec::new();
+    if missing > 0 {
+        warnings.push(format!("{missing} events may be missing from cloud DB"));
+    }
+    if journal_events == 0 {
+        warnings.push("No local journal found".to_string());
+    }
+    DataCompleteness {
+        journal_events,
+        cloud_events,
+        missing_from_cloud: missing,
+        confidence,
+        warnings,
+    }
+}
+
+/// Build analysis context for a specific turn from local data.
+///
+/// Loads checkpoint + journal data for a turn and builds a structured
+/// context string suitable for LLM consumption. This is a data preparation
+/// function — it does not call the LLM.
+pub fn build_turn_analysis_context(session_id: &str, turn: u32) -> Result<String, String> {
+    let events = crate::session_journal::read_journal(session_id)
+        .map_err(|e| format!("Failed to read journal: {e}"))?;
+
+    let turn_events: Vec<_> = events.iter().filter(|e| e.turn == Some(turn)).collect();
+
+    if turn_events.is_empty() {
+        return Err(format!("No events found for turn {turn}"));
+    }
+
+    let mut context = String::new();
+    context.push_str(&format!("## Turn {turn} Analysis Context\n\n"));
+
+    for evt in &turn_events {
+        context.push_str(&format!("### Event: {:?}\n", evt.event_type));
+        if let Some(ref input) = evt.user_input {
+            context.push_str(&format!("User input: {input}\n"));
+        }
+        if let Some(ref output) = evt.assistant_output {
+            context.push_str(&format!(
+                "Assistant output (truncated): {}...\n",
+                output.chars().take(200).collect::<String>()
+            ));
+        }
+        if let Some(ref error) = evt.error {
+            context.push_str(&format!("Error: {error}\n"));
+        }
+        if let Some(ref tools) = evt.tools_used {
+            context.push_str(&format!("Tools used: {}\n", tools.join(", ")));
+        }
+        if let Some(ref tool_calls) = evt.tool_calls {
+            context.push_str(&format!("Tool calls: {} total\n", tool_calls.len()));
+            for tc in tool_calls {
+                context.push_str(&format!("  - {} (ok={}, {}ms)\n", tc.name, tc.ok, tc.ms));
+            }
+        }
+        context.push('\n');
+    }
+
+    Ok(context)
+}
+
+/// Build a unified session diagnostic report from local journal data.
+pub fn build_session_diagnostic(session_id: &str) -> Result<SessionDiagnosticReport, String> {
+    let events = crate::session_journal::read_journal(session_id)
+        .map_err(|e| format!("Failed to read journal: {e}"))?;
+
+    let data_completeness = assess_data_completeness(session_id, None);
+
+    let total_turns = events
+        .iter()
+        .filter(|e| e.event_type == crate::session_journal::JournalEventType::Turn)
+        .count() as u32;
+    let error_count = events
+        .iter()
+        .filter(|e| e.event_type == crate::session_journal::JournalEventType::TurnError)
+        .count() as u32;
+    let stall_count = events
+        .iter()
+        .filter(|e| e.event_type == crate::session_journal::JournalEventType::StallDetected)
+        .count() as u32;
+    let verdict_count = events
+        .iter()
+        .filter(|e| e.event_type == crate::session_journal::JournalEventType::TurnGuardVerdict)
+        .count() as u32;
+
+    let error_summary: Vec<String> = events
+        .iter()
+        .filter_map(|e| e.error.as_ref())
+        .take(10)
+        .cloned()
+        .collect();
+
+    let mut recommendations = Vec::new();
+    if error_count > total_turns / 4 && total_turns > 0 {
+        recommendations.push("High error rate (>25%). Review tool selection strategy.".to_string());
+    }
+    if stall_count > 0 {
+        recommendations.push(format!(
+            "{stall_count} stall events detected. Consider reviewing task decomposition."
+        ));
+    }
+    if data_completeness.confidence < 0.8 {
+        recommendations.push(
+            "Data completeness is low. Some events may be missing from cloud DB.".to_string(),
+        );
+    }
+
+    // Composite snapshot info
+    let snapshot_dir = dirs::home_dir()
+        .unwrap_or_default()
+        .join(".astra")
+        .join("sessions")
+        .join(session_id)
+        .join("step_checkpoints")
+        .join("composite_snapshots.json");
+    let (composite_snapshot_count, latest_snapshot_dimensions) = if snapshot_dir.exists() {
+        match std::fs::read_to_string(&snapshot_dir) {
+            Ok(content) => match serde_json::from_str::<CompositeSnapshotIndex>(&content) {
+                Ok(index) => {
+                    let count = index.snapshots.len() as u32;
+                    let dims = index
+                        .snapshots
+                        .last()
+                        .map(|s| s.dimensions().into_iter().map(String::from).collect())
+                        .unwrap_or_default();
+                    (count, dims)
+                }
+                Err(_) => (0, Vec::new()),
+            },
+            Err(_) => (0, Vec::new()),
+        }
+    } else {
+        (0, Vec::new())
+    };
+
+    Ok(SessionDiagnosticReport {
+        session_id: session_id.to_string(),
+        data_completeness,
+        total_turns,
+        error_count,
+        stall_count,
+        verdict_count,
+        deprioritized_tools: Vec::new(),
+        error_summary,
+        recommendations,
+        composite_snapshot_count,
+        latest_snapshot_dimensions,
+    })
+}
+
+/// Request for LLM-powered single-turn analysis.
+#[derive(Debug, Clone)]
+pub struct TurnAnalysisRequest {
+    pub session_id: String,
+    pub turn: u32,
+    pub question: String,
+}
+
+/// Result of LLM-powered turn analysis.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TurnAnalysisReport {
+    pub session_id: String,
+    pub turn: u32,
+    pub question: String,
+    /// LLM-generated root cause analysis.
+    pub diagnosis: String,
+    /// Specific recommendations from the LLM.
+    pub recommendations: Vec<String>,
+    /// Tool selection quality assessment.
+    pub tool_selection_quality: Option<String>,
+    /// Data sources used for the analysis.
+    pub data_sources: Vec<String>,
+}
+
+/// Unified session diagnostic report combining all inspection capabilities.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionDiagnosticReport {
+    pub session_id: String,
+    /// Data completeness assessment.
+    pub data_completeness: DataCompleteness,
+    /// Total turns in session.
+    pub total_turns: u32,
+    /// Count of turn errors.
+    pub error_count: u32,
+    /// Count of stall events.
+    pub stall_count: u32,
+    /// Count of TurnGuard verdict events.
+    pub verdict_count: u32,
+    /// Tools that were deprioritized.
+    pub deprioritized_tools: Vec<String>,
+    /// Summary of error types encountered.
+    pub error_summary: Vec<String>,
+    /// Actionable recommendations.
+    pub recommendations: Vec<String>,
+    /// Number of composite snapshots available for this session.
+    #[serde(default)]
+    pub composite_snapshot_count: u32,
+    /// Dimensions covered by the most recent composite snapshot.
+    #[serde(default)]
+    pub latest_snapshot_dimensions: Vec<String>,
 }
 
 pub type ServiceResult<T> = Result<T, (StatusCode, Json<ErrorResponse>)>;

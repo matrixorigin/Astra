@@ -236,7 +236,9 @@ pub fn write_workspace(metadata: &WorkspaceMetadata) -> std::io::Result<()> {
     let path = dir.join("workspace.yaml");
     let yaml = serde_yaml::to_string(metadata)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    std::fs::write(&path, yaml)?;
+    let tmp = dir.join(".workspace.yaml.tmp");
+    std::fs::write(&tmp, &yaml)?;
+    std::fs::rename(&tmp, &path)?;
     Ok(())
 }
 

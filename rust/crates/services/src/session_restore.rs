@@ -16,6 +16,7 @@
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 
 fn is_duplicate_key_error(err: &sqlx::Error) -> bool {
     match err {
@@ -92,6 +93,49 @@ pub struct RestoredCheckpoint {
     pub contract_state_json: Option<String>,
 }
 
+/// Tool health entry mirrored from the runtime crate for breakpoint restore.
+/// Avoids a circular dependency (runtime depends on services).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BreakpointToolHealthEntry {
+    pub name: String,
+    pub total_calls: usize,
+    pub total_failures: usize,
+    pub failure_rate: f64,
+    #[serde(default)]
+    pub last_updated_epoch: u64,
+}
+
+/// Result of restoring to a specific breakpoint.
+#[derive(Debug, Clone)]
+pub struct RestoredBreakpoint {
+    /// The base restored session.
+    pub session: RestoredSession,
+    /// Breakpoint metadata.
+    pub breakpoint_id: String,
+    /// Tool health entries from the breakpoint.
+    pub tool_health_entries: Vec<BreakpointToolHealthEntry>,
+    /// Correction history JSON (to restore TurnGuard state).
+    pub correction_history_json: Option<String>,
+    /// Composite snapshot at the breakpoint, if one was recorded.
+    /// Callers can use this to selectively restore data/memory/git dimensions.
+    pub composite_snapshot: Option<astra_core::composite_snapshot::CompositeSnapshot>,
+}
+
+/// Result of restoring from a composite snapshot.
+#[derive(Debug, Clone)]
+pub struct RestoredCompositeState {
+    /// The base restored session (from session state dimension).
+    pub session: Option<RestoredSession>,
+    /// The composite snapshot that was restored from.
+    pub snapshot: astra_core::composite_snapshot::CompositeSnapshot,
+    /// Which dimensions were successfully restored.
+    pub restored_dimensions: Vec<String>,
+    /// Data snapshot ref to restore (caller handles actual SQL).
+    pub data_snapshot_to_restore: Option<astra_core::composite_snapshot::DataSnapshotRef>,
+    /// Git commit to checkout (caller handles actual git).
+    pub git_commit_to_checkout: Option<String>,
+}
+
 // ─── Session Restore Trait ──────────────────────────────────────────────────
 
 /// Abstraction for restoring session state from various backends.
@@ -112,6 +156,27 @@ pub trait SessionRestoreService: Send + Sync {
 
     /// List resumable sessions for a user (active or paused).
     async fn list_resumable_sessions(&self, user_id: &str) -> Result<Vec<RestoredSession>, String>;
+
+    /// Restore session state to a specific composite snapshot.
+    /// Uses the `RestoreSelector` to determine which dimensions to restore.
+    async fn restore_to_composite_snapshot(
+        &self,
+        session_id: &str,
+        snapshot_id: &str,
+        selector: &astra_core::composite_snapshot::RestoreSelector,
+    ) -> Result<Option<RestoredCompositeState>, String> {
+        let _ = (session_id, snapshot_id, selector);
+        Ok(None)
+    }
+
+    /// List composite snapshots for a session.
+    async fn list_composite_snapshots(
+        &self,
+        session_id: &str,
+    ) -> Result<astra_core::composite_snapshot::CompositeSnapshotIndex, String> {
+        let _ = session_id;
+        Ok(astra_core::composite_snapshot::CompositeSnapshotIndex::default())
+    }
 }
 
 // ─── Local-First Implementation ─────────────────────────────────────────────
@@ -385,6 +450,39 @@ impl HybridRestoreService {
     }
 }
 
+/// Reads `composite_snapshots.json` from the session step-checkpoint directory.
+///
+/// Must stay aligned with `astra_runtime::pipeline::step_checkpoint::read_composite_snapshot_index`
+/// (same path on disk). The services crate cannot depend on runtime due to a dependency cycle.
+fn read_composite_snapshot_index_local(
+    session_id: &str,
+) -> Result<astra_core::composite_snapshot::CompositeSnapshotIndex, String> {
+    let path = composite_snapshots_json_path(session_id);
+    if !path.exists() {
+        return Ok(astra_core::composite_snapshot::CompositeSnapshotIndex::default());
+    }
+    let content = std::fs::read_to_string(&path)
+        .map_err(|e| format!("read composite_snapshots.json: {e}"))?;
+    serde_json::from_str(&content).map_err(|e| format!("parse composite_snapshots.json: {e}"))
+}
+
+fn composite_snapshots_json_path(session_id: &str) -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".astra")
+        .join("sessions")
+        .join(session_id)
+        .join("step_checkpoints")
+        .join("composite_snapshots.json")
+}
+
+/// Parse checkpoint number from a heavy checkpoint filename ref (e.g. `000005-heavy.json`).
+fn parse_heavy_checkpoint_number(session_state_ref: &str) -> Option<u32> {
+    session_state_ref
+        .strip_suffix("-heavy.json")
+        .and_then(|prefix| prefix.parse().ok())
+}
+
 #[async_trait]
 impl SessionRestoreService for HybridRestoreService {
     async fn restore_session(&self, session_id: &str) -> Result<Option<RestoredSession>, String> {
@@ -546,6 +644,74 @@ impl SessionRestoreService for HybridRestoreService {
             })
             .collect();
         Ok(sessions)
+    }
+
+    async fn restore_to_composite_snapshot(
+        &self,
+        session_id: &str,
+        snapshot_id: &str,
+        selector: &astra_core::composite_snapshot::RestoreSelector,
+    ) -> Result<Option<RestoredCompositeState>, String> {
+        let index = read_composite_snapshot_index_local(session_id)?;
+        let Some(snapshot) = index
+            .snapshots
+            .iter()
+            .find(|s| s.snapshot_id == snapshot_id)
+            .cloned()
+        else {
+            return Ok(None);
+        };
+
+        if snapshot.session_id != session_id {
+            return Err(format!(
+                "composite snapshot {} belongs to session {}, not {}",
+                snapshot_id, snapshot.session_id, session_id
+            ));
+        }
+
+        let mut restored_dimensions: Vec<String> = Vec::new();
+        let mut session: Option<RestoredSession> = None;
+
+        if selector.restore_session_state
+            && let Some(ref_str) = snapshot.session_state()
+            && let Some(ckpt_num) = parse_heavy_checkpoint_number(ref_str)
+        {
+            match self.restore_to_checkpoint(session_id, ckpt_num).await {
+                Ok(Some(s)) => {
+                    session = Some(s);
+                    restored_dimensions.push("session".to_string());
+                }
+                Ok(None) => {}
+                Err(e) => return Err(e),
+            }
+        }
+
+        let data_snapshot_to_restore = if selector.restore_data {
+            snapshot.data_snapshot().cloned()
+        } else {
+            None
+        };
+
+        let git_commit_to_checkout = if selector.restore_git {
+            snapshot.git_commit().map(str::to_string)
+        } else {
+            None
+        };
+
+        Ok(Some(RestoredCompositeState {
+            session,
+            snapshot,
+            restored_dimensions,
+            data_snapshot_to_restore,
+            git_commit_to_checkout,
+        }))
+    }
+
+    async fn list_composite_snapshots(
+        &self,
+        session_id: &str,
+    ) -> Result<astra_core::composite_snapshot::CompositeSnapshotIndex, String> {
+        read_composite_snapshot_index_local(session_id)
     }
 }
 
@@ -1171,6 +1337,20 @@ mod tests {
         assert_eq!(goal, Some("Fix bug".to_string()));
         assert!(config.is_none());
         assert_eq!(rounds, 1);
+    }
+
+    #[test]
+    fn parse_heavy_checkpoint_number_from_ref() {
+        assert_eq!(
+            super::parse_heavy_checkpoint_number("000005-heavy.json"),
+            Some(5)
+        );
+        assert_eq!(
+            super::parse_heavy_checkpoint_number("000042-heavy.json"),
+            Some(42)
+        );
+        assert!(super::parse_heavy_checkpoint_number("not-a-checkpoint").is_none());
+        assert!(super::parse_heavy_checkpoint_number("000005-light.json").is_none());
     }
 
     #[test]

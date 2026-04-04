@@ -257,6 +257,8 @@ impl AgenticRunLifecycleService {
             consecutive_same_error: 0,
             last_error_category: None,
             checkpoint_gate: None,
+            data_snapshot_provider: None,
+            last_composite_snapshot: None,
         }
     }
 
@@ -898,6 +900,8 @@ impl SubRunExecutor for ServerSubRunExecutor {
             consecutive_same_error: 0,
             last_error_category: None,
             checkpoint_gate: config.checkpoint_gate.clone(),
+            data_snapshot_provider: None,
+            last_composite_snapshot: None,
         };
 
         let outcome = run_agentic_loop_with_host(&mut host, &mut loop_state).await;

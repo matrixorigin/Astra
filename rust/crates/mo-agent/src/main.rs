@@ -376,6 +376,37 @@ struct AuditToolsArgs {
 
 pub(crate) type VerdictEvent = astra_runtime::turn::agentic_verdict_audit::AgenticVerdictAuditEvent;
 
+/// Partial data rescued from `AgenticLoopState` when a turn fails.
+/// Enables enriched error logging, failure learning, and post-mortem analysis.
+#[derive(Debug, Default)]
+pub(crate) struct PartialTurnData {
+    pub tool_call_records: Vec<astra_services::session_journal::ToolCallRecord>,
+    pub tools_used: Vec<String>,
+    pub stall_events: Vec<(String, u32)>,
+    pub verdict_events: Vec<VerdictEvent>,
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+    pub tool_calls_count: u32,
+    #[allow(dead_code)]
+    pub tool_health_export: Vec<astra_runtime::pipeline::persistence::ToolHealthEntry>,
+    #[allow(dead_code)]
+    pub session_id: Option<String>,
+    pub last_heavy_checkpoint: Option<astra_runtime::pipeline::step_protocol::StepCheckpoint>,
+}
+
+/// A turn failure that carries partial data for post-mortem analysis.
+#[derive(Debug)]
+pub(crate) struct TurnFailure {
+    pub error: String,
+    pub partial: PartialTurnData,
+}
+
+impl std::fmt::Display for TurnFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.error)
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct StreamResult {
     session_id: Option<String>,
@@ -863,7 +894,12 @@ async fn handle_resume_command(arg: &str, profile: Option<&str>, state: &mut Rep
                 if session_journal::read_journal(&session_id).is_err() {
                     eprintln!(
                         "{}",
-                        format!("  {} Session {} not found or not owned by user", theme::icon_err(), arg).red()
+                        format!(
+                            "  {} Session {} not found or not owned by user",
+                            theme::icon_err(),
+                            arg
+                        )
+                        .red()
                     );
                     return;
                 }
@@ -1166,7 +1202,11 @@ async fn handle_resume_command(arg: &str, profile: Option<&str>, state: &mut Rep
             } else {
                 "Check connection with /doctor, or try a different session."
             };
-            eprintln!("  {} {}", theme::icon_err(), format!("Resume failed: {e}").red());
+            eprintln!(
+                "  {} {}",
+                theme::icon_err(),
+                format!("Resume failed: {e}").red()
+            );
             eprintln!("{}", format!("  {hint}").dim());
         }
     }
@@ -3653,7 +3693,11 @@ async fn handle_slash_command(
                     state.model.as_deref(),
                 ) {
                     state.model = Some(chosen.clone());
-                    eprintln!("  {} {}", theme::icon_ok(), format!("Model set to: {chosen}").green());
+                    eprintln!(
+                        "  {} {}",
+                        theme::icon_ok(),
+                        format!("Model set to: {chosen}").green()
+                    );
                 } else {
                     eprintln!("{}", "  Cancelled.".dim());
                 }
@@ -3828,7 +3872,11 @@ async fn run_chat_repl(
             &pipeline_modules.calibrator,
         );
         if loaded {
-            eprintln!("  {} {}", theme::icon_ok(), "Loaded learning state from prior sessions".dim());
+            eprintln!(
+                "  {} {}",
+                theme::icon_ok(),
+                "Loaded learning state from prior sessions".dim()
+            );
         }
         // Load tool health for cross-session error budgets
         let mut cross_session_health_entries =
@@ -4166,7 +4214,10 @@ async fn run_chat_repl(
                                                 );
                                             }
                                             Err(e) => {
-                                                eprintln!("{}", format!("  {} {e}", theme::icon_err()).red());
+                                                eprintln!(
+                                                    "{}",
+                                                    format!("  {} {e}", theme::icon_err()).red()
+                                                );
                                             }
                                         }
                                     }
@@ -4357,7 +4408,11 @@ async fn run_chat_repl(
             }
             Err(e) => {
                 clear_slash_overlay();
-                eprintln!("  {} {}", theme::icon_err(), "Input error — exiting session.".red());
+                eprintln!(
+                    "  {} {}",
+                    theme::icon_err(),
+                    "Input error — exiting session.".red()
+                );
                 eprintln!("{}", format!("  ({e})").dim());
                 // Journal + ingestion: session end on error exit
                 if let Some(ref j) = state.journal {
@@ -4972,8 +5027,8 @@ mod tests {
         })
         .await;
         assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert!(err.contains("500"), "got: {err}");
+        let failure = result.unwrap_err();
+        assert!(failure.error.contains("500"), "got: {}", failure.error);
     }
 
     #[tokio::test]

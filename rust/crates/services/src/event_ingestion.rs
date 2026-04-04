@@ -22,6 +22,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::mpsc;
 
 /// Configuration for the ingestion worker.
@@ -263,18 +264,33 @@ impl IngestionEvent {
 #[derive(Clone)]
 pub struct IngestionSender {
     tx: mpsc::Sender<IngestionEvent>,
+    overflow_count: Arc<AtomicU64>,
 }
 
 impl IngestionSender {
     /// Handle with no worker: [`Self::enqueue`] is a no-op (disconnected channel). Tests only.
     pub fn disconnected() -> Self {
         let (tx, _rx) = mpsc::channel(1);
-        Self { tx }
+        Self {
+            tx,
+            overflow_count: Arc::new(AtomicU64::new(0)),
+        }
     }
 
-    /// Enqueue an event for async ingestion. Non-blocking; drops silently if channel full.
+    /// Enqueue an event for async ingestion. Non-blocking; increments overflow counter if channel full.
     pub fn enqueue(&self, event: IngestionEvent) {
-        let _ = self.tx.try_send(event);
+        if let Err(mpsc::error::TrySendError::Full(_)) = self.tx.try_send(event) {
+            let n = self.overflow_count.fetch_add(1, Ordering::Relaxed) + 1;
+            astra_core::agent_warn!(
+                "event_ingestion",
+                "channel full, event dropped (overflow_count={n})"
+            );
+        }
+    }
+
+    /// Total number of events dropped due to a full channel.
+    pub fn overflow_count(&self) -> u64 {
+        self.overflow_count.load(Ordering::Relaxed)
     }
 
     /// Enqueue with backpressure (waits if channel full).
@@ -342,7 +358,11 @@ impl EventIngestionWorker {
 
         let handle = tokio::spawn(worker.run());
 
-        (IngestionSender { tx }, stats_clone, handle)
+        let sender = IngestionSender {
+            tx,
+            overflow_count: Arc::new(AtomicU64::new(0)),
+        };
+        (sender, stats_clone, handle)
     }
 
     async fn run(mut self) {
@@ -589,14 +609,20 @@ mod tests {
     #[tokio::test]
     async fn sender_enqueue_without_worker_does_not_panic() {
         let (tx, _rx) = mpsc::channel(10);
-        let sender = IngestionSender { tx };
+        let sender = IngestionSender {
+            tx,
+            overflow_count: Arc::new(AtomicU64::new(0)),
+        };
         sender.enqueue(test_event("e1", "s1", "test"));
     }
 
     #[tokio::test]
     async fn sender_enqueue_drops_when_channel_full() {
         let (tx, _rx) = mpsc::channel(1);
-        let sender = IngestionSender { tx };
+        let sender = IngestionSender {
+            tx,
+            overflow_count: Arc::new(AtomicU64::new(0)),
+        };
         sender.enqueue(test_event("e1", "s1", "test"));
         // This should be silently dropped (channel full, try_send fails)
         sender.enqueue(test_event("e2", "s1", "test"));
@@ -642,6 +668,7 @@ mod tests {
             session_lineage: None,
             coordination: None,
             edge_policy: None,
+            selection_trace: None,
         }
     }
 
@@ -832,7 +859,10 @@ mod tests {
     #[tokio::test]
     async fn sender_shutdown_closes_channel() {
         let (tx, mut rx) = mpsc::channel(10);
-        let sender = IngestionSender { tx };
+        let sender = IngestionSender {
+            tx,
+            overflow_count: Arc::new(AtomicU64::new(0)),
+        };
         sender.enqueue(test_event("e1", "s1", "test"));
         sender.shutdown();
         // After shutdown, recv should drain the one event then return None
@@ -1043,7 +1073,10 @@ mod tests {
     #[tokio::test]
     async fn sender_enqueue_async_respects_backpressure() {
         let (tx, mut rx) = mpsc::channel(3);
-        let sender = IngestionSender { tx };
+        let sender = IngestionSender {
+            tx,
+            overflow_count: Arc::new(AtomicU64::new(0)),
+        };
 
         for i in 0..3 {
             sender
@@ -1061,7 +1094,10 @@ mod tests {
     #[tokio::test]
     async fn sender_enqueue_drops_silently_when_full() {
         let (tx, mut rx) = mpsc::channel(1);
-        let sender = IngestionSender { tx };
+        let sender = IngestionSender {
+            tx,
+            overflow_count: Arc::new(AtomicU64::new(0)),
+        };
 
         sender.enqueue(test_event("e1", "s1", "turn"));
         sender.enqueue(test_event("e2", "s1", "turn"));
@@ -1177,5 +1213,32 @@ mod tests {
             Some("connection refused"),
             "should fall back to error when no user_input"
         );
+    }
+
+    #[test]
+    fn overflow_count_zero_initially() {
+        let sender = IngestionSender::disconnected();
+        assert_eq!(sender.overflow_count(), 0);
+    }
+
+    #[test]
+    fn overflow_count_increments_on_full_channel() {
+        // Create a channel with capacity 1
+        let (tx, _rx) = mpsc::channel(1);
+        let sender = IngestionSender {
+            tx,
+            overflow_count: Arc::new(AtomicU64::new(0)),
+        };
+
+        // Fill the channel
+        sender.enqueue(test_event("e1", "s1", "turn"));
+        // This should overflow (channel capacity is 1)
+        sender.enqueue(test_event("e2", "s1", "turn"));
+
+        assert_eq!(sender.overflow_count(), 1, "second enqueue should overflow");
+
+        // Third enqueue also overflows
+        sender.enqueue(test_event("e3", "s1", "turn"));
+        assert_eq!(sender.overflow_count(), 2);
     }
 }

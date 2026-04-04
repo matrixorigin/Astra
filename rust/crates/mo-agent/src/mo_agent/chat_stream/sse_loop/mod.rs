@@ -41,7 +41,9 @@ use agentic_sse_loop::{
 use cli_loop_host::CliAgenticLoopHost;
 use serde_json::json;
 
-pub(crate) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResult, String> {
+pub(crate) async fn stream_chat_sse(
+    p: ChatTurnParams<'_>,
+) -> Result<StreamResult, crate::TurnFailure> {
     let start = Instant::now();
     let term_width = terminal_width_usize();
     let project_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
@@ -185,10 +187,28 @@ pub(crate) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
         consecutive_same_error: 0,
         last_error_category: None,
         checkpoint_gate: None,
+        data_snapshot_provider: None,
+        last_composite_snapshot: None,
     };
 
     // ─── Run the runtime loop ────────────────────────────────────────────
-    run_agentic_loop_with_host(&mut host, &mut state).await?;
+    if let Err(e) = run_agentic_loop_with_host(&mut host, &mut state).await {
+        return Err(crate::TurnFailure {
+            error: e,
+            partial: crate::PartialTurnData {
+                tool_call_records: std::mem::take(&mut state.tool_call_records),
+                tools_used: state.all_tools_used.iter().cloned().collect(),
+                stall_events: std::mem::take(&mut state.stall_events),
+                verdict_events: std::mem::take(&mut state.verdict_events),
+                prompt_tokens: state.total_prompt,
+                completion_tokens: state.total_completion,
+                tool_calls_count: state.total_tool_calls,
+                tool_health_export: state.turn_guard.health.export_merged(p.tool_health_entries),
+                session_id: state.current_session_id.clone(),
+                last_heavy_checkpoint: state.last_heavy_checkpoint.take(),
+            },
+        });
+    }
 
     // ─── Finalize ────────────────────────────────────────────────────────
     eprint_stream_loop_sidecars(StreamLoopSidecarEprint {

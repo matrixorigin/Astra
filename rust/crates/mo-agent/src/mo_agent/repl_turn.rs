@@ -114,7 +114,7 @@ pub(super) fn compact_assistant_message(
 }
 
 enum TurnAttempt {
-    Completed(Box<Result<StreamResult, String>>),
+    Completed(Box<Result<StreamResult, crate::TurnFailure>>),
     Interrupted,
 }
 
@@ -146,6 +146,18 @@ pub(super) async fn handle_chat_input(
     match run_chat_turn(state, &ctx, token, &effective_line, session_id.as_deref()).await {
         TurnAttempt::Interrupted => {
             state.last_turn_interrupted = true;
+            if let Some(journal) = state.journal.as_ref() {
+                let evt = session_journal::JournalEvent::turn_error(
+                    state.session_id.as_deref(),
+                    state.turn + 1,
+                    state.model.as_deref(),
+                    &line,
+                    "user_interrupted (Ctrl+C)",
+                    turn_start.elapsed().as_millis() as u64,
+                );
+                let _ = journal.append(&evt);
+                enqueue_ingestion(state, &evt);
+            }
             return Ok(());
         }
         TurnAttempt::Completed(result) => match *result {
@@ -154,8 +166,8 @@ pub(super) async fn handle_chat_input(
                 apply_turn_success(state, ctx.selector, ctx.profile, &line, result, turn_start);
                 return Ok(());
             }
-            Err(error) => {
-                if is_session_not_found_error(&error) && state.session_id.is_some() {
+            Err(failure) => {
+                if is_session_not_found_error(&failure.error) && state.session_id.is_some() {
                     let _ = clear_profile_last_session(ctx.profile);
                     state.session_id = None;
                     eprintln!(
@@ -166,6 +178,18 @@ pub(super) async fn handle_chat_input(
                     match run_chat_turn(state, &ctx, token, &effective_line, None).await {
                         TurnAttempt::Interrupted => {
                             state.last_turn_interrupted = true;
+                            if let Some(journal) = state.journal.as_ref() {
+                                let evt = session_journal::JournalEvent::turn_error(
+                                    state.session_id.as_deref(),
+                                    state.turn + 1,
+                                    state.model.as_deref(),
+                                    &line,
+                                    "user_interrupted (Ctrl+C)",
+                                    turn_start.elapsed().as_millis() as u64,
+                                );
+                                let _ = journal.append(&evt);
+                                enqueue_ingestion(state, &evt);
+                            }
                             return Ok(());
                         }
                         TurnAttempt::Completed(result) => match *result {
@@ -180,15 +204,15 @@ pub(super) async fn handle_chat_input(
                                 );
                                 return Ok(());
                             }
-                            Err(retry_error) => {
-                                report_turn_error(state, &line, &retry_error, turn_start);
+                            Err(retry_failure) => {
+                                report_turn_failure(state, &line, &retry_failure, turn_start);
                                 return Ok(());
                             }
                         },
                     }
                 }
 
-                report_turn_error(state, &line, &error, turn_start);
+                report_turn_failure(state, &line, &failure, turn_start);
             }
         },
     }
@@ -397,7 +421,8 @@ async fn apply_auto_compact_result(
     eprintln!(
         "  {}",
         format!(
-            "{} Compacted {trimmed} turns → {} in context", crate::theme::icon_ok(),
+            "{} Compacted {trimmed} turns → {} in context",
+            crate::theme::icon_ok(),
             state.history.len()
         )
         .green()
@@ -850,21 +875,29 @@ fn print_turn_status_line(state: &ReplState, result: &StreamResult, turn_start: 
         parts.push(format!("model:{model}"));
     }
 
-    parts.push(format!("tokens:{tokens_str} (↑{prompt_short} ↓{completion_short})"));
+    parts.push(format!(
+        "tokens:{tokens_str} (↑{prompt_short} ↓{completion_short})"
+    ));
     parts.push(elapsed_str);
 
     if result.tool_calls_count > 0 {
         parts.push(format!(
             "{} tool{}",
             result.tool_calls_count,
-            if result.tool_calls_count == 1 { "" } else { "s" }
+            if result.tool_calls_count == 1 {
+                ""
+            } else {
+                "s"
+            }
         ));
     }
 
     let line = format!("  ─ {} ─", parts.join(" │ "));
     eprintln!("{}", line.dim());
 
-    let w = crossterm::terminal::size().map(|(c, _)| c as usize).unwrap_or(80);
+    let w = crossterm::terminal::size()
+        .map(|(c, _)| c as usize)
+        .unwrap_or(80);
     let rule = "─".repeat(w.min(72));
     eprintln!("{}", rule.dim());
 }
@@ -903,26 +936,62 @@ fn initialize_journal(state: &mut ReplState, session_id: &str) {
     let _ = astra_services::session_workspace::write_workspace(&ws);
 }
 
-fn report_turn_error(state: &ReplState, line: &str, error: &str, turn_start: Instant) {
-    let lower = error.to_lowercase();
-    if error.contains("401")
+/// Report a turn failure with enriched partial data from the agentic loop.
+fn report_turn_failure(
+    state: &ReplState,
+    line: &str,
+    failure: &crate::TurnFailure,
+    turn_start: Instant,
+) {
+    let lower = failure.error.to_lowercase();
+    if failure.error.contains("401")
         || lower.contains("unauthorized")
         || lower.contains("could not validate credentials")
     {
         eprintln!("{}", "  Session expired. Run /login to refresh.".yellow());
     } else {
-        eprintln!("  {} {}", crate::theme::icon_err(), error.red());
+        eprintln!(
+            "  {} {}",
+            crate::theme::icon_err(),
+            failure.error.as_str().red()
+        );
     }
 
     if let Some(journal) = state.journal.as_ref() {
-        let err_event = session_journal::JournalEvent::turn_error(
+        let mut err_event = session_journal::JournalEvent::turn_error(
             state.session_id.as_deref(),
             state.turn + 1,
             state.model.as_deref(),
             line,
-            error,
+            &failure.error,
             turn_start.elapsed().as_millis() as u64,
         );
+
+        // Enrich with partial data rescued from AgenticLoopState
+        if !failure.partial.tool_call_records.is_empty() {
+            err_event.tool_calls = Some(failure.partial.tool_call_records.clone());
+        }
+        if failure.partial.prompt_tokens > 0 {
+            err_event.tokens_in = Some(failure.partial.prompt_tokens);
+        }
+        if failure.partial.completion_tokens > 0 {
+            err_event.tokens_out = Some(failure.partial.completion_tokens);
+        }
+        if failure.partial.tool_calls_count > 0 {
+            err_event.tool_count = Some(failure.partial.tool_calls_count);
+        }
+        if !failure.partial.tools_used.is_empty() {
+            err_event.tools_used = Some(failure.partial.tools_used.clone());
+        }
+        if !failure.partial.stall_events.is_empty() || !failure.partial.verdict_events.is_empty() {
+            err_event.metadata = Some(serde_json::json!({
+                "error_type": "turn_failure",
+                "stall_count": failure.partial.stall_events.len(),
+                "verdict_count": failure.partial.verdict_events.len(),
+                "has_checkpoint": failure.partial.last_heavy_checkpoint.is_some(),
+            }));
+        }
+
         let _ = journal.append(&err_event);
         enqueue_ingestion(state, &err_event);
     }

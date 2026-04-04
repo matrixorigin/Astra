@@ -7,6 +7,7 @@ use axum::{
 use serde::Serialize;
 use sqlx::{MySql, Pool, mysql::MySqlPoolOptions};
 
+pub mod composite_snapshot;
 pub mod config;
 pub mod log;
 pub mod runtime_limits;

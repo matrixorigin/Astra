@@ -756,10 +756,7 @@ impl StreamRenderState {
     }
 
     fn stop_thinking(&mut self) {
-        let summary = self
-            .thinking_pane
-            .as_ref()
-            .map(|pane| pane.summary_line());
+        let summary = self.thinking_pane.as_ref().map(|pane| pane.summary_line());
         if let Some(mut pane) = self.thinking_pane.take() {
             pane.clear();
         }
@@ -768,19 +765,18 @@ impl StreamRenderState {
         }
         let skip_thought_duration_log = self.waiting_for_first_sse;
         self.waiting_for_first_sse = false;
-        if let Some(_start) = self.thinking_start.take() {
-            if !skip_thought_duration_log {
-                if let Some(line) = summary {
-                    if self.md.is_none() {
-                        println!("{line}");
-                        let _ = io::stdout().flush();
-                        self.lines_written += 1;
-                        self.col = 0;
-                    } else {
-                        eprintln!("{line}");
-                        self.stderr_lines += 1;
-                    }
-                }
+        if let Some(_start) = self.thinking_start.take()
+            && !skip_thought_duration_log
+            && let Some(line) = summary
+        {
+            if self.md.is_none() {
+                println!("{line}");
+                let _ = io::stdout().flush();
+                self.lines_written += 1;
+                self.col = 0;
+            } else {
+                eprintln!("{line}");
+                self.stderr_lines += 1;
             }
         }
     }

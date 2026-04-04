@@ -8,8 +8,17 @@
 //! No embeddings — pure string processing. <0.5ms per check.
 
 use crate::text_tokenize::{build_tf, tokenize};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
+
+/// Structured record of a detected near-duplicate tool call.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DedupAuditRecord {
+    pub tool_name: String,
+    pub duplicate_count: u32,
+    pub original_signature: String,
+}
 
 /// Default similarity threshold for output-based dedup.
 /// 0.75 = conservative (avoids false positives on different data).
@@ -228,6 +237,8 @@ pub struct SemanticDedup {
     output_log: Vec<(String, usize, String)>,
     /// Max entries in output_log before oldest are evicted
     max_output_entries: usize,
+    /// Structured audit trail of detected duplicates.
+    dedup_audit: Vec<DedupAuditRecord>,
 }
 
 impl SemanticDedup {
@@ -237,6 +248,7 @@ impl SemanticDedup {
             param_cache: HashMap::new(),
             output_log: Vec::new(),
             max_output_entries: 50,
+            dedup_audit: Vec::new(),
         }
     }
 
@@ -277,6 +289,25 @@ impl SemanticDedup {
                     }
                 }
             }
+        }
+
+        if let Some((_, ref reason)) = result {
+            let sig = semantic_call_key(tool_name, args)
+                .unwrap_or_else(|| format!("{}:<no-key>", tool_name));
+            let existing = self
+                .dedup_audit
+                .iter_mut()
+                .find(|r| r.tool_name == tool_name && r.original_signature == sig);
+            if let Some(rec) = existing {
+                rec.duplicate_count += 1;
+            } else {
+                self.dedup_audit.push(DedupAuditRecord {
+                    tool_name: tool_name.to_string(),
+                    duplicate_count: 1,
+                    original_signature: sig,
+                });
+            }
+            let _ = reason; // used above via ref
         }
 
         // Record this output (truncated at character boundary)
@@ -326,6 +357,11 @@ impl SemanticDedup {
 
     pub fn output_log_size(&self) -> usize {
         self.output_log.len()
+    }
+
+    /// Drain and return all accumulated audit records.
+    pub fn take_audit_records(&mut self) -> Vec<DedupAuditRecord> {
+        std::mem::take(&mut self.dedup_audit)
     }
 
     /// Generate a concise inventory of context already fetched this session.
@@ -788,5 +824,66 @@ mod tests {
 
         // Just verify no panic occurred - similarity result depends on exact truncation
         drop(result);
+    }
+
+    // ── DedupAuditRecord tests ──
+
+    #[test]
+    fn audit_record_created_on_param_duplicate() {
+        let mut dedup = SemanticDedup::new(DEFAULT_SIMILARITY_THRESHOLD);
+        // First call — no duplicate
+        let r1 =
+            dedup.check_and_record("read_file", &json!({"path": "src/main.rs"}), "content1", 0);
+        assert!(r1.is_none());
+        assert!(dedup.take_audit_records().is_empty());
+
+        // Same tool, same path, different turn → duplicate
+        let r2 =
+            dedup.check_and_record("read_file", &json!({"path": "src/main.rs"}), "content1", 1);
+        assert!(r2.is_some(), "should detect param duplicate");
+
+        let records = dedup.take_audit_records();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].tool_name, "read_file");
+        assert_eq!(records[0].duplicate_count, 1);
+    }
+
+    #[test]
+    fn audit_record_increments_on_repeated_duplicates() {
+        let mut dedup = SemanticDedup::new(DEFAULT_SIMILARITY_THRESHOLD);
+        dedup.check_and_record("read_file", &json!({"path": "a.rs"}), "x", 0);
+        dedup.check_and_record("read_file", &json!({"path": "a.rs"}), "x", 1); // dup 1
+        dedup.check_and_record("read_file", &json!({"path": "a.rs"}), "x", 2); // dup 2
+
+        let records = dedup.take_audit_records();
+        assert_eq!(records.len(), 1, "same signature should be one record");
+        assert_eq!(records[0].duplicate_count, 2);
+    }
+
+    #[test]
+    fn take_audit_records_drains() {
+        let mut dedup = SemanticDedup::new(DEFAULT_SIMILARITY_THRESHOLD);
+        dedup.check_and_record("read_file", &json!({"path": "a.rs"}), "x", 0);
+        dedup.check_and_record("read_file", &json!({"path": "a.rs"}), "x", 1);
+
+        let r1 = dedup.take_audit_records();
+        assert_eq!(r1.len(), 1);
+        let r2 = dedup.take_audit_records();
+        assert!(r2.is_empty(), "take should drain");
+    }
+
+    #[test]
+    fn different_tools_get_separate_audit_records() {
+        let mut dedup = SemanticDedup::new(DEFAULT_SIMILARITY_THRESHOLD);
+        dedup.check_and_record("read_file", &json!({"path": "a.rs"}), "x", 0);
+        dedup.check_and_record("read_file", &json!({"path": "a.rs"}), "x", 1);
+        dedup.check_and_record("glob", &json!({"pattern": "*.rs", "path": "src"}), "y", 0);
+        dedup.check_and_record("glob", &json!({"pattern": "*.rs", "path": "src"}), "y", 1);
+
+        let records = dedup.take_audit_records();
+        assert_eq!(records.len(), 2);
+        let names: Vec<_> = records.iter().map(|r| r.tool_name.as_str()).collect();
+        assert!(names.contains(&"read_file"));
+        assert!(names.contains(&"glob"));
     }
 }

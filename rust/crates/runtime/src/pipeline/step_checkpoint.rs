@@ -218,6 +218,68 @@ fn prune_light_checkpoints(dir: &Path) -> std::io::Result<()> {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// Breakpoint Index I/O
+// ═══════════════════════════════════════════════════════════════════════════════
+
+pub fn write_breakpoint_index(
+    session_id: &str,
+    index: &crate::pipeline::step_protocol::BreakpointIndex,
+) -> std::io::Result<()> {
+    let dir = checkpoint_dir_for(session_id);
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join("breakpoints.json");
+    let json = serde_json::to_string_pretty(index)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    let tmp = dir.join(".breakpoints.json.tmp");
+    std::fs::write(&tmp, &json)?;
+    std::fs::rename(&tmp, &path)?;
+    Ok(())
+}
+
+pub fn read_breakpoint_index(
+    session_id: &str,
+) -> std::io::Result<crate::pipeline::step_protocol::BreakpointIndex> {
+    let path = checkpoint_dir_for(session_id).join("breakpoints.json");
+    if !path.exists() {
+        return Ok(crate::pipeline::step_protocol::BreakpointIndex::default());
+    }
+    let content = std::fs::read_to_string(&path)?;
+    serde_json::from_str(&content)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+}
+
+// ─── Composite Snapshot I/O ──────────────────────────────────────────────────
+
+/// Persist the composite snapshot index to disk (atomic write).
+pub fn write_composite_snapshot_index(
+    session_id: &str,
+    index: &astra_core::composite_snapshot::CompositeSnapshotIndex,
+) -> std::io::Result<()> {
+    let dir = checkpoint_dir_for(session_id);
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join("composite_snapshots.json");
+    let json = serde_json::to_string_pretty(index)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    let tmp = dir.join(".composite_snapshots.json.tmp");
+    std::fs::write(&tmp, &json)?;
+    std::fs::rename(&tmp, &path)?;
+    Ok(())
+}
+
+/// Read the composite snapshot index from disk.
+pub fn read_composite_snapshot_index(
+    session_id: &str,
+) -> std::io::Result<astra_core::composite_snapshot::CompositeSnapshotIndex> {
+    let path = checkpoint_dir_for(session_id).join("composite_snapshots.json");
+    if !path.exists() {
+        return Ok(astra_core::composite_snapshot::CompositeSnapshotIndex::default());
+    }
+    let content = std::fs::read_to_string(&path)?;
+    serde_json::from_str(&content)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // File-Backed StepEventStore (JSONL)
 // ═══════════════════════════════════════════════════════════════════════════════
 

@@ -110,15 +110,34 @@ pub(super) fn handle_debug_command(arg: &str, state: &ReplState) {
 
     // ── Interactive loop ──
     loop {
-        eprint!("\n  Which turn? [1-{}, q to quit]: ", turns.len().max(1));
+        eprint!(
+            "\n  Which turn? [1-{}, bp, ct, cs, q to quit]: ",
+            turns.len().max(1)
+        );
         io::stderr().flush().ok();
         let Some(line) = read_line() else { break };
         let line = line.trim().to_lowercase();
-        if line == "q" || line == "quit" {
-            break;
+        match line.as_str() {
+            "q" | "quit" => break,
+            "bp" | "breakpoints" => {
+                show_breakpoints(&session_id);
+                continue;
+            }
+            "cs" | "snapshots" => {
+                show_composite_snapshots(&session_id);
+                continue;
+            }
+            "ct" | "corrections" => {
+                show_correction_timeline(&session_id);
+                continue;
+            }
+            _ => {}
         }
         let Ok(turn_n) = line.parse::<usize>() else {
-            eprintln!("  {}", "Invalid input".yellow());
+            eprintln!(
+                "  {}",
+                "Invalid input — enter a turn number, bp, ct, cs, or q".yellow()
+            );
             continue;
         };
         if turn_n == 0 || turn_n > turns.len() {
@@ -296,9 +315,10 @@ fn inspect_turn(
         "[7]".cyan()
     );
     eprintln!("  {} summary  — journal turn summary", "[6]".cyan());
+    eprintln!("  {} fork     — fork session from this turn", "[f]".cyan());
 
     loop {
-        eprint!("  What to inspect? [1-6, 7, b to go back]: ");
+        eprint!("  What to inspect? [1-6, 7, f, b to go back]: ");
         io::stderr().flush().ok();
         let Some(line) = read_line() else { return };
         let line = line.trim().to_lowercase();
@@ -313,6 +333,7 @@ fn inspect_turn(
             "5" => dump_turn_json(view, summary, session_id, turn_n, false),
             "6" => show_summary(summary),
             "7" => dump_turn_json(view, summary, session_id, turn_n, true),
+            "f" | "fork" => fork_from_turn(session_id, turn_n),
             _ => eprintln!("  {}", "Invalid choice".yellow()),
         }
     }
@@ -720,6 +741,168 @@ fn list_heavy_checkpoints(session_dir: &Path) -> Vec<PathBuf> {
         .collect();
     paths.sort_by_key(|p| checkpoint_numeric_prefix(p).unwrap_or(0));
     paths
+}
+
+// ── Breakpoints ─────────────────────────────────────────────────────────────
+
+fn show_breakpoints(session_id: &str) {
+    match astra_runtime::pipeline::step_checkpoint::read_breakpoint_index(session_id) {
+        Ok(index) => {
+            if index.breakpoints.is_empty() {
+                eprintln!("  {}", "(no breakpoints)".dim());
+                return;
+            }
+            eprintln!("\n  {}", "── Breakpoints ──".bold());
+            for bp in &index.breakpoints {
+                let short_id = &bp.breakpoint_id[..8.min(bp.breakpoint_id.len())];
+                eprintln!(
+                    "  {} turn {} — {} ({})",
+                    short_id.cyan(),
+                    bp.turn_number.to_string().green(),
+                    bp.label,
+                    bp.created_at.as_str().dim(),
+                );
+            }
+            eprintln!();
+        }
+        Err(e) => eprintln!("  {} {}", theme::icon_err(), e),
+    }
+}
+
+fn show_composite_snapshots(session_id: &str) {
+    let index = astra_runtime::pipeline::step_checkpoint::read_composite_snapshot_index(session_id)
+        .unwrap_or_default();
+
+    if index.snapshots.is_empty() {
+        eprintln!("  {}", "No composite snapshots found.".dim());
+        return;
+    }
+
+    eprintln!(
+        "\n  {}",
+        format!("─── Composite Snapshots ({}) ───", index.snapshots.len()).bold()
+    );
+
+    for snap in &index.snapshots {
+        let dims = snap.dimensions().join(", ");
+        let label = snap.label.as_deref().unwrap_or("-");
+        eprintln!(
+            "  {} T{:<3} {} [{}]  {}",
+            snap.snapshot_id[..8.min(snap.snapshot_id.len())].cyan(),
+            snap.turn,
+            label,
+            dims.green(),
+            snap.created_at.as_str().dim(),
+        );
+    }
+    eprintln!();
+}
+
+// ── Correction Timeline ─────────────────────────────────────────────────────
+
+fn show_correction_timeline(session_id: &str) {
+    let events = match astra_services::session_journal::read_journal(session_id) {
+        Ok(evts) => evts,
+        Err(e) => {
+            eprintln!("  {} {}", theme::icon_err(), e);
+            return;
+        }
+    };
+
+    let verdicts: Vec<_> = events
+        .iter()
+        .filter(|e| {
+            e.event_type == astra_services::session_journal::JournalEventType::TurnGuardVerdict
+        })
+        .collect();
+
+    if verdicts.is_empty() {
+        eprintln!("  {}", "(no correction events)".dim());
+        return;
+    }
+
+    eprintln!("\n  {}", "── Correction Timeline ──".bold());
+    for evt in &verdicts {
+        let turn = evt
+            .turn
+            .map(|t| t.to_string())
+            .unwrap_or_else(|| "?".into());
+        let severity = evt.stall_type.as_deref().unwrap_or("?");
+        let meta = evt.metadata.as_ref();
+
+        let injections = meta
+            .and_then(|m| m.get("injections"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let avoid_tools = meta
+            .and_then(|m| m.get("avoid_tools"))
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+            .unwrap_or_default();
+        let force_stop = meta
+            .and_then(|m| m.get("force_stop"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
+        let severity_colored = match severity {
+            "critical" => severity.red().to_string(),
+            "warning" => severity.yellow().to_string(),
+            "info" => severity.dim().to_string(),
+            _ => severity.to_string(),
+        };
+
+        let avoid_str = if avoid_tools.is_empty() {
+            String::new()
+        } else {
+            format!(", avoid: [{}]", avoid_tools)
+        };
+        let stop_str = if force_stop {
+            format!(" {}", "⛔ FORCE STOP".red())
+        } else {
+            String::new()
+        };
+
+        eprintln!(
+            "  T{} {} — {} injection(s){}{}",
+            turn.bold(),
+            severity_colored,
+            injections,
+            avoid_str,
+            stop_str,
+        );
+    }
+    eprintln!();
+}
+
+// ── Fork from turn ──────────────────────────────────────────────────────────
+
+fn fork_from_turn(session_id: &str, turn_n: usize) {
+    let opts = astra_services::session_fork::ForkSessionOptions {
+        parent_session_id: session_id.to_string(),
+        new_session_id: None,
+        label: Some(format!("debug-fork-at-turn-{turn_n}")),
+        forked_after_turn: Some(turn_n as u32),
+        data_branch: None,
+        snapshot_spec: None,
+    };
+    match astra_services::session_fork::fork_local_session(opts) {
+        Ok(result) => {
+            let short = &result.new_session_id[..8.min(result.new_session_id.len())];
+            eprintln!(
+                "  {} Forked → {} ({} events copied, label: debug-fork-at-turn-{})",
+                theme::icon_ok(),
+                short.green(),
+                result.events_copied,
+                turn_n,
+            );
+        }
+        Err(e) => eprintln!("  {} Fork failed: {}", theme::icon_err(), e),
+    }
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────

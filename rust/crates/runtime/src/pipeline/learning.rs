@@ -53,6 +53,46 @@ impl PipelineLearningWriter {
     }
 }
 
+/// Outcome from a failed turn, for learning from failures.
+///
+/// Distinct from [`TurnLearningOutcome`] because failure-specific fields
+/// (error category, stall detection) don't apply to successes.
+pub struct FailureLearningOutcome {
+    pub query: String,
+    pub tools_attempted: Vec<String>,
+    pub error_category: String,
+    pub stall_detected: bool,
+    pub correction_was_active: bool,
+    pub task_type: String,
+    pub domain_hint: Option<String>,
+}
+
+impl PipelineLearningWriter {
+    /// Record a turn failure across all pipeline modules.
+    ///
+    /// - **PatternLibrary**: increments failure_count for matching patterns
+    /// - **EntityGraph**: dampens confidence for entities mentioned in the query
+    ///
+    /// Does not touch the ProgressiveCalibrator (corrections are tracked separately).
+    pub fn record_failure(&self, outcome: &FailureLearningOutcome) {
+        let task_type = parse_task_type(Some(outcome.task_type.as_str()));
+        let domain = parse_domain_hint(outcome.domain_hint.as_deref());
+
+        if let Some(pl) = &self.pattern_library {
+            let mut lib = pl.lock().unwrap_or_else(|e| e.into_inner());
+            lib.record_failure(&outcome.tools_attempted, task_type, domain);
+        }
+
+        if let Some(eg) = &self.entity_graph {
+            let mut graph = eg.lock().unwrap_or_else(|e| e.into_inner());
+            let entities = extract_entities(&outcome.query);
+            for entity in &entities {
+                graph.record_failure(entity, &outcome.tools_attempted);
+            }
+        }
+    }
+}
+
 impl Default for PipelineLearningWriter {
     fn default() -> Self {
         Self::new()

@@ -166,7 +166,7 @@ pub(super) async fn handle_state_command(
                     text
                 }
                 Err(e) => {
-                    eprintln!("{}", format!("  ✗ Failed to summarize: {e}").red());
+                    eprintln!("{}", format!("  ✗ Failed to summarize: {}", e.error).red());
                     return Ok(());
                 }
             };

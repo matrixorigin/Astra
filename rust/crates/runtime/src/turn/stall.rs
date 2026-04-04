@@ -373,7 +373,47 @@ pub fn detect_nudge_ignored(
         .collect()
 }
 
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+
+// ─── Adaptive stall thresholds ──────────────────────────────────────────────
+
+/// Adaptive stall detection thresholds that can be tuned based on
+/// accumulated correction effectiveness data.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdaptiveStallThresholds {
+    /// Repetition window for stall detection (default: SERVER_STALL_WINDOW).
+    pub stall_window: usize,
+    /// Max exploration rounds before divergence (default: MAX_EXPLORATION_ROUNDS).
+    pub max_exploration_rounds: usize,
+    /// Intent drift detection window (default: INTENT_DRIFT_WINDOW).
+    pub intent_drift_window: usize,
+}
+
+impl Default for AdaptiveStallThresholds {
+    fn default() -> Self {
+        Self {
+            stall_window: SERVER_STALL_WINDOW,
+            max_exploration_rounds: MAX_EXPLORATION_ROUNDS,
+            intent_drift_window: INTENT_DRIFT_WINDOW,
+        }
+    }
+}
+
+impl AdaptiveStallThresholds {
+    /// Adjust thresholds based on false-positive rate.
+    /// If corrections are frequently not followed (low follow rate),
+    /// the thresholds may be too sensitive.
+    pub fn adjust_from_effectiveness(&mut self, follow_rate: f64, effective_rate: f64) {
+        if follow_rate < 0.3 && self.stall_window < 5 {
+            self.stall_window += 1;
+            self.max_exploration_rounds += 1;
+        } else if effective_rate < 0.2 && self.stall_window < 6 {
+            // Only widen window for low effectiveness if follow rate wasn't already low
+            self.stall_window += 1;
+        }
+    }
+}
 
 // ─── Intent drift detection ─────────────────────────────────────────────────
 

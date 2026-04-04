@@ -377,6 +377,9 @@ pub(super) fn handle_session_command(arg: &str, state: &mut ReplState) {
                 parent_session_id: parent_id.clone(),
                 new_session_id: None,
                 label: label.clone(),
+                forked_after_turn: None,
+                data_branch: None,
+                snapshot_spec: None,
             }) {
                 Ok(res) => {
                     let new_sid = res.new_session_id.clone();
@@ -760,6 +763,34 @@ pub(super) fn handle_session_command(arg: &str, state: &mut ReplState) {
                                     icon,
                                     scope,
                                     if passed { "passed" } else { "failed" },
+                                );
+                            }
+                            session_journal::JournalEventType::CompositeSnapshot => {
+                                let snap_id = evt
+                                    .metadata
+                                    .as_ref()
+                                    .and_then(|m| m.get("snapshot_id"))
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("?");
+                                let components = evt
+                                    .metadata
+                                    .as_ref()
+                                    .and_then(|m| m.get("components"))
+                                    .and_then(|v| v.as_array())
+                                    .map(|a| {
+                                        a.iter()
+                                            .filter_map(|v| v.as_str())
+                                            .collect::<Vec<_>>()
+                                            .join(", ")
+                                    })
+                                    .unwrap_or_default();
+                                eprintln!(
+                                    "  {} {} T{} snapshot {} [{}]",
+                                    ts_short.dim(),
+                                    "📸".green(),
+                                    evt.turn.unwrap_or(0),
+                                    snap_id,
+                                    components,
                                 );
                             }
                         }

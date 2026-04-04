@@ -364,6 +364,26 @@ pub struct EdgePolicySnapshot {
     pub rules_fingerprint: Option<String>,
 }
 
+/// Tool selection decision trace for post-hoc analysis.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SelectionTrace {
+    /// Candidate tools and their TF-IDF/LLM scores (top 10).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub candidate_scores: Option<Vec<(String, f64)>>,
+    /// Boost terms applied from entity graph / pattern library.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub boost_terms: Option<Vec<String>>,
+    /// Learned context summary injected into selection.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub learned_context_summary: Option<String>,
+    /// Final selected tools.
+    pub final_tools: Vec<String>,
+    /// Selection confidence score.
+    pub confidence: f64,
+    /// Strategy used (tfidf, llm, fallback, etc.).
+    pub strategy: String,
+}
+
 /// Per-tool-call audit record, embedded in turn events for granular tracking.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolCallRecord {
@@ -496,6 +516,9 @@ pub struct JournalEvent {
     /// Edge policy snapshot for cloud–edge audit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub edge_policy: Option<EdgePolicySnapshot>,
+    /// Tool selection decision trace for post-hoc analysis.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selection_trace: Option<SelectionTrace>,
 }
 
 /// Event type discriminator.
@@ -536,6 +559,9 @@ pub enum JournalEventType {
     DelegationCompleted,
     /// Subtask or plan verification completed (acceptance-criteria gate result).
     VerificationCompleted,
+    /// A composite snapshot was taken — captures references to session state,
+    /// data snapshot, memory snapshot, git commit, etc.
+    CompositeSnapshot,
 }
 
 /// Writer that appends events to a session journal file.
@@ -856,6 +882,7 @@ impl JournalEvent {
             session_lineage: None,
             coordination: None,
             edge_policy: None,
+            selection_trace: None,
         }
     }
 
@@ -1091,6 +1118,12 @@ impl JournalEvent {
         self
     }
 
+    /// Attach selection trace for post-hoc tool selection analysis.
+    pub fn with_selection_trace(mut self, trace: SelectionTrace) -> Self {
+        self.selection_trace = Some(trace);
+        self
+    }
+
     /// Stall detection event.
     pub fn stall_detected(
         session_id: Option<&str>,
@@ -1208,6 +1241,24 @@ impl JournalEvent {
             "scope": scope,
             "passed": passed,
             "results": results,
+        }));
+        evt
+    }
+
+    /// Composite snapshot taken — records references to state dimensions.
+    pub fn composite_snapshot(
+        session_id: Option<&str>,
+        turn: u32,
+        snapshot_id: &str,
+        label: Option<&str>,
+        components: &[&str],
+    ) -> Self {
+        let mut evt = Self::base(JournalEventType::CompositeSnapshot, session_id);
+        evt.turn = Some(turn);
+        evt.metadata = Some(serde_json::json!({
+            "snapshot_id": snapshot_id,
+            "label": label,
+            "components": components,
         }));
         evt
     }

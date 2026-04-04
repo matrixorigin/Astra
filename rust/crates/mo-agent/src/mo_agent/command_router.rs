@@ -74,7 +74,7 @@ pub(super) async fn execute_cli_command(
             .await
             {
                 Ok(sr) => sr,
-                Err(e) if is_session_not_found_error(&e) && session_id.is_some() => {
+                Err(e) if is_session_not_found_error(&e.error) && session_id.is_some() => {
                     let _ = clear_profile_last_session(profile.as_deref());
                     stream_chat_sse(ChatTurnParams {
                         api,
@@ -103,9 +103,10 @@ pub(super) async fn execute_cli_command(
                         stream_event_tx: None,
                         approval_request_tx: None,
                     })
-                    .await?
+                    .await
+                    .map_err(|f| f.error)?
                 }
-                Err(e) => return Err(e),
+                Err(e) => return Err(e.error),
             };
             if let Some(ref sid) = sr.session_id {
                 let p = creds.profiles.entry(name).or_default();
@@ -325,7 +326,7 @@ pub(super) async fn execute_cli_command(
             .await
             {
                 Ok(sr) => sr,
-                Err(e) if is_session_not_found_error(&e) && session_id.is_some() => {
+                Err(e) if is_session_not_found_error(&e.error) && session_id.is_some() => {
                     let _ = clear_profile_last_session(profile.as_deref());
                     stream_chat_sse(ChatTurnParams {
                         api,
@@ -354,9 +355,10 @@ pub(super) async fn execute_cli_command(
                         stream_event_tx: None,
                         approval_request_tx: None,
                     })
-                    .await?
+                    .await
+                    .map_err(|f| f.error)?
                 }
-                Err(e) => return Err(e),
+                Err(e) => return Err(e.error),
             };
 
             // Save session for resumption

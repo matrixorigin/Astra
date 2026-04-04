@@ -885,7 +885,8 @@ pub(super) async fn handle_info_command(
                 stream_event_tx: None,
                 approval_request_tx: None,
             })
-            .await?;
+            .await
+            .map_err(|f| f.error)?;
             if let Some(session_id) = sr.session_id.as_deref() {
                 crate::repl_turn::initialize_journal_pub(state, session_id);
                 state.session_id = Some(session_id.to_string());
