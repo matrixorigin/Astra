@@ -2347,8 +2347,11 @@ mod tests {
 
     /// Spin up a mock `/v1/chat/completions` server that returns a canned JSON score,
     /// then exercise `ServerProxyLlmJudge.evaluate()` end-to-end.
-    async fn mock_completions_server(score: f64, reason: &str) -> (String, tokio::task::JoinHandle<()>) {
-        use axum::{Router, Json, routing::post};
+    async fn mock_completions_server(
+        score: f64,
+        reason: &str,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        use axum::{Json, Router, routing::post};
 
         let score_str = format!(r#"{{"score": {score}, "reason": "{reason}"}}"#);
         let app = Router::new().route(
@@ -2386,7 +2389,10 @@ mod tests {
         let judge = ServerProxyLlmJudge::new(api, "fake-token".into(), None);
 
         let score = judge
-            .evaluate("Function returns i32", "fn add(a: i32, b: i32) -> i32 { a + b }")
+            .evaluate(
+                "Function returns i32",
+                "fn add(a: i32, b: i32) -> i32 { a + b }",
+            )
             .await
             .expect("evaluate should succeed");
 
@@ -2401,7 +2407,10 @@ mod tests {
         let judge = ServerProxyLlmJudge::new(api, "fake-token".into(), None);
 
         let score = judge
-            .evaluate("Handles errors with Result", "fn divide(a: i32, b: i32) -> i32 { a / b }")
+            .evaluate(
+                "Handles errors with Result",
+                "fn divide(a: i32, b: i32) -> i32 { a / b }",
+            )
             .await
             .expect("evaluate should succeed");
 
@@ -2411,7 +2420,7 @@ mod tests {
 
     #[tokio::test]
     async fn server_proxy_judge_includes_model_override() {
-        use axum::{Router, Json, routing::post};
+        use axum::{Json, Router, routing::post};
         use std::sync::{Arc, Mutex};
 
         let captured = Arc::new(Mutex::new(String::new()));
@@ -2441,14 +2450,13 @@ mod tests {
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move { axum::serve(listener, app).await.ok(); });
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
 
         let api = astra_thin_client::ThinClient::new(&format!("http://{addr}"), None).unwrap();
-        let judge = ServerProxyLlmJudge::new(
-            api,
-            "fake-token".into(),
-            Some("custom-model-v2".into()),
-        );
+        let judge =
+            ServerProxyLlmJudge::new(api, "fake-token".into(), Some("custom-model-v2".into()));
 
         let _score = judge.evaluate("test", "test context").await.unwrap();
         assert_eq!(*captured.lock().unwrap(), "custom-model-v2");

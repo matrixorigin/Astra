@@ -1406,10 +1406,7 @@ impl TaskBranchOps for TaskBranchService {
                 self.account
             )
         } else {
-            format!(
-                "RESTORE ACCOUNT {} FROM SNAPSHOT {snapshot}",
-                self.account
-            )
+            format!("RESTORE ACCOUNT {} FROM SNAPSHOT {snapshot}", self.account)
         };
         sqlx::query(&sql)
             .execute(&self.pool)
@@ -2171,8 +2168,11 @@ impl MatrixOneDurableTaskLifecycle {
     ) -> Self {
         let account = account.into();
         let database = database.into();
-        let branch_ops: Arc<dyn TaskBranchOps> =
-            Arc::new(TaskBranchService::new(pool.clone(), account, Some(database)));
+        let branch_ops: Arc<dyn TaskBranchOps> = Arc::new(TaskBranchService::new(
+            pool.clone(),
+            account,
+            Some(database),
+        ));
         Self {
             pool,
             branch_ops,

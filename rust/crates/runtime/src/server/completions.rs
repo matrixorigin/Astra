@@ -130,12 +130,10 @@ pub(super) async fn completions_handler(
         req = req.header("authorization", format!("Bearer {}", resolved.api_key));
     }
 
-    let resp: reqwest::Response = req.json(&body).send().await.map_err(|e| {
-        error_response(
-            StatusCode::BAD_GATEWAY,
-            format!("Upstream LLM error: {e}"),
-        )
-    })?;
+    let resp: reqwest::Response =
+        req.json(&body).send().await.map_err(|e| {
+            error_response(StatusCode::BAD_GATEWAY, format!("Upstream LLM error: {e}"))
+        })?;
 
     if !resp.status().is_success() {
         let status = resp.status();
@@ -170,9 +168,7 @@ pub(super) async fn completions_handler(
         .to_string();
 
     let prompt_tokens = upstream["usage"]["prompt_tokens"].as_u64().unwrap_or(0);
-    let completion_tokens = upstream["usage"]["completion_tokens"]
-        .as_u64()
-        .unwrap_or(0);
+    let completion_tokens = upstream["usage"]["completion_tokens"].as_u64().unwrap_or(0);
 
     Ok(Json(CompletionResponse {
         id: upstream["id"]
