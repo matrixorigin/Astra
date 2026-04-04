@@ -88,12 +88,17 @@ impl LearningFeedbackService for DatabaseLearningFeedbackService {
         }
 
         let score = request.satisfaction_score.unwrap_or(0);
-        query("UPDATE skill_selection_events SET user_feedback_score = ? WHERE event_id = ?")
-            .bind(score)
-            .bind(&request.event_id)
-            .execute(&pool)
-            .await
-            .map_err(|e| internal_error(format!("update feedback: {e}")))?;
+        query(
+            "UPDATE skill_selection_events \
+             SET user_feedback_score = ? \
+             WHERE event_id = ? AND user_id = ?",
+        )
+        .bind(score)
+        .bind(&request.event_id)
+        .bind(&request.user_id)
+        .execute(&pool)
+        .await
+        .map_err(|e| internal_error(format!("update feedback: {e}")))?;
 
         Ok(LearningFeedbackRecord {
             status: "success".to_string(),

@@ -1,9 +1,13 @@
 use axum::{Json, http::StatusCode};
 
 use super::types::QualityTrendPoint;
-use astra_core::ErrorResponse;
+use astra_core::{ErrorResponse, error_response};
 
 pub type ServiceResult<T> = Result<T, (StatusCode, Json<ErrorResponse>)>;
+
+pub fn not_implemented(message: impl Into<String>) -> (StatusCode, Json<ErrorResponse>) {
+    error_response(StatusCode::NOT_IMPLEMENTED, message)
+}
 
 pub fn compute_overall_avg(points: &[QualityTrendPoint]) -> f64 {
     if points.is_empty() {

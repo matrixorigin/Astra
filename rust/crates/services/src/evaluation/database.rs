@@ -3,7 +3,6 @@ use axum::http::StatusCode;
 use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue};
 use serde_json::Value;
 use sqlx::{Row, query};
-use uuid::Uuid;
 
 use super::service::EvaluationService;
 use super::types::*;
@@ -11,6 +10,17 @@ use super::utils::*;
 use astra_core::{
     MatrixOneSettings, SharedPool, connect_matrixone, error_response, internal_error,
 };
+
+const MAX_EVALUATION_ROWS: i32 = 200;
+const MAX_EVALUATION_DAYS: i32 = 365;
+
+fn clamp_eval_limit(limit: i32) -> i32 {
+    limit.clamp(1, MAX_EVALUATION_ROWS)
+}
+
+fn clamp_eval_days(days: i32) -> i32 {
+    days.clamp(1, MAX_EVALUATION_DAYS)
+}
 
 #[derive(Clone, Debug)]
 pub struct DatabaseEvaluationService {
@@ -100,27 +110,32 @@ impl DatabaseEvaluationService {
 impl EvaluationService for DatabaseEvaluationService {
     async fn get_quality_trend(
         &self,
-        _user_id: &str,
+        user_id: &str,
         days: i32,
         model: Option<&str>,
     ) -> ServiceResult<QualityTrendResponse> {
-        let pool = self.get_pool().await.map_err(internal_error)?;
+        if model.is_some() {
+            return Err(not_implemented(
+                "Evaluation quality trend model filtering is not implemented yet",
+            ));
+        }
 
-        let rows = if model.is_some() {
-            Vec::new()
-        } else {
-            query(
-                "SELECT DATE_FORMAT(DATE(created_at), '%Y-%m-%d') AS dt, \
-                 AVG(score) AS avg_score, COUNT(*) AS cnt \
-                 FROM eval_quality_assessments \
-                 WHERE created_at >= DATE_SUB(NOW(), INTERVAL ? DAY) \
-                 GROUP BY dt ORDER BY dt",
-            )
-            .bind(days)
-            .fetch_all(&pool)
-            .await
-            .unwrap_or_default()
-        };
+        let pool = self.get_pool().await.map_err(internal_error)?;
+        let days = clamp_eval_days(days);
+
+        let rows = query(
+            "SELECT DATE_FORMAT(DATE(created_at), '%Y-%m-%d') AS dt, \
+             AVG(score) AS avg_score, COUNT(*) AS cnt \
+             FROM eval_quality_assessments \
+             WHERE user_id = ? \
+               AND created_at >= DATE_SUB(NOW(), INTERVAL ? DAY) \
+             GROUP BY dt ORDER BY dt",
+        )
+        .bind(user_id)
+        .bind(days)
+        .fetch_all(&pool)
+        .await
+        .unwrap_or_default();
 
         let points: Vec<QualityTrendPoint> = rows
             .iter()
@@ -143,25 +158,28 @@ impl EvaluationService for DatabaseEvaluationService {
     }
 
     async fn detect_drift(&self, _user_id: &str) -> ServiceResult<DriftDetectResponse> {
-        Ok(DriftDetectResponse {
-            signals: Vec::new(),
-            checked_at: now_iso(),
-        })
+        Err(not_implemented(
+            "Evaluation drift detection is not implemented yet",
+        ))
     }
 
     async fn get_gate_history(
         &self,
-        _user_id: &str,
+        user_id: &str,
         limit: i32,
     ) -> ServiceResult<GateHistoryResponse> {
         let pool = self.get_pool().await.map_err(internal_error)?;
+        let limit = clamp_eval_limit(limit);
 
         let rows = query(
             "SELECT gate_id, change_type, change_id, sessions_tested, \
              error_rate, score_delta, passed, \
              DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s') AS created_at \
-             FROM eval_gate_results ORDER BY created_at DESC LIMIT ?",
+             FROM eval_gate_results \
+             WHERE user_id = ? \
+             ORDER BY created_at DESC LIMIT ?",
         )
+        .bind(user_id)
         .bind(limit)
         .fetch_all(&pool)
         .await
@@ -190,38 +208,28 @@ impl EvaluationService for DatabaseEvaluationService {
         _agent_id: Option<&str>,
         _days: i32,
     ) -> ServiceResult<CalibrationResponse> {
-        let mean_confidence = 0.0;
-        let mean_quality = 0.0;
-        let calibration_error = compute_calibration_error(mean_confidence, mean_quality);
-        let bias = mean_confidence - mean_quality;
-        let (adjustment_multiplier, adjustment_reason) =
-            compute_adjustment(calibration_error, bias);
-
-        Ok(CalibrationResponse {
-            mean_confidence,
-            mean_quality,
-            calibration_error,
-            bias,
-            sample_count: 0,
-            adjustment_multiplier,
-            adjustment_reason,
-        })
+        Err(not_implemented(
+            "Evaluation calibration reporting is not implemented yet",
+        ))
     }
 
     async fn get_session_scores(
         &self,
-        _user_id: &str,
+        user_id: &str,
         limit: i32,
         min_score: f64,
     ) -> ServiceResult<SessionScoresListResponse> {
         let pool = self.get_pool().await.map_err(internal_error)?;
+        let limit = clamp_eval_limit(limit);
 
         let rows = query(
             "SELECT target_id, score, COALESCE(step_count, 0) AS chain_count \
              FROM eval_quality_assessments \
-             WHERE level = 'session' AND score >= ? \
+             WHERE user_id = ? \
+               AND level = 'session' AND score >= ? \
              ORDER BY updated_at DESC LIMIT ?",
         )
+        .bind(user_id)
         .bind(min_score)
         .bind(limit)
         .fetch_all(&pool)
@@ -243,60 +251,50 @@ impl EvaluationService for DatabaseEvaluationService {
     async fn validate_gate(
         &self,
         _user_id: &str,
-        request: GateValidateRequest,
+        _request: GateValidateRequest,
     ) -> ServiceResult<GateValidateResponse> {
-        Ok(GateValidateResponse {
-            gate_id: Uuid::new_v4().to_string(),
-            change_type: request.change_type,
-            change_id: request.change_id,
-            sessions_tested: 0,
-            error_rate: 0.0,
-            score_delta: 0.0,
-            passed: true,
-            details: "Gate validation stub — core regression runner not yet ported".into(),
-        })
+        Err(not_implemented(
+            "Evaluation gate validation is not implemented yet",
+        ))
     }
 
     async fn run_drift_pipeline(&self, _user_id: &str) -> ServiceResult<DriftPipelineResponse> {
-        Ok(DriftPipelineResponse {
-            run_id: Uuid::new_v4().to_string(),
-            signals_detected: 0,
-            signals: Vec::new(),
-            started_at: now_iso(),
-        })
+        Err(not_implemented(
+            "Evaluation drift pipeline execution is not implemented yet",
+        ))
     }
 
     async fn run_closed_loop(
         &self,
         _user_id: &str,
         _days: i32,
-        dry_run: bool,
+        _dry_run: bool,
     ) -> ServiceResult<ClosedLoopResponse> {
-        Ok(ClosedLoopResponse {
-            loop_id: Uuid::new_v4().to_string(),
-            dry_run,
-            diagnoses: Vec::new(),
-            actions_taken: Vec::new(),
-        })
+        Err(not_implemented(
+            "Evaluation closed-loop execution is not implemented yet",
+        ))
     }
 
     async fn trust_report(
         &self,
-        _user_id: &str,
+        user_id: &str,
         agent_id: &str,
         days: i32,
     ) -> ServiceResult<TrustReportResponse> {
         let pool = self.get_pool().await.map_err(internal_error)?;
+        let days = clamp_eval_days(days);
 
         let row = query(
             "SELECT COUNT(*) AS total, \
              SUM(CASE WHEN JSON_UNQUOTE(JSON_EXTRACT(content, '$.safe_to_deliver')) = 'true' \
-                 THEN 1 ELSE 0 END) AS safe_cnt \
+                  THEN 1 ELSE 0 END) AS safe_cnt \
              FROM agent_events \
-             WHERE event_type = 'hallucination_check' \
+             WHERE user_id = ? \
+               AND event_type = 'hallucination_check' \
                AND agent_id = ? \
                AND created_at > DATE_SUB(NOW(), INTERVAL ? DAY)",
         )
+        .bind(user_id)
         .bind(agent_id)
         .bind(days)
         .fetch_one(&pool)
@@ -324,41 +322,41 @@ impl EvaluationService for DatabaseEvaluationService {
     async fn slo_dashboard(
         &self,
         _user_id: &str,
-        period_days: i32,
+        _period_days: i32,
     ) -> ServiceResult<SloDashboardResponse> {
-        Ok(SloDashboardResponse {
-            period_days,
-            agents: Vec::new(),
-        })
+        Err(not_implemented(
+            "Evaluation SLO dashboard is not implemented yet",
+        ))
     }
 
     async fn slo_history(
         &self,
         _user_id: &str,
-        agent_id: &str,
-        days: i32,
+        _agent_id: &str,
+        _days: i32,
     ) -> ServiceResult<SloHistoryResponse> {
-        Ok(SloHistoryResponse {
-            agent_id: agent_id.to_string(),
-            days,
-            history: Vec::new(),
-        })
+        Err(not_implemented(
+            "Evaluation SLO history is not implemented yet",
+        ))
     }
 
     async fn observability_metrics(
         &self,
-        _user_id: &str,
+        user_id: &str,
         agent_id: &str,
         days: i32,
     ) -> ServiceResult<ObservabilityMetricsResponse> {
         let pool = self.get_pool().await.map_err(internal_error)?;
+        let days = clamp_eval_days(days);
 
         let decision_row = query(
             "SELECT COUNT(*) AS cnt \
              FROM agent_events \
-             WHERE agent_id = ? AND event_type = 'llm_response' \
-                AND created_at > DATE_SUB(NOW(), INTERVAL ? DAY)",
+             WHERE user_id = ? \
+               AND agent_id = ? AND event_type = 'llm_response' \
+                 AND created_at > DATE_SUB(NOW(), INTERVAL ? DAY)",
         )
+        .bind(user_id)
         .bind(agent_id)
         .bind(days)
         .fetch_one(&pool)
@@ -379,11 +377,13 @@ impl EvaluationService for DatabaseEvaluationService {
             "SELECT COUNT(DISTINCT session_id) AS sess_cnt, \
              AVG(turn_count) AS avg_turns \
              FROM (SELECT session_id, COUNT(*) AS turn_count \
-                   FROM agent_events \
-                   WHERE agent_id = ? \
-                     AND created_at > DATE_SUB(NOW(), INTERVAL ? DAY) \
-                   GROUP BY session_id) sub",
+                    FROM agent_events \
+                    WHERE user_id = ? \
+                      AND agent_id = ? \
+                      AND created_at > DATE_SUB(NOW(), INTERVAL ? DAY) \
+                    GROUP BY session_id) sub",
         )
+        .bind(user_id)
         .bind(agent_id)
         .bind(days)
         .fetch_one(&pool)
@@ -404,8 +404,10 @@ impl EvaluationService for DatabaseEvaluationService {
             "SELECT COUNT(*) AS total, \
              SUM(CASE WHEN execution_success = 1 THEN 1 ELSE 0 END) AS ok_cnt \
              FROM skill_selection_events \
-             WHERE created_at > DATE_SUB(NOW(), INTERVAL ? DAY)",
+             WHERE user_id = ? \
+               AND created_at > DATE_SUB(NOW(), INTERVAL ? DAY)",
         )
+        .bind(user_id)
         .bind(days)
         .fetch_one(&pool)
         .await;
@@ -523,14 +525,11 @@ impl EvaluationService for DatabaseEvaluationService {
     async fn extract_training_data(
         &self,
         _user_id: &str,
-        request: TrainingDataExtractRequest,
+        _request: TrainingDataExtractRequest,
     ) -> ServiceResult<TrainingDataExtractResponse> {
-        Ok(TrainingDataExtractResponse {
-            dataset_id: Uuid::new_v4().to_string(),
-            samples_extracted: 0,
-            quality_threshold: request.min_quality,
-            status: "stub — training pipeline not yet ported".into(),
-        })
+        Err(not_implemented(
+            "Evaluation training data extraction is not implemented yet",
+        ))
     }
 
     async fn export_training_data(

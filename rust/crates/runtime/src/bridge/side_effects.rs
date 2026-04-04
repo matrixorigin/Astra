@@ -479,6 +479,7 @@ fn build_hook_db_persist_from_payload(
         return None;
     }
     let session_id = optional_object_str(hook_payload, "session_id")?.to_string();
+    let user_id = optional_object_str(hook_payload, "user_id")?.to_string();
     let parent_event_id = optional_object_str(hook_payload, "parent_event_id")?.to_string();
     let messages = object_array(hook_payload, "messages");
     let run_implicit_feedback = hook_payload
@@ -528,6 +529,7 @@ fn build_hook_db_persist_from_payload(
         .map(|first_tool_name| TurnSkillSelectionRecord {
             event_id: Uuid::now_v7().to_string(),
             session_id,
+            user_id: user_id.clone(),
             agent_id: optional_object_str(hook_payload, "agent_id").map(ToString::to_string),
             user_query: truncate_text(user_content, 2000),
             selected_skills: tool_calls

@@ -234,6 +234,7 @@ pub async fn ensure_core_schema(settings: &MatrixOneSettings) -> Result<(), sqlx
         "CREATE TABLE IF NOT EXISTS skill_selection_events (
             event_id VARCHAR(36) PRIMARY KEY,
             session_id VARCHAR(36) NOT NULL,
+            user_id VARCHAR(36) NULL,
             agent_id VARCHAR(64) NULL,
             user_query LONGTEXT NULL,
             selected_skills JSON NULL,
@@ -245,6 +246,7 @@ pub async fn ensure_core_schema(settings: &MatrixOneSettings) -> Result<(), sqlx
             user_feedback_score BIGINT NULL,
             created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             INDEX idx_skill_selection_session_created (session_id, created_at),
+            INDEX idx_skill_selection_user_created (user_id, created_at),
             INDEX idx_skill_selection_skill_created (skill_name, created_at)
         )",
     )
@@ -836,6 +838,7 @@ pub async fn ensure_core_schema(settings: &MatrixOneSettings) -> Result<(), sqlx
     query(
         "CREATE TABLE IF NOT EXISTS eval_gate_results (
             gate_id         VARCHAR(36) PRIMARY KEY,
+            user_id         VARCHAR(36) NULL,
             change_type     VARCHAR(64) NOT NULL,
             change_id       VARCHAR(64) NOT NULL,
             sessions_tested INT NOT NULL DEFAULT 0,
@@ -843,6 +846,7 @@ pub async fn ensure_core_schema(settings: &MatrixOneSettings) -> Result<(), sqlx
             score_delta     DECIMAL(5,4),
             passed          SMALLINT NOT NULL DEFAULT 0,
             created_at      DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            INDEX idx_egr_user_created (user_id, created_at),
             INDEX idx_egr_change (change_type, change_id),
             INDEX idx_egr_passed (passed)
         )",
@@ -853,12 +857,14 @@ pub async fn ensure_core_schema(settings: &MatrixOneSettings) -> Result<(), sqlx
     query(
         "CREATE TABLE IF NOT EXISTS eval_quality_assessments (
             assessment_id VARCHAR(36) PRIMARY KEY,
+            user_id       VARCHAR(36) NULL,
             target_id     VARCHAR(64) NOT NULL,
             score         DECIMAL(5,4) NOT NULL,
             step_count    INT NOT NULL DEFAULT 0,
             level         VARCHAR(32) NOT NULL DEFAULT 'unknown',
             created_at    DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             updated_at    DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
+            INDEX idx_eqa_user_level_updated (user_id, level, updated_at),
             INDEX idx_eqa_target (target_id),
             INDEX idx_eqa_level (level)
         )",
@@ -912,6 +918,35 @@ pub async fn ensure_core_schema(settings: &MatrixOneSettings) -> Result<(), sqlx
         "CREATE INDEX idx_euf_agent_created ON eval_user_feedback (agent_id, created_at)",
         "CREATE INDEX idx_euf_created ON eval_user_feedback (created_at)",
         "CREATE INDEX idx_euf_type_created ON eval_user_feedback (feedback_type, created_at)",
+    ] {
+        if let Err(e) = query(ddl).execute(&pool).await {
+            let msg = e.to_string().to_lowercase();
+            if !msg.contains("duplicate") && !msg.contains("already exists") {
+                return Err(e);
+            }
+        }
+    }
+
+    for ddl in [
+        "ALTER TABLE skill_selection_events ADD COLUMN user_id VARCHAR(36) NULL",
+        "ALTER TABLE eval_gate_results ADD COLUMN user_id VARCHAR(36) NULL",
+        "ALTER TABLE eval_quality_assessments ADD COLUMN user_id VARCHAR(36) NULL",
+    ] {
+        if let Err(e) = query(ddl).execute(&pool).await {
+            let msg = e.to_string().to_lowercase();
+            if !msg.contains("duplicate")
+                && !msg.contains("already exists")
+                && !msg.contains("exists")
+            {
+                return Err(e);
+            }
+        }
+    }
+
+    for ddl in [
+        "CREATE INDEX idx_skill_selection_user_created ON skill_selection_events (user_id, created_at)",
+        "CREATE INDEX idx_egr_user_created ON eval_gate_results (user_id, created_at)",
+        "CREATE INDEX idx_eqa_user_level_updated ON eval_quality_assessments (user_id, level, updated_at)",
     ] {
         if let Err(e) = query(ddl).execute(&pool).await {
             let msg = e.to_string().to_lowercase();

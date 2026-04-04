@@ -383,6 +383,76 @@ async fn memory_metrics_uses_memoria_health_endpoints() {
 }
 
 #[tokio::test]
+async fn drift_returns_501_when_service_is_stubbed() {
+    let memoria_base_url = start_mock_memoria_health().await;
+    let app = build_memoria_backed_app(memoria_base_url);
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/evaluation/drift")
+                .header("x-user-id", "u1")
+                .body(body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
+}
+
+#[tokio::test]
+async fn quality_trend_model_filter_returns_501_until_supported() {
+    let memoria_base_url = start_mock_memoria_health().await;
+    let app = build_memoria_backed_app(memoria_base_url);
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/evaluation/quality/trend?model=gpt-4")
+                .header("x-user-id", "u1")
+                .body(body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
+}
+
+#[tokio::test]
+async fn slo_dashboard_returns_501_when_service_is_stubbed() {
+    let memoria_base_url = start_mock_memoria_health().await;
+    let app = build_memoria_backed_app(memoria_base_url);
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/evaluation/slo/dashboard")
+                .header("x-user-id", "u1")
+                .body(body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
+}
+
+#[tokio::test]
+async fn training_data_extract_returns_501_when_service_is_stubbed() {
+    let memoria_base_url = start_mock_memoria_health().await;
+    let app = build_memoria_backed_app(memoria_base_url);
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/evaluation/training-data/extract")
+                .header("x-user-id", "u1")
+                .header("content-type", "application/json")
+                .body(body::Body::from(r#"{}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
+}
+
+#[tokio::test]
 async fn training_data_export_returns_503() {
     let app = build_unconfigured_app();
     let resp = app

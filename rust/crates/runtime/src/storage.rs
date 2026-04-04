@@ -112,11 +112,12 @@ pub(crate) async fn insert_turn_skill_selection(
 ) -> Result<(), sqlx::Error> {
     query(
         "INSERT INTO skill_selection_events \
-         (event_id, session_id, agent_id, user_query, selected_skills, skill_name, skill_version, selection_method, execution_success, execution_time_ms, created_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())",
+         (event_id, session_id, user_id, agent_id, user_query, selected_skills, skill_name, skill_version, selection_method, execution_success, execution_time_ms, created_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())",
     )
     .bind(&record.event_id)
     .bind(&record.session_id)
+    .bind(&record.user_id)
     .bind(&record.agent_id)
     .bind(&record.user_query)
     .bind(serde_json::json!(record.selected_skills).to_string())

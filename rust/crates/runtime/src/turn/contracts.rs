@@ -71,6 +71,7 @@ pub struct TurnDecisionAuditRecord {
 pub struct TurnSkillSelectionRecord {
     pub event_id: String,
     pub session_id: String,
+    pub user_id: String,
     pub agent_id: Option<String>,
     pub user_query: String,
     pub selected_skills: Vec<String>,
