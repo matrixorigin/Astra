@@ -2532,20 +2532,29 @@ async fn plan_monitoring_loop(state: &mut ReplState) {
 fn display_plan_updates_live(
     state: &mut ReplState,
     printer: &std::sync::Mutex<Option<readline_actor::BoxedPrinter>>,
+    plan_spinner: &mut Option<effects::PlanActivitySpinner>,
+    current_subtask_tag: &mut String,
 ) {
     use plan_executor::PlanUpdate;
 
     // Print via ExternalPrinter if available, otherwise eprintln!.
-    let print_msg = |printer: &std::sync::Mutex<Option<readline_actor::BoxedPrinter>>,
-                     msg: String| {
-        if let Ok(mut guard) = printer.lock()
-            && let Some(ref mut p) = *guard
-        {
-            let _ = p.print(msg);
-        } else {
-            eprintln!("{msg}");
-        }
-    };
+    // Always stops the active spinner first to clear its \r line.
+    let print_line =
+        |printer: &std::sync::Mutex<Option<readline_actor::BoxedPrinter>>,
+         spinner: &mut Option<effects::PlanActivitySpinner>,
+         msg: String| {
+            // Stop spinner before printing to avoid garbled output
+            if let Some(s) = spinner.take() {
+                s.stop_clear();
+            }
+            if let Ok(mut guard) = printer.lock()
+                && let Some(ref mut p) = *guard
+            {
+                let _ = p.print(msg);
+            } else {
+                eprintln!("{msg}");
+            }
+        };
 
     let handle = match state.plan_handle.as_mut() {
         Some(h) => h,
@@ -2553,14 +2562,21 @@ fn display_plan_updates_live(
     };
 
     while let Some(update) = handle.try_recv() {
-        let msg = match update {
+        // Determine the message to display and whether to start a spinner after.
+        // `post_spinner` is (label, should_start_spinner_after_printing).
+        let (msg, post_spinner): (String, Option<&str>) = match update {
             PlanUpdate::SubtaskStarted {
+                id,
                 title,
                 index,
                 total,
                 ..
             } => {
-                format!("\n▸  [{index}/{total}] {title}")
+                *current_subtask_tag = id;
+                (
+                    format!("\n▸  [{index}/{total}] {title}"),
+                    Some("Waiting for model"),
+                )
             }
             PlanUpdate::SubtaskCompleted {
                 id,
@@ -2572,9 +2588,9 @@ fn display_plan_updates_live(
                     .map(|d| format!(" ({})", format_duration_short(d)))
                     .unwrap_or_default();
                 if verification_passed {
-                    format!("  ✅ {id}{dur}")
+                    (format!("  ✅ {id}{dur}"), None)
                 } else {
-                    format!("  ⚠ {id} — verification failed{dur}")
+                    (format!("  ⚠ {id} — verification failed{dur}"), None)
                 }
             }
             PlanUpdate::SubtaskTurnResult {
@@ -2596,12 +2612,19 @@ fn display_plan_updates_live(
                 ..
             } => {
                 let pct = if total > 0 { done * 100 / total } else { 0 };
-                format!(
-                    "  📊 {done}/{total} ({pct}%) — {}",
-                    format_duration_short(elapsed),
+                (
+                    format!(
+                        "  📊 {done}/{total} ({pct}%) — {}",
+                        format_duration_short(elapsed),
+                    ),
+                    None,
                 )
             }
             PlanUpdate::PlanCompleted { pct, elapsed } => {
+                // Stop spinner
+                if let Some(s) = plan_spinner.take() {
+                    s.stop_clear();
+                }
                 // Take handle out of state to drain without double-borrow
                 if let Some(mut h) = state.plan_handle.take() {
                     while let Some(trailing) = h.try_recv() {
@@ -2614,10 +2637,14 @@ fn display_plan_updates_live(
                 );
                 state.executing_plan = None;
                 state.current_plan_subtask_id = None;
-                print_msg(printer, msg);
+                print_line(printer, plan_spinner, msg);
                 return;
             }
             PlanUpdate::PlanError { error } => {
+                // Stop spinner
+                if let Some(s) = plan_spinner.take() {
+                    s.stop_clear();
+                }
                 if let Some(mut h) = state.plan_handle.take() {
                     while let Some(trailing) = h.try_recv() {
                         apply_trailing_update(trailing, state);
@@ -2626,20 +2653,23 @@ fn display_plan_updates_live(
                 let msg = format!("\n❌  Plan error: {error}");
                 state.executing_plan = None;
                 state.current_plan_subtask_id = None;
-                print_msg(printer, msg);
+                print_line(printer, plan_spinner, msg);
                 return;
             }
             PlanUpdate::PlanPaused {
                 pct,
                 remaining,
                 elapsed,
-            } => {
+            } => (
                 format!(
                     "\n⏸  Plan paused — {pct}% done, {remaining} remaining ({})",
                     format_duration_short(elapsed),
-                )
+                ),
+                None,
+            ),
+            PlanUpdate::GlobalVerificationFailed => {
+                ("  ⚠ Global verification failed".to_string(), None)
             }
-            PlanUpdate::GlobalVerificationFailed => "  ⚠ Global verification failed".to_string(),
             PlanUpdate::JournalEvent(event) => {
                 // Write journal event to the REPL-owned journal writer
                 if let Some(ref journal) = state.journal {
@@ -2665,17 +2695,24 @@ fn display_plan_updates_live(
                 ..
             } => {
                 if retries_exhausted {
-                    format!("  ⚠ {id} — verification failed (retries exhausted)")
+                    (
+                        format!("  ⚠ {id} — verification failed (retries exhausted)"),
+                        None,
+                    )
                 } else {
-                    format!("  ↻ {id} — verification failed, retrying…")
+                    (
+                        format!("  ↻ {id} — verification failed, retrying…"),
+                        Some("Waiting for model"),
+                    )
                 }
             }
             PlanUpdate::StreamingEvent { event, .. } => {
                 use chat_stream::StreamEvent;
                 match event {
-                    StreamEvent::ToolStarted { name, description } => {
-                        format!("  ⚡ {name} {description}")
-                    }
+                    StreamEvent::ToolStarted { name, description } => (
+                        format!("  ⚡ {name} {description}"),
+                        Some("running-tool"), // Placeholder — replaced below
+                    ),
                     StreamEvent::ToolCompleted {
                         name,
                         status,
@@ -2687,16 +2724,40 @@ fn display_plan_updates_live(
                         let summary = output_summary
                             .map(|s| format!("  {s}"))
                             .unwrap_or_default();
-                        format!("  {icon} {name} ({dur}){summary}")
+                        (format!("  {icon} {name} ({dur}){summary}"), None)
                     }
                     StreamEvent::WaitingForModel => {
-                        "  ◌ Waiting for model…".to_string()
+                        // Don't print a line — just start the spinner
+                        if let Some(s) = plan_spinner.take() {
+                            s.stop_clear();
+                        }
+                        *plan_spinner = Some(effects::PlanActivitySpinner::start(
+                            current_subtask_tag,
+                            "Waiting for model",
+                        ));
+                        continue;
                     }
                     StreamEvent::ModelResponding => {
-                        "  ● Model responding…".to_string()
+                        // Replace spinner with "Model responding" spinner
+                        if let Some(s) = plan_spinner.take() {
+                            s.stop_clear();
+                        }
+                        *plan_spinner = Some(effects::PlanActivitySpinner::start(
+                            current_subtask_tag,
+                            "Model responding",
+                        ));
+                        continue;
                     }
                     StreamEvent::Thinking(true) => {
-                        "  ◐ Thinking…".to_string()
+                        // Replace spinner with "Thinking" spinner
+                        if let Some(s) = plan_spinner.take() {
+                            s.stop_clear();
+                        }
+                        *plan_spinner = Some(effects::PlanActivitySpinner::start(
+                            current_subtask_tag,
+                            "Thinking",
+                        ));
+                        continue;
                     }
                     // Skip noisy events: individual tokens, thinking chunks, status lines
                     _ => continue,
@@ -2705,7 +2766,22 @@ fn display_plan_updates_live(
             _ => continue, // ParallelGroupInfo, StepByStepPrompt — future use
         };
 
-        print_msg(printer, msg);
+        // Print the message (stops spinner internally)
+        print_line(printer, plan_spinner, msg);
+
+        // Optionally start a new spinner after the printed line
+        if let Some(label) = post_spinner {
+            // For tool-started events, show "Running <tool>" instead of placeholder
+            let spinner_label = if label == "running-tool" {
+                "Running tool"
+            } else {
+                label
+            };
+            *plan_spinner = Some(effects::PlanActivitySpinner::start(
+                current_subtask_tag,
+                spinner_label,
+            ));
+        }
     }
 }
 
@@ -3886,6 +3962,9 @@ async fn run_chat_repl(
         // ── Select: readline response OR background plan updates ─────
         let readline_result: Result<String, ReadlineError>;
         let mut pending_execute: Option<String> = None;
+        // Spinner state for plan execution — persists across poll cycles
+        let mut plan_spinner: Option<effects::PlanActivitySpinner> = None;
+        let mut current_subtask_tag = String::new();
 
         loop {
             tokio::select! {
@@ -3893,6 +3972,10 @@ async fn run_chat_repl(
 
                 // Readline thread returned a result
                 resp = readline.recv() => {
+                    // Stop plan spinner before processing readline
+                    if let Some(s) = plan_spinner.take() {
+                        s.stop_clear();
+                    }
                     match resp {
                         Some(readline_actor::ReadlineResponse::Line { result, pending_execute: pe }) => {
                             readline_result = result;
@@ -3916,7 +3999,7 @@ async fn run_chat_repl(
                     }
                 } => {
                     // Drain plan updates and display via ExternalPrinter
-                    display_plan_updates_live(&mut state, &ext_printer);
+                    display_plan_updates_live(&mut state, &ext_printer, &mut plan_spinner, &mut current_subtask_tag);
                 }
             }
         }

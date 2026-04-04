@@ -21,12 +21,15 @@
 //! - **stdout via TerminalRegion**: ThinkingPreviewPane uses diff-based rendering
 //!   to coordinate with StreamingMarkdown and avoid cursor desync
 
+mod plan_spinner;
 mod prep_spinner;
 mod spinner;
 mod thinking_pane;
 mod tool_spinner;
 mod ttft_spinner;
 
+#[allow(unused_imports)]
+pub use plan_spinner::PlanActivitySpinner;
 #[allow(unused_imports)]
 pub use prep_spinner::PlanAssembleLineSpinner;
 pub use prep_spinner::{ChatPrepPhaseLabel, ChatTurnPrepLineGuard};
