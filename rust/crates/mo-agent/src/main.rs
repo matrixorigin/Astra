@@ -3970,6 +3970,7 @@ async fn run_chat_repl(
     }
 
     // ── Main loop ─────────────────────────────────────────────────────────────
+    let mut last_ctrl_c_at: Option<std::time::Instant> = None;
     loop {
         let current_token = current_access_token(profile);
 
@@ -4315,7 +4316,33 @@ async fn run_chat_repl(
             }
             Err(ReadlineError::Interrupted) => {
                 clear_slash_overlay();
-                eprintln!("^C");
+                if let Some(ref handle) = state.plan_handle {
+                    // Plan is running — escalating Ctrl+C: pause → cancel
+                    let now = std::time::Instant::now();
+                    let rapid = last_ctrl_c_at
+                        .map(|t| now.duration_since(t) < std::time::Duration::from_secs(2))
+                        .unwrap_or(false);
+                    last_ctrl_c_at = Some(now);
+
+                    if rapid {
+                        // Second rapid Ctrl+C → cancel
+                        let _ = handle.send_command(plan_executor::PlanCommand::Cancel);
+                        eprintln!(
+                            "\n{}  Cancelling plan execution…",
+                            "✗".red()
+                        );
+                    } else {
+                        // First Ctrl+C → pause
+                        let _ = handle.send_command(plan_executor::PlanCommand::Pause);
+                        eprintln!(
+                            "\n{}  Pausing plan… (press Ctrl+C again to cancel)",
+                            "⏸".yellow()
+                        );
+                    }
+                } else {
+                    last_ctrl_c_at = None;
+                    eprintln!("^C");
+                }
             }
             Err(ReadlineError::Eof) => {
                 clear_slash_overlay();

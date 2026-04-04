@@ -114,6 +114,7 @@ pub(super) async fn handle_state_command(
             eprintln!("  {}", "Summarizing…".dim());
             let mut auto_pm =
                 PermissionManager::with_project(true, &std::env::current_dir().unwrap_or_default());
+            let mut _cancel_token_guard: Option<std::sync::Arc<tokio_util::sync::CancellationToken>> = None;
             let summary_result = tokio::select! {
                 r = stream_chat_sse(ChatTurnParams {
                     api,
@@ -137,12 +138,17 @@ pub(super) async fn handle_state_command(
                     is_plan_subtask: false,
                     plan_subtask_id: None,
                     delegation_engine: None,
-                    cancel_token: None,
+                    cancel_token: {
+                        let token = std::sync::Arc::new(tokio_util::sync::CancellationToken::new());
+                        _cancel_token_guard = Some(token.clone());
+                        Some(token)
+                    },
                     plan_assemble_line_release: None,
                     stream_event_tx: None,
                 approval_request_tx: None,
                 }) => r,
                 _ = tokio::signal::ctrl_c() => {
+                    if let Some(ref t) = _cancel_token_guard { t.cancel(); }
                     eprintln!("{}", "  Interrupted.".dim());
                     return Ok(());
                 }
