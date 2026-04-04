@@ -1146,10 +1146,30 @@ impl StreamRenderState {
                 }
                 Some(parts.join("\n    "))
             }
-            "read_file" | "view_file" => Some(format!(
-                "{line_count} lines, {}",
-                format_byte_size(byte_size)
-            )),
+            "read_file" | "view_file" => {
+                // Show first few lines of file content (like Cursor/Claude Code)
+                // Skip metadata lines like "[Auto-expanded..." or line number headers
+                let content_lines: Vec<&str> = output
+                    .lines()
+                    .filter(|l| !l.starts_with('[') && !l.is_empty())
+                    .take(3)
+                    .collect();
+
+                if content_lines.is_empty() {
+                    return Some(format!(
+                        "{line_count} lines, {}",
+                        format_byte_size(byte_size)
+                    ));
+                }
+
+                let mut parts: Vec<String> =
+                    content_lines.iter().map(|l| truncate_line(l, 65)).collect();
+                let remaining = line_count.saturating_sub(content_lines.len() + 1); // +1 for metadata lines
+                if remaining > 0 {
+                    parts.push(format!("… +{remaining} more lines"));
+                }
+                Some(parts.join("\n    "))
+            }
             "git_log" => {
                 // Show first few commit summaries
                 let commits: Vec<&str> = output
