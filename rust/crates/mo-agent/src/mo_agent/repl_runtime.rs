@@ -442,7 +442,7 @@ pub(super) fn print_repl_banner(profile: Option<&str>, state: &ReplState) {
     let tip2_plain = format!("  💡 {tip2}");
 
     let lines_plain = [
-        format!("  astra  v{version}"),
+        format!("  astra  v{version}  powered by MatrixOne"),
         format!(
             "  profile: {}  user: {}  model: {}  session: {}",
             pname, user_display, model_display, session_display
@@ -459,9 +459,10 @@ pub(super) fn print_repl_banner(profile: Option<&str>, state: &ReplState) {
 
     let lines_colored = [
         format!(
-            "  {}  {}",
+            "  {}  {}  {}",
             "astra".cyan().bold(),
-            format!("v{version}").dim()
+            format!("v{version}").dim(),
+            "powered by MatrixOne".dim()
         ),
         format!(
             "  profile: {}  user: {}  model: {}  session: {}",
@@ -546,13 +547,11 @@ fn print_startup_logo() {
             let _ = std::io::stderr().flush();
             std::thread::sleep(delay);
         }
-        eprintln!("  {}", "agent runtime".cyan().dim());
         std::thread::sleep(Duration::from_millis(70));
     } else {
         for line in logo_lines {
             eprintln!("  {}", line.cyan().bold());
         }
-        eprintln!("  {}", "agent runtime".cyan().dim());
     }
     eprintln!();
 }
