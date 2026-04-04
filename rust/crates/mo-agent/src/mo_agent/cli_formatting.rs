@@ -225,14 +225,18 @@ pub fn highlight_code_line(line: &str) -> String {
     let string_re =
         STRING_RE.get_or_init(|| Regex::new(r#"("(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*')"#).unwrap());
 
-    // Check if line starts with line number (e.g., "420\t")
+    // Check if line starts with line number (e.g., "420\t" or " 99\t")
+    // Convert to more compact format: "  42│" (dim, right-aligned number + dim pipe)
     let (prefix, code) = if let Some(tab_pos) = line.find('\t') {
         let num_part = &line[..tab_pos];
         if num_part
             .chars()
             .all(|c| c.is_ascii_digit() || c.is_whitespace())
         {
-            (format!("{}", num_part.dim()), &line[tab_pos..])
+            // Right-align to 4 chars, then apply dim styling
+            let num_trimmed = num_part.trim();
+            let aligned = format!("{:>4}│", num_trimmed);
+            (format!("{}", aligned.dim()), &line[tab_pos + 1..])
         } else {
             (String::new(), line)
         }
@@ -399,6 +403,23 @@ mod tests {
         assert!(stripped.contains("let"));
         assert!(stripped.contains("hello"));
         assert!(stripped.contains("test"));
+    }
+
+    #[test]
+    fn test_highlight_line_number_format() {
+        // Line number should be right-aligned with pipe separator
+        let input = "42\tlet x = 1;";
+        let output = highlight_code_line(input);
+        let stripped = strip_ansi(&output);
+        // Should have right-aligned number and pipe: "  42│let x = 1;"
+        assert!(stripped.starts_with("  42│"));
+        assert!(stripped.contains("let x = 1;"));
+
+        // Test with larger line number
+        let input2 = "1234\tlet y = 2;";
+        let output2 = highlight_code_line(input2);
+        let stripped2 = strip_ansi(&output2);
+        assert!(stripped2.starts_with("1234│"));
     }
 
     /// Helper to strip ANSI escape codes for testing
