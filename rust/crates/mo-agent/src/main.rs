@@ -3967,23 +3967,23 @@ async fn run_chat_repl(
         flush_plan_updates_between_prompts(&mut state);
         let current_token = current_access_token(profile);
 
-        // Keep readline prompts ASCII-only. Unicode characters (⏸, 🔄, ❯)
-        // have ambiguous or environment-dependent widths that can cause
-        // rustyline's cursor position to diverge from the terminal's actual
-        // rendering, clipping the last wide character while typing.
+        // Keep readline prompt TEXT as ASCII-only. Unicode characters (⏸, 🔄, ❯)
+        // have ambiguous display widths that break cursor tracking for CJK input.
+        // ANSI color codes are safe — rustyline's calculate_position() treats them
+        // as width=0 so cursor math is unaffected.
         if let Some(ref sname) = state.skill_dev_name {
             eprintln!("  \u{1f527} {}", format!("Skill dev: {sname}").cyan().dim());
         }
         let prompt_str = if state.plan_mode.is_some() {
-            "plan> ".to_string()
+            "\x1b[1;33mplan>\x1b[0m ".to_string()
         } else if state.executing_plan.is_some() {
-            "pause> ".to_string()
+            "\x1b[1;33mpause>\x1b[0m ".to_string()
         } else if state.plan_handle.is_some() {
-            "bg> ".to_string()
+            "\x1b[1;36mbg>\x1b[0m ".to_string()
         } else if state.chat_plan_only {
-            "plan. ".to_string()
+            "\x1b[1;33mplan.\x1b[0m ".to_string()
         } else {
-            "> ".to_string()
+            "\x1b[1;36m>\x1b[0m ".to_string()
         };
 
         // ── Send readline request to actor thread ────────────────────
