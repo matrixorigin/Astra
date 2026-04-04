@@ -236,6 +236,7 @@ pub struct PlanTemplateSyncRow {
     pub use_count: i32,
 }
 
+const MAX_PREFERENCE_SYNC_ROWS: i64 = 128;
 const MAX_PLAN_TEMPLATE_SYNC_ROWS: i64 = 500;
 
 /// Delta snapshot containing only changed data since last sync.
@@ -971,9 +972,14 @@ impl StateSyncService for MatrixOneSyncService {
 
     async fn pull_all_preferences(&self, user_id: &str) -> Result<Vec<(String, String)>, String> {
         let rows = sqlx::query(
-            "SELECT pref_key, pref_value FROM user_preferences WHERE user_id = ? ORDER BY pref_key",
+            "SELECT pref_key, pref_value \
+             FROM user_preferences \
+             WHERE user_id = ? \
+             ORDER BY pref_key \
+             LIMIT ?",
         )
         .bind(user_id)
+        .bind(MAX_PREFERENCE_SYNC_ROWS)
         .fetch_all(&self.pool)
         .await
         .map_err(|e| format!("pull_all_prefs: {e}"))?;
@@ -1691,6 +1697,11 @@ mod tests {
 
         let result = svc.pull_all_preferences("user1").await;
         assert!(result.unwrap().is_empty());
+    }
+
+    #[test]
+    fn preference_sync_row_limit_is_bounded() {
+        assert_eq!(MAX_PREFERENCE_SYNC_ROWS, 128);
     }
 
     #[tokio::test]
