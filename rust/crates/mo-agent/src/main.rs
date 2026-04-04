@@ -2583,6 +2583,11 @@ fn display_plan_updates_live(
                     let _ = tx.send(false);
                 }
                 print_line(plan_spinner, &mut state.plan_in_token_stream, msg);
+                // Auto-display delivery report if available
+                if let Some(ref report) = state.last_delivery_report {
+                    eprintln!();
+                    durable_bridge::display_delivery_report(report);
+                }
                 return;
             }
             PlanUpdate::PlanError { error } => {
