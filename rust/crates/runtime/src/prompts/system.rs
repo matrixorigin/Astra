@@ -1,6 +1,8 @@
 /// Agent persona / base identity.
 pub const SYSTEM_PROMPT_BASE: &str = "You are an expert software engineer. You write clean, correct code and use tools precisely to solve tasks.";
 
+use crate::output_style::OutputStyle;
+
 /// Confidence threshold below which the system prompt includes an advisory
 /// telling the LLM to ask for clarification rather than guessing with wrong tools.
 pub const LOW_CONFIDENCE_THRESHOLD: f64 = 0.3;
@@ -37,11 +39,29 @@ pub struct PromptSection {
 /// `profile_desc` – optional project-profile block appended after the tool list
 /// `selection_confidence` – tool selection confidence 0.0-1.0, used to gate advisories
 /// `task_type`    – optional task classification ("code_review", "debugging", etc.)
+/// `output_style` – optional output style customization (concise, explanatory, etc.)
 pub fn build_main_system_prompt(
     tool_names: &[&str],
     profile_desc: &str,
     selection_confidence: f64,
     task_type: Option<&str>,
+) -> String {
+    build_main_system_prompt_with_style(
+        tool_names,
+        profile_desc,
+        selection_confidence,
+        task_type,
+        None,
+    )
+}
+
+/// Full system-prompt body with output style customization.
+pub fn build_main_system_prompt_with_style(
+    tool_names: &[&str],
+    profile_desc: &str,
+    selection_confidence: f64,
+    task_type: Option<&str>,
+    output_style: Option<&OutputStyle>,
 ) -> String {
     if tool_names.is_empty() {
         return format!(
@@ -413,6 +433,15 @@ pub fn build_main_system_prompt(
         _ => {}
     }
 
+    // ── Output style customization: inject before Output Format ──
+    if let Some(style) = output_style
+        && !style.prompt.is_empty()
+    {
+        prompt.push('\n');
+        prompt.push_str(&style.prompt);
+        prompt.push('\n');
+    }
+
     // ── Output format guidance: always present ──
     prompt.push_str(
         "\n\
@@ -500,6 +529,23 @@ pub fn build_system_prompt_sections(
     profile_desc: &str,
     selection_confidence: f64,
     task_type: Option<&str>,
+) -> Vec<PromptSection> {
+    build_system_prompt_sections_with_style(
+        tool_names,
+        profile_desc,
+        selection_confidence,
+        task_type,
+        None,
+    )
+}
+
+/// Build system prompt sections with output style customization.
+pub fn build_system_prompt_sections_with_style(
+    tool_names: &[&str],
+    profile_desc: &str,
+    selection_confidence: f64,
+    task_type: Option<&str>,
+    output_style: Option<&OutputStyle>,
 ) -> Vec<PromptSection> {
     if tool_names.is_empty() {
         return vec![
@@ -866,6 +912,15 @@ pub fn build_system_prompt_sections(
             );
         }
         _ => {}
+    }
+
+    // ── Output style customization: inject before Output Format ──
+    if let Some(style) = output_style
+        && !style.prompt.is_empty()
+    {
+        session_section.push('\n');
+        session_section.push_str(&style.prompt);
+        session_section.push('\n');
     }
 
     // Always-present sections (in session scope since they depend on tool presence)

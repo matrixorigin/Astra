@@ -65,6 +65,7 @@ pub mod bridge;
 pub mod evaluation;
 pub mod introspection;
 pub mod matrix_cloud_runtime;
+pub mod output_style;
 pub mod pipeline;
 pub mod plan_decompose;
 pub mod prompts;
