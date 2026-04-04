@@ -2258,6 +2258,15 @@ fn take_plan_context(
         delegation_engine: state.delegation_engine.clone(),
         durable_task_state: state.durable_task_state.take(),
         workspace_root: std::env::current_dir().unwrap_or_default(),
+        // Cloud + learning integration
+        ingestion_user_id: state.ingestion_user_id.clone(),
+        matrix_runtime: state.matrix_runtime.clone(),
+        entity_graph: state.entity_graph.clone(),
+        pattern_library: state.pattern_library.clone(),
+        calibrator: state.calibrator.clone(),
+        // Execution config
+        plan_execution_config: state.plan_execution_config.clone(),
+        turn: state.turn,
     })
 }
 
@@ -2606,7 +2615,29 @@ fn display_plan_updates_live(
                     format_duration_short(elapsed),
                 )
             }
-            _ => continue, // LlmStreaming, ToolCall — future use
+            PlanUpdate::GlobalVerificationFailed => {
+                "  ⚠ Global verification failed".to_string()
+            }
+            PlanUpdate::JournalEvent(event) => {
+                // Write journal event to the REPL-owned journal writer
+                if let Some(ref journal) = state.journal {
+                    let _ = journal.append(&event);
+                }
+                continue; // No visible output
+            }
+            PlanUpdate::HistoryEntry {
+                user_msg,
+                assistant_msg,
+            } => {
+                // Append to REPL conversation history
+                state.history.push((user_msg, assistant_msg));
+                continue;
+            }
+            PlanUpdate::DeliveryReport(report) => {
+                state.last_delivery_report = Some(report);
+                continue;
+            }
+            _ => continue, // SubtaskRetry, ParallelGroupInfo, StepByStepPrompt — future use
         };
 
         print_msg(printer, msg);

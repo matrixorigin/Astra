@@ -16,7 +16,7 @@ use crossterm::style::Stylize;
 // ─── Plan Update Events (channel protocol) ───────────────────────────────────
 
 /// Events emitted by the plan executor through the mpsc channel.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 #[allow(dead_code)] // Fields read by REPL monitoring loop via pattern match
 pub enum PlanUpdate {
     SubtaskStarted {
@@ -76,6 +76,15 @@ pub enum PlanUpdate {
     PlanError {
         error: String,
     },
+    /// Journal event to be written by the REPL thread (JournalWriter is !Send).
+    JournalEvent(Box<session_journal::JournalEvent>),
+    /// History entry from a completed subtask turn — REPL should append to its history.
+    HistoryEntry {
+        user_msg: String,
+        assistant_msg: String,
+    },
+    /// Delivery report from global verification, sent before PlanCompleted.
+    DeliveryReport(astra_services::durable_task::TaskDeliveryReport),
 }
 
 /// Commands sent from the REPL to a background plan executor.
@@ -424,11 +433,12 @@ impl PlanExecutorHandle {
 // ─── Background Plan Execution ───────────────────────────────────────────────
 
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use astra_runtime::pipeline::persistence::ToolHealthEntry;
 use astra_runtime::plan_decompose;
 use astra_runtime::tool_selector::ToolSelector;
+use astra_services::session_journal;
 use astra_services::task_orchestrator::{TaskPlan, TaskStatus};
 
 use crate::StreamResult;
@@ -459,6 +469,17 @@ pub(super) struct BackgroundPlanContext {
     pub delegation_engine: Option<Arc<astra_runtime::server::delegation_engine::DelegationEngine>>,
     pub durable_task_state: Option<durable_bridge::DurableTaskState>,
     pub workspace_root: PathBuf,
+
+    // ─── Cloud + Learning Integration ────────────────────────────────────
+    pub ingestion_user_id: Option<String>,
+    pub matrix_runtime: Option<Arc<astra_runtime::MatrixCloudRuntime>>,
+    pub entity_graph: Option<Arc<Mutex<astra_runtime::pipeline::entity::EntityGraph>>>,
+    pub pattern_library: Option<Arc<Mutex<astra_runtime::pipeline::pattern::PatternLibrary>>>,
+    pub calibrator: Option<Arc<Mutex<astra_runtime::pipeline::calibration::ProgressiveCalibrator>>>,
+
+    // ─── Execution Config ────────────────────────────────────────────────
+    pub plan_execution_config: Option<plan_decompose::PlanExecutionConfig>,
+    pub turn: u32,
 }
 
 /// Spawn a background plan executor task.
@@ -491,6 +512,7 @@ pub(super) fn spawn_plan_executor(
 /// 4. Sends `PlanUpdate::SubtaskCompleted` or `SubtaskRetry`
 /// 5. Checks command channel for Pause/Cancel between subtasks
 ///
+/// Emits journal events and cloud ingestion events for each subtask transition.
 /// On completion, sends `PlanUpdate::PlanCompleted`. On error, sends
 /// `PlanUpdate::PlanError`.
 async fn plan_executor_task(
@@ -505,7 +527,54 @@ async fn plan_executor_task(
     let mut subtask_durations: Vec<Duration> = Vec::new();
     let sink = ChannelSink::new(update_tx.clone());
 
-    // Create a fresh PermissionManager in auto-approve mode for background execution.
+    // Build learning bridge from Arc-wrapped shared state (Send + Sync).
+    let learning_bridge: Option<std::sync::Arc<dyn astra_services::TaskLearningBridge>> = (|| {
+        let eg = ctx.entity_graph.as_ref()?;
+        let pl = ctx.pattern_library.as_ref()?;
+        let cal = ctx.calibrator.as_ref()?;
+        let mut bridge =
+            astra_runtime::pipeline::task_learning::PipelineTaskLearningBridge::from_shared(
+                eg.clone(),
+                pl.clone(),
+                cal.clone(),
+            );
+        if let Some(mc) = &ctx.matrix_runtime {
+            let pool = mc.shared_pool().get().clone();
+            let user_id = ctx.ingestion_user_id.as_deref().unwrap_or("anonymous");
+            bridge = bridge.with_cloud_pool(pool, user_id);
+        }
+        Some(std::sync::Arc::new(bridge) as std::sync::Arc<dyn astra_services::TaskLearningBridge>)
+    })();
+
+    // Helper: emit a journal event via the channel (REPL thread writes it)
+    // and enqueue cloud ingestion event.
+    let emit_event = |tx: &tokio::sync::mpsc::UnboundedSender<PlanUpdate>,
+                      ctx: &BackgroundPlanContext,
+                      event: session_journal::JournalEvent| {
+        // Cloud ingestion
+        let user_id = ctx.ingestion_user_id.as_deref().unwrap_or("anonymous");
+        if let Some(mc) = ctx.matrix_runtime.as_ref() {
+            mc.enqueue_journal_events(user_id, &event);
+        }
+        // Forward to REPL for journal file write
+        let _ = tx.send(PlanUpdate::JournalEvent(Box::new(event)));
+    };
+
+    // Emit plan_started event
+    if let Some(ref goal) = ctx.plan_goal {
+        let total = ctx.plan.subtasks.len();
+        let event = session_journal::JournalEvent::plan_progress(
+            ctx.session_id.as_deref(),
+            ctx.turn,
+            "",   // no subtask yet
+            goal,
+            "plan_started",
+            0,
+            total,
+            0,
+        );
+        emit_event(&update_tx, &ctx, event);
+    }
     let mut perm_manager = PermissionManager::with_project(true, &ctx.workspace_root);
 
     loop {
@@ -558,11 +627,58 @@ async fn plan_executor_task(
             let pct = ctx.plan.progress_pct();
             if pct == 100 {
                 // Durable task: run global verification
-                let _global_passed = if let Some(ref mut durable) = ctx.durable_task_state {
+                let global_passed = if let Some(ref mut durable) = ctx.durable_task_state {
                     durable_bridge::on_plan_complete(durable).await
                 } else {
                     true
                 };
+
+                if !global_passed {
+                    let _ = update_tx.send(PlanUpdate::GlobalVerificationFailed);
+                }
+
+                // Send delivery report if available
+                if let Some(ref durable) = ctx.durable_task_state
+                    && let Some(ref report) = durable.last_report
+                {
+                    let _ = update_tx.send(PlanUpdate::DeliveryReport(report.clone()));
+                }
+
+                // Emit plan_completed journal + cloud event
+                let total = ctx.plan.subtasks.len();
+                let event = session_journal::JournalEvent::plan_progress(
+                    ctx.session_id.as_deref(),
+                    ctx.turn,
+                    "",
+                    ctx.plan_goal.as_deref().unwrap_or("plan"),
+                    "plan_complete",
+                    100,
+                    total,
+                    total,
+                );
+                emit_event(&update_tx, &ctx, event);
+
+                // Learning: record task outcome signal
+                if let Some(ref bridge) = learning_bridge {
+                    let (task_id, contract_id) = ctx.durable_task_state.as_ref()
+                        .map(|d| (d.contract.task_id.clone(), d.contract.contract_id.clone()))
+                        .unwrap_or_default();
+                    let signal = astra_services::durable_task::TaskOutcomeSignal {
+                        task_id,
+                        contract_id,
+                        goal: ctx.plan_goal.clone().unwrap_or_default(),
+                        success: global_passed,
+                        user_rating: None,
+                        tools_used: ctx.recent_tools.clone(),
+                        subtask_outcomes: vec![],
+                        total_verification_attempts: 0,
+                        total_retries: 0,
+                        total_turns: ctx.turn,
+                        domain_hint: None,
+                        task_type: Some("plan".into()),
+                    };
+                    let _ = bridge.learn_from_task_outcome(&signal).await;
+                }
 
                 let _ = update_tx.send(PlanUpdate::PlanCompleted {
                     pct: 100,
@@ -615,6 +731,55 @@ async fn plan_executor_task(
         let group_size = exec_group.len();
 
         for (group_idx, next_id) in exec_group.iter().enumerate() {
+            // ── Step-by-step mode: ask user before each subtask ──────
+            let step_by_step = ctx
+                .plan_execution_config
+                .as_ref()
+                .is_some_and(|c| c.step_by_step);
+            if step_by_step {
+                let st_title = ctx
+                    .plan
+                    .subtasks
+                    .iter()
+                    .find(|s| s.id == *next_id)
+                    .map(|s| s.title.clone())
+                    .unwrap_or_default();
+                sink.step_prompt(&st_title);
+                // Wait for UserInput or Cancel
+                loop {
+                    match cmd_rx.recv().await {
+                        Some(PlanCommand::UserInput(input)) => {
+                            let lower = input.trim().to_lowercase();
+                            if lower == "skip" || lower == "s" {
+                                sink.step_skipped(&st_title);
+                                if let Some(st) =
+                                    ctx.plan.subtasks.iter_mut().find(|s| s.id == *next_id)
+                                {
+                                    st.status = TaskStatus::Completed;
+                                }
+                                continue; // skip to next subtask in group
+                            } else if lower == "abort" || lower == "q" {
+                                sink.step_aborted();
+                                let _ = update_tx.send(PlanUpdate::PlanError {
+                                    error: "Plan aborted by user in step-by-step mode".into(),
+                                });
+                                return;
+                            }
+                            sink.step_proceeding();
+                            break; // proceed with this subtask
+                        }
+                        Some(PlanCommand::Cancel) | None => {
+                            let _ = update_tx.send(PlanUpdate::PlanError {
+                                error: "Plan cancelled by user".into(),
+                            });
+                            return;
+                        }
+                        Some(PlanCommand::Resume { .. }) => break, // treat as proceed
+                        _ => {}
+                    }
+                }
+            }
+
             // Prepare subtask prompt
             let (prompt, title) = {
                 let st = ctx
@@ -698,7 +863,9 @@ async fn plan_executor_task(
 
             match turn_result {
                 Ok(result) => {
-                    // Send turn result back to REPL for history/journal updates
+                    ctx.turn += 1;
+
+                    // Send turn result back to REPL for token accounting
                     let _ = update_tx.send(PlanUpdate::SubtaskTurnResult {
                         subtask_id: next_id.clone(),
                         full_text: result.full_text.clone(),
@@ -708,11 +875,38 @@ async fn plan_executor_task(
                         session_id: result.session_id.clone(),
                     });
 
+                    // Accumulate conversation history so subsequent subtasks have context
+                    ctx.history
+                        .push((prompt.clone(), result.full_text.clone()));
+                    let _ = update_tx.send(PlanUpdate::HistoryEntry {
+                        user_msg: prompt.clone(),
+                        assistant_msg: result.full_text.clone(),
+                    });
+
+                    // Emit subtask turn journal event + cloud ingestion
+                    {
+                        let total = ctx.plan.subtasks.len();
+                        let done = ctx.plan.items_done() as usize;
+                        let event = session_journal::JournalEvent::plan_progress(
+                            ctx.session_id.as_deref(),
+                            ctx.turn,
+                            next_id,
+                            &title,
+                            "subtask_turn",
+                            ctx.plan.progress_pct(),
+                            total,
+                            done,
+                        );
+                        emit_event(&update_tx, &ctx, event);
+                    }
+
                     // Update recent_tools from result
                     let used: Vec<String> = result.tools_used.to_vec();
                     if !used.is_empty() {
                         ctx.recent_tools = used;
                     }
+                    // Clear tool health between subtasks to prevent error cascade
+                    ctx.tool_health_entries.clear();
 
                     // Update session ID if the LLM allocated one
                     if result.session_id.is_some() && ctx.session_id.is_none() {
@@ -727,7 +921,7 @@ async fn plan_executor_task(
                         true
                     };
 
-                    // Update subtask status
+                    // Update subtask status + emit events
                     if let Some(st) = ctx.plan.subtasks.iter_mut().find(|s| s.id == *next_id) {
                         if verification_passed {
                             st.status = TaskStatus::Completed;
@@ -739,6 +933,20 @@ async fn plan_executor_task(
                                 ctx.plan.progress_pct(),
                                 Some(elapsed),
                             );
+                            // Journal + cloud event
+                            let total = ctx.plan.subtasks.len();
+                            let done = ctx.plan.items_done() as usize;
+                            let event = session_journal::JournalEvent::plan_progress(
+                                ctx.session_id.as_deref(),
+                                ctx.turn,
+                                next_id,
+                                &title,
+                                "completed",
+                                ctx.plan.progress_pct(),
+                                total,
+                                done,
+                            );
+                            emit_event(&update_tx, &ctx, event);
                         } else if let Some(ref durable) = ctx.durable_task_state {
                             if durable_bridge::subtask_retries_exhausted(durable, next_id) {
                                 sink.subtask_verification_failed(next_id, &title, true);
@@ -747,6 +955,15 @@ async fn plan_executor_task(
                                 sink.subtask_verification_failed(next_id, &title, false);
                                 st.status = TaskStatus::Pending;
                             }
+                            let event = session_journal::JournalEvent::verification_completed(
+                                ctx.session_id.as_deref(),
+                                ctx.turn,
+                                next_id,
+                                "subtask",
+                                false,
+                                &serde_json::json!({"retries_exhausted": durable_bridge::subtask_retries_exhausted(durable, next_id)}),
+                            );
+                            emit_event(&update_tx, &ctx, event);
                         } else {
                             sink.subtask_verification_failed(next_id, &title, false);
                             st.status = TaskStatus::Pending;
@@ -758,6 +975,15 @@ async fn plan_executor_task(
                     if let Some(st) = ctx.plan.subtasks.iter_mut().find(|s| s.id == *next_id) {
                         st.status = TaskStatus::Pending;
                     }
+                    let event = session_journal::JournalEvent::turn_error(
+                        ctx.session_id.as_deref(),
+                        ctx.turn,
+                        ctx.model.as_deref(),
+                        &format!("plan_subtask:{}", next_id),
+                        &err,
+                        0,
+                    );
+                    emit_event(&update_tx, &ctx, event);
                     let _ = update_tx.send(PlanUpdate::PlanError {
                         error: format!("Subtask '{}' failed: {}", next_id, err),
                     });
