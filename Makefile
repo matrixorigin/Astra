@@ -67,7 +67,7 @@ help:
 CARGO_MANIFEST := rust/Cargo.toml
 CARGO := cargo
 CARGO_MANIFEST_FLAG := --manifest-path $(CARGO_MANIFEST)
-API_SHELL_PKG := -p mo-agent-runtime
+API_SHELL_PKG := -p astra-runtime
 RUST_TARGET_DIR := rust/target
 RUST_DEBUG_BIN_DIR := $(RUST_TARGET_DIR)/debug
 RUST_RELEASE_BIN_DIR := $(RUST_TARGET_DIR)/release
@@ -119,7 +119,7 @@ check-runtime:
 	fi
 	@echo ""
 	@echo "2. Rust API binary:"
-	@cargo build -q --manifest-path rust/Cargo.toml -p mo-agent-runtime --bin mo-agent-server && echo "   ✅ Rust binary build OK"
+	@cargo build -q --manifest-path rust/Cargo.toml -p astra-runtime --bin astra-server && echo "   ✅ Rust binary build OK"
 
 # ============================================================================
 # Dependencies (MatrixOne + Redis)

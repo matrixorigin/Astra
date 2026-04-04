@@ -4,7 +4,7 @@ WORKDIR /app
 
 RUN apt-get update && apt-get install -y --no-install-recommends pkg-config libssl-dev ca-certificates curl && rm -rf /var/lib/apt/lists/*
 COPY . .
-RUN cd rust && cargo build --release -p mo-agent-runtime --bin astra-server && cargo build --release -p astra-cli --bin astra && cargo build --release -p astra-admin-cli --bin astra-admin
+RUN cd rust && cargo build --release -p astra-runtime --bin astra-server && cargo build --release -p astra-cli --bin astra && cargo build --release -p astra-admin-cli --bin astra-admin
 
 FROM debian:bookworm-slim
 

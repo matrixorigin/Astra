@@ -40,7 +40,7 @@ if [ -f .env ]; then
 fi
 
 echo "Building debug API binary..."
-cargo build -q --manifest-path rust/Cargo.toml -p mo-agent-runtime --bin astra-server
+cargo build -q --manifest-path rust/Cargo.toml -p astra-runtime --bin astra-server
 echo "✅ Using $BIN_PATH"
 
 # Best-effort bridge autodiscovery for local dev.
