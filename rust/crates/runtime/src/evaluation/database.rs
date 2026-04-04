@@ -31,52 +31,31 @@ impl EvaluationService for DatabaseEvaluationService {
             .await
             .map_err(internal_error)?;
 
-        let (sql, bind_model) = if let Some(m) = model {
-            (
-                "SELECT DATE_FORMAT(DATE(created_at), '%Y-%m-%d') AS dt, \
-                 AVG(quality_score) AS avg_score, COUNT(*) AS cnt, \
-                 IFNULL(llm_model_used, '') AS model \
-                 FROM agent_events \
-                 WHERE quality_score IS NOT NULL \
-                   AND created_at >= DATE_SUB(NOW(), INTERVAL ? DAY) \
-                   AND llm_model_used = ? \
-                 GROUP BY dt, model ORDER BY dt",
-                Some(m.to_string()),
-            )
+        let rows = if model.is_some() {
+            Vec::new()
         } else {
-            (
+            query(
                 "SELECT DATE_FORMAT(DATE(created_at), '%Y-%m-%d') AS dt, \
-                 AVG(quality_score) AS avg_score, COUNT(*) AS cnt, \
-                 IFNULL(llm_model_used, '') AS model \
-                 FROM agent_events \
-                 WHERE quality_score IS NOT NULL \
-                   AND created_at >= DATE_SUB(NOW(), INTERVAL ? DAY) \
-                 GROUP BY dt, model ORDER BY dt",
-                None,
+                 AVG(score) AS avg_score, COUNT(*) AS cnt \
+                 FROM eval_quality_assessments \
+                 WHERE created_at >= DATE_SUB(NOW(), INTERVAL ? DAY) \
+                 GROUP BY dt ORDER BY dt",
             )
+            .bind(days)
+            .fetch_all(&pool)
+            .await
+            .unwrap_or_default()
         };
-
-        let rows = if let Some(ref m) = bind_model {
-            query(sql).bind(days).bind(m).fetch_all(&pool).await
-        } else {
-            query(sql).bind(days).fetch_all(&pool).await
-        };
-        let rows = rows.unwrap_or_default();
 
 
         let points: Vec<QualityTrendPoint> = rows
             .iter()
             .map(|r| {
-                let model_val: String = r.try_get("model").unwrap_or_default();
                 QualityTrendPoint {
                     date: r.try_get("dt").unwrap_or_default(),
                     avg_score: r.try_get("avg_score").unwrap_or(0.0),
                     count: r.try_get("cnt").unwrap_or(0),
-                    model: if model_val.is_empty() {
-                        None
-                    } else {
-                        Some(model_val)
-                    },
+                    model: None,
                 }
             })
             .collect();
@@ -322,10 +301,10 @@ impl EvaluationService for DatabaseEvaluationService {
 
         // Decision metrics
         let decision_row = query(
-            "SELECT AVG(quality_score) AS avg_q, COUNT(*) AS cnt \
+            "SELECT COUNT(*) AS cnt \
              FROM agent_events \
              WHERE agent_id = ? AND event_type = 'llm_response' \
-               AND created_at > DATE_SUB(NOW(), INTERVAL ? DAY)",
+                AND created_at > DATE_SUB(NOW(), INTERVAL ? DAY)",
         )
         .bind(agent_id)
         .bind(days)
@@ -334,7 +313,7 @@ impl EvaluationService for DatabaseEvaluationService {
 
         let decision = match decision_row {
             Ok(r) => DecisionMetrics {
-                avg_quality: r.try_get::<f64, _>("avg_q").unwrap_or(0.0),
+                avg_quality: 0.0,
                 total_decisions: r.try_get::<i64, _>("cnt").unwrap_or(0),
             },
             Err(_) => DecisionMetrics {

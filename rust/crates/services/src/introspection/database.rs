@@ -18,6 +18,9 @@ use super::{
     SemanticStats, ServiceResult, SkillInfo, SkillsIntrospectionResponse,
 };
 
+const MAX_INTROSPECTION_SNAPSHOTS: i32 = 128;
+const MAX_INTROSPECTION_USAGE_ROWS: i32 = 128;
+
 #[derive(Clone, Debug)]
 pub struct DatabaseIntrospectionService {
     matrixone: MatrixOneSettings,
@@ -125,9 +128,10 @@ impl IntrospectionService for DatabaseIntrospectionService {
         let semantic = {
             let snap_rows = query(
                 "SELECT token_budget, total_tokens, assembly_time_ms, created_at \
-                 FROM ctx_snapshots WHERE session_id = ? ORDER BY created_at DESC",
+                 FROM ctx_snapshots WHERE session_id = ? ORDER BY created_at DESC LIMIT ?",
             )
             .bind(session_id)
+            .bind(MAX_INTROSPECTION_SNAPSHOTS)
             .fetch_all(&pool)
             .await
             .map_err(internal_error)?;
@@ -156,12 +160,13 @@ impl IntrospectionService for DatabaseIntrospectionService {
 
                 let usage_rows = query(
                     "SELECT IFNULL(CAST(token_usage AS CHAR), '{}') AS token_usage \
-                     FROM agent_events \
-                     WHERE session_id = ? AND event_type = 'llm_response' \
-                       AND token_usage IS NOT NULL \
-                     ORDER BY created_at DESC",
+                      FROM agent_events \
+                      WHERE session_id = ? AND event_type = 'llm_response' \
+                        AND token_usage IS NOT NULL \
+                      ORDER BY created_at DESC LIMIT ?",
                 )
                 .bind(session_id)
+                .bind(MAX_INTROSPECTION_USAGE_ROWS)
                 .fetch_all(&pool)
                 .await
                 .map_err(internal_error)?;
@@ -432,16 +437,16 @@ impl IntrospectionService for DatabaseIntrospectionService {
             ));
         }
 
-        let (offset, actual_turn) = if let Some(ti) = turn_index {
+        let actual_turn = if let Some(ti) = turn_index {
             if ti as i64 > total_turns {
                 return Err(error_response(
                     StatusCode::NOT_FOUND,
                     format!("Turn {} not found (session has {} turns)", ti, total_turns),
                 ));
             }
-            ((ti - 1) as i64, ti as i64)
+            ti as i64
         } else {
-            (total_turns - 1, total_turns)
+            total_turns
         };
 
         let content_cols = if detail || raw {
@@ -456,13 +461,17 @@ impl IntrospectionService for DatabaseIntrospectionService {
                     total_tokens, assembly_time_ms, \
                     IFNULL(CAST(relevance_scores AS CHAR), '{{}}') AS relevance_scores, \
                     task_type, llm_response_id{content_cols} \
-             FROM ctx_snapshots WHERE session_id = ? \
-             ORDER BY created_at ASC LIMIT 1 OFFSET ?"
+             FROM ( \
+                 SELECT context_capture_id, token_budget, total_tokens, assembly_time_ms, \
+                        relevance_scores, task_type, llm_response_id{content_cols}, \
+                        ROW_NUMBER() OVER (ORDER BY created_at ASC) AS turn_no \
+                 FROM ctx_snapshots WHERE session_id = ? \
+             ) ranked WHERE turn_no = ?"
         );
 
         let row = query(&sql)
             .bind(session_id)
-            .bind(offset)
+            .bind(actual_turn)
             .fetch_one(&pool)
             .await
             .map_err(internal_error)?;
@@ -488,14 +497,15 @@ impl IntrospectionService for DatabaseIntrospectionService {
 
         // Layer 1: health, zone_balance, token_breakdown
         if let Ok(budget) = serde_json::from_str::<Value>(&budget_raw) {
+            let trend_limit = std::cmp::min(actual_turn as i32, MAX_INTROSPECTION_USAGE_ROWS);
             let trend_rows = query(
                 "SELECT event_id, IFNULL(CAST(token_usage AS CHAR), '{}') AS token_usage \
                  FROM agent_events \
                  WHERE session_id = ? AND event_type = 'llm_response' AND token_usage IS NOT NULL \
-                 ORDER BY created_at ASC LIMIT ?",
+                  ORDER BY created_at ASC LIMIT ?",
             )
             .bind(session_id)
-            .bind(actual_turn as i32)
+            .bind(trend_limit)
             .fetch_all(&pool)
             .await
             .map_err(internal_error)?;

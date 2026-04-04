@@ -130,6 +130,16 @@ Query params: `session_id`, `limit`, `offset`.
 
 Returns event summaries for list views. The `content` field may be truncated for efficiency; use `GET /events/{event_id}` for full event content and metadata.
 
+### GET /tasks
+
+Query params: `status`.
+
+Returns lightweight task summaries only (`task_id`, `title`, `status`, progress counters, timestamps, `project_type`). Use `GET /tasks/{task_id}` for full task detail including description, plan, checkpoint, and error fields.
+
+### GET /tasks/{task_id}
+
+Returns the full task record, including long-text and JSON fields.
+
 ### GET /events/{event_id}
 
 ### GET /events/session/{session_id}

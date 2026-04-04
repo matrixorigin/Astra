@@ -185,6 +185,22 @@ pub struct TaskRecord {
     pub agent_id: Option<String>,
 }
 
+/// Lightweight task summary for list views.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskListItem {
+    pub task_id: String,
+    pub title: String,
+    pub status: TaskStatus,
+    pub progress_pct: u32,
+    pub items_done: u32,
+    pub items_total: u32,
+    pub created_at: String,
+    pub updated_at: String,
+    pub completed_at: Option<String>,
+    #[serde(default)]
+    pub project_type: Option<String>,
+}
+
 /// Task outcome for learning.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -291,7 +307,7 @@ pub trait TaskService: Send + Sync {
         &self,
         user_id: &str,
         status_filter: Option<TaskStatus>,
-    ) -> Result<Vec<TaskRecord>, String>;
+    ) -> Result<Vec<TaskListItem>, String>;
 
     /// Update task status.
     async fn update_status(&self, task_id: &str, status: TaskStatus) -> Result<(), String>;
@@ -448,6 +464,24 @@ impl MatrixOneTaskService {
             agent_id: row.try_get("agent_id").ok().flatten(),
         })
     }
+
+    pub fn parse_mysql_list_row(row: &sqlx::mysql::MySqlRow) -> Result<TaskListItem, String> {
+        use sqlx::Row;
+
+        let status_str: String = row.try_get("status").map_err(|e| e.to_string())?;
+        Ok(TaskListItem {
+            task_id: row.try_get("task_id").map_err(|e| e.to_string())?,
+            title: row.try_get("title").map_err(|e| e.to_string())?,
+            status: TaskStatus::parse_status(&status_str),
+            progress_pct: row.try_get::<i32, _>("progress_pct").unwrap_or(0) as u32,
+            items_done: row.try_get::<i32, _>("items_done").unwrap_or(0) as u32,
+            items_total: row.try_get::<i32, _>("items_total").unwrap_or(0) as u32,
+            created_at: row.try_get::<String, _>("created_at").unwrap_or_default(),
+            updated_at: row.try_get::<String, _>("updated_at").unwrap_or_default(),
+            completed_at: row.try_get("completed_at").ok().flatten(),
+            project_type: row.try_get("project_type").ok().flatten(),
+        })
+    }
 }
 
 #[async_trait]
@@ -511,7 +545,7 @@ impl TaskService for MatrixOneTaskService {
         &self,
         user_id: &str,
         status_filter: Option<TaskStatus>,
-    ) -> Result<Vec<TaskRecord>, String> {
+    ) -> Result<Vec<TaskListItem>, String> {
         let rows = if let Some(status) = status_filter {
             sqlx::query(&format!(
                 "SELECT {AGENT_TASK_LIST_SELECT_COLUMNS} \
@@ -534,7 +568,7 @@ impl TaskService for MatrixOneTaskService {
         }
         .map_err(|e| format!("list_tasks: {e}"))?;
 
-        rows.iter().map(Self::parse_mysql_row).collect()
+        rows.iter().map(Self::parse_mysql_list_row).collect()
     }
 
     async fn update_status(&self, task_id: &str, status: TaskStatus) -> Result<(), String> {
@@ -1031,7 +1065,7 @@ impl TaskService for LocalTaskService {
         &self,
         user_id: &str,
         status_filter: Option<TaskStatus>,
-    ) -> Result<Vec<TaskRecord>, String> {
+    ) -> Result<Vec<TaskListItem>, String> {
         let entries = match std::fs::read_dir(&self.tasks_dir) {
             Ok(e) => e,
             Err(_) => return Ok(Vec::new()),
@@ -1047,7 +1081,18 @@ impl TaskService for LocalTaskService {
                     .as_ref()
                     .is_none_or(|filter| record.status == *filter)
             {
-                tasks.push(record);
+                tasks.push(TaskListItem {
+                    task_id: record.task_id,
+                    title: record.title,
+                    status: record.status,
+                    progress_pct: record.progress_pct,
+                    items_done: record.items_done,
+                    items_total: record.items_total,
+                    created_at: record.created_at,
+                    updated_at: record.updated_at,
+                    completed_at: record.completed_at,
+                    project_type: record.project_type,
+                });
             }
         }
         tasks.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
@@ -1405,7 +1450,11 @@ impl TaskService for UnconfiguredTaskService {
     async fn get_task(&self, _: &str) -> Result<Option<TaskRecord>, String> {
         Err("task service not configured".into())
     }
-    async fn list_tasks(&self, _: &str, _: Option<TaskStatus>) -> Result<Vec<TaskRecord>, String> {
+    async fn list_tasks(
+        &self,
+        _: &str,
+        _: Option<TaskStatus>,
+    ) -> Result<Vec<TaskListItem>, String> {
         Err("task service not configured".into())
     }
     async fn update_status(&self, _: &str, _: TaskStatus) -> Result<(), String> {
@@ -1671,6 +1720,28 @@ mod tests {
         assert_eq!(loaded.user_rating, Some(4));
         assert_eq!(loaded.outcome, Some(TaskOutcome::Success));
         assert_eq!(loaded.agent_id.as_deref(), Some("edge-a"));
+    }
+
+    #[test]
+    fn task_list_item_json_roundtrip() {
+        let item = TaskListItem {
+            task_id: "t-1".into(),
+            title: "Refactor auth".into(),
+            status: TaskStatus::InProgress,
+            progress_pct: 50,
+            items_done: 2,
+            items_total: 4,
+            created_at: "2025-01-01T00:00:00Z".into(),
+            updated_at: "2025-01-01T01:00:00Z".into(),
+            completed_at: None,
+            project_type: Some("Rust".into()),
+        };
+        let json = serde_json::to_string(&item).unwrap();
+        let loaded: TaskListItem = serde_json::from_str(&json).unwrap();
+        assert_eq!(loaded.task_id, "t-1");
+        assert_eq!(loaded.title, "Refactor auth");
+        assert_eq!(loaded.status, TaskStatus::InProgress);
+        assert_eq!(loaded.items_total, 4);
     }
 
     #[test]

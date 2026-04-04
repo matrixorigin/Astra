@@ -19,7 +19,7 @@ pub(super) struct TaskProgressQuery {
 
 #[derive(Serialize)]
 pub(super) struct TaskListResponse {
-    pub tasks: Vec<astra_services::TaskRecord>,
+    pub tasks: Vec<astra_services::TaskListItem>,
     pub total: usize,
 }
 

@@ -8,6 +8,10 @@ use astra_core::{
     ErrorResponse, MatrixOneSettings, SharedPool, connect_matrixone, error_response, internal_error,
 };
 
+const MAX_CHECKPOINT_LIST_ROWS: i32 = 200;
+const MAX_CHECKPOINT_EVENT_ROWS: i32 = 200;
+const MAX_CAUSAL_CHAIN_ROWS: i32 = 500;
+
 // ── Data types ───────────────────────────────────────────────────────────────
 
 #[derive(Clone, Debug, PartialEq)]
@@ -200,10 +204,11 @@ impl DataVersioningService for DatabaseDataVersioningService {
         let rows = query(
             "SELECT checkpoint_name, description, \
              DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s') AS created_at \
-             FROM data_versioning_checkpoints \
-             WHERE user_id = ? ORDER BY created_at DESC",
+              FROM data_versioning_checkpoints \
+              WHERE user_id = ? ORDER BY created_at DESC LIMIT ?",
         )
         .bind(&user_id)
+        .bind(MAX_CHECKPOINT_LIST_ROWS)
         .fetch_all(&pool)
         .await
         .map_err(internal_error)?;
@@ -251,11 +256,13 @@ impl DataVersioningService for DatabaseDataVersioningService {
             "SELECT event_id, session_id, event_type, \
              IFNULL(CAST(content AS CHAR), '') AS content, \
              DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s') AS created_at \
-             FROM agent_events \
-             WHERE created_at <= ? \
-             ORDER BY created_at DESC LIMIT 200",
+              FROM agent_events \
+              WHERE user_id = ? AND created_at <= ? \
+              ORDER BY created_at DESC LIMIT ?",
         )
+        .bind(&user_id)
         .bind(&cp_ts)
+        .bind(MAX_CHECKPOINT_EVENT_ROWS)
         .fetch_all(&pool)
         .await
         .map_err(internal_error)?;
@@ -276,16 +283,18 @@ impl DataVersioningService for DatabaseDataVersioningService {
 
     async fn get_causal_chain(
         &self,
-        _user_id: String,
+        user_id: String,
         event_id: String,
     ) -> Result<Vec<LineageNode>, (StatusCode, Json<ErrorResponse>)> {
         let pool = self.get_pool().await.map_err(internal_error)?;
 
-        let seed = query("SELECT causal_chain_id FROM agent_events WHERE event_id = ?")
-            .bind(&event_id)
-            .fetch_optional(&pool)
-            .await
-            .map_err(internal_error)?;
+        let seed =
+            query("SELECT causal_chain_id FROM agent_events WHERE event_id = ? AND user_id = ?")
+                .bind(&event_id)
+                .bind(&user_id)
+                .fetch_optional(&pool)
+                .await
+                .map_err(internal_error)?;
 
         let seed = seed.ok_or_else(|| {
             error_response(
@@ -303,11 +312,13 @@ impl DataVersioningService for DatabaseDataVersioningService {
              IFNULL(CAST(content AS CHAR), '') AS content, \
              parent_event_id, causal_chain_id, \
              DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s') AS created_at \
-             FROM agent_events \
-             WHERE causal_chain_id = ? \
-             ORDER BY created_at ASC",
+              FROM agent_events \
+              WHERE user_id = ? AND causal_chain_id = ? \
+              ORDER BY created_at ASC LIMIT ?",
         )
+        .bind(&user_id)
         .bind(&chain_id)
+        .bind(MAX_CAUSAL_CHAIN_ROWS)
         .fetch_all(&pool)
         .await
         .map_err(internal_error)?;
@@ -329,7 +340,7 @@ impl DataVersioningService for DatabaseDataVersioningService {
 
     async fn trace_upstream(
         &self,
-        _user_id: String,
+        user_id: String,
         event_id: String,
     ) -> Result<Vec<LineageNode>, (StatusCode, Json<ErrorResponse>)> {
         let pool = self.get_pool().await.map_err(internal_error)?;
@@ -350,9 +361,10 @@ impl DataVersioningService for DatabaseDataVersioningService {
                  IFNULL(CAST(content AS CHAR), '') AS content, \
                  parent_event_id, causal_chain_id, \
                  DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s') AS created_at \
-                 FROM agent_events WHERE event_id = ?",
+                 FROM agent_events WHERE event_id = ? AND user_id = ?",
             )
             .bind(&eid)
+            .bind(&user_id)
             .fetch_optional(&pool)
             .await
             .map_err(internal_error)?;

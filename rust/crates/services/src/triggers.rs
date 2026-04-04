@@ -8,6 +8,8 @@ use astra_core::{
     ErrorResponse, MatrixOneSettings, SharedPool, connect_matrixone, error_response, internal_error,
 };
 
+const MAX_TRIGGER_LIST_ROWS: i32 = 200;
+
 // ── Data types ───────────────────────────────────────────────────────────────
 
 #[derive(Clone, Debug, PartialEq)]
@@ -179,10 +181,11 @@ impl TriggerService for DatabaseTriggerService {
             "SELECT trigger_id, user_id, agent_id, trigger_type, name, user_input, \
              IFNULL(CAST(context AS CHAR), 'null') AS context_json, \
              cron_expr, session_id, is_active, \
-             DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s') AS created_at \
-             FROM wf_triggers WHERE user_id = ? AND is_active = 1 ORDER BY created_at DESC",
+              DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s') AS created_at \
+              FROM wf_triggers WHERE user_id = ? AND is_active = 1 ORDER BY created_at DESC LIMIT ?",
         )
         .bind(&user_id)
+        .bind(MAX_TRIGGER_LIST_ROWS)
         .fetch_all(&pool)
         .await
         .map_err(internal_error)?;
