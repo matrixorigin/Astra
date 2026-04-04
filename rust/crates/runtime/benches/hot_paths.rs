@@ -1,6 +1,6 @@
 //! Criterion benchmarks for performance-critical paths.
 //!
-//! Run: `cargo bench -p mo-agent-runtime --bench hot_paths`
+//! Run: `cargo bench -p astra-runtime --bench hot_paths`
 
 use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
 use serde_json::json;

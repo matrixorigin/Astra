@@ -1,7 +1,7 @@
 //! MySQL / MatrixOne integration tests for [`astra_services::multi_agent`].
 //!
 //! ```text
-//! MO_AGENT_MULTI_AGENT_IT=1 cargo test -p mo-agent-services multi_agent_integration -- --ignored
+//! MO_AGENT_MULTI_AGENT_IT=1 cargo test -p astra-services multi_agent_integration -- --ignored
 //! ```
 //!
 //! Uses `MATRIXONE_*` env vars (after `dotenvy`) with the same defaults as local dev (`127.0.0.1:6001`, …).

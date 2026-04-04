@@ -1,7 +1,7 @@
 //! Domain adapters bridging runtime pipeline learning modules with the unified sync engine.
 //!
-//! Lives in `mo-agent-runtime` because `DomainAdapter` / `CloudTransport` are defined in
-//! `mo-agent-services` while `EntityGraph`, `PatternLibrary`, and persistence live here.
+//! Lives in `astra-runtime` because `DomainAdapter` / `CloudTransport` are defined in
+//! `astra-services` while `EntityGraph`, `PatternLibrary`, and persistence live here.
 //! Adding this module to `services` would require `services` → `runtime`, which cycles with
 //! `runtime` → `services`.
 

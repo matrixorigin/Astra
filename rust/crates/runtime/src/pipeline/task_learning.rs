@@ -1,6 +1,6 @@
 //! Task Learning Bridge — connects durable task outcomes to pipeline learning modules.
 //!
-//! Implements the `TaskLearningBridge` trait (defined in `mo-agent-services`) using the
+//! Implements the `TaskLearningBridge` trait (defined in `astra-services`) using the
 //! concrete pipeline types: EntityGraph, PatternLibrary, ProgressiveCalibrator.
 //!
 //! This bridges the architectural gap: the trait lives in `services` (no pipeline dependency),

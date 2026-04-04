@@ -268,10 +268,10 @@ mod tests {
 
     #[test]
     fn make_args_preview_bash_uses_command() {
-        let v = json!({"command": "cargo test -p mo-agent-runtime"});
+        let v = json!({"command": "cargo test -p astra-runtime"});
         assert_eq!(
             make_args_preview("bash", &v).as_deref(),
-            Some("cargo test -p mo-agent-runtime")
+            Some("cargo test -p astra-runtime")
         );
     }
 
