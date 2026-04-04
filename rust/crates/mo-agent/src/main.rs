@@ -2588,21 +2588,30 @@ fn display_plan_updates_live(
                 )
             }
             PlanUpdate::PlanCompleted { pct, elapsed } => {
+                // Take handle out of state to drain without double-borrow
+                if let Some(mut h) = state.plan_handle.take() {
+                    while let Some(trailing) = h.try_recv() {
+                        apply_trailing_update(trailing, state);
+                    }
+                }
                 let msg = format!(
                     "\n🏁  Plan complete — {pct}% verified in {}",
                     format_duration_short(elapsed),
                 );
                 state.executing_plan = None;
                 state.current_plan_subtask_id = None;
-                state.plan_handle = None;
                 print_msg(printer, msg);
                 return;
             }
             PlanUpdate::PlanError { error } => {
+                if let Some(mut h) = state.plan_handle.take() {
+                    while let Some(trailing) = h.try_recv() {
+                        apply_trailing_update(trailing, state);
+                    }
+                }
                 let msg = format!("\n❌  Plan error: {error}");
                 state.executing_plan = None;
                 state.current_plan_subtask_id = None;
-                state.plan_handle = None;
                 print_msg(printer, msg);
                 return;
             }
@@ -2638,10 +2647,55 @@ fn display_plan_updates_live(
                 state.last_delivery_report = Some(report);
                 continue;
             }
-            _ => continue, // SubtaskRetry, ParallelGroupInfo, StepByStepPrompt — future use
+            PlanUpdate::SubtaskRetry {
+                id,
+                retries_exhausted,
+                ..
+            } => {
+                if retries_exhausted {
+                    format!("  ⚠ {id} — verification failed (retries exhausted)")
+                } else {
+                    format!("  ↻ {id} — verification failed, retrying…")
+                }
+            }
+            _ => continue, // ParallelGroupInfo, StepByStepPrompt — future use
         };
 
         print_msg(printer, msg);
+    }
+}
+
+/// Apply a single trailing update from the plan executor channel.
+/// Called when draining remaining messages after PlanCompleted/PlanError.
+fn apply_trailing_update(update: plan_executor::PlanUpdate, state: &mut ReplState) {
+    use plan_executor::PlanUpdate;
+    match update {
+        PlanUpdate::HistoryEntry {
+            user_msg,
+            assistant_msg,
+        } => {
+            state.history.push((user_msg, assistant_msg));
+        }
+        PlanUpdate::JournalEvent(event) => {
+            if let Some(ref journal) = state.journal {
+                let _ = journal.append(&event);
+            }
+        }
+        PlanUpdate::DeliveryReport(report) => {
+            state.last_delivery_report = Some(report);
+        }
+        PlanUpdate::SubtaskTurnResult {
+            subtask_id,
+            prompt_tokens,
+            completion_tokens,
+            ..
+        } => {
+            state.total_prompt_tokens += prompt_tokens;
+            state.total_completion_tokens += completion_tokens;
+            state.turn += 1;
+            state.current_plan_subtask_id = Some(subtask_id);
+        }
+        _ => {}
     }
 }
 

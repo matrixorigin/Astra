@@ -699,8 +699,26 @@ async fn plan_executor_task(
                     plan_start.elapsed(),
                     &blocked.join(", "),
                 );
+                // Wait for Resume (user may fix blocked deps) or Cancel
+                loop {
+                    match cmd_rx.recv().await {
+                        Some(PlanCommand::Resume { corrections }) => {
+                            if let Some(c) = corrections {
+                                ctx.plan_corrections = c;
+                            }
+                            break; // re-enter outer loop to re-check ready subtasks
+                        }
+                        Some(PlanCommand::Cancel) | None => {
+                            let _ = update_tx.send(PlanUpdate::PlanError {
+                                error: "Plan cancelled while blocked".into(),
+                            });
+                            return;
+                        }
+                        _ => {}
+                    }
+                }
             }
-            return;
+            continue; // re-check ready subtasks after resume
         }
 
         // ── Show parallel group info ─────────────────────────────────
@@ -747,6 +765,7 @@ async fn plan_executor_task(
                     .unwrap_or_default();
                 sink.step_prompt(&st_title);
                 // Wait for UserInput or Cancel
+                let mut skip_subtask = false;
                 loop {
                     match cmd_rx.recv().await {
                         Some(PlanCommand::UserInput(input)) => {
@@ -758,7 +777,8 @@ async fn plan_executor_task(
                                 {
                                     st.status = TaskStatus::Completed;
                                 }
-                                continue; // skip to next subtask in group
+                                skip_subtask = true;
+                                break; // exit inner loop, will break outer for-loop too
                             } else if lower == "abort" || lower == "q" {
                                 sink.step_aborted();
                                 let _ = update_tx.send(PlanUpdate::PlanError {
@@ -779,16 +799,24 @@ async fn plan_executor_task(
                         _ => {}
                     }
                 }
+                if skip_subtask {
+                    break; // break out of for-loop, re-analyze dependencies
+                }
             }
 
             // Prepare subtask prompt
             let (prompt, title) = {
-                let st = ctx
+                let Some(st) = ctx
                     .plan
                     .subtasks
                     .iter_mut()
                     .find(|s| s.id == *next_id)
-                    .unwrap();
+                else {
+                    let _ = update_tx.send(PlanUpdate::PlanError {
+                        error: format!("Subtask '{}' disappeared from plan", next_id),
+                    });
+                    return;
+                };
                 st.status = TaskStatus::InProgress;
                 let prompt = plan_decompose::format_subtask_prompt_with_operator_notes(
                     st,
