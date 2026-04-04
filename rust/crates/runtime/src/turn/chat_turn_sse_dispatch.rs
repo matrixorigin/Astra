@@ -1,4 +1,4 @@
-//! JSON `type` dispatch for mo-agent `/chat/turn` SSE event blocks (blank-line framed).
+//! JSON `type` dispatch for astra `/chat/turn` SSE event blocks (blank-line framed).
 //!
 //! Shared between the CLI stream consumer and any future headless client: updates a structured
 //! accumulator and returns terminal UI hints. [`ChatTurnSseFramer`] turns arbitrary byte chunks

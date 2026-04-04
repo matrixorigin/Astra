@@ -1,6 +1,6 @@
 //! Structured audit row for a non-healthy TurnGuard verdict during the CLI agentic `/chat/turn` loop.
 
-/// Same shape historically stored on `StreamResult` in the mo-agent binary (`VerdictEvent` type alias).
+/// Same shape historically stored on `StreamResult` in the astra binary (`VerdictEvent` type alias).
 #[derive(Debug, Clone)]
 pub struct AgenticVerdictAuditEvent {
     pub turn: u32,

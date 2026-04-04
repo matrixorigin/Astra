@@ -1,6 +1,6 @@
 //! Edge-side prompt context shared by CLI `chat_stream` and any code building `edge_profile.workspace` / file context.
 //!
-//! Part of Phase 0: move cognition-adjacent **pure** helpers out of `mo-agent` toward `runtime` so
+//! Part of Phase 0: move cognition-adjacent **pure** helpers out of `astra` toward `runtime` so
 //! in-process bridge and thin clients can converge on one implementation.
 //!
 //! [`make_args_preview`] reuses [`super::tool_argument_hints`] (`path` / `command` only) so journal

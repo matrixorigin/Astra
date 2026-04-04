@@ -33,7 +33,7 @@ pub enum ErrorCategory {
 
 /// True when the error comes from the Edge workspace guard: existing paths must be
 /// read (fully, when required) before overwrite / patch. Keep in sync with
-/// `mo-agent` `ToolExecutor` / `check_staleness` / `was_fully_read` messages.
+/// `astra` `ToolExecutor` / `check_staleness` / `was_fully_read` messages.
 fn is_workspace_read_before_write_error(lower: &str) -> bool {
     lower.contains("not been read yet")
         || lower.contains("read it first before")

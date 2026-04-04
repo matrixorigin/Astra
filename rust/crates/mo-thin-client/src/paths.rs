@@ -132,7 +132,7 @@ pub fn context_capture(context_capture_id: &str) -> String {
 /// Non-streaming chat routing helper (server `chat_route_handler`).
 pub const CHAT_ROUTE: &str = "/chat/route";
 
-// ── Admin API (`mo-admin-cli` → same server) ───────────────────────────────
+// ── Admin API (`astra-admin-cli` → same server) ───────────────────────────────
 
 pub const ADMIN_INIT: &str = "/admin/init";
 pub const ADMIN_AUDIT: &str = "/admin/audit";

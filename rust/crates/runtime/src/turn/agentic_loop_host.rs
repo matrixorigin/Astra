@@ -10,7 +10,7 @@
 //!
 //! | Host | Crate | Context | Tool execution |
 //! |------|-------|---------|----------------|
-//! | `CliAgenticLoopHost` | mo-agent-cli | Interactive terminal | Local via `ToolExecutor` |
+//! | `CliAgenticLoopHost` | astra-cli | Interactive terminal | Local via `ToolExecutor` |
 //! | `ServerAgenticLoopHost` | runtime/server | Headless cloud/API | Via edge callback ledger |
 //! | `MockHost` (tests) | runtime (tests) | Unit tests | Scripted responses |
 //!
@@ -235,7 +235,7 @@ pub struct AgenticLoopState {
     /// How many times teammate-idle hooks have fired (at most once per loop).
     pub teammate_idle_hook_runs: u32,
     /// Edge/chat project root (`git_root` or `cwd`) for enriching `delegate` sub-run context
-    /// so server-side sub-runs load `.mo-agent/stop-hooks.yaml` from the same tree.
+    /// so server-side sub-runs load `.astra/stop-hooks.yaml` from the same tree.
     pub workspace_root_hint: Option<String>,
 
     // ── Error budget ──

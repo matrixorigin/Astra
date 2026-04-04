@@ -929,12 +929,12 @@ mod tests {
     #[test]
     fn root_response_serializes() {
         let resp = RootResponse {
-            name: "mo-agent".into(),
+            name: "astra".into(),
             version: "1.0.0".into(),
             docs: "https://docs.example.com".into(),
         };
         let v = serde_json::to_value(&resp).unwrap();
-        assert_eq!(v["name"], "mo-agent");
+        assert_eq!(v["name"], "astra");
         assert_eq!(v["version"], "1.0.0");
         assert_eq!(v["docs"], "https://docs.example.com");
     }

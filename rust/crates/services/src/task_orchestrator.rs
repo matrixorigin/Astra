@@ -19,7 +19,7 @@
 //! # Storage
 //!
 //! - `agent_tasks` table in MatrixOne (DDL in storage.rs)
-//! - Local fallback: `~/.mo-agent/tasks/{task_id}.json`
+//! - Local fallback: `~/.astra/tasks/{task_id}.json`
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -926,7 +926,7 @@ impl TaskService for MatrixOneTaskService {
 // ─── Local-Only Implementation (Offline) ────────────────────────────────────
 
 /// File-based task service for offline/edge-only mode.
-/// Stores tasks as JSON files in `~/.mo-agent/tasks/`.
+/// Stores tasks as JSON files in `~/.astra/tasks/`.
 pub struct LocalTaskService {
     tasks_dir: std::path::PathBuf,
 }

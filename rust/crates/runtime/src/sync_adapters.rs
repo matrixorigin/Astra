@@ -765,7 +765,7 @@ impl DomainAdapter for TemplateAdapter {
             *g = rows;
         }
         if std::env::var("MO_SYNC_DEBUG").as_deref() == Ok("1") {
-            eprintln!("[mo-agent-sync][templates] merge_remote: replaced cache with {n} row(s)");
+            eprintln!("[astra-sync][templates] merge_remote: replaced cache with {n} row(s)");
         }
         Ok(MergeResult {
             items_added: n,

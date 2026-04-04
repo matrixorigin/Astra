@@ -43,7 +43,7 @@ fn build_client_for_url(url: &str) -> reqwest::Client {
 /// `pass_threshold` to determine pass/fail.
 ///
 /// This trait lives in `services` so that higher-level crates (`runtime`,
-/// `mo-agent`) can provide concrete implementations with access to LLM APIs.
+/// `astra`) can provide concrete implementations with access to LLM APIs.
 #[async_trait]
 pub trait LlmJudge: Send + Sync {
     /// Evaluate a verification criterion using an LLM.

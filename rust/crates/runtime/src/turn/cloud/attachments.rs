@@ -5,7 +5,7 @@
 //! LLM doesn't lose access to it.
 //!
 //! Inspired by claudecode's post-compact attachment restoration, but adapted
-//! for mo-agent's architecture: attachment selection uses ToolSelector's
+//! for astra's architecture: attachment selection uses ToolSelector's
 //! learned_context for file hotness rather than a separate read-cache.
 
 use serde::{Deserialize, Serialize};

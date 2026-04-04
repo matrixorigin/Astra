@@ -164,8 +164,8 @@ pub async fn resolve_active_llm_model(
         row
     };
 
-    let row =
-        row.ok_or_else(|| "No active LLM model configured. Run: mo-admin model add".to_string())?;
+    let row = row
+        .ok_or_else(|| "No active LLM model configured. Run: astra-admin model add".to_string())?;
 
     let model_name: String = row.try_get("model_name").map_err(|e| e.to_string())?;
     let encrypted: String = row

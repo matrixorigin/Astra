@@ -101,7 +101,7 @@ pub fn detect_server_stall(tool_sigs: &[BTreeSet<String>], window: usize) -> boo
     recent.iter().all(|sig| sig == &recent[window - 1])
 }
 
-// ─── CLI stream_chat_sse agentic loop (mo-agent) ──────────────────────────────
+// ─── CLI stream_chat_sse agentic loop (astra) ──────────────────────────────
 
 /// Subtract this many "remaining inner-loop turns" when TurnGuard reports **critical** during the
 /// CLI `/chat/turn` agentic loop (`apply_post_tool_turn_policy`).
@@ -109,7 +109,7 @@ pub const CLI_AGENTIC_VERDICT_REMAINING_PENALTY_CRITICAL: usize = 5;
 /// Same for **warning** severity.
 pub const CLI_AGENTIC_VERDICT_REMAINING_PENALTY_WARNING: usize = 2;
 
-/// Per-round signature set and tool-name set for mo-agent flat `tool_calls` rows (`name` + `arguments` JSON).
+/// Per-round signature set and tool-name set for astra flat `tool_calls` rows (`name` + `arguments` JSON).
 pub fn round_tool_call_sig_and_names(tool_calls: &[Value]) -> (BTreeSet<String>, HashSet<String>) {
     let sig_set: BTreeSet<String> = tool_calls
         .iter()
@@ -1048,15 +1048,15 @@ mod tests {
         // Round 1: read_file(Cargo.toml)
         let calls_1 = vec![serde_json::json!({
             "name": "read_file",
-            "arguments": {"path": "rust/crates/mo-agent/Cargo.toml"}
+            "arguments": {"path": "rust/crates/astra/Cargo.toml"}
         })];
         record_server_tool_signatures(&mut tool_sigs, &calls_1, window);
         assert!(!detect_server_stall(&tool_sigs, SERVER_STALL_WINDOW));
 
         // Round 2: list_dir + read_file(different path)
         let calls_2 = vec![
-            serde_json::json!({"name": "list_dir", "arguments": {"path": "rust/crates/mo-agent/src/edge_tools"}}),
-            serde_json::json!({"name": "read_file", "arguments": {"path": "rust/crates/mo-agent/src/edge_tools/nonexistent.rs"}}),
+            serde_json::json!({"name": "list_dir", "arguments": {"path": "rust/crates/astra/src/edge_tools"}}),
+            serde_json::json!({"name": "read_file", "arguments": {"path": "rust/crates/astra/src/edge_tools/nonexistent.rs"}}),
         ];
         record_server_tool_signatures(&mut tool_sigs, &calls_2, window);
         assert!(
@@ -1067,7 +1067,7 @@ mod tests {
         // Round 3: read_file(yet another path)
         let calls_3 = vec![serde_json::json!({
             "name": "read_file",
-            "arguments": {"path": "rust/crates/mo-agent/src/edge_tools/mo_tools.rs"}
+            "arguments": {"path": "rust/crates/astra/src/edge_tools/mo_tools.rs"}
         })];
         record_server_tool_signatures(&mut tool_sigs, &calls_3, window);
         assert!(

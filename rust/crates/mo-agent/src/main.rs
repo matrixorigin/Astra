@@ -4270,7 +4270,7 @@ async fn run_chat_repl(
         eprintln!(
             "  {}  {}",
             "⚠".yellow(),
-            "No LLM model configured on server. Run: mo-admin model add".yellow()
+            "No LLM model configured on server. Run: astra-admin model add".yellow()
         );
         eprintln!();
         state.model = None; // reset so chat uses "auto" for actual requests

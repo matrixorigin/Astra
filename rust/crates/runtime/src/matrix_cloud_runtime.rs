@@ -1,5 +1,5 @@
 //! Matrix-backed cloud plumbing in one place: [`SharedPool`], journal ingestion, and
-//! [`SyncOrchestrator`] (learning, events, templates, preferences). Used by `mo-agent-server`
+//! [`SyncOrchestrator`] (learning, events, templates, preferences). Used by `astra-server`
 //! [`AppState`] and by the CLI [`ReplState`] as a single `Arc` attachment.
 
 use std::collections::{BTreeMap, HashSet};
