@@ -2625,9 +2625,7 @@ fn display_plan_updates_live(
                     format_duration_short(elapsed),
                 )
             }
-            PlanUpdate::GlobalVerificationFailed => {
-                "  ⚠ Global verification failed".to_string()
-            }
+            PlanUpdate::GlobalVerificationFailed => "  ⚠ Global verification failed".to_string(),
             PlanUpdate::JournalEvent(event) => {
                 // Write journal event to the REPL-owned journal writer
                 if let Some(ref journal) = state.journal {

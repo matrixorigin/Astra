@@ -1321,7 +1321,13 @@ impl TaskBranchService {
 /// Replaces any other character (notably `-`) with `_`.
 fn sanitize_snapshot_name(raw: &str) -> String {
     raw.chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect()
 }
 

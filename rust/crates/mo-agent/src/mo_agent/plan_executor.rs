@@ -567,7 +567,7 @@ async fn plan_executor_task(
         let event = session_journal::JournalEvent::plan_progress(
             ctx.session_id.as_deref(),
             ctx.turn,
-            "",   // no subtask yet
+            "", // no subtask yet
             goal,
             "plan_started",
             0,
@@ -661,7 +661,9 @@ async fn plan_executor_task(
 
                 // Learning: record task outcome signal
                 if let Some(ref bridge) = learning_bridge {
-                    let (task_id, contract_id) = ctx.durable_task_state.as_ref()
+                    let (task_id, contract_id) = ctx
+                        .durable_task_state
+                        .as_ref()
                         .map(|d| (d.contract.task_id.clone(), d.contract.contract_id.clone()))
                         .unwrap_or_default();
                     let signal = astra_services::durable_task::TaskOutcomeSignal {
@@ -806,12 +808,7 @@ async fn plan_executor_task(
 
             // Prepare subtask prompt
             let (prompt, title) = {
-                let Some(st) = ctx
-                    .plan
-                    .subtasks
-                    .iter_mut()
-                    .find(|s| s.id == *next_id)
-                else {
+                let Some(st) = ctx.plan.subtasks.iter_mut().find(|s| s.id == *next_id) else {
                     let _ = update_tx.send(PlanUpdate::PlanError {
                         error: format!("Subtask '{}' disappeared from plan", next_id),
                     });
@@ -905,8 +902,7 @@ async fn plan_executor_task(
                     });
 
                     // Accumulate conversation history so subsequent subtasks have context
-                    ctx.history
-                        .push((prompt.clone(), result.full_text.clone()));
+                    ctx.history.push((prompt.clone(), result.full_text.clone()));
                     let _ = update_tx.send(PlanUpdate::HistoryEntry {
                         user_msg: prompt.clone(),
                         assistant_msg: result.full_text.clone(),
