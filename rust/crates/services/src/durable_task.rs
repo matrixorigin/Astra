@@ -2213,7 +2213,10 @@ impl MatrixOneDurableTaskLifecycle {
     async fn load_contract_by_id(&self, contract_id: &str) -> Result<Option<TaskContract>, String> {
         let row = sqlx::query(
             "SELECT contract_id, task_id, user_id, session_id, goal, \
-             scope_json, subtasks_json, criteria_json, version, status, \
+             CAST(scope_json AS CHAR) AS scope_json, \
+             CAST(subtasks_json AS CHAR) AS subtasks_json, \
+             CAST(criteria_json AS CHAR) AS criteria_json, \
+             version, status, \
              CAST(created_at AS CHAR) AS created_at, \
              CAST(updated_at AS CHAR) AS updated_at \
              FROM task_contracts WHERE contract_id = ?",
@@ -2235,7 +2238,10 @@ impl MatrixOneDurableTaskLifecycle {
     async fn load_contract_by_task(&self, task_id: &str) -> Result<Option<TaskContract>, String> {
         let row = sqlx::query(
             "SELECT contract_id, task_id, user_id, session_id, goal, \
-             scope_json, subtasks_json, criteria_json, version, status, \
+             CAST(scope_json AS CHAR) AS scope_json, \
+             CAST(subtasks_json AS CHAR) AS subtasks_json, \
+             CAST(criteria_json AS CHAR) AS criteria_json, \
+             version, status, \
              CAST(created_at AS CHAR) AS created_at, \
              CAST(updated_at AS CHAR) AS updated_at \
              FROM task_contracts WHERE task_id = ? AND status != 'abandoned' \

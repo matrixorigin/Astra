@@ -216,8 +216,11 @@ impl HybridRestoreService {
         session_id: &str,
     ) -> Result<Option<String>, String> {
         let row = sqlx::query(
-            "SELECT contract_id, task_id, goal, scope_json, subtasks_json, \
-             criteria_json, version, status, \
+            "SELECT contract_id, task_id, goal, \
+             CAST(scope_json AS CHAR) AS scope_json, \
+             CAST(subtasks_json AS CHAR) AS subtasks_json, \
+             CAST(criteria_json AS CHAR) AS criteria_json, \
+             version, status, \
              CAST(created_at AS CHAR) AS created_at, \
              CAST(updated_at AS CHAR) AS updated_at \
              FROM task_contracts \
