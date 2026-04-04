@@ -10,24 +10,18 @@
 //!  ReadlineActor                      std::thread
 //!   ├─ req_tx ──────────────────────► req_rx
 //!   │  (ReadlineRequest)              loop { recv → editor.readline() }
-//!   ├─ resp_rx ◄────────────────────  resp_tx
-//!   │  (ReadlineResponse)             sends result back
-//!   └─ ext_printer                    editor owns terminal
-//!      (ExternalPrinter)              printer writes via pipe
+//!   └─ resp_rx ◄────────────────────  resp_tx
+//!      (ReadlineResponse)             sends result back
 //! ```
 //!
-//! The `ExternalPrinter` is created before spawning the thread and can
-//! safely print messages while readline is blocking — rustyline handles
-//! prompt redraw automatically.
+//! The readline thread runs autonomously; plan updates are flushed
+//! between prompts via `eprintln!` (not during active readline).
 
 use std::path::PathBuf;
 
-use rustyline::{Editor, ExternalPrinter, error::ReadlineError, history::FileHistory};
+use rustyline::{Editor, error::ReadlineError, history::FileHistory};
 
 use crate::repl_ui::ReplHelper;
-
-/// Boxed printer that can be used from the async main loop while readline blocks.
-pub(super) type BoxedPrinter = Box<dyn ExternalPrinter + Send>;
 
 /// Messages sent from the main async loop → readline thread.
 enum ReadlineRequest {
@@ -60,19 +54,13 @@ pub(super) struct ReadlineActor {
 }
 
 impl ReadlineActor {
-    /// Spawn the readline thread and return the actor handle + an
-    /// `ExternalPrinter` that can print messages while readline blocks.
-    pub fn spawn(
-        mut editor: Editor<ReplHelper, FileHistory>,
-    ) -> Result<(Self, Option<BoxedPrinter>), String> {
-        // Create the external printer BEFORE moving editor to the thread.
-        // May fail on non-TTY (e.g. piped input) — in that case we simply
-        // won't have live plan update printing during readline.
-        let ext_printer: Option<BoxedPrinter> = editor
-            .create_external_printer()
-            .ok()
-            .map(|p| Box::new(p) as BoxedPrinter);
-
+    /// Spawn the readline thread and return the actor handle.
+    ///
+    /// ExternalPrinter is intentionally NOT created — its mere existence
+    /// changes rustyline's internal rendering path, which breaks display of
+    /// the last CJK (wide) character due to rustyline issue #826. Plan
+    /// updates are flushed between prompts via eprintln! instead.
+    pub fn spawn(editor: Editor<ReplHelper, FileHistory>) -> Result<Self, String> {
         // Channels: sync mpsc for requests (main→thread), tokio mpsc for responses (thread→main).
         let (req_tx, req_rx) = std::sync::mpsc::channel::<ReadlineRequest>();
         let (resp_tx, resp_rx) = tokio::sync::mpsc::unbounded_channel::<ReadlineResponse>();
@@ -84,7 +72,7 @@ impl ReadlineActor {
             })
             .map_err(|e| format!("failed to spawn readline thread: {e}"))?;
 
-        Ok((Self { req_tx, resp_rx }, ext_printer))
+        Ok(Self { req_tx, resp_rx })
     }
 
     /// Request the thread to read a line with the given prompt.

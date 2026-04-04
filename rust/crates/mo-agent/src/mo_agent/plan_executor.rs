@@ -1116,12 +1116,22 @@ async fn plan_executor_task(
                                 .unwrap_or((0, 0, None));
                             if durable_bridge::subtask_retries_exhausted(durable, next_id) {
                                 sink.subtask_verification_failed(
-                                    next_id, &title, true, attempt, max_retries, failure_hint,
+                                    next_id,
+                                    &title,
+                                    true,
+                                    attempt,
+                                    max_retries,
+                                    failure_hint,
                                 );
                                 st.status = TaskStatus::Completed;
                             } else {
                                 sink.subtask_verification_failed(
-                                    next_id, &title, false, attempt, max_retries, failure_hint,
+                                    next_id,
+                                    &title,
+                                    false,
+                                    attempt,
+                                    max_retries,
+                                    failure_hint,
                                 );
                                 st.status = TaskStatus::Pending;
                             }

@@ -2351,7 +2351,9 @@ async fn http_chat_turn_bridge_persists_tool_events_after_persist_success() {
     );
     assert_eq!(
         plan.events[1].metadata,
-        Some(serde_json::json!({"tool_call_id":"tc-edge","name":"bash","source":"edge"}))
+        Some(
+            serde_json::json!({"tool_call_id":"tc-edge","name":"bash","source":"edge","tool_name":"bash"})
+        )
     );
     assert_eq!(
         serde_json::from_str::<serde_json::Value>(&plan.events[2].content).unwrap(),

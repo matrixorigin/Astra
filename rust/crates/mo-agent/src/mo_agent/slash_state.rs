@@ -114,7 +114,9 @@ pub(super) async fn handle_state_command(
             eprintln!("  {}", "Summarizing…".dim());
             let mut auto_pm =
                 PermissionManager::with_project(true, &std::env::current_dir().unwrap_or_default());
-            let mut _cancel_token_guard: Option<std::sync::Arc<tokio_util::sync::CancellationToken>> = None;
+            let mut _cancel_token_guard: Option<
+                std::sync::Arc<tokio_util::sync::CancellationToken>,
+            > = None;
             let summary_result = tokio::select! {
                 r = stream_chat_sse(ChatTurnParams {
                     api,
@@ -145,7 +147,7 @@ pub(super) async fn handle_state_command(
                     },
                     plan_assemble_line_release: None,
                     stream_event_tx: None,
-                approval_request_tx: None,
+                    approval_request_tx: None,
                 }) => r,
                 _ = tokio::signal::ctrl_c() => {
                     if let Some(ref t) = _cancel_token_guard { t.cancel(); }
@@ -230,7 +232,7 @@ pub(super) async fn handle_state_command(
                         cancel_token: None,
                         plan_assemble_line_release: None,
                         stream_event_tx: None,
-                approval_request_tx: None,
+                        approval_request_tx: None,
                     })
                     .await;
 
@@ -296,7 +298,7 @@ pub(super) async fn handle_state_command(
                                 cancel_token: None,
                                 plan_assemble_line_release: None,
                                 stream_event_tx: None,
-                approval_request_tx: None,
+                                approval_request_tx: None,
                             })
                             .await;
                             if let Ok(sr2) = synth_result {

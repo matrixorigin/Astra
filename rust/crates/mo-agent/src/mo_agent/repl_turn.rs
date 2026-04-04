@@ -214,7 +214,58 @@ pub(super) fn build_effective_line(line: &str, state: &ReplState) -> String {
         effective_line = format!("{skill_block}\n\n{effective_line}");
     }
 
+    if let Some(anchor) = state
+        .continuation_anchor
+        .as_deref()
+        .filter(|_| is_short_continuation_prompt(line))
+    {
+        effective_line = format!(
+            "[Continuation anchor]\nResume the active task/thread below unless the user explicitly changes topic.\n{anchor}\n\n[User follow-up]\n{effective_line}"
+        );
+    }
+
     effective_line
+}
+
+fn is_short_continuation_prompt(line: &str) -> bool {
+    let trimmed = line.trim();
+    if trimmed.is_empty() || trimmed.chars().count() > 16 {
+        return false;
+    }
+
+    matches!(
+        trimmed.to_ascii_lowercase().as_str(),
+        "continue" | "continue." | "continue!" | "go on" | "resume"
+    ) || matches!(trimmed, "继续" | "继续。" | "继续！")
+}
+
+fn build_continuation_anchor(
+    state: &ReplState,
+    line: &str,
+    result: &StreamResult,
+) -> Option<String> {
+    let user_line = line.trim();
+    if user_line.is_empty() {
+        return state.continuation_anchor.clone();
+    }
+
+    let assistant_summary = result
+        .full_text
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .map(str::trim)
+        .unwrap_or_default();
+
+    let assistant_summary: String = assistant_summary.chars().take(220).collect();
+    let user_summary: String = user_line.chars().take(220).collect();
+
+    if assistant_summary.is_empty() {
+        return Some(format!("Latest user task: {user_summary}"));
+    }
+
+    Some(format!(
+        "Latest user task: {user_summary}\nLatest assistant direction: {assistant_summary}"
+    ))
 }
 
 async fn maybe_auto_compact(
@@ -402,7 +453,7 @@ async fn run_chat_turn(
             cancel_token: Some(cancel_token),
             plan_assemble_line_release: None,
             stream_event_tx: None,
-        approval_request_tx: None,
+            approval_request_tx: None,
         }) => TurnAttempt::Completed(Box::new(result)),
         _ = tokio::signal::ctrl_c() => {
             // Trigger cancellation to interrupt any in-flight SSE streaming.
@@ -741,6 +792,7 @@ fn apply_turn_success(
     state.total_prompt_tokens += result.prompt_tokens;
     state.total_completion_tokens += result.completion_tokens;
     state.last_response = Some(result.full_text.clone());
+    state.continuation_anchor = build_continuation_anchor(state, line, &result);
     state
         .history
         .push((line.to_string(), result.full_text.clone()));
@@ -820,5 +872,49 @@ fn report_turn_error(state: &ReplState, line: &str, error: &str, turn_start: Ins
         );
         let _ = journal.append(&err_event);
         enqueue_ingestion(state, &err_event);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn short_continuation_prompt_is_detected() {
+        assert!(is_short_continuation_prompt("继续"));
+        assert!(is_short_continuation_prompt("continue"));
+        assert!(is_short_continuation_prompt("resume"));
+        assert!(!is_short_continuation_prompt(
+            "继续修这个 bug，并顺便看下另一个问题"
+        ));
+        assert!(!is_short_continuation_prompt("fix this"));
+    }
+
+    #[test]
+    fn build_effective_line_injects_anchor_for_short_continue() {
+        let state = ReplState {
+            continuation_anchor: Some(
+                "Latest user task: debug Chinese input drops\nLatest assistant direction: inspect prompt redraw path"
+                    .to_string(),
+            ),
+            ..ReplState::default()
+        };
+
+        let effective = build_effective_line("继续", &state);
+        assert!(effective.contains("[Continuation anchor]"));
+        assert!(effective.contains("debug Chinese input drops"));
+        assert!(effective.contains("[User follow-up]\n继续"));
+    }
+
+    #[test]
+    fn build_effective_line_leaves_normal_prompt_untouched() {
+        let state = ReplState {
+            continuation_anchor: Some("Latest user task: debug Chinese input drops".to_string()),
+            ..ReplState::default()
+        };
+
+        let effective = build_effective_line("修一下输入法问题", &state);
+        assert!(!effective.contains("[Continuation anchor]"));
+        assert_eq!(effective, "修一下输入法问题");
     }
 }

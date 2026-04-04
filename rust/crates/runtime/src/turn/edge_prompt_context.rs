@@ -444,7 +444,16 @@ mod tests {
     #[test]
     fn environment_context_no_git_in_temp() {
         let tmp = tempdir().unwrap();
+        // Override GIT_CEILING_DIRECTORIES so git won't discover any repo
+        // above the temp dir (e.g. if /tmp itself is inside a worktree).
+        // SAFETY: test is single-threaded for this env var; no concurrent readers.
+        unsafe {
+            std::env::set_var("GIT_CEILING_DIRECTORIES", tmp.path().parent().unwrap());
+        }
         let ctx = build_environment_context(tmp.path());
+        unsafe {
+            std::env::remove_var("GIT_CEILING_DIRECTORIES");
+        }
         assert!(
             !ctx.contains("- Git branch:"),
             "temp dir should not have git branch"

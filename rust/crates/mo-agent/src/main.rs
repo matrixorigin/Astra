@@ -445,6 +445,9 @@ struct ReplState {
     model: Option<String>,
     turn: u32,
     last_response: Option<String>,
+    /// Sticky task/thread summary used to anchor ultra-short follow-ups like
+    /// "继续" even after history compaction prunes earlier turns.
+    continuation_anchor: Option<String>,
     explain: ExplainMode,
     verbose_mode: bool,
     history: Vec<(String, String)>, // (user_msg, assistant_msg)
@@ -543,6 +546,7 @@ impl Default for ReplState {
             model: None,
             turn: 0,
             last_response: None,
+            continuation_anchor: None,
             explain: ExplainMode::Off,
             verbose_mode: true,
             history: Vec::new(),
@@ -2426,143 +2430,23 @@ async fn ensure_durable_task_state(state: &mut ReplState) {
     }
 }
 
-/// Poll the background plan executor for updates, printing progress and
-/// handling completion/pause/error.  Returns when the plan finishes,
-/// pauses, or encounters an error.
-///
-/// **Legacy**: Superseded by `display_plan_updates_live()` which uses ExternalPrinter.
-#[allow(dead_code)]
-async fn plan_monitoring_loop(state: &mut ReplState) {
-    use plan_executor::{PlanCommand, PlanUpdate};
-
-    loop {
-        let handle = match state.plan_handle.as_mut() {
-            Some(h) => h,
-            None => return,
-        };
-
-        tokio::select! {
-            biased;
-
-            // ── Ctrl-C → Pause ───────────────────────────────────────
-            _ = tokio::signal::ctrl_c() => {
-                let _ = handle.send_command(PlanCommand::Pause);
-                eprintln!("\n{}  Sending pause to background plan...", "⏸".yellow());
-            }
-
-            // ── Poll channel with short sleep ────────────────────────
-            _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {
-                // Drain all available updates
-                while let Some(update) = handle.try_recv() {
-                    match update {
-                        PlanUpdate::SubtaskStarted { title, index, total, .. } => {
-                            eprintln!(
-                                "\n{}  [{}/{}] {}",
-                                "▸".cyan(),
-                                index,
-                                total,
-                                title.bold(),
-                            );
-                        }
-                        PlanUpdate::SubtaskCompleted { id, verification_passed, elapsed, .. } => {
-                            let dur = elapsed
-                                .map(|d| format!(" ({})", format_duration_short(d)))
-                                .unwrap_or_default();
-                            if verification_passed {
-                                eprintln!("  {} {}{}", "✅".green(), id, dur.dim());
-                            } else {
-                                eprintln!("  {} {} — verification failed{}", "⚠".yellow(), id, dur.dim());
-                            }
-                        }
-                        PlanUpdate::SubtaskTurnResult { subtask_id, prompt_tokens, completion_tokens, .. } => {
-                            state.total_prompt_tokens += prompt_tokens;
-                            state.total_completion_tokens += completion_tokens;
-                            state.turn += 1;
-                            state.current_plan_subtask_id = Some(subtask_id);
-                        }
-                        PlanUpdate::PlanProgress { done, total, elapsed, eta } => {
-                            let pct = if total > 0 { done * 100 / total } else { 0 };
-                            let eta_str = eta
-                                .map(|d| format!(" — ETA ~{}", format_duration_short(d)))
-                                .unwrap_or_default();
-                            eprintln!(
-                                "  📊 {}/{} ({}%) — {}{}",
-                                done,
-                                total,
-                                pct,
-                                format_duration_short(elapsed).dim(),
-                                eta_str.dim(),
-                            );
-                        }
-                        PlanUpdate::PlanCompleted { pct, elapsed } => {
-                            eprintln!(
-                                "\n{}  Plan complete — {}% verified in {}",
-                                "🏁".green(),
-                                pct,
-                                format_duration_short(elapsed),
-                            );
-                            state.executing_plan = None;
-                            state.current_plan_subtask_id = None;
-                            state.plan_handle = None;
-                            return;
-                        }
-                        PlanUpdate::PlanError { error } => {
-                            eprintln!(
-                                "\n{}  Plan error: {}",
-                                "❌".red(),
-                                error,
-                            );
-                            state.executing_plan = None;
-                            state.current_plan_subtask_id = None;
-                            state.plan_handle = None;
-                            return;
-                        }
-                        PlanUpdate::PlanPaused { pct, remaining, elapsed } => {
-                            eprintln!(
-                                "\n{}  Plan paused — {}% done, {} remaining ({})",
-                                "⏸".yellow(),
-                                pct,
-                                remaining,
-                                format_duration_short(elapsed),
-                            );
-                            // Don't clear the handle — user can resume
-                            return;
-                        }
-                        _ => {} // LlmStreaming, ToolCall, etc. — future use
-                    }
-                }
-            }
-        }
-    }
-}
-
 /// Drain plan updates from the background executor and display them via
-/// `ExternalPrinter`, which safely redraws the rustyline prompt. Called
-/// inside the `select!` loop while the user is at the readline prompt.
+/// `eprintln!`. Called between prompts when readline is not active.
 fn display_plan_updates_live(
     state: &mut ReplState,
-    printer: &std::sync::Mutex<Option<readline_actor::BoxedPrinter>>,
     plan_spinner: &mut Option<effects::PlanActivitySpinner>,
     current_subtask_tag: &mut String,
 ) {
     use plan_executor::PlanUpdate;
 
-    // Print via ExternalPrinter if available, otherwise eprintln!.
+    // Print via eprintln! (readline is not active during this call).
     // Always stops the active spinner first to clear its \r line.
-    let print_line = |printer: &std::sync::Mutex<Option<readline_actor::BoxedPrinter>>,
-                      spinner: &mut Option<effects::PlanActivitySpinner>,
-                      msg: String| {
+    let print_line = |spinner: &mut Option<effects::PlanActivitySpinner>, msg: String| {
         // Stop spinner before printing to avoid garbled output
         if let Some(s) = spinner.take() {
             s.stop_clear();
         }
-        if let Ok(mut guard) = printer.lock()
-            && let Some(ref mut p) = *guard
-        {
-            let _ = p.print(msg);
-        } else {
-            eprintln!("{msg}");
-        }
+        eprintln!("{msg}");
     };
 
     let handle = match state.plan_handle.as_mut() {
@@ -2657,7 +2541,7 @@ fn display_plan_updates_live(
                 if let Some(tx) = state.pending_approval.take() {
                     let _ = tx.send(false);
                 }
-                print_line(printer, plan_spinner, msg);
+                print_line(plan_spinner, msg);
                 return;
             }
             PlanUpdate::PlanError { error } => {
@@ -2677,7 +2561,7 @@ fn display_plan_updates_live(
                 if let Some(tx) = state.pending_approval.take() {
                     let _ = tx.send(false);
                 }
-                print_line(printer, plan_spinner, msg);
+                print_line(plan_spinner, msg);
                 return;
             }
             PlanUpdate::PlanPaused {
@@ -2726,9 +2610,7 @@ fn display_plan_updates_live(
                 } else {
                     String::new()
                 };
-                let hint_str = failure_hint
-                    .map(|h| format!(": {h}"))
-                    .unwrap_or_default();
+                let hint_str = failure_hint.map(|h| format!(": {h}")).unwrap_or_default();
                 if retries_exhausted {
                     (
                         format!("  ⚠ {id} — verification failed{attempt_str}{hint_str}"),
@@ -2815,19 +2697,19 @@ fn display_plan_updates_live(
                     detail.as_deref().unwrap_or(""),
                     reason,
                 );
-                print_line(printer, plan_spinner, msg);
+                print_line(plan_spinner, msg);
                 // Store the response channel for the REPL readline handler.
                 // The next user input line will be interpreted as y/n/a to resolve this.
                 state.pending_approval = Some(response_tx);
                 let prompt_msg = "   Type y(es) to approve, n(o) to deny:".to_string();
-                print_line(printer, plan_spinner, prompt_msg);
+                print_line(plan_spinner, prompt_msg);
                 continue;
             }
             _ => continue, // ParallelGroupInfo, StepByStepPrompt — future use
         };
 
         // Print the message (stops spinner internally)
-        print_line(printer, plan_spinner, msg);
+        print_line(plan_spinner, msg);
 
         // Optionally start a new spinner after the printed line
         if let Some(label) = post_spinner {
@@ -2842,6 +2724,25 @@ fn display_plan_updates_live(
                 spinner_label,
             ));
         }
+    }
+}
+
+/// Flush queued background plan updates when the REPL is *not* actively reading a line.
+///
+/// We intentionally avoid printing plan updates while `rustyline` is in `readline()`.
+/// Prompt redraws during active input can interrupt IME composition and cause
+/// probabilistic dropped characters for CJK input. The plan update channel is
+/// unbounded, so deferring display between prompts is safe and lossless.
+fn flush_plan_updates_between_prompts(state: &mut ReplState) {
+    if state.plan_handle.is_none() {
+        return;
+    }
+
+    let mut plan_spinner: Option<effects::PlanActivitySpinner> = None;
+    let mut current_subtask_tag = state.current_plan_subtask_id.clone().unwrap_or_default();
+    display_plan_updates_live(state, &mut plan_spinner, &mut current_subtask_tag);
+    if let Some(spinner) = plan_spinner.take() {
+        spinner.stop_clear();
     }
 }
 
@@ -3821,11 +3722,7 @@ async fn run_chat_repl(
     try_silent_auth(api, profile).await;
 
     let (editor, hist_path) = build_repl_editor()?;
-    let (mut readline, ext_printer) = readline_actor::ReadlineActor::spawn(editor)?;
-    // Wrap ext_printer in Mutex so display_plan_updates_live can use it.
-    // None when no TTY (e.g. piped) — plan updates fall back to eprintln!.
-    let ext_printer: std::sync::Mutex<Option<readline_actor::BoxedPrinter>> =
-        std::sync::Mutex::new(ext_printer);
+    let mut readline = readline_actor::ReadlineActor::spawn(editor)?;
     let mut state = initialize_repl_state(profile, initial_model);
     // Session-scoped quality tracker: tools that work well get boosted over time
     let quality_tracker = std::sync::Arc::new(std::sync::Mutex::new(
@@ -3999,71 +3896,39 @@ async fn run_chat_repl(
     // ── Main loop ─────────────────────────────────────────────────────────────
     let mut last_ctrl_c_at: Option<std::time::Instant> = None;
     loop {
+        flush_plan_updates_between_prompts(&mut state);
         let current_token = current_access_token(profile);
 
-        // Prompt: plan> in plan mode, ❯ otherwise
+        // Keep readline prompts ASCII-only and unstyled. Rustyline still has
+        // edge cases around ANSI/wide-char prompt width, which can visually
+        // clip the last CJK character while typing.
         if let Some(ref sname) = state.skill_dev_name {
             eprintln!("  \u{1f527} {}", format!("Skill dev: {sname}").cyan().dim());
         }
         let prompt_str = if state.plan_mode.is_some() {
-            format!("{} ", "plan>".yellow().bold())
+            "plan> ".to_string()
         } else if state.executing_plan.is_some() {
-            format!("{} ", "⏸>".yellow().bold())
+            "pause> ".to_string()
         } else if state.plan_handle.is_some() {
-            format!("{} ", "🔄>".cyan().bold())
+            "run> ".to_string()
         } else if state.chat_plan_only {
-            format!("{} ", "plan·".yellow().bold())
+            "plan. ".to_string()
         } else {
-            format!("{} ", "❯".cyan().bold())
+            "> ".to_string()
         };
 
         // ── Send readline request to actor thread ────────────────────
         readline.request_readline(prompt_str);
 
-        // ── Select: readline response OR background plan updates ─────
-        let readline_result: Result<String, ReadlineError>;
-        let mut pending_execute: Option<String> = None;
-        // Spinner state for plan execution — persists across poll cycles
-        let mut plan_spinner: Option<effects::PlanActivitySpinner> = None;
-        let mut current_subtask_tag = String::new();
-
-        loop {
-            tokio::select! {
-                biased;
-
-                // Readline thread returned a result
-                resp = readline.recv() => {
-                    // Stop plan spinner before processing readline
-                    if let Some(s) = plan_spinner.take() {
-                        s.stop_clear();
-                    }
-                    match resp {
-                        Some(readline_actor::ReadlineResponse::Line { result, pending_execute: pe }) => {
-                            readline_result = result;
-                            pending_execute = pe;
-                            break;
-                        }
-                        None => {
-                            // Readline thread exited unexpectedly
-                            readline_result = Err(ReadlineError::Eof);
-                            break;
-                        }
-                    }
-                }
-
-                // Background plan update available (only polls if handle exists)
-                _ = async {
-                    if state.plan_handle.is_some() {
-                        tokio::time::sleep(std::time::Duration::from_millis(50)).await
-                    } else {
-                        std::future::pending::<()>().await
-                    }
-                } => {
-                    // Drain plan updates and display via ExternalPrinter
-                    display_plan_updates_live(&mut state, &ext_printer, &mut plan_spinner, &mut current_subtask_tag);
-                }
-            }
-        }
+        // Do not redraw the prompt while readline is active; this can disrupt IME composition.
+        let (readline_result, pending_execute): (Result<String, ReadlineError>, Option<String>) =
+            match readline.recv().await {
+                Some(readline_actor::ReadlineResponse::Line {
+                    result,
+                    pending_execute,
+                }) => (result, pending_execute),
+                None => (Err(ReadlineError::Eof), None),
+            };
 
         // ── Process readline result ──────────────────────────────────
         match readline_result {
@@ -4170,7 +4035,7 @@ async fn run_chat_repl(
                                 Some(std::mem::take(&mut state.plan_execution_corrections))
                             },
                         });
-                        // Updates will appear via display_plan_updates_live in the select! loop
+                        // Updates will appear via flush_plan_updates_between_prompts at the next loop iteration
                     } else {
                         start_and_monitor_background_plan(
                             &mut state,
@@ -4358,10 +4223,7 @@ async fn run_chat_repl(
                         if let Some(tx) = state.pending_approval.take() {
                             let _ = tx.send(false);
                         }
-                        eprintln!(
-                            "\n{}  Cancelling plan execution…",
-                            "✗".red()
-                        );
+                        eprintln!("\n{}  Cancelling plan execution…", "✗".red());
                     } else {
                         // First Ctrl+C → pause
                         let _ = handle.send_command(plan_executor::PlanCommand::Pause);

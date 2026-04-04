@@ -1509,7 +1509,11 @@ impl Highlighter for ReplHelper {
     }
 
     fn highlight_char(&self, _line: &str, _pos: usize, _forced: bool) -> bool {
-        false
+        // Force full-line redraw after every keystroke. Without this,
+        // rustyline uses incremental rendering which miscounts display
+        // columns for CJK characters, causing the last wide char to
+        // visually disappear.
+        true
     }
 }
 
