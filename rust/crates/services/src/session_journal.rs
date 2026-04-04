@@ -1,6 +1,6 @@
 //! Session Journal — local JSONL persistence for observability & auditability.
 //!
-//! Writes one line per event to `~/.mo-agent/sessions/<session_id>.jsonl`.
+//! Writes one line per event to `~/.astra/sessions/<session_id>.jsonl`.
 //! Events include: turn completions, config changes, errors, compactions.
 //!
 //! The journal is append-only and survives process exits.
@@ -775,7 +775,7 @@ pub fn resolve_session_id(query: &str) -> std::io::Result<String> {
 fn journal_dir() -> PathBuf {
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
-        .join(".mo-agent")
+        .join(".astra")
         .join("sessions")
 }
 
@@ -1489,7 +1489,7 @@ mod tests {
     #[test]
     fn journal_writer_creates_file() {
         let tmp = tempfile::tempdir().unwrap();
-        let dir = tmp.path().join(".mo-agent").join("sessions");
+        let dir = tmp.path().join(".astra").join("sessions");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("test-sess.jsonl");
         let writer = JournalWriter { path: path.clone() };
@@ -1503,7 +1503,7 @@ mod tests {
     #[test]
     fn journal_writer_appends_multiple() {
         let tmp = tempfile::tempdir().unwrap();
-        let dir = tmp.path().join(".mo-agent").join("sessions");
+        let dir = tmp.path().join(".astra").join("sessions");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("multi.jsonl");
         let writer = JournalWriter { path: path.clone() };
@@ -1590,7 +1590,7 @@ mod tests {
     #[test]
     fn journal_write_read_with_selection_data() {
         let tmp = tempfile::tempdir().unwrap();
-        let dir = tmp.path().join(".mo-agent").join("sessions");
+        let dir = tmp.path().join(".astra").join("sessions");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("sel-test.jsonl");
         let writer = JournalWriter { path: path.clone() };

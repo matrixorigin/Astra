@@ -1,5 +1,5 @@
 #!/bin/bash
-# Smart interactive demo setup for mo-agent-engine.
+# Smart interactive demo setup for astra-engine.
 #
 # Design principles:
 #   1. Detect current state — skip what's already done
@@ -57,7 +57,7 @@ export NO_PROXY="${NO_PROXY:+$NO_PROXY,}localhost,127.0.0.1"
 
 # ── State detection helpers ─────────────────────────────────────
 
-CREDS_FILE="$HOME/.mo-agent/credentials.json"
+CREDS_FILE="$HOME/.astra/credentials.json"
 ADMIN_PROFILE=""  # set by step_admin, used by step_models
 
 db_reachable() {
@@ -109,7 +109,7 @@ has_llm_token() {
 profile_logged_in() {
     # Check if a profile's saved token is still valid
     local profile=$1
-    mo-agent --profile "$profile" whoami >/dev/null 2>&1
+    astra --profile "$profile" whoami >/dev/null 2>&1
 }
 
 current_profile() {
@@ -129,7 +129,7 @@ saved_profiles() {
 do_register() {
     local username=$1 password=$2 email=$3
     local out
-    out=$(mo-agent register --username "$username" --password "$password" --email "$email" 2>&1)
+    out=$(astra register --username "$username" --password "$password" --email "$email" 2>&1)
     local rc=$?
     if [ $rc -eq 0 ] && echo "$out" | grep -qi "registered"; then
         return 0
@@ -146,14 +146,14 @@ do_register() {
 }
 
 do_login() {
-    local username=$1 password=$2 tool=${3:-mo-agent}
+    local username=$1 password=$2 tool=${3:-astra}
     $tool login --username "$username" --password "$password" >/dev/null 2>&1
 }
 
 # ── Step 0: Pre-flight checks ──────────────────────────────────
 
 preflight() {
-    header "🚀 mo-agent-engine — Interactive Setup"
+    header "🚀 astra-engine — Interactive Setup"
 
     info "Checking prerequisites..."
 
@@ -192,7 +192,7 @@ step_admin() {
 
     if [ "$admin_count" -gt 0 ]; then
         ok "Admin user already exists — skipping"
-        dim "  (To manage admins: mo-admin user grant-role <user> mo_agent_admin)"
+        dim "  (To manage admins: astra-admin user grant-role <user> mo_agent_admin)"
         # Try to detect admin profile from saved credentials
         ADMIN_PROFILE=${ADMIN_PROFILE:-admin}
         return 0
@@ -243,7 +243,7 @@ step_admin() {
     if do_login "$username" "$password" "mo-admin"; then
         ok "Logged in as admin"
     else
-        warn "Auto-login failed — you can login later: mo-admin login"
+        warn "Auto-login failed — you can login later: astra-admin login"
     fi
 }
 
@@ -395,7 +395,7 @@ for r in rows:
                 ask "Base URL (OpenAI-compatible)"
                 base_url=$REPLY
                 break ;;
-            5|skip) info "Skipping — register models later with: mo-admin model add"; return 0 ;;
+            5|skip) info "Skipping — register models later with: astra-admin model add"; return 0 ;;
             *) warn "Invalid choice '$provider_choice' — please enter 1-5" ;;
         esac
     done
@@ -412,7 +412,7 @@ for r in rows:
     fi
 
     # Ensure mo-admin is authenticated before registering
-    if ! mo-admin --profile "$ADMIN_PROFILE" model list >/dev/null 2>&1; then
+    if ! astra-admin --profile "$ADMIN_PROFILE" model list >/dev/null 2>&1; then
         warn "Admin session expired or not logged in"
         info "Please login as admin to register models:"
         local admin_user admin_pass
@@ -421,7 +421,7 @@ for r in rows:
         ask_secret "Admin password"
         admin_pass=$REPLY
         if ! do_login "$admin_user" "$admin_pass" "mo-admin"; then
-            err "Admin login failed — register models later with: mo-admin login && mo-admin model add"
+            err "Admin login failed — register models later with: astra-admin login && astra-admin model add"
             return 1
         fi
         ADMIN_PROFILE="$admin_user"
@@ -431,7 +431,7 @@ for r in rows:
     info "Registering $model_name ($provider) and validating connectivity..."
     local output base_url_args=()
     [[ -n "$base_url" ]] && base_url_args=(--base-url "$base_url")
-    output=$(mo-admin --profile "$ADMIN_PROFILE" model add "$model_name" "$provider" --api-key "$api_key" "${base_url_args[@]}" 2>&1) || true
+    output=$(astra-admin --profile "$ADMIN_PROFILE" model add "$model_name" "$provider" --api-key "$api_key" "${base_url_args[@]}" 2>&1) || true
     echo "$output"
 
     if echo "$output" | grep -q "INACTIVE"; then
@@ -452,9 +452,9 @@ summary() {
     echo "  API docs:         http://localhost:8000/docs"
     echo ""
     echo "  Quick start:"
-    echo "    mo-agent chat                    # start chatting"
-    echo "    mo-agent chat --model gpt-4o     # use specific model"
-    echo "    mo-admin model list              # list available models"
+    echo "    astra chat                    # start chatting"
+    echo "    astra chat --model gpt-4o     # use specific model"
+    echo "    astra-admin model list              # list available models"
     echo ""
 }
 

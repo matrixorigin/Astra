@@ -5,9 +5,9 @@ use std::path::{Path, PathBuf};
 /// Interactive debug inspector for session turns.
 ///
 /// Data sources (in priority order):
-/// 1. Heavy checkpoints: `~/.mo-agent/sessions/<id>/step_checkpoints/*-heavy.json`
+/// 1. Heavy checkpoints: `~/.astra/sessions/<id>/step_checkpoints/*-heavy.json`
 ///    → full messages array (the actual LLM input/output)
-/// 2. Journal JSONL: `~/.mo-agent/sessions/<id>.jsonl`
+/// 2. Journal JSONL: `~/.astra/sessions/<id>.jsonl`
 ///    → turn summaries, tool calls, timing, token counts
 ///
 /// **Per-turn view:** journal turn *T* is paired with the *T*-th heavy checkpoint file (sorted by
@@ -570,7 +570,7 @@ fn show_summary(summary: &TurnSummary) {
 fn resolve_session_id(input: &str) -> String {
     let sessions_dir = dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
-        .join(".mo-agent")
+        .join(".astra")
         .join("sessions");
     if let Ok(entries) = std::fs::read_dir(&sessions_dir) {
         let matches: Vec<String> = entries
@@ -595,7 +595,7 @@ fn resolve_session_id(input: &str) -> String {
 fn session_dir(session_id: &str) -> PathBuf {
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
-        .join(".mo-agent")
+        .join(".astra")
         .join("sessions")
         .join(session_id)
 }
@@ -603,7 +603,7 @@ fn session_dir(session_id: &str) -> PathBuf {
 fn session_journal_path(session_id: &str) -> PathBuf {
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
-        .join(".mo-agent")
+        .join(".astra")
         .join("sessions")
         .join(format!("{session_id}.jsonl"))
 }

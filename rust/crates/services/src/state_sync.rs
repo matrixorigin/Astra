@@ -5,11 +5,11 @@
 //! ```text
 //!   Edge (CLI)                          Cloud (MatrixOne)
 //!   ─────────                          ──────────────────
-//!   ~/.mo-agent/learning/            learning_snapshots table
+//!   ~/.astra/learning/            learning_snapshots table
 //!     {profile}.json         ──push──▶  (user_id, profile, gzip+base64 json)
 //!                            ◀──pull──
 //!
-//!   ~/.mo-agent/sessions/            agent_sessions + agent_events
+//!   ~/.astra/sessions/            agent_sessions + agent_events
 //!     workspace.yaml         ──push──▶  (metadata sync)
 //!     journal.jsonl          ──push──▶  (event ingestion)
 //!

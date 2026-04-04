@@ -1,10 +1,10 @@
 [package]
-name = "mo-agent-cli"
+name = "astra-cli"
 version.workspace = true
 edition.workspace = true
 
 [[bin]]
-name = "mo-agent"
+name = "astra"
 path = "src/main.rs"
 
 [dependencies]

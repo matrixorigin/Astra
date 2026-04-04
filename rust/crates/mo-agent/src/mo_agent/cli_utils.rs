@@ -22,7 +22,7 @@ pub(super) fn credentials_path() -> PathBuf {
     }
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
-        .join(".mo-agent")
+        .join(".astra")
         .join("credentials.json")
 }
 

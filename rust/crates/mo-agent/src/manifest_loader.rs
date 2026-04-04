@@ -400,14 +400,14 @@ pub fn register_manifest_tools(skills_dir: &Path, registry: &mut PluginRegistry)
 /// Searches for `skills/` directory in:
 /// 1. Current working directory
 /// 2. Repository root (detected via git)
-/// 3. `~/.mo-agent/skills/`
+/// 3. `~/.astra/skills/`
 ///
 /// Silently skips if no skills directory exists.
 pub fn load_skills_directory(registry: &mut PluginRegistry) {
     let search_paths = [
         std::path::PathBuf::from("skills"),
         dirs::home_dir()
-            .map(|h| h.join(".mo-agent").join("skills"))
+            .map(|h| h.join(".astra").join("skills"))
             .unwrap_or_default(),
     ];
     for path in &search_paths {

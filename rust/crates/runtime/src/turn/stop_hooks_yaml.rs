@@ -1,4 +1,4 @@
-//! Declarative stop hooks: `.mo-agent/stop-hooks.yaml` (or `.yml`).
+//! Declarative stop hooks: `.astra/stop-hooks.yaml` (or `.yml`).
 //!
 //! Shared by CLI and server: load from a project root, merge auto-detect, and classify by `when`.
 //! See `docs/design/stop-hooks.md`.
@@ -135,7 +135,7 @@ pub fn is_plan_subtask_from_delegation_context(ctx: &HashMap<String, Value>) -> 
 }
 
 fn load_declarative_config(project_root: &Path) -> FileRoot {
-    let dir = project_root.join(".mo-agent");
+    let dir = project_root.join(".astra");
     for name in CANDIDATE_NAMES {
         let path = dir.join(name);
         if !path.is_file() {
@@ -339,7 +339,7 @@ mod tests {
     #[test]
     fn declarative_parses_minimal_yaml() {
         let dir = tempdir().unwrap();
-        let mo = dir.path().join(".mo-agent");
+        let mo = dir.path().join(".astra");
         std::fs::create_dir_all(&mo).unwrap();
         std::fs::write(
             mo.join("stop-hooks.yaml"),
@@ -362,7 +362,7 @@ hooks:
     #[test]
     fn plan_subtask_uses_task_completed_phase() {
         let dir = tempdir().unwrap();
-        let mo = dir.path().join(".mo-agent");
+        let mo = dir.path().join(".astra");
         std::fs::create_dir_all(&mo).unwrap();
         std::fs::write(
             mo.join("stop-hooks.yaml"),

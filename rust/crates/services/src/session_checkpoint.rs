@@ -2,7 +2,7 @@
 //!
 //! A checkpoint captures a summary of the session state at a specific turn.
 //! Checkpoints are stored as individual files in the session directory:
-//! `~/.mo-agent/sessions/<session_id>/checkpoints/<number>-<slug>.md`
+//! `~/.astra/sessions/<session_id>/checkpoints/<number>-<slug>.md`
 //!
 //! Checkpoints enable:
 //! - Quick overview of session progress without reading JSONL
@@ -215,7 +215,7 @@ mod tests {
         let session_id = "test-cp-1";
         let dir = tmp
             .path()
-            .join(".mo-agent")
+            .join(".astra")
             .join("sessions")
             .join(session_id)
             .join("checkpoints");

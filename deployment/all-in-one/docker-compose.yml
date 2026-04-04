@@ -1,4 +1,4 @@
-# mo-agent-engine -- All-in-One Docker Compose
+# astra-engine -- All-in-One Docker Compose
 #
 # Default profile: infrastructure only (MatrixOne + Redis)
 # App profile: adds init + api
@@ -76,7 +76,7 @@ services:
     hostname: api
     profiles:
       - app
-    command: ["mo-agent-server"]
+    command: ["astra-server"]
     ports:
       - "${API_PORT:-8000}:8000"
     environment:

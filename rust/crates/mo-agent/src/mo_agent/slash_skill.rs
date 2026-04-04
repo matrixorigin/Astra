@@ -64,7 +64,7 @@ pub(super) async fn handle_skill_command(
             }
             let skills_base = std::env::current_dir()
                 .map_err(|e| e.to_string())?
-                .join(".mo-agent/skills");
+                .join(".astra/skills");
             let skill_dir = skills_base.join(name);
             if skill_dir.exists() {
                 eprintln!(
@@ -181,7 +181,7 @@ if __name__ == "__main__":
                 eprintln!("  Running local skill tests...");
                 let skill_dir = std::env::current_dir()
                     .map_err(|e| e.to_string())?
-                    .join(".mo-agent/skills")
+                    .join(".astra/skills")
                     .join(name);
                 let test_file = skill_dir.join("test_skill.py");
                 if test_file.exists() {
@@ -259,7 +259,7 @@ if __name__ == "__main__":
             }
             let skill_dir = std::env::current_dir()
                 .map_err(|e| e.to_string())?
-                .join(".mo-agent/skills")
+                .join(".astra/skills")
                 .join(name);
             let skill_py_path = skill_dir.join("skill.py");
             if !skill_py_path.exists() {
@@ -354,11 +354,11 @@ if __name__ == "__main__":
                 // Scan local skill directories
                 let skills_base = std::env::current_dir()
                     .map_err(|e| e.to_string())?
-                    .join(".mo-agent/skills");
+                    .join(".astra/skills");
                 if !skills_base.exists() {
                     eprintln!(
                         "  {}",
-                        "No local skills found (.mo-agent/skills/ does not exist).".dim()
+                        "No local skills found (.astra/skills/ does not exist).".dim()
                     );
                     return Ok(());
                 }
@@ -419,7 +419,7 @@ if __name__ == "__main__":
             }
             let skill_dir = std::env::current_dir()
                 .map_err(|e| e.to_string())?
-                .join(".mo-agent/skills")
+                .join(".astra/skills")
                 .join(name);
             let skill_py_path = skill_dir.join("skill.py");
             if !skill_py_path.exists() {
@@ -467,7 +467,7 @@ if __name__ == "__main__":
             }
             let skill_dir = std::env::current_dir()
                 .map_err(|e| e.to_string())?
-                .join(".mo-agent/skills")
+                .join(".astra/skills")
                 .join(name);
             let json_path = skill_dir.join("skill.json");
             if !json_path.exists() {

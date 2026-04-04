@@ -103,7 +103,7 @@ impl Helper for AdminHelper {}
 pub(crate) async fn run_interactive(api: &ThinClient, profile: Option<&str>) -> Result<(), String> {
     let history_path = dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
-        .join(".mo-agent")
+        .join(".astra")
         .join("admin_history");
     if let Some(parent) = history_path.parent() {
         let _ = fs::create_dir_all(parent);
@@ -123,13 +123,13 @@ pub(crate) async fn run_interactive(api: &ThinClient, profile: Option<&str>) -> 
     eprintln!();
     eprintln!(
         "{}",
-        "mo-admin interactive mode  (type help for commands, Ctrl+D to exit)".dim()
+        "astra-admin interactive mode  (type help for commands, Ctrl+D to exit)".dim()
     );
     eprintln!();
 
     loop {
         let readline_result = tokio::task::block_in_place(|| {
-            editor.readline(&format!("{} ", "mo-admin❯".yellow().bold()))
+            editor.readline(&format!("{} ", "astra-admin❯".yellow().bold()))
         });
 
         let line = match readline_result {

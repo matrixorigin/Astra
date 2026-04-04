@@ -1,8 +1,8 @@
 use clap::{Args, Parser, Subcommand};
 
 #[derive(Parser, Debug)]
-#[command(name = "mo-admin")]
-#[command(about = "Admin CLI — run `mo-admin` for interactive mode")]
+#[command(name = "astra-admin")]
+#[command(about = "Admin CLI — run `astra-admin` for interactive mode")]
 pub(crate) struct Cli {
     #[arg(long, default_value = "http://127.0.0.1:8000")]
     pub api_url: String,
@@ -234,25 +234,25 @@ mod tests {
 
     #[test]
     fn parse_login_command() {
-        let cli = Cli::try_parse_from(["mo-admin", "login"]).unwrap();
+        let cli = Cli::try_parse_from(["astra-admin", "login"]).unwrap();
         assert!(matches!(cli.command, Some(Command::Login(_))));
     }
 
     #[test]
     fn parse_init_command() {
-        let cli = Cli::try_parse_from(["mo-admin", "init"]).unwrap();
+        let cli = Cli::try_parse_from(["astra-admin", "init"]).unwrap();
         assert!(matches!(cli.command, Some(Command::Init)));
     }
 
     #[test]
     fn parse_model_list() {
-        let cli = Cli::try_parse_from(["mo-admin", "model", "list"]).unwrap();
+        let cli = Cli::try_parse_from(["astra-admin", "model", "list"]).unwrap();
         assert!(matches!(cli.command, Some(Command::Model(ModelCmd::List))));
     }
 
     #[test]
     fn parse_audit_with_limit() {
-        let cli = Cli::try_parse_from(["mo-admin", "audit", "--limit", "50"]).unwrap();
+        let cli = Cli::try_parse_from(["astra-admin", "audit", "--limit", "50"]).unwrap();
         if let Some(Command::Audit(args)) = cli.command {
             assert_eq!(args.limit, 50);
         } else {
@@ -262,20 +262,21 @@ mod tests {
 
     #[test]
     fn parse_profile_flag() {
-        let cli = Cli::try_parse_from(["mo-admin", "--profile", "staging", "init"]).unwrap();
+        let cli = Cli::try_parse_from(["astra-admin", "--profile", "staging", "init"]).unwrap();
         assert_eq!(cli.profile.as_deref(), Some("staging"));
     }
 
     #[test]
     fn parse_api_url_flag() {
-        let cli = Cli::try_parse_from(["mo-admin", "--api-url", "http://localhost:9000", "init"])
-            .unwrap();
+        let cli =
+            Cli::try_parse_from(["astra-admin", "--api-url", "http://localhost:9000", "init"])
+                .unwrap();
         assert_eq!(cli.api_url, "http://localhost:9000");
     }
 
     #[test]
     fn default_api_url() {
-        let cli = Cli::try_parse_from(["mo-admin", "init"]).unwrap();
+        let cli = Cli::try_parse_from(["astra-admin", "init"]).unwrap();
         assert_eq!(cli.api_url, "http://127.0.0.1:8000");
     }
 }

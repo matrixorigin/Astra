@@ -2,12 +2,12 @@
 //!
 //! Allows customization of how the agent formats its responses.
 //! Supports built-in styles (default, explanatory, concise) and
-//! user-defined styles via markdown files in `~/.mo-agent/output-styles/`.
+//! user-defined styles via markdown files in `~/.astra/output-styles/`.
 //!
 //! # Usage
 //!
 //! Set `MO_OUTPUT_STYLE=concise` environment variable, or create a custom
-//! style file at `~/.mo-agent/output-styles/my-style.md`.
+//! style file at `~/.astra/output-styles/my-style.md`.
 
 use std::collections::HashMap;
 use std::env;
@@ -35,9 +35,9 @@ pub struct OutputStyle {
 pub enum StyleSource {
     /// Built into the runtime
     BuiltIn,
-    /// Loaded from user's config directory (~/.mo-agent/output-styles/)
+    /// Loaded from user's config directory (~/.astra/output-styles/)
     User,
-    /// Loaded from project directory (.mo-agent/output-styles/)
+    /// Loaded from project directory (.astra/output-styles/)
     Project,
 }
 
@@ -205,17 +205,17 @@ fn parse_style_file(content: &str) -> (String, String) {
     ("Custom output style".to_string(), content.to_string())
 }
 
-/// Get the user's output styles directory (~/.mo-agent/output-styles/).
+/// Get the user's output styles directory (~/.astra/output-styles/).
 fn user_styles_dir() -> PathBuf {
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
-        .join(".mo-agent")
+        .join(".astra")
         .join("output-styles")
 }
 
-/// Get the project's output styles directory (.mo-agent/output-styles/).
+/// Get the project's output styles directory (.astra/output-styles/).
 fn project_styles_dir() -> PathBuf {
-    PathBuf::from(".mo-agent").join("output-styles")
+    PathBuf::from(".astra").join("output-styles")
 }
 
 // ── Global Style Registry ───────────────────────────────────────────────────
@@ -227,8 +227,8 @@ static STYLE_REGISTRY: OnceLock<HashMap<String, OutputStyle>> = OnceLock::new();
 ///
 /// Loads styles in priority order (lowest to highest):
 /// 1. Built-in styles
-/// 2. User styles (~/.mo-agent/output-styles/)
-/// 3. Project styles (.mo-agent/output-styles/)
+/// 2. User styles (~/.astra/output-styles/)
+/// 3. Project styles (.astra/output-styles/)
 ///
 /// Higher priority styles override lower ones with the same name.
 pub fn get_style_registry() -> &'static HashMap<String, OutputStyle> {

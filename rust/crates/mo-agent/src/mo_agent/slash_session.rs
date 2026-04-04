@@ -797,7 +797,7 @@ pub(super) fn handle_session_command(arg: &str, state: &mut ReplState) {
                 eprintln!("{}", "  No journal files yet.".dim());
                 eprintln!(
                     "  {}",
-                    "Chat once to create a session, or check ~/.mo-agent/sessions.".dim()
+                    "Chat once to create a session, or check ~/.astra/sessions.".dim()
                 );
             }
             Ok(sessions) => {

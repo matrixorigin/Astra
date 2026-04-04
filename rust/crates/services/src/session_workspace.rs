@@ -1,7 +1,7 @@
 //! Session workspace metadata — describes a session's runtime context.
 //!
 //! Written once on session start and updated per-turn with cumulative stats.
-//! Stored at `~/.mo-agent/sessions/<session_id>/workspace.yaml`.
+//! Stored at `~/.astra/sessions/<session_id>/workspace.yaml`.
 //!
 //! This provides:
 //! - Quick session identification without parsing the JSONL journal
@@ -252,7 +252,7 @@ pub fn read_workspace(session_id: &str) -> std::io::Result<WorkspaceMetadata> {
 fn workspace_dir(session_id: &str) -> PathBuf {
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
-        .join(".mo-agent")
+        .join(".astra")
         .join("sessions")
         .join(session_id)
 }
@@ -375,11 +375,7 @@ mod tests {
     fn write_read_workspace_file() {
         let tmp = tempfile::tempdir().unwrap();
         let session_id = "test-ws-1";
-        let dir = tmp
-            .path()
-            .join(".mo-agent")
-            .join("sessions")
-            .join(session_id);
+        let dir = tmp.path().join(".astra").join("sessions").join(session_id);
         std::fs::create_dir_all(&dir).unwrap();
 
         let mut ws = WorkspaceMetadata::with_context(session_id, "claude", "/tmp", None);

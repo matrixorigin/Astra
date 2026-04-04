@@ -1,10 +1,10 @@
 //! Step checkpoint persistence — write/read StepCheckpoint JSON to local filesystem.
 //!
 //! Stores checkpoints at:
-//! `~/.mo-agent/sessions/<session_id>/step_checkpoints/<number>-<tier>.json`
+//! `~/.astra/sessions/<session_id>/step_checkpoints/<number>-<tier>.json`
 //!
 //! Also provides a file-backed StepEventStore that writes events as JSONL:
-//! `~/.mo-agent/sessions/<session_id>/step_events.jsonl`
+//! `~/.astra/sessions/<session_id>/step_events.jsonl`
 //!
 //! Light checkpoints (~1KB) written after each tool completion.
 //! Heavy checkpoints (~10-100KB) written after each turn's verdict.
@@ -26,7 +26,7 @@ const MAX_LIGHT_CHECKPOINTS: usize = 50;
 fn checkpoint_dir_for(session_id: &str) -> PathBuf {
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
-        .join(".mo-agent")
+        .join(".astra")
         .join("sessions")
         .join(session_id)
         .join(STEP_CHECKPOINT_DIR)
@@ -229,7 +229,7 @@ fn events_path_for(session_id: &str) -> PathBuf {
 fn session_dir_for(session_id: &str) -> PathBuf {
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
-        .join(".mo-agent")
+        .join(".astra")
         .join("sessions")
         .join(session_id)
 }

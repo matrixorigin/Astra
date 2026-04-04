@@ -4,7 +4,7 @@ metadata:
   name: {{ .Release.Name }}-api
   namespace: {{ .Values.namespace }}
   labels:
-    app: mo-agent
+    app: astra
     component: api
 spec:
   type: ClusterIP
@@ -14,7 +14,7 @@ spec:
     protocol: TCP
     name: http
   selector:
-    app: mo-agent
+    app: astra
     component: api
 ---
 {{- if .Values.modelServer.enabled }}
@@ -30,7 +30,7 @@ spec:
     targetPort: {{ .Values.modelServer.port }}
     name: http
   selector:
-    app: mo-agent
+    app: astra
     component: model-server
 {{- end }}
 ---
@@ -47,7 +47,7 @@ spec:
     targetPort: {{ .Values.matrixone.port }}
     name: mysql
   selector:
-    app: mo-agent
+    app: astra
     component: matrixone
 {{- end }}
 ---
@@ -64,6 +64,6 @@ spec:
     targetPort: {{ .Values.redis.port }}
     name: redis
   selector:
-    app: mo-agent
+    app: astra
     component: redis
 {{- end }}

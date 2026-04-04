@@ -1,4 +1,4 @@
-# mo-agent-engine
+# astra-engine
 
 Rust-first agent platform for auditable chat runs, session history, replay, skills, admin operations, and MatrixOne-backed state.
 
@@ -80,22 +80,22 @@ The Rust contract tests live under `rust/crates/runtime/tests/`.
 
 ## CLI Examples
 
-### `mo-agent`
+### `astra`
 
 ```bash
-mo-agent login
-mo-agent chat -m "帮我分析这个仓库"
-mo-agent session list --limit 20
-mo-agent health
+astra login
+astra chat -m "帮我分析这个仓库"
+astra session list --limit 20
+astra health
 ```
 
-### `mo-admin`
+### `astra-admin`
 
 ```bash
-mo-admin login
-mo-admin init
-mo-admin model list
-mo-admin audit --limit 20
+astra-admin login
+astra-admin init
+astra-admin model list
+astra-admin audit --limit 20
 ```
 
 ## Repository Layout

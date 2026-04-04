@@ -255,7 +255,7 @@ mod tests {
     #[test]
     fn plan_subtask_ignores_when_stop_uses_task_completed() {
         let dir = tempdir().unwrap();
-        let mo = dir.path().join(".mo-agent");
+        let mo = dir.path().join(".astra");
         std::fs::create_dir_all(&mo).unwrap();
         std::fs::write(
             mo.join("stop-hooks.yaml"),
@@ -280,7 +280,7 @@ hooks:
     #[test]
     fn plan_subtask_empty_without_task_completed_hooks() {
         let dir = tempdir().unwrap();
-        let mo = dir.path().join(".mo-agent");
+        let mo = dir.path().join(".astra");
         std::fs::create_dir_all(&mo).unwrap();
         std::fs::write(
             mo.join("stop-hooks.yaml"),
@@ -295,7 +295,7 @@ hooks:
     #[test]
     fn teammate_idle_hooks_loaded_alongside_stop() {
         let dir = tempdir().unwrap();
-        let mo = dir.path().join(".mo-agent");
+        let mo = dir.path().join(".astra");
         std::fs::create_dir_all(&mo).unwrap();
         std::fs::write(
             mo.join("stop-hooks.yaml"),
@@ -324,7 +324,7 @@ hooks:
     #[test]
     fn declarative_stop_hooks_apply_on_read_only_turn() {
         let dir = tempdir().unwrap();
-        let mo = dir.path().join(".mo-agent");
+        let mo = dir.path().join(".astra");
         std::fs::create_dir_all(&mo).unwrap();
         std::fs::write(
             mo.join("stop-hooks.yaml"),

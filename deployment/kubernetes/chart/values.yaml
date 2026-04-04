@@ -2,7 +2,7 @@
 api:
   replicas: 2
   image:
-    repository: mo-agent-engine
+    repository: astra-engine
     tag: latest
     pullPolicy: IfNotPresent
   port: 8000
@@ -65,7 +65,7 @@ modelServer:
   enabled: false
   replicas: 1
   image:
-    repository: mo-agent-engine
+    repository: astra-engine
     tag: infer
   port: 9527
   resources:
@@ -83,7 +83,7 @@ modelServer:
 skillWorker:
   enabled: false
   image:
-    repository: mo-agent-engine
+    repository: astra-engine
     tag: train-gpu
   gpu:
     enabled: false
@@ -129,7 +129,7 @@ ray:
 ingress:
   enabled: false
   className: nginx
-  host: mo-agent.example.com
+  host: astra.example.com
   tls:
     enabled: false
     secretName: mo-agent-tls

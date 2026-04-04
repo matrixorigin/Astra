@@ -1,4 +1,4 @@
-# mo-agent Production Docker Compose
+# astra Production Docker Compose
 #
 # Production-ready configuration with:
 # - Resource limits
@@ -88,7 +88,7 @@ services:
     build:
       context: ../..
       dockerfile: Dockerfile
-    image: mo-agent:${VERSION:-latest}
+    image: astra:${VERSION:-latest}
     environment:
       # Database
       - MATRIXONE_HOST=matrixone

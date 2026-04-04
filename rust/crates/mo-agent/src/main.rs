@@ -128,8 +128,8 @@ use slash_state::{StateCommandContext, handle_state_command};
 // ══════════════════════════════════════════════════════════════════════ CLI ══
 
 #[derive(Parser, Debug)]
-#[command(name = "mo-agent")]
-#[command(about = "AI agent CLI — run `mo-agent` for interactive chat")]
+#[command(name = "astra")]
+#[command(about = "AI agent CLI — run `astra` for interactive chat")]
 struct Cli {
     #[arg(long, default_value = "http://127.0.0.1:8000")]
     api_url: String,
@@ -5078,7 +5078,7 @@ mod tests {
             .unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Set credentials dir to a temp path so tests don't pollute ~/.mo-agent/credentials.json.
+    /// Set credentials dir to a temp path so tests don't pollute ~/.astra/credentials.json.
     /// Returns a guard that holds a mutex — tests using this are serialized.
     fn isolate_credentials() -> CredentialsGuard {
         let lock = creds_lock();
@@ -5778,7 +5778,7 @@ mod tests {
         // 2. Create workspace.yaml (required for local restore)
         let ws_dir = dirs::home_dir()
             .unwrap_or_else(|| std::path::PathBuf::from("."))
-            .join(".mo-agent")
+            .join(".astra")
             .join("sessions")
             .join(&sid);
         std::fs::create_dir_all(&ws_dir).unwrap();
@@ -5936,7 +5936,7 @@ total_tokens_out: 3
         // Create malformed workspace.yaml
         let ws_dir = dirs::home_dir()
             .unwrap_or_else(|| std::path::PathBuf::from("."))
-            .join(".mo-agent")
+            .join(".astra")
             .join("sessions")
             .join(&sid);
         std::fs::create_dir_all(&ws_dir).unwrap();
@@ -6056,7 +6056,7 @@ total_tokens_out: 3
         // Create workspace
         let ws_dir = dirs::home_dir()
             .unwrap_or_else(|| std::path::PathBuf::from("."))
-            .join(".mo-agent")
+            .join(".astra")
             .join("sessions")
             .join(&sid);
         std::fs::create_dir_all(&ws_dir).unwrap();

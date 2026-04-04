@@ -1,10 +1,10 @@
 [package]
-name = "mo-admin-cli"
+name = "astra-admin-cli"
 version.workspace = true
 edition.workspace = true
 
 [[bin]]
-name = "mo-admin"
+name = "astra-admin"
 path = "src/main.rs"
 
 [dependencies]

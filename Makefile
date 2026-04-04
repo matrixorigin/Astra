@@ -1,8 +1,8 @@
-# mo-agent-engine Makefile
+# astra-engine Makefile
 
 .PHONY: help
 help:
-	@echo "mo-agent-engine Development Commands"
+	@echo "astra-engine Development Commands"
 	@echo "=================================="
 	@echo ""
 	@echo "Quick Start:"
@@ -40,10 +40,10 @@ help:
 	@echo "Build:"
 	@echo "  make build              - Build entire Rust workspace (debug)"
 	@echo "  make build-release      - Build entire Rust workspace (release)"
-	@echo "  make build-server       - Build mo-agent-server (debug)"
-	@echo "  make build-server-release - Build mo-agent-server (release)"
-	@echo "  make build-cli          - Build mo-agent + mo-admin (debug)"
-	@echo "  make build-cli-release  - Build mo-agent + mo-admin (release)"
+	@echo "  make build-server       - Build astra-server (debug)"
+	@echo "  make build-server-release - Build astra-server (release)"
+	@echo "  make build-cli          - Build astra + astra-admin (debug)"
+	@echo "  make build-cli-release  - Build astra + astra-admin (release)"
 	@echo ""
 	@echo "Cleanup:"
 	@echo "  make clean              - Remove Rust build artifacts (target/)"
@@ -71,8 +71,8 @@ API_SHELL_PKG := -p mo-agent-runtime
 RUST_TARGET_DIR := rust/target
 RUST_DEBUG_BIN_DIR := $(RUST_TARGET_DIR)/debug
 RUST_RELEASE_BIN_DIR := $(RUST_TARGET_DIR)/release
-API_SERVER_BIN := mo-agent-server
-CLI_BINS := mo-agent mo-admin
+API_SERVER_BIN := astra-server
+CLI_BINS := astra astra-admin
 
 # ============================================================================
 # Environment Setup
@@ -88,7 +88,7 @@ dev-init: setup install-dev-deps
 
 .PHONY: setup
 setup:
-	@echo "Setting up mo-agent-engine development environment..."
+	@echo "Setting up astra-engine development environment..."
 	@if [ ! -f .env ]; then \
 		cp .env.example .env; \
 		echo "✅ Created .env file (please review and customize)"; \
@@ -280,9 +280,9 @@ dev-start: dev-deps-up dev-deps-wait dev-api-start
 	@echo "   API: http://localhost:8000"
 	@echo ""
 	@echo "Next steps:"
-	@echo "  mo-agent register"
-	@echo "  mo-agent login"
-	@echo "  mo-agent chat"
+	@echo "  astra register"
+	@echo "  astra login"
+	@echo "  astra chat"
 
 .PHONY: dev-start-docker
 dev-start-docker: dev-deps-up dev-deps-wait dev-api-docker-up
@@ -338,27 +338,27 @@ build-release:
 
 .PHONY: build-cli
 build-cli:
-	@echo "Building mo-agent + mo-admin (debug)..."
-	@$(CARGO) build $(CARGO_MANIFEST_FLAG) -p mo-agent-cli -p mo-admin-cli
+	@echo "Building astra + astra-admin (debug)..."
+	@$(CARGO) build $(CARGO_MANIFEST_FLAG) -p astra-cli -p astra-admin-cli
 	@echo "Binaries:"
 	@for bin in $(CLI_BINS); do echo "  $(RUST_DEBUG_BIN_DIR)/$$bin"; done
 
 .PHONY: build-cli-release
 build-cli-release:
-	@echo "Building mo-agent + mo-admin (release)..."
-	@$(CARGO) build $(CARGO_MANIFEST_FLAG) -p mo-agent-cli -p mo-admin-cli --release
+	@echo "Building astra + astra-admin (release)..."
+	@$(CARGO) build $(CARGO_MANIFEST_FLAG) -p astra-cli -p astra-admin-cli --release
 	@echo "Binaries:"
 	@for bin in $(CLI_BINS); do echo "  $(RUST_RELEASE_BIN_DIR)/$$bin"; done
 
 .PHONY: build-server
 build-server:
-	@echo "Building mo-agent-server (debug)..."
+	@echo "Building astra-server (debug)..."
 	@$(CARGO) build $(CARGO_MANIFEST_FLAG) $(API_SHELL_PKG) --bin $(API_SERVER_BIN)
 	@echo "Binary: $(RUST_DEBUG_BIN_DIR)/$(API_SERVER_BIN)"
 
 .PHONY: build-server-release
 build-server-release:
-	@echo "Building mo-agent-server (release)..."
+	@echo "Building astra-server (release)..."
 	@$(CARGO) build $(CARGO_MANIFEST_FLAG) $(API_SHELL_PKG) --release --bin $(API_SERVER_BIN)
 	@echo "Binary: $(RUST_RELEASE_BIN_DIR)/$(API_SERVER_BIN)"
 

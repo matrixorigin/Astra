@@ -1,7 +1,7 @@
 //! Cross-session persistence for pipeline learning modules.
 //!
 //! Serializes EntityGraph, PatternLibrary, and ProgressiveCalibrator
-//! into a single JSON file at `~/.mo-agent/learning/<profile>.json`.
+//! into a single JSON file at `~/.astra/learning/<profile>.json`.
 //! On session start, loads and merges prior knowledge; on session end, saves.
 //!
 //! # Design
@@ -136,7 +136,7 @@ impl Default for LearningSnapshot {
 pub fn learning_dir() -> PathBuf {
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
-        .join(".mo-agent")
+        .join(".astra")
         .join("learning")
 }
 

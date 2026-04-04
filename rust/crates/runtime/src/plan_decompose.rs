@@ -1277,7 +1277,7 @@ impl PlanModeState {
     pub fn state_path() -> std::path::PathBuf {
         let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
         std::path::PathBuf::from(home)
-            .join(".mo-agent")
+            .join(".astra")
             .join("plan_state.json")
     }
 
@@ -1290,9 +1290,7 @@ impl PlanModeState {
     /// Directory for storing all plans.
     pub fn plans_dir() -> std::path::PathBuf {
         let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-        std::path::PathBuf::from(home)
-            .join(".mo-agent")
-            .join("plans")
+        std::path::PathBuf::from(home).join(".astra").join("plans")
     }
 
     /// Generate a unique plan ID from the goal.
@@ -3393,7 +3391,7 @@ pub fn instantiate_template(name: &str, goal: &str) -> Option<TaskPlan> {
 /// List all saved plan state files.
 pub fn list_saved_plans() -> Vec<SavedPlanInfo> {
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    let plans_dir = std::path::PathBuf::from(&home).join(".mo-agent");
+    let plans_dir = std::path::PathBuf::from(&home).join(".astra");
 
     let mut result = Vec::new();
 

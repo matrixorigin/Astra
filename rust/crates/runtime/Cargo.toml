@@ -14,7 +14,7 @@ path = "tests/chat_turn_bridge_ledger_inject_e2e.rs"
 required-features = ["bridge-e2e-hooks"]
 
 [[bin]]
-name = "mo-agent-server"
+name = "astra-server"
 path = "src/main.rs"
 
 [dependencies]

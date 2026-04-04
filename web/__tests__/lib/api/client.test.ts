@@ -16,9 +16,9 @@ jest.mock('@/lib/runtime-config', () => ({
     () => 'Use the Settings page to configure the runtime API URL and login token, or enable demo mode.',
   ),
   DEFAULT_API_URL: 'http://localhost:8000',
-  ACCESS_TOKEN_COOKIE: 'mo_agent_access_token',
-  REFRESH_TOKEN_COOKIE: 'mo_agent_refresh_token',
-  API_URL_COOKIE: 'mo_agent_api_url',
+  ACCESS_TOKEN_COOKIE: 'astra_access_token',
+  REFRESH_TOKEN_COOKIE: 'astra_refresh_token',
+  API_URL_COOKIE: 'astra_api_url',
 }));
 
 import { apiFetch, tryApiFetch, apiPost } from '@/lib/api/client';
@@ -149,8 +149,8 @@ describe('API client', () => {
       // Need to have the cookie store return the refresh token
       const nextHeaders = jest.requireMock('next/headers');
       nextHeaders.__mockCookieStore.get.mockImplementation((name: string) => {
-        if (name === 'mo_agent_refresh_token') return { value: 'refresh-token-val' };
-        if (name === 'mo_agent_api_url') return { value: 'http://api.test:8000' };
+        if (name === 'astra_refresh_token') return { value: 'refresh-token-val' };
+        if (name === 'astra_api_url') return { value: 'http://api.test:8000' };
         return undefined;
       });
 

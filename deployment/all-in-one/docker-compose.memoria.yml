@@ -1,4 +1,4 @@
-# mo-agent-engine with Memoria backend
+# astra-engine with Memoria backend
 #
 # Usage:
 #   docker-compose -f docker-compose.memoria.yml up -d
@@ -108,7 +108,7 @@ services:
     build:
       context: ../..
     hostname: api
-    command: ["mo-agent-server"]
+    command: ["astra-server"]
     ports:
       - "${API_PORT:-8000}:8000"
     environment:

@@ -1258,7 +1258,7 @@ mod tests {
     #[test]
     fn build_initial_state_loads_stop_hooks_from_edge_profile_cwd() {
         let dir = tempfile::tempdir().unwrap();
-        let mo = dir.path().join(".mo-agent");
+        let mo = dir.path().join(".astra");
         std::fs::create_dir_all(&mo).unwrap();
         std::fs::write(
             mo.join("stop-hooks.yaml"),

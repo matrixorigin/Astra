@@ -4,18 +4,18 @@ metadata:
   name: {{ .Release.Name }}-api
   namespace: {{ .Values.namespace }}
   labels:
-    app: mo-agent
+    app: astra
     component: api
 spec:
   replicas: {{ .Values.api.replicas }}
   selector:
     matchLabels:
-      app: mo-agent
+      app: astra
       component: api
   template:
     metadata:
       labels:
-        app: mo-agent
+        app: astra
         component: api
     spec:
       {{- with .Values.imagePullSecrets }}
@@ -26,7 +26,7 @@ spec:
       - name: api
         image: "{{ .Values.api.image.repository }}:{{ .Values.api.image.tag }}"
         imagePullPolicy: {{ .Values.api.image.pullPolicy }}
-        command: ["mo-agent-server"]
+        command: ["astra-server"]
         ports:
         - containerPort: {{ .Values.api.port }}
           name: http

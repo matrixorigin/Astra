@@ -1527,7 +1527,7 @@ impl Validator for ReplHelper {
 pub(super) fn history_path() -> PathBuf {
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
-        .join(".mo-agent")
+        .join(".astra")
         .join("history")
 }
 

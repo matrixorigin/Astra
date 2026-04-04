@@ -2,7 +2,7 @@
 # mo-agent installer — installs via pipx, uv, or pip
 set -euo pipefail
 
-PACKAGE="mo-agent-engine"
+PACKAGE="astra-engine"
 MIN_PYTHON="3.11"
 BOLD='\033[1m'
 GREEN='\033[0;32m'
@@ -74,6 +74,6 @@ echo ""
 echo -e "${GREEN}${BOLD}✓ Installation complete!${NC}"
 echo ""
 echo "  Get started:"
-echo -e "    ${BOLD}mo-agent login${NC}"
-echo -e "    ${BOLD}mo-agent chat${NC}"
+echo -e "    ${BOLD}astra login${NC}"
+echo -e "    ${BOLD}astra chat${NC}"
 echo ""

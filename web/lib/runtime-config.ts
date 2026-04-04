@@ -1,9 +1,9 @@
 import { cookies } from 'next/headers';
 
-export const API_URL_COOKIE = 'mo_agent_api_url';
-export const ACCESS_TOKEN_COOKIE = 'mo_agent_access_token';
-export const REFRESH_TOKEN_COOKIE = 'mo_agent_refresh_token';
-export const DEMO_MODE_COOKIE = 'mo_agent_demo_mode';
+export const API_URL_COOKIE = 'astra_api_url';
+export const ACCESS_TOKEN_COOKIE = 'astra_access_token';
+export const REFRESH_TOKEN_COOKIE = 'astra_refresh_token';
+export const DEMO_MODE_COOKIE = 'astra_demo_mode';
 
 export type WebDataMode = 'live' | 'demo' | 'unconfigured';
 
@@ -61,11 +61,11 @@ export async function getRuntimeConfig(): Promise<RuntimeConfig> {
   }
 
   // Resolve API URL: cookie > env > default
-  const apiUrl = cookieApiUrl ?? process.env.MO_AGENT_API_URL ?? DEFAULT_API_URL;
-  const accessToken = cookieAccessToken ?? process.env.MO_AGENT_ACCESS_TOKEN;
+  const apiUrl = cookieApiUrl ?? process.env.ASTRA_API_URL ?? DEFAULT_API_URL;
+  const accessToken = cookieAccessToken ?? process.env.ASTRA_ACCESS_TOKEN;
   const refreshToken = cookieRefreshToken;
 
-  const envDemo = process.env.MO_AGENT_WEB_DEMO === 'true';
+  const envDemo = process.env.ASTRA_WEB_DEMO === 'true';
   if (envDemo) {
     return {
       mode: 'demo',
@@ -84,7 +84,7 @@ export async function getRuntimeConfig(): Promise<RuntimeConfig> {
   // Live mode: API URL is always available (defaults to localhost:8000)
   const source: 'cookie' | 'env' | 'none' = cookieApiUrl
     ? 'cookie'
-    : process.env.MO_AGENT_API_URL
+    : process.env.ASTRA_API_URL
       ? 'env'
       : 'none';
 

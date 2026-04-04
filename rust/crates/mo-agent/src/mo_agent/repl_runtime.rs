@@ -93,7 +93,7 @@ fn create_tool_selector_with_quality_internal(
     let skills_paths = [
         std::path::PathBuf::from("skills"),
         dirs::home_dir()
-            .map(|h| h.join(".mo-agent").join("skills"))
+            .map(|h| h.join(".astra").join("skills"))
             .unwrap_or_default(),
     ];
     for skills_path in &skills_paths {
@@ -317,7 +317,7 @@ pub(super) fn initialize_repl_state(
     // Initialize local task service
     let tasks_dir = dirs::home_dir()
         .unwrap_or_else(|| std::path::PathBuf::from("."))
-        .join(".mo-agent")
+        .join(".astra")
         .join("tasks");
     state.task_service = Some(std::sync::Arc::new(
         mo_agent_services::LocalTaskService::new(tasks_dir),
