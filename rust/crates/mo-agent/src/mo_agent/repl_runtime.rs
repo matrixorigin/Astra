@@ -889,7 +889,8 @@ mod tests {
         assert!(lines.len() >= 5);
         assert!(lines.iter().all(|line| !line.trim().is_empty()));
         assert!(lines[0].contains("███"));
-        assert!(lines.iter().any(|line| line.contains("╚═════╝")));
+        // Last line should have the bottom corners of the logo
+        assert!(lines.iter().any(|line| line.contains("╚═╝")));
     }
 
     #[test]

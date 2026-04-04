@@ -136,6 +136,133 @@ pub fn shorten_path(path: &str, max_chars: usize) -> String {
     format!(".../{filename}")
 }
 
+/// Simple syntax highlighting for code preview.
+/// Highlights: line numbers (dim), keywords (blue), strings (green), comments (dim green).
+/// Works across multiple languages by using common keywords.
+pub fn highlight_code_line(line: &str) -> String {
+    use regex::Regex;
+
+    // Common keywords across languages
+    static KEYWORDS: &[&str] = &[
+        "fn",
+        "let",
+        "mut",
+        "const",
+        "pub",
+        "struct",
+        "enum",
+        "impl",
+        "trait",
+        "type",
+        "use",
+        "mod",
+        "if",
+        "else",
+        "match",
+        "for",
+        "while",
+        "loop",
+        "return",
+        "break",
+        "continue",
+        "async",
+        "await",
+        "self",
+        "Self", // Rust
+        "def",
+        "class",
+        "import",
+        "from",
+        "as",
+        "pass",
+        "None",
+        "True",
+        "False",
+        "with", // Python
+        "function",
+        "var",
+        "export",
+        "default",
+        "new",
+        "this",
+        "extends",
+        "interface", // JS/TS
+        "func",
+        "package",
+        "go",
+        "defer",
+        "chan",
+        "select",
+        "case", // Go
+        "void",
+        "int",
+        "char",
+        "float",
+        "double",
+        "bool",
+        "true",
+        "false",
+        "null",
+        "nullptr",
+        "static",
+        "final",
+        "public",
+        "private",
+        "protected", // C/Java
+    ];
+
+    // Check if line starts with line number (e.g., "420\t")
+    let (prefix, code) = if let Some(tab_pos) = line.find('\t') {
+        let num_part = &line[..tab_pos];
+        if num_part
+            .chars()
+            .all(|c| c.is_ascii_digit() || c.is_whitespace())
+        {
+            (format!("{}", num_part.dim()), &line[tab_pos..])
+        } else {
+            (String::new(), line)
+        }
+    } else {
+        (String::new(), line)
+    };
+
+    // Detect comment start
+    let comment_start = code.find("//").or_else(|| {
+        code.find('#').filter(|&pos| {
+            // Python/shell comments: # not inside string
+            pos == 0 || code[..pos].matches('"').count() % 2 == 0
+        })
+    });
+
+    let (code_part, comment_part) = if let Some(pos) = comment_start {
+        (&code[..pos], Some(&code[pos..]))
+    } else {
+        (code, None)
+    };
+
+    // Build keyword regex
+    let keyword_pattern = KEYWORDS.join("|");
+    let keyword_re = Regex::new(&format!(r"\b({})\b", keyword_pattern)).unwrap();
+
+    // Highlight keywords in code part
+    let highlighted_code = keyword_re.replace_all(code_part, |caps: &regex::Captures| {
+        format!("{}", caps[1].cyan())
+    });
+
+    // Highlight strings (simple: "..." or '...')
+    let string_re = Regex::new(r#"("[^"]*"|'[^']*')"#).unwrap();
+    let highlighted_code = string_re.replace_all(&highlighted_code, |caps: &regex::Captures| {
+        format!("{}", caps[1].green())
+    });
+
+    // Combine parts
+    let comment_highlighted = comment_part
+        .map(|c| format!("{}", c.dim().green()))
+        .unwrap_or_default();
+
+    format!("{prefix}{highlighted_code}{comment_highlighted}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

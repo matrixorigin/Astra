@@ -22,7 +22,7 @@ use std::time::Instant;
 // CLI formatting utilities
 use super::cli_formatting::{
     colorize_diff_summary, extract_cli_diff_block, format_byte_size, format_duration_suffix,
-    shorten_path, truncate_line,
+    highlight_code_line, shorten_path, truncate_line,
 };
 
 // Effects module types
@@ -1169,11 +1169,16 @@ impl StreamRenderState {
                     ));
                 }
 
-                let mut parts: Vec<String> =
-                    content_lines.iter().map(|l| truncate_line(l, 65)).collect();
+                let mut parts: Vec<String> = content_lines
+                    .iter()
+                    .map(|l| {
+                        let truncated = truncate_line(l, 65);
+                        highlight_code_line(&truncated)
+                    })
+                    .collect();
                 let remaining = line_count.saturating_sub(content_lines.len());
                 if remaining > 0 {
-                    parts.push(format!("… +{remaining} more lines"));
+                    parts.push(format!("{}", format!("… +{remaining} more lines").dim()));
                 }
                 Some(parts.join("\n    "))
             }
