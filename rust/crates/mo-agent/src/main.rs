@@ -2480,14 +2480,18 @@ async fn plan_monitoring_loop(state: &mut ReplState) {
                             state.turn += 1;
                             state.current_plan_subtask_id = Some(subtask_id);
                         }
-                        PlanUpdate::PlanProgress { done, total, elapsed, .. } => {
+                        PlanUpdate::PlanProgress { done, total, elapsed, eta } => {
                             let pct = if total > 0 { done * 100 / total } else { 0 };
+                            let eta_str = eta
+                                .map(|d| format!(" — ETA ~{}", format_duration_short(d)))
+                                .unwrap_or_default();
                             eprintln!(
-                                "  📊 {}/{} ({}%) — {}",
+                                "  📊 {}/{} ({}%) — {}{}",
                                 done,
                                 total,
                                 pct,
                                 format_duration_short(elapsed).dim(),
+                                eta_str.dim(),
                             );
                         }
                         PlanUpdate::PlanCompleted { pct, elapsed } => {
@@ -2615,12 +2619,19 @@ fn display_plan_updates_live(
                 done,
                 total,
                 elapsed,
-                ..
+                eta,
             } => {
                 let pct = if total > 0 { done * 100 / total } else { 0 };
+                let eta_str = eta
+                    .map(|d| format!(" — ETA ~{}", format_duration_short(d)))
+                    .unwrap_or_default();
+                // Feed ETA into the active spinner so it shows elapsed/~ETA
+                if let Some(spinner) = plan_spinner.as_ref() {
+                    spinner.set_eta_secs(eta.map(|d| d.as_secs()).unwrap_or(0));
+                }
                 (
                     format!(
-                        "  📊 {done}/{total} ({pct}%) — {}",
+                        "  📊 {done}/{total} ({pct}%) — {}{eta_str}",
                         format_duration_short(elapsed),
                     ),
                     None,

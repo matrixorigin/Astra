@@ -1020,9 +1020,23 @@ async fn plan_executor_task(
                                 ctx.plan.progress_pct(),
                                 Some(elapsed),
                             );
-                            // Journal + cloud event
+                            // Emit PlanProgress with ETA estimate
                             let total = ctx.plan.subtasks.len();
                             let done = ctx.plan.items_done() as usize;
+                            let remaining = total.saturating_sub(done);
+                            let eta = if !subtask_durations.is_empty() && remaining > 0 {
+                                let avg: Duration = subtask_durations.iter().sum::<Duration>()
+                                    / subtask_durations.len() as u32;
+                                Some(avg * remaining as u32)
+                            } else {
+                                None
+                            };
+                            let _ = update_tx.send(PlanUpdate::PlanProgress {
+                                done,
+                                total,
+                                elapsed: plan_start.elapsed(),
+                                eta,
+                            });
                             let event = session_journal::JournalEvent::plan_progress(
                                 ctx.session_id.as_deref(),
                                 ctx.turn,
