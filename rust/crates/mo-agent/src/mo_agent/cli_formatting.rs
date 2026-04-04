@@ -28,22 +28,44 @@ pub fn extract_cli_diff_block(output: &str) -> Option<Cow<'_, str>> {
 }
 
 /// Colorize a unified diff into a compact summary with green +lines and red -lines.
+/// Shows context around changes for better understanding.
 pub fn colorize_diff_summary(diff: &str, max_lines: usize) -> String {
     let mut parts = Vec::new();
     let mut shown = 0usize;
     let mut total_add = 0usize;
     let mut total_del = 0usize;
+
+    // Extract the file path from diff header
+    let mut file_path: Option<&str> = None;
+    for line in diff.lines() {
+        if let Some(path) = line.strip_prefix("+++ b/") {
+            file_path = Some(path);
+            break;
+        }
+    }
+
+    // Add file header if found
+    if let Some(path) = file_path {
+        let short = shorten_path(path, 50);
+        parts.push(format!("{}", short.dim()));
+    }
+
     for line in diff.lines() {
         if line.starts_with('+') && !line.starts_with("+++ ") {
             total_add += 1;
             if shown < max_lines {
-                parts.push(format!("{}", truncate_line(line, 60).green()));
+                // Green + with highlighted code
+                let code = &line[1..]; // Skip the '+' prefix
+                let highlighted = highlight_code_line(code);
+                parts.push(format!("{}{}", "+".green(), highlighted));
                 shown += 1;
             }
         } else if line.starts_with('-') && !line.starts_with("--- ") {
             total_del += 1;
             if shown < max_lines {
-                parts.push(format!("{}", truncate_line(line, 60).red()));
+                // Red - with dimmed code (deleted)
+                let code = &line[1..]; // Skip the '-' prefix
+                parts.push(format!("{}{}", "-".red(), code.dim()));
                 shown += 1;
             }
         }
@@ -51,10 +73,12 @@ pub fn colorize_diff_summary(diff: &str, max_lines: usize) -> String {
     let remaining = (total_add + total_del).saturating_sub(max_lines);
     if remaining > 0 {
         parts.push(format!(
-            "… {} {} (+{total_add} -{total_del} total)",
-            format!("+{remaining}").dim(),
-            "more".dim(),
+            "{}",
+            format!("… +{remaining} more ({total_add}+ {total_del}-)").dim(),
         ));
+    } else if total_add > 0 || total_del > 0 {
+        // Show total counts on the last line
+        parts.push(format!("{}", format!("{total_add}+ {total_del}-").dim(),));
     }
     if parts.is_empty() {
         return String::new();
