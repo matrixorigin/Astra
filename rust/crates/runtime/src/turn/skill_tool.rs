@@ -131,17 +131,33 @@ pub fn is_skill_call(tool_call: &Value) -> bool {
 
 // ─── Skill execution ─────────────────────────────────────────────────────────
 
+/// Activation effects from a skill invocation.
+///
+/// Returned alongside tool results so the agentic loop can apply
+/// model overrides and tool restrictions to subsequent turns.
+#[derive(Clone, Debug, Default)]
+pub struct SkillActivation {
+    /// Model override for subsequent turns (e.g. `"claude-sonnet-4-20250514"`).
+    pub model_override: Option<String>,
+    /// Tool allow-list — only these tools should be available.
+    /// Empty means no restriction (all tools allowed).
+    pub allowed_tools: Vec<String>,
+}
+
 /// Partition tool calls into skill calls and regular calls, executing skills
 /// via the resolver.
 ///
-/// Returns `(skill_results, remaining_tool_calls)` where each skill result
-/// is `(tool_call_id, output_text)`.
+/// Returns `(skill_results, remaining_tool_calls, activation)` where:
+/// - `skill_results`: `(tool_call_id, output_text)` pairs
+/// - `remaining_tool_calls`: non-skill tool calls passed through
+/// - `activation`: optional model/tool overrides from the last skill invoked
 pub async fn partition_and_execute_skills(
     tool_calls: &[Value],
     resolver: &dyn SkillResolver,
-) -> (Vec<(String, String)>, Vec<Value>) {
+) -> (Vec<(String, String)>, Vec<Value>, Option<SkillActivation>) {
     let mut skill_results = Vec::new();
     let mut remaining = Vec::new();
+    let mut activation: Option<SkillActivation> = None;
 
     for tc in tool_calls {
         if !is_skill_call(tc) {
@@ -167,7 +183,11 @@ pub async fn partition_and_execute_skills(
 
                 let task_hint = args.get("task").and_then(Value::as_str).unwrap_or("");
 
-                execute_skill(resolver, skill_name, task_hint)
+                let (text, act) = execute_skill(resolver, skill_name, task_hint);
+                if let Some(a) = act {
+                    activation = Some(a);
+                }
+                text
             }
             Err(e) => format!("Invalid skill arguments: {e}"),
         };
@@ -175,11 +195,15 @@ pub async fn partition_and_execute_skills(
         skill_results.push((call_id, result));
     }
 
-    (skill_results, remaining)
+    (skill_results, remaining, activation)
 }
 
-/// Execute a single skill call and return the output text.
-fn execute_skill(resolver: &dyn SkillResolver, skill_name: &str, task_hint: &str) -> String {
+/// Execute a single skill call and return the output text + activation metadata.
+fn execute_skill(
+    resolver: &dyn SkillResolver,
+    skill_name: &str,
+    task_hint: &str,
+) -> (String, Option<SkillActivation>) {
     match resolver.resolve(skill_name) {
         Ok(skill) => {
             let mut output = format!(
@@ -202,9 +226,25 @@ fn execute_skill(resolver: &dyn SkillResolver, skill_name: &str, task_hint: &str
                 ));
             }
 
-            output
+            let activation = SkillActivation {
+                model_override: skill.model,
+                allowed_tools: skill.allowed_tools,
+            };
+
+            // Only return activation if it has any effects
+            let activation =
+                if activation.model_override.is_some() || !activation.allowed_tools.is_empty() {
+                    Some(activation)
+                } else {
+                    None
+                };
+
+            (output, activation)
         }
-        Err(e) => format!("Failed to load skill '{}': {}", skill_name, e),
+        Err(e) => (
+            format!("Failed to load skill '{}': {}", skill_name, e),
+            None,
+        ),
     }
 }
 
@@ -320,23 +360,26 @@ mod tests {
     #[test]
     fn execute_skill_returns_instructions() {
         let resolver = stub_resolver();
-        let output = execute_skill(&resolver, "code-review", "");
+        let (output, activation) = execute_skill(&resolver, "code-review", "");
         assert!(output.contains("# Skill: code-review"));
         assert!(output.contains("Check for bugs, security issues, and style."));
+        // No model/tools override in stub → no activation
+        assert!(activation.is_none());
     }
 
     #[test]
     fn execute_skill_includes_task_hint() {
         let resolver = stub_resolver();
-        let output = execute_skill(&resolver, "code-review", "Review auth module");
+        let (output, _) = execute_skill(&resolver, "code-review", "Review auth module");
         assert!(output.contains("**Task context:** Review auth module"));
     }
 
     #[test]
     fn execute_skill_unknown_name() {
         let resolver = stub_resolver();
-        let output = execute_skill(&resolver, "nonexistent", "");
+        let (output, activation) = execute_skill(&resolver, "nonexistent", "");
         assert!(output.contains("Failed to load skill 'nonexistent'"));
+        assert!(activation.is_none());
     }
 
     #[tokio::test]
@@ -366,7 +409,8 @@ mod tests {
             }),
         ];
 
-        let (skill_results, remaining) = partition_and_execute_skills(&tool_calls, &resolver).await;
+        let (skill_results, remaining, _activation) =
+            partition_and_execute_skills(&tool_calls, &resolver).await;
 
         assert_eq!(skill_results.len(), 2);
         assert_eq!(remaining.len(), 1);
@@ -391,7 +435,7 @@ mod tests {
             }
         })];
 
-        let (results, remaining) = partition_and_execute_skills(&tool_calls, &resolver).await;
+        let (results, remaining, _) = partition_and_execute_skills(&tool_calls, &resolver).await;
         assert_eq!(results.len(), 1);
         assert!(results[0].1.contains("Invalid skill arguments"));
         assert_eq!(remaining.len(), 0);
@@ -427,7 +471,42 @@ mod tests {
             }
         }
 
-        let output = execute_skill(&ToolRestrictedResolver, "restricted", "");
+        let (output, activation) = execute_skill(&ToolRestrictedResolver, "restricted", "");
         assert!(output.contains("**Allowed tools for this skill:** bash, read_file"));
+        // allowed_tools set → activation returned
+        let act = activation.unwrap();
+        assert_eq!(act.allowed_tools, vec!["bash", "read_file"]);
+        assert!(act.model_override.is_none());
+    }
+
+    #[test]
+    fn execute_skill_returns_activation_with_model() {
+        struct ModelOverrideResolver;
+        impl SkillResolver for ModelOverrideResolver {
+            fn resolve(&self, _name: &str) -> Result<ResolvedSkill, String> {
+                Ok(ResolvedSkill {
+                    name: "fancy".into(),
+                    instructions: "Be fancy.".into(),
+                    model: Some("gpt-4o".into()),
+                    max_tokens: Some(4096),
+                    allowed_tools: vec!["bash".into()],
+                })
+            }
+            fn available_skills(&self) -> Vec<SkillToolInfo> {
+                vec![]
+            }
+        }
+
+        let (_, activation) = execute_skill(&ModelOverrideResolver, "fancy", "");
+        let act = activation.unwrap();
+        assert_eq!(act.model_override.as_deref(), Some("gpt-4o"));
+        assert_eq!(act.allowed_tools, vec!["bash"]);
+    }
+
+    #[test]
+    fn execute_skill_no_activation_when_no_overrides() {
+        let resolver = stub_resolver();
+        let (_, activation) = execute_skill(&resolver, "code-review", "");
+        assert!(activation.is_none());
     }
 }

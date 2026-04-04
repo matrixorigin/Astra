@@ -76,10 +76,23 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
         let assembly_start = Instant::now();
         let pre_clear = std::mem::take(&mut self.pending_clear_lines);
 
+        // If a skill activation overrode the model, use that; otherwise fall back to host default.
+        let effective_model = state.skill_model_override.as_deref().or(self.model);
+
+        // If a skill activation set an allow-list, convert it to deny-list additions.
+        // Every tool NOT in the allow-list (except "skill" itself) gets restricted.
+        if let Some(ref allowed) = state.skill_allowed_tools {
+            for name in &self.valid_tool_names {
+                if !allowed.contains(name) && name != "skill" {
+                    state.restricted_tools.insert(name.clone());
+                }
+            }
+        }
+
         let turn_result = fetch_chat_turn_sse(ChatTurnSseFetchRequest {
             api: self.api,
             token: self.token,
-            model: self.model,
+            model: effective_model,
             explain: self.explain,
             render_md: self.render_md,
             term_width: self.term_width,

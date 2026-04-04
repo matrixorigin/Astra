@@ -228,6 +228,13 @@ pub struct AgenticLoopState {
     /// When set, the loop injects a `skill` tool schema and intercepts
     /// `skill` calls, returning resolved instructions as tool results.
     pub skill_resolver: Option<Arc<dyn crate::turn::skill_tool::SkillResolver>>,
+    /// Model override from the most recently activated skill.
+    /// When set, the host should use this model instead of the default.
+    pub skill_model_override: Option<String>,
+    /// Tool allow-list from the most recently activated skill.
+    /// When non-empty, only these tools (plus `skill` itself) should be available.
+    /// The host converts this allow-list to additions in `restricted_tools`.
+    pub skill_allowed_tools: Option<HashSet<String>>,
 
     // ── Stop hooks ──
     /// Verification commands run before the loop is allowed to complete.
@@ -751,13 +758,25 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
         // return resolved instructions as tool results.
         let (skill_results, post_skill_tool_calls);
         let effective_tool_calls = if let Some(resolver) = &state.skill_resolver {
-            let (sr, remaining) = crate::turn::skill_tool::partition_and_execute_skills(
-                effective_tool_calls,
-                resolver.as_ref(),
-            )
-            .await;
+            let (sr, remaining, activation) =
+                crate::turn::skill_tool::partition_and_execute_skills(
+                    effective_tool_calls,
+                    resolver.as_ref(),
+                )
+                .await;
             skill_results = sr;
             post_skill_tool_calls = remaining;
+
+            // Apply skill activation effects (model override, tool restrictions)
+            if let Some(act) = activation {
+                if let Some(model) = act.model_override {
+                    state.skill_model_override = Some(model);
+                }
+                if !act.allowed_tools.is_empty() {
+                    state.skill_allowed_tools = Some(act.allowed_tools.into_iter().collect());
+                }
+            }
+
             &post_skill_tool_calls
         } else {
             skill_results = Vec::new();
@@ -1142,6 +1161,8 @@ mod tests {
             cancel_token: None,
             delegation_engine: None,
             skill_resolver: None,
+            skill_model_override: None,
+            skill_allowed_tools: None,
             stop_hooks: Vec::new(),
             stop_hook_runs: 0,
             teammate_idle_hooks: Vec::new(),

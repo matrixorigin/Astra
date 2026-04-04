@@ -175,6 +175,8 @@ pub(crate) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
                 Some(Arc::new(resolver) as Arc<dyn astra_runtime::turn::skill_tool::SkillResolver>)
             }
         },
+        skill_model_override: None,
+        skill_allowed_tools: None,
         stop_hooks: hook_sets.stop_hooks,
         stop_hook_runs: 0,
         teammate_idle_hooks: hook_sets.teammate_idle_hooks,
