@@ -4,7 +4,7 @@
     "matrixone_port": 6001,
     "matrixone_user": "root",
     "matrixone_password": "111",
-    "matrixone_database": "dev_agent",
+    "matrixone_database": "astra_runtime",
     "redis_host": "localhost",
     "redis_port": 6379,
     "redis_password": null,
