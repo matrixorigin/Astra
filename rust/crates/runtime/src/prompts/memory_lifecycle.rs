@@ -39,7 +39,11 @@ const NEGATION_PREFIXES: &[&str] = &[
 fn contains_unnegated(text: &str, patterns: &[&str]) -> bool {
     for pattern in patterns {
         for (pos, _) in text.match_indices(pattern) {
-            let prefix_start = pos.saturating_sub(20);
+            let mut prefix_start = pos.saturating_sub(20);
+            // Walk back to a valid char boundary (at most 3 bytes for UTF-8)
+            while !text.is_char_boundary(prefix_start) {
+                prefix_start = prefix_start.saturating_sub(1);
+            }
             let prefix = &text[prefix_start..pos];
             if !NEGATION_PREFIXES.iter().any(|neg| prefix.contains(neg)) {
                 return true; // Unnegated match found
@@ -78,7 +82,10 @@ const TRACK_NON_TRACKING: &[&str] = &["down", "back", " record", "ing down", "in
 /// Returns false if followed by a non-tracking continuation (e.g., "follow these").
 fn is_tracking_context(text: &str, keyword: &str, pos: usize, bad_suffixes: &[&str]) -> bool {
     // Check negation prefix
-    let prefix_start = pos.saturating_sub(20);
+    let mut prefix_start = pos.saturating_sub(20);
+    while !text.is_char_boundary(prefix_start) {
+        prefix_start = prefix_start.saturating_sub(1);
+    }
     let prefix = &text[prefix_start..pos];
     if NEGATION_PREFIXES.iter().any(|neg| prefix.contains(neg)) {
         return false;
@@ -513,5 +520,22 @@ mod tests {
         assert_eq!(suggest_namespace("convention"), "@convention/semantic");
         assert_eq!(suggest_namespace("fact"), "@knowledge/semantic");
         assert_eq!(suggest_namespace("unknown"), "@fact/semantic");
+    }
+
+    #[test]
+    fn chinese_text_utf8_boundary_no_panic() {
+        // Multi-byte Chinese chars (3 bytes each) can cause saturating_sub(20) to
+        // land mid-character. This must not panic.
+        let text = "这是一段很长的中文文本，我偏好使用深色主题";
+        let result = detect_store_signal(text);
+        assert_eq!(result, Some("preference"), "should detect preference in Chinese text");
+
+        // Negation in Chinese should suppress
+        let negated = "这是一段很长的中文文本，不要我偏好使用深色主题";
+        let result2 = detect_store_signal(negated);
+        assert!(
+            result2.is_none() || result2 != Some("preference"),
+            "Chinese negation should suppress preference detection"
+        );
     }
 }
