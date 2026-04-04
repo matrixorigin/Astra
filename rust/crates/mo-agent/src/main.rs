@@ -3966,9 +3966,10 @@ async fn run_chat_repl(
         flush_plan_updates_between_prompts(&mut state);
         let current_token = current_access_token(profile);
 
-        // Keep readline prompts ASCII-only and unstyled. Rustyline still has
-        // edge cases around ANSI/wide-char prompt width, which can visually
-        // clip the last CJK character while typing.
+        // Keep readline prompts ASCII-only. Unicode characters (⏸, 🔄, ❯)
+        // have ambiguous or environment-dependent widths that can cause
+        // rustyline's cursor position to diverge from the terminal's actual
+        // rendering, clipping the last wide character while typing.
         if let Some(ref sname) = state.skill_dev_name {
             eprintln!("  \u{1f527} {}", format!("Skill dev: {sname}").cyan().dim());
         }
@@ -3977,7 +3978,7 @@ async fn run_chat_repl(
         } else if state.executing_plan.is_some() {
             "pause> ".to_string()
         } else if state.plan_handle.is_some() {
-            "run> ".to_string()
+            "bg> ".to_string()
         } else if state.chat_plan_only {
             "plan. ".to_string()
         } else {
