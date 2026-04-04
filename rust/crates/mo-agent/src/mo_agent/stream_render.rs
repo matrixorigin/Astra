@@ -718,6 +718,17 @@ impl StreamRenderState {
 
     /// Format a Cursor-style tool description: "Grepped pattern in path", "Read file lines X-Y"
     fn format_tool_description(&self, tool: &str, args: &Value) -> String {
+        self.format_tool_description_with_output(tool, args, None)
+    }
+
+    /// Format tool description, optionally adjusting based on output.
+    /// For read_file, detects auto-expand and adjusts description accordingly.
+    fn format_tool_description_with_output(
+        &self,
+        tool: &str,
+        args: &Value,
+        output: Option<&str>,
+    ) -> String {
         match tool {
             "bash" => {
                 let cmd = args.get("command").and_then(Value::as_str).unwrap_or("");
@@ -728,10 +739,20 @@ impl StreamRenderState {
                 let start = args.get("start_line").and_then(Value::as_u64);
                 let end = args.get("end_line").and_then(Value::as_u64);
                 let short_path = shorten_path(path, 40);
-                match (start, end) {
-                    (Some(s), Some(e)) => format!("Read {short_path} lines {s}-{e}"),
-                    (Some(s), None) => format!("Read {short_path} from line {s}"),
-                    _ => format!("Read {short_path}"),
+
+                // Check if auto-expanded (ranged request but full file returned)
+                let auto_expanded = output
+                    .map(|o| o.starts_with("[Auto-expanded to full file"))
+                    .unwrap_or(false);
+
+                if auto_expanded {
+                    format!("Read {short_path} (full)")
+                } else {
+                    match (start, end) {
+                        (Some(s), Some(e)) => format!("Read {short_path} lines {s}-{e}"),
+                        (Some(s), None) => format!("Read {short_path} from line {s}"),
+                        _ => format!("Read {short_path}"),
+                    }
                 }
             }
             "write_file" => {
@@ -1035,7 +1056,8 @@ impl StreamRenderState {
             self.stop_tool_stderr_running();
             // Keep the same tool label as the in-flight spinner (`Git show …`, `Git diff …`) so
             // stderr is not only anonymous +/- counts and paths.
-            let description = self.format_tool_description(tool, args);
+            // Use output-aware description for read_file to detect auto-expand.
+            let description = self.format_tool_description_with_output(tool, args, Some(output));
             let dur_display = if duration_suffix.is_empty() {
                 String::new()
             } else {
@@ -1055,7 +1077,8 @@ impl StreamRenderState {
             return;
         }
         self.stop_tool_stdout_anim();
-        let description = self.format_tool_description(tool, args);
+        // Use output-aware description for read_file to detect auto-expand.
+        let description = self.format_tool_description_with_output(tool, args, Some(output));
         let mut g = self.tool_ui.lock().unwrap();
         if idx < g.lines.len() {
             if status != "error" {
