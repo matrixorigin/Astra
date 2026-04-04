@@ -1551,7 +1551,10 @@ mod tests {
             .criteria
             .iter()
             .any(|c| matches!(c.verifier, VerifierKind::FileExists { .. }));
-        assert!(has_file_check, "Should have FileExists verifier for 'File calculator.py exists'");
+        assert!(
+            has_file_check,
+            "Should have FileExists verifier for 'File calculator.py exists'"
+        );
 
         // Now run on_subtask_complete — it should PASS because the file exists
         let mut durable = DurableTaskState {
@@ -1563,10 +1566,7 @@ mod tests {
         let passed = on_subtask_complete(&mut durable, "s1").await;
         assert!(passed, "Verification should pass — calculator.py exists");
         assert!(
-            matches!(
-                durable.contract.subtasks[0].stage,
-                SubtaskStage::Verified
-            ),
+            matches!(durable.contract.subtasks[0].stage, SubtaskStage::Verified),
             "Subtask stage should be Verified, got {:?}",
             durable.contract.subtasks[0].stage
         );
@@ -1775,7 +1775,10 @@ mod tests {
 
         on_subtask_begin(&durable, "s1").await;
         let passed = on_subtask_complete(&mut durable, "s1").await;
-        assert!(!passed, "GrepCheck should fail — 'rate_limit' is NOT in auth.py");
+        assert!(
+            !passed,
+            "GrepCheck should fail — 'rate_limit' is NOT in auth.py"
+        );
     }
 
     /// Command verifier: pass case (exit 0).
@@ -2059,7 +2062,10 @@ mod tests {
 
         // Run global verification — should pass (files exist)
         let global_passed = on_plan_complete(&mut durable).await;
-        assert!(global_passed, "Global verification should pass — both files exist");
+        assert!(
+            global_passed,
+            "Global verification should pass — both files exist"
+        );
         assert!(
             durable.last_report.is_some(),
             "Delivery report should be generated"

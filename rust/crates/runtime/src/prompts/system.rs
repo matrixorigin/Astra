@@ -2237,4 +2237,63 @@ mod tests {
         assert_eq!(sections[1].scope, CacheScope::None);
         assert!(sections[1].text.is_empty());
     }
+
+    // ── Output style injection ───────────────────────────────────────
+
+    #[test]
+    fn prompt_with_output_style_includes_style_content() {
+        use crate::output_style::{OutputStyle, StyleSource};
+
+        let style = OutputStyle {
+            name: "test".to_string(),
+            description: "Test style".to_string(),
+            prompt: "# Output Style: Test\nBe very brief.".to_string(),
+            source: StyleSource::BuiltIn,
+            keep_coding_instructions: true,
+        };
+
+        let p = build_main_system_prompt_with_style(&["bash"], "", 0.5, None, Some(&style));
+        assert!(
+            p.contains("# Output Style: Test"),
+            "prompt should include output style header"
+        );
+        assert!(
+            p.contains("Be very brief"),
+            "prompt should include output style content"
+        );
+    }
+
+    #[test]
+    fn prompt_without_output_style_has_no_style_section() {
+        let p = build_main_system_prompt_with_style(&["bash"], "", 0.5, None, None);
+        assert!(
+            !p.contains("# Output Style:"),
+            "prompt without style should not have style section"
+        );
+    }
+
+    #[test]
+    fn sections_with_output_style_includes_style_content() {
+        use crate::output_style::{OutputStyle, StyleSource};
+
+        let style = OutputStyle {
+            name: "concise".to_string(),
+            description: "Concise style".to_string(),
+            prompt: "# Output Style: Concise\nMinimize output.".to_string(),
+            source: StyleSource::BuiltIn,
+            keep_coding_instructions: true,
+        };
+
+        let sections =
+            build_system_prompt_sections_with_style(&["bash"], "", 0.5, None, Some(&style));
+        let session = &sections[1];
+        assert!(
+            session.text.contains("# Output Style: Concise"),
+            "session section should include output style"
+        );
+        assert!(
+            session.text.contains("Minimize output"),
+            "session section should include style content"
+        );
+    }
 }

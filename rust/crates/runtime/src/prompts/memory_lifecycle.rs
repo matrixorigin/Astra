@@ -528,7 +528,11 @@ mod tests {
         // land mid-character. This must not panic.
         let text = "这是一段很长的中文文本，我偏好使用深色主题";
         let result = detect_store_signal(text);
-        assert_eq!(result, Some("preference"), "should detect preference in Chinese text");
+        assert_eq!(
+            result,
+            Some("preference"),
+            "should detect preference in Chinese text"
+        );
 
         // Negation in Chinese should suppress
         let negated = "这是一段很长的中文文本，不要我偏好使用深色主题";
