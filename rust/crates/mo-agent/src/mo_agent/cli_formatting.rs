@@ -98,10 +98,10 @@ pub fn format_byte_size(bytes: usize) -> String {
 }
 
 /// Format duration as a human-friendly suffix for the tool description line.
-/// Only shown for durations ≥ 1s. Returns e.g. " 3.2s", " 1m 4s", " 12m 30s".
+/// Returns e.g. " 42ms", " 3.2s", " 1m 4s", " 12m 30s".
 pub fn format_duration_suffix(ms: u64) -> String {
     if ms < 1_000 {
-        return String::new();
+        return format!(" {ms}ms");
     }
     let secs = ms / 1_000;
     if secs < 60 {
@@ -363,7 +363,8 @@ mod tests {
 
     #[test]
     fn test_format_duration_suffix() {
-        assert_eq!(format_duration_suffix(500), "");
+        assert_eq!(format_duration_suffix(42), " 42ms");
+        assert_eq!(format_duration_suffix(500), " 500ms");
         assert_eq!(format_duration_suffix(1000), " 1s");
         assert_eq!(format_duration_suffix(1500), " 1.5s");
         assert_eq!(format_duration_suffix(65000), " 1m 5s");

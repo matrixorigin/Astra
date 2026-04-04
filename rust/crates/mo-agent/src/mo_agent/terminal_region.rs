@@ -223,13 +223,13 @@ impl TerminalRegion {
 /// - Control chars (0x00-0x1F, 0x7F) = 0 width
 /// - Zero-width Unicode (combining marks, etc.) = 0 width
 /// - CJK, emoji, etc. = 2 width
-fn visible_char_width(s: &str) -> usize {
+pub(super) fn visible_char_width(s: &str) -> usize {
     let stripped = strip_ansi_codes(s);
     stripped.chars().map(char_display_width).sum()
 }
 
 /// Estimate display width of a single character.
-fn char_display_width(c: char) -> usize {
+pub(super) fn char_display_width(c: char) -> usize {
     match c {
         // ASCII control characters (including tab, backspace)
         '\x00'..='\x1f' | '\x7f' => 0,

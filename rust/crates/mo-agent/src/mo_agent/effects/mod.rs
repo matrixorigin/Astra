@@ -52,9 +52,6 @@ pub const SPINNER_SHOW_DELAY_MS: u64 = 350;
 /// Poll interval for interruptible delays (allows early exit on stop signal).
 pub const INTERRUPTIBLE_POLL_MS: u64 = 20;
 
-/// Skip `● Thought for …` when thinking was shorter than this (reduces stderr churn).
-pub const MIN_THOUGHT_DURATION_LOG_SECS: f64 = 1.5;
-
 /// Minimum terminal width for clear-line operations.
 const MIN_TERM_WIDTH: usize = 20;
 

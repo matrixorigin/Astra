@@ -489,6 +489,10 @@ pub(super) fn print_repl_banner(profile: Option<&str>, state: &ReplState) {
     eprintln!("{}", row(&lines_colored[2], display_width(&lines_plain[2])));
     eprintln!("{}", row(&lines_colored[3], display_width(&lines_plain[3])));
     eprintln!("{}", format!("╰{hr}╯").cyan());
+    eprintln!(
+        "{}",
+        "  Ctrl-C to cancel │ /help for commands │ /quit to exit".dim()
+    );
     eprintln!();
 }
 

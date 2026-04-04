@@ -397,7 +397,7 @@ async fn apply_auto_compact_result(
     eprintln!(
         "  {}",
         format!(
-            "✓ Compacted {trimmed} turns → {} in context",
+            "{} Compacted {trimmed} turns → {} in context", crate::theme::icon_ok(),
             state.history.len()
         )
         .green()
@@ -806,6 +806,9 @@ fn apply_turn_success(
     commit_turn_journal_workspace_and_sidecars(state, line, &result, turn_start);
     record_selector_turn_outcome(state, selector, line, &result);
 
+    // ── Post-turn status line ────────────────────────────────────────────
+    print_turn_status_line(state, &result, turn_start);
+
     if result.tool_calls_count == 0 && looks_like_live_query_with_context(line, &state.recent_tools)
     {
         eprintln!(
@@ -814,6 +817,56 @@ fn apply_turn_success(
                 .yellow()
         );
     }
+}
+
+fn print_turn_status_line(state: &ReplState, result: &StreamResult, turn_start: Instant) {
+    let elapsed = turn_start.elapsed();
+    let elapsed_str = if elapsed.as_secs() >= 60 {
+        format!("{}m{:.0}s", elapsed.as_secs() / 60, elapsed.as_secs() % 60)
+    } else {
+        format!("{:.1}s", elapsed.as_secs_f64())
+    };
+
+    let total_tokens = result.prompt_tokens + result.completion_tokens;
+    let tokens_str = if total_tokens > 1000 {
+        format!("{:.1}k", total_tokens as f64 / 1000.0)
+    } else {
+        format!("{total_tokens}")
+    };
+    let prompt_short = if result.prompt_tokens > 1000 {
+        format!("{:.1}k", result.prompt_tokens as f64 / 1000.0)
+    } else {
+        format!("{}", result.prompt_tokens)
+    };
+    let completion_short = if result.completion_tokens > 1000 {
+        format!("{:.1}k", result.completion_tokens as f64 / 1000.0)
+    } else {
+        format!("{}", result.completion_tokens)
+    };
+
+    let mut parts = Vec::new();
+
+    if let Some(ref model) = state.model {
+        parts.push(format!("model:{model}"));
+    }
+
+    parts.push(format!("tokens:{tokens_str} (↑{prompt_short} ↓{completion_short})"));
+    parts.push(elapsed_str);
+
+    if result.tool_calls_count > 0 {
+        parts.push(format!(
+            "{} tool{}",
+            result.tool_calls_count,
+            if result.tool_calls_count == 1 { "" } else { "s" }
+        ));
+    }
+
+    let line = format!("  ─ {} ─", parts.join(" │ "));
+    eprintln!("{}", line.dim());
+
+    let w = crossterm::terminal::size().map(|(c, _)| c as usize).unwrap_or(80);
+    let rule = "─".repeat(w.min(72));
+    eprintln!("{}", rule.dim());
 }
 
 pub(super) fn initialize_journal_pub(state: &mut ReplState, session_id: &str) {
@@ -858,7 +911,7 @@ fn report_turn_error(state: &ReplState, line: &str, error: &str, turn_start: Ins
     {
         eprintln!("{}", "  Session expired. Run /login to refresh.".yellow());
     } else {
-        eprintln!("{}", format!("  ✗  {error}").red());
+        eprintln!("  {} {}", crate::theme::icon_err(), error.red());
     }
 
     if let Some(journal) = state.journal.as_ref() {

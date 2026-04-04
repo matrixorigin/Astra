@@ -4,7 +4,7 @@
 //! - [`ToolRunningLineSpinner`]: stderr spinner for markdown mode
 //! - [`ToolStdoutLineAnim`]: stdout animation via TerminalRegion for raw mode
 
-use super::super::terminal_region::TerminalRegion;
+use super::super::terminal_region::{TerminalRegion, visible_char_width};
 use super::{SPINNER_FRAMES, clear_stderr_line, interruptible_sleep, term_width};
 use crossterm::style::Stylize;
 use std::io::{self, IsTerminal, Write};
@@ -42,24 +42,16 @@ impl ToolRunningLineSpinner {
         let w = term_width();
         let label = "Running…";
 
-        // Paint immediately
         {
             let time_part = format!("{:>3}s", 0u64);
             let frame = SPINNER_FRAMES[0];
-            let visible = 2
-                + time_part.chars().count()
-                + 1
-                + label.chars().count()
-                + 1
-                + detail.chars().count()
-                + 1
-                + 1;
+            let plain = format!("  {time_part} {label} {detail} {frame}");
+            let visible = visible_char_width(&plain);
             eprint!("\r  ");
             eprint!("{}", time_part.dim());
             eprint!(" {}", label.dim());
             eprint!(" {}", detail.as_str().dim());
             eprint!(" {}", format!("{frame}").yellow());
-            // Leave 1 char margin to avoid terminal auto-wrap at exact line width
             if visible + 1 < w {
                 eprint!("{}", " ".repeat(w - visible - 1));
             }
@@ -81,20 +73,13 @@ impl ToolRunningLineSpinner {
                 let frame = SPINNER_FRAMES[spin_idx % SPINNER_FRAMES.len()];
                 spin_idx += 1;
                 let time_part = format!("{:>3}s", sec);
-                let visible = 2
-                    + time_part.chars().count()
-                    + 1
-                    + label.chars().count()
-                    + 1
-                    + detail_for_thread.chars().count()
-                    + 1
-                    + 1;
+                let plain = format!("  {time_part} {label} {detail_for_thread} {frame}");
+                let visible = visible_char_width(&plain);
                 eprint!("\r  ");
                 eprint!("{}", time_part.dim());
                 eprint!(" {}", label.dim());
                 eprint!(" {}", detail_for_thread.as_str().dim());
                 eprint!(" {}", format!("{frame}").yellow());
-                // Leave 1 char margin to avoid terminal auto-wrap at exact line width
                 if visible + 1 < w {
                     eprint!("{}", " ".repeat(w - visible - 1));
                 }

@@ -863,7 +863,7 @@ async fn handle_resume_command(arg: &str, profile: Option<&str>, state: &mut Rep
                 if session_journal::read_journal(&session_id).is_err() {
                     eprintln!(
                         "{}",
-                        format!("  ✗ Session {} not found or not owned by user", arg).red()
+                        format!("  {} Session {} not found or not owned by user", theme::icon_err(), arg).red()
                     );
                     return;
                 }
@@ -1166,7 +1166,7 @@ async fn handle_resume_command(arg: &str, profile: Option<&str>, state: &mut Rep
             } else {
                 "Check connection with /doctor, or try a different session."
             };
-            eprintln!("{}", format!("  ✗ Resume failed: {e}").red());
+            eprintln!("  {} {}", theme::icon_err(), format!("Resume failed: {e}").red());
             eprintln!("{}", format!("  {hint}").dim());
         }
     }
@@ -3435,7 +3435,7 @@ async fn handle_task_command(arg: &str, state: &mut ReplState) {
                 }
                 eprintln!();
             }
-            Err(e) => eprintln!("{}", format!("  ✗ {e}").red()),
+            Err(e) => eprintln!("{}", format!("  {} {e}", theme::icon_err()).red()),
         },
         "add" if !sub_arg.is_empty() => {
             match svc
@@ -3462,7 +3462,7 @@ async fn handle_task_command(arg: &str, state: &mut ReplState) {
                         short.dim()
                     );
                 }
-                Err(e) => eprintln!("{}", format!("  ✗ {e}").red()),
+                Err(e) => eprintln!("{}", format!("  {} {e}", theme::icon_err()).red()),
             }
         }
         "done" if !sub_arg.is_empty() => {
@@ -3470,13 +3470,13 @@ async fn handle_task_command(arg: &str, state: &mut ReplState) {
             match find_task_by_query(&*svc, user_id, sub_arg).await {
                 Ok(Some(tid)) => match svc.complete_task(&tid).await {
                     Ok(()) => eprintln!("  {} Task completed: {}", theme::icon_ok(), sub_arg),
-                    Err(e) => eprintln!("{}", format!("  ✗ {e}").red()),
+                    Err(e) => eprintln!("{}", format!("  {} {e}", theme::icon_err()).red()),
                 },
                 Ok(None) => {
                     eprintln!("{}", format!("  Task not found: '{sub_arg}'").yellow());
                     eprintln!("{}", "  Use /task list to see available tasks.".dim());
                 }
-                Err(e) => eprintln!("{}", format!("  ✗ {e}").red()),
+                Err(e) => eprintln!("{}", format!("  {} {e}", theme::icon_err()).red()),
             }
         }
         "status" if !sub_arg.is_empty() => {
@@ -3519,13 +3519,13 @@ async fn handle_task_command(arg: &str, state: &mut ReplState) {
                         eprintln!("{}", format!("  Task not found: '{sub_arg}'").yellow());
                         eprintln!("{}", "  Use /task list to see available tasks.".dim());
                     }
-                    Err(e) => eprintln!("{}", format!("  ✗ {e}").red()),
+                    Err(e) => eprintln!("{}", format!("  {} {e}", theme::icon_err()).red()),
                 },
                 Ok(None) => {
                     eprintln!("{}", format!("  Task not found: '{sub_arg}'").yellow());
                     eprintln!("{}", "  Use /task list to see available tasks.".dim());
                 }
-                Err(e) => eprintln!("{}", format!("  ✗ {e}").red()),
+                Err(e) => eprintln!("{}", format!("  {} {e}", theme::icon_err()).red()),
             }
         }
         _ => {
@@ -3653,7 +3653,7 @@ async fn handle_slash_command(
                     state.model.as_deref(),
                 ) {
                     state.model = Some(chosen.clone());
-                    eprintln!("{}", format!("  ✓ Model set to: {chosen}").green());
+                    eprintln!("  {} {}", theme::icon_ok(), format!("Model set to: {chosen}").green());
                 } else {
                     eprintln!("{}", "  Cancelled.".dim());
                 }
@@ -3828,7 +3828,7 @@ async fn run_chat_repl(
             &pipeline_modules.calibrator,
         );
         if loaded {
-            eprintln!("{}", "  ✓ Loaded learning state from prior sessions".dim());
+            eprintln!("  {} {}", theme::icon_ok(), "Loaded learning state from prior sessions".dim());
         }
         // Load tool health for cross-session error budgets
         let mut cross_session_health_entries =
@@ -4166,7 +4166,7 @@ async fn run_chat_repl(
                                                 );
                                             }
                                             Err(e) => {
-                                                eprintln!("{}", format!("  ✗ {e}").red());
+                                                eprintln!("{}", format!("  {} {e}", theme::icon_err()).red());
                                             }
                                         }
                                     }
@@ -4357,7 +4357,7 @@ async fn run_chat_repl(
             }
             Err(e) => {
                 clear_slash_overlay();
-                eprintln!("{}", "  ✗ Input error — exiting session.".red());
+                eprintln!("  {} {}", theme::icon_err(), "Input error — exiting session.".red());
                 eprintln!("{}", format!("  ({e})").dim());
                 // Journal + ingestion: session end on error exit
                 if let Some(ref j) = state.journal {

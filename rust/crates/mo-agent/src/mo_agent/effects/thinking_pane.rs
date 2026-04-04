@@ -3,8 +3,9 @@
 //! Shows reasoning/thinking content in a viewport that grows until a cap,
 //! then folds away old lines with a "hidden lines above" header.
 
-use super::super::terminal_region::TerminalRegion;
+use super::super::terminal_region::{TerminalRegion, char_display_width};
 use crossterm::style::Stylize;
+use std::time::Instant;
 
 /// Max **content** rows for `thinking_delta` / `reasoning_delta` (`0` = spinner only).
 /// While under this cap the pane **grows downward** (no blank padding). Past the cap, the top
@@ -28,6 +29,7 @@ pub struct ThinkingPreviewPane {
     buffer: String,
     /// Region for diff-based updates (stdout).
     region: TerminalRegion,
+    start: Instant,
 }
 
 impl ThinkingPreviewPane {
@@ -38,6 +40,7 @@ impl ThinkingPreviewPane {
             width: width.max(20),
             buffer: String::new(),
             region: TerminalRegion::new(),
+            start: Instant::now(),
         }
     }
 
@@ -73,10 +76,11 @@ impl ThinkingPreviewPane {
         } else {
             visual[visual.len() - cap..].to_vec()
         };
+        let elapsed = self.start.elapsed().as_secs_f64();
         let header = if hidden > 0 {
-            format!("... ({hidden} lines hidden above)")
+            format!("Thinking… ({hidden} rows hidden, {elapsed:.1}s)")
         } else {
-            String::new()
+            format!("Thinking… ({elapsed:.1}s)")
         };
         (header, body)
     }
@@ -89,17 +93,26 @@ impl ThinkingPreviewPane {
             return;
         }
         let mut lines = Vec::with_capacity(body.len() + 1);
-        if !header.is_empty() {
-            lines.push(format!("  {}", header.dim()));
-        }
+        lines.push(format!("  {}", header.cyan().dim()));
         for line in body {
             if line.is_empty() {
                 lines.push(String::new());
             } else {
-                lines.push(format!("  {} {}", "◇".dim(), line.dim()));
+                lines.push(format!("  {} {}", "│".dark_grey(), line.dim()));
             }
         }
         self.region.update(lines);
+    }
+
+    /// Return a collapsed summary line for after thinking completes.
+    pub fn summary_line(&self) -> String {
+        let words = self.buffer.split_whitespace().count();
+        let elapsed = self.start.elapsed().as_secs_f64();
+        format!(
+            "  {} {}",
+            "◇".dim(),
+            format!("Thought (~{words} words, {elapsed:.1}s)").dim()
+        )
     }
 
     /// Clear the pane content and terminal region.
@@ -117,7 +130,7 @@ impl ThinkingPreviewPane {
 
 // ═══════════════════════════════════════════════════════════════ Helpers ══
 
-/// Split one logical line into fixed-width visual rows (UTF-8 safe).
+/// Split one logical line into visual rows based on display width (CJK-safe).
 fn wrap_line_to_width(line: &str, w: usize) -> Vec<String> {
     if w == 0 {
         return vec![line.to_string()];
@@ -127,11 +140,22 @@ fn wrap_line_to_width(line: &str, w: usize) -> Vec<String> {
         return vec![String::new()];
     }
     let mut out = Vec::new();
-    let mut i = 0usize;
-    while i < chars.len() {
-        let end = (i + w).min(chars.len());
-        out.push(chars[i..end].iter().collect());
-        i = end;
+    let mut row = String::new();
+    let mut row_width = 0usize;
+    for c in &chars {
+        let cw = char_display_width(*c);
+        if row_width + cw > w && !row.is_empty() {
+            out.push(std::mem::take(&mut row));
+            row_width = 0;
+        }
+        row.push(*c);
+        row_width += cw;
+    }
+    if !row.is_empty() {
+        out.push(row);
+    }
+    if out.is_empty() {
+        out.push(String::new());
     }
     out
 }
@@ -192,7 +216,8 @@ mod tests {
         let mut p = ThinkingPreviewPane::new(4, 80);
         p.buffer = "line1\nline2".into();
         let (h, b) = p.build_frame();
-        assert!(h.is_empty(), "no hidden header while under cap");
+        assert!(h.starts_with("Thinking…"), "header should be present");
+        assert!(!h.contains("hidden"), "no hidden count while under cap");
         assert_eq!(b.len(), 2);
         assert_eq!(b[0], "line1");
         assert_eq!(b[1], "line2");
@@ -203,7 +228,7 @@ mod tests {
         let mut p = ThinkingPreviewPane::new(2, 80);
         p.buffer = "a\nb\nc\nd".into();
         let (h, b) = p.build_frame();
-        assert_eq!(h, "... (2 lines hidden above)");
+        assert!(h.contains("2 rows hidden"), "header should show hidden row count");
         assert_eq!(b, vec!["c".to_string(), "d".to_string()]);
     }
 

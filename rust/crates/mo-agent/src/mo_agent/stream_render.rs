@@ -4,7 +4,6 @@ use astra_runtime::turn::chat_turn_sse_dispatch::{
 };
 use astra_runtime::turn::sse_edge_stderr_lines::{
     edge_sse_post_approval_fail_line, edge_sse_post_tool_result_fail_line,
-    edge_sse_thought_duration_line,
 };
 use astra_runtime::turn::sse_stream_host::{
     EdgeApprovalResult, EdgeToolExecResult, NoopSseStreamHost, STREAM_IDLE_TIMEOUT_MS,
@@ -27,8 +26,7 @@ use super::cli_formatting::{
 
 // Effects module types
 use super::effects::{
-    MIN_THOUGHT_DURATION_LOG_SECS, ThinkingSpinnerKind, ToolRegionState, ToolStdoutLineAnim,
-    thinking_viewport_rows,
+    ThinkingSpinnerKind, ToolRegionState, ToolStdoutLineAnim, thinking_viewport_rows,
 };
 
 pub use astra_runtime::turn::chat_turn_sse_dispatch::ChatTurnEdgePending;
@@ -127,10 +125,9 @@ impl<'a> CliSseStreamHost<'a> {
 
     /// Push text to the active renderer (markdown or raw stdout).
     fn render_text(&mut self, s: &str) {
-        // If thinking pane is active, clear it before markdown/text output
-        // to prevent cursor desync between independent TerminalRegions.
-        if let Some(mut pane) = self.render.thinking_pane.take() {
-            pane.clear();
+        if let Some(pane) = self.render.thinking_pane.take() {
+            let summary = pane.summary_line();
+            self.render.clear_thinking_with_summary(pane, &summary);
         }
         if let Some(md) = &mut self.render.md {
             md.push(s);
@@ -759,6 +756,10 @@ impl StreamRenderState {
     }
 
     fn stop_thinking(&mut self) {
+        let summary = self
+            .thinking_pane
+            .as_ref()
+            .map(|pane| pane.summary_line());
         if let Some(mut pane) = self.thinking_pane.take() {
             pane.clear();
         }
@@ -767,33 +768,42 @@ impl StreamRenderState {
         }
         let skip_thought_duration_log = self.waiting_for_first_sse;
         self.waiting_for_first_sse = false;
-        if let Some(start) = self.thinking_start.take() {
-            let elapsed = start.elapsed().as_secs_f64();
-            if !skip_thought_duration_log
-                && elapsed >= MIN_THOUGHT_DURATION_LOG_SECS
-                && self.md.is_none()
-            {
-                // In markdown streaming mode, injecting an unmanaged line here
-                // shifts the cursor below the tracked markdown regions, which
-                // causes partial clears/residual text on the next tool turn.
-                // Keep per-round thought timing out of the normal markdown UX.
-                let line = edge_sse_thought_duration_line(elapsed);
-                println!("{}", line.dim());
-                let _ = io::stdout().flush();
-                self.lines_written += 1;
-                self.col = 0;
+        if let Some(_start) = self.thinking_start.take() {
+            if !skip_thought_duration_log {
+                if let Some(line) = summary {
+                    if self.md.is_none() {
+                        println!("{line}");
+                        let _ = io::stdout().flush();
+                        self.lines_written += 1;
+                        self.col = 0;
+                    } else {
+                        eprintln!("{line}");
+                        self.stderr_lines += 1;
+                    }
+                }
             }
+        }
+    }
+
+    fn clear_thinking_with_summary(&mut self, mut pane: ThinkingPreviewPane, summary: &str) {
+        pane.clear();
+        if self.md.is_none() {
+            println!("{summary}");
+            let _ = io::stdout().flush();
+            self.lines_written += 1;
+            self.col = 0;
+        } else {
+            eprintln!("{summary}");
+            self.stderr_lines += 1;
         }
     }
 
     /// Show a tool as "running" with Cursor-style description (single line).
     fn tool_start(&mut self, tool: &str, args: &Value) -> usize {
         let description = self.format_tool_description(tool, args);
-        // Always clear thinking pane before tool output, regardless of mode.
-        // ThinkingPreviewPane uses stdout (TerminalRegion), so any output to
-        // stdout or stderr will desync its cursor tracking.
-        if let Some(mut pane) = self.thinking_pane.take() {
-            pane.clear();
+        if let Some(pane) = self.thinking_pane.take() {
+            let summary = pane.summary_line();
+            self.clear_thinking_with_summary(pane, &summary);
         }
         self.suppress_reasoning_viewport = true;
         if self.md.is_some() {
@@ -1159,24 +1169,17 @@ impl StreamRenderState {
                 Some(summary) => format!("    {}", summary.dim()),
                 None => String::new(),
             };
-            (format!("{}", "⬢".green()), summary_line)
+            (theme::icon_ok(), summary_line)
         };
         if self.md.is_some() {
             self.stop_tool_stderr_running();
-            // Keep the same tool label as the in-flight spinner (`Git show …`, `Git diff …`) so
-            // stderr is not only anonymous +/- counts and paths.
-            // Use output-aware description for read_file to detect auto-expand.
             let description = self.format_tool_description_with_output(tool, args, Some(output));
-            let dur_display = if duration_suffix.is_empty() {
-                String::new()
-            } else {
-                format!("{}", duration_suffix.dim())
-            };
+            let dur_display = format!("{}", duration_suffix.dim());
             let mut out_lines = 1usize;
             if status == "error" {
                 eprintln!("  {} {}{}", theme::icon_err(), description, dur_display);
             } else {
-                eprintln!("  {} {}{}", "⬢".green(), description, dur_display);
+                eprintln!("  {} {}{}", theme::icon_ok(), description, dur_display);
             }
             if !line.is_empty() {
                 eprintln!("{line}");
@@ -1186,36 +1189,15 @@ impl StreamRenderState {
             return;
         }
         self.stop_tool_stdout_anim();
-        // Use output-aware description for read_file to detect auto-expand.
         let description = self.format_tool_description_with_output(tool, args, Some(output));
+        let dur_display = format!("{}", duration_suffix.dim());
         let mut g = self.tool_ui.lock().unwrap();
         if idx < g.lines.len() {
-            if status != "error" {
-                // Rebuild the row from tool+args so we drop any trailing braille from the animator.
-                let base_row = format!("  {} {}", "⬢".cyan(), description);
-                let base = base_row.replacen(&format!("{}", "⬢".cyan()), &icon, 1);
-                let dur = if duration_suffix.is_empty() {
-                    String::new()
-                } else {
-                    format!("{}", duration_suffix.dim())
-                };
-                g.lines[idx] = format!("{base}{dur}");
-                if !line.is_empty() {
-                    let insert_pos = idx + 1;
-                    if insert_pos <= g.lines.len() {
-                        g.lines.insert(insert_pos, line);
-                    }
-                }
-            } else {
-                // Error: replace icon with ✗, keep description
-                let base_row = format!("  {} {}", "⬢".cyan(), description);
-                let base = base_row.replacen(&format!("{}", "⬢".cyan()), &icon, 1);
-                g.lines[idx] = base;
-                if !line.is_empty() {
-                    let insert_pos = idx + 1;
-                    if insert_pos <= g.lines.len() {
-                        g.lines.insert(insert_pos, line);
-                    }
+            g.lines[idx] = format!("  {icon} {description}{dur_display}");
+            if !line.is_empty() {
+                let insert_pos = idx + 1;
+                if insert_pos <= g.lines.len() {
+                    g.lines.insert(insert_pos, line);
                 }
             }
             let lines = g.lines.clone();
