@@ -112,10 +112,14 @@ impl Drop for PlanActivitySpinner {
 /// Format: `  [tag] Ns label ⣾`
 fn paint_line(tag: &str, time_part: &str, label: &str, frame: char, w: usize) {
     let tag_part = format!("[{tag}]");
-    let visible =
-        2 + tag_part.chars().count() + 1 + time_part.chars().count() + 1 + label.chars().count()
-            + 1
-            + 1;
+    let visible = 2
+        + tag_part.chars().count()
+        + 1
+        + time_part.chars().count()
+        + 1
+        + label.chars().count()
+        + 1
+        + 1;
     eprint!("\r  ");
     eprint!("{}", tag_part.dim());
     eprint!(" {}", time_part.dim());

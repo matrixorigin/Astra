@@ -135,9 +135,7 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
     fn emit_headless_line(&mut self, style: HeadlessStderrStyle, line: String) {
         // Forward to stream event channel (even in suppress mode)
         if let Some(tx) = &self.stream_event_tx {
-            let _ = tx.send(
-                super::super::StreamEvent::StatusLine(line.clone()),
-            );
+            let _ = tx.send(super::super::StreamEvent::StatusLine(line.clone()));
         }
         if self.suppress_intermediate_output {
             return;

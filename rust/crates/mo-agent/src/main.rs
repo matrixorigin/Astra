@@ -2549,22 +2549,21 @@ fn display_plan_updates_live(
 
     // Print via ExternalPrinter if available, otherwise eprintln!.
     // Always stops the active spinner first to clear its \r line.
-    let print_line =
-        |printer: &std::sync::Mutex<Option<readline_actor::BoxedPrinter>>,
-         spinner: &mut Option<effects::PlanActivitySpinner>,
-         msg: String| {
-            // Stop spinner before printing to avoid garbled output
-            if let Some(s) = spinner.take() {
-                s.stop_clear();
-            }
-            if let Ok(mut guard) = printer.lock()
-                && let Some(ref mut p) = *guard
-            {
-                let _ = p.print(msg);
-            } else {
-                eprintln!("{msg}");
-            }
-        };
+    let print_line = |printer: &std::sync::Mutex<Option<readline_actor::BoxedPrinter>>,
+                      spinner: &mut Option<effects::PlanActivitySpinner>,
+                      msg: String| {
+        // Stop spinner before printing to avoid garbled output
+        if let Some(s) = spinner.take() {
+            s.stop_clear();
+        }
+        if let Ok(mut guard) = printer.lock()
+            && let Some(ref mut p) = *guard
+        {
+            let _ = p.print(msg);
+        } else {
+            eprintln!("{msg}");
+        }
+    };
 
     let handle = match state.plan_handle.as_mut() {
         Some(h) => h,
@@ -2738,9 +2737,7 @@ fn display_plan_updates_live(
                     } => {
                         let dur = format_duration_ms(duration_ms);
                         let icon = if status == "error" { "✗" } else { "✓" };
-                        let summary = output_summary
-                            .map(|s| format!("  {s}"))
-                            .unwrap_or_default();
+                        let summary = output_summary.map(|s| format!("  {s}")).unwrap_or_default();
                         (format!("  {icon} {name} ({dur}){summary}"), None)
                     }
                     StreamEvent::WaitingForModel => {

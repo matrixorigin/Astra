@@ -24,10 +24,7 @@ pub enum StreamEvent {
     /// Thinking/reasoning preview chunk.
     ThinkingChunk(String),
     /// Tool execution started.
-    ToolStarted {
-        name: String,
-        description: String,
-    },
+    ToolStarted { name: String, description: String },
     /// Tool execution completed.
     ToolCompleted {
         name: String,
