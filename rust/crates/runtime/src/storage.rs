@@ -10,6 +10,21 @@ use crate::turn::contracts::{
 };
 use crate::turn::hook_plans::SnapshotLinkPlan;
 
+fn metadata_tool_name(metadata: Option<&serde_json::Value>) -> Option<String> {
+    metadata
+        .and_then(|v| v.get("tool_name").or_else(|| v.get("name")))
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim_matches('"').to_string())
+        .filter(|s| !s.is_empty())
+}
+
+fn metadata_duration_ms(metadata: Option<&serde_json::Value>) -> Option<i32> {
+    metadata
+        .and_then(|v| v.get("duration_ms"))
+        .and_then(|v| v.as_i64())
+        .map(|v| v as i32)
+}
+
 pub(crate) async fn insert_core_turn_event(
     tx: &mut sqlx::Transaction<'_, MySql>,
     event: &TurnCoreEventRecord,
@@ -63,8 +78,8 @@ pub(crate) async fn insert_tool_turn_event(
     .bind(&event.skill_name)
     .bind(skill_version.cloned().or_else(|| event.skill_version.clone()))
     .bind(&event.reasoning_content)
-    .bind(event.metadata.as_ref().and_then(|v| v.get("tool_name")).and_then(|v| v.as_str()))
-    .bind(event.metadata.as_ref().and_then(|v| v.get("duration_ms")).and_then(|v| v.as_i64()).map(|v| v as i32))
+    .bind(metadata_tool_name(event.metadata.as_ref()))
+    .bind(metadata_duration_ms(event.metadata.as_ref()))
     .execute(&mut **tx)
     .await?;
     Ok(())

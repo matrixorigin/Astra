@@ -12,6 +12,15 @@ use astra_core::{
     ErrorResponse, MatrixOneSettings, SharedPool, connect_matrixone, error_response, internal_error,
 };
 
+fn normalize_tool_name(name: String) -> String {
+    let trimmed = name.trim_matches('"').trim();
+    if trimmed.is_empty() {
+        "unknown".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
 // ── Response types ───────────────────────────────────────────────────────────
 
 /// High-level session audit summary.
@@ -404,7 +413,8 @@ impl SessionAuditService for DatabaseSessionAuditService {
         .await
         .map_err(internal_error)?;
 
-        let sess_row = sess_row.ok_or_else(|| error_response(StatusCode::NOT_FOUND, "Session not found"))?;
+        let sess_row =
+            sess_row.ok_or_else(|| error_response(StatusCode::NOT_FOUND, "Session not found"))?;
         let owner: String = sess_row.try_get("user_id").map_err(internal_error)?;
         if owner != user_id {
             return Err(error_response(StatusCode::NOT_FOUND, "Session not found"));
@@ -454,10 +464,16 @@ impl SessionAuditService for DatabaseSessionAuditService {
         let turn_count: u32 = metrics_row.try_get::<i64, _>("turn_count").unwrap_or(0) as u32;
         let error_count: u32 = metrics_row.try_get::<i64, _>("error_count").unwrap_or(0) as u32;
         let stall_count: u32 = metrics_row.try_get::<i64, _>("stall_count").unwrap_or(0) as u32;
-        let checkpoint_count: u32 = metrics_row.try_get::<i64, _>("checkpoint_count").unwrap_or(0) as u32;
+        let checkpoint_count: u32 = metrics_row
+            .try_get::<i64, _>("checkpoint_count")
+            .unwrap_or(0) as u32;
         let compact_count: u32 = metrics_row.try_get::<i64, _>("compact_count").unwrap_or(0) as u32;
-        let tool_calls_total: u32 = metrics_row.try_get::<i64, _>("tool_calls_total").unwrap_or(0) as u32;
-        let tool_calls_failed: u32 = metrics_row.try_get::<i64, _>("tool_calls_failed").unwrap_or(0) as u32;
+        let tool_calls_total: u32 = metrics_row
+            .try_get::<i64, _>("tool_calls_total")
+            .unwrap_or(0) as u32;
+        let tool_calls_failed: u32 = metrics_row
+            .try_get::<i64, _>("tool_calls_failed")
+            .unwrap_or(0) as u32;
 
         let tokens_in: i64 = metrics_row.try_get("tokens_in").unwrap_or(0);
         let tokens_out: i64 = metrics_row.try_get("tokens_out").unwrap_or(0);
@@ -783,18 +799,15 @@ impl SessionAuditService for DatabaseSessionAuditService {
         let result: Vec<ToolAnalytics> = rows
             .iter()
             .filter_map(|row| {
-                let mut name: String = row.try_get("tool_name").unwrap_or_default();
-                name = name.trim_matches('"').to_string();
-                if name.is_empty() {
-                    name = "unknown".into();
-                }
+                let name = normalize_tool_name(row.try_get("tool_name").unwrap_or_default());
                 let total_calls = row.try_get::<i64, _>("total_calls").unwrap_or(0) as u32;
                 if total_calls == 0 {
                     return None;
                 }
                 let total_success = row.try_get::<i64, _>("total_success").unwrap_or(0) as u32;
                 let total_failures = row.try_get::<i64, _>("total_failures").unwrap_or(0) as u32;
-                let total_duration_ms = row.try_get::<i64, _>("total_duration_ms").unwrap_or(0) as u64;
+                let total_duration_ms =
+                    row.try_get::<i64, _>("total_duration_ms").unwrap_or(0) as u64;
                 let last_error = row
                     .try_get::<String, _>("last_error")
                     .ok()
@@ -1083,8 +1096,7 @@ impl SessionAuditService for DatabaseSessionAuditService {
         let top_tools: Vec<ToolUsageBrief> = tool_rows
             .iter()
             .map(|r| {
-                let name: String = r.try_get("tool_name").unwrap_or_default();
-                let name = name.trim_matches('"').to_string();
+                let name = normalize_tool_name(r.try_get("tool_name").unwrap_or_default());
                 let cnt = r.try_get::<i64, _>("cnt").unwrap_or(0) as u32;
                 let ok = r.try_get::<i64, _>("ok_cnt").unwrap_or(0) as u32;
                 ToolUsageBrief {
@@ -1207,8 +1219,7 @@ impl SessionAuditService for DatabaseSessionAuditService {
         let result: Vec<CrossSessionToolAnalytics> = rows
             .iter()
             .map(|row| {
-                let name: String = row.try_get("tool_name").unwrap_or_default();
-                let name = name.trim_matches('"').to_string();
+                let name = normalize_tool_name(row.try_get("tool_name").unwrap_or_default());
                 let total_calls = row.try_get::<i64, _>("total_calls").unwrap_or(0) as u32;
                 let total_success = row.try_get::<i64, _>("total_success").unwrap_or(0) as u32;
                 let total_failures = row.try_get::<i64, _>("total_failures").unwrap_or(0) as u32;

@@ -597,7 +597,9 @@ async fn call_llm_stream(
                                                     tool_calls_map.insert(i, m.clone());
                                                 }
                                             }
-                                            if !result.full_text.is_empty() {
+                                            if !result.full_text.is_empty()
+                                                && result.tool_calls.is_empty()
+                                            {
                                                 yield render_sse(&json!({"type":"text_delta","content": result.full_text}));
                                             }
                                             if !result.reasoning.is_empty() {
@@ -1532,7 +1534,7 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
                 }
 
                 full_text.push_str(&loop_text);
-                if use_e2e_llm && !loop_text.trim().is_empty() {
+                if use_e2e_llm && !loop_text.trim().is_empty() && loop_tool_calls.is_empty() {
                     yield render_sse(&json!({"type": "text_delta", "content": loop_text}));
                 }
                 if !loop_reasoning.is_empty() {
@@ -2422,5 +2424,31 @@ mod tests {
         assert!(is_valid_tool_name("read_file"));
         assert!(is_valid_tool_name("list_dir"));
         assert!(is_valid_tool_name("github-mcp-server-search_code"));
+    }
+
+    #[test]
+    fn intermediate_text_is_suppressed_when_tool_calls_exist() {
+        let loop_text = "draft review text";
+        let loop_tool_calls = [json!({
+            "id": "call_1",
+            "type": "function",
+            "function": {"name": "git_show", "arguments": "{\"rev\":\"HEAD\"}"}
+        })];
+        let should_emit = !loop_text.trim().is_empty() && loop_tool_calls.is_empty();
+        assert!(
+            !should_emit,
+            "intermediate draft text must not be emitted when tool calls are pending"
+        );
+    }
+
+    #[test]
+    fn intermediate_text_is_emitted_without_tool_calls() {
+        let loop_text = "final review";
+        let loop_tool_calls: Vec<Value> = Vec::new();
+        let should_emit = !loop_text.trim().is_empty() && loop_tool_calls.is_empty();
+        assert!(
+            should_emit,
+            "final text should still stream when no tool calls exist"
+        );
     }
 }

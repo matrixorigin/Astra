@@ -15,6 +15,7 @@
           "source": "edge",
           "tool_call_id": "tc-edge",
           "name": "get_agent_info",
+          "tool_name": "get_agent_info",
           "introspection": true
         },
         "skill_name": "get_agent_info",
@@ -35,7 +36,8 @@
         "metadata": {
           "source": "cloud",
           "tool_call_id": "tc-cloud",
-          "name": "search_code"
+          "name": "search_code",
+          "tool_name": "search_code"
         },
         "skill_name": "search_code",
         "reasoning_content": null
@@ -63,6 +65,7 @@
         "metadata": {
           "tool_call_id": "tc1",
           "name": "read_file",
+          "tool_name": "read_file",
           "source": "edge"
         },
         "skill_name": "read_file",
@@ -91,6 +94,7 @@
         "metadata": {
           "tool_call_id": "tc2",
           "name": "bash",
+          "tool_name": "bash",
           "source": "cloud"
         },
         "skill_name": "bash",

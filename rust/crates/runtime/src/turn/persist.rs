@@ -35,6 +35,7 @@ pub fn build_tool_result_event_payload(
                 .unwrap_or(Value::Null),
         ),
         ("name".to_string(), Value::from(skill_name.clone())),
+        ("tool_name".to_string(), Value::from(skill_name.clone())),
     ]);
     if source == "edge" && skill_name == "get_agent_info" {
         metadata.insert("introspection".to_string(), Value::Bool(true));
@@ -98,6 +99,7 @@ pub fn build_tool_call_event_payload(
                 tool_call.get("id").cloned().unwrap_or(Value::from("")),
             ),
             ("name".to_string(), Value::from(skill_name.clone())),
+            ("tool_name".to_string(), Value::from(skill_name.clone())),
             ("source".to_string(), Value::from(source)),
         ]),
         skill_name,

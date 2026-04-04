@@ -56,6 +56,14 @@ pub struct EventListRecord {
     pub offset: u32,
 }
 
+fn metadata_tool_name(metadata: Option<&serde_json::Value>) -> Option<String> {
+    metadata
+        .and_then(|v| v.get("tool_name").or_else(|| v.get("name")))
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim_matches('"').to_string())
+        .filter(|s| !s.is_empty())
+}
+
 // ── Trait ─────────────────────────────────────────────────────────────────────
 
 #[async_trait]
@@ -199,12 +207,7 @@ impl EventService for DatabaseEventService {
         let agent_id = request.agent_id.unwrap_or_else(|| "system".to_string());
         let agent_version = request.agent_version.unwrap_or_else(|| "1.0.0".to_string());
 
-        let meta_tool_name = request
-            .metadata
-            .as_ref()
-            .and_then(|v| v.get("tool_name"))
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
+        let meta_tool_name = metadata_tool_name(request.metadata.as_ref());
         let meta_duration_ms = request
             .metadata
             .as_ref()
