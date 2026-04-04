@@ -485,7 +485,7 @@ tools:
 name: github
 version: "1.0.0"
 description: "GitHub integration — PRs, issues, CI status, code search"
-author: "mo-agent-engine"
+author: "astra-engine"
 table_prefix: sk_github
 tables:
   - sk_github_repos

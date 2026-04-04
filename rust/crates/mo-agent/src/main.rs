@@ -158,10 +158,10 @@ enum Command {
     Model(ModelCmd),
     #[command(subcommand)]
     Skill(SkillCmd),
-    /// Session audit: mo-agent audit list/show/turns/tools
+    /// Session audit: astra audit list/show/turns/tools
     #[command(subcommand)]
     Audit(AuditCmd),
-    /// Direct message: mo-agent "your question here"
+    /// Direct message: astra "your question here"
     #[command(external_subcommand)]
     Message(Vec<String>),
 }

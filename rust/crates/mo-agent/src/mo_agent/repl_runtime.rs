@@ -442,7 +442,7 @@ pub(super) fn print_repl_banner(profile: Option<&str>, state: &ReplState) {
     let tip2_plain = format!("  💡 {tip2}");
 
     let lines_plain = [
-        format!("  mo-agent  v{version}"),
+        format!("  astra  v{version}"),
         format!(
             "  profile: {}  user: {}  model: {}  session: {}",
             pname, user_display, model_display, session_display
@@ -460,7 +460,7 @@ pub(super) fn print_repl_banner(profile: Option<&str>, state: &ReplState) {
     let lines_colored = [
         format!(
             "  {}  {}",
-            "mo-agent".cyan().bold(),
+            "astra".cyan().bold(),
             format!("v{version}").dim()
         ),
         format!(
@@ -513,12 +513,12 @@ fn banner_session_display(state: &ReplState) -> String {
 
 fn startup_logo_lines() -> &'static [&'static str] {
     &[
-        "███╗   ███╗ ██████╗",
-        "████╗ ████║██╔═══██╗",
-        "██╔████╔██║██║   ██║",
-        "██║╚██╔╝██║██║   ██║",
-        "██║ ╚═╝ ██║╚██████╔╝",
-        "╚═╝     ╚═╝ ╚═════╝ ",
+        " █████╗ ███████╗████████╗██████╗  █████╗",
+        "██╔══██╗██╔════╝╚══██╔══╝██╔══██╗██╔══██╗",
+        "███████║███████╗   ██║   ██████╔╝███████║",
+        "██╔══██║╚════██║   ██║   ██╔══██╗██╔══██║",
+        "██║  ██║███████║   ██║   ██║  ██║██║  ██║",
+        "╚═╝  ╚═╝╚══════╝   ╚═╝   ╚═╝  ╚═╝╚═╝  ╚═╝",
     ]
 }
 

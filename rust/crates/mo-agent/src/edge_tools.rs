@@ -1,4 +1,4 @@
-//! Edge tool definitions and execution for the mo-agent CLI.
+//! Edge tool definitions and execution for the astra CLI.
 //!
 //! Tools: bash, read_file (with outline mode), write_file, str_replace (with fuzzy matching),
 //!        list_dir, grep (with context_lines/max_matches), glob,
@@ -1189,7 +1189,7 @@ impl ToolExecutor {
                 .filter(|value| !value.is_empty()),
             github_client: Client::builder()
                 .timeout(Duration::from_secs(15))
-                .user_agent(format!("mo-agent/{}", env!("CARGO_PKG_VERSION")))
+                .user_agent(format!("astra/{}", env!("CARGO_PKG_VERSION")))
                 .build()
                 .expect("failed to create GitHub HTTP client"),
             sandbox_policy: Some(sandbox),
@@ -1594,7 +1594,7 @@ impl ToolExecutor {
                         "note": "Context window data is available from the server. Check the explain output (/explain) for token breakdown."
                     }),
                     "identity" => serde_json::json!({
-                        "name": "mo-agent",
+                        "name": "astra",
                         "version": env!("CARGO_PKG_VERSION"),
                         "runtime": "Rust edge CLI",
                         "note": "Cloud-side identity (model, system prompt) is server-managed."
@@ -1602,7 +1602,7 @@ impl ToolExecutor {
                     _ => serde_json::json!({
                         "tools_available": self.tool_names(),
                         "tool_count": self.tool_count(),
-                        "runtime": "mo-agent Rust CLI",
+                        "runtime": "astra Rust CLI",
                         "version": env!("CARGO_PKG_VERSION"),
                         "note": "For full agent info including memory, context, model details, the server provides richer data."
                     }),
@@ -5833,7 +5833,7 @@ func main() {
             .execute(
                 "run_build_test",
                 &json!({
-                    "command": "cargo check -p mo-agent-cli --message-format=short 2>&1 | tail -5"
+                    "command": "cargo check -p astra-cli --message-format=short 2>&1 | tail -5"
                 }),
             )
             .await;

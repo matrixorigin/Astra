@@ -491,7 +491,7 @@ fn dump_turn_json(
 
     let payload = if full_snapshot {
         serde_json::json!({
-            "schema": "mo-agent-debug-turn-full-v1",
+            "schema": "astra-debug-turn-full-v1",
             "session_id": session_id,
             "inspect": {
                 "journal_turn_ordinal": turn_n,
@@ -505,7 +505,7 @@ fn dump_turn_json(
         })
     } else {
         serde_json::json!({
-            "schema": "mo-agent-debug-turn-delta-v1",
+            "schema": "astra-debug-turn-delta-v1",
             "session_id": session_id,
             "inspect": {
                 "journal_turn_ordinal": turn_n,

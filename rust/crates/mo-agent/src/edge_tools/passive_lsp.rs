@@ -1,7 +1,7 @@
 //! Passive stdio LSP: **rust-analyzer** and **typescript-language-server** (opt-in).
 //!
 //! claudecode merges arbitrary servers from **plugins**; here we use env flags until
-//! a `mo-agent-lsp.json` config exists.
+//! a `astra-lsp.json` config exists.
 //!
 //! - Rust: `MO_AGENT_LSP_RUST=1`, `MO_AGENT_RUST_ANALYZER_CMD` (default `rust-analyzer`)
 //! - TS: `MO_AGENT_LSP_TYPESCRIPT=1`, `MO_AGENT_TYPESCRIPT_SERVER_CMD` (default `typescript-language-server`)

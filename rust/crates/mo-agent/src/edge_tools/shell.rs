@@ -1098,7 +1098,7 @@ impl ToolExecutor {
             "--max-filesize",
             &(max_bytes * 2).to_string(),
             "-H",
-            "User-Agent: mo-agent/0.1",
+            "User-Agent: astra/0.1",
             "-w",
             "\n__CURL_META__%{http_code} %{content_type} %{size_download} %{url_effective}",
             url,

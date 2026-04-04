@@ -391,7 +391,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                 if !self.quiet {
                     eprintln!(
                         "{}",
-                        "Session expired. Please re-authenticate with `mo-agent auth login`.".red()
+                        "Session expired. Please re-authenticate with `astra auth login`.".red()
                     );
                 }
             } else if !self.quiet && !self.suppress_intermediate_output {
@@ -441,7 +441,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                 if !self.quiet {
                     eprintln!(
                         "{}",
-                        "Session expired. Please re-authenticate with `mo-agent auth login`.".red()
+                        "Session expired. Please re-authenticate with `astra auth login`.".red()
                     );
                 }
             } else if !self.quiet && !self.suppress_intermediate_output {

@@ -34,7 +34,7 @@ pub(super) async fn execute_cli_command(
             Ok(ExitCode::Success)
         }
 
-        // Inline message: mo-agent "what is the answer to life?"
+        // Inline message: astra "what is the answer to life?"
         Some(Command::Message(words)) => {
             let message = words.join(" ");
             let (mut creds, name, _, token) = get_profile_and_token(profile.as_deref())?;
@@ -133,7 +133,7 @@ pub(super) async fn execute_cli_command(
             do_login(api, profile.as_deref(), &username, &password).await?;
             eprintln!(
                 "{}",
-                "  ✓  Logged in. Run `mo-agent` to start chatting.".green()
+                "  ✓  Logged in. Run `astra` to start chatting.".green()
             );
             Ok(ExitCode::Success)
         }
@@ -150,7 +150,7 @@ pub(super) async fn execute_cli_command(
             do_login(api, profile.as_deref(), &username, &password).await?;
             eprintln!(
                 "{}",
-                "  ✓  Logged in. Run `mo-agent` to start chatting.".green()
+                "  ✓  Logged in. Run `astra` to start chatting.".green()
             );
             Ok(ExitCode::Success)
         }

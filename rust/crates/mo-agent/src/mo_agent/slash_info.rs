@@ -962,7 +962,7 @@ pub(super) async fn handle_info_command(
             rows.push((
                 true,
                 "binary",
-                format!("mo-agent v{}", env!("CARGO_PKG_VERSION")),
+                format!("astra v{}", env!("CARGO_PKG_VERSION")),
             ));
 
             // API health
@@ -1227,7 +1227,7 @@ pub(super) async fn handle_info_command(
         }
 
         "/version" => {
-            eprintln!("{}", "  mo-agent version 0.1.0 (Rust)".bold());
+            eprintln!("{}", "  astra version 0.1.0 (Rust)".bold());
         }
 
         "/rewind" => {
