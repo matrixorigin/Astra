@@ -144,8 +144,8 @@ pub use sandbox::{
     DatabaseSandboxService, SandboxRecord, SandboxService, UnconfiguredSandboxService,
 };
 pub use session_fork::{
-    CrossBranchLearning, DataBranchOptions, ExploreOptions, ExploreResult, ForkSessionOptions,
-    ForkSessionResult, TuneConfig, TuneExperimentResult, TuneSweepResult,
+    CrossBranchLearning, DataBranchOptions, ExploreError, ExploreOptions, ExploreResult,
+    ForkSessionOptions, ForkSessionResult, TuneConfig, TuneExperimentResult, TuneSweepResult,
     create_exploration_branches, fork_local_session,
 };
 pub use skill_config::{

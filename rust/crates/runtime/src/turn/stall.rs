@@ -1,5 +1,6 @@
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 /// Require 3 consecutive identical tool call turns (not 2) to detect stall.
@@ -372,9 +373,6 @@ pub fn detect_nudge_ignored(
         .cloned()
         .collect()
 }
-
-use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 
 // ─── Adaptive stall thresholds ──────────────────────────────────────────────
 

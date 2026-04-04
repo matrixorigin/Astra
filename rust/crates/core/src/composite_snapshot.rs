@@ -15,6 +15,16 @@
 //! The runtime treats data snapshot references as opaque locators — only the
 //! data layer (MatrixOne adapter) knows how to materialise or restore from them.
 //! The business layer declares bindings via [`SnapshotSpec`].
+//!
+//! ## Timestamp formats
+//!
+//! [`DataSnapshotRef::timestamp`] uses ISO 8601 strings because MatrixOne's
+//! `SHOW SNAPSHOTS` returns human-readable timestamps; keeping the same format
+//! avoids a lossy conversion round-trip.
+//!
+//! [`MemorySnapshotRef::epoch`] uses `u64` (Unix epoch seconds) because the
+//! Memoria persistence layer indexes snapshots by epoch — matching that format
+//! keeps lookups zero-cost.
 
 use serde::{Deserialize, Serialize};
 use std::future::Future;

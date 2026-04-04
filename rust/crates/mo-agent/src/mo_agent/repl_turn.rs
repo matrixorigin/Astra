@@ -997,9 +997,473 @@ fn report_turn_failure(
     }
 }
 
+/// Copy plan / durable-task fields from REPL into workspace before checkpointing.
+fn sync_plan_fields_to_workspace(state: &ReplState, ws: &mut astra_services::session_workspace::WorkspaceMetadata) {
+    ws.executing_plan_json = state
+        .executing_plan
+        .as_ref()
+        .and_then(|p| serde_json::to_string(p).ok());
+    ws.plan_goal = state.executing_plan_goal.clone();
+    ws.plan_config_json = state
+        .plan_execution_config
+        .as_ref()
+        .and_then(|c| serde_json::to_string(c).ok());
+    ws.plan_execution_rounds = state.plan_execution_rounds;
+    ws.contract_json = state
+        .durable_task_state
+        .as_ref()
+        .and_then(|d| serde_json::to_string(&d.contract).ok());
+    ws.plan_corrections = state.plan_execution_corrections.clone();
+}
+
+/// Next numeric id for `step_checkpoints/<NNNNNN>-*.json`.
+fn next_step_checkpoint_number(sid: &str) -> Result<u32, String> {
+    let existing = astra_runtime::pipeline::step_checkpoint::list_checkpoints(sid)
+        .map_err(|e| format!("list step checkpoints: {e}"))?;
+    Ok(existing
+        .iter()
+        .map(|(n, _)| *n)
+        .max()
+        .unwrap_or(0)
+        .saturating_add(1))
+}
+
+/// Build heavy step checkpoint from current REPL history (OpenAI-style messages).
+fn build_manual_heavy_step_checkpoint(
+    state: &ReplState,
+    sid: &str,
+) -> astra_runtime::pipeline::step_protocol::StepCheckpoint {
+    use astra_runtime::pipeline::step_protocol::{
+        ExecutionCursor, HeavyCheckpoint, LightCheckpoint, StepCheckpoint, PROTOCOL_VERSION,
+        epoch_ms,
+    };
+
+    let mut messages = Vec::new();
+    for (u, a) in &state.history {
+        messages.push(serde_json::json!({ "role": "user", "content": u }));
+        messages.push(serde_json::json!({ "role": "assistant", "content": a }));
+    }
+
+    let max_turns = std::env::var("MO_MAX_TURNS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(50u32);
+    let now_ms = epoch_ms();
+    let total_tok = state.total_prompt_tokens + state.total_completion_tokens;
+
+    let light = LightCheckpoint {
+        protocol_version: PROTOCOL_VERSION,
+        cursor: ExecutionCursor::default(),
+        step_id: "repl-manual".to_string(),
+        task_id: state.run_id.clone().unwrap_or_else(|| "repl".to_string()),
+        agent_id: sid.to_string(),
+        progress: 1.0,
+        total_tokens: total_tok,
+        created_at: now_ms,
+    };
+    let heavy = HeavyCheckpoint {
+        light,
+        messages,
+        budget_remaining_tokens: 0,
+        budget_remaining_rounds: max_turns.saturating_sub(state.turn),
+        blocked_tools: Vec::new(),
+        recent_tools: state.recent_tools.clone(),
+        learning_snapshot_id: None,
+        memory_context: None,
+        delegation_id: None,
+        delegation_pattern: None,
+        delegation_sub_run_summaries: Vec::new(),
+    };
+    StepCheckpoint::Heavy(Box::new(heavy))
+}
+
+/// Persist heavy JSON + composite snapshot index. Run **before** mutating workspace checkpoint list
+/// so a failure here does not leave `workspace.yaml` ahead of disk recovery files.
+fn persist_manual_heavy_and_composite(
+    sid: &str,
+    turn: u32,
+    title: &str,
+    next_step: u32,
+    step_cp: &astra_runtime::pipeline::step_protocol::StepCheckpoint,
+) -> Result<std::path::PathBuf, String> {
+    use astra_runtime::pipeline::step_checkpoint::{
+        read_composite_snapshot_index, write_composite_snapshot_index, write_step_checkpoint,
+    };
+
+    let heavy_path = write_step_checkpoint(sid, next_step, step_cp)
+        .map_err(|e| format!("write heavy step checkpoint: {e}"))?;
+
+    let snapshot = astra_core::composite_snapshot::CompositeSnapshotBuilder::new(
+        sid.to_string(),
+        turn,
+    )
+    .label(format!("manual:{title}"))
+    .session_state(format!("{next_step:06}-heavy.json"))
+    .workspace_state(sid.to_string())
+    .build();
+    let mut index = read_composite_snapshot_index(sid).unwrap_or_default();
+    index.snapshots.push(snapshot);
+    if let Err(e) = write_composite_snapshot_index(sid, &index) {
+        return Err(format!(
+            "write composite snapshot index: {e} (heavy file already at {})",
+            heavy_path.display()
+        ));
+    }
+
+    Ok(heavy_path)
+}
+
+/// After heavy JSON exists: bump workspace checkpoint list, write markdown, journal, ingestion, `workspace.yaml`.
+fn persist_manual_session_checkpoint_layer(
+    state: &ReplState,
+    journal: &session_journal::JournalWriter,
+    sid: &str,
+    ws: &mut astra_services::session_workspace::WorkspaceMetadata,
+    title: &str,
+) -> Result<
+    (
+        std::path::PathBuf,
+        u32,
+        astra_services::session_checkpoint::Checkpoint,
+    ),
+    String,
+> {
+    ws.record_checkpoint();
+    let cp_number = ws.checkpoints.len() as u32;
+    let summary = format!(
+        "User /checkpoint at turn {} — {} ({} turns in history, {} recent tools).",
+        ws.turn_count,
+        title,
+        state.history.len(),
+        state.recent_tools.len(),
+    );
+
+    let cp = astra_services::session_checkpoint::Checkpoint {
+        number: cp_number,
+        turn: ws.turn_count,
+        title: title.to_string(),
+        summary: summary.clone(),
+        tools_used: state.recent_tools.clone(),
+        total_tokens: ws.total_tokens_in + ws.total_tokens_out,
+        had_stalls: false,
+        error_count: 0,
+        contract_state_json: state
+            .durable_task_state
+            .as_ref()
+            .and_then(|d| serde_json::to_string(&d.contract).ok()),
+    };
+
+    let cp_path = astra_services::session_checkpoint::write_checkpoint(sid, &cp)
+        .map_err(|e| format!("write session checkpoint: {e}"))?;
+
+    let cp_event = session_journal::JournalEvent::checkpoint(
+        Some(sid),
+        ws.turn_count,
+        &summary,
+        ws.total_tokens_in + ws.total_tokens_out,
+        state.recent_tools.len(),
+    );
+    if let Err(e) = journal.append(&cp_event) {
+        astra_core::agent_warn!(
+            "checkpoint",
+            "journal append failed after writing session checkpoint markdown (file={}): {e}",
+            cp_path.display()
+        );
+        return Err(format!(
+            "journal append failed (checkpoint markdown exists at {}): {e}",
+            cp_path.display()
+        ));
+    }
+    enqueue_ingestion(state, &cp_event);
+
+    astra_services::session_workspace::write_workspace(ws)
+        .map_err(|e| format!("write workspace: {e}"))?;
+
+    Ok((cp_path, cp_number, cp))
+}
+
+/// Queue session + step checkpoint uploads (best-effort; errors only in logs).
+fn spawn_manual_checkpoint_cloud_uploads(
+    state: &ReplState,
+    sid: &str,
+    session_cp: &astra_services::session_checkpoint::Checkpoint,
+    next_step: u32,
+    turn: u32,
+    title: &str,
+    step_cp: &astra_runtime::pipeline::step_protocol::StepCheckpoint,
+) {
+    let Some(ref mc) = state.matrix_runtime else {
+        return;
+    };
+    let user_id = state.ingestion_user_id.as_deref().unwrap_or("anonymous").to_string();
+    let user_id_step = user_id.clone();
+    let pool = mc.shared_pool().get().clone();
+    let sid_owned = sid.to_string();
+    let cp_clone = session_cp.clone();
+    tokio::spawn(async move {
+        if let Err(e) = astra_services::session_restore::push_checkpoint_to_cloud(
+            &pool,
+            &sid_owned,
+            &user_id,
+            &cp_clone,
+        )
+        .await
+        {
+            astra_core::agent_warn!("checkpoint", "cloud push session checkpoint: {e}");
+        }
+    });
+
+    let pool2 = mc.shared_pool().get().clone();
+    let sid_step = sid.to_string();
+    let title_owned = title.to_string();
+    let state_json = serde_json::to_string(step_cp).unwrap_or_default();
+    let tools_json =
+        serde_json::to_string(&state.recent_tools).unwrap_or_else(|_| "[]".to_string());
+    tokio::spawn(async move {
+        if let Err(e) = astra_services::session_restore::push_step_checkpoint_to_cloud(
+            &pool2,
+            &sid_step,
+            &user_id_step,
+            next_step,
+            turn,
+            "heavy",
+            &title_owned,
+            &tools_json,
+            &state_json,
+        )
+        .await
+        {
+            astra_core::agent_warn!("checkpoint", "cloud push step checkpoint: {e}");
+        }
+    });
+}
+
+/// User-initiated checkpoint: heavy JSON + composite index first, then session markdown,
+/// journal, and workspace — avoids workspace/checkpoint markdown ahead of failed heavy writes.
+///
+/// Cloud uploads are asynchronous; success line includes **pending cloud sync** when Matrix is enabled.
+pub(super) fn create_manual_repl_checkpoint(
+    state: &mut ReplState,
+    label_arg: &str,
+) -> Result<String, String> {
+    let sid = state
+        .session_id
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| "No active session — chat once first.".to_string())?;
+    let journal = state
+        .journal
+        .as_ref()
+        .ok_or_else(|| "Journal not available.".to_string())?;
+
+    let title = {
+        let t = label_arg.trim();
+        if t.is_empty() {
+            "Manual checkpoint".to_string()
+        } else {
+            t.to_string()
+        }
+    };
+
+    let mut ws = astra_services::session_workspace::read_workspace(sid)
+        .map_err(|e| format!("read workspace: {e}"))?;
+    sync_plan_fields_to_workspace(state, &mut ws);
+
+    let next_step = next_step_checkpoint_number(sid)?;
+    let step_cp = build_manual_heavy_step_checkpoint(state, sid);
+    let heavy_path = persist_manual_heavy_and_composite(sid, ws.turn_count, &title, next_step, &step_cp)?;
+
+    let turn = ws.turn_count;
+    let (cp_path, cp_number, cp) =
+        persist_manual_session_checkpoint_layer(state, journal, sid, &mut ws, &title)?;
+
+    let cloud_note = if state.matrix_runtime.is_some() {
+        " Pending cloud sync — not awaited in the REPL; success is not printed here (errors are logged)."
+    } else {
+        ""
+    };
+
+    spawn_manual_checkpoint_cloud_uploads(state, sid, &cp, next_step, turn, &title, &step_cp);
+
+    Ok(format!(
+        "Saved checkpoint #{} (turn {}) — {}; heavy: {}{cloud_note}",
+        cp_number,
+        turn,
+        cp_path.display(),
+        heavy_path.display(),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use astra_runtime::pipeline::step_checkpoint::read_composite_snapshot_index;
+    use astra_runtime::pipeline::step_protocol::StepCheckpoint;
+
+    /// `list_checkpoints` / journal paths use `dirs::home_dir()` — isolate `HOME` for file tests.
+    struct ScopedHome(Option<std::ffi::OsString>);
+    impl ScopedHome {
+        fn new(tmp: &std::path::Path) -> Self {
+            let old = std::env::var_os("HOME");
+            // SAFETY: unit tests only; `#[serial_test::serial]` avoids concurrent env mutation.
+            unsafe {
+                std::env::set_var("HOME", tmp);
+            }
+            Self(old)
+        }
+    }
+    impl Drop for ScopedHome {
+        fn drop(&mut self) {
+            // SAFETY: restores previous `HOME` after the same test's isolated I/O.
+            unsafe {
+                match self.0.take() {
+                    Some(v) => std::env::set_var("HOME", v),
+                    None => std::env::remove_var("HOME"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn sync_plan_fields_copies_repl_into_workspace() {
+        let mut state = ReplState::default();
+        state.executing_plan_goal = Some("goal-x".to_string());
+        state.plan_execution_rounds = 9;
+        state.plan_execution_corrections = vec!["note".to_string()];
+
+        let mut ws = astra_services::session_workspace::WorkspaceMetadata::new("sid-plan", "m");
+        sync_plan_fields_to_workspace(&state, &mut ws);
+
+        assert_eq!(ws.plan_goal.as_deref(), Some("goal-x"));
+        assert_eq!(ws.plan_execution_rounds, 9);
+        assert_eq!(ws.plan_corrections, vec!["note".to_string()]);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn next_step_checkpoint_number_empty_dir_starts_at_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _home = ScopedHome::new(tmp.path());
+        assert_eq!(next_step_checkpoint_number("sess-empty").unwrap(), 1);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn next_step_checkpoint_number_one_after_max_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _home = ScopedHome::new(tmp.path());
+        let sid = "sess-step";
+        let cp_dir = tmp
+            .path()
+            .join(".astra")
+            .join("sessions")
+            .join(sid)
+            .join("step_checkpoints");
+        std::fs::create_dir_all(&cp_dir).unwrap();
+        std::fs::write(cp_dir.join("000007-heavy.json"), "{}").unwrap();
+        assert_eq!(next_step_checkpoint_number(sid).unwrap(), 8);
+    }
+
+    #[test]
+    fn manual_heavy_checkpoint_maps_history_to_openai_messages() {
+        let mut state = ReplState::default();
+        state.history.push(("u1".into(), "a1".into()));
+        state.history.push(("u2".into(), "a2".into()));
+        state.recent_tools = vec!["bash".to_string()];
+        state.turn = 4;
+        state.total_prompt_tokens = 11;
+        state.total_completion_tokens = 22;
+        state.run_id = Some("run-z".to_string());
+
+        let cp = build_manual_heavy_step_checkpoint(&state, "sess-h");
+        let StepCheckpoint::Heavy(h) = cp else {
+            panic!("expected Heavy checkpoint");
+        };
+        assert_eq!(h.messages.len(), 4);
+        assert_eq!(h.messages[0]["role"], "user");
+        assert_eq!(h.messages[0]["content"], "u1");
+        assert_eq!(h.messages[3]["content"], "a2");
+        assert_eq!(h.recent_tools, vec!["bash".to_string()]);
+        assert_eq!(h.light.agent_id, "sess-h");
+        assert_eq!(h.light.task_id, "run-z");
+        assert_eq!(h.light.total_tokens, 33);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn persist_manual_heavy_and_composite_writes_heavy_and_index() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _home = ScopedHome::new(tmp.path());
+        let sid = "sess-heavy-idx";
+        let state = ReplState::default();
+        let step_cp = build_manual_heavy_step_checkpoint(&state, sid);
+
+        let heavy_path =
+            persist_manual_heavy_and_composite(sid, 2, "label-z", 1, &step_cp).unwrap();
+        assert!(heavy_path.exists());
+        assert!(heavy_path.to_string_lossy().ends_with("-heavy.json"));
+
+        let index = read_composite_snapshot_index(sid).unwrap();
+        assert_eq!(index.snapshots.len(), 1);
+        assert_eq!(
+            index.snapshots[0].label.as_deref(),
+            Some("manual:label-z")
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn persist_manual_session_checkpoint_layer_writes_md_journal_workspace() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _home = ScopedHome::new(tmp.path());
+        let sid = uuid::Uuid::new_v4().to_string();
+
+        let mut ws = astra_services::session_workspace::WorkspaceMetadata::new(&sid, "test-model");
+        ws.turn_count = 3;
+        astra_services::session_workspace::write_workspace(&ws).unwrap();
+
+        let journal = session_journal::JournalWriter::new(&sid).unwrap();
+        let mut state = ReplState::default();
+        state.history.push(("hi".into(), "hello".into()));
+        state.recent_tools = vec!["read_file".to_string()];
+
+        let mut ws = astra_services::session_workspace::read_workspace(&sid).unwrap();
+        let (cp_path, cp_number, _cp) =
+            persist_manual_session_checkpoint_layer(&state, &journal, &sid, &mut ws, "decision A")
+                .unwrap();
+
+        assert_eq!(cp_number, 1);
+        assert!(cp_path.exists());
+        assert_eq!(ws.checkpoints, vec![3]);
+
+        let journal_txt = std::fs::read_to_string(session_journal::journal_file_path(&sid)).unwrap();
+        assert!(
+            journal_txt.contains("\"checkpoint\"") || journal_txt.contains("checkpoint"),
+            "expected checkpoint journal line, got: {journal_txt:?}"
+        );
+        assert!(journal_txt.contains("decision"));
+
+        let ws2 = astra_services::session_workspace::read_workspace(&sid).unwrap();
+        assert_eq!(ws2.checkpoints, vec![3]);
+    }
+
+    #[test]
+    fn spawn_manual_cloud_uploads_no_panic_without_matrix() {
+        let state = ReplState::default();
+        let cp = astra_services::session_checkpoint::Checkpoint {
+            number: 1,
+            turn: 1,
+            title: "t".into(),
+            summary: "s".into(),
+            tools_used: vec![],
+            total_tokens: 0,
+            had_stalls: false,
+            error_count: 0,
+            contract_state_json: None,
+        };
+        let step_cp = build_manual_heavy_step_checkpoint(&state, "noop");
+        spawn_manual_checkpoint_cloud_uploads(&state, "noop", &cp, 1, 1, "t", &step_cp);
+    }
 
     #[test]
     fn short_continuation_prompt_is_detected() {

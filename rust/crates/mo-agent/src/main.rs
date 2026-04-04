@@ -111,7 +111,7 @@ use repl_runtime::{
     create_tool_selector_with_quality, current_access_token, initialize_repl_state,
     print_repl_banner, try_silent_auth,
 };
-use repl_turn::{ReplTurnContext, handle_chat_input};
+use repl_turn::{ReplTurnContext, create_manual_repl_checkpoint, handle_chat_input};
 use repl_ui::{
     ReplHelper, SlashStartCompleteHandler, clear_slash_overlay, history_path,
     is_slash_picker_active, print_keyboard_shortcuts, print_slash_commands, resolve_slash_command,
@@ -3718,6 +3718,15 @@ async fn handle_slash_command(
         }
 
         "/session" => handle_session_command(arg, state),
+
+        "/checkpoint" => match create_manual_repl_checkpoint(state, arg) {
+            Ok(msg) => {
+                eprintln!("  {} {}", theme::icon_ok(), msg.green());
+            }
+            Err(e) => {
+                eprintln!("  {}", e.yellow());
+            }
+        },
 
         "/debug" => handle_debug_command(arg, state),
 

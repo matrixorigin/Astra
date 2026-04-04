@@ -235,12 +235,59 @@ pub struct ExploreResult {
     pub fork_snapshots: Vec<Option<CompositeSnapshot>>,
 }
 
+/// Error from [`create_exploration_branches`] when one branch fails mid-sweep.
+#[derive(Debug, Clone)]
+pub enum ExploreError {
+    /// A fork failed before any branch was created (e.g. invalid parent).
+    Setup(String),
+    /// Some branches were created before a fork failed.
+    /// The caller is responsible for cleaning up `created`.
+    PartialFailure {
+        created: ExploreResult,
+        failed_branch: usize,
+        total_branches: usize,
+        error: String,
+    },
+}
+
+impl std::fmt::Display for ExploreError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Setup(e) => write!(f, "exploration setup failed: {e}"),
+            Self::PartialFailure {
+                created,
+                failed_branch,
+                total_branches,
+                error,
+            } => write!(
+                f,
+                "branch {failed_branch}/{total_branches} failed: {error} \
+                 ({} branches already created: [{}])",
+                created.branch_session_ids.len(),
+                created.branch_session_ids.join(", "),
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ExploreError {}
+
+impl ExploreError {
+    /// Extract successfully created branches for cleanup, regardless of variant.
+    pub fn into_partial_result(self) -> Option<ExploreResult> {
+        match self {
+            Self::Setup(_) => None,
+            Self::PartialFailure { created, .. } => Some(created),
+        }
+    }
+}
+
 /// Fork the parent session into `branch_count` parallel exploration branches.
 ///
 /// Each branch gets a label like `{label_prefix}-1`, `{label_prefix}-2`, etc.
 /// When `with_data_branches` is true, every fork also produces a data branch name
 /// that the caller can materialise via `CREATE DATABASE … FROM … WITH SNAPSHOT`.
-pub fn create_exploration_branches(opts: &ExploreOptions) -> Result<ExploreResult, String> {
+pub fn create_exploration_branches(opts: &ExploreOptions) -> Result<ExploreResult, ExploreError> {
     let mut result = ExploreResult {
         branch_session_ids: Vec::new(),
         data_branch_names: Vec::new(),
@@ -276,15 +323,17 @@ pub fn create_exploration_branches(opts: &ExploreOptions) -> Result<ExploreResul
                 result.fork_snapshots.push(fork_result.fork_snapshot);
             }
             Err(e) => {
-                // Return partial results so the caller knows which branches were created.
-                // The caller is responsible for cleanup of the already-created branches.
-                return Err(format!(
-                    "Failed to create branch {} of {}: {e} ({} branches already created: [{}])",
-                    i + 1,
-                    opts.branch_count,
-                    result.branch_session_ids.len(),
-                    result.branch_session_ids.join(", "),
-                ));
+                let err = if result.branch_session_ids.is_empty() {
+                    ExploreError::Setup(e)
+                } else {
+                    ExploreError::PartialFailure {
+                        created: result,
+                        failed_branch: i + 1,
+                        total_branches: opts.branch_count,
+                        error: e,
+                    }
+                };
+                return Err(err);
             }
         }
     }

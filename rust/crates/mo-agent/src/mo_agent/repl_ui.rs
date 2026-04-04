@@ -5,6 +5,10 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/help", "Show available commands"),
     ("/model", "List models or set active: /model <name>"),
     ("/clear", "Start a new session"),
+    (
+        "/checkpoint",
+        "Manual save: /checkpoint [label] — heavy JSON first, then session md + journal",
+    ),
     ("/history", "Show conversation turns"),
     ("/copy", "Copy last response to clipboard"),
     (
@@ -1079,6 +1083,7 @@ pub(super) fn print_slash_commands(query: Option<&str>) {
                 "/session export",
                 "/session fork",
                 "/session list",
+                "/checkpoint",
                 "/resume",
                 "/plan",
                 "/report",
@@ -1565,6 +1570,7 @@ mod tests {
     fn resolve_exact_match() {
         assert_eq!(resolve_slash_command("/help"), Ok("/help"));
         assert_eq!(resolve_slash_command("/exit"), Ok("/exit"));
+        assert_eq!(resolve_slash_command("/checkpoint"), Ok("/checkpoint"));
     }
 
     #[test]
