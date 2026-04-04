@@ -15,6 +15,20 @@ use mo_agent_services::{
 };
 use std::sync::Arc;
 
+/// Build a reqwest client that skips the system proxy for localhost/loopback URLs.
+/// External URLs use the default proxy from `HTTP_PROXY`/`HTTPS_PROXY` env vars.
+fn build_client_for_url(url: &str) -> reqwest::Client {
+    let is_local = url.contains("127.0.0.1")
+        || url.contains("localhost")
+        || url.contains("[::1]")
+        || url.contains("0.0.0.0");
+    let mut builder = reqwest::Client::builder();
+    if is_local {
+        builder = builder.no_proxy();
+    }
+    builder.build().unwrap_or_else(|_| reqwest::Client::new())
+}
+
 // ─── Active contract state held by the REPL ──────────────────────────────────
 
 /// Holds the active contract and lifecycle service during plan execution.
@@ -1049,8 +1063,9 @@ pub struct HttpLlmJudge {
 
 impl HttpLlmJudge {
     pub fn new(api_key: String, base_url: String, model: String) -> Self {
+        let client = build_client_for_url(&base_url);
         Self {
-            client: reqwest::Client::new(),
+            client,
             api_key,
             base_url,
             model,

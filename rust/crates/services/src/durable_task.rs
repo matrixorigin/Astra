@@ -21,6 +21,19 @@ use serde::{Deserialize, Serialize};
 use crate::event_ingestion::{IngestionEvent, IngestionSender};
 use crate::task_orchestrator::{TaskCheckpoint, TaskPlan};
 
+/// Build a reqwest client that skips the system proxy for localhost/loopback URLs.
+fn build_client_for_url(url: &str) -> reqwest::Client {
+    let is_local = url.contains("127.0.0.1")
+        || url.contains("localhost")
+        || url.contains("[::1]")
+        || url.contains("0.0.0.0");
+    let mut builder = reqwest::Client::builder();
+    if is_local {
+        builder = builder.no_proxy();
+    }
+    builder.build().unwrap_or_else(|_| reqwest::Client::new())
+}
+
 // ─── LLM Judge Trait ────────────────────────────────────────────────────────
 
 /// Trait for LLM-based semantic verification.
@@ -113,8 +126,9 @@ impl CloudLlmConfig {
 impl CloudLlmJudge {
     /// Create a cloud judge with optional database persistence.
     pub fn new(config: CloudLlmConfig, pool: Option<sqlx::Pool<sqlx::MySql>>) -> Self {
+        let client = build_client_for_url(&config.base_url);
         Self {
-            client: reqwest::Client::new(),
+            client,
             api_key: config.api_key,
             base_url: config.base_url,
             model: config.model,

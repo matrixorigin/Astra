@@ -72,6 +72,16 @@ pub async fn serve(addr: SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
     let settings = AppSettings::from_env()?;
     let state = state_builder::build_server_state(settings).await?;
 
+    // Warn about proxy settings that can cause confusing 502s for local clients
+    if let Ok(proxy) = std::env::var("http_proxy").or_else(|_| std::env::var("HTTP_PROXY"))
+        && !proxy.is_empty()
+    {
+        eprintln!(
+            "[warn] HTTP proxy detected: {proxy}. \
+             Local callers should set NO_PROXY=127.0.0.1,localhost or use --noproxy."
+        );
+    }
+
     // Spawn periodic expired data cleanup (runs every 6 hours)
     if let Some(ref pool) = state.shared_pool {
         spawn_data_cleanup(pool.clone());

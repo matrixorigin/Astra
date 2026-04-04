@@ -4268,6 +4268,23 @@ async fn run_chat_repl(
 
     print_repl_banner(profile, &state);
 
+    // Warn if HTTP proxy is set — local service calls bypass it, but users
+    // may see confusing 502s when testing with curl/wget.
+    if let Ok(proxy) = std::env::var("http_proxy").or_else(|_| std::env::var("HTTP_PROXY"))
+        && !proxy.is_empty()
+    {
+        eprintln!(
+            "  {}  {} {}",
+            "⚠".yellow(),
+            "HTTP proxy detected:".yellow(),
+            proxy.dim()
+        );
+        eprintln!(
+            "     {}",
+            "Agent bypasses proxy for local calls. For curl: use --noproxy '*'".dim()
+        );
+    }
+
     let mut edge_heartbeat_task: Option<tokio::task::JoinHandle<()>> = None;
     if let Some(ref tok) = current_access_token(profile) {
         edge_heartbeat_task = register_and_start_heartbeat(api, tok).await;
