@@ -528,6 +528,11 @@ struct ReplState {
     /// When Some, a plan is running in the background and the REPL can
     /// poll for updates via `plan_handle.try_recv()`.
     plan_handle: Option<plan_executor::PlanExecutorHandle>,
+
+    /// When Some, a plan-executor tool is waiting for user approval.
+    /// The REPL readline handler interprets the next line as y/n and
+    /// sends the bool through this oneshot.
+    pending_approval: Option<tokio::sync::oneshot::Sender<bool>>,
 }
 
 impl Default for ReplState {
@@ -585,6 +590,7 @@ impl Default for ReplState {
             plan_execution_corrections: Vec::new(),
             delegation_engine: None,
             plan_handle: None,
+            pending_approval: None,
         }
     }
 }
@@ -2763,6 +2769,33 @@ fn display_plan_updates_live(
                     _ => continue,
                 }
             }
+            PlanUpdate::ApprovalNeeded {
+                tool,
+                header,
+                detail,
+                reason,
+                response_tx,
+            } => {
+                // Stop spinner while waiting for user input
+                if let Some(s) = plan_spinner.take() {
+                    s.stop_clear();
+                }
+                let msg = format!(
+                    "\n{}  {} — {}\n   {}\n   Reason: {}",
+                    "⚠".yellow(),
+                    tool,
+                    header,
+                    detail.as_deref().unwrap_or(""),
+                    reason,
+                );
+                print_line(printer, plan_spinner, msg);
+                // Store the response channel for the REPL readline handler.
+                // The next user input line will be interpreted as y/n/a to resolve this.
+                state.pending_approval = Some(response_tx);
+                let prompt_msg = "   Type y(es) to approve, n(o) to deny:".to_string();
+                print_line(printer, plan_spinner, prompt_msg);
+                continue;
+            }
             _ => continue, // ParallelGroupInfo, StepByStepPrompt — future use
         };
 
@@ -4021,6 +4054,27 @@ async fn run_chat_repl(
                 }
                 readline.add_history(line.clone());
 
+                // ── Handle pending approval from background plan executor ──
+                if let Some(tx) = state.pending_approval.take() {
+                    let trimmed = line.trim().to_lowercase();
+                    let approved = trimmed == "y" || trimmed == "yes" || trimmed == "a";
+                    let denied = trimmed == "n" || trimmed == "no";
+                    if approved || denied {
+                        let _ = tx.send(approved);
+                        if approved {
+                            eprintln!("  {} Approved", "✓".green());
+                        } else {
+                            eprintln!("  {} Denied", "✗".red());
+                        }
+                        continue;
+                    } else {
+                        // Unrecognized — treat as deny and fall through
+                        let _ = tx.send(false);
+                        eprintln!("  {} Unrecognized response, treating as denied", "✗".red());
+                        // Fall through to normal input handling
+                    }
+                }
+
                 if line.starts_with('/') {
                     // If Enter was pressed in the picker, the selected command is
                     // stored in pending-execute (captured by readline actor thread).
@@ -4856,6 +4910,7 @@ mod tests {
             cancel_token: None,
             plan_assemble_line_release: None,
             stream_event_tx: None,
+            approval_request_tx: None,
         })
         .await
         .unwrap();
@@ -4906,6 +4961,7 @@ mod tests {
             cancel_token: None,
             plan_assemble_line_release: None,
             stream_event_tx: None,
+            approval_request_tx: None,
         })
         .await;
         assert!(result.is_err());
@@ -4972,6 +5028,7 @@ mod tests {
             cancel_token: None,
             plan_assemble_line_release: None,
             stream_event_tx: None,
+            approval_request_tx: None,
         })
         .await
         .unwrap();

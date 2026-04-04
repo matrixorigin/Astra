@@ -63,6 +63,8 @@ pub(crate) struct CliAgenticLoopHost<'a> {
     pub plan_assemble_line_release: Option<Arc<AtomicBool>>,
     /// Optional channel for forwarding fine-grained stream events.
     pub stream_event_tx: Option<super::super::StreamEventTx>,
+    /// Optional channel for async tool approval requests during plan execution.
+    pub approval_request_tx: Option<super::super::ApprovalRequestTx>,
 }
 
 #[async_trait]
@@ -119,6 +121,7 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
             cancel_token: state.cancel_token.as_deref(),
             plan_assemble_line_release: self.plan_assemble_line_release.clone(),
             stream_event_tx: self.stream_event_tx.clone(),
+            approval_request_tx: self.approval_request_tx.clone(),
         })
         .await?;
 

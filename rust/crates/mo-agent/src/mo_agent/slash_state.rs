@@ -140,6 +140,7 @@ pub(super) async fn handle_state_command(
                     cancel_token: None,
                     plan_assemble_line_release: None,
                     stream_event_tx: None,
+                approval_request_tx: None,
                 }) => r,
                 _ = tokio::signal::ctrl_c() => {
                     eprintln!("{}", "  Interrupted.".dim());
@@ -223,6 +224,7 @@ pub(super) async fn handle_state_command(
                         cancel_token: None,
                         plan_assemble_line_release: None,
                         stream_event_tx: None,
+                approval_request_tx: None,
                     })
                     .await;
 
@@ -288,6 +290,7 @@ pub(super) async fn handle_state_command(
                                 cancel_token: None,
                                 plan_assemble_line_release: None,
                                 stream_event_tx: None,
+                approval_request_tx: None,
                             })
                             .await;
                             if let Ok(sr2) = synth_result {

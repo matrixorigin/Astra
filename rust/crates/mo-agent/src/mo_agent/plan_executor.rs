@@ -90,6 +90,15 @@ pub enum PlanUpdate {
         subtask_id: String,
         event: super::chat_stream::StreamEvent,
     },
+    /// Tool requires interactive approval — REPL should prompt the user and
+    /// send the response via `response_tx`.
+    ApprovalNeeded {
+        tool: String,
+        header: String,
+        detail: Option<String>,
+        reason: String,
+        response_tx: tokio::sync::oneshot::Sender<bool>,
+    },
 }
 
 /// Commands sent from the REPL to a background plan executor.
@@ -883,6 +892,29 @@ async fn plan_executor_task(
                 }
             });
 
+            // Create approval request channel for async permission dialogs
+            let (approval_tx, mut approval_rx) =
+                tokio::sync::mpsc::unbounded_channel::<super::chat_stream::ApprovalRequest>();
+            let approval_update_tx = update_tx.clone();
+            let approval_forwarder = tokio::spawn(async move {
+                while let Some(req) = approval_rx.recv().await {
+                    // Forward approval request to REPL — the oneshot sender
+                    // travels with the PlanUpdate so the REPL can respond directly.
+                    if approval_update_tx
+                        .send(PlanUpdate::ApprovalNeeded {
+                            tool: req.tool,
+                            header: req.header,
+                            detail: req.detail,
+                            reason: req.reason,
+                            response_tx: req.response_tx,
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            });
+
             // Execute the subtask via stream_chat_sse
             let turn_result: Result<StreamResult, String> = stream_chat_sse(ChatTurnParams {
                 api: &ctx.api,
@@ -909,11 +941,13 @@ async fn plan_executor_task(
                 cancel_token: Some(cancel_token),
                 plan_assemble_line_release: None,
                 stream_event_tx: Some(stream_tx),
+                approval_request_tx: Some(approval_tx),
             })
             .await;
 
-            // The stream_chat_sse call is done; drop the sender by ending the forwarder.
+            // The stream_chat_sse call is done; drop the senders by ending the forwarders.
             stream_forwarder.abort();
+            approval_forwarder.abort();
 
             match turn_result {
                 Ok(result) => {

@@ -45,6 +45,18 @@ pub enum StreamEvent {
 
 pub type StreamEventTx = mpsc::UnboundedSender<StreamEvent>;
 
+/// Approval request sent from the SSE stream host to the plan executor / REPL
+/// when a tool requires interactive approval (bypass-immune check).
+pub struct ApprovalRequest {
+    pub tool: String,
+    pub header: String,
+    pub detail: Option<String>,
+    pub reason: String,
+    pub response_tx: tokio::sync::oneshot::Sender<bool>,
+}
+
+pub type ApprovalRequestTx = mpsc::UnboundedSender<ApprovalRequest>;
+
 /// Parameters for a single agentic chat turn — groups the many arguments
 /// to `stream_chat_sse` into a named struct to reduce cognitive load.
 pub(crate) struct ChatTurnParams<'a> {
@@ -88,4 +100,8 @@ pub(crate) struct ChatTurnParams<'a> {
     /// When present, `CliSseStreamHost` forwards fine-grained events through this channel
     /// even when `quiet` / `suppress_intermediate_output` are true.
     pub(crate) stream_event_tx: Option<StreamEventTx>,
+    /// Optional channel for async tool approval during plan execution.
+    /// When a bypass-immune permission check triggers, the approval request is sent
+    /// through this channel instead of blocking on stdin.
+    pub(crate) approval_request_tx: Option<ApprovalRequestTx>,
 }

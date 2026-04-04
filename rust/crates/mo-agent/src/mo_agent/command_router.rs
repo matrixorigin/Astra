@@ -69,6 +69,7 @@ pub(super) async fn execute_cli_command(
                 cancel_token: None,
                 plan_assemble_line_release: None,
                 stream_event_tx: None,
+                approval_request_tx: None,
             })
             .await
             {
@@ -100,6 +101,7 @@ pub(super) async fn execute_cli_command(
                         cancel_token: None,
                         plan_assemble_line_release: None,
                         stream_event_tx: None,
+                approval_request_tx: None,
                     })
                     .await?
                 }
@@ -318,6 +320,7 @@ pub(super) async fn execute_cli_command(
                 cancel_token: None,
                 plan_assemble_line_release: None,
                 stream_event_tx: None,
+                approval_request_tx: None,
             })
             .await
             {
@@ -349,6 +352,7 @@ pub(super) async fn execute_cli_command(
                         cancel_token: None,
                         plan_assemble_line_release: None,
                         stream_event_tx: None,
+                approval_request_tx: None,
                     })
                     .await?
                 }

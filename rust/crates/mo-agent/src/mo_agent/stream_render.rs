@@ -56,6 +56,8 @@ pub(super) struct EdgeSseContext<'a> {
     pub cancel_token: Option<&'a tokio_util::sync::CancellationToken>,
     /// Optional channel for forwarding fine-grained stream events.
     pub stream_event_tx: Option<super::chat_stream::StreamEventTx>,
+    /// Optional channel for async tool approval requests during plan execution.
+    pub approval_request_tx: Option<super::chat_stream::ApprovalRequestTx>,
 }
 
 // ─── CLI SSE stream host ─────────────────────────────────────────────────────
@@ -94,6 +96,8 @@ struct CliSseStreamHost<'a> {
     cancel_token: Option<&'a tokio_util::sync::CancellationToken>,
     /// Optional channel for forwarding fine-grained stream events.
     stream_event_tx: Option<super::chat_stream::StreamEventTx>,
+    /// Optional channel for async tool approval requests during plan execution.
+    approval_request_tx: Option<super::chat_stream::ApprovalRequestTx>,
 }
 
 impl<'a> CliSseStreamHost<'a> {
@@ -117,6 +121,7 @@ impl<'a> CliSseStreamHost<'a> {
             xml_tag_buffer: String::new(),
             cancel_token: ctx.cancel_token,
             stream_event_tx: ctx.stream_event_tx,
+            approval_request_tx: ctx.approval_request_tx,
         }
     }
 
@@ -377,7 +382,43 @@ impl SseStreamHost for CliSseStreamHost<'_> {
             None
         };
         let allowed = match &mut self.perm_manager {
-            Some(pm) => pm.check(tool, args),
+            Some(pm) => {
+                if self.approval_request_tx.is_some() {
+                    // Plan execution: use non-blocking check and route approvals through channel
+                    match pm.check_nonblocking(tool, args) {
+                        crate::permission_manager::PermissionDecision::Allow => true,
+                        crate::permission_manager::PermissionDecision::Deny(_reason) => false,
+                        crate::permission_manager::PermissionDecision::NeedApproval {
+                            tool: t,
+                            header,
+                            detail,
+                            reason,
+                        } => {
+                            let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
+                            if let Some(tx) = &self.approval_request_tx {
+                                let _ = tx.send(super::chat_stream::ApprovalRequest {
+                                    tool: t.clone(),
+                                    header,
+                                    detail,
+                                    reason,
+                                    response_tx: resp_tx,
+                                });
+                                // Wait for REPL to respond
+                                let result = resp_rx.await.unwrap_or(false);
+                                if result {
+                                    pm.record_approval(&t, true);
+                                }
+                                result
+                            } else {
+                                false
+                            }
+                        }
+                    }
+                } else {
+                    // Normal interactive mode: use blocking check with stdin prompt
+                    pm.check(tool, args)
+                }
+            }
             None => true,
         };
         let start = std::time::Instant::now();

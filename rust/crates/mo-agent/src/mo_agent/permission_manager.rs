@@ -629,6 +629,118 @@ impl PermissionManager {
             _ => false,
         }
     }
+
+    /// Non-blocking permission check for plan execution.
+    ///
+    /// Same 6-step logic as `check()` but returns `NeedApproval` instead of
+    /// blocking on `prompt_approval()`. The caller (execute_tool) can then
+    /// route the approval request through an async channel to the REPL.
+    pub(super) fn check_nonblocking(
+        &mut self,
+        name: &str,
+        args: &serde_json::Value,
+    ) -> PermissionDecision {
+        // Step 1: Deny rules (bypass-immune).
+        if self.check_deny_rules(name, args) {
+            return PermissionDecision::Deny("Denied by rule".into());
+        }
+
+        if let Some(&allowed) = self.session_overrides.get(name) {
+            return if allowed {
+                PermissionDecision::Allow
+            } else {
+                PermissionDecision::Deny("Skipped for session".into())
+            };
+        }
+
+        let side_effect = Self::classify(name);
+        if side_effect == SideEffect::Read {
+            return PermissionDecision::Allow;
+        }
+
+        // Step 2: Git safety checks (bypass-immune).
+        if side_effect == SideEffect::Execute {
+            let git_violations = Self::check_git_safety(args);
+            if !git_violations.is_empty() {
+                if self.mode == PermissionMode::Deny {
+                    return PermissionDecision::Deny("Git safety violation (deny mode)".into());
+                }
+                let reasons: Vec<String> = git_violations.iter().map(|v| format!("{v}")).collect();
+                let (header, detail) = Self::format_tool_display(name, args);
+                return PermissionDecision::NeedApproval {
+                    tool: name.to_string(),
+                    header,
+                    detail,
+                    reason: format!("Git safety: {}", reasons.join(", ")),
+                };
+            }
+        }
+
+        // Step 3: Dangerous file path (bypass-immune).
+        if let Some(warning) = Self::check_dangerous_path(name, args) {
+            if self.mode == PermissionMode::Deny {
+                return PermissionDecision::Deny("Sensitive path (deny mode)".into());
+            }
+            let (header, detail) = Self::format_tool_display(name, args);
+            return PermissionDecision::NeedApproval {
+                tool: name.to_string(),
+                header,
+                detail,
+                reason: warning.to_string(),
+            };
+        }
+
+        // Step 4: Execute decision.
+        if side_effect == SideEffect::Execute {
+            match Self::execute_decision(name, args) {
+                ExecuteDecision::AllowSilent => return PermissionDecision::Allow,
+                ExecuteDecision::Deny => {
+                    return PermissionDecision::Deny("Dangerous command".into());
+                }
+                ExecuteDecision::Ask => {}
+            }
+        } else if Self::is_dangerous(name, args) {
+            return PermissionDecision::Deny("Dangerous pattern".into());
+        }
+
+        // Step 5: Persistent allow rules.
+        if self.check_allow_rules(name, args) {
+            return PermissionDecision::Allow;
+        }
+
+        // Step 6: Permission mode.
+        match self.mode {
+            PermissionMode::Auto => PermissionDecision::Allow,
+            PermissionMode::Deny => PermissionDecision::Deny("Denied by mode".into()),
+            PermissionMode::Prompt => {
+                let (header, detail) = Self::format_tool_display(name, args);
+                PermissionDecision::NeedApproval {
+                    tool: name.to_string(),
+                    header,
+                    detail,
+                    reason: "Write/execute tool requires approval".to_string(),
+                }
+            }
+        }
+    }
+
+    /// Record a session override from an async approval response.
+    pub(super) fn record_approval(&mut self, name: &str, allowed: bool) {
+        self.session_overrides.insert(name.to_string(), allowed);
+    }
+}
+
+/// Result of a non-blocking permission check.
+pub(super) enum PermissionDecision {
+    Allow,
+    Deny(String),
+    /// Tool requires interactive approval — route through async channel.
+    NeedApproval {
+        tool: String,
+        header: String,
+        detail: Option<String>,
+        reason: String,
+    },
 }
 
 fn is_read_only_allowlisted(lower_cmd: &str) -> bool {
