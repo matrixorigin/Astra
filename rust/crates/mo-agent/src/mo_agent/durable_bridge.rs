@@ -1280,7 +1280,7 @@ impl astra_services::LlmJudge for ServerProxyLlmJudge {
 
         let mut body = serde_json::json!({
             "messages": [system_msg, user_msg],
-            "max_tokens": 200,
+            "max_tokens": 2000,
             "temperature": 0.1,
         });
         if let Some(ref m) = self.model {
@@ -1308,7 +1308,7 @@ mod tests {
     use super::*;
     use astra_services::task_orchestrator::{SubtaskPlan, TaskPlan, TaskStatus};
     use astra_services::{
-        SubtaskDeliverySummary, TaskScope, VerificationCriterion, VerificationResult,
+        LlmJudge, SubtaskDeliverySummary, TaskScope, VerificationCriterion, VerificationResult,
     };
 
     fn make_test_plan() -> TaskPlan {
@@ -2341,5 +2341,132 @@ mod tests {
             let gate = create_gate_for_subtask(&durable, &id, "/tmp".into());
             assert!(gate.is_some());
         }
+    }
+
+    // ─── ServerProxyLlmJudge integration tests ──────────────────────────
+
+    /// Spin up a mock `/v1/chat/completions` server that returns a canned JSON score,
+    /// then exercise `ServerProxyLlmJudge.evaluate()` end-to-end.
+    async fn mock_completions_server(score: f64, reason: &str) -> (String, tokio::task::JoinHandle<()>) {
+        use axum::{Router, Json, routing::post};
+
+        let score_str = format!(r#"{{"score": {score}, "reason": "{reason}"}}"#);
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(move |_body: Json<serde_json::Value>| {
+                let content = score_str.clone();
+                async move {
+                    Json(serde_json::json!({
+                        "id": "mock-1",
+                        "object": "chat.completion",
+                        "model": "mock-model",
+                        "choices": [{
+                            "index": 0,
+                            "message": { "role": "assistant", "content": content },
+                            "finish_reason": "stop"
+                        }],
+                        "usage": { "prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15 }
+                    }))
+                }
+            }),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+        (format!("http://{addr}"), handle)
+    }
+
+    #[tokio::test]
+    async fn server_proxy_judge_returns_high_score_on_positive() {
+        let (base_url, server) = mock_completions_server(0.95, "criterion fully met").await;
+        let api = astra_thin_client::ThinClient::new(&base_url, None).unwrap();
+        let judge = ServerProxyLlmJudge::new(api, "fake-token".into(), None);
+
+        let score = judge
+            .evaluate("Function returns i32", "fn add(a: i32, b: i32) -> i32 { a + b }")
+            .await
+            .expect("evaluate should succeed");
+
+        assert!((score - 0.95).abs() < 0.01, "expected ~0.95, got {score}");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn server_proxy_judge_returns_low_score_on_negative() {
+        let (base_url, server) = mock_completions_server(0.1, "no error handling").await;
+        let api = astra_thin_client::ThinClient::new(&base_url, None).unwrap();
+        let judge = ServerProxyLlmJudge::new(api, "fake-token".into(), None);
+
+        let score = judge
+            .evaluate("Handles errors with Result", "fn divide(a: i32, b: i32) -> i32 { a / b }")
+            .await
+            .expect("evaluate should succeed");
+
+        assert!(score < 0.5, "expected low score, got {score}");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn server_proxy_judge_includes_model_override() {
+        use axum::{Router, Json, routing::post};
+        use std::sync::{Arc, Mutex};
+
+        let captured = Arc::new(Mutex::new(String::new()));
+        let captured_clone = captured.clone();
+
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(move |Json(body): Json<serde_json::Value>| {
+                let cap = captured_clone.clone();
+                async move {
+                    // Capture the model field from the request
+                    if let Some(m) = body["model"].as_str() {
+                        *cap.lock().unwrap() = m.to_string();
+                    }
+                    Json(serde_json::json!({
+                        "id": "mock-1",
+                        "choices": [{
+                            "index": 0,
+                            "message": { "role": "assistant", "content": r#"{"score": 0.8}"# },
+                            "finish_reason": "stop"
+                        }],
+                        "usage": { "prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2 }
+                    }))
+                }
+            }),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.ok(); });
+
+        let api = astra_thin_client::ThinClient::new(&format!("http://{addr}"), None).unwrap();
+        let judge = ServerProxyLlmJudge::new(
+            api,
+            "fake-token".into(),
+            Some("custom-model-v2".into()),
+        );
+
+        let _score = judge.evaluate("test", "test context").await.unwrap();
+        assert_eq!(*captured.lock().unwrap(), "custom-model-v2");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn server_proxy_judge_handles_connection_error() {
+        // Point to a port nothing is listening on
+        let api = astra_thin_client::ThinClient::new("http://127.0.0.1:19999", None).unwrap();
+        let judge = ServerProxyLlmJudge::new(api, "fake-token".into(), None);
+
+        let result: Result<f64, String> = judge.evaluate("test criterion", "test context").await;
+        assert!(result.is_err(), "should fail on connection error");
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("Server proxy judge error"),
+            "error should mention proxy: {err}"
+        );
     }
 }
