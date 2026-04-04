@@ -54,6 +54,8 @@ pub(super) struct EdgeSseContext<'a> {
     pub perm_manager: Option<&'a mut crate::permission_manager::PermissionManager>,
     /// Optional cancellation token to abort SSE stream on auth failure.
     pub cancel_token: Option<&'a tokio_util::sync::CancellationToken>,
+    /// Optional channel for forwarding fine-grained stream events.
+    pub stream_event_tx: Option<super::chat_stream::StreamEventTx>,
 }
 
 // ─── CLI SSE stream host ─────────────────────────────────────────────────────
@@ -90,6 +92,8 @@ struct CliSseStreamHost<'a> {
     xml_tag_buffer: String,
     /// Optional cancellation token to abort SSE stream on auth failure.
     cancel_token: Option<&'a tokio_util::sync::CancellationToken>,
+    /// Optional channel for forwarding fine-grained stream events.
+    stream_event_tx: Option<super::chat_stream::StreamEventTx>,
 }
 
 impl<'a> CliSseStreamHost<'a> {
@@ -112,6 +116,7 @@ impl<'a> CliSseStreamHost<'a> {
             edge_tool_round: Vec::new(),
             xml_tag_buffer: String::new(),
             cancel_token: ctx.cancel_token,
+            stream_event_tx: ctx.stream_event_tx,
         }
     }
 
@@ -232,6 +237,9 @@ fn could_become_thinking_tag(partial: &str) -> bool {
 #[async_trait::async_trait]
 impl SseStreamHost for CliSseStreamHost<'_> {
     fn on_before_sse_read_loop(&mut self) {
+        if let Some(tx) = &self.stream_event_tx {
+            let _ = tx.send(super::chat_stream::StreamEvent::WaitingForModel);
+        }
         if self.quiet || self.suppress_intermediate_output {
             return;
         }
@@ -239,6 +247,9 @@ impl SseStreamHost for CliSseStreamHost<'_> {
     }
 
     fn on_first_sse_frame(&mut self) {
+        if let Some(tx) = &self.stream_event_tx {
+            let _ = tx.send(super::chat_stream::StreamEvent::ModelResponding);
+        }
         if self.quiet || self.suppress_intermediate_output {
             return;
         }
@@ -246,6 +257,27 @@ impl SseStreamHost for CliSseStreamHost<'_> {
     }
 
     fn on_render_effects(&mut self, effects: Vec<SseRenderEffect>) {
+        // Forward to stream event channel (even when quiet/suppress are on)
+        if let Some(tx) = &self.stream_event_tx {
+            use super::chat_stream::StreamEvent;
+            for effect in &effects {
+                let ev = match effect {
+                    SseRenderEffect::StreamText(s) if !s.is_empty() => {
+                        Some(StreamEvent::Token(s.clone()))
+                    }
+                    SseRenderEffect::StartThinkingSpinner => Some(StreamEvent::Thinking(true)),
+                    SseRenderEffect::StopThinkingSpinner => Some(StreamEvent::Thinking(false)),
+                    SseRenderEffect::ThinkingPreviewChunk(s) if !s.is_empty() => {
+                        Some(StreamEvent::ThinkingChunk(s.clone()))
+                    }
+                    _ => None,
+                };
+                if let Some(ev) = ev {
+                    let _ = tx.send(ev);
+                }
+            }
+        }
+
         if self.quiet || self.suppress_intermediate_output {
             return;
         }
@@ -304,6 +336,15 @@ impl SseStreamHost for CliSseStreamHost<'_> {
         tool: &str,
         args: &serde_json::Value,
     ) -> EdgeToolExecResult {
+        // Forward tool-started event to observer channel
+        let tool_description = self.render.format_tool_description(tool, args);
+        if let Some(tx) = &self.stream_event_tx {
+            let _ = tx.send(super::chat_stream::StreamEvent::ToolStarted {
+                name: tool.to_string(),
+                description: tool_description.clone(),
+            });
+        }
+
         // Clear text that was rendered or buffered BEFORE the first tool call
         // (intermediate draft). After first tool, keep buffering new text.
         if !self.tool_work_detected {
@@ -351,6 +392,25 @@ impl SseStreamHost for CliSseStreamHost<'_> {
             cloud_tool_result_status_label(&output)
         };
         let duration_ms = start.elapsed().as_millis() as u64;
+
+        // Forward tool-completed event to observer channel
+        if let Some(tx) = &self.stream_event_tx {
+            let output_summary = self
+                .render
+                .format_output_summary(tool, &output, status)
+                .unwrap_or_default();
+            let _ = tx.send(super::chat_stream::StreamEvent::ToolCompleted {
+                name: tool.to_string(),
+                status: status.to_string(),
+                duration_ms,
+                output_summary: if output_summary.is_empty() {
+                    None
+                } else {
+                    Some(output_summary)
+                },
+            });
+        }
+
         // Update tool line to show completion.
         if let Some(idx) = tool_idx {
             self.render

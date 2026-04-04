@@ -269,6 +269,7 @@ async fn maybe_auto_compact(
         delegation_engine: None,
         cancel_token: None,
         plan_assemble_line_release: None,
+        stream_event_tx: None,
     })
     .await;
 
@@ -399,6 +400,7 @@ async fn run_chat_turn(
             delegation_engine: state.delegation_engine.clone(),
             cancel_token: Some(cancel_token),
             plan_assemble_line_release: None,
+            stream_event_tx: None,
         }) => TurnAttempt::Completed(Box::new(result)),
         _ = tokio::signal::ctrl_c() => {
             // Trigger cancellation to interrupt any in-flight SSE streaming.

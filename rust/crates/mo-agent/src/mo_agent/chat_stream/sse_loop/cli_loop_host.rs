@@ -61,6 +61,8 @@ pub(crate) struct CliAgenticLoopHost<'a> {
     pub is_plan_subtask: bool,
     pub plan_subtask_id: Option<&'a str>,
     pub plan_assemble_line_release: Option<Arc<AtomicBool>>,
+    /// Optional channel for forwarding fine-grained stream events.
+    pub stream_event_tx: Option<super::super::StreamEventTx>,
 }
 
 #[async_trait]
@@ -116,6 +118,7 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
             plan_subtask_id: self.plan_subtask_id,
             cancel_token: state.cancel_token.as_deref(),
             plan_assemble_line_release: self.plan_assemble_line_release.clone(),
+            stream_event_tx: self.stream_event_tx.clone(),
         })
         .await?;
 
@@ -127,6 +130,12 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
     }
 
     fn emit_headless_line(&mut self, style: HeadlessStderrStyle, line: String) {
+        // Forward to stream event channel (even in suppress mode)
+        if let Some(tx) = &self.stream_event_tx {
+            let _ = tx.send(
+                super::super::StreamEvent::StatusLine(line.clone()),
+            );
+        }
         if self.suppress_intermediate_output {
             return;
         }

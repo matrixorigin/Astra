@@ -85,6 +85,11 @@ pub enum PlanUpdate {
     },
     /// Delivery report from global verification, sent before PlanCompleted.
     DeliveryReport(astra_services::durable_task::TaskDeliveryReport),
+    /// Real-time streaming event from within an LLM turn (tokens, tool calls, model status).
+    StreamingEvent {
+        subtask_id: String,
+        event: super::chat_stream::StreamEvent,
+    },
 }
 
 /// Commands sent from the REPL to a background plan executor.
@@ -859,6 +864,25 @@ async fn plan_executor_task(
             // Create cancellation token for this subtask
             let cancel_token = Arc::new(tokio_util::sync::CancellationToken::new());
 
+            // Create stream event channel for real-time LLM/tool visibility
+            let (stream_tx, mut stream_rx) =
+                tokio::sync::mpsc::unbounded_channel::<super::chat_stream::StreamEvent>();
+            let stream_update_tx = update_tx.clone();
+            let stream_subtask_id = next_id.to_string();
+            let stream_forwarder = tokio::spawn(async move {
+                while let Some(ev) = stream_rx.recv().await {
+                    if stream_update_tx
+                        .send(PlanUpdate::StreamingEvent {
+                            subtask_id: stream_subtask_id.clone(),
+                            event: ev,
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            });
+
             // Execute the subtask via stream_chat_sse
             let turn_result: Result<StreamResult, String> = stream_chat_sse(ChatTurnParams {
                 api: &ctx.api,
@@ -884,8 +908,12 @@ async fn plan_executor_task(
                 delegation_engine: ctx.delegation_engine.clone(),
                 cancel_token: Some(cancel_token),
                 plan_assemble_line_release: None,
+                stream_event_tx: Some(stream_tx),
             })
             .await;
+
+            // The stream_chat_sse call is done; drop the sender by ending the forwarder.
+            stream_forwarder.abort();
 
             match turn_result {
                 Ok(result) => {

@@ -68,6 +68,7 @@ pub(super) async fn execute_cli_command(
                 delegation_engine: None,
                 cancel_token: None,
                 plan_assemble_line_release: None,
+                stream_event_tx: None,
             })
             .await
             {
@@ -98,6 +99,7 @@ pub(super) async fn execute_cli_command(
                         delegation_engine: None,
                         cancel_token: None,
                         plan_assemble_line_release: None,
+                        stream_event_tx: None,
                     })
                     .await?
                 }
@@ -315,6 +317,7 @@ pub(super) async fn execute_cli_command(
                 delegation_engine: None,
                 cancel_token: None,
                 plan_assemble_line_release: None,
+                stream_event_tx: None,
             })
             .await
             {
@@ -345,6 +348,7 @@ pub(super) async fn execute_cli_command(
                         delegation_engine: None,
                         cancel_token: None,
                         plan_assemble_line_release: None,
+                        stream_event_tx: None,
                     })
                     .await?
                 }

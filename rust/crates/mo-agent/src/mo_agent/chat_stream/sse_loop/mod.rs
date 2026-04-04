@@ -110,6 +110,7 @@ pub(crate) async fn stream_chat_sse(p: ChatTurnParams<'_>) -> Result<StreamResul
         is_plan_subtask: p.is_plan_subtask,
         plan_subtask_id: p.plan_subtask_id,
         plan_assemble_line_release: p.plan_assemble_line_release.clone(),
+        stream_event_tx: p.stream_event_tx,
     };
 
     let hook_sets = detect_turn_hook_sets(&project_root, task_profile, p.is_plan_subtask);

@@ -1,10 +1,49 @@
 use astra_runtime::{pipeline::persistence::ToolHealthEntry, tool_selector::ToolSelector};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use tokio::sync::mpsc;
 
 use crate::{
     ExplainMode, permission_manager::PermissionManager, skill_instructions::SharedSkillRegistry,
 };
+
+// ─── Stream Event (fine-grained observer channel) ────────────────────────────
+
+/// Fine-grained events emitted during an LLM turn for external observers
+/// (e.g., plan executor forwarding to the REPL).
+///
+/// These are distinct from `PlanUpdate` — they represent raw SSE-level activity
+/// without plan-specific context (subtask IDs, etc.).
+#[derive(Debug, Clone)]
+#[allow(dead_code)] // Variants sent through channel and matched on receiver side
+pub enum StreamEvent {
+    /// LLM token chunk.
+    Token(String),
+    /// Model thinking/reasoning started or stopped.
+    Thinking(bool),
+    /// Thinking/reasoning preview chunk.
+    ThinkingChunk(String),
+    /// Tool execution started.
+    ToolStarted {
+        name: String,
+        description: String,
+    },
+    /// Tool execution completed.
+    ToolCompleted {
+        name: String,
+        status: String,
+        duration_ms: u64,
+        output_summary: Option<String>,
+    },
+    /// Waiting for first SSE frame (TTFT gap).
+    WaitingForModel,
+    /// First SSE frame received — model is responding.
+    ModelResponding,
+    /// Status line from headless tool execution (diff, diagnostic, etc.).
+    StatusLine(String),
+}
+
+pub type StreamEventTx = mpsc::UnboundedSender<StreamEvent>;
 
 /// Parameters for a single agentic chat turn — groups the many arguments
 /// to `stream_chat_sse` into a named struct to reduce cognitive load.
@@ -45,4 +84,8 @@ pub(crate) struct ChatTurnParams<'a> {
     /// Plan-only: set to `true` after HTTP 200 so the payload-phase stderr line spinner can exit
     /// before SSE (`Waiting for model` / reasoning preview).
     pub(crate) plan_assemble_line_release: Option<Arc<AtomicBool>>,
+    /// Optional channel for streaming events (token, tool start/end, model status).
+    /// When present, `CliSseStreamHost` forwards fine-grained events through this channel
+    /// even when `quiet` / `suppress_intermediate_output` are true.
+    pub(crate) stream_event_tx: Option<StreamEventTx>,
 }

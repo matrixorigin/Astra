@@ -878,6 +878,7 @@ pub(super) async fn handle_info_command(
                 delegation_engine: None,
                 cancel_token: None,
                 plan_assemble_line_release: None,
+                stream_event_tx: None,
             })
             .await?;
             if let Some(session_id) = sr.session_id.as_deref() {

@@ -2225,6 +2225,20 @@ pub(crate) fn format_duration_short(d: std::time::Duration) -> String {
     }
 }
 
+/// Format a duration in milliseconds as a compact human-readable string.
+fn format_duration_ms(ms: u64) -> String {
+    if ms >= 60_000 {
+        let m = ms / 60_000;
+        let s = (ms % 60_000) / 1000;
+        format!("{m}m{s}s")
+    } else if ms >= 1000 {
+        let s = ms as f64 / 1000.0;
+        format!("{s:.1}s")
+    } else {
+        format!("{ms}ms")
+    }
+}
+
 // ═══════════════════════════════════ Background Plan Execution Wiring ═════
 
 /// Extract a [`BackgroundPlanContext`] from the current REPL state.
@@ -2654,6 +2668,38 @@ fn display_plan_updates_live(
                     format!("  ⚠ {id} — verification failed (retries exhausted)")
                 } else {
                     format!("  ↻ {id} — verification failed, retrying…")
+                }
+            }
+            PlanUpdate::StreamingEvent { event, .. } => {
+                use chat_stream::StreamEvent;
+                match event {
+                    StreamEvent::ToolStarted { name, description } => {
+                        format!("  ⚡ {name} {description}")
+                    }
+                    StreamEvent::ToolCompleted {
+                        name,
+                        status,
+                        duration_ms,
+                        output_summary,
+                    } => {
+                        let dur = format_duration_ms(duration_ms);
+                        let icon = if status == "error" { "✗" } else { "✓" };
+                        let summary = output_summary
+                            .map(|s| format!("  {s}"))
+                            .unwrap_or_default();
+                        format!("  {icon} {name} ({dur}){summary}")
+                    }
+                    StreamEvent::WaitingForModel => {
+                        "  ◌ Waiting for model…".to_string()
+                    }
+                    StreamEvent::ModelResponding => {
+                        "  ● Model responding…".to_string()
+                    }
+                    StreamEvent::Thinking(true) => {
+                        "  ◐ Thinking…".to_string()
+                    }
+                    // Skip noisy events: individual tokens, thinking chunks, status lines
+                    _ => continue,
                 }
             }
             _ => continue, // ParallelGroupInfo, StepByStepPrompt — future use
@@ -4726,6 +4772,7 @@ mod tests {
             delegation_engine: None,
             cancel_token: None,
             plan_assemble_line_release: None,
+            stream_event_tx: None,
         })
         .await
         .unwrap();
@@ -4775,6 +4822,7 @@ mod tests {
             delegation_engine: None,
             cancel_token: None,
             plan_assemble_line_release: None,
+            stream_event_tx: None,
         })
         .await;
         assert!(result.is_err());
@@ -4840,6 +4888,7 @@ mod tests {
             delegation_engine: None,
             cancel_token: None,
             plan_assemble_line_release: None,
+            stream_event_tx: None,
         })
         .await
         .unwrap();

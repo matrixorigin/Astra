@@ -464,6 +464,8 @@ pub(crate) struct ChatTurnSseFetchRequest<'a> {
     pub cancel_token: Option<&'a tokio_util::sync::CancellationToken>,
     /// Plan-only: release the payload-phase stderr line before SSE consumes the body.
     pub plan_assemble_line_release: Option<Arc<AtomicBool>>,
+    /// Optional channel for forwarding fine-grained stream events.
+    pub stream_event_tx: Option<super::super::StreamEventTx>,
 }
 
 /// stderr prep line + timing toggles for [`fetch_chat_turn_sse`].
@@ -578,6 +580,7 @@ pub(crate) async fn fetch_chat_turn_sse(
         plan_subtask_id,
         cancel_token,
         plan_assemble_line_release,
+        stream_event_tx,
     } = ctx;
 
     let ui = chat_turn_sse_fetch_ui(
@@ -655,6 +658,7 @@ pub(crate) async fn fetch_chat_turn_sse(
         show_reasoning_preview,
         perm_manager: Some(perm_manager),
         cancel_token,
+        stream_event_tx,
     };
 
     let sse_mark = Instant::now();
