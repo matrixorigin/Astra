@@ -712,7 +712,7 @@ pub(super) async fn handle_memory_domain_command(
                         match svc.list_tasks(user_id, None).await {
                             Ok(tasks) => {
                                 let with_plans: Vec<_> =
-                                    tasks.iter().filter(|t| t.plan.is_some()).collect();
+                                    tasks.iter().filter(|t| t.items_total > 0).collect();
 
                                 if with_plans.is_empty() {
                                     eprintln!(
@@ -731,8 +731,7 @@ pub(super) async fn handle_memory_domain_command(
                                             _ => "○",
                                         };
                                         let short_id = &t.task_id[..8.min(t.task_id.len())];
-                                        let subtask_count =
-                                            t.plan.as_ref().map(|p| p.subtasks.len()).unwrap_or(0);
+                                        let subtask_count = t.items_total;
                                         let project_type = t.project_type.as_deref().unwrap_or("?");
                                         eprintln!(
                                             "  {} {} {} [{}] ({} subtasks, {})",
@@ -775,8 +774,24 @@ pub(super) async fn handle_memory_domain_command(
                                 });
 
                                 match found {
-                                    Some(task) if task.plan.is_some() => {
-                                        let plan = task.plan.as_ref().unwrap().clone();
+                                    Some(task) => {
+                                        let Some(task) =
+                                            svc.get_task(&task.task_id).await.ok().flatten()
+                                        else {
+                                            eprintln!(
+                                                "  {} Failed to load task details.",
+                                                "✗".red()
+                                            );
+                                            return Ok(());
+                                        };
+                                        let Some(plan) = task.plan.as_ref() else {
+                                            eprintln!(
+                                                "  {} Task '{}' has no plan",
+                                                "⚠".yellow(),
+                                                query
+                                            );
+                                            return Ok(());
+                                        };
                                         let project_root = std::env::current_dir()
                                             .unwrap_or_else(|_| std::path::PathBuf::from("."));
                                         let context = analyze_project(&project_root);
@@ -794,18 +809,11 @@ pub(super) async fn handle_memory_domain_command(
                                             short_id.dim()
                                         );
                                         eprintln!();
-                                        eprintln!("{}", format_plan(&plan));
+                                        eprintln!("{}", format_plan(plan));
                                         eprintln!();
                                         eprintln!(
                                             "  {} Commands: 'execute' to run, 'exit' to leave plan mode",
                                             "💡".cyan()
-                                        );
-                                    }
-                                    Some(_) => {
-                                        eprintln!(
-                                            "  {} Task '{}' has no plan",
-                                            "⚠".yellow(),
-                                            query
                                         );
                                     }
                                     None => {

@@ -370,9 +370,20 @@ pub struct MatrixOneTaskService {
     pool: sqlx::Pool<sqlx::MySql>,
 }
 
-pub(crate) const AGENT_TASK_SELECT_COLUMNS: &str = "task_id, user_id, session_id, parent_task_id, title, description, \
+const MAX_TASK_LIST_ROWS: usize = 200;
+
+pub(crate) const AGENT_TASK_DETAIL_SELECT_COLUMNS: &str = "task_id, user_id, session_id, parent_task_id, title, description, \
      status, progress_pct, items_done, items_total, plan_json, checkpoint_json, \
      error_message, user_rating, completion_time_sec, replan_count, auto_adjustments, \
+     outcome, project_type, goal_pattern, agent_id, \
+     CAST(created_at AS CHAR) AS created_at, \
+     CAST(updated_at AS CHAR) AS updated_at, \
+     completed_at";
+
+pub(crate) const AGENT_TASK_LIST_SELECT_COLUMNS: &str = "task_id, user_id, session_id, parent_task_id, title, \
+     NULL AS description, status, progress_pct, items_done, items_total, \
+     NULL AS plan_json, NULL AS checkpoint_json, NULL AS error_message, \
+     user_rating, completion_time_sec, replan_count, auto_adjustments, \
      outcome, project_type, goal_pattern, agent_id, \
      CAST(created_at AS CHAR) AS created_at, \
      CAST(updated_at AS CHAR) AS updated_at, \
@@ -483,7 +494,7 @@ impl TaskService for MatrixOneTaskService {
 
     async fn get_task(&self, task_id: &str) -> Result<Option<TaskRecord>, String> {
         let row = sqlx::query(&format!(
-            "SELECT {AGENT_TASK_SELECT_COLUMNS} FROM agent_tasks WHERE task_id = ?"
+            "SELECT {AGENT_TASK_DETAIL_SELECT_COLUMNS} FROM agent_tasks WHERE task_id = ?"
         ))
         .bind(task_id)
         .fetch_optional(&self.pool)
@@ -503,8 +514,9 @@ impl TaskService for MatrixOneTaskService {
     ) -> Result<Vec<TaskRecord>, String> {
         let rows = if let Some(status) = status_filter {
             sqlx::query(&format!(
-                "SELECT {AGENT_TASK_SELECT_COLUMNS} \
-                 FROM agent_tasks WHERE user_id = ? AND status = ? ORDER BY updated_at DESC"
+                "SELECT {AGENT_TASK_LIST_SELECT_COLUMNS} \
+                 FROM agent_tasks WHERE user_id = ? AND status = ? ORDER BY updated_at DESC LIMIT {}",
+                MAX_TASK_LIST_ROWS
             ))
             .bind(user_id)
             .bind(status.as_str())
@@ -512,8 +524,9 @@ impl TaskService for MatrixOneTaskService {
             .await
         } else {
             sqlx::query(&format!(
-                "SELECT {AGENT_TASK_SELECT_COLUMNS} \
-                 FROM agent_tasks WHERE user_id = ? ORDER BY updated_at DESC"
+                "SELECT {AGENT_TASK_LIST_SELECT_COLUMNS} \
+                 FROM agent_tasks WHERE user_id = ? ORDER BY updated_at DESC LIMIT {}",
+                MAX_TASK_LIST_ROWS
             ))
             .bind(user_id)
             .fetch_all(&self.pool)
@@ -1658,6 +1671,11 @@ mod tests {
         assert_eq!(loaded.user_rating, Some(4));
         assert_eq!(loaded.outcome, Some(TaskOutcome::Success));
         assert_eq!(loaded.agent_id.as_deref(), Some("edge-a"));
+    }
+
+    #[test]
+    fn task_list_limit_is_bounded() {
+        assert_eq!(MAX_TASK_LIST_ROWS, 200);
     }
 
     // ── LocalTaskService ──

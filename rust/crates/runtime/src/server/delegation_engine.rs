@@ -192,10 +192,7 @@ pub struct SubRunRecord {
 
 /// In-memory tracker for delegation hierarchies and pause state.
 ///
-/// Hierarchy data is now also persisted in the `agent_runs` table via
-/// `parent_run_id`, `delegation_id`, and `agent_id` columns.
-/// On startup, call `load_from_run_records()` to rebuild the in-memory
-/// state from durable records.
+/// Hierarchy is currently tracked in-memory only.
 pub struct DelegationTracker {
     /// delegation_id → sub-run records
     delegations: RwLock<HashMap<String, Vec<SubRunRecord>>>,

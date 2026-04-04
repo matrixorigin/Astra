@@ -84,6 +84,7 @@ pub async fn ensure_core_schema(settings: &MatrixOneSettings) -> Result<(), sqlx
             scope_repo VARCHAR(255) NULL,
             metadata JSON NULL,
             created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            INDEX idx_auth_tokens_active (is_active),
             INDEX idx_auth_tokens_scope_user (scope_user_id),
             INDEX idx_auth_tokens_scope_repo (scope_repo)
         )",
@@ -554,36 +555,6 @@ pub async fn ensure_core_schema(settings: &MatrixOneSettings) -> Result<(), sqlx
     .execute(&pool)
     .await?;
 
-    // Durable agent runs — event-sourced run state with checkpoint support
-    query(
-        "CREATE TABLE IF NOT EXISTS agent_runs (
-            run_id VARCHAR(36) PRIMARY KEY,
-            user_id VARCHAR(36) NOT NULL,
-            session_id VARCHAR(36) NOT NULL,
-            parent_run_id VARCHAR(36) NULL,
-            delegation_id VARCHAR(36) NULL,
-            agent_id VARCHAR(64) NULL,
-            status VARCHAR(20) NOT NULL DEFAULT 'running',
-            waiting_for VARCHAR(200) NULL,
-            checkpoint_json LONGTEXT NULL,
-            error_message TEXT NULL,
-            retry_count INT NOT NULL DEFAULT 0,
-            total_prompt_tokens BIGINT NOT NULL DEFAULT 0,
-            total_completion_tokens BIGINT NOT NULL DEFAULT 0,
-            total_tool_calls INT NOT NULL DEFAULT 0,
-            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            completed_at DATETIME(6) NULL,
-            INDEX idx_runs_user_status (user_id, status),
-            INDEX idx_runs_user_updated (user_id, updated_at),
-            INDEX idx_runs_session (session_id),
-            INDEX idx_runs_parent (parent_run_id),
-            INDEX idx_runs_delegation (delegation_id)
-        )",
-    )
-    .execute(&pool)
-    .await?;
-
     // ── Durable Task System ─────────────────────────────────────────────────
 
     // Task contracts: verifiable acceptance criteria for long-term tasks
@@ -899,6 +870,7 @@ pub async fn ensure_core_schema(settings: &MatrixOneSettings) -> Result<(), sqlx
         "CREATE TABLE IF NOT EXISTS eval_user_feedback (
             feedback_id   VARCHAR(36) PRIMARY KEY,
             user_id       VARCHAR(36) NOT NULL,
+            agent_id      VARCHAR(64),
             session_id    VARCHAR(36),
             turn_id       VARCHAR(36),
             feedback_type VARCHAR(64) NOT NULL,
@@ -906,12 +878,48 @@ pub async fn ensure_core_schema(settings: &MatrixOneSettings) -> Result<(), sqlx
             comment       TEXT,
             created_at    DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             INDEX idx_euf_user (user_id),
+            INDEX idx_euf_agent_created (agent_id, created_at),
+            INDEX idx_euf_created (created_at),
             INDEX idx_euf_session (session_id),
-            INDEX idx_euf_type (feedback_type)
+            INDEX idx_euf_type_created (feedback_type, created_at)
         )",
     )
     .execute(&pool)
     .await?;
+
+    if let Err(e) = query("CREATE INDEX idx_auth_tokens_active ON auth_tokens (is_active)")
+        .execute(&pool)
+        .await
+    {
+        let msg = e.to_string().to_lowercase();
+        if !msg.contains("duplicate") && !msg.contains("already exists") {
+            return Err(e);
+        }
+    }
+
+    if let Err(e) = query("ALTER TABLE eval_user_feedback ADD COLUMN agent_id VARCHAR(64) NULL")
+        .execute(&pool)
+        .await
+    {
+        let msg = e.to_string().to_lowercase();
+        if !msg.contains("duplicate") && !msg.contains("already exists") && !msg.contains("exists")
+        {
+            return Err(e);
+        }
+    }
+
+    for ddl in [
+        "CREATE INDEX idx_euf_agent_created ON eval_user_feedback (agent_id, created_at)",
+        "CREATE INDEX idx_euf_created ON eval_user_feedback (created_at)",
+        "CREATE INDEX idx_euf_type_created ON eval_user_feedback (feedback_type, created_at)",
+    ] {
+        if let Err(e) = query(ddl).execute(&pool).await {
+            let msg = e.to_string().to_lowercase();
+            if !msg.contains("duplicate") && !msg.contains("already exists") {
+                return Err(e);
+            }
+        }
+    }
 
     query(
         "CREATE TABLE IF NOT EXISTS governance_runs (

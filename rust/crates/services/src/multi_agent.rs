@@ -6,7 +6,9 @@ use sqlx::Row;
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
-use crate::task_orchestrator::{AGENT_TASK_SELECT_COLUMNS, MatrixOneTaskService, TaskRecord};
+use crate::task_orchestrator::{
+    AGENT_TASK_DETAIL_SELECT_COLUMNS, MatrixOneTaskService, TaskRecord,
+};
 
 /// Default maximum number of tasks to return in a pack pull.
 /// Can be overridden per-call using `pull_tasks_pack_mysql_with_limit`.
@@ -68,7 +70,7 @@ pub async fn pull_tasks_pack_mysql_with_limit(
     limit: u32,
 ) -> Result<String, String> {
     let q = format!(
-        "SELECT {AGENT_TASK_SELECT_COLUMNS} FROM agent_tasks WHERE user_id = ? ORDER BY updated_at DESC LIMIT {limit}"
+        "SELECT {AGENT_TASK_DETAIL_SELECT_COLUMNS} FROM agent_tasks WHERE user_id = ? ORDER BY updated_at DESC LIMIT {limit}"
     );
     let rows = sqlx::query(&q)
         .bind(user_id)
