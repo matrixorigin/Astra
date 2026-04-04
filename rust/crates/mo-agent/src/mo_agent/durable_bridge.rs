@@ -8,8 +8,8 @@ use astra_runtime::{GateVerdict, VerificationGate};
 use astra_services::coordination::AgentResult;
 use astra_services::{
     ContractAmendment, ContractGenerator, DurableSubtask, DurableTaskLifecycle,
-    LocalDurableTaskLifecycle, SubtaskStage, SubtaskVerificationReport, TaskContract,
-    TaskDeliveryReport, VerificationRunner, VerifierKind,
+    LocalDurableTaskLifecycle, MatrixOneDurableTaskLifecycle, SubtaskStage,
+    SubtaskVerificationReport, TaskContract, TaskDeliveryReport, VerificationRunner, VerifierKind,
 };
 use async_trait::async_trait;
 use crossterm::style::Stylize;
@@ -747,6 +747,45 @@ pub fn create_local_lifecycle_full(
 
     // Wire up live output streaming — tees build/test stderr to the terminal
     // with dim grey styling so it's visible but doesn't dominate the output.
+    lifecycle.set_output_sink(Arc::new(|line: &str| {
+        use crossterm::style::Stylize;
+        eprintln!("      {}", line.dark_grey());
+    }));
+
+    Arc::new(lifecycle)
+}
+
+/// Like [`create_local_lifecycle_full`] but uses the cloud-backed
+/// [`MatrixOneDurableTaskLifecycle`] so that contracts and verification
+/// results are persisted to the MatrixOne database.
+pub fn create_cloud_lifecycle_full(
+    pool: sqlx::Pool<sqlx::MySql>,
+    work_dir: &std::path::Path,
+    sender: Option<astra_services::event_ingestion::IngestionSender>,
+    session_id: Option<&str>,
+    user_id: Option<&str>,
+    cloud_judge: Option<Arc<dyn astra_services::LlmJudge>>,
+    learning_bridge: Option<Arc<dyn astra_services::TaskLearningBridge>>,
+) -> Arc<dyn DurableTaskLifecycle> {
+    let mut lifecycle = MatrixOneDurableTaskLifecycle::new(pool, work_dir.to_path_buf());
+
+    if let Some(judge) = cloud_judge {
+        lifecycle.set_llm_judge(judge);
+    } else if let Some(judge) = HttpLlmJudge::from_env() {
+        lifecycle.set_llm_judge(Arc::new(judge));
+    }
+
+    if let Some(s) = sender {
+        lifecycle.set_event_sender(s);
+    }
+    if let (Some(sid), Some(uid)) = (session_id, user_id) {
+        lifecycle.set_session_context(sid, uid);
+    }
+
+    if let Some(bridge) = learning_bridge {
+        lifecycle.set_learning_bridge(bridge);
+    }
+
     lifecycle.set_output_sink(Arc::new(|line: &str| {
         use crossterm::style::Stylize;
         eprintln!("      {}", line.dark_grey());

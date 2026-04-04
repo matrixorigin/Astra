@@ -1023,25 +1023,46 @@ async fn handle_resume_command(arg: &str, profile: Option<&str>, state: &mut Rep
                 && let Ok(contract) = serde_json::from_str::<astra_services::TaskContract>(json)
             {
                 let work_dir = std::env::current_dir().unwrap_or_default();
-                let session_dir = astra_services::session_workspace::workspace_dir_for(&session_id);
-                let lifecycle = durable_bridge::create_local_lifecycle_full(
-                    &session_dir,
-                    &work_dir,
-                    state
-                        .matrix_runtime
-                        .as_ref()
-                        .and_then(|mc| mc.clone_ingestion_sender()),
-                    Some(&session_id),
-                    state.ingestion_user_id.as_deref(),
-                    state
-                        .matrix_runtime
-                        .as_ref()
-                        .and_then(|mc| mc.create_cloud_llm_judge())
-                        .map(|j| {
-                            std::sync::Arc::new(j) as std::sync::Arc<dyn astra_services::LlmJudge>
-                        }),
-                    build_learning_bridge(state),
-                );
+                let ingestion_sender = state
+                    .matrix_runtime
+                    .as_ref()
+                    .and_then(|mc| mc.clone_ingestion_sender());
+                let cloud_judge = state
+                    .matrix_runtime
+                    .as_ref()
+                    .and_then(|mc| mc.create_cloud_llm_judge())
+                    .map(|j| {
+                        std::sync::Arc::new(j) as std::sync::Arc<dyn astra_services::LlmJudge>
+                    });
+                let learning = build_learning_bridge(state);
+
+                let lifecycle = if let Some(pool) = state
+                    .matrix_runtime
+                    .as_ref()
+                    .map(|mc| mc.shared_pool().get().clone())
+                {
+                    durable_bridge::create_cloud_lifecycle_full(
+                        pool,
+                        &work_dir,
+                        ingestion_sender,
+                        Some(&session_id),
+                        state.ingestion_user_id.as_deref(),
+                        cloud_judge,
+                        learning,
+                    )
+                } else {
+                    let session_dir =
+                        astra_services::session_workspace::workspace_dir_for(&session_id);
+                    durable_bridge::create_local_lifecycle_full(
+                        &session_dir,
+                        &work_dir,
+                        ingestion_sender,
+                        Some(&session_id),
+                        state.ingestion_user_id.as_deref(),
+                        cloud_judge,
+                        learning,
+                    )
+                };
                 state.durable_task_state = Some(durable_bridge::DurableTaskState {
                     contract,
                     lifecycle,
@@ -2301,28 +2322,49 @@ async fn ensure_durable_task_state(state: &mut ReplState) {
     let session_id = state.session_id.as_deref().unwrap_or("unknown");
     let work_dir = std::env::current_dir().unwrap_or_default();
 
-    // Create session-local lifecycle for contract persistence + verification
-    let session_dir = state
-        .session_id
+    // Prefer cloud-backed lifecycle when MatrixOne pool is available;
+    // fall back to local filesystem persistence otherwise.
+    let ingestion_sender = state
+        .matrix_runtime
         .as_ref()
-        .map(|sid| astra_services::session_workspace::workspace_dir_for(sid))
-        .unwrap_or_else(|| work_dir.join(".mo-session"));
-    let lifecycle = durable_bridge::create_local_lifecycle_full(
-        &session_dir,
-        &work_dir,
-        state
-            .matrix_runtime
+        .and_then(|mc| mc.clone_ingestion_sender());
+    let cloud_judge = state
+        .matrix_runtime
+        .as_ref()
+        .and_then(|mc| mc.create_cloud_llm_judge())
+        .map(|j| std::sync::Arc::new(j) as std::sync::Arc<dyn astra_services::LlmJudge>);
+    let learning = build_learning_bridge(state);
+
+    let lifecycle = if let Some(pool) = state
+        .matrix_runtime
+        .as_ref()
+        .map(|mc| mc.shared_pool().get().clone())
+    {
+        durable_bridge::create_cloud_lifecycle_full(
+            pool,
+            &work_dir,
+            ingestion_sender,
+            Some(session_id),
+            Some(user_id),
+            cloud_judge,
+            learning,
+        )
+    } else {
+        let session_dir = state
+            .session_id
             .as_ref()
-            .and_then(|mc| mc.clone_ingestion_sender()),
-        Some(session_id),
-        Some(user_id),
-        state
-            .matrix_runtime
-            .as_ref()
-            .and_then(|mc| mc.create_cloud_llm_judge())
-            .map(|j| std::sync::Arc::new(j) as std::sync::Arc<dyn astra_services::LlmJudge>),
-        build_learning_bridge(state),
-    );
+            .map(|sid| astra_services::session_workspace::workspace_dir_for(sid))
+            .unwrap_or_else(|| work_dir.join(".mo-session"));
+        durable_bridge::create_local_lifecycle_full(
+            &session_dir,
+            &work_dir,
+            ingestion_sender,
+            Some(session_id),
+            Some(user_id),
+            cloud_judge,
+            learning,
+        )
+    };
 
     if let Some(contract) =
         durable_bridge::generate_contract(&lifecycle, plan, goal, user_id, session_id, &work_dir)

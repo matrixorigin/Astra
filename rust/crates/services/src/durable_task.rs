@@ -2090,6 +2090,10 @@ pub struct MatrixOneDurableTaskLifecycle {
     session_id: String,
     /// User ID for event attribution.
     user_id: String,
+    /// Learning bridge for feeding verification patterns into the learning system.
+    learning_bridge: Option<Arc<dyn TaskLearningBridge>>,
+    /// Optional callback that receives live command output lines during verification.
+    output_sink: Option<OutputSink>,
 }
 
 impl MatrixOneDurableTaskLifecycle {
@@ -2103,6 +2107,8 @@ impl MatrixOneDurableTaskLifecycle {
             event_sender: None,
             session_id: String::new(),
             user_id: String::new(),
+            learning_bridge: None,
+            output_sink: None,
         }
     }
 
@@ -2124,6 +2130,8 @@ impl MatrixOneDurableTaskLifecycle {
             event_sender: None,
             session_id: String::new(),
             user_id: String::new(),
+            learning_bridge: None,
+            output_sink: None,
         }
     }
 
@@ -2143,11 +2151,25 @@ impl MatrixOneDurableTaskLifecycle {
         self.user_id = user_id.to_string();
     }
 
+    /// Set the learning bridge for feeding verification patterns into the learning system.
+    pub fn set_learning_bridge(&mut self, bridge: Arc<dyn TaskLearningBridge>) {
+        self.learning_bridge = Some(bridge);
+    }
+
+    /// Set the output sink for live command output during verification.
+    pub fn set_output_sink(&mut self, sink: OutputSink) {
+        self.output_sink = Some(sink);
+    }
+
     fn runner(&self) -> VerificationRunner {
-        match &self.llm_judge {
+        let mut runner = match &self.llm_judge {
             Some(j) => VerificationRunner::with_llm_judge(self.work_dir.clone(), j.clone()),
             None => VerificationRunner::new(self.work_dir.clone()),
+        };
+        if let Some(ref sink) = self.output_sink {
+            runner.output_sink = Some(sink.clone());
         }
+        runner
     }
 
     /// Emit a verification-related event to the cloud event stream.
@@ -2800,6 +2822,43 @@ impl DurableTaskLifecycle for MatrixOneDurableTaskLifecycle {
             }),
         );
 
+        // Feed verification result into learning system for real-time pattern detection
+        if let Some(bridge) = &self.learning_bridge {
+            let criteria_results: Vec<CriterionLearningResult> = durable_st
+                .criteria
+                .iter()
+                .zip(report.results.iter())
+                .map(|(c, r)| CriterionLearningResult {
+                    criterion_id: c.id.clone(),
+                    verifier_kind: format!("{:?}", c.verifier)
+                        .split_whitespace()
+                        .next()
+                        .unwrap_or("unknown")
+                        .to_string(),
+                    passed: r.passed,
+                    duration_ms: r.duration_ms,
+                })
+                .collect();
+            let signal = VerificationLearningSignal {
+                task_id: task_id.to_string(),
+                subtask_id: subtask_id.to_string(),
+                subtask_title: durable_st.title.clone(),
+                goal: contract.goal.clone(),
+                all_passed: report.all_required_passed,
+                pass_rate: if total_count > 0 {
+                    passed_count as f64 / total_count as f64
+                } else {
+                    1.0
+                },
+                attempt: durable_st.retry_count + 1,
+                criteria_results,
+                files: durable_st.files.clone(),
+                domain_hint: contract.domain_hint.clone(),
+                task_type: contract.task_type.clone(),
+            };
+            let _ = bridge.learn_from_verification(&signal).await;
+        }
+
         Ok(report)
     }
 
@@ -2972,6 +3031,30 @@ impl DurableTaskLifecycle for MatrixOneDurableTaskLifecycle {
             "global_checks_passed": report.global_verification.iter().filter(|r| r.passed).count(),
             "global_checks_total": report.global_verification.len(),
         }));
+
+        // Feed completed task into learning system for pattern extraction
+        if let Some(bridge) = &self.learning_bridge {
+            let all_tools: Vec<String> = contract
+                .subtasks
+                .iter()
+                .flat_map(|s| s.tools_used.iter().cloned())
+                .collect::<std::collections::HashSet<_>>()
+                .into_iter()
+                .collect();
+            let outcome = build_outcome_signal(
+                &contract,
+                &report,
+                all_tools,
+                None,
+                contract.domain_hint.clone(),
+                contract.task_type.clone(),
+            );
+            let _ = bridge.learn_from_task_outcome(&outcome).await;
+
+            if contract.status == ContractStatus::Completed {
+                let _ = bridge.extract_template(&contract, &report).await;
+            }
+        }
 
         Ok(report)
     }
