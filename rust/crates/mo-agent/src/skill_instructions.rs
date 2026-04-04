@@ -149,6 +149,8 @@ pub struct SkillMetadata {
     pub when_to_use: Option<String>,
     /// Model override for this skill.
     pub model: Option<String>,
+    /// Maximum token budget (0 = system default).
+    pub max_tokens: u32,
     /// Estimated tokens for this metadata (~100 tokens).
     pub metadata_tokens: u32,
 }
@@ -170,6 +172,7 @@ impl From<&SkillInstruction> for SkillMetadata {
             user_invocable: skill.user_invocable,
             when_to_use: skill.when_to_use.clone(),
             model: skill.model.clone(),
+            max_tokens: skill.max_tokens,
             metadata_tokens,
         }
     }

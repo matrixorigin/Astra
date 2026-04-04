@@ -94,21 +94,46 @@ pub const CURSOR_UP_CLEAR: &str = "\x1b[A\x1b[2K";
 // ── Strip ANSI for non-TTY ───────────────────────────────────────────────
 
 /// Strip ANSI escape codes from a string (for logging, file output, etc.)
+///
+/// Handles CSI sequences (`\x1b[...X` where X is any letter `@`–`~`),
+/// OSC sequences (`\x1b]...BEL/ST`), and simple two-byte sequences (`\x1bX`).
 pub fn strip_ansi(s: &str) -> Cow<'_, str> {
     // Fast path: no escape char means no ANSI codes
     if !s.contains('\x1b') {
         return Cow::Borrowed(s);
     }
-    // Simple state machine: skip \x1b[...m sequences
     let mut out = String::with_capacity(s.len());
-    let mut chars = s.chars();
+    let mut chars = s.chars().peekable();
     while let Some(c) = chars.next() {
         if c == '\x1b' {
-            // Skip until 'm' (SGR) or end of input
-            for inner in chars.by_ref() {
-                if inner == 'm' {
-                    break;
+            match chars.peek() {
+                Some('[') => {
+                    // CSI sequence: \x1b[ ... <final byte 0x40–0x7E>
+                    chars.next(); // consume '['
+                    for inner in chars.by_ref() {
+                        if ('@'..='~').contains(&inner) {
+                            break;
+                        }
+                    }
                 }
+                Some(']') => {
+                    // OSC sequence: \x1b] ... (BEL or ST)
+                    chars.next();
+                    for inner in chars.by_ref() {
+                        if inner == '\x07' {
+                            break;
+                        }
+                        if inner == '\x1b' {
+                            chars.next(); // consume '\\' of ST
+                            break;
+                        }
+                    }
+                }
+                Some(_) => {
+                    // Two-byte sequence (e.g. \x1b= , \x1b> )
+                    chars.next();
+                }
+                None => {}
             }
         } else {
             out.push(c);
@@ -148,6 +173,20 @@ mod tests {
     fn strip_ansi_with_codes() {
         assert_eq!(strip_ansi("\x1b[1;36m>\x1b[0m "), "> ");
         assert_eq!(strip_ansi("\x1b[31mred\x1b[0m text"), "red text");
+    }
+
+    #[test]
+    fn strip_ansi_csi_non_sgr() {
+        // Cursor movement (\x1b[2J = clear screen, \x1b[H = cursor home)
+        assert_eq!(strip_ansi("\x1b[2Jtext\x1b[Hmore"), "textmore");
+        // Cursor up (\x1b[A)
+        assert_eq!(strip_ansi("before\x1b[Aafter"), "beforeafter");
+    }
+
+    #[test]
+    fn strip_ansi_osc() {
+        // OSC title set: \x1b]0;title\x07
+        assert_eq!(strip_ansi("\x1b]0;My Title\x07visible"), "visible");
     }
 
     #[test]
