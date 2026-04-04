@@ -1156,6 +1156,12 @@ impl StreamRenderState {
                         || l.starts_with("⚠ Note:")
                 };
 
+                // Count all non-empty, non-metadata lines for accurate remaining count
+                let total_content_lines = output
+                    .lines()
+                    .filter(|l| !is_metadata(l) && !l.is_empty())
+                    .count();
+
                 let content_lines: Vec<&str> = output
                     .lines()
                     .filter(|l| !is_metadata(l) && !l.is_empty())
@@ -1176,7 +1182,7 @@ impl StreamRenderState {
                         highlight_code_line(&truncated)
                     })
                     .collect();
-                let remaining = line_count.saturating_sub(content_lines.len());
+                let remaining = total_content_lines.saturating_sub(content_lines.len());
                 if remaining > 0 {
                     parts.push(format!("{}", format!("… +{remaining} more lines").dim()));
                 }
@@ -1334,9 +1340,15 @@ impl StreamRenderState {
                         .iter()
                         .take(5)
                         .map(|f| {
-                            let path = f.trim();
+                            let path = f.trim().trim_end_matches('/'); // Remove trailing slash
                             if let Some(last_slash) = path.rfind('/') {
-                                format!("{}{}", path[..=last_slash].dim(), &path[last_slash + 1..])
+                                let filename = &path[last_slash + 1..];
+                                if filename.is_empty() {
+                                    // Path like "/" or unusual case
+                                    path.to_string()
+                                } else {
+                                    format!("{}{}", path[..=last_slash].dim(), filename)
+                                }
                             } else {
                                 path.to_string()
                             }

@@ -257,9 +257,9 @@ pub fn highlight_code_line(line: &str) -> String {
             .chars()
             .all(|c| c.is_ascii_digit() || c.is_whitespace())
         {
-            // Right-align to 4 chars, then apply dim styling
+            // Right-align to 5 chars for files up to 99999 lines
             let num_trimmed = num_part.trim();
-            let aligned = format!("{:>4}│", num_trimmed);
+            let aligned = format!("{:>5}│", num_trimmed);
             (format!("{}", aligned.dim()), &line[tab_pos + 1..])
         } else {
             (String::new(), line)
@@ -431,19 +431,25 @@ mod tests {
 
     #[test]
     fn test_highlight_line_number_format() {
-        // Line number should be right-aligned with pipe separator
+        // Line number should be right-aligned with pipe separator (5 chars)
         let input = "42\tlet x = 1;";
         let output = highlight_code_line(input);
         let stripped = strip_ansi(&output);
-        // Should have right-aligned number and pipe: "  42│let x = 1;"
-        assert!(stripped.starts_with("  42│"));
+        // Should have right-aligned number and pipe: "   42│let x = 1;"
+        assert!(stripped.starts_with("   42│"));
         assert!(stripped.contains("let x = 1;"));
 
-        // Test with larger line number
+        // Test with larger line number (fits in 5 chars)
         let input2 = "1234\tlet y = 2;";
         let output2 = highlight_code_line(input2);
         let stripped2 = strip_ansi(&output2);
-        assert!(stripped2.starts_with("1234│"));
+        assert!(stripped2.starts_with(" 1234│"));
+
+        // Test with 5-digit line number
+        let input3 = "10000\tlet z = 3;";
+        let output3 = highlight_code_line(input3);
+        let stripped3 = strip_ansi(&output3);
+        assert!(stripped3.starts_with("10000│"));
     }
 
     /// Helper to strip ANSI escape codes for testing
