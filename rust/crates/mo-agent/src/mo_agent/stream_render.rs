@@ -1148,11 +1148,18 @@ impl StreamRenderState {
             }
             "read_file" | "view_file" => {
                 // Show first few lines of file content (like Cursor/Claude Code)
-                // Skip metadata lines like "[Auto-expanded..." or line number headers
+                // Only skip our metadata lines, not code that happens to start with '['
+                let is_metadata = |l: &&str| {
+                    l.starts_with("[Auto-expanded")
+                        || l.starts_with("[truncated")
+                        || l.starts_with("⚠ WARNING:")
+                        || l.starts_with("⚠ Note:")
+                };
+
                 let content_lines: Vec<&str> = output
                     .lines()
-                    .filter(|l| !l.starts_with('[') && !l.is_empty())
-                    .take(3)
+                    .filter(|l| !is_metadata(l) && !l.is_empty())
+                    .take(10)
                     .collect();
 
                 if content_lines.is_empty() {
@@ -1164,7 +1171,7 @@ impl StreamRenderState {
 
                 let mut parts: Vec<String> =
                     content_lines.iter().map(|l| truncate_line(l, 65)).collect();
-                let remaining = line_count.saturating_sub(content_lines.len() + 1); // +1 for metadata lines
+                let remaining = line_count.saturating_sub(content_lines.len());
                 if remaining > 0 {
                     parts.push(format!("… +{remaining} more lines"));
                 }
