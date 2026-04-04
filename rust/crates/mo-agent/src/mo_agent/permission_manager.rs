@@ -645,6 +645,13 @@ impl PermissionManager {
             return PermissionDecision::Deny("Denied by rule".into());
         }
 
+        // Step 2: Read-only tools always allowed (before overrides, same as check()).
+        let side_effect = Self::classify(name);
+        if side_effect == SideEffect::Read {
+            return PermissionDecision::Allow;
+        }
+
+        // Step 3: Session overrides from prior approvals.
         if let Some(&allowed) = self.session_overrides.get(name) {
             return if allowed {
                 PermissionDecision::Allow
@@ -653,12 +660,7 @@ impl PermissionManager {
             };
         }
 
-        let side_effect = Self::classify(name);
-        if side_effect == SideEffect::Read {
-            return PermissionDecision::Allow;
-        }
-
-        // Step 2: Git safety checks (bypass-immune).
+        // Step 4: Git safety checks (bypass-immune).
         if side_effect == SideEffect::Execute {
             let git_violations = Self::check_git_safety(args);
             if !git_violations.is_empty() {
@@ -676,7 +678,7 @@ impl PermissionManager {
             }
         }
 
-        // Step 3: Dangerous file path (bypass-immune).
+        // Step 5: Dangerous file path (bypass-immune).
         if let Some(warning) = Self::check_dangerous_path(name, args) {
             if self.mode == PermissionMode::Deny {
                 return PermissionDecision::Deny("Sensitive path (deny mode)".into());

@@ -2653,6 +2653,10 @@ fn display_plan_updates_live(
                 );
                 state.executing_plan = None;
                 state.current_plan_subtask_id = None;
+                // Deny any pending approval (plan is done)
+                if let Some(tx) = state.pending_approval.take() {
+                    let _ = tx.send(false);
+                }
                 print_line(printer, plan_spinner, msg);
                 return;
             }
@@ -2669,6 +2673,10 @@ fn display_plan_updates_live(
                 let msg = format!("\n❌  Plan error: {error}");
                 state.executing_plan = None;
                 state.current_plan_subtask_id = None;
+                // Deny any pending approval (plan failed)
+                if let Some(tx) = state.pending_approval.take() {
+                    let _ = tx.send(false);
+                }
                 print_line(printer, plan_spinner, msg);
                 return;
             }
@@ -4346,6 +4354,10 @@ async fn run_chat_repl(
                     if rapid {
                         // Second rapid Ctrl+C → cancel
                         let _ = handle.send_command(plan_executor::PlanCommand::Cancel);
+                        // Deny any pending approval so execute_tool unblocks
+                        if let Some(tx) = state.pending_approval.take() {
+                            let _ = tx.send(false);
+                        }
                         eprintln!(
                             "\n{}  Cancelling plan execution…",
                             "✗".red()

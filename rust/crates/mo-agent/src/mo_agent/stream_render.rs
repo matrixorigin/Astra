@@ -403,8 +403,16 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                                     reason,
                                     response_tx: resp_tx,
                                 });
-                                // Wait for REPL to respond
-                                let result = resp_rx.await.unwrap_or(false);
+                                // Wait for REPL to respond, but respect cancellation
+                                let result = if let Some(token) = self.cancel_token {
+                                    tokio::select! {
+                                        biased;
+                                        _ = token.cancelled() => false,
+                                        r = resp_rx => r.unwrap_or(false),
+                                    }
+                                } else {
+                                    resp_rx.await.unwrap_or(false)
+                                };
                                 if result {
                                     pm.record_approval(&t, true);
                                 }
