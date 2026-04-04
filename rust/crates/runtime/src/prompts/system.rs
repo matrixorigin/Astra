@@ -111,8 +111,10 @@ pub fn build_main_system_prompt(
          - Reading 3 files? Call read_file 3× in parallel.\n\
          - Need git_status AND git_diff? Call both.\n\
          - Need glob AND grep with different patterns? Call both.\n\
-         Do NOT parallelize when one result determines the next call's arguments.\n\n\
-         ## Token Efficiency\n\
+         Do NOT parallelize when one result determines the next call's arguments.\n\
+          **Limit**: Keep parallel tool calls to ≤5 per turn. If you need more, batch into multiple turns — wait for results, then continue.\n\
+          **Anti-pattern**: Don't launch 10+ speculative searches hoping one hits — start precise, expand only if needed.\n\n\
+          ## Token Efficiency\n\
          - Prefer targeted reads (line ranges) over full-file reads.\n\
          - Use glob to narrow candidates before grep.\n\
          - Request only the data you need — avoid fetching entire files when a section suffices.\n\
@@ -447,6 +449,8 @@ pub fn build_main_system_prompt(
         prompt.push_str(
             "\n\
          ## Search Strategy\n\
+         - **Simple vs Complex**: For simple, directed searches (specific file/class/function), use glob/grep directly. \
+For broad codebase exploration that will clearly need >3 queries, consider delegating to an explore agent if available.\n\
          - Start narrow. Prefer likely roots first: src, crates, app, lib, packages, cmd, internal, tests.\n\
          - Use glob first to narrow filenames/dirs, then grep only that subset for content.\n\
          - For code review, search within changed files or adjacent modules before scanning the whole repo.\n\
@@ -561,7 +565,9 @@ pub fn build_system_prompt_sections(
          - Reading 3 files? Call read_file 3× in parallel.\n\
          - Need git_status AND git_diff? Call both.\n\
          - Need glob AND grep with different patterns? Call both.\n\
-         Do NOT parallelize when one result determines the next call's arguments.\n\n\
+         Do NOT parallelize when one result determines the next call's arguments.\n\
+          **Limit**: Keep parallel tool calls to ≤5 per turn. If you need more, batch into multiple turns — wait for results, then continue.\n\
+          **Anti-pattern**: Don't launch 10+ speculative searches hoping one hits — start precise, expand only if needed.\n\n\
          ## Token Efficiency\n\
          - Prefer targeted reads (line ranges) over full-file reads.\n\
          - Use glob to narrow candidates before grep.\n\
@@ -897,6 +903,8 @@ pub fn build_system_prompt_sections(
         session_section.push_str(
             "\n\
              ## Search Strategy\n\
+             - **Simple vs Complex**: For simple, directed searches (specific file/class/function), use glob/grep directly. \
+For broad codebase exploration that will clearly need >3 queries, consider delegating to an explore agent if available.\n\
              - Start narrow. Prefer likely roots first: src, crates, app, lib, packages, cmd, internal, tests.\n\
              - Use glob first to narrow filenames/dirs, then grep only that subset for content.\n\
              - For code review, search within changed files or adjacent modules before scanning the whole repo.\n\

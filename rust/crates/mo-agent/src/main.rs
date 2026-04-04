@@ -2326,9 +2326,7 @@ async fn ensure_durable_task_state(state: &mut ReplState) {
             .matrix_runtime
             .as_ref()
             .and_then(|mc| mc.create_cloud_llm_judge())
-            .map(|j| {
-                std::sync::Arc::new(j) as std::sync::Arc<dyn mo_agent_services::LlmJudge>
-            }),
+            .map(|j| std::sync::Arc::new(j) as std::sync::Arc<dyn mo_agent_services::LlmJudge>),
         build_learning_bridge(state),
     );
 
