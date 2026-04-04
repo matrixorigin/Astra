@@ -320,6 +320,30 @@ dev-reset: dev-clean
 dev-setup-demo:
 	@bash scripts/setup/demo-init.sh
 
+.PHONY: dev-seed
+dev-seed:
+	@echo "⚠️  This will reset the database and reseed admin + models."
+	@printf "Are you sure? [y/N] "; read REPLY; \
+	[ "$$REPLY" = "y" ] || [ "$$REPLY" = "Y" ] || { echo "Cancelled"; exit 0; }
+	@mysql -h127.0.0.1 -P6001 -uroot -p111 \
+		-e "DROP DATABASE IF EXISTS astra_runtime; CREATE DATABASE astra_runtime;" 2>/dev/null || \
+	mysql -h127.0.0.1 -P6001 -uroot -p111 --skip-ssl \
+		-e "DROP DATABASE IF EXISTS astra_runtime; CREATE DATABASE astra_runtime;" 2>/dev/null || \
+	mysql -h127.0.0.1 -P6001 -uroot -p111 --skip_ssl \
+		-e "DROP DATABASE IF EXISTS astra_runtime; CREATE DATABASE astra_runtime;"
+	@$(MAKE) dev-api-restart build-cli-release
+	@sleep 2
+	@echo "Registering admin (admin@mo.com)..."
+	@NO_PROXY=localhost ./rust/target/release/astra-admin register \
+		--username admin --password 11111111 --email admin@mo.com
+	@echo "Logging in as admin..."
+	@NO_PROXY=localhost ./rust/target/release/astra-admin login \
+		--username admin --password 11111111
+	@echo "Loading models from .models.yaml..."
+	@NO_PROXY=localhost ./rust/target/release/astra-admin model load .models.yaml
+	@echo ""
+	@echo "✅ Seed complete — admin@mo.com / 11111111"
+
 # ============================================================================
 # Build
 # ============================================================================
