@@ -539,6 +539,8 @@ struct ReplState {
     /// True while plan display is in the middle of printing streaming LLM tokens.
     /// Used to insert a newline before the next non-token event.
     plan_in_token_stream: bool,
+    /// Persistent spinner for plan execution progress (survives across flush cycles).
+    plan_spinner: Option<effects::PlanActivitySpinner>,
 }
 
 impl Default for ReplState {
@@ -599,6 +601,7 @@ impl Default for ReplState {
             plan_handle: None,
             pending_approval: None,
             plan_in_token_stream: false,
+            plan_spinner: None,
         }
     }
 }
@@ -2805,12 +2808,10 @@ fn flush_plan_updates_between_prompts(state: &mut ReplState) {
         return;
     }
 
-    let mut plan_spinner: Option<effects::PlanActivitySpinner> = None;
+    let mut spinner = state.plan_spinner.take();
     let mut current_subtask_tag = state.current_plan_subtask_id.clone().unwrap_or_default();
-    display_plan_updates_live(state, &mut plan_spinner, &mut current_subtask_tag);
-    if let Some(spinner) = plan_spinner.take() {
-        spinner.stop_clear();
-    }
+    display_plan_updates_live(state, &mut spinner, &mut current_subtask_tag);
+    state.plan_spinner = spinner;
 }
 
 /// Apply a single trailing update from the plan executor channel.
@@ -3964,6 +3965,10 @@ async fn run_chat_repl(
     let mut last_ctrl_c_at: Option<std::time::Instant> = None;
     loop {
         flush_plan_updates_between_prompts(&mut state);
+        // Stop spinner before showing readline prompt to avoid overlap
+        if let Some(s) = state.plan_spinner.take() {
+            s.stop_clear();
+        }
         let current_token = current_access_token(profile);
 
         // Keep readline prompts ASCII-only. Unicode characters (⏸, 🔄, ❯)
@@ -3988,14 +3993,44 @@ async fn run_chat_repl(
         // ── Send readline request to actor thread ────────────────────
         readline.request_readline(prompt_str);
 
-        // Do not redraw the prompt while readline is active; this can disrupt IME composition.
+        // When a background plan is running, periodically flush buffered
+        // plan updates while waiting for user input.  We clear the current
+        // terminal line before each flush to avoid garbled prompt overlap,
+        // then reprint the prompt prefix so the user can still type.
         let (readline_result, pending_execute): (Result<String, ReadlineError>, Option<String>) =
-            match readline.recv().await {
-                Some(readline_actor::ReadlineResponse::Line {
-                    result,
-                    pending_execute,
-                }) => (result, pending_execute),
-                None => (Err(ReadlineError::Eof), None),
+            if state.plan_handle.is_some() {
+                loop {
+                    tokio::select! {
+                        biased;
+                        response = readline.recv() => {
+                            break match response {
+                                Some(readline_actor::ReadlineResponse::Line {
+                                    result,
+                                    pending_execute,
+                                }) => (result, pending_execute),
+                                None => (Err(ReadlineError::Eof), None),
+                            };
+                        }
+                        _ = tokio::time::sleep(std::time::Duration::from_millis(300)) => {
+                            // Clear the readline prompt line before printing updates
+                            eprint!("\r\x1b[2K");
+                            flush_plan_updates_between_prompts(&mut state);
+                            // If plan finished, break early (handle was consumed)
+                            if state.plan_handle.is_none() {
+                                continue; // Let select! pick up the readline response
+                            }
+                        }
+                    }
+                }
+            } else {
+                // Normal mode: just wait for readline
+                match readline.recv().await {
+                    Some(readline_actor::ReadlineResponse::Line {
+                        result,
+                        pending_execute,
+                    }) => (result, pending_execute),
+                    None => (Err(ReadlineError::Eof), None),
+                }
             };
 
         // ── Process readline result ──────────────────────────────────
