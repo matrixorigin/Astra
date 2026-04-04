@@ -43,7 +43,7 @@ impl AppSettings {
                     "MATRIXONE_PASSWORD",
                     super::runtime_limits::DEV_MATRIXONE_PASSWORD,
                 ),
-                database: value_or_default(&lookup, "MATRIXONE_DATABASE", "dev_agent"),
+                database: value_or_default(&lookup, "MATRIXONE_DATABASE", "astra_runtime"),
             },
             redis: RedisSettings {
                 host: value_or_default(&lookup, "REDIS_HOST", "localhost"),

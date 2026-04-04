@@ -45,7 +45,7 @@ matrixone:
     port: 6001
     user: root
     password: "111"
-    database: mo_dev_agent
+    database: mo_astra_runtime
 
 # ─── Redis [opt] ───────────────────────────────────────────
 redis:

@@ -1,7 +1,7 @@
 # Prometheus Alert Rules for mo-agent-engine
 
 groups:
-  - name: mo_dev_agent_alerts
+  - name: mo_astra_runtime_alerts
     interval: 30s
     rules:
       # High error rate

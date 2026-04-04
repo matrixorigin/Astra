@@ -8,7 +8,7 @@
 //!   MATRIXONE_PORT (default: 6001)
 //!   MATRIXONE_USER (default: root)
 //!   MATRIXONE_PASSWORD (default: dev-only; set for production!)
-//!   MATRIXONE_DATABASE (default: dev_agent)
+//!   MATRIXONE_DATABASE (default: astra_runtime)
 //!
 //! Uses the `mysql` CLI client (MySQL protocol compatible), same pattern as
 //! git tools — shell out to native CLI for zero Rust-side connection overhead.
@@ -28,7 +28,7 @@ fn mo_mysql_cmd(database: Option<&str>) -> Command {
     let password = std::env::var("MATRIXONE_PASSWORD")
         .unwrap_or_else(|_| mo_agent_core::DEV_MATRIXONE_PASSWORD.to_string());
     let db = database.map(String::from).unwrap_or_else(|| {
-        std::env::var("MATRIXONE_DATABASE").unwrap_or_else(|_| "dev_agent".to_string())
+        std::env::var("MATRIXONE_DATABASE").unwrap_or_else(|_| "astra_runtime".to_string())
     });
 
     let mut cmd = Command::new("mysql");
@@ -497,8 +497,8 @@ mod tests {
             .map(|a| a.to_string_lossy().to_string())
             .collect();
         assert!(
-            args.iter().any(|a| a == "dev_agent"),
-            "should default to dev_agent: {:?}",
+            args.iter().any(|a| a == "astra_runtime"),
+            "should default to astra_runtime: {:?}",
             args
         );
     }

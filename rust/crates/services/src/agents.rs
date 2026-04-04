@@ -158,7 +158,7 @@ impl AgentService for DatabaseAgentService {
             .data_source
             .as_ref()
             .map(|v| v.to_string())
-            .unwrap_or_else(|| r#"{"type":"matrixone","database":"dev_agent"}"#.to_string());
+            .unwrap_or_else(|| r#"{"type":"matrixone","database":"astra_runtime"}"#.to_string());
 
         query(
             "INSERT INTO agent_agents \

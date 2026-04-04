@@ -34,7 +34,7 @@ pub fn matrix_settings_from_env() -> MatrixOneSettings {
         user: std::env::var("MATRIXONE_USER").unwrap_or_else(|_| "root".into()),
         password: std::env::var("MATRIXONE_PASSWORD")
             .unwrap_or_else(|_| mo_agent_core::DEV_MATRIXONE_PASSWORD.into()),
-        database: std::env::var("MATRIXONE_DATABASE").unwrap_or_else(|_| "dev_agent".into()),
+        database: std::env::var("MATRIXONE_DATABASE").unwrap_or_else(|_| "astra_runtime".into()),
     }
 }
 
