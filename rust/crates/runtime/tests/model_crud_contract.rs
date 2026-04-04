@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 use astra_runtime::{
     AdminAuthorizer, AppState, AuthLoginRequestData, AuthRefreshRequestData,
     AuthRegisterRequestData, AuthService, AuthTokenRecord, AuthUserRecord, AuthenticatedUser,
-    ErrorResponse, HealthChecker, ModelCreateRequestData, ModelRecord, ModelService,
+    ErrorResponse, HealthChecker, ModelCreateRequestData, ModelListItem, ModelRecord, ModelService,
     ModelUpdateRequestData, PricingData, QuirksData, ServiceInfo, build_app,
 };
 use async_trait::async_trait;
@@ -170,8 +170,23 @@ impl ModelService for StubModelService {
         &self,
         _user_id: String,
         _is_admin: bool,
-    ) -> Result<Vec<ModelRecord>, (StatusCode, axum::Json<ErrorResponse>)> {
-        Ok(self.state.lock().unwrap().clone())
+    ) -> Result<Vec<ModelListItem>, (StatusCode, axum::Json<ErrorResponse>)> {
+        Ok(self
+            .state
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|model| ModelListItem {
+                model_id: model.model_id.clone(),
+                name: model.name.clone(),
+                provider: model.provider.clone(),
+                description: model.description.clone(),
+                is_active: model.is_active,
+                context_window: model.context_window,
+                max_completion_tokens: model.max_completion_tokens,
+                architecture: model.architecture.clone(),
+            })
+            .collect())
     }
 
     async fn get_model(
@@ -350,6 +365,7 @@ async fn list_models_returns_array() {
     let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     let arr = json.as_array().unwrap();
     assert_eq!(arr.len(), 2);
+    assert!(arr[0].get("pricing").is_none());
 }
 
 #[tokio::test]

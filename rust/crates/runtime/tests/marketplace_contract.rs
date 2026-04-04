@@ -352,6 +352,7 @@ async fn install_list_uninstall_flow_is_global_and_deterministic() {
     let list_json = response_json(list_after_install).await;
     assert_eq!(list_json["total"], 1);
     assert_eq!(list_json["installations"][0]["skill_name"], "skill-a");
+    assert_eq!(list_json["limit"], 10);
 
     let uninstall_resp = app
         .clone()

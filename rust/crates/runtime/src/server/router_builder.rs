@@ -260,6 +260,10 @@ pub(super) fn build_router(state: AppState) -> Router {
         // Workflows
         .route("/workflows", get(workflows::list_workflows_handler))
         .route(
+            "/workflows/{workflow_id}",
+            get(workflows::get_workflow_handler),
+        )
+        .route(
             "/workflows/runs/{run_id}",
             get(workflows::get_workflow_run_handler),
         )

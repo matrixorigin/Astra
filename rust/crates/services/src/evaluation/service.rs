@@ -65,7 +65,7 @@ pub trait EvaluationService: Send + Sync {
         days: i32,
     ) -> ServiceResult<ObservabilityMetricsResponse>;
     async fn memory_health(&self, user_id: &str) -> ServiceResult<MemoryHealthResponse>;
-    async fn memory_metrics(&self) -> ServiceResult<MemoryMetricsResponse>;
+    async fn memory_metrics(&self, user_id: &str) -> ServiceResult<MemoryMetricsResponse>;
     async fn extract_training_data(
         &self,
         user_id: &str,

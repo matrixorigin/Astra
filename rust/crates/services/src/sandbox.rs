@@ -7,6 +7,8 @@ use astra_core::{
     ErrorResponse, MatrixOneSettings, SharedPool, connect_matrixone, error_response, internal_error,
 };
 
+const MAX_SANDBOX_LIST_ROWS: i64 = 200;
+
 // ── Data types ───────────────────────────────────────────────────────────────
 
 #[derive(Clone, Debug, PartialEq)]
@@ -144,18 +146,22 @@ impl SandboxService for DatabaseSandboxService {
 
     async fn list_sandboxes(
         &self,
-        _user_id: String,
+        user_id: String,
         pattern: Option<String>,
     ) -> Result<Vec<SandboxRecord>, (StatusCode, Json<ErrorResponse>)> {
         let pool = self.get_pool().await.map_err(internal_error)?;
         let pat = pattern.unwrap_or_else(|| "%".into());
         let rows = query(
             "SELECT sandbox_name, IFNULL(description, '') AS description, \
-             IFNULL(created_by, '') AS created_by, user_id, status, \
-             DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s') AS created_at \
-             FROM infra_sandbox_metadata WHERE sandbox_name LIKE ? ORDER BY created_at DESC",
+              IFNULL(created_by, '') AS created_by, user_id, status, \
+              DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s') AS created_at \
+              FROM infra_sandbox_metadata \
+              WHERE user_id = ? AND sandbox_name LIKE ? \
+              ORDER BY created_at DESC LIMIT ?",
         )
+        .bind(&user_id)
         .bind(&pat)
+        .bind(MAX_SANDBOX_LIST_ROWS)
         .fetch_all(&pool)
         .await
         .map_err(internal_error)?;
@@ -177,16 +183,17 @@ impl SandboxService for DatabaseSandboxService {
     async fn get_sandbox(
         &self,
         name: String,
-        _user_id: String,
+        user_id: String,
     ) -> Result<SandboxRecord, (StatusCode, Json<ErrorResponse>)> {
         let pool = self.get_pool().await.map_err(internal_error)?;
         let row = query(
             "SELECT sandbox_name, IFNULL(description, '') AS description, \
-             IFNULL(created_by, '') AS created_by, user_id, status, \
-             DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s') AS created_at \
-             FROM infra_sandbox_metadata WHERE sandbox_name = ?",
+              IFNULL(created_by, '') AS created_by, user_id, status, \
+              DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s') AS created_at \
+              FROM infra_sandbox_metadata WHERE sandbox_name = ? AND user_id = ?",
         )
         .bind(&name)
+        .bind(&user_id)
         .fetch_optional(&pool)
         .await
         .map_err(internal_error)?;
@@ -210,13 +217,14 @@ impl SandboxService for DatabaseSandboxService {
     async fn delete_sandbox(
         &self,
         name: String,
-        _user_id: String,
+        user_id: String,
     ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
         let pool = self.get_pool().await.map_err(internal_error)?;
 
         let existing =
-            query("SELECT sandbox_name FROM infra_sandbox_metadata WHERE sandbox_name = ?")
+            query("SELECT sandbox_name FROM infra_sandbox_metadata WHERE sandbox_name = ? AND user_id = ?")
                 .bind(&name)
+                .bind(&user_id)
                 .fetch_optional(&pool)
                 .await
                 .map_err(internal_error)?;
@@ -227,8 +235,9 @@ impl SandboxService for DatabaseSandboxService {
             ));
         }
 
-        query("DELETE FROM infra_sandbox_metadata WHERE sandbox_name = ?")
+        query("DELETE FROM infra_sandbox_metadata WHERE sandbox_name = ? AND user_id = ?")
             .bind(&name)
+            .bind(&user_id)
             .execute(&pool)
             .await
             .map_err(internal_error)?;

@@ -190,15 +190,15 @@ impl SkillConfigService for DatabaseSkillConfigService {
     ) -> Result<Json<ValidationResponse>, (StatusCode, Json<ErrorResponse>)> {
         let pool = self.get_pool().await.map_err(internal_error)?;
 
-        let row = sqlx::query("SELECT COUNT(*) as cnt FROM skills_registry WHERE skill_name = ?")
+        let exists = sqlx::query("SELECT 1 FROM skills_registry WHERE skill_name = ? LIMIT 1")
             .bind(skill_name)
-            .fetch_one(&pool)
+            .fetch_optional(&pool)
             .await
-            .map_err(internal_error)?;
-        let cnt: i64 = row.try_get("cnt").unwrap_or(0);
+            .map_err(internal_error)?
+            .is_some();
 
         let mut errors = Vec::new();
-        if cnt == 0 {
+        if !exists {
             errors.push(ValidationError {
                 section: "settings".to_string(),
                 name: skill_name.to_string(),

@@ -42,14 +42,19 @@ pub async fn create_model_handler(
 pub async fn list_models_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
-) -> Result<Json<Vec<ModelResponse>>, (StatusCode, Json<ErrorResponse>)> {
+) -> Result<Json<Vec<ModelListItemResponse>>, (StatusCode, Json<ErrorResponse>)> {
     let user = state.auth_service.current_user(&headers).await?;
     let is_admin = state.admin_authorizer.require_admin(&headers).await.is_ok();
     let models = state
         .model_service
         .list_models(user.user_id, is_admin)
         .await?;
-    Ok(Json(models.into_iter().map(ModelResponse::from).collect()))
+    Ok(Json(
+        models
+            .into_iter()
+            .map(ModelListItemResponse::from)
+            .collect(),
+    ))
 }
 
 pub async fn get_model_handler(

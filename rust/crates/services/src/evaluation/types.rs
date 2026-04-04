@@ -338,8 +338,10 @@ pub struct ObservabilityMetricsResponse {
 #[derive(Debug, Clone, Serialize)]
 pub struct MemoryHealthResponse {
     pub total_memories: i64,
-    pub knowledge_entries: i64,
-    pub last_governance_run: Option<String>,
+    pub active_memories: i64,
+    pub inactive_memories: i64,
+    pub stale_working_memories: i64,
+    pub orphaned_records: i64,
     pub healthy: bool,
 }
 

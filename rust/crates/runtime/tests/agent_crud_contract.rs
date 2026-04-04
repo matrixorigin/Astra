@@ -1,9 +1,10 @@
 use std::sync::{Arc, Mutex};
 
 use astra_runtime::{
-    AgentCreateRequestData, AgentListRecord, AgentRecord, AgentService, AgentUpdateRequestData,
-    AppState, AuthLoginRequestData, AuthRefreshRequestData, AuthRegisterRequestData, AuthService,
-    AuthTokenRecord, AuthUserRecord, ErrorResponse, HealthChecker, ServiceInfo, build_app,
+    AgentCreateRequestData, AgentListItem, AgentListRecord, AgentRecord, AgentService,
+    AgentUpdateRequestData, AppState, AuthLoginRequestData, AuthRefreshRequestData,
+    AuthRegisterRequestData, AuthService, AuthTokenRecord, AuthUserRecord, ErrorResponse,
+    HealthChecker, ServiceInfo, build_app,
 };
 use async_trait::async_trait;
 use axum::{
@@ -130,7 +131,15 @@ impl AgentService for StubAgentService {
             .unwrap()
             .iter()
             .filter(|a| a.owner_user_id == user_id)
-            .cloned()
+            .map(|a| AgentListItem {
+                agent_id: a.agent_id.clone(),
+                name: a.name.clone(),
+                agent_type: a.agent_type.clone(),
+                owner_user_id: a.owner_user_id.clone(),
+                is_active: a.is_active,
+                created_at: a.created_at.clone(),
+                updated_at: a.updated_at.clone(),
+            })
             .collect();
         let total = agents.len() as i64;
         Ok(AgentListRecord { agents, total })
@@ -277,6 +286,7 @@ async fn list_agents_matches_contract() {
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(json["total"], 1);
     assert_eq!(json["agents"][0]["name"], "Alpha Agent");
+    assert!(json["agents"][0].get("agent_config").is_none());
 }
 
 #[tokio::test]

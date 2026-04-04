@@ -182,8 +182,8 @@ pub async fn memory_metrics_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<MemoryMetricsResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let _user_id = extract_user_id(&headers)?;
-    let resp = state.evaluation_service.memory_metrics().await?;
+    let user_id = extract_user_id(&headers)?;
+    let resp = state.evaluation_service.memory_metrics(&user_id).await?;
     Ok(Json(resp))
 }
 

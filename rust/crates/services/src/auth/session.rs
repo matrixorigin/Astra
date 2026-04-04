@@ -8,6 +8,8 @@ use chrono::Utc;
 use sqlx::{MySql, QueryBuilder, Row, query};
 use uuid::Uuid;
 
+const MAX_SESSION_ACTIVITY_ROWS: u32 = 200;
+
 #[async_trait]
 pub trait SessionService: Send + Sync {
     async fn create_session(
@@ -397,11 +399,27 @@ impl SessionService for DatabaseSessionService {
     async fn get_session_activity(
         &self,
         session_id: String,
-        _user_id: String,
+        user_id: String,
         limit: u32,
         offset: u32,
     ) -> Result<SessionActivityRecord, (StatusCode, Json<ErrorResponse>)> {
         let pool = self.get_pool().await.map_err(internal_error)?;
+        let existing = self
+            .fetch_session_by_id(&pool, &session_id)
+            .await?
+            .ok_or_else(|| {
+                error_response(
+                    StatusCode::NOT_FOUND,
+                    format!("Session {session_id} 不存在"),
+                )
+            })?;
+        if existing.user_id != user_id {
+            return Err(error_response(
+                StatusCode::NOT_FOUND,
+                format!("无权限查看 Session {session_id}"),
+            ));
+        }
+        let limit = limit.min(MAX_SESSION_ACTIVITY_ROWS);
 
         let count_row = query(
             "SELECT COUNT(*) as cnt FROM auth_audit_logs \

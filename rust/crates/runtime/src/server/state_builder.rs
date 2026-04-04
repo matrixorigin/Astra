@@ -79,7 +79,12 @@ pub(super) async fn build_server_state(
         FernetTokenEncryptor::from_env().map_err(Box::<dyn std::error::Error>::from)?,
     )
     .with_evaluation_service(Arc::new(
-        DatabaseEvaluationService::new(settings.matrixone.clone()).with_pool(shared_pool.clone()),
+        DatabaseEvaluationService::new(settings.matrixone.clone())
+            .with_pool(shared_pool.clone())
+            .with_memoria_config(
+                settings.memoria_base_url.clone(),
+                settings.memoria_master_key.clone(),
+            ),
     ))
     .with_introspection_service(Arc::new(
         DatabaseIntrospectionService::new(settings.matrixone.clone())

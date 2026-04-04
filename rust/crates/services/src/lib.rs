@@ -48,8 +48,8 @@ pub use admin::{
     AdminUserRoleRequestData, AuthenticatedUser,
 };
 pub use agents::{
-    AgentCreateRequestData, AgentListRecord, AgentRecord, AgentService, AgentUpdateRequestData,
-    DatabaseAgentService, UnconfiguredAgentService,
+    AgentCreateRequestData, AgentListItem, AgentListRecord, AgentRecord, AgentService,
+    AgentUpdateRequestData, DatabaseAgentService, UnconfiguredAgentService,
 };
 pub use auth::{
     AuthLoginRequestData, AuthRefreshRequestData, AuthRegisterRequestData, AuthService,
@@ -62,7 +62,7 @@ pub use auth::{
 pub use branches::{BranchService, DatabaseBranchService, UnconfiguredBranchService};
 pub use context::{
     ContextService, DatabaseContextService, SnapshotCreateRequestData, SnapshotListFilter,
-    SnapshotListRecord, SnapshotRecord, UnconfiguredContextService,
+    SnapshotListItem, SnapshotListRecord, SnapshotRecord, UnconfiguredContextService,
 };
 pub use contract_generator::{
     ContractGenerator, ProjectDetection, detect_build_command, detect_lint_command,
@@ -110,7 +110,7 @@ pub use marketplace::{
     DatabaseMarketplaceService, MarketplaceService, UnconfiguredMarketplaceService,
 };
 pub use models::{
-    DatabaseModelService, ModelCreateRequestData, ModelRecord, ModelService,
+    DatabaseModelService, ModelCreateRequestData, ModelListItem, ModelRecord, ModelService,
     ModelUpdateRequestData, PricingData, QuirksData, ResolvedActiveLlmModel,
     UnconfiguredModelService, resolve_active_llm_model,
 };
@@ -168,6 +168,6 @@ pub use triggers::{
     DatabaseTriggerService, TriggerRecord, TriggerService, UnconfiguredTriggerService,
 };
 pub use workflows::{
-    DatabaseWorkflowService, UnconfiguredWorkflowService, WorkflowDefRecord, WorkflowRunRecord,
-    WorkflowService,
+    DatabaseWorkflowService, UnconfiguredWorkflowService, WorkflowDefRecord, WorkflowListItem,
+    WorkflowRunRecord, WorkflowService,
 };

@@ -100,6 +100,18 @@ pub struct ModelRecord {
     pub connectivity: Option<String>,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct ModelListItem {
+    pub model_id: String,
+    pub name: String,
+    pub provider: String,
+    pub description: Option<String>,
+    pub is_active: bool,
+    pub context_window: i32,
+    pub max_completion_tokens: Option<i32>,
+    pub architecture: Option<String>,
+}
+
 /// Decrypted credentials for the active (or preferred) row in `infra_llm_models`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ResolvedActiveLlmModel {
@@ -219,7 +231,7 @@ pub trait ModelService: Send + Sync {
         &self,
         user_id: String,
         is_admin: bool,
-    ) -> Result<Vec<ModelRecord>, (StatusCode, Json<ErrorResponse>)>;
+    ) -> Result<Vec<ModelListItem>, (StatusCode, Json<ErrorResponse>)>;
 
     async fn get_model(
         &self,
@@ -330,6 +342,10 @@ pub const MODEL_SELECT_COLS: &str = "\
     IFNULL(CAST(pricing AS CHAR), '{}') AS pricing_json, \
     IFNULL(CAST(tags AS CHAR), '[]') AS tags_json, \
     IFNULL(CAST(quirks AS CHAR), '{}') AS quirks_json";
+const MODEL_LIST_SELECT_COLS: &str = "\
+    model_id, model_name, provider, description, is_active, \
+    IFNULL(context_window, 128000) AS context_window, max_completion_tokens, architecture";
+const MAX_MODEL_LIST_ROWS: i64 = 200;
 
 #[async_trait]
 impl ModelService for DatabaseModelService {
@@ -436,25 +452,35 @@ impl ModelService for DatabaseModelService {
         &self,
         _user_id: String,
         is_admin: bool,
-    ) -> Result<Vec<ModelRecord>, (StatusCode, Json<ErrorResponse>)> {
+    ) -> Result<Vec<ModelListItem>, (StatusCode, Json<ErrorResponse>)> {
         let pool = self.get_pool().await.map_err(internal_error)?;
 
         let sql = if is_admin {
             format!(
-                "SELECT {} FROM infra_llm_models ORDER BY provider, model_name",
-                MODEL_SELECT_COLS
+                "SELECT {} FROM infra_llm_models ORDER BY provider, model_name LIMIT {}",
+                MODEL_LIST_SELECT_COLS, MAX_MODEL_LIST_ROWS
             )
         } else {
             format!(
-                "SELECT {} FROM infra_llm_models WHERE is_active = 1 ORDER BY provider, model_name",
-                MODEL_SELECT_COLS
+                "SELECT {} FROM infra_llm_models WHERE is_active = 1 ORDER BY provider, model_name LIMIT {}",
+                MODEL_LIST_SELECT_COLS, MAX_MODEL_LIST_ROWS
             )
         };
         let rows = query(&sql).fetch_all(&pool).await.map_err(internal_error)?;
 
         let mut models = Vec::with_capacity(rows.len());
         for row in rows {
-            models.push(Self::model_record_from_row(row)?);
+            let is_active_int: i16 = row.try_get("is_active").unwrap_or(1);
+            models.push(ModelListItem {
+                model_id: row.try_get("model_id").map_err(internal_error)?,
+                name: row.try_get("model_name").map_err(internal_error)?,
+                provider: row.try_get("provider").map_err(internal_error)?,
+                description: row.try_get("description").ok(),
+                is_active: is_active_int != 0,
+                context_window: row.try_get("context_window").unwrap_or(128000),
+                max_completion_tokens: row.try_get("max_completion_tokens").ok(),
+                architecture: row.try_get("architecture").ok(),
+            });
         }
         Ok(models)
     }
@@ -752,7 +778,7 @@ impl ModelService for UnconfiguredModelService {
         &self,
         _: String,
         _: bool,
-    ) -> Result<Vec<ModelRecord>, (StatusCode, Json<ErrorResponse>)> {
+    ) -> Result<Vec<ModelListItem>, (StatusCode, Json<ErrorResponse>)> {
         Err(internal_error("model service not configured"))
     }
     async fn get_model(&self, _: String) -> Result<ModelRecord, (StatusCode, Json<ErrorResponse>)> {
@@ -843,6 +869,18 @@ pub struct ModelResponse {
     pub connectivity: Option<String>,
 }
 
+#[derive(Serialize, PartialEq)]
+pub struct ModelListItemResponse {
+    pub model_id: String,
+    pub name: String,
+    pub provider: String,
+    pub description: Option<String>,
+    pub is_active: bool,
+    pub context_window: i32,
+    pub max_completion_tokens: Option<i32>,
+    pub architecture: Option<String>,
+}
+
 impl From<ModelRecord> for ModelResponse {
     fn from(r: ModelRecord) -> Self {
         Self {
@@ -862,6 +900,21 @@ impl From<ModelRecord> for ModelResponse {
             tags: r.tags,
             quirks: r.quirks,
             connectivity: r.connectivity,
+        }
+    }
+}
+
+impl From<ModelListItem> for ModelListItemResponse {
+    fn from(r: ModelListItem) -> Self {
+        Self {
+            model_id: r.model_id,
+            name: r.name,
+            provider: r.provider,
+            description: r.description,
+            is_active: r.is_active,
+            context_window: r.context_window,
+            max_completion_tokens: r.max_completion_tokens,
+            architecture: r.architecture,
         }
     }
 }

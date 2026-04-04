@@ -11,10 +11,20 @@ use axum::{
 pub async fn list_workflows_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
-) -> Result<Json<Vec<WorkflowDefRecord>>, (StatusCode, Json<ErrorResponse>)> {
+) -> Result<Json<Vec<WorkflowListItem>>, (StatusCode, Json<ErrorResponse>)> {
     let _user = state.auth_service.current_user(&headers).await?;
     let workflows = state.workflow_service.list_workflows().await?;
     Ok(Json(workflows))
+}
+
+pub async fn get_workflow_handler(
+    State(state): State<AppState>,
+    Path(workflow_id): Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<WorkflowDefRecord>, (StatusCode, Json<ErrorResponse>)> {
+    let _user = state.auth_service.current_user(&headers).await?;
+    let workflow = state.workflow_service.get_workflow(workflow_id).await?;
+    Ok(Json(workflow))
 }
 
 pub async fn get_workflow_run_handler(

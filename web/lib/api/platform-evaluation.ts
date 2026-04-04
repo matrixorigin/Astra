@@ -173,8 +173,10 @@ export async function getSloDashboard(
 
 type ApiMemoryHealthResponse = {
   total_memories: number;
-  knowledge_entries: number;
-  last_governance_run: string;
+  active_memories: number;
+  inactive_memories: number;
+  stale_working_memories: number;
+  orphaned_records: number;
   healthy: boolean;
 };
 
@@ -191,8 +193,10 @@ export async function getMemoryHealth(): Promise<MemoryHealthData | null> {
     const raw = await apiFetch<ApiMemoryHealthResponse>('/evaluation/memory-health');
     return {
       totalMemories: raw.total_memories,
-      knowledgeEntries: raw.knowledge_entries,
-      lastGovernanceRun: raw.last_governance_run,
+      activeMemories: raw.active_memories,
+      inactiveMemories: raw.inactive_memories,
+      staleWorkingMemories: raw.stale_working_memories,
+      orphanedRecords: raw.orphaned_records,
       healthy: raw.healthy,
     };
   } catch {

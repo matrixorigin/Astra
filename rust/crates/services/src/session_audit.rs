@@ -221,6 +221,9 @@ pub struct CrossSessionToolAnalytics {
     pub last_error: Option<String>,
 }
 
+const MAX_AUDIT_SESSIONS_PER_PAGE: u32 = 100;
+const MAX_CROSS_SESSION_TOOLS: i64 = 100;
+
 // ── Request params ───────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Deserialize)]
@@ -755,46 +758,54 @@ impl SessionAuditService for DatabaseSessionAuditService {
         self.verify_session_owner(&pool, session_id, user_id)
             .await?;
 
-        // Aggregate on materialized meta_tool_name / meta_duration_ms (same pattern as
-        // get_cross_session_tools); last_error from the latest tool_error row content.
         let rows = query(
             "SELECT \
                agg.tool_name, agg.total_calls, agg.total_success, agg.total_failures, \
-               agg.avg_ms, agg.max_ms, agg.total_duration_ms, \
-               le.content AS last_error \
-             FROM (\
-               SELECT \
-                 meta_tool_name AS tool_name, \
+               agg.avg_ms, agg.max_ms, agg.total_duration_ms \
+              FROM (\
+                SELECT \
+                  meta_tool_name AS tool_name, \
                  COUNT(*) AS total_calls, \
                  COUNT(CASE WHEN event_type = 'tool_call' THEN 1 END) AS total_success, \
                  COUNT(CASE WHEN event_type = 'tool_error' THEN 1 END) AS total_failures, \
                  COALESCE(AVG(meta_duration_ms), 0) AS avg_ms, \
                  COALESCE(MAX(meta_duration_ms), 0) AS max_ms, \
                  COALESCE(SUM(meta_duration_ms), 0) AS total_duration_ms \
-               FROM agent_events \
-               WHERE session_id = ? AND user_id = ? \
-                 AND event_type IN ('tool_call', 'tool_error') \
-               GROUP BY tool_name \
-             ) agg \
-             LEFT JOIN (\
-               SELECT tool_name, content FROM (\
-                 SELECT \
-                   meta_tool_name AS tool_name, \
-                   content, \
-                   ROW_NUMBER() OVER (PARTITION BY meta_tool_name ORDER BY created_at DESC) AS rn \
-                 FROM agent_events \
-                 WHERE session_id = ? AND user_id = ? AND event_type = 'tool_error'\
-               ) ranked WHERE rn = 1\
-             ) le ON le.tool_name = agg.tool_name \
-             ORDER BY agg.total_duration_ms DESC",
+                FROM agent_events \
+                WHERE session_id = ? AND user_id = ? \
+                  AND event_type IN ('tool_call', 'tool_error') \
+                GROUP BY tool_name \
+              ) agg \
+              ORDER BY agg.total_duration_ms DESC",
         )
-        .bind(session_id)
-        .bind(user_id)
         .bind(session_id)
         .bind(user_id)
         .fetch_all(&pool)
         .await
         .map_err(internal_error)?;
+
+        let error_rows = query(
+            "SELECT meta_tool_name AS tool_name, content \
+             FROM agent_events \
+             WHERE session_id = ? AND user_id = ? AND event_type = 'tool_error' \
+             ORDER BY created_at DESC LIMIT 200",
+        )
+        .bind(session_id)
+        .bind(user_id)
+        .fetch_all(&pool)
+        .await
+        .map_err(internal_error)?;
+        let mut latest_errors = std::collections::HashMap::<String, String>::new();
+        for row in error_rows {
+            let tool_name = normalize_tool_name(row.try_get("tool_name").unwrap_or_default());
+            if latest_errors.contains_key(&tool_name) {
+                continue;
+            }
+            let content: String = row.try_get("content").unwrap_or_default();
+            if !content.is_empty() {
+                latest_errors.insert(tool_name, content);
+            }
+        }
 
         let result: Vec<ToolAnalytics> = rows
             .iter()
@@ -808,10 +819,7 @@ impl SessionAuditService for DatabaseSessionAuditService {
                 let total_failures = row.try_get::<i64, _>("total_failures").unwrap_or(0) as u32;
                 let total_duration_ms =
                     row.try_get::<i64, _>("total_duration_ms").unwrap_or(0) as u64;
-                let last_error = row
-                    .try_get::<String, _>("last_error")
-                    .ok()
-                    .filter(|s| !s.is_empty());
+                let last_error = latest_errors.get(&name).cloned();
 
                 Some(ToolAnalytics {
                     name,
@@ -886,7 +894,7 @@ impl SessionAuditService for DatabaseSessionAuditService {
         params: &AuditSessionListParams,
     ) -> AuditResult<AuditSessionListResponse> {
         let pool = self.get_pool().await.map_err(internal_error)?;
-        let per_page = params.per_page.clamp(1, 100);
+        let per_page = params.per_page.clamp(1, MAX_AUDIT_SESSIONS_PER_PAGE);
         let page = params.page.max(1);
 
         // Build WHERE with all filters pushed into SQL (including min_turns and model)
@@ -1174,47 +1182,58 @@ impl SessionAuditService for DatabaseSessionAuditService {
         }
         let where_clause = where_parts.join(" AND ");
 
-        // Single query: aggregate stats + last_error via LEFT JOIN on a
-        // ROW_NUMBER() subquery that picks the most recent tool_error per tool.
         let sql = format!(
             "SELECT \
                agg.tool_name, agg.total_calls, agg.total_success, agg.total_failures, \
-               agg.avg_ms, agg.max_ms, agg.sessions_used, \
-               le.content AS last_error \
+               agg.avg_ms, agg.max_ms, agg.sessions_used \
              FROM (\
                SELECT \
-                 meta_tool_name AS tool_name, \
-                 COUNT(*) AS total_calls, \
-                 COUNT(CASE WHEN event_type = 'tool_call' THEN 1 END) AS total_success, \
-                 COUNT(CASE WHEN event_type = 'tool_error' THEN 1 END) AS total_failures, \
+                  meta_tool_name AS tool_name, \
+                  COUNT(*) AS total_calls, \
+                  COUNT(CASE WHEN event_type = 'tool_call' THEN 1 END) AS total_success, \
+                  COUNT(CASE WHEN event_type = 'tool_error' THEN 1 END) AS total_failures, \
                  COALESCE(AVG(meta_duration_ms), 0) AS avg_ms, \
                  COALESCE(MAX(meta_duration_ms), 0) AS max_ms, \
                  COUNT(DISTINCT session_id) AS sessions_used \
-               FROM agent_events e \
-               WHERE {where_clause} AND event_type IN ('tool_call', 'tool_error') \
-               GROUP BY tool_name \
-             ) agg \
-             LEFT JOIN (\
-               SELECT tool_name, content FROM (\
-                 SELECT \
-                   meta_tool_name AS tool_name, \
-                   content, \
-                   ROW_NUMBER() OVER (PARTITION BY meta_tool_name ORDER BY created_at DESC) AS rn \
-                 FROM agent_events e \
-                 WHERE {where_clause} AND event_type = 'tool_error'\
-               ) ranked WHERE rn = 1\
-             ) le ON le.tool_name = agg.tool_name \
-             ORDER BY agg.total_calls DESC"
+                FROM agent_events e \
+                WHERE {where_clause} AND event_type IN ('tool_call', 'tool_error') \
+                GROUP BY tool_name \
+              ) agg \
+              ORDER BY agg.total_calls DESC \
+              LIMIT ?"
         );
         let mut q = sqlx::query(&sql);
-        // Bind values appear 3 times: agg subquery, ranked subquery, outer is just joins
         for v in &bind_values {
             q = q.bind(v);
         }
-        for v in &bind_values {
-            q = q.bind(v);
-        }
+        q = q.bind(MAX_CROSS_SESSION_TOOLS);
         let rows = q.fetch_all(&pool).await.map_err(internal_error)?;
+
+        let mut error_sql = format!(
+            "SELECT meta_tool_name AS tool_name, content \
+             FROM agent_events e \
+             WHERE {where_clause} AND event_type = 'tool_error' \
+             ORDER BY created_at DESC"
+        );
+        if !rows.is_empty() {
+            error_sql.push_str(" LIMIT 500");
+        }
+        let mut eq = sqlx::query(&error_sql);
+        for v in &bind_values {
+            eq = eq.bind(v);
+        }
+        let error_rows = eq.fetch_all(&pool).await.map_err(internal_error)?;
+        let mut latest_errors = std::collections::HashMap::<String, String>::new();
+        for row in error_rows {
+            let tool_name = normalize_tool_name(row.try_get("tool_name").unwrap_or_default());
+            if latest_errors.contains_key(&tool_name) {
+                continue;
+            }
+            let content: String = row.try_get("content").unwrap_or_default();
+            if !content.is_empty() {
+                latest_errors.insert(tool_name, content);
+            }
+        }
 
         let result: Vec<CrossSessionToolAnalytics> = rows
             .iter()
@@ -1223,10 +1242,7 @@ impl SessionAuditService for DatabaseSessionAuditService {
                 let total_calls = row.try_get::<i64, _>("total_calls").unwrap_or(0) as u32;
                 let total_success = row.try_get::<i64, _>("total_success").unwrap_or(0) as u32;
                 let total_failures = row.try_get::<i64, _>("total_failures").unwrap_or(0) as u32;
-                let last_error = row
-                    .try_get::<String, _>("last_error")
-                    .ok()
-                    .filter(|s| !s.is_empty());
+                let last_error = latest_errors.get(&name).cloned();
 
                 CrossSessionToolAnalytics {
                     name,

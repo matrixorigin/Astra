@@ -72,7 +72,7 @@ impl EvaluationService for UnconfiguredEvaluationService {
     async fn memory_health(&self, _: &str) -> ServiceResult<MemoryHealthResponse> {
         Err(internal_error("evaluation service not configured"))
     }
-    async fn memory_metrics(&self) -> ServiceResult<MemoryMetricsResponse> {
+    async fn memory_metrics(&self, _: &str) -> ServiceResult<MemoryMetricsResponse> {
         Err(internal_error("evaluation service not configured"))
     }
     async fn extract_training_data(

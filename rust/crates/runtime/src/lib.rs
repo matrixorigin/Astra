@@ -90,8 +90,8 @@ pub use astra_services::{
         AdminUserRoleRecord, AdminUserRoleRequestData, AuthenticatedUser,
     },
     agents::{
-        AgentCreateRequestData, AgentListRecord, AgentRecord, AgentService, AgentUpdateRequestData,
-        DatabaseAgentService, UnconfiguredAgentService,
+        AgentCreateRequestData, AgentListItem, AgentListRecord, AgentRecord, AgentService,
+        AgentUpdateRequestData, DatabaseAgentService, UnconfiguredAgentService,
     },
     auth::{
         AuthLoginRequestData, AuthRefreshRequestData, AuthRegisterRequestData, AuthService,
@@ -105,7 +105,7 @@ pub use astra_services::{
     branches::{BranchService, DatabaseBranchService, UnconfiguredBranchService},
     context::{
         ContextService, DatabaseContextService, SnapshotCreateRequestData, SnapshotListFilter,
-        SnapshotListRecord, SnapshotRecord, UnconfiguredContextService,
+        SnapshotListItem, SnapshotListRecord, SnapshotRecord, UnconfiguredContextService,
     },
     data_versioning::{
         DataVersioningService, DatabaseDataVersioningService, UnconfiguredDataVersioningService,
@@ -127,7 +127,7 @@ pub use astra_services::{
     },
     marketplace::{DatabaseMarketplaceService, MarketplaceService, UnconfiguredMarketplaceService},
     models::{
-        DatabaseModelService, ModelCreateRequestData, ModelRecord, ModelService,
+        DatabaseModelService, ModelCreateRequestData, ModelListItem, ModelRecord, ModelService,
         ModelUpdateRequestData, PricingData, QuirksData, UnconfiguredModelService,
     },
     multi_agent::{
@@ -162,8 +162,8 @@ pub use astra_services::{
     },
     triggers::{DatabaseTriggerService, TriggerRecord, TriggerService, UnconfiguredTriggerService},
     workflows::{
-        DatabaseWorkflowService, UnconfiguredWorkflowService, WorkflowDefRecord, WorkflowRunRecord,
-        WorkflowService,
+        DatabaseWorkflowService, UnconfiguredWorkflowService, WorkflowDefRecord, WorkflowListItem,
+        WorkflowRunRecord, WorkflowService,
     },
 };
 

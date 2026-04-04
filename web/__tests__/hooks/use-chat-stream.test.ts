@@ -5,8 +5,11 @@ import { TextDecoder as NodeTextDecoder } from 'util';
 
 // Polyfill TextDecoder for jsdom
 if (typeof globalThis.TextDecoder === 'undefined') {
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  (globalThis as any).TextDecoder = NodeTextDecoder;
+  Object.defineProperty(globalThis, 'TextDecoder', {
+    value: NodeTextDecoder,
+    configurable: true,
+    writable: true,
+  });
 }
 
 // ---------------------------------------------------------------------------

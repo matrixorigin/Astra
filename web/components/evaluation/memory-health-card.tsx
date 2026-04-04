@@ -25,8 +25,18 @@ export function MemoryHealthCard({
             indicator={health.healthy ? 'green' : 'red'}
           />
           <Stat label="Total memories" value={String(health.totalMemories)} />
-          <Stat label="Knowledge entries" value={String(health.knowledgeEntries)} />
-          <Stat label="Last governance run" value={health.lastGovernanceRun?.slice(0, 16) ?? '—'} />
+          <Stat label="Active memories" value={String(health.activeMemories)} />
+          <Stat label="Inactive memories" value={String(health.inactiveMemories)} />
+          <Stat
+            label="Stale working memories"
+            value={String(health.staleWorkingMemories)}
+            indicator={health.staleWorkingMemories > 0 ? 'amber' : 'green'}
+          />
+          <Stat
+            label="Orphaned records"
+            value={String(health.orphanedRecords)}
+            indicator={health.orphanedRecords > 0 ? 'amber' : 'green'}
+          />
         </>
       )}
       {metrics && (

@@ -3,7 +3,7 @@ use std::sync::Arc;
 use astra_runtime::{
     AppState, AuthLoginRequestData, AuthRefreshRequestData, AuthRegisterRequestData, AuthService,
     AuthTokenRecord, AuthUserRecord, ErrorResponse, HealthChecker, ServiceInfo, WorkflowDefRecord,
-    WorkflowRunRecord, WorkflowService, build_app,
+    WorkflowListItem, WorkflowRunRecord, WorkflowService, build_app,
 };
 use async_trait::async_trait;
 use axum::{
@@ -82,15 +82,37 @@ struct StubWorkflowService;
 impl WorkflowService for StubWorkflowService {
     async fn list_workflows(
         &self,
-    ) -> Result<Vec<WorkflowDefRecord>, (StatusCode, axum::Json<ErrorResponse>)> {
-        Ok(vec![WorkflowDefRecord {
+    ) -> Result<Vec<WorkflowListItem>, (StatusCode, axum::Json<ErrorResponse>)> {
+        Ok(vec![WorkflowListItem {
             workflow_id: "wf-001".to_string(),
             name: "ETL Pipeline".to_string(),
             version: "1.0".to_string(),
             description: Some("Extract-Transform-Load".to_string()),
-            definition: serde_json::json!({"steps": []}),
             is_active: true,
         }])
+    }
+
+    async fn get_workflow(
+        &self,
+        workflow_id: String,
+    ) -> Result<WorkflowDefRecord, (StatusCode, axum::Json<ErrorResponse>)> {
+        if workflow_id == "wf-001" {
+            Ok(WorkflowDefRecord {
+                workflow_id: "wf-001".to_string(),
+                name: "ETL Pipeline".to_string(),
+                version: "1.0".to_string(),
+                description: Some("Extract-Transform-Load".to_string()),
+                definition: serde_json::json!({"steps": []}),
+                is_active: true,
+            })
+        } else {
+            Err((
+                StatusCode::NOT_FOUND,
+                axum::Json(ErrorResponse {
+                    detail: format!("Workflow {} not found", workflow_id),
+                }),
+            ))
+        }
     }
 
     async fn get_workflow_run(
@@ -171,6 +193,27 @@ async fn list_workflows_returns_ok() {
     assert!(json.as_array().unwrap().len() == 1);
     assert_eq!(json[0]["workflow_id"], "wf-001");
     assert_eq!(json[0]["name"], "ETL Pipeline");
+    assert!(json[0].get("definition").is_none());
+}
+
+#[tokio::test]
+async fn get_workflow_returns_detail() {
+    let app = build_test_app();
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/workflows/wf-001")
+                .header("authorization", "Bearer test-token")
+                .body(body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = body::to_bytes(resp.into_body(), 1024 * 64).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(json["workflow_id"], "wf-001");
+    assert!(json.get("definition").is_some());
 }
 
 #[tokio::test]

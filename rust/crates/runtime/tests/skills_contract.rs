@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
 use astra_runtime::skills::{
-    SkillInfoRecord, SkillListRecord, SkillPublishRequestData, SkillRegisterRequestData,
-    SkillStatusRecord, SkillVersionRecord,
+    SkillInfoRecord, SkillListItem, SkillListRecord, SkillPublishRequestData,
+    SkillRegisterRequestData, SkillStatusRecord, SkillVersionRecord,
 };
 use astra_runtime::{
     AppState, AuthLoginRequestData, AuthRefreshRequestData, AuthRegisterRequestData, AuthService,
@@ -112,12 +112,16 @@ impl SkillService for InMemorySkillService {
         offset: u32,
     ) -> Result<SkillListRecord, (StatusCode, axum::Json<ErrorResponse>)> {
         Ok(SkillListRecord {
-            skills: vec![serde_json::json!({
-                "skill_id": "hello@1.0.0",
-                "skill_name": "hello",
-                "version": "1.0.0",
-                "description": "A greeting skill",
-            })],
+            skills: vec![SkillListItem {
+                skill_id: "hello@1.0.0".to_string(),
+                skill_name: "hello".to_string(),
+                version: "1.0.0".to_string(),
+                description: Some("A greeting skill".to_string()),
+                status: Some("active".to_string()),
+                source: Some("user".to_string()),
+                category: Some("general".to_string()),
+                created_at: Some("2026-01-01T00:00:00".to_string()),
+            }],
             total: 1,
             limit,
             offset,
@@ -201,9 +205,36 @@ impl SkillService for InMemorySkillService {
         _per_group: u32,
     ) -> Result<SkillStatusRecord, (StatusCode, axum::Json<ErrorResponse>)> {
         Ok(SkillStatusRecord {
-            builtin: vec![serde_json::json!({"skill_name": "builtin-skill"})],
-            marketplace: vec![serde_json::json!({"skill_name": "mp-skill"})],
-            user: vec![serde_json::json!({"skill_name": "user-skill"})],
+            builtin: vec![SkillListItem {
+                skill_id: "builtin-skill@1.0.0".to_string(),
+                skill_name: "builtin-skill".to_string(),
+                version: "1.0.0".to_string(),
+                description: None,
+                status: Some("active".to_string()),
+                source: Some("builtin".to_string()),
+                category: None,
+                created_at: None,
+            }],
+            marketplace: vec![SkillListItem {
+                skill_id: "mp-skill@1.0.0".to_string(),
+                skill_name: "mp-skill".to_string(),
+                version: "1.0.0".to_string(),
+                description: None,
+                status: Some("active".to_string()),
+                source: Some("marketplace".to_string()),
+                category: None,
+                created_at: None,
+            }],
+            user: vec![SkillListItem {
+                skill_id: "user-skill@1.0.0".to_string(),
+                skill_name: "user-skill".to_string(),
+                version: "1.0.0".to_string(),
+                description: None,
+                status: Some("active".to_string()),
+                source: Some("user".to_string()),
+                category: None,
+                created_at: None,
+            }],
             platform_total: 2,
             user_total: 1,
         })
@@ -284,6 +315,7 @@ async fn list_skills_returns_ok() {
     let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(json["total"], 1);
     assert_eq!(json["skills"][0]["skill_name"], "hello");
+    assert_eq!(json["skills"][0]["source"], "user");
 }
 
 #[tokio::test]
@@ -304,6 +336,7 @@ async fn list_skills_with_query_params() {
     let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(json["limit"], 10);
     assert_eq!(json["offset"], 0);
+    assert_eq!(json["skills"][0]["status"], "active");
 }
 
 #[tokio::test]

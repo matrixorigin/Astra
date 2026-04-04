@@ -20,6 +20,15 @@ pub struct WorkflowDefRecord {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct WorkflowListItem {
+    pub workflow_id: String,
+    pub name: String,
+    pub version: String,
+    pub description: Option<String>,
+    pub is_active: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct WorkflowRunRecord {
     pub run_id: String,
     pub workflow_id: String,
@@ -42,7 +51,12 @@ pub struct WorkflowResolveData {
 pub trait WorkflowService: Send + Sync {
     async fn list_workflows(
         &self,
-    ) -> Result<Vec<WorkflowDefRecord>, (StatusCode, Json<ErrorResponse>)>;
+    ) -> Result<Vec<WorkflowListItem>, (StatusCode, Json<ErrorResponse>)>;
+
+    async fn get_workflow(
+        &self,
+        workflow_id: String,
+    ) -> Result<WorkflowDefRecord, (StatusCode, Json<ErrorResponse>)>;
 
     async fn get_workflow_run(
         &self,
@@ -82,38 +96,81 @@ impl DatabaseWorkflowService {
         }
         connect_matrixone(&self.matrixone).await
     }
+
+    fn workflow_record_from_row(
+        row: sqlx::mysql::MySqlRow,
+    ) -> Result<WorkflowDefRecord, (StatusCode, Json<ErrorResponse>)> {
+        let def_json: String = row
+            .try_get("definition_json")
+            .unwrap_or_else(|_| "{}".into());
+        Ok(WorkflowDefRecord {
+            workflow_id: row.try_get("workflow_id").map_err(internal_error)?,
+            name: row.try_get("name").map_err(internal_error)?,
+            version: row.try_get("version").map_err(internal_error)?,
+            description: row.try_get("description").ok(),
+            definition: serde_json::from_str(&def_json).unwrap_or(serde_json::json!({})),
+            is_active: row.try_get::<i16, _>("is_active").unwrap_or(1) != 0,
+        })
+    }
 }
+
+const WORKFLOW_DETAIL_SELECT_COLS: &str = "\
+    workflow_id, name, version, description, \
+    IFNULL(CAST(definition AS CHAR), '{}') AS definition_json, is_active";
+const WORKFLOW_LIST_SELECT_COLS: &str = "\
+    workflow_id, name, version, description, is_active";
+const MAX_WORKFLOW_LIST_ROWS: i64 = 200;
 
 #[async_trait]
 impl WorkflowService for DatabaseWorkflowService {
     async fn list_workflows(
         &self,
-    ) -> Result<Vec<WorkflowDefRecord>, (StatusCode, Json<ErrorResponse>)> {
+    ) -> Result<Vec<WorkflowListItem>, (StatusCode, Json<ErrorResponse>)> {
         let pool = self.get_pool().await.map_err(internal_error)?;
-        let rows = query(
-            "SELECT workflow_id, name, version, description, \
-             IFNULL(CAST(definition AS CHAR), '{}') AS definition_json, is_active \
-             FROM wf_definitions WHERE is_active = 1 ORDER BY name",
-        )
-        .fetch_all(&pool)
-        .await
-        .map_err(internal_error)?;
+        let sql = format!(
+            "SELECT {} FROM wf_definitions WHERE is_active = 1 ORDER BY name LIMIT ?",
+            WORKFLOW_LIST_SELECT_COLS
+        );
+        let rows = query(&sql)
+            .bind(MAX_WORKFLOW_LIST_ROWS)
+            .fetch_all(&pool)
+            .await
+            .map_err(internal_error)?;
 
         let mut workflows = Vec::with_capacity(rows.len());
         for row in rows {
-            let def_json: String = row
-                .try_get("definition_json")
-                .unwrap_or_else(|_| "{}".into());
-            workflows.push(WorkflowDefRecord {
+            workflows.push(WorkflowListItem {
                 workflow_id: row.try_get("workflow_id").map_err(internal_error)?,
                 name: row.try_get("name").map_err(internal_error)?,
                 version: row.try_get("version").map_err(internal_error)?,
                 description: row.try_get("description").ok(),
-                definition: serde_json::from_str(&def_json).unwrap_or(serde_json::json!({})),
                 is_active: row.try_get::<i16, _>("is_active").unwrap_or(1) != 0,
             });
         }
         Ok(workflows)
+    }
+
+    async fn get_workflow(
+        &self,
+        workflow_id: String,
+    ) -> Result<WorkflowDefRecord, (StatusCode, Json<ErrorResponse>)> {
+        let pool = self.get_pool().await.map_err(internal_error)?;
+        let sql = format!(
+            "SELECT {} FROM wf_definitions WHERE workflow_id = ? LIMIT 1",
+            WORKFLOW_DETAIL_SELECT_COLS
+        );
+        let row = query(&sql)
+            .bind(&workflow_id)
+            .fetch_optional(&pool)
+            .await
+            .map_err(internal_error)?;
+        let row = row.ok_or_else(|| {
+            error_response(
+                StatusCode::NOT_FOUND,
+                format!("Workflow {} not found", workflow_id),
+            )
+        })?;
+        Self::workflow_record_from_row(row)
     }
 
     async fn get_workflow_run(
@@ -198,7 +255,13 @@ pub struct UnconfiguredWorkflowService;
 impl WorkflowService for UnconfiguredWorkflowService {
     async fn list_workflows(
         &self,
-    ) -> Result<Vec<WorkflowDefRecord>, (StatusCode, Json<ErrorResponse>)> {
+    ) -> Result<Vec<WorkflowListItem>, (StatusCode, Json<ErrorResponse>)> {
+        Err(internal_error("workflow service not configured"))
+    }
+    async fn get_workflow(
+        &self,
+        _: String,
+    ) -> Result<WorkflowDefRecord, (StatusCode, Json<ErrorResponse>)> {
         Err(internal_error("workflow service not configured"))
     }
     async fn get_workflow_run(

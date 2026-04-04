@@ -39,8 +39,19 @@ pub struct AgentRecord {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub struct AgentListItem {
+    pub agent_id: String,
+    pub name: String,
+    pub agent_type: String,
+    pub owner_user_id: String,
+    pub is_active: bool,
+    pub created_at: String,
+    pub updated_at: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct AgentListRecord {
-    pub agents: Vec<AgentRecord>,
+    pub agents: Vec<AgentListItem>,
     pub total: i64,
 }
 
@@ -140,6 +151,12 @@ pub const AGENT_SELECT_COLS: &str = "\
     DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s') AS created_at, \
     DATE_FORMAT(updated_at, '%Y-%m-%dT%H:%i:%s') AS updated_at";
 
+const AGENT_LIST_SELECT_COLS: &str = "\
+    agent_id, agent_name, agent_type, owner_user_id, is_active, \
+    DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s') AS created_at, \
+    DATE_FORMAT(updated_at, '%Y-%m-%dT%H:%i:%s') AS updated_at";
+const MAX_AGENT_LIST_ROWS: i64 = 200;
+
 #[async_trait]
 impl AgentService for DatabaseAgentService {
     async fn create_agent(
@@ -202,18 +219,28 @@ impl AgentService for DatabaseAgentService {
         let total = count_row.try_get::<i64, _>("total").unwrap_or(0);
 
         let select_sql = format!(
-            "SELECT {} FROM agent_agents WHERE owner_user_id = ? ORDER BY created_at DESC",
-            AGENT_SELECT_COLS
+            "SELECT {} FROM agent_agents WHERE owner_user_id = ? ORDER BY created_at DESC LIMIT ?",
+            AGENT_LIST_SELECT_COLS
         );
         let rows = query(&select_sql)
             .bind(&user_id)
+            .bind(MAX_AGENT_LIST_ROWS)
             .fetch_all(&pool)
             .await
             .map_err(internal_error)?;
 
         let mut agents = Vec::with_capacity(rows.len());
         for row in rows {
-            agents.push(Self::agent_record_from_row(row)?);
+            let is_active_int: i16 = row.try_get("is_active").unwrap_or(1);
+            agents.push(AgentListItem {
+                agent_id: row.try_get("agent_id").map_err(internal_error)?,
+                name: row.try_get("agent_name").map_err(internal_error)?,
+                agent_type: row.try_get("agent_type").map_err(internal_error)?,
+                owner_user_id: row.try_get("owner_user_id").map_err(internal_error)?,
+                is_active: is_active_int != 0,
+                created_at: row.try_get("created_at").unwrap_or_default(),
+                updated_at: row.try_get("updated_at").ok(),
+            });
         }
 
         Ok(AgentListRecord { agents, total })
@@ -430,8 +457,19 @@ pub struct AgentResponse {
 
 #[derive(Serialize, PartialEq)]
 pub struct AgentListResponse {
-    pub agents: Vec<AgentResponse>,
+    pub agents: Vec<AgentListItemResponse>,
     pub total: i64,
+}
+
+#[derive(Serialize, PartialEq)]
+pub struct AgentListItemResponse {
+    pub agent_id: String,
+    pub name: String,
+    pub agent_type: String,
+    pub owner_user_id: String,
+    pub is_active: bool,
+    pub created_at: String,
+    pub updated_at: Option<String>,
 }
 
 impl From<AgentRecord> for AgentResponse {
@@ -453,7 +491,19 @@ impl From<AgentRecord> for AgentResponse {
 impl From<AgentListRecord> for AgentListResponse {
     fn from(r: AgentListRecord) -> Self {
         Self {
-            agents: r.agents.into_iter().map(AgentResponse::from).collect(),
+            agents: r
+                .agents
+                .into_iter()
+                .map(|agent| AgentListItemResponse {
+                    agent_id: agent.agent_id,
+                    name: agent.name,
+                    agent_type: agent.agent_type,
+                    owner_user_id: agent.owner_user_id,
+                    is_active: agent.is_active,
+                    created_at: agent.created_at,
+                    updated_at: agent.updated_at,
+                })
+                .collect(),
             total: r.total,
         }
     }

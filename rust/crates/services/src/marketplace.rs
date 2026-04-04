@@ -28,6 +28,8 @@ pub struct InstalledListResponse {
     pub offset: i64,
 }
 
+const MAX_INSTALLED_LIST_ROWS: i64 = 200;
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct StatusResponse {
     pub status: String,
@@ -319,6 +321,8 @@ impl MarketplaceService for DatabaseMarketplaceService {
         offset: i64,
     ) -> Result<InstalledListResponse, (StatusCode, Json<ErrorResponse>)> {
         let pool = self.get_pool().await.map_err(internal_error)?;
+        let limit = limit.clamp(0, MAX_INSTALLED_LIST_ROWS);
+        let offset = offset.max(0);
 
         let count_row = query("SELECT COUNT(*) AS cnt FROM skill_installations WHERE user_id = ?")
             .bind(&user_id)

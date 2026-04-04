@@ -20,6 +20,7 @@ use super::{
 
 const MAX_INTROSPECTION_SNAPSHOTS: i32 = 128;
 const MAX_INTROSPECTION_USAGE_ROWS: i32 = 128;
+const MAX_MEMORY_RECALL_RESULTS: i32 = 50;
 
 #[derive(Clone, Debug)]
 pub struct DatabaseIntrospectionService {
@@ -338,16 +339,14 @@ impl IntrospectionService for DatabaseIntrospectionService {
         let pool = self.get_pool().await.map_err(internal_error)?;
         self.verify_session_owner(&pool, session_id, user_id)
             .await?;
+        let turns = turns.clamp(1, MAX_INTROSPECTION_USAGE_ROWS);
 
         let rows = query(
-            "SELECT token_usage FROM ( \
-                 SELECT IFNULL(CAST(token_usage AS CHAR), '{}') AS token_usage, \
-                        causal_chain_id, created_at, \
-                        ROW_NUMBER() OVER (PARTITION BY causal_chain_id ORDER BY created_at) AS rn \
-                 FROM agent_events \
-                 WHERE session_id = ? AND event_type = 'llm_response' AND token_usage IS NOT NULL \
-             ) t WHERE rn = 1 \
-             ORDER BY created_at DESC LIMIT ?",
+            "SELECT IFNULL(CAST(e.token_usage AS CHAR), '{}') AS token_usage \
+             FROM ctx_snapshots s \
+             JOIN agent_events e ON e.event_id = s.llm_response_id \
+             WHERE s.session_id = ? AND s.llm_response_id IS NOT NULL AND e.token_usage IS NOT NULL \
+             ORDER BY s.created_at DESC, s.context_capture_id DESC LIMIT ?",
         )
         .bind(session_id)
         .bind(turns)
@@ -461,17 +460,15 @@ impl IntrospectionService for DatabaseIntrospectionService {
                     total_tokens, assembly_time_ms, \
                     IFNULL(CAST(relevance_scores AS CHAR), '{{}}') AS relevance_scores, \
                     task_type, llm_response_id{content_cols} \
-             FROM ( \
-                 SELECT context_capture_id, token_budget, total_tokens, assembly_time_ms, \
-                        relevance_scores, task_type, llm_response_id{content_cols}, \
-                        ROW_NUMBER() OVER (ORDER BY created_at ASC) AS turn_no \
-                 FROM ctx_snapshots WHERE session_id = ? \
-             ) ranked WHERE turn_no = ?"
+             FROM ctx_snapshots \
+             WHERE session_id = ? \
+             ORDER BY created_at ASC, context_capture_id ASC \
+             LIMIT 1 OFFSET ?"
         );
 
         let row = query(&sql)
             .bind(session_id)
-            .bind(actual_turn)
+            .bind(actual_turn - 1)
             .fetch_one(&pool)
             .await
             .map_err(internal_error)?;
@@ -642,6 +639,7 @@ impl IntrospectionService for DatabaseIntrospectionService {
         let pool = self.get_pool().await.map_err(internal_error)?;
         self.verify_session_owner(&pool, session_id, user_id)
             .await?;
+        let turns = turns.clamp(1, MAX_INTROSPECTION_USAGE_ROWS);
 
         let rows = query(
             "SELECT IFNULL(CAST(relevance_scores AS CHAR), '{}') AS relevance_scores \
@@ -711,6 +709,7 @@ impl IntrospectionService for DatabaseIntrospectionService {
         let pool = self.get_pool().await.map_err(internal_error)?;
         self.verify_session_owner(&pool, session_id, user_id)
             .await?;
+        let limit = limit.clamp(1, MAX_MEMORY_RECALL_RESULTS);
 
         let terms: Vec<&str> = query_str
             .split_whitespace()

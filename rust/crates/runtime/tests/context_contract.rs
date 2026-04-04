@@ -3,7 +3,8 @@ use std::sync::{Arc, Mutex};
 use astra_runtime::{
     AppState, AuthLoginRequestData, AuthRefreshRequestData, AuthRegisterRequestData, AuthService,
     AuthTokenRecord, AuthUserRecord, ContextService, ErrorResponse, HealthChecker, ServiceInfo,
-    SnapshotCreateRequestData, SnapshotListFilter, SnapshotListRecord, SnapshotRecord, build_app,
+    SnapshotCreateRequestData, SnapshotListFilter, SnapshotListItem, SnapshotListRecord,
+    SnapshotRecord, build_app,
 };
 use async_trait::async_trait;
 use axum::{
@@ -122,6 +123,12 @@ impl ContextService for StubContextService {
             .into_iter()
             .skip(filter.offset as usize)
             .take(filter.limit as usize)
+            .map(|snapshot| SnapshotListItem {
+                context_capture_id: snapshot.context_capture_id,
+                session_id: snapshot.session_id,
+                event_id: snapshot.event_id,
+                created_at: snapshot.created_at,
+            })
             .collect();
         Ok(SnapshotListRecord {
             snapshots,
@@ -207,6 +214,7 @@ async fn list_snapshots_returns_ok() {
     let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(json["total"], 1);
     assert!(!json["snapshots"].as_array().unwrap().is_empty());
+    assert!(json["snapshots"][0].get("context_data").is_none());
 }
 
 #[tokio::test]

@@ -109,11 +109,13 @@ impl ReplayService for DatabaseReplayService {
             return Err(error_response(StatusCode::FORBIDDEN, "Not authorized"));
         }
 
-        let count_row = query("SELECT COUNT(*) AS cnt FROM agent_events WHERE session_id = ?")
-            .bind(&session_id)
-            .fetch_one(&pool)
-            .await
-            .map_err(internal_error)?;
+        let count_row =
+            query("SELECT COUNT(*) AS cnt FROM agent_events WHERE session_id = ? AND user_id = ?")
+                .bind(&session_id)
+                .bind(&user_id)
+                .fetch_one(&pool)
+                .await
+                .map_err(internal_error)?;
         let events_replayed: i64 = count_row.try_get("cnt").unwrap_or(0);
 
         let replay_id = Uuid::new_v4().to_string();
@@ -150,23 +152,19 @@ impl ReplayService for DatabaseReplayService {
             return Err(error_response(StatusCode::FORBIDDEN, "Not authorized"));
         }
 
-        let orig_row = query(
-            "SELECT COUNT(*) AS cnt FROM agent_events WHERE session_id = ? AND event_type != 'replay'"
+        let counts = query(
+            "SELECT \
+               COUNT(CASE WHEN event_type != 'replay' THEN 1 END) AS original_cnt, \
+               COUNT(CASE WHEN event_type = 'replay' THEN 1 END) AS replay_cnt \
+             FROM agent_events WHERE session_id = ? AND user_id = ?",
         )
         .bind(&session_id)
+        .bind(&user_id)
         .fetch_one(&pool)
         .await
         .map_err(internal_error)?;
-        let original_event_count: i64 = orig_row.try_get("cnt").unwrap_or(0);
-
-        let replay_row = query(
-            "SELECT COUNT(*) AS cnt FROM agent_events WHERE session_id = ? AND event_type = 'replay'"
-        )
-        .bind(&session_id)
-        .fetch_one(&pool)
-        .await
-        .map_err(internal_error)?;
-        let replay_event_count: i64 = replay_row.try_get("cnt").unwrap_or(0);
+        let original_event_count: i64 = counts.try_get("original_cnt").unwrap_or(0);
+        let replay_event_count: i64 = counts.try_get("replay_cnt").unwrap_or(0);
 
         let difference = (original_event_count - replay_event_count).abs();
         let is_match = difference == 0;

@@ -27,6 +27,14 @@ pub struct SnapshotRecord {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub struct SnapshotListItem {
+    pub context_capture_id: String,
+    pub session_id: String,
+    pub event_id: String,
+    pub created_at: String,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct SnapshotListFilter {
     pub user_id: String,
     pub session_id: Option<String>,
@@ -36,7 +44,7 @@ pub struct SnapshotListFilter {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct SnapshotListRecord {
-    pub snapshots: Vec<SnapshotRecord>,
+    pub snapshots: Vec<SnapshotListItem>,
     pub total: i64,
     pub limit: u32,
     pub offset: u32,
@@ -113,6 +121,10 @@ const SNAPSHOT_SELECT_COLS: &str = "\
     context_capture_id, session_id, event_id, \
     IFNULL(CAST(context_data AS CHAR), '{}') AS context_data_json, \
     DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s') AS created_at";
+const SNAPSHOT_LIST_SELECT_COLS: &str = "\
+    cs.context_capture_id, cs.session_id, cs.event_id, \
+    DATE_FORMAT(cs.created_at, '%Y-%m-%dT%H:%i:%s') AS created_at";
+const MAX_SNAPSHOT_LIST_ROWS: u32 = 200;
 
 #[async_trait]
 impl ContextService for DatabaseContextService {
@@ -173,6 +185,7 @@ impl ContextService for DatabaseContextService {
         filter: SnapshotListFilter,
     ) -> Result<SnapshotListRecord, (StatusCode, Json<ErrorResponse>)> {
         let pool = self.get_pool().await.map_err(internal_error)?;
+        let limit = filter.limit.min(MAX_SNAPSHOT_LIST_ROWS);
 
         let count_sql = if filter.session_id.is_some() {
             "SELECT COUNT(cs.context_capture_id) AS total FROM ctx_snapshots cs \
@@ -200,37 +213,37 @@ impl ContextService for DatabaseContextService {
         let total = total_row.try_get::<i64, _>("total").unwrap_or(0);
 
         let list_sql = if filter.session_id.is_some() {
-            "SELECT cs.context_capture_id, cs.session_id, cs.event_id, \
-                 IFNULL(CAST(cs.context_data AS CHAR), '{}') AS context_data_json, \
-                 DATE_FORMAT(cs.created_at, '%Y-%m-%dT%H:%i:%s') AS created_at \
+            format!(
+                "SELECT {} \
                  FROM ctx_snapshots cs \
                  JOIN agent_sessions s ON cs.session_id = s.session_id \
                  WHERE s.user_id = ? AND cs.session_id = ? \
-                 ORDER BY cs.created_at DESC LIMIT ? OFFSET ?"
-                .to_string()
+                 ORDER BY cs.created_at DESC LIMIT ? OFFSET ?",
+                SNAPSHOT_LIST_SELECT_COLS
+            )
         } else {
-            "SELECT cs.context_capture_id, cs.session_id, cs.event_id, \
-                 IFNULL(CAST(cs.context_data AS CHAR), '{}') AS context_data_json, \
-                 DATE_FORMAT(cs.created_at, '%Y-%m-%dT%H:%i:%s') AS created_at \
+            format!(
+                "SELECT {} \
                  FROM ctx_snapshots cs \
                  JOIN agent_sessions s ON cs.session_id = s.session_id \
                  WHERE s.user_id = ? \
-                 ORDER BY cs.created_at DESC LIMIT ? OFFSET ?"
-                .to_string()
+                 ORDER BY cs.created_at DESC LIMIT ? OFFSET ?",
+                SNAPSHOT_LIST_SELECT_COLS
+            )
         };
 
         let rows = if let Some(sid) = &filter.session_id {
             query(&list_sql)
                 .bind(&filter.user_id)
                 .bind(sid)
-                .bind(i64::from(filter.limit))
+                .bind(i64::from(limit))
                 .bind(i64::from(filter.offset))
                 .fetch_all(&pool)
                 .await
         } else {
             query(&list_sql)
                 .bind(&filter.user_id)
-                .bind(i64::from(filter.limit))
+                .bind(i64::from(limit))
                 .bind(i64::from(filter.offset))
                 .fetch_all(&pool)
                 .await
@@ -239,12 +252,17 @@ impl ContextService for DatabaseContextService {
 
         let mut snapshots = Vec::with_capacity(rows.len());
         for row in rows {
-            snapshots.push(Self::snapshot_record_from_row(row)?);
+            snapshots.push(SnapshotListItem {
+                context_capture_id: row.try_get("context_capture_id").map_err(internal_error)?,
+                session_id: row.try_get("session_id").map_err(internal_error)?,
+                event_id: row.try_get("event_id").map_err(internal_error)?,
+                created_at: row.try_get("created_at").unwrap_or_default(),
+            });
         }
         Ok(SnapshotListRecord {
             snapshots,
             total,
-            limit: filter.limit,
+            limit,
             offset: filter.offset,
         })
     }
@@ -341,10 +359,18 @@ pub struct SnapshotResponse {
 
 #[derive(Serialize, PartialEq)]
 pub struct SnapshotListResponse {
-    pub snapshots: Vec<SnapshotResponse>,
+    pub snapshots: Vec<SnapshotListItemResponse>,
     pub total: i64,
     pub limit: u32,
     pub offset: u32,
+}
+
+#[derive(Serialize, PartialEq)]
+pub struct SnapshotListItemResponse {
+    pub context_capture_id: String,
+    pub session_id: String,
+    pub event_id: String,
+    pub created_at: String,
 }
 
 impl From<SnapshotRecord> for SnapshotResponse {
@@ -365,7 +391,12 @@ impl From<SnapshotListRecord> for SnapshotListResponse {
             snapshots: r
                 .snapshots
                 .into_iter()
-                .map(SnapshotResponse::from)
+                .map(|snapshot| SnapshotListItemResponse {
+                    context_capture_id: snapshot.context_capture_id,
+                    session_id: snapshot.session_id,
+                    event_id: snapshot.event_id,
+                    created_at: snapshot.created_at,
+                })
                 .collect(),
             total: r.total,
             limit: r.limit,

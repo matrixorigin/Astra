@@ -51,10 +51,22 @@ pub struct SkillRecord {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SkillListRecord {
-    pub skills: Vec<serde_json::Value>,
+    pub skills: Vec<SkillListItem>,
     pub total: i64,
     pub limit: u32,
     pub offset: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SkillListItem {
+    pub skill_id: String,
+    pub skill_name: String,
+    pub version: String,
+    pub description: Option<String>,
+    pub status: Option<String>,
+    pub source: Option<String>,
+    pub category: Option<String>,
+    pub created_at: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -80,12 +92,15 @@ pub struct SkillInfoRecord {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SkillStatusRecord {
-    pub builtin: Vec<serde_json::Value>,
-    pub marketplace: Vec<serde_json::Value>,
-    pub user: Vec<serde_json::Value>,
+    pub builtin: Vec<SkillListItem>,
+    pub marketplace: Vec<SkillListItem>,
+    pub user: Vec<SkillListItem>,
     pub platform_total: i64,
     pub user_total: i64,
 }
+
+const MAX_SKILL_LIST_ROWS: u32 = 200;
+const MAX_SKILL_STATUS_PER_GROUP: u32 = 100;
 
 // ── Trait ─────────────────────────────────────────────────────────────────────
 
@@ -233,6 +248,7 @@ impl SkillService for DatabaseSkillService {
         offset: u32,
     ) -> Result<SkillListRecord, (StatusCode, Json<ErrorResponse>)> {
         let pool = self.get_pool().await.map_err(internal_error)?;
+        let limit = limit.min(MAX_SKILL_LIST_ROWS);
 
         let count_row = query("SELECT COUNT(*) AS cnt FROM skills_registry WHERE is_active = 1")
             .fetch_one(&pool)
@@ -254,19 +270,17 @@ impl SkillService for DatabaseSkillService {
         .await
         .map_err(internal_error)?;
 
-        let skills: Vec<serde_json::Value> = rows
+        let skills: Vec<SkillListItem> = rows
             .iter()
-            .map(|row| {
-                serde_json::json!({
-                    "skill_id": row.try_get::<String, _>("skill_id").unwrap_or_default(),
-                    "skill_name": row.try_get::<String, _>("skill_name").unwrap_or_default(),
-                    "version": row.try_get::<String, _>("version").unwrap_or_default(),
-                    "description": row.try_get::<String, _>("description").ok(),
-                    "status": row.try_get::<String, _>("status").ok(),
-                    "source": row.try_get::<String, _>("source").ok(),
-                    "category": row.try_get::<String, _>("category").ok(),
-                    "created_at": row.try_get::<String, _>("created_at").ok(),
-                })
+            .map(|row| SkillListItem {
+                skill_id: row.try_get::<String, _>("skill_id").unwrap_or_default(),
+                skill_name: row.try_get::<String, _>("skill_name").unwrap_or_default(),
+                version: row.try_get::<String, _>("version").unwrap_or_default(),
+                description: row.try_get::<String, _>("description").ok(),
+                status: row.try_get::<String, _>("status").ok(),
+                source: row.try_get::<String, _>("source").ok(),
+                category: row.try_get::<String, _>("category").ok(),
+                created_at: row.try_get::<String, _>("created_at").ok(),
             })
             .collect();
 
@@ -411,6 +425,7 @@ impl SkillService for DatabaseSkillService {
         per_group: u32,
     ) -> Result<SkillStatusRecord, (StatusCode, Json<ErrorResponse>)> {
         let pool = self.get_pool().await.map_err(internal_error)?;
+        let per_group = per_group.min(MAX_SKILL_STATUS_PER_GROUP);
 
         let fetch_group = |source: &str| {
             let pool = pool.clone();
@@ -428,17 +443,18 @@ impl SkillService for DatabaseSkillService {
                 .await
                 .unwrap_or_default();
 
-                rows.iter().map(|row| {
-                    serde_json::json!({
-                        "skill_id": row.try_get::<String, _>("skill_id").unwrap_or_default(),
-                        "skill_name": row.try_get::<String, _>("skill_name").unwrap_or_default(),
-                        "version": row.try_get::<String, _>("version").unwrap_or_default(),
-                        "description": row.try_get::<String, _>("description").ok(),
-                        "status": row.try_get::<String, _>("status").ok(),
-                        "category": row.try_get::<String, _>("category").ok(),
-                        "created_at": row.try_get::<String, _>("created_at").ok(),
+                rows.iter()
+                    .map(|row| SkillListItem {
+                        skill_id: row.try_get::<String, _>("skill_id").unwrap_or_default(),
+                        skill_name: row.try_get::<String, _>("skill_name").unwrap_or_default(),
+                        version: row.try_get::<String, _>("version").unwrap_or_default(),
+                        description: row.try_get::<String, _>("description").ok(),
+                        status: row.try_get::<String, _>("status").ok(),
+                        source: Some(source.clone()),
+                        category: row.try_get::<String, _>("category").ok(),
+                        created_at: row.try_get::<String, _>("created_at").ok(),
                     })
-                }).collect::<Vec<_>>()
+                    .collect::<Vec<_>>()
             }
         };
 

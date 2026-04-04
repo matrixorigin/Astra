@@ -1,5 +1,7 @@
 use async_trait::async_trait;
 use axum::http::StatusCode;
+use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue};
+use serde_json::Value;
 use sqlx::{Row, query};
 use uuid::Uuid;
 
@@ -14,6 +16,8 @@ use astra_core::{
 pub struct DatabaseEvaluationService {
     matrixone: MatrixOneSettings,
     pool: Option<SharedPool>,
+    memoria_base_url: Option<String>,
+    memoria_master_key: Option<String>,
 }
 
 impl DatabaseEvaluationService {
@@ -21,10 +25,22 @@ impl DatabaseEvaluationService {
         Self {
             matrixone,
             pool: None,
+            memoria_base_url: None,
+            memoria_master_key: None,
         }
     }
     pub fn with_pool(mut self, pool: SharedPool) -> Self {
         self.pool = Some(pool);
+        self
+    }
+
+    pub fn with_memoria_config(
+        mut self,
+        base_url: impl Into<String>,
+        master_key: Option<String>,
+    ) -> Self {
+        self.memoria_base_url = Some(base_url.into());
+        self.memoria_master_key = master_key.filter(|key| !key.is_empty());
         self
     }
 
@@ -33,6 +49,50 @@ impl DatabaseEvaluationService {
             return Ok(p.get().clone());
         }
         connect_matrixone(&self.matrixone).await
+    }
+
+    async fn memoria_get(&self, endpoint: &str, user_id: &str) -> ServiceResult<Value> {
+        let base_url = self.memoria_base_url.as_deref().ok_or_else(|| {
+            error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Memoria not configured on server",
+            )
+        })?;
+        let master_key = self.memoria_master_key.as_deref().ok_or_else(|| {
+            error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Memoria not configured on server",
+            )
+        })?;
+
+        let url = format!("{}{}", base_url.trim_end_matches('/'), endpoint);
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "X-User-Id",
+            HeaderValue::from_str(user_id).map_err(internal_error)?,
+        );
+        headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {master_key}")).map_err(internal_error)?,
+        );
+
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .default_headers(headers)
+            .build()
+            .map_err(internal_error)?;
+
+        let response = client.get(url).send().await.map_err(internal_error)?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(error_response(
+                StatusCode::BAD_GATEWAY,
+                format!("Memoria request failed ({status}): {body}"),
+            ));
+        }
+
+        response.json::<Value>().await.map_err(internal_error)
     }
 }
 
@@ -376,44 +436,87 @@ impl EvaluationService for DatabaseEvaluationService {
         })
     }
 
-    async fn memory_health(&self, _user_id: &str) -> ServiceResult<MemoryHealthResponse> {
-        let pool = self.get_pool().await.map_err(internal_error)?;
+    async fn memory_health(&self, user_id: &str) -> ServiceResult<MemoryHealthResponse> {
+        let storage = self.memoria_get("/v1/health/storage", user_id).await?;
+        let hygiene = self.memoria_get("/v1/health/hygiene", user_id).await?;
 
-        let mem_count: i64 = query("SELECT COUNT(*) AS cnt FROM mem_memories")
-            .fetch_one(&pool)
-            .await
-            .and_then(|r| r.try_get("cnt"))
+        let mem_count = storage.get("total").and_then(|v| v.as_i64()).unwrap_or(0);
+        let active_count = storage
+            .get("active")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(mem_count);
+        let inactive_count = storage
+            .get("inactive")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(mem_count.saturating_sub(active_count));
+
+        let hygiene_issues: i64 = [
+            "inactive_memories",
+            "stale_working_memories",
+            "orphan_memory_entity_links",
+            "orphan_entity_links",
+            "orphan_graph_nodes",
+        ]
+        .iter()
+        .map(|key| hygiene.get(*key).and_then(|v| v.as_i64()).unwrap_or(0))
+        .sum();
+        let stale_working_memories = hygiene
+            .get("stale_working_memories")
+            .and_then(|v| v.as_i64())
             .unwrap_or(0);
-
-        let kb_count: i64 = query("SELECT COUNT(*) AS cnt FROM sk_knowledge_entries")
-            .fetch_one(&pool)
-            .await
-            .and_then(|r| r.try_get("cnt"))
-            .unwrap_or(0);
-
-        let last_gov: Option<String> = query(
-            "SELECT DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s') AS ts \
-             FROM governance_runs ORDER BY created_at DESC LIMIT 1",
-        )
-        .fetch_optional(&pool)
-        .await
-        .ok()
-        .flatten()
-        .and_then(|r| r.try_get("ts").ok());
+        let orphaned_records: i64 = [
+            "orphan_memory_entity_links",
+            "orphan_entity_links",
+            "orphan_graph_nodes",
+        ]
+        .iter()
+        .map(|key| hygiene.get(*key).and_then(|v| v.as_i64()).unwrap_or(0))
+        .sum();
 
         Ok(MemoryHealthResponse {
             total_memories: mem_count,
-            knowledge_entries: kb_count,
-            last_governance_run: last_gov,
-            healthy: mem_count >= 0 && kb_count >= 0,
+            active_memories: active_count,
+            inactive_memories: inactive_count,
+            stale_working_memories,
+            orphaned_records,
+            healthy: hygiene_issues == 0 && mem_count >= 0 && inactive_count >= 0,
         })
     }
 
-    async fn memory_metrics(&self) -> ServiceResult<MemoryMetricsResponse> {
+    async fn memory_metrics(&self, user_id: &str) -> ServiceResult<MemoryMetricsResponse> {
+        let storage = self.memoria_get("/v1/health/storage", user_id).await?;
+        let analyze = self.memoria_get("/v1/health/analyze", user_id).await?;
+        let hygiene = self.memoria_get("/v1/health/hygiene", user_id).await?;
+
+        let total_memories = storage.get("total").and_then(|v| v.as_i64()).unwrap_or(0);
+        let stale_count = hygiene
+            .get("stale_working_memories")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+
+        let mut weighted_confidence_sum = 0.0f64;
+        let mut weighted_count = 0i64;
+        if let Some(by_type) = analyze.as_object() {
+            for stats in by_type.values() {
+                let total = stats.get("total").and_then(|v| v.as_i64()).unwrap_or(0);
+                let avg_conf = stats
+                    .get("avg_confidence")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(0.0);
+                weighted_confidence_sum += avg_conf * total as f64;
+                weighted_count += total;
+            }
+        }
+        let avg_confidence = if weighted_count > 0 {
+            weighted_confidence_sum / weighted_count as f64
+        } else {
+            0.0
+        };
+
         Ok(MemoryMetricsResponse {
-            total_memories: 0,
-            avg_confidence: 0.0,
-            stale_count: 0,
+            total_memories,
+            avg_confidence,
+            stale_count,
         })
     }
 
