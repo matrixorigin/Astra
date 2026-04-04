@@ -2708,16 +2708,27 @@ fn display_plan_updates_live(
             PlanUpdate::SubtaskRetry {
                 id,
                 retries_exhausted,
+                attempt,
+                max_retries,
+                failure_hint,
                 ..
             } => {
+                let attempt_str = if max_retries > 0 {
+                    format!(" ({attempt}/{max_retries})")
+                } else {
+                    String::new()
+                };
+                let hint_str = failure_hint
+                    .map(|h| format!(": {h}"))
+                    .unwrap_or_default();
                 if retries_exhausted {
                     (
-                        format!("  ⚠ {id} — verification failed (retries exhausted)"),
+                        format!("  ⚠ {id} — verification failed{attempt_str}{hint_str}"),
                         None,
                     )
                 } else {
                     (
-                        format!("  ↻ {id} — verification failed, retrying…"),
+                        format!("  ↻ {id} — verification failed{attempt_str}{hint_str}, retrying…"),
                         Some("Waiting for model"),
                     )
                 }

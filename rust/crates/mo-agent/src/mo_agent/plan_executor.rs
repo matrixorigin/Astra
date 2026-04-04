@@ -36,6 +36,12 @@ pub enum PlanUpdate {
         id: String,
         title: String,
         retries_exhausted: bool,
+        /// Current retry attempt (1-based). 0 if unknown.
+        attempt: u32,
+        /// Maximum allowed retries.
+        max_retries: u32,
+        /// Brief reason for verification failure (e.g. which criteria failed).
+        failure_hint: Option<String>,
     },
     PlanProgress {
         done: usize,
@@ -137,7 +143,15 @@ pub trait PlanOutputSink {
     fn subtask_completed(&self, id: &str, title: &str, pct: u32, elapsed: Option<Duration>);
 
     /// Subtask verification failed — will retry or force complete.
-    fn subtask_verification_failed(&self, id: &str, title: &str, retries_exhausted: bool);
+    fn subtask_verification_failed(
+        &self,
+        id: &str,
+        title: &str,
+        retries_exhausted: bool,
+        attempt: u32,
+        max_retries: u32,
+        failure_hint: Option<String>,
+    );
 
     /// Plan completed at 100%.
     fn plan_completed(&self, summary: &str, elapsed: Duration);
@@ -211,17 +225,32 @@ impl PlanOutputSink for StderrSink {
         );
     }
 
-    fn subtask_verification_failed(&self, _id: &str, title: &str, retries_exhausted: bool) {
+    fn subtask_verification_failed(
+        &self,
+        _id: &str,
+        title: &str,
+        retries_exhausted: bool,
+        attempt: u32,
+        max_retries: u32,
+        failure_hint: Option<String>,
+    ) {
+        let hint = failure_hint.map(|h| format!(" — {h}")).unwrap_or_default();
         if retries_exhausted {
             eprintln!(
-                "  {}  Subtask verification failed after max retries, forcing complete: {}",
+                "  {}  Verification failed (attempt {}/{}){}: {}",
                 "⚠".yellow(),
+                attempt,
+                max_retries,
+                hint,
                 title,
             );
         } else {
             eprintln!(
-                "  {}  Subtask verification failed, will retry: {}",
+                "  {}  Verification failed (attempt {}/{}){}, retrying: {}",
                 "↻".yellow(),
+                attempt,
+                max_retries,
+                hint,
                 title,
             );
         }
@@ -341,11 +370,22 @@ impl PlanOutputSink for ChannelSink {
         });
     }
 
-    fn subtask_verification_failed(&self, id: &str, title: &str, retries_exhausted: bool) {
+    fn subtask_verification_failed(
+        &self,
+        id: &str,
+        title: &str,
+        retries_exhausted: bool,
+        attempt: u32,
+        max_retries: u32,
+        failure_hint: Option<String>,
+    ) {
         self.send(PlanUpdate::SubtaskRetry {
             id: id.to_string(),
             title: title.to_string(),
             retries_exhausted,
+            attempt,
+            max_retries,
+            failure_hint,
         });
     }
 
@@ -1049,11 +1089,40 @@ async fn plan_executor_task(
                             );
                             emit_event(&update_tx, &ctx, event);
                         } else if let Some(ref durable) = ctx.durable_task_state {
+                            // Extract retry details from the durable contract
+                            let (attempt, max_retries, failure_hint) = durable
+                                .contract
+                                .subtasks
+                                .iter()
+                                .find(|s| s.id == *next_id)
+                                .map(|s| {
+                                    let hint = match &s.stage {
+                                        astra_services::durable_task::SubtaskStage::VerificationFailed { results } => {
+                                            let failed: Vec<_> = results
+                                                .iter()
+                                                .filter(|r| !r.passed)
+                                                .map(|r| r.criterion_id.as_str())
+                                                .collect();
+                                            if failed.is_empty() {
+                                                None
+                                            } else {
+                                                Some(failed.join(", "))
+                                            }
+                                        }
+                                        _ => None,
+                                    };
+                                    (s.retry_count, s.max_retries, hint)
+                                })
+                                .unwrap_or((0, 0, None));
                             if durable_bridge::subtask_retries_exhausted(durable, next_id) {
-                                sink.subtask_verification_failed(next_id, &title, true);
+                                sink.subtask_verification_failed(
+                                    next_id, &title, true, attempt, max_retries, failure_hint,
+                                );
                                 st.status = TaskStatus::Completed;
                             } else {
-                                sink.subtask_verification_failed(next_id, &title, false);
+                                sink.subtask_verification_failed(
+                                    next_id, &title, false, attempt, max_retries, failure_hint,
+                                );
                                 st.status = TaskStatus::Pending;
                             }
                             let event = session_journal::JournalEvent::verification_completed(
@@ -1066,7 +1135,7 @@ async fn plan_executor_task(
                             );
                             emit_event(&update_tx, &ctx, event);
                         } else {
-                            sink.subtask_verification_failed(next_id, &title, false);
+                            sink.subtask_verification_failed(next_id, &title, false, 0, 0, None);
                             st.status = TaskStatus::Pending;
                         }
                     }
