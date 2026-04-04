@@ -8,6 +8,8 @@ use astra_core::{
     ErrorResponse, MatrixOneSettings, SharedPool, connect_matrixone, error_response, internal_error,
 };
 
+const MAX_CAUSAL_CHAIN_EVENTS: i64 = 500;
+
 // ── Data types ───────────────────────────────────────────────────────────────
 
 #[derive(Clone, Debug, PartialEq)]
@@ -157,10 +159,24 @@ impl DatabaseEventService {
     }
 }
 
-pub const EVENT_SELECT_COLS: &str = "\
+pub const EVENT_DETAIL_SELECT_COLS: &str = "\
     event_id, user_id, session_id, event_type, content, \
     agent_id, agent_version, parent_event_id, causal_chain_id, \
     IFNULL(CAST(`metadata` AS CHAR), '{}') AS metadata_json, \
+    DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s') AS created_at";
+
+pub const EVENT_LIST_SELECT_COLS: &str = "\
+    event_id, user_id, session_id, event_type, \
+    CASE \
+        WHEN content IS NULL THEN '' \
+        WHEN CHAR_LENGTH(content) <= 280 THEN content \
+        ELSE CONCAT(SUBSTRING(content, 1, 280), '...') \
+    END AS content, \
+    agent_id, \
+    NULL AS agent_version, \
+    NULL AS parent_event_id, \
+    causal_chain_id, \
+    '{}' AS metadata_json, \
     DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s') AS created_at";
 
 #[async_trait]
@@ -247,7 +263,7 @@ impl EventService for DatabaseEventService {
 
         let select_sql = format!(
             "SELECT {} FROM agent_events WHERE event_id = ?",
-            EVENT_SELECT_COLS
+            EVENT_DETAIL_SELECT_COLS
         );
         let row = query(&select_sql)
             .bind(&event_id)
@@ -297,7 +313,7 @@ impl EventService for DatabaseEventService {
 
         let mut list_qb = QueryBuilder::<MySql>::new(format!(
             "SELECT {} FROM agent_events WHERE user_id = ",
-            EVENT_SELECT_COLS
+            EVENT_LIST_SELECT_COLS
         ));
         list_qb.push_bind(&filter.user_id);
         if let Some(sid) = &filter.session_id {
@@ -347,7 +363,7 @@ impl EventService for DatabaseEventService {
         let pool = self.get_pool().await.map_err(internal_error)?;
         let select_sql = format!(
             "SELECT {} FROM agent_events WHERE event_id = ?",
-            EVENT_SELECT_COLS
+            EVENT_DETAIL_SELECT_COLS
         );
         let row = query(&select_sql)
             .bind(&event_id)
@@ -375,12 +391,13 @@ impl EventService for DatabaseEventService {
     ) -> Result<Vec<EventRecord>, (StatusCode, Json<ErrorResponse>)> {
         let pool = self.get_pool().await.map_err(internal_error)?;
         let select_sql = format!(
-            "SELECT {} FROM agent_events WHERE causal_chain_id = ? AND user_id = ? ORDER BY created_at ASC",
-            EVENT_SELECT_COLS
+            "SELECT {} FROM agent_events WHERE causal_chain_id = ? AND user_id = ? ORDER BY created_at ASC LIMIT ?",
+            EVENT_DETAIL_SELECT_COLS
         );
         let rows = query(&select_sql)
             .bind(&causal_chain_id)
             .bind(&user_id)
+            .bind(MAX_CAUSAL_CHAIN_EVENTS)
             .fetch_all(&pool)
             .await
             .map_err(internal_error)?;
@@ -427,7 +444,7 @@ impl EventService for DatabaseEventService {
 
         let select_sql = format!(
             "SELECT {} FROM agent_events WHERE session_id = ? ORDER BY created_at ASC LIMIT ? OFFSET ?",
-            EVENT_SELECT_COLS
+            EVENT_LIST_SELECT_COLS
         );
         let rows = query(&select_sql)
             .bind(&session_id)
@@ -458,7 +475,7 @@ impl EventService for DatabaseEventService {
 
         let select_sql = format!(
             "SELECT {} FROM agent_events WHERE event_id = ?",
-            EVENT_SELECT_COLS
+            EVENT_DETAIL_SELECT_COLS
         );
         let row = query(&select_sql)
             .bind(&event_id)

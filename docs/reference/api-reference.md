@@ -128,11 +128,13 @@ Query params: `limit`, `offset`.
 
 Query params: `session_id`, `limit`, `offset`.
 
+Returns event summaries for list views. The `content` field may be truncated for efficiency; use `GET /events/{event_id}` for full event content and metadata.
+
 ### GET /events/{event_id}
 
 ### GET /events/session/{session_id}
 
-All events for a session, ordered by creation time.
+Session-scoped event summaries, ordered by creation time. The `content` field may be truncated for efficiency; use `GET /events/{event_id}` for full event content and metadata.
 
 ### GET /events/causal-chain/{chain_id}
 

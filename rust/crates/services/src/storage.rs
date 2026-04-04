@@ -84,7 +84,6 @@ pub async fn ensure_core_schema(settings: &MatrixOneSettings) -> Result<(), sqlx
             scope_repo VARCHAR(255) NULL,
             metadata JSON NULL,
             created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            expires_at DATETIME(6) NULL,
             INDEX idx_auth_tokens_scope_user (scope_user_id),
             INDEX idx_auth_tokens_scope_repo (scope_repo)
         )",
@@ -164,6 +163,7 @@ pub async fn ensure_core_schema(settings: &MatrixOneSettings) -> Result<(), sqlx
             INDEX idx_agent_events_user_created (user_id, created_at),
             INDEX idx_agent_events_causal_chain_id (causal_chain_id),
             INDEX idx_agent_events_skill_created (skill_name, created_at),
+            INDEX idx_agent_events_created_at (created_at),
             INDEX idx_agent_events_tool_name (meta_tool_name)
         )",
     )
@@ -176,6 +176,16 @@ pub async fn ensure_core_schema(settings: &MatrixOneSettings) -> Result<(), sqlx
     )
     .execute(&pool)
     .await
+    {
+        let msg = e.to_string().to_lowercase();
+        if !msg.contains("duplicate") && !msg.contains("already exists") {
+            return Err(e);
+        }
+    }
+
+    if let Err(e) = query("CREATE INDEX idx_agent_events_created_at ON agent_events (created_at)")
+        .execute(&pool)
+        .await
     {
         let msg = e.to_string().to_lowercase();
         if !msg.contains("duplicate") && !msg.contains("already exists") {
@@ -1047,7 +1057,7 @@ pub struct CleanupResult {
 pub struct RetentionPolicy {
     /// Max age in days for expired/revoked refresh tokens (default: 7)
     pub refresh_token_days: u32,
-    /// Max age in days for expired auth tokens (default: 30)
+    /// Max age in days for inactive auth tokens (default: 30)
     pub auth_token_days: u32,
     /// Max age in days for expired task leases (default: 7)
     pub task_lease_days: u32,
@@ -1105,7 +1115,7 @@ pub async fn cleanup_expired_data(
         rows_deleted: deleted,
     });
 
-    // 2. Expired or inactive auth tokens
+    // 2. Inactive auth tokens
     let deleted = sqlx::query(
         "DELETE FROM auth_tokens \
          WHERE is_active = 0 \
@@ -1119,25 +1129,7 @@ pub async fn cleanup_expired_data(
     .map(|r| r.rows_affected())
     .unwrap_or(0);
     results.push(CleanupResult {
-        table: "auth_tokens (inactive)",
-        rows_deleted: deleted,
-    });
-
-    // Also clean expired auth tokens (those with expires_at in the past)
-    let deleted = sqlx::query(
-        "DELETE FROM auth_tokens \
-         WHERE expires_at IS NOT NULL \
-           AND expires_at < DATE_SUB(NOW(6), INTERVAL ? DAY) \
-         LIMIT ?",
-    )
-    .bind(policy.auth_token_days)
-    .bind(BATCH_LIMIT)
-    .execute(pool)
-    .await
-    .map(|r| r.rows_affected())
-    .unwrap_or(0);
-    results.push(CleanupResult {
-        table: "auth_tokens (expired)",
+        table: "auth_tokens",
         rows_deleted: deleted,
     });
 

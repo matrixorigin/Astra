@@ -236,6 +236,8 @@ pub struct PlanTemplateSyncRow {
     pub use_count: i32,
 }
 
+const MAX_PLAN_TEMPLATE_SYNC_ROWS: i64 = 500;
+
 /// Delta snapshot containing only changed data since last sync.
 ///
 /// Used for incremental sync to reduce network bandwidth.
@@ -991,13 +993,14 @@ impl StateSyncService for MatrixOneSyncService {
     async fn pull_plan_templates_pack(&self, user_id: &str) -> Result<String, String> {
         let rows = sqlx::query(
             "SELECT template_id, user_id, goal_pattern, project_type, template_json, \
-             success_rate, avg_completion_time, use_count \
-             FROM plan_templates \
-             WHERE user_id = ? OR user_id IS NULL \
-             ORDER BY updated_at DESC \
-             LIMIT 5000",
+              success_rate, avg_completion_time, use_count \
+              FROM plan_templates \
+              WHERE user_id = ? OR user_id IS NULL \
+              ORDER BY updated_at DESC \
+              LIMIT ?",
         )
         .bind(user_id)
+        .bind(MAX_PLAN_TEMPLATE_SYNC_ROWS)
         .fetch_all(&self.pool)
         .await
         .map_err(|e| format!("pull_plan_templates_pack: {e}"))?;
@@ -1422,6 +1425,11 @@ mod tests {
         let svc = LocalOnlySyncService;
         let j = svc.pull_plan_templates_pack("u1").await.unwrap();
         assert_eq!(j, "[]");
+    }
+
+    #[test]
+    fn plan_template_sync_row_limit_is_bounded() {
+        assert_eq!(MAX_PLAN_TEMPLATE_SYNC_ROWS, 500);
     }
 
     // ── File-based preferences ──
