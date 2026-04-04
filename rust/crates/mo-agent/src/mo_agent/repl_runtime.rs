@@ -89,14 +89,8 @@ fn create_tool_selector_with_quality_internal(
         skill_instructions::SkillRegistry::new(),
     ));
 
-    // Discover and register skill metadata from skills/ directories
-    let skills_paths = [
-        std::path::PathBuf::from("skills"),
-        dirs::home_dir()
-            .map(|h| h.join(".astra").join("skills"))
-            .unwrap_or_default(),
-    ];
-    for skills_path in &skills_paths {
+    // Discover and register skill metadata from standard directories
+    for skills_path in &skill_instructions::skill_search_paths() {
         if skills_path.is_dir()
             && let Ok(mut reg) = skill_registry.write()
         {

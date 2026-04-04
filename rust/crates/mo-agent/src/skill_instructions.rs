@@ -19,6 +19,9 @@
 //!   - bash
 //!   - read_file
 //!   - git_log
+//! when_to_use: "Use when the user reports a bug, error, or unexpected behavior"
+//! model: "claude-sonnet-4-20250514"
+//! max_tokens: 8192
 //! ---
 //! Follow these steps exactly:
 //! 1. Identify the symptom: Ask the user to describe the issue
@@ -26,6 +29,13 @@
 //! 3. Verify the environment: Check Node, deps, env vars
 //! 4. Reproduce: Attempt to break it with a test case
 //! ```
+//!
+//! # Discovery Paths
+//!
+//! Skills are discovered from (highest priority first):
+//! 1. `{cwd}/.astra/skills/` — project-level (Claude Code–style `.claude/skills`)
+//! 2. `{cwd}/skills/` — project-level (explicit)
+//! 3. `~/.astra/skills/` — user-level global skills
 //!
 //! # Three-Level Loading
 //!
@@ -38,7 +48,32 @@
 #![allow(dead_code)]
 
 use serde::{Deserialize, Serialize};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+// ── Skill Discovery Paths ─────────────────────────────────────────────────
+
+/// Standard skill directory search order (high → low priority):
+///
+/// 1. `{cwd}/.astra/skills/`  — project-level (Claude Code–style .claude/skills)
+/// 2. `{cwd}/skills/`         — project-level (legacy / explicit)
+/// 3. `~/.astra/skills/`      — user-level global skills
+pub fn skill_search_paths() -> Vec<PathBuf> {
+    let mut paths = Vec::with_capacity(3);
+
+    if let Ok(cwd) = std::env::current_dir() {
+        paths.push(cwd.join(".astra").join("skills")); // 1. project .astra/skills/
+        paths.push(cwd.join("skills")); // 2. project skills/
+    } else {
+        paths.push(PathBuf::from(".astra/skills"));
+        paths.push(PathBuf::from("skills"));
+    }
+
+    if let Some(home) = dirs::home_dir() {
+        paths.push(home.join(".astra").join("skills")); // 3. ~/.astra/skills/
+    }
+
+    paths
+}
 
 /// Skill instruction parsed from SKILL.md file.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -56,6 +91,23 @@ pub struct SkillInstruction {
     /// Tools this skill is allowed to use (empty = all tools).
     #[serde(default)]
     pub allowed_tools: Vec<String>,
+
+    // ── Claude Code–aligned extended fields ──
+    /// When this skill should be activated (natural-language hint for the model).
+    /// Analogous to CC's `whenToUse` frontmatter field.
+    #[serde(default)]
+    pub when_to_use: Option<String>,
+
+    /// Model override for this skill (e.g. "claude-sonnet-4-20250514").
+    /// If set, turns executed under this skill will request this model.
+    #[serde(default)]
+    pub model: Option<String>,
+
+    /// Maximum token budget for a single invocation of this skill.
+    /// 0 = use system default.
+    #[serde(default)]
+    pub max_tokens: u32,
+
     /// Markdown body containing step-by-step instructions.
     #[serde(skip)]
     pub instructions: String,
@@ -64,18 +116,39 @@ pub struct SkillInstruction {
     pub instruction_tokens: u32,
 }
 
+impl Default for SkillInstruction {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            description: String::new(),
+            user_invocable: true, // matches serde default_true
+            triggers: Vec::new(),
+            allowed_tools: Vec::new(),
+            when_to_use: None,
+            model: None,
+            max_tokens: 0,
+            instructions: String::new(),
+            instruction_tokens: 0,
+        }
+    }
+}
+
 fn default_true() -> bool {
     true
 }
 
 /// Metadata-only view of a skill (Level 1 loading).
 /// Used for discovery and selection without loading full instructions.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SkillMetadata {
     pub name: String,
     pub description: String,
     pub triggers: Vec<String>,
     pub user_invocable: bool,
+    /// When this skill should be activated (from frontmatter `when_to_use`).
+    pub when_to_use: Option<String>,
+    /// Model override for this skill.
+    pub model: Option<String>,
     /// Estimated tokens for this metadata (~100 tokens).
     pub metadata_tokens: u32,
 }
@@ -83,7 +156,11 @@ pub struct SkillMetadata {
 impl From<&SkillInstruction> for SkillMetadata {
     fn from(skill: &SkillInstruction) -> Self {
         // Estimate tokens: ~4 chars per token
-        let text = format!("{} {} {:?}", skill.name, skill.description, skill.triggers);
+        let mut text = format!("{} {} {:?}", skill.name, skill.description, skill.triggers);
+        if let Some(ref wtu) = skill.when_to_use {
+            text.push(' ');
+            text.push_str(wtu);
+        }
         let metadata_tokens = (text.len() as u32) / 4;
 
         SkillMetadata {
@@ -91,6 +168,8 @@ impl From<&SkillInstruction> for SkillMetadata {
             description: skill.description.clone(),
             triggers: skill.triggers.clone(),
             user_invocable: skill.user_invocable,
+            when_to_use: skill.when_to_use.clone(),
+            model: skill.model.clone(),
             metadata_tokens,
         }
     }
@@ -186,6 +265,7 @@ pub fn load_skill_metadata(skills_dir: &Path) -> Vec<SkillMetadata> {
                 triggers: Vec::new(),
                 user_invocable: true,
                 metadata_tokens: 10,
+                ..Default::default()
             });
         }
     }
@@ -303,6 +383,7 @@ Body
             allowed_tools: vec!["bash".to_string()],
             instructions: "Long instructions here...".to_string(),
             instruction_tokens: 100,
+            ..Default::default()
         };
 
         let metadata = SkillMetadata::from(&skill);
@@ -351,6 +432,70 @@ echo "code block"
         assert!(skill.instructions.contains("# Header"));
         assert!(skill.instructions.contains("```bash"));
         assert!(skill.instructions.contains("- List item 1"));
+    }
+
+    #[test]
+    fn parse_extended_frontmatter_fields() {
+        let content = r#"---
+name: reviewer
+description: "Code review assistant"
+when_to_use: "Use when reviewing pull requests or code changes"
+model: "claude-sonnet-4-20250514"
+max_tokens: 8192
+triggers:
+  - review
+  - pr
+---
+Review the code carefully.
+"#;
+        let skill = parse_skill_md(content).unwrap();
+        assert_eq!(skill.name, "reviewer");
+        assert_eq!(
+            skill.when_to_use.as_deref(),
+            Some("Use when reviewing pull requests or code changes")
+        );
+        assert_eq!(skill.model.as_deref(), Some("claude-sonnet-4-20250514"));
+        assert_eq!(skill.max_tokens, 8192);
+
+        // Verify metadata conversion includes new fields
+        let meta = SkillMetadata::from(&skill);
+        assert_eq!(meta.when_to_use, skill.when_to_use);
+        assert_eq!(meta.model, skill.model);
+    }
+
+    #[test]
+    fn extended_fields_default_to_none() {
+        let content = r#"---
+name: simple
+description: "No extended fields"
+---
+Just instructions.
+"#;
+        let skill = parse_skill_md(content).unwrap();
+        assert!(skill.when_to_use.is_none());
+        assert!(skill.model.is_none());
+        assert_eq!(skill.max_tokens, 0);
+    }
+
+    #[test]
+    fn skill_search_paths_includes_astra_dir() {
+        let paths = super::skill_search_paths();
+        // Should have 3 entries: .astra/skills, skills, ~/.astra/skills
+        assert!(paths.len() >= 2);
+
+        let path_strs: Vec<String> = paths.iter().map(|p| p.display().to_string()).collect();
+        // First path should end with .astra/skills (project-level)
+        assert!(
+            path_strs[0].ends_with(".astra/skills"),
+            "First path should be .astra/skills, got: {}",
+            path_strs[0]
+        );
+        // Second path should end with /skills (project-level legacy)
+        assert!(
+            path_strs[1].ends_with("/skills") || path_strs[1] == "skills",
+            "Second path should be skills, got: {}",
+            path_strs[1]
+        );
     }
 }
 
@@ -1163,6 +1308,7 @@ mod registry_tests {
             user_invocable: true,
             triggers: vec!["test".to_string()],
             metadata_tokens: 50,
+            ..Default::default()
         };
 
         registry.register_metadata(metadata, None).unwrap();
@@ -1182,6 +1328,7 @@ mod registry_tests {
             user_invocable: true,
             triggers: vec![],
             metadata_tokens: 60,
+            ..Default::default()
         };
 
         let metadata2 = SkillMetadata {
@@ -1190,6 +1337,7 @@ mod registry_tests {
             user_invocable: true,
             triggers: vec![],
             metadata_tokens: 60,
+            ..Default::default()
         };
 
         registry.register_metadata(metadata1, None).unwrap();
@@ -1212,6 +1360,7 @@ mod registry_tests {
                     user_invocable: true,
                     triggers: vec!["review".to_string(), "audit".to_string()],
                     metadata_tokens: 50,
+                    ..Default::default()
                 },
                 None,
             )
@@ -1225,6 +1374,7 @@ mod registry_tests {
                     user_invocable: true,
                     triggers: vec!["debug".to_string(), "troubleshoot".to_string()],
                     metadata_tokens: 50,
+                    ..Default::default()
                 },
                 None,
             )
@@ -1270,6 +1420,7 @@ allowed_tools:
                 user_invocable: true,
                 triggers: vec!["review".to_string()],
                 metadata_tokens: 50,
+                ..Default::default()
             },
             Some(skill_dir),
         );
@@ -1318,6 +1469,7 @@ Generate code from templates.
                 user_invocable: true,
                 triggers: vec![],
                 metadata_tokens: 40,
+                ..Default::default()
             },
             Some(skill_dir),
         );
@@ -1387,6 +1539,7 @@ We want to verify that loaded_tokens() returns the correct cumulative total.
                 user_invocable: true,
                 triggers: vec![],
                 metadata_tokens: 30,
+                ..Default::default()
             },
             Some(skill_dir),
         );
@@ -1588,6 +1741,7 @@ This skill has templates/ and scripts/ but they are empty.
                 user_invocable: true,
                 triggers: vec![],
                 metadata_tokens: 20,
+                ..Default::default()
             },
             Some(skill_dir),
         );
@@ -1629,6 +1783,7 @@ Flat resources test.
                 user_invocable: true,
                 triggers: vec![],
                 metadata_tokens: 20,
+                ..Default::default()
             },
             Some(skill_dir),
         );
@@ -1691,6 +1846,7 @@ Instructions here.
                 user_invocable: true,
                 triggers: vec![],
                 metadata_tokens: 20,
+                ..Default::default()
             },
             Some(skill_dir),
         );

@@ -286,6 +286,7 @@ pub fn load_skill(skill_dir: &Path) -> Result<LoadedSkill, String> {
             triggers: Vec::new(),
             user_invocable: true,
             metadata_tokens: (manifest.name.len() + manifest.description.len()) as u32 / 4,
+            ..Default::default()
         }
     };
 
@@ -397,20 +398,15 @@ pub fn register_manifest_tools(skills_dir: &Path, registry: &mut PluginRegistry)
 
 /// Best-effort skill loading from standard locations.
 ///
-/// Searches for `skills/` directory in:
-/// 1. Current working directory
-/// 2. Repository root (detected via git)
+/// Uses [`skill_instructions::skill_search_paths()`] for consistent directory
+/// resolution across the CLI:
+/// 1. `{cwd}/.astra/skills/`
+/// 2. `{cwd}/skills/`
 /// 3. `~/.astra/skills/`
 ///
 /// Silently skips if no skills directory exists.
 pub fn load_skills_directory(registry: &mut PluginRegistry) {
-    let search_paths = [
-        std::path::PathBuf::from("skills"),
-        dirs::home_dir()
-            .map(|h| h.join(".astra").join("skills"))
-            .unwrap_or_default(),
-    ];
-    for path in &search_paths {
+    for path in &crate::skill_instructions::skill_search_paths() {
         if path.is_dir() {
             register_manifest_tools(path, registry);
         }
