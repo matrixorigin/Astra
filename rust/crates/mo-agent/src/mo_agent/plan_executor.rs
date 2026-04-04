@@ -106,6 +106,7 @@ pub enum PlanCommand {
 
 /// Abstraction over plan execution output. Implementations decide where
 /// progress updates go — stderr, a channel, a log file, etc.
+#[allow(dead_code)] // Trait methods used selectively by different sink implementations
 pub trait PlanOutputSink {
     /// A subtask is about to start executing.
     fn subtask_started(

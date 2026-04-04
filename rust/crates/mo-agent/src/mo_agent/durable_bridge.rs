@@ -136,6 +136,7 @@ pub fn subtask_retries_exhausted(durable: &DurableTaskState, subtask_id: &str) -
 
 /// Extract the latest verification results for a subtask as a JSON value
 /// suitable for journaling. Returns `None` if the subtask has no results.
+#[allow(dead_code)]
 pub fn subtask_verification_json(
     durable: &DurableTaskState,
     subtask_id: &str,
@@ -613,6 +614,7 @@ pub(super) fn save_delivery_report_json(report: &TaskDeliveryReport) {
 /// Prompt the user for a 1–5 rating and feed it back into the learning pipeline.
 ///
 /// Returns the raw rating (1–5) if the user provided one, or `None` if skipped.
+#[allow(dead_code)]
 pub async fn collect_user_feedback(
     durable: &DurableTaskState,
     learning_bridge: Option<&std::sync::Arc<dyn astra_services::TaskLearningBridge>>,
@@ -821,6 +823,7 @@ impl ContractVerificationGate {
     /// Create a gate from a [`DurableSubtask`]'s criteria.
     ///
     /// The gate will run all non-global criteria when `verify()` is called.
+    #[allow(dead_code)]
     pub fn from_subtask(subtask: &DurableSubtask, work_dir: std::path::PathBuf) -> Self {
         Self {
             criteria: subtask
@@ -949,6 +952,7 @@ impl VerificationGate for ContractVerificationGate {
 ///
 /// Returns `None` when the subtask has no (non-global) criteria — the
 /// delegation engine will skip gate checking in that case.
+#[allow(dead_code)]
 pub fn create_gate_for_subtask(
     durable: &DurableTaskState,
     subtask_id: &str,
