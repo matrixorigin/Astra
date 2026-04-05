@@ -280,6 +280,8 @@ impl AgenticRunLifecycleService {
             skill_resolver,
             skill_executor: None, // fork execution requires CLI; inline skills work
             skill_model_override: None,
+            skill_effort: None,
+            skill_agent_type: None,
             skill_allowed_tools: None,
             skill_quality_tracker: crate::skills::quality::SkillQualityTracker::new(),
             pinned_skills: std::collections::HashSet::new(),
@@ -931,6 +933,8 @@ impl SubRunExecutor for ServerSubRunExecutor {
             skill_resolver,
             skill_executor: None, // fork execution requires CLI; inline skills work
             skill_model_override: None,
+            skill_effort: None,
+            skill_agent_type: None,
             skill_allowed_tools: None,
             skill_quality_tracker: crate::skills::quality::SkillQualityTracker::new(),
             pinned_skills: std::collections::HashSet::new(),

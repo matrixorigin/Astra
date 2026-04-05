@@ -217,6 +217,8 @@ pub(crate) async fn stream_chat_sse(
             Some(router as Arc<dyn astra_runtime::skills::SkillExecutor>)
         },
         skill_model_override: None,
+        skill_effort: None,
+        skill_agent_type: None,
         skill_allowed_tools: None,
             skill_quality_tracker: p.skill_quality_tracker.clone(),
         pinned_skills: std::collections::HashSet::new(),

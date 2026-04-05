@@ -30,6 +30,8 @@ pub trait SkillSubRunExecutor: Send + Sync {
         model: Option<&str>,
         max_tokens: Option<u32>,
         allowed_tools: &[String],
+        effort: Option<&str>,
+        agent_type: Option<&str>,
     ) -> Result<SubRunResult, String>;
 }
 
@@ -72,6 +74,8 @@ impl SkillExecutor for IsolatedSkillExecutor {
                 skill.manifest.model.as_deref(),
                 skill.manifest.max_tokens,
                 &skill.manifest.allowed_tools,
+                skill.manifest.effort.as_ref().map(|e| e.as_str()).as_deref(),
+                skill.manifest.agent_type.as_deref(),
             )
             .await
             .map_err(|e| SkillError::ExecutionFailed(e))?;
@@ -175,6 +179,8 @@ mod tests {
             _model: Option<&str>,
             _max_tokens: Option<u32>,
             _allowed_tools: &[String],
+            _effort: Option<&str>,
+            _agent_type: Option<&str>,
         ) -> Result<SubRunResult, String> {
             Ok(SubRunResult {
                 output: format!("Result from {skill_name}: processed '{task_context}'"),
@@ -301,6 +307,8 @@ mod tests {
             _model: Option<&str>,
             _max_tokens: Option<u32>,
             _allowed_tools: &[String],
+            _effort: Option<&str>,
+            _agent_type: Option<&str>,
         ) -> Result<SubRunResult, String> {
             Err("sub-run failed: timeout".into())
         }

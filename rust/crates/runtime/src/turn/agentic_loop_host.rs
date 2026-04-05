@@ -237,6 +237,10 @@ pub struct AgenticLoopState {
     /// Model override from the most recently activated skill.
     /// When set, the host should use this model instead of the default.
     pub skill_model_override: Option<String>,
+    /// Effort level override from the most recently activated skill.
+    pub skill_effort: Option<crate::skills::manifest::EffortLevel>,
+    /// Agent type hint from the most recently activated skill.
+    pub skill_agent_type: Option<String>,
     /// Tool allow-list from the most recently activated skill.
     /// When non-empty, only these tools (plus `skill` itself) should be available.
     /// The host converts this allow-list to additions in `restricted_tools`.
@@ -946,6 +950,8 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
                 } else {
                     Some(act.allowed_tools.into_iter().collect())
                 };
+                state.skill_effort = act.effort;
+                state.skill_agent_type = act.agent_type;
             }
 
             &post_skill_tool_calls
@@ -1369,6 +1375,8 @@ mod tests {
             skill_resolver: None,
             skill_executor: None,
             skill_model_override: None,
+            skill_effort: None,
+            skill_agent_type: None,
             skill_allowed_tools: None,
             skill_quality_tracker: crate::skills::quality::SkillQualityTracker::new(),
             pinned_skills: std::collections::HashSet::new(),

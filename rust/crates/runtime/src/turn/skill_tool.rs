@@ -33,7 +33,7 @@ use serde_json::Value;
 
 use crate::skills::arguments::substitute_arguments;
 use crate::skills::hooks::HookAction;
-use crate::skills::manifest::{ExecutionContext, LoadedSkill, SkillManifest, SkillSourceKind};
+use crate::skills::manifest::{EffortLevel, ExecutionContext, LoadedSkill, SkillManifest, SkillSourceKind};
 use crate::skills::traits::{SkillExecutionContext, SkillExecutor};
 
 // ─── Skill resolution trait ──────────────────────────────────────────────────
@@ -367,6 +367,10 @@ pub struct SkillActivation {
     /// Tool allow-list — only these tools should be available.
     /// Empty means no restriction (all tools allowed).
     pub allowed_tools: Vec<String>,
+    /// Effort level override for subsequent turns.
+    pub effort: Option<EffortLevel>,
+    /// Agent type hint (e.g. `"coder"`, `"researcher"`).
+    pub agent_type: Option<String>,
 }
 
 /// Partition tool calls into skill calls and regular calls, executing skills
@@ -468,6 +472,10 @@ fn merge_activations(
 
     // Model: last writer wins.
     merged.model_override = new.model_override;
+
+    // Effort & agent_type: last writer wins.
+    merged.effort = new.effort;
+    merged.agent_type = new.agent_type;
 
     // Tools: intersect non-empty allow-lists.
     match (merged.allowed_tools.is_empty(), new.allowed_tools.is_empty()) {
@@ -588,6 +596,8 @@ async fn execute_skill(
                             execution_context: ExecutionContext::Fork,
                             hooks: Some(skill.hooks.clone()),
                             source: skill.source.clone(),
+                            effort: skill.effort.clone(),
+                            agent_type: skill.agent_type.clone(),
                             ..Default::default()
                         },
                         instructions,
@@ -743,6 +753,8 @@ fn build_activation(skill: &ResolvedSkill) -> SkillActivation {
     SkillActivation {
         model_override: skill.model.clone(),
         allowed_tools: skill.allowed_tools.clone(),
+        effort: skill.effort.clone(),
+        agent_type: skill.agent_type.clone(),
     }
 }
 
@@ -1290,6 +1302,8 @@ mod tests {
         let new = SkillActivation {
             model_override: Some("gpt-4o".into()),
             allowed_tools: vec!["bash".into()],
+            effort: None,
+            agent_type: None,
         };
         let merged = super::merge_activations(None, new);
         assert_eq!(merged.model_override.as_deref(), Some("gpt-4o"));
@@ -1301,10 +1315,14 @@ mod tests {
         let prev = SkillActivation {
             model_override: Some("model-a".into()),
             allowed_tools: vec![],
+            effort: None,
+            agent_type: None,
         };
         let new = SkillActivation {
             model_override: Some("model-b".into()),
             allowed_tools: vec![],
+            effort: None,
+            agent_type: None,
         };
         let merged = super::merge_activations(Some(prev), new);
         assert_eq!(merged.model_override.as_deref(), Some("model-b"));
@@ -1315,10 +1333,14 @@ mod tests {
         let prev = SkillActivation {
             model_override: Some("model-a".into()),
             allowed_tools: vec![],
+            effort: None,
+            agent_type: None,
         };
         let new = SkillActivation {
             model_override: None,
             allowed_tools: vec![],
+            effort: None,
+            agent_type: None,
         };
         let merged = super::merge_activations(Some(prev), new);
         assert!(merged.model_override.is_none());
@@ -1329,10 +1351,14 @@ mod tests {
         let prev = SkillActivation {
             model_override: None,
             allowed_tools: vec!["bash".into(), "grep".into(), "read_file".into()],
+            effort: None,
+            agent_type: None,
         };
         let new = SkillActivation {
             model_override: None,
             allowed_tools: vec!["bash".into(), "read_file".into(), "edit".into()],
+            effort: None,
+            agent_type: None,
         };
         let merged = super::merge_activations(Some(prev), new);
         let mut tools = merged.allowed_tools;
@@ -1345,10 +1371,14 @@ mod tests {
         let prev = SkillActivation {
             model_override: None,
             allowed_tools: vec![], // unrestricted
+            effort: None,
+            agent_type: None,
         };
         let new = SkillActivation {
             model_override: None,
             allowed_tools: vec!["bash".into()], // restricted
+            effort: None,
+            agent_type: None,
         };
         let merged = super::merge_activations(Some(prev), new);
         assert_eq!(merged.allowed_tools, vec!["bash"]);
@@ -1359,10 +1389,14 @@ mod tests {
         let prev = SkillActivation {
             model_override: None,
             allowed_tools: vec!["bash".into()], // restricted
+            effort: None,
+            agent_type: None,
         };
         let new = SkillActivation {
             model_override: None,
             allowed_tools: vec![], // unrestricted
+            effort: None,
+            agent_type: None,
         };
         let merged = super::merge_activations(Some(prev), new);
         assert_eq!(merged.allowed_tools, vec!["bash"]);
@@ -1373,10 +1407,14 @@ mod tests {
         let prev = SkillActivation {
             model_override: None,
             allowed_tools: vec!["bash".into()],
+            effort: None,
+            agent_type: None,
         };
         let new = SkillActivation {
             model_override: None,
             allowed_tools: vec!["edit".into()],
+            effort: None,
+            agent_type: None,
         };
         let merged = super::merge_activations(Some(prev), new);
         assert!(merged.allowed_tools.is_empty());

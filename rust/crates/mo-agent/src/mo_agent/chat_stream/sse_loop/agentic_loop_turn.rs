@@ -122,6 +122,10 @@ struct PrepareChatTurnRequest<'a> {
     timing_phases: bool,
     /// Normal chat: human-readable step shown after the elapsed second count on stderr.
     prep_ui_phase: Option<ChatPrepPhaseLabel>,
+    /// Effort level override from skill activation.
+    skill_effort: Option<String>,
+    /// Agent type hint from skill activation.
+    skill_agent_type: Option<String>,
 }
 
 async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
@@ -362,6 +366,14 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
         );
     }
 
+    // Inject skill-level effort and agent_type into the payload when present.
+    if let Some(ref effort) = ctx.skill_effort {
+        payload["effort"] = json!(effort);
+    }
+    if let Some(ref agent_type) = ctx.skill_agent_type {
+        payload["agent_type"] = json!(agent_type);
+    }
+
     payload
 }
 
@@ -414,6 +426,10 @@ pub(crate) struct ChatTurnSseFetchRequest<'a> {
     pub approval_request_tx: Option<super::super::ApprovalRequestTx>,
     /// Skill resolver for intercepting "skill" tool calls.
     pub skill_resolver: Option<std::sync::Arc<dyn astra_runtime::turn::skill_tool::SkillResolver>>,
+    /// Effort level override from skill activation.
+    pub skill_effort: Option<String>,
+    /// Agent type hint from skill activation.
+    pub skill_agent_type: Option<String>,
 }
 
 /// stderr prep line + timing toggles for [`fetch_chat_turn_sse`].
@@ -530,6 +546,8 @@ pub(crate) async fn fetch_chat_turn_sse(
         stream_event_tx,
         approval_request_tx,
         skill_resolver,
+        skill_effort,
+        skill_agent_type,
     } = ctx;
 
     let ui = chat_turn_sse_fetch_ui(
@@ -571,6 +589,8 @@ pub(crate) async fn fetch_chat_turn_sse(
             plan_subtask_id,
             timing_phases: ui.timing,
             prep_ui_phase: ui.prep_ui_phase.clone(),
+            skill_effort,
+            skill_agent_type,
         },
     )
     .await?;

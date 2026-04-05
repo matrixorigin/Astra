@@ -51,6 +51,10 @@ struct SubRunHost {
     perm_manager: PermissionManager,
     /// Per-response completion token limit from the skill manifest.
     max_completion_tokens: Option<u32>,
+    /// Effort level from the skill manifest.
+    effort: Option<String>,
+    /// Agent type hint from the skill manifest.
+    agent_type: Option<String>,
     /// Parent cancellation token — so Ctrl+C / stop propagates into sub-runs.
     cancel_token: Option<std::sync::Arc<tokio_util::sync::CancellationToken>>,
 }
@@ -80,6 +84,14 @@ impl AgenticLoopHost for SubRunHost {
 
         if let Some(max_tokens) = self.max_completion_tokens {
             payload["max_tokens"] = json!(max_tokens);
+        }
+
+        if let Some(ref effort) = self.effort {
+            payload["effort"] = json!(effort);
+        }
+
+        if let Some(ref agent_type) = self.agent_type {
+            payload["agent_type"] = json!(agent_type);
         }
 
         // Attach tool schemas directly (no selector).
@@ -218,6 +230,8 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
         model: Option<&str>,
         max_tokens: Option<u32>,
         allowed_tools: &[String],
+        effort: Option<&str>,
+        agent_type: Option<&str>,
     ) -> Result<SubRunResult, String> {
         let effective_model = model
             .map(String::from)
@@ -239,6 +253,8 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
             valid_tool_names: valid_tool_names.clone(),
             perm_manager,
             max_completion_tokens: max_tokens,
+            effort: effort.map(String::from),
+            agent_type: agent_type.map(String::from),
             cancel_token: self.cancel_token.clone(),
         };
 
@@ -334,6 +350,8 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
             skill_resolver: None,
             skill_executor: None, // no recursive forking
             skill_model_override: None,
+            skill_effort: None,
+            skill_agent_type: None,
             skill_allowed_tools: None,
             skill_quality_tracker: astra_runtime::skills::quality::SkillQualityTracker::new(),
             pinned_skills: std::collections::HashSet::new(),
@@ -381,6 +399,8 @@ mod tests {
             valid_tool_names: HashSet::new(),
             perm_manager: PermissionManager::with_project(true, &root),
             max_completion_tokens: None,
+            effort: None,
+            agent_type: None,
             cancel_token: None,
         };
         assert!(host.is_quiet());
@@ -399,6 +419,8 @@ mod tests {
             valid_tool_names: HashSet::new(),
             perm_manager: PermissionManager::with_project(true, &root),
             max_completion_tokens: None,
+            effort: None,
+            agent_type: None,
             cancel_token: None,
         };
         let schema = json!({
