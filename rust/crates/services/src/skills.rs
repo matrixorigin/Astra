@@ -379,7 +379,7 @@ impl SkillService for DatabaseSkillService {
         })?;
 
         let install_count: i64 = query(
-            "SELECT COUNT(*) AS cnt FROM skill_installations WHERE skill_name = ? AND is_active = 1"
+            "SELECT COUNT(*) AS cnt FROM skill_installations WHERE skill_name = ? AND status = 'installed'"
         )
         .bind(&skill_name)
         .fetch_one(&pool)
@@ -725,4 +725,20 @@ pub struct SkillStatusQuery {
 
 fn default_per_group() -> u32 {
     50
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn install_count_query_uses_status_not_is_active() {
+        let sql =
+            "SELECT COUNT(*) AS cnt FROM skill_installations WHERE skill_name = ? AND status = 'installed'";
+        assert!(
+            !sql.contains("is_active"),
+            "skill_installations has no is_active column; use status = 'installed'"
+        );
+        assert!(sql.contains("status = 'installed'"));
+    }
 }

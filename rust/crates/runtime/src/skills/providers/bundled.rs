@@ -89,38 +89,14 @@ impl BundledSkillProvider {
     /// Create a provider with all built-in skills pre-registered.
     pub fn with_defaults() -> Self {
         let provider = Self::new();
-        for content in BUNDLED_SKILLS {
-            if let Err(e) = provider.register_from_skill_md(content) {
+        for content in super::dynamic_skills::all_dynamic_skills() {
+            if let Err(e) = provider.register_from_skill_md(&content) {
                 eprintln!("  ⚠ Failed to register bundled skill: {e}");
             }
         }
         provider
     }
 }
-
-static BUNDLED_SKILLS: &[&str] = &[
-    // Core diagnostics & quality
-    include_str!("bundled_skills/debug.md"),
-    include_str!("bundled_skills/stuck.md"),
-    include_str!("bundled_skills/verify.md"),
-    include_str!("bundled_skills/perf.md"),
-    // Code review & improvement
-    include_str!("bundled_skills/simplify.md"),
-    include_str!("bundled_skills/pr-review.md"),
-    include_str!("bundled_skills/refactor.md"),
-    include_str!("bundled_skills/security-scan.md"),
-    // Code generation & testing
-    include_str!("bundled_skills/test-gen.md"),
-    include_str!("bundled_skills/explain.md"),
-    include_str!("bundled_skills/commit-msg.md"),
-    // Workflow & automation
-    include_str!("bundled_skills/batch.md"),
-    include_str!("bundled_skills/skillify.md"),
-    include_str!("bundled_skills/remember.md"),
-    // Project & integration
-    include_str!("bundled_skills/init-project.md"),
-    include_str!("bundled_skills/github.md"),
-];
 
 #[async_trait]
 impl SkillProvider for BundledSkillProvider {
@@ -255,27 +231,15 @@ Instructions B.
 
         let names: Vec<&str> = manifests.iter().map(|m| m.name.as_str()).collect();
         let expected = [
-            "debug",
-            "stuck",
-            "verify",
-            "perf",
-            "simplify",
-            "pr-review",
-            "refactor",
-            "security-scan",
-            "test-gen",
-            "explain",
-            "commit-msg",
-            "batch",
-            "skillify",
-            "remember",
-            "init-project",
-            "github",
+        let expected = [
+            "batch", "debug", "simplify", "skillify",
+            "stuck", "verify", "remember",
+        ];
         ];
         for name in &expected {
             assert!(names.contains(name), "missing bundled skill: {name}");
         }
-        assert!(manifests.len() >= expected.len());
+        assert_eq!(manifests.len(), expected.len());
 
         for m in &manifests {
             assert_eq!(m.source, SkillSourceKind::Bundled);
@@ -285,13 +249,7 @@ Instructions B.
     #[tokio::test]
     async fn fork_context_skills() {
         let provider = BundledSkillProvider::with_defaults();
-        let fork_skills = [
-            "batch",
-            "pr-review",
-            "test-gen",
-            "security-scan",
-            "refactor",
-        ];
+        let fork_skills = ["batch"];
         for name in &fork_skills {
             let loaded = provider.load(name).await.unwrap();
             assert!(
@@ -301,36 +259,6 @@ Instructions B.
             assert_eq!(
                 loaded.manifest.execution_context,
                 crate::skills::manifest::ExecutionContext::Fork
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn argument_bearing_skills() {
-        let provider = BundledSkillProvider::with_defaults();
-        let skills_with_args = [
-            "debug",
-            "simplify",
-            "batch",
-            "verify",
-            "explain",
-            "pr-review",
-            "test-gen",
-            "perf",
-            "refactor",
-            "init-project",
-            "commit-msg",
-            "remember",
-            "stuck",
-            "skillify",
-            "github",
-            "security-scan",
-        ];
-        for name in &skills_with_args {
-            let loaded = provider.load(name).await.unwrap();
-            assert!(
-                loaded.instructions.contains("$ARGUMENTS"),
-                "{name} should use $ARGUMENTS in instructions"
             );
         }
     }

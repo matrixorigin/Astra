@@ -7,6 +7,8 @@
 //! | [`DatabaseSkillProvider`](database::DatabaseSkillProvider) | Database (via `SkillService`) | 2 |
 //! | [`McpSkillProvider`](mcp::McpSkillProvider) | MCP server resources | 3 |
 
+mod dynamic_skills;
+
 pub mod bundled;
 pub mod database;
 pub mod local;
