@@ -248,6 +248,8 @@ pub struct AgenticLoopState {
     /// Per-skill quality metrics accumulated during the session.
     /// Used to boost high-performing skills in selection priority.
     pub skill_quality_tracker: crate::skills::quality::SkillQualityTracker,
+    /// Skill auto-improvement tracker — detects user corrections and proposes SKILL.md rewrites.
+    pub skill_improvement_tracker: crate::skills::improvement::ImprovementTracker,
     /// Skills pinned by the user — always included in budget (never truncated).
     pub pinned_skills: std::collections::HashSet<String>,
 
@@ -1417,6 +1419,7 @@ mod tests {
             skill_agent_type: None,
             skill_allowed_tools: None,
             skill_quality_tracker: crate::skills::quality::SkillQualityTracker::new(),
+            skill_improvement_tracker: crate::skills::improvement::ImprovementTracker::new(),
             pinned_skills: std::collections::HashSet::new(),
             stop_hooks: Vec::new(),
             stop_hook_runs: 0,

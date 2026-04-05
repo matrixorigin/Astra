@@ -32,6 +32,7 @@ pub mod composition;
 pub mod executor;
 pub mod handlers;
 pub mod hooks;
+pub mod improvement;
 pub mod loader;
 pub mod manifest;
 pub mod providers;
@@ -53,6 +54,7 @@ pub use providers::{
     BundledSkillProvider, DatabaseSkillProvider, LocalSkillProvider, McpSkillProvider,
 };
 pub use quality::{SkillOutcome, SkillQualityEntry, SkillQualityTracker};
+pub use improvement::{ImprovementTracker, ImprovementProposal, SkillImprovement};
 pub use registry::{SharedSkillRegistry, UnifiedSkillRegistry, UnifiedSkillResolver};
 pub use traits::{SkillError, SkillExecutor, SkillProvider, SkillResolver};
 pub use verify::SkillVerifier;

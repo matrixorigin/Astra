@@ -357,6 +357,7 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
             // Fresh tracker — sub-run metrics are intentionally not propagated
             // back to the parent session's tracker.
             skill_quality_tracker: astra_runtime::skills::quality::SkillQualityTracker::new(),
+            skill_improvement_tracker: astra_runtime::skills::improvement::ImprovementTracker::new(),
             pinned_skills: std::collections::HashSet::new(),
             stop_hooks: Vec::new(),
             stop_hook_runs: 0,
