@@ -6,8 +6,10 @@
 //!    `auth_users`, `agent_sessions`, `agent_agents`, `agent_events`, `ctx_snapshots`,
 //!    `ctx_decision_audits`, `edge_agent_registry`, plus in-memory edge callbacks; also hits
 //!    `auth/refresh`, `auth/logout`, session audit APIs, `GET /events` + causal-chain + list,
-//!    agent update, memory search/purge, and `GET /workflows`. Ends with `chat/turn` (SSE) and
-//!    strict `agent_events` checks (parent link, per-field tokens, `reasoning_content`, causal chain).
+//!    data-versioning lineage (read-only), agent update, memory search/purge, `GET /workflows`,
+//!    jobs (in-memory + webhook), sandbox CRUD, webhook triggers (create → fire → delete), and
+//!    `GET /introspection/skills`. Ends with `chat/turn` (SSE) and strict `agent_events` checks
+//!    (parent link, per-field tokens, `reasoning_content`, causal chain).
 //!
 //! External dependencies remain mocked where the product already allows it:
 //! - LLM: `test_llm_rounds` + `bridge-e2e-hooks` (no external model server).
@@ -142,6 +144,21 @@ async fn delete_no_content(app: &Router, path: &str, auth: Option<&str>) -> Stat
     let req = req.body(Body::empty()).expect("request");
     let response = app.clone().oneshot(req).await.expect("oneshot");
     response.status()
+}
+
+async fn delete_json(app: &Router, path: &str, auth: Option<&str>) -> (StatusCode, Value) {
+    let mut req = Request::builder().method("DELETE").uri(path);
+    if let Some(t) = auth {
+        req = req.header("authorization", t);
+    }
+    let req = req.body(Body::empty()).expect("request");
+    let response = app.clone().oneshot(req).await.expect("oneshot");
+    let status = response.status();
+    let bytes = body::to_bytes(response.into_body(), 8 * 1024 * 1024)
+        .await
+        .expect("body");
+    let json: Value = serde_json::from_slice(&bytes).unwrap_or(json!({}));
+    (status, json)
 }
 
 async fn post_json(
@@ -545,6 +562,36 @@ async fn product_matrix_api_journey_hits_multiple_tables() {
         "manual event missing in list: {ev_sess}"
     );
 
+    let (st_dv_chain, dv_chain) = get_json(
+        &app,
+        &format!("/data-versioning/lineage/{manual_event_id}/chain"),
+        Some(&auth_header),
+        &[],
+    )
+    .await;
+    assert_eq!(
+        st_dv_chain,
+        StatusCode::OK,
+        "data-versioning lineage chain: {dv_chain}"
+    );
+    assert!(
+        dv_chain.as_array().is_some_and(|a| !a.is_empty()),
+        "expected non-empty lineage for manual event: {dv_chain}"
+    );
+
+    let (st_dv_up, dv_up) = get_json(
+        &app,
+        &format!("/data-versioning/lineage/{manual_event_id}/upstream"),
+        Some(&auth_header),
+        &[],
+    )
+    .await;
+    assert_eq!(
+        st_dv_up,
+        StatusCode::OK,
+        "data-versioning upstream lineage: {dv_up}"
+    );
+
     let (st_ctx, ctx_j) = post_json(
         &app,
         "/context",
@@ -768,6 +815,209 @@ async fn product_matrix_api_journey_hits_multiple_tables() {
     let (st_wf, wf_j) = get_json(&app, "/workflows", Some(&auth_header), &[]).await;
     assert_eq!(st_wf, StatusCode::OK, "list workflows: {wf_j}");
     assert!(wf_j.is_array(), "workflows JSON should be an array: {wf_j}");
+
+    let (st_cpl, cpl_j) = get_json(
+        &app,
+        "/data-versioning/checkpoints",
+        Some(&auth_header),
+        &[],
+    )
+    .await;
+    assert_eq!(st_cpl, StatusCode::OK, "list checkpoints (read-only): {cpl_j}");
+    assert!(
+        cpl_j.is_array(),
+        "checkpoints list should be a JSON array: {cpl_j}"
+    );
+
+    let (st_job, job_j) = post_json(
+        &app,
+        "/jobs",
+        Some(&auth_header),
+        json!({
+            "job_type": "matrix_e2e",
+            "inputs": { "suite": "matrix" },
+            "gpu_required": false,
+            "timeout_seconds": 120
+        }),
+    )
+    .await;
+    assert_eq!(st_job, StatusCode::OK, "submit job: {job_j}");
+    let job_id = job_j["job_id"].as_str().expect("job_id").to_string();
+
+    let (st_gj, gj) = get_json(
+        &app,
+        &format!("/jobs/{job_id}"),
+        Some(&auth_header),
+        &[],
+    )
+    .await;
+    assert_eq!(st_gj, StatusCode::OK, "get job: {gj}");
+    assert_eq!(gj["status"].as_str(), Some("pending"));
+
+    let (st_wh, wh_j) = post_json(
+        &app,
+        "/jobs/webhook",
+        None,
+        json!({
+            "job_id": job_id,
+            "status": "completed",
+            "result": { "ok": true },
+            "error": null
+        }),
+    )
+    .await;
+    assert_eq!(st_wh, StatusCode::OK, "job webhook: {wh_j}");
+
+    let (st_gj2, gj2) = get_json(
+        &app,
+        &format!("/jobs/{job_id}"),
+        Some(&auth_header),
+        &[],
+    )
+    .await;
+    assert_eq!(st_gj2, StatusCode::OK, "get job after webhook: {gj2}");
+    assert_eq!(gj2["status"].as_str(), Some("completed"));
+
+    let sb_name = format!("sb_{suffix}");
+    let (st_sb, sb_j) = post_json(
+        &app,
+        "/sandbox",
+        Some(&auth_header),
+        json!({ "name": sb_name, "description": "matrix e2e sandbox" }),
+    )
+    .await;
+    assert_eq!(st_sb, StatusCode::CREATED, "create sandbox: {sb_j}");
+
+    let sb_row = sqlx::query(
+        "SELECT user_id, status FROM infra_sandbox_metadata WHERE sandbox_name = ?",
+    )
+    .bind(&sb_name)
+    .fetch_optional(&pool)
+    .await
+    .expect("sandbox select");
+    let sb_row = sb_row.expect("infra_sandbox_metadata row");
+    assert_eq!(
+        sb_row.try_get::<String, _>("user_id").ok().as_deref(),
+        Some(user_id.as_str())
+    );
+
+    let (st_sbl, sbl) = get_json(&app, "/sandbox", Some(&auth_header), &[]).await;
+    assert_eq!(st_sbl, StatusCode::OK, "list sandboxes: {sbl}");
+    assert!(
+        sbl["sandboxes"].as_array().is_some_and(|a| {
+            a.iter()
+                .any(|s| s["sandbox_name"].as_str() == Some(sb_name.as_str()))
+        }),
+        "sandbox not listed: {sbl}"
+    );
+
+    let (st_sbg, sbg) = get_json(
+        &app,
+        &format!("/sandbox/{sb_name}"),
+        Some(&auth_header),
+        &[],
+    )
+    .await;
+    assert_eq!(st_sbg, StatusCode::OK, "get sandbox: {sbg}");
+
+    let st_sbd = delete_no_content(
+        &app,
+        &format!("/sandbox/{sb_name}"),
+        Some(&auth_header),
+    )
+    .await;
+    assert_eq!(st_sbd, StatusCode::NO_CONTENT, "delete sandbox");
+
+    let sb_gone = sqlx::query("SELECT 1 FROM infra_sandbox_metadata WHERE sandbox_name = ?")
+        .bind(&sb_name)
+        .fetch_optional(&pool)
+        .await
+        .expect("sandbox gone");
+    assert!(
+        sb_gone.is_none(),
+        "sandbox row should be removed after DELETE"
+    );
+
+    let (st_tr, tr_j) = post_json(
+        &app,
+        "/triggers",
+        Some(&auth_header),
+        json!({
+            "trigger_type": "webhook",
+            "name": format!("wh_{suffix}"),
+            "agent_id": agent_id,
+            "user_input": "matrix e2e webhook trigger",
+            "session_id": session_id,
+            "context": { "suite": "matrix" }
+        }),
+    )
+    .await;
+    assert_eq!(st_tr, StatusCode::OK, "create webhook trigger: {tr_j}");
+    let trigger_id = tr_j["trigger_id"].as_str().expect("trigger_id").to_string();
+    let wh_secret = tr_j["secret"].as_str().expect("webhook secret");
+
+    let (st_tr_l, tr_l) = get_json(&app, "/triggers", Some(&auth_header), &[]).await;
+    assert_eq!(st_tr_l, StatusCode::OK, "list triggers: {tr_l}");
+    assert!(
+        tr_l.as_array().is_some_and(|a| {
+            a.iter()
+                .any(|t| t["trigger_id"].as_str() == Some(trigger_id.as_str()))
+        }),
+        "trigger not listed: {tr_l}"
+    );
+
+    let (st_fire, fire_j) = post_json(
+        &app,
+        &format!("/triggers/{trigger_id}/fire"),
+        None,
+        json!({ "secret": wh_secret, "payload": { "hello": "matrix" } }),
+    )
+    .await;
+    assert_eq!(st_fire, StatusCode::OK, "fire webhook: {fire_j}");
+    assert_eq!(fire_j["fired"], true);
+
+    let (st_tr_d, tr_d) = delete_json(
+        &app,
+        &format!("/triggers/{trigger_id}"),
+        Some(&auth_header),
+    )
+    .await;
+    assert_eq!(st_tr_d, StatusCode::OK, "delete trigger: {tr_d}");
+
+    let trig_gone = sqlx::query("SELECT 1 FROM wf_triggers WHERE trigger_id = ?")
+        .bind(&trigger_id)
+        .fetch_optional(&pool)
+        .await
+        .expect("trigger gone");
+    assert!(
+        trig_gone.is_none(),
+        "wf_triggers row should be deleted: {trigger_id}"
+    );
+
+    let (st_sks, sks_j) = get_json(&app, "/skills", Some(&auth_header), &[]).await;
+    assert_eq!(st_sks, StatusCode::OK, "list skills: {sks_j}");
+    assert!(
+        sks_j["skills"].is_array(),
+        "skills list record: {sks_j}"
+    );
+
+    let (st_sst, sst_j) = get_json(
+        &app,
+        "/skills/status?per_group=50",
+        Some(&auth_header),
+        &[],
+    )
+    .await;
+    assert_eq!(st_sst, StatusCode::OK, "skills status: {sst_j}");
+
+    let (st_intro, intro_j) = get_json(
+        &app,
+        "/introspection/skills",
+        Some(&auth_header),
+        &[],
+    )
+    .await;
+    assert_eq!(st_intro, StatusCode::OK, "introspection skills: {intro_j}");
 
     let (st_route, route_j) = post_json(
         &app,
