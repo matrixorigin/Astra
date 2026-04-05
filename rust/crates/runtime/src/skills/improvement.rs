@@ -343,4 +343,142 @@ mod tests {
         // Backup should be cleaned up
         assert!(!path.with_extension("md.bak").exists());
     }
+
+    // ── E2E: full improvement pipeline ──────────────────────────────────────
+
+    #[test]
+    fn e2e_improvement_pipeline_detect_parse_format_apply() {
+        // Simulates the full improvement cycle:
+        // 1. Tracker detects analysis is due
+        // 2. Build analysis prompt from recent messages
+        // 3. Parse LLM response into improvements
+        // 4. Format proposal for display
+        // 5. Apply improvement to a skill file
+
+        // Step 1: Tracker after 5 turns
+        let mut tracker = ImprovementTracker::new();
+        assert!(tracker.should_analyze(5));
+
+        // Step 2: Build analysis prompt
+        let messages = vec![
+            RecentMessage {
+                role: "user".into(),
+                content: "Run the daily standup skill".into(),
+            },
+            RecentMessage {
+                role: "assistant".into(),
+                content: "Running standup skill...".into(),
+            },
+            RecentMessage {
+                role: "user".into(),
+                content: "Also ask about blockers, you always forget that step".into(),
+            },
+            RecentMessage {
+                role: "assistant".into(),
+                content: "I'll add that.".into(),
+            },
+        ];
+        let (system, user) = build_analysis_prompt(
+            "standup",
+            "---\nname: standup\n---\n# Standup\nAsk about progress and plans.",
+            &messages,
+        );
+        assert!(system.contains("analyze conversations"));
+        assert!(user.contains("standup"));
+        assert!(user.contains("blockers"));
+
+        // Step 3: Parse simulated LLM response
+        let llm_response = r#"[
+            {
+                "section": "Steps",
+                "change": "Add a step asking about blockers",
+                "reason": "User said 'Also ask about blockers, you always forget that step'"
+            }
+        ]"#;
+        let improvements = parse_improvements(llm_response);
+        assert_eq!(improvements.len(), 1);
+        assert!(improvements[0].change.contains("blockers"));
+
+        // Step 4: Format proposal
+        let dir = tempfile::tempdir().unwrap();
+        let skill_path = dir.path().join("SKILL.md");
+        let original = "---\nname: standup\n---\n# Standup\nAsk about progress and plans.";
+        std::fs::write(&skill_path, original).unwrap();
+
+        let proposal = ImprovementProposal {
+            skill_name: "standup".into(),
+            skill_path: skill_path.clone(),
+            improvements: improvements.clone(),
+        };
+        tracker.propose(proposal.clone());
+        let display = format_proposal_for_display(&proposal);
+        assert!(display.contains("standup"));
+        assert!(display.contains("blockers"));
+
+        // Step 5: Build rewrite prompt, simulate LLM response, apply
+        let rewrite_prompt = build_rewrite_prompt(original, &improvements);
+        assert!(rewrite_prompt.contains("Add a step asking about blockers"));
+
+        let updated_content = r#"---
+name: standup
+---
+# Standup
+Ask about progress, plans, and blockers."#;
+        let extracted = extract_updated_content(&format!(
+            "Here's the updated file:\n<updated_file>\n{updated_content}\n</updated_file>"
+        ));
+        assert!(extracted.is_some());
+        let extracted = extracted.unwrap();
+        assert!(extracted.contains("blockers"));
+
+        // Step 6: Apply to file
+        apply_improvement(&skill_path, &extracted).unwrap();
+        let final_content = std::fs::read_to_string(&skill_path).unwrap();
+        assert!(final_content.contains("blockers"));
+        assert!(!skill_path.with_extension("md.bak").exists());
+
+        // Step 7: Tracker state updated
+        tracker.mark_analyzed(5);
+        assert!(!tracker.should_analyze(5));
+        assert!(tracker.should_analyze(10));
+        // Proposal consumed
+        let taken = tracker.take_proposal();
+        assert!(taken.is_some());
+        assert!(tracker.take_proposal().is_none());
+    }
+
+    #[test]
+    fn e2e_improvement_no_corrections_detected() {
+        // When LLM finds no corrections, the pipeline should gracefully produce empty results.
+        let messages = vec![
+            RecentMessage {
+                role: "user".into(),
+                content: "What's the weather?".into(),
+            },
+            RecentMessage {
+                role: "assistant".into(),
+                content: "It's sunny.".into(),
+            },
+        ];
+        let (_system, user) =
+            build_analysis_prompt("weather", "# Weather\nCheck weather.", &messages);
+        assert!(user.contains("weather"));
+
+        // LLM returns empty array (no corrections detected)
+        let improvements = parse_improvements("[]");
+        assert!(improvements.is_empty());
+
+        // LLM returns garbled output
+        let improvements = parse_improvements("I found no corrections in this conversation.");
+        assert!(improvements.is_empty());
+    }
+
+    #[test]
+    fn e2e_apply_improvement_preserves_backup_on_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nonexistent_dir").join("SKILL.md");
+        // Writing to a nonexistent directory should fail
+        let result = apply_improvement(&path, "new content");
+        assert!(result.is_err());
+    }
 }

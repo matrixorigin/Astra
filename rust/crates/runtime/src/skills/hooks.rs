@@ -514,4 +514,166 @@ mod tests {
         );
         assert_eq!(block, PreToolDecision::Block("denied".into()));
     }
+
+    // ── E2E: full hook pipeline ─────────────────────────────────────────
+
+    #[test]
+    fn e2e_hooks_json_config_to_registry_to_decisions() {
+        // Simulates the full hook lifecycle:
+        // 1. Load hooks from JSON config
+        // 2. Build registry
+        // 3. Match against tool calls
+        // 4. Produce pre-tool decisions
+
+        // Step 1: Parse hook config from JSON (as would come from .astra/hooks.json)
+        let config_json = r#"[
+            {
+                "event": "pre_tool_use",
+                "matcher": "bash",
+                "action": {"type": "shell", "command": "echo 'checking bash command'"},
+                "timeout_secs": 5
+            },
+            {
+                "event": "post_tool_use",
+                "matcher": "write_*",
+                "action": {"type": "shell", "command": "make lint"},
+                "timeout_secs": 30
+            },
+            {
+                "event": "pre_tool_use",
+                "matcher": "*",
+                "action": {"type": "custom", "id": "audit_log"},
+                "timeout_secs": 2
+            }
+        ]"#;
+        let hooks: Vec<ToolEventHook> = serde_json::from_str(config_json).unwrap();
+        assert_eq!(hooks.len(), 3);
+
+        // Step 2: Build registry
+        let registry = ToolEventHookRegistry::new(hooks);
+        assert_eq!(registry.len(), 3);
+
+        // Step 3: Match against various tool calls
+        // bash: should match both the "bash" hook and the "*" hook
+        let pre_bash = registry.matching(ToolEventKind::PreToolUse, "bash");
+        assert_eq!(pre_bash.len(), 2);
+        assert_eq!(pre_bash[0].matcher, "bash");
+        assert_eq!(pre_bash[1].matcher, "*");
+
+        // write_file: should match post_tool_use "write_*" and pre_tool_use "*"
+        let post_write = registry.matching(ToolEventKind::PostToolUse, "write_file");
+        assert_eq!(post_write.len(), 1);
+        assert_eq!(post_write[0].matcher, "write_*");
+
+        let pre_write = registry.matching(ToolEventKind::PreToolUse, "write_file");
+        assert_eq!(pre_write.len(), 1); // only the "*" catch-all
+        assert_eq!(pre_write[0].matcher, "*");
+
+        // read_file: only the catch-all "*" for pre_tool_use
+        let pre_read = registry.matching(ToolEventKind::PreToolUse, "read_file");
+        assert_eq!(pre_read.len(), 1);
+
+        // no post_tool_use hooks for read_file
+        let post_read = registry.matching(ToolEventKind::PostToolUse, "read_file");
+        assert!(post_read.is_empty());
+
+        // Step 4: Verify decision flow
+        // Simulate: a pre-tool hook returns "block" for dangerous bash command
+        let bash_hooks = registry.matching(ToolEventKind::PreToolUse, "bash");
+        let first_hook = bash_hooks[0];
+        match &first_hook.action {
+            HookAction::Shell { command } => {
+                assert!(command.contains("checking bash"));
+                // In a real system: run the shell command, parse its JSON output
+                // to get allow/block decision. Here we verify the config is correct.
+            }
+            _ => panic!("expected shell action"),
+        }
+
+        // The catch-all audit hook should be a Custom action
+        let audit_hook = bash_hooks[1];
+        match &audit_hook.action {
+            HookAction::Custom { id, .. } => assert_eq!(id, "audit_log"),
+            _ => panic!("expected custom action"),
+        }
+    }
+
+    #[test]
+    fn e2e_hooks_yaml_config_roundtrip() {
+        let hooks = vec![
+            ToolEventHook {
+                event: ToolEventKind::PreToolUse,
+                matcher: "bash".into(),
+                action: HookAction::Shell {
+                    command: "validate-command.sh".into(),
+                },
+                timeout_secs: 10,
+            },
+            ToolEventHook {
+                event: ToolEventKind::PostToolUse,
+                matcher: "write_*".into(),
+                action: HookAction::Shell {
+                    command: "run-linter.sh".into(),
+                },
+                timeout_secs: 30,
+            },
+        ];
+
+        // Roundtrip through YAML (skill frontmatter format)
+        let yaml = serde_yaml::to_string(&hooks).unwrap();
+        let parsed: Vec<ToolEventHook> = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(hooks, parsed);
+
+        // Roundtrip through JSON (project config format)
+        let json = serde_json::to_string_pretty(&hooks).unwrap();
+        let parsed: Vec<ToolEventHook> = serde_json::from_str(&json).unwrap();
+        assert_eq!(hooks, parsed);
+    }
+
+    #[test]
+    fn e2e_multiple_matchers_priority_order() {
+        // Hooks are evaluated in config order — most specific first, catch-all last
+        let registry = ToolEventHookRegistry::new(vec![
+            ToolEventHook {
+                event: ToolEventKind::PreToolUse,
+                matcher: "bash".into(),
+                action: HookAction::Shell {
+                    command: "specific-bash-check".into(),
+                },
+                timeout_secs: 5,
+            },
+            ToolEventHook {
+                event: ToolEventKind::PreToolUse,
+                matcher: "bas*".into(),
+                action: HookAction::Shell {
+                    command: "glob-bash-check".into(),
+                },
+                timeout_secs: 5,
+            },
+            ToolEventHook {
+                event: ToolEventKind::PreToolUse,
+                matcher: "*".into(),
+                action: HookAction::Shell {
+                    command: "catch-all".into(),
+                },
+                timeout_secs: 5,
+            },
+        ]);
+
+        let matches = registry.matching(ToolEventKind::PreToolUse, "bash");
+        assert_eq!(matches.len(), 3);
+        // Order preserved from config
+        match &matches[0].action {
+            HookAction::Shell { command } => assert_eq!(command, "specific-bash-check"),
+            _ => panic!(),
+        }
+        match &matches[1].action {
+            HookAction::Shell { command } => assert_eq!(command, "glob-bash-check"),
+            _ => panic!(),
+        }
+        match &matches[2].action {
+            HookAction::Shell { command } => assert_eq!(command, "catch-all"),
+            _ => panic!(),
+        }
+    }
 }

@@ -1576,4 +1576,113 @@ mod tests {
         assert_eq!(err, "LLM call cancelled");
         assert_eq!(hits.load(Ordering::SeqCst), 1);
     }
+
+    // ── Output escalation E2E tests ─────────────────────────────────────────
+
+    /// Mock server that returns finish_reason=length on first call,
+    /// then finish_reason=stop on second call (simulating successful escalation).
+    async fn mock_length_then_stop(State(Hit(c)): State<Hit>) -> Response {
+        let n = c.fetch_add(1, Ordering::SeqCst);
+        if n == 0 {
+            let d1 = json!({"choices":[{"delta":{"content":"truncat"}}]});
+            let done = json!({"choices":[{"delta":{},"finish_reason":"length"}]});
+            let body = format!("data: {d1}\n\ndata: {done}\n\n");
+            Response::builder()
+                .status(200)
+                .header("content-type", "text/event-stream")
+                .body(Body::from(body))
+                .unwrap()
+        } else {
+            let d1 = json!({"choices":[{"delta":{"content":"complete response"}}]});
+            let done = json!({"choices":[{"delta":{},"finish_reason":"stop"}]});
+            let body = format!("data: {d1}\n\ndata: {done}\n\n");
+            Response::builder()
+                .status(200)
+                .header("content-type", "text/event-stream")
+                .body(Body::from(body))
+                .unwrap()
+        }
+    }
+
+    #[tokio::test]
+    async fn output_escalation_e2e_length_then_stop() {
+        // Verifies: first call returns finish_reason=length, second returns stop.
+        // This is the data path used by server_loop_host's escalation loop.
+        unsafe { std::env::set_var("MO_STREAM_IDLE_TIMEOUT_MS", "60000") };
+        reset_rate_limit_cooldown_for_tests();
+        let hits = Arc::new(AtomicU32::new(0));
+        let app = Router::new()
+            .route("/chat/completions", post(mock_length_then_stop))
+            .with_state(Hit(hits.clone()));
+        let base = spawn_local_http_server(app).await;
+        let messages = vec![json!({"role":"user","content":"x"})];
+
+        // First call: finish_reason=length
+        let res1 = call_llm_and_collect(
+            &messages, &[], "m", "k", &base, "openai", Some(1000), false, LlmCancel::None,
+        )
+        .await
+        .expect("llm ok");
+        assert_eq!(res1.full_text, "truncat");
+        assert_eq!(res1.finish_reason.as_deref(), Some("length"));
+
+        // Second call (escalated): finish_reason=stop
+        let res2 = call_llm_and_collect(
+            &messages, &[], "m", "k", &base, "openai", Some(4000), false, LlmCancel::None,
+        )
+        .await
+        .expect("llm ok");
+        assert_eq!(res2.full_text, "complete response");
+        assert_eq!(res2.finish_reason.as_deref(), Some("stop"));
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+        unsafe { std::env::remove_var("MO_STREAM_IDLE_TIMEOUT_MS") };
+    }
+
+    #[tokio::test]
+    async fn finish_reason_stop_no_retry() {
+        unsafe { std::env::set_var("MO_STREAM_IDLE_TIMEOUT_MS", "60000") };
+        reset_rate_limit_cooldown_for_tests();
+        let hits = Arc::new(AtomicU32::new(0));
+        async fn mock_stop(State(Hit(c)): State<Hit>) -> Response {
+            c.fetch_add(1, Ordering::SeqCst);
+            let d = json!({"choices":[{"delta":{"content":"ok"}}]});
+            let done = json!({"choices":[{"delta":{},"finish_reason":"stop"}]});
+            let body = format!("data: {d}\n\ndata: {done}\n\n");
+            Response::builder()
+                .status(200)
+                .header("content-type", "text/event-stream")
+                .body(Body::from(body))
+                .unwrap()
+        }
+        let app = Router::new()
+            .route("/chat/completions", post(mock_stop))
+            .with_state(Hit(hits.clone()));
+        let base = spawn_local_http_server(app).await;
+        let messages = vec![json!({"role":"user","content":"x"})];
+        let res = call_llm_and_collect(
+            &messages, &[], "m", "k", &base, "openai", Some(1000), false, LlmCancel::None,
+        )
+        .await
+        .expect("llm ok");
+        assert_eq!(res.finish_reason.as_deref(), Some("stop"));
+        assert_eq!(hits.load(Ordering::SeqCst), 1, "no retry when stop");
+        unsafe { std::env::remove_var("MO_STREAM_IDLE_TIMEOUT_MS") };
+    }
+
+    #[tokio::test]
+    async fn finish_reason_tool_calls_extracted() {
+        unsafe { std::env::set_var("MO_STREAM_IDLE_TIMEOUT_MS", "60000") };
+        let d = json!({"choices":[{
+            "delta":{"tool_calls":[{"index":0,"id":"tc1","type":"function","function":{"name":"bash","arguments":"{}"}}]},
+            "finish_reason":"tool_calls"
+        }]});
+        let body = format!("data: {d}\n\n");
+        let stream = stream::iter(vec![Ok(Bytes::from(body))]);
+        let res = collect_llm_stream(stream, "m", Instant::now(), LlmCancel::None)
+            .await
+            .expect("collect");
+        assert_eq!(res.finish_reason.as_deref(), Some("tool_calls"));
+        assert_eq!(res.tool_calls.len(), 1);
+        unsafe { std::env::remove_var("MO_STREAM_IDLE_TIMEOUT_MS") };
+    }
 }
