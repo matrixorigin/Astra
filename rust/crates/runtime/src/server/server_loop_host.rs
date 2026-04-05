@@ -402,13 +402,17 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         let turn_started = Instant::now();
 
         // ── 1. Resolve LLM model ────────────────────────────────────────
-        // Also capture fallback_model name for rate-limit-triggered fallback.
+        // Skill-level model override takes precedence over the host-level one.
+        let effective_model_override = state
+            .skill_model_override
+            .as_deref()
+            .or(self.model_override.as_deref());
         let pool_ref = self.shared_pool.as_ref().map(|sp| sp.get());
         let (mut model_name, mut api_key, mut base_url, mut provider, fallback_model_name) =
             match astra_services::resolve_active_llm_model(
                 &self.matrixone,
                 self.encryptor.as_ref(),
-                self.model_override.as_deref(),
+                effective_model_override,
                 pool_ref,
             )
             .await
@@ -498,6 +502,21 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             .unwrap_or("");
 
         let system_prompt = self.build_system_prompt(user_content);
+
+        // Append skill-level hints (effort, agent_type) when active.
+        let mut system_prompt = system_prompt;
+        if let Some(ref effort) = state.skill_effort {
+            system_prompt.push_str(&format!(
+                "\n\n## Effort Level\nThe active skill requests effort level: **{effort}**. \
+                 Adjust thoroughness accordingly.",
+            ));
+        }
+        if let Some(ref agent_type) = state.skill_agent_type {
+            system_prompt.push_str(&format!(
+                "\n\n## Agent Type\nYou are acting as a **{agent_type}** agent for this skill.",
+            ));
+        }
+
         let llm_messages = self
             .build_llm_messages(
                 &system_prompt,
