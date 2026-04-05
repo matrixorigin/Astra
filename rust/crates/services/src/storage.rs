@@ -167,29 +167,6 @@ pub async fn ensure_core_schema(settings: &MatrixOneSettings) -> Result<(), sqlx
     .execute(&pool)
     .await?;
 
-    // Child events (tool_call / tool_error) are fetched by parent turn via parent_event_id.
-    if let Err(e) = query(
-        "CREATE INDEX idx_agent_events_session_parent ON agent_events (session_id, parent_event_id)",
-    )
-    .execute(&pool)
-    .await
-    {
-        let msg = e.to_string().to_lowercase();
-        if !msg.contains("duplicate") && !msg.contains("already exists") {
-            return Err(e);
-        }
-    }
-
-    if let Err(e) = query("CREATE INDEX idx_agent_events_created_at ON agent_events (created_at)")
-        .execute(&pool)
-        .await
-    {
-        let msg = e.to_string().to_lowercase();
-        if !msg.contains("duplicate") && !msg.contains("already exists") {
-            return Err(e);
-        }
-    }
-
     // Context / decisions / evaluation essentials used by turn persistence
     query(
         "CREATE TABLE IF NOT EXISTS ctx_snapshots (
@@ -392,7 +369,8 @@ pub async fn ensure_core_schema(settings: &MatrixOneSettings) -> Result<(), sqlx
             updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             UNIQUE KEY uq_skill_name_version (skill_name, version),
             INDEX idx_skill_active_name (is_active, status, skill_name),
-            INDEX idx_skill_source_name (source, skill_name)
+            INDEX idx_skill_source_name (source, skill_name),
+            INDEX idx_skill_active_name_ver (is_active, skill_name, version)
         )",
     )
     .execute(&pool)
@@ -802,7 +780,8 @@ pub async fn ensure_core_schema(settings: &MatrixOneSettings) -> Result<(), sqlx
             updated_at         DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
             INDEX idx_mm_user (user_id),
             INDEX idx_mm_type (memory_type),
-            INDEX idx_mm_active (is_active)
+            INDEX idx_mm_active (is_active),
+            INDEX idx_mm_user_active_type_updated (user_id, is_active, memory_type, updated_at)
         )",
     )
     .execute(&pool)
@@ -913,6 +892,67 @@ pub async fn ensure_core_schema(settings: &MatrixOneSettings) -> Result<(), sqlx
         )",
     )
     .execute(&pool)
+    .await?;
+
+    // ─── Schema migration tracking ──────────────────────────────────────────────
+
+    query(
+        "CREATE TABLE IF NOT EXISTS schema_migrations (
+            version     INT PRIMARY KEY,
+            description VARCHAR(255) NOT NULL,
+            applied_at  DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    run_migrations(&pool).await?;
+
+    Ok(())
+}
+
+async fn run_migration(
+    pool: &sqlx::Pool<MySql>,
+    version: i32,
+    description: &str,
+    sql: &str,
+) -> Result<(), sqlx::Error> {
+    let already_applied: bool = query("SELECT 1 FROM schema_migrations WHERE version = ?")
+        .bind(version)
+        .fetch_optional(&*pool)
+        .await?
+        .is_some();
+
+    if already_applied {
+        return Ok(());
+    }
+
+    query(sql).execute(&*pool).await?;
+
+    query("INSERT INTO schema_migrations (version, description) VALUES (?, ?)")
+        .bind(version)
+        .bind(description)
+        .execute(&*pool)
+        .await?;
+
+    Ok(())
+}
+
+async fn run_migrations(pool: &sqlx::Pool<MySql>) -> Result<(), sqlx::Error> {
+    run_migration(
+        pool,
+        1,
+        "add composite index on mem_memories for profile queries",
+        "SELECT 1", // index already in CREATE TABLE above; marker only
+    )
+    .await?;
+
+    run_migration(
+        pool,
+        2,
+        "add covering index on skills_registry for listing queries",
+        "SELECT 1", // index already in CREATE TABLE above; marker only
+    )
     .await?;
 
     Ok(())

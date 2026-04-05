@@ -231,8 +231,7 @@ Instructions B.
 
         let names: Vec<&str> = manifests.iter().map(|m| m.name.as_str()).collect();
         let expected = [
-            "batch", "debug", "reflect", "review", "skillify",
-            "stuck", "verify", "remember",
+            "batch", "debug", "reflect", "review", "skillify", "stuck", "verify", "remember",
         ];
         for name in &expected {
             assert!(names.contains(name), "missing bundled skill: {name}");

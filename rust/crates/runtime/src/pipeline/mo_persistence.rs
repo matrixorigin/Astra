@@ -37,6 +37,7 @@ fn is_duplicate_key_error(err: &sqlx::Error) -> bool {
 // ─── DDL ─────────────────────────────────────────────────────────────────────
 
 /// DDL for the idempotency cache table. Called from ensure_core_schema().
+/// Must stay in sync with `ensure_core_schema` in `astra_services::storage`.
 pub const IDEMPOTENCY_CACHE_DDL: &str = r#"
 CREATE TABLE IF NOT EXISTS step_idempotency_cache (
     cache_key VARCHAR(200) PRIMARY KEY,
@@ -48,7 +49,7 @@ CREATE TABLE IF NOT EXISTS step_idempotency_cache (
     is_error SMALLINT NOT NULL DEFAULT 0,
     cached_at BIGINT NOT NULL,
     created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-    INDEX idx_idempotency_step (step_id),
+    INDEX idx_idempotency_step_tool (step_id, tool_index),
     INDEX idx_idempotency_hash (content_hash)
 )
 "#;

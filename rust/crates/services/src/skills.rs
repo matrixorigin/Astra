@@ -729,12 +729,9 @@ fn default_per_group() -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     #[test]
     fn install_count_query_uses_status_not_is_active() {
-        let sql =
-            "SELECT COUNT(*) AS cnt FROM skill_installations WHERE skill_name = ? AND status = 'installed'";
+        let sql = "SELECT COUNT(*) AS cnt FROM skill_installations WHERE skill_name = ? AND status = 'installed'";
         assert!(
             !sql.contains("is_active"),
             "skill_installations has no is_active column; use status = 'installed'"

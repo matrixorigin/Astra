@@ -150,15 +150,15 @@ dev-deps-clean:
 	@echo "⚠️  WARNING: This will delete all dependency data!"
 	@printf "Are you sure? [y/N] " && read REPLY && \
 	if [ "$$REPLY" = "y" ] || [ "$$REPLY" = "Y" ]; then \
-		cd deployment/all-in-one && docker compose down -v; \
-		if [ -d data ]; then \
-			if [ "$$(stat -c '%u' data 2>/dev/null || stat -f '%u' data 2>/dev/null)" != "$$(id -u)" ]; then \
-				sudo rm -rf data; \
+		(cd deployment/all-in-one && docker compose down -v); \
+		if [ -d deployment/all-in-one/data ]; then \
+			if [ "$$(stat -c '%u' deployment/all-in-one/data 2>/dev/null || stat -f '%u' deployment/all-in-one/data 2>/dev/null)" != "$$(id -u)" ]; then \
+				sudo rm -rf deployment/all-in-one/data; \
 			else \
-				rm -rf data; \
+				rm -rf deployment/all-in-one/data; \
 			fi; \
 		fi; \
-		cd ../.. && rm -f api_server.pid api_server.log; \
+		rm -f api_server.pid api_server.log; \
 		echo "✅ All dependency data removed"; \
 	else \
 		echo "Cancelled"; \
