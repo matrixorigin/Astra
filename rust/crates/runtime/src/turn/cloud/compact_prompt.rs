@@ -55,12 +55,9 @@ pub fn render_messages_for_summary(messages: &[serde_json::Value]) -> String {
                             .and_then(|f| f.get("name"))
                             .and_then(|n| n.as_str())
                             .unwrap_or("unknown_tool");
-                        let args = tc
-                            .get("function")
-                            .and_then(|f| f.get("arguments"))
-                            .and_then(|a| a.as_str())
-                            .unwrap_or("{}");
-                        let args_short = truncate_str(args, 300);
+                        let args_scrubbed =
+                            tool_arguments_for_summary(tc.get("function").and_then(|f| f.get("arguments")));
+                        let args_short = truncate_str(&args_scrubbed, 300);
                         out.push_str(&format!("[ASSISTANT calls {name}({args_short})]\n"));
                     }
                 }
@@ -131,6 +128,14 @@ pub(crate) fn scrub_string_for_summary(s: &str) -> String {
         idx = end;
     }
     out
+}
+
+fn tool_arguments_for_summary(args: Option<&Value>) -> String {
+    match args {
+        None | Some(Value::Null) => "{}".to_string(),
+        Some(Value::String(s)) => scrub_string_for_summary(s),
+        Some(v) => scrub_string_for_summary(&v.to_string()),
+    }
 }
 
 fn looks_like_base64_body(s: &str) -> bool {
@@ -254,6 +259,50 @@ mod tests {
         })];
         let rendered = render_messages_for_summary(&msgs);
         assert!(rendered.contains("bash"));
+    }
+
+    #[test]
+    fn render_scrubs_data_url_inside_tool_call_arguments_string() {
+        let inner = format!(
+            r#"{{"img":"data:image/png;base64,{}","cmd":"ls"}}"#,
+            "y".repeat(100)
+        );
+        let msgs = vec![json!({
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{
+                "function": {
+                    "name": "upload",
+                    "arguments": inner
+                }
+            }]
+        })];
+        let rendered = render_messages_for_summary(&msgs);
+        assert!(rendered.contains("upload"));
+        assert!(rendered.contains("[omitted: base64 or media data]"));
+        assert!(!rendered.contains("data:image/png;base64,"));
+        assert!(!rendered.contains(&"y".repeat(100)));
+        assert!(rendered.contains("cmd"));
+    }
+
+    #[test]
+    fn render_scrubs_tool_call_arguments_when_json_object() {
+        let msgs = vec![json!({
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{
+                "function": {
+                    "name": "x",
+                    "arguments": {
+                        "blob": format!("data:text/plain;base64,{} tail", "z".repeat(50))
+                    }
+                }
+            }]
+        })];
+        let rendered = render_messages_for_summary(&msgs);
+        assert!(rendered.contains("x"));
+        assert!(rendered.contains("[omitted: base64 or media data]"));
+        assert!(!rendered.contains(&"z".repeat(50)));
     }
 
     #[test]
