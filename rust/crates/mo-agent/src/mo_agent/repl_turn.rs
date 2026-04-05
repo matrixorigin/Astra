@@ -834,6 +834,9 @@ fn apply_turn_success(
     commit_turn_journal_workspace_and_sidecars(state, line, &result, turn_start);
     record_selector_turn_outcome(state, selector, line, &result);
 
+    // ── Skill auto-improvement check ─────────────────────────────────────
+    check_skill_improvement(state, line, &result);
+
     // ── Post-turn status line ────────────────────────────────────────────
     print_turn_status_line(state, &result, turn_start);
 
@@ -903,6 +906,74 @@ fn print_turn_status_line(state: &ReplState, result: &StreamResult, turn_start: 
         .unwrap_or(80);
     let rule = "─".repeat(w.min(72));
     eprintln!("{}", rule.dim());
+}
+
+/// Check if the skill improvement tracker should trigger analysis.
+///
+/// After every N user turns (TURN_BATCH_SIZE), checks whether the recent conversation
+/// contains corrections or improvements for any active filesystem skill.
+fn check_skill_improvement(state: &mut ReplState, _line: &str, _result: &StreamResult) {
+    if !state.skill_improvement_tracker.should_analyze(state.turn) {
+        return;
+    }
+
+    // Find active filesystem skills (only .astra/skills/ are improvable)
+    let registry = state.unified_skill_registry.clone();
+    let manifests = registry.all_manifests();
+    let filesystem_skills: Vec<_> = manifests
+        .iter()
+        .filter(|m| {
+            matches!(
+                m.source,
+                astra_runtime::skills::manifest::SkillSourceKind::Local
+            )
+        })
+        .collect();
+
+    if filesystem_skills.is_empty() {
+        state.skill_improvement_tracker.mark_analyzed(state.turn);
+        return;
+    }
+
+    // Build recent messages for analysis
+    let recent: Vec<astra_runtime::skills::improvement::RecentMessage> = state
+        .history
+        .iter()
+        .rev()
+        .take(astra_runtime::skills::improvement::TURN_BATCH_SIZE as usize)
+        .rev()
+        .flat_map(|(user, assistant)| {
+            vec![
+                astra_runtime::skills::improvement::RecentMessage {
+                    role: "user".into(),
+                    content: user.clone(),
+                },
+                astra_runtime::skills::improvement::RecentMessage {
+                    role: "assistant".into(),
+                    content: assistant.clone(),
+                },
+            ]
+        })
+        .collect();
+
+    if recent.is_empty() {
+        state.skill_improvement_tracker.mark_analyzed(state.turn);
+        return;
+    }
+
+    // Log that analysis is due — actual LLM analysis deferred to future iteration.
+    // The prompt builders (build_analysis_prompt, build_rewrite_prompt) are ready
+    // in astra_runtime::skills::improvement, but calling LLM from here requires
+    // async context + API key plumbing that's better handled via a dedicated
+    // background task or post-turn hook.
+    astra_core::agent_info!(
+        "skill",
+        "improvement check: {} filesystem skill(s) eligible, {} recent messages — analysis ready",
+        filesystem_skills.len(),
+        recent.len(),
+    );
+
+    state.skill_improvement_tracker.mark_analyzed(state.turn);
 }
 
 pub(super) fn initialize_journal_pub(state: &mut ReplState, session_id: &str) {
