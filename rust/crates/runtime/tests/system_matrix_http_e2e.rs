@@ -4,9 +4,10 @@
 //! 1. **`product_matrix_api_journey_hits_multiple_tables`** — **product matrix**: one
 //!    realistic client-style journey that exercises many public routes and asserts persistence on
 //!    `auth_users`, `agent_sessions`, `agent_agents`, `agent_events`, `ctx_snapshots`,
-//!    `ctx_decision_audits`, `edge_agent_registry`, plus in-memory edge callbacks; ends with the
-//!    `chat/turn` (SSE) with strict `agent_events` checks (parent link, per-field tokens,
-//!    `reasoning_content`, causal chain).
+//!    `ctx_decision_audits`, `edge_agent_registry`, plus in-memory edge callbacks; also hits
+//!    `auth/refresh`, `auth/logout`, session audit APIs, `GET /events` + causal-chain + list,
+//!    agent update, memory search/purge, and `GET /workflows`. Ends with `chat/turn` (SSE) and
+//!    strict `agent_events` checks (parent link, per-field tokens, `reasoning_content`, causal chain).
 //!
 //! External dependencies remain mocked where the product already allows it:
 //! - LLM: `test_llm_rounds` + `bridge-e2e-hooks` (no external model server).
@@ -214,6 +215,19 @@ async fn cleanup_edge_registry(
     .await;
 }
 
+fn row_get_str(r: &MySqlRow, col: &str) -> String {
+    r.try_get::<String, _>(col)
+        .unwrap_or_else(|_| panic!("missing string column {col}"))
+}
+
+fn row_get_opt_str(r: &MySqlRow, col: &str) -> Option<String> {
+    r.try_get::<Option<String>, _>(col).ok().flatten()
+}
+
+fn row_get_opt_i64(r: &MySqlRow, col: &str) -> Option<i64> {
+    r.try_get::<Option<i64>, _>(col).ok().flatten()
+}
+
 #[tokio::test]
 #[ignore = "live MatrixOne + full secrets; MO_AGENT_SYSTEM_MATRIX_E2E=1 — see module doc"]
 async fn product_matrix_api_journey_hits_multiple_tables() {
@@ -264,7 +278,11 @@ async fn product_matrix_api_journey_hits_multiple_tables() {
     assert_eq!(st_reg, StatusCode::CREATED, "register: {reg}");
     let access = reg["access_token"].as_str().expect("access_token");
     let user_id = reg["user_id"].as_str().expect("user_id").to_string();
-    let auth_header = format!("Bearer {access}");
+    let mut refresh_token = reg["refresh_token"]
+        .as_str()
+        .expect("refresh_token")
+        .to_string();
+    let mut auth_header = format!("Bearer {access}");
 
     let auth_row = sqlx::query("SELECT username, email FROM auth_users WHERE user_id = ?")
         .bind(&user_id)
@@ -293,6 +311,25 @@ async fn product_matrix_api_journey_hits_multiple_tables() {
     let (st_me, me) = get_json(&app, "/auth/me", Some(&auth_header), &[]).await;
     assert_eq!(st_me, StatusCode::OK, "me: {me}");
     assert_eq!(me["user_id"].as_str(), Some(user_id.as_str()));
+
+    let (st_ref, ref_j) = post_json(
+        &app,
+        "/auth/refresh",
+        None,
+        json!({ "refresh_token": refresh_token }),
+    )
+    .await;
+    assert_eq!(st_ref, StatusCode::OK, "refresh: {ref_j}");
+    let access2 = ref_j["access_token"].as_str().expect("post-refresh access_token");
+    refresh_token = ref_j["refresh_token"]
+        .as_str()
+        .expect("post-refresh refresh_token")
+        .to_string();
+    auth_header = format!("Bearer {access2}");
+
+    let (st_me2, me2) = get_json(&app, "/auth/me", Some(&auth_header), &[]).await;
+    assert_eq!(st_me2, StatusCode::OK, "me after refresh: {me2}");
+    assert_eq!(me2["user_id"].as_str(), Some(user_id.as_str()));
 
     let (st_learn_h, learn_h) = get_json(&app, "/api/v1/learning/health", None, &[]).await;
     assert_eq!(st_learn_h, StatusCode::OK, "learning health: {learn_h}");
@@ -350,6 +387,27 @@ async fn product_matrix_api_journey_hits_multiple_tables() {
     .await;
     assert_eq!(st_act, StatusCode::OK, "session activity: {act}");
 
+    let (st_au_sum, au_sum) = get_json(
+        &app,
+        &format!("/sessions/{session_id}/audit/summary"),
+        Some(&auth_header),
+        &[],
+    )
+    .await;
+    assert_eq!(st_au_sum, StatusCode::OK, "audit summary: {au_sum}");
+
+    let (st_au_stats, au_stats) = get_json(&app, "/audit/stats", Some(&auth_header), &[]).await;
+    assert_eq!(st_au_stats, StatusCode::OK, "audit stats: {au_stats}");
+
+    let (st_au_sess, au_sess) = get_json(
+        &app,
+        "/audit/sessions?limit=10&offset=0",
+        Some(&auth_header),
+        &[],
+    )
+    .await;
+    assert_eq!(st_au_sess, StatusCode::OK, "audit sessions: {au_sess}");
+
     let (st_agent, agent_j) = post_json(
         &app,
         "/agents",
@@ -381,6 +439,39 @@ async fn product_matrix_api_journey_hits_multiple_tables() {
         Some(user_id.as_str())
     );
 
+    let (st_get_ag, got_ag) = get_json(
+        &app,
+        &format!("/agents/{agent_id}"),
+        Some(&auth_header),
+        &[],
+    )
+    .await;
+    assert_eq!(st_get_ag, StatusCode::OK, "get agent: {got_ag}");
+    assert_eq!(got_ag["name"].as_str(), Some("matrix-crud-agent"));
+
+    let (st_put_ag, put_ag) = put_json(
+        &app,
+        &format!("/agents/{agent_id}"),
+        Some(&auth_header),
+        json!({ "name": "matrix-crud-agent-renamed" }),
+    )
+    .await;
+    assert_eq!(st_put_ag, StatusCode::OK, "put agent: {put_ag}");
+    assert_eq!(
+        put_ag["name"].as_str(),
+        Some("matrix-crud-agent-renamed"),
+        "agent update response: {put_ag}"
+    );
+    let agent_renamed = sqlx::query("SELECT agent_name FROM agent_agents WHERE agent_id = ?")
+        .bind(&agent_id)
+        .fetch_one(&pool)
+        .await
+        .expect("agent_agents after rename");
+    assert_eq!(
+        agent_renamed.try_get::<String, _>("agent_name").ok().as_deref(),
+        Some("matrix-crud-agent-renamed")
+    );
+
     let (st_ev, ev_j) = post_json(
         &app,
         "/events",
@@ -396,6 +487,47 @@ async fn product_matrix_api_journey_hits_multiple_tables() {
     .await;
     assert_eq!(st_ev, StatusCode::CREATED, "create event: {ev_j}");
     let manual_event_id = ev_j["event_id"].as_str().expect("event_id").to_string();
+
+    let (st_ev_one, ev_one) = get_json(
+        &app,
+        &format!("/events/{manual_event_id}"),
+        Some(&auth_header),
+        &[],
+    )
+    .await;
+    assert_eq!(st_ev_one, StatusCode::OK, "get event by id: {ev_one}");
+    assert_eq!(ev_one["event_id"].as_str(), Some(manual_event_id.as_str()));
+    let causal_chain_id = ev_one["causal_chain_id"]
+        .as_str()
+        .expect("causal_chain_id on event")
+        .to_string();
+
+    let (st_cc, cc_j) = get_json(
+        &app,
+        &format!("/events/causal-chain/{causal_chain_id}"),
+        Some(&auth_header),
+        &[],
+    )
+    .await;
+    assert_eq!(st_cc, StatusCode::OK, "causal chain events: {cc_j}");
+    assert!(
+        cc_j.as_array().is_some_and(|a| {
+            a.iter()
+                .any(|e| e["event_id"].as_str() == Some(manual_event_id.as_str()))
+        }),
+        "manual event missing from causal chain: {cc_j}"
+    );
+
+    let list_ev_path = format!("/events?session_id={session_id}&limit=20&offset=0");
+    let (st_list_ev, list_ev) = get_json(&app, &list_ev_path, Some(&auth_header), &[]).await;
+    assert_eq!(st_list_ev, StatusCode::OK, "list events (query): {list_ev}");
+    assert!(
+        list_ev["events"].as_array().is_some_and(|arr| {
+            arr.iter()
+                .any(|e| e["event_id"].as_str() == Some(manual_event_id.as_str()))
+        }),
+        "manual event missing from GET /events list: {list_ev}"
+    );
 
     let (st_ev_sess, ev_sess) = get_json(
         &app,
@@ -537,6 +669,24 @@ async fn product_matrix_api_journey_hits_multiple_tables() {
     .await;
     assert_eq!(st_mem_r, StatusCode::OK, "memory retrieve: {mem_r}");
 
+    let (st_mem_q, mem_q) = post_json(
+        &app,
+        "/memory/search",
+        Some(&auth_header),
+        json!({ "query": "matrix", "top_k": 3 }),
+    )
+    .await;
+    assert_eq!(st_mem_q, StatusCode::OK, "memory search: {mem_q}");
+
+    let (st_mem_p, mem_p) = post_json(
+        &app,
+        "/memory/purge",
+        Some(&auth_header),
+        json!({ "memory_id": "e2e-purge-dummy" }),
+    )
+    .await;
+    assert_eq!(st_mem_p, StatusCode::OK, "memory purge: {mem_p}");
+
     assert!(
         !memoria.calls.lock().await.is_empty(),
         "memoria forwarder should see at least one proxy call"
@@ -614,6 +764,10 @@ async fn product_matrix_api_journey_hits_multiple_tables() {
 
     let (st_runs, runs) = get_json(&app, "/runs", Some(&auth_header), &[]).await;
     assert_eq!(st_runs, StatusCode::OK, "list runs: {runs}");
+
+    let (st_wf, wf_j) = get_json(&app, "/workflows", Some(&auth_header), &[]).await;
+    assert_eq!(st_wf, StatusCode::OK, "list workflows: {wf_j}");
+    assert!(wf_j.is_array(), "workflows JSON should be an array: {wf_j}");
 
     let (st_route, route_j) = post_json(
         &app,
@@ -705,17 +859,6 @@ async fn product_matrix_api_journey_hits_multiple_tables() {
     .await
     .expect("select agent_events");
 
-    fn row_get_str(r: &MySqlRow, col: &str) -> String {
-        r.try_get::<String, _>(col)
-            .unwrap_or_else(|_| panic!("missing string column {col}"))
-    }
-    fn row_get_opt_str(r: &MySqlRow, col: &str) -> Option<String> {
-        r.try_get::<Option<String>, _>(col).ok().flatten()
-    }
-    fn row_get_opt_i64(r: &MySqlRow, col: &str) -> Option<i64> {
-        r.try_get::<Option<i64>, _>(col).ok().flatten()
-    }
-
     let user_q = recs
         .iter()
         .find(|r| {
@@ -731,8 +874,11 @@ async fn product_matrix_api_journey_hits_multiple_tables() {
 
     let llm = recs
         .iter()
-        .find(|r| row_get_str(r, "event_type") == "llm_response")
-        .expect("llm_response from chat/turn");
+        .find(|r| {
+            row_get_str(r, "event_type") == "llm_response"
+                && row_get_str(r, "content").contains(LLM_TEXT)
+        })
+        .expect("llm_response from chat/turn with expected assistant text");
     assert_eq!(row_get_str(llm, "session_id"), session_id);
     assert_eq!(row_get_str(llm, "user_id"), user_id);
     let llm_content = row_get_str(llm, "content");
@@ -774,6 +920,15 @@ async fn product_matrix_api_journey_hits_multiple_tables() {
         StatusCode::NO_CONTENT,
         "delete agent should succeed"
     );
+
+    let (st_out, out_j) = post_json(
+        &app,
+        "/auth/logout",
+        Some(&auth_header),
+        json!({ "refresh_token": refresh_token }),
+    )
+    .await;
+    assert_eq!(st_out, StatusCode::OK, "logout: {out_j}");
 
     pool.close().await;
 }
