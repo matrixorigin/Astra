@@ -932,6 +932,13 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
         // return resolved instructions as tool results.
         let (skill_results, post_skill_tool_calls);
         let effective_tool_calls = if let Some(resolver) = &state.skill_resolver {
+            // Build runtime context for skill execution
+            let skill_ctx = crate::turn::skill_tool::SkillContext {
+                session_id: state.current_session_id.clone(),
+                available_tools: state.all_tools_used.iter().cloned().collect(),
+                ..Default::default()
+            };
+
             let (sr, remaining, activation) =
                 crate::turn::skill_tool::partition_and_execute_skills(
                     effective_tool_calls,
@@ -939,6 +946,7 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
                     state.skill_executor.as_ref(),
                     Some(&mut state.skill_quality_tracker),
                     None, // composition_ctx: top-level invocation
+                    &skill_ctx,
                 )
                 .await;
             skill_results = sr;

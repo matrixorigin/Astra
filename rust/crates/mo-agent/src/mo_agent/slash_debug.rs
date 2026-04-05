@@ -918,8 +918,8 @@ fn read_line() -> Option<String> {
 }
 
 /// Produce a descriptive tool name for debug display.
-/// `"skill"` → `"Skill: <name>"` (extracted from args_preview JSON `skill_name` field).
-/// MCP tools (`mcp_<server>_<tool>`) → `"MCP <server>: <tool>"`.
+/// `"skill"` → `"Skill <name>"` (extracted from args_preview JSON `skill_name` field).
+/// MCP tools (`mcp_<server>_<tool>`) → `"MCP <server> <tool>"`.
 fn format_debug_tool_name(raw_name: &str, args_preview: &str) -> String {
     if raw_name == "skill" {
         if let Some(start) = args_preview.find("\"skill_name\"") {
@@ -931,7 +931,7 @@ fn format_debug_tool_name(raw_name: &str, args_preview: &str) -> String {
                     .split('"')
                     .next()
                     .unwrap_or("?");
-                return format!("Skill: {name}");
+                return format!("Skill {name}");
             }
         }
         return "Skill".to_string();
@@ -941,9 +941,9 @@ fn format_debug_tool_name(raw_name: &str, args_preview: &str) -> String {
         if let Some(sep) = rest.find('_') {
             let server = &rest[..sep];
             let tool = &rest[sep + 1..];
-            return format!("MCP {server}: {tool}");
+            return format!("MCP {server} {tool}");
         }
-        return format!("MCP: {rest}");
+        return format!("MCP {rest}");
     }
     raw_name.to_string()
 }
@@ -1209,7 +1209,7 @@ mod tests {
     #[test]
     fn debug_tool_name_skill_with_name() {
         let args = r#"{"skill_name": "code-review", "input": "..."}"#;
-        assert_eq!(format_debug_tool_name("skill", args), "Skill: code-review");
+        assert_eq!(format_debug_tool_name("skill", args), "Skill code-review");
     }
 
     #[test]
@@ -1221,13 +1221,13 @@ mod tests {
     fn debug_tool_name_mcp_with_server() {
         assert_eq!(
             format_debug_tool_name("mcp_github_get_pr", ""),
-            "MCP github: get_pr"
+            "MCP github get_pr"
         );
     }
 
     #[test]
     fn debug_tool_name_mcp_no_tool() {
-        assert_eq!(format_debug_tool_name("mcp_github", ""), "MCP: github");
+        assert_eq!(format_debug_tool_name("mcp_github", ""), "MCP github");
     }
 
     #[test]

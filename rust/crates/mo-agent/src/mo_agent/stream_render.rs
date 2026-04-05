@@ -1055,17 +1055,17 @@ impl StreamRenderState {
                     .get("skill_name")
                     .and_then(Value::as_str)
                     .unwrap_or("unknown");
-                format!("Skill: {}", truncate_line(skill_name, 45))
+                format!("Skill {}", truncate_line(skill_name, 45))
             }
             other if other.starts_with("mcp_") => {
-                // MCP tool names are "mcp_{server}_{tool}" — show as "MCP {server}: {tool}"
+                // MCP tool names are "mcp_{server}_{tool}" — show as "MCP {server} {tool}"
                 let rest = &other[4..]; // strip "mcp_"
                 if let Some(sep) = rest.find('_') {
                     let server = &rest[..sep];
                     let tool_name = &rest[sep + 1..];
-                    format!("MCP {server}: {}", truncate_line(tool_name, 40))
+                    format!("MCP {server} {}", truncate_line(tool_name, 40))
                 } else {
-                    format!("MCP: {rest}")
+                    format!("MCP {rest}")
                 }
             }
             _ => tool.to_string(),

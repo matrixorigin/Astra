@@ -53,6 +53,54 @@ pub struct SkillToolInfo {
     pub aliases: Vec<String>,
 }
 
+// ─── Skill context ───────────────────────────────────────────────────────────
+
+/// Runtime context available to skills during execution.
+///
+/// Injected into skill instructions via `${CTX_*}` placeholders.
+/// Built at execution time from the agentic loop state.
+#[derive(Clone, Debug, Default)]
+pub struct SkillContext {
+    /// Current session identifier.
+    pub session_id: Option<String>,
+    /// Directory where session artifacts are stored.
+    pub session_dir: Option<String>,
+    /// Current working directory of the agent.
+    pub work_dir: Option<String>,
+    /// Names of tools available to the agent in this turn.
+    pub available_tools: Vec<String>,
+    /// Extensible key-value pairs for host-specific context.
+    pub extra: HashMap<String, String>,
+}
+
+impl SkillContext {
+    /// Convert context fields into a flat `HashMap` for argument substitution.
+    ///
+    /// Keys are prefixed with `CTX_` to avoid collisions with user-defined arguments.
+    pub fn as_substitution_vars(&self) -> HashMap<String, String> {
+        let mut vars = HashMap::new();
+        if let Some(ref id) = self.session_id {
+            vars.insert("CTX_SESSION_ID".into(), id.clone());
+        }
+        if let Some(ref dir) = self.session_dir {
+            vars.insert("CTX_SESSION_DIR".into(), dir.clone());
+        }
+        if let Some(ref dir) = self.work_dir {
+            vars.insert("CTX_WORK_DIR".into(), dir.clone());
+        }
+        if !self.available_tools.is_empty() {
+            vars.insert(
+                "CTX_AVAILABLE_TOOLS".into(),
+                self.available_tools.join(", "),
+            );
+        }
+        for (k, v) in &self.extra {
+            vars.insert(format!("CTX_{}", k.to_uppercase()), v.clone());
+        }
+        vars
+    }
+}
+
 /// A fully resolved skill ready for execution.
 #[derive(Clone, Debug)]
 pub struct ResolvedSkill {
@@ -369,7 +417,7 @@ pub async fn execute_skill_inline(
     let skill_name = args.get("skill_name").and_then(Value::as_str).unwrap_or("");
     let task_hint = args.get("task").and_then(Value::as_str).unwrap_or("");
     let (text, _activation, _verification) =
-        execute_skill(resolver, None, skill_name, task_hint, None).await;
+        execute_skill(resolver, None, skill_name, task_hint, None, &SkillContext::default()).await;
     text
 }
 
@@ -408,6 +456,7 @@ pub async fn partition_and_execute_skills(
     executor: Option<&Arc<dyn SkillExecutor>>,
     mut quality_tracker: Option<&mut crate::skills::quality::SkillQualityTracker>,
     composition_ctx: Option<&crate::skills::composition::CompositionContext>,
+    skill_ctx: &SkillContext,
 ) -> (Vec<(String, String)>, Vec<Value>, Option<SkillActivation>) {
     let mut skill_results = Vec::new();
     let mut remaining = Vec::new();
@@ -439,7 +488,7 @@ pub async fn partition_and_execute_skills(
 
                 let start = std::time::Instant::now();
                 let (text, act, verification_passed) =
-                    execute_skill(resolver, executor, skill_name, task_hint, composition_ctx).await;
+                    execute_skill(resolver, executor, skill_name, task_hint, composition_ctx, skill_ctx).await;
                 let duration_ms = start.elapsed().as_millis() as u64;
 
                 // Record outcome in quality tracker
@@ -538,6 +587,7 @@ async fn execute_skill(
     skill_name: &str,
     task_hint: &str,
     composition_ctx: Option<&crate::skills::composition::CompositionContext>,
+    skill_ctx: &SkillContext,
 ) -> (String, Option<SkillActivation>, Option<bool>) {
     if let Some(ctx) = composition_ctx {
         // Depth check
@@ -702,11 +752,12 @@ async fn execute_skill(
                 // No executor available — fall through to inline
             }
 
-            // Apply argument substitution: $ARGUMENTS and ${SKILL_DIR}
+            // Apply argument substitution: $ARGUMENTS, ${SKILL_DIR}, and ${CTX_*}
+            let context_vars = skill_ctx.as_substitution_vars();
             let instructions = substitute_arguments(
                 &skill.instructions,
                 task_hint,
-                &HashMap::new(),
+                &context_vars,
                 skill.skill_dir.as_deref(),
             );
 
@@ -921,7 +972,7 @@ mod tests {
     #[tokio::test]
     async fn execute_skill_returns_instructions() {
         let resolver = stub_resolver();
-        let (output, activation, _) = execute_skill(&resolver, None, "code-review", "", None).await;
+        let (output, activation, _) = execute_skill(&resolver, None, "code-review", "", None, &SkillContext::default()).await;
         assert!(output.contains("# Skill: code-review"));
         assert!(output.contains("Check for bugs, security issues, and style."));
         // Activation always returned on success (even with no overrides)
@@ -934,16 +985,91 @@ mod tests {
     async fn execute_skill_includes_task_hint() {
         let resolver = stub_resolver();
         let (output, _, _) =
-            execute_skill(&resolver, None, "code-review", "Review auth module", None).await;
+            execute_skill(&resolver, None, "code-review", "Review auth module", None, &SkillContext::default()).await;
         assert!(output.contains("**Task context:** Review auth module"));
     }
 
     #[tokio::test]
     async fn execute_skill_unknown_name() {
         let resolver = stub_resolver();
-        let (output, activation, _) = execute_skill(&resolver, None, "nonexistent", "", None).await;
+        let (output, activation, _) = execute_skill(&resolver, None, "nonexistent", "", None, &SkillContext::default()).await;
         assert!(output.contains("Failed to load skill 'nonexistent'"));
         assert!(activation.is_none());
+    }
+
+    #[test]
+    fn skill_context_as_substitution_vars() {
+        let ctx = SkillContext {
+            session_id: Some("sess-42".into()),
+            session_dir: Some("/tmp/sessions/42".into()),
+            work_dir: Some("/home/user/project".into()),
+            available_tools: vec!["bash".into(), "read_file".into()],
+            extra: {
+                let mut m = HashMap::new();
+                m.insert("git_branch".into(), "main".into());
+                m
+            },
+        };
+        let vars = ctx.as_substitution_vars();
+        assert_eq!(vars["CTX_SESSION_ID"], "sess-42");
+        assert_eq!(vars["CTX_SESSION_DIR"], "/tmp/sessions/42");
+        assert_eq!(vars["CTX_WORK_DIR"], "/home/user/project");
+        assert_eq!(vars["CTX_AVAILABLE_TOOLS"], "bash, read_file");
+        assert_eq!(vars["CTX_GIT_BRANCH"], "main");
+        assert_eq!(vars.len(), 5);
+    }
+
+    #[test]
+    fn skill_context_default_produces_empty_vars() {
+        let ctx = SkillContext::default();
+        assert!(ctx.as_substitution_vars().is_empty());
+    }
+
+    #[tokio::test]
+    async fn execute_skill_expands_context_vars() {
+        // Build a resolver that includes ${CTX_WORK_DIR} in instructions
+        struct CtxResolver;
+        impl SkillResolver for CtxResolver {
+            fn resolve(&self, _name: &str) -> Result<ResolvedSkill, String> {
+                Ok(ResolvedSkill {
+                    name: "ctx-test".into(),
+                    instructions: "Working in ${CTX_WORK_DIR} with session ${CTX_SESSION_ID}"
+                        .into(),
+                    model: None,
+                    max_tokens: None,
+                    allowed_tools: vec![],
+                    execution_context: ExecutionContext::Inline,
+                    hooks: Default::default(),
+                    skill_dir: None,
+                    source: SkillSourceKind::Bundled,
+                    success_criteria: vec![],
+                    composition: None,
+                    input_schema: None,
+                    aliases: vec![],
+                    effort: None,
+                    agent_type: None,
+                })
+            }
+            fn available_skills(&self) -> Vec<SkillToolInfo> {
+                vec![]
+            }
+        }
+
+        let ctx = SkillContext {
+            work_dir: Some("/my/project".into()),
+            session_id: Some("s-99".into()),
+            ..Default::default()
+        };
+        let (output, _, _) =
+            execute_skill(&CtxResolver, None, "ctx-test", "", None, &ctx).await;
+        assert!(
+            output.contains("/my/project"),
+            "Expected work_dir in output, got: {output}"
+        );
+        assert!(
+            output.contains("s-99"),
+            "Expected session_id in output, got: {output}"
+        );
     }
 
     #[tokio::test]
@@ -974,7 +1100,7 @@ mod tests {
         ];
 
         let (skill_results, remaining, _activation) =
-            partition_and_execute_skills(&tool_calls, &resolver, None, None, None).await;
+            partition_and_execute_skills(&tool_calls, &resolver, None, None, None, &SkillContext::default()).await;
 
         assert_eq!(skill_results.len(), 2);
         assert_eq!(remaining.len(), 1);
@@ -1000,7 +1126,7 @@ mod tests {
         })];
 
         let (results, remaining, _) =
-            partition_and_execute_skills(&tool_calls, &resolver, None, None, None).await;
+            partition_and_execute_skills(&tool_calls, &resolver, None, None, None, &SkillContext::default()).await;
         assert_eq!(results.len(), 1);
         assert!(results[0].1.contains("Invalid skill arguments"));
         assert_eq!(remaining.len(), 0);
@@ -1274,7 +1400,7 @@ mod tests {
         }
 
         let (output, activation, _) =
-            execute_skill(&ToolRestrictedResolver, None, "restricted", "", None).await;
+            execute_skill(&ToolRestrictedResolver, None, "restricted", "", None, &SkillContext::default()).await;
         assert!(output.contains("**Allowed tools for this skill:** bash, read_file"));
         // allowed_tools set → activation returned
         let act = activation.unwrap();
@@ -1311,7 +1437,7 @@ mod tests {
         }
 
         let (_, activation, _) =
-            execute_skill(&ModelOverrideResolver, None, "fancy", "", None).await;
+            execute_skill(&ModelOverrideResolver, None, "fancy", "", None, &SkillContext::default()).await;
         let act = activation.unwrap();
         assert_eq!(act.model_override.as_deref(), Some("gpt-4o"));
         assert_eq!(act.allowed_tools, vec!["bash"]);
@@ -1320,7 +1446,7 @@ mod tests {
     #[tokio::test]
     async fn execute_skill_activation_always_returned_for_successful_resolve() {
         let resolver = stub_resolver();
-        let (_, activation, _) = execute_skill(&resolver, None, "code-review", "", None).await;
+        let (_, activation, _) = execute_skill(&resolver, None, "code-review", "", None, &SkillContext::default()).await;
         // Activation is always returned on success so the loop can clear stale overrides
         let act = activation.unwrap();
         assert!(act.model_override.is_none());
@@ -1330,7 +1456,7 @@ mod tests {
     #[tokio::test]
     async fn execute_skill_failure_returns_none_activation() {
         let resolver = stub_resolver();
-        let (output, activation, _) = execute_skill(&resolver, None, "nonexistent", "", None).await;
+        let (output, activation, _) = execute_skill(&resolver, None, "nonexistent", "", None, &SkillContext::default()).await;
         assert!(output.contains("Failed to load skill"));
         assert!(activation.is_none());
     }
@@ -1634,7 +1760,7 @@ mod tests {
         ];
 
         let (results, remaining, activation) =
-            partition_and_execute_skills(&tool_calls, &MultiResolver, None, None, None).await;
+            partition_and_execute_skills(&tool_calls, &MultiResolver, None, None, None, &SkillContext::default()).await;
 
         assert_eq!(results.len(), 2);
         assert!(remaining.is_empty());
@@ -1690,7 +1816,7 @@ mod tests {
         ];
 
         let (results, _, activation) =
-            partition_and_execute_skills(&tool_calls, &PartialResolver, None, None, None).await;
+            partition_and_execute_skills(&tool_calls, &PartialResolver, None, None, None, &SkillContext::default()).await;
 
         assert_eq!(results.len(), 2);
         assert!(results[0].1.contains("# Skill: good"));
@@ -1743,6 +1869,7 @@ mod tests {
             "child-skill",
             "do work",
             Some(&child_ctx),
+            &SkillContext::default(),
         )
         .await;
         assert!(
@@ -1793,6 +1920,7 @@ mod tests {
             "child-skill",
             "do work",
             Some(&child_ctx),
+            &SkillContext::default(),
         )
         .await;
         // Should succeed (inline injection)
@@ -1842,7 +1970,7 @@ mod tests {
         }
 
         let (output, _, _) =
-            execute_skill(&AnyResolver, None, "too-deep", "work", Some(&ctx)).await;
+            execute_skill(&AnyResolver, None, "too-deep", "work", Some(&ctx), &SkillContext::default()).await;
         assert!(
             output.contains("depth"),
             "Expected depth error, got: {output}"
@@ -1886,6 +2014,7 @@ mod tests {
             "my-skill",
             "work",
             Some(&root_ctx),
+            &SkillContext::default(),
         )
         .await;
         assert!(
@@ -1933,7 +2062,7 @@ mod tests {
 
         // The execute_skill builds args as {"task": "..."}, which won't have "target_path"
         let (output, _, _) =
-            execute_skill(&SchemaResolver, None, "schema-skill", "do stuff", None).await;
+            execute_skill(&SchemaResolver, None, "schema-skill", "do stuff", None, &SkillContext::default()).await;
         assert!(
             output.contains("validation failed"),
             "Expected validation error, got: {output}"
