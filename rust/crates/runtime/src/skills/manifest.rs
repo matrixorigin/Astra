@@ -204,20 +204,27 @@ impl EffortLevel {
         }
     }
 
+    #[deprecated(note = "use Display (to_string()) instead")]
     pub fn as_str(&self) -> String {
+        self.to_string()
+    }
+}
+
+impl std::fmt::Display for EffortLevel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Low => "low".into(),
-            Self::Medium => "medium".into(),
-            Self::High => "high".into(),
-            Self::Max => "max".into(),
-            Self::Custom(n) => n.to_string(),
+            Self::Low => f.write_str("low"),
+            Self::Medium => f.write_str("medium"),
+            Self::High => f.write_str("high"),
+            Self::Max => f.write_str("max"),
+            Self::Custom(n) => write!(f, "{n}"),
         }
     }
 }
 
 impl Serialize for EffortLevel {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_str(&self.as_str())
+        serializer.serialize_str(&self.to_string())
     }
 }
 

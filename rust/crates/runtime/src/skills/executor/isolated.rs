@@ -74,7 +74,7 @@ impl SkillExecutor for IsolatedSkillExecutor {
                 skill.manifest.model.as_deref(),
                 skill.manifest.max_tokens,
                 &skill.manifest.allowed_tools,
-                skill.manifest.effort.as_ref().map(|e| e.as_str()).as_deref(),
+                skill.manifest.effort.as_ref().map(|e| e.to_string()).as_deref(),
                 skill.manifest.agent_type.as_deref(),
             )
             .await

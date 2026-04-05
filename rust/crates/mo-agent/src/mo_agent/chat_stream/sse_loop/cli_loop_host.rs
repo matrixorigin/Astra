@@ -138,7 +138,7 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
             stream_event_tx: self.stream_event_tx.clone(),
             approval_request_tx: self.approval_request_tx.clone(),
             skill_resolver: state.skill_resolver.clone(),
-            skill_effort: state.skill_effort.as_ref().map(|e| e.as_str()),
+            skill_effort: state.skill_effort.as_ref().map(|e| e.to_string()),
             skill_agent_type: state.skill_agent_type.clone(),
         })
         .await?;

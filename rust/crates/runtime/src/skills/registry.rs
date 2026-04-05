@@ -1338,4 +1338,63 @@ Shared MCP.
         assert_eq!(skills[0].name, "my-skill");
         assert_eq!(skills[0].aliases, vec!["ms", "mine"]);
     }
+
+    #[tokio::test]
+    async fn discover_all_warns_on_alias_collision_with_skill_name() {
+        let mut registry = UnifiedSkillRegistry::new();
+        registry.add_provider(Box::new(StubProvider {
+            skills: vec![
+                (
+                    SkillManifest {
+                        name: "skill-a".into(),
+                        description: "First skill".into(),
+                        ..Default::default()
+                    },
+                    "A instructions.".into(),
+                ),
+                (
+                    SkillManifest {
+                        name: "skill-b".into(),
+                        description: "Second skill".into(),
+                        aliases: vec!["skill-a".into()], // collides with skill-a's name
+                        ..Default::default()
+                    },
+                    "B instructions.".into(),
+                ),
+            ],
+        }));
+        // Should succeed without panic — collision is warned, not fatal
+        let names = registry.discover_all().await.unwrap();
+        assert_eq!(names.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn discover_all_warns_on_alias_vs_alias_collision() {
+        let mut registry = UnifiedSkillRegistry::new();
+        registry.add_provider(Box::new(StubProvider {
+            skills: vec![
+                (
+                    SkillManifest {
+                        name: "alpha".into(),
+                        description: "Alpha".into(),
+                        aliases: vec!["shared-alias".into()],
+                        ..Default::default()
+                    },
+                    "Alpha.".into(),
+                ),
+                (
+                    SkillManifest {
+                        name: "beta".into(),
+                        description: "Beta".into(),
+                        aliases: vec!["shared-alias".into()], // same alias as alpha
+                        ..Default::default()
+                    },
+                    "Beta.".into(),
+                ),
+            ],
+        }));
+        let names = registry.discover_all().await.unwrap();
+        assert_eq!(names.len(), 2);
+        // First-registered alias wins — alpha owns "shared-alias"
+    }
 }
