@@ -64,6 +64,32 @@ Legend: **DB** = SQL assertion on MatrixOne; **HTTP** = response-only; **—** =
 - **PR**: keep default `cargo test --workspace` (ignored tests off).
 - **Nightly / manual**: run the command in [How to run](#how-to-run) against a MatrixOne instance; see `.github/workflows/e2e-matrix-nightly.yml` for a template job (`workflow_dispatch` only).
 
+## Router groups alignment
+
+Same prefixes as [`router_builder` `all_api_groups_have_routes`](../../rust/crates/runtime/src/server/router_builder.rs) (integration tests only check registration; this table tracks **system E2E**).
+
+| Group (`router_builder`) | Prefix | System E2E | Notes |
+|--------------------------|--------|------------|--------|
+| auth | `/auth/` | Yes | `auth_users` in bootstrap / `product_matrix_*` |
+| chat | `/chat` | Partial | `/chat/turn` + SSE + `agent_events` in `product_matrix_*`; `POST /chat` + run pause/resume in `e2e_matrix_chat_run_pause_resume_http`; no `/chat/stream` or `/chat/ws` E2E |
+| sessions | `/sessions` | Yes | CRUD/close/resume/activity + DB |
+| admin | `/admin/` | No | Needs admin bootstrap |
+| learning | `/api/v1/learning/` | Yes (reads) | Health/signals/stats in `product_matrix_*` |
+| agents | `/agents` | Yes | Includes edge register path |
+| events | `/events` | Yes | |
+| skills | `/skills` | Partial | List/status; not publish/config/resources E2E |
+| evaluation | `/evaluation/` | Partial | Read-heavy; no write paths (gate/validate, drift/run, loop, training-data) |
+| introspection | `/introspection/` | Yes | |
+| branches | `/branches` | No | |
+| marketplace | `/marketplace/` | Partial | Quality report / stats / search; not full install/upgrade/rollback/credentials |
+| sandbox | `/sandbox` | Yes | |
+| workflows | `/workflows` | Partial | `GET /workflows` only |
+| platform | `/platform/` | No | e.g. `/platform/snapshot` |
+| runs | `/runs` | Partial | List in `product_matrix_*`; lifecycle in `e2e_matrix_chat_run_pause_resume_http` |
+| tasks | `/tasks` | Yes | `e2e_matrix_tasks_lease_and_db_assertions` + `agent_tasks` / `task_leases` |
+
+Additional route families in `router_builder` not named above: **memory** (`/memory/*`), **context** (`/context`), **decisions** (`/decisions`), **models** (`/models`), **jobs** (`/jobs`), **triggers** (`/triggers`), **data-versioning** (`/data-versioning`), **replay** (`/sessions/.../replay`), **reflect** (`/chat/session/.../reflect`), **completions** (`/v1/chat/completions`) — see the P0/P1 table above for E2E status.
+
 ## Future work
 
 - **Runs + DB**: when `RunStateStore` is backed by Matrix for `build_server_state`, add SQL assertions alongside `e2e_matrix_chat_run_pause_resume_http`.
