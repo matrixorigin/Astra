@@ -4,6 +4,8 @@
 //! history that preserves task context, key decisions, and open questions —
 //! while discarding verbatim tool outputs and redundant back-and-forth.
 
+use serde_json::Value;
+
 /// System prompt used when asking the LLM to summarize conversation history.
 pub const COMPACT_SYSTEM_PROMPT: &str = "You are a conversation summarizer. Your task is to create a concise but complete summary of the conversation history provided.\n\nYour summary must preserve:\n- The user's original task/goal\n- Key decisions made and their rationale\n- Important facts discovered (file contents, search results, error messages)\n- The current state of any ongoing work\n- Open questions or blockers\n\nYour summary must omit:\n- Verbatim repetition of long tool outputs (paraphrase the key findings)\n- Conversational filler and acknowledgments\n- Superseded decisions or failed attempts (unless the failure is informative)\n\nFormat your summary with clear markdown sections covering: Task, Progress, Current State, and (if applicable) Open Questions. Be dense and factual. Assume the reader is an LLM that needs only the essentials.";
 
@@ -33,7 +35,7 @@ pub fn render_messages_for_summary(messages: &[serde_json::Value]) -> String {
             .and_then(|v| v.as_str())
             .unwrap_or("unknown");
 
-        let content = msg.get("content").and_then(|v| v.as_str()).unwrap_or("");
+        let content = content_as_text_for_summary(msg.get("content"));
 
         match role {
             "system" => {
@@ -41,7 +43,7 @@ pub fn render_messages_for_summary(messages: &[serde_json::Value]) -> String {
                 continue;
             }
             "tool" => {
-                let truncated = truncate_str(content, TOOL_RESULT_MAX_CHARS);
+                let truncated = truncate_str(&content, TOOL_RESULT_MAX_CHARS);
                 out.push_str(&format!("[TOOL RESULT]: {truncated}\n\n"));
             }
             "assistant" => {
@@ -63,7 +65,7 @@ pub fn render_messages_for_summary(messages: &[serde_json::Value]) -> String {
                     }
                 }
                 if !content.is_empty() {
-                    let truncated = truncate_str(content, MAX_CONTENT_CHARS);
+                    let truncated = truncate_str(&content, MAX_CONTENT_CHARS);
                     out.push_str(&format!("[ASSISTANT]: {truncated}\n\n"));
                 }
             }
@@ -72,16 +74,125 @@ pub fn render_messages_for_summary(messages: &[serde_json::Value]) -> String {
                 if msg.get("attachment_metadata").is_some() {
                     continue;
                 }
-                let truncated = truncate_str(content, MAX_CONTENT_CHARS);
+                let truncated = truncate_str(&content, MAX_CONTENT_CHARS);
                 out.push_str(&format!("[USER]: {truncated}\n\n"));
             }
             _ => {
-                let truncated = truncate_str(content, MAX_CONTENT_CHARS);
+                let truncated = truncate_str(&content, MAX_CONTENT_CHARS);
                 out.push_str(&format!("[{role}]: {truncated}\n\n"));
             }
         }
     }
     out
+}
+
+/// Strip inline media / huge base64 from text before sending history to the summary LLM.
+pub(crate) fn scrub_string_for_summary(s: &str) -> String {
+    if s.is_empty() {
+        return String::new();
+    }
+    const LARGE_THRESHOLD: usize = 12_000;
+    if s.len() > LARGE_THRESHOLD && looks_like_base64_body(s) {
+        return "[omitted: large base64-like payload]".to_string();
+    }
+
+    let mut out = String::with_capacity(s.len().min(16_384));
+    let bytes = s.as_bytes();
+    let mut idx = 0usize;
+    while idx < bytes.len() {
+        let Some(rel) = s[idx..].find("data:") else {
+            out.push_str(&s[idx..]);
+            break;
+        };
+        let abs = idx + rel;
+        out.push_str(&s[idx..abs]);
+        let tail = &s[abs..];
+        let Some(b64_pos) = tail.find("base64,") else {
+            out.push_str("data:");
+            idx = abs + 5;
+            continue;
+        };
+        let payload_start = abs + b64_pos + 7;
+        let mut end = payload_start;
+        while end < bytes.len() {
+            let c = bytes[end];
+            // Strict base64 alphabet only — do not treat spaces or letters after the payload
+            // (e.g. "…base64,AAA tail") as part of the data URL.
+            if c.is_ascii_alphanumeric() || matches!(c, b'+' | b'/' | b'=') {
+                end += 1;
+                if end - payload_start > 512_000 {
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+        out.push_str("[omitted: base64 or media data]");
+        idx = end;
+    }
+    out
+}
+
+fn looks_like_base64_body(s: &str) -> bool {
+    const NEED: usize = 2_000;
+    let mut count = 0usize;
+    for ch in s.chars() {
+        if ch.is_whitespace() {
+            continue;
+        }
+        if !matches!(
+            ch,
+            'A'..='Z' | 'a'..='z' | '0'..='9' | '+' | '/' | '='
+        ) {
+            return false;
+        }
+        count += 1;
+        if count >= NEED {
+            return true;
+        }
+    }
+    false
+}
+
+fn content_as_text_for_summary(content: Option<&Value>) -> String {
+    let Some(v) = content else {
+        return String::new();
+    };
+    let raw = match v {
+        Value::String(s) => s.clone(),
+        Value::Array(parts) => {
+            let mut pieces = Vec::new();
+            for p in parts {
+                if p.get("image_url").is_some() {
+                    pieces.push("[omitted: image]".to_string());
+                    continue;
+                }
+                let t = p.get("type").and_then(|x| x.as_str()).unwrap_or("");
+                match t {
+                    "text" => {
+                        if let Some(txt) = p.get("text").and_then(|x| x.as_str()) {
+                            pieces.push(txt.to_string());
+                        }
+                    }
+                    "image_url" | "image" | "input_image" => {
+                        pieces.push("[omitted: image]".to_string());
+                    }
+                    _ => {
+                        if let Some(txt) = p.get("text").and_then(|x| x.as_str()) {
+                            pieces.push(txt.to_string());
+                        }
+                    }
+                }
+            }
+            pieces.join(" ")
+        }
+        Value::Null => String::new(),
+        _ => v
+            .as_str()
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| v.to_string()),
+    };
+    scrub_string_for_summary(&raw)
 }
 
 fn truncate_str(s: &str, max_chars: usize) -> String {
@@ -150,5 +261,50 @@ mod tests {
         let prompt = build_compact_user_prompt("some conversation");
         assert!(prompt.contains("some conversation"));
         assert!(prompt.contains("summarize"));
+    }
+
+    #[test]
+    fn render_multimodal_user_drops_image_keeps_text() {
+        let msgs = vec![json!({
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "What is in this?"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}
+            ]
+        })];
+        let rendered = render_messages_for_summary(&msgs);
+        assert!(rendered.contains("What is in this?"));
+        assert!(rendered.contains("[omitted: image]"));
+        assert!(!rendered.contains("AAAA"));
+        assert!(!rendered.contains("data:image"));
+    }
+
+    #[test]
+    fn render_strips_embedded_data_url_in_string_content() {
+        let payload = format!(
+            "See: data:image/png;base64,{} tail",
+            "x".repeat(120)
+        );
+        let msgs = vec![json!({"role": "user", "content": payload})];
+        let rendered = render_messages_for_summary(&msgs);
+        assert!(rendered.contains("See:"));
+        assert!(rendered.contains("tail"));
+        assert!(rendered.contains("[omitted: base64 or media data]"));
+        assert!(!rendered.contains("data:image/png;base64,"));
+        assert!(!rendered.contains(&"x".repeat(120)));
+    }
+
+    #[test]
+    fn render_collapses_large_plain_base64_tool_result() {
+        let blob: String = std::iter::repeat('A').take(15_000).collect();
+        let msgs = vec![json!({"role": "tool", "content": blob})];
+        let rendered = render_messages_for_summary(&msgs);
+        assert!(rendered.contains("[omitted: large base64-like payload]"));
+        assert!(!rendered.contains("AAAAA"));
+    }
+
+    #[test]
+    fn scrub_string_empty() {
+        assert!(scrub_string_for_summary("").is_empty());
     }
 }
