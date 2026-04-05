@@ -389,7 +389,7 @@ pub fn compact_tiered_with_result(
         {
             let preview: String = content.lines().take(3).collect::<Vec<_>>().join("\n");
             compacted[index]["content"] = Value::String(format!(
-                "{preview}\n...[{line_count} lines compacted — re-read file if needed]"
+                "{preview}\n...[{line_count} lines compacted — re-run tool if needed]"
             ));
         } else {
             let truncated: String = content.chars().take(eff_limit).collect();

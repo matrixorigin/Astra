@@ -152,11 +152,12 @@ fn format_skills_within_budget(
         return (Vec::new(), Vec::new());
     }
 
+    let mut seen: std::collections::HashSet<&str> = skills.iter().map(|s| s.name.as_str()).collect();
     let mut all_names: Vec<String> = skills.iter().map(|s| s.name.clone()).collect();
     // Include aliases so the LLM can invoke skills by alternative names
     for s in skills {
         for alias in &s.aliases {
-            if !all_names.contains(alias) {
+            if seen.insert(alias.as_str()) {
                 all_names.push(alias.clone());
             }
         }

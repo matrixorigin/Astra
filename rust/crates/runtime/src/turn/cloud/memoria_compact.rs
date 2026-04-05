@@ -787,10 +787,16 @@ pub async fn compact_with_memoria(
 
     // Step 1: Retrieve session context from Memoria
     let query = memoria_compact_retrieve_query(messages);
-    let memories = client
+    let memories = match client
         .retrieve(&query, Some(sid), config.max_memories)
         .await
-        .unwrap_or_default();
+    {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("[compact] Memoria retrieve failed: {e}");
+            Vec::new()
+        }
+    };
 
     let file_text = params
         .session_memory_file
@@ -1245,14 +1251,16 @@ mod tests {
         // Should have injected context message
         assert!(result.messages.len() >= 3);
 
-        // Check for context injection
-        let has_context = result.messages.iter().any(|m| {
-            m.get("content")
-                .and_then(Value::as_str)
-                .map(|s| s.contains("[Session Context from Memory]"))
-                .unwrap_or(false)
-        });
-        assert!(has_context);
+        // Check for context injection at index 1 (after first user message)
+        assert!(result.messages.len() >= 3, "Should have context msg injected");
+        let ctx_content = result.messages[1]
+            .get("content")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        assert!(
+            ctx_content.contains("[Session Context from Memory]"),
+            "Context should be injected at index 1, got: {ctx_content}"
+        );
 
         // Should have stored working memory
         let stored = mock.stored.lock().unwrap();
@@ -1383,13 +1391,17 @@ mod tests {
     #[tokio::test]
     async fn compact_summary_disabled_skips_llm() {
         let msgs = vec![user("hello"), assistant("hi")];
-        let config = MemoriaCompactConfig::default();
+        let config = MemoriaCompactConfig {
+            min_tokens_for_retrieval: 100,
+            ..Default::default()
+        };
+        let mock = MockMemoriaClient::new(vec![]);
         let params = MemoriaCompactParams {
             budget_chars: 10000,
             keep_chars: 2000,
             tier: CompactionTier::AggressivePrune,
             keep_recent_turns: 4,
-            current_tokens: 1000,
+            current_tokens: 6000,
             session_memory_file: None,
             session_memory_combine: SessionMemoryFileCombine::None,
         };
@@ -1405,7 +1417,7 @@ mod tests {
             Some("sess1"),
             &config,
             &params,
-            None,
+            Some(&mock),
             Some(&compact_config),
             Some(&summary_client as &dyn super::super::summary::SummaryLlmClient),
         )
@@ -1426,13 +1438,17 @@ mod tests {
     #[tokio::test]
     async fn compact_summary_failure_falls_back() {
         let msgs = vec![user("hello"), assistant("hi")];
-        let config = MemoriaCompactConfig::default();
+        let config = MemoriaCompactConfig {
+            min_tokens_for_retrieval: 100,
+            ..Default::default()
+        };
+        let mock = MockMemoriaClient::new(vec![]);
         let params = MemoriaCompactParams {
             budget_chars: 10000,
             keep_chars: 2000,
             tier: CompactionTier::AggressivePrune,
             keep_recent_turns: 4,
-            current_tokens: 1000,
+            current_tokens: 6000,
             session_memory_file: None,
             session_memory_combine: SessionMemoryFileCombine::None,
         };
@@ -1449,7 +1465,7 @@ mod tests {
             Some("sess1"),
             &config,
             &params,
-            None,
+            Some(&mock),
             Some(&compact_config),
             Some(&summary_client as &dyn super::super::summary::SummaryLlmClient),
         )
@@ -1469,13 +1485,17 @@ mod tests {
     #[tokio::test]
     async fn compact_summary_below_tier_threshold_skips() {
         let msgs = vec![user("hello"), assistant("hi")];
-        let config = MemoriaCompactConfig::default();
+        let config = MemoriaCompactConfig {
+            min_tokens_for_retrieval: 100,
+            ..Default::default()
+        };
+        let mock = MockMemoriaClient::new(vec![]);
         let params = MemoriaCompactParams {
             budget_chars: 10000,
             keep_chars: 2000,
             tier: CompactionTier::TrimSchemas, // Below AggressivePrune threshold
             keep_recent_turns: 4,
-            current_tokens: 1000,
+            current_tokens: 6000,
             session_memory_file: None,
             session_memory_combine: SessionMemoryFileCombine::None,
         };
@@ -1492,7 +1512,7 @@ mod tests {
             Some("sess1"),
             &config,
             &params,
-            None,
+            Some(&mock),
             Some(&compact_config),
             Some(&summary_client as &dyn super::super::summary::SummaryLlmClient),
         )
