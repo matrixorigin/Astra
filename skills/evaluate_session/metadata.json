@@ -1,7 +1,7 @@
 {
   "name": "evaluate_session",
-  "version": "1.0.0",
-  "description": "Evaluate agent performance metrics for a session",
+  "version": "2.0.0",
+  "description": "Evaluate agent session performance and provide optimization recommendations",
   "category": "analysis",
   "input_schema": {
     "type": "object",
@@ -9,6 +9,11 @@
       "target_session_id": {
         "type": "string",
         "description": "Session ID to evaluate"
+      },
+      "objective": {
+        "type": "string",
+        "enum": ["cost", "accuracy", "latency", "balanced"],
+        "description": "Optimization objective (optional)"
       },
       "include_details": {
         "type": "boolean",
@@ -47,53 +52,44 @@
       "assessment": {
         "type": "object",
         "properties": {
-          "token_efficiency": {
-            "type": "string",
-            "enum": ["excellent", "good", "moderate", "needs_improvement"]
-          },
+          "token_efficiency": {"type": "string", "enum": ["excellent", "good", "moderate", "needs_improvement"]},
           "tokens_per_query": {"type": "integer"},
-          "call_efficiency": {
-            "type": "string",
-            "enum": ["excellent", "good", "moderate", "needs_improvement"]
-          },
+          "call_efficiency": {"type": "string", "enum": ["excellent", "good", "moderate", "needs_improvement"]},
           "calls_per_query": {"type": "number"},
-          "overall": {
-            "type": "string",
-            "enum": ["good", "needs_improvement"]
-          }
+          "overall": {"type": "string", "enum": ["good", "needs_improvement"]}
         }
       },
-      "event_breakdown": {
-        "type": ["array", "null"],
-        "items": {
-          "type": "object",
-          "properties": {
-            "index": {"type": "integer"},
-            "type": {"type": "string"},
-            "model": {"type": ["string", "null"]},
-            "skill": {"type": ["string", "null"]},
-            "tokens": {"type": "integer"}
-          }
+      "optimization": {
+        "type": ["object", "null"],
+        "properties": {
+          "objective": {"type": "string"},
+          "scores_before": {"type": "object"},
+          "scores_after": {"type": "object"},
+          "recommendations": {"type": "array", "items": {"type": "string"}}
         }
       }
     }
   },
   "examples": [
     {
-      "input": {
-        "session_id": "019ca9f1-3dc6-72b3-9813-1f38f7349c53"
-      },
+      "input": {"target_session_id": "019ca9f1-3dc6-72b3-9813-1f38f7349c53"},
       "output": {
         "success": true,
         "user_queries": 3,
         "llm_calls": 7,
-        "tokens": {
-          "total": 42532,
-          "avg_per_call": 6076
-        },
-        "assessment": {
-          "token_efficiency": "moderate",
-          "overall": "needs_improvement"
+        "tokens": {"total": 42532, "avg_per_call": 6076},
+        "assessment": {"token_efficiency": "moderate", "overall": "needs_improvement"}
+      }
+    },
+    {
+      "input": {"target_session_id": "019ca9f1-3dc6-72b3-9813-1f38f7349c53", "objective": "cost"},
+      "output": {
+        "success": true,
+        "optimization": {
+          "objective": "cost",
+          "scores_before": {"cost": 0.60},
+          "scores_after": {"cost": 0.85},
+          "recommendations": ["Enable aggressive context compaction", "Reduce max history"]
         }
       }
     }

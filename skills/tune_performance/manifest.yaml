@@ -1,6 +1,0 @@
-name: tune-performance
-version: "1.0.0"
-description: "Multi-objective performance optimization — reduce costs, improve accuracy, or decrease latency"
-author: "mo-agent-engine"
-
-tools: []

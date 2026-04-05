@@ -1,10 +1,13 @@
 ---
 name: evaluate-session
-description: "Platform skill: evaluates agent performance metrics for a session against agent_events database. Requires mo-agent platform database access."
+description: "Platform skill: evaluates agent session performance and provides optimization recommendations. Requires mo-agent platform database access."
 user_invocable: true
 arguments:
   - name: SESSION
     description: "Session ID or reference (e.g., 'this session', 'last session', or a specific ID)"
+    required: false
+  - name: OBJECTIVE
+    description: "Optional optimization objective: cost, accuracy, latency, or balanced"
     required: false
 allowed_tools:
   - bash
@@ -12,7 +15,7 @@ allowed_tools:
 ---
 # Evaluate Session Skill
 
-When asked to evaluate a session's performance, follow this systematic approach.
+Evaluate agent session performance and provide optimization recommendations.
 
 ## Task
 
@@ -20,23 +23,16 @@ $ARGUMENTS
 
 ## 1. Identify the Target Session
 
-**Determine which session to evaluate:**
-- If a specific session ID is provided, use that
-- If user says "this session" or "current", use the current session ID
-- If user says "last session" or "previous", look up the most recent completed session
+- Specific session ID → use that
+- "this session" / "current" → current session ID
+- "last session" / "previous" → most recent completed session
 
 ## 2. Gather Session Data
 
-Query the `agent_events` table for the session:
-
 ```sql
 SELECT 
-  event_type,
-  model,
-  skill_name,
-  prompt_tokens,
-  completion_tokens,
-  created_at
+  event_type, model, skill_name,
+  prompt_tokens, completion_tokens, created_at
 FROM agent_events
 WHERE session_id = '<session_id>'
 ORDER BY created_at;
@@ -45,9 +41,7 @@ ORDER BY created_at;
 ## 3. Calculate Metrics
 
 ### Token Metrics
-- **Total Prompt Tokens**: Sum of all prompt_tokens
-- **Total Completion Tokens**: Sum of all completion_tokens
-- **Total Tokens**: prompt + completion
+- **Total Prompt / Completion / Combined Tokens**
 - **Average Tokens per LLM Call**: total / llm_call_count
 
 ### Call Metrics
@@ -56,13 +50,11 @@ ORDER BY created_at;
 - **Calls per Query**: llm_calls / user_queries
 
 ### Skill Usage
-- **Unique Skills**: Count distinct skill names
-- **Total Skill Calls**: Count of events with skill_name
-- **Breakdown**: Count per skill
+- **Unique Skills**, **Total Skill Calls**, **Breakdown** per skill
 
 ## 4. Assess Efficiency
 
-### Token Efficiency Rating
+### Token Efficiency
 
 | Rating | Tokens per Query |
 |--------|------------------|
@@ -71,7 +63,7 @@ ORDER BY created_at;
 | 🟠 moderate | 20,000 - 39,999 |
 | 🔴 needs_improvement | ≥ 40,000 |
 
-### Call Efficiency Rating
+### Call Efficiency
 
 | Rating | Calls per Query |
 |--------|-----------------|
@@ -80,60 +72,66 @@ ORDER BY created_at;
 | 🟠 moderate | 4.1 - 6 |
 | 🔴 needs_improvement | > 6 |
 
-### Overall Assessment
-- **good**: Both token and call efficiency are excellent or good
-- **needs_improvement**: Either metric is moderate or worse
+### Overall: "good" if both are excellent/good; "needs_improvement" otherwise.
 
-## 5. Report Format
+## 5. Optimization (when OBJECTIVE is provided)
 
-Present the evaluation in this format:
+If the user requests optimization, calculate dimension scores and suggest actions:
+
+| Objective | Focus | Trade-offs |
+|-----------|-------|------------|
+| **cost** | Reduce tokens, compress history, smaller model | May reduce context quality |
+| **accuracy** | Increase context, add verification, larger model | Higher cost, slower |
+| **latency** | Reduce call count, parallelize, cache results | May miss context updates |
+| **balanced** | Weighted: cost 0.3, accuracy 0.4, latency 0.3 | Moderate trade-offs |
+
+### Scoring
+- **Cost**: `1 - (actual_tokens / baseline_tokens)`
+- **Accuracy**: `successful_completions / total_completions`
+- **Latency**: `1 - (actual_calls / baseline_calls)`
+
+Show before/after comparison with explicit trade-off impact.
+
+## 6. Report Format
 
 ```
 ## Session Evaluation: {session_id}
 
 ### Summary
-- **Total Events**: {count}
-- **User Queries**: {count}
-- **LLM Calls**: {count}
+- Total Events: {count}  |  User Queries: {count}  |  LLM Calls: {count}
 
 ### Token Usage
 | Metric | Value |
 |--------|-------|
-| Prompt Tokens | {prompt_tokens} |
-| Completion Tokens | {completion_tokens} |
-| Total Tokens | {total} |
-| Avg per Call | {avg} |
+| Prompt Tokens | {n} |
+| Completion Tokens | {n} |
+| Total Tokens | {n} |
+| Avg per Call | {n} |
 
-### Efficiency Assessment
-- **Token Efficiency**: {rating} ({tokens_per_query} tokens/query)
-- **Call Efficiency**: {rating} ({calls_per_query} calls/query)
-- **Overall**: {overall}
+### Efficiency
+- Token: {rating} ({n} tokens/query)
+- Call: {rating} ({n} calls/query)
+- Overall: {overall}
 
 ### Skill Usage
-{skill_breakdown_table}
+{breakdown_table}
+
+### Optimization (if requested)
+| Dimension | Before | After | Change |
+|-----------|--------|-------|--------|
+| Cost      | {score} | {score} | {delta} |
+| Accuracy  | {score} | {score} | {delta} |
+| Latency   | {score} | {score} | {delta} |
 
 ### Recommendations
-{specific_recommendations_based_on_metrics}
+{specific_recommendations}
 ```
 
-## 6. Provide Recommendations
+## 7. Recommendations
 
-Based on the assessment, suggest improvements:
-
-**For high token usage:**
-- Consider more concise prompts
-- Break complex tasks into smaller steps
-- Use more targeted tools instead of broad searches
-
-**For high call count:**
-- Batch related operations
-- Use more comprehensive tools
-- Plan before executing
-
-**For good performance:**
-- Note what worked well
-- Suggest maintaining current patterns
-
----
-
-**Note**: This skill enables agent self-awareness and continuous improvement tracking.
+**High token usage:** More concise prompts, smaller steps, targeted tools.
+**High call count:** Batch operations, comprehensive tools, plan before executing.
+**Good performance:** Note what worked well, maintain patterns.
+**Cost optimization:** Aggressive compaction, reduce history, smaller model.
+**Accuracy optimization:** Larger context, verification steps, larger model.
+**Latency optimization:** Fewer calls, parallel tools, caching.

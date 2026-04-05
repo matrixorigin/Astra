@@ -1,91 +1,54 @@
 # Evaluate Session Skill
 
-Agent self-assessment skill that evaluates performance metrics for a session.
+Agent self-assessment skill that evaluates performance metrics and provides optimization recommendations.
 
 ## Overview
 
-This skill enables the agent to analyze its own performance by examining:
-- Token efficiency (tokens per query)
-- LLM call efficiency (calls per query)
-- Skill usage patterns
-- Overall effectiveness
+This skill enables the agent to:
+- Analyze token and call efficiency for a session
+- Assess skill usage patterns
+- Optimize for cost, accuracy, latency, or balanced performance
+- Provide actionable recommendations with trade-off analysis
 
 ## Usage
 
-### As a Tool Call
+### Basic Evaluation
+```
+"Evaluate the performance of session 019ca9f1-3dc6-72b3-9813-1f38f7349c53"
+"How efficient was I in this conversation?"
+```
 
-```python
+### With Optimization
+```
+"Evaluate this session and optimize for cost"
+"Analyze last session, focus on accuracy"
+```
+
+### As a Tool Call
+```json
 {
   "tool": "evaluate_session",
   "arguments": {
-    "target_session_id": "019ca9f1-3dc6-72b3-9813-1f38f7349c53",
+    "target_session_id": "019ca9f1-...",
+    "objective": "cost",
     "include_details": false
   }
 }
 ```
 
-### Example Queries
+## Optimization Objectives
 
-**Simple evaluation:**
-```
-"Evaluate the performance of session 019ca9f1-3dc6-72b3-9813-1f38f7349c53"
-```
+| Objective | Focus | Trade-offs |
+|-----------|-------|------------|
+| **cost** | Minimize tokens, compress history | May reduce context quality |
+| **accuracy** | Maximize correctness, add verification | Higher cost and latency |
+| **latency** | Reduce call count, parallelize | May miss context updates |
+| **balanced** | Weighted combination (cost 0.3, accuracy 0.4, latency 0.3) | Moderate |
 
-**With details:**
-```
-"Give me a detailed evaluation of this session including event breakdown"
-```
-
-**Self-evaluation:**
-```
-"How efficient was I in this conversation?"
-```
-
-## Output
-
-### Basic Metrics
-
-```json
-{
-  "session_id": "019ca9f1-3dc6-72b3-9813-1f38f7349c53",
-  "total_events": 19,
-  "user_queries": 3,
-  "llm_calls": 7,
-  "tokens": {
-    "prompt": 40827,
-    "completion": 1705,
-    "total": 42532,
-    "avg_per_call": 6076
-  },
-  "skills": {
-    "unique": 3,
-    "total_calls": 5,
-    "breakdown": {
-      "stock_assistant": 2,
-      "get_agent_info": 1,
-      "reflect": 2
-    }
-  }
-}
-```
-
-### Assessment
-
-```json
-{
-  "assessment": {
-    "token_efficiency": "moderate",
-    "tokens_per_query": 14177,
-    "call_efficiency": "moderate",
-    "calls_per_query": 2.3,
-    "overall": "needs_improvement"
-  }
-}
-```
-
-### Efficiency Ratings
+## Efficiency Ratings
 
 **Token Efficiency** (tokens per query):
+
 | Rating | Threshold |
 |--------|-----------|
 | excellent | < 10,000 |
@@ -94,6 +57,7 @@ This skill enables the agent to analyze its own performance by examining:
 | needs_improvement | ≥ 40,000 |
 
 **Call Efficiency** (LLM calls per query):
+
 | Rating | Threshold |
 |--------|-----------|
 | excellent | ≤ 2 |
@@ -101,17 +65,8 @@ This skill enables the agent to analyze its own performance by examining:
 | moderate | 4.1 - 6 |
 | needs_improvement | > 6 |
 
-**Overall**: "good" only if both token and call efficiency are "excellent" or "good".
-
-## Benefits
-
-1. **Self-Awareness**: Agent can monitor its own performance
-2. **Real-time Feedback**: Get metrics during conversation
-3. **Debugging**: Identify inefficient patterns
-4. **Optimization**: Track improvements over time
-
 ## Implementation Notes
 
 - Reads from `agent_events` table
-- Supports database session injection for testing
 - Uses `target_session_id` parameter (not `session_id`) to avoid collision with framework-injected fields
+- Optimization scores are relative to session baseline
