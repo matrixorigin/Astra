@@ -1,0 +1,71 @@
+# System E2E matrix (HTTP + MatrixOne)
+
+This document maps **user-visible capabilities** to **HTTP routes**, **persistence (MatrixOne tables or in-process stores)**, and the **integration tests** that assert them. It complements `router_builder.rs` unit tests (route registration only).
+
+## How to run
+
+```bash
+cd rust
+MO_AGENT_SYSTEM_MATRIX_E2E=1 \
+MO_AGENT_BRIDGE_TEST_SECRET=system-matrix-e2e-secret \
+cargo test -p astra-runtime --test system_matrix_http_e2e --features bridge-e2e-hooks -- \
+  --ignored --nocapture
+```
+
+Requires the same environment as `astra-server`: `MATRIXONE_*`, JWT/Fernet secrets via `astra_core::AppSettings::from_env`, etc. Use a local `.env` if you use one for development.
+
+## Test binaries (ignored by default)
+
+| Test name | File / module | Scope |
+|-----------|---------------|--------|
+| `product_matrix_api_journey_hits_multiple_tables` | `tests/system_matrix_http_e2e/journey_full.rs` | Full journey: sessions, agents, events, context, decisions, memory proxy, edge, jobs, sandbox, triggers, skills, introspection, learning, evaluation reads, marketplace probe, `chat/turn` SSE + `agent_events`, audit/replay, logout |
+| `e2e_matrix_basic_auth_session_lifecycle` | `journey_basic.rs` | Bootstrap + session list/get/put, close/resume, `agent_sessions.status`, activity, logout |
+| `e2e_matrix_tasks_lease_and_db_assertions` | `journey_tasks_runs.rs` | `POST /tasks`, `agent_tasks`; edge register; lease claim/release; `task_leases`; `PUT /tasks/{id}/status` |
+| `e2e_matrix_chat_run_pause_resume_http` | `journey_tasks_runs.rs` | `POST /chat` (background run), `POST .../pause`, `GET /chat/runs/{id}`, `POST .../resume` |
+
+Shared helpers: `tests/system_matrix_http_e2e/harness.rs` (`bootstrap`, HTTP helpers, `cleanup_*`, row getters).
+
+## API groups vs coverage (P0 / P1)
+
+Legend: **DB** = SQL assertion on MatrixOne; **HTTP** = response-only; **—** = not covered by system E2E yet.
+
+| Group | P | Representative routes | Persistence check | Test(s) |
+|-------|---|----------------------|-------------------|---------|
+| Meta | P0 | `GET /health`, `GET /` | — | `product_matrix_*` |
+| Auth | P0 | `/auth/register`, `/login`, `/refresh`, `/me`, `/logout` | `auth_users` | all |
+| Sessions | P0 | `/sessions`, `.../close`, `.../resume`, `.../activity` | `agent_sessions` | all |
+| Session audit | P0 | `/sessions/{id}/audit/*`, `/audit/*` | mostly HTTP | `product_matrix_*` |
+| Agents | P0 | `/agents` CRUD | `agent_agents` | `product_matrix_*` |
+| Events | P0 | `/events`, causal chain, session events | `agent_events` | `product_matrix_*` |
+| Context | P0 | `/context` | `ctx_snapshots` | `product_matrix_*` |
+| Decisions | P0 | `/decisions`, audit | `ctx_decision_audits` | `product_matrix_*` |
+| Memory proxy | P1 | `/memory/*` | Memoria stub calls | `product_matrix_*` |
+| Edge §5.5 | P0 | `/agents/edge`, `/tools/result`, `/approval/respond` | `edge_agent_registry` | `product_matrix_*`, tasks lease (edge register) |
+| Jobs | P1 | `/jobs`, `/jobs/webhook` | service persistence | `product_matrix_*` |
+| Sandbox | P1 | `/sandbox` | `infra_sandbox_metadata` | `product_matrix_*` |
+| Triggers | P1 | `/triggers`, fire, delete | `wf_triggers` | `product_matrix_*` |
+| Skills / introspection | P1 | `/skills`, `/introspection/*` | mixed | `product_matrix_*` |
+| Learning | P1 | `/api/v1/learning/*` | — | `product_matrix_*` |
+| Evaluation | P1 | `/evaluation/*` reads | — | `product_matrix_*` |
+| Marketplace | P1 | quality report, stats, search | marketplace stats tables | `product_matrix_*` |
+| Chat turn (SSE) | P0 | `POST /chat/turn` + bridge secret | `agent_events` | `product_matrix_*` |
+| Chat / runs | P0 | `POST /chat`, `/chat/runs/*` | **In-memory** run store in `build_server_state` (not Matrix table today) | `e2e_matrix_chat_run_pause_resume_http` |
+| Tasks | P0 | `/tasks`, `/tasks/{id}/lease/*`, `.../status` | `agent_tasks`, `task_leases` | `e2e_matrix_tasks_lease_and_db_assertions` |
+| Workflows | P1 | `GET /workflows` | — | `product_matrix_*` |
+| Data versioning | P1 | lineage GETs | — | `product_matrix_*` |
+| Replay | P1 | `/sessions/{id}/replay/compare` | — | `product_matrix_*` |
+| Branches | — | `/branches/*` | — | — |
+| Admin | — | `/admin/*` | — | — |
+| WebSocket | — | `/chat/ws` | — | — |
+| Delegation | — | `/chat/runs/.../delegate` | — | — |
+
+## CI / nightly (optional)
+
+- **PR**: keep default `cargo test --workspace` (ignored tests off).
+- **Nightly / manual**: run the command in [How to run](#how-to-run) against a MatrixOne instance; see `.github/workflows/e2e-matrix-nightly.yml` for a template job (`workflow_dispatch` only).
+
+## Future work
+
+- **Runs + DB**: when `RunStateStore` is backed by Matrix for `build_server_state`, add SQL assertions alongside `e2e_matrix_chat_run_pause_resume_http`.
+- **Branches, admin, WS, delegation**: add focused journeys + rows in this matrix.
+- **Real Memoria**: optional second target with a Memoria test double URL instead of the stub forwarder.

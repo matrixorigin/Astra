@@ -15,7 +15,7 @@ required-features = ["bridge-e2e-hooks"]
 
 [[test]]
 name = "system_matrix_http_e2e"
-path = "tests/system_matrix_http_e2e.rs"
+path = "tests/system_matrix_http_e2e/main.rs"
 required-features = ["bridge-e2e-hooks"]
 
 [[bin]]

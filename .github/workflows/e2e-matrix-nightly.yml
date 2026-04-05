@@ -1,0 +1,32 @@
+# Optional: full ignored Matrix system E2E (`system_matrix_http_e2e`).
+# Trigger manually when a MatrixOne instance and app secrets are available (repository secrets / environment).
+name: E2E Matrix (manual)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  system-matrix-e2e:
+    runs-on: ubuntu-latest
+    # Uncomment when MatrixOne is available as a service or reachable host:
+    # services:
+    #   matrixone:
+    #     image: matrixorigin/matrixone:latest
+    #     ports:
+    #       - 6001:6001
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Run system Matrix HTTP E2E (ignored tests)
+        working-directory: rust
+        env:
+          MO_AGENT_SYSTEM_MATRIX_E2E: "1"
+          MO_AGENT_BRIDGE_TEST_SECRET: system-matrix-e2e-secret
+          # Set these via repo secrets before enabling this job in production:
+          # MATRIXONE_HOST, MATRIXONE_PORT, MATRIXONE_USER, MATRIXONE_PASSWORD, MATRIXONE_DATABASE
+          # JWT_SECRET, FERNET_KEY, etc. (see AppSettings::from_env)
+        run: |
+          cargo test -p astra-runtime --test system_matrix_http_e2e \
+            --features bridge-e2e-hooks -- --ignored --nocapture
