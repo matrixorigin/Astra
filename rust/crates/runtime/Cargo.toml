@@ -13,6 +13,11 @@ name = "chat_turn_bridge_ledger_inject_e2e"
 path = "tests/chat_turn_bridge_ledger_inject_e2e.rs"
 required-features = ["bridge-e2e-hooks"]
 
+[[test]]
+name = "system_matrix_http_e2e"
+path = "tests/system_matrix_http_e2e.rs"
+required-features = ["bridge-e2e-hooks"]
+
 [[bin]]
 name = "astra-server"
 path = "src/main.rs"
@@ -47,6 +52,7 @@ notify = { version = "7", default-features = false, features = ["macos_kqueue"] 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
 futures-util.workspace = true
+sqlx.workspace = true
 tempfile = "3"
 tokio-util.workspace = true
 tower.workspace = true

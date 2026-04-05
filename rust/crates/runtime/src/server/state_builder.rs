@@ -1,6 +1,10 @@
 use super::*;
 
-pub(super) async fn build_server_state(
+/// Build the same [`AppState`] as production `astra-server` (MatrixOne, auth, in-process bridge, runs).
+///
+/// Intended for **ignored** integration tests (`MO_AGENT_SYSTEM_MATRIX_E2E=1`) that hit real HTTP
+/// routes and assert database rows. Load `.env` / secrets the same way as local server startup.
+pub async fn build_server_state(
     settings: AppSettings,
 ) -> Result<AppState, Box<dyn std::error::Error>> {
     ensure_core_schema(&settings.matrixone).await?;

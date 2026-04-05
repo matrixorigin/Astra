@@ -52,6 +52,8 @@ use self::{
 mod chat_route;
 mod completions;
 
+pub use state_builder::build_server_state;
+
 pub fn build_app(state: AppState) -> Router {
     let cors = CorsLayer::new()
         .allow_origin(AllowOrigin::any())

@@ -204,7 +204,7 @@ pub use server::delegation_engine::{
 };
 pub use server::run_engine::RunEngine;
 pub use server::run_lifecycle::AgenticRunLifecycleService;
-pub use server::{build_app, serve};
+pub use server::{build_app, build_server_state, serve};
 
 // ── Re-exports: turn engine ──────────────────────────────────────────────────
 
