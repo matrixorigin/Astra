@@ -163,8 +163,11 @@ pub use astra_services::marketplace_stats::{
 
 pub async fn submit_quality_report_handler(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(report): Json<QualityReportData>,
 ) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
+    // Require authentication to prevent anonymous quality report spam
+    let _user = state.auth_service.current_user(&headers).await?;
     state
         .marketplace_stats_service
         .submit_quality_report(report)

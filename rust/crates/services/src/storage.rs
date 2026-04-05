@@ -407,7 +407,13 @@ pub async fn ensure_core_schema(settings: &MatrixOneSettings) -> Result<(), sqlx
         "ALTER TABLE skills_registry ADD COLUMN min_runtime_version VARCHAR(50) NULL",
         "ALTER TABLE skills_registry ADD COLUMN compatibility_platforms JSON NULL",
     ] {
-        let _ = query(alter_sql).execute(&pool).await;
+        if let Err(e) = query(alter_sql).execute(&pool).await {
+            let msg = e.to_string();
+            // Silence "duplicate column" / "already exists" errors — expected on re-run
+            if !msg.contains("uplicate") && !msg.contains("already exists") {
+                eprintln!("  ⚠ ALTER TABLE skills_registry: {msg}");
+            }
+        }
     }
 
     query(
