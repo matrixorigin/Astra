@@ -30,6 +30,7 @@ tags:
 You are orchestrating a large, parallelizable change across this codebase.
 
 **Working directory**: ${{CTX_WORK_DIR}}
+**Git branch**: ${{CTX_GIT_BRANCH}}
 
 ## Prerequisite
 

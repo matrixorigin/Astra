@@ -933,9 +933,29 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
         let (skill_results, post_skill_tool_calls);
         let effective_tool_calls = if let Some(resolver) = &state.skill_resolver {
             // Build runtime context for skill execution
+            let mut extra = std::collections::HashMap::new();
+
+            // Detect git branch if in a workspace
+            if let Some(ref root) = state.workspace_root_hint {
+                if let Ok(output) = std::process::Command::new("git")
+                    .args(["rev-parse", "--abbrev-ref", "HEAD"])
+                    .current_dir(root)
+                    .output()
+                {
+                    if output.status.success() {
+                        let branch = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                        if !branch.is_empty() {
+                            extra.insert("git_branch".into(), branch);
+                        }
+                    }
+                }
+            }
+
             let skill_ctx = crate::turn::skill_tool::SkillContext {
                 session_id: state.current_session_id.clone(),
+                work_dir: state.workspace_root_hint.clone(),
                 available_tools: state.all_tools_used.iter().cloned().collect(),
+                extra,
                 ..Default::default()
             };
 

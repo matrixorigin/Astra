@@ -24,6 +24,7 @@ tags:
 Review all changed files for reuse, quality, and efficiency. Fix any issues found.
 
 **Working directory**: ${{CTX_WORK_DIR}}
+**Git branch**: ${{CTX_GIT_BRANCH}}
 
 ## Phase 1: Identify Changes
 
