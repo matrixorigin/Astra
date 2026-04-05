@@ -1,0 +1,10 @@
+name: review-changes
+version: "1.0.0"
+description: "Context-aware code review: git diffs + code intelligence (symbols, calls, imports) for deep structural review"
+author: "astra"
+
+tools:
+  - bash
+  - read_file
+  - grep
+  - glob

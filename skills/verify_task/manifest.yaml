@@ -1,0 +1,10 @@
+name: verify-task
+version: "1.0.0"
+description: "Verify task completion using astra's 8-type verification engine: build, test, lint, file, grep, command, LLM judge, composite"
+author: "astra"
+
+tools:
+  - bash
+  - read_file
+  - grep
+  - glob

@@ -1,0 +1,72 @@
+{
+  "name": "verify_task",
+  "version": "1.0.0",
+  "description": "Verify task completion using astra's verification engine (8 verifier types)",
+  "category": "development",
+  "input_schema": {
+    "type": "object",
+    "properties": {
+      "task": {
+        "type": "string",
+        "description": "What to verify: 'last', task ID, or natural language description"
+      },
+      "scope": {
+        "type": "string",
+        "enum": ["quick", "full", "custom"],
+        "description": "Verification scope (default: full)"
+      }
+    }
+  },
+  "output_schema": {
+    "type": "object",
+    "properties": {
+      "verdict": {
+        "type": "string",
+        "enum": ["verified", "verified_with_warnings", "failed", "inconclusive"],
+        "description": "Overall verification result"
+      },
+      "required_passed": { "type": "number" },
+      "required_total": { "type": "number" },
+      "optional_passed": { "type": "number" },
+      "optional_total": { "type": "number" },
+      "criteria_results": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "properties": {
+            "id": { "type": "string" },
+            "passed": { "type": "boolean" },
+            "evidence": { "type": "string" },
+            "duration_ms": { "type": "number" }
+          }
+        }
+      },
+      "failures": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "properties": {
+            "criterion_id": { "type": "string" },
+            "expected": { "type": "string" },
+            "actual": { "type": "string" },
+            "fix_suggestion": { "type": "string" }
+          }
+        }
+      }
+    }
+  },
+  "examples": [
+    {
+      "input": { "scope": "quick" },
+      "description": "Quick build+test verification of recent changes"
+    },
+    {
+      "input": { "task": "last", "scope": "full" },
+      "description": "Full verification of the most recently completed task"
+    },
+    {
+      "input": { "task": "Implement JWT authentication", "scope": "custom" },
+      "description": "Custom verification of a specific feature"
+    }
+  ]
+}

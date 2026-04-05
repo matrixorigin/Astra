@@ -1,0 +1,62 @@
+{
+  "name": "review_changes",
+  "version": "1.0.0",
+  "description": "Context-aware code review combining git diffs with code intelligence",
+  "category": "development",
+  "input_schema": {
+    "type": "object",
+    "properties": {
+      "target": {
+        "type": "string",
+        "description": "What to review: 'staged', 'unstaged', 'branch:<name>', 'commit:<sha>', 'pr:<number>'"
+      },
+      "focus": {
+        "type": "string",
+        "enum": ["bugs", "security", "logic", "api", "tests", "all"],
+        "description": "Review focus area (default: all)"
+      }
+    }
+  },
+  "output_schema": {
+    "type": "object",
+    "properties": {
+      "critical_issues": {
+        "type": "array",
+        "items": { "type": "string" },
+        "description": "Bugs, security issues, API breakage"
+      },
+      "important_issues": {
+        "type": "array",
+        "items": { "type": "string" },
+        "description": "Missing tests, error handling gaps"
+      },
+      "suggestions": {
+        "type": "array",
+        "items": { "type": "string" },
+        "description": "Non-blocking improvements"
+      },
+      "impact": {
+        "type": "object",
+        "properties": {
+          "public_api_changes": { "type": "number" },
+          "test_coverage": { "type": "string" },
+          "semver": { "type": "string" }
+        }
+      }
+    }
+  },
+  "examples": [
+    {
+      "input": { "focus": "all" },
+      "description": "Review all uncommitted changes"
+    },
+    {
+      "input": { "target": "branch:feature-x", "focus": "security" },
+      "description": "Security-focused review of a feature branch"
+    },
+    {
+      "input": { "target": "staged", "focus": "bugs" },
+      "description": "Bug-focused review of staged changes"
+    }
+  ]
+}
