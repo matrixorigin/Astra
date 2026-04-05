@@ -97,6 +97,7 @@ pub async fn run_agentic_headless_tool_round<E: EdgeToolRoundRow>(
     idempotency_cache: &mut InMemoryIdempotencyCache,
     semantic_dedup: &mut SemanticDedup,
     tool_call_records: &mut Vec<ToolCallRecord>,
+    tool_event_hooks: &crate::skills::hooks::ToolEventHookRegistry,
     term: &mut dyn HeadlessRoundTerminal,
 ) {
     tool_results.clear();
@@ -255,6 +256,40 @@ pub async fn run_agentic_headless_tool_round<E: EdgeToolRoundRow>(
             continue;
         }
 
+        // ── PreToolUse hook evaluation ──
+        if !tool_event_hooks.is_empty() {
+            let decision = crate::skills::hooks::evaluate_pre_tool_hooks(
+                tool_event_hooks,
+                &name,
+                &args,
+            )
+            .await;
+            match decision {
+                crate::skills::hooks::PreToolDecision::Block(reason) => {
+                    let err_msg = format!(
+                        "Tool '{}' blocked by PreToolUse hook: {}",
+                        name, reason
+                    );
+                    if !quiet {
+                        term.emit_line(
+                            HeadlessStderrStyle::Yellow,
+                            format!("  ⚠ Hook blocked: {name} — {reason}"),
+                        );
+                    }
+                    let (tool_msg, err_tr) = openai_tool_roundtrip_values(&id, &name, &err_msg);
+                    messages.push(tool_msg);
+                    tool_results.push(err_tr);
+                    tool_call_records.push(journal_record_unknown_tool(name.clone()));
+                    continue;
+                }
+                crate::skills::hooks::PreToolDecision::AllowWithContext(ctx) => {
+                    // Context will be appended to the tool result after execution
+                    result_str = format!("{result_str}\n\n[Hook context]: {ctx}");
+                }
+                crate::skills::hooks::PreToolDecision::Allow => {}
+            }
+        }
+
         result_str = hydrate_reflect_placeholder_if_needed(
             api,
             token,
@@ -386,6 +421,20 @@ pub async fn run_agentic_headless_tool_round<E: EdgeToolRoundRow>(
         // Also skip body preview for edge tools.
         if !is_edge_tool {
             emit_headless_tool_body_preview(term, quiet, &name, &result_str, is_err);
+        }
+
+        // ── PostToolUse hook evaluation ──
+        if !tool_event_hooks.is_empty() && !is_err {
+            if let Some(modified) = crate::skills::hooks::evaluate_post_tool_hooks(
+                tool_event_hooks,
+                &name,
+                &args,
+                &result_str,
+            )
+            .await
+            {
+                result_str = modified;
+            }
         }
 
         let model_result_str = tool_result_content_for_model(&name, &result_str);

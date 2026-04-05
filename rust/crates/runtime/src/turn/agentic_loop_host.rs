@@ -253,6 +253,10 @@ pub struct AgenticLoopState {
     /// Skills pinned by the user — always included in budget (never truncated).
     pub pinned_skills: std::collections::HashSet<String>,
 
+    /// Tool event hooks (PreToolUse/PostToolUse) for intercepting tool calls.
+    /// Loaded from `.astra/hooks.json` or skill frontmatter.
+    pub tool_event_hooks: crate::skills::hooks::ToolEventHookRegistry,
+
     // ── Stop hooks ──
     /// Verification commands run before the loop is allowed to complete.
     /// For plan subtasks, populated from declarative `when: task_completed` hooks.
@@ -1050,6 +1054,7 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
                 &mut state.idempotency_cache,
                 &mut state.semantic_dedup,
                 &mut state.tool_call_records,
+                &state.tool_event_hooks,
                 &mut term_adapter,
             )
             .await;
@@ -1421,6 +1426,7 @@ mod tests {
             skill_quality_tracker: crate::skills::quality::SkillQualityTracker::new(),
             skill_improvement_tracker: crate::skills::improvement::ImprovementTracker::new(),
             pinned_skills: std::collections::HashSet::new(),
+            tool_event_hooks: crate::skills::hooks::ToolEventHookRegistry::default(),
             stop_hooks: Vec::new(),
             stop_hook_runs: 0,
             teammate_idle_hooks: Vec::new(),

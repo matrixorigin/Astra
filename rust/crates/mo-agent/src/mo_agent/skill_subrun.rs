@@ -359,6 +359,7 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
             skill_quality_tracker: astra_runtime::skills::quality::SkillQualityTracker::new(),
             skill_improvement_tracker: astra_runtime::skills::improvement::ImprovementTracker::new(),
             pinned_skills: std::collections::HashSet::new(),
+            tool_event_hooks: astra_runtime::skills::hooks::ToolEventHookRegistry::default(),
             stop_hooks: Vec::new(),
             stop_hook_runs: 0,
             teammate_idle_hooks: Vec::new(),

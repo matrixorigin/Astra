@@ -224,6 +224,7 @@ pub(crate) async fn stream_chat_sse(
         skill_quality_tracker: p.skill_quality_tracker.clone(),
         skill_improvement_tracker: astra_runtime::skills::improvement::ImprovementTracker::new(),
         pinned_skills: std::collections::HashSet::new(),
+        tool_event_hooks: astra_runtime::skills::hooks::ToolEventHookRegistry::default(),
         stop_hooks: hook_sets.stop_hooks,
         stop_hook_runs: 0,
         teammate_idle_hooks: hook_sets.teammate_idle_hooks,

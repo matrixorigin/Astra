@@ -158,6 +158,281 @@ impl ToolEventHookRegistry {
     }
 }
 
+// ── Hook execution ──────────────────────────────────────────────────────────
+
+/// Execute all PreToolUse hooks matching a tool name.
+///
+/// Returns the aggregate decision:
+/// - If any hook returns Block, the tool is blocked.
+/// - If any hook returns AllowWithContext, the context is appended.
+/// - Otherwise, Allow.
+///
+/// Shell hooks receive tool info via stdin JSON and produce a JSON decision:
+/// ```json
+/// {"decision": "allow"}
+/// {"decision": "block", "reason": "dangerous command"}
+/// {"decision": "allow", "context": "extra info to append"}
+/// ```
+pub async fn evaluate_pre_tool_hooks(
+    registry: &ToolEventHookRegistry,
+    tool_name: &str,
+    tool_args: &serde_json::Value,
+) -> PreToolDecision {
+    let hooks = registry.matching(ToolEventKind::PreToolUse, tool_name);
+    if hooks.is_empty() {
+        return PreToolDecision::Allow;
+    }
+
+    let mut accumulated_context: Vec<String> = Vec::new();
+
+    for hook in hooks {
+        match &hook.action {
+            HookAction::Shell { command } => {
+                let decision = run_shell_pre_hook(
+                    command,
+                    tool_name,
+                    tool_args,
+                    hook.timeout_secs,
+                )
+                .await;
+                match decision {
+                    PreToolDecision::Block(reason) => return PreToolDecision::Block(reason),
+                    PreToolDecision::AllowWithContext(ctx) => accumulated_context.push(ctx),
+                    PreToolDecision::Allow => {}
+                }
+            }
+            HookAction::SetEnv { key, value } => {
+                // Safety: only used in single-threaded test/CLI contexts
+                unsafe { std::env::set_var(key, value) };
+            }
+            HookAction::Custom { id, .. } => {
+                astra_core::agent_warn!("hook", "Custom hook '{}' matched tool '{}' — not yet implemented", id, tool_name);
+            }
+        }
+    }
+
+    if accumulated_context.is_empty() {
+        PreToolDecision::Allow
+    } else {
+        PreToolDecision::AllowWithContext(accumulated_context.join("\n"))
+    }
+}
+
+/// Execute all PostToolUse hooks matching a tool name.
+///
+/// Returns modified output if any hook changed it, otherwise None.
+pub async fn evaluate_post_tool_hooks(
+    registry: &ToolEventHookRegistry,
+    tool_name: &str,
+    tool_args: &serde_json::Value,
+    tool_output: &str,
+) -> Option<String> {
+    let hooks = registry.matching(ToolEventKind::PostToolUse, tool_name);
+    if hooks.is_empty() {
+        return None;
+    }
+
+    let mut current_output = tool_output.to_string();
+
+    for hook in hooks {
+        match &hook.action {
+            HookAction::Shell { command } => {
+                if let Some(modified) = run_shell_post_hook(
+                    command,
+                    tool_name,
+                    tool_args,
+                    &current_output,
+                    hook.timeout_secs,
+                )
+                .await
+                {
+                    current_output = modified;
+                }
+            }
+            HookAction::Custom { id, .. } => {
+                astra_core::agent_warn!("hook", "PostToolUse custom hook '{}' for '{}' — not yet implemented", id, tool_name);
+            }
+            _ => {}
+        }
+    }
+
+    if current_output != tool_output {
+        Some(current_output)
+    } else {
+        None
+    }
+}
+
+/// Run a shell command for a PreToolUse hook, with timeout.
+async fn run_shell_pre_hook(
+    command: &str,
+    tool_name: &str,
+    tool_args: &serde_json::Value,
+    timeout_secs: u32,
+) -> PreToolDecision {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::process::Command;
+
+    let input = serde_json::json!({
+        "hook_event": "pre_tool_use",
+        "tool_name": tool_name,
+        "tool_input": tool_args,
+    });
+
+    let mut child = match Command::new("sh")
+        .args(["-c", command])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            astra_core::agent_warn!("hook", "Failed to spawn hook '{}': {}", command, e);
+            return PreToolDecision::Allow;
+        }
+    };
+
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(input.to_string().as_bytes()).await;
+        drop(stdin);
+    }
+
+    let mut stdout_handle = child.stdout.take();
+    let timeout = std::time::Duration::from_secs(timeout_secs as u64);
+
+    let wait_result = tokio::time::timeout(timeout, child.wait()).await;
+    match wait_result {
+        Ok(Ok(status)) => {
+            if !status.success() {
+                return PreToolDecision::Block(format!(
+                    "Hook '{}' exited with status {}",
+                    command,
+                    status.code().unwrap_or(-1)
+                ));
+            }
+            let mut buf = Vec::new();
+            if let Some(ref mut stdout) = stdout_handle {
+                let _ = stdout.read_to_end(&mut buf).await;
+            }
+            parse_pre_hook_output(&buf)
+        }
+        Ok(Err(e)) => {
+            astra_core::agent_warn!("hook", "Hook I/O error for '{}': {}", command, e);
+            PreToolDecision::Allow
+        }
+        Err(_) => {
+            let _ = child.kill().await;
+            PreToolDecision::Block(format!(
+                "Hook '{}' timed out after {}s",
+                command, timeout_secs
+            ))
+        }
+    }
+}
+
+/// Run a shell command for a PostToolUse hook, with timeout.
+async fn run_shell_post_hook(
+    command: &str,
+    tool_name: &str,
+    tool_args: &serde_json::Value,
+    tool_output: &str,
+    timeout_secs: u32,
+) -> Option<String> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::process::Command;
+
+    let input = serde_json::json!({
+        "hook_event": "post_tool_use",
+        "tool_name": tool_name,
+        "tool_input": tool_args,
+        "tool_output": tool_output,
+    });
+
+    let mut child = match Command::new("sh")
+        .args(["-c", command])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            astra_core::agent_warn!("hook", "Failed to spawn post-hook '{}': {}", command, e);
+            return None;
+        }
+    };
+
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(input.to_string().as_bytes()).await;
+        drop(stdin);
+    }
+
+    let mut stdout_handle = child.stdout.take();
+    let timeout = std::time::Duration::from_secs(timeout_secs as u64);
+
+    match tokio::time::timeout(timeout, child.wait()).await {
+        Ok(Ok(status)) if status.success() => {
+            let mut buf = Vec::new();
+            if let Some(ref mut stdout) = stdout_handle {
+                let _ = stdout.read_to_end(&mut buf).await;
+            }
+            parse_post_hook_output(&buf)
+        }
+        _ => {
+            let _ = child.kill().await;
+            None
+        }
+    }
+}
+
+/// Parse stdout from a PreToolUse shell hook into a decision.
+fn parse_pre_hook_output(stdout: &[u8]) -> PreToolDecision {
+    let text = String::from_utf8_lossy(stdout);
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return PreToolDecision::Allow;
+    }
+
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(trimmed) {
+        match v.get("decision").and_then(|d| d.as_str()) {
+            Some("block") => {
+                let reason = v
+                    .get("reason")
+                    .and_then(|r| r.as_str())
+                    .unwrap_or("blocked by hook")
+                    .to_string();
+                PreToolDecision::Block(reason)
+            }
+            Some("allow") => {
+                if let Some(ctx) = v.get("context").and_then(|c| c.as_str()) {
+                    PreToolDecision::AllowWithContext(ctx.to_string())
+                } else {
+                    PreToolDecision::Allow
+                }
+            }
+            _ => PreToolDecision::Allow,
+        }
+    } else {
+        PreToolDecision::Allow
+    }
+}
+
+/// Parse stdout from a PostToolUse shell hook for output modification.
+fn parse_post_hook_output(stdout: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(stdout);
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(trimmed) {
+        v.get("output").and_then(|o| o.as_str()).map(String::from)
+    } else {
+        None
+    }
+}
+
 /// Events emitted during the skill lifecycle.
 ///
 /// Can be consumed by telemetry, logging, or debugging systems.
@@ -674,6 +949,213 @@ mod tests {
         match &matches[2].action {
             HookAction::Shell { command } => assert_eq!(command, "catch-all"),
             _ => panic!(),
+        }
+    }
+
+    // ── E2E: async hook execution with real shell commands ──────────
+
+    #[tokio::test]
+    async fn e2e_pre_hook_shell_allow() {
+        let registry = ToolEventHookRegistry::new(vec![ToolEventHook {
+            event: ToolEventKind::PreToolUse,
+            matcher: "bash".into(),
+            action: HookAction::Shell {
+                command: r#"echo '{"decision": "allow"}'"#.into(),
+            },
+            timeout_secs: 5,
+        }]);
+
+        let decision =
+            evaluate_pre_tool_hooks(&registry, "bash", &serde_json::json!({})).await;
+        assert_eq!(decision, PreToolDecision::Allow);
+    }
+
+    #[tokio::test]
+    async fn e2e_pre_hook_shell_block() {
+        let registry = ToolEventHookRegistry::new(vec![ToolEventHook {
+            event: ToolEventKind::PreToolUse,
+            matcher: "bash".into(),
+            action: HookAction::Shell {
+                command: r#"echo '{"decision": "block", "reason": "rm -rf detected"}'"#.into(),
+            },
+            timeout_secs: 5,
+        }]);
+
+        let decision =
+            evaluate_pre_tool_hooks(&registry, "bash", &serde_json::json!({})).await;
+        assert_eq!(decision, PreToolDecision::Block("rm -rf detected".into()));
+    }
+
+    #[tokio::test]
+    async fn e2e_pre_hook_shell_allow_with_context() {
+        let registry = ToolEventHookRegistry::new(vec![ToolEventHook {
+            event: ToolEventKind::PreToolUse,
+            matcher: "*".into(),
+            action: HookAction::Shell {
+                command: r#"echo '{"decision": "allow", "context": "hook injected info"}'"#
+                    .into(),
+            },
+            timeout_secs: 5,
+        }]);
+
+        let decision =
+            evaluate_pre_tool_hooks(&registry, "read_file", &serde_json::json!({})).await;
+        assert_eq!(
+            decision,
+            PreToolDecision::AllowWithContext("hook injected info".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn e2e_pre_hook_shell_exit_nonzero_blocks() {
+        let registry = ToolEventHookRegistry::new(vec![ToolEventHook {
+            event: ToolEventKind::PreToolUse,
+            matcher: "bash".into(),
+            action: HookAction::Shell {
+                command: "exit 1".into(),
+            },
+            timeout_secs: 5,
+        }]);
+
+        let decision =
+            evaluate_pre_tool_hooks(&registry, "bash", &serde_json::json!({})).await;
+        match decision {
+            PreToolDecision::Block(reason) => assert!(reason.contains("exited with status")),
+            _ => panic!("expected Block, got {:?}", decision),
+        }
+    }
+
+    #[tokio::test]
+    async fn e2e_pre_hook_no_match_allows() {
+        let registry = ToolEventHookRegistry::new(vec![ToolEventHook {
+            event: ToolEventKind::PreToolUse,
+            matcher: "bash".into(),
+            action: HookAction::Shell {
+                command: r#"echo '{"decision": "block", "reason": "nope"}'"#.into(),
+            },
+            timeout_secs: 5,
+        }]);
+
+        let decision =
+            evaluate_pre_tool_hooks(&registry, "read_file", &serde_json::json!({})).await;
+        assert_eq!(decision, PreToolDecision::Allow);
+    }
+
+    #[tokio::test]
+    async fn e2e_pre_hook_reads_tool_input() {
+        let registry = ToolEventHookRegistry::new(vec![ToolEventHook {
+            event: ToolEventKind::PreToolUse,
+            matcher: "*".into(),
+            action: HookAction::Shell {
+                command: r#"INPUT=$(cat); TOOL=$(echo "$INPUT" | grep -o '"tool_name":"[^"]*"' | head -1); if echo "$TOOL" | grep -q 'write_file'; then echo '{"decision":"block","reason":"writes blocked"}'; else echo '{"decision":"allow"}'; fi"#.into(),
+            },
+            timeout_secs: 5,
+        }]);
+
+        let allow =
+            evaluate_pre_tool_hooks(&registry, "read_file", &serde_json::json!({})).await;
+        assert_eq!(allow, PreToolDecision::Allow);
+
+        let block =
+            evaluate_pre_tool_hooks(&registry, "write_file", &serde_json::json!({})).await;
+        assert_eq!(block, PreToolDecision::Block("writes blocked".into()));
+    }
+
+    #[tokio::test]
+    async fn e2e_post_hook_shell_modifies_output() {
+        let registry = ToolEventHookRegistry::new(vec![ToolEventHook {
+            event: ToolEventKind::PostToolUse,
+            matcher: "bash".into(),
+            action: HookAction::Shell {
+                command: r#"echo '{"output": "modified output"}'"#.into(),
+            },
+            timeout_secs: 5,
+        }]);
+
+        let result = evaluate_post_tool_hooks(
+            &registry,
+            "bash",
+            &serde_json::json!({}),
+            "original output",
+        )
+        .await;
+        assert_eq!(result, Some("modified output".into()));
+    }
+
+    #[tokio::test]
+    async fn e2e_post_hook_shell_no_modification() {
+        let registry = ToolEventHookRegistry::new(vec![ToolEventHook {
+            event: ToolEventKind::PostToolUse,
+            matcher: "bash".into(),
+            action: HookAction::Shell {
+                command: r#"echo '{}'"#.into(),
+            },
+            timeout_secs: 5,
+        }]);
+
+        let result = evaluate_post_tool_hooks(
+            &registry,
+            "bash",
+            &serde_json::json!({}),
+            "original output",
+        )
+        .await;
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn e2e_pre_hook_empty_registry_allows() {
+        let registry = ToolEventHookRegistry::default();
+        let decision =
+            evaluate_pre_tool_hooks(&registry, "bash", &serde_json::json!({})).await;
+        assert_eq!(decision, PreToolDecision::Allow);
+    }
+
+    #[tokio::test]
+    async fn e2e_pre_hook_empty_output_allows() {
+        let registry = ToolEventHookRegistry::new(vec![ToolEventHook {
+            event: ToolEventKind::PreToolUse,
+            matcher: "*".into(),
+            action: HookAction::Shell {
+                command: "true".into(),
+            },
+            timeout_secs: 5,
+        }]);
+
+        let decision =
+            evaluate_pre_tool_hooks(&registry, "bash", &serde_json::json!({})).await;
+        assert_eq!(decision, PreToolDecision::Allow);
+    }
+
+    #[tokio::test]
+    async fn e2e_pre_hook_multiple_context_accumulates() {
+        let registry = ToolEventHookRegistry::new(vec![
+            ToolEventHook {
+                event: ToolEventKind::PreToolUse,
+                matcher: "*".into(),
+                action: HookAction::Shell {
+                    command: r#"echo '{"decision":"allow","context":"hook1 info"}'"#.into(),
+                },
+                timeout_secs: 5,
+            },
+            ToolEventHook {
+                event: ToolEventKind::PreToolUse,
+                matcher: "*".into(),
+                action: HookAction::Shell {
+                    command: r#"echo '{"decision":"allow","context":"hook2 info"}'"#.into(),
+                },
+                timeout_secs: 5,
+            },
+        ]);
+
+        let decision =
+            evaluate_pre_tool_hooks(&registry, "bash", &serde_json::json!({})).await;
+        match decision {
+            PreToolDecision::AllowWithContext(ctx) => {
+                assert!(ctx.contains("hook1 info"));
+                assert!(ctx.contains("hook2 info"));
+            }
+            _ => panic!("expected AllowWithContext, got {:?}", decision),
         }
     }
 }
