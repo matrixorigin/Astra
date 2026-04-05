@@ -1,0 +1,10 @@
+name: analyze-session
+version: "1.0.0"
+description: "Deep diagnostic analysis of coding agent sessions: context, tools, tokens, errors, and actionable fixes"
+author: "astra"
+
+tools:
+  - bash
+  - read_file
+  - grep
+  - glob

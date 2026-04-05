@@ -1,0 +1,71 @@
+{
+  "name": "analyze_session",
+  "version": "1.0.0",
+  "description": "Deep diagnostic analysis of coding agent sessions",
+  "category": "development",
+  "input_schema": {
+    "type": "object",
+    "properties": {
+      "target": {
+        "type": "string",
+        "description": "Session ID, JSON log file path, or keyword ('this', 'last')"
+      },
+      "focus": {
+        "type": "string",
+        "enum": ["context", "tools", "tokens", "errors", "flow", "all"],
+        "description": "Analysis focus area (default: all)"
+      }
+    }
+  },
+  "output_schema": {
+    "type": "object",
+    "properties": {
+      "health_score": {
+        "type": "number",
+        "description": "Overall health score 0-100"
+      },
+      "context_score": {
+        "type": "number",
+        "description": "Context quality score 0-25"
+      },
+      "tool_score": {
+        "type": "number",
+        "description": "Tool selection score 0-25"
+      },
+      "token_score": {
+        "type": "number",
+        "description": "Token efficiency score 0-25"
+      },
+      "error_score": {
+        "type": "number",
+        "description": "Error handling score 0-25"
+      },
+      "critical_issues": {
+        "type": "array",
+        "items": { "type": "string" }
+      },
+      "warnings": {
+        "type": "array",
+        "items": { "type": "string" }
+      },
+      "recommendations": {
+        "type": "array",
+        "items": { "type": "string" }
+      }
+    }
+  },
+  "examples": [
+    {
+      "input": { "target": "/tmp/debug-6764518e-turn1.json", "focus": "all" },
+      "description": "Analyze a debug JSON log file"
+    },
+    {
+      "input": { "target": "this", "focus": "tokens" },
+      "description": "Analyze current session token efficiency"
+    },
+    {
+      "input": { "focus": "tools" },
+      "description": "Analyze tool selection in the most recent session"
+    }
+  ]
+}
