@@ -410,7 +410,7 @@ pub async fn ensure_core_schema(settings: &MatrixOneSettings) -> Result<(), sqlx
         if let Err(e) = query(alter_sql).execute(&pool).await {
             let msg = e.to_string();
             // Silence "duplicate column" / "already exists" errors — expected on re-run
-            if !msg.contains("uplicate") && !msg.contains("already exists") {
+            if !msg.to_lowercase().contains("duplicate") && !msg.contains("already exists") {
                 eprintln!("  ⚠ ALTER TABLE skills_registry: {msg}");
             }
         }

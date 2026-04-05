@@ -473,9 +473,14 @@ fn merge_activations(
     // Model: last writer wins.
     merged.model_override = new.model_override;
 
-    // Effort & agent_type: last writer wins.
-    merged.effort = new.effort;
-    merged.agent_type = new.agent_type;
+    // Effort & agent_type: new value wins when present, otherwise keep previous.
+    // None means "no opinion", not "clear".
+    if new.effort.is_some() {
+        merged.effort = new.effort;
+    }
+    if new.agent_type.is_some() {
+        merged.agent_type = new.agent_type;
+    }
 
     // Tools: intersect non-empty allow-lists.
     match (merged.allowed_tools.is_empty(), new.allowed_tools.is_empty()) {
@@ -1456,12 +1461,12 @@ mod tests {
             model_override: None,
             allowed_tools: vec![],
             effort: Some(EffortLevel::Max),
-            agent_type: None,
+            agent_type: None, // no opinion — should keep previous
         };
         let merged = super::merge_activations(Some(prev), new);
         assert!(matches!(merged.effort, Some(EffortLevel::Max)));
-        // agent_type cleared by new activation (last writer wins)
-        assert!(merged.agent_type.is_none());
+        // agent_type None = "no opinion" — previous value preserved
+        assert_eq!(merged.agent_type.as_deref(), Some("researcher"));
     }
 
     // ── Multi-skill partition tests ──────────────────────────────────────

@@ -119,6 +119,8 @@ impl UnifiedSkillRegistry {
 
         let mut registered = Vec::new();
         let mut total_tokens: u32 = 0;
+        // Track alias→owner for collision detection.
+        let mut alias_owners: HashMap<String, String> = HashMap::new();
 
         for manifest in all_manifests {
             let tokens = manifest.metadata_tokens();
@@ -133,6 +135,23 @@ impl UnifiedSkillRegistry {
             // First occurrence wins (higher priority sources sorted first)
             if cache.contains_key(&manifest.name) {
                 continue;
+            }
+
+            // Check for alias collisions with other skills' names or aliases.
+            for alias in &manifest.aliases {
+                if cache.contains_key(alias) {
+                    eprintln!(
+                        "  ⚠ Skill '{}': alias '{}' conflicts with existing skill name — ignored",
+                        manifest.name, alias
+                    );
+                } else if let Some(owner) = alias_owners.get(alias) {
+                    eprintln!(
+                        "  ⚠ Skill '{}': alias '{}' conflicts with skill '{}' — ignored",
+                        manifest.name, alias, owner
+                    );
+                } else {
+                    alias_owners.insert(alias.clone(), manifest.name.clone());
+                }
             }
 
             if manifest.is_conditional() {
@@ -423,7 +442,7 @@ impl super::traits::SkillResolver for UnifiedSkillResolver {
                     })
                 })
                 .join()
-                .expect("provider load thread panicked")
+                .map_err(|_| SkillError::Internal("provider load thread panicked".into()))?
         });
 
         result.map(|loaded| Self::loaded_to_resolved(&loaded))
