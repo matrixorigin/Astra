@@ -413,4 +413,111 @@ mod tests {
         assert!(result.output.contains("## Skill Result: forked"));
         assert!(result.output.contains("test-model"));
     }
+
+    // ── Effort/agent_type threading test ─────────────────────────────────
+
+    /// Mock that captures the effort and agent_type passed to it.
+    struct CapturingSubRunExecutor {
+        captured_effort: std::sync::Mutex<Option<String>>,
+        captured_agent_type: std::sync::Mutex<Option<String>>,
+    }
+
+    impl CapturingSubRunExecutor {
+        fn new() -> Self {
+            Self {
+                captured_effort: std::sync::Mutex::new(None),
+                captured_agent_type: std::sync::Mutex::new(None),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl SkillSubRunExecutor for CapturingSubRunExecutor {
+        async fn execute_skill_subrun(
+            &self,
+            _skill_name: &str,
+            _instructions: &str,
+            _task_context: &str,
+            _model: Option<&str>,
+            _max_tokens: Option<u32>,
+            _allowed_tools: &[String],
+            effort: Option<&str>,
+            agent_type: Option<&str>,
+        ) -> Result<SubRunResult, String> {
+            *self.captured_effort.lock().unwrap() = effort.map(String::from);
+            *self.captured_agent_type.lock().unwrap() = agent_type.map(String::from);
+            Ok(SubRunResult {
+                output: "done".into(),
+                tokens_used: 100,
+                turns: 1,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn isolated_executor_threads_effort_and_agent_type() {
+        use crate::skills::manifest::EffortLevel;
+
+        let executor_inner = Arc::new(CapturingSubRunExecutor::new());
+        let executor = IsolatedSkillExecutor::new(executor_inner.clone());
+        let skill = LoadedSkill {
+            manifest: SkillManifest {
+                name: "threaded".into(),
+                execution_context: ExecutionContext::Fork,
+                effort: Some(EffortLevel::High),
+                agent_type: Some("coder".into()),
+                ..Default::default()
+            },
+            instructions: "Thread test.".into(),
+            instruction_tokens: 5,
+            resources: None,
+            skill_dir: None,
+        };
+
+        let context = SkillExecutionContext {
+            task: "test effort threading".into(),
+            arguments: HashMap::new(),
+        };
+
+        let _result = executor.execute(&skill, &context).await.unwrap();
+
+        assert_eq!(
+            *executor_inner.captured_effort.lock().unwrap(),
+            Some("high".to_string()),
+            "effort should be threaded through to SubRunExecutor"
+        );
+        assert_eq!(
+            *executor_inner.captured_agent_type.lock().unwrap(),
+            Some("coder".to_string()),
+            "agent_type should be threaded through to SubRunExecutor"
+        );
+    }
+
+    #[tokio::test]
+    async fn isolated_executor_threads_none_effort() {
+        let executor_inner = Arc::new(CapturingSubRunExecutor::new());
+        let executor = IsolatedSkillExecutor::new(executor_inner.clone());
+        let skill = LoadedSkill {
+            manifest: SkillManifest {
+                name: "no-effort".into(),
+                execution_context: ExecutionContext::Fork,
+                effort: None,
+                agent_type: None,
+                ..Default::default()
+            },
+            instructions: "No effort.".into(),
+            instruction_tokens: 5,
+            resources: None,
+            skill_dir: None,
+        };
+
+        let context = SkillExecutionContext {
+            task: "test".into(),
+            arguments: HashMap::new(),
+        };
+
+        let _result = executor.execute(&skill, &context).await.unwrap();
+        assert_eq!(*executor_inner.captured_effort.lock().unwrap(), None);
+        assert_eq!(*executor_inner.captured_agent_type.lock().unwrap(), None);
+    }
 }

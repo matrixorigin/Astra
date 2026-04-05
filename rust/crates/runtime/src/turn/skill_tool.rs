@@ -1796,4 +1796,50 @@ mod tests {
         ).await;
         assert!(output.contains("validation failed"), "Expected validation error, got: {output}");
     }
+
+    #[test]
+    fn pinned_skill_gets_full_description_even_with_quality_sorting() {
+        use crate::skills::quality::SkillQualityTracker;
+
+        let mut tracker = SkillQualityTracker::new();
+        // Record high-quality outcomes for skill-0 to give it high boost
+        for _ in 0..5 {
+            tracker.record_outcome(&crate::skills::quality::SkillOutcome {
+                skill_name: "skill-0".into(),
+                tokens_used: 100,
+                duration_ms: 50,
+                all_required_passed: true,
+                partial: false,
+            });
+        }
+        // skill-9 (pinned) has no quality data — would normally be low priority
+
+        let skills: Vec<SkillToolInfo> = (0..10)
+            .map(|i| SkillToolInfo {
+                name: format!("skill-{i}"),
+                description: format!("Description for skill {i} which is moderately long text"),
+                when_to_use: None,
+                source: SkillSourceKind::Local,
+                aliases: Vec::new(),
+            })
+            .collect();
+
+        let pinned: std::collections::HashSet<String> =
+            ["skill-9".to_string()].into_iter().collect();
+
+        // Very tight budget — forces truncation
+        let (entries, names) =
+            format_skills_within_budget(&skills, 250, Some(&tracker), Some(&pinned));
+
+        // Pinned skill-9 must have full description (treated as bundled)
+        let pinned_entry = entries.iter().find(|e| e.contains("skill-9")).unwrap();
+        assert!(
+            pinned_entry.contains("Description for skill 9"),
+            "Pinned skill should have full description, got: {pinned_entry}"
+        );
+
+        // All names still in enum
+        assert!(names.contains(&"skill-9".to_string()));
+        assert!(names.contains(&"skill-0".to_string()));
+    }
 }
