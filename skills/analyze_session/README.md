@@ -1,7 +1,8 @@
 # analyze-session
 
-Deep diagnostic analysis of coding agent sessions — context quality, tool/skill/MCP selection,
-token efficiency, error patterns, and execution flow.
+Deep diagnostic analysis of **astra** agent sessions. Reads the session journal (JSONL),
+heavy checkpoints, and debug snapshots to identify inefficiencies in context management,
+tool selection, token usage, error handling, compaction, and stall recovery.
 
 ## Usage
 
@@ -16,32 +17,38 @@ token efficiency, error patterns, and execution flow.
 
 | Dimension | What It Checks |
 |-----------|---------------|
-| **Context** | System prompt bloat, history explosion, repeated file reads, stale context |
-| **Tools** | Wrong tool selection, missed parallelism, redundant calls, MCP effectiveness |
-| **Tokens** | Per-turn budget, waste indicators, cost estimate, thinking token ratio |
-| **Errors** | Error cascades, recovery quality, blind retries, unhandled failures |
-| **Flow** | Task decomposition quality, turn efficiency, decision quality |
+| **Context** | Token growth curve, compaction events, budget pressure tiers, stale reasoning, tool schema bloat |
+| **Tools** | Selection accuracy (tools_selected vs tools_used), selector strategy (tfidf/llm), missed parallelism, bash misuse |
+| **Tokens** | Per-turn prompt/completion, TTFT, context build time, selector overhead |
+| **Errors** | Error cascades, stall detection (sig_stall/name_stall/divergence), TurnGuardVerdict events, tool failure rates |
+| **Flow** | Plan subtask tracking, delegation fan-out/aggregate, turn productivity classification |
+
+## Data Sources
+
+| Source | Location | Format |
+|--------|----------|--------|
+| Session journal | `~/.astra/sessions/<id>.jsonl` | JSONL — one `JournalEvent` per line |
+| Heavy checkpoints | `~/.astra/sessions/<id>/step_checkpoints/*-heavy.json` | JSON array of OpenAI messages |
+| Debug snapshots | `/tmp/debug-<short>-turn<N>.json` | `astra-debug-turn-delta-v1` or `astra-debug-turn-full-v1` |
+| Cloud events | `agent_events` table | Batch INSERTed via EventIngestionWorker |
 
 ## Output
 
 A structured health report with:
-- **Health Score** (0–100) across 4 dimensions
-- **Critical Issues** that need immediate attention
+- **Health Score** (0–100) across 4 dimensions (context, tools, tokens, error handling)
+- **Critical Issues** with astra-specific root causes
 - **Warnings** for suboptimal patterns
-- **Recommendations** with specific, actionable fixes
+- **Recommendations** with references to astra source files
 
-## Data Sources
+## Astra-Specific Anti-Patterns Detected
 
-- JSON debug log files (`/tmp/debug-*.json`)
-- Session events from the platform database (`agent_events` table)
-- Current session context
-
-## Anti-Patterns Detected
-
-- 📛 History explosion (context grows >50% per turn)
-- 📛 Shell-for-everything (using `bash` when specialized tools exist)
-- 📛 Sequential reads (independent file reads not parallelized)
-- 📛 Blind retry (same tool call repeated without changes)
-- 📛 Premature coding (writing code before understanding the problem)
-- 📛 No verification (changes without running tests/lint)
-- 📛 Verbose thinking (>1000 thinking tokens for trivial decisions)
+- 📛 **No compaction**: budget_pressure=0 but tokens >80k
+- 📛 **Aggressive compaction loop**: budget_pressure ≥0.9 for 3+ consecutive turns
+- 📛 **Stale reasoning**: old reasoning_content surviving (strip_stale_reasoning failure)
+- 📛 **Tool schema bloat**: >30 tools in tools_selected (each ~500 tokens)
+- 📛 **Selector miss**: LLM tried tool not in tools_selected
+- 📛 **Strategy mismatch**: tfidf for novel task where LLM selection needed
+- 📛 **Skill injection waste**: skill injected but never referenced in output
+- 📛 **Stall ignored**: StallDetected event followed by same tool pattern
+- 📛 **Slow context build**: context_ms >2000ms
+- 📛 **Output explosion**: single tool result >10KB inflating context

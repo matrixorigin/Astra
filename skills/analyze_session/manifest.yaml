@@ -1,6 +1,6 @@
 name: analyze-session
 version: "1.0.0"
-description: "Deep diagnostic analysis of coding agent sessions: context, tools, tokens, errors, and actionable fixes"
+description: "Deep diagnostic analysis of astra agent sessions: journal, checkpoints, tool selection, compaction, stall detection"
 author: "astra"
 
 tools:
