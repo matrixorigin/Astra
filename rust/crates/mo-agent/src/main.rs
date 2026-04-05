@@ -919,14 +919,9 @@ async fn handle_resume_command(arg: &str, profile: Option<&str>, state: &mut Rep
             state.total_completion_tokens = restored.total_tokens_out;
             state.recent_tools = restored.recent_tools;
 
-            // Merge step checkpoint data if available (with migration support)
-            let registry =
-                astra_runtime::pipeline::step_protocol::MigrationRegistry::with_defaults();
+            // Merge step checkpoint data when the on-disk checkpoint matches current protocol.
             if let Ok(Some(step_restored)) =
-                astra_runtime::pipeline::step_restore::restore_session_with_migrations(
-                    &restored.session_id,
-                    &registry,
-                )
+                astra_runtime::pipeline::step_restore::restore_session(&restored.session_id)
             {
                 let summary =
                     astra_runtime::pipeline::step_restore::restore_summary(&step_restored);

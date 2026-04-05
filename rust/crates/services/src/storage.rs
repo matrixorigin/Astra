@@ -6,10 +6,6 @@ use sqlx::{MySql, QueryBuilder, Row, query};
 use std::collections::{BTreeSet, HashMap};
 use uuid::Uuid;
 
-fn is_missing_skills_registry_message(message: &str) -> bool {
-    message.contains("skills_registry") && message.contains("does not exist")
-}
-
 pub async fn ensure_core_schema(settings: &MatrixOneSettings) -> Result<(), sqlx::Error> {
     let pool = connect_matrixone(settings).await?;
 
@@ -380,6 +376,11 @@ pub async fn ensure_core_schema(settings: &MatrixOneSettings) -> Result<(), sqlx
             triggers JSON NULL,
             dependencies JSON NULL,
             manifest JSON NULL,
+            publisher_id VARCHAR(255) NULL,
+            publisher_verified SMALLINT NOT NULL DEFAULT 0,
+            trust_tier VARCHAR(32) NULL,
+            min_runtime_version VARCHAR(50) NULL,
+            compatibility_platforms JSON NULL,
             category VARCHAR(64) NULL,
             priority INT NULL,
             is_active SMALLINT NOT NULL DEFAULT 1,
@@ -396,25 +397,6 @@ pub async fn ensure_core_schema(settings: &MatrixOneSettings) -> Result<(), sqlx
     )
     .execute(&pool)
     .await?;
-
-    // ── Marketplace signals (Phase 3) — extend skills_registry ──
-    // Use ALTER TABLE MODIFY/ADD for idempotent column additions.
-    // Ignore errors if columns already exist (MatrixOne returns error on dup).
-    for alter_sql in &[
-        "ALTER TABLE skills_registry ADD COLUMN publisher_id VARCHAR(255) NULL",
-        "ALTER TABLE skills_registry ADD COLUMN publisher_verified SMALLINT NOT NULL DEFAULT 0",
-        "ALTER TABLE skills_registry ADD COLUMN trust_tier VARCHAR(32) NULL",
-        "ALTER TABLE skills_registry ADD COLUMN min_runtime_version VARCHAR(50) NULL",
-        "ALTER TABLE skills_registry ADD COLUMN compatibility_platforms JSON NULL",
-    ] {
-        if let Err(e) = query(alter_sql).execute(&pool).await {
-            let msg = e.to_string();
-            // Silence "duplicate column" / "already exists" errors — expected on re-run
-            if !msg.to_lowercase().contains("duplicate") && !msg.contains("already exists") {
-                eprintln!("  ⚠ ALTER TABLE skills_registry: {msg}");
-            }
-        }
-    }
 
     query(
         "CREATE TABLE IF NOT EXISTS skill_marketplace_stats (
@@ -457,6 +439,7 @@ pub async fn ensure_core_schema(settings: &MatrixOneSettings) -> Result<(), sqlx
             task_id VARCHAR(36) PRIMARY KEY,
             user_id VARCHAR(36) NOT NULL,
             session_id VARCHAR(36) NULL,
+            agent_id VARCHAR(128) NULL,
             parent_task_id VARCHAR(36) NULL,
             title VARCHAR(500) NOT NULL,
             description LONGTEXT NULL,
@@ -485,19 +468,6 @@ pub async fn ensure_core_schema(settings: &MatrixOneSettings) -> Result<(), sqlx
     )
     .execute(&pool)
     .await?;
-
-    // Phase 3: optional `agent_id` on tasks (ALTER is idempotent across versions).
-    if let Err(e) = query("ALTER TABLE agent_tasks ADD COLUMN agent_id VARCHAR(128) NULL")
-        .execute(&pool)
-        .await
-    {
-        let msg = e.to_string();
-        if !msg.to_lowercase().contains("duplicate")
-            && !msg.to_lowercase().contains("already exists")
-        {
-            return Err(e);
-        }
-    }
 
     query(
         "CREATE TABLE IF NOT EXISTS edge_agent_registry (
@@ -576,20 +546,6 @@ pub async fn ensure_core_schema(settings: &MatrixOneSettings) -> Result<(), sqlx
     )
     .execute(&pool)
     .await?;
-
-    // Migration: add contract_state_json column for verification context in checkpoints.
-    if let Err(e) =
-        query("ALTER TABLE session_checkpoints ADD COLUMN contract_state_json LONGTEXT NULL")
-            .execute(&pool)
-            .await
-    {
-        let msg = e.to_string();
-        if !msg.to_lowercase().contains("duplicate")
-            && !msg.to_lowercase().contains("already exists")
-        {
-            return Err(e);
-        }
-    }
 
     // Step Protocol idempotency cache
     query(
@@ -946,69 +902,6 @@ pub async fn ensure_core_schema(settings: &MatrixOneSettings) -> Result<(), sqlx
     .execute(&pool)
     .await?;
 
-    if let Err(e) = query("CREATE INDEX idx_auth_tokens_active ON auth_tokens (is_active)")
-        .execute(&pool)
-        .await
-    {
-        let msg = e.to_string().to_lowercase();
-        if !msg.contains("duplicate") && !msg.contains("already exists") {
-            return Err(e);
-        }
-    }
-
-    if let Err(e) = query("ALTER TABLE eval_user_feedback ADD COLUMN agent_id VARCHAR(64) NULL")
-        .execute(&pool)
-        .await
-    {
-        let msg = e.to_string().to_lowercase();
-        if !msg.contains("duplicate") && !msg.contains("already exists") && !msg.contains("exists")
-        {
-            return Err(e);
-        }
-    }
-
-    for ddl in [
-        "CREATE INDEX idx_euf_agent_created ON eval_user_feedback (agent_id, created_at)",
-        "CREATE INDEX idx_euf_created ON eval_user_feedback (created_at)",
-        "CREATE INDEX idx_euf_type_created ON eval_user_feedback (feedback_type, created_at)",
-    ] {
-        if let Err(e) = query(ddl).execute(&pool).await {
-            let msg = e.to_string().to_lowercase();
-            if !msg.contains("duplicate") && !msg.contains("already exists") {
-                return Err(e);
-            }
-        }
-    }
-
-    for ddl in [
-        "ALTER TABLE skill_selection_events ADD COLUMN user_id VARCHAR(36) NULL",
-        "ALTER TABLE eval_gate_results ADD COLUMN user_id VARCHAR(36) NULL",
-        "ALTER TABLE eval_quality_assessments ADD COLUMN user_id VARCHAR(36) NULL",
-    ] {
-        if let Err(e) = query(ddl).execute(&pool).await {
-            let msg = e.to_string().to_lowercase();
-            if !msg.contains("duplicate")
-                && !msg.contains("already exists")
-                && !msg.contains("exists")
-            {
-                return Err(e);
-            }
-        }
-    }
-
-    for ddl in [
-        "CREATE INDEX idx_skill_selection_user_created ON skill_selection_events (user_id, created_at)",
-        "CREATE INDEX idx_egr_user_created ON eval_gate_results (user_id, created_at)",
-        "CREATE INDEX idx_eqa_user_level_updated ON eval_quality_assessments (user_id, level, updated_at)",
-    ] {
-        if let Err(e) = query(ddl).execute(&pool).await {
-            let msg = e.to_string().to_lowercase();
-            if !msg.contains("duplicate") && !msg.contains("already exists") {
-                return Err(e);
-            }
-        }
-    }
-
     query(
         "CREATE TABLE IF NOT EXISTS governance_runs (
             run_id     VARCHAR(36) PRIMARY KEY,
@@ -1119,13 +1012,7 @@ pub async fn resolve_active_skill_versions(
     }
     query_builder.push(") ORDER BY skill_name ASC, version DESC");
 
-    let rows = match query_builder.build().fetch_all(pool).await {
-        Ok(rows) => rows,
-        Err(error) if is_missing_skills_registry_message(&error.to_string()) => {
-            return Ok(HashMap::new());
-        }
-        Err(error) => return Err(error),
-    };
+    let rows = query_builder.build().fetch_all(pool).await?;
     let mut versions = HashMap::new();
     for row in rows {
         let skill_name = row.try_get::<String, _>("skill_name").unwrap_or_default();
@@ -1315,23 +1202,4 @@ pub async fn cleanup_expired_data(
     });
 
     results
-}
-
-#[cfg(test)]
-mod tests {
-    use super::is_missing_skills_registry_message;
-
-    #[test]
-    fn detects_missing_skills_registry_message() {
-        assert!(is_missing_skills_registry_message(
-            "error returned from database: 1064 (HY000): SQL parser error: table \"skills_registry\" does not exist"
-        ));
-    }
-
-    #[test]
-    fn ignores_unrelated_messages() {
-        assert!(!is_missing_skills_registry_message(
-            "error returned from database: duplicate key value"
-        ));
-    }
 }

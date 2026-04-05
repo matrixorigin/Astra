@@ -67,24 +67,6 @@ pub fn merge_active_skills_into_edge_profile(payload: &mut Value, active_skills:
     }
 }
 
-/// Deprecated: proactive skill injection is retired. Skill activation now goes
-/// through the `skill` tool in the agentic loop. Kept temporarily for backward
-/// compatibility; will be removed after all callers are migrated.
-pub fn merge_skill_instructions_into_edge_profile(payload: &mut Value, instructions: Option<&str>) {
-    let Some(text) = instructions.filter(|s| !s.is_empty()) else {
-        return;
-    };
-    if let Some(root) = payload.as_object_mut()
-        && let Some(ep) = root.get_mut("edge_profile")
-        && let Some(ep_obj) = ep.as_object_mut()
-    {
-        ep_obj.insert(
-            "skill_instructions".to_string(),
-            Value::String(text.to_string()),
-        );
-    }
-}
-
 /// Deduped skill names that affected this `/chat` request: selector-chosen registry skills,
 /// message-detected system skills ([`super::chat_turn_edge_profile::detect_active_system_skills_in_message`]),
 /// and registry skills whose instruction bodies were merged successfully.
@@ -215,27 +197,6 @@ mod tests {
                 .as_object()
                 .unwrap()
                 .get("active_skills")
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn merge_skill_instructions_into_edge_profile_inserts() {
-        let mut p = json!({ "edge_profile": {} });
-        merge_skill_instructions_into_edge_profile(&mut p, Some("do the thing"));
-        assert_eq!(p["edge_profile"]["skill_instructions"], "do the thing");
-    }
-
-    #[test]
-    fn merge_skill_instructions_skips_none_and_empty() {
-        let mut p = json!({ "edge_profile": {} });
-        merge_skill_instructions_into_edge_profile(&mut p, None);
-        merge_skill_instructions_into_edge_profile(&mut p, Some(""));
-        assert!(
-            p["edge_profile"]
-                .as_object()
-                .unwrap()
-                .get("skill_instructions")
                 .is_none()
         );
     }

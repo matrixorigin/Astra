@@ -109,9 +109,6 @@ pub trait MarketplaceStatsService: Send + Sync {
         &self,
         skill_name: String,
     ) -> Result<(), (StatusCode, Json<ErrorResponse>)>;
-
-    /// Ensure the required tables exist.
-    async fn ensure_tables(&self) -> Result<(), (StatusCode, Json<ErrorResponse>)>;
 }
 
 // ── Database implementation ──────────────────────────────────────────────────
@@ -370,48 +367,6 @@ impl MarketplaceStatsService for DatabaseMarketplaceStatsService {
 
         Ok(())
     }
-
-    async fn ensure_tables(&self) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
-        let pool = self.get_pool().await.map_err(internal_error)?;
-
-        query(
-            "CREATE TABLE IF NOT EXISTS skill_marketplace_stats (
-                skill_name          VARCHAR(255) PRIMARY KEY,
-                publisher_id        VARCHAR(255),
-                total_installs      BIGINT DEFAULT 0,
-                active_users_7d     INT DEFAULT 0,
-                avg_quality         FLOAT DEFAULT 0.0,
-                avg_rating          FLOAT DEFAULT 0.0,
-                report_count        INT DEFAULT 0,
-                compatibility_score FLOAT DEFAULT 0.0,
-                trust_tier          VARCHAR(32),
-                last_updated        TIMESTAMP,
-                INDEX idx_ranking (avg_quality, active_users_7d)
-            )",
-        )
-        .execute(&pool)
-        .await
-        .map_err(internal_error)?;
-
-        query(
-            "CREATE TABLE IF NOT EXISTS skill_quality_reports (
-                id                  BIGINT AUTO_INCREMENT PRIMARY KEY,
-                skill_name          VARCHAR(255) NOT NULL,
-                skill_version       VARCHAR(50) NOT NULL,
-                runtime_version     VARCHAR(50) NOT NULL,
-                success_rate        FLOAT,
-                avg_tokens          FLOAT,
-                invocation_count    INT,
-                reported_at         TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                INDEX idx_skill (skill_name, skill_version)
-            )",
-        )
-        .execute(&pool)
-        .await
-        .map_err(internal_error)?;
-
-        Ok(())
-    }
 }
 
 // ── Noop implementation (for tests / offline mode) ───────────────────────────
@@ -455,10 +410,6 @@ impl MarketplaceStatsService for NoopMarketplaceStatsService {
         &self,
         _skill_name: String,
     ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
-        Ok(())
-    }
-
-    async fn ensure_tables(&self) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
         Ok(())
     }
 }
