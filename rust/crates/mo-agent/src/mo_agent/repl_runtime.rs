@@ -599,14 +599,64 @@ mod tests {
     use crate::cli_utils::CredentialsFile;
     use tempfile::tempdir;
 
+    /// `session_journal` paths use `dirs::home_dir()` — isolate `HOME` so tests are parallel-safe
+    /// and do not write under the developer's real `~/.astra/sessions`.
+    struct ScopedHome(Option<std::ffi::OsString>);
+    impl ScopedHome {
+        fn new(tmp: &std::path::Path) -> Self {
+            let old = std::env::var_os("HOME");
+            unsafe {
+                std::env::set_var("HOME", tmp);
+            }
+            Self(old)
+        }
+    }
+    impl Drop for ScopedHome {
+        fn drop(&mut self) {
+            unsafe {
+                match self.0.take() {
+                    Some(v) => std::env::set_var("HOME", v),
+                    None => std::env::remove_var("HOME"),
+                }
+            }
+        }
+    }
+
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<std::ffi::OsString>,
+    }
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &std::path::Path) -> Self {
+            let previous = std::env::var_os(key);
+            unsafe {
+                std::env::set_var(key, value);
+            }
+            Self { key, previous }
+        }
+    }
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match self.previous.take() {
+                    Some(v) => std::env::set_var(self.key, v),
+                    None => std::env::remove_var(self.key),
+                }
+            }
+        }
+    }
+
     #[test]
     fn restore_history_empty_for_unknown_session() {
         let history = restore_history_from_journal("nonexistent-session-xyz-123");
         assert!(history.is_empty());
     }
 
+    #[serial_test::serial]
     #[test]
     fn restore_history_from_journal_roundtrip() {
+        let home = tempdir().unwrap();
+        let _home_guard = ScopedHome::new(home.path());
         let sid = format!("test-restore-{}", uuid::Uuid::new_v4());
         let writer = session_journal::JournalWriter::new(&sid).unwrap();
 
@@ -642,11 +692,13 @@ mod tests {
         assert_eq!(history[0].0, "what is Rust?");
         assert_eq!(history[0].1, "Rust is a systems language.");
         assert_eq!(history[1].0, "show me an example");
-        // No cleanup needed — test sessions are ephemeral and won't affect production
     }
 
+    #[serial_test::serial]
     #[test]
     fn restore_history_skips_non_turn_events() {
+        let home = tempdir().unwrap();
+        let _home_guard = ScopedHome::new(home.path());
         let sid = format!("test-skip-{}", uuid::Uuid::new_v4());
         let writer = session_journal::JournalWriter::new(&sid).unwrap();
 
@@ -682,8 +734,11 @@ mod tests {
         assert_eq!(history[0].0, "hello");
     }
 
+    #[serial_test::serial]
     #[test]
     fn restore_session_state_recovers_turn_tools_and_tokens() {
+        let home = tempdir().unwrap();
+        let _home_guard = ScopedHome::new(home.path());
         let sid = format!("test-state-{}", uuid::Uuid::new_v4());
         let writer = session_journal::JournalWriter::new(&sid).unwrap();
 
@@ -741,8 +796,11 @@ mod tests {
         assert_eq!(restored.history.len(), 2);
     }
 
+    #[serial_test::serial]
     #[test]
     fn restore_session_state_uses_latest_session_segment() {
+        let home = tempdir().unwrap();
+        let _home_guard = ScopedHome::new(home.path());
         let sid = format!("test-segment-{}", uuid::Uuid::new_v4());
         let writer = session_journal::JournalWriter::new(&sid).unwrap();
 
@@ -815,12 +873,13 @@ mod tests {
         assert_eq!(restored.recent_tools, vec!["github_ci_status".to_string()]);
     }
 
+    #[serial_test::serial]
     #[test]
     fn initialize_repl_state_skips_cleanly_ended_session() {
+        let home = tempdir().unwrap();
+        let _home_guard = ScopedHome::new(home.path());
         let creds_dir = tempdir().unwrap();
-        unsafe {
-            std::env::set_var("MO_AGENT_CREDENTIALS_DIR", creds_dir.path());
-        }
+        let _creds_guard = EnvVarGuard::set("MO_AGENT_CREDENTIALS_DIR", creds_dir.path());
 
         let sid = format!("test-ended-init-{}", uuid::Uuid::new_v4());
         let writer = session_journal::JournalWriter::new(&sid).unwrap();
@@ -861,10 +920,6 @@ mod tests {
         assert_eq!(state.session_id, None);
         assert!(state.history.is_empty());
         assert_eq!(state.turn, 0);
-
-        unsafe {
-            std::env::remove_var("MO_AGENT_CREDENTIALS_DIR");
-        }
     }
 
     // ── Session display logic ──────────────────────────────────────────────

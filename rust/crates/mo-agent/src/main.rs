@@ -4898,6 +4898,14 @@ mod tests {
         _dir: tempfile::TempDir,
     }
 
+    impl Drop for CredentialsGuard {
+        fn drop(&mut self) {
+            unsafe {
+                std::env::remove_var("MO_AGENT_CREDENTIALS_DIR");
+            }
+        }
+    }
+
     fn creds_lock() -> MutexGuard<'static, ()> {
         static CREDS_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         CREDS_LOCK
@@ -6497,8 +6505,12 @@ total_tokens_out: 500
         assert!(should_append_cloud_pull_journal(&pull, &[], "post_login"));
     }
 
+    #[serial_test::serial]
     #[test]
     fn should_append_cloud_pull_journal_repl_startup_empty_without_env() {
+        unsafe {
+            std::env::remove_var(super::MO_JOURNAL_CLOUD_EMPTY_ACK);
+        }
         let pull = CloudPullResult {
             tool_health: Vec::new(),
             version: None,
