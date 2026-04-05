@@ -1,4 +1,8 @@
-//! Merge selected skill bodies into one markdown block for `/chat` `edge_profile` (Phase 0).
+//! Merge selected skill bodies into one markdown block for `/chat` `edge_profile`.
+//!
+//! Deprecated: proactive skill injection is retired. Skill activation now goes
+//! through the `skill` tool in the agentic loop. This module is kept temporarily
+//! for backward compatibility and will be removed.
 
 /// One skill from a selection round: load error, empty body, or usable markdown.
 #[derive(Debug, Clone)]

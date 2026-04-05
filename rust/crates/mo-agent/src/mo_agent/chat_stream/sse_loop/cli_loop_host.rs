@@ -20,10 +20,7 @@ use async_trait::async_trait;
 use crossterm::style::Stylize;
 use serde_json::Value;
 
-use crate::{
-    ExplainMode, edge_tools::ToolExecutor, permission_manager::PermissionManager,
-    skill_instructions::SharedSkillRegistry,
-};
+use crate::{ExplainMode, edge_tools::ToolExecutor, permission_manager::PermissionManager};
 
 use super::agentic_loop_turn::{
     ChatTurnSseFetchRequest, PrepareTurnTelemetry, fetch_chat_turn_sse,
@@ -51,7 +48,6 @@ pub(crate) struct CliAgenticLoopHost<'a> {
     pub selector: &'a dyn ToolSelector,
     pub registry: ToolRegistry,
     pub all_schemas: Vec<Value>,
-    pub skill_registry: &'a SharedSkillRegistry,
     pub file_context: Vec<String>,
     pub perm_manager: &'a mut PermissionManager,
     pub valid_tool_names: HashSet<String>,
@@ -79,15 +75,22 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
         // If a skill activation overrode the model, use that; otherwise fall back to host default.
         let effective_model = state.skill_model_override.as_deref().or(self.model);
 
-        // If a skill activation set an allow-list, convert it to deny-list additions.
-        // Every tool NOT in the allow-list (except "skill" itself) gets restricted.
-        if let Some(ref allowed) = state.skill_allowed_tools {
-            for name in &self.valid_tool_names {
-                if !allowed.contains(name) && name != "skill" {
-                    state.restricted_tools.insert(name.clone());
-                }
-            }
-        }
+        // Skill-scoped restrictions: computed fresh each turn from skill_allowed_tools
+        // and applied transiently (removed after the turn) so they don't accumulate
+        // in the permanent restricted_tools set.
+        let skill_scoped_restrictions: HashSet<String> =
+            if let Some(ref allowed) = state.skill_allowed_tools {
+                self.valid_tool_names
+                    .iter()
+                    .filter(|name| !allowed.contains(*name) && *name != "skill")
+                    .cloned()
+                    .collect()
+            } else {
+                HashSet::new()
+            };
+        state
+            .restricted_tools
+            .extend(skill_scoped_restrictions.iter().cloned());
 
         let turn_result = fetch_chat_turn_sse(ChatTurnSseFetchRequest {
             api: self.api,
@@ -113,7 +116,6 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
             turn_guard: &state.turn_guard,
             restricted_tools: &mut state.restricted_tools,
             step_recorder: &mut state.step_recorder,
-            skill_registry: self.skill_registry,
             file_context: &self.file_context,
             assembly_start,
             telem: PrepareTurnTelemetry {
@@ -135,8 +137,15 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
             plan_assemble_line_release: self.plan_assemble_line_release.clone(),
             stream_event_tx: self.stream_event_tx.clone(),
             approval_request_tx: self.approval_request_tx.clone(),
+            skill_resolver: state.skill_resolver.clone(),
         })
         .await?;
+
+        // Remove skill-scoped restrictions so they don't accumulate permanently.
+        // They'll be re-computed fresh on the next turn if skill_allowed_tools is still set.
+        for name in &skill_scoped_restrictions {
+            state.restricted_tools.remove(name);
+        }
 
         Ok(HostTurnResult {
             accum: turn_result.core,
@@ -199,6 +208,7 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
             .and_then(Value::as_str)
             && self.valid_tool_names.insert(name.to_string())
         {
+            self.registry.inject_schema(schema.clone());
             self.all_schemas.push(schema);
         }
     }

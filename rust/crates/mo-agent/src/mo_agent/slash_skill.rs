@@ -14,46 +14,199 @@ pub(super) async fn handle_skill_command(
     // Route based on subcommand
     match sub {
         "" | "list" => {
-            // List skills from API
-            let Some(tok) = token else {
-                eprintln!("{}", "  Not logged in. Use /login.".yellow());
-                return Ok(());
-            };
-            let body = api
-                .get_skills_query_text(tok, &[("limit", "50".into()), ("offset", "0".into())])
-                .await
-                .map_err(map_thin_err)?;
-            let value: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
-            let skills = value
-                .as_array()
-                .cloned()
-                .or_else(|| value.get("skills").and_then(|v| v.as_array()).cloned())
-                .unwrap_or_default();
+            // Show skills from the unified registry (local + bundled + MCP)
+            let registry = &state.unified_skill_registry;
+            let all_manifests = registry.all_manifests();
+
+            // Parse filter flags from sub_arg: free text search and --source=X, --category=X
+            let (search_query, source_filter, category_filter) = parse_list_filters(sub_arg);
+
+            let manifests: Vec<_> = all_manifests
+                .into_iter()
+                .filter(|m| matches_skill_filter(m, &search_query, &source_filter, &category_filter))
+                .collect();
+
+            // Show active filter if any
+            if !sub_arg.is_empty() {
+                eprintln!("\n  {} {}", "Filter:".dim(), sub_arg.yellow());
+            }
+
             eprintln!(
                 "\n{}",
-                format!("{:<30}  {:<10}  {}", "Name", "Version", "Description").bold()
+                format!("{:<28}  {:<10}  {:<8}  {}", "Name", "Version", "Source", "Description").bold()
             );
-            eprintln!("{}", "\u{2500}".repeat(70).dim());
-            for s in &skills {
-                let name = s
-                    .get("skill_name")
-                    .or_else(|| s.get("name"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("?");
-                let version = s
-                    .get("skill_version")
-                    .or_else(|| s.get("version"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("?");
-                let desc = s.get("description").and_then(|v| v.as_str()).unwrap_or("");
-                let desc_s = if desc.len() > 40 {
-                    format!("{}\u{2026}", &desc[..40])
+            eprintln!("{}", "\u{2500}".repeat(78).dim());
+
+            if manifests.is_empty() {
+                if sub_arg.is_empty() {
+                    eprintln!("  {}", "(no skills discovered)".dim());
                 } else {
-                    desc.to_string()
-                };
-                eprintln!("  {:<28}  {:<10}  {}", name.cyan(), version.dim(), desc_s);
+                    eprintln!("  {}", format!("No skills matching '{sub_arg}'").dim());
+                }
+            } else {
+                for m in &manifests {
+                    let source = source_label(&m.source);
+                    let desc = truncate_desc(&m.description, 36);
+                    eprintln!(
+                        "  {:<26}  {:<10}  {:<8}  {}",
+                        m.name.as_str().cyan(),
+                        m.version.to_string().dim(),
+                        source.dim(),
+                        desc
+                    );
+                }
+            }
+            let local_count = manifests.iter().filter(|m| m.source == astra_runtime::skills::SkillSourceKind::Local).count();
+            let bundled_count = manifests.iter().filter(|m| m.source == astra_runtime::skills::SkillSourceKind::Bundled).count();
+            let mcp_count = manifests.iter().filter(|m| m.source == astra_runtime::skills::SkillSourceKind::Mcp).count();
+            let mut parts = vec![format!("{} local", local_count), format!("{} bundled", bundled_count)];
+            if mcp_count > 0 {
+                parts.push(format!("{} mcp", mcp_count));
+            }
+            parts.push(format!("{} total", manifests.len()));
+            eprintln!("\n  {}", parts.join(", "));
+            eprintln!();
+        }
+
+        "search" => {
+            let query = sub_arg.trim();
+            if query.is_empty() {
+                eprintln!("{}", "  Usage: /skill search <query>".yellow());
+                eprintln!("{}", "  Example: /skill search code review".dim());
+                return Ok(());
+            }
+            let registry = &state.unified_skill_registry;
+            let all = registry.all_manifests();
+            let query_lower = query.to_lowercase();
+
+            let mut scored: Vec<_> = all
+                .iter()
+                .filter_map(|m| {
+                    let score = skill_relevance_score(m, &query_lower);
+                    if score > 0 { Some((m, score)) } else { None }
+                })
+                .collect();
+            scored.sort_by(|a, b| b.1.cmp(&a.1));
+
+            eprintln!("\n  {} '{}'", "Search results for".dim(), query.cyan());
+            eprintln!("{}", "\u{2500}".repeat(78).dim());
+
+            if scored.is_empty() {
+                eprintln!("  {}", "No matching skills found.".dim());
+            } else {
+                for (m, score) in scored.iter().take(10) {
+                    let source = source_label(&m.source);
+                    let desc = truncate_desc(&m.description, 50);
+                    let relevance = match score {
+                        s if *s >= 10 => "★★★",
+                        s if *s >= 5 => "★★ ",
+                        _ => "★  ",
+                    };
+                    eprintln!(
+                        "  {} {:<24}  {:<8}  {}",
+                        relevance.yellow(),
+                        m.name.as_str().cyan(),
+                        source.dim(),
+                        desc
+                    );
+                    // Show matched fields
+                    let mut matched = Vec::new();
+                    if m.name.to_lowercase().contains(&query_lower) { matched.push("name"); }
+                    if m.description.to_lowercase().contains(&query_lower) { matched.push("description"); }
+                    if m.tags.iter().any(|t| t.to_lowercase().contains(&query_lower)) { matched.push("tags"); }
+                    if m.triggers.iter().any(|t| t.to_lowercase().contains(&query_lower)) { matched.push("triggers"); }
+                    if m.when_to_use.as_ref().map(|w| w.to_lowercase().contains(&query_lower)).unwrap_or(false) { matched.push("when_to_use"); }
+                    if !matched.is_empty() {
+                        eprintln!("        {}", format!("matched: {}", matched.join(", ")).dim());
+                    }
+                }
+                eprintln!("\n  {} results (showing top 10)", scored.len());
             }
             eprintln!();
+        }
+
+        "info" => {
+            let name = sub_arg.trim();
+            if name.is_empty() {
+                eprintln!("{}", "  Usage: /skill info <name>".yellow());
+                return Ok(());
+            }
+            let registry = &state.unified_skill_registry;
+            match registry.get_manifest(name) {
+                None => {
+                    eprintln!("  {}", format!("✗ Skill '{name}' not found").yellow());
+                    // Suggest similar names
+                    let all = registry.skill_names();
+                    let suggestions: Vec<_> = all
+                        .iter()
+                        .filter(|n| n.contains(name) || name.contains(n.as_str()))
+                        .take(5)
+                        .collect();
+                    if !suggestions.is_empty() {
+                        eprintln!("  {}", format!("Did you mean: {}?", suggestions.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")).dim());
+                    }
+                }
+                Some(m) => {
+                    eprintln!("\n{}", format!("── {} ──", m.name).bold());
+                    eprintln!("  {:<16} {}", "Description:".dim(), m.description);
+                    eprintln!("  {:<16} {}", "Version:".dim(), m.version);
+                    eprintln!("  {:<16} {}", "Source:".dim(), source_label(&m.source));
+                    eprintln!("  {:<16} {}", "Context:".dim(), format!("{:?}", m.execution_context).to_lowercase());
+                    if let Some(ref author) = m.author {
+                        eprintln!("  {:<16} {}", "Author:".dim(), author);
+                    }
+                    if let Some(ref model) = m.model {
+                        eprintln!("  {:<16} {}", "Model:".dim(), model);
+                    }
+                    if let Some(max_tok) = m.max_tokens {
+                        eprintln!("  {:<16} {}", "Max tokens:".dim(), max_tok);
+                    }
+                    if let Some(ref cat) = m.category {
+                        eprintln!("  {:<16} {}", "Category:".dim(), cat);
+                    }
+                    if !m.tags.is_empty() {
+                        eprintln!("  {:<16} {}", "Tags:".dim(), m.tags.join(", "));
+                    }
+                    if !m.triggers.is_empty() {
+                        eprintln!("  {:<16} {}", "Triggers:".dim(), m.triggers.join(", "));
+                    }
+                    if !m.allowed_tools.is_empty() {
+                        eprintln!("  {:<16} {}", "Allowed tools:".dim(), m.allowed_tools.join(", "));
+                    }
+                    if !m.paths.is_empty() {
+                        eprintln!("  {:<16} {}", "Path patterns:".dim(), m.paths.join(", "));
+                    }
+                    if !m.arguments.is_empty() {
+                        eprintln!("  {:<16}", "Arguments:".dim());
+                        for arg in &m.arguments {
+                            let required = if arg.required { " (required)" } else { "" };
+                            eprintln!("    {} {}{}", arg.name.as_str().cyan(), arg.description.as_str().dim(), required.yellow());
+                        }
+                    }
+                    if let Some(ref wtu) = m.when_to_use {
+                        eprintln!("  {:<16} {}", "When to use:".dim(), wtu);
+                    }
+                    if !m.user_invocable {
+                        eprintln!("  {:<16} {}", "Invocable:".dim(), "no (auto-only)".yellow());
+                    }
+
+                    // Show instruction preview if loaded
+                    if let Some(loaded) = registry.get_loaded_skill(name) {
+                        eprintln!("\n  {} ({} tokens)", "Instructions:".dim(), loaded.instruction_tokens);
+                        let preview: String = loaded.instructions.chars().take(500).collect();
+                        for line in preview.lines().take(15) {
+                            eprintln!("    {}", line.dim());
+                        }
+                        if loaded.instructions.len() > 500 {
+                            eprintln!("    {}", "… (truncated)".dim());
+                        }
+                        if let Some(ref dir) = loaded.skill_dir {
+                            eprintln!("\n  {:<16} {}", "Directory:".dim(), dir.display());
+                        }
+                    }
+                    eprintln!();
+                }
+            }
         }
 
         "new" => {
@@ -79,64 +232,51 @@ pub(super) async fn handle_skill_command(
             }
             std::fs::create_dir_all(&skill_dir).map_err(|e| e.to_string())?;
 
-            let skill_py = format!(
-                r#""""{name} skill."""
-from pydantic import BaseModel
+            let skill_md = format!(
+                r#"---
+name: {name}
+description: ""
+version: "0.1.0"
+user_invocable: true
+triggers:
+  - {name}
+allowed_tools: []
+when_to_use: ""
+# model: "claude-sonnet-4-20250514"
+# max_tokens: 8192
+# execution_context: inline
+# paths:
+#   - "src/**/*.rs"
+# hooks:
+#   pre_invoke:
+#     - type: shell
+#       command: "echo starting {name}"
+#   post_invoke:
+#     - type: shell
+#       command: "echo done"
+# arguments:
+#   - name: TARGET
+#     description: "Target file or directory"
+#     required: false
+---
 
-class Input(BaseModel):
-    query: str
+# {name}
 
-class Output(BaseModel):
-    result: str
+Follow these steps:
 
-# side_effect_profile = SideEffectProfile(category=SideEffectCategory.READ)
-# runtime = [RuntimeRequirement.NETWORK]
-
-async def execute(input: Input) -> Output:
-    # TODO: implement your skill logic here
-    return Output(result=f"Hello from {{input.query}}")
+1. Understand the user's request
+2. $ARGUMENTS
+3. Report results
 "#
             );
-            std::fs::write(skill_dir.join("skill.py"), skill_py).map_err(|e| e.to_string())?;
-
-            let test_skill_py = r#"""""Basic local tests for the skill scaffold."""
-import asyncio
-import unittest
-
-from skill import Input, Output, execute
-
-
-class SkillScaffoldTests(unittest.TestCase):
-    def test_execute_returns_output(self) -> None:
-        result = asyncio.run(execute(Input(query="world")))
-        self.assertIsInstance(result, Output)
-        self.assertEqual(result.result, "Hello from world")
-
-
-if __name__ == "__main__":
-    unittest.main()
-"#;
-            std::fs::write(skill_dir.join("test_skill.py"), test_skill_py)
-                .map_err(|e| e.to_string())?;
-
-            let skill_json = serde_json::json!({
-                "name": name,
-                "version": "0.1.0",
-                "description": ""
-            });
-            std::fs::write(
-                skill_dir.join("skill.json"),
-                serde_json::to_string_pretty(&skill_json).unwrap(),
-            )
-            .map_err(|e| e.to_string())?;
+            std::fs::write(skill_dir.join("SKILL.md"), skill_md).map_err(|e| e.to_string())?;
 
             eprintln!(
                 "  {} Skill scaffolded: {}",
                 "\u{2713}".green(),
                 skill_dir.display().to_string().cyan()
             );
-            eprintln!("  Files created: skill.py, test_skill.py, skill.json");
-            eprintln!("  {}", format!("Test: /skill test {name}").dim());
+            eprintln!("  Files created: SKILL.md");
             eprintln!("  {}", format!("Dev mode: /skill dev {name}").dim());
         }
 
@@ -178,24 +318,85 @@ if __name__ == "__main__":
             };
 
             if !api_ok {
-                eprintln!("  Running local skill tests...");
                 let skill_dir = std::env::current_dir()
                     .map_err(|e| e.to_string())?
                     .join(".astra/skills")
                     .join(name);
+                let skill_md = skill_dir.join("SKILL.md");
                 let test_file = skill_dir.join("test_skill.py");
-                if test_file.exists() {
+
+                if skill_md.exists() {
+                    eprintln!("  Validating SKILL.md...");
+                    let src = std::fs::read_to_string(&skill_md).map_err(|e| e.to_string())?;
+                    let mut ok = true;
+                    if !src.starts_with("---") {
+                        eprintln!("  {}", "\u{2717} Missing frontmatter".red());
+                        ok = false;
+                    } else if let Some(end) = src[3..].find("\n---") {
+                        let yaml = &src[3..3 + end];
+                        match serde_yaml::from_str::<serde_json::Value>(yaml) {
+                            Ok(val) => {
+                                let sname = val.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                                if sname.is_empty() {
+                                    eprintln!("  {}", "\u{2717} Frontmatter `name` is empty".red());
+                                    ok = false;
+                                }
+                                eprintln!("  Manifest name: {}", sname.cyan());
+                            }
+                            Err(e) => {
+                                eprintln!("  {}", format!("\u{2717} Invalid YAML: {e}").red());
+                                ok = false;
+                            }
+                        }
+                        let body = &src[3 + end + 4..];
+                        if body.trim().is_empty() {
+                            eprintln!("  {}", "\u{2717} Empty instruction body".red());
+                            ok = false;
+                        } else {
+                            eprintln!("  Instruction body: {} chars", body.len());
+                        }
+                    } else {
+                        eprintln!("  {}", "\u{2717} Unclosed frontmatter".red());
+                        ok = false;
+                    }
+
+                    if let Ok((manifest, _body)) = astra_runtime::skills::loader::parse_skill_md(&src) {
+                        if let Some(ref hooks) = manifest.hooks {
+                            if !hooks.pre_invoke.is_empty() {
+                                eprintln!("  Running pre_invoke hooks...");
+                                for action in &hooks.pre_invoke {
+                                    if let astra_runtime::skills::hooks::HookAction::Shell { command } = action {
+                                        eprintln!("  $ {command}");
+                                        match std::process::Command::new("sh")
+                                            .arg("-c").arg(command)
+                                            .current_dir(&skill_dir)
+                                            .output()
+                                        {
+                                            Ok(o) if o.status.success() => {
+                                                eprintln!("    {}", "\u{2713} ok".green());
+                                            }
+                                            Ok(o) => {
+                                                eprintln!("    {}", format!("\u{2717} exit {}", o.status).red());
+                                                ok = false;
+                                            }
+                                            Err(e) => {
+                                                eprintln!("    {}", format!("\u{2717} {e}").red());
+                                                ok = false;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    if ok {
+                        eprintln!("  {}", "\u{2713} SKILL.md validation passed".green());
+                    }
+                } else if test_file.exists() {
+                    eprintln!("  Running legacy Python tests...");
                     let out = std::process::Command::new("python3")
-                        .args([
-                            "-m",
-                            "unittest",
-                            "discover",
-                            "-s",
-                            ".",
-                            "-p",
-                            "test_*.py",
-                            "-q",
-                        ])
+                        .args(["-m", "unittest", "discover", "-s", ".", "-p", "test_*.py", "-q"])
                         .current_dir(&skill_dir)
                         .output();
                     match out {
@@ -207,26 +408,18 @@ if __name__ == "__main__":
                             } else {
                                 eprintln!("  {}", "\u{2717} Local skill tests failed".red());
                             }
-                            if !stdout.is_empty() {
-                                eprintln!("{stdout}");
-                            }
-                            if !stderr.is_empty() {
-                                eprintln!("{stderr}");
-                            }
+                            if !stdout.is_empty() { eprintln!("{stdout}"); }
+                            if !stderr.is_empty() { eprintln!("{stderr}"); }
                         }
                         Err(e) => {
-                            eprintln!(
-                                "{}",
-                                format!("  \u{2717} Failed to run local skill tests: {e}").red()
-                            );
+                            eprintln!("{}", format!("  \u{2717} Failed to run local tests: {e}").red());
                         }
                     }
                 } else {
                     eprintln!(
-                                "  {}",
-                                "No test file found. Create test_skill.py in the skill directory or re-run /skill new with a fresh name."
-                                    .yellow()
-                            );
+                        "  {}",
+                        "No SKILL.md or test_skill.py found. Use /skill new to scaffold.".yellow()
+                    );
                 }
             }
             eprintln!();
@@ -234,7 +427,6 @@ if __name__ == "__main__":
 
         "dev" => {
             if sub_arg == "off" {
-                // Exit dev mode
                 state.skill_dev_name = None;
                 state.skill_dev_dir = None;
                 state.skill_dev_context = None;
@@ -261,19 +453,25 @@ if __name__ == "__main__":
                 .map_err(|e| e.to_string())?
                 .join(".astra/skills")
                 .join(name);
+            let skill_md_path = skill_dir.join("SKILL.md");
+            // Fall back to legacy skill.py for backward compat
             let skill_py_path = skill_dir.join("skill.py");
-            if !skill_py_path.exists() {
+            let (src_path, src_label) = if skill_md_path.exists() {
+                (skill_md_path, "SKILL.md")
+            } else if skill_py_path.exists() {
+                (skill_py_path, "skill.py (legacy)")
+            } else {
                 eprintln!(
                     "{}",
                     format!(
-                        "  \u{2717} skill.py not found in {}. Use /skill new {name} to scaffold.",
+                        "  \u{2717} SKILL.md not found in {}. Use /skill new {name} to scaffold.",
                         skill_dir.display()
                     )
                     .yellow()
                 );
                 return Ok(());
-            }
-            let skill_src = std::fs::read_to_string(&skill_py_path).map_err(|e| e.to_string())?;
+            };
+            let skill_src = std::fs::read_to_string(&src_path).map_err(|e| e.to_string())?;
             state.skill_dev_name = Some(name.to_string());
             state.skill_dev_dir = Some(skill_dir.display().to_string());
             state.skill_dev_context = Some(skill_src);
@@ -283,6 +481,7 @@ if __name__ == "__main__":
                 name.cyan().bold()
             );
             eprintln!("  {}", format!("Dir: {}", skill_dir.display()).dim());
+            eprintln!("  {}", format!("Source: {src_label}").dim());
             eprintln!(
                 "  {}",
                 "Skill source is injected into each turn. Ask me to improve it.".dim()
@@ -351,7 +550,6 @@ if __name__ == "__main__":
             };
 
             if !api_ok {
-                // Scan local skill directories
                 let skills_base = std::env::current_dir()
                     .map_err(|e| e.to_string())?
                     .join(".astra/skills");
@@ -365,41 +563,36 @@ if __name__ == "__main__":
                 eprintln!(
                     "{}",
                     format!(
-                        "{:<28}  {:<10}  {:<14}  {}",
-                        "Name", "skill.py", "test_skill.py", "skill.json"
+                        "{:<28}  {:<12}  {}",
+                        "Name", "SKILL.md", "Format"
                     )
                     .bold()
                 );
-                eprintln!("{}", "\u{2500}".repeat(78).dim());
+                eprintln!("{}", "\u{2500}".repeat(60).dim());
                 let entries = std::fs::read_dir(&skills_base).map_err(|e| e.to_string())?;
                 let mut found = false;
                 for entry in entries.flatten() {
                     if entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
                         let name = entry.file_name().to_string_lossy().to_string();
-                        let has_py = entry.path().join("skill.py").exists();
-                        let has_test = entry.path().join("test_skill.py").exists();
-                        let has_json = entry.path().join("skill.json").exists();
-                        let py_s = if has_py {
+                        let has_skill_md = entry.path().join("SKILL.md").exists();
+                        let has_legacy = entry.path().join("skill.py").exists();
+                        let md_s = if has_skill_md {
                             "\u{2713}".green().to_string()
                         } else {
                             "\u{2717} missing".red().to_string()
                         };
-                        let test_s = if has_test {
-                            "\u{2713}".green().to_string()
+                        let format_s = if has_skill_md {
+                            "unified"
+                        } else if has_legacy {
+                            "legacy (skill.py)"
                         } else {
-                            "\u{2717} missing".red().to_string()
-                        };
-                        let json_s = if has_json {
-                            "\u{2713}".green().to_string()
-                        } else {
-                            "\u{2717} missing".red().to_string()
+                            "unknown"
                         };
                         eprintln!(
-                            "  {:<26}  {:<10}  {:<14}  {}",
+                            "  {:<26}  {:<12}  {}",
                             name.cyan(),
-                            py_s,
-                            test_s,
-                            json_s
+                            md_s,
+                            format_s.dim()
                         );
                         found = true;
                     }
@@ -421,30 +614,40 @@ if __name__ == "__main__":
                 .map_err(|e| e.to_string())?
                 .join(".astra/skills")
                 .join(name);
-            let skill_py_path = skill_dir.join("skill.py");
-            if !skill_py_path.exists() {
+            let skill_md_path = skill_dir.join("SKILL.md");
+            if !skill_md_path.exists() {
                 eprintln!(
                     "{}",
-                    format!("  \u{2717} skill.py not found in {}", skill_dir.display()).red()
+                    format!("  \u{2717} SKILL.md not found in {}", skill_dir.display()).red()
                 );
                 return Ok(());
             }
-            let src = std::fs::read_to_string(&skill_py_path).map_err(|e| e.to_string())?;
+            let src = std::fs::read_to_string(&skill_md_path).map_err(|e| e.to_string())?;
             let mut issues: Vec<String> = Vec::new();
-            if !src.contains("async def execute") {
-                issues.push("missing `async def execute`".to_string());
+
+            // Validate YAML frontmatter
+            if !src.starts_with("---") {
+                issues.push("missing YAML frontmatter (must start with ---)".to_string());
+            } else if let Some(end) = src[3..].find("\n---") {
+                let yaml_block = &src[3..3 + end];
+                match serde_yaml::from_str::<serde_json::Value>(yaml_block) {
+                    Ok(val) => {
+                        if val.get("name").and_then(|v| v.as_str()).unwrap_or("").is_empty() {
+                            issues.push("frontmatter `name` is missing or empty".to_string());
+                        }
+                    }
+                    Err(e) => {
+                        issues.push(format!("invalid YAML frontmatter: {e}"));
+                    }
+                }
+                let body = &src[3 + end + 4..];
+                if body.trim().is_empty() {
+                    issues.push("instruction body is empty (content after frontmatter)".to_string());
+                }
+            } else {
+                issues.push("unclosed frontmatter (missing closing ---)".to_string());
             }
-            if src.contains("\ndef execute") || src.contains("\r\ndef execute") {
-                issues.push(
-                    "found non-async `def execute` (should be `async def execute`)".to_string(),
-                );
-            }
-            if !src.contains("class Input") {
-                issues.push("missing `Input` class".to_string());
-            }
-            if !src.contains("class Output") {
-                issues.push("missing `Output` class".to_string());
-            }
+
             if issues.is_empty() {
                 eprintln!(
                     "  {} {}",
@@ -469,25 +672,45 @@ if __name__ == "__main__":
                 .map_err(|e| e.to_string())?
                 .join(".astra/skills")
                 .join(name);
+            let skill_md_path = skill_dir.join("SKILL.md");
             let json_path = skill_dir.join("skill.json");
-            if !json_path.exists() {
+            if skill_md_path.exists() {
+                let raw = std::fs::read_to_string(&skill_md_path).map_err(|e| e.to_string())?;
+                if raw.starts_with("---") {
+                    if let Some(end) = raw[3..].find("\n---") {
+                        let yaml_block = &raw[3..3 + end];
+                        eprintln!(
+                            "\n{}",
+                            format!("─── {name}/SKILL.md frontmatter ────────────────────────────").bold()
+                        );
+                        for line in yaml_block.lines() {
+                            eprintln!("  {line}");
+                        }
+                        eprintln!();
+                    } else {
+                        eprintln!("  {}", "Unclosed frontmatter in SKILL.md".yellow());
+                    }
+                } else {
+                    eprintln!("  {}", "SKILL.md has no frontmatter".yellow());
+                }
+            } else if json_path.exists() {
+                let raw = std::fs::read_to_string(&json_path).map_err(|e| e.to_string())?;
+                let value: serde_json::Value = serde_json::from_str(&raw).unwrap_or_default();
+                let pretty = serde_json::to_string_pretty(&value).unwrap_or(raw);
+                eprintln!(
+                    "\n{}",
+                    format!("─── {name}/skill.json (legacy) ─────────────────────────────").bold()
+                );
+                for line in pretty.lines() {
+                    eprintln!("  {line}");
+                }
+                eprintln!();
+            } else {
                 eprintln!(
                     "{}",
-                    format!("  \u{2717} skill.json not found in {}", skill_dir.display()).red()
+                    format!("  \u{2717} No SKILL.md or skill.json found in {}", skill_dir.display()).red()
                 );
-                return Ok(());
             }
-            let raw = std::fs::read_to_string(&json_path).map_err(|e| e.to_string())?;
-            let value: serde_json::Value = serde_json::from_str(&raw).unwrap_or_default();
-            let pretty = serde_json::to_string_pretty(&value).unwrap_or(raw);
-            eprintln!(
-                "\n{}",
-                format!("─── {name}/skill.json ─────────────────────────────────────────").bold()
-            );
-            for line in pretty.lines() {
-                eprintln!("  {line}");
-            }
-            eprintln!();
         }
 
         "system" => {
@@ -562,12 +785,353 @@ if __name__ == "__main__":
             }
         }
 
+        "stats" => {
+            let tracker = &state.skill_quality_tracker;
+            let entries = tracker.all_entries();
+
+            if sub_arg.is_empty() {
+                // Show all tracked skills
+                if entries.is_empty() {
+                    eprintln!("  {}", "No skill execution data yet. Run some skills first.".dim());
+                } else {
+                    eprintln!("\n  {:<24}  {:>6}  {:>6}  {:>6}  {:>7}  {:>5}",
+                        "Skill", "Runs", "Pass", "Fail", "Quality", "Boost");
+                    eprintln!("  {}", "─".repeat(72));
+                    let mut sorted: Vec<_> = entries.iter().collect();
+                    sorted.sort_by(|a, b| b.1.quality_score().partial_cmp(&a.1.quality_score()).unwrap_or(std::cmp::Ordering::Equal));
+                    for (name, entry) in &sorted {
+                        let score = entry.quality_score();
+                        let boost = entry.selection_boost();
+                        let score_color = if score >= 0.7 { format!("{:.0}%", score * 100.0).green().to_string() }
+                            else if score >= 0.4 { format!("{:.0}%", score * 100.0).yellow().to_string() }
+                            else { format!("{:.0}%", score * 100.0).red().to_string() };
+                        eprintln!("  {:<24}  {:>6}  {:>6}  {:>6}  {:>7}  {:>5.2}x",
+                            name, entry.invocations, entry.successes, entry.failures,
+                            score_color, boost);
+                    }
+                    eprintln!();
+                }
+            } else {
+                // Show detailed stats for one skill
+                let name = sub_arg;
+                match tracker.get(name) {
+                    Some(entry) => {
+                        eprintln!("\n  Skill: {}", name.cyan());
+                        eprintln!("  ─────────────────────────");
+                        eprintln!("  Invocations:      {}", entry.invocations);
+                        eprintln!("  Successes:        {}", entry.successes);
+                        eprintln!("  Failures:         {}", entry.failures);
+                        eprintln!("  Partial:          {}", entry.partial);
+                        eprintln!("  Success rate:     {:.0}%", entry.success_rate() * 100.0);
+                        eprintln!("  User satisfaction:{:.0}%", entry.user_satisfaction() * 100.0);
+                        eprintln!("  Quality score:    {:.0}%", entry.quality_score() * 100.0);
+                        eprintln!("  Selection boost:  {:.2}x", entry.selection_boost());
+                        if entry.invocations > 0 {
+                            eprintln!("  Avg tokens:       {:.0}", entry.avg_tokens());
+                            eprintln!("  Avg duration:     {:.0}ms", entry.avg_duration_ms());
+                        }
+                        eprintln!();
+                    }
+                    None => {
+                        eprintln!("  {}", format!("No execution data for skill '{name}'").yellow());
+                    }
+                }
+            }
+        }
+
         _ => {
             eprintln!(
                         "{}",
-                        format!("  Unknown /skill subcommand: '{sub}'. Try /skill, /skill new, /skill test, /skill dev, /skill doctor, /skill validate, /skill config, /skill system").yellow()
+                        format!("  Unknown /skill subcommand: '{sub}'. Try /skill list, /skill info, /skill new, /skill test, /skill dev, /skill doctor, /skill stats").yellow()
                     );
         }
     }
     Ok(())
+}
+
+// ── List filtering helpers ──────────────────────────────────────────────
+
+fn source_label(source: &astra_runtime::skills::SkillSourceKind) -> &'static str {
+    match source {
+        astra_runtime::skills::SkillSourceKind::Local => "local",
+        astra_runtime::skills::SkillSourceKind::Bundled => "bundled",
+        astra_runtime::skills::SkillSourceKind::Mcp => "mcp",
+        _ => "other",
+    }
+}
+
+fn truncate_desc(desc: &str, max: usize) -> String {
+    if desc.len() > max {
+        format!("{}\u{2026}", &desc[..max])
+    } else {
+        desc.to_string()
+    }
+}
+
+/// Parse `/skill list` arguments into (free-text search, source filter, category filter).
+/// Supports: `/skill list review`, `/skill list --source=local`, `/skill list --category=code-review`.
+fn parse_list_filters(arg: &str) -> (Option<String>, Option<String>, Option<String>) {
+    let mut search = Vec::new();
+    let mut source = None;
+    let mut category = None;
+
+    for token in arg.split_whitespace() {
+        if let Some(val) = token.strip_prefix("--source=") {
+            source = Some(val.to_lowercase());
+        } else if let Some(val) = token.strip_prefix("--category=") {
+            category = Some(val.to_lowercase());
+        } else {
+            search.push(token);
+        }
+    }
+
+    let query = if search.is_empty() {
+        None
+    } else {
+        Some(search.join(" ").to_lowercase())
+    };
+    (query, source, category)
+}
+
+/// Check if a skill manifest matches the given filters.
+fn matches_skill_filter(
+    m: &astra_runtime::skills::SkillManifest,
+    search: &Option<String>,
+    source_filter: &Option<String>,
+    category_filter: &Option<String>,
+) -> bool {
+    // Source filter
+    if let Some(src) = source_filter {
+        if source_label(&m.source) != src.as_str() {
+            return false;
+        }
+    }
+
+    // Category filter
+    if let Some(cat) = category_filter {
+        match &m.category {
+            Some(c) if c.to_lowercase() == *cat => {}
+            _ => return false,
+        }
+    }
+
+    // Free-text search: match name, description, tags, or category
+    if let Some(q) = search {
+        let name_match = m.name.to_lowercase().contains(q.as_str());
+        let desc_match = m.description.to_lowercase().contains(q.as_str());
+        let tag_match = m.tags.iter().any(|t| t.to_lowercase().contains(q.as_str()));
+        let cat_match = m
+            .category
+            .as_ref()
+            .map(|c| c.to_lowercase().contains(q.as_str()))
+            .unwrap_or(false);
+        if !(name_match || desc_match || tag_match || cat_match) {
+            return false;
+        }
+    }
+
+    true
+}
+
+/// Score a skill's relevance to a search query.
+/// Higher score = more relevant. Returns 0 if no match.
+fn skill_relevance_score(m: &astra_runtime::skills::SkillManifest, query: &str) -> u32 {
+    let mut score = 0u32;
+    let words: Vec<&str> = query.split_whitespace().collect();
+
+    // Exact name match (highest signal)
+    if m.name.to_lowercase() == query {
+        score += 20;
+    } else if m.name.to_lowercase().contains(query) {
+        score += 10;
+    }
+
+    // Word-level name matching
+    for word in &words {
+        if m.name.to_lowercase().contains(word) {
+            score += 5;
+        }
+    }
+
+    // Description matching
+    let desc_lower = m.description.to_lowercase();
+    if desc_lower.contains(query) {
+        score += 6;
+    } else {
+        for word in &words {
+            if desc_lower.contains(word) {
+                score += 2;
+            }
+        }
+    }
+
+    // Tag matching (high signal — tags are curated)
+    for tag in &m.tags {
+        let tag_lower = tag.to_lowercase();
+        if tag_lower == query {
+            score += 8;
+        } else if tag_lower.contains(query) || words.iter().any(|w| tag_lower.contains(w)) {
+            score += 4;
+        }
+    }
+
+    // Trigger matching
+    for trigger in &m.triggers {
+        let trig_lower = trigger.to_lowercase();
+        if trig_lower.contains(query) || words.iter().any(|w| trig_lower.contains(w)) {
+            score += 3;
+        }
+    }
+
+    // when_to_use matching
+    if let Some(ref wtu) = m.when_to_use {
+        let wtu_lower = wtu.to_lowercase();
+        if wtu_lower.contains(query) {
+            score += 4;
+        } else {
+            for word in &words {
+                if wtu_lower.contains(word) {
+                    score += 1;
+                }
+            }
+        }
+    }
+
+    // Category matching
+    if let Some(ref cat) = m.category {
+        if cat.to_lowercase().contains(query) {
+            score += 5;
+        }
+    }
+
+    score
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_list_filters_empty() {
+        let (q, s, c) = parse_list_filters("");
+        assert!(q.is_none());
+        assert!(s.is_none());
+        assert!(c.is_none());
+    }
+
+    #[test]
+    fn parse_list_filters_text_only() {
+        let (q, s, c) = parse_list_filters("review code");
+        assert_eq!(q.as_deref(), Some("review code"));
+        assert!(s.is_none());
+        assert!(c.is_none());
+    }
+
+    #[test]
+    fn parse_list_filters_flags() {
+        let (q, s, c) = parse_list_filters("--source=local --category=testing");
+        assert!(q.is_none());
+        assert_eq!(s.as_deref(), Some("local"));
+        assert_eq!(c.as_deref(), Some("testing"));
+    }
+
+    #[test]
+    fn parse_list_filters_mixed() {
+        let (q, s, c) = parse_list_filters("debug --source=bundled");
+        assert_eq!(q.as_deref(), Some("debug"));
+        assert_eq!(s.as_deref(), Some("bundled"));
+        assert!(c.is_none());
+    }
+
+    #[test]
+    fn matches_filter_no_filters() {
+        let m = astra_runtime::skills::SkillManifest {
+            name: "test-skill".into(),
+            description: "A test skill".into(),
+            ..Default::default()
+        };
+        assert!(matches_skill_filter(&m, &None, &None, &None));
+    }
+
+    #[test]
+    fn matches_filter_by_name() {
+        let m = astra_runtime::skills::SkillManifest {
+            name: "pr-review".into(),
+            description: "Review pull requests".into(),
+            ..Default::default()
+        };
+        let q = Some("review".to_string());
+        assert!(matches_skill_filter(&m, &q, &None, &None));
+
+        let q2 = Some("deploy".to_string());
+        assert!(!matches_skill_filter(&m, &q2, &None, &None));
+    }
+
+    #[test]
+    fn matches_filter_by_source() {
+        let m = astra_runtime::skills::SkillManifest {
+            name: "debug".into(),
+            source: astra_runtime::skills::SkillSourceKind::Bundled,
+            ..Default::default()
+        };
+        let src = Some("bundled".to_string());
+        assert!(matches_skill_filter(&m, &None, &src, &None));
+
+        let src2 = Some("local".to_string());
+        assert!(!matches_skill_filter(&m, &None, &src2, &None));
+    }
+
+    #[test]
+    fn matches_filter_by_tag() {
+        let m = astra_runtime::skills::SkillManifest {
+            name: "security-scan".into(),
+            tags: vec!["security".into(), "audit".into()],
+            ..Default::default()
+        };
+        let q = Some("audit".to_string());
+        assert!(matches_skill_filter(&m, &q, &None, &None));
+    }
+
+    #[test]
+    fn relevance_score_exact_name_highest() {
+        let m = astra_runtime::skills::SkillManifest {
+            name: "debug".into(),
+            description: "Debug issues".into(),
+            ..Default::default()
+        };
+        let exact = skill_relevance_score(&m, "debug");
+        let partial = skill_relevance_score(&m, "deb");
+        assert!(exact > partial, "exact={exact} should > partial={partial}");
+    }
+
+    #[test]
+    fn relevance_score_zero_for_no_match() {
+        let m = astra_runtime::skills::SkillManifest {
+            name: "debug".into(),
+            description: "Debug issues".into(),
+            ..Default::default()
+        };
+        assert_eq!(skill_relevance_score(&m, "deploy"), 0);
+    }
+
+    #[test]
+    fn relevance_score_tag_match() {
+        let m = astra_runtime::skills::SkillManifest {
+            name: "security-scan".into(),
+            tags: vec!["security".into(), "vulnerability".into()],
+            ..Default::default()
+        };
+        assert!(skill_relevance_score(&m, "vulnerability") > 0);
+    }
+
+    #[test]
+    fn relevance_score_multi_word_query() {
+        let m = astra_runtime::skills::SkillManifest {
+            name: "pr-review".into(),
+            description: "Review pull requests for code quality".into(),
+            ..Default::default()
+        };
+        let score = skill_relevance_score(&m, "code review");
+        assert!(score > 0, "multi-word query should match description");
+    }
 }

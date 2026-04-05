@@ -1,8 +1,10 @@
 # Memory Backend Management — Versioned, Per-User, Experimentable
 
-> **Status**: Draft — pending review
-> **Depends on**: [backend-coexistence.md](backend-coexistence.md), [graph-memory.md](graph-memory.md)
-> **Related**: `core/sandbox/`, `core/git_for_data.py`, `core/evaluation/regression_gate.py`
+> **Status**: Draft — pending review  
+> **Depends on**: [backend-coexistence.md](backend-coexistence.md), [graph-memory.md](graph-memory.md)  
+> **Note**: Code examples use Python-style pseudocode for design illustration.
+> Actual implementation is in Rust — see `rust/crates/services/src/` and `rust/crates/runtime/src/`.  
+> **Related (Rust paths)**: `services/src/memory/`, `services/src/evaluation/`, `runtime/src/sandbox/`
 
 ---
 
@@ -20,19 +22,19 @@
 
 ### What We Have
 
-| Capability | Status | Location |
+| Capability | Status | Location (Rust) |
 |---|---|---|
-| Protocol-based interface (MemoryReader/Writer/Admin) | ✅ | `core/memory/interfaces.py` |
-| Factory with backend selector | ✅ | `core/memory/factory.py` |
+| Trait-based interface (MemoryReader/Writer/Admin) | ✅ | `services/src/memory/` |
+| Factory with backend selector | ✅ | `services/src/memory/` |
 | Two backends (tabular, graph) | ⚠️ | graph depends on tabular (see §1.1) |
-| Config with `memory_backend` field | ✅ | `core/memory/config.py` |
-| Sandbox (zero-copy branch + PITR) | ✅ | `core/sandbox/sandbox.py` |
-| Branch (diff, merge, snapshot) | ✅ | `core/sandbox/branch.py` |
-| Git-for-Data (snapshot, time-travel, restore) | ✅ | `core/git_for_data.py` |
-| Regression gate (golden sessions + sandbox replay) | ✅ | `core/evaluation/regression_gate.py` |
+| Config with `memory_backend` field | ✅ | `runtime/src/config/` |
+| Sandbox (zero-copy branch + PITR) | ✅ | `runtime/src/sandbox/` |
+| Branch (diff, merge, snapshot) | ✅ | `runtime/src/sandbox/` |
+| Git-for-Data (snapshot, time-travel, restore) | ✅ | `services/src/git_for_data.rs` |
+| Regression gate (golden sessions + sandbox replay) | ✅ | `services/src/evaluation/` |
 | Per-user backend binding | ❌ | Not implemented |
-| Memory injection/correction API | ✅ | `core/memory/editor.py`, `core/memory/programmer.py` |
-| Memory experiment (sandbox memory) | ✅ | `core/memory/experiment.py` |
+| Memory injection/correction API | ✅ | `services/src/memory/editor.rs` |
+| Memory experiment (sandbox memory) | ✅ | `services/src/memory/experiment.rs` |
 
 ### 1.1 Current Problem: Graph Is Not Independent
 

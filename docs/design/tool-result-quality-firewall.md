@@ -3,7 +3,7 @@
 > **Status**: Core Design  
 > **Last Updated**: 2026-03-01  
 > **Triggered By**: Session `019ca950` — agent based investment advice on empty data (`technical_indicators={}`, `risk_score=0`, `trend_analysis={}`) without noticing  
-> **Related**: [trust-and-safety.md](trust-and-safety.md) (output verification), [context-window-management.md](context-window-management.md) (context quality), [memory-architecture.md](memory-architecture.md) (tool context engine), [evaluation-and-evolution.md](evaluation-and-evolution.md) (quality scoring)
+> **Related**: [trust-and-safety.md](trust-and-safety.md) (output verification), [context-window-management.md](context-window-management.md) (context quality), [memory/README.md](memory/README.md) (tool context engine), [evaluation-and-evolution.md](evaluation-and-evolution.md) (quality scoring)
 
 ---
 
@@ -936,7 +936,7 @@ quality_event = {
 
 **Concern**: Quality events are emitted per tool call. At high volume (thousands of tool calls/day), storing them in `conversation_events` and running analytics queries could become a performance bottleneck.
 
-**Design**: Quality events follow the existing **event tiering** model (write-path-optimization.md):
+**Design**: Quality events follow the existing **event tiering** model (write-path-optimization-v1-python.md):
 
 | Tier | Storage | Query Pattern | Index |
 |------|---------|---------------|-------|

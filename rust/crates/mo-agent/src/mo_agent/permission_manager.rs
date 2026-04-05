@@ -158,6 +158,11 @@ pub(super) struct PermissionManager {
 }
 
 impl PermissionManager {
+    /// Return the current permission mode (for propagation to sub-runs).
+    pub(super) fn mode(&self) -> PermissionMode {
+        self.mode
+    }
+
     /// Label + stable fingerprint of loaded rules (for `edge_profile` / cloud audit).
     #[allow(dead_code)]
     pub(super) fn edge_audit_summary(&self) -> (String, String) {
@@ -432,7 +437,7 @@ impl PermissionManager {
         (header, detail)
     }
 
-    fn prompt_approval() -> char {
+    pub(crate) fn prompt_approval() -> char {
         use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 
         struct RawModeGuard;
@@ -483,6 +488,9 @@ impl PermissionManager {
         }
     }
 
+    /// Synchronous permission check — blocks on terminal prompt if needed.
+    /// Only used by tests; production code uses [`check_nonblocking()`].
+    #[cfg(test)]
     pub(super) fn check(&mut self, name: &str, args: &serde_json::Value) -> bool {
         // Step 1: Deny rules are bypass-immune (checked first, even with auto_approve).
         if self.check_deny_rules(name, args) {
@@ -729,6 +737,11 @@ impl PermissionManager {
     /// Record a session override from an async approval response.
     pub(super) fn record_approval(&mut self, name: &str, allowed: bool) {
         self.session_overrides.insert(name.to_string(), allowed);
+    }
+
+    /// Whether this manager has a project root (for scope display).
+    pub(crate) fn has_project_root(&self) -> bool {
+        self.project_root.is_some()
     }
 }
 

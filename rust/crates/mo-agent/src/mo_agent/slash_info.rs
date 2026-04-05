@@ -874,7 +874,7 @@ pub(super) async fn handle_info_command(
                 selector: &*selector.0,
                 recent_tools: &state.recent_tools,
                 tool_health_entries: &state.tool_health_entries,
-                skill_registry: crate::skill_instructions::empty_registry(),
+                unified_skill_registry: astra_runtime::skills::default_unified_registry(),
                 plan_only_chat: false,
                 hide_streaming_assistant_text: false,
                 is_plan_subtask: false,
@@ -884,6 +884,8 @@ pub(super) async fn handle_info_command(
                 plan_assemble_line_release: None,
                 stream_event_tx: None,
                 approval_request_tx: None,
+                mcp_manager: Some(state.mcp_manager.clone()),
+                skill_quality_tracker: &mut state.skill_quality_tracker,
             })
             .await
             .map_err(|f| f.error)?;

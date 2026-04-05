@@ -1,7 +1,8 @@
 # Agents and Orchestration
 
 > **Status**: Core Design — single source of truth for agent execution, planning, and multi-agent coordination  
-> **Last Updated**: 2026-02-14
+> **Last Updated**: 2026-07-10  
+> **Note**: Pseudocode examples use Rust-like syntax reflecting the current implementation.
 
 ---
 
@@ -9,10 +10,10 @@
 
 An agent is a **ChatLoop instance with a specific configuration**:
 
-```python
-AgentProfile = {
-    agent_id: str,           # "code_reviewer"
-    system_prompt: str,      # Role-specific instructions
+```rust
+AgentProfile {
+    agent_id: "code_reviewer",
+    system_prompt: /* Role-specific instructions */,
     skill_filter: list[str], # Which skills this agent can use
     model: str,              # Model override (optional)
     can_delegate: bool,      # Can delegate to other agents?
@@ -217,14 +218,14 @@ Agents coordinate through shared events in the database. No hidden channels. No 
 
 ### Delegation as a Skill
 
-```python
-# Delegation is a tool like any other
-delegate_task(
-    target_agent="code_agent",
-    task="Fix the auth bug in login.py",
-    context="CI shows test_auth.py failing with missing DB_HOST",
-    wait_for_result=True
-)
+```rust
+// Delegation is a tool like any other
+delegate_task(DelegateRequest {
+    target_agent: "code_agent",
+    task: "Fix the auth bug in the login module",
+    context: "CI shows auth test failing with missing DB_HOST",
+    wait_for_result: true,
+})
 ```
 
 When the orchestrator's LLM decides to delegate, it calls `delegate_task`. The skill executor:
@@ -243,7 +244,7 @@ Orchestrator → delegate(code_agent, "Review code")     ─┐
              ← collect all results → synthesize
 ```
 
-**Status**: ✅ Implemented — `core/agent/coordination.py`
+**Status**: ✅ Implemented — `rust/crates/runtime/src/turn/delegation.rs`
 
 Fan-in returns structured `AggregatedResult` with:
 - Quality metrics: `success_rate`, `succeeded`/`failed` counts
@@ -330,18 +331,18 @@ This is the direction. Not single-agent with tools, but **teams of specialized a
 
 Teams coordinate through the existing event system — no new tables needed:
 
-```python
-# Lead agent creates tasks as events
-create_event(type="team_task", content="Review auth.py", 
-             metadata={"team_id": "quality_team", "status": "open", "assigned_to": None})
+```rust
+// Lead agent creates tasks as events
+create_event(EventType::TeamTask, "Review auth module",
+    metadata! { "team_id": "quality_team", "status": "open", "assigned_to": null });
 
-# Member agent claims a task by creating a child event
-create_event(type="team_task_claimed", parent_event_id=task_event_id,
-             metadata={"claimed_by": "code_agent"})
+// Member agent claims a task by creating a child event
+create_event(EventType::TeamTaskClaimed, task_event_id,
+    metadata! { "claimed_by": "code_agent" });
 
-# Member completes → result event
-create_event(type="team_task_done", parent_event_id=task_event_id,
-             content="Found 2 issues in auth.py", metadata={"claimed_by": "code_agent"})
+// Member completes → result event
+create_event(EventType::TeamTaskDone, task_event_id,
+    "Found 2 issues in auth module", metadata! { "claimed_by": "code_agent" });
 ```
 
 All task coordination flows through `conversation_events` — same causal chain tracking, same audit trail, same replay capability. No separate task board system needed.
@@ -365,29 +366,29 @@ All task coordination flows through `conversation_events` — same causal chain 
 
 Agents can message each other through events:
 
-```python
-# Agent A sends message to Agent B
-send_message(
-    to_agent="review_agent",
-    content="I've pushed the fix to auth.py, please re-review",
-    causal_chain_id=current_chain
-)
-# → Creates event_type="agent_message" in conversation_events
-# → review_agent picks it up on next context build
+```rust
+// Agent A sends message to Agent B
+send_message(AgentMessage {
+    to_agent: "review_agent",
+    content: "I've pushed the fix to the auth module, please re-review",
+    causal_chain_id: current_chain,
+});
+// → Creates event_type="agent_message" in conversation_events
+// → review_agent picks it up on next context build
 ```
 
 ### Dynamic Team Formation
 
 Not all tasks need pre-defined teams. The lead agent can dynamically recruit:
 
-```python
-# Lead agent decides it needs a specialist
-recruit_agent(
-    role="database_expert",
-    reason="Task requires complex SQL optimization",
-    from_pool="available_agents",
-    selection_criteria="skill_match"
-)
+```rust
+// Lead agent decides it needs a specialist
+recruit_agent(RecruitRequest {
+    role: "database_expert",
+    reason: "Task requires complex SQL optimization",
+    from_pool: "available_agents",
+    selection_criteria: "skill_match",
+});
 ```
 
 The platform selects the best-fit agent based on skill overlap, current load, and historical performance on similar tasks.
@@ -482,16 +483,16 @@ Every vote is an event. The full deliberation is replayable.
 
 ### Configuration
 
-```python
-TeamConfig = {
-    "conflict_resolution": {
-        "default_strategy": "evidence_based",
-        "priority_order": ["security_agent", "code_agent", "perf_agent"],
-        "consensus_required_for": ["production_deploy", "data_migration", "access_change"],
-        "max_resolution_rounds": 3,
-        "escalation_target": "human"  # or "senior_agent"
-    }
-}
+```rust
+let team_config = TeamConfig {
+    conflict_resolution: ConflictResolution {
+        default_strategy: "evidence_based",
+        priority_order: vec!["security_agent", "code_agent", "perf_agent"],
+        consensus_required_for: vec!["production_deploy", "data_migration", "access_change"],
+        max_resolution_rounds: 3,
+        escalation_target: "human",  // or "senior_agent"
+    },
+};
 ```
 
 ### Why This Matters
@@ -556,12 +557,12 @@ The router learns: "for code_review tasks, Sonnet achieves 4.2/5 quality at $0.0
 
 Teams can mix models:
 
-```python
-TeamConfig = {
-    "lead": {"model": "opus", "reason": "coordination requires deep reasoning"},
-    "implementer": {"model": "sonnet", "reason": "code generation, good enough"},
-    "tester": {"model": "haiku", "reason": "test execution, simple tasks"},
-}
+```rust
+let team_config = TeamModelConfig {
+    lead: ModelAssignment { model: "opus", reason: "coordination requires deep reasoning" },
+    implementer: ModelAssignment { model: "sonnet", reason: "code generation, good enough" },
+    tester: ModelAssignment { model: "haiku", reason: "test execution, simple tasks" },
+};
 ```
 
 ---
@@ -625,23 +626,27 @@ Incoming agent tasks
 
 The scheduler doesn't just limit spend — it **converges** toward a budget target:
 
-```python
-@dataclass
-class BudgetPolicy:
-    scope_id: str          # user, team, or account — deployment determines granularity
-    daily_budget: float
-    current_spend: float
-    remaining_hours: float
+```rust
+#[derive(Clone, Debug)]
+pub struct BudgetPolicy {
+    pub scope_id: String,       // user, team, or account — deployment determines granularity
+    pub daily_budget: f64,
+    pub current_spend: f64,
+    pub remaining_hours: f64,
+}
 
-    @property
-    def burn_rate_target(self) -> float:
-        """Target $/hour to stay within budget."""
-        remaining = self.daily_budget - self.current_spend
-        return remaining / max(self.remaining_hours, 1)
+impl BudgetPolicy {
+    /// Target $/hour to stay within budget.
+    pub fn burn_rate_target(&self) -> f64 {
+        let remaining = self.daily_budget - self.current_spend;
+        remaining / self.remaining_hours.max(1.0)
+    }
 
-    def should_downgrade_model(self, estimated_cost: float) -> bool:
-        """Switch to cheaper model if burn rate exceeds target."""
-        return estimated_cost > self.burn_rate_target * 0.5
+    /// Switch to cheaper model if burn rate exceeds target.
+    pub fn should_downgrade_model(&self, estimated_cost: f64) -> bool {
+        estimated_cost > self.burn_rate_target() * 0.5
+    }
+}
 ```
 
 When burn rate exceeds target: automatically downgrade non-critical tasks to cheaper models. When under budget: allow quality upgrades. The system self-balances.
@@ -679,12 +684,13 @@ Not all non-determinism is equal. The framework assigns a **tolerance class** to
 
 Configuration per skill:
 
-```python
-class SkillConsistencyPolicy:
-    tolerance: Literal["strict", "semantic", "relaxed"]
-    verification_model: str | None  # cheaper model for consistency checks; None = skip
-    max_retries: int = 2            # retries on consistency failure
-    reference_output: str | None    # golden output for strict comparison (optional)
+```rust
+pub struct SkillConsistencyPolicy {
+    pub tolerance: ConsistencyTolerance,  // Strict | Semantic | Relaxed
+    pub verification_model: Option<String>, // cheaper model for checks; None = skip
+    pub max_retries: u32,                   // retries on consistency failure (default 2)
+    pub reference_output: Option<String>,   // golden output for strict comparison
+}
 ```
 
 ### Consistency Verification Mechanism

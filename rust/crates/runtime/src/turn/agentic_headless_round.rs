@@ -234,6 +234,27 @@ pub async fn run_agentic_headless_tool_round<E: EdgeToolRoundRow>(
             continue;
         }
 
+        // Enforce restricted_tools: the schema was filtered from the payload,
+        // but if the model generates a call anyway, refuse execution.
+        if restricted_tools.contains(&name) {
+            let err_msg = format!(
+                "Tool '{}' is currently restricted and cannot be executed. \
+                 Use only the tools whose schemas were provided.",
+                name
+            );
+            if !quiet {
+                term.emit_line(
+                    HeadlessStderrStyle::Yellow,
+                    format!("  ⚠ Blocked restricted tool: {name}"),
+                );
+            }
+            let (tool_msg, err_tr) = openai_tool_roundtrip_values(&id, &name, &err_msg);
+            messages.push(tool_msg);
+            tool_results.push(err_tr);
+            tool_call_records.push(journal_record_unknown_tool(name.clone()));
+            continue;
+        }
+
         result_str = hydrate_reflect_placeholder_if_needed(
             api,
             token,

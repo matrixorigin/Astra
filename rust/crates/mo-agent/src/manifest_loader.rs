@@ -3,6 +3,11 @@
 //! Extended manifest format supports `tools:` section alongside existing
 //! tables, settings, secrets, and resources declarations.
 //!
+//! Uses legacy `SkillInstruction`/`SkillMetadata` types pending migration to
+//! `astra_runtime::skills::manifest` types.
+
+#![allow(deprecated)]
+//!
 //! Also supports SKILL.md files for detailed instructions (Claude Code style).
 //!
 #![allow(dead_code)] // Module provides future extensibility APIs
@@ -411,6 +416,28 @@ pub fn load_skills_directory(registry: &mut PluginRegistry) {
             register_manifest_tools(path, registry);
         }
     }
+}
+
+/// Collect all MCP server configs from skill manifests across search paths.
+///
+/// Scans the same directories as [`load_skills_directory`], discovers skill
+/// manifests, and returns their `mcp_servers` entries (deduped by server name).
+pub fn collect_mcp_server_configs() -> Vec<crate::mcp_client::McpServerConfig> {
+    let mut seen = std::collections::HashSet::new();
+    let mut configs = Vec::new();
+    for dir in &crate::skill_instructions::skill_search_paths() {
+        if !dir.is_dir() {
+            continue;
+        }
+        for (_skill_name, manifest) in discover_manifests(dir) {
+            for server in &manifest.mcp_servers {
+                if server.enabled && seen.insert(server.name.clone()) {
+                    configs.push(server.clone());
+                }
+            }
+        }
+    }
+    configs
 }
 
 // ─── Shell Command Execution for Manifest Tools ────────────────────────────
@@ -876,6 +903,7 @@ tools: []
                 assert_eq!(command[0], "npx");
                 assert_eq!(args[0], "/workspace");
             }
+            _ => panic!("expected Stdio transport"),
         }
 
         let gh_server = &skill.mcp_servers()[1];

@@ -11,8 +11,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
-use crate::theme;
-
 use astra_runtime::{
     pipeline::step_recorder::StepRecorder,
     tool_registry::{self, ToolRegistry},
@@ -23,7 +21,6 @@ use astra_runtime::{
         record_first_latency_ms_since, record_first_selector_latency_and_strategy,
     },
     turn::boost_domain_hints::{domain_hints_debug_strings, domain_hints_from_boost_terms},
-    turn::chat_history_openai::merge_skill_names_track,
     turn::chat_turn_api_error::{
         CHAT_TURN_POST_MAX_RETRIES, chat_turn_http_error_with_compact_body,
     },
@@ -35,15 +32,11 @@ use astra_runtime::{
     turn::chat_turn_heuristics::extract_repos_from_memory,
     turn::chat_turn_payload::{
         ChatTurnBasePayloadInput, chat_turn_base_payload, merge_active_skills_into_edge_profile,
-        merge_skill_instructions_into_edge_profile, set_payload_tool_results_if_non_empty,
+        set_payload_tool_results_if_non_empty,
     },
     turn::chat_turn_selection_context::build_agentic_tool_selection_context,
     turn::chat_turn_step_plan::record_agentic_step_plan_after_payload_prep,
     turn::prepare_turn_explain_text::explain_stderr_payload_line_pair,
-    turn::skill_instructions_merge::{
-        merge_skill_instruction_bodies_for_chat, skill_instruction_activated_names_csv,
-        skill_instruction_load_failed_message,
-    },
     turn::tool_schema_prune::pin_invoked_tool_schemas,
     turn::turn_guard::{TurnGuard, merge_deprioritized_tools_into_restricted},
 };
@@ -55,7 +48,6 @@ use crate::{
     cli_utils::compact_or_raw,
     edge_tools::ToolExecutor,
     permission_manager::PermissionManager,
-    skill_instructions::SharedSkillRegistry,
     stream_render::{
         ChatPrepPhaseLabel, ChatTurnPrepLineGuard, EdgeSseContext, TurnResult, consume_turn_sse,
     },
@@ -121,8 +113,6 @@ struct PrepareChatTurnRequest<'a> {
     turn_guard: &'a TurnGuard,
     restricted_tools: &'a mut HashSet<String>,
     step_recorder: &'a mut StepRecorder,
-    skill_registry: &'a SharedSkillRegistry,
-    quiet: bool,
     file_context: &'a [String],
     assembly_start: Instant,
     telem: PrepareTurnTelemetry<'a>,
@@ -219,7 +209,11 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
     let learned_context_hint = learned_context.prompt_fragment();
     let learned_task_type = learned_context.task_archetype_payload_token();
 
-    let mut selected_skills: Vec<String> = Vec::new();
+    // Skill activation is handled exclusively by the `skill` tool in the agentic loop
+    // (see turn/skill_tool.rs + partition_and_execute_skills). The model decides when
+    // to invoke skills by calling the tool, rather than having skills pre-injected by
+    // the selector.
+
     let (turn_schemas, selection_report, selection_confidence) = if ctx.tool_results.is_empty() {
         let sel_start = Instant::now();
         touch_prep_ui_phase(&ctx.prep_ui_phase, "Scanning context…");
@@ -254,7 +248,6 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
             sel_result.selector_tokens_in,
             sel_result.selector_tokens_out,
         );
-        selected_skills = sel_result.selected_skills.clone();
         let conf = sel_result.confidence;
         let (schemas, report) = tool_selector::resolve_schemas_with_pressure(
             ctx.registry,
@@ -288,9 +281,6 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
             sel_result.selector_tokens_in,
             sel_result.selector_tokens_out,
         );
-        if !sel_result.selected_skills.is_empty() {
-            selected_skills = sel_result.selected_skills.clone();
-        }
         let conf = sel_result.confidence;
         let (mut selected, mut report) = tool_selector::resolve_schemas_with_pressure(
             ctx.registry,
@@ -306,18 +296,6 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
         (selected, report, conf)
     };
     log_chat_turn_timing_phase(timing, "tool_selector_resolve_schemas", &mut mark);
-
-    touch_prep_ui_phase(&ctx.prep_ui_phase, "Merging skills…");
-
-    let skill_instructions = load_skill_instructions_text(
-        ctx.skill_registry,
-        &selected_skills,
-        ctx.quiet,
-        ctx.explain.explain_verbose,
-    );
-    merge_skill_names_track(ctx.telem.all_selected_skills, &selected_skills);
-
-    merge_skill_instructions_into_edge_profile(&mut payload, skill_instructions.as_deref());
 
     capture_first_selection_report_if_empty(
         ctx.telem.first_selection_report,
@@ -387,43 +365,8 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
     payload
 }
 
-fn load_skill_instructions_text(
-    skill_registry: &SharedSkillRegistry,
-    selected_skills: &[String],
-    quiet: bool,
-    echo_skill_activation: bool,
-) -> Option<String> {
-    if selected_skills.is_empty() {
-        return None;
-    }
-    let mut reg = skill_registry.try_write().ok()?;
-    let (outcomes, merged, activated_skills) =
-        merge_skill_instruction_bodies_for_chat(selected_skills, |name| {
-            reg.load_instructions(name).map_err(|e| e.to_string())?;
-            Ok(reg
-                .get(name)
-                .and_then(|sk| sk.instruction_text())
-                .map(|t| t.to_string()))
-        });
-    for o in outcomes {
-        if let Err(e) = o.result {
-            eprintln!(
-                "  {} {}",
-                theme::icon_warn(),
-                skill_instruction_load_failed_message(o.skill_name.as_str(), e.as_str())
-            );
-        }
-    }
-    let merged = merged?;
-    if !quiet && echo_skill_activation && !activated_skills.is_empty() {
-        eprintln!(
-            "  {} Using skill: {}",
-            "◆".cyan(),
-            skill_instruction_activated_names_csv(activated_skills.as_slice()).cyan()
-        );
-    }
-    Some(merged)
-}
+// `load_skill_instructions_text` removed — skill activation now goes through
+// the `skill` tool in the agentic loop, not through proactive payload injection.
 
 // ─── Fetch: payload → POST → consume_turn_sse ─────────────────────────────────
 
@@ -452,7 +395,6 @@ pub(crate) struct ChatTurnSseFetchRequest<'a> {
     pub turn_guard: &'a astra_runtime::turn::turn_guard::TurnGuard,
     pub restricted_tools: &'a mut HashSet<String>,
     pub step_recorder: &'a mut StepRecorder,
-    pub skill_registry: &'a SharedSkillRegistry,
     pub file_context: &'a [String],
     pub assembly_start: Instant,
     pub telem: PrepareTurnTelemetry<'a>,
@@ -470,6 +412,8 @@ pub(crate) struct ChatTurnSseFetchRequest<'a> {
     pub stream_event_tx: Option<super::super::StreamEventTx>,
     /// Optional channel for async tool approval requests during plan execution.
     pub approval_request_tx: Option<super::super::ApprovalRequestTx>,
+    /// Skill resolver for intercepting "skill" tool calls.
+    pub skill_resolver: Option<std::sync::Arc<dyn astra_runtime::turn::skill_tool::SkillResolver>>,
 }
 
 /// stderr prep line + timing toggles for [`fetch_chat_turn_sse`].
@@ -574,7 +518,6 @@ pub(crate) async fn fetch_chat_turn_sse(
         turn_guard,
         restricted_tools,
         step_recorder,
-        skill_registry,
         file_context,
         assembly_start,
         telem,
@@ -586,6 +529,7 @@ pub(crate) async fn fetch_chat_turn_sse(
         plan_assemble_line_release,
         stream_event_tx,
         approval_request_tx,
+        skill_resolver,
     } = ctx;
 
     let ui = chat_turn_sse_fetch_ui(
@@ -620,8 +564,6 @@ pub(crate) async fn fetch_chat_turn_sse(
             turn_guard,
             restricted_tools,
             step_recorder,
-            skill_registry,
-            quiet,
             file_context,
             assembly_start,
             telem,
@@ -665,6 +607,7 @@ pub(crate) async fn fetch_chat_turn_sse(
         cancel_token,
         stream_event_tx,
         approval_request_tx,
+        skill_resolver,
     };
 
     let sse_mark = Instant::now();

@@ -2,7 +2,7 @@
 
 > **Status**: Final v3 — production ready  
 > **Created**: 2026-03-06  
-> **Related**: [prompt-lifecycle.md](prompt-lifecycle.md) (ReAct `<think>/<reflect>` protocol), [context-window-management.md](context-window-management.md), [per-agent-model-override.md](per-agent-model-override.md) (agent `model` + `model_constraints`), [intent-driven-memory-loading.md](intent-driven-memory-loading.md) (route-driven L0/L1 adaptive loading)
+> **Related**: [prompt-lifecycle.md](prompt-lifecycle.md) (ReAct `<think>/<reflect>` protocol), [context-window-management.md](context-window-management.md), [per-agent-model-override.md](per-agent-model-override.md) (agent `model` + `model_constraints`), [memory/intent-driven-loading.md](memory/intent-driven-loading.md) (route-driven L0/L1 adaptive loading)
 
 ## Core Insight
 

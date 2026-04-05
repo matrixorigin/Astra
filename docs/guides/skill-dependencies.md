@@ -48,13 +48,15 @@ Old format is auto-converted to `Dependency(name=..., version="*", type=skill)`.
 
 ## Tool Versioning
 
-All EdgeTools have a `version` attribute (default `"1.0.0"`):
+Tools have version information tracked in metadata:
 
-```python
-class GitStatusTool(EdgeTool):
-    name = "git_status"
-    version = "1.2.0"
-    # ...
+```rust
+// rust/crates/runtime/src/tool_registry/tool_catalog.rs
+pub struct ToolMetadata {
+    pub name: &'static str,
+    pub version: &'static str,  // default "1.0.0"
+    // ...
+}
 ```
 
 ## What Gets Validated at Install Time
@@ -162,8 +164,7 @@ SkillManifest.depends_on: list[Dependency]
 ```
 
 Key files:
-- `core/skills/version.py` — Version parsing and constraint matching
-- `core/skills/dependencies.py` — Dependency and DependencyType model
-- `core/skills/resolver.py` — DependencyResolver, cycle/conflict detection
-- `core/skills/loader.py` — SkillManifest with typed depends_on
-- `core/skills/skill_manager.py` — Integration in install()
+- `rust/crates/runtime/src/skills/version.rs` — Version parsing and constraint matching
+- `rust/crates/runtime/src/skills/manifest.rs` — SkillManifest with Dependency type
+- `rust/crates/runtime/src/skills/loader.rs` — SKILL.md frontmatter parsing
+- `rust/crates/runtime/src/skills/registry.rs` — UnifiedSkillRegistry (discovery + resolution)

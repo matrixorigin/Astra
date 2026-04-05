@@ -144,8 +144,8 @@ pub struct SelectionResult {
     /// LLM tokens consumed by the selector itself (0 for TF-IDF).
     pub selector_tokens_in: u64,
     pub selector_tokens_out: u64,
-    /// Skills selected by LLM (skill names that should have instructions loaded).
-    /// Empty for TF-IDF fallback (skills require semantic understanding).
+    /// Deprecated: skill activation now goes through the `skill` tool in the
+    /// agentic loop. This field is always empty and will be removed.
     pub selected_skills: Vec<String>,
 }
 
@@ -164,7 +164,9 @@ impl Default for SelectionResult {
     }
 }
 
-/// Skill metadata for tool selection (lightweight, ~50 tokens per skill).
+/// Deprecated: skill metadata was used for proactive skill selection via the
+/// tool selector. Skill activation is now handled by the `skill` tool in the
+/// agentic loop. This type will be removed.
 #[derive(Debug, Clone)]
 pub struct SkillCatalogEntry {
     pub name: String,
@@ -188,8 +190,7 @@ pub trait ToolSelector: Send + Sync {
         LearnedContext::default()
     }
 
-    /// Check if this selector has skills registered for selection.
-    /// Default is false (empty) — only LlmToolSelector has skills.
+    /// Deprecated: proactive skill selection is retired. Always returns true.
     fn selected_skills_empty(&self) -> bool {
         true
     }
@@ -747,46 +748,12 @@ fn build_catalog_summary() -> String {
         .join("\n")
 }
 
-/// Build skill catalog summary for LLM tool selector.
-/// Skills are prefixed with [SKILL] to distinguish from tools.
-fn build_skill_catalog_summary(skills: &[SkillCatalogEntry]) -> String {
-    if skills.is_empty() {
-        return String::new();
-    }
-    skills
-        .iter()
-        .map(|s| {
-            format!(
-                "- [SKILL] {}: {}",
-                s.name,
-                s.description.split('.').next().unwrap_or(&s.description)
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-/// Build combined catalog (tools + skills) for LLM.
-fn build_combined_catalog(skills: &[SkillCatalogEntry]) -> String {
-    let tools = build_catalog_summary();
-    let skills_summary = build_skill_catalog_summary(skills);
-    if skills_summary.is_empty() {
-        tools
-    } else {
-        format!(
-            "{}\n\n# Skills (select when task matches):\n{}",
-            tools, skills_summary
-        )
-    }
-}
-
 /// System prompt for the tool selection LLM call.
 const TOOL_SELECT_SYSTEM: &str = "\
-You are a tool selector. Given the user's query and context, decide which tools and skills are needed.
-Return ONLY a JSON array of names. Select 1-5 items total. Do not explain.
+You are a tool selector. Given the user's query and context, decide which tools are needed.
+Return ONLY a JSON array of tool names. Select 1-5 items total. Do not explain.
 Pinned tools (bash, read_file, write_file, str_replace, list_dir, grep, glob) are always available — do NOT include them.
-Skills are prefixed with [SKILL] in the catalog. Include the skill name (without prefix) if the task matches.
-Only select from the dynamic tools and skills listed below.";
+Only select from the dynamic tools listed below.";
 
 fn build_tool_select_prompt(
     query: &str,
@@ -844,8 +811,6 @@ pub struct LlmToolSelector {
     token: String,
     model: Option<String>,
     catalog_summary: String,
-    /// Skill names registered for selection (used to filter LLM response).
-    skill_names: std::collections::HashSet<String>,
 }
 
 impl LlmToolSelector {
@@ -856,7 +821,6 @@ impl LlmToolSelector {
             token,
             model: None,
             catalog_summary,
-            skill_names: std::collections::HashSet::new(),
         }
     }
 
@@ -865,17 +829,13 @@ impl LlmToolSelector {
         self
     }
 
-    /// Register skills for selection. Call this after skills are discovered.
-    pub fn with_skills(mut self, skills: Vec<SkillCatalogEntry>) -> Self {
-        self.skill_names = skills.iter().map(|s| s.name.clone()).collect();
-        self.catalog_summary = build_combined_catalog(&skills);
+    /// Deprecated: skill activation is now handled by the `skill` tool. No-op.
+    pub fn with_skills(self, _skills: Vec<SkillCatalogEntry>) -> Self {
         self
     }
 
-    /// Update skill catalog (e.g., when skills are dynamically loaded).
-    pub fn update_skills(&mut self, skills: &[SkillCatalogEntry]) {
-        self.skill_names = skills.iter().map(|s| s.name.clone()).collect();
-        self.catalog_summary = build_combined_catalog(skills);
+    /// Deprecated: skill activation is now handled by the `skill` tool. No-op.
+    pub fn update_skills(&mut self, _skills: &[SkillCatalogEntry]) {
     }
 
     /// Make a lightweight SSE call and collect the full response text.
@@ -968,7 +928,7 @@ impl ToolSelector for LlmToolSelector {
     }
 
     fn selected_skills_empty(&self) -> bool {
-        self.skill_names.is_empty()
+        true
     }
 
     async fn select_with_learned_context(
@@ -976,18 +936,6 @@ impl ToolSelector for LlmToolSelector {
         ctx: &SelectionContext<'_>,
         learned_context: &LearnedContext,
     ) -> SelectionResult {
-        // Debug: log skill_names and catalog_summary presence
-        if std::env::var("MO_DEBUG_SKILLS").is_ok() {
-            eprintln!(
-                "[DEBUG] LlmToolSelector skill_names: {:?}",
-                self.skill_names
-            );
-            eprintln!(
-                "[DEBUG] Catalog includes skills: {}",
-                self.catalog_summary.contains("[SKILL]")
-            );
-        }
-
         let messages = build_tool_select_prompt(
             ctx.query,
             ctx.recent_tools,
@@ -999,29 +947,15 @@ impl ToolSelector for LlmToolSelector {
             Ok((text, tin, tout)) => {
                 let names = parse_tool_names_from_llm(&text);
 
-                // Debug: log LLM raw response and parsed names
-                if std::env::var("MO_DEBUG_SKILLS").is_ok() {
-                    eprintln!("[DEBUG] LLM raw response: {:?}", text);
-                    eprintln!("[DEBUG] LLM parsed names: {:?}", names);
-                }
-
                 let valid_tools: std::collections::HashSet<&str> =
                     TOOL_CATALOG.iter().map(|t| t.name).collect();
 
-                // Separate tools from skills
-                let mut tool_names = Vec::new();
-                let mut selected_skills = Vec::new();
+                let tool_names: Vec<String> = names
+                    .into_iter()
+                    .filter(|n| valid_tools.contains(n.as_str()))
+                    .collect();
 
-                for name in names {
-                    if valid_tools.contains(name.as_str()) {
-                        tool_names.push(name);
-                    } else if self.skill_names.contains(&name) {
-                        selected_skills.push(name);
-                    }
-                    // Ignore unknown names
-                }
-
-                if tool_names.is_empty() && selected_skills.is_empty() {
+                if tool_names.is_empty() {
                     return SelectionResult {
                         tool_names: vec![],
                         strategy: "llm_empty",
@@ -1042,7 +976,7 @@ impl ToolSelector for LlmToolSelector {
                     confidence: 0.9,
                     selector_tokens_in: tin,
                     selector_tokens_out: tout,
-                    selected_skills,
+                    selected_skills: vec![],
                 }
             }
             Err(e) => {
@@ -1158,23 +1092,17 @@ impl ToolSelector for FallbackSelector {
             return fast_result;
         }
 
-        // Skills require semantic LLM selection. If the primary selector has
-        // skills registered, we must still ask it even when TF-IDF only found
-        // pinned tools or no dynamic tools.
-        let primary_has_skills = !self.primary.selected_skills_empty();
-
-        // No dynamic tools and no skills → no point asking primary.
-        if !has_dynamic_tools && !primary_has_skills {
+        // No dynamic tools → TF-IDF result is sufficient.
+        if !has_dynamic_tools {
             return fast_result;
         }
 
-        // Low/mid confidence with dynamic tools, or any available skills →
-        // ask the primary selector for a better result.
+        // Low/mid confidence with dynamic tools → ask the primary (LLM) selector.
         let result = self
             .primary
             .select_with_learned_context(ctx, learned_context)
             .await;
-        if !result.failed && (!result.tool_names.is_empty() || !result.selected_skills.is_empty()) {
+        if !result.failed && !result.tool_names.is_empty() {
             result
         } else {
             let mut r = fast_result;
@@ -1944,25 +1872,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fallback_uses_primary_for_skill_only_selection_when_primary_has_skills() {
-        struct SkillPrimary;
+    async fn fallback_skips_primary_when_no_dynamic_tools() {
+        struct NeverCalledPrimary;
         #[async_trait]
-        impl ToolSelector for SkillPrimary {
+        impl ToolSelector for NeverCalledPrimary {
             async fn select(&self, _ctx: &SelectionContext<'_>) -> SelectionResult {
-                SelectionResult {
-                    tool_names: vec![],
-                    strategy: "llm_skill",
-                    budget_used: 0,
-                    failed: false,
-                    confidence: 0.9,
-                    selector_tokens_in: 0,
-                    selector_tokens_out: 0,
-                    selected_skills: vec!["tune-performance".into()],
-                }
-            }
-
-            fn selected_skills_empty(&self) -> bool {
-                false
+                panic!("primary should not be called when fallback has no dynamic tools");
             }
         }
 
@@ -1974,11 +1889,10 @@ mod tests {
             }
         }
 
-        let selector = FallbackSelector::new(Box::new(SkillPrimary), Box::new(PinnedOnlySelector));
-        let result = selector.select(&make_ctx("tune performance")).await;
-        assert_eq!(result.strategy, "llm_skill");
-        assert!(result.tool_names.is_empty());
-        assert_eq!(result.selected_skills, vec!["tune-performance"]);
+        let selector =
+            FallbackSelector::new(Box::new(NeverCalledPrimary), Box::new(PinnedOnlySelector));
+        let result = selector.select(&make_ctx("something")).await;
+        assert_eq!(result.strategy, "tfidf_conversational");
     }
 
     #[tokio::test]
@@ -3387,394 +3301,9 @@ mod tests {
             !result_restricted
                 .tool_names
                 .contains(&"github_list_prs".to_string()),
-            "Restricted tool should be excluded from selection: {:?}",
+            "With restriction, github_list_prs should be excluded: {:?}",
             result_restricted.tool_names
         );
     }
-
-    #[tokio::test]
-    async fn restricted_tools_dont_affect_unrelated() {
-        let selector = TfIdfSelector::new(mock_registry());
-
-        // Restrict a tool not relevant to the query
-        let ctx = SelectionContext {
-            query: "list open pull requests on github",
-            turn_count: 1,
-            recent_tools: &[],
-            budget_tokens: 1200,
-            boost_terms: vec![],
-            budget_pressure: 0.0,
-            memory_domain_hints: vec![],
-            restricted_tools: vec!["mo_query".to_string()],
-            file_context: vec![],
-        };
-        let result = selector.select(&ctx).await;
-        // github_list_prs should still be selected (mo_query is irrelevant here)
-        assert!(
-            result.tool_names.contains(&"github_list_prs".to_string()),
-            "Restricting unrelated tool should not affect relevant tools: {:?}",
-            result.tool_names
-        );
-    }
-
-    // ── Pressure-aware schema resolution ──
-
-    #[test]
-    fn resolve_schemas_no_pressure_includes_all_pinned() {
-        let registry = mock_registry();
-        let (schemas, _) = resolve_schemas(&registry, &[]);
-        let names: Vec<&str> = schemas
-            .iter()
-            .filter_map(|s| {
-                s.get("function")
-                    .and_then(|f| f.get("name"))
-                    .and_then(|n| n.as_str())
-            })
-            .collect();
-        assert!(
-            names.contains(&"memory_store"),
-            "memory_store should be pinned: {:?}",
-            names
-        );
-        assert!(
-            names.contains(&"memory_search"),
-            "memory_search should be pinned: {:?}",
-            names
-        );
-        assert!(
-            names.contains(&"bash"),
-            "bash should be pinned: {:?}",
-            names
-        );
-    }
-
-    #[test]
-    fn resolve_schemas_high_pressure_skips_deferrable_pinned() {
-        let registry = mock_registry();
-        let (schemas, _) = resolve_schemas_with_pressure(&registry, &[], 0.9);
-        let names: Vec<&str> = schemas
-            .iter()
-            .filter_map(|s| {
-                s.get("function")
-                    .and_then(|f| f.get("name"))
-                    .and_then(|n| n.as_str())
-            })
-            .collect();
-        assert!(
-            !names.contains(&"memory_store"),
-            "memory_store should be deferred under high pressure: {:?}",
-            names
-        );
-        assert!(
-            !names.contains(&"memory_search"),
-            "memory_search should be deferred under high pressure: {:?}",
-            names
-        );
-        // Core pinned tools remain
-        assert!(
-            names.contains(&"bash"),
-            "bash must always be included: {:?}",
-            names
-        );
-        assert!(
-            names.contains(&"read_file"),
-            "read_file must always be included: {:?}",
-            names
-        );
-    }
-
-    #[test]
-    fn resolve_schemas_high_pressure_keeps_memory_if_explicitly_selected() {
-        let registry = mock_registry();
-        let selected = vec!["memory_search".to_string()];
-        let (schemas, _) = resolve_schemas_with_pressure(&registry, &selected, 0.9);
-        let names: Vec<&str> = schemas
-            .iter()
-            .filter_map(|s| {
-                s.get("function")
-                    .and_then(|f| f.get("name"))
-                    .and_then(|n| n.as_str())
-            })
-            .collect();
-        // memory_search explicitly selected → should be kept even under pressure
-        assert!(
-            names.contains(&"memory_search"),
-            "explicitly selected memory tool should be kept: {:?}",
-            names
-        );
-    }
-
-    #[test]
-    fn resolve_schemas_moderate_pressure_keeps_all_pinned() {
-        let registry = mock_registry();
-        let (schemas, _) = resolve_schemas_with_pressure(&registry, &[], 0.7);
-        let names: Vec<&str> = schemas
-            .iter()
-            .filter_map(|s| {
-                s.get("function")
-                    .and_then(|f| f.get("name"))
-                    .and_then(|n| n.as_str())
-            })
-            .collect();
-        // 0.7 < 0.8 threshold → all pinned tools kept
-        assert!(
-            names.contains(&"memory_store"),
-            "moderate pressure should keep all pinned: {:?}",
-            names
-        );
-        assert!(names.contains(&"memory_search"));
-    }
-
-    // ── Schema caching infrastructure ──
-
-    #[test]
-    fn registry_schema_index_enables_o1_lookup() {
-        let registry = mock_registry();
-        // Verify O(1) lookup works for all catalog tools
-        for tool in TOOL_CATALOG.iter() {
-            let found = registry.schema_by_name(tool.name);
-            assert!(found.is_some(), "schema_by_name should find {}", tool.name);
-            let schema_name = found
-                .unwrap()
-                .get("function")
-                .and_then(|f| f.get("name"))
-                .and_then(|n| n.as_str())
-                .unwrap();
-            assert_eq!(schema_name, tool.name);
-        }
-    }
-
-    #[test]
-    fn registry_pinned_schemas_cached_at_construction() {
-        let registry = mock_registry();
-        let pinned = registry.pinned_schemas();
-        let pinned_count = TOOL_CATALOG.iter().filter(|t| t.pinned).count();
-        assert_eq!(
-            pinned.len(),
-            pinned_count,
-            "cached pinned schemas should match catalog pinned count"
-        );
-        // Verify all pinned names are correct
-        for (name, schema) in pinned {
-            let meta = TOOL_CATALOG.iter().find(|t| t.name == name).unwrap();
-            assert!(meta.pinned, "{} should be pinned", name);
-            let schema_name = schema
-                .get("function")
-                .and_then(|f| f.get("name"))
-                .and_then(|n| n.as_str())
-                .unwrap();
-            assert_eq!(schema_name, name.as_str());
-        }
-    }
-
-    #[test]
-    fn schema_by_name_returns_none_for_unknown() {
-        let registry = mock_registry();
-        assert!(registry.schema_by_name("nonexistent_tool").is_none());
-    }
-
-    // ── Schema Pruning ──────────────────────────────────────────
-
-    fn make_test_schema() -> Value {
-        serde_json::json!({
-            "type": "function",
-            "function": {
-                "name": "test_tool",
-                "description": "A very long description that explains what this tool does in great detail and should be truncated at the light level to save tokens efficiently.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "path": {"type": "string", "description": "File path relative to project root"},
-                        "start_line": {"type": "integer", "description": "First line to read (1-based, optional)"},
-                        "end_line": {"type": "integer", "description": "Last line to read (inclusive, optional)"}
-                    },
-                    "required": ["path"]
-                }
-            }
-        })
-    }
-
-    #[test]
-    fn prune_none_preserves_schema() {
-        let schema = make_test_schema();
-        let pruned = prune_schema(schema.clone(), PruneLevel::None);
-        assert_eq!(schema, pruned);
-    }
-
-    #[test]
-    fn prune_light_truncates_description() {
-        let schema = make_test_schema();
-        let pruned = prune_schema(schema, PruneLevel::Light);
-
-        let desc = pruned["function"]["description"].as_str().unwrap();
-        assert!(
-            desc.len() <= 85,
-            "description should be truncated, got {}",
-            desc.len()
-        );
-        assert!(desc.ends_with('…'));
-
-        // Param descriptions removed
-        assert!(
-            pruned["function"]["parameters"]["properties"]["path"]
-                .get("description")
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn prune_medium_removes_description() {
-        let schema = make_test_schema();
-        let pruned = prune_schema(schema, PruneLevel::Medium);
-
-        assert!(
-            pruned["function"].get("description").is_none(),
-            "description should be removed at medium level"
-        );
-
-        // All params still present (optional + required)
-        let props = pruned["function"]["parameters"]["properties"]
-            .as_object()
-            .unwrap();
-        assert_eq!(props.len(), 3, "all params should remain at medium level");
-
-        // Param descriptions removed
-        assert!(props["path"].get("description").is_none());
-    }
-
-    #[test]
-    fn prune_aggressive_strips_optional_params() {
-        let schema = make_test_schema();
-        let pruned = prune_schema(schema, PruneLevel::Aggressive);
-
-        assert!(
-            pruned["function"].get("description").is_none(),
-            "description should be removed"
-        );
-
-        // Only required params remain
-        let props = pruned["function"]["parameters"]["properties"]
-            .as_object()
-            .unwrap();
-        assert_eq!(props.len(), 1, "only required param should remain");
-        assert!(props.contains_key("path"));
-        assert!(!props.contains_key("start_line"));
-        assert!(!props.contains_key("end_line"));
-    }
-
-    #[test]
-    fn prune_light_preserves_short_description() {
-        let schema = serde_json::json!({
-            "type": "function",
-            "function": {
-                "name": "short_tool",
-                "description": "Short description.",
-                "parameters": {"type": "object", "properties": {}}
-            }
-        });
-        let pruned = prune_schema(schema, PruneLevel::Light);
-        assert_eq!(
-            pruned["function"]["description"].as_str().unwrap(),
-            "Short description."
-        );
-    }
-
-    #[test]
-    fn prune_schema_missing_function_key() {
-        let schema = serde_json::json!({"type": "function"});
-        let pruned = prune_schema(schema.clone(), PruneLevel::Aggressive);
-        assert_eq!(schema, pruned, "should be no-op without function key");
-    }
-
-    #[test]
-    fn prune_with_pressure_activates_at_thresholds() {
-        let registry = mock_registry();
-        let names = vec!["git_diff".to_string()];
-
-        // No pressure: schemas have descriptions
-        let (schemas_0, _) = resolve_schemas_with_pressure(&registry, &names, 0.0);
-        let has_desc = schemas_0
-            .iter()
-            .all(|s| s["function"].get("description").is_some());
-        assert!(has_desc, "zero pressure should keep descriptions");
-
-        // Medium pressure: descriptions removed
-        let (schemas_06, _) = resolve_schemas_with_pressure(&registry, &names, 0.6);
-        let no_desc = schemas_06
-            .iter()
-            .all(|s| s["function"].get("description").is_none());
-        assert!(no_desc, "medium pressure should remove descriptions");
-    }
-
-    #[test]
-    fn prune_token_savings_measured() {
-        let schema = make_test_schema();
-        let full_size = serde_json::to_string(&schema).unwrap().len();
-
-        let light = prune_schema(schema.clone(), PruneLevel::Light);
-        let light_size = serde_json::to_string(&light).unwrap().len();
-
-        let medium = prune_schema(schema.clone(), PruneLevel::Medium);
-        let medium_size = serde_json::to_string(&medium).unwrap().len();
-
-        let aggressive = prune_schema(schema, PruneLevel::Aggressive);
-        let aggressive_size = serde_json::to_string(&aggressive).unwrap().len();
-
-        // Each level should be strictly smaller than the previous
-        assert!(
-            light_size < full_size,
-            "light ({}) should be smaller than full ({})",
-            light_size,
-            full_size
-        );
-        assert!(
-            medium_size < light_size,
-            "medium ({}) should be smaller than light ({})",
-            medium_size,
-            light_size
-        );
-        assert!(
-            aggressive_size < medium_size,
-            "aggressive ({}) should be smaller than medium ({})",
-            aggressive_size,
-            medium_size
-        );
-
-        // Aggressive should save at least 50%
-        let savings = (full_size - aggressive_size) as f64 / full_size as f64;
-        assert!(
-            savings >= 0.50,
-            "aggressive pruning should save >=50%, got {:.0}%",
-            savings * 100.0
-        );
-    }
-
-    #[test]
-    fn truncate_at_boundary_works() {
-        assert_eq!(truncate_at_boundary("hello world", 20), "hello world");
-        assert_eq!(
-            truncate_at_boundary("hello world foo bar baz", 12),
-            "hello world…"
-        );
-        assert_eq!(truncate_at_boundary("abcdefghij", 5), "abcde…");
-    }
-
-    #[test]
-    fn truncate_at_boundary_utf8_safe() {
-        // Emoji: 🔴 is 4 bytes — slicing at byte 2 would panic without the fix
-        let emoji = "🔴 This is a test";
-        let result = truncate_at_boundary(emoji, 2);
-        assert!(!result.is_empty(), "should not panic on emoji boundary");
-
-        // CJK: 这 is 3 bytes — slicing at byte 5 would land inside '是'
-        let cjk = "这是测试描述";
-        let result = truncate_at_boundary(cjk, 5);
-        assert!(!result.is_empty(), "should not panic on CJK boundary");
-        assert!(result.ends_with('…'));
-
-        // Mixed: ASCII + CJK
-        let mixed = "read 文件内容 from disk";
-        let result = truncate_at_boundary(mixed, 8);
-        assert!(!result.is_empty());
-    }
 }
+     

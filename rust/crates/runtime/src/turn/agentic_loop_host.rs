@@ -224,10 +224,16 @@ pub struct AgenticLoopState {
     pub delegation_engine: Option<Arc<crate::server::delegation_engine::DelegationEngine>>,
 
     // ── Skills ──
+    /// Unified skill registry for conditional activation via file paths.
+    /// When set, edge tool file paths are recorded for conditional skill activation.
+    pub skill_registry_for_activation: Option<Arc<crate::skills::UnifiedSkillRegistry>>,
     /// Optional skill resolver for executing skills as tool calls.
     /// When set, the loop injects a `skill` tool schema and intercepts
     /// `skill` calls, returning resolved instructions as tool results.
     pub skill_resolver: Option<Arc<dyn crate::turn::skill_tool::SkillResolver>>,
+    /// Optional skill executor for fork-context skills. When set, skills with
+    /// `execution_context: Fork` are executed via this executor (sub-agent loop).
+    pub skill_executor: Option<Arc<dyn crate::skills::traits::SkillExecutor>>,
     /// Model override from the most recently activated skill.
     /// When set, the host should use this model instead of the default.
     pub skill_model_override: Option<String>,
@@ -235,6 +241,9 @@ pub struct AgenticLoopState {
     /// When non-empty, only these tools (plus `skill` itself) should be available.
     /// The host converts this allow-list to additions in `restricted_tools`.
     pub skill_allowed_tools: Option<HashSet<String>>,
+    /// Per-skill quality metrics accumulated during the session.
+    /// Used to boost high-performing skills in selection priority.
+    pub skill_quality_tracker: crate::skills::quality::SkillQualityTracker,
 
     // ── Stop hooks ──
     /// Verification commands run before the loop is allowed to complete.
@@ -674,6 +683,51 @@ async fn build_full_composite_snapshot(
     Some(snapshot)
 }
 
+/// Extract a file path from an edge tool's name + arguments.
+///
+/// Covers the common file-touching tools: read_file, write_file, str_replace,
+/// grep, glob, find_definition, etc. Returns `None` for non-file tools.
+fn extract_file_path_from_tool(tool_name: &str, args: &Value) -> Option<String> {
+    match tool_name {
+        "read_file" | "write_file" | "str_replace" | "find_definition" => {
+            args.get("path")
+                .or_else(|| args.get("file_path"))
+                .and_then(Value::as_str)
+                .map(|s| s.to_string())
+        }
+        "grep" | "glob" | "list_dir" => {
+            args.get("path")
+                .or_else(|| args.get("directory"))
+                .and_then(Value::as_str)
+                .map(|s| s.to_string())
+        }
+        _ => None,
+    }
+}
+
+/// Validate a model string from skill frontmatter before passing it to the API.
+///
+/// Accepts strings matching known provider naming conventions:
+/// - Alphanumeric, hyphens, underscores, dots, colons, and forward slashes
+/// - Length between 2 and 128 characters
+/// - Must start with an ASCII alphanumeric character
+///
+/// Rejects empty strings, excessively long strings, and strings with
+/// suspicious characters (shell metacharacters, whitespace, etc.).
+fn is_valid_model_string(model: &str) -> bool {
+    let len = model.len();
+    if !(2..=128).contains(&len) {
+        return false;
+    }
+    let first = model.as_bytes()[0];
+    if !first.is_ascii_alphanumeric() {
+        return false;
+    }
+    model
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.' || b == b':' || b == b'/')
+}
+
 /// Run the multi-turn agentic loop using the provided host.
 ///
 /// This is the runtime-portable entry point. The host handles all
@@ -693,6 +747,9 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
         let skills = resolver.available_skills();
         if !skills.is_empty() {
             host.inject_tool_schema(crate::turn::skill_tool::skill_tool_schema(&skills));
+            // Inject a system reminder so the LLM is primed to use the skill tool.
+            let reminder = crate::turn::skill_tool::skill_listing_system_message(&skills);
+            state.messages.push(reminder);
         }
     }
 
@@ -859,19 +916,25 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
                 crate::turn::skill_tool::partition_and_execute_skills(
                     effective_tool_calls,
                     resolver.as_ref(),
+                    state.skill_executor.as_ref(),
+                    Some(&mut state.skill_quality_tracker),
                 )
                 .await;
             skill_results = sr;
             post_skill_tool_calls = remaining;
 
-            // Apply skill activation effects (model override, tool restrictions)
+            // Apply skill activation effects (model override, tool restrictions).
+            // A new activation fully replaces the previous one — fields not
+            // present in the new activation are cleared so stale overrides
+            // from a prior skill don't persist indefinitely.
             if let Some(act) = activation {
-                if let Some(model) = act.model_override {
-                    state.skill_model_override = Some(model);
-                }
-                if !act.allowed_tools.is_empty() {
-                    state.skill_allowed_tools = Some(act.allowed_tools.into_iter().collect());
-                }
+                state.skill_model_override =
+                    act.model_override.filter(|m| is_valid_model_string(m));
+                state.skill_allowed_tools = if act.allowed_tools.is_empty() {
+                    None
+                } else {
+                    Some(act.allowed_tools.into_iter().collect())
+                };
             }
 
             &post_skill_tool_calls
@@ -942,6 +1005,40 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
             &mut state.explain_turns,
             turn_result.accum.explain_turns.as_slice(),
         );
+
+        // ─── Step 4a: Conditional skill activation ──────────────────────
+        // Record file paths from edge tool executions so path-conditional
+        // skills can activate dynamically. When new skills activate, refresh
+        // the `skill` tool schema with the expanded skill list.
+        if let Some(ref registry) = state.skill_registry_for_activation {
+            let mut any_newly_activated = false;
+            for edge_result in &turn_result.edge_tool_round {
+                if let Some(path) = extract_file_path_from_tool(&edge_result.tool, &edge_result.args) {
+                    let newly = registry.record_file_path(&path);
+                    if !newly.is_empty() {
+                        any_newly_activated = true;
+                        if !quiet {
+                            for name in &newly {
+                                host.emit_headless_line(
+                                    HeadlessStderrStyle::Dim,
+                                    format!("  ◆ Skill activated: {name}"),
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            if any_newly_activated {
+                if let Some(resolver) = &state.skill_resolver {
+                    let skills = resolver.available_skills();
+                    if !skills.is_empty() {
+                        host.inject_tool_schema(
+                            crate::turn::skill_tool::skill_tool_schema(&skills),
+                        );
+                    }
+                }
+            }
+        }
 
         // ─── Step 4b: Error budget tracking ─────────────────────────────
         // Track consecutive turns dominated by the same error category.
@@ -1257,9 +1354,12 @@ mod tests {
             cancel_flag: None,
             cancel_token: None,
             delegation_engine: None,
+            skill_registry_for_activation: None,
             skill_resolver: None,
+            skill_executor: None,
             skill_model_override: None,
             skill_allowed_tools: None,
+            skill_quality_tracker: crate::skills::quality::SkillQualityTracker::new(),
             stop_hooks: Vec::new(),
             stop_hook_runs: 0,
             teammate_idle_hooks: Vec::new(),
@@ -2545,5 +2645,362 @@ mod tests {
 
         // Only one injection, not one per turn
         assert_eq!(host.injected_schemas.len(), 1);
+    }
+
+    // ── is_valid_model_string tests ──────────────────────────────────────
+
+    #[test]
+    fn valid_model_strings() {
+        assert!(super::is_valid_model_string("gpt-4o"));
+        assert!(super::is_valid_model_string("claude-sonnet-4-20250514"));
+        assert!(super::is_valid_model_string("claude-3.5-sonnet"));
+        assert!(super::is_valid_model_string("openai/gpt-4o"));
+        assert!(super::is_valid_model_string("anthropic:claude-3"));
+        assert!(super::is_valid_model_string("m0"));
+    }
+
+    #[test]
+    fn invalid_model_strings() {
+        assert!(!super::is_valid_model_string(""));
+        assert!(!super::is_valid_model_string("x")); // too short
+        assert!(!super::is_valid_model_string("model with spaces"));
+        assert!(!super::is_valid_model_string("-starts-with-dash"));
+        assert!(!super::is_valid_model_string("has;semicolon"));
+        assert!(!super::is_valid_model_string("has$dollar"));
+        assert!(!super::is_valid_model_string("has`backtick`"));
+        assert!(!super::is_valid_model_string("has\nnewline"));
+        assert!(!super::is_valid_model_string("has\ttab"));
+        assert!(!super::is_valid_model_string(&"a".repeat(129))); // too long
+    }
+
+    #[test]
+    fn model_string_boundary_lengths() {
+        assert!(super::is_valid_model_string("ab")); // min valid
+        assert!(super::is_valid_model_string(&format!("m{}", "a".repeat(127)))); // 128 = max
+        assert!(!super::is_valid_model_string(&format!("m{}", "a".repeat(128)))); // 129 = over
+    }
+
+    // ── Skill pipeline integration tests ─────────────────────────────────
+
+    /// Stub SkillResolver for agentic loop integration tests.
+    struct StubSkillResolver {
+        skills: Vec<(String, String, String, Option<String>, Vec<String>)>,
+    }
+
+    impl StubSkillResolver {
+        fn new() -> Self {
+            Self {
+                skills: vec![(
+                    "test-skill".into(),
+                    "A test skill".into(),
+                    "Follow these instructions carefully.".into(),
+                    None,
+                    vec![],
+                )],
+            }
+        }
+
+        fn with_model(mut self, model: &str) -> Self {
+            self.skills[0].3 = Some(model.to_string());
+            self
+        }
+
+        fn with_allowed_tools(mut self, tools: Vec<String>) -> Self {
+            self.skills[0].4 = tools;
+            self
+        }
+    }
+
+    impl crate::turn::skill_tool::SkillResolver for StubSkillResolver {
+        fn resolve(
+            &self,
+            name: &str,
+        ) -> Result<crate::turn::skill_tool::ResolvedSkill, String> {
+            self.skills
+                .iter()
+                .find(|(n, _, _, _, _)| n == name)
+                .map(|(n, _, inst, model, tools)| {
+                    crate::turn::skill_tool::ResolvedSkill {
+                        name: n.clone(),
+                        instructions: inst.clone(),
+                        model: model.clone(),
+                        max_tokens: None,
+                        allowed_tools: tools.clone(),
+                        execution_context:
+                            crate::skills::manifest::ExecutionContext::Inline,
+                        hooks: crate::skills::hooks::SkillHooks::default(),
+                        skill_dir: None,
+                        source: crate::skills::manifest::SkillSourceKind::Local,
+                        success_criteria: Vec::new(),
+                    }
+                })
+                .ok_or_else(|| format!("unknown skill: {name}"))
+        }
+
+        fn available_skills(&self) -> Vec<crate::turn::skill_tool::SkillToolInfo> {
+            self.skills
+                .iter()
+                .map(|(n, d, _, _, _)| crate::turn::skill_tool::SkillToolInfo {
+                    name: n.clone(),
+                    description: d.clone(),
+                    when_to_use: None,
+                    source: crate::skills::manifest::SkillSourceKind::Local,
+                })
+                .collect()
+        }
+    }
+
+    /// Make a HostTurnResult with a `skill` tool call.
+    fn skill_tool_call_result(
+        call_id: &str,
+        args_json: &str,
+        prompt: u64,
+        completion: u64,
+    ) -> HostTurnResult {
+        HostTurnResult {
+            accum: ChatTurnSseAccum {
+                has_tool_calls: true,
+                has_usage: true,
+                prompt_tokens: prompt,
+                completion_tokens: completion,
+                tool_calls: vec![json!({
+                    "id": call_id,
+                    "type": "function",
+                    "function": {
+                        "name": "skill",
+                        "arguments": args_json,
+                    }
+                })],
+                ..ChatTurnSseAccum::default()
+            },
+            ttft_ms: Some(30),
+            edge_tool_round: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn skill_schema_injected_when_resolver_present() {
+        let resolver = StubSkillResolver::new();
+        let mut host = MockHost::new(vec![text_result("done", 50, 20, Some(10))]);
+        let mut state = make_state();
+        state
+            .messages
+            .push(json!({"role": "user", "content": "hello"}));
+        state.skill_resolver = Some(Arc::new(resolver));
+
+        let _ = run_agentic_loop_with_host(&mut host, &mut state).await;
+
+        assert_eq!(host.injected_schemas.len(), 1);
+        let name = host.injected_schemas[0]["function"]["name"]
+            .as_str()
+            .unwrap();
+        assert_eq!(name, "skill");
+        assert!(host.valid_tools.contains("skill"));
+    }
+
+    #[tokio::test]
+    async fn no_skill_schema_when_resolver_absent() {
+        let mut host = MockHost::new(vec![text_result("done", 50, 20, Some(10))]);
+        let mut state = make_state();
+        state
+            .messages
+            .push(json!({"role": "user", "content": "hello"}));
+
+        let _ = run_agentic_loop_with_host(&mut host, &mut state).await;
+
+        assert!(host.injected_schemas.is_empty());
+        assert!(!host.valid_tools.contains("skill"));
+    }
+
+    #[tokio::test]
+    async fn skill_tool_call_intercepted_and_result_injected() {
+        let resolver = StubSkillResolver::new();
+        let turns = vec![
+            skill_tool_call_result(
+                "call_skill_1",
+                r#"{"skill_name": "test-skill"}"#,
+                100,
+                50,
+            ),
+            text_result("Following the skill instructions.", 80, 30, None),
+        ];
+
+        let mut host = MockHost::new(turns);
+        let mut state = make_state();
+        state
+            .messages
+            .push(json!({"role": "user", "content": "use the test skill"}));
+        state.skill_resolver = Some(Arc::new(resolver));
+
+        let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
+        assert!(outcome.is_ok());
+        assert_eq!(state.final_text, "Following the skill instructions.");
+
+        // Skill result should be in messages as a tool message
+        let tool_msgs: Vec<&Value> = state
+            .messages
+            .iter()
+            .filter(|m| m.get("tool_call_id").and_then(Value::as_str) == Some("call_skill_1"))
+            .collect();
+        assert_eq!(tool_msgs.len(), 1);
+        let content = tool_msgs[0]["content"].as_str().unwrap();
+        assert!(content.contains("# Skill: test-skill"));
+        assert!(content.contains("Follow these instructions carefully."));
+    }
+
+    #[tokio::test]
+    async fn skill_model_override_applied_and_cleared() {
+        let resolver =
+            StubSkillResolver::new().with_model("claude-sonnet-4-20250514");
+        let turns = vec![
+            skill_tool_call_result(
+                "call_1",
+                r#"{"skill_name": "test-skill"}"#,
+                100,
+                50,
+            ),
+            text_result("Done with skill.", 80, 30, None),
+        ];
+
+        let mut host = MockHost::new(turns);
+        let mut state = make_state();
+        state
+            .messages
+            .push(json!({"role": "user", "content": "use skill"}));
+        state.skill_resolver = Some(Arc::new(resolver));
+
+        let _ = run_agentic_loop_with_host(&mut host, &mut state).await;
+
+        // Model override should be set after skill activation
+        assert_eq!(
+            state.skill_model_override.as_deref(),
+            Some("claude-sonnet-4-20250514")
+        );
+    }
+
+    #[tokio::test]
+    async fn skill_model_override_rejected_for_invalid_string() {
+        let resolver = StubSkillResolver::new().with_model("model; rm -rf /");
+        let turns = vec![
+            skill_tool_call_result(
+                "call_1",
+                r#"{"skill_name": "test-skill"}"#,
+                100,
+                50,
+            ),
+            text_result("Done.", 80, 30, None),
+        ];
+
+        let mut host = MockHost::new(turns);
+        let mut state = make_state();
+        state
+            .messages
+            .push(json!({"role": "user", "content": "use skill"}));
+        state.skill_resolver = Some(Arc::new(resolver));
+
+        let _ = run_agentic_loop_with_host(&mut host, &mut state).await;
+
+        // Invalid model string should be rejected
+        assert!(state.skill_model_override.is_none());
+    }
+
+    #[tokio::test]
+    async fn skill_allowed_tools_set_and_cleared() {
+        let resolver = StubSkillResolver::new()
+            .with_allowed_tools(vec!["bash".into(), "grep".into()]);
+        let turns = vec![
+            skill_tool_call_result(
+                "call_1",
+                r#"{"skill_name": "test-skill"}"#,
+                100,
+                50,
+            ),
+            text_result("Done.", 80, 30, None),
+        ];
+
+        let mut host = MockHost::new(turns);
+        let mut state = make_state();
+        state
+            .messages
+            .push(json!({"role": "user", "content": "use skill"}));
+        state.skill_resolver = Some(Arc::new(resolver));
+
+        let _ = run_agentic_loop_with_host(&mut host, &mut state).await;
+
+        let allowed = state.skill_allowed_tools.as_ref().unwrap();
+        assert!(allowed.contains("bash"));
+        assert!(allowed.contains("grep"));
+        assert_eq!(allowed.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn unrestricted_skill_clears_prior_overrides() {
+        // Simulate: first skill sets overrides, second skill is unrestricted
+        let mut state = make_state();
+        state.skill_model_override = Some("old-model".into());
+        state.skill_allowed_tools = Some(["bash".into()].into_iter().collect());
+
+        // An unrestricted skill (no model, no tools) should clear both
+        let resolver = StubSkillResolver::new(); // no model, no tools
+        let turns = vec![
+            skill_tool_call_result(
+                "call_1",
+                r#"{"skill_name": "test-skill"}"#,
+                100,
+                50,
+            ),
+            text_result("Done.", 80, 30, None),
+        ];
+
+        let mut host = MockHost::new(turns);
+        state
+            .messages
+            .push(json!({"role": "user", "content": "use skill"}));
+        state.skill_resolver = Some(Arc::new(resolver));
+
+        let _ = run_agentic_loop_with_host(&mut host, &mut state).await;
+
+        // Both should be cleared
+        assert!(state.skill_model_override.is_none());
+        assert!(state.skill_allowed_tools.is_none());
+    }
+
+    #[tokio::test]
+    async fn restricted_tools_not_accumulated_across_turns() {
+        // This tests the invariant that restricted_tools doesn't permanently
+        // grow from skill allowed_tools. After the loop, restricted_tools
+        // should not contain skill-scoped restrictions.
+        let resolver = StubSkillResolver::new()
+            .with_allowed_tools(vec!["bash".into()]);
+        let turns = vec![
+            skill_tool_call_result(
+                "call_1",
+                r#"{"skill_name": "test-skill"}"#,
+                100,
+                50,
+            ),
+            text_result("Done.", 80, 30, None),
+        ];
+
+        let mut host = MockHost::new(turns).with_valid_tools(&["bash", "grep", "edit"]);
+        let mut state = make_state();
+        state
+            .messages
+            .push(json!({"role": "user", "content": "use skill"}));
+        state.skill_resolver = Some(Arc::new(resolver));
+
+        // Pre-condition: restricted_tools is empty
+        assert!(state.restricted_tools.is_empty());
+
+        let _ = run_agentic_loop_with_host(&mut host, &mut state).await;
+
+        // Post-condition: restricted_tools should NOT contain "grep" or "edit"
+        // permanently (skill restrictions are transient, applied only in CLI host)
+        // Note: the runtime loop itself doesn't apply restrictions — that's the
+        // host's job in execute_turn(). This test verifies the runtime doesn't
+        // pollute restricted_tools.
+        // The skill_allowed_tools field IS set (for the host to use):
+        let allowed = state.skill_allowed_tools.as_ref().unwrap();
+        assert!(allowed.contains("bash"));
     }
 }

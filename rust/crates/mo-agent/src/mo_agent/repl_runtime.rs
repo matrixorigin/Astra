@@ -23,10 +23,12 @@ pub(super) struct PipelineModules {
     pub calibrator: std::sync::Arc<
         std::sync::Mutex<astra_runtime::pipeline::calibration::ProgressiveCalibrator>,
     >,
-    /// Skill registry for progressive loading.
-    pub skill_registry: std::sync::Arc<std::sync::RwLock<skill_instructions::SkillRegistry>>,
+    /// Unified skill registry (single source of truth for all skill resolution).
+    pub unified_skill_registry: std::sync::Arc<astra_runtime::skills::UnifiedSkillRegistry>,
     /// MCP client manager for external tool servers.
-    pub mcp_manager: std::sync::Arc<std::sync::RwLock<mcp_client::McpClientManager>>,
+    pub mcp_manager: std::sync::Arc<tokio::sync::RwLock<mcp_client::McpClientManager>>,
+    /// File-system watcher for skill hot-reload (kept alive while REPL runs).
+    pub _skill_watcher: Option<astra_runtime::skills::watcher::SkillWatcherHandle>,
 }
 
 pub(super) fn create_tool_selector_with_quality(
@@ -53,7 +55,7 @@ fn create_tool_selector_with_quality_internal(
     confidence_calibrator: Option<
         std::sync::Arc<astra_runtime::turn::routing_metrics::ConfidenceCalibrator>,
     >,
-    announce_skills: bool,
+    _announce_skills: bool,
 ) -> (Box<dyn tool_selector::ToolSelector>, PipelineModules) {
     use astra_runtime::pipeline::{
         calibration::ProgressiveCalibrator, entity::EntityGraph, pattern::PatternLibrary,
@@ -84,33 +86,75 @@ fn create_tool_selector_with_quality_internal(
         .with_pattern_library(pattern_library.clone())
         .with_progressive_calibrator(calibrator.clone());
 
-    // Initialize skill registry with progressive loading
-    let skill_registry = std::sync::Arc::new(std::sync::RwLock::new(
-        skill_instructions::SkillRegistry::new(),
+    // Initialize unified skill registry with providers (priority: Local > Bundled)
+    let mut unified_skill_registry = astra_runtime::skills::UnifiedSkillRegistry::new();
+    unified_skill_registry.add_provider(Box::new(
+        astra_runtime::skills::LocalSkillProvider::standard(),
     ));
+    unified_skill_registry.add_provider(Box::new(
+        astra_runtime::skills::BundledSkillProvider::with_defaults(),
+    ));
+    let unified_skill_registry = std::sync::Arc::new(unified_skill_registry);
+    // Discover skills eagerly so the `skill` tool schema is populated from the first turn.
+    // This is a sync context, so bridge to async via a scoped thread.
+    let handle = tokio::runtime::Handle::current();
+    let _ = std::thread::scope(|s| {
+        s.spawn(|| handle.block_on(unified_skill_registry.discover_all()))
+            .join()
+            .expect("skill discover thread panicked")
+    });
 
-    // Discover and register skill metadata from standard directories
-    for skills_path in &skill_instructions::skill_search_paths() {
-        if skills_path.is_dir()
-            && let Ok(mut reg) = skill_registry.write()
-        {
-            let registered =
-                skill_instructions::discover_and_register_metadata(skills_path, &mut reg);
-            if announce_skills && !registered.is_empty() {
-                eprintln!(
-                    "  {} Discovered {} skills from {:?}: {:?}",
-                    theme::icon_ok(),
-                    registered.len(),
-                    skills_path,
-                    registered
-                );
-            }
+    // Initialize MCP client manager and connect any MCP servers declared in
+    // skill manifests. This registers `skill://` resources from connected
+    // servers into the unified skill registry.
+    let mcp_manager =
+        std::sync::Arc::new(tokio::sync::RwLock::new(mcp_client::McpClientManager::new()));
+
+    {
+        let mcp_configs = manifest_loader::collect_mcp_server_configs();
+        if !mcp_configs.is_empty() {
+            let mgr = mcp_manager.clone();
+            let reg = unified_skill_registry.clone();
+            let _ = std::thread::scope(|s| {
+                s.spawn(|| {
+                    handle.block_on(async {
+                        let mut manager = mgr.write().await;
+                        for config in mcp_configs {
+                            let name = config.name.clone();
+                            match manager
+                                .connect_and_discover_skills(config, &reg)
+                                .await
+                            {
+                                Ok(n) if n > 0 => {
+                                    eprintln!(
+                                        "  {} Connected MCP server '{}' ({n} skill{})",
+                                        crossterm::style::Stylize::cyan("✓"),
+                                        name,
+                                        if n == 1 { "" } else { "s" }
+                                    );
+                                }
+                                Ok(_) => {}
+                                Err(e) => {
+                                    eprintln!(
+                                        "  ⚠ MCP server '{}' failed: {}",
+                                        name, e
+                                    );
+                                }
+                            }
+                        }
+                    })
+                })
+                .join()
+                .unwrap_or_else(|e| eprintln!("  ⚠ MCP connection thread panicked: {e:?}"))
+            });
         }
     }
 
-    // Initialize MCP client manager (connections happen async later)
-    let mcp_manager =
-        std::sync::Arc::new(std::sync::RwLock::new(mcp_client::McpClientManager::new()));
+    // Start file-system watcher for skill hot-reload
+    let skill_watcher = astra_runtime::skills::watcher::start_watching(
+        unified_skill_registry.clone(),
+        astra_runtime::skills::loader::skill_search_paths(),
+    );
 
     let creds = load_credentials();
     let name = profile_name(profile, &creds);
@@ -120,21 +164,6 @@ fn create_tool_selector_with_quality_internal(
         .and_then(|p| p.access_token.as_ref())
         .cloned();
 
-    // Build skill catalog entries for tool selection (before moving skill_registry)
-    let skill_catalog: Vec<tool_selector::SkillCatalogEntry> = {
-        match skill_registry.read() {
-            Ok(reg) => reg
-                .all_skills()
-                .iter()
-                .map(|s| tool_selector::SkillCatalogEntry {
-                    name: s.metadata.name.clone(),
-                    description: s.metadata.description.clone(),
-                })
-                .collect(),
-            Err(_) => vec![],
-        }
-    };
-
     // Clone calibrator for FallbackSelector before moving into PipelineModules
     let calibrator_for_selector = calibrator.clone();
 
@@ -142,17 +171,18 @@ fn create_tool_selector_with_quality_internal(
         entity_graph,
         pattern_library,
         calibrator,
-        skill_registry,
+        unified_skill_registry,
         mcp_manager,
+        _skill_watcher: skill_watcher,
     };
 
     // Use LLM selector only when logged in, with TF-IDF as fast fallback.
     // FallbackSelector tries LLM first; if it fails or returns empty, uses TF-IDF.
+    // Skill activation is handled by the `skill` tool in the agentic loop, not
+    // by the tool selector.
     let selector: Box<dyn tool_selector::ToolSelector> = match token {
         Some(tok) => {
-            // Register skills with LLM selector so it can include them in selection
-            let llm = tool_selector::LlmToolSelector::new(api.clone(), tok.to_string())
-                .with_skills(skill_catalog);
+            let llm = tool_selector::LlmToolSelector::new(api.clone(), tok.to_string());
             Box::new(
                 tool_selector::FallbackSelector::new(Box::new(llm), Box::new(tfidf))
                     .with_progressive_calibrator(calibrator_for_selector),

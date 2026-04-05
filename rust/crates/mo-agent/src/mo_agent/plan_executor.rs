@@ -499,7 +499,6 @@ use astra_services::session_journal;
 use astra_services::task_orchestrator::{TaskPlan, TaskStatus};
 
 use crate::StreamResult;
-use crate::skill_instructions::SharedSkillRegistry;
 
 use super::chat_stream::ChatTurnParams;
 use super::durable_bridge;
@@ -522,7 +521,7 @@ pub(super) struct BackgroundPlanContext {
     pub session_id: Option<String>,
     pub recent_tools: Vec<String>,
     pub tool_health_entries: Vec<ToolHealthEntry>,
-    pub skill_registry: SharedSkillRegistry,
+    pub unified_skill_registry: Arc<astra_runtime::skills::UnifiedSkillRegistry>,
     pub delegation_engine: Option<Arc<astra_runtime::server::delegation_engine::DelegationEngine>>,
     pub durable_task_state: Option<durable_bridge::DurableTaskState>,
     pub workspace_root: PathBuf,
@@ -958,6 +957,7 @@ async fn plan_executor_task(
             });
 
             // Execute the subtask via stream_chat_sse
+            let mut skill_qt = astra_runtime::skills::quality::SkillQualityTracker::new();
             let turn_result: Result<StreamResult, crate::TurnFailure> =
                 stream_chat_sse(ChatTurnParams {
                     api: &ctx.api,
@@ -975,7 +975,7 @@ async fn plan_executor_task(
                     selector: &*selector,
                     recent_tools: &ctx.recent_tools,
                     tool_health_entries: &ctx.tool_health_entries,
-                    skill_registry: &ctx.skill_registry,
+                    unified_skill_registry: &ctx.unified_skill_registry,
                     plan_only_chat: false,
                     hide_streaming_assistant_text: true,
                     is_plan_subtask: true,
@@ -985,6 +985,8 @@ async fn plan_executor_task(
                     plan_assemble_line_release: None,
                     stream_event_tx: Some(stream_tx),
                     approval_request_tx: Some(approval_tx),
+                    mcp_manager: None,
+                    skill_quality_tracker: &mut skill_qt,
                 })
                 .await;
 

@@ -1,7 +1,11 @@
 ---
 name: tune-performance
-description: "Multi-objective performance optimization skill. Use when user wants to improve agent performance, reduce costs, increase accuracy, decrease latency, or optimize for a balanced approach. Supports automated tuning with trade-off analysis."
+description: "Platform skill: multi-objective optimization of agent performance against agent_events database. Requires mo-agent platform database access."
 user_invocable: true
+arguments:
+  - name: OBJECTIVE
+    description: "Optimization objective or goal (e.g., 'reduce costs', 'improve accuracy')"
+    required: false
 allowed_tools:
   - bash
   - read_file
@@ -10,6 +14,10 @@ allowed_tools:
 # Tune Performance Skill - Multi-Objective Optimization
 
 Automated performance tuning with support for multiple optimization objectives.
+
+## Task
+
+$ARGUMENTS
 
 ## When to Use This Skill
 

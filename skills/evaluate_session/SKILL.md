@@ -1,14 +1,22 @@
 ---
 name: evaluate-session
-description: "Agent self-assessment skill that evaluates performance metrics for a session. Use when user asks about session performance, efficiency, or wants metrics analysis."
+description: "Platform skill: evaluates agent performance metrics for a session against agent_events database. Requires mo-agent platform database access."
 user_invocable: true
+arguments:
+  - name: SESSION
+    description: "Session ID or reference (e.g., 'this session', 'last session', or a specific ID)"
+    required: false
 allowed_tools:
   - bash
   - read_file
 ---
 # Evaluate Session Skill
 
-When asked to evaluate a session's performance, follow this systematic approach:
+When asked to evaluate a session's performance, follow this systematic approach.
+
+## Task
+
+$ARGUMENTS
 
 ## 1. Identify the Target Session
 

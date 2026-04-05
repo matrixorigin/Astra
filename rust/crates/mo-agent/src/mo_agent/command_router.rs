@@ -44,6 +44,7 @@ pub(super) async fn execute_cli_command(
                 false,
                 &std::env::current_dir().unwrap_or_default(),
             );
+            let mut skill_qt = astra_runtime::skills::quality::SkillQualityTracker::new();
             let sr = match stream_chat_sse(ChatTurnParams {
                 api,
                 token: &token,
@@ -60,7 +61,7 @@ pub(super) async fn execute_cli_command(
                 selector: &*selector.0,
                 recent_tools: &[],
                 tool_health_entries: &[],
-                skill_registry: crate::skill_instructions::empty_registry(),
+                unified_skill_registry: astra_runtime::skills::default_unified_registry(),
                 plan_only_chat: false,
                 hide_streaming_assistant_text: false,
                 is_plan_subtask: false,
@@ -70,6 +71,8 @@ pub(super) async fn execute_cli_command(
                 plan_assemble_line_release: None,
                 stream_event_tx: None,
                 approval_request_tx: None,
+                mcp_manager: None,
+                skill_quality_tracker: &mut skill_qt,
             })
             .await
             {
@@ -92,7 +95,7 @@ pub(super) async fn execute_cli_command(
                         selector: &*selector.0,
                         recent_tools: &[],
                         tool_health_entries: &[],
-                        skill_registry: crate::skill_instructions::empty_registry(),
+                        unified_skill_registry: astra_runtime::skills::default_unified_registry(),
                         plan_only_chat: false,
                         hide_streaming_assistant_text: false,
                         is_plan_subtask: false,
@@ -102,6 +105,8 @@ pub(super) async fn execute_cli_command(
                         plan_assemble_line_release: None,
                         stream_event_tx: None,
                         approval_request_tx: None,
+                        mcp_manager: None,
+                skill_quality_tracker: &mut skill_qt,
                     })
                     .await
                     .map_err(|f| f.error)?
@@ -296,6 +301,7 @@ pub(super) async fn execute_cli_command(
             // When quiet, don't render markdown (no terminal formatting)
             let render_md = is_tty && !quiet;
 
+            let mut skill_qt = astra_runtime::skills::quality::SkillQualityTracker::new();
             let sr = match stream_chat_sse(ChatTurnParams {
                 api,
                 token: &token,
@@ -312,7 +318,7 @@ pub(super) async fn execute_cli_command(
                 selector: &*selector.0,
                 recent_tools: &[],
                 tool_health_entries: &[],
-                skill_registry: crate::skill_instructions::empty_registry(),
+                unified_skill_registry: astra_runtime::skills::default_unified_registry(),
                 plan_only_chat: false,
                 hide_streaming_assistant_text: false,
                 is_plan_subtask: false,
@@ -322,6 +328,8 @@ pub(super) async fn execute_cli_command(
                 plan_assemble_line_release: None,
                 stream_event_tx: None,
                 approval_request_tx: None,
+                mcp_manager: None,
+                skill_quality_tracker: &mut skill_qt,
             })
             .await
             {
@@ -344,7 +352,7 @@ pub(super) async fn execute_cli_command(
                         selector: &*selector.0,
                         recent_tools: &[],
                         tool_health_entries: &[],
-                        skill_registry: crate::skill_instructions::empty_registry(),
+                        unified_skill_registry: astra_runtime::skills::default_unified_registry(),
                         plan_only_chat: false,
                         hide_streaming_assistant_text: false,
                         is_plan_subtask: false,
@@ -354,6 +362,8 @@ pub(super) async fn execute_cli_command(
                         plan_assemble_line_release: None,
                         stream_event_tx: None,
                         approval_request_tx: None,
+                        mcp_manager: None,
+                skill_quality_tracker: &mut skill_qt,
                     })
                     .await
                     .map_err(|f| f.error)?

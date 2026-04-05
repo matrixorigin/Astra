@@ -48,8 +48,14 @@ pub(crate) async fn stream_chat_sse(
     let term_width = terminal_width_usize();
     let project_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let file_context = detect_project_languages(&project_root);
-    let executor =
-        edge_tools::ToolExecutor::new(&project_root).with_cloud(p.api.api_origin(), p.token);
+    let executor = {
+        let ex = edge_tools::ToolExecutor::new(&project_root).with_cloud(p.api.api_origin(), p.token);
+        if let Some(ref mgr) = p.mcp_manager {
+            ex.with_mcp_manager(mgr.clone())
+        } else {
+            ex
+        }
+    };
     let mut messages = openai_messages_from_repl_history(p.history, p.message);
     let all_schemas = if p.plan_only_chat {
         messages.insert(
@@ -61,7 +67,13 @@ pub(crate) async fn stream_chat_sse(
         );
         Vec::new()
     } else {
-        edge_tools::all_tool_schemas()
+        let mut schemas = edge_tools::all_tool_schemas();
+        // Inject MCP tool schemas from connected servers
+        if let Some(ref mgr) = p.mcp_manager {
+            let m = mgr.read().await;
+            schemas.extend(m.all_tool_schemas());
+        }
+        schemas
     };
     let registry = ToolRegistry::new(all_schemas.clone());
     let valid_tool_names = openai_tool_names_from_schemas(&all_schemas);
@@ -87,6 +99,10 @@ pub(crate) async fn stream_chat_sse(
         step_recorder_chat_ephemeral_run_id(start.elapsed().as_millis()).as_str(),
     );
 
+    // Capture full permission mode before perm_manager is moved into the host.
+    let parent_perm_mode = p.perm_manager.mode();
+    let parent_cancel_token = p.cancel_token.clone();
+
     // ─── Build host + state ──────────────────────────────────────────────
     let mut host = CliAgenticLoopHost {
         api: p.api,
@@ -106,7 +122,6 @@ pub(crate) async fn stream_chat_sse(
         selector: p.selector,
         registry,
         all_schemas,
-        skill_registry: p.skill_registry,
         file_context,
         perm_manager: p.perm_manager,
         valid_tool_names,
@@ -167,18 +182,43 @@ pub(crate) async fn stream_chat_sse(
         cancel_flag: None,
         cancel_token: p.cancel_token.clone(),
         delegation_engine: p.delegation_engine,
+        skill_registry_for_activation: Some(Arc::clone(&p.unified_skill_registry)),
         skill_resolver: {
-            let resolver =
-                crate::skill_instructions::CliSkillResolver::new(Arc::clone(p.skill_registry));
-            let skills = resolver.available_skills();
+            let reg_arc = Arc::clone(&p.unified_skill_registry);
+            if reg_arc.is_empty() {
+                let _ = reg_arc.discover_all().await;
+            }
+            let inner_resolver = Arc::new(
+                astra_runtime::skills::UnifiedSkillResolver::new(reg_arc)
+            );
+            let adapter = astra_runtime::skills::registry::LegacySkillResolverAdapter::new(inner_resolver);
+            let skills = adapter.available_skills();
             if skills.is_empty() {
                 None
             } else {
-                Some(Arc::new(resolver) as Arc<dyn astra_runtime::turn::skill_tool::SkillResolver>)
+                Some(Arc::new(adapter) as Arc<dyn astra_runtime::turn::skill_tool::SkillResolver>)
             }
+        },
+        skill_executor: {
+            let subrun_exec = Arc::new(crate::skill_subrun::CliSkillSubRunExecutor::new(
+                p.api.clone(),
+                p.token.to_string(),
+                p.model.map(|m| m.to_string()),
+                project_root.clone(),
+                parent_perm_mode,
+                parent_cancel_token,
+            ));
+            let isolated = Arc::new(
+                astra_runtime::skills::executor::IsolatedSkillExecutor::new(subrun_exec),
+            );
+            let router = Arc::new(
+                astra_runtime::skills::executor::SkillExecutionRouter::new(Some(isolated)),
+            );
+            Some(router as Arc<dyn astra_runtime::skills::SkillExecutor>)
         },
         skill_model_override: None,
         skill_allowed_tools: None,
+            skill_quality_tracker: p.skill_quality_tracker.clone(),
         stop_hooks: hook_sets.stop_hooks,
         stop_hook_runs: 0,
         teammate_idle_hooks: hook_sets.teammate_idle_hooks,
@@ -211,6 +251,9 @@ pub(crate) async fn stream_chat_sse(
     }
 
     // ─── Finalize ────────────────────────────────────────────────────────
+    // Merge skill quality data back to session-scoped tracker
+    *p.skill_quality_tracker = state.skill_quality_tracker.clone();
+
     eprint_stream_loop_sidecars(StreamLoopSidecarEprint {
         explain: p.explain,
         quiet: p.quiet || p.suppress_intermediate_output,

@@ -2,7 +2,7 @@
 
 > **Status**: Core Design — single source of truth for prompt generation, assembly, versioning, and introspection  
 > **Last Updated**: 2026-03-01  
-> **Related**: [agent-introspection.md](agent-introspection.md), [memory-architecture.md](memory-architecture.md), [edge-cloud-execution.md](edge-cloud-execution.md), [evaluation-and-evolution.md](evaluation-and-evolution.md), [context-window-management.md](context-window-management.md) (runtime optimization and token budgets)
+> **Related**: [agent-introspection.md](agent-introspection.md), [memory/README.md](memory/README.md), [edge-cloud-execution.md](edge-cloud-execution.md), [evaluation-and-evolution.md](evaluation-and-evolution.md), [context-window-management.md](context-window-management.md) (runtime optimization and token budgets)
 
 ---
 
@@ -594,7 +594,7 @@ Each step is independently deployable and rollback-safe.
 | Document | What Changes |
 |---|---|
 | [Agent Introspection](agent-introspection.md) | Self-model section is the static introspection mechanism. `get_agent_info` tool is the dynamic complement. |
-| [Memory Architecture](memory-architecture.md) | PromptAssembler replaces ad-hoc context injection. Memory layers map to prompt sections. |
+| [Memory Architecture](memory/README.md) | PromptAssembler replaces ad-hoc context injection. Memory layers map to prompt sections. |
 | [Edge-Cloud Execution](edge-cloud-execution.md) | Edge contributes structured `EdgeContext` instead of raw strings. Cloud assembles. |
 | [Skills and Tools](skills-and-tools.md) | Edge tools registered into ToolRegistry for unified selection. |
 | [Evaluation and Evolution](evaluation-and-evolution.md) | Context snapshots capture full assembled prompt for replay. Prompt A/B via branching. |

@@ -67,7 +67,9 @@ pub fn merge_active_skills_into_edge_profile(payload: &mut Value, active_skills:
     }
 }
 
-/// Set `edge_profile.skill_instructions` when LLM-based skill selection produced text.
+/// Deprecated: proactive skill injection is retired. Skill activation now goes
+/// through the `skill` tool in the agentic loop. Kept temporarily for backward
+/// compatibility; will be removed after all callers are migrated.
 pub fn merge_skill_instructions_into_edge_profile(payload: &mut Value, instructions: Option<&str>) {
     let Some(text) = instructions.filter(|s| !s.is_empty()) else {
         return;

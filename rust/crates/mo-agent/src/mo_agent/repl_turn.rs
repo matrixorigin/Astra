@@ -336,7 +336,7 @@ async fn maybe_auto_compact(
         selector: ctx.selector,
         recent_tools: &[],
         tool_health_entries: &[],
-        skill_registry: &state.skill_registry,
+        unified_skill_registry: &state.unified_skill_registry,
         plan_only_chat: false,
         hide_streaming_assistant_text: false,
         is_plan_subtask: false,
@@ -346,6 +346,8 @@ async fn maybe_auto_compact(
         plan_assemble_line_release: None,
         stream_event_tx: None,
         approval_request_tx: None,
+        mcp_manager: Some(state.mcp_manager.clone()),
+                skill_quality_tracker: &mut state.skill_quality_tracker,
     })
     .await;
 
@@ -444,9 +446,8 @@ async fn run_chat_turn(
     message: &str,
     session_id: Option<&str>,
 ) -> TurnAttempt {
-    // NOTE: Skill selection is now done by LLM during tool selection.
-    // The skill_registry is passed to stream_chat_sse for loading instructions
-    // when the LLM selects a skill.
+    // Skill selection is handled by the `skill` tool in the agentic loop.
+    // The unified_skill_registry provides all skill resolution.
 
     // Create a cancellation token that can interrupt SSE streaming mid-flight.
     let cancel_token = std::sync::Arc::new(tokio_util::sync::CancellationToken::new());
@@ -469,7 +470,7 @@ async fn run_chat_turn(
             selector: ctx.selector,
             recent_tools: &state.recent_tools,
             tool_health_entries: &state.tool_health_entries,
-            skill_registry: &state.skill_registry,
+            unified_skill_registry: &state.unified_skill_registry,
             plan_only_chat: state.chat_plan_only && state.current_plan_subtask_id.is_none(),
             hide_streaming_assistant_text: false,
             is_plan_subtask: state.current_plan_subtask_id.is_some(),
@@ -479,6 +480,8 @@ async fn run_chat_turn(
             plan_assemble_line_release: None,
             stream_event_tx: None,
             approval_request_tx: None,
+            mcp_manager: Some(state.mcp_manager.clone()),
+                skill_quality_tracker: &mut state.skill_quality_tracker,
         }) => TurnAttempt::Completed(Box::new(result)),
         _ = tokio::signal::ctrl_c() => {
             // Trigger cancellation to interrupt any in-flight SSE streaming.

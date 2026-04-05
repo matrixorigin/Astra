@@ -42,6 +42,7 @@ tower-http.workspace = true
 uuid.workspace = true
 tree-sitter = "0.24"
 tree-sitter-bash = "0.23"
+notify = { version = "7", default-features = false, features = ["macos_kqueue"] }
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }

@@ -1,0 +1,8 @@
+name: evaluate-session
+version: "1.0.0"
+description: "Evaluate agent performance metrics for a session against agent_events database"
+author: "mo-agent-engine"
+
+tools:
+  - bash
+  - read_file

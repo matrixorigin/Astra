@@ -37,6 +37,34 @@ use crate::turn::agentic_loop_host::{
 use super::run_engine::RunEngine;
 use super::server_loop_host::ServerAgenticLoopHostBuilder;
 
+// ─── Skill wiring for server paths ──────────────────────────────────────────
+
+/// Build skill registry + resolver for server-side agentic loops.
+///
+/// Returns `(registry_for_activation, resolver)` using the global default
+/// registry (Local + Bundled providers). Fork-context skills require a
+/// `skill_executor` which is CLI-only; the server gets inline resolution only.
+fn build_server_skill_resolver() -> (
+    Option<Arc<crate::skills::UnifiedSkillRegistry>>,
+    Option<Arc<dyn crate::turn::skill_tool::SkillResolver>>,
+) {
+    use crate::turn::skill_tool::SkillResolver as _;
+
+    let registry = crate::skills::default_unified_registry().clone();
+    if registry.is_empty() {
+        return (None, None);
+    }
+    let inner = Arc::new(crate::skills::UnifiedSkillResolver::new(Arc::clone(&registry)));
+    let adapter = crate::skills::registry::LegacySkillResolverAdapter::new(inner);
+    let skills = adapter.available_skills();
+    let resolver: Option<Arc<dyn crate::turn::skill_tool::SkillResolver>> = if skills.is_empty() {
+        None
+    } else {
+        Some(Arc::new(adapter))
+    };
+    (Some(registry), resolver)
+}
+
 // ─── Run State ──────────────────────────────────────────────────────────────
 
 /// Status of a single agentic run.
@@ -178,6 +206,8 @@ impl AgenticRunLifecycleService {
         use crate::turn::stop_hooks_yaml::{
             detect_turn_hook_sets, is_plan_subtask_from_chat_context, project_root_for_stop_hooks,
         };
+
+        let (skill_registry, skill_resolver) = build_server_skill_resolver();
         use crate::turn::turn_guard::TurnGuard;
 
         let user_message = json!({
@@ -246,9 +276,12 @@ impl AgenticRunLifecycleService {
             cancel_flag: None,
             cancel_token: None,
             delegation_engine: None,
-            skill_resolver: None,
+            skill_registry_for_activation: skill_registry,
+            skill_resolver,
+            skill_executor: None, // fork execution requires CLI; inline skills work
             skill_model_override: None,
             skill_allowed_tools: None,
+            skill_quality_tracker: crate::skills::quality::SkillQualityTracker::new(),
             stop_hooks: hook_sets.stop_hooks,
             stop_hook_runs: 0,
             teammate_idle_hooks: hook_sets.teammate_idle_hooks,
@@ -844,6 +877,8 @@ impl SubRunExecutor for ServerSubRunExecutor {
             .unwrap_or_default();
         let workspace_root_hint = project_root_buf.map(|p| p.to_string_lossy().into_owned());
 
+        let (skill_registry, skill_resolver) = build_server_skill_resolver();
+
         let mut loop_state = AgenticLoopState {
             messages: vec![user_message],
             tool_results: Vec::new(),
@@ -889,9 +924,12 @@ impl SubRunExecutor for ServerSubRunExecutor {
             cancel_flag: config.pause_flag.clone(),
             cancel_token: None,
             delegation_engine: None,
-            skill_resolver: None,
+            skill_registry_for_activation: skill_registry,
+            skill_resolver,
+            skill_executor: None, // fork execution requires CLI; inline skills work
             skill_model_override: None,
             skill_allowed_tools: None,
+            skill_quality_tracker: crate::skills::quality::SkillQualityTracker::new(),
             stop_hooks: hook_sets.stop_hooks,
             stop_hook_runs: 0,
             teammate_idle_hooks: hook_sets.teammate_idle_hooks,

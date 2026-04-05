@@ -70,7 +70,8 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
         "/session list",
         "All journals + cwd / git / age from workspace",
     ),
-    ("/skill", "Skill management: /skill [list|new|dev|test]"),
+    ("/skill", "Skill management: /skill [list|info|search|new|dev|test]"),
+    ("/mcp", "MCP server status: /mcp [status|servers]"),
     (
         "/report",
         "Show last delivery report (/report save = re-export JSON)",
@@ -221,6 +222,13 @@ const SLASH_FIRST_TOKEN_COMPLETIONS: &[(&str, &[(&str, &str)])] = &[
             ("system", "System skill helpers"),
             ("test", "Run skill test"),
             ("validate", "Validate skill manifest"),
+        ],
+    ),
+    (
+        "/mcp",
+        &[
+            ("servers", "Show server details and tools"),
+            ("status", "Show connection status table"),
         ],
     ),
     (
@@ -546,12 +554,16 @@ fn slash_argument_hint(command: &str) -> Option<&'static str> {
         "/search files" => Some("<glob>"),
         "/search review" => Some("<pattern>"),
         "/review" => Some("[latest|<rev>|working]"),
-        "/skill" => Some("[list|new|test|dev|doctor|validate|config|system]"),
+        "/skill" => Some("[list|info|search|new|test|dev|doctor|validate|config|system]"),
+        "/skill list" => Some("[query] [--source=local|bundled|mcp] [--category=X]"),
+        "/skill info" => Some("<name>"),
+        "/skill search" => Some("<query>"),
         "/skill new" => Some("<name>"),
         "/skill test" => Some("<name> [json_args]"),
         "/skill dev" => Some("<name|off>"),
         "/skill validate" | "/skill config" => Some("<name>"),
         "/skill system" => Some("<name|list>"),
+        "/mcp" => Some("[status|servers]"),
         "/memory" => Some("[list|search <q>|inspect <id>]"),
         "/diff" => Some("[staged|unstaged|stat|show <rev>|help|<paths…>]"),
         "/plan" => {
@@ -1090,6 +1102,7 @@ pub(super) fn print_slash_commands(query: Option<&str>) {
             ],
         ),
         ("🧠", "Skills", &["/skill"]),
+        ("🔌", "MCP", &["/mcp"]),
         ("🔧", "Diagnostics", &["/doctor", "/version"]),
         ("🔑", "Account", &["/login", "/register", "/logout"]),
     ];

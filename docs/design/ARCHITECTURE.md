@@ -28,7 +28,7 @@ Five problems block AI agents from production adoption:
 | 3 | **Memory is broken** | Agents forget across sessions. Knowledge updates silently invalidate past answers. No memory lifecycle. | ✅ **SOLVED**: Episodic/semantic/procedural memory with automated governance (confidence decay, quarantine, compression). Distributed scheduling ensures multi-instance safety. |
 | 4 | **Experimentation is expensive** | Testing on production data requires full copies. Most teams skip it. |
 | 5 | **Trust is unverifiable** | No confidence signals, no claim verification, no audit trail for compliance. |
-| 6 | **Agent loops are unreliable** | Wrong tool selection, futile retries, context bloat, silent failures. No cost governance. | 🔵 **DESIGNED**: See [agent-loop-reliability.md](agent-loop-reliability.md) — ChatLoop restructured into unified execution pipeline with TurnState, intent routing, circuit breaker, and structured failure reporting. |
+| 6 | **Agent loops are unreliable** | Wrong tool selection, futile retries, context bloat, silent failures. No cost governance. | 🔵 **DESIGNED**: See [agent-loop-reliability-v1-python.md](agent-loop-reliability-v1-python.md) — ChatLoop restructured into unified execution pipeline with TurnState, intent routing, circuit breaker, and structured failure reporting. |
 
 ## Core Thesis
 
@@ -96,16 +96,16 @@ This is the index. Each document is the **single source of truth** for its domai
 
 | Document | Scope |
 |----------|-------|
-| [Memory Architecture](memory-architecture.md) | Cognitive architecture: episodic/semantic/procedural memory, context engineering, attention budget, compaction, memory lifecycle |
+| [Memory Architecture](memory/README.md) | Cognitive architecture: episodic/semantic/procedural memory, context engineering, attention budget, compaction, memory lifecycle |
 | [Trust and Safety](trust-and-safety.md) | Decision audit, hallucination firewall, uncertainty quantification, regression gate, observability, guardrails |
 | [Skills and Tools](skills-and-tools.md) | Skill system: Skill-as-Package (stateful architecture, schema, install lifecycle, credential management, configuration center), selection pipeline (retrieve → audit → feedback), MCP compatibility, tool design, progressive disclosure, marketplace |
 | [Agents and Orchestration](agents-and-orchestration.md) | ChatLoop, PAOR planning, multi-agent delegation, streaming, sub-agent architecture |
 | [Data Versioning](data-versioning.md) | Git for Data: time travel, sandbox, branching, cost-aware branching, training data pipeline |
 | [Evaluation and Evolution](evaluation-and-evolution.md) | Quality scoring, replay gating, prompt auto-evolution, implicit feedback mining, self-improving agents, meta-learning closed loop |
-| [Write Path Optimization](write-path-optimization.md) | Async event pipeline: fire-and-forget emit, background batch flush, embedding fully decoupled into `event_embeddings`, event tiering — 60x hot-path latency reduction |
+| [Write Path Optimization](write-path-optimization-v1-python.md) | Async event pipeline: fire-and-forget emit, background batch flush, embedding fully decoupled into `event_embeddings`, event tiering — 60x hot-path latency reduction |
 | [Feedback Classification Model](feedback-classification-model.md) | Native feedback classifier: data pipeline, model training, deployment as platform skill, continuous learning |
 | [Deployment Architecture](deployment-architecture.md) | Deployment topologies (single machine → K8s), edge-cloud split execution, `/chat/turn` protocol, execution backend abstraction, GPU scheduling, Ray integration |
-| [Implementation Plan](implementation-plan.md) | Unified execution plan: write path optimization (A1-A5) + CLI edge-cloud architecture (B1-B5), acceptance criteria, risk register |
+| [Implementation Plan](implementation-plan-v1-python.md) | Unified execution plan: write path optimization (A1-A5) + CLI edge-cloud architecture (B1-B5), acceptance criteria, risk register |
 
 ### Core Design (continued)
 
@@ -136,13 +136,13 @@ This is the index. Each document is the **single source of truth** for its domai
 
 Industry trend: Anthropic's context engineering, Letta/MemGPT's memory OS, EverMemOS's dual-layer architecture, Observational Memory's 95% LongMemEval score — all point to memory as **the** differentiator for production agents.
 
-Our position: Memory is not "RAG bolted on later." It is a cognitive architecture with distinct layers (sensory → working → episodic → semantic → procedural), each with its own storage, retrieval, and lifecycle. See [Memory Architecture](memory-architecture.md).
+Our position: Memory is not "RAG bolted on later." It is a cognitive architecture with distinct layers (sensory → working → episodic → semantic → procedural), each with its own storage, retrieval, and lifecycle. See [Memory Architecture](memory/README.md).
 
 ### 2. Context Engineering Over Prompt Engineering
 
 Following Anthropic's insight: the question is not "how to write a better prompt" but "what configuration of context maximizes desired behavior." Context is a finite attention budget. Every token must earn its place.
 
-Our implementation: task-aware budget allocation, just-in-time retrieval, compaction for long-horizon tasks, structured note-taking for cross-session persistence. See [Memory Architecture](memory-architecture.md).
+Our implementation: task-aware budget allocation, just-in-time retrieval, compaction for long-horizon tasks, structured note-taking for cross-session persistence. See [Memory Architecture](memory/README.md).
 
 ### 3. Skills Are Stateful Packages
 
@@ -194,7 +194,7 @@ All state flows through `conversation_events` with causal chain tracking. This e
 | MemGPT/EverMemOS: cognitive memory architecture | Hybrid memory recall — vector + fulltext + quality in one query, self-curating |
 | Braintrust/Maxim: agent evaluation, regression testing | Clone-test-merge — zero-risk evolution, regression gate as database operation |
 | Microsoft zero-trust: auditable, verifiable agent decisions | Snapshot-as-ground-truth — every decision reconstructable at any future point |
-| LangSmith/OpenTelemetry: async event pipeline, fire-and-forget tracing | Async EventPipeline: in-memory queue → background batch flush → bulk INSERT. Event tiering (critical/durable/ephemeral). See [Write Path Optimization](write-path-optimization.md) |
+| LangSmith/OpenTelemetry: async event pipeline, fire-and-forget tracing | Async EventPipeline: in-memory queue → background batch flush → bulk INSERT. Event tiering (critical/durable/ephemeral). See [Write Path Optimization](write-path-optimization-v1-python.md) |
 | Industry-wide: too many systems to integrate | Single platform DB with `sk_` prefix for skill data; enhanced services for MatrixOne users |
 
 ## What This Is NOT
@@ -281,7 +281,7 @@ Optimizations:
   │   Only 2 sync flush points per turn:
   │   (1) after user_query, for build_context to read;
   │   (2) after run status (completed/failed/cancelled), for cross-worker polling.
-  │   See [Write Path Optimization](write-path-optimization.md).
+  │   See [Write Path Optimization](write-path-optimization-v1-python.md).
   │
   │   Industry alignment: LangSmith SDK uses identical pattern —
   │   PriorityQueue + background thread + batch drain + operation merging.
@@ -293,14 +293,14 @@ Optimizations:
   │   table (separate lifecycle, separate worker, separate DB session).
   │   Only user_query, llm_response, plan_created, knowledge_extracted
   │   get embeddings — stream events are never embedded.
-  │   See [Write Path Optimization](write-path-optimization.md).
+  │   See [Write Path Optimization](write-path-optimization-v1-python.md).
   │
   ├── 3. EVENT TIERING (critical / durable / ephemeral)
   │   Critical (user_query, llm_response) → conversation_events
   │   Durable (run_started, run_completed) → conversation_events
   │   Ephemeral (stream_text_delta, etc.) → run_events only
   │   No tier touches embeddings. Eliminates dual-write overhead for 60% of events.
-  │   See [Write Path Optimization](write-path-optimization.md).
+  │   See [Write Path Optimization](write-path-optimization-v1-python.md).
   │
   ├── 4. ASYNC SNAPSHOT WRITES
   │   Context snapshots are large (full prompt content).

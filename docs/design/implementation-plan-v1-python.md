@@ -2,7 +2,7 @@
 
 > **Last Updated**: 2026-02-23
 > **Scope**: Two workstreams — Write Path Optimization + CLI SaaS Architecture
-> **Design Docs**: [write-path-optimization.md](write-path-optimization.md), [deployment-architecture.md](deployment-architecture.md) §1.1
+> **Design Docs**: [write-path-optimization-v1-python.md](write-path-optimization-v1-python.md), [deployment-architecture.md](deployment-architecture.md) §1.1
 
 ---
 
@@ -28,7 +28,7 @@ A5: Replay migration                    B5: Remove direct DB path + packaging
 ## Workstream A: Write Path Optimization
 
 **Goal**: 60x hot-path latency reduction (1.8s → ~30ms per turn).
-**Design doc**: [write-path-optimization.md](write-path-optimization.md)
+**Design doc**: [write-path-optimization-v1-python.md](write-path-optimization-v1-python.md)
 
 ### A1: EventPipeline core
 
@@ -336,6 +336,6 @@ A1-A5 和 B1-B5 两条线大部分独立。B2 (/chat/turn) 是新增 API endpoin
 
 ## References
 
-- [Write Path Optimization](write-path-optimization.md) — full design, consistency model, failure modes
+- [Write Path Optimization](write-path-optimization-v1-python.md) — full design, consistency model, failure modes
 - [Deployment Architecture §1.1](deployment-architecture.md) — CLI as API client design
 - [ARCHITECTURE.md](ARCHITECTURE.md) — system overview, write path optimizations

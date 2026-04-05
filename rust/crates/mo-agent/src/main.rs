@@ -77,8 +77,12 @@ mod slash_info;
 mod slash_memory;
 #[path = "mo_agent/slash_session.rs"]
 mod slash_session;
+#[path = "mo_agent/skill_subrun.rs"]
+mod skill_subrun;
 #[path = "mo_agent/slash_skill.rs"]
 mod slash_skill;
+#[path = "mo_agent/slash_mcp.rs"]
+mod slash_mcp;
 #[path = "mo_agent/slash_state.rs"]
 mod slash_state;
 #[path = "mo_agent/stream_render.rs"]
@@ -542,10 +546,12 @@ struct ReplState {
             std::sync::Mutex<astra_runtime::pipeline::calibration::ProgressiveCalibrator>,
         >,
     >,
-    /// Skill registry for progressive loading and context injection.
-    skill_registry: std::sync::Arc<std::sync::RwLock<skill_instructions::SkillRegistry>>,
+    /// Unified skill registry (single source of truth for all skill resolution).
+    unified_skill_registry: std::sync::Arc<astra_runtime::skills::UnifiedSkillRegistry>,
+    /// Session-scoped skill quality tracker for learning loop.
+    skill_quality_tracker: astra_runtime::skills::quality::SkillQualityTracker,
     /// MCP client manager for external tool servers.
-    mcp_manager: std::sync::Arc<std::sync::RwLock<mcp_client::McpClientManager>>,
+    mcp_manager: std::sync::Arc<tokio::sync::RwLock<mcp_client::McpClientManager>>,
     /// Skill classification cache for LLM-based skill detection.
     #[allow(dead_code)]
     skill_classification_cache: skill_instructions::SkillClassificationCache,
@@ -618,10 +624,9 @@ impl Default for ReplState {
             pattern_library: None,
             entity_graph: None,
             calibrator: None,
-            skill_registry: std::sync::Arc::new(std::sync::RwLock::new(
-                skill_instructions::SkillRegistry::new(),
-            )),
-            mcp_manager: std::sync::Arc::new(std::sync::RwLock::new(
+            unified_skill_registry: astra_runtime::skills::default_unified_registry().clone(),
+            skill_quality_tracker: astra_runtime::skills::quality::SkillQualityTracker::new(),
+            mcp_manager: std::sync::Arc::new(tokio::sync::RwLock::new(
                 mcp_client::McpClientManager::new(),
             )),
             skill_classification_cache: skill_instructions::SkillClassificationCache::default(),
@@ -2337,7 +2342,7 @@ fn take_plan_context(
         session_id: state.session_id.clone(),
         recent_tools: state.recent_tools.clone(),
         tool_health_entries: state.tool_health_entries.clone(),
-        skill_registry: state.skill_registry.clone(),
+        unified_skill_registry: state.unified_skill_registry.clone(),
         delegation_engine: state.delegation_engine.clone(),
         durable_task_state: state.durable_task_state.take(),
         workspace_root: std::env::current_dir().unwrap_or_default(),
@@ -3735,9 +3740,13 @@ async fn handle_slash_command(
             handle_info_command(cmd, arg, api, state, token).await?;
         }
 
-        "/skill" | "/skill list" | "/skill new" | "/skill test" | "/skill dev"
+        "/skill" | "/skill list" | "/skill info" | "/skill search" | "/skill new" | "/skill test" | "/skill dev"
         | "/skill doctor" | "/skill validate" | "/skill config" | "/skill system" => {
             handle_skill_command(arg, api, state, token).await?;
+        }
+
+        "/mcp" | "/mcp status" | "/mcp servers" => {
+            slash_mcp::handle_mcp_command(arg, state).await?;
         }
 
         "/register" | "/login" | "/logout" | "/memory-setup" => {
@@ -3857,6 +3866,14 @@ async fn run_chat_repl(
     let (editor, hist_path) = build_repl_editor()?;
     let mut readline = readline_actor::ReadlineActor::spawn(editor)?;
     let mut state = initialize_repl_state(profile, initial_model);
+
+    // Load persisted skill quality data from previous sessions
+    let skill_quality_path = dirs::config_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join("astra")
+        .join("skill_quality.json");
+    state.skill_quality_tracker = astra_runtime::skills::quality::SkillQualityTracker::load(&skill_quality_path);
+
     // Session-scoped quality tracker: tools that work well get boosted over time
     let quality_tracker = std::sync::Arc::new(std::sync::Mutex::new(
         tool_registry::ToolQualityTracker::new(),
@@ -3975,7 +3992,7 @@ async fn run_chat_repl(
     state.entity_graph = Some(pipeline_modules.entity_graph.clone());
     state.calibrator = Some(pipeline_modules.calibrator.clone());
     // Store skill registry and MCP manager from pipeline initialization
-    state.skill_registry = pipeline_modules.skill_registry.clone();
+    state.unified_skill_registry = pipeline_modules.unified_skill_registry.clone();
     state.mcp_manager = pipeline_modules.mcp_manager.clone();
 
     append_cloud_pull_sync_journal(
@@ -4442,6 +4459,14 @@ async fn run_chat_repl(
 
     // Save cross-session learning state (including tool health)
     {
+        // Save skill quality metrics
+        if let Err(e) = state.skill_quality_tracker.save(&skill_quality_path) {
+            eprintln!(
+                "{}",
+                format!("  ⚠ Skill quality data not saved: {e}").yellow()
+            );
+        }
+
         let profile_name = profile.unwrap_or("default");
         if let Err(e) = astra_runtime::pipeline::persistence::save_learning_state_with_health(
             profile_name,
@@ -4956,6 +4981,7 @@ mod tests {
         let registry = tool_registry::ToolRegistry::new(edge_tools::all_tool_schemas());
         let selector = tool_selector::TfIdfSelector::new(registry);
         let mut pm = PermissionManager::new(true);
+        let mut skill_qt = astra_runtime::skills::quality::SkillQualityTracker::new();
         let result = stream_chat_sse(ChatTurnParams {
             api: &api,
             token: "fake-token",
@@ -4972,7 +4998,7 @@ mod tests {
             selector: &selector,
             recent_tools: &[],
             tool_health_entries: &[],
-            skill_registry: crate::skill_instructions::empty_registry(),
+            unified_skill_registry: astra_runtime::skills::empty_unified_registry(),
             plan_only_chat: false,
             hide_streaming_assistant_text: false,
             is_plan_subtask: false,
@@ -4982,6 +5008,8 @@ mod tests {
             plan_assemble_line_release: None,
             stream_event_tx: None,
             approval_request_tx: None,
+            mcp_manager: None,
+            skill_quality_tracker: &mut skill_qt,
         })
         .await
         .unwrap();
@@ -5007,6 +5035,7 @@ mod tests {
         let registry = tool_registry::ToolRegistry::new(edge_tools::all_tool_schemas());
         let selector = tool_selector::TfIdfSelector::new(registry);
         let mut pm = PermissionManager::new(true);
+        let mut skill_qt = astra_runtime::skills::quality::SkillQualityTracker::new();
         let result = stream_chat_sse(ChatTurnParams {
             api: &api,
             token: "fake-token",
@@ -5023,7 +5052,7 @@ mod tests {
             selector: &selector,
             recent_tools: &[],
             tool_health_entries: &[],
-            skill_registry: crate::skill_instructions::empty_registry(),
+            unified_skill_registry: astra_runtime::skills::empty_unified_registry(),
             plan_only_chat: false,
             hide_streaming_assistant_text: false,
             is_plan_subtask: false,
@@ -5033,6 +5062,8 @@ mod tests {
             plan_assemble_line_release: None,
             stream_event_tx: None,
             approval_request_tx: None,
+            mcp_manager: None,
+            skill_quality_tracker: &mut skill_qt,
         })
         .await;
         assert!(result.is_err());
@@ -5074,6 +5105,7 @@ mod tests {
         let registry = tool_registry::ToolRegistry::new(edge_tools::all_tool_schemas());
         let selector = tool_selector::TfIdfSelector::new(registry);
         let mut pm = PermissionManager::new(true); // auto-approve
+        let mut skill_qt = astra_runtime::skills::quality::SkillQualityTracker::new();
         let result = stream_chat_sse(ChatTurnParams {
             api: &api,
             token: "fake-token",
@@ -5090,7 +5122,7 @@ mod tests {
             selector: &selector,
             recent_tools: &[],
             tool_health_entries: &[],
-            skill_registry: crate::skill_instructions::empty_registry(),
+            unified_skill_registry: astra_runtime::skills::empty_unified_registry(),
             plan_only_chat: false,
             hide_streaming_assistant_text: false,
             is_plan_subtask: false,
@@ -5100,6 +5132,8 @@ mod tests {
             plan_assemble_line_release: None,
             stream_event_tx: None,
             approval_request_tx: None,
+            mcp_manager: None,
+            skill_quality_tracker: &mut skill_qt,
         })
         .await
         .unwrap();

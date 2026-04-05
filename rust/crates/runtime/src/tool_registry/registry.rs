@@ -493,13 +493,9 @@ impl ToolRegistry {
         let mut included_names = std::collections::HashSet::new();
 
         // Always include pinned tools first (budget-exempt)
-        for tool in TOOL_CATALOG.iter() {
-            if tool.pinned
-                && let Some(schema) = self.find_schema(tool.name)
-            {
-                included_names.insert(tool.name.to_string());
-                result.push(schema);
-            }
+        for (name, schema) in &self.pinned_schemas {
+            included_names.insert(name.clone());
+            result.push(schema.clone());
         }
 
         // Add dynamic tools greedily from ranked list using measured costs
@@ -548,11 +544,7 @@ impl ToolRegistry {
 
     /// Return only pinned tools (for conversational queries).
     pub fn pinned_only(&self) -> Vec<Value> {
-        TOOL_CATALOG
-            .iter()
-            .filter(|t| t.pinned)
-            .filter_map(|tool| self.find_schema(tool.name))
-            .collect()
+        self.pinned_schemas.iter().map(|(_, s)| s.clone()).collect()
     }
 
     /// Return ALL tool schemas (bypass selection — used for tool execution).
@@ -620,8 +612,115 @@ impl ToolRegistry {
         // Pinned schemas don't change (plugins are never pinned in catalog)
     }
 
+    /// Inject a single tool schema dynamically (e.g. the `skill` or `delegate` tool).
+    ///
+    /// When `pinned` is true the tool is budget-exempt (always included like
+    /// core tools such as `bash` and `read_file`).  When false it behaves as a
+    /// plugin tool that is only included when budget allows.
+    pub fn inject_schema(&mut self, schema: Value) {
+        self.inject_schema_pinned(schema, true);
+    }
+
+    /// Inject with explicit pinning control.
+    pub fn inject_schema_pinned(&mut self, schema: Value, pinned: bool) {
+        if let Some(name) = schema
+            .get("function")
+            .and_then(|f| f.get("name"))
+            .and_then(Value::as_str)
+        {
+            if self.schema_index.contains_key(name) {
+                return; // already registered
+            }
+            let name_owned = name.to_string();
+            let idx = self.all_schemas.len();
+            let json_bytes = serde_json::to_string(&schema).map(|s| s.len()).unwrap_or(0);
+            self.measured_costs.insert(name_owned.clone(), (json_bytes / 4) as u32);
+            self.schema_index.insert(name_owned.clone(), idx);
+            if pinned {
+                self.pinned_schemas.push((name_owned, schema.clone()));
+            } else {
+                self.plugin_tool_names.push(name_owned);
+            }
+            self.all_schemas.push(schema);
+        }
+    }
+
     /// Total tool count (built-in + registered plugins).
     pub fn total_tool_count(&self) -> usize {
         self.all_schemas.len()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn sample_schema(name: &str) -> Value {
+        json!({
+            "type": "function",
+            "function": {
+                "name": name,
+                "description": format!("Tool {name}"),
+                "parameters": { "type": "object", "properties": {} }
+            }
+        })
+    }
+
+    #[test]
+    fn inject_schema_adds_to_registry() {
+        let mut reg = ToolRegistry::new(vec![sample_schema("bash")]);
+        assert_eq!(reg.total_tool_count(), 1);
+        assert!(reg.schema_by_name("bash").is_some());
+        assert!(reg.schema_by_name("skill").is_none());
+
+        reg.inject_schema(sample_schema("skill"));
+
+        assert_eq!(reg.total_tool_count(), 2);
+        assert!(reg.schema_by_name("skill").is_some());
+        assert!(reg.token_cost("skill") > 0);
+    }
+
+    #[test]
+    fn inject_schema_is_idempotent() {
+        let mut reg = ToolRegistry::new(vec![sample_schema("bash")]);
+        reg.inject_schema(sample_schema("skill"));
+        reg.inject_schema(sample_schema("skill"));
+        assert_eq!(reg.total_tool_count(), 2);
+    }
+
+    #[test]
+    fn inject_schema_ignores_malformed() {
+        let mut reg = ToolRegistry::new(vec![sample_schema("bash")]);
+        reg.inject_schema(json!({"broken": true}));
+        assert_eq!(reg.total_tool_count(), 1);
+    }
+
+    #[test]
+    fn injected_schema_is_pinned_by_default() {
+        let mut reg = ToolRegistry::new(vec![sample_schema("bash")]);
+        reg.inject_schema(sample_schema("skill"));
+        // Default inject is pinned (budget-exempt)
+        assert!(reg.pinned_schemas.iter().any(|(n, _)| n == "skill"));
+        assert!(!reg.plugin_tool_names.contains(&"skill".to_string()));
+    }
+
+    #[test]
+    fn injected_schema_unpinned_is_plugin() {
+        let mut reg = ToolRegistry::new(vec![sample_schema("bash")]);
+        reg.inject_schema_pinned(sample_schema("skill"), false);
+        assert!(reg.plugin_tool_names.contains(&"skill".to_string()));
+        assert!(!reg.pinned_schemas.iter().any(|(n, _)| n == "skill"));
+    }
+
+    #[test]
+    fn pinned_only_includes_injected_pinned() {
+        let mut reg = ToolRegistry::new(vec![sample_schema("bash")]);
+        reg.inject_schema(sample_schema("skill"));
+        let pinned = reg.pinned_only();
+        let names: Vec<&str> = pinned.iter()
+            .filter_map(|s| s.get("function").and_then(|f| f.get("name")).and_then(|n| n.as_str()))
+            .collect();
+        assert!(names.contains(&"skill"), "pinned_only should include injected pinned tools");
     }
 }

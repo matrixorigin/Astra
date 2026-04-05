@@ -43,9 +43,9 @@
 //! - **Level 2 (Instructions)**: Full SKILL.md content loaded on skill invocation
 //! - **Level 3 (Resources)**: Templates, scripts, references loaded on demand
 
-// Some types/methods are staged for runtime wiring (e.g., SkillInstruction fields, level constants);
-// keep the full API surface without warning spam during incremental integration.
-#![allow(dead_code)]
+// Legacy skill types are deprecated in favor of astra_runtime::skills::*.
+// Allow dead code and deprecation warnings within this module.
+#![allow(dead_code, deprecated)]
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -76,6 +76,7 @@ pub fn skill_search_paths() -> Vec<PathBuf> {
 }
 
 /// Skill instruction parsed from SKILL.md file.
+#[deprecated(note = "Use astra_runtime::skills::manifest::SkillManifest + LoadedSkill instead")]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SkillInstruction {
     /// Unique skill identifier (from frontmatter or filename).
@@ -139,6 +140,7 @@ fn default_true() -> bool {
 
 /// Metadata-only view of a skill (Level 1 loading).
 /// Used for discovery and selection without loading full instructions.
+#[deprecated(note = "Use astra_runtime::skills::manifest::SkillManifest instead")]
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SkillMetadata {
     pub name: String,
@@ -508,6 +510,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
 /// A skill entry that supports progressive loading.
+#[deprecated(note = "Use astra_runtime::skills::manifest::LoadedSkill instead")]
 #[derive(Debug, Clone)]
 pub struct ProgressiveSkill {
     /// Level 1: Metadata (always loaded).
@@ -697,6 +700,7 @@ impl ProgressiveSkill {
 }
 
 /// Registry for managing skills with progressive loading.
+#[deprecated(note = "Use astra_runtime::skills::UnifiedSkillRegistry instead")]
 #[derive(Debug, Default)]
 pub struct SkillRegistry {
     /// Skills indexed by name.
@@ -1301,10 +1305,8 @@ pub fn detect_skill_hybrid_sync(registry: &SkillRegistry, message: &str) -> Opti
 /// CLI-side [`SkillResolver`](astra_runtime::turn::skill_tool::SkillResolver)
 /// implementation that wraps a [`SharedSkillRegistry`].
 ///
-/// When the LLM calls the `skill` tool, this resolver:
-/// 1. Looks up the skill by name in the registry
-/// 2. Lazy-loads instructions (Level 2) if only metadata was loaded
-/// 3. Returns the resolved instructions for injection into the conversation
+/// Deprecated: use `UnifiedSkillResolver` from `astra_runtime::skills::registry` instead.
+#[deprecated(note = "Use astra_runtime::skills::registry::UnifiedSkillResolver instead")]
 pub struct CliSkillResolver {
     registry: SharedSkillRegistry,
 }
@@ -1320,6 +1322,40 @@ impl astra_runtime::turn::skill_tool::SkillResolver for CliSkillResolver {
         &self,
         name: &str,
     ) -> Result<astra_runtime::turn::skill_tool::ResolvedSkill, String> {
+        // Fast path: read-lock to check if instructions are already loaded.
+        // This avoids taking a write lock (and blocking all readers) for the
+        // common case where the skill is already at Level 2.
+        {
+            let reg = self
+                .registry
+                .read()
+                .map_err(|e| format!("skill registry lock poisoned: {e}"))?;
+            let skill = reg
+                .get(name)
+                .ok_or_else(|| format!("unknown skill: {name}"))?;
+            if let Some(instruction) = skill.instructions() {
+                return Ok(astra_runtime::turn::skill_tool::ResolvedSkill {
+                    name: name.to_string(),
+                    instructions: instruction.instructions.clone(),
+                    model: instruction.model.clone(),
+                    max_tokens: if instruction.max_tokens > 0 {
+                        Some(instruction.max_tokens)
+                    } else {
+                        None
+                    },
+                    allowed_tools: instruction.allowed_tools.clone(),
+                    execution_context: astra_runtime::skills::manifest::ExecutionContext::Inline,
+                    hooks: astra_runtime::skills::hooks::SkillHooks::default(),
+                    skill_dir: None,
+                    source: astra_runtime::skills::manifest::SkillSourceKind::Local,
+                    success_criteria: Vec::new(),
+                });
+            }
+        }
+
+        // Slow path: instructions not yet loaded. Take write lock to lazy-load.
+        // The disk I/O in load_instructions() is unavoidable here, but this only
+        // runs once per skill (subsequent calls hit the fast path above).
         let mut reg = self
             .registry
             .write()
@@ -1329,7 +1365,6 @@ impl astra_runtime::turn::skill_tool::SkillResolver for CliSkillResolver {
             .get_mut(name)
             .ok_or_else(|| format!("unknown skill: {name}"))?;
 
-        // Lazy-load instructions if only metadata was loaded
         skill.load_instructions()?;
 
         let instruction = skill
@@ -1346,6 +1381,11 @@ impl astra_runtime::turn::skill_tool::SkillResolver for CliSkillResolver {
                 None
             },
             allowed_tools: instruction.allowed_tools.clone(),
+            execution_context: astra_runtime::skills::manifest::ExecutionContext::Inline,
+            hooks: astra_runtime::skills::hooks::SkillHooks::default(),
+            skill_dir: None,
+            source: astra_runtime::skills::manifest::SkillSourceKind::Local,
+            success_criteria: Vec::new(),
         })
     }
 
@@ -1362,6 +1402,7 @@ impl astra_runtime::turn::skill_tool::SkillResolver for CliSkillResolver {
                 name: s.name().to_string(),
                 description: s.description().to_string(),
                 when_to_use: s.metadata.when_to_use.clone(),
+                source: astra_runtime::skills::manifest::SkillSourceKind::Local,
             })
             .collect()
     }

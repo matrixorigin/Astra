@@ -1,7 +1,7 @@
 # Memory System — Implementation Status
 
 > **Last Updated**: 2026-03-15 (Memoria episodic integration plan)
-> **Design Doc**: [memory-architecture.md](../design/memory-architecture.md)
+> **Design Doc**: [memory/README.md](../design/memory/README.md)
 > **Phase 1 Plan**: [memory-system-refactoring-2026-02-27.md](../../plans/memory-system-refactoring-2026-02-27.md)
 > **Phase 2 Plan**: [memory-system-phase2-2026-02-27.md](../../plans/memory-system-phase2-2026-02-27.md)
 > **Phase 3 Plan**: [memory-system-phase3-2026-02-27.md](../../plans/memory-system-phase3-2026-02-27.md)

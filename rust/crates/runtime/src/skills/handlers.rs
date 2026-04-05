@@ -1,3 +1,8 @@
+//! HTTP handlers for the skill REST API (register, list, publish, etc.).
+//!
+//! These are the original handlers from `skills.rs`, preserved for backward
+//! compatibility with the server router.
+
 pub use astra_services::skills::*;
 
 use crate::AppState;

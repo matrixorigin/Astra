@@ -56,6 +56,8 @@ pub(super) struct EdgeSseContext<'a> {
     pub stream_event_tx: Option<super::chat_stream::StreamEventTx>,
     /// Optional channel for async tool approval requests during plan execution.
     pub approval_request_tx: Option<super::chat_stream::ApprovalRequestTx>,
+    /// Skill resolver for intercepting "skill" tool calls in the SSE stream.
+    pub skill_resolver: Option<std::sync::Arc<dyn astra_runtime::turn::skill_tool::SkillResolver>>,
 }
 
 // ─── CLI SSE stream host ─────────────────────────────────────────────────────
@@ -96,6 +98,8 @@ struct CliSseStreamHost<'a> {
     stream_event_tx: Option<super::chat_stream::StreamEventTx>,
     /// Optional channel for async tool approval requests during plan execution.
     approval_request_tx: Option<super::chat_stream::ApprovalRequestTx>,
+    /// Skill resolver for intercepting "skill" tool calls.
+    skill_resolver: Option<std::sync::Arc<dyn astra_runtime::turn::skill_tool::SkillResolver>>,
 }
 
 impl<'a> CliSseStreamHost<'a> {
@@ -120,6 +124,7 @@ impl<'a> CliSseStreamHost<'a> {
             cancel_token: ctx.cancel_token,
             stream_event_tx: ctx.stream_event_tx,
             approval_request_tx: ctx.approval_request_tx,
+            skill_resolver: ctx.skill_resolver,
         }
     }
 
@@ -380,55 +385,104 @@ impl SseStreamHost for CliSseStreamHost<'_> {
         };
         let allowed = match &mut self.perm_manager {
             Some(pm) => {
-                if self.approval_request_tx.is_some() {
-                    // Plan execution: use non-blocking check and route approvals through channel
-                    match pm.check_nonblocking(tool, args) {
-                        crate::permission_manager::PermissionDecision::Allow => true,
-                        crate::permission_manager::PermissionDecision::Deny(_reason) => false,
-                        crate::permission_manager::PermissionDecision::NeedApproval {
-                            tool: t,
-                            header,
-                            detail,
-                            reason,
-                        } => {
+                // Always use non-blocking check to avoid freezing the async SSE consumer.
+                match pm.check_nonblocking(tool, args) {
+                    crate::permission_manager::PermissionDecision::Allow => true,
+                    crate::permission_manager::PermissionDecision::Deny(_reason) => false,
+                    crate::permission_manager::PermissionDecision::NeedApproval {
+                        tool: t,
+                        header,
+                        detail,
+                        reason,
+                    } => {
+                        if let Some(tx) = &self.approval_request_tx {
+                            // Plan execution: route approval through channel to REPL
                             let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
-                            if let Some(tx) = &self.approval_request_tx {
-                                let _ = tx.send(super::chat_stream::ApprovalRequest {
-                                    tool: t.clone(),
-                                    header,
-                                    detail,
-                                    reason,
-                                    response_tx: resp_tx,
-                                });
-                                // Wait for REPL to respond, but respect cancellation
-                                let result = if let Some(token) = self.cancel_token {
-                                    tokio::select! {
-                                        biased;
-                                        _ = token.cancelled() => false,
-                                        r = resp_rx => r.unwrap_or(false),
-                                    }
-                                } else {
-                                    resp_rx.await.unwrap_or(false)
-                                };
-                                if result {
-                                    pm.record_approval(&t, true);
+                            let _ = tx.send(super::chat_stream::ApprovalRequest {
+                                tool: t.clone(),
+                                header,
+                                detail,
+                                reason,
+                                response_tx: resp_tx,
+                            });
+                            let result = if let Some(token) = self.cancel_token {
+                                tokio::select! {
+                                    biased;
+                                    _ = token.cancelled() => false,
+                                    r = resp_rx => r.unwrap_or(false),
                                 }
-                                result
                             } else {
-                                false
+                                resp_rx.await.unwrap_or(false)
+                            };
+                            if result {
+                                pm.record_approval(&t, true);
                             }
+                            result
+                        } else {
+                            // Normal interactive mode: prompt on a blocking thread so we
+                            // don't freeze the async SSE consumer.  Rustyline is inactive
+                            // during turn execution, so the terminal is available.
+                            //
+                            // Stop the running-tool spinner so the approval prompt is
+                            // visible (the spinner continuously overwrites the line).
+                            self.render.stop_tool_stderr_running();
+                            self.render.stop_tool_stdout_anim();
+                            use crossterm::style::Stylize;
+                            eprintln!("  {}", format!("⚠  {header}").yellow());
+                            if let Some(d) = &detail {
+                                eprintln!("{}", d.as_str().dim());
+                            }
+                            if !reason.is_empty() {
+                                eprintln!("  {}", reason.dim());
+                            }
+                            let ch = tokio::task::spawn_blocking(
+                                crate::permission_manager::PermissionManager::prompt_approval,
+                            )
+                            .await
+                            .unwrap_or('n');
+                            let approved = matches!(ch, 'y' | 'a');
+                            if approved {
+                                pm.record_approval(&t, true);
+                            }
+                            if ch == 'a' {
+                                pm.add_allow_rule(&t);
+                                let scope = if pm.has_project_root() {
+                                    "project"
+                                } else {
+                                    "session"
+                                };
+                                eprintln!(
+                                    "  {}",
+                                    format!("  ✓ {t}: always allowed ({scope})").dim()
+                                );
+                            }
+                            if ch == 's' {
+                                pm.record_approval(&t, false);
+                                eprintln!(
+                                    "  {}",
+                                    format!("  ✗ {t}: skipped for session").dim()
+                                );
+                            }
+                            approved
                         }
                     }
-                } else {
-                    // Normal interactive mode: use blocking check with stdin prompt
-                    pm.check(tool, args)
                 }
             }
             None => true,
         };
         let start = std::time::Instant::now();
         let output = if allowed {
-            self.executor.execute(tool, args).await
+            if tool == astra_runtime::turn::skill_tool::SKILL_TOOL_NAME {
+                if let Some(resolver) = &self.skill_resolver {
+                    astra_runtime::turn::skill_tool::execute_skill_inline(
+                        resolver.as_ref(), tool, args,
+                    ).await
+                } else {
+                    "Error: skill resolver not available".to_string()
+                }
+            } else {
+                self.executor.execute(tool, args).await
+            }
         } else {
             "Permission denied".to_string()
         };
