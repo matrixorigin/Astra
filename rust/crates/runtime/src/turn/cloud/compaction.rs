@@ -295,10 +295,27 @@ pub fn compact_tiered_with_result(
     let total_chars: usize = messages
         .iter()
         .map(|m| {
-            m.get("content")
+            let content_chars = m
+                .get("content")
                 .and_then(Value::as_str)
                 .map(|s| s.chars().count())
-                .unwrap_or(0)
+                .unwrap_or(0);
+            let tool_calls_chars = m
+                .get("tool_calls")
+                .and_then(Value::as_array)
+                .map(|calls| {
+                    calls
+                        .iter()
+                        .filter_map(|c| {
+                            c.get("function")
+                                .and_then(|f| f.get("arguments"))
+                                .and_then(Value::as_str)
+                                .map(|s| s.chars().count())
+                        })
+                        .sum::<usize>()
+                })
+                .unwrap_or(0);
+            content_chars + tool_calls_chars
         })
         .sum();
 

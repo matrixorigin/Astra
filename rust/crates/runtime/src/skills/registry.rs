@@ -123,6 +123,7 @@ impl UnifiedSkillRegistry {
         let mut alias_owners: HashMap<String, String> = HashMap::new();
 
         for manifest in all_manifests {
+            let mut manifest = manifest;
             let tokens = manifest.metadata_tokens();
             if total_tokens + tokens > self.metadata_budget {
                 eprintln!(
@@ -138,6 +139,8 @@ impl UnifiedSkillRegistry {
             }
 
             // Check for alias collisions with other skills' names or aliases.
+            // Remove conflicting aliases so they can't be resolved.
+            let mut clean_aliases = Vec::new();
             for alias in &manifest.aliases {
                 if cache.contains_key(alias) {
                     eprintln!(
@@ -151,8 +154,10 @@ impl UnifiedSkillRegistry {
                     );
                 } else {
                     alias_owners.insert(alias.clone(), manifest.name.clone());
+                    clean_aliases.push(alias.clone());
                 }
             }
+            manifest.aliases = clean_aliases;
 
             if manifest.is_conditional() {
                 conditional.push(manifest.clone());
@@ -394,6 +399,7 @@ impl super::traits::SkillResolver for UnifiedSkillResolver {
         let name = name.to_string();
 
         // Try cache first (synchronous — no runtime needed)
+        let mut canonical_name = name.clone();
         if let Ok(cache) = registry.cache.read() {
             // Direct name match
             if let Some(entry) = cache.get(&name) {
@@ -407,25 +413,24 @@ impl super::traits::SkillResolver for UnifiedSkillResolver {
                     if let Some(ref loaded) = entry.loaded {
                         return Ok(Self::loaded_to_resolved(loaded));
                     }
+                    // Found the canonical name for this alias — use it for provider load
+                    canonical_name = entry.manifest.name.clone();
                 }
             }
         }
 
-        // Cache miss — load from providers. Provider::load() is async, but
-        // this trait method is sync (called from the agentic loop's tool
-        // interception layer). Bridge via a scoped thread + Handle::block_on
-        // so this works on both multi-threaded and current-thread runtimes.
+        // Cache miss — load from providers using canonical name (not alias).
         let handle = tokio::runtime::Handle::current();
         let result = std::thread::scope(|scope| {
             scope
                 .spawn(|| {
                     handle.block_on(async {
                         for provider in &registry.providers {
-                            match provider.load(&name).await {
+                            match provider.load(&canonical_name).await {
                                 Ok(loaded) => {
                                     if let Ok(mut cache) = registry.cache.write() {
                                         cache.insert(
-                                            name.clone(),
+                                            canonical_name.clone(),
                                             CachedSkill {
                                                 manifest: loaded.manifest.clone(),
                                                 loaded: Some(loaded.clone()),
@@ -438,7 +443,7 @@ impl super::traits::SkillResolver for UnifiedSkillResolver {
                                 Err(e) => return Err(e),
                             }
                         }
-                        Err(SkillError::NotFound(format!("unknown skill: {name}")))
+                        Err(SkillError::NotFound(format!("unknown skill: {canonical_name}")))
                     })
                 })
                 .join()

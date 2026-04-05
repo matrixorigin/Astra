@@ -470,7 +470,8 @@ pub async fn partition_and_execute_skills(
 /// When multiple skills fire in one turn, their activations must be
 /// reconciled so the enforced state is consistent with ALL injected
 /// instruction sets:
-/// - `model_override`: last writer wins (only one model per turn).
+/// - `model_override`: None = "no opinion" (keep previous), Some = overwrite.
+/// - `effort` / `agent_type`: same semantics — None preserves, Some overwrites.
 /// - `allowed_tools`: intersection of all non-empty allow-lists. If any
 ///   skill restricts tools, only tools allowed by ALL skills survive.
 ///   An unrestricted skill (empty list) doesn't widen a prior restriction.
@@ -482,8 +483,10 @@ fn merge_activations(
         return new;
     };
 
-    // Model: last writer wins.
-    merged.model_override = new.model_override;
+    // Model: None = "no opinion" (keep previous), Some = overwrite.
+    if new.model_override.is_some() {
+        merged.model_override = new.model_override;
+    }
 
     // Effort & agent_type: new value wins when present, otherwise keep previous.
     // None means "no opinion", not "clear".
@@ -1375,7 +1378,7 @@ mod tests {
     }
 
     #[test]
-    fn merge_activations_model_cleared_by_unrestricted_skill() {
+    fn merge_activations_model_none_preserves_previous() {
         let prev = SkillActivation {
             model_override: Some("model-a".into()),
             allowed_tools: vec![],
@@ -1383,13 +1386,13 @@ mod tests {
             agent_type: None,
         };
         let new = SkillActivation {
-            model_override: None,
+            model_override: None, // no opinion — should keep "model-a"
             allowed_tools: vec![],
             effort: None,
             agent_type: None,
         };
         let merged = super::merge_activations(Some(prev), new);
-        assert!(merged.model_override.is_none());
+        assert_eq!(merged.model_override.as_deref(), Some("model-a"));
     }
 
     #[test]

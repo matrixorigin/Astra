@@ -878,8 +878,8 @@ pub async fn compact_with_memoria(
         );
     }
 
-    // Step 5: Optionally store updated working memory
-    if config.store_on_compact && has_memory_context {
+    // Step 5: Optionally store updated working memory (even on cold start)
+    if config.store_on_compact {
         let working_content = build_working_memory_content(messages, 2000);
         if !working_content.is_empty() {
             let store_content = format!(

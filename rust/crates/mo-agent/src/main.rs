@@ -3882,8 +3882,9 @@ async fn run_chat_repl(
         .join("astra")
         .join("pinned_skills.json");
     if let Ok(data) = std::fs::read_to_string(&pinned_skills_path) {
-        if let Ok(set) = serde_json::from_str::<std::collections::HashSet<String>>(&data) {
-            state.pinned_skills = set;
+        match serde_json::from_str::<std::collections::HashSet<String>>(&data) {
+            Ok(set) => state.pinned_skills = set,
+            Err(e) => eprintln!("⚠ Failed to parse pinned_skills.json: {e}"),
         }
     }
 
@@ -4480,10 +4481,22 @@ async fn run_chat_repl(
             );
         }
 
-        // Save pinned skills
+        // Save pinned skills (atomic: write to temp file, then rename)
         if !state.pinned_skills.is_empty() {
             if let Ok(json) = serde_json::to_string_pretty(&state.pinned_skills) {
-                let _ = std::fs::write(&pinned_skills_path, json);
+                if let Some(parent) = pinned_skills_path.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                let tmp = pinned_skills_path.with_extension("tmp");
+                match std::fs::write(&tmp, &json) {
+                    Ok(()) => {
+                        if let Err(e) = std::fs::rename(&tmp, &pinned_skills_path) {
+                            eprintln!("⚠ Failed to save pinned_skills.json: {e}");
+                            let _ = std::fs::remove_file(&tmp);
+                        }
+                    }
+                    Err(e) => eprintln!("⚠ Failed to write pinned_skills.json: {e}"),
+                }
             }
         } else {
             let _ = std::fs::remove_file(&pinned_skills_path);
