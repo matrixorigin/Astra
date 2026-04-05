@@ -1,6 +1,121 @@
 use crate::prompts::{CompactConfig, CompactionTier};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::HashSet;
+
+// ---------------------------------------------------------------------------
+// Tool-aware micro-compaction (per-tool trunc + duplicate read stubs)
+// ---------------------------------------------------------------------------
+
+/// Resolve `function.name` + `function.arguments` for a `role: tool` message by matching
+/// `tool_call_id` to the nearest preceding assistant `tool_calls` entry.
+fn resolve_tool_call_meta(messages: &[Value], tool_index: usize) -> Option<(String, String)> {
+    let call_id = messages
+        .get(tool_index)?
+        .get("tool_call_id")
+        .and_then(Value::as_str)?;
+    for i in (0..tool_index).rev() {
+        let m = &messages[i];
+        if m.get("role").and_then(Value::as_str) != Some("assistant") {
+            continue;
+        }
+        let Some(arr) = m.get("tool_calls").and_then(Value::as_array) else {
+            continue;
+        };
+        for tc in arr {
+            if tc.get("id").and_then(Value::as_str) != Some(call_id) {
+                continue;
+            }
+            let name = tc
+                .get("function")
+                .and_then(|f| f.get("name"))
+                .and_then(Value::as_str)?
+                .to_string();
+            let args = tc
+                .get("function")
+                .and_then(|f| f.get("arguments"))
+                .and_then(|a| {
+                    a.as_str()
+                        .map(String::from)
+                        .or_else(|| serde_json::to_string(a).ok())
+                })
+                .unwrap_or_else(|| "{}".to_string());
+            return Some((name, args));
+        }
+    }
+    None
+}
+
+fn parse_tool_arguments_json(args: &str) -> Option<Value> {
+    serde_json::from_str(args).ok()
+}
+
+fn read_target_path(tool_name: &str, args: &str) -> Option<String> {
+    if !is_read_like_tool(tool_name) {
+        return None;
+    }
+    let v = parse_tool_arguments_json(args)?;
+    let p = v
+        .get("path")
+        .or_else(|| v.get("file_path"))
+        .or_else(|| v.get("target_file"))
+        .and_then(Value::as_str)?;
+    let n = normalize_read_path(p);
+    if n.is_empty() {
+        None
+    } else {
+        Some(n)
+    }
+}
+
+fn normalize_read_path(p: &str) -> String {
+    p.trim().replace('\\', "/")
+}
+
+fn is_read_like_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "read_file" | "file_read" | "view_file" | "open_file" | "cat"
+    ) || name.to_lowercase().ends_with("/read_file")
+}
+
+/// Per-tool truncation scale (percent of tier `trunc_limit`). Lower = more aggressive.
+fn tool_trunc_numerator(tool_name: Option<&str>) -> usize {
+    let Some(name) = tool_name else {
+        return 100;
+    };
+    let n = name.to_lowercase();
+    if n.contains("bash")
+        || n.contains("shell")
+        || n.contains("terminal")
+        || n == "run_terminal_cmd"
+        || n.contains("powershell")
+    {
+        return 35;
+    }
+    if n.contains("grep")
+        || n.contains("glob")
+        || n.contains("list_dir")
+        || n.contains("find_file")
+        || n.contains("codebase_search")
+    {
+        return 55;
+    }
+    100
+}
+
+fn effective_tool_trunc_limit(base: usize, tool_name: Option<&str>) -> usize {
+    let num = tool_trunc_numerator(tool_name);
+    let scaled = (base.saturating_mul(num)) / 100;
+    scaled.max(80)
+}
+
+fn duplicate_read_stub(path: &str) -> String {
+    format!(
+        "[duplicate read of `{path}` — same path as an earlier tool result in this transcript; \
+         re-read only if the file may have changed]"
+    )
+}
 
 // ---------------------------------------------------------------------------
 // Compaction Types
@@ -205,6 +320,8 @@ pub fn compact_tiered_with_result(
         CompactionTier::AggressivePrune => keep_chars / 2,
     };
 
+    let mut seen_read_paths: HashSet<String> = HashSet::new();
+
     // Truncate tool results (skip the last one — may be in-flight)
     let tool_indices: Vec<usize> = compacted
         .iter()
@@ -213,11 +330,34 @@ pub fn compact_tiered_with_result(
         .collect();
     let compact_limit = tool_indices.len().saturating_sub(1);
     for &index in tool_indices.iter().take(compact_limit) {
+        let meta = resolve_tool_call_meta(&compacted, index);
+        let tool_name_s = meta.as_ref().map(|(n, _)| n.as_str());
+
+        if matches!(
+            tier,
+            CompactionTier::TrimSchemas
+                | CompactionTier::CompactHistory
+                | CompactionTier::AggressivePrune
+        ) {
+            if let Some((name, args)) = meta.as_ref() {
+                if let Some(p) = read_target_path(name, args) {
+                    if seen_read_paths.contains(&p) {
+                        compacted[index]["content"] = Value::String(duplicate_read_stub(&p));
+                        continue;
+                    }
+                    seen_read_paths.insert(p);
+                }
+            }
+        }
+
         let content = compacted[index]
             .get("content")
             .and_then(Value::as_str)
             .unwrap_or_default();
-        if content.chars().count() <= trunc_limit {
+
+        let eff_limit = effective_tool_trunc_limit(trunc_limit, tool_name_s);
+
+        if content.chars().count() <= eff_limit {
             continue;
         }
         // For CompactHistory+, replace large non-error tool results with a
@@ -235,7 +375,7 @@ pub fn compact_tiered_with_result(
                 "{preview}\n...[{line_count} lines compacted — re-read file if needed]"
             ));
         } else {
-            let truncated: String = content.chars().take(trunc_limit).collect();
+            let truncated: String = content.chars().take(eff_limit).collect();
             compacted[index]["content"] =
                 Value::String(truncated + "\n...[compacted for context budget]");
         }
@@ -287,7 +427,7 @@ pub fn compact_tiered_with_result(
         // Keep only the last `keep_recent_turns * 2` conversation messages
         let keep_count = keep_recent_turns * 2;
         if conv_indices.len() > keep_count {
-            let drop_set: std::collections::HashSet<usize> = conv_indices
+            let drop_set: HashSet<usize> = conv_indices
                 [..conv_indices.len() - keep_count]
                 .iter()
                 .copied()
@@ -402,6 +542,27 @@ mod tests {
     fn tool(content: &str) -> Value {
         json!({"role": "tool", "content": content})
     }
+
+    fn assistant_tool(call_id: &str, name: &str, args: &str) -> Value {
+        json!({
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{
+                "id": call_id,
+                "type": "function",
+                "function": {"name": name, "arguments": args}
+            }]
+        })
+    }
+
+    fn tool_with_id(call_id: &str, content: &str) -> Value {
+        json!({
+            "role": "tool",
+            "tool_call_id": call_id,
+            "content": content
+        })
+    }
+
     fn user(content: &str) -> Value {
         json!({"role": "user", "content": content})
     }
@@ -728,5 +889,56 @@ mod tests {
         assert!(result.boundary.is_some());
         // No summary
         assert!(result.boundary.unwrap().summary.is_none());
+    }
+
+    // --- Tool micro-compaction: duplicate reads + per-tool trunc ---
+
+    #[test]
+    fn duplicate_read_replaces_second_tool_result_with_stub() {
+        let line = "abcdefghijklmnopqrstuvwxyz0123456789\n";
+        let big = line.repeat(400);
+        let msgs = vec![
+            assistant_tool("c1", "read_file", r#"{"path":"src/lib.rs"}"#),
+            tool_with_id("c1", &big),
+            assistant_tool("c2", "read_file", r#"{"path":"src/lib.rs"}"#),
+            tool_with_id("c2", &big),
+            tool("tail"),
+        ];
+        let result = compact_tiered(&msgs, 500, 800, CompactionTier::CompactHistory, 4);
+        let t1 = result[1].get("content").and_then(Value::as_str).unwrap();
+        let t3 = result[3].get("content").and_then(Value::as_str).unwrap();
+        assert!(
+            !t1.contains("duplicate read"),
+            "first read should not be duplicate stub: {t1:?}"
+        );
+        assert!(
+            t3.contains("duplicate read"),
+            "second read of same path should stub: {t3:?}"
+        );
+    }
+
+    #[test]
+    fn bash_tool_truncated_more_aggressively_than_read_file() {
+        let blob = "x".repeat(6000);
+        let bash_msgs = vec![
+            assistant_tool("b1", "bash", r#"{"command":"ls"}"#),
+            tool_with_id("b1", &blob),
+            tool("z"),
+        ];
+        let read_msgs = vec![
+            assistant_tool("r1", "read_file", r#"{"path":"a.txt"}"#),
+            tool_with_id("r1", &blob),
+            tool("z"),
+        ];
+        let b = compact_tiered(&bash_msgs, 100, 2000, CompactionTier::CompactHistory, 4);
+        let r = compact_tiered(&read_msgs, 100, 2000, CompactionTier::CompactHistory, 4);
+        let b0 = b[1].get("content").and_then(Value::as_str).unwrap();
+        let r0 = r[1].get("content").and_then(Value::as_str).unwrap();
+        assert!(
+            b0.len() < r0.len(),
+            "bash should be shorter after compaction: bash={} read={}",
+            b0.len(),
+            r0.len()
+        );
     }
 }
