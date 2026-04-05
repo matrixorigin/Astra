@@ -10,7 +10,9 @@
 //!    jobs (in-memory + webhook), sandbox CRUD, webhook triggers (create → fire → delete), and
 //!    `GET /introspection/skills`, session **close → resume** (with `agent_sessions` status checks),
 //!    session audit **tools/errors**, more evaluation reads (scores, quality trend, SLO, memory health,
-//!    trust + observability once `agent_id` exists). Ends with `chat/turn` (SSE) and strict `agent_events`
+//!    trust + observability once `agent_id` exists), marketplace **quality report → stats → search**,
+//!    introspection memory/context/recall, post-`chat/turn` **audit turn detail** + **replay/compare**.
+//!    Ends with `chat/turn` (SSE) and strict `agent_events`
 //!    checks (parent link, per-field tokens, `reasoning_content`, causal chain).
 //!
 //! External dependencies remain mocked where the product already allows it:
@@ -525,6 +527,47 @@ async fn product_matrix_api_journey_hits_multiple_tables() {
     )
     .await;
     assert_eq!(st_mkt, StatusCode::OK, "marketplace installed: {mkt_j}");
+
+    const MKT_PROBE_SKILL: &str = "e2e_matrix_marketplace_probe";
+    let (st_qr, qr_j) = post_json(
+        &app,
+        "/marketplace/quality-report",
+        Some(&auth_header),
+        json!({
+            "skill_name": MKT_PROBE_SKILL,
+            "skill_version": "1.0.0",
+            "runtime_version": "matrix-e2e",
+            "success_rate": 0.95,
+            "avg_tokens": 120.0,
+            "invocation_count": 3
+        }),
+    )
+    .await;
+    assert_eq!(
+        st_qr,
+        StatusCode::NO_CONTENT,
+        "marketplace quality report: {qr_j}"
+    );
+
+    let (st_mst, mst_j) = get_json(
+        &app,
+        &format!("/marketplace/stats/{MKT_PROBE_SKILL}"),
+        None,
+        &[],
+    )
+    .await;
+    assert_eq!(st_mst, StatusCode::OK, "marketplace skill stats: {mst_j}");
+    assert_eq!(mst_j["skill_name"].as_str(), Some(MKT_PROBE_SKILL));
+
+    let (st_msearch, ms_j) = get_json(
+        &app,
+        "/marketplace/search?limit=10&offset=0",
+        None,
+        &[],
+    )
+    .await;
+    assert_eq!(st_msearch, StatusCode::OK, "marketplace search: {ms_j}");
+    assert!(ms_j["results"].is_array(), "search results: {ms_j}");
 
     let xuid = &[("x-user-id", user_id.as_str())];
     let (st_gates, gates_j) = get_json(&app, "/evaluation/gates?limit=10", None, xuid).await;
@@ -1190,6 +1233,36 @@ async fn product_matrix_api_journey_hits_multiple_tables() {
     .await;
     assert_eq!(st_intro, StatusCode::OK, "introspection skills: {intro_j}");
 
+    let intro_mem = format!("/introspection/memory?session_id={session_id}");
+    let (st_imem, imem_j) = get_json(&app, &intro_mem, Some(&auth_header), &[]).await;
+    assert_eq!(st_imem, StatusCode::OK, "introspection memory: {imem_j}");
+
+    let intro_ct = format!(
+        "/introspection/context/trend?session_id={session_id}&turns=8&context_window=128000"
+    );
+    let (st_ict, ict_j) = get_json(&app, &intro_ct, Some(&auth_header), &[]).await;
+    assert_eq!(st_ict, StatusCode::OK, "introspection context trend: {ict_j}");
+
+    let intro_cs = format!("/introspection/context/snapshot?session_id={session_id}&detail=false");
+    let (st_ics, ics_j) = get_json(&app, &intro_cs, Some(&auth_header), &[]).await;
+    assert_eq!(st_ics, StatusCode::OK, "introspection context snapshot: {ics_j}");
+
+    let intro_rq = format!(
+        "/introspection/context/retrieval_quality?session_id={session_id}&turns=5"
+    );
+    let (st_irq, irq_j) = get_json(&app, &intro_rq, Some(&auth_header), &[]).await;
+    assert_eq!(
+        st_irq,
+        StatusCode::OK,
+        "introspection retrieval quality: {irq_j}"
+    );
+
+    let intro_recall = format!(
+        "/introspection/memory/recall?session_id={session_id}&query=matrix&limit=5"
+    );
+    let (st_irc, irc_j) = get_json(&app, &intro_recall, Some(&auth_header), &[]).await;
+    assert_eq!(st_irc, StatusCode::OK, "introspection memory recall: {irc_j}");
+
     let (st_route, route_j) = post_json(
         &app,
         "/chat/route",
@@ -1334,6 +1407,43 @@ async fn product_matrix_api_journey_hits_multiple_tables() {
             .map(|s| s.is_empty())
             .unwrap_or(true),
         "reasoning_content should be empty for mock round with reasoning: \"\""
+    );
+
+    let turn_cnt_row = sqlx::query(
+        "SELECT COUNT(*) AS c FROM agent_events \
+         WHERE session_id = ? AND user_id = ? AND event_type = 'turn'",
+    )
+    .bind(&session_id)
+    .bind(&user_id)
+    .fetch_one(&pool)
+    .await
+    .expect("turn events count");
+    let n_turns: i64 = turn_cnt_row.try_get("c").unwrap_or(0);
+    assert!(
+        n_turns >= 1,
+        "expected >=1 session turn events after chat/turn for audit detail, got {n_turns}"
+    );
+    let last_turn_n = n_turns as u32;
+    let turn_detail_path = format!("/sessions/{session_id}/audit/turns/{last_turn_n}");
+    let (st_td, td_j) = get_json(&app, &turn_detail_path, Some(&auth_header), &[]).await;
+    assert_eq!(st_td, StatusCode::OK, "audit turn detail: {td_j}");
+    assert_eq!(
+        td_j["turn"].as_u64(),
+        Some(u64::from(last_turn_n)),
+        "turn detail index: {td_j}"
+    );
+    let ui = td_j["user_input"].as_str().unwrap_or("");
+    assert!(
+        ui.contains("matrix journey ping"),
+        "turn detail user_input should include user prompt: {td_j}"
+    );
+
+    let replay_cmp_path = format!("/sessions/{session_id}/replay/compare");
+    let (st_rcmp, rcmp_j) = get_json(&app, &replay_cmp_path, Some(&auth_header), &[]).await;
+    assert_eq!(st_rcmp, StatusCode::OK, "replay compare: {rcmp_j}");
+    assert!(
+        rcmp_j["original_event_count"].as_i64().unwrap_or(0) > 0,
+        "replay compare should count non-replay events: {rcmp_j}"
     );
 
     cleanup_session_data(&pool, &session_id).await;
