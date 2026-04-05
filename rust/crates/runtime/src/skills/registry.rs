@@ -360,6 +360,8 @@ impl UnifiedSkillResolver {
             skill_dir: loaded.skill_dir.as_ref().map(|p| p.display().to_string()),
             source: loaded.manifest.source.clone(),
             success_criteria: loaded.manifest.success_criteria.clone(),
+            composition: loaded.manifest.composition.clone(),
+            input_schema: loaded.manifest.input_schema.clone(),
         }
     }
 }
@@ -467,6 +469,8 @@ impl crate::turn::skill_tool::SkillResolver for LegacySkillResolverAdapter {
                 skill_dir: resolved.skill_dir,
                 source: resolved.source,
                 success_criteria: resolved.success_criteria,
+                composition: resolved.composition,
+                input_schema: resolved.input_schema,
             }),
             Err(e) => Err(e.to_string()),
         }

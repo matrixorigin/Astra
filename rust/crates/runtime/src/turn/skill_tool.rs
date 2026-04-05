@@ -71,6 +71,10 @@ pub struct ResolvedSkill {
     pub source: SkillSourceKind,
     /// Machine-executable success criteria (empty = no verification).
     pub success_criteria: Vec<astra_services::VerificationCriterion>,
+    /// Composition metadata (None = not declared, treated as non-composable in nested context).
+    pub composition: Option<crate::skills::manifest::SkillComposition>,
+    /// Input schema for argument validation (JSON Schema subset).
+    pub input_schema: Option<Value>,
 }
 
 /// Trait for resolving skill names to instructions.
@@ -317,7 +321,7 @@ pub async fn execute_skill_inline(
         .get("task")
         .and_then(Value::as_str)
         .unwrap_or("");
-    let (text, _activation) = execute_skill(resolver, None, skill_name, task_hint).await;
+    let (text, _activation) = execute_skill(resolver, None, skill_name, task_hint, None).await;
     text
 }
 
@@ -351,6 +355,7 @@ pub async fn partition_and_execute_skills(
     resolver: &dyn SkillResolver,
     executor: Option<&Arc<dyn SkillExecutor>>,
     mut quality_tracker: Option<&mut crate::skills::quality::SkillQualityTracker>,
+    composition_ctx: Option<&crate::skills::composition::CompositionContext>,
 ) -> (Vec<(String, String)>, Vec<Value>, Option<SkillActivation>) {
     let mut skill_results = Vec::new();
     let mut remaining = Vec::new();
@@ -382,7 +387,7 @@ pub async fn partition_and_execute_skills(
 
                 let start = std::time::Instant::now();
                 let (text, act) =
-                    execute_skill(resolver, executor, skill_name, task_hint).await;
+                    execute_skill(resolver, executor, skill_name, task_hint, composition_ctx).await;
                 let duration_ms = start.elapsed().as_millis() as u64;
 
                 // Record outcome in quality tracker
@@ -462,9 +467,59 @@ async fn execute_skill(
     executor: Option<&Arc<dyn SkillExecutor>>,
     skill_name: &str,
     task_hint: &str,
+    composition_ctx: Option<&crate::skills::composition::CompositionContext>,
 ) -> (String, Option<SkillActivation>) {
+    // ── Composition checks ───────────────────────────────────────────────
+    if let Some(ctx) = composition_ctx {
+        // Depth check
+        if let Err(e) = ctx.check_depth() {
+            return (format!("Composition error: {e}"), None);
+        }
+        // Timeout check
+        if let Err(e) = ctx.check_timeout() {
+            return (format!("Composition error: {e}"), None);
+        }
+    }
+
     match resolver.resolve(skill_name) {
         Ok(skill) => {
+            // Composability gate: nested calls must target composable skills
+            if let Some(ctx) = composition_ctx {
+                if ctx.is_nested() {
+                    let composable = skill
+                        .composition
+                        .as_ref()
+                        .map(|c| c.composable)
+                        .unwrap_or(false);
+                    if !composable {
+                        return (
+                            format!(
+                                "Composition error: skill '{}' is not composable \
+                                 (set composable: true in manifest)",
+                                skill_name,
+                            ),
+                            None,
+                        );
+                    }
+                }
+            }
+
+            // Input schema validation
+            if let Some(ref schema) = skill.input_schema {
+                let args_value: Value = serde_json::json!({ "task": task_hint });
+                let errors = crate::skills::composition::validate_input(schema, &args_value);
+                if !errors.is_empty() {
+                    return (
+                        format!(
+                            "Input validation failed for skill '{}':\n{}",
+                            skill_name,
+                            errors.iter().map(|e| format!("  - {e}")).collect::<Vec<_>>().join("\n")
+                        ),
+                        None,
+                    );
+                }
+            }
+
             let is_mcp = skill.source == SkillSourceKind::Mcp;
 
             // MCP sandbox: block inline shell commands from untrusted sources.
@@ -683,6 +738,8 @@ mod tests {
                     skill_dir: None,
                     source: SkillSourceKind::Local,
                     success_criteria: Vec::new(),
+                    composition: None,
+                    input_schema: None,
                 })
                 .ok_or_else(|| format!("Unknown skill: {name}"))
         }
@@ -774,7 +831,7 @@ mod tests {
     #[tokio::test]
     async fn execute_skill_returns_instructions() {
         let resolver = stub_resolver();
-        let (output, activation) = execute_skill(&resolver, None, "code-review", "").await;
+        let (output, activation) = execute_skill(&resolver, None, "code-review", "", None).await;
         assert!(output.contains("# Skill: code-review"));
         assert!(output.contains("Check for bugs, security issues, and style."));
         // Activation always returned on success (even with no overrides)
@@ -786,14 +843,14 @@ mod tests {
     #[tokio::test]
     async fn execute_skill_includes_task_hint() {
         let resolver = stub_resolver();
-        let (output, _) = execute_skill(&resolver, None, "code-review", "Review auth module").await;
+        let (output, _) = execute_skill(&resolver, None, "code-review", "Review auth module", None).await;
         assert!(output.contains("**Task context:** Review auth module"));
     }
 
     #[tokio::test]
     async fn execute_skill_unknown_name() {
         let resolver = stub_resolver();
-        let (output, activation) = execute_skill(&resolver, None, "nonexistent", "").await;
+        let (output, activation) = execute_skill(&resolver, None, "nonexistent", "", None).await;
         assert!(output.contains("Failed to load skill 'nonexistent'"));
         assert!(activation.is_none());
     }
@@ -826,7 +883,7 @@ mod tests {
         ];
 
         let (skill_results, remaining, _activation) =
-            partition_and_execute_skills(&tool_calls, &resolver, None, None).await;
+            partition_and_execute_skills(&tool_calls, &resolver, None, None, None).await;
 
         assert_eq!(skill_results.len(), 2);
         assert_eq!(remaining.len(), 1);
@@ -851,7 +908,7 @@ mod tests {
             }
         })];
 
-        let (results, remaining, _) = partition_and_execute_skills(&tool_calls, &resolver, None, None).await;
+        let (results, remaining, _) = partition_and_execute_skills(&tool_calls, &resolver, None, None, None).await;
         assert_eq!(results.len(), 1);
         assert!(results[0].1.contains("Invalid skill arguments"));
         assert_eq!(remaining.len(), 0);
@@ -1031,6 +1088,8 @@ mod tests {
                     skill_dir: None,
                     source: SkillSourceKind::Local,
                     success_criteria: Vec::new(),
+                    composition: None,
+                    input_schema: None,
                 })
             }
             fn available_skills(&self) -> Vec<SkillToolInfo> {
@@ -1039,7 +1098,7 @@ mod tests {
         }
 
         let (output, activation) =
-            execute_skill(&ToolRestrictedResolver, None, "restricted", "").await;
+            execute_skill(&ToolRestrictedResolver, None, "restricted", "", None).await;
         assert!(output.contains("**Allowed tools for this skill:** bash, read_file"));
         // allowed_tools set → activation returned
         let act = activation.unwrap();
@@ -1063,6 +1122,8 @@ mod tests {
                     skill_dir: None,
                     source: SkillSourceKind::Local,
                     success_criteria: Vec::new(),
+                    composition: None,
+                    input_schema: None,
                 })
             }
             fn available_skills(&self) -> Vec<SkillToolInfo> {
@@ -1070,7 +1131,7 @@ mod tests {
             }
         }
 
-        let (_, activation) = execute_skill(&ModelOverrideResolver, None, "fancy", "").await;
+        let (_, activation) = execute_skill(&ModelOverrideResolver, None, "fancy", "", None).await;
         let act = activation.unwrap();
         assert_eq!(act.model_override.as_deref(), Some("gpt-4o"));
         assert_eq!(act.allowed_tools, vec!["bash"]);
@@ -1079,7 +1140,7 @@ mod tests {
     #[tokio::test]
     async fn execute_skill_activation_always_returned_for_successful_resolve() {
         let resolver = stub_resolver();
-        let (_, activation) = execute_skill(&resolver, None, "code-review", "").await;
+        let (_, activation) = execute_skill(&resolver, None, "code-review", "", None).await;
         // Activation is always returned on success so the loop can clear stale overrides
         let act = activation.unwrap();
         assert!(act.model_override.is_none());
@@ -1089,7 +1150,7 @@ mod tests {
     #[tokio::test]
     async fn execute_skill_failure_returns_none_activation() {
         let resolver = stub_resolver();
-        let (output, activation) = execute_skill(&resolver, None, "nonexistent", "").await;
+        let (output, activation) = execute_skill(&resolver, None, "nonexistent", "", None).await;
         assert!(output.contains("Failed to load skill"));
         assert!(activation.is_none());
     }
@@ -1109,6 +1170,8 @@ mod tests {
             skill_dir: None,
             source: SkillSourceKind::Local,
                     success_criteria: Vec::new(),
+                    composition: None,
+                    input_schema: None,
         };
         let act = super::build_activation(&skill);
         assert!(act.model_override.is_none());
@@ -1128,6 +1191,8 @@ mod tests {
             skill_dir: None,
             source: SkillSourceKind::Local,
                     success_criteria: Vec::new(),
+                    composition: None,
+                    input_schema: None,
         };
         let act = super::build_activation(&skill);
         assert_eq!(act.model_override.as_deref(), Some("claude-sonnet-4-20250514"));
@@ -1252,6 +1317,8 @@ mod tests {
                         skill_dir: None,
                         source: SkillSourceKind::Local,
                         success_criteria: Vec::new(),
+                    composition: None,
+                    input_schema: None,
                     }),
                     "skill-b" => Ok(ResolvedSkill {
                         name: "skill-b".into(),
@@ -1264,6 +1331,8 @@ mod tests {
                         skill_dir: None,
                         source: SkillSourceKind::Local,
                         success_criteria: Vec::new(),
+                    composition: None,
+                    input_schema: None,
                     }),
                     _ => Err(format!("unknown: {name}")),
                 }
@@ -1288,7 +1357,7 @@ mod tests {
         ];
 
         let (results, remaining, activation) =
-            partition_and_execute_skills(&tool_calls, &MultiResolver, None, None).await;
+            partition_and_execute_skills(&tool_calls, &MultiResolver, None, None, None).await;
 
         assert_eq!(results.len(), 2);
         assert!(remaining.is_empty());
@@ -1317,6 +1386,8 @@ mod tests {
                         skill_dir: None,
                         source: SkillSourceKind::Local,
                     success_criteria: Vec::new(),
+                    composition: None,
+                    input_schema: None,
                     })
                 } else {
                     Err(format!("unknown: {name}"))
@@ -1337,7 +1408,7 @@ mod tests {
         ];
 
         let (results, _, activation) =
-            partition_and_execute_skills(&tool_calls, &PartialResolver, None, None).await;
+            partition_and_execute_skills(&tool_calls, &PartialResolver, None, None, None).await;
 
         assert_eq!(results.len(), 2);
         assert!(results[0].1.contains("# Skill: good"));
@@ -1347,5 +1418,187 @@ mod tests {
         let act = activation.unwrap();
         assert_eq!(act.model_override.as_deref(), Some("good-model"));
         assert_eq!(act.allowed_tools, vec!["bash"]);
+    }
+
+    // ── Composition integration tests ────────────────────────────────────
+
+    #[tokio::test]
+    async fn composability_gate_blocks_non_composable_in_nested_context() {
+        // Skill without composition metadata → not composable in nested context
+        struct NonComposableResolver;
+        impl SkillResolver for NonComposableResolver {
+            fn resolve(&self, name: &str) -> Result<ResolvedSkill, String> {
+                Ok(ResolvedSkill {
+                    name: name.into(),
+                    instructions: "Do things.".into(),
+                    model: None,
+                    max_tokens: None,
+                    allowed_tools: vec![],
+                    execution_context: ExecutionContext::Inline,
+                    hooks: crate::skills::hooks::SkillHooks::default(),
+                    skill_dir: None,
+                    source: SkillSourceKind::Local,
+                    success_criteria: Vec::new(),
+                    composition: None, // not composable
+                    input_schema: None,
+                })
+            }
+            fn available_skills(&self) -> Vec<SkillToolInfo> { vec![] }
+        }
+
+        // Nested context (depth=1)
+        let parent_ctx = crate::skills::composition::CompositionContext::root();
+        let child_ctx = parent_ctx.child("parent-skill", None);
+
+        let (output, _) = execute_skill(
+            &NonComposableResolver, None, "child-skill", "do work", Some(&child_ctx),
+        ).await;
+        assert!(output.contains("not composable"), "Expected composability error, got: {output}");
+    }
+
+    #[tokio::test]
+    async fn composable_skill_allowed_in_nested_context() {
+        struct ComposableResolver;
+        impl SkillResolver for ComposableResolver {
+            fn resolve(&self, name: &str) -> Result<ResolvedSkill, String> {
+                Ok(ResolvedSkill {
+                    name: name.into(),
+                    instructions: "Do composable things.".into(),
+                    model: None,
+                    max_tokens: None,
+                    allowed_tools: vec![],
+                    execution_context: ExecutionContext::Inline,
+                    hooks: crate::skills::hooks::SkillHooks::default(),
+                    skill_dir: None,
+                    source: SkillSourceKind::Local,
+                    success_criteria: Vec::new(),
+                    composition: Some(crate::skills::manifest::SkillComposition {
+                        composable: true,
+                        idempotent: false,
+                        side_effects: vec![],
+                        max_duration_sec: None,
+                    }),
+                    input_schema: None,
+                })
+            }
+            fn available_skills(&self) -> Vec<SkillToolInfo> { vec![] }
+        }
+
+        let parent_ctx = crate::skills::composition::CompositionContext::root();
+        let child_ctx = parent_ctx.child("parent-skill", None);
+
+        let (output, _) = execute_skill(
+            &ComposableResolver, None, "child-skill", "do work", Some(&child_ctx),
+        ).await;
+        // Should succeed (inline injection)
+        assert!(output.contains("Do composable things"), "Expected skill output, got: {output}");
+    }
+
+    #[tokio::test]
+    async fn depth_limit_blocks_deeply_nested() {
+        struct AnyResolver;
+        impl SkillResolver for AnyResolver {
+            fn resolve(&self, name: &str) -> Result<ResolvedSkill, String> {
+                Ok(ResolvedSkill {
+                    name: name.into(),
+                    instructions: "Deep skill.".into(),
+                    model: None,
+                    max_tokens: None,
+                    allowed_tools: vec![],
+                    execution_context: ExecutionContext::Inline,
+                    hooks: crate::skills::hooks::SkillHooks::default(),
+                    skill_dir: None,
+                    source: SkillSourceKind::Local,
+                    success_criteria: Vec::new(),
+                    composition: Some(crate::skills::manifest::SkillComposition {
+                        composable: true,
+                        idempotent: false,
+                        side_effects: vec![],
+                        max_duration_sec: None,
+                    }),
+                    input_schema: None,
+                })
+            }
+            fn available_skills(&self) -> Vec<SkillToolInfo> { vec![] }
+        }
+
+        // Build a context at max depth
+        let mut ctx = crate::skills::composition::CompositionContext::root();
+        for i in 0..crate::skills::composition::MAX_COMPOSITION_DEPTH {
+            ctx = ctx.child(&format!("level-{i}"), None);
+        }
+
+        let (output, _) = execute_skill(
+            &AnyResolver, None, "too-deep", "work", Some(&ctx),
+        ).await;
+        assert!(output.contains("depth"), "Expected depth error, got: {output}");
+    }
+
+    #[tokio::test]
+    async fn top_level_call_skips_composability_check() {
+        // Non-composable skill should work fine at top level (depth=0)
+        struct NonComposableResolver;
+        impl SkillResolver for NonComposableResolver {
+            fn resolve(&self, name: &str) -> Result<ResolvedSkill, String> {
+                Ok(ResolvedSkill {
+                    name: name.into(),
+                    instructions: "Top level only.".into(),
+                    model: None,
+                    max_tokens: None,
+                    allowed_tools: vec![],
+                    execution_context: ExecutionContext::Inline,
+                    hooks: crate::skills::hooks::SkillHooks::default(),
+                    skill_dir: None,
+                    source: SkillSourceKind::Local,
+                    success_criteria: Vec::new(),
+                    composition: None,
+                    input_schema: None,
+                })
+            }
+            fn available_skills(&self) -> Vec<SkillToolInfo> { vec![] }
+        }
+
+        // Root context (depth=0) — composability check should not apply
+        let root_ctx = crate::skills::composition::CompositionContext::root();
+        let (output, _) = execute_skill(
+            &NonComposableResolver, None, "my-skill", "work", Some(&root_ctx),
+        ).await;
+        assert!(!output.contains("not composable"), "Root call should not check composability");
+        assert!(output.contains("Top level only"), "Expected skill output, got: {output}");
+    }
+
+    #[tokio::test]
+    async fn input_schema_validation_blocks_invalid_args() {
+        struct SchemaResolver;
+        impl SkillResolver for SchemaResolver {
+            fn resolve(&self, name: &str) -> Result<ResolvedSkill, String> {
+                Ok(ResolvedSkill {
+                    name: name.into(),
+                    instructions: "Schema skill.".into(),
+                    model: None,
+                    max_tokens: None,
+                    allowed_tools: vec![],
+                    execution_context: ExecutionContext::Inline,
+                    hooks: crate::skills::hooks::SkillHooks::default(),
+                    skill_dir: None,
+                    source: SkillSourceKind::Local,
+                    success_criteria: Vec::new(),
+                    composition: None,
+                    input_schema: Some(serde_json::json!({
+                        "properties": {
+                            "target_path": { "type": "string" }
+                        },
+                        "required": ["target_path"]
+                    })),
+                })
+            }
+            fn available_skills(&self) -> Vec<SkillToolInfo> { vec![] }
+        }
+
+        // The execute_skill builds args as {"task": "..."}, which won't have "target_path"
+        let (output, _) = execute_skill(
+            &SchemaResolver, None, "schema-skill", "do stuff", None,
+        ).await;
+        assert!(output.contains("validation failed"), "Expected validation error, got: {output}");
     }
 }

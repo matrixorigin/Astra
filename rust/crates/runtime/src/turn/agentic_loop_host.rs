@@ -918,6 +918,7 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
                     resolver.as_ref(),
                     state.skill_executor.as_ref(),
                     Some(&mut state.skill_quality_tracker),
+                    None, // composition_ctx: top-level invocation
                 )
                 .await;
             skill_results = sr;
@@ -2732,6 +2733,8 @@ mod tests {
                         skill_dir: None,
                         source: crate::skills::manifest::SkillSourceKind::Local,
                         success_criteria: Vec::new(),
+                        composition: None,
+                        input_schema: None,
                     }
                 })
                 .ok_or_else(|| format!("unknown skill: {name}"))

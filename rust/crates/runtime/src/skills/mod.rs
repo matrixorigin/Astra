@@ -28,6 +28,7 @@
 
 pub mod activation;
 pub mod arguments;
+pub mod composition;
 pub mod executor;
 pub mod handlers;
 pub mod hooks;
@@ -53,6 +54,7 @@ pub use version::{Dependency, DependencyResolver, Version, VersionConstraint};
 pub use providers::{BundledSkillProvider, DatabaseSkillProvider, LocalSkillProvider, McpSkillProvider};
 pub use quality::{SkillQualityTracker, SkillQualityEntry, SkillOutcome};
 pub use verify::SkillVerifier;
+pub use composition::{CompositionContext, CompositionError};
 
 /// Returns a shared reference to a static empty `UnifiedSkillRegistry`.
 /// Useful in tests and server contexts where no local skill providers apply.

@@ -1349,6 +1349,8 @@ impl astra_runtime::turn::skill_tool::SkillResolver for CliSkillResolver {
                     skill_dir: None,
                     source: astra_runtime::skills::manifest::SkillSourceKind::Local,
                     success_criteria: Vec::new(),
+                    composition: None,
+                    input_schema: None,
                 });
             }
         }
@@ -1386,6 +1388,8 @@ impl astra_runtime::turn::skill_tool::SkillResolver for CliSkillResolver {
             skill_dir: None,
             source: astra_runtime::skills::manifest::SkillSourceKind::Local,
             success_criteria: Vec::new(),
+            composition: None,
+            input_schema: None,
         })
     }
 

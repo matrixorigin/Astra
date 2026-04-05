@@ -898,10 +898,52 @@ Follow these steps:
             upload_quality_report(api, &state.skill_quality_tracker, token).await;
         }
 
+        "compose-info" => {
+            let skill_name = sub_arg.trim();
+            if skill_name.is_empty() {
+                eprintln!("{}", "  Usage: /skill compose-info <name>".yellow());
+                return Ok(());
+            }
+            let registry = &state.unified_skill_registry;
+            match registry.get_loaded_skill(skill_name) {
+                Some(skill) => {
+                    eprintln!("  {} {}", "Skill:".bold(), skill.manifest.name);
+                    if let Some(ref comp) = skill.manifest.composition {
+                        eprintln!("  {} {}", "composable:".dim(), comp.composable);
+                        eprintln!("  {} {}", "idempotent:".dim(), comp.idempotent);
+                        if !comp.side_effects.is_empty() {
+                            eprintln!("  {} {}", "side_effects:".dim(), comp.side_effects.join(", "));
+                        }
+                        if let Some(t) = comp.max_duration_sec {
+                            eprintln!("  {} {}s", "max_duration:".dim(), t);
+                        }
+                    } else {
+                        eprintln!("  {}", "(no composition metadata declared)".dim());
+                    }
+                    if skill.manifest.input_schema.is_some() {
+                        eprintln!("  {} defined", "input_schema:".dim());
+                    }
+                    if skill.manifest.output_schema.is_some() {
+                        eprintln!("  {} defined", "output_schema:".dim());
+                    }
+                    if !skill.manifest.required_capabilities.is_empty() {
+                        eprintln!(
+                            "  {} {}",
+                            "required_capabilities:".dim(),
+                            skill.manifest.required_capabilities.join(", ")
+                        );
+                    }
+                }
+                None => {
+                    eprintln!("{}", format!("  Skill '{skill_name}' not found.").yellow());
+                }
+            }
+        }
+
         _ => {
             eprintln!(
                         "{}",
-                        format!("  Unknown /skill subcommand: '{sub}'. Try /skill list, /skill search, /skill search-remote, /skill info, /skill new, /skill test, /skill dev, /skill doctor, /skill stats, /skill upload-quality").yellow()
+                        format!("  Unknown /skill subcommand: '{sub}'. Try /skill list, /skill search, /skill search-remote, /skill info, /skill new, /skill test, /skill dev, /skill doctor, /skill stats, /skill compose-info, /skill upload-quality").yellow()
                     );
         }
     }

@@ -101,6 +101,8 @@ pub struct ResolvedSkill {
     pub skill_dir: Option<String>,
     pub source: super::manifest::SkillSourceKind,
     pub success_criteria: Vec<astra_services::VerificationCriterion>,
+    pub composition: Option<super::manifest::SkillComposition>,
+    pub input_schema: Option<serde_json::Value>,
 }
 
 /// Resolves skill names to instructions.
