@@ -28,6 +28,9 @@ tags:
 
 You've been going in circles or hitting dead ends. Time to step back and try a fundamentally different approach.
 
+**Working directory**: ${{CTX_WORK_DIR}}
+**Available tools**: ${{CTX_AVAILABLE_TOOLS}}
+
 ## Step 1: Understand the Impasse
 
 **Success criteria**: Clear statement of what's been tried and why it failed.

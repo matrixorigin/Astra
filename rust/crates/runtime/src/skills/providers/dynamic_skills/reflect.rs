@@ -23,6 +23,9 @@ tags:
 
 Pause execution and critically examine your own behavior. This is a meta-skill — you are analyzing yourself, not the user's code.
 
+**Working directory**: ${{CTX_WORK_DIR}}
+**Available tools**: ${{CTX_AVAILABLE_TOOLS}}
+
 ## Step 1: Audit Context Usage
 
 **Success criteria**: Clear separation of confirmed facts vs assumptions.

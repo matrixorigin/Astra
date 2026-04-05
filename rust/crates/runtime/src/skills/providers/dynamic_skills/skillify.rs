@@ -27,6 +27,9 @@ tags:
 
 You are capturing this session's repeatable process as a reusable skill.
 
+**Working directory**: ${{CTX_WORK_DIR}}
+**Session**: ${{CTX_SESSION_ID}}
+
 ## Step 1: Analyze the Session
 
 **Success criteria**: You can describe the process in 2-3 sentences.

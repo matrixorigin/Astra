@@ -28,6 +28,8 @@ tags:
 
 Help the user diagnose and fix a bug, test failure, or unexpected behavior.
 
+**Working directory**: ${{CTX_WORK_DIR}}
+
 ## Goal
 Restore correct behavior with minimal changes. Do not refactor unrelated code.
 
