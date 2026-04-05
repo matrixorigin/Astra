@@ -6,6 +6,7 @@
 
 mod batch;
 mod debug;
+mod reflect;
 mod remember;
 mod simplify;
 mod skillify;
@@ -18,6 +19,7 @@ pub fn all_dynamic_skills() -> Vec<String> {
     vec![
         batch::skill_content(),
         debug::skill_content(),
+        reflect::skill_content(),
         simplify::skill_content(),
         skillify::skill_content(),
         stuck::skill_content(),
