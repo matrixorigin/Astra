@@ -4,15 +4,18 @@ pub fn skill_content() -> String {
 name: debug
 description: "Diagnose and fix bugs, test failures, and unexpected behavior systematically"
 version: "2.0.0"
+allowed_tools:
+  - bash
+  - read_file
+  - write_file
+  - delegate
 triggers:
   - debug
   - diagnose
   - troubleshoot
-  - "why is"
-  - "not working"
+  - "why does this fail"
   - broken
-  - error
-when_to_use: "When the user reports a bug, test failure, error, or unexpected behavior that needs systematic diagnosis"
+when_to_use: "When the user reports a specific bug, test failure, or unexpected behavior that needs systematic diagnosis — not for general questions about error handling"
 category: diagnostics
 arguments:
   - name: ISSUE
@@ -36,6 +39,7 @@ Restore correct behavior with minimal changes. Do not refactor unrelated code.
 - Find or write a minimal reproduction (test case, command, input)
 - For compiled languages (Rust, C++, Go): reproduce in release mode first — debug builds have different optimization behavior and can mask real issues
 - If the user can't reproduce: check recent changes (`git log --oneline -20`), environment differences, and intermittent triggers (race conditions, timing)
+- If no error info is available: ask the user for the exact command, input, and expected vs actual output before proceeding
 
 ## Step 2: Gather Context
 
@@ -85,7 +89,7 @@ If the first two hypotheses don't pan out, switch to a fundamentally different d
 - **Read the source**: of dependencies, not just your code
 - **Rubber duck**: explain the problem step by step from scratch
 
-If still stuck after exhausting alternatives, recommend the user use the `/stuck` skill.
+If still stuck after exhausting alternatives, invoke the `stuck` skill.
 "#,
     )
 }

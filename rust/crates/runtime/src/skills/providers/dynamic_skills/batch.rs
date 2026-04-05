@@ -4,15 +4,18 @@ pub fn skill_content() -> String {
 name: batch
 description: "Research, plan, and execute a large-scale change in parallel across isolated sub-agents, each producing a verified commit"
 version: "2.0.0"
-context: fork
+allowed_tools:
+  - delegate
+  - bash
+  - read_file
+  - write_file
 triggers:
   - batch
   - parallel
   - "for each"
   - bulk
   - "across all"
-  - migration
-when_to_use: "When the user wants to make a sweeping, mechanical change across many files (migrations, refactors, bulk renames) that can be decomposed into independent parallel units"
+when_to_use: "When the user explicitly wants to make a sweeping, mechanical change across many files (migrations, refactors, bulk renames) that can be decomposed into independent parallel units"
 category: automation
 arguments:
   - name: INSTRUCTION
@@ -32,16 +35,18 @@ This skill requires a git repository. If this is not a git repo, tell the user a
 
 ## Phase 1: Research and Plan
 
+**Success criteria**: A concrete plan with numbered work units, each independently implementable and verifiable.
+
 1. **Understand the scope.** Use the `delegate` tool to launch one or more sub-agents (foreground — you need their results) to deeply research what the instruction touches. Find all the files, patterns, and call sites that need to change. Understand existing conventions so the change is consistent.
 
-2. **Decompose into independent units.** Break the work into 5–30 self-contained units. Each unit must:
+2. **Decompose into independent units.** Break the work into 5–15 self-contained units. Each unit must:
    - Be independently implementable (no shared state with sibling units)
    - Be mergeable on its own without depending on another unit landing first
    - Be roughly uniform in size — split large units, merge trivial ones
    
    Scale the count to the actual work. Prefer per-directory or per-module slicing over arbitrary file lists.
    
-   Each unit should take 5–15 minutes for a worker to execute independently. If a unit would take <2 min, merge it; >30 min, split it.
+   Each unit should take 5–15 minutes for a worker to execute independently. If a unit would take <2 min, merge it; >30 min, split it. For truly massive changes, go up to 30 units.
 
 3. **Determine the verification recipe.** Figure out how a worker can verify its change actually works:
    - An existing test suite the worker can run
@@ -59,6 +64,8 @@ This skill requires a git repository. If this is not a git repo, tell the user a
 5. **Present the plan for approval.** Do NOT proceed without user confirmation.
 
 ## Phase 2: Spawn Workers
+
+**Success criteria**: All worker agents launched in parallel, each with a fully self-contained prompt.
 
 Once the plan is approved, spawn one background agent per work unit using the `delegate` tool. **Launch them all in a single message so they run in parallel.**
 
@@ -78,13 +85,17 @@ Worker post-implementation steps (include verbatim):
 
 ## Phase 3: Track Progress
 
+**Success criteria**: Final status table showing all units completed or with clear failure reasons.
+
 After launching all workers, render a status table:
 
 | # | Unit | Status | Result |
 |---|------|--------|--------|
 | 1 | <title> | running | — |
 
-As agents complete, update the table. When all agents have reported, render the final table and a one-line summary (e.g., "22/24 units completed successfully").
+As agents complete, update the table. When all agents have reported, render the final table and a one-line summary (e.g., "12/15 units completed successfully").
+
+If a worker fails: note the failure reason in the table. Do NOT auto-retry — report the failure and let the user decide whether to retry, fix manually, or skip.
 
 ## Rules
 - **Worker prompts must be self-contained** — workers have no access to your context. Include everything they need.

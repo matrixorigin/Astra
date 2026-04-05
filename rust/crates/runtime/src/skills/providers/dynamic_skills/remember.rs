@@ -4,13 +4,19 @@ pub fn skill_content() -> String {
 name: remember
 description: "Review and manage persistent memories — promote, clean up, and organize knowledge across sessions"
 version: "2.0.0"
+allowed_tools:
+  - memoria-memory_list
+  - memoria-memory_profile
+  - memoria-memory_purge
+  - memoria-memory_correct
+  - memoria-memory_search
+  - memoria-memory_store
+  - memoria-memory_governance
 triggers:
   - remember
   - memories
-  - "what do you know"
   - "clean up memories"
-  - "memory hygiene"
-when_to_use: "When the user wants to review what's been remembered across sessions, clean up stale memories, or promote working knowledge to long-term storage"
+when_to_use: "When the user explicitly wants to review stored memories, clean up stale knowledge, or organize what the agent remembers across sessions"
 category: meta
 tags:
   - memory
@@ -22,14 +28,18 @@ You help the user review, organize, and maintain persistent memories stored via 
 
 ## Step 1: Retrieve Current State
 
-Use the Memoria memory tools to gather the current state:
-- List active memories (most recent first)
-- Check memory profile for usage patterns
-- Note any memories flagged as low-confidence or contradictory
+**Success criteria**: Full picture of current memory state.
+
+Use the Memoria MCP tools to gather the current state:
+- `memoria-memory_list` — list active memories (most recent first)
+- `memoria-memory_profile` — check usage patterns and profile summary
+- `memoria-memory_search` with broad query — find memories that might be stale or contradictory
 
 If Memoria tools are not available, tell the user and stop.
 
 ## Step 2: Categorize Memories
+
+**Success criteria**: Every memory assigned to exactly one category.
 
 Group memories into:
 
@@ -45,6 +55,8 @@ Present the categorized list to the user.
 
 ## Step 3: Propose Actions
 
+**Success criteria**: Specific, actionable proposal for each non-Active memory.
+
 For each category, suggest specific actions:
 
 - **Stale**: "These 3 memories are about the old auth system which was replaced. Remove?"
@@ -54,9 +66,12 @@ For each category, suggest specific actions:
 
 ## Step 4: Execute with Confirmation
 
+**Success criteria**: All approved changes applied; summary provided.
+
 For each proposed action, get user confirmation before executing:
-- **Remove**: Use memory purge
-- **Update**: Use memory correct with the new text
+- **Remove**: Use `memoria-memory_purge` with the memory ID
+- **Update**: Use `memoria-memory_correct` with new text and reason
+- **Store new**: Use `memoria-memory_store` for merged or sharpened memories
 - **Keep**: No action needed
 
 After all actions, summarize what changed:
@@ -64,13 +79,6 @@ After all actions, summarize what changed:
 - Memories updated: N
 - Memories kept: N
 - Total active: N
-
-## When to Proactively Suggest
-
-If you notice during normal work that:
-- A memory was retrieved but was wrong or outdated → suggest correction
-- The same fact is stored multiple times → suggest dedup
-- A memory contradicts what you just learned → flag it
 
 ## Rules
 - NEVER delete memories without explicit user confirmation

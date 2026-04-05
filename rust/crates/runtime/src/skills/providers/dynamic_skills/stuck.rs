@@ -4,14 +4,17 @@ pub fn skill_content() -> String {
 name: stuck
 description: "Break through when stuck — re-examine assumptions, try alternative approaches, escalate intelligently"
 version: "2.0.0"
+allowed_tools:
+  - bash
+  - read_file
+  - delegate
 triggers:
   - stuck
   - "can't figure out"
-  - blocked
   - "going in circles"
   - "tried everything"
   - "not making progress"
-when_to_use: "When you or the user is stuck on a problem after multiple failed attempts, going in circles, or not making progress"
+when_to_use: "When you or the user is stuck on a problem after multiple failed attempts, going in circles, or not making progress despite trying"
 category: diagnostics
 arguments:
   - name: PROBLEM
@@ -59,7 +62,7 @@ Try these in order. Time-box each to 15 minutes — if no progress, switch:
 3. **Read the source** — not your code, the dependency's code. The answer is often in the implementation, not the docs.
 4. **Invert the problem** — instead of "why does this fail?", ask "under what conditions would this succeed?" and verify each condition.
 5. **Rubber duck** — explain the problem step by step as if to someone who knows nothing about it. Say it out loud (or type it). Surprisingly effective.
-6. **Sleep on it** — if you've been at this for hours, suggest the user take a break. Fresh eyes solve more bugs than tired ones.
+6. **Take a break** — if the user has been at this for hours, suggest stepping away. Fresh eyes solve more bugs than tired ones.
 
 ## Step 4: Escalate Intelligently
 

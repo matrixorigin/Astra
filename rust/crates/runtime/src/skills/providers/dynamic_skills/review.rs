@@ -1,28 +1,37 @@
 pub fn skill_content() -> String {
     format!(
         r#"---
-name: simplify
+name: review
 description: "Review changed code for reuse, quality, and efficiency via three parallel review agents — then fix issues found"
 version: "2.0.0"
+allowed_tools:
+  - delegate
+  - bash
+  - read_file
+  - write_file
 triggers:
+  - review
   - simplify
-  - "clean up"
-  - "code review"
-when_to_use: "When the user wants code reviewed for unnecessary complexity, readability issues, or refactoring opportunities after making changes"
+  - "clean up code"
+when_to_use: "When the user wants their recent code changes reviewed for unnecessary complexity, readability issues, or refactoring opportunities"
 category: code-review
 tags:
   - review
   - quality
 ---
-# Simplify: Code Review and Cleanup
+# Review: Code Review and Cleanup
 
 Review all changed files for reuse, quality, and efficiency. Fix any issues found.
 
 ## Phase 1: Identify Changes
 
+**Success criteria**: You have a clear list of changed files and their diffs.
+
 Run `git diff` (or `git diff HEAD` if there are staged changes) to see what changed. If there are no git changes, review the most recently modified files that the user mentioned or that you edited earlier in this conversation.
 
 ## Phase 2: Launch Three Review Agents in Parallel
+
+**Success criteria**: Three agents launched concurrently, each with the full diff.
 
 Use the `delegate` tool to launch all three agents concurrently in a single message. Pass each agent the full diff so it has the complete context.
 
@@ -59,9 +68,13 @@ Review the same changes for efficiency:
 
 ## Phase 3: Fix Issues
 
-Wait for all three agents to complete. Aggregate their findings and fix each issue directly. If a finding is a false positive or not worth addressing, note it and move on — do not argue with the finding, just skip it.
+**Success criteria**: All valid findings addressed; false positives noted and skipped.
 
-For conflicts between agents, use this priority: (1) correctness, (2) performance, (3) reusability.
+Wait for all three agents to complete. Aggregate their findings. For each finding:
+- If valid and worth fixing: fix it directly
+- If a false positive or not worth addressing: note it and move on
+
+Prioritize fixes in large batches rather than one-at-a-time to stay within context limits. For conflicts between agents, use this priority: (1) correctness, (2) performance, (3) reusability.
 
 When done, briefly summarize what was fixed (or confirm the code was already clean).
 "#,

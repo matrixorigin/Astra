@@ -231,7 +231,7 @@ Instructions B.
 
         let names: Vec<&str> = manifests.iter().map(|m| m.name.as_str()).collect();
         let expected = [
-            "batch", "debug", "reflect", "simplify", "skillify",
+            "batch", "debug", "reflect", "review", "skillify",
             "stuck", "verify", "remember",
         ];
         for name in &expected {
@@ -245,18 +245,16 @@ Instructions B.
     }
 
     #[tokio::test]
-    async fn fork_context_skills() {
+    async fn no_fork_context_by_default() {
         let provider = BundledSkillProvider::with_defaults();
-        let fork_skills = ["batch"];
-        for name in &fork_skills {
-            let loaded = provider.load(name).await.unwrap();
-            assert!(
-                loaded.manifest.is_isolated(),
-                "{name} should have fork execution context"
-            );
+        let manifests = provider.discover().await.unwrap();
+        for m in &manifests {
+            let loaded = provider.load(&m.name).await.unwrap();
             assert_eq!(
                 loaded.manifest.execution_context,
-                crate::skills::manifest::ExecutionContext::Fork
+                crate::skills::manifest::ExecutionContext::Inline,
+                "{} should be inline (no fork context)",
+                m.name
             );
         }
     }

@@ -4,13 +4,16 @@ pub fn skill_content() -> String {
 name: skillify
 description: "Capture this session's repeatable process into a reusable SKILL.md skill file"
 version: "2.0.0"
+allowed_tools:
+  - read_file
+  - write_file
+  - bash
 triggers:
   - skillify
   - "make a skill"
   - "save as skill"
   - "create skill"
-  - "capture workflow"
-when_to_use: "When the user wants to capture a useful workflow, prompt pattern, or set of instructions as a reusable skill"
+when_to_use: "When the user explicitly wants to capture a useful workflow, prompt pattern, or set of instructions as a reusable skill"
 category: meta
 arguments:
   - name: DESCRIPTION
@@ -26,6 +29,8 @@ You are capturing this session's repeatable process as a reusable skill.
 
 ## Step 1: Analyze the Session
 
+**Success criteria**: You can describe the process in 2-3 sentences.
+
 Before asking any questions, analyze the conversation to identify:
 - What repeatable process was performed
 - What the inputs/parameters were
@@ -37,7 +42,7 @@ Before asking any questions, analyze the conversation to identify:
 
 ## Step 2: Interview the User
 
-Use concise questions to clarify. Iterate as needed.
+Use concise questions to clarify. Keep it brief for simple processes — skip rounds that don't add value.
 
 **Round 1: High-level Confirmation**
 - Suggest a name and description based on your analysis
@@ -51,7 +56,7 @@ Use concise questions to clarify. Iterate as needed.
   - **This repo** (`.astra/skills/<name>/SKILL.md`) — for project-specific workflows
   - **Personal** (`~/.astra/skills/<name>/SKILL.md`) — follows the user across all repos
 
-**Round 3: Step Breakdown**
+**Round 3: Step Breakdown** (for complex skills with 5+ steps)
 For each major step, clarify if not obvious:
 - What does this step produce that later steps need?
 - What proves this step succeeded?
@@ -60,7 +65,7 @@ For each major step, clarify if not obvious:
 
 Pay special attention to places where the user corrected you during the session.
 
-**Round 4: Final**
+**Round 4: Final** (if not already clear)
 - Confirm when this skill should be invoked, and suggest trigger phrases
 - Ask for any gotchas or edge cases
 
@@ -68,25 +73,30 @@ Stop interviewing once you have enough information. Don't over-ask for simple pr
 
 ## Step 3: Write the SKILL.md
 
+**Success criteria**: A complete, parseable SKILL.md file.
+
 Create the skill directory and file at the chosen location.
 
 Use this format:
 
 ```markdown
 ---
-name: {{skill-name}}
-description: {{one-line description}}
+name: <skill-name>
+description: <one-line description>
 allowed_tools:
-  {{list of tools needed}}
-when_to_use: {{detailed description including trigger phrases}}
+  - bash
+  - read_file
+  - write_file
+  - delegate
+when_to_use: <detailed description including trigger phrases>
 arguments:
-  - name: {{arg_name}}
-    description: {{arg description}}
-    required: {{true/false}}
-context: {{inline or fork — omit for inline}}
+  - name: <arg_name>
+    description: <arg description>
+    required: <true/false>
+context: <inline or fork — omit for inline>
 ---
 
-# {{Skill Title}}
+# <Skill Title>
 
 Description of skill.
 
@@ -103,24 +113,20 @@ What to do. Be specific and actionable. Include commands when appropriate.
 ...
 ```
 
-**Per-step annotations** (use when helpful):
-- **Success criteria** — REQUIRED on every step
-- **Artifacts** — data this step produces for later steps
-- **Human checkpoint** — pause for user confirmation before irreversible actions
-- **Rules** — hard constraints for this step
-
 **Frontmatter rules:**
-- `allowed_tools`: minimum permissions needed
+- `allowed_tools`: list the specific tools needed (e.g., `bash`, `read_file`, `write_file`, `delegate` for sub-agents, or MCP tool names)
 - `context`: only set `fork` for self-contained skills that don't need mid-process user input
 - `when_to_use`: start with "Use when..." and include trigger phrases
 
 ## Step 4: Confirm and Save
 
+**Success criteria**: Skill file written to disk and user informed of invocation.
+
 Show the complete SKILL.md content for review. Ask "Does this look good to save?"
 
 After writing, tell the user:
 - Where the skill was saved
-- How to invoke it: `/skill {{skill-name}} [arguments]`
+- How to invoke it: `/skill <skill-name> [arguments]`
 - That they can edit the SKILL.md directly to refine it
 
 ## Rules

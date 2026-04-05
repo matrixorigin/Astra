@@ -4,14 +4,14 @@ pub fn skill_content() -> String {
 name: verify
 description: "Run project tests, linters, and type checks to verify code correctness — auto-detects project type"
 version: "2.0.0"
+allowed_tools:
+  - bash
 triggers:
   - verify
-  - check
   - validate
   - "run tests"
-  - "make sure"
   - "does it pass"
-when_to_use: "When the user wants to verify that recent changes haven't broken anything, or wants a comprehensive quality check"
+when_to_use: "When the user wants to verify that recent changes haven't broken anything, or wants a comprehensive quality check across the whole project"
 category: quality
 tags:
   - testing
@@ -23,6 +23,8 @@ Run the project's verification toolchain to confirm code correctness.
 
 ## Step 1: Detect Project Type
 
+**Success criteria**: Identified the project type and available tooling.
+
 Check for these markers (in order) and use the FIRST match:
 
 | Marker | Project Type | 
@@ -31,19 +33,22 @@ Check for these markers (in order) and use the FIRST match:
 | `package.json` | Node.js (check for `bun.lockb` → Bun, else npm/yarn) |
 | `go.mod` | Go |
 | `pyproject.toml` or `requirements.txt` | Python |
+| `build.gradle` or `pom.xml` | Java/Kotlin |
+| `*.csproj` or `*.sln` | .NET (C#/F#) |
+| `Gemfile` | Ruby |
 | `Makefile` | Make-based (read targets to infer language) |
 
 If the project has a `Makefile` with a `check` or `test` target, prefer that — it often wraps the correct sequence.
 
 ## Step 2: Run Checks (in order)
 
-Execute each step. **Stop on first critical failure** — fix the issue before continuing.
+Execute each step. **Stop on first failure and report it.** If the user asked you to fix issues, fix them; otherwise report and continue to the next check.
 
 ### 2a. Format Check
 | Project | Command |
 |---------|---------|
 | Rust | `cargo fmt --check` |
-| Node | `npx prettier --check .` or project's format script |
+| Node | Check `package.json` scripts for `format`/`prettier` first; fallback `npx prettier --check .` |
 | Go | `gofmt -l .` |
 | Python | `ruff format --check .` or `black --check .` |
 
@@ -51,7 +56,7 @@ Execute each step. **Stop on first critical failure** — fix the issue before c
 | Project | Command |
 |---------|---------|
 | Rust | `cargo clippy --all-targets -- -D warnings` |
-| Node | `npx eslint .` or project's lint script |
+| Node | Check `package.json` scripts for `lint` first; fallback `npx eslint .` |
 | Go | `golangci-lint run` or `go vet ./...` |
 | Python | `ruff check .` or `flake8 .` |
 
@@ -78,9 +83,9 @@ Execute each step. **Stop on first critical failure** — fix the issue before c
 
 ## Step 3: Report Results
 
-For each check, report: ✅ passed, ❌ failed (with error summary), or ⏭ skipped (tool not found).
+**Success criteria**: Clear report with pass/fail status for each check.
 
-If any check fails, fix the issue and re-run that check before moving to the next.
+For each check, report: ✅ passed, ❌ failed (with error summary), or ⏭ skipped (tool not found).
 
 ## When NOT to Use
 - Don't use for runtime/integration testing that requires external services
