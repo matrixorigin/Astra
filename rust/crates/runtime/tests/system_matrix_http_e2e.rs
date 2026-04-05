@@ -8,8 +8,9 @@
 //!    `auth/refresh`, `auth/logout`, session audit APIs, `GET /events` + causal-chain + list,
 //!    data-versioning lineage (read-only), agent update, memory search/purge, `GET /workflows`,
 //!    jobs (in-memory + webhook), sandbox CRUD, webhook triggers (create → fire → delete), and
-//!    `GET /introspection/skills`. Ends with `chat/turn` (SSE) and strict `agent_events` checks
-//!    (parent link, per-field tokens, `reasoning_content`, causal chain).
+//!    `GET /introspection/skills`, session **close → resume** (with `agent_sessions` status checks),
+//!    extra audit/evaluation/marketplace reads. Ends with `chat/turn` (SSE) and strict `agent_events`
+//!    checks (parent link, per-field tokens, `reasoning_content`, causal chain).
 //!
 //! External dependencies remain mocked where the product already allows it:
 //! - LLM: `test_llm_rounds` + `bridge-e2e-hooks` (no external model server).
@@ -148,6 +149,22 @@ async fn delete_no_content(app: &Router, path: &str, auth: Option<&str>) -> Stat
 
 async fn delete_json(app: &Router, path: &str, auth: Option<&str>) -> (StatusCode, Value) {
     let mut req = Request::builder().method("DELETE").uri(path);
+    if let Some(t) = auth {
+        req = req.header("authorization", t);
+    }
+    let req = req.body(Body::empty()).expect("request");
+    let response = app.clone().oneshot(req).await.expect("oneshot");
+    let status = response.status();
+    let bytes = body::to_bytes(response.into_body(), 8 * 1024 * 1024)
+        .await
+        .expect("body");
+    let json: Value = serde_json::from_slice(&bytes).unwrap_or(json!({}));
+    (status, json)
+}
+
+/// POST with empty body (routes that have no `Json` extractor).
+async fn post_empty(app: &Router, path: &str, auth: Option<&str>) -> (StatusCode, Value) {
+    let mut req = Request::builder().method("POST").uri(path);
     if let Some(t) = auth {
         req = req.header("authorization", t);
     }
@@ -395,6 +412,46 @@ async fn product_matrix_api_journey_hits_multiple_tables() {
         Some("product matrix session (updated)")
     );
 
+    let (st_close, closed) = post_empty(
+        &app,
+        &format!("/sessions/{session_id}/close"),
+        Some(&auth_header),
+    )
+    .await;
+    assert_eq!(st_close, StatusCode::OK, "close session: {closed}");
+    assert_eq!(closed["status"].as_str(), Some("closed"), "close response: {closed}");
+
+    let sess_status = sqlx::query("SELECT status FROM agent_sessions WHERE session_id = ?")
+        .bind(&session_id)
+        .fetch_one(&pool)
+        .await
+        .expect("session status after close");
+    assert_eq!(
+        sess_status.try_get::<String, _>("status").ok().as_deref(),
+        Some("closed"),
+        "agent_sessions.status after POST .../close"
+    );
+
+    let (st_res, resm) = post_empty(
+        &app,
+        &format!("/sessions/{session_id}/resume"),
+        Some(&auth_header),
+    )
+    .await;
+    assert_eq!(st_res, StatusCode::OK, "resume session: {resm}");
+    assert_eq!(resm["status"].as_str(), Some("active"), "resume response: {resm}");
+
+    let sess_active = sqlx::query("SELECT status FROM agent_sessions WHERE session_id = ?")
+        .bind(&session_id)
+        .fetch_one(&pool)
+        .await
+        .expect("session status after resume");
+    assert_eq!(
+        sess_active.try_get::<String, _>("status").ok().as_deref(),
+        Some("active"),
+        "agent_sessions.status after POST .../resume"
+    );
+
     let (st_act, act) = get_json(
         &app,
         &format!("/sessions/{session_id}/activity"),
@@ -424,6 +481,40 @@ async fn product_matrix_api_journey_hits_multiple_tables() {
     )
     .await;
     assert_eq!(st_au_sess, StatusCode::OK, "audit sessions: {au_sess}");
+
+    let (st_au_turns, au_turns) = get_json(
+        &app,
+        &format!("/sessions/{session_id}/audit/turns?page=1&per_page=20"),
+        Some(&auth_header),
+        &[],
+    )
+    .await;
+    assert_eq!(st_au_turns, StatusCode::OK, "audit turns: {au_turns}");
+
+    let (st_au_tools, au_tools) = get_json(&app, "/audit/tools", Some(&auth_header), &[]).await;
+    assert_eq!(st_au_tools, StatusCode::OK, "cross-session audit tools: {au_tools}");
+
+    let (st_mkt, mkt_j) = get_json(
+        &app,
+        "/marketplace/installed?limit=20&offset=0",
+        Some(&auth_header),
+        &[],
+    )
+    .await;
+    assert_eq!(st_mkt, StatusCode::OK, "marketplace installed: {mkt_j}");
+
+    let xuid = &[("x-user-id", user_id.as_str())];
+    let (st_gates, gates_j) = get_json(&app, "/evaluation/gates?limit=10", None, xuid).await;
+    assert_eq!(st_gates, StatusCode::OK, "evaluation gates: {gates_j}");
+
+    let (st_cal, cal_j) = get_json(
+        &app,
+        "/evaluation/calibration?days=7",
+        None,
+        xuid,
+    )
+    .await;
+    assert_eq!(st_cal, StatusCode::OK, "evaluation calibration: {cal_j}");
 
     let (st_agent, agent_j) = post_json(
         &app,
@@ -1036,6 +1127,15 @@ async fn product_matrix_api_journey_hits_multiple_tables() {
     )
     .await;
     assert_eq!(st_sig, StatusCode::OK, "learning signals: {sig}");
+
+    let (st_lrn_stats, lrn_stats) = get_json(
+        &app,
+        "/api/v1/learning/stats",
+        Some(&auth_header),
+        &[],
+    )
+    .await;
+    assert_eq!(st_lrn_stats, StatusCode::OK, "learning stats: {lrn_stats}");
 
     let (st_drift, drift) = get_json(
         &app,
