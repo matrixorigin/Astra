@@ -281,6 +281,12 @@ pub struct AgenticLoopState {
         Option<Arc<dyn astra_core::composite_snapshot::DataSnapshotProvider>>,
     /// Most recent composite snapshot created for this session.
     pub last_composite_snapshot: Option<astra_core::composite_snapshot::CompositeSnapshot>,
+
+    // ── Context calibration (measured prompt vs estimate) ──
+    /// Last successful LLM turn's reported `prompt_tokens` (previous provider response).
+    pub last_measured_prompt_tokens: Option<u64>,
+    /// Consecutive fatal ingests whose error matched context-window / PTL patterns.
+    pub consecutive_context_window_errors: u32,
 }
 
 /// Consecutive same-category error turns before forcing a strategy change.
@@ -807,6 +813,8 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
                 has_any_usage: &mut state.has_any_usage,
                 forced_factual_retry: &mut state.forced_factual_retry,
                 messages: &mut state.messages,
+                last_measured_prompt_tokens: &mut state.last_measured_prompt_tokens,
+                consecutive_context_window_errors: &mut state.consecutive_context_window_errors,
             },
         )) {
             AgenticIngestIterationControl::Fatal(e) => {
@@ -1374,6 +1382,8 @@ mod tests {
             checkpoint_gate: None,
             data_snapshot_provider: None,
             last_composite_snapshot: None,
+            last_measured_prompt_tokens: None,
+            consecutive_context_window_errors: 0,
         }
     }
 

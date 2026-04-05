@@ -301,7 +301,12 @@ impl ServerAgenticLoopHost {
         let mut all_msgs = llm_messages.clone();
         all_msgs.extend(state.messages.iter().cloned());
         let cache_est = crate::prompts::estimate_tokens_cache_aware(&all_msgs, tool_schema_tokens);
-        let tier = budget.compaction_tier(cache_est.total_tokens);
+        let tier = crate::prompts::compaction_tier_calibrated(
+            &budget,
+            cache_est.total_tokens,
+            state.last_measured_prompt_tokens,
+            state.consecutive_context_window_errors,
+        );
         let budget_chars = budget.effective_input_limit() * 4;
 
         // Use Memoria-based compaction (async with HTTP client)
@@ -509,7 +514,12 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         let mut est_msgs = vec![json!({"role": "system", "content": system_prompt})];
         est_msgs.extend(state.messages.iter().cloned());
         let cache_est = crate::prompts::estimate_tokens_cache_aware(&est_msgs, tool_schema_tokens);
-        let tier = budget.compaction_tier(cache_est.total_tokens);
+        let tier = crate::prompts::compaction_tier_calibrated(
+            &budget,
+            cache_est.total_tokens,
+            state.last_measured_prompt_tokens,
+            state.consecutive_context_window_errors,
+        );
         let pruned_tools = prune_tool_schemas(&self.edge_tools, tier);
 
         let llm_cancel = llm_cancel_for_state(state);
@@ -1017,6 +1027,8 @@ mod tests {
             checkpoint_gate: None,
             data_snapshot_provider: None,
             last_composite_snapshot: None,
+            last_measured_prompt_tokens: None,
+            consecutive_context_window_errors: 0,
         }
     }
 

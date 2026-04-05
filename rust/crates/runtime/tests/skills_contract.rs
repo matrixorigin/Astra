@@ -168,6 +168,8 @@ impl SkillService for InMemorySkillService {
                 category: Some("general".to_string()),
                 install_count: 5,
                 created_at: Some("2026-01-01T00:00:00".to_string()),
+                publisher_id: None,
+                trust_tier: None,
             })
         } else {
             Err((

@@ -314,6 +314,8 @@ mod tests {
             checkpoint_gate: None,
             data_snapshot_provider: None,
             last_composite_snapshot: None,
+            last_measured_prompt_tokens: None,
+            consecutive_context_window_errors: 0,
         }
     }
 

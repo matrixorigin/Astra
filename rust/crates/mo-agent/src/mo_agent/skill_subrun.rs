@@ -347,6 +347,8 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
             checkpoint_gate: None,
             data_snapshot_provider: None,
             last_composite_snapshot: None,
+            last_measured_prompt_tokens: None,
+            consecutive_context_window_errors: 0,
         };
 
         run_agentic_loop_with_host(&mut host, &mut state).await?;

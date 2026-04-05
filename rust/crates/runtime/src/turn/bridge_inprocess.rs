@@ -1212,7 +1212,7 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
             // Merge tool results into messages (handle continuation turns)
             // Client sends complete message history including tool role messages,
             // so we just use messages directly.
-            let (merged_messages, tier) = {
+            let (merged_messages, _initial_tier) = {
                 let raw = messages.clone();
                 // Compute model budget for tier-aware compaction using cache-aware estimation.
                 // Tool schemas are cache-eligible (stable prefix), so we estimate their cost.
@@ -1224,7 +1224,12 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
                 let mut all_msgs = llm_messages.clone();
                 all_msgs.extend(raw.iter().cloned());
                 let cache_est = crate::prompts::estimate_tokens_cache_aware(&all_msgs, tool_schema_tokens);
-                let tier = budget.compaction_tier(cache_est.total_tokens);
+                let tier = crate::prompts::compaction_tier_calibrated(
+                    &budget,
+                    cache_est.total_tokens,
+                    None,
+                    0,
+                );
                 // Use effective input limit as char budget (×4 for char-to-token ratio)
                 let budget_chars = budget.effective_input_limit() * 4;
 
@@ -1265,7 +1270,7 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
                 )
                 .await;
 
-                (compact_result.messages, tier)
+                (compact_result.messages, tier) // tier only feeds memoria_compact params
             };
 
             llm_messages.extend(merged_messages);
@@ -1291,9 +1296,6 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
             let budget = crate::prompts::budget_for_model(Some(&model_name));
             let max_output_tokens =
                 (budget.model_limit as f64 * budget.output_reserve_ratio) as usize;
-            let mut pruned_tools = prune_tool_schemas(&edge_tools, tier);
-            // Annotate tool schemas with cache_control for Anthropic
-            annotate_tool_schemas_for_caching(&mut pruned_tools, &provider, &model_name);
             let ledger_wait = std::time::Duration::from_secs_f64(turn_timeout_s().max(1.0));
             let max_rounds = crate::turn::routing::max_tool_rounds();
             let round_limit: i64 = if use_e2e_llm {
@@ -1305,8 +1307,32 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
                 max_rounds
             };
 
+            let mut last_measured_prompt: Option<u64> = None;
+            let mut bridge_ptl_streak: u32 = 0;
+
             for round_ix in 0i64..round_limit {
                 cloud_loop_turns += 1;
+
+                let tool_schema_tokens_round: usize = edge_tools
+                    .iter()
+                    .map(|t| {
+                        serde_json::to_string(t)
+                            .map(|s| crate::prompts::estimate_str_tokens(&s))
+                            .unwrap_or(50)
+                    })
+                    .sum();
+                let cache_est_round = crate::prompts::estimate_tokens_cache_aware(
+                    &llm_messages,
+                    tool_schema_tokens_round,
+                );
+                let round_tier = crate::prompts::compaction_tier_calibrated(
+                    &budget,
+                    cache_est_round.total_tokens,
+                    last_measured_prompt,
+                    bridge_ptl_streak,
+                );
+                let mut pruned_tools = prune_tool_schemas(&edge_tools, round_tier);
+                annotate_tool_schemas_for_caching(&mut pruned_tools, &provider, &model_name);
 
                 let loop_started = Instant::now();
                 let mut loop_tool_calls: Vec<Value> = Vec::new();
@@ -1357,6 +1383,7 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
                         Ok(s) => s,
                         Err(e) if e.starts_with(crate::turn::llm_client::CONTEXT_WINDOW_ERROR_PREFIX) => {
                             // Context-window error: force aggressive compaction and retry once
+                            bridge_ptl_streak = bridge_ptl_streak.saturating_add(1);
                             astra_core::agent_warn!(
                                 "bridge",
                                 "context window exceeded — forcing aggressive compaction and retrying"
@@ -1547,6 +1574,14 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
                     "out": usage.get("completion").and_then(Value::as_i64),
                     "tool_calls": loop_tool_calls.len(),
                 }));
+
+                let prompt_from_usage = usage
+                    .get("prompt")
+                    .and_then(|v| v.as_u64().or_else(|| v.as_i64().map(|i| i.max(0) as u64)));
+                if let Some(p) = prompt_from_usage.filter(|&p| p > 0) {
+                    last_measured_prompt = Some(p);
+                    bridge_ptl_streak = 0;
+                }
 
                 if loop_tool_calls.is_empty() {
                     break;

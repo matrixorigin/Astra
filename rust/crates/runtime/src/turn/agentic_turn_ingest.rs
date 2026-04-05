@@ -64,6 +64,10 @@ pub struct AgenticTurnIngestMut<'a> {
     pub has_any_usage: &'a mut bool,
     pub forced_factual_retry: &'a mut bool,
     pub messages: &'a mut Vec<Value>,
+    /// See [`crate::turn::agentic_loop_host::AgenticLoopState::last_measured_prompt_tokens`].
+    pub last_measured_prompt_tokens: &'a mut Option<u64>,
+    /// See [`crate::turn::agentic_loop_host::AgenticLoopState::consecutive_context_window_errors`].
+    pub consecutive_context_window_errors: &'a mut u32,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -105,7 +109,7 @@ pub fn ingest_agentic_turn_stream(
     message: &str,
     recent_tools: &[String],
     quiet: bool,
-    st: AgenticTurnIngestMut<'_>,
+    mut st: AgenticTurnIngestMut<'_>,
 ) -> AgenticTurnIngestOutcome {
     if st.first_ttft_ms.is_none() {
         *st.first_ttft_ms = snap.ttft_ms;
@@ -164,6 +168,13 @@ pub fn ingest_agentic_turn_stream(
     *st.has_any_usage = *st.has_any_usage || snap.has_usage;
 
     if let Some(err) = snap.error_message {
+        let lower = err.to_lowercase();
+        if crate::turn::llm_client::is_context_window_error(&lower) {
+            *st.consecutive_context_window_errors =
+                st.consecutive_context_window_errors.saturating_add(1);
+        } else {
+            *st.consecutive_context_window_errors = 0;
+        }
         return AgenticTurnIngestOutcome::Fatal(err.clone());
     }
 
@@ -182,12 +193,26 @@ pub fn ingest_agentic_turn_stream(
             st.messages
                 .push(openai_factual_tool_retry_user_message(message));
             st.final_text.clear();
+            record_prompt_calibration_success(snap, &mut st);
             return AgenticTurnIngestOutcome::Continue;
         }
+        record_prompt_calibration_success(snap, &mut st);
         return AgenticTurnIngestOutcome::Break;
     }
 
+    record_prompt_calibration_success(snap, &mut st);
     AgenticTurnIngestOutcome::HasToolCalls
+}
+
+/// After a non-fatal ingest: clear PTL streak and remember provider prompt size when available.
+fn record_prompt_calibration_success(
+    snap: &AgenticTurnStreamSnapshot<'_>,
+    st: &mut AgenticTurnIngestMut<'_>,
+) {
+    *st.consecutive_context_window_errors = 0;
+    if snap.has_usage && snap.prompt_tokens > 0 {
+        *st.last_measured_prompt_tokens = Some(snap.prompt_tokens);
+    }
 }
 
 #[cfg(test)]
@@ -208,6 +233,8 @@ mod tests {
         has_any_usage: bool,
         forced_factual_retry: bool,
         messages: Vec<Value>,
+        last_measured_prompt_tokens: Option<u64>,
+        consecutive_context_window_errors: u32,
     }
 
     impl Pack {
@@ -225,6 +252,8 @@ mod tests {
                 has_any_usage: false,
                 forced_factual_retry: false,
                 messages: Vec::new(),
+                last_measured_prompt_tokens: None,
+                consecutive_context_window_errors: 0,
             }
         }
 
@@ -243,6 +272,8 @@ mod tests {
                 has_any_usage: &mut self.has_any_usage,
                 forced_factual_retry: &mut self.forced_factual_retry,
                 messages: &mut self.messages,
+                last_measured_prompt_tokens: &mut self.last_measured_prompt_tokens,
+                consecutive_context_window_errors: &mut self.consecutive_context_window_errors,
             }
         }
     }
@@ -317,6 +348,68 @@ mod tests {
             pack.ingest_mut(),
         );
         assert_eq!(out, AgenticTurnIngestOutcome::Fatal("boom".to_string()));
+        assert_eq!(pack.consecutive_context_window_errors, 0);
+    }
+
+    #[test]
+    fn fatal_context_window_increments_ptl_streak() {
+        let err = Some("prompt is too long".to_string());
+        let snap = AgenticTurnStreamSnapshot {
+            ttft_ms: None,
+            session_id: &None,
+            run_id: &None,
+            full_text: "",
+            tool_calls: &[],
+            prompt_tokens: 5,
+            completion_tokens: 1,
+            has_usage: true,
+            error_message: &err,
+        };
+        let mut pack = Pack::new();
+        pack.consecutive_context_window_errors = 1;
+        let out = ingest_agentic_turn_stream(
+            &snap,
+            0,
+            |_| String::new(),
+            "hi",
+            &[],
+            true,
+            pack.ingest_mut(),
+        );
+        assert_eq!(
+            out,
+            AgenticTurnIngestOutcome::Fatal("prompt is too long".to_string())
+        );
+        assert_eq!(pack.consecutive_context_window_errors, 2);
+    }
+
+    #[test]
+    fn fatal_non_context_resets_ptl_streak() {
+        let err = Some("rate limited".to_string());
+        let snap = AgenticTurnStreamSnapshot {
+            ttft_ms: None,
+            session_id: &None,
+            run_id: &None,
+            full_text: "",
+            tool_calls: &[],
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            has_usage: false,
+            error_message: &err,
+        };
+        let mut pack = Pack::new();
+        pack.consecutive_context_window_errors = 4;
+        let out = ingest_agentic_turn_stream(
+            &snap,
+            0,
+            |_| String::new(),
+            "hi",
+            &[],
+            true,
+            pack.ingest_mut(),
+        );
+        assert_eq!(out, AgenticTurnIngestOutcome::Fatal("rate limited".to_string()));
+        assert_eq!(pack.consecutive_context_window_errors, 0);
     }
 
     #[test]
@@ -347,6 +440,8 @@ mod tests {
         assert_eq!(pack.total_prompt, 1);
         assert_eq!(pack.total_completion, 2);
         assert!(pack.has_any_usage);
+        assert_eq!(pack.last_measured_prompt_tokens, Some(1));
+        assert_eq!(pack.consecutive_context_window_errors, 0);
     }
 
     #[test]
@@ -464,6 +559,7 @@ mod tests {
         assert_eq!(out, AgenticTurnIngestOutcome::Continue);
         assert!(pack.forced_factual_retry, "flag should be set");
         assert!(pack.final_text.is_empty(), "text should be cleared");
+        assert_eq!(pack.last_measured_prompt_tokens, Some(100));
         assert_eq!(pack.messages.len(), 1, "nudge message should be injected");
         let nudge = &pack.messages[0];
         assert_eq!(nudge["role"], "user");

@@ -293,6 +293,8 @@ impl AgenticRunLifecycleService {
             checkpoint_gate: None,
             data_snapshot_provider: None,
             last_composite_snapshot: None,
+            last_measured_prompt_tokens: None,
+            consecutive_context_window_errors: 0,
         }
     }
 
@@ -942,6 +944,8 @@ impl SubRunExecutor for ServerSubRunExecutor {
             checkpoint_gate: config.checkpoint_gate.clone(),
             data_snapshot_provider: None,
             last_composite_snapshot: None,
+            last_measured_prompt_tokens: None,
+            consecutive_context_window_errors: 0,
         };
 
         let outcome = run_agentic_loop_with_host(&mut host, &mut loop_state).await;

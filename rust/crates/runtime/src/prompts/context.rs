@@ -323,6 +323,56 @@ impl ContextBudget {
     }
 }
 
+#[must_use]
+fn compaction_tier_rank(tier: CompactionTier) -> u8 {
+    match tier {
+        CompactionTier::Normal => 0,
+        CompactionTier::TrimSchemas => 1,
+        CompactionTier::CompactHistory => 2,
+        CompactionTier::AggressivePrune => 3,
+    }
+}
+
+#[must_use]
+fn tier_from_compaction_rank(rank: u8) -> CompactionTier {
+    match rank.min(3) {
+        0 => CompactionTier::Normal,
+        1 => CompactionTier::TrimSchemas,
+        2 => CompactionTier::CompactHistory,
+        _ => CompactionTier::AggressivePrune,
+    }
+}
+
+#[must_use]
+fn max_compaction_tier(a: CompactionTier, b: CompactionTier) -> CompactionTier {
+    tier_from_compaction_rank(compaction_tier_rank(a).max(compaction_tier_rank(b)))
+}
+
+/// [`ContextBudget::compaction_tier`] plus provider-reported prompt size and recent
+/// prompt-too-long streaks so the next assembly matches tokenizer reality.
+#[must_use]
+pub fn compaction_tier_calibrated(
+    budget: &ContextBudget,
+    estimated_tokens: usize,
+    last_measured_prompt_tokens: Option<u64>,
+    consecutive_context_window_errors: u32,
+) -> CompactionTier {
+    let from_est = budget.compaction_tier(estimated_tokens);
+    let from_meas = last_measured_prompt_tokens
+        .filter(|&p| p > 0)
+        .map(|p| budget.compaction_tier(p as usize))
+        .unwrap_or(CompactionTier::Normal);
+
+    let mut merged = max_compaction_tier(from_est, from_meas);
+    if consecutive_context_window_errors > 0 {
+        let bump = consecutive_context_window_errors.min(3) as u8;
+        let cap = compaction_tier_rank(CompactionTier::AggressivePrune);
+        let new_rank = compaction_tier_rank(merged).saturating_add(bump).min(cap);
+        merged = tier_from_compaction_rank(new_rank);
+    }
+    merged
+}
+
 impl Default for ContextBudget {
     fn default() -> Self {
         Self {
@@ -538,6 +588,60 @@ mod tests {
         // Exactly at 75% — still TrimSchemas (> 0.75 triggers CompactHistory)
         let tokens = (limit as f64 * 0.75) as usize;
         assert_eq!(b.compaction_tier(tokens), CompactionTier::TrimSchemas);
+    }
+
+    // ---------------------------------------------------------------
+    // 3b. Usage-calibrated compaction tier
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn calibrated_tier_uses_max_of_estimate_and_measured() {
+        let b = budget_for_model(Some("gpt-4o"));
+        let limit = b.effective_input_limit();
+        let low_est = (limit as f64 * 0.50) as usize;
+        assert_eq!(b.compaction_tier(low_est), CompactionTier::Normal);
+        let high_measured = (limit as f64 * 0.90) as u64;
+        let tier = compaction_tier_calibrated(&b, low_est, Some(high_measured), 0);
+        assert_eq!(tier, CompactionTier::AggressivePrune);
+    }
+
+    #[test]
+    fn calibrated_tier_no_measurement_falls_back_to_estimate() {
+        let b = budget_for_model(Some("gpt-4o"));
+        let limit = b.effective_input_limit();
+        let tokens = (limit as f64 * 0.65) as usize;
+        let tier = compaction_tier_calibrated(&b, tokens, None, 0);
+        assert_eq!(tier, b.compaction_tier(tokens));
+    }
+
+    #[test]
+    fn calibrated_tier_ptl_bump_from_normal() {
+        let b = budget_for_model(Some("gpt-4o"));
+        let limit = b.effective_input_limit();
+        let tokens = (limit as f64 * 0.50) as usize;
+        assert_eq!(
+            compaction_tier_calibrated(&b, tokens, None, 1),
+            CompactionTier::TrimSchemas
+        );
+        assert_eq!(
+            compaction_tier_calibrated(&b, tokens, None, 2),
+            CompactionTier::CompactHistory
+        );
+        assert_eq!(
+            compaction_tier_calibrated(&b, tokens, None, 3),
+            CompactionTier::AggressivePrune
+        );
+    }
+
+    #[test]
+    fn calibrated_tier_ptl_bump_caps_at_aggressive() {
+        let b = budget_for_model(Some("gpt-4o"));
+        let limit = b.effective_input_limit();
+        let tokens = (limit as f64 * 0.90) as usize;
+        assert_eq!(
+            compaction_tier_calibrated(&b, tokens, None, 99),
+            CompactionTier::AggressivePrune
+        );
     }
 
     // ---------------------------------------------------------------
