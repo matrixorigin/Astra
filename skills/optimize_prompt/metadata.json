@@ -1,0 +1,57 @@
+{
+  "name": "optimize_prompt",
+  "version": "1.0.0",
+  "description": "Analyze and optimize LLM prompt: system message, tool schemas, history, budget pressure",
+  "category": "development",
+  "input_schema": {
+    "type": "object",
+    "properties": {
+      "target": {
+        "type": "string",
+        "description": "Session ID, debug JSON path, or 'this'/'last'"
+      },
+      "component": {
+        "type": "string",
+        "enum": ["system", "tools", "history", "skills", "budget", "all"],
+        "description": "Prompt component to focus on (default: all)"
+      }
+    }
+  },
+  "output_schema": {
+    "type": "object",
+    "properties": {
+      "optimization_score": { "type": "number", "description": "0-100 score" },
+      "token_breakdown": {
+        "type": "object",
+        "properties": {
+          "system_prompt": { "type": "number" },
+          "tool_schemas": { "type": "number" },
+          "conversation": { "type": "number" },
+          "tool_results": { "type": "number" },
+          "skills_memory": { "type": "number" }
+        }
+      },
+      "savings_opportunities": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "properties": {
+            "component": { "type": "string" },
+            "description": { "type": "string" },
+            "estimated_savings_tokens": { "type": "number" }
+          }
+        }
+      }
+    }
+  },
+  "examples": [
+    {
+      "input": { "component": "all" },
+      "description": "Full prompt optimization analysis of most recent session"
+    },
+    {
+      "input": { "component": "tools" },
+      "description": "Focus on tool schema token efficiency"
+    }
+  ]
+}

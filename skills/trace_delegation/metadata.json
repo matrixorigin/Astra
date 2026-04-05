@@ -1,0 +1,53 @@
+{
+  "name": "trace_delegation",
+  "version": "1.0.0",
+  "description": "Trace multi-agent delegation flows, sub-run hierarchy, and verification gates",
+  "category": "development",
+  "input_schema": {
+    "type": "object",
+    "properties": {
+      "target": {
+        "type": "string",
+        "description": "Session ID, delegation ID, or 'last'"
+      },
+      "depth": {
+        "type": "string",
+        "enum": ["summary", "detail", "deep"],
+        "description": "Trace depth (default: detail)"
+      }
+    }
+  },
+  "output_schema": {
+    "type": "object",
+    "properties": {
+      "delegation_id": { "type": "string" },
+      "pattern": { "type": "string" },
+      "agent_count": { "type": "number" },
+      "total_tokens": { "type": "number" },
+      "overhead_ratio": { "type": "number" },
+      "sub_runs": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "properties": {
+            "run_id": { "type": "string" },
+            "agent_id": { "type": "string" },
+            "status": { "type": "string" },
+            "tokens": { "type": "number" },
+            "gate_verdict": { "type": "string" }
+          }
+        }
+      }
+    }
+  },
+  "examples": [
+    {
+      "input": { "depth": "detail" },
+      "description": "Trace most recent delegation with per-sub-run detail"
+    },
+    {
+      "input": { "target": "last", "depth": "deep" },
+      "description": "Full message-level trace of last delegation"
+    }
+  ]
+}

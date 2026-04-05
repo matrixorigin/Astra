@@ -1,0 +1,10 @@
+name: trace-delegation
+version: "1.0.0"
+description: "Trace multi-agent delegation flows: fan-out, pipeline, sequential, adversarial patterns, verification gates, sub-run hierarchy"
+author: "astra"
+
+tools:
+  - bash
+  - read_file
+  - grep
+  - glob

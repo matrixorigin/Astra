@@ -1,0 +1,10 @@
+name: audit-cloud-sync
+version: "1.0.0"
+description: "Audit edge-cloud sync: event ingestion, learning snapshots, checkpoints, task state, conflict resolution, sync failures"
+author: "astra"
+
+tools:
+  - bash
+  - read_file
+  - grep
+  - glob

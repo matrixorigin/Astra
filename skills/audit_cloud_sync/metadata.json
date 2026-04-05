@@ -1,0 +1,45 @@
+{
+  "name": "audit_cloud_sync",
+  "version": "1.0.0",
+  "description": "Audit edge-cloud synchronization: events, learning, checkpoints, tasks",
+  "category": "development",
+  "input_schema": {
+    "type": "object",
+    "properties": {
+      "target": {
+        "type": "string",
+        "description": "Session ID or 'last'"
+      },
+      "aspect": {
+        "type": "string",
+        "enum": ["events", "learning", "checkpoints", "tasks", "all"],
+        "description": "Sync aspect to audit (default: all)"
+      }
+    }
+  },
+  "output_schema": {
+    "type": "object",
+    "properties": {
+      "event_sync_rate": { "type": "number", "description": "% of local events in cloud" },
+      "learning_version_match": { "type": "boolean" },
+      "checkpoint_coverage": { "type": "number", "description": "% of turns with checkpoints" },
+      "sync_success_rate": { "type": "number", "description": "Overall sync success %" },
+      "issues": { "type": "array", "items": { "type": "string" } },
+      "warnings": { "type": "array", "items": { "type": "string" } }
+    }
+  },
+  "examples": [
+    {
+      "input": { "aspect": "all" },
+      "description": "Full sync audit of most recent session"
+    },
+    {
+      "input": { "aspect": "events" },
+      "description": "Check event ingestion completeness"
+    },
+    {
+      "input": { "aspect": "learning" },
+      "description": "Verify learning snapshot sync and version consistency"
+    }
+  ]
+}

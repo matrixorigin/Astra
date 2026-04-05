@@ -1,0 +1,10 @@
+name: optimize-prompt
+version: "1.0.0"
+description: "Analyze and optimize LLM prompt assembly: system message, tool schemas, history, budget pressure, token waste"
+author: "astra"
+
+tools:
+  - bash
+  - read_file
+  - grep
+  - glob
