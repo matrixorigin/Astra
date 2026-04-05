@@ -362,6 +362,9 @@ impl UnifiedSkillResolver {
             success_criteria: loaded.manifest.success_criteria.clone(),
             composition: loaded.manifest.composition.clone(),
             input_schema: loaded.manifest.input_schema.clone(),
+            aliases: loaded.manifest.aliases.clone(),
+            effort: loaded.manifest.effort.clone(),
+            agent_type: loaded.manifest.agent_type.clone(),
         }
     }
 }
@@ -373,9 +376,18 @@ impl super::traits::SkillResolver for UnifiedSkillResolver {
 
         // Try cache first (synchronous — no runtime needed)
         if let Ok(cache) = registry.cache.read() {
+            // Direct name match
             if let Some(entry) = cache.get(&name) {
                 if let Some(ref loaded) = entry.loaded {
                     return Ok(Self::loaded_to_resolved(loaded));
+                }
+            }
+            // Alias match — check all cached entries
+            for entry in cache.values() {
+                if entry.manifest.aliases.iter().any(|a| a == &name) {
+                    if let Some(ref loaded) = entry.loaded {
+                        return Ok(Self::loaded_to_resolved(loaded));
+                    }
                 }
             }
         }
@@ -435,6 +447,7 @@ impl super::traits::SkillResolver for UnifiedSkillResolver {
                 description: m.description,
                 when_to_use: m.when_to_use,
                 source: m.source,
+                aliases: m.aliases,
             })
             .collect()
     }
@@ -471,6 +484,9 @@ impl crate::turn::skill_tool::SkillResolver for LegacySkillResolverAdapter {
                 success_criteria: resolved.success_criteria,
                 composition: resolved.composition,
                 input_schema: resolved.input_schema,
+                aliases: resolved.aliases,
+                effort: resolved.effort,
+                agent_type: resolved.agent_type,
             }),
             Err(e) => Err(e.to_string()),
         }
@@ -485,6 +501,7 @@ impl crate::turn::skill_tool::SkillResolver for LegacySkillResolverAdapter {
                 description: s.description,
                 when_to_use: s.when_to_use,
                 source: s.source,
+                aliases: s.aliases,
             })
             .collect()
     }

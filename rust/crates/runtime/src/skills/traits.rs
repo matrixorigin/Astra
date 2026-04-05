@@ -83,6 +83,7 @@ pub struct SkillToolInfo {
     pub description: String,
     pub when_to_use: Option<String>,
     pub source: super::manifest::SkillSourceKind,
+    pub aliases: Vec<String>,
 }
 
 /// A fully resolved skill ready for execution.
@@ -103,6 +104,9 @@ pub struct ResolvedSkill {
     pub success_criteria: Vec<astra_services::VerificationCriterion>,
     pub composition: Option<super::manifest::SkillComposition>,
     pub input_schema: Option<serde_json::Value>,
+    pub aliases: Vec<String>,
+    pub effort: Option<super::manifest::EffortLevel>,
+    pub agent_type: Option<String>,
 }
 
 /// Resolves skill names to instructions.

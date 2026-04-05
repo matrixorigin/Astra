@@ -2738,6 +2738,9 @@ mod tests {
                         success_criteria: Vec::new(),
                         composition: None,
                         input_schema: None,
+                        aliases: Vec::new(),
+                        effort: None,
+                        agent_type: None,
                     }
                 })
                 .ok_or_else(|| format!("unknown skill: {name}"))
@@ -2751,6 +2754,7 @@ mod tests {
                     description: d.clone(),
                     when_to_use: None,
                     source: crate::skills::manifest::SkillSourceKind::Local,
+                    aliases: Vec::new(),
                 })
                 .collect()
         }

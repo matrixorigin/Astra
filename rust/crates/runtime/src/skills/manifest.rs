@@ -155,6 +155,20 @@ pub struct SkillManifest {
     /// Compatibility constraints.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compatibility: Option<CompatibilityInfo>,
+
+    // ── CC-compatible fields ────────────────────────────────────────────────
+
+    /// Alternative names for this skill (resolved during lookup).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub aliases: Vec<String>,
+    /// Effort level hint — controls reasoning depth when executing this skill.
+    /// Named levels: "low", "medium", "high", "max"; or an integer 0-255.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<EffortLevel>,
+    /// Agent type for fork execution (e.g. "general-purpose", "bash-only").
+    /// Only meaningful when `execution_context` is `Fork`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_type: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -165,7 +179,58 @@ fn is_default_trust_tier(tier: &TrustTier) -> bool {
     *tier == TrustTier::Unverified
 }
 
-/// Composition metadata for skill chaining.
+/// Effort level for skill execution — controls reasoning depth.
+///
+/// Matches CC's `EffortValue`: named levels map to model-specific
+/// reasoning budgets, or a raw integer (0-255) for fine-grained control.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum EffortLevel {
+    Low,
+    Medium,
+    High,
+    Max,
+    /// Raw numeric effort (0-255).
+    Custom(u8),
+}
+
+impl EffortLevel {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.to_lowercase().as_str() {
+            "low" => Some(Self::Low),
+            "medium" => Some(Self::Medium),
+            "high" => Some(Self::High),
+            "max" => Some(Self::Max),
+            _ => s.parse::<u8>().ok().map(Self::Custom),
+        }
+    }
+
+    pub fn as_str(&self) -> String {
+        match self {
+            Self::Low => "low".into(),
+            Self::Medium => "medium".into(),
+            Self::High => "high".into(),
+            Self::Max => "max".into(),
+            Self::Custom(n) => n.to_string(),
+        }
+    }
+}
+
+impl Serialize for EffortLevel {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for EffortLevel {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(deserializer)?;
+        EffortLevel::parse(&s).ok_or_else(|| {
+            serde::de::Error::custom(format!(
+                "invalid effort level '{s}'. Valid: low, medium, high, max, or 0-255"
+            ))
+        })
+    }
+}
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SkillComposition {
     /// Whether this skill can be called by other skills.
@@ -299,6 +364,9 @@ impl Default for SkillManifest {
             trust_tier: TrustTier::default(),
             publisher: None,
             compatibility: None,
+            aliases: Vec::new(),
+            effort: None,
+            agent_type: None,
         }
     }
 }

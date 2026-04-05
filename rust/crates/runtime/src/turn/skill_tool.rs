@@ -47,6 +47,8 @@ pub struct SkillToolInfo {
     pub when_to_use: Option<String>,
     /// Where this skill was loaded from (bundled skills get priority in budget).
     pub source: SkillSourceKind,
+    /// Alternative names for this skill.
+    pub aliases: Vec<String>,
 }
 
 /// A fully resolved skill ready for execution.
@@ -75,6 +77,12 @@ pub struct ResolvedSkill {
     pub composition: Option<crate::skills::manifest::SkillComposition>,
     /// Input schema for argument validation (JSON Schema subset).
     pub input_schema: Option<Value>,
+    /// Alternative names for this skill.
+    pub aliases: Vec<String>,
+    /// Effort level hint for reasoning depth.
+    pub effort: Option<crate::skills::manifest::EffortLevel>,
+    /// Agent type for fork execution (e.g. "general-purpose").
+    pub agent_type: Option<String>,
 }
 
 /// Trait for resolving skill names to instructions.
@@ -102,10 +110,13 @@ const MAX_LISTING_DESC_CHARS: usize = 250;
 
 /// Format a single skill's description, respecting the per-entry cap.
 fn format_skill_description(s: &SkillToolInfo) -> String {
-    let desc = match &s.when_to_use {
+    let mut desc = match &s.when_to_use {
         Some(when) => format!("{} (use when: {})", s.description, when),
         None => s.description.clone(),
     };
+    if !s.aliases.is_empty() {
+        desc.push_str(&format!(" [aliases: {}]", s.aliases.join(", ")));
+    }
     if desc.len() > MAX_LISTING_DESC_CHARS {
         format!("{}…", &desc[..MAX_LISTING_DESC_CHARS - 1])
     } else {
@@ -129,7 +140,15 @@ fn format_skills_within_budget(
         return (Vec::new(), Vec::new());
     }
 
-    let all_names: Vec<String> = skills.iter().map(|s| s.name.clone()).collect();
+    let mut all_names: Vec<String> = skills.iter().map(|s| s.name.clone()).collect();
+    // Include aliases so the LLM can invoke skills by alternative names
+    for s in skills {
+        for alias in &s.aliases {
+            if !all_names.contains(alias) {
+                all_names.push(alias.clone());
+            }
+        }
+    }
 
     // Try full descriptions first
     let full_entries: Vec<String> = skills
@@ -756,6 +775,9 @@ mod tests {
                     success_criteria: Vec::new(),
                     composition: None,
                     input_schema: None,
+                    aliases: Vec::new(),
+                    effort: None,
+                    agent_type: None,
                 })
                 .ok_or_else(|| format!("Unknown skill: {name}"))
         }
@@ -768,6 +790,7 @@ mod tests {
                     description: d.clone(),
                     when_to_use: None,
                     source: SkillSourceKind::Local,
+                    aliases: Vec::new(),
                 })
                 .collect()
         }
@@ -937,6 +960,7 @@ mod tests {
             description: "Deploy services".into(),
             when_to_use: Some("when user asks to deploy".into()),
             source: SkillSourceKind::Local,
+            aliases: Vec::new(),
         }];
         let schema = skill_tool_schema(&skills, None, None);
         let desc = schema["function"]["description"].as_str().unwrap();
@@ -951,6 +975,7 @@ mod tests {
                 description: format!("Does thing {i}"),
                 when_to_use: None,
                 source: SkillSourceKind::Local,
+                aliases: Vec::new(),
             })
             .collect();
         let (entries, names) = format_skills_within_budget(&skills, 10_000, None, None);
@@ -969,6 +994,7 @@ mod tests {
                 description: format!("This is a very long description for skill number {i} that goes on and on"),
                 when_to_use: Some(format!("when the user needs to do something very specific related to task {i}")),
                 source: SkillSourceKind::Local,
+                aliases: Vec::new(),
             })
             .collect();
         let (entries, names) = format_skills_within_budget(&skills, 500, None, None);
@@ -987,6 +1013,7 @@ mod tests {
                 description: format!("Important bundled skill {i}"),
                 when_to_use: None,
                 source: SkillSourceKind::Bundled,
+                aliases: Vec::new(),
             })
             .collect();
         // Add many local skills
@@ -996,6 +1023,7 @@ mod tests {
                 description: format!("Local skill with a fairly long description for number {i}"),
                 when_to_use: None,
                 source: SkillSourceKind::Local,
+                aliases: Vec::new(),
             });
         }
         let (entries, names) = format_skills_within_budget(&skills, 800, None, None);
@@ -1014,6 +1042,7 @@ mod tests {
                 description: format!("Description {i}"),
                 when_to_use: None,
                 source: SkillSourceKind::Local,
+                aliases: Vec::new(),
             })
             .collect();
         // With 100 skills and 200 byte budget, names-only
@@ -1032,6 +1061,7 @@ mod tests {
             description: long_desc.clone(),
             when_to_use: None,
             source: SkillSourceKind::Local,
+            aliases: Vec::new(),
         }];
         let (entries, _) = format_skills_within_budget(&skills, 10_000, None, None);
         // Description should be capped at MAX_LISTING_DESC_CHARS
@@ -1049,12 +1079,14 @@ mod tests {
                 description: "A skill that fails often".into(),
                 when_to_use: None,
                 source: SkillSourceKind::Local,
+                aliases: Vec::new(),
             },
             SkillToolInfo {
                 name: "high-quality".into(),
                 description: "A skill that succeeds often".into(),
                 when_to_use: None,
                 source: SkillSourceKind::Local,
+                aliases: Vec::new(),
             },
         ];
 
@@ -1096,6 +1128,7 @@ mod tests {
                 description: format!("Description for skill {i} which is moderately long"),
                 when_to_use: None,
                 source: SkillSourceKind::Local,
+                aliases: Vec::new(),
             })
             .collect();
 
@@ -1129,6 +1162,9 @@ mod tests {
                     success_criteria: Vec::new(),
                     composition: None,
                     input_schema: None,
+                    aliases: Vec::new(),
+                    effort: None,
+                    agent_type: None,
                 })
             }
             fn available_skills(&self) -> Vec<SkillToolInfo> {
@@ -1163,6 +1199,9 @@ mod tests {
                     success_criteria: Vec::new(),
                     composition: None,
                     input_schema: None,
+                    aliases: Vec::new(),
+                    effort: None,
+                    agent_type: None,
                 })
             }
             fn available_skills(&self) -> Vec<SkillToolInfo> {
@@ -1211,6 +1250,9 @@ mod tests {
                     success_criteria: Vec::new(),
                     composition: None,
                     input_schema: None,
+                    aliases: Vec::new(),
+                    effort: None,
+                    agent_type: None,
         };
         let act = super::build_activation(&skill);
         assert!(act.model_override.is_none());
@@ -1232,6 +1274,9 @@ mod tests {
                     success_criteria: Vec::new(),
                     composition: None,
                     input_schema: None,
+                    aliases: Vec::new(),
+                    effort: None,
+                    agent_type: None,
         };
         let act = super::build_activation(&skill);
         assert_eq!(act.model_override.as_deref(), Some("claude-sonnet-4-20250514"));
@@ -1358,6 +1403,9 @@ mod tests {
                         success_criteria: Vec::new(),
                     composition: None,
                     input_schema: None,
+                    aliases: Vec::new(),
+                    effort: None,
+                    agent_type: None,
                     }),
                     "skill-b" => Ok(ResolvedSkill {
                         name: "skill-b".into(),
@@ -1372,14 +1420,17 @@ mod tests {
                         success_criteria: Vec::new(),
                     composition: None,
                     input_schema: None,
+                    aliases: Vec::new(),
+                    effort: None,
+                    agent_type: None,
                     }),
                     _ => Err(format!("unknown: {name}")),
                 }
             }
             fn available_skills(&self) -> Vec<SkillToolInfo> {
                 vec![
-                    SkillToolInfo { name: "skill-a".into(), description: "A".into(), when_to_use: None, source: SkillSourceKind::Local },
-                    SkillToolInfo { name: "skill-b".into(), description: "B".into(), when_to_use: None, source: SkillSourceKind::Local },
+                    SkillToolInfo { name: "skill-a".into(), description: "A".into(), when_to_use: None, source: SkillSourceKind::Local, aliases: Vec::new() },
+                    SkillToolInfo { name: "skill-b".into(), description: "B".into(), when_to_use: None, source: SkillSourceKind::Local, aliases: Vec::new() },
                 ]
             }
         }
@@ -1427,6 +1478,9 @@ mod tests {
                     success_criteria: Vec::new(),
                     composition: None,
                     input_schema: None,
+                    aliases: Vec::new(),
+                    effort: None,
+                    agent_type: None,
                     })
                 } else {
                     Err(format!("unknown: {name}"))
@@ -1480,6 +1534,9 @@ mod tests {
                     success_criteria: Vec::new(),
                     composition: None, // not composable
                     input_schema: None,
+                    aliases: Vec::new(),
+                    effort: None,
+                    agent_type: None,
                 })
             }
             fn available_skills(&self) -> Vec<SkillToolInfo> { vec![] }
@@ -1518,6 +1575,9 @@ mod tests {
                         max_duration_sec: None,
                     }),
                     input_schema: None,
+                    aliases: Vec::new(),
+                    effort: None,
+                    agent_type: None,
                 })
             }
             fn available_skills(&self) -> Vec<SkillToolInfo> { vec![] }
@@ -1556,6 +1616,9 @@ mod tests {
                         max_duration_sec: None,
                     }),
                     input_schema: None,
+                    aliases: Vec::new(),
+                    effort: None,
+                    agent_type: None,
                 })
             }
             fn available_skills(&self) -> Vec<SkillToolInfo> { vec![] }
@@ -1592,6 +1655,9 @@ mod tests {
                     success_criteria: Vec::new(),
                     composition: None,
                     input_schema: None,
+                    aliases: Vec::new(),
+                    effort: None,
+                    agent_type: None,
                 })
             }
             fn available_skills(&self) -> Vec<SkillToolInfo> { vec![] }
@@ -1629,6 +1695,9 @@ mod tests {
                         },
                         "required": ["target_path"]
                     })),
+                    aliases: Vec::new(),
+                    effort: None,
+                    agent_type: None,
                 })
             }
             fn available_skills(&self) -> Vec<SkillToolInfo> { vec![] }

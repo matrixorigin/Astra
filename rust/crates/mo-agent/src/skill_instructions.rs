@@ -1351,6 +1351,9 @@ impl astra_runtime::turn::skill_tool::SkillResolver for CliSkillResolver {
                     success_criteria: Vec::new(),
                     composition: None,
                     input_schema: None,
+                    aliases: Vec::new(),
+                    effort: None,
+                    agent_type: None,
                 });
             }
         }
@@ -1390,6 +1393,9 @@ impl astra_runtime::turn::skill_tool::SkillResolver for CliSkillResolver {
             success_criteria: Vec::new(),
             composition: None,
             input_schema: None,
+            aliases: Vec::new(),
+            effort: None,
+            agent_type: None,
         })
     }
 
@@ -1407,6 +1413,7 @@ impl astra_runtime::turn::skill_tool::SkillResolver for CliSkillResolver {
                 description: s.description().to_string(),
                 when_to_use: s.metadata.when_to_use.clone(),
                 source: astra_runtime::skills::manifest::SkillSourceKind::Local,
+                aliases: Vec::new(),
             })
             .collect()
     }

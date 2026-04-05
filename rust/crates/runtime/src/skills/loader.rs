@@ -74,6 +74,13 @@ struct RawFrontmatter {
     publisher: Option<super::manifest::PublisherMetadata>,
     #[serde(default)]
     compatibility: Option<super::manifest::CompatibilityInfo>,
+    // CC-compatible fields
+    #[serde(default)]
+    aliases: Vec<String>,
+    #[serde(default)]
+    effort: Option<String>,
+    #[serde(default)]
+    agent_type: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -174,6 +181,9 @@ pub fn parse_skill_md(content: &str) -> Result<(SkillManifest, String), SkillErr
         },
         publisher: raw.publisher,
         compatibility: raw.compatibility,
+        aliases: raw.aliases,
+        effort: raw.effort.as_deref().and_then(super::manifest::EffortLevel::parse),
+        agent_type: raw.agent_type,
     };
 
     Ok((manifest, markdown_body))
