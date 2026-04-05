@@ -339,6 +339,108 @@ fn truncate_str(s: &str, max_chars: usize) -> &str {
     }
 }
 
+/// Default retrieve query when the conversation yields no usable signals.
+const MEMORIA_RETRIEVE_QUERY_FALLBACK: &str = "current session context working memory";
+
+/// Collapse whitespace for a compact retrieval query string.
+fn collapse_whitespace(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn message_user_text(m: &Value) -> Option<String> {
+    if m.get("role").and_then(Value::as_str) != Some("user") {
+        return None;
+    }
+    let c = m.get("content")?;
+    if let Some(s) = c.as_str() {
+        let t = s.trim();
+        return if t.is_empty() {
+            None
+        } else {
+            Some(t.to_string())
+        };
+    }
+    None
+}
+
+/// Truncate by Unicode scalar count (not bytes) so we never split a codepoint.
+fn truncate_chars_prefix(s: &str, max_chars: usize) -> String {
+    let n = s.chars().count();
+    if n <= max_chars {
+        s.to_string()
+    } else {
+        s.chars().take(max_chars).collect()
+    }
+}
+
+/// Build a Memoria semantic-retrieval query from recent user text and tool activity.
+///
+/// [`compact_with_memoria`] uses this so retrieval is biased toward the current task
+/// instead of a fixed generic phrase. Session scoping still comes from `session_id`
+/// on the HTTP request.
+#[must_use]
+pub fn memoria_compact_retrieve_query(messages: &[Value]) -> String {
+    const MAX_USER_CHARS: usize = 400;
+    const MAX_TOOL_NAMES: usize = 12;
+    const LOOKBACK_MESSAGES: usize = 48;
+
+    if messages.is_empty() {
+        return MEMORIA_RETRIEVE_QUERY_FALLBACK.to_string();
+    }
+
+    let start = messages.len().saturating_sub(LOOKBACK_MESSAGES);
+    let window = &messages[start..];
+
+    let user_focus = window.iter().rev().find_map(message_user_text).map(|s| {
+        collapse_whitespace(&truncate_chars_prefix(&s, MAX_USER_CHARS))
+    });
+
+    let mut tool_names: Vec<String> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for m in window.iter().rev() {
+        if m.get("role").and_then(Value::as_str) != Some("assistant") {
+            continue;
+        }
+        let Some(arr) = m.get("tool_calls").and_then(Value::as_array) else {
+            continue;
+        };
+        for tc in arr {
+            let name = tc
+                .get("function")
+                .and_then(|f| f.get("name"))
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            if name.is_empty() {
+                continue;
+            }
+            if seen.insert(name.to_string()) {
+                tool_names.push(name.to_string());
+            }
+            if tool_names.len() >= MAX_TOOL_NAMES {
+                break;
+            }
+        }
+        if tool_names.len() >= MAX_TOOL_NAMES {
+            break;
+        }
+    }
+    tool_names.reverse();
+
+    let mut parts: Vec<String> = Vec::new();
+    parts.push("session working memory".to_string());
+    if let Some(u) = user_focus.filter(|s| !s.is_empty()) {
+        parts.push(format!("current user task: {u}"));
+    }
+    if !tool_names.is_empty() {
+        parts.push(format!("recent tools: {}", tool_names.join(", ")));
+    }
+
+    if parts.len() == 1 {
+        return MEMORIA_RETRIEVE_QUERY_FALLBACK.to_string();
+    }
+    parts.join(". ") + "."
+}
+
 /// Compact messages using Memoria for session context.
 ///
 /// Flow:
@@ -376,9 +478,9 @@ pub async fn compact_with_memoria(
     let sid = session_id.unwrap();
 
     // Step 1: Retrieve session context from Memoria
-    let query = "current session context working memory";
+    let query = memoria_compact_retrieve_query(messages);
     let memories = client
-        .retrieve(query, Some(sid), config.max_memories)
+        .retrieve(&query, Some(sid), config.max_memories)
         .await
         .unwrap_or_default();
 
@@ -551,6 +653,58 @@ mod tests {
 
     fn assistant(content: &str) -> Value {
         json!({"role": "assistant", "content": content})
+    }
+
+    #[test]
+    fn retrieve_query_empty_messages_is_fallback() {
+        let q = memoria_compact_retrieve_query(&[]);
+        assert_eq!(q, MEMORIA_RETRIEVE_QUERY_FALLBACK);
+    }
+
+    #[test]
+    fn retrieve_query_includes_last_user_and_tools() {
+        let tc = json!([{
+            "id": "1",
+            "type": "function",
+            "function": {"name": "read_file", "arguments": "{}"}
+        }]);
+        let msgs = vec![
+            user("older ask"),
+            assistant("ok"),
+            json!({"role": "assistant", "content": "", "tool_calls": tc}),
+            user("  fix the OAuth bug in handler  "),
+        ];
+        let q = memoria_compact_retrieve_query(&msgs);
+        assert!(
+            q.contains("fix the OAuth bug"),
+            "query should carry latest user focus: {q}"
+        );
+        assert!(
+            q.contains("read_file"),
+            "query should mention recent tools: {q}"
+        );
+        assert!(q.contains("session working memory"));
+    }
+
+    #[test]
+    fn retrieve_query_dedupes_tool_names() {
+        let tc = json!([
+            {"id": "1", "type": "function", "function": {"name": "bash", "arguments": "{}"}},
+            {"id": "2", "type": "function", "function": {"name": "bash", "arguments": "{}"}}
+        ]);
+        let msgs = vec![json!({"role": "assistant", "content": "", "tool_calls": tc})];
+        let q = memoria_compact_retrieve_query(&msgs);
+        assert_eq!(q.matches("bash").count(), 1, "dedupe tool names: {q}");
+    }
+
+    #[test]
+    fn retrieve_query_fallback_when_no_user_and_no_tools() {
+        let msgs = vec![
+            json!({"role": "system", "content": "you are a bot"}),
+            json!({"role": "assistant", "content": "hello"}),
+        ];
+        let q = memoria_compact_retrieve_query(&msgs);
+        assert_eq!(q, MEMORIA_RETRIEVE_QUERY_FALLBACK);
     }
 
     #[test]

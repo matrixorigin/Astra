@@ -247,6 +247,7 @@ pub use turn::{
         memoria_compact::{
             HttpMemoriaClient, MemoriaClient, MemoriaCompactConfig, MemoriaCompactParams,
             MemoriaMemory, compact_with_memoria, compact_with_memoria_sync,
+            memoria_compact_retrieve_query,
         },
         prefilter::{CloudSkillCandidatePlan, plan_cloud_skill_candidates},
         summary::{HttpSummaryClient, LlmConnParams, SummaryLlmClient, SummaryResponse},
