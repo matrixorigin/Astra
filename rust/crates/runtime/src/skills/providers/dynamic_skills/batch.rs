@@ -29,6 +29,8 @@ tags:
 
 You are orchestrating a large, parallelizable change across this codebase.
 
+**Working directory**: ${{CTX_WORK_DIR}}
+
 ## Prerequisite
 
 This skill requires a git repository. If this is not a git repo, tell the user and stop.

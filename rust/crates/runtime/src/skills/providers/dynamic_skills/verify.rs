@@ -21,6 +21,8 @@ tags:
 
 Run the project's verification toolchain to confirm code correctness.
 
+**Working directory**: ${{CTX_WORK_DIR}}
+
 ## Step 1: Detect Project Type
 
 **Success criteria**: Identified the project type and available tooling.

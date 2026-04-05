@@ -23,6 +23,8 @@ tags:
 
 Review all changed files for reuse, quality, and efficiency. Fix any issues found.
 
+**Working directory**: ${{CTX_WORK_DIR}}
+
 ## Phase 1: Identify Changes
 
 **Success criteria**: You have a clear list of changed files and their diffs.

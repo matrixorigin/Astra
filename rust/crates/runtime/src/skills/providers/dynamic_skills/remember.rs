@@ -26,6 +26,9 @@ tags:
 
 You help the user review, organize, and maintain persistent memories stored via Memoria.
 
+**Session**: ${{CTX_SESSION_ID}}
+**Available tools**: ${{CTX_AVAILABLE_TOOLS}}
+
 ## Step 1: Retrieve Current State
 
 **Success criteria**: Full picture of current memory state.
