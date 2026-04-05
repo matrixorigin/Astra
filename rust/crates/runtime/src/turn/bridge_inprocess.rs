@@ -1235,12 +1235,20 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
 
                 // Use Memoria-based compaction (async with HTTP client)
                 let memoria_config = crate::turn::cloud::memoria_compact::MemoriaCompactConfig::default();
+                let cwd = edge_profile.get("cwd").and_then(Value::as_str);
+                let (session_memory_file, session_memory_combine) =
+                    crate::turn::cloud::memoria_compact::resolve_session_memory_file_options(
+                        &session_id,
+                        cwd,
+                    );
                 let memoria_params = crate::turn::cloud::memoria_compact::MemoriaCompactParams {
                     budget_chars,
                     keep_chars: 2_000,
                     tier,
                     keep_recent_turns: budget.keep_recent_turns,
                     current_tokens: cache_est.total_tokens,
+                    session_memory_file,
+                    session_memory_combine,
                 };
 
                 // Try to create Memoria client from environment
@@ -1390,12 +1398,20 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
                             );
                             // Re-compact with AggressivePrune tier
                             let budget = crate::prompts::budget_for_model(Some(&model_name));
+                            let cwd_ag = edge_profile.get("cwd").and_then(Value::as_str);
+                            let (session_memory_file, session_memory_combine) =
+                                crate::turn::cloud::memoria_compact::resolve_session_memory_file_options(
+                                    &session_id,
+                                    cwd_ag,
+                                );
                             let aggressive_params = crate::turn::cloud::memoria_compact::MemoriaCompactParams {
                                 budget_chars: budget.effective_input_limit() * 3, // tighter budget
                                 keep_chars: 1_000, // more aggressive truncation
                                 tier: crate::prompts::CompactionTier::AggressivePrune,
                                 keep_recent_turns: 4, // keep fewer turns
                                 current_tokens: budget.effective_input_limit(), // assume we're at limit
+                                session_memory_file,
+                                session_memory_combine,
                             };
                             let compact_config = crate::prompts::CompactConfig::from_env();
                             let summary_client = crate::turn::cloud::summary::HttpSummaryClient::new(

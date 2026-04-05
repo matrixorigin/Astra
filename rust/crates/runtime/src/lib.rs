@@ -246,8 +246,10 @@ pub use turn::{
         iteration::{CloudLoopIterationPlan, plan_cloud_loop_iteration},
         memoria_compact::{
             HttpMemoriaClient, MemoriaClient, MemoriaCompactConfig, MemoriaCompactParams,
-            MemoriaMemory, compact_with_memoria, compact_with_memoria_sync,
-            memoria_compact_retrieve_query,
+            MemoriaMemory, SessionMemoryFileCombine, claude_code_session_memory_path,
+            compact_with_memoria, compact_with_memoria_sync, memoria_compact_retrieve_query,
+            read_session_memory_file, resolve_session_memory_file_options,
+            sanitize_path_for_claude_projects,
         },
         prefilter::{CloudSkillCandidatePlan, plan_cloud_skill_candidates},
         summary::{HttpSummaryClient, LlmConnParams, SummaryLlmClient, SummaryResponse},
