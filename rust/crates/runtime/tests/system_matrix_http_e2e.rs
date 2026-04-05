@@ -9,7 +9,8 @@
 //!    data-versioning lineage (read-only), agent update, memory search/purge, `GET /workflows`,
 //!    jobs (in-memory + webhook), sandbox CRUD, webhook triggers (create → fire → delete), and
 //!    `GET /introspection/skills`, session **close → resume** (with `agent_sessions` status checks),
-//!    extra audit/evaluation/marketplace reads. Ends with `chat/turn` (SSE) and strict `agent_events`
+//!    session audit **tools/errors**, more evaluation reads (scores, quality trend, SLO, memory health,
+//!    trust + observability once `agent_id` exists). Ends with `chat/turn` (SSE) and strict `agent_events`
 //!    checks (parent link, per-field tokens, `reasoning_content`, causal chain).
 //!
 //! External dependencies remain mocked where the product already allows it:
@@ -475,7 +476,7 @@ async fn product_matrix_api_journey_hits_multiple_tables() {
 
     let (st_au_sess, au_sess) = get_json(
         &app,
-        "/audit/sessions?limit=10&offset=0",
+        "/audit/sessions?page=1&per_page=10",
         Some(&auth_header),
         &[],
     )
@@ -490,6 +491,28 @@ async fn product_matrix_api_journey_hits_multiple_tables() {
     )
     .await;
     assert_eq!(st_au_turns, StatusCode::OK, "audit turns: {au_turns}");
+
+    let (st_au_sess_tools, au_sess_tools) = get_json(
+        &app,
+        &format!("/sessions/{session_id}/audit/tools"),
+        Some(&auth_header),
+        &[],
+    )
+    .await;
+    assert_eq!(
+        st_au_sess_tools,
+        StatusCode::OK,
+        "session audit tools: {au_sess_tools}"
+    );
+
+    let (st_au_errs, au_errs) = get_json(
+        &app,
+        &format!("/sessions/{session_id}/audit/errors"),
+        Some(&auth_header),
+        &[],
+    )
+    .await;
+    assert_eq!(st_au_errs, StatusCode::OK, "session audit errors: {au_errs}");
 
     let (st_au_tools, au_tools) = get_json(&app, "/audit/tools", Some(&auth_header), &[]).await;
     assert_eq!(st_au_tools, StatusCode::OK, "cross-session audit tools: {au_tools}");
@@ -515,6 +538,43 @@ async fn product_matrix_api_journey_hits_multiple_tables() {
     )
     .await;
     assert_eq!(st_cal, StatusCode::OK, "evaluation calibration: {cal_j}");
+
+    let (st_scores, scores_j) = get_json(
+        &app,
+        "/evaluation/sessions/scores?limit=10&min_score=0",
+        None,
+        xuid,
+    )
+    .await;
+    assert_eq!(st_scores, StatusCode::OK, "evaluation session scores: {scores_j}");
+    assert!(
+        scores_j["sessions"].is_array(),
+        "session scores payload: {scores_j}"
+    );
+
+    let (st_qt, qt_j) = get_json(
+        &app,
+        "/evaluation/quality/trend?days=7",
+        None,
+        xuid,
+    )
+    .await;
+    assert_eq!(st_qt, StatusCode::OK, "evaluation quality trend: {qt_j}");
+
+    let (st_slo, slo_j) = get_json(
+        &app,
+        "/evaluation/slo/dashboard?period_days=7",
+        None,
+        xuid,
+    )
+    .await;
+    assert_eq!(st_slo, StatusCode::OK, "evaluation slo dashboard: {slo_j}");
+
+    let (st_mh, mh_j) = get_json(&app, "/evaluation/memory-health", None, xuid).await;
+    assert_eq!(st_mh, StatusCode::OK, "evaluation memory-health: {mh_j}");
+
+    let (st_mm, mm_j) = get_json(&app, "/evaluation/memory-metrics", None, xuid).await;
+    assert_eq!(st_mm, StatusCode::OK, "evaluation memory-metrics: {mm_j}");
 
     let (st_agent, agent_j) = post_json(
         &app,
@@ -578,6 +638,26 @@ async fn product_matrix_api_journey_hits_multiple_tables() {
     assert_eq!(
         agent_renamed.try_get::<String, _>("agent_name").ok().as_deref(),
         Some("matrix-crud-agent-renamed")
+    );
+
+    let trust_path = format!("/evaluation/trust-report?agent_id={agent_id}&days=7");
+    let (st_trust, trust_j) = get_json(&app, &trust_path, None, xuid).await;
+    assert_eq!(st_trust, StatusCode::OK, "evaluation trust-report: {trust_j}");
+
+    let slo_hist = format!("/evaluation/slo/{agent_id}/history?days=7");
+    let (st_slo_hist, slo_hist_j) = get_json(&app, &slo_hist, None, xuid).await;
+    assert_eq!(
+        st_slo_hist,
+        StatusCode::OK,
+        "evaluation slo history: {slo_hist_j}"
+    );
+
+    let obs_path = format!("/evaluation/observability/metrics?agent_id={agent_id}&days=7");
+    let (st_obs, obs_j) = get_json(&app, &obs_path, None, xuid).await;
+    assert_eq!(
+        st_obs,
+        StatusCode::OK,
+        "evaluation observability metrics: {obs_j}"
     );
 
     let (st_ev, ev_j) = post_json(
