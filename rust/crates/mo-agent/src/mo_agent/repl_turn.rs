@@ -347,7 +347,7 @@ async fn maybe_auto_compact(
         stream_event_tx: None,
         approval_request_tx: None,
         mcp_manager: Some(state.mcp_manager.clone()),
-                skill_quality_tracker: &mut state.skill_quality_tracker,
+        skill_quality_tracker: &mut state.skill_quality_tracker,
     })
     .await;
 
@@ -1001,7 +1001,10 @@ fn report_turn_failure(
 }
 
 /// Copy plan / durable-task fields from REPL into workspace before checkpointing.
-fn sync_plan_fields_to_workspace(state: &ReplState, ws: &mut astra_services::session_workspace::WorkspaceMetadata) {
+fn sync_plan_fields_to_workspace(
+    state: &ReplState,
+    ws: &mut astra_services::session_workspace::WorkspaceMetadata,
+) {
     ws.executing_plan_json = state
         .executing_plan
         .as_ref()
@@ -1037,7 +1040,7 @@ fn build_manual_heavy_step_checkpoint(
     sid: &str,
 ) -> astra_runtime::pipeline::step_protocol::StepCheckpoint {
     use astra_runtime::pipeline::step_protocol::{
-        ExecutionCursor, HeavyCheckpoint, LightCheckpoint, StepCheckpoint, PROTOCOL_VERSION,
+        ExecutionCursor, HeavyCheckpoint, LightCheckpoint, PROTOCOL_VERSION, StepCheckpoint,
         epoch_ms,
     };
 
@@ -1096,14 +1099,12 @@ fn persist_manual_heavy_and_composite(
     let heavy_path = write_step_checkpoint(sid, next_step, step_cp)
         .map_err(|e| format!("write heavy step checkpoint: {e}"))?;
 
-    let snapshot = astra_core::composite_snapshot::CompositeSnapshotBuilder::new(
-        sid.to_string(),
-        turn,
-    )
-    .label(format!("manual:{title}"))
-    .session_state(format!("{next_step:06}-heavy.json"))
-    .workspace_state(sid.to_string())
-    .build();
+    let snapshot =
+        astra_core::composite_snapshot::CompositeSnapshotBuilder::new(sid.to_string(), turn)
+            .label(format!("manual:{title}"))
+            .session_state(format!("{next_step:06}-heavy.json"))
+            .workspace_state(sid.to_string())
+            .build();
     let mut index = read_composite_snapshot_index(sid).unwrap_or_default();
     index.snapshots.push(snapshot);
     if let Err(e) = write_composite_snapshot_index(sid, &index) {
@@ -1198,17 +1199,18 @@ fn spawn_manual_checkpoint_cloud_uploads(
     let Some(ref mc) = state.matrix_runtime else {
         return;
     };
-    let user_id = state.ingestion_user_id.as_deref().unwrap_or("anonymous").to_string();
+    let user_id = state
+        .ingestion_user_id
+        .as_deref()
+        .unwrap_or("anonymous")
+        .to_string();
     let user_id_step = user_id.clone();
     let pool = mc.shared_pool().get().clone();
     let sid_owned = sid.to_string();
     let cp_clone = session_cp.clone();
     tokio::spawn(async move {
         if let Err(e) = astra_services::session_restore::push_checkpoint_to_cloud(
-            &pool,
-            &sid_owned,
-            &user_id,
-            &cp_clone,
+            &pool, &sid_owned, &user_id, &cp_clone,
         )
         .await
         {
@@ -1274,7 +1276,8 @@ pub(super) fn create_manual_repl_checkpoint(
 
     let next_step = next_step_checkpoint_number(sid)?;
     let step_cp = build_manual_heavy_step_checkpoint(state, sid);
-    let heavy_path = persist_manual_heavy_and_composite(sid, ws.turn_count, &title, next_step, &step_cp)?;
+    let heavy_path =
+        persist_manual_heavy_and_composite(sid, ws.turn_count, &title, next_step, &step_cp)?;
 
     let turn = ws.turn_count;
     let (cp_path, cp_number, cp) =
@@ -1303,28 +1306,12 @@ mod tests {
     use astra_runtime::pipeline::step_checkpoint::read_composite_snapshot_index;
     use astra_runtime::pipeline::step_protocol::StepCheckpoint;
 
-    /// `list_checkpoints` / journal paths use `dirs::home_dir()` — isolate `HOME` for file tests.
-    struct ScopedHome(Option<std::ffi::OsString>);
-    impl ScopedHome {
-        fn new(tmp: &std::path::Path) -> Self {
-            let old = std::env::var_os("HOME");
-            // SAFETY: unit tests only; `#[serial_test::serial]` avoids concurrent env mutation.
-            unsafe {
-                std::env::set_var("HOME", tmp);
-            }
-            Self(old)
-        }
-    }
-    impl Drop for ScopedHome {
-        fn drop(&mut self) {
-            // SAFETY: restores previous `HOME` after the same test's isolated I/O.
-            unsafe {
-                match self.0.take() {
-                    Some(v) => std::env::set_var("HOME", v),
-                    None => std::env::remove_var("HOME"),
-                }
-            }
-        }
+    fn isolated_sessions_dir() -> (tempfile::TempDir, session_journal::JournalDirGuard) {
+        let tmp = tempfile::tempdir().unwrap();
+        let sessions = tmp.path().join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let guard = session_journal::JournalDirGuard::new(&sessions);
+        (tmp, guard)
     }
 
     #[test]
@@ -1343,22 +1330,17 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::serial]
     fn next_step_checkpoint_number_empty_dir_starts_at_one() {
-        let tmp = tempfile::tempdir().unwrap();
-        let _home = ScopedHome::new(tmp.path());
+        let (_tmp, _g) = isolated_sessions_dir();
         assert_eq!(next_step_checkpoint_number("sess-empty").unwrap(), 1);
     }
 
     #[test]
-    #[serial_test::serial]
     fn next_step_checkpoint_number_one_after_max_file() {
-        let tmp = tempfile::tempdir().unwrap();
-        let _home = ScopedHome::new(tmp.path());
+        let (tmp, _g) = isolated_sessions_dir();
         let sid = "sess-step";
         let cp_dir = tmp
             .path()
-            .join(".astra")
             .join("sessions")
             .join(sid)
             .join("step_checkpoints");
@@ -1393,10 +1375,8 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::serial]
     fn persist_manual_heavy_and_composite_writes_heavy_and_index() {
-        let tmp = tempfile::tempdir().unwrap();
-        let _home = ScopedHome::new(tmp.path());
+        let (_tmp, _g) = isolated_sessions_dir();
         let sid = "sess-heavy-idx";
         let state = ReplState::default();
         let step_cp = build_manual_heavy_step_checkpoint(&state, sid);
@@ -1408,17 +1388,12 @@ mod tests {
 
         let index = read_composite_snapshot_index(sid).unwrap();
         assert_eq!(index.snapshots.len(), 1);
-        assert_eq!(
-            index.snapshots[0].label.as_deref(),
-            Some("manual:label-z")
-        );
+        assert_eq!(index.snapshots[0].label.as_deref(), Some("manual:label-z"));
     }
 
     #[test]
-    #[serial_test::serial]
     fn persist_manual_session_checkpoint_layer_writes_md_journal_workspace() {
-        let tmp = tempfile::tempdir().unwrap();
-        let _home = ScopedHome::new(tmp.path());
+        let (_tmp, _g) = isolated_sessions_dir();
         let sid = uuid::Uuid::new_v4().to_string();
 
         let mut ws = astra_services::session_workspace::WorkspaceMetadata::new(&sid, "test-model");
@@ -1439,7 +1414,8 @@ mod tests {
         assert!(cp_path.exists());
         assert_eq!(ws.checkpoints, vec![3]);
 
-        let journal_txt = std::fs::read_to_string(session_journal::journal_file_path(&sid)).unwrap();
+        let journal_txt =
+            std::fs::read_to_string(session_journal::journal_file_path(&sid)).unwrap();
         assert!(
             journal_txt.contains("\"checkpoint\"") || journal_txt.contains("checkpoint"),
             "expected checkpoint journal line, got: {journal_txt:?}"

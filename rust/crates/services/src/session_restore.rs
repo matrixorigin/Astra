@@ -467,10 +467,7 @@ fn read_composite_snapshot_index_local(
 }
 
 fn composite_snapshots_json_path(session_id: &str) -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".astra")
-        .join("sessions")
+    crate::session_journal::local_sessions_dir()
         .join(session_id)
         .join("step_checkpoints")
         .join("composite_snapshots.json")

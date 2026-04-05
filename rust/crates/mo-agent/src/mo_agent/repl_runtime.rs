@@ -121,10 +121,7 @@ fn create_tool_selector_with_quality_internal(
                         let mut manager = mgr.write().await;
                         for config in mcp_configs {
                             let name = config.name.clone();
-                            match manager
-                                .connect_and_discover_skills(config, &reg)
-                                .await
-                            {
+                            match manager.connect_and_discover_skills(config, &reg).await {
                                 Ok(n) if n > 0 => {
                                     eprintln!(
                                         "  {} Connected MCP server '{}' ({n} skill{})",
@@ -135,10 +132,7 @@ fn create_tool_selector_with_quality_internal(
                                 }
                                 Ok(_) => {}
                                 Err(e) => {
-                                    eprintln!(
-                                        "  ⚠ MCP server '{}' failed: {}",
-                                        name, e
-                                    );
+                                    eprintln!("  ⚠ MCP server '{}' failed: {}", name, e);
                                 }
                             }
                         }
@@ -599,27 +593,12 @@ mod tests {
     use crate::cli_utils::CredentialsFile;
     use tempfile::tempdir;
 
-    /// `session_journal` paths use `dirs::home_dir()` — isolate `HOME` so tests are parallel-safe
-    /// and do not write under the developer's real `~/.astra/sessions`.
-    struct ScopedHome(Option<std::ffi::OsString>);
-    impl ScopedHome {
-        fn new(tmp: &std::path::Path) -> Self {
-            let old = std::env::var_os("HOME");
-            unsafe {
-                std::env::set_var("HOME", tmp);
-            }
-            Self(old)
-        }
-    }
-    impl Drop for ScopedHome {
-        fn drop(&mut self) {
-            unsafe {
-                match self.0.take() {
-                    Some(v) => std::env::set_var("HOME", v),
-                    None => std::env::remove_var("HOME"),
-                }
-            }
-        }
+    fn isolated_sessions_dir() -> (tempfile::TempDir, session_journal::JournalDirGuard) {
+        let tmp = tempdir().unwrap();
+        let sessions = tmp.path().join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let guard = session_journal::JournalDirGuard::new(&sessions);
+        (tmp, guard)
     }
 
     struct EnvVarGuard {
@@ -648,15 +627,14 @@ mod tests {
 
     #[test]
     fn restore_history_empty_for_unknown_session() {
+        let (_tmp, _g) = isolated_sessions_dir();
         let history = restore_history_from_journal("nonexistent-session-xyz-123");
         assert!(history.is_empty());
     }
 
-    #[serial_test::serial]
     #[test]
     fn restore_history_from_journal_roundtrip() {
-        let home = tempdir().unwrap();
-        let _home_guard = ScopedHome::new(home.path());
+        let (_tmp, _g) = isolated_sessions_dir();
         let sid = format!("test-restore-{}", uuid::Uuid::new_v4());
         let writer = session_journal::JournalWriter::new(&sid).unwrap();
 
@@ -694,11 +672,9 @@ mod tests {
         assert_eq!(history[1].0, "show me an example");
     }
 
-    #[serial_test::serial]
     #[test]
     fn restore_history_skips_non_turn_events() {
-        let home = tempdir().unwrap();
-        let _home_guard = ScopedHome::new(home.path());
+        let (_tmp, _g) = isolated_sessions_dir();
         let sid = format!("test-skip-{}", uuid::Uuid::new_v4());
         let writer = session_journal::JournalWriter::new(&sid).unwrap();
 
@@ -734,11 +710,9 @@ mod tests {
         assert_eq!(history[0].0, "hello");
     }
 
-    #[serial_test::serial]
     #[test]
     fn restore_session_state_recovers_turn_tools_and_tokens() {
-        let home = tempdir().unwrap();
-        let _home_guard = ScopedHome::new(home.path());
+        let (_tmp, _g) = isolated_sessions_dir();
         let sid = format!("test-state-{}", uuid::Uuid::new_v4());
         let writer = session_journal::JournalWriter::new(&sid).unwrap();
 
@@ -796,11 +770,9 @@ mod tests {
         assert_eq!(restored.history.len(), 2);
     }
 
-    #[serial_test::serial]
     #[test]
     fn restore_session_state_uses_latest_session_segment() {
-        let home = tempdir().unwrap();
-        let _home_guard = ScopedHome::new(home.path());
+        let (_tmp, _g) = isolated_sessions_dir();
         let sid = format!("test-segment-{}", uuid::Uuid::new_v4());
         let writer = session_journal::JournalWriter::new(&sid).unwrap();
 
@@ -873,11 +845,9 @@ mod tests {
         assert_eq!(restored.recent_tools, vec!["github_ci_status".to_string()]);
     }
 
-    #[serial_test::serial]
     #[test]
     fn initialize_repl_state_skips_cleanly_ended_session() {
-        let home = tempdir().unwrap();
-        let _home_guard = ScopedHome::new(home.path());
+        let (_tmp, _g) = isolated_sessions_dir();
         let creds_dir = tempdir().unwrap();
         let _creds_guard = EnvVarGuard::set("MO_AGENT_CREDENTIALS_DIR", creds_dir.path());
 

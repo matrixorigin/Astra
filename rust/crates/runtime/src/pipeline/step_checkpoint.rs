@@ -24,10 +24,7 @@ const MAX_LIGHT_CHECKPOINTS: usize = 50;
 
 /// Get the step checkpoint directory for a session.
 fn checkpoint_dir_for(session_id: &str) -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".astra")
-        .join("sessions")
+    astra_services::session_journal::local_sessions_dir()
         .join(session_id)
         .join(STEP_CHECKPOINT_DIR)
 }
@@ -289,11 +286,7 @@ fn events_path_for(session_id: &str) -> PathBuf {
 }
 
 fn session_dir_for(session_id: &str) -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".astra")
-        .join("sessions")
-        .join(session_id)
+    astra_services::session_journal::local_sessions_dir().join(session_id)
 }
 
 /// File-backed event store: in-memory DAG + append-only JSONL on disk.

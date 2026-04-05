@@ -252,11 +252,7 @@ pub fn read_workspace(session_id: &str) -> std::io::Result<WorkspaceMetadata> {
 
 /// Get the workspace directory for a session.
 fn workspace_dir(session_id: &str) -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".astra")
-        .join("sessions")
-        .join(session_id)
+    crate::session_journal::local_sessions_dir().join(session_id)
 }
 
 /// Get the workspace directory path (public, for use by checkpoint module).

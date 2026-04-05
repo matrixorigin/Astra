@@ -5,9 +5,61 @@
 //!
 //! The journal is append-only and survives process exits.
 //! It can be replayed, exported, or analyzed by `/session` commands.
+//!
+//! **Test isolation:** use [`JournalDirGuard`] to redirect all `sessions`-rooted I/O on the
+//! current thread (journal JSONL, workspace, step checkpoints) without mutating `HOME`.
 
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::cell::RefCell;
+use std::path::{Path, PathBuf};
+
+thread_local! {
+    static LOCAL_SESSIONS_DIR_OVERRIDE: RefCell<Option<PathBuf>> = RefCell::new(None);
+}
+
+/// Resolved local `sessions` directory (`~/.astra/sessions` or a per-thread override).
+///
+/// Step checkpoints, workspace metadata, and session journal files all live under this root.
+pub fn local_sessions_dir() -> PathBuf {
+    LOCAL_SESSIONS_DIR_OVERRIDE.with(|c| {
+        if let Some(ref p) = *c.borrow() {
+            return p.clone();
+        }
+        dirs::home_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join(".astra")
+            .join("sessions")
+    })
+}
+
+/// Redirect session journal + workspace + step checkpoint paths on **this thread** to `dir`.
+///
+/// `dir` must be the `sessions` folder (the directory that will contain `<session_id>.jsonl`
+/// files and `<session_id>/` subdirectories). Nestable: dropping restores the previous override.
+#[must_use = "drop restores the previous sessions-dir override for this thread"]
+pub struct JournalDirGuard {
+    previous: Option<PathBuf>,
+}
+
+impl JournalDirGuard {
+    pub fn new(dir: impl AsRef<Path>) -> Self {
+        let dir = dir.as_ref().to_path_buf();
+        let previous = LOCAL_SESSIONS_DIR_OVERRIDE.with(|c| {
+            let mut slot = c.borrow_mut();
+            std::mem::replace(&mut *slot, Some(dir))
+        });
+        Self { previous }
+    }
+}
+
+impl Drop for JournalDirGuard {
+    fn drop(&mut self) {
+        let prev = self.previous.take();
+        LOCAL_SESSIONS_DIR_OVERRIDE.with(|c| {
+            *c.borrow_mut() = prev;
+        });
+    }
+}
 
 /// Session state change tracking for edge-cloud sync.
 /// Records mutations as deltas instead of overwriting full state.
@@ -797,12 +849,9 @@ pub fn resolve_session_id(query: &str) -> std::io::Result<String> {
     resolve_session_id_from_list(query, &sessions)
 }
 
-/// Helper: get the journal directory path.
+/// Helper: get the journal directory path (same as [`local_sessions_dir()`]).
 fn journal_dir() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".astra")
-        .join("sessions")
+    local_sessions_dir()
 }
 
 fn resolve_session_id_from_list(query: &str, sessions: &[String]) -> std::io::Result<String> {
@@ -1340,6 +1389,25 @@ fn truncate(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn journal_dir_guard_overrides_local_sessions_dir_nested() {
+        let outer = tempdir().unwrap();
+        let inner = tempdir().unwrap();
+        let outer_sessions = outer.path().join("sessions");
+        let inner_sessions = inner.path().join("sessions");
+        std::fs::create_dir_all(&outer_sessions).unwrap();
+        std::fs::create_dir_all(&inner_sessions).unwrap();
+
+        let _g1 = JournalDirGuard::new(&outer_sessions);
+        assert_eq!(local_sessions_dir(), outer_sessions);
+        {
+            let _g2 = JournalDirGuard::new(&inner_sessions);
+            assert_eq!(local_sessions_dir(), inner_sessions);
+        }
+        assert_eq!(local_sessions_dir(), outer_sessions);
+    }
 
     #[test]
     fn journal_event_session_start_serializes() {

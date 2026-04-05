@@ -253,10 +253,7 @@ pub fn build_session_diagnostic(session_id: &str) -> Result<SessionDiagnosticRep
     }
 
     // Composite snapshot info
-    let snapshot_dir = dirs::home_dir()
-        .unwrap_or_default()
-        .join(".astra")
-        .join("sessions")
+    let snapshot_dir = crate::session_journal::local_sessions_dir()
         .join(session_id)
         .join("step_checkpoints")
         .join("composite_snapshots.json");
