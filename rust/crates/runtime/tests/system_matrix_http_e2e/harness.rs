@@ -412,7 +412,8 @@ pub async fn bootstrap() -> BootstrapResult {
     assert_eq!(st_sess, StatusCode::CREATED, "create session: {sess}");
     let session_id = sess["session_id"].as_str().expect("session_id").to_string();
 
-    cleanup_session_data(&pool, &session_id).await;
+    // Do not call `cleanup_session_data` here — it would delete the row we just created via POST
+    // /sessions, breaking list/get/cancel and the full product journey.
     cleanup_edge_registry(&pool, &user_id, &edge_agent_id).await;
 
     BootstrapResult {
