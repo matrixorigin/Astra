@@ -7,7 +7,7 @@ use super::hooks::SkillHooks;
 use super::version::{Dependency, Version};
 
 // Re-export verification types from services for use in skill manifests.
-pub use astra_services::{VerificationCriterion, VerifierKind, VerificationResult};
+pub use astra_services::{VerificationCriterion, VerificationResult, VerifierKind};
 
 /// Where a skill was loaded from.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -127,7 +127,6 @@ pub struct SkillManifest {
     pub metadata: HashMap<String, serde_json::Value>,
 
     // ── Capability fields (Phase 1) ─────────────────────────────────────────
-
     /// JSON Schema for structured skill input. Enables pre-execution validation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub input_schema: Option<serde_json::Value>,
@@ -145,7 +144,6 @@ pub struct SkillManifest {
     pub composition: Option<SkillComposition>,
 
     // ── Marketplace fields (Phase 3) ────────────────────────────────────────
-
     /// Trust tier for this skill. Defaults to `Unverified` for non-bundled skills.
     #[serde(default, skip_serializing_if = "is_default_trust_tier")]
     pub trust_tier: TrustTier,
@@ -157,7 +155,6 @@ pub struct SkillManifest {
     pub compatibility: Option<CompatibilityInfo>,
 
     // ── CC-compatible fields ────────────────────────────────────────────────
-
     /// Alternative names for this skill (resolved during lookup).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub aliases: Vec<String>,
@@ -458,7 +455,10 @@ pub enum CompatibilityIssue {
     /// A required capability is not available.
     MissingCapability(String),
     /// Current platform not in supported list.
-    UnsupportedPlatform { supported: Vec<String>, current: String },
+    UnsupportedPlatform {
+        supported: Vec<String>,
+        current: String,
+    },
 }
 
 impl std::fmt::Display for CompatibilityIssue {
@@ -610,7 +610,10 @@ mod tests {
         };
         let issues = m.check_compatibility("1.5.3", &[]);
         assert_eq!(issues.len(), 1);
-        assert!(matches!(issues[0], CompatibilityIssue::RuntimeVersion { .. }));
+        assert!(matches!(
+            issues[0],
+            CompatibilityIssue::RuntimeVersion { .. }
+        ));
     }
 
     #[test]
@@ -624,7 +627,9 @@ mod tests {
         };
         let issues = m.check_compatibility("1.0.0", &["shell_execution", "file_read"]);
         assert_eq!(issues.len(), 1);
-        assert!(matches!(issues[0], CompatibilityIssue::MissingCapability(ref c) if c == "network_access"));
+        assert!(
+            matches!(issues[0], CompatibilityIssue::MissingCapability(ref c) if c == "network_access")
+        );
     }
 
     #[test]
@@ -641,7 +646,10 @@ mod tests {
             assert!(issues.is_empty());
         } else {
             assert_eq!(issues.len(), 1);
-            assert!(matches!(issues[0], CompatibilityIssue::UnsupportedPlatform { .. }));
+            assert!(matches!(
+                issues[0],
+                CompatibilityIssue::UnsupportedPlatform { .. }
+            ));
         }
     }
 
@@ -659,23 +667,41 @@ mod tests {
     #[test]
     fn effort_parse_named_levels() {
         assert!(matches!(EffortLevel::parse("low"), Some(EffortLevel::Low)));
-        assert!(matches!(EffortLevel::parse("medium"), Some(EffortLevel::Medium)));
-        assert!(matches!(EffortLevel::parse("high"), Some(EffortLevel::High)));
+        assert!(matches!(
+            EffortLevel::parse("medium"),
+            Some(EffortLevel::Medium)
+        ));
+        assert!(matches!(
+            EffortLevel::parse("high"),
+            Some(EffortLevel::High)
+        ));
         assert!(matches!(EffortLevel::parse("max"), Some(EffortLevel::Max)));
     }
 
     #[test]
     fn effort_parse_case_insensitive() {
         assert!(matches!(EffortLevel::parse("LOW"), Some(EffortLevel::Low)));
-        assert!(matches!(EffortLevel::parse("High"), Some(EffortLevel::High)));
+        assert!(matches!(
+            EffortLevel::parse("High"),
+            Some(EffortLevel::High)
+        ));
         assert!(matches!(EffortLevel::parse("MAX"), Some(EffortLevel::Max)));
     }
 
     #[test]
     fn effort_parse_numeric() {
-        assert!(matches!(EffortLevel::parse("0"), Some(EffortLevel::Custom(0))));
-        assert!(matches!(EffortLevel::parse("128"), Some(EffortLevel::Custom(128))));
-        assert!(matches!(EffortLevel::parse("255"), Some(EffortLevel::Custom(255))));
+        assert!(matches!(
+            EffortLevel::parse("0"),
+            Some(EffortLevel::Custom(0))
+        ));
+        assert!(matches!(
+            EffortLevel::parse("128"),
+            Some(EffortLevel::Custom(128))
+        ));
+        assert!(matches!(
+            EffortLevel::parse("255"),
+            Some(EffortLevel::Custom(255))
+        ));
     }
 
     #[test]
@@ -688,7 +714,13 @@ mod tests {
 
     #[test]
     fn effort_roundtrip_as_str() {
-        for (input, expected) in &[("low", "low"), ("medium", "medium"), ("high", "high"), ("max", "max"), ("42", "42")] {
+        for (input, expected) in &[
+            ("low", "low"),
+            ("medium", "medium"),
+            ("high", "high"),
+            ("max", "max"),
+            ("42", "42"),
+        ] {
             let level = EffortLevel::parse(input).unwrap();
             assert_eq!(level.as_str(), *expected);
         }

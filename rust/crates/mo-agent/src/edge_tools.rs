@@ -1128,7 +1128,8 @@ pub struct ToolExecutor {
     passive_lsp: passive_lsp::PassiveLspManager,
     /// MCP client manager for external tool servers.
     /// When present, tool names starting with `mcp_` are routed to MCP servers.
-    pub mcp_manager: Option<std::sync::Arc<tokio::sync::RwLock<crate::mcp_client::McpClientManager>>>,
+    pub mcp_manager:
+        Option<std::sync::Arc<tokio::sync::RwLock<crate::mcp_client::McpClientManager>>>,
 }
 
 /// Extract owner/repo from git remote URLs in the given directory.
@@ -1656,9 +1657,7 @@ impl ToolExecutor {
                     Err(e) => format!("Error: Invalid chain format: {e}"),
                 }
             }
-            _ if name.starts_with("mcp_") => {
-                self.execute_mcp_tool(name, args).await
-            }
+            _ if name.starts_with("mcp_") => self.execute_mcp_tool(name, args).await,
             _ => format!(
                 "Unknown tool: {name}. Available tools: bash, read_file, write_file, str_replace, \
                  list_dir, grep, glob, symbols, find_definition, find_references, git_status, \
@@ -4108,7 +4107,9 @@ impl ToolExecutor {
     async fn execute_mcp_tool(&self, mcp_name: &str, args: &Value) -> String {
         let manager_arc = match &self.mcp_manager {
             Some(m) => m.clone(),
-            None => return format!("Error: MCP not available. Tool '{mcp_name}' cannot be executed."),
+            None => {
+                return format!("Error: MCP not available. Tool '{mcp_name}' cannot be executed.");
+            }
         };
 
         // Resolve the sanitized MCP name to server + original tool name, and get the
@@ -4117,7 +4118,11 @@ impl ToolExecutor {
             let mgr = manager_arc.read().await;
             let (srv, tool) = match mgr.find_tool_by_mcp_name(mcp_name) {
                 Some((s, t)) => (s.to_string(), t.to_string()),
-                None => return format!("Error: MCP tool '{mcp_name}' not found on any connected server."),
+                None => {
+                    return format!(
+                        "Error: MCP tool '{mcp_name}' not found on any connected server."
+                    );
+                }
             };
             let c = match mgr.get(&srv) {
                 Some(c) => c,
@@ -4171,14 +4176,14 @@ impl ToolExecutor {
         };
 
         match conn.call_tool(&original_name, args.clone()).await {
-            Ok(result) => {
-                crate::mcp_client::extract_result_text_with_limit(
-                    &result,
-                    crate::mcp_client::MAX_RESULT_CONTENT_LENGTH,
-                )
-            }
+            Ok(result) => crate::mcp_client::extract_result_text_with_limit(
+                &result,
+                crate::mcp_client::MAX_RESULT_CONTENT_LENGTH,
+            ),
             Err(e) => {
-                format!("Error calling MCP tool '{original_name}' on server '{server_name}' after reconnect: {e}")
+                format!(
+                    "Error calling MCP tool '{original_name}' on server '{server_name}' after reconnect: {e}"
+                )
             }
         }
     }

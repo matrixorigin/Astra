@@ -61,11 +61,7 @@ fn read_target_path(tool_name: &str, args: &str) -> Option<String> {
         .or_else(|| v.get("target_file"))
         .and_then(Value::as_str)?;
     let n = normalize_read_path(p);
-    if n.is_empty() {
-        None
-    } else {
-        Some(n)
-    }
+    if n.is_empty() { None } else { Some(n) }
 }
 
 fn normalize_read_path(p: &str) -> String {
@@ -444,8 +440,7 @@ pub fn compact_tiered_with_result(
         // Keep only the last `keep_recent_turns * 2` conversation messages
         let keep_count = keep_recent_turns * 2;
         if conv_indices.len() > keep_count {
-            let drop_set: HashSet<usize> = conv_indices
-                [..conv_indices.len() - keep_count]
+            let drop_set: HashSet<usize> = conv_indices[..conv_indices.len() - keep_count]
                 .iter()
                 .copied()
                 .collect();

@@ -61,7 +61,9 @@ impl SkillProvider for LocalSkillProvider {
 
                 // Resolve symlinks to prevent duplicate loading of the same
                 // physical skill directory via different symlink paths.
-                let canonical = skill_md_path.canonicalize().unwrap_or_else(|_| skill_md_path.clone());
+                let canonical = skill_md_path
+                    .canonicalize()
+                    .unwrap_or_else(|_| skill_md_path.clone());
                 if !seen_paths.insert(canonical) {
                     continue;
                 }
@@ -72,11 +74,7 @@ impl SkillProvider for LocalSkillProvider {
                         manifests.push(loaded.manifest);
                     }
                     Err(e) => {
-                        eprintln!(
-                            "  ⚠ Failed to parse {}: {}",
-                            skill_md_path.display(),
-                            e
-                        );
+                        eprintln!("  ⚠ Failed to parse {}: {}", skill_md_path.display(), e);
                     }
                 }
             }
@@ -89,14 +87,15 @@ impl SkillProvider for LocalSkillProvider {
         for search_dir in &self.search_paths {
             let skill_md = search_dir.join(name).join("SKILL.md");
             if skill_md.exists() {
-                let mut loaded =
-                    loader::load_skill_from_path_confined(&skill_md, search_dir)?;
+                let mut loaded = loader::load_skill_from_path_confined(&skill_md, search_dir)?;
                 loaded.manifest.source = SkillSourceKind::Local;
                 return Ok(loaded);
             }
         }
 
-        Err(SkillError::NotFound(format!("local skill not found: {name}")))
+        Err(SkillError::NotFound(format!(
+            "local skill not found: {name}"
+        )))
     }
 
     async fn refresh(&self) -> Result<(), SkillError> {

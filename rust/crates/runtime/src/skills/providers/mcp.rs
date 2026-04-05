@@ -196,9 +196,7 @@ Use the MCP server's analysis tool to process the data.
     #[tokio::test]
     async fn remove_server_skills() {
         let provider = McpSkillProvider::new();
-        provider
-            .register_mcp_skill("server-a", MCP_SKILL)
-            .unwrap();
+        provider.register_mcp_skill("server-a", MCP_SKILL).unwrap();
 
         let skill_b = r#"---
 name: mcp-query
@@ -206,9 +204,7 @@ description: "Query via MCP"
 ---
 Query instructions.
 "#;
-        provider
-            .register_mcp_skill("server-b", skill_b)
-            .unwrap();
+        provider.register_mcp_skill("server-b", skill_b).unwrap();
 
         assert_eq!(provider.discover().await.unwrap().len(), 2);
 
@@ -242,12 +238,8 @@ description: "Server B analysis"
 Server B instructions.
 "#;
 
-        provider
-            .register_mcp_skill("server-a", skill_a)
-            .unwrap();
-        provider
-            .register_mcp_skill("server-b", skill_b)
-            .unwrap();
+        provider.register_mcp_skill("server-a", skill_a).unwrap();
+        provider.register_mcp_skill("server-b", skill_b).unwrap();
 
         // Both are registered (discover deduplicates by name, but both exist internally)
         let cache = provider.cache.read().unwrap();
@@ -289,9 +281,6 @@ Instructions.
         // Only one entry left
         let cache = provider.cache.read().unwrap();
         assert_eq!(cache.len(), 1);
-        assert_eq!(
-            cache.values().next().unwrap().server_name,
-            "server-b"
-        );
+        assert_eq!(cache.values().next().unwrap().server_name, "server-b");
     }
 }

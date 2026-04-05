@@ -33,9 +33,7 @@ use std::time::Instant;
 
 use rmcp::{
     ClientHandler, Peer, RoleClient,
-    model::{
-        CallToolRequestParams, CallToolResult, ReadResourceRequestParams, Resource, Tool,
-    },
+    model::{CallToolRequestParams, CallToolResult, ReadResourceRequestParams, Resource, Tool},
     serve_client,
     service::ServiceError,
     transport::TokioChildProcess,
@@ -125,9 +123,15 @@ pub struct RetryConfig {
     pub max_delay_ms: u64,
 }
 
-fn default_max_retries() -> u32 { 5 }
-fn default_initial_delay_ms() -> u64 { 1000 }
-fn default_max_delay_ms() -> u64 { 30_000 }
+fn default_max_retries() -> u32 {
+    5
+}
+fn default_initial_delay_ms() -> u64 {
+    1000
+}
+fn default_max_delay_ms() -> u64 {
+    30_000
+}
 
 impl Default for RetryConfig {
     fn default() -> Self {
@@ -238,7 +242,11 @@ impl McpConnection {
     /// Read a resource by URI, extracting text content.
     pub async fn read_resource(&self, uri: &str) -> Result<String, McpError> {
         let params = ReadResourceRequestParams::new(uri.to_string());
-        let result = self.peer.read_resource(params).await.map_err(McpError::Service)?;
+        let result = self
+            .peer
+            .read_resource(params)
+            .await
+            .map_err(McpError::Service)?;
         let text = result
             .contents
             .into_iter()
@@ -303,7 +311,8 @@ impl McpClientManager {
         }
 
         let name = config.name.clone();
-        self.states.insert(name.clone(), ConnectionState::Connecting);
+        self.states
+            .insert(name.clone(), ConnectionState::Connecting);
         match connect_to_server(config).await {
             Ok(connection) => {
                 self.states.insert(name.clone(), ConnectionState::Connected);
@@ -336,7 +345,10 @@ impl McpClientManager {
         let skill_resources = conn.discover_skill_resources().await;
         let mut registered = 0;
         for (_name, content) in &skill_resources {
-            match skill_registry.register_mcp_skill(&server_name, content).await {
+            match skill_registry
+                .register_mcp_skill(&server_name, content)
+                .await
+            {
                 Ok(_) => registered += 1,
                 Err(e) => {
                     eprintln!("  ⚠ Failed to register MCP skill from {server_name}: {e}");
@@ -356,7 +368,8 @@ impl McpClientManager {
     ) -> bool {
         let removed = self.connections.remove(name).is_some();
         if removed {
-            self.states.insert(name.to_string(), ConnectionState::Disconnected);
+            self.states
+                .insert(name.to_string(), ConnectionState::Disconnected);
             let _ = skill_registry.remove_mcp_server_skills(name).await;
         }
         removed
@@ -367,7 +380,8 @@ impl McpClientManager {
     pub fn disconnect(&mut self, name: &str) -> bool {
         let removed = self.connections.remove(name).is_some();
         if removed {
-            self.states.insert(name.to_string(), ConnectionState::Disconnected);
+            self.states
+                .insert(name.to_string(), ConnectionState::Disconnected);
         }
         removed
     }
@@ -530,17 +544,21 @@ impl McpClientManager {
 
         // Remove old connection before reconnect attempt
         self.connections.remove(name);
-        self.states.insert(name.to_string(), ConnectionState::Reconnecting);
+        self.states
+            .insert(name.to_string(), ConnectionState::Reconnecting);
 
         match connect_to_server(config).await {
             Ok(connection) => {
                 let tool_count = connection.tools.len();
-                self.states.insert(name.to_string(), ConnectionState::Connected);
-                self.connections.insert(name.to_string(), Arc::new(connection));
+                self.states
+                    .insert(name.to_string(), ConnectionState::Connected);
+                self.connections
+                    .insert(name.to_string(), Arc::new(connection));
                 Ok(tool_count)
             }
             Err(e) => {
-                self.states.insert(name.to_string(), ConnectionState::Failed);
+                self.states
+                    .insert(name.to_string(), ConnectionState::Failed);
                 Err(e)
             }
         }
@@ -560,17 +578,20 @@ impl McpClientManager {
         // Clean up old skills first
         let _ = skill_registry.remove_mcp_server_skills(name).await;
         self.connections.remove(name);
-        self.states.insert(name.to_string(), ConnectionState::Reconnecting);
+        self.states
+            .insert(name.to_string(), ConnectionState::Reconnecting);
 
         // Reconnect with retry
         let connection = match connect_to_server(config).await {
             Ok(conn) => conn,
             Err(e) => {
-                self.states.insert(name.to_string(), ConnectionState::Failed);
+                self.states
+                    .insert(name.to_string(), ConnectionState::Failed);
                 return Err(e);
             }
         };
-        self.states.insert(name.to_string(), ConnectionState::Connected);
+        self.states
+            .insert(name.to_string(), ConnectionState::Connected);
         let conn = Arc::new(connection);
         self.connections.insert(name.to_string(), Arc::clone(&conn));
 
@@ -629,7 +650,10 @@ async fn connect_to_server(config: McpServerConfig) -> Result<McpConnection, Mcp
     }
 
     Err(last_error.unwrap_or_else(|| {
-        McpError::Initialize(format!("{name}: all {n} retries exhausted", n = retry.max_retries))
+        McpError::Initialize(format!(
+            "{name}: all {n} retries exhausted",
+            n = retry.max_retries
+        ))
     }))
 }
 
@@ -639,11 +663,33 @@ async fn connect_once(config: &McpServerConfig) -> Result<McpConnection, McpErro
         Transport::Stdio { command, args, env } => {
             connect_stdio(&config.name, command, args, env, config.clone()).await
         }
-        Transport::Sse { url, auth_token, headers } => {
-            connect_sse(&config.name, url, auth_token.as_deref(), headers, config.clone()).await
+        Transport::Sse {
+            url,
+            auth_token,
+            headers,
+        } => {
+            connect_sse(
+                &config.name,
+                url,
+                auth_token.as_deref(),
+                headers,
+                config.clone(),
+            )
+            .await
         }
-        Transport::Ws { url, auth_token, headers } => {
-            connect_ws(&config.name, url, auth_token.as_deref(), headers, config.clone()).await
+        Transport::Ws {
+            url,
+            auth_token,
+            headers,
+        } => {
+            connect_ws(
+                &config.name,
+                url,
+                auth_token.as_deref(),
+                headers,
+                config.clone(),
+            )
+            .await
         }
     }
 }
@@ -723,8 +769,9 @@ async fn connect_sse(
         for (k, v) in headers {
             let header_name = reqwest::header::HeaderName::from_bytes(k.as_bytes())
                 .map_err(|e| McpError::InvalidConfig(format!("invalid header name '{k}': {e}")))?;
-            let header_value = reqwest::header::HeaderValue::from_str(v)
-                .map_err(|e| McpError::InvalidConfig(format!("invalid header value for '{k}': {e}")))?;
+            let header_value = reqwest::header::HeaderValue::from_str(v).map_err(|e| {
+                McpError::InvalidConfig(format!("invalid header value for '{k}': {e}"))
+            })?;
             custom.insert(header_name, header_value);
         }
         transport_config = transport_config.custom_headers(custom);
@@ -929,7 +976,13 @@ fn truncate_with_marker(s: &str, max_len: usize) -> String {
 /// Replaces invalid chars with underscore.
 pub fn sanitize_tool_name(name: &str) -> String {
     name.chars()
-        .map(|c| if c.is_alphanumeric() || c == '_' || c == '-' { c } else { '_' })
+        .map(|c| {
+            if c.is_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect()
 }
 
@@ -1294,7 +1347,11 @@ mcp_servers:
             },
             description: "A test MCP server".to_string(),
             enabled: true,
-            retry: RetryConfig { max_retries: 3, initial_delay_ms: 500, max_delay_ms: 10_000 },
+            retry: RetryConfig {
+                max_retries: 3,
+                initial_delay_ms: 500,
+                max_delay_ms: 10_000,
+            },
         };
 
         let yaml = serde_yaml::to_string(&original).unwrap();
@@ -1427,26 +1484,46 @@ transport:
         assert!(manager.server_state("test").is_none());
 
         // Simulate connect lifecycle (normally via connect_internal)
-        manager.states.insert("test".into(), ConnectionState::Connecting);
-        assert_eq!(manager.server_state("test"), Some(ConnectionState::Connecting));
+        manager
+            .states
+            .insert("test".into(), ConnectionState::Connecting);
+        assert_eq!(
+            manager.server_state("test"),
+            Some(ConnectionState::Connecting)
+        );
 
         // Simulate failure
-        manager.states.insert("test".into(), ConnectionState::Failed);
+        manager
+            .states
+            .insert("test".into(), ConnectionState::Failed);
         assert_eq!(manager.server_state("test"), Some(ConnectionState::Failed));
 
         // Simulate reconnecting
-        manager.states.insert("test".into(), ConnectionState::Reconnecting);
-        assert_eq!(manager.server_state("test"), Some(ConnectionState::Reconnecting));
+        manager
+            .states
+            .insert("test".into(), ConnectionState::Reconnecting);
+        assert_eq!(
+            manager.server_state("test"),
+            Some(ConnectionState::Reconnecting)
+        );
 
         // Simulate connected (then disconnect)
-        manager.states.insert("test".into(), ConnectionState::Connected);
-        assert_eq!(manager.server_state("test"), Some(ConnectionState::Connected));
+        manager
+            .states
+            .insert("test".into(), ConnectionState::Connected);
+        assert_eq!(
+            manager.server_state("test"),
+            Some(ConnectionState::Connected)
+        );
 
         // disconnect() without an actual connection doesn't change state
         // (returns false since no connection exists)
         assert!(!manager.disconnect("test"));
         // State stays Connected since disconnect only updates on actual removal
-        assert_eq!(manager.server_state("test"), Some(ConnectionState::Connected));
+        assert_eq!(
+            manager.server_state("test"),
+            Some(ConnectionState::Connected)
+        );
 
         // server_states includes all tracked servers
         let states = manager.server_states();
@@ -1493,7 +1570,10 @@ transport:
     fn truncate_with_marker_long() {
         let long = "a".repeat(3000);
         let result = truncate_with_marker(&long, MAX_DESCRIPTION_LENGTH);
-        assert!(result.len() <= MAX_DESCRIPTION_LENGTH, "truncated output should not exceed max_len");
+        assert!(
+            result.len() <= MAX_DESCRIPTION_LENGTH,
+            "truncated output should not exceed max_len"
+        );
         assert!(result.ends_with("… [truncated]"));
     }
 
@@ -1507,7 +1587,10 @@ transport:
         let schema = mcp_tool_to_schema("server", &tool);
         let desc = schema["function"]["description"].as_str().unwrap();
 
-        assert!(desc.len() <= MAX_DESCRIPTION_LENGTH, "truncated desc should not exceed max");
+        assert!(
+            desc.len() <= MAX_DESCRIPTION_LENGTH,
+            "truncated desc should not exceed max"
+        );
         assert!(desc.ends_with("… [truncated]"));
     }
 
@@ -1515,7 +1598,11 @@ transport:
     fn mcp_tool_to_schema_sanitizes_name() {
         use std::sync::Arc;
         let empty_schema: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
-        let tool = Tool::new("read file".to_string(), "desc".to_string(), Arc::new(empty_schema));
+        let tool = Tool::new(
+            "read file".to_string(),
+            "desc".to_string(),
+            Arc::new(empty_schema),
+        );
         let schema = mcp_tool_to_schema("my.server", &tool);
 
         let name = schema["function"]["name"].as_str().unwrap();
@@ -1570,7 +1657,11 @@ transport:
         let config: McpServerConfig = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(config.name, "remote-server");
         match &config.transport {
-            Transport::Sse { url, auth_token, headers } => {
+            Transport::Sse {
+                url,
+                auth_token,
+                headers,
+            } => {
                 assert_eq!(url, "https://api.example.com/mcp");
                 assert_eq!(auth_token.as_deref(), Some("my-token"));
                 assert_eq!(headers.get("X-Api-Key"), Some(&"abc123".to_string()));
@@ -1589,7 +1680,11 @@ transport:
 "#;
         let config: McpServerConfig = serde_yaml::from_str(yaml).unwrap();
         match &config.transport {
-            Transport::Sse { url, auth_token, headers } => {
+            Transport::Sse {
+                url,
+                auth_token,
+                headers,
+            } => {
                 assert_eq!(url, "http://localhost:8080/mcp");
                 assert!(auth_token.is_none());
                 assert!(headers.is_empty());
@@ -1608,7 +1703,11 @@ transport:
 "#;
         let config: McpServerConfig = serde_yaml::from_str(yaml).unwrap();
         match &config.transport {
-            Transport::Sse { url, auth_token, headers } => {
+            Transport::Sse {
+                url,
+                auth_token,
+                headers,
+            } => {
                 assert_eq!(url, "http://localhost:3000");
                 assert!(auth_token.is_none());
                 assert!(headers.is_empty());
@@ -1640,8 +1739,14 @@ mcp_servers:
         let configs: ConfigList = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(configs.mcp_servers.len(), 2);
 
-        assert!(matches!(configs.mcp_servers[0].transport, Transport::Stdio { .. }));
-        assert!(matches!(configs.mcp_servers[1].transport, Transport::Sse { .. }));
+        assert!(matches!(
+            configs.mcp_servers[0].transport,
+            Transport::Stdio { .. }
+        ));
+        assert!(matches!(
+            configs.mcp_servers[1].transport,
+            Transport::Sse { .. }
+        ));
     }
 
     #[test]
@@ -1656,7 +1761,9 @@ transport:
         let config: McpServerConfig = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(config.name, "ws-server");
         match &config.transport {
-            Transport::Ws { url, auth_token, .. } => {
+            Transport::Ws {
+                url, auth_token, ..
+            } => {
                 assert_eq!(url, "wss://api.example.com/mcp");
                 assert_eq!(auth_token.as_deref(), Some("ws-token"));
             }
@@ -1674,7 +1781,9 @@ transport:
 "#;
         let config: McpServerConfig = serde_yaml::from_str(yaml).unwrap();
         match &config.transport {
-            Transport::Ws { url, auth_token, .. } => {
+            Transport::Ws {
+                url, auth_token, ..
+            } => {
                 assert_eq!(url, "ws://localhost:9090/mcp");
                 assert!(auth_token.is_none());
             }
@@ -1692,7 +1801,9 @@ transport:
 "#;
         let config: McpServerConfig = serde_yaml::from_str(yaml).unwrap();
         match &config.transport {
-            Transport::Ws { url, auth_token, .. } => {
+            Transport::Ws {
+                url, auth_token, ..
+            } => {
                 assert_eq!(url, "ws://localhost:3000");
                 assert!(auth_token.is_none());
             }
@@ -1725,8 +1836,17 @@ mcp_servers:
 
         let configs: ConfigList = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(configs.mcp_servers.len(), 3);
-        assert!(matches!(configs.mcp_servers[0].transport, Transport::Stdio { .. }));
-        assert!(matches!(configs.mcp_servers[1].transport, Transport::Sse { .. }));
-        assert!(matches!(configs.mcp_servers[2].transport, Transport::Ws { .. }));
+        assert!(matches!(
+            configs.mcp_servers[0].transport,
+            Transport::Stdio { .. }
+        ));
+        assert!(matches!(
+            configs.mcp_servers[1].transport,
+            Transport::Sse { .. }
+        ));
+        assert!(matches!(
+            configs.mcp_servers[2].transport,
+            Transport::Ws { .. }
+        ));
     }
 }

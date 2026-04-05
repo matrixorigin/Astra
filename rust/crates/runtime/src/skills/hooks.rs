@@ -14,7 +14,10 @@ pub enum HookAction {
     /// Set an environment variable.
     SetEnv { key: String, value: String },
     /// Custom hook identifier (for extensibility).
-    Custom { id: String, config: Option<serde_json::Value> },
+    Custom {
+        id: String,
+        config: Option<serde_json::Value>,
+    },
 }
 
 /// Lifecycle hooks for a skill.

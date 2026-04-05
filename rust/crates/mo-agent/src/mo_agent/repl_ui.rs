@@ -70,7 +70,10 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
         "/session list",
         "All journals + cwd / git / age from workspace",
     ),
-    ("/skill", "Skill management: /skill [list|info|search|new|dev|test]"),
+    (
+        "/skill",
+        "Skill management: /skill [list|info|search|new|dev|test]",
+    ),
     ("/mcp", "MCP server status: /mcp [status|servers]"),
     (
         "/report",

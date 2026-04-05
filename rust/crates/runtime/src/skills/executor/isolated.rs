@@ -12,7 +12,9 @@ use async_trait::async_trait;
 use std::sync::Arc;
 
 use super::super::manifest::{ExecutionContext, LoadedSkill};
-use super::super::traits::{SkillError, SkillExecutionContext, SkillExecutionResult, SkillExecutor};
+use super::super::traits::{
+    SkillError, SkillExecutionContext, SkillExecutionResult, SkillExecutor,
+};
 
 /// Trait for executing isolated skill sub-runs.
 ///
@@ -74,7 +76,12 @@ impl SkillExecutor for IsolatedSkillExecutor {
                 skill.manifest.model.as_deref(),
                 skill.manifest.max_tokens,
                 &skill.manifest.allowed_tools,
-                skill.manifest.effort.as_ref().map(|e| e.to_string()).as_deref(),
+                skill
+                    .manifest
+                    .effort
+                    .as_ref()
+                    .map(|e| e.to_string())
+                    .as_deref(),
                 skill.manifest.agent_type.as_deref(),
             )
             .await

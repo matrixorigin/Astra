@@ -190,9 +190,6 @@ pub async fn search_marketplace_handler(
     State(state): State<AppState>,
     Query(query): Query<SkillSearchQuery>,
 ) -> Result<Json<SkillSearchResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let results = state
-        .marketplace_stats_service
-        .search_ranked(query)
-        .await?;
+    let results = state.marketplace_stats_service.search_ranked(query).await?;
     Ok(Json(results))
 }

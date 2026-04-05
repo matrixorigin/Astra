@@ -408,7 +408,10 @@ mod tests {
             true,
             pack.ingest_mut(),
         );
-        assert_eq!(out, AgenticTurnIngestOutcome::Fatal("rate limited".to_string()));
+        assert_eq!(
+            out,
+            AgenticTurnIngestOutcome::Fatal("rate limited".to_string())
+        );
         assert_eq!(pack.consecutive_context_window_errors, 0);
     }
 

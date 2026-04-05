@@ -9,9 +9,7 @@ use std::sync::{Arc, RwLock};
 use super::activation::ConditionalSkillTracker;
 use super::manifest::{LoadedSkill, SkillManifest, SkillSourceKind};
 use super::providers::mcp::McpSkillProvider;
-use super::traits::{
-    ResolvedSkill, SkillError, SkillProvider, SkillToolInfo,
-};
+use super::traits::{ResolvedSkill, SkillError, SkillProvider, SkillToolInfo};
 
 // ── Cached skill entry ───────────────────────────────────────────────────────
 
@@ -100,12 +98,14 @@ impl UnifiedSkillRegistry {
         // Sort by source priority so higher-priority sources win on name collisions
         all_manifests.sort_by_key(|m| Self::source_priority(&m.source));
 
-        let mut cache = self.cache.write().map_err(|e| {
-            SkillError::Internal(format!("cache lock poisoned: {e}"))
-        })?;
-        let mut conditional = self.conditional_skills.write().map_err(|e| {
-            SkillError::Internal(format!("conditional lock poisoned: {e}"))
-        })?;
+        let mut cache = self
+            .cache
+            .write()
+            .map_err(|e| SkillError::Internal(format!("cache lock poisoned: {e}")))?;
+        let mut conditional = self
+            .conditional_skills
+            .write()
+            .map_err(|e| SkillError::Internal(format!("conditional lock poisoned: {e}")))?;
 
         // Clear stale state before re-populating.
         cache.clear();
@@ -181,9 +181,10 @@ impl UnifiedSkillRegistry {
     pub async fn load(&self, name: &str) -> Result<LoadedSkill, SkillError> {
         // Check if already loaded in cache
         {
-            let cache = self.cache.read().map_err(|e| {
-                SkillError::Internal(format!("cache lock poisoned: {e}"))
-            })?;
+            let cache = self
+                .cache
+                .read()
+                .map_err(|e| SkillError::Internal(format!("cache lock poisoned: {e}")))?;
             if let Some(entry) = cache.get(name) {
                 if let Some(ref loaded) = entry.loaded {
                     return Ok(loaded.clone());
@@ -196,15 +197,18 @@ impl UnifiedSkillRegistry {
             .providers
             .iter()
             .map(|p| p.as_ref())
-            .chain(std::iter::once(self.mcp_provider.as_ref() as &dyn SkillProvider))
+            .chain(std::iter::once(
+                self.mcp_provider.as_ref() as &dyn SkillProvider
+            ))
             .collect();
 
         for provider in all_sources {
             match provider.load(name).await {
                 Ok(loaded) => {
-                    let mut cache = self.cache.write().map_err(|e| {
-                        SkillError::Internal(format!("cache lock poisoned: {e}"))
-                    })?;
+                    let mut cache = self
+                        .cache
+                        .write()
+                        .map_err(|e| SkillError::Internal(format!("cache lock poisoned: {e}")))?;
                     cache.insert(
                         name.to_string(),
                         CachedSkill {
@@ -321,7 +325,9 @@ impl UnifiedSkillRegistry {
         server_name: &str,
         skill_md_content: &str,
     ) -> Result<String, SkillError> {
-        let name = self.mcp_provider.register_mcp_skill(server_name, skill_md_content)?;
+        let name = self
+            .mcp_provider
+            .register_mcp_skill(server_name, skill_md_content)?;
         self.discover_all().await?;
         Ok(name)
     }
@@ -443,7 +449,9 @@ impl super::traits::SkillResolver for UnifiedSkillResolver {
                                 Err(e) => return Err(e),
                             }
                         }
-                        Err(SkillError::NotFound(format!("unknown skill: {canonical_name}")))
+                        Err(SkillError::NotFound(format!(
+                            "unknown skill: {canonical_name}"
+                        )))
                     })
                 })
                 .join()
@@ -490,10 +498,7 @@ impl LegacySkillResolverAdapter {
 }
 
 impl crate::turn::skill_tool::SkillResolver for LegacySkillResolverAdapter {
-    fn resolve(
-        &self,
-        name: &str,
-    ) -> Result<crate::turn::skill_tool::ResolvedSkill, String> {
+    fn resolve(&self, name: &str) -> Result<crate::turn::skill_tool::ResolvedSkill, String> {
         match self.inner.resolve(name) {
             Ok(resolved) => Ok(crate::turn::skill_tool::ResolvedSkill {
                 name: resolved.name,
@@ -537,8 +542,8 @@ pub type SharedSkillRegistry = Arc<UnifiedSkillRegistry>;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use async_trait::async_trait;
     use crate::skills::traits::SkillResolver as _;
+    use async_trait::async_trait;
 
     struct StubProvider {
         skills: Vec<(SkillManifest, String)>,
@@ -1161,15 +1166,18 @@ mod tests {
         // Manually inject a stale entry into cache
         {
             let mut cache = registry.cache.write().unwrap();
-            cache.insert("stale-skill".into(), CachedSkill {
-                manifest: SkillManifest {
-                    name: "stale-skill".into(),
-                    description: "Stale".into(),
-                    source: SkillSourceKind::Local,
-                    ..Default::default()
+            cache.insert(
+                "stale-skill".into(),
+                CachedSkill {
+                    manifest: SkillManifest {
+                        name: "stale-skill".into(),
+                        description: "Stale".into(),
+                        source: SkillSourceKind::Local,
+                        ..Default::default()
+                    },
+                    loaded: None,
                 },
-                loaded: None,
-            });
+            );
         }
         assert_eq!(registry.len(), 2);
 
@@ -1223,7 +1231,10 @@ triggers:
 MCP test instructions.
 "#;
 
-        let name = registry.register_mcp_skill("server-1", skill_md).await.unwrap();
+        let name = registry
+            .register_mcp_skill("server-1", skill_md)
+            .await
+            .unwrap();
         assert_eq!(name, "mcp-test");
         assert!(registry.get_manifest("mcp-test").is_some());
 
@@ -1243,7 +1254,10 @@ description: "Will be removed"
 Removable.
 "#;
 
-        registry.register_mcp_skill("server-x", skill_md).await.unwrap();
+        registry
+            .register_mcp_skill("server-x", skill_md)
+            .await
+            .unwrap();
         assert!(registry.get_manifest("mcp-remove").is_some());
 
         registry.remove_mcp_server_skills("server-x").await.unwrap();

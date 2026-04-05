@@ -47,14 +47,16 @@ pub mod watcher;
 pub use handlers::*;
 
 // Re-export key framework types for convenience.
+pub use composition::{CompositionContext, CompositionError};
 pub use manifest::{ExecutionContext, LoadedSkill, SkillManifest, SkillSourceKind};
+pub use providers::{
+    BundledSkillProvider, DatabaseSkillProvider, LocalSkillProvider, McpSkillProvider,
+};
+pub use quality::{SkillOutcome, SkillQualityEntry, SkillQualityTracker};
 pub use registry::{SharedSkillRegistry, UnifiedSkillRegistry, UnifiedSkillResolver};
 pub use traits::{SkillError, SkillExecutor, SkillProvider, SkillResolver};
-pub use version::{Dependency, DependencyResolver, Version, VersionConstraint};
-pub use providers::{BundledSkillProvider, DatabaseSkillProvider, LocalSkillProvider, McpSkillProvider};
-pub use quality::{SkillQualityTracker, SkillQualityEntry, SkillOutcome};
 pub use verify::SkillVerifier;
-pub use composition::{CompositionContext, CompositionError};
+pub use version::{Dependency, DependencyResolver, Version, VersionConstraint};
 
 /// Returns a shared reference to a static empty `UnifiedSkillRegistry`.
 /// Useful in tests and server contexts where no local skill providers apply.
@@ -79,11 +81,8 @@ pub fn default_unified_registry() -> &'static std::sync::Arc<UnifiedSkillRegistr
         let registry = std::sync::Arc::new(registry);
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             let r = registry.clone();
-            let _ = std::thread::scope(|s| {
-                s.spawn(|| handle.block_on(r.discover_all()))
-                    .join()
-                    .ok()
-            });
+            let _ =
+                std::thread::scope(|s| s.spawn(|| handle.block_on(r.discover_all())).join().ok());
         }
         registry
     })

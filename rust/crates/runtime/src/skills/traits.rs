@@ -3,8 +3,8 @@
 //! All extensibility points are defined as traits so new skill sources, executors,
 //! and resolvers can be added without modifying core code.
 
-use async_trait::async_trait;
 use super::manifest::{ExecutionContext, LoadedSkill, SkillManifest, SkillSourceKind};
+use async_trait::async_trait;
 
 // ── SkillProvider ────────────────────────────────────────────────────────────
 
@@ -197,11 +197,7 @@ pub trait SkillMarketplace: Send + Sync {
         filters: &SearchFilters,
     ) -> Result<Vec<SkillManifest>, SkillError>;
 
-    async fn publish(
-        &self,
-        manifest: &SkillManifest,
-        package: &[u8],
-    ) -> Result<(), SkillError>;
+    async fn publish(&self, manifest: &SkillManifest, package: &[u8]) -> Result<(), SkillError>;
 
     async fn download(
         &self,

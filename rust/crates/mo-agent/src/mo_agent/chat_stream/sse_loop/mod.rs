@@ -49,7 +49,8 @@ pub(crate) async fn stream_chat_sse(
     let project_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let file_context = detect_project_languages(&project_root);
     let executor = {
-        let ex = edge_tools::ToolExecutor::new(&project_root).with_cloud(p.api.api_origin(), p.token);
+        let ex =
+            edge_tools::ToolExecutor::new(&project_root).with_cloud(p.api.api_origin(), p.token);
         if let Some(ref mgr) = p.mcp_manager {
             ex.with_mcp_manager(mgr.clone())
         } else {
@@ -188,10 +189,10 @@ pub(crate) async fn stream_chat_sse(
             if reg_arc.is_empty() {
                 let _ = reg_arc.discover_all().await;
             }
-            let inner_resolver = Arc::new(
-                astra_runtime::skills::UnifiedSkillResolver::new(reg_arc)
-            );
-            let adapter = astra_runtime::skills::registry::LegacySkillResolverAdapter::new(inner_resolver);
+            let inner_resolver =
+                Arc::new(astra_runtime::skills::UnifiedSkillResolver::new(reg_arc));
+            let adapter =
+                astra_runtime::skills::registry::LegacySkillResolverAdapter::new(inner_resolver);
             let skills = adapter.available_skills();
             if skills.is_empty() {
                 None
@@ -208,19 +209,19 @@ pub(crate) async fn stream_chat_sse(
                 parent_perm_mode,
                 parent_cancel_token,
             ));
-            let isolated = Arc::new(
-                astra_runtime::skills::executor::IsolatedSkillExecutor::new(subrun_exec),
-            );
-            let router = Arc::new(
-                astra_runtime::skills::executor::SkillExecutionRouter::new(Some(isolated)),
-            );
+            let isolated = Arc::new(astra_runtime::skills::executor::IsolatedSkillExecutor::new(
+                subrun_exec,
+            ));
+            let router = Arc::new(astra_runtime::skills::executor::SkillExecutionRouter::new(
+                Some(isolated),
+            ));
             Some(router as Arc<dyn astra_runtime::skills::SkillExecutor>)
         },
         skill_model_override: None,
         skill_effort: None,
         skill_agent_type: None,
         skill_allowed_tools: None,
-            skill_quality_tracker: p.skill_quality_tracker.clone(),
+        skill_quality_tracker: p.skill_quality_tracker.clone(),
         pinned_skills: std::collections::HashSet::new(),
         stop_hooks: hook_sets.stop_hooks,
         stop_hook_runs: 0,

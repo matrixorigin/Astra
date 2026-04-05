@@ -835,8 +835,7 @@ impl LlmToolSelector {
     }
 
     /// Deprecated: skill activation is now handled by the `skill` tool. No-op.
-    pub fn update_skills(&mut self, _skills: &[SkillCatalogEntry]) {
-    }
+    pub fn update_skills(&mut self, _skills: &[SkillCatalogEntry]) {}
 
     /// Make a lightweight SSE call and collect the full response text.
     /// Returns (text, tokens_in, tokens_out).
@@ -3306,4 +3305,3 @@ mod tests {
         );
     }
 }
-     

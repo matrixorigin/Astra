@@ -54,7 +54,9 @@ fn build_server_skill_resolver() -> (
     if registry.is_empty() {
         return (None, None);
     }
-    let inner = Arc::new(crate::skills::UnifiedSkillResolver::new(Arc::clone(&registry)));
+    let inner = Arc::new(crate::skills::UnifiedSkillResolver::new(Arc::clone(
+        &registry,
+    )));
     let adapter = crate::skills::registry::LegacySkillResolverAdapter::new(inner);
     let skills = adapter.available_skills();
     let resolver: Option<Arc<dyn crate::turn::skill_tool::SkillResolver>> = if skills.is_empty() {

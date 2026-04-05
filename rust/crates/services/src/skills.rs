@@ -527,7 +527,7 @@ impl SkillService for DatabaseSkillService {
              (skill_id, skill_name, version, description, triggers, dependencies, manifest, \
                category, priority, is_active, status, source, is_public, created_by, \
                publisher_id, trust_tier, created_at, updated_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 'active', 'user', 1, ?, ?, ?, NOW(), NOW())"
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 'active', 'user', 1, ?, ?, ?, NOW(), NOW())",
         )
         .bind(&skill_id)
         .bind(&request.name)

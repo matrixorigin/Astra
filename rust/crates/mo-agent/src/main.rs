@@ -67,22 +67,22 @@ mod repl_runtime;
 mod repl_turn;
 #[path = "mo_agent/repl_ui.rs"]
 mod repl_ui;
+#[path = "mo_agent/skill_subrun.rs"]
+mod skill_subrun;
 #[path = "mo_agent/slash_account.rs"]
 mod slash_account;
 #[path = "mo_agent/slash_debug.rs"]
 mod slash_debug;
 #[path = "mo_agent/slash_info.rs"]
 mod slash_info;
+#[path = "mo_agent/slash_mcp.rs"]
+mod slash_mcp;
 #[path = "mo_agent/slash_memory.rs"]
 mod slash_memory;
 #[path = "mo_agent/slash_session.rs"]
 mod slash_session;
-#[path = "mo_agent/skill_subrun.rs"]
-mod skill_subrun;
 #[path = "mo_agent/slash_skill.rs"]
 mod slash_skill;
-#[path = "mo_agent/slash_mcp.rs"]
-mod slash_mcp;
 #[path = "mo_agent/slash_state.rs"]
 mod slash_state;
 #[path = "mo_agent/stream_render.rs"]
@@ -3737,8 +3737,9 @@ async fn handle_slash_command(
             handle_info_command(cmd, arg, api, state, token).await?;
         }
 
-        "/skill" | "/skill list" | "/skill info" | "/skill search" | "/skill new" | "/skill test" | "/skill dev"
-        | "/skill doctor" | "/skill validate" | "/skill config" | "/skill system" => {
+        "/skill" | "/skill list" | "/skill info" | "/skill search" | "/skill new"
+        | "/skill test" | "/skill dev" | "/skill doctor" | "/skill validate" | "/skill config"
+        | "/skill system" => {
             handle_skill_command(arg, api, state, token).await?;
         }
 
@@ -3869,7 +3870,8 @@ async fn run_chat_repl(
         .unwrap_or_else(|| std::path::PathBuf::from("."))
         .join("astra")
         .join("skill_quality.json");
-    state.skill_quality_tracker = astra_runtime::skills::quality::SkillQualityTracker::load(&skill_quality_path);
+    state.skill_quality_tracker =
+        astra_runtime::skills::quality::SkillQualityTracker::load(&skill_quality_path);
 
     // Load pinned skills from previous sessions
     let pinned_skills_path = dirs::config_dir()

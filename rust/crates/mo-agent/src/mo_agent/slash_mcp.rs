@@ -1,10 +1,7 @@
 use super::*;
 use crate::mcp_client::{ConnectionState, McpClientManager};
 
-pub(super) async fn handle_mcp_command(
-    arg: &str,
-    state: &ReplState,
-) -> Result<(), String> {
+pub(super) async fn handle_mcp_command(arg: &str, state: &ReplState) -> Result<(), String> {
     let sub = arg.trim();
 
     match sub {
@@ -13,7 +10,8 @@ pub(super) async fn handle_mcp_command(
         _ => {
             eprintln!(
                 "{}",
-                format!("  Unknown /mcp subcommand: '{sub}'. Try /mcp, /mcp status, /mcp servers").yellow()
+                format!("  Unknown /mcp subcommand: '{sub}'. Try /mcp, /mcp status, /mcp servers")
+                    .yellow()
             );
         }
     }
@@ -27,7 +25,10 @@ async fn show_status(state: &ReplState) {
 
     if count == 0 {
         eprintln!("{}", "  No MCP servers connected.".dim());
-        eprintln!("{}", "  Configure servers in manifest.yaml or .astra/mcp.yaml".dim());
+        eprintln!(
+            "{}",
+            "  Configure servers in manifest.yaml or .astra/mcp.yaml".dim()
+        );
         return;
     }
 
@@ -49,8 +50,11 @@ async fn show_servers(state: &ReplState) {
     for name in &servers {
         if let Some(conn) = manager.get(name) {
             let tools = conn.tools();
-            let state = manager.server_state(name).unwrap_or(ConnectionState::Connected);
-            let uptime = conn.uptime()
+            let state = manager
+                .server_state(name)
+                .unwrap_or(ConnectionState::Connected);
+            let uptime = conn
+                .uptime()
                 .map(|d| format_duration(d))
                 .unwrap_or_else(|| "n/a".to_string());
 
@@ -91,9 +95,12 @@ fn print_server_table(manager: &McpClientManager) {
 
     for name in &servers {
         if let Some(conn) = manager.get(name) {
-            let state = manager.server_state(name).unwrap_or(ConnectionState::Connected);
+            let state = manager
+                .server_state(name)
+                .unwrap_or(ConnectionState::Connected);
             let tool_count = conn.tools().len();
-            let uptime = conn.uptime()
+            let uptime = conn
+                .uptime()
                 .map(|d| format_duration(d))
                 .unwrap_or_else(|| "—".to_string());
 
@@ -146,12 +153,18 @@ mod tests {
 
     #[test]
     fn format_duration_minutes() {
-        assert_eq!(format_duration(std::time::Duration::from_secs(125)), "2m 5s");
+        assert_eq!(
+            format_duration(std::time::Duration::from_secs(125)),
+            "2m 5s"
+        );
     }
 
     #[test]
     fn format_duration_hours() {
-        assert_eq!(format_duration(std::time::Duration::from_secs(7500)), "2h 5m");
+        assert_eq!(
+            format_duration(std::time::Duration::from_secs(7500)),
+            "2h 5m"
+        );
     }
 
     #[test]

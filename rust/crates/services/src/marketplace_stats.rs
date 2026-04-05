@@ -213,7 +213,10 @@ impl MarketplaceStatsService for DatabaseMarketplaceStatsService {
     ) -> Result<SkillSearchResponse, (StatusCode, Json<ErrorResponse>)> {
         let pool = self.get_pool().await.map_err(internal_error)?;
 
-        let limit = search.limit.unwrap_or(DEFAULT_SEARCH_LIMIT).min(MAX_SEARCH_RESULTS);
+        let limit = search
+            .limit
+            .unwrap_or(DEFAULT_SEARCH_LIMIT)
+            .min(MAX_SEARCH_RESULTS);
         let offset = search.offset.unwrap_or(0);
 
         // Build dynamic WHERE clauses
@@ -221,9 +224,7 @@ impl MarketplaceStatsService for DatabaseMarketplaceStatsService {
         let mut binds: Vec<String> = Vec::new();
 
         if let Some(ref q) = search.query {
-            conditions.push(
-                "(sr.skill_name LIKE ? OR sr.description LIKE ?)".to_string(),
-            );
+            conditions.push("(sr.skill_name LIKE ? OR sr.description LIKE ?)".to_string());
             let like = format!("%{q}%");
             binds.push(like.clone());
             binds.push(like);

@@ -50,9 +50,7 @@ impl CompositionContext {
         let remaining = self.remaining_timeout();
         // Take the minimum of: parent's remaining budget, child's declared timeout
         let effective_timeout = match (remaining, child_timeout_secs) {
-            (Some(parent_rem), Some(child_max)) => {
-                Some(parent_rem.as_secs().min(child_max as u64))
-            }
+            (Some(parent_rem), Some(child_max)) => Some(parent_rem.as_secs().min(child_max as u64)),
             (Some(parent_rem), None) => Some(parent_rem.as_secs()),
             (None, Some(child_max)) => Some(child_max as u64),
             (None, None) => None,
@@ -140,11 +138,20 @@ impl std::fmt::Display for CompositionError {
             Self::MaxDepthExceeded { depth, max } => {
                 write!(f, "composition depth {depth} exceeds maximum {max}")
             }
-            Self::Timeout { elapsed_secs, limit_secs } => {
-                write!(f, "composition timed out ({elapsed_secs}s elapsed, {limit_secs}s limit)")
+            Self::Timeout {
+                elapsed_secs,
+                limit_secs,
+            } => {
+                write!(
+                    f,
+                    "composition timed out ({elapsed_secs}s elapsed, {limit_secs}s limit)"
+                )
             }
             Self::NotComposable { skill_name } => {
-                write!(f, "skill '{skill_name}' is not composable (set composable: true in manifest)")
+                write!(
+                    f,
+                    "skill '{skill_name}' is not composable (set composable: true in manifest)"
+                )
             }
             Self::InputValidation { errors } => {
                 write!(f, "input validation failed: {}", errors.join("; "))
@@ -172,11 +179,7 @@ pub fn validate_input(schema: &Value, args: &Value) -> Vec<String> {
     let required = schema
         .get("required")
         .and_then(Value::as_array)
-        .map(|arr| {
-            arr.iter()
-                .filter_map(Value::as_str)
-                .collect::<Vec<_>>()
-        })
+        .map(|arr| arr.iter().filter_map(Value::as_str).collect::<Vec<_>>())
         .unwrap_or_default();
 
     // Check required fields

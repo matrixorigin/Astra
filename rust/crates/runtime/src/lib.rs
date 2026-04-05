@@ -127,8 +127,7 @@ pub use astra_services::{
     },
     marketplace::{DatabaseMarketplaceService, MarketplaceService, UnconfiguredMarketplaceService},
     marketplace_stats::{
-        MarketplaceStatsService, NoopMarketplaceStatsService,
-        DatabaseMarketplaceStatsService,
+        DatabaseMarketplaceStatsService, MarketplaceStatsService, NoopMarketplaceStatsService,
     },
     models::{
         DatabaseModelService, ModelCreateRequestData, ModelListItem, ModelRecord, ModelService,

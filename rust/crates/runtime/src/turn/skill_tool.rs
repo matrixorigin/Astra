@@ -33,7 +33,9 @@ use serde_json::Value;
 
 use crate::skills::arguments::substitute_arguments;
 use crate::skills::hooks::HookAction;
-use crate::skills::manifest::{EffortLevel, ExecutionContext, LoadedSkill, SkillManifest, SkillSourceKind};
+use crate::skills::manifest::{
+    EffortLevel, ExecutionContext, LoadedSkill, SkillManifest, SkillSourceKind,
+};
 use crate::skills::traits::{SkillExecutionContext, SkillExecutor};
 
 // ─── Skill resolution trait ──────────────────────────────────────────────────
@@ -152,7 +154,8 @@ fn format_skills_within_budget(
         return (Vec::new(), Vec::new());
     }
 
-    let mut seen: std::collections::HashSet<&str> = skills.iter().map(|s| s.name.as_str()).collect();
+    let mut seen: std::collections::HashSet<&str> =
+        skills.iter().map(|s| s.name.as_str()).collect();
     let mut all_names: Vec<String> = skills.iter().map(|s| s.name.clone()).collect();
     // Include aliases so the LLM can invoke skills by alternative names
     for s in skills {
@@ -189,7 +192,8 @@ fn format_skills_within_budget(
     // Sort non-bundled by quality boost (highest first) for priority in budget
     if let Some(tracker) = quality_tracker {
         rest_skills.sort_by(|a, b| {
-            tracker.selection_boost(&b.name)
+            tracker
+                .selection_boost(&b.name)
                 .partial_cmp(&tracker.selection_boost(&a.name))
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
@@ -241,8 +245,12 @@ pub fn skill_tool_schema(
     quality_tracker: Option<&crate::skills::quality::SkillQualityTracker>,
     pinned_skills: Option<&std::collections::HashSet<String>>,
 ) -> Value {
-    let (skill_entries, all_names) =
-        format_skills_within_budget(skills, DEFAULT_SKILL_LISTING_BUDGET, quality_tracker, pinned_skills);
+    let (skill_entries, all_names) = format_skills_within_budget(
+        skills,
+        DEFAULT_SKILL_LISTING_BUDGET,
+        quality_tracker,
+        pinned_skills,
+    );
 
     let skill_names: Vec<Value> = all_names.into_iter().map(Value::String).collect();
 
@@ -299,7 +307,12 @@ pub fn skill_listing_system_message(
     quality_tracker: Option<&crate::skills::quality::SkillQualityTracker>,
     pinned_skills: Option<&std::collections::HashSet<String>>,
 ) -> Value {
-    let (entries, _) = format_skills_within_budget(skills, DEFAULT_SKILL_LISTING_BUDGET, quality_tracker, pinned_skills);
+    let (entries, _) = format_skills_within_budget(
+        skills,
+        DEFAULT_SKILL_LISTING_BUDGET,
+        quality_tracker,
+        pinned_skills,
+    );
 
     let mut lines = Vec::with_capacity(entries.len() + 4);
     lines.push("<available_skills>".to_string());
@@ -315,9 +328,7 @@ pub fn skill_listing_system_message(
         } else {
             // Names-only fallback
             let name = trimmed.trim_matches('*');
-            lines.push(format!(
-                "<skill>\n  <name>{name}</name>\n</skill>"
-            ));
+            lines.push(format!("<skill>\n  <name>{name}</name>\n</skill>"));
         }
     }
     lines.push("</available_skills>".to_string());
@@ -355,15 +366,10 @@ pub async fn execute_skill_inline(
     _tool_name: &str,
     args: &Value,
 ) -> String {
-    let skill_name = args
-        .get("skill_name")
-        .and_then(Value::as_str)
-        .unwrap_or("");
-    let task_hint = args
-        .get("task")
-        .and_then(Value::as_str)
-        .unwrap_or("");
-    let (text, _activation, _verification) = execute_skill(resolver, None, skill_name, task_hint, None).await;
+    let skill_name = args.get("skill_name").and_then(Value::as_str).unwrap_or("");
+    let task_hint = args.get("task").and_then(Value::as_str).unwrap_or("");
+    let (text, _activation, _verification) =
+        execute_skill(resolver, None, skill_name, task_hint, None).await;
     text
 }
 
@@ -440,7 +446,8 @@ pub async fn partition_and_execute_skills(
                 if let Some(ref mut tracker) = quality_tracker {
                     let success = verification_passed.unwrap_or_else(|| {
                         // Heuristic fallback when no verification ran
-                        !(text.contains("blocked:") || text.contains("failed:")
+                        !(text.contains("blocked:")
+                            || text.contains("failed:")
                             || text.starts_with("Unknown skill"))
                     });
                     tracker.record_outcome(&crate::skills::quality::SkillOutcome {
@@ -476,10 +483,7 @@ pub async fn partition_and_execute_skills(
 /// - `allowed_tools`: intersection of all non-empty allow-lists. If any
 ///   skill restricts tools, only tools allowed by ALL skills survive.
 ///   An unrestricted skill (empty list) doesn't widen a prior restriction.
-fn merge_activations(
-    prev: Option<SkillActivation>,
-    new: SkillActivation,
-) -> SkillActivation {
+fn merge_activations(prev: Option<SkillActivation>, new: SkillActivation) -> SkillActivation {
     let Some(mut merged) = prev else {
         return new;
     };
@@ -499,7 +503,10 @@ fn merge_activations(
     }
 
     // Tools: intersect non-empty allow-lists.
-    match (merged.allowed_tools.is_empty(), new.allowed_tools.is_empty()) {
+    match (
+        merged.allowed_tools.is_empty(),
+        new.allowed_tools.is_empty(),
+    ) {
         (true, true) => {} // Both unrestricted — stay unrestricted.
         (true, false) => {
             // Previous was unrestricted, new restricts — adopt new restrictions.
@@ -510,7 +517,9 @@ fn merge_activations(
             // Both restrict — intersect.
             let new_set: std::collections::HashSet<&str> =
                 new.allowed_tools.iter().map(|s| s.as_str()).collect();
-            merged.allowed_tools.retain(|t| new_set.contains(t.as_str()));
+            merged
+                .allowed_tools
+                .retain(|t| new_set.contains(t.as_str()));
         }
     }
 
@@ -574,7 +583,11 @@ async fn execute_skill(
                         format!(
                             "Input validation failed for skill '{}':\n{}",
                             skill_name,
-                            errors.iter().map(|e| format!("  - {e}")).collect::<Vec<_>>().join("\n")
+                            errors
+                                .iter()
+                                .map(|e| format!("  - {e}"))
+                                .collect::<Vec<_>>()
+                                .join("\n")
                         ),
                         None,
                         None,
@@ -636,7 +649,8 @@ async fn execute_skill(
 
                             // Post-execution verification (fork skills only)
                             let (output, verified) = if !skill.success_criteria.is_empty() {
-                                let work_dir = skill.skill_dir
+                                let work_dir = skill
+                                    .skill_dir
                                     .as_ref()
                                     .map(std::path::PathBuf::from)
                                     .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
@@ -652,7 +666,9 @@ async fn execute_skill(
                                         let icon = if r.passed { "✅" } else { "❌" };
                                         output.push_str(&format!(
                                             "- {} {} ({}ms){}\n",
-                                            icon, r.criterion_id, r.duration_ms,
+                                            icon,
+                                            r.criterion_id,
+                                            r.duration_ms,
                                             if let Some(ref err) = r.error {
                                                 format!(" — {err}")
                                             } else {
@@ -661,7 +677,9 @@ async fn execute_skill(
                                         ));
                                     }
                                     if !all_passed {
-                                        output.push_str("\n⚠️ Some required verification criteria failed.\n");
+                                        output.push_str(
+                                            "\n⚠️ Some required verification criteria failed.\n",
+                                        );
                                     }
                                 }
                                 (output, Some(all_passed))
@@ -915,7 +933,8 @@ mod tests {
     #[tokio::test]
     async fn execute_skill_includes_task_hint() {
         let resolver = stub_resolver();
-        let (output, _, _) = execute_skill(&resolver, None, "code-review", "Review auth module", None).await;
+        let (output, _, _) =
+            execute_skill(&resolver, None, "code-review", "Review auth module", None).await;
         assert!(output.contains("**Task context:** Review auth module"));
     }
 
@@ -980,7 +999,8 @@ mod tests {
             }
         })];
 
-        let (results, remaining, _) = partition_and_execute_skills(&tool_calls, &resolver, None, None, None).await;
+        let (results, remaining, _) =
+            partition_and_execute_skills(&tool_calls, &resolver, None, None, None).await;
         assert_eq!(results.len(), 1);
         assert!(results[0].1.contains("Invalid skill arguments"));
         assert_eq!(remaining.len(), 0);
@@ -1024,8 +1044,12 @@ mod tests {
         let skills: Vec<SkillToolInfo> = (0..20)
             .map(|i| SkillToolInfo {
                 name: format!("skill-{i}"),
-                description: format!("This is a very long description for skill number {i} that goes on and on"),
-                when_to_use: Some(format!("when the user needs to do something very specific related to task {i}")),
+                description: format!(
+                    "This is a very long description for skill number {i} that goes on and on"
+                ),
+                when_to_use: Some(format!(
+                    "when the user needs to do something very specific related to task {i}"
+                )),
                 source: SkillSourceKind::Local,
                 aliases: Vec::new(),
             })
@@ -1083,7 +1107,10 @@ mod tests {
         assert_eq!(names.len(), 100);
         // At least some entries should be names-only (no ":")
         let names_only_count = entries.iter().filter(|e| !e.contains(": ")).count();
-        assert!(names_only_count > 0, "should have names-only entries under extreme pressure");
+        assert!(
+            names_only_count > 0,
+            "should have names-only entries under extreme pressure"
+        );
     }
 
     #[test]
@@ -1098,13 +1125,16 @@ mod tests {
         }];
         let (entries, _) = format_skills_within_budget(&skills, 10_000, None, None);
         // Description should be capped at MAX_LISTING_DESC_CHARS
-        assert!(entries[0].len() < long_desc.len(), "entry should be shorter than raw description");
+        assert!(
+            entries[0].len() < long_desc.len(),
+            "entry should be shorter than raw description"
+        );
         assert!(entries[0].contains('…'), "should have truncation marker");
     }
 
     #[test]
     fn quality_boost_sorts_skills_under_budget_pressure() {
-        use crate::skills::quality::{SkillQualityTracker, SkillOutcome};
+        use crate::skills::quality::{SkillOutcome, SkillQualityTracker};
 
         let skills = vec![
             SkillToolInfo {
@@ -1148,9 +1178,18 @@ mod tests {
         // Under budget pressure, high-quality should come first
         let (entries, _) = format_skills_within_budget(&skills, 80, Some(&tracker), None);
         // With quality sorting, high-quality should appear before low-quality
-        let high_pos = entries.iter().position(|e| e.contains("high-quality")).unwrap();
-        let low_pos = entries.iter().position(|e| e.contains("low-quality")).unwrap();
-        assert!(high_pos < low_pos, "high-quality skill should be listed first");
+        let high_pos = entries
+            .iter()
+            .position(|e| e.contains("high-quality"))
+            .unwrap();
+        let low_pos = entries
+            .iter()
+            .position(|e| e.contains("low-quality"))
+            .unwrap();
+        assert!(
+            high_pos < low_pos,
+            "high-quality skill should be listed first"
+        );
     }
 
     #[test]
@@ -1271,7 +1310,8 @@ mod tests {
             }
         }
 
-        let (_, activation, _) = execute_skill(&ModelOverrideResolver, None, "fancy", "", None).await;
+        let (_, activation, _) =
+            execute_skill(&ModelOverrideResolver, None, "fancy", "", None).await;
         let act = activation.unwrap();
         assert_eq!(act.model_override.as_deref(), Some("gpt-4o"));
         assert_eq!(act.allowed_tools, vec!["bash"]);
@@ -1309,12 +1349,12 @@ mod tests {
             hooks: crate::skills::hooks::SkillHooks::default(),
             skill_dir: None,
             source: SkillSourceKind::Local,
-                    success_criteria: Vec::new(),
-                    composition: None,
-                    input_schema: None,
-                    aliases: Vec::new(),
-                    effort: None,
-                    agent_type: None,
+            success_criteria: Vec::new(),
+            composition: None,
+            input_schema: None,
+            aliases: Vec::new(),
+            effort: None,
+            agent_type: None,
         };
         let act = super::build_activation(&skill);
         assert!(act.model_override.is_none());
@@ -1333,15 +1373,18 @@ mod tests {
             hooks: crate::skills::hooks::SkillHooks::default(),
             skill_dir: None,
             source: SkillSourceKind::Local,
-                    success_criteria: Vec::new(),
-                    composition: None,
-                    input_schema: None,
-                    aliases: Vec::new(),
-                    effort: None,
-                    agent_type: None,
+            success_criteria: Vec::new(),
+            composition: None,
+            input_schema: None,
+            aliases: Vec::new(),
+            effort: None,
+            agent_type: None,
         };
         let act = super::build_activation(&skill);
-        assert_eq!(act.model_override.as_deref(), Some("claude-sonnet-4-20250514"));
+        assert_eq!(
+            act.model_override.as_deref(),
+            Some("claude-sonnet-4-20250514")
+        );
         assert_eq!(act.allowed_tools, vec!["bash", "read_file"]);
     }
 
@@ -1533,11 +1576,11 @@ mod tests {
                         skill_dir: None,
                         source: SkillSourceKind::Local,
                         success_criteria: Vec::new(),
-                    composition: None,
-                    input_schema: None,
-                    aliases: Vec::new(),
-                    effort: None,
-                    agent_type: None,
+                        composition: None,
+                        input_schema: None,
+                        aliases: Vec::new(),
+                        effort: None,
+                        agent_type: None,
                     }),
                     "skill-b" => Ok(ResolvedSkill {
                         name: "skill-b".into(),
@@ -1550,19 +1593,31 @@ mod tests {
                         skill_dir: None,
                         source: SkillSourceKind::Local,
                         success_criteria: Vec::new(),
-                    composition: None,
-                    input_schema: None,
-                    aliases: Vec::new(),
-                    effort: None,
-                    agent_type: None,
+                        composition: None,
+                        input_schema: None,
+                        aliases: Vec::new(),
+                        effort: None,
+                        agent_type: None,
                     }),
                     _ => Err(format!("unknown: {name}")),
                 }
             }
             fn available_skills(&self) -> Vec<SkillToolInfo> {
                 vec![
-                    SkillToolInfo { name: "skill-a".into(), description: "A".into(), when_to_use: None, source: SkillSourceKind::Local, aliases: Vec::new() },
-                    SkillToolInfo { name: "skill-b".into(), description: "B".into(), when_to_use: None, source: SkillSourceKind::Local, aliases: Vec::new() },
+                    SkillToolInfo {
+                        name: "skill-a".into(),
+                        description: "A".into(),
+                        when_to_use: None,
+                        source: SkillSourceKind::Local,
+                        aliases: Vec::new(),
+                    },
+                    SkillToolInfo {
+                        name: "skill-b".into(),
+                        description: "B".into(),
+                        when_to_use: None,
+                        source: SkillSourceKind::Local,
+                        aliases: Vec::new(),
+                    },
                 ]
             }
         }
@@ -1607,18 +1662,20 @@ mod tests {
                         hooks: crate::skills::hooks::SkillHooks::default(),
                         skill_dir: None,
                         source: SkillSourceKind::Local,
-                    success_criteria: Vec::new(),
-                    composition: None,
-                    input_schema: None,
-                    aliases: Vec::new(),
-                    effort: None,
-                    agent_type: None,
+                        success_criteria: Vec::new(),
+                        composition: None,
+                        input_schema: None,
+                        aliases: Vec::new(),
+                        effort: None,
+                        agent_type: None,
                     })
                 } else {
                     Err(format!("unknown: {name}"))
                 }
             }
-            fn available_skills(&self) -> Vec<SkillToolInfo> { vec![] }
+            fn available_skills(&self) -> Vec<SkillToolInfo> {
+                vec![]
+            }
         }
 
         let tool_calls = vec![
@@ -1671,7 +1728,9 @@ mod tests {
                     agent_type: None,
                 })
             }
-            fn available_skills(&self) -> Vec<SkillToolInfo> { vec![] }
+            fn available_skills(&self) -> Vec<SkillToolInfo> {
+                vec![]
+            }
         }
 
         // Nested context (depth=1)
@@ -1679,9 +1738,17 @@ mod tests {
         let child_ctx = parent_ctx.child("parent-skill", None);
 
         let (output, _, _) = execute_skill(
-            &NonComposableResolver, None, "child-skill", "do work", Some(&child_ctx),
-        ).await;
-        assert!(output.contains("not composable"), "Expected composability error, got: {output}");
+            &NonComposableResolver,
+            None,
+            "child-skill",
+            "do work",
+            Some(&child_ctx),
+        )
+        .await;
+        assert!(
+            output.contains("not composable"),
+            "Expected composability error, got: {output}"
+        );
     }
 
     #[tokio::test]
@@ -1712,17 +1779,27 @@ mod tests {
                     agent_type: None,
                 })
             }
-            fn available_skills(&self) -> Vec<SkillToolInfo> { vec![] }
+            fn available_skills(&self) -> Vec<SkillToolInfo> {
+                vec![]
+            }
         }
 
         let parent_ctx = crate::skills::composition::CompositionContext::root();
         let child_ctx = parent_ctx.child("parent-skill", None);
 
         let (output, _, _) = execute_skill(
-            &ComposableResolver, None, "child-skill", "do work", Some(&child_ctx),
-        ).await;
+            &ComposableResolver,
+            None,
+            "child-skill",
+            "do work",
+            Some(&child_ctx),
+        )
+        .await;
         // Should succeed (inline injection)
-        assert!(output.contains("Do composable things"), "Expected skill output, got: {output}");
+        assert!(
+            output.contains("Do composable things"),
+            "Expected skill output, got: {output}"
+        );
     }
 
     #[tokio::test]
@@ -1753,7 +1830,9 @@ mod tests {
                     agent_type: None,
                 })
             }
-            fn available_skills(&self) -> Vec<SkillToolInfo> { vec![] }
+            fn available_skills(&self) -> Vec<SkillToolInfo> {
+                vec![]
+            }
         }
 
         // Build a context at max depth
@@ -1762,10 +1841,12 @@ mod tests {
             ctx = ctx.child(&format!("level-{i}"), None);
         }
 
-        let (output, _, _) = execute_skill(
-            &AnyResolver, None, "too-deep", "work", Some(&ctx),
-        ).await;
-        assert!(output.contains("depth"), "Expected depth error, got: {output}");
+        let (output, _, _) =
+            execute_skill(&AnyResolver, None, "too-deep", "work", Some(&ctx)).await;
+        assert!(
+            output.contains("depth"),
+            "Expected depth error, got: {output}"
+        );
     }
 
     #[tokio::test]
@@ -1792,16 +1873,29 @@ mod tests {
                     agent_type: None,
                 })
             }
-            fn available_skills(&self) -> Vec<SkillToolInfo> { vec![] }
+            fn available_skills(&self) -> Vec<SkillToolInfo> {
+                vec![]
+            }
         }
 
         // Root context (depth=0) — composability check should not apply
         let root_ctx = crate::skills::composition::CompositionContext::root();
         let (output, _, _) = execute_skill(
-            &NonComposableResolver, None, "my-skill", "work", Some(&root_ctx),
-        ).await;
-        assert!(!output.contains("not composable"), "Root call should not check composability");
-        assert!(output.contains("Top level only"), "Expected skill output, got: {output}");
+            &NonComposableResolver,
+            None,
+            "my-skill",
+            "work",
+            Some(&root_ctx),
+        )
+        .await;
+        assert!(
+            !output.contains("not composable"),
+            "Root call should not check composability"
+        );
+        assert!(
+            output.contains("Top level only"),
+            "Expected skill output, got: {output}"
+        );
     }
 
     #[tokio::test]
@@ -1832,14 +1926,18 @@ mod tests {
                     agent_type: None,
                 })
             }
-            fn available_skills(&self) -> Vec<SkillToolInfo> { vec![] }
+            fn available_skills(&self) -> Vec<SkillToolInfo> {
+                vec![]
+            }
         }
 
         // The execute_skill builds args as {"task": "..."}, which won't have "target_path"
-        let (output, _, _) = execute_skill(
-            &SchemaResolver, None, "schema-skill", "do stuff", None,
-        ).await;
-        assert!(output.contains("validation failed"), "Expected validation error, got: {output}");
+        let (output, _, _) =
+            execute_skill(&SchemaResolver, None, "schema-skill", "do stuff", None).await;
+        assert!(
+            output.contains("validation failed"),
+            "Expected validation error, got: {output}"
+        );
     }
 
     #[test]

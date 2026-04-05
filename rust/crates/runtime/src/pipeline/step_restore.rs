@@ -626,5 +626,4 @@ mod tests {
             "no checkpoint found"
         );
     }
-
 }

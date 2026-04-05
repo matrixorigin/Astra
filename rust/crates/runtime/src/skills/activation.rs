@@ -13,7 +13,10 @@ pub fn path_matches_skill(file_path: &str, skill: &SkillManifest) -> bool {
     if skill.paths.is_empty() {
         return false;
     }
-    skill.paths.iter().any(|pattern| glob_match(pattern, file_path))
+    skill
+        .paths
+        .iter()
+        .any(|pattern| glob_match(pattern, file_path))
 }
 
 /// Simplified glob matching supporting `*` and `**`.
@@ -160,12 +163,18 @@ fn is_word_boundary_match(text: &str, pattern: &str) -> bool {
 
         let start_ok = abs_pos == 0 || {
             let prev_slice = &text[..abs_pos];
-            prev_slice.chars().last().is_none_or(|c| !c.is_ascii_alphanumeric())
+            prev_slice
+                .chars()
+                .last()
+                .is_none_or(|c| !c.is_ascii_alphanumeric())
         };
 
         let end_ok = end_pos >= text.len() || {
             let next_slice = &text[end_pos..];
-            next_slice.chars().next().is_none_or(|c| !c.is_ascii_alphanumeric())
+            next_slice
+                .chars()
+                .next()
+                .is_none_or(|c| !c.is_ascii_alphanumeric())
         };
 
         if start_ok && end_ok {

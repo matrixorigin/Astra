@@ -54,7 +54,11 @@ impl BundledSkillProvider {
     }
 
     /// Register a bundled skill from manifest + instructions directly.
-    pub fn register(&self, mut manifest: SkillManifest, instructions: String) -> Result<(), SkillError> {
+    pub fn register(
+        &self,
+        mut manifest: SkillManifest,
+        instructions: String,
+    ) -> Result<(), SkillError> {
         manifest.source = SkillSourceKind::Bundled;
         manifest.trust_tier = crate::skills::manifest::TrustTier::Bundled;
         let name = manifest.name.clone();
@@ -63,7 +67,13 @@ impl BundledSkillProvider {
             .skills
             .write()
             .map_err(|e| SkillError::Internal(format!("lock poisoned: {e}")))?;
-        skills.insert(name, BundledEntry { manifest, instructions });
+        skills.insert(
+            name,
+            BundledEntry {
+                manifest,
+                instructions,
+            },
+        );
 
         Ok(())
     }
@@ -245,11 +255,22 @@ Instructions B.
 
         let names: Vec<&str> = manifests.iter().map(|m| m.name.as_str()).collect();
         let expected = [
-            "debug", "stuck", "verify", "perf",
-            "simplify", "pr-review", "refactor", "security-scan",
-            "test-gen", "explain", "commit-msg",
-            "batch", "skillify", "remember",
-            "init-project", "github",
+            "debug",
+            "stuck",
+            "verify",
+            "perf",
+            "simplify",
+            "pr-review",
+            "refactor",
+            "security-scan",
+            "test-gen",
+            "explain",
+            "commit-msg",
+            "batch",
+            "skillify",
+            "remember",
+            "init-project",
+            "github",
         ];
         for name in &expected {
             assert!(names.contains(name), "missing bundled skill: {name}");
@@ -264,7 +285,13 @@ Instructions B.
     #[tokio::test]
     async fn fork_context_skills() {
         let provider = BundledSkillProvider::with_defaults();
-        let fork_skills = ["batch", "pr-review", "test-gen", "security-scan", "refactor"];
+        let fork_skills = [
+            "batch",
+            "pr-review",
+            "test-gen",
+            "security-scan",
+            "refactor",
+        ];
         for name in &fork_skills {
             let loaded = provider.load(name).await.unwrap();
             assert!(
@@ -282,9 +309,21 @@ Instructions B.
     async fn argument_bearing_skills() {
         let provider = BundledSkillProvider::with_defaults();
         let skills_with_args = [
-            "debug", "simplify", "batch", "verify", "explain",
-            "pr-review", "test-gen", "perf", "refactor", "init-project",
-            "commit-msg", "remember", "stuck", "skillify", "github",
+            "debug",
+            "simplify",
+            "batch",
+            "verify",
+            "explain",
+            "pr-review",
+            "test-gen",
+            "perf",
+            "refactor",
+            "init-project",
+            "commit-msg",
+            "remember",
+            "stuck",
+            "skillify",
+            "github",
             "security-scan",
         ];
         for name in &skills_with_args {

@@ -236,7 +236,7 @@ pub(super) async fn handle_state_command(
                         stream_event_tx: None,
                         approval_request_tx: None,
                         mcp_manager: Some(state.mcp_manager.clone()),
-                skill_quality_tracker: &mut state.skill_quality_tracker,
+                        skill_quality_tracker: &mut state.skill_quality_tracker,
                     })
                     .await;
 
@@ -293,7 +293,8 @@ pub(super) async fn handle_state_command(
                                 selector,
                                 recent_tools: &[],
                                 tool_health_entries: &[],
-                                unified_skill_registry: astra_runtime::skills::default_unified_registry(),
+                                unified_skill_registry:
+                                    astra_runtime::skills::default_unified_registry(),
                                 plan_only_chat: false,
                                 hide_streaming_assistant_text: false,
                                 is_plan_subtask: false,
@@ -304,7 +305,7 @@ pub(super) async fn handle_state_command(
                                 stream_event_tx: None,
                                 approval_request_tx: None,
                                 mcp_manager: Some(state.mcp_manager.clone()),
-                skill_quality_tracker: &mut state.skill_quality_tracker,
+                                skill_quality_tracker: &mut state.skill_quality_tracker,
                             })
                             .await;
                             if let Ok(sr2) = synth_result {

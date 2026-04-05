@@ -459,9 +459,7 @@ fn trim_str_to_approx_tokens(s: &str, max_tokens: usize) -> String {
 }
 
 fn wrap_file_session_context(body: &str) -> String {
-    format!(
-        "[Session memory — on-disk summary]\n{body}\n[End on-disk session memory]"
-    )
+    format!("[Session memory — on-disk summary]\n{body}\n[End on-disk session memory]")
 }
 
 fn build_file_only_session_context(file_text: &str, max_tokens: usize) -> String {
@@ -628,10 +626,7 @@ fn adjusted_message_budget_chars(
     memory_content_chars: usize,
     summary_reserve_chars: usize,
 ) -> usize {
-    budget_chars.saturating_sub(
-        memory_content_chars
-            .saturating_add(summary_reserve_chars),
-    )
+    budget_chars.saturating_sub(memory_content_chars.saturating_add(summary_reserve_chars))
 }
 
 fn truncate_summary_for_budget(summary: String, summary_token_budget: usize) -> String {
@@ -639,10 +634,7 @@ fn truncate_summary_for_budget(summary: String, summary_token_budget: usize) -> 
     if summary.chars().count() <= max_chars {
         summary
     } else {
-        summary
-            .chars()
-            .take(max_chars)
-            .collect::<String>()
+        summary.chars().take(max_chars).collect::<String>()
             + "\n...[summary truncated for context budget]"
     }
 }
@@ -699,9 +691,11 @@ pub fn memoria_compact_retrieve_query(messages: &[Value]) -> String {
     let start = messages.len().saturating_sub(LOOKBACK_MESSAGES);
     let window = &messages[start..];
 
-    let user_focus = window.iter().rev().find_map(message_user_text).map(|s| {
-        collapse_whitespace(&truncate_chars_prefix(&s, MAX_USER_CHARS))
-    });
+    let user_focus = window
+        .iter()
+        .rev()
+        .find_map(message_user_text)
+        .map(|s| collapse_whitespace(&truncate_chars_prefix(&s, MAX_USER_CHARS)));
 
     let mut tool_names: Vec<String> = Vec::new();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -807,9 +801,7 @@ pub async fn compact_with_memoria(
     let will_summarize = compact_config
         .zip(summary_client.as_ref())
         .is_some_and(|(cfg, _)| cfg.should_summarize(params.tier));
-    let summary_token_budget = compact_config
-        .map(|c| c.summary_token_budget)
-        .unwrap_or(0);
+    let summary_token_budget = compact_config.map(|c| c.summary_token_budget).unwrap_or(0);
 
     let (memory_max_tokens, summary_reserve_chars) = plan_injection_reservations(
         params.budget_chars,
@@ -828,11 +820,8 @@ pub async fn compact_with_memoria(
     let has_memory_context = !memory_context.is_empty();
     let memory_chars = memory_context.chars().count();
 
-    let adjusted_budget_chars = adjusted_message_budget_chars(
-        params.budget_chars,
-        memory_chars,
-        summary_reserve_chars,
-    );
+    let adjusted_budget_chars =
+        adjusted_message_budget_chars(params.budget_chars, memory_chars, summary_reserve_chars);
 
     // Step 3: Apply truncation against budget that leaves room for injections
     let mut result = compact_tiered_with_result(
@@ -1085,7 +1074,10 @@ mod tests {
         let budget = 50_000_usize;
         let (mem_tok, sum_res) = plan_injection_reservations(budget, false, 0, 10_000);
         assert_eq!(sum_res, 0);
-        assert!(mem_tok > 0, "memory token cap should be positive: {mem_tok}");
+        assert!(
+            mem_tok > 0,
+            "memory token cap should be positive: {mem_tok}"
+        );
     }
 
     #[test]
@@ -1252,7 +1244,10 @@ mod tests {
         assert!(result.messages.len() >= 3);
 
         // Check for context injection at index 1 (after first user message)
-        assert!(result.messages.len() >= 3, "Should have context msg injected");
+        assert!(
+            result.messages.len() >= 3,
+            "Should have context msg injected"
+        );
         let ctx_content = result.messages[1]
             .get("content")
             .and_then(Value::as_str)

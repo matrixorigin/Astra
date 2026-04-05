@@ -115,9 +115,16 @@ mod tests {
     #[test]
     fn substitute_skill_dir() {
         let text = "Scripts at ${SKILL_DIR}/scripts/run.sh";
-        let result =
-            substitute_arguments(text, "", &HashMap::new(), Some("/home/user/.astra/skills/review"));
-        assert_eq!(result, "Scripts at /home/user/.astra/skills/review/scripts/run.sh");
+        let result = substitute_arguments(
+            text,
+            "",
+            &HashMap::new(),
+            Some("/home/user/.astra/skills/review"),
+        );
+        assert_eq!(
+            result,
+            "Scripts at /home/user/.astra/skills/review/scripts/run.sh"
+        );
     }
 
     #[test]

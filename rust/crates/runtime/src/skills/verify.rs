@@ -27,10 +27,7 @@ impl SkillVerifier {
     }
 
     /// Create a verifier with LLM judge support for semantic checks.
-    pub fn with_llm_judge(
-        work_dir: PathBuf,
-        judge: Arc<dyn astra_services::LlmJudge>,
-    ) -> Self {
+    pub fn with_llm_judge(work_dir: PathBuf, judge: Arc<dyn astra_services::LlmJudge>) -> Self {
         Self {
             runner: VerificationRunner::with_llm_judge(work_dir, judge),
         }
@@ -135,7 +132,12 @@ mod tests {
             id: "missing-file".to_string(),
             description: "File must exist".to_string(),
             verifier: VerifierKind::FileExists {
-                paths: vec![dir.path().join("nonexistent.txt").to_string_lossy().to_string()],
+                paths: vec![
+                    dir.path()
+                        .join("nonexistent.txt")
+                        .to_string_lossy()
+                        .to_string(),
+                ],
             },
             required: true,
             timeout_sec: 10,
@@ -157,7 +159,12 @@ mod tests {
             id: "advisory-check".to_string(),
             description: "Nice to have".to_string(),
             verifier: VerifierKind::FileExists {
-                paths: vec![dir.path().join("optional.txt").to_string_lossy().to_string()],
+                paths: vec![
+                    dir.path()
+                        .join("optional.txt")
+                        .to_string_lossy()
+                        .to_string(),
+                ],
             },
             required: false, // advisory
             timeout_sec: 10,

@@ -73,7 +73,8 @@ pub(crate) struct ChatTurnParams<'a> {
     pub(crate) recent_tools: &'a [String],
     pub(crate) tool_health_entries: &'a [ToolHealthEntry],
     /// Unified skill registry (single source of truth for all skill resolution).
-    pub(crate) unified_skill_registry: &'a std::sync::Arc<astra_runtime::skills::UnifiedSkillRegistry>,
+    pub(crate) unified_skill_registry:
+        &'a std::sync::Arc<astra_runtime::skills::UnifiedSkillRegistry>,
     /// When true, omit edge tools and inject plan-only system instructions (CLI `/plan on`).
     pub(crate) plan_only_chat: bool,
     /// When true, do not stream `text_delta` to stdout/markdown (still fills `full_text` for parsing).
@@ -100,7 +101,8 @@ pub(crate) struct ChatTurnParams<'a> {
     /// through this channel instead of blocking on stdin.
     pub(crate) approval_request_tx: Option<ApprovalRequestTx>,
     /// MCP client manager for external tool servers.
-    pub(crate) mcp_manager: Option<std::sync::Arc<tokio::sync::RwLock<crate::mcp_client::McpClientManager>>>,
+    pub(crate) mcp_manager:
+        Option<std::sync::Arc<tokio::sync::RwLock<crate::mcp_client::McpClientManager>>>,
     /// Session-scoped skill quality tracker for learning loop.
     pub(crate) skill_quality_tracker: &'a mut astra_runtime::skills::quality::SkillQualityTracker,
 }

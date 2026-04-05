@@ -6596,5 +6596,4 @@ Time:        3.456 s
         assert!(!is_snapshot_excluded(std::ffi::OsStr::new("lib")));
         assert!(!is_snapshot_excluded(std::ffi::OsStr::new("main.py")));
     }
-
 }

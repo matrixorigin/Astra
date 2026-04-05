@@ -9,22 +9,22 @@ use async_trait::async_trait;
 use std::collections::HashSet;
 use std::path::PathBuf;
 
-
+use astra_runtime::skills::executor::isolated::{SkillSubRunExecutor, SubRunResult};
 use astra_runtime::{
     pipeline::step_protocol::InMemoryIdempotencyCache,
     pipeline::step_recorder::StepRecorder,
     semantic_dedup::SemanticDedup,
     turn::agentic_headless_round::HeadlessStderrStyle,
-    turn::agentic_loop_host::{AgenticLoopHost, AgenticLoopState, HostTurnResult, run_agentic_loop_with_host},
+    turn::agentic_loop_host::{
+        AgenticLoopHost, AgenticLoopState, HostTurnResult, run_agentic_loop_with_host,
+    },
     turn::chat_turn_heuristics::infer_task_execution_profile,
     turn::chat_turn_payload::{
-        ChatTurnBasePayloadInput, chat_turn_base_payload,
-        set_payload_tool_results_if_non_empty,
+        ChatTurnBasePayloadInput, chat_turn_base_payload, set_payload_tool_results_if_non_empty,
     },
     turn::tool_schema_prune::openai_tool_names_from_schemas,
     turn::turn_guard::TurnGuard,
 };
-use astra_runtime::skills::executor::isolated::{SkillSubRunExecutor, SubRunResult};
 use serde_json::{Value, json};
 
 use super::edge_tools;
@@ -144,7 +144,7 @@ impl AgenticLoopHost for SubRunHost {
             true,  // quiet
             true,  // suppress_intermediate_output
             Some(edge_ctx),
-            0,    // pre_clear_lines
+            0,                                              // pre_clear_lines
             self.cancel_token.as_ref().map(|t| t.as_ref()), // propagate parent cancel
         )
         .await;
@@ -240,7 +240,8 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
         let all_schemas = edge_tools::all_tool_schemas();
         let valid_tool_names = openai_tool_names_from_schemas(&all_schemas);
 
-        let perm_manager = PermissionManager::with_project_mode(self.permission_mode, &self.project_root);
+        let perm_manager =
+            PermissionManager::with_project_mode(self.permission_mode, &self.project_root);
 
         let mut host = SubRunHost {
             api: self.api.clone(),

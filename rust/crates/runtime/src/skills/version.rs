@@ -225,12 +225,12 @@ impl FromStr for VersionConstraint {
             return Ok(VersionConstraint::any());
         }
 
-        let clauses: Result<Vec<ConstraintOp>, String> =
-            s.split(',').map(|part| parse_constraint_op(part.trim())).collect();
+        let clauses: Result<Vec<ConstraintOp>, String> = s
+            .split(',')
+            .map(|part| parse_constraint_op(part.trim()))
+            .collect();
 
-        Ok(VersionConstraint {
-            clauses: clauses?,
-        })
+        Ok(VersionConstraint { clauses: clauses? })
     }
 }
 
@@ -738,20 +738,22 @@ mod tests {
         resolver.add_available("base", Version::new(1, 0, 0));
         resolver.add_available("mid", Version::new(1, 0, 0));
         resolver.add_available("top", Version::new(1, 0, 0));
-        resolver.add_dependencies("top", vec![
-            Dependency {
+        resolver.add_dependencies(
+            "top",
+            vec![Dependency {
                 name: "mid".into(),
                 version: VersionConstraint::any(),
                 dep_type: DependencyType::Skill,
-            },
-        ]);
-        resolver.add_dependencies("mid", vec![
-            Dependency {
+            }],
+        );
+        resolver.add_dependencies(
+            "mid",
+            vec![Dependency {
                 name: "base".into(),
                 version: VersionConstraint::any(),
                 dep_type: DependencyType::Skill,
-            },
-        ]);
+            }],
+        );
 
         let result = resolver.resolve(&["top".into()]);
         assert!(result.is_ok());

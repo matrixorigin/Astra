@@ -55,8 +55,9 @@ pub fn render_messages_for_summary(messages: &[serde_json::Value]) -> String {
                             .and_then(|f| f.get("name"))
                             .and_then(|n| n.as_str())
                             .unwrap_or("unknown_tool");
-                        let args_scrubbed =
-                            tool_arguments_for_summary(tc.get("function").and_then(|f| f.get("arguments")));
+                        let args_scrubbed = tool_arguments_for_summary(
+                            tc.get("function").and_then(|f| f.get("arguments")),
+                        );
                         let args_short = truncate_str(&args_scrubbed, 300);
                         out.push_str(&format!("[ASSISTANT calls {name}({args_short})]\n"));
                     }
@@ -330,10 +331,7 @@ mod tests {
 
     #[test]
     fn render_strips_embedded_data_url_in_string_content() {
-        let payload = format!(
-            "See: data:image/png;base64,{} tail",
-            "x".repeat(120)
-        );
+        let payload = format!("See: data:image/png;base64,{} tail", "x".repeat(120));
         let msgs = vec![json!({"role": "user", "content": payload})];
         let rendered = render_messages_for_summary(&msgs);
         assert!(rendered.contains("See:"));

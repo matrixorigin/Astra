@@ -458,10 +458,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                             }
                             if ch == 's' {
                                 pm.record_approval(&t, false);
-                                eprintln!(
-                                    "  {}",
-                                    format!("  ✗ {t}: skipped for session").dim()
-                                );
+                                eprintln!("  {}", format!("  ✗ {t}: skipped for session").dim());
                             }
                             approved
                         }
@@ -475,8 +472,11 @@ impl SseStreamHost for CliSseStreamHost<'_> {
             if tool == astra_runtime::turn::skill_tool::SKILL_TOOL_NAME {
                 if let Some(resolver) = &self.skill_resolver {
                     astra_runtime::turn::skill_tool::execute_skill_inline(
-                        resolver.as_ref(), tool, args,
-                    ).await
+                        resolver.as_ref(),
+                        tool,
+                        args,
+                    )
+                    .await
                 } else {
                     "Error: skill resolver not available".to_string()
                 }

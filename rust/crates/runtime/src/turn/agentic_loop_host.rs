@@ -701,18 +701,16 @@ async fn build_full_composite_snapshot(
 /// grep, glob, find_definition, etc. Returns `None` for non-file tools.
 fn extract_file_path_from_tool(tool_name: &str, args: &Value) -> Option<String> {
     match tool_name {
-        "read_file" | "write_file" | "str_replace" | "find_definition" => {
-            args.get("path")
-                .or_else(|| args.get("file_path"))
-                .and_then(Value::as_str)
-                .map(|s| s.to_string())
-        }
-        "grep" | "glob" | "list_dir" => {
-            args.get("path")
-                .or_else(|| args.get("directory"))
-                .and_then(Value::as_str)
-                .map(|s| s.to_string())
-        }
+        "read_file" | "write_file" | "str_replace" | "find_definition" => args
+            .get("path")
+            .or_else(|| args.get("file_path"))
+            .and_then(Value::as_str)
+            .map(|s| s.to_string()),
+        "grep" | "glob" | "list_dir" => args
+            .get("path")
+            .or_else(|| args.get("directory"))
+            .and_then(Value::as_str)
+            .map(|s| s.to_string()),
         _ => None,
     }
 }
@@ -735,9 +733,9 @@ fn is_valid_model_string(model: &str) -> bool {
     if !first.is_ascii_alphanumeric() {
         return false;
     }
-    model
-        .bytes()
-        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.' || b == b':' || b == b'/')
+    model.bytes().all(|b| {
+        b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.' || b == b':' || b == b'/'
+    })
 }
 
 /// Run the multi-turn agentic loop using the provided host.
@@ -758,9 +756,17 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
     if let Some(resolver) = &state.skill_resolver {
         let skills = resolver.available_skills();
         if !skills.is_empty() {
-            host.inject_tool_schema(crate::turn::skill_tool::skill_tool_schema(&skills, Some(&state.skill_quality_tracker), Some(&state.pinned_skills)));
+            host.inject_tool_schema(crate::turn::skill_tool::skill_tool_schema(
+                &skills,
+                Some(&state.skill_quality_tracker),
+                Some(&state.pinned_skills),
+            ));
             // Inject a system reminder so the LLM is primed to use the skill tool.
-            let reminder = crate::turn::skill_tool::skill_listing_system_message(&skills, Some(&state.skill_quality_tracker), Some(&state.pinned_skills));
+            let reminder = crate::turn::skill_tool::skill_listing_system_message(
+                &skills,
+                Some(&state.skill_quality_tracker),
+                Some(&state.pinned_skills),
+            );
             state.messages.push(reminder);
         }
     }
@@ -1030,7 +1036,9 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
         if let Some(ref registry) = state.skill_registry_for_activation {
             let mut any_newly_activated = false;
             for edge_result in &turn_result.edge_tool_round {
-                if let Some(path) = extract_file_path_from_tool(&edge_result.tool, &edge_result.args) {
+                if let Some(path) =
+                    extract_file_path_from_tool(&edge_result.tool, &edge_result.args)
+                {
                     let newly = registry.record_file_path(&path);
                     if !newly.is_empty() {
                         any_newly_activated = true;
@@ -1049,9 +1057,11 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
                 if let Some(resolver) = &state.skill_resolver {
                     let skills = resolver.available_skills();
                     if !skills.is_empty() {
-                        host.inject_tool_schema(
-                            crate::turn::skill_tool::skill_tool_schema(&skills, Some(&state.skill_quality_tracker), Some(&state.pinned_skills)),
-                        );
+                        host.inject_tool_schema(crate::turn::skill_tool::skill_tool_schema(
+                            &skills,
+                            Some(&state.skill_quality_tracker),
+                            Some(&state.pinned_skills),
+                        ));
                     }
                 }
             }
@@ -2698,8 +2708,14 @@ mod tests {
     #[test]
     fn model_string_boundary_lengths() {
         assert!(super::is_valid_model_string("ab")); // min valid
-        assert!(super::is_valid_model_string(&format!("m{}", "a".repeat(127)))); // 128 = max
-        assert!(!super::is_valid_model_string(&format!("m{}", "a".repeat(128)))); // 129 = over
+        assert!(super::is_valid_model_string(&format!(
+            "m{}",
+            "a".repeat(127)
+        ))); // 128 = max
+        assert!(!super::is_valid_model_string(&format!(
+            "m{}",
+            "a".repeat(128)
+        ))); // 129 = over
     }
 
     // ── Skill pipeline integration tests ─────────────────────────────────
@@ -2734,22 +2750,18 @@ mod tests {
     }
 
     impl crate::turn::skill_tool::SkillResolver for StubSkillResolver {
-        fn resolve(
-            &self,
-            name: &str,
-        ) -> Result<crate::turn::skill_tool::ResolvedSkill, String> {
+        fn resolve(&self, name: &str) -> Result<crate::turn::skill_tool::ResolvedSkill, String> {
             self.skills
                 .iter()
                 .find(|(n, _, _, _, _)| n == name)
-                .map(|(n, _, inst, model, tools)| {
-                    crate::turn::skill_tool::ResolvedSkill {
+                .map(
+                    |(n, _, inst, model, tools)| crate::turn::skill_tool::ResolvedSkill {
                         name: n.clone(),
                         instructions: inst.clone(),
                         model: model.clone(),
                         max_tokens: None,
                         allowed_tools: tools.clone(),
-                        execution_context:
-                            crate::skills::manifest::ExecutionContext::Inline,
+                        execution_context: crate::skills::manifest::ExecutionContext::Inline,
                         hooks: crate::skills::hooks::SkillHooks::default(),
                         skill_dir: None,
                         source: crate::skills::manifest::SkillSourceKind::Local,
@@ -2759,8 +2771,8 @@ mod tests {
                         aliases: Vec::new(),
                         effort: None,
                         agent_type: None,
-                    }
-                })
+                    },
+                )
                 .ok_or_else(|| format!("unknown skill: {name}"))
         }
 
@@ -2844,12 +2856,7 @@ mod tests {
     async fn skill_tool_call_intercepted_and_result_injected() {
         let resolver = StubSkillResolver::new();
         let turns = vec![
-            skill_tool_call_result(
-                "call_skill_1",
-                r#"{"skill_name": "test-skill"}"#,
-                100,
-                50,
-            ),
+            skill_tool_call_result("call_skill_1", r#"{"skill_name": "test-skill"}"#, 100, 50),
             text_result("Following the skill instructions.", 80, 30, None),
         ];
 
@@ -2878,15 +2885,9 @@ mod tests {
 
     #[tokio::test]
     async fn skill_model_override_applied_and_cleared() {
-        let resolver =
-            StubSkillResolver::new().with_model("claude-sonnet-4-20250514");
+        let resolver = StubSkillResolver::new().with_model("claude-sonnet-4-20250514");
         let turns = vec![
-            skill_tool_call_result(
-                "call_1",
-                r#"{"skill_name": "test-skill"}"#,
-                100,
-                50,
-            ),
+            skill_tool_call_result("call_1", r#"{"skill_name": "test-skill"}"#, 100, 50),
             text_result("Done with skill.", 80, 30, None),
         ];
 
@@ -2910,12 +2911,7 @@ mod tests {
     async fn skill_model_override_rejected_for_invalid_string() {
         let resolver = StubSkillResolver::new().with_model("model; rm -rf /");
         let turns = vec![
-            skill_tool_call_result(
-                "call_1",
-                r#"{"skill_name": "test-skill"}"#,
-                100,
-                50,
-            ),
+            skill_tool_call_result("call_1", r#"{"skill_name": "test-skill"}"#, 100, 50),
             text_result("Done.", 80, 30, None),
         ];
 
@@ -2934,15 +2930,10 @@ mod tests {
 
     #[tokio::test]
     async fn skill_allowed_tools_set_and_cleared() {
-        let resolver = StubSkillResolver::new()
-            .with_allowed_tools(vec!["bash".into(), "grep".into()]);
+        let resolver =
+            StubSkillResolver::new().with_allowed_tools(vec!["bash".into(), "grep".into()]);
         let turns = vec![
-            skill_tool_call_result(
-                "call_1",
-                r#"{"skill_name": "test-skill"}"#,
-                100,
-                50,
-            ),
+            skill_tool_call_result("call_1", r#"{"skill_name": "test-skill"}"#, 100, 50),
             text_result("Done.", 80, 30, None),
         ];
 
@@ -2971,12 +2962,7 @@ mod tests {
         // An unrestricted skill (no model, no tools) should clear both
         let resolver = StubSkillResolver::new(); // no model, no tools
         let turns = vec![
-            skill_tool_call_result(
-                "call_1",
-                r#"{"skill_name": "test-skill"}"#,
-                100,
-                50,
-            ),
+            skill_tool_call_result("call_1", r#"{"skill_name": "test-skill"}"#, 100, 50),
             text_result("Done.", 80, 30, None),
         ];
 
@@ -2998,15 +2984,9 @@ mod tests {
         // This tests the invariant that restricted_tools doesn't permanently
         // grow from skill allowed_tools. After the loop, restricted_tools
         // should not contain skill-scoped restrictions.
-        let resolver = StubSkillResolver::new()
-            .with_allowed_tools(vec!["bash".into()]);
+        let resolver = StubSkillResolver::new().with_allowed_tools(vec!["bash".into()]);
         let turns = vec![
-            skill_tool_call_result(
-                "call_1",
-                r#"{"skill_name": "test-skill"}"#,
-                100,
-                50,
-            ),
+            skill_tool_call_result("call_1", r#"{"skill_name": "test-skill"}"#, 100, 50),
             text_result("Done.", 80, 30, None),
         ];
 

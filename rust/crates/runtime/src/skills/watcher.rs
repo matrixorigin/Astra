@@ -46,14 +46,15 @@ pub fn start_watching(
 
     let (tx, rx) = mpsc::unbounded_channel::<()>();
 
-    let mut watcher = notify::recommended_watcher(move |res: Result<notify::Event, notify::Error>| {
-        if let Ok(event) = res {
-            if is_skill_relevant_event(&event) {
-                let _ = tx.send(());
+    let mut watcher =
+        notify::recommended_watcher(move |res: Result<notify::Event, notify::Error>| {
+            if let Ok(event) = res {
+                if is_skill_relevant_event(&event) {
+                    let _ = tx.send(());
+                }
             }
-        }
-    })
-    .ok()?;
+        })
+        .ok()?;
 
     for path in &existing_paths {
         if watcher.watch(path, RecursiveMode::Recursive).is_err() {
@@ -77,10 +78,7 @@ fn is_skill_relevant_event(event: &notify::Event) -> bool {
     }
 
     event.paths.iter().any(|p| {
-        let name = p
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or_default();
+        let name = p.file_name().and_then(|n| n.to_str()).unwrap_or_default();
         name == "SKILL.md"
             || name == "manifest.yaml"
             || name == "manifest.yml"
@@ -109,10 +107,7 @@ async fn debounced_refresh_loop(
         // Re-discover skills
         match registry.discover_all().await {
             Ok(names) => {
-                eprintln!(
-                    "  🔄 Skills reloaded ({} discovered)",
-                    names.len()
-                );
+                eprintln!("  🔄 Skills reloaded ({} discovered)", names.len());
             }
             Err(e) => {
                 eprintln!("  ⚠ Skill reload failed: {e}");

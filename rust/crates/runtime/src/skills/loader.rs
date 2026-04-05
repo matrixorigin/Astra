@@ -182,7 +182,10 @@ pub fn parse_skill_md(content: &str) -> Result<(SkillManifest, String), SkillErr
         publisher: raw.publisher,
         compatibility: raw.compatibility,
         aliases: raw.aliases,
-        effort: raw.effort.as_deref().and_then(super::manifest::EffortLevel::parse),
+        effort: raw
+            .effort
+            .as_deref()
+            .and_then(super::manifest::EffortLevel::parse),
         agent_type: raw.agent_type,
     };
 
@@ -256,19 +259,15 @@ pub fn load_skill_from_path(path: &Path) -> Result<LoadedSkill, SkillError> {
 ///
 /// Blocks both `..` traversal and symlink escapes. Use this when loading
 /// skills from untrusted directory trees (e.g. local skill search paths).
-pub fn load_skill_from_path_confined(
-    path: &Path,
-    root: &Path,
-) -> Result<LoadedSkill, SkillError> {
+pub fn load_skill_from_path_confined(path: &Path, root: &Path) -> Result<LoadedSkill, SkillError> {
     reject_path_traversal(path)?;
     verify_confinement(path, root)?;
     load_skill_from_path_inner(path)
 }
 
 fn load_skill_from_path_inner(path: &Path) -> Result<LoadedSkill, SkillError> {
-    let content = std::fs::read_to_string(path).map_err(|e| {
-        SkillError::LoadFailed(format!("Failed to read {}: {e}", path.display()))
-    })?;
+    let content = std::fs::read_to_string(path)
+        .map_err(|e| SkillError::LoadFailed(format!("Failed to read {}: {e}", path.display())))?;
 
     let (mut manifest, instructions) = parse_skill_md(&content)?;
     manifest.source = SkillSourceKind::Local;
@@ -354,16 +353,10 @@ pub fn sanitize_for_path(s: &str) -> String {
 /// descendant of `root`'s canonical path.
 fn verify_confinement(path: &Path, root: &Path) -> Result<(), SkillError> {
     let canonical_path = std::fs::canonicalize(path).map_err(|e| {
-        SkillError::LoadFailed(format!(
-            "cannot canonicalize {}: {e}",
-            path.display()
-        ))
+        SkillError::LoadFailed(format!("cannot canonicalize {}: {e}", path.display()))
     })?;
     let canonical_root = std::fs::canonicalize(root).map_err(|e| {
-        SkillError::LoadFailed(format!(
-            "cannot canonicalize root {}: {e}",
-            root.display()
-        ))
+        SkillError::LoadFailed(format!("cannot canonicalize root {}: {e}", root.display()))
     })?;
     if !canonical_path.starts_with(&canonical_root) {
         return Err(SkillError::PermissionDenied(format!(
@@ -382,12 +375,20 @@ pub fn load_skill_resources(skill_dir: &Path) -> Result<SkillResources, SkillErr
 
     let templates_dir = skill_dir.join("templates");
     if templates_dir.exists() {
-        load_dir_contents(&templates_dir, &mut resources.templates, &mut resources.resource_tokens)?;
+        load_dir_contents(
+            &templates_dir,
+            &mut resources.templates,
+            &mut resources.resource_tokens,
+        )?;
     }
 
     let scripts_dir = skill_dir.join("scripts");
     if scripts_dir.exists() {
-        load_dir_contents(&scripts_dir, &mut resources.scripts, &mut resources.resource_tokens)?;
+        load_dir_contents(
+            &scripts_dir,
+            &mut resources.scripts,
+            &mut resources.resource_tokens,
+        )?;
     }
 
     Ok(resources)
@@ -661,7 +662,11 @@ Instructions.
         let (manifest, _) = parse_skill_md(content).unwrap();
         assert_eq!(manifest.dependencies.len(), 2);
         assert_eq!(manifest.dependencies[0].name, "github");
-        assert!(manifest.dependencies[0].version.matches(&Version::new(99, 0, 0)));
+        assert!(
+            manifest.dependencies[0]
+                .version
+                .matches(&Version::new(99, 0, 0))
+        );
     }
 
     #[test]
@@ -785,7 +790,10 @@ Instructions.
     fn parse_dependency_invalid_type_defaults_to_skill() {
         let content = "---\nname: dep-type\ndepends_on:\n  - name: foo\n    version: \">=1.0\"\n    type: unknown\n---\nBody";
         let (manifest, _) = parse_skill_md(content).unwrap();
-        assert_eq!(manifest.dependencies[0].dep_type, super::super::version::DependencyType::Skill);
+        assert_eq!(
+            manifest.dependencies[0].dep_type,
+            super::super::version::DependencyType::Skill
+        );
     }
 
     #[test]

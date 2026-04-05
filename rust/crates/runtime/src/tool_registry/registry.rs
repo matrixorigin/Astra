@@ -634,7 +634,8 @@ impl ToolRegistry {
             let name_owned = name.to_string();
             let idx = self.all_schemas.len();
             let json_bytes = serde_json::to_string(&schema).map(|s| s.len()).unwrap_or(0);
-            self.measured_costs.insert(name_owned.clone(), (json_bytes / 4) as u32);
+            self.measured_costs
+                .insert(name_owned.clone(), (json_bytes / 4) as u32);
             self.schema_index.insert(name_owned.clone(), idx);
             if pinned {
                 self.pinned_schemas.push((name_owned, schema.clone()));
@@ -718,9 +719,17 @@ mod tests {
         let mut reg = ToolRegistry::new(vec![sample_schema("bash")]);
         reg.inject_schema(sample_schema("skill"));
         let pinned = reg.pinned_only();
-        let names: Vec<&str> = pinned.iter()
-            .filter_map(|s| s.get("function").and_then(|f| f.get("name")).and_then(|n| n.as_str()))
+        let names: Vec<&str> = pinned
+            .iter()
+            .filter_map(|s| {
+                s.get("function")
+                    .and_then(|f| f.get("name"))
+                    .and_then(|n| n.as_str())
+            })
             .collect();
-        assert!(names.contains(&"skill"), "pinned_only should include injected pinned tools");
+        assert!(
+            names.contains(&"skill"),
+            "pinned_only should include injected pinned tools"
+        );
     }
 }

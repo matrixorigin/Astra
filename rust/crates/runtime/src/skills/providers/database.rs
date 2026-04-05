@@ -32,25 +32,18 @@ impl SkillProvider for DatabaseSkillProvider {
     }
 
     async fn discover(&self) -> Result<Vec<SkillManifest>, SkillError> {
-        let result = self
-            .service
-            .list_skills(200, 0)
-            .await
-            .map_err(|(_, err)| {
-                SkillError::Internal(format!(
-                    "failed to list skills from database: {}",
-                    err.0.detail
-                ))
-            })?;
+        let result = self.service.list_skills(200, 0).await.map_err(|(_, err)| {
+            SkillError::Internal(format!(
+                "failed to list skills from database: {}",
+                err.0.detail
+            ))
+        })?;
 
         let manifests = result
             .skills
             .into_iter()
             .map(|item| {
-                let version = item
-                    .version
-                    .parse()
-                    .unwrap_or_default();
+                let version = item.version.parse().unwrap_or_default();
 
                 SkillManifest {
                     name: item.skill_name,
@@ -120,10 +113,10 @@ impl SkillProvider for DatabaseSkillProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use astra_services::skills::*;
-    use axum::http::StatusCode;
-    use axum::Json;
     use astra_core::ErrorResponse;
+    use astra_services::skills::*;
+    use axum::Json;
+    use axum::http::StatusCode;
 
     struct MockSkillService {
         skills: Vec<SkillListItem>,
@@ -257,7 +250,11 @@ mod tests {
         assert!(names.contains(&"review"));
         assert!(names.contains(&"deploy"));
 
-        assert!(manifests.iter().all(|m| m.source == SkillSourceKind::Database));
+        assert!(
+            manifests
+                .iter()
+                .all(|m| m.source == SkillSourceKind::Database)
+        );
     }
 
     #[tokio::test]

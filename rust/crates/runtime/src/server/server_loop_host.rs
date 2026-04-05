@@ -311,10 +311,7 @@ impl ServerAgenticLoopHost {
 
         // Use Memoria-based compaction (async with HTTP client)
         let memoria_config = crate::turn::cloud::memoria_compact::MemoriaCompactConfig::default();
-        let cwd = self
-            .edge_profile
-            .get("cwd")
-            .and_then(|v| v.as_str());
+        let cwd = self.edge_profile.get("cwd").and_then(|v| v.as_str());
         let (session_memory_file, session_memory_combine) =
             crate::turn::cloud::memoria_compact::resolve_session_memory_file_options(
                 &self.session_id,

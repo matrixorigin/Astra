@@ -67,7 +67,8 @@ pub async fn build_server_state(
         DatabaseMarketplaceService::new(settings.matrixone.clone()).with_pool(shared_pool.clone()),
     ))
     .with_marketplace_stats_service(Arc::new(
-        DatabaseMarketplaceStatsService::new(settings.matrixone.clone()).with_pool(shared_pool.clone()),
+        DatabaseMarketplaceStatsService::new(settings.matrixone.clone())
+            .with_pool(shared_pool.clone()),
     ))
     .with_replay_service(Arc::new(
         DatabaseReplayService::new(settings.matrixone.clone()).with_pool(shared_pool.clone()),

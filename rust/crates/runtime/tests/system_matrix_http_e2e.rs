@@ -34,18 +34,18 @@
 use std::sync::Arc;
 use std::sync::OnceLock;
 
+use astra_core::config::AppSettings;
+use astra_runtime::{MemoriaForwarder, build_app, build_server_state};
 use async_trait::async_trait;
 use axum::{
     Router,
     body::{self, Body},
     http::{Request, StatusCode},
 };
-use astra_core::config::AppSettings;
-use astra_runtime::{MemoriaForwarder, build_app, build_server_state};
 use futures_util::StreamExt;
 use serde_json::{Value, json};
-use sqlx::mysql::MySqlRow;
 use sqlx::Row;
+use sqlx::mysql::MySqlRow;
 use tokio::sync::Mutex;
 use tower::util::ServiceExt;
 use uuid::Uuid;
@@ -59,9 +59,8 @@ fn require_system_e2e_env() {
         "set MO_AGENT_SYSTEM_MATRIX_E2E=1 to run this ignored test"
     );
     E2E_ENV_INIT.get_or_init(|| {
-        let secret = std::env::var("MO_AGENT_BRIDGE_TEST_SECRET").unwrap_or_else(|_| {
-            "system-matrix-e2e-secret".to_string()
-        });
+        let secret = std::env::var("MO_AGENT_BRIDGE_TEST_SECRET")
+            .unwrap_or_else(|_| "system-matrix-e2e-secret".to_string());
         // SAFETY: set once before parallel test threads (single ignored test in practice).
         unsafe {
             std::env::set_var("MO_AGENT_BRIDGE_TEST_SECRET", &secret);
@@ -76,15 +75,8 @@ struct E2eMemoriaStub {
 
 #[async_trait]
 impl MemoriaForwarder for E2eMemoriaStub {
-    async fn forward(
-        &self,
-        endpoint: &str,
-        body: Value,
-    ) -> Result<Value, String> {
-        self.calls
-            .lock()
-            .await
-            .push((endpoint.to_string(), body));
+    async fn forward(&self, endpoint: &str, body: Value) -> Result<Value, String> {
+        self.calls.lock().await.push((endpoint.to_string(), body));
         if endpoint.contains("retrieve") {
             return Ok(json!({ "memories": [] }));
         }
@@ -128,9 +120,7 @@ async fn put_json(
     if let Some(t) = auth {
         req = req.header("authorization", t);
     }
-    let req = req
-        .body(Body::from(payload.to_string()))
-        .expect("request");
+    let req = req.body(Body::from(payload.to_string())).expect("request");
     let response = app.clone().oneshot(req).await.expect("oneshot");
     let status = response.status();
     let bytes = body::to_bytes(response.into_body(), 8 * 1024 * 1024)
@@ -207,9 +197,7 @@ async fn post_json_with_headers(
     for (k, v) in extra_headers {
         req = req.header(*k, *v);
     }
-    let req = req
-        .body(Body::from(payload.to_string()))
-        .expect("request");
+    let req = req.body(Body::from(payload.to_string())).expect("request");
     let response = app.clone().oneshot(req).await.expect("oneshot");
     let status = response.status();
     let bytes = body::to_bytes(response.into_body(), 8 * 1024 * 1024)
@@ -238,18 +226,12 @@ async fn cleanup_session_data(pool: &sqlx::MySqlPool, session_id: &str) {
         .await;
 }
 
-async fn cleanup_edge_registry(
-    pool: &sqlx::MySqlPool,
-    user_id: &str,
-    edge_agent_id: &str,
-) {
-    let _ = sqlx::query(
-        "DELETE FROM edge_agent_registry WHERE user_id = ? AND edge_agent_id = ?",
-    )
-    .bind(user_id)
-    .bind(edge_agent_id)
-    .execute(pool)
-    .await;
+async fn cleanup_edge_registry(pool: &sqlx::MySqlPool, user_id: &str, edge_agent_id: &str) {
+    let _ = sqlx::query("DELETE FROM edge_agent_registry WHERE user_id = ? AND edge_agent_id = ?")
+        .bind(user_id)
+        .bind(edge_agent_id)
+        .execute(pool)
+        .await;
 }
 
 fn row_get_str(r: &MySqlRow, col: &str) -> String {
@@ -357,7 +339,9 @@ async fn product_matrix_api_journey_hits_multiple_tables() {
     )
     .await;
     assert_eq!(st_ref, StatusCode::OK, "refresh: {ref_j}");
-    let access2 = ref_j["access_token"].as_str().expect("post-refresh access_token");
+    let access2 = ref_j["access_token"]
+        .as_str()
+        .expect("post-refresh access_token");
     refresh_token = ref_j["refresh_token"]
         .as_str()
         .expect("post-refresh refresh_token")
@@ -387,9 +371,9 @@ async fn product_matrix_api_journey_hits_multiple_tables() {
     let (st_list_s, list_s) = get_json(&app, "/sessions", Some(&auth_header), &[]).await;
     assert_eq!(st_list_s, StatusCode::OK, "list sessions: {list_s}");
     assert!(
-        list_s["sessions"]
-            .as_array()
-            .is_some_and(|a| a.iter().any(|s| s["session_id"].as_str() == Some(&session_id))),
+        list_s["sessions"].as_array().is_some_and(|a| a
+            .iter()
+            .any(|s| s["session_id"].as_str() == Some(&session_id))),
         "session not listed: {list_s}"
     );
 
@@ -422,7 +406,11 @@ async fn product_matrix_api_journey_hits_multiple_tables() {
     )
     .await;
     assert_eq!(st_close, StatusCode::OK, "close session: {closed}");
-    assert_eq!(closed["status"].as_str(), Some("closed"), "close response: {closed}");
+    assert_eq!(
+        closed["status"].as_str(),
+        Some("closed"),
+        "close response: {closed}"
+    );
 
     let sess_status = sqlx::query("SELECT status FROM agent_sessions WHERE session_id = ?")
         .bind(&session_id)
@@ -442,7 +430,11 @@ async fn product_matrix_api_journey_hits_multiple_tables() {
     )
     .await;
     assert_eq!(st_res, StatusCode::OK, "resume session: {resm}");
-    assert_eq!(resm["status"].as_str(), Some("active"), "resume response: {resm}");
+    assert_eq!(
+        resm["status"].as_str(),
+        Some("active"),
+        "resume response: {resm}"
+    );
 
     let sess_active = sqlx::query("SELECT status FROM agent_sessions WHERE session_id = ?")
         .bind(&session_id)
@@ -514,10 +506,18 @@ async fn product_matrix_api_journey_hits_multiple_tables() {
         &[],
     )
     .await;
-    assert_eq!(st_au_errs, StatusCode::OK, "session audit errors: {au_errs}");
+    assert_eq!(
+        st_au_errs,
+        StatusCode::OK,
+        "session audit errors: {au_errs}"
+    );
 
     let (st_au_tools, au_tools) = get_json(&app, "/audit/tools", Some(&auth_header), &[]).await;
-    assert_eq!(st_au_tools, StatusCode::OK, "cross-session audit tools: {au_tools}");
+    assert_eq!(
+        st_au_tools,
+        StatusCode::OK,
+        "cross-session audit tools: {au_tools}"
+    );
 
     let (st_mkt, mkt_j) = get_json(
         &app,
@@ -559,13 +559,8 @@ async fn product_matrix_api_journey_hits_multiple_tables() {
     assert_eq!(st_mst, StatusCode::OK, "marketplace skill stats: {mst_j}");
     assert_eq!(mst_j["skill_name"].as_str(), Some(MKT_PROBE_SKILL));
 
-    let (st_msearch, ms_j) = get_json(
-        &app,
-        "/marketplace/search?limit=10&offset=0",
-        None,
-        &[],
-    )
-    .await;
+    let (st_msearch, ms_j) =
+        get_json(&app, "/marketplace/search?limit=10&offset=0", None, &[]).await;
     assert_eq!(st_msearch, StatusCode::OK, "marketplace search: {ms_j}");
     assert!(ms_j["results"].is_array(), "search results: {ms_j}");
 
@@ -573,13 +568,7 @@ async fn product_matrix_api_journey_hits_multiple_tables() {
     let (st_gates, gates_j) = get_json(&app, "/evaluation/gates?limit=10", None, xuid).await;
     assert_eq!(st_gates, StatusCode::OK, "evaluation gates: {gates_j}");
 
-    let (st_cal, cal_j) = get_json(
-        &app,
-        "/evaluation/calibration?days=7",
-        None,
-        xuid,
-    )
-    .await;
+    let (st_cal, cal_j) = get_json(&app, "/evaluation/calibration?days=7", None, xuid).await;
     assert_eq!(st_cal, StatusCode::OK, "evaluation calibration: {cal_j}");
 
     let (st_scores, scores_j) = get_json(
@@ -589,28 +578,21 @@ async fn product_matrix_api_journey_hits_multiple_tables() {
         xuid,
     )
     .await;
-    assert_eq!(st_scores, StatusCode::OK, "evaluation session scores: {scores_j}");
+    assert_eq!(
+        st_scores,
+        StatusCode::OK,
+        "evaluation session scores: {scores_j}"
+    );
     assert!(
         scores_j["sessions"].is_array(),
         "session scores payload: {scores_j}"
     );
 
-    let (st_qt, qt_j) = get_json(
-        &app,
-        "/evaluation/quality/trend?days=7",
-        None,
-        xuid,
-    )
-    .await;
+    let (st_qt, qt_j) = get_json(&app, "/evaluation/quality/trend?days=7", None, xuid).await;
     assert_eq!(st_qt, StatusCode::OK, "evaluation quality trend: {qt_j}");
 
-    let (st_slo, slo_j) = get_json(
-        &app,
-        "/evaluation/slo/dashboard?period_days=7",
-        None,
-        xuid,
-    )
-    .await;
+    let (st_slo, slo_j) =
+        get_json(&app, "/evaluation/slo/dashboard?period_days=7", None, xuid).await;
     assert_eq!(st_slo, StatusCode::OK, "evaluation slo dashboard: {slo_j}");
 
     let (st_mh, mh_j) = get_json(&app, "/evaluation/memory-health", None, xuid).await;
@@ -633,20 +615,22 @@ async fn product_matrix_api_journey_hits_multiple_tables() {
     assert_eq!(st_agent, StatusCode::CREATED, "create agent: {agent_j}");
     let agent_id = agent_j["agent_id"].as_str().expect("agent_id").to_string();
 
-    let agent_db = sqlx::query(
-        "SELECT agent_name, owner_user_id FROM agent_agents WHERE agent_id = ?",
-    )
-    .bind(&agent_id)
-    .fetch_optional(&pool)
-    .await
-    .expect("agent_agents select");
+    let agent_db =
+        sqlx::query("SELECT agent_name, owner_user_id FROM agent_agents WHERE agent_id = ?")
+            .bind(&agent_id)
+            .fetch_optional(&pool)
+            .await
+            .expect("agent_agents select");
     let agent_db = agent_db.expect("agent row");
     assert_eq!(
         agent_db.try_get::<String, _>("agent_name").ok().as_deref(),
         Some("matrix-crud-agent")
     );
     assert_eq!(
-        agent_db.try_get::<String, _>("owner_user_id").ok().as_deref(),
+        agent_db
+            .try_get::<String, _>("owner_user_id")
+            .ok()
+            .as_deref(),
         Some(user_id.as_str())
     );
 
@@ -679,13 +663,20 @@ async fn product_matrix_api_journey_hits_multiple_tables() {
         .await
         .expect("agent_agents after rename");
     assert_eq!(
-        agent_renamed.try_get::<String, _>("agent_name").ok().as_deref(),
+        agent_renamed
+            .try_get::<String, _>("agent_name")
+            .ok()
+            .as_deref(),
         Some("matrix-crud-agent-renamed")
     );
 
     let trust_path = format!("/evaluation/trust-report?agent_id={agent_id}&days=7");
     let (st_trust, trust_j) = get_json(&app, &trust_path, None, xuid).await;
-    assert_eq!(st_trust, StatusCode::OK, "evaluation trust-report: {trust_j}");
+    assert_eq!(
+        st_trust,
+        StatusCode::OK,
+        "evaluation trust-report: {trust_j}"
+    );
 
     let slo_hist = format!("/evaluation/slo/{agent_id}/history?days=7");
     let (st_slo_hist, slo_hist_j) = get_json(&app, &slo_hist, None, xuid).await;
@@ -823,13 +814,12 @@ async fn product_matrix_api_journey_hits_multiple_tables() {
         .expect("context_capture_id")
         .to_string();
 
-    let snap_row = sqlx::query(
-        "SELECT session_id, event_id FROM ctx_snapshots WHERE context_capture_id = ?",
-    )
-    .bind(&context_capture_id)
-    .fetch_optional(&pool)
-    .await
-    .expect("ctx_snapshots");
+    let snap_row =
+        sqlx::query("SELECT session_id, event_id FROM ctx_snapshots WHERE context_capture_id = ?")
+            .bind(&context_capture_id)
+            .fetch_optional(&pool)
+            .await
+            .expect("ctx_snapshots");
     let snap_row = snap_row.expect("ctx_snapshots row");
     assert_eq!(
         snap_row.try_get::<String, _>("session_id").ok().as_deref(),
@@ -864,7 +854,10 @@ async fn product_matrix_api_journey_hits_multiple_tables() {
     )
     .await;
     assert_eq!(st_dec, StatusCode::CREATED, "record decision: {dec_j}");
-    let decision_id = dec_j["decision_id"].as_str().expect("decision_id").to_string();
+    let decision_id = dec_j["decision_id"]
+        .as_str()
+        .expect("decision_id")
+        .to_string();
 
     let dec_row = sqlx::query(
         "SELECT session_id, decision_type FROM ctx_decision_audits WHERE decision_id = ?",
@@ -879,7 +872,10 @@ async fn product_matrix_api_journey_hits_multiple_tables() {
         Some(session_id.as_str())
     );
     assert_eq!(
-        dec_row.try_get::<String, _>("decision_type").ok().as_deref(),
+        dec_row
+            .try_get::<String, _>("decision_type")
+            .ok()
+            .as_deref(),
         Some("e2e_matrix_decision")
     );
 
@@ -1037,7 +1033,11 @@ async fn product_matrix_api_journey_hits_multiple_tables() {
         &[],
     )
     .await;
-    assert_eq!(st_cpl, StatusCode::OK, "list checkpoints (read-only): {cpl_j}");
+    assert_eq!(
+        st_cpl,
+        StatusCode::OK,
+        "list checkpoints (read-only): {cpl_j}"
+    );
     assert!(
         cpl_j.is_array(),
         "checkpoints list should be a JSON array: {cpl_j}"
@@ -1058,13 +1058,7 @@ async fn product_matrix_api_journey_hits_multiple_tables() {
     assert_eq!(st_job, StatusCode::OK, "submit job: {job_j}");
     let job_id = job_j["job_id"].as_str().expect("job_id").to_string();
 
-    let (st_gj, gj) = get_json(
-        &app,
-        &format!("/jobs/{job_id}"),
-        Some(&auth_header),
-        &[],
-    )
-    .await;
+    let (st_gj, gj) = get_json(&app, &format!("/jobs/{job_id}"), Some(&auth_header), &[]).await;
     assert_eq!(st_gj, StatusCode::OK, "get job: {gj}");
     assert_eq!(gj["status"].as_str(), Some("pending"));
 
@@ -1082,13 +1076,7 @@ async fn product_matrix_api_journey_hits_multiple_tables() {
     .await;
     assert_eq!(st_wh, StatusCode::OK, "job webhook: {wh_j}");
 
-    let (st_gj2, gj2) = get_json(
-        &app,
-        &format!("/jobs/{job_id}"),
-        Some(&auth_header),
-        &[],
-    )
-    .await;
+    let (st_gj2, gj2) = get_json(&app, &format!("/jobs/{job_id}"), Some(&auth_header), &[]).await;
     assert_eq!(st_gj2, StatusCode::OK, "get job after webhook: {gj2}");
     assert_eq!(gj2["status"].as_str(), Some("completed"));
 
@@ -1102,13 +1090,12 @@ async fn product_matrix_api_journey_hits_multiple_tables() {
     .await;
     assert_eq!(st_sb, StatusCode::CREATED, "create sandbox: {sb_j}");
 
-    let sb_row = sqlx::query(
-        "SELECT user_id, status FROM infra_sandbox_metadata WHERE sandbox_name = ?",
-    )
-    .bind(&sb_name)
-    .fetch_optional(&pool)
-    .await
-    .expect("sandbox select");
+    let sb_row =
+        sqlx::query("SELECT user_id, status FROM infra_sandbox_metadata WHERE sandbox_name = ?")
+            .bind(&sb_name)
+            .fetch_optional(&pool)
+            .await
+            .expect("sandbox select");
     let sb_row = sb_row.expect("infra_sandbox_metadata row");
     assert_eq!(
         sb_row.try_get::<String, _>("user_id").ok().as_deref(),
@@ -1134,12 +1121,7 @@ async fn product_matrix_api_journey_hits_multiple_tables() {
     .await;
     assert_eq!(st_sbg, StatusCode::OK, "get sandbox: {sbg}");
 
-    let st_sbd = delete_no_content(
-        &app,
-        &format!("/sandbox/{sb_name}"),
-        Some(&auth_header),
-    )
-    .await;
+    let st_sbd = delete_no_content(&app, &format!("/sandbox/{sb_name}"), Some(&auth_header)).await;
     assert_eq!(st_sbd, StatusCode::NO_CONTENT, "delete sandbox");
 
     let sb_gone = sqlx::query("SELECT 1 FROM infra_sandbox_metadata WHERE sandbox_name = ?")
@@ -1190,12 +1172,8 @@ async fn product_matrix_api_journey_hits_multiple_tables() {
     assert_eq!(st_fire, StatusCode::OK, "fire webhook: {fire_j}");
     assert_eq!(fire_j["fired"], true);
 
-    let (st_tr_d, tr_d) = delete_json(
-        &app,
-        &format!("/triggers/{trigger_id}"),
-        Some(&auth_header),
-    )
-    .await;
+    let (st_tr_d, tr_d) =
+        delete_json(&app, &format!("/triggers/{trigger_id}"), Some(&auth_header)).await;
     assert_eq!(st_tr_d, StatusCode::OK, "delete trigger: {tr_d}");
 
     let trig_gone = sqlx::query("SELECT 1 FROM wf_triggers WHERE trigger_id = ?")
@@ -1210,27 +1188,14 @@ async fn product_matrix_api_journey_hits_multiple_tables() {
 
     let (st_sks, sks_j) = get_json(&app, "/skills", Some(&auth_header), &[]).await;
     assert_eq!(st_sks, StatusCode::OK, "list skills: {sks_j}");
-    assert!(
-        sks_j["skills"].is_array(),
-        "skills list record: {sks_j}"
-    );
+    assert!(sks_j["skills"].is_array(), "skills list record: {sks_j}");
 
-    let (st_sst, sst_j) = get_json(
-        &app,
-        "/skills/status?per_group=50",
-        Some(&auth_header),
-        &[],
-    )
-    .await;
+    let (st_sst, sst_j) =
+        get_json(&app, "/skills/status?per_group=50", Some(&auth_header), &[]).await;
     assert_eq!(st_sst, StatusCode::OK, "skills status: {sst_j}");
 
-    let (st_intro, intro_j) = get_json(
-        &app,
-        "/introspection/skills",
-        Some(&auth_header),
-        &[],
-    )
-    .await;
+    let (st_intro, intro_j) =
+        get_json(&app, "/introspection/skills", Some(&auth_header), &[]).await;
     assert_eq!(st_intro, StatusCode::OK, "introspection skills: {intro_j}");
 
     let intro_mem = format!("/introspection/memory?session_id={session_id}");
@@ -1241,15 +1206,22 @@ async fn product_matrix_api_journey_hits_multiple_tables() {
         "/introspection/context/trend?session_id={session_id}&turns=8&context_window=128000"
     );
     let (st_ict, ict_j) = get_json(&app, &intro_ct, Some(&auth_header), &[]).await;
-    assert_eq!(st_ict, StatusCode::OK, "introspection context trend: {ict_j}");
+    assert_eq!(
+        st_ict,
+        StatusCode::OK,
+        "introspection context trend: {ict_j}"
+    );
 
     let intro_cs = format!("/introspection/context/snapshot?session_id={session_id}&detail=false");
     let (st_ics, ics_j) = get_json(&app, &intro_cs, Some(&auth_header), &[]).await;
-    assert_eq!(st_ics, StatusCode::OK, "introspection context snapshot: {ics_j}");
-
-    let intro_rq = format!(
-        "/introspection/context/retrieval_quality?session_id={session_id}&turns=5"
+    assert_eq!(
+        st_ics,
+        StatusCode::OK,
+        "introspection context snapshot: {ics_j}"
     );
+
+    let intro_rq =
+        format!("/introspection/context/retrieval_quality?session_id={session_id}&turns=5");
     let (st_irq, irq_j) = get_json(&app, &intro_rq, Some(&auth_header), &[]).await;
     assert_eq!(
         st_irq,
@@ -1257,11 +1229,14 @@ async fn product_matrix_api_journey_hits_multiple_tables() {
         "introspection retrieval quality: {irq_j}"
     );
 
-    let intro_recall = format!(
-        "/introspection/memory/recall?session_id={session_id}&query=matrix&limit=5"
-    );
+    let intro_recall =
+        format!("/introspection/memory/recall?session_id={session_id}&query=matrix&limit=5");
     let (st_irc, irc_j) = get_json(&app, &intro_recall, Some(&auth_header), &[]).await;
-    assert_eq!(st_irc, StatusCode::OK, "introspection memory recall: {irc_j}");
+    assert_eq!(
+        st_irc,
+        StatusCode::OK,
+        "introspection memory recall: {irc_j}"
+    );
 
     let (st_route, route_j) = post_json(
         &app,
@@ -1272,22 +1247,11 @@ async fn product_matrix_api_journey_hits_multiple_tables() {
     .await;
     assert_eq!(st_route, StatusCode::OK, "chat/route: {route_j}");
 
-    let (st_sig, sig) = get_json(
-        &app,
-        "/api/v1/learning/signals",
-        Some(&auth_header),
-        &[],
-    )
-    .await;
+    let (st_sig, sig) = get_json(&app, "/api/v1/learning/signals", Some(&auth_header), &[]).await;
     assert_eq!(st_sig, StatusCode::OK, "learning signals: {sig}");
 
-    let (st_lrn_stats, lrn_stats) = get_json(
-        &app,
-        "/api/v1/learning/stats",
-        Some(&auth_header),
-        &[],
-    )
-    .await;
+    let (st_lrn_stats, lrn_stats) =
+        get_json(&app, "/api/v1/learning/stats", Some(&auth_header), &[]).await;
     assert_eq!(st_lrn_stats, StatusCode::OK, "learning stats: {lrn_stats}");
 
     let (st_drift, drift) = get_json(
@@ -1331,7 +1295,11 @@ async fn product_matrix_api_journey_hits_multiple_tables() {
         .expect("chat request");
 
     let response = app.clone().oneshot(chat_req).await.expect("chat oneshot");
-    assert_eq!(response.status(), StatusCode::OK, "chat/turn should return 200");
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "chat/turn should return 200"
+    );
 
     let mut stream = response.into_body().into_data_stream();
     let mut acc = Vec::new();
@@ -1373,7 +1341,10 @@ async fn product_matrix_api_journey_hits_multiple_tables() {
     assert_eq!(row_get_str(user_q, "user_id"), user_id);
     assert!(!row_get_str(user_q, "event_id").is_empty());
     let cc = row_get_opt_str(user_q, "causal_chain_id").unwrap_or_default();
-    assert!(!cc.is_empty(), "causal_chain_id should be set on user_query");
+    assert!(
+        !cc.is_empty(),
+        "causal_chain_id should be set on user_query"
+    );
 
     let llm = recs
         .iter()
@@ -1449,12 +1420,8 @@ async fn product_matrix_api_journey_hits_multiple_tables() {
     cleanup_session_data(&pool, &session_id).await;
     cleanup_edge_registry(&pool, &user_id, &edge_agent_id).await;
 
-    let del_agent = delete_no_content(
-        &app,
-        &format!("/agents/{agent_id}"),
-        Some(&auth_header),
-    )
-    .await;
+    let del_agent =
+        delete_no_content(&app, &format!("/agents/{agent_id}"), Some(&auth_header)).await;
     assert_eq!(
         del_agent,
         StatusCode::NO_CONTENT,

@@ -8,7 +8,9 @@ use async_trait::async_trait;
 
 use super::super::arguments::substitute_arguments;
 use super::super::manifest::{ExecutionContext, LoadedSkill, SkillSourceKind};
-use super::super::traits::{SkillError, SkillExecutionContext, SkillExecutionResult, SkillExecutor};
+use super::super::traits::{
+    SkillError, SkillExecutionContext, SkillExecutionResult, SkillExecutor,
+};
 
 use super::super::has_inline_shell;
 
@@ -22,9 +24,7 @@ impl SkillExecutor for InlineSkillExecutor {
         skill: &LoadedSkill,
         context: &SkillExecutionContext,
     ) -> Result<SkillExecutionResult, SkillError> {
-        if skill.manifest.source == SkillSourceKind::Mcp
-            && has_inline_shell(&skill.instructions)
-        {
+        if skill.manifest.source == SkillSourceKind::Mcp && has_inline_shell(&skill.instructions) {
             return Err(SkillError::PermissionDenied(
                 "MCP skills cannot use inline shell commands".into(),
             ));
@@ -126,7 +126,11 @@ mod tests {
         };
 
         let result = executor.execute(&skill, &context).await.unwrap();
-        assert!(result.output.contains("**Task context:** Review auth module"));
+        assert!(
+            result
+                .output
+                .contains("**Task context:** Review auth module")
+        );
     }
 
     #[tokio::test]
@@ -150,7 +154,11 @@ mod tests {
         };
 
         let result = executor.execute(&skill, &context).await.unwrap();
-        assert!(result.output.contains("**Allowed tools for this skill:** bash, read_file"));
+        assert!(
+            result
+                .output
+                .contains("**Allowed tools for this skill:** bash, read_file")
+        );
     }
 
     #[test]
@@ -342,7 +350,10 @@ mod tests {
         };
 
         let result = executor.execute(&skill, &ctx).await;
-        assert!(result.is_ok(), "prose with ! should not trigger shell detection");
+        assert!(
+            result.is_ok(),
+            "prose with ! should not trigger shell detection"
+        );
     }
 
     #[tokio::test]
