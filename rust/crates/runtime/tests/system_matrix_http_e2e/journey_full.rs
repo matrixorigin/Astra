@@ -208,13 +208,14 @@ pub async fn run_product_matrix_full_journey(
     .await;
     assert_eq!(st_mkt, StatusCode::OK, "marketplace installed: {mkt_j}");
 
-    const MKT_PROBE_SKILL: &str = "e2e_matrix_marketplace_probe";
+    // Per-run skill name so parallel E2E processes do not contend on global marketplace stats rows.
+    let mkt_probe_skill = format!("e2e_matrix_mkt_{suffix}");
     let (st_qr, qr_j) = post_json(
         app,
         "/marketplace/quality-report",
         Some(auth_header.as_str()),
         json!({
-            "skill_name": MKT_PROBE_SKILL,
+            "skill_name": mkt_probe_skill.as_str(),
             "skill_version": "1.0.0",
             "runtime_version": "matrix-e2e",
             "success_rate": 0.95,
@@ -231,13 +232,13 @@ pub async fn run_product_matrix_full_journey(
 
     let (st_mst, mst_j) = get_json(
         app,
-        &format!("/marketplace/stats/{MKT_PROBE_SKILL}"),
+        &format!("/marketplace/stats/{mkt_probe_skill}"),
         None,
         &[],
     )
     .await;
     assert_eq!(st_mst, StatusCode::OK, "marketplace skill stats: {mst_j}");
-    assert_eq!(mst_j["skill_name"].as_str(), Some(MKT_PROBE_SKILL));
+    assert_eq!(mst_j["skill_name"].as_str(), Some(mkt_probe_skill.as_str()));
 
     let (st_msearch, ms_j) =
         get_json(app, "/marketplace/search?limit=10&offset=0", None, &[]).await;

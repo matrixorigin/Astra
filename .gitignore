@@ -46,6 +46,7 @@ yarn-error.log*
 rust/target/
 
 # IDE / OS
+.cursor/
 .idea/
 .vscode/
 *.swp

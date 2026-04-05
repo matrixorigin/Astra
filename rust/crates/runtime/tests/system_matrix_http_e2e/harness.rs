@@ -35,7 +35,7 @@ pub fn require_system_e2e_env() {
     E2E_ENV_INIT.get_or_init(|| {
         let secret = std::env::var("MO_AGENT_BRIDGE_TEST_SECRET")
             .unwrap_or_else(|_| "system-matrix-e2e-secret".to_string());
-        // SAFETY: set once before parallel test threads (single ignored test in practice).
+        // SAFETY: set once before parallel test threads (idempotent for all E2E tests).
         unsafe {
             std::env::set_var("MO_AGENT_BRIDGE_TEST_SECRET", &secret);
         }

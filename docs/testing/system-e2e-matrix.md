@@ -30,6 +30,7 @@ Requires the same environment as `astra-server`: `MATRIXONE_*`, `JWT_SECRET_KEY`
 | `REDIS_HOST` / `REDIS_PORT` | Cache | Defaults `localhost` / `6379` |
 | `EMBEDDING_*` | Embeddings config | `EMBEDDING_DIM` may be required for unknown models (see `AppSettings`) |
 | `CHAT_TURN_BRIDGE_SECRET` | Bridge | Default dev string; align with deployment if using real bridge |
+| `MO_AGENT_SYSTEM_MATRIX_E2E_TEST_THREADS` | Makefile only | Set to `1` to run `system_matrix_http_e2e` with `--test-threads=1` (serial) |
 
 Evaluation **read** routes in the full journey use `x-user-id` without bearer (see `journey_full`). Other authenticated calls use the JWT from `bootstrap`.
 
@@ -46,6 +47,13 @@ Five tests total — overlap with the full journey is avoided (e.g. no separate 
 | `e2e_matrix_chat_stream_session_info` | `journey_extended.rs` | `POST /chat/stream` SSE → `session_info` + `run_id` |
 
 Shared helpers: `tests/system_matrix_http_e2e/harness.rs` (`bootstrap`, HTTP helpers, `cleanup_*`, row getters, SSE helpers).
+
+## Database isolation
+
+- **Shared database**: All tests use the same MatrixOne database from `AppSettings` (typically `astra_runtime`). There is **no separate schema per test**.
+- **Row isolation**: Each `bootstrap()` registers a **new user** (`prod_matrix_{uuid}`), obtains a new `user_id`, creates a **new** `session_id`, and uses an `edge_agent_id` / `suffix` unique to that run. API state and SQL assertions are scoped by those IDs.
+- **Parallel runs**: Tests are safe to run in parallel by default (`cargo` / `make test-integration` without `--test-threads=1`). The full journey uses a **suffix-scoped marketplace skill name** (`e2e_matrix_mkt_{suffix}`) so concurrent runs do not fight over the same global marketplace stats key.
+- **Opt-in serial**: If you hit flakiness (shared Redis keys, connection limits, etc.), run with `MO_AGENT_SYSTEM_MATRIX_E2E_TEST_THREADS=1` (see `Makefile` `test-ignored-integration`) to force `--test-threads=1` for `system_matrix_http_e2e` only.
 
 ## API groups vs coverage (P0 / P1)
 

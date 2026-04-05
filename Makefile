@@ -28,7 +28,7 @@ help:
 	@echo ""
 	@echo "Testing:"
 	@echo "  make test               - Workspace + bridge-e2e-hooks (does not run #[ignore] live-DB E2E)"
-	@echo "  make test-integration   - Same as test + Matrix ignored suites (needs MatrixOne + .env)"
+	@echo "  make test-integration   - Same as test + Matrix ignored suites (parallel E2E by default; MO_AGENT_SYSTEM_MATRIX_E2E_TEST_THREADS=1 to serialize)"
 	@echo "  make test-contract      - Run contract tests (http/admin/auth/config)"
 	@echo ""
 	@echo "Code Quality:"
@@ -419,15 +419,22 @@ test-runtime-bridge-hooks:
 # Ignored tests: opt-in so CI without MatrixOne stays green. Enable with:
 #   MO_AGENT_SYSTEM_MATRIX_E2E=1   -> system_matrix_http_e2e (--ignored)
 #   MO_AGENT_MULTI_AGENT_IT=1      -> astra-services multi_agent_integration (--ignored)
+# Optional serial Matrix E2E: MO_AGENT_SYSTEM_MATRIX_E2E_TEST_THREADS=1 -> --test-threads=1
 .PHONY: test-ignored-integration
 test-ignored-integration:
 	@if [ "$${MO_AGENT_SYSTEM_MATRIX_E2E:-}" != "1" ] && [ "$${MO_AGENT_MULTI_AGENT_IT:-}" != "1" ]; then \
 		echo "Note: optional live-DB tests not run (expected for \`make test\`). To run them: \`make test-integration\`, or set MO_AGENT_SYSTEM_MATRIX_E2E=1 and/or MO_AGENT_MULTI_AGENT_IT=1."; \
 	fi
 	@if [ "$${MO_AGENT_SYSTEM_MATRIX_E2E:-}" = "1" ]; then \
-		echo "Running system_matrix_http_e2e (ignored; live DB + AppSettings::from_env)..."; \
+		EXTRA_THREADS=""; \
+		if [ "$${MO_AGENT_SYSTEM_MATRIX_E2E_TEST_THREADS:-}" = "1" ]; then \
+			EXTRA_THREADS="--test-threads=1"; \
+			echo "system_matrix_http_e2e: serial mode (MO_AGENT_SYSTEM_MATRIX_E2E_TEST_THREADS=1)"; \
+		else \
+			echo "Running system_matrix_http_e2e (ignored; parallel default; live DB + AppSettings::from_env)..."; \
+		fi; \
 		$(CARGO) test $(CARGO_MANIFEST_FLAG) $(API_SHELL_PKG) --features bridge-e2e-hooks \
-			--test system_matrix_http_e2e -- --ignored --test-threads=1; \
+			--test system_matrix_http_e2e -- --ignored $$EXTRA_THREADS --nocapture; \
 	fi
 	@if [ "$${MO_AGENT_MULTI_AGENT_IT:-}" = "1" ]; then \
 		echo "Running multi_agent_integration (ignored; live MatrixOne)..."; \

@@ -32,7 +32,8 @@
 //! Requires the same env as `astra-server` startup: `MATRIXONE_*`, `JWT_SECRET_KEY` / `SECRET_KEY`
 //! from [`astra_core::AppSettings::from_env`], etc. Load `.env` if you use one for development.
 //!
-//! See `docs/testing/system-e2e-matrix.md` for the capability ↔ route ↔ test mapping.
+//! See `docs/testing/system-e2e-matrix.md` for the capability ↔ route ↔ test mapping, DB isolation, and
+//! parallelism (`make test` / `MO_AGENT_SYSTEM_MATRIX_E2E_TEST_THREADS`).
 
 mod harness;
 mod journey_extended;
