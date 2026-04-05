@@ -339,6 +339,85 @@ fn truncate_str(s: &str, max_chars: usize) -> &str {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Unified budget for Memoria injection + LLM summary + truncated messages
+// ---------------------------------------------------------------------------
+
+/// Fraction of `budget_chars` used as a cap when splitting between memory text
+/// and summary reservation before tightening [`compact_tiered_with_result`].
+const AUX_INJECT_BUDGET_PCT: usize = 22;
+
+/// Assumed extra prompt / framing tokens beyond `summary_token_budget` output.
+const SUMMARY_PROMPT_OVERHEAD_TOKENS: usize = 768;
+
+/// Never reserve more than this fraction of the total char budget for the summary slot alone.
+const SUMMARY_RESERVE_MAX_PCT: usize = 40;
+
+/// When summarizing, auxiliary pool (memory + summary slot) is capped at this fraction of total.
+const AUX_COMBINED_MAX_PCT: usize = 55;
+
+/// Minimum char room left for Memoria text after subtracting summary reservation.
+const MEMORY_INJECT_FLOOR_CHARS: usize = 2048;
+
+/// Plan how many tokens may go into [`build_memory_context`] and how many chars we
+/// reserve for the summary message + wrapper (so truncation runs on a tighter budget).
+#[must_use]
+fn plan_injection_reservations(
+    budget_chars: usize,
+    will_summarize: bool,
+    summary_token_budget: usize,
+    config_max_memory_tokens: usize,
+) -> (usize, usize) {
+    let summary_reserve_chars = if will_summarize {
+        let raw = summary_token_budget
+            .saturating_add(SUMMARY_PROMPT_OVERHEAD_TOKENS)
+            .saturating_mul(4);
+        let pct_cap = budget_chars.saturating_mul(SUMMARY_RESERVE_MAX_PCT) / 100;
+        raw.min(pct_cap)
+    } else {
+        0
+    };
+
+    let pct_aux = budget_chars.saturating_mul(AUX_INJECT_BUDGET_PCT) / 100;
+    let aux_cap_chars = if will_summarize {
+        let floor = summary_reserve_chars.saturating_add(MEMORY_INJECT_FLOOR_CHARS);
+        let top = budget_chars.saturating_mul(AUX_COMBINED_MAX_PCT) / 100;
+        floor.max(pct_aux).min(top)
+    } else {
+        pct_aux.max(2048)
+    };
+
+    let memory_room_chars = aux_cap_chars.saturating_sub(summary_reserve_chars);
+    let memory_max_tokens = (memory_room_chars / 4).min(config_max_memory_tokens);
+
+    (memory_max_tokens, summary_reserve_chars)
+}
+
+#[must_use]
+fn adjusted_message_budget_chars(
+    budget_chars: usize,
+    memory_content_chars: usize,
+    summary_reserve_chars: usize,
+) -> usize {
+    budget_chars.saturating_sub(
+        memory_content_chars
+            .saturating_add(summary_reserve_chars),
+    )
+}
+
+fn truncate_summary_for_budget(summary: String, summary_token_budget: usize) -> String {
+    let max_chars = summary_token_budget.saturating_mul(4).max(256);
+    if summary.chars().count() <= max_chars {
+        summary
+    } else {
+        summary
+            .chars()
+            .take(max_chars)
+            .collect::<String>()
+            + "\n...[summary truncated for context budget]"
+    }
+}
+
 /// Default retrieve query when the conversation yields no usable signals.
 const MEMORIA_RETRIEVE_QUERY_FALLBACK: &str = "current session context working memory";
 
@@ -484,14 +563,35 @@ pub async fn compact_with_memoria(
         .await
         .unwrap_or_default();
 
-    // Step 2: Build context summary
-    let memory_context = build_memory_context(&memories, config.max_memory_tokens);
-    let has_memory_context = !memory_context.is_empty();
+    let will_summarize = compact_config
+        .zip(summary_client.as_ref())
+        .is_some_and(|(cfg, _)| cfg.should_summarize(params.tier));
+    let summary_token_budget = compact_config
+        .map(|c| c.summary_token_budget)
+        .unwrap_or(0);
 
-    // Step 3: Apply truncation
+    let (memory_max_tokens, summary_reserve_chars) = plan_injection_reservations(
+        params.budget_chars,
+        will_summarize,
+        summary_token_budget,
+        config.max_memory_tokens,
+    );
+
+    // Step 2: Build context summary (token cap unified with summary reservation)
+    let memory_context = build_memory_context(&memories, memory_max_tokens);
+    let has_memory_context = !memory_context.is_empty();
+    let memory_chars = memory_context.chars().count();
+
+    let adjusted_budget_chars = adjusted_message_budget_chars(
+        params.budget_chars,
+        memory_chars,
+        summary_reserve_chars,
+    );
+
+    // Step 3: Apply truncation against budget that leaves room for injections
     let mut result = compact_tiered_with_result(
         messages,
-        params.budget_chars,
+        adjusted_budget_chars,
         params.keep_chars,
         params.tier,
         params.keep_recent_turns,
@@ -550,6 +650,7 @@ pub async fn compact_with_memoria(
     {
         match super::summary::generate_compact_summary(messages, s_client).await {
             Some(summary) => {
+                let summary = truncate_summary_for_budget(summary, cfg.summary_token_budget);
                 let summary_msg = json!({
                     "role": "user",
                     "content": format!("[Conversation summary — context compacted]\n\n{summary}"),
@@ -564,7 +665,11 @@ pub async fn compact_with_memoria(
                     ));
                 }
 
-                eprintln!("[compact] LLM summary generated ({} chars)", summary.len());
+                eprintln!(
+                    "[compact] LLM summary generated ({} chars, budget {} tok)",
+                    summary.len(),
+                    cfg.summary_token_budget
+                );
             }
             None => {
                 eprintln!("[compact] LLM summary failed, using truncation only");
@@ -705,6 +810,46 @@ mod tests {
         ];
         let q = memoria_compact_retrieve_query(&msgs);
         assert_eq!(q, MEMORIA_RETRIEVE_QUERY_FALLBACK);
+    }
+
+    #[test]
+    fn plan_injection_reserves_summary_and_caps_memory_tokens() {
+        let budget = 100_000_usize;
+        let (mem_tok, sum_res) = plan_injection_reservations(budget, true, 20_000, 4_000);
+        assert!(sum_res > 0, "summary branch should reserve chars");
+        assert!(mem_tok <= 4_000);
+        let adj = adjusted_message_budget_chars(budget, 5_000, sum_res);
+        assert!(
+            adj < budget,
+            "message budget should shrink after reservations: {adj} < {budget}"
+        );
+    }
+
+    #[test]
+    fn plan_injection_without_summary_uses_aux_for_memory_only() {
+        let budget = 50_000_usize;
+        let (mem_tok, sum_res) = plan_injection_reservations(budget, false, 0, 10_000);
+        assert_eq!(sum_res, 0);
+        assert!(mem_tok > 0, "memory token cap should be positive: {mem_tok}");
+    }
+
+    #[test]
+    fn summary_reserve_capped_to_pct_of_total_budget() {
+        let budget = 10_000_usize;
+        let (_, sum_res) = plan_injection_reservations(budget, true, 500_000, 4_000);
+        let max_allowed = budget * 40 / 100;
+        assert!(
+            sum_res <= max_allowed,
+            "summary reserve {sum_res} should be <= {max_allowed}"
+        );
+    }
+
+    #[test]
+    fn truncate_summary_for_budget_enforces_char_cap() {
+        let s = "x".repeat(5000);
+        let out = truncate_summary_for_budget(s, 100);
+        assert!(out.contains("truncated for context budget"));
+        assert!(out.chars().count() < 5000);
     }
 
     #[test]
