@@ -543,6 +543,7 @@ pub fn walk_up_skill_paths(start: &Path) -> Vec<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::skills::manifest::EffortLevel;
 
     #[test]
     fn parse_basic_skill() {
@@ -1141,5 +1142,109 @@ Hooked body."#;
     fn sanitize_path_preserves_safe_names() {
         assert_eq!(sanitize_for_path("my-skill-v2"), "my-skill-v2");
         assert_eq!(sanitize_for_path("debug"), "debug");
+    }
+
+    // ── Aliases / effort / agent_type frontmatter tests ─────────────────
+
+    #[test]
+    fn parse_aliases_from_frontmatter() {
+        let content = r#"---
+name: code-review
+description: "Review code"
+aliases:
+  - cr
+  - review
+---
+Do the review.
+"#;
+        let (manifest, _) = parse_skill_md(content).unwrap();
+        assert_eq!(manifest.aliases, vec!["cr", "review"]);
+    }
+
+    #[test]
+    fn parse_effort_named_from_frontmatter() {
+        let content = r#"---
+name: deep-think
+description: "Think hard"
+effort: high
+---
+Think carefully.
+"#;
+        let (manifest, _) = parse_skill_md(content).unwrap();
+        assert!(matches!(manifest.effort, Some(EffortLevel::High)));
+    }
+
+    #[test]
+    fn parse_effort_numeric_from_frontmatter() {
+        let content = r#"---
+name: custom-effort
+description: "Custom"
+effort: "200"
+---
+Instructions.
+"#;
+        let (manifest, _) = parse_skill_md(content).unwrap();
+        assert!(matches!(manifest.effort, Some(EffortLevel::Custom(200))));
+    }
+
+    #[test]
+    fn parse_agent_type_from_frontmatter() {
+        let content = r#"---
+name: researcher
+description: "Research skill"
+agent_type: researcher
+---
+Do research.
+"#;
+        let (manifest, _) = parse_skill_md(content).unwrap();
+        assert_eq!(manifest.agent_type.as_deref(), Some("researcher"));
+    }
+
+    #[test]
+    fn parse_all_cc_fields_together() {
+        let content = r#"---
+name: full-cc
+description: "Full CC-compatible"
+aliases:
+  - fc
+  - full
+effort: max
+agent_type: coder
+model: "claude-sonnet-4-20250514"
+---
+Full instructions.
+"#;
+        let (manifest, _) = parse_skill_md(content).unwrap();
+        assert_eq!(manifest.aliases, vec!["fc", "full"]);
+        assert!(matches!(manifest.effort, Some(EffortLevel::Max)));
+        assert_eq!(manifest.agent_type.as_deref(), Some("coder"));
+        assert_eq!(manifest.model.as_deref(), Some("claude-sonnet-4-20250514"));
+    }
+
+    #[test]
+    fn missing_cc_fields_default_to_none() {
+        let content = r#"---
+name: minimal
+description: "Minimal skill"
+---
+Just instructions.
+"#;
+        let (manifest, _) = parse_skill_md(content).unwrap();
+        assert!(manifest.aliases.is_empty());
+        assert!(manifest.effort.is_none());
+        assert!(manifest.agent_type.is_none());
+    }
+
+    #[test]
+    fn invalid_effort_ignored_in_frontmatter() {
+        let content = r#"---
+name: bad-effort
+description: "Bad effort"
+effort: "not-a-level"
+---
+Instructions.
+"#;
+        let (manifest, _) = parse_skill_md(content).unwrap();
+        assert!(manifest.effort.is_none());
     }
 }

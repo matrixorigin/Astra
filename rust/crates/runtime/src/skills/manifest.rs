@@ -646,4 +646,68 @@ mod tests {
         assert!(!version_satisfies("0.9.0", "1.0.0"));
         assert!(!version_satisfies("1.0.0", "1.0.1"));
     }
+
+    // ── EffortLevel tests ───────────────────────────────────────────────
+
+    #[test]
+    fn effort_parse_named_levels() {
+        assert!(matches!(EffortLevel::parse("low"), Some(EffortLevel::Low)));
+        assert!(matches!(EffortLevel::parse("medium"), Some(EffortLevel::Medium)));
+        assert!(matches!(EffortLevel::parse("high"), Some(EffortLevel::High)));
+        assert!(matches!(EffortLevel::parse("max"), Some(EffortLevel::Max)));
+    }
+
+    #[test]
+    fn effort_parse_case_insensitive() {
+        assert!(matches!(EffortLevel::parse("LOW"), Some(EffortLevel::Low)));
+        assert!(matches!(EffortLevel::parse("High"), Some(EffortLevel::High)));
+        assert!(matches!(EffortLevel::parse("MAX"), Some(EffortLevel::Max)));
+    }
+
+    #[test]
+    fn effort_parse_numeric() {
+        assert!(matches!(EffortLevel::parse("0"), Some(EffortLevel::Custom(0))));
+        assert!(matches!(EffortLevel::parse("128"), Some(EffortLevel::Custom(128))));
+        assert!(matches!(EffortLevel::parse("255"), Some(EffortLevel::Custom(255))));
+    }
+
+    #[test]
+    fn effort_parse_invalid_returns_none() {
+        assert!(EffortLevel::parse("invalid").is_none());
+        assert!(EffortLevel::parse("").is_none());
+        assert!(EffortLevel::parse("256").is_none()); // u8 overflow
+        assert!(EffortLevel::parse("-1").is_none());
+    }
+
+    #[test]
+    fn effort_roundtrip_as_str() {
+        for (input, expected) in &[("low", "low"), ("medium", "medium"), ("high", "high"), ("max", "max"), ("42", "42")] {
+            let level = EffortLevel::parse(input).unwrap();
+            assert_eq!(level.as_str(), *expected);
+        }
+    }
+
+    #[test]
+    fn effort_serde_roundtrip() {
+        let level = EffortLevel::High;
+        let json = serde_json::to_string(&level).unwrap();
+        assert_eq!(json, "\"high\"");
+        let parsed: EffortLevel = serde_json::from_str(&json).unwrap();
+        assert!(matches!(parsed, EffortLevel::High));
+    }
+
+    #[test]
+    fn effort_serde_custom_roundtrip() {
+        let level = EffortLevel::Custom(200);
+        let json = serde_json::to_string(&level).unwrap();
+        assert_eq!(json, "\"200\"");
+        let parsed: EffortLevel = serde_json::from_str(&json).unwrap();
+        assert!(matches!(parsed, EffortLevel::Custom(200)));
+    }
+
+    #[test]
+    fn effort_serde_invalid_rejects() {
+        let result: Result<EffortLevel, _> = serde_json::from_str("\"invalid\"");
+        assert!(result.is_err());
+    }
 }

@@ -1420,6 +1420,50 @@ mod tests {
         assert!(merged.allowed_tools.is_empty());
     }
 
+    #[test]
+    fn build_activation_includes_effort_and_agent_type() {
+        let skill = ResolvedSkill {
+            name: "effort-skill".into(),
+            instructions: "Work hard.".into(),
+            model: None,
+            max_tokens: None,
+            allowed_tools: vec![],
+            execution_context: ExecutionContext::Inline,
+            hooks: crate::skills::hooks::SkillHooks::default(),
+            skill_dir: None,
+            source: SkillSourceKind::Local,
+            success_criteria: Vec::new(),
+            composition: None,
+            input_schema: None,
+            aliases: Vec::new(),
+            effort: Some(EffortLevel::High),
+            agent_type: Some("coder".into()),
+        };
+        let act = super::build_activation(&skill);
+        assert!(matches!(act.effort, Some(EffortLevel::High)));
+        assert_eq!(act.agent_type.as_deref(), Some("coder"));
+    }
+
+    #[test]
+    fn merge_activations_effort_last_writer_wins() {
+        let prev = SkillActivation {
+            model_override: None,
+            allowed_tools: vec![],
+            effort: Some(EffortLevel::Low),
+            agent_type: Some("researcher".into()),
+        };
+        let new = SkillActivation {
+            model_override: None,
+            allowed_tools: vec![],
+            effort: Some(EffortLevel::Max),
+            agent_type: None,
+        };
+        let merged = super::merge_activations(Some(prev), new);
+        assert!(matches!(merged.effort, Some(EffortLevel::Max)));
+        // agent_type cleared by new activation (last writer wins)
+        assert!(merged.agent_type.is_none());
+    }
+
     // ── Multi-skill partition tests ──────────────────────────────────────
 
     #[tokio::test]

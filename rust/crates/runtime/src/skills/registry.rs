@@ -1243,4 +1243,80 @@ Shared MCP.
         registry.discover_all().await.unwrap();
         assert!(registry.get_manifest("shared-mcp").is_some());
     }
+
+    // ── Alias resolution tests ──────────────────────────────────────────
+
+    #[tokio::test]
+    async fn resolver_finds_skill_by_alias() {
+        let mut registry = UnifiedSkillRegistry::new();
+        registry.add_provider(Box::new(StubProvider {
+            skills: vec![(
+                SkillManifest {
+                    name: "code-review".into(),
+                    description: "Review code".into(),
+                    aliases: vec!["cr".into(), "review".into()],
+                    ..Default::default()
+                },
+                "Review instructions.".into(),
+            )],
+        }));
+        registry.discover_all().await.unwrap();
+        // Pre-load so entry.loaded is Some
+        registry.load("code-review").await.unwrap();
+
+        let resolver = UnifiedSkillResolver::new(Arc::new(registry));
+        // Resolve by alias
+        let resolved = resolver.resolve("cr").unwrap();
+        assert_eq!(resolved.name, "code-review");
+        assert_eq!(resolved.aliases, vec!["cr", "review"]);
+
+        // Also works with second alias
+        let resolved2 = resolver.resolve("review").unwrap();
+        assert_eq!(resolved2.name, "code-review");
+    }
+
+    #[tokio::test]
+    async fn resolver_alias_miss_returns_not_found() {
+        let mut registry = UnifiedSkillRegistry::new();
+        registry.add_provider(Box::new(StubProvider {
+            skills: vec![(
+                SkillManifest {
+                    name: "some-skill".into(),
+                    description: "A skill".into(),
+                    aliases: vec!["alias-a".into()],
+                    ..Default::default()
+                },
+                "Instructions.".into(),
+            )],
+        }));
+        registry.discover_all().await.unwrap();
+        registry.load("some-skill").await.unwrap();
+
+        let resolver = UnifiedSkillResolver::new(Arc::new(registry));
+        let result = resolver.resolve("nonexistent-alias");
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn available_skills_includes_aliases() {
+        let mut registry = UnifiedSkillRegistry::new();
+        registry.add_provider(Box::new(StubProvider {
+            skills: vec![(
+                SkillManifest {
+                    name: "my-skill".into(),
+                    description: "Skill with aliases".into(),
+                    aliases: vec!["ms".into(), "mine".into()],
+                    ..Default::default()
+                },
+                "Do things.".into(),
+            )],
+        }));
+        registry.discover_all().await.unwrap();
+
+        let resolver = UnifiedSkillResolver::new(Arc::new(registry));
+        let skills = resolver.available_skills();
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0].name, "my-skill");
+        assert_eq!(skills[0].aliases, vec!["ms", "mine"]);
+    }
 }
