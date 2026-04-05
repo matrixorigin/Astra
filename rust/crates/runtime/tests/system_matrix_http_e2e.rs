@@ -1,10 +1,16 @@
 //! System HTTP end-to-end: real Axum app + MatrixOne + full `build_server_state` wiring.
 //!
-//! ## What this covers
-//! - `POST /auth/register` → `POST /sessions` → `POST /chat/turn` (SSE)
-//! - Mock LLM via `test_llm_rounds` + `bridge-e2e-hooks` (no external model server)
-//! - Mock Memoria HTTP via [`astra_runtime::MemoriaForwarder`] injection (does not affect chat path)
-//! - SQL assertions on `agent_events` rows produced by the in-process bridge persistence
+//! ## Tests in this binary
+//! 1. **`product_matrix_api_journey_hits_multiple_tables`** — **product matrix**: one
+//!    realistic client-style journey that exercises many public routes and asserts persistence on
+//!    `auth_users`, `agent_sessions`, `agent_agents`, `agent_events`, `ctx_snapshots`,
+//!    `ctx_decision_audits`, `edge_agent_registry`, plus in-memory edge callbacks; ends with the
+//!    `chat/turn` (SSE) with strict `agent_events` checks (parent link, per-field tokens,
+//!    `reasoning_content`, causal chain).
+//!
+//! External dependencies remain mocked where the product already allows it:
+//! - LLM: `test_llm_rounds` + `bridge-e2e-hooks` (no external model server).
+//! - Memoria: [`astra_runtime::MemoriaForwarder`] stub (memory proxy routes only).
 //!
 //! ## How to run
 //! ```text
@@ -79,14 +85,37 @@ impl MemoriaForwarder for E2eMemoriaStub {
     }
 }
 
-async fn post_json(
+async fn get_json(
+    app: &Router,
+    path: &str,
+    auth: Option<&str>,
+    extra_headers: &[(&str, &str)],
+) -> (StatusCode, Value) {
+    let mut req = Request::builder().method("GET").uri(path);
+    if let Some(t) = auth {
+        req = req.header("authorization", t);
+    }
+    for (k, v) in extra_headers {
+        req = req.header(*k, *v);
+    }
+    let req = req.body(Body::empty()).expect("request");
+    let response = app.clone().oneshot(req).await.expect("oneshot");
+    let status = response.status();
+    let bytes = body::to_bytes(response.into_body(), 8 * 1024 * 1024)
+        .await
+        .expect("body");
+    let json: Value = serde_json::from_slice(&bytes).unwrap_or(json!({}));
+    (status, json)
+}
+
+async fn put_json(
     app: &Router,
     path: &str,
     auth: Option<&str>,
     payload: Value,
 ) -> (StatusCode, Value) {
     let mut req = Request::builder()
-        .method("POST")
+        .method("PUT")
         .uri(path)
         .header("content-type", "application/json");
     if let Some(t) = auth {
@@ -104,7 +133,63 @@ async fn post_json(
     (status, json)
 }
 
+async fn delete_no_content(app: &Router, path: &str, auth: Option<&str>) -> StatusCode {
+    let mut req = Request::builder().method("DELETE").uri(path);
+    if let Some(t) = auth {
+        req = req.header("authorization", t);
+    }
+    let req = req.body(Body::empty()).expect("request");
+    let response = app.clone().oneshot(req).await.expect("oneshot");
+    response.status()
+}
+
+async fn post_json(
+    app: &Router,
+    path: &str,
+    auth: Option<&str>,
+    payload: Value,
+) -> (StatusCode, Value) {
+    post_json_with_headers(app, path, auth, &[], payload).await
+}
+
+async fn post_json_with_headers(
+    app: &Router,
+    path: &str,
+    auth: Option<&str>,
+    extra_headers: &[(&str, &str)],
+    payload: Value,
+) -> (StatusCode, Value) {
+    let mut req = Request::builder()
+        .method("POST")
+        .uri(path)
+        .header("content-type", "application/json");
+    if let Some(t) = auth {
+        req = req.header("authorization", t);
+    }
+    for (k, v) in extra_headers {
+        req = req.header(*k, *v);
+    }
+    let req = req
+        .body(Body::from(payload.to_string()))
+        .expect("request");
+    let response = app.clone().oneshot(req).await.expect("oneshot");
+    let status = response.status();
+    let bytes = body::to_bytes(response.into_body(), 8 * 1024 * 1024)
+        .await
+        .expect("body");
+    let json: Value = serde_json::from_slice(&bytes).unwrap_or(json!({}));
+    (status, json)
+}
+
 async fn cleanup_session_data(pool: &sqlx::MySqlPool, session_id: &str) {
+    let _ = sqlx::query("DELETE FROM ctx_decision_audits WHERE session_id = ?")
+        .bind(session_id)
+        .execute(pool)
+        .await;
+    let _ = sqlx::query("DELETE FROM ctx_snapshots WHERE session_id = ?")
+        .bind(session_id)
+        .execute(pool)
+        .await;
     let _ = sqlx::query("DELETE FROM agent_events WHERE session_id = ?")
         .bind(session_id)
         .execute(pool)
@@ -115,11 +200,27 @@ async fn cleanup_session_data(pool: &sqlx::MySqlPool, session_id: &str) {
         .await;
 }
 
+async fn cleanup_edge_registry(
+    pool: &sqlx::MySqlPool,
+    user_id: &str,
+    edge_agent_id: &str,
+) {
+    let _ = sqlx::query(
+        "DELETE FROM edge_agent_registry WHERE user_id = ? AND edge_agent_id = ?",
+    )
+    .bind(user_id)
+    .bind(edge_agent_id)
+    .execute(pool)
+    .await;
+}
+
 #[tokio::test]
 #[ignore = "live MatrixOne + full secrets; MO_AGENT_SYSTEM_MATRIX_E2E=1 — see module doc"]
-async fn register_session_chat_turn_persists_agent_events_with_expected_columns() {
+async fn product_matrix_api_journey_hits_multiple_tables() {
     require_system_e2e_env();
     dotenvy::dotenv().ok();
+
+    const PASSWORD: &str = "E2e-matrix-pass-9";
 
     let settings = AppSettings::from_env().expect("AppSettings::from_env (see astra-server env)");
     let url = settings.matrixone.database_url();
@@ -129,56 +230,436 @@ async fn register_session_chat_turn_persists_agent_events_with_expected_columns(
         .await
         .expect("connect MatrixOne for assertions");
 
+    let memoria = Arc::new(E2eMemoriaStub::default());
     let state = build_server_state(settings.clone())
         .await
         .expect("build_server_state")
-        .with_memoria_forwarder(Arc::new(E2eMemoriaStub::default()));
+        .with_memoria_forwarder(memoria.clone());
 
     let app = build_app(state);
 
     let suffix = Uuid::new_v4().simple().to_string();
-    let username = format!("sys_e2e_{suffix}");
-    let email = format!("sys_e2e_{suffix}@e2e.test");
+    let username = format!("prod_matrix_{suffix}");
+    let email = format!("prod_matrix_{suffix}@e2e.test");
+    let edge_agent_id = format!("edge-{suffix}");
 
-    let (st, reg) = post_json(
+    let (st_h, health) = get_json(&app, "/health", None, &[]).await;
+    assert_eq!(st_h, StatusCode::OK, "health: {health}");
+
+    let (st_root, root) = get_json(&app, "/", None, &[]).await;
+    assert_eq!(st_root, StatusCode::OK, "root: {root}");
+
+    let (st_reg, reg) = post_json(
         &app,
         "/auth/register",
         None,
         json!({
             "username": username,
             "email": email,
-            "password": "E2e-test-pass-9",
-            "display_name": "System E2E User"
+            "password": PASSWORD,
+            "display_name": "Product Matrix E2E"
         }),
     )
     .await;
-    assert_eq!(st, StatusCode::CREATED, "register: {reg}");
+    assert_eq!(st_reg, StatusCode::CREATED, "register: {reg}");
     let access = reg["access_token"].as_str().expect("access_token");
-    let user_id = reg["user_id"].as_str().expect("user_id");
+    let user_id = reg["user_id"].as_str().expect("user_id").to_string();
     let auth_header = format!("Bearer {access}");
 
-    let (st2, sess) = post_json(
+    let auth_row = sqlx::query("SELECT username, email FROM auth_users WHERE user_id = ?")
+        .bind(&user_id)
+        .fetch_optional(&pool)
+        .await
+        .expect("auth_users lookup");
+    let auth_row = auth_row.expect("auth_users row after register");
+    assert_eq!(
+        auth_row.try_get::<String, _>("username").ok().as_deref(),
+        Some(username.as_str())
+    );
+
+    let (st_login, login_j) = post_json(
+        &app,
+        "/auth/login",
+        None,
+        json!({ "username": username, "password": PASSWORD }),
+    )
+    .await;
+    assert_eq!(st_login, StatusCode::OK, "login: {login_j}");
+    assert!(
+        login_j["access_token"].as_str().is_some(),
+        "login access_token: {login_j}"
+    );
+
+    let (st_me, me) = get_json(&app, "/auth/me", Some(&auth_header), &[]).await;
+    assert_eq!(st_me, StatusCode::OK, "me: {me}");
+    assert_eq!(me["user_id"].as_str(), Some(user_id.as_str()));
+
+    let (st_learn_h, learn_h) = get_json(&app, "/api/v1/learning/health", None, &[]).await;
+    assert_eq!(st_learn_h, StatusCode::OK, "learning health: {learn_h}");
+
+    let (st_sess, sess) = post_json(
         &app,
         "/sessions",
         Some(&auth_header),
-        json!({ "title": "system e2e session", "metadata": {} }),
+        json!({ "title": "product matrix session", "metadata": { "suite": "matrix" } }),
     )
     .await;
-    assert_eq!(st2, StatusCode::CREATED, "create session: {sess}");
+    assert_eq!(st_sess, StatusCode::CREATED, "create session: {sess}");
     let session_id = sess["session_id"].as_str().expect("session_id").to_string();
 
     cleanup_session_data(&pool, &session_id).await;
+    cleanup_edge_registry(&pool, &user_id, &edge_agent_id).await;
 
-    const LLM_TEXT: &str = "system-matrix-e2e-reply";
+    let (st_list_s, list_s) = get_json(&app, "/sessions", Some(&auth_header), &[]).await;
+    assert_eq!(st_list_s, StatusCode::OK, "list sessions: {list_s}");
+    assert!(
+        list_s["sessions"]
+            .as_array()
+            .is_some_and(|a| a.iter().any(|s| s["session_id"].as_str() == Some(&session_id))),
+        "session not listed: {list_s}"
+    );
+
+    let (st_get_s, got_s) = get_json(
+        &app,
+        &format!("/sessions/{session_id}"),
+        Some(&auth_header),
+        &[],
+    )
+    .await;
+    assert_eq!(st_get_s, StatusCode::OK, "get session: {got_s}");
+
+    let (st_put_s, put_s) = put_json(
+        &app,
+        &format!("/sessions/{session_id}"),
+        Some(&auth_header),
+        json!({ "title": "product matrix session (updated)" }),
+    )
+    .await;
+    assert_eq!(st_put_s, StatusCode::OK, "put session: {put_s}");
+    assert_eq!(
+        put_s["title"].as_str(),
+        Some("product matrix session (updated)")
+    );
+
+    let (st_act, act) = get_json(
+        &app,
+        &format!("/sessions/{session_id}/activity"),
+        Some(&auth_header),
+        &[],
+    )
+    .await;
+    assert_eq!(st_act, StatusCode::OK, "session activity: {act}");
+
+    let (st_agent, agent_j) = post_json(
+        &app,
+        "/agents",
+        Some(&auth_header),
+        json!({
+            "name": "matrix-crud-agent",
+            "agent_config": { "suite": "matrix" },
+            "data_source": { "type": "matrixone", "database": "astra_runtime" }
+        }),
+    )
+    .await;
+    assert_eq!(st_agent, StatusCode::CREATED, "create agent: {agent_j}");
+    let agent_id = agent_j["agent_id"].as_str().expect("agent_id").to_string();
+
+    let agent_db = sqlx::query(
+        "SELECT agent_name, owner_user_id FROM agent_agents WHERE agent_id = ?",
+    )
+    .bind(&agent_id)
+    .fetch_optional(&pool)
+    .await
+    .expect("agent_agents select");
+    let agent_db = agent_db.expect("agent row");
+    assert_eq!(
+        agent_db.try_get::<String, _>("agent_name").ok().as_deref(),
+        Some("matrix-crud-agent")
+    );
+    assert_eq!(
+        agent_db.try_get::<String, _>("owner_user_id").ok().as_deref(),
+        Some(user_id.as_str())
+    );
+
+    let (st_ev, ev_j) = post_json(
+        &app,
+        "/events",
+        Some(&auth_header),
+        json!({
+            "session_id": session_id,
+            "event_type": "e2e_capability_probe",
+            "content": "manual event for matrix",
+            "agent_id": agent_id,
+            "metadata": { "source": "e2e_matrix" }
+        }),
+    )
+    .await;
+    assert_eq!(st_ev, StatusCode::CREATED, "create event: {ev_j}");
+    let manual_event_id = ev_j["event_id"].as_str().expect("event_id").to_string();
+
+    let (st_ev_sess, ev_sess) = get_json(
+        &app,
+        &format!("/events/session/{session_id}?limit=50&offset=0"),
+        Some(&auth_header),
+        &[],
+    )
+    .await;
+    assert_eq!(st_ev_sess, StatusCode::OK, "session events: {ev_sess}");
+    assert!(
+        ev_sess["events"].as_array().is_some_and(|arr| {
+            arr.iter()
+                .any(|e| e["event_id"].as_str() == Some(manual_event_id.as_str()))
+        }),
+        "manual event missing in list: {ev_sess}"
+    );
+
+    let (st_ctx, ctx_j) = post_json(
+        &app,
+        "/context",
+        Some(&auth_header),
+        json!({
+            "session_id": session_id,
+            "event_id": manual_event_id,
+            "context_data": { "window": "matrix", "tokens": 42 }
+        }),
+    )
+    .await;
+    assert_eq!(st_ctx, StatusCode::CREATED, "context snapshot: {ctx_j}");
+    let context_capture_id = ctx_j["context_capture_id"]
+        .as_str()
+        .expect("context_capture_id")
+        .to_string();
+
+    let snap_row = sqlx::query(
+        "SELECT session_id, event_id FROM ctx_snapshots WHERE context_capture_id = ?",
+    )
+    .bind(&context_capture_id)
+    .fetch_optional(&pool)
+    .await
+    .expect("ctx_snapshots");
+    let snap_row = snap_row.expect("ctx_snapshots row");
+    assert_eq!(
+        snap_row.try_get::<String, _>("session_id").ok().as_deref(),
+        Some(session_id.as_str())
+    );
+    assert_eq!(
+        snap_row.try_get::<String, _>("event_id").ok().as_deref(),
+        Some(manual_event_id.as_str())
+    );
+
+    let (st_get_ctx, got_ctx) = get_json(
+        &app,
+        &format!("/context/{context_capture_id}"),
+        Some(&auth_header),
+        &[],
+    )
+    .await;
+    assert_eq!(st_get_ctx, StatusCode::OK, "get snapshot: {got_ctx}");
+
+    let (st_dec, dec_j) = post_json(
+        &app,
+        "/decisions",
+        Some(&auth_header),
+        json!({
+            "session_id": session_id,
+            "event_id": manual_event_id,
+            "context_capture_id": context_capture_id,
+            "decision_type": "e2e_matrix_decision",
+            "decision_output": { "choice": "path_a" },
+            "model_params": { "temperature": 0.1 }
+        }),
+    )
+    .await;
+    assert_eq!(st_dec, StatusCode::CREATED, "record decision: {dec_j}");
+    let decision_id = dec_j["decision_id"].as_str().expect("decision_id").to_string();
+
+    let dec_row = sqlx::query(
+        "SELECT session_id, decision_type FROM ctx_decision_audits WHERE decision_id = ?",
+    )
+    .bind(&decision_id)
+    .fetch_optional(&pool)
+    .await
+    .expect("ctx_decision_audits");
+    let dec_row = dec_row.expect("decision row");
+    assert_eq!(
+        dec_row.try_get::<String, _>("session_id").ok().as_deref(),
+        Some(session_id.as_str())
+    );
+    assert_eq!(
+        dec_row.try_get::<String, _>("decision_type").ok().as_deref(),
+        Some("e2e_matrix_decision")
+    );
+
+    let (st_get_dec, got_dec) = get_json(
+        &app,
+        &format!("/decisions/{decision_id}"),
+        Some(&auth_header),
+        &[],
+    )
+    .await;
+    assert_eq!(st_get_dec, StatusCode::OK, "get decision: {got_dec}");
+
+    let (st_audit, audit) = get_json(
+        &app,
+        &format!("/decisions/{decision_id}/audit"),
+        Some(&auth_header),
+        &[],
+    )
+    .await;
+    assert_eq!(st_audit, StatusCode::OK, "decision audit: {audit}");
+
+    let list_dec_path = format!("/decisions?session_id={session_id}&limit=20&offset=0");
+    let (st_list_d, list_d) = get_json(&app, &list_dec_path, Some(&auth_header), &[]).await;
+    assert_eq!(st_list_d, StatusCode::OK, "list decisions: {list_d}");
+    assert!(
+        list_d["decisions"].as_array().is_some_and(|arr| {
+            arr.iter()
+                .any(|d| d["decision_id"].as_str() == Some(decision_id.as_str()))
+        }),
+        "decision not in list: {list_d}"
+    );
+
+    let (st_mem_s, mem_s) = post_json(
+        &app,
+        "/memory/store",
+        Some(&auth_header),
+        json!({ "content": "matrix e2e memory", "memory_type": "semantic" }),
+    )
+    .await;
+    assert_eq!(st_mem_s, StatusCode::OK, "memory store: {mem_s}");
+
+    let (st_mem_r, mem_r) = post_json(
+        &app,
+        "/memory/retrieve",
+        Some(&auth_header),
+        json!({ "query": "matrix" }),
+    )
+    .await;
+    assert_eq!(st_mem_r, StatusCode::OK, "memory retrieve: {mem_r}");
+
+    assert!(
+        !memoria.calls.lock().await.is_empty(),
+        "memoria forwarder should see at least one proxy call"
+    );
+
+    let edge_reg = Request::builder()
+        .method("POST")
+        .uri("/agents/edge")
+        .header("authorization", &auth_header)
+        .header("content-type", "application/json")
+        .header("x-mo-edge-id", "matrix-e2e-edge")
+        .body(Body::from(
+            json!({
+                "edge_agent_id": edge_agent_id,
+                "hostname": "matrix-e2e-host",
+                "capabilities": { "tools": ["read_file"] }
+            })
+            .to_string(),
+        ))
+        .expect("edge register body");
+    let edge_resp = app.clone().oneshot(edge_reg).await.expect("edge reg");
+    assert_eq!(edge_resp.status(), StatusCode::OK, "edge register status");
+
+    let edge_db = sqlx::query(
+        "SELECT user_id, edge_id FROM edge_agent_registry WHERE user_id = ? AND edge_agent_id = ?",
+    )
+    .bind(&user_id)
+    .bind(&edge_agent_id)
+    .fetch_optional(&pool)
+    .await
+    .expect("edge registry select");
+    let edge_db = edge_db.expect("edge_agent_registry row");
+    assert_eq!(
+        edge_db.try_get::<String, _>("edge_id").ok().as_deref(),
+        Some("matrix-e2e-edge")
+    );
+
+    let (st_hb, hb) = post_json_with_headers(
+        &app,
+        "/agents/edge/heartbeat",
+        Some(&auth_header),
+        &[("x-mo-edge-id", "matrix-e2e-edge")],
+        json!({ "edge_agent_id": edge_agent_id }),
+    )
+    .await;
+    assert_eq!(st_hb, StatusCode::OK, "edge heartbeat: {hb}");
+
+    let (st_tool, tool_j) = post_json(
+        &app,
+        "/tools/result",
+        Some(&auth_header),
+        json!({
+            "request_id": "matrix-tool-req-1",
+            "status": "ok",
+            "output": "done",
+            "duration_ms": 12
+        }),
+    )
+    .await;
+    assert_eq!(st_tool, StatusCode::OK, "tools/result: {tool_j}");
+    assert_eq!(tool_j["ok"], true);
+
+    let (st_appr, appr_j) = post_json(
+        &app,
+        "/approval/respond",
+        Some(&auth_header),
+        json!({
+            "request_id": "matrix-appr-1",
+            "decision": "allow",
+            "reason": "e2e"
+        }),
+    )
+    .await;
+    assert_eq!(st_appr, StatusCode::OK, "approval/respond: {appr_j}");
+
+    let (st_runs, runs) = get_json(&app, "/runs", Some(&auth_header), &[]).await;
+    assert_eq!(st_runs, StatusCode::OK, "list runs: {runs}");
+
+    let (st_route, route_j) = post_json(
+        &app,
+        "/chat/route",
+        Some(&auth_header),
+        json!({ "query": "run tests and fix failures" }),
+    )
+    .await;
+    assert_eq!(st_route, StatusCode::OK, "chat/route: {route_j}");
+
+    let (st_sig, sig) = get_json(
+        &app,
+        "/api/v1/learning/signals",
+        Some(&auth_header),
+        &[],
+    )
+    .await;
+    assert_eq!(st_sig, StatusCode::OK, "learning signals: {sig}");
+
+    let (st_drift, drift) = get_json(
+        &app,
+        "/evaluation/drift",
+        None,
+        &[("x-user-id", user_id.as_str())],
+    )
+    .await;
+    assert_eq!(st_drift, StatusCode::OK, "evaluation drift: {drift}");
+
+    let reflect_path = format!("/chat/session/{session_id}/reflect");
+    let (st_refl, refl) = get_json(&app, &reflect_path, Some(&auth_header), &[]).await;
+    assert_eq!(st_refl, StatusCode::OK, "reflect: {refl}");
+
+    let trace_path = format!("/chat/session/{session_id}/decision-trace");
+    let (st_trace, trace) = get_json(&app, &trace_path, Some(&auth_header), &[]).await;
+    assert_eq!(st_trace, StatusCode::OK, "decision-trace: {trace}");
+
+    const LLM_TEXT: &str = "product-matrix-e2e-reply";
     let chat_body = json!({
-        "agent_id": "system-e2e-agent",
+        "agent_id": agent_id,
         "session_id": session_id,
-        "messages": [{ "role": "user", "content": "ping for system e2e" }],
+        "messages": [{ "role": "user", "content": "matrix journey ping" }],
         "edge_tools": [],
         "test_llm_rounds": [{
             "full_text": LLM_TEXT,
             "reasoning": "",
-            "usage": { "prompt": 10, "completion": 20, "total": 30 }
+            "usage": { "prompt": 5, "completion": 15, "total": 20 }
         }]
     });
 
@@ -212,7 +693,6 @@ async fn register_session_chat_turn_persists_agent_events_with_expected_columns(
         String::from_utf8_lossy(&acc)
     );
 
-    // Persist hooks run asynchronously on the bridge path.
     tokio::time::sleep(std::time::Duration::from_millis(900)).await;
 
     let recs = sqlx::query(
@@ -224,11 +704,6 @@ async fn register_session_chat_turn_persists_agent_events_with_expected_columns(
     .fetch_all(&pool)
     .await
     .expect("select agent_events");
-
-    assert!(
-        !recs.is_empty(),
-        "expected at least one agent_events row for session {session_id}"
-    );
 
     fn row_get_str(r: &MySqlRow, col: &str) -> String {
         r.try_get::<String, _>(col)
@@ -243,23 +718,21 @@ async fn register_session_chat_turn_persists_agent_events_with_expected_columns(
 
     let user_q = recs
         .iter()
-        .find(|r| row_get_str(r, "event_type") == "user_query")
-        .expect("user_query event");
+        .find(|r| {
+            row_get_str(r, "event_type") == "user_query"
+                && row_get_str(r, "content").contains("matrix journey ping")
+        })
+        .expect("user_query event from chat/turn");
     assert_eq!(row_get_str(user_q, "session_id"), session_id);
     assert_eq!(row_get_str(user_q, "user_id"), user_id);
     assert!(!row_get_str(user_q, "event_id").is_empty());
     let cc = row_get_opt_str(user_q, "causal_chain_id").unwrap_or_default();
-    assert!(!cc.is_empty(), "causal_chain_id should be set");
-    let uq_content = row_get_str(user_q, "content");
-    assert!(
-        uq_content.contains("ping for system e2e"),
-        "user_query content: {uq_content}"
-    );
+    assert!(!cc.is_empty(), "causal_chain_id should be set on user_query");
 
     let llm = recs
         .iter()
         .find(|r| row_get_str(r, "event_type") == "llm_response")
-        .expect("llm_response event");
+        .expect("llm_response from chat/turn");
     assert_eq!(row_get_str(llm, "session_id"), session_id);
     assert_eq!(row_get_str(llm, "user_id"), user_id);
     let llm_content = row_get_str(llm, "content");
@@ -270,17 +743,37 @@ async fn register_session_chat_turn_persists_agent_events_with_expected_columns(
     let uq_event_id = row_get_str(user_q, "event_id");
     assert_eq!(
         row_get_opt_str(llm, "parent_event_id").as_deref(),
-        Some(uq_event_id.as_str())
+        Some(uq_event_id.as_str()),
+        "llm_response should parent to user_query"
     );
-    assert_eq!(row_get_opt_i64(llm, "token_input"), Some(10));
-    assert_eq!(row_get_opt_i64(llm, "token_output"), Some(20));
-    assert_eq!(row_get_opt_i64(llm, "token_total"), Some(30));
+    assert_eq!(row_get_opt_i64(llm, "token_input"), Some(5));
+    assert_eq!(row_get_opt_i64(llm, "token_output"), Some(15));
+    assert_eq!(row_get_opt_i64(llm, "token_total"), Some(20));
     assert_eq!(
         row_get_opt_str(llm, "llm_model_used").as_deref(),
-        Some("bridge-e2e-mock"),
-        "e2e mock model name"
+        Some("bridge-e2e-mock")
+    );
+    assert!(
+        row_get_opt_str(llm, "reasoning_content")
+            .map(|s| s.is_empty())
+            .unwrap_or(true),
+        "reasoning_content should be empty for mock round with reasoning: \"\""
     );
 
     cleanup_session_data(&pool, &session_id).await;
+    cleanup_edge_registry(&pool, &user_id, &edge_agent_id).await;
+
+    let del_agent = delete_no_content(
+        &app,
+        &format!("/agents/{agent_id}"),
+        Some(&auth_header),
+    )
+    .await;
+    assert_eq!(
+        del_agent,
+        StatusCode::NO_CONTENT,
+        "delete agent should succeed"
+    );
+
     pool.close().await;
 }

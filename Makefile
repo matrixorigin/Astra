@@ -27,7 +27,8 @@ help:
 	@echo "  make dev-api-status     - Show API server status"
 	@echo ""
 	@echo "Testing:"
-	@echo "  make test               - Run all Rust workspace tests"
+	@echo "  make test               - Full workspace tests + astra-runtime with bridge-e2e-hooks"
+	@echo "  make test-integration   - Same as test, plus ignored DB suites (needs MatrixOne + .env)"
 	@echo "  make test-contract      - Run contract tests (http/admin/auth/config)"
 	@echo ""
 	@echo "Code Quality:"
@@ -401,17 +402,48 @@ clean:
 # ============================================================================
 
 .PHONY: test
-test:
-	@echo "Running Rust workspace tests..."
+test: test-workspace test-runtime-bridge-hooks test-ignored-integration
+
+.PHONY: test-workspace
+test-workspace:
+	@echo "Running Rust workspace tests (all members, default features)..."
 	@$(CARGO) test $(CARGO_MANIFEST_FLAG)
+
+# Compiles chat/turn bridge hook paths and runs integration binaries that require
+# `required-features = ["bridge-e2e-hooks"]` (e.g. chat_turn_bridge_ledger_inject_e2e).
+.PHONY: test-runtime-bridge-hooks
+test-runtime-bridge-hooks:
+	@echo "Running astra-runtime tests with feature bridge-e2e-hooks..."
+	@$(CARGO) test $(CARGO_MANIFEST_FLAG) $(API_SHELL_PKG) --features bridge-e2e-hooks
+
+# Ignored tests: opt-in so CI without MatrixOne stays green. Enable with:
+#   MO_AGENT_SYSTEM_MATRIX_E2E=1   -> system_matrix_http_e2e (--ignored)
+#   MO_AGENT_MULTI_AGENT_IT=1      -> astra-services multi_agent_integration (--ignored)
+.PHONY: test-ignored-integration
+test-ignored-integration:
+	@if [ "$${MO_AGENT_SYSTEM_MATRIX_E2E:-}" != "1" ] && [ "$${MO_AGENT_MULTI_AGENT_IT:-}" != "1" ]; then \
+		echo "Ignored DB integration tests skipped (use MO_AGENT_SYSTEM_MATRIX_E2E=1 / MO_AGENT_MULTI_AGENT_IT=1, or \`make test-integration\`)."; \
+	fi
+	@if [ "$${MO_AGENT_SYSTEM_MATRIX_E2E:-}" = "1" ]; then \
+		echo "Running system_matrix_http_e2e (ignored; live DB + AppSettings::from_env)..."; \
+		$(CARGO) test $(CARGO_MANIFEST_FLAG) $(API_SHELL_PKG) --features bridge-e2e-hooks \
+			--test system_matrix_http_e2e -- --ignored --test-threads=1; \
+	fi
+	@if [ "$${MO_AGENT_MULTI_AGENT_IT:-}" = "1" ]; then \
+		echo "Running multi_agent_integration (ignored; live MatrixOne)..."; \
+		$(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-services --test multi_agent_integration -- --ignored; \
+	fi
+
+# One-shot local/CI job when deps are up: exports both flags and runs `test`.
+.PHONY: test-integration
+test-integration:
+	@MO_AGENT_SYSTEM_MATRIX_E2E=1 MO_AGENT_MULTI_AGENT_IT=1 $(MAKE) test
 
 .PHONY: test-contract
 test-contract:
-	@echo "Running contract tests (http/admin/auth/config)..."
-	@$(CARGO) test $(CARGO_MANIFEST_FLAG) $(API_SHELL_PKG) --test http_contract
-	@$(CARGO) test $(CARGO_MANIFEST_FLAG) $(API_SHELL_PKG) --test admin_contract
-	@$(CARGO) test $(CARGO_MANIFEST_FLAG) $(API_SHELL_PKG) --test auth_contract
-	@$(CARGO) test $(CARGO_MANIFEST_FLAG) $(API_SHELL_PKG) --test config_contract
+	@echo "Running core HTTP contract binaries (http/admin/auth/config)..."
+	@$(CARGO) test $(CARGO_MANIFEST_FLAG) $(API_SHELL_PKG) \
+		--test http_contract --test admin_contract --test auth_contract --test config_contract
 
 # ============================================================================
 # Code Quality

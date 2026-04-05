@@ -35,25 +35,45 @@ impl AuthService for StubAuthService {
         &self,
         _: AuthRegisterRequestData,
     ) -> Result<AuthUserRecord, (StatusCode, Json<ErrorResponse>)> {
-        unimplemented!()
+        Err((
+            StatusCode::NOT_IMPLEMENTED,
+            Json(ErrorResponse {
+                detail: "not used in reflect contract tests".into(),
+            }),
+        ))
     }
     async fn login(
         &self,
         _: AuthLoginRequestData,
     ) -> Result<AuthTokenRecord, (StatusCode, Json<ErrorResponse>)> {
-        unimplemented!()
+        Err((
+            StatusCode::NOT_IMPLEMENTED,
+            Json(ErrorResponse {
+                detail: "not used in reflect contract tests".into(),
+            }),
+        ))
     }
     async fn refresh(
         &self,
         _: AuthRefreshRequestData,
     ) -> Result<AuthTokenRecord, (StatusCode, Json<ErrorResponse>)> {
-        unimplemented!()
+        Err((
+            StatusCode::NOT_IMPLEMENTED,
+            Json(ErrorResponse {
+                detail: "not used in reflect contract tests".into(),
+            }),
+        ))
     }
     async fn logout(
         &self,
         _: AuthRefreshRequestData,
     ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
-        unimplemented!()
+        Err((
+            StatusCode::NOT_IMPLEMENTED,
+            Json(ErrorResponse {
+                detail: "not used in reflect contract tests".into(),
+            }),
+        ))
     }
     async fn current_user(
         &self,

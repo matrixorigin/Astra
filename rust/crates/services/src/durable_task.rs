@@ -6597,30 +6597,4 @@ Time:        3.456 s
         assert!(!is_snapshot_excluded(std::ffi::OsStr::new("main.py")));
     }
 
-    // ─── MatrixOneDurableTaskLifecycle integration test scaffold ────────────
-
-    /// MatrixOneDurableTaskLifecycle requires a real MySQL/MatrixOne connection.
-    /// This test documents the integration test structure; run manually with:
-    ///   DATABASE_URL=mysql://user:pass@host/db cargo test matrixone_lifecycle --ignored
-    #[tokio::test]
-    #[ignore = "requires real MatrixOne/MySQL database"]
-    async fn matrixone_lifecycle_create_and_verify() {
-        // This would test the full create_contract → begin_subtask → verify → deliver flow
-        // against a real database. The LocalDurableTaskLifecycle tests in this file cover
-        // the equivalent logic paths with file-based storage.
-        //
-        // To run:
-        // 1. Start MatrixOne or MySQL
-        // 2. Create the task_contracts + verification_results tables (see schema above)
-        // 3. Set DATABASE_URL env var
-        // 4. cargo test matrixone_lifecycle --ignored
-        //
-        // let pool = sqlx::MySqlPool::connect(&std::env::var("DATABASE_URL").unwrap()).await.unwrap();
-        // let tmp = tempfile::TempDir::new().unwrap();
-        // let mut svc = MatrixOneDurableTaskLifecycle::new(pool, tmp.path().to_path_buf());
-        // svc.set_session_context("test-session", "test-user");
-        // let plan = make_test_plan();
-        // let contract = svc.create_contract("test-user", "test-session", "test goal", &plan, TaskScope::default()).await.unwrap();
-        // ... verify subtasks, deliver, etc.
-    }
 }
