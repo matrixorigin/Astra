@@ -397,6 +397,53 @@ pub async fn ensure_core_schema(settings: &MatrixOneSettings) -> Result<(), sqlx
     .execute(&pool)
     .await?;
 
+    // ── Marketplace signals (Phase 3) — extend skills_registry ──
+    // Use ALTER TABLE MODIFY/ADD for idempotent column additions.
+    // Ignore errors if columns already exist (MatrixOne returns error on dup).
+    for alter_sql in &[
+        "ALTER TABLE skills_registry ADD COLUMN publisher_id VARCHAR(255) NULL",
+        "ALTER TABLE skills_registry ADD COLUMN publisher_verified SMALLINT NOT NULL DEFAULT 0",
+        "ALTER TABLE skills_registry ADD COLUMN trust_tier VARCHAR(32) NULL",
+        "ALTER TABLE skills_registry ADD COLUMN min_runtime_version VARCHAR(50) NULL",
+        "ALTER TABLE skills_registry ADD COLUMN compatibility_platforms JSON NULL",
+    ] {
+        let _ = query(alter_sql).execute(&pool).await;
+    }
+
+    query(
+        "CREATE TABLE IF NOT EXISTS skill_marketplace_stats (
+            skill_name          VARCHAR(255) PRIMARY KEY,
+            publisher_id        VARCHAR(255),
+            total_installs      BIGINT DEFAULT 0,
+            active_users_7d     INT DEFAULT 0,
+            avg_quality         FLOAT DEFAULT 0.0,
+            avg_rating          FLOAT DEFAULT 0.0,
+            report_count        INT DEFAULT 0,
+            compatibility_score FLOAT DEFAULT 0.0,
+            trust_tier          VARCHAR(32),
+            last_updated        TIMESTAMP,
+            INDEX idx_ranking (avg_quality, active_users_7d)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    query(
+        "CREATE TABLE IF NOT EXISTS skill_quality_reports (
+            id                  BIGINT AUTO_INCREMENT PRIMARY KEY,
+            skill_name          VARCHAR(255) NOT NULL,
+            skill_version       VARCHAR(50) NOT NULL,
+            runtime_version     VARCHAR(50) NOT NULL,
+            success_rate        FLOAT,
+            avg_tokens          FLOAT,
+            invocation_count    INT,
+            reported_at         TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            INDEX idx_skill (skill_name, skill_version)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
     // ── Long-task orchestration (Phase H) ──
 
     query(

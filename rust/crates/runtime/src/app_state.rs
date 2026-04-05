@@ -43,6 +43,7 @@ pub struct AppState {
     pub(crate) branch_service: Arc<dyn BranchService>,
     pub(crate) data_versioning_service: Arc<dyn DataVersioningService>,
     pub(crate) marketplace_service: Arc<dyn MarketplaceService>,
+    pub(crate) marketplace_stats_service: Arc<dyn MarketplaceStatsService>,
     pub(crate) replay_service: Arc<dyn ReplayService>,
     pub(crate) session_audit_service: Arc<dyn SessionAuditService>,
     pub(crate) streaming_service: Arc<dyn StreamingService>,
@@ -122,6 +123,7 @@ impl AppState {
             branch_service: Arc::new(UnconfiguredBranchService),
             data_versioning_service: Arc::new(UnconfiguredDataVersioningService),
             marketplace_service: Arc::new(UnconfiguredMarketplaceService),
+            marketplace_stats_service: Arc::new(NoopMarketplaceStatsService),
             replay_service: Arc::new(UnconfiguredReplayService),
             session_audit_service: Arc::new(UnconfiguredSessionAuditService),
             streaming_service: Arc::new(UnconfiguredStreamingService),
@@ -274,6 +276,14 @@ impl AppState {
         marketplace_service: Arc<dyn MarketplaceService>,
     ) -> Self {
         self.marketplace_service = marketplace_service;
+        self
+    }
+
+    pub fn with_marketplace_stats_service(
+        mut self,
+        marketplace_stats_service: Arc<dyn MarketplaceStatsService>,
+    ) -> Self {
+        self.marketplace_stats_service = marketplace_stats_service;
         self
     }
 

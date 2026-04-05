@@ -126,6 +126,10 @@ pub use astra_services::{
         LearningFeedbackService, UnconfiguredLearningFeedbackService,
     },
     marketplace::{DatabaseMarketplaceService, MarketplaceService, UnconfiguredMarketplaceService},
+    marketplace_stats::{
+        MarketplaceStatsService, NoopMarketplaceStatsService,
+        DatabaseMarketplaceStatsService,
+    },
     models::{
         DatabaseModelService, ModelCreateRequestData, ModelListItem, ModelRecord, ModelService,
         ModelUpdateRequestData, PricingData, QuirksData, UnconfiguredModelService,

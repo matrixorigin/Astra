@@ -81,6 +81,8 @@ pub async fn publish_skill_handler(
                 manifest: request.manifest,
                 category: request.category,
                 priority: request.priority,
+                publisher_id: None,
+                trust_tier: None,
             },
         )
         .await?;

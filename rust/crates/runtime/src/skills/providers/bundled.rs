@@ -56,6 +56,7 @@ impl BundledSkillProvider {
     /// Register a bundled skill from manifest + instructions directly.
     pub fn register(&self, mut manifest: SkillManifest, instructions: String) -> Result<(), SkillError> {
         manifest.source = SkillSourceKind::Bundled;
+        manifest.trust_tier = crate::skills::manifest::TrustTier::Bundled;
         let name = manifest.name.clone();
 
         let mut skills = self

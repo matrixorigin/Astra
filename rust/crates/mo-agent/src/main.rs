@@ -4467,6 +4467,14 @@ async fn run_chat_repl(
             );
         }
 
+        // Upload quality metrics to marketplace (opt-in via ASTRA_QUALITY_UPLOAD=true)
+        slash_skill::maybe_upload_quality_on_exit(
+            api,
+            &state.skill_quality_tracker,
+            current_access_token(profile).as_deref(),
+        )
+        .await;
+
         let profile_name = profile.unwrap_or("default");
         if let Err(e) = astra_runtime::pipeline::persistence::save_learning_state_with_health(
             profile_name,

@@ -442,6 +442,19 @@ pub(super) fn build_router(state: AppState) -> Router {
             "/marketplace/skills/{skill_name}/deprecate",
             post(marketplace::deprecate_skill_handler),
         )
+        // Marketplace stats (Phase 3)
+        .route(
+            "/marketplace/quality-report",
+            post(marketplace::submit_quality_report_handler),
+        )
+        .route(
+            "/marketplace/stats/{skill_name}",
+            get(marketplace::get_skill_stats_handler),
+        )
+        .route(
+            "/marketplace/search",
+            get(marketplace::search_marketplace_handler),
+        )
         // Streaming (deprecated)
         .route("/streaming/chat", post(streaming::stream_chat_handler))
         // Evaluation

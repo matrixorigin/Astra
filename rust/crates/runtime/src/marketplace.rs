@@ -154,3 +154,42 @@ pub async fn deprecate_skill_handler(
         .await?;
     Ok(Json(result))
 }
+
+// ── Marketplace stats handlers (Phase 3) ─────────────────────────────────────
+
+pub use astra_services::marketplace_stats::{
+    QualityReportData, SkillMarketplaceStats, SkillSearchQuery, SkillSearchResponse,
+};
+
+pub async fn submit_quality_report_handler(
+    State(state): State<AppState>,
+    Json(report): Json<QualityReportData>,
+) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
+    state
+        .marketplace_stats_service
+        .submit_quality_report(report)
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+pub async fn get_skill_stats_handler(
+    State(state): State<AppState>,
+    Path(skill_name): Path<String>,
+) -> Result<Json<SkillMarketplaceStats>, (StatusCode, Json<ErrorResponse>)> {
+    let stats = state
+        .marketplace_stats_service
+        .get_skill_stats(skill_name)
+        .await?;
+    Ok(Json(stats))
+}
+
+pub async fn search_marketplace_handler(
+    State(state): State<AppState>,
+    Query(query): Query<SkillSearchQuery>,
+) -> Result<Json<SkillSearchResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let results = state
+        .marketplace_stats_service
+        .search_ranked(query)
+        .await?;
+    Ok(Json(results))
+}

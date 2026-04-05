@@ -67,6 +67,13 @@ struct RawFrontmatter {
     required_capabilities: Vec<String>,
     #[serde(default)]
     composition: Option<super::manifest::SkillComposition>,
+    // Marketplace fields (Phase 3)
+    #[serde(default)]
+    trust_tier: Option<String>,
+    #[serde(default)]
+    publisher: Option<super::manifest::PublisherMetadata>,
+    #[serde(default)]
+    compatibility: Option<super::manifest::CompatibilityInfo>,
 }
 
 fn default_true() -> bool {
@@ -159,6 +166,14 @@ pub fn parse_skill_md(content: &str) -> Result<(SkillManifest, String), SkillErr
         success_criteria: raw.success_criteria,
         required_capabilities: raw.required_capabilities,
         composition: raw.composition,
+        trust_tier: match raw.trust_tier.as_deref() {
+            Some("bundled") => super::manifest::TrustTier::Bundled,
+            Some("verified") => super::manifest::TrustTier::Verified,
+            Some("community") => super::manifest::TrustTier::Community,
+            _ => super::manifest::TrustTier::Unverified,
+        },
+        publisher: raw.publisher,
+        compatibility: raw.compatibility,
     };
 
     Ok((manifest, markdown_body))

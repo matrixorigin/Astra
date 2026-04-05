@@ -839,10 +839,69 @@ Follow these steps:
             }
         }
 
+        "search-remote" | "marketplace" => {
+            let query_str = sub_arg.trim();
+            if query_str.is_empty() {
+                eprintln!("{}", "  Usage: /skill search-remote <query>".yellow());
+                eprintln!("{}", "  Searches the marketplace for skills with ranking.".dim());
+                return Ok(());
+            }
+
+            let tok = token.unwrap_or("");
+            match api
+                .get_bearer_path_query_text(
+                    tok,
+                    "/marketplace/search",
+                    &[("query", query_str.to_string())],
+                )
+                .await
+            {
+                Ok(text) => {
+                    match serde_json::from_str::<astra_services::marketplace_stats::SkillSearchResponse>(&text) {
+                        Ok(resp) => {
+                            eprintln!("\n  {} '{}' ({} results)", "Marketplace search:".dim(), query_str.cyan(), resp.total);
+                            eprintln!("{}", "\u{2500}".repeat(78).dim());
+
+                            if resp.results.is_empty() {
+                                eprintln!("  {}", "No matching skills in marketplace.".dim());
+                            } else {
+                                eprintln!(
+                                    "  {:<24}  {:<8}  {:<10}  {:<6}  {}",
+                                    "Name".bold(), "Version".bold(), "Trust".bold(), "Score".bold(), "Description".bold()
+                                );
+                                for r in &resp.results {
+                                    let tier = r.trust_tier.as_deref().unwrap_or("?");
+                                    let desc = truncate_desc(r.description.as_deref().unwrap_or(""), 30);
+                                    eprintln!(
+                                        "  {:<24}  {:<8}  {:<10}  {:<6.2}  {}",
+                                        r.skill_name.as_str().cyan(),
+                                        r.version.as_str().dim(),
+                                        tier.dim(),
+                                        r.ranking_score,
+                                        desc
+                                    );
+                                }
+                            }
+                        }
+                        Err(e) => eprintln!("  {} {}", "✗ Parse error:".yellow(), format!("{e}").dim()),
+                    }
+                }
+                Err(e) => {
+                    eprintln!("  {} {}", "✗ Marketplace unavailable:".yellow(), format!("{e}").dim());
+                    eprintln!("  {}", "Tip: use '/skill search' for local-only search.".dim());
+                }
+            }
+            eprintln!();
+        }
+
+        "upload-quality" => {
+            upload_quality_report(api, &state.skill_quality_tracker, token).await;
+        }
+
         _ => {
             eprintln!(
                         "{}",
-                        format!("  Unknown /skill subcommand: '{sub}'. Try /skill list, /skill info, /skill new, /skill test, /skill dev, /skill doctor, /skill stats").yellow()
+                        format!("  Unknown /skill subcommand: '{sub}'. Try /skill list, /skill search, /skill search-remote, /skill info, /skill new, /skill test, /skill dev, /skill doctor, /skill stats, /skill upload-quality").yellow()
                     );
         }
     }
@@ -1133,5 +1192,73 @@ mod tests {
         };
         let score = skill_relevance_score(&m, "code review");
         assert!(score > 0, "multi-word query should match description");
+    }
+}
+
+// ── Quality upload ──────────────────────────────────────────────────────
+
+/// Upload local quality metrics to the marketplace API (opt-in).
+async fn upload_quality_report(
+    api: &astra_thin_client::ThinClient,
+    tracker: &astra_runtime::skills::SkillQualityTracker,
+    token: Option<&str>,
+) {
+    let entries = tracker.all_entries();
+    if entries.is_empty() {
+        eprintln!("  {}", "No quality data to upload.".dim());
+        return;
+    }
+
+    let tok = token.unwrap_or("");
+    let runtime_version = env!("CARGO_PKG_VERSION");
+    let mut uploaded = 0u32;
+    let mut failed = 0u32;
+
+    for (name, entry) in entries {
+        if entry.invocations < 2 {
+            continue;
+        }
+
+        let report = serde_json::json!({
+            "skill_name": name,
+            "skill_version": "unknown",
+            "runtime_version": runtime_version,
+            "success_rate": entry.success_rate(),
+            "avg_tokens": entry.avg_tokens(),
+            "invocation_count": entry.invocations,
+        });
+
+        match api
+            .post_bearer_path_json_text(tok, "/marketplace/quality-report", &report)
+            .await
+        {
+            Ok(_) => uploaded += 1,
+            Err(_) => failed += 1,
+        }
+    }
+
+    if failed > 0 {
+        eprintln!(
+            "  {} {uploaded} uploaded, {failed} failed (marketplace may be offline)",
+            "Quality upload:".dim()
+        );
+    } else if uploaded > 0 {
+        eprintln!("  {} {uploaded} skill reports uploaded.", "✓".green());
+    } else {
+        eprintln!("  {}", "No skills had enough data (min 2 invocations).".dim());
+    }
+}
+
+/// Upload quality on REPL exit if opt-in enabled via ASTRA_QUALITY_UPLOAD=true.
+pub(super) async fn maybe_upload_quality_on_exit(
+    api: &astra_thin_client::ThinClient,
+    tracker: &astra_runtime::skills::SkillQualityTracker,
+    token: Option<&str>,
+) {
+    if std::env::var("ASTRA_QUALITY_UPLOAD")
+        .map(|v| v == "true" || v == "1")
+        .unwrap_or(false)
+    {
+        upload_quality_report(api, tracker, token).await;
     }
 }

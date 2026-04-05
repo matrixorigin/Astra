@@ -37,6 +37,9 @@ pub struct SkillPublishRequestData {
     pub manifest: Option<serde_json::Value>,
     pub category: String,
     pub priority: i32,
+    // Phase 3: publisher + trust fields
+    pub publisher_id: Option<String>,
+    pub trust_tier: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -88,6 +91,9 @@ pub struct SkillInfoRecord {
     pub category: Option<String>,
     pub install_count: i64,
     pub created_at: Option<String>,
+    // Phase 3
+    pub publisher_id: Option<String>,
+    pub trust_tier: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -356,6 +362,7 @@ impl SkillService for DatabaseSkillService {
 
         let row = query(
             "SELECT skill_name, version, description, source, status, created_by, category, \
+             publisher_id, trust_tier, \
              DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s') AS created_at \
              FROM skills_registry WHERE skill_name = ? AND is_active = 1 \
              ORDER BY created_at DESC LIMIT 1",
@@ -389,6 +396,8 @@ impl SkillService for DatabaseSkillService {
             category: row.try_get("category").ok(),
             install_count,
             created_at: row.try_get("created_at").ok(),
+            publisher_id: row.try_get("publisher_id").ok(),
+            trust_tier: row.try_get("trust_tier").ok(),
         })
     }
 
@@ -516,8 +525,9 @@ impl SkillService for DatabaseSkillService {
         let insert_result = query(
             "INSERT INTO skills_registry \
              (skill_id, skill_name, version, description, triggers, dependencies, manifest, \
-               category, priority, is_active, status, source, is_public, created_by, created_at, updated_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 'active', 'user', 1, ?, NOW(), NOW())"
+               category, priority, is_active, status, source, is_public, created_by, \
+               publisher_id, trust_tier, created_at, updated_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 'active', 'user', 1, ?, ?, ?, NOW(), NOW())"
         )
         .bind(&skill_id)
         .bind(&request.name)
@@ -529,6 +539,8 @@ impl SkillService for DatabaseSkillService {
         .bind(&request.category)
         .bind(request.priority)
         .bind(&user_id)
+        .bind(&request.publisher_id)
+        .bind(&request.trust_tier)
         .execute(&pool)
         .await;
 

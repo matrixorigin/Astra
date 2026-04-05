@@ -16,6 +16,7 @@ pub mod introspection;
 pub mod jobs;
 pub mod learning;
 pub mod marketplace;
+pub mod marketplace_stats;
 pub mod models;
 pub mod multi_agent;
 pub mod protocol;

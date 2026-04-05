@@ -143,10 +143,26 @@ pub struct SkillManifest {
     /// Composition metadata.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub composition: Option<SkillComposition>,
+
+    // ── Marketplace fields (Phase 3) ────────────────────────────────────────
+
+    /// Trust tier for this skill. Defaults to `Unverified` for non-bundled skills.
+    #[serde(default, skip_serializing_if = "is_default_trust_tier")]
+    pub trust_tier: TrustTier,
+    /// Publisher identity information.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub publisher: Option<PublisherMetadata>,
+    /// Compatibility constraints.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compatibility: Option<CompatibilityInfo>,
 }
 
 fn default_true() -> bool {
     true
+}
+
+fn is_default_trust_tier(tier: &TrustTier) -> bool {
+    *tier == TrustTier::Unverified
 }
 
 /// Composition metadata for skill chaining.
@@ -164,6 +180,75 @@ pub struct SkillComposition {
     /// Maximum execution time in seconds (for orchestrators to enforce).
     #[serde(default)]
     pub max_duration_sec: Option<u32>,
+}
+
+// ── Phase 3: Marketplace signal types ────────────────────────────────────────
+
+/// Trust tier for marketplace skills.
+///
+/// Affects default permission level, marketplace ranking weight,
+/// and budget priority during skill selection.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TrustTier {
+    /// Platform team — built-in, CI-tested. Full trust.
+    Bundled,
+    /// Approved publisher — code review + automated scan. High trust.
+    Verified,
+    /// Any user — automated scan only. Medium trust.
+    Community,
+    /// Anonymous — no verification. Low trust, prompted on use.
+    Unverified,
+}
+
+impl Default for TrustTier {
+    fn default() -> Self {
+        TrustTier::Unverified
+    }
+}
+
+impl TrustTier {
+    /// Numeric weight used in the marketplace ranking algorithm.
+    /// Higher = more trusted.
+    pub fn ranking_weight(&self) -> f64 {
+        match self {
+            TrustTier::Bundled => 1.0,
+            TrustTier::Verified => 0.8,
+            TrustTier::Community => 0.5,
+            TrustTier::Unverified => 0.2,
+        }
+    }
+}
+
+/// Publisher identity metadata.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct PublisherMetadata {
+    /// Publisher account identifier (e.g. "org-matrixorigin").
+    #[serde(default)]
+    pub account_id: Option<String>,
+    /// Whether the publisher has been verified.
+    #[serde(default)]
+    pub verified: bool,
+    /// When this version was published.
+    #[serde(default)]
+    pub published_at: Option<String>,
+}
+
+/// Compatibility constraints for a skill.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct CompatibilityInfo {
+    /// Minimum runtime version required (semver string, e.g. "0.9.0").
+    #[serde(default)]
+    pub min_runtime_version: Option<String>,
+    /// Abstract capabilities required (e.g. "shell_execution", "file_read").
+    #[serde(default)]
+    pub required_capabilities: Vec<String>,
+    /// Models this skill was tested against.
+    #[serde(default)]
+    pub tested_models: Vec<String>,
+    /// OS platforms this skill supports (e.g. "linux", "macos").
+    #[serde(default)]
+    pub platforms: Vec<String>,
 }
 
 /// Structured error categories for skill execution failures.
@@ -211,6 +296,9 @@ impl Default for SkillManifest {
             success_criteria: Vec::new(),
             required_capabilities: Vec::new(),
             composition: None,
+            trust_tier: TrustTier::default(),
+            publisher: None,
+            compatibility: None,
         }
     }
 }
@@ -235,6 +323,107 @@ impl SkillManifest {
     pub fn is_conditional(&self) -> bool {
         !self.paths.is_empty()
     }
+
+    /// Check if this skill is compatible with the current runtime environment.
+    ///
+    /// Returns a list of compatibility issues (empty = fully compatible).
+    /// `available_capabilities` should list the tools/features currently available.
+    pub fn check_compatibility(
+        &self,
+        runtime_version: &str,
+        available_capabilities: &[&str],
+    ) -> Vec<CompatibilityIssue> {
+        let mut issues = Vec::new();
+        if let Some(ref compat) = self.compatibility {
+            // Check runtime version
+            if let Some(ref min_ver) = compat.min_runtime_version {
+                if !version_satisfies(runtime_version, min_ver) {
+                    issues.push(CompatibilityIssue::RuntimeVersion {
+                        required: min_ver.clone(),
+                        actual: runtime_version.to_string(),
+                    });
+                }
+            }
+
+            // Check required capabilities
+            for cap in &compat.required_capabilities {
+                if !available_capabilities.contains(&cap.as_str()) {
+                    issues.push(CompatibilityIssue::MissingCapability(cap.clone()));
+                }
+            }
+
+            // Check platform
+            if !compat.platforms.is_empty() {
+                let current_platform = if cfg!(target_os = "linux") {
+                    "linux"
+                } else if cfg!(target_os = "macos") {
+                    "macos"
+                } else if cfg!(target_os = "windows") {
+                    "windows"
+                } else {
+                    "unknown"
+                };
+                if !compat.platforms.iter().any(|p| p == current_platform) {
+                    issues.push(CompatibilityIssue::UnsupportedPlatform {
+                        supported: compat.platforms.clone(),
+                        current: current_platform.to_string(),
+                    });
+                }
+            }
+        }
+        issues
+    }
+}
+
+/// A compatibility issue detected by `check_compatibility()`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CompatibilityIssue {
+    /// Runtime version too old.
+    RuntimeVersion { required: String, actual: String },
+    /// A required capability is not available.
+    MissingCapability(String),
+    /// Current platform not in supported list.
+    UnsupportedPlatform { supported: Vec<String>, current: String },
+}
+
+impl std::fmt::Display for CompatibilityIssue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CompatibilityIssue::RuntimeVersion { required, actual } => {
+                write!(f, "requires runtime >= {required}, have {actual}")
+            }
+            CompatibilityIssue::MissingCapability(cap) => {
+                write!(f, "missing capability: {cap}")
+            }
+            CompatibilityIssue::UnsupportedPlatform { supported, current } => {
+                write!(
+                    f,
+                    "unsupported platform: {current} (supports: {})",
+                    supported.join(", ")
+                )
+            }
+        }
+    }
+}
+
+/// Simple semver check: does `actual` satisfy `>= required`?
+/// Only compares major.minor.patch (ignores pre-release).
+fn version_satisfies(actual: &str, required: &str) -> bool {
+    let parse = |s: &str| -> (u32, u32, u32) {
+        let parts: Vec<u32> = s
+            .split('.')
+            .take(3)
+            .map(|p| p.parse().unwrap_or(0))
+            .collect();
+        (
+            parts.first().copied().unwrap_or(0),
+            parts.get(1).copied().unwrap_or(0),
+            parts.get(2).copied().unwrap_or(0),
+        )
+    };
+    let a = parse(actual);
+    let r = parse(required);
+    a >= r
 }
 
 /// A fully loaded skill: manifest + instruction text + optional resources.
@@ -312,5 +501,81 @@ mod tests {
         let tokens = m.metadata_tokens();
         assert!(tokens > 0);
         assert!(tokens < 100);
+    }
+
+    #[test]
+    fn trust_tier_ranking_weights() {
+        assert_eq!(TrustTier::Bundled.ranking_weight(), 1.0);
+        assert_eq!(TrustTier::Verified.ranking_weight(), 0.8);
+        assert_eq!(TrustTier::Community.ranking_weight(), 0.5);
+        assert_eq!(TrustTier::Unverified.ranking_weight(), 0.2);
+    }
+
+    #[test]
+    fn default_trust_tier_is_unverified() {
+        let m = SkillManifest::default();
+        assert_eq!(m.trust_tier, TrustTier::Unverified);
+    }
+
+    #[test]
+    fn compatibility_check_passes_when_no_constraints() {
+        let m = SkillManifest::default();
+        let issues = m.check_compatibility("1.0.0", &["shell_execution", "file_read"]);
+        assert!(issues.is_empty());
+    }
+
+    #[test]
+    fn compatibility_check_version_too_old() {
+        let m = SkillManifest {
+            compatibility: Some(CompatibilityInfo {
+                min_runtime_version: Some("2.0.0".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let issues = m.check_compatibility("1.5.3", &[]);
+        assert_eq!(issues.len(), 1);
+        assert!(matches!(issues[0], CompatibilityIssue::RuntimeVersion { .. }));
+    }
+
+    #[test]
+    fn compatibility_check_missing_capability() {
+        let m = SkillManifest {
+            compatibility: Some(CompatibilityInfo {
+                required_capabilities: vec!["shell_execution".into(), "network_access".into()],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let issues = m.check_compatibility("1.0.0", &["shell_execution", "file_read"]);
+        assert_eq!(issues.len(), 1);
+        assert!(matches!(issues[0], CompatibilityIssue::MissingCapability(ref c) if c == "network_access"));
+    }
+
+    #[test]
+    fn compatibility_check_platform_mismatch() {
+        let m = SkillManifest {
+            compatibility: Some(CompatibilityInfo {
+                platforms: vec!["windows".into()],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let issues = m.check_compatibility("1.0.0", &[]);
+        if cfg!(target_os = "windows") {
+            assert!(issues.is_empty());
+        } else {
+            assert_eq!(issues.len(), 1);
+            assert!(matches!(issues[0], CompatibilityIssue::UnsupportedPlatform { .. }));
+        }
+    }
+
+    #[test]
+    fn version_satisfies_basic() {
+        assert!(version_satisfies("1.0.0", "1.0.0"));
+        assert!(version_satisfies("2.0.0", "1.0.0"));
+        assert!(version_satisfies("1.1.0", "1.0.0"));
+        assert!(!version_satisfies("0.9.0", "1.0.0"));
+        assert!(!version_satisfies("1.0.0", "1.0.1"));
     }
 }
