@@ -12,7 +12,26 @@ cargo test -p astra-runtime --test system_matrix_http_e2e --features bridge-e2e-
   --ignored --nocapture
 ```
 
-Requires the same environment as `astra-server`: `MATRIXONE_*`, JWT/Fernet secrets via `astra_core::AppSettings::from_env`, etc. Use a local `.env` if you use one for development.
+Requires the same environment as `astra-server`: `MATRIXONE_*`, `JWT_SECRET_KEY` / `SECRET_KEY` and related keys via `astra_core::AppSettings::from_env`, etc. Use a local `.env` if you use one for development.
+
+## Environment variables (对照表)
+
+| Variable | Role | Notes |
+|----------|------|--------|
+| `MO_AGENT_SYSTEM_MATRIX_E2E` | **Gate** | Must be `1` or ignored tests panic in `require_system_e2e_env` |
+| `MO_AGENT_BRIDGE_TEST_SECRET` | `/chat/turn` E2E | Injected before parallel runs; must match bridge hook expectations in full journey |
+| `MATRIXONE_HOST` | DB | Default `localhost` |
+| `MATRIXONE_PORT` | DB | Default `6001` |
+| `MATRIXONE_USER` | DB | Default `root` |
+| `MATRIXONE_PASSWORD` | DB | Default dev password in `astra_core::runtime_limits` if unset |
+| `MATRIXONE_DATABASE` | DB | Default `astra_runtime` |
+| `JWT_SECRET_KEY` | Auth tokens | Default dev string if unset (not for production) |
+| `SECRET_KEY` | App crypto | Default dev string if unset |
+| `REDIS_HOST` / `REDIS_PORT` | Cache | Defaults `localhost` / `6379` |
+| `EMBEDDING_*` | Embeddings config | `EMBEDDING_DIM` may be required for unknown models (see `AppSettings`) |
+| `CHAT_TURN_BRIDGE_SECRET` | Bridge | Default dev string; align with deployment if using real bridge |
+
+Evaluation routes in journeys use `x-user-id` without bearer on some calls (see `journey_full` / `journey_extended`). All other authenticated routes use the JWT from `bootstrap`.
 
 ## Test binaries (ignored by default)
 
@@ -69,7 +88,7 @@ Legend: **DB** = SQL assertion on MatrixOne; **HTTP** = response-only; **—** =
 ## CI / nightly (optional)
 
 - **PR**: keep default `cargo test --workspace` (ignored tests off).
-- **Nightly / manual**: run the command in [How to run](#how-to-run) against a MatrixOne instance; see `.github/workflows/e2e-matrix-nightly.yml` for a template job (`workflow_dispatch` only).
+- **Manual**: `.github/workflows/e2e-matrix-nightly.yml` — `workflow_dispatch` with optional **test name filter** (substring) to run a subset (e.g. `e2e_matrix_basic`) or leave empty for all ignored tests in the binary. Requires MatrixOne + `AppSettings` env (repo secrets/vars) to succeed.
 
 ## Router groups alignment
 

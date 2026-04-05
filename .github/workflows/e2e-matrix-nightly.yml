@@ -1,9 +1,15 @@
 # Optional: full ignored Matrix system E2E (`system_matrix_http_e2e`).
-# Trigger manually when a MatrixOne instance and app secrets are available (repository secrets / environment).
+# Run when a MatrixOne instance and app secrets are available (repository secrets / environment).
+# See `docs/testing/system-e2e-matrix.md` for env ↔ test mapping.
 name: E2E Matrix (manual)
 
 on:
   workflow_dispatch:
+    inputs:
+      test_name_filter:
+        description: "Optional `cargo test` name filter (substring). Empty = run all ignored tests in the binary."
+        required: false
+        default: ""
 
 jobs:
   system-matrix-e2e:
@@ -24,9 +30,17 @@ jobs:
         env:
           MO_AGENT_SYSTEM_MATRIX_E2E: "1"
           MO_AGENT_BRIDGE_TEST_SECRET: system-matrix-e2e-secret
-          # Set these via repo secrets before enabling this job in production:
+          TEST_NAME_FILTER: ${{ github.event.inputs.test_name_filter || '' }}
+          # Set via repo secrets / vars before relying on this job in CI:
           # MATRIXONE_HOST, MATRIXONE_PORT, MATRIXONE_USER, MATRIXONE_PASSWORD, MATRIXONE_DATABASE
-          # JWT_SECRET, FERNET_KEY, etc. (see AppSettings::from_env)
+          # JWT_SECRET_KEY, SECRET_KEY, REDIS_*, EMBEDDING_* (see astra_core::AppSettings::from_env)
         run: |
-          cargo test -p astra-runtime --test system_matrix_http_e2e \
-            --features bridge-e2e-hooks -- --ignored --nocapture
+          set -euo pipefail
+          FILTER="${TEST_NAME_FILTER:-}"
+          if [ -n "$FILTER" ]; then
+            cargo test -p astra-runtime --test system_matrix_http_e2e \
+              --features bridge-e2e-hooks -- "$FILTER" --ignored --nocapture
+          else
+            cargo test -p astra-runtime --test system_matrix_http_e2e \
+              --features bridge-e2e-hooks -- --ignored --nocapture
+          fi

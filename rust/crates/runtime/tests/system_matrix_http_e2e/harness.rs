@@ -1,4 +1,9 @@
-//! Shared helpers for Matrix-backed system HTTP E2E tests.
+//! Shared harness for **system** Matrix HTTP E2E (Phase A: env gate, HTTP helpers, `sqlx` cleanup /
+//! row assertions, [`bootstrap`] / [`MatrixE2eCtx`]).
+//!
+//! This module is the extracted equivalent of the historical monolithic
+//! `tests/system_matrix_http_e2e.rs` setup; journey logic lives in `journey_*.rs`. See
+//! `docs/testing/system-e2e-matrix.md` for the capability ↔ route ↔ test mapping.
 
 use std::sync::Arc;
 use std::sync::OnceLock;
