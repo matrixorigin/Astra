@@ -14,6 +14,7 @@ use axum::{
 use serde_json::{Value, json};
 use sqlx::Row;
 use sqlx::mysql::MySqlRow;
+use futures_util::StreamExt;
 use tokio::sync::Mutex;
 use tower::util::ServiceExt;
 use uuid::Uuid;
@@ -137,6 +138,86 @@ pub async fn post_empty(app: &Router, path: &str, auth: Option<&str>) -> (Status
         .expect("body");
     let json: Value = serde_json::from_slice(&bytes).unwrap_or(json!({}));
     (status, json)
+}
+
+/// POST with empty body and extra headers (e.g. `x-user-id` for evaluation routes).
+pub async fn post_empty_with_headers(
+    app: &Router,
+    path: &str,
+    auth: Option<&str>,
+    extra_headers: &[(&str, &str)],
+) -> (StatusCode, Value) {
+    let mut req = Request::builder().method("POST").uri(path);
+    if let Some(t) = auth {
+        req = req.header("authorization", t);
+    }
+    for (k, v) in extra_headers {
+        req = req.header(*k, *v);
+    }
+    let req = req.body(Body::empty()).expect("request");
+    let response = app.clone().oneshot(req).await.expect("oneshot");
+    let status = response.status();
+    let bytes = body::to_bytes(response.into_body(), 8 * 1024 * 1024)
+        .await
+        .expect("body");
+    let json: Value = serde_json::from_slice(&bytes).unwrap_or(json!({}));
+    (status, json)
+}
+
+/// POST JSON and collect the response body as UTF-8 (for small buffered SSE bodies).
+pub async fn post_json_collect_body_text(
+    app: &Router,
+    path: &str,
+    auth: Option<&str>,
+    payload: &Value,
+    max_bytes: usize,
+) -> (StatusCode, String) {
+    let mut req = Request::builder()
+        .method("POST")
+        .uri(path)
+        .header("content-type", "application/json");
+    if let Some(t) = auth {
+        req = req.header("authorization", t);
+    }
+    let req = req.body(Body::from(payload.to_string())).expect("request");
+    let response = app.clone().oneshot(req).await.expect("oneshot");
+    let status = response.status();
+    if !status.is_success() {
+        let bytes = body::to_bytes(response.into_body(), 4 * 1024 * 1024)
+            .await
+            .unwrap_or_default();
+        return (status, String::from_utf8_lossy(&bytes).to_string());
+    }
+    let mut stream = response.into_body().into_data_stream();
+    let mut acc = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.expect("body chunk");
+        acc.extend_from_slice(&chunk);
+        if acc.len() >= max_bytes {
+            break;
+        }
+        let preview = String::from_utf8_lossy(&acc);
+        if preview.contains("\"run_id\"") && preview.contains("session_info") {
+            break;
+        }
+    }
+    (status, String::from_utf8_lossy(&acc).to_string())
+}
+
+/// Parse SSE `data: {...}` blocks; return the first JSON object whose `type` matches.
+pub fn sse_first_data_json_with_type(body: &str, want_type: &str) -> Option<Value> {
+    for block in body.split("\n\n") {
+        let line = block.lines().find(|l| l.starts_with("data: "));
+        let Some(l) = line else {
+            continue;
+        };
+        let rest = l.strip_prefix("data: ")?;
+        let v: Value = serde_json::from_str(rest.trim()).ok()?;
+        if v.get("type").and_then(|t| t.as_str()) == Some(want_type) {
+            return Some(v);
+        }
+    }
+    None
 }
 
 pub async fn post_json(

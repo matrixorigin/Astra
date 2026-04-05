@@ -22,8 +22,13 @@ Requires the same environment as `astra-server`: `MATRIXONE_*`, JWT/Fernet secre
 | `e2e_matrix_basic_auth_session_lifecycle` | `journey_basic.rs` | Bootstrap + session list/get/put, close/resume, `agent_sessions.status`, activity, logout |
 | `e2e_matrix_tasks_lease_and_db_assertions` | `journey_tasks_runs.rs` | `POST /tasks`, `agent_tasks`; edge register; lease claim/release; `task_leases`; `PUT /tasks/{id}/status` |
 | `e2e_matrix_chat_run_pause_resume_http` | `journey_tasks_runs.rs` | `POST /chat` (background run), `POST .../pause`, `GET /chat/runs/{id}`, `POST .../resume` |
+| `e2e_matrix_platform_snapshot` | `journey_extended.rs` | `GET /platform/snapshot` |
+| `e2e_matrix_session_cancel_delete` | `journey_extended.rs` | `POST /sessions/{id}/cancel` + `agent_sessions.status`, `DELETE /sessions/{id}` |
+| `e2e_matrix_tasks_list_get_lease_renew` | `journey_extended.rs` | `GET /tasks`, `GET /tasks/{id}`, `GET .../progress`, lease `GET` + `renew` |
+| `e2e_matrix_evaluation_post_not_implemented` | `journey_extended.rs` | `POST /evaluation/gate/validate`, `POST /evaluation/drift/run`, `POST /evaluation/loop?...` → **501** (until implemented) |
+| `e2e_matrix_chat_stream_session_info` | `journey_extended.rs` | `POST /chat/stream` SSE → `session_info` + `run_id` |
 
-Shared helpers: `tests/system_matrix_http_e2e/harness.rs` (`bootstrap`, HTTP helpers, `cleanup_*`, row getters).
+Shared helpers: `tests/system_matrix_http_e2e/harness.rs` (`bootstrap`, HTTP helpers, `cleanup_*`, row getters, SSE helpers).
 
 ## API groups vs coverage (P0 / P1)
 
@@ -33,7 +38,7 @@ Legend: **DB** = SQL assertion on MatrixOne; **HTTP** = response-only; **—** =
 |-------|---|----------------------|-------------------|---------|
 | Meta | P0 | `GET /health`, `GET /` | — | `product_matrix_*` |
 | Auth | P0 | `/auth/register`, `/login`, `/refresh`, `/me`, `/logout` | `auth_users` | all |
-| Sessions | P0 | `/sessions`, `.../close`, `.../resume`, `.../activity` | `agent_sessions` | all |
+| Sessions | P0 | `/sessions`, `.../close`, `.../resume`, `.../cancel`, `DELETE ...`, `.../activity` | `agent_sessions` | all + `e2e_matrix_session_cancel_delete` |
 | Session audit | P0 | `/sessions/{id}/audit/*`, `/audit/*` | mostly HTTP | `product_matrix_*` |
 | Agents | P0 | `/agents` CRUD | `agent_agents` | `product_matrix_*` |
 | Events | P0 | `/events`, causal chain, session events | `agent_events` | `product_matrix_*` |
@@ -47,10 +52,12 @@ Legend: **DB** = SQL assertion on MatrixOne; **HTTP** = response-only; **—** =
 | Skills / introspection | P1 | `/skills`, `/introspection/*` | mixed | `product_matrix_*` |
 | Learning | P1 | `/api/v1/learning/*` | — | `product_matrix_*` |
 | Evaluation | P1 | `/evaluation/*` reads | — | `product_matrix_*` |
+| Evaluation (writes) | P1 | `POST` gate/validate, drift/run, loop | — | `e2e_matrix_evaluation_post_not_implemented` (expects **501** today) |
 | Marketplace | P1 | quality report, stats, search | marketplace stats tables | `product_matrix_*` |
 | Chat turn (SSE) | P0 | `POST /chat/turn` + bridge secret | `agent_events` | `product_matrix_*` |
-| Chat / runs | P0 | `POST /chat`, `/chat/runs/*` | **In-memory** run store in `build_server_state` (not Matrix table today) | `e2e_matrix_chat_run_pause_resume_http` |
-| Tasks | P0 | `/tasks`, `/tasks/{id}/lease/*`, `.../status` | `agent_tasks`, `task_leases` | `e2e_matrix_tasks_lease_and_db_assertions` |
+| Chat / runs | P0 | `POST /chat`, `/chat/stream`, `/chat/runs/*` | **In-memory** run store in `build_server_state` (not Matrix table today) | `e2e_matrix_chat_run_pause_resume_http`, `e2e_matrix_chat_stream_session_info` |
+| Tasks | P0 | `/tasks`, `GET` list/get/progress, `/tasks/{id}/lease/*`, `.../status` | `agent_tasks`, `task_leases` | `e2e_matrix_tasks_lease_and_db_assertions`, `e2e_matrix_tasks_list_get_lease_renew` |
+| Platform | P1 | `GET /platform/snapshot` | — | `e2e_matrix_platform_snapshot` |
 | Workflows | P1 | `GET /workflows` | — | `product_matrix_*` |
 | Data versioning | P1 | lineage GETs | — | `product_matrix_*` |
 | Replay | P1 | `/sessions/{id}/replay/compare` | — | `product_matrix_*` |
@@ -71,27 +78,28 @@ Same prefixes as [`router_builder` `all_api_groups_have_routes`](../../rust/crat
 | Group (`router_builder`) | Prefix | System E2E | Notes |
 |--------------------------|--------|------------|--------|
 | auth | `/auth/` | Yes | `auth_users` in bootstrap / `product_matrix_*` |
-| chat | `/chat` | Partial | `/chat/turn` + SSE + `agent_events` in `product_matrix_*`; `POST /chat` + run pause/resume in `e2e_matrix_chat_run_pause_resume_http`; no `/chat/stream` or `/chat/ws` E2E |
+| chat | `/chat` | Partial | `/chat/turn` + SSE + `agent_events` in `product_matrix_*`; `POST /chat` + run pause/resume in `e2e_matrix_chat_run_pause_resume_http`; `/chat/stream` smoke in `e2e_matrix_chat_stream_session_info`; no `/chat/ws` E2E |
 | sessions | `/sessions` | Yes | CRUD/close/resume/activity + DB |
 | admin | `/admin/` | No | Needs admin bootstrap |
 | learning | `/api/v1/learning/` | Yes (reads) | Health/signals/stats in `product_matrix_*` |
 | agents | `/agents` | Yes | Includes edge register path |
 | events | `/events` | Yes | |
 | skills | `/skills` | Partial | List/status; not publish/config/resources E2E |
-| evaluation | `/evaluation/` | Partial | Read-heavy; no write paths (gate/validate, drift/run, loop, training-data) |
+| evaluation | `/evaluation/` | Partial | Reads in `product_matrix_*`; POST gate/drift/loop contract in `e2e_matrix_evaluation_post_not_implemented` (**501** until DB writes exist); training-data extract/export not in system E2E |
 | introspection | `/introspection/` | Yes | |
 | branches | `/branches` | No | |
 | marketplace | `/marketplace/` | Partial | Quality report / stats / search; not full install/upgrade/rollback/credentials |
 | sandbox | `/sandbox` | Yes | |
 | workflows | `/workflows` | Partial | `GET /workflows` only |
-| platform | `/platform/` | No | e.g. `/platform/snapshot` |
+| platform | `/platform/` | Partial | `GET /platform/snapshot` in `e2e_matrix_platform_snapshot` |
 | runs | `/runs` | Partial | List in `product_matrix_*`; lifecycle in `e2e_matrix_chat_run_pause_resume_http` |
-| tasks | `/tasks` | Yes | `e2e_matrix_tasks_lease_and_db_assertions` + `agent_tasks` / `task_leases` |
+| tasks | `/tasks` | Yes | `e2e_matrix_tasks_lease_and_db_assertions` + `e2e_matrix_tasks_list_get_lease_renew` |
 
 Additional route families in `router_builder` not named above: **memory** (`/memory/*`), **context** (`/context`), **decisions** (`/decisions`), **models** (`/models`), **jobs** (`/jobs`), **triggers** (`/triggers`), **data-versioning** (`/data-versioning`), **replay** (`/sessions/.../replay`), **reflect** (`/chat/session/.../reflect`), **completions** (`/v1/chat/completions`) — see the P0/P1 table above for E2E status.
 
 ## Future work
 
 - **Runs + DB**: when `RunStateStore` is backed by Matrix for `build_server_state`, add SQL assertions alongside `e2e_matrix_chat_run_pause_resume_http`.
+- **Evaluation writes**: when `validate_gate` / `run_drift_pipeline` / `run_closed_loop` return success, change `e2e_matrix_evaluation_post_not_implemented` to assert **200** + response shape (and keep or rename the test).
 - **Branches, admin, WS, delegation**: add focused journeys + rows in this matrix.
 - **Real Memoria**: optional second target with a Memoria test double URL instead of the stub forwarder.
