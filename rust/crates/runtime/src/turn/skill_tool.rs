@@ -108,6 +108,18 @@ const DEFAULT_SKILL_LISTING_BUDGET: usize = 8_000;
 /// is loaded when a skill is actually invoked.
 const MAX_LISTING_DESC_CHARS: usize = 250;
 
+/// Truncate a string at a byte budget, respecting UTF-8 char boundaries.
+fn truncate_desc(s: &str, max_bytes: usize) -> String {
+    if s.len() <= max_bytes {
+        return s.to_string();
+    }
+    let mut end = max_bytes.saturating_sub(1);
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &s[..end])
+}
+
 /// Format a single skill's description, respecting the per-entry cap.
 fn format_skill_description(s: &SkillToolInfo) -> String {
     let mut desc = match &s.when_to_use {
@@ -118,7 +130,7 @@ fn format_skill_description(s: &SkillToolInfo) -> String {
         desc.push_str(&format!(" [aliases: {}]", s.aliases.join(", ")));
     }
     if desc.len() > MAX_LISTING_DESC_CHARS {
-        format!("{}…", &desc[..MAX_LISTING_DESC_CHARS - 1])
+        truncate_desc(&desc, MAX_LISTING_DESC_CHARS)
     } else {
         desc
     }
@@ -207,7 +219,7 @@ fn format_skills_within_budget(
         for s in &rest_skills {
             let desc = format_skill_description(s);
             let truncated = if desc.len() > max_desc {
-                format!("{}…", &desc[..max_desc.saturating_sub(1)])
+                truncate_desc(&desc, max_desc)
             } else {
                 desc
             };
@@ -1159,6 +1171,35 @@ mod tests {
         // The pinned skill should have a full description (not names-only)
         let pinned_entry = entries.iter().find(|e| e.contains("skill-7")).unwrap();
         assert!(pinned_entry.contains("Description for skill 7"));
+    }
+
+    #[test]
+    fn truncate_desc_handles_cjk_without_panic() {
+        // 3 bytes per CJK char — slicing at byte 5 would split a char
+        let cjk = "你好世界测试";
+        let result = truncate_desc(cjk, 5);
+        assert!(result.ends_with('…'));
+        // Should truncate to "你" (3 bytes) + "…", not panic
+        assert!(result.starts_with('你'));
+
+        // ASCII still works normally
+        let ascii = "hello world";
+        let result = truncate_desc(ascii, 7);
+        assert_eq!(result, "hello …");
+    }
+
+    #[test]
+    fn format_skill_description_truncates_cjk_safely() {
+        let skill = SkillToolInfo {
+            name: "cjk-skill".into(),
+            description: "这是一个很长的技能描述".repeat(30), // ~330 CJK chars = ~990 bytes
+            when_to_use: None,
+            source: SkillSourceKind::Local,
+            aliases: Vec::new(),
+        };
+        // Should not panic even with CJK content exceeding MAX_LISTING_DESC_CHARS
+        let desc = format_skill_description(&skill);
+        assert!(desc.ends_with('…'));
     }
 
     #[tokio::test]

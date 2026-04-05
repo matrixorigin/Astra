@@ -556,12 +556,16 @@ fn build_working_memory_content(messages: &[Value], max_chars: usize) -> String 
     parts.join("\n")
 }
 
-fn truncate_str(s: &str, max_chars: usize) -> &str {
-    if s.len() <= max_chars {
-        s
-    } else {
-        &s[..max_chars]
+fn truncate_str(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
     }
+    // Walk back from max_bytes to find a valid char boundary
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
 }
 
 // ---------------------------------------------------------------------------
