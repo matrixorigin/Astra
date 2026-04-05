@@ -1,3 +1,18 @@
+// Clippy 1.94 — allow backlog in the large CLI binary; refine incrementally.
+#![allow(
+    dead_code,
+    clippy::collapsible_if,
+    clippy::derivable_impls,
+    clippy::field_reassign_with_default,
+    clippy::items_after_test_module,
+    clippy::let_unit_value,
+    clippy::manual_strip,
+    clippy::needless_borrow,
+    clippy::redundant_closure,
+    clippy::single_match,
+    clippy::unnecessary_mut_passed
+)]
+
 use std::{
     borrow::Cow,
     collections::{HashMap, HashSet},

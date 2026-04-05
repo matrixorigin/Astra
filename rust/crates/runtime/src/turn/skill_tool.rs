@@ -416,8 +416,15 @@ pub async fn execute_skill_inline(
 ) -> String {
     let skill_name = args.get("skill_name").and_then(Value::as_str).unwrap_or("");
     let task_hint = args.get("task").and_then(Value::as_str).unwrap_or("");
-    let (text, _activation, _verification) =
-        execute_skill(resolver, None, skill_name, task_hint, None, &SkillContext::default()).await;
+    let (text, _activation, _verification) = execute_skill(
+        resolver,
+        None,
+        skill_name,
+        task_hint,
+        None,
+        &SkillContext::default(),
+    )
+    .await;
     text
 }
 
@@ -487,8 +494,15 @@ pub async fn partition_and_execute_skills(
                 let task_hint = args.get("task").and_then(Value::as_str).unwrap_or("");
 
                 let start = std::time::Instant::now();
-                let (text, act, verification_passed) =
-                    execute_skill(resolver, executor, skill_name, task_hint, composition_ctx, skill_ctx).await;
+                let (text, act, verification_passed) = execute_skill(
+                    resolver,
+                    executor,
+                    skill_name,
+                    task_hint,
+                    composition_ctx,
+                    skill_ctx,
+                )
+                .await;
                 let duration_ms = start.elapsed().as_millis() as u64;
 
                 // Record outcome in quality tracker
@@ -972,7 +986,15 @@ mod tests {
     #[tokio::test]
     async fn execute_skill_returns_instructions() {
         let resolver = stub_resolver();
-        let (output, activation, _) = execute_skill(&resolver, None, "code-review", "", None, &SkillContext::default()).await;
+        let (output, activation, _) = execute_skill(
+            &resolver,
+            None,
+            "code-review",
+            "",
+            None,
+            &SkillContext::default(),
+        )
+        .await;
         assert!(output.contains("# Skill: code-review"));
         assert!(output.contains("Check for bugs, security issues, and style."));
         // Activation always returned on success (even with no overrides)
@@ -984,15 +1006,30 @@ mod tests {
     #[tokio::test]
     async fn execute_skill_includes_task_hint() {
         let resolver = stub_resolver();
-        let (output, _, _) =
-            execute_skill(&resolver, None, "code-review", "Review auth module", None, &SkillContext::default()).await;
+        let (output, _, _) = execute_skill(
+            &resolver,
+            None,
+            "code-review",
+            "Review auth module",
+            None,
+            &SkillContext::default(),
+        )
+        .await;
         assert!(output.contains("**Task context:** Review auth module"));
     }
 
     #[tokio::test]
     async fn execute_skill_unknown_name() {
         let resolver = stub_resolver();
-        let (output, activation, _) = execute_skill(&resolver, None, "nonexistent", "", None, &SkillContext::default()).await;
+        let (output, activation, _) = execute_skill(
+            &resolver,
+            None,
+            "nonexistent",
+            "",
+            None,
+            &SkillContext::default(),
+        )
+        .await;
         assert!(output.contains("Failed to load skill 'nonexistent'"));
         assert!(activation.is_none());
     }
@@ -1060,8 +1097,7 @@ mod tests {
             session_id: Some("s-99".into()),
             ..Default::default()
         };
-        let (output, _, _) =
-            execute_skill(&CtxResolver, None, "ctx-test", "", None, &ctx).await;
+        let (output, _, _) = execute_skill(&CtxResolver, None, "ctx-test", "", None, &ctx).await;
         assert!(
             output.contains("/my/project"),
             "Expected work_dir in output, got: {output}"
@@ -1099,8 +1135,15 @@ mod tests {
             }),
         ];
 
-        let (skill_results, remaining, _activation) =
-            partition_and_execute_skills(&tool_calls, &resolver, None, None, None, &SkillContext::default()).await;
+        let (skill_results, remaining, _activation) = partition_and_execute_skills(
+            &tool_calls,
+            &resolver,
+            None,
+            None,
+            None,
+            &SkillContext::default(),
+        )
+        .await;
 
         assert_eq!(skill_results.len(), 2);
         assert_eq!(remaining.len(), 1);
@@ -1125,8 +1168,15 @@ mod tests {
             }
         })];
 
-        let (results, remaining, _) =
-            partition_and_execute_skills(&tool_calls, &resolver, None, None, None, &SkillContext::default()).await;
+        let (results, remaining, _) = partition_and_execute_skills(
+            &tool_calls,
+            &resolver,
+            None,
+            None,
+            None,
+            &SkillContext::default(),
+        )
+        .await;
         assert_eq!(results.len(), 1);
         assert!(results[0].1.contains("Invalid skill arguments"));
         assert_eq!(remaining.len(), 0);
@@ -1399,8 +1449,15 @@ mod tests {
             }
         }
 
-        let (output, activation, _) =
-            execute_skill(&ToolRestrictedResolver, None, "restricted", "", None, &SkillContext::default()).await;
+        let (output, activation, _) = execute_skill(
+            &ToolRestrictedResolver,
+            None,
+            "restricted",
+            "",
+            None,
+            &SkillContext::default(),
+        )
+        .await;
         assert!(output.contains("**Allowed tools for this skill:** bash, read_file"));
         // allowed_tools set → activation returned
         let act = activation.unwrap();
@@ -1436,8 +1493,15 @@ mod tests {
             }
         }
 
-        let (_, activation, _) =
-            execute_skill(&ModelOverrideResolver, None, "fancy", "", None, &SkillContext::default()).await;
+        let (_, activation, _) = execute_skill(
+            &ModelOverrideResolver,
+            None,
+            "fancy",
+            "",
+            None,
+            &SkillContext::default(),
+        )
+        .await;
         let act = activation.unwrap();
         assert_eq!(act.model_override.as_deref(), Some("gpt-4o"));
         assert_eq!(act.allowed_tools, vec!["bash"]);
@@ -1446,7 +1510,15 @@ mod tests {
     #[tokio::test]
     async fn execute_skill_activation_always_returned_for_successful_resolve() {
         let resolver = stub_resolver();
-        let (_, activation, _) = execute_skill(&resolver, None, "code-review", "", None, &SkillContext::default()).await;
+        let (_, activation, _) = execute_skill(
+            &resolver,
+            None,
+            "code-review",
+            "",
+            None,
+            &SkillContext::default(),
+        )
+        .await;
         // Activation is always returned on success so the loop can clear stale overrides
         let act = activation.unwrap();
         assert!(act.model_override.is_none());
@@ -1456,7 +1528,15 @@ mod tests {
     #[tokio::test]
     async fn execute_skill_failure_returns_none_activation() {
         let resolver = stub_resolver();
-        let (output, activation, _) = execute_skill(&resolver, None, "nonexistent", "", None, &SkillContext::default()).await;
+        let (output, activation, _) = execute_skill(
+            &resolver,
+            None,
+            "nonexistent",
+            "",
+            None,
+            &SkillContext::default(),
+        )
+        .await;
         assert!(output.contains("Failed to load skill"));
         assert!(activation.is_none());
     }
@@ -1759,8 +1839,15 @@ mod tests {
             }),
         ];
 
-        let (results, remaining, activation) =
-            partition_and_execute_skills(&tool_calls, &MultiResolver, None, None, None, &SkillContext::default()).await;
+        let (results, remaining, activation) = partition_and_execute_skills(
+            &tool_calls,
+            &MultiResolver,
+            None,
+            None,
+            None,
+            &SkillContext::default(),
+        )
+        .await;
 
         assert_eq!(results.len(), 2);
         assert!(remaining.is_empty());
@@ -1815,8 +1902,15 @@ mod tests {
             }),
         ];
 
-        let (results, _, activation) =
-            partition_and_execute_skills(&tool_calls, &PartialResolver, None, None, None, &SkillContext::default()).await;
+        let (results, _, activation) = partition_and_execute_skills(
+            &tool_calls,
+            &PartialResolver,
+            None,
+            None,
+            None,
+            &SkillContext::default(),
+        )
+        .await;
 
         assert_eq!(results.len(), 2);
         assert!(results[0].1.contains("# Skill: good"));
@@ -1969,8 +2063,15 @@ mod tests {
             ctx = ctx.child(&format!("level-{i}"), None);
         }
 
-        let (output, _, _) =
-            execute_skill(&AnyResolver, None, "too-deep", "work", Some(&ctx), &SkillContext::default()).await;
+        let (output, _, _) = execute_skill(
+            &AnyResolver,
+            None,
+            "too-deep",
+            "work",
+            Some(&ctx),
+            &SkillContext::default(),
+        )
+        .await;
         assert!(
             output.contains("depth"),
             "Expected depth error, got: {output}"
@@ -2061,8 +2162,15 @@ mod tests {
         }
 
         // The execute_skill builds args as {"task": "..."}, which won't have "target_path"
-        let (output, _, _) =
-            execute_skill(&SchemaResolver, None, "schema-skill", "do stuff", None, &SkillContext::default()).await;
+        let (output, _, _) = execute_skill(
+            &SchemaResolver,
+            None,
+            "schema-skill",
+            "do stuff",
+            None,
+            &SkillContext::default(),
+        )
+        .await;
         assert!(
             output.contains("validation failed"),
             "Expected validation error, got: {output}"

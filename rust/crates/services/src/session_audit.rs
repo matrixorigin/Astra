@@ -21,6 +21,15 @@ fn normalize_tool_name(name: String) -> String {
     }
 }
 
+/// `SUBSTRING(..., 1, N)` caps for `agent_events.content` to avoid full LONGTEXT reads.
+/// JSON columns (`metadata`, `token_usage`) are left intact so parsing stays valid.
+mod agent_events_content_cap {
+    pub const TURN_LIST_PREVIEW: u32 = 200;
+    pub const TURN_DETAIL_CHILD: u32 = 65_536;
+    pub const TOOL_LAST_ERROR: u32 = 2048;
+    pub const ERROR_LIST_ENTRY: u32 = 8192;
+}
+
 // ── Response types ───────────────────────────────────────────────────────────
 
 /// High-level session audit summary.
@@ -543,21 +552,25 @@ impl SessionAuditService for DatabaseSessionAuditService {
         .map_err(internal_error)?;
         let total: i64 = count_row.try_get("cnt").unwrap_or(0);
 
-        // Fetch turn events with pagination
-        let rows = query(
-            "SELECT event_id, content, token_usage, llm_model_used, metadata, created_at \
+        // Fetch turn events with pagination (cap content in SQL — matches preview length)
+        let turn_sql = format!(
+            "SELECT event_id, \
+             SUBSTRING(COALESCE(CAST(content AS CHAR), ''), 1, {}) AS content, \
+             token_usage, llm_model_used, metadata, created_at \
              FROM agent_events \
              WHERE session_id = ? AND user_id = ? AND event_type = 'turn' \
              ORDER BY created_at ASC \
              LIMIT ? OFFSET ?",
-        )
-        .bind(session_id)
-        .bind(user_id)
-        .bind(per_page)
-        .bind(offset)
-        .fetch_all(&pool)
-        .await
-        .map_err(internal_error)?;
+            agent_events_content_cap::TURN_LIST_PREVIEW
+        );
+        let rows = query(&turn_sql)
+            .bind(session_id)
+            .bind(user_id)
+            .bind(per_page)
+            .bind(offset)
+            .fetch_all(&pool)
+            .await
+            .map_err(internal_error)?;
 
         let turns: Vec<TurnSummary> = rows
             .iter()
@@ -672,19 +685,23 @@ impl SessionAuditService for DatabaseSessionAuditService {
             .and_then(|v| serde_json::from_value(v.clone()).ok())
             .unwrap_or_default();
 
-        // Fetch child events (tool_call, tool_error) linked via parent_event_id
-        let child_rows = query(
-            "SELECT event_id, event_type, content, metadata, created_at \
+        // Child events may carry huge tool I/O; cap content at the SQL layer.
+        let child_sql = format!(
+            "SELECT event_id, event_type, \
+             SUBSTRING(COALESCE(CAST(content AS CHAR), ''), 1, {}) AS content, \
+             metadata, created_at \
              FROM agent_events \
              WHERE session_id = ? AND user_id = ? AND parent_event_id = ? \
              ORDER BY created_at ASC",
-        )
-        .bind(session_id)
-        .bind(user_id)
-        .bind(&event_id)
-        .fetch_all(&pool)
-        .await
-        .map_err(internal_error)?;
+            agent_events_content_cap::TURN_DETAIL_CHILD
+        );
+        let child_rows = query(&child_sql)
+            .bind(session_id)
+            .bind(user_id)
+            .bind(&event_id)
+            .fetch_all(&pool)
+            .await
+            .map_err(internal_error)?;
 
         let child_events: Vec<ChildEvent> = child_rows
             .iter()
@@ -784,17 +801,20 @@ impl SessionAuditService for DatabaseSessionAuditService {
         .await
         .map_err(internal_error)?;
 
-        let error_rows = query(
-            "SELECT meta_tool_name AS tool_name, content \
+        let err_sql = format!(
+            "SELECT meta_tool_name AS tool_name, \
+             SUBSTRING(COALESCE(CAST(content AS CHAR), ''), 1, {}) AS content \
              FROM agent_events \
              WHERE session_id = ? AND user_id = ? AND event_type = 'tool_error' \
              ORDER BY created_at DESC LIMIT 200",
-        )
-        .bind(session_id)
-        .bind(user_id)
-        .fetch_all(&pool)
-        .await
-        .map_err(internal_error)?;
+            agent_events_content_cap::TOOL_LAST_ERROR
+        );
+        let error_rows = query(&err_sql)
+            .bind(session_id)
+            .bind(user_id)
+            .fetch_all(&pool)
+            .await
+            .map_err(internal_error)?;
         let mut latest_errors = std::collections::HashMap::<String, String>::new();
         for row in error_rows {
             let tool_name = normalize_tool_name(row.try_get("tool_name").unwrap_or_default());
@@ -849,19 +869,23 @@ impl SessionAuditService for DatabaseSessionAuditService {
         self.verify_session_owner(&pool, session_id, user_id)
             .await?;
 
-        let rows = query(
-            "SELECT event_id, event_type, content, metadata, created_at \
+        let list_err_sql = format!(
+            "SELECT event_id, event_type, \
+             SUBSTRING(COALESCE(CAST(content AS CHAR), ''), 1, {}) AS content, \
+             metadata, created_at \
              FROM agent_events \
              WHERE session_id = ? AND user_id = ? \
                AND event_type IN ('turn_error', 'stall_detected', 'error', 'turn_guard_verdict', 'tool_error') \
              ORDER BY created_at ASC \
              LIMIT 200",
-        )
-        .bind(session_id)
-        .bind(user_id)
-        .fetch_all(&pool)
-        .await
-        .map_err(internal_error)?;
+            agent_events_content_cap::ERROR_LIST_ENTRY
+        );
+        let rows = query(&list_err_sql)
+            .bind(session_id)
+            .bind(user_id)
+            .fetch_all(&pool)
+            .await
+            .map_err(internal_error)?;
 
         let errors: Vec<AuditErrorEntry> = rows
             .iter()
@@ -1210,10 +1234,12 @@ impl SessionAuditService for DatabaseSessionAuditService {
         let rows = q.fetch_all(&pool).await.map_err(internal_error)?;
 
         let mut error_sql = format!(
-            "SELECT meta_tool_name AS tool_name, content \
+            "SELECT meta_tool_name AS tool_name, \
+             SUBSTRING(COALESCE(CAST(content AS CHAR), ''), 1, {cap}) AS content \
              FROM agent_events e \
              WHERE {where_clause} AND event_type = 'tool_error' \
-             ORDER BY created_at DESC"
+             ORDER BY created_at DESC",
+            cap = agent_events_content_cap::TOOL_LAST_ERROR
         );
         if !rows.is_empty() {
             error_sql.push_str(" LIMIT 500");

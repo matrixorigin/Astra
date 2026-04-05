@@ -240,7 +240,7 @@ impl IntrospectionService for DatabaseIntrospectionService {
         // Profile memories
         let profile = {
             let rows = query(
-                "SELECT CAST(content AS CHAR) AS content FROM mem_memories \
+                "SELECT SUBSTRING(CAST(content AS CHAR), 1, 8192) AS content FROM mem_memories \
                  WHERE user_id = ? AND is_active = 1 AND memory_type = 'profile' \
                  ORDER BY updated_at DESC LIMIT 20",
             )
@@ -717,7 +717,7 @@ impl IntrospectionService for DatabaseIntrospectionService {
             .collect();
 
         let rows = query(
-            "SELECT memory_id, CAST(content AS CHAR) AS content, \
+            "SELECT memory_id, SUBSTRING(CAST(content AS CHAR), 1, 32768) AS content, \
                     initial_confidence, observed_at, created_at \
              FROM mem_memories \
              WHERE user_id = ? AND is_active = 1 \

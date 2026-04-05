@@ -14,7 +14,7 @@ use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 
 thread_local! {
-    static LOCAL_SESSIONS_DIR_OVERRIDE: RefCell<Option<PathBuf>> = RefCell::new(None);
+    static LOCAL_SESSIONS_DIR_OVERRIDE: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
 }
 
 /// Resolved local `sessions` directory (`~/.astra/sessions` or a per-thread override).
@@ -44,10 +44,7 @@ pub struct JournalDirGuard {
 impl JournalDirGuard {
     pub fn new(dir: impl AsRef<Path>) -> Self {
         let dir = dir.as_ref().to_path_buf();
-        let previous = LOCAL_SESSIONS_DIR_OVERRIDE.with(|c| {
-            let mut slot = c.borrow_mut();
-            std::mem::replace(&mut *slot, Some(dir))
-        });
+        let previous = LOCAL_SESSIONS_DIR_OVERRIDE.with(|c| (*c.borrow_mut()).replace(dir));
         Self { previous }
     }
 }

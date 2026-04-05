@@ -919,7 +919,7 @@ async fn run_migration(
 ) -> Result<(), sqlx::Error> {
     let already_applied: bool = query("SELECT 1 FROM schema_migrations WHERE version = ?")
         .bind(version)
-        .fetch_optional(&*pool)
+        .fetch_optional(pool)
         .await?
         .is_some();
 
@@ -927,12 +927,12 @@ async fn run_migration(
         return Ok(());
     }
 
-    query(sql).execute(&*pool).await?;
+    query(sql).execute(pool).await?;
 
     query("INSERT INTO schema_migrations (version, description) VALUES (?, ?)")
         .bind(version)
         .bind(description)
-        .execute(&*pool)
+        .execute(pool)
         .await?;
 
     Ok(())

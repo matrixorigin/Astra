@@ -254,7 +254,7 @@ impl DataVersioningService for DatabaseDataVersioningService {
 
         let rows = query(
             "SELECT event_id, session_id, event_type, \
-             IFNULL(CAST(content AS CHAR), '') AS content, \
+             SUBSTRING(IFNULL(CAST(content AS CHAR), ''), 1, 500) AS content, \
              DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s') AS created_at \
               FROM agent_events \
               WHERE user_id = ? AND created_at <= ? \
@@ -309,7 +309,7 @@ impl DataVersioningService for DatabaseDataVersioningService {
 
         let rows = query(
             "SELECT event_id, event_type, \
-             IFNULL(CAST(content AS CHAR), '') AS content, \
+             SUBSTRING(IFNULL(CAST(content AS CHAR), ''), 1, 500) AS content, \
              parent_event_id, causal_chain_id, \
              DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s') AS created_at \
               FROM agent_events \
@@ -358,7 +358,7 @@ impl DataVersioningService for DatabaseDataVersioningService {
 
             let row = query(
                 "SELECT event_id, event_type, \
-                 IFNULL(CAST(content AS CHAR), '') AS content, \
+                 SUBSTRING(IFNULL(CAST(content AS CHAR), ''), 1, 500) AS content, \
                  parent_event_id, causal_chain_id, \
                  DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s') AS created_at \
                  FROM agent_events WHERE event_id = ? AND user_id = ?",

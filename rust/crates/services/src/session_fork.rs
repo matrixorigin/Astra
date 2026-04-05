@@ -243,7 +243,7 @@ pub enum ExploreError {
     /// Some branches were created before a fork failed.
     /// The caller is responsible for cleaning up `created`.
     PartialFailure {
-        created: ExploreResult,
+        created: Box<ExploreResult>,
         failed_branch: usize,
         total_branches: usize,
         error: String,
@@ -263,8 +263,8 @@ impl std::fmt::Display for ExploreError {
                 f,
                 "branch {failed_branch}/{total_branches} failed: {error} \
                  ({} branches already created: [{}])",
-                created.branch_session_ids.len(),
-                created.branch_session_ids.join(", "),
+                created.as_ref().branch_session_ids.len(),
+                created.as_ref().branch_session_ids.join(", "),
             ),
         }
     }
@@ -277,7 +277,7 @@ impl ExploreError {
     pub fn into_partial_result(self) -> Option<ExploreResult> {
         match self {
             Self::Setup(_) => None,
-            Self::PartialFailure { created, .. } => Some(created),
+            Self::PartialFailure { created, .. } => Some(*created),
         }
     }
 }
@@ -327,7 +327,7 @@ pub fn create_exploration_branches(opts: &ExploreOptions) -> Result<ExploreResul
                     ExploreError::Setup(e)
                 } else {
                     ExploreError::PartialFailure {
-                        created: result,
+                        created: Box::new(result),
                         failed_branch: i + 1,
                         total_branches: opts.branch_count,
                         error: e,

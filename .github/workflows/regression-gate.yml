@@ -79,7 +79,7 @@ jobs:
       - name: Run regression gate
         id: gate
         run: |
-          if cargo test --manifest-path rust/Cargo.toml -p mo-agent-runtime --test evaluation_contract; then
+          if cargo test --manifest-path rust/Cargo.toml -p astra-runtime --test evaluation_contract; then
             echo '{"verdict":"pass","summary":"Rust evaluation contracts passed"}' > gate_result.json
           else
             echo '{"verdict":"fail","summary":"Rust evaluation contracts failed"}' > gate_result.json

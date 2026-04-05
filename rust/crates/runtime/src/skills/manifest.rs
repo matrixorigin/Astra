@@ -722,7 +722,7 @@ mod tests {
             ("42", "42"),
         ] {
             let level = EffortLevel::parse(input).unwrap();
-            assert_eq!(level.as_str(), *expected);
+            assert_eq!(level.to_string(), *expected);
         }
     }
 
