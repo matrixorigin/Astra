@@ -145,30 +145,6 @@ pub async fn post_empty(app: &Router, path: &str, auth: Option<&str>) -> (Status
     (status, json)
 }
 
-/// POST with empty body and extra headers (e.g. `x-user-id` for evaluation routes).
-pub async fn post_empty_with_headers(
-    app: &Router,
-    path: &str,
-    auth: Option<&str>,
-    extra_headers: &[(&str, &str)],
-) -> (StatusCode, Value) {
-    let mut req = Request::builder().method("POST").uri(path);
-    if let Some(t) = auth {
-        req = req.header("authorization", t);
-    }
-    for (k, v) in extra_headers {
-        req = req.header(*k, *v);
-    }
-    let req = req.body(Body::empty()).expect("request");
-    let response = app.clone().oneshot(req).await.expect("oneshot");
-    let status = response.status();
-    let bytes = body::to_bytes(response.into_body(), 8 * 1024 * 1024)
-        .await
-        .expect("body");
-    let json: Value = serde_json::from_slice(&bytes).unwrap_or(json!({}));
-    (status, json)
-}
-
 /// POST JSON and collect the response body as UTF-8 (for small buffered SSE bodies).
 pub async fn post_json_collect_body_text(
     app: &Router,

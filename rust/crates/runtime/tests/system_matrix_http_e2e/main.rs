@@ -2,23 +2,20 @@
 //!
 //! ## Tests in this binary
 //! - **`product_matrix_api_journey_hits_multiple_tables`** — full product journey (sessions → agents →
-//!   events → jobs → `chat/turn` SSE + `agent_events` assertions → logout). Same coverage as the
-//!   historical monolithic test.
-//! - **`e2e_matrix_basic_auth_session_lifecycle`** — register/bootstrap, session list/get/put,
-//!   close/resume + `agent_sessions` status, activity, logout.
-//! - **`e2e_matrix_tasks_lease_and_db_assertions`** — `POST /tasks`, `agent_tasks` row, edge
-//!   register, lease claim/release, `task_leases` + `PUT /tasks/{id}/status` + `agent_tasks`.
+//!   events → jobs → `chat/turn` SSE + `agent_events` assertions → logout), including
+//!   `GET /platform/snapshot` after session activity.
+//! - **`e2e_matrix_tasks_lease_and_db_assertions`** — `POST /tasks`, `GET /tasks`, `GET /tasks/{id}`,
+//!   `GET .../progress`, edge register, lease claim / `GET` lease / renew / release, `task_leases` +
+//!   `PUT /tasks/{id}/status` + `agent_tasks`.
 //! - **`e2e_matrix_chat_run_pause_resume_http`** — `POST /chat` (background run), immediate
 //!   pause/resume + `GET /chat/runs/{run_id}` (run state is in-memory + optional engine; no Matrix
 //!   table assertion today).
-//! - **`e2e_matrix_platform_snapshot`** — `GET /platform/snapshot` (health + agents/sessions/events).
 //! - **`e2e_matrix_session_cancel_delete`** — `POST .../cancel` + DB `cancelled`, then `DELETE` + 404.
-//! - **`e2e_matrix_tasks_list_get_lease_renew`** — `GET /tasks`, `GET /task`, `GET .../progress`,
-//!   lease claim → `GET .../lease` → renew → release.
-//! - **`e2e_matrix_evaluation_post_not_implemented`** — `POST` gate/drift/loop return **501** until DB
-//!   evaluation writes land (contract test).
 //! - **`e2e_matrix_chat_stream_session_info`** — `POST /chat/stream` buffered SSE; first `session_info`
 //!   event contains `run_id`.
+//!
+//! Session list/get/put, close/resume, activity, and DB checks for close/resume live only in the full
+//! journey (not duplicated in a separate test).
 //!
 //! External dependencies remain mocked where the product already allows it:
 //! - LLM: `test_llm_rounds` + `bridge-e2e-hooks` on `/chat/turn` (no external model server).
@@ -38,7 +35,6 @@
 //! See `docs/testing/system-e2e-matrix.md` for the capability ↔ route ↔ test mapping.
 
 mod harness;
-mod journey_basic;
 mod journey_extended;
 mod journey_full;
 mod journey_tasks_runs;
@@ -57,13 +53,6 @@ async fn product_matrix_api_journey_hits_multiple_tables() {
 
 #[tokio::test]
 #[ignore = "live MatrixOne + full secrets; MO_AGENT_SYSTEM_MATRIX_E2E=1 — see module doc"]
-async fn e2e_matrix_basic_auth_session_lifecycle() {
-    require_system_e2e_env();
-    journey_basic::run_basic_auth_session_lifecycle().await;
-}
-
-#[tokio::test]
-#[ignore = "live MatrixOne + full secrets; MO_AGENT_SYSTEM_MATRIX_E2E=1 — see module doc"]
 async fn e2e_matrix_tasks_lease_and_db_assertions() {
     require_system_e2e_env();
     journey_tasks_runs::run_tasks_lease_with_db_assertions().await;
@@ -78,30 +67,9 @@ async fn e2e_matrix_chat_run_pause_resume_http() {
 
 #[tokio::test]
 #[ignore = "live MatrixOne + full secrets; MO_AGENT_SYSTEM_MATRIX_E2E=1 — see module doc"]
-async fn e2e_matrix_platform_snapshot() {
-    require_system_e2e_env();
-    journey_extended::run_platform_snapshot_smoke().await;
-}
-
-#[tokio::test]
-#[ignore = "live MatrixOne + full secrets; MO_AGENT_SYSTEM_MATRIX_E2E=1 — see module doc"]
 async fn e2e_matrix_session_cancel_delete() {
     require_system_e2e_env();
     journey_extended::run_session_cancel_then_delete().await;
-}
-
-#[tokio::test]
-#[ignore = "live MatrixOne + full secrets; MO_AGENT_SYSTEM_MATRIX_E2E=1 — see module doc"]
-async fn e2e_matrix_tasks_list_get_lease_renew() {
-    require_system_e2e_env();
-    journey_extended::run_tasks_list_get_lease_read_renew().await;
-}
-
-#[tokio::test]
-#[ignore = "live MatrixOne + full secrets; MO_AGENT_SYSTEM_MATRIX_E2E=1 — see module doc"]
-async fn e2e_matrix_evaluation_post_not_implemented() {
-    require_system_e2e_env();
-    journey_extended::run_evaluation_post_writes_not_implemented_yet().await;
 }
 
 #[tokio::test]

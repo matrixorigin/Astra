@@ -1,11 +1,12 @@
-//! P0 gaps: `/tasks` + lease persistence, `/chat` run pause/resume (HTTP; run store is in-memory in `build_server_state`).
+//! `/tasks` list/get/progress + lease claim/GET/renew/release + `agent_tasks` / `task_leases` SQL;
+//! `/chat` run pause/resume (HTTP only; run store is in-memory in `build_server_state`).
 use axum::http::StatusCode;
 use serde_json::json;
 use sqlx::Row;
 use tower::util::ServiceExt;
 
 use super::harness::{
-    bootstrap, cleanup_task_rows, get_json, post_empty, post_json, post_json_with_headers,
+    bootstrap, cleanup_task_rows, get_json, post_empty, post_json, post_json_with_headers, put_json,
 };
 
 pub async fn run_tasks_lease_with_db_assertions() {
@@ -57,6 +58,39 @@ pub async fn run_tasks_lease_with_db_assertions() {
     assert_eq!(
         row.try_get::<String, _>("status").ok().as_deref(),
         Some("pending")
+    );
+
+    let (st_list, list_j) = get_json(app, "/tasks", Some(auth.as_str()), &[]).await;
+    assert_eq!(st_list, StatusCode::OK, "list tasks: {list_j}");
+    let tasks = list_j["tasks"].as_array().expect("tasks array");
+    assert!(
+        tasks
+            .iter()
+            .any(|t| t["task_id"].as_str() == Some(task_id.as_str())),
+        "list should include {task_id}: {list_j}"
+    );
+
+    let (st_get, get_j) = get_json(
+        app,
+        &format!("/tasks/{task_id}"),
+        Some(auth.as_str()),
+        &[],
+    )
+    .await;
+    assert_eq!(st_get, StatusCode::OK, "get task: {get_j}");
+    assert_eq!(get_j["task_id"].as_str(), Some(task_id.as_str()));
+
+    let (st_prog, prog_j) = get_json(
+        app,
+        &format!("/tasks/{task_id}/progress?session_id={session_id}"),
+        Some(auth.as_str()),
+        &[],
+    )
+    .await;
+    assert_eq!(st_prog, StatusCode::OK, "task progress: {prog_j}");
+    assert!(
+        prog_j["progress_events"].is_array(),
+        "progress_events: {prog_j}"
     );
 
     let edge_reg = axum::http::Request::builder()
@@ -115,6 +149,29 @@ pub async fn run_tasks_lease_with_db_assertions() {
         Some("matrix-e2e-edge")
     );
 
+    let (st_lease, lease_j) = get_json(
+        app,
+        &format!("/tasks/{task_id}/lease"),
+        Some(auth.as_str()),
+        &[],
+    )
+    .await;
+    assert_eq!(st_lease, StatusCode::OK, "get lease: {lease_j}");
+    assert!(
+        !lease_j["lease"].is_null() || lease_j.get("holder_agent_id").is_some(),
+        "expected lease payload, got {lease_j}"
+    );
+
+    let (st_renew, renew_j) = post_json_with_headers(
+        app,
+        &format!("/tasks/{task_id}/lease/renew"),
+        Some(auth.as_str()),
+        &[("x-mo-edge-id", "matrix-e2e-edge")],
+        json!({ "edge_agent_id": edge_agent_id, "ttl_sec": 600 }),
+    )
+    .await;
+    assert_eq!(st_renew, StatusCode::OK, "lease renew: {renew_j}");
+
     let (st_rel, rel_j) = post_json_with_headers(
         app,
         &format!("/tasks/{task_id}/lease/release"),
@@ -126,7 +183,7 @@ pub async fn run_tasks_lease_with_db_assertions() {
     assert_eq!(st_rel, StatusCode::OK, "lease release: {rel_j}");
     assert_eq!(rel_j["released"], true);
 
-    let (st_put, put_j) = super::harness::put_json(
+    let (st_put, put_j) = put_json(
         app,
         &format!("/tasks/{task_id}/status"),
         Some(auth.as_str()),
