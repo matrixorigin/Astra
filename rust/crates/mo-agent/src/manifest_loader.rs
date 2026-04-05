@@ -12,7 +12,7 @@
 //!
 #![allow(dead_code)] // Module provides future extensibility APIs
 //! Example manifest with tools:
-//! ```yaml
+//! ```text
 //! name: kubernetes
 //! version: "1.0.0"
 //! description: "Kubernetes cluster management"

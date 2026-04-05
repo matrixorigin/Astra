@@ -173,7 +173,7 @@ fn load_styles_from_dir(dir: &PathBuf, source: StyleSource) -> Vec<OutputStyle> 
 /// Parse a style file, extracting optional YAML frontmatter.
 ///
 /// Format:
-/// ```markdown
+/// ```text
 /// ---
 /// description: My custom style
 /// keep_coding_instructions: false

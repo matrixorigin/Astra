@@ -5819,7 +5819,8 @@ Done!"#;
         assert_eq!(qs[0].options, vec!["JWT", "Session"]);
     }
 
-    /// Pretty-printed array inside a ```json fence (plan mode often emits this).
+    /// Detects clarification when the model wraps questions in a pretty-printed JSON array
+    /// inside a markdown code fence labeled `json` (common in plan mode).
     #[test]
     fn detect_clarification_pretty_json_in_fence() {
         let llm_text = r#"Here are a few questions:

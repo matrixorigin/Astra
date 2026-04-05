@@ -7,7 +7,7 @@
 //! ## Protocol
 //!
 //! **Client → Server** (JSON text frames):
-//! ```json
+//! ```text
 //! {"type": "auth", "token": "Bearer ..."}
 //! {"type": "message", "content": "...", "session_id": "...", "model": "..."}
 //! {"type": "cancel_run", "run_id": "..."}
@@ -16,7 +16,7 @@
 //! ```
 //!
 //! **Server → Client** (JSON text frames):
-//! ```json
+//! ```text
 //! {"type": "auth_ok", "user_id": "...", "username": "..."}
 //! {"type": "auth_error", "message": "..."}
 //! {"type": "session_info", "session_id": "..."}

@@ -6,7 +6,7 @@
 //!
 //! # File Format
 //!
-//! ```markdown
+//! ```text
 //! ---
 //! name: diagnose
 //! description: "Run a structured diagnostic on the current project"
