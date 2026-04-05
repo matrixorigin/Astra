@@ -425,9 +425,10 @@ fn show_tools(view: Option<&TurnMessagesView>, summary: &TurnSummary) {
             theme::icon_err()
         };
         let preview = tc.args_preview.as_deref().unwrap_or("");
+        let display_name = format_debug_tool_name(&tc.name, preview);
         eprintln!(
             "  {status} {} {}  {}",
-            tc.name.as_str().cyan(),
+            display_name.cyan(),
             format!("({}B→{}B)", tc.input_bytes, tc.output_bytes).dim(),
             truncate(preview, 80).dim(),
         );
@@ -916,6 +917,37 @@ fn read_line() -> Option<String> {
     Some(buf)
 }
 
+/// Produce a descriptive tool name for debug display.
+/// `"skill"` → `"Skill: <name>"` (extracted from args_preview JSON `skill_name` field).
+/// MCP tools (`mcp_<server>_<tool>`) → `"MCP <server>: <tool>"`.
+fn format_debug_tool_name(raw_name: &str, args_preview: &str) -> String {
+    if raw_name == "skill" {
+        if let Some(start) = args_preview.find("\"skill_name\"") {
+            let rest = &args_preview[start..];
+            if let Some(colon) = rest.find(':') {
+                let after_colon = rest[colon + 1..].trim_start();
+                let name = after_colon
+                    .trim_start_matches('"')
+                    .split('"')
+                    .next()
+                    .unwrap_or("?");
+                return format!("Skill: {name}");
+            }
+        }
+        return "Skill".to_string();
+    }
+    if raw_name.starts_with("mcp_") {
+        let rest = &raw_name[4..]; // strip "mcp_"
+        if let Some(sep) = rest.find('_') {
+            let server = &rest[..sep];
+            let tool = &rest[sep + 1..];
+            return format!("MCP {server}: {tool}");
+        }
+        return format!("MCP: {rest}");
+    }
+    raw_name.to_string()
+}
+
 fn truncate(s: &str, max: usize) -> String {
     let flat = s.replace('\n', "\\n");
     if flat.len() <= max {
@@ -1170,5 +1202,36 @@ mod tests {
         assert_eq!(v.delta.len(), 1);
         assert_eq!(v.full.len(), 2);
         assert_eq!(v.warning, None);
+    }
+
+    // ── format_debug_tool_name ──────────────────────────────────────────
+
+    #[test]
+    fn debug_tool_name_skill_with_name() {
+        let args = r#"{"skill_name": "code-review", "input": "..."}"#;
+        assert_eq!(format_debug_tool_name("skill", args), "Skill: code-review");
+    }
+
+    #[test]
+    fn debug_tool_name_skill_no_args() {
+        assert_eq!(format_debug_tool_name("skill", ""), "Skill");
+    }
+
+    #[test]
+    fn debug_tool_name_mcp_with_server() {
+        assert_eq!(
+            format_debug_tool_name("mcp_github_get_pr", ""),
+            "MCP github: get_pr"
+        );
+    }
+
+    #[test]
+    fn debug_tool_name_mcp_no_tool() {
+        assert_eq!(format_debug_tool_name("mcp_github", ""), "MCP: github");
+    }
+
+    #[test]
+    fn debug_tool_name_regular_tool() {
+        assert_eq!(format_debug_tool_name("bash", ""), "bash");
     }
 }
