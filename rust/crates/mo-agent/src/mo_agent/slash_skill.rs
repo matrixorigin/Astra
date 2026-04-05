@@ -940,10 +940,49 @@ Follow these steps:
             }
         }
 
+        "pin" => {
+            let skill_name = sub_arg.trim();
+            if skill_name.is_empty() {
+                if state.pinned_skills.is_empty() {
+                    eprintln!("  {}", "No pinned skills.".dim());
+                } else {
+                    eprintln!("  {}", "Pinned skills:".bold());
+                    for name in &state.pinned_skills {
+                        eprintln!("    📌 {name}");
+                    }
+                }
+                return Ok(());
+            }
+            // Verify the skill exists
+            let registry = &state.unified_skill_registry;
+            if registry.get_loaded_skill(skill_name).is_none() {
+                eprintln!("{}", format!("  Skill '{skill_name}' not found.").yellow());
+                return Ok(());
+            }
+            if state.pinned_skills.insert(skill_name.to_string()) {
+                eprintln!("  📌 Pinned skill '{skill_name}' — always included in budget.");
+            } else {
+                eprintln!("  Already pinned: '{skill_name}'");
+            }
+        }
+
+        "unpin" => {
+            let skill_name = sub_arg.trim();
+            if skill_name.is_empty() {
+                eprintln!("{}", "  Usage: /skill unpin <name>".yellow());
+                return Ok(());
+            }
+            if state.pinned_skills.remove(skill_name) {
+                eprintln!("  Unpinned skill '{skill_name}'.");
+            } else {
+                eprintln!("{}", format!("  Skill '{skill_name}' was not pinned.").yellow());
+            }
+        }
+
         _ => {
             eprintln!(
                         "{}",
-                        format!("  Unknown /skill subcommand: '{sub}'. Try /skill list, /skill search, /skill search-remote, /skill info, /skill new, /skill test, /skill dev, /skill doctor, /skill stats, /skill compose-info, /skill upload-quality").yellow()
+                        format!("  Unknown /skill subcommand: '{sub}'. Try /skill list, /skill search, /skill search-remote, /skill info, /skill new, /skill test, /skill dev, /skill doctor, /skill stats, /skill pin, /skill unpin, /skill compose-info, /skill upload-quality").yellow()
                     );
         }
     }

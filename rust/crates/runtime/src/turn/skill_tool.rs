@@ -123,6 +123,7 @@ fn format_skills_within_budget(
     skills: &[SkillToolInfo],
     budget: usize,
     quality_tracker: Option<&crate::skills::quality::SkillQualityTracker>,
+    pinned_skills: Option<&std::collections::HashSet<String>>,
 ) -> (Vec<String>, Vec<String>) {
     if skills.is_empty() {
         return (Vec::new(), Vec::new());
@@ -141,11 +142,12 @@ fn format_skills_within_budget(
         return (full_entries, all_names);
     }
 
-    // Partition into bundled (never truncated) and rest
+    // Partition into priority (bundled + pinned, never truncated) and rest
     let mut bundled_entries = Vec::new();
     let mut rest_skills: Vec<&SkillToolInfo> = Vec::new();
     for (i, s) in skills.iter().enumerate() {
-        if s.source == SkillSourceKind::Bundled {
+        let is_pinned = pinned_skills.map_or(false, |p| p.contains(&s.name));
+        if s.source == SkillSourceKind::Bundled || is_pinned {
             bundled_entries.push(full_entries[i].clone());
         } else {
             rest_skills.push(s);
@@ -202,9 +204,13 @@ fn format_skills_within_budget(
 /// The schema includes an enum of available skill names so the LLM can only
 /// call skills that actually exist. Descriptions are budget-capped to avoid
 /// blowing up the context window with many skills.
-pub fn skill_tool_schema(skills: &[SkillToolInfo]) -> Value {
+pub fn skill_tool_schema(
+    skills: &[SkillToolInfo],
+    quality_tracker: Option<&crate::skills::quality::SkillQualityTracker>,
+    pinned_skills: Option<&std::collections::HashSet<String>>,
+) -> Value {
     let (skill_entries, all_names) =
-        format_skills_within_budget(skills, DEFAULT_SKILL_LISTING_BUDGET, None);
+        format_skills_within_budget(skills, DEFAULT_SKILL_LISTING_BUDGET, quality_tracker, pinned_skills);
 
     let skill_names: Vec<Value> = all_names.into_iter().map(Value::String).collect();
 
@@ -256,8 +262,12 @@ pub fn skill_tool_schema(skills: &[SkillToolInfo]) -> Value {
 /// Injected into the conversation so the LLM is aware skills exist even
 /// before inspecting tool schemas (mirrors Claude Code's `skill_listing`
 /// attachment pattern). Uses the same budget as the tool schema.
-pub fn skill_listing_system_message(skills: &[SkillToolInfo]) -> Value {
-    let (entries, _) = format_skills_within_budget(skills, DEFAULT_SKILL_LISTING_BUDGET, None);
+pub fn skill_listing_system_message(
+    skills: &[SkillToolInfo],
+    quality_tracker: Option<&crate::skills::quality::SkillQualityTracker>,
+    pinned_skills: Option<&std::collections::HashSet<String>>,
+) -> Value {
+    let (entries, _) = format_skills_within_budget(skills, DEFAULT_SKILL_LISTING_BUDGET, quality_tracker, pinned_skills);
 
     let mut lines = Vec::with_capacity(entries.len() + 4);
     lines.push("<available_skills>".to_string());
@@ -321,7 +331,7 @@ pub async fn execute_skill_inline(
         .get("task")
         .and_then(Value::as_str)
         .unwrap_or("");
-    let (text, _activation) = execute_skill(resolver, None, skill_name, task_hint, None).await;
+    let (text, _activation, _verification) = execute_skill(resolver, None, skill_name, task_hint, None).await;
     text
 }
 
@@ -386,19 +396,22 @@ pub async fn partition_and_execute_skills(
                 let task_hint = args.get("task").and_then(Value::as_str).unwrap_or("");
 
                 let start = std::time::Instant::now();
-                let (text, act) =
+                let (text, act, verification_passed) =
                     execute_skill(resolver, executor, skill_name, task_hint, composition_ctx).await;
                 let duration_ms = start.elapsed().as_millis() as u64;
 
                 // Record outcome in quality tracker
                 if let Some(ref mut tracker) = quality_tracker {
-                    let is_error = text.contains("blocked:") || text.contains("failed:")
-                        || text.starts_with("Unknown skill");
+                    let success = verification_passed.unwrap_or_else(|| {
+                        // Heuristic fallback when no verification ran
+                        !(text.contains("blocked:") || text.contains("failed:")
+                            || text.starts_with("Unknown skill"))
+                    });
                     tracker.record_outcome(&crate::skills::quality::SkillOutcome {
                         skill_name: skill_name.to_string(),
                         tokens_used: (text.len() as u32) / 4, // rough estimate
                         duration_ms,
-                        all_required_passed: !is_error,
+                        all_required_passed: success,
                         partial: false,
                     });
                 }
@@ -468,16 +481,15 @@ async fn execute_skill(
     skill_name: &str,
     task_hint: &str,
     composition_ctx: Option<&crate::skills::composition::CompositionContext>,
-) -> (String, Option<SkillActivation>) {
-    // ── Composition checks ───────────────────────────────────────────────
+) -> (String, Option<SkillActivation>, Option<bool>) {
     if let Some(ctx) = composition_ctx {
         // Depth check
         if let Err(e) = ctx.check_depth() {
-            return (format!("Composition error: {e}"), None);
+            return (format!("Composition error: {e}"), None, None);
         }
         // Timeout check
         if let Err(e) = ctx.check_timeout() {
-            return (format!("Composition error: {e}"), None);
+            return (format!("Composition error: {e}"), None, None);
         }
     }
 
@@ -499,6 +511,7 @@ async fn execute_skill(
                                 skill_name,
                             ),
                             None,
+                            None,
                         );
                     }
                 }
@@ -516,6 +529,7 @@ async fn execute_skill(
                             errors.iter().map(|e| format!("  - {e}")).collect::<Vec<_>>().join("\n")
                         ),
                         None,
+                        None,
                     );
                 }
             }
@@ -529,6 +543,7 @@ async fn execute_skill(
                         "Skill '{}' blocked: MCP skills cannot contain inline shell commands.",
                         skill_name,
                     ),
+                    None,
                     None,
                 );
             }
@@ -570,7 +585,7 @@ async fn execute_skill(
                             run_hooks(&skill.hooks.post_invoke, is_mcp);
 
                             // Post-execution verification (fork skills only)
-                            let output = if !skill.success_criteria.is_empty() {
+                            let (output, verified) = if !skill.success_criteria.is_empty() {
                                 let work_dir = skill.skill_dir
                                     .as_ref()
                                     .map(std::path::PathBuf::from)
@@ -599,12 +614,12 @@ async fn execute_skill(
                                         output.push_str("\n⚠️ Some required verification criteria failed.\n");
                                     }
                                 }
-                                output
+                                (output, Some(all_passed))
                             } else {
-                                result.output
+                                (result.output, None)
                             };
 
-                            return (output, Some(build_activation(&skill)));
+                            return (output, Some(build_activation(&skill)), verified);
                         }
                         Err(e) => {
                             eprintln!(
@@ -651,10 +666,11 @@ async fn execute_skill(
             // Run post-invocation hooks (skipped for MCP)
             run_hooks(&skill.hooks.post_invoke, is_mcp);
 
-            (output, Some(build_activation(&skill)))
+            (output, Some(build_activation(&skill)), None)
         }
         Err(e) => (
             format!("Failed to load skill '{}': {}", skill_name, e),
+            None,
             None,
         ),
     }
@@ -778,7 +794,7 @@ mod tests {
     fn schema_has_correct_structure() {
         let resolver = stub_resolver();
         let skills = resolver.available_skills();
-        let schema = skill_tool_schema(&skills);
+        let schema = skill_tool_schema(&skills, None, None);
 
         assert_eq!(schema["function"]["name"], SKILL_TOOL_NAME);
         let params = &schema["function"]["parameters"];
@@ -797,7 +813,7 @@ mod tests {
 
     #[test]
     fn schema_empty_when_no_skills() {
-        let schema = skill_tool_schema(&[]);
+        let schema = skill_tool_schema(&[], None, None);
         let skill_enum = &schema["function"]["parameters"]["properties"]["skill_name"]["enum"];
         assert_eq!(skill_enum.as_array().unwrap().len(), 0);
     }
@@ -831,7 +847,7 @@ mod tests {
     #[tokio::test]
     async fn execute_skill_returns_instructions() {
         let resolver = stub_resolver();
-        let (output, activation) = execute_skill(&resolver, None, "code-review", "", None).await;
+        let (output, activation, _) = execute_skill(&resolver, None, "code-review", "", None).await;
         assert!(output.contains("# Skill: code-review"));
         assert!(output.contains("Check for bugs, security issues, and style."));
         // Activation always returned on success (even with no overrides)
@@ -843,14 +859,14 @@ mod tests {
     #[tokio::test]
     async fn execute_skill_includes_task_hint() {
         let resolver = stub_resolver();
-        let (output, _) = execute_skill(&resolver, None, "code-review", "Review auth module", None).await;
+        let (output, _, _) = execute_skill(&resolver, None, "code-review", "Review auth module", None).await;
         assert!(output.contains("**Task context:** Review auth module"));
     }
 
     #[tokio::test]
     async fn execute_skill_unknown_name() {
         let resolver = stub_resolver();
-        let (output, activation) = execute_skill(&resolver, None, "nonexistent", "", None).await;
+        let (output, activation, _) = execute_skill(&resolver, None, "nonexistent", "", None).await;
         assert!(output.contains("Failed to load skill 'nonexistent'"));
         assert!(activation.is_none());
     }
@@ -922,7 +938,7 @@ mod tests {
             when_to_use: Some("when user asks to deploy".into()),
             source: SkillSourceKind::Local,
         }];
-        let schema = skill_tool_schema(&skills);
+        let schema = skill_tool_schema(&skills, None, None);
         let desc = schema["function"]["description"].as_str().unwrap();
         assert!(desc.contains("when user asks to deploy"));
     }
@@ -937,7 +953,7 @@ mod tests {
                 source: SkillSourceKind::Local,
             })
             .collect();
-        let (entries, names) = format_skills_within_budget(&skills, 10_000, None);
+        let (entries, names) = format_skills_within_budget(&skills, 10_000, None, None);
         assert_eq!(entries.len(), 5);
         assert_eq!(names.len(), 5);
         // All entries have full descriptions
@@ -955,7 +971,7 @@ mod tests {
                 source: SkillSourceKind::Local,
             })
             .collect();
-        let (entries, names) = format_skills_within_budget(&skills, 500, None);
+        let (entries, names) = format_skills_within_budget(&skills, 500, None, None);
         assert_eq!(names.len(), 20); // All names still present in enum
         assert_eq!(entries.len(), 20); // All entries present
         // Entries should be shorter than full descriptions
@@ -982,7 +998,7 @@ mod tests {
                 source: SkillSourceKind::Local,
             });
         }
-        let (entries, names) = format_skills_within_budget(&skills, 800, None);
+        let (entries, names) = format_skills_within_budget(&skills, 800, None, None);
         assert_eq!(names.len(), 23);
         // Bundled entries should have full descriptions
         assert!(entries[0].contains("Important bundled skill 0"));
@@ -1001,7 +1017,7 @@ mod tests {
             })
             .collect();
         // With 100 skills and 200 byte budget, names-only
-        let (entries, names) = format_skills_within_budget(&skills, 200, None);
+        let (entries, names) = format_skills_within_budget(&skills, 200, None, None);
         assert_eq!(names.len(), 100);
         // At least some entries should be names-only (no ":")
         let names_only_count = entries.iter().filter(|e| !e.contains(": ")).count();
@@ -1017,7 +1033,7 @@ mod tests {
             when_to_use: None,
             source: SkillSourceKind::Local,
         }];
-        let (entries, _) = format_skills_within_budget(&skills, 10_000, None);
+        let (entries, _) = format_skills_within_budget(&skills, 10_000, None, None);
         // Description should be capped at MAX_LISTING_DESC_CHARS
         assert!(entries[0].len() < long_desc.len(), "entry should be shorter than raw description");
         assert!(entries[0].contains('…'), "should have truncation marker");
@@ -1065,11 +1081,34 @@ mod tests {
         }
 
         // Under budget pressure, high-quality should come first
-        let (entries, _) = format_skills_within_budget(&skills, 80, Some(&tracker));
+        let (entries, _) = format_skills_within_budget(&skills, 80, Some(&tracker), None);
         // With quality sorting, high-quality should appear before low-quality
         let high_pos = entries.iter().position(|e| e.contains("high-quality")).unwrap();
         let low_pos = entries.iter().position(|e| e.contains("low-quality")).unwrap();
         assert!(high_pos < low_pos, "high-quality skill should be listed first");
+    }
+
+    #[test]
+    fn pinned_skills_bypass_budget_cutoff() {
+        let skills: Vec<SkillToolInfo> = (0..10)
+            .map(|i| SkillToolInfo {
+                name: format!("skill-{i}"),
+                description: format!("Description for skill {i} which is moderately long"),
+                when_to_use: None,
+                source: SkillSourceKind::Local,
+            })
+            .collect();
+
+        // Tiny budget — without pinning, many skills would be truncated
+        let pinned: std::collections::HashSet<String> =
+            ["skill-7".to_string()].into_iter().collect();
+
+        let (entries, names) = format_skills_within_budget(&skills, 200, None, Some(&pinned));
+        // All skill names should still be in the enum (names)
+        assert!(names.contains(&"skill-7".to_string()));
+        // The pinned skill should have a full description (not names-only)
+        let pinned_entry = entries.iter().find(|e| e.contains("skill-7")).unwrap();
+        assert!(pinned_entry.contains("Description for skill 7"));
     }
 
     #[tokio::test]
@@ -1097,7 +1136,7 @@ mod tests {
             }
         }
 
-        let (output, activation) =
+        let (output, activation, _) =
             execute_skill(&ToolRestrictedResolver, None, "restricted", "", None).await;
         assert!(output.contains("**Allowed tools for this skill:** bash, read_file"));
         // allowed_tools set → activation returned
@@ -1131,7 +1170,7 @@ mod tests {
             }
         }
 
-        let (_, activation) = execute_skill(&ModelOverrideResolver, None, "fancy", "", None).await;
+        let (_, activation, _) = execute_skill(&ModelOverrideResolver, None, "fancy", "", None).await;
         let act = activation.unwrap();
         assert_eq!(act.model_override.as_deref(), Some("gpt-4o"));
         assert_eq!(act.allowed_tools, vec!["bash"]);
@@ -1140,7 +1179,7 @@ mod tests {
     #[tokio::test]
     async fn execute_skill_activation_always_returned_for_successful_resolve() {
         let resolver = stub_resolver();
-        let (_, activation) = execute_skill(&resolver, None, "code-review", "", None).await;
+        let (_, activation, _) = execute_skill(&resolver, None, "code-review", "", None).await;
         // Activation is always returned on success so the loop can clear stale overrides
         let act = activation.unwrap();
         assert!(act.model_override.is_none());
@@ -1150,7 +1189,7 @@ mod tests {
     #[tokio::test]
     async fn execute_skill_failure_returns_none_activation() {
         let resolver = stub_resolver();
-        let (output, activation) = execute_skill(&resolver, None, "nonexistent", "", None).await;
+        let (output, activation, _) = execute_skill(&resolver, None, "nonexistent", "", None).await;
         assert!(output.contains("Failed to load skill"));
         assert!(activation.is_none());
     }
@@ -1450,7 +1489,7 @@ mod tests {
         let parent_ctx = crate::skills::composition::CompositionContext::root();
         let child_ctx = parent_ctx.child("parent-skill", None);
 
-        let (output, _) = execute_skill(
+        let (output, _, _) = execute_skill(
             &NonComposableResolver, None, "child-skill", "do work", Some(&child_ctx),
         ).await;
         assert!(output.contains("not composable"), "Expected composability error, got: {output}");
@@ -1487,7 +1526,7 @@ mod tests {
         let parent_ctx = crate::skills::composition::CompositionContext::root();
         let child_ctx = parent_ctx.child("parent-skill", None);
 
-        let (output, _) = execute_skill(
+        let (output, _, _) = execute_skill(
             &ComposableResolver, None, "child-skill", "do work", Some(&child_ctx),
         ).await;
         // Should succeed (inline injection)
@@ -1528,7 +1567,7 @@ mod tests {
             ctx = ctx.child(&format!("level-{i}"), None);
         }
 
-        let (output, _) = execute_skill(
+        let (output, _, _) = execute_skill(
             &AnyResolver, None, "too-deep", "work", Some(&ctx),
         ).await;
         assert!(output.contains("depth"), "Expected depth error, got: {output}");
@@ -1560,7 +1599,7 @@ mod tests {
 
         // Root context (depth=0) — composability check should not apply
         let root_ctx = crate::skills::composition::CompositionContext::root();
-        let (output, _) = execute_skill(
+        let (output, _, _) = execute_skill(
             &NonComposableResolver, None, "my-skill", "work", Some(&root_ctx),
         ).await;
         assert!(!output.contains("not composable"), "Root call should not check composability");
@@ -1596,7 +1635,7 @@ mod tests {
         }
 
         // The execute_skill builds args as {"task": "..."}, which won't have "target_path"
-        let (output, _) = execute_skill(
+        let (output, _, _) = execute_skill(
             &SchemaResolver, None, "schema-skill", "do stuff", None,
         ).await;
         assert!(output.contains("validation failed"), "Expected validation error, got: {output}");

@@ -244,6 +244,8 @@ pub struct AgenticLoopState {
     /// Per-skill quality metrics accumulated during the session.
     /// Used to boost high-performing skills in selection priority.
     pub skill_quality_tracker: crate::skills::quality::SkillQualityTracker,
+    /// Skills pinned by the user — always included in budget (never truncated).
+    pub pinned_skills: std::collections::HashSet<String>,
 
     // ── Stop hooks ──
     /// Verification commands run before the loop is allowed to complete.
@@ -746,9 +748,9 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
     if let Some(resolver) = &state.skill_resolver {
         let skills = resolver.available_skills();
         if !skills.is_empty() {
-            host.inject_tool_schema(crate::turn::skill_tool::skill_tool_schema(&skills));
+            host.inject_tool_schema(crate::turn::skill_tool::skill_tool_schema(&skills, Some(&state.skill_quality_tracker), Some(&state.pinned_skills)));
             // Inject a system reminder so the LLM is primed to use the skill tool.
-            let reminder = crate::turn::skill_tool::skill_listing_system_message(&skills);
+            let reminder = crate::turn::skill_tool::skill_listing_system_message(&skills, Some(&state.skill_quality_tracker), Some(&state.pinned_skills));
             state.messages.push(reminder);
         }
     }
@@ -1034,7 +1036,7 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
                     let skills = resolver.available_skills();
                     if !skills.is_empty() {
                         host.inject_tool_schema(
-                            crate::turn::skill_tool::skill_tool_schema(&skills),
+                            crate::turn::skill_tool::skill_tool_schema(&skills, Some(&state.skill_quality_tracker), Some(&state.pinned_skills)),
                         );
                     }
                 }
@@ -1361,6 +1363,7 @@ mod tests {
             skill_model_override: None,
             skill_allowed_tools: None,
             skill_quality_tracker: crate::skills::quality::SkillQualityTracker::new(),
+            pinned_skills: std::collections::HashSet::new(),
             stop_hooks: Vec::new(),
             stop_hook_runs: 0,
             teammate_idle_hooks: Vec::new(),

@@ -550,7 +550,8 @@ struct ReplState {
     unified_skill_registry: std::sync::Arc<astra_runtime::skills::UnifiedSkillRegistry>,
     /// Session-scoped skill quality tracker for learning loop.
     skill_quality_tracker: astra_runtime::skills::quality::SkillQualityTracker,
-    /// MCP client manager for external tool servers.
+    /// Skills pinned by the user — always included in budget (never truncated).
+    pinned_skills: std::collections::HashSet<String>,
     mcp_manager: std::sync::Arc<tokio::sync::RwLock<mcp_client::McpClientManager>>,
     /// Skill classification cache for LLM-based skill detection.
     #[allow(dead_code)]
@@ -626,6 +627,7 @@ impl Default for ReplState {
             calibrator: None,
             unified_skill_registry: astra_runtime::skills::default_unified_registry().clone(),
             skill_quality_tracker: astra_runtime::skills::quality::SkillQualityTracker::new(),
+            pinned_skills: std::collections::HashSet::new(),
             mcp_manager: std::sync::Arc::new(tokio::sync::RwLock::new(
                 mcp_client::McpClientManager::new(),
             )),
@@ -3874,6 +3876,17 @@ async fn run_chat_repl(
         .join("skill_quality.json");
     state.skill_quality_tracker = astra_runtime::skills::quality::SkillQualityTracker::load(&skill_quality_path);
 
+    // Load pinned skills from previous sessions
+    let pinned_skills_path = dirs::config_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join("astra")
+        .join("pinned_skills.json");
+    if let Ok(data) = std::fs::read_to_string(&pinned_skills_path) {
+        if let Ok(set) = serde_json::from_str::<std::collections::HashSet<String>>(&data) {
+            state.pinned_skills = set;
+        }
+    }
+
     // Session-scoped quality tracker: tools that work well get boosted over time
     let quality_tracker = std::sync::Arc::new(std::sync::Mutex::new(
         tool_registry::ToolQualityTracker::new(),
@@ -4465,6 +4478,15 @@ async fn run_chat_repl(
                 "{}",
                 format!("  ⚠ Skill quality data not saved: {e}").yellow()
             );
+        }
+
+        // Save pinned skills
+        if !state.pinned_skills.is_empty() {
+            if let Ok(json) = serde_json::to_string_pretty(&state.pinned_skills) {
+                let _ = std::fs::write(&pinned_skills_path, json);
+            }
+        } else {
+            let _ = std::fs::remove_file(&pinned_skills_path);
         }
 
         // Upload quality metrics to marketplace (opt-in via ASTRA_QUALITY_UPLOAD=true)

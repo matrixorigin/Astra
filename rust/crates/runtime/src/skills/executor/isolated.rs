@@ -62,6 +62,7 @@ impl SkillExecutor for IsolatedSkillExecutor {
         skill: &LoadedSkill,
         context: &SkillExecutionContext,
     ) -> Result<SkillExecutionResult, SkillError> {
+        let start = std::time::Instant::now();
         let result = self
             .sub_run_executor
             .execute_skill_subrun(
@@ -74,6 +75,7 @@ impl SkillExecutor for IsolatedSkillExecutor {
             )
             .await
             .map_err(|e| SkillError::ExecutionFailed(e))?;
+        let duration_ms = start.elapsed().as_millis() as u64;
 
         let formatted_output = format!(
             "## Skill Result: {}\n\n{}\n\n---\n\
@@ -94,7 +96,7 @@ impl SkillExecutor for IsolatedSkillExecutor {
             output: formatted_output,
             tokens_used: result.tokens_used,
             turns: result.turns,
-            duration_ms: 0, // TODO: measure from SubRunHost
+            duration_ms,
             success: true,
             verification_results: Vec::new(),
             error_category: None,

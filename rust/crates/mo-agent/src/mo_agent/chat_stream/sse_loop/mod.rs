@@ -219,6 +219,7 @@ pub(crate) async fn stream_chat_sse(
         skill_model_override: None,
         skill_allowed_tools: None,
             skill_quality_tracker: p.skill_quality_tracker.clone(),
+        pinned_skills: std::collections::HashSet::new(),
         stop_hooks: hook_sets.stop_hooks,
         stop_hook_runs: 0,
         teammate_idle_hooks: hook_sets.teammate_idle_hooks,
