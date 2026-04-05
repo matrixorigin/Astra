@@ -550,22 +550,43 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         let pruned_tools = prune_tool_schemas(&self.edge_tools, tier);
 
         let llm_cancel = llm_cancel_for_state(state);
-        let result = call_llm_and_collect(
-            &llm_messages,
-            &pruned_tools,
-            &model_name,
-            &api_key,
-            &base_url,
-            &provider,
-            Some(max_output_tokens),
-            has_fallback,
-            llm_cancel,
-        )
-        .await
-        .map_err(|e| {
-            let kind = classify_llm_error(&e);
-            format!("[{kind}] {e}")
-        })?;
+
+        // Output token escalation: if finish_reason is "length", retry once
+        // with a higher max_output_tokens (up to 4× the initial budget).
+        let mut effective_max_output = max_output_tokens;
+        let result = loop {
+            let r = call_llm_and_collect(
+                &llm_messages,
+                &pruned_tools,
+                &model_name,
+                &api_key,
+                &base_url,
+                &provider,
+                Some(effective_max_output),
+                has_fallback,
+                llm_cancel,
+            )
+            .await
+            .map_err(|e| {
+                let kind = classify_llm_error(&e);
+                format!("[{kind}] {e}")
+            })?;
+
+            if r.finish_reason.as_deref() == Some("length")
+                && effective_max_output < max_output_tokens * 4
+            {
+                let prev = effective_max_output;
+                effective_max_output = (effective_max_output * 2).min(max_output_tokens * 4);
+                astra_core::agent_warn!(
+                    "llm",
+                    "output truncated (finish_reason=length), escalating max_output_tokens {} → {}",
+                    prev,
+                    effective_max_output,
+                );
+                continue;
+            }
+            break r;
+        };
 
         // ── 4. Emit SSE events for client ───────────────────────────────
         if !result.full_text.is_empty() {
@@ -807,6 +828,7 @@ mod tests {
             ]),
             model_used: "gpt-4".to_string(),
             duration_ms: 500,
+            finish_reason: Some("stop".to_string()),
         };
 
         let accum = ServerAgenticLoopHost::result_to_accum(&result);

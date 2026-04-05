@@ -182,6 +182,9 @@ pub(crate) struct LlmCallResult {
     pub model_used: String,
     #[allow(dead_code)]
     pub duration_ms: u64,
+    /// The finish_reason from the last SSE choice (e.g. "stop", "length", "tool_calls").
+    /// `None` when the stream ended without an explicit finish_reason.
+    pub finish_reason: Option<String>,
 }
 
 fn turn_timeout_s() -> f64 {
@@ -499,6 +502,7 @@ async fn collect_llm_stream(
     let mut reasoning = String::new();
     let mut tool_calls_map: HashMap<usize, Map<String, Value>> = HashMap::new();
     let mut usage = Map::new();
+    let mut finish_reason: Option<String> = None;
 
     let sse = parse_openai_sse_json_stream(stream);
     tokio::pin!(sse);
@@ -544,6 +548,16 @@ async fn collect_llm_stream(
         let Some(choices) = chunk.get("choices").and_then(Value::as_array) else {
             continue;
         };
+
+        // Extract finish_reason from the last chunk that carries one.
+        if let Some(fr) = choices
+            .first()
+            .and_then(|c| c.get("finish_reason"))
+            .and_then(Value::as_str)
+        {
+            finish_reason = Some(fr.to_string());
+        }
+
         let Some(delta) = choices
             .first()
             .and_then(|c| c.get("delta"))
@@ -626,6 +640,7 @@ async fn collect_llm_stream(
         usage,
         model_used: model_name.to_string(),
         duration_ms: started.elapsed().as_millis() as u64,
+        finish_reason,
     })
 }
 
@@ -760,6 +775,14 @@ fn parse_nonstream_response(v: &Value, model_name: &str, started: Instant) -> Ll
         }
     }
 
+    let finish_reason = v
+        .get("choices")
+        .and_then(Value::as_array)
+        .and_then(|a| a.first())
+        .and_then(|c| c.get("finish_reason"))
+        .and_then(Value::as_str)
+        .map(String::from);
+
     LlmCallResult {
         full_text,
         reasoning,
@@ -767,6 +790,7 @@ fn parse_nonstream_response(v: &Value, model_name: &str, started: Instant) -> Ll
         usage,
         model_used: model_name.to_string(),
         duration_ms: started.elapsed().as_millis() as u64,
+        finish_reason,
     }
 }
 
@@ -1148,6 +1172,37 @@ mod tests {
         assert_eq!(res.usage.get("total").and_then(Value::as_i64), Some(7));
         assert_eq!(res.model_used, "gpt-test");
         assert!(res.tool_calls.is_empty());
+        // No finish_reason chunk was sent, so it should be None
+        assert_eq!(res.finish_reason, None);
+        unsafe { std::env::remove_var("MO_STREAM_IDLE_TIMEOUT_MS") };
+    }
+
+    #[tokio::test]
+    async fn collect_llm_stream_extracts_finish_reason_stop() {
+        unsafe { std::env::set_var("MO_STREAM_IDLE_TIMEOUT_MS", "60000") };
+        let d1 = json!({"choices":[{"delta":{"content":"Hello"}}]});
+        let done = json!({"choices":[{"delta":{},"finish_reason":"stop"}]});
+        let body = format!("data: {d1}\n\ndata: {done}\n\n");
+        let stream = stream::iter(vec![Ok(Bytes::from(body))]);
+        let res = collect_llm_stream(stream, "m", Instant::now(), LlmCancel::None)
+            .await
+            .expect("collect");
+        assert_eq!(res.full_text, "Hello");
+        assert_eq!(res.finish_reason.as_deref(), Some("stop"));
+        unsafe { std::env::remove_var("MO_STREAM_IDLE_TIMEOUT_MS") };
+    }
+
+    #[tokio::test]
+    async fn collect_llm_stream_extracts_finish_reason_length() {
+        unsafe { std::env::set_var("MO_STREAM_IDLE_TIMEOUT_MS", "60000") };
+        let d1 = json!({"choices":[{"delta":{"content":"truncated"}}]});
+        let done = json!({"choices":[{"delta":{},"finish_reason":"length"}]});
+        let body = format!("data: {d1}\n\ndata: {done}\n\n");
+        let stream = stream::iter(vec![Ok(Bytes::from(body))]);
+        let res = collect_llm_stream(stream, "m", Instant::now(), LlmCancel::None)
+            .await
+            .expect("collect");
+        assert_eq!(res.finish_reason.as_deref(), Some("length"));
         unsafe { std::env::remove_var("MO_STREAM_IDLE_TIMEOUT_MS") };
     }
 
