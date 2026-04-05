@@ -289,6 +289,43 @@ pub fn row_get_opt_i64(r: &MySqlRow, col: &str) -> Option<i64> {
     r.try_get::<Option<i64>, _>(col).ok().flatten()
 }
 
+/// Poll until `agent_events` has at least one row per `event_type` for this session, or `timeout`.
+/// Avoids fixed `sleep` after `/chat/turn` SSE (faster on hot DB, less flaky on cold).
+pub async fn wait_for_agent_event_types(
+    pool: &sqlx::MySqlPool,
+    session_id: &str,
+    types: &[&str],
+    timeout: std::time::Duration,
+) {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let mut ok = true;
+        for et in types {
+            let n: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM agent_events WHERE session_id = ? AND event_type = ?",
+            )
+            .bind(session_id)
+            .bind(*et)
+            .fetch_one(pool)
+            .await
+            .unwrap_or(0);
+            if n < 1 {
+                ok = false;
+                break;
+            }
+        }
+        if ok {
+            return;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!(
+                "timeout ({timeout:?}) waiting for agent_events types {types:?} for session_id={session_id}"
+            );
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
 /// Shared Matrix E2E context after app build + user registration + session creation.
 pub struct MatrixE2eCtx {
     pub app: Router,

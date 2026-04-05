@@ -2,6 +2,8 @@
 
 This document maps **user-visible capabilities** to **HTTP routes**, **persistence (MatrixOne tables or in-process stores)**, and the **integration tests** that assert them. It complements `router_builder.rs` unit tests (route registration only).
 
+**Layout (system E2E plan):** the integration binary is `rust/crates/runtime/tests/system_matrix_http_e2e/main.rs` with shared **`harness.rs`** (env gate, HTTP, `sqlx`, `bootstrap`) and **`journey_full.rs` / `journey_tasks_runs.rs` / `journey_extended.rs`**. `Cargo.toml` names the test target `system_matrix_http_e2e` and enables `bridge-e2e-hooks`.
+
 ## How to run
 
 ```bash
@@ -46,7 +48,7 @@ Five tests total — overlap with the full journey is avoided (e.g. no separate 
 | `e2e_matrix_session_cancel_delete` | `journey_extended.rs` | `POST /sessions/{id}/cancel` + `agent_sessions.status`, `DELETE /sessions/{id}` |
 | `e2e_matrix_chat_stream_session_info` | `journey_extended.rs` | `POST /chat/stream` SSE → `session_info` + `run_id` |
 
-Shared helpers: `tests/system_matrix_http_e2e/harness.rs` (`bootstrap`, HTTP helpers, `cleanup_*`, row getters, SSE helpers).
+Shared helpers: `tests/system_matrix_http_e2e/harness.rs` (`bootstrap`, HTTP helpers, `cleanup_*`, row getters, SSE helpers, `wait_for_agent_event_types` — polls `agent_events` after `chat/turn` instead of a fixed sleep).
 
 ## Database isolation
 

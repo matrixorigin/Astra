@@ -11,7 +11,7 @@ use tower::util::ServiceExt;
 use super::harness::{
     MatrixE2eCtx, cleanup_edge_registry, cleanup_session_data, delete_json, delete_no_content,
     get_json, post_empty, post_json, post_json_with_headers, put_json, row_get_opt_i64,
-    row_get_opt_str, row_get_str,
+    row_get_opt_str, row_get_str, wait_for_agent_event_types,
 };
 
 pub async fn run_product_matrix_full_journey(
@@ -1041,7 +1041,13 @@ pub async fn run_product_matrix_full_journey(
         String::from_utf8_lossy(&acc)
     );
 
-    tokio::time::sleep(std::time::Duration::from_millis(900)).await;
+    wait_for_agent_event_types(
+        pool,
+        &session_id,
+        &["user_query", "llm_response"],
+        std::time::Duration::from_secs(30),
+    )
+    .await;
 
     let recs = sqlx::query(
         "SELECT event_id, session_id, user_id, event_type, content, parent_event_id, \
