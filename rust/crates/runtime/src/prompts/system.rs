@@ -125,10 +125,9 @@ fn plan_execution_section() -> &'static str {
      - **Don't skip ahead**: each subtask may depend on previous ones. Trust the ordering.\n"
 }
 
-/// Output format + tool precedence. Pure static (memory line added conditionally).
-fn output_format_section(has_memory: bool) -> String {
-    let mut s = String::from(
-        "\n## Output Format\n\
+/// Output format + tool precedence. Pure static.
+fn output_format_section() -> &'static str {
+    "\n## Output Format\n\
          - **Respond in the user's language.** If they write Chinese, respond in Chinese.\n\
          - **Code changes**: show the changed code with brief explanation. Don't dump entire files.\n\
          - **Search results**: cite file:line, group by relevance. Quote the key lines, not every match.\n\
@@ -146,12 +145,7 @@ fn output_format_section(has_memory: bool) -> String {
          - **Code edit**: read context → str_replace → run_build_test\n\
          - **Git**: status → diff → log → show → blame; git_commit for changes\n\
          - **Build/test**: run_build_test → fix errors → repeat\n\
-         - **GitHub**: list → detail → CI status\n",
-    );
-    if has_memory {
-        s.push_str("         - **Memory**: check '## User Memories' → search → store/correct\n");
-    }
-    s
+         - **GitHub**: list → detail → CI status\n"
 }
 
 /// Tool error recovery. Pure static.
@@ -288,6 +282,9 @@ fn tool_conditional_section(
              ### Deduplication: before storing, consider if similar memory already exists. Use memory_correct to update instead of creating duplicates.\n\
              ### Negative preferences: \"不喜欢\", \"别用\", \"don't want\", \"stop using\" → store as [@pref/negative]. Respect in future tool/approach selection.\n\
              ### Staleness: if a stored memory seems outdated (e.g., old repo URL, changed preference), correct it with memory_correct rather than storing a new one.\n",
+        );
+        s.push_str(
+            "         - **Memory precedence**: check '## User Memories' → search → store/correct\n",
         );
     }
     if selection_confidence < LOW_CONFIDENCE_THRESHOLD {
@@ -521,8 +518,6 @@ pub fn build_system_prompt_sections_with_style(
         ];
     }
 
-    let has_memory = tool_names.iter().any(|n| n.starts_with("memory"));
-
     // ── Global sections (stable across sessions) ──
     let mut sections = vec![
         PromptSection { text: core_rules_section(), scope: CacheScope::Global },
@@ -530,7 +525,7 @@ pub fn build_system_prompt_sections_with_style(
         PromptSection { text: coding_discipline_section().to_string(), scope: CacheScope::Global },
         PromptSection { text: parallel_and_efficiency_section().to_string(), scope: CacheScope::Global },
         PromptSection { text: plan_execution_section().to_string(), scope: CacheScope::Global },
-        PromptSection { text: output_format_section(has_memory), scope: CacheScope::Global },
+        PromptSection { text: output_format_section().to_string(), scope: CacheScope::Global },
         PromptSection { text: tool_error_recovery_section().to_string(), scope: CacheScope::Global },
     ];
 
