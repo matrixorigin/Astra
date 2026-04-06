@@ -3,8 +3,8 @@
 //! Requires `tsc` on `PATH` (e.g. `npm i -D typescript`). If `tsc` is missing, the
 //! pending flag is cleared and nothing is injected (no noisy errors).
 //!
-//! Kill switch: `MO_AGENT_PASSIVE_TSC_CHECK=0|false|off`
-//! Timeout: `MO_AGENT_PASSIVE_TSC_TIMEOUT_SECS` (default 90, max 300)
+//! Kill switch: `ASTRA_PASSIVE_TSC_CHECK=0|false|off`
+//! Timeout: `ASTRA_PASSIVE_TSC_TIMEOUT_SECS` (default 90, max 300)
 
 use std::io::ErrorKind;
 use std::path::Path;
@@ -19,7 +19,7 @@ use tokio::time::timeout;
 const MAX_PASSIVE_DIAG_CHARS: usize = 12_000;
 
 fn passive_tsc_check_enabled() -> bool {
-    match std::env::var("MO_AGENT_PASSIVE_TSC_CHECK") {
+    match std::env::var("ASTRA_PASSIVE_TSC_CHECK") {
         Ok(v) => {
             let v = v.trim().to_lowercase();
             !(v.is_empty() || v == "0" || v == "false" || v == "off")
@@ -29,7 +29,7 @@ fn passive_tsc_check_enabled() -> bool {
 }
 
 fn passive_tsc_timeout() -> Duration {
-    let secs = std::env::var("MO_AGENT_PASSIVE_TSC_TIMEOUT_SECS")
+    let secs = std::env::var("ASTRA_PASSIVE_TSC_TIMEOUT_SECS")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(90);
@@ -261,12 +261,12 @@ mod tests {
         impl Drop for Clear {
             fn drop(&mut self) {
                 unsafe {
-                    std::env::remove_var("MO_AGENT_PASSIVE_TSC_CHECK");
+                    std::env::remove_var("ASTRA_PASSIVE_TSC_CHECK");
                 }
             }
         }
         unsafe {
-            std::env::set_var("MO_AGENT_PASSIVE_TSC_CHECK", "0");
+            std::env::set_var("ASTRA_PASSIVE_TSC_CHECK", "0");
         }
         let _c = Clear;
         let dir = tempfile::tempdir().unwrap();

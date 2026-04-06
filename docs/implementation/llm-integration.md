@@ -44,11 +44,11 @@ API keys are stored **only in the DB `tokens` table** — no environment variabl
 
 ```bash
 # Setup: store API key in DB
-mo-admin token create --type llm --provider deepseek --scope global \
+astra-admin token create --type llm --provider deepseek --scope global \
   --base-url https://api.deepseek.com/v1
 
 # LLMClient auto-detects: provider=deepseek, model=deepseek-chat, base_url from token metadata
-mo-agent chat  # Just works, no --model needed
+astra chat  # Just works, no --model needed
 ```
 
 ## Providers
@@ -109,12 +109,12 @@ Model availability and API keys are configured per scope (global → account →
 
 ```bash
 # Admin: add model globally
-mo-admin model add gpt-4 openai --scope global
+astra-admin model add gpt-4 openai --scope global
 
 # Admin: add model for specific account
-mo-admin model add claude-3 anthropic --scope account --scope-id acme
+astra-admin model add claude-3 anthropic --scope account --scope-id acme
 
 # Admin: manage tokens
-mo-admin token create --type llm --provider deepseek --scope global --base-url https://api.deepseek.com/v1
-mo-admin token list
+astra-admin token create --type llm --provider deepseek --scope global --base-url https://api.deepseek.com/v1
+astra-admin token list
 ```

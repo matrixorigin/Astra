@@ -6,7 +6,7 @@ set -e
 # Configuration
 AWS_REGION="${AWS_REGION:-us-east-1}"
 AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
-ECR_REPOSITORY="${ECR_REPOSITORY:-mo-agent}"
+ECR_REPOSITORY="${ECR_REPOSITORY:-astra}"
 IMAGE_TAG="${IMAGE_TAG:-latest}"
 
 ECR_URL="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"

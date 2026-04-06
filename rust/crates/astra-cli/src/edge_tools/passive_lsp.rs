@@ -3,8 +3,8 @@
 //! claudecode merges arbitrary servers from **plugins**; here we use env flags until
 //! a `astra-lsp.json` config exists.
 //!
-//! - Rust: `MO_AGENT_LSP_RUST=1`, `MO_AGENT_RUST_ANALYZER_CMD` (default `rust-analyzer`)
-//! - TS: `MO_AGENT_LSP_TYPESCRIPT=1`, `MO_AGENT_TYPESCRIPT_SERVER_CMD` (default `typescript-language-server`)
+//! - Rust: `ASTRA_LSP_RUST=1`, `ASTRA_RUST_ANALYZER_CMD` (default `rust-analyzer`)
+//! - TS: `ASTRA_LSP_TYPESCRIPT=1`, `ASTRA_TYPESCRIPT_SERVER_CMD` (default `typescript-language-server`)
 //!
 //! Drain order: rust LSP, then TypeScript LSP (before `cargo` / `tsc` in the payload).
 
@@ -30,11 +30,11 @@ fn env_truthy(name: &str) -> bool {
 }
 
 pub(crate) fn lsp_rust_enabled() -> bool {
-    env_truthy("MO_AGENT_LSP_RUST")
+    env_truthy("ASTRA_LSP_RUST")
 }
 
 pub(crate) fn lsp_typescript_enabled() -> bool {
-    env_truthy("MO_AGENT_LSP_TYPESCRIPT")
+    env_truthy("ASTRA_LSP_TYPESCRIPT")
 }
 
 fn lsp_any_enabled() -> bool {
@@ -42,14 +42,14 @@ fn lsp_any_enabled() -> bool {
 }
 
 fn rust_analyzer_cmd() -> String {
-    std::env::var("MO_AGENT_RUST_ANALYZER_CMD")
+    std::env::var("ASTRA_RUST_ANALYZER_CMD")
         .ok()
         .filter(|s| !s.trim().is_empty())
         .unwrap_or_else(|| "rust-analyzer".to_string())
 }
 
 fn typescript_server_cmd() -> String {
-    std::env::var("MO_AGENT_TYPESCRIPT_SERVER_CMD")
+    std::env::var("ASTRA_TYPESCRIPT_SERVER_CMD")
         .ok()
         .filter(|s| !s.trim().is_empty())
         .unwrap_or_else(|| "typescript-language-server".to_string())
@@ -178,12 +178,12 @@ mod tests {
         impl Drop for SetEnv {
             fn drop(&mut self) {
                 unsafe {
-                    std::env::remove_var("MO_AGENT_LSP_RUST");
+                    std::env::remove_var("ASTRA_LSP_RUST");
                 }
             }
         }
         unsafe {
-            std::env::set_var("MO_AGENT_LSP_RUST", "1");
+            std::env::set_var("ASTRA_LSP_RUST", "1");
         }
         let _g = SetEnv;
         assert!(should_use_rust_lsp(root, Path::new("src/a.rs")));
@@ -199,12 +199,12 @@ mod tests {
         impl Drop for SetEnv {
             fn drop(&mut self) {
                 unsafe {
-                    std::env::remove_var("MO_AGENT_LSP_TYPESCRIPT");
+                    std::env::remove_var("ASTRA_LSP_TYPESCRIPT");
                 }
             }
         }
         unsafe {
-            std::env::set_var("MO_AGENT_LSP_TYPESCRIPT", "1");
+            std::env::set_var("ASTRA_LSP_TYPESCRIPT", "1");
         }
         let _g = SetEnv;
         std::fs::write(root.join("tsconfig.json"), "{}").unwrap();
@@ -238,12 +238,12 @@ mod tests {
         impl Drop for SetEnv {
             fn drop(&mut self) {
                 unsafe {
-                    std::env::remove_var("MO_AGENT_LSP_RUST");
+                    std::env::remove_var("ASTRA_LSP_RUST");
                 }
             }
         }
         unsafe {
-            std::env::set_var("MO_AGENT_LSP_RUST", "1");
+            std::env::set_var("ASTRA_LSP_RUST", "1");
         }
         let _g = SetEnv;
 

@@ -194,7 +194,7 @@ impl AdminAuditReader for StubAdminAuditReader {
                 user_id: "contract-audit-user".to_string(),
                 action: "revoke_role".to_string(),
                 resource_type: "role".to_string(),
-                resource_id: Some("mo_agent_admin".to_string()),
+                resource_id: Some("astra_admin".to_string()),
                 timestamp: "2026-01-03T10:00:00".to_string(),
                 details: Some(serde_json::json!({"username": "alice"})),
             },

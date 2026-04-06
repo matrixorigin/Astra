@@ -2,7 +2,7 @@
 
 > **Last Updated**: 2026-02-21
 
-How mo-agent-engine ensures the quality and safety of LLM-generated responses before delivery.
+How astra-engine ensures the quality and safety of LLM-generated responses before delivery.
 
 ## Hallucination Firewall
 

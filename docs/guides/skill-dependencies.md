@@ -102,12 +102,12 @@ Before uninstalling skill X, check if any other installed skill depends on X. If
 
 ```bash
 # Check what breaks when upgrading
-mo-agent skill upgrade-check <skill_name> <new_version>
+astra skill upgrade-check <skill_name> <new_version>
 ```
 
 Example:
 ```
-$ mo-agent skill upgrade-check knowledge 3.0.0
+$ astra skill upgrade-check knowledge 3.0.0
 ⚠️  Upgrading knowledge to 3.0.0 would break:
   • github (requires ~=2.1.0)
 ```

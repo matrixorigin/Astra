@@ -154,7 +154,7 @@ The fundamental problem: **agent artifacts are scattered across filesystems, S3 
 
 ```sql
 -- STAGE: Mount external storage as SQL-accessible locations
-CREATE STAGE project_artifacts URL = 's3://mo-agent-artifacts/project-alpha/';
+CREATE STAGE project_artifacts URL = 's3://astra-artifacts/project-alpha/';
 CREATE STAGE codebase_stage URL = 'stage://project_artifacts/repos/frontend/';
 
 -- DATALINK: Reference external files WITHOUT loading them into the database

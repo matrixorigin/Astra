@@ -6,14 +6,14 @@ Production deployment with Helm. All components except API are optional.
 
 ```bash
 # Minimal: API only (external DB + Redis)
-helm install mo-agent ./chart \
+helm install astra ./chart \
   --set matrixone.enabled=false \
   --set matrixone.external.host=db.prod.internal \
   --set redis.enabled=false \
   --set redis.external.url=redis://redis.prod.internal:6379
 
 # Full: everything in-cluster
-helm install mo-agent ./chart
+helm install astra ./chart
 ```
 
 ## Components
@@ -79,16 +79,16 @@ ray:
 
 ```bash
 # Dev cluster: all in-cluster, no GPU
-helm install mo-agent ./chart
+helm install astra ./chart
 
 # Staging: external DB, model server enabled
-helm install mo-agent ./chart \
+helm install astra ./chart \
   --set matrixone.enabled=false \
   --set matrixone.external.host=mo-staging.rds.internal \
   --set modelServer.enabled=true
 
 # Production: external DB + Redis, GPU training, Ray
-helm install mo-agent ./chart \
+helm install astra ./chart \
   --set matrixone.enabled=false \
   --set matrixone.external.host=mo-prod.rds.internal \
   --set redis.enabled=false \
@@ -103,7 +103,7 @@ helm install mo-agent ./chart \
 
 ```bash
 # Scale API manually
-kubectl scale deployment mo-agent-api --replicas=5
+kubectl scale deployment astra-api --replicas=5
 
 # Or let HPA handle it (default: CPU 70%)
 # HPA auto-scales 2-10 pods based on CPU utilization

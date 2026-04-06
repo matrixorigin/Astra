@@ -1,4 +1,4 @@
-# mo-agent-engine Architecture
+# astra-engine Architecture
 
 > **Status**: Living Document — source of truth for all design decisions  
 > **Last Updated**: 2026-02-21
@@ -11,9 +11,9 @@ An **Agentic Runtime** — not a framework, not a chatbot wrapper, not an OS.
 
 - **Framework** (LangChain, CrewAI): gives you libraries. You assemble the pieces. No guarantees.
 - **Coding Assistant** (Claude Code, Cursor): single-purpose tool. Runs locally, no platform services.
-- **Agentic Runtime** (mo-agent): provides **execution environment + infrastructure guarantees**. Every agent on this platform automatically gets auditable decisions, versioned memory, safe experimentation, cost control, and trust verification. The agent developer writes a system prompt and picks skills. The runtime handles everything else.
+- **Agentic Runtime** (astra): provides **execution environment + infrastructure guarantees**. Every agent on this platform automatically gets auditable decisions, versioned memory, safe experimentation, cost control, and trust verification. The agent developer writes a system prompt and picks skills. The runtime handles everything else.
 
-Why "Runtime" and not "OS"? An OS manages hardware resources (processes, memory, filesystems). We don't. We manage **agent lifecycle resources**: context budget, memory governance, skill versioning, decision audit, cost tracking. The relationship between mo-agent and an agent is analogous to JVM and a Java program — the runtime provides managed execution with guarantees the raw environment doesn't offer.
+Why "Runtime" and not "OS"? An OS manages hardware resources (processes, memory, filesystems). We don't. We manage **agent lifecycle resources**: context budget, memory governance, skill versioning, decision audit, cost tracking. The relationship between astra and an agent is analogous to JVM and a Java program — the runtime provides managed execution with guarantees the raw environment doesn't offer.
 
 Why "Agentic"? The runtime is not passive. It has agency of its own — it actively manages the agents running on it: implicit feedback mining → prompt auto-evolution → regression gate → activate. Memory self-curates (confidence decay, quarantine, compression). Skill selection learns from historical outcomes. The runtime is itself an agent that governs other agents.
 
@@ -122,6 +122,7 @@ This is the index. Each document is the **single source of truth** for its domai
 
 | Document | Scope |
 |----------|-------|
+| [Edge-Cloud Sync Architecture (Rust audit)](../../rust/docs/edge-cloud-sync-architecture.md) | Learning/events sync, local `~/.astra` layout, `HybridRestoreService` / Step Protocol / resume layering, skill registry vs cloud catalog |
 | [Authentication](../implementation/authentication.md) | JWT, ownership-based authorization |
 | [LLM Integration](../implementation/llm-integration.md) | Provider abstraction, auto-detection from DB tokens, routing, cost tracking |
 | [GitHub Integration](../implementation/github-integration.md) | Repo operations, token management |

@@ -51,7 +51,7 @@ pub const SENSITIVE_ENV_VARS: &[&str] = &[
     "DATABASE_URL",
     "REDIS_URL",
     "MEMORIA_MASTER_KEY",
-    "MO_AGENT_SECRET_KEY",
+    "ASTRA_SECRET_KEY",
     "JWT_SECRET_KEY",
     "ENCRYPTION_KEY",
     "FERNET_KEY",

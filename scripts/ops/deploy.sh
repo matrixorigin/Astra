@@ -37,6 +37,6 @@ echo "  Port: ${API_PORT:-8000}"
 echo "  Workers: ${API_WORKERS:-4}"
 
 RUST_API_ADDR="${API_HOST:-0.0.0.0}:${API_PORT:-8000}" \
-    mo-agent-server
+    astra-server
 
 echo "✅ Deployment complete!"

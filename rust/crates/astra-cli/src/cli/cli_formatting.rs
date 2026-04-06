@@ -9,8 +9,8 @@ use std::borrow::Cow;
 
 /// Unified diff for CLI summaries: `str_replace` / `multi_edit` sentinels, or `write_file` JSON field.
 pub fn extract_cli_diff_block(output: &str) -> Option<Cow<'_, str>> {
-    let start_marker = "<<<MO_AGENT_UNIFIED_DIFF>>>";
-    let end_marker = "<<<END_MO_AGENT_UNIFIED_DIFF>>>";
+    let start_marker = "<<<ASTRA_UNIFIED_DIFF>>>";
+    let end_marker = "<<<END_ASTRA_UNIFIED_DIFF>>>";
     if let Some(start) = output.find(start_marker) {
         let after = &output[start + start_marker.len()..];
         let end = after.find(end_marker).unwrap_or(after.len());
@@ -373,7 +373,7 @@ mod tests {
     #[test]
     fn test_extract_cli_diff_block_sentinel() {
         let embedded = "+++ b/f\n+ok\n";
-        let out = format!("<<<MO_AGENT_UNIFIED_DIFF>>>{embedded}<<<END_MO_AGENT_UNIFIED_DIFF>>>");
+        let out = format!("<<<ASTRA_UNIFIED_DIFF>>>{embedded}<<<END_ASTRA_UNIFIED_DIFF>>>");
         let got = extract_cli_diff_block(&out).expect("diff");
         assert_eq!(got.as_ref(), embedded.trim());
     }

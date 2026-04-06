@@ -1,7 +1,7 @@
 # Edge-Cloud Sync Architecture Audit
 
-**Date:** 2025-01-15  
-**Scope:** `state_sync.rs`, `edge_tools.rs`, `session_journal.rs`  
+**Date:** 2025-01-15 (paths and restore/skills sections verified against Rust implementation, 2026-04)  
+**Scope:** `state_sync.rs`, `edge_tools.rs`, `session_journal.rs`, `session_restore.rs`, `step_restore.rs`, unified skill registry  
 **Status:** Draft for Team Review
 
 ---
@@ -21,13 +21,15 @@ This document analyzes the current edge-cloud synchronization implementation, id
 │                              EDGE (CLI)                                     │
 ├─────────────────────────────────────────────────────────────────────────────┤
 │                                                                             │
-│  ┌──────────────────┐      ┌──────────────────┐      ┌─────────────────┐   │
-│  │ ~/.mo-agent/     │      │ ~/.mo-agent/     │      │ ~/.mo-agent/    │   │
-│  │ learning/        │      │ sessions/        │      │ journal/        │   │
-│  │ {profile}.json   │      │ workspace.yaml   │      │ {session}.jsonl │   │
-│  └────────┬─────────┘      └────────┬─────────┘      └────────┬────────┘   │
-│           │                         │                        │             │
-│           ▼                         ▼                        ▼             │
+│  ┌──────────────────┐      ┌──────────────────────────────────────────────┐  │
+│  │ ~/.astra/        │      │ ~/.astra/sessions/                           │  │
+│  │ learning/        │      │   <session_id>.jsonl  (journal, append-only) │  │
+│  │ {profile}.json   │      │   <session_id>/workspace.yaml                  │  │
+│  └────────┬─────────┘      │   <session_id>/step_checkpoints/ (Protocol +    │  │
+│           │                │     composite_snapshots.json)                  │  │
+│           │                └────────┬─────────────────────────────────────┘  │
+│           │                         │                                        │
+│           ▼                         ▼                                        │
 │  ┌──────────────────────────────────────────────────────────────────────┐  │
 │  │                    StateSyncService Trait                             │  │
 │  │  ┌──────────────────┐  ┌──────────────────┐  ┌──────────────────┐   │  │
@@ -65,7 +67,8 @@ This document analyzes the current edge-cloud synchronization implementation, id
 │  │ session_checkpoints│  │ ctx_snapshots      │  │ data_versioning_   │     │
 │  │ - checkpoint_id    │  │ (introspection)    │  │ _checkpoints       │     │
 │  │ - session_id       │  └────────────────────┘  └────────────────────┘     │
-│  │ - checkpoint_json  │                                                      │
+│  │ - state_json (Step)│  task_contracts (active durable tasks)              │
+│  │ - summary (tier)   │                                                      │
 │  └────────────────────┘                                                      │
 │                                                                             │
 └─────────────────────────────────────────────────────────────────────────────┘
@@ -80,6 +83,8 @@ This document analyzes the current edge-cloud synchronization implementation, id
 | `LocalOnlySyncService` | `state_sync.rs` | No-op for offline mode |
 | `JournalWriter` | `session_journal.rs` | Local JSONL persistence |
 | `JournalEvent` | `session_journal.rs` | Event types for audit trail |
+| `HybridRestoreService` | `session_restore.rs` | Local-first session restore; cloud fallback for `agent_sessions`, checkpoints, learning |
+| `step_restore` | `runtime/.../step_restore.rs` | Step Protocol: heavy checkpoint + JSONL replay (distinct type from services `RestoredSession`) |
 | `DeltaSnapshot` | `state_sync.rs` | Incremental sync payload |
 | `VersionedSnapshot` | `state_sync.rs` | Optimistic locking support |
 
@@ -249,7 +254,7 @@ pub struct ToolCallRecord {
 
 ### 5.4 Storage Format
 
-- **Location**: `~/.mo-agent/sessions/{session_id}.jsonl`
+- **Location**: `~/.astra/sessions/{session_id}.jsonl` (see `session_journal::local_sessions_dir()` in `session_journal.rs`; tests may override per-thread)
 - **Format**: One JSON line per event (append-only)
 - **Truncation**: User input 500 chars, assistant output 1000 chars
 - **Disk Full Handling**: Logs error, drops event (graceful degradation)
@@ -374,9 +379,11 @@ impl DeltaBuffer {
 
 | Type | Location | Use Case |
 |------|----------|----------|
-| **Session Checkpoint** | `session_checkpoints` table | Rewind to specific turn |
+| **Session Checkpoint** | `session_checkpoints` (MatrixOne) + local index under `~/.astra/sessions/<id>/` | Rewind to specific turn; Step Protocol stores `state_json` (heavy tier uses `summary = 'heavy'`) |
+| **Composite snapshot index** | `~/.astra/sessions/<session_id>/step_checkpoints/composite_snapshots.json` | Multi-dimension restore (session/data/git refs); read by `HybridRestoreService::list_composite_snapshots` |
 | **Data Versioning** | `data_versioning_checkpoints` | Experiment isolation |
 | **Journal Checkpoint** | `JournalEvent::Checkpoint` | Event audit trail |
+| **Active task contract** | `task_contracts` (`session_id`, `status = 'active'`) | Restored with cloud session; fallback from latest checkpoint `contract_state_json` |
 
 ### 8.2 Checkpoint Data Flow
 
@@ -392,6 +399,41 @@ impl DeltaBuffer {
 │  points table   │                            │  table          │
 └─────────────────┘                            └─────────────────┘
 ```
+
+### 8.3 `HybridRestoreService` (services crate) — verified behavior
+
+Implementation: `rust/crates/services/src/session_restore.rs`.
+
+- **`restore_session(session_id)`**
+  - **Local-first**: If `workspace.yaml` exists for the session (`session_workspace::read_workspace`), returns `restored_from_cloud: false` with turn/tokens/plan/contract fields from workspace. When a DB pool is configured, still queries **`restore_recent_tools`**: last 5 `agent_events` rows with `event_type = 'turn_complete'`, merging `metadata.tools_used`.
+  - **Cloud fallback**: Loads `agent_sessions`; `turn_count` comes from **`event_count`** on that row. Plan fields are parsed from **`metadata` JSON** (`extract_plan_from_metadata`). Contract: **`task_contracts`** for active row, else last **`contract_state_json`** from **`session_checkpoints`**.
+  - **Learning**: Local branch calls `restore_learning("local", "default")` when a pool exists (queries `learning_snapshots` by user/profile — the `"local"` label is historical naming). With `HybridRestoreService::local_only()`, learning is not loaded from cloud here.
+
+- **`list_checkpoints`**: Prefers **local** checkpoint index (`session_checkpoint::read_checkpoint_index`); if empty, **`session_checkpoints`** in MatrixOne.
+
+- **`restore_to_checkpoint`**: Calls `restore_session`, then rewinds **`turn_count`**, **`total_tokens_in`**, **`checkpoint_count`** from the target checkpoint row; may fill **`contract_json`** from the checkpoint.
+
+- **`pull_step_checkpoint_from_cloud`**: Selects the row with **`summary = 'heavy'`** and non-null **`state_json`**, **highest `number`** — matches how Step checkpoints are pushed (`push_step_checkpoint_to_cloud`).
+
+- **`restore_to_composite_snapshot`**: Reads **only local** `composite_snapshots.json`. If `RestoreSelector.restore_session_state` and the snapshot references `NNNNNN-heavy.json`, delegates to **`restore_to_checkpoint`** (hence local index or cloud checkpoints as above).
+
+**Skill fork sub-runs** do not use this API: they are a separate `AgenticLoopHost` path (`cli/skill_subrun.rs`); no `session_restore` mapping.
+
+### 8.4 CLI `/resume` layering (astra)
+
+`rust/crates/astra-cli/src/main.rs` (`handle_resume_command`):
+
+1. Optional listing merges **`list_resumable_sessions(user_id)`** (cloud) with **`list_sessions_by_time`** (local); **cloud entry wins** on duplicate `session_id`.
+2. After `HybridRestoreService::restore_session`, applies **`step_restore::restore_session`** (local Step Protocol + JSONL). On failure, **`pull_step_checkpoint_from_cloud`** as fallback.
+3. Conversation history: **`restore_history_from_journal`** (local JSONL, session segmentation).
+
+Two different **`RestoredSession`** types exist: **`astra_services::session_restore::RestoredSession`** (hybrid metadata) vs **`astra_runtime::pipeline::step_restore::RestoredSession`** (messages, idempotency cache, protocol version). The REPL uses both in sequence.
+
+### 8.5 Skills: edge registry vs cloud catalog vs HTTP
+
+- **Edge `UnifiedSkillRegistry` (REPL default)** — `repl_runtime.rs`: **`LocalSkillProvider`** + **`BundledSkillProvider`**, eager **`discover_all()`**, MCP discover, **`SkillWatcher`** for filesystem reload. **`DatabaseSkillProvider`** exists in code but is **not** wired into this default path (only unit-tested in `providers/database.rs`).
+- **Cloud-assembled skill index** — In edge-cloud mode, the model-facing catalog slice is built during **cloud context assembly** for `/chat/turn` (see `docs/design/edge-cloud-execution.md`). That is **not** the same object as the edge process registry.
+- **On-demand catalog HTTP** — `ThinClient::get_skills_query_text` → **`GET /skills`** for slash commands / marketplace flows (`command_router.rs`, `slash_skill.rs`). Separate from **`discover_all()`** cache invalidation; installing a skill often triggers **`unified_skill_registry.discover_all()`** to refresh the in-memory manifest cache.
 
 ---
 

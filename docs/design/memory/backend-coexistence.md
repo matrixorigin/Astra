@@ -130,13 +130,13 @@ svc = create_memory_service(db_factory, user_id="alice")
 
 ```bash
 # Check current strategy for a user
-mo-agent memory strategy get --user-id <uid>
+astra memory strategy get --user-id <uid>
 
 # Switch to graph-based activation retrieval (runs backfill if needed)
-mo-agent memory strategy set activation:v1 --user-id <uid>
+astra memory strategy set activation:v1 --user-id <uid>
 
 # Switch back to tabular vector retrieval
-mo-agent memory strategy set vector:v1 --user-id <uid>
+astra memory strategy set vector:v1 --user-id <uid>
 ```
 
 ### MCP Server

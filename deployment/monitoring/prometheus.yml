@@ -2,12 +2,12 @@ global:
   scrape_interval: 15s
   evaluation_interval: 15s
   external_labels:
-    cluster: 'mo-agent'
+    cluster: 'astra'
     environment: 'production'
 
 scrape_configs:
-  # mo-agent API metrics
-  - job_name: 'mo-agent-api'
+  # astra API metrics
+  - job_name: 'astra-api'
     static_configs:
       - targets: ['host.docker.internal:9090']
         labels:
@@ -24,7 +24,7 @@ scrape_configs:
     static_configs:
       - targets: ['node-exporter:9100']
         labels:
-          instance: 'mo-agent-host'
+          instance: 'astra-host'
 
   # MatrixOne metrics (if exposed)
   # - job_name: 'matrixone'

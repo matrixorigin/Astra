@@ -6,14 +6,14 @@ set -e
 # Configuration
 BACKUP_DIR="${BACKUP_DIR:-./backups}"
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-BACKUP_FILE="${BACKUP_DIR}/mo_agent_backup_${TIMESTAMP}.sql"
+BACKUP_FILE="${BACKUP_DIR}/astra_backup_${TIMESTAMP}.sql"
 
 # Database connection
 DB_HOST="${MATRIXONE_HOST:-localhost}"
 DB_PORT="${MATRIXONE_PORT:-6001}"
 DB_USER="${MATRIXONE_USER:-root}"
 DB_PASSWORD="${MATRIXONE_PASSWORD:-111}"
-DB_NAME="${MATRIXONE_DATABASE:-mo_agent}"
+DB_NAME="${MATRIXONE_DATABASE:-astra}"
 
 echo "🔄 Starting database backup..."
 echo "   Database: ${DB_NAME}"
@@ -60,7 +60,7 @@ echo "   Size: ${BACKUP_SIZE}"
 # Optional: Clean old backups (keep last 7 days)
 if [ "${CLEANUP_OLD_BACKUPS:-true}" = "true" ]; then
     echo "🧹 Cleaning old backups (keeping last 7 days)..."
-    find "${BACKUP_DIR}" -name "mo_agent_backup_*.sql.gz" -mtime +7 -delete
+    find "${BACKUP_DIR}" -name "astra_backup_*.sql.gz" -mtime +7 -delete
     echo "✅ Cleanup completed"
 fi
 

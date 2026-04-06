@@ -17,7 +17,7 @@ pub(super) struct Profile {
 
 pub(super) fn credentials_path() -> PathBuf {
     // Allow tests to override the credentials path via env var to avoid polluting real credentials.
-    if let Ok(dir) = std::env::var("MO_AGENT_CREDENTIALS_DIR") {
+    if let Ok(dir) = std::env::var("ASTRA_CREDENTIALS_DIR") {
         return PathBuf::from(dir).join("credentials.json");
     }
     dirs::home_dir()
@@ -485,7 +485,7 @@ mod tests {
     fn resumable_last_session_id_filters_ended_sessions() {
         let creds_dir = tempdir().unwrap();
         unsafe {
-            std::env::set_var("MO_AGENT_CREDENTIALS_DIR", creds_dir.path());
+            std::env::set_var("ASTRA_CREDENTIALS_DIR", creds_dir.path());
         }
 
         let sid = format!("test-profile-ended-{}", uuid::Uuid::new_v4());
@@ -513,7 +513,7 @@ mod tests {
         assert_eq!(resumable_last_session_id(None), None);
 
         unsafe {
-            std::env::remove_var("MO_AGENT_CREDENTIALS_DIR");
+            std::env::remove_var("ASTRA_CREDENTIALS_DIR");
         }
     }
 }

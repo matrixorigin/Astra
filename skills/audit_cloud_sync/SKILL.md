@@ -22,6 +22,8 @@ Audit edge-cloud synchronization in astra. Verifies that local journal events, l
 snapshots, checkpoints, and task state are correctly synced to MatrixOne cloud tables.
 Identifies sync gaps, conflicts, failures, and data integrity issues.
 
+For **HybridRestoreService**, Step Protocol vs services `RestoredSession`, composite snapshots, and **skill** paths (registry vs `GET /skills` vs cloud prompt index), read **`rust/docs/edge-cloud-sync-architecture.md`** §8–§8.5 in the repo.
+
 ## Task
 
 $ARGUMENTS

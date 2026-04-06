@@ -322,6 +322,6 @@ Check:
 | Error recovery & escalation | `rust/crates/runtime/src/turn/error_recovery.rs` |
 | Tool health tracking | `rust/crates/runtime/src/turn/tool_health.rs` |
 | Session journal | `rust/crates/services/src/session_journal.rs` |
-| Debug command | `rust/crates/mo-agent/src/mo_agent/slash_debug.rs` |
-| Chat stream (main loop) | `rust/crates/mo-agent/src/mo_agent/chat_stream.rs` |
+| Debug command | `rust/crates/astra-cli/src/cli/slash_debug.rs` |
+| Chat stream (main loop) | `rust/crates/astra-cli/src/cli/chat_stream.rs` |
 | Compaction | `rust/crates/runtime/src/turn/cloud/compaction.rs` |

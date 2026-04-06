@@ -1,4 +1,4 @@
-# Prometheus Alert Rules for mo-agent-engine
+# Prometheus Alert Rules for astra-engine
 
 groups:
   - name: mo_astra_runtime_alerts
@@ -56,13 +56,13 @@ groups:
       
       # Service down
       - alert: ServiceDown
-        expr: up{job="mo-agent-engine"} == 0
+        expr: up{job="astra-engine"} == 0
         for: 1m
         labels:
           severity: critical
         annotations:
           summary: "Service is down"
-          description: "mo-agent-engine service is not responding"
+          description: "astra-engine service is not responding"
       
       # High memory usage
       - alert: HighMemoryUsage

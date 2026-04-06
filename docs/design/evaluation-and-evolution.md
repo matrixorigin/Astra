@@ -9,7 +9,7 @@
 
 The field is converging on a key insight: **agent evaluation is fundamentally different from traditional software testing.** Outputs are stochastic, multi-step workflows create cascading errors, and quality is subjective. The answer is evaluation-driven iteration: Define → Test → Diagnose → Fix, as a repeatable engineering loop.
 
-mo-agent-engine's unique advantage: we have the **data infrastructure** (time travel, snapshots, causal chains) to make this loop automated and auditable.
+astra-engine's unique advantage: we have the **data infrastructure** (time travel, snapshots, causal chains) to make this loop automated and auditable.
 
 ---
 
@@ -199,7 +199,7 @@ The platform automatically improves prompts based on accumulated feedback:
 6. Auto-activate new version via upsert into prompt_templates
 ```
 
-**CLI**: `mo-admin prompt optimize --template system_general [--dry-run]`
+**CLI**: `astra-admin prompt optimize --template system_general [--dry-run]`
 
 **Verified result**: system_general v1.0 → v1.1 automatically. Diagnosis identified "prompt too vague, lacks behavioral instructions." New prompt added "Be Specific & Direct", "Use Tools Proactively" — measurably more direct responses.
 
@@ -214,7 +214,7 @@ Users rarely give explicit feedback. But their next message is rich with implici
 | Layer | When | Cost | How |
 |-------|------|------|-----|
 | Heuristic detector | Every turn, inline | Zero | Regex patterns for correction/frustration/rephrasing/clarification (CN+EN) |
-| LLM batch analyzer | Async, on-demand | Per-batch | `mo-admin prompt mine-feedback [--use-llm]` analyzes conversation triples |
+| LLM batch analyzer | Async, on-demand | Per-batch | `astra-admin prompt mine-feedback [--use-llm]` analyzes conversation triples |
 
 **Taxonomy** (following Don-Yehiya et al. 2024):
 - `correction`: "不对" / "错了" / "wrong" — user says answer was wrong
@@ -228,9 +228,9 @@ Users rarely give explicit feedback. But their next message is rich with implici
 ```
 User conversation → implicit signal auto-detected → llm_feedback table
                                                          ↓
-                              mo-admin prompt mine-feedback (deep async analysis)
+                              astra-admin prompt mine-feedback (deep async analysis)
                                                          ↓
-                              mo-admin prompt optimize (LLM diagnosis + improvement)
+                              astra-admin prompt optimize (LLM diagnosis + improvement)
                                                          ↓
                               regression gate → new prompt activated → next chat uses it
 ```
@@ -407,11 +407,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Run replay gate
-        run: mo-agent replay-gate run --sessions 50 --threshold 0.95
+        run: astra replay-gate run --sessions 50 --threshold 0.95
       
       - name: Comment results on PR
         if: always()
-        run: mo-agent replay-gate report --format github-comment
+        run: astra replay-gate report --format github-comment
 ```
 
 Every prompt/skill change gets automated quality validation before merge. PR comment shows metrics. Merge blocked if gate fails.
@@ -499,9 +499,9 @@ If a pattern emerges (same memory entry → multiple low-quality decisions), qua
     runs-on: ubuntu-latest
     steps:
       - name: Run adversarial evaluation
-        run: mo-agent adversarial run --attack-suite standard --sessions 20
+        run: astra adversarial run --attack-suite standard --sessions 20
       - name: Check results
-        run: mo-agent adversarial report --fail-if "attack_success_rate > 0.05"
+        run: astra adversarial report --fail-if "attack_success_rate > 0.05"
 ```
 
 ---

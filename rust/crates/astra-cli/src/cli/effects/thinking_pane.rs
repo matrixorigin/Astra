@@ -11,7 +11,7 @@ use std::time::Instant;
 /// While under this cap the pane **grows downward** (no blank padding). Past the cap, the top
 /// folds away and a `... (N lines hidden above)` header appears above the tail.
 pub fn thinking_viewport_rows() -> usize {
-    std::env::var("MO_AGENT_THINKING_VIEWPORT_LINES")
+    std::env::var("ASTRA_THINKING_VIEWPORT_LINES")
         .ok()
         .and_then(|s| s.parse().ok())
         .map(|n: usize| n.min(24))

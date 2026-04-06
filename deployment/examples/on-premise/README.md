@@ -1,6 +1,6 @@
 # On-Premise Deployment
 
-Deploy mo-agent to on-premise infrastructure.
+Deploy astra to on-premise infrastructure.
 
 ## Architecture
 
@@ -38,11 +38,11 @@ Deploy mo-agent to on-premise infrastructure.
 
 ```bash
 # 1. Copy files to server
-scp -r deployment/all-in-one user@server:/opt/mo-agent/
+scp -r deployment/all-in-one user@server:/opt/astra/
 
 # 2. Configure environment
 ssh user@server
-cd /opt/mo-agent
+cd /opt/astra
 cp .env.example .env
 # Edit .env with your settings
 
@@ -60,18 +60,18 @@ curl http://localhost:8000/health
 sudo apt-get update
 sudo apt-get install python3.11 python3-pip
 
-# 2. Install mo-agent
-cd /opt/mo-agent
+# 2. Install astra
+cd /opt/astra
 pip3 install -e .
 
 # 3. Create systemd service
-sudo cp deployment/examples/on-premise/mo-agent.service /etc/systemd/system/
+sudo cp deployment/examples/on-premise/astra.service /etc/systemd/system/
 sudo systemctl daemon-reload
-sudo systemctl enable mo-agent
-sudo systemctl start mo-agent
+sudo systemctl enable astra
+sudo systemctl start astra
 
 # 4. Check status
-sudo systemctl status mo-agent
+sudo systemctl status astra
 ```
 
 ## Components
@@ -79,7 +79,7 @@ sudo systemctl status mo-agent
 ### 1. Load Balancer (Nginx)
 
 ```nginx
-# /etc/nginx/sites-available/mo-agent
+# /etc/nginx/sites-available/astra
 upstream api_backend {
     least_conn;
     server 10.0.1.10:8000 max_fails=3 fail_timeout=30s;
@@ -170,7 +170,7 @@ docker run -d \
 crontab -e
 
 # Add:
-0 2 * * * /opt/mo-agent/scripts/ops/backup.sh
+0 2 * * * /opt/astra/scripts/ops/backup.sh
 ```
 
 ## Monitoring
@@ -180,7 +180,7 @@ crontab -e
 ```yaml
 # /etc/prometheus/alerts.yml
 groups:
-  - name: mo-agent
+  - name: astra
     rules:
       - alert: HighErrorRate
         expr: rate(http_requests_total{status=~"5.."}[5m]) > 0.05
@@ -226,7 +226,7 @@ sudo certbot --nginx -d api.your-domain.com
 
 ```bash
 # Use HashiCorp Vault or similar
-vault kv put secret/mo-agent \
+vault kv put secret/astra \
   token_key="..." \
   jwt_secret="..."
 ```
@@ -237,7 +237,7 @@ vault kv put secret/mo-agent \
 
 ```bash
 # Pull latest image
-docker pull mo-agent:latest
+docker pull astra:latest
 
 # Rolling update
 docker-compose -f docker-compose.prod.yml up -d --no-deps --build api
@@ -247,11 +247,11 @@ docker-compose -f docker-compose.prod.yml up -d --no-deps --build api
 
 ```bash
 # Automated health check
-*/5 * * * * /opt/mo-agent/scripts/ops/health_check.sh || /usr/bin/alert-admin
+*/5 * * * * /opt/astra/scripts/ops/health_check.sh || /usr/bin/alert-admin
 ```
 
 ## See Also
 
-- [mo-agent.service](mo-agent.service) - Systemd service file
+- [astra.service](astra.service) - Systemd service file
 - [nginx.conf](nginx.conf) - Nginx configuration
 - [backup-cron.sh](backup-cron.sh) - Automated backup script

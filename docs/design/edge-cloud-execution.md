@@ -1,7 +1,7 @@
 # Edge-Cloud Split Execution
 
 > **Status**: Core Design — single source of truth for edge-cloud execution model
-> **Last Updated**: 2026-03-01
+> **Last Updated**: 2026-04-06
 > **Related**: [deployment-architecture.md §1.1](deployment-architecture.md), [skills-and-tools.md](skills-and-tools.md), [agents-and-orchestration.md](agents-and-orchestration.md), [durable-agent-runs.md](durable-agent-runs.md)
 
 ---
@@ -32,7 +32,7 @@ No single execution location works for everything. The agentic loop must be **sp
 | **Edge** | Agentic loop driver (EdgeChatLoop) | Must call local tools between LLM turns |
 | **Edge** | Permission prompts (Y/N/Always/Deny) | Interactive, needs user's terminal |
 | **Edge** | Terminal rendering | User's terminal |
-| **Edge** | Project rules loading (.mo-agent/rules.md, CLAUDE.md) | Local files |
+| **Edge** | Project rules loading (repo `.astra/` / `.astra/`, `CLAUDE.md`, etc.) | Local files |
 | **Cloud** | LLM call | API key security; context enrichment; prompt caching |
 | **Cloud** | Context assembly (memory search, few-shot, skill index) | Data in MatrixOne |
 | **Cloud** | Model routing, SLO escalation | Historical cost/quality data in DB |
@@ -40,7 +40,20 @@ No single execution location works for everything. The agentic loop must be **sp
 | **Cloud** | Audit logging (decision + context snapshot) | Source of truth in MatrixOne |
 | **Cloud** | Firewall verification | Needs context snapshot for claim verification |
 | **Cloud** | Event persistence | All events → MatrixOne |
-| **Cloud** | Skill catalog (definitions, versions) | Source of truth; edge caches |
+| **Cloud** | Skill catalog (definitions, versions) | Source of truth in MatrixOne / API; see §2.1 |
+| **Edge** | `UnifiedSkillRegistry` (default: local + bundled + MCP) | Resolves `skill` tool and `discover_skills` for **on-disk** skills; not a full mirror of the DB catalog |
+
+### 2.1 Skill catalog vs edge registry (implementation note)
+
+Three related paths:
+
+1. **Model-facing index** — During `/chat/turn`, the **cloud** assembles context (including a **skill index** slice) from data in MatrixOne and related services. The edge sends messages + tool results; it does not hold the full server-side catalog in memory.
+
+2. **Edge `UnifiedSkillRegistry`** — The interactive CLI (`repl_runtime.rs`) registers **`LocalSkillProvider`** and **`BundledSkillProvider`**, runs **`discover_all()`**, and may add MCP skills. A **`DatabaseSkillProvider`** adapter exists but is **not** part of this default wiring; edge execution of `skill` therefore targets **filesystem/bundled/MCP** definitions unless extended.
+
+3. **HTTP catalog** — `GET /skills` (via `ThinClient`) supports slash commands, marketplace version checks, and registration flows. That is **on-demand** over the network, separate from the registry’s **`discover_all()`** cache refresh (e.g. after installing a skill).
+
+For sync-oriented diagrams and resume/checkpoint behavior, see [`rust/docs/edge-cloud-sync-architecture.md`](../../rust/docs/edge-cloud-sync-architecture.md) §8.5.
 
 ### What the cloud does per `/chat/turn` (not just proxying)
 

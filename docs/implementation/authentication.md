@@ -76,7 +76,7 @@ Audit entries are events in `conversation_events` with `event_type = 'audit'`.
 
 ## What This Is NOT
 
-- ❌ No MatrixOne RBAC dependency (`mo_agent_admin`, `mo_agent_user` roles are not used)
+- ❌ No MatrixOne **native** RBAC — roles live in app tables (`auth_roles`: `astra_admin`, `astra_user`)
 - ❌ No role hierarchy
 - ❌ No permission inheritance
 - ❌ No cross-user resource sharing (future: team-level sharing via visibility flags)

@@ -1,7 +1,7 @@
 name: evaluate-session
 version: "2.0.0"
 description: "Evaluate agent session performance and provide optimization recommendations"
-author: "mo-agent-engine"
+author: "astra-engine"
 
 tools:
   - bash

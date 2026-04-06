@@ -17,7 +17,7 @@
    - 5.3 [Headless Cloud Runtime: Client-Runtime Decoupling](#53-headless-cloud-runtime-client-runtime-decoupling)
    - 5.4 [Responsibility Split: What Moves Where](#54-responsibility-split-what-moves-where)
    - 5.5 [Thin Client Protocol](#55-thin-client-protocol)
-     - 5.5.1 [Reference implementation: `mo-thin-client`](#551-reference-implementation-mo-thin-client)
+     - 5.5.1 [Reference implementation: `astra-thin-client`](#551-reference-implementation-astra-thin-client)
      - 5.5.2 [Lightweight edge executor](#552-lightweight-edge-executor)
      - 5.5.3 [CLI registry and heartbeat environment](#553-cli-registry-and-heartbeat-environment)
 6. [Edge-Cloud State Model](#6-edge-cloud-state-model)
@@ -37,7 +37,7 @@
 
 ## 1. Executive Summary
 
-mo-agent is an **Agentic Runtime** — a managed execution environment where every agent automatically receives auditable decisions, versioned memory, safe experimentation, cost control, and trust verification. The core thesis:
+astra is an **Agentic Runtime** — a managed execution environment where every agent automatically receives auditable decisions, versioned memory, safe experimentation, cost control, and trust verification. The core thesis:
 
 ```
 Agent Decision = f(prompt@version, skill@version, context@snapshot, memory@state, llm_params)
@@ -54,7 +54,7 @@ Agent Decision = f(prompt@version, skill@version, context@snapshot, memory@state
 - Learning converges across agents via conflict-free merge strategies
 
 **Key differentiators vs industry**:
-- **MatrixOne as the agent brain** — other runtimes store state in a database; mo-agent *thinks* in its database. HTAP enables transactional state (leases, sessions) AND analytical workloads (learning convergence, drift detection, cost forecasting) without ETL
+- **MatrixOne as the agent brain** — other runtimes store state in a database; astra *thinks* in its database. HTAP enables transactional state (leases, sessions) AND analytical workloads (learning convergence, drift detection, cost forecasting) without ETL
 - **Cross-session learning** (no competitor does this — Codex, Claude Code, Cursor, Devin all start fresh)
 - **Edge-cloud split execution** (tools local for interactive coding; cloud sandbox for background tasks — combines Claude Code's privacy with Codex's durability)
 - **Self-improving tool selection** (TF-IDF + LLM hybrid with progressive calibration)
@@ -74,7 +74,7 @@ Agent Decision = f(prompt@version, skill@version, context@snapshot, memory@state
 | **Devin/SWE-agent** | Docker isolation | Git snapshots + action log | None | None cross-session | Full state serialization |
 | **LangGraph** | Framework, pluggable | Typed checkpoints (SQLite/PG) | Shared state graph | None | Per-thread isolation |
 | **CrewAI** | Framework, role-based | Role-local, optional vector DB | Sequential/parallel chains | Optional entity memory | Full history replay |
-| **mo-agent** | Edge-cloud split | JSONL journal + MatrixOne cloud | Designed (partial impl) | ✅ Cross-session EntityGraph | Intent-driven loading (~90%) |
+| **astra** | Edge-cloud split | JSONL journal + MatrixOne cloud | Designed (partial impl) | ✅ Cross-session EntityGraph | Intent-driven loading (~90%) |
 
 ### 2.2 Where We Lead
 
@@ -98,10 +98,10 @@ Agent Decision = f(prompt@version, skill@version, context@snapshot, memory@state
 
 ```
 rust/crates/
-├── mo-agent/        # Edge: CLI REPL, 50 tools, thin-client SSE loop (still hosts chat_stream)
+├── astra/        # Edge: CLI REPL, 50 tools, thin-client SSE loop (still hosts chat_stream)
 │   ├── main.rs              # Entry point, REPL loop, session management
 │   ├── edge_tools.rs        # 50 tools: bash, file ops, git (gix), code intel, web, memory
-│   ├── mo_agent/
+│   ├── cli/
 │   │   ├── chat_stream/     # `mod.rs` + `sse_loop/` (`mod.rs` entry, `agentic_sse_loop`, `agentic_loop_turn`); headless §5.5
 │   │   └── repl_turn.rs     # Single turn execution
 │   └── edge_tools/
@@ -135,22 +135,24 @@ rust/crates/
 │   └── task_orchestrator.rs # TaskRecord lifecycle with checkpoint/resume
 │
 ├── core/            # Shared config, logging, runtime limits
-└── mo-admin/        # Admin CLI: credentials, model config, roles
+└── astra-admin/        # Admin CLI: credentials, model config, roles
 ```
 
 ### 3.2 State Model: What Exists Today
 
 #### Session State
 ```
-~/.mo-agent/sessions/{session_id}/
-├── workspace.yaml       # Session metadata: git branch, model, title, token counts
-├── {session_id}.jsonl   # Append-only journal: turns, tool calls, state changes
-└── checkpoints/         # Numbered checkpoint snapshots
+~/.astra/sessions/
+├── {session_id}.jsonl              # Append-only journal (sessions root; session_journal.rs)
+└── {session_id}/
+    ├── workspace.yaml              # Session metadata: git branch, model, token counts
+    ├── checkpoints/                # Numbered markdown checkpoints (session_checkpoint.rs)
+    └── step_checkpoints/           # Step Protocol JSON + composite_snapshots.json
 ```
 
 #### Journal: `sync_marker` after MatrixOne cloud pull
 
-When the CLI pulls **learning** (versioned snapshot) and/or **preferences** from MatrixOne, it may append a `JournalEvent` of type **`sync_marker`** to `~/.mo-agent/sessions/{session_id}.jsonl`. Structured fields live under **`metadata.cloud_pull`**.
+When the CLI pulls **learning** (versioned snapshot) and/or **preferences** from MatrixOne, it may append a `JournalEvent` of type **`sync_marker`** to `~/.astra/sessions/{session_id}.jsonl`. Structured fields live under **`metadata.cloud_pull`**.
 
 | Field | Meaning |
 |-------|---------|
@@ -166,13 +168,13 @@ When the CLI pulls **learning** (versioned snapshot) and/or **preferences** from
 
 1. **Substantive pull** (reachable and at least one of: learning `version`, non-empty tool health from snapshot, or non-empty preference keys): append with `reachable_empty_ack: false` (requires a **session id** and writable journal).
 2. **`post_login` + reachable + empty**: still append, with **`reachable_empty_ack: true`** — infrequent, ties auth refresh to a successful cloud round-trip.
-3. **`repl_startup` + reachable + empty**: by default **omit** (avoids noise on every REPL open). Opt in with environment variable **`MO_JOURNAL_CLOUD_EMPTY_ACK=1`** to append the same empty-ack marker as in (2).
+3. **`repl_startup` + reachable + empty**: by default **omit** (avoids noise on every REPL open). Opt in with environment variable **`ASTRA_JOURNAL_CLOUD_EMPTY_ACK=1`** to append the same empty-ack marker as in (2).
 
 The human-readable `user_input` line on the event includes `cloud_pull`, profile, version, preference count, and the suffix ` empty_ack` when `reachable_empty_ack` is true (easy `grep`).
 
 When **`matrix_runtime`** is attached, the same event is **enqueued for event ingestion** so `agent_events` metadata can include `cloud_pull` (see `services::event_ingestion.rs`).
 
-**Code**: `mo-agent` `main.rs` — `append_cloud_pull_sync_journal`, `post_auth_cloud_resync`, `should_append_cloud_pull_journal`; `mo-agent-services` `session_journal::JournalEvent::cloud_pull_sync_marker`.
+**Code**: `astra` `main.rs` — `append_cloud_pull_sync_journal`, `post_auth_cloud_resync`, `should_append_cloud_pull_journal`; `astra-services` `session_journal::JournalEvent::cloud_pull_sync_marker`.
 
 #### Learning State (per-user, per-profile)
 ```rust
@@ -232,33 +234,33 @@ Code-level audit reveals **5 components stuck in the wrong layer** that block mu
 
 | Component | Current Layer | Evidence | Should Be | Why It Matters |
 |-----------|--------------|----------|-----------|---------------|
-| **SyncOrchestrator** | `mo-agent` `ReplState` | `main.rs:436` | Cloud service state | CLI session holds cloud sync — can't share across Web/IDE clients |
-| **MatrixOne pool** | `mo-agent` `ReplState` | `main.rs:406` | Service layer | DB connection pool is infrastructure, not CLI concern |
-| **Event ingestion sender** | `mo-agent` `ReplState` | `main.rs:402` | Service layer | Cloud event publishing is not a CLI responsibility |
-| **LearningAdapter bridge** | `runtime` `sync_adapters.rs` | Bridges `pipeline` learning modules with `services::SyncEngine` | ✅ **Done** (in `runtime`, not `services` — `services` must not depend on `runtime`) | CLI imports `mo_agent_runtime::sync_adapters::*` |
+| **SyncOrchestrator** | `astra` `ReplState` | `main.rs:436` | Cloud service state | CLI session holds cloud sync — can't share across Web/IDE clients |
+| **MatrixOne pool** | `astra` `ReplState` | `main.rs:406` | Service layer | DB connection pool is infrastructure, not CLI concern |
+| **Event ingestion sender** | `astra` `ReplState` | `main.rs:402` | Service layer | Cloud event publishing is not a CLI responsibility |
+| **LearningAdapter bridge** | `runtime` `sync_adapters.rs` | Bridges `pipeline` learning modules with `services::SyncEngine` | ✅ **Done** (in `runtime`, not `services` — `services` must not depend on `runtime`) | CLI imports `astra_runtime::sync_adapters::*` |
 | **InProcessChatTurnBridge** | `runtime` `turn/bridge_inprocess.rs` | LLM call path | 🟡 **Partial** | Active-model **DB query + decrypt** moved to `services::resolve_active_llm_model`; bridge still holds `MatrixOneSettings` / pool wiring for streaming |
 
 **Crate size confirms the imbalance** (lines of Rust code):
 
 | Crate | LOC | Role | Assessment |
 |-------|----:|------|-----------|
-| `mo-agent` | ≈47k (Rust LOC, approximate) | CLI — should be thin | **Still heavy**: `chat_stream`, `ReplState` infra, edge tools; plan/sync adapters moved to `runtime` |
+| `astra` | ≈47k (Rust LOC, approximate) | CLI — should be thin | **Still heavy**: `chat_stream`, `ReplState` infra, edge tools; plan/sync adapters moved to `runtime` |
 | `runtime` | 56,748 | Cognitive engine + HTTP API | Mostly correct; InProcessBridge is the outlier |
 | `services` | 26,441 | Cloud backend | Clean; only depends on `core` |
 | `core` | ~2,000 | Shared config/types | ✅ Correct |
 
 **Dependency graph** (verified, acyclic):
 ```
-mo-agent ──▶ runtime ──▶ services ──▶ core
+astra ──▶ runtime ──▶ services ──▶ core
    └──────────────────────▶ services
    └──────────────────────────────────▶ core
 ```
 
-The graph is correct (no cycles), but `mo-agent` being the **only crate that can bridge runtime↔services** creates a bottleneck: any new client (Web, IDE) would need to duplicate the bridging code or depend on `mo-agent`.
+The graph is correct (no cycles), but `astra` being the **only crate that can bridge runtime↔services** creates a bottleneck: any new client (Web, IDE) would need to duplicate the bridging code or depend on `astra`.
 
 **Two binary targets already exist** (good foundation):
-- `mo-agent` (CLI): `crates/mo-agent/src/main.rs` — 5,198 lines, REPL + edge tools
-- `mo-agent-server` (API): `crates/runtime/src/main.rs` — 11 lines, pure HTTP server
+- `astra` (CLI): `crates/astra-cli/src/main.rs` — 5,198 lines, REPL + edge tools
+- `astra-server` (API): `crates/runtime/src/main.rs` — 11 lines, pure HTTP server
 
 ---
 
@@ -275,7 +277,7 @@ The graph is correct (no cycles), but `mo-agent` being the **only crate that can
 | G5 | **EventAdapter vs sync engine** | sync_engine.rs: `DomainAdapter` | **Implemented**: [`EventAdapter`](../../rust/crates/runtime/src/sync_adapters.rs) uses dedicated ingestion (`export_delta` → `None`; `export_full` intentionally unsupported) | Events do not ride `SyncOrchestrator` push/pull — by design they use `IngestionSender` |
 | G6 | **TaskAdapter sync** | sync_engine.rs: `DomainAdapter` | **Implemented**: [`TaskAdapter`](../../rust/crates/runtime/src/sync_adapters.rs) exports **dirty ∩ leased** tasks; [`push_tasks_pack_held_mysql`](../../rust/crates/services/src/multi_agent.rs) enforces holder on push | Remaining gap is product/UX (RunEngine, long-running tasks), not the adapter stub |
 | G7 | **Cross-agent learning merge** | state_sync.rs: observation-count-wins merge | Single-writer assumption; no 3-way merge | Multiple agents writing creates conflicts |
-| G8 | **Dual cognitive loops (Phase 0)** | One headless cloud runtime | `mo-agent` [`chat_stream/sse_loop/`](../../rust/crates/mo-agent/src/mo_agent/chat_stream/sse_loop/) **and** [`bridge_inprocess.rs`](../../rust/crates/runtime/src/turn/bridge_inprocess.rs) both run multi-turn LLM loops | Blocks a single thin-client story; duplicates stall/token/schema logic unless consolidated; **SSE** (39); **stall metrics** (40); **ingest** (41); **post-tool + stall preflight + verdict audit type** (42); **headless indices/parse/timeout/unknown-tool** (43); **reflect hydrate + headless postprocess/journal** (44); **budget pressure + headless step/cache/checkpoint/journal** (45); **explain lines + selection context + headless opening/pairs** (46); **headless stderr + skill merge + API error + step plan** (47); **ingest snapshot + headless slot resolve + deprioritized merge + domain-hint debug strings** (48); **agentic prepare telemetry + filtered `edge_tools` attach** (49); **explain stderr line pair helper** (50); **explain flags struct + selector token acc + ingest→loop control** (51); **selector hints+`edge_tools` combo + POST retry const + post-tool→loop control** (52–53); **skill stderr strings for merge** (54) |
+| G8 | **Dual cognitive loops (Phase 0)** | One headless cloud runtime | `astra` [`chat_stream/sse_loop/`](../../rust/crates/astra-cli/src/cli/chat_stream/sse_loop/) **and** [`bridge_inprocess.rs`](../../rust/crates/runtime/src/turn/bridge_inprocess.rs) both run multi-turn LLM loops | Blocks a single thin-client story; duplicates stall/token/schema logic unless consolidated; **SSE** (39); **stall metrics** (40); **ingest** (41); **post-tool + stall preflight + verdict audit type** (42); **headless indices/parse/timeout/unknown-tool** (43); **reflect hydrate + headless postprocess/journal** (44); **budget pressure + headless step/cache/checkpoint/journal** (45); **explain lines + selection context + headless opening/pairs** (46); **headless stderr + skill merge + API error + step plan** (47); **ingest snapshot + headless slot resolve + deprioritized merge + domain-hint debug strings** (48); **agentic prepare telemetry + filtered `edge_tools` attach** (49); **explain stderr line pair helper** (50); **explain flags struct + selector token acc + ingest→loop control** (51); **selector hints+`edge_tools` combo + POST retry const + post-tool→loop control** (52–53); **skill stderr strings for merge** (54) |
 
 ### 4.2 Design Docs That Outpace Implementation
 
@@ -315,7 +317,7 @@ The target is a **three-tier architecture** where the cloud runtime is the brain
 ```
 ┌──────────────────────────────────────────────────────────────────────────┐
 │                         THIN CLIENTS                                     │
-│  CLI (mo-agent) │ Web UI │ IDE Plugin │ SDK │ Webhook                    │
+│  CLI (astra) │ Web UI │ IDE Plugin │ SDK │ Webhook                    │
 │                                                                          │
 │  All speak the same Thin Client Protocol (§5.5):                         │
 │  • SSE stream for chat turns                                             │
@@ -384,7 +386,7 @@ The target is a **three-tier architecture** where the cloud runtime is the brain
 └──────────────────────────────────────────────────────────────────────────┘
 ```
 
-**Key insight**: Today, `mo-agent` CLI is simultaneously a thin client, cognitive engine (`chat_stream`), AND edge executor (tens of kLOC Rust). The target separates these into independently deployable components sharing a common protocol.
+**Key insight**: Today, `astra` CLI is simultaneously a thin client, cognitive engine (`chat_stream`), AND edge executor (tens of kLOC Rust). The target separates these into independently deployable components sharing a common protocol.
 
 ### 5.3 Headless Cloud Runtime: Client-Runtime Decoupling
 
@@ -392,7 +394,7 @@ The target is a **three-tier architecture** where the cloud runtime is the brain
 
 The current architecture tightly couples the CLI to the agent runtime. Evidence:
 
-1. **`chat_stream/sse_loop/`** in `mo-agent` still hosts the multi-turn LLM interaction loop — stall detection, token budgeting, schema pruning, response guards. **Parallel local tool execution was removed**; the headless path assembles results from SSE `tool_request` / edge callbacks (§5.5). Moving the remaining loop into `runtime` is still open.
+1. **`chat_stream/sse_loop/`** in `astra` still hosts the multi-turn LLM interaction loop — stall detection, token budgeting, schema pruning, response guards. **Parallel local tool execution was removed**; the headless path assembles results from SSE `tool_request` / edge callbacks (§5.5). Moving the remaining loop into `runtime` is still open.
 
 2. **`ReplState` in `main.rs:380-447`** holds infrastructure state that belongs in a server:
    ```rust
@@ -403,7 +405,7 @@ The current architecture tightly couples the CLI to the agent runtime. Evidence:
    learning_snapshot: Option<String>,                 // cloud learning data
    ```
 
-3. ~~**`sync_adapters.rs` in `mo-agent`**~~ **Resolved**: file lives in `runtime/src/sync_adapters.rs`; CLI wires `SyncOrchestrator` only.
+3. ~~**`sync_adapters.rs` in `astra`**~~ **Resolved**: file lives in `runtime/src/sync_adapters.rs`; CLI wires `SyncOrchestrator` only.
 
 4. **`InProcessChatTurnBridge`** ~~full infra coupling~~ **Partially resolved**: `infra_llm_models` lookup + Fernet decrypt live in `services::resolve_active_llm_model` (`models.rs`). Further slimming would push more bridge wiring behind `ModelService` trait calls.
 
@@ -441,7 +443,7 @@ A **headless cloud runtime** is an agent runtime that has no UI, no local filesy
 ```
 
 **What "headless" means concretely**:
-- The server binary (`mo-agent-server`) becomes the single source of truth for all agent state
+- The server binary (`astra-server`) becomes the single source of truth for all agent state
 - LLM calls happen server-side only (not in CLI)
 - Tool selection, stall detection, token budgeting — all server-side
 - CLI sends user messages and receives structured events (tool requests, text chunks, plan updates)
@@ -451,9 +453,9 @@ A **headless cloud runtime** is an agent runtime that has no UI, no local filesy
 
 | Component | From | To | Evidence | Effort |
 |-----------|------|----|----------|--------|
-| `chat_stream/sse_loop/` core loop | `mo-agent` | `runtime` server handler | Multi-turn orchestration still in CLI crate; headless tool path done | Large |
-| `plan_decompose.rs` | ~~`mo-agent`~~ → **`runtime`** | `runtime` | ✅ **Done** — `runtime/src/plan_decompose.rs` | — |
-| `sync_adapters.rs` | ~~`mo-agent`~~ → **`runtime`** | `runtime` (not `services`: avoids dep cycle) | ✅ **Done** — `runtime/src/sync_adapters.rs` | — |
+| `chat_stream/sse_loop/` core loop | `astra` | `runtime` server handler | Multi-turn orchestration still in CLI crate; headless tool path done | Large |
+| `plan_decompose.rs` | ~~`astra`~~ → **`runtime`** | `runtime` | ✅ **Done** — `runtime/src/plan_decompose.rs` | — |
+| `sync_adapters.rs` | ~~`astra`~~ → **`runtime`** | `runtime` (not `services`: avoids dep cycle) | ✅ **Done** — `runtime/src/sync_adapters.rs` | — |
 | `SyncOrchestrator` construction | `ReplState` (`main.rs:436`) | `AppState` (`state_builder.rs`) | CLI holds cloud sync state | Small |
 | `MatrixOne pool` | `ReplState` (`main.rs:406`) | `AppState` (already has `shared_pool`) | Duplicate pool in CLI | Small |
 | `IngestionSender` | `ReplState` (`main.rs:402`) | Server-side event pipeline | CLI publishes cloud events directly | Small |
@@ -506,7 +508,7 @@ What happens when edge disconnects mid-tool-execution?
 
 ### 5.4 Responsibility Split: What Moves Where
 
-A precise mapping of every responsibility in the current `mo-agent` CLI to its target location:
+A precise mapping of every responsibility in the current `astra` CLI to its target location:
 
 #### Cloud (Headless Runtime) — Control Plane + State Plane
 
@@ -519,7 +521,7 @@ A precise mapping of every responsibility in the current `mo-agent` CLI to its t
 | Task/plan state machine | `services` `task_orchestrator.rs` | `services` (stays) | Already server-side ✅ |
 | Plan decomposition | `runtime` `plan_decompose.rs` | `runtime` | ✅ Moved out of CLI |
 | Learning sync + merge | `runtime` `sync_adapters.rs` | `runtime` (adapter crate layer) | ✅ Moved; uses `services` traits without `services`→`runtime` cycle |
-| Event ingestion | `mo-agent` `ReplState` | `services` (already has `IngestionWorker`) | Remove from CLI |
+| Event ingestion | `astra` `ReplState` | `services` (already has `IngestionWorker`) | Remove from CLI |
 | Memory/skill/context CRUD | `runtime` route handlers | `runtime` (stays) | Already server-side ✅ |
 | Approval workflow | Not implemented | `services` new module | Cloud-resident for multi-client |
 
@@ -527,7 +529,7 @@ A precise mapping of every responsibility in the current `mo-agent` CLI to its t
 
 | Responsibility | Current Owner | Target Owner | Notes |
 |---------------|--------------|-------------|-------|
-| 50 local tools | `mo-agent` `edge_tools.rs` + subdirs | Edge executor process | Packaged as standalone |
+| 50 local tools | `astra` `edge_tools.rs` + subdirs | Edge executor process | Packaged as standalone |
 | Tool invocation → result | `chat_stream` assembles from edge round | Edge executor via callback API | Headless: SSE `tool_request` → edge → `post_tool_result` (§5.5) |
 | Permission gates (bash, write) | `permission_manager.rs` | Edge executor local UX | User approves locally |
 | MCP server management | `mcp_client.rs` | Edge executor | User's MCP servers |
@@ -585,7 +587,7 @@ data: {"tokens_used": 4500}
 ```
 POST /tools/result
 Authorization: Bearer <jwt>
-X-Mo-Edge-Id: edge-abc
+X-Astra-Edge-Id: edge-abc
 
 {
   "request_id": "tr-1",
@@ -639,47 +641,47 @@ POST   /plans/{id}/resume               # resume paused plan
 
 > **Note**: Many of these routes already exist in `router_builder.rs` (~50 routes). The gap is that today's CLI bypasses them (calling internal Rust functions directly) and the Web UI only uses ~15 routes as read-only GETs. The thin client protocol makes all clients go through the same API surface.
 
-#### 5.5.1 Reference implementation: `mo-thin-client`
+#### 5.5.1 Reference implementation: `astra-thin-client`
 
-Shared crate: `rust/crates/mo-thin-client` (dependency of `mo-agent-cli` and any future Web/IDE clients).
+Shared crate: `rust/crates/astra-thin-client` (dependency of `astra-cli` and any future Web/IDE clients).
 
 | Layer | Module / type | Role |
 |-------|----------------|------|
-| Paths | [`paths.rs`](../../rust/crates/mo-thin-client/src/paths.rs) | Canonical URL constants and `session` / `task` / `context_capture` helpers — keep in sync with `runtime/src/server/router_builder.rs`. |
-| Bodies | [`protocol.rs`](../../rust/crates/mo-thin-client/src/protocol.rs) | `ChatStreamRequest` (§5.5 `edge_executor_id`, `capabilities`), `ToolResultRequest`, `ApprovalRespondRequest`, `EdgeRegisterRequest`, `EdgeHeartbeatRequest`, `TaskLeaseMutationRequest`, `StreamEvent`, session DTOs. |
-| Light edge | [`edge.rs`](../../rust/crates/mo-thin-client/src/edge.rs) | §5.5.2: `advertise_executor`, `builtin_capability_preset`, `edge_register_with_capabilities`, `MO_EDGE_ID_HEADER`. |
-| Transport | [`ThinClient`](../../rust/crates/mo-thin-client/src/client.rs) | `reqwest`-based HTTP + SSE (`chat_stream` / `post_chat_turn`), auth, sessions, skills, memory, tasks (incl. lease helpers), context snapshots, `get_url` for off-origin probes (e.g. Memoria health). |
-| Admin CLI | [`mo-admin-cli`](../../rust/crates/mo-admin/) | Same crate: **only** [`ThinClient`](../../rust/crates/mo-thin-client/src/client.rs) for server calls (no standalone `reqwest` client). |
+| Paths | [`paths.rs`](../../rust/crates/astra-thin-client/src/paths.rs) | Canonical URL constants and `session` / `task` / `context_capture` helpers — keep in sync with `runtime/src/server/router_builder.rs`. |
+| Bodies | [`protocol.rs`](../../rust/crates/astra-thin-client/src/protocol.rs) | `ChatStreamRequest` (§5.5 `edge_executor_id`, `capabilities`), `ToolResultRequest`, `ApprovalRespondRequest`, `EdgeRegisterRequest`, `EdgeHeartbeatRequest`, `TaskLeaseMutationRequest`, `StreamEvent`, session DTOs. |
+| Light edge | [`edge.rs`](../../rust/crates/astra-thin-client/src/edge.rs) | §5.5.2: `advertise_executor`, `builtin_capability_preset`, `edge_register_with_capabilities`, `ASTRA_EDGE_ID_HEADER`. |
+| Transport | [`ThinClient`](../../rust/crates/astra-thin-client/src/client.rs) | `reqwest`-based HTTP + SSE (`chat_stream` / `post_chat_turn`), auth, sessions, skills, memory, tasks (incl. lease helpers), context snapshots, `get_url` for off-origin probes (e.g. Memoria health). |
+| Admin CLI | [`astra-admin-cli`](../../rust/crates/astra-admin/) | Same crate: **only** [`ThinClient`](../../rust/crates/astra-thin-client/src/client.rs) for server calls (no standalone `reqwest` client). |
 
 **Chat endpoints (two surfaces, same SSE framing):**
 
-- **`POST /chat/stream`** — preferred for typed streaming; body is [`ChatStreamRequest`](../../rust/crates/mo-thin-client/src/protocol.rs). Use `ThinClient::chat_stream` / `chat_stream_collect`.
+- **`POST /chat/stream`** — preferred for typed streaming; body is [`ChatStreamRequest`](../../rust/crates/astra-thin-client/src/protocol.rs). Use `ThinClient::chat_stream` / `chat_stream_collect`.
 - **`POST /chat/turn`** — used by the current CLI agentic loop (tools, retries); same `Accept: text/event-stream`, JSON body shaped like the server’s chat-turn handler. Use `ThinClient::post_chat_turn` / `post_chat_turn_retry_429`.
 
-**§5.5 callbacks** — `mo-agent-server` exposes `POST /tools/result`, `POST /approval/respond` (JWT + `AppState::edge_callback_ledger`). **Registry**: `POST /agents/edge` and `POST /agents/edge/heartbeat` persist `edge_agent_registry` (typed bodies in `mo-thin-client`). **Task leases**: `GET /tasks/{id}/lease`, `POST .../lease/claim|release|renew` (JWT + `X-Mo-Edge-Id`). [`ThinClient`](../../rust/crates/mo-thin-client/src/client.rs): `post_tool_result`, `post_approval`, `post_agents_edge_register`, `post_agents_edge_heartbeat`, `get_task_lease`, `post_task_lease_claim` / `release` / `renew`.
+**§5.5 callbacks** — `astra-server` exposes `POST /tools/result`, `POST /approval/respond` (JWT + `AppState::edge_callback_ledger`). **Registry**: `POST /agents/edge` and `POST /agents/edge/heartbeat` persist `edge_agent_registry` (typed bodies in `astra-thin-client`). **Task leases**: `GET /tasks/{id}/lease`, `POST .../lease/claim|release|renew` (JWT + `X-Astra-Edge-Id`). [`ThinClient`](../../rust/crates/astra-thin-client/src/client.rs): `post_tool_result`, `post_approval`, `post_agents_edge_register`, `post_agents_edge_heartbeat`, `get_task_lease`, `post_task_lease_claim` / `release` / `renew`.
 
-**Server-aligned additions (not all listed in the prose above):** `GET/POST /tasks`, task lease paths above, `PUT /tasks/{id}/status`, `GET /tasks/{id}/progress`, `GET/POST /context`, `GET /context/{id}`, `POST /memory/retrieve`, `POST /chat/route` — path helpers in [`paths.rs`](../../rust/crates/mo-thin-client/src/paths.rs) and `ThinClient` in `client.rs`.
+**Server-aligned additions (not all listed in the prose above):** `GET/POST /tasks`, task lease paths above, `PUT /tasks/{id}/status`, `GET /tasks/{id}/progress`, `GET/POST /context`, `GET /context/{id}`, `POST /memory/retrieve`, `POST /chat/route` — path helpers in [`paths.rs`](../../rust/crates/astra-thin-client/src/paths.rs) and `ThinClient` in `client.rs`.
 
 #### 5.5.2 Lightweight edge executor
 
 The **edge** tier is intentionally **thin**: it is not a second copy of the cognitive runtime. A *light edge* process:
 
-| In scope | Out of scope (stays cloud / `mo-agent-server`) |
+| In scope | Out of scope (stays cloud / `astra-server`) |
 |----------|-----------------------------------------------|
 | Hold JWT (or receive per-turn token), call `POST /chat/stream` with SSE | LLM calls, tool selection, stall detection, plan decomposition |
-| Parse [`StreamEvent`](../../rust/crates/mo-thin-client/src/protocol.rs); on `tool_request`, run **local** tools (bash, fs, git, tree-sitter, …) | `SyncOrchestrator`, MatrixOne pool, `IngestionSender`, session journal |
-| `POST /tools/result` with [`ToolResultRequest`](../../rust/crates/mo-thin-client/src/protocol.rs) + `X-Mo-Edge-Id` | EntityGraph, PatternLibrary, progressive calibration |
+| Parse [`StreamEvent`](../../rust/crates/astra-thin-client/src/protocol.rs); on `tool_request`, run **local** tools (bash, fs, git, tree-sitter, …) | `SyncOrchestrator`, MatrixOne pool, `IngestionSender`, session journal |
+| `POST /tools/result` with [`ToolResultRequest`](../../rust/crates/astra-thin-client/src/protocol.rs) + `X-Astra-Edge-Id` | EntityGraph, PatternLibrary, progressive calibration |
 | Optional: `POST /approval/respond` if the UX is on the same machine | Cross-session learning merge |
-| Optional: `POST /agents/edge` (+ heartbeat) with [`EdgeRegisterRequest`](../../rust/crates/mo-thin-client/src/protocol.rs); task lease mutations with [`TaskLeaseMutationRequest`](../../rust/crates/mo-thin-client/src/protocol.rs) for multi-agent coordination | `SyncOrchestrator` / MatrixOne pool (server-side) |
+| Optional: `POST /agents/edge` (+ heartbeat) with [`EdgeRegisterRequest`](../../rust/crates/astra-thin-client/src/protocol.rs); task lease mutations with [`TaskLeaseMutationRequest`](../../rust/crates/astra-thin-client/src/protocol.rs) for multi-agent coordination | `SyncOrchestrator` / MatrixOne pool (server-side) |
 
-**Dependency budget**: `mo-thin-client` (+ serde / async runtime) and a **local tool runner** crate or embedded module. **Must not** depend on `mo-agent` (CLI), `runtime` pipeline, or `services` — otherwise the edge stops being deployable as a small sidecar (CI runner, IDE helper, headless worker).
+**Dependency budget**: `astra-thin-client` (+ serde / async runtime) and a **local tool runner** crate or embedded module. **Must not** depend on `astra` (CLI), `runtime` pipeline, or `services` — otherwise the edge stops being deployable as a small sidecar (CI runner, IDE helper, headless worker).
 
 **Advertise capabilities** on every chat turn so the cloud router knows which `tool_request` events to emit:
 
-- Rust: [`advertise_executor`](../../rust/crates/mo-thin-client/src/edge.rs) on [`ChatStreamRequest`](../../rust/crates/mo-thin-client/src/protocol.rs) sets `edge_executor_id` and, if empty, fills [`builtin_capability_preset`](../../rust/crates/mo-thin-client/src/edge.rs) (`bash`, `fs`, `git`, `code_intel`).
-- Header constant: [`MO_EDGE_ID_HEADER`](../../rust/crates/mo-thin-client/src/edge.rs) (`X-Mo-Edge-Id`) — used by [`ThinClient::post_tool_result`](../../rust/crates/mo-thin-client/src/client.rs).
+- Rust: [`advertise_executor`](../../rust/crates/astra-thin-client/src/edge.rs) on [`ChatStreamRequest`](../../rust/crates/astra-thin-client/src/protocol.rs) sets `edge_executor_id` and, if empty, fills [`builtin_capability_preset`](../../rust/crates/astra-thin-client/src/edge.rs) (`bash`, `fs`, `git`, `code_intel`).
+- Header constant: [`ASTRA_EDGE_ID_HEADER`](../../rust/crates/astra-thin-client/src/edge.rs) (`X-Astra-Edge-Id`) — used by [`ThinClient::post_tool_result`](../../rust/crates/astra-thin-client/src/client.rs).
 
-**Registry**: [`paths::AGENTS_EDGE`](../../rust/crates/mo-thin-client/src/paths.rs) / [`AGENTS_EDGE_HEARTBEAT`](../../rust/crates/mo-thin-client/src/paths.rs) call MatrixOne `edge_agent_registry` (after JWT). Use the same string for `body.edge_agent_id` and (typically) `X-Mo-Edge-Id` unless you split logical agent vs transport instance.
+**Registry**: [`paths::AGENTS_EDGE`](../../rust/crates/astra-thin-client/src/paths.rs) / [`AGENTS_EDGE_HEARTBEAT`](../../rust/crates/astra-thin-client/src/paths.rs) call MatrixOne `edge_agent_registry` (after JWT). Use the same string for `body.edge_agent_id` and (typically) `X-Astra-Edge-Id` unless you split logical agent vs transport instance.
 
 **Event loop (conceptual)**:
 
@@ -690,18 +692,18 @@ open SSE (chat/stream with edge_executor_id + capabilities)
   → render text/plan events for UI
 ```
 
-This is the same protocol as CLI/Web/IDE **thin clients**; the edge differs only in **also** executing tools and posting callbacks. Today’s `mo-agent` CLI still bundles thin client + **`chat_stream` cognitive loop** + edge tools — `plan_decompose` / `sync_adapters` now live in **`runtime`**. Next step: extract the remaining `chat_stream` loop to the server and ship a **standalone light edge** (§5.5.2).
+This is the same protocol as CLI/Web/IDE **thin clients**; the edge differs only in **also** executing tools and posting callbacks. Today’s `astra` CLI still bundles thin client + **`chat_stream` cognitive loop** + edge tools — `plan_decompose` / `sync_adapters` now live in **`runtime`**. Next step: extract the remaining `chat_stream` loop to the server and ship a **standalone light edge** (§5.5.2).
 
-**CLI wiring (current)**: each `/chat/turn` payload includes `edge_executor_id` (env `MO_EDGE_EXECUTOR_ID` or `edge-{uuid}` per process) and `capabilities` from [`builtin_capability_preset`](../../rust/crates/mo-thin-client/src/edge.rs). [`consume_turn_sse`](../../rust/crates/mo-agent/src/mo_agent/stream_render.rs) handles SSE in order: `tool_request` → execute → [`post_tool_result`](../../rust/crates/mo-thin-client/src/client.rs); `approval_required` → [`PermissionManager::resolve_cloud_approval`](../../rust/crates/mo-agent/src/mo_agent/permission_manager.rs) → [`post_approval`](../../rust/crates/mo-thin-client/src/client.rs). If the same tool+args also appears as `tool_call`, the agentic loop **reuses** `edge_callback_outputs` and skips a second local execution. The legacy `tool_call`-only path remains for servers that do not emit `tool_request`.
+**CLI wiring (current)**: each `/chat/turn` payload includes `edge_executor_id` (env `ASTRA_EDGE_EXECUTOR_ID` or `edge-{uuid}` per process) and `capabilities` from [`builtin_capability_preset`](../../rust/crates/astra-thin-client/src/edge.rs). [`consume_turn_sse`](../../rust/crates/astra-cli/src/cli/stream_render.rs) handles SSE in order: `tool_request` → execute → [`post_tool_result`](../../rust/crates/astra-thin-client/src/client.rs); `approval_required` → [`PermissionManager::resolve_cloud_approval`](../../rust/crates/astra-cli/src/cli/permission_manager.rs) → [`post_approval`](../../rust/crates/astra-thin-client/src/client.rs). If the same tool+args also appears as `tool_call`, the agentic loop **reuses** `edge_callback_outputs` and skips a second local execution. The legacy `tool_call`-only path remains for servers that do not emit `tool_request`.
 
 #### 5.5.3 CLI registry and heartbeat environment
 
-After the REPL banner, if silent/auth left a valid access token, [`edge_lifecycle.rs`](../../rust/crates/mo-agent/src/mo_agent/edge_lifecycle.rs) (`register_and_start_heartbeat`) performs a single **`POST /agents/edge`** (typed [`EdgeRegisterRequest`](../../rust/crates/mo-thin-client/src/protocol.rs), same string for `edge_agent_id` and [`X-Mo-Edge-Id`](../../rust/crates/mo-thin-client/src/edge.rs) as `chat_stream`), optional enrichment of `hostname` / `worktree_path` from `HOSTNAME` or `COMPUTERNAME` and `std::env::current_dir()`, then a background loop of **`POST /agents/edge/heartbeat`**. Register failures are non-fatal (dim stderr; chat continues). On REPL exit the heartbeat task is **aborted**.
+After the REPL banner, if silent/auth left a valid access token, [`edge_lifecycle.rs`](../../rust/crates/astra-cli/src/cli/edge_lifecycle.rs) (`register_and_start_heartbeat`) performs a single **`POST /agents/edge`** (typed [`EdgeRegisterRequest`](../../rust/crates/astra-thin-client/src/protocol.rs), same string for `edge_agent_id` and [`X-Astra-Edge-Id`](../../rust/crates/astra-thin-client/src/edge.rs) as `chat_stream`), optional enrichment of `hostname` / `worktree_path` from `HOSTNAME` or `COMPUTERNAME` and `std::env::current_dir()`, then a background loop of **`POST /agents/edge/heartbeat`**. Register failures are non-fatal (dim stderr; chat continues). On REPL exit the heartbeat task is **aborted**.
 
 | Variable | Behavior |
 |----------|----------|
-| `MO_EDGE_REGISTRY` | **Enabled** when unset or set to any value other than `0`, `false`, or `off` (exact string match). Set to one of those three to **disable** cloud register and heartbeat entirely (no HTTP, no background task). |
-| `MO_EDGE_HEARTBEAT_SECS` | Interval between heartbeats in seconds; default **120**. Set to **0** to register once (if enabled) but **not** start the background heartbeat task. Non-numeric values fall back to the default. |
+| `ASTRA_EDGE_REGISTRY` | **Enabled** when unset or set to any value other than `0`, `false`, or `off` (exact string match). Set to one of those three to **disable** cloud register and heartbeat entirely (no HTTP, no background task). |
+| `ASTRA_EDGE_HEARTBEAT_SECS` | Interval between heartbeats in seconds; default **120**. Set to **0** to register once (if enabled) but **not** start the background heartbeat task. Non-numeric values fall back to the default. |
 
 ---
 
@@ -753,7 +755,7 @@ pub trait DomainAdapter: Send + Sync {
 | **TemplateAdapter** | Templates | Pull-only cache of plan templates; cloud authoritative; push disabled (`PushTrigger::Never`) | [`TemplateAdapter`](../../rust/crates/runtime/src/sync_adapters.rs) |
 | **PreferenceAdapter** | Preferences | Bidirectional key/value sync over `user_preferences` via `MatrixOneTransport` | [`PreferenceAdapter`](../../rust/crates/runtime/src/sync_adapters.rs) |
 
-**Tests**: `services` crate includes [`multi_agent` unit tests](../../rust/crates/services/src/multi_agent.rs) (hold cache, TTL clamp, unconfigured services) and **ignored** MySQL integration tests in [`tests/multi_agent_integration.rs`](../../rust/crates/services/tests/multi_agent_integration.rs) (`MO_AGENT_MULTI_AGENT_IT=1`, `cargo test -p mo-agent-services multi_agent_integration -- --ignored`).
+**Tests**: `services` crate includes [`multi_agent` unit tests](../../rust/crates/services/src/multi_agent.rs) (hold cache, TTL clamp, unconfigured services) and **ignored** MySQL integration tests in [`tests/multi_agent_integration.rs`](../../rust/crates/services/tests/multi_agent_integration.rs) (`ASTRA_MULTI_AGENT_IT=1`, `cargo test -p astra-services multi_agent_integration -- --ignored`).
 
 ### 6.3 EventAdapter: Wire to Batch Ingestion
 
@@ -780,27 +782,36 @@ impl DomainAdapter for EventAdapter {
 
 ### 6.4 Session State Restoration
 
-Current `RestoredSession` restores:
-- ✅ Session metadata (git branch, model, title)
-- ✅ Recent tools (last 5 turn_complete events)
-- ✅ Learning snapshot (gzip+base64 from cloud)
-- ✅ Checkpoints (numbered, rewindable)
-- ⚠️ Conversation messages (partial — recent only)
-- ❌ Active plan state (minimal)
-- ❌ Dynamic tool availability
+> **Implementation detail (2026)**: See [`rust/docs/edge-cloud-sync-architecture.md`](../../rust/docs/edge-cloud-sync-architecture.md) §8 for the exact `HybridRestoreService` / Step Protocol / `/resume` layering and file paths (`~/.astra/sessions/…`).
 
-**Target**: Full restoration including plan state and conversation context:
+**`astra_services::session_restore::RestoredSession`** (hybrid metadata for the REPL) today covers:
+
+| Area | Source | Notes |
+|------|--------|--------|
+| Session identity, turn/tokens, model, git branch, status | Local `workspace.yaml` **or** cloud `agent_sessions` | Local-first; cloud uses `event_count` as `turn_count` |
+| Recent tools | Cloud: last 5 `turn_complete` → `metadata.tools_used` | When pool configured, even if workspace is local |
+| Learning snapshot | `learning_snapshots` | Pulled when DB available; `local_only()` service omits |
+| Plan / contract | `agent_sessions.metadata`, `task_contracts`, checkpoint `contract_state_json` | Plan JSON in metadata; contract from active row or checkpoint fallback |
+| Checkpoint list / rewind | Local checkpoint index, else `session_checkpoints` | `restore_to_checkpoint` adjusts turn/tokens from row |
+| Composite snapshot restore | **Local only** `step_checkpoints/composite_snapshots.json` | May chain to `restore_to_checkpoint` |
+
+**Conversation continuity** is handled by a **second** type, **`astra_runtime::pipeline::step_restore::RestoredSession`**: local **heavy** Step checkpoint + JSONL replay + idempotency warm-up; CLI falls back to **`pull_step_checkpoint_from_cloud`** if local restore fails. **`restore_history_from_journal`** fills chat history from JSONL (not full cloud transcript).
+
+**Remaining gaps / targets**
+
+- LLM-facing **conversation_summary** / **key_decisions** as first-class restore fields (not only journal + checkpoint inference).
+- **Dynamic tool availability** (MCP attach state, server-side tool policy) not fully captured on resume.
+- Optional **unification** of naming (`restore_learning("local", …)` vs real `user_id`) to avoid confusion.
+
 ```rust
+// Illustrative target fields (not all implemented on one struct today)
 pub struct RestoredSession {
     // ... existing fields ...
 
-    // NEW: Full plan restoration
     pub active_plan: Option<RestoredPlan>,
     pub plan_subtask_progress: Vec<SubtaskProgress>,
-
-    // NEW: Conversation context for LLM continuity
-    pub conversation_summary: Option<String>,  // LLM-generated summary of prior context
-    pub key_decisions: Vec<DecisionRecord>,     // Auditable decision points
+    pub conversation_summary: Option<String>,
+    pub key_decisions: Vec<DecisionRecord>,
 }
 ```
 
@@ -808,7 +819,7 @@ pub struct RestoredSession {
 
 ## 7. MatrixOne-Native Acceleration
 
-> *"Other agent runtimes store state in a database. mo-agent thinks in its database."*
+> *"Other agent runtimes store state in a database. astra thinks in its database."*
 
 MatrixOne is not just a storage backend — it is the **computational backbone** of the agent runtime. As a cloud-native HTAP database with unique features (Git4Data, Stage, Vector, Fulltext, Pub/Sub, Snapshot, PITR, native multi-tenancy), MatrixOne enables capabilities that **no other agent runtime can replicate** using PostgreSQL, MySQL, or SQLite.
 
@@ -947,7 +958,7 @@ SELECT * FROM coordination.shared_context
 WHERE plan_id = @current_plan;
 ```
 
-**What pub/sub IS good for in mo-agent**:
+**What pub/sub IS good for in astra**:
 - **Shared reference data**: Orchestrator publishes plan templates, task assignments, shared context. Agents subscribe and see updates in real-time without polling.
 - **Learning knowledge sharing**: Publish converged learning state (entity graph, pattern library) so all agents benefit from each other's experience.
 - **Cross-tenant data federation**: Platform-level shared resources (model configs, prompt templates) published to all customer accounts.
@@ -1018,7 +1029,7 @@ MatrixOne's Stage provides unified access to external storage (S3, OSS, local fi
 
 ```sql
 -- Configure artifact storage for agent outputs
-CREATE STAGE agent_artifacts URL = 's3://mo-agent-artifacts/'
+CREATE STAGE agent_artifacts URL = 's3://astra-artifacts/'
     CREDENTIALS = {'AWS_KEY_ID'='...', 'AWS_SECRET_KEY'='...'};
 
 -- Agent stores build artifacts
@@ -1704,7 +1715,7 @@ The agent ecosystem is standardizing. Google's A2A (Agent-to-Agent) protocol and
 
 ### 14.2 MCP as Tool Extension Surface
 
-mo-agent already supports MCP servers for tool discovery. Deepen this:
+astra already supports MCP servers for tool discovery. Deepen this:
 
 ```
 Edge Runtime
@@ -1719,28 +1730,28 @@ Edge Runtime
 
 ### 14.3 A2A for Multi-Platform Agent Federation
 
-When mo-agent needs to coordinate with agents on other platforms:
+When astra needs to coordinate with agents on other platforms:
 
 ```
-mo-agent Orchestrator
+astra Orchestrator
     │
-    ├── mo-agent Worker A (native protocol)
-    ├── mo-agent Worker B (native protocol)
+    ├── astra Worker A (native protocol)
+    ├── astra Worker B (native protocol)
     └── External Agent C (A2A protocol)
         ├── AgentCard discovery (/.well-known/agent.json)
         ├── Task creation (POST /tasks)
         └── Result streaming (SSE /tasks/{id}/events)
 ```
 
-**Implementation strategy**: A2A adapter that translates between mo-agent's internal event model and A2A's task/message format. This is a **bridge**, not a replacement — internal coordination remains native for performance.
+**Implementation strategy**: A2A adapter that translates between astra's internal event model and A2A's task/message format. This is a **bridge**, not a replacement — internal coordination remains native for performance.
 
 ### 14.4 Interop Priority
 
 | Standard | Priority | Rationale |
 |----------|----------|-----------|
 | **MCP tools** | ✅ Already supported | Extend to first-class registry integration |
-| **MCP sampling** | 🟡 High | Let external tools request LLM completions through mo-agent |
-| **A2A Agent Cards** | 🟡 High | Publish mo-agent capabilities for external discovery |
+| **MCP sampling** | 🟡 High | Let external tools request LLM completions through astra |
+| **A2A Agent Cards** | 🟡 High | Publish astra capabilities for external discovery |
 | **A2A Task protocol** | 🟢 Medium | Accept tasks from external orchestrators |
 | **OpenAI Agents SDK** | 🟢 Low | Compatibility layer if demand emerges |
 
@@ -1752,12 +1763,12 @@ mo-agent Orchestrator
 
 ### Phase 0: Crate Restructuring (Headless Runtime Enablement)
 
-**Goal**: Move cloud-side logic out of `mo-agent` CLI into server-side crates. After this phase, `mo-agent` is a thin client that speaks the same protocol as Web and IDE.
+**Goal**: Move cloud-side logic out of `astra` CLI into server-side crates. After this phase, `astra` is a thin client that speaks the same protocol as Web and IDE.
 
 | Task | Status | Effort | Notes / code |
 |------|--------|--------|----------------|
-| Move `sync_adapters` out of CLI | ✅ Done | — | **`runtime/src/sync_adapters.rs`** (not `services`: would create `runtime`↔`services` cycle). CLI uses `mo_agent_runtime::sync_adapters`. |
-| Move `plan_decompose` out of CLI | ✅ Done | — | **`runtime/src/plan_decompose.rs`**; CLI `use mo_agent_runtime::plan_decompose`. |
+| Move `sync_adapters` out of CLI | ✅ Done | — | **`runtime/src/sync_adapters.rs`** (not `services`: would create `runtime`↔`services` cycle). CLI uses `astra_runtime::sync_adapters`. |
+| Move `plan_decompose` out of CLI | ✅ Done | — | **`runtime/src/plan_decompose.rs`**; CLI `use astra_runtime::plan_decompose`. |
 | Extract active LLM row query + decrypt from `bridge_inprocess` | ✅ Done | — | **`services::resolve_active_llm_model`** (`models.rs`); bridge calls it. |
 | Extract shared edge prompt context + tool schema prune to `runtime` | ✅ Done (slice 1) | Small | **`runtime/src/turn/edge_prompt_context.rs`** (`detect_workspace_context`, `detect_project_languages`, `make_args_preview`); **`runtime/src/turn/tool_schema_prune.rs`** (`prune_tool_schemas`) — used by CLI `chat_stream` + `bridge_inprocess` |
 | Extract tool result semantics (error / resource-limit / dedup key) | ✅ Done (slice 2) | Small | **`runtime/src/turn/tool_result_semantics.rs`** — `is_tool_error`, `is_resource_limit_output`, `normalize_tool_arguments`, `tool_dedup_signature`; CLI `chat_stream` + `stream_render` |
@@ -1800,7 +1811,7 @@ mo-agent Orchestrator
 | Align `bridge_inprocess` LLM SSE with blank-line framing + shared `data:` parse | ✅ Done (slice 39) | Small | **`SseBlankLineUtf8Buf`** in **`sse_blocks`** (shared with **`ChatTurnSseFramer`**); **`parse_sse_chunks`**: blank-line blocks → `json_events_from_sse_event_block`; tail → `drain_sse_data_lines` / `finish_sse_data_buffer` |
 | Extract CLI agentic stall signatures + name-stall + verdict turn penalties | ✅ Done (slice 40) | Small | **`runtime::turn::stall`**: `round_tool_call_sig_and_names`, `detect_cli_tool_name_stall` (uses **`SERVER_STALL_WINDOW`**), `CLI_AGENTIC_VERDICT_REMAINING_PENALTY_*`; **`agentic_loop_turn`** calls in |
 | Extract `/chat/turn` stream ingest (guards, usage, factual retry, no-tool exit) | ✅ Done (slice 41) | Small | **`runtime::turn::agentic_turn_ingest`**: `ingest_agentic_turn_stream`, `AgenticTurnStreamSnapshot`, `AgenticTurnIngestMut`; CLI wires `TurnResult` → snapshot + edge index fn |
-| Move TurnGuard verdict audit row type to runtime (`VerdictEvent` alias in CLI) | ✅ Done (slice 42) | Tiny | **`runtime::turn::agentic_verdict_audit::AgenticVerdictAuditEvent`**; mo-agent `pub(crate) type VerdictEvent = …` |
+| Move TurnGuard verdict audit row type to runtime (`VerdictEvent` alias in CLI) | ✅ Done (slice 42) | Tiny | **`runtime::turn::agentic_verdict_audit::AgenticVerdictAuditEvent`**; astra `pub(crate) type VerdictEvent = …` |
 | Extend headless tool assembly (round indices, flat parse, timeout names, unknown-tool message) | ✅ Done (slice 43) | Tiny | **`headless_tool_assembly`**: `HeadlessRoundToolIdx`, `headless_round_tool_indices`, `parse_flat_tool_call_event`, `headless_timeout_aborted_tool_names`, `unknown_local_tool_error_message`; CLI `run_headless_tool_round` |
 | Extract reflect session hydrate + headless tool postprocess + journal row builders | ✅ Done (slice 44) | Small | **`hydrate_reflect`**: `reflect_hydration_rel_path`, `hydrate_reflect_placeholder_if_needed`; **`headless_tool_postprocess`**: `enrich_headless_tool_output_for_errors_and_limits`, `append_headless_result_quality_feedback`, `format_headless_tool_duration`; **`headless_tool_journal`**: duplicate/cache/unknown `ToolCallRecord` factories; **`SemanticDedup::append_near_duplicate_hint_if_any`**; removed `chat_stream/hydrate_reflect.rs` |
 | Extract `/chat` budget pressure + headless step/cache/checkpoint + executed journal row + skill-name merge | ✅ Done (slice 45) | Small | **`chat_turn_budget_pressure::budget_pressure_for_chat_turn`**; **`headless_tool_assembly::idempotency_cache_hit_message`**; **`headless_tool_postprocess`**: `HeadlessStepDeadline`, `HeadlessCacheableRecordCtx`, `record_headless_cacheable_success_and_semantic_hint`, `try_write_light_headless_step_checkpoint`; **`headless_tool_journal::journal_record_executed_tool_call`**; **`chat_history_openai::merge_skill_names_track`** |
@@ -1832,7 +1843,7 @@ mo-agent Orchestrator
 | Remove `matrixone_pool` from `ReplState` (use server `shared_pool`) | ✅ Done | — | Superseded by `MatrixCloudRuntime::shared_pool()`; no `matrixone_pool` field on `ReplState` |
 | Refactor `chat_stream/`: cognitive loop → `runtime`, rendering stays CLI | 🟡 In progress | Large | **Slices 1–67** + **`sse_loop/`** (2 child modules + `mod.rs`) + **`runtime/turn/chat_turn_sse_dispatch`**. Remaining: `/chat` prep + turn POST/SSE + multi-turn loop on server |
 
-**Success criteria** (unchanged): `mo-agent` CLI can be deleted and replaced with a ~500-line thin client; **not yet met** — `chat_stream` + `ReplState` infra fields remain.
+**Success criteria** (unchanged): `astra` CLI can be deleted and replaced with a ~500-line thin client; **not yet met** — `chat_stream` + `ReplState` infra fields remain.
 
 **Correction vs older drafts**: `sync_adapters` targets **`runtime`**, not `services`.
 
@@ -1867,11 +1878,11 @@ mo-agent Orchestrator
 
 **Goal**: Multiple agents can safely claim and execute tasks without conflicts.
 
-**Implemented**: `edge_agent_registry` + `task_leases` ([`storage.rs`](../../rust/crates/services/src/storage.rs)), [`DatabaseEdgeRegistryService`](../../rust/crates/services/src/multi_agent.rs) / [`DatabaseTaskLeaseService`](../../rust/crates/services/src/multi_agent.rs), `POST /agents/edge` and `POST /agents/edge/heartbeat`, task lease routes under `/tasks/{task_id}/lease/*`, `agent_tasks.agent_id`, `StateSyncService::pull_tasks_pack` / `push_tasks_pack_held`, [`TaskAdapter`](../../rust/crates/runtime/src/sync_adapters.rs) + [`MatrixOneTransport`](../../rust/crates/runtime/src/sync_adapters.rs) for [`SyncDomain::Tasks`](../../rust/crates/services/src/sync_engine.rs). CLI chat uses `MO_EDGE_EXECUTOR_ID` (or `edge-{uuid}`) for `edge_executor_id` / `X-Mo-Edge-Id`; [`MatrixCloudRuntime`](../../rust/crates/runtime/src/matrix_cloud_runtime.rs) may use `MO_EDGE_AGENT_ID` for the same logical role in server-side wiring — keep **one** id per process consistent with lease claim bodies.
+**Implemented**: `edge_agent_registry` + `task_leases` ([`storage.rs`](../../rust/crates/services/src/storage.rs)), [`DatabaseEdgeRegistryService`](../../rust/crates/services/src/multi_agent.rs) / [`DatabaseTaskLeaseService`](../../rust/crates/services/src/multi_agent.rs), `POST /agents/edge` and `POST /agents/edge/heartbeat`, task lease routes under `/tasks/{task_id}/lease/*`, `agent_tasks.agent_id`, `StateSyncService::pull_tasks_pack` / `push_tasks_pack_held`, [`TaskAdapter`](../../rust/crates/runtime/src/sync_adapters.rs) + [`MatrixOneTransport`](../../rust/crates/runtime/src/sync_adapters.rs) for [`SyncDomain::Tasks`](../../rust/crates/services/src/sync_engine.rs). CLI chat uses `ASTRA_EDGE_EXECUTOR_ID` (or `edge-{uuid}`) for `edge_executor_id` / `X-Astra-Edge-Id`; [`MatrixCloudRuntime`](../../rust/crates/runtime/src/matrix_cloud_runtime.rs) may use `ASTRA_EDGE_AGENT_ID` for the same logical role in server-side wiring — keep **one** id per process consistent with lease claim bodies.
 
 | Task | Status | Notes |
 |------|--------|--------|
-| `edge_agent_registry` + heartbeat | ✅ Done | Typed bodies in `mo-thin-client`; see [`edge_callback_handlers`](../../rust/crates/runtime/src/server/edge_callback_handlers.rs) |
+| `edge_agent_registry` + heartbeat | ✅ Done | Typed bodies in `astra-thin-client`; see [`edge_callback_handlers`](../../rust/crates/runtime/src/server/edge_callback_handlers.rs) |
 | `task_leases` + transactional claim | ✅ Done | `SELECT … FOR UPDATE` on `agent_tasks` + `task_leases` in [`try_claim_lease`](../../rust/crates/services/src/multi_agent.rs) |
 | `agent_id` on `TaskRecord` / `agent_tasks` | ✅ Done | Nullable `agent_id` column + lease-driven updates |
 | Lease-aware TaskAdapter + held push | ✅ Done | [`TaskAdapter`](../../rust/crates/runtime/src/sync_adapters.rs), [`push_tasks_pack_held_mysql`](../../rust/crates/services/src/multi_agent.rs) |
@@ -1907,7 +1918,7 @@ mo-agent Orchestrator
 
 ## Appendix A: Industry Comparison Matrix
 
-| Capability | Codex | Claude Code | Cursor | Devin | LangGraph | CrewAI | **mo-agent (current)** | **mo-agent (target)** |
+| Capability | Codex | Claude Code | Cursor | Devin | LangGraph | CrewAI | **astra (current)** | **astra (target)** |
 |-----------|-------|-------------|--------|-------|-----------|--------|----------------------|---------------------|
 | Execution model | Cloud container | Local CLI | IDE embedded | Docker isolated | Framework | Framework | Edge-cloud split | Edge-cloud split |
 | Session persistence | None | Local SQLite | IDE state | Git snapshots | Checkpoints | None default | JSONL + MatrixOne | JSONL + MatrixOne |
@@ -1956,22 +1967,22 @@ mo-agent Orchestrator
 | Chat turn heuristics | `runtime/src/turn/chat_turn_heuristics.rs` | Factual-query guard, `openai_factual_tool_retry_user_message`, session-not-found, repo extraction from memory text | runtime ✅ |
 | Headless tool assembly | `runtime/src/turn/headless_tool_assembly.rs` | `CACHEABLE_TOOLS`, edge row → `tool_call` output match, `openai_assistant_with_tool_calls_message`, `openai_tool_roundtrip_values` | runtime ✅ |
 | Bridge (HTTP) | `runtime/src/turn/bridge/mod.rs` | HttpChatTurnBridge, forwards to external service | runtime ✅ |
-| Chat stream | `mo-agent/src/mo_agent/chat_stream/` (`sse_loop/mod.rs`, `agentic_sse_loop.rs`, `agentic_loop_turn.rs`) | Multi-turn loop orchestration + CLI rendering; imports runtime headless helpers | ⚠️ Core loop should move to runtime |
+| Chat stream | `rust/crates/astra-cli/src/cli/chat_stream/` (`sse_loop/mod.rs`, `agentic_sse_loop.rs`, `agentic_loop_turn.rs`) | Multi-turn loop orchestration + CLI rendering; imports runtime headless helpers | ⚠️ Core loop should move to runtime |
 | Plan decompose | `runtime/src/plan_decompose.rs` | Long-horizon planning, subtask generation | runtime ✅ |
 | Entity graph | `runtime/src/pipeline/entity.rs` | EntityKnowledge, decayed_confidence | runtime ✅ |
 | Pattern library | `runtime/src/pipeline/pattern.rs` | ToolChainPattern, drift detection | runtime ✅ |
 | Calibrator | `runtime/src/pipeline/calibration.rs` | ProgressiveCalibrator, 3-axis thresholds | runtime ✅ |
 | Stall detection | `runtime/src/turn/stall.rs` | TurnGuard, intent drift, name stall | runtime ✅ |
 | Error recovery | `runtime/src/turn/error_recovery.rs` | ErrorCategory, escalation thresholds | runtime ✅ |
-| Code intelligence | `mo-agent/src/edge_tools/code_intel.rs` | 10 AST tools, tree-sitter, PARSER_CACHE | edge ✅ (stays) |
-| Git (pure Rust) | `mo-agent/src/edge_tools/git_gix.rs` | 8 git tools via gix, no binary dependency | edge ✅ (stays) |
+| Code intelligence | `astra/src/edge_tools/code_intel.rs` | 10 AST tools, tree-sitter, PARSER_CACHE | edge ✅ (stays) |
+| Git (pure Rust) | `astra/src/edge_tools/git_gix.rs` | 8 git tools via gix, no binary dependency | edge ✅ (stays) |
 | App state | `runtime/src/app_state.rs` | AppState: 30+ service traits, turn writers, bridge | runtime ✅ |
 | Server builder | `runtime/src/server/state_builder.rs` | Pipeline learning writer, bridge wiring | runtime ✅ |
 | Router | `runtime/src/server/router_builder.rs` | 50+ HTTP routes, the thin client API surface | runtime ✅ |
 | Edge §5.5 callbacks | `runtime/src/server/edge_callback_handlers.rs` | `/tools/result`, `/approval/respond`, `/agents/edge*` | runtime ✅ |
 | Web proxy | `web/app/api/backend/[...path]/route.ts` | Server-side proxy, httpOnly cookie auth | web ✅ |
-| Thin client (§5.5) | `mo-thin-client/src/{paths,protocol,client}.rs` | Shared HTTP+SSE; CLI and future clients | ✅ |
-| Light edge (§5.5.2) | `mo-thin-client/src/edge.rs` | `edge_executor_id` helpers, capability preset, `X-Mo-Edge-Id` | ✅ |
+| Thin client (§5.5) | `astra-thin-client/src/{paths,protocol,client}.rs` | Shared HTTP+SSE; CLI and future clients | ✅ |
+| Light edge (§5.5.2) | `astra-thin-client/src/edge.rs` | `edge_executor_id` helpers, capability preset, `X-Astra-Edge-Id` | ✅ |
 
 ---
 

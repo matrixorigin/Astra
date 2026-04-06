@@ -31,7 +31,7 @@ type ActionResult = {
 const TOKEN_MAX_AGE = 365 * 24 * 60 * 60; // 1 year for cookie persistence
 
 function getApiUrl(cookieStore: Awaited<ReturnType<typeof cookies>>): string {
-  return cookieStore.get(API_URL_COOKIE)?.value ?? process.env.MO_AGENT_API_URL ?? DEFAULT_API_URL;
+  return cookieStore.get(API_URL_COOKIE)?.value ?? process.env.ASTRA_API_URL ?? DEFAULT_API_URL;
 }
 
 async function saveTokens(tokens: AuthTokens): Promise<void> {

@@ -27,7 +27,7 @@ docker compose --profile app up -d --build
 | --- | --- | --- | --- |
 | matrixone | 6001 | default | primary database |
 | redis | 6379 | default | cache and queue support |
-| init | - | app | one-shot initialization via `mo-admin init` |
+| init | - | app | one-shot initialization via `astra-admin init` |
 | api | 8000 | app | Rust API shell |
 
 ## Notes

@@ -1,7 +1,7 @@
 //! Full path: `POST /chat/turn` (mock LLM via `test_llm_rounds`) → SSE `tool_request` →
 //! `POST /tools/result` → shared ledger → bridge consumes and persists tool result.
 //!
-//! Requires crate feature `bridge-e2e-hooks` and env `MO_AGENT_BRIDGE_TEST_SECRET` (set below).
+//! Requires crate feature `bridge-e2e-hooks` and env `ASTRA_BRIDGE_TEST_SECRET` (set below).
 
 use std::sync::Arc;
 use std::sync::OnceLock;
@@ -32,7 +32,7 @@ fn ensure_bridge_test_secret_env() {
         // SAFETY: `set_var` is `unsafe` in Rust 2024; this integration test binary sets the secret
         // once (before test threads read it) so `bridge_e2e_hooks::authorized` matches the client header.
         unsafe {
-            std::env::set_var("MO_AGENT_BRIDGE_TEST_SECRET", "ledger-inject-e2e-secret");
+            std::env::set_var("ASTRA_BRIDGE_TEST_SECRET", "ledger-inject-e2e-secret");
         }
     });
 }

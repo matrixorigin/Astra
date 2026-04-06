@@ -3,6 +3,8 @@
 Audit edge-cloud synchronization in **astra**. Verifies data integrity between local
 journal/checkpoints and MatrixOne cloud tables.
 
+**Architecture reference (restore, composite snapshots, skill registry vs cloud):** [rust/docs/edge-cloud-sync-architecture.md](../../rust/docs/edge-cloud-sync-architecture.md) — especially §8–§8.5.
+
 ## Usage
 
 ```
@@ -18,7 +20,7 @@ journal/checkpoints and MatrixOne cloud tables.
 |--------|-------------|-------------|-------|
 | **Events** | `~/.astra/sessions/<id>.jsonl` | `agent_events` | Event count match, expansion, ingestion rate |
 | **Learning** | `~/.astra/learning/<profile>.json` | `learning_snapshots` | Version match, delta sync, conflicts |
-| **Checkpoints** | `step_checkpoints/*-heavy.json` | `session_checkpoints` | Coverage, recoverability, consistency |
+| **Checkpoints** | `~/.astra/sessions/<id>/step_checkpoints/*-heavy.json` (+ `checkpoints/` markdown) | `session_checkpoints` | Coverage, recoverability, consistency |
 | **Tasks** | Journal PlanProgress events | `agent_tasks` | Active task sync, orphan detection |
 
 ## Sync Architecture

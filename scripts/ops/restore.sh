@@ -10,8 +10,8 @@ if [ $# -eq 0 ]; then
     echo "Usage: $0 <backup_file>"
     echo ""
     echo "Example:"
-    echo "   $0 backups/mo_agent_backup_20260224_091500.sql.gz"
-    echo "   $0 backups/mo_agent_backup_20260224_091500.sql"
+    echo "   $0 backups/astra_backup_20260224_091500.sql.gz"
+    echo "   $0 backups/astra_backup_20260224_091500.sql"
     exit 1
 fi
 
@@ -28,7 +28,7 @@ DB_HOST="${MATRIXONE_HOST:-localhost}"
 DB_PORT="${MATRIXONE_PORT:-6001}"
 DB_USER="${MATRIXONE_USER:-root}"
 DB_PASSWORD="${MATRIXONE_PASSWORD:-111}"
-DB_NAME="${MATRIXONE_DATABASE:-mo_agent}"
+DB_NAME="${MATRIXONE_DATABASE:-astra}"
 
 echo "⚠️  WARNING: This will replace all data in database '${DB_NAME}'"
 echo "   Host: ${DB_HOST}:${DB_PORT}"
@@ -48,7 +48,7 @@ echo "🔄 Starting database restore..."
 TEMP_FILE=""
 if [[ "${BACKUP_FILE}" == *.gz ]]; then
     echo "📦 Decompressing backup..."
-    TEMP_FILE="/tmp/mo_agent_restore_$$.sql"
+    TEMP_FILE="/tmp/astra_restore_$$.sql"
     gunzip -c "${BACKUP_FILE}" > "${TEMP_FILE}"
     RESTORE_FILE="${TEMP_FILE}"
 else

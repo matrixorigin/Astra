@@ -132,8 +132,8 @@ ingress:
   host: astra.example.com
   tls:
     enabled: false
-    secretName: mo-agent-tls
+    secretName: astra-tls
 
 # ─── Common ───────────────────────────────────────────────
-namespace: mo-agent
+namespace: astra
 imagePullSecrets: []

@@ -1,7 +1,7 @@
 {
   "name": "audit_cloud_sync",
   "version": "1.0.0",
-  "description": "Audit edge-cloud synchronization: events, learning, checkpoints, tasks",
+  "description": "Audit edge-cloud synchronization: events, learning, checkpoints, tasks. See rust/docs/edge-cloud-sync-architecture.md §8 for restore and skill paths.",
   "category": "development",
   "input_schema": {
     "type": "object",

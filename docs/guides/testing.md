@@ -37,7 +37,7 @@ cargo check --manifest-path rust/Cargo.toml
 
 ```bash
 # 1. Run the smallest relevant contract test while iterating
-cargo test --manifest-path rust/Cargo.toml -p mo-agent-runtime --test auth_contract
+cargo test --manifest-path rust/Cargo.toml -p astra-runtime --test auth_contract
 
 # 2. Expand to the API-shell contract suite
 make test-contract

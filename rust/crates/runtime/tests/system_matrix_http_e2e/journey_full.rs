@@ -630,7 +630,7 @@ pub async fn run_product_matrix_full_journey(
         .uri("/agents/edge")
         .header("authorization", auth_header.as_str())
         .header("content-type", "application/json")
-        .header("x-mo-edge-id", "matrix-e2e-edge")
+        .header("x-astra-edge-id", "matrix-e2e-edge")
         .body(Body::from(
             json!({
                 "edge_agent_id": edge_agent_id,
@@ -661,7 +661,7 @@ pub async fn run_product_matrix_full_journey(
         app,
         "/agents/edge/heartbeat",
         Some(auth_header.as_str()),
-        &[("x-mo-edge-id", "matrix-e2e-edge")],
+        &[("x-astra-edge-id", "matrix-e2e-edge")],
         json!({ "edge_agent_id": edge_agent_id }),
     )
     .await;
@@ -1002,7 +1002,7 @@ pub async fn run_product_matrix_full_journey(
         }]
     });
 
-    let test_secret = std::env::var("MO_AGENT_BRIDGE_TEST_SECRET").expect("bridge test secret");
+    let test_secret = std::env::var("ASTRA_BRIDGE_TEST_SECRET").expect("bridge test secret");
     let chat_req = Request::builder()
         .method("POST")
         .uri("/chat/turn")

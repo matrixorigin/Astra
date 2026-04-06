@@ -1,6 +1,6 @@
-# Example model configuration file for mo-admin model load
+# Example model configuration file for astra-admin model load
 #
-# Usage: mo-admin model load models.yaml
+# Usage: astra-admin model load models.yaml
 #
 # Supports both single model and array of models.
 # Required fields: name, provider, api_key

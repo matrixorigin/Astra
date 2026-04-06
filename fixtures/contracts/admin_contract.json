@@ -210,7 +210,7 @@
         "user_id": "contract-audit-user",
         "action": "revoke_role",
         "resource_type": "role",
-        "resource_id": "mo_agent_admin",
+        "resource_id": "astra_admin",
         "timestamp": "2026-01-03T10:00:00",
         "details": {
           "username": "alice"
@@ -237,7 +237,7 @@
         "user_id": "contract-audit-user",
         "action": "revoke_role",
         "resource_type": "role",
-        "resource_id": "mo_agent_admin",
+        "resource_id": "astra_admin",
         "timestamp": "2026-01-03T10:00:00",
         "details": {
           "username": "alice"

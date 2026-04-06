@@ -56,10 +56,10 @@ The edge knows things the cloud doesn't (local files, tools, working directory).
 │  EDGE (first turn only)                                     │
 │                                                             │
 │  Collects local context:                                    │
-│  ├── project_rules     (.mo-agent/rules.md, steering/*.md)  │
+│  ├── project_rules     (.astra/rules.md, .astra/rules.md, steering/*.md)  │
 │  ├── edge_tools        (tool schemas from ToolRouter)       │
 │  ├── edge_profile      (cwd, git branch, language detected) │
-│  └── user_preferences  (.mo-agent/preferences.json)         │
+│  └── user_preferences  (merged from cloud / local; see state_sync + journal sync_marker) │
 │                                                             │
 │  Sends as structured payload in first /chat/turn            │
 └──────────────────────────┬──────────────────────────────────┘
@@ -147,7 +147,7 @@ This is what makes the agent self-aware. It's assembled from multiple sources:
 ```python
 ## Self-Model
 
-You are **{agent_name}**, a {agent_type} agent running on mo-agent-engine.
+You are **{agent_name}**, a {agent_type} agent running on astra-engine.
 
 ### Capabilities
 - Local tools (via edge): {edge_tool_names}

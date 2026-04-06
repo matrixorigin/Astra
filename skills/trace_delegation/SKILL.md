@@ -364,6 +364,6 @@ Sub-runs check `pause_flag` at tool execution boundaries. Check:
 | CoordinationPattern | `rust/crates/services/src/coordination.rs` |
 | AgentProfile & tiers | `rust/crates/services/src/coordination.rs` |
 | Delegation events | `rust/crates/services/src/session_journal.rs` |
-| Durable bridge | `rust/crates/mo-agent/src/mo_agent/durable_bridge.rs` |
+| Durable bridge | `rust/crates/astra-cli/src/cli/durable_bridge.rs` |
 | Verification gate | `rust/crates/runtime/src/server/delegation_engine.rs` (VerificationGate trait) |
 | Checkpoint gate | `rust/crates/runtime/src/server/delegation_engine.rs` (CheckpointGate trait) |

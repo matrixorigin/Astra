@@ -35,7 +35,7 @@ The platform already has every piece of the pipeline:
 | `context_snapshots` | ✅ Exists | Full context at each decision point |
 | Heuristic detector | ✅ Implemented | Auto-labels high-confidence cases |
 | `/rate` command | ✅ Implemented | Explicit user labels |
-| `mo-admin prompt mine-feedback --use-llm` | ✅ Implemented | LLM teacher labels |
+| `astra-admin prompt mine-feedback --use-llm` | ✅ Implemented | LLM teacher labels |
 | Training data pipeline | ✅ Designed (§6 eval-and-evolution) | Versioned datasets with lineage |
 | Regression gate | ✅ Implemented | Validates model changes before deployment |
 | Skill registry | ✅ Implemented | Deploy model as a platform skill |
@@ -61,7 +61,7 @@ No external infrastructure needed. The model trains on platform data, deploys as
 │  - Maps: rating 1-2 → negative, 4-5 → positive              │
 ├─────────────────────────────────────────────────────────────┤
 │  Source 3: LLM Teacher (batch, on-demand)                    │
-│  - mo-admin prompt mine-feedback --use-llm                   │
+│  - astra-admin prompt mine-feedback --use-llm                   │
 │  - Classifies ambiguous cases heuristic couldn't resolve     │
 │  - Highest coverage, moderate cost                           │
 ├─────────────────────────────────────────────────────────────┤
@@ -102,7 +102,7 @@ No external infrastructure needed. The model trains on platform data, deploys as
 
 ```bash
 # Export training data from llm_feedback table
-mo-admin feedback export --output train.jsonl --min-confidence 0.7
+astra-admin feedback export --output train.jsonl --min-confidence 0.7
 
 # Output format (JSONL):
 {"query": "...", "response": "...", "followup": "...", "label": "correction", "weight": 1.0}
@@ -204,7 +204,7 @@ class FeedbackTrainerSkill(BaseSkill):
             {
                 "artifact_id": "art_abc123",
                 "metrics": {"accuracy": 0.87, "f1": 0.85},
-                "onnx_path": "~/.mo-agent/models/art_abc123.onnx"
+                "onnx_path": "~/.astra/models/art_abc123.onnx"
             }
         """
 ```
@@ -537,12 +537,12 @@ CREATE TABLE model_artifacts (
 ```
 
 **Storage strategy**:
-- **Development**: `~/.mo-agent/models/art_abc123.onnx`
+- **Development**: `~/.astra/models/art_abc123.onnx`
 - **Production**: S3 + CloudFront CDN for fast download
 
 ### 6.5 Multi-Process Deployment
 
-**Problem**: Multiple `mo-agent chat` processes each load model (110MB × N)
+**Problem**: Multiple `astra chat` processes each load model (110MB × N)
 
 **Solution**: Shared model server
 
@@ -567,10 +567,10 @@ class ModelServer:
 
 ```bash
 # Terminal 1: Start model server
-mo-agent model serve --port 9527
+astra model serve --port 9527
 
 # Terminal 2-N: Chat processes use HTTP client
-mo-agent chat  # Auto-detects model server at localhost:9527
+astra chat  # Auto-detects model server at localhost:9527
 ```
     category = "platform"
     
@@ -611,16 +611,16 @@ class ImplicitFeedbackDetector:
 
 ```bash
 # Export training data
-mo-admin feedback export --format jsonl --output feedback_train.jsonl
+astra-admin feedback export --format jsonl --output feedback_train.jsonl
 
 # Train model
-mo-admin feedback train --data feedback_train.jsonl --output models/feedback_v1/
+astra-admin feedback train --data feedback_train.jsonl --output models/feedback_v1/
 
 # Evaluate
-mo-admin feedback eval --model models/feedback_v1/ --test feedback_test.jsonl
+astra-admin feedback eval --model models/feedback_v1/ --test feedback_test.jsonl
 
 # Deploy (registers as platform skill, replaces heuristic layer)
-mo-admin feedback deploy --model models/feedback_v1/
+astra-admin feedback deploy --model models/feedback_v1/
 ```
 
 ---
@@ -645,7 +645,7 @@ Monitor: dataset size, label distribution, model accuracy
     ↓
 Trigger: dataset grows 20%+ OR accuracy drops 5%+ OR 1 month elapsed
     ↓
-mo-admin feedback retrain --validate
+astra-admin feedback retrain --validate
     ↓
 FeedbackTrainerSkill: export data → train → export ONNX → register artifact
     ↓
@@ -696,11 +696,11 @@ class RetrainingMonitor:
 
 ```bash
 # Cron job: weekly check
-0 2 * * 0  conda run -n agent-engine mo-admin feedback retrain --auto-activate
+0 2 * * 0  conda run -n agent-engine astra-admin feedback retrain --auto-activate
 
 # Manual trigger
-mo-admin feedback retrain --validate --dry-run  # Preview metrics
-mo-admin feedback retrain --validate            # Train + gate + activate if pass
+astra-admin feedback retrain --validate --dry-run  # Preview metrics
+astra-admin feedback retrain --validate            # Train + gate + activate if pass
 ```
 
 ### 7.3 A/B Testing

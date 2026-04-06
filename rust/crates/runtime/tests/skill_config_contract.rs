@@ -472,7 +472,7 @@ async fn set_setting_global_scope_with_admin_returns_ok() {
                 .method("PUT")
                 .uri("/skills/my-skill/config/api_key?scope=global")
                 .header("X-User-Id", "user-1")
-                .header("X-User-Role", "mo_agent_admin")
+                .header("X-User-Role", "astra_admin")
                 .header("content-type", "application/json")
                 .body(body::Body::from(r#"{"value":"test"}"#))
                 .unwrap(),

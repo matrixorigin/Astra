@@ -318,7 +318,7 @@ def suggest_quality_schema(skill_name: str, sample_size: int = 50) -> dict:
     return schema  # Draft for human review
 ```
 
-4. **CLI tooling.** `mo-admin skill suggest-schema <skill_name>` generates the draft and opens it for review. The developer edits and confirms — not writes from scratch.
+4. **CLI tooling.** `astra-admin skill suggest-schema <skill_name>` generates the draft and opens it for review. The developer edits and confirms — not writes from scratch.
 
 5. **Continuous sentinel discovery.** `suggest_quality_schema()` is not a one-shot tool — it runs as a **weekly governance task** that compares current historical patterns against the active schema and surfaces new sentinel candidates:
 
@@ -1114,7 +1114,7 @@ Over 500 sessions with tool calls:
 ### Costs
 
 - Engineering: 8 engineer-days (2 weeks, 4 days/week)
-- Schema authoring: ~1 hour per skill with `mo-admin skill suggest-schema` (auto-generated draft, human review only)
+- Schema authoring: ~1 hour per skill with `astra-admin skill suggest-schema` (auto-generated draft, human review only)
 - Token overhead: ≤105 tokens per annotated result (only degraded results)
 - Latency: <1ms typical, <3ms worst case per assessment (depth-limited JSON traversal, no LLM). Results >32KB skip assessment entirely. See §4.3 for performance guardrails.
 
@@ -1145,7 +1145,7 @@ No major agent framework currently implements pre-LLM tool result quality assess
 | AutoGen | Pass-through to LLM | ❌ None |
 | Claude Code | Pass-through to LLM | ❌ None |
 | Letta/MemGPT | Pass-through to LLM | ❌ None |
-| **mo-agent** | **Assess → Annotate → Pass to LLM** | **✅ Schema-driven + structural inference** |
+| **astra** | **Assess → Annotate → Pass to LLM** | **✅ Schema-driven + structural inference** |
 
 The closest analogy is data quality monitoring in data engineering (Great Expectations, dbt tests) — but applied to real-time tool outputs in an agentic loop. We are the first to bring data quality discipline to the agent tool-use pipeline.
 

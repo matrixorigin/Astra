@@ -1,12 +1,12 @@
-# Tool discovery at scale: mo-agent vs Claude Code (`ToolSearchTool`)
+# Tool discovery at scale: astra vs Claude Code (`ToolSearchTool`)
 
 ## Comparison row
 
-| 能力 | mo-agent | Claude Code | 对比 |
+| 能力 | astra | Claude Code | 对比 |
 |------|----------|-------------|------|
 | **ToolSearchTool**（模型主动「搜工具 / 拉 deferred schema」） | ❌ **CLI 路径未暴露**同名工具；每轮由 **selector（TF-IDF / LLM 等）在边侧先裁剪**，再把 **子集 schema** 交给模型 | ✅ 提供 **`ToolSearchTool`** 一类能力：大集合下由 **LLM 按需发现**并 **deferred 加载**工具定义 | **CC 优势**：超大规模 tool / MCP 池时，模型可自主「翻目录」，不必一次性依赖本轮静态子集 |
 
-## What mo-agent has today (nuance)
+## What astra has today (nuance)
 
 - **Runtime 基建（CC `ToolSearch` 的类比物）** 已存在：`rust/crates/runtime/src/tool_registry/tool_pool.rs`  
   - `ToolPool` + `SearchableToolMeta`：大索引、**按需物化**完整 JSON schema。  

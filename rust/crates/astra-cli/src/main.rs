@@ -52,63 +52,63 @@ use rustyline::{
 };
 use serde::{Deserialize, Serialize};
 
-#[path = "mo_agent/auth_flow.rs"]
+#[path = "cli/auth_flow.rs"]
 mod auth_flow;
-#[path = "mo_agent/chat_stream/mod.rs"]
+#[path = "cli/chat_stream/mod.rs"]
 mod chat_stream;
-#[path = "mo_agent/cli_formatting.rs"]
+#[path = "cli/cli_formatting.rs"]
 mod cli_formatting;
-#[path = "mo_agent/cli_utils.rs"]
+#[path = "cli/cli_utils.rs"]
 mod cli_utils;
-#[path = "mo_agent/command_router.rs"]
+#[path = "cli/command_router.rs"]
 mod command_router;
-#[path = "mo_agent/diff_presenter.rs"]
+#[path = "cli/diff_presenter.rs"]
 mod diff_presenter;
-#[path = "mo_agent/durable_bridge.rs"]
+#[path = "cli/durable_bridge.rs"]
 mod durable_bridge;
-#[path = "mo_agent/edge_lifecycle.rs"]
+#[path = "cli/edge_lifecycle.rs"]
 mod edge_lifecycle;
-#[path = "mo_agent/effects/mod.rs"]
+#[path = "cli/effects/mod.rs"]
 mod effects;
-#[path = "mo_agent/permission_manager.rs"]
+#[path = "cli/permission_manager.rs"]
 mod permission_manager;
-#[path = "mo_agent/plan_executor.rs"]
+#[path = "cli/plan_executor.rs"]
 mod plan_executor;
-#[path = "mo_agent/readline_actor.rs"]
+#[path = "cli/readline_actor.rs"]
 mod readline_actor;
-#[path = "mo_agent/repl_runtime.rs"]
+#[path = "cli/repl_runtime.rs"]
 mod repl_runtime;
-#[path = "mo_agent/repl_turn.rs"]
+#[path = "cli/repl_turn.rs"]
 mod repl_turn;
-#[path = "mo_agent/repl_ui.rs"]
+#[path = "cli/repl_ui.rs"]
 mod repl_ui;
-#[path = "mo_agent/skill_subrun.rs"]
+#[path = "cli/skill_subrun.rs"]
 mod skill_subrun;
-#[path = "mo_agent/slash_account.rs"]
+#[path = "cli/slash_account.rs"]
 mod slash_account;
-#[path = "mo_agent/slash_debug.rs"]
+#[path = "cli/slash_debug.rs"]
 mod slash_debug;
-#[path = "mo_agent/slash_info.rs"]
+#[path = "cli/slash_info.rs"]
 mod slash_info;
-#[path = "mo_agent/slash_mcp.rs"]
+#[path = "cli/slash_mcp.rs"]
 mod slash_mcp;
-#[path = "mo_agent/slash_memory.rs"]
+#[path = "cli/slash_memory.rs"]
 mod slash_memory;
-#[path = "mo_agent/slash_session.rs"]
+#[path = "cli/slash_session.rs"]
 mod slash_session;
-#[path = "mo_agent/slash_skill.rs"]
+#[path = "cli/slash_skill.rs"]
 mod slash_skill;
-#[path = "mo_agent/slash_state.rs"]
+#[path = "cli/slash_state.rs"]
 mod slash_state;
-#[path = "mo_agent/slash_team.rs"]
+#[path = "cli/slash_team.rs"]
 mod slash_team;
-#[path = "mo_agent/stream_render.rs"]
+#[path = "cli/stream_render.rs"]
 mod stream_render;
-#[path = "mo_agent/streaming_md.rs"]
+#[path = "cli/streaming_md.rs"]
 mod streaming_md;
-#[path = "mo_agent/terminal_region.rs"]
+#[path = "cli/terminal_region.rs"]
 mod terminal_region;
-#[path = "mo_agent/theme.rs"]
+#[path = "cli/theme.rs"]
 mod theme;
 
 use astra_runtime::turn::chat_turn_heuristics::{
@@ -3791,13 +3791,13 @@ fn cloud_pull_warrants_sync_marker(pull: &CloudPullResult, pref_keys: &[String])
 
 /// When set to `1`, `repl_startup` also journals a sync marker if MatrixOne was reachable but
 /// returned no learning rows, tool health, or preferences (audit / connectivity proof).
-const MO_JOURNAL_CLOUD_EMPTY_ACK: &str = "MO_JOURNAL_CLOUD_EMPTY_ACK";
+const ASTRA_JOURNAL_CLOUD_EMPTY_ACK: &str = "ASTRA_JOURNAL_CLOUD_EMPTY_ACK";
 
 fn cloud_pull_empty_ack_desired_for_source(source: &str) -> bool {
     if source == "post_login" {
         return true;
     }
-    std::env::var(MO_JOURNAL_CLOUD_EMPTY_ACK).ok().as_deref() == Some("1")
+    std::env::var(ASTRA_JOURNAL_CLOUD_EMPTY_ACK).ok().as_deref() == Some("1")
 }
 
 fn should_append_cloud_pull_journal(
@@ -3913,7 +3913,7 @@ async fn try_connect_matrixone() -> Option<sqlx::Pool<sqlx::MySql>> {
         .unwrap_or(6001);
     let user = std::env::var("MATRIXONE_USER").unwrap_or_else(|_| "root".to_string());
     let password = std::env::var("MATRIXONE_PASSWORD").unwrap_or_default();
-    let database = std::env::var("MATRIXONE_DATABASE").unwrap_or_else(|_| "mo_agent".to_string());
+    let database = std::env::var("MATRIXONE_DATABASE").unwrap_or_else(|_| "astra".to_string());
     let url = format!("mysql://{user}:{password}@{host}:{port}/{database}");
     sqlx::mysql::MySqlPoolOptions::new()
         .max_connections(2)
@@ -5414,7 +5414,7 @@ mod tests {
         base
     }
 
-    /// Guard that serializes tests touching MO_AGENT_CREDENTIALS_DIR.
+    /// Guard that serializes tests touching ASTRA_CREDENTIALS_DIR.
     /// Multiple async tests concurrently setting this env var is a data race;
     /// the guard ensures they execute sequentially.
     use std::sync::{Mutex, MutexGuard, OnceLock};
@@ -5427,7 +5427,7 @@ mod tests {
     impl Drop for CredentialsGuard {
         fn drop(&mut self) {
             unsafe {
-                std::env::remove_var("MO_AGENT_CREDENTIALS_DIR");
+                std::env::remove_var("ASTRA_CREDENTIALS_DIR");
             }
         }
     }
@@ -5446,7 +5446,7 @@ mod tests {
         let lock = creds_lock();
         let dir = tempfile::tempdir().unwrap();
         // SAFETY: protected by CREDS_LOCK; no concurrent set_var.
-        unsafe { std::env::set_var("MO_AGENT_CREDENTIALS_DIR", dir.path()) };
+        unsafe { std::env::set_var("ASTRA_CREDENTIALS_DIR", dir.path()) };
         CredentialsGuard {
             _lock: lock,
             _dir: dir,
@@ -7047,7 +7047,7 @@ total_tokens_out: 500
     #[test]
     fn should_append_cloud_pull_journal_repl_startup_empty_without_env() {
         unsafe {
-            std::env::remove_var(super::MO_JOURNAL_CLOUD_EMPTY_ACK);
+            std::env::remove_var(super::ASTRA_JOURNAL_CLOUD_EMPTY_ACK);
         }
         let pull = CloudPullResult {
             tool_health: Vec::new(),
@@ -7070,7 +7070,7 @@ total_tokens_out: 500
             cloud_reachable: true,
         };
         unsafe {
-            std::env::remove_var(super::MO_JOURNAL_CLOUD_EMPTY_ACK);
+            std::env::remove_var(super::ASTRA_JOURNAL_CLOUD_EMPTY_ACK);
         }
         assert!(!should_append_cloud_pull_journal(
             &pull,
@@ -7078,11 +7078,11 @@ total_tokens_out: 500
             "repl_startup"
         ));
         unsafe {
-            std::env::set_var(super::MO_JOURNAL_CLOUD_EMPTY_ACK, "1");
+            std::env::set_var(super::ASTRA_JOURNAL_CLOUD_EMPTY_ACK, "1");
         }
         assert!(should_append_cloud_pull_journal(&pull, &[], "repl_startup"));
         unsafe {
-            std::env::remove_var(super::MO_JOURNAL_CLOUD_EMPTY_ACK);
+            std::env::remove_var(super::ASTRA_JOURNAL_CLOUD_EMPTY_ACK);
         }
     }
 

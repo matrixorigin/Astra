@@ -1,5 +1,5 @@
 apiVersion: v2
-name: mo-agent-engine
+name: astra-engine
 description: Intelligent agent platform with auditable decisions
 type: application
 version: 0.1.0

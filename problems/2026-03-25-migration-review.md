@@ -198,18 +198,18 @@ introspection 模块已去重（-1831 行）。
 | `memory_contract.rs` | +1 | spoofed user_id 安全测试 |
 | `persist_counter_contract.rs` | 5 | 持久化计数器 |
 | `shared_pool_migration_contract.rs` | 4 | SharedPool 迁移 API |
-| `mo-agent/main.rs` (inline) | +18 | mock HTTP: auth, SSE, slash commands |
-| `mo-agent/repl_runtime.rs` (inline) | 3 | journal history 恢复 |
-| `mo-agent/cli_utils.rs` (inline) | 18 | 纯函数 |
-| `mo-agent/repl_ui.rs` (inline) | 12 | slash 命令解析 |
-| `mo-agent/stream_render.rs` (inline) | 12 | SSE dispatch |
-| `mo-agent/edge_tools.rs` (inline) | 12 | schema 完整性 |
-| `mo-agent/edge_tools/fs.rs` (inline) | 10 | 文件操作 |
-| `mo-agent/edge_tools/shell.rs` (inline) | 7 | shell 工具 |
-| `mo-agent/permission_manager.rs` (inline) | 13 | 权限分类 |
-| `mo-admin/credentials.rs` (inline) | 4 | 凭证管理 |
-| `mo-admin/http_helpers.rs` (inline) | 6 | HTTP 辅助 |
-| `mo-admin/cli_args.rs` (inline) | 7 | CLI 参数解析 |
+| `astra/main.rs` (inline) | +18 | mock HTTP: auth, SSE, slash commands |
+| `astra/repl_runtime.rs` (inline) | 3 | journal history 恢复 |
+| `astra/cli_utils.rs` (inline) | 18 | 纯函数 |
+| `astra/repl_ui.rs` (inline) | 12 | slash 命令解析 |
+| `astra/stream_render.rs` (inline) | 12 | SSE dispatch |
+| `astra/edge_tools.rs` (inline) | 12 | schema 完整性 |
+| `astra/edge_tools/fs.rs` (inline) | 10 | 文件操作 |
+| `astra/edge_tools/shell.rs` (inline) | 7 | shell 工具 |
+| `astra/permission_manager.rs` (inline) | 13 | 权限分类 |
+| `astra-admin/credentials.rs` (inline) | 4 | 凭证管理 |
+| `astra-admin/http_helpers.rs` (inline) | 6 | HTTP 辅助 |
+| `astra-admin/cli_args.rs` (inline) | 7 | CLI 参数解析 |
 
 ---
 

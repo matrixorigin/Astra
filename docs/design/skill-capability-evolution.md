@@ -435,7 +435,7 @@ pub struct SkillExecutionResult {
 4. Add `/skill stats [name]` CLI command
 5. Persist metrics (local config file → later DB)
 
-**Files**: `runtime/src/skills/quality.rs` (new), `runtime/src/turn/skill_tool.rs`, `mo-agent/src/mo_agent/slash_skill.rs`
+**Files**: `runtime/src/skills/quality.rs` (new), `runtime/src/turn/skill_tool.rs`, `rust/crates/astra-cli/src/cli/slash_skill.rs`
 
 ### Phase 3: Marketplace Signals (问题3核心)
 

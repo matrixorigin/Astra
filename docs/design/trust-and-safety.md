@@ -10,7 +10,7 @@
 
 The industry is converging on a hard truth: **intelligence is not the bottleneck for agent adoption — trust is.** McKinsey reports only 1% of organizations consider their AI adoption fully mature. The gap is not capability but governance, auditability, and safety.
 
-mo-agent-engine's competitive position is not "smarter agents" but **provably trustworthy agents**. Every capability in this document is platform infrastructure — agents get it automatically, developers don't implement it.
+astra-engine's competitive position is not "smarter agents" but **provably trustworthy agents**. Every capability in this document is platform infrastructure — agents get it automatically, developers don't implement it.
 
 ### Edge Trust Boundary
 
@@ -551,7 +551,7 @@ Policy engine evaluates ALL active policies
 
 > **Status**: Application layer cleaned — no `tenant_id` in agent code. Multi-tenancy is purely a deployment-time concern handled by MatrixOne Multi-Account namespace isolation. Agent code is identical in single-tenant and multi-tenant deployments.
 
-When multi-tenant deployment is needed, MatrixOne Multi-Account provides database-level namespace isolation transparently — the agent connects to the same `mo_agent` database, the connection string determines the account scope. No application code changes required.
+When multi-tenant deployment is needed, MatrixOne Multi-Account provides database-level namespace isolation transparently — the agent connects to the same `astra` database, the connection string determines the account scope. No application code changes required.
 
 ---
 

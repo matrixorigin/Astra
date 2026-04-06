@@ -1,6 +1,6 @@
 # Monitoring Stack
 
-Prometheus + Grafana monitoring for mo-agent.
+Prometheus + Grafana monitoring for astra.
 
 ## Quick Start
 
@@ -138,7 +138,7 @@ Create `alerts.yml`:
 
 ```yaml
 groups:
-  - name: mo-agent
+  - name: astra
     rules:
       - alert: HighErrorRate
         expr: rate(http_requests_total{status=~"5.."}[5m]) > 0.05

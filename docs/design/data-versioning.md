@@ -9,7 +9,7 @@
 
 ## Why Data Versioning Is the Moat
 
-Every capability that makes mo-agent-engine unique depends on one thing: **the ability to query historical data states, branch data cheaply, and track causal relationships natively.**
+Every capability that makes astra-engine unique depends on one thing: **the ability to query historical data states, branch data cheaply, and track causal relationships natively.**
 
 | Platform Capability | Required Data Capability |
 |---------------------|-------------------------|

@@ -793,8 +793,8 @@ Both come from same MCP server but enter different systems.
 | Skill tool schema + budget   | ✅ Done     | `runtime/src/turn/skill_tool.rs`          | 10+   |
 | Conditional activation       | ✅ Done     | `runtime/src/skills/activation.rs`        | 15+   |
 | File watcher hot-reload      | ✅ Done     | `runtime/src/skills/watcher.rs`           | 3     |
-| CLI /skill commands          | ✅ Done     | `mo-agent/src/mo_agent/slash_skill.rs`    | 12    |
-| Non-blocking permission      | ✅ Done     | `mo-agent/src/mo_agent/stream_render.rs`  | —     |
+| CLI /skill commands          | ✅ Done     | `rust/crates/astra-cli/src/cli/slash_skill.rs`    | 12    |
+| Non-blocking permission      | ✅ Done     | `rust/crates/astra-cli/src/cli/stream_render.rs`  | —     |
 | Pin/Unpin mechanism          | 🔵 Design  | —                                          | —     |
 | Registered skills (DB)       | 🔵 Design  | —                                          | —     |
 | Marketplace (Stage)          | 🔵 Design  | —                                          | —     |

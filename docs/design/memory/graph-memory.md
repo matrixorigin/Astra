@@ -1515,7 +1515,7 @@ This uses MatrixOne's zero-copy branching — no data duplication, instant creat
 | Graph grows unbounded | Memory/query degradation | Tiered loading (§5.8): skeleton load for 10K-50K, anchor-expand for 50K+. Node archival for dormant nodes. No hard cap needed — tiers adapt automatically |
 | Tier 3 anchor-expand misses distant scenes | Important but topologically distant scenes invisible | Mitigation: anchor selection includes top-5 scene nodes by importance regardless of activation proximity. Consolidation periodically tags "global anchor" scenes (importance >0.8, cross-session span >3) that are always included in Tier 3 working set |
 | Reflection produces low-quality scenes | Bad memories pollute future retrieval | Conservative initial confidence (T4, 0.5), opinion evolution can quarantine bad scenes. A/B test plan: Phase 4 runs reflection prompt variants on 20% of users, measures scene usefulness rate (target >70%). Prompt managed by PromptOptimizer with `prompt_template_id = "reflection_synthesis"` |
-| Complexity jump (2→5 modules) | Onboarding/debug cost increases | Mitigation: (1) each module has a single-file entry point with <200 LOC public API, (2) legacy retriever remains as permanent fallback — new modules are additive, not replacement, (3) `mo-agent graph inspect` CLI command for debugging, (4) incremental rollout: Phase 1-2 run shadow-mode (log but don't serve) before Phase 3-4 go live |
+| Complexity jump (2→5 modules) | Onboarding/debug cost increases | Mitigation: (1) each module has a single-file entry point with <200 LOC public API, (2) legacy retriever remains as permanent fallback — new modules are additive, not replacement, (3) `astra graph inspect` CLI command for debugging, (4) incremental rollout: Phase 1-2 run shadow-mode (log but don't serve) before Phase 3-4 go live |
 | Activation propagation too slow | Retrieval latency regression | Cap iterations at 3. Tier 2/3 limit working set to <2,500 nodes regardless of total graph size. Fallback to legacy retrieval |
 | Cold start (new users have sparse graph) | Activation provides no benefit over vector search | Fallback to legacy retrieval when graph has < 50 nodes |
 | LLM reflection calls add cost | $/user/day increase | Importance threshold filters ~80% of candidates; ~0.4 scenes/day/user = ~1 LLM call/day |
@@ -1557,7 +1557,7 @@ Sensitivity classification (High/Medium/Low) will be confirmed empirically. Para
 
 2. **Cross-user patterns**: Current design is strictly per-user. Should we ever allow opt-in cross-user pattern sharing (e.g., "80% of users hit this same CI issue")? Privacy implications are significant.
 
-3. **Graph visualization**: Should we expose graph structure in the CLI/API for debugging? (`mo-agent graph show --user alice --depth 2`)
+3. **Graph visualization**: Should we expose graph structure in the CLI/API for debugging? (`astra graph show --user alice --depth 2`)
 
 4. **Activation caching**: Should we cache activation state between turns within a session? (Synapse caches and updates only during consolidation windows.)
 

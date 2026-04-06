@@ -37,10 +37,10 @@
 | --- | --- |
 | `make build` | Build the Rust workspace in debug mode (`rust/target/debug`) |
 | `make build-release` | Build the Rust workspace in release mode (`rust/target/release`) |
-| `make build-server` | Build `mo-agent-server` in debug mode |
-| `make build-server-release` | Build `mo-agent-server` in release mode |
-| `make build-cli` | Build `mo-agent` and `mo-admin` in debug mode |
-| `make build-cli-release` | Build `mo-agent` and `mo-admin` in release mode |
+| `make build-server` | Build `astra-server` in debug mode |
+| `make build-server-release` | Build `astra-server` in release mode |
+| `make build-cli` | Build `astra` and `astra-admin` in debug mode |
+| `make build-cli-release` | Build `astra` and `astra-admin` in release mode |
 
 ## Memoria
 

@@ -903,7 +903,7 @@ mod tests {
     fn initialize_repl_state_skips_cleanly_ended_session() {
         let (_tmp, _g) = isolated_sessions_dir();
         let creds_dir = tempdir().unwrap();
-        let _creds_guard = EnvVarGuard::set("MO_AGENT_CREDENTIALS_DIR", creds_dir.path());
+        let _creds_guard = EnvVarGuard::set("ASTRA_CREDENTIALS_DIR", creds_dir.path());
 
         let sid = format!("test-ended-init-{}", uuid::Uuid::new_v4());
         let writer = session_journal::JournalWriter::new(&sid).unwrap();

@@ -2,7 +2,7 @@ import type { Metadata } from 'next';
 import './globals.css';
 
 export const metadata: Metadata = {
-  title: 'mo-agent web',
+  title: 'astra web',
   description: 'Frontend platform for agent, session, run, and event observability.',
 };
 

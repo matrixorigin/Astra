@@ -13,9 +13,9 @@
 //!
 //! ## On-disk session memory (Claude Code–compatible)
 //!
-//! When `MO_AGENT_SESSION_MEMORY_COMBINE` is set, the compactor can read
+//! When `ASTRA_SESSION_MEMORY_COMBINE` is set, the compactor can read
 //! `CLAUDE_CONFIG_DIR/projects/<sanitized-cwd>/<session_id>/session-memory/summary.md`
-//! (same layout as Claude Code) or a path from `MO_AGENT_SESSION_MEMORY_FILE`.
+//! (same layout as Claude Code) or a path from `ASTRA_SESSION_MEMORY_FILE`.
 //! - `fallback`: use the file only if Memoria returns no memories.
 //! - `merge` / `true` / `1` / `both`: keep Memoria hits and add a capped file excerpt.
 
@@ -71,9 +71,9 @@ pub enum SessionMemoryFileCombine {
 }
 
 impl SessionMemoryFileCombine {
-    /// Parse `MO_AGENT_SESSION_MEMORY_COMBINE` (`merge` | `fallback` | `true` | `1` | `both`).
+    /// Parse `ASTRA_SESSION_MEMORY_COMBINE` (`merge` | `fallback` | `true` | `1` | `both`).
     pub fn from_env() -> Self {
-        let Ok(raw) = std::env::var("MO_AGENT_SESSION_MEMORY_COMBINE") else {
+        let Ok(raw) = std::env::var("ASTRA_SESSION_MEMORY_COMBINE") else {
             return Self::None;
         };
         match raw.to_ascii_lowercase().as_str() {
@@ -188,8 +188,8 @@ pub fn read_session_memory_file(path: &Path) -> Option<String> {
 
 /// Resolve on-disk session memory path and combine mode from env + optional workspace cwd.
 ///
-/// - `MO_AGENT_SESSION_MEMORY_FILE` → explicit file; if set, defaults combine mode to [`Merge`]
-///   when `MO_AGENT_SESSION_MEMORY_COMBINE` is unset.
+/// - `ASTRA_SESSION_MEMORY_FILE` → explicit file; if set, defaults combine mode to [`Merge`]
+///   when `ASTRA_SESSION_MEMORY_COMBINE` is unset.
 /// - Otherwise, when combine is `merge` or `fallback`, uses [`claude_code_session_memory_path`]
 ///   if `cwd` is present.
 pub fn resolve_session_memory_file_options(
@@ -198,7 +198,7 @@ pub fn resolve_session_memory_file_options(
 ) -> (Option<PathBuf>, SessionMemoryFileCombine) {
     let env_combine = SessionMemoryFileCombine::from_env();
 
-    if let Ok(p) = std::env::var("MO_AGENT_SESSION_MEMORY_FILE") {
+    if let Ok(p) = std::env::var("ASTRA_SESSION_MEMORY_FILE") {
         let path = PathBuf::from(p);
         let combine = if env_combine == SessionMemoryFileCombine::None {
             SessionMemoryFileCombine::Merge

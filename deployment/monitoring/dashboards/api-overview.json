@@ -1,7 +1,7 @@
 {
   "dashboard": {
-    "title": "mo-agent API Overview",
-    "tags": ["mo-agent", "api"],
+    "title": "astra API Overview",
+    "tags": ["astra", "api"],
     "timezone": "browser",
     "panels": [
       {

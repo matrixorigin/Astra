@@ -274,9 +274,9 @@ If cloud-synced data structures changed:
 
 | Component | File |
 |-----------|------|
-| Code intelligence | `rust/crates/mo-agent/src/edge_tools/code_intel.rs` |
-| Git tools | `rust/crates/mo-agent/src/edge_tools/git_gix.rs` |
-| Edge tools registry | `rust/crates/mo-agent/src/edge_tools.rs` |
-| Tool parallel safety | `rust/crates/mo-agent/src/mo_agent/chat_stream.rs` (PARALLEL_SAFE_TOOLS) |
+| Code intelligence | `rust/crates/astra-cli/src/edge_tools/code_intel.rs` |
+| Git tools | `rust/crates/astra-cli/src/edge_tools/git_gix.rs` |
+| Edge tools registry | `rust/crates/astra-cli/src/edge_tools.rs` |
+| Tool parallel safety | `rust/crates/astra-cli/src/cli/chat_stream.rs` (PARALLEL_SAFE_TOOLS) |
 | Session journal schema | `rust/crates/services/src/session_journal.rs` |
 | Durable task states | `rust/crates/services/src/durable_task.rs` |

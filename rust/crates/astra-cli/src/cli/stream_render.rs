@@ -658,7 +658,7 @@ pub(super) struct StreamRenderState {
     waiting_for_first_sse: bool,
     thinking_start: Option<Instant>,
     thinking_spinner: Option<ThinkingSpinnerKind>,
-    /// stderr preview for `reasoning_delta`: grows until viewport cap, then tail + hidden count (see `MO_AGENT_THINKING_VIEWPORT_LINES`).
+    /// stderr preview for `reasoning_delta`: grows until viewport cap, then tail + hidden count (see `ASTRA_THINKING_VIEWPORT_LINES`).
     thinking_pane: Option<ThinkingPreviewPane>,
     /// Lines written to the terminal during streaming (stdout + stderr).
     /// Used by the re-render pass to clear all streamed output.
@@ -1940,7 +1940,7 @@ mod tests {
     #[test]
     fn extract_cli_diff_sentinel_wrapped() {
         let embedded = "+++ b/f\n+ok\n";
-        let out = format!("<<<MO_AGENT_UNIFIED_DIFF>>>{embedded}<<<END_MO_AGENT_UNIFIED_DIFF>>>");
+        let out = format!("<<<ASTRA_UNIFIED_DIFF>>>{embedded}<<<END_ASTRA_UNIFIED_DIFF>>>");
         let got = super::extract_cli_diff_block(&out).expect("diff");
         assert_eq!(got.as_ref(), embedded.trim());
     }

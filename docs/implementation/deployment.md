@@ -12,7 +12,7 @@ make dev-stop      # Stop services
 ## Project Structure
 
 ```
-mo-agent-engine/
+astra-engine/
 ├── api/                    # FastAPI REST API
 │   ├── main.py             # Application entry, middleware, CORS
 │   ├── routers/            # Endpoint handlers (agents, sessions, events, ...)
@@ -38,8 +38,8 @@ mo-agent-engine/
 │   └── validation.py       # Input validation utilities
 │
 ├── cli/                    # Command-line interfaces
-│   ├── mo_agent.py         # User CLI (chat, skill, session, replay)
-│   └── mo_admin.py         # Admin CLI (init, model, token, audit)
+│   ├── astra_cli (Rust)    # User CLI (chat, skill, session, replay) — `rust/crates/astra-cli`
+│   └── astra-admin (Rust)  # Admin CLI — `rust/crates/astra-admin`
 │
 ├── config/                 # Configuration
 │   └── settings.py         # Environment-based settings
@@ -57,10 +57,10 @@ mo-agent-engine/
 
 ```bash
 # Development
-RUST_API_ADDR=0.0.0.0:8000 mo-agent-server
+RUST_API_ADDR=0.0.0.0:8000 astra-server
 
 # Production
-RUST_API_ADDR=0.0.0.0:8000 mo-agent-server
+RUST_API_ADDR=0.0.0.0:8000 astra-server
 ```
 
 Features: structured JSON logging, JWT auth, rate limiting (60 req/min), health checks, Prometheus metrics.
@@ -69,7 +69,7 @@ Features: structured JSON logging, JWT auth, rate limiting (60 req/min), health 
 
 ```bash
 # Build
-docker build -t mo-agent-engine .
+docker build -t astra-engine .
 
 # All-in-one (MatrixOne + Redis + API)
 cd deployment/all-in-one && docker-compose up -d
@@ -95,4 +95,4 @@ cd deployment/all-in-one && docker-compose --profile full up -d
 
 ## Database Initialization
 
-Tables auto-initialize on first API start or `mo-admin init`. Schema is defined in `api/database.py` and `scripts/init-db.sh`.
+Tables auto-initialize on first API start or `astra-admin init`. Schema is defined in `api/database.py` and `scripts/init-db.sh`.

@@ -1,4 +1,4 @@
-//! Incremental Server-Sent Events parser for `data: {json}\\n\\n` frames (mo-agent server style).
+//! Incremental Server-Sent Events parser for `data: {json}\\n\\n` frames (astra server style).
 
 use crate::error::ThinClientError;
 use crate::protocol::{StreamEvent, classify_stream_event};

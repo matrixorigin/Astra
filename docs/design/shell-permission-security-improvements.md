@@ -6,7 +6,7 @@ Inspired by Claude Code's architecture, adapted to the existing Rust codebase.
 
 ### 1. Permission/Approval System (VERY HIGH — Security)
 
-**File: `rust/crates/mo-agent/src/mo_agent/permission_manager.rs`**
+**File: `rust/crates/astra-cli/src/cli/permission_manager.rs`**
 
 - **Rule-based permissions**: Added `PermissionRule` with glob-style matching (`Bash(git commit:*)`)
 - **Settings persistence**: `PermissionSettings` loads/saves from `.kiro/permissions.json`
@@ -39,7 +39,7 @@ Validates git commands before execution:
 
 ### 3. Shell Output Streaming (HIGH — UX)
 
-**File: `rust/crates/mo-agent/src/edge_tools/shell.rs`**
+**File: `rust/crates/astra-cli/src/edge_tools/shell.rs`**
 
 - **`run_command_streaming()`**: New streaming execution function alongside existing `run_command_with_cleanup()`
   - Reads stdout/stderr incrementally via background threads
@@ -49,7 +49,7 @@ Validates git commands before execution:
 
 ### 4. Timeout Auto-Backgrounding (MEDIUM — UX)
 
-**File: `rust/crates/mo-agent/src/edge_tools/shell.rs`**
+**File: `rust/crates/astra-cli/src/edge_tools/shell.rs`**
 
 - **Auto-backgrounding**: When `allow_background=true` and timeout hits, the process is detached instead of killed
 - **Size watchdog**: Background thread monitors process, kills after 30 minutes max
@@ -93,7 +93,7 @@ Validates git commands before execution:
 The implementation follows Claude Code's layered security model while fitting into the existing Rust architecture:
 
 ```
-Claude Code (TypeScript)          →  mo-agent-runtime (Rust)
+Claude Code (TypeScript)          →  astra-runtime (Rust)
 ─────────────────────────────────────────────────────────────
 permissions.ts (rule engine)      →  permission_manager.rs (PermissionRule + PermissionSettings)
 bashSecurity.ts (git validation)  →  git_safety.rs (validate_git_command)

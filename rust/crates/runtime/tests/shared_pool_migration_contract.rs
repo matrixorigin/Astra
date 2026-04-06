@@ -11,7 +11,7 @@ fn dummy_settings() -> MatrixOneSettings {
         port: 6001,
         user: "root".to_string(),
         password: "111".to_string(),
-        database: "mo_agent".to_string(),
+        database: "astra".to_string(),
     }
 }
 

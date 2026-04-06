@@ -28,16 +28,16 @@ static E2E_ENV_INIT: OnceLock<()> = OnceLock::new();
 
 pub fn require_system_e2e_env() {
     assert_eq!(
-        std::env::var("MO_AGENT_SYSTEM_MATRIX_E2E").as_deref(),
+        std::env::var("ASTRA_SYSTEM_MATRIX_E2E").as_deref(),
         Ok("1"),
-        "set MO_AGENT_SYSTEM_MATRIX_E2E=1 to run this ignored test"
+        "set ASTRA_SYSTEM_MATRIX_E2E=1 to run this ignored test"
     );
     E2E_ENV_INIT.get_or_init(|| {
-        let secret = std::env::var("MO_AGENT_BRIDGE_TEST_SECRET")
+        let secret = std::env::var("ASTRA_BRIDGE_TEST_SECRET")
             .unwrap_or_else(|_| "system-matrix-e2e-secret".to_string());
         // SAFETY: set once before parallel test threads (idempotent for all E2E tests).
         unsafe {
-            std::env::set_var("MO_AGENT_BRIDGE_TEST_SECRET", &secret);
+            std::env::set_var("ASTRA_BRIDGE_TEST_SECRET", &secret);
         }
     });
 }

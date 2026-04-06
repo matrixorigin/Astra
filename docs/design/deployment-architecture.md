@@ -7,17 +7,17 @@
 
 ## 1. System Components
 
-mo-agent-engine consists of these runtime components:
+astra-engine consists of these runtime components:
 
 | Component | Process | Stateless? | Scalable? | Description |
 |-----------|---------|-----------|-----------|-------------|
-| **API Server** | `mo-agent-server` | ✅ Yes | Horizontal | REST API, JWT auth, rate limiting |
-| **CLI (mo-agent)** | `mo-agent chat` | ✅ Yes | Per-user | Interactive chat, skill execution |
-| **CLI (mo-admin)** | `mo-admin init/prompt/...` | ✅ Yes | Single | Admin operations |
+| **API Server** | `astra-server` | ✅ Yes | Horizontal | REST API, JWT auth, rate limiting |
+| **CLI (astra)** | `astra chat` | ✅ Yes | Per-user | Interactive chat, skill execution |
+| **CLI (astra-admin)** | `astra-admin init/prompt/...` | ✅ Yes | Single | Admin operations |
 | **MatrixOne** | `mo-service` | ❌ Stateful | Cluster | HTAP database, time-travel, branching |
 | **Redis** | `redis-server` | ❌ Stateful | Cluster/Sentinel | Cache, rate limiting, pub/sub |
 | **Skill Workers** | Skill execution processes | ✅ Yes | Horizontal | Heavy skill execution (training, etc.) |
-| **Model Server** | `mo-agent model serve` | ✅ Yes | Horizontal | Shared inference for platform-trained small models (NOT LLMs) |
+| **Model Server** | `astra model serve` | ✅ Yes | Horizontal | Shared inference for platform-trained small models (NOT LLMs) |
 
 ### Component Dependencies
 
@@ -129,7 +129,7 @@ The agentic loop runs on the edge (user's machine). LLM calls go through the clo
 | Prompt caching management | | ✅ | Cross-session cache coordination |
 | Message history (working memory) | ✅ | ✅ | Edge holds current session; cloud persists all |
 | Skill definitions (catalog) | | ✅ | Edge caches; cloud is source of truth |
-| Project rules / config | ✅ | | Local files (.mo-agent/rules.md, CLAUDE.md) |
+| Project rules / config | ✅ | | Local files (`.astra/` / `.astra/`, `CLAUDE.md`, etc.) |
 | Terminal rendering | ✅ | | User's terminal |
 
 ### The `/chat/turn` API — Core Protocol
@@ -183,10 +183,10 @@ Edge                                Cloud API
 ```
 Edge holds (local):
   ├── Current session message history (working memory for agentic loop)
-  ├── JWT credential (~/.mo-agent/credentials.json)
-  ├── Configuration cache (~/.mo-agent/config.json, .mo-agent/config.json)
-  ├── Skill definition cache (pulled from cloud, TTL-based)
-  ├── Project rules (local files: .mo-agent/rules.md, CLAUDE.md, etc.)
+  ├── JWT credential (**`~/.astra/credentials.json`**; override with **`ASTRA_CREDENTIALS_DIR`**)
+  ├── Optional legacy config paths (older docs mentioned `~/.astra/config.json`; Rust CLI uses **`~/.astra/`** for credentials and session state)
+  ├── Skill manifests: **local/bundled/MCP** via `UnifiedSkillRegistry` + optional **`GET /skills`** for slash/marketplace (see [edge-cloud-execution.md §2.1](edge-cloud-execution.md))
+  ├── Project rules (repo-local: **`.astra/`** or **`.astra/`**, `CLAUDE.md`, etc., depending on project layout)
   ├── Event buffer (tool results queued for upload)
   └── Recent session index (for /sessions list without network)
 
@@ -209,11 +209,11 @@ Sync model:
 ### Authentication Flow
 
 ```
-1. mo-agent login --user alice --password ***
+1. astra login --user alice --password ***
    → POST /auth/login → JWT (access + refresh tokens)
-   → Tokens stored in ~/.mo-agent/credentials.json
+   → Tokens stored in ~/.astra/credentials.json
 
-2. mo-agent chat "hello"
+2. astra chat "hello"
    → EdgeChatLoop starts
    → POST /chat/turn (Authorization: Bearer <access_token>)
    → SSE response stream
@@ -223,7 +223,7 @@ Sync model:
    → CLI auto-refreshes: POST /auth/refresh
    → Retry original request
 
-4. mo-admin (admin operations):
+4. astra-admin (admin operations):
    → Same JWT flow, but API checks role == admin
    → Non-admin users get 403
 ```
@@ -232,16 +232,16 @@ Sync model:
 
 | CLI Command | Current (direct) | Target (API) |
 |---|---|---|
-| `mo-agent chat` | `ChatLoop` + `get_db_session()` | EdgeChatLoop + `POST /chat/turn` (per-turn SSE) |
-| `mo-agent session list` | `SessionManager` + DB query | `GET /sessions` |
-| `mo-agent session show` | `SessionManager` + DB query | `GET /sessions/{id}` |
-| `mo-agent replay` | `stream_replay` + DB query | `POST /sessions/{id}/replay` |
-| `mo-agent skill list` | `SkillRegistry` + DB query | `GET /skills` |
-| `mo-agent model list` | DB query | `GET /models` |
-| `mo-admin init` | DDL execution via `get_db_session()` | `POST /admin/init` (admin-only) |
-| `mo-admin token create` | Direct DB insert | `POST /admin/tokens` (admin-only) |
-| `mo-admin audit logs` | Direct DB query | `GET /admin/audit` (admin-only) |
-| `mo-admin prompt optimize` | `PromptOptimizer` + DB | `POST /admin/prompts/optimize` (admin-only) |
+| `astra chat` | `ChatLoop` + `get_db_session()` | EdgeChatLoop + `POST /chat/turn` (per-turn SSE) |
+| `astra session list` | `SessionManager` + DB query | `GET /sessions` |
+| `astra session show` | `SessionManager` + DB query | `GET /sessions/{id}` |
+| `astra replay` | `stream_replay` + DB query | `POST /sessions/{id}/replay` |
+| `astra skill list` | `SkillRegistry` + DB query | `GET /skills` |
+| `astra model list` | DB query | `GET /models` |
+| `astra-admin init` | DDL execution via `get_db_session()` | `POST /admin/init` (admin-only) |
+| `astra-admin token create` | Direct DB insert | `POST /admin/tokens` (admin-only) |
+| `astra-admin audit logs` | Direct DB query | `GET /admin/audit` (admin-only) |
+| `astra-admin prompt optimize` | `PromptOptimizer` + DB | `POST /admin/prompts/optimize` (admin-only) |
 
 ### Design Principles
 
@@ -250,7 +250,7 @@ Sync model:
 3. **Cloud is not a proxy.** Each `/chat/turn` does context assembly, model routing, budget control, verification, and audit. This is the platform's core value — not available in direct-to-LLM tools like Claude Code.
 4. **All state syncs to cloud.** Edge has caches and buffers, but source of truth is always MatrixOne. Session resume, cross-device, team sharing — all work because state is centralized.
 5. **Same API for CLI, SDK, and web UI.** The `/chat/turn` protocol works for any client that can execute tools locally.
-6. **Dev mode shortcut (optional).** `mo-agent --local` bypasses the API and uses core libraries directly. For developers with local DB access only. Not available in SaaS.
+6. **Dev mode shortcut (optional).** `astra --local` bypasses the API and uses core libraries directly. For developers with local DB access only. Not available in SaaS.
 
 ### What This Enables
 
@@ -280,7 +280,7 @@ Sync model:
 │                   Single Machine                     │
 │                                                      │
 │  ┌──────────┐  ┌──────────┐  ┌──────────────────┐  │
-│  │MatrixOne │  │  Redis   │  │  mo-agent chat   │  │
+│  │MatrixOne │  │  Redis   │  │  astra chat   │  │
 │  │ (Docker) │  │ (Docker) │  │  (conda env)     │  │
 │  │ :6001    │  │ :6379    │  │                   │  │
 │  └──────────┘  └──────────┘  │  API Server       │  │
@@ -293,10 +293,10 @@ Sync model:
 ```bash
 conda activate agent-engine
 make dev-start                       # MatrixOne + Redis in Docker
-RUST_API_ADDR=0.0.0.0:8000 mo-agent-server  # API server (required, unless --local)
-mo-admin init                        # Init DB (via API after migration)
-mo-agent chat                        # CLI → API Server → DB
-# OR: mo-agent --local chat          # Dev shortcut: CLI → DB directly
+RUST_API_ADDR=0.0.0.0:8000 astra-server  # API server (required, unless --local)
+astra-admin init                        # Init DB (via API after migration)
+astra chat                        # CLI → API Server → DB
+# OR: astra --local chat          # Dev shortcut: CLI → DB directly
 ```
 
 > **Note**: In the current prototype, all CLI commands connect directly to DB. After the CLI architecture migration (§1.1), the default path is CLI → API server. The `--local` flag preserves direct-DB mode for development convenience (requires DB credentials and a local MatrixOne instance).
@@ -363,7 +363,7 @@ MatrixOne, Redis, Ray, GPU 全部可选 — 可以用集群外已有的实例。
 │                        Kubernetes Cluster                            │
 │                                                                      │
 │  ┌─────────────────────────────────────────────────────────────┐    │
-│  │  Namespace: mo-agent                                         │    │
+│  │  Namespace: astra                                         │    │
 │  │                                                               │    │
 │  │  ┌─────────────────────┐                                     │    │
 │  │  │ Deployment: api     │    Required                         │    │
@@ -445,14 +445,14 @@ ray:
 **Usage**:
 ```bash
 # Minimal: API only (external DB + Redis)
-helm install mo-agent ./charts/mo-agent-engine \
+helm install astra ./charts/astra-engine \
   --set matrixone.enabled=false \
   --set matrixone.external.host=db.prod.internal \
   --set redis.enabled=false \
   --set redis.external.url=redis://redis.prod.internal:6379
 
 # Full: everything in-cluster
-helm install mo-agent ./charts/mo-agent-engine \
+helm install astra ./charts/astra-engine \
   --set matrixone.enabled=true \
   --set redis.enabled=true \
   --set modelServer.enabled=true \
@@ -661,7 +661,7 @@ class RayJobBackend(JobBackend):
 class K8sJobBackend(JobBackend):
     """Kubernetes Job execution for cloud-native deployments"""
     
-    def __init__(self, namespace: str = "mo-agent", image_registry: str = ""):
+    def __init__(self, namespace: str = "astra", image_registry: str = ""):
         from kubernetes import client, config
         
         # Auto-detect: in-cluster or kubeconfig
@@ -696,7 +696,7 @@ class K8sJobBackend(JobBackend):
                 "name": job_name,
                 "namespace": self.namespace,
                 "labels": {
-                    "app": "mo-agent",
+                    "app": "astra",
                     "component": "skill-worker",
                     "skill": skill_id
                 }
@@ -706,7 +706,7 @@ class K8sJobBackend(JobBackend):
                 "activeDeadlineSeconds": requirements.timeout_seconds or 3600,
                 "template": {
                     "metadata": {
-                        "labels": {"app": "mo-agent", "skill": skill_id}
+                        "labels": {"app": "astra", "skill": skill_id}
                     },
                     "spec": {
                         "restartPolicy": "Never",
@@ -716,10 +716,10 @@ class K8sJobBackend(JobBackend):
                             "command": ["python", "-m", "core.skills.runner"],
                             "args": ["--skill-id", skill_id, "--inputs", json.dumps(inputs)],
                             "resources": resources,
-                            "envFrom": [{"configMapRef": {"name": "mo-agent-config"}}],
+                            "envFrom": [{"configMapRef": {"name": "astra-config"}}],
                             "env": [
-                                {"name": "MATRIXONE_HOST", "value": "matrixone.mo-agent.svc"},
-                                {"name": "REDIS_URL", "value": "redis://redis.mo-agent.svc:6379"}
+                                {"name": "MATRIXONE_HOST", "value": "matrixone.astra.svc"},
+                                {"name": "REDIS_URL", "value": "redis://redis.astra.svc:6379"}
                             ]
                         }],
                         # GPU node selector
@@ -738,7 +738,7 @@ class K8sJobBackend(JobBackend):
     
     def _select_image(self, requirements):
         """Select Docker image based on skill requirements"""
-        base = self.image_registry or "mo-agent-engine"
+        base = self.image_registry or "astra-engine"
         
         if requirements.gpu_required or requirements.conda_env == "agent-engine-train":
             return f"{base}:train-gpu"  # Image with PyTorch + CUDA
@@ -854,10 +854,10 @@ COPY . .
 
 | Image Tag | Base | Size | GPU | Use Case |
 |-----------|------|------|-----|----------|
-| `mo-agent:latest` | python:3.11-slim | ~500MB | ❌ | API, CLI, inference |
-| `mo-agent:infer` | python:3.11-slim | ~600MB | ❌ | + ONNX Runtime |
-| `mo-agent:train-gpu` | nvidia/cuda:12.1 | ~8GB | ✅ | Training workloads |
-| `mo-agent:train-cpu` | python:3.11-slim | ~4GB | ❌ | Training (no GPU) |
+| `astra:latest` | python:3.11-slim | ~500MB | ❌ | API, CLI, inference |
+| `astra:infer` | python:3.11-slim | ~600MB | ❌ | + ONNX Runtime |
+| `astra:train-gpu` | nvidia/cuda:12.1 | ~8GB | ✅ | Training workloads |
+| `astra:train-cpu` | python:3.11-slim | ~4GB | ❌ | Training (no GPU) |
 
 ---
 
@@ -872,24 +872,24 @@ All components except API are optional. Helm values control what gets deployed.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: mo-agent-api
-  namespace: mo-agent
+  name: astra-api
+  namespace: astra
 spec:
   replicas: 2
   selector:
     matchLabels:
-      app: mo-agent
+      app: astra
       component: api
   template:
     metadata:
       labels:
-        app: mo-agent
+        app: astra
         component: api
     spec:
       containers:
       - name: api
-        image: mo-agent:latest
-        command: ["mo-agent-server"]
+        image: astra:latest
+        command: ["astra-server"]
         ports:
         - containerPort: 8000
         resources:
@@ -901,12 +901,12 @@ spec:
             memory: "2Gi"
         env:
         - name: MATRIXONE_HOST
-          value: "matrixone.mo-agent.svc.cluster.local"
+          value: "matrixone.astra.svc.cluster.local"
         - name: REDIS_URL
-          value: "redis://redis.mo-agent.svc.cluster.local:6379"
+          value: "redis://redis.astra.svc.cluster.local:6379"
         envFrom:
         - secretRef:
-            name: mo-agent-secrets
+            name: astra-secrets
         readinessProbe:
           httpGet:
             path: /health
@@ -923,13 +923,13 @@ spec:
 apiVersion: autoscaling/v2
 kind: HorizontalPodAutoscaler
 metadata:
-  name: mo-agent-api-hpa
-  namespace: mo-agent
+  name: astra-api-hpa
+  namespace: astra
 spec:
   scaleTargetRef:
     apiVersion: apps/v1
     kind: Deployment
-    name: mo-agent-api
+    name: astra-api
   minReplicas: 2
   maxReplicas: 10
   metrics:
@@ -948,19 +948,19 @@ spec:
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: mo-agent-model-server
-  namespace: mo-agent
+  name: astra-model-server
+  namespace: astra
 spec:
   replicas: 1
   selector:
     matchLabels:
-      app: mo-agent
+      app: astra
       component: model-server
   template:
     spec:
       containers:
       - name: model-server
-        image: mo-agent:infer
+        image: astra:infer
         command: ["python", "-m", "core.models.model_server", "--port", "9527"]
         ports:
         - containerPort: 9527
@@ -988,9 +988,9 @@ apiVersion: batch/v1
 kind: Job
 metadata:
   generateName: skill-feedback-trainer-
-  namespace: mo-agent
+  namespace: astra
   labels:
-    app: mo-agent
+    app: astra
     component: skill-worker
     skill: feedback_trainer
 spec:
@@ -1007,7 +1007,7 @@ spec:
         effect: "NoSchedule"
       containers:
       - name: trainer
-        image: mo-agent:train-gpu
+        image: astra:train-gpu
         command: ["python", "-m", "core.skills.runner"]
         args: ["--skill-id", "feedback_trainer", "--inputs-file", "/tmp/inputs.json"]
         resources:
@@ -1021,7 +1021,7 @@ spec:
             nvidia.com/gpu: "1"
         env:
         - name: MATRIXONE_HOST
-          value: "matrixone.mo-agent.svc.cluster.local"
+          value: "matrixone.astra.svc.cluster.local"
         volumeMounts:
         - name: model-output
           mountPath: /output
@@ -1053,8 +1053,8 @@ spec:
 apiVersion: ray.io/v1
 kind: RayCluster
 metadata:
-  name: mo-agent-ray
-  namespace: mo-agent
+  name: astra-ray
+  namespace: astra
 spec:
   headGroupSpec:
     rayStartParams:
@@ -1063,7 +1063,7 @@ spec:
       spec:
         containers:
         - name: ray-head
-          image: mo-agent:train-gpu
+          image: astra:train-gpu
           resources:
             requests:
               cpu: "2"
@@ -1080,7 +1080,7 @@ spec:
           accelerator: nvidia-gpu
         containers:
         - name: ray-worker
-          image: mo-agent:train-gpu
+          image: astra:train-gpu
           resources:
             requests:
               cpu: "4"
@@ -1094,7 +1094,7 @@ spec:
       spec:
         containers:
         - name: ray-worker
-          image: mo-agent:latest
+          image: astra:latest
           resources:
             requests:
               cpu: "2"
@@ -1125,7 +1125,7 @@ class DistributedFeedbackTrainer:
                 resources_per_worker={"CPU": 2, "GPU": 1}
             ),
             run_config=train.RunConfig(
-                storage_path="s3://mo-agent-models/ray-results",
+                storage_path="s3://astra-models/ray-results",
                 checkpoint_config=train.CheckpointConfig(
                     num_to_keep=2
                 )
@@ -1177,16 +1177,16 @@ execution:
   
   ray:
     address: auto  # or ray://head:10001
-    namespace: mo-agent
+    namespace: astra
     runtime_env:
       working_dir: /app
   
   kubernetes:
-    namespace: mo-agent
-    image_registry: registry.example.com/mo-agent
+    namespace: astra
+    image_registry: registry.example.com/astra
     gpu_node_selector:
       accelerator: nvidia-gpu
-    service_account: mo-agent-skill-runner
+    service_account: astra-skill-runner
 
 model_server:
   enabled: auto  # auto, true, false
@@ -1198,8 +1198,8 @@ model_server:
 storage:
   artifacts:
     backend: auto  # auto, local, s3
-    local_dir: ~/.mo-agent/models
-    s3_bucket: mo-agent-models
+    local_dir: ~/.astra/models
+    s3_bucket: astra-models
     s3_prefix: artifacts/
 ```
 
@@ -1231,8 +1231,8 @@ class DeploymentDetector:
 ```bash
 # Before: 手动启动各组件
 make dev-start       # MatrixOne + Redis
-mo-admin init        # Init DB
-RUST_API_ADDR=0.0.0.0:8000 mo-agent-server # API
+astra-admin init        # Init DB
+RUST_API_ADDR=0.0.0.0:8000 astra-server # API
 
 # After: 一键全部拉起
 docker-compose up -d
@@ -1243,19 +1243,19 @@ docker-compose up -d
 
 ```bash
 # Minimal: 只部署 API（DB/Redis 用已有的）
-helm install mo-agent ./charts/mo-agent-engine \
+helm install astra ./charts/astra-engine \
   --set matrixone.enabled=false \
   --set matrixone.external.host=db.prod.internal \
   --set redis.enabled=false \
   --set redis.external.url=redis://redis.prod.internal:6379
 
 # 逐步开启可选组件
-helm upgrade mo-agent ./charts/mo-agent-engine \
+helm upgrade astra ./charts/astra-engine \
   --set modelServer.enabled=true          # 加 Model Server
-helm upgrade mo-agent ./charts/mo-agent-engine \
+helm upgrade astra ./charts/astra-engine \
   --set skillWorker.enabled=true \
   --set skillWorker.gpu.enabled=true      # 加 GPU 训练
-helm upgrade mo-agent ./charts/mo-agent-engine \
+helm upgrade astra ./charts/astra-engine \
   --set ray.enabled=true                  # 加 Ray 集群
 ```
 
@@ -1274,7 +1274,7 @@ helm upgrade mo-agent ./charts/mo-agent-engine \
 - [ ] `core/skills/runner.py` — 独立进程 skill 执行入口
 
 **Phase 3: Kubernetes**
-- [ ] `charts/mo-agent-engine/` — Helm chart
+- [ ] `charts/astra-engine/` — Helm chart
 - [ ] `core/agent/backends/kubernetes_backend.py` — KubernetesBackend
 - [ ] CI/CD: Docker image build + push
 

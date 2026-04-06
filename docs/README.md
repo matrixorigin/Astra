@@ -1,10 +1,10 @@
-# mo-agent Documentation
+# astra Documentation
 
-Welcome to mo-agent documentation! This guide will help you find the information you need.
+Welcome to astra documentation! This guide will help you find the information you need.
 
 ## 🚀 Quick Start
 
-**New to mo-agent?** Start here:
+**New to astra?** Start here:
 
 - [5-Minute Quick Start](quickstart/README.md) - Get up and running fast
 - [Development Environment](quickstart/development.md) - Set up local development
@@ -13,7 +13,7 @@ Welcome to mo-agent documentation! This guide will help you find the information
 
 ## 📘 Guides
 
-**Learn how to use mo-agent:**
+**Learn how to use astra:**
 
 - [Development Workflow](guides/development-workflow.md) - Daily development commands and workflows
 - [Testing Guide](guides/testing.md) - Run and write tests
@@ -26,7 +26,7 @@ Welcome to mo-agent documentation! This guide will help you find the information
 
 - [API Reference](reference/api-reference.md) - Complete API endpoint documentation
 - [Makefile Commands](reference/makefile-commands.md) - All available make commands
-- [CLI Commands](reference/cli-commands.md) - mo-agent and mo-admin CLI reference
+- [CLI Commands](reference/cli-commands.md) - astra and astra-admin CLI reference
 - [Configuration](reference/configuration.md) - Environment variables and configuration
 - [Dependencies](reference/dependencies.md) - Dependency groups, installation, and optional extras
 

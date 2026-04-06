@@ -7,13 +7,14 @@
 
 use super::*;
 
+use astra_thin_client::ASTRA_EDGE_ID_HEADER;
 use serde::Deserialize;
 
 use crate::turn::edge_ledger::{LEDGER_MAX_ENTRIES, approval_callback_key, tool_callback_key};
 
 fn edge_id_from_headers(headers: &HeaderMap) -> String {
     headers
-        .get("x-mo-edge-id")
+        .get(ASTRA_EDGE_ID_HEADER)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
         .to_string()

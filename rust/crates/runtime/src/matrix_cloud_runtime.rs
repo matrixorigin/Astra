@@ -70,8 +70,8 @@ impl MatrixCloudRuntime {
         cloud_learning_version: Option<i64>,
         lease_hold_cache: Arc<TaskLeaseHoldCache>,
     ) -> Self {
-        let edge_agent_id: Arc<str> = std::env::var("MO_EDGE_AGENT_ID")
-            .unwrap_or_else(|_| "mo-server".into())
+        let edge_agent_id: Arc<str> = std::env::var("ASTRA_EDGE_AGENT_ID")
+            .unwrap_or_else(|_| "astra-server".into())
             .into();
         let task_mirror = Arc::new(Mutex::new(BTreeMap::new()));
         let task_dirty = Arc::new(Mutex::new(HashSet::new()));

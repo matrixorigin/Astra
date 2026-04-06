@@ -1,16 +1,16 @@
 [Unit]
-Description=mo-agent API Server
+Description=astra API Server
 After=network.target matrixone.service redis.service
 Wants=matrixone.service redis.service
 
 [Service]
 Type=simple
-User=mo-agent
-Group=mo-agent
-WorkingDirectory=/opt/mo-agent
-EnvironmentFile=/opt/mo-agent/.env
+User=astra
+Group=astra
+WorkingDirectory=/opt/astra
+EnvironmentFile=/opt/astra/.env
 Environment=RUST_API_ADDR=0.0.0.0:8000
-ExecStart=/usr/local/bin/mo-agent-rs-api-shell
+ExecStart=/usr/local/bin/astra-rs-api-shell
 Restart=always
 RestartSec=10
 StandardOutput=journal
@@ -21,7 +21,7 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/opt/mo-agent/logs
+ReadWritePaths=/opt/astra/logs
 
 [Install]
 WantedBy=multi-user.target

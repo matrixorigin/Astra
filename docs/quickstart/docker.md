@@ -1,13 +1,13 @@
 # Docker Deployment
 
-Run mo-agent using Docker and Docker Compose.
+Run astra using Docker and Docker Compose.
 
 ## Quick Start
 
 ```bash
 # 1. Clone repository
-git clone https://github.com/matrixorigin/mo-agent.git
-cd mo-agent
+git clone https://github.com/matrixorigin/mo-dev-agent.git
+cd mo-dev-agent
 
 # 2. Configure environment
 cp .env.example .env
@@ -73,7 +73,7 @@ MATRIXONE_HOST=matrixone
 MATRIXONE_PORT=6001
 MATRIXONE_USER=root
 MATRIXONE_PASSWORD=111
-MATRIXONE_DATABASE=mo_agent
+MATRIXONE_DATABASE=astra
 
 # Redis
 REDIS_HOST=redis
@@ -240,10 +240,10 @@ docker-compose -f deployment/monitoring/docker-compose.yml up -d
 
 ```bash
 # Backup MatrixOne data
-docker exec matrixone mysqldump -h127.0.0.1 -P6001 -uroot -p111 mo_agent > backup.sql
+docker exec matrixone mysqldump -h127.0.0.1 -P6001 -uroot -p111 astra > backup.sql
 
 # Restore
-docker exec -i matrixone mysql -h127.0.0.1 -P6001 -uroot -p111 mo_agent < backup.sql
+docker exec -i matrixone mysql -h127.0.0.1 -P6001 -uroot -p111 astra < backup.sql
 ```
 
 ## Next Steps

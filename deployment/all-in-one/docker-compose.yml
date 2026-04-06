@@ -56,7 +56,7 @@ services:
       context: ../..
     profiles:
       - app
-    command: ["mo-admin", "init"]
+    command: ["astra-admin", "init"]
     environment:
       - MATRIXONE_HOST=matrixone
       - MATRIXONE_PORT=6001

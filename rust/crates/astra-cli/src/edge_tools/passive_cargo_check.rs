@@ -2,8 +2,8 @@
 //! that carries `tool_results`, then inject a user message (claudecode-style
 //! `<new-diagnostics>`) when there are errors or the check fails.
 //!
-//! Kill switch: `MO_AGENT_PASSIVE_CARGO_CHECK=0|false|off`
-//! Timeout: `MO_AGENT_PASSIVE_CARGO_TIMEOUT_SECS` (default 45, max 300)
+//! Kill switch: `ASTRA_PASSIVE_CARGO_CHECK=0|false|off`
+//! Timeout: `ASTRA_PASSIVE_CARGO_TIMEOUT_SECS` (default 45, max 300)
 
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -19,7 +19,7 @@ use super::build_test;
 const MAX_PASSIVE_DIAG_CHARS: usize = 12_000;
 
 fn passive_cargo_check_enabled() -> bool {
-    match std::env::var("MO_AGENT_PASSIVE_CARGO_CHECK") {
+    match std::env::var("ASTRA_PASSIVE_CARGO_CHECK") {
         Ok(v) => {
             let v = v.trim().to_lowercase();
             !(v.is_empty() || v == "0" || v == "false" || v == "off")
@@ -29,7 +29,7 @@ fn passive_cargo_check_enabled() -> bool {
 }
 
 fn passive_cargo_timeout() -> Duration {
-    let secs = std::env::var("MO_AGENT_PASSIVE_CARGO_TIMEOUT_SECS")
+    let secs = std::env::var("ASTRA_PASSIVE_CARGO_TIMEOUT_SECS")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(45);
@@ -266,13 +266,13 @@ mod tests {
             fn drop(&mut self) {
                 // SAFETY: `serial` test; no concurrent readers of this env var in other threads.
                 unsafe {
-                    std::env::remove_var("MO_AGENT_PASSIVE_CARGO_CHECK");
+                    std::env::remove_var("ASTRA_PASSIVE_CARGO_CHECK");
                 }
             }
         }
         // SAFETY: `serial` test; no concurrent env access in other threads.
         unsafe {
-            std::env::set_var("MO_AGENT_PASSIVE_CARGO_CHECK", "0");
+            std::env::set_var("ASTRA_PASSIVE_CARGO_CHECK", "0");
         }
         let _clear = ClearPassiveEnv;
         let dir = tempfile::tempdir().unwrap();

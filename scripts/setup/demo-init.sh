@@ -51,7 +51,7 @@ confirm() {
 }
 
 # ── Proxy helper ─────────────────────────────────────────────────
-# CLI tools (mo-agent, mo-admin) now auto-bypass proxy for localhost.
+# CLI tools (astra, astra-admin) now auto-bypass proxy for localhost.
 # Only curl still needs NO_PROXY.
 export NO_PROXY="${NO_PROXY:+$NO_PROXY,}localhost,127.0.0.1"
 
@@ -91,7 +91,7 @@ has_admin() {
     _db_query "
 n = db.execute(text(
     \"SELECT COUNT(*) FROM user_roles ur JOIN roles r ON ur.role_id = r.role_id \"
-    \"WHERE r.role_name = 'mo_agent_admin'\"
+    \"WHERE r.role_name = 'astra_admin'\"
 )).fetchone()[0]
 print(n)
 "
@@ -192,7 +192,7 @@ step_admin() {
 
     if [ "$admin_count" -gt 0 ]; then
         ok "Admin user already exists — skipping"
-        dim "  (To manage admins: astra-admin user grant-role <user> mo_agent_admin)"
+        dim "  (To manage admins: astra-admin user grant-role <user> astra_admin)"
         # Try to detect admin profile from saved credentials
         ADMIN_PROFILE=${ADMIN_PROFILE:-admin}
         return 0
@@ -240,7 +240,7 @@ step_admin() {
     esac
 
     info "Logging in as $username (admin profile)..."
-    if do_login "$username" "$password" "mo-admin"; then
+    if do_login "$username" "$password" "astra-admin"; then
         ok "Logged in as admin"
     else
         warn "Auto-login failed — you can login later: astra-admin login"
@@ -275,7 +275,7 @@ step_demo_user() {
                 return 0
             fi
             ask_secret "Password"
-            if do_login "$username" "$REPLY" "mo-agent"; then
+            if do_login "$username" "$REPLY" "astra"; then
                 ok "Logged in as $username"
                 return 0
             else
@@ -324,7 +324,7 @@ step_demo_user() {
     esac
 
     info "Logging in..."
-    if do_login "$username" "$password" "mo-agent"; then
+    if do_login "$username" "$password" "astra"; then
         ok "Logged in as $username"
     else
         err "Login failed"
@@ -411,7 +411,7 @@ for r in rows:
         return 0
     fi
 
-    # Ensure mo-admin is authenticated before registering
+    # Ensure astra-admin is authenticated before registering
     if ! astra-admin --profile "$ADMIN_PROFILE" model list >/dev/null 2>&1; then
         warn "Admin session expired or not logged in"
         info "Please login as admin to register models:"
@@ -420,7 +420,7 @@ for r in rows:
         admin_user=$REPLY
         ask_secret "Admin password"
         admin_pass=$REPLY
-        if ! do_login "$admin_user" "$admin_pass" "mo-admin"; then
+        if ! do_login "$admin_user" "$admin_pass" "astra-admin"; then
             err "Admin login failed — register models later with: astra-admin login && astra-admin model add"
             return 1
         fi

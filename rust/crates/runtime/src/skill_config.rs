@@ -8,6 +8,10 @@ use axum::{
     http::{HeaderMap, StatusCode},
 };
 
+fn is_platform_admin_role(role: &str) -> bool {
+    role == "astra_admin"
+}
+
 fn extract_user_id(headers: &HeaderMap) -> Result<String, (StatusCode, Json<ErrorResponse>)> {
     headers
         .get("X-User-Id")
@@ -55,7 +59,7 @@ pub async fn set_setting_handler(
         let is_admin = headers
             .get("X-User-Role")
             .and_then(|v| v.to_str().ok())
-            .map(|r| r == "mo_agent_admin")
+            .map(is_platform_admin_role)
             .unwrap_or(false);
         if !is_admin {
             return Err(error_response(
@@ -90,7 +94,7 @@ pub async fn delete_setting_handler(
         let is_admin = headers
             .get("X-User-Role")
             .and_then(|v| v.to_str().ok())
-            .map(|r| r == "mo_agent_admin")
+            .map(is_platform_admin_role)
             .unwrap_or(false);
         if !is_admin {
             return Err(error_response(

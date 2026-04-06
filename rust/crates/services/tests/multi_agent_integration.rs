@@ -1,7 +1,7 @@
 //! MySQL / MatrixOne integration tests for [`astra_services::multi_agent`].
 //!
 //! ```text
-//! MO_AGENT_MULTI_AGENT_IT=1 cargo test -p astra-services multi_agent_integration -- --ignored
+//! ASTRA_MULTI_AGENT_IT=1 cargo test -p astra-services multi_agent_integration -- --ignored
 //! ```
 //!
 //! Uses `MATRIXONE_*` env vars (after `dotenvy`) with the same defaults as local dev (`127.0.0.1:6001`, …).
@@ -20,9 +20,9 @@ use uuid::Uuid;
 
 fn require_it_env() -> MatrixOneSettings {
     assert_eq!(
-        std::env::var("MO_AGENT_MULTI_AGENT_IT").as_deref(),
+        std::env::var("ASTRA_MULTI_AGENT_IT").as_deref(),
         Ok("1"),
-        "set MO_AGENT_MULTI_AGENT_IT=1 for ignored integration tests"
+        "set ASTRA_MULTI_AGENT_IT=1 for ignored integration tests"
     );
     dotenvy::dotenv().ok();
     MatrixOneSettings {
@@ -66,7 +66,7 @@ async fn cleanup_edge(pool: &sqlx::Pool<sqlx::MySql>, user_id: &str, edge_agent_
 }
 
 #[tokio::test]
-#[ignore = "MO_AGENT_MULTI_AGENT_IT=1 and live MatrixOne; see module doc"]
+#[ignore = "ASTRA_MULTI_AGENT_IT=1 and live MatrixOne; see module doc"]
 async fn edge_registry_register_twice_keeps_registry_id() {
     let shared = setup_pool().await;
     let pool = shared.get().clone();
@@ -112,7 +112,7 @@ async fn edge_registry_register_twice_keeps_registry_id() {
 }
 
 #[tokio::test]
-#[ignore = "MO_AGENT_MULTI_AGENT_IT=1 and live MatrixOne; see module doc"]
+#[ignore = "ASTRA_MULTI_AGENT_IT=1 and live MatrixOne; see module doc"]
 async fn task_lease_second_holder_gets_contested() {
     let shared = setup_pool().await;
     let pool = shared.get().clone();
@@ -153,7 +153,7 @@ async fn task_lease_second_holder_gets_contested() {
 }
 
 #[tokio::test]
-#[ignore = "MO_AGENT_MULTI_AGENT_IT=1 and live MatrixOne; see module doc"]
+#[ignore = "ASTRA_MULTI_AGENT_IT=1 and live MatrixOne; see module doc"]
 async fn task_lease_parallel_claims_single_winner() {
     let shared = setup_pool().await;
     let pool = shared.get().clone();
@@ -230,7 +230,7 @@ fn sample_task_record(task_id: &str, user_id: &str) -> TaskRecord {
 }
 
 #[tokio::test]
-#[ignore = "MO_AGENT_MULTI_AGENT_IT=1 and live MatrixOne; see module doc"]
+#[ignore = "ASTRA_MULTI_AGENT_IT=1 and live MatrixOne; see module doc"]
 async fn push_tasks_pack_held_accepts_holder_rejects_other() {
     let shared = setup_pool().await;
     let pool = shared.get().clone();

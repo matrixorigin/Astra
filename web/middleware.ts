@@ -26,7 +26,7 @@ export function middleware(request: NextRequest) {
   // Only require auth for specific protected paths (workspace, etc.)
   // Read-only dashboard pages work without auth
   if (requiresAuth(pathname)) {
-    const hasToken = request.cookies.has(ACCESS_TOKEN_COOKIE) || process.env.MO_AGENT_ACCESS_TOKEN;
+    const hasToken = request.cookies.has(ACCESS_TOKEN_COOKIE) || process.env.ASTRA_ACCESS_TOKEN;
     if (!hasToken) {
       const url = request.nextUrl.clone();
       url.pathname = '/login';

@@ -25,12 +25,12 @@ if [ -f "$PID_FILE" ]; then
 fi
 
 # Fallback: kill any remaining Rust api-shell processes
-PIDS=$(pgrep -f "mo-agent-server" 2>/dev/null)
+PIDS=$(pgrep -f "astra-server" 2>/dev/null)
 if [ -n "$PIDS" ]; then
     echo "$PIDS" | xargs -r kill 2>/dev/null || true
     sleep 2
     # Force kill stragglers
-    pgrep -f "mo-agent-server" | xargs -r kill -9 2>/dev/null || true
+    pgrep -f "astra-server" | xargs -r kill -9 2>/dev/null || true
 fi
 
 echo "✅ API server stopped"

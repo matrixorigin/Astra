@@ -18,7 +18,7 @@ pub mod sse;
 
 pub use client::ThinClient;
 pub use edge::{
-    MO_EDGE_ID_HEADER, advertise_executor, builtin_capability_preset,
+    ASTRA_EDGE_ID_HEADER, advertise_executor, builtin_capability_preset,
     edge_register_with_capabilities,
 };
 pub use error::ThinClientError;

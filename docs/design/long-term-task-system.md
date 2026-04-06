@@ -368,7 +368,7 @@ documentation), MatrixOne Stage provides persistent storage:
 
 ```sql
 -- Mount artifact storage
-CREATE STAGE task_artifacts URL = 's3://mo-agent-artifacts/';
+CREATE STAGE task_artifacts URL = 's3://astra-artifacts/';
 
 -- Store task deliverables as DataLink references
 CREATE TABLE IF NOT EXISTS task_artifacts (

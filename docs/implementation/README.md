@@ -1,6 +1,6 @@
 # Implementation Documentation Index
 
-This directory contains detailed implementation documentation for mo-agent-engine features.
+This directory contains detailed implementation documentation for astra-engine features.
 
 ---
 

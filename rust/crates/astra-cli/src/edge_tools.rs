@@ -5327,7 +5327,7 @@ fn helper() {}
                 &json!({
                     "symbol": "Language",
                     "language": "rust",
-                    "file": "crates/mo-agent/src/edge_tools.rs"
+                    "file": "crates/astra-cli/src/edge_tools.rs"
                 }),
             )
             .await;

@@ -392,7 +392,7 @@ The verification framework lives in `durable_task.rs` and supports:
 |-----------|------|
 | VerificationRunner | `rust/crates/services/src/durable_task.rs` |
 | VerifierKind enum | `rust/crates/services/src/durable_task.rs` |
-| Delivery report display | `rust/crates/mo-agent/src/mo_agent/durable_bridge.rs` |
-| Plan executor | `rust/crates/mo-agent/src/mo_agent/plan_executor.rs` |
-| Build/test detection | `rust/crates/mo-agent/src/edge_tools.rs` |
+| Delivery report display | `rust/crates/astra-cli/src/cli/durable_bridge.rs` |
+| Plan executor | `rust/crates/astra-cli/src/cli/plan_executor.rs` |
+| Build/test detection | `rust/crates/astra-cli/src/edge_tools.rs` |
 | Session journal | `rust/crates/services/src/session_journal.rs` |

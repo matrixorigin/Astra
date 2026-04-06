@@ -139,12 +139,12 @@ impl DatabaseAuthService {
         for (role_id, role_name, description) in [
             (
                 "role-admin",
-                "mo_agent_admin",
+                "astra_admin",
                 "Administrator with full system access",
             ),
             (
                 "role-user",
-                "mo_agent_user",
+                "astra_user",
                 "Regular user with limited access",
             ),
         ] {
@@ -368,9 +368,9 @@ impl AuthService for DatabaseAuthService {
         query(
             "INSERT INTO auth_user_roles (user_id, role_id) \
              SELECT ?, r.role_id FROM auth_roles r \
-             WHERE r.role_name = 'mo_agent_admin' \
+             WHERE r.role_name = 'astra_admin' \
              AND NOT EXISTS (SELECT 1 FROM auth_user_roles ur JOIN auth_roles r2 \
-             ON ur.role_id = r2.role_id WHERE r2.role_name = 'mo_agent_admin')",
+             ON ur.role_id = r2.role_id WHERE r2.role_name = 'astra_admin')",
         )
         .bind(&user_id)
         .execute(&mut *tx)

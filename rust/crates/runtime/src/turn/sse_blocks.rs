@@ -30,7 +30,7 @@ pub fn drain_complete_sse_event_blocks(buf: &mut String) -> Vec<String> {
 }
 
 /// Incremental UTF-8 buffer for SSE over HTTP: decode chunks with [`String::from_utf8_lossy`], then
-/// drain every complete blank-line event (same boundaries as `/chat/turn` and mo-thin-client).
+/// drain every complete blank-line event (same boundaries as `/chat/turn` and astra-thin-client).
 #[derive(Debug, Default)]
 pub struct SseBlankLineUtf8Buf {
     buf: String,

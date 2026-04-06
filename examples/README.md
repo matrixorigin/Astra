@@ -19,8 +19,8 @@ make test-contract
 Then try:
 
 ```bash
-mo-agent login
-mo-agent chat -m "帮我分析这个仓库"
-mo-admin login
-mo-admin audit --limit 20
+astra login
+astra chat -m "帮我分析这个仓库"
+astra-admin login
+astra-admin audit --limit 20
 ```

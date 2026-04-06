@@ -1,6 +1,6 @@
 # GCP Deployment Example
 
-Deploy mo-agent to Google Cloud Platform using Cloud Run or GKE.
+Deploy astra to Google Cloud Platform using Cloud Run or GKE.
 
 ## Option 1: Cloud Run (Serverless)
 
@@ -8,11 +8,11 @@ Deploy mo-agent to Google Cloud Platform using Cloud Run or GKE.
 
 ```bash
 # 1. Build and push to GCR
-gcloud builds submit --tag gcr.io/PROJECT_ID/mo-agent
+gcloud builds submit --tag gcr.io/PROJECT_ID/astra
 
 # 2. Deploy to Cloud Run
-gcloud run deploy mo-agent \
-  --image gcr.io/PROJECT_ID/mo-agent \
+gcloud run deploy astra \
+  --image gcr.io/PROJECT_ID/astra \
   --platform managed \
   --region us-central1 \
   --allow-unauthenticated \
@@ -48,15 +48,15 @@ gcloud run deploy mo-agent \
 
 ```bash
 # 1. Create GKE cluster
-gcloud container clusters create mo-agent \
+gcloud container clusters create astra \
   --num-nodes=3 \
   --region=us-central1
 
 # 2. Get credentials
-gcloud container clusters get-credentials mo-agent --region=us-central1
+gcloud container clusters get-credentials astra --region=us-central1
 
 # 3. Deploy with Helm
-helm install mo-agent ../../kubernetes/chart
+helm install astra ../../kubernetes/chart
 ```
 
 ## Components
@@ -65,18 +65,18 @@ helm install mo-agent ../../kubernetes/chart
 
 ```bash
 # Build and push
-gcloud builds submit --tag gcr.io/PROJECT_ID/mo-agent
+gcloud builds submit --tag gcr.io/PROJECT_ID/astra
 
 # Or use Docker
-docker build -t gcr.io/PROJECT_ID/mo-agent .
-docker push gcr.io/PROJECT_ID/mo-agent
+docker build -t gcr.io/PROJECT_ID/astra .
+docker push gcr.io/PROJECT_ID/astra
 ```
 
 ### 2. Database (Cloud SQL)
 
 ```bash
 # Create Cloud SQL instance
-gcloud sql instances create mo-agent-db \
+gcloud sql instances create astra-db \
   --database-version=MYSQL_8_0 \
   --tier=db-n1-standard-2 \
   --region=us-central1
@@ -86,7 +86,7 @@ gcloud sql instances create mo-agent-db \
 
 ```bash
 # Create Redis instance
-gcloud redis instances create mo-agent-redis \
+gcloud redis instances create astra-redis \
   --size=1 \
   --region=us-central1 \
   --redis-version=redis_6_x
@@ -105,7 +105,7 @@ echo -n "your-openai-key" | gcloud secrets create openai-key --data-file=-
 
 ```bash
 # View logs
-gcloud logging read "resource.type=cloud_run_revision AND resource.labels.service_name=mo-agent"
+gcloud logging read "resource.type=cloud_run_revision AND resource.labels.service_name=astra"
 
 # Create alert
 gcloud alpha monitoring policies create \
@@ -121,7 +121,7 @@ Cloud Run auto-scales by default. For GKE:
 
 ```bash
 # Horizontal Pod Autoscaler
-kubectl autoscale deployment mo-agent-api \
+kubectl autoscale deployment astra-api \
   --cpu-percent=70 \
   --min=2 \
   --max=10

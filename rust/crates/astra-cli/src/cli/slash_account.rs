@@ -69,7 +69,7 @@ pub(super) async fn handle_account_command(
             if arg.is_empty() {
                 eprintln!("  Usage: /memory-setup <api_key>");
                 eprintln!(
-                    "  Get a key from Memoria: curl -X POST http://localhost:8100/auth/keys -H 'Authorization: Bearer <master_key>' -H 'Content-Type: application/json' -d '{{\"user_id\":\"<user>\",\"name\":\"mo-agent\"}}'"
+                    "  Get a key from Memoria: curl -X POST http://localhost:8100/auth/keys -H 'Authorization: Bearer <master_key>' -H 'Content-Type: application/json' -d '{{\"user_id\":\"<user>\",\"name\":\"astra\"}}'"
                 );
             } else {
                 let mut creds = load_credentials();

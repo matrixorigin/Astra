@@ -105,7 +105,7 @@ class ReflectTool(EdgeTool):
 | `cli/api_client.py` | ADD `get_reflect()` method |
 | `api/routers/chat.py` | ADD `GET /chat/session/{sid}/reflect` endpoint |
 | `cli/edge_chat_loop.py` | REMOVE `session_state` parameter + history population |
-| `cli/mo_agent_api.py` | REMOVE `session_state`, simplify ReflectTool construction |
+| `rust/crates/astra-cli` (`/reflect` path) | REMOVE `session_state`, simplify ReflectTool construction |
 | `tests/unit/test_reflect.py` | REWRITE — test endpoint + edge tool + diagnosis logic |
 
 ---

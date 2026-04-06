@@ -1,5 +1,6 @@
 use super::*;
 use astra_services::session_journal;
+use astra_thin_client::ASTRA_EDGE_ID_HEADER;
 
 // ─── Query parameters ───────────────────────────────────────────────────────
 
@@ -210,7 +211,7 @@ pub(super) struct LeaseClaimRequest {
 
 fn edge_id_header(headers: &HeaderMap) -> String {
     headers
-        .get("x-mo-edge-id")
+        .get(ASTRA_EDGE_ID_HEADER)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
         .to_string()

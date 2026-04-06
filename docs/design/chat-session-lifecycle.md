@@ -105,7 +105,7 @@ state, rather than rejecting it. A session being zombie/closed does not mean its
 history is gone — it just means no one was using it.
 
 ```python
-# cli/mo_agent_api.py — resume with validation
+# rust/crates/astra-cli — `/resume` with validation
 if resume and not session_id and _profile.get("last_session_id"):
     candidate = _profile["last_session_id"]
     try:
@@ -120,21 +120,21 @@ if resume and not session_id and _profile.get("last_session_id"):
 
 ```bash
 # New session each time (default)
-mo-agent chat --user-id alice
+astra chat --user-id alice
 
 # Resume last session
-mo-agent chat --user-id alice --resume
+astra chat --user-id alice --resume
 
 # Join a specific session
-mo-agent chat --user-id alice --session-id <id>
+astra chat --user-id alice --session-id <id>
 
 # Script / pipe: multiple turns in one session
-printf "turn 1\nturn 2\nturn 3\n" | mo-agent chat --user-id alice
+printf "turn 1\nturn 2\nturn 3\n" | astra chat --user-id alice
 ```
 
-## Related: mo-agent CLI local journal (JSONL)
+## Related: astra CLI local journal (JSONL)
 
-The interactive **`mo-agent`** REPL keeps an append-only **`{session_id}.jsonl`** under `~/.mo-agent/sessions/` (turns, config changes, and other audit events). After a successful MatrixOne **learning / preferences** pull at REPL startup or after **`/login`**, the CLI may append a **`sync_marker`** line whose structured payload lives in **`metadata.cloud_pull`** (including **`reachable_empty_ack`** when the cloud was reachable but returned nothing to merge, and optional **`MO_JOURNAL_CLOUD_EMPTY_ACK=1`** for the same on startup). Full field list and semantics: [multi-agent-cloud-runtime.md](./multi-agent-cloud-runtime.md) — subsection **Journal: `sync_marker` after MatrixOne cloud pull** under **§3.2 State Model**.
+The interactive **`astra`** REPL keeps an append-only **`{session_id}.jsonl`** under **`~/.astra/sessions/`** (`session_journal::local_sessions_dir()`; turns, config changes, and other audit events). After a successful MatrixOne **learning / preferences** pull at REPL startup or after **`/login`**, the CLI may append a **`sync_marker`** line whose structured payload lives in **`metadata.cloud_pull`** (including **`reachable_empty_ack`** when the cloud was reachable but returned nothing to merge, and optional **`ASTRA_JOURNAL_CLOUD_EMPTY_ACK=1`** for the same on startup). Full field list and semantics: [multi-agent-cloud-runtime.md](./multi-agent-cloud-runtime.md) — subsection **Journal: `sync_marker` after MatrixOne cloud pull** under **§3.2 State Model**. For restore/checkpoint and skill-registry vs cloud catalog, see [edge-cloud-sync-architecture.md](../../rust/docs/edge-cloud-sync-architecture.md).
 
 ## Implementation Checklist
 

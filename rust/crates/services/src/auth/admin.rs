@@ -146,7 +146,7 @@ impl AdminAuthorizer for DatabaseAdminAuthorizer {
         }
 
         let has_admin = self
-            .query_has_role(&user_id, username.as_deref(), "mo_agent_admin")
+            .query_has_role(&user_id, username.as_deref(), "astra_admin")
             .await
             .map_err(internal_error)?;
 
@@ -638,12 +638,12 @@ impl AdminInitializer for DatabaseAdminInitializer {
         for (role_id, role_name, description) in [
             (
                 "role-admin",
-                "mo_agent_admin",
+                "astra_admin",
                 "Administrator with full system access",
             ),
             (
                 "role-user",
-                "mo_agent_user",
+                "astra_user",
                 "Regular user with limited access",
             ),
         ] {

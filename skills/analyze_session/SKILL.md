@@ -399,7 +399,7 @@ When investigating issues found by this analysis, relevant astra source files:
 | Compaction | `rust/crates/runtime/src/turn/cloud/compaction.rs` |
 | Edge ledger | `rust/crates/runtime/src/turn/edge_ledger.rs` |
 | Stall detection | `rust/crates/runtime/src/stall_detector.rs` |
-| Chat stream (main loop) | `rust/crates/mo-agent/src/mo_agent/chat_stream.rs` |
-| Plan executor | `rust/crates/mo-agent/src/mo_agent/plan_executor.rs` |
-| Debug inspector | `rust/crates/mo-agent/src/mo_agent/slash_debug.rs` |
-| REPL turn handler | `rust/crates/mo-agent/src/mo_agent/repl_turn.rs` |
+| Chat stream (main loop) | `rust/crates/astra-cli/src/cli/chat_stream.rs` |
+| Plan executor | `rust/crates/astra-cli/src/cli/plan_executor.rs` |
+| Debug inspector | `rust/crates/astra-cli/src/cli/slash_debug.rs` |
+| REPL turn handler | `rust/crates/astra-cli/src/cli/repl_turn.rs` |

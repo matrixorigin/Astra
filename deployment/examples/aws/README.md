@@ -1,6 +1,6 @@
 # AWS Deployment Example
 
-Deploy mo-agent to AWS using ECS (Elastic Container Service).
+Deploy astra to AWS using ECS (Elastic Container Service).
 
 ## Prerequisites
 
@@ -15,16 +15,16 @@ Deploy mo-agent to AWS using ECS (Elastic Container Service).
 ./build-and-push.sh
 
 # 2. Create ECS cluster
-aws ecs create-cluster --cluster-name mo-agent
+aws ecs create-cluster --cluster-name astra
 
 # 3. Register task definition
 aws ecs register-task-definition --cli-input-json file://task-definition.json
 
 # 4. Create service
 aws ecs create-service \
-  --cluster mo-agent \
-  --service-name mo-agent-api \
-  --task-definition mo-agent \
+  --cluster astra \
+  --service-name astra-api \
+  --task-definition astra \
   --desired-count 3 \
   --launch-type FARGATE \
   --network-configuration "awsvpcConfiguration={subnets=[subnet-xxx],securityGroups=[sg-xxx],assignPublicIp=ENABLED}"
@@ -61,7 +61,7 @@ aws ecs create-service \
 
 ```bash
 # Create ECR repository
-aws ecr create-repository --repository-name mo-agent
+aws ecr create-repository --repository-name astra
 
 # Get login command
 aws ecr get-login-password --region us-east-1 | \
@@ -89,7 +89,7 @@ docker run -d -p 6001:6001 matrixorigin/matrixone:latest
 ```bash
 # Create RDS instance
 aws rds create-db-instance \
-  --db-instance-identifier mo-agent-db \
+  --db-instance-identifier astra-db \
   --db-instance-class db.t3.medium \
   --engine mysql \
   --master-username admin \
@@ -102,7 +102,7 @@ aws rds create-db-instance \
 ```bash
 # Create Redis cluster
 aws elasticache create-cache-cluster \
-  --cache-cluster-id mo-agent-redis \
+  --cache-cluster-id astra-redis \
   --cache-node-type cache.t3.micro \
   --engine redis \
   --num-cache-nodes 1
@@ -113,15 +113,15 @@ aws elasticache create-cache-cluster \
 ```bash
 # Store secrets
 aws secretsmanager create-secret \
-  --name mo-agent/prod/token-key \
+  --name astra/prod/token-key \
   --secret-string "your-token-encryption-key"
 
 aws secretsmanager create-secret \
-  --name mo-agent/prod/jwt-secret \
+  --name astra/prod/jwt-secret \
   --secret-string "your-jwt-secret"
 
 aws secretsmanager create-secret \
-  --name mo-agent/prod/openai-key \
+  --name astra/prod/openai-key \
   --secret-string "your-openai-api-key"
 ```
 
@@ -130,13 +130,13 @@ aws secretsmanager create-secret \
 ```bash
 # Create Application Load Balancer
 aws elbv2 create-load-balancer \
-  --name mo-agent-alb \
+  --name astra-alb \
   --subnets subnet-xxx subnet-yyy \
   --security-groups sg-xxx
 
 # Create target group
 aws elbv2 create-target-group \
-  --name mo-agent-targets \
+  --name astra-targets \
   --protocol HTTP \
   --port 8000 \
   --vpc-id vpc-xxx \
@@ -168,11 +168,11 @@ Store in ECS task definition or use Secrets Manager:
 
 ```bash
 # View logs
-aws logs tail /ecs/mo-agent --follow
+aws logs tail /ecs/astra --follow
 
 # Create alarm
 aws cloudwatch put-metric-alarm \
-  --alarm-name mo-agent-high-cpu \
+  --alarm-name astra-high-cpu \
   --comparison-operator GreaterThanThreshold \
   --evaluation-periods 2 \
   --metric-name CPUUtilization \
@@ -190,7 +190,7 @@ aws cloudwatch put-metric-alarm \
 # Register scalable target
 aws application-autoscaling register-scalable-target \
   --service-namespace ecs \
-  --resource-id service/mo-agent/mo-agent-api \
+  --resource-id service/astra/astra-api \
   --scalable-dimension ecs:service:DesiredCount \
   --min-capacity 2 \
   --max-capacity 10
@@ -198,7 +198,7 @@ aws application-autoscaling register-scalable-target \
 # Create scaling policy
 aws application-autoscaling put-scaling-policy \
   --service-namespace ecs \
-  --resource-id service/mo-agent/mo-agent-api \
+  --resource-id service/astra/astra-api \
   --scalable-dimension ecs:service:DesiredCount \
   --policy-name cpu-scaling \
   --policy-type TargetTrackingScaling \

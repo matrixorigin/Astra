@@ -1,6 +1,6 @@
 name: audit-cloud-sync
 version: "1.0.0"
-description: "Audit edge-cloud sync: event ingestion, learning snapshots, checkpoints, task state, conflict resolution, sync failures"
+description: "Audit edge-cloud sync: events, learning, checkpoints, tasks, conflicts. Ref: rust/docs/edge-cloud-sync-architecture.md §8 (restore, skills)."
 author: "astra"
 
 tools:

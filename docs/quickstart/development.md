@@ -30,6 +30,6 @@ make dev-stop
 ## Focused Validation
 
 ```bash
-cargo test --manifest-path rust/Cargo.toml -p mo-agent-runtime --test http_contract
+cargo test --manifest-path rust/Cargo.toml -p astra-runtime --test http_contract
 cargo check --manifest-path rust/Cargo.toml
 ```

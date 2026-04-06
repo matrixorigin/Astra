@@ -16,7 +16,7 @@ Workstream A: Write Path (性能)          Workstream B: CLI Edge-Cloud (SaaS)
 A1: EventPipeline core                  B1: Edge tools + API client
 A2: Wire into ChatLoop/RunEngine        B2: /chat/turn API + server refactor
 A3: Embedding decoupling                B3: EdgeChatLoop (edge agentic loop)
-A4: Async snapshot + firewall           B4: Admin API + mo-admin migration
+A4: Async snapshot + firewall           B4: Admin API + astra-admin migration
 A5: Replay migration                    B5: Remove direct DB path + packaging
          │                                        │
          └──────────── Integration ───────────────┘
@@ -179,7 +179,7 @@ The server-side ChatLoop must be refactored to support per-turn execution (edge 
 | Tool schema | Server returns available tool schemas (from skill registry + edge-registered tools) so LLM knows what tools exist |
 | Event persistence | Server persists: user_query event, llm_response event, tool_call metadata, decision + snapshot |
 | Edge tool results | Server receives tool results from edge, persists as events, includes in next LLM context |
-| Project rules | Edge sends project rules (from local .mo-agent/rules.md etc.) in first turn; server injects into system prompt |
+| Project rules | Edge sends project rules (from local `.astra/` / `.astra/` rules files, `CLAUDE.md`, etc.) in first turn; server injects into system prompt |
 
 **Key difference from current `/chat/stream`**: Current endpoint runs the full agentic loop server-side (ChatLoop.run_step_stream). New endpoint runs ONE LLM turn, returns tool_calls to edge, waits for edge to call back with results.
 
@@ -212,9 +212,9 @@ The server-side ChatLoop must be refactored to support per-turn execution (edge 
 
 ---
 
-### B4: Admin API endpoints + mo-admin migration
+### B4: Admin API endpoints + astra-admin migration
 
-**Modified file**: `api/routers/admin.py` (already exists), `cli/mo_admin_api.py`
+**Modified file**: `api/routers/admin.py` (already exists); admin CLI is `rust/crates/astra-admin`
 
 | Endpoint | What it does | Auth |
 |---|---|---|
@@ -224,7 +224,7 @@ The server-side ChatLoop must be refactored to support per-turn execution (edge 
 | `GET /admin/audit` | Query audit logs | admin role |
 | `POST /admin/prompts/optimize` | Trigger prompt optimization | admin role |
 
-Migrate mo-admin commands to use API client instead of direct DB.
+Migrate astra-admin commands to use API client instead of direct DB.
 
 **Validation**: API tests for each endpoint with admin/non-admin JWT.
 
@@ -232,7 +232,7 @@ Migrate mo-admin commands to use API client instead of direct DB.
 
 ### B5: Remove direct DB path + CLI packaging
 
-**Modified files**: `cli/mo_agent_api.py`, `cli/mo_admin_api.py`
+**Modified files** (historical Python layout; current code: `rust/crates/astra-cli`, `rust/crates/astra-admin`)
 
 | Item | Detail |
 |---|---|
@@ -240,7 +240,7 @@ Migrate mo-admin commands to use API client instead of direct DB.
 | Delete | All `from core.*` imports from CLI (except `cli/tools/` which has no core deps) |
 | `--local` flag | Optional dev shortcut, re-enables direct DB path. Not default. |
 | Verify | CLI package has zero dependency on `core/` or `api/database.py` |
-| Packaging | CLI installable as `pip install mo-agent[cli]` without full server deps |
+| Packaging | CLI installable as `pip install astra-cli[cli]` without full server deps |
 
 ---
 
@@ -258,7 +258,7 @@ Week 4:    A3 (Embedding decoupling)    ←── depends on A2
 
 Week 5:    A4 (Async snapshot/firewall) ←── depends on A2
            A5 (Replay migration)        ←── depends on A2
-           B4 (Admin API + mo-admin)    ←── depends on B1
+           B4 (Admin API + astra-admin)    ←── depends on B1
 
 Week 6:    B5 (Remove direct DB path)   ←── depends on B3 + B4
            Integration testing + acceptance criteria validation
@@ -328,7 +328,7 @@ A1-A5 和 B1-B5 两条线大部分独立。B2 (/chat/turn) 是新增 API endpoin
 | A5 | Independent, revert to reading stream events from `conversation_events` |
 | B1 | Additive (new files), no impact on existing CLI |
 | B2 | Additive (new endpoint `/chat/turn`), existing `/chat/stream` untouched |
-| B3 | EdgeChatLoop is new code; existing `mo-agent chat` via `/chat/stream` still works |
+| B3 | EdgeChatLoop is new code; existing `astra chat` via `/chat/stream` still works |
 | B4 | `--local` flag preserves direct DB path throughout migration |
 | B5 | Don't delete direct DB imports until all commands verified |
 

@@ -501,12 +501,12 @@ Initial ETA (before any history) uses a conservative default of 80 memories/sec 
 - Global concurrency limit: **5 simultaneous backfill jobs** (configurable via `BACKFILL_MAX_CONCURRENT`)
 - Jobs beyond the limit are queued with FIFO ordering
 - CLI shows queue position: `Strategy: activation:v1 (queued — position 2 of 3)`
-- Priority override: admin can bump a job with `mo-agent memory backfill prioritize <user_id>`
+- Priority override: admin can bump a job with `astra memory backfill prioritize <user_id>`
 
 **Progress visibility:**
 
 ```bash
-mo-agent memory status
+astra memory status
 # Strategy: activation:v1 (building index... 67% — ~45s remaining)
 # or: Strategy: activation:v1 (queued — position 2 of 3)
 ```
@@ -724,7 +724,7 @@ class MemoryExperiment:
         ...
 
     def extend_ttl(self, experiment_id: str, days: int = 7) -> None:
-        """Extend experiment TTL. CLI: mo-agent experiment extend <id>."""
+        """Extend experiment TTL. CLI: astra experiment extend <id>."""
         ...
 ```
 
@@ -742,7 +742,7 @@ class MemoryExperiment:
 ### 7.6 Experiment TTL & Cleanup
 
 - Default TTL: **7 days** from creation
-- User can extend: `mo-agent experiment extend <id>` (adds 7 days, max 30 days total)
+- User can extend: `astra experiment extend <id>` (adds 7 days, max 30 days total)
 - Auto-cleanup job (runs daily with GovernanceScheduler):
   1. Find experiments where `status = 'active' AND created_at + TTL < NOW()`
   2. Set `status = 'expired'`
@@ -762,7 +762,7 @@ class MemoryExperiment:
 Before commit, the system auto-generates a structured change summary:
 
 ```
-mo-agent memory experiment commit exp_123
+astra memory experiment commit exp_123
 
   Change Summary (auto-generated):
   ├─ 3 memories injected (2 semantic, 1 procedural)
@@ -939,24 +939,24 @@ Every execution is sandboxed by default. `--no-sandbox` available for admin batc
 
 ```bash
 # Natural language (LLM generates script)
-mo-agent memory program "User now prefers Python for data science, Go only for system tools"
+astra memory program "User now prefers Python for data science, Go only for system tools"
 
 # YAML script
-mo-agent memory program run my-memory-program.yml
+astra memory program run my-memory-program.yml
 
 # Batch (admin)
-mo-agent memory program batch --script company-standards.yml --users all --dry-run
+astra memory program batch --script company-standards.yml --users all --dry-run
 
 # LLM-assisted debug
-mo-agent memory program debug "Why does agent still think I prefer Go?"
+astra memory program debug "Why does agent still think I prefer Go?"
 
 # Thought experiment
-mo-agent memory program experiment "test-clean-slate" --script purge-old-prefs.yml
+astra memory program experiment "test-clean-slate" --script purge-old-prefs.yml
 
 # Review pending, commit, discard
-mo-agent memory program review
-mo-agent memory program commit
-mo-agent memory program discard
+astra memory program review
+astra memory program commit
+astra memory program discard
 ```
 
 ### 9.5 User Tiers & Permission Model
@@ -964,7 +964,7 @@ mo-agent memory program discard
 | Tier | Interface | YAML scripts? | Batch? |
 |---|---|---|---|
 | Casual | Natural language chat | ❌ (LLM generates internally) | ❌ |
-| Developer | YAML scripts | ✅ (own memories only) | ✅ (`mo-agent memory run`) |
+| Developer | YAML scripts | ✅ (own memories only) | ✅ (`astra memory run`) |
 | Admin | Full access | ✅ | ✅ (`--users`) |
 
 Casual users can only use natural language one-liners. YAML script execution requires `developer` role or above.
@@ -1227,7 +1227,7 @@ CREATE TABLE mem_edit_log (
 1. ✅ MemoryProgrammer module (script parser + action dispatcher) — core/memory/programmer.py
 2. ✅ YAML script schema + validation — parse_script() with field normalization
 3. ✅ LLM natural-language → script conversion — nl_to_script() with model="cheapest"
-4. ✅ CLI commands (program, run, commit, discard, review) — cli/mo_agent_api.py
+4. ✅ CLI commands (program, run, commit, discard, review) — `rust/crates/astra-cli`
 5. ✅ Permission scoping (user-self vs admin-batch)
 6. ✅ EdgeTool for LLM chat loop — cli/tools/memory_program.py
 ```
@@ -1283,7 +1283,7 @@ Switching strategy = backfill new index from canonical storage. No data export/i
 | 2 | Backfill performance & UX? | **Async** (background job). ~2 min for 10K memories. `index_status` field visible via API/CLI. User sees "构建加速索引中" and continues using old strategy. |
 | 3 | Index garbage collection? | Keep orphaned index data **30 days** for potential switch-back, then GC. Orphaned data doesn't affect correctness. |
 | 4 | Experiment concurrency? | **Yes**, multiple active experiments allowed. Only one can commit at a time — **optimistic locking** via `base_snapshot` timestamp comparison against production state. If production changed since branch point, commit fails with `ConflictError`. |
-| 5 | Experiment TTL? | **7 days default**. User can extend via `mo-agent experiment extend <id>` (adds 7 days, max 30 days). Auto-cleanup job runs daily. Orphaned branches cleaned after 24h. |
+| 5 | Experiment TTL? | **7 days default**. User can extend via `astra experiment extend <id>` (adds 7 days, max 30 days). Auto-cleanup job runs daily. Orphaned branches cleaned after 24h. |
 | 6 | Relearn scope? | **Configurable**, default last 30 days. Full relearn available as admin operation. |
 | 7 | Metrics schema? | **Standardized** — see §8.4. Core: precision@k, recall@k, response_quality_score, retrieve_latency. Strategy-specific: multi_hop_hit_rate (activation). |
 | 8 | Strategy params validation? | **Pydantic schema per strategy** — see §8.5. Validated at write time. Invalid params rejected. |
@@ -1297,7 +1297,7 @@ Switching strategy = backfill new index from canonical storage. No data export/i
 |---|---|---|---|---|
 | 1 | Trainable Spreading Activation | Online learning layer: contrastive loss on retrieval feedback every ~1K retrievals to fine-tune edge type weights. Replaces static `TASK_EDGE_BOOST`. | Medium (PyTorch) | v2 |
 | 2 | Multimodal Memory | Add `content_type` (text/image/code) + `multimodal_embedding` column to graph nodes. Enables screenshot, code snippet, log image memories. | Medium | v2 |
-| 3 | Graph Visualization | `mo-agent memory graph viz --user alice --depth 3` — interactive graph visualization for debugging multi-hop failures. Graphviz or React component. | Low | v2 |
+| 3 | Graph Visualization | `astra memory graph viz --user alice --depth 3` — interactive graph visualization for debugging multi-hop failures. Graphviz or React component. | Low | v2 |
 | 4 | Standard Benchmark Integration | Built-in LongMemEval / LoCoMo golden sets. One-click evaluation in experiment branch. Quantify every change as "±X% on benchmark". | Low | v2 |
 | 5 | Distributed Governance | GovernanceScheduler with distributed locking (via existing `distributed_locks` table). Required for multi-instance / multi-tenant deployment. | Medium | v3 |
 

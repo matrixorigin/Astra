@@ -5,13 +5,13 @@ use serde_json::Value;
 use std::sync::OnceLock;
 
 /// Marks unified diff appended to `str_replace` text results (not sent to the model).
-pub const STR_REPLACE_DIFF_START: &str = "\n<<<MO_AGENT_UNIFIED_DIFF>>>\n";
-pub const STR_REPLACE_DIFF_END: &str = "\n<<<END_MO_AGENT_UNIFIED_DIFF>>>\n";
+pub const STR_REPLACE_DIFF_START: &str = "\n<<<ASTRA_UNIFIED_DIFF>>>\n";
+pub const STR_REPLACE_DIFF_END: &str = "\n<<<END_ASTRA_UNIFIED_DIFF>>>\n";
 
 fn str_replace_diff_block_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
-        Regex::new(r"\n<<<MO_AGENT_UNIFIED_DIFF>>>\n[\s\S]*?\n<<<END_MO_AGENT_UNIFIED_DIFF>>>\n?")
+        Regex::new(r"\n<<<ASTRA_UNIFIED_DIFF>>>\n[\s\S]*?\n<<<END_ASTRA_UNIFIED_DIFF>>>\n?")
             .expect("regex")
     })
 }
@@ -60,18 +60,18 @@ mod tests {
 
     #[test]
     fn strips_str_replace_sentinel() {
-        let raw = "Replaced ok\n<<<MO_AGENT_UNIFIED_DIFF>>>\n+a\n<<<END_MO_AGENT_UNIFIED_DIFF>>>\n";
+        let raw = "Replaced ok\n<<<ASTRA_UNIFIED_DIFF>>>\n+a\n<<<END_ASTRA_UNIFIED_DIFF>>>\n";
         let out = tool_result_content_for_model("str_replace", raw);
-        assert!(!out.contains("MO_AGENT"));
+        assert!(!out.contains("ASTRA_UNIFIED_DIFF"));
         assert!(out.contains("Replaced"));
     }
 
     #[test]
     fn strips_multi_edit_sentinel() {
         let raw =
-            "Applied 1 edit(s)\n<<<MO_AGENT_UNIFIED_DIFF>>>\n+a\n<<<END_MO_AGENT_UNIFIED_DIFF>>>\n";
+            "Applied 1 edit(s)\n<<<ASTRA_UNIFIED_DIFF>>>\n+a\n<<<END_ASTRA_UNIFIED_DIFF>>>\n";
         let out = tool_result_content_for_model("multi_edit", raw);
-        assert!(!out.contains("MO_AGENT"));
+        assert!(!out.contains("ASTRA_UNIFIED_DIFF"));
         assert!(out.contains("Applied"));
     }
 }

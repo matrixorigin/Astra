@@ -12,7 +12,7 @@ Complete engineering design for training, deploying, and operating the feedback 
 │                    Training Pipeline                         │
 │  (Heavy deps: transformers, torch, GPU)                     │
 │                                                              │
-│  mo-admin feedback train                                     │
+│  astra-admin feedback train                                     │
 │      → FeedbackTrainerSkill (isolated conda env)            │
 │      → Export ONNX model                                     │
 │      → Register to model_artifacts table                    │
@@ -366,7 +366,7 @@ CREATE TABLE model_artifacts (
 # core/models/artifact_manager.py
 class ArtifactManager:
     def save(self, artifact_id: str, model_path: str):
-        storage_dir = Path("~/.mo-agent/models").expanduser()
+        storage_dir = Path("~/.astra/models").expanduser()
         storage_dir.mkdir(parents=True, exist_ok=True)
         
         dest = storage_dir / f"{artifact_id}.onnx"
@@ -386,7 +386,7 @@ class S3ArtifactManager(ArtifactManager):
         self.s3_client.upload_file(model_path, self.bucket, s3_key)
         
         # Generate CloudFront URL for fast download
-        cdn_url = f"https://cdn.mo-agent.com/models/{artifact_id}.onnx"
+        cdn_url = f"https://cdn.astra.local/models/{artifact_id}.onnx"
         
         self.db.execute(
             "INSERT INTO model_artifacts (...) VALUES (...)",
@@ -403,7 +403,7 @@ class S3ArtifactManager(ArtifactManager):
 conda activate agent-engine-train
 
 # Train via skill
-mo-agent skill execute feedback_trainer \
+astra skill execute feedback_trainer \
   --dataset-id ds_20260221 \
   --epochs 3 \
   --batch-size 16
@@ -412,14 +412,14 @@ mo-agent skill execute feedback_trainer \
 # ✅ Training complete
 # 📊 Accuracy: 0.87, F1: 0.85
 # 💾 Artifact ID: art_abc123
-# 📦 ONNX exported: ~/.mo-agent/models/art_abc123.onnx
+# 📦 ONNX exported: ~/.astra/models/art_abc123.onnx
 ```
 
 ### 2. Validate Model
 
 ```bash
 # Regression gate: compare with current active model
-mo-admin model validate --artifact-id art_abc123
+astra-admin model validate --artifact-id art_abc123
 
 # Output:
 # 🔍 Testing on golden set (100 samples)
@@ -432,7 +432,7 @@ mo-admin model validate --artifact-id art_abc123
 
 ```bash
 # Switch to new model
-mo-admin model activate --artifact-id art_abc123
+astra-admin model activate --artifact-id art_abc123
 
 # DB update:
 # UPDATE model_artifacts SET is_active = FALSE WHERE skill_id = 'feedback_classifier';
@@ -446,10 +446,10 @@ mo-admin model activate --artifact-id art_abc123
 conda activate agent-engine
 
 # Chat loop automatically uses new model
-mo-agent chat
+astra chat
 
 # First inference triggers lazy load:
-# 📥 Loading model art_abc123 from ~/.mo-agent/models/art_abc123.onnx
+# 📥 Loading model art_abc123 from ~/.astra/models/art_abc123.onnx
 # ✅ Model loaded (50ms)
 # 🔮 Inference: signal_type=correction, confidence=0.89
 ```
@@ -457,7 +457,7 @@ mo-agent chat
 ## Multi-Process Deployment
 
 ### Problem
-- Multiple `mo-agent chat` processes
+- Multiple `astra chat` processes
 - Each loads model into memory (110MB × N processes)
 
 ### Solution: Shared Model Server
@@ -483,10 +483,10 @@ class ModelServer:
 
 ```bash
 # Terminal 1: Start model server
-mo-agent model serve --port 9527
+astra model serve --port 9527
 
 # Terminal 2-N: Chat processes use HTTP client
-mo-agent chat  # Auto-detects model server at localhost:9527
+astra chat  # Auto-detects model server at localhost:9527
 ```
 
 ## Monitoring & Observability
@@ -537,7 +537,7 @@ FeedbackClassifierSkill auto-reloads
 Automated via cron job:
 ```bash
 # crontab
-0 2 * * 0  conda run -n agent-engine-train mo-admin feedback retrain --auto-activate
+0 2 * * 0  conda run -n agent-engine-train astra-admin feedback retrain --auto-activate
 ```
 
 ## Cost Analysis

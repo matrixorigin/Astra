@@ -3,9 +3,9 @@ members = [
     "crates/core",
     "crates/services",
     "crates/runtime",
-    "crates/mo-agent",
-    "crates/mo-admin",
-    "crates/mo-thin-client",
+    "crates/astra-cli",
+    "crates/astra-admin",
+    "crates/astra-thin-client",
 ]
 resolver = "2"
 
@@ -17,7 +17,7 @@ edition = "2024"
 astra-core = { path = "crates/core" }
 astra-services = { path = "crates/services" }
 astra-runtime = { path = "crates/runtime" }
-astra-thin-client = { path = "crates/mo-thin-client" }
+astra-thin-client = { path = "crates/astra-thin-client" }
 async-stream = "0.3.6"
 async-trait = "0.1.89"
 axum = { version = "0.8.6", features = ["ws"] }

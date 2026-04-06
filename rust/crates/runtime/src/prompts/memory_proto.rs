@@ -1,6 +1,6 @@
 /// Structured memory entry protocol (v1).
 ///
-/// Every memory stored by mo-agent follows this wire format:
+/// Every memory stored by astra follows this wire format:
 ///
 /// ```text
 /// [@<namespace>/<status>] <body>

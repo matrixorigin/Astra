@@ -219,7 +219,7 @@ pub(super) async fn dispatch_chat_turn_bridge(
         );
     }
     // Bridge E2E hooks (`bridge-e2e-hooks`): in-process bridge reads this header with env
-    // `MO_AGENT_BRIDGE_TEST_SECRET`; harmless if unset or header absent.
+    // `ASTRA_BRIDGE_TEST_SECRET`; harmless if unset or header absent.
     if let Some(v) = source_headers.get("x-mo-bridge-test-secret").cloned() {
         bridge_headers.insert(HeaderName::from_static("x-mo-bridge-test-secret"), v);
     }

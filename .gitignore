@@ -1,7 +1,7 @@
 # Local memory / rules (do not commit)
 .local/
 
-.mo-agent/
+.astra/
 
 # Kiro local settings (MCP config has local paths/credentials)
 .kiro/settings/

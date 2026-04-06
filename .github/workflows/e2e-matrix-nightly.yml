@@ -28,8 +28,8 @@ jobs:
       - name: Run system Matrix HTTP E2E (ignored tests)
         working-directory: rust
         env:
-          MO_AGENT_SYSTEM_MATRIX_E2E: "1"
-          MO_AGENT_BRIDGE_TEST_SECRET: system-matrix-e2e-secret
+          ASTRA_SYSTEM_MATRIX_E2E: "1"
+          ASTRA_BRIDGE_TEST_SECRET: system-matrix-e2e-secret
           TEST_NAME_FILTER: ${{ github.event.inputs.test_name_filter || '' }}
           # Set via repo secrets / vars before relying on this job in CI:
           # MATRIXONE_HOST, MATRIXONE_PORT, MATRIXONE_USER, MATRIXONE_PASSWORD, MATRIXONE_DATABASE

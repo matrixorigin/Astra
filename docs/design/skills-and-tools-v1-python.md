@@ -18,7 +18,7 @@
 
 The industry is moving from "tools as function calls" to "skills as modular expertise packages." Anthropic's Agent Skills introduces three-tier progressive loading. ElizaOS pioneered plugin schemas (plugins declare DB tables, platform auto-migrates).
 
-mo-agent-engine goes further with **Skill-as-Package**: skills are platform capabilities with platform-defined schemas and typed API layers. All skill tables live in the platform database with `sk_{skill}_{table}` naming convention. Users interact with skill data through skill APIs, not direct SQL. Each skill defines its own tables in `skills/{name}/models.py`.
+astra-engine goes further with **Skill-as-Package**: skills are platform capabilities with platform-defined schemas and typed API layers. All skill tables live in the platform database with `sk_{skill}_{table}` naming convention. Users interact with skill data through skill APIs, not direct SQL. Each skill defines its own tables in `skills/{name}/models.py`.
 
 ---
 
@@ -126,7 +126,7 @@ skills/
 name: github
 version: "1.0.0"
 description: "GitHub integration — PRs, issues, CI status, code search"
-author: "mo-agent-engine"
+author: "astra-engine"
 table_prefix: sk_github
 
 tables:
@@ -437,7 +437,7 @@ Archived:    Read-only, available for replay only
 
 Replay requires executing the exact skill code that ran during the original session. The platform maintains a **skill artifact registry** to guarantee code-level reproducibility.
 
-**Publish flow**: `mo-admin skill publish` packages the skill directory into a tarball, computes `code_hash` (SHA-256), and stores it in the artifact registry (local filesystem or object storage). The `skills_registry.code_hash` column records the hash for each published version.
+**Publish flow**: `astra-admin skill publish` packages the skill directory into a tarball, computes `code_hash` (SHA-256), and stores it in the artifact registry (local filesystem or object storage). The `skills_registry.code_hash` column records the hash for each published version.
 
 **Replay flow**:
 ```
@@ -1044,7 +1044,7 @@ MCP and A2A are interoperability protocols — useful for ecosystem integration,
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│  mo-agent-engine Skill Registry                             │
+│  astra-engine Skill Registry                             │
 │                                                             │
 │  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐     │
 │  │ Built-in     │  │ User-defined │  │ MCP Server   │     │
@@ -1066,9 +1066,9 @@ MCP and A2A are interoperability protocols — useful for ecosystem integration,
 
 **Two directions**:
 
-1. **MCP Client**: mo-agent-engine connects to external MCP servers. Each MCP tool is registered as a skill with auto-generated metadata, side-effect profile defaults to "write" (conservative).
+1. **MCP Client**: astra-engine connects to external MCP servers. Each MCP tool is registered as a skill with auto-generated metadata, side-effect profile defaults to "write" (conservative).
 
-2. **MCP Server**: mo-agent-engine exposes its skills as MCP tools. External agents (Claude Code, Cursor, etc.) can use our skills with full audit trail.
+2. **MCP Server**: astra-engine exposes its skills as MCP tools. External agents (Claude Code, Cursor, etc.) can use our skills with full audit trail.
 
 ### A2A Gateway (Future)
 
@@ -1374,7 +1374,7 @@ Parameter names and descriptions are part of the tool's "prompt." They must be u
 
 Comparison focuses on **stateful skill management** — persistent data, lifecycle, platform-level governance. All frameworks support tool/function schemas for LLM calling; that is table stakes and not compared here.
 
-| Feature | ElizaOS | LangChain | MCP | **mo-agent-engine** |
+| Feature | ElizaOS | LangChain | MCP | **astra-engine** |
 |---------|---------|-----------|-----|---------------------|
 | Platform-managed schema | ✅ plugin schema (plugin owns) | ❌ stateless | ❌ stateless | ✅ platform-defined |
 | Table namespace | ❌ bare names | ❌ | ❌ | ✅ `sk_{skill}_{table}` |
@@ -1556,7 +1556,7 @@ depends_on: []
 ### CLI Command
 
 ```bash
-mo-admin skill scaffold skill.yaml
+astra-admin skill scaffold skill.yaml
 # Generates:
 #   skills/jira/
 #     manifest.yaml      ← from skill.yaml metadata
@@ -1587,7 +1587,7 @@ mo-admin skill scaffold skill.yaml
 
 ### Validation & Testing (P1)
 
-`mo-admin skill validate <skill_dir>` performs post-scaffold consistency checks:
+`astra-admin skill validate <skill_dir>` performs post-scaffold consistency checks:
 - Generated code matches manifest declarations (actions, tables, config keys)
 - Type annotations are consistent between YAML types and Python signatures
 - Required config keys have no missing defaults
@@ -1600,7 +1600,7 @@ Optional: `--generate-tests` flag auto-generates a `unittest` skeleton per actio
 A lightweight browser-based YAML editor with:
 - Live JSON Schema validation (red squiggles on invalid fields)
 - Visual table/action builder (form → YAML, not the other way around)
-- One-click "Scaffold & Download" that calls `mo-admin skill scaffold` server-side
+- One-click "Scaffold & Download" that calls `astra-admin skill scaffold` server-side
 
 ---
 
@@ -2206,7 +2206,7 @@ User: "install github skill"
   ├─ 8. Record installation
   └─ 9. Show resource binding instructions:
         "To use GitHub skill with specific repos, run:
-         mo-agent skill config github --resource matrixorigin/matrixone"
+         astra skill config github --resource matrixorigin/matrixone"
 ```
 
 **Pre-execution gate** (replaces old `require_executable`):
@@ -2287,25 +2287,25 @@ GET /skills/github/config/validate?resource=unknown-org/new-repo
 
 ```bash
 # Interactive config setup
-mo-agent skill config github
+astra skill config github
 # → Shows current settings, prompts for missing required items
 
 # Set a setting
-mo-agent skill config github --set api_base_url=https://github.corp.com/api/v3
+astra skill config github --set api_base_url=https://github.corp.com/api/v3
 
 # Set a secret
-mo-agent skill config github --secret default_token
+astra skill config github --secret default_token
 # → Prompts for value (hidden input)
 
 # Bind a resource
-mo-agent skill config github --resource matrixorigin/matrixone
+astra skill config github --resource matrixorigin/matrixone
 # → Prompts for read_token (required), write_token (optional), default_branch
 
 # List resources
-mo-agent skill config github --list-resources
+astra skill config github --list-resources
 
 # Validate
-mo-agent skill config github --validate
+astra skill config github --validate
 ```
 
 #### Event Sourcing
@@ -2415,7 +2415,7 @@ board_id for PROJECT-A → skill_resource_bindings: 42
 | P0 | Pre-execution validation in `require_executable()` | 0.5 day | ✅ Done |
 | P0 | Migration from `skill_user_credentials` | 0.5 day | ✅ Done |
 | P1 | REST API endpoints (`api/routers/skill_config.py`) | 1 day | ✅ Done |
-| P1 | CLI `mo-agent skill config` commands | 1 day | ✅ Done |
+| P1 | CLI `astra skill config` commands | 1 day | ✅ Done |
 | P2 | Tenant-scope admin endpoints | 0.5 day | |
 | P2 | Config change events | 0.5 day | |
 

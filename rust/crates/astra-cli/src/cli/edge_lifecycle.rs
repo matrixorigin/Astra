@@ -10,16 +10,16 @@ use crossterm::style::Stylize;
 
 use crate::chat_stream::edge_executor_instance_id;
 
-/// When `MO_EDGE_REGISTRY` is `0`, `false`, or `off`, skip register and heartbeat.
+/// When `ASTRA_EDGE_REGISTRY` is `0`, `false`, or `off`, skip register and heartbeat.
 pub fn edge_cloud_registry_enabled() -> bool {
     !matches!(
-        std::env::var("MO_EDGE_REGISTRY").as_deref(),
+        std::env::var("ASTRA_EDGE_REGISTRY").as_deref(),
         Ok("0") | Ok("false") | Ok("off")
     )
 }
 
 fn heartbeat_period() -> Option<Duration> {
-    let secs: u64 = std::env::var("MO_EDGE_HEARTBEAT_SECS")
+    let secs: u64 = std::env::var("ASTRA_EDGE_HEARTBEAT_SECS")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(120);
@@ -106,7 +106,7 @@ pub async fn register_and_start_heartbeat(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use astra_thin_client::MO_EDGE_ID_HEADER;
+    use astra_thin_client::ASTRA_EDGE_ID_HEADER;
     use serial_test::serial;
     use wiremock::matchers::{header_exists, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -125,60 +125,60 @@ mod tests {
     #[test]
     #[serial]
     fn edge_cloud_registry_enabled_respects_env() {
-        let prev = std::env::var("MO_EDGE_REGISTRY").ok();
-        env_remove("MO_EDGE_REGISTRY");
+        let prev = std::env::var("ASTRA_EDGE_REGISTRY").ok();
+        env_remove("ASTRA_EDGE_REGISTRY");
         assert!(edge_cloud_registry_enabled());
-        env_set("MO_EDGE_REGISTRY", "0");
+        env_set("ASTRA_EDGE_REGISTRY", "0");
         assert!(!edge_cloud_registry_enabled());
-        env_set("MO_EDGE_REGISTRY", "false");
+        env_set("ASTRA_EDGE_REGISTRY", "false");
         assert!(!edge_cloud_registry_enabled());
-        env_set("MO_EDGE_REGISTRY", "off");
+        env_set("ASTRA_EDGE_REGISTRY", "off");
         assert!(!edge_cloud_registry_enabled());
         match &prev {
-            Some(v) => env_set("MO_EDGE_REGISTRY", v),
-            None => env_remove("MO_EDGE_REGISTRY"),
+            Some(v) => env_set("ASTRA_EDGE_REGISTRY", v),
+            None => env_remove("ASTRA_EDGE_REGISTRY"),
         }
     }
 
     #[test]
     #[serial]
     fn heartbeat_period_parsing() {
-        let prev = std::env::var("MO_EDGE_HEARTBEAT_SECS").ok();
-        env_remove("MO_EDGE_HEARTBEAT_SECS");
+        let prev = std::env::var("ASTRA_EDGE_HEARTBEAT_SECS").ok();
+        env_remove("ASTRA_EDGE_HEARTBEAT_SECS");
         assert_eq!(heartbeat_period(), Some(Duration::from_secs(120)));
-        env_set("MO_EDGE_HEARTBEAT_SECS", "0");
+        env_set("ASTRA_EDGE_HEARTBEAT_SECS", "0");
         assert_eq!(heartbeat_period(), None);
-        env_set("MO_EDGE_HEARTBEAT_SECS", "30");
+        env_set("ASTRA_EDGE_HEARTBEAT_SECS", "30");
         assert_eq!(heartbeat_period(), Some(Duration::from_secs(30)));
         match &prev {
-            Some(v) => env_set("MO_EDGE_HEARTBEAT_SECS", v),
-            None => env_remove("MO_EDGE_HEARTBEAT_SECS"),
+            Some(v) => env_set("ASTRA_EDGE_HEARTBEAT_SECS", v),
+            None => env_remove("ASTRA_EDGE_HEARTBEAT_SECS"),
         }
     }
 
     #[tokio::test]
     #[serial]
     async fn register_disabled_skips_http() {
-        let prev_reg = std::env::var("MO_EDGE_REGISTRY").ok();
-        env_set("MO_EDGE_REGISTRY", "0");
+        let prev_reg = std::env::var("ASTRA_EDGE_REGISTRY").ok();
+        env_set("ASTRA_EDGE_REGISTRY", "0");
         let api = ThinClient::new("http://127.0.0.1:1", None).expect("url");
         let r = register_edge_once(&api, "token").await;
         assert!(r.is_ok());
         match &prev_reg {
-            Some(v) => env_set("MO_EDGE_REGISTRY", v),
-            None => env_remove("MO_EDGE_REGISTRY"),
+            Some(v) => env_set("ASTRA_EDGE_REGISTRY", v),
+            None => env_remove("ASTRA_EDGE_REGISTRY"),
         }
     }
 
     #[tokio::test]
     #[serial]
     async fn register_edge_once_hits_wiremock() {
-        env_remove("MO_EDGE_REGISTRY");
+        env_remove("ASTRA_EDGE_REGISTRY");
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/agents/edge"))
             .and(header_exists("authorization"))
-            .and(header_exists(MO_EDGE_ID_HEADER))
+            .and(header_exists(ASTRA_EDGE_ID_HEADER))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
             .mount(&server)
             .await;
@@ -199,9 +199,9 @@ mod tests {
     #[serial]
     async fn register_enriches_hostname_from_env() {
         let prev_host = std::env::var("HOSTNAME").ok();
-        let prev_reg = std::env::var("MO_EDGE_REGISTRY").ok();
+        let prev_reg = std::env::var("ASTRA_EDGE_REGISTRY").ok();
         env_set("HOSTNAME", "unit-test-host");
-        env_remove("MO_EDGE_REGISTRY");
+        env_remove("ASTRA_EDGE_REGISTRY");
 
         let server = MockServer::start().await;
         Mock::given(method("POST"))
@@ -225,8 +225,8 @@ mod tests {
             None => env_remove("HOSTNAME"),
         }
         match &prev_reg {
-            Some(v) => env_set("MO_EDGE_REGISTRY", v),
-            None => env_remove("MO_EDGE_REGISTRY"),
+            Some(v) => env_set("ASTRA_EDGE_REGISTRY", v),
+            None => env_remove("ASTRA_EDGE_REGISTRY"),
         }
     }
 }

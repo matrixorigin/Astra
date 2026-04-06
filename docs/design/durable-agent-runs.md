@@ -567,7 +567,7 @@ Exception: if a run is purely cloud-skilled (system agent, no edge tools), cloud
 ### Edge Reconnection UX
 
 ```
-$ mo-agent chat
+$ astra chat
 ⏳ 1 task ready to resume:
   [run_abc] "修复 CI，跑回归测试" — CI completed (passed) 2h ago
   

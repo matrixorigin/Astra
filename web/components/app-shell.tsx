@@ -25,7 +25,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
           <div className="sticky top-0 p-6">
             <Link href="/overview" className="block">
               <p className="text-sm font-semibold uppercase tracking-[0.24em] text-sky-300">
-                mo-agent web
+                astra web
               </p>
               <h1 className="mt-2 text-2xl font-semibold text-white">Platform console</h1>
             </Link>

@@ -28,7 +28,7 @@ help:
 	@echo ""
 	@echo "Testing:"
 	@echo "  make test               - Workspace + bridge-e2e-hooks (does not run #[ignore] live-DB E2E)"
-	@echo "  make test-integration   - Same as test + Matrix ignored suites (parallel E2E by default; MO_AGENT_SYSTEM_MATRIX_E2E_TEST_THREADS=1 to serialize)"
+	@echo "  make test-integration   - Same as test + Matrix ignored suites (parallel E2E by default; ASTRA_SYSTEM_MATRIX_E2E_TEST_THREADS=1 to serialize)"
 	@echo "  make test-contract      - Run contract tests (http/admin/auth/config)"
 	@echo ""
 	@echo "Code Quality:"
@@ -241,7 +241,7 @@ dev-api-status:
 .PHONY: dev-api-docker-build
 dev-api-docker-build:
 	@echo "Building API server image..."
-	@docker build -t mo-agent-engine:latest .
+	@docker build -t astra-engine:latest .
 	@echo "✅ Image built"
 
 .PHONY: dev-api-docker-up
@@ -417,26 +417,26 @@ test-runtime-bridge-hooks:
 	@$(CARGO) test $(CARGO_MANIFEST_FLAG) $(API_SHELL_PKG) --features bridge-e2e-hooks
 
 # Ignored tests: opt-in so CI without MatrixOne stays green. Enable with:
-#   MO_AGENT_SYSTEM_MATRIX_E2E=1   -> system_matrix_http_e2e (--ignored)
-#   MO_AGENT_MULTI_AGENT_IT=1      -> astra-services multi_agent_integration (--ignored)
-# Optional serial Matrix E2E: MO_AGENT_SYSTEM_MATRIX_E2E_TEST_THREADS=1 -> --test-threads=1
+#   ASTRA_SYSTEM_MATRIX_E2E=1   -> system_matrix_http_e2e (--ignored)
+#   ASTRA_MULTI_AGENT_IT=1      -> astra-services multi_agent_integration (--ignored)
+# Optional serial Matrix E2E: ASTRA_SYSTEM_MATRIX_E2E_TEST_THREADS=1 -> --test-threads=1
 .PHONY: test-ignored-integration
 test-ignored-integration:
-	@if [ "$${MO_AGENT_SYSTEM_MATRIX_E2E:-}" != "1" ] && [ "$${MO_AGENT_MULTI_AGENT_IT:-}" != "1" ]; then \
-		echo "Note: optional live-DB tests not run (expected for \`make test\`). To run them: \`make test-integration\`, or set MO_AGENT_SYSTEM_MATRIX_E2E=1 and/or MO_AGENT_MULTI_AGENT_IT=1."; \
+	@if [ "$${ASTRA_SYSTEM_MATRIX_E2E:-}" != "1" ] && [ "$${ASTRA_MULTI_AGENT_IT:-}" != "1" ]; then \
+		echo "Note: optional live-DB tests not run (expected for \`make test\`). To run them: \`make test-integration\`, or set ASTRA_SYSTEM_MATRIX_E2E=1 and/or ASTRA_MULTI_AGENT_IT=1."; \
 	fi
-	@if [ "$${MO_AGENT_SYSTEM_MATRIX_E2E:-}" = "1" ]; then \
+	@if [ "$${ASTRA_SYSTEM_MATRIX_E2E:-}" = "1" ]; then \
 		EXTRA_THREADS=""; \
-		if [ "$${MO_AGENT_SYSTEM_MATRIX_E2E_TEST_THREADS:-}" = "1" ]; then \
+		if [ "$${ASTRA_SYSTEM_MATRIX_E2E_TEST_THREADS:-}" = "1" ]; then \
 			EXTRA_THREADS="--test-threads=1"; \
-			echo "system_matrix_http_e2e: serial mode (MO_AGENT_SYSTEM_MATRIX_E2E_TEST_THREADS=1)"; \
+			echo "system_matrix_http_e2e: serial mode (ASTRA_SYSTEM_MATRIX_E2E_TEST_THREADS=1)"; \
 		else \
 			echo "Running system_matrix_http_e2e (ignored; parallel default; live DB + AppSettings::from_env)..."; \
 		fi; \
 		$(CARGO) test $(CARGO_MANIFEST_FLAG) $(API_SHELL_PKG) --features bridge-e2e-hooks \
 			--test system_matrix_http_e2e -- --ignored $$EXTRA_THREADS --nocapture; \
 	fi
-	@if [ "$${MO_AGENT_MULTI_AGENT_IT:-}" = "1" ]; then \
+	@if [ "$${ASTRA_MULTI_AGENT_IT:-}" = "1" ]; then \
 		echo "Running multi_agent_integration (ignored; live MatrixOne)..."; \
 		$(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-services --test multi_agent_integration -- --ignored; \
 	fi
@@ -444,7 +444,7 @@ test-ignored-integration:
 # One-shot local/CI job when deps are up: exports both flags and runs `test`.
 .PHONY: test-integration
 test-integration:
-	@MO_AGENT_SYSTEM_MATRIX_E2E=1 MO_AGENT_MULTI_AGENT_IT=1 $(MAKE) test
+	@ASTRA_SYSTEM_MATRIX_E2E=1 ASTRA_MULTI_AGENT_IT=1 $(MAKE) test
 
 .PHONY: test-contract
 test-contract:

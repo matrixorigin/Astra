@@ -93,7 +93,7 @@ pub async fn run_tasks_lease_with_db_assertions() {
         .uri("/agents/edge")
         .header("authorization", auth.as_str())
         .header("content-type", "application/json")
-        .header("x-mo-edge-id", "matrix-e2e-edge")
+        .header("x-astra-edge-id", "matrix-e2e-edge")
         .body(axum::body::Body::from(
             json!({
                 "edge_agent_id": edge_agent_id,
@@ -110,7 +110,7 @@ pub async fn run_tasks_lease_with_db_assertions() {
         app,
         &format!("/tasks/{task_id}/lease/claim"),
         Some(auth.as_str()),
-        &[("x-mo-edge-id", "matrix-e2e-edge")],
+        &[("x-astra-edge-id", "matrix-e2e-edge")],
         json!({ "edge_agent_id": edge_agent_id, "ttl_sec": 300 }),
     )
     .await;
@@ -161,7 +161,7 @@ pub async fn run_tasks_lease_with_db_assertions() {
         app,
         &format!("/tasks/{task_id}/lease/renew"),
         Some(auth.as_str()),
-        &[("x-mo-edge-id", "matrix-e2e-edge")],
+        &[("x-astra-edge-id", "matrix-e2e-edge")],
         json!({ "edge_agent_id": edge_agent_id, "ttl_sec": 600 }),
     )
     .await;
@@ -171,7 +171,7 @@ pub async fn run_tasks_lease_with_db_assertions() {
         app,
         &format!("/tasks/{task_id}/lease/release"),
         Some(auth.as_str()),
-        &[("x-mo-edge-id", "matrix-e2e-edge")],
+        &[("x-astra-edge-id", "matrix-e2e-edge")],
         json!({ "edge_agent_id": edge_agent_id }),
     )
     .await;

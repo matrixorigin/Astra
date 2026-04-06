@@ -112,7 +112,7 @@
 
 Memory and context are the two most critical capabilities for production AI agents. Anthropic's context engineering research shows that intelligence is not the bottleneck — **context is**. Letta/MemGPT, EverMemOS, and Observational Memory demonstrate that agents with proper memory architecture dramatically outperform those without.
 
-This document defines how mo-agent-engine thinks about, stores, retrieves, and manages the information that agents use to make decisions.
+This document defines how astra-engine thinks about, stores, retrieves, and manages the information that agents use to make decisions.
 
 ### Memory Behaviors: Why They Matter
 

@@ -223,7 +223,7 @@ This is the most complex part. The CLI host uses references (`&'a`) extensively,
 can't directly clone it. We need a builder pattern or owned-value wrapper.
 
 ```rust
-// New file: rust/crates/mo-agent/src/mo_agent/chat_stream/sse_loop/skill_subrun.rs
+// New file: rust/crates/astra-cli/src/cli/chat_stream/sse_loop/skill_subrun.rs
 
 pub struct CliSkillSubRunExecutor {
     api: Arc<ThinClient>,            // Shared API client (upgrade from &'a to Arc)

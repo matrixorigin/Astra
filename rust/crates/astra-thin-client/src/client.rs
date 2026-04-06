@@ -11,7 +11,7 @@ use reqwest::{
 };
 use serde_json::Value;
 
-use crate::edge::MO_EDGE_ID_HEADER;
+use crate::edge::ASTRA_EDGE_ID_HEADER;
 use crate::error::ThinClientError;
 use crate::paths;
 use crate::protocol::{
@@ -21,7 +21,7 @@ use crate::protocol::{
 };
 use crate::sse::SseParser;
 
-/// Stateless façade over the mo-agent HTTP API (thin client).
+/// Stateless façade over the astra HTTP API (thin client).
 #[derive(Debug, Clone)]
 pub struct ThinClient {
     http: Client,
@@ -804,7 +804,7 @@ impl ThinClient {
             .await?)
     }
 
-    /// Retry on 429 up to `max_attempts` (same policy as mo-agent CLI).
+    /// Retry on 429 up to `max_attempts` (same policy as astra CLI).
     pub async fn post_chat_turn_retry_429(
         &self,
         token: &str,
@@ -992,7 +992,7 @@ impl ThinClient {
         if let Some(id) = edge_executor_id
             && let Ok(v) = HeaderValue::from_str(id)
         {
-            req = req.header(MO_EDGE_ID_HEADER, v);
+            req = req.header(ASTRA_EDGE_ID_HEADER, v);
         }
         let resp = req.send().await?;
         Self::json_or_error(resp).await
@@ -1014,7 +1014,7 @@ impl ThinClient {
         Self::json_or_error(resp).await
     }
 
-    /// `POST /agents/edge` — persist edge registry row (JWT). `edge_transport_id` → [`MO_EDGE_ID_HEADER`]
+    /// `POST /agents/edge` — persist edge registry row (JWT). `edge_transport_id` → [`ASTRA_EDGE_ID_HEADER`]
     /// (transport instance); `body.edge_agent_id` is the logical agent id (often the same string).
     pub async fn post_agents_edge_register(
         &self,
@@ -1031,7 +1031,7 @@ impl ThinClient {
         if let Some(id) = edge_transport_id
             && let Ok(v) = HeaderValue::from_str(id)
         {
-            req = req.header(MO_EDGE_ID_HEADER, v);
+            req = req.header(ASTRA_EDGE_ID_HEADER, v);
         }
         let resp = req.send().await?;
         Self::json_or_error(resp).await
@@ -1053,7 +1053,7 @@ impl ThinClient {
         if let Some(id) = edge_transport_id
             && let Ok(v) = HeaderValue::from_str(id)
         {
-            req = req.header(MO_EDGE_ID_HEADER, v);
+            req = req.header(ASTRA_EDGE_ID_HEADER, v);
         }
         let resp = req.send().await?;
         Self::json_or_error(resp).await
@@ -1092,7 +1092,7 @@ impl ThinClient {
         if let Some(id) = edge_transport_id
             && let Ok(v) = HeaderValue::from_str(id)
         {
-            req = req.header(MO_EDGE_ID_HEADER, v);
+            req = req.header(ASTRA_EDGE_ID_HEADER, v);
         }
         let resp = req.send().await?;
         Self::json_or_error(resp).await
@@ -1115,7 +1115,7 @@ impl ThinClient {
         if let Some(id) = edge_transport_id
             && let Ok(v) = HeaderValue::from_str(id)
         {
-            req = req.header(MO_EDGE_ID_HEADER, v);
+            req = req.header(ASTRA_EDGE_ID_HEADER, v);
         }
         let resp = req.send().await?;
         Self::json_or_error(resp).await
@@ -1138,7 +1138,7 @@ impl ThinClient {
         if let Some(id) = edge_transport_id
             && let Ok(v) = HeaderValue::from_str(id)
         {
-            req = req.header(MO_EDGE_ID_HEADER, v);
+            req = req.header(ASTRA_EDGE_ID_HEADER, v);
         }
         let resp = req.send().await?;
         Self::json_or_error(resp).await
@@ -1209,7 +1209,7 @@ mod tests {
         let srv = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/tools/result"))
-            .and(header("x-mo-edge-id", "edge-abc"))
+            .and(header("x-astra-edge-id", "edge-abc"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
             .mount(&srv)
             .await;
@@ -1284,7 +1284,7 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/agents/edge"))
             .and(header("authorization", "Bearer t"))
-            .and(header("x-mo-edge-id", "transport-1"))
+            .and(header("x-astra-edge-id", "transport-1"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
             .mount(&srv)
             .await;
@@ -1309,7 +1309,7 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/tasks/t1/lease/claim"))
             .and(header("authorization", "Bearer t"))
-            .and(header("x-mo-edge-id", "edge-xyz"))
+            .and(header("x-astra-edge-id", "edge-xyz"))
             .respond_with(
                 ResponseTemplate::new(200).set_body_json(serde_json::json!({"status":"granted"})),
             )

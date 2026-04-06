@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# mo-agent installer — installs via pipx, uv, or pip
+# astra installer — installs via pipx, uv, or pip
 set -euo pipefail
 
 PACKAGE="astra-engine"
@@ -63,7 +63,7 @@ check_path() {
 
 # --- Main ---
 echo ""
-info "✦ mo-agent installer"
+info "✦ astra installer"
 echo ""
 
 check_python

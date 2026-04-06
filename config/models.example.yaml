@@ -5,7 +5,7 @@
 # Setup:
 #   1. cp config/models.example.yaml .models.yaml
 #   2. Fill in your API keys and endpoint IDs
-#   3. mo-admin model load .models.yaml
+#   3. astra-admin model load .models.yaml
 #
 # After loading, run: make verify-llm
 

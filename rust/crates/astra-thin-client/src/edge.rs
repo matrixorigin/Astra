@@ -1,12 +1,12 @@
 //! Lightweight **edge executor** helpers — transport + local tools only (design §5.5.2).
 //!
 //! An edge process should depend on [`crate::ThinClient`] and local tool execution, not on
-//! `mo-agent` / `runtime` / cognitive pipelines.
+//! `astra` / `runtime` / cognitive pipelines.
 
 use crate::protocol::{ChatStreamRequest, EdgeRegisterRequest};
 
 /// HTTP header matching design doc §5.5 (`POST /tools/result`).
-pub const MO_EDGE_ID_HEADER: &str = "X-Mo-Edge-Id";
+pub const ASTRA_EDGE_ID_HEADER: &str = "X-Astra-Edge-Id";
 
 /// Default `capabilities` tags for a full local toolkit (coarse buckets; server may refine).
 ///

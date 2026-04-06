@@ -1,7 +1,7 @@
 //! MCP (Model Context Protocol) client for external tool integration.
 //!
 //! This module provides a client implementation for connecting to MCP servers,
-//! allowing mo-agent to leverage external tools and resources exposed via MCP.
+//! allowing astra to leverage external tools and resources exposed via MCP.
 //!
 //! # Usage
 //!
