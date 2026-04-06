@@ -30,9 +30,16 @@ pub enum ToolSource {
 
 impl SearchableToolMeta {
     pub fn from_catalog(meta: &'static ToolMeta) -> Self {
+        // Include triggers in the short text so overlap_score can match
+        // CJK queries against trigger phrases (e.g., "记住" → memory_search).
+        let mut short = meta.description.to_string();
+        if !meta.triggers.is_empty() {
+            short.push(' ');
+            short.push_str(&meta.triggers.join(" "));
+        }
         Self {
             name: meta.name.to_string(),
-            short: meta.description.to_string(),
+            short,
             intents: meta.intents.iter().map(|i| i.as_str()).collect(),
             estimated_schema_tokens: meta.schema_tokens,
             pinned: meta.pinned,

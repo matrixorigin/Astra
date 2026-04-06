@@ -71,13 +71,13 @@ mod tests {
     }
 
     #[test]
-    fn catalog_has_9_pinned() {
-        assert_eq!(ToolRegistry::pinned_count(), 9);
+    fn catalog_has_8_pinned() {
+        assert_eq!(ToolRegistry::pinned_count(), 8);
     }
 
     #[test]
-    fn catalog_has_24_dynamic() {
-        assert_eq!(ToolRegistry::dynamic_count(), 25);
+    fn catalog_has_26_dynamic() {
+        assert_eq!(ToolRegistry::dynamic_count(), 26);
     }
 
     #[test]
@@ -95,7 +95,8 @@ mod tests {
         assert!(pinned.contains(&"grep"));
         assert!(pinned.contains(&"glob"));
         assert!(pinned.contains(&"memory_store"));
-        assert!(pinned.contains(&"memory_search"));
+        // memory_search is dynamic — selected only when query involves recall
+        assert!(!pinned.contains(&"memory_search"));
     }
 
     #[test]
@@ -183,14 +184,14 @@ mod tests {
 
     #[test]
     fn prefilter_ranks_memory_purge_for_recall() {
-        // memory_store and memory_search are pinned (always available).
-        // memory_purge is dynamic and should appear for memory-related queries.
+        // memory_store is pinned; memory_search and memory_purge are dynamic.
+        // For memory-related queries, memory_purge should appear in dynamic results.
         let state = ConversationState::from_message("之前我记住了什么偏好?", 1);
         let ranked = pre_filter_dynamic(&state, "之前我记住了什么偏好?");
 
         let top_names: Vec<&str> = ranked
             .iter()
-            .take(5)
+            .take(6)
             .map(|&(idx, _)| TOOL_CATALOG[idx].name)
             .collect();
         assert!(

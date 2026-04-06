@@ -597,10 +597,10 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
         scope: Scope::External,
         schema_tokens: 25,
     },
-    // Memory tools are pinned because the system prompt always includes memory rules
-    // ("STORE to memory_store when user states a preference…"). If the prompt tells the
-    // LLM to use a tool, that tool must be available — otherwise the LLM describes the
-    // action in text instead of calling it. Cost: +65 tokens/turn (negligible).
+    // memory_store stays pinned: preference expressions ("苹果比较好吃") have
+    // zero keyword overlap with memory triggers, so tfidf can't select it.
+    // The system prompt tells the LLM to call memory_store for preferences,
+    // so the tool must always be available. Cost: ~35 tokens/turn.
     ToolMeta {
         name: "memory_store",
         description: "Store information to persistent memory",
@@ -636,6 +636,8 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
         scope: Scope::CrossSession,
         schema_tokens: 35,
     },
+    // memory_search is dynamic: only needed when user explicitly asks about
+    // stored memories. Rich triggers ensure tfidf selects it reliably.
     ToolMeta {
         name: "memory_search",
         description: "Search persistent memories for relevant information",
@@ -649,16 +651,23 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
             "what do I",
             "stored",
             "what did I say",
+            "preference",
+            "preferences",
             "记忆",
             "回忆",
             "搜索记忆",
             "记住了什么",
+            "记住的",
             "偏好",
+            "偏好是什么",
             "哪些记忆",
             "之前说过",
+            "之前记住",
             "搜一下记忆",
+            "我的偏好",
+            "我记住了",
         ],
-        pinned: true,
+        pinned: false,
         intents: &[IntentType::Memory],
         scope: Scope::CrossSession,
         schema_tokens: 30,
