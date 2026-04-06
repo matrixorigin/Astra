@@ -98,6 +98,7 @@ pub(crate) struct PrepareTurnTelemetry<'a> {
 
 struct PrepareChatTurnRequest<'a> {
     messages: &'a [Value],
+    ephemeral_prefix: Option<&'a Value>,
     current_session_id: Option<&'a str>,
     model: Option<&'a str>,
     explain: AgenticChatExplainFlags,
@@ -147,6 +148,13 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
         project_root: ctx.project_root,
         git_branch,
     });
+
+    // Inject ephemeral prefix (e.g., skill listing) at the start of messages.
+    if let Some(prefix) = ctx.ephemeral_prefix {
+        if let Some(arr) = payload.get_mut("messages").and_then(Value::as_array_mut) {
+            arr.insert(0, prefix.clone());
+        }
+    }
     let active_skills = detect_active_system_skills_in_message(ctx.message);
     merge_active_skills_into_edge_profile(&mut payload, &active_skills);
 
@@ -401,6 +409,9 @@ pub(crate) struct ChatTurnSseFetchRequest<'a> {
     pub selector: &'a dyn ToolSelector,
     pub registry: &'a ToolRegistry,
     pub messages: &'a [Value],
+    /// Ephemeral system message prepended to messages for this turn only
+    /// (e.g., skill listing). Not stored in conversation history.
+    pub ephemeral_prefix: Option<&'a Value>,
     pub current_session_id: Option<&'a str>,
     pub tool_results: &'a [Value],
     pub all_schemas: &'a [Value],
@@ -528,6 +539,7 @@ pub(crate) async fn fetch_chat_turn_sse(
         selector,
         registry,
         messages,
+        ephemeral_prefix,
         current_session_id,
         tool_results,
         all_schemas,
@@ -563,6 +575,7 @@ pub(crate) async fn fetch_chat_turn_sse(
         &ui,
         PrepareChatTurnRequest {
             messages,
+            ephemeral_prefix,
             current_session_id,
             model,
             explain: AgenticChatExplainFlags::from_explain_ui_mode(match explain {

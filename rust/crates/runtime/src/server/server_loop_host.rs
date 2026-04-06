@@ -1088,9 +1088,9 @@ mod tests {
             last_composite_snapshot: None,
             last_measured_prompt_tokens: None,
             consecutive_context_window_errors: 0,
+            skill_listing_message: None,
         }
     }
-
     #[tokio::test]
     async fn server_host_mock_text_response() {
         let mut host = MockServerHost::with_text_response("Hello from server", 100, 50);

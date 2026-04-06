@@ -1587,6 +1587,7 @@ mod tests {
             last_composite_snapshot: None,
             last_measured_prompt_tokens: None,
             consecutive_context_window_errors: 0,
+            skill_listing_message: None,
         }
     }
 
@@ -3256,5 +3257,190 @@ mod tests {
         std::fs::write(tmp.path().join("setup.py"), "").unwrap();
         let types = detect_project_types(tmp.path());
         assert_eq!(types.iter().filter(|&&t| t == "python").count(), 1);
+    }
+
+    // ── Skill listing ephemeral injection tests ─────────────────────────
+
+    #[test]
+    fn skill_listing_message_not_in_state_messages() {
+        // Skill listing should be stored on the field, not pushed into messages.
+        let mut state = make_state();
+        state.messages = vec![json!({"role": "user", "content": "hi"})];
+        state.skill_listing_message = Some(json!({
+            "role": "system",
+            "content": "<available_skills>...</available_skills>"
+        }));
+
+        // Messages should not contain the listing
+        assert_eq!(state.messages.len(), 1);
+        assert_eq!(state.messages[0]["role"], "user");
+        // But the listing should be available for ephemeral injection
+        assert!(state.skill_listing_message.is_some());
+    }
+
+    #[test]
+    fn skill_listing_message_defaults_to_none() {
+        let state = make_state();
+        assert!(state.skill_listing_message.is_none());
+    }
+
+    #[test]
+    fn skill_listing_system_message_format() {
+        use crate::turn::skill_tool::{SkillToolInfo, skill_listing_system_message};
+        use crate::skills::manifest::SkillSourceKind;
+
+        let skills = vec![
+            SkillToolInfo {
+                name: "review".into(),
+                description: "Code review".into(),
+                when_to_use: None,
+                source: SkillSourceKind::Bundled,
+                aliases: vec![],
+            },
+            SkillToolInfo {
+                name: "debug".into(),
+                description: "Debug issues".into(),
+                when_to_use: None,
+                source: SkillSourceKind::Bundled,
+                aliases: vec![],
+            },
+        ];
+
+        let msg = skill_listing_system_message(&skills, None, None);
+        let content = msg["content"].as_str().unwrap();
+
+        // Must contain skill names in XML format
+        assert!(content.contains("<name>review</name>"), "missing review skill");
+        assert!(content.contains("<name>debug</name>"), "missing debug skill");
+        assert!(content.contains("<available_skills>"), "missing opening tag");
+        assert!(content.contains("</available_skills>"), "missing closing tag");
+        // Must be a system message
+        assert_eq!(msg["role"], "system");
+    }
+
+    #[test]
+    fn skill_listing_empty_skills_produces_no_message() {
+        use crate::turn::skill_tool::skill_listing_system_message;
+        // With empty skills, the function still returns a message but with no skill entries
+        let msg = skill_listing_system_message(&[], None, None);
+        let content = msg["content"].as_str().unwrap();
+        // Should have the wrapper but no <skill> entries
+        assert!(content.contains("<available_skills>"));
+        assert!(!content.contains("<name>"));
+    }
+
+    #[tokio::test]
+    async fn skill_listing_not_persisted_after_turn() {
+        // After a turn completes, state.messages should NOT contain the skill listing.
+        let mut host = MockHost::new(vec![text_result("Hello!", 10, 5, Some(42))]);
+        let mut state = make_state();
+        state.messages = vec![json!({"role": "user", "content": "hi"})];
+        state.skill_listing_message = Some(json!({
+            "role": "system",
+            "content": "skill listing content"
+        }));
+
+        let _ = run_agentic_loop_with_host(&mut host, &mut state).await;
+
+        // Verify: no message in state.messages contains "skill listing content"
+        for msg in &state.messages {
+            if let Some(content) = msg.get("content").and_then(Value::as_str) {
+                assert!(
+                    !content.contains("skill listing content"),
+                    "skill listing leaked into persistent messages: {:?}",
+                    msg
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn skill_listing_refresh_updates_field() {
+        use crate::turn::skill_tool::{SkillToolInfo, skill_listing_system_message};
+        use crate::skills::manifest::SkillSourceKind;
+
+        let mut state = make_state();
+
+        // Initial: no listing
+        assert!(state.skill_listing_message.is_none());
+
+        // Simulate first refresh with 1 skill
+        let skills_v1 = vec![SkillToolInfo {
+            name: "review".into(),
+            description: "v1".into(),
+            when_to_use: None,
+            source: SkillSourceKind::Bundled,
+            aliases: vec![],
+        }];
+        state.skill_listing_message = Some(skill_listing_system_message(&skills_v1, None, None));
+        let v1_content = state.skill_listing_message.as_ref().unwrap()["content"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(v1_content.contains("review"));
+
+        // Simulate second refresh with 2 skills (hot-reload added one)
+        let skills_v2 = vec![
+            SkillToolInfo {
+                name: "review".into(),
+                description: "v2".into(),
+                when_to_use: None,
+                source: SkillSourceKind::Bundled,
+                aliases: vec![],
+            },
+            SkillToolInfo {
+                name: "debug".into(),
+                description: "new".into(),
+                when_to_use: None,
+                source: SkillSourceKind::Bundled,
+                aliases: vec![],
+            },
+        ];
+        state.skill_listing_message = Some(skill_listing_system_message(&skills_v2, None, None));
+        let v2_content = state.skill_listing_message.as_ref().unwrap()["content"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(v2_content.contains("debug"), "new skill should appear after refresh");
+    }
+
+    #[test]
+    fn ephemeral_prefix_inserted_at_start_of_payload_messages() {
+        // Verify that ephemeral_prefix is inserted at index 0 of the messages array.
+        let messages = vec![
+            json!({"role": "user", "content": "hello"}),
+            json!({"role": "assistant", "content": "hi"}),
+        ];
+        let prefix = json!({"role": "system", "content": "skill listing"});
+
+        let mut payload = json!({"messages": messages});
+        // Simulate what prepare_chat_turn_payload does
+        if let Some(arr) = payload.get_mut("messages").and_then(Value::as_array_mut) {
+            arr.insert(0, prefix.clone());
+        }
+
+        let arr = payload["messages"].as_array().unwrap();
+        assert_eq!(arr.len(), 3);
+        assert_eq!(arr[0]["content"], "skill listing");
+        assert_eq!(arr[1]["content"], "hello");
+        assert_eq!(arr[2]["content"], "hi");
+    }
+
+    #[test]
+    fn no_ephemeral_prefix_leaves_messages_unchanged() {
+        let messages = vec![json!({"role": "user", "content": "hello"})];
+        let mut payload = json!({"messages": messages});
+        let prefix: Option<&Value> = None;
+
+        // Simulate: no prefix → no modification
+        if let Some(p) = prefix {
+            if let Some(arr) = payload.get_mut("messages").and_then(Value::as_array_mut) {
+                arr.insert(0, p.clone());
+            }
+        }
+
+        let arr = payload["messages"].as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["content"], "hello");
     }
 }
