@@ -42,3 +42,62 @@ pub fn apply_turn_to_session_entry(
     );
     updated_entry
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_entry_gets_history_and_turn_count() {
+        let entry = Map::new();
+        let result = apply_turn_to_session_entry(&entry, "hello", &[], "", &[], None, None);
+        assert_eq!(result["turn_count"].as_i64().unwrap(), 1);
+        assert_eq!(result["history"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn increments_existing_turn_count() {
+        let mut entry = Map::new();
+        entry.insert("turn_count".to_string(), json!(5));
+        let result = apply_turn_to_session_entry(&entry, "hi", &[], "", &[], None, None);
+        assert_eq!(result["turn_count"].as_i64().unwrap(), 6);
+    }
+
+    #[test]
+    fn preserves_existing_history() {
+        let mut entry = Map::new();
+        entry.insert("history".to_string(), json!([{"role": "user", "content": "old"}]));
+        let result = apply_turn_to_session_entry(&entry, "new", &[], "", &[], None, None);
+        let hist = result["history"].as_array().unwrap();
+        assert!(hist.len() >= 2);
+    }
+
+    #[test]
+    fn sets_turn_chain_id() {
+        let entry = Map::new();
+        let result = apply_turn_to_session_entry(&entry, "", &[], "", &[], Some("chain-1"), None);
+        assert_eq!(result["turn_chain_id"].as_str().unwrap(), "chain-1");
+    }
+
+    #[test]
+    fn null_turn_chain_id_when_none() {
+        let entry = Map::new();
+        let result = apply_turn_to_session_entry(&entry, "", &[], "", &[], None, None);
+        assert!(result["turn_chain_id"].is_null());
+    }
+
+    #[test]
+    fn sets_user_query_event_id() {
+        let entry = Map::new();
+        let result = apply_turn_to_session_entry(&entry, "", &[], "", &[], None, Some("evt-1"));
+        assert_eq!(result["user_query_event_id"].as_str().unwrap(), "evt-1");
+    }
+
+    #[test]
+    fn non_integer_turn_count_treated_as_zero() {
+        let mut entry = Map::new();
+        entry.insert("turn_count".to_string(), json!("not_a_number"));
+        let result = apply_turn_to_session_entry(&entry, "", &[], "", &[], None, None);
+        assert_eq!(result["turn_count"].as_i64().unwrap(), 1);
+    }
+}

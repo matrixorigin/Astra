@@ -508,3 +508,137 @@ impl RunLifecycleService for UnconfiguredRunLifecycleService {
         ))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn make_event(event_type: &str, data: serde_json::Value) -> serde_json::Value {
+        json!({"event_type": event_type, "data": data})
+    }
+
+    #[test]
+    fn text_delta() {
+        let out = transform_run_event_for_client(make_event("text_delta", json!({"chunk": "hi"})));
+        assert_eq!(out["type"], "text_delta");
+        assert_eq!(out["content"], "hi");
+    }
+
+    #[test]
+    fn text_delta_missing_chunk() {
+        let out = transform_run_event_for_client(make_event("text_delta", json!({})));
+        assert_eq!(out["content"], "");
+    }
+
+    #[test]
+    fn text_done() {
+        let out = transform_run_event_for_client(make_event("text_done", json!({"full_text": "all"})));
+        assert_eq!(out["type"], "text_done");
+        assert_eq!(out["full_text"], "all");
+    }
+
+    #[test]
+    fn reasoning_message_content() {
+        let out = transform_run_event_for_client(make_event("reasoning_message_content", json!({"content": "think"})));
+        assert_eq!(out["type"], "reasoning_message_content");
+        assert_eq!(out["content"], "think");
+    }
+
+    #[test]
+    fn thinking_delta() {
+        let out = transform_run_event_for_client(make_event("thinking_delta", json!({"chunk": "t"})));
+        assert_eq!(out["type"], "thinking_delta");
+        assert_eq!(out["content"], "t");
+    }
+
+    #[test]
+    fn thinking_done() {
+        let out = transform_run_event_for_client(make_event("thinking_done", json!({})));
+        assert_eq!(out["type"], "thinking_done");
+    }
+
+    #[test]
+    fn tool_call_start() {
+        let out = transform_run_event_for_client(make_event("tool_call_start", json!({"tool": "bash", "call_id": "c1"})));
+        assert_eq!(out["type"], "tool_call_start");
+        assert_eq!(out["tool"], "bash");
+        assert_eq!(out["call_id"], "c1");
+    }
+
+    #[test]
+    fn tool_result() {
+        let out = transform_run_event_for_client(make_event("tool_result", json!({"call_id": "c1", "result": "ok"})));
+        assert_eq!(out["type"], "tool_result");
+        assert_eq!(out["call_id"], "c1");
+    }
+
+    #[test]
+    fn run_started_and_finished() {
+        let started = transform_run_event_for_client(make_event("run_started", json!({})));
+        assert_eq!(started["type"], "run_started");
+        let finished = transform_run_event_for_client(make_event("run_finished", json!({})));
+        assert_eq!(finished["type"], "run_finished");
+    }
+
+    #[test]
+    fn run_error_maps_to_error_type() {
+        let out = transform_run_event_for_client(make_event("run_error", json!({"error": "boom"})));
+        assert_eq!(out["type"], "error");
+        assert_eq!(out["message"], "boom");
+        assert_eq!(out["code"], "RUN_ERROR");
+    }
+
+    #[test]
+    fn run_error_default_message() {
+        let out = transform_run_event_for_client(make_event("run_error", json!({})));
+        assert_eq!(out["message"], "Unknown error");
+    }
+
+    #[test]
+    fn plan_events() {
+        let created = transform_run_event_for_client(make_event("plan_created", json!({"plan": {"steps": []}})));
+        assert_eq!(created["type"], "plan_created");
+        let step_start = transform_run_event_for_client(make_event("plan_step_start", json!({"step": "s1"})));
+        assert_eq!(step_start["type"], "plan_step_start");
+        let step_done = transform_run_event_for_client(make_event("plan_step_done", json!({"step": "s1", "result": "ok"})));
+        assert_eq!(step_done["type"], "plan_step_done");
+        let revised = transform_run_event_for_client(make_event("plan_revised", json!({"plan": {}})));
+        assert_eq!(revised["type"], "plan_revised");
+    }
+
+    #[test]
+    fn agent_events() {
+        let delegated = transform_run_event_for_client(make_event("agent_delegated", json!({"agent_id": "a1", "task": "t"})));
+        assert_eq!(delegated["type"], "agent_delegated");
+        let progress = transform_run_event_for_client(make_event("agent_progress", json!({"agent_id": "a1", "progress": "50%"})));
+        assert_eq!(progress["type"], "agent_progress");
+        let completed = transform_run_event_for_client(make_event("agent_completed", json!({"agent_id": "a1", "result": "done"})));
+        assert_eq!(completed["type"], "agent_completed");
+    }
+
+    #[test]
+    fn keepalive_maps_to_ping() {
+        let out = transform_run_event_for_client(make_event("keepalive", json!({})));
+        assert_eq!(out["type"], "ping");
+    }
+
+    #[test]
+    fn unknown_event_type_passthrough() {
+        let out = transform_run_event_for_client(make_event("custom_event", json!({})));
+        assert_eq!(out["type"], "custom_event");
+    }
+
+    #[test]
+    fn missing_event_type() {
+        let out = transform_run_event_for_client(json!({"data": {}}));
+        assert_eq!(out["type"], "");
+    }
+
+    #[test]
+    fn missing_data_object() {
+        let out = transform_run_event_for_client(json!({"event_type": "text_delta"}));
+        assert_eq!(out["type"], "text_delta");
+        assert_eq!(out["content"], "");
+    }
+}
