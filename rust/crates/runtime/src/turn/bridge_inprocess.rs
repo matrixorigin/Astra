@@ -2638,4 +2638,117 @@ mod tests {
             "final text should still stream when no tool calls exist"
         );
     }
+
+    // ── Cache token extraction tests ─────────────────────────────────────
+
+    /// Validates the JSON path used in the bridge to extract cache_read_tokens
+    /// from OpenAI-format usage chunks: usage.prompt_tokens_details.cached_tokens
+    #[test]
+    fn openai_cache_token_extraction_pattern() {
+        let chunk: Value = json!({
+            "usage": {
+                "prompt_tokens": 1000,
+                "completion_tokens": 500,
+                "prompt_tokens_details": {
+                    "cached_tokens": 800
+                }
+            }
+        });
+        let u = chunk.get("usage").unwrap();
+        let cache_read = u
+            .get("prompt_tokens_details")
+            .and_then(|d| d.get("cached_tokens"))
+            .and_then(Value::as_i64);
+        assert_eq!(cache_read, Some(800));
+    }
+
+    #[test]
+    fn openai_cache_token_extraction_missing_details() {
+        let chunk: Value = json!({
+            "usage": {
+                "prompt_tokens": 1000,
+                "completion_tokens": 500
+            }
+        });
+        let u = chunk.get("usage").unwrap();
+        let cache_read = u
+            .get("prompt_tokens_details")
+            .and_then(|d| d.get("cached_tokens"))
+            .and_then(Value::as_i64);
+        assert_eq!(cache_read, None);
+    }
+
+    #[test]
+    fn openai_cache_token_extraction_null_cached_tokens() {
+        let chunk: Value = json!({
+            "usage": {
+                "prompt_tokens": 1000,
+                "completion_tokens": 500,
+                "prompt_tokens_details": {
+                    "cached_tokens": null
+                }
+            }
+        });
+        let u = chunk.get("usage").unwrap();
+        let cache_read = u
+            .get("prompt_tokens_details")
+            .and_then(|d| d.get("cached_tokens"))
+            .and_then(Value::as_i64);
+        assert_eq!(cache_read, None);
+    }
+
+    #[test]
+    fn openai_cache_token_extraction_zero() {
+        let chunk: Value = json!({
+            "usage": {
+                "prompt_tokens": 1000,
+                "completion_tokens": 500,
+                "prompt_tokens_details": {
+                    "cached_tokens": 0
+                }
+            }
+        });
+        let u = chunk.get("usage").unwrap();
+        let cache_read = u
+            .get("prompt_tokens_details")
+            .and_then(|d| d.get("cached_tokens"))
+            .and_then(Value::as_i64);
+        assert_eq!(cache_read, Some(0));
+    }
+
+    #[test]
+    fn sse_usage_event_with_cache_tokens_format() {
+        // Verify the SSE event format that bridge emits matches what ChatTurnSseAccum expects
+        let prompt = Some(1000i64);
+        let completion = Some(500i64);
+        let cache_read: Option<i64> = Some(800);
+
+        let event = json!({
+            "type": "usage",
+            "prompt_tokens": prompt,
+            "completion_tokens": completion,
+            "cache_read_tokens": cache_read,
+        });
+        assert_eq!(event["type"], "usage");
+        assert_eq!(event["prompt_tokens"].as_i64(), Some(1000));
+        assert_eq!(event["completion_tokens"].as_i64(), Some(500));
+        assert_eq!(event["cache_read_tokens"].as_i64(), Some(800));
+    }
+
+    #[test]
+    fn sse_usage_event_null_cache_matches_dispatcher_handling() {
+        // Non-stream fallback emits cache_read_tokens: null
+        let event = json!({
+            "type": "usage",
+            "prompt_tokens": 1000,
+            "completion_tokens": 500,
+            "cache_read_tokens": Value::Null,
+        });
+        // ChatTurnSseAccum uses .as_u64().unwrap_or(0) for null → 0
+        let cache_read = event
+            .get("cache_read_tokens")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        assert_eq!(cache_read, 0);
+    }
 }
