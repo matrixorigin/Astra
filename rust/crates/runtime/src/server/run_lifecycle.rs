@@ -232,6 +232,10 @@ impl AgenticRunLifecycleService {
             })
             .unwrap_or_default();
         let workspace_root_hint = project_root_buf.map(|p| p.to_string_lossy().into_owned());
+        let tool_event_hooks = workspace_root_hint
+            .as_ref()
+            .map(|root| crate::skills::hooks::load_tool_event_hooks(std::path::Path::new(root)))
+            .unwrap_or_default();
 
         AgenticLoopState {
             messages: vec![user_message],
@@ -288,7 +292,7 @@ impl AgenticRunLifecycleService {
             skill_quality_tracker: crate::skills::quality::SkillQualityTracker::new(),
             skill_improvement_tracker: crate::skills::improvement::ImprovementTracker::new(),
             pinned_skills: std::collections::HashSet::new(),
-            tool_event_hooks: crate::skills::hooks::ToolEventHookRegistry::default(),
+            tool_event_hooks,
             stop_hooks: hook_sets.stop_hooks,
             stop_hook_runs: 0,
             teammate_idle_hooks: hook_sets.teammate_idle_hooks,
@@ -885,6 +889,10 @@ impl SubRunExecutor for ServerSubRunExecutor {
             })
             .unwrap_or_default();
         let workspace_root_hint = project_root_buf.map(|p| p.to_string_lossy().into_owned());
+        let tool_event_hooks = workspace_root_hint
+            .as_ref()
+            .map(|root| crate::skills::hooks::load_tool_event_hooks(std::path::Path::new(root)))
+            .unwrap_or_default();
 
         let (skill_registry, skill_resolver) = build_server_skill_resolver();
 
@@ -943,7 +951,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
             skill_quality_tracker: crate::skills::quality::SkillQualityTracker::new(),
             skill_improvement_tracker: crate::skills::improvement::ImprovementTracker::new(),
             pinned_skills: std::collections::HashSet::new(),
-            tool_event_hooks: crate::skills::hooks::ToolEventHookRegistry::default(),
+            tool_event_hooks,
             stop_hooks: hook_sets.stop_hooks,
             stop_hook_runs: 0,
             teammate_idle_hooks: hook_sets.teammate_idle_hooks,

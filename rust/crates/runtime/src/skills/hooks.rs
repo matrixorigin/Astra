@@ -158,6 +158,107 @@ impl ToolEventHookRegistry {
     }
 }
 
+// ── Config loading ──────────────────────────────────────────────────────────
+
+/// File names to search for in `.astra/` directory.
+const HOOK_CONFIG_CANDIDATES: &[&str] = &["hooks.json", "hooks.yaml", "hooks.yml"];
+
+/// Load tool event hooks from the project's `.astra/` directory.
+///
+/// Searches for `hooks.json`, `hooks.yaml`, or `hooks.yml` under
+/// `<project_root>/.astra/`. Returns an empty registry if no file is found
+/// or if parsing fails (with a warning log).
+pub fn load_tool_event_hooks(project_root: &std::path::Path) -> ToolEventHookRegistry {
+    let astra_dir = project_root.join(".astra");
+    if !astra_dir.is_dir() {
+        return ToolEventHookRegistry::default();
+    }
+
+    for candidate in HOOK_CONFIG_CANDIDATES {
+        let path = astra_dir.join(candidate);
+        if path.is_file() {
+            match std::fs::read_to_string(&path) {
+                Ok(content) => {
+                    let hooks = if candidate.ends_with(".json") {
+                        parse_hooks_json(&content, &path)
+                    } else {
+                        parse_hooks_yaml(&content, &path)
+                    };
+                    if !hooks.is_empty() {
+                        astra_core::agent_warn!(
+                            "hook",
+                            "Loaded {} tool event hooks from {}",
+                            hooks.len(),
+                            path.display()
+                        );
+                    }
+                    return ToolEventHookRegistry::new(hooks);
+                }
+                Err(e) => {
+                    astra_core::agent_warn!(
+                        "hook",
+                        "Failed to read {}: {}",
+                        path.display(),
+                        e
+                    );
+                }
+            }
+        }
+    }
+
+    ToolEventHookRegistry::default()
+}
+
+/// JSON format: top-level array of ToolEventHook objects, or an object with a "hooks" key.
+fn parse_hooks_json(content: &str, path: &std::path::Path) -> Vec<ToolEventHook> {
+    // Try direct array first
+    if let Ok(hooks) = serde_json::from_str::<Vec<ToolEventHook>>(content) {
+        return hooks;
+    }
+
+    // Try { "hooks": [...] } wrapper
+    #[derive(serde::Deserialize)]
+    struct Wrapper {
+        #[serde(default)]
+        hooks: Vec<ToolEventHook>,
+    }
+    if let Ok(w) = serde_json::from_str::<Wrapper>(content) {
+        return w.hooks;
+    }
+
+    astra_core::agent_warn!(
+        "hook",
+        "Failed to parse {}: expected JSON array or {{\"hooks\": [...]}}",
+        path.display()
+    );
+    Vec::new()
+}
+
+/// YAML format: same as JSON — top-level list or `hooks:` key.
+fn parse_hooks_yaml(content: &str, path: &std::path::Path) -> Vec<ToolEventHook> {
+    // Try direct array
+    if let Ok(hooks) = serde_yaml::from_str::<Vec<ToolEventHook>>(content) {
+        return hooks;
+    }
+
+    // Try wrapper
+    #[derive(serde::Deserialize)]
+    struct Wrapper {
+        #[serde(default)]
+        hooks: Vec<ToolEventHook>,
+    }
+    if let Ok(w) = serde_yaml::from_str::<Wrapper>(content) {
+        return w.hooks;
+    }
+
+    astra_core::agent_warn!(
+        "hook",
+        "Failed to parse {}: expected YAML list or `hooks:` mapping",
+        path.display()
+    );
+    Vec::new()
+}
+
 // ── Hook execution ──────────────────────────────────────────────────────────
 
 /// Execute all PreToolUse hooks matching a tool name.
@@ -1157,5 +1258,131 @@ mod tests {
             }
             _ => panic!("expected AllowWithContext, got {:?}", decision),
         }
+    }
+
+    // ── Config loading tests ────────────────────────────────────────
+
+    #[test]
+    fn load_hooks_json_array() {
+        let dir = tempfile::tempdir().unwrap();
+        let astra = dir.path().join(".astra");
+        std::fs::create_dir_all(&astra).unwrap();
+        let json = r#"[
+            {
+                "event": "pre_tool_use",
+                "matcher": "bash",
+                "action": {"type": "shell", "command": "check-bash.sh"},
+                "timeout_secs": 5
+            }
+        ]"#;
+        std::fs::write(astra.join("hooks.json"), json).unwrap();
+
+        let registry = load_tool_event_hooks(dir.path());
+        assert_eq!(registry.len(), 1);
+        let hooks = registry.matching(ToolEventKind::PreToolUse, "bash");
+        assert_eq!(hooks.len(), 1);
+    }
+
+    #[test]
+    fn load_hooks_json_wrapper() {
+        let dir = tempfile::tempdir().unwrap();
+        let astra = dir.path().join(".astra");
+        std::fs::create_dir_all(&astra).unwrap();
+        let json = r#"{
+            "hooks": [
+                {
+                    "event": "post_tool_use",
+                    "matcher": "write_*",
+                    "action": {"type": "shell", "command": "lint.sh"}
+                }
+            ]
+        }"#;
+        std::fs::write(astra.join("hooks.json"), json).unwrap();
+
+        let registry = load_tool_event_hooks(dir.path());
+        assert_eq!(registry.len(), 1);
+    }
+
+    #[test]
+    fn load_hooks_yaml() {
+        let dir = tempfile::tempdir().unwrap();
+        let astra = dir.path().join(".astra");
+        std::fs::create_dir_all(&astra).unwrap();
+        let yaml = r#"
+- event: pre_tool_use
+  matcher: "*"
+  action:
+    type: shell
+    command: audit-log.sh
+  timeout_secs: 2
+"#;
+        std::fs::write(astra.join("hooks.yaml"), yaml).unwrap();
+
+        let registry = load_tool_event_hooks(dir.path());
+        assert_eq!(registry.len(), 1);
+    }
+
+    #[test]
+    fn load_hooks_yaml_wrapper() {
+        let dir = tempfile::tempdir().unwrap();
+        let astra = dir.path().join(".astra");
+        std::fs::create_dir_all(&astra).unwrap();
+        let yaml = r#"
+hooks:
+  - event: pre_tool_use
+    matcher: bash
+    action:
+      type: shell
+      command: validate.sh
+"#;
+        std::fs::write(astra.join("hooks.yml"), yaml).unwrap();
+
+        let registry = load_tool_event_hooks(dir.path());
+        assert_eq!(registry.len(), 1);
+    }
+
+    #[test]
+    fn load_hooks_no_astra_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = load_tool_event_hooks(dir.path());
+        assert!(registry.is_empty());
+    }
+
+    #[test]
+    fn load_hooks_no_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".astra")).unwrap();
+        let registry = load_tool_event_hooks(dir.path());
+        assert!(registry.is_empty());
+    }
+
+    #[test]
+    fn load_hooks_invalid_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let astra = dir.path().join(".astra");
+        std::fs::create_dir_all(&astra).unwrap();
+        std::fs::write(astra.join("hooks.json"), "not valid json").unwrap();
+
+        let registry = load_tool_event_hooks(dir.path());
+        assert!(registry.is_empty());
+    }
+
+    #[test]
+    fn load_hooks_json_preferred_over_yaml() {
+        let dir = tempfile::tempdir().unwrap();
+        let astra = dir.path().join(".astra");
+        std::fs::create_dir_all(&astra).unwrap();
+
+        let json = r#"[
+            {"event": "pre_tool_use", "matcher": "a", "action": {"type": "shell", "command": "a"}},
+            {"event": "pre_tool_use", "matcher": "b", "action": {"type": "shell", "command": "b"}}
+        ]"#;
+        std::fs::write(astra.join("hooks.json"), json).unwrap();
+
+        let yaml = "- event: pre_tool_use\n  matcher: c\n  action:\n    type: shell\n    command: c\n";
+        std::fs::write(astra.join("hooks.yaml"), yaml).unwrap();
+
+        let registry = load_tool_event_hooks(dir.path());
+        assert_eq!(registry.len(), 2); // JSON takes precedence
     }
 }
