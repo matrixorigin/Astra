@@ -267,6 +267,9 @@ pub async fn consume_sse_stream_cancellable<H: SseStreamHost>(
     }
 
     // Now flush all deferred tool requests at once, with skill-awareness.
+    // Reorder so skill calls execute first — the host's execute_tool sets a
+    // skill-exclusivity flag that defers subsequent non-skill calls.
+    prioritize_skill_tools(&mut deferred_tool_pending);
     flush_pending_via_host(
         &mut deferred_tool_pending,
         host,
@@ -290,31 +293,38 @@ pub async fn consume_sse_stream_cancellable<H: SseStreamHost>(
 
 /// Move `ToolRequest` items from `pending` into `deferred`, leaving only
 /// non-tool items (e.g. `ApprovalRequired`) in `pending` for immediate flush.
-/// Skill tool requests are placed before non-skill requests so that the host's
-/// `execute_tool` can set its skill-exclusivity flag before processing the rest.
 fn split_and_defer_tools(
     pending: &mut Vec<ChatTurnEdgePending>,
     deferred: &mut Vec<ChatTurnEdgePending>,
 ) {
     let taken = std::mem::take(pending);
-    // Two-pass: skills first, then the rest, preserving relative order within each group.
-    let mut non_skill = Vec::new();
     for item in taken {
+        if matches!(item, ChatTurnEdgePending::ToolRequest { .. }) {
+            deferred.push(item);
+        } else {
+            pending.push(item);
+        }
+    }
+}
+
+/// Reorder so that skill tool requests come before all non-skill requests.
+/// Preserves relative order within each group.
+fn prioritize_skill_tools(items: &mut Vec<ChatTurnEdgePending>) {
+    // stable partition: skills first, rest after
+    let mut skills = Vec::new();
+    let mut rest = Vec::new();
+    for item in std::mem::take(items) {
         match &item {
             ChatTurnEdgePending::ToolRequest { tool, .. }
                 if tool == crate::turn::skill_tool::SKILL_TOOL_NAME =>
             {
-                deferred.push(item);
+                skills.push(item);
             }
-            ChatTurnEdgePending::ToolRequest { .. } => {
-                non_skill.push(item);
-            }
-            _ => {
-                pending.push(item);
-            }
+            _ => rest.push(item),
         }
     }
-    deferred.extend(non_skill);
+    skills.extend(rest);
+    *items = skills;
 }
 
 async fn flush_pending_via_host<H: SseStreamHost>(
@@ -944,5 +954,118 @@ mod tests {
         assert!(abort.is_none());
         assert_eq!(result.tool_results.len(), 1);
         assert_eq!(result.accum.full_text, "Based on the file, here is my analysis.");
+    }
+
+    // ── split_and_defer_tools / prioritize_skill_tools unit tests ────────
+
+    fn make_tool_pending(tool: &str) -> ChatTurnEdgePending {
+        ChatTurnEdgePending::ToolRequest {
+            request_id: format!("req-{tool}"),
+            tool: tool.to_string(),
+            args: serde_json::json!({}),
+        }
+    }
+
+    fn make_approval_pending() -> ChatTurnEdgePending {
+        ChatTurnEdgePending::ApprovalRequired {
+            request_id: "req-approval".to_string(),
+            tool: "bash".to_string(),
+            path: None,
+        }
+    }
+
+    fn tool_name(item: &ChatTurnEdgePending) -> &str {
+        match item {
+            ChatTurnEdgePending::ToolRequest { tool, .. } => tool,
+            _ => "approval",
+        }
+    }
+
+    #[test]
+    fn split_separates_tools_from_approvals() {
+        let mut pending = vec![
+            make_tool_pending("bash"),
+            make_approval_pending(),
+            make_tool_pending("skill"),
+        ];
+        let mut deferred = Vec::new();
+        super::split_and_defer_tools(&mut pending, &mut deferred);
+
+        // Approvals stay in pending
+        assert_eq!(pending.len(), 1);
+        assert!(matches!(pending[0], ChatTurnEdgePending::ApprovalRequired { .. }));
+        // Tools moved to deferred
+        assert_eq!(deferred.len(), 2);
+        assert_eq!(tool_name(&deferred[0]), "bash");
+        assert_eq!(tool_name(&deferred[1]), "skill");
+    }
+
+    #[test]
+    fn prioritize_puts_skill_before_others() {
+        let mut items = vec![
+            make_tool_pending("write_file"),
+            make_tool_pending("bash"),
+            make_tool_pending(crate::turn::skill_tool::SKILL_TOOL_NAME),
+            make_tool_pending("grep"),
+        ];
+        super::prioritize_skill_tools(&mut items);
+
+        assert_eq!(tool_name(&items[0]), crate::turn::skill_tool::SKILL_TOOL_NAME);
+        assert_eq!(tool_name(&items[1]), "write_file");
+        assert_eq!(tool_name(&items[2]), "bash");
+        assert_eq!(tool_name(&items[3]), "grep");
+    }
+
+    #[test]
+    fn prioritize_no_skill_preserves_order() {
+        let mut items = vec![
+            make_tool_pending("write_file"),
+            make_tool_pending("bash"),
+        ];
+        super::prioritize_skill_tools(&mut items);
+
+        assert_eq!(tool_name(&items[0]), "write_file");
+        assert_eq!(tool_name(&items[1]), "bash");
+    }
+
+    #[test]
+    fn prioritize_multiple_skills() {
+        let mut items = vec![
+            make_tool_pending("bash"),
+            make_tool_pending(crate::turn::skill_tool::SKILL_TOOL_NAME),
+            make_tool_pending("write_file"),
+            make_tool_pending(crate::turn::skill_tool::SKILL_TOOL_NAME),
+        ];
+        super::prioritize_skill_tools(&mut items);
+
+        assert_eq!(tool_name(&items[0]), crate::turn::skill_tool::SKILL_TOOL_NAME);
+        assert_eq!(tool_name(&items[1]), crate::turn::skill_tool::SKILL_TOOL_NAME);
+        assert_eq!(tool_name(&items[2]), "bash");
+        assert_eq!(tool_name(&items[3]), "write_file");
+    }
+
+    #[test]
+    fn split_across_multiple_calls_accumulates() {
+        let mut deferred = Vec::new();
+
+        // First block: write_file arrives
+        let mut pending1 = vec![make_tool_pending("write_file")];
+        super::split_and_defer_tools(&mut pending1, &mut deferred);
+        assert!(pending1.is_empty());
+        assert_eq!(deferred.len(), 1);
+
+        // Second block: skill arrives
+        let mut pending2 = vec![make_tool_pending(crate::turn::skill_tool::SKILL_TOOL_NAME)];
+        super::split_and_defer_tools(&mut pending2, &mut deferred);
+        assert_eq!(deferred.len(), 2);
+
+        // write_file is first (arrival order), skill is second
+        assert_eq!(tool_name(&deferred[0]), "write_file");
+        assert_eq!(tool_name(&deferred[1]), crate::turn::skill_tool::SKILL_TOOL_NAME);
+
+        // After prioritize, skill comes first
+        super::prioritize_skill_tools(&mut deferred);
+        assert_eq!(tool_name(&deferred[0]), crate::turn::skill_tool::SKILL_TOOL_NAME);
+        assert_eq!(tool_name(&deferred[1]), "write_file");
     }
 }
