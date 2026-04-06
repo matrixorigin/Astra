@@ -1252,7 +1252,8 @@ fn source_label(source: &astra_runtime::skills::SkillSourceKind) -> &'static str
 
 fn truncate_desc(desc: &str, max: usize) -> String {
     if desc.len() > max {
-        format!("{}\u{2026}", &desc[..max])
+        let end = desc.floor_char_boundary(max);
+        format!("{}\u{2026}", &desc[..end])
     } else {
         desc.to_string()
     }
@@ -1705,6 +1706,40 @@ pub(crate) fn derive_triggers(name: &str, intents: &[String]) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── truncate_desc tests ────────────────────────────────────────────
+
+    #[test]
+    fn truncate_desc_ascii_short() {
+        assert_eq!(truncate_desc("hello", 10), "hello");
+    }
+
+    #[test]
+    fn truncate_desc_ascii_truncated() {
+        let result = truncate_desc("hello world", 5);
+        assert_eq!(result, "hello\u{2026}");
+    }
+
+    #[test]
+    fn truncate_desc_cjk_boundary() {
+        // Each CJK char is 3 bytes. Cutting at byte 36 would land inside '协'.
+        let desc = "数据查询技能：通过 MySQL 协议连接";
+        let result = truncate_desc(desc, 36);
+        // Should not panic, and should end at a valid char boundary
+        assert!(result.ends_with('\u{2026}'));
+        assert!(result.len() <= 36 + "\u{2026}".len());
+    }
+
+    #[test]
+    fn truncate_desc_exact_len() {
+        let desc = "exact";
+        assert_eq!(truncate_desc(desc, 5), "exact");
+    }
+
+    #[test]
+    fn truncate_desc_empty() {
+        assert_eq!(truncate_desc("", 10), "");
+    }
 
     #[test]
     fn parse_list_filters_empty() {
