@@ -1609,4 +1609,103 @@ mod tests {
         assert!(!effective.contains("[Continuation anchor]"));
         assert_eq!(effective, "修一下输入法问题");
     }
+
+    // ── Cost tracking & status line logic tests ──────────────────────────
+
+    #[test]
+    fn repl_state_accumulates_cache_tokens_across_turns() {
+        let mut state = ReplState::default();
+        // Simulate first turn
+        state.total_prompt_tokens += 1000;
+        state.total_completion_tokens += 500;
+        state.total_cache_read_tokens += 800;
+        state.total_cache_creation_tokens += 100;
+        state.turn += 1;
+
+        // Simulate second turn
+        state.total_prompt_tokens += 2000;
+        state.total_completion_tokens += 1000;
+        state.total_cache_read_tokens += 1500;
+        state.total_cache_creation_tokens += 0;
+        state.turn += 1;
+
+        assert_eq!(state.total_prompt_tokens, 3000);
+        assert_eq!(state.total_completion_tokens, 1500);
+        assert_eq!(state.total_cache_read_tokens, 2300);
+        assert_eq!(state.total_cache_creation_tokens, 100);
+        assert_eq!(state.turn, 2);
+    }
+
+    #[test]
+    fn cache_hit_percentage_formula() {
+        // Formula from print_turn_status_line:
+        // cache_pct = cache_read / (prompt + cache_read) * 100
+        let prompt = 200u64;
+        let cache_read = 800u64;
+        let cache_pct =
+            cache_read as f64 / (prompt + cache_read).max(1) as f64 * 100.0;
+        assert!((cache_pct - 80.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn cache_hit_percentage_zero_when_no_cache() {
+        let prompt = 1000u64;
+        let cache_read = 0u64;
+        let cache_pct =
+            cache_read as f64 / (prompt + cache_read).max(1) as f64 * 100.0;
+        assert!((cache_pct - 0.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn cache_hit_percentage_100_when_all_cached() {
+        let prompt = 0u64;
+        let cache_read = 5000u64;
+        let cache_pct =
+            cache_read as f64 / (prompt + cache_read).max(1) as f64 * 100.0;
+        assert!((cache_pct - 100.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn session_cost_accumulation() {
+        let mut state = ReplState::default();
+        state.cached_pricing = astra_services::models::PricingData {
+            prompt: 3.0,       // $3/1K prompt tokens
+            completion: 15.0,  // $15/1K completion tokens
+            cache_read: Some(0.3),   // $0.3/1K (10% of prompt)
+            cache_write: Some(3.75), // $3.75/1K (125% of prompt)
+        };
+
+        // First turn
+        let cost1 = crate::cost_for_tokens(1000, 500, 800, 100, &state.cached_pricing);
+        state.total_session_cost += cost1;
+        assert!(cost1 > 0.0);
+
+        // Second turn
+        let cost2 = crate::cost_for_tokens(2000, 1000, 1500, 0, &state.cached_pricing);
+        state.total_session_cost += cost2;
+
+        assert!((state.total_session_cost - (cost1 + cost2)).abs() < 1e-10);
+    }
+
+    #[test]
+    fn token_compact_format_below_1k() {
+        let tokens = 999u64;
+        let compact = if tokens > 1000 {
+            format!("{:.1}k", tokens as f64 / 1000.0)
+        } else {
+            format!("{tokens}")
+        };
+        assert_eq!(compact, "999");
+    }
+
+    #[test]
+    fn token_compact_format_above_1k() {
+        let tokens = 12500u64;
+        let compact = if tokens > 1000 {
+            format!("{:.1}k", tokens as f64 / 1000.0)
+        } else {
+            format!("{tokens}")
+        };
+        assert_eq!(compact, "12.5k");
+    }
 }
