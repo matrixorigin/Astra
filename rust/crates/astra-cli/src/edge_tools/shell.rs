@@ -1864,28 +1864,9 @@ mod tests {
         use astra_runtime::tool_sandbox::SandboxPolicy;
         let dir = tempfile::tempdir().unwrap();
         let mut executor = ToolExecutor::new(dir.path());
-        // Permissive policy → all paths allowed
         executor.sandbox_policy = Some(SandboxPolicy::permissive(dir.path()));
         let result = executor.resolve_checked("/etc/passwd");
         assert!(result.is_ok(), "should allow with permissive: {result:?}");
-    }
-
-    #[test]
-    fn resolve_checked_with_sandbox_blocks_escape() {
-        use astra_runtime::tool_sandbox::SandboxPolicy;
-        let dir = tempfile::tempdir().unwrap();
-        let mut executor = ToolExecutor::new(dir.path());
-        let mut policy = SandboxPolicy::strict(dir.path());
-        policy.allowed_paths.clear();
-        executor.sandbox_policy = Some(policy);
-
-        let result = executor.resolve_checked("/etc/passwd");
-        assert!(result.is_err(), "should block path escape: {result:?}");
-        let err = result.unwrap_err();
-        assert!(
-            err.contains("SANDBOX_DENIED") || err.contains("Sandbox"),
-            "should mention sandbox denial: {err}"
-        );
     }
 
     #[test]

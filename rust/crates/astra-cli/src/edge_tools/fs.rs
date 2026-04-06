@@ -61,36 +61,6 @@ fn is_dangerous_write_target(rel_path: &str) -> Option<&'static str> {
 }
 
 impl ToolExecutor {
-    /// Resolve a tool-provided path, enforcing sandbox boundary when active.
-    ///
-    /// **DEPRECATED**: Use `resolve_checked()` instead. This method silently
-    /// falls back on sandbox violations, which allows the agent to bypass
-    /// the sandbox by retrying with bash. All tool implementations should
-    /// use `resolve_checked()` and return the error to the caller.
-    #[allow(dead_code)]
-    pub(crate) fn resolve(&self, path: &str) -> PathBuf {
-        if is_unc_path(path) {
-            return self.project_root.clone();
-        }
-        let p = Path::new(path);
-        let resolved = if p.is_absolute() {
-            p.to_path_buf()
-        } else {
-            self.project_root.join(p)
-        };
-
-        // If sandbox is active (non-Permissive), validate the path
-        if let Some(ref policy) = self.sandbox_policy
-            && !matches!(policy.mode, SandboxMode::Permissive)
-        {
-            match validate_path(policy, path) {
-                Ok(safe) => return safe,
-                Err(_) => return resolved, // let the caller handle the error naturally
-            }
-        }
-        resolved
-    }
-
     /// Resolve path with explicit error when sandbox blocks it.
     pub(crate) fn resolve_checked(&self, path: &str) -> Result<PathBuf, String> {
         if is_unc_path(path) {

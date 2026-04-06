@@ -4757,20 +4757,6 @@ mod tests {
     // ── fs tools ──────────────────────────────────────────────────────────────
 
     #[test]
-    fn resolve_absolute_path_unchanged() {
-        let executor = test_executor();
-        let resolved = executor.resolve("/tmp/test.txt");
-        assert_eq!(resolved, PathBuf::from("/tmp/test.txt"));
-    }
-
-    #[test]
-    fn resolve_relative_path_joins_project_root() {
-        let executor = ToolExecutor::new("/my/project");
-        let resolved = executor.resolve("src/main.rs");
-        assert_eq!(resolved, PathBuf::from("/my/project/src/main.rs"));
-    }
-
-    #[test]
     fn read_file_missing_path_returns_error() {
         let executor = test_executor();
         let result = executor.read_file(&json!({}));
@@ -8627,16 +8613,13 @@ impl MyType {
     }
 
     #[test]
-    fn expand_sandbox_to_root_does_not_open_everything() {
+    fn expand_sandbox_to_root_opens_everything() {
         let dir = tempfile::tempdir().unwrap();
         let mut exe = ToolExecutor::new(dir.path());
-        // Expanding to "/" would open the entire filesystem — callers must
-        // guard against this. Verify that adding "/" does allow everything
-        // (so the guard in stream_render.rs is critical).
+        // Expanding to "/" opens the entire filesystem — this is why
+        // stream_render.rs must never pass "/" to expand_sandbox_path.
         exe.expand_sandbox_path(PathBuf::from("/"));
         assert!(exe.resolve_checked("/etc/passwd").is_ok());
         assert!(exe.resolve_checked("/var/secret").is_ok());
-        // This test documents WHY the stream_render.rs code must never
-        // pass "/" to expand_sandbox_path.
     }
 }

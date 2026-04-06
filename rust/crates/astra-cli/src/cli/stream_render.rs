@@ -530,7 +530,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                             crate::permission_manager::PermissionDecision::Allow => true,
                             crate::permission_manager::PermissionDecision::Deny(_) => false,
                             crate::permission_manager::PermissionDecision::NeedApproval {
-                                header, detail, reason, ..
+                                detail, reason, ..
                             } => {
                                 if let Some(tx) = &self.approval_request_tx {
                                     // Plan execution mode: route through channel
@@ -567,7 +567,6 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                                     if !reason.is_empty() {
                                         eprintln!("  {}", reason.dim());
                                     }
-                                    let _ = header;
                                     let ch = tokio::task::spawn_blocking(
                                         crate::permission_manager::PermissionManager::prompt_approval,
                                     )
