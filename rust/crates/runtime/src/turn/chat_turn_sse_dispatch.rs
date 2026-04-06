@@ -597,4 +597,38 @@ mod tests {
         assert_eq!(a.cache_read_tokens, 0);
         assert_eq!(a.cache_creation_tokens, 0);
     }
+
+    #[test]
+    fn usage_without_prompt_or_completion_is_error_and_ignores_cache() {
+        let mut a = ChatTurnSseAccum::default();
+        dispatch_chat_turn_sse_event_block(
+            &sse(
+                "usage",
+                ",\"cache_read_tokens\":500,\"cache_creation_tokens\":100",
+            ),
+            &mut a,
+            &mut vec![],
+        );
+        // Early return: no prompt/completion → error, cache tokens not parsed
+        assert!(!a.has_usage);
+        assert_eq!(a.cache_read_tokens, 0);
+        assert_eq!(a.cache_creation_tokens, 0);
+        assert!(a.error_message.is_some());
+    }
+
+    #[test]
+    fn usage_second_event_overwrites_cache_tokens() {
+        let mut a = ChatTurnSseAccum::default();
+        let block = format!(
+            "{}{}",
+            sse("usage", ",\"prompt_tokens\":100,\"completion_tokens\":50,\"cache_read_tokens\":30,\"cache_creation_tokens\":10"),
+            sse("usage", ",\"prompt_tokens\":200,\"completion_tokens\":80,\"cache_read_tokens\":60,\"cache_creation_tokens\":0"),
+        );
+        dispatch_chat_turn_sse_event_block(&block, &mut a, &mut vec![]);
+        // Second usage event overwrites (not accumulates)
+        assert_eq!(a.prompt_tokens, 200);
+        assert_eq!(a.completion_tokens, 80);
+        assert_eq!(a.cache_read_tokens, 60);
+        assert_eq!(a.cache_creation_tokens, 0);
+    }
 }

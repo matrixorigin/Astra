@@ -833,4 +833,69 @@ mod tests {
         assert_eq!(pack.total_prompt, 500);
         assert_eq!(pack.total_completion, 200);
     }
+
+    #[test]
+    fn has_any_usage_propagated_with_cache_tokens() {
+        let snap = AgenticTurnStreamSnapshot {
+            ttft_ms: None,
+            session_id: &None,
+            run_id: &None,
+            full_text: "response",
+            tool_calls: &[],
+            prompt_tokens: 500,
+            completion_tokens: 200,
+            cache_read_tokens: 400,
+            cache_creation_tokens: 50,
+            has_usage: true,
+            error_message: &None,
+        };
+        let mut pack = Pack::new();
+        assert!(!pack.has_any_usage);
+        ingest_agentic_turn_stream(
+            &snap,
+            0,
+            |_| String::new(),
+            "q",
+            &[],
+            true,
+            pack.ingest_mut(),
+        );
+        assert!(pack.has_any_usage);
+        assert_eq!(pack.total_cache_read, 400);
+        assert_eq!(pack.total_cache_creation, 50);
+    }
+
+    #[test]
+    fn cache_tokens_accumulate_independently_of_prompt_completion() {
+        // First turn: only cache_read, no cache_creation
+        let snap1 = AgenticTurnStreamSnapshot {
+            ttft_ms: None,
+            session_id: &None,
+            run_id: &None,
+            full_text: "t1",
+            tool_calls: &[],
+            prompt_tokens: 100,
+            completion_tokens: 50,
+            cache_read_tokens: 90,
+            cache_creation_tokens: 0,
+            has_usage: true,
+            error_message: &None,
+        };
+        let mut pack = Pack::new();
+        ingest_agentic_turn_stream(
+            &snap1, 0, |_| String::new(), "q", &[], true, pack.ingest_mut(),
+        );
+        // Second turn: cache_creation but no cache_read
+        let snap2 = AgenticTurnStreamSnapshot {
+            full_text: "t2",
+            cache_read_tokens: 0,
+            cache_creation_tokens: 75,
+            ..snap1
+        };
+        ingest_agentic_turn_stream(
+            &snap2, 0, |_| String::new(), "q", &[], true, pack.ingest_mut(),
+        );
+        assert_eq!(pack.total_cache_read, 90);        // only from turn 1
+        assert_eq!(pack.total_cache_creation, 75);     // only from turn 2
+    }
 }
