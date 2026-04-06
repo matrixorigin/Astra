@@ -53,6 +53,7 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/health", "Tool health dashboard"),
     ("/learn", "Learning insights: patterns, drift, exploration"),
     ("/sync", "Cloud sync status and push"),
+    ("/team", "Team coordination: create, list, add-member, context"),
     // ── Advanced ──────────────────────────────────────────────────────────
     ("/doctor", "Run diagnostics"),
     ("/version", "Show version info"),
@@ -589,6 +590,7 @@ fn slash_argument_hint(command: &str) -> Option<&'static str> {
         "/health" => Some("[detail]"),
         "/sync" => Some("[log|push|pull]"),
         "/style" => Some("[list|default|minimal|colorful|high-contrast]"),
+        "/team" => Some("[list|create|info|add-member|delete|context]"),
         _ => None,
     }
 }

@@ -100,6 +100,8 @@ mod slash_session;
 mod slash_skill;
 #[path = "mo_agent/slash_state.rs"]
 mod slash_state;
+#[path = "mo_agent/slash_team.rs"]
+mod slash_team;
 #[path = "mo_agent/stream_render.rs"]
 mod stream_render;
 #[path = "mo_agent/streaming_md.rs"]
@@ -586,6 +588,8 @@ struct ReplState {
     /// the verification gate is swapped per-subtask via `clone_with_gate`.
     delegation_engine:
         Option<std::sync::Arc<astra_runtime::server::delegation_engine::DelegationEngine>>,
+    /// Team coordination registry for multi-agent team patterns.
+    team_registry: slash_team::TeamRegistry,
     /// Handle for communicating with a background plan executor.
     /// When Some, a plan is running in the background and the REPL can
     /// poll for updates via `plan_handle.try_recv()`.
@@ -657,6 +661,7 @@ impl Default for ReplState {
             last_delivery_report: None,
             plan_execution_corrections: Vec::new(),
             delegation_engine: None,
+            team_registry: slash_team::TeamRegistry::new(),
             plan_handle: None,
             pending_approval: None,
             plan_in_token_stream: false,
@@ -4095,6 +4100,11 @@ async fn handle_slash_command(
 
         "/mcp" | "/mcp status" | "/mcp servers" => {
             slash_mcp::handle_mcp_command(arg, state).await?;
+        }
+
+        "/team" | "/team list" | "/team create" | "/team info" | "/team delete"
+        | "/team add-member" | "/team context" => {
+            slash_team::handle_team_command(arg, state);
         }
 
         "/register" | "/login" | "/logout" | "/memory-setup" => {
