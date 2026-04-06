@@ -13,7 +13,51 @@ pub(super) async fn handle_skill_command(
 
     // Route based on subcommand
     match sub {
-        "" | "list" => {
+        "" => {
+            // Overview + subcommand navigation (like /session)
+            let registry = &state.unified_skill_registry;
+            let all = registry.all_manifests();
+            let local = all.iter().filter(|m| m.source == astra_runtime::skills::SkillSourceKind::Local).count();
+            let bundled = all.iter().filter(|m| m.source == astra_runtime::skills::SkillSourceKind::Bundled).count();
+            let mcp = all.iter().filter(|m| m.source == astra_runtime::skills::SkillSourceKind::Mcp).count();
+
+            eprintln!(
+                "\n{}",
+                "─── Skills ──────────────────────────────────────".bold()
+            );
+            eprintln!("  {:<16} {}", "total:".dim(), all.len().to_string().cyan());
+            eprintln!("  {:<16} {}", "local:".dim(), local.to_string().cyan());
+            eprintln!("  {:<16} {}", "bundled:".dim(), bundled.to_string().cyan());
+            if mcp > 0 {
+                eprintln!("  {:<16} {}", "mcp:".dim(), mcp.to_string().cyan());
+            }
+            if let Some(ref name) = state.skill_dev_name {
+                eprintln!("  {:<16} {} {}", "dev mode:".dim(), name.as_str().cyan(), "(use /skill dev off to exit)".dim());
+            }
+            eprintln!();
+            eprintln!("  {}", "Subcommands:".dim());
+            eprintln!("    {}  {}", "/skill list [filter]".cyan(), "List all skills".dim());
+            eprintln!("    {}  {}", "/skill info <name>".cyan(), "Show skill details".dim());
+            eprintln!("    {}  {}", "/skill search <query>".cyan(), "Semantic search".dim());
+            eprintln!("    {}  {}", "/skill new <name>".cyan(), "Scaffold a new skill".dim());
+            eprintln!("    {}  {}", "/skill create".cyan(), "Auto-generate from session".dim());
+            eprintln!("    {}  {}", "/skill dev <name|off>".cyan(), "Enter/exit dev mode".dim());
+            eprintln!("    {}  {}", "/skill test <name>".cyan(), "Run skill tests".dim());
+            eprintln!("    {}  {}", "/skill validate <name>".cyan(), "Validate manifest".dim());
+            eprintln!("    {}  {}", "/skill doctor".cyan(), "Health check all skills".dim());
+            eprintln!("    {}  {}", "/skill stats".cyan(), "Quality tracker stats".dim());
+            eprintln!("    {}  {}", "/skill pin/unpin <name>".cyan(), "Pin/unpin for priority".dim());
+            eprintln!("    {}  {}", "/skill config".cyan(), "Skill system config".dim());
+            eprintln!();
+            eprintln!("  {}", "Marketplace:".dim());
+            eprintln!("    {}  {}", "/skill browse [query]".cyan(), "Browse marketplace".dim());
+            eprintln!("    {}  {}", "/skill install <name>".cyan(), "Install from marketplace".dim());
+            eprintln!("    {}  {}", "/skill publish <name>".cyan(), "Publish to marketplace".dim());
+            eprintln!("    {}  {}", "/skill upgrade <name>".cyan(), "Upgrade installed skill".dim());
+            eprintln!();
+        }
+
+        "list" => {
             // Show skills from the unified registry (local + bundled + MCP)
             let registry = &state.unified_skill_registry;
             let all_manifests = registry.all_manifests();
