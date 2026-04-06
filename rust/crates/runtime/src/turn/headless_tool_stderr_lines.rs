@@ -100,4 +100,90 @@ mod tests {
         let p = headless_stderr_error_preview_line(s, 3);
         assert_eq!(p, "αβγ…");
     }
+
+    // ──────────────────────────────────────────────────────────
+    // headless_stderr_unknown_tool_header / detail
+    // ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn unknown_tool_header() {
+        assert_eq!(
+            headless_stderr_unknown_tool_header("bad_tool"),
+            "  ✗ bad_tool"
+        );
+    }
+
+    #[test]
+    fn unknown_tool_detail() {
+        assert_eq!(
+            headless_stderr_unknown_tool_detail("not found"),
+            "  └ not found"
+        );
+    }
+
+    // ──────────────────────────────────────────────────────────
+    // resource limit lines
+    // ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn resource_limit_blocked() {
+        let s = headless_stderr_resource_limit_blocked("bash");
+        assert!(s.contains("bash"));
+        assert!(s.contains("blocked"));
+    }
+
+    #[test]
+    fn resource_limit_in_output() {
+        let s = headless_stderr_resource_limit_in_output("exec");
+        assert!(s.contains("exec"));
+        assert!(s.contains("resource limit"));
+    }
+
+    // ──────────────────────────────────────────────────────────
+    // tool error/ok headers
+    // ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn tool_error_header() {
+        let s = headless_stderr_tool_error_header("bash", "150ms");
+        assert_eq!(s, "  ✗ bash (150ms)");
+    }
+
+    #[test]
+    fn tool_ok_header() {
+        let s = headless_stderr_tool_ok_header("read_file", "5ms");
+        assert_eq!(s, "  ✓ read_file (5ms)");
+    }
+
+    // ──────────────────────────────────────────────────────────
+    // error preview line edge cases
+    // ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn preview_within_limit_no_truncation() {
+        let s = headless_stderr_error_preview_line("short", 100);
+        assert_eq!(s, "short");
+    }
+
+    #[test]
+    fn preview_empty_string() {
+        let s = headless_stderr_error_preview_line("", 10);
+        assert_eq!(s, "");
+    }
+
+    #[test]
+    fn preview_exact_limit() {
+        let s = headless_stderr_error_preview_line("abcde", 5);
+        assert_eq!(s, "abcde"); // exact match, no truncation
+    }
+
+    // ──────────────────────────────────────────────────────────
+    // tool error/ok detail lines
+    // ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn tool_error_detail_line() {
+        let s = headless_stderr_tool_error_detail_line("permission denied");
+        assert_eq!(s, "  └ Error: permission denied");
+    }
 }

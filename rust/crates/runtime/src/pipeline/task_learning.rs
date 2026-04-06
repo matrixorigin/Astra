@@ -715,6 +715,65 @@ mod tests {
         assert!(parse_domain_hint(Some("bogus")).is_none());
     }
 
+    // ──────────────────────────────────────────────────────────
+    // parse_task_type — exhaustive variant coverage
+    // ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn parse_task_type_all_variants() {
+        assert_eq!(parse_task_type(Some("code")), TaskType::Code);
+        assert_eq!(parse_task_type(Some("reasoning")), TaskType::Reasoning);
+        assert_eq!(parse_task_type(Some("fetch")), TaskType::Fetch);
+        assert_eq!(parse_task_type(Some("mutate")), TaskType::Mutate);
+        assert_eq!(parse_task_type(Some("memory")), TaskType::Memory);
+        assert_eq!(
+            parse_task_type(Some("conversational")),
+            TaskType::Conversational
+        );
+        assert_eq!(parse_task_type(Some("compound")), TaskType::Compound);
+    }
+
+    #[test]
+    fn parse_task_type_case_sensitive() {
+        // Labels are exact match — uppercase should be Unknown
+        assert_eq!(parse_task_type(Some("Code")), TaskType::Unknown);
+        assert_eq!(parse_task_type(Some("CODE")), TaskType::Unknown);
+    }
+
+    #[test]
+    fn parse_task_type_empty_string() {
+        assert_eq!(parse_task_type(Some("")), TaskType::Unknown);
+    }
+
+    // ──────────────────────────────────────────────────────────
+    // parse_domain_hint — exhaustive variant coverage
+    // ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn parse_domain_hint_all_variants() {
+        assert_eq!(parse_domain_hint(Some("github")), Some(DomainHint::GitHub));
+        assert_eq!(parse_domain_hint(Some("code")), Some(DomainHint::Code));
+        assert_eq!(parse_domain_hint(Some("memory")), Some(DomainHint::Memory));
+        assert_eq!(parse_domain_hint(Some("git")), Some(DomainHint::Git));
+        assert_eq!(parse_domain_hint(Some("system")), Some(DomainHint::System));
+        assert_eq!(
+            parse_domain_hint(Some("database")),
+            Some(DomainHint::Database)
+        );
+        assert_eq!(parse_domain_hint(Some("web")), Some(DomainHint::Web));
+    }
+
+    #[test]
+    fn parse_domain_hint_case_sensitive() {
+        assert!(parse_domain_hint(Some("GitHub")).is_none());
+        assert!(parse_domain_hint(Some("GIT")).is_none());
+    }
+
+    #[test]
+    fn parse_domain_hint_empty_string() {
+        assert!(parse_domain_hint(Some("")).is_none());
+    }
+
     // ─── Verification Learning Tests ────────────────────────────────────────
 
     fn make_verification_signal(all_passed: bool, attempt: u32) -> VerificationLearningSignal {

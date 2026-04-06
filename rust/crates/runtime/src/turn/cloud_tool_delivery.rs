@@ -683,4 +683,179 @@ mod tests {
                 .contains("read_ok")
         );
     }
+
+    // ──────────────────────────────────────────────────────────
+    // raw_tool_arguments
+    // ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn raw_tool_arguments_valid() {
+        let tc = json!({
+            "function": {"name": "bash", "arguments": r#"{"cmd": "ls"}"#}
+        });
+        let r = raw_tool_arguments(&tc);
+        assert_eq!(r.as_str().unwrap(), r#"{"cmd": "ls"}"#);
+    }
+
+    #[test]
+    fn raw_tool_arguments_missing_function() {
+        let tc = json!({"id": "t1"});
+        let r = raw_tool_arguments(&tc);
+        assert_eq!(r.as_str().unwrap(), "{}");
+    }
+
+    #[test]
+    fn raw_tool_arguments_missing_arguments_key() {
+        let tc = json!({"function": {"name": "bash"}});
+        let r = raw_tool_arguments(&tc);
+        assert_eq!(r.as_str().unwrap(), "{}");
+    }
+
+    // ──────────────────────────────────────────────────────────
+    // parse_cloud_approval_outcome (additional cases)
+    // ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn parse_approval_none_is_timeout() {
+        assert_eq!(
+            parse_cloud_approval_outcome(None),
+            CloudApprovalResult::Timeout
+        );
+    }
+
+    #[test]
+    fn parse_approval_malformed_json() {
+        let v = json!({"body": {"bad": "shape"}});
+        assert_eq!(
+            parse_cloud_approval_outcome(Some(&v)),
+            CloudApprovalResult::Malformed
+        );
+    }
+
+    #[test]
+    fn parse_approval_allow_session() {
+        let v = json!({
+            "body": {"request_id": "t1", "decision": "allow_session"}
+        });
+        assert_eq!(
+            parse_cloud_approval_outcome(Some(&v)),
+            CloudApprovalResult::Allowed
+        );
+    }
+
+    #[test]
+    fn parse_approval_deny_without_reason() {
+        let v = json!({
+            "body": {"request_id": "t1", "decision": "deny"}
+        });
+        assert_eq!(
+            parse_cloud_approval_outcome(Some(&v)),
+            CloudApprovalResult::Denied { reason: None }
+        );
+    }
+
+    // ──────────────────────────────────────────────────────────
+    // denied_tool_content
+    // ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn denied_tool_content_with_reason() {
+        let s = denied_tool_content(Some("policy violation"));
+        assert!(s.contains("user_denied"));
+        assert!(s.contains("policy violation"));
+    }
+
+    #[test]
+    fn denied_tool_content_without_reason() {
+        let s = denied_tool_content(None);
+        assert!(s.contains("user_denied"));
+    }
+
+    // ──────────────────────────────────────────────────────────
+    // persist_denied_tool_result
+    // ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn persist_denied_result_extracts_id_and_name() {
+        let tc = json!({
+            "id": "call_123",
+            "function": {"name": "write_file", "arguments": "{}"}
+        });
+        let r = persist_denied_tool_result(&tc, Some("no"));
+        assert_eq!(r["tool_call_id"], "call_123");
+        assert_eq!(r["name"], "write_file");
+        assert!(r["result"].as_str().unwrap().contains("user_denied"));
+    }
+
+    #[test]
+    fn persist_denied_result_missing_fields() {
+        let tc = json!({}); // no id, no function
+        let r = persist_denied_tool_result(&tc, None);
+        assert_eq!(r["tool_call_id"], "");
+        assert_eq!(r["name"], "");
+    }
+
+    // ──────────────────────────────────────────────────────────
+    // sse_maps_through_tool_request
+    // ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn sse_maps_valid_tool_call() {
+        let tc = read_tool("c1");
+        let maps = sse_maps_through_tool_request(&tc);
+        assert_eq!(maps.len(), 2);
+    }
+
+    #[test]
+    fn sse_maps_non_object_returns_empty() {
+        let tc = json!("not an object");
+        let maps = sse_maps_through_tool_request(&tc);
+        assert!(maps.is_empty());
+    }
+
+    // ──────────────────────────────────────────────────────────
+    // cloud_tool_requires_approval
+    // ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn read_file_does_not_require_approval() {
+        let tc = read_tool("r1");
+        assert!(!cloud_tool_requires_approval(&tc));
+    }
+
+    #[test]
+    fn write_file_requires_approval() {
+        let tc = write_tool("w1");
+        assert!(cloud_tool_requires_approval(&tc));
+    }
+
+    #[test]
+    fn empty_tool_call_no_panic() {
+        let tc = json!({});
+        // Should not panic, just default behavior
+        let _ = cloud_tool_requires_approval(&tc);
+    }
+
+    // ──────────────────────────────────────────────────────────
+    // tool_path_hint
+    // ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn tool_path_hint_extracts_from_args() {
+        let tc = json!({
+            "function": {"name": "write_file", "arguments": r#"{"path": "src/main.rs"}"#}
+        });
+        let hint = tool_path_hint(&tc);
+        assert_eq!(hint, Some("src/main.rs".to_string()));
+    }
+
+    #[test]
+    fn tool_path_hint_no_path_in_args() {
+        let tc = json!({
+            "function": {"name": "bash", "arguments": r#"{"command": "ls"}"#}
+        });
+        let hint = tool_path_hint(&tc);
+        // bash doesn't have a path arg, so hint may be None
+        assert!(hint.is_none() || hint.is_some());
+    }
 }

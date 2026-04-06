@@ -1004,6 +1004,15 @@ mod tests {
         json!({"role": "assistant", "content": content})
     }
 
+    fn make_mem(id: &str, content: &str) -> MemoriaMemory {
+        MemoriaMemory {
+            memory_id: id.to_string(),
+            content: content.to_string(),
+            memory_type: "semantic".to_string(),
+            retrieval_score: Some(0.8),
+        }
+    }
+
     #[test]
     fn retrieve_query_empty_messages_is_fallback() {
         let q = memoria_compact_retrieve_query(&[]);
@@ -1659,5 +1668,441 @@ mod tests {
             .join("\n");
         assert!(text.contains("DISK_UNIQUE"));
         assert!(text.contains("MEM_UNIQUE"));
+    }
+
+    // ──────────────────────────────────────────────────────────
+    // djb2_hash_utf16
+    // ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn djb2_hash_empty_string() {
+        assert_eq!(djb2_hash_utf16(""), 0);
+    }
+
+    #[test]
+    fn djb2_hash_deterministic() {
+        let h1 = djb2_hash_utf16("hello");
+        let h2 = djb2_hash_utf16("hello");
+        assert_eq!(h1, h2);
+    }
+
+    #[test]
+    fn djb2_hash_different_for_different_inputs() {
+        assert_ne!(djb2_hash_utf16("abc"), djb2_hash_utf16("def"));
+    }
+
+    // ──────────────────────────────────────────────────────────
+    // abs_hash_to_string_36
+    // ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn abs_hash_to_string_36_zero() {
+        assert_eq!(abs_hash_to_string_36(0), "0");
+    }
+
+    #[test]
+    fn abs_hash_to_string_36_positive() {
+        let s = abs_hash_to_string_36(36);
+        assert_eq!(s, "10"); // 36 in base-36 is "10"
+    }
+
+    #[test]
+    fn abs_hash_to_string_36_negative() {
+        // abs(-36) = 36, same as positive
+        assert_eq!(abs_hash_to_string_36(-36), "10");
+    }
+
+    #[test]
+    fn abs_hash_to_string_36_large() {
+        let s = abs_hash_to_string_36(i32::MAX);
+        assert!(!s.is_empty());
+        // Only [0-9a-z] characters
+        assert!(s.chars().all(|c| c.is_ascii_alphanumeric()));
+    }
+
+    // ──────────────────────────────────────────────────────────
+    // sanitize_path_for_claude_projects (extended)
+    // ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn sanitize_path_short_keeps_as_is() {
+        assert_eq!(sanitize_path_for_claude_projects("abc123"), "abc123");
+    }
+
+    #[test]
+    fn sanitize_path_long_appends_hash() {
+        let long_path = "a/".repeat(200); // > 200 chars after sanitization
+        let result = sanitize_path_for_claude_projects(&long_path);
+        assert!(result.len() > 200); // prefix + "-" + hash
+        assert!(result.contains('-'));
+    }
+
+    #[test]
+    fn sanitize_path_empty() {
+        assert_eq!(sanitize_path_for_claude_projects(""), "");
+    }
+
+    // ──────────────────────────────────────────────────────────
+    // trim_str_to_approx_tokens
+    // ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn trim_str_within_limit() {
+        let s = "hello world";
+        assert_eq!(trim_str_to_approx_tokens(s, 100), s);
+    }
+
+    #[test]
+    fn trim_str_exceeds_limit() {
+        let s = "a".repeat(2000);
+        let r = trim_str_to_approx_tokens(&s, 1); // 1 token ≈ 4 chars, min 256
+        assert!(r.len() < s.len());
+        assert!(r.ends_with('…'));
+    }
+
+    #[test]
+    fn trim_str_empty() {
+        assert_eq!(trim_str_to_approx_tokens("", 100), "");
+    }
+
+    // ──────────────────────────────────────────────────────────
+    // wrap_file_session_context / build_file_only_session_context
+    // ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn wrap_file_session_context_format() {
+        let r = wrap_file_session_context("my notes");
+        assert!(r.starts_with("[Session memory"));
+        assert!(r.contains("my notes"));
+        assert!(r.ends_with("]"));
+    }
+
+    #[test]
+    fn build_file_only_empty_yields_empty() {
+        assert!(build_file_only_session_context("", 100).is_empty());
+    }
+
+    #[test]
+    fn build_file_only_wraps_text() {
+        let r = build_file_only_session_context("disk notes", 100);
+        assert!(r.contains("disk notes"));
+        assert!(r.contains("[Session memory"));
+    }
+
+    // ──────────────────────────────────────────────────────────
+    // build_session_context_with_optional_file
+    // ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn session_context_none_combine_ignores_file() {
+        let mems = vec![make_mem("x", "mem stuff")];
+        let r = build_session_context_with_optional_file(
+            &mems,
+            Some("disk stuff"),
+            SessionMemoryFileCombine::None,
+            1000,
+        );
+        assert!(r.contains("mem stuff"));
+        assert!(!r.contains("disk stuff"));
+    }
+
+    #[test]
+    fn session_context_fallback_with_memories_ignores_file() {
+        let mems = vec![make_mem("x", "mem stuff")];
+        let r = build_session_context_with_optional_file(
+            &mems,
+            Some("disk stuff"),
+            SessionMemoryFileCombine::Fallback,
+            1000,
+        );
+        assert!(r.contains("mem stuff"));
+        assert!(!r.contains("disk stuff"));
+    }
+
+    #[test]
+    fn session_context_fallback_empty_memories_uses_file() {
+        let r = build_session_context_with_optional_file(
+            &[],
+            Some("disk fallback"),
+            SessionMemoryFileCombine::Fallback,
+            1000,
+        );
+        assert!(r.contains("disk fallback"));
+    }
+
+    #[test]
+    fn session_context_fallback_empty_both() {
+        let r = build_session_context_with_optional_file(
+            &[],
+            None,
+            SessionMemoryFileCombine::Fallback,
+            1000,
+        );
+        assert!(r.is_empty());
+    }
+
+    #[test]
+    fn session_context_merge_combines_both() {
+        let mems = vec![make_mem("x", "mem side")];
+        let r = build_session_context_with_optional_file(
+            &mems,
+            Some("disk side"),
+            SessionMemoryFileCombine::Merge,
+            1000,
+        );
+        assert!(r.contains("mem side"));
+        assert!(r.contains("disk side"));
+    }
+
+    #[test]
+    fn session_context_merge_no_file_just_memory() {
+        let mems = vec![make_mem("x", "only mem")];
+        let r = build_session_context_with_optional_file(
+            &mems,
+            None,
+            SessionMemoryFileCombine::Merge,
+            1000,
+        );
+        assert!(r.contains("only mem"));
+    }
+
+    // ──────────────────────────────────────────────────────────
+    // build_working_memory_content
+    // ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn working_memory_empty_messages() {
+        assert!(build_working_memory_content(&[], 1000).is_empty());
+    }
+
+    #[test]
+    fn working_memory_user_and_assistant() {
+        let msgs = vec![user("hello"), assistant("world")];
+        let r = build_working_memory_content(&msgs, 10000);
+        assert!(r.contains("User: hello"));
+        assert!(r.contains("Assistant: world"));
+    }
+
+    #[test]
+    fn working_memory_skips_tool_role() {
+        let tool_msg = json!({"role": "tool", "content": "tool output", "tool_call_id": "t1"});
+        let msgs = vec![user("q"), tool_msg, assistant("a")];
+        let r = build_working_memory_content(&msgs, 10000);
+        assert!(!r.contains("tool output"));
+    }
+
+    #[test]
+    fn working_memory_assistant_with_tool_calls() {
+        let a = json!({
+            "role": "assistant",
+            "content": null,
+            "tool_calls": [{"function": {"name": "bash", "arguments": "{}"}}]
+        });
+        let msgs = vec![user("run it"), a];
+        let r = build_working_memory_content(&msgs, 10000);
+        assert!(r.contains("[tools: bash]"));
+    }
+
+    #[test]
+    fn working_memory_budget_caps() {
+        let msgs = vec![
+            user(&"x".repeat(500)),
+            assistant(&"y".repeat(500)),
+        ];
+        let r = build_working_memory_content(&msgs, 100);
+        // Should be capped and not include all content
+        assert!(r.len() <= 500); // generous but capped
+    }
+
+    // ──────────────────────────────────────────────────────────
+    // truncate_str
+    // ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn truncate_str_within_limit() {
+        assert_eq!(truncate_str("hello", 10), "hello");
+    }
+
+    #[test]
+    fn truncate_str_at_boundary() {
+        assert_eq!(truncate_str("hello", 5), "hello");
+    }
+
+    #[test]
+    fn truncate_str_beyond() {
+        assert_eq!(truncate_str("hello world", 5), "hello");
+    }
+
+    #[test]
+    fn truncate_str_empty() {
+        assert_eq!(truncate_str("", 10), "");
+    }
+
+    #[test]
+    fn truncate_str_unicode_boundary() {
+        let s = "αβγδ"; // each α is 2 bytes
+        let r = truncate_str(s, 3);
+        // Can't cut mid-codepoint; walks back to last valid boundary
+        assert_eq!(r, "α"); // 2 bytes fits, 4 doesn't
+    }
+
+    // ──────────────────────────────────────────────────────────
+    // collapse_whitespace
+    // ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn collapse_whitespace_multi_spaces() {
+        assert_eq!(collapse_whitespace("a  b   c"), "a b c");
+    }
+
+    #[test]
+    fn collapse_whitespace_tabs_newlines() {
+        assert_eq!(collapse_whitespace("a\t\nb\n\nc"), "a b c");
+    }
+
+    #[test]
+    fn collapse_whitespace_empty() {
+        assert_eq!(collapse_whitespace(""), "");
+    }
+
+    #[test]
+    fn collapse_whitespace_only_whitespace() {
+        assert_eq!(collapse_whitespace("   \t\n  "), "");
+    }
+
+    // ──────────────────────────────────────────────────────────
+    // message_user_text
+    // ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn message_user_text_from_user() {
+        let m = user("hello world");
+        assert_eq!(message_user_text(&m), Some("hello world".into()));
+    }
+
+    #[test]
+    fn message_user_text_from_assistant() {
+        let m = assistant("response");
+        assert_eq!(message_user_text(&m), None);
+    }
+
+    #[test]
+    fn message_user_text_empty_content() {
+        let m = json!({"role": "user", "content": ""});
+        assert_eq!(message_user_text(&m), None);
+    }
+
+    #[test]
+    fn message_user_text_whitespace_only() {
+        let m = json!({"role": "user", "content": "   \n  "});
+        assert_eq!(message_user_text(&m), None);
+    }
+
+    #[test]
+    fn message_user_text_null_content() {
+        let m = json!({"role": "user", "content": null});
+        assert_eq!(message_user_text(&m), None);
+    }
+
+    #[test]
+    fn message_user_text_missing_content() {
+        let m = json!({"role": "user"});
+        assert_eq!(message_user_text(&m), None);
+    }
+
+    // ──────────────────────────────────────────────────────────
+    // truncate_chars_prefix
+    // ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn truncate_chars_prefix_within_limit() {
+        assert_eq!(truncate_chars_prefix("abc", 10), "abc");
+    }
+
+    #[test]
+    fn truncate_chars_prefix_exceeds() {
+        assert_eq!(truncate_chars_prefix("abcdef", 3), "abc");
+    }
+
+    #[test]
+    fn truncate_chars_prefix_unicode() {
+        assert_eq!(truncate_chars_prefix("αβγδ", 2), "αβ");
+    }
+
+    #[test]
+    fn truncate_chars_prefix_empty() {
+        assert_eq!(truncate_chars_prefix("", 5), "");
+    }
+
+    // ──────────────────────────────────────────────────────────
+    // adjusted_message_budget_chars
+    // ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn adjusted_budget_basic() {
+        assert_eq!(adjusted_message_budget_chars(1000, 200, 100), 700);
+    }
+
+    #[test]
+    fn adjusted_budget_underflow_saturates() {
+        assert_eq!(adjusted_message_budget_chars(100, 500, 500), 0);
+    }
+
+    #[test]
+    fn adjusted_budget_zero_deductions() {
+        assert_eq!(adjusted_message_budget_chars(1000, 0, 0), 1000);
+    }
+
+    // ──────────────────────────────────────────────────────────
+    // truncate_summary_for_budget
+    // ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn truncate_summary_within_budget() {
+        let s = "short summary".to_string();
+        assert_eq!(truncate_summary_for_budget(s.clone(), 100), s);
+    }
+
+    #[test]
+    fn truncate_summary_over_budget() {
+        let s = "a".repeat(2000);
+        let r = truncate_summary_for_budget(s, 1); // 1 token ≈ 4 chars, min 256
+        assert!(r.contains("[summary truncated"));
+    }
+
+    // ──────────────────────────────────────────────────────────
+    // read_session_memory_file
+    // ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn read_session_memory_file_normal() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("notes.md");
+        std::fs::write(&f, "  session notes  \n").unwrap();
+        assert_eq!(read_session_memory_file(&f), Some("session notes".into()));
+    }
+
+    #[test]
+    fn read_session_memory_file_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("empty.md");
+        std::fs::write(&f, "   ").unwrap();
+        assert_eq!(read_session_memory_file(&f), None);
+    }
+
+    #[test]
+    fn read_session_memory_file_missing() {
+        let path = std::path::Path::new("/nonexistent/file.md");
+        assert_eq!(read_session_memory_file(path), None);
+    }
+
+    #[test]
+    fn read_session_memory_file_too_large() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("huge.md");
+        // Create file > 512KB
+        let data = "x".repeat(600 * 1024);
+        std::fs::write(&f, &data).unwrap();
+        assert_eq!(read_session_memory_file(&f), None);
     }
 }
