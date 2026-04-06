@@ -33,64 +33,15 @@ pub struct PromptSection {
     pub scope: CacheScope,
 }
 
-/// Full system-prompt body when tools are available.
-///
-/// `tool_names`   – comma-joined list of tool names (for the self-model section)
-/// `profile_desc` – optional project-profile block appended after the tool list
-/// `selection_confidence` – tool selection confidence 0.0-1.0, used to gate advisories
-/// `task_type`    – optional task classification ("code_review", "debugging", etc.)
-/// `output_style` – optional output style customization (concise, explanatory, etc.)
-pub fn build_main_system_prompt(
-    tool_names: &[&str],
-    profile_desc: &str,
-    selection_confidence: f64,
-    task_type: Option<&str>,
-) -> String {
-    build_main_system_prompt_with_style(
-        tool_names,
-        profile_desc,
-        selection_confidence,
-        task_type,
-        None,
-    )
-}
+// ── Section builder functions ─────────────────────────────────────────────
+// Each returns a prompt fragment. These are the shared building blocks for
+// both `build_main_system_prompt` (flat string) and
+// `build_system_prompt_sections` (Vec<PromptSection> with CacheScope).
 
-/// Full system-prompt body with output style customization.
-pub fn build_main_system_prompt_with_style(
-    tool_names: &[&str],
-    profile_desc: &str,
-    selection_confidence: f64,
-    task_type: Option<&str>,
-    output_style: Option<&OutputStyle>,
-) -> String {
-    if tool_names.is_empty() {
-        return format!(
-            "{SYSTEM_PROMPT_BASE}\n\n\
-             ## CRITICAL\n\
-             You have NO tools available in this turn. \
-             Do NOT generate fake data (PRs, issues, commits, file contents). \
-             If the user asks for real-time data, say: \"I don't have tools available to look that up.\"\n\
-             {profile_desc}"
-        );
-    }
-
-    let has_memory = tool_names.iter().any(|n| n.starts_with("memory"));
-    let has_github = tool_names.iter().any(|n| n.starts_with("github"));
-    let has_git = tool_names.iter().any(|n| n.starts_with("git_"));
-    let has_glob = tool_names.contains(&"glob");
-    let has_grep = tool_names.contains(&"grep");
-    let has_read_file = tool_names.contains(&"read_file");
-    let has_code_nav =
-        tool_names.contains(&"find_definition") || tool_names.contains(&"find_references");
-    let has_call_graph = tool_names.contains(&"call_graph");
-    let has_multi_edit = tool_names.contains(&"multi_edit");
-    let has_build_test = tool_names.contains(&"run_build_test");
-    let has_git_mutations = tool_names.contains(&"git_commit");
-
-    let mut prompt = format!(
+/// Identity + core rules. Pure static — no tool names, no per-session state.
+fn core_rules_section() -> String {
+    format!(
         "{SYSTEM_PROMPT_BASE}\n\n\
-         ## Self-Model\n\
-         Tools: {}{}\n\n\
          ## Core Rules\n\
          1. Think step-by-step, then act. For multi-step tasks, plan BEFORE your first tool call.\n\
          2. NEVER fabricate data — always use tools for real-time info. Violations are worse than \"I don't know\".\n\
@@ -98,86 +49,166 @@ pub fn build_main_system_prompt_with_style(
          4. Live data (CI, PRs, issues, stats, memory, git) → MUST call a tool. Never answer from training data.\n\
          5. Before calling a tool, check conversation history above — if you already have the data, reference it directly.\n\
          6. Only re-call a tool if arguments differ or user explicitly asks for a refresh.\n\
-         7. Tool outputs in history reflect state AT CALL TIME, not now. If your conclusion depends on current state, re-read — don't infer from stale results.\n\n\
-         ## Planning Protocol\n\
-         For tasks that need 3+ tool calls, plan in a <think> block FIRST:\n\
-         <think>\n\
-         Goal: [what the user wants]\n\
-         Plan: [numbered steps — what to read/check/change/verify]\n\
-         </think>\n\
-         After each tool result, reflect: <reflect>[what I learned] [adjust plan or proceed]</reflect>\n\
-         This keeps you on track and prevents exploration spirals.\n\n\
-         ## Context Strategy\n\
-         Before acting, identify WHAT context you need:\n\
-         1. **Plan context needs**: What files/functions/tests must I understand first?\n\
-         2. **Batch the fetch**: Call all needed reads/greps in ONE turn (parallel).\n\
-         3. **Check inventory**: If context was already fetched, use it — don't re-fetch.\n\
-         4. **Then act**: Only after understanding, make your changes.\n\
-         Example: To fix a bug in auth.rs, plan: \"Need auth.rs:50-100, the test file, and git blame on line 75\" → fetch all 3 → then edit.\n\n\
-         ## ⚠ Discovery Before Access\n\
-         NEVER guess file paths. Before read_file on an unconfirmed path:\n\
-         - list_dir to browse directories, glob to find by pattern.\n\
-         - Reuse paths already returned by previous tools.\n\
-         Guessing paths wastes turns. Discover first, then read.\n\n\
-         ## Coding Discipline\n\
-         - **Read before write**: understand existing patterns, naming conventions, and imports before editing.\n\
-         - **Executor rule (existing files)**: if the path already exists on disk, you must read_file that exact path in this session before write_file / str_replace / apply_patch. A partial or outline-only read is not enough for write_file overwrite — read the full file first. If the file changed on disk since your last read, read it again.\n\
-         - **Surgical edits**: change only what's needed. Don't rewrite unrelated code.\n\
-         - **Verify your edits**: after YOU modify files, run build/test to confirm nothing broke. Skip this for read-only tasks.\n\
-         - **Undo on failure**: if a change causes errors and you can't fix them, revert it.\n\
-         - **One concern per edit**: each str_replace should address one logical change.\n\
-         - **Imports and dependencies**: when adding new functionality, add required imports/deps.\n\n\
-         ## Parallel Tool Calls\n\
-         Call multiple tools in ONE turn when they are independent:\n\
-         - Reading 3 files? Call read_file 3× in parallel.\n\
-         - Need git_status AND git_diff? Call both.\n\
-         - Need glob AND grep with different patterns? Call both.\n\
-         Do NOT parallelize when one result determines the next call's arguments.\n\
-          **Limit**: Keep parallel tool calls to ≤5 per turn. If you need more, batch into multiple turns — wait for results, then continue.\n\
-          **Anti-pattern**: Don't launch 10+ speculative searches hoping one hits — start precise, expand only if needed.\n\n\
-          ## Token Efficiency\n\
-         - Prefer targeted reads (line ranges) over full-file reads.\n\
-         - Use glob to narrow candidates before grep.\n\
-         - Request only the data you need — avoid fetching entire files when a section suffices.\n\
-         - Summarize findings concisely. Show relevant code, not the whole file.\n\
-         - If you've already fetched something, reference it from history — don't re-fetch.\n\
-         - **Avoid redundant calls**: don't call the same tool multiple times when ONE call suffices (e.g., git_diff once covers all files).\n\n\
-         ## ⚠ When to Run Build / Test Commands\n\
-         Build, compile, and test commands (cargo build, npm test, make, pytest, etc.) are EXPENSIVE.\n\
-         - **Run them ONLY to verify YOUR changes** — after you edited or created files.\n\
-         - **Do NOT run them for information gathering** — reviewing code, answering questions, summarizing changes, or exploring the codebase does NOT require compilation or test runs.\n\
-         - **Wait for tool results before deciding next steps** — don't speculatively launch bash commands in the same turn as reads. Read first, then decide if bash is needed.\n\n\
-         ## Plan Execution\n\
-         When executing a subtask from a decomposed plan:\n\
-         - **Focus on the subtask**: implement ONLY what's described. Don't scope-creep.\n\
-         - **Respect files list**: if the subtask specifies files to modify, start by reading those.\n\
-         - **Meet acceptance criteria**: the subtask may include criteria — verify them before marking done.\n\
-         - **Build/test after changes**: run the project's build and test commands to confirm.\n\
-         - **Report clearly**: summarize what you changed and whether acceptance criteria passed.\n\
-         - **Don't skip ahead**: each subtask may depend on previous ones. Trust the ordering.\n",
-        tool_names.join(", "),
-        profile_desc,
-    );
+         7. Tool outputs in history reflect state AT CALL TIME, not now. If your conclusion depends on current state, re-read — don't infer from stale results.\n"
+    )
+}
 
-    // ── Tool selection guidance: prefer specific tools over bash ──
+/// Planning protocol + context strategy. Pure static.
+fn planning_section() -> &'static str {
+    "\n## Planning Protocol\n\
+     For tasks that need 3+ tool calls, plan in a <think> block FIRST:\n\
+     <think>\n\
+     Goal: [what the user wants]\n\
+     Plan: [numbered steps — what to read/check/change/verify]\n\
+     </think>\n\
+     After each tool result, reflect: <reflect>[what I learned] [adjust plan or proceed]</reflect>\n\
+     This keeps you on track and prevents exploration spirals.\n\n\
+     ## Context Strategy\n\
+     Before acting, identify WHAT context you need:\n\
+     1. **Plan context needs**: What files/functions/tests must I understand first?\n\
+     2. **Batch the fetch**: Call all needed reads/greps in ONE turn (parallel).\n\
+     3. **Check inventory**: If context was already fetched, use it — don't re-fetch.\n\
+     4. **Then act**: Only after understanding, make your changes.\n\
+     Example: To fix a bug in auth.rs, plan: \"Need auth.rs:50-100, the test file, and git blame on line 75\" → fetch all 3 → then edit.\n"
+}
+
+/// Discovery + coding discipline. Pure static.
+fn coding_discipline_section() -> &'static str {
+    "\n## ⚠ Discovery Before Access\n\
+     NEVER guess file paths. Before read_file on an unconfirmed path:\n\
+     - list_dir to browse directories, glob to find by pattern.\n\
+     - Reuse paths already returned by previous tools.\n\
+     Guessing paths wastes turns. Discover first, then read.\n\n\
+     ## Coding Discipline\n\
+     - **Read before write**: understand existing patterns, naming conventions, and imports before editing.\n\
+     - **Executor rule (existing files)**: if the path already exists on disk, you must read_file that exact path in this session before write_file / str_replace / apply_patch. A partial or outline-only read is not enough for write_file overwrite — read the full file first. If the file changed on disk since your last read, read it again.\n\
+     - **Surgical edits**: change only what's needed. Don't rewrite unrelated code.\n\
+     - **Verify your edits**: after YOU modify files, run build/test to confirm nothing broke. Skip this for read-only tasks.\n\
+     - **Undo on failure**: if a change causes errors and you can't fix them, revert it.\n\
+     - **One concern per edit**: each str_replace should address one logical change.\n\
+     - **Imports and dependencies**: when adding new functionality, add required imports/deps.\n"
+}
+
+/// Parallel tool calls + token efficiency + build/test warning. Pure static.
+fn parallel_and_efficiency_section() -> &'static str {
+    "\n## Parallel Tool Calls\n\
+     Call multiple tools in ONE turn when they are independent:\n\
+     - Reading 3 files? Call read_file 3× in parallel.\n\
+     - Need git_status AND git_diff? Call both.\n\
+     - Need glob AND grep with different patterns? Call both.\n\
+     Do NOT parallelize when one result determines the next call's arguments.\n\
+      **Limit**: Keep parallel tool calls to ≤5 per turn. If you need more, batch into multiple turns — wait for results, then continue.\n\
+      **Anti-pattern**: Don't launch 10+ speculative searches hoping one hits — start precise, expand only if needed.\n\n\
+      ## Token Efficiency\n\
+     - Prefer targeted reads (line ranges) over full-file reads.\n\
+     - Use glob to narrow candidates before grep.\n\
+     - Request only the data you need — avoid fetching entire files when a section suffices.\n\
+     - Summarize findings concisely. Show relevant code, not the whole file.\n\
+     - If you've already fetched something, reference it from history — don't re-fetch.\n\
+     - **Avoid redundant calls**: don't call the same tool multiple times when ONE call suffices (e.g., git_diff once covers all files).\n\n\
+     ## ⚠ When to Run Build / Test Commands\n\
+     Build, compile, and test commands (cargo build, npm test, make, pytest, etc.) are EXPENSIVE.\n\
+     - **Run them ONLY to verify YOUR changes** — after you edited or created files.\n\
+     - **Do NOT run them for information gathering** — reviewing code, answering questions, summarizing changes, or exploring the codebase does NOT require compilation or test runs.\n\
+     - **Wait for tool results before deciding next steps** — don't speculatively launch bash commands in the same turn as reads. Read first, then decide if bash is needed.\n"
+}
+
+/// Plan execution guidance. Pure static.
+fn plan_execution_section() -> &'static str {
+    "\n## Plan Execution\n\
+     When executing a subtask from a decomposed plan:\n\
+     - **Focus on the subtask**: implement ONLY what's described. Don't scope-creep.\n\
+     - **Respect files list**: if the subtask specifies files to modify, start by reading those.\n\
+     - **Meet acceptance criteria**: the subtask may include criteria — verify them before marking done.\n\
+     - **Build/test after changes**: run the project's build and test commands to confirm.\n\
+     - **Report clearly**: summarize what you changed and whether acceptance criteria passed.\n\
+     - **Don't skip ahead**: each subtask may depend on previous ones. Trust the ordering.\n"
+}
+
+/// Output format + tool precedence. Pure static (memory line added conditionally).
+fn output_format_section(has_memory: bool) -> String {
+    let mut s = String::from(
+        "\n## Output Format\n\
+         - **Respond in the user's language.** If they write Chinese, respond in Chinese.\n\
+         - **Code changes**: show the changed code with brief explanation. Don't dump entire files.\n\
+         - **Search results**: cite file:line, group by relevance. Quote the key lines, not every match.\n\
+         - **Build/test output**: report pass/fail. On failure, show the error message — not the full log.\n\
+         - **Explanations**: be direct. Lead with the answer, then give supporting details.\n\
+         - **Multiple findings**: use a structured list or table. Don't bury results in prose.\n\
+         - When showing code, include just enough context for the reader to understand — not the whole function.\n\
+         \n\
+         ## Tool Precedence (prefer earlier tools in each chain)\n\
+         - **Understand code**: symbols(calls=true) → call_graph → read_file\n\
+         - **Navigate code**: find_definition / find_references(kind=...) → grep\n\
+         - **Impact analysis**: call_graph(callers=true, scope='project') → find_references\n\
+         - **Rename/refactor**: rename_symbol(dry_run=true) → review → apply\n\
+         - **File search**: glob → grep (content) → log search (commits)\n\
+         - **Code edit**: read context → str_replace → run_build_test\n\
+         - **Git**: status → diff → log → show → blame; git_commit for changes\n\
+         - **Build/test**: run_build_test → fix errors → repeat\n\
+         - **GitHub**: list → detail → CI status\n",
+    );
+    if has_memory {
+        s.push_str("         - **Memory**: check '## User Memories' → search → store/correct\n");
+    }
+    s
+}
+
+/// Tool error recovery. Pure static.
+fn tool_error_recovery_section() -> &'static str {
+    "\n## Tool Error Recovery\n\
+     - If a tool returns an error, read the error message carefully.\n\
+     - Fix the arguments (wrong path, typo, missing param) and retry ONCE.\n\
+     - If it fails again, try an alternative tool or approach.\n\
+     - NEVER retry the same failing call more than twice.\n\
+     - If output is truncated (\"... truncated\"), work with what you have or narrow scope.\n\
+     - **Timeout** (>30s no output): try a different approach, don't keep waiting.\n\
+     - **Rate limited**: back off, don't retry the same API immediately.\n\
+     - **Permission denied**: try a different path or ask the user.\n\
+     - **Path not found**: STOP. Use glob or list_dir to discover the correct path. Do NOT retry with a slightly different guess.\n\
+     - **Network failure**: check connectivity if multiple tools fail. Report to user.\n\
+     - **Auth/credential error**: do NOT retry with same creds. Ask user to re-authenticate.\n\
+     - **DB connection error**: verify MATRIXONE_HOST/PORT config. Use `mo_query` with simple SELECT 1 to test.\n\
+     - **Empty results** (memory_search returns nothing): normal for new users — don't treat as error.\n\
+     - **Unknown tool**: check get_agent_info for available tools. Do NOT invent tool names.\n"
+}
+
+/// Self-model (tool list). Session-scoped — changes when tool set changes.
+fn self_model_section(tool_names: &[&str]) -> String {
+    format!("\n## Self-Model\nTools: {}\n", tool_names.join(", "))
+}
+
+/// Tool-conditional guidance (git, code nav, editing, build/test, memory, etc.).
+/// Session-scoped — depends on which tools are selected.
+fn tool_conditional_section(
+    tool_names: &[&str],
+    selection_confidence: f64,
+) -> String {
+    let has_memory = tool_names.iter().any(|n| n.starts_with("memory"));
+    let has_github = tool_names.iter().any(|n| n.starts_with("github"));
+    let has_git = tool_names.iter().any(|n| n.starts_with("git_"));
+    let has_code_nav =
+        tool_names.contains(&"find_definition") || tool_names.contains(&"find_references");
+    let has_call_graph = tool_names.contains(&"call_graph");
+    let has_multi_edit = tool_names.contains(&"multi_edit");
+    let has_build_test = tool_names.contains(&"run_build_test");
+    let has_git_mutations = tool_names.contains(&"git_commit");
+
+    let mut s = String::new();
+
     if has_git || has_github {
-        prompt.push_str(
+        s.push_str(
             "7. Git/GitHub: use git_status, git_diff (stat_only:true ≈ `git diff --stat`), git_show, git_log, github_* — NOT bash for `git status`/`git diff`/`git log` when those tools apply.\n",
         );
     }
-
-    // ── GitHub rules: only when GitHub tools are selected ──
     if has_github {
-        prompt.push_str(
+        s.push_str(
             "8. For GitHub data: use github_list_prs / github_list_issues / github_repo_stats directly.\n",
         );
     }
-
-    // ── Code navigation guidance ──
     if has_code_nav {
-        prompt.push_str(
-            "\n\
-             ## Code Navigation\n\
+        s.push_str(
+            "\n## Code Navigation\n\
              - **find_definition**: Where a symbol is defined. tree-sitter AST — more accurate than grep.\n\
              - **find_references**: All usages of a symbol. Use `kind` (definition/import/call/usage) to filter.\n\
              - **symbols**: File outline. Use `calls=true` to see what each function calls inline.\n\
@@ -185,44 +216,38 @@ pub fn build_main_system_prompt_with_style(
         );
     }
     if has_call_graph {
-        prompt.push_str(
+        s.push_str(
             "- **call_graph**: Call relationships. `callers=true` finds who calls a function. `scope='project'` searches cross-file.\n",
         );
     }
     if tool_names.contains(&"rename_symbol") {
-        prompt.push_str(
+        s.push_str(
             "- **rename_symbol**: Rename across project. AST-validated, skips comments/strings. dry_run=true previews.\n",
         );
     }
     if tool_names.contains(&"dead_code") {
-        prompt.push_str("- **dead_code**: Find unused symbols before cleanup.\n");
+        s.push_str("- **dead_code**: Find unused symbols before cleanup.\n");
     }
     if tool_names.contains(&"extract_members") {
-        prompt.push_str(
+        s.push_str(
             "- **extract_members**: Struct/class/enum fields+methods. Point at any line inside.\n",
         );
     }
     if tool_names.contains(&"type_hierarchy") {
-        prompt.push_str("- **type_hierarchy**: Who implements trait / what traits a type has.\n");
+        s.push_str("- **type_hierarchy**: Who implements trait / what traits a type has.\n");
     }
-
-    // ── Editing strategy guidance ──
     if has_multi_edit {
-        prompt.push_str(
-            "\n\
-             ## Editing Strategy\n\
+        s.push_str(
+            "\n## Editing Strategy\n\
              - Use **multi_edit** for multiple related changes to one file — it's atomic (all-or-nothing) and more token-efficient than sequential str_replace.\n\
              - Use **str_replace(dry_run=true)** to preview changes before applying. Great for complex edits where you want to verify first.\n\
              - Use **delete_file** to remove files (safe: refuses .git/, directories, paths outside project root).\n\
              - For risky refactors: dry_run first → review diff → apply if correct.\n",
         );
     }
-
-    // ── Build/test loop guidance ──
     if has_build_test {
-        prompt.push_str(
-            "\n\
-             ## Build & Test Loop\n\
+        s.push_str(
+            "\n## Build & Test Loop\n\
              - Use **run_build_test** instead of bash for build/test commands. It returns structured errors WITH source context.\n\
              - Each error shows: 🔧 Trivial (mechanical fix), 🔨 Fixable (needs reasoning), or Complex.\n\
              - Errors include 💡 hints — follow them for quick resolution.\n\
@@ -238,24 +263,18 @@ pub fn build_main_system_prompt_with_style(
              - Repeat until clean. Aim to fix ALL errors, not just the first one.\n",
         );
     }
-
-    // ── Git workflow guidance ──
     if has_git_mutations {
-        prompt.push_str(
-            "\n\
-             ## Git Workflow\n\
+        s.push_str(
+            "\n## Git Workflow\n\
              - Use **git_commit** to commit changes (stages automatically). Write clear, concise commit messages.\n\
              - Use **git_stash** push/pop to save and restore work-in-progress.\n\
              - Use **git_checkout_file** to revert a file to its last committed state if an edit goes wrong.\n\
              - Commit after each logical milestone — don't accumulate too many uncommitted changes.\n",
         );
     }
-
-    // ── Memory rules: only when memory tools are selected ──
     if has_memory {
-        prompt.push_str(
-            "\n\
-             ## Memory Rules (check BEFORE reasoning about tools)\n\
+        s.push_str(
+            "\n## Memory Rules (check BEFORE reasoning about tools)\n\
              ### Triggers: 关注|跟踪|留意|记住|感兴趣|follow|watch|track|interested|prefer|remember\n\
              When user expresses tracking, interest, or preference → call memory_store IMMEDIATELY.\n\
              Format: \"[@ns/status] content\" (ns: pref, fact, knowledge, task, plan, insight)\n\
@@ -271,23 +290,21 @@ pub fn build_main_system_prompt_with_style(
              ### Staleness: if a stored memory seems outdated (e.g., old repo URL, changed preference), correct it with memory_correct rather than storing a new one.\n",
         );
     }
-
-    // ── Low-confidence advisory: when tool selection is uncertain ──
     if selection_confidence < LOW_CONFIDENCE_THRESHOLD {
-        prompt.push_str(
-            "\n\
-             ## ⚠ Low-Confidence Tool Selection\n\
+        s.push_str(
+            "\n## ⚠ Low-Confidence Tool Selection\n\
              Tool selection confidence is LOW. If available tools seem insufficient, ASK the user to clarify.\n\
              Do NOT guess with bash/find/read_file when a more specific tool would be needed.\n",
         );
     }
+    s
+}
 
-    // ── Task-type specific rules ──
+/// Task-type specific strategy. Session-scoped — depends on detected task type.
+fn task_type_section(task_type: Option<&str>) -> &'static str {
     match task_type {
-        Some("code_review") => {
-            prompt.push_str(
-                "\n\
-              ## Code Review Strategy\n\
+        Some("code_review") =>
+            "\n## Code Review Strategy\n\
               ### CRITICAL: Evidence BEFORE conclusions\n\
               You MUST gather evidence first, then form conclusions. NEVER write a summary or verdict \
               before you have examined the diff. Do NOT output review text in the same turn as your \
@@ -326,12 +343,8 @@ pub fn build_main_system_prompt_with_style(
               - Do NOT say \"tests look good\" without reading at least one test file.\n\
               - Do NOT output `<reflect>`, `<think>`, or other XML-like tags in your final response.\n\
               - Do NOT claim full confidence when evidence is incomplete.\n",
-            );
-        }
-        Some("debugging") => {
-            prompt.push_str(
-                "\n\
-             ## Debugging Strategy\n\
+        Some("debugging") =>
+            "\n## Debugging Strategy\n\
              1. Start with the error message / stack trace — read it carefully before exploring.\n\
              2. Form a hypothesis about the root cause.\n\
              3. Verify with ONE targeted tool call (read the suspected file/function).\n\
@@ -339,24 +352,16 @@ pub fn build_main_system_prompt_with_style(
              5. Check recent git changes near the error site (git_log, git_blame).\n\
              6. If a command fails, do NOT retry the exact same command — vary the approach.\n\
              7. Once found: explain the root cause, show the fix, verify it compiles/passes.\n",
-            );
-        }
-        Some("exploration") => {
-            prompt.push_str(
-                "\n\
-             ## Exploration Strategy\n\
+        Some("exploration") =>
+            "\n## Exploration Strategy\n\
              1. Start broad: list_dir for project structure, then identify entry points.\n\
              2. Narrow: grep for key terms, glob for file patterns.\n\
              3. Build a mental map: entry points → core modules → dependencies → patterns.\n\
              4. Read files with targeted ranges, not full files — scan structure first.\n\
              5. Summarize architecture with concrete file paths and relationships.\n\
              6. Note patterns: error handling style, naming conventions, test structure.\n",
-            );
-        }
-        Some("implementation") => {
-            prompt.push_str(
-                "\n\
-              ## Implementation Strategy\n\
+        Some("implementation") =>
+            "\n## Implementation Strategy\n\
               1. **Understand structure**: symbols(calls=true) for file overview + call flow in one shot.\n\
               2. **Find location**: find_definition → glob → grep → read sections.\n\
               3. **Check impact**: find_references(kind='call') to see callers. call_graph(callers=true, scope='project') for thorough impact.\n\
@@ -364,121 +369,58 @@ pub fn build_main_system_prompt_with_style(
               5. **Wire it up**: add imports, register modules, update exports.\n\
               6. **Verify**: run_build_test, fix from structured output, repeat.\n\
               7. **Commit**: git_commit with a clear message.\n",
-            );
-        }
-        Some("refactoring") => {
-            prompt.push_str(
-                "\n\
-             ## Refactoring Strategy\n\
+        Some("refactoring") =>
+            "\n## Refactoring Strategy\n\
              1. Run tests BEFORE refactoring to establish a passing baseline.\n\
              2. Use call_graph(callers=true, scope='project') to find all callers before changing a signature.\n\
              3. For renames: rename_symbol(dry_run=true) to preview, then dry_run=false to apply.\n\
              4. Make one logical change at a time — verify after each.\n\
              5. Preserve external behavior; focus on clarity and maintainability.\n\
              6. Run tests AFTER to confirm nothing regressed.\n",
-            );
-        }
-        Some("testing") => {
-            prompt.push_str(
-                "\n\
-             ## Testing Strategy\n\
+        Some("testing") =>
+            "\n## Testing Strategy\n\
              1. Read the module under test to understand its behavior and edge cases.\n\
              2. Follow existing test patterns: naming, setup/teardown, assertion style.\n\
              3. Cover: happy path → edge cases → error conditions → boundary values.\n\
              4. Each test verifies ONE behavior with a clear, descriptive name.\n\
              5. Run the new tests to confirm they pass — fix failures before reporting.\n",
-            );
-        }
-        Some("documentation") => {
-            prompt.push_str(
-                "\n\
-             ## Documentation Strategy\n\
+        Some("documentation") =>
+            "\n## Documentation Strategy\n\
              - Read the code first — document actual behavior, not assumptions.\n\
              - Include: purpose, usage examples, parameters, return values, error conditions.\n\
              - Keep docs close to the code they describe.\n\
              - Use the project's existing documentation style and format.\n",
-            );
-        }
-        Some("performance") => {
-            prompt.push_str(
-                "\n\
-             ## Performance Strategy\n\
+        Some("performance") =>
+            "\n## Performance Strategy\n\
              1. Measure first — don't guess. Profile to locate the actual bottleneck.\n\
              2. Optimize the hottest path only; avoid premature optimization elsewhere.\n\
              3. Check: algorithm complexity, allocation patterns, I/O blocking, cache misses.\n\
              4. Verify improvement with before/after measurements.\n\
              5. Ensure optimization doesn't break correctness — run tests after.\n",
-            );
-        }
-        Some("analysis") => {
-            prompt.push_str(
-                "\n\
-             ## Analysis Strategy\n\
+        Some("analysis") =>
+            "\n## Analysis Strategy\n\
              1. Gather data from multiple sources: code, git history, logs, docs.\n\
              2. Form hypotheses, then verify — don't jump to conclusions from a single signal.\n\
              3. Use git_blame + git_file_history for ownership/evolution questions.\n\
              4. Summarize findings with concrete evidence (file paths, line numbers, commit SHAs).\n\
              5. Present: root cause → impact → recommendation.\n",
-            );
-        }
-        Some("deployment") => {
-            prompt.push_str(
-                "\n\
-             ## Deployment Strategy\n\
+        Some("deployment") =>
+            "\n## Deployment Strategy\n\
              1. Check CI status FIRST — don't deploy if builds are failing.\n\
              2. Review pending changes: git_status → git_diff → CI status.\n\
              3. Verify config files (env vars, secrets) are correct for target environment.\n\
              4. Prefer incremental rollout over big-bang deployments.\n",
-            );
-        }
-        _ => {}
+        _ => "",
     }
+}
 
-    // ── Output style customization: inject before Output Format ──
-    if let Some(style) = output_style
-        && !style.prompt.is_empty()
-    {
-        prompt.push('\n');
-        prompt.push_str(&style.prompt);
-        prompt.push('\n');
-    }
-
-    // ── Output format guidance: always present ──
-    prompt.push_str(
-        "\n\
-         ## Output Format\n\
-         - **Respond in the user's language.** If they write Chinese, respond in Chinese.\n\
-         - **Code changes**: show the changed code with brief explanation. Don't dump entire files.\n\
-         - **Search results**: cite file:line, group by relevance. Quote the key lines, not every match.\n\
-         - **Build/test output**: report pass/fail. On failure, show the error message — not the full log.\n\
-         - **Explanations**: be direct. Lead with the answer, then give supporting details.\n\
-         - **Multiple findings**: use a structured list or table. Don't bury results in prose.\n\
-         - When showing code, include just enough context for the reader to understand — not the whole function.\n",
-    );
-
-    // ── Tool precedence guidance: always present ──
-    prompt.push_str(
-        "\n\
-         ## Tool Precedence (prefer earlier tools in each chain)\n\
-         - **Understand code**: symbols(calls=true) → call_graph → read_file\n\
-         - **Navigate code**: find_definition / find_references(kind=...) → grep\n\
-         - **Impact analysis**: call_graph(callers=true, scope='project') → find_references\n\
-         - **Rename/refactor**: rename_symbol(dry_run=true) → review → apply\n\
-         - **File search**: glob → grep (content) → log search (commits)\n\
-         - **Code edit**: read context → str_replace → run_build_test\n\
-         - **Git**: status → diff → log → show → blame; git_commit for changes\n\
-         - **Build/test**: run_build_test → fix errors → repeat\n\
-         - **GitHub**: list → detail → CI status\n",
-    );
-    if has_memory {
-        prompt
-            .push_str("         - **Memory**: check '## User Memories' → search → store/correct\n");
-    }
-
+/// Search strategy. Session-scoped — only when search tools are available.
+fn search_strategy_section(tool_names: &[&str]) -> &'static str {
+    let has_glob = tool_names.contains(&"glob");
+    let has_grep = tool_names.contains(&"grep");
+    let has_read_file = tool_names.contains(&"read_file");
     if has_glob || has_grep || has_read_file {
-        prompt.push_str(
-            "\n\
-         ## Search Strategy\n\
+        "\n## Search Strategy\n\
          - **Simple vs Complex**: For simple, directed searches (specific file/class/function), use glob/grep directly. \
 For broad codebase exploration that will clearly need >3 queries, consider delegating to an explore agent if available.\n\
          - Start narrow. Prefer likely roots first: src, crates, app, lib, packages, cmd, internal, tests.\n\
@@ -487,44 +429,56 @@ For broad codebase exploration that will clearly need >3 queries, consider deleg
          - Avoid broad repo-wide regex searches when a symbol, filename, extension, or directory hint is available.\n\
          - Skip generated or bulky trees unless the task explicitly targets them: build, dist, target, coverage, htmlcov, node_modules, vendor.\n\
          - After grep finds candidates, switch to targeted reads instead of repeating more broad searches.\n\
-         - If a grep is slow or noisy, tighten path, extension, or literal term — do NOT repeat the same broad search.\n",
-        );
+         - If a grep is slow or noisy, tighten path, extension, or literal term — do NOT repeat the same broad search.\n"
+    } else {
+        ""
     }
+}
 
-    // ── Error recovery: always present ──
-    prompt.push_str(
-        "\n\
-         ## Tool Error Recovery\n\
-         - If a tool returns an error, read the error message carefully.\n\
-         - Fix the arguments (wrong path, typo, missing param) and retry ONCE.\n\
-         - If it fails again, try an alternative tool or approach.\n\
-         - NEVER retry the same failing call more than twice.\n\
-         - If output is truncated (\"... truncated\"), work with what you have or narrow scope.\n\
-         - **Timeout** (>30s no output): try a different approach, don't keep waiting.\n\
-         - **Rate limited**: back off, don't retry the same API immediately.\n\
-         - **Permission denied**: try a different path or ask the user.\n\
-         - **Path not found**: STOP. Use glob or list_dir to discover the correct path. Do NOT retry with a slightly different guess.\n\
-         - **Network failure**: check connectivity if multiple tools fail. Report to user.\n\
-         - **Auth/credential error**: do NOT retry with same creds. Ask user to re-authenticate.\n\
-         - **DB connection error**: verify MATRIXONE_HOST/PORT config. Use `mo_query` with simple SELECT 1 to test.\n\
-         - **Empty results** (memory_search returns nothing): normal for new users — don't treat as error.\n\
-         - **Unknown tool**: check get_agent_info for available tools. Do NOT invent tool names.\n",
-    );
+// ── Public API ───────────────────────────────────────────────────────────
 
-    prompt
+/// Full system-prompt body when tools are available.
+pub fn build_main_system_prompt(
+    tool_names: &[&str],
+    profile_desc: &str,
+    selection_confidence: f64,
+    task_type: Option<&str>,
+) -> String {
+    build_main_system_prompt_with_style(
+        tool_names,
+        profile_desc,
+        selection_confidence,
+        task_type,
+        None,
+    )
+}
+
+/// Full system-prompt body with output style customization.
+/// Delegates to `build_system_prompt_sections_with_style` and flattens.
+pub fn build_main_system_prompt_with_style(
+    tool_names: &[&str],
+    profile_desc: &str,
+    selection_confidence: f64,
+    task_type: Option<&str>,
+    output_style: Option<&OutputStyle>,
+) -> String {
+    sections_to_string(&build_system_prompt_sections_with_style(
+        tool_names,
+        profile_desc,
+        selection_confidence,
+        task_type,
+        output_style,
+    ))
 }
 
 /// Build system prompt as structured sections with cache scope metadata.
 ///
-/// Returns sections annotated with [`CacheScope`] so callers can:
-/// - Apply provider-level `cache_control` (Anthropic ephemeral markers)
-/// - Improve in-process caching by separating stable from volatile parts
-/// - Track cache efficiency via section-level token counts
-///
-/// Section layout:
-///   1. **Global** – identity + core rules + output format + error recovery (~stable for weeks)
-///   2. **Session** – tool-conditional + task-type guidance (stable while tools/task unchanged)
-///   3. **None** – project profile, per-turn hints (changes every turn)
+/// Section layout (fine-grained for maximum cache reuse):
+///   1. **Global** – core rules, planning, coding discipline, parallel/efficiency,
+///      plan execution, output format, error recovery (~stable for weeks)
+///   2. **Session** – self-model (tool list), tool-conditional guidance, task-type
+///      strategy, search strategy (stable while tools/task unchanged)
+///   3. **None** – output style, project profile (changes every turn)
 pub fn build_system_prompt_sections(
     tool_names: &[&str],
     profile_desc: &str,
@@ -567,443 +521,50 @@ pub fn build_system_prompt_sections_with_style(
         ];
     }
 
-    // ── Section 1: Global (identity + core rules) ──
-    let global_section = format!(
-        "{SYSTEM_PROMPT_BASE}\n\n\
-         ## Self-Model\n\
-         Tools: {}\n\n\
-         ## Core Rules\n\
-         1. Think step-by-step, then act. For multi-step tasks, plan BEFORE your first tool call.\n\
-         2. NEVER fabricate data — always use tools for real-time info. Violations are worse than \"I don't know\".\n\
-         3. Do ONLY what the user asked. When done → STOP and report.\n\
-         4. Live data (CI, PRs, issues, stats, memory, git) → MUST call a tool. Never answer from training data.\n\
-         5. Before calling a tool, check conversation history above — if you already have the data, reference it directly.\n\
-         6. Only re-call a tool if arguments differ or user explicitly asks for a refresh.\n\
-         7. Tool outputs in history reflect state AT CALL TIME, not now. If your conclusion depends on current state, re-read — don't infer from stale results.\n\n\
-         ## Planning Protocol\n\
-         For tasks that need 3+ tool calls, plan in a <think> block FIRST:\n\
-         <think>\n\
-         Goal: [what the user wants]\n\
-         Plan: [numbered steps — what to read/check/change/verify]\n\
-         </think>\n\
-         After each tool result, reflect: <reflect>[what I learned] [adjust plan or proceed]</reflect>\n\
-         This keeps you on track and prevents exploration spirals.\n\n\
-         ## Context Strategy\n\
-         Before acting, identify WHAT context you need:\n\
-         1. **Plan context needs**: What files/functions/tests must I understand first?\n\
-         2. **Batch the fetch**: Call all needed reads/greps in ONE turn (parallel).\n\
-         3. **Check inventory**: If context was already fetched, use it — don't re-fetch.\n\
-         4. **Then act**: Only after understanding, make your changes.\n\
-         Example: To fix a bug in auth.rs, plan: \"Need auth.rs:50-100, the test file, and git blame on line 75\" → fetch all 3 → then edit.\n\n\
-         ## ⚠ Discovery Before Access\n\
-         NEVER guess file paths. Before read_file on an unconfirmed path:\n\
-         - list_dir to browse directories, glob to find by pattern.\n\
-         - Reuse paths already returned by previous tools.\n\
-         Guessing paths wastes turns. Discover first, then read.\n\n\
-         ## Coding Discipline\n\
-         - **Read before write**: understand existing patterns, naming conventions, and imports before editing.\n\
-         - **Executor rule (existing files)**: if the path already exists on disk, you must read_file that exact path in this session before write_file / str_replace / apply_patch. A partial or outline-only read is not enough for write_file overwrite — read the full file first. If the file changed on disk since your last read, read it again.\n\
-         - **Surgical edits**: change only what's needed. Don't rewrite unrelated code.\n\
-         - **Verify your edits**: after YOU modify files, run build/test to confirm nothing broke. Skip this for read-only tasks.\n\
-         - **Undo on failure**: if a change causes errors and you can't fix them, revert it.\n\
-         - **One concern per edit**: each str_replace should address one logical change.\n\
-         - **Imports and dependencies**: when adding new functionality, add required imports/deps.\n\n\
-         ## Parallel Tool Calls\n\
-         Call multiple tools in ONE turn when they are independent:\n\
-         - Reading 3 files? Call read_file 3× in parallel.\n\
-         - Need git_status AND git_diff? Call both.\n\
-         - Need glob AND grep with different patterns? Call both.\n\
-         Do NOT parallelize when one result determines the next call's arguments.\n\
-          **Limit**: Keep parallel tool calls to ≤5 per turn. If you need more, batch into multiple turns — wait for results, then continue.\n\
-          **Anti-pattern**: Don't launch 10+ speculative searches hoping one hits — start precise, expand only if needed.\n\n\
-         ## Token Efficiency\n\
-         - Prefer targeted reads (line ranges) over full-file reads.\n\
-         - Use glob to narrow candidates before grep.\n\
-         - Request only the data you need — avoid fetching entire files when a section suffices.\n\
-         - Summarize findings concisely. Show relevant code, not the whole file.\n\
-         - If you've already fetched something, reference it from history — don't re-fetch.\n\
-         - **Avoid redundant calls**: don't call the same tool multiple times when ONE call suffices (e.g., git_diff once covers all files).\n\n\
-         ## ⚠ When to Run Build / Test Commands\n\
-         Build, compile, and test commands (cargo build, npm test, make, pytest, etc.) are EXPENSIVE.\n\
-         - **Run them ONLY to verify YOUR changes** — after you edited or created files.\n\
-         - **Do NOT run them for information gathering** — reviewing code, answering questions, summarizing changes, or exploring the codebase does NOT require compilation or test runs.\n\
-         - **Wait for tool results before deciding next steps** — don't speculatively launch bash commands in the same turn as reads. Read first, then decide if bash is needed.\n\n\
-         ## Plan Execution\n\
-         When executing a subtask from a decomposed plan:\n\
-         - **Focus on the subtask**: implement ONLY what's described. Don't scope-creep.\n\
-         - **Respect files list**: if the subtask specifies files to modify, start by reading those.\n\
-         - **Meet acceptance criteria**: the subtask may include criteria — verify them before marking done.\n\
-         - **Build/test after changes**: run the project's build and test commands to confirm.\n\
-         - **Report clearly**: summarize what you changed and whether acceptance criteria passed.\n\
-         - **Don't skip ahead**: each subtask may depend on previous ones. Trust the ordering.\n",
-        tool_names.join(", "),
-    );
-
-    // ── Section 2: Session (tool-conditional + task-type) ──
     let has_memory = tool_names.iter().any(|n| n.starts_with("memory"));
-    let has_github = tool_names.iter().any(|n| n.starts_with("github"));
-    let has_git = tool_names.iter().any(|n| n.starts_with("git_"));
-    let has_glob = tool_names.contains(&"glob");
-    let has_grep = tool_names.contains(&"grep");
-    let has_read_file = tool_names.contains(&"read_file");
-    let has_code_nav =
-        tool_names.contains(&"find_definition") || tool_names.contains(&"find_references");
-    let has_call_graph = tool_names.contains(&"call_graph");
-    let has_multi_edit = tool_names.contains(&"multi_edit");
-    let has_build_test = tool_names.contains(&"run_build_test");
-    let has_git_mutations = tool_names.contains(&"git_commit");
 
-    let mut session_section = String::new();
+    // ── Global sections (stable across sessions) ──
+    let mut sections = vec![
+        PromptSection { text: core_rules_section(), scope: CacheScope::Global },
+        PromptSection { text: planning_section().to_string(), scope: CacheScope::Global },
+        PromptSection { text: coding_discipline_section().to_string(), scope: CacheScope::Global },
+        PromptSection { text: parallel_and_efficiency_section().to_string(), scope: CacheScope::Global },
+        PromptSection { text: plan_execution_section().to_string(), scope: CacheScope::Global },
+        PromptSection { text: output_format_section(has_memory), scope: CacheScope::Global },
+        PromptSection { text: tool_error_recovery_section().to_string(), scope: CacheScope::Global },
+    ];
 
-    if has_git || has_github {
-        session_section.push_str(
-            "7. Git/GitHub: use git_status, git_diff (stat_only:true ≈ `git diff --stat`), git_show, git_log, github_* — NOT bash for `git status`/`git diff`/`git log` when those tools apply.\n",
-        );
-    }
-    if has_github {
-        session_section.push_str(
-            "8. For GitHub data: use github_list_prs / github_list_issues / github_repo_stats directly.\n",
-        );
-    }
-    if has_code_nav {
-        session_section.push_str(
-            "\n\
-             ## Code Navigation\n\
-             - **find_definition**: Where a symbol is defined. tree-sitter AST — more accurate than grep.\n\
-             - **find_references**: All usages of a symbol. Use `kind` (definition/import/call/usage) to filter.\n\
-             - **symbols**: File outline. Use `calls=true` to see what each function calls inline.\n\
-             Use these BEFORE grep for code symbols. They understand syntax, grep doesn't.\n",
-        );
-    }
-    if has_call_graph {
-        session_section.push_str(
-            "- **call_graph**: Call relationships. `callers=true` finds who calls a function. `scope='project'` searches cross-file.\n",
-        );
-    }
-    if tool_names.contains(&"rename_symbol") {
-        session_section.push_str(
-            "- **rename_symbol**: Rename across project. AST-validated, skips comments/strings. dry_run=true previews.\n",
-        );
-    }
-    if tool_names.contains(&"dead_code") {
-        session_section.push_str("- **dead_code**: Find unused symbols before cleanup.\n");
-    }
-    if tool_names.contains(&"extract_members") {
-        session_section.push_str(
-            "- **extract_members**: Struct/class/enum fields+methods. Point at any line inside.\n",
-        );
-    }
-    if tool_names.contains(&"type_hierarchy") {
-        session_section
-            .push_str("- **type_hierarchy**: Who implements trait / what traits a type has.\n");
-    }
-    if has_multi_edit {
-        session_section.push_str(
-            "\n\
-             ## Editing Strategy\n\
-             - Use **multi_edit** for multiple related changes to one file — it's atomic (all-or-nothing) and more token-efficient than sequential str_replace.\n\
-             - Use **str_replace(dry_run=true)** to preview changes before applying. Great for complex edits where you want to verify first.\n\
-             - Use **delete_file** to remove files (safe: refuses .git/, directories, paths outside project root).\n\
-             - For risky refactors: dry_run first → review diff → apply if correct.\n",
-        );
-    }
-    if has_build_test {
-        session_section.push_str(
-            "\n\
-             ## Build & Test Loop\n\
-             - Use **run_build_test** instead of bash for build/test commands. It returns structured errors WITH source context.\n\
-             - Each error shows: 🔧 Trivial (mechanical fix), 🔨 Fixable (needs reasoning), or Complex.\n\
-             - Errors include 💡 hints — follow them for quick resolution.\n\
-             - Each error location includes surrounding code — fix directly with str_replace, no extra read_file needed.\n\
-             - ⚡ Cascading errors: when the tool says \"fix root cause FIRST\", do that — downstream errors often resolve automatically.\n\
-             - If >3 errors in the same file, fix the FIRST one — later errors are often cascading.\n\
-             - Set **auto_fix: true** for trivial fixes (unused imports/vars). The tool auto-applies high-confidence fixes and re-runs (max 3 iterations).\n\
-             - Auto-fix aborts on regression (more errors after fix) and reverts the offending changes automatically.\n\
-             - Set **report_only: true** to preview what auto-fix would do without applying — useful for checking before committing.\n\
-             - After fixing, call run_build_test again with the SAME command. The tool tracks iterations:\n\
-             - It shows ✅ Fixed, 🆕 New, ⏳ Persistent errors — use this to gauge your fix progress.\n\
-             - If you see ⚠ REGRESSION (more errors after your fix), revert the change and try a different approach.\n\
-             - Repeat until clean. Aim to fix ALL errors, not just the first one.\n",
-        );
-    }
-    if has_git_mutations {
-        session_section.push_str(
-            "\n\
-             ## Git Workflow\n\
-             - Use **git_commit** to commit changes (stages automatically). Write clear, concise commit messages.\n\
-             - Use **git_stash** push/pop to save and restore work-in-progress.\n\
-             - Use **git_checkout_file** to revert a file to its last committed state if an edit goes wrong.\n\
-             - Commit after each logical milestone — don't accumulate too many uncommitted changes.\n",
-        );
-    }
-    if has_memory {
-        session_section.push_str(
-            "\n\
-             ## Memory Rules (check BEFORE reasoning about tools)\n\
-             ### Triggers: 关注|跟踪|留意|记住|感兴趣|follow|watch|track|interested|prefer|remember\n\
-             When user expresses tracking, interest, or preference → call memory_store IMMEDIATELY.\n\
-             Format: \"[@ns/status] content\" (ns: pref, fact, knowledge, task, plan, insight)\n\
-             Example: \"我关注matrixorigin\" → store \"[@pref/active] user follows matrixorigin\"\n\
-             - Do NOT ask whether to store — just store, then confirm.\n\
-             - Do NOT explore codebase for interest expressions.\n\
-             - '## User Memories' (when present) = user context — check it BEFORE calling any tool.\n\
-             - If User Memories has a repo mapping, USE that exact repo.\n\
-             ### What to STORE: preferences, conventions, decisions, tracking interests.\n\
-             ### What to SKIP: ephemeral tool outputs, raw file contents, duplicates.\n\
-             ### Deduplication: before storing, consider if similar memory already exists. Use memory_correct to update instead of creating duplicates.\n\
-             ### Negative preferences: \"不喜欢\", \"别用\", \"don't want\", \"stop using\" → store as [@pref/negative]. Respect in future tool/approach selection.\n\
-             ### Staleness: if a stored memory seems outdated (e.g., old repo URL, changed preference), correct it with memory_correct rather than storing a new one.\n",
-        );
-    }
-    if selection_confidence < LOW_CONFIDENCE_THRESHOLD {
-        session_section.push_str(
-            "\n\
-             ## ⚠ Low-Confidence Tool Selection\n\
-             Tool selection confidence is LOW. If available tools seem insufficient, ASK the user to clarify.\n\
-             Do NOT guess with bash/find/read_file when a more specific tool would be needed.\n",
-        );
+    // ── Session sections (stable within a session) ──
+    sections.push(PromptSection {
+        text: self_model_section(tool_names),
+        scope: CacheScope::Session,
+    });
+
+    let tool_cond = tool_conditional_section(tool_names, selection_confidence);
+    if !tool_cond.is_empty() {
+        sections.push(PromptSection { text: tool_cond, scope: CacheScope::Session });
     }
 
-    // Task-type specific rules
-    match task_type {
-        Some("code_review") => {
-            session_section.push_str(
-                "\n\
-              ## Code Review Strategy\n\
-              ### CRITICAL: Evidence BEFORE conclusions\n\
-              You MUST gather evidence first, then form conclusions. NEVER write a summary or verdict \
-              before you have examined the diff. Do NOT output review text in the same turn as your \
-              first tool call — wait for tool results.\n\
-              \n\
-              ### Process\n\
-              1. **Get the diff**: call git_status + git_diff in ONE parallel turn. \
-              ONLY use git_diff with `path` if the output shows \"[truncated]\". \
-              The first git_diff returns the COMPLETE diff — do NOT re-fetch the same content with path filters.\n\
-              2. **Identify scope**: from the diff, list changed files and categorize (logic, test, config, formatting).\n\
-              3. **Read targeted context**: for files with non-trivial logic changes, call read_file with \
-              start_line/end_line for ~30 lines around the change, or outline=true for large files. \
-              NEVER read_file on a whole large file — if it fails with 'too large', retry with line ranges or outline=true.\n\
-              4. **Evaluate**: correctness → security → edge cases → performance → test coverage. Skip pure style nits.\n\
-              5. **If a read_file fails**: degrade your conclusion for that file. Say \"could not verify\" — do NOT claim it is fine.\n\
-              \n\
-              ### Output Format\n\
-              Summary:\n\
-              - 1–3 bullets: what the change does and overall risk level.\n\
-              \n\
-              Findings:\n\
-              - 0–5 findings, only material issues. Each: file:line, what's wrong, suggested fix.\n\
-              - If no material issues, say \"None\".\n\
-              - Group by severity: 🔴 must-fix, 🟡 should-fix, 💡 suggestion.\n\
-              \n\
-              Verification:\n\
-              - State what you checked (files read, diff shape, risk areas inspected).\n\
-              - If any file could not be read, say so explicitly.\n\
-              \n\
-              Verdict:\n\
-              - LGTM or Needs changes, with one sentence.\n\
-              - NEVER say LGTM if you had read_file errors on logic-changed files.\n\
-              \n\
-              ### Anti-patterns (NEVER do these)\n\
-              - Do NOT write a review summary in the same response where you call git_diff.\n\
-              - Do NOT say \"tests look good\" without reading at least one test file.\n\
-              - Do NOT output `<reflect>`, `<think>`, or other XML-like tags in your final response.\n\
-              - Do NOT claim full confidence when evidence is incomplete.\n",
-            );
-        }
-        Some("debugging") => {
-            session_section.push_str(
-                "\n\
-             ## Debugging Strategy\n\
-             1. Start with the error message / stack trace — read it carefully before exploring.\n\
-             2. Form a hypothesis about the root cause.\n\
-             3. Verify with ONE targeted tool call (read the suspected file/function).\n\
-             4. If hypothesis is wrong, form a new one — don't shotgun search.\n\
-             5. Check recent git changes near the error site (git_log, git_blame).\n\
-             6. If a command fails, do NOT retry the exact same command — vary the approach.\n\
-             7. Once found: explain the root cause, show the fix, verify it compiles/passes.\n",
-            );
-        }
-        Some("exploration") => {
-            session_section.push_str(
-                "\n\
-             ## Exploration Strategy\n\
-             1. Start broad: list_dir for project structure, then identify entry points.\n\
-             2. Narrow: grep for key terms, glob for file patterns.\n\
-             3. Build a mental map: entry points → core modules → dependencies → patterns.\n\
-             4. Read files with targeted ranges, not full files — scan structure first.\n\
-             5. Summarize architecture with concrete file paths and relationships.\n\
-             6. Note patterns: error handling style, naming conventions, test structure.\n",
-            );
-        }
-        Some("implementation") => {
-            session_section.push_str(
-                "\n\
-              ## Implementation Strategy\n\
-              1. **Understand structure**: symbols(calls=true) for file overview + call flow in one shot.\n\
-              2. **Find location**: find_definition → glob → grep → read sections.\n\
-              3. **Check impact**: find_references(kind='call') to see callers. call_graph(callers=true, scope='project') for thorough impact.\n\
-              4. **Implement surgically**: minimal changes, follow style. str_replace auto-formats.\n\
-              5. **Wire it up**: add imports, register modules, update exports.\n\
-              6. **Verify**: run_build_test, fix from structured output, repeat.\n\
-              7. **Commit**: git_commit with a clear message.\n",
-            );
-        }
-        Some("refactoring") => {
-            session_section.push_str(
-                "\n\
-             ## Refactoring Strategy\n\
-             1. Run tests BEFORE refactoring to establish a passing baseline.\n\
-             2. Use call_graph(callers=true, scope='project') to find all callers before changing a signature.\n\
-             3. For renames: rename_symbol(dry_run=true) to preview, then dry_run=false to apply.\n\
-             4. Make one logical change at a time — verify after each.\n\
-             5. Preserve external behavior; focus on clarity and maintainability.\n\
-             6. Run tests AFTER to confirm nothing regressed.\n",
-            );
-        }
-        Some("testing") => {
-            session_section.push_str(
-                "\n\
-             ## Testing Strategy\n\
-             1. Read the module under test to understand its behavior and edge cases.\n\
-             2. Follow existing test patterns: naming, setup/teardown, assertion style.\n\
-             3. Cover: happy path → edge cases → error conditions → boundary values.\n\
-             4. Each test verifies ONE behavior with a clear, descriptive name.\n\
-             5. Run the new tests to confirm they pass — fix failures before reporting.\n",
-            );
-        }
-        Some("documentation") => {
-            session_section.push_str(
-                "\n\
-             ## Documentation Strategy\n\
-             - Read the code first — document actual behavior, not assumptions.\n\
-             - Include: purpose, usage examples, parameters, return values, error conditions.\n\
-             - Keep docs close to the code they describe.\n\
-             - Use the project's existing documentation style and format.\n",
-            );
-        }
-        Some("performance") => {
-            session_section.push_str(
-                "\n\
-             ## Performance Strategy\n\
-             1. Measure first — don't guess. Profile to locate the actual bottleneck.\n\
-             2. Optimize the hottest path only; avoid premature optimization elsewhere.\n\
-             3. Check: algorithm complexity, allocation patterns, I/O blocking, cache misses.\n\
-             4. Verify improvement with before/after measurements.\n\
-             5. Ensure optimization doesn't break correctness — run tests after.\n",
-            );
-        }
-        Some("analysis") => {
-            session_section.push_str(
-                "\n\
-             ## Analysis Strategy\n\
-             1. Gather data from multiple sources: code, git history, logs, docs.\n\
-             2. Form hypotheses, then verify — don't jump to conclusions from a single signal.\n\
-             3. Use git_blame + git_file_history for ownership/evolution questions.\n\
-             4. Summarize findings with concrete evidence (file paths, line numbers, commit SHAs).\n\
-             5. Present: root cause → impact → recommendation.\n",
-            );
-        }
-        Some("deployment") => {
-            session_section.push_str(
-                "\n\
-             ## Deployment Strategy\n\
-             1. Check CI status FIRST — don't deploy if builds are failing.\n\
-             2. Review pending changes: git_status → git_diff → CI status.\n\
-             3. Verify config files (env vars, secrets) are correct for target environment.\n\
-             4. Prefer incremental rollout over big-bang deployments.\n",
-            );
-        }
-        _ => {}
+    let tt = task_type_section(task_type);
+    if !tt.is_empty() {
+        sections.push(PromptSection { text: tt.to_string(), scope: CacheScope::Session });
     }
 
-    // ── Output style customization: inject before Output Format ──
+    let ss = search_strategy_section(tool_names);
+    if !ss.is_empty() {
+        sections.push(PromptSection { text: ss.to_string(), scope: CacheScope::Session });
+    }
+
+    // ── Dynamic sections (change every turn) ──
     if let Some(style) = output_style
         && !style.prompt.is_empty()
     {
-        session_section.push('\n');
-        session_section.push_str(&style.prompt);
-        session_section.push('\n');
-    }
-
-    // Always-present sections (in session scope since they depend on tool presence)
-    session_section.push_str(
-        "\n\
-         ## Output Format\n\
-         - **Respond in the user's language.** If they write Chinese, respond in Chinese.\n\
-         - **Code changes**: show the changed code with brief explanation. Don't dump entire files.\n\
-         - **Search results**: cite file:line, group by relevance. Quote the key lines, not every match.\n\
-         - **Build/test output**: report pass/fail. On failure, show the error message — not the full log.\n\
-         - **Explanations**: be direct. Lead with the answer, then give supporting details.\n\
-         - **Multiple findings**: use a structured list or table. Don't bury results in prose.\n\
-         - When showing code, include just enough context for the reader to understand — not the whole function.\n",
-    );
-
-    session_section.push_str(
-        "\n\
-         ## Tool Precedence (prefer earlier tools in each chain)\n\
-         - **Understand code**: symbols(calls=true) → call_graph → read_file\n\
-         - **Navigate code**: find_definition / find_references(kind=...) → grep\n\
-         - **Impact analysis**: call_graph(callers=true, scope='project') → find_references\n\
-         - **Rename/refactor**: rename_symbol(dry_run=true) → review → apply\n\
-         - **File search**: glob → grep (content) → log search (commits)\n\
-         - **Code edit**: read context → str_replace → run_build_test\n\
-         - **Git**: status → diff → log → show → blame; git_commit for changes\n\
-         - **Build/test**: run_build_test → fix errors → repeat\n\
-         - **GitHub**: list → detail → CI status\n",
-    );
-    if has_memory {
-        session_section
-            .push_str("         - **Memory**: check '## User Memories' → search → store/correct\n");
-    }
-
-    if has_glob || has_grep || has_read_file {
-        session_section.push_str(
-            "\n\
-             ## Search Strategy\n\
-             - **Simple vs Complex**: For simple, directed searches (specific file/class/function), use glob/grep directly. \
-For broad codebase exploration that will clearly need >3 queries, consider delegating to an explore agent if available.\n\
-             - Start narrow. Prefer likely roots first: src, crates, app, lib, packages, cmd, internal, tests.\n\
-             - Use glob first to narrow filenames/dirs, then grep only that subset for content.\n\
-             - For code review, search within changed files or adjacent modules before scanning the whole repo.\n\
-             - Avoid broad repo-wide regex searches when a symbol, filename, extension, or directory hint is available.\n\
-             - Skip generated or bulky trees unless the task explicitly targets them: build, dist, target, coverage, htmlcov, node_modules, vendor.\n\
-             - After grep finds candidates, switch to targeted reads instead of repeating more broad searches.\n\
-             - If a grep is slow or noisy, tighten path, extension, or literal term — do NOT repeat the same broad search.\n",
-        );
-    }
-
-    session_section.push_str(
-        "\n\
-         ## Tool Error Recovery\n\
-         - If a tool returns an error, read the error message carefully.\n\
-         - Fix the arguments (wrong path, typo, missing param) and retry ONCE.\n\
-         - If it fails again, try an alternative tool or approach.\n\
-         - NEVER retry the same failing call more than twice.\n\
-         - If output is truncated (\"... truncated\"), work with what you have or narrow scope.\n\
-         - **Timeout** (>30s no output): try a different approach, don't keep waiting.\n\
-         - **Rate limited**: back off, don't retry the same API immediately.\n\
-         - **Permission denied**: try a different path or ask the user.\n\
-         - **Path not found**: STOP. Use glob or list_dir to discover the correct path. Do NOT retry with a slightly different guess.\n\
-         - **Network failure**: check connectivity if multiple tools fail. Report to user.\n\
-         - **Auth/credential error**: do NOT retry with same creds. Ask user to re-authenticate.\n\
-         - **DB connection error**: verify MATRIXONE_HOST/PORT config. Use `mo_query` with simple SELECT 1 to test.\n\
-         - **Empty results** (memory_search returns nothing): normal for new users — don't treat as error.\n\
-         - **Unknown tool**: check get_agent_info for available tools. Do NOT invent tool names.\n",
-    );
-
-    let mut sections = vec![PromptSection {
-        text: global_section,
-        scope: CacheScope::Global,
-    }];
-
-    if !session_section.is_empty() {
         sections.push(PromptSection {
-            text: session_section,
-            scope: CacheScope::Session,
+            text: format!("\n{}\n", style.prompt),
+            scope: CacheScope::None,
         });
     }
 
-    // Profile/per-turn section
     if !profile_desc.is_empty() {
         sections.push(PromptSection {
             text: profile_desc.to_string(),
@@ -1913,17 +1474,14 @@ mod tests {
         let tools = vec!["bash", "read_file", "glob", "grep"];
         let sections = build_system_prompt_sections(&tools, "cwd: /tmp", 0.8, None);
 
-        assert!(sections.len() >= 2, "should have at least Global + Session");
-        assert_eq!(
-            sections[0].scope,
-            CacheScope::Global,
-            "first section should be Global"
-        );
-        assert_eq!(
-            sections[1].scope,
-            CacheScope::Session,
-            "second section should be Session"
-        );
+        // Should have multiple Global sections, then Session, then None
+        let globals: Vec<_> = sections.iter().filter(|s| s.scope == CacheScope::Global).collect();
+        let sessions: Vec<_> = sections.iter().filter(|s| s.scope == CacheScope::Session).collect();
+        assert!(globals.len() >= 5, "should have multiple Global sections, got {}", globals.len());
+        assert!(!sessions.is_empty(), "should have Session sections");
+
+        // First section should be Global
+        assert_eq!(sections[0].scope, CacheScope::Global, "first section should be Global");
 
         // Profile section should be CacheScope::None
         let profile = sections.iter().find(|s| s.scope == CacheScope::None);
@@ -1942,21 +1500,25 @@ mod tests {
         let tools = vec!["bash"];
         let sections = build_system_prompt_sections(&tools, "", 0.8, None);
 
-        let global = &sections[0];
+        // Core rules are in the first Global section
+        let global_text: String = sections.iter()
+            .filter(|s| s.scope == CacheScope::Global)
+            .map(|s| s.text.as_str())
+            .collect();
         assert!(
-            global.text.contains(SYSTEM_PROMPT_BASE),
+            global_text.contains(SYSTEM_PROMPT_BASE),
             "should contain base identity"
         );
         assert!(
-            global.text.contains("Core Rules"),
+            global_text.contains("Core Rules"),
             "should contain core rules"
         );
         assert!(
-            global.text.contains("Planning Protocol"),
+            global_text.contains("Planning Protocol"),
             "should contain planning"
         );
         assert!(
-            global.text.contains("Context Strategy"),
+            global_text.contains("Context Strategy"),
             "should contain context strategy"
         );
     }
@@ -1966,18 +1528,17 @@ mod tests {
         let tools = vec!["bash", "find_definition", "find_references", "git_commit"];
         let sections = build_system_prompt_sections(&tools, "", 0.8, Some("debugging"));
 
-        let session = &sections[1];
+        let session_text: String = sections.iter()
+            .filter(|s| s.scope == CacheScope::Session)
+            .map(|s| s.text.as_str())
+            .collect();
         assert!(
-            session.text.contains("Code Navigation"),
+            session_text.contains("Code Navigation"),
             "session should include code nav guidance"
         );
         assert!(
-            session.text.contains("Debugging Strategy"),
+            session_text.contains("Debugging Strategy"),
             "session should include task-type strategy"
-        );
-        assert!(
-            session.text.contains("Tool Precedence"),
-            "session should include tool precedence"
         );
     }
 
@@ -2048,9 +1609,12 @@ mod tests {
         let tools = vec!["bash"];
         let sections = build_system_prompt_sections(&tools, "", 0.1, None);
 
-        let session = &sections[1];
+        let session_text: String = sections.iter()
+            .filter(|s| s.scope == CacheScope::Session)
+            .map(|s| s.text.as_str())
+            .collect();
         assert!(
-            session.text.contains("Low-Confidence Tool Selection"),
+            session_text.contains("Low-Confidence Tool Selection"),
             "low confidence advisory should be in session section"
         );
     }
@@ -2215,13 +1779,16 @@ mod tests {
             "type_hierarchy",
         ];
         let sections = build_system_prompt_sections(&tools, "", 0.8, None);
-        let session = &sections[1];
-        assert!(session.text.contains("Code Navigation"));
-        assert!(session.text.contains("call_graph"));
-        assert!(session.text.contains("rename_symbol"));
-        assert!(session.text.contains("dead_code"));
-        assert!(session.text.contains("extract_members"));
-        assert!(session.text.contains("type_hierarchy"));
+        let session_text: String = sections.iter()
+            .filter(|s| s.scope == CacheScope::Session)
+            .map(|s| s.text.as_str())
+            .collect();
+        assert!(session_text.contains("Code Navigation"));
+        assert!(session_text.contains("call_graph"));
+        assert!(session_text.contains("rename_symbol"));
+        assert!(session_text.contains("dead_code"));
+        assert!(session_text.contains("extract_members"));
+        assert!(session_text.contains("type_hierarchy"));
     }
 
     // ── Empty-tools + empty-profile section behavior ─────────────
@@ -2288,14 +1855,17 @@ mod tests {
 
         let sections =
             build_system_prompt_sections_with_style(&["bash"], "", 0.5, None, Some(&style));
-        let session = &sections[1];
+        let all_text: String = sections.iter().map(|s| s.text.as_str()).collect();
         assert!(
-            session.text.contains("# Output Style: Concise"),
-            "session section should include output style"
+            all_text.contains("# Output Style: Concise"),
+            "should include output style"
         );
         assert!(
-            session.text.contains("Minimize output"),
-            "session section should include style content"
+            all_text.contains("Minimize output"),
+            "should include style content"
         );
+        // Output style should be in None scope (dynamic)
+        let style_section = sections.iter().find(|s| s.text.contains("Output Style: Concise"));
+        assert_eq!(style_section.unwrap().scope, CacheScope::None, "output style should be None-scoped");
     }
 }
