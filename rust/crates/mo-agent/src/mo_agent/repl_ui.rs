@@ -48,6 +48,7 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
         "Interactive session inspector (messages, tools, injections)",
     ),
     ("/stats", "Session analytics: turns, tokens, errors"),
+    ("/cost", "Per-session API cost estimate"),
     ("/tools", "Tool performance: calls, timing, success rate"),
     ("/health", "Tool health dashboard"),
     ("/learn", "Learning insights: patterns, drift, exploration"),
@@ -189,6 +190,13 @@ const SLASH_FIRST_TOKEN_COMPLETIONS: &[(&str, &[(&str, &str)])] = &[
     (
         "/stats",
         &[("history", "Aggregate stats across recent sessions")],
+    ),
+    (
+        "/cost",
+        &[
+            ("detail", "Per-turn cost breakdown"),
+            ("history", "Cost across recent sessions"),
+        ],
     ),
     ("/health", &[("detail", "Per-tool health breakdown")]),
     (
@@ -575,6 +583,7 @@ fn slash_argument_hint(command: &str) -> Option<&'static str> {
         "/task" => Some("[list|add <title>|done <id>|status <id>]"),
         "/resume" => Some("[session_id]"),
         "/stats" => Some("[history]"),
+        "/cost" => Some("[detail|history]"),
         "/health" => Some("[detail]"),
         "/sync" => Some("[log|push|pull]"),
         _ => None,
@@ -1085,7 +1094,7 @@ pub(super) fn print_slash_commands(query: Option<&str>) {
             "🔭",
             "Observability",
             &[
-                "/explain", "/turn", "/debug", "/stats", "/tools", "/health", "/sync",
+                "/explain", "/turn", "/debug", "/stats", "/cost", "/tools", "/health", "/sync",
             ],
         ),
         (
@@ -2195,7 +2204,7 @@ mod tests {
         let groups: &[&[&str]] = &[
             &["/help", "/model", "/clear", "/history", "/copy", "/exit"],
             &[
-                "/explain", "/turn", "/debug", "/stats", "/tools", "/health", "/sync",
+                "/explain", "/turn", "/debug", "/stats", "/cost", "/tools", "/health", "/sync",
             ],
             &[
                 "/session",

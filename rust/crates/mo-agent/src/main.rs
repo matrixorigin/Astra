@@ -505,6 +505,8 @@ struct ReplState {
     history: Vec<(String, String)>, // (user_msg, assistant_msg)
     total_prompt_tokens: u64,
     total_completion_tokens: u64,
+    /// Cached pricing data for the active model (used by /cost).
+    cached_pricing: astra_services::models::PricingData,
     skill_dev_name: Option<String>,
     skill_dev_dir: Option<String>,
     skill_dev_context: Option<String>,
@@ -612,6 +614,7 @@ impl Default for ReplState {
             history: Vec::new(),
             total_prompt_tokens: 0,
             total_completion_tokens: 0,
+            cached_pricing: Default::default(),
             skill_dev_name: None,
             skill_dev_dir: None,
             skill_dev_context: None,
@@ -1360,6 +1363,274 @@ fn handle_stats_command(arg: &str, state: &ReplState) {
             eprintln!();
         }
     }
+}
+
+// ═══════════════════════════════════════════════ Cost Tracking ═════════════
+
+/// Per-turn cost record for granular cost breakdown.
+#[derive(Clone, Debug)]
+struct TurnCostEntry {
+    turn: u32,
+    prompt_tokens: u64,
+    completion_tokens: u64,
+    model: String,
+}
+
+/// Handle the `/cost` slash command — display per-session API cost estimates.
+///
+/// Subcommands:
+///   /cost           — current session summary
+///   /cost detail    — per-turn breakdown
+///   /cost history   — across recent sessions
+fn handle_cost_command(arg: &str, state: &ReplState) {
+    use astra_services::session_analytics;
+
+    match arg {
+        "detail" | "breakdown" => {
+            // Per-turn breakdown from journal
+            let sid = match &state.session_id {
+                Some(s) => s.clone(),
+                None => {
+                    eprintln!("{}", "  No active session.".dim());
+                    return;
+                }
+            };
+            let events = session_journal::read_journal(&sid).unwrap_or_default();
+            let pricing = &state.cached_pricing;
+
+            eprintln!(
+                "\n{}",
+                "─── Per-Turn Cost Breakdown ─────────────────────".bold()
+            );
+            if let Some(ref m) = state.model {
+                eprintln!("  {:<14} {}", "model:".dim(), m.as_str().cyan());
+            }
+            eprintln!(
+                "  {:<14} ${:.4}/1k prompt, ${:.4}/1k completion",
+                "rates:".dim(),
+                pricing.prompt,
+                pricing.completion
+            );
+            eprintln!();
+
+            let mut total_in = 0u64;
+            let mut total_out = 0u64;
+            let mut total_cost = 0.0f64;
+            let mut turn_num = 0u32;
+
+            for ev in &events {
+                if ev.event_type == session_journal::JournalEventType::Turn {
+                    turn_num += 1;
+                    let p_tok = ev.tokens_in.unwrap_or(0);
+                    let c_tok = ev.tokens_out.unwrap_or(0);
+                    let cost = cost_for_tokens(p_tok, c_tok, pricing);
+                    total_in += p_tok;
+                    total_out += c_tok;
+                    total_cost += cost;
+
+                    eprintln!(
+                        "  Turn {:>3}  {:>6}+{:<6} tok  ${:.4}",
+                        turn_num, p_tok, c_tok, cost
+                    );
+                }
+            }
+
+            eprintln!(
+                "\n  {}",
+                "─────────────────────────────────────────────────".dim()
+            );
+            eprintln!(
+                "  {:<14} {}+{} tok  {}",
+                "total:".bold(),
+                total_in,
+                total_out,
+                format_cost(total_cost).bold(),
+            );
+            eprintln!();
+        }
+
+        "history" => {
+            // Across recent sessions
+            let sessions = match session_journal::list_sessions() {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!(
+                        "{}",
+                        format!("  ⚠ Could not read session history: {e}").yellow()
+                    );
+                    return;
+                }
+            };
+            if sessions.is_empty() {
+                eprintln!("{}", "  No sessions found.".dim());
+                return;
+            }
+
+            let pricing = &state.cached_pricing;
+
+            eprintln!(
+                "\n{}",
+                "─── Session Cost History ────────────────────────".bold()
+            );
+            eprintln!(
+                "  {:<14} ${:.4}/1k prompt, ${:.4}/1k completion",
+                "rates:".dim(),
+                pricing.prompt,
+                pricing.completion
+            );
+            eprintln!();
+
+            let recent: Vec<_> = sessions.into_iter().take(10).collect();
+            let mut grand_total = 0.0f64;
+
+            for sid in &recent {
+                if let Ok(events) = session_journal::read_journal(sid) {
+                    let stats = session_analytics::compute_session_stats(sid, &events);
+                    let cost = cost_for_tokens(
+                        stats.total_tokens_in,
+                        stats.total_tokens_out,
+                        pricing,
+                    );
+                    grand_total += cost;
+
+                    let short = &sid[..8.min(sid.len())];
+                    let model = stats.model.as_deref().unwrap_or("?");
+                    eprintln!(
+                        "  {} {:>3} turns  {:>6}+{:<6} tok  {}  {}",
+                        short.cyan(),
+                        stats.turn_count,
+                        stats.total_tokens_in,
+                        stats.total_tokens_out,
+                        format_cost(cost),
+                        model.dim(),
+                    );
+                }
+            }
+
+            eprintln!(
+                "\n  {} across {} sessions",
+                format_cost(grand_total).bold(),
+                recent.len(),
+            );
+            eprintln!();
+        }
+
+        _ => {
+            // Current session summary
+            let pricing = &state.cached_pricing;
+            let cost = cost_for_tokens(
+                state.total_prompt_tokens,
+                state.total_completion_tokens,
+                pricing,
+            );
+
+            eprintln!(
+                "\n{}",
+                "─── Session Cost ────────────────────────────────".bold()
+            );
+            if let Some(ref sid) = state.session_id {
+                eprintln!(
+                    "  {:<14} {}",
+                    "session:".dim(),
+                    sid[..8.min(sid.len())].cyan()
+                );
+            }
+            if let Some(ref m) = state.model {
+                eprintln!("  {:<14} {}", "model:".dim(), m.as_str().cyan());
+            }
+            eprintln!(
+                "  {:<14} ${:.4}/1k prompt, ${:.4}/1k completion",
+                "rates:".dim(),
+                pricing.prompt,
+                pricing.completion
+            );
+            eprintln!();
+            eprintln!(
+                "  {:<14} {} ({})",
+                "prompt:".dim(),
+                state.total_prompt_tokens,
+                format_cost(state.total_prompt_tokens as f64 * pricing.prompt / 1000.0),
+            );
+            eprintln!(
+                "  {:<14} {} ({})",
+                "completion:".dim(),
+                state.total_completion_tokens,
+                format_cost(state.total_completion_tokens as f64 * pricing.completion / 1000.0),
+            );
+            eprintln!("  {:<14} {}", "total:".bold(), format_cost(cost).bold());
+            if state.turn > 0 {
+                eprintln!(
+                    "  {:<14} {} per turn",
+                    "avg:".dim(),
+                    format_cost(cost / state.turn as f64)
+                );
+            }
+            eprintln!(
+                "\n  {}",
+                "Use /cost detail for per-turn breakdown, /cost history for past sessions.".dim()
+            );
+            eprintln!();
+        }
+    }
+}
+
+/// Calculate cost in dollars for given token counts.
+fn cost_for_tokens(
+    prompt_tokens: u64,
+    completion_tokens: u64,
+    pricing: &astra_services::models::PricingData,
+) -> f64 {
+    (prompt_tokens as f64 * pricing.prompt / 1000.0)
+        + (completion_tokens as f64 * pricing.completion / 1000.0)
+}
+
+/// Format a dollar cost for display.
+fn format_cost(cost: f64) -> String {
+    if cost < 0.01 {
+        format!("${:.4}", cost)
+    } else if cost < 1.0 {
+        format!("${:.3}", cost)
+    } else {
+        format!("${:.2}", cost)
+    }
+}
+
+/// Extract pricing data for a model from the API models list.
+fn extract_pricing_for_model(
+    models: &[serde_json::Value],
+    model_name: &str,
+) -> Option<astra_services::models::PricingData> {
+    for m in models {
+        let name = m
+            .get("name")
+            .or_else(|| m.get("model_name"))
+            .and_then(|v| v.as_str())?;
+        if name != model_name {
+            continue;
+        }
+        if let Some(pricing) = m.get("pricing") {
+            return serde_json::from_value(pricing.clone()).ok();
+        }
+        // Fallback: top-level pricing_prompt / pricing_completion fields
+        let prompt = m
+            .get("pricing_prompt")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0);
+        let completion = m
+            .get("pricing_completion")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0);
+        if prompt > 0.0 || completion > 0.0 {
+            return Some(astra_services::models::PricingData {
+                prompt,
+                completion,
+                cache_read: None,
+                cache_write: None,
+            });
+        }
+        return None;
+    }
+    None
 }
 
 // ═══════════════════════════════════════════════ Tool Profile ═════════════
@@ -3713,6 +3984,10 @@ async fn handle_slash_command(
                     state.model.as_deref(),
                 ) {
                     state.model = Some(chosen.clone());
+                    // Cache pricing for /cost command
+                    if let Some(pricing) = extract_pricing_for_model(&models, &chosen) {
+                        state.cached_pricing = pricing;
+                    }
                     eprintln!(
                         "  {} {}",
                         theme::icon_ok(),
@@ -3798,6 +4073,10 @@ async fn handle_slash_command(
 
         "/stats" => {
             handle_stats_command(arg, state);
+        }
+
+        "/cost" => {
+            handle_cost_command(arg, state);
         }
 
         "/tools" => {
