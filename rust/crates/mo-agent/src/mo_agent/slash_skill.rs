@@ -1538,7 +1538,7 @@ async fn install_skill_from_marketplace(
     };
 
     let tok = token.unwrap_or("");
-    let mut query_params = vec![("version".to_string(), version.unwrap_or("latest").to_string())];
+    let query_params = vec![("version".to_string(), version.unwrap_or("latest").to_string())];
     let _ = query_params; // suppress unused warning
 
     eprintln!(
