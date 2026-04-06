@@ -89,3 +89,126 @@ pub fn plan_retrieval_inputs(
         user_query,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn user(content: &str) -> Value {
+        json!({"role": "user", "content": content})
+    }
+
+    fn assistant(content: &str) -> Value {
+        json!({"role": "assistant", "content": content})
+    }
+
+    fn system(content: &str) -> Value {
+        json!({"role": "system", "content": content})
+    }
+
+    // ──────────────────────────────────────────────────────────
+    // extract_latest_user_query
+    // ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn extract_user_query_finds_last_user() {
+        let msgs = vec![user("first"), assistant("reply"), user("second")];
+        assert_eq!(extract_latest_user_query(&msgs), "second");
+    }
+
+    #[test]
+    fn extract_user_query_empty_messages() {
+        assert_eq!(extract_latest_user_query(&[]), "");
+    }
+
+    #[test]
+    fn extract_user_query_no_user_message() {
+        let msgs = vec![assistant("hello"), system("sys")];
+        assert_eq!(extract_latest_user_query(&msgs), "");
+    }
+
+    #[test]
+    fn extract_user_query_skips_empty_content() {
+        let msgs = vec![user("real"), user("")];
+        assert_eq!(extract_latest_user_query(&msgs), "real");
+    }
+
+    // ──────────────────────────────────────────────────────────
+    // compose_retrieval_view
+    // ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn compose_with_all_parts() {
+        let sys_map = system("sys prompt")
+            .as_object()
+            .unwrap()
+            .clone();
+        let recent = vec![user("q"), assistant("a")];
+        let result = compose_retrieval_view(Some(&sys_map), Some("retrieved"), &recent);
+        assert_eq!(result.len(), 4); // system + retrieved + 2 recent
+        assert_eq!(result[0]["role"], "system");
+        assert_eq!(result[1]["content"], "retrieved");
+    }
+
+    #[test]
+    fn compose_without_system_or_retrieved() {
+        let recent = vec![user("q")];
+        let result = compose_retrieval_view(None, None, &recent);
+        assert_eq!(result.len(), 1);
+    }
+
+    #[test]
+    fn compose_empty_retrieved_block_skipped() {
+        let recent = vec![user("q")];
+        let result = compose_retrieval_view(None, Some(""), &recent);
+        assert_eq!(result.len(), 1); // empty block skipped
+    }
+
+    // ──────────────────────────────────────────────────────────
+    // plan_retrieval_inputs
+    // ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn plan_retrieval_empty_history_returns_none() {
+        assert!(plan_retrieval_inputs(&[], &[user("q")], 2, 4).is_none());
+    }
+
+    #[test]
+    fn plan_retrieval_below_min_history_returns_none() {
+        let h = vec![system("s"), user("u")];
+        assert!(plan_retrieval_inputs(&h, &[user("q")], 5, 4).is_none());
+    }
+
+    #[test]
+    fn plan_retrieval_no_user_query_returns_none() {
+        let h = vec![system("s"), user("u"), assistant("a"), user("u2"), assistant("a2")];
+        let current = vec![assistant("no user here")];
+        assert!(plan_retrieval_inputs(&h, &current, 2, 4).is_none());
+    }
+
+    #[test]
+    fn plan_retrieval_valid_returns_plan() {
+        let h = vec![system("s"), user("u1"), assistant("a1"), user("u2"), assistant("a2")];
+        let current = vec![user("my question")];
+        let plan = plan_retrieval_inputs(&h, &current, 2, 4).unwrap();
+        assert_eq!(plan.user_query, "my question");
+        assert!(plan.system_message.is_some());
+    }
+
+    #[test]
+    fn plan_retrieval_extracts_system_from_history() {
+        let h = vec![system("sys"), user("u1"), assistant("a1")];
+        let current = vec![user("q")];
+        let plan = plan_retrieval_inputs(&h, &current, 1, 4).unwrap();
+        let sys = plan.system_message.unwrap();
+        assert_eq!(sys["content"], "sys");
+    }
+
+    #[test]
+    fn plan_retrieval_no_system_in_history() {
+        let h = vec![user("u1"), assistant("a1"), user("u2")];
+        let current = vec![user("q")];
+        let plan = plan_retrieval_inputs(&h, &current, 1, 4).unwrap();
+        assert!(plan.system_message.is_none());
+    }
+}

@@ -504,3 +504,291 @@ fn is_conversational_msg(lower: &str, chars: &[char]) -> bool {
         .iter()
         .any(|p| word_boundary_match(lower, chars, p))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ──────────────────────────────────────────────────────────
+    // word_boundary_match
+    // ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn word_boundary_exact_match() {
+        let h = "check the git log";
+        let chars: Vec<char> = h.chars().collect();
+        assert!(word_boundary_match(h, &chars, "git"));
+    }
+
+    #[test]
+    fn word_boundary_no_false_positive_substring() {
+        // "digit" contains "git" but shouldn't match at word boundary
+        let h = "digit recognition";
+        let chars: Vec<char> = h.chars().collect();
+        assert!(!word_boundary_match(h, &chars, "git"));
+    }
+
+    #[test]
+    fn word_boundary_stem_plural() {
+        let h = "list all commits";
+        let chars: Vec<char> = h.chars().collect();
+        assert!(word_boundary_match(h, &chars, "commit"));
+    }
+
+    #[test]
+    fn word_boundary_stem_past_tense() {
+        let h = "i already fixed it";
+        let chars: Vec<char> = h.chars().collect();
+        assert!(word_boundary_match(h, &chars, "fix"));
+    }
+
+    #[test]
+    fn word_boundary_stem_gerund() {
+        let h = "currently debugging the issue";
+        let chars: Vec<char> = h.chars().collect();
+        assert!(word_boundary_match(h, &chars, "debug"));
+    }
+
+    #[test]
+    fn word_boundary_cjk_substring() {
+        let h = "我需要分析这个";
+        let chars: Vec<char> = h.chars().collect();
+        assert!(word_boundary_match(h, &chars, "分析"));
+    }
+
+    #[test]
+    fn word_boundary_multi_word_needle() {
+        let h = "open a pull request for this";
+        let chars: Vec<char> = h.chars().collect();
+        assert!(word_boundary_match(h, &chars, "pull request"));
+    }
+
+    #[test]
+    fn word_boundary_no_match() {
+        let h = "hello world";
+        let chars: Vec<char> = h.chars().collect();
+        assert!(!word_boundary_match(h, &chars, "git"));
+    }
+
+    // ──────────────────────────────────────────────────────────
+    // stem_matches
+    // ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn stem_exact() {
+        assert!(stem_matches("commit", "commit"));
+    }
+
+    #[test]
+    fn stem_plural_s() {
+        assert!(stem_matches("commits", "commit"));
+    }
+
+    #[test]
+    fn stem_plural_es() {
+        assert!(stem_matches("issues", "issue"));
+    }
+
+    #[test]
+    fn stem_past_ed() {
+        assert!(stem_matches("fixed", "fix"));
+    }
+
+    #[test]
+    fn stem_gerund_ing() {
+        assert!(stem_matches("debugging", "debug"));
+    }
+
+    #[test]
+    fn stem_consonant_doubling() {
+        assert!(stem_matches("committed", "commit"));
+        assert!(stem_matches("committing", "commit"));
+    }
+
+    #[test]
+    fn stem_drop_e_gerund() {
+        assert!(stem_matches("merging", "merge"));
+        assert!(stem_matches("analyzing", "analyze"));
+    }
+
+    #[test]
+    fn stem_drop_e_past() {
+        assert!(stem_matches("merged", "merge"));
+    }
+
+    #[test]
+    fn stem_no_match() {
+        assert!(!stem_matches("hello", "world"));
+    }
+
+    #[test]
+    fn stem_shorter_word_no_match() {
+        assert!(!stem_matches("co", "commit"));
+    }
+
+    // ──────────────────────────────────────────────────────────
+    // substring_boundary_match
+    // ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn substring_boundary_exact() {
+        assert!(substring_boundary_match("open pull request now", "pull request"));
+    }
+
+    #[test]
+    fn substring_boundary_with_suffix() {
+        assert!(substring_boundary_match("pull requests are pending", "pull request"));
+    }
+
+    #[test]
+    fn substring_boundary_mid_word_no_match() {
+        assert!(!substring_boundary_match("xpull request", "pull request"));
+    }
+
+    // ──────────────────────────────────────────────────────────
+    // is_followup_msg
+    // ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn followup_first_turn_never() {
+        let s = "pr呢？";
+        let chars: Vec<char> = s.chars().collect();
+        assert!(!is_followup_msg(s, &chars, 1));
+    }
+
+    #[test]
+    fn followup_chinese_particle() {
+        let s = "pr呢？";
+        let chars: Vec<char> = s.chars().collect();
+        assert!(is_followup_msg(s, &chars, 2));
+    }
+
+    #[test]
+    fn followup_english_pattern() {
+        let s = "what about tests?";
+        let chars: Vec<char> = s.chars().collect();
+        assert!(is_followup_msg(s, &chars, 3));
+    }
+
+    #[test]
+    fn followup_short_question_mark() {
+        let s = "star?";
+        let chars: Vec<char> = s.chars().collect();
+        assert!(is_followup_msg(s, &chars, 2));
+    }
+
+    #[test]
+    fn followup_long_message_not_followup() {
+        let s = "this is a really long message that has nothing to do with follow-up patterns at all";
+        let chars: Vec<char> = s.chars().collect();
+        assert!(!is_followup_msg(s, &chars, 5));
+    }
+
+    // ──────────────────────────────────────────────────────────
+    // is_conversational_msg
+    // ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn conversational_hello() {
+        let s = "hello";
+        let chars: Vec<char> = s.chars().collect();
+        assert!(is_conversational_msg(s, &chars));
+    }
+
+    #[test]
+    fn conversational_chinese() {
+        let s = "谢谢";
+        let chars: Vec<char> = s.chars().collect();
+        assert!(is_conversational_msg(s, &chars));
+    }
+
+    #[test]
+    fn conversational_long_not_conversational() {
+        let s = "please explain the architecture of this system in detail";
+        let chars: Vec<char> = s.chars().collect();
+        assert!(!is_conversational_msg(s, &chars));
+    }
+
+    #[test]
+    fn conversational_hi_no_false_positive_in_long() {
+        // "this" contains "hi" but is too long (>20 chars scenario)
+        let s = "this is a technical discussion about something";
+        let chars: Vec<char> = s.chars().collect();
+        assert!(!is_conversational_msg(s, &chars));
+    }
+
+    // ──────────────────────────────────────────────────────────
+    // ConversationState::signal_count
+    // ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn signal_count_default_is_zero() {
+        let s = ConversationState::default();
+        assert_eq!(s.signal_count(), 0);
+    }
+
+    #[test]
+    fn signal_count_counts_true_flags() {
+        let s = ConversationState {
+            is_fetch: true,
+            is_git: true,
+            is_memory: true,
+            ..Default::default()
+        };
+        assert_eq!(s.signal_count(), 3);
+    }
+
+    // ──────────────────────────────────────────────────────────
+    // ConversationState::from_message
+    // ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn from_message_empty() {
+        let s = ConversationState::from_message("", 1);
+        assert!(s.is_conversational);
+    }
+
+    #[test]
+    fn from_message_pure_punctuation() {
+        let s = ConversationState::from_message("!!??...", 1);
+        assert!(s.is_conversational);
+    }
+
+    #[test]
+    fn from_message_git_signal() {
+        let s = ConversationState::from_message("show me the git log", 1);
+        assert!(s.is_git);
+    }
+
+    #[test]
+    fn from_message_github_signal() {
+        let s = ConversationState::from_message("open a pull request", 1);
+        assert!(s.is_github);
+    }
+
+    #[test]
+    fn from_message_memory_signal() {
+        let s = ConversationState::from_message("记住这个偏好", 1);
+        assert!(s.is_memory);
+    }
+
+    #[test]
+    fn from_message_mutate_signal() {
+        let s = ConversationState::from_message("create a new file", 1);
+        assert!(s.is_mutate);
+    }
+
+    #[test]
+    fn from_message_followup_sets_fetch() {
+        let s = ConversationState::from_message("pr呢？", 2);
+        assert!(s.is_followup);
+        assert!(s.is_fetch); // follow-up inherits fetch
+    }
+
+    #[test]
+    fn from_message_long_query_truncated() {
+        let long = "analyze ".repeat(500); // > 2000 chars
+        let s = ConversationState::from_message(&long, 1);
+        assert!(s.is_analytical); // still detects signal in truncated prefix
+    }
+}

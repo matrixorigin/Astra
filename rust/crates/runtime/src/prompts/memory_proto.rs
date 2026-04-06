@@ -351,3 +351,330 @@ pub fn format_for_llm(contents: &[&str]) -> String {
 
     sections.join("\n")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ──────────────────────────────────────────────────────────
+    // ns_to_memory_type
+    // ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn ns_to_memory_type_known_namespaces() {
+        assert_eq!(ns_to_memory_type(NS_TASK), "working");
+        assert_eq!(ns_to_memory_type(NS_PLAN), "procedural");
+        assert_eq!(ns_to_memory_type(NS_FACT), "semantic");
+        assert_eq!(ns_to_memory_type(NS_EPISODE), "episodic");
+        assert_eq!(ns_to_memory_type(NS_PREF), "profile");
+        assert_eq!(ns_to_memory_type(NS_SWAP), "working");
+        assert_eq!(ns_to_memory_type(NS_INSIGHT), "semantic");
+        assert_eq!(ns_to_memory_type(NS_KNOWLEDGE), "semantic");
+    }
+
+    #[test]
+    fn ns_to_memory_type_unknown_fallback() {
+        assert_eq!(ns_to_memory_type("bogus"), "semantic");
+        assert_eq!(ns_to_memory_type(""), "semantic");
+    }
+
+    // ──────────────────────────────────────────────────────────
+    // EntryMeta
+    // ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn entry_meta_from_session_populates_fields() {
+        let m = EntryMeta::from_session(Some("s1"), 3, SRC_USER);
+        assert_eq!(m.session_id, Some("s1".into()));
+        assert_eq!(m.turn, Some(3));
+        assert_eq!(m.source, Some(SRC_USER.into()));
+        assert!(m.created_at.is_some());
+    }
+
+    #[test]
+    fn entry_meta_from_session_none_session() {
+        let m = EntryMeta::from_session(None, 1, SRC_COMPACT);
+        assert_eq!(m.session_id, None);
+        assert_eq!(m.turn, Some(1));
+    }
+
+    #[test]
+    fn entry_meta_to_json_all_fields() {
+        let m = EntryMeta {
+            session_id: Some("s1".into()),
+            turn: Some(2),
+            source: Some("user".into()),
+            created_at: Some("2025-01-01T00:00:00Z".into()),
+        };
+        let j = m.to_json();
+        assert_eq!(j["session_id"], "s1");
+        assert_eq!(j["turn"], 2);
+        assert_eq!(j["source"], "user");
+        assert_eq!(j["created_at"], "2025-01-01T00:00:00Z");
+    }
+
+    #[test]
+    fn entry_meta_to_json_empty() {
+        let m = EntryMeta::default();
+        let j = m.to_json();
+        let obj = j.as_object().unwrap();
+        assert!(obj.is_empty());
+    }
+
+    // ──────────────────────────────────────────────────────────
+    // MemoryEntry::new / encode / parse roundtrip
+    // ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn memory_entry_encode_format() {
+        let e = MemoryEntry::new("task", "pending", "Review PR #42");
+        assert_eq!(e.encode(), "[@task/pending] Review PR #42");
+    }
+
+    #[test]
+    fn memory_entry_parse_roundtrip() {
+        let original = MemoryEntry::new("plan", "active", "Finish API integration");
+        let encoded = original.encode();
+        let parsed = MemoryEntry::parse(&encoded).unwrap();
+        assert_eq!(parsed, original);
+    }
+
+    #[test]
+    fn memory_entry_parse_with_leading_whitespace() {
+        let e = MemoryEntry::parse("  [@fact/semantic] User prefers Rust  ").unwrap();
+        assert_eq!(e.ns, "fact");
+        assert_eq!(e.status, "semantic");
+        assert_eq!(e.body, "User prefers Rust");
+    }
+
+    #[test]
+    fn memory_entry_parse_no_tag() {
+        assert!(MemoryEntry::parse("just plain text").is_none());
+    }
+
+    #[test]
+    fn memory_entry_parse_malformed_tag_no_slash() {
+        assert!(MemoryEntry::parse("[@noslash] body").is_none());
+    }
+
+    #[test]
+    fn memory_entry_parse_empty_body() {
+        let e = MemoryEntry::parse("[@task/done]").unwrap();
+        assert_eq!(e.ns, "task");
+        assert_eq!(e.status, "done");
+        assert_eq!(e.body, "");
+    }
+
+    #[test]
+    fn memory_entry_parse_empty_string() {
+        assert!(MemoryEntry::parse("").is_none());
+    }
+
+    // ──────────────────────────────────────────────────────────
+    // MemoryEntry methods
+    // ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn memory_entry_memory_type() {
+        let e = MemoryEntry::new("task", "pending", "x");
+        assert_eq!(e.memory_type(), "working");
+    }
+
+    #[test]
+    fn memory_entry_is_ns() {
+        let e = MemoryEntry::new("plan", "active", "x");
+        assert!(e.is_ns("plan"));
+        assert!(!e.is_ns("task"));
+    }
+
+    #[test]
+    fn memory_entry_is_status() {
+        let e = MemoryEntry::new("task", "done", "x");
+        assert!(e.is_status("done"));
+        assert!(!e.is_status("pending"));
+    }
+
+    // ──────────────────────────────────────────────────────────
+    // to_store_payload / to_store_payload_with_meta
+    // ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn to_store_payload_shape() {
+        let e = MemoryEntry::new("fact", "semantic", "Rust is fast");
+        let p = e.to_store_payload();
+        assert!(p["content"].as_str().unwrap().contains("[@fact/semantic]"));
+        assert_eq!(p["memory_type"], "semantic");
+    }
+
+    #[test]
+    fn to_store_payload_with_meta_includes_metadata() {
+        let e = MemoryEntry::new("task", "pending", "do thing");
+        let meta = EntryMeta {
+            session_id: Some("s1".into()),
+            turn: Some(1),
+            source: Some("user".into()),
+            created_at: None,
+        };
+        let p = e.to_store_payload_with_meta(&meta);
+        assert_eq!(p["metadata"]["session_id"], "s1");
+        assert_eq!(p["metadata"]["turn"], 1);
+    }
+
+    // ──────────────────────────────────────────────────────────
+    // purge_payload / purge_ns_status_payload / search_query
+    // ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn purge_payload_format() {
+        let p = MemoryEntry::purge_payload("task");
+        assert_eq!(p["topic"], "[@task/");
+        assert!(p["reason"].as_str().unwrap().contains("task"));
+    }
+
+    #[test]
+    fn purge_ns_status_payload_format() {
+        let p = MemoryEntry::purge_ns_status_payload("plan", "done");
+        assert_eq!(p["topic"], "[@plan/done]");
+    }
+
+    #[test]
+    fn search_query_no_extra() {
+        let q = MemoryEntry::search_query("fact", "");
+        assert_eq!(q["query"], "[@fact/");
+        assert_eq!(q["top_k"], 20);
+    }
+
+    #[test]
+    fn search_query_with_extra() {
+        let q = MemoryEntry::search_query("task", "auth module");
+        assert_eq!(q["query"], "[@task/] auth module");
+    }
+
+    // ──────────────────────────────────────────────────────────
+    // display_line / display_task_line
+    // ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn display_line_truncates_long_body() {
+        let body = "a".repeat(200);
+        let e = MemoryEntry::new("fact", "semantic", &body);
+        let line = e.display_line();
+        assert!(line.len() < 200); // truncated to 80 chars + prefix
+        assert!(line.starts_with("[fact/semantic]"));
+    }
+
+    #[test]
+    fn display_task_line_done_icon() {
+        let e = MemoryEntry::new("task", "done", "Fix bug");
+        assert!(e.display_task_line().starts_with("✓"));
+    }
+
+    #[test]
+    fn display_task_line_pending_icon() {
+        let e = MemoryEntry::new("task", "pending", "Review code");
+        assert!(e.display_task_line().starts_with("○"));
+    }
+
+    #[test]
+    fn display_task_line_other_icon() {
+        let e = MemoryEntry::new("task", "active", "In progress");
+        assert!(e.display_task_line().starts_with("·"));
+    }
+
+    // ──────────────────────────────────────────────────────────
+    // filter_ns / filter_ns_status
+    // ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn filter_ns_returns_matching() {
+        let contents = vec![
+            "[@task/pending] Task A",
+            "[@fact/semantic] Fact B",
+            "[@task/done] Task C",
+            "plain text",
+        ];
+        let result = filter_ns(&contents, "task");
+        assert_eq!(result.len(), 2);
+        assert!(result[0].body.contains("Task A"));
+        assert!(result[1].body.contains("Task C"));
+    }
+
+    #[test]
+    fn filter_ns_empty_input() {
+        let result = filter_ns(&[], "task");
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn filter_ns_status_matches() {
+        let contents = vec![
+            "[@task/pending] A",
+            "[@task/done] B",
+            "[@task/pending] C",
+        ];
+        let result = filter_ns_status(&contents, "task", "pending");
+        assert_eq!(result.len(), 2);
+    }
+
+    // ──────────────────────────────────────────────────────────
+    // partition_memories
+    // ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn partition_memories_splits_correctly() {
+        let contents = vec![
+            "[@task/pending] do thing",
+            "unstructured note",
+            "[@fact/semantic] know stuff",
+            "   ", // whitespace-only → dropped
+        ];
+        let (structured, unstructured) = partition_memories(&contents);
+        assert_eq!(structured.len(), 2);
+        assert_eq!(unstructured.len(), 1);
+        assert_eq!(unstructured[0], "unstructured note");
+    }
+
+    #[test]
+    fn partition_memories_empty() {
+        let (s, u) = partition_memories(&[]);
+        assert!(s.is_empty());
+        assert!(u.is_empty());
+    }
+
+    // ──────────────────────────────────────────────────────────
+    // format_for_llm
+    // ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn format_for_llm_groups_by_namespace() {
+        let contents = vec![
+            "[@task/pending] Review PR",
+            "[@task/done] Write tests",
+            "[@fact/semantic] User prefers Rust",
+        ];
+        let result = format_for_llm(&contents);
+        assert!(result.contains("**Knowledge:**"));
+        assert!(result.contains("**Tasks:**"));
+    }
+
+    #[test]
+    fn format_for_llm_includes_unstructured() {
+        let contents = vec!["plain note"];
+        let result = format_for_llm(&contents);
+        assert!(result.contains("**Context:**"));
+        assert!(result.contains("plain note"));
+    }
+
+    #[test]
+    fn format_for_llm_empty() {
+        assert!(format_for_llm(&[]).is_empty());
+    }
+
+    #[test]
+    fn format_for_llm_tasks_use_icons() {
+        let contents = vec!["[@task/done] Fixed it", "[@task/pending] Todo"];
+        let result = format_for_llm(&contents);
+        assert!(result.contains("✓"));
+        assert!(result.contains("○"));
+    }
+}

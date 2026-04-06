@@ -82,3 +82,54 @@ pub fn build_skill_instructions(skills: &[SystemSkill]) -> String {
     }
     format!("\n\n{}", parts.join("\n"))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn build_skill_dev_prefix_contains_name_and_src() {
+        let r = build_skill_dev_prefix("my-skill", "# My Skill\nDo stuff");
+        assert!(r.contains("my-skill"));
+        assert!(r.contains("# My Skill"));
+        assert!(r.contains("Do stuff"));
+        assert!(r.contains("SKILL DEV"));
+    }
+
+    #[test]
+    fn builtin_markdown_skill_shape() {
+        let s = builtin_markdown_skill();
+        assert_eq!(s.name, "markdown");
+        assert!(!s.instructions.is_empty());
+        assert!(!s.description.is_empty());
+    }
+
+    #[test]
+    fn builtin_concise_skill_shape() {
+        let s = builtin_concise_skill();
+        assert_eq!(s.name, "concise");
+        assert!(s.instructions.contains("100 words"));
+    }
+
+    #[test]
+    fn builtin_system_skills_returns_two() {
+        let skills = builtin_system_skills();
+        assert_eq!(skills.len(), 2);
+        let names: Vec<&str> = skills.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"markdown"));
+        assert!(names.contains(&"concise"));
+    }
+
+    #[test]
+    fn build_skill_instructions_empty() {
+        assert!(build_skill_instructions(&[]).is_empty());
+    }
+
+    #[test]
+    fn build_skill_instructions_joins() {
+        let skills = builtin_system_skills();
+        let r = build_skill_instructions(&skills);
+        assert!(r.contains("Markdown"));
+        assert!(r.contains("Concise"));
+    }
+}
