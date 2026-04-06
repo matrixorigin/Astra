@@ -4102,4 +4102,105 @@ mod tests {
             );
         }
     }
+
+    #[tokio::test]
+    async fn skill_exclusivity_still_defers_when_skill_fails() {
+        // Even if the skill call fails (unknown skill), regular tools should
+        // still be deferred — the model should see the error and re-evaluate.
+        let resolver = StubSkillResolver::new(); // only knows "test-skill"
+        let turns = vec![
+            skill_plus_regular_tool_call_result(
+                "call_skill",
+                r#"{"skill_name": "nonexistent-skill"}"#,
+                "call_bash",
+                "bash",
+                r#"{"command": "rm -rf /"}"#,
+                100,
+                50,
+            ),
+            text_result("OK, skill not found.", 80, 30, None),
+        ];
+
+        let mut host = MockHost::new(turns);
+        let mut state = make_state();
+        state
+            .messages
+            .push(json!({"role": "user", "content": "use skill"}));
+        state.skill_resolver = Some(Arc::new(resolver));
+
+        let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
+        assert!(outcome.is_ok());
+
+        // bash should still be deferred even though skill failed
+        let bash_msgs: Vec<&Value> = state
+            .messages
+            .iter()
+            .filter(|m| m.get("tool_call_id").and_then(Value::as_str) == Some("call_bash"))
+            .collect();
+        assert_eq!(bash_msgs.len(), 1);
+        assert!(
+            bash_msgs[0]["content"].as_str().unwrap().contains("Deferred"),
+            "bash should be deferred even when skill fails"
+        );
+
+        // skill call should have an error result (not a skill instruction)
+        let skill_msgs: Vec<&Value> = state
+            .messages
+            .iter()
+            .filter(|m| m.get("tool_call_id").and_then(Value::as_str) == Some("call_skill"))
+            .collect();
+        assert_eq!(skill_msgs.len(), 1);
+        let skill_content = skill_msgs[0]["content"].as_str().unwrap();
+        assert!(
+            skill_content.contains("Unknown skill") || skill_content.contains("unknown"),
+            "Skill should have failed, got: {skill_content}"
+        );
+    }
+
+    #[tokio::test]
+    async fn skill_exclusivity_malformed_tool_call_no_panic() {
+        // Tool call with missing id/function — should not panic
+        let resolver = StubSkillResolver::new();
+        let turns = vec![
+            HostTurnResult {
+                accum: ChatTurnSseAccum {
+                    has_tool_calls: true,
+                    has_usage: true,
+                    prompt_tokens: 100,
+                    completion_tokens: 50,
+                    tool_calls: vec![
+                        json!({
+                            "id": "call_skill",
+                            "type": "function",
+                            "function": {
+                                "name": "skill",
+                                "arguments": r#"{"skill_name": "test-skill"}"#,
+                            }
+                        }),
+                        // Malformed: missing function.name
+                        json!({
+                            "id": "call_bad",
+                            "type": "function",
+                            "function": {}
+                        }),
+                    ],
+                    ..ChatTurnSseAccum::default()
+                },
+                ttft_ms: Some(30),
+                edge_tool_round: Vec::new(),
+            },
+            text_result("Done.", 80, 30, None),
+        ];
+
+        let mut host = MockHost::new(turns);
+        let mut state = make_state();
+        state
+            .messages
+            .push(json!({"role": "user", "content": "use skill"}));
+        state.skill_resolver = Some(Arc::new(resolver));
+
+        // Should not panic
+        let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
+        assert!(outcome.is_ok());
+    }
 }

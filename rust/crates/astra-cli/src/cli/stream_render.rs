@@ -475,8 +475,8 @@ impl SseStreamHost for CliSseStreamHost<'_> {
         let start = std::time::Instant::now();
         let output = if allowed {
             if tool == astra_runtime::turn::skill_tool::SKILL_TOOL_NAME {
-                self.skill_fired_this_turn = true;
                 if let Some(resolver) = &self.skill_resolver {
+                    self.skill_fired_this_turn = true;
                     astra_runtime::turn::skill_tool::execute_skill_inline(
                         resolver.as_ref(),
                         tool,
@@ -484,6 +484,8 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                     )
                     .await
                 } else {
+                    // No resolver — don't set skill_fired_this_turn so other
+                    // tools are not needlessly deferred.
                     "Error: skill resolver not available".to_string()
                 }
             } else if self.skill_fired_this_turn {
