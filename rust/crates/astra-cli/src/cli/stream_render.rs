@@ -203,7 +203,7 @@ fn extract_first_absolute_path(command: &str) -> Option<String> {
     for token in command.split_whitespace() {
         if token.starts_with('/') && !token.starts_with("//") && !token.contains('$') {
             // Strip trailing punctuation that might be shell syntax
-            let clean = token.trim_end_matches(|c: char| c == ';' || c == '&' || c == ')');
+            let clean = token.trim_end_matches([';', '&', ')']);
             if !clean.is_empty() {
                 return Some(clean.to_string());
             }

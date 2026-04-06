@@ -519,6 +519,19 @@ impl ToolExecutor {
             None => return json!({ "success": false, "error": "missing 'content'" }).to_string(),
         };
 
+        // Content size guard — prevent writing extremely large files that
+        // could exhaust disk space.  10 MB is generous for source files.
+        const MAX_WRITE_BYTES: usize = 10 * 1024 * 1024; // 10 MB
+        if content.len() > MAX_WRITE_BYTES {
+            return json!({
+                "success": false,
+                "error": format!(
+                    "Content too large ({} bytes, limit {}). Break into smaller files or use bash for large writes.",
+                    content.len(), MAX_WRITE_BYTES
+                )
+            }).to_string();
+        }
+
         // Dangerous file guard
         let rel = path.strip_prefix(&self.project_root).unwrap_or(&path);
         let rel_str = rel.to_string_lossy();
@@ -558,7 +571,7 @@ impl ToolExecutor {
             .to_string();
         }
         let prior_for_diff = if path.exists() {
-            fs::read_to_string(&path).ok()
+            read_to_string_lossy(&path).ok()
         } else {
             None
         };
@@ -633,7 +646,7 @@ impl ToolExecutor {
             return format!("Error: {e}");
         }
 
-        let content = match fs::read_to_string(&path) {
+        let content = match read_to_string_lossy(&path) {
             Ok(c) => c,
             Err(e) => return format!("Error reading file: {e}"),
         };
@@ -833,7 +846,7 @@ impl ToolExecutor {
             return format!("Error: {e}");
         }
 
-        let content = match fs::read_to_string(&path) {
+        let content = match read_to_string_lossy(&path) {
             Ok(c) => c,
             Err(e) => return format!("Error reading file: {e}"),
         };
@@ -925,9 +938,18 @@ impl ToolExecutor {
             },
             None => self.project_root.clone(),
         };
-        let depth = args.get("depth").and_then(Value::as_u64).unwrap_or(1) as usize;
+        let depth = args
+            .get("depth")
+            .and_then(Value::as_u64)
+            .unwrap_or(1)
+            .min(10) as usize; // hard cap at 10 to prevent abuse
         let mut out = String::new();
-        self.list_dir_recursive(&dir, &dir, depth, 0, &mut out);
+        let mut visited = std::collections::HashSet::new();
+        // Seed with the root dir's canonical path to prevent symlink loops.
+        if let Ok(canon) = dir.canonicalize() {
+            visited.insert(canon);
+        }
+        self.list_dir_recursive(&dir, &dir, depth, 0, &mut out, &mut visited);
         if out.is_empty() {
             "(empty)".to_string()
         } else {
@@ -943,6 +965,7 @@ impl ToolExecutor {
         max_depth: usize,
         cur: usize,
         out: &mut String,
+        visited: &mut std::collections::HashSet<std::path::PathBuf>,
     ) {
         let Ok(entries) = fs::read_dir(dir) else {
             return;
@@ -962,14 +985,27 @@ impl ToolExecutor {
                 continue;
             }
             let ft = entry.file_type().ok();
-            let is_dir = ft.map(|t| t.is_dir()).unwrap_or(false);
+            let is_dir = ft.as_ref().map(|t| t.is_dir()).unwrap_or(false);
+            let is_symlink = ft.as_ref().map(|t| t.is_symlink()).unwrap_or(false);
             out.push_str(&format!(
                 "{indent}{}{}\n",
                 name,
                 if is_dir { "/" } else { "" }
             ));
             if is_dir && cur < max_depth.saturating_sub(1) {
-                self.list_dir_recursive(base, &entry.path(), max_depth, cur + 1, out);
+                // Symlink loop guard: canonicalize the target and skip if already visited.
+                if is_symlink {
+                    if let Ok(canon) = entry.path().canonicalize() {
+                        if !visited.insert(canon) {
+                            // Already traversed this directory via a different path.
+                            continue;
+                        }
+                    } else {
+                        // Broken symlink — skip.
+                        continue;
+                    }
+                }
+                self.list_dir_recursive(base, &entry.path(), max_depth, cur + 1, out, visited);
             }
         }
     }

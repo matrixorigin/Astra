@@ -1556,6 +1556,11 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
                     tokio::pin!(llm_stream);
                     let mut sse_buf = SseBlankLineUtf8Buf::new();
                     let mut saw_inprocess_summary = false;
+                    // Keepalive interval: emit SSE comment every 30s so the
+                    // CLI-side idle timer (90s) doesn't fire while the bridge
+                    // waits for LLM data (e.g. during non-stream fallback).
+                    let keepalive = tokio::time::Duration::from_secs(30);
+                    let mut keepalive_deadline = tokio::time::Instant::now() + keepalive;
 
                     loop {
                         tokio::select! {
@@ -1569,6 +1574,7 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
                                 break;
                             }
                             item = llm_stream.next() => {
+                                keepalive_deadline = tokio::time::Instant::now() + keepalive;
                                 let Some(bytes) = item else { break };
                                 for block in sse_buf.push_lossy_bytes(&bytes) {
                                     match extend_forward_from_validated_sse_block(
@@ -1596,6 +1602,10 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
                                         }
                                     }
                                 }
+                            }
+                            _ = tokio::time::sleep_until(keepalive_deadline) => {
+                                yield Bytes::from(":\n\n");
+                                keepalive_deadline = tokio::time::Instant::now() + keepalive;
                             }
                         }
                     }

@@ -15,6 +15,15 @@ use super::truncate_output;
 const DIFF_LIMIT: usize = 40_000; // ~10K tokens — diff is the primary input for code review
 const SHOW_LIMIT: usize = 16_000; // ~4K tokens; was 30K
 
+/// Reject file paths with `..` components that could escape the repository tree.
+fn reject_path_traversal(file: &str) -> Result<(), String> {
+    if file.contains("..") {
+        Err("Error: path traversal ('..') not allowed in file parameter".to_string())
+    } else {
+        Ok(())
+    }
+}
+
 fn tool_output_limit() -> usize {
     super::tool_output_limit()
 }
@@ -452,6 +461,9 @@ pub(crate) fn git_blame(project_root: &Path, args: &Value) -> String {
         Some(f) => f,
         None => return "Error: missing 'file' parameter".to_string(),
     };
+    if let Err(e) = reject_path_traversal(file) {
+        return e;
+    }
 
     let line_start = args.get("line_start").and_then(Value::as_u64);
     let line_end = args.get("line_end").and_then(Value::as_u64);
@@ -607,6 +619,11 @@ pub(crate) fn git_diff(
     let staged = args.get("staged").and_then(Value::as_bool).unwrap_or(false);
     let git_ref = args.get("ref").and_then(Value::as_str);
     let path_filter = args.get("path").and_then(Value::as_str);
+    if let Some(p) = path_filter {
+        if let Err(e) = reject_path_traversal(p) {
+            return e;
+        }
+    }
 
     // If a ref is given, do a tree-to-tree diff (HEAD vs ref)
     if let Some(ref_str) = git_ref {
@@ -972,6 +989,9 @@ pub(crate) fn git_file_history(project_root: &Path, args: &Value) -> String {
         Some(f) => f,
         None => return "Error: missing 'file' parameter".to_string(),
     };
+    if let Err(e) = reject_path_traversal(file) {
+        return e;
+    }
 
     let n = args.get("n").and_then(Value::as_u64).unwrap_or(10) as usize;
 
@@ -1270,6 +1290,11 @@ pub(crate) fn git_contributors(project_root: &Path, args: &Value) -> String {
     };
 
     let path_filter = args.get("path").and_then(Value::as_str);
+    if let Some(p) = path_filter {
+        if let Err(e) = reject_path_traversal(p) {
+            return e;
+        }
+    }
     let since_str = args.get("since").and_then(Value::as_str);
 
     // Parse --since into a unix timestamp cutoff
@@ -1674,6 +1699,8 @@ pub fn git_checkout_file(project_root: &Path, args: &Value) -> String {
         || git_ref.contains('|')
         || git_ref.contains('&')
         || git_ref.contains('`')
+        || git_ref.contains("$(")
+        || git_ref.contains("${")
     {
         return "Error: invalid ref".to_string();
     }
