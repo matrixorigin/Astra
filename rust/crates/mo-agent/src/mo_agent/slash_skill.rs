@@ -1168,10 +1168,15 @@ Follow these steps:
             list_installed_marketplace(api, token).await;
         }
 
+        "create" => {
+            // Auto-generate a skill from the current session transcript
+            create_skill_from_session(sub_arg, state).await?;
+        }
+
         _ => {
             eprintln!(
                         "{}",
-                        format!("  Unknown /skill subcommand: '{sub}'. Try /skill list, /skill search, /skill search-remote, /skill browse, /skill trending, /skill installed, /skill info, /skill new, /skill test, /skill dev, /skill doctor, /skill stats, /skill pin, /skill unpin, /skill install, /skill publish, /skill uninstall, /skill pack, /skill unpack, /skill inspect, /skill compose-info, /skill upload-quality").yellow()
+                        format!("  Unknown /skill subcommand: '{sub}'. Try /skill list, /skill search, /skill search-remote, /skill browse, /skill trending, /skill installed, /skill info, /skill new, /skill create, /skill test, /skill dev, /skill doctor, /skill stats, /skill pin, /skill unpin, /skill install, /skill publish, /skill uninstall, /skill pack, /skill unpack, /skill inspect, /skill compose-info, /skill upload-quality").yellow()
                     );
         }
     }
@@ -1335,6 +1340,324 @@ fn skill_relevance_score(m: &astra_runtime::skills::SkillManifest, query: &str) 
 
     score
 }
+
+
+// ═══════════════════════════════════════════════ Skill Auto-Generation ════
+
+
+/// Analyze the current session and generate a SKILL.md from observed patterns.
+async fn create_skill_from_session(
+    arg: &str,
+    state: &mut super::ReplState,
+) -> Result<(), String> {
+    use astra_services::session_journal;
+    use std::collections::HashMap;
+
+    let name = arg.split_whitespace().next().unwrap_or("").trim();
+    if name.is_empty() {
+        eprintln!("{}", "  Usage: /skill create <name>".yellow());
+        eprintln!(
+            "{}",
+            "  Analyzes the current session and generates a skill from it.".dim()
+        );
+        return Ok(());
+    }
+
+    // Validate name (kebab-case)
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        eprintln!(
+            "  {} Skill name must be alphanumeric, hyphens, or underscores.",
+            theme::icon_err()
+        );
+        return Ok(());
+    }
+
+    // Check not duplicate
+    let skills_base = std::env::current_dir()
+        .map_err(|e| e.to_string())?
+        .join(".astra/skills");
+    let skill_dir = skills_base.join(name);
+    if skill_dir.exists() {
+        eprintln!(
+            "  {} Skill '{}' already exists at {}",
+            theme::icon_err(),
+            name,
+            skill_dir.display()
+        );
+        return Ok(());
+    }
+
+    // Read session journal
+    let session_id = match &state.session_id {
+        Some(s) => s.clone(),
+        None => {
+            eprintln!("  {} No active session to analyze.", theme::icon_err());
+            return Ok(());
+        }
+    };
+
+    let events = session_journal::read_journal(&session_id).map_err(|e| e.to_string())?;
+    let turns: Vec<_> = events
+        .iter()
+        .filter(|e| {
+            matches!(
+                e.event_type,
+                session_journal::JournalEventType::Turn
+            )
+        })
+        .collect();
+
+    if turns.is_empty() {
+        eprintln!(
+            "  {} No turns in current session to analyze.",
+            theme::icon_warn()
+        );
+        return Ok(());
+    }
+
+    eprintln!(
+        "  {} Analyzing {} turns from session {}...",
+        theme::icon_info(),
+        turns.len(),
+        &session_id[..8.min(session_id.len())]
+    );
+
+    // ── Extract patterns ────────────────────────────────────────────────
+
+    // 1. Tool frequency
+    let mut tool_freq: HashMap<String, u32> = HashMap::new();
+    let mut total_tool_calls = 0u32;
+    for t in &turns {
+        if let Some(ref tools) = t.tools_used {
+            for tool in tools {
+                *tool_freq.entry(tool.clone()).or_insert(0) += 1;
+                total_tool_calls += 1;
+            }
+        }
+    }
+
+    // Sort by frequency, take top tools
+    let mut tool_ranked: Vec<_> = tool_freq.into_iter().collect();
+    tool_ranked.sort_by(|a, b| b.1.cmp(&a.1));
+    let top_tools: Vec<String> = tool_ranked.iter().take(10).map(|t| t.0.clone()).collect();
+
+    // 2. Collect user intents (first line of each user input)
+    let mut user_intents: Vec<String> = Vec::new();
+    for t in &turns {
+        if let Some(ref input) = t.user_input {
+            let first_line = input.lines().next().unwrap_or("").trim();
+            if !first_line.is_empty() && first_line.len() < 200 {
+                user_intents.push(first_line.to_string());
+            }
+        }
+    }
+
+    // 3. Skills already used
+    let mut skills_used: Vec<String> = Vec::new();
+    for t in &turns {
+        if let Some(ref skills) = t.selected_skills {
+            for s in skills {
+                if !skills_used.contains(s) {
+                    skills_used.push(s.clone());
+                }
+            }
+        }
+    }
+
+    // 4. Estimate description from first user message
+    let description = user_intents
+        .first()
+        .cloned()
+        .unwrap_or_else(|| format!("Auto-generated skill from session {}", &session_id[..8]));
+
+    // 5. Derive triggers from common words
+    let triggers = derive_triggers(name, &user_intents);
+
+    // ── Build steps from turn transcript ────────────────────────────────
+
+    let mut steps = Vec::new();
+    for (i, t) in turns.iter().enumerate() {
+        let mut step = String::new();
+        if let Some(ref input) = t.user_input {
+            let preview = if input.len() > 120 {
+                format!("{}...", &input[..120])
+            } else {
+                input.clone()
+            };
+            step.push_str(&format!("User asked: {preview}"));
+        }
+        if let Some(ref tools) = t.tools_used {
+            if !tools.is_empty() {
+                step.push_str(&format!(" → Tools: {}", tools.join(", ")));
+            }
+        }
+        if !step.is_empty() {
+            steps.push(format!("{}. {step}", i + 1));
+        }
+    }
+
+    // ── Generate SKILL.md ───────────────────────────────────────────────
+
+    let allowed_tools_yaml = if top_tools.is_empty() {
+        "allowed_tools: []".to_string()
+    } else {
+        let items: Vec<String> = top_tools.iter().map(|t| format!("  - {t}")).collect();
+        format!("allowed_tools:\n{}", items.join("\n"))
+    };
+
+    let triggers_yaml = if triggers.is_empty() {
+        "triggers: []".to_string()
+    } else {
+        let items: Vec<String> = triggers.iter().map(|t| format!("  - {t}")).collect();
+        format!("triggers:\n{}", items.join("\n"))
+    };
+
+    let session_steps = if steps.is_empty() {
+        "1. Understand the user's request\n2. Execute the task\n3. Report results".to_string()
+    } else {
+        steps.join("\n")
+    };
+
+    let skill_md = format!(
+        r#"---
+name: {name}
+description: "{description}"
+version: "0.1.0"
+user_invocable: true
+{triggers_yaml}
+{allowed_tools_yaml}
+when_to_use: "{description}"
+# arguments:
+#   - name: TARGET
+#     description: "Target file or directory"
+#     required: false
+---
+
+# {name}
+
+Skill auto-generated from session {session_short}.
+{total_tool_calls} tool calls across {turn_count} turns.
+
+## Objective
+
+{description}
+
+## Steps
+
+{session_steps}
+
+## Tools Available
+
+{tool_summary}
+
+## Guidelines
+
+- Follow the step sequence above, adapting to the specific request
+- Use the allowed tools listed in the frontmatter
+- Report progress and results clearly
+"#,
+        session_short = &session_id[..8.min(session_id.len())],
+        turn_count = turns.len(),
+        tool_summary = if top_tools.is_empty() {
+            "All tools available.".to_string()
+        } else {
+            format!(
+                "Primary tools (by frequency): {}",
+                tool_ranked
+                    .iter()
+                    .take(5)
+                    .map(|(n, c)| format!("{n} ({c}x)"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        },
+    );
+
+    // Write to disk
+    std::fs::create_dir_all(&skill_dir).map_err(|e| e.to_string())?;
+    std::fs::write(skill_dir.join("SKILL.md"), &skill_md).map_err(|e| e.to_string())?;
+
+    // Summary output
+    eprintln!(
+        "\n  {} Skill '{}' created from session analysis",
+        theme::icon_ok(),
+        name.to_string().cyan()
+    );
+    eprintln!("  {}", format!("  Path: {}", skill_dir.display()).dim());
+    eprintln!(
+        "  {}",
+        format!(
+            "  Derived from: {} turns, {} tool calls",
+            turns.len(),
+            total_tool_calls
+        )
+        .dim()
+    );
+    if !top_tools.is_empty() {
+        eprintln!(
+            "  {}",
+            format!("  Top tools: {}", top_tools[..top_tools.len().min(5)].join(", ")).dim()
+        );
+    }
+    eprintln!(
+        "\n  {}",
+        format!("  Edit: {}/SKILL.md", skill_dir.display()).dim()
+    );
+    eprintln!(
+        "  {}",
+        format!("  Dev mode: /skill dev {name}").dim()
+    );
+    eprintln!(
+        "  {}",
+        format!("  Test: /skill test {name}").dim()
+    );
+    eprintln!();
+
+    Ok(())
+}
+
+/// Derive trigger words from user intents and the skill name.
+pub(crate) fn derive_triggers(name: &str, intents: &[String]) -> Vec<String> {
+    use std::collections::HashMap;
+
+    let mut triggers = vec![name.to_string()];
+
+    // Count words across intents (skip very common words)
+    let stop_words: std::collections::HashSet<&str> = [
+        "the", "a", "an", "to", "in", "for", "of", "and", "or", "is", "it", "on", "at", "by",
+        "with", "this", "that", "from", "can", "do", "how", "what", "i", "me", "my", "we",
+        "you", "your", "please", "let", "make", "use", "get", "set", "put", "all", "not", "no",
+        "so", "if", "be", "as", "but", "are", "was", "were",
+    ]
+    .into_iter()
+    .collect();
+
+    let mut word_freq: HashMap<String, u32> = HashMap::new();
+    for intent in intents {
+        for word in intent.split_whitespace() {
+            let w = word.to_lowercase();
+            let w = w.trim_matches(|c: char| !c.is_alphanumeric());
+            if w.len() >= 3 && !stop_words.contains(&*w) {
+                *word_freq.entry(w.to_string()).or_insert(0) += 1;
+            }
+        }
+    }
+
+    // Take top 3 frequent words as triggers
+    let mut ranked: Vec<_> = word_freq.into_iter().collect();
+    ranked.sort_by(|a, b| b.1.cmp(&a.1));
+    for (word, _) in ranked.iter().take(3) {
+        if !triggers.contains(word) {
+            triggers.push(word.clone());
+        }
+    }
+
+    triggers
+}
+
 
 #[cfg(test)]
 mod tests {

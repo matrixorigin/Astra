@@ -571,6 +571,7 @@ fn slash_argument_hint(command: &str) -> Option<&'static str> {
         "/skill info" => Some("<name>"),
         "/skill search" => Some("<query>"),
         "/skill new" => Some("<name>"),
+        "/skill create" => Some("<name> — auto-generate from current session"),
         "/skill test" => Some("<name> [json_args]"),
         "/skill dev" => Some("<name|off>"),
         "/skill validate" | "/skill config" => Some("<name>"),
