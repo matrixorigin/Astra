@@ -867,4 +867,185 @@ mod tests {
         // No tools available → nothing added (regression: previously could add invalid)
         assert!(result.is_empty());
     }
+
+    // ──────────────────────────────────────────────────────────
+    // tfidf_score
+    // ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn tfidf_score_empty_query_returns_zero() {
+        let score = tfidf_score(&[], 0);
+        assert_eq!(score, 0.0);
+    }
+
+    #[test]
+    fn tfidf_score_unknown_terms_returns_zero() {
+        let terms: Vec<String> = vec!["xyznonexistent123".into()];
+        let score = tfidf_score(&terms, 0);
+        assert_eq!(score, 0.0);
+    }
+
+    #[test]
+    fn tfidf_score_relevant_terms_positive() {
+        // "file" and "read" should match read_file tool (index 0 in TOOL_CATALOG)
+        let terms: Vec<String> = vec!["file".into(), "read".into()];
+        // Find the read_file tool index
+        let idx = TOOL_CATALOG
+            .iter()
+            .position(|t| t.name == "read_file")
+            .unwrap();
+        let score = tfidf_score(&terms, idx);
+        assert!(score > 0.0, "expected positive score, got {score}");
+    }
+
+    #[test]
+    fn tfidf_score_bounded_by_one() {
+        // Even with perfect match terms, score should be <= 1.0
+        let idx = TOOL_CATALOG
+            .iter()
+            .position(|t| t.name == "bash")
+            .unwrap();
+        let terms: Vec<String> = vec![
+            "bash".into(),
+            "execute".into(),
+            "command".into(),
+            "shell".into(),
+            "run".into(),
+        ];
+        let score = tfidf_score(&terms, idx);
+        assert!(score <= 1.0, "expected score <= 1.0, got {score}");
+    }
+
+    // ──────────────────────────────────────────────────────────
+    // file_context_tool_boost
+    // ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn file_context_boost_empty_context() {
+        assert_eq!(file_context_tool_boost("bash", &[]), 0.0);
+    }
+
+    #[test]
+    fn file_context_boost_rust_bash() {
+        let ctx = vec!["rust".to_string()];
+        assert_eq!(file_context_tool_boost("bash", &ctx), 0.05);
+    }
+
+    #[test]
+    fn file_context_boost_rust_unrelated_tool() {
+        let ctx = vec!["rust".to_string()];
+        assert_eq!(file_context_tool_boost("github_search_repos", &ctx), 0.0);
+    }
+
+    #[test]
+    fn file_context_boost_python() {
+        let ctx = vec!["python".to_string()];
+        assert_eq!(file_context_tool_boost("read_file", &ctx), 0.05);
+        assert_eq!(file_context_tool_boost("write_file", &ctx), 0.05);
+    }
+
+    #[test]
+    fn file_context_boost_docker() {
+        let ctx = vec!["docker".to_string()];
+        assert_eq!(file_context_tool_boost("bash", &ctx), 0.05);
+        assert_eq!(file_context_tool_boost("grep", &ctx), 0.0); // grep not in docker list
+    }
+
+    #[test]
+    fn file_context_boost_unknown_lang() {
+        let ctx = vec!["haskell".to_string()];
+        assert_eq!(file_context_tool_boost("bash", &ctx), 0.0);
+    }
+
+    // ──────────────────────────────────────────────────────────
+    // raw_recency_boost
+    // ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn recency_boost_exact_tool_match() {
+        let state = ConversationState {
+            recent_tools: vec!["bash".into()],
+            ..Default::default()
+        };
+        let tool = TOOL_CATALOG
+            .iter()
+            .find(|t| t.name == "bash")
+            .unwrap();
+        assert_eq!(raw_recency_boost(tool, &state), 0.3);
+    }
+
+    #[test]
+    fn recency_boost_no_match() {
+        let state = ConversationState {
+            recent_tools: vec!["bash".into()],
+            ..Default::default()
+        };
+        let tool = TOOL_CATALOG
+            .iter()
+            .find(|t| t.name == "read_file")
+            .unwrap();
+        // read_file and bash may share an intent (FileSystem), giving 0.1
+        // Or they may not. Just verify it's less than 0.3.
+        let boost = raw_recency_boost(tool, &state);
+        assert!(boost < 0.3);
+    }
+
+    #[test]
+    fn recency_boost_empty_recent() {
+        let state = ConversationState::default();
+        let tool = TOOL_CATALOG
+            .iter()
+            .find(|t| t.name == "bash")
+            .unwrap();
+        assert_eq!(raw_recency_boost(tool, &state), 0.0);
+    }
+
+    // ──────────────────────────────────────────────────────────
+    // pre_filter_dynamic
+    // ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn pre_filter_returns_nonempty_for_real_query() {
+        let state = state_at_turn(1);
+        let results = pre_filter_dynamic(&state, "read the contents of a file");
+        assert!(!results.is_empty(), "should return some tools for a real query");
+    }
+
+    #[test]
+    fn pre_filter_empty_query() {
+        let state = state_at_turn(1);
+        let results = pre_filter_dynamic(&state, "");
+        // Empty query may still return tools due to cold-start logic
+        // Just verify it doesn't panic
+        let _ = results;
+    }
+
+    #[test]
+    fn pre_filter_with_file_context() {
+        let state = state_at_turn(1);
+        let ctx = vec!["rust".to_string()];
+        let results = pre_filter_dynamic_with_file_context(
+            &state, "run tests", None, None, &[], 0.0, &HashMap::new(), &ctx,
+        );
+        assert!(!results.is_empty());
+    }
+
+    #[test]
+    fn pre_filter_with_pressure_zero() {
+        let state = state_at_turn(1);
+        let results = pre_filter_dynamic_with_pressure(
+            &state, "read file", None, None, &[], 0.0,
+        );
+        assert!(!results.is_empty());
+    }
+
+    #[test]
+    fn pre_filter_with_pressure_max() {
+        let state = state_at_turn(1);
+        let results = pre_filter_dynamic_with_pressure(
+            &state, "read file", None, None, &[], 1.0,
+        );
+        // High pressure = stricter filter, but shouldn't panic
+        let _ = results;
+    }
 }

@@ -394,4 +394,300 @@ hooks:
         m.insert("plan_subtask_id".into(), Value::String("t1".into()));
         assert!(is_plan_subtask_from_context_map(&m));
     }
+
+    // ──────────────────────────────────────────────────────────
+    // normalize_when
+    // ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn normalize_when_lowercase_and_replace_dash() {
+        assert_eq!(normalize_when("Task-Completed"), "task_completed");
+    }
+
+    #[test]
+    fn normalize_when_trims_whitespace() {
+        assert_eq!(normalize_when("  stop  "), "stop");
+    }
+
+    #[test]
+    fn normalize_when_already_normalized() {
+        assert_eq!(normalize_when("teammate_idle"), "teammate_idle");
+    }
+
+    #[test]
+    fn normalize_when_empty() {
+        assert_eq!(normalize_when(""), "");
+    }
+
+    // ──────────────────────────────────────────────────────────
+    // is_plan_subtask_from_context_map
+    // ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn context_map_detects_is_plan_subtask_flag() {
+        let mut m = Map::new();
+        m.insert("is_plan_subtask".into(), Value::Bool(true));
+        assert!(is_plan_subtask_from_context_map(&m));
+    }
+
+    #[test]
+    fn context_map_false_flag() {
+        let mut m = Map::new();
+        m.insert("is_plan_subtask".into(), Value::Bool(false));
+        assert!(!is_plan_subtask_from_context_map(&m));
+    }
+
+    #[test]
+    fn context_map_empty_subtask_id() {
+        let mut m = Map::new();
+        m.insert("plan_subtask_id".into(), Value::String("".into()));
+        assert!(!is_plan_subtask_from_context_map(&m));
+    }
+
+    #[test]
+    fn context_map_empty() {
+        let m = Map::new();
+        assert!(!is_plan_subtask_from_context_map(&m));
+    }
+
+    // ──────────────────────────────────────────────────────────
+    // is_plan_subtask_from_chat_context
+    // ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn chat_context_none() {
+        assert!(!is_plan_subtask_from_chat_context(&None));
+    }
+
+    #[test]
+    fn chat_context_with_flag() {
+        let mut m = Map::new();
+        m.insert("is_plan_subtask".into(), Value::Bool(true));
+        assert!(is_plan_subtask_from_chat_context(&Some(m)));
+    }
+
+    // ──────────────────────────────────────────────────────────
+    // is_plan_subtask_from_delegation_context
+    // ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn delegation_context_flag() {
+        let mut ctx = HashMap::new();
+        ctx.insert("is_plan_subtask".into(), Value::Bool(true));
+        assert!(is_plan_subtask_from_delegation_context(&ctx));
+    }
+
+    #[test]
+    fn delegation_context_subtask_id() {
+        let mut ctx = HashMap::new();
+        ctx.insert("plan_subtask_id".into(), Value::String("build-1".into()));
+        assert!(is_plan_subtask_from_delegation_context(&ctx));
+    }
+
+    #[test]
+    fn delegation_context_empty() {
+        let ctx = HashMap::new();
+        assert!(!is_plan_subtask_from_delegation_context(&ctx));
+    }
+
+    // ──────────────────────────────────────────────────────────
+    // project_root_from_delegation_context
+    // ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn delegation_root_from_git_root() {
+        let mut ctx = HashMap::new();
+        ctx.insert("git_root".into(), Value::String("/home/user/project".into()));
+        let r = project_root_from_delegation_context(&ctx).unwrap();
+        assert_eq!(r, PathBuf::from("/home/user/project"));
+    }
+
+    #[test]
+    fn delegation_root_from_workspace_root() {
+        let mut ctx = HashMap::new();
+        ctx.insert("workspace_root".into(), Value::String("/home/user/ws".into()));
+        let r = project_root_from_delegation_context(&ctx).unwrap();
+        assert_eq!(r, PathBuf::from("/home/user/ws"));
+    }
+
+    #[test]
+    fn delegation_root_from_cwd() {
+        let mut ctx = HashMap::new();
+        ctx.insert("cwd".into(), Value::String("/tmp".into()));
+        let r = project_root_from_delegation_context(&ctx).unwrap();
+        assert_eq!(r, PathBuf::from("/tmp"));
+    }
+
+    #[test]
+    fn delegation_root_prefers_git_root_over_cwd() {
+        let mut ctx = HashMap::new();
+        ctx.insert("git_root".into(), Value::String("/home/user/project".into()));
+        ctx.insert("cwd".into(), Value::String("/tmp".into()));
+        let r = project_root_from_delegation_context(&ctx).unwrap();
+        assert_eq!(r, PathBuf::from("/home/user/project"));
+    }
+
+    #[test]
+    fn delegation_root_empty_strings_skipped() {
+        let mut ctx = HashMap::new();
+        ctx.insert("git_root".into(), Value::String("".into()));
+        ctx.insert("cwd".into(), Value::String("/fallback".into()));
+        let r = project_root_from_delegation_context(&ctx).unwrap();
+        assert_eq!(r, PathBuf::from("/fallback"));
+    }
+
+    #[test]
+    fn delegation_root_empty_context() {
+        let ctx = HashMap::new();
+        assert!(project_root_from_delegation_context(&ctx).is_none());
+    }
+
+    #[test]
+    fn delegation_root_whitespace_only_skipped() {
+        let mut ctx = HashMap::new();
+        ctx.insert("git_root".into(), Value::String("   ".into()));
+        assert!(project_root_from_delegation_context(&ctx).is_none());
+    }
+
+    // ──────────────────────────────────────────────────────────
+    // resolve_working_dir
+    // ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn resolve_working_dir_none() {
+        let root = tempdir().unwrap();
+        let wd = resolve_working_dir(root.path(), None);
+        assert_eq!(wd, root.path().to_string_lossy());
+    }
+
+    #[test]
+    fn resolve_working_dir_dot() {
+        let root = tempdir().unwrap();
+        let wd = resolve_working_dir(root.path(), Some("."));
+        assert_eq!(wd, root.path().to_string_lossy());
+    }
+
+    #[test]
+    fn resolve_working_dir_empty() {
+        let root = tempdir().unwrap();
+        let wd = resolve_working_dir(root.path(), Some(""));
+        assert_eq!(wd, root.path().to_string_lossy());
+    }
+
+    #[test]
+    fn resolve_working_dir_subdir() {
+        let root = tempdir().unwrap();
+        let sub = root.path().join("subdir");
+        std::fs::create_dir_all(&sub).unwrap();
+        let wd = resolve_working_dir(root.path(), Some("subdir"));
+        assert!(wd.contains("subdir"));
+    }
+
+    // ──────────────────────────────────────────────────────────
+    // auto_detect_verify_changes_hook
+    // ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn auto_detect_no_verification_needed() {
+        let root = tempdir().unwrap();
+        let prof = TaskExecutionProfile::default(); // verification_required = false
+        let hooks = auto_detect_verify_changes_hook(root.path(), prof);
+        assert!(hooks.is_empty());
+    }
+
+    #[test]
+    fn auto_detect_no_markers() {
+        let root = tempdir().unwrap();
+        let prof = TaskExecutionProfile {
+            verification_required: true,
+            ..Default::default()
+        };
+        let hooks = auto_detect_verify_changes_hook(root.path(), prof);
+        assert!(hooks.is_empty()); // No Cargo.toml, package.json, etc.
+    }
+
+    #[test]
+    fn auto_detect_cargo_toml() {
+        let root = tempdir().unwrap();
+        std::fs::write(root.path().join("Cargo.toml"), "[package]").unwrap();
+        let prof = TaskExecutionProfile {
+            verification_required: true,
+            ..Default::default()
+        };
+        let hooks = auto_detect_verify_changes_hook(root.path(), prof);
+        assert_eq!(hooks.len(), 1);
+        assert!(hooks[0].command.contains("Rust/Cargo"));
+    }
+
+    #[test]
+    fn auto_detect_multiple_markers() {
+        let root = tempdir().unwrap();
+        std::fs::write(root.path().join("Cargo.toml"), "").unwrap();
+        std::fs::write(root.path().join("package.json"), "{}").unwrap();
+        let prof = TaskExecutionProfile {
+            verification_required: true,
+            ..Default::default()
+        };
+        let hooks = auto_detect_verify_changes_hook(root.path(), prof);
+        assert_eq!(hooks.len(), 1);
+        assert!(hooks[0].command.contains("Rust/Cargo"));
+        assert!(hooks[0].command.contains("Node.js"));
+    }
+
+    // ──────────────────────────────────────────────────────────
+    // detect_turn_hook_sets (disabled hooks, teammate_idle)
+    // ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn disabled_hook_is_skipped() {
+        let dir = tempdir().unwrap();
+        let mo = dir.path().join(".astra");
+        std::fs::create_dir_all(&mo).unwrap();
+        std::fs::write(
+            mo.join("stop-hooks.yaml"),
+            r#"version: 1
+auto_detect: false
+hooks:
+  - label: disabled-hook
+    command: echo nope
+    enabled: false
+  - label: active-hook
+    command: echo yes
+"#,
+        )
+        .unwrap();
+        let s = detect_turn_hook_sets(dir.path(), TaskExecutionProfile::default(), false);
+        assert_eq!(s.stop_hooks.len(), 1);
+        assert_eq!(s.stop_hooks[0].label, "active-hook");
+    }
+
+    #[test]
+    fn teammate_idle_hooks_parsed() {
+        let dir = tempdir().unwrap();
+        let mo = dir.path().join(".astra");
+        std::fs::create_dir_all(&mo).unwrap();
+        std::fs::write(
+            mo.join("stop-hooks.yaml"),
+            r#"version: 1
+auto_detect: false
+hooks:
+  - label: idle-check
+    command: echo idle
+    when: teammate_idle
+"#,
+        )
+        .unwrap();
+        let s = detect_turn_hook_sets(dir.path(), TaskExecutionProfile::default(), false);
+        assert!(s.stop_hooks.is_empty());
+        assert_eq!(s.teammate_idle_hooks.len(), 1);
+        assert_eq!(s.teammate_idle_hooks[0].label, "idle-check");
+    }
+
+    #[test]
+    fn no_yaml_file_returns_empty() {
+        let dir = tempdir().unwrap();
+        let s = detect_turn_hook_sets(dir.path(), TaskExecutionProfile::default(), false);
+        assert!(s.stop_hooks.is_empty());
+        assert!(s.teammate_idle_hooks.is_empty());
+    }
 }

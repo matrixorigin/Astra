@@ -215,4 +215,255 @@ mod tests {
     fn verdict_icon_critical() {
         assert_eq!(verdict_severity_icon("critical"), "🛑");
     }
+
+    // ──────────────────────────────────────────────────────────
+    // explain_turn_summary_line
+    // ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn turn_summary_line_format() {
+        let s = explain_turn_summary_line(1, 250, "1024", "512", "tools: 3/10");
+        assert!(s.contains("Turn 1"));
+        assert!(s.contains("250ms"));
+        assert!(s.contains("1024→512"));
+        assert!(s.contains("tools: 3/10"));
+    }
+
+    #[test]
+    fn turn_summary_line_zero_values() {
+        let s = explain_turn_summary_line(0, 0, "0", "0", "");
+        assert!(s.contains("Turn 0"));
+        assert!(s.contains("0ms"));
+    }
+
+    // ──────────────────────────────────────────────────────────
+    // explain_tool_info_line
+    // ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn tool_info_line_no_suffixes_no_skills() {
+        let s = explain_tool_info_line("5", "20", None, None, "");
+        assert_eq!(s, "tools: 5/20");
+    }
+
+    #[test]
+    fn tool_info_line_selection_suffix_only() {
+        let s = explain_tool_info_line("3", "10", Some(" → adaptive".into()), None, "");
+        assert!(s.contains("→ adaptive"));
+        assert!(!s.contains("skills="));
+    }
+
+    #[test]
+    fn tool_info_line_fallback_suffix_only() {
+        let s = explain_tool_info_line("3", "10", None, Some(" ⚠fallback:x".into()), "");
+        assert!(s.contains("⚠fallback:x"));
+    }
+
+    // ──────────────────────────────────────────────────────────
+    // explain_routing_*
+    // ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn routing_skipped_line() {
+        let s = explain_routing_skipped_line("no classifier loaded");
+        assert!(s.contains("skipped (no classifier loaded)"));
+    }
+
+    #[test]
+    fn routing_active_line() {
+        let s = explain_routing_active_line("code_edit", "0.95", "fast", 12.5, "4096");
+        assert!(s.contains("code_edit"));
+        assert!(s.contains("conf=0.95"));
+        assert!(s.contains("tier=fast"));
+        assert!(s.contains("12ms") || s.contains("13ms")); // {:.0} rounds to nearest
+        assert!(s.contains("~4096tok"));
+    }
+
+    // ──────────────────────────────────────────────────────────
+    // explain_l0_profile_line
+    // ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn l0_profile_line() {
+        let s = explain_l0_profile_line("cached", 2048, 5.3);
+        assert!(s.contains("L0 profile"));
+        assert!(s.contains("cached"));
+        assert!(s.contains("2048 tokens"));
+        assert!(s.contains("5ms"));
+    }
+
+    // ──────────────────────────────────────────────────────────
+    // explain_l1_retrieval_line
+    // ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn l1_retrieval_line() {
+        let s = explain_l1_retrieval_line(25.0, "3", 10, "5", 20, 7, 5, 512);
+        assert!(s.contains("L1 retrieval"));
+        assert!(s.contains("25ms"));
+        assert!(s.contains("kw=3(10)"));
+        assert!(s.contains("vec=5(20)"));
+        assert!(s.contains("512 tokens"));
+    }
+
+    // ──────────────────────────────────────────────────────────
+    // explain_memory_total_line
+    // ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn memory_total_line() {
+        let s = explain_memory_total_line(42.7);
+        assert!(s.contains("memory total"));
+        assert!(s.contains("43ms")); // rounded
+    }
+
+    // ──────────────────────────────────────────────────────────
+    // explain_step_llm_line / explain_step_generic_line
+    // ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn step_llm_line() {
+        let s = explain_step_llm_line(300, "in=1024 out=256");
+        assert!(s.contains("LLM"));
+        assert!(s.contains("300ms"));
+        assert!(s.contains("in=1024 out=256"));
+    }
+
+    #[test]
+    fn step_generic_line() {
+        let s = explain_step_generic_line("planning", 50);
+        assert!(s.contains("planning"));
+        assert!(s.contains("50ms"));
+    }
+
+    // ──────────────────────────────────────────────────────────
+    // explain_llm_tokens_suffix
+    // ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn llm_tokens_suffix_no_tool_calls() {
+        let s = explain_llm_tokens_suffix("1024", "256", 0);
+        assert_eq!(s, "in=1024 out=256");
+    }
+
+    #[test]
+    fn llm_tokens_suffix_with_tool_calls() {
+        let s = explain_llm_tokens_suffix("1024", "256", 3);
+        assert!(s.contains("tool_calls=3"));
+    }
+
+    // ──────────────────────────────────────────────────────────
+    // explain_auxiliary_llm_*
+    // ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn auxiliary_llm_header_line() {
+        let s = explain_auxiliary_llm_header_line(2, "512");
+        assert!(s.contains("auxiliary LLM"));
+        assert!(s.contains("2 calls"));
+        assert!(s.contains("512 tokens"));
+    }
+
+    #[test]
+    fn auxiliary_llm_call_line() {
+        let s = explain_auxiliary_llm_call_line("routing", 15, "100", "50");
+        assert!(s.contains("routing"));
+        assert!(s.contains("15ms"));
+        assert!(s.contains("100→50"));
+    }
+
+    // ──────────────────────────────────────────────────────────
+    // explain_content_preview_line / explain_phase_timing_line
+    // ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn content_preview_line() {
+        let s = explain_content_preview_line("Hello world...");
+        assert!(s.contains("content  Hello world..."));
+    }
+
+    #[test]
+    fn phase_timing_line() {
+        let s = explain_phase_timing_line("memory", 42);
+        assert!(s.contains("phase  memory  42ms"));
+    }
+
+    // ──────────────────────────────────────────────────────────
+    // explain_memory_candidate_line
+    // ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn memory_candidate_line() {
+        let s = explain_memory_candidate_line("mem_42", 0.875);
+        assert!(s.contains("candidate  mem_42  score=0.875"));
+    }
+
+    // ──────────────────────────────────────────────────────────
+    // explain_totals_line
+    // ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn totals_line() {
+        let s = explain_totals_line(500, "2048", "1024");
+        assert!(s.contains("Total: 500ms"));
+        assert!(s.contains("2048→1024"));
+    }
+
+    // ──────────────────────────────────────────────────────────
+    // verdict_severity_icon
+    // ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn verdict_icon_warning() {
+        assert_eq!(verdict_severity_icon("warning"), "⚠");
+    }
+
+    #[test]
+    fn verdict_icon_unknown() {
+        assert_eq!(verdict_severity_icon("info"), "ℹ");
+        assert_eq!(verdict_severity_icon("other"), "ℹ");
+    }
+
+    // ──────────────────────────────────────────────────────────
+    // verdict_event_summary_line
+    // ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn verdict_event_summary_no_force_stop() {
+        let s = verdict_event_summary_line(3, "⚠", "warning", 2, 1, 0, false);
+        assert!(s.contains("T3"));
+        assert!(s.contains("⚠"));
+        assert!(s.contains("nudges=2"));
+        assert!(s.contains("errors=1"));
+        assert!(!s.contains("FORCE_STOP"));
+    }
+
+    #[test]
+    fn verdict_event_summary_with_force_stop() {
+        let s = verdict_event_summary_line(1, "🛑", "critical", 0, 5, 2, true);
+        assert!(s.contains("FORCE_STOP"));
+        assert!(s.contains("deprioritized=2"));
+    }
+
+    // ──────────────────────────────────────────────────────────
+    // verdict_avoid_tools_line / verdict_injection_*
+    // ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn verdict_avoid_tools_line_format() {
+        let s = verdict_avoid_tools_line("bash, exec");
+        assert!(s.contains("avoid: [bash, exec]"));
+    }
+
+    #[test]
+    fn verdict_injection_preview_line_format() {
+        let s = verdict_injection_preview_line(0, "You should not use bash");
+        assert!(s.contains("injection[0]:"));
+        assert!(s.contains("You should not use bash"));
+    }
+
+    #[test]
+    fn verdict_injection_count_line_format() {
+        assert!(verdict_injection_count_line(3).contains("3 injection(s)"));
+    }
 }
