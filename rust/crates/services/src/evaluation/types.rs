@@ -155,6 +155,111 @@ fn default_export_format() -> String {
     "jsonl".into()
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ──────────────────────────────────────────────────────────
+    // default value functions
+    // ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn default_values() {
+        assert_eq!(default_days(), 30);
+        assert_eq!(default_limit(), 50);
+        assert_eq!(default_golden_count(), 50);
+        assert!((default_error_threshold() - 0.05).abs() < 1e-9);
+        assert!((default_score_regression() - (-0.1)).abs() < 1e-9);
+        assert!((default_min_quality() - 0.7).abs() < 1e-9);
+        assert_eq!(default_extract_limit(), 1000);
+        assert_eq!(default_export_format(), "jsonl");
+    }
+
+    // ──────────────────────────────────────────────────────────
+    // serde enum round-trips
+    // ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn drift_severity_roundtrip() {
+        let json = serde_json::to_string(&DriftSeverity::Critical).unwrap();
+        assert_eq!(json, r#""critical""#);
+        let parsed: DriftSeverity = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, DriftSeverity::Critical);
+    }
+
+    #[test]
+    fn change_type_roundtrip() {
+        let json = serde_json::to_string(&ChangeType::Prompt).unwrap();
+        assert_eq!(json, r#""prompt""#);
+        let parsed: ChangeType = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, ChangeType::Prompt);
+    }
+
+    #[test]
+    fn loop_action_roundtrip() {
+        let json = serde_json::to_string(&LoopAction::NoOp).unwrap();
+        assert_eq!(json, r#""no_op""#);
+        let parsed: LoopAction = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, LoopAction::NoOp);
+    }
+
+    #[test]
+    fn export_format_roundtrip() {
+        for variant in [ExportFormat::Jsonl, ExportFormat::Csv, ExportFormat::Parquet] {
+            let json = serde_json::to_string(&variant).unwrap();
+            let parsed: ExportFormat = serde_json::from_str(&json).unwrap();
+            assert_eq!(parsed, variant);
+        }
+    }
+
+    // ──────────────────────────────────────────────────────────
+    // query deserialization with defaults
+    // ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn quality_trend_query_defaults() {
+        let q: QualityTrendQuery = serde_json::from_str("{}").unwrap();
+        assert_eq!(q.days, 30);
+        assert!(q.model.is_none());
+    }
+
+    #[test]
+    fn gate_history_query_defaults() {
+        let q: GateHistoryQuery = serde_json::from_str("{}").unwrap();
+        assert_eq!(q.limit, 50);
+    }
+
+    #[test]
+    fn session_scores_query_defaults() {
+        let q: SessionScoresQuery = serde_json::from_str("{}").unwrap();
+        assert_eq!(q.limit, 50);
+        assert_eq!(q.min_score, 0.0);
+    }
+
+    #[test]
+    fn gate_validate_request_defaults() {
+        let json = r#"{"change_type":"prompt","change_id":"c1","change_content":{}}"#;
+        let req: GateValidateRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.golden_session_count, 50);
+        assert!((req.error_rate_threshold - 0.05).abs() < 1e-9);
+        assert!((req.score_regression_threshold - (-0.1)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn export_query_defaults() {
+        let q: ExportQuery = serde_json::from_str("{}").unwrap();
+        assert_eq!(q.format, "jsonl");
+    }
+
+    #[test]
+    fn training_data_extract_defaults() {
+        let q: TrainingDataExtractRequest = serde_json::from_str("{}").unwrap();
+        assert_eq!(q.days, 30);
+        assert!((q.min_quality - 0.7).abs() < 1e-9);
+        assert_eq!(q.max_samples, 1000);
+    }
+}
+
 // ── Response types ───────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
