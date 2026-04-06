@@ -729,6 +729,8 @@ fn default_per_group() -> u32 {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[test]
     fn install_count_query_uses_status_not_is_active() {
         let sql = "SELECT COUNT(*) AS cnt FROM skill_installations WHERE skill_name = ? AND status = 'installed'";
@@ -737,5 +739,34 @@ mod tests {
             "skill_installations has no is_active column; use status = 'installed'"
         );
         assert!(sql.contains("status = 'installed'"));
+    }
+
+    #[test]
+    fn publish_request_defaults() {
+        let json = r#"{"name":"test","version":"1.0","description":"desc"}"#;
+        let req: PublishSkillRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.category, "user");
+        assert_eq!(req.priority, 5);
+        assert!(req.triggers.is_none());
+        assert!(req.manifest.is_none());
+    }
+
+    #[test]
+    fn skill_list_query_defaults() {
+        let q: SkillListQuery = serde_json::from_str("{}").unwrap();
+        assert_eq!(q.limit, 50);
+        assert_eq!(q.offset, 0);
+    }
+
+    #[test]
+    fn skill_status_query_default() {
+        let q: SkillStatusQuery = serde_json::from_str("{}").unwrap();
+        assert_eq!(q.per_group, 50);
+    }
+
+    #[test]
+    fn skill_get_query_no_version() {
+        let q: SkillGetQuery = serde_json::from_str("{}").unwrap();
+        assert!(q.version.is_none());
     }
 }

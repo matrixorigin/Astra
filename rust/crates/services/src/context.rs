@@ -404,3 +404,21 @@ impl From<SnapshotListRecord> for SnapshotListResponse {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn snapshot_list_query_defaults() {
+        let q: SnapshotListQuery = serde_json::from_str("{}").unwrap();
+        assert_eq!(q.limit, 50);
+        assert_eq!(q.offset, 0);
+        assert!(q.session_id.is_none());
+    }
+
+    #[test]
+    fn default_snapshot_limit_value() {
+        assert_eq!(default_snapshot_limit(), 50);
+    }
+}
