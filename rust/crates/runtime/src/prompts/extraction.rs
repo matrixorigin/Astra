@@ -119,3 +119,110 @@ User preferences, project conventions, or important details worth remembering.
 - After the bullets under `### Key Facts`, stop. Do not add closing remarks or a summary line.
 - Use bullet points under each section, not prose paragraphs.
 - Do not paste the raw transcript; summarize.";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_empty_array() {
+        assert!(parse_extracted_facts("[]").is_empty());
+    }
+
+    #[test]
+    fn parse_valid_json() {
+        let input = r#"[{"fact": "Uses Rust.", "type": "procedural"}]"#;
+        let facts = parse_extracted_facts(input);
+        assert_eq!(facts.len(), 1);
+        assert_eq!(facts[0].0, "Uses Rust.");
+        assert_eq!(facts[0].1, "procedural");
+    }
+
+    #[test]
+    fn parse_with_markdown_fences() {
+        let input = "```json\n[{\"fact\": \"Prefers vim.\", \"type\": \"profile\"}]\n```";
+        let facts = parse_extracted_facts(input);
+        assert_eq!(facts.len(), 1);
+        assert_eq!(facts[0].1, "profile");
+    }
+
+    #[test]
+    fn parse_with_plain_fences() {
+        let input = "```\n[{\"fact\": \"Test.\", \"type\": \"semantic\"}]\n```";
+        let facts = parse_extracted_facts(input);
+        assert_eq!(facts.len(), 1);
+    }
+
+    #[test]
+    fn parse_with_preamble() {
+        let input = "Here are the facts:\n[{\"fact\": \"Preamble test.\", \"type\": \"working\"}]";
+        let facts = parse_extracted_facts(input);
+        assert_eq!(facts.len(), 1);
+        assert_eq!(facts[0].1, "working");
+    }
+
+    #[test]
+    fn parse_invalid_type_defaults_semantic() {
+        let input = r#"[{"fact": "Test.", "type": "invalid_type"}]"#;
+        let facts = parse_extracted_facts(input);
+        assert_eq!(facts[0].1, "semantic");
+    }
+
+    #[test]
+    fn parse_missing_type_defaults_semantic() {
+        let input = r#"[{"fact": "No type field."}]"#;
+        let facts = parse_extracted_facts(input);
+        assert_eq!(facts[0].1, "semantic");
+    }
+
+    #[test]
+    fn parse_empty_fact_filtered() {
+        let input = r#"[{"fact": "", "type": "semantic"}, {"fact": "  ", "type": "semantic"}]"#;
+        let facts = parse_extracted_facts(input);
+        assert!(facts.is_empty());
+    }
+
+    #[test]
+    fn parse_missing_fact_field_filtered() {
+        let input = r#"[{"type": "semantic"}]"#;
+        let facts = parse_extracted_facts(input);
+        assert!(facts.is_empty());
+    }
+
+    #[test]
+    fn parse_garbage_input() {
+        assert!(parse_extracted_facts("not json at all").is_empty());
+    }
+
+    #[test]
+    fn parse_no_brackets() {
+        assert!(parse_extracted_facts("just some text without brackets").is_empty());
+    }
+
+    #[test]
+    fn parse_all_valid_types() {
+        for t in &["semantic", "profile", "procedural", "working"] {
+            let input = format!(r#"[{{"fact": "Test.", "type": "{t}"}}]"#);
+            let facts = parse_extracted_facts(&input);
+            assert_eq!(facts[0].1, *t);
+        }
+    }
+
+    #[test]
+    fn parse_multiple_facts() {
+        let input = r#"[
+            {"fact": "One.", "type": "semantic"},
+            {"fact": "Two.", "type": "profile"},
+            {"fact": "Three.", "type": "procedural"}
+        ]"#;
+        let facts = parse_extracted_facts(input);
+        assert_eq!(facts.len(), 3);
+    }
+
+    #[test]
+    fn parse_fact_trimmed() {
+        let input = r#"[{"fact": "  spaced  ", "type": "semantic"}]"#;
+        let facts = parse_extracted_facts(input);
+        assert_eq!(facts[0].0, "spaced");
+    }
+}

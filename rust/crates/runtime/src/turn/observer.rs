@@ -21,3 +21,44 @@ pub fn build_observer_messages(
     ]));
     messages
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn should_run_text_no_calls() {
+        assert!(should_run_observer("hello", false));
+    }
+
+    #[test]
+    fn should_run_empty_text() {
+        assert!(!should_run_observer("", false));
+    }
+
+    #[test]
+    fn should_run_has_tool_calls() {
+        assert!(!should_run_observer("hello", true));
+    }
+
+    #[test]
+    fn observer_messages_with_user() {
+        let msgs = build_observer_messages(Some("question"), "answer");
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0]["role"].as_str().unwrap(), "user");
+        assert_eq!(msgs[1]["role"].as_str().unwrap(), "assistant");
+    }
+
+    #[test]
+    fn observer_messages_no_user() {
+        let msgs = build_observer_messages(None, "answer");
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0]["role"].as_str().unwrap(), "assistant");
+    }
+
+    #[test]
+    fn observer_messages_empty_user_content() {
+        let msgs = build_observer_messages(Some(""), "answer");
+        assert_eq!(msgs.len(), 1);
+    }
+}
