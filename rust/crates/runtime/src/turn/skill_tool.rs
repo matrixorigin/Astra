@@ -21,10 +21,13 @@
 //! | CLI  | astra-cli | Wraps `SkillRegistry` from `skill_instructions.rs` |
 //! | Server | runtime/server | (Future) wraps cloud skill catalog |
 //!
-//! # Future: Sub-agent execution
+//! # Fork (isolated) execution
 //!
-//! Skills with `isolated: true` (not yet supported) will get a full sub-loop
-//! via [`SubRunExecutor`](super::super::server::delegation_engine::SubRunExecutor).
+//! Skills with [`ExecutionContext::Fork`](crate::skills::manifest::ExecutionContext::Fork)
+//! run in a nested agentic loop via [`crate::skills::executor::IsolatedSkillExecutor`] and a
+//! host-provided [`crate::skills::executor::SkillSubRunExecutor`] (e.g. CLI fork sub-run host).
+//! Recursive fork is disabled in sub-runs (`skill_executor: None`); nested `skill` calls are
+//! still resolved and executed **inline** so composition can proceed.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -1402,8 +1405,8 @@ fn execute_skill<'a>(
                                 "  ⚠ Fork execution of skill '{}' failed: {}; falling back to inline",
                                 skill_name, e
                             );
-                            // Fall through to inline — pre_invoke already ran,
-                            // on_error deferred until inline also fails (if it does).
+                            // pre_invoke already ran; notify lifecycle hooks, then fall back to inline.
+                            run_hooks(&skill.hooks.on_error, is_mcp);
                         }
                     }
                 }

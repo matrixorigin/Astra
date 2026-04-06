@@ -8,6 +8,7 @@
 use async_trait::async_trait;
 use std::collections::HashSet;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use astra_runtime::skills::executor::isolated::{SkillSubRunExecutor, SubRunResult};
 use astra_runtime::{
@@ -57,6 +58,9 @@ struct SubRunHost {
     agent_type: Option<String>,
     /// Parent cancellation token — so Ctrl+C / stop propagates into sub-runs.
     cancel_token: Option<std::sync::Arc<tokio_util::sync::CancellationToken>>,
+    /// Same resolver as the parent loop so `skill` tool calls during the SSE edge
+    /// round resolve (nested skills run inline — sub-run has no `skill_executor`).
+    skill_resolver: Option<Arc<dyn astra_runtime::turn::skill_tool::SkillResolver>>,
 }
 
 #[async_trait]
@@ -132,7 +136,7 @@ impl AgenticLoopHost for SubRunHost {
             cancel_token: self.cancel_token.as_ref().map(|t| t.as_ref()),
             stream_event_tx: None,
             approval_request_tx: None,
-            skill_resolver: None,
+            skill_resolver: self.skill_resolver.clone(),
         };
 
         let prep_line = ChatTurnPrepLineGuard::maybe_start(false, None);
@@ -269,6 +273,7 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
             effort: effort.map(String::from),
             agent_type: agent_type.map(String::from),
             cancel_token: self.cancel_token.clone(),
+            skill_resolver: self.skill_resolver.clone(),
         };
 
         let messages = vec![
