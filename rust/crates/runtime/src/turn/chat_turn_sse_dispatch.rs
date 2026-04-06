@@ -22,6 +22,8 @@ pub struct ChatTurnSseAccum {
     pub has_tool_calls: bool,
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_creation_tokens: u64,
     pub has_usage: bool,
     pub error_message: Option<String>,
 }
@@ -162,6 +164,14 @@ fn apply_one_event(
             }
             accum.prompt_tokens = prompt.unwrap_or(0);
             accum.completion_tokens = completion.unwrap_or(0);
+            accum.cache_read_tokens = event
+                .get("cache_read_tokens")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            accum.cache_creation_tokens = event
+                .get("cache_creation_tokens")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
             accum.has_usage = true;
         }
         "error" => {

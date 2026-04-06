@@ -821,6 +821,18 @@ fn apply_turn_success(
     state.turn += 1;
     state.total_prompt_tokens += result.prompt_tokens;
     state.total_completion_tokens += result.completion_tokens;
+    state.total_cache_read_tokens += result.cache_read_tokens;
+    state.total_cache_creation_tokens += result.cache_creation_tokens;
+
+    // Accumulate per-turn cost
+    let turn_cost = crate::cost_for_tokens(
+        result.prompt_tokens,
+        result.completion_tokens,
+        result.cache_read_tokens,
+        result.cache_creation_tokens,
+        &state.cached_pricing,
+    );
+    state.total_session_cost += turn_cost;
     state.last_response = Some(result.full_text.clone());
     state.continuation_anchor = build_continuation_anchor(state, line, &result);
     state
@@ -877,6 +889,15 @@ fn print_turn_status_line(state: &ReplState, result: &StreamResult, turn_start: 
         format!("{}", result.completion_tokens)
     };
 
+    // Per-turn cost
+    let turn_cost = crate::cost_for_tokens(
+        result.prompt_tokens,
+        result.completion_tokens,
+        result.cache_read_tokens,
+        result.cache_creation_tokens,
+        &state.cached_pricing,
+    );
+
     let mut parts = Vec::new();
 
     if let Some(ref model) = state.model {
@@ -886,6 +907,12 @@ fn print_turn_status_line(state: &ReplState, result: &StreamResult, turn_start: 
     parts.push(format!(
         "tokens:{tokens_str} (↑{prompt_short} ↓{completion_short})"
     ));
+
+    // Show turn cost (skip if pricing not available)
+    if turn_cost > 0.0 {
+        parts.push(crate::format_cost(turn_cost));
+    }
+
     parts.push(elapsed_str);
 
     if result.tool_calls_count > 0 {
@@ -900,8 +927,22 @@ fn print_turn_status_line(state: &ReplState, result: &StreamResult, turn_start: 
         ));
     }
 
+    // Cache savings indicator
+    if result.cache_read_tokens > 0 {
+        let cache_pct =
+            result.cache_read_tokens as f64 / (result.prompt_tokens + result.cache_read_tokens).max(1) as f64 * 100.0;
+        parts.push(format!("cache:{cache_pct:.0}%"));
+    }
+
     let line = format!("  ─ {} ─", parts.join(" │ "));
     eprintln!("{}", line.dim());
+
+    // Session total on second line (only after first turn with pricing)
+    let session_cost = state.total_session_cost + turn_cost;
+    if session_cost > 0.0 && state.turn > 0 {
+        let session_line = format!("  session: {}", crate::format_cost(session_cost));
+        eprintln!("{}", session_line.dim());
+    }
 
     let w = crossterm::terminal::size()
         .map(|(c, _)| c as usize)

@@ -438,6 +438,8 @@ pub(crate) struct StreamResult {
     full_text: String,
     prompt_tokens: u64,
     completion_tokens: u64,
+    cache_read_tokens: u64,
+    cache_creation_tokens: u64,
     tool_calls_count: u32,
     /// Tool names selected for LLM (first turn selection report).
     tools_selected: Vec<String>,
@@ -510,6 +512,10 @@ struct ReplState {
     history: Vec<(String, String)>, // (user_msg, assistant_msg)
     total_prompt_tokens: u64,
     total_completion_tokens: u64,
+    total_cache_read_tokens: u64,
+    total_cache_creation_tokens: u64,
+    /// Per-turn cost accumulator (sum of all turns in this session).
+    total_session_cost: f64,
     /// Cached pricing data for the active model (used by /cost).
     cached_pricing: astra_services::models::PricingData,
     skill_dev_name: Option<String>,
@@ -623,6 +629,9 @@ impl Default for ReplState {
             history: Vec::new(),
             total_prompt_tokens: 0,
             total_completion_tokens: 0,
+            total_cache_read_tokens: 0,
+            total_cache_creation_tokens: 0,
+            total_session_cost: 0.0,
             cached_pricing: Default::default(),
             skill_dev_name: None,
             skill_dev_dir: None,
@@ -1435,7 +1444,7 @@ fn handle_cost_command(arg: &str, state: &ReplState) {
                     turn_num += 1;
                     let p_tok = ev.tokens_in.unwrap_or(0);
                     let c_tok = ev.tokens_out.unwrap_or(0);
-                    let cost = cost_for_tokens(p_tok, c_tok, pricing);
+                    let cost = cost_for_tokens(p_tok, c_tok, 0, 0, pricing);
                     total_in += p_tok;
                     total_out += c_tok;
                     total_cost += cost;
@@ -1499,7 +1508,7 @@ fn handle_cost_command(arg: &str, state: &ReplState) {
                 if let Ok(events) = session_journal::read_journal(sid) {
                     let stats = session_analytics::compute_session_stats(sid, &events);
                     let cost =
-                        cost_for_tokens(stats.total_tokens_in, stats.total_tokens_out, pricing);
+                        cost_for_tokens(stats.total_tokens_in, stats.total_tokens_out, 0, 0, pricing);
                     grand_total += cost;
 
                     let short = &sid[..8.min(sid.len())];
@@ -1530,6 +1539,8 @@ fn handle_cost_command(arg: &str, state: &ReplState) {
             let cost = cost_for_tokens(
                 state.total_prompt_tokens,
                 state.total_completion_tokens,
+                state.total_cache_read_tokens,
+                state.total_cache_creation_tokens,
                 pricing,
             );
 
@@ -1587,10 +1598,16 @@ fn handle_cost_command(arg: &str, state: &ReplState) {
 pub(crate) fn cost_for_tokens(
     prompt_tokens: u64,
     completion_tokens: u64,
+    cache_read_tokens: u64,
+    cache_creation_tokens: u64,
     pricing: &astra_services::models::PricingData,
 ) -> f64 {
+    let cache_read_rate = pricing.cache_read.unwrap_or(pricing.prompt * 0.1);
+    let cache_write_rate = pricing.cache_write.unwrap_or(pricing.prompt * 1.25);
     (prompt_tokens as f64 * pricing.prompt / 1000.0)
         + (completion_tokens as f64 * pricing.completion / 1000.0)
+        + (cache_read_tokens as f64 * cache_read_rate / 1000.0)
+        + (cache_creation_tokens as f64 * cache_write_rate / 1000.0)
 }
 
 /// Format a dollar cost for display.
@@ -7172,7 +7189,7 @@ total_tokens_out: 500
             cache_read: None,
             cache_write: None,
         };
-        let cost = cost_for_tokens(1000, 500, &pricing);
+        let cost = cost_for_tokens(1000, 500, 0, 0, &pricing);
         // 1000 * 0.003/1000 + 500 * 0.015/1000 = 0.003 + 0.0075 = 0.0105
         assert!(
             (cost - 0.0105).abs() < 1e-10,
@@ -7188,13 +7205,13 @@ total_tokens_out: 500
             cache_read: None,
             cache_write: None,
         };
-        assert_eq!(cost_for_tokens(0, 0, &pricing), 0.0);
+        assert_eq!(cost_for_tokens(0, 0, 0, 0, &pricing), 0.0);
     }
 
     #[test]
     fn cost_for_tokens_zero_pricing() {
         let pricing = astra_services::models::PricingData::default();
-        assert_eq!(cost_for_tokens(10000, 5000, &pricing), 0.0);
+        assert_eq!(cost_for_tokens(10000, 5000, 0, 0, &pricing), 0.0);
     }
 
     #[test]
@@ -7206,11 +7223,48 @@ total_tokens_out: 500
             cache_write: None,
         };
         // 1M prompt + 500K completion
-        let cost = cost_for_tokens(1_000_000, 500_000, &pricing);
+        let cost = cost_for_tokens(1_000_000, 500_000, 0, 0, &pricing);
         // 1M * 0.003/1K + 500K * 0.015/1K = 3.0 + 7.5 = 10.5
         assert!(
             (cost - 10.5).abs() < 1e-6,
             "large token cost should be $10.50, got {cost}"
+        );
+    }
+
+    #[test]
+    fn cost_for_tokens_with_cache() {
+        let pricing = astra_services::models::PricingData {
+            prompt: 0.003,
+            completion: 0.015,
+            cache_read: Some(0.0003),  // 10% of prompt
+            cache_write: Some(0.00375), // 125% of prompt
+        };
+        // 500 prompt + 200 completion + 1000 cache_read + 100 cache_write
+        let cost = cost_for_tokens(500, 200, 1000, 100, &pricing);
+        let expected = (500.0 * 0.003 / 1000.0)
+            + (200.0 * 0.015 / 1000.0)
+            + (1000.0 * 0.0003 / 1000.0)
+            + (100.0 * 0.00375 / 1000.0);
+        assert!(
+            (cost - expected).abs() < 1e-10,
+            "cache cost should be {expected}, got {cost}"
+        );
+    }
+
+    #[test]
+    fn cost_for_tokens_cache_fallback_rates() {
+        // When cache_read/cache_write are None, uses 10%/125% of prompt rate
+        let pricing = astra_services::models::PricingData {
+            prompt: 0.003,
+            completion: 0.015,
+            cache_read: None,
+            cache_write: None,
+        };
+        let cost = cost_for_tokens(0, 0, 1000, 1000, &pricing);
+        let expected = (1000.0 * 0.003 * 0.1 / 1000.0) + (1000.0 * 0.003 * 1.25 / 1000.0);
+        assert!(
+            (cost - expected).abs() < 1e-10,
+            "fallback cache cost should be {expected}, got {cost}"
         );
     }
 

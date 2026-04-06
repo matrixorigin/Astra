@@ -26,6 +26,8 @@ pub struct AgenticTurnStreamSnapshot<'a> {
     pub tool_calls: &'a [Value],
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_creation_tokens: u64,
     pub has_usage: bool,
     pub error_message: &'a Option<String>,
 }
@@ -44,6 +46,8 @@ pub fn agentic_turn_stream_snapshot_from_sse_accum<'a>(
         tool_calls: accum.tool_calls.as_slice(),
         prompt_tokens: accum.prompt_tokens,
         completion_tokens: accum.completion_tokens,
+        cache_read_tokens: accum.cache_read_tokens,
+        cache_creation_tokens: accum.cache_creation_tokens,
         has_usage: accum.has_usage,
         error_message: &accum.error_message,
     }
@@ -58,6 +62,8 @@ pub struct AgenticTurnIngestMut<'a> {
     pub final_text: &'a mut String,
     pub total_prompt: &'a mut u64,
     pub total_completion: &'a mut u64,
+    pub total_cache_read: &'a mut u64,
+    pub total_cache_creation: &'a mut u64,
     pub total_tool_calls: &'a mut u32,
     pub step_recorder: &'a mut StepRecorder,
     pub all_tools_used: &'a mut HashSet<String>,
@@ -148,6 +154,8 @@ pub fn ingest_agentic_turn_stream(
 
     *st.total_prompt += snap.prompt_tokens;
     *st.total_completion += snap.completion_tokens;
+    *st.total_cache_read += snap.cache_read_tokens;
+    *st.total_cache_creation += snap.cache_creation_tokens;
     *st.total_tool_calls += if !snap.tool_calls.is_empty() {
         snap.tool_calls.len()
     } else {
@@ -227,6 +235,8 @@ mod tests {
         final_text: String,
         total_prompt: u64,
         total_completion: u64,
+        total_cache_read: u64,
+        total_cache_creation: u64,
         total_tool_calls: u32,
         step_recorder: StepRecorder,
         all_tools_used: HashSet<String>,
@@ -246,6 +256,8 @@ mod tests {
                 final_text: String::new(),
                 total_prompt: 0,
                 total_completion: 0,
+                total_cache_read: 0,
+                total_cache_creation: 0,
                 total_tool_calls: 0,
                 step_recorder: StepRecorder::with_persistence("s", "t"),
                 all_tools_used: HashSet::new(),
@@ -266,6 +278,8 @@ mod tests {
                 final_text: &mut self.final_text,
                 total_prompt: &mut self.total_prompt,
                 total_completion: &mut self.total_completion,
+                total_cache_read: &mut self.total_cache_read,
+                total_cache_creation: &mut self.total_cache_creation,
                 total_tool_calls: &mut self.total_tool_calls,
                 step_recorder: &mut self.step_recorder,
                 all_tools_used: &mut self.all_tools_used,
@@ -287,6 +301,8 @@ mod tests {
             tool_calls: vec![json!({"name": "bash"})],
             prompt_tokens: 3,
             completion_tokens: 4,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
             has_usage: true,
             error_message: Some("e".into()),
             ..Default::default()
@@ -334,6 +350,8 @@ mod tests {
             tool_calls: &[],
             prompt_tokens: 0,
             completion_tokens: 0,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
             has_usage: false,
             error_message: &err,
         };
@@ -362,6 +380,8 @@ mod tests {
             tool_calls: &[],
             prompt_tokens: 5,
             completion_tokens: 1,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
             has_usage: true,
             error_message: &err,
         };
@@ -394,6 +414,8 @@ mod tests {
             tool_calls: &[],
             prompt_tokens: 0,
             completion_tokens: 0,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
             has_usage: false,
             error_message: &err,
         };
@@ -425,6 +447,8 @@ mod tests {
             tool_calls: &[],
             prompt_tokens: 1,
             completion_tokens: 2,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
             has_usage: true,
             error_message: &None,
         };
@@ -457,6 +481,8 @@ mod tests {
             tool_calls: &[],
             prompt_tokens: 0,
             completion_tokens: 0,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
             has_usage: false,
             error_message: &None,
         };
@@ -486,6 +512,8 @@ mod tests {
             tool_calls: &tcs,
             prompt_tokens: 0,
             completion_tokens: 0,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
             has_usage: false,
             error_message: &None,
         };
@@ -514,6 +542,8 @@ mod tests {
             tool_calls: &tcs,
             prompt_tokens: 1,
             completion_tokens: 2,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
             has_usage: true,
             error_message: &None,
         };
@@ -546,6 +576,8 @@ mod tests {
             tool_calls: &[],
             prompt_tokens: 100,
             completion_tokens: 200,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
             has_usage: true,
             error_message: &None,
         };
@@ -584,6 +616,8 @@ mod tests {
             tool_calls: &[],
             prompt_tokens: 10,
             completion_tokens: 20,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
             has_usage: true,
             error_message: &None,
         };
@@ -613,6 +647,8 @@ mod tests {
             tool_calls: &[],
             prompt_tokens: 10,
             completion_tokens: 20,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
             has_usage: true,
             error_message: &None,
         };
@@ -642,6 +678,8 @@ mod tests {
             tool_calls: &[],
             prompt_tokens: 10,
             completion_tokens: 50,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
             has_usage: true,
             error_message: &None,
         };
@@ -671,6 +709,8 @@ mod tests {
             tool_calls: &[],
             prompt_tokens: 50,
             completion_tokens: 100,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
             has_usage: true,
             error_message: &None,
         };
