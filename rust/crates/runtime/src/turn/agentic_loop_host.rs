@@ -314,6 +314,10 @@ pub struct AgenticLoopState {
     /// into each LLM request without bloating the persistent conversation history.
     /// Hosts should prepend this to the messages array when building the payload.
     pub skill_listing_message: Option<Value>,
+
+    /// Skills invoked during this session, keyed by canonical name.
+    /// Used for same-session dedup and post-compaction re-injection.
+    pub invoked_skills: std::collections::HashMap<String, crate::turn::skill_tool::InvokedSkill>,
 }
 
 /// Consecutive same-category error turns before forcing a strategy change.
@@ -995,7 +999,7 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
         // ─── Step 3c: Skill interception ─────────────────────────────────
         // If a skill resolver is wired, intercept "skill" tool calls and
         // return resolved instructions as tool results.
-        let (skill_results, post_skill_tool_calls);
+        let (mut skill_results, post_skill_tool_calls);
         let effective_tool_calls = if let Some(resolver) = &state.skill_resolver {
             // Build runtime context for skill execution
             let mut extra = std::collections::HashMap::new();
@@ -1112,9 +1116,39 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
             );
             let discover_exclude =
                 crate::turn::skill_tool::skill_mask_names_lowercase(&visible_for_mask);
+
+            // ── Same-session skill dedup: return stub for already-invoked skills ──
+            let mut dedup_results: Vec<(String, String)> = Vec::new();
+            let mut fresh_tool_calls: Vec<Value> = Vec::new();
+            for tc in effective_tool_calls {
+                if crate::turn::skill_tool::is_skill_call(tc) {
+                    let skill_name = tc
+                        .get("function")
+                        .and_then(|f| f.get("arguments"))
+                        .and_then(Value::as_str)
+                        .and_then(|s| serde_json::from_str::<Value>(s).ok())
+                        .and_then(|a| a.get("skill_name").and_then(Value::as_str).map(String::from));
+                    if let Some(ref name) = skill_name {
+                        if let Some(prev) = state.invoked_skills.get(name.as_str()) {
+                            let call_id = tc.get("id").and_then(Value::as_str).unwrap_or("unknown");
+                            dedup_results.push((
+                                call_id.to_string(),
+                                format!(
+                                    "Skill '{}' was already loaded (turn {}). \
+                                     Follow those instructions directly — do not re-invoke.",
+                                    name, prev.invoked_at_turn
+                                ),
+                            ));
+                            continue;
+                        }
+                    }
+                }
+                fresh_tool_calls.push(tc.clone());
+            }
+
             let (sr, remaining, activation) =
                 crate::turn::skill_tool::partition_discover_and_execute_skills(
-                    effective_tool_calls,
+                    &fresh_tool_calls,
                     resolver.as_ref(),
                     &full_catalog,
                     &discover_exclude,
@@ -1125,7 +1159,36 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
                     &skill_ctx,
                 )
                 .await;
-            skill_results = sr;
+
+            // Record newly invoked skills + merge dedup stubs
+            let current_turn = (state.max_turns - state.remaining_turns) as u32;
+            for (call_id, result_text) in &sr {
+                // Extract skill name from the matching fresh_tool_calls
+                if let Some(tc) = fresh_tool_calls.iter().find(|t| {
+                    t.get("id").and_then(Value::as_str) == Some(call_id.as_str())
+                }) {
+                    let name = tc
+                        .get("function")
+                        .and_then(|f| f.get("arguments"))
+                        .and_then(Value::as_str)
+                        .and_then(|s| serde_json::from_str::<Value>(s).ok())
+                        .and_then(|a| a.get("skill_name").and_then(Value::as_str).map(String::from));
+                    if let Some(name) = name {
+                        if crate::turn::skill_tool::is_skill_call(tc) {
+                            state.invoked_skills.insert(
+                                name.clone(),
+                                crate::turn::skill_tool::InvokedSkill {
+                                    name,
+                                    content: result_text.clone(),
+                                    invoked_at_turn: current_turn,
+                                },
+                            );
+                        }
+                    }
+                }
+            }
+            skill_results = dedup_results;
+            skill_results.extend(sr);
             post_skill_tool_calls = remaining;
 
             // Apply skill activation effects (model override, tool restrictions).
@@ -1665,6 +1728,7 @@ mod tests {
             last_measured_prompt_tokens: None,
             consecutive_context_window_errors: 0,
             skill_listing_message: None,
+            invoked_skills: std::collections::HashMap::new(),
         }
     }
 
@@ -3571,5 +3635,90 @@ mod tests {
         let arr = payload["messages"].as_array().unwrap();
         assert_eq!(arr.len(), 1);
         assert_eq!(arr[0]["content"], "hello");
+    }
+
+    // ── Invoked skills dedup tests ──────────────────────────────────────
+
+    #[test]
+    fn invoked_skills_defaults_to_empty() {
+        let state = make_state();
+        assert!(state.invoked_skills.is_empty());
+    }
+
+    #[test]
+    fn invoked_skills_dedup_returns_stub_on_second_invocation() {
+        use crate::turn::skill_tool::InvokedSkill;
+
+        let mut state = make_state();
+        state.invoked_skills.insert(
+            "review-changes".into(),
+            InvokedSkill {
+                name: "review-changes".into(),
+                content: "Full skill instructions here...".into(),
+                invoked_at_turn: 1,
+            },
+        );
+
+        // Simulate dedup check (same logic as agentic loop)
+        let skill_name = "review-changes";
+        let prev = state.invoked_skills.get(skill_name);
+        assert!(prev.is_some());
+        let stub = format!(
+            "Skill '{}' was already loaded (turn {}). \
+             Follow those instructions directly — do not re-invoke.",
+            skill_name,
+            prev.unwrap().invoked_at_turn
+        );
+        assert!(stub.contains("already loaded"));
+        assert!(stub.contains("turn 1"));
+    }
+
+    #[test]
+    fn invoked_skills_allows_different_skills() {
+        use crate::turn::skill_tool::InvokedSkill;
+
+        let mut state = make_state();
+        state.invoked_skills.insert(
+            "review-changes".into(),
+            InvokedSkill {
+                name: "review-changes".into(),
+                content: "review instructions".into(),
+                invoked_at_turn: 1,
+            },
+        );
+
+        // Different skill should not be deduped
+        assert!(state.invoked_skills.get("debug").is_none());
+    }
+
+    #[test]
+    fn post_compact_skill_reinjection() {
+        use crate::turn::cloud::attachments::AttachmentBuilder;
+        use crate::turn::skill_tool::InvokedSkill;
+
+        let mut state = make_state();
+        state.invoked_skills.insert(
+            "review-changes".into(),
+            InvokedSkill {
+                name: "review-changes".into(),
+                content: "# Review\nDo a code review.".into(),
+                invoked_at_turn: 2,
+            },
+        );
+
+        // Simulate post-compaction re-injection
+        let mut builder = AttachmentBuilder::new();
+        let mut skills: Vec<_> = state.invoked_skills.values().collect();
+        skills.sort_by(|a, b| b.invoked_at_turn.cmp(&a.invoked_at_turn));
+        for skill in skills {
+            builder.add_skill(&skill.name, &skill.content);
+        }
+        let attachments = builder.build();
+        let msgs = attachments.to_messages();
+
+        assert_eq!(msgs.len(), 1);
+        let content = msgs[0]["content"].as_str().unwrap();
+        assert!(content.contains("review-changes"));
+        assert!(content.contains("# Review"));
     }
 }

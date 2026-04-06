@@ -424,6 +424,7 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
             last_measured_prompt_tokens: None,
             consecutive_context_window_errors: 0,
             skill_listing_message: None,
+            invoked_skills: std::collections::HashMap::new(),
         };
 
         run_agentic_loop_with_host(&mut host, &mut state).await?;

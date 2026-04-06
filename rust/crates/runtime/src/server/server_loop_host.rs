@@ -359,6 +359,19 @@ impl ServerAgenticLoopHost {
         // Strip old reasoning to reduce input tokens (see edge_ledger::strip_stale_reasoning).
         crate::turn::edge_ledger::strip_stale_reasoning(&mut llm_messages);
 
+        // Post-compaction: re-inject invoked skill instructions (truncated)
+        // so the LLM retains skill context after history summarization.
+        if !state.invoked_skills.is_empty() {
+            let mut builder = crate::turn::cloud::attachments::AttachmentBuilder::new();
+            let mut skills: Vec<_> = state.invoked_skills.values().collect();
+            skills.sort_by(|a, b| b.invoked_at_turn.cmp(&a.invoked_at_turn));
+            for skill in skills {
+                builder.add_skill(&skill.name, &skill.content);
+            }
+            let attachments = builder.build();
+            llm_messages.extend(attachments.to_messages());
+        }
+
         // Ephemeral skill listing: injected per-turn, not stored in state.messages.
         if let Some(ref listing) = state.skill_listing_message {
             llm_messages.push(listing.clone());
@@ -1106,6 +1119,7 @@ mod tests {
             last_measured_prompt_tokens: None,
             consecutive_context_window_errors: 0,
             skill_listing_message: None,
+            invoked_skills: std::collections::HashMap::new(),
         }
     }
     #[tokio::test]

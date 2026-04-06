@@ -257,6 +257,7 @@ pub(crate) async fn stream_chat_sse(
         last_measured_prompt_tokens: None,
         consecutive_context_window_errors: 0,
         skill_listing_message: None,
+        invoked_skills: std::collections::HashMap::new(),
     };
 
     // ─── Run the runtime loop ────────────────────────────────────────────

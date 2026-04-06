@@ -322,6 +322,7 @@ impl AgenticRunLifecycleService {
             last_measured_prompt_tokens: None,
             consecutive_context_window_errors: 0,
             skill_listing_message: None,
+            invoked_skills: std::collections::HashMap::new(),
         }
     }
 
@@ -987,6 +988,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
             last_measured_prompt_tokens: None,
             consecutive_context_window_errors: 0,
             skill_listing_message: None,
+            invoked_skills: std::collections::HashMap::new(),
         };
 
         let outcome = run_agentic_loop_with_host(&mut host, &mut loop_state).await;

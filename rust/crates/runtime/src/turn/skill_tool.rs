@@ -126,6 +126,18 @@ impl SkillContext {
     }
 }
 
+/// Record of a skill invoked during this session.
+/// Used for same-session dedup and post-compaction re-injection.
+#[derive(Clone, Debug)]
+pub struct InvokedSkill {
+    /// Canonical skill name.
+    pub name: String,
+    /// Full instructions returned on first invocation.
+    pub content: String,
+    /// Turn number when the skill was first invoked.
+    pub invoked_at_turn: u32,
+}
+
 /// A fully resolved skill ready for execution.
 #[derive(Clone, Debug)]
 pub struct ResolvedSkill {
