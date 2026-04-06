@@ -921,4 +921,205 @@ mod tests {
         // full_reserve = 200_000 * 0.20 = 40_000 → capped to 8192
         assert_eq!(capped_output_tokens(&b), 8192);
     }
+
+    // -----------------------------------------------------------------------
+    // Unhappy-path / edge-case tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn estimate_str_tokens_empty_string_returns_zero() {
+        assert_eq!(estimate_str_tokens(""), 0);
+    }
+
+    #[test]
+    fn estimate_str_tokens_pure_cjk_no_ascii() {
+        let s = "你好世界测试中文字符啊";
+        assert_eq!(s.chars().count(), 11);
+        let tokens = estimate_str_tokens(s);
+        // (11*3).div_ceil(2) = 33.div_ceil(2) = 17
+        assert_eq!(tokens, 17);
+    }
+
+    #[test]
+    fn estimate_str_tokens_pure_ascii_text() {
+        let s = "hello world this is text"; // 24 bytes, starts with 'h' → divisor 4
+        let tokens = estimate_str_tokens(s);
+        assert_eq!(tokens, 24 / 4); // 6
+    }
+
+    #[test]
+    fn estimate_str_tokens_json_object_smaller_divisor() {
+        let s = r#"{"key": "value", "num": 42}"#; // starts with '{' → divisor 2
+        let tokens = estimate_str_tokens(s);
+        assert_eq!(tokens, s.len() / 2);
+    }
+
+    #[test]
+    fn estimate_str_tokens_array_like_uses_smaller_divisor() {
+        let s = r#"["a", "b", "c"]"#; // starts with '[' → divisor 2
+        let tokens = estimate_str_tokens(s);
+        assert_eq!(tokens, s.len() / 2);
+    }
+
+    #[test]
+    fn estimate_str_tokens_cjk_ascii_mixed() {
+        let s = "hello你好"; // 5 ASCII bytes + 2 CJK chars
+        let tokens = estimate_str_tokens(s);
+        // CJK: (2*3).div_ceil(2) = 3
+        // ASCII: 5 bytes, first byte is 'h' → divisor 4 → 5/4 = 1
+        assert_eq!(tokens, 3 + 1);
+    }
+
+    #[test]
+    fn estimate_str_tokens_single_char() {
+        assert_eq!(estimate_str_tokens("x"), 0); // 1 byte / 4 = 0 (integer division)
+    }
+
+    #[test]
+    fn estimate_str_tokens_emoji_counted_as_ascii() {
+        let s = "😀"; // 4 bytes UTF-8, not in CJK ranges
+        let tokens = estimate_str_tokens(s);
+        // 4 bytes / 4 = 1
+        assert_eq!(tokens, 1);
+    }
+
+    #[test]
+    fn estimate_tokens_empty_messages_has_fixed_overhead() {
+        let tokens = estimate_tokens(&[]);
+        // Just FIXED_OVERHEAD (3000) with no messages
+        assert_eq!(tokens, 3000);
+    }
+
+    #[test]
+    fn estimate_tokens_message_without_content() {
+        let tokens = estimate_tokens(&[json!({"role": "user"})]);
+        // Should not panic on missing content
+        assert!(tokens > 3000); // overhead + per-message overhead
+    }
+
+    #[test]
+    fn capped_output_tokens_zero_model_limit() {
+        let b = ContextBudget {
+            model_limit: 0,
+            compact_threshold: 0.80,
+            keep_recent_turns: 4,
+            memory_budget_chars: 3000,
+            output_reserve_ratio: 0.20,
+            compact_config: CompactConfig::default(),
+        };
+        assert_eq!(capped_output_tokens(&b), 0);
+    }
+
+    #[test]
+    fn capped_output_tokens_very_large_model() {
+        let b = ContextBudget {
+            model_limit: 2_000_000, // 2M tokens
+            compact_threshold: 0.80,
+            keep_recent_turns: 4,
+            memory_budget_chars: 3000,
+            output_reserve_ratio: 0.20,
+            compact_config: CompactConfig::default(),
+        };
+        // 2M * 0.20 = 400K → capped to 8192
+        assert_eq!(capped_output_tokens(&b), 8192);
+    }
+
+    #[test]
+    fn effective_input_limit_zero_reserve() {
+        let b = ContextBudget {
+            model_limit: 100_000,
+            compact_threshold: 0.80,
+            keep_recent_turns: 4,
+            memory_budget_chars: 3000,
+            output_reserve_ratio: 0.0,
+            compact_config: CompactConfig::default(),
+        };
+        assert_eq!(b.effective_input_limit(), 100_000);
+    }
+
+    #[test]
+    fn effective_input_limit_full_reserve() {
+        let b = ContextBudget {
+            model_limit: 100_000,
+            compact_threshold: 0.80,
+            keep_recent_turns: 4,
+            memory_budget_chars: 3000,
+            output_reserve_ratio: 1.0,
+            compact_config: CompactConfig::default(),
+        };
+        assert_eq!(b.effective_input_limit(), 0);
+    }
+
+    #[test]
+    fn compaction_tier_zero_tokens() {
+        let b = ContextBudget {
+            model_limit: 100_000,
+            compact_threshold: 0.80,
+            keep_recent_turns: 4,
+            memory_budget_chars: 3000,
+            output_reserve_ratio: 0.20,
+            compact_config: CompactConfig::default(),
+        };
+        assert_eq!(b.compaction_tier(0), CompactionTier::Normal);
+    }
+
+    #[test]
+    fn compaction_tier_at_limit() {
+        let b = ContextBudget {
+            model_limit: 100_000,
+            compact_threshold: 0.80,
+            keep_recent_turns: 4,
+            memory_budget_chars: 3000,
+            output_reserve_ratio: 0.20,
+            compact_config: CompactConfig::default(),
+        };
+        // effective_input_limit = 80_000
+        // 80_000 → ratio = 1.0 → AggressivePrune
+        assert_eq!(b.compaction_tier(80_000), CompactionTier::AggressivePrune);
+    }
+
+    #[test]
+    fn compaction_tier_zero_effective_limit() {
+        let b = ContextBudget {
+            model_limit: 100_000,
+            compact_threshold: 0.80,
+            keep_recent_turns: 4,
+            memory_budget_chars: 3000,
+            output_reserve_ratio: 1.0, // 100% reserved → effective = 0
+            compact_config: CompactConfig::default(),
+        };
+        // effective = 0, ratio = 0/0 → NaN or Inf
+        // Any tokens / 0 → infinity → AggressivePrune (ratio > 0.85)
+        let tier = b.compaction_tier(1);
+        assert_eq!(tier, CompactionTier::AggressivePrune);
+    }
+
+    #[test]
+    fn should_compact_boundary() {
+        let b = ContextBudget {
+            model_limit: 100_000,
+            compact_threshold: 0.80,
+            keep_recent_turns: 4,
+            memory_budget_chars: 3000,
+            output_reserve_ratio: 0.20,
+            compact_config: CompactConfig::default(),
+        };
+        // compact_trigger = 80_000 * 0.80 = 64_000
+        assert!(!b.should_compact(64_000)); // Not > trigger
+        assert!(b.should_compact(64_001));  // > trigger
+    }
+
+    #[test]
+    fn max_compaction_tier_commutative() {
+        assert_eq!(
+            max_compaction_tier(CompactionTier::Normal, CompactionTier::AggressivePrune),
+            max_compaction_tier(CompactionTier::AggressivePrune, CompactionTier::Normal),
+        );
+    }
+
+    #[test]
+    fn tier_from_rank_clamps_at_3() {
+        // Ranks > 3 should still return AggressivePrune
+        assert_eq!(tier_from_compaction_rank(255), CompactionTier::AggressivePrune);
+    }
 }

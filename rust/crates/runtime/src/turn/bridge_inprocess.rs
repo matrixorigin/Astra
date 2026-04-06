@@ -3416,4 +3416,140 @@ mod tests {
         assert_eq!(g_none, g_review, "Global prefix should be identical regardless of task type");
         assert_eq!(g_review, g_debug, "Global prefix should be identical regardless of task type");
     }
+
+    // -----------------------------------------------------------------------
+    // Unhappy-path / edge-case tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn classify_llm_error_rate_limit_variants() {
+        assert_eq!(classify_llm_error("rate limit exceeded"), "rate_limit");
+        assert_eq!(classify_llm_error("HTTP 429 Too Many Requests"), "rate_limit");
+        assert_eq!(classify_llm_error("Rate limiting active"), "rate_limit");
+    }
+
+    #[test]
+    fn classify_llm_error_timeout_variants() {
+        assert_eq!(classify_llm_error("request timeout"), "timeout");
+        assert_eq!(classify_llm_error("connection timed out"), "timeout");
+    }
+
+    #[test]
+    fn classify_llm_error_transport_variants() {
+        assert_eq!(classify_llm_error("connection refused"), "transport");
+        assert_eq!(classify_llm_error("transport error"), "transport");
+        assert_eq!(classify_llm_error("network unreachable"), "transport");
+    }
+
+    #[test]
+    fn classify_llm_error_permission_variants() {
+        assert_eq!(classify_llm_error("HTTP 401"), "permission");
+        assert_eq!(classify_llm_error("unauthorized access"), "permission");
+        assert_eq!(classify_llm_error("invalid api key"), "permission");
+    }
+
+    #[test]
+    fn classify_llm_error_unknown_defaults_to_internal() {
+        assert_eq!(classify_llm_error("something went wrong"), "internal");
+        assert_eq!(classify_llm_error(""), "internal");
+    }
+
+    #[test]
+    fn classify_llm_error_case_insensitive() {
+        assert_eq!(classify_llm_error("RATE LIMIT"), "rate_limit");
+        assert_eq!(classify_llm_error("Timeout"), "timeout");
+        assert_eq!(classify_llm_error("UNAUTHORIZED"), "permission");
+    }
+
+    #[test]
+    fn header_str_missing_header_returns_none() {
+        let headers = HeaderMap::new();
+        assert!(header_str(&headers, "x-mo-user-id").is_none());
+    }
+
+    #[test]
+    fn header_str_empty_value_returns_none() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-mo-user-id", "".parse().unwrap());
+        assert!(header_str(&headers, "x-mo-user-id").is_none());
+    }
+
+    #[test]
+    fn header_str_valid_value_returns_some() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-mo-user-id", "user-123".parse().unwrap());
+        assert_eq!(header_str(&headers, "x-mo-user-id").as_deref(), Some("user-123"));
+    }
+
+    #[test]
+    fn extract_entity_tokens_empty_string() {
+        assert_eq!(extract_entity_tokens(""), "");
+    }
+
+    #[test]
+    fn extract_entity_tokens_short_words_filtered() {
+        // Words < 3 chars are dropped
+        assert_eq!(extract_entity_tokens("a b cd ef"), "");
+    }
+
+    #[test]
+    fn extract_entity_tokens_preserves_long_tokens() {
+        assert_eq!(extract_entity_tokens("hello world"), "hello world");
+    }
+
+    #[test]
+    fn extract_entity_tokens_special_chars_split() {
+        assert_eq!(
+            extract_entity_tokens("user.name@domain.com"),
+            "user name domain com"
+        );
+    }
+
+    #[test]
+    fn extract_entity_tokens_hyphens_and_underscores_kept() {
+        assert_eq!(extract_entity_tokens("my-app_v2"), "my-app_v2");
+    }
+
+    #[test]
+    fn extract_entity_tokens_unicode_chars_as_delimiters() {
+        // CJK chars and emoji act as delimiters
+        let result = extract_entity_tokens("hello你好world");
+        // 'hello' is 5 chars, '你好' splits, 'world' is 5 chars
+        assert_eq!(result, "hello world");
+    }
+
+    #[test]
+    fn extract_entity_tokens_only_special_chars() {
+        assert_eq!(extract_entity_tokens("!@#$%^&*()"), "");
+    }
+
+    #[test]
+    fn prefetch_memories_empty_key_returns_default() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let result = rt.block_on(prefetch_memories("http://localhost", "", "query", "user1"));
+        assert_eq!(result.items, 0);
+        assert!(result.section.is_none());
+    }
+
+    #[test]
+    fn prefetch_memories_whitespace_message_returns_default() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let result = rt.block_on(prefetch_memories("http://localhost", "key", "   ", "user1"));
+        assert_eq!(result.items, 0);
+    }
+
+    #[test]
+    fn memory_prefetch_result_default() {
+        let r = MemoryPrefetchResult::default();
+        assert!(r.section.is_none());
+        assert_eq!(r.items, 0);
+        assert!(r.preview.is_empty());
+        assert_eq!(r.fetch_ms, 0);
+    }
 }

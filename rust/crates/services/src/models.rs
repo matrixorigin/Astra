@@ -918,3 +918,214 @@ impl From<ModelListItem> for ModelListItemResponse {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    // -- PricingData --
+
+    #[test]
+    fn pricing_data_serialization_roundtrip() {
+        let p = PricingData {
+            prompt: 0.003,
+            completion: 0.015,
+            cache_read: Some(0.0003),
+            cache_write: Some(0.00375),
+        };
+        let json = serde_json::to_string(&p).unwrap();
+        let restored: PricingData = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored, p);
+    }
+
+    #[test]
+    fn pricing_data_default_is_zeroed() {
+        let p = PricingData::default();
+        assert_eq!(p.prompt, 0.0);
+        assert_eq!(p.completion, 0.0);
+        assert!(p.cache_read.is_none());
+        assert!(p.cache_write.is_none());
+    }
+
+    #[test]
+    fn pricing_data_missing_optional_fields() {
+        let p: PricingData =
+            serde_json::from_str(r#"{"prompt": 0.003, "completion": 0.015}"#).unwrap();
+        assert_eq!(p.prompt, 0.003);
+        assert!(p.cache_read.is_none());
+        assert!(p.cache_write.is_none());
+    }
+
+    #[test]
+    fn pricing_data_empty_json_uses_defaults() {
+        let p: PricingData = serde_json::from_str("{}").unwrap();
+        assert_eq!(p.prompt, 0.0);
+        assert_eq!(p.completion, 0.0);
+    }
+
+    #[test]
+    fn pricing_data_null_cache_fields() {
+        let p: PricingData = serde_json::from_str(
+            r#"{"prompt": 1.0, "completion": 2.0, "cache_read": null, "cache_write": null}"#,
+        )
+        .unwrap();
+        assert!(p.cache_read.is_none());
+        assert!(p.cache_write.is_none());
+    }
+
+    #[test]
+    fn pricing_data_skip_serializing_none() {
+        let p = PricingData {
+            prompt: 1.0,
+            completion: 2.0,
+            cache_read: None,
+            cache_write: None,
+        };
+        let json = serde_json::to_string(&p).unwrap();
+        assert!(!json.contains("cache_read"));
+        assert!(!json.contains("cache_write"));
+    }
+
+    #[test]
+    fn pricing_data_negative_values_accepted() {
+        // Negative pricing is structurally valid (no validation at serde level)
+        let p: PricingData =
+            serde_json::from_str(r#"{"prompt": -0.001, "completion": -0.002}"#).unwrap();
+        assert!(p.prompt < 0.0);
+    }
+
+    // -- QuirksData --
+
+    #[test]
+    fn quirks_data_default_all_false() {
+        let q = QuirksData::default();
+        assert!(!q.preserve_reasoning_content);
+        assert!(!q.no_parallel_tool_calls);
+        assert!(!q.tool_choice_required);
+        assert!(!q.strict_tool_call_ids);
+        assert!(!q.no_system_message);
+        assert!(!q.system_as_user_prefix);
+        assert!(q.fixed_temperature.is_none());
+        assert!(q.fallback_model.is_none());
+    }
+
+    #[test]
+    fn quirks_data_empty_json_uses_defaults() {
+        let q: QuirksData = serde_json::from_str("{}").unwrap();
+        assert_eq!(q, QuirksData::default());
+    }
+
+    #[test]
+    fn quirks_data_malformed_json_fails() {
+        let result: Result<QuirksData, _> = serde_json::from_str("{not valid json}");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn quirks_data_extra_unknown_fields_ignored() {
+        let q: QuirksData = serde_json::from_str(
+            r#"{"no_system_message": true, "unknown_future_field": 42}"#,
+        )
+        .unwrap();
+        assert!(q.no_system_message);
+    }
+
+    #[test]
+    fn quirks_data_wrong_type_for_bool_field_fails() {
+        let result: Result<QuirksData, _> =
+            serde_json::from_str(r#"{"no_system_message": "yes"}"#);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn quirks_data_serialization_roundtrip() {
+        let q = QuirksData {
+            fixed_temperature: Some(0.7),
+            preserve_reasoning_content: true,
+            no_parallel_tool_calls: true,
+            tool_choice_required: false,
+            strict_tool_call_ids: true,
+            no_system_message: false,
+            system_as_user_prefix: true,
+            fallback_model: Some("claude-haiku".into()),
+        };
+        let json = serde_json::to_string(&q).unwrap();
+        let restored: QuirksData = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored, q);
+    }
+
+    #[test]
+    fn quirks_unwrap_or_default_on_malformed_gives_safe_defaults() {
+        // This mimics the production pattern in models.rs line 203
+        let malformed = "not json at all";
+        let quirks: QuirksData = serde_json::from_str(malformed).unwrap_or_default();
+        assert_eq!(quirks, QuirksData::default());
+    }
+
+    // -- ModelListItemResponse / conversions --
+
+    #[test]
+    fn model_list_item_to_response_preserves_fields() {
+        let item = ModelListItem {
+            model_id: "m1".into(),
+            name: "gpt-4o".into(),
+            provider: "openai".into(),
+            description: Some("fast".into()),
+            is_active: true,
+            context_window: 128000,
+            max_completion_tokens: Some(16384),
+            architecture: Some("transformer".into()),
+        };
+        let resp = ModelListItemResponse::from(item.clone());
+        assert_eq!(resp.model_id, item.model_id);
+        assert_eq!(resp.name, item.name);
+        assert_eq!(resp.context_window, 128000);
+    }
+
+    #[test]
+    fn model_list_item_with_none_optionals() {
+        let item = ModelListItem {
+            model_id: "m2".into(),
+            name: "test".into(),
+            provider: "local".into(),
+            description: None,
+            is_active: false,
+            context_window: 4096,
+            max_completion_tokens: None,
+            architecture: None,
+        };
+        let resp = ModelListItemResponse::from(item);
+        assert!(resp.description.is_none());
+        assert!(resp.max_completion_tokens.is_none());
+        assert!(resp.architecture.is_none());
+    }
+
+    // -- PricingData edge cases used in cost calculation --
+
+    #[test]
+    fn pricing_data_zero_rates() {
+        let p = PricingData {
+            prompt: 0.0,
+            completion: 0.0,
+            cache_read: Some(0.0),
+            cache_write: Some(0.0),
+        };
+        // Valid: free model
+        assert_eq!(p.prompt, 0.0);
+        assert_eq!(p.cache_read, Some(0.0));
+    }
+
+    #[test]
+    fn pricing_data_very_large_rates() {
+        let p: PricingData = serde_json::from_str(
+            r#"{"prompt": 999.99, "completion": 999.99, "cache_read": 999.99}"#,
+        )
+        .unwrap();
+        assert!(p.prompt > 100.0);
+    }
+}

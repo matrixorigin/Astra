@@ -6596,4 +6596,208 @@ Time:        3.456 s
         assert!(!is_snapshot_excluded(std::ffi::OsStr::new("lib")));
         assert!(!is_snapshot_excluded(std::ffi::OsStr::new("main.py")));
     }
+
+    // -----------------------------------------------------------------------
+    // Unhappy-path / edge-case tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn contract_status_parse_unknown_defaults_to_draft() {
+        assert_eq!(ContractStatus::parse("unknown"), ContractStatus::Draft);
+        assert_eq!(ContractStatus::parse(""), ContractStatus::Draft);
+        assert_eq!(ContractStatus::parse("ACTIVE"), ContractStatus::Draft); // case-sensitive
+    }
+
+    #[test]
+    fn contract_status_roundtrip_all_variants() {
+        for status in [
+            ContractStatus::Draft,
+            ContractStatus::Active,
+            ContractStatus::Amended,
+            ContractStatus::Completed,
+            ContractStatus::Abandoned,
+        ] {
+            let s = status.as_str();
+            assert_eq!(ContractStatus::parse(s), status);
+        }
+    }
+
+    #[test]
+    fn contract_status_serde_roundtrip() {
+        for status in [
+            ContractStatus::Draft,
+            ContractStatus::Active,
+            ContractStatus::Amended,
+            ContractStatus::Completed,
+            ContractStatus::Abandoned,
+        ] {
+            let json = serde_json::to_string(&status).unwrap();
+            let restored: ContractStatus = serde_json::from_str(&json).unwrap();
+            assert_eq!(restored, status);
+        }
+    }
+
+    #[test]
+    fn contract_status_invalid_json_fails() {
+        let result: Result<ContractStatus, _> = serde_json::from_str(r#""unknown_status""#);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn verification_criterion_defaults() {
+        let json = r#"{"id":"c1","description":"test","verifier":{"kind":"command","cmd":"echo ok"}}"#;
+        let c: VerificationCriterion = serde_json::from_str(json).unwrap();
+        assert!(c.required); // default_true
+        assert_eq!(c.timeout_sec, 120); // default_timeout
+        assert!(!c.global_only); // default false
+    }
+
+    #[test]
+    fn verification_criterion_all_verifier_kinds_deserialize() {
+        let cases = vec![
+            r#"{"id":"1","description":"d","verifier":{"kind":"command","cmd":"echo"}}"#,
+            r#"{"id":"2","description":"d","verifier":{"kind":"command_output","cmd":"echo","contains":["ok"]}}"#,
+            r#"{"id":"3","description":"d","verifier":{"kind":"file_exists","paths":["a.rs"]}}"#,
+            r#"{"id":"4","description":"d","verifier":{"kind":"grep_check","file":"a.rs","pattern":"fn main"}}"#,
+            r#"{"id":"5","description":"d","verifier":{"kind":"build_pass","cmd":"cargo build"}}"#,
+            r#"{"id":"6","description":"d","verifier":{"kind":"test_pass","cmd":"cargo test"}}"#,
+            r#"{"id":"7","description":"d","verifier":{"kind":"llm_judge","prompt":"Is it good?"}}"#,
+        ];
+        for json in cases {
+            let c: VerificationCriterion = serde_json::from_str(json).unwrap();
+            assert!(!c.id.is_empty());
+        }
+    }
+
+    #[test]
+    fn verification_criterion_invalid_verifier_kind_fails() {
+        let json = r#"{"id":"1","description":"d","verifier":{"kind":"nonexistent"}}"#;
+        let result: Result<VerificationCriterion, _> = serde_json::from_str(json);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn verification_result_with_error() {
+        let r = VerificationResult {
+            criterion_id: "c1".into(),
+            passed: false,
+            evidence: "".into(),
+            expected: "exit 0".into(),
+            duration_ms: 500,
+            error: Some("command not found".into()),
+        };
+        let json = serde_json::to_string(&r).unwrap();
+        let loaded: VerificationResult = serde_json::from_str(&json).unwrap();
+        assert!(!loaded.passed);
+        assert_eq!(loaded.error.as_deref(), Some("command not found"));
+    }
+
+    #[test]
+    fn verification_result_without_error_skips_field() {
+        let r = VerificationResult {
+            criterion_id: "c1".into(),
+            passed: true,
+            evidence: "ok".into(),
+            expected: "ok".into(),
+            duration_ms: 100,
+            error: None,
+        };
+        let json = serde_json::to_string(&r).unwrap();
+        assert!(!json.contains("error"));
+    }
+
+    #[test]
+    fn task_scope_default_empty() {
+        let s = TaskScope::default();
+        assert!(s.in_scope.is_empty());
+        assert!(s.out_of_scope.is_empty());
+        assert!(s.assumptions.is_empty());
+    }
+
+    #[test]
+    fn task_scope_roundtrip() {
+        let s = TaskScope {
+            in_scope: vec!["auth module".into()],
+            out_of_scope: vec!["UI".into()],
+            assumptions: vec!["PostgreSQL available".into()],
+        };
+        let json = serde_json::to_string(&s).unwrap();
+        let loaded: TaskScope = serde_json::from_str(&json).unwrap();
+        assert_eq!(loaded.in_scope, s.in_scope);
+        assert_eq!(loaded.out_of_scope, s.out_of_scope);
+    }
+
+    #[test]
+    fn subtask_verification_report_roundtrip() {
+        let report = SubtaskVerificationReport {
+            subtask_id: "st-1".into(),
+            all_required_passed: false,
+            results: vec![VerificationResult {
+                criterion_id: "c1".into(),
+                passed: false,
+                evidence: "exit 1".into(),
+                expected: "exit 0".into(),
+                duration_ms: 1000,
+                error: Some("test failed".into()),
+            }],
+            timestamp: "2024-01-01T00:00:00Z".into(),
+        };
+        let json = serde_json::to_string(&report).unwrap();
+        let loaded: SubtaskVerificationReport = serde_json::from_str(&json).unwrap();
+        assert!(!loaded.all_required_passed);
+        assert_eq!(loaded.results.len(), 1);
+        assert_eq!(loaded.results[0].criterion_id, "c1");
+    }
+
+    #[test]
+    fn verifier_kind_command_defaults() {
+        let json = r#"{"kind":"command","cmd":"echo hello"}"#;
+        let v: VerifierKind = serde_json::from_str(json).unwrap();
+        match v {
+            VerifierKind::Command { cmd, expected_exit } => {
+                assert_eq!(cmd, "echo hello");
+                assert_eq!(expected_exit, 0); // default
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn verifier_kind_test_pass_default_rate() {
+        let json = r#"{"kind":"test_pass","cmd":"cargo test"}"#;
+        let v: VerifierKind = serde_json::from_str(json).unwrap();
+        match v {
+            VerifierKind::TestPass { min_pass_rate, .. } => {
+                assert!((min_pass_rate - 1.0).abs() < f64::EPSILON);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn verifier_kind_llm_judge_default_threshold() {
+        let json = r#"{"kind":"llm_judge","prompt":"check quality"}"#;
+        let v: VerifierKind = serde_json::from_str(json).unwrap();
+        match v {
+            VerifierKind::LlmJudge { pass_threshold, .. } => {
+                assert!((pass_threshold - 0.7).abs() < f64::EPSILON);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn verifier_kind_composite_roundtrip() {
+        let json = r#"{"kind":"composite","criteria":[
+            {"id":"c1","description":"d","verifier":{"kind":"command","cmd":"echo"}}
+        ],"require_all":false}"#;
+        let v: VerifierKind = serde_json::from_str(json).unwrap();
+        match v {
+            VerifierKind::Composite { criteria, require_all } => {
+                assert_eq!(criteria.len(), 1);
+                assert!(!require_all);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
 }

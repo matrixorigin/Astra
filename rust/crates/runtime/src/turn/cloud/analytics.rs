@@ -889,4 +889,265 @@ mod tests {
         assert_eq!(cleared, 0);
         assert_eq!(result, messages);
     }
+
+    // -----------------------------------------------------------------------
+    // Unhappy-path / edge-case tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn collect_tool_results_empty_messages() {
+        let results = collect_tool_results(&[]);
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn collect_tool_results_no_tool_messages() {
+        let messages = vec![
+            json!({"role": "user", "content": "hi"}),
+            json!({"role": "assistant", "content": "hello"}),
+        ];
+        let results = collect_tool_results(&messages);
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn collect_tool_results_missing_tool_call_id_skipped() {
+        let messages = vec![
+            json!({"role": "tool", "content": "output without id"}),
+            json!({"role": "tool", "tool_call_id": "c1", "content": "valid"}),
+        ];
+        let results = collect_tool_results(&messages);
+        // First one has no tool_call_id → skipped by filter_map (as_str returns None)
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0, "c1");
+    }
+
+    #[test]
+    fn collect_tool_results_null_tool_call_id_skipped() {
+        let messages = vec![
+            json!({"role": "tool", "tool_call_id": null, "content": "output"}),
+        ];
+        let results = collect_tool_results(&messages);
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn collect_tool_results_missing_content_estimates_zero_tokens() {
+        let messages = vec![json!({"role": "tool", "tool_call_id": "c1"})];
+        let results = collect_tool_results(&messages);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].1, 0); // no content → 0 tokens
+    }
+
+    #[test]
+    fn collect_tool_results_non_string_content_estimates_zero() {
+        let messages = vec![
+            json!({"role": "tool", "tool_call_id": "c1", "content": 12345}),
+            json!({"role": "tool", "tool_call_id": "c2", "content": ["array", "content"]}),
+        ];
+        let results = collect_tool_results(&messages);
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].1, 0); // numeric content → as_str returns None → 0
+        assert_eq!(results[1].1, 0); // array content → as_str returns None → 0
+    }
+
+    #[test]
+    fn split_clearable_keep_recent_exceeds_total() {
+        let results = vec![("c1".to_string(), 100)];
+        let (ids, tokens) = split_clearable(results, 10); // keep_recent=10 > total=1
+        assert!(ids.is_empty());
+        assert_eq!(tokens, 0);
+    }
+
+    #[test]
+    fn split_clearable_keep_recent_equals_total() {
+        let results = vec![
+            ("c1".to_string(), 100),
+            ("c2".to_string(), 200),
+        ];
+        let (ids, _) = split_clearable(results, 2);
+        assert!(ids.is_empty()); // All are "recent"
+    }
+
+    #[test]
+    fn split_clearable_empty_input() {
+        let (ids, tokens) = split_clearable(vec![], 5);
+        assert!(ids.is_empty());
+        assert_eq!(tokens, 0);
+    }
+
+    #[test]
+    fn find_last_assistant_timestamp_empty_messages() {
+        assert!(find_last_assistant_timestamp(&[]).is_none());
+    }
+
+    #[test]
+    fn find_last_assistant_timestamp_no_assistants() {
+        let messages = vec![
+            json!({"role": "user", "content": "hi", "timestamp": 1000}),
+            json!({"role": "tool", "tool_call_id": "c1", "timestamp": 2000}),
+        ];
+        assert!(find_last_assistant_timestamp(&messages).is_none());
+    }
+
+    #[test]
+    fn find_last_assistant_timestamp_no_timestamp_field() {
+        let messages = vec![
+            json!({"role": "assistant", "content": "no timestamp at all"}),
+        ];
+        // Assistant found, but no timestamp/metadata → returns None
+        assert!(find_last_assistant_timestamp(&messages).is_none());
+    }
+
+    #[test]
+    fn find_last_assistant_timestamp_from_metadata_created_at() {
+        let messages = vec![
+            json!({"role": "assistant", "content": "hi", "metadata": {"created_at": 5000}}),
+        ];
+        assert_eq!(find_last_assistant_timestamp(&messages), Some(5000));
+    }
+
+    #[test]
+    fn find_last_assistant_timestamp_from_metadata_timestamp() {
+        let messages = vec![
+            json!({"role": "assistant", "content": "hi", "metadata": {"timestamp": 7000}}),
+        ];
+        assert_eq!(find_last_assistant_timestamp(&messages), Some(7000));
+    }
+
+    #[test]
+    fn find_last_assistant_timestamp_prefers_direct_over_metadata() {
+        let messages = vec![
+            json!({"role": "assistant", "content": "hi", "timestamp": 3000, "metadata": {"created_at": 1000}}),
+        ];
+        assert_eq!(find_last_assistant_timestamp(&messages), Some(3000));
+    }
+
+    #[test]
+    fn find_last_assistant_timestamp_string_timestamp_not_parsed() {
+        let messages = vec![
+            json!({"role": "assistant", "content": "hi", "timestamp": "2024-01-01"}),
+        ];
+        // String timestamp → as_u64() returns None → metadata checked → None → returns None
+        assert!(find_last_assistant_timestamp(&messages).is_none());
+    }
+
+    #[test]
+    fn evaluate_turn_count_trigger_disabled() {
+        let messages = vec![json!({"role": "tool", "tool_call_id": "c1", "content": "x"})];
+        let config = TurnCountCompactConfig {
+            enabled: false,
+            ..Default::default()
+        };
+        assert!(evaluate_turn_count_trigger(&messages, &config).is_none());
+    }
+
+    #[test]
+    fn evaluate_turn_count_trigger_below_threshold() {
+        // Default: trigger_threshold=8, keep_recent=3, so need 11+ tool results
+        let messages: Vec<Value> = (0..10)
+            .map(|i| json!({"role": "tool", "tool_call_id": format!("c{i}"), "content": "x".repeat(100)}))
+            .collect();
+        let config = TurnCountCompactConfig::default();
+        assert!(evaluate_turn_count_trigger(&messages, &config).is_none());
+    }
+
+    #[test]
+    fn evaluate_turn_count_trigger_at_exact_threshold() {
+        // trigger_threshold=8, keep_recent=3 → need total >= 11
+        let messages: Vec<Value> = (0..11)
+            .map(|i| json!({"role": "tool", "tool_call_id": format!("c{i}"), "content": "x".repeat(100)}))
+            .collect();
+        let config = TurnCountCompactConfig::default();
+        let trigger = evaluate_turn_count_trigger(&messages, &config);
+        assert!(trigger.is_some());
+        let t = trigger.unwrap();
+        assert_eq!(t.total_tool_results, 11);
+        // Clears 11 - 3 = 8
+        assert_eq!(t.tool_ids_to_clear.len(), 8);
+    }
+
+    #[test]
+    fn evaluate_turn_count_trigger_empty_messages() {
+        let config = TurnCountCompactConfig::default();
+        assert!(evaluate_turn_count_trigger(&[], &config).is_none());
+    }
+
+    #[test]
+    fn evaluate_time_based_trigger_disabled_by_default() {
+        // TimeBasedCompactConfig default has enabled=false
+        let config = TimeBasedCompactConfig::default();
+        let messages = vec![
+            json!({"role": "assistant", "content": "old", "timestamp": 1000}),
+            json!({"role": "tool", "tool_call_id": "c1", "content": "big data"}),
+        ];
+        assert!(evaluate_time_based_trigger(&messages, &config).is_none());
+    }
+
+    #[test]
+    fn evaluate_time_based_trigger_no_assistants_returns_none() {
+        let config = TimeBasedCompactConfig {
+            enabled: true,
+            gap_threshold_minutes: 0,
+            keep_recent: 0,
+        };
+        let messages = vec![
+            json!({"role": "tool", "tool_call_id": "c1", "content": "data"}),
+        ];
+        assert!(evaluate_time_based_trigger(&messages, &config).is_none());
+    }
+
+    #[test]
+    fn apply_micro_compact_empty_messages() {
+        let (result, cleared) = apply_micro_compact(&[], &["c1".to_string()]);
+        assert!(result.is_empty());
+        assert_eq!(cleared, 0);
+    }
+
+    #[test]
+    fn apply_micro_compact_tool_missing_tool_call_id() {
+        let messages = vec![json!({"role": "tool", "content": "data"})];
+        let (result, cleared) = apply_micro_compact(&messages, &["c1".to_string()]);
+        // Missing tool_call_id → empty string → doesn't match "c1" → not cleared
+        assert_eq!(cleared, 0);
+        assert_eq!(result[0]["content"], "data");
+    }
+
+    #[test]
+    fn apply_micro_compact_preserves_non_tool_messages() {
+        let messages = vec![
+            json!({"role": "user", "content": "hello"}),
+            json!({"role": "assistant", "content": "world"}),
+            json!({"role": "system", "content": "prompt"}),
+        ];
+        let (result, cleared) = apply_micro_compact(&messages, &["anything".to_string()]);
+        assert_eq!(cleared, 0);
+        assert_eq!(result, messages);
+    }
+
+    #[test]
+    fn run_micro_compact_empty_messages_returns_empty() {
+        let result = run_micro_compact(&[]);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn run_micro_compact_single_system_message_noop() {
+        let messages = vec![json!({"role": "system", "content": "You are helpful"})];
+        let result = run_micro_compact(&messages);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0]["content"], "You are helpful");
+    }
+
+    #[test]
+    fn compression_ratio_zero_pre_tokens() {
+        // When pre_tokens is 0, should return ratio 1.0 (no compression)
+        let event = CompactionEvent::from_boundary(
+            &CompactBoundary::new(CompactTrigger::Auto, CompactionTier::Normal)
+                .with_pre_metrics(0, 2)
+                .with_post_count(2),
+            0,
+        );
+        assert!((event.compression_ratio - 1.0).abs() < f64::EPSILON);
+    }
 }

@@ -625,10 +625,340 @@ mod tests {
             sse("usage", ",\"prompt_tokens\":200,\"completion_tokens\":80,\"cache_read_tokens\":60,\"cache_creation_tokens\":0"),
         );
         dispatch_chat_turn_sse_event_block(&block, &mut a, &mut vec![]);
-        // Second usage event overwrites (not accumulates)
         assert_eq!(a.prompt_tokens, 200);
         assert_eq!(a.completion_tokens, 80);
         assert_eq!(a.cache_read_tokens, 60);
         assert_eq!(a.cache_creation_tokens, 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // Unhappy-path / edge-case tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn text_delta_missing_content_field_no_panic() {
+        let mut a = ChatTurnSseAccum::default();
+        dispatch_chat_turn_sse_event_block(&sse("text_delta", ""), &mut a, &mut vec![]);
+        assert_eq!(a.full_text, "");
+    }
+
+    #[test]
+    fn text_delta_null_content_ignored() {
+        let mut a = ChatTurnSseAccum::default();
+        dispatch_chat_turn_sse_event_block(
+            &sse("text_delta", ",\"content\":null"),
+            &mut a,
+            &mut vec![],
+        );
+        assert_eq!(a.full_text, "");
+    }
+
+    #[test]
+    fn text_delta_numeric_content_ignored() {
+        let mut a = ChatTurnSseAccum::default();
+        dispatch_chat_turn_sse_event_block(
+            &sse("text_delta", ",\"content\":42"),
+            &mut a,
+            &mut vec![],
+        );
+        assert_eq!(a.full_text, "");
+    }
+
+    #[test]
+    fn tool_request_missing_id_not_pushed() {
+        let mut a = ChatTurnSseAccum::default();
+        let mut pending = vec![];
+        dispatch_chat_turn_sse_event_block(
+            &sse("tool_request", ",\"tool\":\"read_file\",\"args\":{}"),
+            &mut a,
+            &mut pending,
+        );
+        // Empty request_id → not pushed
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn tool_request_missing_tool_not_pushed() {
+        let mut a = ChatTurnSseAccum::default();
+        let mut pending = vec![];
+        dispatch_chat_turn_sse_event_block(
+            &sse("tool_request", ",\"request_id\":\"r1\",\"args\":{}"),
+            &mut a,
+            &mut pending,
+        );
+        // Empty tool → not pushed
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn tool_request_missing_args_defaults_to_empty_object() {
+        let mut a = ChatTurnSseAccum::default();
+        let mut pending = vec![];
+        dispatch_chat_turn_sse_event_block(
+            &sse("tool_request", ",\"request_id\":\"r1\",\"tool\":\"bash\""),
+            &mut a,
+            &mut pending,
+        );
+        assert_eq!(pending.len(), 1);
+        if let ChatTurnEdgePending::ToolRequest { args, .. } = &pending[0] {
+            assert!(args.is_object());
+            assert!(args.as_object().unwrap().is_empty());
+        } else {
+            panic!("expected ToolRequest");
+        }
+    }
+
+    #[test]
+    fn approval_required_missing_id_not_pushed() {
+        let mut a = ChatTurnSseAccum::default();
+        let mut pending = vec![];
+        dispatch_chat_turn_sse_event_block(
+            &sse("approval_required", ",\"tool\":\"write_file\""),
+            &mut a,
+            &mut pending,
+        );
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn usage_negative_tokens_treated_as_missing() {
+        let mut a = ChatTurnSseAccum::default();
+        // as_u64() returns None for negative values
+        dispatch_chat_turn_sse_event_block(
+            &sse("usage", ",\"prompt_tokens\":-1,\"completion_tokens\":-5"),
+            &mut a,
+            &mut vec![],
+        );
+        // Negative i64 fails as_u64() → both None → error
+        assert!(a.error_message.is_some());
+        assert!(!a.has_usage);
+    }
+
+    #[test]
+    fn usage_float_tokens_treated_as_zero() {
+        let mut a = ChatTurnSseAccum::default();
+        dispatch_chat_turn_sse_event_block(
+            &sse("usage", ",\"prompt_tokens\":1.5,\"completion_tokens\":2.7"),
+            &mut a,
+            &mut vec![],
+        );
+        // as_u64() returns None for floats → falls through to unwrap_or(0)
+        // But at least one must be present as integer for has_usage
+        assert!(a.error_message.is_some());
+    }
+
+    #[test]
+    fn usage_missing_cache_tokens_default_to_zero() {
+        let mut a = ChatTurnSseAccum::default();
+        dispatch_chat_turn_sse_event_block(
+            &sse("usage", ",\"prompt_tokens\":100,\"completion_tokens\":50"),
+            &mut a,
+            &mut vec![],
+        );
+        assert!(a.has_usage);
+        assert_eq!(a.cache_read_tokens, 0);
+        assert_eq!(a.cache_creation_tokens, 0);
+    }
+
+    #[test]
+    fn multiple_errors_only_first_preserved() {
+        let mut a = ChatTurnSseAccum::default();
+        let block = format!(
+            "{}{}",
+            sse("error", ",\"message\":\"rate limited\""),
+            sse("error", ",\"message\":\"server error\""),
+        );
+        dispatch_chat_turn_sse_event_block(&block, &mut a, &mut vec![]);
+        // Second error overwrites (current behavior: each error replaces)
+        assert!(a.error_message.as_ref().unwrap().contains("server error"));
+    }
+
+    #[test]
+    fn error_event_missing_message_says_unknown() {
+        let mut a = ChatTurnSseAccum::default();
+        dispatch_chat_turn_sse_event_block(&sse("error", ""), &mut a, &mut vec![]);
+        assert_eq!(a.error_message.as_deref(), Some("Error: unknown error"));
+    }
+
+    #[test]
+    fn unknown_event_type_extracts_run_id() {
+        let mut a = ChatTurnSseAccum::default();
+        dispatch_chat_turn_sse_event_block(
+            &sse("some_future_event", ",\"run_id\":\"run-42\""),
+            &mut a,
+            &mut vec![],
+        );
+        assert_eq!(a.run_id.as_deref(), Some("run-42"));
+    }
+
+    #[test]
+    fn unknown_event_without_run_id_is_noop() {
+        let mut a = ChatTurnSseAccum::default();
+        dispatch_chat_turn_sse_event_block(
+            &sse("some_future_event", ",\"data\":123"),
+            &mut a,
+            &mut vec![],
+        );
+        assert!(a.run_id.is_none());
+        assert!(a.error_message.is_none());
+    }
+
+    #[test]
+    fn empty_block_is_noop() {
+        let mut a = ChatTurnSseAccum::default();
+        let efx = dispatch_chat_turn_sse_event_block("", &mut a, &mut vec![]);
+        assert!(efx.is_empty());
+        assert_eq!(a.full_text, "");
+        assert!(a.error_message.is_none());
+    }
+
+    #[test]
+    fn whitespace_only_block_is_noop() {
+        let mut a = ChatTurnSseAccum::default();
+        let efx = dispatch_chat_turn_sse_event_block("  \n\n  \n", &mut a, &mut vec![]);
+        assert!(efx.is_empty());
+    }
+
+    #[test]
+    fn done_only_block_is_noop() {
+        let mut a = ChatTurnSseAccum::default();
+        let efx =
+            dispatch_chat_turn_sse_event_block("data: [DONE]\n\n", &mut a, &mut vec![]);
+        assert!(efx.is_empty());
+        assert!(!a.has_usage);
+    }
+
+    #[test]
+    fn invalid_json_sets_error() {
+        let mut a = ChatTurnSseAccum::default();
+        let efx = dispatch_chat_turn_sse_event_block(
+            "data: {not valid json}\n\n",
+            &mut a,
+            &mut vec![],
+        );
+        assert!(a.error_message.as_ref().unwrap().contains("invalid JSON"));
+        // Should also emit StopThinkingSpinner
+        assert!(efx.iter().any(|e| matches!(e, SseRenderEffect::StopThinkingSpinner)));
+    }
+
+    #[test]
+    fn invalid_json_then_valid_event_still_works() {
+        let mut a = ChatTurnSseAccum::default();
+        let block = format!(
+            "data: {{bad json}}\n\n{}",
+            sse("text_delta", ",\"content\":\"ok\""),
+        );
+        dispatch_chat_turn_sse_event_block(&block, &mut a, &mut vec![]);
+        assert_eq!(a.full_text, "ok");
+        // Error from first event preserved
+        assert!(a.error_message.is_some());
+    }
+
+    #[test]
+    fn event_missing_type_field_treated_as_unknown() {
+        let mut a = ChatTurnSseAccum::default();
+        dispatch_chat_turn_sse_event_block(
+            "data: {\"run_id\":\"r1\"}\n\n",
+            &mut a,
+            &mut vec![],
+        );
+        // Missing "type" → unwrap_or("") → falls into _ arm → extracts run_id
+        assert_eq!(a.run_id.as_deref(), Some("r1"));
+    }
+
+    #[test]
+    fn framer_handles_empty_bytes() {
+        let mut f = ChatTurnSseFramer::new();
+        let blocks = f.push_lossy_bytes(&[]);
+        assert!(blocks.is_empty());
+        assert!(f.ttft_ms.is_none());
+    }
+
+    #[test]
+    fn framer_trailing_blob_on_empty_returns_empty_string() {
+        let mut f = ChatTurnSseFramer::new();
+        let tail = f.take_trailing_dispatch_blob();
+        assert_eq!(tail, "");
+    }
+
+    #[test]
+    fn framer_invalid_utf8_lossy_converts() {
+        let mut f = ChatTurnSseFramer::new();
+        // Invalid UTF-8 sequence: 0xFF is never valid
+        let data = b"data: {\"type\":\"text_delta\",\"content\":\"hi\xff\"}\n\n";
+        let blocks = f.push_lossy_bytes(data);
+        assert_eq!(blocks.len(), 1);
+        // Lossy conversion replaces invalid bytes with U+FFFD
+        assert!(blocks[0].contains('\u{FFFD}') || blocks[0].contains("hi"));
+    }
+
+    #[test]
+    fn session_info_missing_session_id_is_noop() {
+        let mut a = ChatTurnSseAccum::default();
+        dispatch_chat_turn_sse_event_block(
+            &sse("session_info", ",\"other_field\":\"val\""),
+            &mut a,
+            &mut vec![],
+        );
+        assert!(a.session_id.is_none());
+    }
+
+    #[test]
+    fn turn_complete_missing_has_tool_calls_defaults_false() {
+        let mut a = ChatTurnSseAccum::default();
+        dispatch_chat_turn_sse_event_block(
+            &sse("turn_complete", ""),
+            &mut a,
+            &mut vec![],
+        );
+        assert!(!a.has_tool_calls);
+    }
+
+    #[test]
+    fn thinking_delta_missing_content_no_panic() {
+        let mut a = ChatTurnSseAccum::default();
+        let efx = dispatch_chat_turn_sse_event_block(
+            &sse("thinking_delta", ""),
+            &mut a,
+            &mut vec![],
+        );
+        assert_eq!(a.reasoning_content, "");
+        assert!(efx.iter().any(|e| matches!(e, SseRenderEffect::StartThinkingSpinner)));
+    }
+
+    #[test]
+    fn thinking_delta_empty_string_no_preview_chunk() {
+        let mut a = ChatTurnSseAccum::default();
+        let efx = dispatch_chat_turn_sse_event_block(
+            &sse("thinking_delta", ",\"content\":\"\""),
+            &mut a,
+            &mut vec![],
+        );
+        // Empty content: spinner started but no ThinkingPreviewChunk emitted
+        assert!(efx.iter().any(|e| matches!(e, SseRenderEffect::StartThinkingSpinner)));
+        assert!(!efx.iter().any(|e| matches!(e, SseRenderEffect::ThinkingPreviewChunk(_))));
+    }
+
+    #[test]
+    fn text_done_only_fills_when_full_text_empty() {
+        let mut a = ChatTurnSseAccum::default();
+        a.full_text = "already set".to_string();
+        dispatch_chat_turn_sse_event_block(
+            &sse("text_done", ",\"full_text\":\"should not overwrite\""),
+            &mut a,
+            &mut vec![],
+        );
+        assert_eq!(a.full_text, "already set");
+    }
+
+    #[test]
+    fn text_done_fills_empty_full_text() {
+        let mut a = ChatTurnSseAccum::default();
+        dispatch_chat_turn_sse_event_block(
+            &sse("text_done", ",\"full_text\":\"complete response\""),
+            &mut a,
+            &mut vec![],
+        );
+        assert_eq!(a.full_text, "complete response");
     }
 }

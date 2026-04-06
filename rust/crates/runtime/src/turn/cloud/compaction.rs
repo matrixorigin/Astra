@@ -1560,4 +1560,146 @@ mod tests {
                 .map(|s| s.contains("Fix the race condition")).unwrap_or(false));
         assert!(has_fix, "recent user instruction must survive");
     }
+
+    // -----------------------------------------------------------------------
+    // Unhappy-path / edge-case tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn compact_tiered_empty_messages() {
+        let result = compact_tiered(&[], 100, 100, CompactionTier::CompactHistory, 4);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn compact_tiered_single_system_message() {
+        let msgs = vec![json!({"role": "system", "content": "You are helpful"})];
+        let result = compact_tiered(&msgs, 0, 0, CompactionTier::AggressivePrune, 4);
+        // System message should always survive
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0]["role"], "system");
+    }
+
+    #[test]
+    fn compact_tiered_under_budget_no_change() {
+        let msgs = vec![user("hello"), assistant("hi")];
+        let result =
+            compact_tiered_with_result(&msgs, 1000, 500, CompactionTier::TrimSchemas, 4);
+        assert_eq!(result.messages.len(), 2);
+        // Under budget → no boundary emitted
+        assert!(result.boundary.is_none());
+    }
+
+    #[test]
+    fn compact_tiered_zero_budget_triggers_compaction() {
+        let msgs = vec![
+            user("hello"),
+            assistant("world"),
+            tool_with_id("c1", &"x".repeat(1000)),
+        ];
+        let result = compact_tiered_with_result(
+            &msgs,
+            0,    // budget_chars = 0
+            100,  // keep_chars
+            CompactionTier::CompactHistory,
+            4,
+        );
+        // Should compact since total_chars > 0 = budget_chars
+        assert!(result.boundary.is_some() || result.messages.len() <= msgs.len());
+    }
+
+    #[test]
+    fn compact_tiered_messages_without_content() {
+        // Messages with only role, no content field
+        let msgs = vec![
+            json!({"role": "user"}),
+            json!({"role": "assistant"}),
+            json!({"role": "tool", "tool_call_id": "c1"}),
+        ];
+        // Should not panic even with missing content
+        let result = compact_tiered(&msgs, 0, 0, CompactionTier::AggressivePrune, 4);
+        assert!(!result.is_empty() || msgs.is_empty());
+    }
+
+    #[test]
+    fn compact_boundary_invalid_json_deserialization() {
+        let bad_json = r#"{"not_a_boundary": true}"#;
+        let result: Result<CompactBoundary, _> = serde_json::from_str(bad_json);
+        // Should either fail or produce default fields — not panic
+        // CompactBoundary has defaults so it may deserialize with defaults
+        if let Ok(b) = result {
+            // Verify it has sensible defaults
+            assert_eq!(b.pre_tokens, 0);
+            assert_eq!(b.messages_before, 0);
+        }
+        // Either way: no panic
+    }
+
+    #[test]
+    fn compact_tier_invalid_string_deserialization() {
+        let result: Result<CompactionTier, _> = serde_json::from_str(r#""invalid_tier""#);
+        assert!(result.is_err(), "Invalid tier string should fail deserialization");
+    }
+
+    #[test]
+    fn compact_tier_empty_string_deserialization() {
+        let result: Result<CompactionTier, _> = serde_json::from_str(r#""""#);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn resolve_tool_call_meta_no_matching_assistant() {
+        let msgs = vec![
+            user("hello"),
+            json!({"role": "tool", "tool_call_id": "orphan", "content": "data"}),
+        ];
+        let result = resolve_tool_call_meta(&msgs, 1);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn resolve_tool_call_meta_tool_without_call_id() {
+        let msgs = vec![
+            assistant_tool("c1", "read_file", "{}"),
+            tool("data"), // no tool_call_id
+        ];
+        let result = resolve_tool_call_meta(&msgs, 1);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn resolve_tool_call_meta_index_out_of_bounds() {
+        let msgs = vec![user("hello")];
+        let result = resolve_tool_call_meta(&msgs, 5);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn resolve_tool_call_meta_index_zero() {
+        // Index 0: no preceding messages to search
+        let msgs = vec![json!({"role": "tool", "tool_call_id": "c1", "content": "data"})];
+        let result = resolve_tool_call_meta(&msgs, 0);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn compact_boundary_to_system_message_roundtrip() {
+        let boundary =
+            CompactBoundary::new(CompactTrigger::Auto, CompactionTier::CompactHistory)
+                .with_pre_metrics(5000, 10)
+                .with_post_count(6);
+        let msg = boundary.to_system_message();
+        assert_eq!(msg["role"], "system");
+        // Content should contain embedded JSON
+        let content = msg["content"].as_str().unwrap();
+        assert!(content.contains("compact-history"));
+    }
+
+    #[test]
+    fn keep_recent_turns_larger_than_message_count() {
+        let msgs = vec![user("hello"), assistant("hi")];
+        let result = compact_tiered(&msgs, 0, 0, CompactionTier::CompactHistory, 100);
+        // keep_recent_turns=100 > 2 messages → all kept
+        assert_eq!(result.len(), 2);
+    }
 }

@@ -1367,4 +1367,160 @@ mod tests {
         assert_eq!(loaded.plan_config_json, s.plan_config_json);
         assert_eq!(loaded.plan_execution_rounds, 5);
     }
+
+    // -----------------------------------------------------------------------
+    // Unhappy-path / edge-case tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn restored_session_minimal_json() {
+        // Required fields without serde(default)
+        let json = r#"{
+            "session_id":"s1","last_status":"active","turn_count":0,
+            "total_tokens_in":0,"total_tokens_out":0,"recent_tools":[],
+            "checkpoint_count":0,"restored_from_cloud":false
+        }"#;
+        let s: RestoredSession = serde_json::from_str(json).unwrap();
+        assert_eq!(s.session_id, "s1");
+        assert_eq!(s.turn_count, 0);
+        assert!(s.conversation_messages.is_empty());
+        assert!(s.blocked_tools.is_empty());
+        assert!(s.plan_corrections.is_empty());
+        assert_eq!(s.plan_execution_rounds, 0);
+    }
+
+    fn minimal_session_json(extra: &str) -> String {
+        format!(
+            r#"{{"session_id":"s1","last_status":"x","turn_count":0,
+            "total_tokens_in":0,"total_tokens_out":0,"recent_tools":[],
+            "checkpoint_count":0,"restored_from_cloud":false{}}}"#,
+            if extra.is_empty() { "".to_string() } else { format!(",{extra}") }
+        )
+    }
+
+    #[test]
+    fn restored_session_with_extra_fields_ignored() {
+        let json = minimal_session_json(r#""unknown_field":"value","another":42"#);
+        let s: RestoredSession = serde_json::from_str(&json).unwrap();
+        assert_eq!(s.session_id, "s1");
+    }
+
+    #[test]
+    fn restored_session_null_optional_fields() {
+        let json = minimal_session_json(
+            r#""learning_snapshot_json":null,"git_branch":null,"model":null,"title":null"#,
+        );
+        let s: RestoredSession = serde_json::from_str(&json).unwrap();
+        assert!(s.learning_snapshot_json.is_none());
+        assert!(s.git_branch.is_none());
+        assert!(s.model.is_none());
+        assert!(s.title.is_none());
+    }
+
+    #[test]
+    fn restored_checkpoint_serialization_roundtrip() {
+        let ckpt = RestoredCheckpoint {
+            number: 5,
+            turn: 10,
+            title: "Phase 1 complete".into(),
+            summary: "Implemented auth module".into(),
+            total_tokens: 50000,
+            contract_state_json: Some(r#"{"id":"c1"}"#.into()),
+        };
+        let json = serde_json::to_string(&ckpt).unwrap();
+        let loaded: RestoredCheckpoint = serde_json::from_str(&json).unwrap();
+        assert_eq!(loaded.number, 5);
+        assert_eq!(loaded.turn, 10);
+        assert_eq!(loaded.title, "Phase 1 complete");
+        assert_eq!(loaded.contract_state_json.as_deref(), Some(r#"{"id":"c1"}"#));
+    }
+
+    #[test]
+    fn restored_checkpoint_missing_contract_state() {
+        let json = r#"{"number":1,"turn":2,"title":"t","summary":"s","total_tokens":100}"#;
+        let ckpt: RestoredCheckpoint = serde_json::from_str(json).unwrap();
+        assert!(ckpt.contract_state_json.is_none());
+    }
+
+    #[test]
+    fn parse_heavy_checkpoint_number_zero_padded() {
+        assert_eq!(super::parse_heavy_checkpoint_number("000001-heavy.json"), Some(1));
+        assert_eq!(super::parse_heavy_checkpoint_number("000999-heavy.json"), Some(999));
+    }
+
+    #[test]
+    fn parse_heavy_checkpoint_number_no_padding() {
+        assert_eq!(super::parse_heavy_checkpoint_number("1-heavy.json"), Some(1));
+        assert_eq!(super::parse_heavy_checkpoint_number("42-heavy.json"), Some(42));
+    }
+
+    #[test]
+    fn parse_heavy_checkpoint_number_empty_string() {
+        assert!(super::parse_heavy_checkpoint_number("").is_none());
+    }
+
+    #[test]
+    fn parse_heavy_checkpoint_number_wrong_suffix() {
+        assert!(super::parse_heavy_checkpoint_number("000005-light.json").is_none());
+        assert!(super::parse_heavy_checkpoint_number("000005-heavy.txt").is_none());
+        assert!(super::parse_heavy_checkpoint_number("000005.json").is_none());
+    }
+
+    #[test]
+    fn parse_heavy_checkpoint_number_non_numeric_prefix() {
+        assert!(super::parse_heavy_checkpoint_number("abc-heavy.json").is_none());
+        assert!(super::parse_heavy_checkpoint_number("-heavy.json").is_none());
+    }
+
+    #[test]
+    fn parse_heavy_checkpoint_number_negative() {
+        // "-1-heavy.json" → strip suffix → "-1" → parse fails
+        assert!(super::parse_heavy_checkpoint_number("-1-heavy.json").is_none());
+    }
+
+    #[test]
+    fn is_duplicate_key_error_non_database_error() {
+        let err = sqlx::Error::RowNotFound;
+        assert!(!super::is_duplicate_key_error(&err));
+    }
+
+    #[test]
+    fn restored_session_conversation_messages_preserved() {
+        let s = RestoredSession {
+            session_id: "s1".into(),
+            conversation_messages: vec![
+                serde_json::json!({"role": "user", "content": "hi"}),
+                serde_json::json!({"role": "assistant", "content": "hello"}),
+            ],
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&s).unwrap();
+        let loaded: RestoredSession = serde_json::from_str(&json).unwrap();
+        assert_eq!(loaded.conversation_messages.len(), 2);
+        assert_eq!(loaded.conversation_messages[0]["role"], "user");
+    }
+
+    #[test]
+    fn restored_session_blocked_tools_and_corrections() {
+        let s = RestoredSession {
+            session_id: "s1".into(),
+            blocked_tools: vec!["dangerous_tool".into()],
+            plan_corrections: vec!["skip step 3".into(), "add validation".into()],
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&s).unwrap();
+        let loaded: RestoredSession = serde_json::from_str(&json).unwrap();
+        assert_eq!(loaded.blocked_tools, vec!["dangerous_tool"]);
+        assert_eq!(loaded.plan_corrections.len(), 2);
+    }
+
+    #[test]
+    fn restored_session_skip_serializing_empty_collections() {
+        let s = RestoredSession::default();
+        let json = serde_json::to_string(&s).unwrap();
+        // Empty vecs should not appear in serialized JSON
+        assert!(!json.contains("conversation_messages"));
+        assert!(!json.contains("blocked_tools"));
+        assert!(!json.contains("plan_corrections"));
+    }
 }
