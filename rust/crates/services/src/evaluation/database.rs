@@ -544,3 +544,285 @@ impl EvaluationService for DatabaseEvaluationService {
         ))
     }
 }
+
+// ─── Tests ───────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── clamp helpers ───────────────────────────────────────────────────
+
+    #[test]
+    fn clamp_eval_limit_within_range() {
+        assert_eq!(clamp_eval_limit(50), 50);
+    }
+
+    #[test]
+    fn clamp_eval_limit_too_low() {
+        assert_eq!(clamp_eval_limit(0), 1);
+        assert_eq!(clamp_eval_limit(-10), 1);
+    }
+
+    #[test]
+    fn clamp_eval_limit_too_high() {
+        assert_eq!(clamp_eval_limit(999), MAX_EVALUATION_ROWS);
+    }
+
+    #[test]
+    fn clamp_eval_days_within_range() {
+        assert_eq!(clamp_eval_days(30), 30);
+    }
+
+    #[test]
+    fn clamp_eval_days_boundaries() {
+        assert_eq!(clamp_eval_days(0), 1);
+        assert_eq!(clamp_eval_days(-5), 1);
+        assert_eq!(clamp_eval_days(999), MAX_EVALUATION_DAYS);
+        assert_eq!(clamp_eval_days(1), 1);
+        assert_eq!(clamp_eval_days(365), 365);
+    }
+
+    // ── DatabaseEvaluationService builder ───────────────────────────────
+
+    #[test]
+    fn new_service_has_no_pool_or_memoria() {
+        let settings = MatrixOneSettings { host: String::new(), port: 0, user: String::new(), password: String::new(), database: String::new() };
+        let svc = DatabaseEvaluationService::new(settings);
+        assert!(svc.pool.is_none());
+        assert!(svc.memoria_base_url.is_none());
+        assert!(svc.memoria_master_key.is_none());
+    }
+
+    #[test]
+    fn with_memoria_config_filters_empty_key() {
+        let settings = MatrixOneSettings { host: String::new(), port: 0, user: String::new(), password: String::new(), database: String::new() };
+        let svc = DatabaseEvaluationService::new(settings)
+            .with_memoria_config("http://localhost:8080", Some("".to_string()));
+        assert_eq!(svc.memoria_base_url, Some("http://localhost:8080".into()));
+        // Empty key should be filtered to None
+        assert!(svc.memoria_master_key.is_none());
+    }
+
+    #[test]
+    fn with_memoria_config_keeps_valid_key() {
+        let settings = MatrixOneSettings { host: String::new(), port: 0, user: String::new(), password: String::new(), database: String::new() };
+        let svc = DatabaseEvaluationService::new(settings)
+            .with_memoria_config("http://localhost:8080", Some("secret123".to_string()));
+        assert_eq!(svc.memoria_master_key, Some("secret123".into()));
+    }
+
+    #[test]
+    fn with_memoria_config_none_key() {
+        let settings = MatrixOneSettings { host: String::new(), port: 0, user: String::new(), password: String::new(), database: String::new() };
+        let svc = DatabaseEvaluationService::new(settings)
+            .with_memoria_config("http://localhost:8080", None);
+        assert!(svc.memoria_master_key.is_none());
+    }
+
+    // ── memoria_get error paths (no DB needed) ──────────────────────────
+
+    #[tokio::test]
+    async fn memoria_get_fails_without_config() {
+        let settings = MatrixOneSettings { host: String::new(), port: 0, user: String::new(), password: String::new(), database: String::new() };
+        let svc = DatabaseEvaluationService::new(settings);
+        let result = svc.memoria_get("/v1/health/storage", "user1").await;
+        assert!(result.is_err());
+        let (status, _) = result.unwrap_err();
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn memoria_get_fails_without_master_key() {
+        let settings = MatrixOneSettings { host: String::new(), port: 0, user: String::new(), password: String::new(), database: String::new() };
+        let svc = DatabaseEvaluationService::new(settings)
+            .with_memoria_config("http://localhost:9999", None);
+        let result = svc.memoria_get("/v1/health/storage", "user1").await;
+        assert!(result.is_err());
+        let (status, _) = result.unwrap_err();
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    // ── UnconfiguredEvaluationService ───────────────────────────────────
+
+    #[tokio::test]
+    async fn unconfigured_service_all_methods_error() {
+        use super::super::noop::UnconfiguredEvaluationService;
+        use super::super::service::EvaluationService;
+        let svc = UnconfiguredEvaluationService;
+
+        assert!(svc.get_quality_trend("u", 30, None).await.is_err());
+        assert!(svc.detect_drift("u").await.is_err());
+        assert!(svc.get_gate_history("u", 50).await.is_err());
+        assert!(svc.get_calibration("u", None, 30).await.is_err());
+        assert!(svc.get_session_scores("u", 50, 0.0).await.is_err());
+        assert!(svc.trust_report("u", "a", 30).await.is_err());
+        assert!(svc.slo_dashboard("u", 30).await.is_err());
+        assert!(svc.slo_history("u", "a", 30).await.is_err());
+        assert!(svc.observability_metrics("u", "a", 30).await.is_err());
+        assert!(svc.memory_health("u").await.is_err());
+        assert!(svc.memory_metrics("u").await.is_err());
+    }
+
+    // ── evaluation/utils pure functions ──────────────────────────────────
+
+    #[test]
+    fn compute_overall_avg_empty() {
+        use super::super::utils::compute_overall_avg;
+        assert_eq!(compute_overall_avg(&[]), 0.0);
+    }
+
+    #[test]
+    fn compute_overall_avg_weighted() {
+        use super::super::utils::compute_overall_avg;
+        use super::super::types::QualityTrendPoint;
+        let points = vec![
+            QualityTrendPoint { date: "2024-01-01".into(), avg_score: 0.8, count: 10, model: None },
+            QualityTrendPoint { date: "2024-01-02".into(), avg_score: 0.6, count: 10, model: None },
+        ];
+        let avg = compute_overall_avg(&points);
+        assert!((avg - 0.7).abs() < 0.001);
+    }
+
+    #[test]
+    fn compute_overall_avg_zero_counts() {
+        use super::super::utils::compute_overall_avg;
+        use super::super::types::QualityTrendPoint;
+        let points = vec![
+            QualityTrendPoint { date: "2024-01-01".into(), avg_score: 0.9, count: 0, model: None },
+        ];
+        assert_eq!(compute_overall_avg(&points), 0.0);
+    }
+
+    #[test]
+    fn trust_ratio_zero_checks() {
+        use super::super::utils::trust_ratio;
+        assert_eq!(trust_ratio(0, 0), 1.0);
+    }
+
+    #[test]
+    fn trust_ratio_all_safe() {
+        use super::super::utils::trust_ratio;
+        assert_eq!(trust_ratio(100, 100), 1.0);
+    }
+
+    #[test]
+    fn trust_ratio_partial() {
+        use super::super::utils::trust_ratio;
+        assert!((trust_ratio(10, 7) - 0.7).abs() < 0.001);
+    }
+
+    #[test]
+    fn skill_success_rate_zero() {
+        use super::super::utils::skill_success_rate;
+        assert_eq!(skill_success_rate(0, 0), 0.0);
+    }
+
+    #[test]
+    fn skill_success_rate_half() {
+        use super::super::utils::skill_success_rate;
+        assert!((skill_success_rate(10, 5) - 0.5).abs() < 0.001);
+    }
+
+    #[test]
+    fn compute_calibration_error_perfect() {
+        use super::super::utils::compute_calibration_error;
+        assert_eq!(compute_calibration_error(0.8, 0.8), 0.0);
+    }
+
+    #[test]
+    fn compute_calibration_error_gap() {
+        use super::super::utils::compute_calibration_error;
+        assert!((compute_calibration_error(0.9, 0.7) - 0.2).abs() < 0.001);
+    }
+
+    #[test]
+    fn compute_adjustment_well_calibrated() {
+        use super::super::utils::compute_adjustment;
+        let (mult, reason) = compute_adjustment(0.03, 0.0);
+        assert_eq!(mult, 1.0);
+        assert!(reason.contains("Well calibrated"));
+    }
+
+    #[test]
+    fn compute_adjustment_overconfident() {
+        use super::super::utils::compute_adjustment;
+        let (mult, reason) = compute_adjustment(0.2, 0.15);
+        assert!(mult < 1.0);
+        assert!(reason.contains("Overconfident"));
+    }
+
+    #[test]
+    fn compute_adjustment_underconfident() {
+        use super::super::utils::compute_adjustment;
+        let (mult, reason) = compute_adjustment(0.2, -0.15);
+        assert!(mult > 1.0);
+        assert!(reason.contains("Underconfident"));
+    }
+
+    // ── evaluation/types serde ──────────────────────────────────────────
+
+    #[test]
+    fn drift_severity_serde_roundtrip() {
+        use super::super::types::DriftSeverity;
+        let json = serde_json::to_string(&DriftSeverity::Critical).unwrap();
+        assert_eq!(json, r#""critical""#);
+        let back: DriftSeverity = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, DriftSeverity::Critical);
+    }
+
+    #[test]
+    fn change_type_serde() {
+        use super::super::types::ChangeType;
+        let json = serde_json::to_string(&ChangeType::ContextBudget).unwrap();
+        assert_eq!(json, r#""context_budget""#);
+    }
+
+    #[test]
+    fn loop_action_serde() {
+        use super::super::types::LoopAction;
+        let json = serde_json::to_string(&LoopAction::NoOp).unwrap();
+        assert_eq!(json, r#""no_op""#);
+    }
+
+    #[test]
+    fn export_format_serde() {
+        use super::super::types::ExportFormat;
+        let json = serde_json::to_string(&ExportFormat::Parquet).unwrap();
+        assert_eq!(json, r#""parquet""#);
+    }
+
+    #[test]
+    fn quality_trend_query_defaults() {
+        use super::super::types::QualityTrendQuery;
+        let q: QualityTrendQuery = serde_json::from_str("{}").unwrap();
+        assert_eq!(q.days, 30);
+        assert!(q.model.is_none());
+    }
+
+    #[test]
+    fn gate_validate_request_defaults() {
+        use super::super::types::GateValidateRequest;
+        let json = r#"{"change_type":"prompt","change_id":"c1","change_content":{}}"#;
+        let req: GateValidateRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.golden_session_count, 50);
+        assert!((req.error_rate_threshold - 0.05).abs() < 0.001);
+        assert!((req.score_regression_threshold - (-0.1)).abs() < 0.001);
+    }
+
+    #[test]
+    fn training_data_extract_defaults() {
+        use super::super::types::TrainingDataExtractRequest;
+        let req: TrainingDataExtractRequest = serde_json::from_str("{}").unwrap();
+        assert_eq!(req.days, 30);
+        assert!((req.min_quality - 0.7).abs() < 0.001);
+        assert_eq!(req.max_samples, 1000);
+    }
+
+    #[test]
+    fn not_implemented_helper() {
+        use super::super::utils::not_implemented;
+        let (status, _) = not_implemented("test");
+        assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
+    }
+}

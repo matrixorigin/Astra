@@ -758,3 +758,198 @@ impl SkillConfigService for UnconfiguredSkillConfigService {
         ))
     }
 }
+
+// ─── Tests ───────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── scope_id ────────────────────────────────────────────────────────
+
+    #[test]
+    fn scope_id_global_returns_none() {
+        assert_eq!(DatabaseSkillConfigService::scope_id("user1", "global"), None);
+    }
+
+    #[test]
+    fn scope_id_user_returns_user_id() {
+        assert_eq!(
+            DatabaseSkillConfigService::scope_id("user1", "user"),
+            Some("user1".to_string())
+        );
+    }
+
+    #[test]
+    fn scope_id_unknown_scope_returns_user_id() {
+        // Any scope that isn't "global" returns the user_id
+        assert_eq!(
+            DatabaseSkillConfigService::scope_id("u", "tenant"),
+            Some("u".to_string())
+        );
+        assert_eq!(
+            DatabaseSkillConfigService::scope_id("u", ""),
+            Some("u".to_string())
+        );
+    }
+
+    // ── default_scope ───────────────────────────────────────────────────
+
+    #[test]
+    fn default_scope_is_user() {
+        assert_eq!(default_scope(), "user");
+    }
+
+    // ── UnconfiguredSkillConfigService ───────────────────────────────────
+
+    fn assert_unavailable(result: Result<impl std::fmt::Debug, (StatusCode, Json<ErrorResponse>)>) {
+        let (status, _) = result.unwrap_err();
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn unconfigured_validate_config() {
+        let svc = UnconfiguredSkillConfigService;
+        assert_unavailable(svc.validate_config("u", "s", None).await);
+    }
+
+    #[tokio::test]
+    async fn unconfigured_get_effective_config() {
+        let svc = UnconfiguredSkillConfigService;
+        assert_unavailable(svc.get_effective_config("u", "s").await);
+    }
+
+    #[tokio::test]
+    async fn unconfigured_delete_setting() {
+        let svc = UnconfiguredSkillConfigService;
+        assert_unavailable(svc.delete_setting("u", "s", "k", "user").await);
+    }
+
+    #[tokio::test]
+    async fn unconfigured_list_resources() {
+        let svc = UnconfiguredSkillConfigService;
+        assert_unavailable(svc.list_resources("u", "s").await);
+    }
+
+    #[tokio::test]
+    async fn unconfigured_unbind_resource() {
+        let svc = UnconfiguredSkillConfigService;
+        assert_unavailable(svc.unbind_resource("u", "s", "r").await);
+    }
+
+    // ── Type serialization ──────────────────────────────────────────────
+
+    #[test]
+    fn validation_response_serialize() {
+        let resp = ValidationResponse {
+            valid: false,
+            errors: vec![ValidationError {
+                section: "settings".into(),
+                name: "api_key".into(),
+                resource_key: Some("my-db".into()),
+                error: "Missing".into(),
+            }],
+        };
+        let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(json["valid"], false);
+        assert_eq!(json["errors"][0]["resource_key"], "my-db");
+    }
+
+    #[test]
+    fn validation_response_no_resource_key() {
+        let resp = ValidationResponse {
+            valid: true,
+            errors: vec![ValidationError {
+                section: "secrets".into(),
+                name: "token".into(),
+                resource_key: None,
+                error: "Empty".into(),
+            }],
+        };
+        let json = serde_json::to_value(&resp).unwrap();
+        // resource_key: None → should be skipped
+        assert!(json["errors"][0].get("resource_key").is_none());
+    }
+
+    #[test]
+    fn config_response_serialize() {
+        let mut settings = HashMap::new();
+        settings.insert("timeout".into(), serde_json::json!(30));
+        let resp = ConfigResponse {
+            settings,
+            secrets: HashMap::from([("api_key".into(), "***".into())]),
+            resources_configured: 2,
+        };
+        let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(json["settings"]["timeout"], 30);
+        assert_eq!(json["secrets"]["api_key"], "***");
+        assert_eq!(json["resources_configured"], 2);
+    }
+
+    #[test]
+    fn scope_query_default() {
+        let q: ScopeQuery = serde_json::from_str("{}").unwrap();
+        assert_eq!(q.scope, "user");
+    }
+
+    #[test]
+    fn scope_query_custom() {
+        let q: ScopeQuery = serde_json::from_str(r#"{"scope":"global"}"#).unwrap();
+        assert_eq!(q.scope, "global");
+    }
+
+    #[test]
+    fn bind_resource_request_deserialize() {
+        let json = r#"{"bindings":{"host":"localhost","port":5432}}"#;
+        let req: BindResourceRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.bindings.len(), 2);
+        assert_eq!(req.bindings["host"], "localhost");
+    }
+
+    #[test]
+    fn resource_entry_serialize() {
+        let entry = ResourceEntry {
+            resource_key: "my-db".into(),
+            resource_type: "postgres".into(),
+        };
+        let json = serde_json::to_value(&entry).unwrap();
+        assert_eq!(json["resource_key"], "my-db");
+        assert_eq!(json["resource_type"], "postgres");
+    }
+
+    #[test]
+    fn status_response_serialize() {
+        let resp = StatusResponse { status: "ok".into() };
+        let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(json["status"], "ok");
+    }
+
+    #[test]
+    fn unbind_response_serialize() {
+        let resp = UnbindResourceResponse {
+            status: "deleted".into(),
+            count: 3,
+        };
+        let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(json["count"], 3);
+    }
+
+    #[test]
+    fn bind_response_serialize() {
+        let resp = BindResourceResponse {
+            status: "ok".into(),
+            resource_key: "my-db".into(),
+        };
+        let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(json["resource_key"], "my-db");
+    }
+
+    #[test]
+    fn validate_query_deserialize() {
+        let q: ValidateQuery = serde_json::from_str(r#"{"resource":"my-db"}"#).unwrap();
+        assert_eq!(q.resource, Some("my-db".into()));
+
+        let q: ValidateQuery = serde_json::from_str("{}").unwrap();
+        assert!(q.resource.is_none());
+    }
+}

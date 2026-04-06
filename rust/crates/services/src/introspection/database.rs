@@ -938,3 +938,222 @@ fn raw_contents(
 
     Value::Object(raw)
 }
+
+// ─── Tests ───────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── empty_memory_recall ──────────────────────────────────────────────
+
+    #[test]
+    fn empty_memory_recall_structure() {
+        let result = empty_memory_recall("test query", "code_gen");
+        assert_eq!(result["query"], "test query");
+        assert_eq!(result["task_hint"], "code_gen");
+        assert_eq!(result["retrieved_count"], 0);
+        assert!(result["ranking"].as_array().unwrap().is_empty());
+        assert_eq!(result["phases"]["keyword"]["candidates"], 0);
+    }
+
+    #[test]
+    fn empty_memory_recall_empty_strings() {
+        let result = empty_memory_recall("", "");
+        assert_eq!(result["query"], "");
+        assert_eq!(result["task_hint"], "");
+    }
+
+    // ── summarize_contents ──────────────────────────────────────────────
+
+    #[test]
+    fn summarize_contents_all_none() {
+        let result = summarize_contents(None, None, None, None);
+        assert!(result.as_object().unwrap().is_empty());
+    }
+
+    #[test]
+    fn summarize_contents_valid_events() {
+        let events = r#"[{"event_type":"user_query"},{"event_type":"tool_call"},{"event_type":"user_query"}]"#;
+        let result = summarize_contents(Some(events), None, None, None);
+        assert_eq!(result["events"]["total"], 3);
+        let by_type = result["events"]["by_type"].as_object().unwrap();
+        assert_eq!(by_type["user_query"], 2);
+        assert_eq!(by_type["tool_call"], 1);
+    }
+
+    #[test]
+    fn summarize_contents_malformed_events_json() {
+        let result = summarize_contents(Some("not json"), None, None, None);
+        // Malformed JSON → silently skipped
+        assert!(result.as_object().unwrap().get("events").is_none());
+    }
+
+    #[test]
+    fn summarize_contents_valid_code() {
+        let code = r#"[{"file":"src/main.rs"},{"path":"src/lib.rs"}]"#;
+        let result = summarize_contents(None, Some(code), None, None);
+        assert_eq!(result["code"]["files"], 2);
+        let paths = result["code"]["paths"].as_array().unwrap();
+        assert!(paths.contains(&Value::String("src/main.rs".into())));
+        assert!(paths.contains(&Value::String("src/lib.rs".into())));
+    }
+
+    #[test]
+    fn summarize_contents_code_missing_path_field() {
+        let code = r#"[{"content":"fn main(){}"}]"#;
+        let result = summarize_contents(None, Some(code), None, None);
+        assert_eq!(result["code"]["files"], 1);
+        // No file/path field → filtered out
+        assert!(result["code"]["paths"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn summarize_contents_valid_skills() {
+        let skills = r#"[{"skill_name":"code_review"},{"skill_name":"test_gen"}]"#;
+        let result = summarize_contents(None, None, Some(skills), None);
+        let names = result["skills"].as_array().unwrap();
+        assert_eq!(names.len(), 2);
+        assert!(names.contains(&Value::String("code_review".into())));
+    }
+
+    #[test]
+    fn summarize_contents_valid_docs() {
+        let docs = r#"[{"source":"README.md"},{"title":"API Guide"}]"#;
+        let result = summarize_contents(None, None, None, Some(docs));
+        let titles = result["docs"].as_array().unwrap();
+        assert_eq!(titles.len(), 2);
+    }
+
+    #[test]
+    fn summarize_contents_event_without_type() {
+        let events = r#"[{"content":"hello"}]"#;
+        let result = summarize_contents(Some(events), None, None, None);
+        // Missing event_type → counted as "unknown"
+        let by_type = result["events"]["by_type"].as_object().unwrap();
+        assert_eq!(by_type["unknown"], 1);
+    }
+
+    // ── raw_contents ────────────────────────────────────────────────────
+
+    #[test]
+    fn raw_contents_all_none() {
+        let result = raw_contents(None, None, None, None, 1000);
+        assert!(result.as_object().unwrap().is_empty());
+    }
+
+    #[test]
+    fn raw_contents_fits_budget() {
+        let events = r#"[{"event_type":"user_query","content":"hi"}]"#;
+        let result = raw_contents(Some(events), None, None, None, 1000);
+        let arr = result["events"].as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert!(result.get("events_truncated").is_none());
+    }
+
+    #[test]
+    fn raw_contents_zero_budget() {
+        let events = r#"[{"event_type":"x"}]"#;
+        // token_budget=0 → char_budget=0 → nothing fits
+        let result = raw_contents(Some(events), None, None, None, 0);
+        assert!(result.as_object().unwrap().is_empty());
+    }
+
+    #[test]
+    fn raw_contents_truncates_large_data() {
+        // Create events that exceed the budget
+        let mut items = Vec::new();
+        for i in 0..100 {
+            items.push(serde_json::json!({"idx": i, "data": "x".repeat(50)}));
+        }
+        let events = serde_json::to_string(&items).unwrap();
+        // Very small budget → only some items fit
+        let result = raw_contents(Some(&events), None, None, None, 50);
+        if let Some(arr) = result["events"].as_array() {
+            assert!(arr.len() < 100);
+            assert_eq!(result["events_truncated"], true);
+        }
+    }
+
+    #[test]
+    fn raw_contents_malformed_json_skipped() {
+        let result = raw_contents(Some("not json"), None, None, None, 1000);
+        assert!(result.as_object().unwrap().get("events").is_none());
+    }
+
+    #[test]
+    fn raw_contents_empty_blob_skipped() {
+        let result = raw_contents(Some(""), None, None, None, 1000);
+        assert!(result.as_object().unwrap().is_empty());
+    }
+
+    #[test]
+    fn raw_contents_multiple_sections() {
+        let events = r#"[{"e":1}]"#;
+        let code = r#"[{"file":"a.rs"}]"#;
+        let result = raw_contents(Some(events), Some(code), None, None, 5000);
+        assert!(result.get("events").is_some());
+        assert!(result.get("code").is_some());
+    }
+
+    // ── UnconfiguredIntrospectionService ─────────────────────────────────
+
+    #[tokio::test]
+    async fn unconfigured_service_returns_errors() {
+        use super::super::{IntrospectionService, UnconfiguredIntrospectionService};
+        let svc = UnconfiguredIntrospectionService;
+        assert!(svc.get_memory_introspection("u1", "s1").await.is_err());
+        assert!(svc.get_skills_introspection("u1").await.is_err());
+        assert!(svc.get_context_trend("u1", "s1", 10, 128000).await.is_err());
+        assert!(
+            svc.get_context_snapshot("u1", "s1", None, false, false, 2000)
+                .await
+                .is_err()
+        );
+        assert!(svc.get_retrieval_quality("u1", "s1", 5).await.is_err());
+        assert!(
+            svc.get_memory_recall("u1", "s1", "q", "hint", 10)
+                .await
+                .is_err()
+        );
+    }
+
+    // ── Query type serde defaults ───────────────────────────────────────
+
+    #[test]
+    fn context_trend_query_defaults() {
+        use super::super::ContextTrendQuery;
+        let q: ContextTrendQuery =
+            serde_json::from_str(r#"{"session_id":"s1"}"#).unwrap();
+        assert_eq!(q.turns, 10);
+        assert_eq!(q.context_window, 128000);
+    }
+
+    #[test]
+    fn context_snapshot_query_defaults() {
+        use super::super::ContextSnapshotQuery;
+        let q: ContextSnapshotQuery =
+            serde_json::from_str(r#"{"session_id":"s1"}"#).unwrap();
+        assert!(!q.detail);
+        assert!(!q.raw);
+        assert_eq!(q.raw_token_budget, 2000);
+        assert!(q.turn_index.is_none());
+    }
+
+    #[test]
+    fn retrieval_quality_query_defaults() {
+        use super::super::RetrievalQualityQuery;
+        let q: RetrievalQualityQuery =
+            serde_json::from_str(r#"{"session_id":"s1"}"#).unwrap();
+        assert_eq!(q.turns, 5);
+    }
+
+    #[test]
+    fn memory_recall_query_defaults() {
+        use super::super::MemoryRecallQuery;
+        let q: MemoryRecallQuery =
+            serde_json::from_str(r#"{"session_id":"s1","query":"test"}"#).unwrap();
+        assert_eq!(q.task_hint, "default");
+        assert_eq!(q.limit, 10);
+    }
+}
