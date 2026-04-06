@@ -199,3 +199,159 @@ pub(crate) fn build_stream_result(ctx: StreamResultBuild<'_>) -> StreamResult {
         memoria_ms,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_step_recorder() -> StepRecorder {
+        StepRecorder::with_persistence("test-session", "test-task")
+    }
+
+    fn make_turn_guard() -> TurnGuard {
+        TurnGuard::new()
+    }
+
+    fn make_build_ctx<'a>(
+        step_recorder: &'a StepRecorder,
+        turn_guard: &'a TurnGuard,
+    ) -> StreamResultBuild<'a> {
+        StreamResultBuild {
+            tool_health_entries: &[],
+            session_id: Some("sess-1".into()),
+            run_id: Some("run-1".into()),
+            full_text: "hello".into(),
+            prompt_tokens: 1000,
+            completion_tokens: 500,
+            cache_read_tokens: 800,
+            cache_creation_tokens: 100,
+            tool_calls_count: 3,
+            first_selection_report: None,
+            selected_skills: vec!["sk1".into()],
+            tools_used: HashSet::from(["bash".into(), "read".into()]),
+            tool_call_records: vec![],
+            budget_pressure: 0.5,
+            stall_events: vec![],
+            verdict_events: vec![],
+            step_recorder,
+            turn_guard,
+            last_heavy_checkpoint: None,
+            ttft_ms: Some(42),
+            context_ms: Some(100),
+            selector_strategy: Some("tfidf".into()),
+            selector_ms: Some(5),
+            selector_tokens_in: 200,
+            selector_tokens_out: 50,
+            memoria_ms: None,
+        }
+    }
+
+    #[test]
+    fn build_stream_result_passes_cache_tokens_through() {
+        let sr = make_step_recorder();
+        let tg = make_turn_guard();
+        let ctx = make_build_ctx(&sr, &tg);
+        let result = build_stream_result(ctx);
+        assert_eq!(result.cache_read_tokens, 800);
+        assert_eq!(result.cache_creation_tokens, 100);
+        assert_eq!(result.prompt_tokens, 1000);
+        assert_eq!(result.completion_tokens, 500);
+    }
+
+    #[test]
+    fn build_stream_result_passes_basic_fields() {
+        let sr = make_step_recorder();
+        let tg = make_turn_guard();
+        let ctx = make_build_ctx(&sr, &tg);
+        let result = build_stream_result(ctx);
+        assert_eq!(result.session_id.as_deref(), Some("sess-1"));
+        assert_eq!(result.run_id.as_deref(), Some("run-1"));
+        assert_eq!(result.full_text, "hello");
+        assert_eq!(result.tool_calls_count, 3);
+        assert_eq!(result.ttft_ms, Some(42));
+        assert_eq!(result.context_ms, Some(100));
+        assert_eq!(result.selector_strategy.as_deref(), Some("tfidf"));
+    }
+
+    #[test]
+    fn build_stream_result_deduplicates_stall_events() {
+        let sr = make_step_recorder();
+        let tg = make_turn_guard();
+        let mut ctx = make_build_ctx(&sr, &tg);
+        ctx.stall_events = vec![
+            ("slow_tool".into(), 1),
+            ("slow_tool".into(), 2),
+            ("rate_limit".into(), 1),
+        ];
+        let result = build_stream_result(ctx);
+        assert_eq!(result.stall_events.len(), 2);
+        assert_eq!(result.stall_events[0].0, "slow_tool");
+        assert_eq!(result.stall_events[1].0, "rate_limit");
+    }
+
+    #[test]
+    fn build_stream_result_deduplicates_verdict_events() {
+        let sr = make_step_recorder();
+        let tg = make_turn_guard();
+        let mut ctx = make_build_ctx(&sr, &tg);
+        ctx.verdict_events = vec![
+            VerdictEvent {
+                severity: "warn".into(),
+                turn: 1,
+                injections: vec![],
+                avoid_tools: vec![],
+                force_stop: false,
+                nudge_count: 0,
+                total_errors: 0,
+                deprioritized_count: 0,
+                total_timeouts: 0,
+                total_cache_hits: 0,
+                flaky_count: 0,
+            },
+            VerdictEvent {
+                severity: "warn".into(),
+                turn: 2,
+                injections: vec![],
+                avoid_tools: vec![],
+                force_stop: false,
+                nudge_count: 0,
+                total_errors: 0,
+                deprioritized_count: 0,
+                total_timeouts: 0,
+                total_cache_hits: 0,
+                flaky_count: 0,
+            },
+            VerdictEvent {
+                severity: "error".into(),
+                turn: 3,
+                injections: vec![],
+                avoid_tools: vec![],
+                force_stop: false,
+                nudge_count: 0,
+                total_errors: 0,
+                deprioritized_count: 0,
+                total_timeouts: 0,
+                total_cache_hits: 0,
+                flaky_count: 0,
+            },
+        ];
+        let result = build_stream_result(ctx);
+        assert_eq!(result.verdict_events.len(), 2);
+        assert_eq!(result.verdict_events[0].severity, "warn");
+        assert_eq!(result.verdict_events[1].severity, "error");
+        // Turns are reset to 0 in dedup
+        assert_eq!(result.verdict_events[0].turn, 0);
+    }
+
+    #[test]
+    fn build_stream_result_zero_cache_tokens() {
+        let sr = make_step_recorder();
+        let tg = make_turn_guard();
+        let mut ctx = make_build_ctx(&sr, &tg);
+        ctx.cache_read_tokens = 0;
+        ctx.cache_creation_tokens = 0;
+        let result = build_stream_result(ctx);
+        assert_eq!(result.cache_read_tokens, 0);
+        assert_eq!(result.cache_creation_tokens, 0);
+    }
+}

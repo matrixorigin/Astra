@@ -5446,6 +5446,7 @@ mod tests {
             approval_request_tx: None,
             mcp_manager: None,
             skill_quality_tracker: &mut skill_qt,
+            discovered_skills: None,
         })
         .await
         .unwrap();
@@ -5500,6 +5501,7 @@ mod tests {
             approval_request_tx: None,
             mcp_manager: None,
             skill_quality_tracker: &mut skill_qt,
+            discovered_skills: None,
         })
         .await;
         assert!(result.is_err());
@@ -5570,6 +5572,7 @@ mod tests {
             approval_request_tx: None,
             mcp_manager: None,
             skill_quality_tracker: &mut skill_qt,
+            discovered_skills: None,
         })
         .await
         .unwrap();

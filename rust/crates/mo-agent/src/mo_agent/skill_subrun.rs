@@ -437,6 +437,7 @@ mod tests {
             effort: None,
             agent_type: None,
             cancel_token: None,
+            skill_resolver: None,
         };
         assert!(host.is_quiet());
     }
@@ -457,6 +458,7 @@ mod tests {
             effort: None,
             agent_type: None,
             cancel_token: None,
+            skill_resolver: None,
         };
         let schema = json!({
             "type": "function",
