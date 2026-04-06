@@ -383,8 +383,10 @@ pub fn skill_listing_system_message(
 
     let content = format!(
         "You have access to specialized skills via the `skill` tool. \
-         When a user's request matches a skill, you MUST invoke it using the skill tool \
-         BEFORE doing any other work. Do not attempt to manually replicate what a skill does.\n\n{}",
+         This is a BLOCKING REQUIREMENT: when a user's request matches a skill, \
+         invoke the skill tool BEFORE generating any other response about the task. \
+         Do not attempt to manually replicate what a skill does — skills encode \
+         domain-specific workflows that outperform ad-hoc tool calls.\n\n{}",
         lines.join("\n")
     );
 
