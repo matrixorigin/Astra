@@ -2,8 +2,8 @@ pub fn skill_content() -> String {
     format!(
         r#"---
 name: reflect
-description: "Pause and reflect on your own behavior — examine context usage, tool choices, approach effectiveness, and course-correct"
-version: "2.0.0"
+description: "Pause and reflect — use runtime metrics (tokens, errors, stalls, tool health) to diagnose problems and course-correct"
+version: "3.0.0"
 allowed_tools:
   - bash
   - read_file
@@ -19,56 +19,65 @@ tags:
   - meta
   - self-assessment
 ---
-# Reflect: Agent Self-Assessment
+# Reflect: Data-Driven Self-Assessment
 
-Pause execution and critically examine your own behavior. This is a meta-skill — you are analyzing yourself, not the user's code.
+Pause and critically examine your own behavior using both your conversation history and the runtime metrics below.
 
-**Working directory**: ${{CTX_WORK_DIR}}
-**Available tools**: ${{CTX_AVAILABLE_TOOLS}}
+## Runtime Snapshot
 
-## Step 1: Audit Context Usage
+| Metric | Value |
+|--------|-------|
+| Turn | ${{CTX_TURN_NUMBER}} of ${{CTX_TURN_NUMBER}}+${{CTX_TURNS_REMAINING}} |
+| Prompt tokens (cumulative) | ${{CTX_TOTAL_PROMPT_TOKENS}} |
+| Completion tokens (cumulative) | ${{CTX_TOTAL_COMPLETION_TOKENS}} |
+| Tool calls (total) | ${{CTX_TOTAL_TOOL_CALLS}} |
+| Stall nudges sent | ${{CTX_NUDGE_COUNT}} |
+| Errors | ${{CTX_ERROR_COUNT}} |
+| Deprioritized tools | ${{CTX_DEPRIORITIZED_TOOLS}} |
+| Stall events | ${{CTX_STALL_EVENTS}} |
+| Correction follow rate | ${{CTX_CORRECTION_FOLLOW_RATE}} |
 
-**Success criteria**: Clear separation of confirmed facts vs assumptions.
+Use these numbers — don't guess. A blank value means zero/none.
 
-Review how you've been using your context window:
+## Step 1: Diagnose from Metrics
 
-- **What do you actually know?** List the files you've read, tools you've called, and facts you've established. Separate confirmed facts from assumptions.
-- **What are you assuming?** Identify anything you're treating as true without having verified it. Flag these explicitly.
-- **What's missing?** What information would change your approach if you had it? Is it obtainable?
-- **Are you hallucinating?** Check: did you reference a function, file, or API that you haven't actually seen? If so, verify before continuing.
+Read the snapshot above and answer:
 
-## Step 2: Evaluate Tool Selection
+- **Token burn rate**: Is `prompt_tokens` growing faster than expected? Over 50k in <5 turns suggests context bloat (large tool results, repeated file reads, or compaction not triggering).
+- **Tool failure rate**: `errors / tool_calls` — above 20% means something systemic is wrong. Check which tools are deprioritized.
+- **Stall signals**: Any `nudge_count > 0` or `stall_events` means the system already detected you're stuck. What pattern triggered it? Are you still doing the same thing?
+- **Correction compliance**: If `correction_follow_rate` is below 80%, you're ignoring the system's guidance. Why?
 
-**Success criteria**: Identified at least one tool usage that could be improved.
+If all metrics look healthy (low errors, no stalls, reasonable token growth), skip to Step 3.
 
-Review your recent tool calls:
+## Step 2: Root Cause
 
-- **Right tool for the job?** Did you use grep when you should have read the file? Did you read files you didn't need? Did you use bash when a more targeted tool existed?
-- **Efficiency**: Are you making redundant calls? Reading the same file twice? Running commands you've already run?
-- **Missing tools**: Is there a tool available that would solve this more directly? Check what tools you have access to.
-- **Over-reliance**: Are you leaning too heavily on one approach? (e.g., always grepping when you should be reading documentation, or always reading code when you should be running it)
+Based on Step 1, identify the root cause. Common patterns:
 
-## Step 3: Assess Approach Effectiveness
+| Symptom | Likely Cause | Fix |
+|---------|-------------|-----|
+| High prompt tokens, few turns | Reading large files or getting huge tool outputs | Read specific line ranges; use grep first |
+| Errors climbing | Wrong tool or wrong arguments | Check deprioritized list; switch tools |
+| Stall detected | Repeating same approach | Stop. Try a completely different tool or strategy |
+| Nudges ignored | Fixated on one approach | Respect the avoid list. Use suggested alternatives |
+| Many tool calls, little progress | Exploring without a plan | State your plan in 3 bullet points, then execute |
 
-**Success criteria**: Honest answer to "Is this working?"
+## Step 3: Qualitative Check
 
-- **Is the current approach working?** If you've been at this for multiple turns without progress, the approach is wrong — not the execution.
-- **Scope creep**: Are you solving the problem the user asked about, or have you drifted into a related but different problem?
-- **Complexity bias**: Are you building something elaborate when a simple solution exists? The best fix is often the smallest one.
-- **Confirmation bias**: Are you looking for evidence that supports your current theory while ignoring evidence that contradicts it?
+- **Assumptions**: What are you treating as true without verification? List them.
+- **Scope**: Are you still solving the user's actual problem, or have you drifted?
+- **Simplicity**: Is there a simpler approach you haven't tried?
 
-## Step 4: Course-Correct
+## Step 4: Decision
 
-**Success criteria**: A concrete decision with reasoning, followed by immediate action.
+Choose one and act immediately:
 
-Based on your self-assessment, decide:
+1. **Continue** — metrics healthy, approach sound
+2. **Pivot** — state what you'll change and why (reference the metric that triggered this)
+3. **Ask** — you need user input to proceed
+4. **Simplify** — strip back to minimal solution
 
-1. **Continue** — current approach is sound, proceed with more focus
-2. **Pivot** — change strategy based on what you found (explain what and why)
-3. **Ask** — you need information from the user to proceed effectively
-4. **Simplify** — you've been over-engineering; strip back to the minimal solution
-
-State your decision clearly and explain your reasoning. Then act on it immediately — reflection without action is just stalling.
+Reflection without action is stalling. Decide and move.
 "#,
     )
 }

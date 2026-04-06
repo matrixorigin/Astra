@@ -982,6 +982,47 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
             // OS info
             extra.insert("os".into(), std::env::consts::OS.into());
 
+            // ── Runtime metrics for reflect skill ──
+            let turns_used = state.max_turns.saturating_sub(state.remaining_turns);
+            extra.insert("turn_number".into(), turns_used.to_string());
+            extra.insert("turns_remaining".into(), state.remaining_turns.to_string());
+            extra.insert("total_prompt_tokens".into(), state.total_prompt.to_string());
+            extra.insert(
+                "total_completion_tokens".into(),
+                state.total_completion.to_string(),
+            );
+            extra.insert(
+                "total_tool_calls".into(),
+                state.total_tool_calls.to_string(),
+            );
+            extra.insert(
+                "nudge_count".into(),
+                state.turn_guard.nudge_count.to_string(),
+            );
+            extra.insert(
+                "error_count".into(),
+                state.turn_guard.errors.total_errors.to_string(),
+            );
+            let depri = state.turn_guard.health.deprioritized_tools();
+            if !depri.is_empty() {
+                extra.insert("deprioritized_tools".into(), depri.join(", "));
+            }
+            if !state.stall_events.is_empty() {
+                let stalls: Vec<String> = state
+                    .stall_events
+                    .iter()
+                    .map(|(kind, turn)| format!("{}@t{}", kind, turn))
+                    .collect();
+                extra.insert("stall_events".into(), stalls.join(", "));
+            }
+            let eff = state.turn_guard.correction_effectiveness();
+            if eff.total_corrections > 0 {
+                extra.insert(
+                    "correction_follow_rate".into(),
+                    format!("{:.0}%", eff.follow_rate * 100.0),
+                );
+            }
+
             let session_dir = state.current_session_id.as_ref().map(|id| {
                 dirs::home_dir()
                     .unwrap_or_else(|| std::path::PathBuf::from("."))
