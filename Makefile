@@ -120,7 +120,7 @@ check-runtime:
 	fi
 	@echo ""
 	@echo "2. Rust API binary:"
-	@cargo build -q --manifest-path rust/Cargo.toml -p astra-runtime --bin astra-server && echo "   ✅ Rust binary build OK"
+	@cargo build -q --manifest-path rust/Cargo.toml -p astra-runtime --release --bin astra-server && echo "   ✅ Rust binary build OK"
 
 # ============================================================================
 # Dependencies (MatrixOne + Redis)
@@ -350,10 +350,7 @@ dev-seed:
 # ============================================================================
 
 .PHONY: build
-build:
-	@echo "Building Rust workspace (debug)..."
-	@$(CARGO) build $(CARGO_MANIFEST_FLAG)
-	@echo "✅ Debug artifacts: $(RUST_DEBUG_BIN_DIR)/"
+build: build-release
 
 .PHONY: build-release
 build-release:
@@ -362,11 +359,7 @@ build-release:
 	@echo "✅ Release artifacts: $(RUST_RELEASE_BIN_DIR)/"
 
 .PHONY: build-cli
-build-cli:
-	@echo "Building astra + astra-admin (debug)..."
-	@$(CARGO) build $(CARGO_MANIFEST_FLAG) -p astra-cli -p astra-admin-cli
-	@echo "Binaries:"
-	@for bin in $(CLI_BINS); do echo "  $(RUST_DEBUG_BIN_DIR)/$$bin"; done
+build-cli: build-cli-release
 
 .PHONY: build-cli-release
 build-cli-release:
@@ -376,10 +369,7 @@ build-cli-release:
 	@for bin in $(CLI_BINS); do echo "  $(RUST_RELEASE_BIN_DIR)/$$bin"; done
 
 .PHONY: build-server
-build-server:
-	@echo "Building astra-server (debug)..."
-	@$(CARGO) build $(CARGO_MANIFEST_FLAG) $(API_SHELL_PKG) --bin $(API_SERVER_BIN)
-	@echo "Binary: $(RUST_DEBUG_BIN_DIR)/$(API_SERVER_BIN)"
+build-server: build-server-release
 
 .PHONY: build-server-release
 build-server-release:
@@ -396,6 +386,12 @@ clean:
 	@echo "Removing Rust build artifacts..."
 	@$(CARGO) clean $(CARGO_MANIFEST_FLAG)
 	@echo "✅ Build artifacts removed"
+
+.PHONY: clean-incremental
+clean-incremental:
+	@echo "Cleaning incremental compilation cache..."
+	@rm -rf $(RUST_TARGET_DIR)/debug/incremental
+	@echo "✅ Incremental cache removed"
 
 # ============================================================================
 # Testing

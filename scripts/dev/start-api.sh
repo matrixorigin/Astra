@@ -5,7 +5,7 @@ set -e
 
 PID_FILE="api_server.pid"
 LOG_FILE="api_server.log"
-BIN_PATH="rust/target/debug/astra-server"
+BIN_PATH="rust/target/release/astra-server"
 
 echo "Starting API server..."
 
@@ -39,8 +39,8 @@ if [ -f .env ]; then
     set -a; source .env; set +a
 fi
 
-echo "Building debug API binary..."
-cargo build -q --manifest-path rust/Cargo.toml -p astra-runtime --bin astra-server
+echo "Building release API binary..."
+cargo build -q --manifest-path rust/Cargo.toml -p astra-runtime --release --bin astra-server
 echo "✅ Using $BIN_PATH"
 
 # Best-effort bridge autodiscovery for local dev.

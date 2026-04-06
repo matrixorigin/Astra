@@ -88,3 +88,4 @@ review/
 .mo-session/
 rust/budget-app/
 .mo-delivery-*.json
+rust/.cargo/

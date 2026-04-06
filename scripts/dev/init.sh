@@ -44,6 +44,27 @@ else
     echo "✅ JWT_SECRET_KEY already configured"
 fi
 
+# ── Optional: fast linker (mold) ──
+CARGO_CONFIG="$PROJECT_ROOT/rust/.cargo/config.toml"
+if [ "$(uname -s)" = "Linux" ] && [ "$(uname -m)" = "x86_64" ]; then
+    if command -v mold >/dev/null 2>&1 && command -v clang >/dev/null 2>&1; then
+        if [ ! -f "$CARGO_CONFIG" ]; then
+            mkdir -p "$(dirname "$CARGO_CONFIG")"
+            cat > "$CARGO_CONFIG" <<'EOF'
+[target.x86_64-unknown-linux-gnu]
+linker = "clang"
+rustflags = ["-C", "link-arg=-fuse-ld=mold"]
+EOF
+            echo "✅ Configured mold linker (faster linking)"
+        else
+            echo "✅ Cargo config already exists, skipping mold setup"
+        fi
+    else
+        echo "💡 Tip: install mold + clang for faster linking:"
+        echo "   sudo apt install mold clang"
+    fi
+fi
+
 echo ""
 echo "✅ Development environment initialized!"
 echo ""
