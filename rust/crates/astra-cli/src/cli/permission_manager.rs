@@ -648,6 +648,35 @@ impl PermissionManager {
         name: &str,
         args: &serde_json::Value,
     ) -> PermissionDecision {
+        // Sandbox expansion requests always require explicit user approval,
+        // regardless of permission mode (except Auto which trusts everything).
+        if let Some(inner_tool) = name.strip_prefix("sandbox_expand:") {
+            let reason = args
+                .get("reason")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("Access to path outside project boundary");
+            // Check session overrides first
+            if let Some(&allowed) = self.session_overrides.get(name) {
+                return if allowed {
+                    PermissionDecision::Allow
+                } else {
+                    PermissionDecision::Deny("Sandbox expansion denied for session".into())
+                };
+            }
+            return match self.mode {
+                PermissionMode::Auto => PermissionDecision::Allow,
+                PermissionMode::Deny => {
+                    PermissionDecision::Deny("Sandbox expansion denied (deny mode)".into())
+                }
+                PermissionMode::Prompt => PermissionDecision::NeedApproval {
+                    tool: name.to_string(),
+                    header: format!("Sandbox: {inner_tool} needs access outside project"),
+                    detail: Some(reason.to_string()),
+                    reason: "Path is outside the project sandbox boundary".to_string(),
+                },
+            };
+        }
+
         // Step 1: Deny rules (bypass-immune).
         if self.check_deny_rules(name, args) {
             return PermissionDecision::Deny("Denied by rule".into());
@@ -746,6 +775,7 @@ impl PermissionManager {
 }
 
 /// Result of a non-blocking permission check.
+#[derive(Debug)]
 pub(super) enum PermissionDecision {
     Allow,
     Deny(String),
@@ -1197,5 +1227,71 @@ mod tests {
         let args = serde_json::json!({"command": "rm -rf /"});
         // Even in auto mode, deny rules are bypass-immune
         assert!(!pm.check("bash", &args));
+    }
+
+    // ── Sandbox expansion ─────────────────────────────────────────────────────
+
+    #[test]
+    fn sandbox_expand_auto_mode_allows() {
+        let mut pm = PermissionManager::new(true);
+        let args = serde_json::json!({"reason": "path outside project"});
+        let decision = pm.check_nonblocking("sandbox_expand:read_file", &args);
+        assert!(matches!(decision, PermissionDecision::Allow));
+    }
+
+    #[test]
+    fn sandbox_expand_deny_mode_denies() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut pm = PermissionManager::with_project_mode(PermissionMode::Deny, dir.path());
+        let args = serde_json::json!({"reason": "path outside project"});
+        let decision = pm.check_nonblocking("sandbox_expand:read_file", &args);
+        assert!(matches!(decision, PermissionDecision::Deny(_)));
+    }
+
+    #[test]
+    fn sandbox_expand_prompt_mode_needs_approval() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, dir.path());
+        let args = serde_json::json!({"reason": "path outside project"});
+        let decision = pm.check_nonblocking("sandbox_expand:bash", &args);
+        match decision {
+            PermissionDecision::NeedApproval { tool, header, .. } => {
+                assert_eq!(tool, "sandbox_expand:bash");
+                assert!(header.contains("bash"));
+            }
+            other => panic!("expected NeedApproval, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sandbox_expand_session_override_remembered() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, dir.path());
+        pm.record_approval("sandbox_expand:read_file", true);
+        let args = serde_json::json!({"reason": "path outside project"});
+        let decision = pm.check_nonblocking("sandbox_expand:read_file", &args);
+        assert!(matches!(decision, PermissionDecision::Allow));
+    }
+
+    #[test]
+    fn sandbox_expand_session_deny_remembered() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, dir.path());
+        pm.record_approval("sandbox_expand:read_file", false);
+        let args = serde_json::json!({"reason": "path outside project"});
+        let decision = pm.check_nonblocking("sandbox_expand:read_file", &args);
+        assert!(matches!(decision, PermissionDecision::Deny(_)));
+    }
+
+    #[test]
+    fn sandbox_expand_does_not_affect_normal_tools() {
+        // Verify that a normal read_file tool still goes through the standard
+        // permission flow, not the sandbox_expand shortcut.
+        let dir = tempfile::tempdir().unwrap();
+        let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, dir.path());
+        let args = serde_json::json!({"path": "test.txt"});
+        let decision = pm.check_nonblocking("read_file", &args);
+        // read_file is classified as Read → always allowed
+        assert!(matches!(decision, PermissionDecision::Allow));
     }
 }

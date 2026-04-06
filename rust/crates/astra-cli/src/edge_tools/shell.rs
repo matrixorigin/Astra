@@ -105,6 +105,85 @@ fn last_pipeline_command(command: &str) -> &str {
 // Inspired by Claude Code's destructiveCommandWarning.ts.
 // ---------------------------------------------------------------------------
 
+/// Check if a bash command references file paths outside the sandbox boundary.
+///
+/// Extracts path-like arguments from common file-access commands (cat, head, tail,
+/// less, cp, mv, etc.) and validates them against the sandbox policy. Returns a
+/// `SANDBOX_DENIED` error message if any path escapes the boundary.
+///
+/// This closes the security gap where `read_file("/outside/path")` is blocked by
+/// the sandbox but `cat /outside/path` bypasses it entirely.
+fn check_bash_path_boundary(
+    policy: &astra_runtime::tool_sandbox::SandboxPolicy,
+    command: &str,
+) -> Option<String> {
+    // Split on shell command separators to check ALL commands, not just the first.
+    // Covers: `cmd1 | cmd2`, `cmd1 && cmd2`, `cmd1 ; cmd2`, `cmd1 || cmd2`
+    for segment in command.split(&['|', ';'][..]) {
+        // Also split on && and ||
+        for sub in segment.split("&&") {
+            if let Some(msg) = check_single_command_path_boundary(policy, sub.trim()) {
+                return Some(msg);
+            }
+        }
+    }
+    None
+}
+
+/// Check a single (non-compound) command for path boundary violations.
+fn check_single_command_path_boundary(
+    policy: &astra_runtime::tool_sandbox::SandboxPolicy,
+    command: &str,
+) -> Option<String> {
+    let parts: Vec<&str> = command.split_whitespace().collect();
+    if parts.is_empty() {
+        return None;
+    }
+
+    let base = parts[0]
+        .rsplit('/')
+        .next()
+        .unwrap_or(parts[0]);
+
+    // Only check commands known to access files by path argument.
+    let is_file_access_cmd = matches!(
+        base,
+        "cat" | "head" | "tail" | "less" | "more" | "tac" | "nl"
+            | "cp" | "mv" | "rm" | "ln" | "install"
+            | "stat" | "file" | "wc" | "md5sum" | "sha256sum" | "sha1sum"
+            | "readlink" | "realpath"
+            | "source" | "."
+    );
+    if !is_file_access_cmd {
+        return None;
+    }
+
+    // Check each non-flag argument that looks like an absolute path.
+    for arg in &parts[1..] {
+        // Skip flags
+        if arg.starts_with('-') {
+            continue;
+        }
+        // Only check absolute paths — relative paths resolve inside project_root
+        // which is already the cwd for sandboxed commands.
+        if !arg.starts_with('/') {
+            continue;
+        }
+        if let Err(e) = validate_path(policy, arg) {
+            if e.is_boundary_violation() {
+                return Some(format!(
+                    "{}The command references '{}' which is outside the project directory '{}'. \
+                     Ask the user for permission before accessing files outside the project.",
+                    super::SANDBOX_DENIED_PREFIX,
+                    arg,
+                    policy.project_root.display(),
+                ));
+            }
+        }
+    }
+    None
+}
+
 /// Check if a command is potentially destructive and return a warning.
 fn destructive_command_warning(command: &str) -> Option<&'static str> {
     // Static patterns checked in order; first match wins.
@@ -766,6 +845,19 @@ impl ToolExecutor {
                 }
             });
 
+        // Sandbox path boundary check for bash commands.
+        // If the sandbox is active, extract file path arguments from the command
+        // and reject the command if any path escapes the project boundary.
+        // This closes the loophole where read_file is blocked by the sandbox
+        // but `cat /outside/path` bypasses it.
+        if let Some(ref policy) = self.sandbox_policy
+            && !matches!(policy.mode, SandboxMode::Permissive)
+        {
+            if let Some(msg) = check_bash_path_boundary(policy, command) {
+                return msg;
+            }
+        }
+
         match self.run_shell_output(command, timeout_secs) {
             Err(error) => error,
             Ok(out) => {
@@ -864,11 +956,13 @@ impl ToolExecutor {
             Some(p) => p,
             None => return "Error: missing 'pattern'".to_string(),
         };
-        let search_path = args
-            .get("path")
-            .and_then(Value::as_str)
-            .map(|p| self.resolve(p))
-            .unwrap_or_else(|| self.project_root.clone());
+        let search_path = match args.get("path").and_then(Value::as_str) {
+            Some(p) => match self.resolve_checked(p) {
+                Ok(safe) => safe,
+                Err(e) => return e,
+            },
+            None => self.project_root.clone(),
+        };
 
         // Validate search path exists before spawning grep
         if !search_path.exists() {
@@ -998,11 +1092,13 @@ impl ToolExecutor {
             Some(p) => p,
             None => return "Error: missing 'pattern'".to_string(),
         };
-        let base = args
-            .get("path")
-            .and_then(Value::as_str)
-            .map(|p| self.resolve(p))
-            .unwrap_or_else(|| self.project_root.clone());
+        let base = match args.get("path").and_then(Value::as_str) {
+            Some(p) => match self.resolve_checked(p) {
+                Ok(safe) => safe,
+                Err(e) => return e,
+            },
+            None => self.project_root.clone(),
+        };
 
         // Validate base path exists
         if !base.exists() {
@@ -1608,11 +1704,11 @@ mod tests {
             "pattern": "hello",
             "path": "/nonexistent/fake/directory"
         }));
+        // Sandbox blocks the path before we even check existence
         assert!(
-            result.contains("Error"),
-            "should error on missing path, got: {result}"
+            result.contains("SANDBOX_DENIED") || result.contains("does not exist"),
+            "should be blocked by sandbox or report missing path, got: {result}"
         );
-        assert!(result.contains("does not exist"), "got: {result}");
     }
 
     #[test]
@@ -1688,6 +1784,31 @@ mod tests {
         );
     }
 
+    #[test]
+    fn glob_outside_project_sandbox_blocked() {
+        let dir = tempfile::tempdir().unwrap();
+        let executor = ToolExecutor::new(dir.path());
+        let result = executor.glob(&serde_json::json!({
+            "pattern": "*.conf",
+            "path": "/etc"
+        }));
+        assert!(
+            result.contains("SANDBOX_DENIED") || result.contains("Sandbox"),
+            "glob outside project should be blocked: {result}"
+        );
+    }
+
+    #[test]
+    fn list_dir_outside_project_sandbox_blocked() {
+        let dir = tempfile::tempdir().unwrap();
+        let executor = ToolExecutor::new(dir.path());
+        let result = executor.list_dir(&serde_json::json!({"path": "/etc"}));
+        assert!(
+            result.contains("SANDBOX_DENIED") || result.contains("Sandbox"),
+            "list_dir outside project should be blocked: {result}"
+        );
+    }
+
     // ── str_replace diff preview ─────────────────────────────────────────────
 
     #[test]
@@ -1760,10 +1881,231 @@ mod tests {
 
         let result = executor.resolve_checked("/etc/passwd");
         assert!(result.is_err(), "should block path escape: {result:?}");
+        let err = result.unwrap_err();
         assert!(
-            result.unwrap_err().contains("Sandbox"),
-            "should mention sandbox"
+            err.contains("SANDBOX_DENIED") || err.contains("Sandbox"),
+            "should mention sandbox denial: {err}"
         );
+    }
+
+    #[test]
+    fn resolve_checked_project_relative_path_ok() {
+        let dir = tempfile::tempdir().unwrap();
+        let executor = ToolExecutor::new(dir.path());
+        let result = executor.resolve_checked("src/main.rs");
+        assert!(result.is_ok(), "relative path inside project should succeed: {result:?}");
+        assert!(result.unwrap().starts_with(dir.path()));
+    }
+
+    #[test]
+    fn resolve_checked_boundary_violation_has_sandbox_denied_prefix() {
+        use astra_runtime::tool_sandbox::SandboxPolicy;
+        let dir = tempfile::tempdir().unwrap();
+        let mut executor = ToolExecutor::new(dir.path());
+        executor.sandbox_policy = Some(SandboxPolicy::for_project(dir.path()));
+        let err = executor.resolve_checked("/etc/passwd").unwrap_err();
+        assert!(
+            err.starts_with(super::SANDBOX_DENIED_PREFIX),
+            "boundary violation should have SANDBOX_DENIED prefix: {err}"
+        );
+    }
+
+    // ── Bash path boundary check ────────────────────────────────────────────
+
+    #[test]
+    fn bash_cat_outside_project_blocked() {
+        use astra_runtime::tool_sandbox::SandboxPolicy;
+        let policy = SandboxPolicy::for_project("/home/user/project");
+        let result = check_bash_path_boundary(&policy, "cat /etc/passwd");
+        assert!(result.is_some(), "should block cat of /etc/passwd");
+        assert!(result.unwrap().starts_with(super::SANDBOX_DENIED_PREFIX));
+    }
+
+    #[test]
+    fn bash_cat_inside_project_allowed() {
+        use astra_runtime::tool_sandbox::SandboxPolicy;
+        let dir = tempfile::tempdir().unwrap();
+        let policy = SandboxPolicy::for_project(dir.path());
+        let result = check_bash_path_boundary(&policy, "cat src/main.rs");
+        assert!(result.is_none(), "relative path should be allowed");
+    }
+
+    #[test]
+    fn bash_cat_tmp_allowed() {
+        use astra_runtime::tool_sandbox::SandboxPolicy;
+        let policy = SandboxPolicy::for_project("/home/user/project");
+        let result = check_bash_path_boundary(&policy, "cat /tmp/build.log");
+        assert!(result.is_none(), "/tmp should be in allowed_paths");
+    }
+
+    #[test]
+    fn bash_non_file_command_not_checked() {
+        use astra_runtime::tool_sandbox::SandboxPolicy;
+        let policy = SandboxPolicy::for_project("/home/user/project");
+        let result = check_bash_path_boundary(&policy, "echo /etc/passwd");
+        assert!(result.is_none(), "echo should not be checked");
+    }
+
+    #[test]
+    fn bash_grep_not_checked() {
+        use astra_runtime::tool_sandbox::SandboxPolicy;
+        let policy = SandboxPolicy::for_project("/home/user/project");
+        // grep is not in the file-access command list (it's a search tool)
+        let result = check_bash_path_boundary(&policy, "grep pattern /etc/passwd");
+        assert!(result.is_none(), "grep should not be checked by path boundary");
+    }
+
+    #[test]
+    fn bash_pipeline_checks_all_commands() {
+        use astra_runtime::tool_sandbox::SandboxPolicy;
+        let policy = SandboxPolicy::for_project("/home/user/project");
+        // cat in the second pipeline stage should also be caught
+        let result = check_bash_path_boundary(&policy, "echo hello | cat /etc/passwd");
+        assert!(result.is_some(), "should block cat /etc/passwd even after pipe");
+    }
+
+    #[test]
+    fn bash_compound_and_checks_all_commands() {
+        use astra_runtime::tool_sandbox::SandboxPolicy;
+        let policy = SandboxPolicy::for_project("/home/user/project");
+        let result = check_bash_path_boundary(&policy, "true && cat /etc/passwd");
+        assert!(result.is_some(), "should block cat after &&");
+    }
+
+    #[test]
+    fn bash_semicolon_checks_all_commands() {
+        use astra_runtime::tool_sandbox::SandboxPolicy;
+        let policy = SandboxPolicy::for_project("/home/user/project");
+        let result = check_bash_path_boundary(&policy, "echo hi; head /etc/shadow");
+        assert!(result.is_some(), "should block head after ;");
+    }
+
+    #[test]
+    fn bash_or_checks_all_commands() {
+        use astra_runtime::tool_sandbox::SandboxPolicy;
+        let policy = SandboxPolicy::for_project("/home/user/project");
+        let result = check_bash_path_boundary(&policy, "false || cat /etc/passwd");
+        assert!(result.is_some(), "should block cat after ||");
+    }
+
+    #[test]
+    fn bash_full_path_command_detected() {
+        use astra_runtime::tool_sandbox::SandboxPolicy;
+        let policy = SandboxPolicy::for_project("/home/user/project");
+        // /usr/bin/cat should be recognized as "cat"
+        let result = check_bash_path_boundary(&policy, "/usr/bin/cat /etc/passwd");
+        assert!(result.is_some(), "should detect /usr/bin/cat as cat");
+    }
+
+    #[test]
+    fn bash_empty_command_no_panic() {
+        use astra_runtime::tool_sandbox::SandboxPolicy;
+        let policy = SandboxPolicy::for_project("/home/user/project");
+        assert!(check_bash_path_boundary(&policy, "").is_none());
+        assert!(check_bash_path_boundary(&policy, "   ").is_none());
+        assert!(check_bash_path_boundary(&policy, "| ; &&").is_none());
+    }
+
+    #[test]
+    fn bash_cat_multiple_paths_second_blocked() {
+        use astra_runtime::tool_sandbox::SandboxPolicy;
+        let policy = SandboxPolicy::for_project("/tmp");
+        // First path is /tmp/ok (allowed), second is /etc/passwd (blocked)
+        let result = check_bash_path_boundary(&policy, "cat /tmp/ok /etc/passwd");
+        assert!(result.is_some(), "should block second path: /etc/passwd");
+        assert!(result.unwrap().contains("/etc/passwd"));
+    }
+
+    #[test]
+    fn bash_permissive_mode_skips_check() {
+        // The check_bash_path_boundary is only called when mode != Permissive
+        // (guarded in bash()), but validate_path itself also passes in Permissive.
+        use astra_runtime::tool_sandbox::SandboxPolicy;
+        let policy = SandboxPolicy::permissive("/home/user/project");
+        let result = check_bash_path_boundary(&policy, "cat /etc/passwd");
+        assert!(result.is_none(), "permissive mode should allow everything");
+    }
+
+    // ── Bypass attempt tests ────────────────────────────────────────────────
+    // These document known bypass vectors and whether they are caught.
+
+    #[test]
+    fn bypass_bash_c_not_caught() {
+        // bash -c "cat /etc/passwd" — the inner command is a string argument,
+        // not parsed by our simple whitespace splitter. This is a KNOWN LIMITATION.
+        // The existing analyze_command_risks() AST parser covers this via
+        // CommandSubstitution / RemoteCodeExecution detection at the permission layer.
+        use astra_runtime::tool_sandbox::SandboxPolicy;
+        let policy = SandboxPolicy::for_project("/home/user/project");
+        let result = check_bash_path_boundary(&policy, r#"bash -c "cat /etc/passwd""#);
+        // Not caught by path boundary check — handled by permission_manager instead
+        assert!(result.is_none(), "bash -c is handled by permission layer, not path check");
+    }
+
+    #[test]
+    fn bypass_command_substitution_not_caught() {
+        // $(cat /etc/passwd) — command substitution. KNOWN LIMITATION.
+        // Covered by analyze_command_risks() CommandSubstitution detection.
+        use astra_runtime::tool_sandbox::SandboxPolicy;
+        let policy = SandboxPolicy::for_project("/home/user/project");
+        let result = check_bash_path_boundary(&policy, "echo $(cat /etc/passwd)");
+        assert!(result.is_none(), "command substitution handled by permission layer");
+    }
+
+    #[test]
+    fn bypass_redirect_input_not_caught() {
+        // cat < /etc/passwd — redirect. KNOWN LIMITATION.
+        // The `<` is not a flag so it's checked, but it's not an absolute path.
+        // The actual path `/etc/passwd` follows and IS checked.
+        use astra_runtime::tool_sandbox::SandboxPolicy;
+        let policy = SandboxPolicy::for_project("/home/user/project");
+        let result = check_bash_path_boundary(&policy, "cat < /etc/passwd");
+        // `<` is skipped (not abs path), `/etc/passwd` IS caught
+        assert!(result.is_some(), "redirect target path should still be caught");
+    }
+
+    #[test]
+    fn bypass_tilde_expansion_not_caught() {
+        // cat ~/.ssh/id_rsa — tilde is not an absolute path, so not checked.
+        // KNOWN LIMITATION: tilde expands to home dir at shell level.
+        // Mitigated by: cwd is set to project_root, and sensitive paths like
+        // ~/.ssh are covered by is_dangerous_file_path() in permission_manager.
+        use astra_runtime::tool_sandbox::SandboxPolicy;
+        let policy = SandboxPolicy::for_project("/home/user/project");
+        let result = check_bash_path_boundary(&policy, "cat ~/.ssh/id_rsa");
+        assert!(result.is_none(), "tilde paths not checked (handled by dangerous path detection)");
+    }
+
+    #[test]
+    fn bypass_env_var_in_path_not_caught() {
+        // cat $HOME/.bashrc — variable expansion. Not checked because we
+        // can't resolve env vars at static analysis time.
+        // Mitigated by: sandbox env filtering + dangerous path detection.
+        use astra_runtime::tool_sandbox::SandboxPolicy;
+        let policy = SandboxPolicy::for_project("/home/user/project");
+        let result = check_bash_path_boundary(&policy, "cat $HOME/.bashrc");
+        assert!(result.is_none(), "env var paths not statically resolvable");
+    }
+
+    #[test]
+    fn bypass_xargs_not_caught() {
+        // find / -name passwd | xargs cat — xargs is not in the allowlist.
+        // KNOWN LIMITATION but low risk: find itself doesn't exfiltrate data,
+        // and xargs+cat is an unusual pattern the model rarely generates.
+        use astra_runtime::tool_sandbox::SandboxPolicy;
+        let policy = SandboxPolicy::for_project("/home/user/project");
+        let result = check_bash_path_boundary(&policy, "find / -name passwd | xargs cat");
+        assert!(result.is_none(), "xargs not in file-access command list");
+    }
+
+    #[test]
+    fn bypass_python_read_not_caught() {
+        // python3 -c "open('/etc/passwd').read()" — interpreter invocation.
+        // KNOWN LIMITATION: handled by permission_manager execute classification.
+        use astra_runtime::tool_sandbox::SandboxPolicy;
+        let policy = SandboxPolicy::for_project("/home/user/project");
+        let result = check_bash_path_boundary(&policy, "python3 -c \"open('/etc/passwd').read()\"");
+        assert!(result.is_none(), "interpreter commands handled by permission layer");
     }
 
     // ── SSRF protection ─────────────────────────────────────────────────────

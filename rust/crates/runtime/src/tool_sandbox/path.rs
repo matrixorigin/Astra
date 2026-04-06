@@ -46,6 +46,17 @@ impl std::fmt::Display for SandboxPathError {
 
 impl std::error::Error for SandboxPathError {}
 
+impl SandboxPathError {
+    /// Returns `true` when the error is a boundary violation (not a resolution failure).
+    /// Callers can use this to distinguish "needs user authorization" from "path is broken".
+    pub fn is_boundary_violation(&self) -> bool {
+        matches!(
+            self,
+            Self::BoundaryEscape { .. } | Self::SymlinkEscape { .. }
+        )
+    }
+}
+
 /// Validate and resolve a path against the sandbox policy.
 ///
 /// For Permissive mode, returns the path as-is (backward compatible).
@@ -321,5 +332,33 @@ mod tests {
             reason: "not found".into(),
         };
         assert!(err.to_string().contains("not found"));
+    }
+
+    #[test]
+    fn boundary_escape_is_boundary_violation() {
+        let err = SandboxPathError::BoundaryEscape {
+            requested: "../secret".into(),
+            resolved: "/etc/secret".into(),
+            project_root: "/home/user/project".into(),
+        };
+        assert!(err.is_boundary_violation());
+    }
+
+    #[test]
+    fn symlink_escape_is_boundary_violation() {
+        let err = SandboxPathError::SymlinkEscape {
+            requested: "link".into(),
+            target: "/etc/passwd".into(),
+        };
+        assert!(err.is_boundary_violation());
+    }
+
+    #[test]
+    fn resolution_failed_is_not_boundary_violation() {
+        let err = SandboxPathError::ResolutionFailed {
+            requested: "x".into(),
+            reason: "not found".into(),
+        };
+        assert!(!err.is_boundary_violation());
     }
 }

@@ -62,6 +62,12 @@ fn is_dangerous_write_target(rel_path: &str) -> Option<&'static str> {
 
 impl ToolExecutor {
     /// Resolve a tool-provided path, enforcing sandbox boundary when active.
+    ///
+    /// **DEPRECATED**: Use `resolve_checked()` instead. This method silently
+    /// falls back on sandbox violations, which allows the agent to bypass
+    /// the sandbox by retrying with bash. All tool implementations should
+    /// use `resolve_checked()` and return the error to the caller.
+    #[allow(dead_code)]
     pub(crate) fn resolve(&self, path: &str) -> PathBuf {
         if is_unc_path(path) {
             return self.project_root.clone();
@@ -100,7 +106,22 @@ impl ToolExecutor {
         if let Some(ref policy) = self.sandbox_policy
             && !matches!(policy.mode, SandboxMode::Permissive)
         {
-            return validate_path(policy, path).map_err(|e| format!("Sandbox: {e}"));
+            return validate_path(policy, path).map_err(|e| {
+                if e.is_boundary_violation() {
+                    // Use structured prefix so the agentic loop can detect sandbox
+                    // denials and prompt the user for authorization instead of
+                    // letting the model silently fall back to bash.
+                    format!(
+                        "{}Path '{}' is outside the project directory '{}'. \
+                         Ask the user for permission before accessing files outside the project.",
+                        super::SANDBOX_DENIED_PREFIX,
+                        path,
+                        policy.project_root.display(),
+                    )
+                } else {
+                    format!("Sandbox: {e}")
+                }
+            });
         }
         Ok(resolved)
     }
@@ -907,11 +928,13 @@ impl ToolExecutor {
     }
 
     pub(crate) fn list_dir(&self, args: &Value) -> String {
-        let dir = args
-            .get("path")
-            .and_then(Value::as_str)
-            .map(|p| self.resolve(p))
-            .unwrap_or_else(|| self.project_root.clone());
+        let dir = match args.get("path").and_then(Value::as_str) {
+            Some(p) => match self.resolve_checked(p) {
+                Ok(safe) => safe,
+                Err(e) => return e,
+            },
+            None => self.project_root.clone(),
+        };
         let depth = args.get("depth").and_then(Value::as_u64).unwrap_or(1) as usize;
         let mut out = String::new();
         self.list_dir_recursive(&dir, &dir, depth, 0, &mut out);

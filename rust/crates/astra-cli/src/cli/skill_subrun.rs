@@ -130,7 +130,7 @@ impl AgenticLoopHost for SubRunHost {
             api: &self.api,
             token: &self.token,
             executor_id: "subrun",
-            executor: &self.executor,
+            executor: &mut self.executor,
             quiet: true,
             suppress_intermediate_output: true,
             hide_streaming_assistant_text: false,

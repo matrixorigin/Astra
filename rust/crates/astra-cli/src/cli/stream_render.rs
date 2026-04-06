@@ -42,7 +42,7 @@ pub(super) struct EdgeSseContext<'a> {
     pub api: &'a astra_thin_client::ThinClient,
     pub token: &'a str,
     pub executor_id: &'a str,
-    pub executor: &'a crate::edge_tools::ToolExecutor,
+    pub executor: &'a mut crate::edge_tools::ToolExecutor,
     pub quiet: bool,
     pub suppress_intermediate_output: bool,
     /// Skip `StreamText` effects only (reasoning preview / spinners still run).
@@ -76,7 +76,7 @@ struct CliSseStreamHost<'a> {
     api: &'a astra_thin_client::ThinClient,
     token: &'a str,
     executor_id: &'a str,
-    executor: &'a crate::edge_tools::ToolExecutor,
+    executor: &'a mut crate::edge_tools::ToolExecutor,
     quiet: bool,
     suppress_intermediate_output: bool,
     hide_streaming_assistant_text: bool,
@@ -194,6 +194,22 @@ impl<'a> CliSseStreamHost<'a> {
             self.render_text(&buf);
         }
     }
+}
+
+/// Extract the first absolute path from a bash command string.
+/// Used to determine which directory to expand the sandbox to when the user
+/// approves a sandbox-denied bash command.
+fn extract_first_absolute_path(command: &str) -> Option<String> {
+    for token in command.split_whitespace() {
+        if token.starts_with('/') && !token.starts_with("//") && !token.contains('$') {
+            // Strip trailing punctuation that might be shell syntax
+            let clean = token.trim_end_matches(|c: char| c == ';' || c == '&' || c == ')');
+            if !clean.is_empty() {
+                return Some(clean.to_string());
+            }
+        }
+    }
+    None
 }
 
 /// Returns true if `partial` could become one of our known thinking tags.
@@ -498,7 +514,121 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                     tool
                 )
             } else {
-                self.executor.execute(tool, args).await
+                let result = self.executor.execute(tool, args).await;
+                // If the sandbox denied the operation, prompt the user for
+                // authorization. On approval, temporarily expand the sandbox
+                // boundary and retry the tool.
+                if result.starts_with(crate::edge_tools::SANDBOX_DENIED_PREFIX) {
+                    if let Some(pm) = &mut self.perm_manager {
+                        let sandbox_msg = &result[crate::edge_tools::SANDBOX_DENIED_PREFIX.len()..];
+                        let sandbox_tool_key = format!("sandbox_expand:{tool}");
+                        let decision = pm.check_nonblocking(
+                            &sandbox_tool_key,
+                            &serde_json::json!({"reason": sandbox_msg}),
+                        );
+                        let approved = match decision {
+                            crate::permission_manager::PermissionDecision::Allow => true,
+                            crate::permission_manager::PermissionDecision::Deny(_) => false,
+                            crate::permission_manager::PermissionDecision::NeedApproval {
+                                header, detail, reason, ..
+                            } => {
+                                if let Some(tx) = &self.approval_request_tx {
+                                    // Plan execution mode: route through channel
+                                    let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
+                                    let _ = tx.send(super::chat_stream::ApprovalRequest {
+                                        tool: sandbox_tool_key.clone(),
+                                        header: format!("🔒 {sandbox_msg}"),
+                                        detail,
+                                        reason,
+                                        response_tx: resp_tx,
+                                    });
+                                    let grant = if let Some(token) = self.cancel_token {
+                                        tokio::select! {
+                                            biased;
+                                            _ = token.cancelled() => false,
+                                            r = resp_rx => r.unwrap_or(false),
+                                        }
+                                    } else {
+                                        resp_rx.await.unwrap_or(false)
+                                    };
+                                    if grant {
+                                        pm.record_approval(&sandbox_tool_key, true);
+                                    }
+                                    grant
+                                } else {
+                                    // Interactive mode: prompt directly
+                                    self.render.stop_tool_stderr_running();
+                                    self.render.stop_tool_stdout_anim();
+                                    use crossterm::style::Stylize;
+                                    eprintln!("  {}", format!("🔒 {sandbox_msg}").yellow());
+                                    if let Some(d) = &detail {
+                                        eprintln!("{}", d.as_str().dim());
+                                    }
+                                    if !reason.is_empty() {
+                                        eprintln!("  {}", reason.dim());
+                                    }
+                                    let _ = header;
+                                    let ch = tokio::task::spawn_blocking(
+                                        crate::permission_manager::PermissionManager::prompt_approval,
+                                    )
+                                    .await
+                                    .unwrap_or('n');
+                                    let grant = matches!(ch, 'y' | 'a');
+                                    if grant {
+                                        pm.record_approval(&sandbox_tool_key, true);
+                                    }
+                                    if ch == 's' {
+                                        pm.record_approval(&sandbox_tool_key, false);
+                                    }
+                                    grant
+                                }
+                            }
+                        };
+                        if approved {
+                            // Temporarily expand sandbox to allow the requested path,
+                            // then retry the tool.
+                            // Use parent directory so sibling files are also accessible,
+                            // but never expand to "/" (would open entire filesystem).
+                            let expand_dir = args
+                                .get("path")
+                                .or_else(|| args.get("file_path"))
+                                .and_then(serde_json::Value::as_str)
+                                .and_then(|p| {
+                                    let parent = std::path::Path::new(p).parent()?;
+                                    if parent == std::path::Path::new("/") {
+                                        // For root-level files like /passwd, expand to
+                                        // the file itself, not "/"
+                                        Some(std::path::PathBuf::from(p))
+                                    } else {
+                                        Some(parent.to_path_buf())
+                                    }
+                                })
+                                .or_else(|| {
+                                    args.get("command")
+                                        .and_then(serde_json::Value::as_str)
+                                        .and_then(extract_first_absolute_path)
+                                        .and_then(|p| {
+                                            let parent = std::path::Path::new(&p).parent()?;
+                                            if parent == std::path::Path::new("/") {
+                                                Some(std::path::PathBuf::from(&p))
+                                            } else {
+                                                Some(parent.to_path_buf())
+                                            }
+                                        })
+                                });
+                            if let Some(dir) = expand_dir {
+                                self.executor.expand_sandbox_path(dir);
+                            }
+                            self.executor.execute(tool, args).await
+                        } else {
+                            result
+                        }
+                    } else {
+                        result
+                    }
+                } else {
+                    result
+                }
             }
         } else {
             "Permission denied".to_string()
@@ -1960,5 +2090,43 @@ mod tests {
         let out = format!("<<<ASTRA_UNIFIED_DIFF>>>{embedded}<<<END_ASTRA_UNIFIED_DIFF>>>");
         let got = super::extract_cli_diff_block(&out).expect("diff");
         assert_eq!(got.as_ref(), embedded.trim());
+    }
+
+    // ── extract_first_absolute_path ─────────────────────────────────────
+
+    #[test]
+    fn extract_absolute_path_from_cat_command() {
+        assert_eq!(
+            extract_first_absolute_path("cat /etc/passwd"),
+            Some("/etc/passwd".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_absolute_path_skips_relative() {
+        assert_eq!(extract_first_absolute_path("cat src/main.rs"), None);
+    }
+
+    #[test]
+    fn extract_absolute_path_skips_variable() {
+        assert_eq!(extract_first_absolute_path("cat $HOME/.bashrc"), None);
+    }
+
+    #[test]
+    fn extract_absolute_path_skips_unc() {
+        assert_eq!(extract_first_absolute_path("cat //server/share"), None);
+    }
+
+    #[test]
+    fn extract_absolute_path_strips_trailing_semicolon() {
+        assert_eq!(
+            extract_first_absolute_path("cat /etc/passwd;"),
+            Some("/etc/passwd".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_absolute_path_empty_command() {
+        assert_eq!(extract_first_absolute_path(""), None);
     }
 }

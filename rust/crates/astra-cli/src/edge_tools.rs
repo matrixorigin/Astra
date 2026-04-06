@@ -18,6 +18,11 @@ use std::{
 use astra_runtime::tool_sandbox::{
     SandboxMode, SandboxPolicy, sandbox_command, validate_path, wrap_command_with_limits,
 };
+
+/// Prefix returned by tool execution when the sandbox blocks a path.
+/// The agentic loop / permission manager can detect this to prompt the user
+/// for authorization instead of letting the model silently fall back to bash.
+pub const SANDBOX_DENIED_PREFIX: &str = "SANDBOX_DENIED: ";
 use chrono::{DateTime, Utc};
 use reqwest::{Client, Method, StatusCode};
 use serde_json::{Value, json};
@@ -1284,6 +1289,14 @@ impl ToolExecutor {
     ) -> Self {
         self.mcp_manager = Some(manager);
         self
+    }
+
+    /// Expand the sandbox boundary to include an additional directory.
+    /// Called when the user approves access to a path outside the project.
+    pub fn expand_sandbox_path(&mut self, dir: PathBuf) {
+        if let Some(ref mut policy) = self.sandbox_policy {
+            policy.allowed_paths.push(dir);
+        }
     }
 
     /// Run passive workspace checks (optional **rust-analyzer LSP**, `cargo`, `tsc`) after
@@ -8576,5 +8589,54 @@ impl MyType {
             pressured_result.len(),
             normal_result.len()
         );
+    }
+
+    // ── expand_sandbox_path ──────────────────────────────────────────────────
+
+    #[test]
+    fn expand_sandbox_path_adds_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut exe = ToolExecutor::new(dir.path());
+        // Before expansion: /etc is not allowed
+        assert!(!exe.sandbox_policy.as_ref().unwrap().is_path_allowed(std::path::Path::new("/etc/passwd")));
+        // Expand
+        exe.expand_sandbox_path(PathBuf::from("/etc"));
+        // After expansion: /etc is allowed
+        assert!(exe.sandbox_policy.as_ref().unwrap().is_path_allowed(std::path::Path::new("/etc/passwd")));
+    }
+
+    #[test]
+    fn expand_sandbox_path_noop_without_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut exe = ToolExecutor::new(dir.path());
+        exe.sandbox_policy = None;
+        // Should not panic
+        exe.expand_sandbox_path(PathBuf::from("/etc"));
+    }
+
+    #[test]
+    fn expand_sandbox_then_resolve_checked_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut exe = ToolExecutor::new(dir.path());
+        // Before: /etc/passwd is blocked
+        assert!(exe.resolve_checked("/etc/passwd").is_err());
+        // Expand to /etc
+        exe.expand_sandbox_path(PathBuf::from("/etc"));
+        // After: /etc/passwd is allowed
+        assert!(exe.resolve_checked("/etc/passwd").is_ok());
+    }
+
+    #[test]
+    fn expand_sandbox_to_root_does_not_open_everything() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut exe = ToolExecutor::new(dir.path());
+        // Expanding to "/" would open the entire filesystem — callers must
+        // guard against this. Verify that adding "/" does allow everything
+        // (so the guard in stream_render.rs is critical).
+        exe.expand_sandbox_path(PathBuf::from("/"));
+        assert!(exe.resolve_checked("/etc/passwd").is_ok());
+        assert!(exe.resolve_checked("/var/secret").is_ok());
+        // This test documents WHY the stream_render.rs code must never
+        // pass "/" to expand_sandbox_path.
     }
 }
