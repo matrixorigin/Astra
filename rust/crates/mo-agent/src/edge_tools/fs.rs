@@ -2156,6 +2156,116 @@ type Handler interface {
         );
     }
 
+    #[test]
+    fn read_file_ranged_reads_trigger_grep_nudge() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("big.txt");
+        let mut f = std::fs::File::create(&file_path).unwrap();
+        for i in 0..3000 {
+            writeln!(f, "line {i}: {}", "x".repeat(30)).unwrap();
+        }
+        drop(f);
+
+        let executor = test_executor_in(dir.path());
+        // First 2 ranged reads — no warning yet
+        for start in [1, 20] {
+            let out = executor.read_file(&serde_json::json!({
+                "path": "big.txt",
+                "start_line": start,
+                "end_line": start + 5
+            }));
+            assert!(
+                !out.contains("3+ different ranges"),
+                "should not warn before 3 ranged reads"
+            );
+        }
+        // 3rd ranged read — should trigger the grep nudge
+        let third = executor.read_file(&serde_json::json!({
+            "path": "big.txt",
+            "start_line": 40,
+            "end_line": 45
+        }));
+        assert!(
+            third.contains("3+ different ranges") || third.contains("Use grep"),
+            "3rd ranged read should nudge toward grep, got: {}",
+            &third[third.len().saturating_sub(200)..]
+        );
+    }
+
+    #[test]
+    fn full_reads_dont_increment_ranged_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("big.txt");
+        // Must be >8KB to avoid auto-expand
+        let mut f = std::fs::File::create(&file_path).unwrap();
+        for i in 0..500 { writeln!(f, "line {i}: {}", "x".repeat(80)).unwrap(); }
+        drop(f);
+
+        let executor = test_executor_in(dir.path());
+
+        // 3 ranged reads — should trigger grep nudge
+        for start in [1, 20, 40] {
+            executor.read_file(&serde_json::json!({
+                "path": "big.txt", "start_line": start, "end_line": start + 5
+            }));
+        }
+        let fourth_ranged = executor.read_file(&serde_json::json!({
+            "path": "big.txt", "start_line": 60, "end_line": 65
+        }));
+        assert!(
+            fourth_ranged.contains("3+ different ranges") || fourth_ranged.contains("Use grep"),
+            "4th ranged read should trigger grep nudge"
+        );
+        assert!(
+            !fourth_ranged.contains("read 4+ times"),
+            "ranged reads should not trigger full-read warning"
+        );
+    }
+
+    #[test]
+    fn ranged_read_count_resets_on_different_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_a = dir.path().join("a.txt");
+        let file_b = dir.path().join("b.txt");
+        // Files must be >8KB to avoid auto-expand upgrading ranged reads to full reads
+        let mut f = std::fs::File::create(&file_a).unwrap();
+        for i in 0..500 { writeln!(f, "a line {i}: {}", "x".repeat(80)).unwrap(); }
+        drop(f);
+        let mut f = std::fs::File::create(&file_b).unwrap();
+        for i in 0..500 { writeln!(f, "b line {i}: {}", "x".repeat(80)).unwrap(); }
+        drop(f);
+
+        let executor = test_executor_in(dir.path());
+        // 2 ranged reads of file a
+        for start in [1, 20] {
+            executor.read_file(&serde_json::json!({
+                "path": "a.txt", "start_line": start, "end_line": start + 5
+            }));
+        }
+        // 2 ranged reads of file b — should be independent
+        for start in [1, 20] {
+            executor.read_file(&serde_json::json!({
+                "path": "b.txt", "start_line": start, "end_line": start + 5
+            }));
+        }
+        // 3rd ranged read of file a — should trigger
+        let third_a = executor.read_file(&serde_json::json!({
+            "path": "a.txt", "start_line": 40, "end_line": 45
+        }));
+        assert!(
+            third_a.contains("3+ different ranges") || third_a.contains("Use grep"),
+            "3rd ranged read of file a should trigger grep nudge, got: {third_a}"
+        );
+        // 3rd ranged read of file b — should also trigger independently
+        let third_b = executor.read_file(&serde_json::json!({
+            "path": "b.txt", "start_line": 40, "end_line": 45
+        }));
+        assert!(
+            third_b.contains("3+ different ranges") || third_b.contains("Use grep"),
+            "3rd ranged read of file b should trigger grep nudge"
+        );
+    }
+
     // ── Claude Code–style consecutive identical partial read dedup ───────────
 
     #[test]

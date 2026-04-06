@@ -886,4 +886,43 @@ mod tests {
         assert!(names.contains(&"read_file"));
         assert!(names.contains(&"glob"));
     }
+
+    // ── output_similarity unit tests ─────────────────────────────────────
+
+    #[test]
+    fn output_similarity_identical_is_one() {
+        let text = "fn main() {\n    println!(\"hello world\");\n}";
+        assert!((output_similarity(text, text) - 1.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn output_similarity_completely_different_is_low() {
+        let a = "This is a Python script that does image processing with numpy and opencv";
+        let b = "The database schema has tables for users, roles, permissions and sessions";
+        let sim = output_similarity(a, b);
+        assert!(sim < 0.3, "completely different outputs should have low similarity: {sim}");
+    }
+
+    #[test]
+    fn output_similarity_short_outputs_return_zero() {
+        let short = "hello";
+        let normal = "This is a sufficiently long output string for testing purposes";
+        assert_eq!(output_similarity(short, normal), 0.0);
+        assert_eq!(output_similarity(normal, short), 0.0);
+        assert_eq!(output_similarity(short, short), 0.0);
+    }
+
+    #[test]
+    fn output_similarity_minor_diff_is_high() {
+        let a = "src/main.rs:10: fn handle_request()\nsrc/main.rs:25: fn process_data()\nsrc/main.rs:40: fn send_response()";
+        let b = "src/main.rs:10: fn handle_request()\nsrc/main.rs:25: fn process_data()\nsrc/main.rs:42: fn send_response()";
+        let sim = output_similarity(a, b);
+        assert!(sim > 0.75, "minor difference should have high similarity: {sim}");
+    }
+
+    #[test]
+    fn output_similarity_empty_strings_return_zero() {
+        assert_eq!(output_similarity("", ""), 0.0);
+        assert_eq!(output_similarity("", "some content that is long enough"), 0.0);
+    }
 }

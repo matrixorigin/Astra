@@ -774,4 +774,12 @@ mod tests {
         assert_eq!(tr["name"], "read_file");
         assert_eq!(tr["result"], "ok");
     }
+
+    #[test]
+    fn cacheable_tools_includes_git_show() {
+        assert!(
+            CACHEABLE_TOOLS.contains(&"git_show"),
+            "git_show should be cacheable (idempotent read of committed content)"
+        );
+    }
 }
