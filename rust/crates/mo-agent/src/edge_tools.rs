@@ -412,6 +412,25 @@ pub fn all_tool_schemas() -> Vec<Value> {
                 }
             }
         }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "git_worktree",
+                "description": "Manage git worktrees for isolated parallel work. Create a new worktree+branch for a task, list existing worktrees, or remove completed ones. Each worktree is a separate working directory with its own branch — ideal for parallel tasks without conflicts.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "action": {"type": "string", "enum": ["add", "list", "remove"], "description": "Worktree operation: add (create new), list (show all), remove (cleanup)"},
+                        "branch": {"type": "string", "description": "Branch name for the worktree (required for add)"},
+                        "path": {"type": "string", "description": "Filesystem path for the worktree (auto-generated if omitted for add; required for remove)"},
+                        "new_branch": {"type": "boolean", "description": "Create a new branch (true, default) or use existing branch (false)"},
+                        "force": {"type": "boolean", "description": "Force removal even if worktree has changes (for remove)"},
+                        "delete_branch": {"type": "boolean", "description": "Also delete the branch when removing worktree (for remove)"}
+                    },
+                    "required": ["action"]
+                }
+            }
+        }),
         // ── Code navigation tools ──────────────────────────────────────────
         json!({
             "type": "function",
@@ -1561,6 +1580,7 @@ impl ToolExecutor {
             "git_commit" => git_gix::git_commit(&self.project_root, args),
             "git_stash" => git_gix::git_stash(&self.project_root, args),
             "git_checkout_file" => git_gix::git_checkout_file(&self.project_root, args),
+            "git_worktree" => git_gix::git_worktree(&self.project_root, args),
             "find_definition" => self.find_definition(args),
             "find_references" => self.find_references(args),
             "call_graph" => self.call_graph(args),

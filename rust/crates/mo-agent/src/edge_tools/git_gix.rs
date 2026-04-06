@@ -1675,6 +1675,254 @@ pub fn git_checkout_file(project_root: &Path, args: &Value) -> String {
     }
 }
 
+// ─── Git Worktree Management ────────────────────────────────────────────────
+
+/// Create, list, or remove git worktrees for isolated parallel work.
+pub fn git_worktree(project_root: &Path, args: &Value) -> String {
+    let action = match args.get("action").and_then(Value::as_str) {
+        Some(a) => a,
+        None => return "Error: 'action' is required (add, list, remove)".to_string(),
+    };
+
+    match action {
+        "add" | "create" => worktree_add(project_root, args),
+        "list" | "ls" => worktree_list(project_root),
+        "remove" | "rm" | "delete" => worktree_remove(project_root, args),
+        _ => format!("Error: unknown worktree action '{action}'. Use: add, list, remove"),
+    }
+}
+
+fn worktree_add(project_root: &Path, args: &Value) -> String {
+    let branch = match args.get("branch").and_then(Value::as_str) {
+        Some(b) if !b.is_empty() => b,
+        _ => return "Error: 'branch' is required for add".to_string(),
+    };
+
+    // Security: reject shell-dangerous chars in branch name
+    if branch
+        .chars()
+        .any(|c| matches!(c, ';' | '|' | '&' | '`' | '$' | '(' | ')' | '{' | '}'))
+    {
+        return "Error: invalid branch name".to_string();
+    }
+
+    // Determine worktree path: user-provided or auto-generated sibling directory
+    let worktree_path = if let Some(p) = args.get("path").and_then(Value::as_str) {
+        std::path::PathBuf::from(p)
+    } else {
+        // Default: sibling directory named <repo>-<branch>
+        let repo_name = project_root
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("repo");
+        let sanitized_branch = branch.replace('/', "-");
+        project_root
+            .parent()
+            .unwrap_or(project_root)
+            .join(format!("{repo_name}-{sanitized_branch}"))
+    };
+
+    // Check if path already exists
+    if worktree_path.exists() {
+        return format!(
+            "Error: worktree path already exists: {}",
+            worktree_path.display()
+        );
+    }
+
+    // Determine if we create a new branch or use existing
+    let create_new = args
+        .get("new_branch")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+
+    let mut cmd = std::process::Command::new("git");
+    cmd.current_dir(project_root);
+    cmd.arg("worktree").arg("add");
+
+    if create_new {
+        cmd.arg("-b").arg(branch);
+    }
+
+    cmd.arg(worktree_path.to_string_lossy().as_ref());
+
+    if !create_new {
+        cmd.arg(branch);
+    }
+
+    match cmd.output() {
+        Ok(o) if o.status.success() => {
+            format!(
+                "✓ Worktree created\n  Branch: {branch}\n  Path: {}\n  Use `cd {}` or set project_root to work in this worktree.",
+                worktree_path.display(),
+                worktree_path.display()
+            )
+        }
+        Ok(o) => {
+            let stderr = String::from_utf8_lossy(&o.stderr);
+            format!("Error: git worktree add failed: {}", stderr.trim())
+        }
+        Err(e) => format!("Error: git worktree add failed: {e}"),
+    }
+}
+
+fn worktree_list(project_root: &Path) -> String {
+    let out = std::process::Command::new("git")
+        .args(["worktree", "list", "--porcelain"])
+        .current_dir(project_root)
+        .output();
+
+    match out {
+        Ok(o) if o.status.success() => {
+            let raw = String::from_utf8_lossy(&o.stdout);
+            if raw.trim().is_empty() {
+                return "No worktrees found".to_string();
+            }
+
+            // Parse porcelain output into structured display
+            let mut result = String::from("Git Worktrees:\n");
+            let mut current_path = "";
+            let mut current_branch = String::new();
+            let mut current_head = String::new();
+            let mut is_bare = false;
+
+            for line in raw.lines() {
+                if let Some(path) = line.strip_prefix("worktree ") {
+                    if !current_path.is_empty() {
+                        result.push_str(&format_worktree_entry(
+                            current_path,
+                            &current_branch,
+                            &current_head,
+                            is_bare,
+                        ));
+                    }
+                    current_path = path;
+                    current_branch.clear();
+                    current_head.clear();
+                    is_bare = false;
+                } else if let Some(head) = line.strip_prefix("HEAD ") {
+                    current_head = head[..7.min(head.len())].to_string();
+                } else if let Some(branch) = line.strip_prefix("branch refs/heads/") {
+                    current_branch = branch.to_string();
+                } else if line == "bare" {
+                    is_bare = true;
+                } else if line == "detached" {
+                    current_branch = "(detached)".to_string();
+                }
+            }
+            // Flush last entry
+            if !current_path.is_empty() {
+                result.push_str(&format_worktree_entry(
+                    current_path,
+                    &current_branch,
+                    &current_head,
+                    is_bare,
+                ));
+            }
+
+            result
+        }
+        Ok(o) => {
+            let stderr = String::from_utf8_lossy(&o.stderr);
+            format!("Error: git worktree list failed: {}", stderr.trim())
+        }
+        Err(e) => format!("Error: git worktree list failed: {e}"),
+    }
+}
+
+fn format_worktree_entry(path: &str, branch: &str, head: &str, bare: bool) -> String {
+    if bare {
+        format!("  {path} (bare)\n")
+    } else if branch.is_empty() {
+        format!("  {path}  [{head}]\n")
+    } else {
+        format!("  {path}  [{branch}] {head}\n")
+    }
+}
+
+fn worktree_remove(project_root: &Path, args: &Value) -> String {
+    let path = match args.get("path").and_then(Value::as_str) {
+        Some(p) if !p.is_empty() => p,
+        _ => return "Error: 'path' is required for remove".to_string(),
+    };
+
+    let force = args
+        .get("force")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+
+    // Also delete the branch if requested
+    let delete_branch = args
+        .get("delete_branch")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+
+    // First, get the branch name before removal (for optional branch deletion)
+    let branch_name = if delete_branch {
+        let out = std::process::Command::new("git")
+            .args(["worktree", "list", "--porcelain"])
+            .current_dir(project_root)
+            .output();
+        out.ok().and_then(|o| {
+            let stdout = String::from_utf8_lossy(&o.stdout);
+            let mut found_path = false;
+            for line in stdout.lines() {
+                if let Some(wt_path) = line.strip_prefix("worktree ") {
+                    found_path = wt_path == path
+                        || std::path::Path::new(wt_path) == std::path::Path::new(path);
+                }
+                if found_path {
+                    if let Some(branch) = line.strip_prefix("branch refs/heads/") {
+                        return Some(branch.to_string());
+                    }
+                }
+            }
+            None
+        })
+    } else {
+        None
+    };
+
+    // Remove worktree
+    let mut cmd = std::process::Command::new("git");
+    cmd.current_dir(project_root)
+        .arg("worktree")
+        .arg("remove");
+    if force {
+        cmd.arg("--force");
+    }
+    cmd.arg(path);
+
+    match cmd.output() {
+        Ok(o) if o.status.success() => {
+            let mut msg = format!("✓ Worktree removed: {path}");
+
+            // Optionally delete the branch
+            if let Some(ref branch) = branch_name {
+                let del = std::process::Command::new("git")
+                    .args(["branch", "-D", branch])
+                    .current_dir(project_root)
+                    .output();
+                match del {
+                    Ok(d) if d.status.success() => {
+                        msg.push_str(&format!("\n  ✓ Branch '{branch}' deleted"));
+                    }
+                    _ => {
+                        msg.push_str(&format!("\n  ⚠ Could not delete branch '{branch}'"));
+                    }
+                }
+            }
+
+            msg
+        }
+        Ok(o) => {
+            let stderr = String::from_utf8_lossy(&o.stderr);
+            format!("Error: git worktree remove failed: {}", stderr.trim())
+        }
+        Err(e) => format!("Error: git worktree remove failed: {e}"),
+    }
+}
+
 // ─── Tests ──────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
