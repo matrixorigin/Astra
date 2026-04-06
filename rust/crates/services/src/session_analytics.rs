@@ -13,6 +13,8 @@ pub struct SessionStats {
     pub compact_count: u32,
     pub total_tokens_in: u64,
     pub total_tokens_out: u64,
+    pub total_cache_read: u64,
+    pub total_cache_creation: u64,
     pub total_duration_ms: u64,
     pub total_tool_calls: u32,
     pub unique_tools: Vec<String>,
@@ -46,6 +48,8 @@ pub fn compute_session_stats(session_id: &str, events: &[JournalEvent]) -> Sessi
                 stats.turn_count += 1;
                 stats.total_tokens_in += event.tokens_in.unwrap_or(0);
                 stats.total_tokens_out += event.tokens_out.unwrap_or(0);
+                stats.total_cache_read += event.cache_read_tokens.unwrap_or(0);
+                stats.total_cache_creation += event.cache_creation_tokens.unwrap_or(0);
                 stats.total_duration_ms += event.duration_ms.unwrap_or(0);
                 stats.total_tool_calls += event.tool_count.unwrap_or(0);
                 if let Some(ref tools) = event.tools_used {

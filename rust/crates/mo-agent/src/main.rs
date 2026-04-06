@@ -1448,14 +1448,22 @@ fn handle_cost_command(arg: &str, state: &ReplState) {
                     turn_num += 1;
                     let p_tok = ev.tokens_in.unwrap_or(0);
                     let c_tok = ev.tokens_out.unwrap_or(0);
-                    let cost = cost_for_tokens(p_tok, c_tok, 0, 0, pricing);
+                    let cr = ev.cache_read_tokens.unwrap_or(0);
+                    let cw = ev.cache_creation_tokens.unwrap_or(0);
+                    let cost = cost_for_tokens(p_tok, c_tok, cr, cw, pricing);
                     total_in += p_tok;
                     total_out += c_tok;
                     total_cost += cost;
 
+                    let cache_info = if cr > 0 {
+                        let pct = cr as f64 / (p_tok + cr).max(1) as f64 * 100.0;
+                        format!("  cache:{pct:.0}%")
+                    } else {
+                        String::new()
+                    };
                     eprintln!(
-                        "  Turn {:>3}  {:>6}+{:<6} tok  ${:.4}",
-                        turn_num, p_tok, c_tok, cost
+                        "  Turn {:>3}  {:>6}+{:<6} tok  {}{}",
+                        turn_num, p_tok, c_tok, format_cost(cost), cache_info
                     );
                 }
             }
@@ -1511,8 +1519,13 @@ fn handle_cost_command(arg: &str, state: &ReplState) {
             for sid in &recent {
                 if let Ok(events) = session_journal::read_journal(sid) {
                     let stats = session_analytics::compute_session_stats(sid, &events);
-                    let cost =
-                        cost_for_tokens(stats.total_tokens_in, stats.total_tokens_out, 0, 0, pricing);
+                    let cost = cost_for_tokens(
+                        stats.total_tokens_in,
+                        stats.total_tokens_out,
+                        stats.total_cache_read,
+                        stats.total_cache_creation,
+                        pricing,
+                    );
                     grand_total += cost;
 
                     let short = &sid[..8.min(sid.len())];
@@ -1540,6 +1553,8 @@ fn handle_cost_command(arg: &str, state: &ReplState) {
         _ => {
             // Current session summary
             let pricing = &state.cached_pricing;
+            let cache_read_rate = pricing.cache_read.unwrap_or(pricing.prompt * 0.1);
+            let cache_write_rate = pricing.cache_write.unwrap_or(pricing.prompt * 1.25);
             let cost = cost_for_tokens(
                 state.total_prompt_tokens,
                 state.total_completion_tokens,
@@ -1581,12 +1596,39 @@ fn handle_cost_command(arg: &str, state: &ReplState) {
                 state.total_completion_tokens,
                 format_cost(state.total_completion_tokens as f64 * pricing.completion / 1000.0),
             );
+            if state.total_cache_read_tokens > 0 {
+                eprintln!(
+                    "  {:<14} {} ({})",
+                    "cache read:".dim(),
+                    state.total_cache_read_tokens,
+                    format_cost(state.total_cache_read_tokens as f64 * cache_read_rate / 1000.0),
+                );
+            }
+            if state.total_cache_creation_tokens > 0 {
+                eprintln!(
+                    "  {:<14} {} ({})",
+                    "cache write:".dim(),
+                    state.total_cache_creation_tokens,
+                    format_cost(state.total_cache_creation_tokens as f64 * cache_write_rate / 1000.0),
+                );
+            }
             eprintln!("  {:<14} {}", "total:".bold(), format_cost(cost).bold());
             if state.turn > 0 {
                 eprintln!(
                     "  {:<14} {} per turn",
                     "avg:".dim(),
                     format_cost(cost / state.turn as f64)
+                );
+            }
+            if state.total_cache_read_tokens > 0 {
+                let total_input = state.total_prompt_tokens + state.total_cache_read_tokens;
+                let cache_pct = state.total_cache_read_tokens as f64 / total_input.max(1) as f64 * 100.0;
+                let saved = state.total_cache_read_tokens as f64 * (pricing.prompt - cache_read_rate) / 1000.0;
+                eprintln!(
+                    "  {:<14} {:.0}% cache hit, {} saved",
+                    "savings:".dim(),
+                    cache_pct,
+                    format_cost(saved),
                 );
             }
             eprintln!(

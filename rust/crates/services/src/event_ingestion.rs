@@ -687,6 +687,8 @@ mod tests {
             selector_ms: None,
             selector_tokens_in: None,
             selector_tokens_out: None,
+            cache_read_tokens: None,
+            cache_creation_tokens: None,
             memoria_ms: None,
             session_lineage: None,
             coordination: None,

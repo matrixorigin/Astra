@@ -553,6 +553,12 @@ pub struct JournalEvent {
     pub selector_tokens_in: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub selector_tokens_out: Option<u64>,
+    /// Cache read tokens (prompt cache hits).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_read_tokens: Option<u64>,
+    /// Cache creation tokens (prompt cache writes).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_creation_tokens: Option<u64>,
     /// Memoria search time in milliseconds (subset of context_ms).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub memoria_ms: Option<u64>,
@@ -924,6 +930,8 @@ impl JournalEvent {
             selector_ms: None,
             selector_tokens_in: None,
             selector_tokens_out: None,
+            cache_read_tokens: None,
+            cache_creation_tokens: None,
             memoria_ms: None,
             session_lineage: None,
             coordination: None,
@@ -1032,6 +1040,17 @@ impl JournalEvent {
         evt.tokens_out = Some(tokens_out);
         evt.duration_ms = Some(duration_ms);
         evt
+    }
+
+    /// Add cache token counts to a turn event (builder pattern).
+    pub fn with_cache_tokens(mut self, cache_read: u64, cache_creation: u64) -> Self {
+        if cache_read > 0 {
+            self.cache_read_tokens = Some(cache_read);
+        }
+        if cache_creation > 0 {
+            self.cache_creation_tokens = Some(cache_creation);
+        }
+        self
     }
 
     /// Turn error event.

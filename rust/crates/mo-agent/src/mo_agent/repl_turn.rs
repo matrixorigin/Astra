@@ -530,7 +530,8 @@ fn commit_turn_journal_workspace_and_sidecars(
         .with_selector_strategy(result.selector_strategy.clone())
         .with_selector_time(result.selector_ms)
         .with_selector_tokens(result.selector_tokens_in, result.selector_tokens_out)
-        .with_memoria_time(result.memoria_ms);
+        .with_memoria_time(result.memoria_ms)
+        .with_cache_tokens(result.cache_read_tokens, result.cache_creation_tokens);
 
         // Store for /turn command
         state.last_turn_event = Some(turn_event.clone());
