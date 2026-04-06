@@ -457,9 +457,14 @@ impl ToolExecutor {
             }
             // Require full read (not outline/partial) before overwriting
             if !self.was_fully_read(&path) {
+                let rel = path.strip_prefix(&self.project_root).unwrap_or(&path);
                 return json!({
                     "success": false,
-                    "error": "File was only partially read (outline or line range). Read the full file before overwriting."
+                    "error": format!(
+                        "File was only partially read (outline or line range). Read the full file before overwriting.\n\
+                         → Action required: call read_file(\"{}\") (without start_line/end_line) first, then retry.",
+                        rel.to_string_lossy()
+                    )
                 }).to_string();
             }
         }
@@ -478,6 +483,16 @@ impl ToolExecutor {
         } else {
             None
         };
+
+        // Defense-in-depth: re-check staleness right before writing to catch
+        // race conditions between the initial validation and the actual write
+        // (e.g. a linter or user modified the file in between).
+        if path.exists() {
+            if let Err(e) = self.check_staleness(&path) {
+                return json!({ "success": false, "error": format!("Pre-write staleness check failed: {e}") }).to_string();
+            }
+        }
+
         match fs::write(&path, content) {
             Ok(_) => {
                 // Record write state so subsequent reads/edits know the mtime
@@ -556,6 +571,10 @@ impl ToolExecutor {
                     if dry_run {
                         return unified_diff(&content, &new_content, &path);
                     }
+                    // Defense-in-depth: re-check staleness right before writing.
+                    if let Err(e) = self.check_staleness(&path) {
+                        return format!("Error: Pre-write staleness check failed: {e}");
+                    }
                     match fs::write(&path, &new_content) {
                         Ok(_) => {
                             self.record_write(&path);
@@ -611,6 +630,11 @@ impl ToolExecutor {
         // Dry run: show unified diff without writing
         if dry_run {
             return unified_diff(&content, &new_content, &path);
+        }
+
+        // Defense-in-depth: re-check staleness right before writing.
+        if let Err(e) = self.check_staleness(&path) {
+            return format!("Error: Pre-write staleness check failed: {e}");
         }
 
         match fs::write(&path, &new_content) {
@@ -770,6 +794,11 @@ impl ToolExecutor {
         // Dry run: show diff
         if dry_run {
             return unified_diff(&content, &working, &path);
+        }
+
+        // Defense-in-depth: re-check staleness right before writing.
+        if let Err(e) = self.check_staleness(&path) {
+            return format!("Error: Pre-write staleness check failed: {e}");
         }
 
         // Apply
@@ -2946,5 +2975,683 @@ type Handler interface {
         assert!(exe.resolve_checked("\\\\server\\share").is_err());
         assert!(exe.resolve_checked("//server/share").is_err());
         assert!(exe.resolve_checked("src/main.rs").is_ok());
+    }
+
+    // ── Read-before-write guard: realistic session scenarios ─────────────────
+    //
+    // These tests reproduce the exact failure patterns observed in real agentic
+    // sessions (e.g. session 1e627e9a) where the LLM attempts write_file or
+    // str_replace on files it hasn't read yet, or on files that became stale
+    // between reads and writes.
+
+    /// Scenario from session 1e627e9a Turn 2: LLM calls skill("say-hello")
+    /// which returns SKILL.md content, then immediately tries write_file on
+    /// SKILL.md without calling read_file first. The guard must reject this.
+    #[test]
+    fn write_file_blocked_on_unread_existing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = test_executor_in(dir.path());
+
+        // Simulate: file exists on disk (created by `astra init` or prior session)
+        let skill_path = dir.path().join(".astra/skills/say-hello/SKILL.md");
+        std::fs::create_dir_all(skill_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &skill_path,
+            "---\nname: say-hello\ndescription: \"\"\n---\n# say-hello\n",
+        )
+        .unwrap();
+
+        // LLM tries to overwrite without reading first
+        let result = exe.write_file(&json!({
+            "path": ".astra/skills/say-hello/SKILL.md",
+            "content": "---\nname: say-hello\ndescription: \"updated\"\n---\n# say-hello\n"
+        }));
+
+        assert!(
+            result.contains("has not been read yet"),
+            "should reject unread file, got: {result}"
+        );
+        // Must contain actionable guidance with the concrete path
+        assert!(
+            result.contains("read_file"),
+            "error should mention read_file, got: {result}"
+        );
+        assert!(
+            result.contains("SKILL.md"),
+            "error should mention the file path, got: {result}"
+        );
+    }
+
+    /// Same scenario but for str_replace: LLM tries to edit a file it hasn't read.
+    #[test]
+    fn str_replace_blocked_on_unread_existing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = test_executor_in(dir.path());
+
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "key = \"old_value\"\n").unwrap();
+
+        let result = exe.str_replace(&json!({
+            "path": "config.toml",
+            "old_str": "key = \"old_value\"",
+            "new_str": "key = \"new_value\""
+        }));
+
+        assert!(
+            result.contains("has not been read yet"),
+            "should reject unread file, got: {result}"
+        );
+        assert!(
+            result.contains("read_file(\"config.toml\")"),
+            "error should contain actionable read_file call, got: {result}"
+        );
+    }
+
+    /// After read_file, write_file should succeed (the happy path).
+    #[test]
+    fn write_file_succeeds_after_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = test_executor_in(dir.path());
+
+        let path = dir.path().join("hello.txt");
+        std::fs::write(&path, "original content").unwrap();
+
+        // Step 1: read the file (as the LLM should)
+        let read_result = exe.read_file(&json!({"path": "hello.txt"}));
+        assert!(
+            read_result.contains("original content"),
+            "read should work: {read_result}"
+        );
+
+        // Step 2: now write should succeed
+        let write_result = exe.write_file(&json!({
+            "path": "hello.txt",
+            "content": "updated content"
+        }));
+        assert!(
+            write_result.contains("\"success\":true") || write_result.contains("\"success\": true"),
+            "write should succeed after read, got: {write_result}"
+        );
+
+        // Verify content on disk
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(on_disk, "updated content");
+    }
+
+    /// After read_file, str_replace should succeed.
+    #[test]
+    fn str_replace_succeeds_after_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = test_executor_in(dir.path());
+
+        let path = dir.path().join("code.rs");
+        std::fs::write(&path, "fn main() {\n    println!(\"hello\");\n}\n").unwrap();
+
+        exe.read_file(&json!({"path": "code.rs"}));
+
+        let result = exe.str_replace(&json!({
+            "path": "code.rs",
+            "old_str": "println!(\"hello\")",
+            "new_str": "println!(\"world\")"
+        }));
+        assert!(
+            result.contains("Replaced"),
+            "str_replace should succeed after read, got: {result}"
+        );
+
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+        assert!(on_disk.contains("println!(\"world\")"));
+    }
+
+    /// Scenario: write_file creates a new file (no prior read needed).
+    #[test]
+    fn write_file_creates_new_file_without_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = test_executor_in(dir.path());
+
+        let result = exe.write_file(&json!({
+            "path": "brand_new.txt",
+            "content": "fresh content"
+        }));
+        assert!(
+            result.contains("\"success\":true") || result.contains("\"success\": true"),
+            "new file write should not require read, got: {result}"
+        );
+    }
+
+    /// Scenario: after write_file creates a file, a subsequent write_file
+    /// should succeed without needing read_file (write records state).
+    #[test]
+    fn consecutive_writes_without_intermediate_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = test_executor_in(dir.path());
+
+        // First write creates the file
+        exe.write_file(&json!({"path": "iter.txt", "content": "v1"}));
+
+        // Second write should succeed because record_write updated file_state
+        let result = exe.write_file(&json!({"path": "iter.txt", "content": "v2"}));
+        assert!(
+            result.contains("\"success\":true") || result.contains("\"success\": true"),
+            "second write should succeed (record_write tracks state), got: {result}"
+        );
+    }
+
+    /// Scenario: after str_replace edits a file, a subsequent str_replace
+    /// should succeed without needing read_file again.
+    #[test]
+    fn consecutive_str_replace_without_intermediate_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = test_executor_in(dir.path());
+
+        std::fs::write(dir.path().join("chain.txt"), "aaa bbb ccc").unwrap();
+        exe.read_file(&json!({"path": "chain.txt"}));
+
+        // First edit
+        let r1 = exe.str_replace(&json!({
+            "path": "chain.txt",
+            "old_str": "aaa",
+            "new_str": "AAA"
+        }));
+        assert!(r1.contains("Replaced"), "first edit should work: {r1}");
+
+        // Second edit on the same file — should succeed because record_write
+        // updated file_state after the first edit
+        let r2 = exe.str_replace(&json!({
+            "path": "chain.txt",
+            "old_str": "bbb",
+            "new_str": "BBB"
+        }));
+        assert!(
+            r2.contains("Replaced"),
+            "second edit should succeed without re-read, got: {r2}"
+        );
+
+        let on_disk = std::fs::read_to_string(dir.path().join("chain.txt")).unwrap();
+        assert_eq!(on_disk, "AAA BBB ccc");
+    }
+
+    /// Scenario from session 1e627e9a Turn 2: LLM sends str_replace with
+    /// old_str that was valid before a prior str_replace in the same turn
+    /// modified the file. The second str_replace should fail with a helpful
+    /// hint showing the actual file content.
+    #[test]
+    fn str_replace_fails_on_stale_old_str_after_prior_edit() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = test_executor_in(dir.path());
+
+        std::fs::write(
+            dir.path().join("skill.md"),
+            "---\nname: say-hello\nversion: \"0.1.0\"\n---\n# Steps\n1. Say hello\n",
+        )
+        .unwrap();
+        exe.read_file(&json!({"path": "skill.md"}));
+
+        // First edit: change version
+        let r1 = exe.str_replace(&json!({
+            "path": "skill.md",
+            "old_str": "version: \"0.1.0\"",
+            "new_str": "version: \"0.2.0\""
+        }));
+        assert!(r1.contains("Replaced"), "first edit: {r1}");
+
+        // Second edit: LLM still thinks old content has "version: \"0.1.0\""
+        let r2 = exe.str_replace(&json!({
+            "path": "skill.md",
+            "old_str": "version: \"0.1.0\"",
+            "new_str": "version: \"0.3.0\""
+        }));
+        assert!(
+            r2.contains("not found"),
+            "should fail because old_str no longer exists, got: {r2}"
+        );
+    }
+
+    /// Scenario: external modification between read and write (linter, user edit).
+    /// The staleness guard must catch this.
+    #[test]
+    fn write_file_blocked_on_externally_modified_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = test_executor_in(dir.path());
+
+        let path = dir.path().join("modified.txt");
+        std::fs::write(&path, "original").unwrap();
+
+        // Read the file
+        exe.read_file(&json!({"path": "modified.txt"}));
+
+        // Simulate external modification (linter, user, etc.)
+        // Need to ensure mtime actually changes — sleep briefly
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        std::fs::write(&path, "externally modified").unwrap();
+
+        // Write should be blocked
+        let result = exe.write_file(&json!({
+            "path": "modified.txt",
+            "content": "agent's version"
+        }));
+        assert!(
+            result.contains("modified since last read")
+                || result.contains("modified since")
+                || result.contains("staleness"),
+            "should detect external modification, got: {result}"
+        );
+        assert!(
+            result.contains("read_file"),
+            "error should suggest re-reading, got: {result}"
+        );
+    }
+
+    /// Scenario: external modification between read and str_replace.
+    #[test]
+    fn str_replace_blocked_on_externally_modified_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = test_executor_in(dir.path());
+
+        let path = dir.path().join("linted.rs");
+        std::fs::write(&path, "fn main() { }").unwrap();
+
+        exe.read_file(&json!({"path": "linted.rs"}));
+
+        // Simulate linter reformatting
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        std::fs::write(&path, "fn main() {\n}\n").unwrap();
+
+        let result = exe.str_replace(&json!({
+            "path": "linted.rs",
+            "old_str": "fn main() { }",
+            "new_str": "fn main() { println!(\"hi\"); }"
+        }));
+        assert!(
+            result.contains("modified since last read")
+                || result.contains("modified since")
+                || result.contains("staleness"),
+            "should detect linter modification, got: {result}"
+        );
+    }
+
+    /// Scenario: partial read (outline) should NOT allow write_file overwrite.
+    #[test]
+    fn write_file_blocked_after_outline_only_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = test_executor_in(dir.path());
+
+        let path = dir.path().join("big.rs");
+        std::fs::write(
+            &path,
+            "pub fn foo() {}\npub fn bar() {}\npub fn baz() {}\n",
+        )
+        .unwrap();
+
+        // Read with outline=true (partial view)
+        exe.read_file(&json!({"path": "big.rs", "outline": true}));
+
+        // write_file should be blocked — outline is not a full read
+        let result = exe.write_file(&json!({
+            "path": "big.rs",
+            "content": "pub fn foo() { /* changed */ }\n"
+        }));
+        assert!(
+            result.contains("partially read") || result.contains("partial"),
+            "should reject write after outline-only read, got: {result}"
+        );
+        assert!(
+            result.contains("read_file"),
+            "error should suggest full read, got: {result}"
+        );
+    }
+
+    /// Scenario: partial read (line range) should still allow str_replace
+    /// (str_replace doesn't require full read, only write_file does).
+    #[test]
+    fn str_replace_allowed_after_partial_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = test_executor_in(dir.path());
+
+        let path = dir.path().join("partial.txt");
+        std::fs::write(&path, "line1\nline2\nline3\n").unwrap();
+
+        // Read with line range (partial)
+        exe.read_file(&json!({"path": "partial.txt", "start_line": 1, "end_line": 2}));
+
+        // str_replace should work — it only needs the file to be in file_state
+        let result = exe.str_replace(&json!({
+            "path": "partial.txt",
+            "old_str": "line2",
+            "new_str": "LINE2"
+        }));
+        assert!(
+            result.contains("Replaced"),
+            "str_replace should work after partial read, got: {result}"
+        );
+    }
+
+    /// Scenario: register_external_read allows subsequent writes without
+    /// explicit read_file. This is the key improvement for skill execution.
+    #[test]
+    fn register_external_read_enables_subsequent_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = test_executor_in(dir.path());
+
+        let skill_path = dir.path().join(".astra/skills/say-hello/SKILL.md");
+        std::fs::create_dir_all(skill_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &skill_path,
+            "---\nname: say-hello\n---\n# say-hello\nFollow these steps:\n",
+        )
+        .unwrap();
+
+        // Simulate: skill execution loaded and returned the file content.
+        // The skill runner calls register_external_read.
+        exe.register_external_read(std::path::Path::new(
+            ".astra/skills/say-hello/SKILL.md",
+        ));
+
+        // Now write_file should succeed without explicit read_file
+        let result = exe.write_file(&json!({
+            "path": ".astra/skills/say-hello/SKILL.md",
+            "content": "---\nname: say-hello\n---\n# say-hello\nUpdated steps:\n"
+        }));
+        assert!(
+            result.contains("\"success\":true") || result.contains("\"success\": true"),
+            "write should succeed after register_external_read, got: {result}"
+        );
+    }
+
+    /// Scenario: register_external_read also enables str_replace.
+    #[test]
+    fn register_external_read_enables_subsequent_str_replace() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = test_executor_in(dir.path());
+
+        let path = dir.path().join("ext_read.txt");
+        std::fs::write(&path, "hello world").unwrap();
+
+        exe.register_external_read(std::path::Path::new("ext_read.txt"));
+
+        let result = exe.str_replace(&json!({
+            "path": "ext_read.txt",
+            "old_str": "hello",
+            "new_str": "goodbye"
+        }));
+        assert!(
+            result.contains("Replaced"),
+            "str_replace should work after external read, got: {result}"
+        );
+    }
+
+    /// Scenario: multi_edit blocked on unread file.
+    #[test]
+    fn multi_edit_blocked_on_unread_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = test_executor_in(dir.path());
+
+        let path = dir.path().join("multi.txt");
+        std::fs::write(&path, "aaa\nbbb\nccc\n").unwrap();
+
+        let result = exe.multi_edit(&json!({
+            "path": "multi.txt",
+            "edits": [
+                {"old_str": "aaa", "new_str": "AAA"},
+                {"old_str": "bbb", "new_str": "BBB"}
+            ]
+        }));
+        assert!(
+            result.contains("has not been read yet"),
+            "multi_edit should be blocked on unread file, got: {result}"
+        );
+    }
+
+    /// Scenario: multi_edit succeeds after read, applying all edits atomically.
+    #[test]
+    fn multi_edit_succeeds_after_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = test_executor_in(dir.path());
+
+        let path = dir.path().join("atomic.txt");
+        std::fs::write(&path, "aaa\nbbb\nccc\n").unwrap();
+
+        exe.read_file(&json!({"path": "atomic.txt"}));
+
+        let result = exe.multi_edit(&json!({
+            "path": "atomic.txt",
+            "edits": [
+                {"old_str": "aaa", "new_str": "AAA"},
+                {"old_str": "bbb", "new_str": "BBB"}
+            ]
+        }));
+        assert!(
+            result.contains("Applied 2 edit(s)"),
+            "multi_edit should succeed, got: {result}"
+        );
+
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(on_disk, "AAA\nBBB\nccc\n");
+    }
+
+    /// Scenario: defense-in-depth — external modification happens BETWEEN
+    /// the initial staleness check and the actual write. The pre-write
+    /// re-check should catch this race condition.
+    #[test]
+    fn defense_in_depth_catches_race_between_check_and_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = test_executor_in(dir.path());
+
+        let path = dir.path().join("race.txt");
+        std::fs::write(&path, "original").unwrap();
+
+        // Read the file to pass the initial staleness check
+        exe.read_file(&json!({"path": "race.txt"}));
+
+        // Now simulate: the initial check_staleness passes, but before
+        // fs::write happens, the file is modified externally.
+        // We can't truly race in a unit test, but we can verify that
+        // check_staleness is called at the right point by modifying
+        // the file and then calling str_replace (which reads content
+        // between check and write).
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        std::fs::write(&path, "modified by linter").unwrap();
+
+        // str_replace: the initial check_staleness catches this
+        let result = exe.str_replace(&json!({
+            "path": "race.txt",
+            "old_str": "original",
+            "new_str": "agent version"
+        }));
+        assert!(
+            result.contains("modified since") || result.contains("staleness"),
+            "should catch external modification, got: {result}"
+        );
+
+        // Verify file was NOT corrupted
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(on_disk, "modified by linter");
+    }
+
+    /// Scenario: the full realistic session flow from session 1e627e9a.
+    /// Turn 1: skill returns content → write blocked → read → edit succeeds.
+    /// Turn 2: verify edit → re-edit succeeds without re-read.
+    #[test]
+    fn realistic_session_skill_edit_flow() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = test_executor_in(dir.path());
+
+        // Setup: SKILL.md exists from `astra init`
+        let skill_dir = dir.path().join(".astra/skills/say-hello");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: say-hello\nversion: \"0.1.0\"\n---\n# say-hello\n\n1. Say hello\n",
+        )
+        .unwrap();
+
+        // Turn 1, Step 1: LLM tries write_file without reading (BLOCKED)
+        let r1 = exe.write_file(&json!({
+            "path": ".astra/skills/say-hello/SKILL.md",
+            "content": "---\nname: say-hello\nversion: \"0.2.0\"\n---\n# say-hello\n\n1. Greet user\n"
+        }));
+        assert!(r1.contains("has not been read yet"), "step 1: {r1}");
+
+        // Turn 1, Step 2: LLM reads the file
+        let r2 = exe.read_file(&json!({"path": ".astra/skills/say-hello/SKILL.md"}));
+        assert!(r2.contains("say-hello"), "step 2: {r2}");
+
+        // Turn 1, Step 3: LLM edits with str_replace (SUCCESS)
+        let r3 = exe.str_replace(&json!({
+            "path": ".astra/skills/say-hello/SKILL.md",
+            "old_str": "version: \"0.1.0\"",
+            "new_str": "version: \"0.2.0\""
+        }));
+        assert!(r3.contains("Replaced"), "step 3: {r3}");
+
+        // Turn 1, Step 4: LLM makes another edit (SUCCESS — no re-read needed)
+        let r4 = exe.str_replace(&json!({
+            "path": ".astra/skills/say-hello/SKILL.md",
+            "old_str": "1. Say hello",
+            "new_str": "1. Greet user warmly"
+        }));
+        assert!(r4.contains("Replaced"), "step 4: {r4}");
+
+        // Verify final content
+        let on_disk =
+            std::fs::read_to_string(skill_dir.join("SKILL.md")).unwrap();
+        assert!(on_disk.contains("version: \"0.2.0\""));
+        assert!(on_disk.contains("1. Greet user warmly"));
+    }
+
+    /// Scenario: the improved flow with register_external_read.
+    /// Skill execution registers the read, so the LLM can edit immediately.
+    #[test]
+    fn improved_session_flow_with_external_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = test_executor_in(dir.path());
+
+        let skill_dir = dir.path().join(".astra/skills/say-hello");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: say-hello\nversion: \"0.1.0\"\n---\n# say-hello\n\n1. Say hello\n",
+        )
+        .unwrap();
+
+        // Skill execution loads the file and registers it
+        exe.register_external_read(std::path::Path::new(
+            ".astra/skills/say-hello/SKILL.md",
+        ));
+
+        // LLM can now edit immediately — no read_file needed!
+        let r1 = exe.str_replace(&json!({
+            "path": ".astra/skills/say-hello/SKILL.md",
+            "old_str": "version: \"0.1.0\"",
+            "new_str": "version: \"0.2.0\""
+        }));
+        assert!(
+            r1.contains("Replaced"),
+            "should succeed after external read, got: {r1}"
+        );
+
+        // And write_file also works
+        let r2 = exe.write_file(&json!({
+            "path": ".astra/skills/say-hello/SKILL.md",
+            "content": "---\nname: say-hello\nversion: \"0.3.0\"\n---\n# say-hello\n\nNew content\n"
+        }));
+        assert!(
+            r2.contains("\"success\":true") || r2.contains("\"success\": true"),
+            "write_file should also work, got: {r2}"
+        );
+    }
+
+    /// Verify that error messages contain actionable "→ Action required" text
+    /// with the concrete file path, so the LLM can act without reasoning.
+    #[test]
+    fn error_messages_contain_actionable_guidance() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = test_executor_in(dir.path());
+
+        std::fs::write(dir.path().join("target.rs"), "fn main() {}").unwrap();
+
+        // write_file on unread file
+        let r1 = exe.write_file(&json!({
+            "path": "target.rs",
+            "content": "fn main() { println!(\"hi\"); }"
+        }));
+        assert!(
+            r1.contains("Action required"),
+            "write_file error should have actionable guidance, got: {r1}"
+        );
+        assert!(
+            r1.contains("read_file") && r1.contains("target.rs"),
+            "should contain read_file and file path, got: {r1}"
+        );
+
+        // str_replace on unread file
+        let r2 = exe.str_replace(&json!({
+            "path": "target.rs",
+            "old_str": "fn main() {}",
+            "new_str": "fn main() { println!(\"hi\"); }"
+        }));
+        assert!(
+            r2.contains("Action required"),
+            "str_replace error should have actionable guidance, got: {r2}"
+        );
+        assert!(
+            r2.contains("read_file") && r2.contains("target.rs"),
+            "should contain read_file and file path, got: {r2}"
+        );
+    }
+
+    /// Verify that the partial-read error for write_file also contains
+    /// actionable guidance.
+    #[test]
+    fn partial_read_error_contains_actionable_guidance() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = test_executor_in(dir.path());
+
+        let path = dir.path().join("partial_target.rs");
+        std::fs::write(&path, "line1\nline2\nline3\nline4\nline5\n").unwrap();
+
+        // Read with line range (partial)
+        exe.read_file(&json!({"path": "partial_target.rs", "start_line": 1, "end_line": 2}));
+
+        // write_file should fail with actionable message
+        let result = exe.write_file(&json!({
+            "path": "partial_target.rs",
+            "content": "completely new content"
+        }));
+        assert!(
+            result.contains("Action required"),
+            "partial read error should have actionable guidance, got: {result}"
+        );
+        assert!(
+            result.contains("without start_line/end_line"),
+            "should tell user to do full read, got: {result}"
+        );
+    }
+
+    /// Verify staleness error also contains actionable guidance with path.
+    #[test]
+    fn staleness_error_contains_actionable_guidance() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = test_executor_in(dir.path());
+
+        let path = dir.path().join("stale.txt");
+        std::fs::write(&path, "v1").unwrap();
+        exe.read_file(&json!({"path": "stale.txt"}));
+
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        std::fs::write(&path, "v2").unwrap();
+
+        let result = exe.write_file(&json!({
+            "path": "stale.txt",
+            "content": "v3"
+        }));
+        assert!(
+            result.contains("Action required"),
+            "staleness error should have actionable guidance, got: {result}"
+        );
+        assert!(
+            result.contains("read_file") && result.contains("stale.txt"),
+            "should contain read_file and file path, got: {result}"
+        );
     }
 }

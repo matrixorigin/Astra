@@ -1431,29 +1431,49 @@ impl ToolExecutor {
 
     /// Check if a file has been modified since we last read/wrote it.
     /// Returns Err(message) if stale, Ok(()) if fresh or unknown.
+    ///
+    /// The error message includes the concrete file path and the exact tool call
+    /// the model should make next, so the LLM can act without extra reasoning.
     fn check_staleness(&self, path: &Path) -> Result<(), String> {
         let current_ts = Self::file_mtime_ms(path);
         if current_ts == 0 {
             return Ok(()); // file doesn't exist yet — ok for write_file
         }
+        let rel = path
+            .strip_prefix(&self.project_root)
+            .unwrap_or(path)
+            .to_string_lossy();
         if let Ok(state) = self.file_state.lock() {
             if let Some(fs) = state.get(path) {
                 if current_ts > fs.timestamp_ms {
-                    return Err(
+                    return Err(format!(
                         "File has been modified since last read (by user or linter). \
-                         Read it again before editing."
-                            .to_string(),
-                    );
+                         Read it again before editing.\n\
+                         → Action required: call read_file(\"{rel}\") first, then retry."
+                    ));
                 }
             } else {
                 // Never read — require read first for existing files
-                return Err(
-                    "File exists but has not been read yet. Read it first before writing/editing."
-                        .to_string(),
-                );
+                return Err(format!(
+                    "File exists but has not been read yet. \
+                     Read it first before writing/editing.\n\
+                     → Action required: call read_file(\"{rel}\") first, then retry."
+                ));
             }
         }
         Ok(())
+    }
+
+    /// Register a file as "read" from an external source (e.g. skill execution
+    /// that loaded and returned the file content). This prevents the
+    /// read-before-write guard from rejecting subsequent edits to the file.
+    pub fn register_external_read(&self, path: &Path) {
+        let abs = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            self.project_root.join(path)
+        };
+        self.record_read(&abs, false, ReadDedupKey::Full);
     }
 
     /// Check if a file was read as a full view (not partial/outline).
