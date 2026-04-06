@@ -92,6 +92,15 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
             .restricted_tools
             .extend(skill_scoped_restrictions.iter().cloned());
 
+        // Propagate skill sandbox policy to the tool executor for this turn.
+        // Saved/restored so it doesn't persist after the skill deactivates.
+        let prev_sandbox = self.executor.sandbox_policy.take();
+        if let Some(ref policy) = state.skill_sandbox_policy {
+            self.executor.sandbox_policy = Some(policy.clone());
+        } else {
+            self.executor.sandbox_policy = prev_sandbox.clone();
+        }
+
         let turn_result = fetch_chat_turn_sse(ChatTurnSseFetchRequest {
             api: self.api,
             token: self.token,
@@ -149,6 +158,9 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
         for name in &skill_scoped_restrictions {
             state.restricted_tools.remove(name);
         }
+
+        // Restore previous sandbox policy after the turn.
+        self.executor.sandbox_policy = prev_sandbox;
 
         Ok(HostTurnResult {
             accum: turn_result.core,
