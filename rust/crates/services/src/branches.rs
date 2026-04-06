@@ -391,3 +391,58 @@ pub struct CostEstimateRequest {
     pub session_count: Option<i64>,
     pub budget_remaining: Option<f64>,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validate_ident_valid_letter_start() {
+        assert!(validate_ident("myBranch", "branch").is_ok());
+    }
+
+    #[test]
+    fn validate_ident_valid_underscore_start() {
+        assert!(validate_ident("_private", "branch").is_ok());
+    }
+
+    #[test]
+    fn validate_ident_valid_with_dots_digits() {
+        assert!(validate_ident("v1.2.3_beta", "version").is_ok());
+    }
+
+    #[test]
+    fn validate_ident_empty() {
+        assert!(validate_ident("", "branch").is_err());
+    }
+
+    #[test]
+    fn validate_ident_starts_with_digit() {
+        assert!(validate_ident("1abc", "branch").is_err());
+    }
+
+    #[test]
+    fn validate_ident_special_chars() {
+        assert!(validate_ident("my-branch", "branch").is_err());
+        assert!(validate_ident("my@branch", "branch").is_err());
+        assert!(validate_ident("my branch", "branch").is_err());
+    }
+
+    #[test]
+    fn validate_ident_too_long() {
+        let long = format!("a{}", "b".repeat(128)); // 129 chars
+        assert!(validate_ident(&long, "branch").is_err());
+    }
+
+    #[test]
+    fn validate_ident_max_length() {
+        let max = format!("a{}", "b".repeat(127)); // 128 chars
+        assert!(validate_ident(&max, "branch").is_ok());
+    }
+
+    #[test]
+    fn validate_ident_single_char() {
+        assert!(validate_ident("a", "branch").is_ok());
+        assert!(validate_ident("_", "branch").is_ok());
+    }
+}
