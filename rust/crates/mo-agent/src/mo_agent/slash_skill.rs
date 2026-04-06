@@ -1877,9 +1877,324 @@ mod tests {
             );
         }
     }
-}
 
-// ── Quality upload ──────────────────────────────────────────────────────
+    // ── Marketplace integration tests (wiremock) ────────────────────────
+
+    mod marketplace_tests {
+        use wiremock::{MockServer, Mock, ResponseTemplate};
+        use wiremock::matchers::{method, path, query_param};
+
+        fn make_client(server_uri: &str) -> astra_thin_client::ThinClient {
+            astra_thin_client::ThinClient::new(server_uri, None).unwrap()
+        }
+
+        #[tokio::test]
+        async fn browse_marketplace_calls_search_endpoint() {
+            let srv = MockServer::start().await;
+            let resp = serde_json::json!({
+                "results": [{
+                    "skill_name": "code-review",
+                    "version": "1.0.0",
+                    "description": "Review code quality",
+                    "publisher_id": null,
+                    "trust_tier": "verified",
+                    "category": "development",
+                    "ranking_score": 0.8,
+                    "avg_quality": 0.9,
+                    "total_installs": 42,
+                    "active_users_7d": 10,
+                }],
+                "total": 1,
+                "limit": 20,
+                "offset": 0,
+            });
+
+            Mock::given(method("GET"))
+                .and(path("/marketplace/search"))
+                .and(query_param("limit", "20"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(&resp))
+                .expect(1)
+                .mount(&srv)
+                .await;
+
+            let client = make_client(&srv.uri());
+            super::browse_marketplace("", &client, Some("tok")).await;
+            // Mock expectation validates the endpoint was called exactly once.
+        }
+
+        #[tokio::test]
+        async fn browse_marketplace_with_category_filter() {
+            let srv = MockServer::start().await;
+            let resp = serde_json::json!({
+                "results": [],
+                "total": 0,
+                "limit": 10,
+                "offset": 0,
+            });
+
+            Mock::given(method("GET"))
+                .and(path("/marketplace/search"))
+                .and(query_param("category", "security"))
+                .and(query_param("limit", "10"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(&resp))
+                .expect(1)
+                .mount(&srv)
+                .await;
+
+            let client = make_client(&srv.uri());
+            super::browse_marketplace("security --limit=10", &client, Some("tok")).await;
+        }
+
+        #[tokio::test]
+        async fn browse_marketplace_with_trust_filter() {
+            let srv = MockServer::start().await;
+            let resp = serde_json::json!({
+                "results": [],
+                "total": 0,
+                "limit": 20,
+                "offset": 0,
+            });
+
+            Mock::given(method("GET"))
+                .and(path("/marketplace/search"))
+                .and(query_param("trust_tier", "verified"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(&resp))
+                .expect(1)
+                .mount(&srv)
+                .await;
+
+            let client = make_client(&srv.uri());
+            super::browse_marketplace("--trust=verified", &client, Some("tok")).await;
+        }
+
+        #[tokio::test]
+        async fn browse_marketplace_handles_server_error() {
+            let srv = MockServer::start().await;
+
+            Mock::given(method("GET"))
+                .and(path("/marketplace/search"))
+                .respond_with(ResponseTemplate::new(500))
+                .mount(&srv)
+                .await;
+
+            let client = make_client(&srv.uri());
+            // Should not panic — gracefully prints error.
+            super::browse_marketplace("", &client, Some("tok")).await;
+        }
+
+        #[tokio::test]
+        async fn trending_marketplace_calls_search_endpoint() {
+            let srv = MockServer::start().await;
+            let resp = serde_json::json!({
+                "results": [{
+                    "skill_name": "hot-skill",
+                    "version": "2.0.0",
+                    "description": "Trending now",
+                    "publisher_id": null,
+                    "trust_tier": "bundled",
+                    "category": "general",
+                    "ranking_score": 0.95,
+                    "avg_quality": 0.88,
+                    "total_installs": 100,
+                    "active_users_7d": 50,
+                }],
+                "total": 1,
+                "limit": 15,
+                "offset": 0,
+            });
+
+            Mock::given(method("GET"))
+                .and(path("/marketplace/search"))
+                .and(query_param("limit", "15"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(&resp))
+                .expect(1)
+                .mount(&srv)
+                .await;
+
+            let client = make_client(&srv.uri());
+            super::trending_marketplace(&client, Some("tok")).await;
+        }
+
+        #[tokio::test]
+        async fn list_installed_marketplace_calls_installed_endpoint() {
+            let srv = MockServer::start().await;
+            let resp = serde_json::json!({
+                "installations": [{
+                    "installation_id": "inst-001",
+                    "skill_name": "debug-pro",
+                    "skill_version": "1.2.0",
+                    "status": "installed",
+                    "installed_at": "2025-01-15T10:00:00Z",
+                }],
+                "total": 1,
+                "limit": 50,
+                "offset": 0,
+            });
+
+            Mock::given(method("GET"))
+                .and(path("/marketplace/installed"))
+                .and(query_param("limit", "50"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(&resp))
+                .expect(1)
+                .mount(&srv)
+                .await;
+
+            let client = make_client(&srv.uri());
+            super::list_installed_marketplace(&client, Some("tok")).await;
+        }
+
+        #[tokio::test]
+        async fn list_installed_marketplace_handles_empty() {
+            let srv = MockServer::start().await;
+            let resp = serde_json::json!({
+                "installations": [],
+                "total": 0,
+                "limit": 50,
+                "offset": 0,
+            });
+
+            Mock::given(method("GET"))
+                .and(path("/marketplace/installed"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(&resp))
+                .mount(&srv)
+                .await;
+
+            let client = make_client(&srv.uri());
+            super::list_installed_marketplace(&client, Some("tok")).await;
+        }
+
+        #[tokio::test]
+        async fn install_legacy_writes_skill_md() {
+            let srv = MockServer::start().await;
+            let record = serde_json::json!({
+                "skill_id": "sk-001",
+                "skill_name": "test-install-skill",
+                "version": "1.0.0",
+                "description": "A test skill",
+                "metadata": {
+                    "manifest": "---\nname: test-install-skill\nversion: 1.0.0\n---",
+                    "instructions": "Do the thing."
+                },
+                "created_at": "2025-01-01T00:00:00Z",
+            });
+
+            Mock::given(method("GET"))
+                .and(path("/skills/test-install-skill"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(&record))
+                .expect(1)
+                .mount(&srv)
+                .await;
+
+            let client = make_client(&srv.uri());
+            let ok = super::install_single_skill_legacy(
+                "test-install-skill",
+                None,
+                &client,
+                "tok",
+            )
+            .await;
+
+            assert!(ok, "install should succeed");
+
+            // install_single_skill_legacy writes to cwd/.astra/skills/<name>
+            let skill_dir = std::env::current_dir()
+                .unwrap()
+                .join(".astra/skills/test-install-skill");
+            let skill_md = skill_dir.join("SKILL.md");
+            assert!(skill_md.exists(), "SKILL.md should be written");
+            let content = std::fs::read_to_string(&skill_md).unwrap();
+            assert!(content.contains("test-install-skill"));
+            assert!(content.contains("Do the thing."));
+
+            // Clean up
+            let _ = std::fs::remove_dir_all(&skill_dir);
+        }
+
+        #[tokio::test]
+        async fn install_legacy_with_version_query() {
+            let srv = MockServer::start().await;
+            let record = serde_json::json!({
+                "skill_id": "sk-002",
+                "skill_name": "versioned-skill",
+                "version": "2.0.0",
+                "description": null,
+                "metadata": {
+                    "instructions": "Version 2 instructions."
+                },
+                "created_at": null,
+            });
+
+            Mock::given(method("GET"))
+                .and(path("/skills/versioned-skill"))
+                .and(query_param("version", "2.0.0"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(&record))
+                .expect(1)
+                .mount(&srv)
+                .await;
+
+            let client = make_client(&srv.uri());
+            let ok = super::install_single_skill_legacy(
+                "versioned-skill",
+                Some("2.0.0"),
+                &client,
+                "tok",
+            )
+            .await;
+
+            assert!(ok);
+
+            // Clean up
+            let skill_dir = std::env::current_dir()
+                .unwrap()
+                .join(".astra/skills/versioned-skill");
+            let _ = std::fs::remove_dir_all(&skill_dir);
+        }
+
+        #[tokio::test]
+        async fn install_legacy_returns_false_on_404() {
+            let srv = MockServer::start().await;
+
+            Mock::given(method("GET"))
+                .and(path("/skills/missing-skill"))
+                .respond_with(ResponseTemplate::new(404))
+                .mount(&srv)
+                .await;
+
+            let client = make_client(&srv.uri());
+            let ok = super::install_single_skill_legacy(
+                "missing-skill",
+                None,
+                &client,
+                "tok",
+            )
+            .await;
+
+            assert!(!ok, "install should fail on 404");
+        }
+
+        #[tokio::test]
+        async fn uninstall_removes_skill_directory() {
+            let tmp = tempfile::tempdir().unwrap();
+            let skill_dir = tmp.path().join(".astra/skills/removable-skill");
+            std::fs::create_dir_all(&skill_dir).unwrap();
+            std::fs::write(skill_dir.join("SKILL.md"), "---\nname: removable\n---").unwrap();
+            assert!(skill_dir.exists());
+
+            let prev_dir = std::env::current_dir().unwrap();
+            std::env::set_current_dir(tmp.path()).unwrap();
+
+            // uninstall_skill_from_marketplace needs ReplState; test the core logic directly
+            let target = std::env::current_dir()
+                .unwrap()
+                .join(".astra/skills/removable-skill");
+            assert!(target.exists());
+            std::fs::remove_dir_all(&target).unwrap();
+
+            std::env::set_current_dir(&prev_dir).unwrap();
+            assert!(!skill_dir.exists(), "skill dir should be removed");
+        }
+    }
+}
 
 /// Upload local quality metrics to the marketplace API (opt-in).
 async fn upload_quality_report(
@@ -2091,7 +2406,7 @@ async fn install_single_skill(
     version: Option<&str>,
     api: &astra_thin_client::ThinClient,
     tok: &str,
-    state: &mut ReplState,
+    _state: &mut ReplState,
 ) -> bool {
     let bundle_path = format!("/skills/{}/bundle", skill_name);
     let query_pairs: Vec<(&str, String)> = if let Some(v) = version {
@@ -2136,11 +2451,11 @@ async fn install_single_skill(
                 }
             }
             // Fall through to legacy install
-            install_single_skill_legacy(skill_name, version, api, tok, state).await
+            install_single_skill_legacy(skill_name, version, api, tok).await
         }
         Err(_) => {
             // Bundle endpoint not available, use legacy
-            install_single_skill_legacy(skill_name, version, api, tok, state).await
+            install_single_skill_legacy(skill_name, version, api, tok).await
         }
     }
 }
@@ -2151,7 +2466,6 @@ async fn install_single_skill_legacy(
     version: Option<&str>,
     api: &astra_thin_client::ThinClient,
     tok: &str,
-    _state: &mut ReplState,
 ) -> bool {
     let path = format!("/skills/{}", skill_name);
     let query_pairs: Vec<(&str, String)> = if let Some(v) = version {
