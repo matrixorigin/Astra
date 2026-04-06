@@ -422,11 +422,14 @@ pub fn budget_for_model(model: Option<&str>) -> ContextBudget {
 
 /// Conservative default output token cap (8K) with escalation on `finish_reason: "length"`.
 ///
+/// Default cap on output tokens. Most responses fit within 8K (p99 ≈ 5K).
+const DEFAULT_OUTPUT_TOKEN_CAP: usize = 8192;
+
 /// Most responses fit within 8K tokens (p99 ≈ 5K). Starting low frees context
 /// headroom; the existing escalation logic retries at 2× then 4× if truncated.
 pub fn capped_output_tokens(budget: &ContextBudget) -> usize {
     let full_reserve = (budget.model_limit as f64 * budget.output_reserve_ratio) as usize;
-    full_reserve.min(8192)
+    full_reserve.min(DEFAULT_OUTPUT_TOKEN_CAP)
 }
 
 // ---------------------------------------------------------------------------

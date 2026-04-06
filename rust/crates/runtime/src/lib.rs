@@ -248,7 +248,7 @@ pub use turn::{
             CompactionEvent, CompactionEventType, MessageRange, PartialCompactRequest,
             PartialCompactResult, TimeBasedCompactConfig, TimeBasedTrigger, compact_partial,
             evaluate_time_based_trigger, TurnCountCompactConfig, TurnCountTrigger,
-            evaluate_turn_count_trigger, apply_micro_compact, MICRO_COMPACT_STUB,
+            evaluate_turn_count_trigger, apply_micro_compact, run_micro_compact, MICRO_COMPACT_STUB,
         },
         attachments::{
             AttachmentBuilder, FileAttachment, PlanAttachment, PostCompactAttachments,

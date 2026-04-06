@@ -137,7 +137,16 @@ fn render_recent(messages: &[Value]) -> String {
     for msg in recent.into_iter().rev() {
         let role = msg.get("role").and_then(Value::as_str).unwrap_or("?");
         let content = msg.get("content").and_then(Value::as_str).unwrap_or("");
-        let trunc = if content.len() > 500 { &content[..500] } else { content };
+        let trunc = if content.len() > 500 {
+            // Safe truncation: walk backwards from 500 to find a valid char boundary
+            let mut end = 500;
+            while end > 0 && !content.is_char_boundary(end) {
+                end -= 1;
+            }
+            &content[..end]
+        } else {
+            content
+        };
         match role {
             "user" => out.push_str(&format!("[USER]: {trunc}\n")),
             "assistant" => out.push_str(&format!("[ASSISTANT]: {trunc}\n")),

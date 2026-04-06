@@ -1276,27 +1276,10 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
             // Client sends complete message history including tool role messages,
             // so we just use messages directly.
             let (merged_messages, _initial_tier) = {
-                let mut raw = messages.clone();
+                let raw = messages.clone();
 
                 // ── Micro-compact: clear old tool results before main compaction ──
-                {
-                    let tc_config = crate::turn::cloud::analytics::TurnCountCompactConfig::default();
-                    if let Some(trigger) = crate::turn::cloud::analytics::evaluate_turn_count_trigger(&raw, &tc_config) {
-                        let (compacted, cleared) = crate::turn::cloud::analytics::apply_micro_compact(&raw, &trigger.tool_ids_to_clear);
-                        if cleared > 0 {
-                            eprintln!("[micro_compact] turn-count: cleared {} tool results (~{} tokens)", cleared, trigger.estimated_tokens_saved);
-                            raw = compacted;
-                        }
-                    }
-                    let tb_config = crate::turn::cloud::analytics::TimeBasedCompactConfig::default();
-                    if let Some(trigger) = crate::turn::cloud::analytics::evaluate_time_based_trigger(&raw, &tb_config) {
-                        let (compacted, cleared) = crate::turn::cloud::analytics::apply_micro_compact(&raw, &trigger.tool_ids_to_clear);
-                        if cleared > 0 {
-                            eprintln!("[micro_compact] time-based ({}min gap): cleared {} tool results", trigger.gap_minutes, cleared);
-                            raw = compacted;
-                        }
-                    }
-                }
+                let raw = crate::turn::cloud::analytics::run_micro_compact(&raw);
 
                 // Compute model budget for tier-aware compaction using cache-aware estimation.
                 // Tool schemas are cache-eligible (stable prefix), so we estimate their cost.
@@ -1401,6 +1384,8 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
             let mut last_measured_prompt: Option<u64> = None;
             let mut bridge_ptl_streak: u32 = 0;
             let mut cache_detector = crate::turn::cloud::cache_diagnostics::CacheBreakDetector::new();
+            // Pre-serialize tool schemas for cache fingerprinting (stable across rounds)
+            let tools_fingerprint_str = serde_json::to_string(&edge_tools).unwrap_or_default();
 
             for round_ix in 0i64..round_limit {
                 cloud_loop_turns += 1;
@@ -1685,11 +1670,15 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
 
                 // ── Cache break detection ──
                 {
-                    let sys_prompt_str = llm_messages.first()
-                        .and_then(|m| m.get("content")).and_then(Value::as_str).unwrap_or("");
-                    let tools_str = serde_json::to_string(&edge_tools).unwrap_or_default();
+                    let sys_content = llm_messages.first()
+                        .and_then(|m| m.get("content"));
+                    let sys_prompt_str = match sys_content {
+                        Some(Value::String(s)) => s.clone(),
+                        Some(v) => serde_json::to_string(v).unwrap_or_default(),
+                        None => String::new(),
+                    };
                     let fp = crate::turn::cloud::cache_diagnostics::CacheFingerprint::new(
-                        sys_prompt_str, &tools_str, &model_name, &provider,
+                        &sys_prompt_str, &tools_fingerprint_str, &model_name, &provider,
                     );
                     let cache_read = usage.get("cache_read")
                         .and_then(|v| v.as_u64().or_else(|| v.as_i64().map(|i| i.max(0) as u64)))

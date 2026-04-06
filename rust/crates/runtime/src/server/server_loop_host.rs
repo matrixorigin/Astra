@@ -311,24 +311,8 @@ impl ServerAgenticLoopHost {
 
         // ── Micro-compact: clear old tool results before main compaction ──
         let micro_compacted_messages = {
-            let mut msgs = state.messages.clone();
-            let tc_config = crate::turn::cloud::analytics::TurnCountCompactConfig::default();
-            if let Some(trigger) = crate::turn::cloud::analytics::evaluate_turn_count_trigger(&msgs, &tc_config) {
-                let (compacted, cleared) = crate::turn::cloud::analytics::apply_micro_compact(&msgs, &trigger.tool_ids_to_clear);
-                if cleared > 0 {
-                    eprintln!("[micro_compact] turn-count: cleared {} tool results (~{} tokens)", cleared, trigger.estimated_tokens_saved);
-                    msgs = compacted;
-                }
-            }
-            let tb_config = crate::turn::cloud::analytics::TimeBasedCompactConfig::default();
-            if let Some(trigger) = crate::turn::cloud::analytics::evaluate_time_based_trigger(&msgs, &tb_config) {
-                let (compacted, cleared) = crate::turn::cloud::analytics::apply_micro_compact(&msgs, &trigger.tool_ids_to_clear);
-                if cleared > 0 {
-                    eprintln!("[micro_compact] time-based ({}min gap): cleared {} tool results", trigger.gap_minutes, cleared);
-                    msgs = compacted;
-                }
-            }
-            msgs
+            let msgs = state.messages.clone();
+            crate::turn::cloud::analytics::run_micro_compact(&msgs)
         };
 
         // Use Memoria-based compaction (async with HTTP client)

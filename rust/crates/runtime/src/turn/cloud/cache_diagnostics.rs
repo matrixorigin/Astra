@@ -13,7 +13,6 @@ pub enum CacheBreakCause {
     ToolSchemasChanged,
     ModelChanged,
     ProviderChanged,
-    Unknown,
 }
 
 impl std::fmt::Display for CacheBreakCause {
@@ -23,7 +22,6 @@ impl std::fmt::Display for CacheBreakCause {
             Self::ToolSchemasChanged => write!(f, "ToolSchemasChanged"),
             Self::ModelChanged => write!(f, "ModelChanged"),
             Self::ProviderChanged => write!(f, "ProviderChanged"),
-            Self::Unknown => write!(f, "Unknown"),
         }
     }
 }
@@ -74,9 +72,6 @@ pub fn diff_fingerprints(old: &CacheFingerprint, new: &CacheFingerprint) -> Vec<
     }
     if old.provider != new.provider {
         causes.push(CacheBreakCause::ProviderChanged);
-    }
-    if causes.is_empty() && old != new {
-        causes.push(CacheBreakCause::Unknown);
     }
     causes
 }

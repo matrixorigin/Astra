@@ -214,9 +214,9 @@ pub struct TimeBasedCompactConfig {
 impl Default for TimeBasedCompactConfig {
     fn default() -> Self {
         Self {
-            enabled: true,
+            enabled: false,
             gap_threshold_minutes: 30,
-            keep_recent: 3,
+            keep_recent: 5,
         }
     }
 }
@@ -393,7 +393,7 @@ pub fn apply_micro_compact(messages: &[Value], tool_ids_to_clear: &[String]) -> 
                 return msg.clone();
             }
             let id = msg.get("tool_call_id").and_then(Value::as_str).unwrap_or("");
-            if !clear_set.contains(id) {
+            if id.is_empty() || !clear_set.contains(id) {
                 return msg.clone();
             }
             cleared += 1;
@@ -403,6 +403,47 @@ pub fn apply_micro_compact(messages: &[Value], tool_ids_to_clear: &[String]) -> 
         })
         .collect();
     (result, cleared)
+}
+
+/// Run the full micro-compact pipeline: evaluate turn-count and time-based triggers,
+/// collect a union of IDs to clear, then apply once.
+/// Returns the (possibly compacted) messages.
+pub fn run_micro_compact(messages: &[Value]) -> Vec<Value> {
+    let mut ids_to_clear = Vec::new();
+    let mut total_tokens_saved = 0usize;
+    let mut gap_minutes = 0u32;
+
+    let tc_config = TurnCountCompactConfig::default();
+    if let Some(trigger) = evaluate_turn_count_trigger(messages, &tc_config) {
+        total_tokens_saved += trigger.estimated_tokens_saved;
+        ids_to_clear.extend(trigger.tool_ids_to_clear);
+    }
+
+    let tb_config = TimeBasedCompactConfig::default();
+    if let Some(trigger) = evaluate_time_based_trigger(messages, &tb_config) {
+        gap_minutes = trigger.gap_minutes;
+        total_tokens_saved += trigger.estimated_tokens_saved;
+        // Merge IDs (dedup via HashSet below in apply_micro_compact)
+        for id in trigger.tool_ids_to_clear {
+            if !ids_to_clear.contains(&id) {
+                ids_to_clear.push(id);
+            }
+        }
+    }
+
+    if ids_to_clear.is_empty() {
+        return messages.to_vec();
+    }
+
+    let (compacted, cleared) = apply_micro_compact(messages, &ids_to_clear);
+    if cleared > 0 {
+        if gap_minutes > 0 {
+            eprintln!("[micro_compact] cleared {} tool results (~{} tokens, {}min gap)", cleared, total_tokens_saved, gap_minutes);
+        } else {
+            eprintln!("[micro_compact] cleared {} tool results (~{} tokens)", cleared, total_tokens_saved);
+        }
+    }
+    compacted
 }
 
 // ---------------------------------------------------------------------------
@@ -675,9 +716,9 @@ mod tests {
     #[test]
     fn time_based_config_defaults() {
         let config = TimeBasedCompactConfig::default();
-        assert!(config.enabled);
+        assert!(!config.enabled);
         assert_eq!(config.gap_threshold_minutes, 30);
-        assert_eq!(config.keep_recent, 3);
+        assert_eq!(config.keep_recent, 5);
     }
 
     #[test]
@@ -753,7 +794,8 @@ mod tests {
             json!({"role": "tool", "tool_call_id": "c3", "content": "r3"}),
             json!({"role": "tool", "tool_call_id": "c4", "content": "r4"}),
         ];
-        let t = evaluate_time_based_trigger(&messages, &TimeBasedCompactConfig::default()).unwrap();
+        let config = TimeBasedCompactConfig { enabled: true, gap_threshold_minutes: 30, keep_recent: 3 };
+        let t = evaluate_time_based_trigger(&messages, &config).unwrap();
         assert!(t.gap_minutes >= 44);
         assert_eq!(t.tool_ids_to_clear.len(), 1); // 4 - keep_recent(3)
     }
@@ -765,7 +807,8 @@ mod tests {
             json!({"role": "assistant", "content": "hi", "timestamp": recent_ts}),
             json!({"role": "tool", "tool_call_id": "c1", "content": "x".repeat(5000)}),
         ];
-        assert!(evaluate_time_based_trigger(&messages, &TimeBasedCompactConfig::default()).is_none());
+        let config = TimeBasedCompactConfig { enabled: true, gap_threshold_minutes: 30, keep_recent: 5 };
+        assert!(evaluate_time_based_trigger(&messages, &config).is_none());
     }
 
     #[test]
