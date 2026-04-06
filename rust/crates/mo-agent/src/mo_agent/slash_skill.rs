@@ -1156,10 +1156,22 @@ Follow these steps:
             inspect_skill_bundle(sub_arg.trim());
         }
 
+        "browse" => {
+            browse_marketplace(sub_arg.trim(), api, token).await;
+        }
+
+        "trending" => {
+            trending_marketplace(api, token).await;
+        }
+
+        "installed" => {
+            list_installed_marketplace(api, token).await;
+        }
+
         _ => {
             eprintln!(
                         "{}",
-                        format!("  Unknown /skill subcommand: '{sub}'. Try /skill list, /skill search, /skill search-remote, /skill info, /skill new, /skill test, /skill dev, /skill doctor, /skill stats, /skill pin, /skill unpin, /skill install, /skill publish, /skill uninstall, /skill pack, /skill unpack, /skill inspect, /skill compose-info, /skill upload-quality").yellow()
+                        format!("  Unknown /skill subcommand: '{sub}'. Try /skill list, /skill search, /skill search-remote, /skill browse, /skill trending, /skill installed, /skill info, /skill new, /skill test, /skill dev, /skill doctor, /skill stats, /skill pin, /skill unpin, /skill install, /skill publish, /skill uninstall, /skill pack, /skill unpack, /skill inspect, /skill compose-info, /skill upload-quality").yellow()
                     );
         }
     }
@@ -2088,4 +2100,257 @@ fn format_bytes(bytes: u64) -> String {
     } else {
         format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
     }
+}
+
+// ── Browse / Trending / Installed commands ──────────────────────────────
+
+/// Browse marketplace by category.
+async fn browse_marketplace(
+    category: &str,
+    api: &astra_thin_client::ThinClient,
+    token: Option<&str>,
+) {
+    let tok = token.unwrap_or("");
+
+    // Parse args: optional category + flags
+    let mut cat_filter = None;
+    let mut trust_filter = None;
+    let mut limit = 20u32;
+
+    for part in category.split_whitespace() {
+        if let Some(val) = part.strip_prefix("--trust=") {
+            trust_filter = Some(val.to_string());
+        } else if let Some(val) = part.strip_prefix("--limit=") {
+            limit = val.parse().unwrap_or(20).min(100);
+        } else if cat_filter.is_none() {
+            cat_filter = Some(part.to_string());
+        }
+    }
+
+    let title = cat_filter
+        .as_deref()
+        .map(|c| format!("Browse: {c}"))
+        .unwrap_or_else(|| "Browse marketplace".to_string());
+
+    eprintln!("\n  {}", title.bold());
+    eprintln!("{}", "─".repeat(78).dim());
+
+    let mut query_pairs: Vec<(&str, String)> = vec![("limit", limit.to_string())];
+    if let Some(ref c) = cat_filter {
+        query_pairs.push(("category", c.clone()));
+    }
+    if let Some(ref t) = trust_filter {
+        query_pairs.push(("trust_tier", t.clone()));
+    }
+
+    match api
+        .get_bearer_path_query_text(tok, "/marketplace/search", &query_pairs)
+        .await
+    {
+        Ok(text) => {
+            match serde_json::from_str::<astra_services::marketplace_stats::SkillSearchResponse>(
+                &text,
+            ) {
+                Ok(resp) => {
+                    if resp.results.is_empty() {
+                        eprintln!("  {}", "No skills found.".dim());
+                    } else {
+                        eprintln!(
+                            "  {:<24}  {:<8}  {:<12}  {:<10}  {:<6}  {}",
+                            "Name".bold(),
+                            "Version".bold(),
+                            "Category".bold(),
+                            "Trust".bold(),
+                            "Installs".bold(),
+                            "Description".bold()
+                        );
+                        for r in &resp.results {
+                            let cat = r.category.as_deref().unwrap_or("-");
+                            let tier = r.trust_tier.as_deref().unwrap_or("?");
+                            let desc = truncate_desc(r.description.as_deref().unwrap_or(""), 28);
+                            eprintln!(
+                                "  {:<24}  {:<8}  {:<12}  {:<10}  {:<6}  {}",
+                                r.skill_name.as_str().cyan(),
+                                r.version.as_str().dim(),
+                                cat.dim(),
+                                tier.dim(),
+                                r.total_installs,
+                                desc
+                            );
+                        }
+                        eprintln!(
+                            "\n  {} {} total",
+                            "Showing".dim(),
+                            resp.total.to_string().dim()
+                        );
+                    }
+                }
+                Err(e) => {
+                    eprintln!("  {} {}", "✗ Parse error:".yellow(), format!("{e}").dim());
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!(
+                "  {} {}",
+                "✗ Marketplace unavailable:".yellow(),
+                format!("{e}").dim()
+            );
+        }
+    }
+
+    if cat_filter.is_none() {
+        eprintln!();
+        eprintln!(
+            "  {}",
+            "Tip: /skill browse <category> to filter (e.g. code-review, deployment, analysis)."
+                .dim()
+        );
+    }
+    eprintln!();
+}
+
+/// Show trending skills from the marketplace (sorted by ranking score).
+async fn trending_marketplace(
+    api: &astra_thin_client::ThinClient,
+    token: Option<&str>,
+) {
+    let tok = token.unwrap_or("");
+
+    eprintln!("\n  {}", "🔥 Trending skills".bold());
+    eprintln!("{}", "─".repeat(78).dim());
+
+    match api
+        .get_bearer_path_query_text(tok, "/marketplace/search", &[("limit", "15".to_string())])
+        .await
+    {
+        Ok(text) => {
+            match serde_json::from_str::<astra_services::marketplace_stats::SkillSearchResponse>(
+                &text,
+            ) {
+                Ok(resp) => {
+                    if resp.results.is_empty() {
+                        eprintln!("  {}", "No skills in marketplace yet.".dim());
+                    } else {
+                        eprintln!(
+                            "  {:<3}  {:<22}  {:<8}  {:<6}  {:<8}  {:<7}  {}",
+                            "#".bold(),
+                            "Name".bold(),
+                            "Version".bold(),
+                            "Score".bold(),
+                            "Installs".bold(),
+                            "Active".bold(),
+                            "Description".bold()
+                        );
+                        for (i, r) in resp.results.iter().enumerate() {
+                            let desc = truncate_desc(r.description.as_deref().unwrap_or(""), 26);
+                            let rank_color = if i < 3 {
+                                format!("{:<3}", i + 1).yellow().bold().to_string()
+                            } else {
+                                format!("{:<3}", i + 1)
+                            };
+                            eprintln!(
+                                "  {}  {:<22}  {:<8}  {:<6.2}  {:<8}  {:<7}  {}",
+                                rank_color,
+                                r.skill_name.as_str().cyan(),
+                                r.version.as_str().dim(),
+                                r.ranking_score,
+                                r.total_installs,
+                                r.active_users_7d,
+                                desc
+                            );
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("  {} {}", "✗ Parse error:".yellow(), format!("{e}").dim());
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!(
+                "  {} {}",
+                "✗ Marketplace unavailable:".yellow(),
+                format!("{e}").dim()
+            );
+        }
+    }
+    eprintln!();
+}
+
+/// Show skills installed on the server for the current user.
+async fn list_installed_marketplace(
+    api: &astra_thin_client::ThinClient,
+    token: Option<&str>,
+) {
+    let tok = token.unwrap_or("");
+
+    eprintln!("\n  {}", "Installed skills (server)".bold());
+    eprintln!("{}", "─".repeat(78).dim());
+
+    match api
+        .get_bearer_path_query_text(tok, "/marketplace/installed", &[("limit", "50".to_string())])
+        .await
+    {
+        Ok(text) => {
+            match serde_json::from_str::<astra_services::marketplace::InstalledListResponse>(&text)
+            {
+                Ok(resp) => {
+                    if resp.installations.is_empty() {
+                        eprintln!(
+                            "  {}",
+                            "No skills installed from marketplace.".dim()
+                        );
+                        eprintln!(
+                            "  {}",
+                            "Tip: use '/skill install <name>' to install from marketplace.".dim()
+                        );
+                    } else {
+                        eprintln!(
+                            "  {:<24}  {:<10}  {:<12}  {}",
+                            "Name".bold(),
+                            "Version".bold(),
+                            "Status".bold(),
+                            "Installed".bold()
+                        );
+                        for inst in &resp.installations {
+                            let status_colored = match inst.status.as_str() {
+                                "installed" => inst.status.as_str().green().to_string(),
+                                "upgraded" => inst.status.as_str().cyan().to_string(),
+                                "rolled_back" => inst.status.as_str().yellow().to_string(),
+                                _ => inst.status.clone(),
+                            };
+                            eprintln!(
+                                "  {:<24}  {:<10}  {:<12}  {}",
+                                inst.skill_name.as_str().cyan(),
+                                inst.skill_version.as_str().dim(),
+                                status_colored,
+                                inst.installed_at.as_str().dim()
+                            );
+                        }
+                        eprintln!(
+                            "\n  {} {} total",
+                            "Installed:".dim(),
+                            resp.total.to_string().dim()
+                        );
+                    }
+                }
+                Err(e) => {
+                    eprintln!("  {} {}", "✗ Parse error:".yellow(), format!("{e}").dim());
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!(
+                "  {} {}",
+                "✗ Server unavailable:".yellow(),
+                format!("{e}").dim()
+            );
+            eprintln!(
+                "  {}",
+                "Tip: use '/skill list' to see locally available skills.".dim()
+            );
+        }
+    }
+    eprintln!();
 }
