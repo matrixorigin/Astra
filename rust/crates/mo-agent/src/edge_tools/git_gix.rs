@@ -2919,4 +2919,130 @@ mod tests {
             "nonexistent dir should return None for fallback"
         );
     }
+
+    // ── Git Worktree Tests ──────────────────────────────────────────────
+
+    #[test]
+    fn git_worktree_missing_action() {
+        let root = repo_root();
+        let result = git_worktree(&root, &json!({}));
+        assert!(
+            result.contains("Error") && result.contains("action"),
+            "should require action: {result}"
+        );
+    }
+
+    #[test]
+    fn git_worktree_unknown_action() {
+        let root = repo_root();
+        let result = git_worktree(&root, &json!({"action": "teleport"}));
+        assert!(
+            result.contains("Error") && result.contains("unknown"),
+            "should reject unknown action: {result}"
+        );
+    }
+
+    #[test]
+    fn git_worktree_add_missing_branch() {
+        let root = repo_root();
+        let result = git_worktree(&root, &json!({"action": "add"}));
+        assert!(
+            result.contains("Error") && result.contains("branch"),
+            "should require branch: {result}"
+        );
+    }
+
+    #[test]
+    fn git_worktree_add_rejects_shell_injection() {
+        let root = repo_root();
+        for dangerous in &[
+            "test;rm -rf /",
+            "test|cat /etc/passwd",
+            "test&whoami",
+            "test`id`",
+            "test$(whoami)",
+            "test()",
+            "test{}",
+        ] {
+            let result =
+                git_worktree(&root, &json!({"action": "add", "branch": dangerous}));
+            assert!(
+                result.contains("Error") && result.contains("invalid branch name"),
+                "should reject '{dangerous}': {result}"
+            );
+        }
+    }
+
+    #[test]
+    fn git_worktree_list_runs() {
+        let root = repo_root();
+        let result = git_worktree(&root, &json!({"action": "list"}));
+        // Should contain at least the main worktree path
+        assert!(
+            !result.contains("Error: git") || result.contains("worktree"),
+            "list should succeed or show worktree info: {result}"
+        );
+    }
+
+    #[test]
+    fn git_worktree_list_alias_ls() {
+        let root = repo_root();
+        let result = git_worktree(&root, &json!({"action": "ls"}));
+        assert!(
+            !result.contains("unknown"),
+            "ls should be accepted as alias for list: {result}"
+        );
+    }
+
+    #[test]
+    fn git_worktree_remove_missing_path() {
+        let root = repo_root();
+        let result = git_worktree(&root, &json!({"action": "remove"}));
+        assert!(
+            result.contains("Error") && result.contains("path"),
+            "should require path for remove: {result}"
+        );
+    }
+
+    #[test]
+    fn git_worktree_remove_nonexistent() {
+        let root = repo_root();
+        let result = git_worktree(
+            &root,
+            &json!({"action": "remove", "path": "/tmp/nonexistent-worktree-xyz"}),
+        );
+        assert!(
+            result.contains("Error") || result.contains("error"),
+            "removing nonexistent worktree should fail: {result}"
+        );
+    }
+
+    #[test]
+    fn git_worktree_add_existing_path_fails() {
+        let root = repo_root();
+        // Use /tmp which always exists — should fail with "already exists"
+        let result = git_worktree(
+            &root,
+            &json!({"action": "add", "branch": "test-existing", "path": "/tmp"}),
+        );
+        assert!(
+            result.contains("Error") && result.contains("already exists"),
+            "should reject existing path: {result}"
+        );
+    }
+
+    #[test]
+    fn git_worktree_action_aliases() {
+        let root = repo_root();
+        // "create" should alias to "add" (needs branch param, so will error on missing branch)
+        let r1 = git_worktree(&root, &json!({"action": "create"}));
+        assert!(r1.contains("branch"), "create should route to add: {r1}");
+
+        // "rm" and "delete" should alias to "remove" (needs path param)
+        let r2 = git_worktree(&root, &json!({"action": "rm"}));
+        assert!(r2.contains("path"), "rm should route to remove: {r2}");
+
+        let r3 = git_worktree(&root, &json!({"action": "delete"}));
+        assert!(r3.contains("path"), "delete should route to remove: {r3}");
+    }
 }

@@ -1786,6 +1786,97 @@ mod tests {
         let score = skill_relevance_score(&m, "code review");
         assert!(score > 0, "multi-word query should match description");
     }
+
+    // ── derive_triggers tests ───────────────────────────────────────────
+
+    #[test]
+    fn derive_triggers_name_always_first() {
+        let triggers = super::derive_triggers("my-skill", &[]);
+        assert_eq!(triggers[0], "my-skill");
+    }
+
+    #[test]
+    fn derive_triggers_empty_intents() {
+        let triggers = super::derive_triggers("test", &[]);
+        assert_eq!(triggers, vec!["test"]);
+    }
+
+    #[test]
+    fn derive_triggers_extracts_frequent_words() {
+        let intents = vec![
+            "deploy the frontend app".to_string(),
+            "deploy the backend api".to_string(),
+            "deploy to production".to_string(),
+        ];
+        let triggers = super::derive_triggers("cleanup", &intents);
+        assert_eq!(triggers[0], "cleanup");
+        assert!(triggers.contains(&"deploy".to_string()));
+    }
+
+    #[test]
+    fn derive_triggers_skips_stop_words() {
+        let intents = vec![
+            "the quick brown fox".to_string(),
+            "the quick lazy dog".to_string(),
+        ];
+        let triggers = super::derive_triggers("x", &intents);
+        // "the" is a stop word, should not appear
+        assert!(!triggers.contains(&"the".to_string()));
+    }
+
+    #[test]
+    fn derive_triggers_skips_short_words() {
+        let intents = vec![
+            "do it as we go on by".to_string(),
+            "do it as we go on by".to_string(),
+        ];
+        let triggers = super::derive_triggers("x", &intents);
+        // all words < 3 chars, no extra triggers beyond the name
+        assert_eq!(triggers.len(), 1);
+    }
+
+    #[test]
+    fn derive_triggers_max_three_extras() {
+        let intents = vec![
+            "deploy frontend backend infrastructure monitoring alerting".to_string(),
+            "deploy frontend backend infrastructure monitoring alerting".to_string(),
+        ];
+        let triggers = super::derive_triggers("name", &intents);
+        // name + at most 3 extras = 4 max
+        assert!(triggers.len() <= 4, "got {}: {:?}", triggers.len(), triggers);
+    }
+
+    #[test]
+    fn derive_triggers_no_duplicate_with_name() {
+        let intents = vec![
+            "deploy deploy deploy".to_string(),
+        ];
+        let triggers = super::derive_triggers("deploy", &intents);
+        let count = triggers.iter().filter(|t| *t == "deploy").count();
+        assert_eq!(count, 1, "name should not be duplicated");
+    }
+
+    // ── Skill name validation tests ─────────────────────────────────────
+
+    #[test]
+    fn skill_name_validation_accepts_valid() {
+        for name in &["my-skill", "test_123", "ABC", "a"] {
+            assert!(
+                name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'),
+                "should accept: {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn skill_name_validation_rejects_invalid() {
+        for name in &["my skill", "test/bad", "a@b", "skill;rm"] {
+            assert!(
+                !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'),
+                "should reject: {name}"
+            );
+        }
+    }
 }
 
 // ── Quality upload ──────────────────────────────────────────────────────

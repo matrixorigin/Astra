@@ -2511,4 +2511,42 @@ Instructions.
         // No match
         assert_eq!(detect_skill_hybrid_sync(&registry, "hello world"), None);
     }
+
+    #[test]
+    fn batch_parallel_skill_parses_correctly() {
+        let skill_md_path = std::path::Path::new("../../../skills/batch_parallel/SKILL.md");
+        if !skill_md_path.exists() {
+            return; // Skip if not running from expected location
+        }
+        let content = std::fs::read_to_string(skill_md_path).unwrap();
+        let skill = parse_skill_md(&content).unwrap();
+        assert_eq!(skill.name, "batch-parallel");
+        assert!(!skill.description.is_empty());
+        assert!(skill.user_invocable);
+        assert!(
+            !skill.triggers.is_empty(),
+            "should have triggers: {:?}",
+            skill.triggers
+        );
+        assert!(
+            skill.triggers.contains(&"batch".to_string()),
+            "should trigger on 'batch'"
+        );
+        assert!(
+            !skill.allowed_tools.is_empty(),
+            "should have allowed_tools"
+        );
+        assert!(
+            skill.allowed_tools.contains(&"git_worktree".to_string()),
+            "should include git_worktree tool"
+        );
+        assert!(
+            !skill.instructions.is_empty(),
+            "should have instruction body"
+        );
+        assert!(
+            skill.instructions.contains("Phase 1") && skill.instructions.contains("Phase 5"),
+            "should have all 5 phases"
+        );
+    }
 }
