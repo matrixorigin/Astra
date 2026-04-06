@@ -180,12 +180,6 @@ pub async fn consume_sse_stream_cancellable<H: SseStreamHost>(
     let mut abort: Option<SseAbortReason> = None;
     let mut first_sse_frame_seen = false;
 
-    // Tool requests from the tail flush (after stream ends) are collected
-    // here so we can reorder skill calls before non-skill calls.
-    // During streaming, tools are flushed inline (not deferred) because the
-    // bridge waits for edge callback results before sending more data.
-    let mut tail_tool_pending: Vec<ChatTurnEdgePending> = Vec::new();
-
     host.on_before_sse_read_loop();
 
     let idle = idle_timeout;
@@ -223,11 +217,8 @@ pub async fn consume_sse_stream_cancellable<H: SseStreamHost>(
             }
             let effects = dispatch_chat_turn_sse_event_block(&event_str, &mut accum, &mut pending);
             host.on_render_effects(effects);
-            // Flush tool requests inline during streaming — the host's
-            // execute_tool posts results back to the bridge via edge callback,
-            // so deferring would deadlock (bridge waits for tool result while
-            // CLI waits for stream to end).
-            // Reorder so skill calls execute first within each batch.
+            // Skill-exclusivity: reorder so skill calls execute before
+            // non-skill calls within the same batch.
             prioritize_skill_tools(&mut pending);
             flush_pending_via_host(&mut pending, host, &mut tool_results, &mut approval_results)
                 .await;
@@ -243,7 +234,6 @@ pub async fn consume_sse_stream_cancellable<H: SseStreamHost>(
         accum.reasoning_content.clear();
         accum.tool_calls.clear();
         pending.clear();
-        tail_tool_pending.clear();
         let msg = match abort {
             Some(SseAbortReason::IdleTimeout) => {
                 format!("Error: stream idle timeout after {}ms", idle.as_millis())
@@ -263,23 +253,9 @@ pub async fn consume_sse_stream_cancellable<H: SseStreamHost>(
         }
         let effects = dispatch_chat_turn_sse_event_block(&tail, &mut accum, &mut pending);
         host.on_render_effects(effects);
-        // Tail flush: stream is done, so we can safely reorder for skill
-        // prioritization before executing.
-        split_and_defer_tools(&mut pending, &mut tail_tool_pending);
+        prioritize_skill_tools(&mut pending);
         flush_pending_via_host(&mut pending, host, &mut tool_results, &mut approval_results).await;
     }
-
-    // Now flush all deferred tool requests at once, with skill-awareness.
-    // Reorder so skill calls execute first — the host's execute_tool sets a
-    // skill-exclusivity flag that defers subsequent non-skill calls.
-    prioritize_skill_tools(&mut tail_tool_pending);
-    flush_pending_via_host(
-        &mut tail_tool_pending,
-        host,
-        &mut tool_results,
-        &mut approval_results,
-    )
-    .await;
 
     host.on_stream_complete();
 
@@ -292,22 +268,6 @@ pub async fn consume_sse_stream_cancellable<H: SseStreamHost>(
         },
         abort,
     )
-}
-
-/// Move `ToolRequest` items from `pending` into `deferred`, leaving only
-/// non-tool items (e.g. `ApprovalRequired`) in `pending` for immediate flush.
-fn split_and_defer_tools(
-    pending: &mut Vec<ChatTurnEdgePending>,
-    deferred: &mut Vec<ChatTurnEdgePending>,
-) {
-    let taken = std::mem::take(pending);
-    for item in taken {
-        if matches!(item, ChatTurnEdgePending::ToolRequest { .. }) {
-            deferred.push(item);
-        } else {
-            pending.push(item);
-        }
-    }
 }
 
 /// Reorder so that skill tool requests come before all non-skill requests.
@@ -962,7 +922,7 @@ mod tests {
         assert_eq!(result.accum.full_text, "Based on the file, here is my analysis.");
     }
 
-    // ── split_and_defer_tools / prioritize_skill_tools unit tests ────────
+    // ── prioritize_skill_tools unit tests ──────────────────────────────────
 
     fn make_tool_pending(tool: &str) -> ChatTurnEdgePending {
         ChatTurnEdgePending::ToolRequest {
@@ -972,38 +932,11 @@ mod tests {
         }
     }
 
-    fn make_approval_pending() -> ChatTurnEdgePending {
-        ChatTurnEdgePending::ApprovalRequired {
-            request_id: "req-approval".to_string(),
-            tool: "bash".to_string(),
-            path: None,
-        }
-    }
-
     fn tool_name(item: &ChatTurnEdgePending) -> &str {
         match item {
             ChatTurnEdgePending::ToolRequest { tool, .. } => tool,
             _ => "approval",
         }
-    }
-
-    #[test]
-    fn split_separates_tools_from_approvals() {
-        let mut pending = vec![
-            make_tool_pending("bash"),
-            make_approval_pending(),
-            make_tool_pending("skill"),
-        ];
-        let mut deferred = Vec::new();
-        super::split_and_defer_tools(&mut pending, &mut deferred);
-
-        // Approvals stay in pending
-        assert_eq!(pending.len(), 1);
-        assert!(matches!(pending[0], ChatTurnEdgePending::ApprovalRequired { .. }));
-        // Tools moved to deferred
-        assert_eq!(deferred.len(), 2);
-        assert_eq!(tool_name(&deferred[0]), "bash");
-        assert_eq!(tool_name(&deferred[1]), "skill");
     }
 
     #[test]
@@ -1050,31 +983,6 @@ mod tests {
         assert_eq!(tool_name(&items[3]), "write_file");
     }
 
-    #[test]
-    fn split_across_multiple_calls_accumulates() {
-        let mut deferred = Vec::new();
-
-        // First block: write_file arrives
-        let mut pending1 = vec![make_tool_pending("write_file")];
-        super::split_and_defer_tools(&mut pending1, &mut deferred);
-        assert!(pending1.is_empty());
-        assert_eq!(deferred.len(), 1);
-
-        // Second block: skill arrives
-        let mut pending2 = vec![make_tool_pending(crate::turn::skill_tool::SKILL_TOOL_NAME)];
-        super::split_and_defer_tools(&mut pending2, &mut deferred);
-        assert_eq!(deferred.len(), 2);
-
-        // write_file is first (arrival order), skill is second
-        assert_eq!(tool_name(&deferred[0]), "write_file");
-        assert_eq!(tool_name(&deferred[1]), crate::turn::skill_tool::SKILL_TOOL_NAME);
-
-        // After prioritize, skill comes first
-        super::prioritize_skill_tools(&mut deferred);
-        assert_eq!(tool_name(&deferred[0]), crate::turn::skill_tool::SKILL_TOOL_NAME);
-        assert_eq!(tool_name(&deferred[1]), "write_file");
-    }
-
     // Helper: create a channel-backed stream for async tests.
     // Wrap tokio mpsc Receiver as a futures Stream for test use.
     struct RxStream(tokio::sync::mpsc::Receiver<Result<Vec<u8>, String>>);
@@ -1102,7 +1010,8 @@ mod tests {
     ///
     /// Regression test for the bug where `split_and_defer_tools` during
     /// streaming caused CLI to wait for stream end while bridge waited for
-    /// tool result via edge callback.
+    /// tool result via edge callback. Fix: removed defer mechanism entirely;
+    /// skill exclusivity is handled server-side in agentic_loop_host.rs.
     #[tokio::test]
     async fn tool_request_executes_inline_not_deferred() {
         let (tx, rx) = test_channel();
@@ -1188,6 +1097,34 @@ mod tests {
         assert_eq!(exec_order[0], crate::turn::skill_tool::SKILL_TOOL_NAME,
             "skill should execute before bash, got: {:?}", *exec_order);
         assert_eq!(exec_order[1], "bash");
+    }
+
+    /// Tool request in trailing bytes (incomplete SSE block that only
+    /// completes via the framer's tail flush after stream EOF) must still
+    /// be executed.
+    #[tokio::test]
+    async fn tail_flush_executes_tool_request() {
+        // Send a complete text event, then a tool_request WITHOUT the
+        // trailing \n\n — it stays in the framer buffer and gets flushed
+        // as the tail blob after the stream ends.
+        let complete = sse_event("text_delta", ",\"content\":\"hi\"");
+        let partial_tool = "data: {\"type\":\"tool_request\",\"request_id\":\"t1\",\"tool\":\"bash\",\"args\":{}}";
+        let chunks: Vec<Result<Vec<u8>, String>> = vec![
+            Ok(format!("{complete}{partial_tool}").into_bytes()),
+        ];
+        let mut stream = stream::iter(chunks);
+        let mut host = RecordingSseStreamHost::new()
+            .with_tool_output("bash", "tail result");
+
+        let (result, abort) = consume_sse_stream(
+            &mut stream, &mut host,
+            std::time::Duration::from_millis(STREAM_IDLE_TIMEOUT_MS),
+        ).await;
+
+        assert!(abort.is_none());
+        assert_eq!(result.accum.full_text, "hi");
+        assert_eq!(result.tool_results.len(), 1, "tail tool_request should be executed");
+        assert_eq!(result.tool_results[0].output, "tail result");
     }
 
     /// Unhappy: idle timeout with pending deferred tools — tombstoned, no

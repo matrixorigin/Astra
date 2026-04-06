@@ -100,11 +100,9 @@ struct CliSseStreamHost<'a> {
     approval_request_tx: Option<super::chat_stream::ApprovalRequestTx>,
     /// Skill resolver for intercepting "skill" tool calls.
     skill_resolver: Option<std::sync::Arc<dyn astra_runtime::turn::skill_tool::SkillResolver>>,
-    /// Set when a skill call fires during this SSE turn. Subsequent non-skill
-    /// tool calls are deferred (returned as synthetic errors) so the model
-    /// re-evaluates after reading the skill instructions.
-    /// NOTE: never reset — host is created per-turn in `consume_turn_sse`.
-    skill_fired_this_turn: bool,
+    // skill_fired_this_turn removed: was causing infinite loops in bridge
+    // cloud loop. Server-side skill exclusivity in agentic_loop_host.rs
+    // handles this instead.
 }
 
 impl<'a> CliSseStreamHost<'a> {
@@ -130,7 +128,6 @@ impl<'a> CliSseStreamHost<'a> {
             stream_event_tx: ctx.stream_event_tx,
             approval_request_tx: ctx.approval_request_tx,
             skill_resolver: ctx.skill_resolver,
-            skill_fired_this_turn: false,
         }
     }
 
@@ -493,7 +490,6 @@ impl SseStreamHost for CliSseStreamHost<'_> {
         let output = if allowed {
             if tool == astra_runtime::turn::skill_tool::SKILL_TOOL_NAME {
                 if let Some(resolver) = &self.skill_resolver {
-                    self.skill_fired_this_turn = true;
                     astra_runtime::turn::skill_tool::execute_skill_inline(
                         resolver.as_ref(),
                         tool,
@@ -501,19 +497,8 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                     )
                     .await
                 } else {
-                    // No resolver — don't set skill_fired_this_turn so other
-                    // tools are not needlessly deferred.
                     "Error: skill resolver not available".to_string()
                 }
-            } else if self.skill_fired_this_turn {
-                // A skill was invoked earlier in this turn. This tool call was
-                // generated without seeing the skill instructions — defer it so
-                // the model re-evaluates after reading the skill content.
-                format!(
-                    "Deferred: a skill was invoked in this turn. Read the skill \
-                     instructions first, then decide whether to call `{}` again.",
-                    tool
-                )
             } else {
                 let result = self.executor.execute(tool, args).await;
                 // If the sandbox denied the operation, prompt the user for
