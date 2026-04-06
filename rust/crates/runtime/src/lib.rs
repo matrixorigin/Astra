@@ -247,15 +247,20 @@ pub use turn::{
         analytics::{
             CompactionEvent, CompactionEventType, MessageRange, PartialCompactRequest,
             PartialCompactResult, TimeBasedCompactConfig, TimeBasedTrigger, compact_partial,
-            evaluate_time_based_trigger,
+            evaluate_time_based_trigger, TurnCountCompactConfig, TurnCountTrigger,
+            evaluate_turn_count_trigger, apply_micro_compact, MICRO_COMPACT_STUB,
         },
         attachments::{
             AttachmentBuilder, FileAttachment, PlanAttachment, PostCompactAttachments,
             SkillAttachment,
         },
+        cache_diagnostics::{
+            CacheBreakCause, CacheBreakDetector, CacheBreakEvent, CacheFingerprint,
+            diff_fingerprints,
+        },
         compaction::{
-            CompactBoundary, CompactResult, CompactTrigger, compact_tiered,
-            compact_tiered_with_result, compact_with_summary,
+            CompactBoundary, CompactCircuitBreaker, CompactResult, CompactTrigger,
+            compact_tiered, compact_tiered_with_result, compact_with_summary,
         },
         history::compact_cloud_loop_history,
         iteration::{CloudLoopIterationPlan, plan_cloud_loop_iteration},
@@ -267,6 +272,11 @@ pub use turn::{
             sanitize_path_for_claude_projects,
         },
         prefilter::{CloudSkillCandidatePlan, plan_cloud_skill_candidates},
+        session_memory_extract::{
+            SessionMemoryExtractConfig, SessionMemoryState, SESSION_MEMORY_TEMPLATE,
+            build_extraction_prompt, should_extract as should_extract_session_memory,
+            write_session_memory_file,
+        },
         summary::{HttpSummaryClient, LlmConnParams, SummaryLlmClient, SummaryResponse},
     },
     complete::build_turn_complete_event,

@@ -14,8 +14,8 @@ mod system;
 
 pub use context::{
     CacheAwareEstimate, CompactConfig, CompactionTier, ContextBudget, budget_for_model,
-    compaction_tier_calibrated, estimate_str_tokens, estimate_tokens, estimate_tokens_cache_aware,
-    estimate_tokens_precise,
+    capped_output_tokens, compaction_tier_calibrated, estimate_str_tokens, estimate_tokens,
+    estimate_tokens_cache_aware, estimate_tokens_precise,
 };
 pub use extraction::{COMPACT_SUMMARY_REQUEST, MEMORY_EXTRACTOR_PROMPT, parse_extracted_facts};
 pub use skills::{

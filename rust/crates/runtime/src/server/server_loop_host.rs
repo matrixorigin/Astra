@@ -309,6 +309,28 @@ impl ServerAgenticLoopHost {
         );
         let budget_chars = budget.effective_input_limit() * 4;
 
+        // ── Micro-compact: clear old tool results before main compaction ──
+        let micro_compacted_messages = {
+            let mut msgs = state.messages.clone();
+            let tc_config = crate::turn::cloud::analytics::TurnCountCompactConfig::default();
+            if let Some(trigger) = crate::turn::cloud::analytics::evaluate_turn_count_trigger(&msgs, &tc_config) {
+                let (compacted, cleared) = crate::turn::cloud::analytics::apply_micro_compact(&msgs, &trigger.tool_ids_to_clear);
+                if cleared > 0 {
+                    eprintln!("[micro_compact] turn-count: cleared {} tool results (~{} tokens)", cleared, trigger.estimated_tokens_saved);
+                    msgs = compacted;
+                }
+            }
+            let tb_config = crate::turn::cloud::analytics::TimeBasedCompactConfig::default();
+            if let Some(trigger) = crate::turn::cloud::analytics::evaluate_time_based_trigger(&msgs, &tb_config) {
+                let (compacted, cleared) = crate::turn::cloud::analytics::apply_micro_compact(&msgs, &trigger.tool_ids_to_clear);
+                if cleared > 0 {
+                    eprintln!("[micro_compact] time-based ({}min gap): cleared {} tool results", trigger.gap_minutes, cleared);
+                    msgs = compacted;
+                }
+            }
+            msgs
+        };
+
         // Use Memoria-based compaction (async with HTTP client)
         let memoria_config = crate::turn::cloud::memoria_compact::MemoriaCompactConfig::default();
         let cwd = self.edge_profile.get("cwd").and_then(|v| v.as_str());
@@ -343,7 +365,7 @@ impl ServerAgenticLoopHost {
         );
 
         let compact_result = crate::turn::cloud::memoria_compact::compact_with_memoria(
-            &state.messages,
+            &micro_compacted_messages,
             Some(&self.session_id),
             &memoria_config,
             &memoria_params,
@@ -548,7 +570,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
 
         // ── 3. Call LLM ─────────────────────────────────────────────────
         let budget = crate::prompts::budget_for_model(Some(&model_name));
-        let max_output_tokens = (budget.model_limit as f64 * budget.output_reserve_ratio) as usize;
+        let max_output_tokens = crate::prompts::capped_output_tokens(&budget);
 
         let tool_schema_tokens: usize = self
             .edge_tools

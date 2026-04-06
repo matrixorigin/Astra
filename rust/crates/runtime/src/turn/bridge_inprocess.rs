@@ -1268,7 +1268,28 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
             // Client sends complete message history including tool role messages,
             // so we just use messages directly.
             let (merged_messages, _initial_tier) = {
-                let raw = messages.clone();
+                let mut raw = messages.clone();
+
+                // ── Micro-compact: clear old tool results before main compaction ──
+                {
+                    let tc_config = crate::turn::cloud::analytics::TurnCountCompactConfig::default();
+                    if let Some(trigger) = crate::turn::cloud::analytics::evaluate_turn_count_trigger(&raw, &tc_config) {
+                        let (compacted, cleared) = crate::turn::cloud::analytics::apply_micro_compact(&raw, &trigger.tool_ids_to_clear);
+                        if cleared > 0 {
+                            eprintln!("[micro_compact] turn-count: cleared {} tool results (~{} tokens)", cleared, trigger.estimated_tokens_saved);
+                            raw = compacted;
+                        }
+                    }
+                    let tb_config = crate::turn::cloud::analytics::TimeBasedCompactConfig::default();
+                    if let Some(trigger) = crate::turn::cloud::analytics::evaluate_time_based_trigger(&raw, &tb_config) {
+                        let (compacted, cleared) = crate::turn::cloud::analytics::apply_micro_compact(&raw, &trigger.tool_ids_to_clear);
+                        if cleared > 0 {
+                            eprintln!("[micro_compact] time-based ({}min gap): cleared {} tool results", trigger.gap_minutes, cleared);
+                            raw = compacted;
+                        }
+                    }
+                }
+
                 // Compute model budget for tier-aware compaction using cache-aware estimation.
                 // Tool schemas are cache-eligible (stable prefix), so we estimate their cost.
                 let budget = crate::prompts::budget_for_model(Some(&model_name));
@@ -1357,8 +1378,7 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
 
             let llm_started = Instant::now();
             let budget = crate::prompts::budget_for_model(Some(&model_name));
-            let max_output_tokens =
-                (budget.model_limit as f64 * budget.output_reserve_ratio) as usize;
+            let max_output_tokens = crate::prompts::capped_output_tokens(&budget);
             let ledger_wait = std::time::Duration::from_secs_f64(turn_timeout_s().max(1.0));
             let max_rounds = crate::turn::routing::max_tool_rounds();
             let round_limit: i64 = if use_e2e_llm {
@@ -1372,6 +1392,7 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
 
             let mut last_measured_prompt: Option<u64> = None;
             let mut bridge_ptl_streak: u32 = 0;
+            let mut cache_detector = crate::turn::cloud::cache_diagnostics::CacheBreakDetector::new();
 
             for round_ix in 0i64..round_limit {
                 cloud_loop_turns += 1;
@@ -1652,6 +1673,23 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
                 if let Some(p) = prompt_from_usage.filter(|&p| p > 0) {
                     last_measured_prompt = Some(p);
                     bridge_ptl_streak = 0;
+                }
+
+                // ── Cache break detection ──
+                {
+                    let sys_prompt_str = llm_messages.first()
+                        .and_then(|m| m.get("content")).and_then(Value::as_str).unwrap_or("");
+                    let tools_str = serde_json::to_string(&edge_tools).unwrap_or_default();
+                    let fp = crate::turn::cloud::cache_diagnostics::CacheFingerprint::new(
+                        sys_prompt_str, &tools_str, &model_name, &provider,
+                    );
+                    let cache_read = usage.get("cache_read")
+                        .and_then(|v| v.as_u64().or_else(|| v.as_i64().map(|i| i.max(0) as u64)))
+                        .unwrap_or(0);
+                    if let Some(event) = cache_detector.detect_break(&fp, cache_read) {
+                        let causes: Vec<String> = event.causes.iter().map(|c| c.to_string()).collect();
+                        eprintln!("[cache_diagnostics] cache break detected: {}", causes.join(", "));
+                    }
                 }
 
                 if loop_tool_calls.is_empty() {

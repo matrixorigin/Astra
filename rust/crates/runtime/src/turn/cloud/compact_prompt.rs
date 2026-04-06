@@ -7,7 +7,28 @@
 use serde_json::Value;
 
 /// System prompt used when asking the LLM to summarize conversation history.
-pub const COMPACT_SYSTEM_PROMPT: &str = "You are a conversation summarizer. Your task is to create a concise but complete summary of the conversation history provided.\n\nYour summary must preserve:\n- The user's original task/goal\n- Key decisions made and their rationale\n- Important facts discovered (file contents, search results, error messages)\n- The current state of any ongoing work\n- Open questions or blockers\n\nYour summary must omit:\n- Verbatim repetition of long tool outputs (paraphrase the key findings)\n- Conversational filler and acknowledgments\n- Superseded decisions or failed attempts (unless the failure is informative)\n\nFormat your summary with clear markdown sections covering: Task, Progress, Current State, and (if applicable) Open Questions. Be dense and factual. Assume the reader is an LLM that needs only the essentials.";
+pub const COMPACT_SYSTEM_PROMPT: &str = "You are a conversation summarizer. Create a structured summary preserving all essential context.\n\n\
+IMPORTANT: First write an <analysis> block where you reason about what to preserve. \
+Then write a <summary> block with the actual summary. The <analysis> block will be stripped.\n\n\
+## Output format\n\n\
+<analysis>\n\
+Think about: What is the user's goal? What key decisions were made? What files were touched? \
+What errors occurred? What is pending?\n\
+</analysis>\n\n\
+<summary>\n\
+### Primary Request\nThe user's original task/goal in 1-2 sentences.\n\n\
+### Key Technical Concepts\nDomain knowledge, architecture decisions, constraints discovered.\n\n\
+### Files & Code Modified\nFile paths and what changed. One bullet per file.\n\n\
+### Errors & Fixes\nErrors encountered and how they were resolved (or still open).\n\n\
+### All User Messages\nEvery user intent/instruction, preserving their exact meaning.\n\n\
+### Pending Tasks\nWhat remains to be done. Ordered by priority.\n\n\
+### Current State\nWhat was just completed. What the next step should be.\n\
+</summary>\n\n\
+## Rules\n\
+- Be dense and factual. No filler.\n\
+- Paraphrase tool outputs, don't reproduce verbatim.\n\
+- Omit superseded decisions unless the failure is informative.\n\
+- The reader is an LLM that needs only the essentials.";
 
 /// Build the user message that presents the conversation history for summarization.
 pub fn build_compact_user_prompt(conversation_text: &str) -> String {
@@ -82,6 +103,45 @@ pub fn render_messages_for_summary(messages: &[serde_json::Value]) -> String {
         }
     }
     out
+}
+
+/// Strip `<analysis>...</analysis>` and extract content from `<summary>...</summary>`.
+///
+/// Falls back to the full input if no `<summary>` tags are found.
+pub fn strip_analysis_block(raw: &str) -> String {
+    if let Some(start) = raw.find("<summary>") {
+        let after_tag = start + "<summary>".len();
+        let end = raw[after_tag..]
+            .find("</summary>")
+            .map(|e| after_tag + e)
+            .unwrap_or(raw.len());
+        return raw[after_tag..end].trim().to_string();
+    }
+    let mut result = raw.to_string();
+    while let Some(start) = result.find("<analysis>") {
+        let end = result[start..]
+            .find("</analysis>")
+            .map(|e| start + e + "</analysis>".len())
+            .unwrap_or(result.len());
+        result = format!("{}{}", &result[..start], &result[end..]);
+    }
+    result.trim().to_string()
+}
+
+/// Strip analysis block and validate structured section headers.
+///
+/// If the summary lacks key section headers, prepends a warning so the LLM
+/// (on the next turn) knows the summary may be incomplete.
+pub fn format_structured_summary(raw: &str) -> String {
+    let summary = strip_analysis_block(raw);
+    const REQUIRED: &[&str] = &["### Primary Request", "### Pending Tasks", "### Current State"];
+    let missing: Vec<&&str> = REQUIRED.iter().filter(|h| !summary.contains(**h)).collect();
+    if missing.is_empty() {
+        summary
+    } else {
+        let names: Vec<&str> = missing.iter().map(|s| **s).collect();
+        format!("[compact warning: missing sections: {}]\n\n{}", names.join(", "), summary)
+    }
 }
 
 /// Strip inline media / huge base64 from text before sending history to the summary LLM.
@@ -353,5 +413,46 @@ mod tests {
     #[test]
     fn scrub_string_empty() {
         assert!(scrub_string_for_summary("").is_empty());
+    }
+
+    #[test]
+    fn strip_analysis_removes_thinking() {
+        let input = "<analysis>thinking here</analysis>\n<summary>the real content</summary>";
+        assert_eq!(strip_analysis_block(input), "the real content");
+    }
+
+    #[test]
+    fn strip_analysis_fallback_no_tags() {
+        assert_eq!(strip_analysis_block("just plain text"), "just plain text");
+    }
+
+    #[test]
+    fn strip_analysis_only_removes_analysis() {
+        let input = "<analysis>drop this</analysis>\nkeep this part";
+        assert_eq!(strip_analysis_block(input), "keep this part");
+    }
+
+    #[test]
+    fn format_structured_summary_preserves_sections() {
+        let input = "<analysis>x</analysis><summary>### Primary Request\nDo stuff\n### Pending Tasks\nMore\n### Current State\nDone</summary>";
+        let result = format_structured_summary(input);
+        assert!(result.contains("### Primary Request"));
+        assert!(result.contains("### Pending Tasks"));
+        assert!(result.contains("### Current State"));
+        assert!(!result.contains("[compact warning"));
+    }
+
+    #[test]
+    fn format_structured_summary_warns_on_missing_sections() {
+        let input = "<summary>### Primary Request\nDo stuff</summary>";
+        let result = format_structured_summary(input);
+        assert!(result.contains("[compact warning"));
+        assert!(result.contains("### Pending Tasks"));
+    }
+
+    #[test]
+    fn compact_system_prompt_has_analysis_instruction() {
+        assert!(COMPACT_SYSTEM_PROMPT.contains("<analysis>"));
+        assert!(COMPACT_SYSTEM_PROMPT.contains("<summary>"));
     }
 }

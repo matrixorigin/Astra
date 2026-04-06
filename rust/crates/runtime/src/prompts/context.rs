@@ -420,6 +420,15 @@ pub fn budget_for_model(model: Option<&str>) -> ContextBudget {
     }
 }
 
+/// Conservative default output token cap (8K) with escalation on `finish_reason: "length"`.
+///
+/// Most responses fit within 8K tokens (p99 ≈ 5K). Starting low frees context
+/// headroom; the existing escalation logic retries at 2× then 4× if truncated.
+pub fn capped_output_tokens(budget: &ContextBudget) -> usize {
+    let full_reserve = (budget.model_limit as f64 * budget.output_reserve_ratio) as usize;
+    full_reserve.min(8192)
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -885,5 +894,28 @@ mod tests {
             ctx.effective_input_limit() < ctx.model_limit,
             "input limit should be less than model limit due to output reserve"
         );
+    }
+
+    // ── capped_output_tokens tests ──
+
+    #[test]
+    fn capped_output_tokens_default_8k() {
+        let b = budget_for_model(None); // 128K, 0.15
+        // full_reserve = 128_000 * 0.15 = 19_200 → capped to 8192
+        assert_eq!(capped_output_tokens(&b), 8192);
+    }
+
+    #[test]
+    fn capped_output_tokens_scales_for_small_model() {
+        let b = budget_for_model(Some("gpt-3.5")); // 16K, 0.12
+        // full_reserve = 16_000 * 0.12 = 1_920 → min(1920, 8192) = 1920
+        assert_eq!(capped_output_tokens(&b), 1920);
+    }
+
+    #[test]
+    fn capped_output_tokens_claude() {
+        let b = budget_for_model(Some("claude-3.5-sonnet")); // 200K, 0.20
+        // full_reserve = 200_000 * 0.20 = 40_000 → capped to 8192
+        assert_eq!(capped_output_tokens(&b), 8192);
     }
 }

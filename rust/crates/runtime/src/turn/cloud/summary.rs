@@ -88,7 +88,7 @@ pub async fn generate_compact_summary(
 
         match client.summarize(&prompt_messages).await {
             Ok(resp) if !resp.is_ptl_error => {
-                return Some(resp.text);
+                return Some(super::compact_prompt::format_structured_summary(&resp.text));
             }
             Ok(resp) if resp.is_ptl_error => {
                 if attempt >= MAX_PTL_RETRIES {
@@ -321,19 +321,21 @@ pub mod tests {
 
     #[tokio::test]
     async fn success_on_first_attempt() {
-        let client = MockSummaryClient::success("## Task\nDoing stuff");
+        let body = "### Primary Request\nDoing stuff\n### Pending Tasks\nNone\n### Current State\nDone";
+        let client = MockSummaryClient::success(body);
         let msgs = make_messages(3);
         let result = generate_compact_summary(&msgs, &client).await;
-        assert_eq!(result.as_deref(), Some("## Task\nDoing stuff"));
+        assert_eq!(result.as_deref(), Some(body));
         assert_eq!(client.call_count.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
     async fn ptl_retry_drops_oldest_round_and_succeeds() {
-        let client = MockSummaryClient::ptl_then_success("## Summary");
+        let body = "### Primary Request\nX\n### Pending Tasks\nY\n### Current State\nZ";
+        let client = MockSummaryClient::ptl_then_success(body);
         let msgs = make_messages(4); // 4 rounds, enough to drop one
         let result = generate_compact_summary(&msgs, &client).await;
-        assert_eq!(result.as_deref(), Some("## Summary"));
+        assert_eq!(result.as_deref(), Some(body));
         assert_eq!(client.call_count.load(Ordering::SeqCst), 2);
     }
 

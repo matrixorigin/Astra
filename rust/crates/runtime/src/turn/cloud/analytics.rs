@@ -214,9 +214,9 @@ pub struct TimeBasedCompactConfig {
 impl Default for TimeBasedCompactConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: true,
             gap_threshold_minutes: 30,
-            keep_recent: 5,
+            keep_recent: 3,
         }
     }
 }
@@ -266,46 +266,143 @@ pub fn evaluate_time_based_trigger(
 }
 
 /// Find the timestamp of the last assistant message.
+///
+/// Checks `timestamp`, `metadata.created_at`, and `metadata.timestamp` fields.
 fn find_last_assistant_timestamp(messages: &[Value]) -> Option<u64> {
     for msg in messages.iter().rev() {
-        if msg.get("role").and_then(Value::as_str) == Some("assistant") {
-            // Try to extract timestamp from message metadata
-            if let Some(ts) = msg.get("timestamp").and_then(Value::as_u64) {
-                return Some(ts);
-            }
-            // Fallback: estimate from message position (not ideal)
-            return None;
+        if msg.get("role").and_then(Value::as_str) != Some("assistant") {
+            continue;
         }
+        if let Some(ts) = msg.get("timestamp").and_then(Value::as_u64) {
+            return Some(ts);
+        }
+        if let Some(meta) = msg.get("metadata") {
+            for key in ["created_at", "timestamp"] {
+                if let Some(ts) = meta.get(key).and_then(Value::as_u64) {
+                    return Some(ts);
+                }
+            }
+        }
+        return None;
     }
     None
 }
 
-/// Find tool result IDs that can be cleared.
-fn find_clearable_tool_results(messages: &[Value], keep_recent: usize) -> (Vec<String>, usize) {
-    let mut tool_results: Vec<(String, usize)> = Vec::new();
-
-    for msg in messages {
-        if msg.get("role").and_then(Value::as_str) == Some("tool")
-            && let Some(id) = msg.get("tool_call_id").and_then(Value::as_str)
-        {
-            let content_len = msg
+/// Collect all tool results as `(tool_call_id, estimated_tokens)` pairs.
+fn collect_tool_results(messages: &[Value]) -> Vec<(String, usize)> {
+    messages
+        .iter()
+        .filter_map(|msg| {
+            if msg.get("role").and_then(Value::as_str) != Some("tool") {
+                return None;
+            }
+            let id = msg.get("tool_call_id").and_then(Value::as_str)?;
+            let tokens = msg
                 .get("content")
                 .and_then(Value::as_str)
-                .map(|s| s.len())
+                .map(|s| crate::prompts::estimate_str_tokens(s))
                 .unwrap_or(0);
-            let tokens = crate::prompts::estimate_str_tokens(&"x".repeat(content_len));
-            tool_results.push((id.to_string(), tokens));
-        }
-    }
+            Some((id.to_string(), tokens))
+        })
+        .collect()
+}
 
-    // Keep the most recent `keep_recent` tool results
+/// Split tool results into (clearable_ids, estimated_tokens_saved), keeping recent.
+fn split_clearable(tool_results: Vec<(String, usize)>, keep_recent: usize) -> (Vec<String>, usize) {
     let clearable_count = tool_results.len().saturating_sub(keep_recent);
     let clearable: Vec<_> = tool_results.into_iter().take(clearable_count).collect();
-
     let total_tokens: usize = clearable.iter().map(|(_, t)| t).sum();
     let ids: Vec<String> = clearable.into_iter().map(|(id, _)| id).collect();
-
     (ids, total_tokens)
+}
+
+/// Find tool result IDs that can be cleared (oldest first, keeping recent).
+fn find_clearable_tool_results(messages: &[Value], keep_recent: usize) -> (Vec<String>, usize) {
+    split_clearable(collect_tool_results(messages), keep_recent)
+}
+
+/// Stub text replacing cleared tool results.
+pub const MICRO_COMPACT_STUB: &str = "[tool result cleared \u{2014} re-run if needed]";
+
+// ---------------------------------------------------------------------------
+// Turn-Count-Based Micro-Compaction
+// ---------------------------------------------------------------------------
+
+/// Configuration for turn-count-based microcompaction.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TurnCountCompactConfig {
+    pub enabled: bool,
+    pub trigger_threshold: usize,
+    pub keep_recent: usize,
+}
+
+impl Default for TurnCountCompactConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            trigger_threshold: 8,
+            keep_recent: 3,
+        }
+    }
+}
+
+/// Trigger data for turn-count-based compaction.
+#[derive(Debug, Clone)]
+pub struct TurnCountTrigger {
+    pub total_tool_results: usize,
+    pub tool_ids_to_clear: Vec<String>,
+    pub estimated_tokens_saved: usize,
+}
+
+/// Evaluate whether turn-count-based compaction should trigger.
+pub fn evaluate_turn_count_trigger(
+    messages: &[Value],
+    config: &TurnCountCompactConfig,
+) -> Option<TurnCountTrigger> {
+    if !config.enabled {
+        return None;
+    }
+    let tool_results = collect_tool_results(messages);
+    let total = tool_results.len();
+    if total < config.trigger_threshold + config.keep_recent {
+        return None;
+    }
+    let (ids, total_tokens) = split_clearable(tool_results, config.keep_recent);
+    if ids.is_empty() {
+        return None;
+    }
+    Some(TurnCountTrigger {
+        total_tool_results: total,
+        tool_ids_to_clear: ids,
+        estimated_tokens_saved: total_tokens,
+    })
+}
+
+/// Apply micro-compaction by replacing tool result content for the given IDs.
+pub fn apply_micro_compact(messages: &[Value], tool_ids_to_clear: &[String]) -> (Vec<Value>, usize) {
+    if tool_ids_to_clear.is_empty() {
+        return (messages.to_vec(), 0);
+    }
+    let clear_set: std::collections::HashSet<&str> =
+        tool_ids_to_clear.iter().map(|s| s.as_str()).collect();
+    let mut cleared = 0usize;
+    let result = messages
+        .iter()
+        .map(|msg| {
+            if msg.get("role").and_then(Value::as_str) != Some("tool") {
+                return msg.clone();
+            }
+            let id = msg.get("tool_call_id").and_then(Value::as_str).unwrap_or("");
+            if !clear_set.contains(id) {
+                return msg.clone();
+            }
+            cleared += 1;
+            let mut m = msg.clone();
+            m["content"] = Value::String(MICRO_COMPACT_STUB.to_string());
+            m
+        })
+        .collect();
+    (result, cleared)
 }
 
 // ---------------------------------------------------------------------------
@@ -578,9 +675,9 @@ mod tests {
     #[test]
     fn time_based_config_defaults() {
         let config = TimeBasedCompactConfig::default();
-        assert!(!config.enabled);
+        assert!(config.enabled);
         assert_eq!(config.gap_threshold_minutes, 30);
-        assert_eq!(config.keep_recent, 5);
+        assert_eq!(config.keep_recent, 3);
     }
 
     #[test]
@@ -641,5 +738,112 @@ mod tests {
         assert!(!result.compacted_ranges.is_empty());
         // Post tokens should be less than pre
         assert!(result.post_tokens <= result.pre_tokens);
+    }
+
+    // ── Time-based micro-compact ──
+
+    #[test]
+    fn time_based_trigger_fires_after_gap() {
+        let old_ts = chrono::Utc::now().timestamp() as u64 - 2700; // 45 min ago
+        let messages = vec![
+            json!({"role": "user", "content": "hi"}),
+            json!({"role": "assistant", "content": "hello", "timestamp": old_ts}),
+            json!({"role": "tool", "tool_call_id": "c1", "content": "r1"}),
+            json!({"role": "tool", "tool_call_id": "c2", "content": "r2"}),
+            json!({"role": "tool", "tool_call_id": "c3", "content": "r3"}),
+            json!({"role": "tool", "tool_call_id": "c4", "content": "r4"}),
+        ];
+        let t = evaluate_time_based_trigger(&messages, &TimeBasedCompactConfig::default()).unwrap();
+        assert!(t.gap_minutes >= 44);
+        assert_eq!(t.tool_ids_to_clear.len(), 1); // 4 - keep_recent(3)
+    }
+
+    #[test]
+    fn time_based_trigger_skips_short_gap() {
+        let recent_ts = chrono::Utc::now().timestamp() as u64 - 300;
+        let messages = vec![
+            json!({"role": "assistant", "content": "hi", "timestamp": recent_ts}),
+            json!({"role": "tool", "tool_call_id": "c1", "content": "x".repeat(5000)}),
+        ];
+        assert!(evaluate_time_based_trigger(&messages, &TimeBasedCompactConfig::default()).is_none());
+    }
+
+    #[test]
+    fn time_based_fallback_without_timestamps() {
+        let messages = vec![
+            json!({"role": "assistant", "content": "no ts"}),
+            json!({"role": "tool", "tool_call_id": "c1", "content": "data"}),
+        ];
+        assert!(evaluate_time_based_trigger(&messages, &TimeBasedCompactConfig::default()).is_none());
+    }
+
+    #[test]
+    fn find_timestamp_checks_metadata() {
+        let msgs = vec![json!({"role": "assistant", "content": "a", "metadata": {"created_at": 1000u64}})];
+        assert_eq!(find_last_assistant_timestamp(&msgs), Some(1000));
+    }
+
+    // ── Turn-count micro-compact ──
+
+    #[test]
+    fn turn_count_trigger_fires_at_threshold() {
+        let messages: Vec<Value> = (0..12)
+            .map(|i| json!({"role": "tool", "tool_call_id": format!("c{i}"), "content": "data"}))
+            .collect();
+        let config = TurnCountCompactConfig { enabled: true, trigger_threshold: 8, keep_recent: 3 };
+        let t = evaluate_turn_count_trigger(&messages, &config).unwrap();
+        assert_eq!(t.total_tool_results, 12);
+        assert_eq!(t.tool_ids_to_clear.len(), 9);
+    }
+
+    #[test]
+    fn turn_count_trigger_preserves_recent() {
+        let messages: Vec<Value> = (0..12)
+            .map(|i| json!({"role": "tool", "tool_call_id": format!("c{i}"), "content": "data"}))
+            .collect();
+        let t = evaluate_turn_count_trigger(&messages, &TurnCountCompactConfig::default()).unwrap();
+        assert!(!t.tool_ids_to_clear.contains(&"c9".to_string()));
+        assert!(!t.tool_ids_to_clear.contains(&"c10".to_string()));
+        assert!(!t.tool_ids_to_clear.contains(&"c11".to_string()));
+    }
+
+    #[test]
+    fn turn_count_below_threshold_no_trigger() {
+        let messages: Vec<Value> = (0..5)
+            .map(|i| json!({"role": "tool", "tool_call_id": format!("c{i}"), "content": "data"}))
+            .collect();
+        assert!(evaluate_turn_count_trigger(&messages, &TurnCountCompactConfig::default()).is_none());
+    }
+
+    // ── apply_micro_compact ──
+
+    #[test]
+    fn apply_micro_compact_replaces_content() {
+        let messages = vec![
+            json!({"role": "user", "content": "hi"}),
+            json!({"role": "tool", "tool_call_id": "c1", "content": "big data"}),
+            json!({"role": "tool", "tool_call_id": "c2", "content": "keep"}),
+        ];
+        let (result, cleared) = apply_micro_compact(&messages, &["c1".to_string()]);
+        assert_eq!(cleared, 1);
+        assert_eq!(result[1]["content"].as_str().unwrap(), MICRO_COMPACT_STUB);
+        assert_eq!(result[2]["content"].as_str().unwrap(), "keep");
+    }
+
+    #[test]
+    fn micro_compact_token_savings() {
+        let big = "x".repeat(4000);
+        let messages = vec![json!({"role": "tool", "tool_call_id": "c1", "content": big})];
+        let (result, cleared) = apply_micro_compact(&messages, &["c1".to_string()]);
+        assert_eq!(cleared, 1);
+        assert_eq!(result[0]["content"].as_str().unwrap(), MICRO_COMPACT_STUB);
+    }
+
+    #[test]
+    fn apply_micro_compact_empty_ids_noop() {
+        let messages = vec![json!({"role": "tool", "tool_call_id": "c1", "content": "data"})];
+        let (result, cleared) = apply_micro_compact(&messages, &[]);
+        assert_eq!(cleared, 0);
+        assert_eq!(result, messages);
     }
 }
