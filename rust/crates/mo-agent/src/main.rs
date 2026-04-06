@@ -413,6 +413,9 @@ pub(crate) struct PartialTurnData {
     #[allow(dead_code)]
     pub session_id: Option<String>,
     pub last_heavy_checkpoint: Option<astra_runtime::pipeline::step_protocol::StepCheckpoint>,
+    /// Partial text the model generated before the turn was interrupted.
+    /// Preserved in conversation history so the next turn has context.
+    pub partial_text: String,
 }
 
 /// A turn failure that carries partial data for post-mortem analysis.

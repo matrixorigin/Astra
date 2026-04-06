@@ -273,6 +273,7 @@ pub(crate) async fn stream_chat_sse(
                 tool_health_export: state.turn_guard.health.export_merged(p.tool_health_entries),
                 session_id: state.current_session_id.clone(),
                 last_heavy_checkpoint: state.last_heavy_checkpoint.take(),
+                partial_text: std::mem::take(&mut state.final_text),
             },
         });
     }

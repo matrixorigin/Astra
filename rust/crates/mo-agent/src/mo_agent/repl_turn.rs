@@ -1014,7 +1014,7 @@ fn initialize_journal(state: &mut ReplState, session_id: &str) {
 
 /// Report a turn failure with enriched partial data from the agentic loop.
 fn report_turn_failure(
-    state: &ReplState,
+    state: &mut ReplState,
     line: &str,
     failure: &crate::TurnFailure,
     turn_start: Instant,
@@ -1070,6 +1070,19 @@ fn report_turn_failure(
 
         let _ = journal.append(&err_event);
         enqueue_ingestion(state, &err_event);
+    }
+
+    // Preserve partial text in conversation history so the next turn has
+    // context about what the model already did before the interruption.
+    if !failure.partial.partial_text.is_empty() {
+        let partial_with_note = format!(
+            "[Interrupted: {}]\n\n{}",
+            failure.error, failure.partial.partial_text
+        );
+        state
+            .history
+            .push((line.to_string(), partial_with_note));
+        state.last_response = Some(failure.partial.partial_text.clone());
     }
 }
 
