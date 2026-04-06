@@ -94,3 +94,103 @@ pub fn plan_cloud_loop_iteration_ext(
         history_message,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn tool_call(name: &str, id: &str) -> Value {
+        json!({"id": id, "function": {"name": name, "arguments": "{}"}})
+    }
+
+    fn cloud_names(names: &[&str]) -> BTreeSet<String> {
+        names.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn empty_tool_calls() {
+        let plan = plan_cloud_loop_iteration(&[], &cloud_names(&["web"]), "hello", None);
+        assert!(plan.cloud_tool_calls.is_empty());
+        assert!(plan.edge_tool_calls.is_empty());
+        assert!(plan.assistant_message.is_none());
+        assert!(plan.history_message.is_none());
+    }
+
+    #[test]
+    fn all_edge_tools() {
+        let tools = vec![tool_call("bash", "1"), tool_call("read", "2")];
+        let plan = plan_cloud_loop_iteration(&tools, &cloud_names(&["web"]), "", None);
+        assert!(plan.cloud_tool_calls.is_empty());
+        assert_eq!(plan.edge_tool_calls.len(), 2);
+        assert!(plan.assistant_message.is_none());
+    }
+
+    #[test]
+    fn all_cloud_tools() {
+        let tools = vec![tool_call("web", "1")];
+        let plan = plan_cloud_loop_iteration(&tools, &cloud_names(&["web"]), "", None);
+        assert_eq!(plan.cloud_tool_calls.len(), 1);
+        assert!(plan.edge_tool_calls.is_empty());
+        assert!(plan.assistant_message.is_some());
+        assert!(plan.history_message.is_some());
+    }
+
+    #[test]
+    fn mixed_tools_split_correctly() {
+        let tools = vec![tool_call("web", "1"), tool_call("bash", "2"), tool_call("web", "3")];
+        let plan = plan_cloud_loop_iteration(&tools, &cloud_names(&["web"]), "", None);
+        assert_eq!(plan.cloud_tool_calls.len(), 2);
+        assert_eq!(plan.edge_tool_calls.len(), 1);
+    }
+
+    #[test]
+    fn text_included_in_assistant_message() {
+        let tools = vec![tool_call("web", "1")];
+        let plan = plan_cloud_loop_iteration(&tools, &cloud_names(&["web"]), "thinking aloud", None);
+        let msg = plan.assistant_message.unwrap();
+        assert_eq!(msg["content"].as_str().unwrap(), "thinking aloud");
+    }
+
+    #[test]
+    fn empty_text_not_included() {
+        let tools = vec![tool_call("web", "1")];
+        let plan = plan_cloud_loop_iteration(&tools, &cloud_names(&["web"]), "", None);
+        let msg = plan.assistant_message.unwrap();
+        assert!(msg.get("content").is_none());
+    }
+
+    #[test]
+    fn reasoning_included_when_present() {
+        let tools = vec![tool_call("web", "1")];
+        let plan = plan_cloud_loop_iteration(&tools, &cloud_names(&["web"]), "", Some("because"));
+        let msg = plan.assistant_message.unwrap();
+        assert_eq!(msg["reasoning_content"].as_str().unwrap(), "because");
+    }
+
+    #[test]
+    fn reasoning_empty_string_not_included() {
+        let tools = vec![tool_call("web", "1")];
+        let plan = plan_cloud_loop_iteration(&tools, &cloud_names(&["web"]), "", Some(""));
+        let msg = plan.assistant_message.unwrap();
+        assert!(msg.get("reasoning_content").is_none());
+    }
+
+    #[test]
+    fn force_reasoning_adds_empty_string() {
+        let tools = vec![tool_call("web", "1")];
+        let plan = plan_cloud_loop_iteration_ext(&tools, &cloud_names(&["web"]), "", None, true);
+        let msg = plan.assistant_message.unwrap();
+        assert_eq!(msg["reasoning_content"].as_str().unwrap(), "");
+        let hist = plan.history_message.unwrap();
+        assert_eq!(hist["reasoning_content"].as_str().unwrap(), "");
+    }
+
+    #[test]
+    fn history_message_has_null_content() {
+        let tools = vec![tool_call("web", "1")];
+        let plan = plan_cloud_loop_iteration(&tools, &cloud_names(&["web"]), "", None);
+        let hist = plan.history_message.unwrap();
+        assert!(hist["content"].is_null());
+    }
+}

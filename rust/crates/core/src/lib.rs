@@ -96,3 +96,84 @@ pub fn bearer_token(headers: &HeaderMap) -> Result<&str, (StatusCode, Json<Error
         .filter(|value| !value.is_empty())
         .ok_or_else(|| error_response(StatusCode::UNAUTHORIZED, "Not authenticated"))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- error_response ---
+
+    #[test]
+    fn error_response_status_and_detail() {
+        let (status, Json(body)) = error_response(StatusCode::BAD_REQUEST, "bad input");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body.detail, "bad input");
+    }
+
+    #[test]
+    fn error_response_from_string() {
+        let (status, Json(body)) = error_response(StatusCode::NOT_FOUND, String::from("missing"));
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body.detail, "missing");
+    }
+
+    // --- internal_error ---
+
+    #[test]
+    fn internal_error_wraps_to_string() {
+        let (status, Json(body)) = internal_error("db failed");
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body.detail, "db failed");
+    }
+
+    #[test]
+    fn internal_error_from_io_error() {
+        let err = std::io::Error::new(std::io::ErrorKind::NotFound, "file gone");
+        let (status, _) = internal_error(err);
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    // --- current_unix_seconds ---
+
+    #[test]
+    fn current_unix_seconds_positive() {
+        let ts = current_unix_seconds();
+        assert!(ts > 1_700_000_000.0); // after 2023
+    }
+
+    // --- bearer_token ---
+
+    #[test]
+    fn bearer_token_valid() {
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "Bearer abc123".parse().unwrap());
+        assert_eq!(bearer_token(&headers).ok(), Some("abc123"));
+    }
+
+    #[test]
+    fn bearer_token_missing_header() {
+        let headers = HeaderMap::new();
+        assert!(bearer_token(&headers).is_err());
+    }
+
+    #[test]
+    fn bearer_token_wrong_prefix() {
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "Basic abc".parse().unwrap());
+        assert!(bearer_token(&headers).is_err());
+    }
+
+    #[test]
+    fn bearer_token_empty_after_prefix() {
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "Bearer ".parse().unwrap());
+        assert!(bearer_token(&headers).is_err());
+    }
+
+    #[test]
+    fn bearer_token_with_spaces() {
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "Bearer token with spaces".parse().unwrap());
+        assert_eq!(bearer_token(&headers).ok(), Some("token with spaces"));
+    }
+}
