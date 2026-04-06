@@ -1550,4 +1550,234 @@ mod tests {
         let result = take_bridge_tail_update_args(&mut map).unwrap();
         assert_eq!(result.get("full_text").unwrap(), &json!(null));
     }
+
+    // ──────────────────────────────────────────────────────────
+    // truncate_text
+    // ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn truncate_text_empty_string() {
+        assert_eq!(truncate_text("", 10), "");
+    }
+
+    #[test]
+    fn truncate_text_within_limit() {
+        assert_eq!(truncate_text("hello", 10), "hello");
+    }
+
+    #[test]
+    fn truncate_text_at_limit() {
+        assert_eq!(truncate_text("hello", 5), "hello");
+    }
+
+    #[test]
+    fn truncate_text_exceeds_limit() {
+        assert_eq!(truncate_text("hello world", 5), "hello");
+    }
+
+    #[test]
+    fn truncate_text_zero_limit() {
+        assert_eq!(truncate_text("anything", 0), "");
+    }
+
+    #[test]
+    fn truncate_text_unicode() {
+        let result = truncate_text("你好世界", 2);
+        assert_eq!(result, "你好");
+    }
+
+    // ──────────────────────────────────────────────────────────
+    // optional_object_str
+    // ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn optional_object_str_present_string() {
+        let map = to_map(json!({"key": "value"}));
+        assert_eq!(optional_object_str(&map, "key"), Some("value"));
+    }
+
+    #[test]
+    fn optional_object_str_missing_key() {
+        let map = to_map(json!({"other": "val"}));
+        assert_eq!(optional_object_str(&map, "key"), None);
+    }
+
+    #[test]
+    fn optional_object_str_non_string_value() {
+        let map = to_map(json!({"key": 42}));
+        assert_eq!(optional_object_str(&map, "key"), None);
+    }
+
+    #[test]
+    fn optional_object_str_null_value() {
+        let map = to_map(json!({"key": null}));
+        assert_eq!(optional_object_str(&map, "key"), None);
+    }
+
+    #[test]
+    fn optional_object_str_empty_string() {
+        let map = to_map(json!({"key": ""}));
+        assert_eq!(optional_object_str(&map, "key"), Some(""));
+    }
+
+    // ──────────────────────────────────────────────────────────
+    // optional_object_value
+    // ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn optional_object_value_present() {
+        let map = to_map(json!({"key": 42}));
+        assert_eq!(optional_object_value(&map, "key"), Some(json!(42)));
+    }
+
+    #[test]
+    fn optional_object_value_missing() {
+        let map = to_map(json!({"other": 1}));
+        assert_eq!(optional_object_value(&map, "key"), None);
+    }
+
+    #[test]
+    fn optional_object_value_null_filtered() {
+        let map = to_map(json!({"key": null}));
+        assert_eq!(optional_object_value(&map, "key"), None);
+    }
+
+    #[test]
+    fn optional_object_value_false_not_filtered() {
+        let map = to_map(json!({"key": false}));
+        assert_eq!(optional_object_value(&map, "key"), Some(json!(false)));
+    }
+
+    // ──────────────────────────────────────────────────────────
+    // object_array
+    // ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn object_array_valid() {
+        let map = to_map(json!({"items": [1, 2, 3]}));
+        assert_eq!(object_array(&map, "items"), vec![json!(1), json!(2), json!(3)]);
+    }
+
+    #[test]
+    fn object_array_missing_key() {
+        let map = to_map(json!({"other": 1}));
+        assert!(object_array(&map, "items").is_empty());
+    }
+
+    #[test]
+    fn object_array_not_array() {
+        let map = to_map(json!({"items": "not an array"}));
+        assert!(object_array(&map, "items").is_empty());
+    }
+
+    #[test]
+    fn object_array_null() {
+        let map = to_map(json!({"items": null}));
+        assert!(object_array(&map, "items").is_empty());
+    }
+
+    #[test]
+    fn object_array_empty_array() {
+        let map = to_map(json!({"items": []}));
+        assert!(object_array(&map, "items").is_empty());
+    }
+
+    // ──────────────────────────────────────────────────────────
+    // object_array_maps
+    // ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn object_array_maps_valid() {
+        let map = to_map(json!({"items": [{"a": 1}, {"b": 2}]}));
+        let result = object_array_maps(&map, "items");
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0]["a"], json!(1));
+    }
+
+    #[test]
+    fn object_array_maps_filters_non_objects() {
+        let map = to_map(json!({"items": [{"a": 1}, "string", 42, null]}));
+        let result = object_array_maps(&map, "items");
+        assert_eq!(result.len(), 1); // Only the object survives
+    }
+
+    #[test]
+    fn object_array_maps_missing_key() {
+        let map = to_map(json!({"other": 1}));
+        assert!(object_array_maps(&map, "items").is_empty());
+    }
+
+    #[test]
+    fn object_array_maps_not_array() {
+        let map = to_map(json!({"items": {"nested": true}}));
+        assert!(object_array_maps(&map, "items").is_empty());
+    }
+
+    // ──────────────────────────────────────────────────────────
+    // first_user_content
+    // ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn first_user_content_found() {
+        let msgs = vec![
+            json!({"role": "system", "content": "You are a helper"}),
+            json!({"role": "user", "content": "Hello"}),
+        ];
+        assert_eq!(first_user_content(&msgs), Some("Hello"));
+    }
+
+    #[test]
+    fn first_user_content_no_user() {
+        let msgs = vec![json!({"role": "assistant", "content": "Hi"})];
+        assert_eq!(first_user_content(&msgs), None);
+    }
+
+    #[test]
+    fn first_user_content_empty_content_skipped() {
+        let msgs = vec![
+            json!({"role": "user", "content": ""}),
+            json!({"role": "user", "content": "Real message"}),
+        ];
+        assert_eq!(first_user_content(&msgs), Some("Real message"));
+    }
+
+    #[test]
+    fn first_user_content_non_string_content() {
+        let msgs = vec![json!({"role": "user", "content": 42})];
+        assert_eq!(first_user_content(&msgs), None);
+    }
+
+    #[test]
+    fn first_user_content_empty_messages() {
+        assert_eq!(first_user_content(&[]), None);
+    }
+
+    // ──────────────────────────────────────────────────────────
+    // latest_assistant_content
+    // ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn latest_assistant_content_picks_last() {
+        let msgs = vec![
+            json!({"role": "assistant", "content": "First"}),
+            json!({"role": "user", "content": "Q"}),
+            json!({"role": "assistant", "content": "Second"}),
+        ];
+        assert_eq!(latest_assistant_content(&msgs), Some("Second"));
+    }
+
+    #[test]
+    fn latest_assistant_content_no_assistant() {
+        let msgs = vec![json!({"role": "user", "content": "Q"})];
+        assert_eq!(latest_assistant_content(&msgs), None);
+    }
+
+    #[test]
+    fn latest_assistant_content_empty_skipped() {
+        let msgs = vec![
+            json!({"role": "assistant", "content": "First"}),
+            json!({"role": "assistant", "content": ""}),
+        ];
+        assert_eq!(latest_assistant_content(&msgs), Some("First"));
+    }
 }

@@ -877,4 +877,195 @@ mod tests {
             "flushed assistant tool-call message must carry reasoning_content"
         );
     }
+
+    // ──────────────────────────────────────────────────────────
+    // json_stringify
+    // ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn json_stringify_object() {
+        let v = json!({"a": 1});
+        let s = json_stringify(&v);
+        assert!(s.contains("\"a\""));
+        assert!(s.contains('1'));
+    }
+
+    #[test]
+    fn json_stringify_string() {
+        let v = json!("hello");
+        assert_eq!(json_stringify(&v), "\"hello\"");
+    }
+
+    #[test]
+    fn json_stringify_null() {
+        assert_eq!(json_stringify(&Value::Null), "null");
+    }
+
+    // ──────────────────────────────────────────────────────────
+    // parsed_object
+    // ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn parsed_object_valid_json() {
+        let map = parsed_object(r#"{"key": "value"}"#);
+        assert_eq!(map.get("key").unwrap(), "value");
+    }
+
+    #[test]
+    fn parsed_object_invalid_json() {
+        let map = parsed_object("not json");
+        assert!(map.is_empty());
+    }
+
+    #[test]
+    fn parsed_object_json_array() {
+        // Array is valid JSON but not an object
+        let map = parsed_object("[1, 2, 3]");
+        assert!(map.is_empty());
+    }
+
+    #[test]
+    fn parsed_object_empty_string() {
+        let map = parsed_object("");
+        assert!(map.is_empty());
+    }
+
+    #[test]
+    fn parsed_object_json_string() {
+        let map = parsed_object("\"hello\"");
+        assert!(map.is_empty());
+    }
+
+    // ──────────────────────────────────────────────────────────
+    // parsed_metadata
+    // ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn parsed_metadata_object() {
+        let map = parsed_metadata(Some(json!({"tool_call_id": "tc1"})));
+        assert_eq!(map.get("tool_call_id").unwrap(), "tc1");
+    }
+
+    #[test]
+    fn parsed_metadata_string_json() {
+        let map = parsed_metadata(Some(json!(r#"{"tool_call_id": "tc2"}"#)));
+        assert_eq!(map.get("tool_call_id").unwrap(), "tc2");
+    }
+
+    #[test]
+    fn parsed_metadata_invalid_string() {
+        let map = parsed_metadata(Some(json!("not json")));
+        assert!(map.is_empty());
+    }
+
+    #[test]
+    fn parsed_metadata_none() {
+        let map = parsed_metadata(None);
+        assert!(map.is_empty());
+    }
+
+    #[test]
+    fn parsed_metadata_null() {
+        let map = parsed_metadata(Some(Value::Null));
+        assert!(map.is_empty());
+    }
+
+    #[test]
+    fn parsed_metadata_number() {
+        let map = parsed_metadata(Some(json!(42)));
+        assert!(map.is_empty());
+    }
+
+    // ──────────────────────────────────────────────────────────
+    // result_content
+    // ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn result_content_string_result() {
+        let v = json!({"result": "success"});
+        assert_eq!(result_content(&v), "success");
+    }
+
+    #[test]
+    fn result_content_object_result() {
+        let v = json!({"result": {"code": 0}});
+        let s = result_content(&v);
+        assert!(s.contains("\"code\""));
+    }
+
+    #[test]
+    fn result_content_missing_result() {
+        let v = json!({"other": "data"});
+        assert_eq!(result_content(&v), "");
+    }
+
+    #[test]
+    fn result_content_non_object() {
+        assert_eq!(result_content(&json!("string")), "");
+        assert_eq!(result_content(&json!(42)), "");
+        assert_eq!(result_content(&Value::Null), "");
+    }
+
+    // ──────────────────────────────────────────────────────────
+    // role_at
+    // ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn role_at_valid() {
+        let msgs = vec![json!({"role": "user"}), json!({"role": "assistant"})];
+        assert_eq!(role_at(&msgs, 0), Some("user"));
+        assert_eq!(role_at(&msgs, 1), Some("assistant"));
+    }
+
+    #[test]
+    fn role_at_out_of_bounds() {
+        let msgs = vec![json!({"role": "user"})];
+        assert_eq!(role_at(&msgs, 5), None);
+    }
+
+    #[test]
+    fn role_at_no_role_field() {
+        let msgs = vec![json!({"content": "hi"})];
+        assert_eq!(role_at(&msgs, 0), None);
+    }
+
+    #[test]
+    fn role_at_non_string_role() {
+        let msgs = vec![json!({"role": 42})];
+        assert_eq!(role_at(&msgs, 0), None);
+    }
+
+    // ──────────────────────────────────────────────────────────
+    // history_has_reasoning
+    // ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn history_has_reasoning_present() {
+        let h = vec![json!({"role": "assistant", "reasoning_content": "thinking..."})];
+        assert!(history_has_reasoning(&h));
+    }
+
+    #[test]
+    fn history_has_reasoning_empty_string() {
+        // Even empty string counts as "present"
+        let h = vec![json!({"role": "assistant", "reasoning_content": ""})];
+        assert!(history_has_reasoning(&h));
+    }
+
+    #[test]
+    fn history_has_reasoning_absent() {
+        let h = vec![json!({"role": "assistant", "content": "hi"})];
+        assert!(!history_has_reasoning(&h));
+    }
+
+    #[test]
+    fn history_has_reasoning_only_user() {
+        let h = vec![json!({"role": "user", "reasoning_content": "x"})];
+        assert!(!history_has_reasoning(&h));
+    }
+
+    #[test]
+    fn history_has_reasoning_empty() {
+        assert!(!history_has_reasoning(&[]));
+    }
 }

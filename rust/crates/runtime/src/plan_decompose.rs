@@ -6313,4 +6313,381 @@ Done!"#;
         let display = timeline.format_display();
         assert!(display.contains("✅"), "should have success icon");
     }
+
+    // ═══════════════════════ extract_json Tests ════════════════════════
+
+    #[test]
+    fn extract_json_from_json_block() {
+        let input = "Here:\n```json\n{\"key\": \"val\"}\n```\nDone.";
+        assert_eq!(extract_json(input), r#"{"key": "val"}"#);
+    }
+
+    #[test]
+    fn extract_json_from_plain_block() {
+        let input = "Here:\n```\n{\"key\": 1}\n```\nDone.";
+        assert_eq!(extract_json(input), r#"{"key": 1}"#);
+    }
+
+    #[test]
+    fn extract_json_from_plain_block_with_lang() {
+        let input = "Here:\n```rust\n{\"key\": 1}\n```\nDone.";
+        assert_eq!(extract_json(input), r#"{"key": 1}"#);
+    }
+
+    #[test]
+    fn extract_json_raw_array() {
+        let input = r#"[{"q": "how?"}, {"q": "what?"}]"#;
+        assert_eq!(extract_json(input), input);
+    }
+
+    #[test]
+    fn extract_json_raw_object() {
+        let input = "Some text {\"key\": \"val\"} more text";
+        assert_eq!(extract_json(input), r#"{"key": "val"}"#);
+    }
+
+    #[test]
+    fn extract_json_no_json() {
+        let input = "Just some text";
+        assert_eq!(extract_json(input), input);
+    }
+
+    #[test]
+    fn extract_json_empty_string() {
+        assert_eq!(extract_json(""), "");
+    }
+
+    // ═══════════════════════ parse_execution_confirmation Tests ════════════════════════
+
+    #[test]
+    fn execution_confirmation_yes_variants() {
+        assert_eq!(parse_execution_confirmation("y"), ExecutionConfirmation::Execute);
+        assert_eq!(parse_execution_confirmation("yes"), ExecutionConfirmation::Execute);
+        assert_eq!(parse_execution_confirmation("go"), ExecutionConfirmation::Execute);
+        assert_eq!(parse_execution_confirmation("execute"), ExecutionConfirmation::Execute);
+        assert_eq!(parse_execution_confirmation("run"), ExecutionConfirmation::Execute);
+    }
+
+    #[test]
+    fn execution_confirmation_chinese() {
+        assert_eq!(parse_execution_confirmation("确认"), ExecutionConfirmation::Execute);
+        assert_eq!(parse_execution_confirmation("是"), ExecutionConfirmation::Execute);
+        assert_eq!(parse_execution_confirmation("逐步"), ExecutionConfirmation::StepByStep);
+        assert_eq!(parse_execution_confirmation("编辑"), ExecutionConfirmation::Edit);
+        assert_eq!(parse_execution_confirmation("修改"), ExecutionConfirmation::Edit);
+    }
+
+    #[test]
+    fn execution_confirmation_step_by_step() {
+        assert_eq!(parse_execution_confirmation("s"), ExecutionConfirmation::StepByStep);
+        assert_eq!(parse_execution_confirmation("step"), ExecutionConfirmation::StepByStep);
+        assert_eq!(parse_execution_confirmation("step-by-step"), ExecutionConfirmation::StepByStep);
+    }
+
+    #[test]
+    fn execution_confirmation_edit() {
+        assert_eq!(parse_execution_confirmation("e"), ExecutionConfirmation::Edit);
+        assert_eq!(parse_execution_confirmation("edit"), ExecutionConfirmation::Edit);
+        assert_eq!(parse_execution_confirmation("modify"), ExecutionConfirmation::Edit);
+    }
+
+    #[test]
+    fn execution_confirmation_cancel_fallback() {
+        assert_eq!(parse_execution_confirmation("n"), ExecutionConfirmation::Cancel);
+        assert_eq!(parse_execution_confirmation("anything else"), ExecutionConfirmation::Cancel);
+        assert_eq!(parse_execution_confirmation(""), ExecutionConfirmation::Cancel);
+    }
+
+    #[test]
+    fn execution_confirmation_case_insensitive() {
+        assert_eq!(parse_execution_confirmation("YES"), ExecutionConfirmation::Execute);
+        assert_eq!(parse_execution_confirmation("  Go  "), ExecutionConfirmation::Execute);
+    }
+
+    // ═══════════════════════ parse_subtask_confirmation Tests ════════════════════════
+
+    #[test]
+    fn subtask_confirmation_execute() {
+        assert_eq!(parse_subtask_confirmation("y"), SubtaskConfirmation::Execute);
+        assert_eq!(parse_subtask_confirmation("yes"), SubtaskConfirmation::Execute);
+        assert_eq!(parse_subtask_confirmation(""), SubtaskConfirmation::Execute);
+    }
+
+    #[test]
+    fn subtask_confirmation_skip() {
+        assert_eq!(parse_subtask_confirmation("s"), SubtaskConfirmation::Skip);
+        assert_eq!(parse_subtask_confirmation("skip"), SubtaskConfirmation::Skip);
+        assert_eq!(parse_subtask_confirmation("跳过"), SubtaskConfirmation::Skip);
+    }
+
+    #[test]
+    fn subtask_confirmation_quit_fallback() {
+        assert_eq!(parse_subtask_confirmation("q"), SubtaskConfirmation::Quit);
+        assert_eq!(parse_subtask_confirmation("quit"), SubtaskConfirmation::Quit);
+        assert_eq!(parse_subtask_confirmation("anything"), SubtaskConfirmation::Quit);
+    }
+
+    // ═══════════════════════ parse_plan_paused_user_line Tests ════════════════════════
+
+    #[test]
+    fn paused_line_empty() {
+        assert_eq!(parse_plan_paused_user_line(""), None);
+        assert_eq!(parse_plan_paused_user_line("   "), None);
+    }
+
+    #[test]
+    fn paused_line_correction() {
+        let r = parse_plan_paused_user_line("correct Fix the import order");
+        assert_eq!(r, Some(PlanPausedUserAction::Correction("Fix the import order".to_string())));
+    }
+
+    #[test]
+    fn paused_line_note_correction() {
+        let r = parse_plan_paused_user_line("note use async version");
+        assert_eq!(r, Some(PlanPausedUserAction::Correction("use async version".to_string())));
+    }
+
+    #[test]
+    fn paused_line_adjust_correction() {
+        let r = parse_plan_paused_user_line("adjust something");
+        assert_eq!(r, Some(PlanPausedUserAction::Correction("something".to_string())));
+    }
+
+    #[test]
+    fn paused_line_clear_corrections() {
+        assert_eq!(parse_plan_paused_user_line("correct clear"), Some(PlanPausedUserAction::ClearCorrections));
+        assert_eq!(parse_plan_paused_user_line("note clear"), Some(PlanPausedUserAction::ClearCorrections));
+        assert_eq!(parse_plan_paused_user_line("adjust clear"), Some(PlanPausedUserAction::ClearCorrections));
+    }
+
+    #[test]
+    fn paused_line_rewind_numeric() {
+        let r = parse_plan_paused_user_line("rewind 3");
+        assert_eq!(r, Some(PlanPausedUserAction::Rewind(PlanRewindAnchor::OneBased(3))));
+    }
+
+    #[test]
+    fn paused_line_rewind_id_prefix() {
+        let r = parse_plan_paused_user_line("rewind setup");
+        assert_eq!(r, Some(PlanPausedUserAction::Rewind(PlanRewindAnchor::IdPrefix("setup".to_string()))));
+    }
+
+    #[test]
+    fn paused_line_restart_from() {
+        let r = parse_plan_paused_user_line("restart from 2");
+        assert_eq!(r, Some(PlanPausedUserAction::Rewind(PlanRewindAnchor::OneBased(2))));
+    }
+
+    #[test]
+    fn paused_line_redo_from() {
+        let r = parse_plan_paused_user_line("redo from auth");
+        assert_eq!(r, Some(PlanPausedUserAction::Rewind(PlanRewindAnchor::IdPrefix("auth".to_string()))));
+    }
+
+    #[test]
+    fn paused_line_rewind_zero_ignored() {
+        assert_eq!(parse_plan_paused_user_line("rewind 0"), None);
+    }
+
+    #[test]
+    fn paused_line_rewind_empty_rest() {
+        assert_eq!(parse_plan_paused_user_line("rewind "), None);
+    }
+
+    #[test]
+    fn paused_line_correction_empty_rest() {
+        assert_eq!(parse_plan_paused_user_line("correct "), None);
+    }
+
+    #[test]
+    fn paused_line_normal_text_returns_none() {
+        assert_eq!(parse_plan_paused_user_line("hello world"), None);
+    }
+
+    // ═══════════════════════ resolve_rewind_start_index Tests ════════════════════════
+
+    #[test]
+    fn rewind_index_one_based_valid() {
+        use astra_services::task_orchestrator::{SubtaskPlan, TaskPlan};
+        let plan = TaskPlan {
+            subtasks: vec![
+                SubtaskPlan { id: "a".into(), title: "A".into(), ..Default::default() },
+                SubtaskPlan { id: "b".into(), title: "B".into(), ..Default::default() },
+            ],
+            notes: None,
+        };
+        assert_eq!(resolve_rewind_start_index(&plan, &PlanRewindAnchor::OneBased(1)), Ok(0));
+        assert_eq!(resolve_rewind_start_index(&plan, &PlanRewindAnchor::OneBased(2)), Ok(1));
+    }
+
+    #[test]
+    fn rewind_index_one_based_out_of_range() {
+        use astra_services::task_orchestrator::{SubtaskPlan, TaskPlan};
+        let plan = TaskPlan {
+            subtasks: vec![SubtaskPlan { id: "a".into(), title: "A".into(), ..Default::default() }],
+            notes: None,
+        };
+        assert!(resolve_rewind_start_index(&plan, &PlanRewindAnchor::OneBased(0)).is_err());
+        assert!(resolve_rewind_start_index(&plan, &PlanRewindAnchor::OneBased(5)).is_err());
+    }
+
+    #[test]
+    fn rewind_index_id_prefix_exact_match() {
+        use astra_services::task_orchestrator::{SubtaskPlan, TaskPlan};
+        let plan = TaskPlan {
+            subtasks: vec![
+                SubtaskPlan { id: "setup".into(), title: "Setup".into(), ..Default::default() },
+                SubtaskPlan { id: "build".into(), title: "Build".into(), ..Default::default() },
+            ],
+            notes: None,
+        };
+        assert_eq!(resolve_rewind_start_index(&plan, &PlanRewindAnchor::IdPrefix("build".into())), Ok(1));
+    }
+
+    #[test]
+    fn rewind_index_id_prefix_ambiguous() {
+        use astra_services::task_orchestrator::{SubtaskPlan, TaskPlan};
+        let plan = TaskPlan {
+            subtasks: vec![
+                SubtaskPlan { id: "test-unit".into(), title: "Unit".into(), ..Default::default() },
+                SubtaskPlan { id: "test-integration".into(), title: "Integ".into(), ..Default::default() },
+            ],
+            notes: None,
+        };
+        let r = resolve_rewind_start_index(&plan, &PlanRewindAnchor::IdPrefix("test".into()));
+        assert!(r.is_err());
+        assert!(r.unwrap_err().contains("ambiguous"));
+    }
+
+    #[test]
+    fn rewind_index_id_prefix_no_match() {
+        use astra_services::task_orchestrator::{SubtaskPlan, TaskPlan};
+        let plan = TaskPlan {
+            subtasks: vec![SubtaskPlan { id: "a".into(), title: "A".into(), ..Default::default() }],
+            notes: None,
+        };
+        assert!(resolve_rewind_start_index(&plan, &PlanRewindAnchor::IdPrefix("zzz".into())).is_err());
+    }
+
+    #[test]
+    fn rewind_index_id_prefix_empty() {
+        use astra_services::task_orchestrator::{SubtaskPlan, TaskPlan};
+        let plan = TaskPlan {
+            subtasks: vec![SubtaskPlan { id: "a".into(), title: "A".into(), ..Default::default() }],
+            notes: None,
+        };
+        assert!(resolve_rewind_start_index(&plan, &PlanRewindAnchor::IdPrefix("".into())).is_err());
+    }
+
+    // ═══════════════════════ rewind_plan_from_subtask Tests ════════════════════════
+
+    #[test]
+    fn rewind_resets_from_start_index() {
+        use astra_services::task_orchestrator::{SubtaskPlan, TaskPlan, TaskStatus};
+        let mut plan = TaskPlan {
+            subtasks: vec![
+                SubtaskPlan { id: "a".into(), title: "A".into(), status: TaskStatus::Completed, ..Default::default() },
+                SubtaskPlan { id: "b".into(), title: "B".into(), status: TaskStatus::InProgress, ..Default::default() },
+                SubtaskPlan { id: "c".into(), title: "C".into(), status: TaskStatus::Pending, ..Default::default() },
+            ],
+            notes: None,
+        };
+        let n = rewind_plan_from_subtask(&mut plan, 1);
+        assert_eq!(n, 1); // only "b" was reset (c was already pending)
+        assert_eq!(plan.subtasks[0].status, TaskStatus::Completed); // unchanged
+        assert_eq!(plan.subtasks[1].status, TaskStatus::Pending);
+        assert_eq!(plan.subtasks[2].status, TaskStatus::Pending);
+    }
+
+    #[test]
+    fn rewind_all_from_zero() {
+        use astra_services::task_orchestrator::{SubtaskPlan, TaskPlan, TaskStatus};
+        let mut plan = TaskPlan {
+            subtasks: vec![
+                SubtaskPlan { id: "a".into(), title: "A".into(), status: TaskStatus::Completed, ..Default::default() },
+                SubtaskPlan { id: "b".into(), title: "B".into(), status: TaskStatus::Failed, ..Default::default() },
+            ],
+            notes: None,
+        };
+        let n = rewind_plan_from_subtask(&mut plan, 0);
+        assert_eq!(n, 2);
+    }
+
+    #[test]
+    fn rewind_past_end_resets_nothing() {
+        use astra_services::task_orchestrator::{SubtaskPlan, TaskPlan, TaskStatus};
+        let mut plan = TaskPlan {
+            subtasks: vec![SubtaskPlan { id: "a".into(), title: "A".into(), status: TaskStatus::Completed, ..Default::default() }],
+            notes: None,
+        };
+        let n = rewind_plan_from_subtask(&mut plan, 10);
+        assert_eq!(n, 0);
+    }
+
+    // ═══════════════════════ analyze_parallelism Tests ════════════════════════
+
+    #[test]
+    fn parallelism_no_ready_subtasks() {
+        use astra_services::task_orchestrator::{SubtaskPlan, TaskPlan, TaskStatus};
+        let plan = TaskPlan {
+            subtasks: vec![SubtaskPlan {
+                id: "a".into(),
+                title: "A".into(),
+                status: TaskStatus::Completed,
+                ..Default::default()
+            }],
+            notes: None,
+        };
+        let r = analyze_parallelism(&plan);
+        assert!(r.groups.is_empty());
+        assert!(r.conflicts.is_empty());
+    }
+
+    #[test]
+    fn parallelism_single_ready() {
+        use astra_services::task_orchestrator::{SubtaskPlan, TaskPlan, TaskStatus};
+        let plan = TaskPlan {
+            subtasks: vec![SubtaskPlan {
+                id: "a".into(),
+                title: "A".into(),
+                status: TaskStatus::Pending,
+                ..Default::default()
+            }],
+            notes: None,
+        };
+        let r = analyze_parallelism(&plan);
+        assert_eq!(r.groups.len(), 1);
+        assert_eq!(r.groups[0], vec!["a".to_string()]);
+    }
+
+    #[test]
+    fn parallelism_no_conflicts() {
+        use astra_services::task_orchestrator::{SubtaskPlan, TaskPlan, TaskStatus};
+        let plan = TaskPlan {
+            subtasks: vec![
+                SubtaskPlan { id: "a".into(), title: "A".into(), status: TaskStatus::Pending, files: vec!["a.rs".into()], ..Default::default() },
+                SubtaskPlan { id: "b".into(), title: "B".into(), status: TaskStatus::Pending, files: vec!["b.rs".into()], ..Default::default() },
+            ],
+            notes: None,
+        };
+        let r = analyze_parallelism(&plan);
+        assert_eq!(r.groups.len(), 1); // all in one group
+        assert_eq!(r.conflicts.len(), 0);
+    }
+
+    #[test]
+    fn parallelism_with_file_conflict() {
+        use astra_services::task_orchestrator::{SubtaskPlan, TaskPlan, TaskStatus};
+        let plan = TaskPlan {
+            subtasks: vec![
+                SubtaskPlan { id: "a".into(), title: "A".into(), status: TaskStatus::Pending, files: vec!["shared.rs".into()], ..Default::default() },
+                SubtaskPlan { id: "b".into(), title: "B".into(), status: TaskStatus::Pending, files: vec!["shared.rs".into()], ..Default::default() },
+            ],
+            notes: None,
+        };
+        let r = analyze_parallelism(&plan);
+        assert_eq!(r.conflicts.len(), 1);
+        assert_eq!(r.conflicts[0].shared_files, vec!["shared.rs".to_string()]);
+        assert_eq!(r.groups.len(), 2); // separated into different groups
+    }
 }
