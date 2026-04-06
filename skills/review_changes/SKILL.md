@@ -10,10 +10,14 @@ arguments:
     description: "Review focus: 'bugs', 'security', 'logic', 'api', 'tests', or 'all' (default: all)"
     required: false
 allowed_tools:
-  - bash
+  - git_diff
+  - git_status
+  - git_show
+  - git_log
   - read_file
   - grep
   - glob
+  - bash
 ---
 # Review Changes
 
@@ -35,52 +39,33 @@ $ARGUMENTS
 
 ### 1.1 Resolve TARGET
 
-```bash
-# Default: all uncommitted changes
-git --no-pager diff HEAD --stat
-git --no-pager diff HEAD
+**⚠ CRITICAL: Use the built-in `git_diff`, `git_status`, `git_show`, `git_log` tools — NOT `bash` with raw git commands.** The built-in tools have automatic output truncation that prevents context explosion.
 
-# Staged only
-git --no-pager diff --cached --stat
-git --no-pager diff --cached
+| TARGET | Tool call |
+|--------|-----------|
+| Default (uncommitted) | `git_diff` (no args) |
+| `staged` | `git_diff` with `staged: true` |
+| `unstaged` | `git_diff` (default is worktree vs HEAD) |
+| `branch:<name>` | `git_diff` with `ref: "main"` (or the base branch) |
+| `commit:<sha>` | `git_show` with the SHA |
+| Stat overview | `git_diff` with `stat_only: true` |
+| Filter by path | `git_diff` with `path: "rust/crates/..."` |
 
-# Unstaged only
-git --no-pager diff --stat
-git --no-pager diff
+**When `git_diff` returns "No changes":**
+1. Check `git_status` — are there staged changes? Try `git_diff` with `staged: true`
+2. If still nothing, **ask the user** what they want reviewed. Do NOT automatically expand to branch diff against main — that can be hundreds of files.
 
-# Branch diff (against main/master)
-git --no-pager diff main...<branch> --stat
-git --no-pager diff main...<branch>
+### 1.2 Assess Scope Before Deep Dive
 
-# Specific commit
-git --no-pager show <sha> --stat
-git --no-pager show <sha>
-
-# PR (needs gh cli)
-gh pr diff <number>
-```
-
-### 1.2 Build File Inventory
-
-From the diff stat, categorize changed files:
-
-```
-| File | Language | Lines +/- | Category |
-|------|----------|-----------|----------|
-```
-
-Categories:
-- **Core logic**: `src/`, `lib/`
-- **Tests**: `tests/`, `*_test.*`, `test_*.*`
-- **Config**: `Cargo.toml`, `package.json`, `.toml`, `.yaml`
-- **Docs**: `*.md`, `docs/`
-- **Build**: `Makefile`, `Dockerfile`, `build.rs`
-
-### 1.3 Assess Scope
-
+First call `git_diff` with `stat_only: true` to see the file list:
 - **Trivial** (<50 lines, 1-2 files): Quick inline review
 - **Medium** (50-300 lines, 3-10 files): Per-file review with cross-file analysis
-- **Large** (>300 lines, >10 files): Structural review first, then targeted deep dives
+- **Large** (>300 lines, >10 files): Ask user to narrow scope, or review only the most critical files
+
+For large diffs, **do not** read every file. Focus on:
+- Core logic changes (skip config, docs, generated files)
+- Public API changes
+- Files with the most line changes
 
 ---
 
@@ -107,32 +92,18 @@ For each changed file, use astra's code intelligence to extract symbols:
 ```bash
 # For each modified function, find callers
 grep -rn "function_name(" --include="*.rs" rust/crates/ | grep -v "test" | head -20
-
-# For Rust: check if trait impl changed
-grep -rn "impl.*TraitName.*for" --include="*.rs" rust/crates/
 ```
 
 ### 2.2 Import/Dependency Changes
 
-```bash
-# Extract import changes from diff
-git --no-pager diff HEAD | grep -E "^[+-].*(use |import |from |require\()" | head -30
-```
-
-For each changed import:
+From the diff output, check import changes (`use`, `import`, `from`, `require`):
 - Was a dependency added? Check `Cargo.toml` / `package.json` changes
 - Was a module restructured? Check if old import paths still work
 - Any circular dependency introduced?
 
 ### 2.3 Type/API Surface Changes
 
-For Rust files specifically:
-```bash
-# Find pub items that changed
-git --no-pager diff HEAD -- "*.rs" | grep -E "^[+-]\s*(pub\s+(fn|struct|enum|trait|type|const|static))" | head -20
-```
-
-For each public API change:
+From the diff, identify public API changes (`pub fn`, `pub struct`, `pub enum`, `pub trait`, `export`):
 - **Breaking change?** Removed parameter, changed type, removed variant
 - **Semver impact?** Major (breaking), minor (additive), patch (internal)
 - **Migration needed?** Find all callers that need updating
@@ -172,24 +143,12 @@ Check for:
 - **SQL injection**: String interpolation in SQL queries (relevant for MatrixOne)
 - **Unsafe code**: New `unsafe` blocks without safety comments
 
-```bash
-# Quick security scan on changed files
-git --no-pager diff HEAD --name-only | xargs grep -n "unsafe\|unwrap()\|Command::new\|exec\|eval" 2>/dev/null | head -20
-```
-
 ### 3.3 Test Coverage
 
 For each changed function:
-1. Does a test exist? Search `tests/` and `#[test]` / `#[tokio::test]`
+1. Does a test exist? Use `grep` to search for the function name in test files
 2. Does the test cover the new/changed behavior?
 3. Are edge cases tested?
-
-```bash
-# Find tests for changed functions
-for func in <changed_functions>; do
-  grep -rn "$func" --include="*.rs" rust/crates/ | grep "#\[test\]" -A 5 | head -10
-done
-```
 
 Flag:
 - 🔴 Public API change with no test update
