@@ -176,7 +176,15 @@ fn create_tool_selector_with_quality_internal(
     // by the tool selector.
     let selector: Box<dyn tool_selector::ToolSelector> = match token {
         Some(tok) => {
-            let llm = tool_selector::LlmToolSelector::new(api.clone(), tok.to_string());
+            let mut llm = tool_selector::LlmToolSelector::new(api.clone(), tok.to_string());
+            // Use the cheapest available model for tool selection (simple classification).
+            // Priority: ASTRA_SELECTOR_MODEL env > smallest context_window from /models.
+            let selector_model = std::env::var("ASTRA_SELECTOR_MODEL").ok().or_else(|| {
+                pick_cheapest_model(&api, &tok)
+            });
+            if let Some(m) = selector_model {
+                llm = llm.with_model(m);
+            }
             Box::new(
                 tool_selector::FallbackSelector::new(Box::new(llm), Box::new(tfidf))
                     .with_progressive_calibrator(calibrator_for_selector),
@@ -186,6 +194,52 @@ fn create_tool_selector_with_quality_internal(
     };
 
     (selector, modules)
+}
+
+/// Pick the model with the smallest context window from /models (proxy for cheapest).
+/// Blocking call — safe to use from sync context when a tokio Handle is available.
+/// Returns None on any error (network, parse, empty list).
+fn pick_cheapest_model(api: &astra_thin_client::ThinClient, token: &str) -> Option<String> {
+    let handle = tokio::runtime::Handle::current();
+    let api = api.clone();
+    let token = token.to_string();
+    std::thread::scope(|s| {
+        s.spawn(move || {
+            handle.block_on(async {
+                let resp = api
+                    .get_models_response_timeout(&token, std::time::Duration::from_secs(3))
+                    .await
+                    .ok()?;
+                if !resp.status().is_success() {
+                    return None;
+                }
+                let body: serde_json::Value = resp.json().await.ok()?;
+                cheapest_model_from_json(&body)
+            })
+        })
+        .join()
+        .ok()
+        .flatten()
+    })
+}
+
+/// Extract the active model with the smallest context_window from a /models response.
+fn cheapest_model_from_json(body: &serde_json::Value) -> Option<String> {
+    let arr = body
+        .as_array()
+        .or_else(|| body.get("models").and_then(|v| v.as_array()))?;
+    arr.iter()
+        .filter(|m| m.get("is_active").and_then(|v| v.as_bool()).unwrap_or(true))
+        .filter_map(|m| {
+            let name = m.get("name").and_then(|v| v.as_str())?;
+            let cw = m
+                .get("context_window")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(i64::MAX);
+            Some((name.to_string(), cw))
+        })
+        .min_by_key(|(_, cw)| *cw)
+        .map(|(name, _)| name)
 }
 
 /// Quick check whether the server has at least one LLM model configured.
@@ -956,5 +1010,57 @@ mod tests {
         for (idx, frame) in frames.iter().enumerate() {
             assert_eq!(frame.lines().count(), idx + 1);
         }
+    }
+
+    // ── cheapest_model_from_json tests ──
+
+    #[test]
+    fn cheapest_model_picks_smallest_context_window() {
+        let body = serde_json::json!([
+            {"name": "opus", "context_window": 200000, "is_active": true},
+            {"name": "sonnet", "context_window": 100000, "is_active": true},
+            {"name": "haiku", "context_window": 32000, "is_active": true},
+        ]);
+        assert_eq!(cheapest_model_from_json(&body).as_deref(), Some("haiku"));
+    }
+
+    #[test]
+    fn cheapest_model_skips_inactive() {
+        let body = serde_json::json!([
+            {"name": "haiku", "context_window": 32000, "is_active": false},
+            {"name": "sonnet", "context_window": 100000, "is_active": true},
+        ]);
+        assert_eq!(cheapest_model_from_json(&body).as_deref(), Some("sonnet"));
+    }
+
+    #[test]
+    fn cheapest_model_handles_nested_models_key() {
+        let body = serde_json::json!({
+            "models": [
+                {"name": "gpt-4o-mini", "context_window": 16000, "is_active": true},
+                {"name": "gpt-4o", "context_window": 128000, "is_active": true},
+            ]
+        });
+        assert_eq!(
+            cheapest_model_from_json(&body).as_deref(),
+            Some("gpt-4o-mini")
+        );
+    }
+
+    #[test]
+    fn cheapest_model_returns_none_on_empty() {
+        assert_eq!(cheapest_model_from_json(&serde_json::json!([])), None);
+        assert_eq!(cheapest_model_from_json(&serde_json::json!({})), None);
+        assert_eq!(cheapest_model_from_json(&serde_json::json!("bad")), None);
+    }
+
+    #[test]
+    fn cheapest_model_defaults_inactive_to_true() {
+        // Models without is_active field should be treated as active
+        let body = serde_json::json!([
+            {"name": "flash", "context_window": 8000},
+            {"name": "pro", "context_window": 200000},
+        ]);
+        assert_eq!(cheapest_model_from_json(&body).as_deref(), Some("flash"));
     }
 }
