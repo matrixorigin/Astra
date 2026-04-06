@@ -27,6 +27,7 @@ chrono = { version = "0.4.42", features = ["clock"] }
 dotenvy = "0.15.7"
 fernet = "0.2.2"
 flate2 = "1.1.2"
+tar = "0.4"
 futures-util = "0.3.31"
 jsonwebtoken = "9.3.1"
 regex = "1.12.2"

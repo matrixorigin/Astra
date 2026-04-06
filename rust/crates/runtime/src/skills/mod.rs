@@ -35,6 +35,7 @@ pub mod hooks;
 pub mod improvement;
 pub mod loader;
 pub mod manifest;
+pub mod pack;
 pub mod providers;
 pub mod quality;
 pub mod registry;

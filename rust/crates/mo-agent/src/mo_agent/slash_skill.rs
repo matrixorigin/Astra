@@ -1144,10 +1144,22 @@ Follow these steps:
             uninstall_local_skill(sub_arg.trim(), state).await;
         }
 
+        "pack" => {
+            pack_skill_bundle(sub_arg.trim());
+        }
+
+        "unpack" => {
+            unpack_skill_bundle(sub_arg.trim(), state).await;
+        }
+
+        "inspect" => {
+            inspect_skill_bundle(sub_arg.trim());
+        }
+
         _ => {
             eprintln!(
                         "{}",
-                        format!("  Unknown /skill subcommand: '{sub}'. Try /skill list, /skill search, /skill search-remote, /skill info, /skill new, /skill test, /skill dev, /skill doctor, /skill stats, /skill pin, /skill unpin, /skill install, /skill publish, /skill uninstall, /skill compose-info, /skill upload-quality").yellow()
+                        format!("  Unknown /skill subcommand: '{sub}'. Try /skill list, /skill search, /skill search-remote, /skill info, /skill new, /skill test, /skill dev, /skill doctor, /skill stats, /skill pin, /skill unpin, /skill install, /skill publish, /skill uninstall, /skill pack, /skill unpack, /skill inspect, /skill compose-info, /skill upload-quality").yellow()
                     );
         }
     }
@@ -1538,8 +1550,6 @@ async fn install_skill_from_marketplace(
     };
 
     let tok = token.unwrap_or("");
-    let query_params = vec![("version".to_string(), version.unwrap_or("latest").to_string())];
-    let _ = query_params; // suppress unused warning
 
     eprintln!(
         "  {} {}{}",
@@ -1551,7 +1561,72 @@ async fn install_skill_from_marketplace(
             .dim()
     );
 
-    // Fetch skill content from server
+    // Try bundle endpoint first, fall back to legacy JSON
+    let bundle_path = format!("/skills/{}/bundle", skill_name);
+    let query_pairs: Vec<(&str, String)> = if let Some(v) = version {
+        vec![("version", v.to_string())]
+    } else {
+        vec![]
+    };
+
+    // Attempt bundle download (binary, base64-encoded)
+    match api
+        .get_bearer_path_query_text(tok, &bundle_path, &query_pairs)
+        .await
+    {
+        Ok(text) => {
+            // Try to decode as base64 bundle
+            if let Ok(bytes) = base64::Engine::decode(
+                &base64::engine::general_purpose::STANDARD,
+                text.trim(),
+            ) {
+                let install_dir = std::env::current_dir()
+                    .unwrap_or_default()
+                    .join(".astra")
+                    .join("skills");
+
+                match astra_runtime::skills::pack::unpack_skill_from_bytes(&bytes, &install_dir) {
+                    Ok((installed, manifest)) => {
+                        eprintln!(
+                            "  {} Installed {} v{} to {}",
+                            "✓".green(),
+                            manifest.name.cyan(),
+                            manifest.version.dim(),
+                            installed.display().to_string().dim()
+                        );
+                        let _ = state.unified_skill_registry.discover_all().await;
+                        eprintln!("  {}", "Skill registry refreshed.".dim());
+                        eprintln!();
+                        return;
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "  {} {}",
+                            "Bundle unpack failed, trying legacy format...".yellow(),
+                            format!("{e}").dim()
+                        );
+                    }
+                }
+            }
+            // Fall through to legacy install
+            install_skill_legacy(skill_name, version, api, tok, state).await;
+        }
+        Err(_) => {
+            // Bundle endpoint not available, use legacy
+            install_skill_legacy(skill_name, version, api, tok, state).await;
+        }
+    }
+    eprintln!();
+}
+
+/// Legacy install: fetches SkillRecord JSON and writes SKILL.md directly.
+async fn install_skill_legacy(
+    skill_name: &str,
+    version: Option<&str>,
+    api: &astra_thin_client::ThinClient,
+    tok: &str,
+    state: &mut ReplState,
+) {
     let path = format!("/skills/{}", skill_name);
     let query_pairs: Vec<(&str, String)> = if let Some(v) = version {
         vec![("version", v.to_string())]
@@ -1580,7 +1655,6 @@ async fn install_skill_from_marketplace(
                         .and_then(|v| v.as_str())
                         .unwrap_or("");
 
-                    // Install to project .astra/skills/<name>/
                     let install_dir = std::env::current_dir()
                         .unwrap_or_default()
                         .join(".astra")
@@ -1592,7 +1666,6 @@ async fn install_skill_from_marketplace(
                         return;
                     }
 
-                    // Write SKILL.md
                     let skill_md = if !manifest_str.is_empty() {
                         format!("{manifest_str}\n\n{instructions}")
                     } else {
@@ -1618,7 +1691,6 @@ async fn install_skill_from_marketplace(
                         install_dir.display().to_string().dim()
                     );
 
-                    // Re-discover so the skill is immediately available
                     let _ = state.unified_skill_registry.discover_all().await;
                     eprintln!("  {}", "Skill registry refreshed.".dim());
                 }
@@ -1635,10 +1707,9 @@ async fn install_skill_from_marketplace(
             );
         }
     }
-    eprintln!();
 }
 
-/// Publish a local skill to the marketplace.
+/// Publish a local skill to the marketplace (as a bundle).
 async fn publish_skill_to_marketplace(
     name: &str,
     api: &astra_thin_client::ThinClient,
@@ -1649,7 +1720,7 @@ async fn publish_skill_to_marketplace(
         eprintln!("{}", "  Usage: /skill publish <name>".yellow());
         eprintln!(
             "{}",
-            "  Publishes a local skill to the marketplace.".dim()
+            "  Publishes a local skill to the marketplace as a bundle.".dim()
         );
         return;
     }
@@ -1676,14 +1747,16 @@ async fn publish_skill_to_marketplace(
         }
     };
 
-    // Load full skill content
-    let loaded = match registry.load(name).await {
-        Ok(l) => l,
-        Err(e) => {
-            eprintln!("  {} {}", "✗ Failed to load skill:".red(), e);
-            return;
+    // Find skill directory to pack
+    let search_paths = crate::skill_instructions::skill_search_paths();
+    let mut skill_dir: Option<std::path::PathBuf> = None;
+    for base in &search_paths {
+        let candidate = base.join(name);
+        if candidate.join("SKILL.md").exists() {
+            skill_dir = Some(candidate);
+            break;
         }
-    };
+    }
 
     eprintln!(
         "  {} {} v{}...",
@@ -1692,7 +1765,67 @@ async fn publish_skill_to_marketplace(
         manifest.version.to_string().dim()
     );
 
-    // Build publish request
+    // Try bundle publish if we have a local directory
+    if let Some(ref dir) = skill_dir {
+        match astra_runtime::skills::pack::pack_skill_to_bytes(dir) {
+            Ok((bundle_bytes, bundle_manifest)) => {
+                let encoded = base64::Engine::encode(
+                    &base64::engine::general_purpose::STANDARD,
+                    &bundle_bytes,
+                );
+                let request = serde_json::json!({
+                    "name": bundle_manifest.name,
+                    "version": bundle_manifest.version,
+                    "description": bundle_manifest.description,
+                    "category": manifest.category,
+                    "tags": manifest.tags,
+                    "bundle": encoded,
+                    "bundle_sha256": bundle_manifest.skill_md_sha256,
+                });
+
+                match api
+                    .post_bearer_path_json_text(tok, "/skills/publish", &request)
+                    .await
+                {
+                    Ok(_) => {
+                        eprintln!(
+                            "  {} Published {} v{} ({} bundle)",
+                            "✓".green(),
+                            name.cyan(),
+                            manifest.version.to_string().dim(),
+                            format_bytes(bundle_bytes.len() as u64).dim()
+                        );
+                        eprintln!();
+                        return;
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "  {} {}",
+                            "✗ Bundle publish failed:".yellow(),
+                            format!("{e}").dim()
+                        );
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!(
+                    "  {} {}",
+                    "✗ Bundle creation failed:".yellow(),
+                    format!("{e}").dim()
+                );
+            }
+        }
+    }
+
+    // Fallback: publish raw manifest + instructions
+    let loaded = match registry.load(name).await {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("  {} {}", "✗ Failed to load skill:".red(), e);
+            return;
+        }
+    };
+
     let request = serde_json::json!({
         "name": manifest.name,
         "version": manifest.version.to_string(),
@@ -1778,4 +1911,181 @@ async fn uninstall_local_skill(name: &str, state: &mut ReplState) {
         }
     }
     eprintln!();
+}
+
+// ── Pack / Unpack / Inspect commands ────────────────────────────────────
+
+/// Pack a local skill into a `.astra-skill` bundle.
+fn pack_skill_bundle(name: &str) {
+    if name.is_empty() {
+        eprintln!("{}", "  Usage: /skill pack <name>".yellow());
+        eprintln!(
+            "{}",
+            "  Bundles a local skill directory into a .astra-skill file.".dim()
+        );
+        return;
+    }
+
+    // Find the skill directory
+    let search_paths = crate::skill_instructions::skill_search_paths();
+    let mut skill_dir: Option<std::path::PathBuf> = None;
+
+    for base in &search_paths {
+        let candidate = base.join(name);
+        if candidate.join("SKILL.md").exists() {
+            skill_dir = Some(candidate);
+            break;
+        }
+    }
+
+    let skill_dir = match skill_dir {
+        Some(d) => d,
+        None => {
+            eprintln!(
+                "  {} Skill '{}' not found in local paths.",
+                "✗".yellow(),
+                name.cyan()
+            );
+            return;
+        }
+    };
+
+    // Output to current directory
+    let output_dir = std::env::current_dir().unwrap_or_default();
+
+    match astra_runtime::skills::pack::pack_skill(&skill_dir, &output_dir) {
+        Ok((path, manifest)) => {
+            let size = std::fs::metadata(&path)
+                .map(|m| format_bytes(m.len()))
+                .unwrap_or_else(|_| "?".to_string());
+            eprintln!(
+                "  {} Packed {} v{} → {} ({})",
+                "✓".green(),
+                manifest.name.cyan(),
+                manifest.version.dim(),
+                path.file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .cyan()
+                    .bold(),
+                size.dim()
+            );
+            eprintln!(
+                "  {}",
+                format!("SHA-256: {}", manifest.skill_md_sha256).dim()
+            );
+        }
+        Err(e) => {
+            eprintln!("  {} {}", "✗ Pack failed:".red(), e);
+        }
+    }
+    eprintln!();
+}
+
+/// Unpack a `.astra-skill` bundle to local skills directory.
+async fn unpack_skill_bundle(path_str: &str, state: &mut ReplState) {
+    if path_str.is_empty() {
+        eprintln!("{}", "  Usage: /skill unpack <file.astra-skill>".yellow());
+        eprintln!(
+            "{}",
+            "  Extracts a skill bundle to .astra/skills/.".dim()
+        );
+        return;
+    }
+
+    let bundle_path = std::path::Path::new(path_str);
+    if !bundle_path.exists() {
+        eprintln!(
+            "  {} File not found: {}",
+            "✗".yellow(),
+            path_str.cyan()
+        );
+        return;
+    }
+
+    let install_dir = std::env::current_dir()
+        .unwrap_or_default()
+        .join(".astra")
+        .join("skills");
+
+    match astra_runtime::skills::pack::unpack_skill(bundle_path, &install_dir) {
+        Ok((installed, manifest)) => {
+            eprintln!(
+                "  {} Unpacked {} v{} to {}",
+                "✓".green(),
+                manifest.name.cyan(),
+                manifest.version.dim(),
+                installed.display().to_string().dim()
+            );
+
+            // Refresh registry
+            let _ = state.unified_skill_registry.discover_all().await;
+            eprintln!("  {}", "Skill registry refreshed.".dim());
+        }
+        Err(e) => {
+            eprintln!("  {} {}", "✗ Unpack failed:".red(), e);
+        }
+    }
+    eprintln!();
+}
+
+/// Inspect a `.astra-skill` bundle without extracting.
+fn inspect_skill_bundle(path_str: &str) {
+    if path_str.is_empty() {
+        eprintln!(
+            "{}",
+            "  Usage: /skill inspect <file.astra-skill>".yellow()
+        );
+        eprintln!(
+            "{}",
+            "  Shows bundle metadata without extracting.".dim()
+        );
+        return;
+    }
+
+    let bundle_path = std::path::Path::new(path_str);
+    if !bundle_path.exists() {
+        eprintln!(
+            "  {} File not found: {}",
+            "✗".yellow(),
+            path_str.cyan()
+        );
+        return;
+    }
+
+    match astra_runtime::skills::pack::inspect_bundle(bundle_path) {
+        Ok(manifest) => {
+            eprintln!("  {}", "Bundle contents:".bold());
+            eprintln!("    Name:        {}", manifest.name.cyan());
+            eprintln!("    Version:     {}", manifest.version.dim());
+            eprintln!("    Description: {}", manifest.description);
+            if let Some(ref author) = manifest.author {
+                eprintln!("    Author:      {}", author);
+            }
+            if let Some(ref category) = manifest.category {
+                eprintln!("    Category:    {}", category);
+            }
+            if !manifest.tags.is_empty() {
+                eprintln!("    Tags:        {}", manifest.tags.join(", "));
+            }
+            eprintln!(
+                "    SHA-256:     {}",
+                manifest.skill_md_sha256.dim()
+            );
+        }
+        Err(e) => {
+            eprintln!("  {} {}", "✗ Inspect failed:".red(), e);
+        }
+    }
+    eprintln!();
+}
+
+fn format_bytes(bytes: u64) -> String {
+    if bytes < 1024 {
+        format!("{bytes} B")
+    } else if bytes < 1024 * 1024 {
+        format!("{:.1} KB", bytes as f64 / 1024.0)
+    } else {
+        format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
+    }
 }
