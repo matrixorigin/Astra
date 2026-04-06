@@ -957,12 +957,22 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
                 }
             }
 
+            let session_dir = state.current_session_id.as_ref().map(|id| {
+                dirs::home_dir()
+                    .unwrap_or_else(|| std::path::PathBuf::from("."))
+                    .join(".astra")
+                    .join("sessions")
+                    .join(id)
+                    .to_string_lossy()
+                    .into_owned()
+            });
+
             let skill_ctx = crate::turn::skill_tool::SkillContext {
                 session_id: state.current_session_id.clone(),
+                session_dir,
                 work_dir: state.workspace_root_hint.clone(),
                 available_tools: state.all_tools_used.iter().cloned().collect(),
                 extra,
-                ..Default::default()
             };
 
             let (sr, remaining, activation) =
