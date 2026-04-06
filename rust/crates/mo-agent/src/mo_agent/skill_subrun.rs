@@ -292,7 +292,12 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
             let allowed: HashSet<&str> = allowed_tools.iter().map(|s| s.as_str()).collect();
             valid_tool_names
                 .iter()
-                .filter(|name| !allowed.contains(name.as_str()) && name.as_str() != "skill")
+                .filter(|name| {
+                    !allowed.contains(name.as_str())
+                        && name.as_str() != astra_runtime::turn::skill_tool::SKILL_TOOL_NAME
+                        && name.as_str()
+                            != astra_runtime::turn::skill_tool::DISCOVER_SKILLS_TOOL_NAME
+                })
                 .cloned()
                 .collect()
         };

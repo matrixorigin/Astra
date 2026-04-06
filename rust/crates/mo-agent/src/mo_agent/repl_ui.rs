@@ -53,11 +53,17 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/health", "Tool health dashboard"),
     ("/learn", "Learning insights: patterns, drift, exploration"),
     ("/sync", "Cloud sync status and push"),
-    ("/team", "Team coordination: create, list, add-member, context"),
+    (
+        "/team",
+        "Team coordination: create, list, add-member, context",
+    ),
     // ── Advanced ──────────────────────────────────────────────────────────
     ("/doctor", "Run diagnostics"),
     ("/version", "Show version info"),
-    ("/style", "Switch output theme (default, minimal, colorful, high-contrast)"),
+    (
+        "/style",
+        "Switch output theme (default, minimal, colorful, high-contrast)",
+    ),
     (
         "/session",
         "Session info: cwd, git, workspace.yaml, REPL state",

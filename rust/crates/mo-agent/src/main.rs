@@ -573,6 +573,8 @@ struct ReplState {
     skill_improvement_tracker: astra_runtime::skills::improvement::ImprovementTracker,
     /// Skills pinned by the user — always included in budget (never truncated).
     pinned_skills: std::collections::HashSet<String>,
+    /// Skills surfaced by `discover_skills` during this REPL session.
+    discovered_skills: std::collections::HashSet<String>,
     mcp_manager: std::sync::Arc<tokio::sync::RwLock<mcp_client::McpClientManager>>,
     /// Skill classification cache for LLM-based skill detection.
     #[allow(dead_code)]
@@ -654,6 +656,7 @@ impl Default for ReplState {
             skill_improvement_tracker: astra_runtime::skills::improvement::ImprovementTracker::new(
             ),
             pinned_skills: std::collections::HashSet::new(),
+            discovered_skills: std::collections::HashSet::new(),
             mcp_manager: std::sync::Arc::new(tokio::sync::RwLock::new(
                 mcp_client::McpClientManager::new(),
             )),
@@ -1492,11 +1495,8 @@ fn handle_cost_command(arg: &str, state: &ReplState) {
             for sid in &recent {
                 if let Ok(events) = session_journal::read_journal(sid) {
                     let stats = session_analytics::compute_session_stats(sid, &events);
-                    let cost = cost_for_tokens(
-                        stats.total_tokens_in,
-                        stats.total_tokens_out,
-                        pricing,
-                    );
+                    let cost =
+                        cost_for_tokens(stats.total_tokens_in, stats.total_tokens_out, pricing);
                     grand_total += cost;
 
                     let short = &sid[..8.min(sid.len())];
@@ -1685,7 +1685,11 @@ fn handle_style_command(arg: &str) {
                     .map(|t| t.name.clone())
                     .chain(theme::load_user_themes().iter().map(|t| t.name.clone()))
                     .collect();
-                eprintln!("  {} Available: {}", theme::icon_info(), available.join(", "));
+                eprintln!(
+                    "  {} Available: {}",
+                    theme::icon_info(),
+                    available.join(", ")
+                );
             }
         },
     }
@@ -4093,9 +4097,8 @@ async fn handle_slash_command(
         }
 
         "/skill" | "/skill list" | "/skill info" | "/skill search" | "/skill new"
-        | "/skill create"
-        | "/skill test" | "/skill dev" | "/skill doctor" | "/skill validate" | "/skill config"
-        | "/skill system" => {
+        | "/skill create" | "/skill test" | "/skill dev" | "/skill doctor" | "/skill validate"
+        | "/skill config" | "/skill system" => {
             handle_skill_command(arg, api, state, token).await?;
         }
 
@@ -7161,8 +7164,8 @@ total_tokens_out: 500
     #[test]
     fn cost_for_tokens_basic() {
         let pricing = astra_services::models::PricingData {
-            prompt: 0.003,      // $0.003 per 1K tokens = $3 per 1M
-            completion: 0.015,  // $0.015 per 1K tokens = $15 per 1M
+            prompt: 0.003,     // $0.003 per 1K tokens = $3 per 1M
+            completion: 0.015, // $0.015 per 1K tokens = $15 per 1M
             cache_read: None,
             cache_write: None,
         };
@@ -7261,7 +7264,9 @@ total_tokens_out: 500
 
     #[test]
     fn extract_pricing_model_not_found() {
-        let models = vec![serde_json::json!({"name": "gpt-4", "pricing_prompt": 0.03, "pricing_completion": 0.06})];
+        let models = vec![
+            serde_json::json!({"name": "gpt-4", "pricing_prompt": 0.03, "pricing_completion": 0.06}),
+        ];
         assert!(extract_pricing_for_model(&models, "nonexistent").is_none());
     }
 

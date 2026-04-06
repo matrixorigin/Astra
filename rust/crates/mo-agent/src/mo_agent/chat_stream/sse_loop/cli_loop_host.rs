@@ -82,7 +82,11 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
             if let Some(ref allowed) = state.skill_allowed_tools {
                 self.valid_tool_names
                     .iter()
-                    .filter(|name| !allowed.contains(*name) && *name != "skill")
+                    .filter(|name| {
+                        !allowed.contains(*name)
+                            && *name != astra_runtime::turn::skill_tool::SKILL_TOOL_NAME
+                            && *name != astra_runtime::turn::skill_tool::DISCOVER_SKILLS_TOOL_NAME
+                    })
                     .cloned()
                     .collect()
             } else {

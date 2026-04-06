@@ -2536,10 +2536,7 @@ Instructions.
             skill.triggers.contains(&"batch".to_string()),
             "should trigger on 'batch'"
         );
-        assert!(
-            !skill.allowed_tools.is_empty(),
-            "should have allowed_tools"
-        );
+        assert!(!skill.allowed_tools.is_empty(), "should have allowed_tools");
         assert!(
             skill.allowed_tools.contains(&"git_worktree".to_string()),
             "should include git_worktree tool"

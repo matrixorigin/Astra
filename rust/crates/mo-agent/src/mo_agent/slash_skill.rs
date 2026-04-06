@@ -1353,15 +1353,10 @@ fn skill_relevance_score(m: &astra_runtime::skills::SkillManifest, query: &str) 
     score
 }
 
-
 // ═══════════════════════════════════════════════ Skill Auto-Generation ════
 
-
 /// Analyze the current session and generate a SKILL.md from observed patterns.
-async fn create_skill_from_session(
-    arg: &str,
-    state: &mut super::ReplState,
-) -> Result<(), String> {
+async fn create_skill_from_session(arg: &str, state: &mut super::ReplState) -> Result<(), String> {
     use astra_services::session_journal;
     use std::collections::HashMap;
 
@@ -1414,12 +1409,7 @@ async fn create_skill_from_session(
     let events = session_journal::read_journal(&session_id).map_err(|e| e.to_string())?;
     let turns: Vec<_> = events
         .iter()
-        .filter(|e| {
-            matches!(
-                e.event_type,
-                session_journal::JournalEventType::Turn
-            )
-        })
+        .filter(|e| matches!(e.event_type, session_journal::JournalEventType::Turn))
         .collect();
 
     if turns.is_empty() {
@@ -1611,21 +1601,19 @@ Skill auto-generated from session {session_short}.
     if !top_tools.is_empty() {
         eprintln!(
             "  {}",
-            format!("  Top tools: {}", top_tools[..top_tools.len().min(5)].join(", ")).dim()
+            format!(
+                "  Top tools: {}",
+                top_tools[..top_tools.len().min(5)].join(", ")
+            )
+            .dim()
         );
     }
     eprintln!(
         "\n  {}",
         format!("  Edit: {}/SKILL.md", skill_dir.display()).dim()
     );
-    eprintln!(
-        "  {}",
-        format!("  Dev mode: /skill dev {name}").dim()
-    );
-    eprintln!(
-        "  {}",
-        format!("  Test: /skill test {name}").dim()
-    );
+    eprintln!("  {}", format!("  Dev mode: /skill dev {name}").dim());
+    eprintln!("  {}", format!("  Test: /skill test {name}").dim());
     eprintln!();
 
     Ok(())
@@ -1640,9 +1628,9 @@ pub(crate) fn derive_triggers(name: &str, intents: &[String]) -> Vec<String> {
     // Count words across intents (skip very common words)
     let stop_words: std::collections::HashSet<&str> = [
         "the", "a", "an", "to", "in", "for", "of", "and", "or", "is", "it", "on", "at", "by",
-        "with", "this", "that", "from", "can", "do", "how", "what", "i", "me", "my", "we",
-        "you", "your", "please", "let", "make", "use", "get", "set", "put", "all", "not", "no",
-        "so", "if", "be", "as", "but", "are", "was", "were",
+        "with", "this", "that", "from", "can", "do", "how", "what", "i", "me", "my", "we", "you",
+        "your", "please", "let", "make", "use", "get", "set", "put", "all", "not", "no", "so",
+        "if", "be", "as", "but", "are", "was", "were",
     ]
     .into_iter()
     .collect();
@@ -1652,7 +1640,7 @@ pub(crate) fn derive_triggers(name: &str, intents: &[String]) -> Vec<String> {
         for word in intent.split_whitespace() {
             let w = word.to_lowercase();
             let w = w.trim_matches(|c: char| !c.is_alphanumeric());
-            if w.len() >= 3 && !stop_words.contains(&*w) {
+            if w.len() >= 3 && !stop_words.contains(w) {
                 *word_freq.entry(w.to_string()).or_insert(0) += 1;
             }
         }
@@ -1669,7 +1657,6 @@ pub(crate) fn derive_triggers(name: &str, intents: &[String]) -> Vec<String> {
 
     triggers
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -1855,14 +1842,17 @@ mod tests {
         ];
         let triggers = super::derive_triggers("name", &intents);
         // name + at most 3 extras = 4 max
-        assert!(triggers.len() <= 4, "got {}: {:?}", triggers.len(), triggers);
+        assert!(
+            triggers.len() <= 4,
+            "got {}: {:?}",
+            triggers.len(),
+            triggers
+        );
     }
 
     #[test]
     fn derive_triggers_no_duplicate_with_name() {
-        let intents = vec![
-            "deploy deploy deploy".to_string(),
-        ];
+        let intents = vec!["deploy deploy deploy".to_string()];
         let triggers = super::derive_triggers("deploy", &intents);
         let count = triggers.iter().filter(|t| *t == "deploy").count();
         assert_eq!(count, 1, "name should not be duplicated");
@@ -1874,7 +1864,8 @@ mod tests {
     fn skill_name_validation_accepts_valid() {
         for name in &["my-skill", "test_123", "ABC", "a"] {
             assert!(
-                name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'),
+                name.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'),
                 "should accept: {name}"
             );
         }
@@ -1884,7 +1875,9 @@ mod tests {
     fn skill_name_validation_rejects_invalid() {
         for name in &["my skill", "test/bad", "a@b", "skill;rm"] {
             assert!(
-                !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'),
+                !name
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'),
                 "should reject: {name}"
             );
         }
@@ -1893,8 +1886,8 @@ mod tests {
     // ── Marketplace integration tests (wiremock) ────────────────────────
 
     mod marketplace_tests {
-        use wiremock::{MockServer, Mock, ResponseTemplate};
         use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
 
         fn make_client(server_uri: &str) -> astra_thin_client::ThinClient {
             astra_thin_client::ThinClient::new(server_uri, None).unwrap()
@@ -2098,13 +2091,8 @@ mod tests {
                 .await;
 
             let client = make_client(&srv.uri());
-            let ok = super::install_single_skill_legacy(
-                "test-install-skill",
-                None,
-                &client,
-                "tok",
-            )
-            .await;
+            let ok = super::install_single_skill_legacy("test-install-skill", None, &client, "tok")
+                .await;
 
             assert!(ok, "install should succeed");
 
@@ -2173,13 +2161,8 @@ mod tests {
                 .await;
 
             let client = make_client(&srv.uri());
-            let ok = super::install_single_skill_legacy(
-                "missing-skill",
-                None,
-                &client,
-                "tok",
-            )
-            .await;
+            let ok =
+                super::install_single_skill_legacy("missing-skill", None, &client, "tok").await;
 
             assert!(!ok, "install should fail on 404");
         }
@@ -2306,10 +2289,10 @@ mod tests {
             assert!(remote > local);
 
             let same: Version = "1.0.0".parse().unwrap();
-            assert!(!(same > local));
+            assert!(same <= local);
 
             let older: Version = "0.9.0".parse().unwrap();
-            assert!(!(older > local));
+            assert!(local >= older);
         }
 
         #[test]
@@ -2439,127 +2422,132 @@ fn install_skill_recursive<'a>(
     depth: u32,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + 'a>> {
     Box::pin(async move {
-    if depth > MAX_DEP_INSTALL_DEPTH {
-        eprintln!(
-            "  {} Dependency depth limit ({}) reached for '{}'",
-            "⚠".yellow(),
-            MAX_DEP_INSTALL_DEPTH,
-            name.cyan()
-        );
-        return;
-    }
-
-    // Parse name@version (explicit version override takes precedence over constraint)
-    let (skill_name, explicit_version) = if let Some(idx) = name.find('@') {
-        (&name[..idx], Some(&name[idx + 1..]))
-    } else {
-        (name, None)
-    };
-
-    // Skip if already installed in this session (avoid cycles)
-    if installed.iter().any(|n| n == skill_name) {
-        return;
-    }
-
-    // Check if skill is already available locally and satisfies the constraint
-    if depth > 0 {
-        let all = state.unified_skill_registry.all_manifests();
-        if let Some(existing) = all.iter().find(|m| m.name == skill_name) {
-            if constraint.matches(&existing.version) {
-                return; // Already available and satisfies constraint
-            }
-            // Version constraint not satisfied — will re-install
+        if depth > MAX_DEP_INSTALL_DEPTH {
             eprintln!(
-                "  {} '{}' v{} does not satisfy {}, upgrading…",
+                "  {} Dependency depth limit ({}) reached for '{}'",
                 "⚠".yellow(),
+                MAX_DEP_INSTALL_DEPTH,
+                name.cyan()
+            );
+            return;
+        }
+
+        // Parse name@version (explicit version override takes precedence over constraint)
+        let (skill_name, explicit_version) = if let Some(idx) = name.find('@') {
+            (&name[..idx], Some(&name[idx + 1..]))
+        } else {
+            (name, None)
+        };
+
+        // Skip if already installed in this session (avoid cycles)
+        if installed.iter().any(|n| n == skill_name) {
+            return;
+        }
+
+        // Check if skill is already available locally and satisfies the constraint
+        if depth > 0 {
+            let all = state.unified_skill_registry.all_manifests();
+            if let Some(existing) = all.iter().find(|m| m.name == skill_name) {
+                if constraint.matches(&existing.version) {
+                    return; // Already available and satisfies constraint
+                }
+                // Version constraint not satisfied — will re-install
+                eprintln!(
+                    "  {} '{}' v{} does not satisfy {}, upgrading…",
+                    "⚠".yellow(),
+                    skill_name.cyan(),
+                    existing.version.to_string().dim(),
+                    constraint.to_string().yellow()
+                );
+            }
+        }
+
+        let constraint_label = if constraint.is_any() {
+            String::new()
+        } else {
+            format!(" ({})", constraint)
+        };
+
+        if depth == 0 {
+            eprintln!(
+                "  {} {}{}",
+                "Installing".cyan(),
+                skill_name.cyan().bold(),
+                explicit_version
+                    .map(|v| format!("@{v}"))
+                    .unwrap_or(constraint_label)
+                    .dim()
+            );
+        } else {
+            eprintln!(
+                "  {} {}{} (dependency)",
+                "Installing".cyan(),
                 skill_name.cyan(),
-                existing.version.to_string().dim(),
-                constraint.to_string().yellow()
+                constraint_label.dim()
             );
         }
-    }
 
-    let constraint_label = if constraint.is_any() {
-        String::new()
-    } else {
-        format!(" ({})", constraint)
-    };
+        // Try bundle endpoint first, fall back to legacy JSON
+        let success = install_single_skill(skill_name, explicit_version, api, tok, state).await;
 
-    if depth == 0 {
-        eprintln!(
-            "  {} {}{}",
-            "Installing".cyan(),
-            skill_name.cyan().bold(),
-            explicit_version
-                .map(|v| format!("@{v}"))
-                .unwrap_or(constraint_label)
-                .dim()
-        );
-    } else {
-        eprintln!(
-            "  {} {}{} (dependency)",
-            "Installing".cyan(),
-            skill_name.cyan(),
-            constraint_label.dim()
-        );
-    }
+        if success {
+            installed.push(skill_name.to_string());
 
-    // Try bundle endpoint first, fall back to legacy JSON
-    let success = install_single_skill(skill_name, explicit_version, api, tok, state).await;
+            // Refresh registry to pick up newly installed skill
+            let _ = state.unified_skill_registry.discover_all().await;
 
-    if success {
-        installed.push(skill_name.to_string());
+            // Validate the installed version satisfies the constraint
+            if !constraint.is_any() {
+                let all = state.unified_skill_registry.all_manifests();
+                if let Some(m) = all.iter().find(|m| m.name == skill_name) {
+                    if !constraint.matches(&m.version) {
+                        eprintln!(
+                            "  {} Installed '{}' v{} does not satisfy constraint {}",
+                            "⚠".yellow(),
+                            skill_name.cyan(),
+                            m.version.to_string().dim(),
+                            constraint.to_string().yellow()
+                        );
+                    }
+                }
+            }
 
-        // Refresh registry to pick up newly installed skill
-        let _ = state.unified_skill_registry.discover_all().await;
+            // Check dependencies of the newly installed skill
+            let deps = {
+                let all = state.unified_skill_registry.all_manifests();
+                all.iter()
+                    .find(|m| m.name == skill_name)
+                    .map(|m| m.dependencies.clone())
+                    .unwrap_or_default()
+            };
 
-        // Validate the installed version satisfies the constraint
-        if !constraint.is_any() {
-            let all = state.unified_skill_registry.all_manifests();
-            if let Some(m) = all.iter().find(|m| m.name == skill_name) {
-                if !constraint.matches(&m.version) {
-                    eprintln!(
-                        "  {} Installed '{}' v{} does not satisfy constraint {}",
-                        "⚠".yellow(),
-                        skill_name.cyan(),
-                        m.version.to_string().dim(),
-                        constraint.to_string().yellow()
-                    );
+            let skill_deps: Vec<_> = deps
+                .into_iter()
+                .filter(|d| d.dep_type == astra_runtime::skills::version::DependencyType::Skill)
+                .collect();
+
+            if !skill_deps.is_empty() {
+                eprintln!(
+                    "  {} {} has {} dependencies",
+                    "→".dim(),
+                    skill_name.cyan(),
+                    skill_deps.len()
+                );
+
+                for dep in &skill_deps {
+                    install_skill_recursive(
+                        &dep.name,
+                        &dep.version,
+                        api,
+                        tok,
+                        state,
+                        installed,
+                        depth + 1,
+                    )
+                    .await;
                 }
             }
         }
-
-        // Check dependencies of the newly installed skill
-        let deps = {
-            let all = state.unified_skill_registry.all_manifests();
-            all.iter()
-                .find(|m| m.name == skill_name)
-                .map(|m| m.dependencies.clone())
-                .unwrap_or_default()
-        };
-
-        let skill_deps: Vec<_> = deps
-            .into_iter()
-            .filter(|d| {
-                d.dep_type == astra_runtime::skills::version::DependencyType::Skill
-            })
-            .collect();
-
-        if !skill_deps.is_empty() {
-            eprintln!(
-                "  {} {} has {} dependencies",
-                "→".dim(),
-                skill_name.cyan(),
-                skill_deps.len()
-            );
-
-            for dep in &skill_deps {
-                install_skill_recursive(
-                    &dep.name, &dep.version, api, tok, state, installed, depth + 1,
-                ).await;
-            }
-        }
-    }
     }) // close Box::pin(async move { ... })
 }
 
@@ -2584,10 +2572,9 @@ async fn install_single_skill(
         .await
     {
         Ok(text) => {
-            if let Ok(bytes) = base64::Engine::decode(
-                &base64::engine::general_purpose::STANDARD,
-                text.trim(),
-            ) {
+            if let Ok(bytes) =
+                base64::Engine::decode(&base64::engine::general_purpose::STANDARD, text.trim())
+            {
                 let install_dir = std::env::current_dir()
                     .unwrap_or_default()
                     .join(".astra")
@@ -2641,66 +2628,64 @@ async fn install_single_skill_legacy(
         .get_bearer_path_query_text(tok, &path, &query_pairs)
         .await
     {
-        Ok(text) => {
-            match serde_json::from_str::<astra_services::skills::SkillRecord>(&text) {
-                Ok(record) => {
-                    let instructions = record
-                        .metadata
-                        .as_ref()
-                        .and_then(|m| m.get("instructions"))
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("");
+        Ok(text) => match serde_json::from_str::<astra_services::skills::SkillRecord>(&text) {
+            Ok(record) => {
+                let instructions = record
+                    .metadata
+                    .as_ref()
+                    .and_then(|m| m.get("instructions"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
 
-                    let manifest_str = record
-                        .metadata
-                        .as_ref()
-                        .and_then(|m| m.get("manifest"))
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("");
+                let manifest_str = record
+                    .metadata
+                    .as_ref()
+                    .and_then(|m| m.get("manifest"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
 
-                    let install_dir = std::env::current_dir()
-                        .unwrap_or_default()
-                        .join(".astra")
-                        .join("skills")
-                        .join(skill_name);
+                let install_dir = std::env::current_dir()
+                    .unwrap_or_default()
+                    .join(".astra")
+                    .join("skills")
+                    .join(skill_name);
 
-                    if let Err(e) = std::fs::create_dir_all(&install_dir) {
-                        eprintln!("  {} {}", "✗ Failed to create directory:".red(), e);
-                        return false;
-                    }
+                if let Err(e) = std::fs::create_dir_all(&install_dir) {
+                    eprintln!("  {} {}", "✗ Failed to create directory:".red(), e);
+                    return false;
+                }
 
-                    let skill_md = if !manifest_str.is_empty() {
-                        format!("{manifest_str}\n\n{instructions}")
-                    } else {
-                        let header = format!(
-                            "---\nname: {}\nversion: {}\ndescription: {}\n---\n\n",
-                            record.skill_name,
-                            record.version,
-                            record.description.as_deref().unwrap_or(""),
-                        );
-                        format!("{header}{instructions}")
-                    };
-
-                    if let Err(e) = std::fs::write(install_dir.join("SKILL.md"), &skill_md) {
-                        eprintln!("  {} {}", "✗ Failed to write SKILL.md:".red(), e);
-                        return false;
-                    }
-
-                    eprintln!(
-                        "  {} Installed {} v{} to {}",
-                        "✓".green(),
-                        record.skill_name.cyan(),
-                        record.version.dim(),
-                        install_dir.display().to_string().dim()
+                let skill_md = if !manifest_str.is_empty() {
+                    format!("{manifest_str}\n\n{instructions}")
+                } else {
+                    let header = format!(
+                        "---\nname: {}\nversion: {}\ndescription: {}\n---\n\n",
+                        record.skill_name,
+                        record.version,
+                        record.description.as_deref().unwrap_or(""),
                     );
-                    true
+                    format!("{header}{instructions}")
+                };
+
+                if let Err(e) = std::fs::write(install_dir.join("SKILL.md"), &skill_md) {
+                    eprintln!("  {} {}", "✗ Failed to write SKILL.md:".red(), e);
+                    return false;
                 }
-                Err(e) => {
-                    eprintln!("  {} {}", "✗ Parse error:".yellow(), format!("{e}").dim());
-                    false
-                }
+
+                eprintln!(
+                    "  {} Installed {} v{} to {}",
+                    "✓".green(),
+                    record.skill_name.cyan(),
+                    record.version.dim(),
+                    install_dir.display().to_string().dim()
+                );
+                true
             }
-        }
+            Err(e) => {
+                eprintln!("  {} {}", "✗ Parse error:".yellow(), format!("{e}").dim());
+                false
+            }
+        },
         Err(e) => {
             eprintln!(
                 "  {} {}",
@@ -2989,20 +2974,13 @@ fn pack_skill_bundle(name: &str) {
 async fn unpack_skill_bundle(path_str: &str, state: &mut ReplState) {
     if path_str.is_empty() {
         eprintln!("{}", "  Usage: /skill unpack <file.astra-skill>".yellow());
-        eprintln!(
-            "{}",
-            "  Extracts a skill bundle to .astra/skills/.".dim()
-        );
+        eprintln!("{}", "  Extracts a skill bundle to .astra/skills/.".dim());
         return;
     }
 
     let bundle_path = std::path::Path::new(path_str);
     if !bundle_path.exists() {
-        eprintln!(
-            "  {} File not found: {}",
-            "✗".yellow(),
-            path_str.cyan()
-        );
+        eprintln!("  {} File not found: {}", "✗".yellow(), path_str.cyan());
         return;
     }
 
@@ -3035,24 +3013,14 @@ async fn unpack_skill_bundle(path_str: &str, state: &mut ReplState) {
 /// Inspect a `.astra-skill` bundle without extracting.
 fn inspect_skill_bundle(path_str: &str) {
     if path_str.is_empty() {
-        eprintln!(
-            "{}",
-            "  Usage: /skill inspect <file.astra-skill>".yellow()
-        );
-        eprintln!(
-            "{}",
-            "  Shows bundle metadata without extracting.".dim()
-        );
+        eprintln!("{}", "  Usage: /skill inspect <file.astra-skill>".yellow());
+        eprintln!("{}", "  Shows bundle metadata without extracting.".dim());
         return;
     }
 
     let bundle_path = std::path::Path::new(path_str);
     if !bundle_path.exists() {
-        eprintln!(
-            "  {} File not found: {}",
-            "✗".yellow(),
-            path_str.cyan()
-        );
+        eprintln!("  {} File not found: {}", "✗".yellow(), path_str.cyan());
         return;
     }
 
@@ -3071,10 +3039,7 @@ fn inspect_skill_bundle(path_str: &str) {
             if !manifest.tags.is_empty() {
                 eprintln!("    Tags:        {}", manifest.tags.join(", "));
             }
-            eprintln!(
-                "    SHA-256:     {}",
-                manifest.skill_md_sha256.dim()
-            );
+            eprintln!("    SHA-256:     {}", manifest.skill_md_sha256.dim());
         }
         Err(e) => {
             eprintln!("  {} {}", "✗ Inspect failed:".red(), e);
@@ -3096,7 +3061,9 @@ fn format_bytes(bytes: u64) -> String {
 // ── Upgrade / Rollback / Check-update commands ─────────────────────────
 
 /// Read the local installed version of a skill from its SKILL.md frontmatter.
-fn read_local_skill_version(skill_name: &str) -> Option<(std::path::PathBuf, astra_runtime::skills::version::Version)> {
+fn read_local_skill_version(
+    skill_name: &str,
+) -> Option<(std::path::PathBuf, astra_runtime::skills::version::Version)> {
     let search_paths = crate::skill_instructions::skill_search_paths();
     for base in &search_paths {
         let skill_md = base.join(skill_name).join("SKILL.md");
@@ -3117,16 +3084,16 @@ async fn fetch_marketplace_version(
     api: &astra_thin_client::ThinClient,
     tok: &str,
 ) -> Option<String> {
-    let query_pairs = vec![
-        ("name", skill_name.to_string()),
-        ("limit", "1".to_string()),
-    ];
+    let query_pairs = vec![("name", skill_name.to_string()), ("limit", "1".to_string())];
     match api
         .get_bearer_path_query_text(tok, "/marketplace/search", &query_pairs)
         .await
     {
         Ok(text) => {
-            if let Ok(resp) = serde_json::from_str::<astra_services::marketplace_stats::SkillSearchResponse>(&text) {
+            if let Ok(resp) = serde_json::from_str::<
+                astra_services::marketplace_stats::SkillSearchResponse,
+            >(&text)
+            {
                 resp.results.first().map(|r| r.version.clone())
             } else {
                 None
@@ -3137,11 +3104,7 @@ async fn fetch_marketplace_version(
 }
 
 /// `/skill check-update [name]` — compare installed vs marketplace latest.
-async fn check_skill_updates(
-    name: &str,
-    api: &astra_thin_client::ThinClient,
-    token: Option<&str>,
-) {
+async fn check_skill_updates(name: &str, api: &astra_thin_client::ThinClient, token: Option<&str>) {
     let tok = token.unwrap_or("");
 
     eprintln!("\n  {}", "Checking for updates…".bold());
@@ -3352,21 +3315,25 @@ async fn upgrade_skill(
 }
 
 /// Upgrade all installed marketplace skills.
-async fn upgrade_all_skills(
-    api: &astra_thin_client::ThinClient,
-    tok: &str,
-    state: &mut ReplState,
-) {
-    eprintln!("\n  {}", "Checking all installed skills for updates…".bold());
+async fn upgrade_all_skills(api: &astra_thin_client::ThinClient, tok: &str, state: &mut ReplState) {
+    eprintln!(
+        "\n  {}",
+        "Checking all installed skills for updates…".bold()
+    );
     eprintln!("{}", "─".repeat(78).dim());
 
     // Get installed list from server
     let installed = match api
-        .get_bearer_path_query_text(tok, "/marketplace/installed", &[("limit", "200".to_string())])
+        .get_bearer_path_query_text(
+            tok,
+            "/marketplace/installed",
+            &[("limit", "200".to_string())],
+        )
         .await
     {
         Ok(text) => {
-            match serde_json::from_str::<astra_services::marketplace::InstalledListResponse>(&text) {
+            match serde_json::from_str::<astra_services::marketplace::InstalledListResponse>(&text)
+            {
                 Ok(resp) => resp.installations,
                 Err(e) => {
                     eprintln!("  {} {}", "✗ Parse error:".yellow(), format!("{e}").dim());
@@ -3459,14 +3426,8 @@ async fn rollback_skill(
     state: &mut ReplState,
 ) {
     if name.is_empty() {
-        eprintln!(
-            "{}",
-            "  Usage: /skill rollback <name>".yellow()
-        );
-        eprintln!(
-            "{}",
-            "  Reverts a skill to its previous version.".dim()
-        );
+        eprintln!("{}", "  Usage: /skill rollback <name>".yellow());
+        eprintln!("{}", "  Reverts a skill to its previous version.".dim());
         return;
     }
 
@@ -3503,11 +3464,7 @@ async fn rollback_skill(
                     name.cyan()
                 );
             } else {
-                eprintln!(
-                    "  {} {}",
-                    "✗ Rollback failed:".yellow(),
-                    msg.dim()
-                );
+                eprintln!("  {} {}", "✗ Rollback failed:".yellow(), msg.dim());
             }
             eprintln!();
             return;
@@ -3650,10 +3607,7 @@ async fn browse_marketplace(
 }
 
 /// Show trending skills from the marketplace (sorted by ranking score).
-async fn trending_marketplace(
-    api: &astra_thin_client::ThinClient,
-    token: Option<&str>,
-) {
+async fn trending_marketplace(api: &astra_thin_client::ThinClient, token: Option<&str>) {
     let tok = token.unwrap_or("");
 
     eprintln!("\n  {}", "🔥 Trending skills".bold());
@@ -3718,17 +3672,18 @@ async fn trending_marketplace(
 }
 
 /// Show skills installed on the server for the current user.
-async fn list_installed_marketplace(
-    api: &astra_thin_client::ThinClient,
-    token: Option<&str>,
-) {
+async fn list_installed_marketplace(api: &astra_thin_client::ThinClient, token: Option<&str>) {
     let tok = token.unwrap_or("");
 
     eprintln!("\n  {}", "Installed skills (server)".bold());
     eprintln!("{}", "─".repeat(78).dim());
 
     match api
-        .get_bearer_path_query_text(tok, "/marketplace/installed", &[("limit", "50".to_string())])
+        .get_bearer_path_query_text(
+            tok,
+            "/marketplace/installed",
+            &[("limit", "50".to_string())],
+        )
         .await
     {
         Ok(text) => {
@@ -3736,10 +3691,7 @@ async fn list_installed_marketplace(
             {
                 Ok(resp) => {
                     if resp.installations.is_empty() {
-                        eprintln!(
-                            "  {}",
-                            "No skills installed from marketplace.".dim()
-                        );
+                        eprintln!("  {}", "No skills installed from marketplace.".dim());
                         eprintln!(
                             "  {}",
                             "Tip: use '/skill install <name>' to install from marketplace.".dim()

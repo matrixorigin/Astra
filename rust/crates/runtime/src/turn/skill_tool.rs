@@ -2175,7 +2175,7 @@ mod tests {
 
             effort: None,
             agent_type: None,
-                    trust_tier: crate::skills::manifest::TrustTier::Bundled,
+            trust_tier: crate::skills::manifest::TrustTier::Bundled,
         };
         let act = super::build_activation(&skill);
         assert!(act.model_override.is_none());
@@ -2201,7 +2201,7 @@ mod tests {
 
             effort: None,
             agent_type: None,
-                    trust_tier: crate::skills::manifest::TrustTier::Bundled,
+            trust_tier: crate::skills::manifest::TrustTier::Bundled,
         };
         let act = super::build_activation(&skill);
         assert_eq!(
@@ -2220,7 +2220,7 @@ mod tests {
             allowed_tools: vec!["bash".into()],
             effort: None,
             agent_type: None,
-                    sandbox_policy: None,
+            sandbox_policy: None,
         };
         let merged = super::merge_activations(None, new);
         assert_eq!(merged.model_override.as_deref(), Some("gpt-4o"));
@@ -2234,14 +2234,14 @@ mod tests {
             allowed_tools: vec![],
             effort: None,
             agent_type: None,
-                    sandbox_policy: None,
+            sandbox_policy: None,
         };
         let new = SkillActivation {
             model_override: Some("model-b".into()),
             allowed_tools: vec![],
             effort: None,
             agent_type: None,
-                    sandbox_policy: None,
+            sandbox_policy: None,
         };
         let merged = super::merge_activations(Some(prev), new);
         assert_eq!(merged.model_override.as_deref(), Some("model-b"));
@@ -2254,14 +2254,14 @@ mod tests {
             allowed_tools: vec![],
             effort: None,
             agent_type: None,
-                    sandbox_policy: None,
+            sandbox_policy: None,
         };
         let new = SkillActivation {
             model_override: None, // no opinion — should keep "model-a"
             allowed_tools: vec![],
             effort: None,
             agent_type: None,
-                    sandbox_policy: None,
+            sandbox_policy: None,
         };
         let merged = super::merge_activations(Some(prev), new);
         assert_eq!(merged.model_override.as_deref(), Some("model-a"));
@@ -2274,14 +2274,14 @@ mod tests {
             allowed_tools: vec!["bash".into(), "grep".into(), "read_file".into()],
             effort: None,
             agent_type: None,
-                    sandbox_policy: None,
+            sandbox_policy: None,
         };
         let new = SkillActivation {
             model_override: None,
             allowed_tools: vec!["bash".into(), "read_file".into(), "edit".into()],
             effort: None,
             agent_type: None,
-                    sandbox_policy: None,
+            sandbox_policy: None,
         };
         let merged = super::merge_activations(Some(prev), new);
         let mut tools = merged.allowed_tools;
@@ -2296,14 +2296,14 @@ mod tests {
             allowed_tools: vec![], // unrestricted
             effort: None,
             agent_type: None,
-                    sandbox_policy: None,
+            sandbox_policy: None,
         };
         let new = SkillActivation {
             model_override: None,
             allowed_tools: vec!["bash".into()], // restricted
             effort: None,
             agent_type: None,
-                    sandbox_policy: None,
+            sandbox_policy: None,
         };
         let merged = super::merge_activations(Some(prev), new);
         assert_eq!(merged.allowed_tools, vec!["bash"]);
@@ -2316,14 +2316,14 @@ mod tests {
             allowed_tools: vec!["bash".into()], // restricted
             effort: None,
             agent_type: None,
-                    sandbox_policy: None,
+            sandbox_policy: None,
         };
         let new = SkillActivation {
             model_override: None,
             allowed_tools: vec![], // unrestricted
             effort: None,
             agent_type: None,
-                    sandbox_policy: None,
+            sandbox_policy: None,
         };
         let merged = super::merge_activations(Some(prev), new);
         assert_eq!(merged.allowed_tools, vec!["bash"]);
@@ -2336,14 +2336,14 @@ mod tests {
             allowed_tools: vec!["bash".into()],
             effort: None,
             agent_type: None,
-                    sandbox_policy: None,
+            sandbox_policy: None,
         };
         let new = SkillActivation {
             model_override: None,
             allowed_tools: vec!["edit".into()],
             effort: None,
             agent_type: None,
-                    sandbox_policy: None,
+            sandbox_policy: None,
         };
         let merged = super::merge_activations(Some(prev), new);
         assert!(merged.allowed_tools.is_empty());
@@ -2423,7 +2423,7 @@ mod tests {
 
                         effort: None,
                         agent_type: None,
-                    trust_tier: crate::skills::manifest::TrustTier::Bundled,
+                        trust_tier: crate::skills::manifest::TrustTier::Bundled,
                     }),
                     "skill-b" => Ok(ResolvedSkill {
                         name: "skill-b".into(),
@@ -2442,7 +2442,7 @@ mod tests {
 
                         effort: None,
                         agent_type: None,
-                    trust_tier: crate::skills::manifest::TrustTier::Bundled,
+                        trust_tier: crate::skills::manifest::TrustTier::Bundled,
                     }),
                     _ => Err(format!("unknown: {name}")),
                 }
@@ -2527,7 +2527,7 @@ mod tests {
 
                         effort: None,
                         agent_type: None,
-                    trust_tier: crate::skills::manifest::TrustTier::Bundled,
+                        trust_tier: crate::skills::manifest::TrustTier::Bundled,
                     })
                 } else {
                     Err(format!("unknown: {name}"))

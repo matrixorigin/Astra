@@ -215,16 +215,13 @@ pub fn load_user_themes() -> Vec<ThemeConfig> {
             let path = entry.path();
             if path
                 .extension()
-                .map_or(false, |ext| ext == "yaml" || ext == "yml")
+                .is_some_and(|ext| ext == "yaml" || ext == "yml")
             {
                 if let Ok(contents) = std::fs::read_to_string(&path) {
                     match serde_yaml::from_str::<ThemeConfig>(&contents) {
                         Ok(theme) => themes.push(theme),
                         Err(e) => {
-                            eprintln!(
-                                "  ⚠ Failed to parse theme {}: {e}",
-                                path.display()
-                            );
+                            eprintln!("  ⚠ Failed to parse theme {}: {e}", path.display());
                         }
                     }
                 }
@@ -319,12 +316,7 @@ pub fn header(text: &str) -> String {
 /// Style a section label (theme section_color, bold)
 pub fn section(text: &str) -> String {
     let t = current_theme();
-    let base = styled(text, t.section_color);
-    if t.bold_headers {
-        base // already colored, crossterm doesn't chain easily — acceptable
-    } else {
-        base
-    }
+    styled(text, t.section_color)
 }
 
 /// Style subtle/secondary text (dim if theme enables it)

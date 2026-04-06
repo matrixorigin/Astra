@@ -1846,10 +1846,7 @@ fn worktree_remove(project_root: &Path, args: &Value) -> String {
         _ => return "Error: 'path' is required for remove".to_string(),
     };
 
-    let force = args
-        .get("force")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
+    let force = args.get("force").and_then(Value::as_bool).unwrap_or(false);
 
     // Also delete the branch if requested
     let delete_branch = args
@@ -1885,9 +1882,7 @@ fn worktree_remove(project_root: &Path, args: &Value) -> String {
 
     // Remove worktree
     let mut cmd = std::process::Command::new("git");
-    cmd.current_dir(project_root)
-        .arg("worktree")
-        .arg("remove");
+    cmd.current_dir(project_root).arg("worktree").arg("remove");
     if force {
         cmd.arg("--force");
     }
@@ -2964,8 +2959,7 @@ mod tests {
             "test()",
             "test{}",
         ] {
-            let result =
-                git_worktree(&root, &json!({"action": "add", "branch": dangerous}));
+            let result = git_worktree(&root, &json!({"action": "add", "branch": dangerous}));
             assert!(
                 result.contains("Error") && result.contains("invalid branch name"),
                 "should reject '{dangerous}': {result}"

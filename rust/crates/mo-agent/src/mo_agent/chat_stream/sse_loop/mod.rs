@@ -42,7 +42,7 @@ use cli_loop_host::CliAgenticLoopHost;
 use serde_json::json;
 
 pub(crate) async fn stream_chat_sse(
-    p: ChatTurnParams<'_>,
+    mut p: ChatTurnParams<'_>,
 ) -> Result<StreamResult, crate::TurnFailure> {
     let start = Instant::now();
     let term_width = terminal_width_usize();
@@ -99,6 +99,11 @@ pub(crate) async fn stream_chat_sse(
         current_session_id.as_deref().unwrap_or("ephemeral"),
         step_recorder_chat_ephemeral_run_id(start.elapsed().as_millis()).as_str(),
     );
+    let mut local_discovered_skills = HashSet::new();
+    let discovered_skills = match p.discovered_skills.as_deref_mut() {
+        Some(shared) => std::mem::take(shared),
+        None => std::mem::take(&mut local_discovered_skills),
+    };
 
     // Capture full permission mode before perm_manager is moved into the host.
     let parent_perm_mode = p.perm_manager.mode();
@@ -229,11 +234,11 @@ pub(crate) async fn stream_chat_sse(
         skill_effort: None,
         skill_agent_type: None,
         skill_allowed_tools: None,
-            skill_sandbox_policy: None,
+        skill_sandbox_policy: None,
         skill_quality_tracker: p.skill_quality_tracker.clone(),
         skill_improvement_tracker: astra_runtime::skills::improvement::ImprovementTracker::new(),
         pinned_skills: std::collections::HashSet::new(),
-        discovered_skills: std::collections::HashSet::new(),
+        discovered_skills,
         tool_event_hooks: astra_runtime::skills::hooks::load_tool_event_hooks(&project_root),
         stop_hooks: hook_sets.stop_hooks,
         stop_hook_runs: 0,
@@ -252,6 +257,9 @@ pub(crate) async fn stream_chat_sse(
 
     // ─── Run the runtime loop ────────────────────────────────────────────
     if let Err(e) = run_agentic_loop_with_host(&mut host, &mut state).await {
+        if let Some(shared) = p.discovered_skills {
+            *shared = state.discovered_skills;
+        }
         return Err(crate::TurnFailure {
             error: e,
             partial: crate::PartialTurnData {
@@ -272,6 +280,9 @@ pub(crate) async fn stream_chat_sse(
     // ─── Finalize ────────────────────────────────────────────────────────
     // Merge skill quality data back to session-scoped tracker
     *p.skill_quality_tracker = state.skill_quality_tracker.clone();
+    if let Some(shared) = p.discovered_skills {
+        *shared = state.discovered_skills.clone();
+    }
 
     eprint_stream_loop_sidecars(StreamLoopSidecarEprint {
         explain: p.explain,

@@ -1,4 +1,5 @@
 use astra_runtime::{pipeline::persistence::ToolHealthEntry, tool_selector::ToolSelector};
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use tokio::sync::mpsc;
@@ -105,4 +106,6 @@ pub(crate) struct ChatTurnParams<'a> {
         Option<std::sync::Arc<tokio::sync::RwLock<crate::mcp_client::McpClientManager>>>,
     /// Session-scoped skill quality tracker for learning loop.
     pub(crate) skill_quality_tracker: &'a mut astra_runtime::skills::quality::SkillQualityTracker,
+    /// Session-scoped discover cache so surfaced skills survive across user turns.
+    pub(crate) discovered_skills: Option<&'a mut HashSet<String>>,
 }

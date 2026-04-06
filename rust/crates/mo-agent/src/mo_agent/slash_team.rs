@@ -101,7 +101,8 @@ impl TeamRegistry {
                 members: vec![
                     TeamMember {
                         role: "planner".to_string(),
-                        description: "Decomposes task into subtasks with acceptance criteria".into(),
+                        description: "Decomposes task into subtasks with acceptance criteria"
+                            .into(),
                         skills: vec![],
                         model_override: None,
                     },
@@ -151,17 +152,16 @@ impl TeamRegistry {
         Ok(())
     }
 
-    pub fn add_member(
-        &mut self,
-        team: &str,
-        member: TeamMember,
-    ) -> Result<(), String> {
+    pub fn add_member(&mut self, team: &str, member: TeamMember) -> Result<(), String> {
         let t = self
             .teams
             .get_mut(team)
             .ok_or_else(|| format!("Team '{team}' not found"))?;
         if t.members.iter().any(|m| m.role == member.role) {
-            return Err(format!("Role '{}' already exists in team '{team}'", member.role));
+            return Err(format!(
+                "Role '{}' already exists in team '{team}'",
+                member.role
+            ));
         }
         t.members.push(member);
         Ok(())
@@ -195,7 +195,10 @@ pub(super) fn handle_team_command(arg: &str, state: &mut super::ReplState) {
         "" | "list" => {
             let teams = state.team_registry.list();
             if teams.is_empty() {
-                eprintln!("  {}", "No teams defined. Use /team create <name> <description>".dim());
+                eprintln!(
+                    "  {}",
+                    "No teams defined. Use /team create <name> <description>".dim()
+                );
                 return;
             }
             eprintln!(
@@ -319,11 +322,7 @@ pub(super) fn handle_team_command(arg: &str, state: &mut super::ReplState) {
                             m.description
                         );
                         if !m.skills.is_empty() {
-                            eprintln!(
-                                "      {} {}",
-                                "Skills:".dim(),
-                                m.skills.join(", ")
-                            );
+                            eprintln!("      {} {}", "Skills:".dim(), m.skills.join(", "));
                         }
                         if let Some(ref model) = m.model_override {
                             eprintln!("      {} {}", "Model:".dim(), model);
@@ -369,10 +368,7 @@ pub(super) fn handle_team_command(arg: &str, state: &mut super::ReplState) {
             let key = parts.next().unwrap_or("").trim();
             let value = parts.next().unwrap_or("").trim();
             if team.is_empty() || key.is_empty() {
-                eprintln!(
-                    "{}",
-                    "  Usage: /team context <team> <key> <value>".yellow()
-                );
+                eprintln!("{}", "  Usage: /team context <team> <key> <value>".yellow());
                 eprintln!(
                     "{}",
                     "  Sets shared context accessible to all team members.".dim()
