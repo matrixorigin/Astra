@@ -7,42 +7,21 @@ on:
     branches: [main, develop]
 
 jobs:
-  lint:
+  check:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - name: Cache cargo
-        uses: actions/cache@v4
+      - uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            rust/target
-          key: ${{ runner.os }}-cargo-check-${{ hashFiles('rust/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-check-
-      - name: Install dependencies
-        run: make install-dev-deps
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('rust/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-registry-
       - name: Run clippy
-        run: cargo clippy --manifest-path rust/Cargo.toml --all-targets -- -D warnings
+        run: make lint
       - name: Check formatting
-        run: cargo fmt --manifest-path rust/Cargo.toml --all -- --check
-
-  type-check:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - name: Cache cargo
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            rust/target
-          key: ${{ runner.os }}-cargo-check-${{ hashFiles('rust/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-check-
-      - name: Install dependencies
-        run: make install-dev-deps
+        run: make format-check
       - name: Run cargo check
-        run: cargo check --manifest-path rust/Cargo.toml --all-targets
+        run: make type-check

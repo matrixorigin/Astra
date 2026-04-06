@@ -45,13 +45,8 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            rust/target
-          key: ${{ runner.os }}-cargo-gate-${{ hashFiles('rust/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-gate-
-
-      # Single source of truth for dev dependencies — see Makefile.
-      - name: Install dependencies
-        run: make install-dev-deps
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('rust/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-registry-
       
       - name: Detect change type
         id: detect-change

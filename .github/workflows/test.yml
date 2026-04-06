@@ -7,10 +7,8 @@ on:
     branches: [ main, develop ]
 
 jobs:
-  # ── Job 1: Rust workspace tests ────────────────────────────────────────
   test:
     runs-on: ubuntu-latest
-
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -19,12 +17,7 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            rust/target
-          key: ${{ runner.os }}-cargo-test-${{ hashFiles('rust/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-test-
-
-      - name: Install dependencies
-        run: make install-dev-deps
-
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('rust/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-registry-
       - name: Run test suite
         run: make test
