@@ -22,76 +22,57 @@ tags:
 Run the project's verification toolchain to confirm code correctness.
 
 **Working directory**: ${{CTX_WORK_DIR}}
+**Project type**: ${{CTX_PROJECT_TYPE}}
 
-## Step 1: Detect Project Type
+## Step 1: Select Toolchain
 
-**Success criteria**: Identified the project type and available tooling.
-
-Check for these markers (in order) and use the FIRST match:
-
-| Marker | Project Type | 
-|--------|-------------|
-| `Cargo.toml` | Rust |
-| `package.json` | Node.js (check for `bun.lockb` → Bun, else npm/yarn) |
-| `go.mod` | Go |
-| `pyproject.toml` or `requirements.txt` | Python |
-| `build.gradle` or `pom.xml` | Java/Kotlin |
-| `*.csproj` or `*.sln` | .NET (C#/F#) |
-| `Gemfile` | Ruby |
-| `Makefile` | Make-based (read targets to infer language) |
+Use the detected project type above. If blank or ambiguous, check for marker files (`Cargo.toml`, `package.json`, `go.mod`, etc.).
 
 If the project has a `Makefile` with a `check` or `test` target, prefer that — it often wraps the correct sequence.
 
-## Step 2: Run Checks (in order)
+## Step 2: Run Checks (stop on first failure unless user asked to fix)
 
-Execute each step. **Stop on first failure and report it.** If the user asked you to fix issues, fix them; otherwise report and continue to the next check.
+### Rust
+```
+cargo fmt --check
+cargo clippy --all-targets -- -D warnings
+cargo test
+```
 
-### 2a. Format Check
-| Project | Command |
-|---------|---------|
-| Rust | `cargo fmt --check` |
-| Node | Check `package.json` scripts for `format`/`prettier` first; fallback `npx prettier --check .` |
-| Go | `gofmt -l .` |
-| Python | `ruff format --check .` or `black --check .` |
+### Node.js / TypeScript
+```
+# Check package.json scripts first; fallback:
+npx prettier --check .
+npx eslint .
+npx tsc --noEmit        # if TypeScript
+npm test
+```
 
-### 2b. Lint
-| Project | Command |
-|---------|---------|
-| Rust | `cargo clippy --all-targets -- -D warnings` |
-| Node | Check `package.json` scripts for `lint` first; fallback `npx eslint .` |
-| Go | `golangci-lint run` or `go vet ./...` |
-| Python | `ruff check .` or `flake8 .` |
+### Go
+```
+gofmt -l .
+go vet ./...
+go test ./...
+```
 
-### 2c. Type Check (if applicable)
-| Project | Command |
-|---------|---------|
-| Node (TS) | `npx tsc --noEmit` |
-| Python | `mypy .` or `pyright .` |
+### Python
+```
+ruff format --check .    # or black --check .
+ruff check .             # or flake8 .
+mypy .                   # if configured
+pytest
+```
 
-### 2d. Test
-| Project | Command |
-|---------|---------|
-| Rust | `cargo test` |
-| Node | `npm test` / `bun test` / project's test script |
-| Go | `go test ./...` |
-| Python | `pytest` or `python -m unittest discover` |
+### Other
+Read the `Makefile`, `justfile`, or CI config to find the correct commands.
 
-### 2e. Build (if applicable)
-| Project | Command |
-|---------|---------|
-| Rust | `cargo build` |
-| Node | project's build script if present |
-| Go | `go build ./...` |
+## Step 3: Report
 
-## Step 3: Report Results
-
-**Success criteria**: Clear report with pass/fail status for each check.
-
-For each check, report: ✅ passed, ❌ failed (with error summary), or ⏭ skipped (tool not found).
+For each check: ✅ passed, ❌ failed (with error summary), or ⏭ skipped (tool not found).
 
 ## When NOT to Use
 - Don't use for runtime/integration testing that requires external services
-- If the user specifies a SCOPE (file or module), run only relevant tests, not the full suite
+- If the user specifies a scope (file or module), run only relevant tests
 "#,
     )
 }
