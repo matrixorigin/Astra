@@ -10,6 +10,7 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use astra_core::SkillSearchSettings;
 use astra_runtime::skills::executor::isolated::{SkillSubRunExecutor, SubRunResult};
 use astra_runtime::{
     pipeline::step_protocol::InMemoryIdempotencyCache,
@@ -177,9 +178,19 @@ impl AgenticLoopHost for SubRunHost {
             .get("function")
             .and_then(|f| f.get("name"))
             .and_then(Value::as_str)
-            && self.valid_tool_names.insert(name.to_string())
         {
-            self.all_schemas.push(schema);
+            let name_owned = name.to_string();
+            self.valid_tool_names.insert(name_owned.clone());
+            if let Some(existing) = self.all_schemas.iter_mut().find(|tool| {
+                tool.get("function")
+                    .and_then(|f| f.get("name"))
+                    .and_then(Value::as_str)
+                    == Some(name_owned.as_str())
+            }) {
+                *existing = schema;
+            } else {
+                self.all_schemas.push(schema);
+            }
         }
     }
 }
@@ -204,6 +215,8 @@ pub(crate) struct CliSkillSubRunExecutor {
     cancel_token: Option<std::sync::Arc<tokio_util::sync::CancellationToken>>,
     /// Skill resolver inherited from parent — enables nested skill invocations.
     skill_resolver: Option<std::sync::Arc<dyn astra_runtime::turn::skill_tool::SkillResolver>>,
+    /// Same surfacing policy as the parent loop / session state.
+    skill_search: SkillSearchSettings,
 }
 
 impl CliSkillSubRunExecutor {
@@ -223,6 +236,7 @@ impl CliSkillSubRunExecutor {
             permission_mode,
             cancel_token,
             skill_resolver: None,
+            skill_search: SkillSearchSettings::default(),
         }
     }
 
@@ -232,6 +246,11 @@ impl CliSkillSubRunExecutor {
         resolver: Option<std::sync::Arc<dyn astra_runtime::turn::skill_tool::SkillResolver>>,
     ) -> Self {
         self.skill_resolver = resolver;
+        self
+    }
+
+    pub fn with_skill_search(mut self, skill_search: SkillSearchSettings) -> Self {
+        self.skill_search = skill_search;
         self
     }
 }
@@ -386,6 +405,7 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
             ),
             pinned_skills: std::collections::HashSet::new(),
             discovered_skills: std::collections::HashSet::new(),
+            skill_search: self.skill_search.clone(),
             tool_event_hooks: astra_runtime::skills::hooks::load_tool_event_hooks(
                 &self.project_root,
             ),

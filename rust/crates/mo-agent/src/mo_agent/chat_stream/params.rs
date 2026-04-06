@@ -104,6 +104,8 @@ pub(crate) struct ChatTurnParams<'a> {
     /// MCP client manager for external tool servers.
     pub(crate) mcp_manager:
         Option<std::sync::Arc<tokio::sync::RwLock<crate::mcp_client::McpClientManager>>>,
+    /// Session-scoped skill surfacing policy for this REPL / plan execution.
+    pub(crate) skill_search: &'a astra_core::SkillSearchSettings,
     /// Session-scoped skill quality tracker for learning loop.
     pub(crate) skill_quality_tracker: &'a mut astra_runtime::skills::quality::SkillQualityTracker,
     /// Session-scoped discover cache so surfaced skills survive across user turns.

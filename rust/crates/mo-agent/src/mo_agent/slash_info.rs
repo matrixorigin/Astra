@@ -885,6 +885,7 @@ pub(super) async fn handle_info_command(
                 stream_event_tx: None,
                 approval_request_tx: None,
                 mcp_manager: Some(state.mcp_manager.clone()),
+                skill_search: &state.skill_search,
                 skill_quality_tracker: &mut state.skill_quality_tracker,
                 discovered_skills: None,
             })

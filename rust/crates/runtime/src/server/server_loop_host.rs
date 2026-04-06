@@ -650,9 +650,19 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             .get("function")
             .and_then(|f| f.get("name"))
             .and_then(Value::as_str)
-            && self.valid_tools.insert(name.to_string())
         {
-            self.edge_tools.push(schema);
+            let name_owned = name.to_string();
+            self.valid_tools.insert(name_owned.clone());
+            if let Some(existing) = self.edge_tools.iter_mut().find(|tool| {
+                tool.get("function")
+                    .and_then(|f| f.get("name"))
+                    .and_then(Value::as_str)
+                    == Some(name_owned.as_str())
+            }) {
+                *existing = schema;
+            } else {
+                self.edge_tools.push(schema);
+            }
         }
     }
 }
@@ -1081,6 +1091,7 @@ mod tests {
             skill_improvement_tracker: crate::skills::improvement::ImprovementTracker::new(),
             pinned_skills: std::collections::HashSet::new(),
             discovered_skills: std::collections::HashSet::new(),
+            skill_search: astra_core::SkillSearchSettings::default(),
             tool_event_hooks: crate::skills::hooks::ToolEventHookRegistry::default(),
             stop_hooks: Vec::new(),
             stop_hook_runs: 0,

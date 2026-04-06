@@ -629,7 +629,7 @@ impl ToolRegistry {
             .and_then(Value::as_str)
         {
             if self.schema_index.contains_key(name) {
-                return; // already registered
+                return;
             }
             let name_owned = name.to_string();
             let idx = self.all_schemas.len();
@@ -644,6 +644,39 @@ impl ToolRegistry {
             }
             self.all_schemas.push(schema);
         }
+    }
+
+    /// Insert a new schema or replace an existing schema with the same tool name.
+    pub fn upsert_schema_pinned(&mut self, schema: Value, pinned: bool) {
+        let Some(name) = schema
+            .get("function")
+            .and_then(|f| f.get("name"))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+        else {
+            return;
+        };
+
+        let json_bytes = serde_json::to_string(&schema).map(|s| s.len()).unwrap_or(0);
+        self.measured_costs
+            .insert(name.clone(), (json_bytes / 4) as u32);
+
+        if let Some(&idx) = self.schema_index.get(&name) {
+            self.all_schemas[idx] = schema.clone();
+            if let Some((_, existing)) = self.pinned_schemas.iter_mut().find(|(n, _)| n == &name) {
+                *existing = schema;
+            } else if pinned {
+                self.pinned_schemas.push((name, schema));
+            }
+            return;
+        }
+
+        self.inject_schema_pinned(schema, pinned);
+    }
+
+    /// Insert or replace a pinned schema by tool name.
+    pub fn upsert_schema(&mut self, schema: Value) {
+        self.upsert_schema_pinned(schema, true);
     }
 
     /// Total tool count (built-in + registered plugins).

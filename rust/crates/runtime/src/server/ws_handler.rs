@@ -437,6 +437,7 @@ async fn handle_chat_message(
         session_id: conn.session_id.clone(),
         agent_id: None,
         model,
+        skill_search: None,
         context,
         max_candidates: 25,
         explain: false,

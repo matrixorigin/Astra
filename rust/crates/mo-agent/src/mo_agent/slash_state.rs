@@ -149,8 +149,9 @@ pub(super) async fn handle_state_command(
                     stream_event_tx: None,
                     approval_request_tx: None,
                     mcp_manager: Some(state.mcp_manager.clone()),
-                skill_quality_tracker: &mut state.skill_quality_tracker,
-                discovered_skills: None,
+                    skill_search: &state.skill_search,
+                    skill_quality_tracker: &mut state.skill_quality_tracker,
+                    discovered_skills: None,
                 }) => r,
                 _ = tokio::signal::ctrl_c() => {
                     if let Some(ref t) = _cancel_token_guard { t.cancel(); }
@@ -237,6 +238,7 @@ pub(super) async fn handle_state_command(
                         stream_event_tx: None,
                         approval_request_tx: None,
                         mcp_manager: Some(state.mcp_manager.clone()),
+                        skill_search: &state.skill_search,
                         skill_quality_tracker: &mut state.skill_quality_tracker,
                         discovered_skills: None,
                     })
@@ -307,6 +309,7 @@ pub(super) async fn handle_state_command(
                                 stream_event_tx: None,
                                 approval_request_tx: None,
                                 mcp_manager: Some(state.mcp_manager.clone()),
+                                skill_search: &state.skill_search,
                                 skill_quality_tracker: &mut state.skill_quality_tracker,
                                 discovered_skills: None,
                             })

@@ -73,6 +73,7 @@ pub struct ChatRequestData {
     pub session_id: Option<String>,
     pub agent_id: Option<String>,
     pub model: Option<String>,
+    pub skill_search: Option<astra_core::SkillSearchSettings>,
     pub context: Option<serde_json::Map<String, serde_json::Value>>,
     pub max_candidates: u32,
     pub explain: bool,

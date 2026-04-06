@@ -258,8 +258,10 @@ pub struct AgenticLoopState {
     pub skill_improvement_tracker: crate::skills::improvement::ImprovementTracker,
     /// Skills pinned by the user — always included in budget (never truncated).
     pub pinned_skills: std::collections::HashSet<String>,
-    /// Canonical skill names surfaced via `discover_skills` this session (experimental search).
+    /// Canonical skill names surfaced via `discover_skills` this session.
     pub discovered_skills: HashSet<String>,
+    /// Skill catalog surfacing for this request / session.
+    pub skill_search: astra_core::SkillSearchSettings,
 
     /// Tool event hooks (PreToolUse/PostToolUse) for intercepting tool calls.
     /// Loaded from `.astra/hooks.json` or skill frontmatter.
@@ -351,6 +353,7 @@ fn parse_delegation_request(
     tool_call: &Value,
     parent_run_id: &str,
     session_id: &str,
+    skill_search: &astra_core::SkillSearchSettings,
 ) -> Result<astra_services::coordination::DelegationRequest, String> {
     let args_str = tool_call
         .get("function")
@@ -373,6 +376,11 @@ fn parse_delegation_request(
     context.insert(
         "session_id".to_string(),
         Value::String(session_id.to_string()),
+    );
+    context.insert(
+        "skill_search".to_string(),
+        serde_json::to_value(skill_search)
+            .map_err(|e| format!("failed to encode skill_search config: {e}"))?,
     );
     if let Some(ctx) = args.get("context").and_then(Value::as_object) {
         for (k, v) in ctx {
@@ -479,6 +487,7 @@ async fn partition_and_execute_delegations(
     session_id: &str,
     source_agent_id: &str,
     workspace_hint: Option<&str>,
+    skill_search: &astra_core::SkillSearchSettings,
 ) -> (Vec<(String, String)>, Vec<Value>) {
     let mut delegation_results = Vec::new();
     let mut remaining = Vec::new();
@@ -491,7 +500,7 @@ async fn partition_and_execute_delegations(
                 .unwrap_or("unknown")
                 .to_string();
 
-            match parse_delegation_request(tc, parent_run_id, session_id) {
+            match parse_delegation_request(tc, parent_run_id, session_id, skill_search) {
                 Ok(mut request) => {
                     merge_workspace_hint_into_delegation_request(&mut request, workspace_hint);
                     match engine.execute(request, source_agent_id).await {
@@ -780,20 +789,21 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
     if let Some(resolver) = &state.skill_resolver {
         let full = resolver.available_skills();
         if !full.is_empty() {
-            let (visible, experimental) = crate::turn::skill_tool::visible_skills_for_host_turn(
+            let (visible, open_skill_name) = crate::turn::skill_tool::visible_skills_for_host_turn(
                 &full,
                 state.message.as_str(),
                 &state.skill_quality_tracker,
                 &state.pinned_skills,
                 &state.discovered_skills,
+                &state.skill_search,
             );
             host.inject_tool_schema(crate::turn::skill_tool::skill_tool_schema(
                 &visible,
                 Some(&state.skill_quality_tracker),
                 Some(&state.pinned_skills),
-                experimental,
+                open_skill_name,
             ));
-            if experimental {
+            if open_skill_name {
                 host.inject_tool_schema(crate::turn::skill_tool::discover_skills_tool_schema());
             }
         }
@@ -828,18 +838,20 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
             state.skill_listing_message = if full.is_empty() {
                 None
             } else {
-                let (visible, experimental) = crate::turn::skill_tool::visible_skills_for_host_turn(
-                    &full,
-                    state.message.as_str(),
-                    &state.skill_quality_tracker,
-                    &state.pinned_skills,
-                    &state.discovered_skills,
-                );
+                let (visible, open_skill_name) =
+                    crate::turn::skill_tool::visible_skills_for_host_turn(
+                        &full,
+                        state.message.as_str(),
+                        &state.skill_quality_tracker,
+                        &state.pinned_skills,
+                        &state.discovered_skills,
+                        &state.skill_search,
+                    );
                 Some(crate::turn::skill_tool::skill_listing_system_message(
                     &visible,
                     Some(&state.skill_quality_tracker),
                     Some(&state.pinned_skills),
-                    experimental,
+                    open_skill_name,
                 ))
             };
         }
@@ -940,6 +952,7 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
                     state.current_session_id.as_deref().unwrap_or("unknown"),
                     "orchestrator",
                     state.workspace_root_hint.as_deref(),
+                    &state.skill_search,
                 )
                 .await
             } else {
@@ -1095,6 +1108,7 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
                 &state.skill_quality_tracker,
                 &state.pinned_skills,
                 &state.discovered_skills,
+                &state.skill_search,
             );
             let discover_exclude =
                 crate::turn::skill_tool::skill_mask_names_lowercase(&visible_for_mask);
@@ -1229,21 +1243,22 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
                 if let Some(resolver) = &state.skill_resolver {
                     let full = resolver.available_skills();
                     if !full.is_empty() {
-                        let (visible, experimental) =
+                        let (visible, open_skill_name) =
                             crate::turn::skill_tool::visible_skills_for_host_turn(
                                 &full,
                                 state.message.as_str(),
                                 &state.skill_quality_tracker,
                                 &state.pinned_skills,
                                 &state.discovered_skills,
+                                &state.skill_search,
                             );
                         host.inject_tool_schema(crate::turn::skill_tool::skill_tool_schema(
                             &visible,
                             Some(&state.skill_quality_tracker),
                             Some(&state.pinned_skills),
-                            experimental,
+                            open_skill_name,
                         ));
-                        if experimental {
+                        if open_skill_name {
                             host.inject_tool_schema(
                                 crate::turn::skill_tool::discover_skills_tool_schema(),
                             );
@@ -1635,6 +1650,7 @@ mod tests {
             skill_improvement_tracker: crate::skills::improvement::ImprovementTracker::new(),
             pinned_skills: std::collections::HashSet::new(),
             discovered_skills: HashSet::new(),
+            skill_search: astra_core::SkillSearchSettings::default(),
             tool_event_hooks: crate::skills::hooks::ToolEventHookRegistry::default(),
             stop_hooks: Vec::new(),
             stop_hook_runs: 0,
@@ -2248,10 +2264,17 @@ mod tests {
                 "arguments": "{\"task\": \"write tests\", \"agents\": [\"coder\"], \"pattern\": \"sequential\", \"context\": {\"repo\": \"my-repo\"}}"
             }
         });
-        let req = super::parse_delegation_request(&tool_call, "run-123", "session-456").unwrap();
+        let req = super::parse_delegation_request(
+            &tool_call,
+            "run-123",
+            "session-456",
+            &astra_core::SkillSearchSettings::default(),
+        )
+        .unwrap();
         assert_eq!(req.task, "write tests");
         assert_eq!(req.parent_run_id, "run-123");
         assert!(req.context.contains_key("session_id"));
+        assert!(req.context.contains_key("skill_search"));
         assert!(req.context.contains_key("repo"));
     }
 
@@ -2264,7 +2287,12 @@ mod tests {
                 "name": "delegate"
             }
         });
-        let result = super::parse_delegation_request(&tool_call, "run-1", "sess-1");
+        let result = super::parse_delegation_request(
+            &tool_call,
+            "run-1",
+            "sess-1",
+            &astra_core::SkillSearchSettings::default(),
+        );
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("missing arguments"));
     }
@@ -2416,6 +2444,7 @@ mod tests {
             "test-session",
             "orchestrator",
             None,
+            &astra_core::SkillSearchSettings::default(),
         )
         .await;
 
@@ -2469,6 +2498,7 @@ mod tests {
             "sess-1",
             "orchestrator",
             None,
+            &astra_core::SkillSearchSettings::default(),
         )
         .await;
 
@@ -2505,6 +2535,7 @@ mod tests {
             "sess-1",
             "orchestrator",
             None,
+            &astra_core::SkillSearchSettings::default(),
         )
         .await;
 

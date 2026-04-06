@@ -578,6 +578,8 @@ struct ReplState {
     unified_skill_registry: std::sync::Arc<astra_runtime::skills::UnifiedSkillRegistry>,
     /// Session-scoped skill quality tracker for learning loop.
     skill_quality_tracker: astra_runtime::skills::quality::SkillQualityTracker,
+    /// Session-scoped skill surfacing config for dynamic tuning.
+    skill_search: astra_core::SkillSearchSettings,
     /// Skill auto-improvement tracker — detects user corrections and proposes SKILL.md rewrites.
     skill_improvement_tracker: astra_runtime::skills::improvement::ImprovementTracker,
     /// Skills pinned by the user — always included in budget (never truncated).
@@ -665,6 +667,7 @@ impl Default for ReplState {
             calibrator: None,
             unified_skill_registry: astra_runtime::skills::default_unified_registry().clone(),
             skill_quality_tracker: astra_runtime::skills::quality::SkillQualityTracker::new(),
+            skill_search: astra_core::SkillSearchSettings::default(),
             skill_improvement_tracker: astra_runtime::skills::improvement::ImprovementTracker::new(
             ),
             pinned_skills: std::collections::HashSet::new(),
@@ -2711,6 +2714,7 @@ fn take_plan_context(
         recent_tools: state.recent_tools.clone(),
         tool_health_entries: state.tool_health_entries.clone(),
         unified_skill_registry: state.unified_skill_registry.clone(),
+        skill_search: state.skill_search.clone(),
         delegation_engine: state.delegation_engine.clone(),
         durable_task_state: state.durable_task_state.take(),
         workspace_root: std::env::current_dir().unwrap_or_default(),
@@ -5418,6 +5422,7 @@ mod tests {
         let selector = tool_selector::TfIdfSelector::new(registry);
         let mut pm = PermissionManager::new(true);
         let mut skill_qt = astra_runtime::skills::quality::SkillQualityTracker::new();
+        let skill_search = astra_core::SkillSearchSettings::default();
         let result = stream_chat_sse(ChatTurnParams {
             api: &api,
             token: "fake-token",
@@ -5445,6 +5450,7 @@ mod tests {
             stream_event_tx: None,
             approval_request_tx: None,
             mcp_manager: None,
+            skill_search: &skill_search,
             skill_quality_tracker: &mut skill_qt,
             discovered_skills: None,
         })
@@ -5473,6 +5479,7 @@ mod tests {
         let selector = tool_selector::TfIdfSelector::new(registry);
         let mut pm = PermissionManager::new(true);
         let mut skill_qt = astra_runtime::skills::quality::SkillQualityTracker::new();
+        let skill_search = astra_core::SkillSearchSettings::default();
         let result = stream_chat_sse(ChatTurnParams {
             api: &api,
             token: "fake-token",
@@ -5500,6 +5507,7 @@ mod tests {
             stream_event_tx: None,
             approval_request_tx: None,
             mcp_manager: None,
+            skill_search: &skill_search,
             skill_quality_tracker: &mut skill_qt,
             discovered_skills: None,
         })
@@ -5544,6 +5552,7 @@ mod tests {
         let selector = tool_selector::TfIdfSelector::new(registry);
         let mut pm = PermissionManager::new(true); // auto-approve
         let mut skill_qt = astra_runtime::skills::quality::SkillQualityTracker::new();
+        let skill_search = astra_core::SkillSearchSettings::default();
         let result = stream_chat_sse(ChatTurnParams {
             api: &api,
             token: "fake-token",
@@ -5571,6 +5580,7 @@ mod tests {
             stream_event_tx: None,
             approval_request_tx: None,
             mcp_manager: None,
+            skill_search: &skill_search,
             skill_quality_tracker: &mut skill_qt,
             discovered_skills: None,
         })

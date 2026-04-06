@@ -1,9 +1,41 @@
 use std::{collections::HashMap, env, error::Error, fmt};
 
+use serde::{Deserialize, Serialize};
+
 /// Default Memoria base URL. Uses `127.0.0.1` instead of `localhost` because
 /// Memoria binds to `0.0.0.0` (IPv4 only) and `localhost` may resolve to `::1`
 /// on dual-stack systems, causing connection failures.
 pub const DEFAULT_MEMORIA_URL: &str = "http://127.0.0.1:8100";
+
+/// Tunable skill catalog surfacing: capped per-turn listing plus `discover_skills` when the
+/// catalog is larger than `min_catalog_size` and `dynamic_surface` is enabled.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkillSearchSettings {
+    /// When true and skill count exceeds `min_catalog_size`, use a capped surface + discovery tool.
+    pub dynamic_surface: bool,
+    /// Below or equal to this count, every skill is listed (no discovery path).
+    pub min_catalog_size: usize,
+    /// Max skills in the auto-surfaced subset when dynamic mode applies.
+    pub surface_cap: usize,
+}
+
+impl Default for SkillSearchSettings {
+    fn default() -> Self {
+        Self {
+            dynamic_surface: true,
+            min_catalog_size: 8,
+            surface_cap: 14,
+        }
+    }
+}
+
+impl SkillSearchSettings {
+    /// When true, expose the full catalog (enum listing, no `discover_skills` for this size).
+    #[inline]
+    pub fn use_full_catalog(&self, skill_count: usize) -> bool {
+        !self.dynamic_surface || skill_count <= self.min_catalog_size
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AppSettings {

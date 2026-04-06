@@ -45,6 +45,7 @@ pub(super) async fn execute_cli_command(
                 &std::env::current_dir().unwrap_or_default(),
             );
             let mut skill_qt = astra_runtime::skills::quality::SkillQualityTracker::new();
+            let skill_search = astra_core::SkillSearchSettings::default();
             let sr = match stream_chat_sse(ChatTurnParams {
                 api,
                 token: &token,
@@ -72,6 +73,7 @@ pub(super) async fn execute_cli_command(
                 stream_event_tx: None,
                 approval_request_tx: None,
                 mcp_manager: None,
+                skill_search: &skill_search,
                 skill_quality_tracker: &mut skill_qt,
                 discovered_skills: None,
             })
@@ -107,6 +109,7 @@ pub(super) async fn execute_cli_command(
                         stream_event_tx: None,
                         approval_request_tx: None,
                         mcp_manager: None,
+                        skill_search: &skill_search,
                         skill_quality_tracker: &mut skill_qt,
                 discovered_skills: None,
                     })
@@ -304,6 +307,7 @@ pub(super) async fn execute_cli_command(
             let render_md = is_tty && !quiet;
 
             let mut skill_qt = astra_runtime::skills::quality::SkillQualityTracker::new();
+            let skill_search = astra_core::SkillSearchSettings::default();
             let sr = match stream_chat_sse(ChatTurnParams {
                 api,
                 token: &token,
@@ -331,6 +335,7 @@ pub(super) async fn execute_cli_command(
                 stream_event_tx: None,
                 approval_request_tx: None,
                 mcp_manager: None,
+                skill_search: &skill_search,
                 skill_quality_tracker: &mut skill_qt,
                 discovered_skills: None,
             })
@@ -366,6 +371,7 @@ pub(super) async fn execute_cli_command(
                         stream_event_tx: None,
                         approval_request_tx: None,
                         mcp_manager: None,
+                        skill_search: &skill_search,
                         skill_quality_tracker: &mut skill_qt,
                 discovered_skills: None,
                     })

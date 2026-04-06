@@ -225,10 +225,20 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
             .get("function")
             .and_then(|f| f.get("name"))
             .and_then(Value::as_str)
-            && self.valid_tool_names.insert(name.to_string())
         {
-            self.registry.inject_schema(schema.clone());
-            self.all_schemas.push(schema);
+            let name_owned = name.to_string();
+            self.valid_tool_names.insert(name_owned.clone());
+            self.registry.upsert_schema(schema.clone());
+            if let Some(existing) = self.all_schemas.iter_mut().find(|tool| {
+                tool.get("function")
+                    .and_then(|f| f.get("name"))
+                    .and_then(Value::as_str)
+                    == Some(name_owned.as_str())
+            }) {
+                *existing = schema;
+            } else {
+                self.all_schemas.push(schema);
+            }
         }
     }
 }

@@ -32,6 +32,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use astra_core::SkillSearchSettings;
 use serde_json::Value;
 
 use crate::skills::arguments::substitute_arguments;
@@ -177,14 +178,8 @@ pub trait SkillResolver: Send + Sync {
 
 pub const SKILL_TOOL_NAME: &str = "skill";
 
-/// Second-stage discovery tool (Claude Code `EXPERIMENTAL_SKILL_SEARCH` parity).
+/// Second-stage discovery tool (Claude Code skill-search parity).
 pub const DISCOVER_SKILLS_TOOL_NAME: &str = "discover_skills";
-
-/// Only auto-surface a subset when the catalog is larger than this.
-const EXPERIMENTAL_SKILL_SEARCH_MIN_CATALOG: usize = 8;
-
-/// Max skills shown in the tool listing / schema when experimental search is on.
-const EXPERIMENTAL_SURFACE_CAP: usize = 14;
 
 /// Max skills returned from a single `discover_skills` call.
 const DISCOVER_SKILLS_MAX_RESULTS: usize = 8;
@@ -321,24 +316,6 @@ fn format_skills_within_budget(
     (entries, all_names)
 }
 
-// ─── Experimental skill search (Claude Code EXPERIMENTAL_SKILL_SEARCH) ─────
-
-/// `EXPERIMENTAL_SKILL_SEARCH=1|true|yes|on` enables dynamic surfacing + `discover_skills`.
-pub fn experimental_skill_search_enabled() -> bool {
-    match std::env::var("EXPERIMENTAL_SKILL_SEARCH") {
-        Ok(v) => {
-            let s = v.to_ascii_lowercase();
-            matches!(s.as_str(), "1" | "true" | "yes" | "on")
-        }
-        Err(_) => false,
-    }
-}
-
-/// When true, use the full catalog path (no `discover_skills`, enum listing all names).
-pub fn experimental_skill_search_use_full_catalog(skill_count: usize) -> bool {
-    !experimental_skill_search_enabled() || skill_count <= EXPERIMENTAL_SKILL_SEARCH_MIN_CATALOG
-}
-
 fn tokenize_query(q: &str) -> Vec<String> {
     q.to_lowercase()
         .split(|c: char| !c.is_alphanumeric())
@@ -414,14 +391,15 @@ fn score_skill_for_query(
     score
 }
 
-/// Pick a small relevant subset for the current user message (experimental mode only).
+/// Pick a small relevant subset for the current user message when dynamic surfacing applies.
 pub fn select_skills_for_turn(
     all_skills: &[SkillToolInfo],
     user_message: &str,
     quality_tracker: Option<&crate::skills::quality::SkillQualityTracker>,
     pinned_skills: Option<&HashSet<String>>,
+    cfg: &SkillSearchSettings,
 ) -> Vec<SkillToolInfo> {
-    if experimental_skill_search_use_full_catalog(all_skills.len()) {
+    if cfg.use_full_catalog(all_skills.len()) {
         return all_skills.to_vec();
     }
 
@@ -455,7 +433,7 @@ pub fn select_skills_for_turn(
 
     if !weak {
         for (sc, s) in scored {
-            if picked.len() >= EXPERIMENTAL_SURFACE_CAP {
+            if picked.len() >= cfg.surface_cap {
                 break;
             }
             if sc >= threshold {
@@ -490,7 +468,7 @@ pub fn select_skills_for_turn(
             })
         });
         for s in rest {
-            if picked.len() >= EXPERIMENTAL_SURFACE_CAP {
+            if picked.len() >= cfg.surface_cap {
                 break;
             }
             picked.push((*s).clone());
@@ -516,18 +494,25 @@ pub fn merge_discovered_skills_into_visible(
     out
 }
 
-/// Visible skills + whether experimental search mode is active for this catalog size.
+/// Visible skills + whether dynamic surfacing is active (open `skill_name` + `discover_skills`).
 pub fn visible_skills_for_host_turn(
     full: &[SkillToolInfo],
     user_message: &str,
     quality_tracker: &crate::skills::quality::SkillQualityTracker,
     pinned: &HashSet<String>,
     discovered: &HashSet<String>,
+    cfg: &SkillSearchSettings,
 ) -> (Vec<SkillToolInfo>, bool) {
-    if experimental_skill_search_use_full_catalog(full.len()) {
+    if cfg.use_full_catalog(full.len()) {
         return (full.to_vec(), false);
     }
-    let base = select_skills_for_turn(full, user_message, Some(quality_tracker), Some(pinned));
+    let base = select_skills_for_turn(
+        full,
+        user_message,
+        Some(quality_tracker),
+        Some(pinned),
+        cfg,
+    );
     let visible = merge_discovered_skills_into_visible(base, full, discovered);
     (visible, true)
 }
@@ -635,7 +620,7 @@ pub fn execute_discover_skills(
 
 /// Generate the OpenAI-compatible tool schema for the `skill` tool.
 ///
-/// When `open_skill_name` is true (experimental search), `skill_name` is a free string
+/// When `open_skill_name` is true (dynamic surfacing), `skill_name` is a free string
 /// (no JSON `enum`) so the catalog can grow mid-session via `discover_skills` without
 /// re-injecting schemas. Otherwise an enum lists all callable aliases.
 ///
@@ -664,7 +649,7 @@ pub fn skill_tool_schema(
         }
     }
 
-    let experimental_note = if open_skill_name {
+    let dynamic_note = if open_skill_name {
         "\n\nOnly a subset of skills is listed below. If none apply, call `discover_skills` with a specific description of your next action before improvising."
     } else {
         ""
@@ -687,7 +672,7 @@ pub fn skill_tool_schema(
          - If the user explicitly references a skill by name, invoke it\n\n\
          Available skills:\n{}{}",
         skill_entries.join("\n"),
-        experimental_note
+        dynamic_note
     );
 
     serde_json::json!({
@@ -828,8 +813,8 @@ pub struct SkillActivation {
 
 /// Handle `discover_skills` then `skill` tool calls in one batch (discover runs first).
 ///
-/// When `experimental_skill_search` is off, callers should use [`partition_and_execute_skills`]
-/// only — this function is a no-op wrapper if there are no discover calls (still splits skills).
+/// When dynamic surfacing is off, callers typically see no `discover_skills` calls; this still
+/// splits `skill` vs other tools and runs discovery first when present.
 pub async fn partition_discover_and_execute_skills(
     tool_calls: &[Value],
     resolver: &dyn SkillResolver,

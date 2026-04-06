@@ -38,6 +38,8 @@ pub(super) struct ChatRequest {
     pub(super) session_id: Option<String>,
     pub(super) agent_id: Option<String>,
     pub(super) model: Option<String>,
+    #[serde(default)]
+    pub(super) skill_search: Option<astra_core::SkillSearchSettings>,
     pub(super) context: Option<serde_json::Map<String, serde_json::Value>>,
     #[serde(default = "default_max_candidates")]
     pub(super) max_candidates: u32,
@@ -598,6 +600,7 @@ pub(super) fn chat_request_into_data(mut request: ChatRequest) -> ChatRequestDat
         session_id: request.session_id,
         agent_id: request.agent_id,
         model: request.model,
+        skill_search: request.skill_search,
         context,
         max_candidates: request.max_candidates,
         explain: request.explain,
@@ -1528,6 +1531,7 @@ mod tests {
             session_id: Some("s1".into()),
             agent_id: Some("a1".into()),
             model: Some("gpt-4".into()),
+            skill_search: Some(astra_core::SkillSearchSettings::default()),
             context: Some(ctx.clone()),
             max_candidates: 3,
             explain: true,
@@ -1539,6 +1543,10 @@ mod tests {
         assert_eq!(data.session_id.as_deref(), Some("s1"));
         assert_eq!(data.agent_id.as_deref(), Some("a1"));
         assert_eq!(data.model.as_deref(), Some("gpt-4"));
+        assert_eq!(
+            data.skill_search,
+            Some(astra_core::SkillSearchSettings::default())
+        );
         assert_eq!(data.context, Some(ctx));
         assert_eq!(data.max_candidates, 3);
         assert!(data.explain);
@@ -1564,6 +1572,7 @@ mod tests {
             session_id: None,
             agent_id: None,
             model: None,
+            skill_search: None,
             context: None,
             max_candidates: 5,
             explain: false,

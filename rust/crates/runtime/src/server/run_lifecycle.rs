@@ -67,6 +67,16 @@ fn build_server_skill_resolver() -> (
     (Some(registry), resolver)
 }
 
+fn skill_search_from_context(
+    context: &std::collections::HashMap<String, serde_json::Value>,
+) -> astra_core::SkillSearchSettings {
+    context
+        .get("skill_search")
+        .cloned()
+        .and_then(|v| serde_json::from_value(v).ok())
+        .unwrap_or_default()
+}
+
 // ─── Run State ──────────────────────────────────────────────────────────────
 
 /// Status of a single agentic run.
@@ -232,6 +242,7 @@ impl AgenticRunLifecycleService {
             })
             .unwrap_or_default();
         let workspace_root_hint = project_root_buf.map(|p| p.to_string_lossy().into_owned());
+        let skill_search = request.skill_search.clone().unwrap_or_default();
         let tool_event_hooks = workspace_root_hint
             .as_ref()
             .map(|root| crate::skills::hooks::load_tool_event_hooks(std::path::Path::new(root)))
@@ -296,6 +307,7 @@ impl AgenticRunLifecycleService {
             skill_improvement_tracker: crate::skills::improvement::ImprovementTracker::new(),
             pinned_skills: std::collections::HashSet::new(),
             discovered_skills: std::collections::HashSet::new(),
+            skill_search,
             tool_event_hooks,
             stop_hooks: hook_sets.stop_hooks,
             stop_hook_runs: 0,
@@ -960,6 +972,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
             skill_improvement_tracker: crate::skills::improvement::ImprovementTracker::new(),
             pinned_skills: std::collections::HashSet::new(),
             discovered_skills: std::collections::HashSet::new(),
+            skill_search: skill_search_from_context(&config.context),
             tool_event_hooks,
             stop_hooks: hook_sets.stop_hooks,
             stop_hook_runs: 0,
@@ -1091,6 +1104,7 @@ mod tests {
             session_id: None,
             agent_id: None,
             model: None,
+            skill_search: None,
             context: None,
             max_candidates: 5,
             explain: false,
@@ -1277,6 +1291,7 @@ mod tests {
             session_id: None,
             agent_id: None,
             model: None,
+            skill_search: None,
             context: Some(ctx),
             max_candidates: 5,
             explain: false,
@@ -1303,6 +1318,7 @@ mod tests {
             session_id: None,
             agent_id: None,
             model: None,
+            skill_search: None,
             context: Some(ctx),
             max_candidates: 5,
             explain: false,

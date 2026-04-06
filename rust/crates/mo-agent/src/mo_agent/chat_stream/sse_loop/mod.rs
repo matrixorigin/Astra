@@ -169,7 +169,8 @@ pub(crate) async fn stream_chat_sse(
                 parent_perm_mode,
                 parent_cancel_token,
             )
-            .with_skill_resolver(skill_resolver.clone()),
+            .with_skill_resolver(skill_resolver.clone())
+            .with_skill_search(p.skill_search.clone()),
         );
         let isolated = Arc::new(astra_runtime::skills::executor::IsolatedSkillExecutor::new(
             subrun_exec,
@@ -241,6 +242,7 @@ pub(crate) async fn stream_chat_sse(
         skill_improvement_tracker: astra_runtime::skills::improvement::ImprovementTracker::new(),
         pinned_skills: std::collections::HashSet::new(),
         discovered_skills,
+        skill_search: p.skill_search.clone(),
         tool_event_hooks: astra_runtime::skills::hooks::load_tool_event_hooks(&project_root),
         stop_hooks: hook_sets.stop_hooks,
         stop_hook_runs: 0,
