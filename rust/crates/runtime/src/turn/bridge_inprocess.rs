@@ -2903,6 +2903,8 @@ mod tests {
 
     #[test]
     fn section_cache_evicts_after_capacity() {
+        let _lock = CACHE_ENV_MUTEX.lock().unwrap();
+
         // Clear any pre-existing cache entries
         if let Ok(mut cache) = section_cache().lock() {
             cache.clear();
@@ -3122,5 +3124,307 @@ mod tests {
             .or_else(|| usage.get("cache_read_input_tokens").and_then(Value::as_i64));
 
         assert_eq!(cache_read, None);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // Multi-turn cache regression: structural guarantees for both providers
+    // ═══════════════════════════════════════════════════════════════════
+
+    /// Anthropic: at most 4 cache_control breakpoints across the entire request
+    /// (system prompt + tool schemas + conversation messages).
+    /// System prompt should use at most 2 (last Global, last Session).
+    #[test]
+    fn anthropic_cache_breakpoints_within_limit() {
+        let _lock = CACHE_ENV_MUTEX.lock().unwrap();
+        unsafe { std::env::remove_var("MO_PROMPT_CACHE_DISABLED"); }
+
+        // Worst case: many tools → many Session sections
+        let tools: Vec<&str> = vec![
+            "bash", "read_file", "write_file", "glob", "grep",
+            "git_status", "git_diff", "git_log", "git_commit",
+            "find_definition", "find_references", "call_graph",
+            "rename_symbol", "dead_code", "extract_members", "type_hierarchy",
+            "multi_edit", "run_build_test",
+            "memory_store", "memory_search",
+            "github_list_prs", "github_get_issue",
+        ];
+        let msg = build_system_message(
+            &tools, "profile", 0.8, Some("code_review"),
+            "anthropic", "claude-sonnet-4-20250514",
+        );
+
+        let blocks = msg["content"].as_array().unwrap();
+        let cc_count = blocks.iter()
+            .filter(|b| b.get("cache_control").is_some_and(|cc| !cc.is_null()))
+            .count();
+        assert!(
+            cc_count <= 2,
+            "system prompt should have at most 2 cache_control breakpoints, got {cc_count}"
+        );
+    }
+
+    /// Anthropic: Global breakpoint has scope:"global", Session breakpoint does not.
+    #[test]
+    fn anthropic_scope_annotations_correct() {
+        let _lock = CACHE_ENV_MUTEX.lock().unwrap();
+        unsafe { std::env::remove_var("MO_PROMPT_CACHE_DISABLED"); }
+
+        let msg = build_system_message(
+            &["bash", "read_file", "memory_store"],
+            "profile", 0.8, Some("debugging"),
+            "anthropic", "claude-sonnet-4-20250514",
+        );
+
+        let blocks = msg["content"].as_array().unwrap();
+        let cc_blocks: Vec<_> = blocks.iter()
+            .filter(|b| b.get("cache_control").is_some_and(|cc| !cc.is_null()))
+            .collect();
+
+        assert_eq!(cc_blocks.len(), 2, "should have exactly 2 breakpoints");
+
+        // First breakpoint: Global (has scope:"global")
+        let first_cc = &cc_blocks[0]["cache_control"];
+        assert_eq!(first_cc["scope"].as_str(), Some("global"));
+        assert_eq!(first_cc["ttl"].as_str(), Some("1h"));
+
+        // Second breakpoint: Session (no scope field)
+        let second_cc = &cc_blocks[1]["cache_control"];
+        assert!(
+            second_cc.get("scope").is_none() || second_cc["scope"].is_null(),
+            "Session breakpoint should not have scope"
+        );
+        assert_eq!(second_cc["ttl"].as_str(), Some("1h"));
+    }
+
+    /// Anthropic multi-turn: Global prefix is identical across turns with
+    /// different tool sets → cross-session cache reuse.
+    #[test]
+    fn anthropic_global_prefix_stable_across_tool_sets() {
+        let _lock = CACHE_ENV_MUTEX.lock().unwrap();
+        unsafe { std::env::remove_var("MO_PROMPT_CACHE_DISABLED"); }
+
+        let msg1 = build_system_message(
+            &["bash", "read_file"], "p1", 0.8, None,
+            "anthropic", "claude-sonnet-4-20250514",
+        );
+        let msg2 = build_system_message(
+            &["bash", "git_diff", "memory_store"], "p2", 0.5, Some("debugging"),
+            "anthropic", "claude-sonnet-4-20250514",
+        );
+
+        let blocks1 = msg1["content"].as_array().unwrap();
+        let blocks2 = msg2["content"].as_array().unwrap();
+
+        // Find the Global breakpoint index in each
+        let global_end_1 = blocks1.iter().position(|b|
+            b.get("cache_control")
+                .and_then(|cc| cc.get("scope"))
+                .and_then(|s| s.as_str()) == Some("global")
+        ).expect("should have global breakpoint");
+        let global_end_2 = blocks2.iter().position(|b|
+            b.get("cache_control")
+                .and_then(|cc| cc.get("scope"))
+                .and_then(|s| s.as_str()) == Some("global")
+        ).expect("should have global breakpoint");
+
+        // Same number of Global blocks
+        assert_eq!(global_end_1, global_end_2, "Global prefix length should be identical");
+
+        // Same content in each Global block
+        for i in 0..=global_end_1 {
+            let t1 = blocks1[i]["text"].as_str().unwrap();
+            let t2 = blocks2[i]["text"].as_str().unwrap();
+            assert_eq!(t1, t2, "Global block {i} should be identical across tool sets");
+        }
+    }
+
+    /// Anthropic multi-turn: same tool set + same task type → Session prefix
+    /// also identical (only profile/style differ).
+    #[test]
+    fn anthropic_session_prefix_stable_within_session() {
+        let _lock = CACHE_ENV_MUTEX.lock().unwrap();
+        unsafe { std::env::remove_var("MO_PROMPT_CACHE_DISABLED"); }
+
+        // Simulate two turns in the same session (same tools, different profile)
+        let msg_turn1 = build_system_message(
+            &["bash", "read_file", "git_diff"], "turn1 profile", 0.8, None,
+            "anthropic", "claude-sonnet-4-20250514",
+        );
+        let msg_turn2 = build_system_message(
+            &["bash", "read_file", "git_diff"], "turn2 profile", 0.8, None,
+            "anthropic", "claude-sonnet-4-20250514",
+        );
+
+        let b1 = msg_turn1["content"].as_array().unwrap();
+        let b2 = msg_turn2["content"].as_array().unwrap();
+
+        // Find Session breakpoint (last block with cache_control but no scope:"global")
+        let session_end = |blocks: &[Value]| -> usize {
+            blocks.iter().rposition(|b|
+                b.get("cache_control").is_some_and(|cc| !cc.is_null())
+            ).unwrap()
+        };
+        let se1 = session_end(b1);
+        let se2 = session_end(b2);
+        assert_eq!(se1, se2, "Session prefix length should be identical across turns");
+
+        // All blocks up to and including Session breakpoint should be identical
+        for i in 0..=se1 {
+            assert_eq!(
+                b1[i]["text"].as_str(), b2[i]["text"].as_str(),
+                "Block {i} should be identical across turns (only profile differs)"
+            );
+        }
+
+        // Profile blocks (after Session breakpoint) should differ
+        let last1 = b1.last().unwrap()["text"].as_str().unwrap();
+        let last2 = b2.last().unwrap()["text"].as_str().unwrap();
+        assert_ne!(last1, last2, "Profile blocks should differ between turns");
+    }
+
+    /// OpenAI: stable prefix for automatic prefix caching.
+    /// Static content must come first, dynamic content last.
+    #[test]
+    fn openai_stable_prefix_across_turns() {
+        let _lock = CACHE_ENV_MUTEX.lock().unwrap();
+
+        let msg1 = build_system_message(
+            &["bash", "read_file"], "turn1 profile", 0.8, None,
+            "openai", "gpt-4o",
+        );
+        let msg2 = build_system_message(
+            &["bash", "read_file"], "turn2 profile", 0.8, None,
+            "openai", "gpt-4o",
+        );
+
+        let s1 = msg1["content"].as_str().unwrap();
+        let s2 = msg2["content"].as_str().unwrap();
+
+        // Find where they diverge
+        let common_prefix_len = s1.chars().zip(s2.chars())
+            .take_while(|(a, b)| a == b)
+            .count();
+
+        // The shared prefix should be substantial (all Global + Session content)
+        // Only the profile at the end should differ
+        let total_len = s1.len().min(s2.len());
+        let prefix_ratio = common_prefix_len as f64 / total_len as f64;
+        assert!(
+            prefix_ratio > 0.90,
+            "OpenAI prefix should be >90% shared across turns, got {:.1}% ({common_prefix_len}/{total_len})",
+            prefix_ratio * 100.0
+        );
+
+        // Verify the divergence point is the profile
+        assert!(
+            s1[common_prefix_len..].contains("turn1"),
+            "divergence should be at profile content"
+        );
+    }
+
+    /// OpenAI: different tool sets share the same Global prefix.
+    #[test]
+    fn openai_global_prefix_stable_across_tool_sets() {
+        let _lock = CACHE_ENV_MUTEX.lock().unwrap();
+
+        let msg1 = build_system_message(
+            &["bash"], "", 0.8, None,
+            "openai", "gpt-4o",
+        );
+        let msg2 = build_system_message(
+            &["bash", "git_diff", "memory_store", "find_definition"],
+            "", 0.8, Some("code_review"),
+            "openai", "gpt-4o",
+        );
+
+        let s1 = msg1["content"].as_str().unwrap();
+        let s2 = msg2["content"].as_str().unwrap();
+
+        // Both should start with the same Global content (Core Rules etc.)
+        // The Global prefix ends before "## Self-Model"
+        let self_model_pos_1 = s1.find("## Self-Model").unwrap();
+        let self_model_pos_2 = s2.find("## Self-Model").unwrap();
+
+        // Everything before Self-Model should be identical
+        assert_eq!(
+            &s1[..self_model_pos_1], &s2[..self_model_pos_2],
+            "Global prefix (before Self-Model) should be identical across tool sets"
+        );
+    }
+
+    /// Global sections contain no tool names — ensures cross-session cache reuse.
+    #[test]
+    fn global_sections_contain_no_tool_names() {
+        let _lock = CACHE_ENV_MUTEX.lock().unwrap();
+        unsafe { std::env::remove_var("MO_PROMPT_CACHE_DISABLED"); }
+
+        let tools = vec!["bash", "read_file", "memory_store", "git_diff"];
+        let msg = build_system_message(
+            &tools, "", 0.8, None,
+            "anthropic", "claude-sonnet-4-20250514",
+        );
+
+        let blocks = msg["content"].as_array().unwrap();
+        // Find the Global breakpoint
+        let global_end = blocks.iter().position(|b|
+            b.get("cache_control")
+                .and_then(|cc| cc.get("scope"))
+                .and_then(|s| s.as_str()) == Some("global")
+        ).unwrap();
+
+        // No Global block should contain any tool name
+        for i in 0..=global_end {
+            let text = blocks[i]["text"].as_str().unwrap();
+            for tool in &tools {
+                // "bash" appears in generic text like "bash commands", skip it
+                if *tool == "bash" { continue; }
+                assert!(
+                    !text.contains(&format!("{tool},")),
+                    "Global block {i} should not contain tool name '{tool}' in a tool list"
+                );
+            }
+            assert!(
+                !text.contains("Self-Model"),
+                "Global block {i} should not contain Self-Model"
+            );
+        }
+    }
+
+    /// Task type change only affects Session sections, not Global.
+    #[test]
+    fn task_type_change_preserves_global_prefix() {
+        let _lock = CACHE_ENV_MUTEX.lock().unwrap();
+        unsafe { std::env::remove_var("MO_PROMPT_CACHE_DISABLED"); }
+
+        let tools = vec!["bash", "read_file"];
+        let msg_none = build_system_message(
+            &tools, "", 0.8, None,
+            "anthropic", "claude-sonnet-4-20250514",
+        );
+        let msg_review = build_system_message(
+            &tools, "", 0.8, Some("code_review"),
+            "anthropic", "claude-sonnet-4-20250514",
+        );
+        let msg_debug = build_system_message(
+            &tools, "", 0.8, Some("debugging"),
+            "anthropic", "claude-sonnet-4-20250514",
+        );
+
+        let get_global_blocks = |msg: &Value| -> Vec<String> {
+            let blocks = msg["content"].as_array().unwrap();
+            let global_end = blocks.iter().position(|b|
+                b.get("cache_control")
+                    .and_then(|cc| cc.get("scope"))
+                    .and_then(|s| s.as_str()) == Some("global")
+            ).unwrap();
+            (0..=global_end).map(|i| blocks[i]["text"].as_str().unwrap().to_string()).collect()
+        };
+
+        let g_none = get_global_blocks(&msg_none);
+        let g_review = get_global_blocks(&msg_review);
+        let g_debug = get_global_blocks(&msg_debug);
+
+        assert_eq!(g_none, g_review, "Global prefix should be identical regardless of task type");
+        assert_eq!(g_review, g_debug, "Global prefix should be identical regardless of task type");
     }
 }
