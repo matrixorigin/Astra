@@ -143,6 +143,7 @@ mod tests {
     use std::sync::atomic::AtomicBool;
 
     #[test]
+    #[serial_test::serial]
     fn should_schedule_requires_rs_and_cargo_toml() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
