@@ -41,3 +41,146 @@ fn looks_like_email(value: &str) -> bool {
     let domain = parts.next().unwrap_or_default();
     !local.is_empty() && domain.contains('.') && parts.next().is_none()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- looks_like_email ---
+
+    #[test]
+    fn email_valid() {
+        assert!(looks_like_email("user@example.com"));
+    }
+
+    #[test]
+    fn email_no_at() {
+        assert!(!looks_like_email("userexample.com"));
+    }
+
+    #[test]
+    fn email_no_dot() {
+        assert!(!looks_like_email("user@example"));
+    }
+
+    #[test]
+    fn email_empty() {
+        assert!(!looks_like_email(""));
+    }
+
+    #[test]
+    fn email_double_at() {
+        assert!(!looks_like_email("user@@example.com"));
+    }
+
+    #[test]
+    fn email_empty_local() {
+        assert!(!looks_like_email("@example.com"));
+    }
+
+    #[test]
+    fn email_at_dot() {
+        assert!(!looks_like_email("@."));
+    }
+
+    // --- validate_register_request ---
+
+    #[test]
+    fn validate_valid_request() {
+        let req = AuthRegisterRequestData {
+            username: "alice".to_string(),
+            email: "alice@test.com".to_string(),
+            password: "password123".to_string(),
+            display_name: None,
+        };
+        assert!(validate_register_request(&req).is_ok());
+    }
+
+    #[test]
+    fn validate_username_too_short() {
+        let req = AuthRegisterRequestData {
+            username: "ab".to_string(),
+            email: "x@t.c".to_string(),
+            password: "password123".to_string(),
+            display_name: None,
+        };
+        assert!(validate_register_request(&req).is_err());
+    }
+
+    #[test]
+    fn validate_username_boundary_3() {
+        let req = AuthRegisterRequestData {
+            username: "abc".to_string(),
+            email: "x@t.c".to_string(),
+            password: "password123".to_string(),
+            display_name: None,
+        };
+        assert!(validate_register_request(&req).is_ok());
+    }
+
+    #[test]
+    fn validate_username_invalid_chars() {
+        let req = AuthRegisterRequestData {
+            username: "alice!".to_string(),
+            email: "x@t.c".to_string(),
+            password: "password123".to_string(),
+            display_name: None,
+        };
+        assert!(validate_register_request(&req).is_err());
+    }
+
+    #[test]
+    fn validate_password_too_short() {
+        let req = AuthRegisterRequestData {
+            username: "alice".to_string(),
+            email: "x@t.c".to_string(),
+            password: "short".to_string(),
+            display_name: None,
+        };
+        assert!(validate_register_request(&req).is_err());
+    }
+
+    #[test]
+    fn validate_password_boundary_8() {
+        let req = AuthRegisterRequestData {
+            username: "alice".to_string(),
+            email: "x@t.c".to_string(),
+            password: "12345678".to_string(),
+            display_name: None,
+        };
+        assert!(validate_register_request(&req).is_ok());
+    }
+
+    #[test]
+    fn validate_invalid_email() {
+        let req = AuthRegisterRequestData {
+            username: "alice".to_string(),
+            email: "not-an-email".to_string(),
+            password: "password123".to_string(),
+            display_name: None,
+        };
+        assert!(validate_register_request(&req).is_err());
+    }
+
+    #[test]
+    fn validate_display_name_too_long() {
+        let req = AuthRegisterRequestData {
+            username: "alice".to_string(),
+            email: "x@t.c".to_string(),
+            password: "password123".to_string(),
+            display_name: Some("x".repeat(256)),
+        };
+        assert!(validate_register_request(&req).is_err());
+    }
+
+    #[test]
+    fn validate_display_name_at_limit() {
+        let req = AuthRegisterRequestData {
+            username: "alice".to_string(),
+            email: "x@t.c".to_string(),
+            password: "password123".to_string(),
+            display_name: Some("x".repeat(255)),
+        };
+        assert!(validate_register_request(&req).is_ok());
+    }
+}

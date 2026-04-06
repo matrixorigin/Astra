@@ -17,3 +17,29 @@ pub fn build_tool_result_quality_event_payload(
         ),
     ])
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn quality_payload_full() {
+        let assessment = Map::from_iter([
+            ("tool_name".to_string(), json!("bash")),
+            ("score".to_string(), json!(0.9)),
+            ("grade".to_string(), json!("A")),
+            ("signals".to_string(), json!(["fast"])),
+            ("stale".to_string(), json!(false)),
+        ]);
+        let payload = build_tool_result_quality_event_payload(&assessment);
+        assert_eq!(payload["metadata"]["tool_name"].as_str().unwrap(), "bash");
+        assert!((payload["metadata"]["quality_score"].as_f64().unwrap() - 0.9).abs() < 0.001);
+    }
+
+    #[test]
+    fn quality_payload_empty() {
+        let payload = build_tool_result_quality_event_payload(&Map::new());
+        assert!(payload["metadata"]["tool_name"].is_null());
+        assert!(payload["metadata"]["quality_score"].is_null());
+    }
+}

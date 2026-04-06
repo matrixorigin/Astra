@@ -34,3 +34,54 @@ pub fn build_turn_complete_event(
     }
     event
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn complete_basic_no_force_stop() {
+        let event = build_turn_complete_event(true, false, &DivergenceStatus::Healthy, None);
+        assert_eq!(event["type"].as_str().unwrap(), "turn_complete");
+        assert!(event["has_tool_calls"].as_bool().unwrap());
+        assert!(event.get("stall_detected").is_none());
+        assert!(event.get("divergence_detected").is_none());
+    }
+
+    #[test]
+    fn complete_stall_forces_no_tool_calls() {
+        let event = build_turn_complete_event(true, true, &DivergenceStatus::Healthy, None);
+        assert!(!event["has_tool_calls"].as_bool().unwrap());
+        assert!(event["stall_detected"].as_bool().unwrap());
+    }
+
+    #[test]
+    fn complete_diverging_forces_no_tool_calls() {
+        let event = build_turn_complete_event(true, false, &DivergenceStatus::Diverging(3), None);
+        assert!(!event["has_tool_calls"].as_bool().unwrap());
+        assert!(event["divergence_detected"].as_bool().unwrap());
+        assert_eq!(event["exploration_rounds"].as_u64().unwrap(), 3);
+    }
+
+    #[test]
+    fn complete_exploring_no_force_stop() {
+        let event = build_turn_complete_event(true, false, &DivergenceStatus::Exploring(2), None);
+        assert!(event["has_tool_calls"].as_bool().unwrap());
+        assert!(event.get("divergence_detected").is_none());
+    }
+
+    #[test]
+    fn complete_with_execution_state() {
+        let state = json!({"round": 3});
+        let event =
+            build_turn_complete_event(false, false, &DivergenceStatus::Healthy, Some(state));
+        assert_eq!(event["execution_state"]["round"].as_i64().unwrap(), 3);
+    }
+
+    #[test]
+    fn complete_no_execution_state() {
+        let event = build_turn_complete_event(false, false, &DivergenceStatus::Healthy, None);
+        assert!(event.get("execution_state").is_none());
+    }
+}

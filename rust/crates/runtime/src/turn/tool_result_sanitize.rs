@@ -74,4 +74,54 @@ mod tests {
         assert!(!out.contains("ASTRA_UNIFIED_DIFF"));
         assert!(out.contains("Applied"));
     }
+
+    #[test]
+    fn write_file_non_json_passthrough() {
+        let raw = "this is not json";
+        let out = tool_result_content_for_model("write_file", raw);
+        assert_eq!(out, raw);
+    }
+
+    #[test]
+    fn write_file_non_object_json_passthrough() {
+        let out = tool_result_content_for_model("write_file", "[1,2,3]");
+        assert_eq!(out, "[1,2,3]");
+    }
+
+    #[test]
+    fn write_file_no_cli_keys_unchanged() {
+        let raw = r#"{"success":true}"#;
+        let out = tool_result_content_for_model("write_file", raw);
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert!(v["success"].as_bool().unwrap());
+    }
+
+    #[test]
+    fn unknown_tool_passthrough() {
+        let raw = "anything here";
+        let out = tool_result_content_for_model("bash", raw);
+        assert_eq!(out, raw);
+    }
+
+    #[test]
+    fn str_replace_no_sentinel_passthrough() {
+        let raw = "Replaced successfully";
+        let out = tool_result_content_for_model("str_replace", raw);
+        assert_eq!(out, raw);
+    }
+
+    #[test]
+    fn write_file_multiple_cli_keys() {
+        let raw = json!({
+            "success": true,
+            "_cli_diff": "diff",
+            "_cli_preview": "preview",
+            "path": "a.rs"
+        })
+        .to_string();
+        let out = tool_result_content_for_model("write_file", &raw);
+        assert!(!out.contains("_cli_"));
+        assert!(out.contains("success"));
+        assert!(out.contains("path"));
+    }
 }

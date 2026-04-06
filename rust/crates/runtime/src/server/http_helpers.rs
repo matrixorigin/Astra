@@ -45,3 +45,47 @@ pub(super) fn status_to_sse_error_code(status: StatusCode) -> &'static str {
         _ => "INTERNAL_ERROR",
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sse_code_unauthorized() {
+        assert_eq!(status_to_sse_error_code(StatusCode::UNAUTHORIZED), "AUTH_ERROR");
+    }
+
+    #[test]
+    fn sse_code_forbidden() {
+        assert_eq!(status_to_sse_error_code(StatusCode::FORBIDDEN), "AUTH_ERROR");
+    }
+
+    #[test]
+    fn sse_code_not_found() {
+        assert_eq!(status_to_sse_error_code(StatusCode::NOT_FOUND), "NOT_FOUND");
+    }
+
+    #[test]
+    fn sse_code_unprocessable() {
+        assert_eq!(
+            status_to_sse_error_code(StatusCode::UNPROCESSABLE_ENTITY),
+            "VALIDATION_ERROR"
+        );
+    }
+
+    #[test]
+    fn sse_code_internal_server_error() {
+        assert_eq!(
+            status_to_sse_error_code(StatusCode::INTERNAL_SERVER_ERROR),
+            "INTERNAL_ERROR"
+        );
+    }
+
+    #[test]
+    fn sse_code_unknown_default() {
+        assert_eq!(
+            status_to_sse_error_code(StatusCode::IM_A_TEAPOT),
+            "INTERNAL_ERROR"
+        );
+    }
+}
