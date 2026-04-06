@@ -201,6 +201,11 @@ impl VersionConstraint {
     pub fn matches(&self, v: &Version) -> bool {
         self.clauses.iter().all(|c| c.matches(v))
     }
+
+    /// True if this constraint accepts any version (`*`).
+    pub fn is_any(&self) -> bool {
+        self.clauses.len() == 1 && matches!(self.clauses[0], ConstraintOp::Any)
+    }
 }
 
 impl Default for VersionConstraint {
@@ -763,5 +768,21 @@ mod tests {
         let top_idx = result.ordered.iter().position(|n| n == "top");
         assert!(base_idx < mid_idx);
         assert!(mid_idx < top_idx);
+    }
+
+    #[test]
+    fn is_any_returns_true_for_default_constraint() {
+        let c = VersionConstraint::default();
+        assert!(c.is_any());
+        let c2 = VersionConstraint::any();
+        assert!(c2.is_any());
+    }
+
+    #[test]
+    fn is_any_returns_false_for_specific_constraint() {
+        let c: VersionConstraint = ">=1.0".parse().unwrap();
+        assert!(!c.is_any());
+        let c2 = VersionConstraint::exact(Version::new(1, 0, 0));
+        assert!(!c2.is_any());
     }
 }

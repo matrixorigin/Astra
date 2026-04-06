@@ -2411,8 +2411,9 @@ async fn install_skill_from_marketplace(
 
     let tok = token.unwrap_or("");
     let mut installed_names: Vec<String> = Vec::new();
+    let constraint = astra_runtime::skills::version::VersionConstraint::default(); // Any
 
-    install_skill_recursive(name, api, tok, state, &mut installed_names, 0).await;
+    install_skill_recursive(name, &constraint, api, tok, state, &mut installed_names, 0).await;
 
     if installed_names.len() > 1 {
         eprintln!(
@@ -2427,9 +2428,10 @@ async fn install_skill_from_marketplace(
 
 const MAX_DEP_INSTALL_DEPTH: u32 = 5;
 
-/// Recursively install a skill and its dependencies.
+/// Recursively install a skill and its dependencies, checking version constraints.
 fn install_skill_recursive<'a>(
     name: &'a str,
+    constraint: &'a astra_runtime::skills::version::VersionConstraint,
     api: &'a astra_thin_client::ThinClient,
     tok: &'a str,
     state: &'a mut ReplState,
@@ -2447,8 +2449,8 @@ fn install_skill_recursive<'a>(
         return;
     }
 
-    // Parse name@version
-    let (skill_name, version) = if let Some(idx) = name.find('@') {
+    // Parse name@version (explicit version override takes precedence over constraint)
+    let (skill_name, explicit_version) = if let Some(idx) = name.find('@') {
         (&name[..idx], Some(&name[idx + 1..]))
     } else {
         (name, None)
@@ -2459,40 +2461,73 @@ fn install_skill_recursive<'a>(
         return;
     }
 
-    // Check if skill is already available locally
+    // Check if skill is already available locally and satisfies the constraint
     if depth > 0 {
         let all = state.unified_skill_registry.all_manifests();
-        if all.iter().any(|m| m.name == skill_name) {
-            return; // Already available, skip
+        if let Some(existing) = all.iter().find(|m| m.name == skill_name) {
+            if constraint.matches(&existing.version) {
+                return; // Already available and satisfies constraint
+            }
+            // Version constraint not satisfied — will re-install
+            eprintln!(
+                "  {} '{}' v{} does not satisfy {}, upgrading…",
+                "⚠".yellow(),
+                skill_name.cyan(),
+                existing.version.to_string().dim(),
+                constraint.to_string().yellow()
+            );
         }
     }
+
+    let constraint_label = if constraint.is_any() {
+        String::new()
+    } else {
+        format!(" ({})", constraint)
+    };
 
     if depth == 0 {
         eprintln!(
             "  {} {}{}",
             "Installing".cyan(),
             skill_name.cyan().bold(),
-            version
+            explicit_version
                 .map(|v| format!("@{v}"))
-                .unwrap_or_default()
+                .unwrap_or(constraint_label)
                 .dim()
         );
     } else {
         eprintln!(
-            "  {} {} (dependency)",
+            "  {} {}{} (dependency)",
             "Installing".cyan(),
-            skill_name.cyan()
+            skill_name.cyan(),
+            constraint_label.dim()
         );
     }
 
     // Try bundle endpoint first, fall back to legacy JSON
-    let success = install_single_skill(skill_name, version, api, tok, state).await;
+    let success = install_single_skill(skill_name, explicit_version, api, tok, state).await;
 
     if success {
         installed.push(skill_name.to_string());
 
         // Refresh registry to pick up newly installed skill
         let _ = state.unified_skill_registry.discover_all().await;
+
+        // Validate the installed version satisfies the constraint
+        if !constraint.is_any() {
+            let all = state.unified_skill_registry.all_manifests();
+            if let Some(m) = all.iter().find(|m| m.name == skill_name) {
+                if !constraint.matches(&m.version) {
+                    eprintln!(
+                        "  {} Installed '{}' v{} does not satisfy constraint {}",
+                        "⚠".yellow(),
+                        skill_name.cyan(),
+                        m.version.to_string().dim(),
+                        constraint.to_string().yellow()
+                    );
+                }
+            }
+        }
 
         // Check dependencies of the newly installed skill
         let deps = {
@@ -2504,7 +2539,7 @@ fn install_skill_recursive<'a>(
         };
 
         let skill_deps: Vec<_> = deps
-            .iter()
+            .into_iter()
             .filter(|d| {
                 d.dep_type == astra_runtime::skills::version::DependencyType::Skill
             })
@@ -2518,8 +2553,10 @@ fn install_skill_recursive<'a>(
                 skill_deps.len()
             );
 
-            for dep in skill_deps {
-                install_skill_recursive(&dep.name, api, tok, state, installed, depth + 1).await;
+            for dep in &skill_deps {
+                install_skill_recursive(
+                    &dep.name, &dep.version, api, tok, state, installed, depth + 1,
+                ).await;
             }
         }
     }
