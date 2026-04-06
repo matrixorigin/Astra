@@ -45,7 +45,7 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ),
     (
         "/turn",
-        "Show turn trace (/turn [n] = journal turn #n or nth turn)",
+        "Turn trace: /turn | list | N | seq:N | #N | id:N | @N | -1",
     ),
     (
         "/debug",

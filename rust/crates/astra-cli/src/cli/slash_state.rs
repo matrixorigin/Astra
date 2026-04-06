@@ -30,8 +30,7 @@ fn parse_skill_search_command(arg: &str) -> Result<SkillSearchCommand, String> {
     let value = parts.next().unwrap_or_default();
     if parts.next().is_some() {
         return Err(
-            "Usage: /skill-search [show|status|reset|dynamic <on|off>|min <n>|cap <n>]"
-                .to_string(),
+            "Usage: /skill-search [show|status|reset|dynamic <on|off>|min <n>|cap <n>]".to_string(),
         );
     }
 
@@ -54,8 +53,7 @@ fn parse_skill_search_command(arg: &str) -> Result<SkillSearchCommand, String> {
             .map(SkillSearchCommand::SetSurfaceCap)
             .ok_or_else(|| "Usage: /skill-search cap <positive-integer>".to_string()),
         _ => Err(
-            "Usage: /skill-search [show|status|reset|dynamic <on|off>|min <n>|cap <n>]"
-                .to_string(),
+            "Usage: /skill-search [show|status|reset|dynamic <on|off>|min <n>|cap <n>]".to_string(),
         ),
     }
 }
@@ -223,9 +221,7 @@ pub(super) async fn handle_state_command(
             };
             let (message, changed) = apply_skill_search_command(state, command);
             eprintln!("  {}", message.green());
-            if changed
-                && let Some(ref j) = state.journal
-            {
+            if changed && let Some(ref j) = state.journal {
                 let _ = j.append(&session_journal::JournalEvent::config_change(
                     state.session_id.as_deref(),
                     "skill_search",
@@ -242,6 +238,20 @@ pub(super) async fn handle_state_command(
                 );
                 return Ok(());
             }
+            let (compact_quick, compact_no_memoria) = {
+                let mut q = false;
+                let mut nm = false;
+                for w in arg.split_whitespace() {
+                    let t = w.to_ascii_lowercase();
+                    if t == "quick" || t == "summary-only" {
+                        q = true;
+                    }
+                    if t == "no-memoria" || t == "no_memoria" {
+                        nm = true;
+                    }
+                }
+                (q, nm)
+            };
             let Some(tok) = token else {
                 eprintln!("{}", "  Not logged in. Use /login.".yellow());
                 return Ok(());
@@ -315,165 +325,170 @@ pub(super) async fn handle_state_command(
             let mut saved_to_memoria = false;
             let mut facts_stored = 0usize;
             if let Some(tok) = token {
-                let meta = prompts::memory_proto::EntryMeta::from_session(
-                    state.session_id.as_deref(),
-                    state.turn,
-                    prompts::memory_proto::SRC_COMPACT,
-                );
-                let entry = prompts::memory_proto::MemoryEntry::new(
-                    prompts::memory_proto::NS_EPISODE,
-                    prompts::memory_proto::ST_SUMMARY,
-                    &summary,
-                );
-                match api
-                    .post_memory_store_json(tok, &entry.to_store_payload_with_meta(&meta))
-                    .await
-                {
-                    Ok(r) if r.status().is_success() => saved_to_memoria = true,
-                    Ok(r) => eprintln!(
-                        "{}",
-                        format!("  ⚠ Memory save failed ({})", r.status()).yellow()
-                    ),
-                    Err(e) => eprintln!(
-                        "{}",
-                        format!("  ⚠ Memory service unreachable: {e}").yellow()
-                    ),
-                }
-
-                // Extract structured facts from summary and store each individually
-                if saved_to_memoria {
-                    let extract_msg = format!("{}{summary}", prompts::MEMORY_EXTRACTOR_PROMPT);
-                    let mut auto_pm2 = PermissionManager::with_project(
-                        true,
-                        &std::env::current_dir().unwrap_or_default(),
+                if !compact_no_memoria {
+                    let meta = prompts::memory_proto::EntryMeta::from_session(
+                        state.session_id.as_deref(),
+                        state.turn,
+                        prompts::memory_proto::SRC_COMPACT,
                     );
-                    let extract_result = stream_chat_sse(ChatTurnParams {
-                        api,
-                        token: tok,
-                        message: &extract_msg,
-                        session_id: state.session_id.as_deref(),
-                        model: state.model.as_deref(),
-                        explain: ExplainMode::Off,
-                        render_md: false,
-                        history: &[],
-                        perm_manager: &mut auto_pm2,
-                        verbose_mode: false,
-                        quiet: true,
-                        suppress_intermediate_output: false,
-                        selector,
-                        recent_tools: &[],
-                        tool_health_entries: &[],
-                        unified_skill_registry: astra_runtime::skills::default_unified_registry(),
-                        plan_only_chat: false,
-                        hide_streaming_assistant_text: false,
-                        is_plan_subtask: false,
-                        plan_subtask_id: None,
-                        delegation_engine: None,
-                        cancel_token: None,
-                        plan_assemble_line_release: None,
-                        stream_event_tx: None,
-                        approval_request_tx: None,
-                        mcp_manager: Some(state.mcp_manager.clone()),
-                        skill_search: &state.skill_search,
-                        skill_quality_tracker: &mut state.skill_quality_tracker,
-                        discovered_skills: None,
-                    })
-                    .await;
+                    let entry = prompts::memory_proto::MemoryEntry::new(
+                        prompts::memory_proto::NS_EPISODE,
+                        prompts::memory_proto::ST_SUMMARY,
+                        &summary,
+                    );
+                    match api
+                        .post_memory_store_json(tok, &entry.to_store_payload_with_meta(&meta))
+                        .await
+                    {
+                        Ok(r) if r.status().is_success() => saved_to_memoria = true,
+                        Ok(r) => eprintln!(
+                            "{}",
+                            format!("  ⚠ Memory save failed ({})", r.status()).yellow()
+                        ),
+                        Err(e) => eprintln!(
+                            "{}",
+                            format!("  ⚠ Memory service unreachable: {e}").yellow()
+                        ),
+                    }
 
-                    if let Ok(sr) = extract_result {
-                        let facts = prompts::parse_extracted_facts(&sr.full_text);
-                        let fact_meta = prompts::memory_proto::EntryMeta::from_session(
-                            state.session_id.as_deref(),
-                            state.turn,
-                            prompts::memory_proto::SRC_EXTRACTED,
+                    // Extract structured facts from summary and store each individually
+                    if saved_to_memoria && !compact_quick {
+                        let extract_msg = format!("{}{summary}", prompts::MEMORY_EXTRACTOR_PROMPT);
+                        let mut auto_pm2 = PermissionManager::with_project(
+                            true,
+                            &std::env::current_dir().unwrap_or_default(),
                         );
-                        for (fact, mem_type) in &facts {
-                            let fact_entry = prompts::memory_proto::MemoryEntry::new(
-                                prompts::memory_proto::NS_FACT,
-                                mem_type,
-                                fact,
-                            );
-                            let _ = api
-                                .post_memory_store_json(
-                                    tok,
-                                    &fact_entry.to_store_payload_with_meta(&fact_meta),
-                                )
-                                .await;
-                            facts_stored += 1;
-                        }
+                        let extract_result = stream_chat_sse(ChatTurnParams {
+                            api,
+                            token: tok,
+                            message: &extract_msg,
+                            session_id: state.session_id.as_deref(),
+                            model: state.model.as_deref(),
+                            explain: ExplainMode::Off,
+                            render_md: false,
+                            history: &[],
+                            perm_manager: &mut auto_pm2,
+                            verbose_mode: false,
+                            quiet: true,
+                            suppress_intermediate_output: false,
+                            selector,
+                            recent_tools: &[],
+                            tool_health_entries: &[],
+                            unified_skill_registry: astra_runtime::skills::default_unified_registry(
+                            ),
+                            plan_only_chat: false,
+                            hide_streaming_assistant_text: false,
+                            is_plan_subtask: false,
+                            plan_subtask_id: None,
+                            delegation_engine: None,
+                            cancel_token: None,
+                            plan_assemble_line_release: None,
+                            stream_event_tx: None,
+                            approval_request_tx: None,
+                            mcp_manager: Some(state.mcp_manager.clone()),
+                            skill_search: &state.skill_search,
+                            skill_quality_tracker: &mut state.skill_quality_tracker,
+                            discovered_skills: None,
+                        })
+                        .await;
 
-                        // ── Knowledge synthesis: detect patterns across extracted facts ──
-                        if facts.len() >= 2 {
-                            let fact_lines: Vec<String> =
-                                facts.iter().map(|(f, t)| format!("- [{t}] {f}")).collect();
-                            let synthesis_prompt = format!(
-                                "Given these extracted facts from a conversation:\n{}\n\n\
+                        if let Ok(sr) = extract_result {
+                            let facts = prompts::parse_extracted_facts(&sr.full_text);
+                            let fact_meta = prompts::memory_proto::EntryMeta::from_session(
+                                state.session_id.as_deref(),
+                                state.turn,
+                                prompts::memory_proto::SRC_EXTRACTED,
+                            );
+                            for (fact, mem_type) in &facts {
+                                let fact_entry = prompts::memory_proto::MemoryEntry::new(
+                                    prompts::memory_proto::NS_FACT,
+                                    mem_type,
+                                    fact,
+                                );
+                                let _ = api
+                                    .post_memory_store_json(
+                                        tok,
+                                        &fact_entry.to_store_payload_with_meta(&fact_meta),
+                                    )
+                                    .await;
+                                facts_stored += 1;
+                            }
+
+                            // ── Knowledge synthesis: detect patterns across extracted facts ──
+                            if facts.len() >= 2 {
+                                let fact_lines: Vec<String> =
+                                    facts.iter().map(|(f, t)| format!("- [{t}] {f}")).collect();
+                                let synthesis_prompt = format!(
+                                    "Given these extracted facts from a conversation:\n{}\n\n\
                                  If there is a higher-level pattern, theme, or insight that \
                                  connects 2+ facts, state it as ONE concise sentence (≤25 words). \
                                  If no pattern exists, respond with exactly: NONE",
-                                fact_lines.join("\n")
-                            );
-                            let mut auto_pm3 = PermissionManager::with_project(
-                                true,
-                                &std::env::current_dir().unwrap_or_default(),
-                            );
-                            let synth_result = stream_chat_sse(ChatTurnParams {
-                                api,
-                                token: tok,
-                                message: &synthesis_prompt,
-                                session_id: state.session_id.as_deref(),
-                                model: state.model.as_deref(),
-                                explain: ExplainMode::Off,
-                                render_md: false,
-                                history: &[],
-                                perm_manager: &mut auto_pm3,
-                                verbose_mode: false,
-                                quiet: true,
-                                suppress_intermediate_output: false,
-                                selector,
-                                recent_tools: &[],
-                                tool_health_entries: &[],
-                                unified_skill_registry:
-                                    astra_runtime::skills::default_unified_registry(),
-                                plan_only_chat: false,
-                                hide_streaming_assistant_text: false,
-                                is_plan_subtask: false,
-                                plan_subtask_id: None,
-                                delegation_engine: None,
-                                cancel_token: None,
-                                plan_assemble_line_release: None,
-                                stream_event_tx: None,
-                                approval_request_tx: None,
-                                mcp_manager: Some(state.mcp_manager.clone()),
-                                skill_search: &state.skill_search,
-                                skill_quality_tracker: &mut state.skill_quality_tracker,
-                                discovered_skills: None,
-                            })
-                            .await;
-                            if let Ok(sr2) = synth_result {
-                                let insight = sr2.full_text.trim().to_string();
-                                if !insight.is_empty()
-                                    && !insight.eq_ignore_ascii_case("NONE")
-                                    && !insight.contains("no pattern")
-                                    && insight.len() < 200
-                                {
-                                    let insight_entry = prompts::memory_proto::MemoryEntry::new(
-                                        prompts::memory_proto::NS_INSIGHT,
-                                        prompts::memory_proto::ST_ACTIVE,
-                                        &insight,
-                                    );
-                                    let synth_meta = prompts::memory_proto::EntryMeta::from_session(
-                                        state.session_id.as_deref(),
-                                        state.turn,
-                                        prompts::memory_proto::SRC_SYNTHESIS,
-                                    );
-                                    let _ = api
-                                        .post_memory_store_json(
-                                            tok,
-                                            &insight_entry.to_store_payload_with_meta(&synth_meta),
-                                        )
-                                        .await;
-                                    facts_stored += 1; // count insight as a stored fact
+                                    fact_lines.join("\n")
+                                );
+                                let mut auto_pm3 = PermissionManager::with_project(
+                                    true,
+                                    &std::env::current_dir().unwrap_or_default(),
+                                );
+                                let synth_result = stream_chat_sse(ChatTurnParams {
+                                    api,
+                                    token: tok,
+                                    message: &synthesis_prompt,
+                                    session_id: state.session_id.as_deref(),
+                                    model: state.model.as_deref(),
+                                    explain: ExplainMode::Off,
+                                    render_md: false,
+                                    history: &[],
+                                    perm_manager: &mut auto_pm3,
+                                    verbose_mode: false,
+                                    quiet: true,
+                                    suppress_intermediate_output: false,
+                                    selector,
+                                    recent_tools: &[],
+                                    tool_health_entries: &[],
+                                    unified_skill_registry:
+                                        astra_runtime::skills::default_unified_registry(),
+                                    plan_only_chat: false,
+                                    hide_streaming_assistant_text: false,
+                                    is_plan_subtask: false,
+                                    plan_subtask_id: None,
+                                    delegation_engine: None,
+                                    cancel_token: None,
+                                    plan_assemble_line_release: None,
+                                    stream_event_tx: None,
+                                    approval_request_tx: None,
+                                    mcp_manager: Some(state.mcp_manager.clone()),
+                                    skill_search: &state.skill_search,
+                                    skill_quality_tracker: &mut state.skill_quality_tracker,
+                                    discovered_skills: None,
+                                })
+                                .await;
+                                if let Ok(sr2) = synth_result {
+                                    let insight = sr2.full_text.trim().to_string();
+                                    if !insight.is_empty()
+                                        && !insight.eq_ignore_ascii_case("NONE")
+                                        && !insight.contains("no pattern")
+                                        && insight.len() < 200
+                                    {
+                                        let insight_entry = prompts::memory_proto::MemoryEntry::new(
+                                            prompts::memory_proto::NS_INSIGHT,
+                                            prompts::memory_proto::ST_ACTIVE,
+                                            &insight,
+                                        );
+                                        let synth_meta =
+                                            prompts::memory_proto::EntryMeta::from_session(
+                                                state.session_id.as_deref(),
+                                                state.turn,
+                                                prompts::memory_proto::SRC_SYNTHESIS,
+                                            );
+                                        let _ = api
+                                            .post_memory_store_json(
+                                                tok,
+                                                &insight_entry
+                                                    .to_store_payload_with_meta(&synth_meta),
+                                            )
+                                            .await;
+                                        facts_stored += 1; // count insight as a stored fact
+                                    }
                                 }
                             }
                         }
@@ -481,58 +496,64 @@ pub(super) async fn handle_state_command(
                 }
             }
 
-            // Truncate history: keep last 3 turns, prepend summary as system context
-            const KEEP_RECENT: usize = 3;
+            // Truncate history: align with ContextBudget (same as auto-compact)
+            let keep_recent = state.context_budget.keep_recent_turns;
             let total = state.history.len();
-            let trimmed_count = total.saturating_sub(KEEP_RECENT);
+            let trimmed_count = total.saturating_sub(keep_recent);
             if trimmed_count > 0 {
                 // ── Context swap: store trimmed turns to memory for later retrieval ──
                 if let Some(tok) = token {
-                    // Build a compact representation of the swapped turns
-                    let mut swap_lines: Vec<String> = Vec::new();
-                    for (user_msg, assistant_msg) in &state.history[..trimmed_count] {
-                        if !user_msg.is_empty() {
-                            let preview: String = user_msg.chars().take(100).collect();
-                            swap_lines.push(format!("U: {preview}"));
+                    if !compact_no_memoria {
+                        // Build a compact representation of the swapped turns
+                        let mut swap_lines: Vec<String> = Vec::new();
+                        for (user_msg, assistant_msg) in &state.history[..trimmed_count] {
+                            if !user_msg.is_empty() {
+                                let preview: String = user_msg.chars().take(100).collect();
+                                swap_lines.push(format!("U: {preview}"));
+                            }
+                            if !assistant_msg.is_empty() {
+                                let preview: String = assistant_msg.chars().take(150).collect();
+                                swap_lines.push(format!("A: {preview}"));
+                            }
                         }
-                        if !assistant_msg.is_empty() {
-                            let preview: String = assistant_msg.chars().take(150).collect();
-                            swap_lines.push(format!("A: {preview}"));
+                        if !swap_lines.is_empty() {
+                            let swap_body = format!(
+                                "Turns 1-{trimmed_count} swapped out:\n{}",
+                                swap_lines.join("\n")
+                            );
+                            // Cap at 2000 chars to avoid storing excessive content
+                            let capped: String = swap_body.chars().take(2000).collect();
+                            let swap_entry = prompts::memory_proto::MemoryEntry::new(
+                                prompts::memory_proto::NS_SWAP,
+                                prompts::memory_proto::ST_ARCHIVED,
+                                &capped,
+                            );
+                            let swap_meta = prompts::memory_proto::EntryMeta::from_session(
+                                state.session_id.as_deref(),
+                                state.turn,
+                                prompts::memory_proto::SRC_COMPACT,
+                            );
+                            let _ = api
+                                .post_memory_store_json(
+                                    tok,
+                                    &swap_entry.to_store_payload_with_meta(&swap_meta),
+                                )
+                                .await;
                         }
-                    }
-                    if !swap_lines.is_empty() {
-                        let swap_body = format!(
-                            "Turns 1-{trimmed_count} swapped out:\n{}",
-                            swap_lines.join("\n")
-                        );
-                        // Cap at 2000 chars to avoid storing excessive content
-                        let capped: String = swap_body.chars().take(2000).collect();
-                        let swap_entry = prompts::memory_proto::MemoryEntry::new(
-                            prompts::memory_proto::NS_SWAP,
-                            prompts::memory_proto::ST_ARCHIVED,
-                            &capped,
-                        );
-                        let swap_meta = prompts::memory_proto::EntryMeta::from_session(
-                            state.session_id.as_deref(),
-                            state.turn,
-                            prompts::memory_proto::SRC_COMPACT,
-                        );
-                        let _ = api
-                            .post_memory_store_json(
-                                tok,
-                                &swap_entry.to_store_payload_with_meta(&swap_meta),
-                            )
-                            .await;
                     }
                 }
 
-                let anchor = crate::repl_turn::fetch_compact_memory_anchor_snippet(
-                    api,
-                    tok,
-                    state.session_id.as_deref(),
-                    &summary,
-                )
-                .await;
+                let anchor = if compact_no_memoria {
+                    None
+                } else {
+                    crate::repl_turn::fetch_compact_memory_anchor_snippet(
+                        api,
+                        tok,
+                        state.session_id.as_deref(),
+                        &summary,
+                    )
+                    .await
+                };
                 let assistant_text = crate::repl_turn::compact_assistant_message(
                     trimmed_count,
                     &summary,
@@ -559,12 +580,18 @@ pub(super) async fn handle_state_command(
                 "────────────────────────────────────────────────────────────".dim()
             );
             eprintln!();
-            let mem_note = if saved_to_memoria {
-                if facts_stored > 0 {
+            let mem_note = if compact_no_memoria {
+                " · Memoria side-effects skipped (no-memoria)".to_string()
+            } else if saved_to_memoria {
+                let mut s = if facts_stored > 0 {
                     format!(" · saved to memory ({facts_stored} facts extracted)")
                 } else {
                     " · saved to memory".to_string()
+                };
+                if compact_quick {
+                    s.push_str(" · quick (no fact extraction pass)");
                 }
+                s
             } else {
                 String::new()
             };

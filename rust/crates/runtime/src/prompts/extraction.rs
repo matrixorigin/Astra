@@ -114,6 +114,8 @@ User preferences, project conventions, or important details worth remembering.
 
 ## Rules
 - Under 250 words total.
-- No preamble, greeting, or sign-off.
-- Start directly with ### Goals.
-- Use bullet points, not prose.";
+- Output only the five sections above. Do not add any other headings, sections, preamble, greeting, or sign-off.
+- The first line of your response must be exactly `### Goals` (no text before it).
+- After the bullets under `### Key Facts`, stop. Do not add closing remarks or a summary line.
+- Use bullet points under each section, not prose paragraphs.
+- Do not paste the raw transcript; summarize.";

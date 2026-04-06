@@ -89,6 +89,8 @@ mod tests {
         assert!(COMPACT_SUMMARY_REQUEST.contains("250 words"));
         assert!(COMPACT_SUMMARY_REQUEST.contains("### Goals"));
         assert!(COMPACT_SUMMARY_REQUEST.contains("### Key Facts"));
+        assert!(COMPACT_SUMMARY_REQUEST.contains("five sections"));
+        assert!(COMPACT_SUMMARY_REQUEST.contains("first line"));
     }
 
     #[test]

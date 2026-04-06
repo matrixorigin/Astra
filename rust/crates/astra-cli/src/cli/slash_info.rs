@@ -376,15 +376,20 @@ Output format:\n\
     )
 }
 
-/// Prefer journal `turn == n` (latest match), else the *n*th `Turn` event (1-based order).
-fn resolve_turn_from_journal(
+fn collect_journal_turns(
     events: Vec<session_journal::JournalEvent>,
-    n: u32,
-) -> Option<session_journal::JournalEvent> {
-    let turns: Vec<_> = events
+) -> Vec<session_journal::JournalEvent> {
+    events
         .into_iter()
         .filter(|e| e.event_type == session_journal::JournalEventType::Turn)
-        .collect();
+        .collect()
+}
+
+/// Prefer journal `turn == n` (latest match), else the *n*th `Turn` event (1-based order).
+fn resolve_legacy_turn(
+    turns: &[session_journal::JournalEvent],
+    n: u32,
+) -> Option<session_journal::JournalEvent> {
     turns
         .iter()
         .rev()
@@ -393,12 +398,202 @@ fn resolve_turn_from_journal(
         .or_else(|| turns.get((n as usize).saturating_sub(1)).cloned())
 }
 
-fn print_turn_trace(ev: &session_journal::JournalEvent) {
-    let total_ms = ev.duration_ms.unwrap_or(1) as f64;
-    let sep = "─".repeat(42);
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TurnPick {
+    Last,
+    List,
+    /// Historical behavior: match `turn == n` (latest), else nth Turn event.
+    Legacy(u32),
+    /// Nth Turn event in chronological order (1-based).
+    Seq(u32),
+    /// Strict: `event.turn == n` only (latest such event).
+    Id(u32),
+    /// From end: -1 last, -2 previous, … (matches journal `seq` ordering).
+    Relative(i32),
+}
+
+fn turn_arg_usage() -> &'static str {
+    "Usage: /turn | /turn list | /turn N | /turn seq:N | /turn #N | /turn id:N | /turn @N | /turn -1  (see /help)"
+}
+
+fn parse_turn_pick(arg: &str) -> Result<TurnPick, String> {
+    let t = arg.trim();
+    if t.is_empty() {
+        return Ok(TurnPick::Last);
+    }
+    if t.eq_ignore_ascii_case("list") {
+        return Ok(TurnPick::List);
+    }
+    let lower = t.to_ascii_lowercase();
+    if let Some(rest) = lower.strip_prefix("seq:") {
+        let n = rest
+            .trim()
+            .parse::<u32>()
+            .map_err(|_| turn_arg_usage().to_string())?;
+        if n == 0 {
+            return Err("seq must be >= 1".to_string());
+        }
+        return Ok(TurnPick::Seq(n));
+    }
+    if let Some(rest) = lower.strip_prefix("id:") {
+        let n = rest
+            .trim()
+            .parse::<u32>()
+            .map_err(|_| turn_arg_usage().to_string())?;
+        return Ok(TurnPick::Id(n));
+    }
+    if let Some(rest) = t.strip_prefix('#') {
+        let n = rest
+            .trim()
+            .parse::<u32>()
+            .map_err(|_| turn_arg_usage().to_string())?;
+        if n == 0 {
+            return Err("seq must be >= 1".to_string());
+        }
+        return Ok(TurnPick::Seq(n));
+    }
+    if let Some(rest) = t.strip_prefix('@') {
+        let n = rest
+            .trim()
+            .parse::<u32>()
+            .map_err(|_| turn_arg_usage().to_string())?;
+        return Ok(TurnPick::Id(n));
+    }
+    if let Ok(i) = t.parse::<i32>() {
+        if i < 0 {
+            return Ok(TurnPick::Relative(i));
+        }
+        if i > 0 {
+            return Ok(TurnPick::Legacy(i as u32));
+        }
+        return Err("turn number must be non-zero".to_string());
+    }
+    Err(turn_arg_usage().to_string())
+}
+
+fn seq_for_event(
+    turns: &[session_journal::JournalEvent],
+    ev: &session_journal::JournalEvent,
+) -> Option<u32> {
+    let key = (ev.turn, ev.ts.as_str());
+    turns.iter().enumerate().find_map(|(i, e)| {
+        if (e.turn, e.ts.as_str()) == key {
+            Some(i as u32 + 1)
+        } else {
+            None
+        }
+    })
+}
+
+fn resolve_turn_pick(
+    turns: &[session_journal::JournalEvent],
+    pick: TurnPick,
+) -> Result<Option<(session_journal::JournalEvent, Option<u32>)>, String> {
+    match pick {
+        TurnPick::Last => Ok(turns.last().cloned().map(|ev| {
+            let seq = turns.len() as u32;
+            (ev, Some(seq))
+        })),
+        TurnPick::List => Ok(None),
+        TurnPick::Legacy(n) => {
+            let ev = resolve_legacy_turn(turns, n);
+            Ok(ev.map(|e| {
+                let seq = seq_for_event(turns, &e);
+                (e, seq)
+            }))
+        }
+        TurnPick::Seq(n) => {
+            let ev = turns
+                .get((n as usize).saturating_sub(1))
+                .cloned()
+                .ok_or_else(|| {
+                    format!("no journal Turn at seq {n} ({} in session)", turns.len())
+                })?;
+            Ok(Some((ev, Some(n))))
+        }
+        TurnPick::Id(n) => {
+            let mut found: Option<(usize, session_journal::JournalEvent)> = None;
+            for (i, e) in turns.iter().enumerate() {
+                if e.turn == Some(n) {
+                    found = Some((i, e.clone()));
+                }
+            }
+            let (i, ev) = found.ok_or_else(|| {
+                format!("no Turn event with id {n} (use `/turn list` for seq / id columns)")
+            })?;
+            Ok(Some((ev, Some(i as u32 + 1))))
+        }
+        TurnPick::Relative(i) => {
+            let len = turns.len() as i32;
+            let idx = len + i;
+            if idx < 0 || idx >= len {
+                return Err(format!(
+                    "relative index {i} out of range for {} journal turns",
+                    turns.len()
+                ));
+            }
+            let ev = turns[idx as usize].clone();
+            Ok(Some((ev, Some(idx as u32 + 1))))
+        }
+    }
+}
+
+fn print_turn_journal_list(turns: &[session_journal::JournalEvent]) {
     eprintln!(
         "\n  {}",
-        format!("─── Turn {} Trace {sep}", ev.turn.unwrap_or(0)).cyan()
+        "─── Journal turns (seq = chronological index) ───────────────".cyan()
+    );
+    eprintln!(
+        "  {:>4} {:>6} {:>8}  {}",
+        "seq".bold(),
+        "id".bold(),
+        "ms".bold(),
+        "user (preview)".dim()
+    );
+    for (i, ev) in turns.iter().enumerate() {
+        let seq = i + 1;
+        let id = ev
+            .turn
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "-".to_string());
+        let ms = ev
+            .duration_ms
+            .map(|m| m.to_string())
+            .unwrap_or_else(|| "-".to_string());
+        let preview = ev
+            .user_input
+            .as_deref()
+            .map(|s| {
+                let s = s.trim();
+                if s.chars().count() > 56 {
+                    let short: String = s.chars().take(55).collect();
+                    format!("{short}…")
+                } else {
+                    s.to_string()
+                }
+            })
+            .unwrap_or_default();
+        eprintln!("  {:>4} {:>6} {:>8}  {}", seq, id, ms, preview.dim());
+    }
+    eprintln!("  {}", "─".repeat(60).cyan().dim());
+    eprintln!(
+        "{}",
+        "  Pick: /turn seq:N or /turn #N  ·  strict id: /turn id:N or /turn @N  ·  legacy: /turn N  ·  relative: /turn -1"
+            .dim()
+    );
+    eprintln!();
+}
+
+fn print_turn_trace(ev: &session_journal::JournalEvent, journal_seq: Option<u32>) {
+    let total_ms = ev.duration_ms.unwrap_or(1) as f64;
+    let sep = "─".repeat(42);
+    let id = ev.turn.unwrap_or(0);
+    let seq_note = journal_seq
+        .map(|s| format!(" · journal seq {s}"))
+        .unwrap_or_default();
+    eprintln!(
+        "\n  {}",
+        format!("─── Turn id {id} trace{seq_note} {sep}").cyan()
     );
 
     // Calculate tool time
@@ -1183,57 +1378,89 @@ pub(super) async fn handle_info_command(
         }
 
         "/turn" => {
-            let trimmed = arg.trim();
-            let from_journal = if trimmed.is_empty() {
-                None
-            } else {
-                let n = match trimmed.parse::<u32>() {
-                    Ok(v) if v > 0 => v,
-                    _ => {
-                        eprintln!(
-                            "{}",
-                            "  Usage: /turn [n] — show timing trace for the last turn, or journal turn #n / nth completed turn."
-                                .yellow()
-                        );
-                        return Ok(());
-                    }
-                };
+            let pick = match parse_turn_pick(arg) {
+                Ok(p) => p,
+                Err(msg) => {
+                    eprintln!("{}", format!("  {msg}").yellow());
+                    return Ok(());
+                }
+            };
+
+            if pick == TurnPick::List {
                 let Some(sid) = state.session_id.as_deref() else {
                     eprintln!(
                         "{}",
-                        "  No active session; cannot load /turn from journal.".yellow()
+                        "  No active session; cannot list journal turns.".yellow()
                     );
                     return Ok(());
                 };
                 match session_journal::read_journal(sid) {
-                    Ok(events) => resolve_turn_from_journal(events, n),
+                    Ok(events) => {
+                        let turns = collect_journal_turns(events);
+                        if turns.is_empty() {
+                            eprintln!("{}", "  No Turn events in this session journal yet.".dim());
+                        } else {
+                            print_turn_journal_list(&turns);
+                        }
+                    }
                     Err(e) => {
                         eprintln!(
                             "{}",
                             format!("  Failed to read session journal: {e}").yellow()
                         );
-                        return Ok(());
                     }
                 }
-            };
-            let ev_ref = if trimmed.is_empty() {
-                state.last_turn_event.as_ref()
-            } else {
-                from_journal.as_ref()
-            };
+                return Ok(());
+            }
 
-            if let Some(ev) = ev_ref {
-                print_turn_trace(ev);
-            } else if trimmed.is_empty() {
+            if pick == TurnPick::Last {
+                if let Some(ev) = state.last_turn_event.as_ref() {
+                    let seq = state
+                        .session_id
+                        .as_deref()
+                        .and_then(|sid| {
+                            session_journal::read_journal(sid).ok().map(|events| {
+                                let turns = collect_journal_turns(events);
+                                seq_for_event(&turns, ev)
+                            })
+                        })
+                        .flatten();
+                    print_turn_trace(ev, seq);
+                } else {
+                    eprintln!(
+                        "{}",
+                        "  No turn data yet. Complete a conversation turn first.".dim()
+                    );
+                }
+                return Ok(());
+            }
+
+            let Some(sid) = state.session_id.as_deref() else {
                 eprintln!(
                     "{}",
-                    "  No turn data yet. Complete a conversation turn first.".dim()
+                    "  No active session; cannot load /turn from journal.".yellow()
                 );
-            } else {
-                eprintln!(
-                    "{}",
-                    format!("  No journal turn matches '{trimmed}'.").yellow()
-                );
+                return Ok(());
+            };
+            let turns = match session_journal::read_journal(sid) {
+                Ok(events) => collect_journal_turns(events),
+                Err(e) => {
+                    eprintln!(
+                        "{}",
+                        format!("  Failed to read session journal: {e}").yellow()
+                    );
+                    return Ok(());
+                }
+            };
+            match resolve_turn_pick(&turns, pick) {
+                Ok(Some((ev, seq))) => print_turn_trace(&ev, seq),
+                Ok(None) => {
+                    eprintln!(
+                        "{}",
+                        "  No matching journal Turn for that selector.".yellow()
+                    );
+                }
+                Err(e) => eprintln!("{}", format!("  {e}").yellow()),
             }
         }
 

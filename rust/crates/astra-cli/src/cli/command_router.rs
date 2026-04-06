@@ -111,7 +111,7 @@ pub(super) async fn execute_cli_command(
                         mcp_manager: None,
                         skill_search: &skill_search,
                         skill_quality_tracker: &mut skill_qt,
-                discovered_skills: None,
+                        discovered_skills: None,
                     })
                     .await
                     .map_err(|f| f.error)?
@@ -373,7 +373,7 @@ pub(super) async fn execute_cli_command(
                         mcp_manager: None,
                         skill_search: &skill_search,
                         skill_quality_tracker: &mut skill_qt,
-                discovered_skills: None,
+                        discovered_skills: None,
                     })
                     .await
                     .map_err(|f| f.error)?
@@ -696,6 +696,11 @@ pub(super) async fn execute_cli_command(
             }
             .map_err(map_thin_err)?;
             print_json_or_raw(&body);
+            Ok(ExitCode::Success)
+        }
+
+        Some(Command::Journal(JournalCmd::Digest(args))) => {
+            journal_digest::run_digest(&args)?;
             Ok(ExitCode::Success)
         }
     }

@@ -70,6 +70,8 @@ mod durable_bridge;
 mod edge_lifecycle;
 #[path = "cli/effects/mod.rs"]
 mod effects;
+#[path = "cli/journal_digest.rs"]
+mod journal_digest;
 #[path = "cli/permission_manager.rs"]
 mod permission_manager;
 #[path = "cli/plan_executor.rs"]
@@ -184,6 +186,9 @@ enum Command {
     /// Session audit: astra audit list/show/turns/tools
     #[command(subcommand)]
     Audit(AuditCmd),
+    /// Local session journal (offline): astra journal digest
+    #[command(subcommand)]
+    Journal(JournalCmd),
     /// Direct message: astra "your question here"
     #[command(external_subcommand)]
     Message(Vec<String>),
@@ -387,6 +392,25 @@ struct AuditToolsArgs {
     since: Option<String>,
     #[arg(long)]
     until: Option<String>,
+}
+
+#[derive(Subcommand, Debug)]
+enum JournalCmd {
+    /// Print a deterministic digest of a local session journal (JSON or text)
+    Digest(JournalDigestArgs),
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct JournalDigestArgs {
+    /// Session id, unique prefix, `last`, or omit for most recent local journal
+    #[arg(value_name = "SESSION")]
+    session_id: Option<String>,
+    /// Output format: json or text
+    #[arg(long, default_value = "json")]
+    format: String,
+    /// all (default) or summary (smaller turn rows)
+    #[arg(long)]
+    focus: Option<String>,
 }
 
 // ═══════════════════════════════════════════════════════ Credentials ══════
@@ -1463,7 +1487,11 @@ fn handle_cost_command(arg: &str, state: &ReplState) {
                     };
                     eprintln!(
                         "  Turn {:>3}  {:>6}+{:<6} tok  {}{}",
-                        turn_num, p_tok, c_tok, format_cost(cost), cache_info
+                        turn_num,
+                        p_tok,
+                        c_tok,
+                        format_cost(cost),
+                        cache_info
                     );
                 }
             }
@@ -1609,7 +1637,9 @@ fn handle_cost_command(arg: &str, state: &ReplState) {
                     "  {:<14} {} ({})",
                     "cache write:".dim(),
                     state.total_cache_creation_tokens,
-                    format_cost(state.total_cache_creation_tokens as f64 * cache_write_rate / 1000.0),
+                    format_cost(
+                        state.total_cache_creation_tokens as f64 * cache_write_rate / 1000.0
+                    ),
                 );
             }
             eprintln!("  {:<14} {}", "total:".bold(), format_cost(cost).bold());
@@ -1622,8 +1652,11 @@ fn handle_cost_command(arg: &str, state: &ReplState) {
             }
             if state.total_cache_read_tokens > 0 {
                 let total_input = state.total_prompt_tokens + state.total_cache_read_tokens;
-                let cache_pct = state.total_cache_read_tokens as f64 / total_input.max(1) as f64 * 100.0;
-                let saved = state.total_cache_read_tokens as f64 * (pricing.prompt - cache_read_rate) / 1000.0;
+                let cache_pct =
+                    state.total_cache_read_tokens as f64 / total_input.max(1) as f64 * 100.0;
+                let saved = state.total_cache_read_tokens as f64
+                    * (pricing.prompt - cache_read_rate)
+                    / 1000.0;
                 eprintln!(
                     "  {:<14} {:.0}% cache hit, {} saved",
                     "savings:".dim(),
@@ -1768,7 +1801,11 @@ pub(crate) fn fallback_pricing(model_name: &str) -> astra_services::models::Pric
         };
     }
     // GPT-4o-mini / GPT-4.1-mini: $0.15/$0.60 per Mtok
-    if name.contains("4o-mini") || name.contains("4.1-mini") || name.contains("5-mini") || name.contains("5.4-mini") {
+    if name.contains("4o-mini")
+        || name.contains("4.1-mini")
+        || name.contains("5-mini")
+        || name.contains("5.4-mini")
+    {
         return PricingData {
             prompt: 0.00015,
             completion: 0.0006,
@@ -7384,7 +7421,7 @@ total_tokens_out: 500
         let pricing = astra_services::models::PricingData {
             prompt: 0.003,
             completion: 0.015,
-            cache_read: Some(0.0003),  // 10% of prompt
+            cache_read: Some(0.0003),   // 10% of prompt
             cache_write: Some(0.00375), // 125% of prompt
         };
         // 500 prompt + 200 completion + 1000 cache_read + 100 cache_write
@@ -7505,20 +7542,29 @@ total_tokens_out: 500
     #[test]
     fn fallback_opus_4_pricing() {
         let p = fallback_pricing("claude-opus-4-20250514");
-        assert!((p.prompt - 0.015).abs() < 1e-6, "opus-4 prompt should be $15/Mtok");
+        assert!(
+            (p.prompt - 0.015).abs() < 1e-6,
+            "opus-4 prompt should be $15/Mtok"
+        );
         assert!((p.completion - 0.075).abs() < 1e-6);
     }
 
     #[test]
     fn fallback_opus_45_pricing() {
         let p = fallback_pricing("claude-opus-4.5-20250415");
-        assert!((p.prompt - 0.005).abs() < 1e-6, "opus 4.5 should be $5/Mtok");
+        assert!(
+            (p.prompt - 0.005).abs() < 1e-6,
+            "opus 4.5 should be $5/Mtok"
+        );
     }
 
     #[test]
     fn fallback_haiku_pricing() {
         let p = fallback_pricing("claude-haiku-4.5-20250514");
-        assert!((p.prompt - 0.001).abs() < 1e-6, "haiku 4.5 should be $1/Mtok");
+        assert!(
+            (p.prompt - 0.001).abs() < 1e-6,
+            "haiku 4.5 should be $1/Mtok"
+        );
     }
 
     #[test]
@@ -7536,7 +7582,10 @@ total_tokens_out: 500
     #[test]
     fn fallback_unknown_uses_sonnet() {
         let p = fallback_pricing("some-unknown-model");
-        assert!((p.prompt - 0.003).abs() < 1e-6, "unknown model should default to sonnet pricing");
+        assert!(
+            (p.prompt - 0.003).abs() < 1e-6,
+            "unknown model should default to sonnet pricing"
+        );
     }
 
     #[test]
@@ -7546,6 +7595,9 @@ total_tokens_out: 500
         let cost = cost_for_tokens(1000, 500, 2000, 100, &p);
         // $0.003/Ktok * 1 + $0.015/Ktok * 0.5 + $0.0003/Ktok * 2 + $0.00375/Ktok * 0.1
         let expected = 0.003 + 0.0075 + 0.0006 + 0.000375;
-        assert!((cost - expected).abs() < 1e-8, "cost={cost} expected={expected}");
+        assert!(
+            (cost - expected).abs() < 1e-8,
+            "cost={cost} expected={expected}"
+        );
     }
 }
