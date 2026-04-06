@@ -1281,12 +1281,12 @@ fn execute_skill<'a>(
                         Some(&pipeline_ctx)
                     }
                     None => {
-                        let mut root = crate::skills::composition::CompositionContext::root();
-                        root.timeout_secs = skill
-                            .composition
-                            .as_ref()
-                            .and_then(|c| c.max_duration_sec)
-                            .map(|s| s as u64);
+                        let comp = skill.composition.as_ref().unwrap();
+                        let mut root = match comp.max_depth {
+                            Some(d) => crate::skills::composition::CompositionContext::root_with_max_depth(d),
+                            None => crate::skills::composition::CompositionContext::root(),
+                        };
+                        root.timeout_secs = comp.max_duration_sec.map(|s| s as u64);
                         pipeline_ctx = root;
                         Some(&pipeline_ctx)
                     }
@@ -2803,6 +2803,7 @@ mod tests {
                         idempotent: false,
                         side_effects: vec![],
                         max_duration_sec: None,
+                        max_depth: None,
                         steps: vec![],
                     }),
                     input_schema: None,
@@ -2858,6 +2859,7 @@ mod tests {
                         idempotent: false,
                         side_effects: vec![],
                         max_duration_sec: None,
+                        max_depth: None,
                         steps: vec![],
                     }),
                     input_schema: None,
@@ -3070,6 +3072,7 @@ mod tests {
                         idempotent: false,
                         side_effects: vec![],
                         max_duration_sec: Some(300),
+                        max_depth: None,
                         steps: vec![
                             crate::skills::manifest::PipelineStep {
                                 skill: "step-a".into(),
@@ -3107,6 +3110,7 @@ mod tests {
                         idempotent: true,
                         side_effects: vec![],
                         max_duration_sec: None,
+                        max_depth: None,
                         steps: vec![],
                     }),
                     input_schema: None,
@@ -3182,6 +3186,7 @@ mod tests {
                             idempotent: false,
                             side_effects: vec![],
                             max_duration_sec: None,
+                            max_depth: None,
                             steps: vec![
                                 crate::skills::manifest::PipelineStep {
                                     skill: "ok-step".into(),
@@ -3225,6 +3230,7 @@ mod tests {
                             idempotent: true,
                             side_effects: vec![],
                             max_duration_sec: None,
+                            max_depth: None,
                             steps: vec![],
                         }),
                         input_schema: None,
@@ -3280,5 +3286,36 @@ Run the pipeline.
         assert!(comp.steps[0].required); // default true
         assert_eq!(comp.steps[1].skill, "fix");
         assert!(!comp.steps[1].required);
+    }
+
+    #[tokio::test]
+    async fn max_depth_parsed_from_yaml() {
+        let skill_md = r#"---
+name: deep-skill
+description: "Skill with custom depth"
+composition:
+  composable: true
+  max_depth: 5
+---
+Deep nesting allowed.
+"#;
+        let (manifest, _body) = crate::skills::loader::parse_skill_md(skill_md).unwrap();
+        let comp = manifest.composition.unwrap();
+        assert_eq!(comp.max_depth, Some(5));
+    }
+
+    #[tokio::test]
+    async fn max_depth_defaults_to_none() {
+        let skill_md = r#"---
+name: normal-skill
+description: "No custom depth"
+composition:
+  composable: true
+---
+Normal.
+"#;
+        let (manifest, _body) = crate::skills::loader::parse_skill_md(skill_md).unwrap();
+        let comp = manifest.composition.unwrap();
+        assert_eq!(comp.max_depth, None);
     }
 }

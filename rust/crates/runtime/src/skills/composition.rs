@@ -43,6 +43,20 @@ impl CompositionContext {
         }
     }
 
+    /// Create a root context with a custom depth limit.
+    ///
+    /// Used when a skill declares `max_depth` in its composition metadata.
+    pub fn root_with_max_depth(max_depth: u32) -> Self {
+        Self {
+            depth: 0,
+            max_depth,
+            parent_skill: None,
+            side_effects: Vec::new(),
+            start_time: Instant::now(),
+            timeout_secs: None,
+        }
+    }
+
     /// Create a child context for a nested skill invocation.
     ///
     /// Inherits the parent's timeout budget (minus elapsed time) and increments depth.
@@ -394,5 +408,44 @@ mod tests {
         });
         let warnings = validate_output(&schema, r#"{"status": "ok"}"#);
         assert!(warnings.is_empty());
+    }
+
+    // ── Configurable depth tests ─────────────────────────────────────────────
+
+    #[test]
+    fn root_with_max_depth_uses_custom_limit() {
+        let ctx = CompositionContext::root_with_max_depth(5);
+        assert_eq!(ctx.max_depth, 5);
+        assert_eq!(ctx.depth, 0);
+        assert!(ctx.check_depth().is_ok());
+    }
+
+    #[test]
+    fn custom_depth_limit_enforced() {
+        let mut ctx = CompositionContext::root_with_max_depth(2);
+        ctx.depth = 2;
+        assert!(ctx.check_depth().is_err());
+        ctx.depth = 1;
+        assert!(ctx.check_depth().is_ok());
+    }
+
+    #[test]
+    fn child_inherits_parent_max_depth() {
+        let root = CompositionContext::root_with_max_depth(5);
+        let child = root.child("skill-a", None);
+        assert_eq!(child.max_depth, 5);
+        assert_eq!(child.depth, 1);
+    }
+
+    #[test]
+    fn deeper_nesting_allowed_with_custom_depth() {
+        let root = CompositionContext::root_with_max_depth(5);
+        let c1 = root.child("a", None);
+        let c2 = c1.child("b", None);
+        let c3 = c2.child("c", None);
+        let c4 = c3.child("d", None);
+        assert!(c4.check_depth().is_ok()); // depth 4 < max 5
+        let c5 = c4.child("e", None);
+        assert!(c5.check_depth().is_err()); // depth 5 >= max 5
     }
 }

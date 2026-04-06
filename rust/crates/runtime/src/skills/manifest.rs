@@ -249,6 +249,14 @@ pub struct SkillComposition {
     /// Maximum execution time in seconds (for orchestrators to enforce).
     #[serde(default)]
     pub max_duration_sec: Option<u32>,
+    /// Maximum nesting depth for this skill's composition chain.
+    ///
+    /// Overrides the global `MAX_COMPOSITION_DEPTH` (default 3).
+    /// A skill with `max_depth: 5` allows deeper nesting when it is the
+    /// root of a composition, but the depth is still capped by the parent
+    /// context's remaining budget when called as a nested step.
+    #[serde(default)]
+    pub max_depth: Option<u32>,
     /// Ordered pipeline of skills to execute sequentially.
     ///
     /// When present, invoking this skill runs each step in order,
