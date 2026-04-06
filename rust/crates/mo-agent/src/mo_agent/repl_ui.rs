@@ -56,6 +56,7 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     // ── Advanced ──────────────────────────────────────────────────────────
     ("/doctor", "Run diagnostics"),
     ("/version", "Show version info"),
+    ("/style", "Switch output theme (default, minimal, colorful, high-contrast)"),
     (
         "/session",
         "Session info: cwd, git, workspace.yaml, REPL state",
@@ -586,6 +587,7 @@ fn slash_argument_hint(command: &str) -> Option<&'static str> {
         "/cost" => Some("[detail|history]"),
         "/health" => Some("[detail]"),
         "/sync" => Some("[log|push|pull]"),
+        "/style" => Some("[list|default|minimal|colorful|high-contrast]"),
         _ => None,
     }
 }
