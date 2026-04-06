@@ -766,11 +766,9 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
     }
 
     // ─── Preamble: auto-inject skill tool when skills are available ──────
-    // Register the skill tool schema so the LLM knows the `skill` tool exists.
-    // The skill listing (available skill names + descriptions) is stored on
-    // state.skill_listing_message and injected ephemerally by the host at
-    // each turn — it does NOT go into state.messages, so it doesn't bloat
-    // the persistent conversation history or survive into compaction.
+    // Register the skill tool schema once so the LLM knows the `skill` tool exists.
+    // The skill listing is refreshed per-turn below (skills may change at runtime
+    // via hot-reload or MCP server connect/disconnect).
     if let Some(resolver) = &state.skill_resolver {
         let skills = resolver.available_skills();
         if !skills.is_empty() {
@@ -779,13 +777,6 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
                 Some(&state.skill_quality_tracker),
                 Some(&state.pinned_skills),
             ));
-            state.skill_listing_message = Some(
-                crate::turn::skill_tool::skill_listing_system_message(
-                    &skills,
-                    Some(&state.skill_quality_tracker),
-                    Some(&state.pinned_skills),
-                ),
-            );
         }
     }
 
@@ -811,6 +802,20 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
         }
         state.remaining_turns = state.remaining_turns.saturating_sub(1);
         state.step_recorder.begin_turn(turn_index as u32);
+
+        // ─── Refresh ephemeral skill listing (picks up hot-reload changes) ──
+        if let Some(resolver) = &state.skill_resolver {
+            let skills = resolver.available_skills();
+            state.skill_listing_message = if skills.is_empty() {
+                None
+            } else {
+                Some(crate::turn::skill_tool::skill_listing_system_message(
+                    &skills,
+                    Some(&state.skill_quality_tracker),
+                    Some(&state.pinned_skills),
+                ))
+            };
+        }
 
         // ─── Step 1: Host executes the turn (payload → HTTP → SSE) ──────
         let turn_result = host.execute_turn(state).await?;
