@@ -641,11 +641,14 @@ async fn call_llm_stream(
                                             let prompt = result.usage.get("prompt").and_then(Value::as_i64);
                                             let completion = result.usage.get("completion").and_then(Value::as_i64);
                                             if prompt.is_some() || completion.is_some() {
+                                                let cache_read = result.usage.get("cache_read").and_then(Value::as_i64);
+                                                let cache_creation = result.usage.get("cache_creation").and_then(Value::as_i64);
                                                 yield render_sse(&json!({
                                                     "type": "usage",
                                                     "prompt_tokens": prompt,
                                                     "completion_tokens": completion,
-                                                    "cache_read_tokens": Value::Null,
+                                                    "cache_read_tokens": cache_read,
+                                                    "cache_creation_tokens": cache_creation,
                                                 }));
                                             }
                                         }
@@ -691,13 +694,22 @@ async fn call_llm_stream(
                                         usage_map.insert("total".to_string(), Value::from(p + c));
                                     }
                                     usage = usage_map;
+                                    // OpenAI: prompt_tokens_details.cached_tokens
+                                    // Anthropic (via proxy): cache_read_input_tokens / cache_creation_input_tokens
+                                    let cache_read = u.get("prompt_tokens_details")
+                                        .and_then(|d| d.get("cached_tokens"))
+                                        .and_then(Value::as_i64)
+                                        .or_else(|| u.get("cache_read_input_tokens").and_then(Value::as_i64));
+                                    let cache_creation = u.get("prompt_tokens_details")
+                                        .and_then(|d| d.get("cache_creation_input_tokens"))
+                                        .and_then(Value::as_i64)
+                                        .or_else(|| u.get("cache_creation_input_tokens").and_then(Value::as_i64));
                                     yield render_sse(&json!({
                                         "type": "usage",
                                         "prompt_tokens": prompt,
                                         "completion_tokens": completion,
-                                        "cache_read_tokens": u.get("prompt_tokens_details")
-                                            .and_then(|d| d.get("cached_tokens"))
-                                            .and_then(Value::as_i64),
+                                        "cache_read_tokens": cache_read,
+                                        "cache_creation_tokens": cache_creation,
                                     }));
                                 }
                             }

@@ -1079,6 +1079,7 @@ async fn handle_resume_command(arg: &str, profile: Option<&str>, state: &mut Rep
 
             if let Some(ref m) = restored.model {
                 state.model = Some(m.clone());
+                state.cached_pricing = fallback_pricing(m);
             }
 
             // Store learning snapshot for merge after handler returns
@@ -1660,6 +1661,95 @@ pub(crate) fn extract_pricing_for_model(
         return None;
     }
     None
+}
+
+/// Built-in pricing table for known models ($/Ktok).
+/// Used when the API model list doesn't include pricing data.
+/// Pricing from https://platform.claude.com/docs/en/about-claude/pricing
+/// and https://openai.com/api/pricing/
+pub(crate) fn fallback_pricing(model_name: &str) -> astra_services::models::PricingData {
+    use astra_services::models::PricingData;
+    let name = model_name.to_lowercase();
+
+    // Claude Opus 4/4.1: $15/$75 per Mtok
+    if name.contains("opus-4") && !name.contains("4.5") && !name.contains("4.6") {
+        return PricingData {
+            prompt: 0.015,
+            completion: 0.075,
+            cache_read: Some(0.0015),
+            cache_write: Some(0.01875),
+        };
+    }
+    // Claude Opus 4.5/4.6: $5/$25 per Mtok
+    if name.contains("opus") {
+        return PricingData {
+            prompt: 0.005,
+            completion: 0.025,
+            cache_read: Some(0.0005),
+            cache_write: Some(0.00625),
+        };
+    }
+    // Claude Sonnet (3.5/3.7/4/4.5/4.6): $3/$15 per Mtok
+    if name.contains("sonnet") {
+        return PricingData {
+            prompt: 0.003,
+            completion: 0.015,
+            cache_read: Some(0.0003),
+            cache_write: Some(0.00375),
+        };
+    }
+    // Claude Haiku 4.5: $1/$5 per Mtok
+    if name.contains("haiku") && (name.contains("4.5") || name.contains("4-5")) {
+        return PricingData {
+            prompt: 0.001,
+            completion: 0.005,
+            cache_read: Some(0.0001),
+            cache_write: Some(0.00125),
+        };
+    }
+    // Claude Haiku 3.5: $0.80/$4 per Mtok
+    if name.contains("haiku") {
+        return PricingData {
+            prompt: 0.0008,
+            completion: 0.004,
+            cache_read: Some(0.00008),
+            cache_write: Some(0.001),
+        };
+    }
+    // GPT-4o / GPT-4.1: $2.5/$10 per Mtok
+    if name.contains("gpt-4o") || name.contains("gpt-4.1") {
+        return PricingData {
+            prompt: 0.0025,
+            completion: 0.01,
+            cache_read: Some(0.000625),
+            cache_write: None,
+        };
+    }
+    // GPT-4o-mini / GPT-4.1-mini: $0.15/$0.60 per Mtok
+    if name.contains("4o-mini") || name.contains("4.1-mini") || name.contains("5-mini") || name.contains("5.4-mini") {
+        return PricingData {
+            prompt: 0.00015,
+            completion: 0.0006,
+            cache_read: Some(0.0000375),
+            cache_write: None,
+        };
+    }
+    // DeepSeek V3/R1: $0.27/$1.10 per Mtok (cache read $0.07)
+    if name.contains("deepseek") {
+        return PricingData {
+            prompt: 0.00027,
+            completion: 0.0011,
+            cache_read: Some(0.00007),
+            cache_write: None,
+        };
+    }
+    // Default: Sonnet pricing as safe fallback
+    PricingData {
+        prompt: 0.003,
+        completion: 0.015,
+        cache_read: Some(0.0003),
+        cache_write: Some(0.00375),
+    }
 }
 
 // ═══════════════════════════════════════════════ Output Styles ═════════════
@@ -4070,10 +4160,9 @@ async fn handle_slash_command(
                     state.model.as_deref(),
                 ) {
                     state.model = Some(chosen.clone());
-                    // Cache pricing for /cost command
-                    if let Some(pricing) = extract_pricing_for_model(&models, &chosen) {
-                        state.cached_pricing = pricing;
-                    }
+                    // Cache pricing: prefer API-provided, fall back to built-in table
+                    state.cached_pricing = extract_pricing_for_model(&models, &chosen)
+                        .unwrap_or_else(|| fallback_pricing(&chosen));
                     eprintln!(
                         "  {} {}",
                         theme::icon_ok(),
@@ -4087,6 +4176,7 @@ async fn handle_slash_command(
 
         "/model" => {
             state.model = Some(arg.to_string());
+            state.cached_pricing = fallback_pricing(arg);
             state.context_budget = prompts::budget_for_model(Some(arg));
             eprintln!("{}", format!("  \u{2713}  Model set to: {}", arg).green());
             if let Some(ref j) = state.journal {
@@ -6269,6 +6359,9 @@ total_tokens_out: 3
             state.total_completion_tokens = restored.total_tokens_out;
             state.recent_tools = restored.recent_tools.clone();
             state.model = restored.model.clone();
+            if let Some(ref m) = state.model {
+                state.cached_pricing = fallback_pricing(m);
+            }
         }
 
         // Apply learning snapshot
@@ -7354,5 +7447,63 @@ total_tokens_out: 500
             "pricing_completion": 0.0
         })];
         assert!(extract_pricing_for_model(&models, "test").is_none());
+    }
+
+    // ── fallback_pricing tests ───────────────────────────────────────────
+
+    #[test]
+    fn fallback_sonnet_pricing() {
+        let p = fallback_pricing("claude-sonnet-4-20250514");
+        assert!((p.prompt - 0.003).abs() < 1e-6);
+        assert!((p.completion - 0.015).abs() < 1e-6);
+        assert!(p.cache_read.is_some());
+        assert!((p.cache_read.unwrap() - 0.0003).abs() < 1e-8);
+    }
+
+    #[test]
+    fn fallback_opus_4_pricing() {
+        let p = fallback_pricing("claude-opus-4-20250514");
+        assert!((p.prompt - 0.015).abs() < 1e-6, "opus-4 prompt should be $15/Mtok");
+        assert!((p.completion - 0.075).abs() < 1e-6);
+    }
+
+    #[test]
+    fn fallback_opus_45_pricing() {
+        let p = fallback_pricing("claude-opus-4.5-20250415");
+        assert!((p.prompt - 0.005).abs() < 1e-6, "opus 4.5 should be $5/Mtok");
+    }
+
+    #[test]
+    fn fallback_haiku_pricing() {
+        let p = fallback_pricing("claude-haiku-4.5-20250514");
+        assert!((p.prompt - 0.001).abs() < 1e-6, "haiku 4.5 should be $1/Mtok");
+    }
+
+    #[test]
+    fn fallback_gpt4o_pricing() {
+        let p = fallback_pricing("gpt-4o-2024-08-06");
+        assert!((p.prompt - 0.0025).abs() < 1e-6);
+    }
+
+    #[test]
+    fn fallback_deepseek_pricing() {
+        let p = fallback_pricing("deepseek-chat");
+        assert!((p.prompt - 0.00027).abs() < 1e-8);
+    }
+
+    #[test]
+    fn fallback_unknown_uses_sonnet() {
+        let p = fallback_pricing("some-unknown-model");
+        assert!((p.prompt - 0.003).abs() < 1e-6, "unknown model should default to sonnet pricing");
+    }
+
+    #[test]
+    fn fallback_cost_calculation_with_cache() {
+        // Sonnet: 1000 prompt + 500 completion + 2000 cache_read + 100 cache_creation
+        let p = fallback_pricing("claude-sonnet-4-20250514");
+        let cost = cost_for_tokens(1000, 500, 2000, 100, &p);
+        // $0.003/Ktok * 1 + $0.015/Ktok * 0.5 + $0.0003/Ktok * 2 + $0.00375/Ktok * 0.1
+        let expected = 0.003 + 0.0075 + 0.0006 + 0.000375;
+        assert!((cost - expected).abs() < 1e-8, "cost={cost} expected={expected}");
     }
 }
