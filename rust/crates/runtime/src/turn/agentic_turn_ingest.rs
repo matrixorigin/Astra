@@ -729,4 +729,108 @@ mod tests {
         assert!(pack.final_text.is_empty());
         assert_eq!(pack.messages.len(), 1);
     }
+
+    // ── Cache token accumulation tests ───────────────────────────────────
+
+    #[test]
+    fn snapshot_captures_nonzero_cache_tokens() {
+        let accum = ChatTurnSseAccum {
+            prompt_tokens: 1000,
+            completion_tokens: 500,
+            cache_read_tokens: 250,
+            cache_creation_tokens: 100,
+            has_usage: true,
+            ..Default::default()
+        };
+        let snap = agentic_turn_stream_snapshot_from_sse_accum(&accum, None);
+        assert_eq!(snap.cache_read_tokens, 250);
+        assert_eq!(snap.cache_creation_tokens, 100);
+    }
+
+    #[test]
+    fn cache_tokens_accumulate_across_turns() {
+        let snap1 = AgenticTurnStreamSnapshot {
+            ttft_ms: None,
+            session_id: &None,
+            run_id: &None,
+            full_text: "turn1",
+            tool_calls: &[],
+            prompt_tokens: 100,
+            completion_tokens: 50,
+            cache_read_tokens: 80,
+            cache_creation_tokens: 20,
+            has_usage: true,
+            error_message: &None,
+        };
+        let mut pack = Pack::new();
+        let out = ingest_agentic_turn_stream(
+            &snap1,
+            0,
+            |_| String::new(),
+            "q1",
+            &[],
+            true,
+            pack.ingest_mut(),
+        );
+        assert_eq!(out, AgenticTurnIngestOutcome::Break);
+        assert_eq!(pack.total_cache_read, 80);
+        assert_eq!(pack.total_cache_creation, 20);
+        assert_eq!(pack.total_prompt, 100);
+        assert_eq!(pack.total_completion, 50);
+
+        // Second turn: cache tokens accumulate
+        let snap2 = AgenticTurnStreamSnapshot {
+            full_text: "turn2",
+            prompt_tokens: 200,
+            completion_tokens: 100,
+            cache_read_tokens: 150,
+            cache_creation_tokens: 30,
+            ..snap1
+        };
+        let out2 = ingest_agentic_turn_stream(
+            &snap2,
+            0,
+            |_| String::new(),
+            "q2",
+            &[],
+            true,
+            pack.ingest_mut(),
+        );
+        assert_eq!(out2, AgenticTurnIngestOutcome::Break);
+        assert_eq!(pack.total_cache_read, 230);       // 80 + 150
+        assert_eq!(pack.total_cache_creation, 50);     // 20 + 30
+        assert_eq!(pack.total_prompt, 300);            // 100 + 200
+        assert_eq!(pack.total_completion, 150);        // 50 + 100
+    }
+
+    #[test]
+    fn zero_cache_tokens_dont_affect_accumulation() {
+        let snap = AgenticTurnStreamSnapshot {
+            ttft_ms: None,
+            session_id: &None,
+            run_id: &None,
+            full_text: "test",
+            tool_calls: &[],
+            prompt_tokens: 500,
+            completion_tokens: 200,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+            has_usage: true,
+            error_message: &None,
+        };
+        let mut pack = Pack::new();
+        ingest_agentic_turn_stream(
+            &snap,
+            0,
+            |_| String::new(),
+            "q",
+            &[],
+            true,
+            pack.ingest_mut(),
+        );
+        assert_eq!(pack.total_cache_read, 0);
+        assert_eq!(pack.total_cache_creation, 0);
+        assert_eq!(pack.total_prompt, 500);
+        assert_eq!(pack.total_completion, 200);
+    }
 }

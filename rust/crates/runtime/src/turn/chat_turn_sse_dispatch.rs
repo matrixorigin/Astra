@@ -549,4 +549,52 @@ mod tests {
         let _ = f.push_lossy_bytes(block.as_bytes());
         assert!(f.ttft_ms.is_some());
     }
+
+    // ── Cache token tests ────────────────────────────────────────────────
+
+    #[test]
+    fn usage_with_cache_tokens_parsed() {
+        let mut a = ChatTurnSseAccum::default();
+        dispatch_chat_turn_sse_event_block(
+            &sse(
+                "usage",
+                ",\"prompt_tokens\":100,\"completion_tokens\":50,\"cache_read_tokens\":25,\"cache_creation_tokens\":10",
+            ),
+            &mut a,
+            &mut vec![],
+        );
+        assert!(a.has_usage);
+        assert_eq!(a.prompt_tokens, 100);
+        assert_eq!(a.completion_tokens, 50);
+        assert_eq!(a.cache_read_tokens, 25);
+        assert_eq!(a.cache_creation_tokens, 10);
+    }
+
+    #[test]
+    fn usage_cache_tokens_default_to_zero_when_missing() {
+        let mut a = ChatTurnSseAccum::default();
+        dispatch_chat_turn_sse_event_block(
+            &sse("usage", ",\"prompt_tokens\":100,\"completion_tokens\":50"),
+            &mut a,
+            &mut vec![],
+        );
+        assert!(a.has_usage);
+        assert_eq!(a.cache_read_tokens, 0);
+        assert_eq!(a.cache_creation_tokens, 0);
+    }
+
+    #[test]
+    fn usage_cache_tokens_null_treated_as_zero() {
+        let mut a = ChatTurnSseAccum::default();
+        dispatch_chat_turn_sse_event_block(
+            &sse(
+                "usage",
+                ",\"prompt_tokens\":100,\"completion_tokens\":50,\"cache_read_tokens\":null,\"cache_creation_tokens\":null",
+            ),
+            &mut a,
+            &mut vec![],
+        );
+        assert_eq!(a.cache_read_tokens, 0);
+        assert_eq!(a.cache_creation_tokens, 0);
+    }
 }
