@@ -256,6 +256,8 @@ pub struct AgenticLoopState {
     pub skill_improvement_tracker: crate::skills::improvement::ImprovementTracker,
     /// Skills pinned by the user — always included in budget (never truncated).
     pub pinned_skills: std::collections::HashSet<String>,
+    /// Canonical skill names surfaced via `discover_skills` this session (experimental search).
+    pub discovered_skills: HashSet<String>,
 
     /// Tool event hooks (PreToolUse/PostToolUse) for intercepting tool calls.
     /// Loaded from `.astra/hooks.json` or skill frontmatter.
@@ -774,13 +776,24 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
     // The skill listing is refreshed per-turn below (skills may change at runtime
     // via hot-reload or MCP server connect/disconnect).
     if let Some(resolver) = &state.skill_resolver {
-        let skills = resolver.available_skills();
-        if !skills.is_empty() {
+        let full = resolver.available_skills();
+        if !full.is_empty() {
+            let (visible, experimental) = crate::turn::skill_tool::visible_skills_for_host_turn(
+                &full,
+                state.message.as_str(),
+                &state.skill_quality_tracker,
+                &state.pinned_skills,
+                &state.discovered_skills,
+            );
             host.inject_tool_schema(crate::turn::skill_tool::skill_tool_schema(
-                &skills,
+                &visible,
                 Some(&state.skill_quality_tracker),
                 Some(&state.pinned_skills),
+                experimental,
             ));
+            if experimental {
+                host.inject_tool_schema(crate::turn::skill_tool::discover_skills_tool_schema());
+            }
         }
     }
 
@@ -809,14 +822,22 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
 
         // ─── Refresh ephemeral skill listing (picks up hot-reload changes) ──
         if let Some(resolver) = &state.skill_resolver {
-            let skills = resolver.available_skills();
-            state.skill_listing_message = if skills.is_empty() {
+            let full = resolver.available_skills();
+            state.skill_listing_message = if full.is_empty() {
                 None
             } else {
+                let (visible, experimental) = crate::turn::skill_tool::visible_skills_for_host_turn(
+                    &full,
+                    state.message.as_str(),
+                    &state.skill_quality_tracker,
+                    &state.pinned_skills,
+                    &state.discovered_skills,
+                );
                 Some(crate::turn::skill_tool::skill_listing_system_message(
-                    &skills,
+                    &visible,
                     Some(&state.skill_quality_tracker),
                     Some(&state.pinned_skills),
+                    experimental,
                 ))
             };
         }
@@ -1063,10 +1084,23 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
             };
 
             let composition_ctx = crate::skills::composition::CompositionContext::root();
+            let full_catalog = resolver.available_skills();
+            let (visible_for_mask, _) = crate::turn::skill_tool::visible_skills_for_host_turn(
+                &full_catalog,
+                state.message.as_str(),
+                &state.skill_quality_tracker,
+                &state.pinned_skills,
+                &state.discovered_skills,
+            );
+            let discover_exclude =
+                crate::turn::skill_tool::skill_mask_names_lowercase(&visible_for_mask);
             let (sr, remaining, activation) =
-                crate::turn::skill_tool::partition_and_execute_skills(
+                crate::turn::skill_tool::partition_discover_and_execute_skills(
                     effective_tool_calls,
                     resolver.as_ref(),
+                    &full_catalog,
+                    &discover_exclude,
+                    &mut state.discovered_skills,
                     state.skill_executor.as_ref(),
                     Some(&mut state.skill_quality_tracker),
                     Some(&composition_ctx),
@@ -1189,13 +1223,27 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
             }
             if any_newly_activated {
                 if let Some(resolver) = &state.skill_resolver {
-                    let skills = resolver.available_skills();
-                    if !skills.is_empty() {
+                    let full = resolver.available_skills();
+                    if !full.is_empty() {
+                        let (visible, experimental) =
+                            crate::turn::skill_tool::visible_skills_for_host_turn(
+                                &full,
+                                state.message.as_str(),
+                                &state.skill_quality_tracker,
+                                &state.pinned_skills,
+                                &state.discovered_skills,
+                            );
                         host.inject_tool_schema(crate::turn::skill_tool::skill_tool_schema(
-                            &skills,
+                            &visible,
                             Some(&state.skill_quality_tracker),
                             Some(&state.pinned_skills),
+                            experimental,
                         ));
+                        if experimental {
+                            host.inject_tool_schema(
+                                crate::turn::skill_tool::discover_skills_tool_schema(),
+                            );
+                        }
                     }
                 }
             }
@@ -1580,6 +1628,7 @@ mod tests {
             skill_quality_tracker: crate::skills::quality::SkillQualityTracker::new(),
             skill_improvement_tracker: crate::skills::improvement::ImprovementTracker::new(),
             pinned_skills: std::collections::HashSet::new(),
+            discovered_skills: HashSet::new(),
             tool_event_hooks: crate::skills::hooks::ToolEventHookRegistry::default(),
             stop_hooks: Vec::new(),
             stop_hook_runs: 0,
@@ -2961,6 +3010,7 @@ mod tests {
                         composition: None,
                         input_schema: None,
                         aliases: Vec::new(),
+
                         effort: None,
                         agent_type: None,
                         trust_tier: crate::skills::manifest::TrustTier::Bundled,
@@ -2978,6 +3028,9 @@ mod tests {
                     when_to_use: None,
                     source: crate::skills::manifest::SkillSourceKind::Local,
                     aliases: Vec::new(),
+                    category: None,
+                    tags: Vec::new(),
+                    triggers: Vec::new(),
                 })
                 .collect()
         }
@@ -3293,8 +3346,8 @@ mod tests {
 
     #[test]
     fn skill_listing_system_message_format() {
-        use crate::turn::skill_tool::{SkillToolInfo, skill_listing_system_message};
         use crate::skills::manifest::SkillSourceKind;
+        use crate::turn::skill_tool::{SkillToolInfo, skill_listing_system_message};
 
         let skills = vec![
             SkillToolInfo {
@@ -3303,6 +3356,9 @@ mod tests {
                 when_to_use: None,
                 source: SkillSourceKind::Bundled,
                 aliases: vec![],
+                category: None,
+                tags: vec![],
+                triggers: vec![],
             },
             SkillToolInfo {
                 name: "debug".into(),
@@ -3310,17 +3366,32 @@ mod tests {
                 when_to_use: None,
                 source: SkillSourceKind::Bundled,
                 aliases: vec![],
+                category: None,
+                tags: vec![],
+                triggers: vec![],
             },
         ];
 
-        let msg = skill_listing_system_message(&skills, None, None);
+        let msg = skill_listing_system_message(&skills, None, None, false);
         let content = msg["content"].as_str().unwrap();
 
         // Must contain skill names in XML format
-        assert!(content.contains("<name>review</name>"), "missing review skill");
-        assert!(content.contains("<name>debug</name>"), "missing debug skill");
-        assert!(content.contains("<available_skills>"), "missing opening tag");
-        assert!(content.contains("</available_skills>"), "missing closing tag");
+        assert!(
+            content.contains("<name>review</name>"),
+            "missing review skill"
+        );
+        assert!(
+            content.contains("<name>debug</name>"),
+            "missing debug skill"
+        );
+        assert!(
+            content.contains("<available_skills>"),
+            "missing opening tag"
+        );
+        assert!(
+            content.contains("</available_skills>"),
+            "missing closing tag"
+        );
         // Must be a system message
         assert_eq!(msg["role"], "system");
     }
@@ -3329,7 +3400,7 @@ mod tests {
     fn skill_listing_empty_skills_produces_no_message() {
         use crate::turn::skill_tool::skill_listing_system_message;
         // With empty skills, the function still returns a message but with no skill entries
-        let msg = skill_listing_system_message(&[], None, None);
+        let msg = skill_listing_system_message(&[], None, None, false);
         let content = msg["content"].as_str().unwrap();
         // Should have the wrapper but no <skill> entries
         assert!(content.contains("<available_skills>"));
@@ -3363,8 +3434,8 @@ mod tests {
 
     #[test]
     fn skill_listing_refresh_updates_field() {
-        use crate::turn::skill_tool::{SkillToolInfo, skill_listing_system_message};
         use crate::skills::manifest::SkillSourceKind;
+        use crate::turn::skill_tool::{SkillToolInfo, skill_listing_system_message};
 
         let mut state = make_state();
 
@@ -3378,8 +3449,12 @@ mod tests {
             when_to_use: None,
             source: SkillSourceKind::Bundled,
             aliases: vec![],
+            category: None,
+            tags: vec![],
+            triggers: vec![],
         }];
-        state.skill_listing_message = Some(skill_listing_system_message(&skills_v1, None, None));
+        state.skill_listing_message =
+            Some(skill_listing_system_message(&skills_v1, None, None, false));
         let v1_content = state.skill_listing_message.as_ref().unwrap()["content"]
             .as_str()
             .unwrap()
@@ -3394,6 +3469,9 @@ mod tests {
                 when_to_use: None,
                 source: SkillSourceKind::Bundled,
                 aliases: vec![],
+                category: None,
+                tags: vec![],
+                triggers: vec![],
             },
             SkillToolInfo {
                 name: "debug".into(),
@@ -3401,14 +3479,21 @@ mod tests {
                 when_to_use: None,
                 source: SkillSourceKind::Bundled,
                 aliases: vec![],
+                category: None,
+                tags: vec![],
+                triggers: vec![],
             },
         ];
-        state.skill_listing_message = Some(skill_listing_system_message(&skills_v2, None, None));
+        state.skill_listing_message =
+            Some(skill_listing_system_message(&skills_v2, None, None, false));
         let v2_content = state.skill_listing_message.as_ref().unwrap()["content"]
             .as_str()
             .unwrap()
             .to_string();
-        assert!(v2_content.contains("debug"), "new skill should appear after refresh");
+        assert!(
+            v2_content.contains("debug"),
+            "new skill should appear after refresh"
+        );
     }
 
     #[test]

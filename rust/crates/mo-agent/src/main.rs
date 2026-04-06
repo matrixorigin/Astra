@@ -651,7 +651,8 @@ impl Default for ReplState {
             calibrator: None,
             unified_skill_registry: astra_runtime::skills::default_unified_registry().clone(),
             skill_quality_tracker: astra_runtime::skills::quality::SkillQualityTracker::new(),
-            skill_improvement_tracker: astra_runtime::skills::improvement::ImprovementTracker::new(),
+            skill_improvement_tracker: astra_runtime::skills::improvement::ImprovementTracker::new(
+            ),
             pinned_skills: std::collections::HashSet::new(),
             mcp_manager: std::sync::Arc::new(tokio::sync::RwLock::new(
                 mcp_client::McpClientManager::new(),

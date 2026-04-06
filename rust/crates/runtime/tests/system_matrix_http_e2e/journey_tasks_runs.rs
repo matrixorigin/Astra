@@ -70,13 +70,8 @@ pub async fn run_tasks_lease_with_db_assertions() {
         "list should include {task_id}: {list_j}"
     );
 
-    let (st_get, get_j) = get_json(
-        app,
-        &format!("/tasks/{task_id}"),
-        Some(auth.as_str()),
-        &[],
-    )
-    .await;
+    let (st_get, get_j) =
+        get_json(app, &format!("/tasks/{task_id}"), Some(auth.as_str()), &[]).await;
     assert_eq!(st_get, StatusCode::OK, "get task: {get_j}");
     assert_eq!(get_j["task_id"].as_str(), Some(task_id.as_str()));
 

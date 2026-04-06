@@ -195,12 +195,7 @@ pub fn load_tool_event_hooks(project_root: &std::path::Path) -> ToolEventHookReg
                     return ToolEventHookRegistry::new(hooks);
                 }
                 Err(e) => {
-                    astra_core::agent_warn!(
-                        "hook",
-                        "Failed to read {}: {}",
-                        path.display(),
-                        e
-                    );
+                    astra_core::agent_warn!("hook", "Failed to read {}: {}", path.display(), e);
                 }
             }
         }
@@ -308,13 +303,8 @@ pub async fn evaluate_pre_tool_hooks(
     for hook in hooks {
         match &hook.action {
             HookAction::Shell { command } => {
-                let decision = run_shell_pre_hook(
-                    command,
-                    tool_name,
-                    tool_args,
-                    hook.timeout_secs,
-                )
-                .await;
+                let decision =
+                    run_shell_pre_hook(command, tool_name, tool_args, hook.timeout_secs).await;
                 match decision {
                     PreToolDecision::Block(reason) => return PreToolDecision::Block(reason),
                     PreToolDecision::AllowWithContext(ctx) => accumulated_context.push(ctx),
@@ -326,7 +316,12 @@ pub async fn evaluate_pre_tool_hooks(
                 unsafe { std::env::set_var(key, value) };
             }
             HookAction::Custom { id, .. } => {
-                astra_core::agent_warn!("hook", "Custom hook '{}' matched tool '{}' — not yet implemented", id, tool_name);
+                astra_core::agent_warn!(
+                    "hook",
+                    "Custom hook '{}' matched tool '{}' — not yet implemented",
+                    id,
+                    tool_name
+                );
             }
         }
     }
@@ -370,7 +365,12 @@ pub async fn evaluate_post_tool_hooks(
                 }
             }
             HookAction::Custom { id, .. } => {
-                astra_core::agent_warn!("hook", "PostToolUse custom hook '{}' for '{}' — not yet implemented", id, tool_name);
+                astra_core::agent_warn!(
+                    "hook",
+                    "PostToolUse custom hook '{}' for '{}' — not yet implemented",
+                    id,
+                    tool_name
+                );
             }
             _ => {}
         }
@@ -891,9 +891,11 @@ mod tests {
     fn registry_empty_returns_no_matches() {
         let registry = ToolEventHookRegistry::default();
         assert!(registry.is_empty());
-        assert!(registry
-            .matching(ToolEventKind::PreToolUse, "bash")
-            .is_empty());
+        assert!(
+            registry
+                .matching(ToolEventKind::PreToolUse, "bash")
+                .is_empty()
+        );
     }
 
     #[test]
@@ -903,10 +905,7 @@ mod tests {
         let block = PreToolDecision::Block("denied".into());
 
         assert_eq!(allow, PreToolDecision::Allow);
-        assert_eq!(
-            ctx,
-            PreToolDecision::AllowWithContext("extra info".into())
-        );
+        assert_eq!(ctx, PreToolDecision::AllowWithContext("extra info".into()));
         assert_eq!(block, PreToolDecision::Block("denied".into()));
     }
 
@@ -1085,8 +1084,7 @@ mod tests {
             timeout_secs: 5,
         }]);
 
-        let decision =
-            evaluate_pre_tool_hooks(&registry, "bash", &serde_json::json!({})).await;
+        let decision = evaluate_pre_tool_hooks(&registry, "bash", &serde_json::json!({})).await;
         assert_eq!(decision, PreToolDecision::Allow);
     }
 
@@ -1101,8 +1099,7 @@ mod tests {
             timeout_secs: 5,
         }]);
 
-        let decision =
-            evaluate_pre_tool_hooks(&registry, "bash", &serde_json::json!({})).await;
+        let decision = evaluate_pre_tool_hooks(&registry, "bash", &serde_json::json!({})).await;
         assert_eq!(decision, PreToolDecision::Block("rm -rf detected".into()));
     }
 
@@ -1112,8 +1109,7 @@ mod tests {
             event: ToolEventKind::PreToolUse,
             matcher: "*".into(),
             action: HookAction::Shell {
-                command: r#"echo '{"decision": "allow", "context": "hook injected info"}'"#
-                    .into(),
+                command: r#"echo '{"decision": "allow", "context": "hook injected info"}'"#.into(),
             },
             timeout_secs: 5,
         }]);
@@ -1137,8 +1133,7 @@ mod tests {
             timeout_secs: 5,
         }]);
 
-        let decision =
-            evaluate_pre_tool_hooks(&registry, "bash", &serde_json::json!({})).await;
+        let decision = evaluate_pre_tool_hooks(&registry, "bash", &serde_json::json!({})).await;
         match decision {
             PreToolDecision::Block(reason) => assert!(reason.contains("exited with status")),
             _ => panic!("expected Block, got {:?}", decision),
@@ -1172,12 +1167,10 @@ mod tests {
             timeout_secs: 5,
         }]);
 
-        let allow =
-            evaluate_pre_tool_hooks(&registry, "read_file", &serde_json::json!({})).await;
+        let allow = evaluate_pre_tool_hooks(&registry, "read_file", &serde_json::json!({})).await;
         assert_eq!(allow, PreToolDecision::Allow);
 
-        let block =
-            evaluate_pre_tool_hooks(&registry, "write_file", &serde_json::json!({})).await;
+        let block = evaluate_pre_tool_hooks(&registry, "write_file", &serde_json::json!({})).await;
         assert_eq!(block, PreToolDecision::Block("writes blocked".into()));
     }
 
@@ -1192,13 +1185,9 @@ mod tests {
             timeout_secs: 5,
         }]);
 
-        let result = evaluate_post_tool_hooks(
-            &registry,
-            "bash",
-            &serde_json::json!({}),
-            "original output",
-        )
-        .await;
+        let result =
+            evaluate_post_tool_hooks(&registry, "bash", &serde_json::json!({}), "original output")
+                .await;
         assert_eq!(result, Some("modified output".into()));
     }
 
@@ -1213,21 +1202,16 @@ mod tests {
             timeout_secs: 5,
         }]);
 
-        let result = evaluate_post_tool_hooks(
-            &registry,
-            "bash",
-            &serde_json::json!({}),
-            "original output",
-        )
-        .await;
+        let result =
+            evaluate_post_tool_hooks(&registry, "bash", &serde_json::json!({}), "original output")
+                .await;
         assert!(result.is_none());
     }
 
     #[tokio::test]
     async fn e2e_pre_hook_empty_registry_allows() {
         let registry = ToolEventHookRegistry::default();
-        let decision =
-            evaluate_pre_tool_hooks(&registry, "bash", &serde_json::json!({})).await;
+        let decision = evaluate_pre_tool_hooks(&registry, "bash", &serde_json::json!({})).await;
         assert_eq!(decision, PreToolDecision::Allow);
     }
 
@@ -1242,8 +1226,7 @@ mod tests {
             timeout_secs: 5,
         }]);
 
-        let decision =
-            evaluate_pre_tool_hooks(&registry, "bash", &serde_json::json!({})).await;
+        let decision = evaluate_pre_tool_hooks(&registry, "bash", &serde_json::json!({})).await;
         assert_eq!(decision, PreToolDecision::Allow);
     }
 
@@ -1268,8 +1251,7 @@ mod tests {
             },
         ]);
 
-        let decision =
-            evaluate_pre_tool_hooks(&registry, "bash", &serde_json::json!({})).await;
+        let decision = evaluate_pre_tool_hooks(&registry, "bash", &serde_json::json!({})).await;
         match decision {
             PreToolDecision::AllowWithContext(ctx) => {
                 assert!(ctx.contains("hook1 info"));
@@ -1398,7 +1380,8 @@ hooks:
         ]"#;
         std::fs::write(astra.join("hooks.json"), json).unwrap();
 
-        let yaml = "- event: pre_tool_use\n  matcher: c\n  action:\n    type: shell\n    command: c\n";
+        let yaml =
+            "- event: pre_tool_use\n  matcher: c\n  action:\n    type: shell\n    command: c\n";
         std::fs::write(astra.join("hooks.yaml"), yaml).unwrap();
 
         let registry = load_tool_event_hooks(dir.path());
@@ -1464,7 +1447,9 @@ hooks:
         let hooks = vec![ToolEventHook {
             event: ToolEventKind::PreToolUse,
             matcher: "*".into(),
-            action: HookAction::Shell { command: "a".into() },
+            action: HookAction::Shell {
+                command: "a".into(),
+            },
             timeout_secs: 10,
         }];
         // No default → no change

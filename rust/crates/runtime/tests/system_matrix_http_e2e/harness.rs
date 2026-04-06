@@ -16,10 +16,10 @@ use axum::{
     body::{self, Body},
     http::{Request, StatusCode},
 };
+use futures_util::StreamExt;
 use serde_json::{Value, json};
 use sqlx::Row;
 use sqlx::mysql::MySqlRow;
-use futures_util::StreamExt;
 use tokio::sync::Mutex;
 use tower::util::ServiceExt;
 use uuid::Uuid;

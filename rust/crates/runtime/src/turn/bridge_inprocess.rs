@@ -2485,6 +2485,7 @@ mod tests {
 
     #[test]
     fn annotate_tool_schemas_for_caching_adds_cache_control() {
+        let _lock = CACHE_ENV_MUTEX.lock().unwrap();
         unsafe {
             std::env::remove_var("MO_PROMPT_CACHE_DISABLED");
         }
@@ -2524,6 +2525,7 @@ mod tests {
 
     #[test]
     fn add_message_cache_breakpoint_targets_last_non_system() {
+        let _lock = CACHE_ENV_MUTEX.lock().unwrap();
         let mut messages = vec![
             json!({"role": "system", "content": "sys prompt"}),
             json!({"role": "user", "content": "hello"}),
@@ -2547,6 +2549,7 @@ mod tests {
 
     #[test]
     fn add_message_cache_breakpoint_noop_for_openai() {
+        let _lock = CACHE_ENV_MUTEX.lock().unwrap();
         let mut messages = vec![
             json!({"role": "system", "content": "sys"}),
             json!({"role": "user", "content": "hi"}),

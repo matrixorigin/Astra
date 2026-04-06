@@ -26,7 +26,7 @@
 //! Skills with `isolated: true` (not yet supported) will get a full sub-loop
 //! via [`SubRunExecutor`](super::super::server::delegation_engine::SubRunExecutor).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use serde_json::Value;
@@ -51,6 +51,27 @@ pub struct SkillToolInfo {
     pub source: SkillSourceKind,
     /// Alternative names for this skill.
     pub aliases: Vec<String>,
+    /// Optional category from manifest (e.g. `code-review`).
+    pub category: Option<String>,
+    /// Free-form tags from manifest.
+    pub tags: Vec<String>,
+    /// Trigger phrases / keywords from manifest.
+    pub triggers: Vec<String>,
+}
+
+impl Default for SkillToolInfo {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            description: String::new(),
+            when_to_use: None,
+            source: SkillSourceKind::Local,
+            aliases: Vec::new(),
+            category: None,
+            tags: Vec::new(),
+            triggers: Vec::new(),
+        }
+    }
 }
 
 // ─── Skill context ───────────────────────────────────────────────────────────
@@ -152,6 +173,18 @@ pub trait SkillResolver: Send + Sync {
 // ─── Tool schema ─────────────────────────────────────────────────────────────
 
 pub const SKILL_TOOL_NAME: &str = "skill";
+
+/// Second-stage discovery tool (Claude Code `EXPERIMENTAL_SKILL_SEARCH` parity).
+pub const DISCOVER_SKILLS_TOOL_NAME: &str = "discover_skills";
+
+/// Only auto-surface a subset when the catalog is larger than this.
+const EXPERIMENTAL_SKILL_SEARCH_MIN_CATALOG: usize = 8;
+
+/// Max skills shown in the tool listing / schema when experimental search is on.
+const EXPERIMENTAL_SURFACE_CAP: usize = 14;
+
+/// Max skills returned from a single `discover_skills` call.
+const DISCOVER_SKILLS_MAX_RESULTS: usize = 8;
 
 /// Character budget for the skill listing section (1% of 200k tokens × 4 chars/token).
 const DEFAULT_SKILL_LISTING_BUDGET: usize = 8_000;
@@ -285,15 +318,330 @@ fn format_skills_within_budget(
     (entries, all_names)
 }
 
+// ─── Experimental skill search (Claude Code EXPERIMENTAL_SKILL_SEARCH) ─────
+
+/// `EXPERIMENTAL_SKILL_SEARCH=1|true|yes|on` enables dynamic surfacing + `discover_skills`.
+pub fn experimental_skill_search_enabled() -> bool {
+    match std::env::var("EXPERIMENTAL_SKILL_SEARCH") {
+        Ok(v) => {
+            let s = v.to_ascii_lowercase();
+            matches!(s.as_str(), "1" | "true" | "yes" | "on")
+        }
+        Err(_) => false,
+    }
+}
+
+/// When true, use the full catalog path (no `discover_skills`, enum listing all names).
+pub fn experimental_skill_search_use_full_catalog(skill_count: usize) -> bool {
+    !experimental_skill_search_enabled() || skill_count <= EXPERIMENTAL_SKILL_SEARCH_MIN_CATALOG
+}
+
+fn tokenize_query(q: &str) -> Vec<String> {
+    q.to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|s| s.len() > 1)
+        .map(std::string::ToString::to_string)
+        .collect()
+}
+
+fn haystack_for_scoring(s: &SkillToolInfo) -> String {
+    let mut h = format!("{} {}", s.name, s.description);
+    if let Some(w) = &s.when_to_use {
+        h.push(' ');
+        h.push_str(w);
+    }
+    if let Some(c) = &s.category {
+        h.push(' ');
+        h.push_str(c);
+    }
+    for t in &s.tags {
+        h.push(' ');
+        h.push_str(t);
+    }
+    for t in &s.triggers {
+        h.push(' ');
+        h.push_str(t);
+    }
+    for a in &s.aliases {
+        h.push(' ');
+        h.push_str(a);
+    }
+    h.to_lowercase()
+}
+
+fn score_skill_for_query(
+    s: &SkillToolInfo,
+    query_lower: &str,
+    query_tokens: &[String],
+    quality_tracker: Option<&crate::skills::quality::SkillQualityTracker>,
+) -> f32 {
+    let mut score: f32 = 0.0;
+    let hay = haystack_for_scoring(s);
+    let name_l = s.name.to_lowercase();
+
+    if !query_lower.is_empty() {
+        if name_l == query_lower {
+            score += 12.0;
+        } else if hay.contains(query_lower) {
+            score += 6.0;
+        }
+        if query_lower.contains(&name_l) || name_l.contains(query_lower) {
+            score += 4.0;
+        }
+    }
+
+    for t in query_tokens {
+        if name_l == *t || s.aliases.iter().any(|a| a.to_lowercase() == *t) {
+            score += 5.0;
+        } else if s.triggers.iter().any(|tr| tr.to_lowercase().contains(t)) {
+            score += 4.0;
+        } else if hay.contains(t) {
+            score += 1.5;
+        }
+    }
+
+    if matches!(s.source, SkillSourceKind::Bundled) {
+        score += 1.25;
+    }
+
+    if let Some(qt) = quality_tracker {
+        score += qt.selection_boost(&s.name) as f32 * 0.5;
+    }
+
+    score
+}
+
+/// Pick a small relevant subset for the current user message (experimental mode only).
+pub fn select_skills_for_turn(
+    all_skills: &[SkillToolInfo],
+    user_message: &str,
+    quality_tracker: Option<&crate::skills::quality::SkillQualityTracker>,
+    pinned_skills: Option<&HashSet<String>>,
+) -> Vec<SkillToolInfo> {
+    if experimental_skill_search_use_full_catalog(all_skills.len()) {
+        return all_skills.to_vec();
+    }
+
+    let mut picked: Vec<SkillToolInfo> = Vec::new();
+    let mut picked_names: HashSet<String> = HashSet::new();
+    if let Some(pinned) = pinned_skills {
+        for s in all_skills {
+            if pinned.contains(&s.name) {
+                picked_names.insert(s.name.clone());
+                picked.push(s.clone());
+            }
+        }
+    }
+
+    let query_lower = user_message.trim().to_lowercase();
+    let tokens = tokenize_query(user_message);
+
+    let mut scored: Vec<(f32, &SkillToolInfo)> = all_skills
+        .iter()
+        .filter(|s| !picked_names.contains(&s.name))
+        .map(|s| {
+            let sc = score_skill_for_query(s, &query_lower, &tokens, quality_tracker);
+            (sc, s)
+        })
+        .collect();
+    scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+
+    let threshold = 0.8_f32;
+    let top_score = scored.first().map(|(s, _)| *s).unwrap_or(0.0);
+    let weak = top_score < threshold;
+
+    if !weak {
+        for (sc, s) in scored {
+            if picked.len() >= EXPERIMENTAL_SURFACE_CAP {
+                break;
+            }
+            if sc >= threshold {
+                picked_names.insert(s.name.clone());
+                picked.push(s.clone());
+            }
+        }
+    }
+
+    if weak || picked.len() < 3 {
+        picked.clear();
+        picked_names.clear();
+        if let Some(pinned) = pinned_skills {
+            for s in all_skills {
+                if pinned.contains(&s.name) {
+                    picked_names.insert(s.name.clone());
+                    picked.push(s.clone());
+                }
+            }
+        }
+        let mut rest: Vec<&SkillToolInfo> = all_skills
+            .iter()
+            .filter(|s| !picked_names.contains(&s.name))
+            .collect();
+        rest.sort_by(|a, b| {
+            let pa = matches!(a.source, SkillSourceKind::Bundled);
+            let pb = matches!(b.source, SkillSourceKind::Bundled);
+            pb.cmp(&pa).then_with(|| {
+                let qa = quality_tracker.map_or(0.0, |q| q.selection_boost(&a.name));
+                let qb = quality_tracker.map_or(0.0, |q| q.selection_boost(&b.name));
+                qb.partial_cmp(&qa).unwrap_or(std::cmp::Ordering::Equal)
+            })
+        });
+        for s in rest {
+            if picked.len() >= EXPERIMENTAL_SURFACE_CAP {
+                break;
+            }
+            picked.push((*s).clone());
+        }
+    }
+
+    picked
+}
+
+/// Skills visible this session: auto-surface ∪ user-pinned ∪ previously discovered.
+pub fn merge_discovered_skills_into_visible(
+    base: Vec<SkillToolInfo>,
+    all_skills: &[SkillToolInfo],
+    discovered: &HashSet<String>,
+) -> Vec<SkillToolInfo> {
+    let mut out = base;
+    let mut have: HashSet<String> = out.iter().map(|s| s.name.clone()).collect();
+    for s in all_skills {
+        if discovered.contains(&s.name) && have.insert(s.name.clone()) {
+            out.push(s.clone());
+        }
+    }
+    out
+}
+
+/// Visible skills + whether experimental search mode is active for this catalog size.
+pub fn visible_skills_for_host_turn(
+    full: &[SkillToolInfo],
+    user_message: &str,
+    quality_tracker: &crate::skills::quality::SkillQualityTracker,
+    pinned: &HashSet<String>,
+    discovered: &HashSet<String>,
+) -> (Vec<SkillToolInfo>, bool) {
+    if experimental_skill_search_use_full_catalog(full.len()) {
+        return (full.to_vec(), false);
+    }
+    let base = select_skills_for_turn(full, user_message, Some(quality_tracker), Some(pinned));
+    let visible = merge_discovered_skills_into_visible(base, full, discovered);
+    (visible, true)
+}
+
+/// Lowercased canonical names and aliases — used to filter `discover_skills` results.
+pub fn skill_mask_names_lowercase(skills: &[SkillToolInfo]) -> HashSet<String> {
+    let mut m = HashSet::new();
+    for s in skills {
+        m.insert(s.name.to_lowercase());
+        for a in &s.aliases {
+            m.insert(a.to_lowercase());
+        }
+    }
+    m
+}
+
+/// OpenAI-style tool schema for `discover_skills`.
+pub fn discover_skills_tool_schema() -> Value {
+    serde_json::json!({
+        "type": "function",
+        "function": {
+            "name": DISCOVER_SKILLS_TOOL_NAME,
+            "description": "Search the full skill catalog for additional workflow packs not shown in the current skill listing.\n\n\
+                Call this when you are pivoting, planning a multi-step workflow, or the surfaced skills do not cover your next action. \
+                Skills already listed for this turn (or discovered earlier in the session) are filtered out.\n\n\
+                After a successful discovery, invoke `skill` with one of the returned names.",
+            "parameters": {
+                "type": "object",
+                "required": ["query"],
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Concrete description of what you are trying to do next (task, domain, or workflow)."
+                    }
+                }
+            }
+        }
+    })
+}
+
+/// True if this tool call targets `discover_skills`.
+pub fn is_discover_skills_call(tool_call: &Value) -> bool {
+    tool_call
+        .get("function")
+        .and_then(|f| f.get("name"))
+        .and_then(Value::as_str)
+        == Some(DISCOVER_SKILLS_TOOL_NAME)
+}
+
+/// Run discovery; returns assistant-facing text and canonical names to merge into session state.
+pub fn execute_discover_skills(
+    query: &str,
+    catalog: &[SkillToolInfo],
+    mut excluded_lowercase: HashSet<String>,
+    quality_tracker: Option<&crate::skills::quality::SkillQualityTracker>,
+) -> (String, Vec<String>) {
+    let query_lower = query.trim().to_lowercase();
+    let tokens = tokenize_query(query);
+
+    let mut candidates: Vec<(&SkillToolInfo, f32)> = catalog
+        .iter()
+        .filter(|s| {
+            !excluded_lowercase.contains(&s.name.to_lowercase())
+                && !s
+                    .aliases
+                    .iter()
+                    .any(|a| excluded_lowercase.contains(&a.to_lowercase()))
+        })
+        .map(|s| {
+            let sc = score_skill_for_query(s, &query_lower, &tokens, quality_tracker);
+            (s, sc)
+        })
+        .filter(|(_, sc)| *sc > 0.01)
+        .collect();
+
+    candidates.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+    if candidates.is_empty() {
+        return (
+            "No additional skills matched that query. Try different keywords, or proceed with general tools.".to_string(),
+            Vec::new(),
+        );
+    }
+
+    let mut lines = Vec::new();
+    let mut new_names = Vec::new();
+    for (s, _) in candidates.iter().take(DISCOVER_SKILLS_MAX_RESULTS) {
+        lines.push(format!("- **{}**: {}", s.name, format_skill_description(s)));
+        new_names.push(s.name.clone());
+        excluded_lowercase.insert(s.name.to_lowercase());
+        for a in &s.aliases {
+            excluded_lowercase.insert(a.to_lowercase());
+        }
+    }
+
+    let body = lines.join("\n");
+    (
+        format!(
+            "Additional skills (now available via `skill` for this session):\n\n{body}\n\n\
+             Invoke `skill` with `skill_name` set to one of the names above."
+        ),
+        new_names,
+    )
+}
+
 /// Generate the OpenAI-compatible tool schema for the `skill` tool.
 ///
-/// The schema includes an enum of available skill names so the LLM can only
-/// call skills that actually exist. Descriptions are budget-capped to avoid
-/// blowing up the context window with many skills.
+/// When `open_skill_name` is true (experimental search), `skill_name` is a free string
+/// (no JSON `enum`) so the catalog can grow mid-session via `discover_skills` without
+/// re-injecting schemas. Otherwise an enum lists all callable aliases.
+///
+/// Descriptions are budget-capped to avoid blowing up the context window.
 pub fn skill_tool_schema(
     skills: &[SkillToolInfo],
     quality_tracker: Option<&crate::skills::quality::SkillQualityTracker>,
     pinned_skills: Option<&std::collections::HashSet<String>>,
+    open_skill_name: bool,
 ) -> Value {
     let (skill_entries, all_names) = format_skills_within_budget(
         skills,
@@ -302,7 +650,22 @@ pub fn skill_tool_schema(
         pinned_skills,
     );
 
-    let skill_names: Vec<Value> = all_names.into_iter().map(Value::String).collect();
+    let mut skill_name_prop = serde_json::json!({
+        "type": "string",
+        "description": "The name of the skill to execute (canonical name or alias)."
+    });
+    if !open_skill_name {
+        let skill_names: Vec<Value> = all_names.into_iter().map(Value::String).collect();
+        if let Some(obj) = skill_name_prop.as_object_mut() {
+            obj.insert("enum".to_string(), Value::Array(skill_names));
+        }
+    }
+
+    let experimental_note = if open_skill_name {
+        "\n\nOnly a subset of skills is listed below. If none apply, call `discover_skills` with a specific description of your next action before improvising."
+    } else {
+        ""
+    };
 
     let description = format!(
         "Execute a skill within the current conversation.\n\n\
@@ -319,8 +682,9 @@ pub fn skill_tool_schema(
          invoke the relevant skill tool BEFORE generating any other response about the task\n\
          - NEVER just mention a skill in your text response without actually calling this tool\n\
          - If the user explicitly references a skill by name, invoke it\n\n\
-         Available skills:\n{}",
-        skill_entries.join("\n")
+         Available skills:\n{}{}",
+        skill_entries.join("\n"),
+        experimental_note
     );
 
     serde_json::json!({
@@ -332,11 +696,7 @@ pub fn skill_tool_schema(
                 "type": "object",
                 "required": ["skill_name"],
                 "properties": {
-                    "skill_name": {
-                        "type": "string",
-                        "enum": skill_names,
-                        "description": "The name of the skill to execute."
-                    },
+                    "skill_name": skill_name_prop,
                     "task": {
                         "type": "string",
                         "description": "Optional task description or additional context for the skill. If omitted, the skill uses the current conversation context."
@@ -356,6 +716,7 @@ pub fn skill_listing_system_message(
     skills: &[SkillToolInfo],
     quality_tracker: Option<&crate::skills::quality::SkillQualityTracker>,
     pinned_skills: Option<&std::collections::HashSet<String>>,
+    append_discover_hint: bool,
 ) -> Value {
     let (entries, _) = format_skills_within_budget(
         skills,
@@ -383,13 +744,21 @@ pub fn skill_listing_system_message(
     }
     lines.push("</available_skills>".to_string());
 
+    let discover_note = if append_discover_hint {
+        "\n\nRelevant skills are surfaced each turn. If you are pivoting or none of the above \
+         fit your next step, call `discover_skills` with a specific description before improvising."
+    } else {
+        ""
+    };
+
     let content = format!(
         "You have access to specialized skills via the `skill` tool. \
          This is a BLOCKING REQUIREMENT: when a user's request matches a skill, \
          invoke the skill tool BEFORE generating any other response about the task. \
          Do not attempt to manually replicate what a skill does — skills encode \
-         domain-specific workflows that outperform ad-hoc tool calls.\n\n{}",
-        lines.join("\n")
+         domain-specific workflows that outperform ad-hoc tool calls.\n\n{}{}",
+        lines.join("\n"),
+        discover_note
     );
 
     serde_json::json!({
@@ -452,6 +821,103 @@ pub struct SkillActivation {
     /// Sandbox policy derived from the skill's trust tier.
     /// When set, the agentic loop should apply these restrictions to tool execution.
     pub sandbox_policy: Option<crate::tool_sandbox::SandboxPolicy>,
+}
+
+/// Handle `discover_skills` then `skill` tool calls in one batch (discover runs first).
+///
+/// When `experimental_skill_search` is off, callers should use [`partition_and_execute_skills`]
+/// only — this function is a no-op wrapper if there are no discover calls (still splits skills).
+pub async fn partition_discover_and_execute_skills(
+    tool_calls: &[Value],
+    resolver: &dyn SkillResolver,
+    catalog: &[SkillToolInfo],
+    discover_exclude_lowercase: &HashSet<String>,
+    discovered_skills: &mut HashSet<String>,
+    executor: Option<&Arc<dyn SkillExecutor>>,
+    quality_tracker: Option<&mut crate::skills::quality::SkillQualityTracker>,
+    composition_ctx: Option<&crate::skills::composition::CompositionContext>,
+    skill_ctx: &SkillContext,
+) -> (Vec<(String, String)>, Vec<Value>, Option<SkillActivation>) {
+    let mut discover_calls = Vec::new();
+    let mut skill_calls = Vec::new();
+    let mut other = Vec::new();
+    for tc in tool_calls {
+        if is_discover_skills_call(tc) {
+            discover_calls.push(tc.clone());
+        } else if is_skill_call(tc) {
+            skill_calls.push(tc.clone());
+        } else {
+            other.push(tc.clone());
+        }
+    }
+
+    let mut combined_results = Vec::new();
+    let mut activation: Option<SkillActivation> = None;
+
+    let mut excluded = discover_exclude_lowercase.clone();
+    for n in discovered_skills.iter() {
+        excluded.insert(n.to_lowercase());
+    }
+
+    for tc in discover_calls {
+        let call_id = tc
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown")
+            .to_string();
+
+        let args_str = tc
+            .get("function")
+            .and_then(|f| f.get("arguments"))
+            .and_then(Value::as_str)
+            .unwrap_or("{}");
+
+        let result = match serde_json::from_str::<Value>(args_str) {
+            Ok(args) => {
+                let query = args.get("query").and_then(Value::as_str).unwrap_or("");
+                let (text, discovered) = execute_discover_skills(
+                    query,
+                    catalog,
+                    excluded.clone(),
+                    quality_tracker.as_deref(),
+                );
+                for n in &discovered {
+                    discovered_skills.insert(n.clone());
+                }
+                for s in catalog {
+                    if discovered.contains(&s.name) {
+                        excluded.insert(s.name.to_lowercase());
+                        for a in &s.aliases {
+                            excluded.insert(a.to_lowercase());
+                        }
+                    }
+                }
+                text
+            }
+            Err(e) => format!("Invalid discover_skills arguments: {e}"),
+        };
+
+        combined_results.push((call_id, result));
+    }
+
+    let (skill_results, _remaining_skills_only, act) = partition_and_execute_skills(
+        &skill_calls,
+        resolver,
+        executor,
+        quality_tracker,
+        composition_ctx,
+        skill_ctx,
+    )
+    .await;
+    if let Some(a) = act {
+        activation = Some(merge_activations(activation, a));
+    }
+    combined_results.extend(skill_results);
+
+    let mut final_remaining = _remaining_skills_only;
+    final_remaining.extend(other);
+
+    (combined_results, final_remaining, activation)
 }
 
 /// Partition tool calls into skill calls and regular calls, executing skills
@@ -918,6 +1384,7 @@ mod tests {
                     composition: None,
                     input_schema: None,
                     aliases: Vec::new(),
+
                     effort: None,
                     agent_type: None,
                     trust_tier: crate::skills::manifest::TrustTier::Bundled,
@@ -934,6 +1401,9 @@ mod tests {
                     when_to_use: None,
                     source: SkillSourceKind::Local,
                     aliases: Vec::new(),
+                    category: None,
+                    tags: Vec::new(),
+                    triggers: Vec::new(),
                 })
                 .collect()
         }
@@ -960,7 +1430,7 @@ mod tests {
     fn schema_has_correct_structure() {
         let resolver = stub_resolver();
         let skills = resolver.available_skills();
-        let schema = skill_tool_schema(&skills, None, None);
+        let schema = skill_tool_schema(&skills, None, None, false);
 
         assert_eq!(schema["function"]["name"], SKILL_TOOL_NAME);
         let params = &schema["function"]["parameters"];
@@ -978,8 +1448,86 @@ mod tests {
     }
 
     #[test]
+    fn schema_open_skill_name_has_no_enum() {
+        let skills = vec![SkillToolInfo {
+            name: "only-one".into(),
+            description: "test".into(),
+            ..Default::default()
+        }];
+        let schema = skill_tool_schema(&skills, None, None, true);
+        assert!(
+            schema["function"]["parameters"]["properties"]["skill_name"]
+                .get("enum")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn discover_skills_finds_nonsurfaced_candidates() {
+        let catalog = vec![
+            SkillToolInfo {
+                name: "surfaced".into(),
+                description: "Already shown".into(),
+                ..Default::default()
+            },
+            SkillToolInfo {
+                name: "hidden-deploy".into(),
+                description: "Deploy applications to Kubernetes".into(),
+                ..Default::default()
+            },
+        ];
+        let mut ex = HashSet::new();
+        ex.insert("surfaced".into());
+        let (text, names) = execute_discover_skills("kubernetes deploy", &catalog, ex, None);
+        assert!(text.contains("hidden-deploy"), "{text}");
+        assert_eq!(names, vec!["hidden-deploy".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn partition_runs_discover_before_skill() {
+        let resolver = stub_resolver();
+        let catalog = resolver.available_skills();
+        let mut ex = HashSet::new();
+        // Simulate "code-review" already in the turn surface; "test-writer" is discoverable.
+        ex.insert("code-review".into());
+        let mut discovered = HashSet::new();
+        let tool_calls = vec![
+            serde_json::json!({
+                "id": "d1",
+                "function": {
+                    "name": DISCOVER_SKILLS_TOOL_NAME,
+                    "arguments": "{\"query\": \"write unit tests\"}"
+                }
+            }),
+            serde_json::json!({
+                "id": "c1",
+                "function": {
+                    "name": "bash",
+                    "arguments": "{\"command\": \"echo hi\"}"
+                }
+            }),
+        ];
+        let (results, remaining, _) = partition_discover_and_execute_skills(
+            &tool_calls,
+            &resolver,
+            &catalog,
+            &ex,
+            &mut discovered,
+            None,
+            None,
+            None,
+            &SkillContext::default(),
+        )
+        .await;
+        assert_eq!(results.len(), 1);
+        assert!(results[0].1.contains("test-writer") || results[0].1.contains("Additional skills"));
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0]["function"]["name"], "bash");
+    }
+
+    #[test]
     fn schema_empty_when_no_skills() {
-        let schema = skill_tool_schema(&[], None, None);
+        let schema = skill_tool_schema(&[], None, None, false);
         let skill_enum = &schema["function"]["parameters"]["properties"]["skill_name"]["enum"];
         assert_eq!(skill_enum.as_array().unwrap().len(), 0);
     }
@@ -1218,8 +1766,11 @@ mod tests {
             when_to_use: Some("when user asks to deploy".into()),
             source: SkillSourceKind::Local,
             aliases: Vec::new(),
+            category: None,
+            tags: Vec::new(),
+            triggers: Vec::new(),
         }];
-        let schema = skill_tool_schema(&skills, None, None);
+        let schema = skill_tool_schema(&skills, None, None, false);
         let desc = schema["function"]["description"].as_str().unwrap();
         assert!(desc.contains("when user asks to deploy"));
     }
@@ -1233,6 +1784,9 @@ mod tests {
                 when_to_use: None,
                 source: SkillSourceKind::Local,
                 aliases: Vec::new(),
+                category: None,
+                tags: Vec::new(),
+                triggers: Vec::new(),
             })
             .collect();
         let (entries, names) = format_skills_within_budget(&skills, 10_000, None, None);
@@ -1256,6 +1810,9 @@ mod tests {
                 )),
                 source: SkillSourceKind::Local,
                 aliases: Vec::new(),
+                category: None,
+                tags: Vec::new(),
+                triggers: Vec::new(),
             })
             .collect();
         let (entries, names) = format_skills_within_budget(&skills, 500, None, None);
@@ -1275,6 +1832,9 @@ mod tests {
                 when_to_use: None,
                 source: SkillSourceKind::Bundled,
                 aliases: Vec::new(),
+                category: None,
+                tags: Vec::new(),
+                triggers: Vec::new(),
             })
             .collect();
         // Add many local skills
@@ -1285,6 +1845,9 @@ mod tests {
                 when_to_use: None,
                 source: SkillSourceKind::Local,
                 aliases: Vec::new(),
+                category: None,
+                tags: Vec::new(),
+                triggers: Vec::new(),
             });
         }
         let (entries, names) = format_skills_within_budget(&skills, 800, None, None);
@@ -1304,6 +1867,9 @@ mod tests {
                 when_to_use: None,
                 source: SkillSourceKind::Local,
                 aliases: Vec::new(),
+                category: None,
+                tags: Vec::new(),
+                triggers: Vec::new(),
             })
             .collect();
         // With 100 skills and 200 byte budget, names-only
@@ -1326,6 +1892,9 @@ mod tests {
             when_to_use: None,
             source: SkillSourceKind::Local,
             aliases: Vec::new(),
+            category: None,
+            tags: Vec::new(),
+            triggers: Vec::new(),
         }];
         let (entries, _) = format_skills_within_budget(&skills, 10_000, None, None);
         // Description should be capped at MAX_LISTING_DESC_CHARS
@@ -1347,6 +1916,9 @@ mod tests {
                 when_to_use: None,
                 source: SkillSourceKind::Local,
                 aliases: Vec::new(),
+                category: None,
+                tags: Vec::new(),
+                triggers: Vec::new(),
             },
             SkillToolInfo {
                 name: "high-quality".into(),
@@ -1354,6 +1926,9 @@ mod tests {
                 when_to_use: None,
                 source: SkillSourceKind::Local,
                 aliases: Vec::new(),
+                category: None,
+                tags: Vec::new(),
+                triggers: Vec::new(),
             },
         ];
 
@@ -1405,6 +1980,9 @@ mod tests {
                 when_to_use: None,
                 source: SkillSourceKind::Local,
                 aliases: Vec::new(),
+                category: None,
+                tags: Vec::new(),
+                triggers: Vec::new(),
             })
             .collect();
 
@@ -1443,6 +2021,9 @@ mod tests {
             when_to_use: None,
             source: SkillSourceKind::Local,
             aliases: Vec::new(),
+            category: None,
+            tags: Vec::new(),
+            triggers: Vec::new(),
         };
         // Should not panic even with CJK content exceeding MAX_LISTING_DESC_CHARS
         let desc = format_skill_description(&skill);
@@ -1468,6 +2049,7 @@ mod tests {
                     composition: None,
                     input_schema: None,
                     aliases: Vec::new(),
+
                     effort: None,
                     agent_type: None,
                     trust_tier: crate::skills::manifest::TrustTier::Bundled,
@@ -1513,6 +2095,7 @@ mod tests {
                     composition: None,
                     input_schema: None,
                     aliases: Vec::new(),
+
                     effort: None,
                     agent_type: None,
                     trust_tier: crate::skills::manifest::TrustTier::Bundled,
@@ -1589,6 +2172,7 @@ mod tests {
             composition: None,
             input_schema: None,
             aliases: Vec::new(),
+
             effort: None,
             agent_type: None,
                     trust_tier: crate::skills::manifest::TrustTier::Bundled,
@@ -1614,6 +2198,7 @@ mod tests {
             composition: None,
             input_schema: None,
             aliases: Vec::new(),
+
             effort: None,
             agent_type: None,
                     trust_tier: crate::skills::manifest::TrustTier::Bundled,
@@ -1780,6 +2365,7 @@ mod tests {
             composition: None,
             input_schema: None,
             aliases: Vec::new(),
+
             effort: Some(EffortLevel::High),
             agent_type: Some("coder".into()),
             trust_tier: crate::skills::manifest::TrustTier::Bundled,
@@ -1834,6 +2420,7 @@ mod tests {
                         composition: None,
                         input_schema: None,
                         aliases: Vec::new(),
+
                         effort: None,
                         agent_type: None,
                     trust_tier: crate::skills::manifest::TrustTier::Bundled,
@@ -1852,6 +2439,7 @@ mod tests {
                         composition: None,
                         input_schema: None,
                         aliases: Vec::new(),
+
                         effort: None,
                         agent_type: None,
                     trust_tier: crate::skills::manifest::TrustTier::Bundled,
@@ -1867,6 +2455,9 @@ mod tests {
                         when_to_use: None,
                         source: SkillSourceKind::Local,
                         aliases: Vec::new(),
+                        category: None,
+                        tags: Vec::new(),
+                        triggers: Vec::new(),
                     },
                     SkillToolInfo {
                         name: "skill-b".into(),
@@ -1874,6 +2465,9 @@ mod tests {
                         when_to_use: None,
                         source: SkillSourceKind::Local,
                         aliases: Vec::new(),
+                        category: None,
+                        tags: Vec::new(),
+                        triggers: Vec::new(),
                     },
                 ]
             }
@@ -1930,6 +2524,7 @@ mod tests {
                         composition: None,
                         input_schema: None,
                         aliases: Vec::new(),
+
                         effort: None,
                         agent_type: None,
                     trust_tier: crate::skills::manifest::TrustTier::Bundled,
@@ -1996,6 +2591,7 @@ mod tests {
                     composition: None, // not composable
                     input_schema: None,
                     aliases: Vec::new(),
+
                     effort: None,
                     agent_type: None,
                     trust_tier: crate::skills::manifest::TrustTier::Bundled,
@@ -2049,6 +2645,7 @@ mod tests {
                     }),
                     input_schema: None,
                     aliases: Vec::new(),
+
                     effort: None,
                     agent_type: None,
                     trust_tier: crate::skills::manifest::TrustTier::Bundled,
@@ -2102,6 +2699,7 @@ mod tests {
                     }),
                     input_schema: None,
                     aliases: Vec::new(),
+
                     effort: None,
                     agent_type: None,
                     trust_tier: crate::skills::manifest::TrustTier::Bundled,
@@ -2153,6 +2751,7 @@ mod tests {
                     composition: None,
                     input_schema: None,
                     aliases: Vec::new(),
+
                     effort: None,
                     agent_type: None,
                     trust_tier: crate::skills::manifest::TrustTier::Bundled,
@@ -2208,6 +2807,7 @@ mod tests {
                         "required": ["target_path"]
                     })),
                     aliases: Vec::new(),
+
                     effort: None,
                     agent_type: None,
                     trust_tier: crate::skills::manifest::TrustTier::Bundled,
@@ -2258,6 +2858,9 @@ mod tests {
                 when_to_use: None,
                 source: SkillSourceKind::Local,
                 aliases: Vec::new(),
+                category: None,
+                tags: Vec::new(),
+                triggers: Vec::new(),
             })
             .collect();
 

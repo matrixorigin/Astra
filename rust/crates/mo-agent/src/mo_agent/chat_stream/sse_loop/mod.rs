@@ -142,8 +142,7 @@ pub(crate) async fn stream_chat_sse(
         if reg_arc.is_empty() {
             let _ = reg_arc.discover_all().await;
         }
-        let inner_resolver =
-            Arc::new(astra_runtime::skills::UnifiedSkillResolver::new(reg_arc));
+        let inner_resolver = Arc::new(astra_runtime::skills::UnifiedSkillResolver::new(reg_arc));
         let adapter =
             astra_runtime::skills::registry::LegacySkillResolverAdapter::new(inner_resolver);
         let skills = adapter.available_skills();
@@ -234,6 +233,7 @@ pub(crate) async fn stream_chat_sse(
         skill_quality_tracker: p.skill_quality_tracker.clone(),
         skill_improvement_tracker: astra_runtime::skills::improvement::ImprovementTracker::new(),
         pinned_skills: std::collections::HashSet::new(),
+        discovered_skills: std::collections::HashSet::new(),
         tool_event_hooks: astra_runtime::skills::hooks::load_tool_event_hooks(&project_root),
         stop_hooks: hook_sets.stop_hooks,
         stop_hook_runs: 0,
@@ -247,7 +247,7 @@ pub(crate) async fn stream_chat_sse(
         last_composite_snapshot: None,
         last_measured_prompt_tokens: None,
         consecutive_context_window_errors: 0,
-            skill_listing_message: None,
+        skill_listing_message: None,
     };
 
     // ─── Run the runtime loop ────────────────────────────────────────────

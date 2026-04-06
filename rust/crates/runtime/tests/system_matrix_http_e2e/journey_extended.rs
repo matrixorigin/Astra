@@ -40,12 +40,8 @@ pub async fn run_session_cancel_then_delete() {
         Some("cancelled")
     );
 
-    let st_del = delete_no_content(
-        app,
-        &format!("/sessions/{session_id}"),
-        Some(auth.as_str()),
-    )
-    .await;
+    let st_del =
+        delete_no_content(app, &format!("/sessions/{session_id}"), Some(auth.as_str())).await;
     assert_eq!(st_del, StatusCode::NO_CONTENT, "delete session");
 
     let (st_get, _) = get_json(
@@ -72,14 +68,9 @@ pub async fn run_chat_stream_session_info_smoke() {
         "session_id": session_id,
         "max_candidates": 1
     });
-    let (st, text) = post_json_collect_body_text(
-        app,
-        "/chat/stream",
-        Some(auth.as_str()),
-        &body,
-        512 * 1024,
-    )
-    .await;
+    let (st, text) =
+        post_json_collect_body_text(app, "/chat/stream", Some(auth.as_str()), &body, 512 * 1024)
+            .await;
     assert_eq!(
         st,
         StatusCode::OK,

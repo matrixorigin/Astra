@@ -101,13 +101,12 @@ impl SkillProvider for LocalSkillProvider {
             }
             let found = loader::discover_skills_in_dir(search_dir);
             for (_dir_name, skill_md_path) in found {
-                let mut loaded = match loader::load_skill_from_path_confined(&skill_md_path, search_dir)
-                {
-                    Ok(l) => l,
-                    Err(_) => continue,
-                };
-                if loaded.manifest.name == name
-                    || loaded.manifest.aliases.iter().any(|a| a == name)
+                let mut loaded =
+                    match loader::load_skill_from_path_confined(&skill_md_path, search_dir) {
+                        Ok(l) => l,
+                        Err(_) => continue,
+                    };
+                if loaded.manifest.name == name || loaded.manifest.aliases.iter().any(|a| a == name)
                 {
                     loaded.manifest.source = SkillSourceKind::Local;
                     return Ok(loaded);

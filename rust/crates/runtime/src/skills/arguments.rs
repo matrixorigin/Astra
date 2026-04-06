@@ -74,11 +74,10 @@ pub fn substitute_arguments(
     let needs_positional = result.contains("$ARGUMENTS[") || {
         // Check for $0..$9 not preceded by ${ (to avoid matching ${ARG0} etc.)
         let bytes = result.as_bytes();
-        bytes.windows(2).enumerate().any(|(i, w)| {
-            w[0] == b'$'
-                && w[1].is_ascii_digit()
-                && (i == 0 || bytes[i - 1] != b'{')
-        })
+        bytes
+            .windows(2)
+            .enumerate()
+            .any(|(i, w)| w[0] == b'$' && w[1].is_ascii_digit() && (i == 0 || bytes[i - 1] != b'{'))
     };
 
     if needs_positional {
@@ -106,7 +105,8 @@ pub fn substitute_arguments(
             let mut new_result = String::with_capacity(result.len());
             let bytes = result.as_bytes();
             while pos < bytes.len() {
-                if bytes[pos] == b'$' && pos + 1 < bytes.len() && bytes[pos + 1] == (b'0' + i as u8) {
+                if bytes[pos] == b'$' && pos + 1 < bytes.len() && bytes[pos + 1] == (b'0' + i as u8)
+                {
                     // Check it's not inside ${...}
                     if pos + 2 < bytes.len() && bytes[pos + 1] == b'{' {
                         new_result.push(bytes[pos] as char);

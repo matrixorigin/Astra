@@ -47,7 +47,10 @@ impl BundleManifest {
 /// Pack a skill directory into a `.astra-skill` bundle.
 ///
 /// Returns `(output_path, BundleManifest)` on success.
-pub fn pack_skill(skill_dir: &Path, output_dir: &Path) -> Result<(PathBuf, BundleManifest), SkillError> {
+pub fn pack_skill(
+    skill_dir: &Path,
+    output_dir: &Path,
+) -> Result<(PathBuf, BundleManifest), SkillError> {
     let skill_md_path = skill_dir.join("SKILL.md");
     if !skill_md_path.exists() {
         return Err(SkillError::NotFound(format!(
@@ -57,9 +60,8 @@ pub fn pack_skill(skill_dir: &Path, output_dir: &Path) -> Result<(PathBuf, Bundl
     }
 
     // Parse SKILL.md to extract manifest
-    let content = std::fs::read_to_string(&skill_md_path).map_err(|e| {
-        SkillError::LoadFailed(format!("Failed to read SKILL.md: {e}"))
-    })?;
+    let content = std::fs::read_to_string(&skill_md_path)
+        .map_err(|e| SkillError::LoadFailed(format!("Failed to read SKILL.md: {e}")))?;
 
     let (manifest, _body) = loader::parse_skill_md(&content)?;
 
@@ -69,17 +71,15 @@ pub fn pack_skill(skill_dir: &Path, output_dir: &Path) -> Result<(PathBuf, Bundl
     let hash = format!("{:x}", hasher.finalize());
 
     let bundle_manifest = BundleManifest::from_skill_manifest(&manifest, &hash);
-    let manifest_json = serde_json::to_string_pretty(&bundle_manifest).map_err(|e| {
-        SkillError::LoadFailed(format!("Failed to serialize manifest: {e}"))
-    })?;
+    let manifest_json = serde_json::to_string_pretty(&bundle_manifest)
+        .map_err(|e| SkillError::LoadFailed(format!("Failed to serialize manifest: {e}")))?;
 
     // Build tar.gz
     let bundle_name = format!("{}-{}.astra-skill", manifest.name, manifest.version);
     let output_path = output_dir.join(&bundle_name);
 
-    let file = std::fs::File::create(&output_path).map_err(|e| {
-        SkillError::LoadFailed(format!("Failed to create bundle file: {e}"))
-    })?;
+    let file = std::fs::File::create(&output_path)
+        .map_err(|e| SkillError::LoadFailed(format!("Failed to create bundle file: {e}")))?;
     let gz = flate2::write::GzEncoder::new(file, flate2::Compression::default());
     let mut tar = tar::Builder::new(gz);
 
@@ -101,9 +101,8 @@ pub fn pack_skill(skill_dir: &Path, output_dir: &Path) -> Result<(PathBuf, Bundl
         add_dir_to_tar(&mut tar, &scripts_dir, "scripts")?;
     }
 
-    tar.finish().map_err(|e| {
-        SkillError::LoadFailed(format!("Failed to finalize tar: {e}"))
-    })?;
+    tar.finish()
+        .map_err(|e| SkillError::LoadFailed(format!("Failed to finalize tar: {e}")))?;
 
     Ok((output_path, bundle_manifest))
 }
@@ -116,9 +115,8 @@ pub fn unpack_skill(
     bundle_path: &Path,
     target_dir: &Path,
 ) -> Result<(PathBuf, BundleManifest), SkillError> {
-    let file = std::fs::File::open(bundle_path).map_err(|e| {
-        SkillError::LoadFailed(format!("Failed to open bundle: {e}"))
-    })?;
+    let file = std::fs::File::open(bundle_path)
+        .map_err(|e| SkillError::LoadFailed(format!("Failed to open bundle: {e}")))?;
     let gz = flate2::read::GzDecoder::new(file);
     let mut archive = tar::Archive::new(gz);
 
@@ -126,12 +124,12 @@ pub fn unpack_skill(
     let mut manifest_json = String::new();
     let mut entries_data: Vec<(String, Vec<u8>)> = Vec::new();
 
-    for entry in archive.entries().map_err(|e| {
-        SkillError::LoadFailed(format!("Failed to read tar entries: {e}"))
-    })? {
-        let mut entry = entry.map_err(|e| {
-            SkillError::LoadFailed(format!("Failed to read tar entry: {e}"))
-        })?;
+    for entry in archive
+        .entries()
+        .map_err(|e| SkillError::LoadFailed(format!("Failed to read tar entries: {e}")))?
+    {
+        let mut entry =
+            entry.map_err(|e| SkillError::LoadFailed(format!("Failed to read tar entry: {e}")))?;
         let path = entry
             .path()
             .map_err(|e| SkillError::LoadFailed(format!("Invalid path in tar: {e}")))?
@@ -146,9 +144,9 @@ pub fn unpack_skill(
         }
 
         let mut data = Vec::new();
-        entry.read_to_end(&mut data).map_err(|e| {
-            SkillError::LoadFailed(format!("Failed to read entry {path}: {e}"))
-        })?;
+        entry
+            .read_to_end(&mut data)
+            .map_err(|e| SkillError::LoadFailed(format!("Failed to read entry {path}: {e}")))?;
 
         if path == "manifest.json" {
             manifest_json = String::from_utf8(data.clone()).map_err(|e| {
@@ -165,10 +163,8 @@ pub fn unpack_skill(
         ));
     }
 
-    let bundle_manifest: BundleManifest =
-        serde_json::from_str(&manifest_json).map_err(|e| {
-            SkillError::LoadFailed(format!("Invalid manifest.json: {e}"))
-        })?;
+    let bundle_manifest: BundleManifest = serde_json::from_str(&manifest_json)
+        .map_err(|e| SkillError::LoadFailed(format!("Invalid manifest.json: {e}")))?;
 
     // Verify SKILL.md hash
     if let Some((_, skill_md_data)) = entries_data.iter().find(|(p, _)| p == "SKILL.md") {
@@ -189,9 +185,8 @@ pub fn unpack_skill(
 
     // Extract to target_dir/<name>/
     let install_dir = target_dir.join(&bundle_manifest.name);
-    std::fs::create_dir_all(&install_dir).map_err(|e| {
-        SkillError::LoadFailed(format!("Failed to create install dir: {e}"))
-    })?;
+    std::fs::create_dir_all(&install_dir)
+        .map_err(|e| SkillError::LoadFailed(format!("Failed to create install dir: {e}")))?;
 
     for (path, data) in &entries_data {
         if path == "manifest.json" {
@@ -206,14 +201,12 @@ pub fn unpack_skill(
 
         // Create parent directories for nested files (templates/foo.yaml, scripts/bar.sh)
         if let Some(parent) = dest.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| {
-                SkillError::LoadFailed(format!("Failed to create dir: {e}"))
-            })?;
+            std::fs::create_dir_all(parent)
+                .map_err(|e| SkillError::LoadFailed(format!("Failed to create dir: {e}")))?;
         }
 
-        std::fs::write(&dest, data).map_err(|e| {
-            SkillError::LoadFailed(format!("Failed to write {path}: {e}"))
-        })?;
+        std::fs::write(&dest, data)
+            .map_err(|e| SkillError::LoadFailed(format!("Failed to write {path}: {e}")))?;
     }
 
     Ok((install_dir, bundle_manifest))
@@ -221,18 +214,17 @@ pub fn unpack_skill(
 
 /// Read bundle manifest without fully extracting.
 pub fn inspect_bundle(bundle_path: &Path) -> Result<BundleManifest, SkillError> {
-    let file = std::fs::File::open(bundle_path).map_err(|e| {
-        SkillError::LoadFailed(format!("Failed to open bundle: {e}"))
-    })?;
+    let file = std::fs::File::open(bundle_path)
+        .map_err(|e| SkillError::LoadFailed(format!("Failed to open bundle: {e}")))?;
     let gz = flate2::read::GzDecoder::new(file);
     let mut archive = tar::Archive::new(gz);
 
-    for entry in archive.entries().map_err(|e| {
-        SkillError::LoadFailed(format!("Failed to read tar entries: {e}"))
-    })? {
-        let mut entry = entry.map_err(|e| {
-            SkillError::LoadFailed(format!("Failed to read tar entry: {e}"))
-        })?;
+    for entry in archive
+        .entries()
+        .map_err(|e| SkillError::LoadFailed(format!("Failed to read tar entries: {e}")))?
+    {
+        let mut entry =
+            entry.map_err(|e| SkillError::LoadFailed(format!("Failed to read tar entry: {e}")))?;
         let path = entry
             .path()
             .map_err(|e| SkillError::LoadFailed(format!("Invalid path: {e}")))?
@@ -244,9 +236,8 @@ pub fn inspect_bundle(bundle_path: &Path) -> Result<BundleManifest, SkillError> 
             entry.read_to_string(&mut data).map_err(|e| {
                 SkillError::LoadFailed(format!("Failed to read manifest.json: {e}"))
             })?;
-            return serde_json::from_str(&data).map_err(|e| {
-                SkillError::LoadFailed(format!("Invalid manifest.json: {e}"))
-            });
+            return serde_json::from_str(&data)
+                .map_err(|e| SkillError::LoadFailed(format!("Invalid manifest.json: {e}")));
         }
     }
 
@@ -265,9 +256,8 @@ pub fn pack_skill_to_bytes(skill_dir: &Path) -> Result<(Vec<u8>, BundleManifest)
         )));
     }
 
-    let content = std::fs::read_to_string(&skill_md_path).map_err(|e| {
-        SkillError::LoadFailed(format!("Failed to read SKILL.md: {e}"))
-    })?;
+    let content = std::fs::read_to_string(&skill_md_path)
+        .map_err(|e| SkillError::LoadFailed(format!("Failed to read SKILL.md: {e}")))?;
 
     let (manifest, _body) = loader::parse_skill_md(&content)?;
 
@@ -276,9 +266,8 @@ pub fn pack_skill_to_bytes(skill_dir: &Path) -> Result<(Vec<u8>, BundleManifest)
     let hash = format!("{:x}", hasher.finalize());
 
     let bundle_manifest = BundleManifest::from_skill_manifest(&manifest, &hash);
-    let manifest_json = serde_json::to_string_pretty(&bundle_manifest).map_err(|e| {
-        SkillError::LoadFailed(format!("Failed to serialize manifest: {e}"))
-    })?;
+    let manifest_json = serde_json::to_string_pretty(&bundle_manifest)
+        .map_err(|e| SkillError::LoadFailed(format!("Failed to serialize manifest: {e}")))?;
 
     let mut buf = Vec::new();
     {
@@ -297,9 +286,8 @@ pub fn pack_skill_to_bytes(skill_dir: &Path) -> Result<(Vec<u8>, BundleManifest)
             add_dir_to_tar(&mut tar, &scripts_dir, "scripts")?;
         }
 
-        tar.finish().map_err(|e| {
-            SkillError::LoadFailed(format!("Failed to finalize tar: {e}"))
-        })?;
+        tar.finish()
+            .map_err(|e| SkillError::LoadFailed(format!("Failed to finalize tar: {e}")))?;
     }
 
     Ok((buf, bundle_manifest))
@@ -312,12 +300,10 @@ pub fn unpack_skill_from_bytes(
 ) -> Result<(PathBuf, BundleManifest), SkillError> {
     // Write to temp file, then unpack
     let tmp = target_dir.join(".tmp-bundle.astra-skill");
-    std::fs::create_dir_all(target_dir).map_err(|e| {
-        SkillError::LoadFailed(format!("Failed to create target dir: {e}"))
-    })?;
-    std::fs::write(&tmp, data).map_err(|e| {
-        SkillError::LoadFailed(format!("Failed to write temp bundle: {e}"))
-    })?;
+    std::fs::create_dir_all(target_dir)
+        .map_err(|e| SkillError::LoadFailed(format!("Failed to create target dir: {e}")))?;
+    std::fs::write(&tmp, data)
+        .map_err(|e| SkillError::LoadFailed(format!("Failed to write temp bundle: {e}")))?;
     let result = unpack_skill(&tmp, target_dir);
     let _ = std::fs::remove_file(&tmp);
     result
@@ -334,9 +320,8 @@ fn add_bytes_to_tar<W: Write>(
     header.set_size(data.len() as u64);
     header.set_mode(0o644);
     header.set_cksum();
-    tar.append_data(&mut header, path, data).map_err(|e| {
-        SkillError::LoadFailed(format!("Failed to add {path} to archive: {e}"))
-    })
+    tar.append_data(&mut header, path, data)
+        .map_err(|e| SkillError::LoadFailed(format!("Failed to add {path} to archive: {e}")))
 }
 
 fn add_dir_to_tar<W: Write>(
@@ -344,14 +329,12 @@ fn add_dir_to_tar<W: Write>(
     dir: &Path,
     prefix: &str,
 ) -> Result<(), SkillError> {
-    let entries = std::fs::read_dir(dir).map_err(|e| {
-        SkillError::LoadFailed(format!("Failed to read {}: {e}", dir.display()))
-    })?;
+    let entries = std::fs::read_dir(dir)
+        .map_err(|e| SkillError::LoadFailed(format!("Failed to read {}: {e}", dir.display())))?;
 
     for entry in entries {
-        let entry = entry.map_err(|e| {
-            SkillError::LoadFailed(format!("Failed to read dir entry: {e}"))
-        })?;
+        let entry =
+            entry.map_err(|e| SkillError::LoadFailed(format!("Failed to read dir entry: {e}")))?;
         let path = entry.path();
 
         // Only include regular files, skip subdirectories and symlinks for safety
@@ -439,7 +422,10 @@ mod tests {
 
         assert_eq!(unpacked_manifest.name, orig_manifest.name);
         assert_eq!(unpacked_manifest.version, orig_manifest.version);
-        assert_eq!(unpacked_manifest.skill_md_sha256, orig_manifest.skill_md_sha256);
+        assert_eq!(
+            unpacked_manifest.skill_md_sha256,
+            orig_manifest.skill_md_sha256
+        );
 
         // Verify files exist
         assert!(installed.join("SKILL.md").exists());
@@ -512,7 +498,8 @@ mod tests {
             if path == "manifest.json" {
                 // Tamper with the hash
                 let mut m: BundleManifest = serde_json::from_slice(&data).unwrap();
-                m.skill_md_sha256 = "0000000000000000000000000000000000000000000000000000000000000000".to_string();
+                m.skill_md_sha256 =
+                    "0000000000000000000000000000000000000000000000000000000000000000".to_string();
                 data = serde_json::to_vec_pretty(&m).unwrap();
             }
             entries.push((path, data));
@@ -528,7 +515,9 @@ mod tests {
             header.set_size(data.len() as u64);
             header.set_mode(0o644);
             header.set_cksum();
-            tar_builder.append_data(&mut header, path, data.as_slice()).unwrap();
+            tar_builder
+                .append_data(&mut header, path, data.as_slice())
+                .unwrap();
         }
         let gz = tar_builder.into_inner().unwrap();
         gz.finish().unwrap();
@@ -538,7 +527,10 @@ mod tests {
         let result = unpack_skill(&tampered_path, &install_dir);
         assert!(result.is_err());
         let err_msg = result.unwrap_err().to_string();
-        assert!(err_msg.contains("integrity check failed"), "unexpected error: {err_msg}");
+        assert!(
+            err_msg.contains("integrity check failed"),
+            "unexpected error: {err_msg}"
+        );
     }
 
     #[test]
@@ -585,9 +577,7 @@ mod tests {
             let name = b"../escape.txt\0";
             gnu.name[..name.len()].copy_from_slice(name);
             header.set_cksum();
-            tar_builder
-                .append(&header, &payload[..])
-                .unwrap();
+            tar_builder.append(&header, &payload[..]).unwrap();
 
             let gz = tar_builder.into_inner().unwrap();
             gz.finish().unwrap();

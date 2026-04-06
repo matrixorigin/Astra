@@ -120,13 +120,8 @@ pub async fn run_product_matrix_full_journey(
     .await;
     assert_eq!(st_act, StatusCode::OK, "session activity: {act}");
 
-    let (st_plat, plat) = get_json(
-        app,
-        "/platform/snapshot",
-        Some(auth_header.as_str()),
-        &[],
-    )
-    .await;
+    let (st_plat, plat) =
+        get_json(app, "/platform/snapshot", Some(auth_header.as_str()), &[]).await;
     assert_eq!(st_plat, StatusCode::OK, "platform snapshot: {plat}");
     assert!(
         plat["health"]["status"].is_string(),

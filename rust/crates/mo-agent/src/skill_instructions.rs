@@ -1395,6 +1395,7 @@ impl astra_runtime::turn::skill_tool::SkillResolver for CliSkillResolver {
             composition: None,
             input_schema: None,
             aliases: Vec::new(),
+
             effort: None,
             agent_type: None,
             trust_tier: astra_runtime::skills::manifest::TrustTier::Bundled,
@@ -1416,6 +1417,9 @@ impl astra_runtime::turn::skill_tool::SkillResolver for CliSkillResolver {
                 when_to_use: s.metadata.when_to_use.clone(),
                 source: astra_runtime::skills::manifest::SkillSourceKind::Local,
                 aliases: Vec::new(),
+                category: None,
+                tags: Vec::new(),
+                triggers: s.metadata.triggers.clone(),
             })
             .collect()
     }

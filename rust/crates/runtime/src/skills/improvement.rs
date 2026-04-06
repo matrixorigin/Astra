@@ -179,10 +179,7 @@ pub fn parse_improvements(response: &str) -> Vec<SkillImprovement> {
             .strip_prefix("```json")
             .or_else(|| trimmed.strip_prefix("```"))
             .unwrap_or(trimmed);
-        inner
-            .strip_suffix("```")
-            .unwrap_or(inner)
-            .trim()
+        inner.strip_suffix("```").unwrap_or(inner).trim()
     } else {
         trimmed
     };
@@ -280,7 +277,8 @@ mod tests {
 
     #[test]
     fn extract_updated_content_works() {
-        let response = "Here's the update:\n<updated_file>\n---\nname: test\n---\n# Hello\n</updated_file>";
+        let response =
+            "Here's the update:\n<updated_file>\n---\nname: test\n---\n# Hello\n</updated_file>";
         let content = extract_updated_content(response).unwrap();
         assert!(content.starts_with("---"));
         assert!(content.contains("# Hello"));

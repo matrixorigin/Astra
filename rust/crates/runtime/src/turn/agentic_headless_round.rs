@@ -258,18 +258,11 @@ pub async fn run_agentic_headless_tool_round<E: EdgeToolRoundRow>(
 
         // ── PreToolUse hook evaluation ──
         if !tool_event_hooks.is_empty() {
-            let decision = crate::skills::hooks::evaluate_pre_tool_hooks(
-                tool_event_hooks,
-                &name,
-                &args,
-            )
-            .await;
+            let decision =
+                crate::skills::hooks::evaluate_pre_tool_hooks(tool_event_hooks, &name, &args).await;
             match decision {
                 crate::skills::hooks::PreToolDecision::Block(reason) => {
-                    let err_msg = format!(
-                        "Tool '{}' blocked by PreToolUse hook: {}",
-                        name, reason
-                    );
+                    let err_msg = format!("Tool '{}' blocked by PreToolUse hook: {}", name, reason);
                     if !quiet {
                         term.emit_line(
                             HeadlessStderrStyle::Yellow,

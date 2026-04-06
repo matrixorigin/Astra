@@ -179,9 +179,9 @@ fn create_tool_selector_with_quality_internal(
             let mut llm = tool_selector::LlmToolSelector::new(api.clone(), tok.to_string());
             // Use the cheapest available model for tool selection (simple classification).
             // Priority: ASTRA_SELECTOR_MODEL env > smallest context_window from /models.
-            let selector_model = std::env::var("ASTRA_SELECTOR_MODEL").ok().or_else(|| {
-                pick_cheapest_model(&api, &tok)
-            });
+            let selector_model = std::env::var("ASTRA_SELECTOR_MODEL")
+                .ok()
+                .or_else(|| pick_cheapest_model(&api, &tok));
             if let Some(m) = selector_model {
                 llm = llm.with_model(m);
             }

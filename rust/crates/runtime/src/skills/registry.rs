@@ -481,6 +481,9 @@ impl super::traits::SkillResolver for UnifiedSkillResolver {
                 when_to_use: m.when_to_use,
                 source: m.source,
                 aliases: m.aliases,
+                category: m.category,
+                tags: m.tags,
+                triggers: m.triggers,
             })
             .collect()
     }
@@ -533,6 +536,9 @@ impl crate::turn::skill_tool::SkillResolver for LegacySkillResolverAdapter {
                 when_to_use: s.when_to_use,
                 source: s.source,
                 aliases: s.aliases,
+                category: s.category,
+                tags: s.tags,
+                triggers: s.triggers,
             })
             .collect()
     }

@@ -50,12 +50,12 @@ pub use handlers::*;
 
 // Re-export key framework types for convenience.
 pub use composition::{CompositionContext, CompositionError};
+pub use improvement::{ImprovementProposal, ImprovementTracker, SkillImprovement};
 pub use manifest::{ExecutionContext, LoadedSkill, SkillManifest, SkillSourceKind};
 pub use providers::{
     BundledSkillProvider, DatabaseSkillProvider, LocalSkillProvider, McpSkillProvider,
 };
 pub use quality::{SkillOutcome, SkillQualityEntry, SkillQualityTracker};
-pub use improvement::{ImprovementTracker, ImprovementProposal, SkillImprovement};
 pub use registry::{SharedSkillRegistry, UnifiedSkillRegistry, UnifiedSkillResolver};
 pub use traits::{SkillError, SkillExecutor, SkillProvider, SkillResolver};
 pub use verify::SkillVerifier;

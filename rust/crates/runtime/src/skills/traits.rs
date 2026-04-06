@@ -84,6 +84,9 @@ pub struct SkillToolInfo {
     pub when_to_use: Option<String>,
     pub source: super::manifest::SkillSourceKind,
     pub aliases: Vec<String>,
+    pub category: Option<String>,
+    pub tags: Vec<String>,
+    pub triggers: Vec<String>,
 }
 
 /// A fully resolved skill ready for execution.
