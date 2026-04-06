@@ -23,6 +23,10 @@ arguments:
 tags:
   - debugging
   - problem-solving
+composition:
+  composable: false
+  idempotent: true
+  max_duration_sec: 300
 ---
 # Stuck: Break Through the Impasse
 

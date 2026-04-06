@@ -273,4 +273,63 @@ Instructions B.
             );
         }
     }
+
+    #[tokio::test]
+    async fn all_bundled_skills_have_composition_metadata() {
+        let provider = BundledSkillProvider::with_defaults();
+        let manifests = provider.discover().await.unwrap();
+        for m in &manifests {
+            let loaded = provider.load(&m.name).await.unwrap();
+            assert!(
+                loaded.manifest.composition.is_some(),
+                "bundled skill '{}' missing composition metadata",
+                m.name
+            );
+            let comp = loaded.manifest.composition.as_ref().unwrap();
+            assert!(
+                comp.max_duration_sec.is_some(),
+                "bundled skill '{}' missing max_duration_sec",
+                m.name
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn composable_skills_are_expected_set() {
+        let provider = BundledSkillProvider::with_defaults();
+        let manifests = provider.discover().await.unwrap();
+
+        let expected_composable = ["batch", "debug", "reflect", "review", "verify"];
+        let expected_non_composable = ["remember", "skillify", "stuck"];
+
+        for m in &manifests {
+            let loaded = provider.load(&m.name).await.unwrap();
+            let comp = loaded.manifest.composition.as_ref().unwrap();
+            if expected_composable.contains(&m.name.as_str()) {
+                assert!(comp.composable, "'{}' should be composable", m.name);
+            }
+            if expected_non_composable.contains(&m.name.as_str()) {
+                assert!(!comp.composable, "'{}' should NOT be composable", m.name);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn idempotent_skills_have_no_side_effects() {
+        let provider = BundledSkillProvider::with_defaults();
+        let manifests = provider.discover().await.unwrap();
+
+        for m in &manifests {
+            let loaded = provider.load(&m.name).await.unwrap();
+            let comp = loaded.manifest.composition.as_ref().unwrap();
+            if comp.idempotent {
+                assert!(
+                    comp.side_effects.is_empty(),
+                    "idempotent skill '{}' should not declare side_effects: {:?}",
+                    m.name,
+                    comp.side_effects
+                );
+            }
+        }
+    }
 }

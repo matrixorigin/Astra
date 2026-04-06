@@ -23,6 +23,12 @@ arguments:
     required: false
 tags:
   - debugging
+composition:
+  composable: true
+  idempotent: false
+  side_effects:
+    - filesystem
+  max_duration_sec: 900
 ---
 # Debug: Systematic Diagnosis
 

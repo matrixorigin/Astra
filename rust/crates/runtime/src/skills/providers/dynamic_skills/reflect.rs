@@ -18,6 +18,10 @@ category: meta
 tags:
   - meta
   - self-assessment
+composition:
+  composable: true
+  idempotent: true
+  max_duration_sec: 120
 ---
 # Reflect: Data-Driven Self-Assessment
 

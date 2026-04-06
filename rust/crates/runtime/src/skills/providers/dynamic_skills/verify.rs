@@ -16,6 +16,10 @@ category: quality
 tags:
   - testing
   - quality
+composition:
+  composable: true
+  idempotent: true
+  max_duration_sec: 1800
 ---
 # Verify: Comprehensive Code Verification
 

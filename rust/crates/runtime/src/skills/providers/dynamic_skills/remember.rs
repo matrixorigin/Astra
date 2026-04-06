@@ -21,6 +21,12 @@ category: meta
 tags:
   - memory
   - knowledge-management
+composition:
+  composable: false
+  idempotent: false
+  side_effects:
+    - database
+  max_duration_sec: 300
 ---
 # Remember: Memory Management
 

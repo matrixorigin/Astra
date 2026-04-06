@@ -22,6 +22,12 @@ arguments:
 tags:
   - meta
   - skill-creation
+composition:
+  composable: false
+  idempotent: false
+  side_effects:
+    - filesystem
+  max_duration_sec: 600
 ---
 # Skillify: Capture Workflow as Reusable Skill
 

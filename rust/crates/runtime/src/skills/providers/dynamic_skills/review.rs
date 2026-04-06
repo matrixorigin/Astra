@@ -18,6 +18,12 @@ category: code-review
 tags:
   - review
   - quality
+composition:
+  composable: true
+  idempotent: false
+  side_effects:
+    - filesystem
+  max_duration_sec: 1200
 ---
 # Review: Code Review and Cleanup
 

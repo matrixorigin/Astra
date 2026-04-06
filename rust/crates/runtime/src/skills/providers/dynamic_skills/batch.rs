@@ -24,6 +24,13 @@ arguments:
 tags:
   - parallel
   - automation
+composition:
+  composable: true
+  idempotent: false
+  side_effects:
+    - filesystem
+    - git
+  max_duration_sec: 3600
 ---
 # Batch: Parallel Work Orchestration
 
