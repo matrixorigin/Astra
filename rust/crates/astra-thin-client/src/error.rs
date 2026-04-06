@@ -24,3 +24,43 @@ pub enum ThinClientError {
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn invalid_base_url_display() {
+        let err = ThinClientError::InvalidBaseUrl("bad://url".to_string());
+        assert!(err.to_string().contains("bad://url"));
+    }
+
+    #[test]
+    fn invalid_auth_header_display() {
+        let err = ThinClientError::InvalidAuthHeader;
+        assert!(err.to_string().contains("Authorization"));
+    }
+
+    #[test]
+    fn api_error_display() {
+        let err = ThinClientError::Api {
+            status: reqwest::StatusCode::NOT_FOUND,
+            body: "not found".to_string(),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("404"));
+        assert!(msg.contains("not found"));
+    }
+
+    #[test]
+    fn sse_parse_display() {
+        let err = ThinClientError::SseParse("bad frame".to_string());
+        assert!(err.to_string().contains("bad frame"));
+    }
+
+    #[test]
+    fn invalid_sse_json_display() {
+        let err = ThinClientError::InvalidSseJson(serde_json::json!("not_object"));
+        assert!(err.to_string().contains("not_object"));
+    }
+}
