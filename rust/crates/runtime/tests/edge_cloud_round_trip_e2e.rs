@@ -211,12 +211,6 @@ async fn wait_persist() {
     tokio::time::sleep(std::time::Duration::from_millis(400)).await;
 }
 
-fn _persisted_tool_results(capture: &Capture) -> Vec<TurnToolEventPersistPlan> {
-    // We can't await inside a sync fn, so this is only called after wait_persist
-    // Use try_lock since we know no one else holds it after the stream ends
-    capture.plans.try_lock().map(|g| g.clone()).unwrap_or_default()
-}
-
 // ═══════════════════════════════════════════════════════════════════════════════
 // Test 1: Multi-tool parallel delivery — 3 tool_calls in one round
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -666,11 +660,11 @@ async fn sse_event_ordering_contract() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// Test 7: Ping events don't break the flow
+// Test 7: Single tool round-trip baseline (also verifies pings are harmless)
 // ═══════════════════════════════════════════════════════════════════════════════
 
 #[tokio::test]
-async fn ping_events_are_harmless() {
+async fn single_tool_round_trip_baseline() {
     init_env();
     let capture = Capture::default();
     let app = build_app_with_capture(capture.clone());
@@ -741,4 +735,288 @@ async fn text_only_turn_no_tools() {
     // turn_complete with has_tool_calls: false
     let completes = events_of_type(&events, "turn_complete");
     assert!(!completes.is_empty(), "should have turn_complete");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Test 9: Edge returns tool error — cloud passes error to LLM, LLM continues
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn tool_error_result_propagates_to_next_round() {
+    init_env();
+    let capture = Capture::default();
+    let app = build_app_with_capture(capture.clone());
+
+    let payload = json!({
+        "agent_id": "rt-agent",
+        "messages": [{ "role": "user", "content": "read secret.key" }],
+        "edge_tools": [tool_schema("read_file")],
+        "test_llm_rounds": [
+            { "tool_calls": [tool_call("tc-err-1", "read_file", json!({"path": "secret.key"}))] },
+            { "full_text": "The file could not be read due to a permission error." }
+        ]
+    });
+
+    let req = Request::builder()
+        .method("POST").uri("/chat/turn")
+        .header("authorization", TOKEN)
+        .header("content-type", "application/json")
+        .header("x-mo-bridge-test-secret", SECRET)
+        .body(Body::from(payload.to_string())).unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let mut stream = resp.into_body().into_data_stream();
+    let mut acc = Vec::new();
+    let mut posted = false;
+
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.expect("sse chunk");
+        acc.extend_from_slice(&chunk);
+        let s = String::from_utf8_lossy(&acc);
+
+        if !posted && s.contains("\"type\":\"tool_request\"") && s.contains("tc-err-1") {
+            // Edge returns an error result (like a real read_file permission denied)
+            let (st, _) = post_json(&app, "/tools/result", json!({
+                "request_id": "tc-err-1",
+                "status": "error",
+                "output": "Error: permission denied (os error 13). Cannot read secret.key"
+            })).await;
+            assert_eq!(st, StatusCode::OK);
+            posted = true;
+        }
+    }
+
+    let full = String::from_utf8_lossy(&acc);
+    assert!(posted, "tool_request never appeared");
+
+    // LLM should still get round 2 (with error as tool result content)
+    assert!(
+        full.contains("permission error"),
+        "round 2 should appear with LLM acknowledging the error: {full}"
+    );
+    assert!(!full.contains(MSG_TOOL_LEDGER_TIMEOUT), "should not timeout");
+
+    // Persistence: error result should be persisted
+    wait_persist().await;
+    let plans = capture.plans.lock().await;
+    let error_events: Vec<_> = plans.iter()
+        .flat_map(|p| &p.events)
+        .filter(|e| e.event_type == "tool_result" && e.content.contains("permission denied"))
+        .collect();
+    assert!(!error_events.is_empty(), "error tool_result should be persisted");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Test 10: Duplicate tool result — second POST is accepted but doesn't break flow
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn duplicate_tool_result_does_not_break_flow() {
+    init_env();
+    let capture = Capture::default();
+    let app = build_app_with_capture(capture.clone());
+
+    let payload = json!({
+        "agent_id": "rt-agent",
+        "messages": [{ "role": "user", "content": "check status" }],
+        "edge_tools": [tool_schema("read_file")],
+        "test_llm_rounds": [
+            { "tool_calls": [tool_call("tc-dup-1", "read_file", json!({"path": "status.txt"}))] },
+            { "full_text": "Status is healthy." }
+        ]
+    });
+
+    let req = Request::builder()
+        .method("POST").uri("/chat/turn")
+        .header("authorization", TOKEN)
+        .header("content-type", "application/json")
+        .header("x-mo-bridge-test-secret", SECRET)
+        .body(Body::from(payload.to_string())).unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let mut stream = resp.into_body().into_data_stream();
+    let mut acc = Vec::new();
+    let mut post_count = 0;
+
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.expect("sse chunk");
+        acc.extend_from_slice(&chunk);
+        let s = String::from_utf8_lossy(&acc);
+
+        if s.contains("\"type\":\"tool_request\"") && s.contains("tc-dup-1") && post_count < 2 {
+            // Post the result (first time: consumed by bridge; second time: goes to ledger but nobody reads it)
+            let (st, _) = post_json(&app, "/tools/result", json!({
+                "request_id": "tc-dup-1",
+                "status": "ok",
+                "output": "all systems operational"
+            })).await;
+            assert_eq!(st, StatusCode::OK);
+            post_count += 1;
+        }
+    }
+
+    let full = String::from_utf8_lossy(&acc);
+
+    // The flow should complete normally despite the duplicate
+    assert!(post_count >= 1, "should have posted at least once");
+    assert!(full.contains("Status is healthy"), "round 2 text should appear: {full}");
+    assert!(!full.contains(MSG_TOOL_LEDGER_TIMEOUT), "should not timeout");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Test 11: Mixed approval + read-only in same round — approval sequential,
+//          read-only concurrent, both complete correctly
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn mixed_approval_and_readonly_in_same_round() {
+    init_env();
+    let capture = Capture::default();
+    let app = build_app_with_capture(capture.clone());
+
+    // write_file needs approval (sequential), read_file + grep don't (concurrent)
+    let payload = json!({
+        "agent_id": "rt-agent",
+        "messages": [{ "role": "user", "content": "update config and verify" }],
+        "edge_tools": [tool_schema("write_file"), tool_schema("read_file"), tool_schema("grep")],
+        "test_llm_rounds": [
+            {
+                "tool_calls": [
+                    tool_call("tc-mix-wf", "write_file", json!({"path": "config.yaml", "content": "key: value"})),
+                    tool_call("tc-mix-rf", "read_file", json!({"path": "config.yaml"})),
+                    tool_call("tc-mix-gr", "grep", json!({"path": ".", "command": "key"})),
+                ]
+            },
+            { "full_text": "Config updated and verified." }
+        ]
+    });
+
+    let req = Request::builder()
+        .method("POST").uri("/chat/turn")
+        .header("authorization", TOKEN)
+        .header("content-type", "application/json")
+        .header("x-mo-bridge-test-secret", SECRET)
+        .body(Body::from(payload.to_string())).unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let mut stream = resp.into_body().into_data_stream();
+    let mut acc = Vec::new();
+    let mut approved: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut posted: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.expect("sse chunk");
+        acc.extend_from_slice(&chunk);
+        let s = String::from_utf8_lossy(&acc);
+
+        // Approve write_file
+        if !approved.contains("tc-mix-wf")
+            && s.contains("\"type\":\"approval_required\"")
+            && s.contains("tc-mix-wf")
+        {
+            let (st, _) = post_json(&app, "/approval/respond", json!({
+                "request_id": "tc-mix-wf", "decision": "allow"
+            })).await;
+            assert_eq!(st, StatusCode::OK);
+            approved.insert("tc-mix-wf".into());
+        }
+
+        // Post results for all tools
+        for (id, output) in [
+            ("tc-mix-wf", "{\"success\":true,\"bytes_written\":10}"),
+            ("tc-mix-rf", "key: value"),
+            ("tc-mix-gr", "config.yaml:1:key: value"),
+        ] {
+            if !posted.contains(id)
+                && s.contains("\"type\":\"tool_request\"")
+                && s.contains(id)
+            {
+                let (st, _) = post_json(&app, "/tools/result", json!({
+                    "request_id": id, "status": "ok", "output": output
+                })).await;
+                assert_eq!(st, StatusCode::OK);
+                posted.insert(id.into());
+            }
+        }
+    }
+
+    let full = String::from_utf8_lossy(&acc);
+
+    // All 3 tools completed
+    assert_eq!(posted.len(), 3, "all 3 tools should complete: {posted:?}");
+
+    // Verify ordering: approval_required for write_file comes before its tool_request
+    let events = parse_sse_events(&full);
+    let appr_idx = events.iter().position(|e|
+        e["type"] == "approval_required" && e.to_string().contains("tc-mix-wf")
+    );
+    let wf_req_idx = events.iter().position(|e|
+        e["type"] == "tool_request" && e.to_string().contains("tc-mix-wf")
+    );
+    if let (Some(a), Some(r)) = (appr_idx, wf_req_idx) {
+        assert!(a < r, "approval_required must precede tool_request for write_file");
+    }
+
+    // read_file and grep should NOT have approval_required events
+    let rf_approvals: Vec<_> = events.iter()
+        .filter(|e| e["type"] == "approval_required" && e.to_string().contains("tc-mix-rf"))
+        .collect();
+    assert!(rf_approvals.is_empty(), "read_file should not need approval");
+
+    assert!(full.contains("Config updated and verified"), "final text missing: {full}");
+    assert!(!full.contains(MSG_TOOL_LEDGER_TIMEOUT), "unexpected timeout");
+
+    // Persistence
+    wait_persist().await;
+    let plans = capture.plans.lock().await;
+    let result_count = plans.iter()
+        .flat_map(|p| &p.events)
+        .filter(|e| e.event_type == "tool_result")
+        .count();
+    assert!(result_count >= 3, "expected ≥3 persisted tool_results, got {result_count}");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Test 12: turn_complete.has_tool_calls reflects actual tool presence
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn turn_complete_has_tool_calls_field_accuracy() {
+    init_env();
+    let app = build_app_with_capture(Capture::default());
+
+    // Case A: turn WITH tool calls
+    let payload_tools = json!({
+        "agent_id": "rt-agent",
+        "messages": [{ "role": "user", "content": "read x" }],
+        "edge_tools": [tool_schema("read_file")],
+        "test_llm_rounds": [
+            { "tool_calls": [tool_call("tc-htc-1", "read_file", json!({"path": "x"}))] },
+            { "full_text": "done" }
+        ]
+    });
+    let results_a = HashMap::from([("tc-htc-1".to_string(), json!("content"))]);
+    let full_a = consume_sse_posting_results(&app, payload_tools, results_a).await;
+    let events_a = parse_sse_events(&full_a);
+    let complete_a = events_a.iter().find(|e| e["type"] == "turn_complete").expect("turn_complete");
+    assert_eq!(complete_a["has_tool_calls"], true, "turn with tools should have has_tool_calls:true");
+
+    // Case B: turn WITHOUT tool calls
+    let payload_text = json!({
+        "agent_id": "rt-agent",
+        "messages": [{ "role": "user", "content": "hi" }],
+        "edge_tools": [],
+        "test_llm_rounds": [{ "full_text": "hello" }]
+    });
+    let (_, raw_b) = chat_turn(&app, payload_text).await;
+    let full_b = String::from_utf8_lossy(&raw_b);
+    let events_b = parse_sse_events(&full_b);
+    let complete_b = events_b.iter().find(|e| e["type"] == "turn_complete").expect("turn_complete");
+    // Note: has_tool_calls may be true if the bridge always sets it based on
+    // all_round_tool_calls (which includes tools from prior rounds in the same
+    // /chat/turn call). For a pure text turn, it should be false.
+    assert_eq!(complete_b["has_tool_calls"], false, "text-only turn should have has_tool_calls:false, got: {complete_b}");
 }
