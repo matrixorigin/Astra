@@ -73,6 +73,7 @@ pub(super) async fn execute_cli_command(
                 approval_request_tx: None,
                 mcp_manager: None,
                 skill_quality_tracker: &mut skill_qt,
+                discovered_skills: None,
             })
             .await
             {
@@ -107,6 +108,7 @@ pub(super) async fn execute_cli_command(
                         approval_request_tx: None,
                         mcp_manager: None,
                         skill_quality_tracker: &mut skill_qt,
+                discovered_skills: None,
                     })
                     .await
                     .map_err(|f| f.error)?
@@ -330,6 +332,7 @@ pub(super) async fn execute_cli_command(
                 approval_request_tx: None,
                 mcp_manager: None,
                 skill_quality_tracker: &mut skill_qt,
+                discovered_skills: None,
             })
             .await
             {
@@ -364,6 +367,7 @@ pub(super) async fn execute_cli_command(
                         approval_request_tx: None,
                         mcp_manager: None,
                         skill_quality_tracker: &mut skill_qt,
+                discovered_skills: None,
                     })
                     .await
                     .map_err(|f| f.error)?

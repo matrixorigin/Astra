@@ -150,6 +150,7 @@ pub(super) async fn handle_state_command(
                     approval_request_tx: None,
                     mcp_manager: Some(state.mcp_manager.clone()),
                 skill_quality_tracker: &mut state.skill_quality_tracker,
+                discovered_skills: None,
                 }) => r,
                 _ = tokio::signal::ctrl_c() => {
                     if let Some(ref t) = _cancel_token_guard { t.cancel(); }
@@ -237,6 +238,7 @@ pub(super) async fn handle_state_command(
                         approval_request_tx: None,
                         mcp_manager: Some(state.mcp_manager.clone()),
                         skill_quality_tracker: &mut state.skill_quality_tracker,
+                        discovered_skills: None,
                     })
                     .await;
 
@@ -306,6 +308,7 @@ pub(super) async fn handle_state_command(
                                 approval_request_tx: None,
                                 mcp_manager: Some(state.mcp_manager.clone()),
                                 skill_quality_tracker: &mut state.skill_quality_tracker,
+                                discovered_skills: None,
                             })
                             .await;
                             if let Ok(sr2) = synth_result {

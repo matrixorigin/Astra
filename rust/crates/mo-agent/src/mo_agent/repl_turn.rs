@@ -348,6 +348,7 @@ async fn maybe_auto_compact(
         approval_request_tx: None,
         mcp_manager: Some(state.mcp_manager.clone()),
         skill_quality_tracker: &mut state.skill_quality_tracker,
+        discovered_skills: None,
     })
     .await;
 
@@ -482,6 +483,7 @@ async fn run_chat_turn(
             approval_request_tx: None,
             mcp_manager: Some(state.mcp_manager.clone()),
                 skill_quality_tracker: &mut state.skill_quality_tracker,
+                discovered_skills: Some(&mut state.discovered_skills),
         }) => TurnAttempt::Completed(Box::new(result)),
         _ = tokio::signal::ctrl_c() => {
             // Trigger cancellation to interrupt any in-flight SSE streaming.

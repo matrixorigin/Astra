@@ -886,6 +886,7 @@ pub(super) async fn handle_info_command(
                 approval_request_tx: None,
                 mcp_manager: Some(state.mcp_manager.clone()),
                 skill_quality_tracker: &mut state.skill_quality_tracker,
+                discovered_skills: None,
             })
             .await
             .map_err(|f| f.error)?;

@@ -987,6 +987,7 @@ async fn plan_executor_task(
                     approval_request_tx: Some(approval_tx),
                     mcp_manager: None,
                     skill_quality_tracker: &mut skill_qt,
+                    discovered_skills: None,
                 })
                 .await;
 
