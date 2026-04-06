@@ -3645,50 +3645,88 @@ mod tests {
         assert!(state.invoked_skills.is_empty());
     }
 
-    #[test]
-    fn invoked_skills_dedup_returns_stub_on_second_invocation() {
-        use crate::turn::skill_tool::InvokedSkill;
+    #[tokio::test]
+    async fn skill_dedup_returns_stub_on_second_invocation() {
+        // Turn 1: skill call → full instructions returned + recorded
+        // Turn 2: same skill call → stub returned (dedup)
+        // Turn 3: text completion
+        let resolver = StubSkillResolver::new(); // has "test-skill"
+        let turns = vec![
+            // Turn 1: LLM calls skill
+            skill_tool_call_result("call_1", r#"{"skill_name": "test-skill"}"#, 100, 50),
+            // Turn 2: LLM calls same skill again
+            skill_tool_call_result("call_2", r#"{"skill_name": "test-skill"}"#, 100, 50),
+            // Turn 3: LLM finishes
+            text_result("Done.", 80, 20, None),
+        ];
 
+        let mut host = MockHost::new(turns);
         let mut state = make_state();
-        state.invoked_skills.insert(
-            "review-changes".into(),
-            InvokedSkill {
-                name: "review-changes".into(),
-                content: "Full skill instructions here...".into(),
-                invoked_at_turn: 1,
-            },
-        );
+        state.messages.push(json!({"role": "user", "content": "use skill twice"}));
+        state.skill_resolver = Some(Arc::new(resolver));
 
-        // Simulate dedup check (same logic as agentic loop)
-        let skill_name = "review-changes";
-        let prev = state.invoked_skills.get(skill_name);
-        assert!(prev.is_some());
-        let stub = format!(
-            "Skill '{}' was already loaded (turn {}). \
-             Follow those instructions directly — do not re-invoke.",
-            skill_name,
-            prev.unwrap().invoked_at_turn
-        );
-        assert!(stub.contains("already loaded"));
-        assert!(stub.contains("turn 1"));
+        let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
+        assert!(outcome.is_ok());
+
+        // First call: full instructions
+        let msg1: Vec<&Value> = state.messages.iter()
+            .filter(|m| m.get("tool_call_id").and_then(Value::as_str) == Some("call_1"))
+            .collect();
+        assert_eq!(msg1.len(), 1);
+        assert!(msg1[0]["content"].as_str().unwrap().contains("# Skill: test-skill"));
+        assert!(msg1[0]["content"].as_str().unwrap().contains("Follow these instructions carefully."));
+
+        // Second call: stub (dedup)
+        let msg2: Vec<&Value> = state.messages.iter()
+            .filter(|m| m.get("tool_call_id").and_then(Value::as_str) == Some("call_2"))
+            .collect();
+        assert_eq!(msg2.len(), 1);
+        let stub = msg2[0]["content"].as_str().unwrap();
+        assert!(stub.contains("already loaded"), "expected dedup stub, got: {stub}");
+        assert!(!stub.contains("# Skill:"), "stub should NOT contain full instructions");
+
+        // Skill should be tracked
+        assert!(state.invoked_skills.contains_key("test-skill"));
+        assert_eq!(state.invoked_skills["test-skill"].invoked_at_turn, 1);
     }
 
-    #[test]
-    fn invoked_skills_allows_different_skills() {
-        use crate::turn::skill_tool::InvokedSkill;
+    #[tokio::test]
+    async fn skill_dedup_allows_different_skills() {
+        let mut resolver = StubSkillResolver::new(); // has "test-skill"
+        resolver.skills.push((
+            "other-skill".into(),
+            "Another skill".into(),
+            "Other instructions.".into(),
+            None,
+            vec![],
+        ));
+        let turns = vec![
+            skill_tool_call_result("call_1", r#"{"skill_name": "test-skill"}"#, 100, 50),
+            skill_tool_call_result("call_2", r#"{"skill_name": "other-skill"}"#, 100, 50),
+            text_result("Done.", 80, 20, None),
+        ];
 
+        let mut host = MockHost::new(turns);
         let mut state = make_state();
-        state.invoked_skills.insert(
-            "review-changes".into(),
-            InvokedSkill {
-                name: "review-changes".into(),
-                content: "review instructions".into(),
-                invoked_at_turn: 1,
-            },
-        );
+        state.messages.push(json!({"role": "user", "content": "use both skills"}));
+        state.skill_resolver = Some(Arc::new(resolver));
 
-        // Different skill should not be deduped
-        assert!(state.invoked_skills.get("debug").is_none());
+        let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
+        assert!(outcome.is_ok());
+
+        // Both should get full instructions (different skills, no dedup)
+        let msg1: Vec<&Value> = state.messages.iter()
+            .filter(|m| m.get("tool_call_id").and_then(Value::as_str) == Some("call_1"))
+            .collect();
+        assert!(msg1[0]["content"].as_str().unwrap().contains("# Skill: test-skill"));
+
+        let msg2: Vec<&Value> = state.messages.iter()
+            .filter(|m| m.get("tool_call_id").and_then(Value::as_str) == Some("call_2"))
+            .collect();
+        assert!(msg2[0]["content"].as_str().unwrap().contains("# Skill: other-skill"));
+
+        // Both tracked
+        assert_eq!(state.invoked_skills.len(), 2);
     }
 
     #[test]
