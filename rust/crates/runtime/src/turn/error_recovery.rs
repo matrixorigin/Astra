@@ -66,6 +66,13 @@ pub fn classify_error(error_str: &str) -> ErrorCategory {
         return ErrorCategory::ResourceLimit;
     }
 
+    // Edge workspace policy: must read on-disk file (fully when overwriting)
+    // before write/patch. Check BEFORE Transient because the actionable error
+    // messages contain "retry" which would otherwise match the Transient rule.
+    if is_workspace_read_before_write_error(&lower) {
+        return ErrorCategory::InvalidArgs;
+    }
+
     // Transient: network, timeout, rate limit, server errors
     if lower.contains("timeout")
         || lower.contains("timed out")
@@ -145,11 +152,6 @@ pub fn classify_error(error_str: &str) -> ErrorCategory {
         || lower.contains("type mismatch")
         || lower.contains("malformed")
     {
-        return ErrorCategory::InvalidArgs;
-    }
-
-    // Edge workspace policy: must read on-disk file (fully when overwriting) before write/patch.
-    if is_workspace_read_before_write_error(&lower) {
         return ErrorCategory::InvalidArgs;
     }
 
@@ -319,6 +321,9 @@ pub fn build_recovery_message(
         )
         && is_workspace_read_before_write_error(&error_lower)
     {
+        // The check_staleness error already contains the actionable "→ Action required"
+        // line with the concrete file path. Avoid duplicating the guidance — just add
+        // the workspace-safety framing and let the original error speak for itself.
         msg = format!(
             "⚠ {} was blocked by workspace safety: the path must be read in this session before you edit it. \
              For existing files, call read_file on that exact path first (use a full read before write_file overwrite); \
@@ -549,6 +554,36 @@ mod tests {
         assert_eq!(
             classify_error(
                 "File has been modified since last read (by user or linter). Read it again before editing."
+            ),
+            ErrorCategory::InvalidArgs
+        );
+    }
+
+    /// The new actionable error messages (with "→ Action required" and concrete
+    /// file paths) must still be classified as InvalidArgs so the recovery
+    /// pipeline handles them correctly.
+    #[test]
+    fn classify_actionable_read_before_write_errors() {
+        assert_eq!(
+            classify_error(
+                "File exists but has not been read yet. Read it first before writing/editing.\n\
+                 → Action required: call read_file(\"src/main.rs\") first, then retry."
+            ),
+            ErrorCategory::InvalidArgs
+        );
+        assert_eq!(
+            classify_error(
+                "File has been modified since last read (by user or linter). \
+                 Read it again before editing.\n\
+                 → Action required: call read_file(\"config.toml\") first, then retry."
+            ),
+            ErrorCategory::InvalidArgs
+        );
+        assert_eq!(
+            classify_error(
+                "Pre-write staleness check failed: File has been modified since last read \
+                 (by user or linter). Read it again before editing.\n\
+                 → Action required: call read_file(\"src/lib.rs\") first, then retry."
             ),
             ErrorCategory::InvalidArgs
         );
