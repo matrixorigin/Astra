@@ -3362,8 +3362,8 @@ mod tests {
         ).unwrap();
 
         // No Global block should contain any tool name
-        for i in 0..=global_end {
-            let text = blocks[i]["text"].as_str().unwrap();
+        for (i, block) in blocks.iter().enumerate().take(global_end + 1) {
+            let text = block["text"].as_str().unwrap();
             for tool in &tools {
                 // "bash" appears in generic text like "bash commands", skip it
                 if *tool == "bash" { continue; }

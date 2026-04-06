@@ -839,7 +839,7 @@ mod tests {
         ];
         let mut stream = stream::iter(chunks);
         let mut host = RecordingSseStreamHost::new();
-        let (result, abort) = consume_sse_stream(
+        let (_result, abort) = consume_sse_stream(
             &mut stream,
             &mut host,
             std::time::Duration::from_millis(STREAM_IDLE_TIMEOUT_MS),

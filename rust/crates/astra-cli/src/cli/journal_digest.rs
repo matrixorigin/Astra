@@ -394,8 +394,8 @@ pub fn print_text(d: &JournalDigest) {
     if !d.turns.is_empty() {
         println!();
         println!(
-            "{:>4} {:>5} {:>7} {:>7} {:>8}  {}",
-            "seq", "id", "tin", "tout", "ms", "user_preview"
+            "{:>4} {:>5} {:>7} {:>7} {:>8}  user_preview",
+            "seq", "id", "tin", "tout", "ms"
         );
         for t in &d.turns {
             let tin = t.tokens_in.unwrap_or(0);

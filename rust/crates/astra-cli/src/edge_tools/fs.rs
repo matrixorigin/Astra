@@ -103,6 +103,21 @@ impl ToolExecutor {
             self.project_root.join(p)
         };
 
+        // Symlink loop / depth guard: canonicalize to detect circular symlinks.
+        // Skip for non-existent paths (let the caller produce a clear NotFound).
+        if resolved.exists() {
+            match resolved.canonicalize() {
+                Ok(_) => {} // reachable — no loop
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {} // race — let caller handle
+                Err(e) => {
+                    return Err(format!(
+                        "Error: cannot resolve '{}' (possible symlink loop or broken link): {e}",
+                        path
+                    ));
+                }
+            }
+        }
+
         if let Some(ref policy) = self.sandbox_policy
             && !matches!(policy.mode, SandboxMode::Permissive)
         {
@@ -276,7 +291,7 @@ impl ToolExecutor {
                     let remaining = super::AGGREGATE_OUTPUT_BUDGET.saturating_sub(agg);
                     if size > remaining {
                         // Auto-downgrade: return outline instead of full content
-                        let content_for_outline = match fs::read_to_string(&path) {
+                        let content_for_outline = match read_to_string_lossy(&path) {
                             Ok(c) => c,
                             Err(e) => return format!("Error: {e}"),
                         };
@@ -328,7 +343,7 @@ impl ToolExecutor {
             }
         }
 
-        let content = match fs::read_to_string(&path) {
+        let content = match read_to_string_lossy(&path) {
             Ok(c) => c,
             Err(e) => {
                 let msg = format!("Error: {e}");
@@ -346,6 +361,11 @@ impl ToolExecutor {
                 }
                 if e.kind() == std::io::ErrorKind::IsADirectory {
                     return format!("{msg}. Use list_dir instead for directories.");
+                }
+                if e.kind() == std::io::ErrorKind::PermissionDenied {
+                    return format!(
+                        "{msg}. Check file permissions or use bash with `sudo cat` if appropriate."
+                    );
                 }
                 return msg;
             }
@@ -1625,6 +1645,19 @@ fn normalize_ws(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+// ─── UTF-8 lossy file reading ───────────────────────────────────────────────
+
+/// Read a file to a String, falling back to lossy UTF-8 conversion for
+/// non-UTF-8 files (e.g. Latin-1, UTF-16 with BOM stripped by the OS).
+/// Returns a standard `io::Error` for I/O failures.
+fn read_to_string_lossy(path: &Path) -> std::io::Result<String> {
+    let bytes = fs::read(path)?;
+    match String::from_utf8(bytes) {
+        Ok(s) => Ok(s),
+        Err(e) => Ok(String::from_utf8_lossy(e.as_bytes()).into_owned()),
+    }
+}
+
 // ─── Line numbers ───────────────────────────────────────────────────────────
 
 /// Add line numbers to content in compact tab-separated format.
@@ -2477,7 +2510,7 @@ type Handler interface {
         });
         let first = executor.read_file(&args);
         assert!(
-            first.contains("row 1") && first.contains("Same read_file request") == false,
+            first.contains("row 1") && !first.contains("Same read_file request"),
             "first read should return content: {first}"
         );
 

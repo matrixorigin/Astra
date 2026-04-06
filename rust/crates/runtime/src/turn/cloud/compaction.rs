@@ -1312,6 +1312,7 @@ mod tests {
     /// user corrects it, LLM fixes it. After compaction, the fix
     /// (not the error) must be the surviving version.
     #[test]
+    #[allow(clippy::vec_init_then_push)]
     fn scenario_error_correction_chain_preserves_fix() {
         let mut msgs = Vec::new();
         // Turn 0: initial request
