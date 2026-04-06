@@ -765,4 +765,133 @@ mod tests {
                 .contains("Cancelled")
         );
     }
+
+    // ── Edge SSE resilience: transport error, malformed frames, pings ────────
+
+    #[tokio::test]
+    async fn transport_error_aborts_cleanly() {
+        // Stream yields one good chunk then an error.
+        let chunks: Vec<Result<Vec<u8>, String>> = vec![
+            Ok(sse_event("text_delta", ",\"content\":\"partial\"")
+                .into_bytes()),
+            Err("connection reset by peer".to_string()),
+        ];
+        let mut stream = stream::iter(chunks);
+        let mut host = RecordingSseStreamHost::new();
+        let (result, abort) = consume_sse_stream(
+            &mut stream,
+            &mut host,
+            std::time::Duration::from_millis(STREAM_IDLE_TIMEOUT_MS),
+        )
+        .await;
+
+        assert_eq!(abort, Some(SseAbortReason::TransportError));
+        // Unlike idle timeout, transport error does NOT tombstone — partial
+        // state is preserved so the caller can decide what to do.
+        // (The consumer breaks out of the loop immediately.)
+    }
+
+    #[tokio::test]
+    async fn malformed_sse_frame_skipped_gracefully() {
+        // Mix of garbage and valid events — valid events should still be captured.
+        let raw = format!(
+            "garbage line without data prefix\n\n{}not-json-data\n\n{}",
+            sse_event("text_delta", ",\"content\":\"good\""),
+            sse_event("text_delta", ",\"content\":\" stuff\""),
+        );
+        let chunks = chunks_from_sse(&raw);
+        let mut stream = stream::iter(chunks);
+        let mut host = NoopSseStreamHost;
+        let (result, abort) = consume_sse_stream(
+            &mut stream,
+            &mut host,
+            std::time::Duration::from_millis(STREAM_IDLE_TIMEOUT_MS),
+        )
+        .await;
+
+        assert!(abort.is_none());
+        assert!(
+            result.accum.full_text.contains("good"),
+            "valid events should be captured despite garbage: {}",
+            result.accum.full_text
+        );
+    }
+
+    #[tokio::test]
+    async fn ping_events_interleaved_with_content() {
+        let events = format!(
+            "{}{}{}{}{}",
+            sse_event("session_info", ",\"session_id\":\"s1\""),
+            sse_event("ping", ",\"ts\":1234567890"),
+            sse_event("text_delta", ",\"content\":\"hello\""),
+            sse_event("ping", ",\"ts\":1234567891"),
+            sse_event("text_delta", ",\"content\":\" world\""),
+        );
+        let chunks = chunks_from_sse(&events);
+        let mut stream = stream::iter(chunks);
+        let mut host = NoopSseStreamHost;
+        let (result, abort) = consume_sse_stream(
+            &mut stream,
+            &mut host,
+            std::time::Duration::from_millis(STREAM_IDLE_TIMEOUT_MS),
+        )
+        .await;
+
+        assert!(abort.is_none());
+        assert_eq!(result.accum.full_text, "hello world");
+        assert_eq!(result.accum.session_id.as_deref(), Some("s1"));
+    }
+
+    #[tokio::test]
+    async fn multiple_tool_requests_executed_sequentially() {
+        let events = format!(
+            "{}{}",
+            sse_event("tool_request", ",\"request_id\":\"t1\",\"tool\":\"read_file\",\"args\":{\"path\":\"a.rs\"}"),
+            sse_event("tool_request", ",\"request_id\":\"t2\",\"tool\":\"grep\",\"args\":{\"pattern\":\"TODO\"}"),
+        );
+        let chunks = chunks_from_sse(&events);
+        let mut stream = stream::iter(chunks);
+        let mut host = RecordingSseStreamHost::new()
+            .with_tool_output("read_file", "fn main() {}")
+            .with_tool_output("grep", "line 10: TODO");
+        let (result, abort) = consume_sse_stream(
+            &mut stream,
+            &mut host,
+            std::time::Duration::from_millis(STREAM_IDLE_TIMEOUT_MS),
+        )
+        .await;
+
+        assert!(abort.is_none());
+        assert_eq!(result.tool_results.len(), 2);
+        assert_eq!(result.tool_results[0].request_id, "t1");
+        assert_eq!(result.tool_results[0].output, "fn main() {}");
+        assert_eq!(result.tool_results[1].request_id, "t2");
+        assert_eq!(result.tool_results[1].output, "line 10: TODO");
+    }
+
+    #[tokio::test]
+    async fn tool_request_then_text_delta_in_same_stream() {
+        // Realistic: tool_request in round 1, then text_delta in round 2
+        // (all within the same SSE stream from a single /chat/turn call)
+        let events = format!(
+            "{}{}{}",
+            sse_event("tool_request", ",\"request_id\":\"t1\",\"tool\":\"read_file\",\"args\":{\"path\":\"x\"}"),
+            sse_event("text_delta", ",\"content\":\"Based on the file, \""),
+            sse_event("text_delta", ",\"content\":\"here is my analysis.\""),
+        );
+        let chunks = chunks_from_sse(&events);
+        let mut stream = stream::iter(chunks);
+        let mut host = RecordingSseStreamHost::new()
+            .with_tool_output("read_file", "file content");
+        let (result, abort) = consume_sse_stream(
+            &mut stream,
+            &mut host,
+            std::time::Duration::from_millis(STREAM_IDLE_TIMEOUT_MS),
+        )
+        .await;
+
+        assert!(abort.is_none());
+        assert_eq!(result.tool_results.len(), 1);
+        assert_eq!(result.accum.full_text, "Based on the file, here is my analysis.");
+    }
 }
