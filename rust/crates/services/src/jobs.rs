@@ -225,3 +225,209 @@ pub struct JobWebhookRequest {
     pub result: Option<serde_json::Value>,
     pub error: Option<String>,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Helper to unwrap Result with non-Debug error type.
+    fn unwrap_ok<T>(r: Result<T, (StatusCode, Json<ErrorResponse>)>) -> T {
+        match r {
+            Ok(v) => v,
+            Err((status, _)) => panic!("expected Ok, got error with status {}", status),
+        }
+    }
+
+    fn assert_err_status(r: Result<impl std::fmt::Debug, (StatusCode, Json<ErrorResponse>)>, expected: StatusCode) {
+        match r {
+            Ok(v) => panic!("expected error {}, got Ok({:?})", expected, v),
+            Err((status, _)) => assert_eq!(status, expected),
+        }
+    }
+
+    // ── InMemoryJobService basic flow ──
+
+    #[tokio::test]
+    async fn submit_and_get_job() {
+        let svc = InMemoryJobService::new();
+        let req = JobSubmitRequestData {
+            job_type: "train".into(),
+            inputs: serde_json::json!({"epochs": 10}),
+            gpu_required: true,
+            timeout_seconds: 1800,
+            conda_env: Some("ml".into()),
+        };
+        let job = unwrap_ok(svc.submit_job("u1".into(), req).await);
+        assert_eq!(job.status, "pending");
+        assert_eq!(job.progress, 0.0);
+
+        let fetched = unwrap_ok(svc.get_job(job.job_id.clone()).await);
+        assert_eq!(fetched.job_id, job.job_id);
+    }
+
+    #[tokio::test]
+    async fn get_nonexistent_job_returns_not_found() {
+        let svc = InMemoryJobService::new();
+        assert_err_status(svc.get_job("nonexistent".into()).await, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn cancel_pending_job() {
+        let svc = InMemoryJobService::new();
+        let req = JobSubmitRequestData {
+            job_type: "train".into(),
+            inputs: serde_json::json!({}),
+            gpu_required: false,
+            timeout_seconds: 3600,
+            conda_env: None,
+        };
+        let job = unwrap_ok(svc.submit_job("u1".into(), req).await);
+        let cancelled = unwrap_ok(svc.cancel_job(job.job_id).await);
+        assert_eq!(cancelled.status, "cancelled");
+    }
+
+    #[tokio::test]
+    async fn cancel_nonexistent_job_returns_not_found() {
+        let svc = InMemoryJobService::new();
+        assert_err_status(svc.cancel_job("nonexistent".into()).await, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn cancel_already_terminal_job_returns_conflict() {
+        let svc = InMemoryJobService::new();
+        let req = JobSubmitRequestData {
+            job_type: "train".into(),
+            inputs: serde_json::json!({}),
+            gpu_required: false,
+            timeout_seconds: 3600,
+            conda_env: None,
+        };
+        let job = unwrap_ok(svc.submit_job("u1".into(), req).await);
+        unwrap_ok(svc.cancel_job(job.job_id.clone()).await);
+        assert_err_status(svc.cancel_job(job.job_id).await, StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn webhook_updates_job_state() {
+        let svc = InMemoryJobService::new();
+        let req = JobSubmitRequestData {
+            job_type: "train".into(),
+            inputs: serde_json::json!({}),
+            gpu_required: false,
+            timeout_seconds: 3600,
+            conda_env: None,
+        };
+        let job = unwrap_ok(svc.submit_job("u1".into(), req).await);
+
+        let result = unwrap_ok(svc.job_webhook(JobWebhookData {
+            job_id: job.job_id.clone(),
+            status: "completed".into(),
+            result: Some(serde_json::json!({"accuracy": 0.95})),
+            error: None,
+        }).await);
+        assert_eq!(result["resumed"], true);
+
+        let updated = unwrap_ok(svc.get_job(job.job_id).await);
+        assert_eq!(updated.status, "completed");
+        assert!(updated.result.is_some());
+    }
+
+    #[tokio::test]
+    async fn webhook_for_nonexistent_job_still_succeeds() {
+        let svc = InMemoryJobService::new();
+        let result = unwrap_ok(svc.job_webhook(JobWebhookData {
+            job_id: "nonexistent".into(),
+            status: "completed".into(),
+            result: None,
+            error: None,
+        }).await);
+        assert_eq!(result["resumed"], true);
+    }
+
+    // ── UnconfiguredJobService ──
+
+    #[tokio::test]
+    async fn unconfigured_service_returns_errors() {
+        let svc = UnconfiguredJobService;
+        let req = JobSubmitRequestData {
+            job_type: "train".into(),
+            inputs: serde_json::json!({}),
+            gpu_required: false,
+            timeout_seconds: 3600,
+            conda_env: None,
+        };
+        assert!(svc.submit_job("u1".into(), req).await.is_err());
+        assert!(svc.get_job("j1".into()).await.is_err());
+        assert!(svc.cancel_job("j1".into()).await.is_err());
+        assert!(svc.job_webhook(JobWebhookData {
+            job_id: "j1".into(),
+            status: "done".into(),
+            result: None,
+            error: None,
+        }).await.is_err());
+    }
+
+    // ── HTTP types ──
+
+    #[test]
+    fn job_submit_request_defaults() {
+        let json = r#"{"job_type":"train"}"#;
+        let r: JobSubmitRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(r.job_type, "train");
+        assert_eq!(r.gpu_required, false);
+        assert_eq!(r.timeout_seconds, 3600);
+        assert!(r.conda_env.is_none());
+        assert_eq!(r.inputs, serde_json::Value::Null);
+    }
+
+    #[test]
+    fn job_submit_request_full() {
+        let json = r#"{"job_type":"train","inputs":{"lr":0.01},"gpu_required":true,"timeout_seconds":7200,"conda_env":"ml"}"#;
+        let r: JobSubmitRequest = serde_json::from_str(json).unwrap();
+        assert!(r.gpu_required);
+        assert_eq!(r.timeout_seconds, 7200);
+        assert_eq!(r.conda_env.as_deref(), Some("ml"));
+    }
+
+    #[test]
+    fn job_response_skip_serializing_none() {
+        let r = JobResponse {
+            job_id: "j1".into(),
+            status: "pending".into(),
+            result: None,
+            error: None,
+            progress: 0.0,
+        };
+        let json = serde_json::to_string(&r).unwrap();
+        assert!(!json.contains("result"));
+        assert!(!json.contains("error"));
+    }
+
+    #[test]
+    fn job_response_from_record() {
+        let rec = JobRecord {
+            job_id: "j1".into(),
+            status: "completed".into(),
+            result: Some(serde_json::json!({"ok": true})),
+            error: None,
+            progress: 1.0,
+        };
+        let resp: JobResponse = rec.into();
+        assert_eq!(resp.job_id, "j1");
+        assert_eq!(resp.progress, 1.0);
+        assert!(resp.result.is_some());
+    }
+
+    #[test]
+    fn job_webhook_request_deserialize() {
+        let json = r#"{"job_id":"j1","status":"failed","result":null,"error":"OOM"}"#;
+        let r: JobWebhookRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(r.job_id, "j1");
+        assert_eq!(r.error.as_deref(), Some("OOM"));
+    }
+
+    #[test]
+    fn default_timeout_value() {
+        assert_eq!(default_timeout(), 3600);
+    }
+}

@@ -860,4 +860,118 @@ mod tests {
             "total 529 errors accumulated"
         );
     }
+
+    // ── Additional edge-case tests ──
+
+    #[test]
+    fn parse_retry_after_empty_string() {
+        assert_eq!(parse_retry_after_ms(""), None);
+    }
+
+    #[test]
+    fn parse_retry_after_whitespace() {
+        assert_eq!(parse_retry_after_ms("  5  "), Some(5000));
+    }
+
+    #[test]
+    fn parse_retry_after_negative() {
+        // Negative numbers can't parse as u64
+        assert_eq!(parse_retry_after_ms("-1"), None);
+    }
+
+    #[test]
+    fn parse_retry_after_zero() {
+        assert_eq!(parse_retry_after_ms("0"), Some(0));
+    }
+
+    #[test]
+    fn parse_retry_after_non_numeric() {
+        assert_eq!(parse_retry_after_ms("abc"), None);
+        assert_eq!(parse_retry_after_ms("1.5"), None);
+    }
+
+    #[test]
+    fn is_rate_limit_status_edge_cases() {
+        assert!(is_rate_limit_status(429));
+        assert!(!is_rate_limit_status(430));
+        assert!(!is_rate_limit_status(503));
+        assert!(!is_rate_limit_status(0));
+    }
+
+    #[test]
+    fn is_overload_status_edge_cases() {
+        assert!(is_overload_status(529));
+        assert!(is_overload_status(503));
+        assert!(!is_overload_status(500));
+        assert!(!is_overload_status(429));
+        assert!(!is_overload_status(0));
+    }
+
+    #[test]
+    fn per_model_cooldown_isolated() {
+        let pmc = PerModelCooldown::new();
+        // Record errors for model A
+        pmc.with("model-a", |rl| {
+            rl.record_429(None, false);
+            rl.record_429(None, false);
+            rl.record_429(None, false);
+        });
+        // Model B should still be active
+        let action = pmc.with("model-b", |rl| rl.check_request(false));
+        assert_eq!(action, RateLimitAction::Proceed);
+    }
+
+    #[test]
+    fn per_model_cooldown_creates_on_demand() {
+        let pmc = PerModelCooldown::new();
+        let action = pmc.with("new-model", |rl| rl.check_request(false));
+        assert_eq!(action, RateLimitAction::Proceed);
+    }
+
+    #[test]
+    fn cooldown_reason_as_str_values() {
+        assert_eq!(CooldownReason::RateLimit.as_str(), "rate_limit");
+        assert_eq!(CooldownReason::Overloaded.as_str(), "overloaded");
+    }
+
+    #[test]
+    fn default_creates_active_state() {
+        let rl = RateLimitCooldown::default();
+        assert_eq!(rl.state(), RateLimitState::Active);
+        assert!(!rl.is_in_cooldown());
+        assert_eq!(rl.cooldown_remaining_ms(), 0);
+    }
+
+    #[test]
+    fn single_429_below_threshold_waits_and_retries() {
+        let rl = RateLimitCooldown::new();
+        let action = rl.record_429(None, false);
+        // Below consecutive threshold → WaitAndRetry with default 5000ms
+        assert!(matches!(action, RateLimitAction::WaitAndRetry { delay_ms: 5000 }));
+    }
+
+    #[test]
+    fn max_cooldown_capped() {
+        let rl = RateLimitCooldown::new();
+        // Trigger cooldown with very large retry-after
+        rl.record_429(Some(999_999_999), false);
+        rl.record_429(Some(999_999_999), false);
+        let action = rl.record_429(Some(999_999_999), false);
+        // Should be capped at MAX_COOLDOWN_MS (5 minutes)
+        match action {
+            RateLimitAction::Reject { reset_in_ms, .. } => {
+                assert!(reset_in_ms <= 5 * 60 * 1000 + 100); // allow small timing variance
+            }
+            _ => panic!("expected Reject, got {:?}", action),
+        }
+    }
+
+    #[test]
+    fn metrics_unknown_state() {
+        let rl = RateLimitCooldown::new();
+        // Force unknown state
+        rl.state.store(255, Ordering::SeqCst);
+        let m = rl.metrics();
+        assert_eq!(m.state, "unknown");
+    }
 }

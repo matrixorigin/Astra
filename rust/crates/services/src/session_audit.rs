@@ -1672,4 +1672,241 @@ mod tests {
         };
         assert!((t.success_rate - 0.95).abs() < 0.001);
     }
+
+    // ── Unhappy path / edge-case tests ──
+
+    #[test]
+    fn normalize_tool_name_empty() {
+        assert_eq!(normalize_tool_name("".into()), "unknown");
+    }
+
+    #[test]
+    fn normalize_tool_name_whitespace() {
+        assert_eq!(normalize_tool_name("   ".into()), "unknown");
+    }
+
+    #[test]
+    fn normalize_tool_name_quoted() {
+        assert_eq!(normalize_tool_name("\"bash\"".into()), "bash");
+    }
+
+    #[test]
+    fn normalize_tool_name_double_quoted_empty() {
+        assert_eq!(normalize_tool_name("\"\"".into()), "unknown");
+    }
+
+    #[test]
+    fn normalize_tool_name_normal() {
+        assert_eq!(normalize_tool_name("write_file".into()), "write_file");
+    }
+
+    #[test]
+    fn truncate_str_empty() {
+        assert_eq!(truncate_str("", 10), "");
+    }
+
+    #[test]
+    fn truncate_str_zero_max_len() {
+        let result = truncate_str("hello", 0);
+        assert_eq!(result, "…");
+    }
+
+    #[test]
+    fn truncate_str_exact_boundary() {
+        assert_eq!(truncate_str("hello", 5), "hello");
+    }
+
+    #[test]
+    fn truncate_str_multibyte_no_panic() {
+        // 4 CJK chars = 12 bytes, truncate at 7 bytes → must find char boundary
+        let result = truncate_str("你好世界", 7);
+        assert!(result.ends_with('…'));
+        // Should be "你好…" (6 bytes for 2 CJK + 3 bytes for …)
+    }
+
+    #[test]
+    fn extract_tool_calls_null_metadata() {
+        let meta = serde_json::json!(null);
+        let calls = extract_tool_calls_from_metadata(&meta);
+        assert!(calls.is_empty());
+    }
+
+    #[test]
+    fn extract_tool_calls_non_array_tool_calls() {
+        let meta = serde_json::json!({"tool_calls": "not_an_array"});
+        let calls = extract_tool_calls_from_metadata(&meta);
+        assert!(calls.is_empty());
+    }
+
+    #[test]
+    fn extract_tool_calls_empty_array() {
+        let meta = serde_json::json!({"tool_calls": []});
+        let calls = extract_tool_calls_from_metadata(&meta);
+        assert!(calls.is_empty());
+    }
+
+    #[test]
+    fn extract_tool_calls_missing_fields_default() {
+        let meta = serde_json::json!({"tool_calls": [{}]});
+        let calls = extract_tool_calls_from_metadata(&meta);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "unknown");
+        assert!(calls[0].ok);
+        assert_eq!(calls[0].duration_ms, 0);
+        assert!(calls[0].error.is_none());
+    }
+
+    #[test]
+    fn compute_duration_invalid_formats() {
+        assert_eq!(compute_duration_secs(Some("not-a-date"), Some("also-not")), 0.0);
+    }
+
+    #[test]
+    fn compute_duration_mixed_formats() {
+        // One RFC3339, one MySQL → neither parser matches both
+        assert_eq!(
+            compute_duration_secs(
+                Some("2026-04-01T10:00:00+08:00"),
+                Some("2026-04-01 10:05:00.000000")
+            ),
+            0.0
+        );
+    }
+
+    #[test]
+    fn compute_duration_negative_result() {
+        // End before start → negative duration
+        let d = compute_duration_secs(
+            Some("2026-04-01 10:05:00.000000"),
+            Some("2026-04-01 10:00:00.000000"),
+        );
+        assert!(d < 0.0);
+    }
+
+    #[test]
+    fn audit_session_list_params_defaults() {
+        let json = r#"{}"#;
+        let p: AuditSessionListParams = serde_json::from_str(json).unwrap();
+        assert_eq!(p.page, 1);
+        assert_eq!(p.per_page, 20);
+        assert_eq!(p.sort, "created");
+        assert_eq!(p.order, "desc");
+        assert!(p.status.is_none());
+        assert!(p.model.is_none());
+        assert!(p.min_turns.is_none());
+    }
+
+    #[test]
+    fn audit_session_list_params_custom() {
+        let json = r#"{"page":2,"per_page":50,"status":"active","sort":"turns","order":"asc","min_turns":5}"#;
+        let p: AuditSessionListParams = serde_json::from_str(json).unwrap();
+        assert_eq!(p.page, 2);
+        assert_eq!(p.per_page, 50);
+        assert_eq!(p.status.as_deref(), Some("active"));
+        assert_eq!(p.sort, "turns");
+        assert_eq!(p.order, "asc");
+        assert_eq!(p.min_turns, Some(5));
+    }
+
+    #[test]
+    fn tool_call_brief_skip_serializing_none_error() {
+        let tc = ToolCallBrief {
+            name: "bash".into(),
+            ok: true,
+            duration_ms: 100,
+            error: None,
+        };
+        let json = serde_json::to_string(&tc).unwrap();
+        assert!(!json.contains("error"));
+    }
+
+    #[test]
+    fn tool_call_brief_with_error() {
+        let tc = ToolCallBrief {
+            name: "bash".into(),
+            ok: false,
+            duration_ms: 200,
+            error: Some("exit code 1".into()),
+        };
+        let json = serde_json::to_string(&tc).unwrap();
+        assert!(json.contains("exit code 1"));
+    }
+
+    #[test]
+    fn session_audit_summary_roundtrip() {
+        let s = SessionAuditSummary {
+            session_id: "s1".into(),
+            status: "active".into(),
+            turn_count: 0,
+            tokens_in: 0,
+            tokens_out: 0,
+            tool_calls_total: 0,
+            tool_calls_failed: 0,
+            error_count: 0,
+            stall_count: 0,
+            checkpoint_count: 0,
+            compact_count: 0,
+            models_used: vec![],
+            duration_secs: 0.0,
+            created_at: "2024-01-01".into(),
+            ended_at: None,
+        };
+        let json = serde_json::to_string(&s).unwrap();
+        let restored: SessionAuditSummary = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.session_id, "s1");
+        assert!(restored.models_used.is_empty());
+    }
+
+    #[test]
+    fn cross_session_stats_serde() {
+        let stats = CrossSessionStats {
+            session_count: 10,
+            total_turns: 100,
+            total_tokens_in: 50000,
+            total_tokens_out: 30000,
+            total_tool_calls: 200,
+            total_tool_failures: 5,
+            total_errors: 2,
+            total_stalls: 1,
+            avg_turns_per_session: 10.0,
+            avg_tokens_per_session: 8000.0,
+            tool_error_rate: 0.025,
+            top_tools: vec![],
+            top_models: vec![],
+        };
+        let json = serde_json::to_string(&stats).unwrap();
+        let restored: CrossSessionStats = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.session_count, 10);
+        assert!((restored.tool_error_rate - 0.025).abs() < 0.001);
+    }
+
+    #[test]
+    fn model_usage_brief_serde() {
+        let m = ModelUsageBrief {
+            model: "claude-3.5".into(),
+            session_count: 5,
+            total_tokens: 100000,
+        };
+        let json = serde_json::to_string(&m).unwrap();
+        let restored: ModelUsageBrief = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.model, "claude-3.5");
+    }
+
+    #[test]
+    fn cross_session_tool_analytics_serde() {
+        let t = CrossSessionToolAnalytics {
+            name: "bash".into(),
+            total_calls: 100,
+            total_success: 95,
+            total_failures: 5,
+            success_rate: 0.95,
+            avg_duration_ms: 150.0,
+            max_duration_ms: 5000,
+            sessions_used_in: 8,
+            last_error: Some("timeout".into()),
+        };
+        let json = serde_json::to_string(&t).unwrap();
+        let restored: CrossSessionToolAnalytics = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.last_error.as_deref(), Some("timeout"));
+    }
 }

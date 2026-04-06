@@ -513,3 +513,181 @@ pub struct CreateCheckpointRequest {
 pub struct SandboxCheckpointRequest {
     pub checkpoint_name: String,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── validate_checkpoint_name ──
+
+    #[test]
+    fn validate_checkpoint_name_valid_names() {
+        assert!(validate_checkpoint_name("my-checkpoint").is_ok());
+        assert!(validate_checkpoint_name("cp_123").is_ok());
+        assert!(validate_checkpoint_name("a").is_ok());
+        assert!(validate_checkpoint_name(&"x".repeat(128)).is_ok());
+    }
+
+    #[test]
+    fn validate_checkpoint_name_empty() {
+        let err = validate_checkpoint_name("");
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn validate_checkpoint_name_too_long() {
+        assert!(validate_checkpoint_name(&"x".repeat(129)).is_err());
+    }
+
+    #[test]
+    fn validate_checkpoint_name_special_chars() {
+        assert!(validate_checkpoint_name("my checkpoint").is_err());
+        assert!(validate_checkpoint_name("cp/bad").is_err());
+        assert!(validate_checkpoint_name("cp.dot").is_err());
+    }
+
+    #[test]
+    fn validate_checkpoint_name_unicode() {
+        assert!(validate_checkpoint_name("检查点").is_err());
+    }
+
+    // ── truncate_content ──
+
+    #[test]
+    fn truncate_content_short_unchanged() {
+        assert_eq!(truncate_content("hello", 10), "hello");
+    }
+
+    #[test]
+    fn truncate_content_exact_length() {
+        assert_eq!(truncate_content("hello", 5), "hello");
+    }
+
+    #[test]
+    fn truncate_content_long_adds_ellipsis() {
+        assert_eq!(truncate_content("hello world", 5), "hello...");
+    }
+
+    #[test]
+    fn truncate_content_empty() {
+        assert_eq!(truncate_content("", 0), "");
+        assert_eq!(truncate_content("", 100), "");
+    }
+
+    // ── Serialization ──
+
+    #[test]
+    fn checkpoint_response_skip_serializing_none_description() {
+        let r = CheckpointResponse {
+            checkpoint_name: "cp1".into(),
+            timestamp: "2024-01-01T00:00:00".into(),
+            description: None,
+        };
+        let json = serde_json::to_string(&r).unwrap();
+        assert!(!json.contains("description"));
+    }
+
+    #[test]
+    fn checkpoint_response_includes_description() {
+        let r = CheckpointResponse {
+            checkpoint_name: "cp1".into(),
+            timestamp: "2024-01-01T00:00:00".into(),
+            description: Some("test".into()),
+        };
+        let json = serde_json::to_string(&r).unwrap();
+        assert!(json.contains("\"description\":\"test\""));
+    }
+
+    #[test]
+    fn lineage_node_serialization_roundtrip() {
+        let node = LineageNode {
+            event_id: "e1".into(),
+            event_type: "tool_call".into(),
+            content: "hello".into(),
+            parent_event_id: Some("e0".into()),
+            causal_chain_id: None,
+            created_at: "2024-01-01T00:00:00".into(),
+        };
+        let json = serde_json::to_string(&node).unwrap();
+        assert!(json.contains("\"parent_event_id\":\"e0\""));
+        assert!(json.contains("\"causal_chain_id\":null"));
+    }
+
+    #[test]
+    fn event_at_checkpoint_serialization() {
+        let e = EventAtCheckpoint {
+            event_id: "e1".into(),
+            session_id: "s1".into(),
+            event_type: "user_message".into(),
+            content: "test".into(),
+            created_at: "2024-01-01".into(),
+        };
+        let json = serde_json::to_string(&e).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["event_id"], "e1");
+        assert_eq!(parsed["session_id"], "s1");
+    }
+
+    #[test]
+    fn status_response_serialization() {
+        let r = StatusResponse {
+            status: "restored".into(),
+        };
+        let json = serde_json::to_string(&r).unwrap();
+        assert_eq!(json, r#"{"status":"restored"}"#);
+    }
+
+    // ── Request deserialization ──
+
+    #[test]
+    fn create_checkpoint_request_deserialize() {
+        let json = r#"{"name":"cp1","description":"test"}"#;
+        let r: CreateCheckpointRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(r.name, "cp1");
+        assert_eq!(r.description.as_deref(), Some("test"));
+    }
+
+    #[test]
+    fn create_checkpoint_request_no_description() {
+        let json = r#"{"name":"cp1"}"#;
+        let r: CreateCheckpointRequest = serde_json::from_str(json).unwrap();
+        assert!(r.description.is_none());
+    }
+
+    #[test]
+    fn sandbox_checkpoint_request_deserialize() {
+        let json = r#"{"checkpoint_name":"snap1"}"#;
+        let r: SandboxCheckpointRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(r.checkpoint_name, "snap1");
+    }
+
+    // ── UnconfiguredDataVersioningService ──
+
+    #[tokio::test]
+    async fn unconfigured_service_returns_errors() {
+        let svc = UnconfiguredDataVersioningService;
+        assert!(svc.create_checkpoint("u1".into(), CreateCheckpointData { name: "cp".into(), description: None }).await.is_err());
+        assert!(svc.list_checkpoints("u1".into()).await.is_err());
+        assert!(svc.get_events_at_checkpoint("u1".into(), "cp".into()).await.is_err());
+        assert!(svc.get_causal_chain("u1".into(), "e1".into()).await.is_err());
+        assert!(svc.trace_upstream("u1".into(), "e1".into()).await.is_err());
+        assert!(svc.sandbox_checkpoint("u1".into(), "sb".into(), SandboxCheckpointData { checkpoint_name: "cp".into() }).await.is_err());
+        assert!(svc.sandbox_restore("u1".into(), "sb".into(), SandboxCheckpointData { checkpoint_name: "cp".into() }).await.is_err());
+    }
+
+    // ── Data type equality ──
+
+    #[test]
+    fn create_checkpoint_data_equality() {
+        let a = CreateCheckpointData { name: "cp1".into(), description: Some("d".into()) };
+        let b = CreateCheckpointData { name: "cp1".into(), description: Some("d".into()) };
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn sandbox_checkpoint_data_equality() {
+        let a = SandboxCheckpointData { checkpoint_name: "snap1".into() };
+        let b = a.clone();
+        assert_eq!(a, b);
+    }
+}

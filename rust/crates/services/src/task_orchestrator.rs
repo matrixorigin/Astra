@@ -2245,4 +2245,212 @@ mod tests {
         assert!(!recs.is_empty());
         assert!(recs[0].template.use_count >= 2);
     }
+
+    // ── Unhappy path / edge-case tests ──
+
+    #[test]
+    fn task_status_parse_empty_string() {
+        assert_eq!(TaskStatus::parse_status(""), TaskStatus::Pending);
+    }
+
+    #[test]
+    fn task_status_parse_case_sensitive() {
+        // "In_Progress" should not match (case-sensitive)
+        assert_eq!(TaskStatus::parse_status("In_Progress"), TaskStatus::Pending);
+        assert_eq!(TaskStatus::parse_status("COMPLETED"), TaskStatus::Pending);
+    }
+
+    #[test]
+    fn task_status_serde_roundtrip() {
+        for status in [
+            TaskStatus::Pending,
+            TaskStatus::InProgress,
+            TaskStatus::Paused,
+            TaskStatus::Completed,
+            TaskStatus::Failed,
+            TaskStatus::Cancelled,
+        ] {
+            let json = serde_json::to_string(&status).unwrap();
+            let restored: TaskStatus = serde_json::from_str(&json).unwrap();
+            assert_eq!(restored, status);
+        }
+    }
+
+    #[test]
+    fn task_status_default_is_pending() {
+        assert_eq!(TaskStatus::default(), TaskStatus::Pending);
+    }
+
+    #[test]
+    fn task_outcome_roundtrip() {
+        for (s, o) in [
+            ("success", TaskOutcome::Success),
+            ("partial", TaskOutcome::Partial),
+            ("failed", TaskOutcome::Failed),
+            ("cancelled", TaskOutcome::Cancelled),
+        ] {
+            assert_eq!(TaskOutcome::parse(s), Some(o));
+            assert_eq!(o.as_str(), s);
+        }
+    }
+
+    #[test]
+    fn task_outcome_parse_unknown_returns_none() {
+        assert_eq!(TaskOutcome::parse("unknown"), None);
+        assert_eq!(TaskOutcome::parse(""), None);
+    }
+
+    #[test]
+    fn task_outcome_serde_roundtrip() {
+        let json = serde_json::to_string(&TaskOutcome::Success).unwrap();
+        let restored: TaskOutcome = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored, TaskOutcome::Success);
+    }
+
+    #[test]
+    fn subtask_plan_default() {
+        let st = SubtaskPlan::default();
+        assert!(st.id.is_empty());
+        assert!(st.depends_on.is_empty());
+        assert_eq!(st.status, TaskStatus::Pending);
+        assert!(st.effort.is_none());
+        assert!(st.files.is_empty());
+        assert!(st.acceptance.is_none());
+    }
+
+    #[test]
+    fn subtask_plan_skip_serializing_empty() {
+        let st = SubtaskPlan {
+            id: "s1".into(),
+            title: "test".into(),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&st).unwrap();
+        assert!(!json.contains("effort"));
+        assert!(!json.contains("files"));
+        assert!(!json.contains("acceptance"));
+    }
+
+    #[test]
+    fn task_plan_all_completed_100_pct() {
+        let plan = TaskPlan {
+            subtasks: vec![
+                SubtaskPlan { id: "a".into(), status: TaskStatus::Completed, ..Default::default() },
+                SubtaskPlan { id: "b".into(), status: TaskStatus::Completed, ..Default::default() },
+            ],
+            notes: None,
+        };
+        assert_eq!(plan.progress_pct(), 100);
+        assert_eq!(plan.items_done(), 2);
+    }
+
+    #[test]
+    fn task_plan_failed_counts_as_terminal() {
+        let plan = TaskPlan {
+            subtasks: vec![
+                SubtaskPlan { id: "a".into(), status: TaskStatus::Failed, ..Default::default() },
+                SubtaskPlan { id: "b".into(), status: TaskStatus::Pending, ..Default::default() },
+            ],
+            notes: None,
+        };
+        // Failed is terminal, so progress is 50%
+        assert_eq!(plan.progress_pct(), 50);
+        // But items_done only counts Completed
+        assert_eq!(plan.items_done(), 0);
+    }
+
+    #[test]
+    fn task_plan_ready_with_all_pending_no_deps() {
+        let plan = TaskPlan {
+            subtasks: vec![
+                SubtaskPlan { id: "a".into(), status: TaskStatus::Pending, ..Default::default() },
+                SubtaskPlan { id: "b".into(), status: TaskStatus::Pending, ..Default::default() },
+            ],
+            notes: None,
+        };
+        assert_eq!(plan.ready_subtasks().len(), 2);
+    }
+
+    #[test]
+    fn task_plan_ready_with_unmet_dependency() {
+        let plan = TaskPlan {
+            subtasks: vec![
+                SubtaskPlan { id: "a".into(), status: TaskStatus::InProgress, depends_on: vec![], ..Default::default() },
+                SubtaskPlan { id: "b".into(), status: TaskStatus::Pending, depends_on: vec!["a".into()], ..Default::default() },
+            ],
+            notes: None,
+        };
+        // b depends on a which is InProgress (not Completed), so b is not ready
+        assert!(plan.ready_subtasks().is_empty());
+    }
+
+    #[test]
+    fn task_plan_ready_with_nonexistent_dependency() {
+        let plan = TaskPlan {
+            subtasks: vec![
+                SubtaskPlan { id: "a".into(), status: TaskStatus::Pending, depends_on: vec!["nonexistent".into()], ..Default::default() },
+            ],
+            notes: None,
+        };
+        // Dependency doesn't exist, so "a" is blocked
+        assert!(plan.ready_subtasks().is_empty());
+    }
+
+    #[test]
+    fn task_checkpoint_default() {
+        let cp = TaskCheckpoint::default();
+        assert!(cp.active_subtask_id.is_none());
+        assert_eq!(cp.turn, 0);
+        assert!(cp.session_id.is_none());
+        assert!(cp.state.is_empty());
+    }
+
+    #[test]
+    fn task_checkpoint_serde_roundtrip() {
+        let mut state = serde_json::Map::new();
+        state.insert("key".into(), serde_json::json!("value"));
+        let cp = TaskCheckpoint {
+            active_subtask_id: Some("s1".into()),
+            turn: 5,
+            session_id: Some("sess1".into()),
+            state,
+        };
+        let json = serde_json::to_string(&cp).unwrap();
+        let restored: TaskCheckpoint = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.active_subtask_id, cp.active_subtask_id);
+        assert_eq!(restored.turn, 5);
+        assert_eq!(restored.state["key"], "value");
+    }
+
+    #[test]
+    fn task_record_serde_defaults() {
+        let json = r#"{
+            "task_id": "t1",
+            "user_id": "u1",
+            "title": "test",
+            "status": "pending",
+            "progress_pct": 0,
+            "items_done": 0,
+            "items_total": 0,
+            "created_at": "2024-01-01",
+            "updated_at": "2024-01-01"
+        }"#;
+        let r: TaskRecord = serde_json::from_str(json).unwrap();
+        assert_eq!(r.replan_count, 0);
+        assert_eq!(r.auto_adjustments, 0);
+        assert!(r.user_rating.is_none());
+        assert!(r.outcome.is_none());
+        assert!(r.project_type.is_none());
+        assert!(r.agent_id.is_none());
+    }
+
+    #[test]
+    fn learning_stats_default() {
+        let ls = LearningStats::default();
+        assert_eq!(ls.total_tasks, 0);
+        assert_eq!(ls.completed_tasks, 0);
+        assert!(ls.avg_rating.is_none());
+        assert_eq!(ls.avg_replan_count, 0.0);
+        assert_eq!(ls.inferred_success_rate, 0.0);
+    }
 }

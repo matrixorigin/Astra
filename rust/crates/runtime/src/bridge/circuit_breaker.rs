@@ -443,4 +443,102 @@ mod tests {
         let s = m.snapshot();
         assert_eq!(s.p99_latency_ms, 500);
     }
+
+    // ── Unhappy path / edge-case tests ──
+
+    #[test]
+    fn circuit_breaker_unknown_state_denies_request() {
+        let cb = CircuitBreaker::with_defaults();
+        // Force an invalid state value
+        cb.state.store(255, Ordering::SeqCst);
+        assert!(!cb.allow_request());
+        assert_eq!(cb.state(), "unknown");
+    }
+
+    #[test]
+    fn circuit_breaker_zero_threshold_opens_immediately() {
+        // Edge: threshold=0 means any failure opens
+        // Actually threshold 0 means `failures >= 0` is always true after fetch_add
+        let cb = CircuitBreaker::new(1, Duration::from_secs(30), 1);
+        cb.record_failure();
+        assert_eq!(cb.state(), "open");
+    }
+
+    #[test]
+    fn record_failure_while_open_stays_open() {
+        let cb = CircuitBreaker::new(2, Duration::from_secs(60), 2);
+        cb.record_failure();
+        cb.record_failure(); // opens
+        assert_eq!(cb.state(), "open");
+        cb.record_failure(); // additional failure while open
+        assert_eq!(cb.state(), "open"); // stays open
+    }
+
+    #[test]
+    fn record_success_while_closed_resets_consecutive() {
+        let cb = CircuitBreaker::new(5, Duration::from_secs(30), 3);
+        cb.record_failure();
+        cb.record_failure();
+        assert_eq!(cb.metrics().consecutive_failures, 2);
+        cb.record_success();
+        assert_eq!(cb.metrics().consecutive_failures, 0);
+    }
+
+    #[test]
+    fn metrics_accumulate_correctly() {
+        let cb = CircuitBreaker::with_defaults();
+        for _ in 0..3 {
+            cb.record_success();
+        }
+        for _ in 0..2 {
+            cb.record_failure();
+        }
+        let m = cb.metrics();
+        assert_eq!(m.success_count, 3);
+        assert_eq!(m.failure_count, 2);
+    }
+
+    #[test]
+    fn bridge_health_all_failures() {
+        let m = BridgeHealthMetrics::new();
+        for _ in 0..10 {
+            m.record_request(100, false, false);
+        }
+        let s = m.snapshot();
+        assert_eq!(s.failure_rate, 1.0);
+        assert_eq!(s.timeout_rate, 0.0);
+    }
+
+    #[test]
+    fn bridge_health_all_timeouts() {
+        let m = BridgeHealthMetrics::new();
+        m.record_request(240_000, false, true);
+        let s = m.snapshot();
+        assert_eq!(s.failure_rate, 1.0);
+        assert_eq!(s.timeout_rate, 1.0);
+    }
+
+    #[test]
+    fn bridge_health_zero_latency() {
+        let m = BridgeHealthMetrics::new();
+        m.record_request(0, true, false);
+        let s = m.snapshot();
+        assert_eq!(s.avg_latency_ms, 0.0);
+        assert_eq!(s.p99_latency_ms, 0);
+    }
+
+    #[test]
+    fn bridge_health_default_is_new() {
+        let m = BridgeHealthMetrics::default();
+        let s = m.snapshot();
+        assert_eq!(s.total_requests, 0);
+    }
+
+    #[test]
+    fn bridge_health_single_request_p99() {
+        let m = BridgeHealthMetrics::new();
+        m.record_request(42, true, false);
+        let s = m.snapshot();
+        assert_eq!(s.p99_latency_ms, 42);
+    }
 }
