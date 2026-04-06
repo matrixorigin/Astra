@@ -661,6 +661,24 @@ impl JournalWriter {
     }
 }
 
+fn parse_journal_text(content: &str) -> (Vec<JournalEvent>, usize, usize) {
+    let mut events = Vec::new();
+    let mut non_empty_lines = 0usize;
+    let mut malformed_lines = 0usize;
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        non_empty_lines += 1;
+        match serde_json::from_str::<JournalEvent>(line) {
+            Ok(evt) => events.push(evt),
+            Err(_) => malformed_lines += 1,
+        }
+    }
+    (events, non_empty_lines, malformed_lines)
+}
+
 /// Read all events from a session journal file.
 pub fn read_journal(session_id: &str) -> std::io::Result<Vec<JournalEvent>> {
     let path = journal_dir().join(format!("{session_id}.jsonl"));
@@ -668,18 +686,24 @@ pub fn read_journal(session_id: &str) -> std::io::Result<Vec<JournalEvent>> {
         return Ok(Vec::new());
     }
     let content = std::fs::read_to_string(&path)?;
-    let mut events = Vec::new();
-    for line in content.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        match serde_json::from_str::<JournalEvent>(line) {
-            Ok(evt) => events.push(evt),
-            Err(_) => continue, // skip malformed lines
-        }
+    Ok(parse_journal_text(&content).0)
+}
+
+/// Read journal for offline analysis tools. Returns an error if the JSONL file is missing.
+///
+/// Second element: non-empty physical lines; third: lines that failed JSON parse.
+pub fn read_journal_for_digest(
+    session_id: &str,
+) -> std::io::Result<(Vec<JournalEvent>, usize, usize)> {
+    let path = journal_dir().join(format!("{session_id}.jsonl"));
+    if !path.exists() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("session journal not found: {}", path.display()),
+        ));
     }
-    Ok(events)
+    let content = std::fs::read_to_string(&path)?;
+    Ok(parse_journal_text(&content))
 }
 
 /// List all session IDs that have journal files.

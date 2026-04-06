@@ -44,6 +44,10 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
         "Session skill surfacing config: show/reset/dynamic/min/cap",
     ),
     (
+        "/compact",
+        "Summarize & trim history — optional: quick | summary-only | no-memoria",
+    ),
+    (
         "/turn",
         "Turn trace: /turn | list | N | seq:N | #N | id:N | @N | -1",
     ),
@@ -1109,7 +1113,15 @@ pub(super) fn print_slash_commands(query: Option<&str>) {
             "🔭",
             "Observability",
             &[
-                "/explain", "/turn", "/debug", "/stats", "/cost", "/tools", "/health", "/sync",
+                "/explain",
+                "/compact",
+                "/turn",
+                "/debug",
+                "/stats",
+                "/cost",
+                "/tools",
+                "/health",
+                "/sync",
             ],
         ),
         (
@@ -2219,7 +2231,15 @@ mod tests {
         let groups: &[&[&str]] = &[
             &["/help", "/model", "/clear", "/history", "/copy", "/exit"],
             &[
-                "/explain", "/turn", "/debug", "/stats", "/cost", "/tools", "/health", "/sync",
+                "/explain",
+                "/compact",
+                "/turn",
+                "/debug",
+                "/stats",
+                "/cost",
+                "/tools",
+                "/health",
+                "/sync",
             ],
             &[
                 "/session",

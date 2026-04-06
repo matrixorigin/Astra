@@ -405,6 +405,9 @@ pub(crate) struct JournalDigestArgs {
     /// Session id, unique prefix, `last`, or omit for most recent local journal
     #[arg(value_name = "SESSION")]
     session_id: Option<String>,
+    /// Same meaning as positional SESSION (positional wins if both are set)
+    #[arg(long = "session", value_name = "SESSION")]
+    session: Option<String>,
     /// Output format: json or text
     #[arg(long, default_value = "json")]
     format: String,

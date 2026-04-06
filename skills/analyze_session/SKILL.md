@@ -28,7 +28,7 @@ $ARGUMENTS
 
 ## Phase 1: Load digest (required)
 
-Run from the project or any directory (command is offline; no login required):
+Run from the project or any directory (command is offline; no login required). If `astra` is not on `PATH`, use the full path to the CLI binary (ask the user or use `command -v astra`).
 
 ```bash
 # Most recent local session
@@ -36,6 +36,7 @@ astra journal digest
 
 # Specific session (full UUID, unique prefix, or last)
 astra journal digest <SESSION_ID>
+astra journal digest --session <SESSION_ID>
 astra journal digest last
 
 # Smaller JSON (metrics-focused turn rows)
@@ -49,7 +50,8 @@ astra journal digest --format text
 
 ### JSON fields to use (do not invent numbers)
 
-- **`aggregates`**: `turn_count`, `turn_error_count`, `compact_count`, `stall_count`, `error_event_count`, `total_tokens_in`, `total_tokens_out`, `total_duration_ms`, `total_tool_calls`, `tool_calls_failed`, `avg_tokens_in`, `avg_tokens_out`, `avg_duration_ms`.
+- **`journal_lines_non_empty`**, **`journal_lines_malformed`**: raw JSONL line counts; non-zero `malformed` means some lines were skipped during parse.
+- **`aggregates`**: `session_start_count`, `session_end_count`, `turn_count`, `turn_error_count`, `compact_count`, `stall_count`, `error_event_count`, `total_tokens_in`, `total_tokens_out`, `total_duration_ms`, `total_tool_calls`, `tool_calls_failed`, `avg_tokens_in`, `avg_tokens_out`, `avg_duration_ms`.
 - **`turns`**: per-turn `seq` (1-based chronological index), `turn_id` (session turn counter when present), `tokens_in` / `tokens_out`, `duration_ms`, `ttft_ms`, `context_ms`, `selector_ms`, `selector_strategy`, `tools_selected_count`, `tools_used_count`, `selected_skills`, `tool_calls_ok`, `tool_calls_fail`, `user_input_preview`, `budget_pressure`.
 - **`compaction_events`**, **`stalls`**, **`turn_errors`**, **`other_errors`**: structured side events; cite `ts`, `turn`, and `detail` from JSON.
 

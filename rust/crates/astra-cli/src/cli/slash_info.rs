@@ -440,6 +440,9 @@ fn parse_turn_pick(arg: &str) -> Result<TurnPick, String> {
             .trim()
             .parse::<u32>()
             .map_err(|_| turn_arg_usage().to_string())?;
+        if n == 0 {
+            return Err("turn id must be >= 1".to_string());
+        }
         return Ok(TurnPick::Id(n));
     }
     if let Some(rest) = t.strip_prefix('#') {
@@ -457,6 +460,9 @@ fn parse_turn_pick(arg: &str) -> Result<TurnPick, String> {
             .trim()
             .parse::<u32>()
             .map_err(|_| turn_arg_usage().to_string())?;
+        if n == 0 {
+            return Err("turn id must be >= 1".to_string());
+        }
         return Ok(TurnPick::Id(n));
     }
     if let Ok(i) = t.parse::<i32>() {
@@ -476,13 +482,11 @@ fn seq_for_event(
     ev: &session_journal::JournalEvent,
 ) -> Option<u32> {
     let key = (ev.turn, ev.ts.as_str());
-    turns.iter().enumerate().find_map(|(i, e)| {
-        if (e.turn, e.ts.as_str()) == key {
-            Some(i as u32 + 1)
-        } else {
-            None
-        }
-    })
+    turns
+        .iter()
+        .enumerate()
+        .rfind(|(_, e)| (e.turn, e.ts.as_str()) == key)
+        .map(|(i, _)| i as u32 + 1)
 }
 
 fn resolve_turn_pick(
@@ -490,10 +494,7 @@ fn resolve_turn_pick(
     pick: TurnPick,
 ) -> Result<Option<(session_journal::JournalEvent, Option<u32>)>, String> {
     match pick {
-        TurnPick::Last => Ok(turns.last().cloned().map(|ev| {
-            let seq = turns.len() as u32;
-            (ev, Some(seq))
-        })),
+        TurnPick::Last => unreachable!("TurnPick::Last is handled before resolve_turn_pick"),
         TurnPick::List => Ok(None),
         TurnPick::Legacy(n) => {
             let ev = resolve_legacy_turn(turns, n);
@@ -1426,10 +1427,31 @@ pub(super) async fn handle_info_command(
                         })
                         .flatten();
                     print_turn_trace(ev, seq);
+                } else if let Some(sid) = state.session_id.as_deref() {
+                    match session_journal::read_journal(sid) {
+                        Ok(events) => {
+                            let turns = collect_journal_turns(events);
+                            if let Some(ev) = turns.last() {
+                                let seq = Some(turns.len() as u32);
+                                print_turn_trace(ev, seq);
+                            } else {
+                                eprintln!(
+                                    "{}",
+                                    "  No Turn events in journal yet. Complete a turn first.".dim()
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "{}",
+                                format!("  Failed to read session journal: {e}").yellow()
+                            );
+                        }
+                    }
                 } else {
                     eprintln!(
                         "{}",
-                        "  No turn data yet. Complete a conversation turn first.".dim()
+                        "  No active session and no in-memory turn; cannot show trace.".yellow()
                     );
                 }
                 return Ok(());

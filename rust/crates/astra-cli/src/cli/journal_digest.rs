@@ -27,9 +27,17 @@ pub fn parse_focus(raw: Option<&str>) -> Result<DigestFocus, String> {
     }
 }
 
-pub fn resolve_session_for_digest(query: Option<&str>) -> Result<String, String> {
-    match query.map(str::trim) {
-        None | Some("") => session_journal::list_sessions_by_time(1)
+/// `positional` is the optional CLI positional; `long_session` is `--session`.
+pub fn resolve_session_for_digest(
+    positional: Option<&str>,
+    long_session: Option<&str>,
+) -> Result<String, String> {
+    let query = positional
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .or_else(|| long_session.map(str::trim).filter(|s| !s.is_empty()));
+    match query {
+        None => session_journal::list_sessions_by_time(1)
             .map_err(|e| e.to_string())?
             .into_iter()
             .next()
@@ -54,6 +62,10 @@ pub struct JournalDigest {
     pub schema_version: &'static str,
     pub session_id: String,
     pub journal_file: String,
+    /// Non-empty lines in the JSONL file.
+    pub journal_lines_non_empty: usize,
+    /// Lines that were non-empty but not valid `JournalEvent` JSON.
+    pub journal_lines_malformed: usize,
     pub aggregates: Aggregates,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub turns: Vec<TurnRow>,
@@ -174,8 +186,9 @@ fn tool_call_counts(calls: Option<&Vec<session_journal::ToolCallRecord>>) -> (u3
     (ok, fail)
 }
 
-pub fn build_digest(session_id: &str, focus: DigestFocus) -> JournalDigest {
-    let events = session_journal::read_journal(session_id).unwrap_or_default();
+pub fn build_digest(session_id: &str, focus: DigestFocus) -> Result<JournalDigest, String> {
+    let (events, journal_lines_non_empty, journal_lines_malformed) =
+        session_journal::read_journal_for_digest(session_id).map_err(|e| e.to_string())?;
     let journal_file = session_journal::journal_file_path(session_id)
         .to_string_lossy()
         .into_owned();
@@ -321,10 +334,12 @@ pub fn build_digest(session_id: &str, focus: DigestFocus) -> JournalDigest {
         )
     };
 
-    JournalDigest {
+    Ok(JournalDigest {
         schema_version: SCHEMA_VERSION,
         session_id: session_id.to_string(),
         journal_file,
+        journal_lines_non_empty,
+        journal_lines_malformed,
         aggregates: Aggregates {
             turn_count,
             turn_error_count,
@@ -347,13 +362,17 @@ pub fn build_digest(session_id: &str, focus: DigestFocus) -> JournalDigest {
         stalls,
         turn_errors,
         other_errors,
-    }
+    })
 }
 
 pub fn print_text(d: &JournalDigest) {
     println!("schema_version: {}", d.schema_version);
     println!("session_id: {}", d.session_id);
     println!("journal_file: {}", d.journal_file);
+    println!(
+        "journal_lines: non_empty={} malformed={}",
+        d.journal_lines_non_empty, d.journal_lines_malformed
+    );
     let a = &d.aggregates;
     println!(
         "aggregates: turns={} turn_errors={} compacts={} stalls={} errors={} tokens_in={} tokens_out={} duration_ms={} tool_calls={} tool_failures={}",
@@ -424,8 +443,8 @@ pub fn print_text(d: &JournalDigest) {
 
 pub fn run_digest(args: &super::JournalDigestArgs) -> Result<(), String> {
     let focus = parse_focus(args.focus.as_deref())?;
-    let sid = resolve_session_for_digest(args.session_id.as_deref())?;
-    let digest = build_digest(&sid, focus);
+    let sid = resolve_session_for_digest(args.session_id.as_deref(), args.session.as_deref())?;
+    let digest = build_digest(&sid, focus)?;
     let fmt = args.format.trim().to_ascii_lowercase();
     match fmt.as_str() {
         "json" => {
@@ -464,8 +483,10 @@ mod tests {
         )
         .expect("write journal");
 
-        let d = build_digest(sid, DigestFocus::All);
+        let d = build_digest(sid, DigestFocus::All).expect("digest");
         assert_eq!(d.schema_version, SCHEMA_VERSION);
+        assert_eq!(d.journal_lines_non_empty, 3);
+        assert_eq!(d.journal_lines_malformed, 0);
         assert_eq!(d.turns.len(), 2);
         assert_eq!(d.aggregates.turn_count, 2);
         assert_eq!(d.aggregates.total_tokens_in, 300);
@@ -474,5 +495,37 @@ mod tests {
         assert_eq!(d.turns[0].seq, 1);
         assert_eq!(d.turns[0].turn_id, Some(1));
         assert_eq!(d.turns[1].tool_calls_ok, 1);
+    }
+
+    #[test]
+    fn digest_reports_malformed_lines() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _g = JournalDirGuard::new(tmp.path());
+        let sid = "test-digest-malformed-00000000-0000-0000-0000-000000000002";
+        fs::write(
+            tmp.path().join(format!("{sid}.jsonl")),
+            "{\"type\":\"turn\",\"ts\":\"2026-01-01T00:00:00Z\",\"turn\":1,\"tool_calls\":[]}\nnot json\n",
+        )
+        .expect("write");
+        let d = build_digest(sid, DigestFocus::All).expect("digest");
+        assert_eq!(d.journal_lines_non_empty, 2);
+        assert_eq!(d.journal_lines_malformed, 1);
+        assert_eq!(d.aggregates.turn_count, 1);
+    }
+
+    #[test]
+    fn digest_errors_when_journal_missing() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _g = JournalDirGuard::new(tmp.path());
+        let err = build_digest(
+            "missing-session-00000000-0000-0000-0000-000000000099",
+            DigestFocus::All,
+        )
+        .err()
+        .expect("expected missing file");
+        assert!(
+            err.contains("not found") || err.contains("journal"),
+            "{err}"
+        );
     }
 }
