@@ -344,24 +344,32 @@ fn build_system_message(
         // Even via OpenAI-compatible proxies, many forward cache_control to the
         // native Messages API. Proxies that don't will simply ignore the field.
         //
-        // Cache strategy (mirrors Claude Code's approach):
+        // Cache strategy:
+        //   Place cache_control on the LAST block of each scope group.
+        //   Anthropic allows up to 4 breakpoints per request — we use at most 2
+        //   (last Global, last Session). The provider caches the prefix up to
+        //   each breakpoint.
+        //
         //   Global  → scope:"global" + ttl:"1h"  (shared across all sessions/orgs)
         //   Session → ttl:"1h"                    (stable within a session)
         //   None    → no cache_control             (changes every turn)
         let cache_disabled = std::env::var("MO_PROMPT_CACHE_DISABLED")
             .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
+
+        // Find the last index of each scope group for breakpoint placement
+        let last_global = sections.iter().rposition(|s| s.scope == prompts::CacheScope::Global);
+        let last_session = sections.iter().rposition(|s| s.scope == prompts::CacheScope::Session);
+
         let mut blocks: Vec<Value> = Vec::with_capacity(sections.len() + 1);
-        for section in &sections {
+        for (i, section) in sections.iter().enumerate() {
             let cc = if cache_disabled {
                 None
+            } else if Some(i) == last_global {
+                Some(json!({"type": "ephemeral", "scope": "global", "ttl": "1h"}))
+            } else if Some(i) == last_session {
+                Some(json!({"type": "ephemeral", "ttl": "1h"}))
             } else {
-                match section.scope {
-                    prompts::CacheScope::Global => {
-                        Some(json!({"type": "ephemeral", "scope": "global", "ttl": "1h"}))
-                    }
-                    prompts::CacheScope::Session => Some(json!({"type": "ephemeral", "ttl": "1h"})),
-                    prompts::CacheScope::None => None,
-                }
+                None
             };
             let mut block = json!({
                 "type": "text",
@@ -2421,27 +2429,27 @@ mod tests {
             .expect("Anthropic content should be array");
         assert!(blocks.len() >= 2, "should have at least 2 blocks");
 
-        // First block (Global) should have cache_control with scope + ttl
+        // First block (Global) should NOT have cache_control (only last Global does)
         let first = &blocks[0];
         assert!(
-            first.get("cache_control").is_some(),
-            "Global block should have cache_control"
+            first.get("cache_control").is_none() || first["cache_control"].is_null(),
+            "Non-last Global block should not have cache_control"
         );
-        assert_eq!(
-            first["cache_control"]["type"].as_str(),
-            Some("ephemeral"),
-            "cache_control type should be ephemeral"
+
+        // Some block should have cache_control with scope=global (the last Global)
+        let global_cc_block = blocks.iter().find(|b| {
+            b.get("cache_control")
+                .and_then(|cc| cc.get("scope"))
+                .and_then(|s| s.as_str())
+                == Some("global")
+        });
+        assert!(
+            global_cc_block.is_some(),
+            "should have a block with scope=global cache_control"
         );
-        assert_eq!(
-            first["cache_control"]["scope"].as_str(),
-            Some("global"),
-            "Global block should have scope=global"
-        );
-        assert_eq!(
-            first["cache_control"]["ttl"].as_str(),
-            Some("1h"),
-            "Global block should have ttl=1h"
-        );
+        let gcc = &global_cc_block.unwrap()["cache_control"];
+        assert_eq!(gcc["type"].as_str(), Some("ephemeral"));
+        assert_eq!(gcc["ttl"].as_str(), Some("1h"));
 
         // Last block (profile/dynamic) should NOT have cache_control
         let last = blocks.last().unwrap();
