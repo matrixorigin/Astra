@@ -482,3 +482,22 @@ impl From<DecisionListRecord> for DecisionListResponse {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decision_list_query_defaults() {
+        let q: DecisionListQuery = serde_json::from_str("{}").unwrap();
+        assert_eq!(q.limit, 50);
+        assert_eq!(q.offset, 0);
+        assert!(q.session_id.is_none());
+        assert!(q.decision_type.is_none());
+    }
+
+    #[test]
+    fn default_decision_limit_value() {
+        assert_eq!(default_decision_limit(), 50);
+    }
+}

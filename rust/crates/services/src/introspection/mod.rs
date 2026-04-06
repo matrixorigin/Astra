@@ -245,3 +245,41 @@ pub struct MemoryRecallQuery {
     #[serde(default = "default_recall_limit")]
     pub limit: i32,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn context_trend_query_defaults() {
+        let json = r#"{"session_id": "s1"}"#;
+        let q: ContextTrendQuery = serde_json::from_str(json).unwrap();
+        assert_eq!(q.turns, 10);
+        assert_eq!(q.context_window, 128000);
+    }
+
+    #[test]
+    fn context_snapshot_query_defaults() {
+        let json = r#"{"session_id": "s1"}"#;
+        let q: ContextSnapshotQuery = serde_json::from_str(json).unwrap();
+        assert_eq!(q.raw_token_budget, 2000);
+        assert!(!q.detail);
+        assert!(!q.raw);
+        assert!(q.turn_index.is_none());
+    }
+
+    #[test]
+    fn retrieval_quality_query_defaults() {
+        let json = r#"{"session_id": "s1"}"#;
+        let q: RetrievalQualityQuery = serde_json::from_str(json).unwrap();
+        assert_eq!(q.turns, 5);
+    }
+
+    #[test]
+    fn memory_recall_query_defaults() {
+        let json = r#"{"session_id": "s1", "query": "hello"}"#;
+        let q: MemoryRecallQuery = serde_json::from_str(json).unwrap();
+        assert_eq!(q.task_hint, "default");
+        assert_eq!(q.limit, 10);
+    }
+}
