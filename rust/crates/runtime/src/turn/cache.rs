@@ -65,3 +65,127 @@ impl SessionCache {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn empty_map() -> Map<String, Value> {
+        Map::new()
+    }
+
+    // --- insert ---
+
+    #[test]
+    fn insert_empty_cache() {
+        let mut cache = SessionCache::new(3, 60.0);
+        cache.insert("a", empty_map(), 100.0);
+        assert!(cache.get("a", 100.0).is_some());
+    }
+
+    #[test]
+    fn insert_sets_ts_if_missing() {
+        let mut cache = SessionCache::new(3, 60.0);
+        cache.insert("a", empty_map(), 42.0);
+        let entry = cache.get("a", 42.0).unwrap();
+        assert_eq!(entry["ts"].as_f64().unwrap(), 42.0);
+    }
+
+    #[test]
+    fn insert_preserves_existing_ts() {
+        let mut cache = SessionCache::new(3, 60.0);
+        let mut m = Map::new();
+        m.insert("ts".to_string(), json!(10.0));
+        cache.insert("a", m, 42.0);
+        let entry = cache.entries.get("a").unwrap();
+        assert_eq!(entry["ts"].as_f64().unwrap(), 10.0);
+    }
+
+    #[test]
+    fn insert_evicts_oldest_at_maxsize() {
+        let mut cache = SessionCache::new(2, 60.0);
+        cache.insert("a", empty_map(), 1.0);
+        cache.insert("b", empty_map(), 2.0);
+        cache.insert("c", empty_map(), 3.0);
+        assert!(cache.get("a", 3.0).is_none());
+        assert!(cache.get("b", 3.0).is_some());
+        assert!(cache.get("c", 3.0).is_some());
+    }
+
+    #[test]
+    fn insert_existing_key_moves_to_end() {
+        let mut cache = SessionCache::new(3, 60.0);
+        cache.insert("a", empty_map(), 1.0);
+        cache.insert("b", empty_map(), 2.0);
+        cache.insert("a", empty_map(), 3.0);
+        assert_eq!(cache.order, vec!["b", "a"]);
+    }
+
+    // --- get ---
+
+    #[test]
+    fn get_nonexistent() {
+        let mut cache = SessionCache::new(3, 60.0);
+        assert!(cache.get("nope", 0.0).is_none());
+    }
+
+    #[test]
+    fn get_expired_entry() {
+        let mut cache = SessionCache::new(3, 60.0);
+        cache.insert("a", empty_map(), 0.0);
+        assert!(cache.get("a", 61.0).is_none());
+        // entry should be removed
+        assert!(cache.entries.get("a").is_none());
+    }
+
+    #[test]
+    fn get_valid_updates_ts() {
+        let mut cache = SessionCache::new(3, 60.0);
+        cache.insert("a", empty_map(), 10.0);
+        let entry = cache.get("a", 20.0).unwrap();
+        assert_eq!(entry["ts"].as_f64().unwrap(), 20.0);
+    }
+
+    #[test]
+    fn get_moves_to_end_of_lru() {
+        let mut cache = SessionCache::new(3, 60.0);
+        cache.insert("a", empty_map(), 1.0);
+        cache.insert("b", empty_map(), 2.0);
+        cache.insert("c", empty_map(), 3.0);
+        cache.get("a", 4.0);
+        assert_eq!(cache.order.last().unwrap(), "a");
+    }
+
+    #[test]
+    fn get_at_exact_ttl_boundary_expired() {
+        let mut cache = SessionCache::new(3, 60.0);
+        cache.insert("a", empty_map(), 0.0);
+        // TTL=60, now - ts > ttl means 60.001 > 60 → expired
+        assert!(cache.get("a", 60.001).is_none());
+    }
+
+    #[test]
+    fn get_at_exact_ttl_boundary_valid() {
+        let mut cache = SessionCache::new(3, 60.0);
+        cache.insert("a", empty_map(), 0.0);
+        // now - ts = 60.0, which is NOT > 60.0
+        assert!(cache.get("a", 60.0).is_some());
+    }
+
+    // --- LRU integration ---
+
+    #[test]
+    fn lru_access_prevents_eviction() {
+        let mut cache = SessionCache::new(2, 1000.0);
+        cache.insert("a", empty_map(), 1.0);
+        cache.insert("b", empty_map(), 2.0);
+        // access "a" to move it to end
+        cache.get("a", 3.0);
+        // insert "c" should evict "b" (now oldest)
+        cache.insert("c", empty_map(), 4.0);
+        assert!(cache.get("a", 4.0).is_some());
+        assert!(cache.get("b", 4.0).is_none());
+        assert!(cache.get("c", 4.0).is_some());
+    }
+}

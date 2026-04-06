@@ -500,3 +500,56 @@ impl TurnAuxiliaryEventWriter for NoopTurnAuxiliaryEventWriter {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn metadata_tool_name_none() {
+        assert!(metadata_tool_name(None).is_none());
+    }
+
+    #[test]
+    fn metadata_tool_name_from_tool_name() {
+        let v = json!({"tool_name": "bash"});
+        assert_eq!(metadata_tool_name(Some(&v)).unwrap(), "bash");
+    }
+
+    #[test]
+    fn metadata_tool_name_from_name_fallback() {
+        let v = json!({"name": "read_file"});
+        assert_eq!(metadata_tool_name(Some(&v)).unwrap(), "read_file");
+    }
+
+    #[test]
+    fn metadata_tool_name_prefers_tool_name() {
+        let v = json!({"tool_name": "preferred", "name": "fallback"});
+        assert_eq!(metadata_tool_name(Some(&v)).unwrap(), "preferred");
+    }
+
+    #[test]
+    fn metadata_tool_name_trims_quotes() {
+        let v = json!({"tool_name": "\"bash\""});
+        assert_eq!(metadata_tool_name(Some(&v)).unwrap(), "bash");
+    }
+
+    #[test]
+    fn metadata_tool_name_empty_after_trim() {
+        let v = json!({"tool_name": "\"\""});
+        assert!(metadata_tool_name(Some(&v)).is_none());
+    }
+
+    #[test]
+    fn metadata_tool_name_missing_both_fields() {
+        let v = json!({"other": "field"});
+        assert!(metadata_tool_name(Some(&v)).is_none());
+    }
+
+    #[test]
+    fn metadata_tool_name_non_string_value() {
+        let v = json!({"tool_name": 42});
+        assert!(metadata_tool_name(Some(&v)).is_none());
+    }
+}

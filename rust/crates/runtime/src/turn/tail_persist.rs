@@ -155,6 +155,139 @@ pub fn build_persist_thread_args(
     ])
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- build_cached_assistant_message ---
+
+    #[test]
+    fn cached_msg_basic() {
+        let msg = build_cached_assistant_message("hello", &[], "");
+        assert_eq!(msg["role"].as_str().unwrap(), "assistant");
+        assert_eq!(msg["content"].as_str().unwrap(), "hello");
+        assert!(msg.get("tool_calls").is_none());
+        assert!(msg.get("reasoning_content").is_none());
+    }
+
+    #[test]
+    fn cached_msg_with_tool_calls() {
+        let calls = vec![json!({"id": "tc1"})];
+        let msg = build_cached_assistant_message("", &calls, "");
+        assert_eq!(msg["tool_calls"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn cached_msg_with_reasoning() {
+        let msg = build_cached_assistant_message("hi", &[], "thought process");
+        assert_eq!(msg["reasoning_content"].as_str().unwrap(), "thought process");
+    }
+
+    #[test]
+    fn cached_msg_empty_tool_calls_excluded() {
+        let msg = build_cached_assistant_message("hi", &[], "");
+        assert!(msg.get("tool_calls").is_none());
+    }
+
+    // --- build_persist_thread_args ---
+
+    #[test]
+    fn persist_thread_minimal() {
+        let args = build_persist_thread_args(
+            "u1", "s1", &[], &[], "", &[], &[], "", &[], None, None, None, None, &[], 0, None,
+            None, None, None, None, None, false, false, false, false, false, false,
+        );
+        assert_eq!(args["user_id"].as_str().unwrap(), "u1");
+        assert_eq!(args["session_id"].as_str().unwrap(), "s1");
+        assert!(args["context_capture_id"].is_null());
+        assert!(args["cloud_tool_results"].is_null());
+        assert!(args["routing_meta"].is_null());
+    }
+
+    #[test]
+    fn persist_thread_merges_tool_calls() {
+        let cloud = vec![json!({"id": "c1"})];
+        let edge = vec![json!({"id": "e1"})];
+        let args = build_persist_thread_args(
+            "u1", "s1", &[], &[], "", &cloud, &edge, "", &[], None, None, None, None, &[], 0,
+            None, None, None, None, None, None, false, false, false, false, false, false,
+        );
+        let calls = args["tool_calls"].as_array().unwrap();
+        assert_eq!(calls.len(), 2);
+    }
+
+    #[test]
+    fn persist_thread_empty_routing_meta_is_null() {
+        let args = build_persist_thread_args(
+            "u1", "s1", &[], &[], "", &[], &[], "", &[], None, None, None, None, &[], 0, None,
+            None, None, None, None, Some(Value::Object(Map::new())), false, false, false, false,
+            false, false,
+        );
+        assert!(args["routing_meta"].is_null());
+    }
+
+    #[test]
+    fn persist_thread_nonempty_routing_meta() {
+        let args = build_persist_thread_args(
+            "u1", "s1", &[], &[], "", &[], &[], "", &[], None, None, None, None, &[], 0, None,
+            None, None, None, None, Some(json!({"model": "gpt-4"})), false, false, false, false,
+            false, false,
+        );
+        assert_eq!(args["routing_meta"]["model"].as_str().unwrap(), "gpt-4");
+    }
+
+    #[test]
+    fn persist_thread_cloud_results_nonempty() {
+        let cloud_results = vec![json!({"tool_call_id": "tc1"})];
+        let args = build_persist_thread_args(
+            "u1", "s1", &[], &[], "", &[], &[], "", &cloud_results, None, None, None, None, &[],
+            0, None, None, None, None, None, None, false, false, false, false, false, false,
+        );
+        assert_eq!(args["cloud_tool_results"].as_array().unwrap().len(), 1);
+    }
+
+    // --- build_turn_hook_args ---
+
+    #[test]
+    fn hook_args_minimal() {
+        let args = build_turn_hook_args(
+            "u1", "s1", &[], &[], "", &[], None, None, None, None, 0, None, false, false, false,
+            false,
+        );
+        assert_eq!(args["user_id"].as_str().unwrap(), "u1");
+        assert!(args["context_capture_id"].is_null());
+        assert_eq!(args["turn_count"].as_i64().unwrap(), 0);
+        assert!(!args["run_hook_db_writes"].as_bool().unwrap());
+    }
+
+    #[test]
+    fn hook_args_with_all_options() {
+        let args = build_turn_hook_args(
+            "u1",
+            "s1",
+            &[json!({"role": "user"})],
+            &[],
+            "response",
+            &[json!({"id": "tc1"})],
+            Some("cap1"),
+            Some("gpt-4"),
+            Some("agent1"),
+            Some("evt1"),
+            5,
+            Some(json!("2025-01-01")),
+            true,
+            true,
+            true,
+            true,
+        );
+        assert_eq!(args["context_capture_id"].as_str().unwrap(), "cap1");
+        assert_eq!(args["model_used"].as_str().unwrap(), "gpt-4");
+        assert_eq!(args["turn_count"].as_i64().unwrap(), 5);
+        assert!(args["run_hook_db_writes"].as_bool().unwrap());
+        assert!(args["run_observer"].as_bool().unwrap());
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn build_turn_hook_args(
     user_id: &str,
