@@ -50,3 +50,69 @@ pub fn parse_llm_round(v: &Value) -> (String, String, Vec<Value>, Map<String, Va
         .unwrap_or_default();
     (full_text, reasoning, tool_calls, usage)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    // --- parse_llm_round ---
+
+    #[test]
+    fn parse_full_round() {
+        let v = json!({
+            "full_text": "hello",
+            "reasoning": "because",
+            "tool_calls": [{"id": "1"}],
+            "usage": {"prompt_tokens": 10}
+        });
+        let (ft, r, tc, u) = parse_llm_round(&v);
+        assert_eq!(ft, "hello");
+        assert_eq!(r, "because");
+        assert_eq!(tc.len(), 1);
+        assert_eq!(u["prompt_tokens"], 10);
+    }
+
+    #[test]
+    fn parse_empty_object() {
+        let (ft, r, tc, u) = parse_llm_round(&json!({}));
+        assert!(ft.is_empty());
+        assert!(r.is_empty());
+        assert!(tc.is_empty());
+        assert!(u.is_empty());
+    }
+
+    #[test]
+    fn parse_wrong_types() {
+        let v = json!({"full_text": 42, "tool_calls": "not_array", "usage": "not_object"});
+        let (ft, _, tc, u) = parse_llm_round(&v);
+        assert!(ft.is_empty());
+        assert!(tc.is_empty());
+        assert!(u.is_empty());
+    }
+
+    // --- authorized ---
+    // Note: authorized() tests omitted — env var manipulation is
+    // inherently racy in parallel test harness.
+
+    // --- header_str ---
+
+    #[test]
+    fn header_str_exists() {
+        let mut h = HeaderMap::new();
+        h.insert("x-test", "value".parse().unwrap());
+        assert_eq!(header_str(&h, "x-test").as_deref(), Some("value"));
+    }
+
+    #[test]
+    fn header_str_missing() {
+        assert!(header_str(&HeaderMap::new(), "x-test").is_none());
+    }
+
+    #[test]
+    fn header_str_empty_value() {
+        let mut h = HeaderMap::new();
+        h.insert("x-test", "".parse().unwrap());
+        assert!(header_str(&h, "x-test").is_none());
+    }
+}

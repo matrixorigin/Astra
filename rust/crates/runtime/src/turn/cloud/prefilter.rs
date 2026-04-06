@@ -82,3 +82,92 @@ pub fn plan_cloud_skill_candidates(
         cloud_skill_names,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn schema(name: &str, desc: &str) -> Value {
+        json!({"function": {"name": name, "description": desc}})
+    }
+
+    #[test]
+    fn empty_schemas() {
+        let plan = plan_cloud_skill_candidates(&[], &BTreeSet::new(), "hello", 10);
+        assert!(plan.selected_schemas.is_empty());
+        assert!(plan.cloud_skill_names.is_empty());
+    }
+
+    #[test]
+    fn empty_query_returns_all() {
+        let schemas = vec![schema("foo", "bar"), schema("baz", "qux")];
+        let plan = plan_cloud_skill_candidates(&schemas, &BTreeSet::new(), "", 10);
+        assert_eq!(plan.selected_schemas.len(), 2);
+        assert_eq!(plan.cloud_skill_names.len(), 2);
+    }
+
+    #[test]
+    fn edge_tool_names_excluded() {
+        let schemas = vec![schema("bash", "run commands"), schema("web", "search")];
+        let edge = BTreeSet::from(["bash".to_string()]);
+        let plan = plan_cloud_skill_candidates(&schemas, &edge, "run", 10);
+        assert_eq!(plan.selected_schemas.len(), 1);
+        // bash is NOT in cloud_skill_names because it's an edge tool
+        assert!(!plan.cloud_skill_names.contains("bash"));
+        assert!(plan.cloud_skill_names.contains("web"));
+    }
+
+    #[test]
+    fn max_candidates_limits_output() {
+        let schemas = vec![schema("a", "x"), schema("b", "y"), schema("c", "z")];
+        let plan = plan_cloud_skill_candidates(&schemas, &BTreeSet::new(), "x y z", 2);
+        assert_eq!(plan.selected_schemas.len(), 2);
+        // all three still tracked as cloud skill names
+        assert_eq!(plan.cloud_skill_names.len(), 3);
+    }
+
+    #[test]
+    fn token_match_scoring() {
+        let schemas = vec![
+            schema("file_search", "search files on disk"),
+            schema("web_fetch", "fetch web pages"),
+        ];
+        let plan = plan_cloud_skill_candidates(&schemas, &BTreeSet::new(), "search files", 10);
+        // file_search should score higher (both tokens match)
+        assert_eq!(
+            plan.selected_schemas[0]["function"]["name"].as_str().unwrap(),
+            "file_search"
+        );
+    }
+
+    #[test]
+    fn substring_overlap_boosts_score() {
+        let schemas = vec![
+            schema("memory_store", "save data"),
+            schema("disk_write", "write to disk"),
+        ];
+        // "memory" matches name part "memory" via substring overlap → +2 boost
+        let plan = plan_cloud_skill_candidates(&schemas, &BTreeSet::new(), "memory", 10);
+        assert_eq!(
+            plan.selected_schemas[0]["function"]["name"].as_str().unwrap(),
+            "memory_store"
+        );
+    }
+
+    #[test]
+    fn schema_without_function_name_skipped() {
+        let schemas = vec![json!({"function": {}}), schema("good", "desc")];
+        let plan = plan_cloud_skill_candidates(&schemas, &BTreeSet::new(), "good", 10);
+        assert_eq!(plan.selected_schemas.len(), 1);
+        assert_eq!(plan.cloud_skill_names.len(), 1);
+    }
+
+    #[test]
+    fn zero_max_candidates() {
+        let schemas = vec![schema("a", "b")];
+        let plan = plan_cloud_skill_candidates(&schemas, &BTreeSet::new(), "a", 0);
+        assert!(plan.selected_schemas.is_empty());
+        assert_eq!(plan.cloud_skill_names.len(), 1);
+    }
+}

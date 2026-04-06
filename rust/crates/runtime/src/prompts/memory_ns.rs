@@ -31,3 +31,51 @@ pub fn to_memory_type(ns: &str) -> &'static str {
 
 /// All known namespaces.
 pub const ALL: &[&str] = &[PREFERENCE, KNOWLEDGE, STAGING, PLAN, TASK, EPISODIC];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn preference_maps_to_profile() {
+        assert_eq!(to_memory_type(PREFERENCE), "profile");
+    }
+
+    #[test]
+    fn knowledge_maps_to_semantic() {
+        assert_eq!(to_memory_type(KNOWLEDGE), "semantic");
+    }
+
+    #[test]
+    fn staging_maps_to_working() {
+        assert_eq!(to_memory_type(STAGING), "working");
+    }
+
+    #[test]
+    fn plan_maps_to_procedural() {
+        assert_eq!(to_memory_type(PLAN), "procedural");
+    }
+
+    #[test]
+    fn task_maps_to_working() {
+        assert_eq!(to_memory_type(TASK), "working");
+    }
+
+    #[test]
+    fn episodic_maps_to_episodic() {
+        assert_eq!(to_memory_type(EPISODIC), "episodic");
+    }
+
+    #[test]
+    fn unknown_maps_to_semantic() {
+        assert_eq!(to_memory_type("unknown"), "semantic");
+        assert_eq!(to_memory_type(""), "semantic");
+    }
+
+    #[test]
+    fn all_constant_complete() {
+        assert_eq!(ALL.len(), 6);
+        assert!(ALL.contains(&PREFERENCE));
+        assert!(ALL.contains(&EPISODIC));
+    }
+}
