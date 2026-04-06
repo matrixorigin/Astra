@@ -2470,10 +2470,15 @@ mod tests {
         let content = msg.get("content").expect("should have content");
         let blocks = content.as_array().unwrap();
 
-        // Find Session block (second block, if present)
-        if blocks.len() >= 3 {
-            let session_block = &blocks[1];
-            if let Some(cc) = session_block.get("cache_control") {
+        // With fine-grained sections, Session blocks come after Global blocks.
+        // Find a block whose text contains "Self-Model" (Session-scoped tool list).
+        let session_block = blocks.iter().find(|b| {
+            b.get("text")
+                .and_then(|t| t.as_str())
+                .is_some_and(|t| t.contains("Self-Model"))
+        });
+        if let Some(block) = session_block {
+            if let Some(cc) = block.get("cache_control") {
                 assert_eq!(cc["ttl"].as_str(), Some("1h"), "Session should have ttl=1h");
                 // Session should NOT have scope=global (it's per-session)
                 assert!(

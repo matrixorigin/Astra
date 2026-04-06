@@ -24,7 +24,7 @@ use crate::bridge::rate_limit_cooldown::{
     PerModelCooldown, RateLimitAction, is_overload_status, is_rate_limit_status,
     parse_retry_after_ms,
 };
-use crate::output_style::{OutputStyle, current_output_style};
+use crate::output_style::current_output_style;
 use crate::prompts;
 
 /// Maximum retries for transient LLM errors (429, 5xx, network).
@@ -69,73 +69,23 @@ fn is_valid_tool_name(name: &str) -> bool {
         && !name.chars().any(char::is_whitespace)
 }
 
-// ── System Prompt Cache ──────────────────────────────────────────────────────
-use std::sync::Mutex;
+// ── System Prompt ─────────────────────────────────────────────────────────
 
-fn prompt_cache() -> &'static Mutex<HashMap<u64, String>> {
-    static CACHE: OnceLock<Mutex<HashMap<u64, String>>> = OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-/// Build or retrieve a cached system prompt for the given tool+profile context.
+/// Build a system prompt for the given tool+profile context.
+/// The underlying section builders are cached in bridge_inprocess::section_cache.
 pub(crate) fn cached_system_prompt(
     tool_names: &[&str],
     profile_desc: &str,
     confidence: f64,
     task_type: Option<&str>,
 ) -> String {
-    cached_system_prompt_with_style(
+    prompts::build_main_system_prompt_with_style(
         tool_names,
         profile_desc,
         confidence,
         task_type,
         current_output_style(),
     )
-}
-
-/// Build or retrieve a cached system prompt with explicit output style.
-pub(crate) fn cached_system_prompt_with_style(
-    tool_names: &[&str],
-    profile_desc: &str,
-    confidence: f64,
-    task_type: Option<&str>,
-    output_style: Option<&OutputStyle>,
-) -> String {
-    // Include output style name in cache key hash
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    for name in tool_names {
-        name.hash(&mut hasher);
-    }
-    task_type.unwrap_or("none").hash(&mut hasher);
-    let bucket = if confidence < 0.3 { "low" } else { "normal" };
-    bucket.hash(&mut hasher);
-    profile_desc.hash(&mut hasher);
-    output_style
-        .map(|s| s.name.as_str())
-        .unwrap_or("default")
-        .hash(&mut hasher);
-    let key = hasher.finish();
-
-    if let Ok(cache) = prompt_cache().lock()
-        && let Some(cached) = cache.get(&key)
-    {
-        return cached.clone();
-    }
-    let prompt = prompts::build_main_system_prompt_with_style(
-        tool_names,
-        profile_desc,
-        confidence,
-        task_type,
-        output_style,
-    );
-    if let Ok(mut cache) = prompt_cache().lock() {
-        if cache.len() > 32 {
-            cache.clear();
-        }
-        cache.insert(key, prompt.clone());
-    }
-    prompt
 }
 
 /// Classify an LLM error message into a category for SSE error events.
