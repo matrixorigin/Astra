@@ -100,6 +100,10 @@ struct CliSseStreamHost<'a> {
     approval_request_tx: Option<super::chat_stream::ApprovalRequestTx>,
     /// Skill resolver for intercepting "skill" tool calls.
     skill_resolver: Option<std::sync::Arc<dyn astra_runtime::turn::skill_tool::SkillResolver>>,
+    /// Set when a skill call fires during this SSE turn. Subsequent non-skill
+    /// tool calls are deferred (returned as synthetic errors) so the model
+    /// re-evaluates after reading the skill instructions.
+    skill_fired_this_turn: bool,
 }
 
 impl<'a> CliSseStreamHost<'a> {
@@ -125,6 +129,7 @@ impl<'a> CliSseStreamHost<'a> {
             stream_event_tx: ctx.stream_event_tx,
             approval_request_tx: ctx.approval_request_tx,
             skill_resolver: ctx.skill_resolver,
+            skill_fired_this_turn: false,
         }
     }
 
@@ -470,6 +475,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
         let start = std::time::Instant::now();
         let output = if allowed {
             if tool == astra_runtime::turn::skill_tool::SKILL_TOOL_NAME {
+                self.skill_fired_this_turn = true;
                 if let Some(resolver) = &self.skill_resolver {
                     astra_runtime::turn::skill_tool::execute_skill_inline(
                         resolver.as_ref(),
@@ -480,6 +486,15 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                 } else {
                     "Error: skill resolver not available".to_string()
                 }
+            } else if self.skill_fired_this_turn {
+                // A skill was invoked earlier in this turn. This tool call was
+                // generated without seeing the skill instructions — defer it so
+                // the model re-evaluates after reading the skill content.
+                format!(
+                    "Deferred: a skill was invoked in this turn. Read the skill \
+                     instructions first, then decide whether to call `{}` again.",
+                    tool
+                )
             } else {
                 self.executor.execute(tool, args).await
             }

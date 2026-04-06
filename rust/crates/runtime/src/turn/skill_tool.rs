@@ -679,7 +679,9 @@ pub fn skill_tool_schema(
          - When a skill is relevant to the user's request, invoke it IMMEDIATELY \
          as your first action\n\
          - When a skill matches the user's request, this is a BLOCKING REQUIREMENT: \
-         invoke the relevant skill tool BEFORE generating any other response about the task\n\
+         invoke the relevant skill tool BEFORE generating any other response about the task. \
+         Do NOT call any other tools in the same response as a skill invocation — the skill \
+         must be loaded first so you can follow its instructions\n\
          - NEVER just mention a skill in your text response without actually calling this tool\n\
          - If the user explicitly references a skill by name, invoke it\n\n\
          Available skills:\n{}{}",
@@ -755,6 +757,8 @@ pub fn skill_listing_system_message(
         "You have access to specialized skills via the `skill` tool. \
          This is a BLOCKING REQUIREMENT: when a user's request matches a skill, \
          invoke the skill tool BEFORE generating any other response about the task. \
+         Do NOT call any other tools in the same response as a skill invocation — \
+         the skill must be loaded first so you can follow its instructions. \
          Do not attempt to manually replicate what a skill does — skills encode \
          domain-specific workflows that outperform ad-hoc tool calls.\n\n{}{}",
         lines.join("\n"),

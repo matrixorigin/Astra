@@ -1188,8 +1188,50 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
                 }
             }
             skill_results = dedup_results;
-            skill_results.extend(sr);
-            post_skill_tool_calls = remaining;
+            skill_results.extend(sr.iter().cloned());
+
+            // ── Skill exclusivity: drop non-skill tool calls when skills fired ──
+            // When the model emits skill calls alongside regular tool calls in the
+            // same turn, the regular calls were generated WITHOUT seeing the skill
+            // instructions. Executing them would bypass the skill's guidance entirely.
+            // Drop them and return synthetic errors so the model re-evaluates after
+            // reading the skill content.
+            //
+            // Only trigger on *new* skill invocations (`sr`), not dedup stubs —
+            // a dedup stub means the skill was already loaded in a prior turn and
+            // the model should already know its instructions.
+            let new_skills_fired = !sr.is_empty();
+            if new_skills_fired && !remaining.is_empty() {
+                let dropped_count = remaining.len();
+                for tc in &remaining {
+                    let call_id = tc.get("id").and_then(Value::as_str).unwrap_or("unknown");
+                    let tool_name = tc
+                        .get("function")
+                        .and_then(|f| f.get("name"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown");
+                    skill_results.push((
+                        call_id.to_string(),
+                        format!(
+                            "Deferred: skill was invoked in this turn. Read the skill \
+                             instructions above, then decide whether to call `{}` again.",
+                            tool_name
+                        ),
+                    ));
+                }
+                post_skill_tool_calls = Vec::new(); // clear remaining
+                if !quiet {
+                    host.emit_headless_line(
+                        HeadlessStderrStyle::Dim,
+                        format!(
+                            "  ⏸ {} non-skill tool call(s) deferred — skill takes priority",
+                            dropped_count
+                        ),
+                    );
+                }
+            } else {
+                post_skill_tool_calls = remaining;
+            }
 
             // Apply skill activation effects (model override, tool restrictions).
             // A new activation fully replaces the previous one — fields not
@@ -3758,5 +3800,204 @@ mod tests {
         let content = msgs[0]["content"].as_str().unwrap();
         assert!(content.contains("review-changes"));
         assert!(content.contains("# Review"));
+    }
+
+    // ── Skill exclusivity tests ─────────────────────────────────────────
+
+    /// Helper: a turn where the model emits a skill call AND a regular tool call together.
+    fn skill_plus_regular_tool_call_result(
+        skill_call_id: &str,
+        skill_args: &str,
+        regular_call_id: &str,
+        regular_tool: &str,
+        regular_args: &str,
+        prompt: u64,
+        completion: u64,
+    ) -> HostTurnResult {
+        HostTurnResult {
+            accum: ChatTurnSseAccum {
+                has_tool_calls: true,
+                has_usage: true,
+                prompt_tokens: prompt,
+                completion_tokens: completion,
+                tool_calls: vec![
+                    json!({
+                        "id": skill_call_id,
+                        "type": "function",
+                        "function": {
+                            "name": "skill",
+                            "arguments": skill_args,
+                        }
+                    }),
+                    json!({
+                        "id": regular_call_id,
+                        "type": "function",
+                        "function": {
+                            "name": regular_tool,
+                            "arguments": regular_args,
+                        }
+                    }),
+                ],
+                ..ChatTurnSseAccum::default()
+            },
+            ttft_ms: Some(30),
+            edge_tool_round: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn skill_exclusivity_defers_parallel_non_skill_tool_calls() {
+        let resolver = StubSkillResolver::new();
+        let turns = vec![
+            // Turn 1: model emits skill + write_file in parallel
+            skill_plus_regular_tool_call_result(
+                "call_skill",
+                r#"{"skill_name": "test-skill"}"#,
+                "call_write",
+                "write_file",
+                r#"{"path": "/tmp/test.html", "content": "hello"}"#,
+                100,
+                50,
+            ),
+            // Turn 2: model follows skill instructions properly
+            text_result("Done following skill.", 80, 30, None),
+        ];
+
+        let mut host = MockHost::new(turns);
+        host.quiet = false; // enable stderr output to check deferred message
+        let mut state = make_state();
+        state
+            .messages
+            .push(json!({"role": "user", "content": "use the test skill"}));
+        state.skill_resolver = Some(Arc::new(resolver));
+
+        let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
+        assert!(outcome.is_ok());
+
+        // The write_file call should have a "Deferred" tool result, not actual execution
+        let write_tool_msgs: Vec<&Value> = state
+            .messages
+            .iter()
+            .filter(|m| m.get("tool_call_id").and_then(Value::as_str) == Some("call_write"))
+            .collect();
+        assert_eq!(write_tool_msgs.len(), 1);
+        let content = write_tool_msgs[0]["content"].as_str().unwrap();
+        assert!(
+            content.contains("Deferred"),
+            "Expected deferred message, got: {content}"
+        );
+        assert!(
+            content.contains("write_file"),
+            "Should mention the deferred tool name"
+        );
+
+        // The skill call should still have been executed normally
+        let skill_msgs: Vec<&Value> = state
+            .messages
+            .iter()
+            .filter(|m| m.get("tool_call_id").and_then(Value::as_str) == Some("call_skill"))
+            .collect();
+        assert_eq!(skill_msgs.len(), 1);
+        assert!(skill_msgs[0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("# Skill: test-skill"));
+
+        // Host should have emitted a deferred notice
+        assert!(
+            host.emitted_lines
+                .iter()
+                .any(|l| l.contains("deferred")),
+            "Expected deferred notice in emitted lines: {:?}",
+            host.emitted_lines
+        );
+    }
+
+    #[tokio::test]
+    async fn skill_exclusivity_does_not_trigger_for_dedup_stubs() {
+        let resolver = StubSkillResolver::new();
+        let turns = vec![
+            // Turn 1: first invocation of skill (normal)
+            skill_tool_call_result("call_1", r#"{"skill_name": "test-skill"}"#, 100, 50),
+            // Turn 2: model re-invokes same skill + a regular tool call
+            // The skill should be deduped (stub), and the regular call should NOT be deferred
+            skill_plus_regular_tool_call_result(
+                "call_2",
+                r#"{"skill_name": "test-skill"}"#,
+                "call_bash",
+                "bash",
+                r#"{"command": "echo hi"}"#,
+                100,
+                50,
+            ),
+            text_result("All done.", 80, 30, None),
+        ];
+
+        let mut host = MockHost::new(turns);
+        let mut state = make_state();
+        state
+            .messages
+            .push(json!({"role": "user", "content": "use the test skill"}));
+        state.skill_resolver = Some(Arc::new(resolver));
+
+        let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
+        assert!(outcome.is_ok());
+
+        // The bash call should NOT be deferred (skill was a dedup stub, not new)
+        let bash_msgs: Vec<&Value> = state
+            .messages
+            .iter()
+            .filter(|m| m.get("tool_call_id").and_then(Value::as_str) == Some("call_bash"))
+            .collect();
+        // bash tool call goes through headless round (not intercepted by skill partition)
+        // so it won't have a "Deferred" message
+        for msg in &bash_msgs {
+            let content = msg["content"].as_str().unwrap_or("");
+            assert!(
+                !content.contains("Deferred"),
+                "Dedup stub should not trigger exclusivity, got: {content}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn skill_exclusivity_not_triggered_when_no_skills() {
+        // No skill resolver — regular tool calls should work normally
+        let turns = vec![
+            server_tool_result(
+                vec![json!({
+                    "id": "call_bash",
+                    "type": "function",
+                    "function": {
+                        "name": "bash",
+                        "arguments": r#"{"command": "echo hi"}"#,
+                    }
+                })],
+                vec![],
+                100,
+                50,
+                Some(30),
+            ),
+            text_result("Done.", 80, 30, None),
+        ];
+
+        let mut host = MockHost::new(turns);
+        let mut state = make_state();
+        state
+            .messages
+            .push(json!({"role": "user", "content": "run echo"}));
+        // No skill_resolver set
+
+        let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
+        assert!(outcome.is_ok());
+
+        // No deferred messages should exist
+        for msg in &state.messages {
+            let content = msg.get("content").and_then(Value::as_str).unwrap_or("");
+            assert!(
+                !content.contains("Deferred"),
+                "No skills = no deferral, got: {content}"
+            );
+        }
     }
 }

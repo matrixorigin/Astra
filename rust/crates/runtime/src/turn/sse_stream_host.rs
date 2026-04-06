@@ -180,6 +180,15 @@ pub async fn consume_sse_stream_cancellable<H: SseStreamHost>(
     let mut abort: Option<SseAbortReason> = None;
     let mut first_sse_frame_seen = false;
 
+    // Tool requests are accumulated during streaming and flushed after the
+    // stream ends.  This lets us inspect the full set of tool calls before
+    // executing any of them — critical for skill-exclusivity: if a `skill`
+    // call appears alongside regular tool calls we must execute the skill
+    // first and defer the rest.
+    //
+    // Approval requests are still flushed inline (they don't execute tools).
+    let mut deferred_tool_pending: Vec<ChatTurnEdgePending> = Vec::new();
+
     host.on_before_sse_read_loop();
 
     let idle = idle_timeout;
@@ -217,6 +226,8 @@ pub async fn consume_sse_stream_cancellable<H: SseStreamHost>(
             }
             let effects = dispatch_chat_turn_sse_event_block(&event_str, &mut accum, &mut pending);
             host.on_render_effects(effects);
+            // Separate tool requests (deferred) from approval requests (flush now).
+            split_and_defer_tools(&mut pending, &mut deferred_tool_pending);
             flush_pending_via_host(&mut pending, host, &mut tool_results, &mut approval_results)
                 .await;
         }
@@ -231,6 +242,7 @@ pub async fn consume_sse_stream_cancellable<H: SseStreamHost>(
         accum.reasoning_content.clear();
         accum.tool_calls.clear();
         pending.clear();
+        deferred_tool_pending.clear();
         let msg = match abort {
             Some(SseAbortReason::IdleTimeout) => {
                 format!("Error: stream idle timeout after {}ms", idle.as_millis())
@@ -250,8 +262,18 @@ pub async fn consume_sse_stream_cancellable<H: SseStreamHost>(
         }
         let effects = dispatch_chat_turn_sse_event_block(&tail, &mut accum, &mut pending);
         host.on_render_effects(effects);
+        split_and_defer_tools(&mut pending, &mut deferred_tool_pending);
         flush_pending_via_host(&mut pending, host, &mut tool_results, &mut approval_results).await;
     }
+
+    // Now flush all deferred tool requests at once, with skill-awareness.
+    flush_pending_via_host(
+        &mut deferred_tool_pending,
+        host,
+        &mut tool_results,
+        &mut approval_results,
+    )
+    .await;
 
     host.on_stream_complete();
 
@@ -264,6 +286,35 @@ pub async fn consume_sse_stream_cancellable<H: SseStreamHost>(
         },
         abort,
     )
+}
+
+/// Move `ToolRequest` items from `pending` into `deferred`, leaving only
+/// non-tool items (e.g. `ApprovalRequired`) in `pending` for immediate flush.
+/// Skill tool requests are placed before non-skill requests so that the host's
+/// `execute_tool` can set its skill-exclusivity flag before processing the rest.
+fn split_and_defer_tools(
+    pending: &mut Vec<ChatTurnEdgePending>,
+    deferred: &mut Vec<ChatTurnEdgePending>,
+) {
+    let taken = std::mem::take(pending);
+    // Two-pass: skills first, then the rest, preserving relative order within each group.
+    let mut non_skill = Vec::new();
+    for item in taken {
+        match &item {
+            ChatTurnEdgePending::ToolRequest { tool, .. }
+                if tool == crate::turn::skill_tool::SKILL_TOOL_NAME =>
+            {
+                deferred.push(item);
+            }
+            ChatTurnEdgePending::ToolRequest { .. } => {
+                non_skill.push(item);
+            }
+            _ => {
+                pending.push(item);
+            }
+        }
+    }
+    deferred.extend(non_skill);
 }
 
 async fn flush_pending_via_host<H: SseStreamHost>(
