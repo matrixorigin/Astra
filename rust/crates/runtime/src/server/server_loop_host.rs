@@ -1072,6 +1072,7 @@ mod tests {
             skill_effort: None,
             skill_agent_type: None,
             skill_allowed_tools: None,
+            skill_sandbox_policy: None,
             skill_quality_tracker: crate::skills::quality::SkillQualityTracker::new(),
             skill_improvement_tracker: crate::skills::improvement::ImprovementTracker::new(),
             pinned_skills: std::collections::HashSet::new(),

@@ -245,6 +245,10 @@ pub struct AgenticLoopState {
     /// When non-empty, only these tools (plus `skill` itself) should be available.
     /// The host converts this allow-list to additions in `restricted_tools`.
     pub skill_allowed_tools: Option<HashSet<String>>,
+    /// Sandbox policy derived from the most recently activated skill's trust tier.
+    /// When set, tool execution should apply these restrictions (path boundaries,
+    /// env filtering, network control, timeouts).
+    pub skill_sandbox_policy: Option<crate::tool_sandbox::SandboxPolicy>,
     /// Per-skill quality metrics accumulated during the session.
     /// Used to boost high-performing skills in selection priority.
     pub skill_quality_tracker: crate::skills::quality::SkillQualityTracker,
@@ -1086,6 +1090,7 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
                 };
                 state.skill_effort = act.effort;
                 state.skill_agent_type = act.agent_type;
+                state.skill_sandbox_policy = act.sandbox_policy;
             }
 
             &post_skill_tool_calls
@@ -1571,6 +1576,7 @@ mod tests {
             skill_effort: None,
             skill_agent_type: None,
             skill_allowed_tools: None,
+            skill_sandbox_policy: None,
             skill_quality_tracker: crate::skills::quality::SkillQualityTracker::new(),
             skill_improvement_tracker: crate::skills::improvement::ImprovementTracker::new(),
             pinned_skills: std::collections::HashSet::new(),
@@ -2957,6 +2963,7 @@ mod tests {
                         aliases: Vec::new(),
                         effort: None,
                         agent_type: None,
+                        trust_tier: crate::skills::manifest::TrustTier::Bundled,
                     },
                 )
                 .ok_or_else(|| format!("unknown skill: {name}"))

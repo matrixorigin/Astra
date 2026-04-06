@@ -230,6 +230,7 @@ pub(crate) async fn stream_chat_sse(
         skill_effort: None,
         skill_agent_type: None,
         skill_allowed_tools: None,
+            skill_sandbox_policy: None,
         skill_quality_tracker: p.skill_quality_tracker.clone(),
         skill_improvement_tracker: astra_runtime::skills::improvement::ImprovementTracker::new(),
         pinned_skills: std::collections::HashSet::new(),

@@ -2,8 +2,8 @@
 
 use std::path::PathBuf;
 
-/// Security enforcement level.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Security enforcement level (ordered from least to most restrictive).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum SandboxMode {
     /// No restrictions — backward compatible with current behavior.
     Permissive,
@@ -129,6 +129,32 @@ impl SandboxPolicy {
         }
     }
 
+    /// Create a policy based on the skill's trust tier.
+    ///
+    /// Maps trust tiers to sandbox modes:
+    /// - Bundled → Permissive (platform-tested, full trust)
+    /// - Verified → Standard (reviewed publisher, path enforcement)
+    /// - Community → Standard + env allowlist (automated scan only)
+    /// - Unverified → Strict (no verification, full isolation)
+    pub fn for_trust_tier(
+        tier: &crate::skills::manifest::TrustTier,
+        project_root: impl Into<PathBuf>,
+    ) -> Self {
+        use crate::skills::manifest::TrustTier;
+        let root = project_root.into();
+        match tier {
+            TrustTier::Bundled => Self::permissive(root),
+            TrustTier::Verified => Self::for_project(root),
+            TrustTier::Community => {
+                let mut p = Self::for_project(root);
+                // Community skills get env filtering (only baseline + build vars)
+                p.env_allowlist = Some(Vec::new());
+                p
+            }
+            TrustTier::Unverified => Self::strict(root),
+        }
+    }
+
     /// Check if a path prefix is allowed (project root or allowed_paths).
     pub fn is_path_allowed(&self, path: &std::path::Path) -> bool {
         if self.mode == SandboxMode::Permissive {
@@ -217,5 +243,45 @@ mod tests {
         assert!(p.is_path_allowed(std::path::Path::new("/home/user/proj")));
         assert!(p.is_path_allowed(std::path::Path::new("/home/user/proj/deep/dir")));
         assert!(!p.is_path_allowed(std::path::Path::new("/home/user")));
+    }
+
+    #[test]
+    fn trust_tier_bundled_is_permissive() {
+        use crate::skills::manifest::TrustTier;
+        let p = SandboxPolicy::for_trust_tier(&TrustTier::Bundled, "/proj");
+        assert_eq!(p.mode, SandboxMode::Permissive);
+        assert!(p.network_allowed);
+        assert!(p.is_path_allowed(std::path::Path::new("/etc/passwd")));
+    }
+
+    #[test]
+    fn trust_tier_verified_is_standard() {
+        use crate::skills::manifest::TrustTier;
+        let p = SandboxPolicy::for_trust_tier(&TrustTier::Verified, "/proj");
+        assert_eq!(p.mode, SandboxMode::Standard);
+        assert!(p.network_allowed);
+        assert!(p.is_path_allowed(std::path::Path::new("/proj/src/main.rs")));
+        assert!(!p.is_path_allowed(std::path::Path::new("/etc/passwd")));
+    }
+
+    #[test]
+    fn trust_tier_community_has_env_filter() {
+        use crate::skills::manifest::TrustTier;
+        let p = SandboxPolicy::for_trust_tier(&TrustTier::Community, "/proj");
+        assert_eq!(p.mode, SandboxMode::Standard);
+        // Community gets env allowlist (only baseline vars)
+        assert!(p.env_allowlist.is_some());
+        assert!(p.is_env_allowed("PATH")); // baseline always allowed
+        assert!(!p.is_env_allowed("SECRET_API_KEY")); // non-baseline blocked
+    }
+
+    #[test]
+    fn trust_tier_unverified_is_strict() {
+        use crate::skills::manifest::TrustTier;
+        let p = SandboxPolicy::for_trust_tier(&TrustTier::Unverified, "/proj");
+        assert_eq!(p.mode, SandboxMode::Strict);
+        assert!(!p.network_allowed);
+        assert_eq!(p.max_execution_secs, 15.0);
+        assert!(!p.is_path_allowed(std::path::Path::new("/etc/passwd")));
     }
 }

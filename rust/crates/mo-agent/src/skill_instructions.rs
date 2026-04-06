@@ -1354,6 +1354,7 @@ impl astra_runtime::turn::skill_tool::SkillResolver for CliSkillResolver {
                     aliases: Vec::new(),
                     effort: None,
                     agent_type: None,
+                    trust_tier: astra_runtime::skills::manifest::TrustTier::Bundled,
                 });
             }
         }
@@ -1396,6 +1397,7 @@ impl astra_runtime::turn::skill_tool::SkillResolver for CliSkillResolver {
             aliases: Vec::new(),
             effort: None,
             agent_type: None,
+            trust_tier: astra_runtime::skills::manifest::TrustTier::Bundled,
         })
     }
 

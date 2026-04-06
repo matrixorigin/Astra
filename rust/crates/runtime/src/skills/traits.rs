@@ -107,6 +107,7 @@ pub struct ResolvedSkill {
     pub aliases: Vec<String>,
     pub effort: Option<super::manifest::EffortLevel>,
     pub agent_type: Option<String>,
+    pub trust_tier: super::manifest::TrustTier,
 }
 
 /// Resolves skill names to instructions.

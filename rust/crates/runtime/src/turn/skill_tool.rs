@@ -133,6 +133,8 @@ pub struct ResolvedSkill {
     pub effort: Option<crate::skills::manifest::EffortLevel>,
     /// Agent type for fork execution (e.g. "general-purpose").
     pub agent_type: Option<String>,
+    /// Trust tier — determines sandbox policy during execution.
+    pub trust_tier: crate::skills::manifest::TrustTier,
 }
 
 /// Trait for resolving skill names to instructions.
@@ -447,6 +449,9 @@ pub struct SkillActivation {
     pub effort: Option<EffortLevel>,
     /// Agent type hint (e.g. `"coder"`, `"researcher"`).
     pub agent_type: Option<String>,
+    /// Sandbox policy derived from the skill's trust tier.
+    /// When set, the agentic loop should apply these restrictions to tool execution.
+    pub sandbox_policy: Option<crate::tool_sandbox::SandboxPolicy>,
 }
 
 /// Partition tool calls into skill calls and regular calls, executing skills
@@ -586,6 +591,17 @@ fn merge_activations(prev: Option<SkillActivation>, new: SkillActivation) -> Ski
                 .allowed_tools
                 .retain(|t| new_set.contains(t.as_str()));
         }
+    }
+
+    // Sandbox: stricter policy wins (higher SandboxMode ordinal = more restrictive).
+    match (&merged.sandbox_policy, &new.sandbox_policy) {
+        (None, p @ Some(_)) => merged.sandbox_policy = p.clone(),
+        (Some(prev_p), Some(new_p)) => {
+            if new_p.mode > prev_p.mode {
+                merged.sandbox_policy = Some(new_p.clone());
+            }
+        }
+        _ => {} // prev has policy, new doesn't → keep prev; both None → nothing.
     }
 
     merged
@@ -856,11 +872,19 @@ fn run_hooks(actions: &[HookAction], skip_shell: bool) {
 }
 
 fn build_activation(skill: &ResolvedSkill) -> SkillActivation {
+    let sandbox_policy = {
+        let root = std::env::current_dir().unwrap_or_default();
+        Some(crate::tool_sandbox::SandboxPolicy::for_trust_tier(
+            &skill.trust_tier,
+            root,
+        ))
+    };
     SkillActivation {
         model_override: skill.model.clone(),
         allowed_tools: skill.allowed_tools.clone(),
         effort: skill.effort.clone(),
         agent_type: skill.agent_type.clone(),
+        sandbox_policy,
     }
 }
 
@@ -896,6 +920,7 @@ mod tests {
                     aliases: Vec::new(),
                     effort: None,
                     agent_type: None,
+                    trust_tier: crate::skills::manifest::TrustTier::Bundled,
                 })
                 .ok_or_else(|| format!("Unknown skill: {name}"))
         }
@@ -1087,6 +1112,7 @@ mod tests {
                     aliases: vec![],
                     effort: None,
                     agent_type: None,
+                    trust_tier: crate::skills::manifest::TrustTier::Bundled,
                 })
             }
             fn available_skills(&self) -> Vec<SkillToolInfo> {
@@ -1444,6 +1470,7 @@ mod tests {
                     aliases: Vec::new(),
                     effort: None,
                     agent_type: None,
+                    trust_tier: crate::skills::manifest::TrustTier::Bundled,
                 })
             }
             fn available_skills(&self) -> Vec<SkillToolInfo> {
@@ -1488,6 +1515,7 @@ mod tests {
                     aliases: Vec::new(),
                     effort: None,
                     agent_type: None,
+                    trust_tier: crate::skills::manifest::TrustTier::Bundled,
                 })
             }
             fn available_skills(&self) -> Vec<SkillToolInfo> {
@@ -1563,6 +1591,7 @@ mod tests {
             aliases: Vec::new(),
             effort: None,
             agent_type: None,
+                    trust_tier: crate::skills::manifest::TrustTier::Bundled,
         };
         let act = super::build_activation(&skill);
         assert!(act.model_override.is_none());
@@ -1587,6 +1616,7 @@ mod tests {
             aliases: Vec::new(),
             effort: None,
             agent_type: None,
+                    trust_tier: crate::skills::manifest::TrustTier::Bundled,
         };
         let act = super::build_activation(&skill);
         assert_eq!(
@@ -1605,6 +1635,7 @@ mod tests {
             allowed_tools: vec!["bash".into()],
             effort: None,
             agent_type: None,
+                    sandbox_policy: None,
         };
         let merged = super::merge_activations(None, new);
         assert_eq!(merged.model_override.as_deref(), Some("gpt-4o"));
@@ -1618,12 +1649,14 @@ mod tests {
             allowed_tools: vec![],
             effort: None,
             agent_type: None,
+                    sandbox_policy: None,
         };
         let new = SkillActivation {
             model_override: Some("model-b".into()),
             allowed_tools: vec![],
             effort: None,
             agent_type: None,
+                    sandbox_policy: None,
         };
         let merged = super::merge_activations(Some(prev), new);
         assert_eq!(merged.model_override.as_deref(), Some("model-b"));
@@ -1636,12 +1669,14 @@ mod tests {
             allowed_tools: vec![],
             effort: None,
             agent_type: None,
+                    sandbox_policy: None,
         };
         let new = SkillActivation {
             model_override: None, // no opinion — should keep "model-a"
             allowed_tools: vec![],
             effort: None,
             agent_type: None,
+                    sandbox_policy: None,
         };
         let merged = super::merge_activations(Some(prev), new);
         assert_eq!(merged.model_override.as_deref(), Some("model-a"));
@@ -1654,12 +1689,14 @@ mod tests {
             allowed_tools: vec!["bash".into(), "grep".into(), "read_file".into()],
             effort: None,
             agent_type: None,
+                    sandbox_policy: None,
         };
         let new = SkillActivation {
             model_override: None,
             allowed_tools: vec!["bash".into(), "read_file".into(), "edit".into()],
             effort: None,
             agent_type: None,
+                    sandbox_policy: None,
         };
         let merged = super::merge_activations(Some(prev), new);
         let mut tools = merged.allowed_tools;
@@ -1674,12 +1711,14 @@ mod tests {
             allowed_tools: vec![], // unrestricted
             effort: None,
             agent_type: None,
+                    sandbox_policy: None,
         };
         let new = SkillActivation {
             model_override: None,
             allowed_tools: vec!["bash".into()], // restricted
             effort: None,
             agent_type: None,
+                    sandbox_policy: None,
         };
         let merged = super::merge_activations(Some(prev), new);
         assert_eq!(merged.allowed_tools, vec!["bash"]);
@@ -1692,12 +1731,14 @@ mod tests {
             allowed_tools: vec!["bash".into()], // restricted
             effort: None,
             agent_type: None,
+                    sandbox_policy: None,
         };
         let new = SkillActivation {
             model_override: None,
             allowed_tools: vec![], // unrestricted
             effort: None,
             agent_type: None,
+                    sandbox_policy: None,
         };
         let merged = super::merge_activations(Some(prev), new);
         assert_eq!(merged.allowed_tools, vec!["bash"]);
@@ -1710,12 +1751,14 @@ mod tests {
             allowed_tools: vec!["bash".into()],
             effort: None,
             agent_type: None,
+                    sandbox_policy: None,
         };
         let new = SkillActivation {
             model_override: None,
             allowed_tools: vec!["edit".into()],
             effort: None,
             agent_type: None,
+                    sandbox_policy: None,
         };
         let merged = super::merge_activations(Some(prev), new);
         assert!(merged.allowed_tools.is_empty());
@@ -1739,10 +1782,12 @@ mod tests {
             aliases: Vec::new(),
             effort: Some(EffortLevel::High),
             agent_type: Some("coder".into()),
+            trust_tier: crate::skills::manifest::TrustTier::Bundled,
         };
         let act = super::build_activation(&skill);
         assert!(matches!(act.effort, Some(EffortLevel::High)));
         assert_eq!(act.agent_type.as_deref(), Some("coder"));
+        assert!(act.sandbox_policy.is_some());
     }
 
     #[test]
@@ -1752,12 +1797,14 @@ mod tests {
             allowed_tools: vec![],
             effort: Some(EffortLevel::Low),
             agent_type: Some("researcher".into()),
+            sandbox_policy: None,
         };
         let new = SkillActivation {
             model_override: None,
             allowed_tools: vec![],
             effort: Some(EffortLevel::Max),
             agent_type: None, // no opinion — should keep previous
+            sandbox_policy: None,
         };
         let merged = super::merge_activations(Some(prev), new);
         assert!(matches!(merged.effort, Some(EffortLevel::Max)));
@@ -1789,6 +1836,7 @@ mod tests {
                         aliases: Vec::new(),
                         effort: None,
                         agent_type: None,
+                    trust_tier: crate::skills::manifest::TrustTier::Bundled,
                     }),
                     "skill-b" => Ok(ResolvedSkill {
                         name: "skill-b".into(),
@@ -1806,6 +1854,7 @@ mod tests {
                         aliases: Vec::new(),
                         effort: None,
                         agent_type: None,
+                    trust_tier: crate::skills::manifest::TrustTier::Bundled,
                     }),
                     _ => Err(format!("unknown: {name}")),
                 }
@@ -1883,6 +1932,7 @@ mod tests {
                         aliases: Vec::new(),
                         effort: None,
                         agent_type: None,
+                    trust_tier: crate::skills::manifest::TrustTier::Bundled,
                     })
                 } else {
                     Err(format!("unknown: {name}"))
@@ -1948,6 +1998,7 @@ mod tests {
                     aliases: Vec::new(),
                     effort: None,
                     agent_type: None,
+                    trust_tier: crate::skills::manifest::TrustTier::Bundled,
                 })
             }
             fn available_skills(&self) -> Vec<SkillToolInfo> {
@@ -2000,6 +2051,7 @@ mod tests {
                     aliases: Vec::new(),
                     effort: None,
                     agent_type: None,
+                    trust_tier: crate::skills::manifest::TrustTier::Bundled,
                 })
             }
             fn available_skills(&self) -> Vec<SkillToolInfo> {
@@ -2052,6 +2104,7 @@ mod tests {
                     aliases: Vec::new(),
                     effort: None,
                     agent_type: None,
+                    trust_tier: crate::skills::manifest::TrustTier::Bundled,
                 })
             }
             fn available_skills(&self) -> Vec<SkillToolInfo> {
@@ -2102,6 +2155,7 @@ mod tests {
                     aliases: Vec::new(),
                     effort: None,
                     agent_type: None,
+                    trust_tier: crate::skills::manifest::TrustTier::Bundled,
                 })
             }
             fn available_skills(&self) -> Vec<SkillToolInfo> {
@@ -2156,6 +2210,7 @@ mod tests {
                     aliases: Vec::new(),
                     effort: None,
                     agent_type: None,
+                    trust_tier: crate::skills::manifest::TrustTier::Bundled,
                 })
             }
             fn available_skills(&self) -> Vec<SkillToolInfo> {

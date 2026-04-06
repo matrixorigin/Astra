@@ -395,6 +395,7 @@ impl UnifiedSkillResolver {
             aliases: loaded.manifest.aliases.clone(),
             effort: loaded.manifest.effort.clone(),
             agent_type: loaded.manifest.agent_type.clone(),
+            trust_tier: loaded.manifest.trust_tier.clone(),
         }
     }
 }
@@ -516,6 +517,7 @@ impl crate::turn::skill_tool::SkillResolver for LegacySkillResolverAdapter {
                 aliases: resolved.aliases,
                 effort: resolved.effort,
                 agent_type: resolved.agent_type,
+                trust_tier: resolved.trust_tier,
             }),
             Err(e) => Err(e.to_string()),
         }

@@ -366,6 +366,7 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
             skill_effort: None,
             skill_agent_type: None,
             skill_allowed_tools: None,
+            skill_sandbox_policy: None,
             // Fresh tracker — sub-run metrics are intentionally not propagated
             // back to the parent session's tracker.
             skill_quality_tracker: astra_runtime::skills::quality::SkillQualityTracker::new(),
