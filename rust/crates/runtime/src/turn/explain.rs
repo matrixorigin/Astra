@@ -51,3 +51,59 @@ pub fn build_explain_event(
     }
     explain_event
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn explain_minimal() {
+        let event = build_explain_event(0, None, None, 0, 0, None, vec![], None, None, None);
+        assert_eq!(event["type"].as_str().unwrap(), "explain");
+        assert_eq!(event["total_ms"].as_i64().unwrap(), 0);
+        assert!(event["prompt_tokens"].is_null());
+        assert!(event["completion_tokens"].is_null());
+        assert!(event["tool_selection"].is_null());
+        assert!(event["tool_selection_fallback"].is_null());
+        assert!(event["steps"].as_array().unwrap().is_empty());
+        assert!(event.get("memory").is_none());
+        assert!(event.get("routing").is_none());
+        assert!(event.get("auxiliary_llm_calls").is_none());
+    }
+
+    #[test]
+    fn explain_with_tokens() {
+        let event = build_explain_event(150, Some(1000), Some(500), 5, 20, None, vec![], None, None, None);
+        assert_eq!(event["total_ms"].as_i64().unwrap(), 150);
+        assert_eq!(event["prompt_tokens"].as_i64().unwrap(), 1000);
+        assert_eq!(event["completion_tokens"].as_i64().unwrap(), 500);
+        assert_eq!(event["tools_selected"].as_u64().unwrap(), 5);
+        assert_eq!(event["tools_available"].as_u64().unwrap(), 20);
+    }
+
+    #[test]
+    fn explain_with_optional_fields() {
+        let event = build_explain_event(
+            100,
+            None,
+            None,
+            0,
+            0,
+            Some(json!({"method": "scoring"})),
+            vec![json!("step1")],
+            Some(json!({"recall": 3})),
+            Some(json!({"model": "gpt-4"})),
+            Some(vec![json!({"type": "aux"})]),
+        );
+        assert_eq!(event["memory"]["recall"].as_i64().unwrap(), 3);
+        assert_eq!(event["routing"]["model"].as_str().unwrap(), "gpt-4");
+        assert_eq!(event["auxiliary_llm_calls"].as_array().unwrap().len(), 1);
+        assert_eq!(event["steps"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn explain_negative_total_ms() {
+        let event = build_explain_event(-10, None, None, 0, 0, None, vec![], None, None, None);
+        assert_eq!(event["total_ms"].as_i64().unwrap(), -10);
+    }
+}

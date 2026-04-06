@@ -647,3 +647,129 @@ impl From<EventListRecord> for EventListResponse {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- metadata_tool_name ---
+
+    #[test]
+    fn metadata_none() {
+        assert!(metadata_tool_name(None).is_none());
+    }
+
+    #[test]
+    fn metadata_from_tool_name() {
+        let v = serde_json::json!({"tool_name": "bash"});
+        assert_eq!(metadata_tool_name(Some(&v)).unwrap(), "bash");
+    }
+
+    #[test]
+    fn metadata_from_name_fallback() {
+        let v = serde_json::json!({"name": "read_file"});
+        assert_eq!(metadata_tool_name(Some(&v)).unwrap(), "read_file");
+    }
+
+    #[test]
+    fn metadata_prefers_tool_name() {
+        let v = serde_json::json!({"tool_name": "preferred", "name": "fallback"});
+        assert_eq!(metadata_tool_name(Some(&v)).unwrap(), "preferred");
+    }
+
+    #[test]
+    fn metadata_trims_quotes() {
+        let v = serde_json::json!({"tool_name": "\"bash\""});
+        assert_eq!(metadata_tool_name(Some(&v)).unwrap(), "bash");
+    }
+
+    #[test]
+    fn metadata_empty_after_trim() {
+        let v = serde_json::json!({"tool_name": "\"\""});
+        assert!(metadata_tool_name(Some(&v)).is_none());
+    }
+
+    #[test]
+    fn metadata_missing_fields() {
+        let v = serde_json::json!({"other": "field"});
+        assert!(metadata_tool_name(Some(&v)).is_none());
+    }
+
+    #[test]
+    fn metadata_non_string() {
+        let v = serde_json::json!({"tool_name": 42});
+        assert!(metadata_tool_name(Some(&v)).is_none());
+    }
+
+    // --- defaults ---
+
+    #[test]
+    fn default_limits() {
+        assert_eq!(default_event_limit(), 50);
+        assert_eq!(default_session_event_limit(), 100);
+    }
+
+    // --- EventRecord → EventResponse conversion ---
+
+    #[test]
+    fn event_record_to_response() {
+        let record = EventRecord {
+            event_id: "e1".to_string(),
+            user_id: "u1".to_string(),
+            session_id: "s1".to_string(),
+            event_type: "tool_call".to_string(),
+            content: "{}".to_string(),
+            agent_id: Some("a1".to_string()),
+            agent_version: None,
+            parent_event_id: None,
+            causal_chain_id: "cc1".to_string(),
+            metadata: serde_json::json!({"tool_name": "bash"}),
+            created_at: "2025-01-01".to_string(),
+        };
+        let resp = EventResponse::from(record);
+        assert_eq!(resp.event_id, "e1");
+        assert_eq!(resp.agent_id.as_deref(), Some("a1"));
+        assert!(resp.agent_version.is_none());
+    }
+
+    #[test]
+    fn event_list_record_to_response() {
+        let record = EventListRecord {
+            events: vec![EventRecord {
+                event_id: "e1".to_string(),
+                user_id: "u1".to_string(),
+                session_id: "s1".to_string(),
+                event_type: "t".to_string(),
+                content: "c".to_string(),
+                agent_id: None,
+                agent_version: None,
+                parent_event_id: None,
+                causal_chain_id: "cc".to_string(),
+                metadata: serde_json::json!(null),
+                created_at: "now".to_string(),
+            }],
+            total: 42,
+            limit: 10,
+            offset: 0,
+        };
+        let resp = EventListResponse::from(record);
+        assert_eq!(resp.events.len(), 1);
+        assert_eq!(resp.total, 42);
+    }
+
+    // --- query deserialization defaults ---
+
+    #[test]
+    fn event_list_query_defaults() {
+        let q: EventListQuery = serde_json::from_str("{}").unwrap();
+        assert_eq!(q.limit, 50);
+        assert_eq!(q.offset, 0);
+    }
+
+    #[test]
+    fn session_event_query_defaults() {
+        let q: SessionEventQuery = serde_json::from_str("{}").unwrap();
+        assert_eq!(q.limit, 100);
+        assert_eq!(q.offset, 0);
+    }
+}
