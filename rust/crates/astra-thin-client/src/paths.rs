@@ -196,3 +196,165 @@ pub fn session_audit_tools(session_id: &str) -> String {
 pub fn session_audit_errors(session_id: &str) -> String {
     format!("/sessions/{session_id}/audit/errors")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- Constants ---
+
+    #[test]
+    fn constants_start_with_slash() {
+        for path in [
+            CHAT_STREAM, CHAT_TURN, TOOLS_RESULT, APPROVAL_RESPOND,
+            AGENTS_EDGE, AGENTS_EDGE_HEARTBEAT, SESSIONS,
+            AUTH_REGISTER, AUTH_LOGIN, AUTH_REFRESH, AUTH_LOGOUT, AUTH_ME,
+            HEALTH, MODELS, SKILLS, SKILLS_STATUS, SKILLS_TEST,
+            MEMORY_STORE, MEMORY_SEARCH, MEMORY_RETRIEVE, MEMORY_PURGE,
+            TASKS, CONTEXT, CHAT_ROUTE, COMPLETIONS,
+            ADMIN_INIT, ADMIN_AUDIT, ADMIN_USERS_GRANT_ROLE,
+            ADMIN_USERS_REVOKE_ROLE, ADMIN_TOKENS, ADMIN_PROMPTS_OPTIMIZE,
+            ADMIN_FEEDBACK_STATS, ADMIN_FEEDBACK_EXPORT,
+            AUDIT_SESSIONS, AUDIT_STATS, AUDIT_TOOLS,
+        ] {
+            assert!(path.starts_with('/'), "path should start with /: {path}");
+        }
+    }
+
+    // --- Session paths ---
+
+    #[test]
+    fn session_path() {
+        assert_eq!(session("abc"), "/sessions/abc");
+    }
+
+    #[test]
+    fn session_close_path() {
+        assert_eq!(session_close("s1"), "/sessions/s1/close");
+    }
+
+    #[test]
+    fn session_replay_path() {
+        assert_eq!(session_replay("s1"), "/sessions/s1/replay");
+    }
+
+    #[test]
+    fn session_replay_compare_path() {
+        assert_eq!(session_replay_compare("s1"), "/sessions/s1/replay/compare");
+    }
+
+    #[test]
+    fn chat_session_reflect_path() {
+        assert_eq!(chat_session_reflect("s1"), "/chat/session/s1/reflect");
+    }
+
+    #[test]
+    fn chat_session_decision_trace_path() {
+        assert_eq!(chat_session_decision_trace("s1"), "/chat/session/s1/decision-trace");
+    }
+
+    // --- Model/Skill paths ---
+
+    #[test]
+    fn model_path() {
+        assert_eq!(model("gpt-4"), "/models/gpt-4");
+    }
+
+    #[test]
+    fn skill_path() {
+        assert_eq!(skill("bash"), "/skills/bash");
+    }
+
+    #[test]
+    fn model_check_path() {
+        assert_eq!(model_check("gpt-4"), "/models/gpt-4/check");
+    }
+
+    #[test]
+    fn skill_versions_path() {
+        assert_eq!(skill_versions("bash"), "/skills/bash/versions");
+    }
+
+    // --- Task paths ---
+
+    #[test]
+    fn task_path() {
+        assert_eq!(task("t1"), "/tasks/t1");
+    }
+
+    #[test]
+    fn task_progress_path() {
+        assert_eq!(task_progress("t1"), "/tasks/t1/progress");
+    }
+
+    #[test]
+    fn task_status_path() {
+        assert_eq!(task_status("t1"), "/tasks/t1/status");
+    }
+
+    #[test]
+    fn task_lease_path() {
+        assert_eq!(task_lease("t1"), "/tasks/t1/lease");
+    }
+
+    #[test]
+    fn task_lease_claim_path() {
+        assert_eq!(task_lease_claim("t1"), "/tasks/t1/lease/claim");
+    }
+
+    #[test]
+    fn task_lease_release_path() {
+        assert_eq!(task_lease_release("t1"), "/tasks/t1/lease/release");
+    }
+
+    #[test]
+    fn task_lease_renew_path() {
+        assert_eq!(task_lease_renew("t1"), "/tasks/t1/lease/renew");
+    }
+
+    // --- Context path ---
+
+    #[test]
+    fn context_capture_path() {
+        assert_eq!(context_capture("cap1"), "/context/cap1");
+    }
+
+    // --- Audit paths ---
+
+    #[test]
+    fn session_audit_summary_path() {
+        assert_eq!(session_audit_summary("s1"), "/sessions/s1/audit/summary");
+    }
+
+    #[test]
+    fn session_audit_turns_path() {
+        assert_eq!(session_audit_turns("s1"), "/sessions/s1/audit/turns");
+    }
+
+    #[test]
+    fn session_audit_turn_detail_path() {
+        assert_eq!(session_audit_turn_detail("s1", 3), "/sessions/s1/audit/turns/3");
+    }
+
+    #[test]
+    fn session_audit_tools_path() {
+        assert_eq!(session_audit_tools("s1"), "/sessions/s1/audit/tools");
+    }
+
+    #[test]
+    fn session_audit_errors_path() {
+        assert_eq!(session_audit_errors("s1"), "/sessions/s1/audit/errors");
+    }
+
+    // --- Edge cases ---
+
+    #[test]
+    fn empty_id() {
+        assert_eq!(session(""), "/sessions/");
+    }
+
+    #[test]
+    fn id_with_special_chars() {
+        assert_eq!(task("a/b"), "/tasks/a/b");
+    }
+}

@@ -27,3 +27,48 @@ pub fn all_dynamic_skills() -> Vec<String> {
         remember::skill_content(),
     ]
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn returns_eight_skills() {
+        assert_eq!(all_dynamic_skills().len(), 8);
+    }
+
+    #[test]
+    fn all_start_with_frontmatter() {
+        for (i, content) in all_dynamic_skills().into_iter().enumerate() {
+            assert!(
+                content.starts_with("---"),
+                "skill {i} should start with YAML frontmatter"
+            );
+        }
+    }
+
+    #[test]
+    fn all_contain_name_field() {
+        for (i, content) in all_dynamic_skills().into_iter().enumerate() {
+            assert!(
+                content.contains("name:"),
+                "skill {i} should contain name field"
+            );
+        }
+    }
+
+    #[test]
+    fn no_empty_skills() {
+        for content in all_dynamic_skills() {
+            assert!(content.len() > 50, "skill content should be substantial");
+        }
+    }
+
+    #[test]
+    fn individual_skill_names_present() {
+        let all = all_dynamic_skills().join("\n");
+        for name in ["batch", "debug", "reflect", "review", "skillify", "stuck", "verify", "remember"] {
+            assert!(all.contains(&format!("name: {name}")), "missing skill: {name}");
+        }
+    }
+}
