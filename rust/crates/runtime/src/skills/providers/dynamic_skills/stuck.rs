@@ -2,8 +2,8 @@ pub fn skill_content() -> String {
     format!(
         r#"---
 name: stuck
-description: "Break through when stuck — re-examine assumptions, try alternative approaches, escalate intelligently"
-version: "2.0.0"
+description: "Break through when stuck — use runtime diagnostics to identify the real blocker, then try a fundamentally different approach"
+version: "3.0.0"
 allowed_tools:
   - bash
   - read_file
@@ -26,60 +26,69 @@ tags:
 ---
 # Stuck: Break Through the Impasse
 
-You've been going in circles or hitting dead ends. Time to step back and try a fundamentally different approach.
+You've been going in circles or hitting dead ends. Use the runtime data below to understand WHY, then try a fundamentally different approach.
 
-**Working directory**: ${{CTX_WORK_DIR}}
-**Available tools**: ${{CTX_AVAILABLE_TOOLS}}
+## Runtime Diagnostics
 
-## Step 1: Understand the Impasse
+| Metric | Value |
+|--------|-------|
+| Turn | ${{CTX_TURN_NUMBER}} / ${{CTX_TURN_NUMBER}}+${{CTX_TURNS_REMAINING}} |
+| Prompt tokens (cumulative) | ${{CTX_TOTAL_PROMPT_TOKENS}} |
+| Tool calls (total) | ${{CTX_TOTAL_TOOL_CALLS}} |
+| Stall nudges sent | ${{CTX_NUDGE_COUNT}} |
+| Errors | ${{CTX_ERROR_COUNT}} |
+| Deprioritized tools | ${{CTX_DEPRIORITIZED_TOOLS}} |
+| Stall events | ${{CTX_STALL_EVENTS}} |
+| Correction follow rate | ${{CTX_CORRECTION_FOLLOW_RATE}} |
 
-**Success criteria**: Clear statement of what's been tried and why it failed.
+## Step 1: Diagnose the Impasse
 
-Summarize:
-- What is the actual goal? (not the approach — the goal)
-- What approaches have been tried?
-- What happened with each? (exact errors, unexpected behavior)
-- How long have you been stuck?
+Read the metrics and classify the blocker:
+
+| Pattern | Diagnosis | Go to |
+|---------|-----------|-------|
+| `nudge_count` ≥ 2 | System already told you to stop. You ignored it. | Step 3 option 5 |
+| `error_count` / `tool_calls` > 30% | Tool or environment is broken | Step 2: challenge assumption #1–#4 |
+| `deprioritized_tools` non-empty | These tools are failing repeatedly — stop using them | Step 3: use different tools |
+| `stall_events` present | Exact stall type tells you what's repeating | Step 3: pick the opposite strategy |
+| High `tool_calls`, low progress | Exploring without a plan | Step 3 option 1 |
+| High `prompt_tokens`, few turns | Context bloated from large reads | Step 3 option 2 |
+
+Then summarize in one sentence: what is the actual goal (not the approach — the goal), and what has been tried.
 
 ## Step 2: Challenge Assumptions
 
-**Success criteria**: At least one assumption identified that might be wrong.
+At least one of these is wrong. Check each:
 
-Common wrong assumptions:
-1. **The bug is where you think it is** — the error message points to symptom, not cause. Search upstream.
+1. **The bug is where you think it is** — the error points to the symptom, not the cause. Search upstream.
 2. **The API works as documented** — read the source, not the docs. Check the actual version installed.
-3. **The data is what you expect** — log the actual values at each step. Print types, lengths, encodings.
-4. **The environment matches** — compare dev vs prod, local vs CI. Check versions: `rustc --version`, `node --version`, etc.
-5. **Your previous fix worked** — verify by reverting it. Confirmation bias is real.
+3. **The data is what you expect** — log actual values. Print types, lengths, encodings.
+4. **The environment matches** — compare versions: `rustc --version`, `node --version`, etc.
+5. **Your previous fix worked** — verify by reverting it.
 
-For each assumption you hold, ask: "What if this is wrong? What would I see?"
+For each assumption: "What if this is wrong? What would I see?"
 
-## Step 3: Try Alternative Approaches
+## Step 3: Try a Different Strategy
 
-**Success criteria**: Progress on at least one new path.
+Pick ONE. Time-box to 15 minutes — if no progress, switch to the next:
 
-Try these in order. Time-box each to 15 minutes — if no progress, switch:
+1. **Binary search** — `git bisect`, or comment out half the code. Narrow to smallest failing case.
+2. **Minimal reproduction** — new empty project, add only what's needed. If it works in isolation, the bug is in the interaction.
+3. **Read the source** — the dependency's code, not yours. The answer is in the implementation.
+4. **Invert the problem** — instead of "why does this fail?", ask "under what conditions would this succeed?" and verify each.
+5. **Stop and report** — if `nudge_count` ≥ 2, summarize what you've found and ask the user for guidance. Do NOT keep trying.
 
-1. **Binary search the problem space** — `git bisect`, or comment out half the code to isolate. Narrow down to the smallest failing case.
-2. **Minimal reproduction** — create a new, empty project and add ONLY what's needed to reproduce. If it works in isolation, the bug is in the interaction.
-3. **Read the source** — not your code, the dependency's code. The answer is often in the implementation, not the docs.
-4. **Invert the problem** — instead of "why does this fail?", ask "under what conditions would this succeed?" and verify each condition.
-5. **Rubber duck** — explain the problem step by step as if to someone who knows nothing about it. Say it out loud (or type it). Surprisingly effective.
-6. **Take a break** — if the user has been at this for hours, suggest stepping away. Fresh eyes solve more bugs than tired ones.
+## Step 4: Escalate
 
-## Step 4: Escalate Intelligently
-
-**Success criteria**: A concrete, answerable question that an expert could help with.
-
-If alternative approaches don't work:
-- Search for the exact error message online (include version numbers)
-- Check the project's issue tracker for similar reports
-- Formulate a clear question: "I'm trying to [goal]. I expected [X] but got [Y]. I've tried [A, B, C]. Here's a minimal reproduction: [link/code]."
+If nothing works:
+- Search for the exact error message (include version numbers)
+- Check the project's issue tracker
+- Formulate: "I'm trying to [goal]. Expected [X], got [Y]. Tried [A, B, C]. Minimal repro: [code]."
 
 ## Rules
-- Do NOT keep trying the same approach with small variations — that's the definition of stuck
-- Each new attempt must be a fundamentally different strategy
-- If you've spent 3x the expected time, it's time to ask for help, not try harder
+- Do NOT keep trying the same approach with small variations
+- If `deprioritized_tools` lists a tool, do NOT use it
+- If `nudge_count` ≥ 3, you MUST stop and ask the user — no more autonomous attempts
 "#,
     )
 }
