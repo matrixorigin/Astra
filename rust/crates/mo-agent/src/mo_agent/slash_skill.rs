@@ -1132,10 +1132,22 @@ Follow these steps:
             }
         }
 
+        "install" => {
+            install_skill_from_marketplace(sub_arg.trim(), api, token, state).await;
+        }
+
+        "publish" => {
+            publish_skill_to_marketplace(sub_arg.trim(), api, token, state).await;
+        }
+
+        "uninstall" | "remove" => {
+            uninstall_local_skill(sub_arg.trim(), state).await;
+        }
+
         _ => {
             eprintln!(
                         "{}",
-                        format!("  Unknown /skill subcommand: '{sub}'. Try /skill list, /skill search, /skill search-remote, /skill info, /skill new, /skill test, /skill dev, /skill doctor, /skill stats, /skill pin, /skill unpin, /skill compose-info, /skill upload-quality").yellow()
+                        format!("  Unknown /skill subcommand: '{sub}'. Try /skill list, /skill search, /skill search-remote, /skill info, /skill new, /skill test, /skill dev, /skill doctor, /skill stats, /skill pin, /skill unpin, /skill install, /skill publish, /skill uninstall, /skill compose-info, /skill upload-quality").yellow()
                     );
         }
     }
@@ -1498,4 +1510,272 @@ pub(super) async fn maybe_upload_quality_on_exit(
     {
         upload_quality_report(api, tracker, token).await;
     }
+}
+
+// ── Marketplace install/publish/uninstall ─────────────────────────────────
+
+/// Install a skill from the marketplace into `.astra/skills/<name>/`.
+async fn install_skill_from_marketplace(
+    name: &str,
+    api: &astra_thin_client::ThinClient,
+    token: Option<&str>,
+    state: &mut ReplState,
+) {
+    if name.is_empty() {
+        eprintln!("{}", "  Usage: /skill install <name>[@version]".yellow());
+        eprintln!(
+            "{}",
+            "  Downloads a skill from the marketplace to .astra/skills/.".dim()
+        );
+        return;
+    }
+
+    // Parse name@version
+    let (skill_name, version) = if let Some(idx) = name.find('@') {
+        (&name[..idx], Some(&name[idx + 1..]))
+    } else {
+        (name, None)
+    };
+
+    let tok = token.unwrap_or("");
+    let mut query_params = vec![("version".to_string(), version.unwrap_or("latest").to_string())];
+    let _ = query_params; // suppress unused warning
+
+    eprintln!(
+        "  {} {}{}",
+        "Installing".cyan(),
+        skill_name.cyan().bold(),
+        version
+            .map(|v| format!("@{v}"))
+            .unwrap_or_default()
+            .dim()
+    );
+
+    // Fetch skill content from server
+    let path = format!("/skills/{}", skill_name);
+    let query_pairs: Vec<(&str, String)> = if let Some(v) = version {
+        vec![("version", v.to_string())]
+    } else {
+        vec![]
+    };
+
+    match api
+        .get_bearer_path_query_text(tok, &path, &query_pairs)
+        .await
+    {
+        Ok(text) => {
+            match serde_json::from_str::<astra_services::skills::SkillRecord>(&text) {
+                Ok(record) => {
+                    let instructions = record
+                        .metadata
+                        .as_ref()
+                        .and_then(|m| m.get("instructions"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+
+                    let manifest_str = record
+                        .metadata
+                        .as_ref()
+                        .and_then(|m| m.get("manifest"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+
+                    // Install to project .astra/skills/<name>/
+                    let install_dir = std::env::current_dir()
+                        .unwrap_or_default()
+                        .join(".astra")
+                        .join("skills")
+                        .join(skill_name);
+
+                    if let Err(e) = std::fs::create_dir_all(&install_dir) {
+                        eprintln!("  {} {}", "✗ Failed to create directory:".red(), e);
+                        return;
+                    }
+
+                    // Write SKILL.md
+                    let skill_md = if !manifest_str.is_empty() {
+                        format!("{manifest_str}\n\n{instructions}")
+                    } else {
+                        let header = format!(
+                            "---\nname: {}\nversion: {}\ndescription: {}\n---\n\n",
+                            record.skill_name,
+                            record.version,
+                            record.description.as_deref().unwrap_or(""),
+                        );
+                        format!("{header}{instructions}")
+                    };
+
+                    if let Err(e) = std::fs::write(install_dir.join("SKILL.md"), &skill_md) {
+                        eprintln!("  {} {}", "✗ Failed to write SKILL.md:".red(), e);
+                        return;
+                    }
+
+                    eprintln!(
+                        "  {} Installed {} v{} to {}",
+                        "✓".green(),
+                        record.skill_name.cyan(),
+                        record.version.dim(),
+                        install_dir.display().to_string().dim()
+                    );
+
+                    // Re-discover so the skill is immediately available
+                    let _ = state.unified_skill_registry.discover_all().await;
+                    eprintln!("  {}", "Skill registry refreshed.".dim());
+                }
+                Err(e) => {
+                    eprintln!("  {} {}", "✗ Parse error:".yellow(), format!("{e}").dim());
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!(
+                "  {} {}",
+                "✗ Failed to fetch skill:".yellow(),
+                format!("{e}").dim()
+            );
+        }
+    }
+    eprintln!();
+}
+
+/// Publish a local skill to the marketplace.
+async fn publish_skill_to_marketplace(
+    name: &str,
+    api: &astra_thin_client::ThinClient,
+    token: Option<&str>,
+    state: &ReplState,
+) {
+    if name.is_empty() {
+        eprintln!("{}", "  Usage: /skill publish <name>".yellow());
+        eprintln!(
+            "{}",
+            "  Publishes a local skill to the marketplace.".dim()
+        );
+        return;
+    }
+
+    let tok = token.unwrap_or("");
+
+    // Find the skill in local registry
+    let registry = &state.unified_skill_registry;
+    let all = registry.all_manifests();
+    let manifest = all.iter().find(|m| m.name == name);
+    let manifest = match manifest {
+        Some(m) => m.clone(),
+        None => {
+            eprintln!(
+                "  {} {}",
+                "✗ Skill not found locally:".yellow(),
+                name.cyan()
+            );
+            eprintln!(
+                "  {}",
+                "Tip: use '/skill list' to see available skills.".dim()
+            );
+            return;
+        }
+    };
+
+    // Load full skill content
+    let loaded = match registry.load(name).await {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("  {} {}", "✗ Failed to load skill:".red(), e);
+            return;
+        }
+    };
+
+    eprintln!(
+        "  {} {} v{}...",
+        "Publishing".cyan(),
+        name.cyan().bold(),
+        manifest.version.to_string().dim()
+    );
+
+    // Build publish request
+    let request = serde_json::json!({
+        "name": manifest.name,
+        "version": manifest.version.to_string(),
+        "description": manifest.description,
+        "triggers": manifest.triggers,
+        "dependencies": manifest.dependencies,
+        "manifest": loaded.instructions,
+        "category": manifest.category,
+    });
+
+    match api
+        .post_bearer_path_json_text(tok, "/skills/publish", &request)
+        .await
+    {
+        Ok(_) => {
+            eprintln!(
+                "  {} Published {} v{} to marketplace.",
+                "✓".green(),
+                name.cyan(),
+                manifest.version.to_string().dim()
+            );
+        }
+        Err(e) => {
+            eprintln!(
+                "  {} {}",
+                "✗ Publish failed:".yellow(),
+                format!("{e}").dim()
+            );
+        }
+    }
+    eprintln!();
+}
+
+/// Remove a locally installed skill.
+async fn uninstall_local_skill(name: &str, state: &mut ReplState) {
+    if name.is_empty() {
+        eprintln!("{}", "  Usage: /skill uninstall <name>".yellow());
+        eprintln!("{}", "  Removes a locally installed skill.".dim());
+        return;
+    }
+
+    // Search for the skill in local paths
+    let search_paths = crate::skill_instructions::skill_search_paths();
+    let mut found_dir: Option<std::path::PathBuf> = None;
+
+    for base in &search_paths {
+        let candidate = base.join(name);
+        if candidate.join("SKILL.md").exists() {
+            found_dir = Some(candidate);
+            break;
+        }
+    }
+
+    match found_dir {
+        Some(dir) => {
+            match std::fs::remove_dir_all(&dir) {
+                Ok(()) => {
+                    eprintln!(
+                        "  {} Removed skill '{}' from {}",
+                        "✓".green(),
+                        name.cyan(),
+                        dir.display().to_string().dim()
+                    );
+                    // Refresh registry
+                    let _ = state.unified_skill_registry.discover_all().await;
+                    eprintln!("  {}", "Skill registry refreshed.".dim());
+                }
+                Err(e) => {
+                    eprintln!("  {} {}", "✗ Failed to remove:".red(), e);
+                }
+            }
+        }
+        None => {
+            eprintln!(
+                "  {} Skill '{}' not found in local paths.",
+                "✗".yellow(),
+                name.cyan()
+            );
+            eprintln!("  {}", "Searched:".dim());
+            for p in &search_paths {
+                eprintln!("    {}", p.display().to_string().dim());
+            }
+        }
+    }
+    eprintln!();
 }
