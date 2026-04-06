@@ -198,6 +198,8 @@ pub(crate) struct CliSkillSubRunExecutor {
     permission_mode: PermissionMode,
     /// Parent cancellation token — propagated so Ctrl+C / stop interrupts subruns.
     cancel_token: Option<std::sync::Arc<tokio_util::sync::CancellationToken>>,
+    /// Skill resolver inherited from parent — enables nested skill invocations.
+    skill_resolver: Option<std::sync::Arc<dyn astra_runtime::turn::skill_tool::SkillResolver>>,
 }
 
 impl CliSkillSubRunExecutor {
@@ -216,7 +218,17 @@ impl CliSkillSubRunExecutor {
             project_root,
             permission_mode,
             cancel_token,
+            skill_resolver: None,
         }
+    }
+
+    /// Attach a skill resolver so sub-runs can invoke other skills.
+    pub fn with_skill_resolver(
+        mut self,
+        resolver: Option<std::sync::Arc<dyn astra_runtime::turn::skill_tool::SkillResolver>>,
+    ) -> Self {
+        self.skill_resolver = resolver;
+        self
     }
 }
 
@@ -348,7 +360,7 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
             cancel_token: self.cancel_token.clone(),
             delegation_engine: None,
             skill_registry_for_activation: None,
-            skill_resolver: None,
+            skill_resolver: self.skill_resolver.clone(),
             skill_executor: None, // no recursive forking
             skill_model_override: None,
             skill_effort: None,

@@ -1041,13 +1041,14 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
                 extra,
             };
 
+            let composition_ctx = crate::skills::composition::CompositionContext::root();
             let (sr, remaining, activation) =
                 crate::turn::skill_tool::partition_and_execute_skills(
                     effective_tool_calls,
                     resolver.as_ref(),
                     state.skill_executor.as_ref(),
                     Some(&mut state.skill_quality_tracker),
-                    None, // composition_ctx: top-level invocation
+                    Some(&composition_ctx),
                     &skill_ctx,
                 )
                 .await;

@@ -136,6 +136,46 @@ pub(crate) async fn stream_chat_sse(
 
     let hook_sets = detect_turn_hook_sets(&project_root, task_profile, p.is_plan_subtask);
 
+    // Build skill resolver — shared with sub-run executor for nested skill invocations.
+    let skill_resolver: Option<Arc<dyn astra_runtime::turn::skill_tool::SkillResolver>> = {
+        let reg_arc = Arc::clone(&p.unified_skill_registry);
+        if reg_arc.is_empty() {
+            let _ = reg_arc.discover_all().await;
+        }
+        let inner_resolver =
+            Arc::new(astra_runtime::skills::UnifiedSkillResolver::new(reg_arc));
+        let adapter =
+            astra_runtime::skills::registry::LegacySkillResolverAdapter::new(inner_resolver);
+        let skills = adapter.available_skills();
+        if skills.is_empty() {
+            None
+        } else {
+            Some(Arc::new(adapter) as Arc<dyn astra_runtime::turn::skill_tool::SkillResolver>)
+        }
+    };
+
+    // Build skill executor — fork sub-runs inherit the resolver for nesting.
+    let skill_executor: Option<Arc<dyn astra_runtime::skills::SkillExecutor>> = {
+        let subrun_exec = Arc::new(
+            crate::skill_subrun::CliSkillSubRunExecutor::new(
+                p.api.clone(),
+                p.token.to_string(),
+                p.model.map(|m| m.to_string()),
+                project_root.clone(),
+                parent_perm_mode,
+                parent_cancel_token,
+            )
+            .with_skill_resolver(skill_resolver.clone()),
+        );
+        let isolated = Arc::new(astra_runtime::skills::executor::IsolatedSkillExecutor::new(
+            subrun_exec,
+        ));
+        let router = Arc::new(astra_runtime::skills::executor::SkillExecutionRouter::new(
+            Some(isolated),
+        ));
+        Some(router as Arc<dyn astra_runtime::skills::SkillExecutor>)
+    };
+
     let mut state = AgenticLoopState {
         messages,
         tool_results: Vec::new(),
@@ -184,39 +224,8 @@ pub(crate) async fn stream_chat_sse(
         cancel_token: p.cancel_token.clone(),
         delegation_engine: p.delegation_engine,
         skill_registry_for_activation: Some(Arc::clone(&p.unified_skill_registry)),
-        skill_resolver: {
-            let reg_arc = Arc::clone(&p.unified_skill_registry);
-            if reg_arc.is_empty() {
-                let _ = reg_arc.discover_all().await;
-            }
-            let inner_resolver =
-                Arc::new(astra_runtime::skills::UnifiedSkillResolver::new(reg_arc));
-            let adapter =
-                astra_runtime::skills::registry::LegacySkillResolverAdapter::new(inner_resolver);
-            let skills = adapter.available_skills();
-            if skills.is_empty() {
-                None
-            } else {
-                Some(Arc::new(adapter) as Arc<dyn astra_runtime::turn::skill_tool::SkillResolver>)
-            }
-        },
-        skill_executor: {
-            let subrun_exec = Arc::new(crate::skill_subrun::CliSkillSubRunExecutor::new(
-                p.api.clone(),
-                p.token.to_string(),
-                p.model.map(|m| m.to_string()),
-                project_root.clone(),
-                parent_perm_mode,
-                parent_cancel_token,
-            ));
-            let isolated = Arc::new(astra_runtime::skills::executor::IsolatedSkillExecutor::new(
-                subrun_exec,
-            ));
-            let router = Arc::new(astra_runtime::skills::executor::SkillExecutionRouter::new(
-                Some(isolated),
-            ));
-            Some(router as Arc<dyn astra_runtime::skills::SkillExecutor>)
-        },
+        skill_resolver,
+        skill_executor,
         skill_model_override: None,
         skill_effort: None,
         skill_agent_type: None,
