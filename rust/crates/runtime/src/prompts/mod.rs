@@ -74,6 +74,13 @@ mod tests {
         let prefix = build_skill_dev_prefix("my_skill", "def run(): pass");
         assert!(prefix.starts_with("[SKILL DEV: my_skill]"));
         assert!(prefix.contains("def run(): pass"));
+        // Must tell LLM not to re-read the file
+        assert!(prefix.contains("do NOT read_file"));
+        // Must include file path hint
+        assert!(prefix.contains(".astra/skills/my_skill/SKILL.md"));
+        // Must include brief writing guidance
+        assert!(prefix.contains("when_to_use"));
+        assert!(prefix.contains("$ARGUMENTS"));
     }
 
     #[test]

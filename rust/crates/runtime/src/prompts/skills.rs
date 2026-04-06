@@ -1,13 +1,21 @@
 /// Prefix injected into the user message when `/skill dev <name>` is active.
 ///
-/// The skill source code is embedded so the agent can edit it in-context.
+/// Provides the full skill source in-context plus file path for editing.
+/// Prevents the LLM from grep-ing for the file it already has.
+/// Writing guidance is kept brief — the LLM already knows markdown;
+/// it just needs the structural patterns specific to SKILL.md.
 pub fn build_skill_dev_prefix(skill_name: &str, skill_src: &str) -> String {
     format!(
         "[SKILL DEV: {skill_name}]\n\
-         Skill source:\n\
-         ```json\n\
+         The complete source of \"{skill_name}\" is below — do NOT read_file or grep for it.\n\
+         File path: `.astra/skills/{skill_name}/SKILL.md` (or `skills/{skill_name}/SKILL.md`)\n\
+         To edit: modify the content and use `write_file` to save.\n\n\
+         ```markdown\n\
          {skill_src}\n\
-         ```\n\n"
+         ```\n\n\
+         SKILL.md patterns: frontmatter (`when_to_use`, `allowed_tools`, `arguments`), \
+         phased steps with success criteria, decision tables, `$ARGUMENTS` placeholder, \
+         built-in tools over bash, anti-pattern rules.\n\n"
     )
 }
 
