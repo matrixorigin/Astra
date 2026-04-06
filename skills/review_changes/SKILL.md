@@ -2,6 +2,7 @@
 name: review-changes
 description: "Developer skill: context-aware code review of uncommitted changes, branch diffs, or specific commits in the astra codebase. Combines git diff with code intelligence (symbol extraction, call analysis, import resolution) for deep structural review."
 user_invocable: true
+when_to_use: "When the user asks to review code changes, commits, diffs, PRs, or says 'review latest commit'"
 arguments:
   - name: TARGET
     description: "What to review: 'staged', 'unstaged', 'branch:<name>', 'commit:<sha>', or 'pr:<number>'. Default: all uncommitted changes."

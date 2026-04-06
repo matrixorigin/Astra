@@ -2,6 +2,7 @@
 name: trace-delegation
 description: "Developer skill: trace multi-agent delegation flows in astra — fan-out, pipeline, sequential, adversarial patterns. Visualizes sub-run hierarchy, token aggregation, verification gates, and pause/resume state."
 user_invocable: true
+when_to_use: "When the user wants to trace or visualize multi-agent delegation flows, sub-run hierarchies, or fan-out patterns"
 arguments:
   - name: TARGET
     description: "Session ID, delegation ID, or 'last'. Omit for most recent delegation."

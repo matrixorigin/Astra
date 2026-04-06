@@ -2,6 +2,7 @@
 name: optimize-prompt
 description: "Developer skill: analyze and optimize the LLM prompt — system message, tool schemas, history, skill injections, budget pressure. Identifies token waste and context bloat in astra's prompt assembly pipeline."
 user_invocable: true
+when_to_use: "When the user wants to analyze or reduce the LLM prompt size, find token waste, or optimize context assembly"
 arguments:
   - name: TARGET
     description: "Session ID, debug JSON path, or 'this'/'last'. Omit for most recent."

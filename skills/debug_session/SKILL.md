@@ -2,6 +2,7 @@
 name: debug-session
 description: "Developer skill: diagnose why an astra session is stuck, slow, or producing bad results. Analyzes stall patterns, turn guard verdicts, error cascades, tool health, and escalation levels using journal + checkpoint data."
 user_invocable: true
+when_to_use: "When a session is stuck, slow, or producing bad results and the user wants to diagnose why"
 arguments:
   - name: TARGET
     description: "Session ID, debug JSON path, or keyword ('this', 'last'). Omit for most recent."

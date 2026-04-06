@@ -2,6 +2,7 @@
 name: verify-task
 description: "Developer skill: verify that a completed task actually works. Runs astra's verification engine (8 verifier types), generates acceptance criteria from task context, executes build/test/lint/grep checks, and produces a delivery report."
 user_invocable: true
+when_to_use: "When the user wants to verify a completed task actually works — run tests, lint, build checks, and generate a delivery report"
 arguments:
   - name: TASK
     description: "What to verify: 'last' (most recent task), task ID, or natural language description of what should work."

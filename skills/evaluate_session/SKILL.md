@@ -2,6 +2,7 @@
 name: evaluate-session
 description: "Platform skill: evaluates agent session performance and provides optimization recommendations. Requires mo-agent platform database access."
 user_invocable: true
+when_to_use: "When the user wants to evaluate agent performance metrics or get optimization recommendations for a session"
 arguments:
   - name: SESSION
     description: "Session ID or reference (e.g., 'this session', 'last session', or a specific ID)"

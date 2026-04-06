@@ -2,6 +2,7 @@
 name: analyze-session
 description: "Developer skill: deep diagnostic analysis of an astra session — context quality, tool/skill selection accuracy, token efficiency, error patterns, compaction events, and stall detection. Reads from session journal (~/.astra/sessions/) and debug snapshots (/tmp/debug-*.json)."
 user_invocable: true
+when_to_use: "When the user wants to analyze a past session for token waste, tool selection accuracy, or context efficiency"
 arguments:
   - name: TARGET
     description: "Session ID, debug JSON path (/tmp/debug-*.json), or keyword ('this', 'last'). Omit to analyze most recent."

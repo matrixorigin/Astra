@@ -2,6 +2,7 @@
 name: audit-cloud-sync
 description: "Developer skill: audit edge-cloud synchronization in astra — event ingestion, learning sync, checkpoint recovery, conflict resolution, sync failures. Verifies data integrity between local journal and cloud tables."
 user_invocable: true
+when_to_use: "When the user wants to audit edge-cloud sync, check event ingestion, or diagnose sync failures"
 arguments:
   - name: TARGET
     description: "Session ID, or 'last'. Omit for most recent session."
