@@ -1168,6 +1168,18 @@ Follow these steps:
             list_installed_marketplace(api, token).await;
         }
 
+        "check-update" | "check-updates" => {
+            check_skill_updates(sub_arg.trim(), api, token).await;
+        }
+
+        "upgrade" | "update" => {
+            upgrade_skill(sub_arg.trim(), api, token, state).await;
+        }
+
+        "rollback" | "downgrade" => {
+            rollback_skill(sub_arg.trim(), api, token, state).await;
+        }
+
         "create" => {
             // Auto-generate a skill from the current session transcript
             create_skill_from_session(sub_arg, state).await?;
@@ -1176,7 +1188,7 @@ Follow these steps:
         _ => {
             eprintln!(
                         "{}",
-                        format!("  Unknown /skill subcommand: '{sub}'. Try /skill list, /skill search, /skill search-remote, /skill browse, /skill trending, /skill installed, /skill info, /skill new, /skill create, /skill test, /skill dev, /skill doctor, /skill stats, /skill pin, /skill unpin, /skill install, /skill publish, /skill uninstall, /skill pack, /skill unpack, /skill inspect, /skill compose-info, /skill upload-quality").yellow()
+                        format!("  Unknown /skill subcommand: '{sub}'. Try /skill list, /skill search, /skill search-remote, /skill browse, /skill trending, /skill installed, /skill info, /skill new, /skill create, /skill test, /skill dev, /skill doctor, /skill stats, /skill pin, /skill unpin, /skill install, /skill publish, /skill uninstall, /skill upgrade, /skill rollback, /skill check-update, /skill pack, /skill unpack, /skill inspect, /skill compose-info, /skill upload-quality").yellow()
                     );
         }
     }
@@ -2193,6 +2205,120 @@ mod tests {
             std::env::set_current_dir(&prev_dir).unwrap();
             assert!(!skill_dir.exists(), "skill dir should be removed");
         }
+
+        // ── Versioning / upgrade tests ─────────────────────────────────
+
+        #[test]
+        fn read_local_skill_version_parses_frontmatter() {
+            let tmp = tempfile::tempdir().unwrap();
+            let skill_dir = tmp.path().join("my-skill");
+            std::fs::create_dir_all(&skill_dir).unwrap();
+            std::fs::write(
+                skill_dir.join("SKILL.md"),
+                "---\nname: my-skill\nversion: \"1.2.3\"\ndescription: test\n---\nInstructions",
+            )
+            .unwrap();
+
+            // read_local_skill_version searches skill_search_paths() which won't find
+            // our tempdir, so test the underlying parse_skill_md directly
+            let content = std::fs::read_to_string(skill_dir.join("SKILL.md")).unwrap();
+            let (manifest, _body) =
+                astra_runtime::skills::loader::parse_skill_md(&content).unwrap();
+            assert_eq!(manifest.version.to_string(), "1.2.3");
+        }
+
+        #[tokio::test]
+        async fn fetch_marketplace_version_returns_latest() {
+            let srv = MockServer::start().await;
+            let resp = serde_json::json!({
+                "results": [{
+                    "skill_name": "my-skill",
+                    "version": "2.0.0",
+                    "description": null,
+                    "publisher_id": null,
+                    "trust_tier": null,
+                    "category": null,
+                    "ranking_score": 0.5,
+                    "avg_quality": 0.0,
+                    "total_installs": 0,
+                    "active_users_7d": 0,
+                }],
+                "total": 1,
+                "limit": 1,
+                "offset": 0,
+            });
+
+            Mock::given(method("GET"))
+                .and(path("/marketplace/search"))
+                .and(query_param("name", "my-skill"))
+                .and(query_param("limit", "1"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(&resp))
+                .expect(1)
+                .mount(&srv)
+                .await;
+
+            let client = make_client(&srv.uri());
+            let ver = super::fetch_marketplace_version("my-skill", &client, "tok").await;
+            assert_eq!(ver, Some("2.0.0".to_string()));
+        }
+
+        #[tokio::test]
+        async fn fetch_marketplace_version_returns_none_on_empty() {
+            let srv = MockServer::start().await;
+            let resp = serde_json::json!({
+                "results": [],
+                "total": 0,
+                "limit": 1,
+                "offset": 0,
+            });
+
+            Mock::given(method("GET"))
+                .and(path("/marketplace/search"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(&resp))
+                .mount(&srv)
+                .await;
+
+            let client = make_client(&srv.uri());
+            let ver = super::fetch_marketplace_version("nonexistent", &client, "tok").await;
+            assert_eq!(ver, None);
+        }
+
+        #[tokio::test]
+        async fn fetch_marketplace_version_returns_none_on_server_error() {
+            let srv = MockServer::start().await;
+
+            Mock::given(method("GET"))
+                .and(path("/marketplace/search"))
+                .respond_with(ResponseTemplate::new(500))
+                .mount(&srv)
+                .await;
+
+            let client = make_client(&srv.uri());
+            let ver = super::fetch_marketplace_version("some-skill", &client, "tok").await;
+            assert_eq!(ver, None);
+        }
+
+        #[test]
+        fn version_comparison_detects_upgrade_needed() {
+            use astra_runtime::skills::version::Version;
+            let local: Version = "1.0.0".parse().unwrap();
+            let remote: Version = "1.1.0".parse().unwrap();
+            assert!(remote > local);
+
+            let same: Version = "1.0.0".parse().unwrap();
+            assert!(!(same > local));
+
+            let older: Version = "0.9.0".parse().unwrap();
+            assert!(!(older > local));
+        }
+
+        #[test]
+        fn version_comparison_handles_prerelease() {
+            use astra_runtime::skills::version::Version;
+            let release: Version = "2.0.0".parse().unwrap();
+            let pre: Version = "2.0.0-beta".parse().unwrap();
+            assert!(release > pre, "release should be greater than pre-release");
+        }
     }
 }
 
@@ -2928,6 +3054,454 @@ fn format_bytes(bytes: u64) -> String {
     } else {
         format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
     }
+}
+
+// ── Upgrade / Rollback / Check-update commands ─────────────────────────
+
+/// Read the local installed version of a skill from its SKILL.md frontmatter.
+fn read_local_skill_version(skill_name: &str) -> Option<(std::path::PathBuf, astra_runtime::skills::version::Version)> {
+    let search_paths = crate::skill_instructions::skill_search_paths();
+    for base in &search_paths {
+        let skill_md = base.join(skill_name).join("SKILL.md");
+        if skill_md.exists() {
+            if let Ok(content) = std::fs::read_to_string(&skill_md) {
+                if let Ok((manifest, _)) = astra_runtime::skills::loader::parse_skill_md(&content) {
+                    return Some((base.join(skill_name), manifest.version));
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Fetch the latest version string for a skill from the marketplace.
+async fn fetch_marketplace_version(
+    skill_name: &str,
+    api: &astra_thin_client::ThinClient,
+    tok: &str,
+) -> Option<String> {
+    let query_pairs = vec![
+        ("name", skill_name.to_string()),
+        ("limit", "1".to_string()),
+    ];
+    match api
+        .get_bearer_path_query_text(tok, "/marketplace/search", &query_pairs)
+        .await
+    {
+        Ok(text) => {
+            if let Ok(resp) = serde_json::from_str::<astra_services::marketplace_stats::SkillSearchResponse>(&text) {
+                resp.results.first().map(|r| r.version.clone())
+            } else {
+                None
+            }
+        }
+        Err(_) => None,
+    }
+}
+
+/// `/skill check-update [name]` — compare installed vs marketplace latest.
+async fn check_skill_updates(
+    name: &str,
+    api: &astra_thin_client::ThinClient,
+    token: Option<&str>,
+) {
+    let tok = token.unwrap_or("");
+
+    eprintln!("\n  {}", "Checking for updates…".bold());
+    eprintln!("{}", "─".repeat(78).dim());
+
+    // Collect skills to check
+    let skills_to_check: Vec<String> = if name.is_empty() {
+        // Check all locally installed skills
+        let search_paths = crate::skill_instructions::skill_search_paths();
+        let mut names = Vec::new();
+        for base in &search_paths {
+            if let Ok(entries) = std::fs::read_dir(base) {
+                for entry in entries.flatten() {
+                    if entry.path().join("SKILL.md").exists() {
+                        if let Some(n) = entry.file_name().to_str() {
+                            if !names.contains(&n.to_string()) {
+                                names.push(n.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        names.sort();
+        names
+    } else {
+        vec![name.to_string()]
+    };
+
+    if skills_to_check.is_empty() {
+        eprintln!("  {}", "No locally installed skills found.".dim());
+        eprintln!();
+        return;
+    }
+
+    let mut updates_available = 0u32;
+
+    for skill_name in &skills_to_check {
+        let skill_name = skill_name.as_str();
+        let local = read_local_skill_version(skill_name);
+        let remote = fetch_marketplace_version(skill_name, api, tok).await;
+
+        match (local, remote) {
+            (Some((_path, local_ver)), Some(remote_str)) => {
+                match remote_str.parse::<astra_runtime::skills::version::Version>() {
+                    Ok(remote_ver) => {
+                        if remote_ver > local_ver {
+                            eprintln!(
+                                "  {} {} → {} {}",
+                                skill_name.cyan(),
+                                local_ver.to_string().dim(),
+                                remote_ver.to_string().green(),
+                                "(update available)".green()
+                            );
+                            updates_available += 1;
+                        } else {
+                            eprintln!(
+                                "  {} {} {}",
+                                skill_name.cyan(),
+                                local_ver.to_string().dim(),
+                                "(up to date)".dim()
+                            );
+                        }
+                    }
+                    Err(_) => {
+                        eprintln!(
+                            "  {} {} {}",
+                            skill_name.cyan(),
+                            local_ver.to_string().dim(),
+                            format!("(marketplace version '{remote_str}' unparseable)").yellow()
+                        );
+                    }
+                }
+            }
+            (Some((_path, local_ver)), None) => {
+                eprintln!(
+                    "  {} {} {}",
+                    skill_name.cyan(),
+                    local_ver.to_string().dim(),
+                    "(not found in marketplace)".dim()
+                );
+            }
+            (None, _) => {
+                if !name.is_empty() {
+                    eprintln!(
+                        "  {} Skill '{}' not found locally.",
+                        "✗".yellow(),
+                        skill_name.cyan()
+                    );
+                }
+            }
+        }
+    }
+
+    if updates_available == 0 {
+        eprintln!("\n  {}", "All skills are up to date.".dim());
+    } else {
+        eprintln!(
+            "\n  {} {} update(s) available. Use '/skill upgrade <name>' to upgrade.",
+            "ℹ".cyan(),
+            updates_available
+        );
+    }
+    eprintln!();
+}
+
+/// `/skill upgrade <name>` or `/skill upgrade --all` — upgrade to latest version.
+async fn upgrade_skill(
+    arg: &str,
+    api: &astra_thin_client::ThinClient,
+    token: Option<&str>,
+    state: &mut ReplState,
+) {
+    let tok = token.unwrap_or("");
+
+    if arg == "--all" {
+        upgrade_all_skills(api, tok, state).await;
+        return;
+    }
+
+    let skill_name = arg;
+    if skill_name.is_empty() {
+        eprintln!(
+            "{}",
+            "  Usage: /skill upgrade <name>  or  /skill upgrade --all".yellow()
+        );
+        return;
+    }
+
+    // Check local version
+    let local = read_local_skill_version(skill_name);
+    let (local_path, local_ver) = match local {
+        Some((p, v)) => (p, v),
+        None => {
+            eprintln!(
+                "  {} Skill '{}' not found locally. Use '/skill install {}' first.",
+                "✗".yellow(),
+                skill_name.cyan(),
+                skill_name
+            );
+            eprintln!();
+            return;
+        }
+    };
+
+    // Fetch latest from marketplace
+    let remote_str = match fetch_marketplace_version(skill_name, api, tok).await {
+        Some(v) => v,
+        None => {
+            eprintln!(
+                "  {} Skill '{}' not found in marketplace.",
+                "✗".yellow(),
+                skill_name.cyan()
+            );
+            eprintln!();
+            return;
+        }
+    };
+
+    let remote_ver = match remote_str.parse::<astra_runtime::skills::version::Version>() {
+        Ok(v) => v,
+        Err(_) => {
+            eprintln!(
+                "  {} Cannot parse marketplace version '{}'.",
+                "✗".yellow(),
+                remote_str
+            );
+            eprintln!();
+            return;
+        }
+    };
+
+    if remote_ver <= local_ver {
+        eprintln!(
+            "  {} '{}' is already at v{} (latest).",
+            "✓".green(),
+            skill_name.cyan(),
+            local_ver
+        );
+        eprintln!();
+        return;
+    }
+
+    eprintln!(
+        "  {} Upgrading '{}': {} → {}",
+        "⬆".cyan(),
+        skill_name.cyan(),
+        local_ver.to_string().dim(),
+        remote_ver.to_string().green()
+    );
+
+    // Remove old and re-install latest
+    let _ = std::fs::remove_dir_all(&local_path);
+    let ok = install_single_skill(skill_name, None, api, tok, state).await;
+
+    if ok {
+        // Notify server
+        let body = serde_json::json!({ "skill_name": skill_name });
+        let _ = api
+            .post_bearer_path_json_text(tok, "/marketplace/upgrade", &body)
+            .await;
+
+        // Refresh registry
+        let _ = state.unified_skill_registry.discover_all().await;
+        eprintln!("  {}", "Skill registry refreshed.".dim());
+    }
+    eprintln!();
+}
+
+/// Upgrade all installed marketplace skills.
+async fn upgrade_all_skills(
+    api: &astra_thin_client::ThinClient,
+    tok: &str,
+    state: &mut ReplState,
+) {
+    eprintln!("\n  {}", "Checking all installed skills for updates…".bold());
+    eprintln!("{}", "─".repeat(78).dim());
+
+    // Get installed list from server
+    let installed = match api
+        .get_bearer_path_query_text(tok, "/marketplace/installed", &[("limit", "200".to_string())])
+        .await
+    {
+        Ok(text) => {
+            match serde_json::from_str::<astra_services::marketplace::InstalledListResponse>(&text) {
+                Ok(resp) => resp.installations,
+                Err(e) => {
+                    eprintln!("  {} {}", "✗ Parse error:".yellow(), format!("{e}").dim());
+                    return;
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!(
+                "  {} {}",
+                "✗ Server unavailable:".yellow(),
+                format!("{e}").dim()
+            );
+            return;
+        }
+    };
+
+    if installed.is_empty() {
+        eprintln!("  {}", "No skills installed from marketplace.".dim());
+        eprintln!();
+        return;
+    }
+
+    let mut upgraded = 0u32;
+    let mut up_to_date = 0u32;
+
+    for inst in &installed {
+        let skill_name = inst.skill_name.as_str();
+        let local = read_local_skill_version(skill_name);
+
+        let remote_str = match fetch_marketplace_version(skill_name, api, tok).await {
+            Some(v) => v,
+            None => continue,
+        };
+
+        let remote_ver = match remote_str.parse::<astra_runtime::skills::version::Version>() {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+
+        match local {
+            Some((local_path, local_ver)) if remote_ver > local_ver => {
+                eprintln!(
+                    "  {} Upgrading '{}': {} → {}",
+                    "⬆".cyan(),
+                    skill_name.cyan(),
+                    local_ver.to_string().dim(),
+                    remote_ver.to_string().green()
+                );
+                let _ = std::fs::remove_dir_all(&local_path);
+                let ok = install_single_skill(skill_name, None, api, tok, state).await;
+                if ok {
+                    let body = serde_json::json!({ "skill_name": skill_name });
+                    let _ = api
+                        .post_bearer_path_json_text(tok, "/marketplace/upgrade", &body)
+                        .await;
+                    upgraded += 1;
+                }
+            }
+            Some(_) => {
+                up_to_date += 1;
+            }
+            None => {
+                // Installed on server but not locally — skip
+                up_to_date += 1;
+            }
+        }
+    }
+
+    if upgraded > 0 {
+        // Refresh registry once after all upgrades
+        let _ = state.unified_skill_registry.discover_all().await;
+        eprintln!("  {}", "Skill registry refreshed.".dim());
+    }
+
+    eprintln!(
+        "\n  {} {} upgraded, {} up to date",
+        "Done:".bold(),
+        upgraded.to_string().green(),
+        up_to_date.to_string().dim()
+    );
+    eprintln!();
+}
+
+/// `/skill rollback <name>` — revert to previous version.
+async fn rollback_skill(
+    name: &str,
+    api: &astra_thin_client::ThinClient,
+    token: Option<&str>,
+    state: &mut ReplState,
+) {
+    if name.is_empty() {
+        eprintln!(
+            "{}",
+            "  Usage: /skill rollback <name>".yellow()
+        );
+        eprintln!(
+            "{}",
+            "  Reverts a skill to its previous version.".dim()
+        );
+        return;
+    }
+
+    let tok = token.unwrap_or("");
+
+    // Call server rollback to get previous version
+    let body = serde_json::json!({ "skill_name": name });
+    let resp = match api
+        .post_bearer_path_json_text(tok, "/marketplace/rollback", &body)
+        .await
+    {
+        Ok(text) => {
+            match serde_json::from_str::<astra_services::marketplace::InstallationResponse>(&text) {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("  {} {}", "✗ Parse error:".yellow(), format!("{e}").dim());
+                    eprintln!();
+                    return;
+                }
+            }
+        }
+        Err(e) => {
+            let msg = format!("{e}");
+            if msg.contains("404") || msg.contains("not installed") || msg.contains("Not Found") {
+                eprintln!(
+                    "  {} Skill '{}' is not installed on the server.",
+                    "✗".yellow(),
+                    name.cyan()
+                );
+            } else if msg.contains("400") || msg.contains("No previous version") {
+                eprintln!(
+                    "  {} No previous version to rollback to for '{}'.",
+                    "✗".yellow(),
+                    name.cyan()
+                );
+            } else {
+                eprintln!(
+                    "  {} {}",
+                    "✗ Rollback failed:".yellow(),
+                    msg.dim()
+                );
+            }
+            eprintln!();
+            return;
+        }
+    };
+
+    let target_version = &resp.skill_version;
+    eprintln!(
+        "  {} Rolling back '{}' to v{}",
+        "⬇".cyan(),
+        name.cyan(),
+        target_version.as_str().dim()
+    );
+
+    // Remove local copy and re-install the specific version
+    let search_paths = crate::skill_instructions::skill_search_paths();
+    for base in &search_paths {
+        let skill_dir = base.join(name);
+        if skill_dir.exists() {
+            let _ = std::fs::remove_dir_all(&skill_dir);
+            break;
+        }
+    }
+
+    let ok = install_single_skill(name, Some(target_version.as_str()), api, tok, state).await;
+
+    if ok {
+        let _ = state.unified_skill_registry.discover_all().await;
+        eprintln!("  {}", "Skill registry refreshed.".dim());
+    }
+    eprintln!();
 }
 
 // ── Browse / Trending / Installed commands ──────────────────────────────
