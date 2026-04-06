@@ -54,9 +54,21 @@ mod shell;
 /// entry with the oldest timestamp is evicted.
 const MAX_FILE_STATE_ENTRIES: usize = 200;
 
+/// Shape of the last `read_file` call, for consecutive-request dedup (same idea as
+/// Claude Code `FileReadTool`: same offset+limit + unchanged mtime → stub before I/O).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ReadDedupKey {
+    Full,
+    Outline,
+    /// Raw `start_line` / `end_line` JSON (absent key = `None`), like Claude's offset/limit.
+    Range {
+        start_line: Option<u64>,
+        end_line: Option<u64>,
+    },
+}
+
 /// Tracks the last-read state of a file for staleness detection and dedup.
 /// Inspired by Claude Code's readFileState mechanism.
-#[derive(Debug, Clone)]
 struct FileState {
     /// mtime (milliseconds) at the time of last read/write.
     timestamp_ms: u128,
@@ -71,6 +83,8 @@ struct FileState {
     /// How many times this file has been read with different ranges.
     /// Used to nudge the model toward grep for large files.
     ranged_read_count: u32,
+    /// Last read_file request shape (updated on every successful read).
+    last_dedup_key: ReadDedupKey,
 }
 
 pub fn all_tool_schemas() -> Vec<Value> {
@@ -1338,7 +1352,7 @@ impl ToolExecutor {
     }
 
     /// Record file state after a read.
-    fn record_read(&self, path: &Path, is_partial: bool) {
+    fn record_read(&self, path: &Path, is_partial: bool, last_dedup_key: ReadDedupKey) {
         let ts = Self::file_mtime_ms(path);
         if let Ok(mut state) = self.file_state.lock() {
             let prev = state.get(path);
@@ -1365,6 +1379,7 @@ impl ToolExecutor {
                     is_partial,
                     read_count: new_count,
                     ranged_read_count: new_ranged,
+                    last_dedup_key,
                 },
             );
             // LRU eviction: keep at most MAX_FILE_STATE_ENTRIES
@@ -1399,6 +1414,7 @@ impl ToolExecutor {
                     is_partial: false,
                     read_count: 0,
                     ranged_read_count: 0,
+                    last_dedup_key: ReadDedupKey::Full,
                 },
             );
             // LRU eviction: keep at most MAX_FILE_STATE_ENTRIES
@@ -1447,6 +1463,34 @@ impl ToolExecutor {
             .ok()
             .and_then(|s| s.get(path).map(|fs| !fs.is_partial))
             .unwrap_or(false)
+    }
+
+    /// Consecutive identical partial read (outline or same raw line range) with unchanged
+    /// mtime — stub **before** disk read, like Claude Code `tengu_file_read_dedup` for
+    /// the same offset/limit as the immediately previous read.
+    fn can_dedup_identical_partial_read(&self, path: &Path, requested: &ReadDedupKey) -> bool {
+        if std::env::var("MO_DEDUP_DISABLED").is_ok_and(|v| v == "1" || v == "true") {
+            return false;
+        }
+        if matches!(requested, ReadDedupKey::Full) {
+            return false;
+        }
+        let current_ts = Self::file_mtime_ms(path);
+        if current_ts == 0 {
+            return false;
+        }
+        self.file_state
+            .lock()
+            .ok()
+            .and_then(|s| {
+                s.get(path).and_then(|fs| {
+                    (fs.from_read
+                        && fs.timestamp_ms == current_ts
+                        && fs.last_dedup_key == *requested)
+                        .then_some(())
+                })
+            })
+            .is_some()
     }
 
     /// Check if we can dedup a read (previous op was a full read, unchanged mtime).

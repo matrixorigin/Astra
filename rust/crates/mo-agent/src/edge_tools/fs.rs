@@ -171,7 +171,7 @@ impl ToolExecutor {
                             "webp" => "image/webp",
                             _ => "application/octet-stream",
                         };
-                        self.record_read(&path, false);
+                        self.record_read(&path, false, ReadDedupKey::Full);
                         return format!("data:{mime};base64,{b64}");
                     }
                     Err(e) => return format!("Error reading image: {e}"),
@@ -192,14 +192,37 @@ impl ToolExecutor {
             }
         }
 
-        // Pre-read size gate: check file size before reading.
-        // Large files without a line range should use outline or start_line/end_line.
-        // Inspired by Claude Code's maxSizeBytes (256KB) pre-read check.
-        let has_range = args.get("start_line").is_some() || args.get("end_line").is_some();
+        // Raw range keys (match Claude Code offset/limit identity for consecutive dedup).
+        let start_raw = args.get("start_line").and_then(Value::as_u64);
+        let end_raw = args.get("end_line").and_then(Value::as_u64);
+        let has_range = start_raw.is_some() || end_raw.is_some();
         let has_outline = args
             .get("outline")
             .and_then(Value::as_bool)
             .unwrap_or(false);
+        let dedup_key = if has_outline {
+            ReadDedupKey::Outline
+        } else if has_range {
+            ReadDedupKey::Range {
+                start_line: start_raw,
+                end_line: end_raw,
+            }
+        } else {
+            ReadDedupKey::Full
+        };
+
+        // Consecutive identical outline/range request + unchanged file → stub before I/O
+        // (Claude Code FileReadTool dedup for the same offset/limit as last read).
+        if self.can_dedup_identical_partial_read(&path, &dedup_key) {
+            return format!(
+                "[Same read_file request as immediately before — file unchanged. \
+                 Refer to the earlier read_file result for {path_str}.]"
+            );
+        }
+
+        // Pre-read size gate: check file size before reading.
+        // Large files without a line range should use outline or start_line/end_line.
+        // Inspired by Claude Code's maxSizeBytes (256KB) pre-read check.
         if !has_range
             && !has_outline
             && let Ok(meta) = fs::metadata(&path)
@@ -240,16 +263,12 @@ impl ToolExecutor {
         };
 
         // Outline mode: return only definition signatures with line numbers
-        if args
-            .get("outline")
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
-        {
+        if has_outline {
             let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
             let total_lines = content.lines().count();
 
             // Record as partial read (outline)
-            self.record_read(&path, true);
+            self.record_read(&path, true, ReadDedupKey::Outline);
 
             // Try tree-sitter first for accurate AST-based extraction
             if let Some(ts_lang) = super::code_intel::detect_language(&path) {
@@ -280,16 +299,10 @@ impl ToolExecutor {
             );
         }
 
-        let start = args
-            .get("start_line")
-            .and_then(Value::as_u64)
-            .map(|n| n as usize);
-        let end = args
-            .get("end_line")
-            .and_then(Value::as_u64)
-            .map(|n| n as usize);
+        let start = start_raw.map(|n| n as usize);
+        let end = end_raw.map(|n| n as usize);
 
-        let is_ranged = start.is_some() || end.is_some();
+        let is_ranged = has_range;
 
         // Dedup: if file was fully read before and hasn't changed, return stub.
         // Works for both ranged and non-ranged reads — once the model has the
@@ -323,7 +336,7 @@ impl ToolExecutor {
                 && content.len() <= max_chars
             {
                 // Upgrade to full read — future reads will hit can_dedup_read
-                self.record_read(&path, false);
+                self.record_read(&path, false, ReadDedupKey::Full);
                 let total_lines = content.lines().count();
                 let numbered = add_line_numbers(&content, 1);
                 return format!(
@@ -335,7 +348,15 @@ impl ToolExecutor {
         }
 
         // Record the read state
-        self.record_read(&path, is_ranged);
+        let record_key = if is_ranged {
+            ReadDedupKey::Range {
+                start_line: start_raw,
+                end_line: end_raw,
+            }
+        } else {
+            ReadDedupKey::Full
+        };
+        self.record_read(&path, is_ranged, record_key);
 
         // Escalating warning when the same file is read too many times.
         // Inspired by Claude Code's dedup stub behavior: train the model
@@ -2133,6 +2154,105 @@ type Handler interface {
             !last.contains("read 3 times"),
             "ranged reads should not trigger warning"
         );
+    }
+
+    // ── Claude Code–style consecutive identical partial read dedup ───────────
+
+    #[test]
+    fn read_file_consecutive_identical_range_dedups() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("dup.txt");
+        let mut f = std::fs::File::create(&file_path).unwrap();
+        for i in 1..=20 {
+            writeln!(f, "row {i}").unwrap();
+        }
+        drop(f);
+
+        let executor = test_executor_in(dir.path());
+        let args = serde_json::json!({
+            "path": "dup.txt",
+            "start_line": 1,
+            "end_line": 5
+        });
+        let first = executor.read_file(&args);
+        assert!(
+            first.contains("row 1") && first.contains("Same read_file request") == false,
+            "first read should return content: {first}"
+        );
+
+        let second = executor.read_file(&args);
+        assert!(
+            second.contains("Same read_file request"),
+            "second identical range should stub: {second}"
+        );
+    }
+
+    #[test]
+    fn read_file_consecutive_identical_outline_dedups() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("o.rs");
+        std::fs::write(
+            &file_path,
+            "fn alpha() {}\nfn beta() {}\n",
+        )
+        .unwrap();
+
+        let executor = test_executor_in(dir.path());
+        let args = serde_json::json!({ "path": "o.rs", "outline": true });
+        let first = executor.read_file(&args);
+        assert!(
+            first.contains("Outline") || first.contains("fn "),
+            "first outline read: {first}"
+        );
+        assert!(!first.contains("Same read_file request"));
+
+        let second = executor.read_file(&args);
+        assert!(
+            second.contains("Same read_file request"),
+            "second outline should stub: {second}"
+        );
+    }
+
+    #[test]
+    fn read_file_nonconsecutive_same_range_not_deduped() {
+        // > AUTO_EXPAND_MAX_BYTES so the second ranged read does not upgrade to a full read
+        // (which would make a third ranged read hit can_dedup_read instead of this scenario).
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("ab.txt");
+        let mut f = std::fs::File::create(&file_path).unwrap();
+        writeln!(f, "MARK_A").unwrap();
+        writeln!(f, "MARK_B").unwrap();
+        writeln!(f, "MARK_C").unwrap();
+        writeln!(f, "MARK_D").unwrap();
+        for i in 0..300 {
+            writeln!(f, "pad {i}: {}", "x".repeat(40)).unwrap();
+        }
+        drop(f);
+
+        let executor = test_executor_in(dir.path());
+        let r_a = executor.read_file(&serde_json::json!({
+            "path": "ab.txt",
+            "start_line": 1,
+            "end_line": 2
+        }));
+        assert!(r_a.contains("MARK_A"));
+
+        let _r_b = executor.read_file(&serde_json::json!({
+            "path": "ab.txt",
+            "start_line": 3,
+            "end_line": 4
+        }));
+
+        let r_a_again = executor.read_file(&serde_json::json!({
+            "path": "ab.txt",
+            "start_line": 1,
+            "end_line": 2
+        }));
+        assert!(
+            !r_a_again.contains("Same read_file request"),
+            "last read was a different range — should re-fetch lines: {r_a_again}"
+        );
+        assert!(r_a_again.contains("MARK_A"));
     }
 
     // ── read_file not-found hints ────────────────────────────────────────────
