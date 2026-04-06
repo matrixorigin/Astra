@@ -1554,6 +1554,44 @@ async fn install_skill_from_marketplace(
         return;
     }
 
+    let tok = token.unwrap_or("");
+    let mut installed_names: Vec<String> = Vec::new();
+
+    install_skill_recursive(name, api, tok, state, &mut installed_names, 0).await;
+
+    if installed_names.len() > 1 {
+        eprintln!(
+            "  {} Installed {} skills total: {}",
+            "✓".green(),
+            installed_names.len(),
+            installed_names.join(", ").dim()
+        );
+    }
+    eprintln!();
+}
+
+const MAX_DEP_INSTALL_DEPTH: u32 = 5;
+
+/// Recursively install a skill and its dependencies.
+fn install_skill_recursive<'a>(
+    name: &'a str,
+    api: &'a astra_thin_client::ThinClient,
+    tok: &'a str,
+    state: &'a mut ReplState,
+    installed: &'a mut Vec<String>,
+    depth: u32,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + 'a>> {
+    Box::pin(async move {
+    if depth > MAX_DEP_INSTALL_DEPTH {
+        eprintln!(
+            "  {} Dependency depth limit ({}) reached for '{}'",
+            "⚠".yellow(),
+            MAX_DEP_INSTALL_DEPTH,
+            name.cyan()
+        );
+        return;
+    }
+
     // Parse name@version
     let (skill_name, version) = if let Some(idx) = name.find('@') {
         (&name[..idx], Some(&name[idx + 1..]))
@@ -1561,19 +1599,86 @@ async fn install_skill_from_marketplace(
         (name, None)
     };
 
-    let tok = token.unwrap_or("");
+    // Skip if already installed in this session (avoid cycles)
+    if installed.iter().any(|n| n == skill_name) {
+        return;
+    }
 
-    eprintln!(
-        "  {} {}{}",
-        "Installing".cyan(),
-        skill_name.cyan().bold(),
-        version
-            .map(|v| format!("@{v}"))
-            .unwrap_or_default()
-            .dim()
-    );
+    // Check if skill is already available locally
+    if depth > 0 {
+        let all = state.unified_skill_registry.all_manifests();
+        if all.iter().any(|m| m.name == skill_name) {
+            return; // Already available, skip
+        }
+    }
+
+    if depth == 0 {
+        eprintln!(
+            "  {} {}{}",
+            "Installing".cyan(),
+            skill_name.cyan().bold(),
+            version
+                .map(|v| format!("@{v}"))
+                .unwrap_or_default()
+                .dim()
+        );
+    } else {
+        eprintln!(
+            "  {} {} (dependency)",
+            "Installing".cyan(),
+            skill_name.cyan()
+        );
+    }
 
     // Try bundle endpoint first, fall back to legacy JSON
+    let success = install_single_skill(skill_name, version, api, tok, state).await;
+
+    if success {
+        installed.push(skill_name.to_string());
+
+        // Refresh registry to pick up newly installed skill
+        let _ = state.unified_skill_registry.discover_all().await;
+
+        // Check dependencies of the newly installed skill
+        let deps = {
+            let all = state.unified_skill_registry.all_manifests();
+            all.iter()
+                .find(|m| m.name == skill_name)
+                .map(|m| m.dependencies.clone())
+                .unwrap_or_default()
+        };
+
+        let skill_deps: Vec<_> = deps
+            .iter()
+            .filter(|d| {
+                d.dep_type == astra_runtime::skills::version::DependencyType::Skill
+            })
+            .collect();
+
+        if !skill_deps.is_empty() {
+            eprintln!(
+                "  {} {} has {} dependencies",
+                "→".dim(),
+                skill_name.cyan(),
+                skill_deps.len()
+            );
+
+            for dep in skill_deps {
+                install_skill_recursive(&dep.name, api, tok, state, installed, depth + 1).await;
+            }
+        }
+    }
+    }) // close Box::pin(async move { ... })
+}
+
+/// Install a single skill (no dependency resolution). Returns true on success.
+async fn install_single_skill(
+    skill_name: &str,
+    version: Option<&str>,
+    api: &astra_thin_client::ThinClient,
+    tok: &str,
+    state: &mut ReplState,
+) -> bool {
     let bundle_path = format!("/skills/{}/bundle", skill_name);
     let query_pairs: Vec<(&str, String)> = if let Some(v) = version {
         vec![("version", v.to_string())]
@@ -1587,7 +1692,6 @@ async fn install_skill_from_marketplace(
         .await
     {
         Ok(text) => {
-            // Try to decode as base64 bundle
             if let Ok(bytes) = base64::Engine::decode(
                 &base64::engine::general_purpose::STANDARD,
                 text.trim(),
@@ -1606,10 +1710,7 @@ async fn install_skill_from_marketplace(
                             manifest.version.dim(),
                             installed.display().to_string().dim()
                         );
-                        let _ = state.unified_skill_registry.discover_all().await;
-                        eprintln!("  {}", "Skill registry refreshed.".dim());
-                        eprintln!();
-                        return;
+                        return true;
                     }
                     Err(e) => {
                         eprintln!(
@@ -1621,24 +1722,23 @@ async fn install_skill_from_marketplace(
                 }
             }
             // Fall through to legacy install
-            install_skill_legacy(skill_name, version, api, tok, state).await;
+            install_single_skill_legacy(skill_name, version, api, tok, state).await
         }
         Err(_) => {
             // Bundle endpoint not available, use legacy
-            install_skill_legacy(skill_name, version, api, tok, state).await;
+            install_single_skill_legacy(skill_name, version, api, tok, state).await
         }
     }
-    eprintln!();
 }
 
-/// Legacy install: fetches SkillRecord JSON and writes SKILL.md directly.
-async fn install_skill_legacy(
+/// Legacy install: fetches SkillRecord JSON and writes SKILL.md directly. Returns true on success.
+async fn install_single_skill_legacy(
     skill_name: &str,
     version: Option<&str>,
     api: &astra_thin_client::ThinClient,
     tok: &str,
-    state: &mut ReplState,
-) {
+    _state: &mut ReplState,
+) -> bool {
     let path = format!("/skills/{}", skill_name);
     let query_pairs: Vec<(&str, String)> = if let Some(v) = version {
         vec![("version", v.to_string())]
@@ -1675,7 +1775,7 @@ async fn install_skill_legacy(
 
                     if let Err(e) = std::fs::create_dir_all(&install_dir) {
                         eprintln!("  {} {}", "✗ Failed to create directory:".red(), e);
-                        return;
+                        return false;
                     }
 
                     let skill_md = if !manifest_str.is_empty() {
@@ -1692,7 +1792,7 @@ async fn install_skill_legacy(
 
                     if let Err(e) = std::fs::write(install_dir.join("SKILL.md"), &skill_md) {
                         eprintln!("  {} {}", "✗ Failed to write SKILL.md:".red(), e);
-                        return;
+                        return false;
                     }
 
                     eprintln!(
@@ -1702,12 +1802,11 @@ async fn install_skill_legacy(
                         record.version.dim(),
                         install_dir.display().to_string().dim()
                     );
-
-                    let _ = state.unified_skill_registry.discover_all().await;
-                    eprintln!("  {}", "Skill registry refreshed.".dim());
+                    true
                 }
                 Err(e) => {
                     eprintln!("  {} {}", "✗ Parse error:".yellow(), format!("{e}").dim());
+                    false
                 }
             }
         }
@@ -1717,6 +1816,7 @@ async fn install_skill_legacy(
                 "✗ Failed to fetch skill:".yellow(),
                 format!("{e}").dim()
             );
+            false
         }
     }
 }
