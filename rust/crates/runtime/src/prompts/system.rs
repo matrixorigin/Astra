@@ -97,7 +97,8 @@ pub fn build_main_system_prompt_with_style(
          3. Do ONLY what the user asked. When done → STOP and report.\n\
          4. Live data (CI, PRs, issues, stats, memory, git) → MUST call a tool. Never answer from training data.\n\
          5. Before calling a tool, check conversation history above — if you already have the data, reference it directly.\n\
-         6. Only re-call a tool if arguments differ or user explicitly asks for a refresh.\n\n\
+         6. Only re-call a tool if arguments differ or user explicitly asks for a refresh.\n\
+         7. Tool outputs in history reflect state AT CALL TIME, not now. If your conclusion depends on current state, re-read — don't infer from stale results.\n\n\
          ## Planning Protocol\n\
          For tasks that need 3+ tool calls, plan in a <think> block FIRST:\n\
          <think>\n\
@@ -577,7 +578,8 @@ pub fn build_system_prompt_sections_with_style(
          3. Do ONLY what the user asked. When done → STOP and report.\n\
          4. Live data (CI, PRs, issues, stats, memory, git) → MUST call a tool. Never answer from training data.\n\
          5. Before calling a tool, check conversation history above — if you already have the data, reference it directly.\n\
-         6. Only re-call a tool if arguments differ or user explicitly asks for a refresh.\n\n\
+         6. Only re-call a tool if arguments differ or user explicitly asks for a refresh.\n\
+         7. Tool outputs in history reflect state AT CALL TIME, not now. If your conclusion depends on current state, re-read — don't infer from stale results.\n\n\
          ## Planning Protocol\n\
          For tasks that need 3+ tool calls, plan in a <think> block FIRST:\n\
          <think>\n\
