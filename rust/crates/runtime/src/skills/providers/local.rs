@@ -93,6 +93,28 @@ impl SkillProvider for LocalSkillProvider {
             }
         }
 
+        // Directory name often uses snake_case (`review_changes`) while SKILL.md frontmatter
+        // uses kebab-case (`review-changes`). Direct path join misses; resolve by scanning.
+        for search_dir in &self.search_paths {
+            if !search_dir.exists() {
+                continue;
+            }
+            let found = loader::discover_skills_in_dir(search_dir);
+            for (_dir_name, skill_md_path) in found {
+                let mut loaded = match loader::load_skill_from_path_confined(&skill_md_path, search_dir)
+                {
+                    Ok(l) => l,
+                    Err(_) => continue,
+                };
+                if loaded.manifest.name == name
+                    || loaded.manifest.aliases.iter().any(|a| a == name)
+                {
+                    loaded.manifest.source = SkillSourceKind::Local;
+                    return Ok(loaded);
+                }
+            }
+        }
+
         Err(SkillError::NotFound(format!(
             "local skill not found: {name}"
         )))
@@ -162,6 +184,36 @@ mod tests {
         let provider = LocalSkillProvider::with_paths(vec![dir.path().to_path_buf()]);
         let result = provider.load("nonexistent").await;
         assert!(matches!(result, Err(SkillError::NotFound(_))));
+    }
+
+    /// Kebab-case manifest `name` with snake_case directory (common in `skills/<dir>/`).
+    #[tokio::test]
+    async fn load_resolves_kebab_name_from_snake_case_dir() {
+        let dir = TempDir::new().unwrap();
+        create_test_skill(
+            dir.path(),
+            "review_changes",
+            "---\nname: review-changes\ndescription: Review\n---\nDo the review.",
+        );
+
+        let provider = LocalSkillProvider::with_paths(vec![dir.path().to_path_buf()]);
+        let loaded = provider.load("review-changes").await.unwrap();
+        assert_eq!(loaded.manifest.name, "review-changes");
+        assert!(loaded.instructions.contains("Do the review."));
+    }
+
+    #[tokio::test]
+    async fn load_resolves_by_alias_when_dir_name_differs() {
+        let dir = TempDir::new().unwrap();
+        create_test_skill(
+            dir.path(),
+            "my_skill_dir",
+            "---\nname: canonical\ndescription: X\naliases:\n  - review-changes\n---\nBody.",
+        );
+
+        let provider = LocalSkillProvider::with_paths(vec![dir.path().to_path_buf()]);
+        let loaded = provider.load("review-changes").await.unwrap();
+        assert_eq!(loaded.manifest.name, "canonical");
     }
 
     #[tokio::test]
