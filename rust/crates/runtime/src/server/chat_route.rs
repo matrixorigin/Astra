@@ -361,3 +361,275 @@ fn keyword_matches(query: &str, keyword: &str) -> bool {
 fn is_cjk(ch: char) -> bool {
     ('\u{4E00}'..='\u{9FFF}').contains(&ch)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ──────────────────────────────────────────────────────────
+    // is_cjk
+    // ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn is_cjk_chinese_char() {
+        assert!(is_cjk('你'));
+        assert!(is_cjk('好'));
+    }
+
+    #[test]
+    fn is_cjk_ascii_char() {
+        assert!(!is_cjk('a'));
+        assert!(!is_cjk('Z'));
+    }
+
+    #[test]
+    fn is_cjk_boundary() {
+        assert!(is_cjk('\u{4E00}')); // start
+        assert!(is_cjk('\u{9FFF}')); // end
+        assert!(!is_cjk('\u{4DFF}')); // just before
+    }
+
+    // ──────────────────────────────────────────────────────────
+    // keyword_matches
+    // ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn keyword_matches_exact_en() {
+        assert!(keyword_matches("run the tests", "run"));
+    }
+
+    #[test]
+    fn keyword_matches_boundary_en() {
+        // "run" should not match inside "running" via word boundary
+        // Actually \brun\b won't match "running", but let's check
+        assert!(!keyword_matches("running fast", "run"));
+    }
+
+    #[test]
+    fn keyword_matches_cjk() {
+        assert!(keyword_matches("帮我搜索一下", "搜索"));
+    }
+
+    #[test]
+    fn keyword_matches_case_insensitive() {
+        assert!(keyword_matches("Hello World", "hello"));
+    }
+
+    #[test]
+    fn keyword_matches_no_match() {
+        assert!(!keyword_matches("hello world", "xyzzy"));
+    }
+
+    // ──────────────────────────────────────────────────────────
+    // keyword_registry_match
+    // ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn registry_match_empty_query() {
+        let m = keyword_registry_match("", &[("test", &["hello"])], &[]);
+        assert!(m.label.is_none());
+        assert_eq!(m.score, 0.0);
+    }
+
+    #[test]
+    fn registry_match_single_hit() {
+        let m = keyword_registry_match("hello world", &[("greet", &["hello"])], &[]);
+        assert_eq!(m.label, Some("greet"));
+        assert!(m.score > 0.0);
+    }
+
+    #[test]
+    fn registry_match_negative_suppresses() {
+        let m = keyword_registry_match(
+            "search the code",
+            &[("search", &["search"])],
+            &[("search", &["code"])],
+        );
+        assert!(m.label.is_none()); // negative keyword "code" suppressed it
+    }
+
+    #[test]
+    fn registry_match_best_wins() {
+        let m = keyword_registry_match(
+            "debug this error",
+            &[
+                ("greet", &["hello"]),
+                ("debug", &["debug", "error"]),
+            ],
+            &[],
+        );
+        assert_eq!(m.label, Some("debug"));
+    }
+
+    // ──────────────────────────────────────────────────────────
+    // regex_classify_chat_route_intent
+    // ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn regex_intent_preference() {
+        assert_eq!(
+            regex_classify_chat_route_intent("记住我的偏好"),
+            Some("preference")
+        );
+        assert_eq!(
+            regex_classify_chat_route_intent("I prefer tabs"),
+            Some("preference")
+        );
+    }
+
+    #[test]
+    fn regex_intent_command() {
+        assert_eq!(
+            regex_classify_chat_route_intent("run cargo test"),
+            Some("command")
+        );
+    }
+
+    #[test]
+    fn regex_intent_feedback() {
+        assert_eq!(
+            regex_classify_chat_route_intent("不对，应该是这样"),
+            Some("feedback")
+        );
+    }
+
+    #[test]
+    fn regex_intent_no_match() {
+        assert!(regex_classify_chat_route_intent("explain this code").is_none());
+    }
+
+    // ──────────────────────────────────────────────────────────
+    // heuristic_classify_chat_route_intent
+    // ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn heuristic_empty_query() {
+        assert!(heuristic_classify_chat_route_intent("", 0).is_none());
+    }
+
+    #[test]
+    fn heuristic_short_question() {
+        // ≤3 words ending in ? → None
+        assert!(heuristic_classify_chat_route_intent("what is this?", 0).is_none());
+    }
+
+    #[test]
+    fn heuristic_first_turn_no_question_mark() {
+        // history_len=0, no ?, >3 words → command
+        assert_eq!(
+            heuristic_classify_chat_route_intent("create a new file here", 0),
+            Some("command")
+        );
+    }
+
+    #[test]
+    fn heuristic_non_first_turn() {
+        // history_len > 0 → None (no heuristic match)
+        assert!(heuristic_classify_chat_route_intent("do something", 5).is_none());
+    }
+
+    // ──────────────────────────────────────────────────────────
+    // classify_chat_route_intent (combined)
+    // ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn combined_intent_both_match_high_confidence() {
+        // "run cargo test" → regex matches "command", heuristic also "command" (first turn)
+        let r = classify_chat_route_intent("run cargo test", 0);
+        assert_eq!(r.intent, Some("command"));
+        assert_eq!(r.confidence, 0.95);
+        assert_eq!(r.matched_by, "both");
+    }
+
+    #[test]
+    fn combined_intent_regex_only() {
+        // "remember this" → regex matches "preference", heuristic returns None (history>0)
+        let r = classify_chat_route_intent("remember this", 5);
+        assert_eq!(r.intent, Some("preference"));
+        assert_eq!(r.matched_by, "regex");
+    }
+
+    #[test]
+    fn combined_intent_none() {
+        let r = classify_chat_route_intent("explain this code to me please", 5);
+        assert!(r.intent.is_none());
+        assert_eq!(r.matched_by, "none");
+    }
+
+    // ──────────────────────────────────────────────────────────
+    // classify_chat_route_tool_filter
+    // ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn tool_filter_conversational() {
+        let (filter, rounds) = classify_chat_route_tool_filter("hello");
+        assert_eq!(filter, "all_blocked");
+        assert_eq!(rounds, 0);
+    }
+
+    #[test]
+    fn tool_filter_external_fetch() {
+        let (filter, rounds) = classify_chat_route_tool_filter("search online for the latest news");
+        assert_eq!(filter, "local_blocked");
+        assert_eq!(rounds, 3);
+    }
+
+    #[test]
+    fn tool_filter_general() {
+        let (filter, rounds) = classify_chat_route_tool_filter("implement a new auth module");
+        assert_eq!(filter, "none");
+        assert_eq!(rounds, 10);
+    }
+
+    #[test]
+    fn tool_filter_chinese_conversational() {
+        let (filter, _) = classify_chat_route_tool_filter("你好");
+        assert_eq!(filter, "all_blocked");
+    }
+
+    // ──────────────────────────────────────────────────────────
+    // classify_chat_route_task_type
+    // ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn task_type_code_review() {
+        assert_eq!(classify_chat_route_task_type("review this PR"), "code_review");
+    }
+
+    #[test]
+    fn task_type_debugging() {
+        assert_eq!(classify_chat_route_task_type("debug this error"), "debugging");
+    }
+
+    #[test]
+    fn task_type_planning() {
+        assert_eq!(
+            classify_chat_route_task_type("design the architecture"),
+            "planning"
+        );
+    }
+
+    #[test]
+    fn task_type_general() {
+        assert_eq!(
+            classify_chat_route_task_type("implement a new feature"),
+            "general"
+        );
+    }
+
+    // ──────────────────────────────────────────────────────────
+    // classify_chat_route (full pipeline)
+    // ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn full_route_conversational() {
+        let r = classify_chat_route("hi".to_string());
+        assert_eq!(r.tool_filter, "all_blocked");
+    }
+
+    #[test]
+    fn full_route_general_command() {
+        let r = classify_chat_route("run all the tests".to_string());
+        assert!(r.intent.is_some());
+    }
+}
