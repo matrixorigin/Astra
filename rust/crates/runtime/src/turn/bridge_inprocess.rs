@@ -343,13 +343,25 @@ fn build_system_message(
         // Anthropic: multi-block content with cache_control on stable sections.
         // Even via OpenAI-compatible proxies, many forward cache_control to the
         // native Messages API. Proxies that don't will simply ignore the field.
+        //
+        // Cache strategy (mirrors Claude Code's approach):
+        //   Global  → scope:"global" + ttl:"1h"  (shared across all sessions/orgs)
+        //   Session → ttl:"1h"                    (stable within a session)
+        //   None    → no cache_control             (changes every turn)
+        let cache_disabled = std::env::var("MO_PROMPT_CACHE_DISABLED")
+            .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
         let mut blocks: Vec<Value> = Vec::with_capacity(sections.len() + 1);
         for section in &sections {
-            let cc = match section.scope {
-                prompts::CacheScope::Global | prompts::CacheScope::Session => {
-                    Some(json!({"type": "ephemeral"}))
+            let cc = if cache_disabled {
+                None
+            } else {
+                match section.scope {
+                    prompts::CacheScope::Global => {
+                        Some(json!({"type": "ephemeral", "scope": "global", "ttl": "1h"}))
+                    }
+                    prompts::CacheScope::Session => Some(json!({"type": "ephemeral", "ttl": "1h"})),
+                    prompts::CacheScope::None => None,
                 }
-                prompts::CacheScope::None => None,
             };
             let mut block = json!({
                 "type": "text",
@@ -387,10 +399,16 @@ fn annotate_tool_schemas_for_caching(tools: &mut [Value], provider: &str, model_
     if !is_anthropic || tools.is_empty() {
         return;
     }
+    if std::env::var("MO_PROMPT_CACHE_DISABLED")
+        .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+    {
+        return;
+    }
     // Mark last tool definition with cache_control — Anthropic caches the prefix
-    // up to the last cache_control marker
+    // up to the last cache_control marker. Use 1h TTL since tool schemas are
+    // stable within a session.
     if let Some(last) = tools.last_mut() {
-        last["cache_control"] = json!({"type": "ephemeral"});
+        last["cache_control"] = json!({"type": "ephemeral", "ttl": "1h"});
     }
 }
 
@@ -399,6 +417,11 @@ fn annotate_tool_schemas_for_caching(tools: &mut [Value], provider: &str, model_
 fn add_message_cache_breakpoint(messages: &mut [Value], provider: &str, model_name: &str) {
     let is_anthropic = provider == "anthropic" || model_name.contains("claude");
     if !is_anthropic || messages.is_empty() {
+        return;
+    }
+    if std::env::var("MO_PROMPT_CACHE_DISABLED")
+        .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+    {
         return;
     }
     // Find the last non-system message and add cache_control to it
@@ -2301,9 +2324,17 @@ mod tests {
     }
 
     // ── Static/dynamic prompt boundary tests ──
+    // These tests manipulate env vars, so they must not run in parallel.
+    static CACHE_ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn build_system_message_anthropic_has_cache_control() {
+        let _lock = CACHE_ENV_MUTEX.lock().unwrap();
+        // Ensure env var doesn't interfere
+        unsafe {
+            std::env::remove_var("MO_PROMPT_CACHE_DISABLED");
+        }
+
         let msg = build_system_message(
             &["bash", "read_file"],
             "cwd: /test",
@@ -2320,7 +2351,7 @@ mod tests {
             .expect("Anthropic content should be array");
         assert!(blocks.len() >= 2, "should have at least 2 blocks");
 
-        // First block (Global) should have cache_control
+        // First block (Global) should have cache_control with scope + ttl
         let first = &blocks[0];
         assert!(
             first.get("cache_control").is_some(),
@@ -2331,6 +2362,16 @@ mod tests {
             Some("ephemeral"),
             "cache_control type should be ephemeral"
         );
+        assert_eq!(
+            first["cache_control"]["scope"].as_str(),
+            Some("global"),
+            "Global block should have scope=global"
+        );
+        assert_eq!(
+            first["cache_control"]["ttl"].as_str(),
+            Some("1h"),
+            "Global block should have ttl=1h"
+        );
 
         // Last block (profile/dynamic) should NOT have cache_control
         let last = blocks.last().unwrap();
@@ -2338,6 +2379,69 @@ mod tests {
             last.get("cache_control").is_none() || last["cache_control"].is_null(),
             "dynamic block should not have cache_control"
         );
+    }
+
+    #[test]
+    fn build_system_message_session_scope_has_ttl_but_no_global_scope() {
+        let _lock = CACHE_ENV_MUTEX.lock().unwrap();
+        unsafe {
+            std::env::remove_var("MO_PROMPT_CACHE_DISABLED");
+        }
+
+        let msg = build_system_message(
+            &["bash", "read_file"],
+            "cwd: /test",
+            0.8,
+            Some("implementation"),
+            "anthropic",
+            "claude-sonnet-4-20250514",
+        );
+
+        let content = msg.get("content").expect("should have content");
+        let blocks = content.as_array().unwrap();
+
+        // Find Session block (second block, if present)
+        if blocks.len() >= 3 {
+            let session_block = &blocks[1];
+            if let Some(cc) = session_block.get("cache_control") {
+                assert_eq!(cc["ttl"].as_str(), Some("1h"), "Session should have ttl=1h");
+                // Session should NOT have scope=global (it's per-session)
+                assert!(
+                    cc.get("scope").is_none() || cc["scope"].is_null(),
+                    "Session block should not have scope=global"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn build_system_message_cache_disabled_env() {
+        let _lock = CACHE_ENV_MUTEX.lock().unwrap();
+        unsafe {
+            std::env::set_var("MO_PROMPT_CACHE_DISABLED", "1");
+        }
+
+        let msg = build_system_message(
+            &["bash"],
+            "cwd: /test",
+            0.8,
+            None,
+            "anthropic",
+            "claude-sonnet-4-20250514",
+        );
+
+        let content = msg.get("content").expect("should have content");
+        let blocks = content.as_array().unwrap();
+        for block in blocks {
+            assert!(
+                block.get("cache_control").is_none() || block["cache_control"].is_null(),
+                "all blocks should lack cache_control when disabled"
+            );
+        }
+
+        unsafe {
+            std::env::remove_var("MO_PROMPT_CACHE_DISABLED");
+        }
     }
 
     #[test]
@@ -2381,6 +2485,10 @@ mod tests {
 
     #[test]
     fn annotate_tool_schemas_for_caching_adds_cache_control() {
+        unsafe {
+            std::env::remove_var("MO_PROMPT_CACHE_DISABLED");
+        }
+
         let mut tools = vec![
             json!({"function": {"name": "bash"}}),
             json!({"function": {"name": "read_file"}}),
@@ -2396,6 +2504,11 @@ mod tests {
             tools[1]["cache_control"]["type"].as_str(),
             Some("ephemeral"),
             "last tool should have ephemeral cache_control"
+        );
+        assert_eq!(
+            tools[1]["cache_control"]["ttl"].as_str(),
+            Some("1h"),
+            "last tool should have ttl=1h"
         );
     }
 

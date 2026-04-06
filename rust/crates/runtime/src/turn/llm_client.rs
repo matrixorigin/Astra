@@ -1619,7 +1619,15 @@ mod tests {
 
         // First call: finish_reason=length
         let res1 = call_llm_and_collect(
-            &messages, &[], "m", "k", &base, "openai", Some(1000), false, LlmCancel::None,
+            &messages,
+            &[],
+            "m",
+            "k",
+            &base,
+            "openai",
+            Some(1000),
+            false,
+            LlmCancel::None,
         )
         .await
         .expect("llm ok");
@@ -1628,7 +1636,15 @@ mod tests {
 
         // Second call (escalated): finish_reason=stop
         let res2 = call_llm_and_collect(
-            &messages, &[], "m", "k", &base, "openai", Some(4000), false, LlmCancel::None,
+            &messages,
+            &[],
+            "m",
+            "k",
+            &base,
+            "openai",
+            Some(4000),
+            false,
+            LlmCancel::None,
         )
         .await
         .expect("llm ok");
@@ -1660,7 +1676,15 @@ mod tests {
         let base = spawn_local_http_server(app).await;
         let messages = vec![json!({"role":"user","content":"x"})];
         let res = call_llm_and_collect(
-            &messages, &[], "m", "k", &base, "openai", Some(1000), false, LlmCancel::None,
+            &messages,
+            &[],
+            "m",
+            "k",
+            &base,
+            "openai",
+            Some(1000),
+            false,
+            LlmCancel::None,
         )
         .await
         .expect("llm ok");
