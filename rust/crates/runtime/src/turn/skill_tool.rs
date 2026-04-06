@@ -1073,20 +1073,136 @@ fn merge_activations(prev: Option<SkillActivation>, new: SkillActivation) -> Ski
     merged
 }
 
+// ─── Pipeline execution ──────────────────────────────────────────────────────
+
+/// Execute a skill pipeline — a sequence of skills where each step's output
+/// is threaded as context into the next.
+///
+/// Returns aggregated output + merged activation from the last step.
+async fn execute_pipeline(
+    resolver: &dyn SkillResolver,
+    executor: Option<&Arc<dyn SkillExecutor>>,
+    pipeline_skill_name: &str,
+    steps: &[crate::skills::manifest::PipelineStep],
+    task_hint: &str,
+    composition_ctx: Option<&crate::skills::composition::CompositionContext>,
+    skill_ctx: &SkillContext,
+) -> (String, Option<SkillActivation>, Option<bool>) {
+    let total = steps.len();
+    let mut results: Vec<(String, String, Option<bool>)> = Vec::new();
+    let mut previous_output: Option<String> = None;
+    let mut last_activation: Option<SkillActivation> = None;
+    let mut all_passed = true;
+
+    for (i, step) in steps.iter().enumerate() {
+        let label = step
+            .label
+            .as_deref()
+            .unwrap_or(step.skill.as_str());
+
+        // Thread previous output into the task context
+        let threaded_task = if let Some(ref prev) = previous_output {
+            format!(
+                "{}\n\n---\nPrevious step output ({}):\n{}",
+                task_hint,
+                results.last().map(|(l, _, _)| l.as_str()).unwrap_or(""),
+                prev
+            )
+        } else {
+            task_hint.to_string()
+        };
+
+        // Build per-step composition context with optional step timeout
+        let step_ctx;
+        let ctx_ref = if let Some(parent) = composition_ctx {
+            step_ctx = parent.child(
+                &format!("{}:{}", pipeline_skill_name, label),
+                step.timeout_sec,
+            );
+            Some(&step_ctx)
+        } else {
+            None
+        };
+
+        let (output, act, verified) = execute_skill(
+            resolver,
+            executor,
+            &step.skill,
+            &threaded_task,
+            ctx_ref,
+            skill_ctx,
+        )
+        .await;
+
+        // Determine step success: explicit verification > activation presence > assume pass
+        let step_passed = match verified {
+            Some(v) => v,
+            None => act.is_some(), // no activation = skill failed to load/resolve
+        };
+        if !step_passed {
+            all_passed = false;
+        }
+
+        if let Some(a) = act {
+            last_activation = Some(merge_activations(last_activation, a));
+        }
+
+        previous_output = Some(output.clone());
+        results.push((label.to_string(), output, verified));
+
+        // Stop on failure for required steps
+        if step.required && !step_passed {
+            let mut summary = format!(
+                "# Pipeline: {}\n\n⚠️ Pipeline stopped at step {}/{}: **{}** (required step failed)\n\n",
+                pipeline_skill_name,
+                i + 1,
+                total,
+                label
+            );
+            for (lbl, out, passed) in &results {
+                let icon = match passed {
+                    Some(true) => "✅",
+                    Some(false) => "❌",
+                    None => "⏩",
+                };
+                summary.push_str(&format!("## {icon} Step: {lbl}\n\n{out}\n\n---\n\n"));
+            }
+            return (summary, last_activation, Some(false));
+        }
+    }
+
+    // All steps completed — format aggregated output
+    let mut summary = format!(
+        "# Pipeline: {} — all {total} steps completed\n\n",
+        pipeline_skill_name
+    );
+    for (lbl, out, passed) in &results {
+        let icon = match passed {
+            Some(true) => "✅",
+            Some(false) => "⚠️",
+            None => "⏩",
+        };
+        summary.push_str(&format!("## {icon} Step: {lbl}\n\n{out}\n\n---\n\n"));
+    }
+
+    (summary, last_activation, Some(all_passed))
+}
+
 /// Execute a single skill call and return the output text + activation metadata.
 ///
 /// When the skill has `execution_context: Fork` and an executor is available,
 /// the skill is run in an isolated sub-agent loop. On failure, execution falls
 /// back to inline mode. MCP skills are sandboxed: inline shell commands and
 /// hooks are blocked.
-async fn execute_skill(
-    resolver: &dyn SkillResolver,
-    executor: Option<&Arc<dyn SkillExecutor>>,
-    skill_name: &str,
-    task_hint: &str,
-    composition_ctx: Option<&crate::skills::composition::CompositionContext>,
-    skill_ctx: &SkillContext,
-) -> (String, Option<SkillActivation>, Option<bool>) {
+fn execute_skill<'a>(
+    resolver: &'a dyn SkillResolver,
+    executor: Option<&'a Arc<dyn SkillExecutor>>,
+    skill_name: &'a str,
+    task_hint: &'a str,
+    composition_ctx: Option<&'a crate::skills::composition::CompositionContext>,
+    skill_ctx: &'a SkillContext,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = (String, Option<SkillActivation>, Option<bool>)> + Send + 'a>> {
+    Box::pin(async move {
     if let Some(ctx) = composition_ctx {
         // Depth check
         if let Err(e) = ctx.check_depth() {
@@ -1141,6 +1257,50 @@ async fn execute_skill(
                         None,
                     );
                 }
+            }
+
+            // Pipeline execution: if this skill declares steps, run them sequentially
+            let has_pipeline = skill
+                .composition
+                .as_ref()
+                .map(|c| !c.steps.is_empty())
+                .unwrap_or(false);
+            if has_pipeline {
+                let steps = &skill.composition.as_ref().unwrap().steps;
+                // Create a child composition context for the pipeline
+                let pipeline_ctx;
+                let ctx_ref = match composition_ctx {
+                    Some(parent) => {
+                        pipeline_ctx = parent.child(
+                            skill_name,
+                            skill
+                                .composition
+                                .as_ref()
+                                .and_then(|c| c.max_duration_sec),
+                        );
+                        Some(&pipeline_ctx)
+                    }
+                    None => {
+                        let mut root = crate::skills::composition::CompositionContext::root();
+                        root.timeout_secs = skill
+                            .composition
+                            .as_ref()
+                            .and_then(|c| c.max_duration_sec)
+                            .map(|s| s as u64);
+                        pipeline_ctx = root;
+                        Some(&pipeline_ctx)
+                    }
+                };
+                return execute_pipeline(
+                    resolver,
+                    executor,
+                    skill_name,
+                    steps,
+                    task_hint,
+                    ctx_ref,
+                    skill_ctx,
+                )
+                .await;
             }
 
             let is_mcp = skill.source == SkillSourceKind::Mcp;
@@ -1291,6 +1451,7 @@ async fn execute_skill(
             None,
         ),
     }
+    })
 }
 
 /// Execute hook actions synchronously. Shell commands are run with best-effort
@@ -2642,6 +2803,7 @@ mod tests {
                         idempotent: false,
                         side_effects: vec![],
                         max_duration_sec: None,
+                        steps: vec![],
                     }),
                     input_schema: None,
                     aliases: Vec::new(),
@@ -2696,6 +2858,7 @@ mod tests {
                         idempotent: false,
                         side_effects: vec![],
                         max_duration_sec: None,
+                        steps: vec![],
                     }),
                     input_schema: None,
                     aliases: Vec::new(),
@@ -2881,5 +3044,241 @@ mod tests {
         // All names still in enum
         assert!(names.contains(&"skill-9".to_string()));
         assert!(names.contains(&"skill-0".to_string()));
+    }
+
+    // ─── Pipeline execution tests ────────────────────────────────────────────
+
+    /// Resolver that supports pipeline execution: a "pipeline-skill" with two steps
+    /// that resolve to "step-a" and "step-b".
+    struct PipelineResolver;
+    impl SkillResolver for PipelineResolver {
+        fn resolve(&self, name: &str) -> Result<ResolvedSkill, String> {
+            match name {
+                "pipeline-skill" => Ok(ResolvedSkill {
+                    name: name.into(),
+                    instructions: "This is a pipeline skill.".into(),
+                    model: None,
+                    max_tokens: None,
+                    allowed_tools: vec![],
+                    execution_context: ExecutionContext::Inline,
+                    hooks: crate::skills::hooks::SkillHooks::default(),
+                    skill_dir: None,
+                    source: SkillSourceKind::Local,
+                    success_criteria: Vec::new(),
+                    composition: Some(crate::skills::manifest::SkillComposition {
+                        composable: false,
+                        idempotent: false,
+                        side_effects: vec![],
+                        max_duration_sec: Some(300),
+                        steps: vec![
+                            crate::skills::manifest::PipelineStep {
+                                skill: "step-a".into(),
+                                label: Some("Analyze".into()),
+                                timeout_sec: None,
+                                required: true,
+                            },
+                            crate::skills::manifest::PipelineStep {
+                                skill: "step-b".into(),
+                                label: Some("Build".into()),
+                                timeout_sec: None,
+                                required: true,
+                            },
+                        ],
+                    }),
+                    input_schema: None,
+                    aliases: Vec::new(),
+                    effort: None,
+                    agent_type: None,
+                    trust_tier: crate::skills::manifest::TrustTier::Bundled,
+                }),
+                "step-a" | "step-b" => Ok(ResolvedSkill {
+                    name: name.into(),
+                    instructions: format!("Instructions for {name}."),
+                    model: None,
+                    max_tokens: None,
+                    allowed_tools: vec![],
+                    execution_context: ExecutionContext::Inline,
+                    hooks: crate::skills::hooks::SkillHooks::default(),
+                    skill_dir: None,
+                    source: SkillSourceKind::Local,
+                    success_criteria: Vec::new(),
+                    composition: Some(crate::skills::manifest::SkillComposition {
+                        composable: true,
+                        idempotent: true,
+                        side_effects: vec![],
+                        max_duration_sec: None,
+                        steps: vec![],
+                    }),
+                    input_schema: None,
+                    aliases: Vec::new(),
+                    effort: None,
+                    agent_type: None,
+                    trust_tier: crate::skills::manifest::TrustTier::Bundled,
+                }),
+                _ => Err(format!("Unknown skill: {name}")),
+            }
+        }
+        fn available_skills(&self) -> Vec<SkillToolInfo> {
+            vec![]
+        }
+    }
+
+    #[tokio::test]
+    async fn pipeline_executes_all_steps_sequentially() {
+        let resolver = PipelineResolver;
+        let (output, activation, verified) = execute_skill(
+            &resolver,
+            None,
+            "pipeline-skill",
+            "run it",
+            None,
+            &SkillContext::default(),
+        )
+        .await;
+        assert!(output.contains("all 2 steps completed"), "Expected pipeline completion, got: {output}");
+        assert!(output.contains("Step: Analyze"), "Should contain step-a label");
+        assert!(output.contains("Step: Build"), "Should contain step-b label");
+        assert!(output.contains("Instructions for step-a"), "Should contain step-a output");
+        assert!(output.contains("Instructions for step-b"), "Should contain step-b output");
+        assert!(activation.is_some());
+        assert_eq!(verified, Some(true));
+    }
+
+    #[tokio::test]
+    async fn pipeline_threads_output_between_steps() {
+        let resolver = PipelineResolver;
+        let (output, _, _) = execute_skill(
+            &resolver,
+            None,
+            "pipeline-skill",
+            "check threading",
+            None,
+            &SkillContext::default(),
+        )
+        .await;
+        // Step B should receive step A's output threaded in
+        assert!(output.contains("Previous step output"), "Expected output threading between steps");
+    }
+
+    #[tokio::test]
+    async fn pipeline_stops_on_required_step_failure() {
+        struct FailingPipelineResolver;
+        impl SkillResolver for FailingPipelineResolver {
+            fn resolve(&self, name: &str) -> Result<ResolvedSkill, String> {
+                match name {
+                    "fail-pipeline" => Ok(ResolvedSkill {
+                        name: name.into(),
+                        instructions: "Pipeline.".into(),
+                        model: None,
+                        max_tokens: None,
+                        allowed_tools: vec![],
+                        execution_context: ExecutionContext::Inline,
+                        hooks: crate::skills::hooks::SkillHooks::default(),
+                        skill_dir: None,
+                        source: SkillSourceKind::Local,
+                        success_criteria: Vec::new(),
+                        composition: Some(crate::skills::manifest::SkillComposition {
+                            composable: false,
+                            idempotent: false,
+                            side_effects: vec![],
+                            max_duration_sec: None,
+                            steps: vec![
+                                crate::skills::manifest::PipelineStep {
+                                    skill: "ok-step".into(),
+                                    label: None,
+                                    timeout_sec: None,
+                                    required: true,
+                                },
+                                crate::skills::manifest::PipelineStep {
+                                    skill: "missing-step".into(),
+                                    label: None,
+                                    timeout_sec: None,
+                                    required: true,
+                                },
+                                crate::skills::manifest::PipelineStep {
+                                    skill: "never-reached".into(),
+                                    label: None,
+                                    timeout_sec: None,
+                                    required: true,
+                                },
+                            ],
+                        }),
+                        input_schema: None,
+                        aliases: Vec::new(),
+                        effort: None,
+                        agent_type: None,
+                        trust_tier: crate::skills::manifest::TrustTier::Bundled,
+                    }),
+                    "ok-step" => Ok(ResolvedSkill {
+                        name: name.into(),
+                        instructions: "OK step.".into(),
+                        model: None,
+                        max_tokens: None,
+                        allowed_tools: vec![],
+                        execution_context: ExecutionContext::Inline,
+                        hooks: crate::skills::hooks::SkillHooks::default(),
+                        skill_dir: None,
+                        source: SkillSourceKind::Local,
+                        success_criteria: Vec::new(),
+                        composition: Some(crate::skills::manifest::SkillComposition {
+                            composable: true,
+                            idempotent: true,
+                            side_effects: vec![],
+                            max_duration_sec: None,
+                            steps: vec![],
+                        }),
+                        input_schema: None,
+                        aliases: Vec::new(),
+                        effort: None,
+                        agent_type: None,
+                        trust_tier: crate::skills::manifest::TrustTier::Bundled,
+                    }),
+                    _ => Err(format!("Unknown skill: {name}")),
+                }
+            }
+            fn available_skills(&self) -> Vec<SkillToolInfo> {
+                vec![]
+            }
+        }
+
+        let resolver = FailingPipelineResolver;
+        let (output, _, _) = execute_skill(
+            &resolver,
+            None,
+            "fail-pipeline",
+            "test",
+            None,
+            &SkillContext::default(),
+        )
+        .await;
+        // The missing-step should fail resolution, and never-reached should not appear
+        assert!(!output.contains("never-reached"), "Pipeline should stop before 3rd step");
+        assert!(output.contains("Failed to load skill"), "Should show load failure");
+    }
+
+    #[tokio::test]
+    async fn pipeline_steps_parsed_from_yaml() {
+        let skill_md = r#"---
+name: my-pipeline
+description: "Test pipeline"
+composition:
+  steps:
+    - skill: analyze
+      label: "Step 1"
+      timeout_sec: 60
+    - skill: fix
+      required: false
+---
+Run the pipeline.
+"#;
+        let (manifest, _body) = crate::skills::loader::parse_skill_md(skill_md).unwrap();
+        let comp = manifest.composition.unwrap();
+        assert_eq!(comp.steps.len(), 2);
+        assert_eq!(comp.steps[0].skill, "analyze");
+        assert_eq!(comp.steps[0].label.as_deref(), Some("Step 1"));
+        assert_eq!(comp.steps[0].timeout_sec, Some(60));
+        assert!(comp.steps[0].required); // default true
+        assert_eq!(comp.steps[1].skill, "fix");
+        assert!(!comp.steps[1].required);
     }
 }

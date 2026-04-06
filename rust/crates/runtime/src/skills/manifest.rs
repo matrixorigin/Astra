@@ -249,6 +249,32 @@ pub struct SkillComposition {
     /// Maximum execution time in seconds (for orchestrators to enforce).
     #[serde(default)]
     pub max_duration_sec: Option<u32>,
+    /// Ordered pipeline of skills to execute sequentially.
+    ///
+    /// When present, invoking this skill runs each step in order,
+    /// threading the output of each step into the next as context.
+    #[serde(default)]
+    pub steps: Vec<PipelineStep>,
+}
+
+/// A single step in a skill pipeline.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PipelineStep {
+    /// Skill name to invoke for this step.
+    pub skill: String,
+    /// Human-readable label (defaults to the skill name if absent).
+    #[serde(default)]
+    pub label: Option<String>,
+    /// Per-step timeout in seconds (overrides the pipeline's max_duration_sec).
+    #[serde(default)]
+    pub timeout_sec: Option<u32>,
+    /// If true (default), the pipeline stops when this step fails.
+    #[serde(default = "default_true_pipeline")]
+    pub required: bool,
+}
+
+fn default_true_pipeline() -> bool {
+    true
 }
 
 // ── Phase 3: Marketplace signal types ────────────────────────────────────────
