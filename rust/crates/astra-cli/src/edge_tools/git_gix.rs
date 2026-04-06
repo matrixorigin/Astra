@@ -202,8 +202,18 @@ pub(crate) fn git_log(project_root: &Path, args: &Value) -> String {
 
 // ─── git_show ───────────────────────────────────────────────────────────────
 
-pub(crate) fn git_show(project_root: &Path, args: &Value, pressure: f64) -> String {
-    let limit = pressure_scaled_limit(SHOW_LIMIT, pressure);
+pub(crate) fn git_show(
+    project_root: &Path,
+    args: &Value,
+    pressure: f64,
+    aggregate_bytes: usize,
+) -> String {
+    let mut limit = pressure_scaled_limit(SHOW_LIMIT, pressure);
+    // Further reduce limit when aggregate output is already high
+    if aggregate_bytes > super::AGGREGATE_SOFT_LIMIT {
+        let remaining = super::AGGREGATE_OUTPUT_BUDGET.saturating_sub(aggregate_bytes);
+        limit = limit.min(remaining).max(2048);
+    }
     let repo = match open_repo(project_root) {
         Ok(r) => r,
         Err(e) => return e,
@@ -569,8 +579,18 @@ fn git_diff_stat_cli(project_root: &Path, args: &Value, limit: usize) -> String 
     diff_via_git_cli(project_root, &cmd_refs, limit).unwrap_or_else(|| "No changes".to_string())
 }
 
-pub(crate) fn git_diff(project_root: &Path, args: &Value, pressure: f64) -> String {
-    let limit = pressure_scaled_limit(DIFF_LIMIT, pressure);
+pub(crate) fn git_diff(
+    project_root: &Path,
+    args: &Value,
+    pressure: f64,
+    aggregate_bytes: usize,
+) -> String {
+    let mut limit = pressure_scaled_limit(DIFF_LIMIT, pressure);
+    // Further reduce limit when aggregate output is already high
+    if aggregate_bytes > super::AGGREGATE_SOFT_LIMIT {
+        let remaining = super::AGGREGATE_OUTPUT_BUDGET.saturating_sub(aggregate_bytes);
+        limit = limit.min(remaining).max(2048);
+    }
     let stat_only = args
         .get("stat_only")
         .and_then(Value::as_bool)
@@ -1968,21 +1988,21 @@ mod tests {
     #[test]
     fn git_show_missing_commit() {
         let root = repo_root();
-        let result = git_show(&root, &json!({}), 0.0);
+        let result = git_show(&root, &json!({}), 0.0, 0);
         assert!(result.contains("Error: missing"));
     }
 
     #[test]
     fn git_show_invalid_ref() {
         let root = repo_root();
-        let result = git_show(&root, &json!({"commit": "abc;rm -rf /"}), 0.0);
+        let result = git_show(&root, &json!({"commit": "abc;rm -rf /"}), 0.0, 0);
         assert!(result.contains("Error: invalid commit reference"));
     }
 
     #[test]
     fn git_show_head() {
         let root = repo_root();
-        let result = git_show(&root, &json!({"commit": "HEAD"}), 0.0);
+        let result = git_show(&root, &json!({"commit": "HEAD"}), 0.0, 0);
         assert!(result.contains("commit "), "should show commit: {result}");
         assert!(result.contains("Author:"), "should show author");
     }
@@ -1990,7 +2010,7 @@ mod tests {
     #[test]
     fn git_show_stat_only() {
         let root = repo_root();
-        let result = git_show(&root, &json!({"commit": "HEAD", "stat_only": true}), 0.0);
+        let result = git_show(&root, &json!({"commit": "HEAD", "stat_only": true}), 0.0, 0);
         assert!(result.contains("commit "));
         assert!(
             result.contains("files changed") || result.contains("root commit"),
@@ -2034,7 +2054,7 @@ mod tests {
     #[test]
     fn git_diff_no_crash() {
         let root = repo_root();
-        let result = git_diff(&root, &json!({}), 0.0);
+        let result = git_diff(&root, &json!({}), 0.0, 0);
         assert!(
             !result.contains("Error: cannot open"),
             "should open repo: {result}"
@@ -2080,7 +2100,7 @@ mod tests {
     fn git_diff_staged_param_accepted() {
         let root = repo_root();
         // staged=true should not crash (may return "No staged changes" or file list)
-        let result = git_diff(&root, &json!({"staged": true}), 0.0);
+        let result = git_diff(&root, &json!({"staged": true}), 0.0, 0);
         assert!(
             !result.contains("Error: cannot open"),
             "staged diff should not fail to open repo: {result}"
@@ -2091,7 +2111,7 @@ mod tests {
     fn git_diff_ref_param_uses_tree_diff() {
         let root = repo_root();
         // Diff HEAD against HEAD~1 should produce actual file changes
-        let result = git_diff(&root, &json!({"ref": "HEAD~1"}), 0.0);
+        let result = git_diff(&root, &json!({"ref": "HEAD~1"}), 0.0, 0);
         assert!(
             result.contains("diff --git")
                 || result.contains("No changes")
@@ -2103,7 +2123,7 @@ mod tests {
     #[test]
     fn git_diff_default_shows_worktree() {
         let root = repo_root();
-        let result = git_diff(&root, &json!({}), 0.0);
+        let result = git_diff(&root, &json!({}), 0.0, 0);
         // Should not error — either shows changes or "No changes"
         assert!(
             !result.starts_with("Error:"),
@@ -2114,7 +2134,7 @@ mod tests {
     #[test]
     fn git_diff_stat_only_smoke() {
         let root = repo_root();
-        let result = git_diff(&root, &json!({"stat_only": true}), 0.0);
+        let result = git_diff(&root, &json!({"stat_only": true}), 0.0, 0);
         assert!(
             !result.starts_with("Error:"),
             "stat_only should use git CLI without repo open errors: {result}"
@@ -2130,11 +2150,7 @@ mod tests {
     #[test]
     fn git_diff_stat_only_rejects_staged_with_ref() {
         let root = repo_root();
-        let result = git_diff(
-            &root,
-            &json!({"stat_only": true, "staged": true, "ref": "HEAD~1"}),
-            0.0,
-        );
+        let result = git_diff(&root, &json!({"stat_only": true, "staged": true, "ref": "HEAD~1"}), 0.0, 0);
         assert!(result.contains("not both"), "{result}");
     }
 
@@ -2144,7 +2160,7 @@ mod tests {
     fn git_show_allows_reflog_syntax() {
         let root = repo_root();
         // HEAD@{0} should not be rejected by validation — it should reach rev_parse
-        let result = git_show(&root, &json!({"commit": "HEAD@{0}"}), 0.0);
+        let result = git_show(&root, &json!({"commit": "HEAD@{0}"}), 0.0, 0);
         // Should show a commit (passes validation), not be rejected outright
         assert!(
             result.starts_with("commit ") || result.starts_with("Error: cannot resolve"),
@@ -2155,14 +2171,14 @@ mod tests {
     #[test]
     fn git_show_rejects_shell_metachar() {
         let root = repo_root();
-        let result = git_show(&root, &json!({"commit": "HEAD;rm -rf /"}), 0.0);
+        let result = git_show(&root, &json!({"commit": "HEAD;rm -rf /"}), 0.0, 0);
         assert!(result.contains("Error: invalid commit reference"));
     }
 
     #[test]
     fn git_show_head_has_diff_content() {
         let root = repo_root();
-        let result = git_show(&root, &json!({"commit": "HEAD"}), 0.0);
+        let result = git_show(&root, &json!({"commit": "HEAD"}), 0.0, 0);
         assert!(result.contains("commit "), "should show commit header");
         assert!(result.contains("Author:"), "should show author");
         // Should contain actual diff markers or root commit marker
@@ -2175,7 +2191,7 @@ mod tests {
     #[test]
     fn git_show_stat_only_has_stats() {
         let root = repo_root();
-        let result = git_show(&root, &json!({"commit": "HEAD", "stat_only": true}), 0.0);
+        let result = git_show(&root, &json!({"commit": "HEAD", "stat_only": true}), 0.0, 0);
         assert!(result.contains("commit "));
         assert!(
             result.contains("files changed") || result.contains("[root commit]"),
@@ -2186,7 +2202,7 @@ mod tests {
     #[test]
     fn git_show_file_filter() {
         let root = repo_root();
-        let result = git_show(&root, &json!({"commit": "HEAD", "file": "README.md"}), 0.0);
+        let result = git_show(&root, &json!({"commit": "HEAD", "file": "README.md"}), 0.0, 0);
         // If README.md was changed in HEAD, it should appear; otherwise no diff lines
         assert!(result.contains("commit "), "should show header: {result}");
     }
@@ -2288,7 +2304,7 @@ mod tests {
     #[test]
     fn git_diff_ref_produces_line_content() {
         let root = repo_root();
-        let result = git_diff(&root, &json!({"ref": "HEAD~1"}), 0.0);
+        let result = git_diff(&root, &json!({"ref": "HEAD~1"}), 0.0, 0);
         if result.contains("diff --git") {
             // If there are changes, we should see actual +/- lines
             assert!(
@@ -2313,7 +2329,7 @@ mod tests {
     #[test]
     fn git_show_parent_ref() {
         let root = repo_root();
-        let result = git_show(&root, &json!({"commit": "HEAD~1"}), 0.0);
+        let result = git_show(&root, &json!({"commit": "HEAD~1"}), 0.0, 0);
         assert!(
             result.contains("commit ") || result.contains("Error: cannot resolve"),
             "HEAD~1 should work: {result}"
@@ -2550,7 +2566,7 @@ mod tests {
     fn git_diff_staged_detects_no_staged() {
         // In a clean repo, staged diff should say "No staged changes"
         let root = repo_root();
-        let result = git_diff(&root, &json!({"staged": true}), 0.0);
+        let result = git_diff(&root, &json!({"staged": true}), 0.0, 0);
         // Either "No staged changes" or actual staged content — no panic/error
         assert!(
             result.contains("staged") || result.contains("diff --git"),
@@ -2650,7 +2666,7 @@ mod tests {
             }
         }
         if let Some(oid) = root_oid {
-            let result = git_show(&root, &json!({"commit": oid}), 0.0);
+            let result = git_show(&root, &json!({"commit": oid}), 0.0, 0);
             assert!(
                 result.contains("[root commit]"),
                 "should mark as root: {result}"
@@ -2698,8 +2714,8 @@ mod tests {
     #[test]
     fn git_show_under_pressure_truncates_earlier() {
         let root = std::env::current_dir().unwrap();
-        let normal = git_show(&root, &json!({"commit": "HEAD"}), 0.0);
-        let pressed = git_show(&root, &json!({"commit": "HEAD"}), 0.9);
+        let normal = git_show(&root, &json!({"commit": "HEAD"}), 0.0, 0);
+        let pressed = git_show(&root, &json!({"commit": "HEAD"}), 0.9, 0);
         assert!(
             pressed.len() <= normal.len(),
             "high-pressure output ({}) should not exceed normal ({})",
@@ -2711,8 +2727,8 @@ mod tests {
     #[test]
     fn git_diff_under_pressure_truncates_earlier() {
         let root = std::env::current_dir().unwrap();
-        let normal = git_diff(&root, &json!({}), 0.0);
-        let pressed = git_diff(&root, &json!({}), 0.9);
+        let normal = git_diff(&root, &json!({}), 0.0, 0);
+        let pressed = git_diff(&root, &json!({}), 0.9, 0);
         assert!(
             pressed.len() <= normal.len(),
             "high-pressure diff ({}) should not exceed normal ({})",

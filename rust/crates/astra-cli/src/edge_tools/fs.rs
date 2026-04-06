@@ -240,6 +240,73 @@ impl ToolExecutor {
             }
         }
 
+        // Aggregate output gate: when cumulative tool output this turn is
+        // already high and a full-file read would be too large, auto-downgrade
+        // to outline mode instead of blocking. Ranged reads are always allowed
+        // (they're already targeted). Inspired by Claude Code's approach of
+        // never blocking tool calls but degrading gracefully.
+        if !has_range && !has_outline {
+            let agg = self
+                .aggregate_output_bytes
+                .load(std::sync::atomic::Ordering::Relaxed);
+            if agg > super::AGGREGATE_SOFT_LIMIT {
+                if let Ok(meta) = fs::metadata(&path) {
+                    let size = meta.len() as usize;
+                    let remaining = super::AGGREGATE_OUTPUT_BUDGET.saturating_sub(agg);
+                    if size > remaining {
+                        // Auto-downgrade: return outline instead of full content
+                        let content_for_outline = match fs::read_to_string(&path) {
+                            Ok(c) => c,
+                            Err(e) => return format!("Error: {e}"),
+                        };
+                        let total_lines = content_for_outline.lines().count();
+                        self.record_read(&path, true, ReadDedupKey::Outline);
+
+                        if let Some(ts_lang) = super::code_intel::detect_language(&path) {
+                            let outline =
+                                super::code_intel::generate_outline(&content_for_outline, ts_lang);
+                            if !outline.is_empty() {
+                                let def_count = outline.lines().count();
+                                return format!(
+                                    "[Auto-downgraded to outline — aggregate output budget is high \
+                                     ({agg} bytes used). Use start_line/end_line to read specific sections.]\n\
+                                     # Outline ({total_lines} lines, {def_count} symbols)\n{outline}"
+                                );
+                            }
+                        }
+
+                        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+                        let lang = detect_language(ext);
+                        let outline = extract_outline(&content_for_outline, lang);
+                        if !outline.is_empty() {
+                            return format!(
+                                "[Auto-downgraded to outline — aggregate output budget is high \
+                                 ({agg} bytes used). Use start_line/end_line to read specific sections.]\n\
+                                 # Outline ({total_lines} lines, {} definitions)\n{}",
+                                outline.len(),
+                                outline
+                                    .iter()
+                                    .map(|(line_no, sig)| format!("{line_no}: {sig}"))
+                                    .collect::<Vec<_>>()
+                                    .join("\n")
+                            );
+                        }
+
+                        // No outline available — return truncated content with hint
+                        let limit = self.scaled_output_limit();
+                        let truncated = &content_for_outline
+                            [..content_for_outline.floor_char_boundary(limit)];
+                        let numbered = add_line_numbers(truncated, 1);
+                        return format!(
+                            "{numbered}\n[Auto-truncated — aggregate output budget is high \
+                             ({agg} bytes used, file has {total_lines} lines). \
+                             Use start_line/end_line to read specific sections.]"
+                        );
+                    }
+                }
+            }
+        }
+
         let content = match fs::read_to_string(&path) {
             Ok(c) => c,
             Err(e) => {
