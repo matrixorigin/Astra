@@ -855,7 +855,10 @@ impl BuildTestResult {
             }
         }
 
-        // For failed builds, include relevant raw output (truncated)
+        // Include raw output for failed builds (full tail) and successful builds
+        // (compact tail with warnings). Without this, successful `cargo check`
+        // returns only "✓ unknown | completed" — the agent can't see warnings
+        // or verify what was compiled.
         if !self.passed && raw_output.len() > 200 {
             parts.push(String::new());
             parts.push("─── Raw output (last 2000 chars) ───".to_string());
@@ -868,6 +871,20 @@ impl BuildTestResult {
         } else if !self.passed {
             parts.push(String::new());
             parts.push(raw_output.to_string());
+        } else if !raw_output.is_empty() && self.error_messages.is_empty() {
+            // Successful build/test — include compact tail so agent can see
+            // warnings, compilation summary, and "Finished ..." line.
+            let tail = if raw_output.len() > 500 {
+                &raw_output[raw_output.len() - 500..]
+            } else {
+                raw_output
+            };
+            // Only include if there's something beyond whitespace
+            let trimmed = tail.trim();
+            if !trimmed.is_empty() {
+                parts.push(String::new());
+                parts.push(trimmed.to_string());
+            }
         }
 
         parts.join("\n")

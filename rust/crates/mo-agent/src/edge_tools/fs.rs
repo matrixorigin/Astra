@@ -313,10 +313,11 @@ impl ToolExecutor {
         // Auto-expand: if same file was previously read in a different range
         // (partial read, mtime unchanged) and file fits in output budget,
         // return the full file to eliminate fragmented multi-range reads.
-        // Also check file size against the pre-read gate to avoid expanding
-        // large files that would have been rejected by a non-ranged read.
+        // Hard cap at 8 KB (~2000 tokens) to prevent large files from
+        // exploding context even if they fit the dynamic output budget.
+        const AUTO_EXPAND_MAX_BYTES: usize = 8192;
         if is_ranged && self.was_partially_read_unchanged(&path) {
-            let max_chars = self.scaled_output_limit();
+            let max_chars = self.scaled_output_limit().min(AUTO_EXPAND_MAX_BYTES);
             if let Ok(meta) = fs::metadata(&path)
                 && (meta.len() as usize) <= max_chars
                 && content.len() <= max_chars

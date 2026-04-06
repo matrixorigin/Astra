@@ -1092,6 +1092,26 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
                     reason,
                     reset_in_ms,
                 } => {
+                    // Preserve tool results that were collected before the rate limit hit.
+                    // Without this, the client loses all tool output from this round and
+                    // the model has no context about what already happened when retrying.
+                    if !tool_results.is_empty() {
+                        let summary = format!(
+                            "[Rate-limited before LLM call. {} tool result(s) from this round are preserved below.]\n",
+                            tool_results.len()
+                        );
+                        let mut content_ev = Map::new();
+                        content_ev.insert("type".into(), json!("content"));
+                        content_ev.insert("content".into(), json!(summary));
+                        yield render_sse_map(&content_ev);
+                        // Yield each tool result as an SSE event so the client can persist them
+                        for tr in tool_results.iter() {
+                            let mut tr_ev = Map::new();
+                            tr_ev.insert("type".into(), json!("tool_result"));
+                            tr_ev.insert("tool_result".into(), tr.clone());
+                            yield render_sse_map(&tr_ev);
+                        }
+                    }
                     let err_msg = format!(
                         "Rate limit cooldown active ({}). Resets in {}s. Try again later.",
                         reason.as_str(),
