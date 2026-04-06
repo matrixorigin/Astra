@@ -941,8 +941,10 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
             // Build runtime context for skill execution
             let mut extra = std::collections::HashMap::new();
 
-            // Detect git branch if in a workspace
             if let Some(ref root) = state.workspace_root_hint {
+                let root_path = std::path::Path::new(root.as_str());
+
+                // Detect git branch
                 if let Ok(output) = std::process::Command::new("git")
                     .args(["rev-parse", "--abbrev-ref", "HEAD"])
                     .current_dir(root)
@@ -955,7 +957,30 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
                         }
                     }
                 }
+
+                // Detect git repo name from remote origin
+                if let Ok(output) = std::process::Command::new("git")
+                    .args(["config", "--get", "remote.origin.url"])
+                    .current_dir(root)
+                    .output()
+                {
+                    if output.status.success() {
+                        let url = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                        if let Some(name) = extract_repo_name_from_url(&url) {
+                            extra.insert("git_repo".into(), name);
+                        }
+                    }
+                }
+
+                // Detect project type from marker files
+                let project_types = detect_project_types(root_path);
+                if !project_types.is_empty() {
+                    extra.insert("project_type".into(), project_types.join(","));
+                }
             }
+
+            // OS info
+            extra.insert("os".into(), std::env::consts::OS.into());
 
             let session_dir = state.current_session_id.as_ref().map(|id| {
                 dirs::home_dir()
@@ -1223,6 +1248,60 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
     // Loop exhausted max_turns without explicit break — write final state.
     try_write_heavy_checkpoint(state);
     Ok(AgenticLoopOutcome::Completed)
+}
+
+// ─── CTX_ helpers ────────────────────────────────────────────────────────────
+
+/// Extract repository name from a git remote URL.
+///
+/// Handles SSH (`git@host:org/repo.git`), HTTPS (`https://host/org/repo.git`),
+/// and bare paths.
+fn extract_repo_name_from_url(url: &str) -> Option<String> {
+    // Take the last path component, strip `.git` suffix
+    let path = url.trim_end_matches('/');
+    let segment = if let Some(idx) = path.rfind('/') {
+        &path[idx + 1..]
+    } else if let Some(idx) = path.rfind(':') {
+        // SSH shorthand: git@github.com:org/repo.git
+        let after_colon = &path[idx + 1..];
+        after_colon.rsplit('/').next().unwrap_or(after_colon)
+    } else {
+        return None;
+    };
+    let name = segment.strip_suffix(".git").unwrap_or(segment);
+    if name.is_empty() {
+        None
+    } else {
+        Some(name.to_string())
+    }
+}
+
+/// Detect project types from well-known marker files in the workspace root.
+/// Returns a list of detected types (a project can be multi-language).
+fn detect_project_types(root: &std::path::Path) -> Vec<&'static str> {
+    let markers: &[(&str, &str)] = &[
+        ("Cargo.toml", "rust"),
+        ("package.json", "node"),
+        ("pyproject.toml", "python"),
+        ("setup.py", "python"),
+        ("requirements.txt", "python"),
+        ("go.mod", "go"),
+        ("pom.xml", "java"),
+        ("build.gradle", "java"),
+        ("Gemfile", "ruby"),
+        ("Makefile", "make"),
+        ("CMakeLists.txt", "cmake"),
+        ("docker-compose.yml", "docker"),
+        ("Dockerfile", "docker"),
+    ];
+    let mut seen = std::collections::HashSet::new();
+    let mut types = Vec::new();
+    for (file, lang) in markers {
+        if root.join(file).exists() && seen.insert(*lang) {
+            types.push(*lang);
+        }
+    }
+    types
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────────
@@ -3057,5 +3136,66 @@ mod tests {
         // The skill_allowed_tools field IS set (for the host to use):
         let allowed = state.skill_allowed_tools.as_ref().unwrap();
         assert!(allowed.contains("bash"));
+    }
+
+    // ── CTX_ helper tests ──────────────────────────────────────────────────
+
+    #[test]
+    fn extract_repo_name_https() {
+        assert_eq!(
+            extract_repo_name_from_url("https://github.com/org/my-repo.git"),
+            Some("my-repo".into())
+        );
+    }
+
+    #[test]
+    fn extract_repo_name_ssh() {
+        assert_eq!(
+            extract_repo_name_from_url("git@github.com:org/my-repo.git"),
+            Some("my-repo".into())
+        );
+    }
+
+    #[test]
+    fn extract_repo_name_no_git_suffix() {
+        assert_eq!(
+            extract_repo_name_from_url("https://github.com/org/my-repo"),
+            Some("my-repo".into())
+        );
+    }
+
+    #[test]
+    fn extract_repo_name_trailing_slash() {
+        assert_eq!(
+            extract_repo_name_from_url("https://github.com/org/repo.git/"),
+            Some("repo".into())
+        );
+    }
+
+    #[test]
+    fn detect_project_types_rust_and_docker() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("Cargo.toml"), "").unwrap();
+        std::fs::write(tmp.path().join("Dockerfile"), "").unwrap();
+        let types = detect_project_types(tmp.path());
+        assert!(types.contains(&"rust"));
+        assert!(types.contains(&"docker"));
+    }
+
+    #[test]
+    fn detect_project_types_empty_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let types = detect_project_types(tmp.path());
+        assert!(types.is_empty());
+    }
+
+    #[test]
+    fn detect_project_types_no_duplicates() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Both pyproject.toml and setup.py → single "python"
+        std::fs::write(tmp.path().join("pyproject.toml"), "").unwrap();
+        std::fs::write(tmp.path().join("setup.py"), "").unwrap();
+        let types = detect_project_types(tmp.path());
+        assert_eq!(types.iter().filter(|&&t| t == "python").count(), 1);
     }
 }
