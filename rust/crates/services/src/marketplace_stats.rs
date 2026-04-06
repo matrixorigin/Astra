@@ -248,15 +248,16 @@ impl MarketplaceStatsService for DatabaseMarketplaceStatsService {
         // score = 0.35 * quality + 0.25 * popularity + 0.20 * freshness + 0.15 * trust + 0.05 * compat
         //
         // - quality: COALESCE(ms.avg_quality, 0.5) — normalized [0,1]
-        // - popularity: LOG(1 + COALESCE(ms.active_users_7d, 0)) / LOG(1 + max_users)
-        //   simplified to: LEAST(1.0, COALESCE(ms.active_users_7d, 0) / 1000.0)
-        // - freshness: 1.0 - LEAST(1.0, DATEDIFF(NOW(), sr.updated_at) / 365.0)
-        //   simplified to: CASE WHEN sr.updated_at IS NOT NULL THEN 0.5 ELSE 0.3 END
+        // - popularity: cap active_users at 1.0 — use CASE (MatrixOne has no LEAST())
+        // - freshness: simplified to: CASE WHEN sr.updated_at IS NOT NULL THEN 0.5 ELSE 0.3 END
         // - trust: CASE trust_tier mapping
         // - compat: COALESCE(ms.compatibility_score, 0.5)
         let ranking_sql = "\
             0.35 * COALESCE(ms.avg_quality, 0.5) \
-            + 0.25 * LEAST(1.0, COALESCE(ms.active_users_7d, 0) / 1000.0) \
+            + 0.25 * CASE \
+                WHEN (COALESCE(ms.active_users_7d, 0) / 1000.0) < 1.0 \
+                THEN (COALESCE(ms.active_users_7d, 0) / 1000.0) \
+                ELSE 1.0 END \
             + 0.20 * CASE WHEN sr.updated_at IS NOT NULL THEN 0.5 ELSE 0.3 END \
             + 0.15 * CASE ms.trust_tier \
                 WHEN 'bundled' THEN 1.0 \

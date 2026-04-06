@@ -830,7 +830,7 @@ impl TaskService for MatrixOneTaskService {
             "SELECT template_id, user_id, goal_pattern, project_type, template_json, \
              success_rate, avg_completion_time, use_count, created_at, updated_at, \
              CASE WHEN user_id = ? THEN 1 ELSE 0 END as is_own, \
-             (success_rate * 0.4 + LEAST(use_count, 10) / 10.0 * 0.3 + \
+             (success_rate * 0.4 + (CASE WHEN use_count < 10 THEN use_count ELSE 10 END) / 10.0 * 0.3 + \
               CASE WHEN user_id = ? THEN 0.3 ELSE 0.0 END) as score \
              FROM plan_templates \
              WHERE ({}) \

@@ -275,7 +275,7 @@ impl TaskLearningBridge for PipelineTaskLearningBridge {
                 "INSERT INTO plan_templates (template_id, user_id, goal_pattern, template_json, success_rate, use_count) \
                  VALUES (?, ?, ?, ?, 1.0, 0) \
                  ON DUPLICATE KEY UPDATE template_json = VALUES(template_json), \
-                 success_rate = LEAST(success_rate + 0.1, 1.0), updated_at = NOW(6)",
+                 success_rate = CASE WHEN success_rate + 0.1 < 1.0 THEN success_rate + 0.1 ELSE 1.0 END, updated_at = NOW(6)",
             )
             .bind(&template_id)
             .bind(user_id)
