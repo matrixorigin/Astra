@@ -4139,7 +4139,7 @@ async fn handle_slash_command(
             handle_account_command(cmd, arg, api, profile, state).await?;
         }
 
-        "/clear" | "/explain" | "/verbose" | "/compact" | "/reflect" => {
+        "/clear" | "/explain" | "/verbose" | "/compact" | "/reflect" | "/skill-search" => {
             handle_state_command(
                 cmd,
                 arg,

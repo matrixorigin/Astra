@@ -40,6 +40,10 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
         "Cycle explain: off → on (API) → verbose (+stderr)",
     ),
     (
+        "/skill-search",
+        "Session skill surfacing config: show/reset/dynamic/min/cap",
+    ),
+    (
         "/turn",
         "Show turn trace (/turn [n] = journal turn #n or nth turn)",
     ),

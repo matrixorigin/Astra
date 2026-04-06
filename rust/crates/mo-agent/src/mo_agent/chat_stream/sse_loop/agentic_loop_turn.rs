@@ -117,6 +117,7 @@ struct PrepareChatTurnRequest<'a> {
     file_context: &'a [String],
     assembly_start: Instant,
     telem: PrepareTurnTelemetry<'a>,
+    skill_search: &'a astra_core::SkillSearchSettings,
     is_plan_subtask: bool,
     plan_subtask_id: Option<&'a str>,
     /// When true, emit `[chat-turn timing] …` lines to stderr (see `chat_turn_timing_stderr_enabled`).
@@ -351,16 +352,14 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
 
     record_first_latency_ms_since(ctx.telem.first_context_assembly_ms, ctx.assembly_start);
 
-    if (ctx.is_plan_subtask || ctx.plan_subtask_id.is_some())
-        && let Some(root) = payload.as_object_mut()
-    {
-        if ctx.is_plan_subtask {
-            root.insert("is_plan_subtask".into(), json!(true));
-        }
-        if let Some(id) = ctx.plan_subtask_id.map(str::trim).filter(|s| !s.is_empty()) {
-            root.insert("plan_subtask_id".into(), json!(id));
-        }
-    }
+    inject_runtime_turn_overrides(
+        &mut payload,
+        ctx.skill_search,
+        ctx.is_plan_subtask,
+        ctx.plan_subtask_id,
+        ctx.skill_effort.as_deref(),
+        ctx.skill_agent_type.as_deref(),
+    );
 
     log_chat_turn_timing_phase(timing, "finalize_payload_records", &mut mark);
     if timing {
@@ -374,15 +373,38 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
         );
     }
 
-    // Inject skill-level effort and agent_type into the payload when present.
-    if let Some(ref effort) = ctx.skill_effort {
-        payload["effort"] = json!(effort);
-    }
-    if let Some(ref agent_type) = ctx.skill_agent_type {
-        payload["agent_type"] = json!(agent_type);
-    }
-
     payload
+}
+
+fn inject_runtime_turn_overrides(
+    payload: &mut Value,
+    skill_search: &astra_core::SkillSearchSettings,
+    is_plan_subtask: bool,
+    plan_subtask_id: Option<&str>,
+    skill_effort: Option<&str>,
+    skill_agent_type: Option<&str>,
+) {
+    let Some(root) = payload.as_object_mut() else {
+        return;
+    };
+
+    root.insert(
+        "skill_search".into(),
+        serde_json::to_value(skill_search).unwrap_or_else(|_| json!({})),
+    );
+
+    if is_plan_subtask {
+        root.insert("is_plan_subtask".into(), json!(true));
+    }
+    if let Some(id) = plan_subtask_id.map(str::trim).filter(|s| !s.is_empty()) {
+        root.insert("plan_subtask_id".into(), json!(id));
+    }
+    if let Some(effort) = skill_effort {
+        root.insert("effort".into(), json!(effort));
+    }
+    if let Some(agent_type) = skill_agent_type {
+        root.insert("agent_type".into(), json!(agent_type));
+    }
 }
 
 // `load_skill_instructions_text` removed — skill activation now goes through
@@ -422,6 +444,7 @@ pub(crate) struct ChatTurnSseFetchRequest<'a> {
     pub assembly_start: Instant,
     pub telem: PrepareTurnTelemetry<'a>,
     pub perm_manager: &'a mut PermissionManager,
+    pub skill_search: &'a astra_core::SkillSearchSettings,
     /// Lines from the previous headless tool round that must be cleared
     /// before the next SSE stream starts rendering.
     pub pre_clear_lines: usize,
@@ -550,6 +573,7 @@ pub(crate) async fn fetch_chat_turn_sse(
         assembly_start,
         telem,
         perm_manager,
+        skill_search,
         pre_clear_lines,
         is_plan_subtask,
         plan_subtask_id,
@@ -598,6 +622,7 @@ pub(crate) async fn fetch_chat_turn_sse(
             file_context,
             assembly_start,
             telem,
+            skill_search,
             is_plan_subtask,
             plan_subtask_id,
             timing_phases: ui.timing,
@@ -676,12 +701,38 @@ pub(crate) async fn fetch_chat_turn_sse(
 #[cfg(test)]
 mod tests {
     use astra_runtime::turn::chat_history_openai::merge_skill_names_track;
+    use serde_json::json;
 
     #[test]
     fn merge_skill_names_track_dedupes() {
         let mut v = vec!["a".into()];
         merge_skill_names_track(&mut v, &["b".into(), "a".into()]);
         assert_eq!(v, vec!["a", "b"]);
+    }
+
+    #[test]
+    fn inject_runtime_turn_overrides_adds_skill_search_and_plan_fields() {
+        let mut payload = json!({});
+        super::inject_runtime_turn_overrides(
+            &mut payload,
+            &astra_core::SkillSearchSettings {
+                dynamic_surface: false,
+                min_catalog_size: 12,
+                surface_cap: 20,
+            },
+            true,
+            Some("sub-1"),
+            Some("high"),
+            Some("coder"),
+        );
+
+        assert_eq!(payload["skill_search"]["dynamic_surface"], json!(false));
+        assert_eq!(payload["skill_search"]["min_catalog_size"], json!(12));
+        assert_eq!(payload["skill_search"]["surface_cap"], json!(20));
+        assert_eq!(payload["is_plan_subtask"], json!(true));
+        assert_eq!(payload["plan_subtask_id"], json!("sub-1"));
+        assert_eq!(payload["effort"], json!("high"));
+        assert_eq!(payload["agent_type"], json!("coder"));
     }
 }
 

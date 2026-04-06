@@ -144,6 +144,7 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
                 all_selected_skills: &mut state.all_selected_skills,
             },
             perm_manager: self.perm_manager,
+            skill_search: &state.skill_search,
             pre_clear_lines: pre_clear,
             is_plan_subtask: self.is_plan_subtask,
             plan_subtask_id: self.plan_subtask_id,
