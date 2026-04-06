@@ -181,6 +181,7 @@ pub const CACHEABLE_TOOLS: &[&str] = &[
     "git_status",
     "git_diff",
     "git_log",
+    "git_show",
     "git_blame",
     "git_file_history",
     "git_contributors",

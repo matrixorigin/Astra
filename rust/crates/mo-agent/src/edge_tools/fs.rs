@@ -341,14 +341,22 @@ impl ToolExecutor {
         // Inspired by Claude Code's dedup stub behavior: train the model
         // to stop re-reading by making the cost of repetition visible.
         let read_count = self.file_read_count(&path);
+        let ranged_count = self.file_ranged_read_count(&path);
         let read_warning = if read_count >= 4 {
             "\n\n⚠ WARNING: This file has been read 4+ times this session. You already \
              have this content — stop re-reading and use the information from earlier reads."
+                .to_string()
         } else if read_count >= 3 {
             "\n\n⚠ Note: This file has been read 3 times. Consider using content from \
              earlier reads instead of requesting more ranges."
+                .to_string()
+        } else if is_ranged && ranged_count >= 3 {
+            // Large file read in 3+ different ranges — nudge toward grep
+            "\n\n⚠ This file has been read in 3+ different ranges. Use grep to find \
+             specific content instead of reading more sections — it uses far fewer tokens."
+                .to_string()
         } else {
-            ""
+            String::new()
         };
 
         if !is_ranged {
@@ -362,7 +370,7 @@ impl ToolExecutor {
                     "\n[truncated — file has {total_lines} lines, use start_line/end_line or outline=true]"
                 ));
                 if !read_warning.is_empty() {
-                    out.push_str(read_warning);
+                    out.push_str(&read_warning);
                 }
                 return out;
             }
@@ -390,7 +398,7 @@ impl ToolExecutor {
             self.scaled_output_limit(),
         );
         if !read_warning.is_empty() {
-            result.push_str(read_warning);
+            result.push_str(&read_warning);
         }
         result
     }

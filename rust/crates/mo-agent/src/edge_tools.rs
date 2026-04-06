@@ -65,9 +65,12 @@ struct FileState {
     from_read: bool,
     /// True if the last read was a partial view (outline, line range).
     is_partial: bool,
-    /// How many times this file has been read (any range).
+    /// How many times this file has been fully read.
     /// Used for escalating warnings when the model loops on the same file.
     read_count: u32,
+    /// How many times this file has been read with different ranges.
+    /// Used to nudge the model toward grep for large files.
+    ranged_read_count: u32,
 }
 
 pub fn all_tool_schemas() -> Vec<Value> {
@@ -1338,7 +1341,9 @@ impl ToolExecutor {
     fn record_read(&self, path: &Path, is_partial: bool) {
         let ts = Self::file_mtime_ms(path);
         if let Ok(mut state) = self.file_state.lock() {
-            let prev_count = state.get(path).map(|fs| fs.read_count).unwrap_or(0);
+            let prev = state.get(path);
+            let prev_count = prev.map(|fs| fs.read_count).unwrap_or(0);
+            let prev_ranged = prev.map(|fs| fs.ranged_read_count).unwrap_or(0);
             // Only increment read_count for full (non-partial) reads.
             // Ranged reads of different sections are expected behavior
             // (guided by the size gate), not wasteful repetition.
@@ -1347,6 +1352,11 @@ impl ToolExecutor {
             } else {
                 prev_count + 1
             };
+            let new_ranged = if is_partial {
+                prev_ranged + 1
+            } else {
+                prev_ranged
+            };
             state.insert(
                 path.to_path_buf(),
                 FileState {
@@ -1354,6 +1364,7 @@ impl ToolExecutor {
                     from_read: true,
                     is_partial,
                     read_count: new_count,
+                    ranged_read_count: new_ranged,
                 },
             );
             // LRU eviction: keep at most MAX_FILE_STATE_ENTRIES
@@ -1387,6 +1398,7 @@ impl ToolExecutor {
                     from_read: false,
                     is_partial: false,
                     read_count: 0,
+                    ranged_read_count: 0,
                 },
             );
             // LRU eviction: keep at most MAX_FILE_STATE_ENTRIES
@@ -1464,6 +1476,15 @@ impl ToolExecutor {
             .lock()
             .ok()
             .and_then(|s| s.get(path).map(|fs| fs.read_count))
+            .unwrap_or(0)
+    }
+
+    /// How many times this file has been read with different ranges.
+    fn file_ranged_read_count(&self, path: &Path) -> u32 {
+        self.file_state
+            .lock()
+            .ok()
+            .and_then(|s| s.get(path).map(|fs| fs.ranged_read_count))
             .unwrap_or(0)
     }
 
