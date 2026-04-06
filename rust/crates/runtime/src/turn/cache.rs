@@ -136,7 +136,7 @@ mod tests {
         cache.insert("a", empty_map(), 0.0);
         assert!(cache.get("a", 61.0).is_none());
         // entry should be removed
-        assert!(cache.entries.get("a").is_none());
+        assert!(!cache.entries.contains_key("a"));
     }
 
     #[test]

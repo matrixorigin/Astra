@@ -48,7 +48,7 @@ mod tests {
     fn passes_through_existing_history() {
         let history = vec![json!({"role": "user", "content": "hi"})];
         let result = apply_turn_inputs_to_history(&history, &[], &[]);
-        assert!(result.len() >= 1);
+        assert!(!result.is_empty());
         assert_eq!(result[0]["content"], "hi");
     }
 

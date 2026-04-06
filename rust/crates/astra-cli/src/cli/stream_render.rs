@@ -103,6 +103,7 @@ struct CliSseStreamHost<'a> {
     /// Set when a skill call fires during this SSE turn. Subsequent non-skill
     /// tool calls are deferred (returned as synthetic errors) so the model
     /// re-evaluates after reading the skill instructions.
+    /// NOTE: never reset — host is created per-turn in `consume_turn_sse`.
     skill_fired_this_turn: bool,
 }
 
