@@ -209,21 +209,23 @@ pub fn load_tool_event_hooks(project_root: &std::path::Path) -> ToolEventHookReg
     ToolEventHookRegistry::default()
 }
 
-/// JSON format: top-level array of ToolEventHook objects, or an object with a "hooks" key.
+/// JSON format: top-level array of ToolEventHook objects, or an object with a "hooks" key
+/// and optional `default_timeout_secs`.
 fn parse_hooks_json(content: &str, path: &std::path::Path) -> Vec<ToolEventHook> {
     // Try direct array first
     if let Ok(hooks) = serde_json::from_str::<Vec<ToolEventHook>>(content) {
         return hooks;
     }
 
-    // Try { "hooks": [...] } wrapper
+    // Try { "hooks": [...], "default_timeout_secs": N } wrapper
     #[derive(serde::Deserialize)]
     struct Wrapper {
         #[serde(default)]
         hooks: Vec<ToolEventHook>,
+        default_timeout_secs: Option<u32>,
     }
     if let Ok(w) = serde_json::from_str::<Wrapper>(content) {
-        return w.hooks;
+        return apply_default_timeout(w.hooks, w.default_timeout_secs);
     }
 
     astra_core::agent_warn!(
@@ -234,7 +236,7 @@ fn parse_hooks_json(content: &str, path: &std::path::Path) -> Vec<ToolEventHook>
     Vec::new()
 }
 
-/// YAML format: same as JSON — top-level list or `hooks:` key.
+/// YAML format: same as JSON — top-level list or `hooks:` key with optional `default_timeout_secs`.
 fn parse_hooks_yaml(content: &str, path: &std::path::Path) -> Vec<ToolEventHook> {
     // Try direct array
     if let Ok(hooks) = serde_yaml::from_str::<Vec<ToolEventHook>>(content) {
@@ -246,9 +248,10 @@ fn parse_hooks_yaml(content: &str, path: &std::path::Path) -> Vec<ToolEventHook>
     struct Wrapper {
         #[serde(default)]
         hooks: Vec<ToolEventHook>,
+        default_timeout_secs: Option<u32>,
     }
     if let Ok(w) = serde_yaml::from_str::<Wrapper>(content) {
-        return w.hooks;
+        return apply_default_timeout(w.hooks, w.default_timeout_secs);
     }
 
     astra_core::agent_warn!(
@@ -257,6 +260,22 @@ fn parse_hooks_yaml(content: &str, path: &std::path::Path) -> Vec<ToolEventHook>
         path.display()
     );
     Vec::new()
+}
+
+/// Apply `default_timeout_secs` to hooks that still have the built-in default (10).
+fn apply_default_timeout(
+    mut hooks: Vec<ToolEventHook>,
+    default: Option<u32>,
+) -> Vec<ToolEventHook> {
+    if let Some(dt) = default {
+        let builtin = default_hook_timeout();
+        for h in &mut hooks {
+            if h.timeout_secs == builtin {
+                h.timeout_secs = dt;
+            }
+        }
+    }
+    hooks
 }
 
 // ── Hook execution ──────────────────────────────────────────────────────────
@@ -1384,5 +1403,72 @@ hooks:
 
         let registry = load_tool_event_hooks(dir.path());
         assert_eq!(registry.len(), 2); // JSON takes precedence
+    }
+
+    #[test]
+    fn load_hooks_json_default_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let astra = dir.path().join(".astra");
+        std::fs::create_dir_all(&astra).unwrap();
+
+        let json = r#"{
+            "default_timeout_secs": 30,
+            "hooks": [
+                {"event": "pre_tool_use", "matcher": "bash", "action": {"type": "shell", "command": "check.sh"}},
+                {"event": "pre_tool_use", "matcher": "edit", "action": {"type": "shell", "command": "lint.sh"}, "timeout_secs": 5}
+            ]
+        }"#;
+        std::fs::write(astra.join("hooks.json"), json).unwrap();
+
+        let registry = load_tool_event_hooks(dir.path());
+        assert_eq!(registry.len(), 2);
+        let hooks = registry.matching(ToolEventKind::PreToolUse, "bash");
+        assert_eq!(hooks[0].timeout_secs, 30); // inherited global default
+        let hooks = registry.matching(ToolEventKind::PreToolUse, "edit");
+        assert_eq!(hooks[0].timeout_secs, 5); // explicit override preserved
+    }
+
+    #[test]
+    fn load_hooks_yaml_default_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let astra = dir.path().join(".astra");
+        std::fs::create_dir_all(&astra).unwrap();
+
+        let yaml = r#"
+default_timeout_secs: 20
+hooks:
+  - event: pre_tool_use
+    matcher: bash
+    action:
+      type: shell
+      command: check.sh
+  - event: post_tool_use
+    matcher: "*"
+    action:
+      type: shell
+      command: log.sh
+    timeout_secs: 3
+"#;
+        std::fs::write(astra.join("hooks.yaml"), yaml).unwrap();
+
+        let registry = load_tool_event_hooks(dir.path());
+        assert_eq!(registry.len(), 2);
+        let hooks = registry.matching(ToolEventKind::PreToolUse, "bash");
+        assert_eq!(hooks[0].timeout_secs, 20); // inherited global default
+        let hooks = registry.matching(ToolEventKind::PostToolUse, "anything");
+        assert_eq!(hooks[0].timeout_secs, 3); // explicit override preserved
+    }
+
+    #[test]
+    fn apply_default_timeout_no_override() {
+        let hooks = vec![ToolEventHook {
+            event: ToolEventKind::PreToolUse,
+            matcher: "*".into(),
+            action: HookAction::Shell { command: "a".into() },
+            timeout_secs: 10,
+        }];
+        // No default → no change
+        let result = apply_default_timeout(hooks, None);
+        assert_eq!(result[0].timeout_secs, 10);
     }
 }
