@@ -3,7 +3,7 @@ pub fn skill_content() -> String {
         r#"---
 name: skillify
 description: "Capture this session's repeatable process into a reusable SKILL.md skill file"
-version: "2.0.0"
+version: "1.0.0"
 allowed_tools:
   - read_file
   - write_file

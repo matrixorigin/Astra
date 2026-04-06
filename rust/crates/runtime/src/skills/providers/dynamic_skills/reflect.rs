@@ -3,7 +3,7 @@ pub fn skill_content() -> String {
         r#"---
 name: reflect
 description: "Pause and reflect — use runtime metrics (tokens, errors, stalls, tool health) to diagnose problems and course-correct"
-version: "3.0.0"
+version: "1.0.0"
 allowed_tools:
   - bash
   - read_file

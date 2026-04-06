@@ -3,7 +3,7 @@ pub fn skill_content() -> String {
         r#"---
 name: debug
 description: "Diagnose and fix bugs, test failures, and unexpected behavior systematically"
-version: "2.0.0"
+version: "1.0.0"
 allowed_tools:
   - bash
   - read_file

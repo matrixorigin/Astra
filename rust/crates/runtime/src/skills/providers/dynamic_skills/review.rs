@@ -3,7 +3,7 @@ pub fn skill_content() -> String {
         r#"---
 name: review
 description: "Review changed code for reuse, quality, and efficiency via three parallel review agents — then fix issues found"
-version: "2.0.0"
+version: "1.0.0"
 allowed_tools:
   - delegate
   - bash

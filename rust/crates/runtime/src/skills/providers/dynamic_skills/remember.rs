@@ -3,7 +3,7 @@ pub fn skill_content() -> String {
         r#"---
 name: remember
 description: "Review and manage persistent memories — promote, clean up, and organize knowledge across sessions"
-version: "2.0.0"
+version: "1.0.0"
 allowed_tools:
   - memoria-memory_list
   - memoria-memory_profile

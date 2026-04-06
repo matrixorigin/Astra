@@ -3,7 +3,7 @@ pub fn skill_content() -> String {
         r#"---
 name: batch
 description: "Research, plan, and execute a large-scale change in parallel across isolated sub-agents, each producing a verified commit"
-version: "2.0.0"
+version: "1.0.0"
 allowed_tools:
   - delegate
   - bash
