@@ -2763,4 +2763,313 @@ mod tests {
             .unwrap_or(0);
         assert_eq!(cache_read, 0);
     }
+
+    // ── Combined cache layer tests ──────────────────────────────────────
+
+    #[test]
+    fn all_three_cache_layers_present_for_anthropic() {
+        let _lock = CACHE_ENV_MUTEX.lock().unwrap();
+        unsafe { std::env::remove_var("MO_PROMPT_CACHE_DISABLED"); }
+
+        // Layer 1: System message with cache_control
+        let sys = build_system_message(
+            &["bash", "read_file"],
+            "cwd: /test",
+            0.8,
+            Some("implementation"),
+            "anthropic",
+            "claude-sonnet-4-20250514",
+        );
+        let sys_blocks = sys["content"].as_array().expect("array content");
+        let has_sys_cache = sys_blocks.iter().any(|b| b.get("cache_control").is_some());
+        assert!(has_sys_cache, "Layer 1: system message should have cache_control");
+
+        // Layer 2: Tool schemas with cache_control
+        let mut tools = vec![
+            json!({"function": {"name": "bash"}}),
+            json!({"function": {"name": "read_file"}}),
+        ];
+        annotate_tool_schemas_for_caching(&mut tools, "anthropic", "claude-sonnet-4-20250514");
+        assert!(
+            tools.last().unwrap().get("cache_control").is_some(),
+            "Layer 2: last tool should have cache_control"
+        );
+
+        // Layer 3: Message breakpoint
+        let mut messages = vec![
+            json!({"role": "user", "content": "hello"}),
+            json!({"role": "assistant", "content": "hi"}),
+        ];
+        add_message_cache_breakpoint(&mut messages, "anthropic", "claude-sonnet-4-20250514");
+        let last = messages.last().unwrap();
+        let last_arr = last["content"].as_array().expect("converted to array");
+        assert!(
+            last_arr[0].get("cache_control").is_some(),
+            "Layer 3: last message should have cache breakpoint"
+        );
+    }
+
+    #[test]
+    fn cache_disabled_strips_all_three_layers() {
+        let _lock = CACHE_ENV_MUTEX.lock().unwrap();
+        unsafe { std::env::set_var("MO_PROMPT_CACHE_DISABLED", "1"); }
+
+        // Layer 1: system message
+        let sys = build_system_message(
+            &["bash"], "cwd: /test", 0.8, None,
+            "anthropic", "claude-sonnet-4-20250514",
+        );
+        let sys_blocks = sys["content"].as_array().unwrap();
+        for block in sys_blocks {
+            assert!(
+                block.get("cache_control").is_none() || block["cache_control"].is_null(),
+                "system blocks should not have cache_control when disabled"
+            );
+        }
+
+        // Layer 2: tool schemas
+        let mut tools = vec![json!({"function": {"name": "bash"}})];
+        annotate_tool_schemas_for_caching(&mut tools, "anthropic", "claude-sonnet-4-20250514");
+        assert!(
+            tools[0].get("cache_control").is_none(),
+            "tools should not have cache_control when disabled"
+        );
+
+        // Layer 3: message breakpoint
+        let mut messages = vec![
+            json!({"role": "user", "content": "hello"}),
+        ];
+        add_message_cache_breakpoint(&mut messages, "anthropic", "claude-sonnet-4-20250514");
+        assert!(
+            messages[0]["content"].is_string(),
+            "messages should not be modified when cache disabled"
+        );
+
+        unsafe { std::env::remove_var("MO_PROMPT_CACHE_DISABLED"); }
+    }
+
+    // ── Section cache eviction test ────────────────────────────────────
+
+    #[test]
+    fn section_cache_evicts_after_capacity() {
+        // Clear any pre-existing cache entries
+        if let Ok(mut cache) = section_cache().lock() {
+            cache.clear();
+        }
+
+        // Fill cache to 33 entries (> 32 threshold), then one more triggers clear
+        for i in 0..34 {
+            let tool_name = format!("tool_{i}");
+            let tools: Vec<&str> = vec![tool_name.as_str()];
+            let _msg = build_system_message(&tools, "", 0.8, None, "openai", "gpt-4");
+        }
+
+        let cache_size = section_cache().lock().unwrap().len();
+        // After 34th insert: cache had 33 entries (> 32), cleared, then 34th re-added → 1
+        assert!(
+            cache_size <= 2,
+            "cache should have been evicted: size={cache_size}, expected ≤2"
+        );
+
+        // Clean up
+        section_cache().lock().unwrap().clear();
+    }
+
+    #[test]
+    fn section_cache_key_deterministic_for_same_inputs() {
+        let k1 = section_cache_key(&["bash", "read_file"], Some("debug"), 0.5);
+        let k2 = section_cache_key(&["bash", "read_file"], Some("debug"), 0.5);
+        assert_eq!(k1, k2, "same inputs should produce same key");
+    }
+
+    #[test]
+    fn section_cache_key_differs_for_different_tools() {
+        let k1 = section_cache_key(&["bash"], None, 0.8);
+        let k2 = section_cache_key(&["read_file"], None, 0.8);
+        assert_ne!(k1, k2, "different tools should produce different keys");
+    }
+
+    #[test]
+    fn section_cache_key_low_confidence_bucketed() {
+        // confidence < 0.3 → "low" bucket, >= 0.3 → "normal" bucket
+        let low = section_cache_key(&["bash"], None, 0.1);
+        let normal = section_cache_key(&["bash"], None, 0.5);
+        assert_ne!(low, normal, "low vs normal confidence should differ");
+
+        // Both in normal bucket → same key
+        let n1 = section_cache_key(&["bash"], None, 0.5);
+        let n2 = section_cache_key(&["bash"], None, 0.9);
+        assert_eq!(n1, n2, "both normal confidence should be same bucket");
+    }
+
+    // ── Message breakpoint edge cases ──────────────────────────────────
+
+    #[test]
+    fn message_breakpoint_skips_system_only() {
+        let _lock = CACHE_ENV_MUTEX.lock().unwrap();
+        unsafe { std::env::remove_var("MO_PROMPT_CACHE_DISABLED"); }
+
+        let mut messages = vec![
+            json!({"role": "system", "content": "sys prompt"}),
+        ];
+        add_message_cache_breakpoint(&mut messages, "anthropic", "claude-sonnet-4-20250514");
+        // System message should not be modified
+        assert!(messages[0]["content"].is_string(), "system-only: should be untouched");
+    }
+
+    #[test]
+    fn message_breakpoint_empty_messages_noop() {
+        let _lock = CACHE_ENV_MUTEX.lock().unwrap();
+        let mut messages: Vec<Value> = vec![];
+        add_message_cache_breakpoint(&mut messages, "anthropic", "claude-sonnet-4-20250514");
+        assert!(messages.is_empty());
+    }
+
+    #[test]
+    fn message_breakpoint_array_content_appends_to_last_block() {
+        let _lock = CACHE_ENV_MUTEX.lock().unwrap();
+        unsafe { std::env::remove_var("MO_PROMPT_CACHE_DISABLED"); }
+
+        let mut messages = vec![
+            json!({
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "hello"},
+                    {"type": "text", "text": "world"},
+                ]
+            }),
+        ];
+        add_message_cache_breakpoint(&mut messages, "anthropic", "claude-sonnet-4-20250514");
+
+        let blocks = messages[0]["content"].as_array().unwrap();
+        // First block should NOT have cache_control
+        assert!(
+            blocks[0].get("cache_control").is_none() || blocks[0]["cache_control"].is_null(),
+            "first block should not have cache_control"
+        );
+        // Last block SHOULD have cache_control
+        assert!(
+            blocks[1].get("cache_control").is_some(),
+            "last block should have cache_control"
+        );
+    }
+
+    #[test]
+    fn tool_schemas_empty_list_noop() {
+        let _lock = CACHE_ENV_MUTEX.lock().unwrap();
+        let mut tools: Vec<Value> = vec![];
+        annotate_tool_schemas_for_caching(&mut tools, "anthropic", "claude-sonnet-4-20250514");
+        assert!(tools.is_empty());
+    }
+
+    // ── Multi-turn cache token simulation ──────────────────────────────
+
+    #[test]
+    fn multi_turn_sse_cache_tokens_accumulate_in_accum() {
+        use super::super::chat_turn_sse_dispatch::{
+            dispatch_chat_turn_sse_event_block, ChatTurnSseAccum,
+        };
+
+        fn sse_usage(prompt: u64, completion: u64, cache_read: u64, cache_creation: u64) -> String {
+            format!(
+                "data: {{\"type\":\"usage\",\"prompt_tokens\":{prompt},\"completion_tokens\":{completion},\"cache_read_tokens\":{cache_read},\"cache_creation_tokens\":{cache_creation}}}\n\n"
+            )
+        }
+
+        // Turn 1: cache miss → creation high, read 0
+        let mut accum1 = ChatTurnSseAccum::default();
+        dispatch_chat_turn_sse_event_block(&sse_usage(1000, 500, 0, 800), &mut accum1, &mut vec![]);
+        assert_eq!(accum1.cache_read_tokens, 0);
+        assert_eq!(accum1.cache_creation_tokens, 800);
+
+        // Turn 2: partial cache hit → read tokens appear
+        let mut accum2 = ChatTurnSseAccum::default();
+        dispatch_chat_turn_sse_event_block(
+            &sse_usage(600, 400, 500, 200),
+            &mut accum2,
+            &mut vec![],
+        );
+        assert_eq!(accum2.cache_read_tokens, 500);
+        assert_eq!(accum2.cache_creation_tokens, 200);
+
+        // Turn 3: full cache hit → read tokens high
+        let mut accum3 = ChatTurnSseAccum::default();
+        dispatch_chat_turn_sse_event_block(
+            &sse_usage(200, 300, 900, 0),
+            &mut accum3,
+            &mut vec![],
+        );
+        assert_eq!(accum3.cache_read_tokens, 900);
+
+        // Verify warming pattern: reads increase across turns
+        assert!(accum3.cache_read_tokens > accum2.cache_read_tokens);
+        assert!(accum2.cache_read_tokens > accum1.cache_read_tokens);
+        // Creation decreases
+        assert!(accum1.cache_creation_tokens > accum2.cache_creation_tokens);
+        assert!(accum2.cache_creation_tokens > accum3.cache_creation_tokens);
+    }
+
+    #[test]
+    fn cache_tokens_correctly_extracted_from_anthropic_format() {
+        // Anthropic native format: cache_read_input_tokens / cache_creation_input_tokens
+        let usage = json!({
+            "prompt_tokens": 1000,
+            "completion_tokens": 500,
+            "cache_read_input_tokens": 800,
+            "cache_creation_input_tokens": 200,
+        });
+
+        // Our bridge extraction logic (from bridge_inprocess.rs)
+        let cache_read = usage.get("prompt_tokens_details")
+            .and_then(|d| d.get("cached_tokens"))
+            .and_then(Value::as_i64)
+            .or_else(|| usage.get("cache_read_input_tokens").and_then(Value::as_i64));
+        let cache_creation = usage.get("prompt_tokens_details")
+            .and_then(|d| d.get("cache_creation_input_tokens"))
+            .and_then(Value::as_i64)
+            .or_else(|| usage.get("cache_creation_input_tokens").and_then(Value::as_i64));
+
+        assert_eq!(cache_read, Some(800));
+        assert_eq!(cache_creation, Some(200));
+    }
+
+    #[test]
+    fn cache_tokens_correctly_extracted_from_openai_format() {
+        // OpenAI format: prompt_tokens_details.cached_tokens
+        let usage = json!({
+            "prompt_tokens": 1000,
+            "completion_tokens": 500,
+            "prompt_tokens_details": {
+                "cached_tokens": 600,
+                "cache_creation_input_tokens": 100,
+            },
+        });
+
+        let cache_read = usage.get("prompt_tokens_details")
+            .and_then(|d| d.get("cached_tokens"))
+            .and_then(Value::as_i64)
+            .or_else(|| usage.get("cache_read_input_tokens").and_then(Value::as_i64));
+        let cache_creation = usage.get("prompt_tokens_details")
+            .and_then(|d| d.get("cache_creation_input_tokens"))
+            .and_then(Value::as_i64)
+            .or_else(|| usage.get("cache_creation_input_tokens").and_then(Value::as_i64));
+
+        assert_eq!(cache_read, Some(600));
+        assert_eq!(cache_creation, Some(100));
+    }
+
+    #[test]
+    fn cache_tokens_none_when_absent() {
+        let usage = json!({
+            "prompt_tokens": 1000,
+            "completion_tokens": 500,
+        });
+
+        let cache_read = usage.get("prompt_tokens_details")
+            .and_then(|d| d.get("cached_tokens"))
+            .and_then(Value::as_i64)
+            .or_else(|| usage.get("cache_read_input_tokens").and_then(Value::as_i64));
+
+        assert_eq!(cache_read, None);
+    }
 }
