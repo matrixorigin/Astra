@@ -251,8 +251,9 @@ impl ToolExecutor {
                     } else {
                         String::new()
                     };
+                    let cwd = self.project_root.display();
                     return format!(
-                        "{msg}. Use list_dir or glob to find the correct path first.{hint}"
+                        "{msg}. Note: current working directory is {cwd}. Use list_dir or glob to find the correct path first.{hint}"
                     );
                 }
                 if e.kind() == std::io::ErrorKind::IsADirectory {
@@ -914,44 +915,34 @@ impl ToolExecutor {
             )
         };
 
-        let search_dir = match search_dir {
-            Some(d) if d.exists() => d,
-            _ => return Vec::new(),
-        };
+        // When the parent directory doesn't exist (e.g. crate renamed from
+        // mo-agent → astra-cli), fall back to a project-wide filename search
+        // so the error message can suggest the correct path immediately instead
+        // of forcing the LLM through a glob → read recovery loop.
+        let dir_exists = matches!(search_dir, Some(ref d) if d.exists());
 
-        // Find similar files in the directory
         let mut candidates: Vec<(String, usize)> = Vec::new();
-        if let Ok(entries) = fs::read_dir(&search_dir) {
-            for entry in entries.flatten() {
-                let name = entry.file_name();
-                let name_str = name.to_string_lossy().to_lowercase();
 
-                // Skip directories (user should use list_dir for those)
-                let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
-                if is_dir {
-                    continue;
-                }
+        if dir_exists {
+            // Fast path: search within the same directory
+            let search_dir = search_dir.unwrap();
+            Self::collect_similar_in_dir(
+                &search_dir,
+                &target_name,
+                &self.project_root,
+                &mut candidates,
+            );
+        }
 
-                // Calculate similarity - also check against hidden file variants
-                let mut best_score = similarity_score(&target_name, &name_str);
-
-                // If candidate is a hidden file, also compare without leading dot
-                if let Some(without_dot) = name_str.strip_prefix('.') {
-                    best_score = best_score.max(similarity_score(&target_name, without_dot));
-                }
-
-                // Minimum threshold to avoid noise
-                const MIN_SIMILARITY: usize = 5;
-                if best_score >= MIN_SIMILARITY {
-                    let rel_path = entry.path();
-                    let display = rel_path
-                        .strip_prefix(&self.project_root)
-                        .unwrap_or(&rel_path)
-                        .display()
-                        .to_string();
-                    candidates.push((display, best_score));
-                }
-            }
+        // If no candidates found locally (or dir missing), do a project-wide
+        // search for exact filename matches using a bounded walk.
+        if candidates.is_empty() {
+            Self::collect_exact_name_in_tree(
+                &self.project_root,
+                &target_name,
+                &self.project_root,
+                &mut candidates,
+            );
         }
 
         // Sort by score descending and take top 3
@@ -961,6 +952,87 @@ impl ToolExecutor {
             .take(3)
             .map(|(path, _)| path)
             .collect()
+    }
+
+    /// Collect similar filenames from a single directory.
+    fn collect_similar_in_dir(
+        dir: &Path,
+        target_name: &str,
+        project_root: &Path,
+        candidates: &mut Vec<(String, usize)>,
+    ) {
+        let Ok(entries) = fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                continue;
+            }
+            let name_str = entry.file_name().to_string_lossy().to_lowercase();
+            let mut best = similarity_score(target_name, &name_str);
+            if let Some(without_dot) = name_str.strip_prefix('.') {
+                best = best.max(similarity_score(target_name, without_dot));
+            }
+            const MIN_SIMILARITY: usize = 5;
+            if best >= MIN_SIMILARITY {
+                let display = entry
+                    .path()
+                    .strip_prefix(project_root)
+                    .unwrap_or(&entry.path())
+                    .display()
+                    .to_string();
+                candidates.push((display, best));
+            }
+        }
+    }
+
+    /// Walk the project tree (bounded depth) looking for exact filename matches.
+    /// Used when the requested parent directory doesn't exist (e.g. crate rename).
+    fn collect_exact_name_in_tree(
+        root: &Path,
+        target_name: &str,
+        project_root: &Path,
+        candidates: &mut Vec<(String, usize)>,
+    ) {
+        const MAX_DEPTH: usize = 8;
+        const SKIP_DIRS: &[&str] = &[".git", "node_modules", "target", ".astra", "dist", "build"];
+
+        fn walk(
+            dir: &Path,
+            target: &str,
+            project_root: &Path,
+            candidates: &mut Vec<(String, usize)>,
+            depth: usize,
+        ) {
+            if depth > MAX_DEPTH || candidates.len() >= 5 {
+                return;
+            }
+            let Ok(entries) = fs::read_dir(dir) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let name_str = name.to_string_lossy();
+                let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+                if is_dir {
+                    if SKIP_DIRS.contains(&name_str.as_ref()) {
+                        continue;
+                    }
+                    walk(&entry.path(), target, project_root, candidates, depth + 1);
+                } else if name_str.to_lowercase() == target {
+                    let display = entry
+                        .path()
+                        .strip_prefix(project_root)
+                        .unwrap_or(&entry.path())
+                        .display()
+                        .to_string();
+                    // Exact name match in different directory gets high score
+                    candidates.push((display, 90));
+                }
+            }
+        }
+
+        walk(root, target_name, project_root, candidates, 0);
     }
 }
 
@@ -3652,6 +3724,118 @@ type Handler interface {
         assert!(
             result.contains("read_file") && result.contains("stale.txt"),
             "should contain read_file and file path, got: {result}"
+        );
+    }
+
+    // ── find_similar_files: cross-directory fallback ────────────────────────
+    //
+    // When the requested parent directory doesn't exist (e.g. crate renamed
+    // from mo-agent → astra-cli), find_similar_files should search the
+    // project tree and suggest the correct path.
+
+    /// Core scenario: file exists under a different parent directory.
+    /// read_file("old_dir/foo.rs") should suggest "new_dir/foo.rs".
+    #[test]
+    fn read_file_suggests_file_in_different_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        // File lives under new_crate/, but LLM will ask for old_crate/
+        let new_dir = dir.path().join("src/new_crate/src");
+        std::fs::create_dir_all(&new_dir).unwrap();
+        std::fs::write(new_dir.join("edge_tools.rs"), "// tools").unwrap();
+
+        let exe = test_executor_in(dir.path());
+        let result = exe.read_file(&json!({
+            "path": "src/old_crate/src/edge_tools.rs"
+        }));
+
+        assert!(
+            result.contains("No such file"),
+            "should report not found: {result}"
+        );
+        assert!(
+            result.contains("edge_tools.rs") && result.contains("new_crate"),
+            "should suggest the file under new_crate, got: {result}"
+        );
+    }
+
+    /// Deeply nested file found via project-wide search.
+    #[test]
+    fn read_file_suggests_deeply_nested_renamed_path() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("a/b/c/d")).unwrap();
+        std::fs::write(dir.path().join("a/b/c/d/config.toml"), "# cfg").unwrap();
+
+        let exe = test_executor_in(dir.path());
+        let result = exe.read_file(&json!({
+            "path": "x/y/config.toml"
+        }));
+
+        assert!(
+            result.contains("Did you mean"),
+            "should suggest alternative: {result}"
+        );
+        assert!(
+            result.contains("a/b/c/d/config.toml"),
+            "should find deeply nested file, got: {result}"
+        );
+    }
+
+    /// No match anywhere — should not crash, just return generic error.
+    #[test]
+    fn read_file_no_suggestion_when_truly_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("unrelated.py"), "pass").unwrap();
+
+        let exe = test_executor_in(dir.path());
+        let result = exe.read_file(&json!({
+            "path": "nonexistent/totally_unique_name.rs"
+        }));
+
+        assert!(
+            result.contains("No such file"),
+            "should report not found: {result}"
+        );
+        assert!(
+            !result.contains("Did you mean"),
+            "should NOT suggest unrelated files, got: {result}"
+        );
+    }
+
+    /// Skipped directories (.git, node_modules, target) should not be searched.
+    #[test]
+    fn read_file_skips_ignored_dirs_in_suggestion() {
+        let dir = tempfile::tempdir().unwrap();
+        // Put file only inside .git — should not be suggested
+        std::fs::create_dir_all(dir.path().join(".git/objects")).unwrap();
+        std::fs::write(dir.path().join(".git/objects/handler.rs"), "// git").unwrap();
+        std::fs::create_dir_all(dir.path().join("node_modules/pkg")).unwrap();
+        std::fs::write(dir.path().join("node_modules/pkg/handler.rs"), "// nm").unwrap();
+
+        let exe = test_executor_in(dir.path());
+        let result = exe.read_file(&json!({
+            "path": "old/handler.rs"
+        }));
+
+        assert!(
+            !result.contains("Did you mean"),
+            "should not suggest files from .git or node_modules, got: {result}"
+        );
+    }
+
+    /// Same-directory suggestion still works after refactor (regression guard).
+    #[test]
+    fn read_file_same_dir_suggestion_still_works() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("config.rs"), "// cfg").unwrap();
+
+        let exe = test_executor_in(dir.path());
+        let result = exe.read_file(&json!({
+            "path": "confg.rs"
+        }));
+
+        assert!(
+            result.contains("config.rs"),
+            "same-dir typo suggestion should still work, got: {result}"
         );
     }
 }
