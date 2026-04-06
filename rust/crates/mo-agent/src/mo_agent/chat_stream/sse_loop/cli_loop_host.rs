@@ -92,6 +92,18 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
             .restricted_tools
             .extend(skill_scoped_restrictions.iter().cloned());
 
+        // Ephemeral skill listing: prepend to messages for this turn only,
+        // without modifying state.messages (persistent history).
+        let effective_messages: Vec<Value>;
+        let messages_slice: &[Value] = if let Some(ref listing) = state.skill_listing_message {
+            effective_messages = std::iter::once(listing.clone())
+                .chain(state.messages.iter().cloned())
+                .collect();
+            &effective_messages
+        } else {
+            state.messages.as_slice()
+        };
+
         let turn_result = fetch_chat_turn_sse(ChatTurnSseFetchRequest {
             api: self.api,
             token: self.token,
@@ -109,7 +121,7 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
             executor: &mut self.executor,
             selector: self.selector,
             registry: &self.registry,
-            messages: state.messages.as_slice(),
+            messages: messages_slice,
             current_session_id: state.current_session_id.as_deref(),
             tool_results: state.tool_results.as_slice(),
             all_schemas: &self.all_schemas,

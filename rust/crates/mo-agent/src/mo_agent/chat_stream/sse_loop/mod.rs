@@ -246,6 +246,7 @@ pub(crate) async fn stream_chat_sse(
         last_composite_snapshot: None,
         last_measured_prompt_tokens: None,
         consecutive_context_window_errors: 0,
+            skill_listing_message: None,
     };
 
     // ─── Run the runtime loop ────────────────────────────────────────────

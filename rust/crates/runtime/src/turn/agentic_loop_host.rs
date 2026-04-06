@@ -297,6 +297,13 @@ pub struct AgenticLoopState {
     pub last_measured_prompt_tokens: Option<u64>,
     /// Consecutive fatal ingests whose error matched context-window / PTL patterns.
     pub consecutive_context_window_errors: u32,
+
+    // ── Ephemeral skill listing ──
+    /// Skill listing message (available skill names + descriptions).
+    /// Stored here instead of in `messages` so hosts can inject it ephemerally
+    /// into each LLM request without bloating the persistent conversation history.
+    /// Hosts should prepend this to the messages array when building the payload.
+    pub skill_listing_message: Option<Value>,
 }
 
 /// Consecutive same-category error turns before forcing a strategy change.
@@ -759,6 +766,11 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
     }
 
     // ─── Preamble: auto-inject skill tool when skills are available ──────
+    // Register the skill tool schema so the LLM knows the `skill` tool exists.
+    // The skill listing (available skill names + descriptions) is stored on
+    // state.skill_listing_message and injected ephemerally by the host at
+    // each turn — it does NOT go into state.messages, so it doesn't bloat
+    // the persistent conversation history or survive into compaction.
     if let Some(resolver) = &state.skill_resolver {
         let skills = resolver.available_skills();
         if !skills.is_empty() {
@@ -767,13 +779,13 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
                 Some(&state.skill_quality_tracker),
                 Some(&state.pinned_skills),
             ));
-            // Inject a system reminder so the LLM is primed to use the skill tool.
-            let reminder = crate::turn::skill_tool::skill_listing_system_message(
-                &skills,
-                Some(&state.skill_quality_tracker),
-                Some(&state.pinned_skills),
+            state.skill_listing_message = Some(
+                crate::turn::skill_tool::skill_listing_system_message(
+                    &skills,
+                    Some(&state.skill_quality_tracker),
+                    Some(&state.pinned_skills),
+                ),
             );
-            state.messages.push(reminder);
         }
     }
 

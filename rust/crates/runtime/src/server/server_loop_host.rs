@@ -358,6 +358,12 @@ impl ServerAgenticLoopHost {
         llm_messages.extend(compact_result.messages);
         // Strip old reasoning to reduce input tokens (see edge_ledger::strip_stale_reasoning).
         crate::turn::edge_ledger::strip_stale_reasoning(&mut llm_messages);
+
+        // Ephemeral skill listing: injected per-turn, not stored in state.messages.
+        if let Some(ref listing) = state.skill_listing_message {
+            llm_messages.push(listing.clone());
+        }
+
         llm_messages
     }
 
