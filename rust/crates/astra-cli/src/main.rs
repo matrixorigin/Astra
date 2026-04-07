@@ -191,6 +191,9 @@ enum Command {
     /// Local session journal (offline): astra journal digest
     #[command(subcommand)]
     Journal(JournalCmd),
+    /// Manage MCP servers: astra mcp add/remove/list/get
+    #[command(subcommand)]
+    Mcp(McpCmd),
     /// Direct message: astra "your question here"
     #[command(external_subcommand)]
     Message(Vec<String>),
@@ -426,6 +429,68 @@ pub(crate) struct JournalDigestArgs {
     /// all (default) or summary (smaller turn rows)
     #[arg(long)]
     focus: Option<String>,
+}
+
+#[derive(Subcommand, Debug)]
+enum McpCmd {
+    /// List configured MCP servers
+    List(McpListArgs),
+    /// Add a stdio MCP server
+    Add(McpAddArgs),
+    /// Add an MCP server from a JSON config string
+    #[command(name = "add-json")]
+    AddJson(McpAddJsonArgs),
+    /// Remove an MCP server
+    Remove(McpRemoveArgs),
+    /// Show details of a configured MCP server
+    Get(McpGetArgs),
+}
+
+#[derive(Args, Debug)]
+struct McpListArgs {
+    /// Config scope: project or user
+    #[arg(short = 's', long, default_value = "project")]
+    scope: String,
+}
+
+#[derive(Args, Debug)]
+struct McpAddArgs {
+    /// Server name
+    name: String,
+    /// Command to run
+    command: String,
+    /// Command arguments
+    #[arg(trailing_var_arg = true)]
+    args: Vec<String>,
+    /// Config scope: project or user
+    #[arg(short = 's', long, default_value = "project")]
+    scope: String,
+}
+
+#[derive(Args, Debug)]
+struct McpAddJsonArgs {
+    /// Server name
+    name: String,
+    /// JSON configuration string
+    json: String,
+    /// Config scope: project or user
+    #[arg(short = 's', long, default_value = "project")]
+    scope: String,
+}
+
+#[derive(Args, Debug)]
+struct McpRemoveArgs {
+    /// Server name to remove
+    name: String,
+    /// Config scope: project or user
+    #[arg(short = 's', long, default_value = "project")]
+    scope: String,
+}
+
+#[derive(Args, Debug)]
+struct McpGetArgs {
+    /// Server name to inspect
+    name: String,
 }
 
 // ═══════════════════════════════════════════════════════ Credentials ══════
