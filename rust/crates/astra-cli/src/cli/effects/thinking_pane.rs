@@ -104,6 +104,13 @@ impl ThinkingPreviewPane {
         self.region.update(lines);
     }
 
+    /// Redraw header only (elapsed time update) without new content.
+    pub fn tick(&mut self) {
+        if !self.buffer.is_empty() {
+            self.redraw();
+        }
+    }
+
     /// Return a collapsed summary line for after thinking completes.
     pub fn summary_line(&self) -> String {
         let words = self.buffer.split_whitespace().count();

@@ -119,6 +119,10 @@ pub trait SseStreamHost: Send {
     /// CLI: dismiss the TTFT “waiting” spinner before handling render effects.
     fn on_first_sse_frame(&mut self) {}
 
+    /// Periodic heartbeat while waiting for the next SSE chunk.
+    /// CLI: refreshes the thinking pane elapsed timer so the UI never looks frozen.
+    fn on_idle_tick(&mut self) {}
+
     /// Execute a tool request that arrived via `tool_request` SSE event.
     /// Returns the execution result (output, status, duration).
     async fn execute_tool(
@@ -183,24 +187,47 @@ pub async fn consume_sse_stream_cancellable<H: SseStreamHost>(
     host.on_before_sse_read_loop();
 
     let idle = idle_timeout;
+    // Short tick for UI heartbeat (thinking pane elapsed timer refresh).
+    let tick = std::time::Duration::from_secs(1);
     loop {
-        // Use tokio::select! to allow cancellation to interrupt the stream read.
-        let chunk_result = if let Some(token) = cancel_token {
-            tokio::select! {
-                biased;
-                _ = token.cancelled() => {
-                    abort = Some(SseAbortReason::Cancelled);
-                    break;
+        // Inner loop: retry with short ticks so on_idle_tick can refresh the UI,
+        // but accumulate elapsed time toward the full idle_timeout.
+        let chunk_result = 'wait: {
+            let mut elapsed = std::time::Duration::ZERO;
+            loop {
+                let remaining = idle.saturating_sub(elapsed);
+                if remaining.is_zero() {
+                    break 'wait None; // idle timeout
                 }
-                next = tokio::time::timeout(idle, chunks.next()) => next,
+                let wait = remaining.min(tick);
+                let r = if let Some(token) = cancel_token {
+                    tokio::select! {
+                        biased;
+                        _ = token.cancelled() => {
+                            abort = Some(SseAbortReason::Cancelled);
+                            break 'wait None;
+                        }
+                        next = tokio::time::timeout(wait, chunks.next()) => next,
+                    }
+                } else {
+                    tokio::time::timeout(wait, chunks.next()).await
+                };
+                match r {
+                    Ok(v) => break 'wait Some(v),
+                    Err(_) => {
+                        elapsed += wait;
+                        host.on_idle_tick();
+                    }
+                }
             }
-        } else {
-            tokio::time::timeout(idle, chunks.next()).await
         };
+        if abort.is_some() {
+            break;
+        }
 
         let chunk = match chunk_result {
-            Ok(v) => v,
-            Err(_) => {
+            Some(v) => v,
+            None => {
                 abort = Some(SseAbortReason::IdleTimeout);
                 break;
             }

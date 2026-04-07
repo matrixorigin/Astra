@@ -282,6 +282,13 @@ impl SseStreamHost for CliSseStreamHost<'_> {
         self.render.stop_thinking();
     }
 
+    fn on_idle_tick(&mut self) {
+        if self.quiet || self.suppress_intermediate_output {
+            return;
+        }
+        self.render.tick_thinking_pane();
+    }
+
     fn on_render_effects(&mut self, effects: Vec<SseRenderEffect>) {
         // Forward to stream event channel (even when quiet/suppress are on)
         if let Some(tx) = &self.stream_event_tx {
@@ -938,6 +945,16 @@ impl StreamRenderState {
             if let Some(pane) = &mut self.thinking_pane {
                 pane.push_chunk(chunk);
             }
+        }
+    }
+
+    /// Refresh the thinking pane header (elapsed time) without new content.
+    fn tick_thinking_pane(&mut self) {
+        if let Some(pane) = &mut self.thinking_pane {
+            if let Some(md) = &mut self.md {
+                md.pause_unstable();
+            }
+            pane.tick();
         }
     }
 
