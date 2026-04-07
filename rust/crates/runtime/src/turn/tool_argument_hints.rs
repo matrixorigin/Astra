@@ -5,6 +5,8 @@
 
 use serde_json::Value;
 
+use crate::str_preview::truncate_str;
+
 use super::cloud_approval_policy::{CloudGatedToolKind, cloud_gated_tool_kind};
 
 /// Parse `function.arguments` from an LLM tool call: either a JSON object or a string of JSON.
@@ -53,16 +55,16 @@ fn mcp_args_summary(args: &Value) -> String {
     for (k, v) in obj.iter().take(3) {
         let val_str = match v {
             Value::String(s) => {
-                if s.len() > 60 {
-                    format!("\"{}…\"", &s[..57])
+                if s.chars().count() > 60 {
+                    format!("\"{}\"", truncate_str(s, 57))
                 } else {
                     format!("\"{s}\"")
                 }
             }
             other => {
                 let s = other.to_string();
-                if s.len() > 60 {
-                    format!("{}…", &s[..57])
+                if s.chars().count() > 60 {
+                    truncate_str(&s, 57)
                 } else {
                     s
                 }
@@ -184,5 +186,14 @@ mod tests {
         let args = json!({"a": 1, "b": 2, "c": 3, "d": 4, "e": 5});
         let detail = permission_prompt_primary_detail("mcp_server_tool", &args).unwrap();
         assert!(detail.contains("+2 more"));
+    }
+
+    #[test]
+    fn mcp_args_summary_long_unicode_no_panic() {
+        let long_val = format!("{}end", "数据—".repeat(25));
+        let args = json!({"data": long_val});
+        let detail = permission_prompt_primary_detail("mcp_server_tool", &args).unwrap();
+        assert!(detail.contains("data="));
+        assert!(detail.contains('…'));
     }
 }

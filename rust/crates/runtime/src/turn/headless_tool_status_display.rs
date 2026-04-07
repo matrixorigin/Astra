@@ -2,6 +2,8 @@
 
 use serde_json::{Map, Value};
 
+use crate::str_preview::truncate_str;
+
 #[derive(Debug, Clone, Copy)]
 enum ToolCat {
     Github,
@@ -321,36 +323,10 @@ pub fn tool_result_summary(name: &str, result: &str) -> Option<String> {
     }
 }
 
-#[must_use]
-pub fn truncate_str(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        s.to_string()
-    } else {
-        let truncated: String = s.chars().take(max).collect();
-        format!("{truncated}…")
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
-
-    #[test]
-    fn truncate_short_string_unchanged() {
-        assert_eq!(truncate_str("hello", 10), "hello");
-    }
-
-    #[test]
-    fn truncate_long_string_adds_ellipsis() {
-        let result = truncate_str("hello world", 5);
-        assert_eq!(result, "hello…");
-    }
-
-    #[test]
-    fn truncate_exact_length_unchanged() {
-        assert_eq!(truncate_str("abc", 3), "abc");
-    }
 
     #[test]
     fn tool_call_detail_github_shows_owner_repo() {

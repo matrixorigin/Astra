@@ -40,6 +40,8 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+use crate::str_preview::prefix_chars;
+
 // ─── Protocol Version ────────────────────────────────────────────────────────
 
 /// Version encoding: major * 1000 + minor. E.g., 1000 = v1.0, 1001 = v1.1, 2000 = v2.0.
@@ -1304,10 +1306,10 @@ impl IdempotencyKey {
         if let Some(ctx) = &self.context_signature {
             let mut parts = base;
             if let Some(ws) = &ctx.workspace_version {
-                parts.push_str(&format!(":ws={}", &ws[..ws.len().min(8)]));
+                parts.push_str(&format!(":ws={}", prefix_chars(ws, 8)));
             }
             if let Some(ms) = &ctx.memory_snapshot_id {
-                parts.push_str(&format!(":ms={}", &ms[..ms.len().min(8)]));
+                parts.push_str(&format!(":ms={}", prefix_chars(ms, 8)));
             }
             parts
         } else {
@@ -1528,7 +1530,8 @@ fn compute_content_hash(tool_name: &str, args: &serde_json::Value) -> String {
     let canonical = canonical_json(args);
     hasher.update(canonical.as_bytes());
     let hash = hasher.finalize();
-    format!("{:x}", hash)[..16].to_string()
+    let hex = format!("{:x}", hash);
+    prefix_chars(&hex, 16)
 }
 
 /// Produce canonical JSON with sorted keys (recursively).
@@ -1575,7 +1578,8 @@ fn compute_idempotency_key(
     let payload_value: serde_json::Value = serde_json::from_str(&payload_json).unwrap_or_default();
     hasher.update(canonical_json(&payload_value).as_bytes());
     let hash = hasher.finalize();
-    format!("{:x}", hash)[..32].to_string() // 32-char prefix
+    let hex = format!("{:x}", hash);
+    prefix_chars(&hex, 32) // 32-char hex prefix
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────────

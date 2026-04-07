@@ -6,6 +6,8 @@
 
 use serde_json::Value;
 
+use crate::str_preview::truncate_str;
+
 /// System prompt used when asking the LLM to summarize conversation history.
 pub const COMPACT_SYSTEM_PROMPT: &str = "You are a conversation summarizer. Create a structured summary preserving all essential context.\n\n\
 IMPORTANT: First write an <analysis> block where you reason about what to preserve. \
@@ -269,14 +271,6 @@ fn content_as_text_for_summary(content: Option<&Value>) -> String {
     scrub_string_for_summary(&raw)
 }
 
-fn truncate_str(s: &str, max_chars: usize) -> String {
-    if s.chars().count() <= max_chars {
-        return s.to_string();
-    }
-    let truncated: String = s.chars().take(max_chars).collect();
-    format!("{truncated}...[truncated]")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -310,7 +304,7 @@ mod tests {
         let msgs = vec![json!({"role": "tool", "content": long})];
         let rendered = render_messages_for_summary(&msgs);
         assert!(rendered.contains("[TOOL RESULT]"));
-        assert!(rendered.contains("[truncated]"));
+        assert!(rendered.contains('…'));
         assert!(rendered.len() < 2000);
     }
 

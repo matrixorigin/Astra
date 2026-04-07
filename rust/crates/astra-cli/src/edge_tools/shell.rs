@@ -1976,16 +1976,28 @@ mod tests {
         let executor = ToolExecutor::new(dir.path());
         // ".." traversal
         let result = executor.glob(&serde_json::json!({"pattern": "../../etc/*"}));
-        assert!(result.contains("path traversal"), "should reject ..: {result}");
+        assert!(
+            result.contains("path traversal"),
+            "should reject ..: {result}"
+        );
         // Absolute path
         let result = executor.glob(&serde_json::json!({"pattern": "/etc/*.conf"}));
-        assert!(result.contains("path traversal"), "should reject /: {result}");
+        assert!(
+            result.contains("path traversal"),
+            "should reject /: {result}"
+        );
         // Tilde expansion
         let result = executor.glob(&serde_json::json!({"pattern": "~/.*"}));
-        assert!(result.contains("path traversal"), "should reject ~/: {result}");
+        assert!(
+            result.contains("path traversal"),
+            "should reject ~/: {result}"
+        );
         // Normal pattern should work
         let result = executor.glob(&serde_json::json!({"pattern": "*.rs"}));
-        assert!(!result.contains("path traversal"), "should allow *.rs: {result}");
+        assert!(
+            !result.contains("path traversal"),
+            "should allow *.rs: {result}"
+        );
     }
 
     #[test]

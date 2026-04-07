@@ -471,7 +471,10 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                                 pm.record_approval(&t, true);
                             }
                             if ch == 'a' {
-                                let rule = crate::permission_manager::PermissionManager::make_allow_rule(&t, args);
+                                let rule =
+                                    crate::permission_manager::PermissionManager::make_allow_rule(
+                                        &t, args,
+                                    );
                                 pm.add_allow_rule(&rule);
                                 let scope = if pm.has_project_root() {
                                     "project"

@@ -418,10 +418,13 @@ impl std::fmt::Display for SseParseError {
 }
 
 fn truncate_for_debug(s: &str) -> String {
-    if s.len() <= 200 {
-        s.to_string()
+    use crate::str_preview::truncate_str;
+
+    let preview = truncate_str(s, 200);
+    if preview == s {
+        preview
     } else {
-        format!("{}…({} bytes)", &s[..200], s.len())
+        format!("{preview} ({} bytes)", s.len())
     }
 }
 

@@ -1397,7 +1397,10 @@ mod tests {
         let mut pm = PermissionManager::new(true);
         pm.session_overrides.insert("bash".to_string(), true);
         let args = serde_json::json!({"command": "rm -rf /"});
-        assert!(!pm.check("bash", &args), "check() must deny dangerous commands despite override");
+        assert!(
+            !pm.check("bash", &args),
+            "check() must deny dangerous commands despite override"
+        );
     }
 
     // ── Security: make_allow_rule generates pattern-specific rules ───────────

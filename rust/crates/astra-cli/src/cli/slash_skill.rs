@@ -418,11 +418,13 @@ pub(super) async fn handle_skill_command(
             let (message, changed) = apply_skill_surfacing(state, command);
             eprintln!("  {}", message.green());
             if changed && let Some(ref j) = state.journal {
-                let _ = j.append(&astra_services::session_journal::JournalEvent::config_change(
-                    state.session_id.as_deref(),
-                    "skill_search",
-                    &format_skill_surfacing_line(&state.skill_search),
-                ));
+                let _ = j.append(
+                    &astra_services::session_journal::JournalEvent::config_change(
+                        state.session_id.as_deref(),
+                        "skill_search",
+                        &format_skill_surfacing_line(&state.skill_search),
+                    ),
+                );
             }
         }
 
@@ -450,7 +452,8 @@ pub(super) async fn handle_skill_command(
                         None => {
                             eprintln!(
                                 "  {}",
-                                format!("No on-disk SKILL.md for '{name}' (e.g. MCP-only).").yellow()
+                                format!("No on-disk SKILL.md for '{name}' (e.g. MCP-only).")
+                                    .yellow()
                             );
                         }
                     },
@@ -950,10 +953,9 @@ Follow these steps:
                 for m in &manifests {
                     use astra_runtime::skills::SkillSourceKind::*;
                     let (disk_col, check_col): (String, String) = match m.source {
-                        Mcp | Database | Plugin => (
-                            "—".dim().to_string(),
-                            "(remote)".dim().to_string(),
-                        ),
+                        Mcp | Database | Plugin => {
+                            ("—".dim().to_string(), "(remote)".dim().to_string())
+                        }
                         Local | Bundled => {
                             let disk = resolve_skill_dir_on_disk(m.name.as_str());
                             let disk_mark = if disk.is_some() {
@@ -966,7 +968,8 @@ Follow these steps:
                                 if md.exists() {
                                     match std::fs::read_to_string(md) {
                                         Ok(src) => {
-                                            let issues = collect_skill_md_issues(m.name.as_str(), &src);
+                                            let issues =
+                                                collect_skill_md_issues(m.name.as_str(), &src);
                                             if issues.is_empty() {
                                                 "ok".green().to_string()
                                             } else {
@@ -1224,7 +1227,8 @@ Follow these steps:
                     );
                     eprintln!(
                         "  {}",
-                        "Tip: use '/skill search' for local keyword match (not vector search).".dim()
+                        "Tip: use '/skill search' for local keyword match (not vector search)."
+                            .dim()
                     );
                 }
             }
@@ -1762,10 +1766,12 @@ async fn create_skill_from_session(arg: &str, state: &mut super::ReplState) -> R
     }
 
     // 4. Estimate description from first user message
-    let description = user_intents
-        .first()
-        .cloned()
-        .unwrap_or_else(|| format!("Auto-generated skill from session {}", &session_id[..8]));
+    let description = user_intents.first().cloned().unwrap_or_else(|| {
+        format!(
+            "Auto-generated skill from session {}",
+            prefix_chars(&session_id, 8)
+        )
+    });
 
     // 5. Derive triggers from common words
     let triggers = derive_triggers(name, &user_intents);
@@ -1776,11 +1782,7 @@ async fn create_skill_from_session(arg: &str, state: &mut super::ReplState) -> R
     for (i, t) in turns.iter().enumerate() {
         let mut step = String::new();
         if let Some(ref input) = t.user_input {
-            let preview = if input.len() > 120 {
-                format!("{}...", &input[..120])
-            } else {
-                input.clone()
-            };
+            let preview = truncate_str(input, 120);
             step.push_str(&format!("User asked: {preview}"));
         }
         if let Some(ref tools) = t.tools_used {
@@ -2023,7 +2025,10 @@ mod tests {
     #[test]
     fn parse_skill_surfacing_supports_status_and_updates() {
         assert_eq!(parse_skill_surfacing("").unwrap(), SkillSurfacingCmd::Show);
-        assert_eq!(parse_skill_surfacing("status").unwrap(), SkillSurfacingCmd::Show);
+        assert_eq!(
+            parse_skill_surfacing("status").unwrap(),
+            SkillSurfacingCmd::Show
+        );
         assert_eq!(
             parse_skill_surfacing("dynamic off").unwrap(),
             SkillSurfacingCmd::SetDynamic(false)

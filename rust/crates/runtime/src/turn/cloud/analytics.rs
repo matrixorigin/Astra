@@ -8,6 +8,7 @@ use serde_json::Value;
 
 use super::compaction::{CompactBoundary, CompactTrigger};
 use crate::prompts::CompactionTier;
+use crate::str_preview::truncate_str;
 
 // ---------------------------------------------------------------------------
 // Event Types
@@ -710,13 +711,14 @@ fn truncate_tool_content(msg: &Value, max_chars: usize) -> Value {
     let mut msg = msg.clone();
     if let Some(content) = msg.get_mut("content")
         && let Some(s) = content.as_str()
-        && s.len() > max_chars
     {
-        *content = Value::String(format!(
-            "{}... [truncated, {} chars total]",
-            &s[..max_chars.min(s.len())],
-            s.len()
-        ));
+        let total = s.chars().count();
+        if total > max_chars {
+            *content = Value::String(format!(
+                "{} · {total} Unicode scalars",
+                truncate_str(s, max_chars)
+            ));
+        }
     }
     msg
 }

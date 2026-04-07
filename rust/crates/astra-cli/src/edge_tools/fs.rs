@@ -1,4 +1,5 @@
 use super::*;
+use astra_runtime::str_preview::truncate_str;
 
 /// Check if a path is a UNC path (Windows network path that could leak NTLM credentials).
 fn is_unc_path(path: &str) -> bool {
@@ -46,18 +47,12 @@ fn is_dangerous_write_target(rel_path: &str) -> Option<&'static str> {
         ),
         (".npmrc", "NPM config — can change registry or auth tokens"),
         (".env", "Environment variables — may contain secrets"),
-        (
-            ".env.local",
-            "Local env variables — may contain secrets",
-        ),
+        (".env.local", "Local env variables — may contain secrets"),
         (
             ".aws/credentials",
             "AWS credentials — changes affect cloud access",
         ),
-        (
-            ".aws/config",
-            "AWS config — changes affect cloud access",
-        ),
+        (".aws/config", "AWS config — changes affect cloud access"),
         (
             ".kube/config",
             "Kubernetes config — changes affect cluster access",
@@ -1767,14 +1762,6 @@ fn count_with_quote_normalization(content: &str, search: &str) -> usize {
     norm_content.matches(&norm_search).count()
 }
 
-fn truncate_str(s: &str, max: usize) -> String {
-    if s.len() <= max {
-        s.to_string()
-    } else {
-        format!("{}...", &s[..max])
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2672,10 +2659,9 @@ type Handler interface {
     }
 
     #[test]
-    fn truncate_str_over_limit() {
+    fn truncate_str_over_limit_uses_runtime_helper() {
         let result = truncate_str("this is a long string", 7);
-        assert!(result.ends_with("..."), "should end with ...: {result}");
-        assert!(result.len() <= 10);
+        assert_eq!(result, "this is…");
     }
 
     // ── file_outline: generic fallback ───────────────────────────────────────

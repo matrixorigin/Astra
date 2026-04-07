@@ -17,6 +17,8 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::time::Instant;
 
+use crate::str_preview::{prefix_chars, truncate_str};
+
 // Re-export task types from services
 pub use astra_services::task_orchestrator::{SubtaskPlan, TaskPlan, TaskStatus};
 
@@ -1506,18 +1508,6 @@ pub fn parse_plan_entry_choice(input: &str, has_active: bool, has_paused: bool) 
     PlanEntryChoice::Goal(trimmed.to_string())
 }
 
-/// Truncate to at most `max_len` Unicode scalar values (`.chars()`), appending `"..."` if truncated.
-fn truncate_str(s: &str, max_len: usize) -> String {
-    let n = s.chars().count();
-    if n <= max_len {
-        s.to_string()
-    } else {
-        let take_n = max_len.saturating_sub(3).max(1);
-        let truncated: String = s.chars().take(take_n).collect();
-        format!("{truncated}...")
-    }
-}
-
 // ─── Clarification Questions ─────────────────────────────────────────────────
 
 /// A clarification question with multiple choice options.
@@ -2665,11 +2655,7 @@ impl TimelineEvent {
             TimelineEventKind::GitCommit {
                 commit_hash,
                 message,
-            } => format!(
-                "Commit {}: {}",
-                &commit_hash[..7.min(commit_hash.len())],
-                message
-            ),
+            } => format!("Commit {}: {}", prefix_chars(commit_hash, 7), message),
         };
 
         format!("{}  {} {}", self.time_display, icon, desc)
@@ -3502,10 +3488,10 @@ mod tests {
     #[test]
     fn truncate_str_respects_utf8_char_boundaries() {
         let s = "在/tmp 下面构建一个js的网页，用户输入，展示绚丽的动态效果";
-        let t = truncate_str(s, 20);
-        assert!(t.ends_with("..."));
+        let t = crate::str_preview::truncate_str(s, 20);
+        assert!(t.ends_with('…'), "{t:?}");
         assert!(
-            t.chars().count() <= 20,
+            t.chars().count() <= 21,
             "got {} chars: {t:?}",
             t.chars().count()
         );

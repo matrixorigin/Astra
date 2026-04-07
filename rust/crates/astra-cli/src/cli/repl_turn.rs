@@ -2127,7 +2127,8 @@ mod tests {
         let trimmed = history.len().saturating_sub(keep);
         let summary = "User explored Rust async patterns, asked about pinning, \
                         debugged a lifetime issue, and reviewed tokio spawn.";
-        let anchor_text = "- [fact] Rust Pin<T> prevents moves\n- [fact] tokio::spawn requires 'static";
+        let anchor_text =
+            "- [fact] Rust Pin<T> prevents moves\n- [fact] tokio::spawn requires 'static";
         let compact_msg = compact_assistant_message(trimmed, summary, Some(anchor_text));
         let summary_entry = (String::new(), compact_msg);
 
@@ -2186,24 +2187,28 @@ mod tests {
             Some("- [fact] axum uses tower layers"),
         );
         let history: Vec<(String, String)> = vec![
-            (String::new(), summary),                                  // compacted
+            (String::new(), summary),                                   // compacted
             ("add rate limiting".into(), "use tower RateLimit".into()), // turn 6
             ("show example".into(), "```rust\nuse tower...```".into()), // turn 7
-            ("deploy it".into(), "docker build...".into()),            // turn 8
+            ("deploy it".into(), "docker build...".into()),             // turn 8
         ];
 
         let messages = history_as_messages(&history);
 
         // Compacted entry: only assistant (no user role)
         assert_eq!(messages[0]["role"], "assistant");
-        assert!(messages[0]["content"]
-            .as_str()
-            .unwrap()
-            .contains("5 turns compacted"));
-        assert!(messages[0]["content"]
-            .as_str()
-            .unwrap()
-            .contains("[Session memory anchor]"));
+        assert!(
+            messages[0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("5 turns compacted")
+        );
+        assert!(
+            messages[0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("[Session memory anchor]")
+        );
 
         // Recent turns: alternating user/assistant
         assert_eq!(messages[1]["role"], "user");
@@ -2272,10 +2277,7 @@ mod tests {
 
         // Assistant part truncated to 220 chars (first non-empty line)
         assert!(anchor.contains("Latest assistant direction: "));
-        let assistant_part = anchor
-            .split("Latest assistant direction: ")
-            .nth(1)
-            .unwrap();
+        let assistant_part = anchor.split("Latest assistant direction: ").nth(1).unwrap();
         assert_eq!(assistant_part.chars().count(), 220);
     }
 
@@ -2300,7 +2302,10 @@ mod tests {
         let mut state = ReplState::default();
 
         // Turn 1: success
-        state.history.push(("explain ownership".into(), "Ownership in Rust means each value has exactly one owner...".into()));
+        state.history.push((
+            "explain ownership".into(),
+            "Ownership in Rust means each value has exactly one owner...".into(),
+        ));
         state.turn = 1;
         state.continuation_anchor = Some(
             "Latest user task: explain ownership\nLatest assistant direction: Ownership in Rust means each value has exactl"
@@ -2348,11 +2353,12 @@ mod tests {
             .join(" ");
         // The failed turn's content DOES appear in Turn 3 (retry same message)
         // but there should be exactly 2 user messages, not 3
-        let user_messages: Vec<_> = messages
-            .iter()
-            .filter(|m| m["role"] == "user")
-            .collect();
-        assert_eq!(user_messages.len(), 2, "failed turn must not create extra user message");
+        let user_messages: Vec<_> = messages.iter().filter(|m| m["role"] == "user").collect();
+        assert_eq!(
+            user_messages.len(),
+            2,
+            "failed turn must not create extra user message"
+        );
     }
 
     // ── Relevance scoring tests ──────────────────────────────────────────
@@ -2382,7 +2388,10 @@ mod tests {
             "Use the migration tool.".to_string(),
         );
         let score = score_turn_relevance(&turn, &context_tokens);
-        assert!(score > 0.0, "overlapping turn should score > 0, got {score}");
+        assert!(
+            score > 0.0,
+            "overlapping turn should score > 0, got {score}"
+        );
     }
 
     #[test]
@@ -2424,8 +2433,14 @@ mod tests {
     fn select_turns_preserves_recent_and_relevant() {
         // 10 turns: turns 0,1 are about "database", turns 2-7 are filler, 8-9 are recent
         let history: Vec<(String, String)> = vec![
-            ("setup database schema".into(), "Done, schema created.".into()),
-            ("add database indexes".into(), "Added indexes on user_id.".into()),
+            (
+                "setup database schema".into(),
+                "Done, schema created.".into(),
+            ),
+            (
+                "add database indexes".into(),
+                "Added indexes on user_id.".into(),
+            ),
             ("what is the weather".into(), "It's sunny.".into()),
             ("tell me a joke".into(), "Why did the chicken...".into()),
             ("random topic alpha".into(), "Alpha response.".into()),
@@ -2446,12 +2461,19 @@ mod tests {
             "relevant database turns 0/1 should be kept: {kept:?}"
         );
         // Should NOT keep all filler turns
-        let filler_kept: Vec<usize> = kept.iter().filter(|&&i| (2..8).contains(&i)).copied().collect();
+        let filler_kept: Vec<usize> = kept
+            .iter()
+            .filter(|&&i| (2..8).contains(&i))
+            .copied()
+            .collect();
         assert!(
             filler_kept.len() < 6,
             "not all filler turns should be kept: {kept:?}"
         );
-        assert!(kept.len() <= 6, "total kept should not exceed budget: {kept:?}");
+        assert!(
+            kept.len() <= 6,
+            "total kept should not exceed budget: {kept:?}"
+        );
     }
 
     #[test]

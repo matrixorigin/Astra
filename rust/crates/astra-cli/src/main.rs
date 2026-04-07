@@ -120,7 +120,7 @@ use auth_flow::{clear_profile_last_session, do_login, do_register};
 use chat_stream::{ChatTurnParams, stream_chat_sse};
 use cli_utils::{
     Profile, compact_or_raw, get_profile_and_token, interactive_select, load_credentials,
-    map_thin_err, print_json_or_raw, profile_name, prompt_or, prompt_password_masked,
+    map_thin_err, prefix_chars, print_json_or_raw, profile_name, prompt_or, prompt_password_masked,
     resumable_last_session_id, save_credentials, truncate_str, urlencoding,
 };
 use command_router::{ExitCode, execute_cli_command, run_print_mode};
@@ -130,9 +130,9 @@ use permission_manager::PermissionManager;
 use stream_render::{StreamRenderState, TurnResult, dispatch_turn_event_block};
 
 use repl_runtime::{
-    build_repl_editor, check_server_has_models, create_tool_selector,
-    create_tool_selector_quiet, create_tool_selector_with_quality, current_access_token,
-    initialize_repl_state, print_repl_banner, try_silent_auth,
+    build_repl_editor, check_server_has_models, create_tool_selector, create_tool_selector_quiet,
+    create_tool_selector_with_quality, current_access_token, initialize_repl_state,
+    print_repl_banner, try_silent_auth,
 };
 use repl_turn::{ReplTurnContext, create_manual_repl_checkpoint, handle_chat_input};
 use repl_ui::{
@@ -856,7 +856,9 @@ impl Default for ReplState {
             journal: None,
             recent_tools: Vec::new(),
             perm_manager: PermissionManager::with_project(
-                std::env::var("ASTRA_AUTO_APPROVE").map(|v| v == "1").unwrap_or(false),
+                std::env::var("ASTRA_AUTO_APPROVE")
+                    .map(|v| v == "1")
+                    .unwrap_or(false),
                 &std::env::current_dir().unwrap_or_default(),
             ),
             ingestion_user_id: None,
@@ -2351,7 +2353,7 @@ fn display_sync_status(status: &astra_services::SyncStatus) {
 
     // Last error
     if let Some(err) = &status.last_error {
-        let short = if err.len() > 80 { &err[..80] } else { err };
+        let short = truncate_str(err, 80);
         eprintln!("  Last error: {}", short.red());
     }
 }
@@ -4427,14 +4429,11 @@ async fn handle_task_command(
                     .await;
 
                 // Create fresh auto-approve permission manager for background
-                let mut perm_manager =
-                    PermissionManager::with_project(true, &workspace_root);
-                let mut skill_qt =
-                    astra_runtime::skills::quality::SkillQualityTracker::new();
+                let mut perm_manager = PermissionManager::with_project(true, &workspace_root);
+                let mut skill_qt = astra_runtime::skills::quality::SkillQualityTracker::new();
 
                 // Create a fresh tool selector for the background task
-                let (selector, _modules) =
-                    create_tool_selector_quiet(&api_clone, None);
+                let (selector, _modules) = create_tool_selector_quiet(&api_clone, None);
 
                 let result = stream_chat_sse(ChatTurnParams {
                     api: &api_clone,
@@ -4510,9 +4509,7 @@ async fn handle_task_command(
                         );
                     }
                     Err(e) => {
-                        let _ = svc_clone
-                            .fail_task(&bg_task_id, &e.error)
-                            .await;
+                        let _ = svc_clone.fail_task(&bg_task_id, &e.error).await;
                         eprintln!(
                             "\n  {} Background task {} failed: {}",
                             theme::icon_err(),
@@ -4531,8 +4528,7 @@ async fn handle_task_command(
                         let short = &t.task_id[..8.min(t.task_id.len())];
                         eprintln!(
                             "\n{}",
-                            format!("─── Task Result ({short}) ─────────────────────────")
-                                .bold()
+                            format!("─── Task Result ({short}) ─────────────────────────").bold()
                         );
                         eprintln!("  {:<12} {}", "title:".dim(), t.title);
                         eprintln!("  {:<12} {}", "status:".dim(), t.status.as_str().cyan());
@@ -4563,8 +4559,7 @@ async fn handle_task_command(
                                         .unwrap_or(0);
                                     eprintln!(
                                         "\n  {}",
-                                        format!("tokens: {tokens}→/{comp}← | tools: {tools}")
-                                            .dim()
+                                        format!("tokens: {tokens}→/{comp}← | tools: {tools}").dim()
                                     );
                                 }
                             }
@@ -4803,25 +4798,23 @@ async fn handle_slash_command(
                         next.to_string().cyan()
                     );
                 }
-                _ => {
-                    match arg.parse::<PermissionMode>() {
-                        Ok(mode) => {
-                            state.perm_manager.set_mode(mode);
-                            eprintln!(
-                                "  {} Permission mode → {}",
-                                theme::icon_info(),
-                                mode.to_string().cyan()
-                            );
-                        }
-                        Err(_) => {
-                            eprintln!(
-                                "  {} Unknown mode '{}'. Use: auto, prompt, deny",
-                                theme::icon_warn(),
-                                arg
-                            );
-                        }
+                _ => match arg.parse::<PermissionMode>() {
+                    Ok(mode) => {
+                        state.perm_manager.set_mode(mode);
+                        eprintln!(
+                            "  {} Permission mode → {}",
+                            theme::icon_info(),
+                            mode.to_string().cyan()
+                        );
                     }
-                }
+                    Err(_) => {
+                        eprintln!(
+                            "  {} Unknown mode '{}'. Use: auto, prompt, deny",
+                            theme::icon_warn(),
+                            arg
+                        );
+                    }
+                },
             }
         }
 
@@ -4898,7 +4891,7 @@ async fn handle_slash_command(
             if state.turn > 0
                 && let Some(ref sid) = state.session_id
             {
-                let short = if sid.len() > 8 { &sid[..8] } else { sid };
+                let short = prefix_chars(sid, 8);
                 eprintln!(
                     "{}",
                     format!("  Session {short}… saved. To resume: /resume {sid}").dim()
@@ -4949,8 +4942,7 @@ async fn run_chat_repl(
         state.session_id = Some(sid.to_string());
         eprintln!(
             "{}",
-            format!("  Resuming session {}", truncate_str(sid, 12))
-                .cyan()
+            format!("  Resuming session {}", truncate_str(sid, 12)).cyan()
         );
     }
 
@@ -4959,8 +4951,7 @@ async fn run_chat_repl(
         state.session_id = Some(sid.clone());
         eprintln!(
             "{}",
-            format!("  Using session {}", truncate_str(&sid, 12))
-                .cyan()
+            format!("  Using session {}", truncate_str(&sid, 12)).cyan()
         );
     }
 
@@ -5573,7 +5564,7 @@ async fn run_chat_repl(
                 if state.turn > 0
                     && let Some(ref sid) = state.session_id
                 {
-                    let short = if sid.len() > 8 { &sid[..8] } else { sid };
+                    let short = prefix_chars(sid, 8);
                     eprintln!(
                         "{}",
                         format!("  Session {short}… saved. To resume: /resume {sid}").dim()
@@ -5763,17 +5754,23 @@ async fn main() {
 
     // --bare: set env var for minimal mode
     if bare {
-        unsafe { std::env::set_var("ASTRA_BARE", "1"); }
+        unsafe {
+            std::env::set_var("ASTRA_BARE", "1");
+        }
     }
 
     // --max-turns: override via env var before RuntimeLimits singleton is initialized
     if let Some(turns) = max_turns {
-        unsafe { std::env::set_var("MO_MAX_TURNS", turns.to_string()); }
+        unsafe {
+            std::env::set_var("MO_MAX_TURNS", turns.to_string());
+        }
     }
 
     // --max-budget: store the limit; enforcement happens in the REPL loop
     if max_budget > 0.0 {
-        unsafe { std::env::set_var("MO_MAX_BUDGET", max_budget.to_string()); }
+        unsafe {
+            std::env::set_var("MO_MAX_BUDGET", max_budget.to_string());
+        }
     }
 
     // --system-prompt: support @file syntax to read from file
@@ -5782,7 +5779,10 @@ async fn main() {
             match std::fs::read_to_string(path) {
                 Ok(content) => content,
                 Err(e) => {
-                    eprintln!("{}", format!("Error: cannot read system prompt file '{}': {}", path, e).red());
+                    eprintln!(
+                        "{}",
+                        format!("Error: cannot read system prompt file '{}': {}", path, e).red()
+                    );
                     std::process::exit(1);
                 }
             }
@@ -5800,7 +5800,9 @@ async fn main() {
             .filter(|s| !s.is_empty())
             .collect();
         if !normalized.is_empty() {
-            unsafe { std::env::set_var("ASTRA_ALLOWED_TOOLS", normalized.join(",")); }
+            unsafe {
+                std::env::set_var("ASTRA_ALLOWED_TOOLS", normalized.join(","));
+            }
         }
     }
 
@@ -5813,7 +5815,9 @@ async fn main() {
             .filter(|s| !s.is_empty())
             .collect();
         if !normalized.is_empty() {
-            unsafe { std::env::set_var("ASTRA_DISALLOWED_TOOLS", normalized.join(",")); }
+            unsafe {
+                std::env::set_var("ASTRA_DISALLOWED_TOOLS", normalized.join(","));
+            }
         }
     }
 
@@ -5828,46 +5832,70 @@ async fn main() {
                     .unwrap_or_else(|_| d.clone())
             })
             .collect();
-        unsafe { std::env::set_var("ASTRA_ADD_DIRS", dirs.join(":")); }
+        unsafe {
+            std::env::set_var("ASTRA_ADD_DIRS", dirs.join(":"));
+        }
     }
 
     // --yes (-y): set auto-approve mode for the interactive REPL
     if auto_approve {
-        unsafe { std::env::set_var("ASTRA_AUTO_APPROVE", "1"); }
+        unsafe {
+            std::env::set_var("ASTRA_AUTO_APPROVE", "1");
+        }
     }
     if verbose {
-        unsafe { std::env::set_var("ASTRA_VERBOSE", "1"); }
+        unsafe {
+            std::env::set_var("ASTRA_VERBOSE", "1");
+        }
     }
 
     // --mcp-config: load MCP server configs from files/JSON strings
     if !mcp_config.is_empty() {
         if let Err(e) = command_router::load_mcp_configs(&mcp_config) {
-            eprintln!("{}", format!("Warning: failed to load MCP config: {e}").yellow());
+            eprintln!(
+                "{}",
+                format!("Warning: failed to load MCP config: {e}").yellow()
+            );
         }
     }
 
     // --session-id: validate UUID format and export for REPL to pick up
     if let Some(ref sid) = cli_session_id {
         if uuid::Uuid::parse_str(sid).is_err() {
-            eprintln!("{}", format!("Error: --session-id must be a valid UUID, got '{sid}'").red());
+            eprintln!(
+                "{}",
+                format!("Error: --session-id must be a valid UUID, got '{sid}'").red()
+            );
             std::process::exit(1);
         }
-        unsafe { std::env::set_var("ASTRA_SESSION_ID", sid); }
+        unsafe {
+            std::env::set_var("ASTRA_SESSION_ID", sid);
+        }
     }
 
     // --name: export session display name
     if let Some(ref name) = session_name {
-        unsafe { std::env::set_var("ASTRA_SESSION_NAME", name); }
+        unsafe {
+            std::env::set_var("ASTRA_SESSION_NAME", name);
+        }
     }
 
     // Resolve model: --model flag > config default_model > None
-    let resolved_model = cli_model.or_else(|| {
-        command_router::read_config_default_model().ok().flatten()
-    });
+    let resolved_model =
+        cli_model.or_else(|| command_router::read_config_default_model().ok().flatten());
 
     // --print mode: headless single-shot, always auto-approve (can't prompt)
     if print_mode {
-        match run_print_mode(&api, profile.as_deref(), &output_format, resolved_model.as_deref(), system_prompt.as_deref(), command).await {
+        match run_print_mode(
+            &api,
+            profile.as_deref(),
+            &output_format,
+            resolved_model.as_deref(),
+            system_prompt.as_deref(),
+            command,
+        )
+        .await
+        {
             Ok(code) => std::process::exit(i32::from(code)),
             Err(e) => {
                 eprintln!("{}", format!("Error: {e}").red());
@@ -5895,7 +5923,13 @@ async fn main() {
 
         match resolved_sid {
             Some(sid) => {
-                let result = run_chat_repl(&api, profile.as_deref(), resolved_model.as_deref(), Some(&sid)).await;
+                let result = run_chat_repl(
+                    &api,
+                    profile.as_deref(),
+                    resolved_model.as_deref(),
+                    Some(&sid),
+                )
+                .await;
                 match result {
                     Ok(()) => std::process::exit(0),
                     Err(e) => {
@@ -5905,13 +5939,25 @@ async fn main() {
                 }
             }
             None => {
-                eprintln!("{}", "No previous session to continue. Start a new one with `astra`.".yellow());
+                eprintln!(
+                    "{}",
+                    "No previous session to continue. Start a new one with `astra`.".yellow()
+                );
                 std::process::exit(1);
             }
         }
     }
 
-    match execute_cli_command(command, profile, resolved_model, auto_approve, system_prompt, &api).await {
+    match execute_cli_command(
+        command,
+        profile,
+        resolved_model,
+        auto_approve,
+        system_prompt,
+        &api,
+    )
+    .await
+    {
         Ok(exit_code) => {
             std::process::exit(i32::from(exit_code));
         }
@@ -6048,7 +6094,8 @@ mod tests {
         let out = truncate_skill_desc_for_completion(&s);
         assert!(out.ends_with('…'), "out={out:?}");
         assert_eq!(out.chars().count(), 40);
-        assert!(out.starts_with(&s[..39]));
+        let head: String = s.chars().take(39).collect();
+        assert!(out.starts_with(&head));
     }
 
     /// Regression: byte index 39 was inside U+2014 EM DASH (3 bytes) — must not slice by bytes.
@@ -6898,9 +6945,9 @@ mod tests {
         let found = find_task_by_query(&svc, "u1", &tid).await.unwrap();
         assert_eq!(found, Some(tid.clone()));
 
-        // Prefix match (first 8 chars)
-        let prefix = &tid[..8];
-        let found = find_task_by_query(&svc, "u1", prefix).await.unwrap();
+        // Prefix match (first 8 Unicode scalars)
+        let prefix = prefix_chars(&tid, 8);
+        let found = find_task_by_query(&svc, "u1", &prefix).await.unwrap();
         assert_eq!(found, Some(tid));
     }
 
@@ -8546,10 +8593,8 @@ total_tokens_out: 500
 
     #[test]
     fn cli_mcp_add_with_args() {
-        let cli = Cli::try_parse_from([
-            "astra", "mcp", "add", "myserver", "npx", "server",
-        ])
-        .unwrap();
+        let cli =
+            Cli::try_parse_from(["astra", "mcp", "add", "myserver", "npx", "server"]).unwrap();
         match cli.command {
             Some(Command::Mcp(McpCmd::Add(ref args))) => {
                 assert_eq!(args.name, "myserver");
@@ -8585,7 +8630,10 @@ total_tokens_out: 500
     #[test]
     fn cli_config_list_subcommand() {
         let cli = Cli::try_parse_from(["astra", "config", "list"]).unwrap();
-        assert!(matches!(cli.command, Some(Command::Config(ConfigCmd::List))));
+        assert!(matches!(
+            cli.command,
+            Some(Command::Config(ConfigCmd::List))
+        ));
     }
 
     #[test]
@@ -8601,7 +8649,8 @@ total_tokens_out: 500
 
     #[test]
     fn cli_config_set_subcommand() {
-        let cli = Cli::try_parse_from(["astra", "config", "set", "default_model", "gpt-4o"]).unwrap();
+        let cli =
+            Cli::try_parse_from(["astra", "config", "set", "default_model", "gpt-4o"]).unwrap();
         match cli.command {
             Some(Command::Config(ConfigCmd::Set(ref args))) => {
                 assert_eq!(args.key, "default_model");
@@ -8613,7 +8662,8 @@ total_tokens_out: 500
 
     #[test]
     fn cli_chat_with_model() {
-        let cli = Cli::try_parse_from(["astra", "chat", "-m", "hello", "--model", "gpt-4o"]).unwrap();
+        let cli =
+            Cli::try_parse_from(["astra", "chat", "-m", "hello", "--model", "gpt-4o"]).unwrap();
         match cli.command {
             Some(Command::Chat(ref args)) => {
                 assert_eq!(args.message.as_deref(), Some("hello"));
@@ -8712,10 +8762,8 @@ total_tokens_out: 500
 
     #[test]
     fn cli_mcp_add_scope_project() {
-        let cli = Cli::try_parse_from([
-            "astra", "mcp", "add", "--scope", "project", "s1", "npx",
-        ])
-        .unwrap();
+        let cli = Cli::try_parse_from(["astra", "mcp", "add", "--scope", "project", "s1", "npx"])
+            .unwrap();
         match cli.command {
             Some(Command::Mcp(McpCmd::Add(ref args))) => {
                 assert_eq!(args.scope, "project");
@@ -8728,10 +8776,8 @@ total_tokens_out: 500
 
     #[test]
     fn cli_mcp_add_scope_user() {
-        let cli = Cli::try_parse_from([
-            "astra", "mcp", "add", "--scope", "user", "s1", "npx",
-        ])
-        .unwrap();
+        let cli =
+            Cli::try_parse_from(["astra", "mcp", "add", "--scope", "user", "s1", "npx"]).unwrap();
         match cli.command {
             Some(Command::Mcp(McpCmd::Add(ref args))) => {
                 assert_eq!(args.scope, "user");
@@ -8776,8 +8822,12 @@ total_tokens_out: 500
 
     #[test]
     fn cli_system_prompt_flag() {
-        let cli = Cli::try_parse_from(["astra", "--system-prompt", "You are a code reviewer"]).unwrap();
-        assert_eq!(cli.system_prompt.as_deref(), Some("You are a code reviewer"));
+        let cli =
+            Cli::try_parse_from(["astra", "--system-prompt", "You are a code reviewer"]).unwrap();
+        assert_eq!(
+            cli.system_prompt.as_deref(),
+            Some("You are a code reviewer")
+        );
     }
 
     #[test]
@@ -8795,8 +8845,14 @@ total_tokens_out: 500
     #[test]
     fn cli_system_prompt_with_print() {
         let cli = Cli::try_parse_from([
-            "astra", "-p", "--system-prompt", "Be concise", "--max-turns", "5",
-        ]).unwrap();
+            "astra",
+            "-p",
+            "--system-prompt",
+            "Be concise",
+            "--max-turns",
+            "5",
+        ])
+        .unwrap();
         assert!(cli.print);
         assert_eq!(cli.system_prompt.as_deref(), Some("Be concise"));
         assert_eq!(cli.max_turns, Some(5));
@@ -8841,10 +8897,19 @@ total_tokens_out: 500
     #[test]
     fn cli_all_flags_combined() {
         let cli = Cli::try_parse_from([
-            "astra", "--model", "gpt-4o", "-p", "-y",
-            "--system-prompt", "Review code", "--max-turns", "3",
-            "--output-format", "json",
-        ]).unwrap();
+            "astra",
+            "--model",
+            "gpt-4o",
+            "-p",
+            "-y",
+            "--system-prompt",
+            "Review code",
+            "--max-turns",
+            "3",
+            "--output-format",
+            "json",
+        ])
+        .unwrap();
         assert_eq!(cli.model.as_deref(), Some("gpt-4o"));
         assert!(cli.print);
         assert!(cli.yes);
@@ -8863,9 +8928,8 @@ total_tokens_out: 500
 
     #[test]
     fn cli_allowed_tools_multiple_space_separated() {
-        let cli = Cli::try_parse_from([
-            "astra", "--allowed-tools", "Bash", "Edit", "Read",
-        ]).unwrap();
+        let cli =
+            Cli::try_parse_from(["astra", "--allowed-tools", "Bash", "Edit", "Read"]).unwrap();
         assert_eq!(cli.allowed_tools, vec!["Bash", "Edit", "Read"]);
     }
 
@@ -8885,9 +8949,7 @@ total_tokens_out: 500
 
     #[test]
     fn cli_add_dir_multiple() {
-        let cli = Cli::try_parse_from([
-            "astra", "--add-dir", "/tmp/a", "/tmp/b",
-        ]).unwrap();
+        let cli = Cli::try_parse_from(["astra", "--add-dir", "/tmp/a", "/tmp/b"]).unwrap();
         assert_eq!(cli.add_dir, vec!["/tmp/a", "/tmp/b"]);
     }
 
@@ -8921,9 +8983,7 @@ total_tokens_out: 500
 
     #[test]
     fn cli_mcp_config_multiple() {
-        let cli = Cli::try_parse_from([
-            "astra", "--mcp-config", "a.json", "b.json",
-        ]).unwrap();
+        let cli = Cli::try_parse_from(["astra", "--mcp-config", "a.json", "b.json"]).unwrap();
         assert_eq!(cli.mcp_config, vec!["a.json", "b.json"]);
     }
 
@@ -8938,11 +8998,20 @@ total_tokens_out: 500
     #[test]
     fn cli_all_new_flags_combined() {
         let cli = Cli::try_parse_from([
-            "astra", "--allowed-tools", "Bash", "Edit",
-            "--add-dir", "/tmp/extra",
-            "--verbose", "--mcp-config", "mcp.json",
-            "--model", "gpt-4o", "-p",
-        ]).unwrap();
+            "astra",
+            "--allowed-tools",
+            "Bash",
+            "Edit",
+            "--add-dir",
+            "/tmp/extra",
+            "--verbose",
+            "--mcp-config",
+            "mcp.json",
+            "--model",
+            "gpt-4o",
+            "-p",
+        ])
+        .unwrap();
         assert_eq!(cli.allowed_tools, vec!["Bash", "Edit"]);
         assert_eq!(cli.add_dir, vec!["/tmp/extra"]);
         assert!(cli.verbose);
@@ -8961,9 +9030,7 @@ total_tokens_out: 500
 
     #[test]
     fn cli_disallowed_tools_multiple() {
-        let cli = Cli::try_parse_from([
-            "astra", "--disallowed-tools", "Bash", "Edit",
-        ]).unwrap();
+        let cli = Cli::try_parse_from(["astra", "--disallowed-tools", "Bash", "Edit"]).unwrap();
         assert_eq!(cli.disallowed_tools, vec!["Bash", "Edit"]);
     }
 
@@ -8976,9 +9043,14 @@ total_tokens_out: 500
     #[test]
     fn cli_allowed_and_disallowed_together() {
         let cli = Cli::try_parse_from([
-            "astra", "--allowed-tools", "Read", "Edit",
-            "--disallowed-tools", "Bash",
-        ]).unwrap();
+            "astra",
+            "--allowed-tools",
+            "Read",
+            "Edit",
+            "--disallowed-tools",
+            "Bash",
+        ])
+        .unwrap();
         assert_eq!(cli.allowed_tools, vec!["Read", "Edit"]);
         assert_eq!(cli.disallowed_tools, vec!["Bash"]);
     }
@@ -8988,9 +9060,15 @@ total_tokens_out: 500
     #[test]
     fn cli_session_id_flag() {
         let cli = Cli::try_parse_from([
-            "astra", "--session-id", "550e8400-e29b-41d4-a716-446655440000",
-        ]).unwrap();
-        assert_eq!(cli.session_id.as_deref(), Some("550e8400-e29b-41d4-a716-446655440000"));
+            "astra",
+            "--session-id",
+            "550e8400-e29b-41d4-a716-446655440000",
+        ])
+        .unwrap();
+        assert_eq!(
+            cli.session_id.as_deref(),
+            Some("550e8400-e29b-41d4-a716-446655440000")
+        );
     }
 
     #[test]
@@ -9036,9 +9114,15 @@ total_tokens_out: 500
     #[test]
     fn cli_bare_with_print_and_system_prompt() {
         let cli = Cli::try_parse_from([
-            "astra", "--bare", "-p", "--system-prompt", "Be brief",
-            "--add-dir", "/tmp/work",
-        ]).unwrap();
+            "astra",
+            "--bare",
+            "-p",
+            "--system-prompt",
+            "Be brief",
+            "--add-dir",
+            "/tmp/work",
+        ])
+        .unwrap();
         assert!(cli.bare);
         assert!(cli.print);
         assert_eq!(cli.system_prompt.as_deref(), Some("Be brief"));
@@ -9048,10 +9132,17 @@ total_tokens_out: 500
     #[test]
     fn cli_session_id_and_name_combined() {
         let cli = Cli::try_parse_from([
-            "astra", "--session-id", "123e4567-e89b-12d3-a456-426614174000",
-            "-n", "debug-session",
-        ]).unwrap();
-        assert_eq!(cli.session_id.as_deref(), Some("123e4567-e89b-12d3-a456-426614174000"));
+            "astra",
+            "--session-id",
+            "123e4567-e89b-12d3-a456-426614174000",
+            "-n",
+            "debug-session",
+        ])
+        .unwrap();
+        assert_eq!(
+            cli.session_id.as_deref(),
+            Some("123e4567-e89b-12d3-a456-426614174000")
+        );
         assert_eq!(cli.session_name.as_deref(), Some("debug-session"));
     }
 
@@ -9077,9 +9168,8 @@ total_tokens_out: 500
 
     #[test]
     fn cli_max_budget_with_print_and_turns() {
-        let cli = Cli::try_parse_from([
-            "astra", "-p", "--max-turns", "10", "--max-budget", "1.0",
-        ]).unwrap();
+        let cli = Cli::try_parse_from(["astra", "-p", "--max-turns", "10", "--max-budget", "1.0"])
+            .unwrap();
         assert!(cli.print);
         assert_eq!(cli.max_turns, Some(10));
         assert!((cli.max_budget - 1.0).abs() < f64::EPSILON);
@@ -9111,10 +9201,17 @@ total_tokens_out: 500
     #[test]
     fn repl_state_auto_approve_env_activates_auto_mode() {
         // When ASTRA_AUTO_APPROVE=1, ReplState should start in Auto mode
-        unsafe { std::env::set_var("ASTRA_AUTO_APPROVE", "1"); }
+        unsafe {
+            std::env::set_var("ASTRA_AUTO_APPROVE", "1");
+        }
         let state = ReplState::default();
-        unsafe { std::env::remove_var("ASTRA_AUTO_APPROVE"); }
-        assert_eq!(state.perm_manager.mode(), permission_manager::PermissionMode::Auto);
+        unsafe {
+            std::env::remove_var("ASTRA_AUTO_APPROVE");
+        }
+        assert_eq!(
+            state.perm_manager.mode(),
+            permission_manager::PermissionMode::Auto
+        );
     }
 
     #[tokio::test]

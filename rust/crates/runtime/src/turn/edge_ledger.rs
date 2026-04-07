@@ -750,12 +750,24 @@ mod tests {
     #[test]
     fn provider_preserves_reasoning_moonshot() {
         assert!(super::provider_preserves_reasoning("moonshot", "kimi-k2.5"));
-        assert!(super::provider_preserves_reasoning("moonshot", "kimi-k2-thinking"));
-        assert!(super::provider_preserves_reasoning("moonshot", "some-other-model"));
+        assert!(super::provider_preserves_reasoning(
+            "moonshot",
+            "kimi-k2-thinking"
+        ));
+        assert!(super::provider_preserves_reasoning(
+            "moonshot",
+            "some-other-model"
+        ));
         assert!(super::provider_preserves_reasoning("other", "kimi-k2.5"));
         assert!(!super::provider_preserves_reasoning("openai", "gpt-4"));
-        assert!(!super::provider_preserves_reasoning("deepseek", "deepseek-chat"));
-        assert!(!super::provider_preserves_reasoning("anthropic", "claude-3"));
+        assert!(!super::provider_preserves_reasoning(
+            "deepseek",
+            "deepseek-chat"
+        ));
+        assert!(!super::provider_preserves_reasoning(
+            "anthropic",
+            "claude-3"
+        ));
     }
 
     #[test]

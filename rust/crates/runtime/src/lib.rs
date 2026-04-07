@@ -58,6 +58,7 @@ pub mod sandbox;
 pub mod semantic_dedup;
 pub mod skill_config;
 pub mod skills;
+pub mod str_preview;
 pub mod streaming;
 pub mod text_tokenize;
 pub mod tool_sandbox;

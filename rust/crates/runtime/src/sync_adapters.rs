@@ -14,6 +14,7 @@ use crate::pipeline::calibration::ProgressiveCalibrator;
 use crate::pipeline::entity::EntityGraph;
 use crate::pipeline::pattern::PatternLibrary;
 use crate::pipeline::persistence::{self, LearningSnapshot, ToolHealthEntry};
+use crate::str_preview::prefix_chars;
 
 use astra_services::event_ingestion;
 use astra_services::state_sync::{PlanTemplateSyncRow, StateSyncService};
@@ -25,7 +26,8 @@ use astra_services::{
 
 fn payload_sync_version(data: &[u8]) -> u64 {
     let h = sha256_checksum(data);
-    u64::from_str_radix(&h[..16], 16).unwrap_or(1)
+    let prefix = prefix_chars(&h, 16);
+    u64::from_str_radix(&prefix, 16).unwrap_or(1)
 }
 
 /// Wire format for [`SyncDomain::Tasks`] push; pull uses a plain JSON array of [`TaskRecord`].

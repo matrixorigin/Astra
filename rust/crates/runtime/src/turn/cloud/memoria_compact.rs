@@ -29,6 +29,7 @@ use super::compaction::{
 };
 use super::summary::SummaryLlmClient;
 use crate::prompts::{CompactConfig, CompactionTier};
+use crate::str_preview::truncate_str;
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -552,18 +553,6 @@ fn build_working_memory_content(messages: &[Value], max_chars: usize) -> String 
 
     parts.reverse();
     parts.join("\n")
-}
-
-fn truncate_str(s: &str, max_bytes: usize) -> &str {
-    if s.len() <= max_bytes {
-        return s;
-    }
-    // Walk back from max_bytes to find a valid char boundary
-    let mut end = max_bytes;
-    while end > 0 && !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    &s[..end]
 }
 
 // ---------------------------------------------------------------------------
@@ -1909,38 +1898,6 @@ mod tests {
         let r = build_working_memory_content(&msgs, 100);
         // Should be capped and not include all content
         assert!(r.len() <= 500); // generous but capped
-    }
-
-    // ──────────────────────────────────────────────────────────
-    // truncate_str
-    // ──────────────────────────────────────────────────────────
-
-    #[test]
-    fn truncate_str_within_limit() {
-        assert_eq!(truncate_str("hello", 10), "hello");
-    }
-
-    #[test]
-    fn truncate_str_at_boundary() {
-        assert_eq!(truncate_str("hello", 5), "hello");
-    }
-
-    #[test]
-    fn truncate_str_beyond() {
-        assert_eq!(truncate_str("hello world", 5), "hello");
-    }
-
-    #[test]
-    fn truncate_str_empty() {
-        assert_eq!(truncate_str("", 10), "");
-    }
-
-    #[test]
-    fn truncate_str_unicode_boundary() {
-        let s = "αβγδ"; // each α is 2 bytes
-        let r = truncate_str(s, 3);
-        // Can't cut mid-codepoint; walks back to last valid boundary
-        assert_eq!(r, "α"); // 2 bytes fits, 4 doesn't
     }
 
     // ──────────────────────────────────────────────────────────

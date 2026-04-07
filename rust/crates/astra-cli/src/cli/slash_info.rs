@@ -863,11 +863,7 @@ fn print_turn_trace(ev: &session_journal::JournalEvent, journal_seq: Option<u32>
             // Show args preview if available
             if let Some(ref args) = tc.args_preview {
                 let sub_branch = if is_last { "   " } else { "│  " };
-                let args_truncated = if args.len() > 60 {
-                    format!("{}…", &args[..59])
-                } else {
-                    args.clone()
-                };
+                let args_truncated = truncate_str(args, 59);
                 eprintln!(
                     "    {}    {} {}",
                     " ".repeat(8),
@@ -877,11 +873,7 @@ fn print_turn_trace(ev: &session_journal::JournalEvent, journal_seq: Option<u32>
             }
 
             if let Some(ref err) = tc.error {
-                let err_preview = if err.len() > 50 {
-                    format!("{}…", &err[..50])
-                } else {
-                    err.clone()
-                };
+                let err_preview = truncate_str(err, 50);
                 let sub_branch = if is_last { "   " } else { "│  " };
                 eprintln!(
                     "    {}    {} {}",
@@ -974,19 +966,11 @@ pub(super) async fn handle_info_command(
                         found += 1;
                         eprintln!("  {}", format!("Turn {turn_n}").bold());
                         if matches_user {
-                            let u = if user.len() > 120 {
-                                format!("{}…", &user[..120])
-                            } else {
-                                user.clone()
-                            };
+                            let u = truncate_str(user, 120);
                             eprintln!("  {} {}", "❯".cyan(), u);
                         }
                         if matches_asst {
-                            let a = if asst.len() > 120 {
-                                format!("{}…", &asst[..120])
-                            } else {
-                                asst.clone()
-                            };
+                            let a = truncate_str(asst, 120);
                             eprintln!("    {}", a.dim());
                         }
                         eprintln!();
@@ -1004,16 +988,8 @@ pub(super) async fn handle_info_command(
                 );
                 for (i, (user, asst)) in state.history.iter().enumerate() {
                     let turn_n = i + 1;
-                    let u = if user.len() > 80 {
-                        format!("{}…", &user[..80])
-                    } else {
-                        user.clone()
-                    };
-                    let a = if asst.len() > 80 {
-                        format!("{}…", &asst[..80])
-                    } else {
-                        asst.clone()
-                    };
+                    let u = truncate_str(user, 80);
+                    let a = truncate_str(asst, 80);
                     eprintln!("  {}", format!("Turn {turn_n}").bold());
                     eprintln!("  {} {}", "❯".cyan(), u);
                     eprintln!("    {}", a.dim());
@@ -1319,25 +1295,13 @@ pub(super) async fn handle_info_command(
             let session_display = state
                 .session_id
                 .as_deref()
-                .map(|s| {
-                    if s.len() > 8 {
-                        s[..8].to_string()
-                    } else {
-                        s.to_string()
-                    }
-                })
+                .map(|s| prefix_chars(s, 8))
                 .unwrap_or_else(|| "none".to_string());
             let model_display = state.model.clone().unwrap_or_else(|| "default".to_string());
             let run_display = state
                 .run_id
                 .as_deref()
-                .map(|s| {
-                    if s.len() > 8 {
-                        s[..8].to_string()
-                    } else {
-                        s.to_string()
-                    }
-                })
+                .map(|s| prefix_chars(s, 8))
                 .unwrap_or_else(|| "none".to_string());
             let msg_count = state.history.len() * 2;
             // Estimate tokens from history
@@ -1535,11 +1499,7 @@ pub(super) async fn handle_info_command(
                     );
                     for (i, (user, _)) in state.history.iter().enumerate() {
                         let turn_n = i + 1;
-                        let u = if user.len() > 60 {
-                            format!("{}…", &user[..60])
-                        } else {
-                            user.clone()
-                        };
+                        let u = truncate_str(user, 60);
                         eprintln!(
                             "  {} {} {}",
                             format!("{turn_n}").bold(),

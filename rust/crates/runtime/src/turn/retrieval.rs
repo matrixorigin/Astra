@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use serde_json::{Map, Value};
 
+use crate::str_preview::prefix_chars;
 use crate::text_tokenize::{build_tf, tokenize};
 
 // ── Type aliases ─────────────────────────────────────────────────────────────
@@ -251,10 +252,6 @@ fn assemble_parts(scored: &[(f64, &Map<String, Value>)], budget_chars: usize) ->
     } else {
         Some(format!("{RETRIEVAL_HEADER}{}", parts.join("\n")))
     }
-}
-
-fn prefix_chars(text: &str, limit: usize) -> String {
-    text.chars().take(limit).collect()
 }
 
 // ── Entity Boost Terms ──────────────────────────────────────────────────────
