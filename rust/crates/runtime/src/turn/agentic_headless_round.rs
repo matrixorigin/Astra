@@ -431,6 +431,21 @@ pub async fn run_agentic_headless_tool_round<E: EdgeToolRoundRow>(
         }
 
         let model_result_str = tool_result_content_for_model(&name, &result_str);
+
+        // Persist large tool results to disk, replacing inline content with
+        // a compact preview + file reference to keep the context window lean.
+        let model_result_str = if let Some(sid) = current_session_id {
+            let session_dir = astra_services::session_journal::local_sessions_dir().join(sid);
+            match super::tool_result_storage::maybe_persist_tool_result(
+                &session_dir, &id, &name, &model_result_str,
+            ) {
+                Some(replacement) => replacement,
+                None => model_result_str,
+            }
+        } else {
+            model_result_str
+        };
+
         let (tool_msg, tr) = openai_tool_roundtrip_values(&id, &name, &model_result_str);
         messages.push(tool_msg);
         tool_results.push(tr);
