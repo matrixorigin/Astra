@@ -118,8 +118,8 @@ pub fn all_tool_schemas() -> Vec<Value> {
                     "type": "object",
                     "properties": {
                         "path": {"type": "string", "description": "File path relative to project root"},
-                        "start_line": {"type": "integer", "description": "First line to read (1-based, optional)"},
-                        "end_line": {"type": "integer", "description": "Last line to read (inclusive, optional)"},
+                        "start_line": {"type": "integer", "minimum": 1, "description": "First line to read (1-based, optional)"},
+                        "end_line": {"type": "integer", "minimum": 1, "description": "Last line to read (inclusive, optional)"},
                         "outline": {"type": "boolean", "description": "If true, return only function/class/struct/trait signatures with line numbers instead of full content. Ideal for understanding file structure."}
                     },
                     "required": ["path"]
@@ -231,7 +231,7 @@ pub fn all_tool_schemas() -> Vec<Value> {
                         "max_matches": {"type": "integer", "description": "Max matches per file (limits output, saves tokens)"},
                         "scope_context": {"type": "boolean", "description": "Annotate each match with its containing function/class name (tree-sitter)"},
                         "output_mode": {"type": "string", "enum": ["content", "files_with_matches", "count"], "description": "Output mode: 'content' (default, matching lines), 'files_with_matches' (file paths only), 'count' (match counts per file)"},
-                        "offset": {"type": "integer", "description": "Skip first N result lines (for pagination)"}
+                        "offset": {"type": "integer", "minimum": 0, "description": "Skip first N result lines (for pagination)"}
                     },
                     "required": ["pattern"]
                 }
@@ -499,8 +499,8 @@ pub fn all_tool_schemas() -> Vec<Value> {
                     "properties": {
                         "path": {"type": "string", "description": "File path relative to project root"},
                         "symbol": {"type": "string", "description": "Symbol name to analyze (function/method name)"},
-                        "start_line": {"type": "integer", "description": "Start line (alternative to symbol name)"},
-                        "end_line": {"type": "integer", "description": "End line (alternative to symbol name)"},
+                        "start_line": {"type": "integer", "minimum": 1, "description": "Start line (alternative to symbol name)"},
+                        "end_line": {"type": "integer", "minimum": 1, "description": "End line (alternative to symbol name)"},
                         "callers": {"type": "boolean", "description": "If true, also find functions that CALL this symbol (reverse call graph)."},
                         "scope": {"type": "string", "enum": ["file", "project"], "description": "Scope for caller search: 'file' (default, fast) or 'project' (cross-file, thorough). Only used with callers=true."}
                     },
