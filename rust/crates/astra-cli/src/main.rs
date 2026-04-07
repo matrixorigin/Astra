@@ -179,6 +179,12 @@ struct Cli {
     /// Auto-approve tool calls without prompting
     #[arg(short = 'y', long = "yes")]
     yes: bool,
+    /// System prompt to prepend (useful with --print for scripting)
+    #[arg(long = "system-prompt")]
+    system_prompt: Option<String>,
+    /// Maximum agentic turns (useful with --print to limit cost)
+    #[arg(long = "max-turns")]
+    max_turns: Option<usize>,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -5321,8 +5327,15 @@ async fn main() {
         continue_last,
         resume,
         yes: auto_approve,
+        system_prompt,
+        max_turns,
         command,
     } = cli;
+
+    // --max-turns: override via env var before RuntimeLimits singleton is initialized
+    if let Some(turns) = max_turns {
+        unsafe { std::env::set_var("MO_MAX_TURNS", turns.to_string()); }
+    }
 
     // Resolve model: --model flag > config default_model > None
     let resolved_model = cli_model.or_else(|| {
@@ -5331,7 +5344,7 @@ async fn main() {
 
     // --print mode: headless single-shot, always auto-approve (can't prompt)
     if print_mode {
-        match run_print_mode(&api, profile.as_deref(), &output_format, resolved_model.as_deref(), command).await {
+        match run_print_mode(&api, profile.as_deref(), &output_format, resolved_model.as_deref(), system_prompt.as_deref(), command).await {
             Ok(code) => std::process::exit(i32::from(code)),
             Err(e) => {
                 eprintln!("{}", format!("Error: {e}").red());
@@ -5375,7 +5388,7 @@ async fn main() {
         }
     }
 
-    match execute_cli_command(command, profile, resolved_model, auto_approve, &api).await {
+    match execute_cli_command(command, profile, resolved_model, auto_approve, system_prompt, &api).await {
         Ok(exit_code) => {
             std::process::exit(i32::from(exit_code));
         }
@@ -6214,6 +6227,7 @@ mod tests {
             Some("nonexistent-profile".to_string()),
             None,
             false,
+            None,
             &api,
         )
         .await;
@@ -8192,5 +8206,33 @@ total_tokens_out: 500
     fn cli_whoami_subcommand() {
         let cli = Cli::try_parse_from(["astra", "whoami"]).unwrap();
         assert!(matches!(cli.command, Some(Command::Whoami)));
+    }
+
+    #[test]
+    fn cli_system_prompt_flag() {
+        let cli = Cli::try_parse_from(["astra", "--system-prompt", "You are a code reviewer"]).unwrap();
+        assert_eq!(cli.system_prompt.as_deref(), Some("You are a code reviewer"));
+    }
+
+    #[test]
+    fn cli_max_turns_flag() {
+        let cli = Cli::try_parse_from(["astra", "--max-turns", "10"]).unwrap();
+        assert_eq!(cli.max_turns, Some(10));
+    }
+
+    #[test]
+    fn cli_max_turns_default_is_none() {
+        let cli = Cli::try_parse_from(["astra"]).unwrap();
+        assert!(cli.max_turns.is_none());
+    }
+
+    #[test]
+    fn cli_system_prompt_with_print() {
+        let cli = Cli::try_parse_from([
+            "astra", "-p", "--system-prompt", "Be concise", "--max-turns", "5",
+        ]).unwrap();
+        assert!(cli.print);
+        assert_eq!(cli.system_prompt.as_deref(), Some("Be concise"));
+        assert_eq!(cli.max_turns, Some(5));
     }
 }
