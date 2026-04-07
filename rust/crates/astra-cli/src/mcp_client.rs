@@ -171,26 +171,30 @@ fn default_true() -> bool {
 
 /// MCP client handler that tracks tool list change notifications.
 ///
-/// When the server sends `notifications/tools/list_changed` or
-/// `notifications/prompts/list_changed`, the handler sets the corresponding
-/// flag.  The connection owner can poll these flags and refresh as needed.
+/// When the server sends change notifications for tools, prompts, or resources,
+/// the handler sets the corresponding flag. The connection owner can poll these
+/// flags and refresh as needed.
 #[derive(Debug, Clone)]
 struct ChangeHandler {
     tools_changed: Arc<AtomicBool>,
     prompts_changed: Arc<AtomicBool>,
+    resources_changed: Arc<AtomicBool>,
 }
 
 impl ChangeHandler {
-    fn new() -> (Self, Arc<AtomicBool>, Arc<AtomicBool>) {
+    fn new() -> (Self, Arc<AtomicBool>, Arc<AtomicBool>, Arc<AtomicBool>) {
         let tools = Arc::new(AtomicBool::new(false));
         let prompts = Arc::new(AtomicBool::new(false));
+        let resources = Arc::new(AtomicBool::new(false));
         (
             Self {
                 tools_changed: tools.clone(),
                 prompts_changed: prompts.clone(),
+                resources_changed: resources.clone(),
             },
             tools,
             prompts,
+            resources,
         )
     }
 }
@@ -211,6 +215,23 @@ impl ClientHandler for ChangeHandler {
         self.prompts_changed.store(true, Ordering::Release);
         std::future::ready(())
     }
+
+    fn on_resource_list_changed(
+        &self,
+        _context: NotificationContext<RoleClient>,
+    ) -> impl std::future::Future<Output = ()> + Send + '_ {
+        self.resources_changed.store(true, Ordering::Release);
+        std::future::ready(())
+    }
+
+    fn on_resource_updated(
+        &self,
+        _params: rmcp::model::ResourceUpdatedNotificationParam,
+        _context: NotificationContext<RoleClient>,
+    ) -> impl std::future::Future<Output = ()> + Send + '_ {
+        self.resources_changed.store(true, Ordering::Release);
+        std::future::ready(())
+    }
 }
 
 /// Running MCP client connection.
@@ -229,6 +250,8 @@ pub struct McpConnection {
     tools_changed: Arc<AtomicBool>,
     /// Flag set by the notification handler when the server's prompt list changes.
     prompts_changed: Arc<AtomicBool>,
+    /// Flag set by the notification handler when the server's resource list changes.
+    resources_changed: Arc<AtomicBool>,
 }
 
 impl McpConnection {
@@ -281,6 +304,16 @@ impl McpConnection {
     /// Consume the prompts_changed flag (returns previous value).
     pub fn consume_prompt_change(&self) -> bool {
         self.prompts_changed.swap(false, Ordering::AcqRel)
+    }
+
+    /// Whether the server has signalled a resource list/update change.
+    pub fn has_pending_resource_change(&self) -> bool {
+        self.resources_changed.load(Ordering::Acquire)
+    }
+
+    /// Consume the resources_changed flag (returns previous value).
+    pub fn consume_resource_change(&self) -> bool {
+        self.resources_changed.swap(false, Ordering::AcqRel)
     }
 
     /// Call a tool on this server.
@@ -773,6 +806,21 @@ impl McpClientManager {
         }
         changed
     }
+
+    /// Check all connections for resource change notifications and consume
+    /// the flags. Returns the names of servers whose resources changed.
+    pub fn consume_resource_changes(&self) -> Vec<String> {
+        let mut changed = Vec::new();
+        for (name, conn) in &self.connections {
+            if conn.consume_resource_change() {
+                changed.push(name.clone());
+            }
+        }
+        if !changed.is_empty() {
+            eprintln!("  ↻ Resources changed on: {}", changed.join(", "));
+        }
+        changed
+    }
 }
 
 /// Thread-safe MCP client manager.
@@ -887,7 +935,7 @@ async fn connect_stdio(
     let transport = TokioChildProcess::new(cmd).map_err(|e| McpError::Spawn(e.to_string()))?;
 
     // Connect as MCP client with change notification handler
-    let (handler, tools_changed, prompts_changed) = ChangeHandler::new();
+    let (handler, tools_changed, prompts_changed, resources_changed) = ChangeHandler::new();
     let running = serve_client(handler, transport)
         .await
         .map_err(|e| McpError::Initialize(e.to_string()))?;
@@ -905,6 +953,7 @@ async fn connect_stdio(
         config,
         tools_changed,
         prompts_changed,
+        resources_changed,
     })
 }
 
@@ -949,7 +998,7 @@ async fn connect_sse(
     let transport = StreamableHttpClientTransport::from_config(transport_config);
 
     // Connect as MCP client with change notification handler
-    let (handler, tools_changed, prompts_changed) = ChangeHandler::new();
+    let (handler, tools_changed, prompts_changed, resources_changed) = ChangeHandler::new();
     let running = serve_client(handler, transport)
         .await
         .map_err(|e| McpError::Initialize(format!("SSE connect to {url}: {e}")))?;
@@ -967,6 +1016,7 @@ async fn connect_sse(
         config,
         tools_changed,
         prompts_changed,
+        resources_changed,
     })
 }
 
@@ -1078,7 +1128,7 @@ async fn connect_ws(
     });
 
     // Connect as MCP client with change notification handler
-    let (handler, tools_changed, prompts_changed) = ChangeHandler::new();
+    let (handler, tools_changed, prompts_changed, resources_changed) = ChangeHandler::new();
     let running = serve_client(handler, (rmcp_read, rmcp_write))
         .await
         .map_err(|e| McpError::Initialize(format!("MCP init over WebSocket {url}: {e}")))?;
@@ -1094,6 +1144,7 @@ async fn connect_ws(
         config,
         tools_changed,
         prompts_changed,
+        resources_changed,
     })
 }
 
@@ -2028,46 +2079,62 @@ mcp_servers:
 
     #[test]
     fn change_handler_initial_state() {
-        let (_handler, tools, prompts) = ChangeHandler::new();
+        let (_handler, tools, prompts, resources) = ChangeHandler::new();
         assert!(!tools.load(Ordering::Acquire));
         assert!(!prompts.load(Ordering::Acquire));
+        assert!(!resources.load(Ordering::Acquire));
     }
 
     #[test]
     fn change_handler_sets_tools_flag() {
-        let (handler, tools, _prompts) = ChangeHandler::new();
+        let (handler, tools, _prompts, _resources) = ChangeHandler::new();
         handler.tools_changed.store(true, Ordering::Release);
         assert!(tools.load(Ordering::Acquire));
     }
 
     #[test]
     fn change_handler_sets_prompts_flag() {
-        let (handler, _tools, prompts) = ChangeHandler::new();
+        let (handler, _tools, prompts, _resources) = ChangeHandler::new();
         handler.prompts_changed.store(true, Ordering::Release);
         assert!(prompts.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn change_handler_sets_resources_flag() {
+        let (handler, _tools, _prompts, resources) = ChangeHandler::new();
+        handler.resources_changed.store(true, Ordering::Release);
+        assert!(resources.load(Ordering::Acquire));
     }
 
     #[test]
     fn change_handler_flags_independent() {
-        let (handler, tools, prompts) = ChangeHandler::new();
+        let (handler, tools, prompts, resources) = ChangeHandler::new();
         handler.tools_changed.store(true, Ordering::Release);
         assert!(tools.load(Ordering::Acquire));
         assert!(!prompts.load(Ordering::Acquire));
+        assert!(!resources.load(Ordering::Acquire));
 
         handler.prompts_changed.store(true, Ordering::Release);
         assert!(prompts.load(Ordering::Acquire));
+        assert!(!resources.load(Ordering::Acquire));
+
+        handler.resources_changed.store(true, Ordering::Release);
+        assert!(resources.load(Ordering::Acquire));
     }
 
     #[test]
     fn change_handler_clone_shares_flags() {
-        let (handler, tools, prompts) = ChangeHandler::new();
+        let (handler, tools, prompts, resources) = ChangeHandler::new();
         let cloned = handler.clone();
         cloned.tools_changed.store(true, Ordering::Release);
         cloned.prompts_changed.store(true, Ordering::Release);
+        cloned.resources_changed.store(true, Ordering::Release);
         assert!(tools.load(Ordering::Acquire));
         assert!(prompts.load(Ordering::Acquire));
+        assert!(resources.load(Ordering::Acquire));
         assert!(handler.tools_changed.load(Ordering::Acquire));
         assert!(handler.prompts_changed.load(Ordering::Acquire));
+        assert!(handler.resources_changed.load(Ordering::Acquire));
     }
 
     #[test]
