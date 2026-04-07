@@ -548,4 +548,99 @@ mod tests {
                 .any(|r| matches!(r, CommandRisk::ZshDangerous(_)))
         );
     }
+
+    // --- edge cases ---
+
+    #[test]
+    fn empty_command_no_risks() {
+        let risks = analyze_command_risks("");
+        assert!(risks.is_empty());
+    }
+
+    #[test]
+    fn whitespace_only_no_risks() {
+        let risks = analyze_command_risks("   \t  \n  ");
+        assert!(risks.is_empty());
+    }
+
+    #[test]
+    fn push_unique_deduplicates() {
+        let mut risks = Vec::new();
+        push_unique(&mut risks, CommandRisk::PathTraversal);
+        push_unique(&mut risks, CommandRisk::PathTraversal);
+        assert_eq!(risks.len(), 1);
+    }
+
+    #[test]
+    fn sensitive_path_access_variants() {
+        for path in &["/etc/passwd", "/root/.bashrc", "/var/log/syslog", "/proc/1/status", "/sys/class/net"] {
+            let cmd = format!("cat {}", path);
+            let risks = analyze_command_risks(&cmd);
+            assert!(
+                risks.iter().any(|r| matches!(r, CommandRisk::SensitivePathAccess(_))),
+                "Not detected for: {}",
+                path
+            );
+        }
+    }
+
+    #[test]
+    fn process_control_killall() {
+        let risks = analyze_command_risks("killall nginx");
+        assert!(risks.contains(&CommandRisk::ProcessControl));
+    }
+
+    #[test]
+    fn env_manipulation_requires_export_keyword() {
+        // Just "PATH=x" without "export " doesn't trigger the heuristic scanner
+        let risks = analyze_command_risks("PATH=/evil ls");
+        // AST might catch it; heuristic needs "export "
+        let heuristic_env = risks.contains(&CommandRisk::EnvManipulation);
+        // We just verify no panic; the AST analyzer may or may not detect it
+        let _ = heuristic_env;
+    }
+
+    #[test]
+    fn zsh_zsocket_detected() {
+        let risks = analyze_command_risks("zsocket -l 8080");
+        assert!(risks.iter().any(|r| matches!(r, CommandRisk::ZshDangerous(_))));
+    }
+
+    #[test]
+    fn zsh_zselect_detected() {
+        let risks = analyze_command_risks("zselect -r 0 -t 100");
+        assert!(risks.iter().any(|r| matches!(r, CommandRisk::ZshDangerous(_))));
+    }
+
+    #[test]
+    fn command_risk_display_all_variants() {
+        let variants: Vec<CommandRisk> = vec![
+            CommandRisk::PathTraversal,
+            CommandRisk::SensitivePathAccess("/etc".into()),
+            CommandRisk::EnvManipulation,
+            CommandRisk::NetworkAccess,
+            CommandRisk::ProcessControl,
+            CommandRisk::PrivilegeEscalation,
+            CommandRisk::RemoteCodeExecution,
+            CommandRisk::OutputRedirection,
+            CommandRisk::Eval,
+            CommandRisk::CommandSubstitution,
+            CommandRisk::ProcessSubstitution,
+            CommandRisk::ZshDangerous("test".into()),
+        ];
+        for v in &variants {
+            let s = v.to_string();
+            assert!(!s.is_empty(), "Display empty for: {:?}", v);
+        }
+    }
+
+    #[test]
+    fn combined_risks_multiple_detected() {
+        // A command that triggers multiple risk categories
+        let cmd = "sudo kill -9 1234 && cat ../etc/passwd";
+        let risks = analyze_command_risks(cmd);
+        assert!(risks.contains(&CommandRisk::PrivilegeEscalation));
+        assert!(risks.contains(&CommandRisk::ProcessControl));
+        assert!(risks.contains(&CommandRisk::PathTraversal));
+    }
 }

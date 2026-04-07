@@ -284,4 +284,75 @@ mod tests {
         assert_eq!(p.max_execution_secs, 15.0);
         assert!(!p.is_path_allowed(std::path::Path::new("/etc/passwd")));
     }
+
+    // --- edge cases ---
+
+    #[test]
+    fn sandbox_mode_ordering() {
+        // Modes are ordered: Permissive < Standard < Strict
+        assert!(SandboxMode::Permissive < SandboxMode::Standard);
+        assert!(SandboxMode::Standard < SandboxMode::Strict);
+    }
+
+    #[test]
+    fn strict_max_output_smaller_than_standard() {
+        let standard = SandboxPolicy::for_project("/proj");
+        let strict = SandboxPolicy::strict("/proj");
+        assert!(strict.max_output_bytes < standard.max_output_bytes);
+    }
+
+    #[test]
+    fn strict_timeout_shorter_than_standard() {
+        let standard = SandboxPolicy::for_project("/proj");
+        let strict = SandboxPolicy::strict("/proj");
+        assert!(strict.max_execution_secs < standard.max_execution_secs);
+    }
+
+    #[test]
+    fn standard_allows_var_tmp_but_strict_does_not() {
+        let standard = SandboxPolicy::for_project("/proj");
+        let strict = SandboxPolicy::strict("/proj");
+        let var_tmp = std::path::Path::new("/var/tmp/some_file");
+        assert!(standard.is_path_allowed(var_tmp));
+        assert!(!strict.is_path_allowed(var_tmp));
+    }
+
+    #[test]
+    fn empty_env_allowlist_blocks_non_baseline() {
+        let mut p = SandboxPolicy::for_project("/proj");
+        p.env_allowlist = Some(Vec::new());
+        assert!(p.is_env_allowed("PATH")); // baseline
+        assert!(!p.is_env_allowed("CUSTOM_VAR")); // not in allowlist
+    }
+
+    #[test]
+    fn project_root_exact_match_allowed() {
+        let p = SandboxPolicy::strict("/home/user/proj");
+        // Exact project root itself
+        assert!(p.is_path_allowed(std::path::Path::new("/home/user/proj")));
+    }
+
+    #[test]
+    fn permissive_no_allowed_paths_but_allows_all() {
+        let p = SandboxPolicy::permissive("/proj");
+        assert!(p.allowed_paths.is_empty());
+        // Yet allows any path due to Permissive mode
+        assert!(p.is_path_allowed(std::path::Path::new("/anywhere")));
+    }
+
+    #[test]
+    fn env_baseline_covers_matrixone_vars() {
+        let p = SandboxPolicy::strict("/proj");
+        for var in &["MATRIXONE_HOST", "MATRIXONE_PORT", "MATRIXONE_USER", "MATRIXONE_PASSWORD", "MATRIXONE_DATABASE"] {
+            assert!(p.is_env_allowed(var), "Baseline missing: {}", var);
+        }
+    }
+
+    #[test]
+    fn community_tier_allows_network() {
+        use crate::skills::manifest::TrustTier;
+        let p = SandboxPolicy::for_trust_tier(&TrustTier::Community, "/proj");
+        // Community uses Standard mode which allows network
+        assert!(p.network_allowed);
+    }
 }
