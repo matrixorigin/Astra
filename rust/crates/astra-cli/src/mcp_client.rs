@@ -673,10 +673,7 @@ impl McpClientManager {
             }
         }
         if !refreshed.is_empty() {
-            eprintln!(
-                "  ↻ Refreshed tool lists for: {}",
-                refreshed.join(", ")
-            );
+            eprintln!("  ↻ Refreshed tool lists for: {}", refreshed.join(", "));
         }
         refreshed
     }
