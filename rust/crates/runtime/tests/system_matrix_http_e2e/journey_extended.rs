@@ -58,6 +58,63 @@ pub async fn run_session_cancel_then_delete() {
 }
 
 /// Unauthenticated `/sessions`, duplicate register, and bad password login (real DB + services).
+/// Memory proxy must overwrite spoofed `user_id` / `session_id` with the authenticated user (real
+/// `MemoriaForwarder` + JWT). Replaces stub `memory_contract` security coverage.
+pub async fn run_memory_proxy_user_isolation() {
+    let b = bootstrap().await;
+    let ctx = &b.ctx;
+    let app = &ctx.app;
+    let auth = &b.auth_header;
+    let user_id = ctx.user_id.as_str();
+
+    let (st_unauth, j_unauth) = post_json(
+        app,
+        "/memory/store",
+        None,
+        json!({ "content": "x", "memory_type": "semantic" }),
+    )
+    .await;
+    assert_eq!(
+        st_unauth,
+        StatusCode::UNAUTHORIZED,
+        "memory without auth: {j_unauth}"
+    );
+
+    let before = ctx.memoria.calls.lock().await.len();
+    let (st_spoof, j_spoof) = post_json(
+        app,
+        "/memory/store",
+        Some(auth.as_str()),
+        json!({
+            "content": "spoof probe",
+            "memory_type": "semantic",
+            "user_id": "victim-user-id",
+            "session_id": "victim-session-id"
+        }),
+    )
+    .await;
+    assert_eq!(st_spoof, StatusCode::OK, "memory store: {j_spoof}");
+
+    let calls = ctx.memoria.calls.lock().await;
+    assert!(
+        calls.len() > before,
+        "memoria forwarder should record /memory/store"
+    );
+    let (_, body) = calls.last().expect("last memoria call");
+    assert_eq!(
+        body["user_id"].as_str(),
+        Some(user_id),
+        "spoofed user_id must be replaced: {body}"
+    );
+    assert_eq!(
+        body["session_id"].as_str(),
+        Some(user_id),
+        "spoofed session_id must be replaced with authenticated user_id: {body}"
+    );
+
+    ctx.pool.close().await;
+}
+
 pub async fn run_auth_and_session_negative_paths() {
     let b = bootstrap().await;
     let ctx = &b.ctx;

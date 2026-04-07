@@ -42,7 +42,7 @@
 
 **修复**: `auth_handlers.rs` 中 `or_insert_with` → `insert`，强制覆盖 `user_id`/`session_id`。
 
-**测试**: `memory_contract.rs::memory_proxy_overwrites_spoofed_user_id`
+**测试**: `system_matrix_http_e2e` 中 `e2e_matrix_memory_proxy_user_isolation`（`ASTRA_SYSTEM_MATRIX_E2E=1`）
 
 ---
 
@@ -195,7 +195,7 @@ introspection 模块已去重（-1831 行）。
 | `inprocess_hook_contract.rs` | 5 | hook side effects |
 | `memory_prefetch_contract.rs` | 8 | e2e with mock Memoria |
 | `bridge_inprocess.rs` (inline) | 11 | entity extraction, merge, memory section |
-| `memory_contract.rs` | +1 | spoofed user_id 安全测试 |
+| `system_matrix_http_e2e` | +1 | memory 代理 spoofed user_id（见 `e2e_matrix_memory_proxy_user_isolation`） |
 | `persist_counter_contract.rs` | 5 | 持久化计数器 |
 | `shared_pool_migration_contract.rs` | 4 | SharedPool 迁移 API |
 | `astra/main.rs` (inline) | +18 | mock HTTP: auth, SSE, slash commands |

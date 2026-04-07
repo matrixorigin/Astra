@@ -16,6 +16,9 @@
 //! - **`e2e_matrix_auth_session_negative_paths`** — `GET /sessions` without auth (401), duplicate
 //!   `POST /auth/register` (400), bad `POST /auth/login` (401), then successful login (replaces stub
 //!   `auth_contract` / `session_contract` negative coverage).
+//! - **`e2e_matrix_memory_proxy_user_isolation`** — unauthenticated memory returns 401; spoofed
+//!   `user_id` / `session_id` in body are overwritten to JWT user on forward (replaces `memory_contract`
+//!   isolation tests).
 //!
 //! Session list/get/put, close/resume, activity, and DB checks for close/resume live only in the full
 //! journey (not duplicated in a separate test).
@@ -88,4 +91,11 @@ async fn e2e_matrix_chat_stream_session_info() {
 async fn e2e_matrix_auth_session_negative_paths() {
     require_system_e2e_env();
     journey_extended::run_auth_and_session_negative_paths().await;
+}
+
+#[tokio::test]
+#[ignore = "live MatrixOne + full secrets; ASTRA_SYSTEM_MATRIX_E2E=1 — see module doc"]
+async fn e2e_matrix_memory_proxy_user_isolation() {
+    require_system_e2e_env();
+    journey_extended::run_memory_proxy_user_isolation().await;
 }

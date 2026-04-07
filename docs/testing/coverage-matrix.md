@@ -15,6 +15,21 @@ Legend: **E2E** = `rust/crates/runtime/tests/system_matrix_http_e2e/` with `ASTR
 | Agents CRUD + DB | `journey_full` + `agent_agents` | `agent_crud_contract` | — |
 | Events create/get/list/causal chain | `journey_full` | `event_crud_contract` | — |
 
+## Product API (context, decisions, memory proxy, jobs, sandbox, …)
+
+| Capability | E2E | Removed stub tests |
+|------------|-----|-------------------|
+| Context + decisions + DB | `journey_full` | `context_contract`, `decisions_contract` |
+| Memory proxy isolation (`user_id` / `session_id` overwrite) | `journey_extended::run_memory_proxy_user_isolation` | `memory_contract` |
+| Skills + introspection reads | `journey_full` | `skills_contract`, `introspection_contract` |
+| Jobs + webhook | `journey_full` | `jobs_contract` |
+| Workflows list | `journey_full` | `workflows_contract` |
+| Sandbox CRUD + DB | `journey_full` | `sandbox_contract` |
+| Triggers + fire + delete + DB | `journey_full` | `triggers_contract` |
+| Marketplace probe | `journey_full` | `marketplace_contract` |
+| Data versioning lineage | `journey_full` | `data_versioning_contract` |
+| Replay compare | `journey_full` | `replay_contract` |
+
 ## Large integration binaries (audit — not removed in this pass)
 
 | Binary | Role | E2E overlap | Recommendation |

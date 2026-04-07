@@ -38,7 +38,7 @@ Evaluation **read** routes in the full journey use `x-user-id` without bearer (s
 
 ## Test binaries (ignored by default)
 
-Six tests total — overlap with the full journey is avoided (e.g. no separate “basic session” test that repeats the same list/get/close/resume steps).
+Seven tests total — overlap with the full journey is avoided (e.g. no separate “basic session” test that repeats the same list/get/close/resume steps).
 
 | Test name | File / module | Scope |
 |-----------|---------------|-------|
@@ -48,6 +48,7 @@ Six tests total — overlap with the full journey is avoided (e.g. no separate �
 | `e2e_matrix_session_cancel_delete` | `journey_extended.rs` | `POST /sessions/{id}/cancel` + `agent_sessions.status`, `DELETE /sessions/{id}` |
 | `e2e_matrix_chat_stream_session_info` | `journey_extended.rs` | `POST /chat/stream` SSE → `session_info` + `run_id` |
 | `e2e_matrix_auth_session_negative_paths` | `journey_extended.rs` | `GET /sessions` without auth (401); duplicate `POST /auth/register`; bad `POST /auth/login`; successful login |
+| `e2e_matrix_memory_proxy_user_isolation` | `journey_extended.rs` | Unauthenticated `POST /memory/store` (401); spoofed `user_id`/`session_id` in body → forwarder receives JWT `user_id` for both fields |
 
 Shared helpers: `tests/system_matrix_http_e2e/harness.rs` (`bootstrap`, HTTP helpers, `cleanup_*`, row getters, SSE helpers, `wait_for_agent_event_types` — polls `agent_events` after `chat/turn` instead of a fixed sleep).
 
