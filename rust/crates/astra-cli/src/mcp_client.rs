@@ -35,13 +35,13 @@ use std::time::Instant;
 use rmcp::{
     ClientHandler, Peer, RoleClient,
     model::{
-        ArgumentInfo, CallToolRequestParams, CallToolResult, CompleteRequestParams, CompleteResult,
-        CreateElicitationRequestParams, CreateElicitationResult,
+        ArgumentInfo, CallToolRequestParams, CallToolResult, ClientRequest, CompleteRequestParams,
+        CompleteResult, CreateElicitationRequestParams, CreateElicitationResult,
         CreateMessageRequestParams, CreateMessageResult, ElicitationAction,
         ErrorData as McpHandlerError, GetPromptRequestParams, GetPromptResult, ListRootsResult,
-        LoggingLevel, Prompt, ReadResourceRequestParams, Reference, Resource, Role, Root,
-        SamplingMessage, SamplingMessageContent, SetLevelRequestParams, SubscribeRequestParams,
-        Tool, UnsubscribeRequestParams,
+        LoggingLevel, PingRequest, Prompt, ReadResourceRequestParams, Reference, Resource, Role,
+        Root, SamplingMessage, SamplingMessageContent, SetLevelRequestParams,
+        SubscribeRequestParams, Tool, UnsubscribeRequestParams,
     },
     serve_client,
     service::{NotificationContext, RequestContext, ServiceError},
@@ -858,6 +858,18 @@ impl McpConnection {
         );
         self.peer.complete(params).await
     }
+
+    /// Ping the server to check connectivity.
+    pub async fn ping(&self) -> Result<(), ServiceError> {
+        let ping = PingRequest {
+            method: Default::default(),
+            extensions: Default::default(),
+        };
+        self.peer
+            .send_request(ClientRequest::PingRequest(ping))
+            .await?;
+        Ok(())
+    }
 }
 
 /// MCP client manager for multiple server connections.
@@ -1192,6 +1204,33 @@ impl McpClientManager {
         conn.complete(reference, argument_name, argument_value)
             .await
             .map_err(McpError::Service)
+    }
+
+    /// Ping a specific server to check connectivity.
+    pub async fn ping(&self, server: &str) -> Result<std::time::Duration, McpError> {
+        let conn = self
+            .connections
+            .get(server)
+            .ok_or_else(|| McpError::ServerNotConnected(server.to_string()))?;
+        let start = Instant::now();
+        conn.ping().await.map_err(McpError::Service)?;
+        Ok(start.elapsed())
+    }
+
+    /// Ping all connected servers, returning (name, latency_or_error) pairs.
+    pub async fn ping_all(&self) -> Vec<(String, Result<std::time::Duration, McpError>)> {
+        let mut results = Vec::new();
+        for (name, conn) in &self.connections {
+            let start = Instant::now();
+            let result = conn.ping().await;
+            results.push((
+                name.clone(),
+                result
+                    .map(|_| start.elapsed())
+                    .map_err(McpError::Service),
+            ));
+        }
+        results
     }
 
     /// Number of active connections.
@@ -2990,5 +3029,30 @@ mcp_servers:
 
         let ok: Vec<String> = (0..100).map(|i| format!("v{i}")).collect();
         assert!(CompletionInfo::new(ok).is_ok());
+    }
+
+    // ── Ping Tests ───────────────────────────────────────────────────────
+
+    #[test]
+    fn ping_request_serialization() {
+        use rmcp::model::PingRequest;
+        let ping = PingRequest {
+            method: Default::default(),
+            extensions: Default::default(),
+        };
+        let json = serde_json::to_value(&ping).unwrap();
+        assert_eq!(json["method"], "ping");
+    }
+
+    #[test]
+    fn ping_request_in_client_request() {
+        use rmcp::model::{ClientRequest, PingRequest};
+        let ping = PingRequest {
+            method: Default::default(),
+            extensions: Default::default(),
+        };
+        let req = ClientRequest::PingRequest(ping);
+        // Verify the method string extraction works.
+        assert_eq!(req.method(), "ping");
     }
 }

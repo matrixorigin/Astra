@@ -51,10 +51,12 @@ pub(super) async fn handle_mcp_command(arg: &str, state: &ReplState) -> Result<(
             eprintln!("{}", "    /mcp complete myserver:prompt:deploy env pr".dim());
             eprintln!("{}", "    /mcp complete myserver:resource:file://path arg val".dim());
         }
+        s if s.starts_with("ping ") => handle_mcp_ping(Some(&s[5..]), state).await,
+        "ping" => handle_mcp_ping(None, state).await,
         _ => {
             eprintln!(
                 "{}",
-                format!("  Unknown /mcp subcommand: '{sub}'. Try /mcp, /mcp add, /mcp remove, /mcp servers, /mcp prompts, /mcp resources, /mcp prompt, /mcp resource, /mcp complete")
+                format!("  Unknown /mcp subcommand: '{sub}'. Try /mcp, /mcp add, /mcp remove, /mcp servers, /mcp prompts, /mcp resources, /mcp prompt, /mcp resource, /mcp complete, /mcp ping")
                     .yellow()
             );
         }
@@ -921,6 +923,34 @@ async fn handle_mcp_complete(arg: &str, state: &ReplState) {
         }
         Err(e) => {
             eprintln!("{}", format!("  Completion failed: {e}").red());
+        }
+    }
+}
+
+/// Handle `/mcp ping [server]` — ping one server or all.
+async fn handle_mcp_ping(server: Option<&str>, state: &ReplState) {
+    let manager = state.mcp_manager.read().await;
+
+    if manager.connection_count() == 0 {
+        eprintln!("{}", "  No MCP servers connected.".dim());
+        return;
+    }
+
+    match server.map(str::trim) {
+        Some(name) if !name.is_empty() => {
+            match manager.ping(name).await {
+                Ok(d) => eprintln!("  ✓ {name}: {:.1}ms", d.as_secs_f64() * 1000.0),
+                Err(e) => eprintln!("{}", format!("  ✗ {name}: {e}").red()),
+            }
+        }
+        _ => {
+            let results = manager.ping_all().await;
+            for (name, result) in results {
+                match result {
+                    Ok(d) => eprintln!("  ✓ {name}: {:.1}ms", d.as_secs_f64() * 1000.0),
+                    Err(e) => eprintln!("{}", format!("  ✗ {name}: {e}").red()),
+                }
+            }
         }
     }
 }
