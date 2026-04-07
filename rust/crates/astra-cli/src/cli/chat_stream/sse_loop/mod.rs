@@ -63,7 +63,7 @@ pub(crate) async fn stream_chat_sse(
 
     let project_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let file_context = detect_project_languages(&project_root);
-    let executor = {
+    let mut executor = {
         let ex =
             edge_tools::ToolExecutor::new(&project_root).with_cloud(p.api.api_origin(), p.token);
         if let Some(ref mgr) = p.mcp_manager {
@@ -72,6 +72,13 @@ pub(crate) async fn stream_chat_sse(
             ex
         }
     };
+
+    // --add-dir: expand sandbox to include additional directories
+    if let Ok(dirs) = std::env::var("ASTRA_ADD_DIRS") {
+        for dir in dirs.split(':').filter(|s| !s.is_empty()) {
+            executor.expand_sandbox_path(PathBuf::from(dir));
+        }
+    }
     let mut messages = openai_messages_from_repl_history(p.history, p.message);
     let all_schemas = if p.plan_only_chat {
         messages.insert(
@@ -100,6 +107,21 @@ pub(crate) async fn stream_chat_sse(
     };
     let registry = ToolRegistry::new(all_schemas.clone());
     let valid_tool_names = openai_tool_names_from_schemas(&all_schemas);
+
+    // --allowed-tools: if set, restrict to only the specified tools
+    let initial_restricted: HashSet<String> = if let Ok(allowed_csv) = std::env::var("ASTRA_ALLOWED_TOOLS") {
+        let allowed: HashSet<&str> = allowed_csv.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
+        if !allowed.is_empty() {
+            valid_tool_names.iter()
+                .filter(|name| !allowed.contains(name.as_str()))
+                .cloned()
+                .collect()
+        } else {
+            HashSet::new()
+        }
+    } else {
+        HashSet::new()
+    };
 
     let current_session_id = p.session_id.map(|s| s.to_string());
     let mut task_profile = infer_task_execution_profile(p.message);
@@ -218,7 +240,7 @@ pub(crate) async fn stream_chat_sse(
         max_turns,
         remaining_turns: max_turns,
         turn_guard,
-        restricted_tools: HashSet::new(),
+        restricted_tools: initial_restricted,
         step_recorder,
         idempotency_cache: InMemoryIdempotencyCache::new(),
         semantic_dedup: SemanticDedup::new(
