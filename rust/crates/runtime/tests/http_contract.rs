@@ -182,83 +182,50 @@ async fn learning_health_matches_shared_contract() {
 }
 
 #[tokio::test]
-async fn learning_signals_require_auth() {
+async fn learning_routes_require_auth() {
     let contract = load_contract();
+    let app = build_test_app(true);
 
-    let (status, json) = read_json(build_test_app(true), "/api/v1/learning/signals").await;
-
-    assert_eq!(status.as_u16(), contract.auth_error.status);
-    assert_eq!(json, contract.auth_error.json);
-}
-
-#[tokio::test]
-async fn learning_stats_require_auth() {
-    let contract = load_contract();
-
-    let (status, json) = read_json(build_test_app(true), "/api/v1/learning/stats").await;
-
-    assert_eq!(status.as_u16(), contract.auth_error.status);
-    assert_eq!(json, contract.auth_error.json);
-}
-
-#[tokio::test]
-async fn learning_trigger_requires_auth() {
-    let contract = load_contract();
+    for path in ["/api/v1/learning/signals", "/api/v1/learning/stats"] {
+        let (status, json) = read_json(app.clone(), path).await;
+        assert_eq!(status.as_u16(), contract.auth_error.status, "{path}");
+        assert_eq!(json, contract.auth_error.json, "{path}");
+    }
 
     let (status, json) = post_json(
-        build_test_app(true),
+        app,
         "/api/v1/learning/trigger",
         &[],
         contract.learning_trigger.request.clone(),
     )
     .await;
-
     assert_eq!(status.as_u16(), contract.auth_error.status);
     assert_eq!(json, contract.auth_error.json);
 }
 
 #[tokio::test]
-async fn learning_signals_match_shared_contract() {
+async fn learning_routes_match_shared_contract_when_authenticated() {
     let contract = load_contract();
+    let app = build_test_app(true);
+    let auth = &[("authorization", "Bearer test-token")];
 
-    let (status, json) = read_json_with_headers(
-        build_test_app(true),
-        "/api/v1/learning/signals",
-        &[("authorization", "Bearer test-token")],
-    )
-    .await;
-
+    let (status, json) =
+        read_json_with_headers(app.clone(), "/api/v1/learning/signals", auth).await;
     assert_eq!(status.as_u16(), contract.learning_signals.status);
     assert_eq!(json, contract.learning_signals.json);
-}
 
-#[tokio::test]
-async fn learning_stats_match_shared_contract() {
-    let contract = load_contract();
-
-    let (status, json) = read_json_with_headers(
-        build_test_app(true),
-        "/api/v1/learning/stats",
-        &[("authorization", "Bearer test-token")],
-    )
-    .await;
-
+    let (status, json) =
+        read_json_with_headers(app.clone(), "/api/v1/learning/stats", auth).await;
     assert_eq!(status.as_u16(), contract.learning_stats.status);
     assert_eq!(json, contract.learning_stats.json);
-}
-
-#[tokio::test]
-async fn learning_trigger_matches_shared_contract() {
-    let contract = load_contract();
 
     let (status, json) = post_json(
-        build_test_app(true),
+        app,
         "/api/v1/learning/trigger",
-        &[("authorization", "Bearer test-token")],
+        auth,
         contract.learning_trigger.request.clone(),
     )
     .await;
-
     assert_eq!(status.as_u16(), contract.learning_trigger.status);
     assert_eq!(json, contract.learning_trigger.json);
 }
