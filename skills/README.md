@@ -16,6 +16,14 @@ the same format used by Claude Code. This means:
 - **Shared SKILL.md format**: YAML frontmatter (`name`, `description`,
   `allowed-tools`, etc.) + Markdown body.
 
+### Cursor IDE
+
+Cursor loads project skills from **`.cursor/skills/<name>/SKILL.md`**. This repo keeps a single source of truth under **`skills/`** at the repository root and exposes it to Cursor via a symlink:
+
+- `.cursor/skills` → `../skills`
+
+If skills still do not appear, reload the window (**Developer: Reload Window**) or ensure you opened the repository root as the workspace folder.
+
 ### Search order
 
 Astra discovers skills from these paths (high → low priority):
