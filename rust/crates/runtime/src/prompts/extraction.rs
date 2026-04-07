@@ -225,4 +225,79 @@ mod tests {
         let facts = parse_extracted_facts(input);
         assert_eq!(facts[0].0, "spaced");
     }
+
+    // --- parse_extracted_facts edge cases ---
+
+    #[test]
+    fn parse_fact_with_newlines_in_text() {
+        let input = r#"[{"fact": "line1\nline2", "type": "semantic"}]"#;
+        let facts = parse_extracted_facts(input);
+        assert_eq!(facts.len(), 1);
+        assert!(facts[0].0.contains('\n')); // JSON \n decoded to actual newline
+    }
+
+    #[test]
+    fn parse_fact_with_unicode() {
+        let input = r#"[{"fact": "使用JWT进行身份验证", "type": "semantic"}]"#;
+        let facts = parse_extracted_facts(input);
+        assert_eq!(facts.len(), 1);
+        assert!(facts[0].0.contains("JWT"));
+    }
+
+    #[test]
+    fn parse_duplicate_facts_both_kept() {
+        let input = r#"[
+            {"fact": "same fact", "type": "semantic"},
+            {"fact": "same fact", "type": "semantic"}
+        ]"#;
+        let facts = parse_extracted_facts(input);
+        assert_eq!(facts.len(), 2); // no dedup in parser
+    }
+
+    #[test]
+    fn parse_fact_type_whitespace_defaults() {
+        let input = r#"[{"fact": "test", "type": " semantic "}]"#;
+        let facts = parse_extracted_facts(input);
+        // " semantic " doesn't match any valid type → defaults to "semantic"
+        assert_eq!(facts[0].1, "semantic");
+    }
+
+    #[test]
+    fn parse_deeply_nested_array_rejected() {
+        let input = "[[[[]]]]";
+        let facts = parse_extracted_facts(input);
+        assert!(facts.is_empty());
+    }
+
+    #[test]
+    fn parse_fact_with_all_valid_types() {
+        let input = r#"[
+            {"fact": "a", "type": "semantic"},
+            {"fact": "b", "type": "profile"},
+            {"fact": "c", "type": "procedural"},
+            {"fact": "d", "type": "working"}
+        ]"#;
+        let facts = parse_extracted_facts(input);
+        assert_eq!(facts.len(), 4);
+        assert_eq!(facts[0].1, "semantic");
+        assert_eq!(facts[1].1, "profile");
+        assert_eq!(facts[2].1, "procedural");
+        assert_eq!(facts[3].1, "working");
+    }
+
+    #[test]
+    fn parse_fact_number_type_defaults_semantic() {
+        let input = r#"[{"fact": "test", "type": 123}]"#;
+        let facts = parse_extracted_facts(input);
+        // type is a number, not a string → as_str() returns None → defaults to "semantic"
+        assert_eq!(facts[0].1, "semantic");
+    }
+
+    #[test]
+    fn parse_with_trailing_comma_fails_gracefully() {
+        let input = r#"[{"fact": "test", "type": "semantic"},]"#;
+        let facts = parse_extracted_facts(input);
+        // serde_json rejects trailing commas → empty
+        assert!(facts.is_empty());
+    }
 }

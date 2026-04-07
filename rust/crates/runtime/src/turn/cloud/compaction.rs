@@ -1703,4 +1703,108 @@ mod tests {
         // keep_recent_turns=100 > 2 messages → all kept
         assert_eq!(result.len(), 2);
     }
+
+    // --- CompactBoundary builder & serde edge cases ---
+
+    #[test]
+    fn compact_boundary_new_defaults() {
+        let b = CompactBoundary::new(CompactTrigger::Manual, CompactionTier::Normal);
+        assert_eq!(b.pre_tokens, 0);
+        assert_eq!(b.messages_before, 0);
+        assert_eq!(b.messages_after, 0);
+        assert!(b.last_pre_compact_uuid.is_none());
+        assert!(b.summary.is_none());
+        assert!(b.recent_files.is_empty());
+        assert!(b.discovered_tools.is_empty());
+    }
+
+    #[test]
+    fn compact_boundary_builder_chain() {
+        let b = CompactBoundary::new(CompactTrigger::Auto, CompactionTier::AggressivePrune)
+            .with_pre_metrics(10000, 50)
+            .with_post_count(10)
+            .with_last_uuid("uuid-123")
+            .with_recent_files(vec!["a.rs".into(), "b.rs".into()])
+            .with_discovered_tools(vec!["bash".into()]);
+        assert_eq!(b.pre_tokens, 10000);
+        assert_eq!(b.messages_before, 50);
+        assert_eq!(b.messages_after, 10);
+        assert_eq!(b.last_pre_compact_uuid.as_deref(), Some("uuid-123"));
+        assert_eq!(b.recent_files.len(), 2);
+        assert_eq!(b.discovered_tools, vec!["bash"]);
+    }
+
+    #[test]
+    fn compact_boundary_serde_round_trip() {
+        let b = CompactBoundary::new(CompactTrigger::Auto, CompactionTier::TrimSchemas)
+            .with_pre_metrics(5000, 20)
+            .with_post_count(8)
+            .with_recent_files(vec!["main.rs".into()]);
+        let json = serde_json::to_string(&b).unwrap();
+        let back: CompactBoundary = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.trigger, CompactTrigger::Auto);
+        assert_eq!(back.pre_tokens, 5000);
+        assert_eq!(back.messages_before, 20);
+        assert_eq!(back.messages_after, 8);
+        assert_eq!(back.recent_files, vec!["main.rs"]);
+    }
+
+    #[test]
+    fn compact_boundary_serde_skips_empty_vecs() {
+        let b = CompactBoundary::new(CompactTrigger::Manual, CompactionTier::Normal);
+        let json = serde_json::to_string(&b).unwrap();
+        assert!(!json.contains("recent_files"), "empty recent_files should be skipped");
+        assert!(!json.contains("discovered_tools"), "empty discovered_tools should be skipped");
+        assert!(!json.contains("summary"), "None summary should be skipped");
+    }
+
+    #[test]
+    fn compact_trigger_serde_snake_case() {
+        let json = serde_json::to_string(&CompactTrigger::Manual).unwrap();
+        assert_eq!(json, r#""manual""#);
+        let json = serde_json::to_string(&CompactTrigger::Auto).unwrap();
+        assert_eq!(json, r#""auto""#);
+    }
+
+    #[test]
+    fn compact_trigger_deserialize_rejects_camel_case() {
+        let result = serde_json::from_str::<CompactTrigger>(r#""Manual""#);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn compact_boundary_with_zero_pre_metrics() {
+        let b = CompactBoundary::new(CompactTrigger::Auto, CompactionTier::CompactHistory)
+            .with_pre_metrics(0, 0)
+            .with_post_count(0);
+        let json = serde_json::to_string(&b).unwrap();
+        let back: CompactBoundary = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.pre_tokens, 0);
+        assert_eq!(back.messages_before, 0);
+    }
+
+    // --- effective_tool_trunc_limit ---
+
+    #[test]
+    fn effective_tool_trunc_limit_minimum_80() {
+        // Even with base=0, should return at least 80
+        let result = effective_tool_trunc_limit(0, None);
+        assert_eq!(result, 80);
+    }
+
+    #[test]
+    fn effective_tool_trunc_limit_no_overflow() {
+        // Very large base should not overflow via saturating_mul
+        let result = effective_tool_trunc_limit(usize::MAX, None);
+        assert!(result >= 80);
+    }
+
+    // --- duplicate_read_stub ---
+
+    #[test]
+    fn duplicate_read_stub_contains_path() {
+        let stub = duplicate_read_stub("src/main.rs");
+        assert!(stub.contains("src/main.rs"));
+        assert!(stub.contains("duplicate read"));
+    }
 }
