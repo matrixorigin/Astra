@@ -32,6 +32,30 @@ pub fn local_sessions_dir() -> PathBuf {
     })
 }
 
+/// Validate that a session ID is safe for use as a filesystem path component.
+/// Rejects path traversal attempts (`..`, `/`, `\`) and empty/whitespace-only IDs.
+pub fn validate_session_id(session_id: &str) -> Result<(), String> {
+    if session_id.is_empty() || session_id.trim().is_empty() {
+        return Err("session ID cannot be empty".to_string());
+    }
+    if session_id.contains('/')
+        || session_id.contains('\\')
+        || session_id.contains("..")
+        || session_id.contains('\0')
+    {
+        return Err(format!(
+            "invalid session ID '{session_id}': must not contain '/', '\\\\', '..', or null bytes"
+        ));
+    }
+    // Must be a single path component (no directory separators after normalization)
+    if Path::new(session_id).components().count() != 1 {
+        return Err(format!(
+            "invalid session ID '{session_id}': must be a single path component"
+        ));
+    }
+    Ok(())
+}
+
 /// Redirect session journal + workspace + step checkpoint paths on **this thread** to `dir`.
 ///
 /// `dir` must be the `sessions` folder (the directory that will contain `<session_id>.jsonl`
@@ -643,6 +667,13 @@ impl JournalWriter {
             .create(true)
             .append(true)
             .open(&self.path)?;
+        // Restrict file permissions to owner-only (0o600) to protect sensitive
+        // conversation history from other users on shared systems.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = file.set_permissions(std::fs::Permissions::from_mode(0o600));
+        }
         if let Err(e) = writeln!(file, "{line}") {
             if e.kind() == std::io::ErrorKind::Other
                 || e.raw_os_error() == Some(28) // ENOSPC
@@ -726,8 +757,16 @@ pub fn list_sessions() -> std::io::Result<Vec<String>> {
 }
 
 /// Path to the JSONL journal file for a session.
+///
+/// # Panics
+/// Panics if `session_id` contains path traversal characters. Use [`validate_session_id`]
+/// to pre-validate untrusted input.
 #[must_use]
 pub fn journal_file_path(session_id: &str) -> PathBuf {
+    assert!(
+        validate_session_id(session_id).is_ok(),
+        "unsafe session ID passed to journal_file_path: {session_id}"
+    );
     journal_dir().join(format!("{session_id}.jsonl"))
 }
 
@@ -2479,5 +2518,32 @@ mod tests {
         let parsed: JournalEvent = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.event_type, JournalEventType::DelegationStarted);
         assert!(json.contains("\"delegation_id\":\"d1\""));
+    }
+
+    // ── Session ID Validation Security Tests ──
+
+    #[test]
+    fn validate_session_id_rejects_path_traversal() {
+        assert!(validate_session_id("../../etc/passwd").is_err());
+        assert!(validate_session_id("../sibling").is_err());
+        assert!(validate_session_id("a/b/c").is_err());
+        assert!(validate_session_id("a\\b").is_err());
+        assert!(validate_session_id("").is_err());
+        assert!(validate_session_id("   ").is_err());
+        assert!(validate_session_id("a\0b").is_err());
+    }
+
+    #[test]
+    fn validate_session_id_accepts_safe_ids() {
+        assert!(validate_session_id("abc-123").is_ok());
+        assert!(validate_session_id("550e8400-e29b-41d4-a716-446655440000").is_ok());
+        assert!(validate_session_id("my_session").is_ok());
+        assert!(validate_session_id("session.2024").is_ok());
+    }
+
+    #[test]
+    #[should_panic(expected = "unsafe session ID")]
+    fn journal_file_path_panics_on_traversal() {
+        let _ = journal_file_path("../../etc/passwd");
     }
 }
