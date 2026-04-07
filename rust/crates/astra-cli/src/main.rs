@@ -196,6 +196,8 @@ enum Command {
     Mcp(McpCmd),
     /// Generate shell completion script
     Completion(CompletionArgs),
+    /// Diagnose installation, config, and connectivity
+    Doctor,
     /// Direct message: astra "your question here"
     #[command(external_subcommand)]
     Message(Vec<String>),
