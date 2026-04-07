@@ -853,7 +853,7 @@ impl Default for ReplState {
             journal: None,
             recent_tools: Vec::new(),
             perm_manager: PermissionManager::with_project(
-                false,
+                std::env::var("ASTRA_AUTO_APPROVE").map(|v| v == "1").unwrap_or(false),
                 &std::env::current_dir().unwrap_or_default(),
             ),
             ingestion_user_id: None,
@@ -4680,6 +4680,14 @@ async fn run_chat_repl(
         state.session_name = Some(name);
     }
 
+    // --yes: warn about auto-approve mode
+    if state.perm_manager.mode() == permission_manager::PermissionMode::Auto {
+        eprintln!(
+            "{}",
+            "  ⚠ Auto-approve mode: all tool calls will execute without confirmation.".yellow()
+        );
+    }
+
     // Load persisted skill quality data from previous sessions
     let skill_quality_path = dirs::config_dir()
         .unwrap_or_else(|| std::path::PathBuf::from("."))
@@ -5529,7 +5537,10 @@ async fn main() {
         unsafe { std::env::set_var("ASTRA_ADD_DIRS", dirs.join(":")); }
     }
 
-    // --verbose: override verbose setting
+    // --yes (-y): set auto-approve mode for the interactive REPL
+    if auto_approve {
+        unsafe { std::env::set_var("ASTRA_AUTO_APPROVE", "1"); }
+    }
     if verbose {
         unsafe { std::env::set_var("ASTRA_VERBOSE", "1"); }
     }
@@ -8758,5 +8769,14 @@ total_tokens_out: 500
             let mode: permission_manager::PermissionMode = mode_str.parse().unwrap();
             assert_eq!(mode.to_string().to_lowercase(), *mode_str);
         }
+    }
+
+    #[test]
+    fn repl_state_auto_approve_env_activates_auto_mode() {
+        // When ASTRA_AUTO_APPROVE=1, ReplState should start in Auto mode
+        unsafe { std::env::set_var("ASTRA_AUTO_APPROVE", "1"); }
+        let state = ReplState::default();
+        unsafe { std::env::remove_var("ASTRA_AUTO_APPROVE"); }
+        assert_eq!(state.perm_manager.mode(), permission_manager::PermissionMode::Auto);
     }
 }
