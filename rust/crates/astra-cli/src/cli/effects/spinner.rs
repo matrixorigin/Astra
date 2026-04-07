@@ -44,11 +44,7 @@ impl Spinner {
         // before the background thread is scheduled (avoids a blank gap).
         if !delay {
             let frame = SPINNER_FRAMES[0];
-            eprint!(
-                "\r  {} {}",
-                prefix.as_str().cyan(),
-                format!("{frame}").yellow()
-            );
+            eprint!("\r  {} {}", prefix.as_str().cyan(), format!("{frame}").yellow());
             let _ = io::stderr().flush();
         }
 
