@@ -713,6 +713,9 @@ struct ReplState {
     /// Sticky task/thread summary used to anchor ultra-short follow-ups like
     /// "继续" even after history compaction prunes earlier turns.
     continuation_anchor: Option<String>,
+    /// Session-level goal derived from the first substantive user message.
+    /// Survives compaction and is injected alongside the continuation anchor.
+    session_goal: Option<String>,
     explain: ExplainMode,
     verbose_mode: bool,
     history: Vec<(String, String)>, // (user_msg, assistant_msg)
@@ -833,6 +836,7 @@ impl Default for ReplState {
             turn: 0,
             last_response: None,
             continuation_anchor: None,
+            session_goal: None,
             explain: ExplainMode::Off,
             verbose_mode: true,
             history: Vec::new(),
