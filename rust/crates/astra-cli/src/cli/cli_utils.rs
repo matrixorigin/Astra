@@ -6,13 +6,25 @@ pub(super) struct CredentialsFile {
     pub(super) profiles: HashMap<String, Profile>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Clone, Serialize, Deserialize, Default)]
 pub(super) struct Profile {
     pub(super) username: Option<String>,
     pub(super) access_token: Option<String>,
     pub(super) refresh_token: Option<String>,
     pub(super) last_session_id: Option<String>,
     pub(super) memoria_api_key: Option<String>,
+}
+
+impl std::fmt::Debug for Profile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Profile")
+            .field("username", &self.username)
+            .field("access_token", &self.access_token.as_ref().map(|_| "***"))
+            .field("refresh_token", &self.refresh_token.as_ref().map(|_| "***"))
+            .field("last_session_id", &self.last_session_id)
+            .field("memoria_api_key", &self.memoria_api_key.as_ref().map(|_| "***"))
+            .finish()
+    }
 }
 
 pub(super) fn credentials_path() -> PathBuf {
@@ -42,7 +54,14 @@ pub(super) fn save_credentials(data: &CredentialsFile) -> Result<(), String> {
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
     let body = serde_json::to_string_pretty(data).map_err(|e| e.to_string())?;
-    fs::write(path, body).map_err(|e| e.to_string())
+    fs::write(&path, body).map_err(|e| e.to_string())?;
+    // Restrict to owner-only (0o600) — credentials contain tokens and secrets
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
+    }
+    Ok(())
 }
 
 pub(super) fn profile_name(cli_profile: Option<&str>, data: &CredentialsFile) -> String {
@@ -512,6 +531,48 @@ mod tests {
 
         assert_eq!(resumable_last_session_id(None), None);
 
+        unsafe {
+            std::env::remove_var("ASTRA_CREDENTIALS_DIR");
+        }
+    }
+
+    #[test]
+    fn test_profile_debug_masks_secrets() {
+        let profile = Profile {
+            username: Some("alice".into()),
+            access_token: Some("sk-secret-token-12345".into()),
+            refresh_token: Some("rt-refresh-abcdef".into()),
+            last_session_id: Some("sess-001".into()),
+            memoria_api_key: Some("mem-key-xyz".into()),
+        };
+        let dbg = format!("{:?}", profile);
+        assert!(dbg.contains("alice"), "username should be visible");
+        assert!(dbg.contains("sess-001"), "session_id should be visible");
+        assert!(!dbg.contains("sk-secret"), "access_token must be masked");
+        assert!(!dbg.contains("rt-refresh"), "refresh_token must be masked");
+        assert!(!dbg.contains("mem-key"), "memoria_api_key must be masked");
+        assert!(dbg.contains("***"), "masked fields should show ***");
+    }
+
+    #[test]
+    fn test_credentials_file_permissions() {
+        let tmp = tempfile::tempdir().unwrap();
+        unsafe {
+            std::env::set_var("ASTRA_CREDENTIALS_DIR", tmp.path());
+        }
+        let creds = CredentialsFile {
+            current_profile: Some("default".into()),
+            profiles: HashMap::new(),
+        };
+        save_credentials(&creds).unwrap();
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let path = tmp.path().join("credentials.json");
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "credentials.json must be 0600, got {mode:o}");
+        }
         unsafe {
             std::env::remove_var("ASTRA_CREDENTIALS_DIR");
         }

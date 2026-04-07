@@ -726,6 +726,12 @@ async fn handle_mcp_add(arg: &str) {
                 let _ = std::fs::remove_file(&tmp);
                 return;
             }
+            // Restrict to owner-only — mcp.json may contain API keys
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+            }
         }
         Err(e) => {
             eprintln!(
@@ -817,6 +823,11 @@ async fn handle_mcp_remove(arg: &str) {
                 );
                 let _ = std::fs::remove_file(&tmp);
                 return;
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
             }
         }
         Err(e) => {

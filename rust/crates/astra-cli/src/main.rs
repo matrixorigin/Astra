@@ -699,6 +699,9 @@ struct SkillDevState {
     dir: std::path::PathBuf,
 }
 
+// NOTE: ReplState is per-session and NOT shared across sessions. In future
+// server/multi-session mode, ensure each session gets its own ReplState
+// instance to prevent cross-session data leakage (permissions, history, tokens).
 struct ReplState {
     session_id: Option<String>,
     run_id: Option<String>,
