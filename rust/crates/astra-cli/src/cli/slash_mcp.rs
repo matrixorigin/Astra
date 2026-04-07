@@ -20,10 +20,16 @@ pub(super) async fn handle_mcp_command(arg: &str, state: &ReplState) -> Result<(
         "remove" => {
             eprintln!("{}", "  Usage: /mcp remove <name>".dim());
         }
+        s if s.starts_with("prompt ") => {
+            eprintln!("{}", "  Hint: use /mcp prompt <server>:<name> [arg1 arg2 ...]".dim());
+        }
+        "prompt" => {
+            eprintln!("{}", "  Usage: /mcp prompt <server>:<name> [arg1 arg2 ...]".dim());
+        }
         _ => {
             eprintln!(
                 "{}",
-                format!("  Unknown /mcp subcommand: '{sub}'. Try /mcp, /mcp add, /mcp remove, /mcp servers, /mcp prompts")
+                format!("  Unknown /mcp subcommand: '{sub}'. Try /mcp, /mcp add, /mcp remove, /mcp servers, /mcp prompts, /mcp prompt")
                     .yellow()
             );
         }
@@ -147,6 +153,177 @@ async fn show_prompts(state: &ReplState) {
             args.dim(),
             desc.dim(),
         );
+    }
+}
+
+/// `/mcp prompt <server>:<name> [arg1 arg2 ...]` — invoke an MCP prompt.
+///
+/// Fetches the prompt result from the server, extracts text content,
+/// and injects it into conversation history so the LLM sees it on the
+/// next turn.
+pub(super) async fn handle_mcp_prompt_invoke(
+    arg: &str,
+    state: &mut ReplState,
+) -> Result<(), String> {
+    // arg here is everything after "/mcp" — so it starts with "prompt ..."
+    // But the main.rs match on "/mcp prompt" already split: cmd="/mcp", first word consumed
+    // by resolve, so arg = "prompt <server>:<name> [args...]"
+    // We need to strip "prompt " prefix
+    let rest = if let Some(stripped) = arg.trim().strip_prefix("prompt") {
+        stripped.trim()
+    } else {
+        arg.trim()
+    };
+
+    if rest.is_empty() {
+        eprintln!(
+            "{}",
+            "  Usage: /mcp prompt <server>:<name> [arg1 arg2 ...]".dim()
+        );
+        eprintln!(
+            "{}",
+            "  Example: /mcp prompt github:create-pr fix authentication bug".dim()
+        );
+        return Ok(());
+    }
+
+    let parts: Vec<&str> = rest.splitn(2, ' ').collect();
+    let qualified_name = parts[0];
+    let raw_args = parts.get(1).copied().unwrap_or("");
+
+    // Parse server:name
+    let (server_name, prompt_name) = match qualified_name.split_once(':') {
+        Some((s, n)) if !s.is_empty() && !n.is_empty() => (s, n),
+        _ => {
+            eprintln!(
+                "{}",
+                format!("  ⚠ Invalid format: '{qualified_name}'. Use <server>:<prompt_name>").yellow()
+            );
+            return Ok(());
+        }
+    };
+
+    // Build arguments map: match positional args to prompt argument names
+    let manager = state.mcp_manager.read().await;
+    let prompts = manager.all_prompts().await;
+    let prompt_def = prompts.iter().find(|(s, p)| s == server_name && p.name == prompt_name);
+
+    let arguments = if !raw_args.is_empty() {
+        let arg_values: Vec<&str> = raw_args.split_whitespace().collect();
+        let mut map = serde_json::Map::new();
+
+        if let Some((_, def)) = prompt_def {
+            // Map positional args to named arguments
+            if let Some(ref arg_defs) = def.arguments {
+                for (i, val) in arg_values.iter().enumerate() {
+                    if let Some(arg_def) = arg_defs.get(i) {
+                        map.insert(arg_def.name.clone(), serde_json::Value::String(val.to_string()));
+                    }
+                }
+                // If more values than named args, join remaining as last arg
+                if arg_values.len() > arg_defs.len() && !arg_defs.is_empty() {
+                    let last_key = &arg_defs[arg_defs.len() - 1].name;
+                    let joined = arg_values[arg_defs.len() - 1..].join(" ");
+                    map.insert(last_key.clone(), serde_json::Value::String(joined));
+                }
+            } else {
+                // No arg definitions — use "input" as key
+                map.insert("input".to_string(), serde_json::Value::String(raw_args.to_string()));
+            }
+        } else {
+            // Prompt definition not found in cache — use "input" as key
+            map.insert("input".to_string(), serde_json::Value::String(raw_args.to_string()));
+        }
+        Some(map)
+    } else {
+        None
+    };
+
+    eprintln!(
+        "  {} Invoking prompt {}:{}…",
+        "⟳".yellow(),
+        server_name,
+        prompt_name
+    );
+
+    let result = match manager.get_prompt(server_name, prompt_name, arguments).await {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("{}", format!("  ⚠ Failed to get prompt: {e}").yellow());
+            return Ok(());
+        }
+    };
+    drop(manager);
+
+    if result.messages.is_empty() {
+        eprintln!("{}", "  Prompt returned no messages.".dim());
+        return Ok(());
+    }
+
+    // Extract text content from prompt messages
+    let mut user_parts = Vec::new();
+    let mut assistant_parts = Vec::new();
+
+    for msg in &result.messages {
+        let text = extract_prompt_message_text(&msg.content);
+        if text.is_empty() {
+            continue;
+        }
+        match msg.role {
+            rmcp::model::PromptMessageRole::User => user_parts.push(text),
+            rmcp::model::PromptMessageRole::Assistant => assistant_parts.push(text),
+        }
+    }
+
+    let user_text = if user_parts.is_empty() {
+        format!("[MCP prompt {server_name}:{prompt_name}]")
+    } else {
+        user_parts.join("\n\n")
+    };
+    let assistant_text = assistant_parts.join("\n\n");
+
+    // Display what was injected
+    if !assistant_text.is_empty() {
+        eprintln!(
+            "  {} Injected prompt result ({} message{})",
+            "✓".green(),
+            result.messages.len(),
+            if result.messages.len() == 1 { "" } else { "s" },
+        );
+        // Show a preview
+        let preview: String = assistant_text.chars().take(200).collect();
+        if assistant_text.len() > 200 {
+            eprintln!("  {}", format!("{preview}…").dim());
+        } else {
+            eprintln!("  {}", preview.dim());
+        }
+    } else {
+        eprintln!(
+            "  {} Injected prompt context ({} message{})",
+            "✓".green(),
+            result.messages.len(),
+            if result.messages.len() == 1 { "" } else { "s" },
+        );
+    }
+
+    // Inject into conversation history
+    state.history.push((user_text, assistant_text));
+
+    Ok(())
+}
+
+/// Extract text content from a PromptMessageContent.
+fn extract_prompt_message_text(content: &rmcp::model::PromptMessageContent) -> String {
+    match content {
+        rmcp::model::PromptMessageContent::Text { text } => text.clone(),
+        rmcp::model::PromptMessageContent::Resource { resource } => {
+            // Try to extract text from embedded resource
+            match &resource.resource {
+                rmcp::model::ResourceContents::TextResourceContents { text, .. } => text.clone(),
+                _ => String::new(),
+            }
+        }
+        _ => String::new(),
     }
 }
 
@@ -423,5 +600,49 @@ mod tests {
         let _ = format_state(ConnectionState::Reconnecting);
         let _ = format_state(ConnectionState::Disconnected);
         let _ = format_state(ConnectionState::Failed);
+    }
+
+    #[test]
+    fn extract_prompt_text_content() {
+        let content = rmcp::model::PromptMessageContent::Text {
+            text: "Hello world".to_string(),
+        };
+        assert_eq!(extract_prompt_message_text(&content), "Hello world");
+    }
+
+    #[test]
+    fn extract_prompt_image_content_empty() {
+        use rmcp::model::{Annotated, RawImageContent};
+        let content = rmcp::model::PromptMessageContent::Image {
+            image: Annotated {
+                raw: RawImageContent {
+                    data: "abc".to_string(),
+                    mime_type: "image/png".to_string(),
+                    meta: None,
+                },
+                annotations: None,
+            },
+        };
+        assert_eq!(extract_prompt_message_text(&content), "");
+    }
+
+    #[test]
+    fn extract_prompt_resource_text() {
+        use rmcp::model::{Annotated, RawEmbeddedResource, ResourceContents};
+        let content = rmcp::model::PromptMessageContent::Resource {
+            resource: Annotated {
+                raw: RawEmbeddedResource {
+                    meta: None,
+                    resource: ResourceContents::TextResourceContents {
+                        uri: "file:///test.txt".to_string(),
+                        mime_type: Some("text/plain".to_string()),
+                        text: "resource content".to_string(),
+                        meta: None,
+                    },
+                },
+                annotations: None,
+            },
+        };
+        assert_eq!(extract_prompt_message_text(&content), "resource content");
     }
 }
