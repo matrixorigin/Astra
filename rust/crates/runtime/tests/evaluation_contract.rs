@@ -157,182 +157,83 @@ fn build_memoria_backed_app(memoria_base_url: String) -> axum::Router {
     build_app(state)
 }
 
-// ── GET endpoints ────────────────────────────────────────────────────────────
-
-#[tokio::test]
-async fn quality_trend_returns_503() {
-    let app = build_unconfigured_app();
-    let resp = app
-        .oneshot(
-            Request::builder()
-                .uri("/evaluation/quality/trend")
-                .header("x-user-id", "u1")
-                .body(body::Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+/// `json_ct`: send `content-type: application/json` (only for POST bodies that had it originally).
+async fn oneshot_eval(
+    app: axum::Router,
+    method: &str,
+    uri: &str,
+    body: body::Body,
+    json_ct: bool,
+) -> axum::response::Response {
+    let mut req = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header("x-user-id", "u1");
+    if json_ct {
+        req = req.header("content-type", "application/json");
+    }
+    app.oneshot(req.body(body).unwrap()).await.unwrap()
 }
 
 #[tokio::test]
-async fn drift_returns_503() {
+async fn unconfigured_evaluation_routes_return_503() {
     let app = build_unconfigured_app();
-    let resp = app
-        .oneshot(
-            Request::builder()
-                .uri("/evaluation/drift")
-                .header("x-user-id", "u1")
-                .body(body::Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let get_uris = [
+        "/evaluation/quality/trend",
+        "/evaluation/drift",
+        "/evaluation/gates",
+        "/evaluation/calibration",
+        "/evaluation/sessions/scores",
+        "/evaluation/trust-report?agent_id=agent-1",
+        "/evaluation/slo/dashboard",
+        "/evaluation/slo/agent-1/history",
+        "/evaluation/observability/metrics?agent_id=agent-1",
+        "/evaluation/memory-health",
+        "/evaluation/memory-metrics",
+        "/evaluation/training-data/ds-001/export",
+    ];
+    for uri in get_uris {
+        let resp = oneshot_eval(app.clone(), "GET", uri, body::Body::empty(), false).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "GET {uri}"
+        );
+    }
+
+    let post_cases: [(&str, body::Body, bool); 4] = [
+        (
+            "/evaluation/gate/validate",
+            body::Body::from(
+                r#"{"change_type":"prompt","change_id":"c1","change_content":{}}"#,
+            ),
+            true,
+        ),
+        ("/evaluation/drift/run", body::Body::empty(), false),
+        ("/evaluation/loop", body::Body::empty(), false),
+        (
+            "/evaluation/training-data/extract",
+            body::Body::from(r#"{}"#),
+            true,
+        ),
+    ];
+    for (uri, b, json_ct) in post_cases {
+        let resp = oneshot_eval(app.clone(), "POST", uri, b, json_ct).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "POST {uri}"
+        );
+    }
 }
 
 #[tokio::test]
-async fn gate_history_returns_503() {
-    let app = build_unconfigured_app();
-    let resp = app
-        .oneshot(
-            Request::builder()
-                .uri("/evaluation/gates")
-                .header("x-user-id", "u1")
-                .body(body::Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
-}
-
-#[tokio::test]
-async fn calibration_returns_503() {
-    let app = build_unconfigured_app();
-    let resp = app
-        .oneshot(
-            Request::builder()
-                .uri("/evaluation/calibration")
-                .header("x-user-id", "u1")
-                .body(body::Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
-}
-
-#[tokio::test]
-async fn session_scores_returns_503() {
-    let app = build_unconfigured_app();
-    let resp = app
-        .oneshot(
-            Request::builder()
-                .uri("/evaluation/sessions/scores")
-                .header("x-user-id", "u1")
-                .body(body::Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
-}
-
-#[tokio::test]
-async fn trust_report_returns_503() {
-    let app = build_unconfigured_app();
-    let resp = app
-        .oneshot(
-            Request::builder()
-                .uri("/evaluation/trust-report?agent_id=agent-1")
-                .header("x-user-id", "u1")
-                .body(body::Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
-}
-
-#[tokio::test]
-async fn slo_dashboard_returns_503() {
-    let app = build_unconfigured_app();
-    let resp = app
-        .oneshot(
-            Request::builder()
-                .uri("/evaluation/slo/dashboard")
-                .header("x-user-id", "u1")
-                .body(body::Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
-}
-
-#[tokio::test]
-async fn slo_history_returns_503() {
-    let app = build_unconfigured_app();
-    let resp = app
-        .oneshot(
-            Request::builder()
-                .uri("/evaluation/slo/agent-1/history")
-                .header("x-user-id", "u1")
-                .body(body::Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
-}
-
-#[tokio::test]
-async fn observability_metrics_returns_503() {
-    let app = build_unconfigured_app();
-    let resp = app
-        .oneshot(
-            Request::builder()
-                .uri("/evaluation/observability/metrics?agent_id=agent-1")
-                .header("x-user-id", "u1")
-                .body(body::Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
-}
-
-#[tokio::test]
-async fn memory_health_returns_503() {
-    let app = build_unconfigured_app();
-    let resp = app
-        .oneshot(
-            Request::builder()
-                .uri("/evaluation/memory-health")
-                .header("x-user-id", "u1")
-                .body(body::Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
-}
-
-#[tokio::test]
-async fn memory_health_uses_memoria_storage_and_hygiene() {
+async fn memory_health_and_metrics_use_mock_memoria() {
     let memoria_base_url = start_mock_memoria_health().await;
     let app = build_memoria_backed_app(memoria_base_url);
-    let resp = app
-        .oneshot(
-            Request::builder()
-                .uri("/evaluation/memory-health")
-                .header("x-user-id", "u1")
-                .body(body::Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
+
+    let resp = oneshot_eval(app.clone(), "GET", "/evaluation/memory-health", body::Body::empty(), false)
+        .await;
     assert_eq!(resp.status(), StatusCode::OK);
     let bytes = body::to_bytes(resp.into_body(), 1024 * 64).await.unwrap();
     let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
@@ -342,38 +243,8 @@ async fn memory_health_uses_memoria_storage_and_hygiene() {
     assert_eq!(json["stale_working_memories"], 2);
     assert_eq!(json["orphaned_records"], 0);
     assert_eq!(json["healthy"], false);
-}
 
-#[tokio::test]
-async fn memory_metrics_returns_503() {
-    let app = build_unconfigured_app();
-    let resp = app
-        .oneshot(
-            Request::builder()
-                .uri("/evaluation/memory-metrics")
-                .header("x-user-id", "u1")
-                .body(body::Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
-}
-
-#[tokio::test]
-async fn memory_metrics_uses_memoria_health_endpoints() {
-    let memoria_base_url = start_mock_memoria_health().await;
-    let app = build_memoria_backed_app(memoria_base_url);
-    let resp = app
-        .oneshot(
-            Request::builder()
-                .uri("/evaluation/memory-metrics")
-                .header("x-user-id", "u1")
-                .body(body::Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
+    let resp = oneshot_eval(app, "GET", "/evaluation/memory-metrics", body::Body::empty(), false).await;
     assert_eq!(resp.status(), StatusCode::OK);
     let bytes = body::to_bytes(resp.into_body(), 1024 * 64).await.unwrap();
     let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
@@ -383,161 +254,32 @@ async fn memory_metrics_uses_memoria_health_endpoints() {
 }
 
 #[tokio::test]
-async fn drift_returns_501_when_service_is_stubbed() {
+async fn memoria_stubbed_evaluation_routes_return_501() {
     let memoria_base_url = start_mock_memoria_health().await;
     let app = build_memoria_backed_app(memoria_base_url);
-    let resp = app
-        .oneshot(
-            Request::builder()
-                .uri("/evaluation/drift")
-                .header("x-user-id", "u1")
-                .body(body::Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
-}
 
-#[tokio::test]
-async fn quality_trend_model_filter_returns_501_until_supported() {
-    let memoria_base_url = start_mock_memoria_health().await;
-    let app = build_memoria_backed_app(memoria_base_url);
-    let resp = app
-        .oneshot(
-            Request::builder()
-                .uri("/evaluation/quality/trend?model=gpt-4")
-                .header("x-user-id", "u1")
-                .body(body::Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
-}
-
-#[tokio::test]
-async fn slo_dashboard_returns_501_when_service_is_stubbed() {
-    let memoria_base_url = start_mock_memoria_health().await;
-    let app = build_memoria_backed_app(memoria_base_url);
-    let resp = app
-        .oneshot(
-            Request::builder()
-                .uri("/evaluation/slo/dashboard")
-                .header("x-user-id", "u1")
-                .body(body::Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
-}
-
-#[tokio::test]
-async fn training_data_extract_returns_501_when_service_is_stubbed() {
-    let memoria_base_url = start_mock_memoria_health().await;
-    let app = build_memoria_backed_app(memoria_base_url);
-    let resp = app
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/evaluation/training-data/extract")
-                .header("x-user-id", "u1")
-                .header("content-type", "application/json")
-                .body(body::Body::from(r#"{}"#))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
-}
-
-#[tokio::test]
-async fn training_data_export_returns_503() {
-    let app = build_unconfigured_app();
-    let resp = app
-        .oneshot(
-            Request::builder()
-                .uri("/evaluation/training-data/ds-001/export")
-                .header("x-user-id", "u1")
-                .body(body::Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
-}
-
-// ── POST endpoints ───────────────────────────────────────────────────────────
-
-#[tokio::test]
-async fn gate_validate_returns_503() {
-    let app = build_unconfigured_app();
-    let resp = app
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/evaluation/gate/validate")
-                .header("x-user-id", "u1")
-                .header("content-type", "application/json")
-                .body(body::Body::from(
-                    r#"{"change_type":"prompt","change_id":"c1","change_content":{}}"#,
-                ))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
-}
-
-#[tokio::test]
-async fn drift_run_returns_503() {
-    let app = build_unconfigured_app();
-    let resp = app
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/evaluation/drift/run")
-                .header("x-user-id", "u1")
-                .body(body::Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
-}
-
-#[tokio::test]
-async fn closed_loop_returns_503() {
-    let app = build_unconfigured_app();
-    let resp = app
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/evaluation/loop")
-                .header("x-user-id", "u1")
-                .body(body::Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
-}
-
-#[tokio::test]
-async fn training_data_extract_returns_503() {
-    let app = build_unconfigured_app();
-    let resp = app
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/evaluation/training-data/extract")
-                .header("x-user-id", "u1")
-                .header("content-type", "application/json")
-                .body(body::Body::from(r#"{}"#))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let cases = [
+        ("GET", "/evaluation/drift", body::Body::empty(), false),
+        (
+            "GET",
+            "/evaluation/quality/trend?model=gpt-4",
+            body::Body::empty(),
+            false,
+        ),
+        ("GET", "/evaluation/slo/dashboard", body::Body::empty(), false),
+        (
+            "POST",
+            "/evaluation/training-data/extract",
+            body::Body::from(r#"{}"#),
+            true,
+        ),
+    ];
+    for (method, uri, b, json_ct) in cases {
+        let resp = oneshot_eval(app.clone(), method, uri, b, json_ct).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_IMPLEMENTED,
+            "{method} {uri}"
+        );
+    }
 }
