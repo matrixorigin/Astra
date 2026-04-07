@@ -1,10 +1,13 @@
-//! Skill lifecycle hooks and tool event hooks.
+//! Skill lifecycle hooks, tool event hooks, and session event hooks.
 //!
-//! Two hook systems coexist:
+//! Three hook systems coexist:
 //!
 //! 1. **Skill lifecycle hooks** (`SkillHooks`) — pre/post invocation of a skill itself.
 //! 2. **Tool event hooks** (`ToolEventHook`) — fire on any tool call matching a pattern,
 //!    inspired by Claude Code's PreToolUse / PostToolUse system.
+//! 3. **Session event hooks** (`SessionEventHook`) — fire on session lifecycle events
+//!    (SessionStart, SessionEnd, UserPromptSubmit, SubagentStart), compatible with
+//!    Claude Code's hook event model.
 
 use serde::{Deserialize, Serialize};
 
@@ -169,9 +172,26 @@ const HOOK_CONFIG_CANDIDATES: &[&str] = &["hooks.json", "hooks.yaml", "hooks.yml
 /// `<project_root>/.astra/`. Returns an empty registry if no file is found
 /// or if parsing fails (with a warning log).
 pub fn load_tool_event_hooks(project_root: &std::path::Path) -> ToolEventHookRegistry {
+    let (tool_hooks, _) = load_all_hooks(project_root);
+    tool_hooks
+}
+
+/// Load session event hooks from the project's `.astra/` directory.
+pub fn load_session_event_hooks(project_root: &std::path::Path) -> SessionEventHookRegistry {
+    let (_, session_hooks) = load_all_hooks(project_root);
+    session_hooks
+}
+
+/// Load both tool and session event hooks from a single config file.
+pub fn load_all_hooks(
+    project_root: &std::path::Path,
+) -> (ToolEventHookRegistry, SessionEventHookRegistry) {
     let astra_dir = project_root.join(".astra");
     if !astra_dir.is_dir() {
-        return ToolEventHookRegistry::default();
+        return (
+            ToolEventHookRegistry::default(),
+            SessionEventHookRegistry::default(),
+        );
     }
 
     for candidate in HOOK_CONFIG_CANDIDATES {
@@ -179,20 +199,24 @@ pub fn load_tool_event_hooks(project_root: &std::path::Path) -> ToolEventHookReg
         if path.is_file() {
             match std::fs::read_to_string(&path) {
                 Ok(content) => {
-                    let hooks = if candidate.ends_with(".json") {
-                        parse_hooks_json(&content, &path)
+                    let (tool_hooks, session_hooks) = if candidate.ends_with(".json") {
+                        parse_all_hooks_json(&content, &path)
                     } else {
-                        parse_hooks_yaml(&content, &path)
+                        parse_all_hooks_yaml(&content, &path)
                     };
-                    if !hooks.is_empty() {
+                    if !tool_hooks.is_empty() || !session_hooks.is_empty() {
                         astra_core::agent_warn!(
                             "hook",
-                            "Loaded {} tool event hooks from {}",
-                            hooks.len(),
+                            "Loaded {} tool + {} session hooks from {}",
+                            tool_hooks.len(),
+                            session_hooks.len(),
                             path.display()
                         );
                     }
-                    return ToolEventHookRegistry::new(hooks);
+                    return (
+                        ToolEventHookRegistry::new(tool_hooks),
+                        SessionEventHookRegistry::new(session_hooks),
+                    );
                 }
                 Err(e) => {
                     astra_core::agent_warn!("hook", "Failed to read {}: {}", path.display(), e);
@@ -201,26 +225,37 @@ pub fn load_tool_event_hooks(project_root: &std::path::Path) -> ToolEventHookReg
         }
     }
 
-    ToolEventHookRegistry::default()
+    (
+        ToolEventHookRegistry::default(),
+        SessionEventHookRegistry::default(),
+    )
 }
 
 /// JSON format: top-level array of ToolEventHook objects, or an object with a "hooks" key
-/// and optional `default_timeout_secs`.
-fn parse_hooks_json(content: &str, path: &std::path::Path) -> Vec<ToolEventHook> {
-    // Try direct array first
+/// and optional `default_timeout_secs`. Session hooks live under `"session_hooks"`.
+fn parse_all_hooks_json(
+    content: &str,
+    path: &std::path::Path,
+) -> (Vec<ToolEventHook>, Vec<SessionEventHook>) {
+    // Try direct array first (legacy: tool hooks only)
     if let Ok(hooks) = serde_json::from_str::<Vec<ToolEventHook>>(content) {
-        return hooks;
+        return (hooks, Vec::new());
     }
 
-    // Try { "hooks": [...], "default_timeout_secs": N } wrapper
+    // Try wrapper with both tool and session hooks
     #[derive(serde::Deserialize)]
     struct Wrapper {
         #[serde(default)]
         hooks: Vec<ToolEventHook>,
+        #[serde(default)]
+        session_hooks: Vec<SessionEventHook>,
         default_timeout_secs: Option<u32>,
     }
     if let Ok(w) = serde_json::from_str::<Wrapper>(content) {
-        return apply_default_timeout(w.hooks, w.default_timeout_secs);
+        return (
+            apply_default_timeout(w.hooks, w.default_timeout_secs),
+            apply_default_timeout_session(w.session_hooks, w.default_timeout_secs),
+        );
     }
 
     astra_core::agent_warn!(
@@ -228,14 +263,17 @@ fn parse_hooks_json(content: &str, path: &std::path::Path) -> Vec<ToolEventHook>
         "Failed to parse {}: expected JSON array or {{\"hooks\": [...]}}",
         path.display()
     );
-    Vec::new()
+    (Vec::new(), Vec::new())
 }
 
-/// YAML format: same as JSON — top-level list or `hooks:` key with optional `default_timeout_secs`.
-fn parse_hooks_yaml(content: &str, path: &std::path::Path) -> Vec<ToolEventHook> {
-    // Try direct array
+/// YAML format: same as JSON — top-level list or `hooks:` + `session_hooks:` keys.
+fn parse_all_hooks_yaml(
+    content: &str,
+    path: &std::path::Path,
+) -> (Vec<ToolEventHook>, Vec<SessionEventHook>) {
+    // Try direct array (legacy: tool hooks only)
     if let Ok(hooks) = serde_yaml::from_str::<Vec<ToolEventHook>>(content) {
-        return hooks;
+        return (hooks, Vec::new());
     }
 
     // Try wrapper
@@ -243,10 +281,15 @@ fn parse_hooks_yaml(content: &str, path: &std::path::Path) -> Vec<ToolEventHook>
     struct Wrapper {
         #[serde(default)]
         hooks: Vec<ToolEventHook>,
+        #[serde(default)]
+        session_hooks: Vec<SessionEventHook>,
         default_timeout_secs: Option<u32>,
     }
     if let Ok(w) = serde_yaml::from_str::<Wrapper>(content) {
-        return apply_default_timeout(w.hooks, w.default_timeout_secs);
+        return (
+            apply_default_timeout(w.hooks, w.default_timeout_secs),
+            apply_default_timeout_session(w.session_hooks, w.default_timeout_secs),
+        );
     }
 
     astra_core::agent_warn!(
@@ -254,7 +297,7 @@ fn parse_hooks_yaml(content: &str, path: &std::path::Path) -> Vec<ToolEventHook>
         "Failed to parse {}: expected YAML list or `hooks:` mapping",
         path.display()
     );
-    Vec::new()
+    (Vec::new(), Vec::new())
 }
 
 /// Apply `default_timeout_secs` to hooks that still have the built-in default (10).
@@ -273,7 +316,53 @@ fn apply_default_timeout(
     hooks
 }
 
+/// Apply `default_timeout_secs` to session hooks that still have the built-in default.
+fn apply_default_timeout_session(
+    mut hooks: Vec<SessionEventHook>,
+    default: Option<u32>,
+) -> Vec<SessionEventHook> {
+    if let Some(dt) = default {
+        let builtin = default_hook_timeout();
+        for h in &mut hooks {
+            if h.timeout_secs == builtin {
+                h.timeout_secs = dt;
+            }
+        }
+    }
+    hooks
+}
+
 // ── Hook execution ──────────────────────────────────────────────────────────
+
+/// Maximum bytes to read from a hook's stdout. Prevents a runaway hook from
+/// consuming unbounded memory. 256 KiB is generous for JSON context output.
+pub(crate) const HOOK_STDOUT_MAX_BYTES: usize = 256 * 1024;
+
+/// Read up to [`HOOK_STDOUT_MAX_BYTES`] from an async reader.
+pub(crate) async fn read_capped(reader: &mut (impl tokio::io::AsyncRead + Unpin)) -> Vec<u8> {
+    use tokio::io::AsyncReadExt;
+    let mut buf = Vec::with_capacity(4096);
+    let mut tmp = [0u8; 8192];
+    loop {
+        match reader.read(&mut tmp).await {
+            Ok(0) => break,
+            Ok(n) => {
+                let remaining = HOOK_STDOUT_MAX_BYTES - buf.len();
+                buf.extend_from_slice(&tmp[..n.min(remaining)]);
+                if buf.len() >= HOOK_STDOUT_MAX_BYTES {
+                    break;
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    buf
+}
+
+/// Convenience: fire SessionEnd hooks, ignoring output.
+pub async fn fire_session_end(registry: &SessionEventHookRegistry, session_id: &str) {
+    let _ = evaluate_session_hooks(registry, SessionEvent::SessionEnd, session_id, None).await;
+}
 
 /// Execute all PreToolUse hooks matching a tool name.
 ///
@@ -390,7 +479,7 @@ async fn run_shell_pre_hook(
     tool_args: &serde_json::Value,
     timeout_secs: u32,
 ) -> PreToolDecision {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::io::AsyncWriteExt;
     use tokio::process::Command;
 
     let input = serde_json::json!({
@@ -421,23 +510,29 @@ async fn run_shell_pre_hook(
     let mut stdout_handle = child.stdout.take();
     let timeout = std::time::Duration::from_secs(timeout_secs as u64);
 
-    let wait_result = tokio::time::timeout(timeout, child.wait()).await;
+    // Read stdout first (capped) to prevent pipe-full deadlock, then wait.
+    let read_fut = async {
+        let buf = match stdout_handle.as_mut() {
+            Some(s) => read_capped(s).await,
+            None => Vec::new(),
+        };
+        let status = child.wait().await;
+        (buf, status)
+    };
+
+    let wait_result = tokio::time::timeout(timeout, read_fut).await;
     match wait_result {
-        Ok(Ok(status)) => {
-            if !status.success() {
-                return PreToolDecision::Block(format!(
-                    "Hook '{}' exited with status {}",
-                    command,
-                    status.code().unwrap_or(-1)
-                ));
-            }
-            let mut buf = Vec::new();
-            if let Some(ref mut stdout) = stdout_handle {
-                let _ = stdout.read_to_end(&mut buf).await;
-            }
+        Ok((_, Ok(status))) if !status.success() => {
+            PreToolDecision::Block(format!(
+                "Hook '{}' exited with status {}",
+                command,
+                status.code().unwrap_or(-1)
+            ))
+        }
+        Ok((buf, Ok(_))) => {
             parse_pre_hook_output(&buf)
         }
-        Ok(Err(e)) => {
+        Ok((_, Err(e))) => {
             astra_core::agent_warn!("hook", "Hook I/O error for '{}': {}", command, e);
             PreToolDecision::Allow
         }
@@ -459,7 +554,7 @@ async fn run_shell_post_hook(
     tool_output: &str,
     timeout_secs: u32,
 ) -> Option<String> {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::io::AsyncWriteExt;
     use tokio::process::Command;
 
     let input = serde_json::json!({
@@ -491,12 +586,18 @@ async fn run_shell_post_hook(
     let mut stdout_handle = child.stdout.take();
     let timeout = std::time::Duration::from_secs(timeout_secs as u64);
 
-    match tokio::time::timeout(timeout, child.wait()).await {
-        Ok(Ok(status)) if status.success() => {
-            let mut buf = Vec::new();
-            if let Some(ref mut stdout) = stdout_handle {
-                let _ = stdout.read_to_end(&mut buf).await;
-            }
+    // Read stdout first (capped) to prevent pipe-full deadlock, then wait.
+    let read_fut = async {
+        let buf = match stdout_handle.as_mut() {
+            Some(s) => read_capped(s).await,
+            None => Vec::new(),
+        };
+        let status = child.wait().await;
+        (buf, status)
+    };
+
+    match tokio::time::timeout(timeout, read_fut).await {
+        Ok((buf, Ok(status))) if status.success() => {
             parse_post_hook_output(&buf)
         }
         _ => {
@@ -580,6 +681,249 @@ pub enum SkillLifecycleEvent {
     },
     /// A skill invocation failed.
     Failed { name: String, error: String },
+}
+
+// ── Session event hooks (CC-compatible) ─────────────────────────────────
+
+/// Session lifecycle events that can trigger hooks.
+///
+/// Compatible with Claude Code's hook event model.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionEvent {
+    /// Fires once when a new session begins, before the first LLM turn.
+    SessionStart,
+    /// Fires when a session ends (explicit `/quit`, timeout, or graceful close).
+    SessionEnd,
+    /// Fires after the user submits a prompt, before tool selection / LLM call.
+    UserPromptSubmit,
+    /// Fires when a sub-agent (delegation) is spawned.
+    SubagentStart,
+}
+
+/// A single session event hook configuration.
+///
+/// Configured in `.astra/hooks.json` / `.astra/hooks.yaml` alongside tool event hooks.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionEventHook {
+    /// Which session event triggers this hook.
+    pub event: SessionEvent,
+    /// The action to execute when the event fires.
+    pub action: HookAction,
+    /// Timeout in seconds for shell actions (default: 10).
+    #[serde(default = "default_hook_timeout")]
+    pub timeout_secs: u32,
+}
+
+/// Output from a session event hook execution.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SessionHookOutput {
+    /// Context to inject into the conversation (e.g. greeting, env info).
+    pub context: Option<String>,
+    /// Environment variables to set.
+    pub env_vars: Vec<(String, String)>,
+}
+
+/// Registry of session event hooks with lookup by event type.
+#[derive(Clone, Debug, Default)]
+pub struct SessionEventHookRegistry {
+    hooks: Vec<SessionEventHook>,
+}
+
+impl SessionEventHookRegistry {
+    pub fn new(hooks: Vec<SessionEventHook>) -> Self {
+        Self { hooks }
+    }
+
+    /// Return all hooks matching the given event.
+    pub fn matching(&self, event: SessionEvent) -> Vec<&SessionEventHook> {
+        self.hooks.iter().filter(|h| h.event == event).collect()
+    }
+
+    /// Check if any hooks exist for the given event (no allocation).
+    pub fn has_event(&self, event: SessionEvent) -> bool {
+        self.hooks.iter().any(|h| h.event == event)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.hooks.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.hooks.len()
+    }
+}
+
+/// Execute all hooks for a session event.
+///
+/// Shell hooks receive event info via stdin JSON:
+/// ```json
+/// {"hook_event": "session_start", "session_id": "...", "user_message": "hello"}
+/// ```
+///
+/// And produce optional JSON output:
+/// ```json
+/// {"context": "Welcome back! Last session was about X."}
+/// ```
+pub async fn evaluate_session_hooks(
+    registry: &SessionEventHookRegistry,
+    event: SessionEvent,
+    session_id: &str,
+    user_message: Option<&str>,
+) -> SessionHookOutput {
+    let hooks = registry.matching(event);
+    if hooks.is_empty() {
+        return SessionHookOutput::default();
+    }
+
+    let mut output = SessionHookOutput::default();
+    let mut contexts: Vec<String> = Vec::new();
+
+    for hook in hooks {
+        match &hook.action {
+            HookAction::Shell { command } => {
+                if let Some(result) =
+                    run_shell_session_hook(command, event, session_id, user_message, hook.timeout_secs)
+                        .await
+                {
+                    if let Some(ctx) = result.context {
+                        contexts.push(ctx);
+                    }
+                    output.env_vars.extend(result.env_vars);
+                }
+            }
+            HookAction::SetEnv { key, value } => {
+                output.env_vars.push((key.clone(), value.clone()));
+            }
+            HookAction::Custom { id, .. } => {
+                astra_core::agent_warn!(
+                    "hook",
+                    "Custom session hook '{}' for {:?} — not yet implemented",
+                    id,
+                    event
+                );
+            }
+        }
+    }
+
+    if !contexts.is_empty() {
+        output.context = Some(contexts.join("\n"));
+    }
+    output
+}
+
+/// Run a shell command for a session event hook.
+async fn run_shell_session_hook(
+    command: &str,
+    event: SessionEvent,
+    session_id: &str,
+    user_message: Option<&str>,
+    timeout_secs: u32,
+) -> Option<SessionHookOutput> {
+    use tokio::io::AsyncWriteExt;
+    use tokio::process::Command;
+
+    let input = serde_json::json!({
+        "hook_event": event,
+        "session_id": session_id,
+        "user_message": user_message,
+    });
+
+    let mut child = match Command::new("sh")
+        .args(["-c", command])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            astra_core::agent_warn!("hook", "Failed to spawn session hook '{}': {}", command, e);
+            return None;
+        }
+    };
+
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(input.to_string().as_bytes()).await;
+        drop(stdin);
+    }
+
+    let mut stdout_handle = child.stdout.take();
+    let timeout = std::time::Duration::from_secs(timeout_secs as u64);
+
+    // Read stdout first (capped) to prevent pipe-full deadlock, then wait.
+    let read_fut = async {
+        let buf = match stdout_handle.as_mut() {
+            Some(s) => read_capped(s).await,
+            None => Vec::new(),
+        };
+        let status = child.wait().await;
+        (buf, status)
+    };
+
+    match tokio::time::timeout(timeout, read_fut).await {
+        Ok((buf, Ok(status))) if status.success() => {
+            Some(parse_session_hook_output(&buf))
+        }
+        Ok((_, Ok(status))) => {
+            astra_core::agent_warn!(
+                "hook",
+                "Session hook '{}' exited with status {}",
+                command,
+                status.code().unwrap_or(-1)
+            );
+            None
+        }
+        Ok((_, Err(e))) => {
+            astra_core::agent_warn!("hook", "Session hook I/O error for '{}': {}", command, e);
+            None
+        }
+        Err(_) => {
+            let _ = child.kill().await;
+            astra_core::agent_warn!(
+                "hook",
+                "Session hook '{}' timed out after {}s",
+                command,
+                timeout_secs
+            );
+            None
+        }
+    }
+}
+
+/// Parse stdout from a session event hook.
+///
+/// Expected JSON: `{"context": "...", "env": {"KEY": "VALUE"}}`
+/// Plain text stdout is treated as context.
+fn parse_session_hook_output(stdout: &[u8]) -> SessionHookOutput {
+    let text = String::from_utf8_lossy(stdout);
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return SessionHookOutput::default();
+    }
+
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(trimmed) {
+        let context = v.get("context").and_then(|c| c.as_str()).map(String::from);
+        let env_vars = v
+            .get("env")
+            .and_then(|e| e.as_object())
+            .map(|obj| {
+                obj.iter()
+                    .filter_map(|(k, v)| v.as_str().map(|val| (k.clone(), val.to_string())))
+                    .collect()
+            })
+            .unwrap_or_default();
+        SessionHookOutput {
+            context,
+            env_vars,
+        }
+    } else {
+        // Plain text → treat as context
+        SessionHookOutput {
+            context: Some(trimmed.to_string()),
+            env_vars: Vec::new(),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1455,5 +1799,314 @@ hooks:
         // No default → no change
         let result = apply_default_timeout(hooks, None);
         assert_eq!(result[0].timeout_secs, 10);
+    }
+
+    // ── Session event hook tests ────────────────────────────────────
+
+    #[test]
+    fn session_event_serde_roundtrip() {
+        let hook = SessionEventHook {
+            event: SessionEvent::SessionStart,
+            action: HookAction::Shell {
+                command: "echo hello".into(),
+            },
+            timeout_secs: 5,
+        };
+        let json = serde_json::to_string(&hook).unwrap();
+        let parsed: SessionEventHook = serde_json::from_str(&json).unwrap();
+        assert_eq!(hook, parsed);
+    }
+
+    #[test]
+    fn session_event_all_variants_deserialize() {
+        for (name, expected) in [
+            ("session_start", SessionEvent::SessionStart),
+            ("session_end", SessionEvent::SessionEnd),
+            ("user_prompt_submit", SessionEvent::UserPromptSubmit),
+            ("subagent_start", SessionEvent::SubagentStart),
+        ] {
+            let json = format!(
+                r#"{{"event":"{}","action":{{"type":"shell","command":"x"}}}}"#,
+                name
+            );
+            let hook: SessionEventHook = serde_json::from_str(&json).unwrap();
+            assert_eq!(hook.event, expected);
+        }
+    }
+
+    #[test]
+    fn session_registry_matching() {
+        let registry = SessionEventHookRegistry::new(vec![
+            SessionEventHook {
+                event: SessionEvent::SessionStart,
+                action: HookAction::Shell {
+                    command: "greet".into(),
+                },
+                timeout_secs: 5,
+            },
+            SessionEventHook {
+                event: SessionEvent::SessionEnd,
+                action: HookAction::Shell {
+                    command: "cleanup".into(),
+                },
+                timeout_secs: 5,
+            },
+            SessionEventHook {
+                event: SessionEvent::SessionStart,
+                action: HookAction::SetEnv {
+                    key: "SESSION".into(),
+                    value: "1".into(),
+                },
+                timeout_secs: 10,
+            },
+        ]);
+        assert_eq!(registry.len(), 3);
+        assert_eq!(registry.matching(SessionEvent::SessionStart).len(), 2);
+        assert_eq!(registry.matching(SessionEvent::SessionEnd).len(), 1);
+        assert_eq!(registry.matching(SessionEvent::UserPromptSubmit).len(), 0);
+    }
+
+    #[test]
+    fn session_registry_empty() {
+        let registry = SessionEventHookRegistry::default();
+        assert!(registry.is_empty());
+        assert!(registry.matching(SessionEvent::SessionStart).is_empty());
+    }
+
+    #[test]
+    fn parse_session_hook_output_json_context() {
+        let stdout = br#"{"context": "Welcome back!"}"#;
+        let out = parse_session_hook_output(stdout);
+        assert_eq!(out.context.as_deref(), Some("Welcome back!"));
+        assert!(out.env_vars.is_empty());
+    }
+
+    #[test]
+    fn parse_session_hook_output_json_env() {
+        let stdout = br#"{"context": "hi", "env": {"FOO": "bar", "BAZ": "qux"}}"#;
+        let out = parse_session_hook_output(stdout);
+        assert_eq!(out.context.as_deref(), Some("hi"));
+        assert_eq!(out.env_vars.len(), 2);
+        assert!(out.env_vars.contains(&("FOO".into(), "bar".into())));
+    }
+
+    #[test]
+    fn parse_session_hook_output_plain_text() {
+        let stdout = b"Hello, xupeng!";
+        let out = parse_session_hook_output(stdout);
+        assert_eq!(out.context.as_deref(), Some("Hello, xupeng!"));
+        assert!(out.env_vars.is_empty());
+    }
+
+    #[test]
+    fn parse_session_hook_output_empty() {
+        let out = parse_session_hook_output(b"");
+        assert!(out.context.is_none());
+        assert!(out.env_vars.is_empty());
+    }
+
+    #[test]
+    fn load_session_hooks_from_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let astra = dir.path().join(".astra");
+        std::fs::create_dir_all(&astra).unwrap();
+        let json = r#"{
+            "hooks": [],
+            "session_hooks": [
+                {
+                    "event": "session_start",
+                    "action": {"type": "shell", "command": "echo greeting"},
+                    "timeout_secs": 3
+                }
+            ]
+        }"#;
+        std::fs::write(astra.join("hooks.json"), json).unwrap();
+
+        let registry = load_session_event_hooks(dir.path());
+        assert_eq!(registry.len(), 1);
+        assert_eq!(registry.matching(SessionEvent::SessionStart).len(), 1);
+    }
+
+    #[test]
+    fn load_session_hooks_from_yaml() {
+        let dir = tempfile::tempdir().unwrap();
+        let astra = dir.path().join(".astra");
+        std::fs::create_dir_all(&astra).unwrap();
+        let yaml = r#"
+hooks: []
+session_hooks:
+  - event: session_start
+    action:
+      type: shell
+      command: echo hi
+  - event: session_end
+    action:
+      type: shell
+      command: echo bye
+"#;
+        std::fs::write(astra.join("hooks.yaml"), yaml).unwrap();
+
+        let registry = load_session_event_hooks(dir.path());
+        assert_eq!(registry.len(), 2);
+    }
+
+    #[test]
+    fn load_session_hooks_legacy_array_returns_empty() {
+        // Legacy format (plain array) has no session_hooks key → empty
+        let dir = tempfile::tempdir().unwrap();
+        let astra = dir.path().join(".astra");
+        std::fs::create_dir_all(&astra).unwrap();
+        let json = r#"[
+            {"event": "pre_tool_use", "matcher": "bash", "action": {"type": "shell", "command": "x"}}
+        ]"#;
+        std::fs::write(astra.join("hooks.json"), json).unwrap();
+
+        let registry = load_session_event_hooks(dir.path());
+        assert!(registry.is_empty());
+    }
+
+    #[test]
+    fn load_session_hooks_default_timeout_applied() {
+        let dir = tempfile::tempdir().unwrap();
+        let astra = dir.path().join(".astra");
+        std::fs::create_dir_all(&astra).unwrap();
+        let json = r#"{
+            "default_timeout_secs": 30,
+            "hooks": [],
+            "session_hooks": [
+                {"event": "session_start", "action": {"type": "shell", "command": "greet"}},
+                {"event": "session_end", "action": {"type": "shell", "command": "bye"}, "timeout_secs": 5}
+            ]
+        }"#;
+        std::fs::write(astra.join("hooks.json"), json).unwrap();
+
+        let registry = load_session_event_hooks(dir.path());
+        let start = registry.matching(SessionEvent::SessionStart);
+        assert_eq!(start[0].timeout_secs, 30, "should inherit default_timeout_secs");
+        let end = registry.matching(SessionEvent::SessionEnd);
+        assert_eq!(end[0].timeout_secs, 5, "explicit timeout should be preserved");
+    }
+
+    #[test]
+    fn load_both_tool_and_session_hooks() {
+        let dir = tempfile::tempdir().unwrap();
+        let astra = dir.path().join(".astra");
+        std::fs::create_dir_all(&astra).unwrap();
+        let json = r#"{
+            "hooks": [
+                {"event": "pre_tool_use", "matcher": "bash", "action": {"type": "shell", "command": "check"}}
+            ],
+            "session_hooks": [
+                {"event": "session_start", "action": {"type": "shell", "command": "greet"}}
+            ]
+        }"#;
+        std::fs::write(astra.join("hooks.json"), json).unwrap();
+
+        let tool_reg = load_tool_event_hooks(dir.path());
+        let session_reg = load_session_event_hooks(dir.path());
+        assert_eq!(tool_reg.len(), 1);
+        assert_eq!(session_reg.len(), 1);
+    }
+
+    // ── E2E: session hook execution ─────────────────────────────────
+
+    #[tokio::test]
+    async fn e2e_session_start_hook_returns_context() {
+        let registry = SessionEventHookRegistry::new(vec![SessionEventHook {
+            event: SessionEvent::SessionStart,
+            action: HookAction::Shell {
+                command: r#"echo '{"context": "Welcome back, user!"}'"#.into(),
+            },
+            timeout_secs: 5,
+        }]);
+
+        let output =
+            evaluate_session_hooks(&registry, SessionEvent::SessionStart, "test-session", Some("hello"))
+                .await;
+        assert_eq!(output.context.as_deref(), Some("Welcome back, user!"));
+    }
+
+    #[tokio::test]
+    async fn e2e_session_hook_set_env() {
+        let registry = SessionEventHookRegistry::new(vec![SessionEventHook {
+            event: SessionEvent::SessionStart,
+            action: HookAction::SetEnv {
+                key: "GREETING".into(),
+                value: "done".into(),
+            },
+            timeout_secs: 10,
+        }]);
+
+        let output =
+            evaluate_session_hooks(&registry, SessionEvent::SessionStart, "s1", None).await;
+        assert!(output.context.is_none());
+        assert_eq!(output.env_vars, vec![("GREETING".into(), "done".into())]);
+    }
+
+    #[tokio::test]
+    async fn e2e_session_hook_no_match_returns_default() {
+        let registry = SessionEventHookRegistry::new(vec![SessionEventHook {
+            event: SessionEvent::SessionEnd,
+            action: HookAction::Shell {
+                command: "echo bye".into(),
+            },
+            timeout_secs: 5,
+        }]);
+
+        let output =
+            evaluate_session_hooks(&registry, SessionEvent::SessionStart, "s1", None).await;
+        assert!(output.context.is_none());
+        assert!(output.env_vars.is_empty());
+    }
+
+    #[tokio::test]
+    async fn e2e_session_hook_multiple_contexts_joined() {
+        let registry = SessionEventHookRegistry::new(vec![
+            SessionEventHook {
+                event: SessionEvent::SessionStart,
+                action: HookAction::Shell {
+                    command: r#"echo '{"context": "hook1"}'"#.into(),
+                },
+                timeout_secs: 5,
+            },
+            SessionEventHook {
+                event: SessionEvent::SessionStart,
+                action: HookAction::Shell {
+                    command: r#"echo '{"context": "hook2"}'"#.into(),
+                },
+                timeout_secs: 5,
+            },
+        ]);
+
+        let output =
+            evaluate_session_hooks(&registry, SessionEvent::SessionStart, "s1", Some("hi")).await;
+        let ctx = output.context.unwrap();
+        assert!(ctx.contains("hook1"));
+        assert!(ctx.contains("hook2"));
+    }
+
+    #[tokio::test]
+    async fn e2e_session_hook_failed_command_skipped() {
+        let registry = SessionEventHookRegistry::new(vec![SessionEventHook {
+            event: SessionEvent::SessionStart,
+            action: HookAction::Shell {
+                command: "exit 1".into(),
+            },
+            timeout_secs: 5,
+        }]);
+
+        let output =
+            evaluate_session_hooks(&registry, SessionEvent::SessionStart, "s1", None).await;
+        // Failed hook is skipped, no context
+        assert!(output.context.is_none());
+    }
+
+    #[tokio::test]
+    async fn e2e_session_hook_empty_registry() {
+        let registry = SessionEventHookRegistry::default();
+        let output =
+            evaluate_session_hooks(&registry, SessionEvent::SessionStart, "s1", None).await;
+        assert!(output.context.is_none());
+        assert!(output.env_vars.is_empty());
     }
 }

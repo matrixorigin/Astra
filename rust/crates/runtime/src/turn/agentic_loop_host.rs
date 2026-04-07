@@ -267,6 +267,10 @@ pub struct AgenticLoopState {
     /// Loaded from `.astra/hooks.json` or skill frontmatter.
     pub tool_event_hooks: crate::skills::hooks::ToolEventHookRegistry,
 
+    /// Session event hooks (SessionStart, SessionEnd, etc.).
+    /// Loaded from `.astra/hooks.json` alongside tool event hooks.
+    pub session_event_hooks: crate::skills::hooks::SessionEventHookRegistry,
+
     // ── Stop hooks ──
     /// Verification commands run before the loop is allowed to complete.
     /// For plan subtasks, populated from declarative `when: task_completed` hooks.
@@ -799,6 +803,33 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
     host: &mut H,
     state: &mut AgenticLoopState,
 ) -> Result<AgenticLoopOutcome, String> {
+    // ─── Preamble: fire SessionStart hooks ───────────────────────────────
+    if state.session_event_hooks.has_event(crate::skills::hooks::SessionEvent::SessionStart) {
+        let session_id = state.current_session_id.as_deref().unwrap_or("");
+        let user_msg = state.message.as_str();
+        let hook_output = crate::skills::hooks::evaluate_session_hooks(
+            &state.session_event_hooks,
+            crate::skills::hooks::SessionEvent::SessionStart,
+            session_id,
+            Some(user_msg),
+        )
+        .await;
+        // Inject context as a system message before the first user message.
+        if let Some(ctx) = hook_output.context {
+            state.messages.insert(
+                0,
+                serde_json::json!({
+                    "role": "system",
+                    "content": format!("[Session hooks]\n{ctx}"),
+                }),
+            );
+        }
+        for (key, value) in hook_output.env_vars {
+            // Safety: session hooks run once at startup, before concurrent tool execution.
+            unsafe { std::env::set_var(&key, &value) };
+        }
+    }
+
     // ─── Preamble: auto-inject delegate tool when delegation is wired ────
     if state.delegation_engine.is_some() {
         host.inject_tool_schema(delegate_tool_schema());
@@ -1048,6 +1079,16 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
         // and execute them as multi-agent coordination runs.
         let (delegation_results, remaining_tool_calls) =
             if let Some(engine) = &state.delegation_engine {
+                // Fire SubagentStart hooks before delegation.
+                if turn_result.accum.tool_calls.iter().any(is_delegation_call) {
+                    let _ = crate::skills::hooks::evaluate_session_hooks(
+                        &state.session_event_hooks,
+                        crate::skills::hooks::SessionEvent::SubagentStart,
+                        state.current_session_id.as_deref().unwrap_or(""),
+                        None,
+                    )
+                    .await;
+                }
                 partition_and_execute_delegations(
                     &turn_result.accum.tool_calls,
                     engine,
@@ -1893,6 +1934,7 @@ mod tests {
             discovered_skills: HashSet::new(),
             skill_search: astra_core::SkillSearchSettings::default(),
             tool_event_hooks: crate::skills::hooks::ToolEventHookRegistry::default(),
+            session_event_hooks: crate::skills::hooks::SessionEventHookRegistry::default(),
             stop_hooks: Vec::new(),
             stop_hook_runs: 0,
             teammate_idle_hooks: Vec::new(),
@@ -4572,6 +4614,301 @@ mod tests {
         assert!(
             outcome.is_err(),
             "non-rate-limit error should always be fatal",
+        );
+    }
+
+    // ── Session event hooks: multi-turn integration tests ───────────────
+
+    #[tokio::test]
+    async fn session_start_hook_injects_context_before_first_turn() {
+        // Hook: shell that returns greeting context
+        let hooks = crate::skills::hooks::SessionEventHookRegistry::new(vec![
+            crate::skills::hooks::SessionEventHook {
+                event: crate::skills::hooks::SessionEvent::SessionStart,
+                action: crate::skills::hooks::HookAction::Shell {
+                    command: r#"echo '{"context": "Branch: main | Last session: audit"}'"#.into(),
+                },
+                timeout_secs: 5,
+            },
+        ]);
+
+        // Two turns: first turn sees the injected context, second turn completes
+        let mut host = MockHost::new(vec![
+            // Turn 1: LLM sees the hook context + user message, responds with tool call
+            edge_tool_result(
+                vec![make_edge_tool("bash", "xupeng\n")],
+                100,
+                20,
+                Some(50),
+            ),
+            // Turn 2: LLM produces final text
+            text_result("Hello xupeng! Branch: main", 120, 30, Some(30)),
+        ]);
+        host = host.with_valid_tools(&["bash"]);
+
+        let mut state = make_state();
+        state.session_event_hooks = hooks;
+        state.current_session_id = Some("test-session-123".to_string());
+        state.message = "hello".to_string();
+        state
+            .messages
+            .push(json!({"role": "user", "content": "hello"}));
+
+        let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
+        assert!(matches!(outcome, Ok(AgenticLoopOutcome::Completed)));
+
+        // Verify: hook context was injected as the first message (before user message)
+        let first_msg = &state.messages[0];
+        let content = first_msg["content"].as_str().unwrap();
+        assert!(
+            content.contains("Branch: main"),
+            "first message should contain hook context, got: {content}"
+        );
+        assert!(
+            content.contains("[Session hooks]"),
+            "should be tagged as session hooks"
+        );
+
+        // Verify: user message follows the hook context
+        let user_msg = state
+            .messages
+            .iter()
+            .find(|m| m["role"] == "user")
+            .expect("should have user message");
+        assert_eq!(user_msg["content"], "hello");
+
+        // Verify: final text includes the greeting
+        assert!(state.final_text.contains("Hello xupeng"));
+    }
+
+    #[tokio::test]
+    async fn session_start_hook_env_vars_are_set() {
+        let hooks = crate::skills::hooks::SessionEventHookRegistry::new(vec![
+            crate::skills::hooks::SessionEventHook {
+                event: crate::skills::hooks::SessionEvent::SessionStart,
+                action: crate::skills::hooks::HookAction::SetEnv {
+                    key: "ASTRA_TEST_HOOK_VAR".into(),
+                    value: "session_active".into(),
+                },
+                timeout_secs: 10,
+            },
+        ]);
+
+        let mut host = MockHost::new(vec![text_result("done", 10, 5, Some(10))]);
+        let mut state = make_state();
+        state.session_event_hooks = hooks;
+        state
+            .messages
+            .push(json!({"role": "user", "content": "test"}));
+
+        let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
+        assert!(matches!(outcome, Ok(AgenticLoopOutcome::Completed)));
+
+        // Verify env var was set
+        assert_eq!(
+            std::env::var("ASTRA_TEST_HOOK_VAR").ok().as_deref(),
+            Some("session_active")
+        );
+        // Cleanup
+        unsafe { std::env::remove_var("ASTRA_TEST_HOOK_VAR") };
+    }
+
+    #[tokio::test]
+    async fn session_start_hook_multiple_hooks_context_merged() {
+        let hooks = crate::skills::hooks::SessionEventHookRegistry::new(vec![
+            crate::skills::hooks::SessionEventHook {
+                event: crate::skills::hooks::SessionEvent::SessionStart,
+                action: crate::skills::hooks::HookAction::Shell {
+                    command: r#"echo '{"context": "git: main, 3 uncommitted"}'"#.into(),
+                },
+                timeout_secs: 5,
+            },
+            crate::skills::hooks::SessionEventHook {
+                event: crate::skills::hooks::SessionEvent::SessionStart,
+                action: crate::skills::hooks::HookAction::Shell {
+                    command: r#"echo '{"context": "last session: reviewed PR #42"}'"#.into(),
+                },
+                timeout_secs: 5,
+            },
+        ]);
+
+        let mut host = MockHost::new(vec![text_result("ok", 10, 5, Some(10))]);
+        let mut state = make_state();
+        state.session_event_hooks = hooks;
+        state
+            .messages
+            .push(json!({"role": "user", "content": "hi"}));
+
+        let _ = run_agentic_loop_with_host(&mut host, &mut state).await;
+
+        let first_content = state.messages[0]["content"].as_str().unwrap();
+        assert!(
+            first_content.contains("3 uncommitted"),
+            "should contain first hook context"
+        );
+        assert!(
+            first_content.contains("PR #42"),
+            "should contain second hook context"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_start_hook_failure_does_not_block_session() {
+        let hooks = crate::skills::hooks::SessionEventHookRegistry::new(vec![
+            crate::skills::hooks::SessionEventHook {
+                event: crate::skills::hooks::SessionEvent::SessionStart,
+                action: crate::skills::hooks::HookAction::Shell {
+                    command: "exit 1".into(), // fails
+                },
+                timeout_secs: 5,
+            },
+        ]);
+
+        let mut host = MockHost::new(vec![text_result("Hello!", 10, 5, Some(10))]);
+        let mut state = make_state();
+        state.session_event_hooks = hooks;
+        state
+            .messages
+            .push(json!({"role": "user", "content": "hello"}));
+
+        let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
+        assert!(
+            matches!(outcome, Ok(AgenticLoopOutcome::Completed)),
+            "session should complete even when hook fails"
+        );
+        assert_eq!(state.final_text, "Hello!");
+
+        // No hook context injected (hook failed)
+        assert!(
+            !state.messages[0]["content"]
+                .as_str()
+                .unwrap_or("")
+                .contains("[Session hooks]"),
+            "failed hook should not inject context"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_session_hooks_skips_preamble() {
+        // Empty registry — no hooks fire, no context injected
+        let mut host = MockHost::new(vec![text_result("Hi", 10, 5, Some(10))]);
+        let mut state = make_state();
+        state
+            .messages
+            .push(json!({"role": "user", "content": "hello"}));
+
+        let msg_count_before = state.messages.len();
+        let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
+        assert!(matches!(outcome, Ok(AgenticLoopOutcome::Completed)));
+
+        // No extra messages were injected at position 0
+        // (the first message should still be the user message, not a system hook message)
+        let first_role = state.messages[0]["role"].as_str().unwrap();
+        assert_eq!(first_role, "user", "no hook context should be injected");
+    }
+
+    #[tokio::test]
+    async fn session_hook_receives_user_message_in_stdin() {
+        // Hook script reads stdin JSON and echoes user_message back as context
+        let hooks = crate::skills::hooks::SessionEventHookRegistry::new(vec![
+            crate::skills::hooks::SessionEventHook {
+                event: crate::skills::hooks::SessionEvent::SessionStart,
+                action: crate::skills::hooks::HookAction::Shell {
+                    command: r#"python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+msg = d.get('user_message', '')
+print(json.dumps({'context': 'user said: ' + msg}))
+""#
+                    .into(),
+                },
+                timeout_secs: 5,
+            },
+        ]);
+
+        let mut host = MockHost::new(vec![text_result("ok", 10, 5, Some(10))]);
+        let mut state = make_state();
+        state.session_event_hooks = hooks;
+        state.message = "analyze my code".to_string();
+        state
+            .messages
+            .push(json!({"role": "user", "content": "analyze my code"}));
+
+        let _ = run_agentic_loop_with_host(&mut host, &mut state).await;
+
+        let first_content = state.messages[0]["content"].as_str().unwrap();
+        assert!(
+            first_content.contains("user said: analyze my code"),
+            "hook should receive the user message, got: {first_content}"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_end_hooks_not_fired_at_start() {
+        // Only SessionEnd hooks — should NOT fire during SessionStart preamble
+        let hooks = crate::skills::hooks::SessionEventHookRegistry::new(vec![
+            crate::skills::hooks::SessionEventHook {
+                event: crate::skills::hooks::SessionEvent::SessionEnd,
+                action: crate::skills::hooks::HookAction::Shell {
+                    command: r#"echo '{"context": "SHOULD NOT APPEAR"}'"#.into(),
+                },
+                timeout_secs: 5,
+            },
+        ]);
+
+        let mut host = MockHost::new(vec![text_result("done", 10, 5, Some(10))]);
+        let mut state = make_state();
+        state.session_event_hooks = hooks;
+        state
+            .messages
+            .push(json!({"role": "user", "content": "test"}));
+
+        let _ = run_agentic_loop_with_host(&mut host, &mut state).await;
+
+        // No hook context should be injected (SessionEnd doesn't fire at start)
+        for msg in &state.messages {
+            let content = msg["content"].as_str().unwrap_or("");
+            assert!(
+                !content.contains("SHOULD NOT APPEAR"),
+                "SessionEnd hook should not fire at session start"
+            );
+        }
+    }
+
+    // ── read_capped tests ───────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn read_capped_limits_large_hook_output() {
+        // A hook that outputs more than 256 KiB should be truncated
+        use crate::skills::hooks::HOOK_STDOUT_MAX_BYTES;
+        let registry = crate::skills::hooks::SessionEventHookRegistry::new(vec![
+            crate::skills::hooks::SessionEventHook {
+                event: crate::skills::hooks::SessionEvent::SessionStart,
+                action: crate::skills::hooks::HookAction::Shell {
+                    // dd outputs exactly 300 KiB of zeros, fast
+                    command: format!(
+                        "dd if=/dev/zero bs=1024 count={} 2>/dev/null | tr '\\0' 'x'",
+                        (HOOK_STDOUT_MAX_BYTES + 50_000) / 1024
+                    ),
+                },
+                timeout_secs: 5,
+            },
+        ]);
+
+        let output = crate::skills::hooks::evaluate_session_hooks(
+            &registry,
+            crate::skills::hooks::SessionEvent::SessionStart,
+            "s1",
+            None,
+        )
+        .await;
+        // Output should exist but be capped (plain text → context)
+        let ctx = output.context.unwrap();
+        assert!(
+            ctx.len() <= HOOK_STDOUT_MAX_BYTES,
+            "context should be capped at {} bytes, got {}",
+            HOOK_STDOUT_MAX_BYTES,
+            ctx.len()
         );
     }
 }

@@ -243,9 +243,9 @@ impl AgenticRunLifecycleService {
             .unwrap_or_default();
         let workspace_root_hint = project_root_buf.map(|p| p.to_string_lossy().into_owned());
         let skill_search = request.skill_search.clone().unwrap_or_default();
-        let tool_event_hooks = workspace_root_hint
+        let (tool_event_hooks, session_event_hooks) = workspace_root_hint
             .as_ref()
-            .map(|root| crate::skills::hooks::load_tool_event_hooks(std::path::Path::new(root)))
+            .map(|root| crate::skills::hooks::load_all_hooks(std::path::Path::new(root)))
             .unwrap_or_default();
 
         AgenticLoopState {
@@ -309,6 +309,7 @@ impl AgenticRunLifecycleService {
             discovered_skills: std::collections::HashSet::new(),
             skill_search,
             tool_event_hooks,
+            session_event_hooks,
             stop_hooks: hook_sets.stop_hooks,
             stop_hook_runs: 0,
             teammate_idle_hooks: hook_sets.teammate_idle_hooks,
@@ -431,6 +432,10 @@ impl RunLifecycleService for AgenticRunLifecycleService {
 
         tokio::spawn(async move {
             let outcome = run_agentic_loop_with_host(&mut host, &mut loop_state).await;
+
+            // Fire SessionEnd hooks (best-effort, non-blocking).
+            crate::skills::hooks::fire_session_end(&loop_state.session_event_hooks,
+                loop_state.current_session_id.as_deref().unwrap_or("")).await;
 
             let mut events = host.take_emitted_events();
             let (final_status, error_msg) = match outcome {
@@ -568,7 +573,13 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         // Run the agentic loop
         let mut all_events = vec![json!({"event_type": "run_started", "data": {}})];
 
-        match run_agentic_loop_with_host(&mut host, &mut state).await {
+        let loop_result = run_agentic_loop_with_host(&mut host, &mut state).await;
+
+        // Fire SessionEnd hooks (best-effort).
+        crate::skills::hooks::fire_session_end(&state.session_event_hooks,
+            state.current_session_id.as_deref().unwrap_or("")).await;
+
+        match loop_result {
             Ok(_outcome) => {
                 // Collect all events emitted by the host during the loop
                 all_events.extend(host.take_emitted_events());
@@ -910,9 +921,9 @@ impl SubRunExecutor for ServerSubRunExecutor {
             })
             .unwrap_or_default();
         let workspace_root_hint = project_root_buf.map(|p| p.to_string_lossy().into_owned());
-        let tool_event_hooks = workspace_root_hint
+        let (tool_event_hooks, session_event_hooks) = workspace_root_hint
             .as_ref()
-            .map(|root| crate::skills::hooks::load_tool_event_hooks(std::path::Path::new(root)))
+            .map(|root| crate::skills::hooks::load_all_hooks(std::path::Path::new(root)))
             .unwrap_or_default();
 
         let (skill_registry, skill_resolver) = build_server_skill_resolver();
@@ -978,6 +989,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
             discovered_skills: std::collections::HashSet::new(),
             skill_search: skill_search_from_context(&config.context),
             tool_event_hooks,
+            session_event_hooks,
             stop_hooks: hook_sets.stop_hooks,
             stop_hook_runs: 0,
             teammate_idle_hooks: hook_sets.teammate_idle_hooks,
@@ -998,6 +1010,10 @@ impl SubRunExecutor for ServerSubRunExecutor {
         };
 
         let outcome = run_agentic_loop_with_host(&mut host, &mut loop_state).await;
+
+        // Fire SessionEnd hooks (best-effort).
+        crate::skills::hooks::fire_session_end(&loop_state.session_event_hooks,
+            loop_state.current_session_id.as_deref().unwrap_or("")).await;
 
         match outcome {
             Ok(AgenticLoopOutcome::Completed) => Ok(astra_services::coordination::AgentResult {

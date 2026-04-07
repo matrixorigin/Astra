@@ -1123,6 +1123,7 @@ mod tests {
             discovered_skills: std::collections::HashSet::new(),
             skill_search: astra_core::SkillSearchSettings::default(),
             tool_event_hooks: crate::skills::hooks::ToolEventHookRegistry::default(),
+            session_event_hooks: crate::skills::hooks::SessionEventHookRegistry::default(),
             stop_hooks: Vec::new(),
             stop_hook_runs: 0,
             teammate_idle_hooks: Vec::new(),
