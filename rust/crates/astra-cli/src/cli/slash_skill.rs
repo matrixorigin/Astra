@@ -63,7 +63,7 @@ pub(super) async fn handle_skill_command(
             eprintln!(
                 "    {}  {}",
                 "/skill search <query>".cyan(),
-                "Semantic search".dim()
+                "Keyword match (name, tags, description, …)".dim()
             );
             eprintln!(
                 "    {}  {}",
@@ -83,12 +83,7 @@ pub(super) async fn handle_skill_command(
             eprintln!(
                 "    {}  {}",
                 "/skill test <name>".cyan(),
-                "Run skill tests".dim()
-            );
-            eprintln!(
-                "    {}  {}",
-                "/skill validate <name>".cyan(),
-                "Validate manifest".dim()
+                "API test or local manifest check (+ hooks)".dim()
             );
             eprintln!(
                 "    {}  {}",
@@ -107,8 +102,8 @@ pub(super) async fn handle_skill_command(
             );
             eprintln!(
                 "    {}  {}",
-                "/skill config".cyan(),
-                "Skill system config".dim()
+                "/skill info <name> --raw".cyan(),
+                "Print YAML frontmatter (on-disk)".dim()
             );
             eprintln!();
             eprintln!("  {}", "Marketplace:".dim());
@@ -228,7 +223,12 @@ pub(super) async fn handle_skill_command(
                 .collect();
             scored.sort_by(|a, b| b.1.cmp(&a.1));
 
-            eprintln!("\n  {} '{}'", "Search results for".dim(), query.cyan());
+            eprintln!(
+                "\n  {} '{}' {}",
+                "Keyword matches for".dim(),
+                query.cyan(),
+                "(not vector search)".dim()
+            );
             eprintln!("{}", "\u{2500}".repeat(78).dim());
 
             if scored.is_empty() {
@@ -289,20 +289,45 @@ pub(super) async fn handle_skill_command(
         }
 
         "info" => {
-            let name = sub_arg.trim();
+            let (name, raw_config) = parse_skill_info_args(sub_arg);
             if name.is_empty() {
-                eprintln!("{}", "  Usage: /skill info <name>".yellow());
+                eprintln!("{}", "  Usage: /skill info <name> [--raw]".yellow());
                 return Ok(());
             }
             let registry = &state.unified_skill_registry;
-            match registry.get_manifest(name) {
+            if raw_config {
+                match registry.get_manifest(name.as_str()) {
+                    None => {
+                        eprintln!(
+                            "  {}",
+                            format!("✗ Skill '{name}' not found in catalog").yellow()
+                        );
+                    }
+                    Some(_) => match resolve_skill_dir_on_disk(name.as_str()) {
+                        Some(ref dir) => {
+                            if let Err(e) = print_skill_directory_raw(name.as_str(), dir) {
+                                eprintln!("  {}", e.red());
+                            }
+                        }
+                        None => {
+                            eprintln!(
+                                "  {}",
+                                format!("No on-disk SKILL.md for '{name}' (e.g. MCP-only).").yellow()
+                            );
+                        }
+                    },
+                }
+                eprintln!();
+                return Ok(());
+            }
+            match registry.get_manifest(name.as_str()) {
                 None => {
                     eprintln!("  {}", format!("✗ Skill '{name}' not found").yellow());
                     // Suggest similar names
                     let all = registry.skill_names();
                     let suggestions: Vec<_> = all
                         .iter()
-                        .filter(|n| n.contains(name) || name.contains(n.as_str()))
+                        .filter(|n| n.contains(name.as_str()) || name.contains(n.as_str()))
                         .take(5)
                         .collect();
                     if !suggestions.is_empty() {
@@ -378,7 +403,7 @@ pub(super) async fn handle_skill_command(
                     }
 
                     // Show instruction preview if loaded
-                    if let Some(loaded) = registry.get_loaded_skill(name) {
+                    if let Some(loaded) = registry.get_loaded_skill(name.as_str()) {
                         eprintln!(
                             "\n  {} ({} tokens)",
                             "Instructions:".dim(),
@@ -509,50 +534,45 @@ Follow these steps:
             };
 
             if !api_ok {
-                let skill_dir = std::env::current_dir()
-                    .map_err(|e| e.to_string())?
-                    .join(".astra/skills")
-                    .join(name);
+                let skill_dir = match resolve_skill_dir_on_disk(name) {
+                    Some(p) => p,
+                    None => {
+                        eprintln!(
+                            "{}",
+                            format!(
+                                "  \u{2717} Skill directory not found for '{name}' (searched .astra/skills, skills/, ~/.astra/skills)"
+                            )
+                            .yellow()
+                        );
+                        eprintln!();
+                        return Ok(());
+                    }
+                };
                 let skill_md = skill_dir.join("SKILL.md");
                 let test_file = skill_dir.join("test_skill.py");
 
                 if skill_md.exists() {
-                    eprintln!("  Validating SKILL.md...");
+                    eprintln!("  Validating SKILL.md ({})...", skill_dir.display());
                     let src = std::fs::read_to_string(&skill_md).map_err(|e| e.to_string())?;
-                    let mut ok = true;
-                    if !src.starts_with("---") {
-                        eprintln!("  {}", "\u{2717} Missing frontmatter".red());
-                        ok = false;
+                    let issues = collect_skill_md_issues(name, &src);
+                    let mut ok = issues.is_empty();
+                    if !issues.is_empty() {
+                        for issue in &issues {
+                            eprintln!("  {}", format!("\u{2717} {issue}").red());
+                        }
                     } else if let Some(end) = src[3..].find("\n---") {
                         let yaml = &src[3..3 + end];
-                        match serde_yaml::from_str::<serde_json::Value>(yaml) {
-                            Ok(val) => {
-                                let sname = val.get("name").and_then(|v| v.as_str()).unwrap_or("");
-                                if sname.is_empty() {
-                                    eprintln!("  {}", "\u{2717} Frontmatter `name` is empty".red());
-                                    ok = false;
-                                }
-                                eprintln!("  Manifest name: {}", sname.cyan());
-                            }
-                            Err(e) => {
-                                eprintln!("  {}", format!("\u{2717} Invalid YAML: {e}").red());
-                                ok = false;
-                            }
+                        if let Ok(val) = serde_yaml::from_str::<serde_json::Value>(yaml) {
+                            let sname = val.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                            eprintln!("  Manifest name: {}", sname.cyan());
                         }
                         let body = &src[3 + end + 4..];
-                        if body.trim().is_empty() {
-                            eprintln!("  {}", "\u{2717} Empty instruction body".red());
-                            ok = false;
-                        } else {
-                            eprintln!("  Instruction body: {} chars", body.len());
-                        }
-                    } else {
-                        eprintln!("  {}", "\u{2717} Unclosed frontmatter".red());
-                        ok = false;
+                        eprintln!("  Instruction body: {} chars", body.len());
                     }
 
-                    if let Ok((manifest, _body)) =
-                        astra_runtime::skills::loader::parse_skill_md(&src)
+                    if ok
+                        && let Ok((manifest, _body)) =
+                            astra_runtime::skills::loader::parse_skill_md(&src)
                     {
                         if let Some(ref hooks) = manifest.hooks {
                             if !hooks.pre_invoke.is_empty() {
@@ -767,168 +787,78 @@ Follow these steps:
             };
 
             if !api_ok {
-                let skills_base = std::env::current_dir()
-                    .map_err(|e| e.to_string())?
-                    .join(".astra/skills");
-                if !skills_base.exists() {
-                    eprintln!(
-                        "  {}",
-                        "No local skills found (.astra/skills/ does not exist).".dim()
-                    );
+                eprintln!(
+                    "  {}",
+                    "Local view: unified catalog + on-disk paths (.astra/skills, skills/, ~/.astra/skills)."
+                        .dim()
+                );
+                let registry = &state.unified_skill_registry;
+                let mut manifests = registry.all_manifests();
+                if manifests.is_empty() {
+                    eprintln!("  {}", "No skills discovered in catalog.".dim());
+                    eprintln!();
                     return Ok(());
                 }
-                eprintln!(
-                    "{}",
-                    format!("{:<28}  {:<12}  {}", "Name", "SKILL.md", "Format").bold()
-                );
-                eprintln!("{}", "\u{2500}".repeat(60).dim());
-                let entries = std::fs::read_dir(&skills_base).map_err(|e| e.to_string())?;
-                let mut found = false;
-                for entry in entries.flatten() {
-                    if entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
-                        let name = entry.file_name().to_string_lossy().to_string();
-                        let has_skill_md = entry.path().join("SKILL.md").exists();
-                        let has_legacy = entry.path().join("skill.py").exists();
-                        let md_s = if has_skill_md {
-                            "\u{2713}".green().to_string()
-                        } else {
-                            "\u{2717} missing".red().to_string()
-                        };
-                        let format_s = if has_skill_md {
-                            "unified"
-                        } else if has_legacy {
-                            "legacy (skill.py)"
-                        } else {
-                            "unknown"
-                        };
-                        eprintln!("  {:<26}  {:<12}  {}", name.cyan(), md_s, format_s.dim());
-                        found = true;
-                    }
-                }
-                if !found {
-                    eprintln!("  {}", "No skill directories found.".dim());
-                }
-                eprintln!();
-            }
-        }
-
-        "validate" => {
-            let name = sub_arg;
-            if name.is_empty() {
-                eprintln!("{}", "  Usage: /skill validate <name>".yellow());
-                return Ok(());
-            }
-            let skill_dir = std::env::current_dir()
-                .map_err(|e| e.to_string())?
-                .join(".astra/skills")
-                .join(name);
-            let skill_md_path = skill_dir.join("SKILL.md");
-            if !skill_md_path.exists() {
-                eprintln!(
-                    "{}",
-                    format!("  \u{2717} SKILL.md not found in {}", skill_dir.display()).red()
-                );
-                return Ok(());
-            }
-            let src = std::fs::read_to_string(&skill_md_path).map_err(|e| e.to_string())?;
-            let mut issues: Vec<String> = Vec::new();
-
-            // Validate YAML frontmatter
-            if !src.starts_with("---") {
-                issues.push("missing YAML frontmatter (must start with ---)".to_string());
-            } else if let Some(end) = src[3..].find("\n---") {
-                let yaml_block = &src[3..3 + end];
-                match serde_yaml::from_str::<serde_json::Value>(yaml_block) {
-                    Ok(val) => {
-                        if val
-                            .get("name")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("")
-                            .is_empty()
-                        {
-                            issues.push("frontmatter `name` is missing or empty".to_string());
-                        }
-                    }
-                    Err(e) => {
-                        issues.push(format!("invalid YAML frontmatter: {e}"));
-                    }
-                }
-                let body = &src[3 + end + 4..];
-                if body.trim().is_empty() {
-                    issues
-                        .push("instruction body is empty (content after frontmatter)".to_string());
-                }
-            } else {
-                issues.push("unclosed frontmatter (missing closing ---)".to_string());
-            }
-
-            if issues.is_empty() {
-                eprintln!(
-                    "  {} {}",
-                    "\u{2713}".green(),
-                    format!("{name} looks valid").green()
-                );
-            } else {
-                eprintln!("  {} {} issue(s):", "\u{2717}".red(), issues.len());
-                for issue in &issues {
-                    eprintln!("    - {}", issue.as_str().yellow());
-                }
-            }
-        }
-
-        "config" => {
-            let name = sub_arg;
-            if name.is_empty() {
-                eprintln!("{}", "  Usage: /skill config <name>".yellow());
-                return Ok(());
-            }
-            let skill_dir = std::env::current_dir()
-                .map_err(|e| e.to_string())?
-                .join(".astra/skills")
-                .join(name);
-            let skill_md_path = skill_dir.join("SKILL.md");
-            let json_path = skill_dir.join("skill.json");
-            if skill_md_path.exists() {
-                let raw = std::fs::read_to_string(&skill_md_path).map_err(|e| e.to_string())?;
-                if raw.starts_with("---") {
-                    if let Some(end) = raw[3..].find("\n---") {
-                        let yaml_block = &raw[3..3 + end];
-                        eprintln!(
-                            "\n{}",
-                            format!("─── {name}/SKILL.md frontmatter ────────────────────────────")
-                                .bold()
-                        );
-                        for line in yaml_block.lines() {
-                            eprintln!("  {line}");
-                        }
-                        eprintln!();
-                    } else {
-                        eprintln!("  {}", "Unclosed frontmatter in SKILL.md".yellow());
-                    }
-                } else {
-                    eprintln!("  {}", "SKILL.md has no frontmatter".yellow());
-                }
-            } else if json_path.exists() {
-                let raw = std::fs::read_to_string(&json_path).map_err(|e| e.to_string())?;
-                let value: serde_json::Value = serde_json::from_str(&raw).unwrap_or_default();
-                let pretty = serde_json::to_string_pretty(&value).unwrap_or(raw);
-                eprintln!(
-                    "\n{}",
-                    format!("─── {name}/skill.json (legacy) ─────────────────────────────").bold()
-                );
-                for line in pretty.lines() {
-                    eprintln!("  {line}");
-                }
-                eprintln!();
-            } else {
+                manifests.sort_by(|a, b| a.name.cmp(&b.name));
                 eprintln!(
                     "{}",
                     format!(
-                        "  \u{2717} No SKILL.md or skill.json found in {}",
-                        skill_dir.display()
+                        "{:<24}  {:<10}  {:<8}  {}",
+                        "Name", "Source", "On disk", "Check"
                     )
-                    .red()
+                    .bold()
                 );
+                eprintln!("{}", "\u{2500}".repeat(72).dim());
+                for m in &manifests {
+                    use astra_runtime::skills::SkillSourceKind::*;
+                    let (disk_col, check_col): (String, String) = match m.source {
+                        Mcp | Database | Plugin => (
+                            "—".dim().to_string(),
+                            "(remote)".dim().to_string(),
+                        ),
+                        Local | Bundled => {
+                            let disk = resolve_skill_dir_on_disk(m.name.as_str());
+                            let disk_mark = if disk.is_some() {
+                                "\u{2713}".green().to_string()
+                            } else {
+                                "\u{2717}".red().to_string()
+                            };
+                            let check = if let Some(ref d) = disk {
+                                let md = d.join("SKILL.md");
+                                if md.exists() {
+                                    match std::fs::read_to_string(md) {
+                                        Ok(src) => {
+                                            let issues = collect_skill_md_issues(m.name.as_str(), &src);
+                                            if issues.is_empty() {
+                                                "ok".green().to_string()
+                                            } else {
+                                                format!("{} issue(s)", issues.len())
+                                                    .yellow()
+                                                    .to_string()
+                                            }
+                                        }
+                                        Err(e) => format!("read err: {e}").red().to_string(),
+                                    }
+                                } else if d.join("skill.py").exists() {
+                                    "legacy skill.py".dim().to_string()
+                                } else {
+                                    "no SKILL.md".yellow().to_string()
+                                }
+                            } else {
+                                "not found".yellow().to_string()
+                            };
+                            (disk_mark, check)
+                        }
+                    };
+                    eprintln!(
+                        "  {:<22}  {:<10}  {:<8}  {}",
+                        m.name.as_str().cyan(),
+                        source_label(&m.source).dim(),
+                        disk_col,
+                        check_col
+                    );
+                }
+                eprintln!();
             }
         }
 
@@ -1156,7 +1086,7 @@ Follow these steps:
                     );
                     eprintln!(
                         "  {}",
-                        "Tip: use '/skill search' for local-only search.".dim()
+                        "Tip: use '/skill search' for local keyword match (not vector search).".dim()
                     );
                 }
             }
@@ -1311,11 +1241,111 @@ Follow these steps:
         _ => {
             eprintln!(
                         "{}",
-                        format!("  Unknown /skill subcommand: '{sub}'. Try /skill list, /skill search, /skill search-remote, /skill browse, /skill trending, /skill installed, /skill info, /skill new, /skill create, /skill test, /skill dev, /skill doctor, /skill stats, /skill pin, /skill unpin, /skill install, /skill publish, /skill uninstall, /skill upgrade, /skill rollback, /skill check-update, /skill pack, /skill unpack, /skill inspect, /skill compose-info, /skill upload-quality").yellow()
+                        format!("  Unknown /skill subcommand: '{sub}'. Try /skill list, /skill search, /skill search-remote, /skill browse, /skill trending, /skill installed, /skill info, /skill info <n> --raw, /skill new, /skill create, /skill test, /skill dev, /skill doctor, /skill stats, /skill pin, /skill unpin, /skill install, /skill publish, /skill uninstall, /skill upgrade, /skill rollback, /skill check-update, /skill pack, /skill unpack, /skill inspect, /skill compose-info, /skill upload-quality").yellow()
                     );
         }
     }
     Ok(())
+}
+
+// ── Skill path + SKILL.md checks (info --raw, test, doctor) ──
+
+fn parse_skill_info_args(sub_arg: &str) -> (String, bool) {
+    const SUFFIX: &str = " --raw";
+    let s = sub_arg.trim();
+    if s.len() > SUFFIX.len() && s.ends_with(SUFFIX) {
+        return (s[..s.len() - SUFFIX.len()].trim().to_string(), true);
+    }
+    (s.to_string(), false)
+}
+
+/// Same resolution order as `/skill dev`: `.astra/skills`, `skills/`, `~/.astra/skills`.
+fn resolve_skill_dir_on_disk(name: &str) -> Option<std::path::PathBuf> {
+    crate::skill_instructions::skill_search_paths()
+        .into_iter()
+        .find_map(|base| {
+            let dir = base.join(name);
+            if dir.join("SKILL.md").exists() || dir.join("skill.py").exists() {
+                Some(dir)
+            } else {
+                None
+            }
+        })
+}
+
+fn collect_skill_md_issues(_skill_name: &str, src: &str) -> Vec<String> {
+    let mut issues: Vec<String> = Vec::new();
+    if !src.starts_with("---") {
+        issues.push("missing YAML frontmatter (must start with ---)".to_string());
+    } else if let Some(end) = src[3..].find("\n---") {
+        let yaml_block = &src[3..3 + end];
+        match serde_yaml::from_str::<serde_json::Value>(yaml_block) {
+            Ok(val) => {
+                if val
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .is_empty()
+                {
+                    issues.push("frontmatter `name` is missing or empty".to_string());
+                }
+            }
+            Err(e) => {
+                issues.push(format!("invalid YAML frontmatter: {e}"));
+            }
+        }
+        let body = &src[3 + end + 4..];
+        if body.trim().is_empty() {
+            issues.push("instruction body is empty (content after frontmatter)".to_string());
+        }
+    } else {
+        issues.push("unclosed frontmatter (missing closing ---)".to_string());
+    }
+    issues
+}
+
+fn print_skill_directory_raw(name: &str, skill_dir: &std::path::Path) -> Result<(), String> {
+    let skill_md_path = skill_dir.join("SKILL.md");
+    let json_path = skill_dir.join("skill.json");
+    if skill_md_path.exists() {
+        let raw = std::fs::read_to_string(&skill_md_path).map_err(|e| e.to_string())?;
+        if raw.starts_with("---") {
+            if let Some(end) = raw[3..].find("\n---") {
+                let yaml_block = &raw[3..3 + end];
+                eprintln!(
+                    "\n{}",
+                    format!("─── {name}/SKILL.md frontmatter ────────────────────────────").bold()
+                );
+                for line in yaml_block.lines() {
+                    eprintln!("  {line}");
+                }
+                eprintln!();
+            } else {
+                eprintln!("  {}", "Unclosed frontmatter in SKILL.md".yellow());
+            }
+        } else {
+            eprintln!("  {}", "SKILL.md has no frontmatter".yellow());
+        }
+        Ok(())
+    } else if json_path.exists() {
+        let raw = std::fs::read_to_string(&json_path).map_err(|e| e.to_string())?;
+        let value: serde_json::Value = serde_json::from_str(&raw).unwrap_or_default();
+        let pretty = serde_json::to_string_pretty(&value).unwrap_or(raw);
+        eprintln!(
+            "\n{}",
+            format!("─── {name}/skill.json (legacy) ─────────────────────────────").bold()
+        );
+        for line in pretty.lines() {
+            eprintln!("  {line}");
+        }
+        eprintln!();
+        Ok(())
+    } else {
+        Err(format!(
+            "\u{2717} No SKILL.md or skill.json in {}",
+            skill_dir.display()
+        ))
+    }
 }
 
 // ── List filtering helpers ──────────────────────────────────────────────
