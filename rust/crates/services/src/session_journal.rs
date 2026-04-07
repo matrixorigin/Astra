@@ -896,6 +896,200 @@ fn extract_json_str(line: &str, needle: &str) -> Option<String> {
     Some(rest[..end].replace("\\\"", "\"").replace("\\n", " "))
 }
 
+// ── Session cleanup / lifecycle ──────────────────────────────────────────────
+
+/// Metadata about a session that's a candidate for cleanup.
+#[derive(Debug, Clone)]
+pub struct StaleSessionInfo {
+    pub session_id: String,
+    /// File modification time of the journal.
+    pub last_modified: std::time::SystemTime,
+    /// Journal file size in bytes.
+    pub journal_bytes: u64,
+    /// Turn count (fast count, not full parse).
+    pub turns: u32,
+    /// Total disk usage: journal + workspace dir (recursive).
+    pub total_bytes: u64,
+}
+
+/// Find sessions whose journal file hasn't been modified in `max_age`.
+///
+/// `exclude_id` — the currently active session (never returned).
+pub fn find_stale_sessions(
+    max_age: std::time::Duration,
+    exclude_id: Option<&str>,
+) -> std::io::Result<Vec<StaleSessionInfo>> {
+    let dir = journal_dir();
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+    let cutoff = std::time::SystemTime::now()
+        .checked_sub(max_age)
+        .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+
+    let mut stale = Vec::new();
+    for entry in std::fs::read_dir(&dir)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let Some(sid) = name.strip_suffix(".jsonl") else {
+            continue;
+        };
+        if sid.starts_with("test-") || sid.starts_with("new-sess-") {
+            continue;
+        }
+        if exclude_id == Some(sid) {
+            continue;
+        }
+        let meta = entry.metadata()?;
+        let mtime = meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        if mtime >= cutoff {
+            continue; // still fresh
+        }
+        let journal_bytes = meta.len();
+        let turns = count_turns(sid);
+        let ws_dir = crate::session_workspace::workspace_dir_for(sid);
+        let ws_bytes = dir_size_recursive(&ws_dir);
+        stale.push(StaleSessionInfo {
+            session_id: sid.to_string(),
+            last_modified: mtime,
+            journal_bytes,
+            turns,
+            total_bytes: journal_bytes + ws_bytes,
+        });
+    }
+    // Sort oldest first
+    stale.sort_by_key(|s| s.last_modified);
+    Ok(stale)
+}
+
+/// Delete a session's journal file and workspace directory.
+///
+/// Returns `Ok(bytes_freed)` on success.
+pub fn delete_session(session_id: &str) -> std::io::Result<u64> {
+    validate_session_id(session_id).map_err(|e| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, e)
+    })?;
+    let journal = journal_file_path(session_id);
+    let ws_dir = crate::session_workspace::workspace_dir_for(session_id);
+    let mut freed = 0u64;
+    if journal.exists() {
+        freed += std::fs::metadata(&journal).map(|m| m.len()).unwrap_or(0);
+        std::fs::remove_file(&journal)?;
+    }
+    if ws_dir.exists() {
+        freed += dir_size_recursive(&ws_dir);
+        std::fs::remove_dir_all(&ws_dir)?;
+    }
+    Ok(freed)
+}
+
+/// Recursively compute total size of a directory (best-effort, ignores errors).
+fn dir_size_recursive(path: &std::path::Path) -> u64 {
+    if !path.is_dir() {
+        return 0;
+    }
+    walkdir(path)
+}
+
+fn walkdir(path: &std::path::Path) -> u64 {
+    let mut total = 0u64;
+    if let Ok(entries) = std::fs::read_dir(path) {
+        for entry in entries.flatten() {
+            let Ok(meta) = entry.metadata() else {
+                continue;
+            };
+            if meta.is_file() {
+                total += meta.len();
+            } else if meta.is_dir() {
+                total += walkdir(&entry.path());
+            }
+        }
+    }
+    total
+}
+
+/// Compress a session's `.jsonl` journal to `.jsonl.gz` and remove the original.
+///
+/// Returns `Ok((original_bytes, compressed_bytes))` on success.
+/// Only archives if the session has a `session_end` event (i.e., completed).
+pub fn archive_journal(session_id: &str) -> std::io::Result<(u64, u64)> {
+    use flate2::write::GzEncoder;
+    use flate2::Compression;
+    use std::io::Write;
+
+    validate_session_id(session_id).map_err(|e| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, e)
+    })?;
+    let src = journal_file_path(session_id);
+    if !src.exists() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("journal file not found for {session_id}"),
+        ));
+    }
+    // Check the journal has a session_end (don't archive active sessions)
+    let content = std::fs::read(&src)?;
+    if !content.windows(b"\"session_end\"".len()).any(|w| w == b"\"session_end\"") {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "session has no session_end event — still active?",
+        ));
+    }
+    let original_bytes = content.len() as u64;
+    let dst = journal_dir().join(format!("{session_id}.jsonl.gz"));
+    let out_file = std::fs::File::create(&dst)?;
+    let mut encoder = GzEncoder::new(out_file, Compression::default());
+    encoder.write_all(&content)?;
+    encoder.finish()?;
+    let compressed_bytes = std::fs::metadata(&dst)?.len();
+    std::fs::remove_file(&src)?;
+    Ok((original_bytes, compressed_bytes))
+}
+
+/// Find completed sessions eligible for archival (have session_end, not yet compressed).
+///
+/// `exclude_id` — the currently active session.
+pub fn find_archivable_sessions(
+    exclude_id: Option<&str>,
+) -> std::io::Result<Vec<(String, u64)>> {
+    let dir = journal_dir();
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut result = Vec::new();
+    for entry in std::fs::read_dir(&dir)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let Some(sid) = name.strip_suffix(".jsonl") else {
+            continue;
+        };
+        // Skip already-compressed (.jsonl.gz would not match .jsonl suffix)
+        if sid.ends_with(".jsonl") {
+            continue; // double extension guard
+        }
+        if sid.starts_with("test-") || sid.starts_with("new-sess-") {
+            continue;
+        }
+        if exclude_id == Some(sid) {
+            continue;
+        }
+        let meta = entry.metadata()?;
+        let bytes = meta.len();
+        // Quick check: has session_end?
+        let path = entry.path();
+        let has_end = std::fs::read_to_string(&path)
+            .map(|c| c.contains("\"session_end\""))
+            .unwrap_or(false);
+        if has_end {
+            result.push((sid.to_string(), bytes));
+        }
+    }
+    result.sort_by(|a, b| b.1.cmp(&a.1)); // largest first
+    Ok(result)
+}
+
 /// Resolve a session id to an exact journal filename stem.
 ///
 /// Accepts:
@@ -1097,7 +1291,7 @@ impl JournalEvent {
         evt.turn = Some(turn);
         evt.model = model.map(|s| s.to_string());
         evt.user_input = Some(truncate(user_input, 500));
-        evt.assistant_output = Some(truncate(assistant_output, 1000));
+        evt.assistant_output = Some(truncate(assistant_output, 10000));
         evt.tool_count = Some(tool_count);
         evt.tokens_in = Some(tokens_in);
         evt.tokens_out = Some(tokens_out);

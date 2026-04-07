@@ -361,7 +361,7 @@ pub(super) fn handle_session_command(arg: &str, state: &mut ReplState) {
             eprintln!();
             eprintln!(
                 "  {}",
-                "Subcommands: /session history · errors · export · list · fork".dim()
+                "Subcommands: /session history · errors · export · list · fork · cleanup · verify".dim()
             );
             eprintln!();
         }
@@ -940,11 +940,17 @@ pub(super) fn handle_session_command(arg: &str, state: &mut ReplState) {
             }
             export_session_markdown(&target_sid);
         }
+        "cleanup" => {
+            handle_session_cleanup(sub_arg, state);
+        }
+        "verify" | "sync" | "status" => {
+            handle_session_verify(state);
+        }
         other => {
             eprintln!("{}", format!("  Unknown subcommand: {other}").red());
             eprintln!(
                 "  {}",
-                "Usage: /session [history|list|errors|export|fork] …  (export → Markdown file)"
+                "Usage: /session [history|list|errors|export|fork|cleanup|verify] …"
                     .dim()
             );
         }
@@ -1095,6 +1101,419 @@ fn export_session_markdown(session_id: &str) {
         }
         Err(e) => eprintln!("{}", format!("  ✗ {e}").red()),
     }
+}
+
+// ── Session cleanup ─────────────────────────────────────────────────────────
+
+/// Handle `/session cleanup [--days N] [--force] [--compress]`.
+///
+/// Default: show stale sessions (>30 days) and ask for confirmation.
+/// `--days N` overrides the age threshold.
+/// `--force` skips the confirmation prompt.
+/// `--compress` archives completed journals to .jsonl.gz (instead of deleting).
+fn handle_session_cleanup(arg: &str, state: &ReplState) {
+    let tokens: Vec<&str> = arg.split_whitespace().collect();
+    let mut max_days: u64 = 30;
+    let mut force = false;
+    let mut compress = false;
+
+    let mut i = 0;
+    while i < tokens.len() {
+        match tokens[i] {
+            "--days" | "-d" => {
+                if i + 1 < tokens.len() {
+                    match tokens[i + 1].parse::<u64>() {
+                        Ok(d) if d > 0 => max_days = d,
+                        _ => {
+                            eprintln!(
+                                "{}",
+                                format!("  ✗ Invalid --days value: {}", tokens[i + 1]).red()
+                            );
+                            return;
+                        }
+                    }
+                    i += 2;
+                } else {
+                    eprintln!("{}", "  ✗ --days requires a number".red());
+                    return;
+                }
+            }
+            "--force" | "-f" => {
+                force = true;
+                i += 1;
+            }
+            "--compress" | "-c" => {
+                compress = true;
+                i += 1;
+            }
+            other => {
+                eprintln!(
+                    "{}",
+                    format!("  ✗ Unknown flag: {other}").red()
+                );
+                eprintln!(
+                    "  {}",
+                    "Usage: /session cleanup [--days N] [--force] [--compress]".dim()
+                );
+                return;
+            }
+        }
+    }
+
+    // If --compress with no --days, compress all completed sessions (not just stale)
+    if compress {
+        handle_compress(state, force);
+        return;
+    }
+
+    let max_age = std::time::Duration::from_secs(max_days * 86400);
+    let current_sid = state.session_id.as_deref();
+
+    let stale = match session_journal::find_stale_sessions(max_age, current_sid) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("{}", format!("  ✗ Failed to scan sessions: {e}").red());
+            return;
+        }
+    };
+
+    if stale.is_empty() {
+        eprintln!(
+            "  {} No sessions older than {} days found.",
+            theme::icon_ok(),
+            max_days
+        );
+        return;
+    }
+
+    let total_bytes: u64 = stale.iter().map(|s| s.total_bytes).sum();
+    eprintln!(
+        "\n  Found {} session(s) older than {} days ({}):\n",
+        stale.len().to_string().yellow(),
+        max_days,
+        human_bytes(total_bytes).yellow()
+    );
+
+    // Show at most 20 sessions in detail
+    let show_count = stale.len().min(20);
+    for info in &stale[..show_count] {
+        let age = info
+            .last_modified
+            .elapsed()
+            .map(|d| format_age_days(d))
+            .unwrap_or_else(|_| "?".to_string());
+        let short_id = if info.session_id.len() > 12 {
+            &info.session_id[..12]
+        } else {
+            &info.session_id
+        };
+        eprintln!(
+            "    {} {} turns, {}, {} ago",
+            short_id.dim(),
+            info.turns,
+            human_bytes(info.total_bytes).dim(),
+            age,
+        );
+    }
+    if stale.len() > show_count {
+        eprintln!("    … and {} more", stale.len() - show_count);
+    }
+    eprintln!();
+
+    if !force {
+        eprint!(
+            "  Delete all {} sessions? [y/N] ",
+            stale.len()
+        );
+        let _ = std::io::stderr().flush();
+        let mut input = String::new();
+        if std::io::stdin().read_line(&mut input).is_err() || !input.trim().eq_ignore_ascii_case("y")
+        {
+            eprintln!("  Cancelled.");
+            return;
+        }
+    }
+
+    let mut deleted = 0u64;
+    let mut freed = 0u64;
+    let mut errors = 0u64;
+    for info in &stale {
+        match session_journal::delete_session(&info.session_id) {
+            Ok(bytes) => {
+                deleted += 1;
+                freed += bytes;
+            }
+            Err(e) => {
+                errors += 1;
+                eprintln!(
+                    "    {} {}…: {}",
+                    theme::icon_err(),
+                    &info.session_id[..info.session_id.len().min(12)],
+                    e.to_string().red()
+                );
+            }
+        }
+    }
+
+    eprintln!(
+        "  {} Deleted {} session(s), freed {}",
+        theme::icon_ok(),
+        deleted.to_string().green(),
+        human_bytes(freed).green()
+    );
+    if errors > 0 {
+        eprintln!(
+            "  {} {} session(s) could not be deleted",
+            theme::icon_warn(),
+            errors
+        );
+    }
+}
+
+/// Compress completed session journals to .jsonl.gz.
+fn handle_compress(state: &ReplState, force: bool) {
+    let current_sid = state.session_id.as_deref();
+    let archivable = match session_journal::find_archivable_sessions(current_sid) {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("{}", format!("  ✗ Failed to scan: {e}").red());
+            return;
+        }
+    };
+
+    if archivable.is_empty() {
+        eprintln!(
+            "  {} No completed sessions to compress.",
+            theme::icon_ok()
+        );
+        return;
+    }
+
+    let total_bytes: u64 = archivable.iter().map(|(_, b)| b).sum();
+    eprintln!(
+        "\n  Found {} completed session(s) to compress ({}):\n",
+        archivable.len().to_string().yellow(),
+        human_bytes(total_bytes).yellow()
+    );
+
+    if !force {
+        eprint!(
+            "  Compress {} session journals? [y/N] ",
+            archivable.len()
+        );
+        let _ = std::io::stderr().flush();
+        let mut input = String::new();
+        if std::io::stdin().read_line(&mut input).is_err()
+            || !input.trim().eq_ignore_ascii_case("y")
+        {
+            eprintln!("  Cancelled.");
+            return;
+        }
+    }
+
+    let mut compressed = 0u64;
+    let mut saved = 0u64;
+    let mut errors = 0u64;
+    for (sid, _) in &archivable {
+        match session_journal::archive_journal(sid) {
+            Ok((orig, comp)) => {
+                compressed += 1;
+                saved += orig.saturating_sub(comp);
+            }
+            Err(e) => {
+                errors += 1;
+                let short = &sid[..sid.len().min(12)];
+                eprintln!("    {} {short}…: {}", theme::icon_err(), e.to_string().red());
+            }
+        }
+    }
+
+    eprintln!(
+        "  {} Compressed {} session(s), saved {}",
+        theme::icon_ok(),
+        compressed.to_string().green(),
+        human_bytes(saved).green()
+    );
+    if errors > 0 {
+        eprintln!(
+            "  {} {} session(s) could not be compressed",
+            theme::icon_warn(),
+            errors
+        );
+    }
+}
+
+fn human_bytes(bytes: u64) -> String {
+    if bytes < 1024 {
+        format!("{bytes} B")
+    } else if bytes < 1024 * 1024 {
+        format!("{:.1} KB", bytes as f64 / 1024.0)
+    } else if bytes < 1024 * 1024 * 1024 {
+        format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
+    } else {
+        format!("{:.1} GB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
+    }
+}
+
+fn format_age_days(d: std::time::Duration) -> String {
+    let days = d.as_secs() / 86400;
+    if days == 0 {
+        "today".to_string()
+    } else if days == 1 {
+        "1 day".to_string()
+    } else {
+        format!("{days} days")
+    }
+}
+
+// ── Session verify / sync status ────────────────────────────────────────────
+
+/// Show local journal vs cloud ingestion sync health.
+fn handle_session_verify(state: &ReplState) {
+    let sid = state.session_id.as_deref().unwrap_or("none");
+    eprintln!(
+        "\n{}",
+        "─── Sync Health ─────────────────────────────────".bold()
+    );
+
+    // Local journal stats
+    let journal_events = if sid != "none" {
+        session_journal::read_journal(sid)
+            .map(|evts| evts.len())
+            .unwrap_or(0)
+    } else {
+        0
+    };
+    let journal_path = if sid != "none" {
+        let p = session_journal::journal_file_path(sid);
+        if p.exists() {
+            let bytes = std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0);
+            format!(
+                "{} ({})",
+                tilde_path(&p.display().to_string()),
+                human_bytes(bytes)
+            )
+        } else {
+            "not found".to_string()
+        }
+    } else {
+        "—".to_string()
+    };
+
+    eprintln!("  {}", "Local journal".dim());
+    eprintln!("    {:<20} {}", "events:".dim(), journal_events.to_string().cyan());
+    eprintln!("    {:<20} {}", "file:".dim(), journal_path.dim());
+
+    // Cloud ingestion stats
+    if let Some(ref mc) = state.matrix_runtime {
+        eprintln!();
+        eprintln!("  {}", "Cloud ingestion".dim());
+        if let Some(stats) = mc.ingestion_stats() {
+            let lag = stats.events_received.saturating_sub(stats.events_flushed);
+            eprintln!(
+                "    {:<20} {}",
+                "received:".dim(),
+                stats.events_received.to_string().cyan()
+            );
+            eprintln!(
+                "    {:<20} {}",
+                "flushed:".dim(),
+                stats.events_flushed.to_string().cyan()
+            );
+            eprintln!(
+                "    {:<20} {}",
+                "flushes:".dim(),
+                stats.flush_count.to_string().cyan()
+            );
+            let overflow = mc.ingestion_overflow_count();
+            if lag > 0 {
+                eprintln!(
+                    "    {:<20} {}",
+                    "pending:".dim(),
+                    lag.to_string().yellow()
+                );
+            } else {
+                eprintln!(
+                    "    {:<20} {}",
+                    "pending:".dim(),
+                    "0 (synced)".green()
+                );
+            }
+            if overflow > 0 {
+                eprintln!(
+                    "    {:<20} {}",
+                    "dropped:".dim(),
+                    overflow.to_string().red()
+                );
+            }
+            if stats.errors > 0 {
+                eprintln!(
+                    "    {:<20} {}",
+                    "errors:".dim(),
+                    stats.errors.to_string().red()
+                );
+                if let Some(ref last_err) = stats.last_error {
+                    let truncated = if last_err.len() > 80 {
+                        format!("{}…", &last_err[..80])
+                    } else {
+                        last_err.clone()
+                    };
+                    eprintln!(
+                        "    {:<20} {}",
+                        "last error:".dim(),
+                        truncated.red()
+                    );
+                }
+            }
+        } else {
+            eprintln!("    {}", "stats unavailable (lock contention)".dim());
+        }
+    } else {
+        eprintln!();
+        eprintln!("  {} Cloud not connected", "⚠".yellow());
+    }
+
+    // Session disk usage summary
+    if sid != "none" {
+        let sessions_dir = session_journal::local_sessions_dir();
+        let all_sessions = session_journal::list_sessions().unwrap_or_default();
+        let total_journals: u64 = all_sessions
+            .iter()
+            .filter_map(|s| {
+                std::fs::metadata(sessions_dir.join(format!("{s}.jsonl")))
+                    .ok()
+                    .map(|m| m.len())
+            })
+            .sum();
+        let compressed: usize = std::fs::read_dir(&sessions_dir)
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .filter(|e| {
+                        e.file_name()
+                            .to_string_lossy()
+                            .ends_with(".jsonl.gz")
+                    })
+                    .count()
+            })
+            .unwrap_or(0);
+
+        eprintln!();
+        eprintln!("  {}", "Disk".dim());
+        eprintln!(
+            "    {:<20} {} active, {} archived",
+            "sessions:".dim(),
+            all_sessions.len().to_string().cyan(),
+            compressed.to_string().cyan()
+        );
+        eprintln!(
+            "    {:<20} {}",
+            "journal total:".dim(),
+            human_bytes(total_journals).cyan()
+        );
+    }
+
+    eprintln!();
 }
 
 #[cfg(test)]

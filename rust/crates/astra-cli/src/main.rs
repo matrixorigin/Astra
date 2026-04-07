@@ -153,6 +153,78 @@ use slash_session::resolve_journal_target_session;
 use slash_skill::handle_skill_command;
 use slash_state::{StateCommandContext, handle_state_command};
 
+// ── Panic-safe & signal-safe session guard ────────────────────────────────────
+// On panic or SIGTERM, writes a `session_end` event to the local journal
+// so the session file is properly closed even on unexpected crashes.
+
+/// Session context stored globally so the panic/signal hooks can write `session_end`.
+struct PanicSessionGuard {
+    session_id: String,
+    turn: u32,
+}
+
+static PANIC_SESSION_GUARD: std::sync::Mutex<Option<PanicSessionGuard>> =
+    std::sync::Mutex::new(None);
+
+/// Best-effort write of `session_end` to journal from the global guard.
+/// Safe to call from panic hooks and signal handlers (no async, no cloud).
+fn emergency_session_end() {
+    if let Ok(guard) = PANIC_SESSION_GUARD.lock() {
+        if let Some(ref ctx) = *guard {
+            let end_event = session_journal::JournalEvent::session_end(
+                Some(ctx.session_id.as_str()),
+                ctx.turn,
+            );
+            if let Ok(writer) = session_journal::JournalWriter::new(&ctx.session_id) {
+                let _ = writer.append(&end_event);
+            }
+        }
+    }
+}
+
+/// Install a panic hook that writes `session_end` to the local journal.
+/// Called once at startup before the REPL loop.
+fn install_session_panic_hook() {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        emergency_session_end();
+        default_hook(info);
+    }));
+}
+
+/// Install a SIGTERM handler that writes `session_end` and exits cleanly.
+/// Must be called inside a tokio runtime.
+fn install_sigterm_handler() {
+    tokio::spawn(async {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{SignalKind, signal};
+            if let Ok(mut sigterm) = signal(SignalKind::terminate()) {
+                sigterm.recv().await;
+                emergency_session_end();
+                std::process::exit(0);
+            }
+        }
+    });
+}
+
+/// Update the global panic guard with current session state.
+fn update_panic_guard(session_id: &str, turn: u32) {
+    if let Ok(mut guard) = PANIC_SESSION_GUARD.lock() {
+        *guard = Some(PanicSessionGuard {
+            session_id: session_id.to_string(),
+            turn,
+        });
+    }
+}
+
+/// Clear the panic guard (e.g., on graceful exit after session_end is already written).
+fn clear_panic_guard() {
+    if let Ok(mut guard) = PANIC_SESSION_GUARD.lock() {
+        *guard = None;
+    }
+}
+
 // ══════════════════════════════════════════════════════════════════════ CLI ══
 
 #[derive(Parser, Debug)]
@@ -4893,8 +4965,9 @@ async fn handle_slash_command(
                 repl_turn::enqueue_ingestion_pub(state, &end_event);
             }
             if let Some(mc) = state.matrix_runtime.as_ref() {
-                mc.shutdown_ingestion();
+                mc.shutdown_ingestion_and_wait().await;
             }
+            clear_panic_guard();
             if state.turn > 0
                 && let Some(ref sid) = state.session_id
             {
@@ -4943,6 +5016,11 @@ async fn run_chat_repl(
     let (editor, hist_path) = build_repl_editor()?;
     let mut readline = readline_actor::ReadlineActor::spawn(editor)?;
     let mut state = initialize_repl_state(profile, initial_model);
+
+    // Install panic hook to write session_end on unexpected crashes.
+    install_session_panic_hook();
+    // Install SIGTERM handler so `kill <pid>` writes session_end before exit.
+    install_sigterm_handler();
 
     // Apply resume session if requested (-c or -r)
     if let Some(sid) = resume_session_id {
@@ -5461,6 +5539,11 @@ async fn run_chat_repl(
                         .await?;
                     }
 
+                    // Keep panic guard in sync with current session state.
+                    if let Some(ref sid) = state.session_id {
+                        update_panic_guard(sid, state.turn);
+                    }
+
                     // Periodic learning sync: push to cloud at checkpoint boundaries
                     // to prevent data loss on crash (every CHECKPOINT_INTERVAL turns)
                     if state.matrix_runtime.is_some()
@@ -5563,10 +5646,11 @@ async fn run_chat_repl(
                     let _ = j.append(&end_event);
                     repl_turn::enqueue_ingestion_pub(&state, &end_event);
                 }
-                // Graceful ingestion shutdown: drop sender so worker flushes remaining buffer
+                // Graceful ingestion shutdown: await worker flush to ensure short sessions sync
                 if let Some(mc) = state.matrix_runtime.as_ref() {
-                    mc.shutdown_ingestion();
+                    mc.shutdown_ingestion_and_wait().await;
                 }
+                clear_panic_guard();
                 // Show resume hint if session had any turns
                 if state.turn > 0
                     && let Some(ref sid) = state.session_id
@@ -5600,8 +5684,9 @@ async fn run_chat_repl(
                     repl_turn::enqueue_ingestion_pub(&state, &end_event);
                 }
                 if let Some(mc) = state.matrix_runtime.as_ref() {
-                    mc.shutdown_ingestion();
+                    mc.shutdown_ingestion_and_wait().await;
                 }
+                clear_panic_guard();
                 break;
             }
         }
