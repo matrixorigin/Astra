@@ -29,13 +29,14 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use rmcp::{
     ClientHandler, Peer, RoleClient,
     model::{CallToolRequestParams, CallToolResult, ReadResourceRequestParams, Resource, Tool},
     serve_client,
-    service::ServiceError,
+    service::{NotificationContext, ServiceError},
     transport::TokioChildProcess,
 };
 use tokio::sync::RwLock;
@@ -165,11 +166,37 @@ fn default_true() -> bool {
     true
 }
 
-/// MCP client handler that does nothing (default implementation).
-#[derive(Debug, Default, Clone)]
-struct NoOpClientHandler;
+/// MCP client handler that tracks tool list change notifications.
+///
+/// When the server sends `notifications/tools/list_changed`, the handler
+/// sets the `tools_changed` flag.  The connection owner can poll this flag
+/// and refresh tools via `McpConnection::refresh_tools_if_changed()`.
+#[derive(Debug, Clone)]
+struct ToolChangeHandler {
+    tools_changed: Arc<AtomicBool>,
+}
 
-impl ClientHandler for NoOpClientHandler {}
+impl ToolChangeHandler {
+    fn new() -> (Self, Arc<AtomicBool>) {
+        let flag = Arc::new(AtomicBool::new(false));
+        (
+            Self {
+                tools_changed: flag.clone(),
+            },
+            flag,
+        )
+    }
+}
+
+impl ClientHandler for ToolChangeHandler {
+    fn on_tool_list_changed(
+        &self,
+        _context: NotificationContext<RoleClient>,
+    ) -> impl std::future::Future<Output = ()> + Send + '_ {
+        self.tools_changed.store(true, Ordering::Release);
+        std::future::ready(())
+    }
+}
 
 /// Running MCP client connection.
 pub struct McpConnection {
@@ -183,6 +210,8 @@ pub struct McpConnection {
     connected_at: Option<Instant>,
     /// Original config for reconnection.
     config: McpServerConfig,
+    /// Flag set by the notification handler when the server's tool list changes.
+    tools_changed: Arc<AtomicBool>,
 }
 
 impl McpConnection {
@@ -204,7 +233,26 @@ impl McpConnection {
     /// Refresh the tool list from the server.
     pub async fn refresh_tools(&mut self) -> Result<&[Tool], ServiceError> {
         self.tools = self.peer.list_all_tools().await?;
+        self.tools_changed.store(false, Ordering::Release);
         Ok(&self.tools)
+    }
+
+    /// Check if the server signalled a tool list change and refresh if so.
+    ///
+    /// Returns `true` if tools were refreshed, `false` if no change detected.
+    pub async fn refresh_tools_if_changed(&mut self) -> Result<bool, ServiceError> {
+        if self.tools_changed.swap(false, Ordering::AcqRel) {
+            self.tools = self.peer.list_all_tools().await?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    /// Whether the server has signalled a tool list change that hasn't been
+    /// consumed yet.
+    pub fn has_pending_tool_change(&self) -> bool {
+        self.tools_changed.load(Ordering::Acquire)
     }
 
     /// Call a tool on this server.
@@ -608,6 +656,30 @@ impl McpClientManager {
         }
         Ok(registered)
     }
+
+    /// Check all connections for tool list change notifications and refresh
+    /// any that have pending changes. Returns the names of servers that were refreshed.
+    pub async fn refresh_changed_tools(&mut self) -> Vec<String> {
+        let mut refreshed = Vec::new();
+        for (name, conn) in &mut self.connections {
+            if conn.has_pending_tool_change() {
+                if let Some(inner) = Arc::get_mut(conn) {
+                    match inner.refresh_tools_if_changed().await {
+                        Ok(true) => refreshed.push(name.clone()),
+                        Ok(false) => {}
+                        Err(e) => eprintln!("  ⚠ Failed to refresh tools for {name}: {e}"),
+                    }
+                }
+            }
+        }
+        if !refreshed.is_empty() {
+            eprintln!(
+                "  ↻ Refreshed tool lists for: {}",
+                refreshed.join(", ")
+            );
+        }
+        refreshed
+    }
 }
 
 /// Thread-safe MCP client manager.
@@ -721,8 +793,9 @@ async fn connect_stdio(
     // Create child process transport
     let transport = TokioChildProcess::new(cmd).map_err(|e| McpError::Spawn(e.to_string()))?;
 
-    // Connect as MCP client
-    let running = serve_client(NoOpClientHandler, transport)
+    // Connect as MCP client with tool change notification handler
+    let (handler, tools_changed) = ToolChangeHandler::new();
+    let running = serve_client(handler, transport)
         .await
         .map_err(|e| McpError::Initialize(e.to_string()))?;
 
@@ -737,6 +810,7 @@ async fn connect_stdio(
         tools,
         connected_at: Some(Instant::now()),
         config,
+        tools_changed,
     })
 }
 
@@ -780,8 +854,9 @@ async fn connect_sse(
     // Create transport (reqwest-based, via rmcp feature)
     let transport = StreamableHttpClientTransport::from_config(transport_config);
 
-    // Connect as MCP client
-    let running = serve_client(NoOpClientHandler, transport)
+    // Connect as MCP client with tool change notification handler
+    let (handler, tools_changed) = ToolChangeHandler::new();
+    let running = serve_client(handler, transport)
         .await
         .map_err(|e| McpError::Initialize(format!("SSE connect to {url}: {e}")))?;
 
@@ -796,6 +871,7 @@ async fn connect_sse(
         tools,
         connected_at: Some(Instant::now()),
         config,
+        tools_changed,
     })
 }
 
@@ -906,8 +982,9 @@ async fn connect_ws(
         }
     });
 
-    // Connect as MCP client using (AsyncRead, AsyncWrite)
-    let running = serve_client(NoOpClientHandler, (rmcp_read, rmcp_write))
+    // Connect as MCP client with tool change notification handler
+    let (handler, tools_changed) = ToolChangeHandler::new();
+    let running = serve_client(handler, (rmcp_read, rmcp_write))
         .await
         .map_err(|e| McpError::Initialize(format!("MCP init over WebSocket {url}: {e}")))?;
 
@@ -920,6 +997,7 @@ async fn connect_ws(
         tools,
         connected_at: Some(Instant::now()),
         config,
+        tools_changed,
     })
 }
 
@@ -1848,5 +1926,53 @@ mcp_servers:
             configs.mcp_servers[2].transport,
             Transport::Ws { .. }
         ));
+    }
+
+    // ── ToolChangeHandler tests ─────────────────────────────────────────────
+
+    #[test]
+    fn tool_change_handler_initial_state() {
+        let (_handler, flag) = ToolChangeHandler::new();
+        assert!(!flag.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn tool_change_handler_sets_flag() {
+        let (handler, flag) = ToolChangeHandler::new();
+        handler.tools_changed.store(true, Ordering::Release);
+        assert!(flag.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn tool_change_handler_flag_shared() {
+        // Handler and returned flag reference the same AtomicBool
+        let (handler, flag) = ToolChangeHandler::new();
+        flag.store(true, Ordering::Release);
+        assert!(handler.tools_changed.load(Ordering::Acquire));
+
+        handler.tools_changed.store(false, Ordering::Release);
+        assert!(!flag.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn tool_change_handler_clone_shares_flag() {
+        let (handler, flag) = ToolChangeHandler::new();
+        let cloned = handler.clone();
+        cloned.tools_changed.store(true, Ordering::Release);
+        assert!(flag.load(Ordering::Acquire));
+        assert!(handler.tools_changed.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn manager_refresh_changed_tools_empty() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let mut manager = McpClientManager::new();
+            let refreshed = manager.refresh_changed_tools().await;
+            assert!(refreshed.is_empty());
+        });
     }
 }
