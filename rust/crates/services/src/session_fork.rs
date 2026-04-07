@@ -166,6 +166,9 @@ pub fn fork_local_session(opts: ForkSessionOptions) -> Result<ForkSessionResult,
     for evt in &out {
         writer.append(evt).map_err(|e| e.to_string())?;
     }
+    eprintln!(
+        "[audit] forked session {parent} → {new_id} (turn {forked_at_turn}, {copied} events copied)"
+    );
 
     let mut ws = session_workspace::read_workspace(&parent)
         .unwrap_or_else(|_| WorkspaceMetadata::new(&parent, model.as_deref().unwrap_or("default")));

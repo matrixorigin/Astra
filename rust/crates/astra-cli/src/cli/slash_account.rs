@@ -77,6 +77,8 @@ pub(super) async fn handle_account_command(
                 let p = creds.profiles.entry(pname).or_default();
                 p.memoria_api_key = Some(arg.to_string());
                 let _ = save_credentials(&creds);
+                // SAFETY: This runs during single-threaded REPL command processing.
+                // No concurrent threads read MEMORIA_API_KEY at this point.
                 unsafe {
                     std::env::set_var("MEMORIA_API_KEY", arg);
                 }

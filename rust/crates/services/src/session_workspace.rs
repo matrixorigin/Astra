@@ -239,6 +239,12 @@ pub fn write_workspace(metadata: &WorkspaceMetadata) -> std::io::Result<()> {
     let tmp = dir.join(".workspace.yaml.tmp");
     std::fs::write(&tmp, &yaml)?;
     std::fs::rename(&tmp, &path)?;
+    // Restrict to owner-only (0o600) — workspace may contain plan details/secrets
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    }
     Ok(())
 }
 
