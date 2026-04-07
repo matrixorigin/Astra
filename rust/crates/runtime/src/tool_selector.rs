@@ -106,26 +106,24 @@ impl LearnedContext {
             return String::new();
         }
 
-        let mut lines = Vec::new();
+        let mut parts = Vec::new();
         if let Some(task_type) = self.task_archetype {
-            lines.push(format!("- Learned task archetype: {task_type:?}"));
+            parts.push(format!("Task:{task_type:?}"));
         }
-        for entity in &self.entity_hints {
-            lines.push(format!("- {entity}"));
+        // Limit entity/pattern/calibration hints to 2 each for token efficiency
+        for entity in self.entity_hints.iter().take(2) {
+            parts.push(entity.clone());
         }
-        for pattern in &self.pattern_hints {
-            lines.push(format!("- {pattern}"));
+        for pattern in self.pattern_hints.iter().take(2) {
+            parts.push(pattern.clone());
         }
-        for hint in &self.calibration_hints {
-            lines.push(format!("- {hint}"));
+        for hint in self.calibration_hints.iter().take(2) {
+            parts.push(hint.clone());
         }
-        for hint in &self.tool_hints {
-            lines.push(format!("- {hint}"));
+        for hint in self.tool_hints.iter().take(2) {
+            parts.push(hint.clone());
         }
-        format!(
-            "Learned runtime context (use as a prior, not a hard requirement):\n{}",
-            lines.join("\n")
-        )
+        format!("Context hints: {}", parts.join(" | "))
     }
 }
 
@@ -1064,7 +1062,7 @@ impl ToolSelector for FallbackSelector {
         });
 
         // High confidence with dynamic tools → trust TF-IDF.
-        // Use calibrated threshold if available, otherwise default 0.7.
+        // Use calibrated threshold if available, otherwise default 0.5.
         let threshold = self
             .progressive_calibrator
             .as_ref()
@@ -1089,7 +1087,7 @@ impl ToolSelector for FallbackSelector {
                     });
                 locked.calibrated_threshold(&intent, domain, task_type)
             })
-            .unwrap_or(0.7);
+            .unwrap_or(0.5);
         if fast_result.confidence >= threshold && has_dynamic_tools {
             return fast_result;
         }
@@ -1436,7 +1434,7 @@ mod tests {
             "catalog",
         );
         let user_msg = messages[1]["content"].as_str().unwrap();
-        assert!(user_msg.contains("Learned runtime context"));
+        assert!(user_msg.contains("Context hints:"));
         assert!(user_msg.contains("matrixorigin"));
         assert!(user_msg.contains("github_list_prs"));
         assert!(user_msg.contains("Calibration risk"));
@@ -1982,7 +1980,7 @@ mod tests {
                     strategy: "tfidf",
                     budget_used: 100,
                     failed: false,
-                    confidence: 0.5,
+                    confidence: 0.3,
                     selector_tokens_in: 0,
                     selector_tokens_out: 0,
                     selected_skills: vec![],
