@@ -48,11 +48,17 @@ Legend: **E2E** = `rust/crates/runtime/tests/system_matrix_http_e2e/` with `ASTR
 |--------|------|-------------|----------------|
 | `improvement_proofs.rs` | Token/budget/compaction **proofs** vs baselines | None (no HTTP/DB) | **Keep**; move overlapping cases into `astra-runtime` unit tests only if duplicates appear in `src/`. |
 | `utterance_regression.rs` | Utterance/tool-selection regression | Partial overlap with `phase8_regression` / cloud routing | **Keep** for NLP surface; dedupe individual cases incrementally if two tests assert the same ranking. |
-| `chat_turn_bridge_contract.rs` | Many `/chat/turn` + bridge scenarios (stub LLM) | `chat_turn_bridge_ledger_inject_e2e`, `journey_full` `chat/turn` + `agent_events` | **Consolidate incrementally**: prefer new journey steps + DB over new stub scenarios; do not delete wholesale without mapping each scenario. |
+| `chat_turn_bridge_contract.rs` | Many `/chat/turn` + bridge scenarios (stub LLM) | `chat_turn_bridge_ledger_inject_e2e`, `journey_full` `chat/turn` + `agent_events` | **Keep** as the single large stub binary; add Matrix E2E when a scenario needs real DB. |
+| Chat turn **pure helpers** (stall, state, persist, routing, cloud/history, …) | `#[cfg(test)]` next to each module under `rust/crates/runtime/src/turn/` | Removed ~33 `chat_turn_*_contract.rs` + matching `fixtures/contracts/chat_turn_*.json` (duplicated JSON snapshots) |
+| Run/chat lifecycle (stub `RunLifecycleService` + `/chat/stream` SSE) | — (Matrix journeys exercise `/runs` list and `journey_tasks_runs` for pause/resume) | `chat_lifecycle_contract` |
+| Memory prefetch (`prefetch_memories` + mock Memoria HTTP) | `bridge_inprocess.rs` unit tests around `prefetch_memories` | `memory_prefetch_contract` |
+| Token / context budget / retrieval JSON tables | `rust/crates/runtime/src/prompts/mod.rs`, `context.rs` `#[cfg(test)]` | `token_retrieval_contract` + `token_retrieval_contract.json` |
 
-## Chat turn / bridge (stub JSON contracts)
+## Chat turn / bridge (what remains)
 
-The `chat_turn_*_contract.rs` family and `fixtures/contracts/chat_turn_*.json` remain for fast CI paths that do not start MatrixOne. Migrate scenario-by-scenario into **E2E** when the same behavior is asserted with **real persistence** (`agent_events`, `ctx_*`, etc.). See the P0/P1 table in [`system-e2e-matrix.md`](./system-e2e-matrix.md).
+- **Stub integration:** `chat_turn_bridge_contract.rs` + `fixtures/contracts/chat_turn_bridge_contract.json` only — fast CI path without MatrixOne.
+- **Logic:** prefer `src/turn/*` unit tests; extend those modules (or Matrix `system_matrix_http_e2e`) instead of new top-level `*_contract.rs` binaries.
+- **Other stub HTTP:** `chat_stream_bridge_fallback_contract.rs` (`/chat/stream` → bridge fallback when lifecycle unconfigured).
 
 ## Services crate
 
