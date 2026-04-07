@@ -123,7 +123,7 @@ use cli_utils::{
     map_thin_err, print_json_or_raw, profile_name, prompt_or, prompt_password_masked,
     resumable_last_session_id, save_credentials, truncate_str, urlencoding,
 };
-use command_router::{ExitCode, execute_cli_command};
+use command_router::{ExitCode, execute_cli_command, run_print_mode};
 use edge_lifecycle::register_and_start_heartbeat;
 use permission_manager::PermissionManager;
 #[cfg(test)]
@@ -160,6 +160,13 @@ struct Cli {
     api_url: String,
     #[arg(long)]
     profile: Option<String>,
+    /// Print mode: send prompt, print response, exit. No tools, no interaction.
+    /// Usage: astra -p "your question" or echo "question" | astra -p
+    #[arg(short = 'p', long = "print")]
+    print: bool,
+    /// Output format for --print mode
+    #[arg(long = "output-format", default_value = "text")]
+    output_format: String,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -5258,8 +5265,21 @@ async fn main() {
     let Cli {
         api_url: _,
         profile,
+        print: print_mode,
+        output_format,
         command,
     } = cli;
+
+    // --print mode: headless single-shot, no tool execution
+    if print_mode {
+        match run_print_mode(&api, profile.as_deref(), &output_format, command).await {
+            Ok(code) => std::process::exit(i32::from(code)),
+            Err(e) => {
+                eprintln!("{}", format!("Error: {e}").red());
+                std::process::exit(i32::from(ExitCode::ApiError));
+            }
+        }
+    }
 
     match execute_cli_command(command, profile, &api).await {
         Ok(exit_code) => {

@@ -757,6 +757,150 @@ fn compute_exit_code(sr: &StreamResult) -> ExitCode {
     ExitCode::Success
 }
 
+/// `--print` / `-p` mode: headless single-shot query, prints response and exits.
+/// Reads message from positional args (Message variant) or stdin.
+pub(super) async fn run_print_mode(
+    api: &astra_thin_client::ThinClient,
+    profile: Option<&str>,
+    output_format: &str,
+    command: Option<Command>,
+) -> Result<ExitCode, String> {
+    // Extract message from command or stdin
+    let message = match command {
+        Some(Command::Message(words)) if !words.is_empty() => words.join(" "),
+        _ => {
+            // Try reading from stdin
+            let mut buf = String::new();
+            std::io::stdin()
+                .read_to_string(&mut buf)
+                .map_err(|e| format!("Failed to read stdin: {e}"))?;
+            let msg = buf.trim().to_string();
+            if msg.is_empty() {
+                return Err(
+                    "Print mode requires a message. Usage: astra -p \"question\" or echo \"question\" | astra -p"
+                        .to_string(),
+                );
+            }
+            msg
+        }
+    };
+
+    let (mut creds, name, _, token) = get_profile_and_token(profile)?;
+    let session_id = resumable_last_session_id(profile);
+    let selector = create_tool_selector(api, profile);
+    let mut pm = PermissionManager::with_project(
+        false,
+        &std::env::current_dir().unwrap_or_default(),
+    );
+    let mut skill_qt = astra_runtime::skills::quality::SkillQualityTracker::new();
+    let skill_search = astra_core::SkillSearchSettings::default();
+
+    let sr = match stream_chat_sse(ChatTurnParams {
+        api,
+        token: &token,
+        message: &message,
+        session_id: session_id.as_deref(),
+        model: None,
+        explain: ExplainMode::Off,
+        render_md: false,
+        history: &[],
+        perm_manager: &mut pm,
+        verbose_mode: false,
+        quiet: true,
+        suppress_intermediate_output: true,
+        selector: &*selector.0,
+        recent_tools: &[],
+        tool_health_entries: &[],
+        unified_skill_registry: astra_runtime::skills::default_unified_registry(),
+        plan_only_chat: false,
+        hide_streaming_assistant_text: true,
+        is_plan_subtask: false,
+        plan_subtask_id: None,
+        delegation_engine: None,
+        cancel_token: None,
+        plan_assemble_line_release: None,
+        stream_event_tx: None,
+        approval_request_tx: None,
+        mcp_manager: None,
+        skill_search: &skill_search,
+        skill_quality_tracker: &mut skill_qt,
+        discovered_skills: None,
+    })
+    .await
+    {
+        Ok(sr) => sr,
+        Err(e) if is_session_not_found_error(&e.error) && session_id.is_some() => {
+            let _ = clear_profile_last_session(profile);
+            stream_chat_sse(ChatTurnParams {
+                api,
+                token: &token,
+                message: &message,
+                session_id: None,
+                model: None,
+                explain: ExplainMode::Off,
+                render_md: false,
+                history: &[],
+                perm_manager: &mut pm,
+                verbose_mode: false,
+                quiet: true,
+                suppress_intermediate_output: true,
+                selector: &*selector.0,
+                recent_tools: &[],
+                tool_health_entries: &[],
+                unified_skill_registry: astra_runtime::skills::default_unified_registry(),
+                plan_only_chat: false,
+                hide_streaming_assistant_text: true,
+                is_plan_subtask: false,
+                plan_subtask_id: None,
+                delegation_engine: None,
+                cancel_token: None,
+                plan_assemble_line_release: None,
+                stream_event_tx: None,
+                approval_request_tx: None,
+                mcp_manager: None,
+                skill_search: &skill_search,
+                skill_quality_tracker: &mut skill_qt,
+                discovered_skills: None,
+            })
+            .await
+            .map_err(|f| f.error)?
+        }
+        Err(e) => return Err(e.error),
+    };
+
+    // Save session for resumption
+    if let Some(sid) = &sr.session_id {
+        let p = creds.profiles.entry(name).or_default();
+        p.last_session_id = Some(sid.clone());
+        save_credentials(&creds)?;
+    }
+
+    let exit_code = compute_exit_code(&sr);
+
+    match output_format {
+        "json" | "stream-json" => {
+            let json_output = serde_json::json!({
+                "session_id": sr.session_id,
+                "run_id": sr.run_id,
+                "text": sr.full_text,
+                "prompt_tokens": sr.prompt_tokens,
+                "completion_tokens": sr.completion_tokens,
+                "tool_calls_count": sr.tool_calls_count,
+                "tools_used": sr.tools_used,
+                "exit_code": i32::from(exit_code),
+                "success": exit_code == ExitCode::Success,
+            });
+            println!("{}", serde_json::to_string_pretty(&json_output).unwrap());
+        }
+        _ => {
+            // text mode: just the response
+            print!("{}", sr.full_text);
+        }
+    }
+
+    Ok(exit_code)
+}
+
 // ═══════════════════════════════════════════════════════ Doctor ═══════════
 
 async fn run_doctor(api: &astra_thin_client::ThinClient, profile: Option<&str>) {
