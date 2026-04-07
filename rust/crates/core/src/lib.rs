@@ -176,4 +176,53 @@ mod tests {
         headers.insert("authorization", "Bearer token with spaces".parse().unwrap());
         assert_eq!(bearer_token(&headers).ok(), Some("token with spaces"));
     }
+
+    // --- bearer_token edge cases ---
+
+    #[test]
+    fn bearer_token_lowercase_header_name() {
+        // HeaderMap is case-insensitive
+        let mut headers = HeaderMap::new();
+        headers.insert("Authorization", "Bearer mytoken".parse().unwrap());
+        assert_eq!(bearer_token(&headers).ok(), Some("mytoken"));
+    }
+
+    #[test]
+    fn bearer_token_no_space_after_bearer() {
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "Bearertoken".parse().unwrap());
+        assert!(bearer_token(&headers).is_err());
+    }
+
+    #[test]
+    fn bearer_token_double_space() {
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "Bearer  double".parse().unwrap());
+        // starts_with("Bearer ") matches, then remainder is " double" (with leading space)
+        assert_eq!(bearer_token(&headers).ok(), Some(" double"));
+    }
+
+    // --- error_response edge cases ---
+
+    #[test]
+    fn error_response_preserves_unicode() {
+        let (status, Json(body)) = error_response(StatusCode::BAD_REQUEST, "无效请求");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body.detail, "无效请求");
+    }
+
+    #[test]
+    fn error_response_empty_detail() {
+        let (status, Json(body)) = error_response(StatusCode::NOT_FOUND, "");
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body.detail, "");
+    }
+
+    #[test]
+    fn internal_error_always_500() {
+        let (status, _) = internal_error("anything");
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        let (status2, _) = internal_error("");
+        assert_eq!(status2, StatusCode::INTERNAL_SERVER_ERROR);
+    }
 }

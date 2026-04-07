@@ -162,4 +162,87 @@ mod tests {
         let evs = parse_sse_body(body).unwrap();
         assert!(matches!(evs[0], StreamEvent::Ping));
     }
+
+    // --- finish() edge cases ---
+
+    #[test]
+    fn finish_empty_buffer() {
+        let mut p = SseParser::new();
+        let evs = p.finish().unwrap();
+        assert!(evs.is_empty());
+    }
+
+    #[test]
+    fn finish_unterminated_event() {
+        let mut p = SseParser::new();
+        // Push event without trailing \n\n
+        p.push_bytes(b"data: {\"type\":\"ping\"}").unwrap();
+        let evs = p.finish().unwrap();
+        assert_eq!(evs.len(), 1);
+        assert!(matches!(evs[0], StreamEvent::Ping));
+    }
+
+    #[test]
+    fn finish_invalid_utf8() {
+        let mut p = SseParser::new();
+        p.push_bytes(&[0xff, 0xfe, 0xfd]).unwrap();
+        let result = p.finish();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn finish_clears_buffer() {
+        let mut p = SseParser::new();
+        p.push_bytes(b"data: {\"type\":\"ping\"}").unwrap();
+        let _ = p.finish().unwrap();
+        // Second finish should be empty (buffer was cleared)
+        let evs = p.finish().unwrap();
+        assert!(evs.is_empty());
+    }
+
+    // --- parse_event_block edge cases ---
+
+    #[test]
+    fn empty_body_returns_empty() {
+        let evs = parse_sse_body("").unwrap();
+        assert!(evs.is_empty());
+    }
+
+    #[test]
+    fn whitespace_only_body() {
+        let evs = parse_sse_body("   \n\n").unwrap();
+        assert!(evs.is_empty());
+    }
+
+    #[test]
+    fn non_data_lines_ignored() {
+        let body = "event: message\nid: 123\ndata: {\"type\":\"ping\"}\n\n";
+        let evs = parse_sse_body(body).unwrap();
+        assert_eq!(evs.len(), 1);
+        assert!(matches!(evs[0], StreamEvent::Ping));
+    }
+
+    #[test]
+    fn consecutive_separators_produce_no_extra_events() {
+        let body = "data: {\"type\":\"ping\"}\n\n\n\n";
+        let evs = parse_sse_body(body).unwrap();
+        assert_eq!(evs.len(), 1);
+    }
+
+    #[test]
+    fn separator_at_chunk_boundary() {
+        let mut p = SseParser::new();
+        // First \n at end of chunk 1, second \n at start of chunk 2
+        let evs1 = p.push_bytes(b"data: {\"type\":\"ping\"}\n").unwrap();
+        assert!(evs1.is_empty()); // not complete yet
+        let evs2 = p.push_bytes(b"\n").unwrap();
+        assert_eq!(evs2.len(), 1);
+    }
+
+    #[test]
+    fn invalid_json_in_data_field() {
+        let body = "data: not valid json\n\n";
+        let result = parse_sse_body(body);
+        assert!(result.is_err());
+    }
 }
