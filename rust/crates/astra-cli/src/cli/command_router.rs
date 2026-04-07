@@ -827,7 +827,7 @@ pub(super) async fn run_print_mode(
         render_md: false,
         history: &[],
         perm_manager: &mut pm,
-        verbose_mode: false,
+        verbose_mode: std::env::var("ASTRA_VERBOSE").map(|v| v == "1").unwrap_or(false),
         quiet: true,
         suppress_intermediate_output: true,
         selector: &*selector.0,
@@ -863,7 +863,7 @@ pub(super) async fn run_print_mode(
                 render_md: false,
                 history: &[],
                 perm_manager: &mut pm,
-                verbose_mode: false,
+                verbose_mode: std::env::var("ASTRA_VERBOSE").map(|v| v == "1").unwrap_or(false),
                 quiet: true,
                 suppress_intermediate_output: true,
                 selector: &*selector.0,
@@ -1067,6 +1067,46 @@ async fn run_doctor(api: &astra_thin_client::ThinClient, profile: Option<&str>) 
 }
 
 // ═══════════════════════════════════════════════════════ MCP CLI ══════════
+
+/// Load MCP server configs from JSON files or inline JSON strings and merge
+/// them into the project-level mcp.json. Each source should be a file path
+/// or a raw JSON string containing `{"mcpServers": {...}}`.
+pub(super) fn load_mcp_configs(sources: &[String]) -> Result<(), String> {
+    let project_path = crate::manifest_loader::project_mcp_json_path()
+        .ok_or_else(|| "Cannot determine project directory for MCP config".to_string())?;
+    let mut config = read_mcp_config(&project_path)?;
+
+    for source in sources {
+        let json_str = if std::path::Path::new(source).is_file() {
+            std::fs::read_to_string(source)
+                .map_err(|e| format!("Failed to read MCP config file '{}': {e}", source))?
+        } else {
+            source.clone()
+        };
+        let parsed: serde_json::Value = serde_json::from_str(&json_str)
+            .map_err(|e| format!("Invalid MCP config JSON from '{}': {e}", source))?;
+
+        if let Some(servers) = parsed.get("mcpServers").and_then(|v| v.as_object()) {
+            let target = config
+                .as_object_mut()
+                .unwrap()
+                .entry("mcpServers")
+                .or_insert_with(|| serde_json::json!({}))
+                .as_object_mut()
+                .unwrap();
+            for (name, entry) in servers {
+                target.insert(name.clone(), entry.clone());
+            }
+        } else {
+            return Err(format!(
+                "MCP config from '{}' must contain a \"mcpServers\" object", source
+            ));
+        }
+    }
+
+    write_mcp_config(&project_path, &config)?;
+    Ok(())
+}
 
 /// Resolve the mcp.json path for the given scope.
 fn mcp_json_path_for_scope(scope: &str) -> Result<std::path::PathBuf, String> {
@@ -1655,6 +1695,33 @@ mod mcp_cli_tests {
         let content = std::fs::read_to_string(&path).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
         assert_eq!(parsed["mcpServers"]["s"]["command"], "echo");
+    }
+
+    #[test]
+    fn load_mcp_configs_from_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let config_file = dir.path().join("custom-mcp.json");
+        std::fs::write(
+            &config_file,
+            r#"{"mcpServers":{"test-server":{"command":"echo","args":["hello"]}}}"#,
+        ).unwrap();
+
+        // We can't easily test load_mcp_configs (needs project_mcp_json_path),
+        // but we can test the JSON parsing logic directly
+        let json_str = std::fs::read_to_string(&config_file).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+        let servers = parsed.get("mcpServers").and_then(|v| v.as_object()).unwrap();
+        assert!(servers.contains_key("test-server"));
+        assert_eq!(servers["test-server"]["command"], "echo");
+        assert_eq!(servers["test-server"]["args"][0], "hello");
+    }
+
+    #[test]
+    fn load_mcp_configs_rejects_missing_mcp_servers_key() {
+        let json_str = r#"{"servers":{"foo":{}}}"#;
+        let parsed: serde_json::Value = serde_json::from_str(json_str).unwrap();
+        let servers = parsed.get("mcpServers").and_then(|v| v.as_object());
+        assert!(servers.is_none(), "missing mcpServers should return None");
     }
 }
 

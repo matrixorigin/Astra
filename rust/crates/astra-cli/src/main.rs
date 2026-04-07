@@ -185,6 +185,18 @@ struct Cli {
     /// Maximum agentic turns (useful with --print to limit cost)
     #[arg(long = "max-turns")]
     max_turns: Option<usize>,
+    /// Comma or space-separated list of tool names to allow (e.g. "Bash Edit Read")
+    #[arg(long = "allowed-tools", num_args = 1..)]
+    allowed_tools: Vec<String>,
+    /// Additional directories to allow tool access to
+    #[arg(long = "add-dir", num_args = 1..)]
+    add_dir: Vec<String>,
+    /// Enable verbose output (overrides config setting)
+    #[arg(long = "verbose")]
+    verbose: bool,
+    /// Load MCP server config from JSON file(s) or inline JSON strings
+    #[arg(long = "mcp-config", num_args = 1..)]
+    mcp_config: Vec<String>,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -5329,12 +5341,55 @@ async fn main() {
         yes: auto_approve,
         system_prompt,
         max_turns,
+        allowed_tools,
+        add_dir,
+        verbose,
+        mcp_config,
         command,
     } = cli;
 
     // --max-turns: override via env var before RuntimeLimits singleton is initialized
     if let Some(turns) = max_turns {
         unsafe { std::env::set_var("MO_MAX_TURNS", turns.to_string()); }
+    }
+
+    // --allowed-tools: normalize comma/space-separated list and export as env var
+    if !allowed_tools.is_empty() {
+        let normalized: Vec<String> = allowed_tools
+            .iter()
+            .flat_map(|s| s.split([',', ' ']))
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if !normalized.is_empty() {
+            unsafe { std::env::set_var("ASTRA_ALLOWED_TOOLS", normalized.join(",")); }
+        }
+    }
+
+    // --add-dir: export additional directories as env var
+    if !add_dir.is_empty() {
+        let dirs: Vec<String> = add_dir
+            .iter()
+            .map(|d| {
+                std::path::Path::new(d)
+                    .canonicalize()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_else(|_| d.clone())
+            })
+            .collect();
+        unsafe { std::env::set_var("ASTRA_ADD_DIRS", dirs.join(":")); }
+    }
+
+    // --verbose: override verbose setting
+    if verbose {
+        unsafe { std::env::set_var("ASTRA_VERBOSE", "1"); }
+    }
+
+    // --mcp-config: load MCP server configs from files/JSON strings
+    if !mcp_config.is_empty() {
+        if let Err(e) = command_router::load_mcp_configs(&mcp_config) {
+            eprintln!("{}", format!("Warning: failed to load MCP config: {e}").yellow());
+        }
     }
 
     // Resolve model: --model flag > config default_model > None
@@ -8285,5 +8340,103 @@ total_tokens_out: 500
         assert_eq!(cli.system_prompt.as_deref(), Some("Review code"));
         assert_eq!(cli.max_turns, Some(3));
         assert_eq!(cli.output_format, "json");
+    }
+
+    // ── --allowed-tools tests ──
+
+    #[test]
+    fn cli_allowed_tools_single() {
+        let cli = Cli::try_parse_from(["astra", "--allowed-tools", "Bash"]).unwrap();
+        assert_eq!(cli.allowed_tools, vec!["Bash"]);
+    }
+
+    #[test]
+    fn cli_allowed_tools_multiple_space_separated() {
+        let cli = Cli::try_parse_from([
+            "astra", "--allowed-tools", "Bash", "Edit", "Read",
+        ]).unwrap();
+        assert_eq!(cli.allowed_tools, vec!["Bash", "Edit", "Read"]);
+    }
+
+    #[test]
+    fn cli_allowed_tools_empty_default() {
+        let cli = Cli::try_parse_from(["astra"]).unwrap();
+        assert!(cli.allowed_tools.is_empty());
+    }
+
+    // ── --add-dir tests ──
+
+    #[test]
+    fn cli_add_dir_single() {
+        let cli = Cli::try_parse_from(["astra", "--add-dir", "/tmp/extra"]).unwrap();
+        assert_eq!(cli.add_dir, vec!["/tmp/extra"]);
+    }
+
+    #[test]
+    fn cli_add_dir_multiple() {
+        let cli = Cli::try_parse_from([
+            "astra", "--add-dir", "/tmp/a", "/tmp/b",
+        ]).unwrap();
+        assert_eq!(cli.add_dir, vec!["/tmp/a", "/tmp/b"]);
+    }
+
+    #[test]
+    fn cli_add_dir_empty_default() {
+        let cli = Cli::try_parse_from(["astra"]).unwrap();
+        assert!(cli.add_dir.is_empty());
+    }
+
+    // ── --verbose tests ──
+
+    #[test]
+    fn cli_verbose_flag() {
+        let cli = Cli::try_parse_from(["astra", "--verbose"]).unwrap();
+        assert!(cli.verbose);
+    }
+
+    #[test]
+    fn cli_verbose_default_false() {
+        let cli = Cli::try_parse_from(["astra"]).unwrap();
+        assert!(!cli.verbose);
+    }
+
+    // ── --mcp-config tests ──
+
+    #[test]
+    fn cli_mcp_config_single() {
+        let cli = Cli::try_parse_from(["astra", "--mcp-config", "mcp.json"]).unwrap();
+        assert_eq!(cli.mcp_config, vec!["mcp.json"]);
+    }
+
+    #[test]
+    fn cli_mcp_config_multiple() {
+        let cli = Cli::try_parse_from([
+            "astra", "--mcp-config", "a.json", "b.json",
+        ]).unwrap();
+        assert_eq!(cli.mcp_config, vec!["a.json", "b.json"]);
+    }
+
+    #[test]
+    fn cli_mcp_config_empty_default() {
+        let cli = Cli::try_parse_from(["astra"]).unwrap();
+        assert!(cli.mcp_config.is_empty());
+    }
+
+    // ── Combined new flags ──
+
+    #[test]
+    fn cli_all_new_flags_combined() {
+        let cli = Cli::try_parse_from([
+            "astra", "--allowed-tools", "Bash", "Edit",
+            "--add-dir", "/tmp/extra",
+            "--verbose", "--mcp-config", "mcp.json",
+            "--model", "gpt-4o", "-p",
+        ]).unwrap();
+        assert_eq!(cli.allowed_tools, vec!["Bash", "Edit"]);
+        assert_eq!(cli.add_dir, vec!["/tmp/extra"]);
+        assert!(cli.verbose);
+        assert_eq!(cli.mcp_config, vec!["mcp.json"]);
+        assert_eq!(cli.model.as_deref(), Some("gpt-4o"));
+        assert!(cli.print);
     }
 }
