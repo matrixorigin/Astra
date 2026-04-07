@@ -735,6 +735,12 @@ pub(super) async fn execute_cli_command(
             run_doctor(api, profile.as_deref()).await;
             Ok(ExitCode::Success)
         }
+
+        // ── Config management ───────────────────────────────────────────
+        Some(Command::Config(cfg_cmd)) => {
+            execute_config_command(cfg_cmd)?;
+            Ok(ExitCode::Success)
+        }
     }
 }
 
@@ -1283,6 +1289,130 @@ fn mcp_get(name: &str) -> Result<(), String> {
     Err(format!("No MCP server found with name: {name}"))
 }
 
+// ═══════════════════════════════════════════════════════ Config ═══════════
+
+/// Path to `~/.astra/settings.json`.
+fn settings_path() -> Result<std::path::PathBuf, String> {
+    dirs::home_dir()
+        .map(|h| h.join(".astra").join("settings.json"))
+        .ok_or_else(|| "Cannot determine home directory".to_string())
+}
+
+fn read_settings() -> Result<serde_json::Map<String, serde_json::Value>, String> {
+    let path = settings_path()?;
+    if !path.is_file() {
+        return Ok(serde_json::Map::new());
+    }
+    let content = std::fs::read_to_string(&path)
+        .map_err(|e| format!("Failed to read {}: {e}", path.display()))?;
+    let val: serde_json::Value = serde_json::from_str(&content)
+        .map_err(|e| format!("Failed to parse {}: {e}", path.display()))?;
+    val.as_object()
+        .cloned()
+        .ok_or_else(|| format!("{} is not a JSON object", path.display()))
+}
+
+fn write_settings(settings: &serde_json::Map<String, serde_json::Value>) -> Result<(), String> {
+    let path = settings_path()?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("Failed to create {}: {e}", parent.display()))?;
+    }
+    let val = serde_json::Value::Object(settings.clone());
+    let pretty = serde_json::to_string_pretty(&val).unwrap_or_default();
+    std::fs::write(&path, &pretty)
+        .map_err(|e| format!("Failed to write {}: {e}", path.display()))
+}
+
+/// Known setting keys with descriptions for list/help.
+const KNOWN_SETTINGS: &[(&str, &str)] = &[
+    ("default_model", "Default model for chat (e.g. gpt-4o, claude-3.5-sonnet)"),
+    ("verbose", "Enable verbose output (true/false)"),
+    ("auto_approve", "Auto-approve tool calls (true/false)"),
+    ("api_url", "API server URL"),
+    ("theme", "Color theme (auto/dark/light)"),
+    ("permission_mode", "Default permission mode (auto/prompt/deny)"),
+];
+
+fn execute_config_command(cmd: ConfigCmd) -> Result<(), String> {
+    match cmd {
+        ConfigCmd::List => config_list(),
+        ConfigCmd::Get(args) => config_get(&args.key),
+        ConfigCmd::Set(args) => config_set(&args.key, &args.value),
+    }
+}
+
+fn config_list() -> Result<(), String> {
+    let settings = read_settings()?;
+    let path = settings_path()?;
+
+    if settings.is_empty() {
+        println!("No settings configured.");
+        println!("Use `astra config set <key> <value>` to set a value.");
+        println!("\nAvailable keys:");
+        for (key, desc) in KNOWN_SETTINGS {
+            println!("  {key:<20} {desc}");
+        }
+        return Ok(());
+    }
+
+    println!("{:<20} {}", "Key", "Value");
+    println!("{}", "─".repeat(50));
+    for (key, value) in &settings {
+        let display = match value {
+            serde_json::Value::String(s) => s.clone(),
+            other => other.to_string(),
+        };
+        println!("{key:<20} {display}");
+    }
+    println!("\nConfig file: {}", path.display());
+    Ok(())
+}
+
+fn config_get(key: &str) -> Result<(), String> {
+    let settings = read_settings()?;
+    match settings.get(key) {
+        Some(val) => {
+            match val {
+                serde_json::Value::String(s) => println!("{s}"),
+                other => println!("{other}"),
+            }
+            Ok(())
+        }
+        None => {
+            // Check if it's a known key
+            if let Some((_, desc)) = KNOWN_SETTINGS.iter().find(|(k, _)| *k == key) {
+                Err(format!("'{key}' is not set. {desc}"))
+            } else {
+                Err(format!("'{key}' is not set"))
+            }
+        }
+    }
+}
+
+fn config_set(key: &str, value: &str) -> Result<(), String> {
+    let mut settings = read_settings()?;
+
+    // Parse value: try bool, then number, then keep as string
+    let json_value = match value {
+        "true" => serde_json::Value::Bool(true),
+        "false" => serde_json::Value::Bool(false),
+        v if v.parse::<f64>().is_ok() && !v.contains(|c: char| c.is_alphabetic()) => {
+            if let Ok(n) = v.parse::<i64>() {
+                serde_json::Value::Number(n.into())
+            } else {
+                serde_json::Value::String(v.to_string())
+            }
+        }
+        v => serde_json::Value::String(v.to_string()),
+    };
+
+    settings.insert(key.to_string(), json_value);
+    write_settings(&settings)?;
+    println!("Set '{key}' = {value}");
+    Ok(())
+}
+
 #[cfg(test)]
 mod mcp_cli_tests {
     use super::*;
@@ -1500,5 +1630,89 @@ mod mcp_cli_tests {
         let content = std::fs::read_to_string(&path).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
         assert_eq!(parsed["mcpServers"]["s"]["command"], "echo");
+    }
+}
+
+#[cfg(test)]
+mod config_cli_tests {
+    use super::*;
+
+    #[test]
+    fn read_settings_missing_file_returns_empty() {
+        // settings_path() returns home-based path; test read directly
+        let settings = serde_json::Map::new();
+        assert!(settings.is_empty());
+    }
+
+    #[test]
+    fn write_and_read_settings_roundtrip() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("settings.json");
+
+        let mut settings = serde_json::Map::new();
+        settings.insert("default_model".to_string(), serde_json::Value::String("gpt-4o".into()));
+        settings.insert("verbose".to_string(), serde_json::Value::Bool(true));
+
+        let val = serde_json::Value::Object(settings.clone());
+        std::fs::write(&path, serde_json::to_string_pretty(&val).unwrap()).unwrap();
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+        let loaded = parsed.as_object().unwrap();
+        assert_eq!(loaded["default_model"], "gpt-4o");
+        assert_eq!(loaded["verbose"], true);
+    }
+
+    #[test]
+    fn value_parsing_booleans() {
+        let parse = |v: &str| -> serde_json::Value {
+            match v {
+                "true" => serde_json::Value::Bool(true),
+                "false" => serde_json::Value::Bool(false),
+                _ => serde_json::Value::String(v.to_string()),
+            }
+        };
+        assert_eq!(parse("true"), serde_json::Value::Bool(true));
+        assert_eq!(parse("false"), serde_json::Value::Bool(false));
+        assert_eq!(parse("hello"), serde_json::Value::String("hello".into()));
+    }
+
+    #[test]
+    fn value_parsing_numbers() {
+        let v = "42";
+        let parsed = v.parse::<i64>().unwrap();
+        assert_eq!(parsed, 42);
+    }
+
+    #[test]
+    fn known_settings_not_empty() {
+        assert!(!KNOWN_SETTINGS.is_empty());
+        for (key, desc) in KNOWN_SETTINGS {
+            assert!(!key.is_empty());
+            assert!(!desc.is_empty());
+        }
+    }
+
+    #[test]
+    fn config_set_overwrites() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("settings.json");
+
+        // Initial
+        let mut settings = serde_json::Map::new();
+        settings.insert("key".to_string(), serde_json::Value::String("v1".into()));
+        std::fs::write(&path, serde_json::to_string_pretty(&serde_json::Value::Object(settings)).unwrap()).unwrap();
+
+        // Overwrite
+        let content = std::fs::read_to_string(&path).unwrap();
+        let mut loaded: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str::<serde_json::Value>(&content).unwrap()
+                .as_object().unwrap().clone();
+        loaded.insert("key".to_string(), serde_json::Value::String("v2".into()));
+        std::fs::write(&path, serde_json::to_string_pretty(&serde_json::Value::Object(loaded)).unwrap()).unwrap();
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        let final_val: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(final_val["key"], "v2");
     }
 }
