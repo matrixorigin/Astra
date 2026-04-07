@@ -1101,6 +1101,20 @@ pub async fn run_product_matrix_full_journey(
         Some(uq_event_id.as_str()),
         "llm_response should parent to user_query"
     );
+
+    let (st_fb, fb_j) = post_json(
+        app,
+        "/api/v1/learning/feedback",
+        Some(auth_header.as_str()),
+        json!({
+            "event_id": uq_event_id,
+            "satisfaction_score": 2
+        }),
+    )
+    .await;
+    assert_eq!(st_fb, StatusCode::OK, "learning feedback: {fb_j}");
+    assert_eq!(fb_j["status"], "success");
+
     assert_eq!(row_get_opt_i64(llm, "token_input"), Some(5));
     assert_eq!(row_get_opt_i64(llm, "token_output"), Some(15));
     assert_eq!(row_get_opt_i64(llm, "token_total"), Some(20));

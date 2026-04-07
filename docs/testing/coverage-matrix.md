@@ -32,6 +32,11 @@ Legend: **E2E** = `rust/crates/runtime/tests/system_matrix_http_e2e/` with `ASTR
 | `POST /chat/route` (shape + auth path) | `journey_full` + unit tests in `runtime/src/server/chat_route.rs` | `chat_route_contract` |
 | `GET /models` (authenticated list) | `journey_full` | — |
 | Models admin CRUD + `infra_llm_models` | `journey_extended::run_models_admin_crud_with_db` (`provider: mock`, `grant_astra_admin_role`) | `model_crud_contract` |
+| Reflect + decision-trace (authenticated) | `journey_full` (`GET .../reflect`, `GET .../decision-trace`) | `reflect_contract` (stub) |
+| Learning feedback POST | `journey_full` (`POST /api/v1/learning/feedback` with real `event_id` after `chat/turn`) | `reflect_contract` (stub) |
+| Skill config CRUD (in-memory stub) | — (future E2E or `astra-runtime` unit tests) | `skill_config_contract` |
+| Memory branches API (stub `X-User-Id` auth) | — (future E2E with JWT) | `branches_contract` |
+| `POST /streaming/chat` (stub `X-User-Id`) | — (prod uses configured `StreamingService`; `journey_extended` covers `POST /chat/stream` SSE) | `streaming_contract` |
 
 ## Large integration binaries (audit — not removed in this pass)
 
