@@ -207,6 +207,9 @@ enum Command {
     /// Manage MCP servers: astra mcp add/remove/list/get
     #[command(subcommand)]
     Mcp(McpCmd),
+    /// Manage settings: astra config list/get/set
+    #[command(subcommand)]
+    Config(ConfigCmd),
     /// Generate shell completion script
     Completion(CompletionArgs),
     /// Diagnose installation, config, and connectivity
@@ -515,6 +518,30 @@ struct CompletionArgs {
     /// Shell to generate completions for
     #[arg(value_enum)]
     shell: clap_complete::Shell,
+}
+
+#[derive(Subcommand, Debug)]
+enum ConfigCmd {
+    /// List all settings and their values
+    List,
+    /// Get a specific setting value
+    Get(ConfigGetArgs),
+    /// Set a setting value
+    Set(ConfigSetArgs),
+}
+
+#[derive(Args, Debug)]
+struct ConfigGetArgs {
+    /// Setting key (e.g. default_model, verbose, api_url)
+    key: String,
+}
+
+#[derive(Args, Debug)]
+struct ConfigSetArgs {
+    /// Setting key
+    key: String,
+    /// Setting value
+    value: String,
 }
 
 // ═══════════════════════════════════════════════════════ Credentials ══════
