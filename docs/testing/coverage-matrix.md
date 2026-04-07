@@ -37,6 +37,8 @@ Legend: **E2E** = `rust/crates/runtime/tests/system_matrix_http_e2e/` with `ASTR
 | Skill config CRUD (in-memory stub) | — (future E2E or `astra-runtime` unit tests) | `skill_config_contract` |
 | Memory branches API (stub `X-User-Id` auth) | — (future E2E with JWT) | `branches_contract` |
 | `POST /streaming/chat` (stub `X-User-Id`) | — (prod uses configured `StreamingService`; `journey_extended` covers `POST /chat/stream` SSE) | `streaming_contract` |
+| Route registration (no accidental 404 on major paths) | `runtime/src/server/router_builder.rs` `#[cfg(test)]` (`route_count_regression`, `critical_route_paths_exist`, `all_api_groups_have_routes`) + Matrix `journey_full` | `route_registry_contract` (HTTP smoke) |
+| `SharedPool` on `AppState` / auth+session service constructors | Compile-time API + real pool in services tests / Matrix E2E | `shared_pool_contract`, `shared_pool_migration_contract` |
 
 ## Large integration binaries (audit — not removed in this pass)
 
