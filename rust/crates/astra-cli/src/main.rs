@@ -7813,4 +7813,384 @@ total_tokens_out: 500
             "cost={cost} expected={expected}"
         );
     }
+
+    // ── CLI arg parsing tests ─────────────────────────────────────────────
+
+    #[test]
+    fn cli_no_args_gives_no_command() {
+        let cli = Cli::try_parse_from(["astra"]).unwrap();
+        assert!(cli.command.is_none());
+        assert!(!cli.print);
+        assert!(!cli.continue_last);
+        assert!(!cli.yes);
+        assert!(cli.model.is_none());
+        assert!(cli.resume.is_none());
+    }
+
+    #[test]
+    fn cli_model_flag_long() {
+        let cli = Cli::try_parse_from(["astra", "--model", "gpt-4o"]).unwrap();
+        assert_eq!(cli.model.as_deref(), Some("gpt-4o"));
+    }
+
+    #[test]
+    fn cli_model_flag_equals() {
+        let cli = Cli::try_parse_from(["astra", "--model=claude-3-opus"]).unwrap();
+        assert_eq!(cli.model.as_deref(), Some("claude-3-opus"));
+    }
+
+    #[test]
+    fn cli_print_flag_short() {
+        let cli = Cli::try_parse_from(["astra", "-p"]).unwrap();
+        assert!(cli.print);
+    }
+
+    #[test]
+    fn cli_print_flag_long() {
+        let cli = Cli::try_parse_from(["astra", "--print"]).unwrap();
+        assert!(cli.print);
+    }
+
+    #[test]
+    fn cli_output_format_default_is_text() {
+        let cli = Cli::try_parse_from(["astra"]).unwrap();
+        assert_eq!(cli.output_format, "text");
+    }
+
+    #[test]
+    fn cli_output_format_json() {
+        let cli = Cli::try_parse_from(["astra", "--output-format", "json"]).unwrap();
+        assert_eq!(cli.output_format, "json");
+    }
+
+    #[test]
+    fn cli_continue_flag_short() {
+        let cli = Cli::try_parse_from(["astra", "-c"]).unwrap();
+        assert!(cli.continue_last);
+    }
+
+    #[test]
+    fn cli_continue_flag_long() {
+        let cli = Cli::try_parse_from(["astra", "--continue"]).unwrap();
+        assert!(cli.continue_last);
+    }
+
+    #[test]
+    fn cli_resume_flag_short() {
+        let cli = Cli::try_parse_from(["astra", "-r", "abc123"]).unwrap();
+        assert_eq!(cli.resume.as_deref(), Some("abc123"));
+    }
+
+    #[test]
+    fn cli_resume_flag_long() {
+        let cli = Cli::try_parse_from(["astra", "--resume", "session-xyz"]).unwrap();
+        assert_eq!(cli.resume.as_deref(), Some("session-xyz"));
+    }
+
+    #[test]
+    fn cli_yes_flag_short() {
+        let cli = Cli::try_parse_from(["astra", "-y"]).unwrap();
+        assert!(cli.yes);
+    }
+
+    #[test]
+    fn cli_yes_flag_long() {
+        let cli = Cli::try_parse_from(["astra", "--yes"]).unwrap();
+        assert!(cli.yes);
+    }
+
+    #[test]
+    fn cli_combined_short_flags() {
+        // -p -c -y can be combined
+        let cli = Cli::try_parse_from(["astra", "-p", "-c", "-y"]).unwrap();
+        assert!(cli.print);
+        assert!(cli.continue_last);
+        assert!(cli.yes);
+    }
+
+    #[test]
+    fn cli_model_with_print_and_yes() {
+        let cli = Cli::try_parse_from(["astra", "--model", "gpt-4o", "-p", "-y"]).unwrap();
+        assert_eq!(cli.model.as_deref(), Some("gpt-4o"));
+        assert!(cli.print);
+        assert!(cli.yes);
+    }
+
+    #[test]
+    fn cli_doctor_subcommand() {
+        let cli = Cli::try_parse_from(["astra", "doctor"]).unwrap();
+        assert!(matches!(cli.command, Some(Command::Doctor)));
+    }
+
+    #[test]
+    fn cli_completion_bash() {
+        let cli = Cli::try_parse_from(["astra", "completion", "bash"]).unwrap();
+        match cli.command {
+            Some(Command::Completion(ref args)) => {
+                assert_eq!(args.shell, clap_complete::Shell::Bash);
+            }
+            _ => panic!("expected Completion command"),
+        }
+    }
+
+    #[test]
+    fn cli_completion_zsh() {
+        let cli = Cli::try_parse_from(["astra", "completion", "zsh"]).unwrap();
+        match cli.command {
+            Some(Command::Completion(ref args)) => {
+                assert_eq!(args.shell, clap_complete::Shell::Zsh);
+            }
+            _ => panic!("expected Completion command"),
+        }
+    }
+
+    #[test]
+    fn cli_completion_fish() {
+        let cli = Cli::try_parse_from(["astra", "completion", "fish"]).unwrap();
+        match cli.command {
+            Some(Command::Completion(ref args)) => {
+                assert_eq!(args.shell, clap_complete::Shell::Fish);
+            }
+            _ => panic!("expected Completion command"),
+        }
+    }
+
+    #[test]
+    fn cli_mcp_list_subcommand() {
+        let cli = Cli::try_parse_from(["astra", "mcp", "list"]).unwrap();
+        match cli.command {
+            Some(Command::Mcp(McpCmd::List(_))) => {}
+            _ => panic!("expected Mcp List command"),
+        }
+    }
+
+    #[test]
+    fn cli_mcp_add_with_args() {
+        let cli = Cli::try_parse_from([
+            "astra", "mcp", "add", "myserver", "npx", "server",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Command::Mcp(McpCmd::Add(ref args))) => {
+                assert_eq!(args.name, "myserver");
+                assert_eq!(args.command, "npx");
+                assert_eq!(args.args, vec!["server"]);
+            }
+            _ => panic!("expected Mcp Add command"),
+        }
+    }
+
+    #[test]
+    fn cli_mcp_remove_subcommand() {
+        let cli = Cli::try_parse_from(["astra", "mcp", "remove", "myserver"]).unwrap();
+        match cli.command {
+            Some(Command::Mcp(McpCmd::Remove(ref args))) => {
+                assert_eq!(args.name, "myserver");
+            }
+            _ => panic!("expected Mcp Remove command"),
+        }
+    }
+
+    #[test]
+    fn cli_mcp_get_subcommand() {
+        let cli = Cli::try_parse_from(["astra", "mcp", "get", "myserver"]).unwrap();
+        match cli.command {
+            Some(Command::Mcp(McpCmd::Get(ref args))) => {
+                assert_eq!(args.name, "myserver");
+            }
+            _ => panic!("expected Mcp Get command"),
+        }
+    }
+
+    #[test]
+    fn cli_config_list_subcommand() {
+        let cli = Cli::try_parse_from(["astra", "config", "list"]).unwrap();
+        assert!(matches!(cli.command, Some(Command::Config(ConfigCmd::List))));
+    }
+
+    #[test]
+    fn cli_config_get_subcommand() {
+        let cli = Cli::try_parse_from(["astra", "config", "get", "default_model"]).unwrap();
+        match cli.command {
+            Some(Command::Config(ConfigCmd::Get(ref args))) => {
+                assert_eq!(args.key, "default_model");
+            }
+            _ => panic!("expected Config Get command"),
+        }
+    }
+
+    #[test]
+    fn cli_config_set_subcommand() {
+        let cli = Cli::try_parse_from(["astra", "config", "set", "default_model", "gpt-4o"]).unwrap();
+        match cli.command {
+            Some(Command::Config(ConfigCmd::Set(ref args))) => {
+                assert_eq!(args.key, "default_model");
+                assert_eq!(args.value, "gpt-4o");
+            }
+            _ => panic!("expected Config Set command"),
+        }
+    }
+
+    #[test]
+    fn cli_chat_with_model() {
+        let cli = Cli::try_parse_from(["astra", "chat", "-m", "hello", "--model", "gpt-4o"]).unwrap();
+        match cli.command {
+            Some(Command::Chat(ref args)) => {
+                assert_eq!(args.message.as_deref(), Some("hello"));
+                assert_eq!(args.model.as_deref(), Some("gpt-4o"));
+            }
+            _ => panic!("expected Chat command"),
+        }
+    }
+
+    #[test]
+    fn cli_chat_auto_approve() {
+        let cli = Cli::try_parse_from(["astra", "chat", "-y"]).unwrap();
+        match cli.command {
+            Some(Command::Chat(ref args)) => {
+                assert!(args.auto_approve);
+            }
+            _ => panic!("expected Chat command"),
+        }
+    }
+
+    #[test]
+    fn cli_chat_permission_mode() {
+        let cli = Cli::try_parse_from(["astra", "chat", "--permission-mode", "auto"]).unwrap();
+        match cli.command {
+            Some(Command::Chat(ref args)) => {
+                assert_eq!(args.permission_mode.as_deref(), Some("auto"));
+            }
+            _ => panic!("expected Chat command"),
+        }
+    }
+
+    #[test]
+    fn cli_external_subcommand_message() {
+        let cli = Cli::try_parse_from(["astra", "what", "is", "rust"]).unwrap();
+        match cli.command {
+            Some(Command::Message(ref words)) => {
+                assert_eq!(words, &["what", "is", "rust"]);
+            }
+            _ => panic!("expected Message command"),
+        }
+    }
+
+    #[test]
+    fn cli_serve_defaults() {
+        let cli = Cli::try_parse_from(["astra", "serve"]).unwrap();
+        match cli.command {
+            Some(Command::Serve(ref args)) => {
+                assert_eq!(args.host, "127.0.0.1");
+                assert_eq!(args.port, 8000);
+            }
+            _ => panic!("expected Serve command"),
+        }
+    }
+
+    #[test]
+    fn cli_serve_custom_port() {
+        let cli = Cli::try_parse_from(["astra", "serve", "--port", "3000"]).unwrap();
+        match cli.command {
+            Some(Command::Serve(ref args)) => {
+                assert_eq!(args.port, 3000);
+            }
+            _ => panic!("expected Serve command"),
+        }
+    }
+
+    #[test]
+    fn cli_api_url_default() {
+        let cli = Cli::try_parse_from(["astra"]).unwrap();
+        assert_eq!(cli.api_url, "http://127.0.0.1:8000");
+    }
+
+    #[test]
+    fn cli_api_url_custom() {
+        let cli = Cli::try_parse_from(["astra", "--api-url", "http://remote:9000"]).unwrap();
+        assert_eq!(cli.api_url, "http://remote:9000");
+    }
+
+    #[test]
+    fn cli_profile_flag() {
+        let cli = Cli::try_parse_from(["astra", "--profile", "work"]).unwrap();
+        assert_eq!(cli.profile.as_deref(), Some("work"));
+    }
+
+    #[test]
+    fn cli_top_level_yes_does_not_conflict_with_chat_yes() {
+        // Both top-level -y and chat -y should work together
+        let cli = Cli::try_parse_from(["astra", "-y", "chat", "-y"]).unwrap();
+        assert!(cli.yes);
+        match cli.command {
+            Some(Command::Chat(ref args)) => {
+                assert!(args.auto_approve);
+            }
+            _ => panic!("expected Chat command"),
+        }
+    }
+
+    #[test]
+    fn cli_mcp_add_scope_project() {
+        let cli = Cli::try_parse_from([
+            "astra", "mcp", "add", "--scope", "project", "s1", "npx",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Command::Mcp(McpCmd::Add(ref args))) => {
+                assert_eq!(args.scope, "project");
+                assert_eq!(args.name, "s1");
+                assert_eq!(args.command, "npx");
+            }
+            _ => panic!("expected Mcp Add command"),
+        }
+    }
+
+    #[test]
+    fn cli_mcp_add_scope_user() {
+        let cli = Cli::try_parse_from([
+            "astra", "mcp", "add", "--scope", "user", "s1", "npx",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Command::Mcp(McpCmd::Add(ref args))) => {
+                assert_eq!(args.scope, "user");
+            }
+            _ => panic!("expected Mcp Add command"),
+        }
+    }
+
+    #[test]
+    fn cli_mcp_add_with_trailing_args() {
+        let cli = Cli::try_parse_from([
+            "astra", "mcp", "add", "s1", "npx", "server", "--port", "8080",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Command::Mcp(McpCmd::Add(ref args))) => {
+                assert_eq!(args.name, "s1");
+                assert_eq!(args.command, "npx");
+                assert_eq!(args.args, vec!["server", "--port", "8080"]);
+            }
+            _ => panic!("expected Mcp Add command"),
+        }
+    }
+
+    #[test]
+    fn cli_interactive_subcommand() {
+        let cli = Cli::try_parse_from(["astra", "interactive"]).unwrap();
+        assert!(matches!(cli.command, Some(Command::Interactive)));
+    }
+
+    #[test]
+    fn cli_health_subcommand() {
+        let cli = Cli::try_parse_from(["astra", "health"]).unwrap();
+        assert!(matches!(cli.command, Some(Command::Health)));
+    }
+
+    #[test]
+    fn cli_whoami_subcommand() {
+        let cli = Cli::try_parse_from(["astra", "whoami"]).unwrap();
+        assert!(matches!(cli.command, Some(Command::Whoami)));
+    }
 }
