@@ -194,6 +194,8 @@ enum Command {
     /// Manage MCP servers: astra mcp add/remove/list/get
     #[command(subcommand)]
     Mcp(McpCmd),
+    /// Generate shell completion script
+    Completion(CompletionArgs),
     /// Direct message: astra "your question here"
     #[command(external_subcommand)]
     Message(Vec<String>),
@@ -491,6 +493,13 @@ struct McpRemoveArgs {
 struct McpGetArgs {
     /// Server name to inspect
     name: String,
+}
+
+#[derive(Args, Debug)]
+struct CompletionArgs {
+    /// Shell to generate completions for
+    #[arg(value_enum)]
+    shell: clap_complete::Shell,
 }
 
 // ═══════════════════════════════════════════════════════ Credentials ══════
