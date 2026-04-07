@@ -23,11 +23,20 @@ impl From<ExitCode> for i32 {
     }
 }
 
+/// Prepend system prompt to user message when `--system-prompt` is set.
+fn apply_system_prompt(message: &str, system_prompt: Option<&str>) -> String {
+    match system_prompt {
+        Some(sp) => format!("<system_instructions>\n{sp}\n</system_instructions>\n\n{message}"),
+        None => message.to_string(),
+    }
+}
+
 pub(super) async fn execute_cli_command(
     command: Option<Command>,
     profile: Option<String>,
     global_model: Option<String>,
     auto_approve: bool,
+    system_prompt: Option<String>,
     api: &astra_thin_client::ThinClient,
 ) -> Result<ExitCode, String> {
     match command {
@@ -51,7 +60,8 @@ pub(super) async fn execute_cli_command(
 
         // Inline message: astra "what is the answer to life?"
         Some(Command::Message(words)) => {
-            let message = words.join(" ");
+            let raw_message = words.join(" ");
+            let message = apply_system_prompt(&raw_message, system_prompt.as_deref());
             let (mut creds, name, _, token) = get_profile_and_token(profile.as_deref())?;
             let session_id = resumable_last_session_id(profile.as_deref());
             let selector = create_tool_selector(api, profile.as_deref());
@@ -773,10 +783,11 @@ pub(super) async fn run_print_mode(
     profile: Option<&str>,
     output_format: &str,
     model: Option<&str>,
+    system_prompt: Option<&str>,
     command: Option<Command>,
 ) -> Result<ExitCode, String> {
     // Extract message from command or stdin
-    let message = match command {
+    let raw_message = match command {
         Some(Command::Message(words)) if !words.is_empty() => words.join(" "),
         _ => {
             // Try reading from stdin
@@ -794,6 +805,7 @@ pub(super) async fn run_print_mode(
             msg
         }
     };
+    let message = apply_system_prompt(&raw_message, system_prompt);
 
     let (mut creds, name, _, token) = get_profile_and_token(profile)?;
     let session_id = resumable_last_session_id(profile);
@@ -1772,5 +1784,18 @@ mod config_cli_tests {
     #[test]
     fn known_settings_has_auto_approve() {
         assert!(KNOWN_SETTINGS.iter().any(|(k, _)| *k == "auto_approve"));
+    }
+
+    #[test]
+    fn apply_system_prompt_none_passthrough() {
+        assert_eq!(apply_system_prompt("hello", None), "hello");
+    }
+
+    #[test]
+    fn apply_system_prompt_wraps_message() {
+        let result = apply_system_prompt("hello", Some("Be concise"));
+        assert!(result.starts_with("<system_instructions>"));
+        assert!(result.contains("Be concise"));
+        assert!(result.ends_with("hello"));
     }
 }
