@@ -171,32 +171,44 @@ fn default_true() -> bool {
 
 /// MCP client handler that tracks tool list change notifications.
 ///
-/// When the server sends `notifications/tools/list_changed`, the handler
-/// sets the `tools_changed` flag.  The connection owner can poll this flag
-/// and refresh tools via `McpConnection::refresh_tools_if_changed()`.
+/// When the server sends `notifications/tools/list_changed` or
+/// `notifications/prompts/list_changed`, the handler sets the corresponding
+/// flag.  The connection owner can poll these flags and refresh as needed.
 #[derive(Debug, Clone)]
-struct ToolChangeHandler {
+struct ChangeHandler {
     tools_changed: Arc<AtomicBool>,
+    prompts_changed: Arc<AtomicBool>,
 }
 
-impl ToolChangeHandler {
-    fn new() -> (Self, Arc<AtomicBool>) {
-        let flag = Arc::new(AtomicBool::new(false));
+impl ChangeHandler {
+    fn new() -> (Self, Arc<AtomicBool>, Arc<AtomicBool>) {
+        let tools = Arc::new(AtomicBool::new(false));
+        let prompts = Arc::new(AtomicBool::new(false));
         (
             Self {
-                tools_changed: flag.clone(),
+                tools_changed: tools.clone(),
+                prompts_changed: prompts.clone(),
             },
-            flag,
+            tools,
+            prompts,
         )
     }
 }
 
-impl ClientHandler for ToolChangeHandler {
+impl ClientHandler for ChangeHandler {
     fn on_tool_list_changed(
         &self,
         _context: NotificationContext<RoleClient>,
     ) -> impl std::future::Future<Output = ()> + Send + '_ {
         self.tools_changed.store(true, Ordering::Release);
+        std::future::ready(())
+    }
+
+    fn on_prompt_list_changed(
+        &self,
+        _context: NotificationContext<RoleClient>,
+    ) -> impl std::future::Future<Output = ()> + Send + '_ {
+        self.prompts_changed.store(true, Ordering::Release);
         std::future::ready(())
     }
 }
@@ -215,6 +227,8 @@ pub struct McpConnection {
     config: McpServerConfig,
     /// Flag set by the notification handler when the server's tool list changes.
     tools_changed: Arc<AtomicBool>,
+    /// Flag set by the notification handler when the server's prompt list changes.
+    prompts_changed: Arc<AtomicBool>,
 }
 
 impl McpConnection {
@@ -256,6 +270,17 @@ impl McpConnection {
     /// consumed yet.
     pub fn has_pending_tool_change(&self) -> bool {
         self.tools_changed.load(Ordering::Acquire)
+    }
+
+    /// Whether the server has signalled a prompt list change that hasn't been
+    /// consumed yet.
+    pub fn has_pending_prompt_change(&self) -> bool {
+        self.prompts_changed.load(Ordering::Acquire)
+    }
+
+    /// Consume the prompts_changed flag (returns previous value).
+    pub fn consume_prompt_change(&self) -> bool {
+        self.prompts_changed.swap(false, Ordering::AcqRel)
     }
 
     /// Call a tool on this server.
@@ -733,6 +758,21 @@ impl McpClientManager {
         }
         refreshed
     }
+
+    /// Check all connections for prompt list change notifications and consume
+    /// the flags. Returns the names of servers whose prompt lists changed.
+    pub fn consume_prompt_changes(&self) -> Vec<String> {
+        let mut changed = Vec::new();
+        for (name, conn) in &self.connections {
+            if conn.consume_prompt_change() {
+                changed.push(name.clone());
+            }
+        }
+        if !changed.is_empty() {
+            eprintln!("  ↻ Prompt lists changed on: {}", changed.join(", "));
+        }
+        changed
+    }
 }
 
 /// Thread-safe MCP client manager.
@@ -846,8 +886,8 @@ async fn connect_stdio(
     // Create child process transport
     let transport = TokioChildProcess::new(cmd).map_err(|e| McpError::Spawn(e.to_string()))?;
 
-    // Connect as MCP client with tool change notification handler
-    let (handler, tools_changed) = ToolChangeHandler::new();
+    // Connect as MCP client with change notification handler
+    let (handler, tools_changed, prompts_changed) = ChangeHandler::new();
     let running = serve_client(handler, transport)
         .await
         .map_err(|e| McpError::Initialize(e.to_string()))?;
@@ -864,6 +904,7 @@ async fn connect_stdio(
         connected_at: Some(Instant::now()),
         config,
         tools_changed,
+        prompts_changed,
     })
 }
 
@@ -907,8 +948,8 @@ async fn connect_sse(
     // Create transport (reqwest-based, via rmcp feature)
     let transport = StreamableHttpClientTransport::from_config(transport_config);
 
-    // Connect as MCP client with tool change notification handler
-    let (handler, tools_changed) = ToolChangeHandler::new();
+    // Connect as MCP client with change notification handler
+    let (handler, tools_changed, prompts_changed) = ChangeHandler::new();
     let running = serve_client(handler, transport)
         .await
         .map_err(|e| McpError::Initialize(format!("SSE connect to {url}: {e}")))?;
@@ -925,6 +966,7 @@ async fn connect_sse(
         connected_at: Some(Instant::now()),
         config,
         tools_changed,
+        prompts_changed,
     })
 }
 
@@ -1035,8 +1077,8 @@ async fn connect_ws(
         }
     });
 
-    // Connect as MCP client with tool change notification handler
-    let (handler, tools_changed) = ToolChangeHandler::new();
+    // Connect as MCP client with change notification handler
+    let (handler, tools_changed, prompts_changed) = ChangeHandler::new();
     let running = serve_client(handler, (rmcp_read, rmcp_write))
         .await
         .map_err(|e| McpError::Initialize(format!("MCP init over WebSocket {url}: {e}")))?;
@@ -1051,6 +1093,7 @@ async fn connect_ws(
         connected_at: Some(Instant::now()),
         config,
         tools_changed,
+        prompts_changed,
     })
 }
 
@@ -1981,39 +2024,50 @@ mcp_servers:
         ));
     }
 
-    // ── ToolChangeHandler tests ─────────────────────────────────────────────
+    // ── ChangeHandler tests ───────────────────────────────────────────────
 
     #[test]
-    fn tool_change_handler_initial_state() {
-        let (_handler, flag) = ToolChangeHandler::new();
-        assert!(!flag.load(Ordering::Acquire));
+    fn change_handler_initial_state() {
+        let (_handler, tools, prompts) = ChangeHandler::new();
+        assert!(!tools.load(Ordering::Acquire));
+        assert!(!prompts.load(Ordering::Acquire));
     }
 
     #[test]
-    fn tool_change_handler_sets_flag() {
-        let (handler, flag) = ToolChangeHandler::new();
+    fn change_handler_sets_tools_flag() {
+        let (handler, tools, _prompts) = ChangeHandler::new();
         handler.tools_changed.store(true, Ordering::Release);
-        assert!(flag.load(Ordering::Acquire));
+        assert!(tools.load(Ordering::Acquire));
     }
 
     #[test]
-    fn tool_change_handler_flag_shared() {
-        // Handler and returned flag reference the same AtomicBool
-        let (handler, flag) = ToolChangeHandler::new();
-        flag.store(true, Ordering::Release);
-        assert!(handler.tools_changed.load(Ordering::Acquire));
-
-        handler.tools_changed.store(false, Ordering::Release);
-        assert!(!flag.load(Ordering::Acquire));
+    fn change_handler_sets_prompts_flag() {
+        let (handler, _tools, prompts) = ChangeHandler::new();
+        handler.prompts_changed.store(true, Ordering::Release);
+        assert!(prompts.load(Ordering::Acquire));
     }
 
     #[test]
-    fn tool_change_handler_clone_shares_flag() {
-        let (handler, flag) = ToolChangeHandler::new();
+    fn change_handler_flags_independent() {
+        let (handler, tools, prompts) = ChangeHandler::new();
+        handler.tools_changed.store(true, Ordering::Release);
+        assert!(tools.load(Ordering::Acquire));
+        assert!(!prompts.load(Ordering::Acquire));
+
+        handler.prompts_changed.store(true, Ordering::Release);
+        assert!(prompts.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn change_handler_clone_shares_flags() {
+        let (handler, tools, prompts) = ChangeHandler::new();
         let cloned = handler.clone();
         cloned.tools_changed.store(true, Ordering::Release);
-        assert!(flag.load(Ordering::Acquire));
+        cloned.prompts_changed.store(true, Ordering::Release);
+        assert!(tools.load(Ordering::Acquire));
+        assert!(prompts.load(Ordering::Acquire));
         assert!(handler.tools_changed.load(Ordering::Acquire));
+        assert!(handler.prompts_changed.load(Ordering::Acquire));
     }
 
     #[test]
