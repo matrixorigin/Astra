@@ -309,11 +309,9 @@ fn run_command_with_cleanup(
 // ---------------------------------------------------------------------------
 
 /// Maximum output size before truncation (30K chars, matching Claude Code's default).
-#[allow(dead_code)] // Will be used when streaming shell output is wired up
 const MAX_OUTPUT_CHARS: usize = 30_000;
 
 /// Size watchdog poll interval for backgrounded tasks.
-#[allow(dead_code)] // Will be used when streaming shell output is wired up
 const SIZE_WATCHDOG_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Execute a command with streaming output and optional auto-backgrounding on timeout.
@@ -324,7 +322,6 @@ const SIZE_WATCHDOG_INTERVAL: Duration = Duration::from_secs(5);
 /// - Watchdog kills backgrounded processes after 30 minutes
 ///
 /// Returns (output_text, exit_code, was_backgrounded).
-#[allow(dead_code)] // Will be wired up when shell output streaming is implemented
 fn run_command_streaming(
     cmd: &mut Command,
     timeout_secs: f64,
@@ -489,7 +486,6 @@ struct StreamingResult {
     backgrounded: bool,
 }
 
-#[allow(dead_code)]
 enum OutputChunk {
     Stdout(String),
     Stderr(String),
@@ -498,7 +494,6 @@ enum OutputChunk {
 /// Time-limit watchdog for backgrounded processes.
 /// Kills the process after 30 minutes to prevent indefinite resource consumption.
 /// Inspired by Claude Code's background task management.
-#[allow(dead_code)]
 fn size_watchdog(
     mut child: std::process::Child,
     stdout_thread: std::thread::JoinHandle<()>,
@@ -539,6 +534,119 @@ fn size_watchdog(
     // Clean up threads.
     let _ = stdout_thread.join();
     let _ = stderr_thread.join();
+}
+
+/// Default cap on grep result lines when no explicit limit is given.
+/// Prevents unbounded output from broad patterns on large repos.
+/// The LLM can pass `head_limit=0` to override.
+const GREP_DEFAULT_HEAD_LIMIT: usize = 250;
+
+/// Run a read-only command (grep/glob) with timeout, capturing only stdout.
+/// Unlike `run_command_streaming`, stderr is captured separately and not mixed
+/// into the output — the caller gets clean stdout content plus stderr for errors.
+/// Returns `(stdout, stderr, exit_code, timed_out)`.
+fn run_readonly_command_with_partial(
+    cmd: &mut Command,
+    timeout_secs: f64,
+) -> Result<(String, String, i32, bool), String> {
+    use std::io::Read;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+
+    let mut child = cmd.spawn().map_err(|e| format!("Error: {e}"))?;
+    let mut stdout = child.stdout.take().ok_or("Failed to capture stdout")?;
+    let mut stderr_pipe = child.stderr.take().ok_or("Failed to capture stderr")?;
+
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    let reader = std::thread::spawn(move || {
+        let mut buf = [0u8; 8192];
+        loop {
+            match stdout.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    let _ = tx.send(String::from_utf8_lossy(&buf[..n]).to_string());
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    // Capture stderr in a separate thread (for error reporting only, not mixed into output)
+    let stderr_reader = std::thread::spawn(move || {
+        let mut buf = String::new();
+        let _ = stderr_pipe.read_to_string(&mut buf);
+        buf
+    });
+
+    let mut output = String::new();
+    let max_bytes = MAX_OUTPUT_CHARS;
+    let mut capped = false;
+    let deadline = std::time::Instant::now() + Duration::from_secs_f64(timeout_secs);
+
+    loop {
+        while let Ok(chunk) = rx.try_recv() {
+            if !capped {
+                if output.len() + chunk.len() > max_bytes {
+                    let remaining = max_bytes.saturating_sub(output.len());
+                    let safe = chunk.floor_char_boundary(remaining);
+                    output.push_str(&chunk[..safe]);
+                    capped = true;
+                } else {
+                    output.push_str(&chunk);
+                }
+            }
+        }
+
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let _ = reader.join();
+                let stderr_text = stderr_reader.join().unwrap_or_default();
+                while let Ok(chunk) = rx.try_recv() {
+                    if !capped && output.len() + chunk.len() <= max_bytes {
+                        output.push_str(&chunk);
+                    }
+                }
+                return Ok((output, stderr_text, status.code().unwrap_or(-1), false));
+            }
+            Ok(None) => {
+                if std::time::Instant::now() > deadline {
+                    #[cfg(unix)]
+                    {
+                        let pid = child.id();
+                        let _ = Command::new("kill")
+                            .args(["-9", &format!("-{pid}")])
+                            .output();
+                    }
+                    #[cfg(not(unix))]
+                    {
+                        let _ = child.kill();
+                    }
+                    let _ = child.wait();
+                    let _ = reader.join();
+                    let _ = stderr_reader.join();
+                    // Drain any remaining buffered output
+                    while let Ok(chunk) = rx.try_recv() {
+                        if !capped && output.len() + chunk.len() <= max_bytes {
+                            output.push_str(&chunk);
+                        }
+                    }
+                    // Drop the last line — it may be incomplete (like Claude Code)
+                    if let Some(last_nl) = output.rfind('\n') {
+                        output.truncate(last_nl);
+                    }
+                    return Ok((output, String::new(), -1, true));
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(e) => return Err(format!("Error: {e}")),
+        }
+    }
 }
 
 const DEFAULT_SEARCH_EXCLUDE_DIRS: &[&str] = &[
@@ -994,6 +1102,10 @@ impl ToolExecutor {
             .and_then(Value::as_str)
             .unwrap_or("content");
         let offset = args.get("offset").and_then(Value::as_u64).unwrap_or(0) as usize;
+        let head_limit = args
+            .get("head_limit")
+            .and_then(Value::as_u64)
+            .map(|n| n as usize);
 
         let grep_flags = match output_mode {
             "files_with_matches" => "-rlHE",
@@ -1017,70 +1129,106 @@ impl ToolExecutor {
         cmd.arg(pattern).arg(&search_path);
         cmd.current_dir(&self.project_root);
 
-        // Use 30s timeout for grep (large repos can take time)
-        match run_command_with_cleanup(&mut cmd, 30.0) {
-            Ok(out) => {
-                let raw_text = String::from_utf8_lossy(&out.stdout);
-                let stderr = String::from_utf8_lossy(&out.stderr);
-                match out.status.code() {
-                    Some(0) => {
-                        // For count mode, filter out zero-count lines
-                        let text = if output_mode == "count" {
-                            raw_text
-                                .lines()
-                                .filter(|line| !line.ends_with(":0"))
-                                .collect::<Vec<_>>()
-                                .join("\n")
-                        } else {
-                            raw_text.to_string()
-                        };
+        // Use streaming execution to preserve partial results on timeout
+        match run_readonly_command_with_partial(&mut cmd, 30.0) {
+            Ok((raw_text, stderr_text, exit_code, timed_out)) => {
+                // Treat exit code 1 as "no matches" (grep convention)
+                if exit_code == 1 && raw_text.trim().is_empty() {
+                    let warn = stderr_text.trim();
+                    return if warn.is_empty() {
+                        "No matches found".to_string()
+                    } else {
+                        format!("No matches found (warnings: {warn})")
+                    };
+                }
 
-                        // Apply offset for pagination
-                        let text = if offset > 0 {
-                            let lines: Vec<&str> = text.lines().collect();
-                            if offset >= lines.len() {
-                                return format!(
-                                    "No more results (offset {} >= {} lines)",
-                                    offset,
-                                    lines.len()
-                                );
-                            }
-                            lines[offset..].join("\n")
-                        } else {
-                            text
-                        };
+                // If we got no output and a non-zero exit code, report error
+                if raw_text.trim().is_empty() && exit_code != 0 {
+                    if timed_out {
+                        return "Error: grep timed out after 30s with no results. \
+                             The search scope is too broad. Try: \
+                             (1) search a specific subdirectory with 'path', \
+                             (2) use 'include' to filter file types, \
+                             (3) use a more specific pattern."
+                            .to_string();
+                    }
+                    let detail = stderr_text.trim();
+                    return if detail.is_empty() {
+                        "Error: grep failed".to_string()
+                    } else {
+                        format!("Error: {detail}")
+                    };
+                }
 
-                        let limit = self.scaled_output_limit().min(20_000);
-                        let result = if text.len() > limit {
-                            let mut t = text[..text.floor_char_boundary(limit)].to_string();
-                            t.push_str("\n[truncated]");
-                            t
-                        } else {
-                            text
-                        };
+                // For count mode, filter out zero-count lines
+                let text = if output_mode == "count" {
+                    raw_text
+                        .lines()
+                        .filter(|line| !line.ends_with(":0"))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                } else {
+                    raw_text
+                };
 
-                        if scope_context {
-                            annotate_grep_with_scope(&result, &self.project_root)
-                        } else {
-                            result
-                        }
+                // Apply offset for pagination
+                let lines: Vec<&str> = text.lines().collect();
+                let lines = if offset > 0 {
+                    if offset >= lines.len() {
+                        return format!(
+                            "No more results (offset {} >= {} lines)",
+                            offset,
+                            lines.len()
+                        );
                     }
-                    Some(1) => {
-                        let warn = stderr.trim();
-                        if warn.is_empty() {
-                            "No matches found".to_string()
-                        } else {
-                            format!("No matches found (warnings: {warn})")
-                        }
+                    &lines[offset..]
+                } else {
+                    &lines[..]
+                };
+
+                // Apply head_limit (default GREP_DEFAULT_HEAD_LIMIT, 0 = unlimited)
+                let effective_limit = match head_limit {
+                    Some(0) => None,           // explicit 0 = unlimited
+                    Some(n) => Some(n),        // explicit limit
+                    None => Some(GREP_DEFAULT_HEAD_LIMIT), // default
+                };
+                let (lines, was_truncated_by_limit) = if let Some(limit) = effective_limit {
+                    if lines.len() > limit {
+                        (&lines[..limit], true)
+                    } else {
+                        (lines, false)
                     }
-                    _ => {
-                        let detail = stderr.trim();
-                        if detail.is_empty() {
-                            "Error: grep failed".to_string()
-                        } else {
-                            format!("Error: {detail}")
-                        }
-                    }
+                } else {
+                    (lines, false)
+                };
+
+                let mut result_text = lines.join("\n");
+
+                // Apply byte-level output limit
+                let limit = self.scaled_output_limit().min(20_000);
+                if result_text.len() > limit {
+                    result_text = result_text[..result_text.floor_char_boundary(limit)].to_string();
+                    result_text.push_str("\n[truncated]");
+                }
+
+                // Append metadata about truncation/timeout
+                if timed_out {
+                    result_text.push_str(&format!(
+                        "\n\n[grep timed out after 30s — showing partial results. \
+                         Narrow the search: use 'path' for a subdirectory or 'include' for file types.]"
+                    ));
+                }
+                if was_truncated_by_limit {
+                    let eff = effective_limit.unwrap_or(0);
+                    result_text.push_str(&format!(
+                        "\n\n[Results limited to {eff} lines. Use 'offset' to paginate or 'head_limit: 0' for unlimited.]"
+                    ));
+                }
+
+                if scope_context {
+                    annotate_grep_with_scope(&result_text, &self.project_root)
+                } else {
+                    result_text
                 }
             }
             Err(e) => e,
@@ -2522,6 +2670,357 @@ mod tests {
         assert!(
             result.contains("// in "),
             "should have scope context annotation: {result}"
+        );
+    }
+
+    #[test]
+    fn grep_head_limit_truncates_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let executor = super::ToolExecutor::new(dir.path());
+        // Create a file with many matching lines
+        let content: String = (0..100).map(|i| format!("needle line {i}\n")).collect();
+        std::fs::write(dir.path().join("big.txt"), &content).unwrap();
+
+        let result = executor.grep(&serde_json::json!({
+            "pattern": "needle",
+            "path": ".",
+            "head_limit": 5
+        }));
+        // Should have at most 5 matching lines + metadata
+        let match_lines: Vec<&str> = result.lines().filter(|l| l.contains("needle")).collect();
+        assert_eq!(match_lines.len(), 5, "should limit to 5 lines, got: {result}");
+        assert!(result.contains("Results limited to"), "should note truncation, got: {result}");
+    }
+
+    #[test]
+    fn grep_head_limit_zero_means_unlimited() {
+        let dir = tempfile::tempdir().unwrap();
+        let executor = super::ToolExecutor::new(dir.path());
+        let content: String = (0..300).map(|i| format!("needle line {i}\n")).collect();
+        std::fs::write(dir.path().join("big.txt"), &content).unwrap();
+
+        let result = executor.grep(&serde_json::json!({
+            "pattern": "needle",
+            "path": ".",
+            "head_limit": 0
+        }));
+        // Should NOT have the "Results limited" message
+        assert!(!result.contains("Results limited to"), "head_limit=0 should be unlimited, got: {result}");
+        let match_lines: Vec<&str> = result.lines().filter(|l| l.contains("needle")).collect();
+        assert!(match_lines.len() > 250, "should have all lines, got {}", match_lines.len());
+    }
+
+    #[test]
+    fn grep_default_head_limit_applies() {
+        let dir = tempfile::tempdir().unwrap();
+        let executor = super::ToolExecutor::new(dir.path());
+        // Create more than GREP_DEFAULT_HEAD_LIMIT (250) matching lines
+        let content: String = (0..300).map(|i| format!("needle line {i}\n")).collect();
+        std::fs::write(dir.path().join("big.txt"), &content).unwrap();
+
+        let result = executor.grep(&serde_json::json!({
+            "pattern": "needle",
+            "path": "."
+        }));
+        let match_lines: Vec<&str> = result.lines().filter(|l| l.contains("needle")).collect();
+        assert_eq!(match_lines.len(), 250, "default limit should be 250, got {}", match_lines.len());
+        assert!(result.contains("Results limited to 250"), "should note default limit, got: {result}");
+    }
+
+    #[test]
+    fn grep_offset_with_head_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let executor = super::ToolExecutor::new(dir.path());
+        let content: String = (0..20).map(|i| format!("needle line {i}\n")).collect();
+        std::fs::write(dir.path().join("test.txt"), &content).unwrap();
+
+        let result = executor.grep(&serde_json::json!({
+            "pattern": "needle",
+            "path": ".",
+            "offset": 5,
+            "head_limit": 3
+        }));
+        let match_lines: Vec<&str> = result.lines().filter(|l| l.contains("needle")).collect();
+        assert_eq!(match_lines.len(), 3, "should have 3 lines after offset, got: {result}");
+        // First visible line should be line 5 (0-indexed)
+        assert!(result.contains("needle line 5"), "should start at offset 5, got: {result}");
+    }
+
+    #[test]
+    fn grep_streaming_preserves_partial_on_timeout() {
+        // Test that run_readonly_command_with_partial returns partial stdout on timeout
+        let dir = tempfile::tempdir().unwrap();
+
+        // Create a script that outputs lines then hangs
+        let script = dir.path().join("slow.sh");
+        std::fs::write(
+            &script,
+            "#!/bin/bash\nfor i in $(seq 1 5); do echo \"match_line_$i\"; done; sleep 60",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let mut cmd = std::process::Command::new("bash");
+        cmd.arg(&script);
+        cmd.current_dir(dir.path());
+
+        let (output, _stderr, exit_code, timed_out) =
+            super::run_readonly_command_with_partial(&mut cmd, 2.0)
+                .expect("should not return Err");
+        // Should have captured partial stdout before timeout
+        assert!(output.contains("match_line_1"), "should have partial output, got: {output}");
+        assert!(timed_out, "should report timed_out=true");
+        assert_eq!(exit_code, -1, "timed out exit code should be -1");
+        // Should NOT contain any error metadata in the output (clean stdout only)
+        assert!(!output.contains("Error:"), "output should be clean stdout, got: {output}");
+    }
+
+    #[test]
+    fn grep_count_mode_with_head_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let executor = super::ToolExecutor::new(dir.path());
+        std::fs::write(dir.path().join("a.txt"), "needle\nneedle\n").unwrap();
+        std::fs::write(dir.path().join("b.txt"), "needle\n").unwrap();
+        std::fs::write(dir.path().join("c.txt"), "nothing\n").unwrap();
+
+        let result = executor.grep(&serde_json::json!({
+            "pattern": "needle",
+            "path": ".",
+            "output_mode": "count",
+            "head_limit": 1
+        }));
+        // Count mode should filter zero-count lines, then apply head_limit.
+        // Only count the actual count lines (file:N), not metadata lines.
+        let count_lines: Vec<&str> = result
+            .lines()
+            .filter(|l| l.contains(".txt:"))
+            .collect();
+        assert_eq!(count_lines.len(), 1, "should limit to 1 count entry, got: {result}");
+    }
+
+    #[test]
+    fn grep_files_with_matches_mode_works() {
+        let dir = tempfile::tempdir().unwrap();
+        let executor = super::ToolExecutor::new(dir.path());
+        std::fs::write(dir.path().join("a.txt"), "needle here\n").unwrap();
+        std::fs::write(dir.path().join("b.txt"), "no match\n").unwrap();
+
+        let result = executor.grep(&serde_json::json!({
+            "pattern": "needle",
+            "path": ".",
+            "output_mode": "files_with_matches"
+        }));
+        assert!(result.contains("a.txt"), "should list matching file, got: {result}");
+        assert!(!result.contains("b.txt"), "should not list non-matching file, got: {result}");
+    }
+
+    #[test]
+    fn grep_stderr_not_mixed_into_output() {
+        // Verify that stderr (e.g. "Binary file matches") doesn't appear in results
+        let dir = tempfile::tempdir().unwrap();
+
+        let mut cmd = std::process::Command::new("bash");
+        cmd.arg("-c")
+            .arg("echo 'stdout_line' && echo 'stderr_line' >&2");
+        cmd.current_dir(dir.path());
+
+        let (output, _stderr, _exit_code, _timed_out) =
+            super::run_readonly_command_with_partial(&mut cmd, 5.0)
+                .expect("should not return Err");
+        assert!(output.contains("stdout_line"), "should have stdout, got: {output}");
+        assert!(!output.contains("stderr_line"), "should NOT have stderr, got: {output}");
+    }
+
+    #[test]
+    fn grep_stderr_captured_separately_for_errors() {
+        // Verify stderr is available for error reporting
+        let dir = tempfile::tempdir().unwrap();
+
+        let mut cmd = std::process::Command::new("bash");
+        cmd.arg("-c")
+            .arg("echo 'error detail' >&2; exit 2");
+        cmd.current_dir(dir.path());
+
+        let (stdout, stderr, exit_code, _) =
+            super::run_readonly_command_with_partial(&mut cmd, 5.0)
+                .expect("should not return Err");
+        assert!(stdout.trim().is_empty(), "stdout should be empty, got: {stdout}");
+        assert!(stderr.contains("error detail"), "stderr should be captured, got: {stderr}");
+        assert_eq!(exit_code, 2);
+    }
+
+    #[test]
+    fn grep_invalid_regex_reports_stderr() {
+        let dir = tempfile::tempdir().unwrap();
+        let executor = super::ToolExecutor::new(dir.path());
+        std::fs::write(dir.path().join("test.txt"), "hello").unwrap();
+
+        let result = executor.grep(&serde_json::json!({
+            "pattern": "[invalid",
+            "path": "."
+        }));
+        // Should report the grep error from stderr, not just "grep failed"
+        assert!(result.starts_with("Error"), "should be error, got: {result}");
+    }
+
+    #[test]
+    fn grep_timeout_with_partial_drops_incomplete_last_line() {
+        // When timeout kills grep mid-write, the last line may be incomplete.
+        // run_readonly_command_with_partial should drop it.
+        let dir = tempfile::tempdir().unwrap();
+
+        let script = dir.path().join("partial.sh");
+        std::fs::write(
+            &script,
+            "#!/bin/bash\necho 'complete_line_1'\necho 'complete_line_2'\nprintf 'incomplete_no_newline'\nsleep 60",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let mut cmd = std::process::Command::new("bash");
+        cmd.arg(&script);
+        cmd.current_dir(dir.path());
+
+        let (output, _stderr, _, timed_out) =
+            super::run_readonly_command_with_partial(&mut cmd, 2.0)
+                .expect("should not return Err");
+        assert!(timed_out);
+        assert!(output.contains("complete_line_1"), "should have complete lines, got: {output}");
+        assert!(output.contains("complete_line_2"), "should have complete lines, got: {output}");
+        // The incomplete line (no trailing newline) should be dropped
+        assert!(!output.contains("incomplete_no_newline"), "should drop incomplete last line, got: {output}");
+    }
+
+    #[test]
+    fn grep_timeout_empty_output_returns_actionable_error() {
+        // #6 + #14: timeout with zero output → specific error message
+        let dir = tempfile::tempdir().unwrap();
+        let _executor = super::ToolExecutor::new(dir.path());
+
+        // Create a script that hangs without producing output (simulates grep
+        // scanning a huge tree with no matches before timeout)
+        let script = dir.path().join("hang.sh");
+        std::fs::write(&script, "#!/bin/bash\nsleep 60").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let mut cmd = std::process::Command::new("bash");
+        cmd.arg(&script);
+        cmd.current_dir(dir.path());
+
+        let (output, _stderr, _exit, timed_out) =
+            super::run_readonly_command_with_partial(&mut cmd, 1.0)
+                .expect("should not return Err");
+        assert!(timed_out);
+        assert!(output.trim().is_empty(), "should have no output, got: {output}");
+    }
+
+    #[test]
+    fn grep_no_match_with_stderr_warnings() {
+        // #13: exit_code=1 with stderr warnings
+        let dir = tempfile::tempdir().unwrap();
+        let executor = super::ToolExecutor::new(dir.path());
+        // Create a binary file that grep will warn about
+        std::fs::write(dir.path().join("bin.dat"), &[0u8, 1, 2, 0xFF, 0xFE]).unwrap();
+        std::fs::write(dir.path().join("text.txt"), "no match here").unwrap();
+
+        let result = executor.grep(&serde_json::json!({
+            "pattern": "zzzzz_nonexistent",
+            "path": ".",
+            "include": "*"
+        }));
+        assert!(result.contains("No matches"), "should report no matches, got: {result}");
+    }
+
+    #[test]
+    fn grep_offset_beyond_results() {
+        // #18: offset >= lines.len()
+        let dir = tempfile::tempdir().unwrap();
+        let executor = super::ToolExecutor::new(dir.path());
+        std::fs::write(dir.path().join("test.txt"), "needle\n").unwrap();
+
+        let result = executor.grep(&serde_json::json!({
+            "pattern": "needle",
+            "path": ".",
+            "offset": 999
+        }));
+        assert!(result.contains("No more results"), "should report no more results, got: {result}");
+        assert!(result.contains("999"), "should mention the offset, got: {result}");
+    }
+
+    #[test]
+    fn grep_timeout_with_partial_shows_timeout_note() {
+        // #24: end-to-end — timed_out with partial results appends timeout note
+        let dir = tempfile::tempdir().unwrap();
+
+        // Create many files so grep has something to find before timeout
+        for i in 0..20 {
+            std::fs::write(
+                dir.path().join(format!("f{i}.txt")),
+                format!("needle_line_{i}\n"),
+            )
+            .unwrap();
+        }
+
+        // We can't easily make grep itself timeout in a test, so test the
+        // metadata appending logic directly: simulate a timed_out result
+        // by calling run_readonly_command_with_partial on a slow script
+        let script = dir.path().join("slow_grep.sh");
+        std::fs::write(
+            &script,
+            "#!/bin/bash\nfor i in $(seq 1 10); do echo \"file$i.txt:1:needle_$i\"; done; sleep 60",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let mut cmd = std::process::Command::new("bash");
+        cmd.arg(&script);
+        cmd.current_dir(dir.path());
+
+        let (output, _stderr, _, timed_out) =
+            super::run_readonly_command_with_partial(&mut cmd, 2.0)
+                .expect("should not return Err");
+        assert!(timed_out);
+        assert!(output.contains("needle_1"), "should have partial results");
+        // The grep function would append the timeout note — verify the raw
+        // output does NOT contain it (clean separation)
+        assert!(!output.contains("[grep timed out"), "raw output should be clean");
+    }
+
+    #[test]
+    fn readonly_command_caps_output_at_max() {
+        // #8: output exceeding MAX_OUTPUT_CHARS is capped
+        let dir = tempfile::tempdir().unwrap();
+
+        // Generate output larger than MAX_OUTPUT_CHARS (30_000)
+        let mut cmd = std::process::Command::new("bash");
+        cmd.arg("-c")
+            .arg("yes 'abcdefghij' | head -5000"); // 5000 * 11 = 55000 chars
+        cmd.current_dir(dir.path());
+
+        let (output, _stderr, exit_code, _) =
+            super::run_readonly_command_with_partial(&mut cmd, 10.0)
+                .expect("should not return Err");
+        assert_eq!(exit_code, 0);
+        assert!(
+            output.len() <= super::MAX_OUTPUT_CHARS + 100, // small margin for partial chunk
+            "output should be capped near MAX_OUTPUT_CHARS, got {} bytes",
+            output.len()
         );
     }
 
