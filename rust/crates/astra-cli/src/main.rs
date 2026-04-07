@@ -3585,6 +3585,37 @@ fn display_plan_updates_live(
 /// Prompt redraws during active input can interrupt IME composition and cause
 /// probabilistic dropped characters for CJK input. The plan update channel is
 /// unbounded, so deferring display between prompts is safe and lossless.
+/// Refresh dynamic Tab-completion data (skill names, MCP server names) from
+/// the current REPL state so the readline completer offers them.
+async fn refresh_dynamic_completions(state: &ReplState) {
+    // Skill names from UnifiedSkillRegistry
+    let skill_entries: Vec<(String, String)> = {
+        let manifests = state.unified_skill_registry.all_manifests();
+        manifests
+            .into_iter()
+            .map(|m| {
+                let desc = if m.description.len() > 40 {
+                    format!("{}…", &m.description[..39])
+                } else {
+                    m.description.clone()
+                };
+                (m.name, desc)
+            })
+            .collect()
+    };
+    repl_ui::update_skill_completions(skill_entries);
+
+    // MCP server names
+    let mcp_entries: Vec<(String, String)> = {
+        let mgr = state.mcp_manager.read().await;
+        mgr.server_states()
+            .into_iter()
+            .map(|(name, st)| (name.to_string(), format!("{:?}", st)))
+            .collect()
+    };
+    repl_ui::update_mcp_completions(mcp_entries);
+}
+
 fn flush_plan_updates_between_prompts(state: &mut ReplState) {
     if state.plan_handle.is_none() {
         return;
@@ -4873,10 +4904,15 @@ async fn run_chat_repl(
         state.model = None; // reset so chat uses "auto" for actual requests
     }
 
+    // Seed dynamic Tab-completion with available skills / MCP servers.
+    refresh_dynamic_completions(&state).await;
+
     // ── Main loop ─────────────────────────────────────────────────────────────
     let mut last_ctrl_c_at: Option<std::time::Instant> = None;
     loop {
         flush_plan_updates_between_prompts(&mut state);
+        // Refresh Tab-completion data (skills/MCP may change mid-session).
+        refresh_dynamic_completions(&state).await;
         let current_token = current_access_token(profile);
 
         // Keep readline prompt TEXT as ASCII-only. Unicode characters (⏸, 🔄, ❯)
