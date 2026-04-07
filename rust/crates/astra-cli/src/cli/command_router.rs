@@ -1,4 +1,5 @@
 use super::*;
+use clap::CommandFactory;
 use crate::permission_manager::PermissionMode;
 use astra_thin_client::paths;
 use std::io::Read;
@@ -720,6 +721,13 @@ pub(super) async fn execute_cli_command(
         // ── MCP server management (offline, no server needed) ──────────
         Some(Command::Mcp(mcp_cmd)) => {
             execute_mcp_command(mcp_cmd)?;
+            Ok(ExitCode::Success)
+        }
+
+        // ── Shell completion script generation ──────────────────────────
+        Some(Command::Completion(args)) => {
+            let mut cmd = Cli::command();
+            clap_complete::generate(args.shell, &mut cmd, "astra", &mut std::io::stdout());
             Ok(ExitCode::Success)
         }
     }
