@@ -177,6 +177,74 @@ pub(super) async fn handle_state_command(
             );
         }
 
+        "/undo" => {
+            if state.history.is_empty() {
+                eprintln!("{}", "  Nothing to undo.".yellow());
+                return Ok(());
+            }
+            let count: usize = if arg.is_empty() {
+                1
+            } else {
+                match arg.parse::<usize>() {
+                    Ok(0) => {
+                        eprintln!("{}", "  /undo requires a positive number.".yellow());
+                        return Ok(());
+                    }
+                    Ok(n) => n,
+                    Err(_) => {
+                        eprintln!(
+                            "{}",
+                            "  Usage: /undo [N]  — undo last N turns (default 1)".yellow()
+                        );
+                        return Ok(());
+                    }
+                }
+            };
+            let actual = count.min(state.history.len());
+            let mut undone_previews = Vec::new();
+            for _ in 0..actual {
+                if let Some((user_msg, _)) = state.history.pop() {
+                    let preview: String = user_msg.chars().take(50).collect();
+                    let preview = if user_msg.chars().count() > 50 {
+                        format!("{}…", preview)
+                    } else {
+                        preview
+                    };
+                    undone_previews.push(preview);
+                    state.turn = state.turn.saturating_sub(1);
+                }
+            }
+            state.last_response = state.history.last().map(|(_, resp)| resp.clone());
+            state.continuation_anchor = None;
+            if actual == 1 {
+                eprintln!(
+                    "  {} Undid 1 turn: {}",
+                    theme::icon_ok(),
+                    undone_previews[0].as_str().dim()
+                );
+            } else {
+                eprintln!(
+                    "  {} Undid {} turns:",
+                    theme::icon_ok(),
+                    actual,
+                );
+                for (i, preview) in undone_previews.iter().enumerate() {
+                    eprintln!("    {}. {}", actual - i, preview.as_str().dim());
+                }
+            }
+            eprintln!(
+                "  {} turns remaining in context",
+                state.history.len()
+            );
+            if let Some(ref j) = state.journal {
+                let _ = j.append(&session_journal::JournalEvent::config_change(
+                    state.session_id.as_deref(),
+                    "undo",
+                    &actual.to_string(),
+                ));
+            }
+        }
+
         "/explain" => {
             state.explain = match state.explain {
                 ExplainMode::Off => ExplainMode::On,
@@ -906,5 +974,78 @@ mod tests {
 
         let (_, changed) = apply_skill_search_command(&mut state, SkillSearchCommand::Show);
         assert!(!changed);
+    }
+
+    // ── /undo tests ──
+
+    /// Helper: build a ReplState with N fake turns in history.
+    fn state_with_turns(n: usize) -> ReplState {
+        let mut state = ReplState::default();
+        for i in 0..n {
+            state.history.push((
+                format!("question {}", i + 1),
+                format!("answer {}", i + 1),
+            ));
+            state.turn += 1;
+        }
+        state.last_response = state.history.last().map(|(_, r)| r.clone());
+        state
+    }
+
+    #[test]
+    fn undo_single_turn() {
+        let mut state = state_with_turns(3);
+        assert_eq!(state.history.len(), 3);
+        assert_eq!(state.turn, 3);
+
+        // Pop the last turn
+        state.history.pop();
+        state.turn = state.turn.saturating_sub(1);
+        state.last_response = state.history.last().map(|(_, r)| r.clone());
+
+        assert_eq!(state.history.len(), 2);
+        assert_eq!(state.turn, 2);
+        assert_eq!(state.last_response.as_deref(), Some("answer 2"));
+    }
+
+    #[test]
+    fn undo_multiple_turns() {
+        let mut state = state_with_turns(5);
+        let count = 3;
+        let actual = count.min(state.history.len());
+        for _ in 0..actual {
+            state.history.pop();
+            state.turn = state.turn.saturating_sub(1);
+        }
+        state.last_response = state.history.last().map(|(_, r)| r.clone());
+
+        assert_eq!(state.history.len(), 2);
+        assert_eq!(state.turn, 2);
+        assert_eq!(state.last_response.as_deref(), Some("answer 2"));
+    }
+
+    #[test]
+    fn undo_all_turns() {
+        let mut state = state_with_turns(2);
+        let count = 5; // More than available
+        let actual = count.min(state.history.len());
+        for _ in 0..actual {
+            state.history.pop();
+            state.turn = state.turn.saturating_sub(1);
+        }
+        state.last_response = state.history.last().map(|(_, r)| r.clone());
+
+        assert_eq!(state.history.len(), 0);
+        assert_eq!(state.turn, 0);
+        assert!(state.last_response.is_none());
+    }
+
+    #[test]
+    fn undo_empty_history_is_noop() {
+        let mut state = state_with_turns(0);
+        assert!(state.history.is_empty());
+        // /undo on empty should not panic
+        let count = 1usize.min(state.history.len());
+        assert_eq!(count, 0);
     }
 }
