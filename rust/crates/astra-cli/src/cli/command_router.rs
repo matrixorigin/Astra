@@ -34,6 +34,19 @@ pub(super) async fn execute_cli_command(
             Ok(ExitCode::Success)
         }
 
+        // Start embedded HTTP API server
+        Some(Command::Serve(args)) => {
+            let addr: std::net::SocketAddr =
+                format!("{}:{}", args.host, args.port)
+                    .parse()
+                    .map_err(|e| format!("Invalid listen address: {e}"))?;
+            eprintln!("Starting API server on {addr} ...");
+            astra_runtime::serve(addr)
+                .await
+                .map_err(|e| format!("Server error: {e}"))?;
+            Ok(ExitCode::Success)
+        }
+
         // Inline message: astra "what is the answer to life?"
         Some(Command::Message(words)) => {
             let message = words.join(" ");
