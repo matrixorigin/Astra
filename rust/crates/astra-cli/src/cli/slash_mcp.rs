@@ -9,6 +9,7 @@ pub(super) async fn handle_mcp_command(arg: &str, state: &ReplState) -> Result<(
         "" | "status" => show_status(state).await,
         "servers" => show_servers(state).await,
         "prompts" => show_prompts(state).await,
+        "resources" => show_resources(state).await,
         s if s.starts_with("add ") => handle_mcp_add(&s[4..]).await,
         "add" => {
             eprintln!(
@@ -20,6 +21,10 @@ pub(super) async fn handle_mcp_command(arg: &str, state: &ReplState) -> Result<(
         "remove" => {
             eprintln!("{}", "  Usage: /mcp remove <name>".dim());
         }
+        s if s.starts_with("resource ") => handle_mcp_resource_read(&s[9..], state).await,
+        "resource" => {
+            eprintln!("{}", "  Usage: /mcp resource <server>:<uri>".dim());
+        }
         s if s.starts_with("prompt ") => {
             eprintln!("{}", "  Hint: use /mcp prompt <server>:<name> [arg1 arg2 ...]".dim());
         }
@@ -29,7 +34,7 @@ pub(super) async fn handle_mcp_command(arg: &str, state: &ReplState) -> Result<(
         _ => {
             eprintln!(
                 "{}",
-                format!("  Unknown /mcp subcommand: '{sub}'. Try /mcp, /mcp add, /mcp remove, /mcp servers, /mcp prompts, /mcp prompt")
+                format!("  Unknown /mcp subcommand: '{sub}'. Try /mcp, /mcp add, /mcp remove, /mcp servers, /mcp prompts, /mcp resources, /mcp prompt, /mcp resource")
                     .yellow()
             );
         }
@@ -153,6 +158,107 @@ async fn show_prompts(state: &ReplState) {
             args.dim(),
             desc.dim(),
         );
+    }
+}
+
+async fn show_resources(state: &ReplState) {
+    let manager = state.mcp_manager.read().await;
+
+    if manager.connection_count() == 0 {
+        eprintln!("{}", "  No MCP servers connected.".dim());
+        return;
+    }
+
+    let resources = manager.all_resources().await;
+
+    if resources.is_empty() {
+        eprintln!(
+            "{}",
+            "  No resources available from connected MCP servers.".dim()
+        );
+        return;
+    }
+
+    eprintln!(
+        "{}",
+        format!("  MCP Resources: {} available", resources.len()).bold()
+    );
+    eprintln!();
+
+    for (server, resource) in &resources {
+        let desc = resource
+            .description
+            .as_deref()
+            .unwrap_or("")
+            .chars()
+            .take(60)
+            .collect::<String>();
+        let mime = resource
+            .raw
+            .mime_type
+            .as_deref()
+            .map(|m| format!("[{m}]"))
+            .unwrap_or_default();
+
+        eprintln!(
+            "  {} {} {}",
+            format!("{server}:{}", resource.raw.uri).bold(),
+            mime.dim(),
+            desc.dim(),
+        );
+    }
+}
+
+/// `/mcp resource <server>:<uri>` — read an MCP resource by URI.
+async fn handle_mcp_resource_read(arg: &str, state: &ReplState) {
+    let rest = arg.trim();
+    if rest.is_empty() {
+        eprintln!("{}", "  Usage: /mcp resource <server>:<uri>".dim());
+        eprintln!(
+            "{}",
+            "  Example: /mcp resource github:file:///README.md".dim()
+        );
+        return;
+    }
+
+    // Parse server:uri (split on first colon only)
+    let (server_name, uri) = match rest.split_once(':') {
+        Some((s, u)) if !s.is_empty() && !u.is_empty() => (s, u),
+        _ => {
+            eprintln!(
+                "{}",
+                format!("  ⚠ Invalid format: '{rest}'. Use <server>:<uri>").yellow()
+            );
+            return;
+        }
+    };
+
+    let manager = state.mcp_manager.read().await;
+    let conn = match manager.get(server_name) {
+        Some(c) => c,
+        None => {
+            eprintln!(
+                "{}",
+                format!("  ⚠ Server '{server_name}' not found.").yellow()
+            );
+            return;
+        }
+    };
+
+    match conn.read_resource(uri).await {
+        Ok(content) => {
+            if content.is_empty() {
+                eprintln!("{}", "  (empty resource)".dim());
+            } else {
+                eprintln!("{content}");
+            }
+        }
+        Err(e) => {
+            eprintln!(
+                "{}",
+                format!("  ⚠ Failed to read resource '{uri}' from {server_name}: {e}").yellow()
+            );
+        }
     }
 }
 
