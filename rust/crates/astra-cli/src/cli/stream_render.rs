@@ -507,6 +507,20 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                 } else {
                     "Error: skill resolver not available".to_string()
                 }
+            } else if tool == astra_runtime::turn::skill_tool::DISCOVER_SKILLS_TOOL_NAME {
+                if let Some(resolver) = &self.skill_resolver {
+                    let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
+                    let catalog = resolver.available_skills();
+                    let (text, _) = astra_runtime::turn::skill_tool::execute_discover_skills(
+                        query,
+                        &catalog,
+                        std::collections::HashSet::new(),
+                        None,
+                    );
+                    text
+                } else {
+                    "Error: skill resolver not available".to_string()
+                }
             } else {
                 let result = self.executor.execute(tool, args).await;
                 // If the sandbox denied the operation, prompt the user for
