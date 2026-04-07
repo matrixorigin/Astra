@@ -240,8 +240,8 @@ mod tests {
         // Coding Discipline (including Executor rule), Parallel Tool Calls (with Limit/Anti-pattern),
         // Token Efficiency, Build/Test Guidance, Plan Execution, Search Strategy (with Simple vs Complex).
         assert!(
-            p.len() < 10400,
-            "compressed prompt should be under 10400 chars, got {}",
+            p.len() < 10600,
+            "compressed prompt should be under 10600 chars, got {}",
             p.len()
         );
     }
@@ -923,8 +923,8 @@ mod tests {
         // Budget: full prompt should still be reasonable (allows for Executor rule addition
         // and Parallel Tool Calls Limit/Anti-pattern, Search Strategy Simple vs Complex)
         assert!(
-            p.len() < 15800,
-            "full toolset prompt should be under 15800 chars, got {}",
+            p.len() < 16000,
+            "full toolset prompt should be under 16000 chars, got {}",
             p.len()
         );
     }

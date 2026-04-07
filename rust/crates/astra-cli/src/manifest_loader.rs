@@ -610,7 +610,9 @@ fn load_mcp_json_into(
 
 /// Return the path to the project-level `.astra/mcp.json`.
 pub fn project_mcp_json_path() -> Option<PathBuf> {
-    std::env::current_dir().ok().map(|cwd| cwd.join(".astra").join("mcp.json"))
+    std::env::current_dir()
+        .ok()
+        .map(|cwd| cwd.join(".astra").join("mcp.json"))
 }
 
 /// Return the path to the user-level `~/.astra/mcp.json`.
@@ -1482,7 +1484,9 @@ tools: []
         let entry = &config.mcp_servers["realtime"];
         let converted = json_entry_to_config("realtime", entry).unwrap();
         match &converted.transport {
-            Transport::Ws { url, auth_token, .. } => {
+            Transport::Ws {
+                url, auth_token, ..
+            } => {
                 assert_eq!(url, "ws://localhost:9090/mcp");
                 assert_eq!(auth_token.as_deref(), Some("bearer-xyz"));
             }

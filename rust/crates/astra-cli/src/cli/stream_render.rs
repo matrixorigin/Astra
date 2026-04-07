@@ -2273,7 +2273,10 @@ mod tests {
     fn skill_output_summary_empty() {
         let r = StreamRenderState::new();
         assert!(r.format_output_summary("skill", "", "ok").is_none());
-        assert!(r.format_output_summary("skill", "   \n  \n", "ok").is_none());
+        assert!(
+            r.format_output_summary("skill", "   \n  \n", "ok")
+                .is_none()
+        );
     }
 
     #[test]
@@ -2290,8 +2293,9 @@ mod tests {
     #[test]
     fn mcp_output_summary_empty() {
         let r = StreamRenderState::new();
-        assert!(r
-            .format_output_summary("mcp_github_search", "", "ok")
-            .is_none());
+        assert!(
+            r.format_output_summary("mcp_github_search", "", "ok")
+                .is_none()
+        );
     }
 }

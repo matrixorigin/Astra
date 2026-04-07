@@ -914,11 +914,13 @@ Hooked body."#;
     #[test]
     fn skill_search_paths_includes_claude_dirs() {
         let paths = skill_search_paths();
-        let has_claude = paths.iter().any(|p| {
-            p.components()
-                .any(|c| c.as_os_str() == ".claude")
-        });
-        assert!(has_claude, "should include .claude/skills/ paths, got: {paths:?}");
+        let has_claude = paths
+            .iter()
+            .any(|p| p.components().any(|c| c.as_os_str() == ".claude"));
+        assert!(
+            has_claude,
+            "should include .claude/skills/ paths, got: {paths:?}"
+        );
     }
 
     // ── Path traversal protection ──
@@ -1170,7 +1172,10 @@ Hooked body."#;
 
         let (_astra, claude) = walk_up_skill_paths(&deep);
         assert!(claude.contains(&inside));
-        assert!(!claude.contains(&outside), ".claude outside git root must be excluded");
+        assert!(
+            !claude.contains(&outside),
+            ".claude outside git root must be excluded"
+        );
     }
 
     // ── Skill name validation ──

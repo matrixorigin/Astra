@@ -1,5 +1,5 @@
 use super::*;
-use crate::manifest_loader::{project_mcp_json_path, global_mcp_json_path};
+use crate::manifest_loader::project_mcp_json_path;
 use crate::mcp_client::{ConnectionState, McpClientManager};
 
 pub(super) async fn handle_mcp_command(arg: &str, state: &ReplState) -> Result<(), String> {
@@ -17,10 +17,7 @@ pub(super) async fn handle_mcp_command(arg: &str, state: &ReplState) -> Result<(
         }
         s if s.starts_with("remove ") => handle_mcp_remove(&s[7..]).await,
         "remove" => {
-            eprintln!(
-                "{}",
-                "  Usage: /mcp remove <name>".dim()
-            );
+            eprintln!("{}", "  Usage: /mcp remove <name>".dim());
         }
         _ => {
             eprintln!(
@@ -99,12 +96,9 @@ async fn show_servers(state: &ReplState) {
 
 /// `/mcp add <name> <command> [args...]` — add a stdio MCP server to project config.
 async fn handle_mcp_add(arg: &str) {
-    let parts: Vec<&str> = arg.trim().split_whitespace().collect();
+    let parts: Vec<&str> = arg.split_whitespace().collect();
     if parts.len() < 2 {
-        eprintln!(
-            "{}",
-            "  Usage: /mcp add <name> <command> [args...]".dim()
-        );
+        eprintln!("{}", "  Usage: /mcp add <name> <command> [args...]".dim());
         eprintln!(
             "{}",
             "  Example: /mcp add github npx @modelcontextprotocol/server-github".dim()
@@ -126,9 +120,8 @@ async fn handle_mcp_add(arg: &str) {
     // Load existing or create new config
     let mut config: serde_json::Value = if path.is_file() {
         match std::fs::read_to_string(&path) {
-            Ok(content) => serde_json::from_str(&content).unwrap_or_else(|_| {
-                serde_json::json!({"mcpServers": {}})
-            }),
+            Ok(content) => serde_json::from_str(&content)
+                .unwrap_or_else(|_| serde_json::json!({"mcpServers": {}})),
             Err(_) => serde_json::json!({"mcpServers": {}}),
         }
     } else {
@@ -166,13 +159,19 @@ async fn handle_mcp_add(arg: &str) {
     match std::fs::write(&tmp, &pretty) {
         Ok(()) => {
             if let Err(e) = std::fs::rename(&tmp, &path) {
-                eprintln!("{}", format!("  ⚠ Failed to write {}: {e}", path.display()).yellow());
+                eprintln!(
+                    "{}",
+                    format!("  ⚠ Failed to write {}: {e}", path.display()).yellow()
+                );
                 let _ = std::fs::remove_file(&tmp);
                 return;
             }
         }
         Err(e) => {
-            eprintln!("{}", format!("  ⚠ Failed to write {}: {e}", path.display()).yellow());
+            eprintln!(
+                "{}",
+                format!("  ⚠ Failed to write {}: {e}", path.display()).yellow()
+            );
             return;
         }
     }
@@ -214,14 +213,20 @@ async fn handle_mcp_remove(arg: &str) {
     let content = match std::fs::read_to_string(&path) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("{}", format!("  ⚠ Failed to read {}: {e}", path.display()).yellow());
+            eprintln!(
+                "{}",
+                format!("  ⚠ Failed to read {}: {e}", path.display()).yellow()
+            );
             return;
         }
     };
     let mut config: serde_json::Value = match serde_json::from_str(&content) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("{}", format!("  ⚠ Failed to parse {}: {e}", path.display()).yellow());
+            eprintln!(
+                "{}",
+                format!("  ⚠ Failed to parse {}: {e}", path.display()).yellow()
+            );
             return;
         }
     };
@@ -246,13 +251,19 @@ async fn handle_mcp_remove(arg: &str) {
     match std::fs::write(&tmp, &pretty) {
         Ok(()) => {
             if let Err(e) = std::fs::rename(&tmp, &path) {
-                eprintln!("{}", format!("  ⚠ Failed to write {}: {e}", path.display()).yellow());
+                eprintln!(
+                    "{}",
+                    format!("  ⚠ Failed to write {}: {e}", path.display()).yellow()
+                );
                 let _ = std::fs::remove_file(&tmp);
                 return;
             }
         }
         Err(e) => {
-            eprintln!("{}", format!("  ⚠ Failed to write {}: {e}", path.display()).yellow());
+            eprintln!(
+                "{}",
+                format!("  ⚠ Failed to write {}: {e}", path.display()).yellow()
+            );
             return;
         }
     }

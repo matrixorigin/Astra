@@ -553,7 +553,7 @@ fn size_watchdog(
 /// Default cap on grep result lines when no explicit limit is given.
 /// Prevents unbounded output from broad patterns on large repos.
 /// The LLM can pass `head_limit=0` to override.
-const GREP_DEFAULT_HEAD_LIMIT: usize = 250;
+const GREP_DEFAULT_HEAD_LIMIT: usize = 100;
 
 /// Run a read-only command (grep/glob) with timeout, capturing only stdout.
 /// Unlike `run_command_streaming`, stderr is captured separately and not mixed
@@ -1218,8 +1218,9 @@ impl ToolExecutor {
 
                 let mut result_text = lines.join("\n");
 
-                // Apply byte-level output limit
-                let limit = self.scaled_output_limit().min(20_000);
+                // Apply byte-level output limit (10KB cap for grep to avoid
+                // context bloat when multiple greps fire in parallel)
+                let limit = self.scaled_output_limit().min(10_000);
                 if result_text.len() > limit {
                     result_text = result_text[..result_text.floor_char_boundary(limit)].to_string();
                     result_text.push_str("\n[truncated]");
@@ -1272,7 +1273,7 @@ impl ToolExecutor {
 
         // Use fd if available (faster, respects .gitignore), fall back to find
         let shell_cmd = format!(
-            "cd {} && {{ fd --type f --glob {} 2>/dev/null || find . {} -o -name {} -print | sed 's|^./||'; }} | head -200",
+            "cd {} && {{ fd --type f --glob {} 2>/dev/null || find . {} -o -name {} -print | sed 's|^./||'; }} | head -100",
             shell_escape(base.to_string_lossy().as_ref()),
             shell_escape(pattern),
             default_find_prune_clause(),
@@ -1287,8 +1288,8 @@ impl ToolExecutor {
                 if text.trim().is_empty() {
                     "No files found".to_string()
                 } else {
-                    // Apply budget-pressure-aware truncation
-                    let limit = self.scaled_output_limit();
+                    // Apply budget-pressure-aware truncation (10KB cap like grep)
+                    let limit = self.scaled_output_limit().min(10_000);
                     let line_count = text.lines().count();
                     if text.len() > limit {
                         let end = text.floor_char_boundary(limit);
@@ -2741,7 +2742,7 @@ mod tests {
     fn grep_head_limit_zero_means_unlimited() {
         let dir = tempfile::tempdir().unwrap();
         let executor = super::ToolExecutor::new(dir.path());
-        let content: String = (0..300).map(|i| format!("needle line {i}\n")).collect();
+        let content: String = (0..150).map(|i| format!("needle line {i}\n")).collect();
         std::fs::write(dir.path().join("big.txt"), &content).unwrap();
 
         let result = executor.grep(&serde_json::json!({
@@ -2756,7 +2757,7 @@ mod tests {
         );
         let match_lines: Vec<&str> = result.lines().filter(|l| l.contains("needle")).collect();
         assert!(
-            match_lines.len() > 250,
+            match_lines.len() > 100,
             "should have all lines, got {}",
             match_lines.len()
         );
@@ -2766,8 +2767,8 @@ mod tests {
     fn grep_default_head_limit_applies() {
         let dir = tempfile::tempdir().unwrap();
         let executor = super::ToolExecutor::new(dir.path());
-        // Create more than GREP_DEFAULT_HEAD_LIMIT (250) matching lines
-        let content: String = (0..300).map(|i| format!("needle line {i}\n")).collect();
+        // Create more than GREP_DEFAULT_HEAD_LIMIT (100) matching lines
+        let content: String = (0..150).map(|i| format!("needle line {i}\n")).collect();
         std::fs::write(dir.path().join("big.txt"), &content).unwrap();
 
         let result = executor.grep(&serde_json::json!({
@@ -2777,12 +2778,12 @@ mod tests {
         let match_lines: Vec<&str> = result.lines().filter(|l| l.contains("needle")).collect();
         assert_eq!(
             match_lines.len(),
-            250,
-            "default limit should be 250, got {}",
+            100,
+            "default limit should be 100, got {}",
             match_lines.len()
         );
         assert!(
-            result.contains("Results limited to 250"),
+            result.contains("Results limited to 100"),
             "should note default limit, got: {result}"
         );
     }

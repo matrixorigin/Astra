@@ -422,7 +422,9 @@ mod tests {
     fn mcp_tools_require_approval() {
         assert!(edge_tool_requires_cloud_approval("mcp_filesystem_read"));
         assert!(edge_tool_requires_cloud_approval("mcp_github_search"));
-        assert!(edge_tool_requires_cloud_approval("mcp_custom_server_do_stuff"));
+        assert!(edge_tool_requires_cloud_approval(
+            "mcp_custom_server_do_stuff"
+        ));
     }
 
     #[test]

@@ -219,7 +219,7 @@ pub fn all_tool_schemas() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "grep",
-                "description": "Search for a pattern in files. Returns matching lines with file:line context (output truncated to ~20KB). Use scope_context=true to see which function/class each match is in. For large codebases, narrow path or pattern for complete results.",
+                "description": "Search for a pattern in files. Returns matching lines with file:line context (output truncated to ~10KB, 100 lines max). Use scope_context=true to see which function/class each match is in. For large codebases, narrow path or pattern for complete results.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -2671,7 +2671,7 @@ impl ToolExecutor {
             );
             truncate_output(
                 format!("{}{}", header, body_parts.join("")),
-                tool_output_limit(),
+                tool_output_limit().min(15_000),
             )
         }
     }
@@ -2808,7 +2808,7 @@ impl ToolExecutor {
                     output.push_str(&format!("\n[{} more references not shown]", total - 50));
                 }
 
-                truncate_output(output, tool_output_limit())
+                truncate_output(output, tool_output_limit().min(15_000))
             }
             Err(_) => {
                 // Fallback to grep if rg not available
@@ -2836,7 +2836,7 @@ impl ToolExecutor {
                                 format!("# References to '{}' ({} found)\n\n", symbol, lines.len());
                             truncate_output(
                                 format!("{header}{}", lines.join("\n")),
-                                tool_output_limit(),
+                                tool_output_limit().min(15_000),
                             )
                         }
                     }
