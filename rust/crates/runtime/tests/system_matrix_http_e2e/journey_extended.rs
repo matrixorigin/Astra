@@ -1,12 +1,13 @@
 //! Journeys that do not belong in the monolithic product matrix: session cancel/delete, `/chat/stream`,
-//! auth/session negative paths (replaces stub `auth_contract` / `session_contract` coverage).
+//! auth/session negative paths (replaces stub `auth_contract` / `session_contract` coverage),
+//! models admin CRUD with DB checks (replaces `model_crud_contract`).
 use axum::http::StatusCode;
 use serde_json::json;
 use sqlx::Row;
 
 use super::harness::{
-    E2E_PASSWORD, bootstrap, delete_no_content, get_json, post_empty, post_json,
-    post_json_collect_body_text, sse_first_data_json_with_type,
+    bootstrap, delete_no_content, get_json, grant_astra_admin_role, post_empty, post_json,
+    post_json_collect_body_text, put_json, sse_first_data_json_with_type, E2E_PASSWORD,
 };
 
 pub async fn run_session_cancel_then_delete() {
@@ -212,6 +213,91 @@ pub async fn run_chat_stream_session_info_smoke() {
     assert_eq!(info["session_id"].as_str(), Some(session_id.as_str()));
     let run_id = info["run_id"].as_str().expect("run_id in session_info");
     assert!(!run_id.is_empty(), "non-empty run_id");
+
+    ctx.pool.close().await;
+}
+
+/// Admin model CRUD with `infra_llm_models` assertions. Uses `provider: mock` so connectivity check
+/// skips the network (`validate_connectivity` short-circuit).
+pub async fn run_models_admin_crud_with_db() {
+    let b = bootstrap().await;
+    let ctx = &b.ctx;
+    grant_astra_admin_role(&ctx.pool, &ctx.user_id).await;
+
+    let app = &ctx.app;
+    let auth = b.auth_header.as_str();
+    let pool = &ctx.pool;
+    let model_name = format!("e2e_mtx_mdl_{}", ctx.suffix);
+
+    let (st_c, j_c) = post_json(
+        app,
+        "/models",
+        Some(auth),
+        json!({
+            "name": model_name,
+            "provider": "mock",
+            "api_key": "e2e-key-not-used",
+            "input_modalities": ["text"],
+            "output_modalities": ["text"],
+            "supported_parameters": ["temperature"],
+            "tags": ["e2e_matrix"]
+        }),
+    )
+    .await;
+    assert_eq!(st_c, StatusCode::CREATED, "create model: {j_c}");
+    assert_eq!(j_c["name"].as_str(), Some(model_name.as_str()));
+
+    let row = sqlx::query("SELECT model_name, provider FROM infra_llm_models WHERE model_name = ?")
+        .bind(&model_name)
+        .fetch_optional(pool)
+        .await
+        .expect("select infra_llm_models");
+    let row = row.expect("model row after create");
+    assert_eq!(
+        row.try_get::<String, _>("model_name").ok().as_deref(),
+        Some(model_name.as_str())
+    );
+    assert_eq!(
+        row.try_get::<String, _>("provider").ok().as_deref(),
+        Some("mock")
+    );
+
+    let (st_u, j_u) = put_json(
+        app,
+        &format!("/models/{model_name}"),
+        Some(auth),
+        json!({ "description": "e2e matrix updated", "is_active": true }),
+    )
+    .await;
+    assert_eq!(st_u, StatusCode::OK, "update model: {j_u}");
+    assert_eq!(j_u["description"].as_str(), Some("e2e matrix updated"));
+
+    let desc_row = sqlx::query("SELECT description FROM infra_llm_models WHERE model_name = ?")
+        .bind(&model_name)
+        .fetch_one(pool)
+        .await
+        .expect("description after update");
+    assert_eq!(
+        desc_row
+            .try_get::<Option<String>, _>("description")
+            .ok()
+            .flatten()
+            .as_deref(),
+        Some("e2e matrix updated")
+    );
+
+    let st_d = delete_no_content(app, &format!("/models/{model_name}"), Some(auth)).await;
+    assert_eq!(st_d, StatusCode::NO_CONTENT, "delete model");
+
+    let gone = sqlx::query("SELECT 1 FROM infra_llm_models WHERE model_name = ?")
+        .bind(&model_name)
+        .fetch_optional(pool)
+        .await
+        .expect("select after delete");
+    assert!(gone.is_none(), "model row should be deleted");
+
+    let (st_g, _) = get_json(app, &format!("/models/{model_name}"), Some(auth), &[]).await;
+    assert_eq!(st_g, StatusCode::NOT_FOUND, "get after delete");
 
     ctx.pool.close().await;
 }

@@ -19,6 +19,8 @@
 //! - **`e2e_matrix_memory_proxy_user_isolation`** — unauthenticated memory returns 401; spoofed
 //!   `user_id` / `session_id` in body are overwritten to JWT user on forward (replaces `memory_contract`
 //!   isolation tests).
+//! - **`e2e_matrix_models_admin_crud`** — grant `astra_admin`, `POST/PUT/DELETE /models` with
+//!   `provider: mock` + `infra_llm_models` SQL checks (replaces `model_crud_contract`).
 //!
 //! Session list/get/put, close/resume, activity, and DB checks for close/resume live only in the full
 //! journey (not duplicated in a separate test).
@@ -98,4 +100,11 @@ async fn e2e_matrix_auth_session_negative_paths() {
 async fn e2e_matrix_memory_proxy_user_isolation() {
     require_system_e2e_env();
     journey_extended::run_memory_proxy_user_isolation().await;
+}
+
+#[tokio::test]
+#[ignore = "live MatrixOne + full secrets; ASTRA_SYSTEM_MATRIX_E2E=1 — see module doc"]
+async fn e2e_matrix_models_admin_crud() {
+    require_system_e2e_env();
+    journey_extended::run_models_admin_crud_with_db().await;
 }

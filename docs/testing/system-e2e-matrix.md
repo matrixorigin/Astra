@@ -38,7 +38,7 @@ Evaluation **read** routes in the full journey use `x-user-id` without bearer (s
 
 ## Test binaries (ignored by default)
 
-Seven tests total — overlap with the full journey is avoided (e.g. no separate “basic session” test that repeats the same list/get/close/resume steps).
+Eight tests total — overlap with the full journey is avoided (e.g. no separate “basic session” test that repeats the same list/get/close/resume steps).
 
 | Test name | File / module | Scope |
 |-----------|---------------|-------|
@@ -49,8 +49,9 @@ Seven tests total — overlap with the full journey is avoided (e.g. no separate
 | `e2e_matrix_chat_stream_session_info` | `journey_extended.rs` | `POST /chat/stream` SSE → `session_info` + `run_id` |
 | `e2e_matrix_auth_session_negative_paths` | `journey_extended.rs` | `GET /sessions` without auth (401); duplicate `POST /auth/register`; bad `POST /auth/login`; successful login |
 | `e2e_matrix_memory_proxy_user_isolation` | `journey_extended.rs` | Unauthenticated `POST /memory/store` (401); spoofed `user_id`/`session_id` in body → forwarder receives JWT `user_id` for both fields |
+| `e2e_matrix_models_admin_crud` | `journey_extended.rs` | SQL `astra_admin` role grant; `POST/PUT/DELETE /models` with `provider: mock` + `infra_llm_models` row checks |
 
-Shared helpers: `tests/system_matrix_http_e2e/harness.rs` (`bootstrap`, HTTP helpers, `cleanup_*`, row getters, SSE helpers, `wait_for_agent_event_types` — polls `agent_events` after `chat/turn` instead of a fixed sleep).
+Shared helpers: `tests/system_matrix_http_e2e/harness.rs` (`bootstrap`, `grant_astra_admin_role`, HTTP helpers, `cleanup_*`, row getters, SSE helpers, `wait_for_agent_event_types` — polls `agent_events` after `chat/turn` instead of a fixed sleep).
 
 ## Database isolation
 
@@ -70,6 +71,7 @@ Legend: **DB** = SQL assertion on MatrixOne; **HTTP** = response-only; **—** =
 | Sessions | P0 | `/sessions`, `.../close`, `.../resume`, `.../cancel`, `DELETE ...`, `.../activity` | `agent_sessions` | `product_matrix_*` + `e2e_matrix_session_cancel_delete` |
 | Session audit | P0 | `/sessions/{id}/audit/*`, `/audit/*` | mostly HTTP | `product_matrix_*` |
 | Agents | P0 | `/agents` CRUD | `agent_agents` | `product_matrix_*` |
+| Models | P1 | `GET /models`, admin `POST/PUT/DELETE /models` | `infra_llm_models` | `product_matrix_*` (list); `e2e_matrix_models_admin_crud` (admin CRUD + DB) |
 | Events | P0 | `/events`, causal chain, session events | `agent_events` | `product_matrix_*` |
 | Context | P0 | `/context` | `ctx_snapshots` | `product_matrix_*` |
 | Decisions | P0 | `/decisions`, audit | `ctx_decision_audits` | `product_matrix_*` |

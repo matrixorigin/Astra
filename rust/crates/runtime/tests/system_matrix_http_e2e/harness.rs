@@ -9,17 +9,17 @@ use std::sync::Arc;
 use std::sync::OnceLock;
 
 use astra_core::config::AppSettings;
-use astra_runtime::{MemoriaForwarder, build_app, build_server_state};
+use astra_runtime::{build_app, build_server_state, MemoriaForwarder};
 use async_trait::async_trait;
 use axum::{
-    Router,
     body::{self, Body},
     http::{Request, StatusCode},
+    Router,
 };
 use futures_util::StreamExt;
-use serde_json::{Value, json};
-use sqlx::Row;
+use serde_json::{json, Value};
 use sqlx::mysql::MySqlRow;
+use sqlx::Row;
 use tokio::sync::Mutex;
 use tower::util::ServiceExt;
 use uuid::Uuid;
@@ -346,6 +346,32 @@ pub struct BootstrapResult {
 }
 
 pub const E2E_PASSWORD: &str = "E2e-matrix-pass-9";
+
+/// Ensure `user_id` has the `astra_admin` role (idempotent). Used for admin-only HTTP paths in E2E.
+pub async fn grant_astra_admin_role(pool: &sqlx::MySqlPool, user_id: &str) {
+    sqlx::query(
+        "INSERT IGNORE INTO auth_user_roles (user_id, role_id) \
+         SELECT ?, r.role_id FROM auth_roles r WHERE r.role_name = 'astra_admin' LIMIT 1",
+    )
+    .bind(user_id)
+    .execute(pool)
+    .await
+    .expect("grant_astra_admin_role insert");
+
+    let n: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM auth_user_roles ur \
+         INNER JOIN auth_roles r ON ur.role_id = r.role_id \
+         WHERE ur.user_id = ? AND r.role_name = 'astra_admin'",
+    )
+    .bind(user_id)
+    .fetch_one(pool)
+    .await
+    .expect("grant_astra_admin_role verify");
+    assert!(
+        n >= 1,
+        "user {user_id} should have astra_admin (auth_roles seeded?)"
+    );
+}
 
 /// Build app, connect pool, register user, refresh token, create session (with cleanup of stale rows).
 pub async fn bootstrap() -> BootstrapResult {
