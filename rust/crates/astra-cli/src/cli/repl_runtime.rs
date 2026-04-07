@@ -127,6 +127,20 @@ fn create_tool_selector_with_quality_internal(
         }
     }
 
+    // Set initial roots to the current working directory.
+    {
+        if let Ok(cwd) = std::env::current_dir() {
+            let uri = format!("file://{}", cwd.display());
+            let root = rmcp::model::Root::new(uri).with_name("workspace");
+            let roots = mcp_manager.blocking_read().roots().clone();
+            tokio::task::block_in_place(|| {
+                handle.block_on(async {
+                    roots.write().await.push(root);
+                })
+            });
+        }
+    }
+
     {
         let mcp_configs = manifest_loader::collect_mcp_server_configs();
         if !mcp_configs.is_empty() {
