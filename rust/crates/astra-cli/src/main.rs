@@ -145,7 +145,6 @@ use slash_debug::handle_debug_command;
 use slash_info::handle_info_command;
 use slash_memory::{handle_memory_domain_command, handle_plan_mode_input};
 use slash_session::handle_session_command;
-use slash_session::handle_export_command;
 #[cfg(test)]
 use slash_session::resolve_journal_target_session;
 use slash_skill::handle_skill_command;
@@ -1458,7 +1457,7 @@ async fn handle_resume_command(arg: &str, profile: Option<&str>, state: &mut Rep
             let hint = if e.to_string().contains("not found") {
                 "Use /resume to see available sessions."
             } else {
-                "Check connection with /doctor, or try a different session."
+                "Check connection with /diagnostics, or try a different session."
             };
             eprintln!(
                 "  {} {}",
@@ -4486,8 +4485,6 @@ async fn handle_slash_command(
 
         "/session" => handle_session_command(arg, state),
 
-        "/export" => handle_export_command(state),
-
         "/checkpoint" => match create_manual_repl_checkpoint(state, arg) {
             Ok(msg) => {
                 eprintln!("  {} {}", theme::icon_ok(), msg.green());
@@ -4503,24 +4500,20 @@ async fn handle_slash_command(
             handle_style_command(arg);
         }
 
-        "/history" | "/search" | "/review" | "/copy" | "/doctor" | "/context" | "/version"
+        "/history" | "/grep" | "/review" | "/copy" | "/diagnostics" | "/context" | "/version"
         | "/rewind" | "/turn" | "/report" => {
             handle_info_command(cmd, arg, api, state, token).await?;
         }
 
-        "/skill" | "/skill list" | "/skill info" | "/skill search" | "/skill surfacing"
-        | "/skill new" | "/skill create" | "/skill test" | "/skill dev" | "/skill doctor"
-        | "/skill system" => {
+        "/skill" => {
             handle_skill_command(arg, api, state, token).await?;
         }
 
-        "/mcp" | "/mcp status" | "/mcp servers" | "/mcp prompts" | "/mcp resources"
-        | "/mcp resource" | "/mcp subscribe" | "/mcp unsubscribe" | "/mcp log-level" => {
+        "/mcp" => {
             slash_mcp::handle_mcp_command(arg, state).await?;
         }
 
-        "/team" | "/team list" | "/team create" | "/team info" | "/team delete"
-        | "/team add-member" | "/team context" => {
+        "/team" => {
             slash_team::handle_team_command(arg, state);
         }
 

@@ -1,50 +1,70 @@
 use super::*;
 
 const SLASH_COMMANDS: &[(&str, &str)] = &[
-    // ── Core Commands ─────────────────────────────────────────────────────
+    // ── Core ──────────────────────────────────────────────────────────────
     ("/help", "Show available commands"),
+    ("/keys", "Keyboard shortcuts"),
     ("/model", "List models or set active: /model <name>"),
     ("/clear", "Start a new session"),
-    ("/undo", "Undo last turn(s): /undo [N] — removes last N turns from context"),
+    ("/undo", "Undo last turn(s): /undo [N]"),
     (
         "/checkpoint",
-        "Manual save: /checkpoint [label] — heavy JSON first, then session md + journal",
+        "Manual save: /checkpoint [label] — JSON + session md + journal",
     ),
-    ("/history", "Show conversation turns"),
-    ("/export", "Export session as Markdown (timestamped file in cwd)"),
+    ("/history", "Conversation turns; /history grep <q> filters in-memory"),
     ("/copy", "Copy last response to clipboard"),
     (
-        "/review",
-        "Review local changes or a commit: /review [latest|<rev>|working]",
+        "/grep",
+        "Workspace ripgrep: <pattern> | files <glob> | review <pattern>",
     ),
     (
-        "/diff",
-        "Colored git diff vs HEAD (staged, stat, show <rev>)",
+        "/review",
+        "LLM review of git changes: /review [latest|<rev>|working]",
     ),
-    ("/plan", "Structured plan editor: enter/exit (no args)"),
-    ("/plan on", "Plan-only chat: no tools until /plan off"),
-    ("/plan off", "Exit plan-only chat (restore tools)"),
-    ("/plan list", "List plan history"),
-    ("/plan history", "Show plan version history"),
-    ("/plan status", "Show running/paused plan progress"),
-    ("/plan pause", "Pause the current plan execution"),
-    ("/plan resume", "Resume paused plan execution"),
-    ("/resume", "Resume a previous session: /resume [session_id]"),
+    ("/diff", "Colored git diff (staged, stat, show <rev>, …)"),
+    ("/resume", "Resume a session: /resume [session_id]"),
     ("/exit", "Exit the REPL"),
     ("/quit", "Exit the REPL (alias for /exit)"),
-    // ── Account ───────────────────────────────────────────────────────────
-    ("/login", "Authenticate with the API"),
-    ("/register", "Register a new account"),
-    ("/logout", "Logout from the API"),
-    // ── Observability ─────────────────────────────────────────────────────
+    // ── Session & plan ───────────────────────────────────────────────────
+    (
+        "/session",
+        "Session: cwd, git, workspace — sub: history|errors|export|fork|list",
+    ),
+    ("/session history", "Session journal-style history"),
+    ("/session errors", "Session errors from journal"),
+    (
+        "/session export",
+        "Export session to timestamped Markdown in cwd",
+    ),
+    (
+        "/session fork",
+        "Fork session — new id, copy journal (multi-agent / experiments)",
+    ),
+    (
+        "/session list",
+        "All journals + cwd / git / age from workspace",
+    ),
+    ("/plan", "Structured plan: on|off|list|status|pause|resume|…"),
+    ("/plan on", "Plan-only chat until /plan off"),
+    ("/plan off", "Exit plan-only chat"),
+    ("/plan list", "List plan history"),
+    ("/plan history", "Plan version history"),
+    ("/plan status", "Running/paused plan progress"),
+    ("/plan pause", "Pause plan execution"),
+    ("/plan resume", "Resume plan execution"),
+    ("/report", "Last delivery report (/report save = JSON)"),
+    // ── Memory & tasks ────────────────────────────────────────────────────
+    ("/memory", "Memoria: list, search <q>, inspect <id>, …"),
+    ("/task", "Local tasks: list, add, done, status"),
+    // ── State & reflection ───────────────────────────────────────────────
     (
         "/explain",
         "Cycle explain: off → on (API) → verbose (+stderr)",
     ),
-    (
-        "/compact",
-        "Summarize & trim history — optional: quick | summary-only | no-memoria",
-    ),
+    ("/verbose", "Verbose streaming on"),
+    ("/compact", "Summarize & trim history (quick | no-memoria, …)"),
+    ("/reflect", "Reflect on session (modes: skill_failure, performance, …)"),
+    // ── Observability ─────────────────────────────────────────────────────
     (
         "/turn",
         "Turn trace: /turn | list | N | seq:N | #N | id:N | @N | -1",
@@ -59,44 +79,36 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/health", "Tool health dashboard"),
     ("/learn", "Learning insights: patterns, drift, exploration"),
     ("/sync", "Cloud sync status and push"),
-    (
-        "/team",
-        "Team coordination: create, list, add-member, context",
-    ),
-    // ── Advanced ──────────────────────────────────────────────────────────
-    ("/allow", "Toggle permission mode: /allow [auto|prompt|deny]"),
-    ("/doctor", "Run diagnostics"),
-    ("/version", "Show version info"),
-    (
-        "/style",
-        "Switch output theme (default, minimal, colorful, high-contrast)",
-    ),
-    (
-        "/session",
-        "Session info: cwd, git, workspace.yaml, REPL state",
-    ),
-    ("/session history", "View session conversation history"),
-    ("/session errors", "View session errors"),
-    ("/session export", "Export session data"),
-    (
-        "/session fork",
-        "Fork session — copy journal + new id (multi-agent / experiments)",
-    ),
-    (
-        "/session list",
-        "All journals + cwd / git / age from workspace",
-    ),
+    ("/context", "Context window / budget summary"),
+    ("/rewind", "Rewind conversation to an earlier turn"),
+    ("/version", "Version info"),
+    // ── Skills & MCP ─────────────────────────────────────────────────────
     (
         "/skill",
-        "Skill management: /skill [list|info|search|surfacing|new|dev|test|doctor|system|…]",
+        "Skills: list|info|search|surfacing|health|new|test|dev|system|…",
     ),
     (
         "/mcp",
-        "MCP servers: /mcp [status|servers|prompts|resources|prompt|add|remove|ping|...]",
+        "MCP: status|servers|prompts|resources|add|remove|ping|complete|…",
+    ),
+    // ── Team & account ───────────────────────────────────────────────────
+    (
+        "/team",
+        "Teams: create, list, info, add-member, context, delete",
+    ),
+    ("/login", "Authenticate with the API"),
+    ("/register", "Register a new account"),
+    ("/logout", "Logout from the API"),
+    ("/memory-setup", "Guided Memoria configuration"),
+    // ── Toggles & style ───────────────────────────────────────────────────
+    ("/allow", "Permission mode: /allow [auto|prompt|deny]"),
+    (
+        "/style",
+        "Output theme: default | minimal | colorful | high-contrast",
     ),
     (
-        "/report",
-        "Show last delivery report (/report save = re-export JSON)",
+        "/diagnostics",
+        "Binary, API, auth, environment checks",
     ),
 ];
 
@@ -168,7 +180,7 @@ fn is_command_alias(command: &str) -> bool {
     matches!(command, "/?" | "/commands" | "/quit")
 }
 
-/// A sub-command contains a space (e.g. "/skill list", "/search files").
+/// A sub-command contains a space (e.g. "/skill list", "/grep files …").
 fn is_subcommand(command: &str) -> bool {
     command.trim_start_matches('/').contains(' ')
 }
@@ -246,7 +258,7 @@ const SLASH_FIRST_TOKEN_COMPLETIONS: &[(&str, &[(&str, &str)])] = &[
             ("browse", "Browse marketplace"),
             ("create", "Generate skill from session"),
             ("dev", "Skill dev mode"),
-            ("doctor", "Skill diagnostics"),
+            ("health", "Skill catalog health"),
             ("info", "Skill details"),
             ("list", "List skills"),
             ("new", "Create skill"),
@@ -717,11 +729,11 @@ fn slash_argument_hint(command: &str) -> Option<&'static str> {
         "/session history" | "/session errors" | "/session export" => Some("<session_id|prefix>"),
         "/session fork" => Some("[parent_id] [label]"),
         "/rewind" => Some("<turn>"),
-        "/search" => Some("<pattern|files <glob>|review <pattern>>"),
-        "/search files" => Some("<glob>"),
-        "/search review" => Some("<pattern>"),
+        "/grep" => Some("<pattern|files <glob>|review <pattern>>"),
+        "/grep files" => Some("<glob>"),
+        "/grep review" => Some("<pattern>"),
         "/review" => Some("[latest|<rev>|working]"),
-        "/skill" => Some("[list|info|search|surfacing|new|test|dev|doctor|system|…]"),
+        "/skill" => Some("[list|info|search|surfacing|health|new|test|dev|system|…]"),
         "/skill list" => Some("[query] [--source=local|bundled|mcp] [--category=X]"),
         "/skill info" => Some("<name> [--raw]"),
         "/skill search" => Some("<query> — keyword match on catalog"),
@@ -732,7 +744,9 @@ fn slash_argument_hint(command: &str) -> Option<&'static str> {
         "/skill create" => Some("<name> — auto-generate from current session"),
         "/skill test" => Some("<name> [json_args]"),
         "/skill dev" => Some("<name|off>"),
+        "/skill health" => Some("— registry + on-disk SKILL.md checks"),
         "/skill system" => Some("<name|list>"),
+        "/diagnostics" => Some("— API, auth, binary, environment"),
         "/mcp" => Some("[status|servers|prompts|resources|prompt|add|remove|ping|complete]"),
         "/memory" => Some("[list|search <q>|inspect <id>]"),
         "/diff" => Some("[staged|unstaged|stat|show <rev>|help|<paths…>]"),
@@ -1249,19 +1263,23 @@ pub(super) fn print_slash_commands(query: Option<&str>) {
         (
             "⚡",
             "Core",
-            &["/help", "/model", "/clear", "/history", "/copy", "/exit"],
+            &[
+                "/help", "/keys", "/model", "/clear", "/undo", "/history", "/copy", "/resume",
+                "/exit",
+            ],
         ),
+        ("📂", "Workspace", &["/grep", "/diff", "/review"]),
         (
             "🔭",
             "Observability",
             &[
-                "/explain", "/compact", "/turn", "/debug", "/stats", "/cost", "/tools", "/health",
-                "/sync",
+                "/explain", "/verbose", "/compact", "/reflect", "/turn", "/debug", "/stats",
+                "/cost", "/tools", "/health", "/sync", "/learn", "/context", "/rewind", "/version",
             ],
         ),
         (
             "📋",
-            "Session",
+            "Session & plan",
             &[
                 "/session",
                 "/session history",
@@ -1270,15 +1288,19 @@ pub(super) fn print_slash_commands(query: Option<&str>) {
                 "/session fork",
                 "/session list",
                 "/checkpoint",
-                "/resume",
                 "/plan",
                 "/report",
             ],
         ),
-        ("🧠", "Skills", &["/skill"]),
+        ("🧠", "Memory & tasks", &["/memory", "/task"]),
+        ("📦", "Skills", &["/skill"]),
         ("🔌", "MCP", &["/mcp"]),
-        ("🔧", "Diagnostics", &["/doctor", "/version"]),
-        ("🔑", "Account", &["/login", "/register", "/logout"]),
+        (
+            "👥",
+            "Team & account",
+            &["/team", "/login", "/register", "/logout", "/memory-setup"],
+        ),
+        ("🔧", "System", &["/diagnostics", "/allow", "/style"]),
     ];
 
     for (icon, title, commands) in groups {
@@ -2367,10 +2389,14 @@ mod tests {
         // group structure indirectly by checking all listed commands exist
         // in SLASH_COMMANDS.
         let groups: &[&[&str]] = &[
-            &["/help", "/model", "/clear", "/history", "/copy", "/exit"],
             &[
-                "/explain", "/compact", "/turn", "/debug", "/stats", "/cost", "/tools", "/health",
-                "/sync",
+                "/help", "/keys", "/model", "/clear", "/undo", "/history", "/copy", "/resume",
+                "/exit",
+            ],
+            &["/grep", "/diff", "/review"],
+            &[
+                "/explain", "/verbose", "/compact", "/reflect", "/turn", "/debug", "/stats",
+                "/cost", "/tools", "/health", "/sync", "/learn", "/context", "/rewind", "/version",
             ],
             &[
                 "/session",
@@ -2379,12 +2405,15 @@ mod tests {
                 "/session export",
                 "/session fork",
                 "/session list",
-                "/resume",
+                "/checkpoint",
                 "/plan",
+                "/report",
             ],
+            &["/memory", "/task"],
             &["/skill"],
-            &["/doctor", "/version"],
-            &["/login", "/register", "/logout"],
+            &["/mcp"],
+            &["/team", "/login", "/register", "/logout", "/memory-setup"],
+            &["/diagnostics", "/allow", "/style"],
         ];
         let known: std::collections::HashSet<&str> =
             SLASH_COMMANDS.iter().map(|(cmd, _)| *cmd).collect();
