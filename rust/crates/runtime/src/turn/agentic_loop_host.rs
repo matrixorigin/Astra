@@ -326,10 +326,20 @@ pub struct AgenticLoopState {
     /// Skills invoked during this session, keyed by canonical name.
     /// Used for same-session dedup and post-compaction re-injection.
     pub invoked_skills: std::collections::HashMap<String, crate::turn::skill_tool::InvokedSkill>,
+
+    /// Recently accessed file paths tracked for post-compaction restoration.
+    /// Each entry is `(absolute_path, turn_number)`. The list is bounded to
+    /// the most recent [`MAX_TRACKED_FILE_READS`] entries. After compaction,
+    /// hosts use this to re-inject recent file contents so the LLM retains
+    /// awareness of recently-read code.
+    pub recent_file_reads: Vec<(String, u32)>,
 }
 
 /// Consecutive same-category error turns before forcing a strategy change.
 const CONSECUTIVE_ERROR_BUDGET: u32 = 3;
+
+/// Maximum number of recent file reads to track for post-compact restoration.
+const MAX_TRACKED_FILE_READS: usize = 20;
 
 // ─── Loop exit ───────────────────────────────────────────────────────────────
 
@@ -1412,7 +1422,30 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
             turn_result.accum.explain_turns.as_slice(),
         );
 
-        // ─── Step 4a: Conditional skill activation ──────────────────────
+        // ─── Step 4a: Track recent file reads for post-compact restoration ──
+        {
+            let turn_num = (state.max_turns - state.remaining_turns) as u32;
+            for edge_result in &turn_result.edge_tool_round {
+                if let Some(path) =
+                    extract_file_path_from_tool(&edge_result.tool, &edge_result.args)
+                {
+                    // Deduplicate: if same path already tracked, update its turn number
+                    if let Some(existing) = state.recent_file_reads.iter_mut().find(|(p, _)| p == &path) {
+                        existing.1 = turn_num;
+                    } else {
+                        state.recent_file_reads.push((path, turn_num));
+                    }
+                    // Bound the list to prevent unbounded growth
+                    if state.recent_file_reads.len() > MAX_TRACKED_FILE_READS {
+                        // Remove oldest (lowest turn number)
+                        state.recent_file_reads.sort_by_key(|(_, t)| *t);
+                        state.recent_file_reads.remove(0);
+                    }
+                }
+            }
+        }
+
+        // ─── Step 4b: Conditional skill activation ──────────────────────
         // Record file paths from edge tool executions so path-conditional
         // skills can activate dynamically. When new skills activate, refresh
         // the `skill` tool schema with the expanded skill list.
@@ -1865,6 +1898,7 @@ mod tests {
             budget_wrapup_injected: false,
             skill_listing_message: None,
             invoked_skills: std::collections::HashMap::new(),
+            recent_file_reads: Vec::new(),
         }
     }
 

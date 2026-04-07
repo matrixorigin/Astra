@@ -427,6 +427,7 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
             budget_wrapup_injected: false,
             skill_listing_message: None,
             invoked_skills: std::collections::HashMap::new(),
+            recent_file_reads: Vec::new(),
         };
 
         run_agentic_loop_with_host(&mut host, &mut state).await?;

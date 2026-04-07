@@ -294,6 +294,66 @@ impl AttachmentBuilder {
 }
 
 // ---------------------------------------------------------------------------
+// Standalone file restoration helper
+// ---------------------------------------------------------------------------
+
+/// Read recently-accessed files from disk and produce user messages for
+/// post-compaction injection.
+///
+/// `recent_reads` is `(path, turn_number)` — sorted by turn number ascending
+/// (oldest first). We take the most recent [`MAX_FILES_TO_RESTORE`] entries,
+/// read each from disk, and use [`AttachmentBuilder`] to enforce per-file
+/// and total char budgets.
+///
+/// If `cwd` is provided, relative paths are resolved against it.
+pub fn restore_recent_files(
+    recent_reads: &[(String, u32)],
+    cwd: Option<&str>,
+) -> Vec<Value> {
+    if recent_reads.is_empty() {
+        return Vec::new();
+    }
+
+    // Deduplicate by path, keeping the highest turn number (most recent access).
+    let mut by_path: std::collections::HashMap<&str, u32> = std::collections::HashMap::new();
+    for (path, turn) in recent_reads {
+        let entry = by_path.entry(path.as_str()).or_insert(0);
+        if *turn > *entry {
+            *entry = *turn;
+        }
+    }
+
+    // Sort by turn number descending (most recent first), take top N.
+    let mut candidates: Vec<(&str, u32)> = by_path.into_iter().collect();
+    candidates.sort_by(|a, b| b.1.cmp(&a.1));
+    candidates.truncate(MAX_FILES_TO_RESTORE);
+
+    let mut builder = AttachmentBuilder::new();
+    for (path, turn) in &candidates {
+        let abs_path = if std::path::Path::new(path).is_absolute() {
+            std::path::PathBuf::from(path)
+        } else if let Some(base) = cwd {
+            std::path::PathBuf::from(base).join(path)
+        } else {
+            std::path::PathBuf::from(path)
+        };
+
+        match std::fs::read_to_string(&abs_path) {
+            Ok(content) => {
+                // Use turn number as recency score (higher = more recent).
+                builder.add_file(path.to_string(), content, *turn as f64);
+            }
+            Err(_) => {
+                // File deleted or inaccessible — skip silently.
+            }
+        }
+    }
+
+    let attachments = builder.build();
+    attachments.to_messages()
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -394,5 +454,96 @@ mod tests {
             msg["attachment_metadata"]["path"].as_str().unwrap(),
             "foo.rs"
         );
+    }
+
+    #[test]
+    fn restore_recent_files_empty_input() {
+        let msgs = restore_recent_files(&[], None);
+        assert!(msgs.is_empty());
+    }
+
+    #[test]
+    fn restore_recent_files_reads_real_files() {
+        let dir = std::env::temp_dir().join("restore_test_reads");
+        let _ = std::fs::create_dir_all(&dir);
+        let f1 = dir.join("hello.txt");
+        std::fs::write(&f1, "hello world").unwrap();
+        let f2 = dir.join("goodbye.txt");
+        std::fs::write(&f2, "goodbye world").unwrap();
+
+        let reads = vec![
+            (f1.to_string_lossy().to_string(), 1),
+            (f2.to_string_lossy().to_string(), 5),
+        ];
+        let msgs = restore_recent_files(&reads, None);
+        assert_eq!(msgs.len(), 2);
+        // Most recent (turn 5 = goodbye) should appear last in messages
+        // (AttachmentBuilder sorts most-recent first, to_messages reverses)
+        let last_content = msgs.last().unwrap()["content"].as_str().unwrap();
+        assert!(last_content.contains("goodbye"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn restore_recent_files_skips_missing() {
+        let reads = vec![
+            ("/nonexistent/path/xyz.rs".to_string(), 1),
+        ];
+        let msgs = restore_recent_files(&reads, None);
+        assert!(msgs.is_empty());
+    }
+
+    #[test]
+    fn restore_recent_files_deduplicates_by_path() {
+        let dir = std::env::temp_dir().join("restore_test_dedup");
+        let _ = std::fs::create_dir_all(&dir);
+        let f = dir.join("dup.txt");
+        std::fs::write(&f, "content").unwrap();
+
+        let path = f.to_string_lossy().to_string();
+        let reads = vec![
+            (path.clone(), 1),
+            (path.clone(), 5),
+            (path.clone(), 3),
+        ];
+        let msgs = restore_recent_files(&reads, None);
+        // Should only produce one message despite 3 entries for same path
+        assert_eq!(msgs.len(), 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn restore_recent_files_respects_max_limit() {
+        let dir = std::env::temp_dir().join("restore_test_limit");
+        let _ = std::fs::create_dir_all(&dir);
+
+        let mut reads = Vec::new();
+        for i in 0..MAX_FILES_TO_RESTORE + 5 {
+            let f = dir.join(format!("file_{i}.txt"));
+            std::fs::write(&f, format!("content {i}")).unwrap();
+            reads.push((f.to_string_lossy().to_string(), i as u32));
+        }
+
+        let msgs = restore_recent_files(&reads, None);
+        assert!(msgs.len() <= MAX_FILES_TO_RESTORE);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn restore_recent_files_resolves_relative_with_cwd() {
+        let dir = std::env::temp_dir().join("restore_test_cwd");
+        let _ = std::fs::create_dir_all(&dir);
+        let f = dir.join("relative.txt");
+        std::fs::write(&f, "relative content").unwrap();
+
+        let reads = vec![("relative.txt".to_string(), 1)];
+        let msgs = restore_recent_files(&reads, Some(dir.to_str().unwrap()));
+        assert_eq!(msgs.len(), 1);
+        assert!(msgs[0]["content"].as_str().unwrap().contains("relative content"));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -378,6 +378,17 @@ impl ServerAgenticLoopHost {
             llm_messages.extend(attachments.to_messages());
         }
 
+        // Post-compaction: re-inject recently-read file contents so the LLM
+        // retains awareness of code it was working with before compaction.
+        if !state.recent_file_reads.is_empty() {
+            let cwd = self.edge_profile.get("cwd").and_then(|v| v.as_str());
+            let file_messages = crate::turn::cloud::attachments::restore_recent_files(
+                &state.recent_file_reads,
+                cwd,
+            );
+            llm_messages.extend(file_messages);
+        }
+
         // Ephemeral skill listing: injected per-turn, not stored in state.messages.
         if let Some(ref listing) = state.skill_listing_message {
             llm_messages.push(listing.clone());
@@ -1128,6 +1139,7 @@ mod tests {
             budget_wrapup_injected: false,
             skill_listing_message: None,
             invoked_skills: std::collections::HashMap::new(),
+            recent_file_reads: Vec::new(),
         }
     }
     #[tokio::test]

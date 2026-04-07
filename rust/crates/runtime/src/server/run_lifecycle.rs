@@ -325,6 +325,7 @@ impl AgenticRunLifecycleService {
             budget_wrapup_injected: false,
             skill_listing_message: None,
             invoked_skills: std::collections::HashMap::new(),
+            recent_file_reads: Vec::new(),
         }
     }
 
@@ -993,6 +994,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
             budget_wrapup_injected: false,
             skill_listing_message: None,
             invoked_skills: std::collections::HashMap::new(),
+            recent_file_reads: Vec::new(),
         };
 
         let outcome = run_agentic_loop_with_host(&mut host, &mut loop_state).await;
