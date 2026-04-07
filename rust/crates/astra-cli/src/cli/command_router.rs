@@ -26,12 +26,13 @@ impl From<ExitCode> for i32 {
 pub(super) async fn execute_cli_command(
     command: Option<Command>,
     profile: Option<String>,
+    global_model: Option<String>,
     api: &astra_thin_client::ThinClient,
 ) -> Result<ExitCode, String> {
     match command {
         // No subcommand → interactive REPL (Codex-style default)
         None | Some(Command::Interactive) => {
-            run_chat_repl(api, profile.as_deref(), None, None).await?;
+            run_chat_repl(api, profile.as_deref(), global_model.as_deref(), None).await?;
             Ok(ExitCode::Success)
         }
 
@@ -64,7 +65,7 @@ pub(super) async fn execute_cli_command(
                 token: &token,
                 message: &message,
                 session_id: session_id.as_deref(),
-                model: None,
+                model: global_model.as_deref(),
                 explain: ExplainMode::Off,
                 render_md: terminal::size().is_ok(),
                 history: &[],
@@ -100,7 +101,7 @@ pub(super) async fn execute_cli_command(
                         token: &token,
                         message: &message,
                         session_id: None,
-                        model: None,
+                        model: global_model.as_deref(),
                         explain: ExplainMode::Off,
                         render_md: terminal::size().is_ok(),
                         history: &[],
@@ -286,7 +287,8 @@ pub(super) async fn execute_cli_command(
                 m
             } else {
                 // No message → start REPL with optional pre-set session/model
-                run_chat_repl(api, profile.as_deref(), args.model.as_deref(), None).await?;
+                let model = args.model.as_deref().or(global_model.as_deref());
+                run_chat_repl(api, profile.as_deref(), model, None).await?;
                 return Ok(ExitCode::Success);
             };
 
@@ -326,7 +328,7 @@ pub(super) async fn execute_cli_command(
                 token: &token,
                 message: &message,
                 session_id: session_id.as_deref(),
-                model: args.model.as_deref(),
+                model: args.model.as_deref().or(global_model.as_deref()),
                 explain: explain_mode,
                 render_md,
                 history: &[],
@@ -362,7 +364,7 @@ pub(super) async fn execute_cli_command(
                         token: &token,
                         message: &message,
                         session_id: None,
-                        model: args.model.as_deref(),
+                        model: args.model.as_deref().or(global_model.as_deref()),
                         explain: explain_mode,
                         render_md,
                         history: &[],
@@ -769,6 +771,7 @@ pub(super) async fn run_print_mode(
     api: &astra_thin_client::ThinClient,
     profile: Option<&str>,
     output_format: &str,
+    model: Option<&str>,
     command: Option<Command>,
 ) -> Result<ExitCode, String> {
     // Extract message from command or stdin
@@ -806,7 +809,7 @@ pub(super) async fn run_print_mode(
         token: &token,
         message: &message,
         session_id: session_id.as_deref(),
-        model: None,
+        model: model,
         explain: ExplainMode::Off,
         render_md: false,
         history: &[],
@@ -842,7 +845,7 @@ pub(super) async fn run_print_mode(
                 token: &token,
                 message: &message,
                 session_id: None,
-                model: None,
+                model: model,
                 explain: ExplainMode::Off,
                 render_md: false,
                 history: &[],
@@ -1310,6 +1313,15 @@ fn read_settings() -> Result<serde_json::Map<String, serde_json::Value>, String>
     val.as_object()
         .cloned()
         .ok_or_else(|| format!("{} is not a JSON object", path.display()))
+}
+
+/// Read `default_model` from settings.json, if set.
+pub fn read_config_default_model() -> Result<Option<String>, String> {
+    let settings = read_settings()?;
+    Ok(settings
+        .get("default_model")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string()))
 }
 
 fn write_settings(settings: &serde_json::Map<String, serde_json::Value>) -> Result<(), String> {
