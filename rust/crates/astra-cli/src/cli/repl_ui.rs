@@ -66,6 +66,7 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
         "Team coordination: create, list, add-member, context",
     ),
     // ── Advanced ──────────────────────────────────────────────────────────
+    ("/allow", "Toggle permission mode: /allow [auto|prompt|deny]"),
     ("/doctor", "Run diagnostics"),
     ("/version", "Show version info"),
     (

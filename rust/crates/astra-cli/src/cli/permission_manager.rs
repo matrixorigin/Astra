@@ -173,6 +173,11 @@ impl PermissionManager {
         self.mode
     }
 
+    /// Switch the permission mode at runtime (e.g., via `/allow` command).
+    pub(super) fn set_mode(&mut self, mode: PermissionMode) {
+        self.mode = mode;
+    }
+
     /// Label + stable fingerprint of loaded rules (for `edge_profile` / cloud audit).
     #[allow(dead_code)]
     pub(super) fn edge_audit_summary(&self) -> (String, String) {

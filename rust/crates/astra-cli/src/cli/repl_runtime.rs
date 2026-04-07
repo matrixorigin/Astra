@@ -603,6 +603,30 @@ pub(super) fn print_repl_banner(profile: Option<&str>, state: &ReplState) {
     eprintln!("{}", row(&lines_colored[2], display_width(&lines_plain[2])));
     eprintln!("{}", row(&lines_colored[3], display_width(&lines_plain[3])));
     eprintln!("{}", format!("╰{hr}╯").cyan());
+
+    // Show active limits (system prompt, max-budget, permission mode)
+    let mut limits = Vec::new();
+    if std::env::var("MO_MAX_TURNS").is_ok() {
+        limits.push(format!(
+            "max-turns: {}",
+            std::env::var("MO_MAX_TURNS").unwrap()
+        ));
+    }
+    if state.max_budget_limit > 0.0 {
+        limits.push(format!("max-budget: ${:.2}", state.max_budget_limit));
+    }
+    if state.perm_manager.mode() == crate::permission_manager::PermissionMode::Auto {
+        limits.push("permission: auto".to_string());
+    }
+    if !limits.is_empty() {
+        eprintln!(
+            "{}",
+            format!("  ⚙ Active limits: {}", limits.join(" │ "))
+                .yellow()
+                .dim()
+        );
+    }
+
     eprintln!(
         "{}",
         "  Ctrl-C to cancel │ /help for commands │ /quit to exit".dim()
