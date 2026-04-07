@@ -335,3 +335,52 @@ pub struct WebhookFireRequest {
     pub secret: String,
     pub payload: Option<serde_json::Value>,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn create_trigger_request_default_agent_id() {
+        let json = r#"{"trigger_type":"webhook","name":"t1","user_input":"hello"}"#;
+        let req: CreateTriggerRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.agent_id, "dev-agent");
+        assert_eq!(req.trigger_type, "webhook");
+    }
+
+    #[test]
+    fn create_trigger_request_explicit_agent_id() {
+        let json = r#"{"trigger_type":"schedule","name":"t2","user_input":"go","agent_id":"custom"}"#;
+        let req: CreateTriggerRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.agent_id, "custom");
+    }
+
+    #[test]
+    fn create_trigger_request_optional_fields_none() {
+        let json = r#"{"trigger_type":"webhook","name":"t","user_input":"x"}"#;
+        let req: CreateTriggerRequest = serde_json::from_str(json).unwrap();
+        assert!(req.context.is_none());
+        assert!(req.cron_expr.is_none());
+        assert!(req.session_id.is_none());
+    }
+
+    #[test]
+    fn trigger_record_skip_serializing_none_secret() {
+        let rec = TriggerRecord {
+            trigger_id: "t1".into(),
+            user_id: "u1".into(),
+            agent_id: "a1".into(),
+            trigger_type: "webhook".into(),
+            name: "test".into(),
+            user_input: "hi".into(),
+            context: None,
+            cron_expr: None,
+            secret: None,
+            session_id: None,
+            is_active: true,
+            created_at: "now".into(),
+        };
+        let json = serde_json::to_string(&rec).unwrap();
+        assert!(!json.contains("secret"));
+    }
+}

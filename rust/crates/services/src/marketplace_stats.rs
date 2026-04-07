@@ -415,3 +415,47 @@ impl MarketplaceStatsService for NoopMarketplaceStatsService {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn skill_search_query_default_all_none() {
+        let q = SkillSearchQuery::default();
+        assert!(q.query.is_none());
+        assert!(q.category.is_none());
+        assert!(q.trust_tier.is_none());
+        assert!(q.limit.is_none());
+        assert!(q.offset.is_none());
+    }
+
+    #[test]
+    fn skill_search_query_from_json_partial() {
+        let q: SkillSearchQuery = serde_json::from_str(r#"{"query":"test","limit":10}"#).unwrap();
+        assert_eq!(q.query.as_deref(), Some("test"));
+        assert_eq!(q.limit, Some(10));
+        assert!(q.category.is_none());
+    }
+
+    #[test]
+    fn skill_search_result_round_trip() {
+        let r = SkillSearchResult {
+            skill_name: "s1".into(),
+            version: "1.0".into(),
+            description: Some("desc".into()),
+            publisher_id: None,
+            trust_tier: Some("verified".into()),
+            category: None,
+            ranking_score: 0.95,
+            avg_quality: 0.8,
+            total_installs: 100,
+            active_users_7d: 42,
+        };
+        let json = serde_json::to_string(&r).unwrap();
+        let back: SkillSearchResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(r.skill_name, back.skill_name);
+        assert_eq!(r.ranking_score, back.ranking_score);
+        assert_eq!(r.active_users_7d, back.active_users_7d);
+    }
+}

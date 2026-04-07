@@ -884,3 +884,128 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
         schema_tokens: 80,
     },
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    // --- IntentType ---
+
+    #[test]
+    fn intent_type_as_str_all_variants() {
+        assert_eq!(IntentType::CodeEdit.as_str(), "code_edit");
+        assert_eq!(IntentType::CodeRead.as_str(), "code_read");
+        assert_eq!(IntentType::Git.as_str(), "git");
+        assert_eq!(IntentType::GitHub.as_str(), "github");
+        assert_eq!(IntentType::Memory.as_str(), "memory");
+        assert_eq!(IntentType::Introspect.as_str(), "introspect");
+        assert_eq!(IntentType::Database.as_str(), "database");
+    }
+
+    #[test]
+    fn intent_type_serde_round_trip() {
+        let variants = [
+            IntentType::CodeEdit,
+            IntentType::CodeRead,
+            IntentType::Git,
+            IntentType::GitHub,
+            IntentType::Memory,
+            IntentType::Introspect,
+            IntentType::Database,
+        ];
+        for v in &variants {
+            let json = serde_json::to_string(v).unwrap();
+            let back: IntentType = serde_json::from_str(&json).unwrap();
+            assert_eq!(*v, back);
+        }
+    }
+
+    #[test]
+    fn intent_type_serde_uses_snake_case() {
+        let json = serde_json::to_string(&IntentType::CodeEdit).unwrap();
+        assert_eq!(json, r#""code_edit""#);
+        let json = serde_json::to_string(&IntentType::CodeRead).unwrap();
+        assert_eq!(json, r#""code_read""#);
+    }
+
+    #[test]
+    fn intent_type_deserialize_rejects_wrong_case() {
+        let result = serde_json::from_str::<IntentType>(r#""CodeEdit""#);
+        assert!(result.is_err());
+    }
+
+    // --- Scope ---
+
+    #[test]
+    fn scope_serde_round_trip() {
+        let variants = [Scope::Local, Scope::LocalGit, Scope::External, Scope::CrossSession];
+        for v in &variants {
+            let json = serde_json::to_string(v).unwrap();
+            let back: Scope = serde_json::from_str(&json).unwrap();
+            assert_eq!(*v, back);
+        }
+    }
+
+    #[test]
+    fn scope_serde_uses_snake_case() {
+        assert_eq!(serde_json::to_string(&Scope::LocalGit).unwrap(), r#""local_git""#);
+        assert_eq!(serde_json::to_string(&Scope::CrossSession).unwrap(), r#""cross_session""#);
+    }
+
+    // --- TOOL_CATALOG validation ---
+
+    #[test]
+    fn catalog_no_duplicate_names() {
+        let mut seen = HashSet::new();
+        for tool in TOOL_CATALOG {
+            assert!(seen.insert(tool.name), "duplicate tool name: {}", tool.name);
+        }
+    }
+
+    #[test]
+    fn catalog_all_tools_have_nonempty_fields() {
+        for tool in TOOL_CATALOG {
+            assert!(!tool.name.is_empty(), "tool has empty name");
+            assert!(!tool.description.is_empty(), "tool {} has empty description", tool.name);
+            assert!(!tool.triggers.is_empty(), "tool {} has no triggers", tool.name);
+            assert!(!tool.intents.is_empty(), "tool {} has no intents", tool.name);
+        }
+    }
+
+    #[test]
+    fn catalog_pinned_tools_include_bash_and_read_file() {
+        let pinned: Vec<&str> = TOOL_CATALOG.iter().filter(|t| t.pinned).map(|t| t.name).collect();
+        assert!(pinned.contains(&"bash"), "bash should be pinned");
+        assert!(pinned.contains(&"read_file"), "read_file should be pinned");
+    }
+
+    #[test]
+    fn catalog_schema_tokens_positive_for_all() {
+        for tool in TOOL_CATALOG {
+            assert!(tool.schema_tokens > 0, "tool {} has zero schema_tokens", tool.name);
+        }
+    }
+
+    #[test]
+    fn catalog_has_expected_count() {
+        // Sanity check — if tools are added/removed, update this
+        assert!(TOOL_CATALOG.len() >= 30, "expected at least 30 tools, got {}", TOOL_CATALOG.len());
+    }
+
+    #[test]
+    fn catalog_no_duplicate_triggers_within_tool() {
+        for tool in TOOL_CATALOG {
+            let mut seen = HashSet::new();
+            for trigger in tool.triggers {
+                assert!(seen.insert(*trigger), "tool {} has duplicate trigger: {}", tool.name, trigger);
+            }
+        }
+    }
+
+    #[test]
+    fn catalog_memory_store_is_pinned() {
+        let ms = TOOL_CATALOG.iter().find(|t| t.name == "memory_store").unwrap();
+        assert!(ms.pinned, "memory_store should be pinned");
+    }
+}
