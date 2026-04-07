@@ -27,6 +27,7 @@ pub(super) async fn execute_cli_command(
     command: Option<Command>,
     profile: Option<String>,
     global_model: Option<String>,
+    auto_approve: bool,
     api: &astra_thin_client::ThinClient,
 ) -> Result<ExitCode, String> {
     match command {
@@ -55,7 +56,7 @@ pub(super) async fn execute_cli_command(
             let session_id = resumable_last_session_id(profile.as_deref());
             let selector = create_tool_selector(api, profile.as_deref());
             let mut pm = PermissionManager::with_project(
-                false,
+                auto_approve,
                 &std::env::current_dir().unwrap_or_default(),
             );
             let mut skill_qt = astra_runtime::skills::quality::SkillQualityTracker::new();
@@ -307,7 +308,7 @@ pub(super) async fn execute_cli_command(
                     });
                     PermissionManager::with_project_mode(mode, &project_root)
                 } else {
-                    PermissionManager::with_project(args.auto_approve, &project_root)
+                    PermissionManager::with_project(args.auto_approve || auto_approve, &project_root)
                 }
             };
             let explain_mode = if args.explain {
@@ -798,7 +799,7 @@ pub(super) async fn run_print_mode(
     let session_id = resumable_last_session_id(profile);
     let selector = create_tool_selector(api, profile);
     let mut pm = PermissionManager::with_project(
-        false,
+        true, // print mode is headless, always auto-approve
         &std::env::current_dir().unwrap_or_default(),
     );
     let mut skill_qt = astra_runtime::skills::quality::SkillQualityTracker::new();
