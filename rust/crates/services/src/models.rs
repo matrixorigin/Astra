@@ -926,7 +926,6 @@ impl From<ModelListItem> for ModelListItemResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
 
     // -- PricingData --
 

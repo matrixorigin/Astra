@@ -567,7 +567,6 @@ Follow these steps:
             if sub_arg == "off" {
                 state.skill_dev_name = None;
                 state.skill_dev_dir = None;
-                state.skill_dev_context = None;
                 eprintln!("  {}", "Exited skill dev mode".green());
                 return Ok(());
             }
@@ -587,32 +586,33 @@ Follow these steps:
                 }
                 return Ok(());
             }
-            let skill_dir = std::env::current_dir()
-                .map_err(|e| e.to_string())?
-                .join(".astra/skills")
-                .join(name);
-            let skill_md_path = skill_dir.join("SKILL.md");
-            // Fall back to legacy skill.py for backward compat
-            let skill_py_path = skill_dir.join("skill.py");
-            let (src_path, src_label) = if skill_md_path.exists() {
-                (skill_md_path, "SKILL.md")
-            } else if skill_py_path.exists() {
-                (skill_py_path, "skill.py (legacy)")
-            } else {
-                eprintln!(
-                    "{}",
-                    format!(
-                        "  \u{2717} SKILL.md not found in {}. Use /skill new {name} to scaffold.",
-                        skill_dir.display()
-                    )
-                    .yellow()
-                );
-                return Ok(());
+            // Search all skill paths (project .astra/skills/, skills/, ~/.astra/skills/)
+            let search_paths = crate::skill_instructions::skill_search_paths();
+            let found = search_paths.iter().find_map(|base| {
+                let dir = base.join(name);
+                if dir.join("SKILL.md").exists() {
+                    Some((dir, "SKILL.md"))
+                } else if dir.join("skill.py").exists() {
+                    Some((dir, "skill.py (legacy)"))
+                } else {
+                    None
+                }
+            });
+            let (skill_dir, src_label) = match found {
+                Some(pair) => pair,
+                None => {
+                    eprintln!(
+                        "{}",
+                        format!(
+                            "  \u{2717} SKILL.md not found for '{name}'. Use /skill new {name} to scaffold."
+                        )
+                        .yellow()
+                    );
+                    return Ok(());
+                }
             };
-            let skill_src = std::fs::read_to_string(&src_path).map_err(|e| e.to_string())?;
             state.skill_dev_name = Some(name.to_string());
-            state.skill_dev_dir = Some(skill_dir.display().to_string());
-            state.skill_dev_context = Some(skill_src);
+            state.skill_dev_dir = Some(skill_dir.clone());
             eprintln!(
                 "\n  \u{1f527} {} {}",
                 "Skill dev mode:".bold(),
@@ -622,7 +622,7 @@ Follow these steps:
             eprintln!("  {}", format!("Source: {src_label}").dim());
             eprintln!(
                 "  {}",
-                "Skill source is injected into each turn. Ask me to improve it.".dim()
+                "SKILL.md is re-read from disk each turn — external edits are picked up automatically.".dim()
             );
             eprintln!("  {}", "Exit: /skill dev off".dim());
             eprintln!();

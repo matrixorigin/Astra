@@ -75,12 +75,14 @@ mod tests {
         assert!(prefix.starts_with("[SKILL DEV: my_skill]"));
         assert!(prefix.contains("def run(): pass"));
         // Must tell LLM not to re-read the file
-        assert!(prefix.contains("do NOT read_file"));
+        assert!(prefix.contains("do NOT"));
         // Must include file path hint
         assert!(prefix.contains(".astra/skills/my_skill/SKILL.md"));
-        // Must include brief writing guidance
+        // Must include dev guidelines
+        assert!(prefix.contains("Dev Guidelines"));
         assert!(prefix.contains("when_to_use"));
-        assert!(prefix.contains("$ARGUMENTS"));
+        assert!(prefix.contains("Success criteria"));
+        assert!(prefix.contains("allowed_tools"));
     }
 
     #[test]

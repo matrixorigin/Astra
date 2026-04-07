@@ -221,14 +221,21 @@ pub(super) async fn handle_chat_input(
 }
 
 pub(super) fn build_effective_line(line: &str, state: &ReplState) -> String {
-    let mut effective_line = if let (Some(skill_name), Some(source)) = (
+    let mut effective_line = if let (Some(skill_name), Some(skill_dir)) = (
         state.skill_dev_name.as_deref(),
-        state.skill_dev_context.as_deref(),
+        state.skill_dev_dir.as_deref(),
     ) {
-        format!(
-            "{}{line}",
-            prompts::build_skill_dev_prefix(skill_name, source)
-        )
+        // Re-read SKILL.md from disk every turn so external edits are picked up.
+        match std::fs::read_to_string(skill_dir.join("SKILL.md")) {
+            Ok(source) => format!(
+                "{}{line}",
+                prompts::build_skill_dev_prefix(skill_name, &source)
+            ),
+            Err(_) => {
+                eprintln!("  ⚠ SKILL.md not found at {}, dev context skipped", skill_dir.display());
+                line.to_string()
+            }
+        }
     } else {
         line.to_string()
     };
@@ -1213,7 +1220,14 @@ fn build_manual_heavy_step_checkpoint(
     let heavy = HeavyCheckpoint {
         light,
         messages,
-        budget_remaining_tokens: 0,
+        budget_remaining_tokens: {
+            let limit = astra_core::RuntimeLimits::global().max_turn_input_tokens;
+            if limit == 0 {
+                0 // unlimited
+            } else {
+                limit.saturating_sub(state.total_prompt_tokens)
+            }
+        },
         budget_remaining_rounds: max_turns.saturating_sub(state.turn),
         blocked_tools: Vec::new(),
         recent_tools: state.recent_tools.clone(),
@@ -1624,6 +1638,42 @@ mod tests {
         let effective = build_effective_line("修一下输入法问题", &state);
         assert!(!effective.contains("[Continuation anchor]"));
         assert_eq!(effective, "修一下输入法问题");
+    }
+
+    #[test]
+    fn build_effective_line_skill_dev_reads_from_disk() {
+        let tmp = tempfile::tempdir().unwrap();
+        let skill_dir = tmp.path().join("test-skill");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: test-skill\n---\n# Test\nDo stuff.",
+        )
+        .unwrap();
+
+        let state = ReplState {
+            skill_dev_name: Some("test-skill".to_string()),
+            skill_dev_dir: Some(skill_dir),
+            ..ReplState::default()
+        };
+
+        let effective = build_effective_line("improve this skill", &state);
+        assert!(effective.contains("[SKILL DEV: test-skill]"));
+        assert!(effective.contains("Do stuff."));
+        assert!(effective.contains("improve this skill"));
+    }
+
+    #[test]
+    fn build_effective_line_skill_dev_missing_file_falls_through() {
+        let state = ReplState {
+            skill_dev_name: Some("ghost".to_string()),
+            skill_dev_dir: Some(std::path::PathBuf::from("/nonexistent/path/ghost")),
+            ..ReplState::default()
+        };
+
+        let effective = build_effective_line("hello", &state);
+        // Should fall through without prefix when file is missing
+        assert_eq!(effective, "hello");
     }
 
     // ── Cost tracking & status line logic tests ──────────────────────────

@@ -1213,10 +1213,10 @@ impl ToolExecutor {
 
                 // Append metadata about truncation/timeout
                 if timed_out {
-                    result_text.push_str(&format!(
+                    result_text.push_str(
                         "\n\n[grep timed out after 30s — showing partial results. \
                          Narrow the search: use 'path' for a subdirectory or 'include' for file types.]"
-                    ));
+                    );
                 }
                 if was_truncated_by_limit {
                     let eff = effective_limit.unwrap_or(0);

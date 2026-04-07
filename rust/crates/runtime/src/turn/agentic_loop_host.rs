@@ -308,6 +308,14 @@ pub struct AgenticLoopState {
     /// Consecutive fatal ingests whose error matched context-window / PTL patterns.
     pub consecutive_context_window_errors: u32,
 
+    // ── Per-turn token budget ──
+    /// Maximum LLM input tokens before the loop forces a graceful wind-down.
+    /// 0 = unlimited (legacy).  Set from `RuntimeLimits::max_turn_input_tokens`.
+    pub max_turn_input_tokens: u64,
+    /// Set to `true` once the budget-exceeded wrap-up message has been injected.
+    /// The loop allows exactly one more LLM iteration after injection.
+    pub budget_wrapup_injected: bool,
+
     // ── Ephemeral skill listing ──
     /// Skill listing message (available skill names + descriptions).
     /// Stored here instead of in `messages` so hosts can inject it ephemerally
@@ -931,6 +939,50 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
                 continue;
             }
             AgenticIngestIterationControl::ProceedWithToolCalls => {}
+        }
+
+        // ─── Step 2b: Token budget guard ─────────────────────────────────
+        // If the last LLM call's prompt_tokens exceeds max_turn_input_tokens,
+        // inject a wrap-up system message and skip tool execution.  The loop
+        // continues for exactly one more iteration so the model can produce a
+        // final answer.  On the second breach (wrapup already injected),
+        // force-complete immediately.
+        if state.max_turn_input_tokens > 0 {
+            if let Some(measured) = state.last_measured_prompt_tokens {
+                if measured > state.max_turn_input_tokens {
+                    if state.budget_wrapup_injected {
+                        // Second breach after wrap-up — hard stop.
+                        if !quiet {
+                            host.emit_headless_line(
+                                HeadlessStderrStyle::Yellow,
+                                "⚠ Token budget exceeded — completing turn.".to_string(),
+                            );
+                        }
+                        try_write_heavy_checkpoint(state);
+                        return Ok(AgenticLoopOutcome::Completed);
+                    }
+                    // First breach — inject wrap-up instruction, skip tool execution.
+                    state.budget_wrapup_injected = true;
+                    if !quiet {
+                        host.emit_headless_line(
+                            HeadlessStderrStyle::Yellow,
+                            format!(
+                                "⚠ Token budget reached ({measured}/{} tokens) — wrapping up.",
+                                state.max_turn_input_tokens,
+                            ),
+                        );
+                    }
+                    state.messages.push(serde_json::json!({
+                        "role": "system",
+                        "content": "You have reached the token budget limit for this turn. \
+                            Do NOT call any more tools. Summarize your progress so far and \
+                            present your results to the user. If you have partial work, \
+                            explain what remains to be done."
+                    }));
+                    try_write_heavy_checkpoint(state);
+                    continue;
+                }
+            }
         }
 
         // ─── Step 3: Stall preflight ────────────────────────────────────
@@ -1772,6 +1824,8 @@ mod tests {
             last_composite_snapshot: None,
             last_measured_prompt_tokens: None,
             consecutive_context_window_errors: 0,
+            max_turn_input_tokens: 0,
+            budget_wrapup_injected: false,
             skill_listing_message: None,
             invoked_skills: std::collections::HashMap::new(),
         }
@@ -4202,5 +4256,104 @@ mod tests {
         // Should not panic
         let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
         assert!(outcome.is_ok());
+    }
+
+    // ── Token budget enforcement tests ──────────────────────────────────────
+
+    #[tokio::test]
+    async fn budget_exceeded_injects_wrapup_and_completes() {
+        // Turn 1: edge tool call with prompt=50K → under 80K budget → proceeds
+        // Turn 2: prompt=90K → exceeds 80K budget → wrapup injected, loop continues
+        // Turn 3: final text response → completes
+        let mut host = MockHost::new(vec![
+            edge_tool_result(
+                vec![make_edge_tool("bash", "file list")],
+                50_000,
+                1000,
+                Some(200),
+            ),
+            edge_tool_result(
+                vec![make_edge_tool("read_file", "big content")],
+                90_000,
+                2000,
+                Some(100),
+            ),
+            text_result("Here is my summary.", 90_000, 500, None),
+        ]);
+        let mut state = make_state();
+        state.max_turn_input_tokens = 80_000;
+        state
+            .messages
+            .push(json!({"role": "user", "content": "analyze code"}));
+
+        let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
+        assert!(outcome.is_ok());
+        assert!(state.budget_wrapup_injected);
+        assert_eq!(state.final_text, "Here is my summary.");
+        // Verify a system message was injected about budget
+        let has_budget_msg = state
+            .messages
+            .iter()
+            .any(|m| {
+                m.get("content")
+                    .and_then(|c| c.as_str())
+                    .is_some_and(|s| s.contains("token budget limit"))
+            });
+        assert!(has_budget_msg, "expected budget wrapup system message");
+    }
+
+    #[tokio::test]
+    async fn budget_zero_means_unlimited() {
+        // With max_turn_input_tokens=0, even large prompt tokens shouldn't trigger wrapup.
+        let mut host = MockHost::new(vec![
+            edge_tool_result(
+                vec![make_edge_tool("bash", "big output")],
+                200_000,
+                5000,
+                Some(100),
+            ),
+            text_result("All done.", 200_000, 1000, None),
+        ]);
+        let mut state = make_state();
+        state.max_turn_input_tokens = 0; // unlimited
+        state
+            .messages
+            .push(json!({"role": "user", "content": "big task"}));
+
+        let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
+        assert!(outcome.is_ok());
+        assert!(!state.budget_wrapup_injected);
+        assert_eq!(state.final_text, "All done.");
+    }
+
+    #[tokio::test]
+    async fn budget_hard_stop_on_second_breach() {
+        // Turn 1: prompt=90K → exceeds 80K budget → wrapup injected
+        // Turn 2: model still returns tool calls with prompt=95K → hard stop
+        let mut host = MockHost::new(vec![
+            edge_tool_result(
+                vec![make_edge_tool("bash", "output1")],
+                90_000,
+                2000,
+                Some(100),
+            ),
+            // After wrapup injection, model ignores instruction and returns tool calls again.
+            edge_tool_result(
+                vec![make_edge_tool("bash", "output2")],
+                95_000,
+                2500,
+                Some(50),
+            ),
+        ]);
+        let mut state = make_state();
+        state.max_turn_input_tokens = 80_000;
+        state
+            .messages
+            .push(json!({"role": "user", "content": "complex task"}));
+
+        let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
+        // Should complete (hard stop), not error.
+        assert!(outcome.is_ok());
+        assert!(state.budget_wrapup_injected);
     }
 }

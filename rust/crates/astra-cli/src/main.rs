@@ -545,8 +545,7 @@ struct ReplState {
     /// Cached pricing data for the active model (used by /cost).
     cached_pricing: astra_services::models::PricingData,
     skill_dev_name: Option<String>,
-    skill_dev_dir: Option<String>,
-    skill_dev_context: Option<String>,
+    skill_dev_dir: Option<std::path::PathBuf>,
     active_system_skills: Vec<prompts::SystemSkill>,
     context_budget: prompts::ContextBudget,
     journal: Option<session_journal::JournalWriter>,
@@ -663,7 +662,6 @@ impl Default for ReplState {
             cached_pricing: Default::default(),
             skill_dev_name: None,
             skill_dev_dir: None,
-            skill_dev_context: None,
             active_system_skills: Vec::new(),
             context_budget: prompts::ContextBudget::default(),
             journal: None,

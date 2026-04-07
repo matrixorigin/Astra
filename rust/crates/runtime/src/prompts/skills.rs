@@ -1,21 +1,24 @@
 /// Prefix injected into the user message when `/skill dev <name>` is active.
 ///
-/// Provides the full skill source in-context plus file path for editing.
-/// Prevents the LLM from grep-ing for the file it already has.
-/// Writing guidance is kept brief — the LLM already knows markdown;
-/// it just needs the structural patterns specific to SKILL.md.
+/// Provides the full skill source (re-read from disk each turn) plus
+/// structured editing guidelines. Prevents the LLM from re-reading
+/// the file it already has in context.
 pub fn build_skill_dev_prefix(skill_name: &str, skill_src: &str) -> String {
     format!(
         "[SKILL DEV: {skill_name}]\n\
-         The complete source of \"{skill_name}\" is below — do NOT read_file or grep for it.\n\
-         File path: `.astra/skills/{skill_name}/SKILL.md` (or `skills/{skill_name}/SKILL.md`)\n\
-         To edit: modify the content and use `write_file` to save.\n\n\
+         You are in skill development mode. The complete, live source of \"{skill_name}\" is below.\n\
+         File: `.astra/skills/{skill_name}/SKILL.md` (re-read from disk each turn)\n\n\
          ```markdown\n\
          {skill_src}\n\
          ```\n\n\
-         SKILL.md patterns: frontmatter (`when_to_use`, `allowed_tools`, `arguments`), \
-         phased steps with success criteria, decision tables, `$ARGUMENTS` placeholder, \
-         built-in tools over bash, anti-pattern rules.\n\n"
+         ## Dev Guidelines\n\
+         - Edit via `write_file` — do NOT `read_file` or `grep` for this skill, you already have it.\n\
+         - After any edit, validate: frontmatter must parse as YAML, `name` must be non-empty.\n\
+         - Every step needs a **Success criteria** line.\n\
+         - `when_to_use` must start with \"Use when...\" and include trigger phrases.\n\
+         - `allowed_tools` should be minimal — list only what the skill actually needs.\n\
+         - If the skill takes parameters, define `arguments` in frontmatter and use `$ARG_NAME` in the body.\n\
+         - Prefer built-in tools (`read_file`, `write_file`, `delegate`) over `bash` where possible.\n\n"
     )
 }
 

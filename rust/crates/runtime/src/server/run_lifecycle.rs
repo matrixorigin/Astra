@@ -321,6 +321,8 @@ impl AgenticRunLifecycleService {
             last_composite_snapshot: None,
             last_measured_prompt_tokens: None,
             consecutive_context_window_errors: 0,
+            max_turn_input_tokens: astra_core::RuntimeLimits::global().max_turn_input_tokens,
+            budget_wrapup_injected: false,
             skill_listing_message: None,
             invoked_skills: std::collections::HashMap::new(),
         }
@@ -987,6 +989,8 @@ impl SubRunExecutor for ServerSubRunExecutor {
             last_composite_snapshot: None,
             last_measured_prompt_tokens: None,
             consecutive_context_window_errors: 0,
+            max_turn_input_tokens: astra_core::RuntimeLimits::global().max_turn_input_tokens,
+            budget_wrapup_injected: false,
             skill_listing_message: None,
             invoked_skills: std::collections::HashMap::new(),
         };

@@ -12,6 +12,7 @@
 //! MO_MAX_TOOL_RETRIES=3        # transient-error retries per tool
 //! MO_RETRY_BASE_MS=500         # base backoff for retries (doubles each)
 //! MO_MAX_RETRIEVED=8           # memory/knowledge docs per turn
+//! MO_MAX_TURN_INPUT_TOKENS=80000 # max LLM input tokens per turn (0=unlimited)
 //! ```
 
 use std::sync::OnceLock;
@@ -38,6 +39,10 @@ pub struct RuntimeLimits {
     pub retry_base_ms: u64,
     /// Maximum memory/knowledge-base documents retrieved per turn.
     pub max_retrieved: usize,
+    /// Maximum LLM input tokens per turn before the loop forces a wrap-up.
+    /// Prevents runaway context growth that triggers endpoint TPM errors.
+    /// 0 = unlimited (legacy default).
+    pub max_turn_input_tokens: u64,
 }
 
 impl Default for RuntimeLimits {
@@ -51,6 +56,7 @@ impl Default for RuntimeLimits {
             max_tool_retries: 2,
             retry_base_ms: 500,
             max_retrieved: 6,
+            max_turn_input_tokens: 80_000,
         }
     }
 }
@@ -68,6 +74,10 @@ impl RuntimeLimits {
             max_tool_retries: env_parse("MO_MAX_TOOL_RETRIES", d.max_tool_retries),
             retry_base_ms: env_parse("MO_RETRY_BASE_MS", d.retry_base_ms),
             max_retrieved: env_parse("MO_MAX_RETRIEVED", d.max_retrieved),
+            max_turn_input_tokens: env_parse(
+                "MO_MAX_TURN_INPUT_TOKENS",
+                d.max_turn_input_tokens,
+            ),
         }
     }
 
@@ -119,6 +129,7 @@ mod tests {
         assert_eq!(d.max_tool_retries, 2);
         assert_eq!(d.retry_base_ms, 500);
         assert_eq!(d.max_retrieved, 6);
+        assert_eq!(d.max_turn_input_tokens, 80_000);
     }
 
     #[test]

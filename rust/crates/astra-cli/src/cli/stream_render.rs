@@ -276,9 +276,6 @@ impl SseStreamHost for CliSseStreamHost<'_> {
         if let Some(tx) = &self.stream_event_tx {
             let _ = tx.send(super::chat_stream::StreamEvent::ModelResponding);
         }
-        if self.quiet || self.suppress_intermediate_output {
-            return;
-        }
         // Don't stop the TTFT spinner here — the first SSE frame is often
         // metadata (session_info, usage) not visible content.  Let the
         // spinner run until actual thinking/text arrives, which will
