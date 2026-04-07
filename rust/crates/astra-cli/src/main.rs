@@ -4305,10 +4305,6 @@ async fn handle_slash_command(
             slash_mcp::handle_mcp_command(arg, state).await?;
         }
 
-        "/mcp prompt" => {
-            slash_mcp::handle_mcp_prompt_invoke(arg, state).await?;
-        }
-
         "/team" | "/team list" | "/team create" | "/team info" | "/team delete"
         | "/team add-member" | "/team context" => {
             slash_team::handle_team_command(arg, state);
