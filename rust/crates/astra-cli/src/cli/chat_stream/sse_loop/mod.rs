@@ -88,6 +88,7 @@ pub(crate) async fn stream_chat_sse(
             let mut m = mgr.write().await;
             m.refresh_changed_tools().await;
             m.consume_prompt_changes();
+            m.consume_resource_changes();
         }
         let mut schemas = edge_tools::all_tool_schemas();
         // Inject MCP tool schemas from connected servers
