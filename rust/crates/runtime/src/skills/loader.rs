@@ -476,22 +476,30 @@ pub fn discover_skills_in_dir(dir: &Path) -> Vec<(String, PathBuf)> {
 /// Standard skill directory search order (high -> low priority):
 ///
 /// 1. Walk-up from cwd: `{ancestor}/.astra/skills/` for each ancestor
-/// 2. `{cwd}/skills/`         — project-level (legacy)
-/// 3. `~/.astra/skills/`      — user-level global skills
+/// 2. Walk-up from cwd: `{ancestor}/.claude/skills/` for each ancestor (CC-compatible)
+/// 3. `{cwd}/skills/`         — project-level (legacy)
+/// 4. `~/.astra/skills/`      — user-level global skills
+/// 5. `~/.claude/skills/`     — Claude Code user-level skills (CC-compatible)
 ///
 /// Walk-up discovery traverses from `cwd` upward to the filesystem root,
-/// collecting `.astra/skills/` directories. This mirrors Claude Code's
-/// behavior for monorepo support where sub-projects define their own skills.
+/// collecting skill directories. Astra's SKILL.md format is compatible with
+/// the Agent Skills open standard used by Claude Code, so skills authored for
+/// either tool work in both. Claude Code skills are discovered at lower
+/// priority so astra-native skills take precedence when names collide.
 pub fn skill_search_paths() -> Vec<PathBuf> {
-    let mut paths = Vec::with_capacity(8);
+    let mut paths = Vec::with_capacity(12);
 
     if let Ok(cwd) = std::env::current_dir() {
-        // Walk up from cwd to root, collecting .astra/skills/ directories.
-        paths.extend(walk_up_skill_paths(&cwd));
+        // Single walk-up collecting both .astra/skills/ and .claude/skills/.
+        // .astra paths first at each level so they take priority over .claude.
+        let (astra, claude) = walk_up_skill_paths(&cwd);
+        paths.extend(astra);
+        paths.extend(claude);
         // Legacy: skills/ in cwd only (not walked up).
         paths.push(cwd.join("skills"));
     } else {
         paths.push(PathBuf::from(".astra/skills"));
+        paths.push(PathBuf::from(".claude/skills"));
         paths.push(PathBuf::from("skills"));
     }
 
@@ -500,45 +508,48 @@ pub fn skill_search_paths() -> Vec<PathBuf> {
         if !paths.contains(&global) {
             paths.push(global);
         }
+        let cc_global = home.join(".claude").join("skills");
+        if !paths.contains(&cc_global) {
+            paths.push(cc_global);
+        }
     }
 
     paths
 }
 
-/// Walk from `start` upward, collecting `{ancestor}/.astra/skills/` paths.
+/// Walk from `start` upward once, collecting both `.astra/skills/` and
+/// `.claude/skills/` at each ancestor. Returns `(astra_paths, claude_paths)`
+/// so the caller can maintain priority (astra before claude).
 ///
-/// Stops at repository root (detected by `.git` directory) or user's home
-/// directory, whichever is encountered first. This prevents skills from
-/// untrusted parent directories outside the project from being injected.
-///
-/// Returns paths in priority order (deepest/most-specific first).
-pub fn walk_up_skill_paths(start: &Path) -> Vec<PathBuf> {
-    let mut result = Vec::new();
+/// Stops at repository root (`.git`) or user's home directory.
+pub fn walk_up_skill_paths(start: &Path) -> (Vec<PathBuf>, Vec<PathBuf>) {
+    let mut astra = Vec::new();
+    let mut claude = Vec::new();
     let mut dir = start.to_path_buf();
     let home = dirs::home_dir();
 
     loop {
-        let candidate = dir.join(".astra").join("skills");
-        if candidate.is_dir() {
-            result.push(candidate);
+        let a = dir.join(".astra").join("skills");
+        if a.is_dir() {
+            astra.push(a);
+        }
+        let c = dir.join(".claude").join("skills");
+        if c.is_dir() {
+            claude.push(c);
         }
 
-        // Stop at repo root — don't cross trust boundaries.
         if dir.join(".git").exists() {
             break;
         }
-
-        // Stop at home directory — don't scan system-level ancestors.
         if matches!(&home, Some(h) if dir == *h) {
             break;
         }
-
         if !dir.pop() {
             break;
         }
     }
 
-    result
+    (astra, claude)
 }
 
 #[cfg(test)]
@@ -900,6 +911,16 @@ Hooked body."#;
         assert!(paths.len() >= 2);
     }
 
+    #[test]
+    fn skill_search_paths_includes_claude_dirs() {
+        let paths = skill_search_paths();
+        let has_claude = paths.iter().any(|p| {
+            p.components()
+                .any(|c| c.as_os_str() == ".claude")
+        });
+        assert!(has_claude, "should include .claude/skills/ paths, got: {paths:?}");
+    }
+
     // ── Path traversal protection ──
 
     #[test]
@@ -1047,10 +1068,10 @@ Hooked body."#;
         let mid_skills = dir.path().join("a").join(".astra").join("skills");
         std::fs::create_dir_all(&mid_skills).unwrap();
 
-        let paths = walk_up_skill_paths(&deep);
-        assert_eq!(paths.len(), 2);
-        assert_eq!(paths[0], mid_skills);
-        assert_eq!(paths[1], root_skills);
+        let (astra, _claude) = walk_up_skill_paths(&deep);
+        assert_eq!(astra.len(), 2);
+        assert_eq!(astra[0], mid_skills);
+        assert_eq!(astra[1], root_skills);
     }
 
     #[test]
@@ -1069,14 +1090,14 @@ Hooked body."#;
         let outside_skills = dir.path().join(".astra").join("skills");
         std::fs::create_dir_all(&outside_skills).unwrap();
 
-        let paths = walk_up_skill_paths(&deep);
+        let (astra, _claude) = walk_up_skill_paths(&deep);
 
         assert!(
-            paths.contains(&repo_skills),
+            astra.contains(&repo_skills),
             "should find skills inside repo"
         );
         assert!(
-            !paths.contains(&outside_skills),
+            !astra.contains(&outside_skills),
             "should NOT find skills outside repo root"
         );
     }
@@ -1089,8 +1110,67 @@ Hooked body."#;
         // Place .git so we don't walk outside the temp dir
         std::fs::create_dir_all(dir.path().join(".git")).unwrap();
 
-        let paths = walk_up_skill_paths(&deep);
-        assert!(paths.is_empty());
+        let (astra, claude) = walk_up_skill_paths(&deep);
+        assert!(astra.is_empty());
+        assert!(claude.is_empty());
+    }
+
+    #[test]
+    fn walk_up_finds_claude_skills() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let deep = dir.path().join("src");
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::create_dir_all(dir.path().join(".git")).unwrap();
+
+        let cc_skills = dir.path().join(".claude").join("skills");
+        std::fs::create_dir_all(&cc_skills).unwrap();
+
+        let (astra, claude) = walk_up_skill_paths(&deep);
+        assert!(astra.is_empty(), "no .astra/skills/ exists");
+        assert_eq!(claude.len(), 1);
+        assert_eq!(claude[0], cc_skills);
+    }
+
+    #[test]
+    fn walk_up_finds_both_astra_and_claude() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let deep = dir.path().join("pkg").join("sub");
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::create_dir_all(dir.path().join(".git")).unwrap();
+
+        let astra_root = dir.path().join(".astra").join("skills");
+        let claude_root = dir.path().join(".claude").join("skills");
+        let claude_mid = dir.path().join("pkg").join(".claude").join("skills");
+        std::fs::create_dir_all(&astra_root).unwrap();
+        std::fs::create_dir_all(&claude_root).unwrap();
+        std::fs::create_dir_all(&claude_mid).unwrap();
+
+        let (astra, claude) = walk_up_skill_paths(&deep);
+        assert_eq!(astra, vec![astra_root]);
+        assert_eq!(claude.len(), 2);
+        assert_eq!(claude[0], claude_mid, "deeper .claude first");
+        assert_eq!(claude[1], claude_root);
+    }
+
+    #[test]
+    fn walk_up_claude_stops_at_git_boundary() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let repo = dir.path().join("repo");
+        let deep = repo.join("src");
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+
+        // Inside repo — should be found
+        let inside = repo.join(".claude").join("skills");
+        std::fs::create_dir_all(&inside).unwrap();
+
+        // Outside repo — should NOT be found
+        let outside = dir.path().join(".claude").join("skills");
+        std::fs::create_dir_all(&outside).unwrap();
+
+        let (_astra, claude) = walk_up_skill_paths(&deep);
+        assert!(claude.contains(&inside));
+        assert!(!claude.contains(&outside), ".claude outside git root must be excluded");
     }
 
     // ── Skill name validation ──

@@ -49,7 +49,8 @@ fn core_rules_section() -> String {
          4. Live data (CI, PRs, issues, stats, memory, git) → MUST call a tool. Never answer from training data.\n\
          5. Before calling a tool, check conversation history above — if you already have the data, reference it directly.\n\
          6. Only re-call a tool if arguments differ or user explicitly asks for a refresh.\n\
-         7. Tool outputs in history reflect state AT CALL TIME, not now. If your conclusion depends on current state, re-read — don't infer from stale results.\n"
+         7. Tool outputs in history reflect state AT CALL TIME, not now. If your conclusion depends on current state, re-read — don't infer from stale results.\n\
+         8. You are compatible with Claude Code skills (Agent Skills open standard). When you see `.claude/skills/`, `.claude/commands/`, or skill SKILL.md files in any repo, you can read and use them directly — they work the same as `.astra/skills/`.\n"
     )
 }
 
@@ -174,10 +175,7 @@ fn self_model_section(tool_names: &[&str]) -> String {
 
 /// Tool-conditional guidance (git, code nav, editing, build/test, memory, etc.).
 /// Session-scoped — depends on which tools are selected.
-fn tool_conditional_section(
-    tool_names: &[&str],
-    selection_confidence: f64,
-) -> String {
+fn tool_conditional_section(tool_names: &[&str], selection_confidence: f64) -> String {
     let has_memory = tool_names.iter().any(|n| n.starts_with("memory"));
     let has_github = tool_names.iter().any(|n| n.starts_with("github"));
     let has_git = tool_names.iter().any(|n| n.starts_with("git_"));
@@ -300,7 +298,7 @@ fn tool_conditional_section(
 /// Task-type specific strategy. Session-scoped — depends on detected task type.
 fn task_type_section(task_type: Option<&str>) -> &'static str {
     match task_type {
-        Some("code_review") =>
+        Some("code_review") => {
             "\n## Code Review Strategy\n\
               ### CRITICAL: Evidence BEFORE conclusions\n\
               You MUST gather evidence first, then form conclusions. NEVER write a summary or verdict \
@@ -339,8 +337,9 @@ fn task_type_section(task_type: Option<&str>) -> &'static str {
               - Do NOT write a review summary in the same response where you call git_diff.\n\
               - Do NOT say \"tests look good\" without reading at least one test file.\n\
               - Do NOT output `<reflect>`, `<think>`, or other XML-like tags in your final response.\n\
-              - Do NOT claim full confidence when evidence is incomplete.\n",
-        Some("debugging") =>
+              - Do NOT claim full confidence when evidence is incomplete.\n"
+        }
+        Some("debugging") => {
             "\n## Debugging Strategy\n\
              1. Start with the error message / stack trace — read it carefully before exploring.\n\
              2. Form a hypothesis about the root cause.\n\
@@ -348,16 +347,18 @@ fn task_type_section(task_type: Option<&str>) -> &'static str {
              4. If hypothesis is wrong, form a new one — don't shotgun search.\n\
              5. Check recent git changes near the error site (git_log, git_blame).\n\
              6. If a command fails, do NOT retry the exact same command — vary the approach.\n\
-             7. Once found: explain the root cause, show the fix, verify it compiles/passes.\n",
-        Some("exploration") =>
+             7. Once found: explain the root cause, show the fix, verify it compiles/passes.\n"
+        }
+        Some("exploration") => {
             "\n## Exploration Strategy\n\
              1. Start broad: list_dir for project structure, then identify entry points.\n\
              2. Narrow: grep for key terms, glob for file patterns.\n\
              3. Build a mental map: entry points → core modules → dependencies → patterns.\n\
              4. Read files with targeted ranges, not full files — scan structure first.\n\
              5. Summarize architecture with concrete file paths and relationships.\n\
-             6. Note patterns: error handling style, naming conventions, test structure.\n",
-        Some("implementation") =>
+             6. Note patterns: error handling style, naming conventions, test structure.\n"
+        }
+        Some("implementation") => {
             "\n## Implementation Strategy\n\
               1. **Understand structure**: symbols(calls=true) for file overview + call flow in one shot.\n\
               2. **Find location**: find_definition → glob → grep → read sections.\n\
@@ -365,48 +366,55 @@ fn task_type_section(task_type: Option<&str>) -> &'static str {
               4. **Implement surgically**: minimal changes, follow style. str_replace auto-formats.\n\
               5. **Wire it up**: add imports, register modules, update exports.\n\
               6. **Verify**: run_build_test, fix from structured output, repeat.\n\
-              7. **Commit**: git_commit with a clear message.\n",
-        Some("refactoring") =>
+              7. **Commit**: git_commit with a clear message.\n"
+        }
+        Some("refactoring") => {
             "\n## Refactoring Strategy\n\
              1. Run tests BEFORE refactoring to establish a passing baseline.\n\
              2. Use call_graph(callers=true, scope='project') to find all callers before changing a signature.\n\
              3. For renames: rename_symbol(dry_run=true) to preview, then dry_run=false to apply.\n\
              4. Make one logical change at a time — verify after each.\n\
              5. Preserve external behavior; focus on clarity and maintainability.\n\
-             6. Run tests AFTER to confirm nothing regressed.\n",
-        Some("testing") =>
+             6. Run tests AFTER to confirm nothing regressed.\n"
+        }
+        Some("testing") => {
             "\n## Testing Strategy\n\
              1. Read the module under test to understand its behavior and edge cases.\n\
              2. Follow existing test patterns: naming, setup/teardown, assertion style.\n\
              3. Cover: happy path → edge cases → error conditions → boundary values.\n\
              4. Each test verifies ONE behavior with a clear, descriptive name.\n\
-             5. Run the new tests to confirm they pass — fix failures before reporting.\n",
-        Some("documentation") =>
+             5. Run the new tests to confirm they pass — fix failures before reporting.\n"
+        }
+        Some("documentation") => {
             "\n## Documentation Strategy\n\
              - Read the code first — document actual behavior, not assumptions.\n\
              - Include: purpose, usage examples, parameters, return values, error conditions.\n\
              - Keep docs close to the code they describe.\n\
-             - Use the project's existing documentation style and format.\n",
-        Some("performance") =>
+             - Use the project's existing documentation style and format.\n"
+        }
+        Some("performance") => {
             "\n## Performance Strategy\n\
              1. Measure first — don't guess. Profile to locate the actual bottleneck.\n\
              2. Optimize the hottest path only; avoid premature optimization elsewhere.\n\
              3. Check: algorithm complexity, allocation patterns, I/O blocking, cache misses.\n\
              4. Verify improvement with before/after measurements.\n\
-             5. Ensure optimization doesn't break correctness — run tests after.\n",
-        Some("analysis") =>
+             5. Ensure optimization doesn't break correctness — run tests after.\n"
+        }
+        Some("analysis") => {
             "\n## Analysis Strategy\n\
              1. Gather data from multiple sources: code, git history, logs, docs.\n\
              2. Form hypotheses, then verify — don't jump to conclusions from a single signal.\n\
              3. Use git_blame + git_file_history for ownership/evolution questions.\n\
              4. Summarize findings with concrete evidence (file paths, line numbers, commit SHAs).\n\
-             5. Present: root cause → impact → recommendation.\n",
-        Some("deployment") =>
+             5. Present: root cause → impact → recommendation.\n"
+        }
+        Some("deployment") => {
             "\n## Deployment Strategy\n\
              1. Check CI status FIRST — don't deploy if builds are failing.\n\
              2. Review pending changes: git_status → git_diff → CI status.\n\
              3. Verify config files (env vars, secrets) are correct for target environment.\n\
-             4. Prefer incremental rollout over big-bang deployments.\n",
+             4. Prefer incremental rollout over big-bang deployments.\n"
+        }
         _ => "",
     }
 }
@@ -520,13 +528,34 @@ pub fn build_system_prompt_sections_with_style(
 
     // ── Global sections (stable across sessions) ──
     let mut sections = vec![
-        PromptSection { text: core_rules_section(), scope: CacheScope::Global },
-        PromptSection { text: planning_section().to_string(), scope: CacheScope::Global },
-        PromptSection { text: coding_discipline_section().to_string(), scope: CacheScope::Global },
-        PromptSection { text: parallel_and_efficiency_section().to_string(), scope: CacheScope::Global },
-        PromptSection { text: plan_execution_section().to_string(), scope: CacheScope::Global },
-        PromptSection { text: output_format_section().to_string(), scope: CacheScope::Global },
-        PromptSection { text: tool_error_recovery_section().to_string(), scope: CacheScope::Global },
+        PromptSection {
+            text: core_rules_section(),
+            scope: CacheScope::Global,
+        },
+        PromptSection {
+            text: planning_section().to_string(),
+            scope: CacheScope::Global,
+        },
+        PromptSection {
+            text: coding_discipline_section().to_string(),
+            scope: CacheScope::Global,
+        },
+        PromptSection {
+            text: parallel_and_efficiency_section().to_string(),
+            scope: CacheScope::Global,
+        },
+        PromptSection {
+            text: plan_execution_section().to_string(),
+            scope: CacheScope::Global,
+        },
+        PromptSection {
+            text: output_format_section().to_string(),
+            scope: CacheScope::Global,
+        },
+        PromptSection {
+            text: tool_error_recovery_section().to_string(),
+            scope: CacheScope::Global,
+        },
     ];
 
     // ── Session sections (stable within a session) ──
@@ -537,17 +566,26 @@ pub fn build_system_prompt_sections_with_style(
 
     let tool_cond = tool_conditional_section(tool_names, selection_confidence);
     if !tool_cond.is_empty() {
-        sections.push(PromptSection { text: tool_cond, scope: CacheScope::Session });
+        sections.push(PromptSection {
+            text: tool_cond,
+            scope: CacheScope::Session,
+        });
     }
 
     let tt = task_type_section(task_type);
     if !tt.is_empty() {
-        sections.push(PromptSection { text: tt.to_string(), scope: CacheScope::Session });
+        sections.push(PromptSection {
+            text: tt.to_string(),
+            scope: CacheScope::Session,
+        });
     }
 
     let ss = search_strategy_section(tool_names);
     if !ss.is_empty() {
-        sections.push(PromptSection { text: ss.to_string(), scope: CacheScope::Session });
+        sections.push(PromptSection {
+            text: ss.to_string(),
+            scope: CacheScope::Session,
+        });
     }
 
     // ── Dynamic sections (change every turn) ──
@@ -984,6 +1022,11 @@ mod tests {
         let p = build_main_system_prompt(&[], "", 0.5, None);
         assert!(p.contains("NO tools available"));
         assert!(p.contains("fake data"));
+        // No-tools mode uses a minimal prompt — CC skill awareness is omitted
+        assert!(
+            !p.contains("Claude Code"),
+            "no-tools prompt should not contain CC skill rule"
+        );
     }
 
     #[test]
@@ -1470,13 +1513,27 @@ mod tests {
         let sections = build_system_prompt_sections(&tools, "cwd: /tmp", 0.8, None);
 
         // Should have multiple Global sections, then Session, then None
-        let globals: Vec<_> = sections.iter().filter(|s| s.scope == CacheScope::Global).collect();
-        let sessions: Vec<_> = sections.iter().filter(|s| s.scope == CacheScope::Session).collect();
-        assert!(globals.len() >= 5, "should have multiple Global sections, got {}", globals.len());
+        let globals: Vec<_> = sections
+            .iter()
+            .filter(|s| s.scope == CacheScope::Global)
+            .collect();
+        let sessions: Vec<_> = sections
+            .iter()
+            .filter(|s| s.scope == CacheScope::Session)
+            .collect();
+        assert!(
+            globals.len() >= 5,
+            "should have multiple Global sections, got {}",
+            globals.len()
+        );
         assert!(!sessions.is_empty(), "should have Session sections");
 
         // First section should be Global
-        assert_eq!(sections[0].scope, CacheScope::Global, "first section should be Global");
+        assert_eq!(
+            sections[0].scope,
+            CacheScope::Global,
+            "first section should be Global"
+        );
 
         // Profile section should be CacheScope::None
         let profile = sections.iter().find(|s| s.scope == CacheScope::None);
@@ -1496,7 +1553,8 @@ mod tests {
         let sections = build_system_prompt_sections(&tools, "", 0.8, None);
 
         // Core rules are in the first Global section
-        let global_text: String = sections.iter()
+        let global_text: String = sections
+            .iter()
             .filter(|s| s.scope == CacheScope::Global)
             .map(|s| s.text.as_str())
             .collect();
@@ -1516,6 +1574,10 @@ mod tests {
             global_text.contains("Context Strategy"),
             "should contain context strategy"
         );
+        assert!(
+            global_text.contains("Claude Code skills"),
+            "should contain CC skill compatibility rule"
+        );
     }
 
     #[test]
@@ -1523,7 +1585,8 @@ mod tests {
         let tools = vec!["bash", "find_definition", "find_references", "git_commit"];
         let sections = build_system_prompt_sections(&tools, "", 0.8, Some("debugging"));
 
-        let session_text: String = sections.iter()
+        let session_text: String = sections
+            .iter()
             .filter(|s| s.scope == CacheScope::Session)
             .map(|s| s.text.as_str())
             .collect();
@@ -1604,7 +1667,8 @@ mod tests {
         let tools = vec!["bash"];
         let sections = build_system_prompt_sections(&tools, "", 0.1, None);
 
-        let session_text: String = sections.iter()
+        let session_text: String = sections
+            .iter()
             .filter(|s| s.scope == CacheScope::Session)
             .map(|s| s.text.as_str())
             .collect();
@@ -1774,7 +1838,8 @@ mod tests {
             "type_hierarchy",
         ];
         let sections = build_system_prompt_sections(&tools, "", 0.8, None);
-        let session_text: String = sections.iter()
+        let session_text: String = sections
+            .iter()
             .filter(|s| s.scope == CacheScope::Session)
             .map(|s| s.text.as_str())
             .collect();
@@ -1860,7 +1925,13 @@ mod tests {
             "should include style content"
         );
         // Output style should be in None scope (dynamic)
-        let style_section = sections.iter().find(|s| s.text.contains("Output Style: Concise"));
-        assert_eq!(style_section.unwrap().scope, CacheScope::None, "output style should be None-scoped");
+        let style_section = sections
+            .iter()
+            .find(|s| s.text.contains("Output Style: Concise"));
+        assert_eq!(
+            style_section.unwrap().scope,
+            CacheScope::None,
+            "output style should be None-scoped"
+        );
     }
 }

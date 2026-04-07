@@ -1,7 +1,9 @@
 //! Local filesystem skill provider — discovers and loads skills from SKILL.md files.
 //!
-//! Scans standard directories (`.astra/skills/`, `skills/`, `~/.astra/skills/`)
-//! for skill directories containing a `SKILL.md` file.
+//! Scans standard directories (`.astra/skills/`, `.claude/skills/`, `skills/`,
+//! `~/.astra/skills/`, `~/.claude/skills/`) for skill directories containing a
+//! `SKILL.md` file. Claude Code skills are discovered automatically since both
+//! tools follow the Agent Skills open standard.
 
 use async_trait::async_trait;
 use std::path::PathBuf;
