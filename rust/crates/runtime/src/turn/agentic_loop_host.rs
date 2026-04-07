@@ -59,6 +59,7 @@ use crate::pipeline::step_checkpoint;
 use crate::pipeline::step_protocol::{InMemoryIdempotencyCache, StepCheckpoint};
 use crate::pipeline::step_recorder::StepRecorder;
 use crate::semantic_dedup::SemanticDedup;
+use crate::str_preview::truncate_str;
 use crate::tool_registry::SelectionReport;
 use crate::turn::agentic_headless_round::{
     HeadlessRoundTerminal, HeadlessStderrStyle, run_agentic_headless_tool_round,
@@ -564,13 +565,7 @@ fn format_delegation_result(result: &astra_services::coordination::DelegationRes
         let output_preview = ar
             .output
             .as_deref()
-            .map(|o| {
-                if o.len() > 500 {
-                    format!("{}...", &o[..500])
-                } else {
-                    o.to_string()
-                }
-            })
+            .map(|o| truncate_str(o, 500))
             .unwrap_or_else(|| "[no output]".to_string());
         parts.push(format!(
             "\n{status_icon} Agent '{}' ({}): {output_preview}",
@@ -2639,8 +2634,8 @@ mod tests {
             total_tool_calls: 1,
         };
         let formatted = super::format_delegation_result(&result);
-        assert!(formatted.contains("..."));
-        // Output should be truncated to ~500 chars + "..."
+        assert!(formatted.contains('…'));
+        // Output should be truncated to 500 Unicode scalars + ellipsis
         assert!(formatted.len() < 1500);
     }
 

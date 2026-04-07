@@ -944,7 +944,8 @@ pub(super) fn handle_session_command(arg: &str, state: &mut ReplState) {
             eprintln!("{}", format!("  Unknown subcommand: {other}").red());
             eprintln!(
                 "  {}",
-                "Usage: /session [history|list|errors|export|fork] …  (export → Markdown file)".dim()
+                "Usage: /session [history|list|errors|export|fork] …  (export → Markdown file)"
+                    .dim()
             );
         }
     }
@@ -973,7 +974,10 @@ fn format_tool_calls_md(calls: &[session_journal::ToolCallRecord]) -> String {
             } else {
                 preview.clone()
             };
-            out.push_str(&format!("  > ```\n  > {}\n  > ```\n", short.replace('\n', "\n  > ")));
+            out.push_str(&format!(
+                "  > ```\n  > {}\n  > ```\n",
+                short.replace('\n', "\n  > ")
+            ));
         }
     }
     out.push_str("\n</details>\n\n");

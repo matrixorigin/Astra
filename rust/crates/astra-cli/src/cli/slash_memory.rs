@@ -183,7 +183,7 @@ pub(super) async fn handle_memory_domain_command(
                                             .and_then(|v| v.as_str())
                                             .unwrap_or("?");
                                         let id = m.get("id").and_then(|v| v.as_str()).unwrap_or("");
-                                        let short_id = if id.len() > 8 { &id[..8] } else { id };
+                                        let short_id = prefix_chars(id, 8);
                                         // Use protocol-aware display
                                         let display = if let Some(entry) =
                                             prompts::memory_proto::MemoryEntry::parse(content)
@@ -997,7 +997,7 @@ pub(super) async fn handle_memory_domain_command(
                                                                 "  {} Template extracted: {} → {}",
                                                                 "📝".cyan(),
                                                                 goal_pattern.dim(),
-                                                                &template_id[..8]
+                                                                prefix_chars(&template_id, 8)
                                                             );
                                                         }
                                                         Ok(None) => {} // Not eligible

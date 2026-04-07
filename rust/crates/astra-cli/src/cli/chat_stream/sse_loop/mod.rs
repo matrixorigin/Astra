@@ -109,23 +109,33 @@ pub(crate) async fn stream_chat_sse(
     let valid_tool_names = openai_tool_names_from_schemas(&all_schemas);
 
     // --allowed-tools: if set, restrict to only the specified tools
-    let mut initial_restricted: HashSet<String> = if let Ok(allowed_csv) = std::env::var("ASTRA_ALLOWED_TOOLS") {
-        let allowed: HashSet<&str> = allowed_csv.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
-        if !allowed.is_empty() {
-            valid_tool_names.iter()
-                .filter(|name| !allowed.contains(name.as_str()))
-                .cloned()
-                .collect()
+    let mut initial_restricted: HashSet<String> =
+        if let Ok(allowed_csv) = std::env::var("ASTRA_ALLOWED_TOOLS") {
+            let allowed: HashSet<&str> = allowed_csv
+                .split(',')
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .collect();
+            if !allowed.is_empty() {
+                valid_tool_names
+                    .iter()
+                    .filter(|name| !allowed.contains(name.as_str()))
+                    .cloned()
+                    .collect()
+            } else {
+                HashSet::new()
+            }
         } else {
             HashSet::new()
-        }
-    } else {
-        HashSet::new()
-    };
+        };
 
     // --disallowed-tools: directly add to restricted set
     if let Ok(denied_csv) = std::env::var("ASTRA_DISALLOWED_TOOLS") {
-        for name in denied_csv.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        for name in denied_csv
+            .split(',')
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+        {
             initial_restricted.insert(name.to_string());
         }
     }
@@ -190,7 +200,9 @@ pub(crate) async fn stream_chat_sse(
         approval_request_tx: p.approval_request_tx,
     };
 
-    let bare_mode = std::env::var("ASTRA_BARE").map(|v| v == "1").unwrap_or(false);
+    let bare_mode = std::env::var("ASTRA_BARE")
+        .map(|v| v == "1")
+        .unwrap_or(false);
     let hook_sets = if bare_mode {
         // Bare mode: skip all hooks
         astra_runtime::turn::stop_hooks_yaml::TurnHookSets::default()
@@ -300,8 +312,16 @@ pub(crate) async fn stream_chat_sse(
         pinned_skills: std::collections::HashSet::new(),
         discovered_skills,
         skill_search: p.skill_search.clone(),
-        tool_event_hooks: if bare_mode { Default::default() } else { astra_runtime::skills::hooks::load_tool_event_hooks(&project_root) },
-        session_event_hooks: if bare_mode { Default::default() } else { astra_runtime::skills::hooks::load_session_event_hooks(&project_root) },
+        tool_event_hooks: if bare_mode {
+            Default::default()
+        } else {
+            astra_runtime::skills::hooks::load_tool_event_hooks(&project_root)
+        },
+        session_event_hooks: if bare_mode {
+            Default::default()
+        } else {
+            astra_runtime::skills::hooks::load_session_event_hooks(&project_root)
+        },
         stop_hooks: hook_sets.stop_hooks,
         stop_hook_runs: 0,
         teammate_idle_hooks: hook_sets.teammate_idle_hooks,

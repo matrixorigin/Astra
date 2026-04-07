@@ -15,6 +15,7 @@ use std::{
     time::Duration,
 };
 
+use astra_runtime::str_preview::truncate_str;
 use astra_runtime::tool_sandbox::{
     SandboxMode, SandboxPolicy, sandbox_command, validate_path, wrap_command_with_limits,
 };
@@ -3938,11 +3939,7 @@ impl ToolExecutor {
                         conf,
                     ));
                     if !fix.new_text.is_empty() {
-                        let text = if fix.new_text.len() > 80 {
-                            format!("{}...", &fix.new_text[..77])
-                        } else {
-                            fix.new_text.clone()
-                        };
+                        let text = truncate_str(&fix.new_text, 77);
                         preview.push_str(&format!("     + {}\n", text));
                     }
                 }
@@ -4179,11 +4176,7 @@ impl ToolExecutor {
                 parts.push(format!("  → {}:{}", fix.file, fix.line));
                 if !fix.new_text.is_empty() {
                     // Show what to insert/replace
-                    let preview = if fix.new_text.len() > 80 {
-                        format!("{}...", &fix.new_text[..77])
-                    } else {
-                        fix.new_text.clone()
-                    };
+                    let preview = truncate_str(&fix.new_text, 77);
                     parts.push(format!("  + {}", preview));
                 }
                 let _ = err_idx; // used for ordering

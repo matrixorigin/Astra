@@ -122,9 +122,7 @@ const MAX_GIT_STAT_BYTES: usize = 4096;
 
 /// Run `git diff --stat` (staged or unstaged), returning a compact summary.
 fn git_diff_stat(project_root: &Path, staged: bool) -> Option<String> {
-    let mut args = vec![
-        "diff", "--stat", "--stat-width=80", "--no-color",
-    ];
+    let mut args = vec!["diff", "--stat", "--stat-width=80", "--no-color"];
     if staged {
         args.push("--cached");
     }
@@ -137,7 +135,8 @@ fn git_diff_stat(project_root: &Path, staged: bool) -> Option<String> {
         .map(|s| {
             let s = s.trim().to_string();
             if s.len() > MAX_GIT_STAT_BYTES {
-                format!("{}… (truncated)", &s[..MAX_GIT_STAT_BYTES])
+                let end = s.floor_char_boundary(MAX_GIT_STAT_BYTES);
+                format!("{}… (truncated)", &s[..end])
             } else {
                 s
             }

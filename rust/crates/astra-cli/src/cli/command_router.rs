@@ -318,7 +318,10 @@ pub(super) async fn execute_cli_command(
                     });
                     PermissionManager::with_project_mode(mode, &project_root)
                 } else {
-                    PermissionManager::with_project(args.auto_approve || auto_approve, &project_root)
+                    PermissionManager::with_project(
+                        args.auto_approve || auto_approve,
+                        &project_root,
+                    )
                 }
             };
             let explain_mode = if args.explain {
@@ -827,7 +830,9 @@ pub(super) async fn run_print_mode(
         render_md: false,
         history: &[],
         perm_manager: &mut pm,
-        verbose_mode: std::env::var("ASTRA_VERBOSE").map(|v| v == "1").unwrap_or(false),
+        verbose_mode: std::env::var("ASTRA_VERBOSE")
+            .map(|v| v == "1")
+            .unwrap_or(false),
         quiet: true,
         suppress_intermediate_output: true,
         selector: &*selector.0,
@@ -863,7 +868,9 @@ pub(super) async fn run_print_mode(
                 render_md: false,
                 history: &[],
                 perm_manager: &mut pm,
-                verbose_mode: std::env::var("ASTRA_VERBOSE").map(|v| v == "1").unwrap_or(false),
+                verbose_mode: std::env::var("ASTRA_VERBOSE")
+                    .map(|v| v == "1")
+                    .unwrap_or(false),
                 quiet: true,
                 suppress_intermediate_output: true,
                 selector: &*selector.0,
@@ -1099,7 +1106,8 @@ pub(super) fn load_mcp_configs(sources: &[String]) -> Result<(), String> {
             }
         } else {
             return Err(format!(
-                "MCP config from '{}' must contain a \"mcpServers\" object", source
+                "MCP config from '{}' must contain a \"mcpServers\" object",
+                source
             ));
         }
     }
@@ -1385,18 +1393,23 @@ fn write_settings(settings: &serde_json::Map<String, serde_json::Value>) -> Resu
     }
     let val = serde_json::Value::Object(settings.clone());
     let pretty = serde_json::to_string_pretty(&val).unwrap_or_default();
-    std::fs::write(&path, &pretty)
-        .map_err(|e| format!("Failed to write {}: {e}", path.display()))
+    std::fs::write(&path, &pretty).map_err(|e| format!("Failed to write {}: {e}", path.display()))
 }
 
 /// Known setting keys with descriptions for list/help.
 const KNOWN_SETTINGS: &[(&str, &str)] = &[
-    ("default_model", "Default model for chat (e.g. gpt-4o, claude-3.5-sonnet)"),
+    (
+        "default_model",
+        "Default model for chat (e.g. gpt-4o, claude-3.5-sonnet)",
+    ),
     ("verbose", "Enable verbose output (true/false)"),
     ("auto_approve", "Auto-approve tool calls (true/false)"),
     ("api_url", "API server URL"),
     ("theme", "Color theme (auto/dark/light)"),
-    ("permission_mode", "Default permission mode (auto/prompt/deny)"),
+    (
+        "permission_mode",
+        "Default permission mode (auto/prompt/deny)",
+    ),
 ];
 
 fn execute_config_command(cmd: ConfigCmd) -> Result<(), String> {
@@ -1704,13 +1717,17 @@ mod mcp_cli_tests {
         std::fs::write(
             &config_file,
             r#"{"mcpServers":{"test-server":{"command":"echo","args":["hello"]}}}"#,
-        ).unwrap();
+        )
+        .unwrap();
 
         // We can't easily test load_mcp_configs (needs project_mcp_json_path),
         // but we can test the JSON parsing logic directly
         let json_str = std::fs::read_to_string(&config_file).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json_str).unwrap();
-        let servers = parsed.get("mcpServers").and_then(|v| v.as_object()).unwrap();
+        let servers = parsed
+            .get("mcpServers")
+            .and_then(|v| v.as_object())
+            .unwrap();
         assert!(servers.contains_key("test-server"));
         assert_eq!(servers["test-server"]["command"], "echo");
         assert_eq!(servers["test-server"]["args"][0], "hello");
@@ -1742,7 +1759,10 @@ mod config_cli_tests {
         let path = dir.path().join("settings.json");
 
         let mut settings = serde_json::Map::new();
-        settings.insert("default_model".to_string(), serde_json::Value::String("gpt-4o".into()));
+        settings.insert(
+            "default_model".to_string(),
+            serde_json::Value::String("gpt-4o".into()),
+        );
         settings.insert("verbose".to_string(), serde_json::Value::Bool(true));
 
         let val = serde_json::Value::Object(settings.clone());
@@ -1793,15 +1813,26 @@ mod config_cli_tests {
         // Initial
         let mut settings = serde_json::Map::new();
         settings.insert("key".to_string(), serde_json::Value::String("v1".into()));
-        std::fs::write(&path, serde_json::to_string_pretty(&serde_json::Value::Object(settings)).unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            serde_json::to_string_pretty(&serde_json::Value::Object(settings)).unwrap(),
+        )
+        .unwrap();
 
         // Overwrite
         let content = std::fs::read_to_string(&path).unwrap();
         let mut loaded: serde_json::Map<String, serde_json::Value> =
-            serde_json::from_str::<serde_json::Value>(&content).unwrap()
-                .as_object().unwrap().clone();
+            serde_json::from_str::<serde_json::Value>(&content)
+                .unwrap()
+                .as_object()
+                .unwrap()
+                .clone();
         loaded.insert("key".to_string(), serde_json::Value::String("v2".into()));
-        std::fs::write(&path, serde_json::to_string_pretty(&serde_json::Value::Object(loaded)).unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            serde_json::to_string_pretty(&serde_json::Value::Object(loaded)).unwrap(),
+        )
+        .unwrap();
 
         let content = std::fs::read_to_string(&path).unwrap();
         let final_val: serde_json::Value = serde_json::from_str(&content).unwrap();
@@ -1839,7 +1870,10 @@ mod config_cli_tests {
 
     #[test]
     fn config_value_parsing_strings() {
-        assert_eq!(parse_value("gpt-4o"), serde_json::Value::String("gpt-4o".into()));
+        assert_eq!(
+            parse_value("gpt-4o"),
+            serde_json::Value::String("gpt-4o".into())
+        );
         assert_eq!(parse_value(""), serde_json::Value::String("".into()));
     }
 
@@ -1911,32 +1945,34 @@ mod exit_code_tests {
     #[test]
     fn exit_code_tool_failure_on_failed_tool() {
         let mut sr = empty_stream_result();
-        sr.tool_call_records.push(astra_services::session_journal::ToolCallRecord {
-            name: "Bash".to_string(),
-            ok: false,
-            ms: 100,
-            error: Some("exit code 1".to_string()),
-            input_bytes: None,
-            output_bytes: None,
-            args_preview: None,
-            result_preview: None,
-        });
+        sr.tool_call_records
+            .push(astra_services::session_journal::ToolCallRecord {
+                name: "Bash".to_string(),
+                ok: false,
+                ms: 100,
+                error: Some("exit code 1".to_string()),
+                input_bytes: None,
+                output_bytes: None,
+                args_preview: None,
+                result_preview: None,
+            });
         assert_eq!(compute_exit_code(&sr), ExitCode::ToolFailure);
     }
 
     #[test]
     fn exit_code_force_stop_overrides_tool_failure() {
         let mut sr = empty_stream_result();
-        sr.tool_call_records.push(astra_services::session_journal::ToolCallRecord {
-            name: "Bash".to_string(),
-            ok: false,
-            ms: 100,
-            error: None,
-            input_bytes: None,
-            output_bytes: None,
-            args_preview: None,
-            result_preview: None,
-        });
+        sr.tool_call_records
+            .push(astra_services::session_journal::ToolCallRecord {
+                name: "Bash".to_string(),
+                ok: false,
+                ms: 100,
+                error: None,
+                input_bytes: None,
+                output_bytes: None,
+                args_preview: None,
+                result_preview: None,
+            });
         sr.verdict_events.push(VerdictEvent {
             turn: 1,
             severity: "critical".to_string(),
@@ -1956,26 +1992,28 @@ mod exit_code_tests {
     #[test]
     fn exit_code_success_when_all_tools_ok() {
         let mut sr = empty_stream_result();
-        sr.tool_call_records.push(astra_services::session_journal::ToolCallRecord {
-            name: "Read".to_string(),
-            ok: true,
-            ms: 50,
-            error: None,
-            input_bytes: None,
-            output_bytes: None,
-            args_preview: None,
-            result_preview: None,
-        });
-        sr.tool_call_records.push(astra_services::session_journal::ToolCallRecord {
-            name: "Edit".to_string(),
-            ok: true,
-            ms: 80,
-            error: None,
-            input_bytes: None,
-            output_bytes: None,
-            args_preview: None,
-            result_preview: None,
-        });
+        sr.tool_call_records
+            .push(astra_services::session_journal::ToolCallRecord {
+                name: "Read".to_string(),
+                ok: true,
+                ms: 50,
+                error: None,
+                input_bytes: None,
+                output_bytes: None,
+                args_preview: None,
+                result_preview: None,
+            });
+        sr.tool_call_records
+            .push(astra_services::session_journal::ToolCallRecord {
+                name: "Edit".to_string(),
+                ok: true,
+                ms: 80,
+                error: None,
+                input_bytes: None,
+                output_bytes: None,
+                args_preview: None,
+                result_preview: None,
+            });
         assert_eq!(compute_exit_code(&sr), ExitCode::Success);
     }
 
@@ -2001,8 +2039,6 @@ mod exit_code_tests {
 
 #[cfg(test)]
 mod default_model_tests {
-    use super::*;
-
     #[test]
     fn read_config_default_model_from_file() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -2017,21 +2053,30 @@ mod default_model_tests {
         // extraction logic directly
         let content = std::fs::read_to_string(&path).unwrap();
         let val: serde_json::Value = serde_json::from_str(&content).unwrap();
-        let model = val.get("default_model").and_then(|v| v.as_str()).map(|s| s.to_string());
+        let model = val
+            .get("default_model")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
         assert_eq!(model, Some("gpt-4o".to_string()));
     }
 
     #[test]
     fn read_config_default_model_missing_key() {
         let settings = serde_json::json!({ "verbose": true });
-        let model = settings.get("default_model").and_then(|v| v.as_str()).map(|s| s.to_string());
+        let model = settings
+            .get("default_model")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
         assert_eq!(model, None);
     }
 
     #[test]
     fn read_config_default_model_non_string_value() {
         let settings = serde_json::json!({ "default_model": 42 });
-        let model = settings.get("default_model").and_then(|v| v.as_str()).map(|s| s.to_string());
+        let model = settings
+            .get("default_model")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
         assert_eq!(model, None); // non-string returns None
     }
 }

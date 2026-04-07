@@ -4,6 +4,8 @@
 //! so plan execution can show contract generation, verification results, and delivery
 //! reports in a user-friendly way.
 
+use crate::cli_utils::{prefix_chars, truncate_str};
+
 use astra_runtime::{GateVerdict, VerificationGate};
 use astra_services::coordination::AgentResult;
 use astra_services::{
@@ -127,7 +129,7 @@ fn display_contract_summary(contract: &TaskContract) {
         n_subtasks,
         n_criteria,
         n_global,
-        &contract.contract_id[..8],
+        prefix_chars(&contract.contract_id, 8),
     );
 }
 
@@ -1196,7 +1198,7 @@ impl astra_services::LlmJudge for HttpLlmJudge {
             let text = resp.text().await.unwrap_or_default();
             return Err(format!(
                 "LLM API error {status}: {}",
-                &text[..text.len().min(200)]
+                truncate_str(&text, 200)
             ));
         }
 
@@ -1251,7 +1253,7 @@ fn parse_judge_score(text: &str) -> Result<f64, String> {
 
     Err(format!(
         "Could not extract score from LLM response: {}",
-        &text[..text.len().min(200)]
+        truncate_str(text, 200)
     ))
 }
 

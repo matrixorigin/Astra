@@ -22,7 +22,10 @@ impl std::fmt::Debug for Profile {
             .field("access_token", &self.access_token.as_ref().map(|_| "***"))
             .field("refresh_token", &self.refresh_token.as_ref().map(|_| "***"))
             .field("last_session_id", &self.last_session_id)
-            .field("memoria_api_key", &self.memoria_api_key.as_ref().map(|_| "***"))
+            .field(
+                "memoria_api_key",
+                &self.memoria_api_key.as_ref().map(|_| "***"),
+            )
             .finish()
     }
 }
@@ -402,7 +405,7 @@ pub(crate) fn print_markdown_width(text: &str, width: Option<usize>) {
     print!("{}", fmt);
 }
 
-pub(super) use astra_runtime::turn::headless_tool_status_display::truncate_str;
+pub(crate) use astra_runtime::str_preview::{prefix_chars, truncate_str};
 
 pub(super) fn urlencoding(s: &str) -> String {
     s.chars()

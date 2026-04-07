@@ -762,10 +762,7 @@ fn build_tool_select_prompt(
     learned_context: &LearnedContext,
     catalog: &str,
 ) -> Vec<Value> {
-    let system = format!(
-        "{}\n\nDynamic tools:\n{}",
-        TOOL_SELECT_SYSTEM, catalog
-    );
+    let system = format!("{}\n\nDynamic tools:\n{}", TOOL_SELECT_SYSTEM, catalog);
     let mut user_msg = format!("Query: {}", query);
     if !recent_tools.is_empty() {
         user_msg.push_str(&format!("\nRecently used: {:?}", recent_tools));

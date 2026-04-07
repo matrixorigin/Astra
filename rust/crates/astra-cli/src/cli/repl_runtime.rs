@@ -638,11 +638,11 @@ pub(super) fn print_repl_banner(profile: Option<&str>, state: &ReplState) {
 fn banner_session_display(state: &ReplState) -> String {
     match state.session_id.as_deref() {
         Some(s) => {
-            let short = if s.len() > 8 { &s[..8] } else { s };
+            let short = prefix_chars(s, 8);
             if state.turn > 0 {
                 format!("{short} (resumed)")
             } else {
-                short.to_string()
+                short
             }
         }
         None => "new".to_string(),

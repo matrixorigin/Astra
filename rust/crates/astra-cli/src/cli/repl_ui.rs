@@ -11,7 +11,10 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
         "/checkpoint",
         "Manual save: /checkpoint [label] — JSON + session md + journal",
     ),
-    ("/history", "Conversation turns; /history grep <q> filters in-memory"),
+    (
+        "/history",
+        "Conversation turns; /history grep <q> filters in-memory",
+    ),
     ("/copy", "Copy last response to clipboard"),
     (
         "/grep",
@@ -44,7 +47,10 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
         "/session list",
         "All journals + cwd / git / age from workspace",
     ),
-    ("/plan", "Structured plan: on|off|list|status|pause|resume|…"),
+    (
+        "/plan",
+        "Structured plan: on|off|list|status|pause|resume|…",
+    ),
     ("/plan on", "Plan-only chat until /plan off"),
     ("/plan off", "Exit plan-only chat"),
     ("/plan list", "List plan history"),
@@ -55,15 +61,24 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/report", "Last delivery report (/report save = JSON)"),
     // ── Memory & tasks ────────────────────────────────────────────────────
     ("/memory", "Memoria: list, search <q>, inspect <id>, …"),
-    ("/task", "Tasks: list, add, done, status, run <prompt>, result <id>"),
+    (
+        "/task",
+        "Tasks: list, add, done, status, run <prompt>, result <id>",
+    ),
     // ── State & reflection ───────────────────────────────────────────────
     (
         "/explain",
         "Cycle explain: off → on (API) → verbose (+stderr)",
     ),
     ("/verbose", "Verbose streaming on"),
-    ("/compact", "Summarize & trim history (quick | no-memoria, …)"),
-    ("/reflect", "Reflect on session (modes: skill_failure, performance, …)"),
+    (
+        "/compact",
+        "Summarize & trim history (quick | no-memoria, …)",
+    ),
+    (
+        "/reflect",
+        "Reflect on session (modes: skill_failure, performance, …)",
+    ),
     // ── Observability ─────────────────────────────────────────────────────
     (
         "/turn",
@@ -106,10 +121,7 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
         "/style",
         "Output theme: default | minimal | colorful | high-contrast",
     ),
-    (
-        "/diagnostics",
-        "Binary, API, auth, environment checks",
-    ),
+    ("/diagnostics", "Binary, API, auth, environment checks"),
 ];
 
 fn command_matches_filter(command: &str, desc: &str, filter: &str) -> bool {
@@ -274,7 +286,10 @@ const SLASH_FIRST_TOKEN_COMPLETIONS: &[(&str, &[(&str, &str)])] = &[
         "/mcp",
         &[
             ("add", "Add: /mcp add <name> <command> [args…]"),
-            ("complete", "Completions: /mcp complete <server>:prompt:<name> <arg> [value]"),
+            (
+                "complete",
+                "Completions: /mcp complete <server>:prompt:<name> <arg> [value]",
+            ),
             ("log-level", "Set level: /mcp log-level <server> <level>"),
             ("ping", "Ping: /mcp ping [server]"),
             ("prompt", "Invoke: /mcp prompt <server>:<name> [args]"),
@@ -285,7 +300,10 @@ const SLASH_FIRST_TOKEN_COMPLETIONS: &[(&str, &[(&str, &str)])] = &[
             ("servers", "Show server details and tools"),
             ("status", "Show connection status table"),
             ("subscribe", "Subscribe: /mcp subscribe <server>:<uri>"),
-            ("unsubscribe", "Unsubscribe: /mcp unsubscribe <server>:<uri>"),
+            (
+                "unsubscribe",
+                "Unsubscribe: /mcp unsubscribe <server>:<uri>",
+            ),
         ],
     ),
     (
@@ -351,12 +369,7 @@ const SLASH_FIRST_TOKEN_COMPLETIONS: &[(&str, &[(&str, &str)])] = &[
             ("unstaged", "Unstaged only"),
         ],
     ),
-    (
-        "/turn",
-        &[
-            ("list", "List all journal turns"),
-        ],
-    ),
+    ("/turn", &[("list", "List all journal turns")]),
     (
         "/search",
         &[

@@ -331,11 +331,7 @@ pub(super) fn handle_team_command(arg: &str, state: &mut super::ReplState) {
                     if !t.shared_context.is_empty() {
                         eprintln!("\n  {}", "Shared Context:".bold());
                         for (k, v) in &t.shared_context {
-                            let preview = if v.len() > 60 {
-                                format!("{}...", &v[..60])
-                            } else {
-                                v.clone()
-                            };
+                            let preview = truncate_str(v, 60);
                             eprintln!("    {} = {}", k.as_str().cyan(), preview);
                         }
                     }
@@ -384,11 +380,7 @@ pub(super) fn handle_team_command(arg: &str, state: &mut super::ReplState) {
                         "  {} Set context '{}'='{}' on team '{}'",
                         theme::icon_ok(),
                         key,
-                        if value.len() > 40 {
-                            format!("{}...", &value[..40])
-                        } else {
-                            value.to_string()
-                        },
+                        truncate_str(value, 40),
                         team.cyan()
                     );
                 }

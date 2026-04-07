@@ -96,8 +96,7 @@ pub fn write_checkpoint(session_id: &str, checkpoint: &Checkpoint) -> std::io::R
 
     // Symlink safety: verify the checkpoint directory resolves within the session dir
     let canonical_dir = dir.canonicalize()?;
-    let session_dir =
-        super::session_workspace::workspace_dir_for(session_id).canonicalize()?;
+    let session_dir = super::session_workspace::workspace_dir_for(session_id).canonicalize()?;
     if !canonical_dir.starts_with(&session_dir) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,

@@ -64,8 +64,10 @@ pub fn format_token_count_compact(tokens: u64) -> String {
 pub fn session_id_footer_abbrev(session_id: Option<&str>) -> &str {
     match session_id {
         None => "?",
-        Some(s) if s.len() > 8 => &s[..8],
-        Some(s) => s,
+        Some(s) => match s.char_indices().nth(8) {
+            None => s,
+            Some((byte_idx, _)) => &s[..byte_idx],
+        },
     }
 }
 
@@ -153,6 +155,10 @@ mod tests {
         assert_eq!(session_id_footer_abbrev(Some("")), "");
         assert_eq!(session_id_footer_abbrev(Some("abc")), "abc");
         assert_eq!(session_id_footer_abbrev(Some("1234567890")), "12345678");
+        assert_eq!(
+            session_id_footer_abbrev(Some("数据数据数据数据数据数据数据数据数据")),
+            "数据数据数据数据"
+        );
     }
 
     #[test]

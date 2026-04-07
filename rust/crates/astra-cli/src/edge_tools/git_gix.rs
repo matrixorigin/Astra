@@ -60,10 +60,7 @@ pub(crate) fn head_short(project_root: &Path) -> String {
         Err(_) => return String::new(),
     };
     match repo.head_id() {
-        Ok(id) => {
-            let hex = id.to_string();
-            hex[..hex.len().min(7)].to_string()
-        }
+        Ok(id) => id.to_hex_with_len(7).to_string(),
         Err(_) => String::new(),
     }
 }
@@ -92,7 +89,10 @@ pub(crate) fn git_status(project_root: &Path) -> String {
             let name = r.name().shorten().to_string();
             out.push_str(&format!("## {name}\n"));
         } else if let Ok(head) = repo.head_id() {
-            out.push_str(&format!("## HEAD detached at {}\n", &head.to_string()[..8]));
+            out.push_str(&format!(
+                "## HEAD detached at {}\n",
+                head.to_hex_with_len(8)
+            ));
         }
     }
 
@@ -2005,6 +2005,7 @@ fn worktree_remove(project_root: &Path, args: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use astra_runtime::str_preview::prefix_chars;
     use serde_json::json;
 
     fn repo_root() -> std::path::PathBuf {
@@ -2033,8 +2034,9 @@ mod tests {
         let lines: Vec<&str> = result.lines().collect();
         assert!(!lines.is_empty(), "log should return commits");
         let first = lines[0];
+        let hash_prefix = prefix_chars(first, 7);
         assert!(
-            first.len() >= 7 && first[..7].chars().all(|c| c.is_ascii_hexdigit()),
+            hash_prefix.chars().count() == 7 && hash_prefix.chars().all(|c| c.is_ascii_hexdigit()),
             "first log line should start with hash: {first}"
         );
     }
@@ -2359,8 +2361,10 @@ mod tests {
         let result = git_log(&root, &json!({"n": 5}));
         for line in result.lines().filter(|l| !l.is_empty()) {
             // Each line should start with a 7-char hex hash
+            let hash_prefix = prefix_chars(line, 7);
             assert!(
-                line.len() >= 7 && line[..7].chars().all(|c| c.is_ascii_hexdigit()),
+                hash_prefix.chars().count() == 7
+                    && hash_prefix.chars().all(|c| c.is_ascii_hexdigit()),
                 "log line should start with hash: {line}"
             );
             // Should have a space after the hash
@@ -2613,7 +2617,11 @@ mod tests {
         let root = repo_root();
         let short = head_short(&root);
         assert!(!short.is_empty(), "should return a short hash");
-        assert!(short.len() <= 7, "should be at most 7 chars: {short}");
+        assert_eq!(
+            short.len(),
+            7,
+            "to_hex_with_len(7) yields 7 hex chars: {short}"
+        );
         assert!(
             short.chars().all(|c| c.is_ascii_hexdigit()),
             "should be hex: {short}"

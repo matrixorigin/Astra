@@ -1060,8 +1060,7 @@ impl McpClientManager {
     /// Each schema follows the OpenAI function-calling format with `mcp_<server>_<name>` naming.
     /// Warns and deduplicates on name collisions after sanitization.
     pub fn all_tool_schemas(&self) -> Vec<serde_json::Value> {
-        let mut seen: std::collections::HashMap<String, &str> =
-            std::collections::HashMap::new();
+        let mut seen: std::collections::HashMap<String, &str> = std::collections::HashMap::new();
         let mut schemas = Vec::new();
         let mut collision_count = 0usize;
         for (server, tool) in self.all_tools() {
@@ -1561,9 +1560,7 @@ async fn connect_stdio(
     // escalation or library injection attacks.
     for (key, value) in env {
         if is_dangerous_env_var(key) {
-            eprintln!(
-                "  ⚠ MCP server '{name}': blocked dangerous env var '{key}'"
-            );
+            eprintln!("  ⚠ MCP server '{name}': blocked dangerous env var '{key}'");
             continue;
         }
         cmd.env(key, value);
@@ -1867,7 +1864,7 @@ const BLOCKED_ENV_PREFIXES: &[&str] = &[
     "LD_",           // LD_PRELOAD, LD_LIBRARY_PATH — library injection
     "DYLD_",         // macOS equivalent of LD_*
     "SUDO_",         // SUDO_ASKPASS, SUDO_USER — privilege escalation
-    "SSH_AUTH_SOCK",  // SSH agent socket hijacking
+    "SSH_AUTH_SOCK", // SSH agent socket hijacking
 ];
 
 const BLOCKED_ENV_EXACT: &[&str] = &[
@@ -3616,9 +3613,8 @@ mcp_servers:
         use rmcp::model::{Content, RawContent};
         // Create a result that exceeds the limit
         let long_text = "x".repeat(500);
-        let result = CallToolResult::success(vec![
-            Content::new(RawContent::text(&long_text), None),
-        ]);
+        let result =
+            CallToolResult::success(vec![Content::new(RawContent::text(&long_text), None)]);
         let text = extract_result_text_with_limit(&result, 100);
         assert!(text.contains("[OUTPUT TRUNCATED"));
         assert!(text.len() < 500);

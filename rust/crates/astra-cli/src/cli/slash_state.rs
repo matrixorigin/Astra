@@ -110,19 +110,12 @@ pub(super) async fn handle_state_command(
                     undone_previews[0].as_str().dim()
                 );
             } else {
-                eprintln!(
-                    "  {} Undid {} turns:",
-                    theme::icon_ok(),
-                    actual,
-                );
+                eprintln!("  {} Undid {} turns:", theme::icon_ok(), actual,);
                 for (i, preview) in undone_previews.iter().enumerate() {
                     eprintln!("    {}. {}", actual - i, preview.as_str().dim());
                 }
             }
-            eprintln!(
-                "  {} turns remaining in context",
-                state.history.len()
-            );
+            eprintln!("  {} turns remaining in context", state.history.len());
             if let Some(ref j) = state.journal {
                 let _ = j.append(&session_journal::JournalEvent::config_change(
                     state.session_id.as_deref(),
@@ -625,11 +618,7 @@ fn render_reflect_report(body: &str, session_id: &str) {
     };
 
     let overview = &report["overview"];
-    let short_sid = if session_id.len() > 8 {
-        &session_id[..8]
-    } else {
-        session_id
-    };
+    let short_sid = prefix_chars(session_id, 8);
 
     // Header
     eprintln!(
@@ -803,10 +792,9 @@ mod tests {
     fn state_with_turns(n: usize) -> ReplState {
         let mut state = ReplState::default();
         for i in 0..n {
-            state.history.push((
-                format!("question {}", i + 1),
-                format!("answer {}", i + 1),
-            ));
+            state
+                .history
+                .push((format!("question {}", i + 1), format!("answer {}", i + 1)));
             state.turn += 1;
         }
         state.last_response = state.history.last().map(|(_, r)| r.clone());
@@ -863,7 +851,7 @@ mod tests {
 
     #[test]
     fn undo_empty_history_is_noop() {
-        let mut state = state_with_turns(0);
+        let state = state_with_turns(0);
         assert!(state.history.is_empty());
         // /undo on empty should not panic
         let count = 1usize.min(state.history.len());
