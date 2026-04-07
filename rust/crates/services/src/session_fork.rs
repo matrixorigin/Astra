@@ -10,6 +10,7 @@
 
 use crate::session_journal::{
     JournalEvent, JournalEventType, JournalWriter, SessionLineage, journal_file_path, read_journal,
+    validate_session_id,
 };
 use crate::session_workspace::{self, WorkspaceMetadata};
 use serde::{Deserialize, Serialize};
@@ -74,12 +75,16 @@ pub fn fork_local_session(opts: ForkSessionOptions) -> Result<ForkSessionResult,
     if parent.is_empty() {
         return Err("parent_session_id is empty".into());
     }
+    validate_session_id(&parent)
+        .map_err(|e| format!("invalid parent session ID: {e}"))?;
 
     let new_id = opts
         .new_session_id
         .filter(|s| !s.trim().is_empty())
         .map(|s| s.trim().to_string())
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    validate_session_id(&new_id)
+        .map_err(|e| format!("invalid new session ID: {e}"))?;
 
     let dest = journal_file_path(&new_id);
     if dest.exists() {

@@ -957,6 +957,15 @@ pub async fn push_plan_state_to_cloud(
 pub fn extract_plan_from_metadata(
     metadata_json: &str,
 ) -> (Option<String>, Option<String>, Option<String>, usize) {
+    // Defense: reject excessively large metadata to prevent DoS
+    const MAX_METADATA_SIZE: usize = 512 * 1024; // 512 KB
+    if metadata_json.len() > MAX_METADATA_SIZE {
+        eprintln!(
+            "[WARN] session metadata too large ({} bytes), skipping plan extraction",
+            metadata_json.len()
+        );
+        return (None, None, None, 0);
+    }
     let parsed: serde_json::Value = match serde_json::from_str(metadata_json) {
         Ok(v) => v,
         Err(_) => return (None, None, None, 0),
