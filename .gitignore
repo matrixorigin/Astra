@@ -45,11 +45,9 @@ yarn-error.log*
 # Rust
 rust/target/
 
-# Agent tool configs (user-local, not committed)
-.cursor/
-.claude/
-.kiro/steering/
-codex.md
+# Agent tool configs (track project rules, ignore user-local extras)
+.cursor/plans/
+.kiro/settings/
 
 # IDE / OS
 .idea/
