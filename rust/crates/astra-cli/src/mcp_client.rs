@@ -35,12 +35,14 @@ use std::time::Instant;
 use rmcp::{
     ClientHandler, Peer, RoleClient,
     model::{
-        CallToolRequestParams, CallToolResult, GetPromptRequestParams, GetPromptResult,
-        LoggingLevel, Prompt, ReadResourceRequestParams, Resource, SetLevelRequestParams,
-        SubscribeRequestParams, Tool, UnsubscribeRequestParams,
+        CallToolRequestParams, CallToolResult, CreateMessageRequestParams, CreateMessageResult,
+        ErrorData as McpHandlerError, GetPromptRequestParams, GetPromptResult, LoggingLevel,
+        Prompt, ReadResourceRequestParams, Resource, Role, SamplingMessage,
+        SamplingMessageContent, SetLevelRequestParams, SubscribeRequestParams, Tool,
+        UnsubscribeRequestParams,
     },
     serve_client,
-    service::{NotificationContext, ServiceError},
+    service::{NotificationContext, RequestContext, ServiceError},
     transport::TokioChildProcess,
 };
 use tokio::sync::RwLock;
@@ -170,20 +172,43 @@ fn default_true() -> bool {
     true
 }
 
+/// Configuration for MCP sampling — allows the handler to forward
+/// `sampling/createMessage` requests to our LLM API.
+#[derive(Clone)]
+pub struct SamplingConfig {
+    pub api: Arc<astra_thin_client::ThinClient>,
+    pub token: String,
+    pub model: String,
+}
+
+impl std::fmt::Debug for SamplingConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SamplingConfig")
+            .field("model", &self.model)
+            .finish_non_exhaustive()
+    }
+}
+
 /// MCP client handler that tracks tool list change notifications.
 ///
 /// When the server sends change notifications for tools, prompts, or resources,
 /// the handler sets the corresponding flag. The connection owner can poll these
 /// flags and refresh as needed.
+///
+/// Optionally holds a [`SamplingConfig`] to fulfill `sampling/createMessage`
+/// requests from MCP servers.
 #[derive(Debug, Clone)]
 struct ChangeHandler {
     tools_changed: Arc<AtomicBool>,
     prompts_changed: Arc<AtomicBool>,
     resources_changed: Arc<AtomicBool>,
+    sampling: Option<Arc<SamplingConfig>>,
 }
 
 impl ChangeHandler {
-    fn new() -> (Self, Arc<AtomicBool>, Arc<AtomicBool>, Arc<AtomicBool>) {
+    fn new(
+        sampling: Option<Arc<SamplingConfig>>,
+    ) -> (Self, Arc<AtomicBool>, Arc<AtomicBool>, Arc<AtomicBool>) {
         let tools = Arc::new(AtomicBool::new(false));
         let prompts = Arc::new(AtomicBool::new(false));
         let resources = Arc::new(AtomicBool::new(false));
@@ -192,6 +217,7 @@ impl ChangeHandler {
                 tools_changed: tools.clone(),
                 prompts_changed: prompts.clone(),
                 resources_changed: resources.clone(),
+                sampling,
             },
             tools,
             prompts,
@@ -258,6 +284,120 @@ impl ClientHandler for ChangeHandler {
         eprintln!("  [{level}] {logger}: {data}");
         std::future::ready(())
     }
+
+    fn create_message(
+        &self,
+        params: CreateMessageRequestParams,
+        _context: RequestContext<RoleClient>,
+    ) -> impl std::future::Future<Output = Result<CreateMessageResult, McpHandlerError>> + Send + '_ {
+        let sampling = self.sampling.clone();
+        async move {
+            let config = sampling.ok_or_else(|| {
+                McpHandlerError::method_not_found::<rmcp::model::CreateMessageRequestMethod>()
+            })?;
+            do_sampling(&config, params).await
+        }
+    }
+}
+
+// ── Sampling implementation ──────────────────────────────────────────────
+
+/// Convert MCP `SamplingMessage` list to OpenAI `messages` array.
+fn sampling_messages_to_openai(messages: &[SamplingMessage]) -> Vec<serde_json::Value> {
+    messages
+        .iter()
+        .map(|msg| {
+            let role = match msg.role {
+                Role::User => "user",
+                Role::Assistant => "assistant",
+            };
+
+            let contents: Vec<serde_json::Value> = msg
+                .content
+                .iter()
+                .filter_map(|c| match c {
+                    SamplingMessageContent::Text(t) => Some(serde_json::json!({
+                        "type": "text",
+                        "text": t.text,
+                    })),
+                    SamplingMessageContent::Image(img) => Some(serde_json::json!({
+                        "type": "image_url",
+                        "image_url": {
+                            "url": format!("data:{};base64,{}", img.mime_type, img.data),
+                        },
+                    })),
+                    _ => None, // ToolUse/ToolResult/Audio — not mapped yet
+                })
+                .collect();
+
+            if contents.len() == 1 {
+                if let Some(text) = contents[0].get("text") {
+                    return serde_json::json!({ "role": role, "content": text });
+                }
+            }
+            serde_json::json!({ "role": role, "content": contents })
+        })
+        .collect()
+}
+
+/// Fulfill a sampling request by calling our LLM API.
+async fn do_sampling(
+    config: &SamplingConfig,
+    params: CreateMessageRequestParams,
+) -> Result<CreateMessageResult, McpHandlerError> {
+    let mut body = serde_json::json!({
+        "model": config.model,
+        "messages": sampling_messages_to_openai(&params.messages),
+        "max_tokens": params.max_tokens,
+    });
+
+    if let Some(system) = &params.system_prompt {
+        if let Some(arr) = body["messages"].as_array_mut() {
+            arr.insert(0, serde_json::json!({ "role": "system", "content": system }));
+        }
+    }
+    if let Some(temp) = params.temperature {
+        body["temperature"] = serde_json::json!(temp);
+    }
+    if let Some(stops) = &params.stop_sequences {
+        body["stop"] = serde_json::json!(stops);
+    }
+
+    let resp = config
+        .api
+        .post_completions(&config.token, &body)
+        .await
+        .map_err(|e| McpHandlerError::internal_error(format!("LLM API error: {e}"), None))?;
+
+    let choice = resp["choices"]
+        .as_array()
+        .and_then(|a| a.first())
+        .ok_or_else(|| McpHandlerError::internal_error("no choices in LLM response", None))?;
+
+    let text = choice["message"]["content"]
+        .as_str()
+        .unwrap_or("");
+
+    let finish_reason = choice["finish_reason"]
+        .as_str()
+        .unwrap_or("endTurn");
+
+    let stop_reason = match finish_reason {
+        "stop" => CreateMessageResult::STOP_REASON_END_TURN,
+        "length" => CreateMessageResult::STOP_REASON_END_MAX_TOKEN,
+        "tool_calls" => CreateMessageResult::STOP_REASON_TOOL_USE,
+        other => other,
+    };
+
+    let model_name = resp["model"]
+        .as_str()
+        .unwrap_or(&config.model);
+
+    Ok(CreateMessageResult::new(
+        SamplingMessage::assistant_text(text),
+        model_name.to_string(),
+    )
+    .with_stop_reason(stop_reason))
 }
 
 /// Running MCP client connection.
@@ -460,6 +600,8 @@ pub struct McpClientManager {
     connections: HashMap<String, Arc<McpConnection>>,
     /// Connection state per server (tracks lifecycle across reconnects).
     states: HashMap<String, ConnectionState>,
+    /// Optional sampling config — forwarded to each new connection's handler.
+    sampling: Option<Arc<SamplingConfig>>,
 }
 
 impl Default for McpClientManager {
@@ -467,6 +609,7 @@ impl Default for McpClientManager {
         Self {
             connections: HashMap::new(),
             states: HashMap::new(),
+            sampling: None,
         }
     }
 }
@@ -475,6 +618,12 @@ impl McpClientManager {
     /// Create a new empty client manager.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Set (or clear) the sampling configuration. All subsequent connections
+    /// will use this config to handle `sampling/createMessage` requests.
+    pub fn set_sampling_config(&mut self, config: Option<SamplingConfig>) {
+        self.sampling = config.map(Arc::new);
     }
 
     /// Low-level connect (no skill discovery). Use `connect_and_discover_skills`
@@ -487,7 +636,7 @@ impl McpClientManager {
         let name = config.name.clone();
         self.states
             .insert(name.clone(), ConnectionState::Connecting);
-        match connect_to_server(config).await {
+        match connect_to_server(config, self.sampling.clone()).await {
             Ok(connection) => {
                 self.states.insert(name.clone(), ConnectionState::Connected);
                 self.connections.insert(name, Arc::new(connection));
@@ -754,6 +903,11 @@ impl McpClientManager {
         self.connections.len()
     }
 
+    /// Whether sampling (createMessage) support is configured.
+    pub fn has_sampling(&self) -> bool {
+        self.sampling.is_some()
+    }
+
     /// Get the connection state for all servers.
     pub fn server_states(&self) -> Vec<(&str, ConnectionState)> {
         self.states
@@ -775,7 +929,7 @@ impl McpClientManager {
         self.states
             .insert(name.to_string(), ConnectionState::Reconnecting);
 
-        match connect_to_server(config).await {
+        match connect_to_server(config, self.sampling.clone()).await {
             Ok(connection) => {
                 let tool_count = connection.tools.len();
                 self.states
@@ -810,7 +964,7 @@ impl McpClientManager {
             .insert(name.to_string(), ConnectionState::Reconnecting);
 
         // Reconnect with retry
-        let connection = match connect_to_server(config).await {
+        let connection = match connect_to_server(config, self.sampling.clone()).await {
             Ok(conn) => conn,
             Err(e) => {
                 self.states
@@ -898,7 +1052,10 @@ pub fn new_shared_manager() -> SharedMcpClientManager {
 }
 
 /// Connect to an MCP server with exponential backoff retry.
-async fn connect_to_server(config: McpServerConfig) -> Result<McpConnection, McpError> {
+async fn connect_to_server(
+    config: McpServerConfig,
+    sampling: Option<Arc<SamplingConfig>>,
+) -> Result<McpConnection, McpError> {
     let retry = config.retry.clone();
     let name = config.name.clone();
 
@@ -916,7 +1073,7 @@ async fn connect_to_server(config: McpServerConfig) -> Result<McpConnection, Mcp
             tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
         }
 
-        match connect_once(&config).await {
+        match connect_once(&config, sampling.clone()).await {
             Ok(conn) => return Ok(conn),
             Err(e) => {
                 // Don't retry config errors — they won't resolve themselves.
@@ -937,10 +1094,13 @@ async fn connect_to_server(config: McpServerConfig) -> Result<McpConnection, Mcp
 }
 
 /// Single connection attempt (no retry).
-async fn connect_once(config: &McpServerConfig) -> Result<McpConnection, McpError> {
+async fn connect_once(
+    config: &McpServerConfig,
+    sampling: Option<Arc<SamplingConfig>>,
+) -> Result<McpConnection, McpError> {
     match &config.transport {
         Transport::Stdio { command, args, env } => {
-            connect_stdio(&config.name, command, args, env, config.clone()).await
+            connect_stdio(&config.name, command, args, env, config.clone(), sampling).await
         }
         Transport::Sse {
             url,
@@ -953,6 +1113,7 @@ async fn connect_once(config: &McpServerConfig) -> Result<McpConnection, McpErro
                 auth_token.as_deref(),
                 headers,
                 config.clone(),
+                sampling,
             )
             .await
         }
@@ -967,6 +1128,7 @@ async fn connect_once(config: &McpServerConfig) -> Result<McpConnection, McpErro
                 auth_token.as_deref(),
                 headers,
                 config.clone(),
+                sampling,
             )
             .await
         }
@@ -980,6 +1142,7 @@ async fn connect_stdio(
     args: &[String],
     env: &HashMap<String, String>,
     config: McpServerConfig,
+    sampling: Option<Arc<SamplingConfig>>,
 ) -> Result<McpConnection, McpError> {
     if command.is_empty() {
         return Err(McpError::InvalidConfig(
@@ -1001,7 +1164,7 @@ async fn connect_stdio(
     let transport = TokioChildProcess::new(cmd).map_err(|e| McpError::Spawn(e.to_string()))?;
 
     // Connect as MCP client with change notification handler
-    let (handler, tools_changed, prompts_changed, resources_changed) = ChangeHandler::new();
+    let (handler, tools_changed, prompts_changed, resources_changed) = ChangeHandler::new(sampling);
     let running = serve_client(handler, transport)
         .await
         .map_err(|e| McpError::Initialize(e.to_string()))?;
@@ -1030,6 +1193,7 @@ async fn connect_sse(
     auth_token: Option<&str>,
     headers: &HashMap<String, String>,
     config: McpServerConfig,
+    sampling: Option<Arc<SamplingConfig>>,
 ) -> Result<McpConnection, McpError> {
     use rmcp::transport::streamable_http_client::{
         StreamableHttpClientTransport, StreamableHttpClientTransportConfig,
@@ -1064,7 +1228,7 @@ async fn connect_sse(
     let transport = StreamableHttpClientTransport::from_config(transport_config);
 
     // Connect as MCP client with change notification handler
-    let (handler, tools_changed, prompts_changed, resources_changed) = ChangeHandler::new();
+    let (handler, tools_changed, prompts_changed, resources_changed) = ChangeHandler::new(sampling);
     let running = serve_client(handler, transport)
         .await
         .map_err(|e| McpError::Initialize(format!("SSE connect to {url}: {e}")))?;
@@ -1097,6 +1261,7 @@ async fn connect_ws(
     auth_token: Option<&str>,
     headers: &HashMap<String, String>,
     config: McpServerConfig,
+    sampling: Option<Arc<SamplingConfig>>,
 ) -> Result<McpConnection, McpError> {
     use futures_util::{SinkExt, StreamExt};
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -1194,7 +1359,7 @@ async fn connect_ws(
     });
 
     // Connect as MCP client with change notification handler
-    let (handler, tools_changed, prompts_changed, resources_changed) = ChangeHandler::new();
+    let (handler, tools_changed, prompts_changed, resources_changed) = ChangeHandler::new(sampling);
     let running = serve_client(handler, (rmcp_read, rmcp_write))
         .await
         .map_err(|e| McpError::Initialize(format!("MCP init over WebSocket {url}: {e}")))?;
@@ -2145,7 +2310,7 @@ mcp_servers:
 
     #[test]
     fn change_handler_initial_state() {
-        let (_handler, tools, prompts, resources) = ChangeHandler::new();
+        let (_handler, tools, prompts, resources) = ChangeHandler::new(None);
         assert!(!tools.load(Ordering::Acquire));
         assert!(!prompts.load(Ordering::Acquire));
         assert!(!resources.load(Ordering::Acquire));
@@ -2153,28 +2318,28 @@ mcp_servers:
 
     #[test]
     fn change_handler_sets_tools_flag() {
-        let (handler, tools, _prompts, _resources) = ChangeHandler::new();
+        let (handler, tools, _prompts, _resources) = ChangeHandler::new(None);
         handler.tools_changed.store(true, Ordering::Release);
         assert!(tools.load(Ordering::Acquire));
     }
 
     #[test]
     fn change_handler_sets_prompts_flag() {
-        let (handler, _tools, prompts, _resources) = ChangeHandler::new();
+        let (handler, _tools, prompts, _resources) = ChangeHandler::new(None);
         handler.prompts_changed.store(true, Ordering::Release);
         assert!(prompts.load(Ordering::Acquire));
     }
 
     #[test]
     fn change_handler_sets_resources_flag() {
-        let (handler, _tools, _prompts, resources) = ChangeHandler::new();
+        let (handler, _tools, _prompts, resources) = ChangeHandler::new(None);
         handler.resources_changed.store(true, Ordering::Release);
         assert!(resources.load(Ordering::Acquire));
     }
 
     #[test]
     fn change_handler_flags_independent() {
-        let (handler, tools, prompts, resources) = ChangeHandler::new();
+        let (handler, tools, prompts, resources) = ChangeHandler::new(None);
         handler.tools_changed.store(true, Ordering::Release);
         assert!(tools.load(Ordering::Acquire));
         assert!(!prompts.load(Ordering::Acquire));
@@ -2190,7 +2355,7 @@ mcp_servers:
 
     #[test]
     fn change_handler_clone_shares_flags() {
-        let (handler, tools, prompts, resources) = ChangeHandler::new();
+        let (handler, tools, prompts, resources) = ChangeHandler::new(None);
         let cloned = handler.clone();
         cloned.tools_changed.store(true, Ordering::Release);
         cloned.prompts_changed.store(true, Ordering::Release);
@@ -2241,5 +2406,100 @@ mcp_servers:
             assert!(result.is_err());
             assert!(matches!(result.unwrap_err(), McpError::ServerNotConnected(_)));
         });
+    }
+
+    // ── Sampling tests ────────────────────────────────────────────────────
+
+    #[test]
+    fn sampling_messages_text_only() {
+        let msgs = vec![
+            SamplingMessage::user_text("Hello"),
+            SamplingMessage::assistant_text("Hi there"),
+        ];
+        let openai = sampling_messages_to_openai(&msgs);
+        assert_eq!(openai.len(), 2);
+        assert_eq!(openai[0]["role"], "user");
+        assert_eq!(openai[0]["content"], "Hello");
+        assert_eq!(openai[1]["role"], "assistant");
+        assert_eq!(openai[1]["content"], "Hi there");
+    }
+
+    #[test]
+    fn sampling_messages_image_content() {
+        use rmcp::model::RawImageContent;
+        let img = SamplingMessageContent::Image(RawImageContent {
+            mime_type: "image/png".into(),
+            data: "abc123".into(),
+            meta: None,
+        });
+        let msg = SamplingMessage::new(Role::User, img);
+        let openai = sampling_messages_to_openai(&[msg]);
+        assert_eq!(openai.len(), 1);
+        let content = &openai[0]["content"];
+        assert!(content.is_array());
+        let part = &content[0];
+        assert_eq!(part["type"], "image_url");
+        assert_eq!(
+            part["image_url"]["url"],
+            "data:image/png;base64,abc123"
+        );
+    }
+
+    #[test]
+    fn sampling_messages_empty() {
+        let openai = sampling_messages_to_openai(&[]);
+        assert!(openai.is_empty());
+    }
+
+    #[test]
+    fn sampling_config_debug_hides_token() {
+        let config = SamplingConfig {
+            api: Arc::new(
+                astra_thin_client::ThinClient::new("http://localhost:8000", None).unwrap(),
+            ),
+            token: "secret-token-123".to_string(),
+            model: "test-model".to_string(),
+        };
+        let debug = format!("{config:?}");
+        assert!(debug.contains("test-model"));
+        assert!(!debug.contains("secret-token-123"));
+    }
+
+    #[test]
+    fn change_handler_with_sampling_config() {
+        let config = SamplingConfig {
+            api: Arc::new(
+                astra_thin_client::ThinClient::new("http://localhost:8000", None).unwrap(),
+            ),
+            token: "tok".to_string(),
+            model: "m".to_string(),
+        };
+        let (handler, _t, _p, _r) = ChangeHandler::new(Some(Arc::new(config)));
+        assert!(handler.sampling.is_some());
+    }
+
+    #[test]
+    fn change_handler_without_sampling() {
+        let (handler, _t, _p, _r) = ChangeHandler::new(None);
+        assert!(handler.sampling.is_none());
+    }
+
+    #[test]
+    fn manager_set_sampling_config() {
+        let mut manager = McpClientManager::new();
+        assert!(manager.sampling.is_none());
+
+        let config = SamplingConfig {
+            api: Arc::new(
+                astra_thin_client::ThinClient::new("http://localhost:8000", None).unwrap(),
+            ),
+            token: "tok".to_string(),
+            model: "m".to_string(),
+        };
+        manager.set_sampling_config(Some(config));
+        assert!(manager.sampling.is_some());
+
+        manager.set_sampling_config(None);
+        assert!(manager.sampling.is_none());
     }
 }
