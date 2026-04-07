@@ -183,7 +183,12 @@ pub struct SamplingConfig {
     pub api: Arc<astra_thin_client::ThinClient>,
     pub token: String,
     pub model: String,
+    /// Max tokens cap for sampling requests. Defaults to [`DEFAULT_SAMPLING_MAX_TOKENS_CAP`].
+    pub max_tokens_cap: i64,
 }
+
+/// Default max tokens cap for MCP sampling requests.
+pub const DEFAULT_SAMPLING_MAX_TOKENS_CAP: i64 = 4096;
 
 impl std::fmt::Debug for SamplingConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -391,9 +396,8 @@ async fn do_sampling(
     config: &SamplingConfig,
     params: CreateMessageRequestParams,
 ) -> Result<CreateMessageResult, McpHandlerError> {
-    // Cap max_tokens to prevent budget abuse by MCP servers
-    const SAMPLING_MAX_TOKENS_CAP: i64 = 4096;
-    let capped_tokens = (params.max_tokens as i64).min(SAMPLING_MAX_TOKENS_CAP);
+    // Cap max_tokens using the configurable limit
+    let capped_tokens = (params.max_tokens as i64).min(config.max_tokens_cap);
 
     let mut body = serde_json::json!({
         "model": config.model,
@@ -776,6 +780,10 @@ impl McpConnection {
         )
         .await
         .map_err(|_| {
+            eprintln!(
+                "[ERROR] MCP tool '{}' on server '{}' timed out after {}s",
+                name, self.name, MCP_TOOL_CALL_TIMEOUT_SECS
+            );
             ServiceError::Timeout {
                 timeout: std::time::Duration::from_secs(MCP_TOOL_CALL_TIMEOUT_SECS),
             }
@@ -1055,6 +1063,7 @@ impl McpClientManager {
         let mut seen: std::collections::HashMap<String, &str> =
             std::collections::HashMap::new();
         let mut schemas = Vec::new();
+        let mut collision_count = 0usize;
         for (server, tool) in self.all_tools() {
             let schema = mcp_tool_to_schema(server, tool);
             let name = schema["function"]["name"]
@@ -1066,10 +1075,17 @@ impl McpClientManager {
                     "[WARN] MCP tool name collision: '{name}' from server '{server}' \
                      conflicts with server '{prev_server}' — skipping duplicate"
                 );
+                collision_count += 1;
                 continue;
             }
             seen.insert(name, server);
             schemas.push(schema);
+        }
+        if collision_count > 0 {
+            eprintln!(
+                "[WARN] {collision_count} MCP tool(s) skipped due to name collisions \
+                 — check server configurations for duplicate tool names"
+            );
         }
         schemas
     }
@@ -1855,7 +1871,8 @@ const BLOCKED_ENV_PREFIXES: &[&str] = &[
 ];
 
 const BLOCKED_ENV_EXACT: &[&str] = &[
-    "PATH",           // PATH manipulation
+    // Note: PATH is intentionally NOT blocked — MCP servers (especially Node.js)
+    // need it to find executables. The server's env config can override if needed.
     "IFS",            // Shell word-splitting attacks
     "BASH_ENV",       // Bash startup injection
     "ENV",            // POSIX shell startup injection
@@ -2930,6 +2947,7 @@ mcp_servers:
             ),
             token: "secret-token-123".to_string(),
             model: "test-model".to_string(),
+            max_tokens_cap: DEFAULT_SAMPLING_MAX_TOKENS_CAP,
         };
         let debug = format!("{config:?}");
         assert!(debug.contains("test-model"));
@@ -2944,6 +2962,7 @@ mcp_servers:
             ),
             token: "tok".to_string(),
             model: "m".to_string(),
+            max_tokens_cap: DEFAULT_SAMPLING_MAX_TOKENS_CAP,
         };
         let (handler, _t, _p, _r) =
             ChangeHandler::new(Some(Arc::new(config)), Arc::new(RwLock::new(Vec::new())));
@@ -2967,6 +2986,7 @@ mcp_servers:
             ),
             token: "tok".to_string(),
             model: "m".to_string(),
+            max_tokens_cap: DEFAULT_SAMPLING_MAX_TOKENS_CAP,
         };
         manager.set_sampling_config(Some(config));
         assert!(manager.sampling.is_some());
@@ -3199,6 +3219,7 @@ mcp_servers:
             ),
             token: "tok".into(),
             model: "test".into(),
+            max_tokens_cap: DEFAULT_SAMPLING_MAX_TOKENS_CAP,
         });
         let roots = Arc::new(RwLock::new(vec![]));
         let (handler, _, _, _) = ChangeHandler::new(Some(sampling), roots);
@@ -3255,6 +3276,7 @@ mcp_servers:
             ),
             token: "tok".into(),
             model: "test".into(),
+            max_tokens_cap: DEFAULT_SAMPLING_MAX_TOKENS_CAP,
         };
         mgr.set_sampling_config(Some(config));
         assert!(mgr.has_sampling());
@@ -3542,7 +3564,6 @@ mcp_servers:
         // SSH
         assert!(is_dangerous_env_var("SSH_AUTH_SOCK"));
         // Exact matches
-        assert!(is_dangerous_env_var("PATH"));
         assert!(is_dangerous_env_var("IFS"));
         assert!(is_dangerous_env_var("BASH_ENV"));
         assert!(is_dangerous_env_var("ENV"));
@@ -3561,6 +3582,8 @@ mcp_servers:
         assert!(!is_dangerous_env_var("LANG"));
         assert!(!is_dangerous_env_var("MY_APP_TOKEN"));
         assert!(!is_dangerous_env_var("NODE_ENV"));
+        // PATH is intentionally allowed — MCP servers need it
+        assert!(!is_dangerous_env_var("PATH"));
         // Not prefix match — must be exact for non-prefix entries
         assert!(!is_dangerous_env_var("PATHINFO"));
     }
