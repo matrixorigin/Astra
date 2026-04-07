@@ -42,6 +42,11 @@ pub fn matrix_settings_from_env() -> MatrixOneSettings {
 pub struct MatrixCloudRuntime {
     shared_pool: SharedPool,
     ingestion: Mutex<Option<astra_services::event_ingestion::IngestionSender>>,
+    /// Join handle for the background ingestion worker — awaited on graceful shutdown
+    /// to ensure all buffered events are flushed to cloud before process exit.
+    ingestion_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Live ingestion stats (events_received, events_flushed, errors).
+    ingestion_stats: Arc<std::sync::Mutex<astra_services::event_ingestion::IngestionStats>>,
     sync_orchestrator: TokioMutex<SyncOrchestrator>,
     /// Edge preference map (same `Arc` as [`PreferenceAdapter`] inside the orchestrator).
     preference_store: Arc<Mutex<BTreeMap<String, String>>>,
@@ -77,7 +82,7 @@ impl MatrixCloudRuntime {
         let task_dirty = Arc::new(Mutex::new(HashSet::new()));
 
         let pool = shared_pool.get().clone();
-        let (sender, _stats, _jh) =
+        let (sender, ingestion_stats, ingestion_jh) =
             event_ingestion::EventIngestionWorker::spawn(pool.clone(), IngestionConfig::default());
         let sync_svc = Arc::new(MatrixOneSyncService::new(pool));
         let transport: Arc<dyn CloudTransport> = Arc::new(MatrixOneTransport::new(
@@ -123,6 +128,8 @@ impl MatrixCloudRuntime {
         Self {
             shared_pool,
             ingestion: Mutex::new(Some(sender)),
+            ingestion_handle: Mutex::new(Some(ingestion_jh)),
+            ingestion_stats,
             sync_orchestrator: TokioMutex::new(orch),
             preference_store,
             template_cache,
@@ -157,6 +164,20 @@ impl MatrixCloudRuntime {
 
     pub fn shared_pool(&self) -> &SharedPool {
         &self.shared_pool
+    }
+
+    /// Snapshot of ingestion stats (events received/flushed/errors + overflow).
+    pub fn ingestion_stats(&self) -> Option<astra_services::event_ingestion::IngestionStats> {
+        self.ingestion_stats.lock().ok().map(|s| s.clone())
+    }
+
+    /// Number of events silently dropped because the ingestion channel was full.
+    pub fn ingestion_overflow_count(&self) -> u64 {
+        self.ingestion
+            .lock()
+            .ok()
+            .and_then(|g| g.as_ref().map(|s| s.overflow_count()))
+            .unwrap_or(0)
     }
 
     /// Create a [`CloudLlmJudge`] backed by this runtime's database pool.
@@ -196,6 +217,37 @@ impl MatrixCloudRuntime {
             && let Some(s) = g.take()
         {
             s.shutdown();
+        }
+    }
+
+    /// Flush and stop the ingestion worker, then **wait** for the background
+    /// worker to drain its buffer and exit. Use this on graceful exit paths
+    /// to ensure short sessions don't lose their final events.
+    pub async fn shutdown_ingestion_and_wait(&self) {
+        // Drop sender first — closes the channel so the worker drains its buffer.
+        if let Ok(mut g) = self.ingestion.lock() {
+            if let Some(s) = g.take() {
+                s.shutdown();
+            }
+        }
+        // Await the worker join handle with a timeout to avoid hanging forever.
+        let handle = self.ingestion_handle.lock().ok().and_then(|mut g| g.take());
+        if let Some(jh) = handle {
+            match tokio::time::timeout(std::time::Duration::from_secs(5), jh).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    astra_core::agent_warn!(
+                        "ingestion",
+                        "worker join failed: {e}"
+                    );
+                }
+                Err(_) => {
+                    astra_core::agent_warn!(
+                        "ingestion",
+                        "worker flush timed out after 5s, some events may be lost"
+                    );
+                }
+            }
         }
     }
 
