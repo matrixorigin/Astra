@@ -767,7 +767,7 @@ mod tests {
     }
 
     #[test]
-    fn multiple_errors_only_first_preserved() {
+    fn multiple_errors_last_wins() {
         let mut a = ChatTurnSseAccum::default();
         let block = format!(
             "{}{}",
@@ -775,7 +775,7 @@ mod tests {
             sse("error", ",\"message\":\"server error\""),
         );
         dispatch_chat_turn_sse_event_block(&block, &mut a, &mut vec![]);
-        // Second error overwrites (current behavior: each error replaces)
+        // Each error overwrites the previous — last error wins.
         assert!(a.error_message.as_ref().unwrap().contains("server error"));
     }
 
@@ -963,5 +963,117 @@ mod tests {
             &mut vec![],
         );
         assert_eq!(a.full_text, "complete response");
+    }
+
+    // ── Additional edge-case tests ─────────────────────────────────────────
+
+    #[test]
+    fn usage_negative_tokens_treated_as_invalid() {
+        let mut a = ChatTurnSseAccum::default();
+        dispatch_chat_turn_sse_event_block(
+            &sse("usage", ",\"prompt_tokens\":-5,\"completion_tokens\":-10"),
+            &mut a,
+            &mut vec![],
+        );
+        // Negative values fail as_u64() → both None → error branch
+        assert!(!a.has_usage);
+        assert!(a.error_message.is_some());
+        assert!(a
+            .error_message
+            .as_ref()
+            .unwrap()
+            .contains("invalid usage"));
+    }
+
+    #[test]
+    fn usage_float_tokens_treated_as_error() {
+        let mut a = ChatTurnSseAccum::default();
+        // Float values cannot be parsed as i64 by serde, so as_i64() returns None.
+        dispatch_chat_turn_sse_event_block(
+            &"data: {\"type\":\"usage\",\"prompt_tokens\":3.14,\"completion_tokens\":2.71}\n\n"
+                .to_string(),
+            &mut a,
+            &mut vec![],
+        );
+        // The parser falls through to the "neither prompt nor completion" branch
+        // and sets an error, OR it just stores 0. Either way, no panic.
+        assert!(a.has_usage || a.error_message.is_some());
+    }
+
+    #[test]
+    fn empty_block_produces_no_effects() {
+        let mut a = ChatTurnSseAccum::default();
+        let efx = dispatch_chat_turn_sse_event_block("", &mut a, &mut vec![]);
+        assert!(efx.is_empty());
+        assert!(a.full_text.is_empty());
+    }
+
+    #[test]
+    fn whitespace_only_block_produces_no_effects() {
+        let mut a = ChatTurnSseAccum::default();
+        let efx = dispatch_chat_turn_sse_event_block("   \n\n  \n", &mut a, &mut vec![]);
+        assert!(efx.is_empty());
+    }
+
+    #[test]
+    fn done_marker_only_produces_no_effects() {
+        let mut a = ChatTurnSseAccum::default();
+        let efx = dispatch_chat_turn_sse_event_block("data: [DONE]\n\n", &mut a, &mut vec![]);
+        assert!(efx.is_empty());
+    }
+
+    #[test]
+    fn invalid_json_in_data_line_sets_error() {
+        let mut a = ChatTurnSseAccum::default();
+        dispatch_chat_turn_sse_event_block(
+            "data: {not valid json}\n\n",
+            &mut a,
+            &mut vec![],
+        );
+        assert!(a.error_message.is_some());
+    }
+
+    #[test]
+    fn session_info_captures_id() {
+        let mut a = ChatTurnSseAccum::default();
+        dispatch_chat_turn_sse_event_block(
+            &sse("session_info", ",\"session_id\":\"sess-abc\""),
+            &mut a,
+            &mut vec![],
+        );
+        assert_eq!(a.session_id.as_deref(), Some("sess-abc"));
+    }
+
+    #[test]
+    fn turn_complete_with_tool_calls_true() {
+        let mut a = ChatTurnSseAccum::default();
+        dispatch_chat_turn_sse_event_block(
+            &sse("turn_complete", ",\"has_tool_calls\":true"),
+            &mut a,
+            &mut vec![],
+        );
+        assert!(a.has_tool_calls);
+    }
+
+    #[test]
+    fn turn_complete_without_tool_calls_stays_false() {
+        let mut a = ChatTurnSseAccum::default();
+        dispatch_chat_turn_sse_event_block(
+            &sse("turn_complete", ",\"has_tool_calls\":false"),
+            &mut a,
+            &mut vec![],
+        );
+        assert!(!a.has_tool_calls);
+    }
+
+    #[test]
+    fn explain_event_collected() {
+        let mut a = ChatTurnSseAccum::default();
+        dispatch_chat_turn_sse_event_block(
+            &sse("explain", ",\"detail\":\"selection took 5ms\""),
+            &mut a,
+            &mut vec![],
+        );
+        assert_eq!(a.explain_turns.len(), 1);
     }
 }

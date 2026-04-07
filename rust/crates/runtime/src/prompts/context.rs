@@ -1125,4 +1125,124 @@ mod tests {
             CompactionTier::AggressivePrune
         );
     }
+
+    // ── CompactConfig tests ──────────────────────────────────────────────
+
+    #[test]
+    fn should_summarize_disabled_always_false() {
+        let cfg = CompactConfig {
+            enable_summary: false,
+            ..Default::default()
+        };
+        assert!(!cfg.should_summarize(CompactionTier::Normal));
+        assert!(!cfg.should_summarize(CompactionTier::AggressivePrune));
+    }
+
+    #[test]
+    fn should_summarize_respects_min_tier() {
+        let cfg = CompactConfig {
+            enable_summary: true,
+            summary_min_tier: CompactionTier::CompactHistory,
+            ..Default::default()
+        };
+        assert!(!cfg.should_summarize(CompactionTier::Normal));
+        assert!(!cfg.should_summarize(CompactionTier::TrimSchemas));
+        assert!(cfg.should_summarize(CompactionTier::CompactHistory));
+        assert!(cfg.should_summarize(CompactionTier::AggressivePrune));
+    }
+
+    #[test]
+    fn should_summarize_at_lowest_min_tier() {
+        let cfg = CompactConfig {
+            enable_summary: true,
+            summary_min_tier: CompactionTier::Normal,
+            ..Default::default()
+        };
+        // Everything triggers when min tier is Normal
+        assert!(cfg.should_summarize(CompactionTier::Normal));
+        assert!(cfg.should_summarize(CompactionTier::TrimSchemas));
+    }
+
+    #[test]
+    fn should_summarize_at_highest_min_tier() {
+        let cfg = CompactConfig {
+            enable_summary: true,
+            summary_min_tier: CompactionTier::AggressivePrune,
+            ..Default::default()
+        };
+        assert!(!cfg.should_summarize(CompactionTier::CompactHistory));
+        assert!(cfg.should_summarize(CompactionTier::AggressivePrune));
+    }
+
+    #[test]
+    fn compact_config_default_values() {
+        let cfg = CompactConfig::default();
+        assert!(cfg.enable_summary);
+        assert_eq!(cfg.summary_token_budget, 20_000);
+        assert_eq!(cfg.max_ptl_retries, 3);
+        assert_eq!(cfg.summary_min_tier, CompactionTier::CompactHistory);
+    }
+
+    // ── CompactionTier budget_pressure ───────────────────────────────────
+
+    #[test]
+    fn budget_pressure_increases_with_severity() {
+        assert_eq!(CompactionTier::Normal.budget_pressure(), 0.0);
+        assert!(CompactionTier::TrimSchemas.budget_pressure() > 0.0);
+        assert!(
+            CompactionTier::CompactHistory.budget_pressure()
+                > CompactionTier::TrimSchemas.budget_pressure()
+        );
+        assert!(
+            CompactionTier::AggressivePrune.budget_pressure()
+                > CompactionTier::CompactHistory.budget_pressure()
+        );
+    }
+
+    // ── budget_for_model edge cases ─────────────────────────────────────
+
+    #[test]
+    fn budget_for_model_none_uses_defaults() {
+        let b = budget_for_model(None);
+        assert_eq!(b.model_limit, 128_000);
+        assert!((b.output_reserve_ratio - 0.15).abs() < 1e-6);
+    }
+
+    #[test]
+    fn budget_for_model_empty_string_uses_defaults() {
+        let b = budget_for_model(Some(""));
+        assert_eq!(b.model_limit, 128_000);
+    }
+
+    #[test]
+    fn budget_for_model_unknown_uses_defaults() {
+        let b = budget_for_model(Some("totally-unknown-model-xyz"));
+        assert_eq!(b.model_limit, 128_000);
+    }
+
+    // ── ContextBudget edge: total < reserved ────────────────────────────
+
+    #[test]
+    fn effective_input_limit_with_reserve_exceeding_one() {
+        // output_reserve_ratio > 1.0 is nonsensical but should not panic
+        let b = ContextBudget {
+            model_limit: 1000,
+            output_reserve_ratio: 1.5,
+            ..Default::default()
+        };
+        // (1000 * (1.0 - 1.5)) = -500, cast to usize wraps
+        // The key assertion: no panic
+        let _ = b.effective_input_limit();
+    }
+
+    #[test]
+    fn compact_trigger_zero_threshold() {
+        let b = ContextBudget {
+            compact_threshold: 0.0,
+            ..Default::default()
+        };
+        assert_eq!(b.compact_trigger(), 0);
+        // Any positive token count should trigger compaction
+        assert!(b.should_compact(1));
+    }
 }

@@ -544,13 +544,13 @@ async fn apply_auto_compact_result(
 
     // Skip Memoria anchor for short sessions — the summary alone is sufficient
     // and the anchor would largely duplicate what's already in kept turns.
-    let anchor = if trimmed >= 4 {
+    let anchor = if compacted_count >= 4 {
         fetch_compact_memory_anchor_snippet(ctx.api, token, state.session_id.as_deref(), &summary)
             .await
     } else {
         None
     };
-    let assistant_text = compact_assistant_message(trimmed, &summary, anchor.as_deref());
+    let assistant_text = compact_assistant_message(compacted_count, &summary, anchor.as_deref());
     let summary_entry = (String::new(), assistant_text);
     let mut new_history = vec![summary_entry];
 
