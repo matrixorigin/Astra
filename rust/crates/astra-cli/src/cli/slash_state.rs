@@ -1,118 +1,5 @@
 use super::*;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SkillSearchCommand {
-    Show,
-    Reset,
-    SetDynamic(bool),
-    SetMinCatalog(usize),
-    SetSurfaceCap(usize),
-}
-
-fn format_skill_search_settings(settings: &astra_core::SkillSearchSettings) -> String {
-    format!(
-        "dynamic={}, min_catalog_size={}, surface_cap={}",
-        settings.dynamic_surface, settings.min_catalog_size, settings.surface_cap
-    )
-}
-
-fn parse_skill_search_command(arg: &str) -> Result<SkillSearchCommand, String> {
-    let arg = arg.trim();
-    if arg.is_empty() || matches!(arg, "show" | "status") {
-        return Ok(SkillSearchCommand::Show);
-    }
-    if arg == "reset" {
-        return Ok(SkillSearchCommand::Reset);
-    }
-
-    let mut parts = arg.split_whitespace();
-    let key = parts.next().unwrap_or_default();
-    let value = parts.next().unwrap_or_default();
-    if parts.next().is_some() {
-        return Err(
-            "Usage: /skill-search [show|status|reset|dynamic <on|off>|min <n>|cap <n>]".to_string(),
-        );
-    }
-
-    match key {
-        "dynamic" => match value.to_ascii_lowercase().as_str() {
-            "on" | "true" | "1" => Ok(SkillSearchCommand::SetDynamic(true)),
-            "off" | "false" | "0" => Ok(SkillSearchCommand::SetDynamic(false)),
-            _ => Err("Usage: /skill-search dynamic <on|off>".to_string()),
-        },
-        "min" => value
-            .parse::<usize>()
-            .ok()
-            .filter(|n| *n > 0)
-            .map(SkillSearchCommand::SetMinCatalog)
-            .ok_or_else(|| "Usage: /skill-search min <positive-integer>".to_string()),
-        "cap" => value
-            .parse::<usize>()
-            .ok()
-            .filter(|n| *n > 0)
-            .map(SkillSearchCommand::SetSurfaceCap)
-            .ok_or_else(|| "Usage: /skill-search cap <positive-integer>".to_string()),
-        _ => Err(
-            "Usage: /skill-search [show|status|reset|dynamic <on|off>|min <n>|cap <n>]".to_string(),
-        ),
-    }
-}
-
-fn apply_skill_search_command(
-    state: &mut ReplState,
-    command: SkillSearchCommand,
-) -> (String, bool) {
-    match command {
-        SkillSearchCommand::Show => (
-            format!(
-                "Skill search config: {}",
-                format_skill_search_settings(&state.skill_search)
-            ),
-            false,
-        ),
-        SkillSearchCommand::Reset => {
-            state.skill_search = astra_core::SkillSearchSettings::default();
-            (
-                format!(
-                    "Skill search reset: {}",
-                    format_skill_search_settings(&state.skill_search)
-                ),
-                true,
-            )
-        }
-        SkillSearchCommand::SetDynamic(dynamic) => {
-            state.skill_search.dynamic_surface = dynamic;
-            (
-                format!(
-                    "Skill search updated: {}",
-                    format_skill_search_settings(&state.skill_search)
-                ),
-                true,
-            )
-        }
-        SkillSearchCommand::SetMinCatalog(min_catalog_size) => {
-            state.skill_search.min_catalog_size = min_catalog_size;
-            (
-                format!(
-                    "Skill search updated: {}",
-                    format_skill_search_settings(&state.skill_search)
-                ),
-                true,
-            )
-        }
-        SkillSearchCommand::SetSurfaceCap(surface_cap) => {
-            state.skill_search.surface_cap = surface_cap;
-            (
-                format!(
-                    "Skill search updated: {}",
-                    format_skill_search_settings(&state.skill_search)
-                ),
-                true,
-            )
-        }
-    }
-}
-
 pub(super) struct StateCommandContext<'a> {
     pub(super) api: &'a astra_thin_client::ThinClient,
     pub(super) profile: Option<&'a str>,
@@ -277,25 +164,6 @@ pub(super) async fn handle_state_command(
         "/verbose" => {
             state.verbose_mode = true;
             eprintln!("  Verbose mode on");
-        }
-
-        "/skill-search" => {
-            let command = match parse_skill_search_command(arg) {
-                Ok(command) => command,
-                Err(message) => {
-                    eprintln!("  {}", message.yellow());
-                    return Ok(());
-                }
-            };
-            let (message, changed) = apply_skill_search_command(state, command);
-            eprintln!("  {}", message.green());
-            if changed && let Some(ref j) = state.journal {
-                let _ = j.append(&session_journal::JournalEvent::config_change(
-                    state.session_id.as_deref(),
-                    "skill_search",
-                    &format_skill_search_settings(&state.skill_search),
-                ));
-            }
         }
 
         "/compact" => {
@@ -928,53 +796,6 @@ fn render_reflect_report(body: &str, session_id: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn parse_skill_search_command_supports_status_and_updates() {
-        assert_eq!(
-            parse_skill_search_command("").unwrap(),
-            SkillSearchCommand::Show
-        );
-        assert_eq!(
-            parse_skill_search_command("status").unwrap(),
-            SkillSearchCommand::Show
-        );
-        assert_eq!(
-            parse_skill_search_command("dynamic off").unwrap(),
-            SkillSearchCommand::SetDynamic(false)
-        );
-        assert_eq!(
-            parse_skill_search_command("min 12").unwrap(),
-            SkillSearchCommand::SetMinCatalog(12)
-        );
-        assert_eq!(
-            parse_skill_search_command("cap 20").unwrap(),
-            SkillSearchCommand::SetSurfaceCap(20)
-        );
-    }
-
-    #[test]
-    fn apply_skill_search_command_mutates_repl_state() {
-        let mut state = ReplState::default();
-
-        let (_, changed) =
-            apply_skill_search_command(&mut state, SkillSearchCommand::SetDynamic(false));
-        assert!(changed);
-        assert!(!state.skill_search.dynamic_surface);
-
-        let (_, changed) =
-            apply_skill_search_command(&mut state, SkillSearchCommand::SetMinCatalog(11));
-        assert!(changed);
-        assert_eq!(state.skill_search.min_catalog_size, 11);
-
-        let (_, changed) =
-            apply_skill_search_command(&mut state, SkillSearchCommand::SetSurfaceCap(19));
-        assert!(changed);
-        assert_eq!(state.skill_search.surface_cap, 19);
-
-        let (_, changed) = apply_skill_search_command(&mut state, SkillSearchCommand::Show);
-        assert!(!changed);
-    }
 
     // ── /undo tests ──
 
