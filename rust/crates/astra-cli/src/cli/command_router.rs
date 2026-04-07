@@ -31,7 +31,7 @@ pub(super) async fn execute_cli_command(
     match command {
         // No subcommand → interactive REPL (Codex-style default)
         None | Some(Command::Interactive) => {
-            run_chat_repl(api, profile.as_deref(), None).await?;
+            run_chat_repl(api, profile.as_deref(), None, None).await?;
             Ok(ExitCode::Success)
         }
 
@@ -286,7 +286,7 @@ pub(super) async fn execute_cli_command(
                 m
             } else {
                 // No message → start REPL with optional pre-set session/model
-                run_chat_repl(api, profile.as_deref(), args.model.as_deref()).await?;
+                run_chat_repl(api, profile.as_deref(), args.model.as_deref(), None).await?;
                 return Ok(ExitCode::Success);
             };
 
