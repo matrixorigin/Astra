@@ -1783,4 +1783,32 @@ mod tests {
         ];
         assert_eq!(latest_assistant_content(&msgs), Some("First"));
     }
+
+    // ──────────────────────────────────────────────────────────
+    // PERSIST_* counters (health JSON shape: `http_contract` + fixture)
+    // ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn persist_fail_counter_round_trip() {
+        use std::sync::atomic::Ordering;
+        let before = PERSIST_FAIL_COUNT.load(Ordering::Relaxed);
+        PERSIST_FAIL_COUNT.fetch_add(1, Ordering::Relaxed);
+        assert_eq!(
+            PERSIST_FAIL_COUNT.load(Ordering::Relaxed),
+            before.saturating_add(1)
+        );
+        PERSIST_FAIL_COUNT.store(before, Ordering::Relaxed);
+    }
+
+    #[test]
+    fn persist_ok_counter_round_trip() {
+        use std::sync::atomic::Ordering;
+        let before = PERSIST_OK_COUNT.load(Ordering::Relaxed);
+        PERSIST_OK_COUNT.fetch_add(1, Ordering::Relaxed);
+        assert_eq!(
+            PERSIST_OK_COUNT.load(Ordering::Relaxed),
+            before.saturating_add(1)
+        );
+        PERSIST_OK_COUNT.store(before, Ordering::Relaxed);
+    }
 }
