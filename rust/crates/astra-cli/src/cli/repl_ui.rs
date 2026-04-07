@@ -91,7 +91,7 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
         "/skill",
         "Skill management: /skill [list|info|search|new|dev|test]",
     ),
-    ("/mcp", "MCP server status: /mcp [status|servers]"),
+    ("/mcp", "MCP server status: /mcp [status|servers|prompts]"),
     (
         "/report",
         "Show last delivery report (/report save = re-export JSON)",
@@ -256,6 +256,7 @@ const SLASH_FIRST_TOKEN_COMPLETIONS: &[(&str, &[(&str, &str)])] = &[
         &[
             ("servers", "Show server details and tools"),
             ("status", "Show connection status table"),
+            ("prompts", "List available MCP prompts"),
         ],
     ),
     (
@@ -591,7 +592,7 @@ fn slash_argument_hint(command: &str) -> Option<&'static str> {
         "/skill dev" => Some("<name|off>"),
         "/skill validate" | "/skill config" => Some("<name>"),
         "/skill system" => Some("<name|list>"),
-        "/mcp" => Some("[status|servers]"),
+        "/mcp" => Some("[status|servers|prompts]"),
         "/memory" => Some("[list|search <q>|inspect <id>]"),
         "/diff" => Some("[staged|unstaged|stat|show <rev>|help|<paths…>]"),
         "/plan" => {

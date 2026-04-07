@@ -4300,7 +4300,7 @@ async fn handle_slash_command(
             handle_skill_command(arg, api, state, token).await?;
         }
 
-        "/mcp" | "/mcp status" | "/mcp servers" => {
+        "/mcp" | "/mcp status" | "/mcp servers" | "/mcp prompts" => {
             slash_mcp::handle_mcp_command(arg, state).await?;
         }
 

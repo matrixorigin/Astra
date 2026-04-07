@@ -34,7 +34,10 @@ use std::time::Instant;
 
 use rmcp::{
     ClientHandler, Peer, RoleClient,
-    model::{CallToolRequestParams, CallToolResult, ReadResourceRequestParams, Resource, Tool},
+    model::{
+        CallToolRequestParams, CallToolResult, GetPromptRequestParams, GetPromptResult, Prompt,
+        ReadResourceRequestParams, Resource, Tool,
+    },
     serve_client,
     service::{NotificationContext, ServiceError},
     transport::TokioChildProcess,
@@ -326,6 +329,24 @@ impl McpConnection {
         }
         skills
     }
+
+    /// List all prompts available from this server.
+    pub async fn list_prompts(&self) -> Result<Vec<Prompt>, ServiceError> {
+        self.peer.list_all_prompts().await
+    }
+
+    /// Get a specific prompt by name, optionally with arguments.
+    pub async fn get_prompt(
+        &self,
+        name: &str,
+        arguments: Option<serde_json::Map<String, serde_json::Value>>,
+    ) -> Result<GetPromptResult, ServiceError> {
+        let mut params = GetPromptRequestParams::new(name.to_string());
+        if let Some(args) = arguments {
+            params.arguments = Some(args);
+        }
+        self.peer.get_prompt(params).await
+    }
 }
 
 /// MCP client manager for multiple server connections.
@@ -464,6 +485,41 @@ impl McpClientManager {
             .into_iter()
             .map(|(server, tool)| mcp_tool_to_schema(server, tool))
             .collect()
+    }
+
+    /// List all prompts from all connected servers.
+    /// Returns (server_name, prompt) pairs.
+    pub async fn all_prompts(&self) -> Vec<(String, Prompt)> {
+        let mut result = Vec::new();
+        for (name, conn) in &self.connections {
+            match conn.list_prompts().await {
+                Ok(prompts) => {
+                    for p in prompts {
+                        result.push((name.clone(), p));
+                    }
+                }
+                Err(e) => {
+                    eprintln!("  ⚠ Failed to list prompts from {name}: {e}");
+                }
+            }
+        }
+        result
+    }
+
+    /// Get a prompt from a specific server.
+    pub async fn get_prompt(
+        &self,
+        server_name: &str,
+        prompt_name: &str,
+        arguments: Option<serde_json::Map<String, serde_json::Value>>,
+    ) -> Result<GetPromptResult, McpError> {
+        let conn = self
+            .connections
+            .get(server_name)
+            .ok_or_else(|| McpError::ServerNotConnected(server_name.to_string()))?;
+        conn.get_prompt(prompt_name, arguments)
+            .await
+            .map_err(McpError::Service)
     }
 
     /// Find which server owns a sanitized MCP tool name (e.g. "mcp_fs_read_file").
@@ -1970,6 +2026,33 @@ mcp_servers:
             let mut manager = McpClientManager::new();
             let refreshed = manager.refresh_changed_tools().await;
             assert!(refreshed.is_empty());
+        });
+    }
+
+    #[test]
+    fn manager_all_prompts_empty() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let manager = McpClientManager::new();
+            let prompts = manager.all_prompts().await;
+            assert!(prompts.is_empty());
+        });
+    }
+
+    #[test]
+    fn manager_get_prompt_no_server() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let manager = McpClientManager::new();
+            let result = manager.get_prompt("nonexistent", "test", None).await;
+            assert!(result.is_err());
+            assert!(matches!(result.unwrap_err(), McpError::ServerNotConnected(_)));
         });
     }
 }

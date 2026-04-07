@@ -8,6 +8,7 @@ pub(super) async fn handle_mcp_command(arg: &str, state: &ReplState) -> Result<(
     match sub {
         "" | "status" => show_status(state).await,
         "servers" => show_servers(state).await,
+        "prompts" => show_prompts(state).await,
         s if s.starts_with("add ") => handle_mcp_add(&s[4..]).await,
         "add" => {
             eprintln!(
@@ -22,7 +23,7 @@ pub(super) async fn handle_mcp_command(arg: &str, state: &ReplState) -> Result<(
         _ => {
             eprintln!(
                 "{}",
-                format!("  Unknown /mcp subcommand: '{sub}'. Try /mcp, /mcp add, /mcp remove, /mcp servers")
+                format!("  Unknown /mcp subcommand: '{sub}'. Try /mcp, /mcp add, /mcp remove, /mcp servers, /mcp prompts")
                     .yellow()
             );
         }
@@ -91,6 +92,61 @@ async fn show_servers(state: &ReplState) {
             }
             eprintln!("  └─");
         }
+    }
+}
+
+async fn show_prompts(state: &ReplState) {
+    let manager = state.mcp_manager.read().await;
+
+    if manager.connection_count() == 0 {
+        eprintln!("{}", "  No MCP servers connected.".dim());
+        return;
+    }
+
+    let prompts = manager.all_prompts().await;
+
+    if prompts.is_empty() {
+        eprintln!("{}", "  No prompts available from connected MCP servers.".dim());
+        return;
+    }
+
+    eprintln!(
+        "{}",
+        format!("  MCP Prompts: {} available", prompts.len()).bold()
+    );
+    eprintln!();
+
+    for (server, prompt) in &prompts {
+        let desc = prompt
+            .description
+            .as_deref()
+            .unwrap_or("")
+            .chars()
+            .take(60)
+            .collect::<String>();
+        let args = prompt
+            .arguments
+            .as_ref()
+            .map(|a| {
+                a.iter()
+                    .map(|arg| {
+                        if arg.required.unwrap_or(false) {
+                            format!("<{}>", arg.name)
+                        } else {
+                            format!("[{}]", arg.name)
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .unwrap_or_default();
+
+        eprintln!(
+            "  {} {} {}",
+            format!("{server}:{}", prompt.name).bold(),
+            args.dim(),
+            desc.dim(),
+        );
     }
 }
 
