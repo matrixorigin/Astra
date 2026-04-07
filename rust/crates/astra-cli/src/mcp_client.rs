@@ -35,9 +35,10 @@ use std::time::Instant;
 use rmcp::{
     ClientHandler, Peer, RoleClient,
     model::{
-        CallToolRequestParams, CallToolResult, CreateMessageRequestParams, CreateMessageResult,
-        ErrorData as McpHandlerError, GetPromptRequestParams, GetPromptResult, LoggingLevel,
-        Prompt, ReadResourceRequestParams, Resource, Role, SamplingMessage,
+        CallToolRequestParams, CallToolResult, CreateElicitationRequestParams,
+        CreateElicitationResult, CreateMessageRequestParams, CreateMessageResult,
+        ElicitationAction, ErrorData as McpHandlerError, GetPromptRequestParams, GetPromptResult,
+        LoggingLevel, Prompt, ReadResourceRequestParams, Resource, Role, SamplingMessage,
         SamplingMessageContent, SetLevelRequestParams, SubscribeRequestParams, Tool,
         UnsubscribeRequestParams,
     },
@@ -298,6 +299,15 @@ impl ClientHandler for ChangeHandler {
             do_sampling(&config, params).await
         }
     }
+
+    fn create_elicitation(
+        &self,
+        request: CreateElicitationRequestParams,
+        _context: RequestContext<RoleClient>,
+    ) -> impl std::future::Future<Output = Result<CreateElicitationResult, McpHandlerError>> + Send + '_
+    {
+        async move { do_elicitation(request).await }
+    }
 }
 
 // ── Sampling implementation ──────────────────────────────────────────────
@@ -398,6 +408,229 @@ async fn do_sampling(
         model_name.to_string(),
     )
     .with_stop_reason(stop_reason))
+}
+
+// ── Elicitation implementation ───────────────────────────────────────────
+
+/// Extract enum values from any variant of `EnumSchema`.
+fn enum_schema_values(schema: &rmcp::model::EnumSchema) -> Vec<String> {
+    // Serialize to JSON and extract `enum` or `oneOf[].const` values.
+    let json = match serde_json::to_value(schema) {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+    // Legacy / untitled: has "enum" array
+    if let Some(arr) = json.get("enum").and_then(|v| v.as_array()) {
+        return arr.iter().filter_map(|v| v.as_str().map(String::from)).collect();
+    }
+    // Titled: has "oneOf" with "const" values
+    if let Some(arr) = json.get("oneOf").and_then(|v| v.as_array()) {
+        return arr
+            .iter()
+            .filter_map(|v| v.get("const").and_then(|c| c.as_str()).map(String::from))
+            .collect();
+    }
+    Vec::new()
+}
+
+/// Fulfill an elicitation request by prompting the user interactively.
+async fn do_elicitation(
+    request: CreateElicitationRequestParams,
+) -> Result<CreateElicitationResult, McpHandlerError> {
+    use rmcp::model::PrimitiveSchema;
+
+    match request {
+        CreateElicitationRequestParams::FormElicitationParams {
+            message,
+            requested_schema,
+            ..
+        } => {
+            // Collect schema info before entering the blocking thread.
+            let required: std::collections::HashSet<String> = requested_schema
+                .required
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .cloned()
+                .collect();
+
+            let fields: Vec<(String, String, bool)> = requested_schema
+                .properties
+                .iter()
+                .map(|(name, schema)| {
+                    let type_hint = match schema {
+                        PrimitiveSchema::String(s) => {
+                            if let Some(fmt) = &s.format {
+                                format!("{fmt:?}").to_lowercase()
+                            } else {
+                                "string".to_string()
+                            }
+                        }
+                        PrimitiveSchema::Number(_) => "number".to_string(),
+                        PrimitiveSchema::Integer(_) => "integer".to_string(),
+                        PrimitiveSchema::Boolean(_) => "true/false".to_string(),
+                        PrimitiveSchema::Enum(e) => {
+                            let opts = enum_schema_values(e);
+                            if opts.is_empty() {
+                                "enum".to_string()
+                            } else {
+                                format!("one of: {}", opts.join(", "))
+                            }
+                        }
+                    };
+                    let is_required = required.contains(name);
+                    (name.clone(), type_hint, is_required)
+                })
+                .collect();
+
+            // Schema types for parsing (cloned to move into blocking closure).
+            let schema_types: Vec<(String, String)> = requested_schema
+                .properties
+                .iter()
+                .map(|(name, schema)| {
+                    let kind = match schema {
+                        PrimitiveSchema::Boolean(_) => "bool",
+                        PrimitiveSchema::Integer(_) => "int",
+                        PrimitiveSchema::Number(_) => "num",
+                        _ => "str",
+                    };
+                    (name.clone(), kind.to_string())
+                })
+                .collect();
+
+            tokio::task::spawn_blocking(move || {
+                use std::io::BufRead;
+                let stdin = std::io::stdin();
+
+                eprintln!("\n  ╭─ MCP Elicitation Request");
+                eprintln!("  │ {message}");
+
+                let mut data = serde_json::Map::new();
+
+                for (name, type_hint, is_required) in &fields {
+                    let req_marker = if *is_required { "*" } else { "" };
+                    eprint!("  │ {name}{req_marker} ({type_hint}): ");
+
+                    let mut line = String::new();
+                    if stdin.lock().read_line(&mut line).is_err() || line.is_empty() {
+                        eprintln!("  ╰─ Cancelled (input closed)");
+                        return Ok(CreateElicitationResult {
+                            action: ElicitationAction::Cancel,
+                            content: None,
+                        });
+                    }
+
+                    let trimmed = line.trim();
+                    if trimmed.is_empty() && !is_required {
+                        continue;
+                    }
+                    if trimmed == "/cancel" {
+                        eprintln!("  ╰─ Cancelled");
+                        return Ok(CreateElicitationResult {
+                            action: ElicitationAction::Cancel,
+                            content: None,
+                        });
+                    }
+                    if trimmed == "/decline" {
+                        eprintln!("  ╰─ Declined");
+                        return Ok(CreateElicitationResult {
+                            action: ElicitationAction::Decline,
+                            content: None,
+                        });
+                    }
+
+                    let kind = schema_types
+                        .iter()
+                        .find(|(n, _)| n == name)
+                        .map(|(_, k)| k.as_str())
+                        .unwrap_or("str");
+
+                    let value = match kind {
+                        "bool" => serde_json::Value::Bool(
+                            matches!(trimmed, "true" | "yes" | "1" | "y"),
+                        ),
+                        "int" => match trimmed.parse::<i64>() {
+                            Ok(n) => serde_json::Value::Number(n.into()),
+                            Err(_) => serde_json::Value::String(trimmed.to_string()),
+                        },
+                        "num" => match trimmed.parse::<f64>() {
+                            Ok(n) => serde_json::Number::from_f64(n)
+                                .map(serde_json::Value::Number)
+                                .unwrap_or_else(|| {
+                                    serde_json::Value::String(trimmed.to_string())
+                                }),
+                            Err(_) => serde_json::Value::String(trimmed.to_string()),
+                        },
+                        _ => serde_json::Value::String(trimmed.to_string()),
+                    };
+                    data.insert(name.clone(), value);
+                }
+
+                eprintln!("  ╰─ Accepted");
+                Ok(CreateElicitationResult {
+                    action: ElicitationAction::Accept,
+                    content: Some(serde_json::Value::Object(data)),
+                })
+            })
+            .await
+            .unwrap_or_else(|e| {
+                Err(McpHandlerError::internal_error(
+                    format!("elicitation task failed: {e}"),
+                    None,
+                ))
+            })
+        }
+        CreateElicitationRequestParams::UrlElicitationParams {
+            message, url, ..
+        } => {
+            tokio::task::spawn_blocking(move || {
+                use std::io::BufRead;
+                let stdin = std::io::stdin();
+
+                eprintln!("\n  ╭─ MCP Elicitation (URL)");
+                eprintln!("  │ {message}");
+                eprintln!("  │ URL: {url}");
+                eprint!("  │ Press Enter after visiting, or type /cancel: ");
+
+                let mut line = String::new();
+                if stdin.lock().read_line(&mut line).is_err() || line.is_empty() {
+                    eprintln!("  ╰─ Cancelled (input closed)");
+                    return Ok(CreateElicitationResult {
+                        action: ElicitationAction::Cancel,
+                        content: None,
+                    });
+                }
+
+                let trimmed = line.trim();
+                if trimmed == "/cancel" {
+                    eprintln!("  ╰─ Cancelled");
+                    Ok(CreateElicitationResult {
+                        action: ElicitationAction::Cancel,
+                        content: None,
+                    })
+                } else if trimmed == "/decline" {
+                    eprintln!("  ╰─ Declined");
+                    Ok(CreateElicitationResult {
+                        action: ElicitationAction::Decline,
+                        content: None,
+                    })
+                } else {
+                    eprintln!("  ╰─ Accepted");
+                    Ok(CreateElicitationResult {
+                        action: ElicitationAction::Accept,
+                        content: None,
+                    })
+                }
+            })
+            .await
+            .unwrap_or_else(|e| {
+                Err(McpHandlerError::internal_error(
+                    format!("elicitation task failed: {e}"),
+                    None,
+                ))
+            })
+        }
+    }
 }
 
 /// Running MCP client connection.
@@ -2500,5 +2733,87 @@ mcp_servers:
 
         manager.set_sampling_config(None);
         assert!(manager.sampling.is_none());
+    }
+
+    // ── Elicitation Tests ────────────────────────────────────────────────
+
+    #[test]
+    fn enum_schema_values_legacy() {
+        // Legacy schema has "enum" array at top level.
+        let json = serde_json::json!({
+            "type": "string",
+            "enum": ["red", "green", "blue"]
+        });
+        let schema: rmcp::model::EnumSchema = serde_json::from_value(json).unwrap();
+        let vals = enum_schema_values(&schema);
+        assert_eq!(vals, vec!["red", "green", "blue"]);
+    }
+
+    #[test]
+    fn enum_schema_values_titled_single() {
+        // Titled single-select uses oneOf with const + title.
+        let json = serde_json::json!({
+            "type": "string",
+            "oneOf": [
+                {"const": "a", "title": "Option A"},
+                {"const": "b", "title": "Option B"}
+            ]
+        });
+        let schema: rmcp::model::EnumSchema = serde_json::from_value(json).unwrap();
+        let vals = enum_schema_values(&schema);
+        assert_eq!(vals, vec!["a", "b"]);
+    }
+
+    #[test]
+    fn enum_schema_values_empty_fallback() {
+        // If we can't extract any values, return empty vec.
+        let json = serde_json::json!({"type": "string"});
+        // This may fail to parse as EnumSchema, so test the function with a valid but empty enum.
+        let json2 = serde_json::json!({"type": "string", "enum": []});
+        let schema: rmcp::model::EnumSchema = serde_json::from_value(json2).unwrap();
+        let vals = enum_schema_values(&schema);
+        assert!(vals.is_empty());
+    }
+
+    #[test]
+    fn elicitation_result_actions() {
+        // Verify we can construct all action variants.
+        use rmcp::model::{CreateElicitationResult, ElicitationAction};
+
+        let accept = CreateElicitationResult {
+            action: ElicitationAction::Accept,
+            content: Some(serde_json::json!({"name": "test"})),
+        };
+        assert!(matches!(accept.action, ElicitationAction::Accept));
+        assert!(accept.content.is_some());
+
+        let decline = CreateElicitationResult {
+            action: ElicitationAction::Decline,
+            content: None,
+        };
+        assert!(matches!(decline.action, ElicitationAction::Decline));
+
+        let cancel = CreateElicitationResult {
+            action: ElicitationAction::Cancel,
+            content: None,
+        };
+        assert!(matches!(cancel.action, ElicitationAction::Cancel));
+    }
+
+    #[test]
+    fn elicitation_result_roundtrip() {
+        use rmcp::model::{CreateElicitationResult, ElicitationAction};
+
+        let result = CreateElicitationResult {
+            action: ElicitationAction::Accept,
+            content: Some(serde_json::json!({"age": 25, "name": "Alice"})),
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        let back: CreateElicitationResult = serde_json::from_str(&json).unwrap();
+        assert!(matches!(back.action, ElicitationAction::Accept));
+        assert_eq!(
+            back.content.unwrap().get("name").unwrap().as_str().unwrap(),
+            "Alice"
+        );
     }
 }

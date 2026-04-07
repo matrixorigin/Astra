@@ -82,6 +82,7 @@ async fn show_status(state: &ReplState) {
     if manager.has_sampling() {
         eprintln!("  {}", "Sampling: enabled".dim());
     }
+    eprintln!("  {}", "Elicitation: enabled".dim());
     eprintln!();
 
     print_server_table(&manager);
