@@ -117,6 +117,46 @@ pub fn detect_project_languages(root: &Path) -> Vec<String> {
     langs
 }
 
+/// Max bytes for git diff stat output to avoid blowing up context.
+const MAX_GIT_STAT_BYTES: usize = 4096;
+
+/// Run `git diff --stat` (staged or unstaged), returning a compact summary.
+fn git_diff_stat(project_root: &Path, staged: bool) -> Option<String> {
+    let mut args = vec![
+        "diff", "--stat", "--stat-width=80", "--no-color",
+    ];
+    if staged {
+        args.push("--cached");
+    }
+    std::process::Command::new("git")
+        .args(&args)
+        .current_dir(project_root)
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| {
+            let s = s.trim().to_string();
+            if s.len() > MAX_GIT_STAT_BYTES {
+                format!("{}… (truncated)", &s[..MAX_GIT_STAT_BYTES])
+            } else {
+                s
+            }
+        })
+        .filter(|s| !s.is_empty())
+}
+
+/// Run `git log --oneline -N` to get recent commit summaries.
+fn git_recent_commits(project_root: &Path, n: usize) -> Option<String> {
+    std::process::Command::new("git")
+        .args(["log", "--oneline", "--no-color", &format!("-{n}")])
+        .current_dir(project_root)
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
 /// Build a human-readable environment context string for the system prompt.
 /// Includes OS, architecture, shell, CWD, git branch/status, and terminal info.
 /// This gives the LLM awareness of the runtime environment for better tool usage.
@@ -165,6 +205,29 @@ pub fn build_environment_context(project_root: &Path) -> String {
                 .unwrap_or(false);
             let status = if dirty { " (dirty)" } else { "" };
             lines.push(format!("- Git branch: {branch}{status}"));
+
+            // Git diff summary: staged + unstaged changes (compact stat format)
+            if dirty {
+                // Staged changes
+                if let Some(staged) = git_diff_stat(project_root, true) {
+                    if !staged.is_empty() {
+                        lines.push(format!("- Staged changes:\n{staged}"));
+                    }
+                }
+                // Unstaged changes
+                if let Some(unstaged) = git_diff_stat(project_root, false) {
+                    if !unstaged.is_empty() {
+                        lines.push(format!("- Unstaged changes:\n{unstaged}"));
+                    }
+                }
+            }
+
+            // Recent commits (last 5 one-liners for context)
+            if let Some(log) = git_recent_commits(project_root, 5) {
+                if !log.is_empty() {
+                    lines.push(format!("- Recent commits:\n{log}"));
+                }
+            }
         }
     }
 
@@ -457,6 +520,60 @@ mod tests {
         assert!(
             !ctx.contains("- Git branch:"),
             "temp dir should not have git branch"
+        );
+    }
+
+    #[test]
+    fn git_diff_stat_returns_some_in_git_repo() {
+        let cwd = std::env::current_dir().unwrap();
+        // Should return Some (possibly empty string) or None — just ensure no panic
+        let _ = git_diff_stat(&cwd, true);
+        let _ = git_diff_stat(&cwd, false);
+    }
+
+    #[test]
+    fn git_diff_stat_returns_none_outside_repo() {
+        let tmp = tempdir().unwrap();
+        unsafe {
+            std::env::set_var("GIT_CEILING_DIRECTORIES", tmp.path().parent().unwrap());
+        }
+        let result = git_diff_stat(tmp.path(), false);
+        unsafe {
+            std::env::remove_var("GIT_CEILING_DIRECTORIES");
+        }
+        // Outside a git repo, git diff fails — returns None
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn git_recent_commits_returns_some_in_git_repo() {
+        let cwd = std::env::current_dir().unwrap();
+        let log = git_recent_commits(&cwd, 3);
+        assert!(log.is_some(), "should have recent commits in project repo");
+        let log = log.unwrap();
+        assert!(log.lines().count() <= 3);
+    }
+
+    #[test]
+    fn git_recent_commits_returns_none_outside_repo() {
+        let tmp = tempdir().unwrap();
+        unsafe {
+            std::env::set_var("GIT_CEILING_DIRECTORIES", tmp.path().parent().unwrap());
+        }
+        let result = git_recent_commits(tmp.path(), 3);
+        unsafe {
+            std::env::remove_var("GIT_CEILING_DIRECTORIES");
+        }
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn environment_context_includes_git_commits_in_repo() {
+        let cwd = std::env::current_dir().unwrap();
+        let ctx = build_environment_context(&cwd);
+        assert!(
+            ctx.contains("- Recent commits:"),
+            "should include recent commits in a git repo"
         );
     }
 }
