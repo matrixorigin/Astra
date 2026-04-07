@@ -63,7 +63,7 @@ Legend: **E2E** = `rust/crates/runtime/tests/system_matrix_http_e2e/` with `ASTR
 
 ## Chat turn / bridge (what remains)
 
-- **Stub integration:** `chat_turn_bridge_contract.rs` + `fixtures/contracts/chat_turn_bridge_contract.json` only — fast CI path without MatrixOne. Shared `sse_ok` / `ingest_bridge_capture_from_request` helpers; eight former “rebuilds \*” HTTP cases run inside `http_chat_turn_bridge_rebuilds_sanitized_upstream_events` via `internal_rebuild_case!`.
+- **Stub integration:** `chat_turn_bridge_contract.rs` + `fixtures/contracts/chat_turn_bridge_contract.json` only — fast CI path without MatrixOne. Shared `sse_ok` / `ingest_bridge_capture_from_request` helpers; eight former `http_chat_turn_bridge_rebuilds_*` cases run inside `http_chat_turn_bridge_rebuilds_sanitized_upstream_events` via `internal_rebuild_case!`.
 - **Logic:** prefer `src/turn/*` unit tests; extend those modules (or Matrix `system_matrix_http_e2e`) instead of new top-level `*_contract.rs` binaries.
 - **`/chat/stream` bridge fallback** (lifecycle unconfigured): `runtime/src/server/chat_handlers.rs` → `chat_stream_bridge_fallback_tests` (`#[cfg(test)]`, was `chat_stream_bridge_fallback_contract.rs`).
 - **Bridge hook DB side effects** (`build_turn_hook_args` → `run_bridge_hook_side_effects`): `runtime/src/bridge/side_effects.rs` → `inprocess_hook_contract_tests` (`#[cfg(test)]`, was `inprocess_hook_contract.rs`).
