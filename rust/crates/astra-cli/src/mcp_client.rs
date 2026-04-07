@@ -35,9 +35,9 @@ use std::time::Instant;
 use rmcp::{
     ClientHandler, Peer, RoleClient,
     model::{
-        CallToolRequestParams, CallToolResult, GetPromptRequestParams, GetPromptResult, Prompt,
-        ReadResourceRequestParams, Resource, SubscribeRequestParams, Tool,
-        UnsubscribeRequestParams,
+        CallToolRequestParams, CallToolResult, GetPromptRequestParams, GetPromptResult,
+        LoggingLevel, Prompt, ReadResourceRequestParams, Resource, SetLevelRequestParams,
+        SubscribeRequestParams, Tool, UnsubscribeRequestParams,
     },
     serve_client,
     service::{NotificationContext, ServiceError},
@@ -233,6 +233,31 @@ impl ClientHandler for ChangeHandler {
         self.resources_changed.store(true, Ordering::Release);
         std::future::ready(())
     }
+
+    fn on_logging_message(
+        &self,
+        params: rmcp::model::LoggingMessageNotificationParam,
+        _context: NotificationContext<RoleClient>,
+    ) -> impl std::future::Future<Output = ()> + Send + '_ {
+        let level = match params.level {
+            rmcp::model::LoggingLevel::Debug => "DEBUG",
+            rmcp::model::LoggingLevel::Info => "INFO",
+            rmcp::model::LoggingLevel::Notice => "NOTICE",
+            rmcp::model::LoggingLevel::Warning => "WARN",
+            rmcp::model::LoggingLevel::Error => "ERROR",
+            rmcp::model::LoggingLevel::Critical => "CRIT",
+            rmcp::model::LoggingLevel::Alert => "ALERT",
+            rmcp::model::LoggingLevel::Emergency => "EMERG",
+        };
+        let logger = params.logger.as_deref().unwrap_or("mcp");
+        let data = if let Some(s) = params.data.as_str() {
+            s.to_string()
+        } else {
+            params.data.to_string()
+        };
+        eprintln!("  [{level}] {logger}: {data}");
+        std::future::ready(())
+    }
 }
 
 /// Running MCP client connection.
@@ -380,6 +405,13 @@ impl McpConnection {
     pub async fn unsubscribe_resource(&self, uri: &str) -> Result<(), ServiceError> {
         self.peer
             .unsubscribe(UnsubscribeRequestParams::new(uri))
+            .await
+    }
+
+    /// Set the logging level for this server.
+    pub async fn set_log_level(&self, level: LoggingLevel) -> Result<(), ServiceError> {
+        self.peer
+            .set_level(SetLevelRequestParams::new(level))
             .await
     }
 
