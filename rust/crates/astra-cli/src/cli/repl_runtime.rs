@@ -120,6 +120,7 @@ fn create_tool_selector_with_quality_internal(
                 ),
                 token,
                 model: "default".to_string(),
+                max_tokens_cap: mcp_client::DEFAULT_SAMPLING_MAX_TOKENS_CAP,
             };
             tokio::task::block_in_place(|| {
                 handle.block_on(async {
