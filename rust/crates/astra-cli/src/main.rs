@@ -185,6 +185,9 @@ struct Cli {
     /// Maximum agentic turns (useful with --print to limit cost)
     #[arg(long = "max-turns")]
     max_turns: Option<usize>,
+    /// Maximum session cost in USD before auto-exit (0 = unlimited)
+    #[arg(long = "max-budget", default_value_t = 0.0)]
+    max_budget: f64,
     /// Comma or space-separated list of tool names to allow (e.g. "Bash Edit Read")
     #[arg(long = "allowed-tools", num_args = 1..)]
     allowed_tools: Vec<String>,
@@ -716,6 +719,8 @@ struct ReplState {
     total_cache_creation_tokens: u64,
     /// Per-turn cost accumulator (sum of all turns in this session).
     total_session_cost: f64,
+    /// Maximum session cost in USD before auto-exit (0.0 = unlimited).
+    max_budget_limit: f64,
     /// Cached pricing data for the active model (used by /cost).
     cached_pricing: astra_services::models::PricingData,
     skill_dev: Option<SkillDevState>,
@@ -833,6 +838,10 @@ impl Default for ReplState {
             total_cache_read_tokens: 0,
             total_cache_creation_tokens: 0,
             total_session_cost: 0.0,
+            max_budget_limit: std::env::var("MO_MAX_BUDGET")
+                .ok()
+                .and_then(|v| v.parse::<f64>().ok())
+                .unwrap_or(0.0),
             cached_pricing: Default::default(),
             skill_dev: None,
             active_system_skills: Vec::new(),
@@ -4482,6 +4491,45 @@ async fn handle_slash_command(
             handle_account_command(cmd, arg, api, profile, state).await?;
         }
 
+        "/allow" => {
+            use permission_manager::PermissionMode;
+            match arg {
+                "" => {
+                    // Cycle: Prompt → Auto → Deny → Prompt
+                    let next = match state.perm_manager.mode() {
+                        PermissionMode::Prompt => PermissionMode::Auto,
+                        PermissionMode::Auto => PermissionMode::Deny,
+                        PermissionMode::Deny => PermissionMode::Prompt,
+                    };
+                    state.perm_manager.set_mode(next);
+                    eprintln!(
+                        "  {} Permission mode → {}",
+                        theme::icon_info(),
+                        next.to_string().cyan()
+                    );
+                }
+                _ => {
+                    match arg.parse::<PermissionMode>() {
+                        Ok(mode) => {
+                            state.perm_manager.set_mode(mode);
+                            eprintln!(
+                                "  {} Permission mode → {}",
+                                theme::icon_info(),
+                                mode.to_string().cyan()
+                            );
+                        }
+                        Err(_) => {
+                            eprintln!(
+                                "  {} Unknown mode '{}'. Use: auto, prompt, deny",
+                                theme::icon_warn(),
+                                arg
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
         "/clear" | "/explain" | "/verbose" | "/compact" | "/reflect" | "/skill-search" => {
             handle_state_command(
                 cmd,
@@ -5143,6 +5191,27 @@ async fn run_chat_repl(
                         // On conflict, we skip this push — the final push at session end
                         // will resolve conflicts via pull-merge-push cycle
                     }
+
+                    // --max-budget enforcement: check accumulated cost against budget limit
+                    if state.max_budget_limit > 0.0 {
+                        let current_cost = cost_for_tokens(
+                            state.total_prompt_tokens,
+                            state.total_completion_tokens,
+                            state.total_cache_read_tokens,
+                            state.total_cache_creation_tokens,
+                            &state.cached_pricing,
+                        );
+                        state.total_session_cost = current_cost;
+                        if current_cost >= state.max_budget_limit {
+                            eprintln!(
+                                "\n  {} Session budget reached: {} / {} limit. Exiting.",
+                                theme::icon_warn(),
+                                format_cost(current_cost).bold(),
+                                format_cost(state.max_budget_limit),
+                            );
+                            break;
+                        }
+                    }
                 }
             }
             Err(ReadlineError::Interrupted) => {
@@ -5372,6 +5441,7 @@ async fn main() {
         yes: auto_approve,
         system_prompt,
         max_turns,
+        max_budget,
         allowed_tools,
         disallowed_tools,
         add_dir,
@@ -5392,6 +5462,26 @@ async fn main() {
     if let Some(turns) = max_turns {
         unsafe { std::env::set_var("MO_MAX_TURNS", turns.to_string()); }
     }
+
+    // --max-budget: store the limit; enforcement happens in the REPL loop
+    if max_budget > 0.0 {
+        unsafe { std::env::set_var("MO_MAX_BUDGET", max_budget.to_string()); }
+    }
+
+    // --system-prompt: support @file syntax to read from file
+    let system_prompt = system_prompt.map(|sp| {
+        if let Some(path) = sp.strip_prefix('@') {
+            match std::fs::read_to_string(path) {
+                Ok(content) => content,
+                Err(e) => {
+                    eprintln!("{}", format!("Error: cannot read system prompt file '{}': {}", path, e).red());
+                    std::process::exit(1);
+                }
+            }
+        } else {
+            sp
+        }
+    });
 
     // --allowed-tools: normalize comma/space-separated list and export as env var
     if !allowed_tools.is_empty() {
@@ -8609,5 +8699,58 @@ total_tokens_out: 500
         ]).unwrap();
         assert_eq!(cli.session_id.as_deref(), Some("123e4567-e89b-12d3-a456-426614174000"));
         assert_eq!(cli.session_name.as_deref(), Some("debug-session"));
+    }
+
+    // ── --max-budget tests ──
+
+    #[test]
+    fn cli_max_budget_flag() {
+        let cli = Cli::try_parse_from(["astra", "--max-budget", "5.50"]).unwrap();
+        assert!((cli.max_budget - 5.50).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn cli_max_budget_default_zero() {
+        let cli = Cli::try_parse_from(["astra"]).unwrap();
+        assert!((cli.max_budget - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn cli_max_budget_rejects_non_numeric() {
+        let result = Cli::try_parse_from(["astra", "--max-budget", "abc"]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn cli_max_budget_with_print_and_turns() {
+        let cli = Cli::try_parse_from([
+            "astra", "-p", "--max-turns", "10", "--max-budget", "1.0",
+        ]).unwrap();
+        assert!(cli.print);
+        assert_eq!(cli.max_turns, Some(10));
+        assert!((cli.max_budget - 1.0).abs() < f64::EPSILON);
+    }
+
+    // ── /allow command tests ──
+
+    #[test]
+    fn permission_mode_set_mode() {
+        let mut pm = permission_manager::PermissionManager::with_project(
+            false,
+            &std::path::PathBuf::from("/tmp"),
+        );
+        assert_eq!(pm.mode(), permission_manager::PermissionMode::Prompt);
+        pm.set_mode(permission_manager::PermissionMode::Auto);
+        assert_eq!(pm.mode(), permission_manager::PermissionMode::Auto);
+        pm.set_mode(permission_manager::PermissionMode::Deny);
+        assert_eq!(pm.mode(), permission_manager::PermissionMode::Deny);
+    }
+
+    #[test]
+    fn permission_mode_roundtrip_parse() {
+        for mode_str in &["auto", "prompt", "deny"] {
+            let mode: permission_manager::PermissionMode = mode_str.parse().unwrap();
+            assert_eq!(mode.to_string().to_lowercase(), *mode_str);
+        }
     }
 }
