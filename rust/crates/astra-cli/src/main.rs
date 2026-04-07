@@ -3584,6 +3584,20 @@ fn display_plan_updates_live(
 /// Prompt redraws during active input can interrupt IME composition and cause
 /// probabilistic dropped characters for CJK input. The plan update channel is
 /// unbounded, so deferring display between prompts is safe and lossless.
+/// Truncate skill description for readline completion (≤39 chars + `…` when longer).
+///
+/// Do not slice by byte index: descriptions may contain multi-byte Unicode (em dash, CJK, …).
+fn truncate_skill_desc_for_completion(description: &str) -> String {
+    const MAX_CHARS: usize = 39;
+    let mut iter = description.chars();
+    let preview: String = iter.by_ref().take(MAX_CHARS).collect();
+    if iter.next().is_some() {
+        format!("{preview}…")
+    } else {
+        description.to_string()
+    }
+}
+
 /// Refresh dynamic Tab-completion data (skill names, MCP server names) from
 /// the current REPL state so the readline completer offers them.
 async fn refresh_dynamic_completions(state: &ReplState) {
@@ -3593,13 +3607,7 @@ async fn refresh_dynamic_completions(state: &ReplState) {
         manifests
             .into_iter()
             .map(|m| {
-                let mut iter = m.description.chars();
-                let preview: String = iter.by_ref().take(39).collect();
-                let desc = if iter.next().is_some() {
-                    format!("{preview}…")
-                } else {
-                    m.description.clone()
-                };
+                let desc = truncate_skill_desc_for_completion(m.description.as_str());
                 (m.name, desc)
             })
             .collect()
@@ -5760,6 +5768,49 @@ mod tests {
             assistant_tc_msg.get("reasoning_content").is_none(),
             "reasoning_content must NOT be present for non-thinking models"
         );
+    }
+
+    #[test]
+    fn truncate_skill_desc_for_completion_empty() {
+        assert_eq!(truncate_skill_desc_for_completion(""), "");
+    }
+
+    #[test]
+    fn truncate_skill_desc_for_completion_short_unchanged() {
+        let s = "Short skill blurb";
+        assert_eq!(truncate_skill_desc_for_completion(s), s);
+    }
+
+    #[test]
+    fn truncate_skill_desc_for_completion_exact_limit_no_ellipsis() {
+        let s: String = (0..39).map(|_| 'a').collect();
+        assert_eq!(truncate_skill_desc_for_completion(&s), s);
+    }
+
+    #[test]
+    fn truncate_skill_desc_for_completion_ascii_long_gets_ellipsis() {
+        let s: String = (0..45).map(|_| 'b').collect();
+        let out = truncate_skill_desc_for_completion(&s);
+        assert!(out.ends_with('…'), "out={out:?}");
+        assert_eq!(out.chars().count(), 40);
+        assert!(out.starts_with(&s[..39]));
+    }
+
+    /// Regression: byte index 39 was inside U+2014 EM DASH (3 bytes) — must not slice by bytes.
+    #[test]
+    fn truncate_skill_desc_for_completion_em_dash_no_panic() {
+        let s = "Review and manage persistent memories — promote, clean up, and organize knowledge across sessions";
+        let expect: String = s.chars().take(39).collect();
+        let out = truncate_skill_desc_for_completion(s);
+        assert_eq!(out, format!("{expect}…"));
+    }
+
+    #[test]
+    fn truncate_skill_desc_for_completion_cjk_no_panic() {
+        let s = "数据".repeat(30);
+        let out = truncate_skill_desc_for_completion(&s);
+        assert!(out.ends_with('…'));
+        assert_eq!(out.chars().count(), 40);
     }
 
     #[test]
