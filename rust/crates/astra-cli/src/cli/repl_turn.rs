@@ -24,10 +24,10 @@ pub(super) fn enqueue_ingestion_pub(state: &ReplState, event: &session_journal::
 /// Pull a few Memoria hits after compact so the shortened context keeps **session-relevant**
 /// recall (similar in spirit to Claude Code keeping session memory as an anchor).
 const COMPACT_ANCHOR_QUERY_MAX: usize = 220;
-const COMPACT_ANCHOR_TOP_K: u32 = 5;
-const COMPACT_ANCHOR_MAX_LINES: usize = 4;
-const COMPACT_ANCHOR_LINE_MAX: usize = 140;
-const COMPACT_ANCHOR_TOTAL_MAX: usize = 700;
+const COMPACT_ANCHOR_TOP_K: u32 = 3;
+const COMPACT_ANCHOR_MAX_LINES: usize = 3;
+const COMPACT_ANCHOR_LINE_MAX: usize = 120;
+const COMPACT_ANCHOR_TOTAL_MAX: usize = 400;
 
 pub(super) async fn fetch_compact_memory_anchor_snippet(
     api: &astra_thin_client::ThinClient,
@@ -542,10 +542,15 @@ async fn apply_auto_compact_result(
         return Ok(());
     }
 
-    let anchor =
+    // Skip Memoria anchor for short sessions — the summary alone is sufficient
+    // and the anchor would largely duplicate what's already in kept turns.
+    let anchor = if trimmed >= 4 {
         fetch_compact_memory_anchor_snippet(ctx.api, token, state.session_id.as_deref(), &summary)
-            .await;
-    let assistant_text = compact_assistant_message(compacted_count, &summary, anchor.as_deref());
+            .await
+    } else {
+        None
+    };
+    let assistant_text = compact_assistant_message(trimmed, &summary, anchor.as_deref());
     let summary_entry = (String::new(), assistant_text);
     let mut new_history = vec![summary_entry];
 

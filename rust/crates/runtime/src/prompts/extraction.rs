@@ -93,32 +93,24 @@ pub fn parse_extracted_facts(raw: &str) -> Vec<(String, String)> {
 /// The existing conversation history is already in the message context, so the
 /// LLM sees the full transcript when it generates the summary.
 pub const COMPACT_SUMMARY_REQUEST: &str = "\
-Produce a concise, structured summary of the conversation so far.
-
-## Required sections (use these exact headers):
+Summarize this conversation in <250 words using exactly these 5 sections:
 
 ### Goals
-What the user is trying to achieve.
+What the user wants to achieve.
 
 ### Decisions
-Key choices made and their reasoning. One bullet per decision.
+Key choices and reasoning. One bullet each.
 
 ### Actions
-Tool calls, code changes, commands run. Brief, factual.
+Tool calls, code changes, commands. Brief.
 
 ### Status
-Current state: what's done, what's pending, any blockers.
+Done, pending, blockers.
 
 ### Key Facts
-User preferences, project conventions, or important details worth remembering.
+Preferences, conventions, important details.
 
-## Rules
-- Under 250 words total.
-- Output only the five sections above. Do not add any other headings, sections, preamble, greeting, or sign-off.
-- The first line of your response must be exactly `### Goals` (no text before it).
-- After the bullets under `### Key Facts`, stop. Do not add closing remarks or a summary line.
-- Use bullet points under each section, not prose paragraphs.
-- Do not paste the raw transcript; summarize.";
+Rules: bullets only, no prose. Start with `### Goals`. Stop after Key Facts. 5 sections only.";
 
 #[cfg(test)]
 mod tests {
