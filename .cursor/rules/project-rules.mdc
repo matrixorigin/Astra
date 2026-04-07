@@ -1,6 +1,11 @@
-# astra-engine Development & Testing Guide
+---
+description: mo-agent-runtime — Rust (astra-*) development, testing, and conventions
+alwaysApply: true
+---
 
-You are working on astra-engine, a Rust-first agent platform. Your primary tasks are development, testing, and debugging.
+# mo-agent-runtime Development & Testing Guide
+
+You are working on **mo-agent-runtime**, a Rust-first agent platform (workspace crates `astra-core`, `astra-cli`, `astra-admin`, etc.). Primary focus: development, testing, and debugging.
 
 ## Quick Reference
 
@@ -16,11 +21,12 @@ make dev-stop           # Stop all
 
 ## Workspace Structure
 
-- `rust/crates/core/` — shared types
+- `rust/crates/core/` — package `astra-core`, shared types and config contract tests
 - `rust/crates/services/` — sessions, journals, durable tasks, cloud sync
 - `rust/crates/runtime/` — Axum HTTP server, contract tests in `tests/`
 - `rust/crates/astra-cli/` — CLI, edge tools, plan executor, code intel
 - `rust/crates/astra-admin/` — admin CLI
+- `rust/crates/astra-thin-client/` — stateless HTTP + SSE client for the thin client protocol
 - `skills/` — Agent Skills (SKILL.md format, see `skills/README.md`)
 - `web/` — Next.js admin dashboard
 
@@ -93,6 +99,8 @@ All persisted state must form a coherent, navigable chain for debugging and anal
 5. For DB-dependent tests: `make dev-start` then `make test-integration`
 
 ## Built-in Skills (read `skills/<name>/SKILL.md` for full instructions)
+
+Sources live under repository root `skills/`. **Cursor** discovers the same tree as `.cursor/skills/` (symlink → `skills/`) so the Skills UI and agent can load them.
 
 When the user asks you to perform any of the following tasks, read the corresponding SKILL.md file first and follow its phased workflow:
 
