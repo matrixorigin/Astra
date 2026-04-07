@@ -83,6 +83,14 @@ async fn show_status(state: &ReplState) {
         eprintln!("  {}", "Sampling: enabled".dim());
     }
     eprintln!("  {}", "Elicitation: enabled".dim());
+    let roots = manager.roots().read().await;
+    if !roots.is_empty() {
+        let names: Vec<&str> = roots
+            .iter()
+            .map(|r| r.name.as_deref().unwrap_or(&r.uri))
+            .collect();
+        eprintln!("  {}", format!("Roots: {}", names.join(", ")).dim());
+    }
     eprintln!();
 
     print_server_table(&manager);

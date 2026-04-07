@@ -38,9 +38,9 @@ use rmcp::{
         CallToolRequestParams, CallToolResult, CreateElicitationRequestParams,
         CreateElicitationResult, CreateMessageRequestParams, CreateMessageResult,
         ElicitationAction, ErrorData as McpHandlerError, GetPromptRequestParams, GetPromptResult,
-        LoggingLevel, Prompt, ReadResourceRequestParams, Resource, Role, SamplingMessage,
-        SamplingMessageContent, SetLevelRequestParams, SubscribeRequestParams, Tool,
-        UnsubscribeRequestParams,
+        ListRootsResult, LoggingLevel, Prompt, ReadResourceRequestParams, Resource, Role, Root,
+        SamplingMessage, SamplingMessageContent, SetLevelRequestParams, SubscribeRequestParams,
+        Tool, UnsubscribeRequestParams,
     },
     serve_client,
     service::{NotificationContext, RequestContext, ServiceError},
@@ -197,18 +197,21 @@ impl std::fmt::Debug for SamplingConfig {
 /// flags and refresh as needed.
 ///
 /// Optionally holds a [`SamplingConfig`] to fulfill `sampling/createMessage`
-/// requests from MCP servers.
+/// requests from MCP servers. Holds a shared list of filesystem [`Root`]s
+/// returned to servers via `roots/list`.
 #[derive(Debug, Clone)]
 struct ChangeHandler {
     tools_changed: Arc<AtomicBool>,
     prompts_changed: Arc<AtomicBool>,
     resources_changed: Arc<AtomicBool>,
     sampling: Option<Arc<SamplingConfig>>,
+    roots: Arc<RwLock<Vec<Root>>>,
 }
 
 impl ChangeHandler {
     fn new(
         sampling: Option<Arc<SamplingConfig>>,
+        roots: Arc<RwLock<Vec<Root>>>,
     ) -> (Self, Arc<AtomicBool>, Arc<AtomicBool>, Arc<AtomicBool>) {
         let tools = Arc::new(AtomicBool::new(false));
         let prompts = Arc::new(AtomicBool::new(false));
@@ -219,6 +222,7 @@ impl ChangeHandler {
                 prompts_changed: prompts.clone(),
                 resources_changed: resources.clone(),
                 sampling,
+                roots,
             },
             tools,
             prompts,
@@ -307,6 +311,17 @@ impl ClientHandler for ChangeHandler {
     ) -> impl std::future::Future<Output = Result<CreateElicitationResult, McpHandlerError>> + Send + '_
     {
         async move { do_elicitation(request).await }
+    }
+
+    fn list_roots(
+        &self,
+        _context: RequestContext<RoleClient>,
+    ) -> impl std::future::Future<Output = Result<ListRootsResult, McpHandlerError>> + Send + '_ {
+        let roots = self.roots.clone();
+        async move {
+            let r = roots.read().await;
+            Ok(ListRootsResult::new(r.clone()))
+        }
     }
 }
 
@@ -831,6 +846,8 @@ pub struct McpClientManager {
     states: HashMap<String, ConnectionState>,
     /// Optional sampling config — forwarded to each new connection's handler.
     sampling: Option<Arc<SamplingConfig>>,
+    /// Shared roots list — returned to servers via `roots/list`.
+    roots: Arc<RwLock<Vec<Root>>>,
 }
 
 impl Default for McpClientManager {
@@ -839,6 +856,7 @@ impl Default for McpClientManager {
             connections: HashMap::new(),
             states: HashMap::new(),
             sampling: None,
+            roots: Arc::new(RwLock::new(Vec::new())),
         }
     }
 }
@@ -855,6 +873,16 @@ impl McpClientManager {
         self.sampling = config.map(Arc::new);
     }
 
+    /// Get a reference to the shared roots list.
+    pub fn roots(&self) -> &Arc<RwLock<Vec<Root>>> {
+        &self.roots
+    }
+
+    /// Check if sampling is configured.
+    pub fn has_sampling(&self) -> bool {
+        self.sampling.is_some()
+    }
+
     /// Low-level connect (no skill discovery). Use `connect_and_discover_skills`
     /// for production code paths that should register `skill://` resources.
     async fn connect_internal(&mut self, config: McpServerConfig) -> Result<(), McpError> {
@@ -865,7 +893,7 @@ impl McpClientManager {
         let name = config.name.clone();
         self.states
             .insert(name.clone(), ConnectionState::Connecting);
-        match connect_to_server(config, self.sampling.clone()).await {
+        match connect_to_server(config, self.sampling.clone(), self.roots.clone()).await {
             Ok(connection) => {
                 self.states.insert(name.clone(), ConnectionState::Connected);
                 self.connections.insert(name, Arc::new(connection));
@@ -1132,11 +1160,6 @@ impl McpClientManager {
         self.connections.len()
     }
 
-    /// Whether sampling (createMessage) support is configured.
-    pub fn has_sampling(&self) -> bool {
-        self.sampling.is_some()
-    }
-
     /// Get the connection state for all servers.
     pub fn server_states(&self) -> Vec<(&str, ConnectionState)> {
         self.states
@@ -1158,7 +1181,7 @@ impl McpClientManager {
         self.states
             .insert(name.to_string(), ConnectionState::Reconnecting);
 
-        match connect_to_server(config, self.sampling.clone()).await {
+        match connect_to_server(config, self.sampling.clone(), self.roots.clone()).await {
             Ok(connection) => {
                 let tool_count = connection.tools.len();
                 self.states
@@ -1193,7 +1216,7 @@ impl McpClientManager {
             .insert(name.to_string(), ConnectionState::Reconnecting);
 
         // Reconnect with retry
-        let connection = match connect_to_server(config, self.sampling.clone()).await {
+        let connection = match connect_to_server(config, self.sampling.clone(), self.roots.clone()).await {
             Ok(conn) => conn,
             Err(e) => {
                 self.states
@@ -1284,6 +1307,7 @@ pub fn new_shared_manager() -> SharedMcpClientManager {
 async fn connect_to_server(
     config: McpServerConfig,
     sampling: Option<Arc<SamplingConfig>>,
+    roots: Arc<RwLock<Vec<Root>>>,
 ) -> Result<McpConnection, McpError> {
     let retry = config.retry.clone();
     let name = config.name.clone();
@@ -1302,7 +1326,7 @@ async fn connect_to_server(
             tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
         }
 
-        match connect_once(&config, sampling.clone()).await {
+        match connect_once(&config, sampling.clone(), roots.clone()).await {
             Ok(conn) => return Ok(conn),
             Err(e) => {
                 // Don't retry config errors — they won't resolve themselves.
@@ -1326,10 +1350,11 @@ async fn connect_to_server(
 async fn connect_once(
     config: &McpServerConfig,
     sampling: Option<Arc<SamplingConfig>>,
+    roots: Arc<RwLock<Vec<Root>>>,
 ) -> Result<McpConnection, McpError> {
     match &config.transport {
         Transport::Stdio { command, args, env } => {
-            connect_stdio(&config.name, command, args, env, config.clone(), sampling).await
+            connect_stdio(&config.name, command, args, env, config.clone(), sampling, roots.clone()).await
         }
         Transport::Sse {
             url,
@@ -1343,6 +1368,7 @@ async fn connect_once(
                 headers,
                 config.clone(),
                 sampling,
+                roots.clone(),
             )
             .await
         }
@@ -1358,6 +1384,7 @@ async fn connect_once(
                 headers,
                 config.clone(),
                 sampling,
+                roots,
             )
             .await
         }
@@ -1372,6 +1399,7 @@ async fn connect_stdio(
     env: &HashMap<String, String>,
     config: McpServerConfig,
     sampling: Option<Arc<SamplingConfig>>,
+    roots: Arc<RwLock<Vec<Root>>>,
 ) -> Result<McpConnection, McpError> {
     if command.is_empty() {
         return Err(McpError::InvalidConfig(
@@ -1393,7 +1421,7 @@ async fn connect_stdio(
     let transport = TokioChildProcess::new(cmd).map_err(|e| McpError::Spawn(e.to_string()))?;
 
     // Connect as MCP client with change notification handler
-    let (handler, tools_changed, prompts_changed, resources_changed) = ChangeHandler::new(sampling);
+    let (handler, tools_changed, prompts_changed, resources_changed) = ChangeHandler::new(sampling, roots);
     let running = serve_client(handler, transport)
         .await
         .map_err(|e| McpError::Initialize(e.to_string()))?;
@@ -1423,6 +1451,7 @@ async fn connect_sse(
     headers: &HashMap<String, String>,
     config: McpServerConfig,
     sampling: Option<Arc<SamplingConfig>>,
+    roots: Arc<RwLock<Vec<Root>>>,
 ) -> Result<McpConnection, McpError> {
     use rmcp::transport::streamable_http_client::{
         StreamableHttpClientTransport, StreamableHttpClientTransportConfig,
@@ -1457,7 +1486,7 @@ async fn connect_sse(
     let transport = StreamableHttpClientTransport::from_config(transport_config);
 
     // Connect as MCP client with change notification handler
-    let (handler, tools_changed, prompts_changed, resources_changed) = ChangeHandler::new(sampling);
+    let (handler, tools_changed, prompts_changed, resources_changed) = ChangeHandler::new(sampling, roots);
     let running = serve_client(handler, transport)
         .await
         .map_err(|e| McpError::Initialize(format!("SSE connect to {url}: {e}")))?;
@@ -1491,6 +1520,7 @@ async fn connect_ws(
     headers: &HashMap<String, String>,
     config: McpServerConfig,
     sampling: Option<Arc<SamplingConfig>>,
+    roots: Arc<RwLock<Vec<Root>>>,
 ) -> Result<McpConnection, McpError> {
     use futures_util::{SinkExt, StreamExt};
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -1588,7 +1618,7 @@ async fn connect_ws(
     });
 
     // Connect as MCP client with change notification handler
-    let (handler, tools_changed, prompts_changed, resources_changed) = ChangeHandler::new(sampling);
+    let (handler, tools_changed, prompts_changed, resources_changed) = ChangeHandler::new(sampling, roots);
     let running = serve_client(handler, (rmcp_read, rmcp_write))
         .await
         .map_err(|e| McpError::Initialize(format!("MCP init over WebSocket {url}: {e}")))?;
@@ -2539,7 +2569,7 @@ mcp_servers:
 
     #[test]
     fn change_handler_initial_state() {
-        let (_handler, tools, prompts, resources) = ChangeHandler::new(None);
+        let (_handler, tools, prompts, resources) = ChangeHandler::new(None, Arc::new(RwLock::new(Vec::new())));
         assert!(!tools.load(Ordering::Acquire));
         assert!(!prompts.load(Ordering::Acquire));
         assert!(!resources.load(Ordering::Acquire));
@@ -2547,28 +2577,28 @@ mcp_servers:
 
     #[test]
     fn change_handler_sets_tools_flag() {
-        let (handler, tools, _prompts, _resources) = ChangeHandler::new(None);
+        let (handler, tools, _prompts, _resources) = ChangeHandler::new(None, Arc::new(RwLock::new(Vec::new())));
         handler.tools_changed.store(true, Ordering::Release);
         assert!(tools.load(Ordering::Acquire));
     }
 
     #[test]
     fn change_handler_sets_prompts_flag() {
-        let (handler, _tools, prompts, _resources) = ChangeHandler::new(None);
+        let (handler, _tools, prompts, _resources) = ChangeHandler::new(None, Arc::new(RwLock::new(Vec::new())));
         handler.prompts_changed.store(true, Ordering::Release);
         assert!(prompts.load(Ordering::Acquire));
     }
 
     #[test]
     fn change_handler_sets_resources_flag() {
-        let (handler, _tools, _prompts, resources) = ChangeHandler::new(None);
+        let (handler, _tools, _prompts, resources) = ChangeHandler::new(None, Arc::new(RwLock::new(Vec::new())));
         handler.resources_changed.store(true, Ordering::Release);
         assert!(resources.load(Ordering::Acquire));
     }
 
     #[test]
     fn change_handler_flags_independent() {
-        let (handler, tools, prompts, resources) = ChangeHandler::new(None);
+        let (handler, tools, prompts, resources) = ChangeHandler::new(None, Arc::new(RwLock::new(Vec::new())));
         handler.tools_changed.store(true, Ordering::Release);
         assert!(tools.load(Ordering::Acquire));
         assert!(!prompts.load(Ordering::Acquire));
@@ -2584,7 +2614,7 @@ mcp_servers:
 
     #[test]
     fn change_handler_clone_shares_flags() {
-        let (handler, tools, prompts, resources) = ChangeHandler::new(None);
+        let (handler, tools, prompts, resources) = ChangeHandler::new(None, Arc::new(RwLock::new(Vec::new())));
         let cloned = handler.clone();
         cloned.tools_changed.store(true, Ordering::Release);
         cloned.prompts_changed.store(true, Ordering::Release);
@@ -2706,13 +2736,13 @@ mcp_servers:
             token: "tok".to_string(),
             model: "m".to_string(),
         };
-        let (handler, _t, _p, _r) = ChangeHandler::new(Some(Arc::new(config)));
+        let (handler, _t, _p, _r) = ChangeHandler::new(Some(Arc::new(config)), Arc::new(RwLock::new(Vec::new())));
         assert!(handler.sampling.is_some());
     }
 
     #[test]
     fn change_handler_without_sampling() {
-        let (handler, _t, _p, _r) = ChangeHandler::new(None);
+        let (handler, _t, _p, _r) = ChangeHandler::new(None, Arc::new(RwLock::new(Vec::new())));
         assert!(handler.sampling.is_none());
     }
 
@@ -2767,7 +2797,7 @@ mcp_servers:
     #[test]
     fn enum_schema_values_empty_fallback() {
         // If we can't extract any values, return empty vec.
-        let json = serde_json::json!({"type": "string"});
+        let _json = serde_json::json!({"type": "string"});
         // This may fail to parse as EnumSchema, so test the function with a valid but empty enum.
         let json2 = serde_json::json!({"type": "string", "enum": []});
         let schema: rmcp::model::EnumSchema = serde_json::from_value(json2).unwrap();
@@ -2815,5 +2845,55 @@ mcp_servers:
             back.content.unwrap().get("name").unwrap().as_str().unwrap(),
             "Alice"
         );
+    }
+
+    // ── Roots Tests ──────────────────────────────────────────────────────
+
+    #[test]
+    fn root_new_with_name() {
+        use rmcp::model::Root;
+        let root = Root::new("file:///home/user/project").with_name("workspace");
+        assert_eq!(root.uri, "file:///home/user/project");
+        assert_eq!(root.name.as_deref(), Some("workspace"));
+    }
+
+    #[test]
+    fn list_roots_result_roundtrip() {
+        use rmcp::model::{ListRootsResult, Root};
+        let result = ListRootsResult::new(vec![
+            Root::new("file:///workspace").with_name("workspace"),
+            Root::new("file:///tmp"),
+        ]);
+        let json = serde_json::to_string(&result).unwrap();
+        let back: ListRootsResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.roots.len(), 2);
+        assert_eq!(back.roots[0].name.as_deref(), Some("workspace"));
+        assert!(back.roots[1].name.is_none());
+    }
+
+    #[tokio::test]
+    async fn handler_shares_roots() {
+        use rmcp::model::Root;
+        let roots = Arc::new(RwLock::new(vec![
+            Root::new("file:///project").with_name("project"),
+        ]));
+        let (_handler, _t, _p, _r) = ChangeHandler::new(None, roots.clone());
+
+        // The handler's roots are the same Arc — changes are visible.
+        assert_eq!(roots.read().await.len(), 1);
+        roots
+            .write()
+            .await
+            .push(Root::new("file:///extra").with_name("extra"));
+        assert_eq!(roots.read().await.len(), 2);
+        assert_eq!(roots.read().await[1].uri, "file:///extra");
+    }
+
+    #[test]
+    fn manager_has_roots() {
+        let manager = McpClientManager::new();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let roots = rt.block_on(manager.roots().read());
+        assert!(roots.is_empty());
     }
 }
