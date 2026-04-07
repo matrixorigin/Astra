@@ -145,17 +145,52 @@ pub fn is_session_not_found_error(error: &str) -> bool {
     error.to_lowercase().contains("session not found")
 }
 
+/// Detect queries that refer to the conversation itself rather than
+/// external data.  These should NOT be forced into tool-retry because
+/// the answer is already in the LLM's context window.
+fn references_conversation_context(input: &str) -> bool {
+    let q = input.to_lowercase();
+    [
+        "上面",
+        "上一个",
+        "上个问题",
+        "之前说的",
+        "刚才说的",
+        "前面说的",
+        "你说的",
+        "我说的",
+        "我的问题",
+        "my question",
+        "you said",
+        "i said",
+        "above",
+        "previous message",
+        "previous question",
+        "previous answer",
+    ]
+    .iter()
+    .any(|kw| q.contains(kw))
+}
+
 /// Detect queries that almost certainly need tool calls to answer correctly.
 /// Used for the hallucination guard: if LLM answers these with 0 tool calls,
 /// the response is likely fabricated.
 pub fn looks_like_factual_query(input: &str) -> bool {
+    // Queries about the conversation itself never need tools — the LLM
+    // already has the full chat history in context.
+    if references_conversation_context(input) {
+        return false;
+    }
+
     let q = input.to_lowercase();
+    // NOTE: bare "问题" removed — it means both "question" and "issue" in
+    // Chinese, causing false positives on conversational queries like
+    // "我上面一个问题？".  "issue" (English) is specific enough.
     let github_keywords = [
         "pr",
         "pull request",
         "issue",
         "拉取请求",
-        "问题",
         "commit",
         "提交",
         "ci ",
@@ -198,6 +233,9 @@ pub fn looks_like_factual_query(input: &str) -> bool {
 
     // Workspace-state queries: anything asking about local changes, diffs,
     // file contents, or repo state that the model cannot know without tools.
+    // NOTE: bare "看一下" / "看看" removed — they are generic Chinese for
+    // "take a look" and trigger on non-workspace queries like "看看你说的对不对".
+    // They remain in ANALYSIS_TERMS for task-profile classification.
     let workspace_keywords = [
         "review",
         "diff",
@@ -210,8 +248,6 @@ pub fn looks_like_factual_query(input: &str) -> bool {
         "审查",
         "审阅",
         "评审",
-        "看一下",
-        "看看",
         "什么文件",
         "哪些文件",
         "this repo",
@@ -489,6 +525,30 @@ mod tests {
         assert!(!looks_like_factual_query("explain monads"));
         assert!(!looks_like_factual_query("write a function"));
         assert!(!looks_like_factual_query("hello"));
+    }
+
+    #[test]
+    fn factual_query_rejects_conversation_references() {
+        // Queries about the conversation itself should NOT trigger factual retry
+        // — the answer is already in the LLM's context window.
+        assert!(!looks_like_factual_query("我上面一个问题？"));
+        assert!(!looks_like_factual_query("上一个问题是什么"));
+        assert!(!looks_like_factual_query("之前说的那个"));
+        assert!(!looks_like_factual_query("你说的对吗"));
+        assert!(!looks_like_factual_query("what you said above"));
+        assert!(!looks_like_factual_query("my previous question"));
+    }
+
+    #[test]
+    fn factual_query_rejects_ambiguous_chinese_keywords() {
+        // "问题" alone should NOT trigger (means "question" not just "issue")
+        assert!(!looks_like_factual_query("什么问题？"));
+        assert!(!looks_like_factual_query("你有什么问题？"));
+        assert!(!looks_like_factual_query("这个有问题吗"));
+        // "看一下" / "看看" alone should NOT trigger (too generic)
+        assert!(!looks_like_factual_query("看一下这个公式"));
+        assert!(!looks_like_factual_query("看看你说的对不对"));
+        assert!(!looks_like_factual_query("帮我看看这段话"));
     }
 
     #[test]

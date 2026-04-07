@@ -140,19 +140,33 @@ fn check_single_command_path_boundary(
         return None;
     }
 
-    let base = parts[0]
-        .rsplit('/')
-        .next()
-        .unwrap_or(parts[0]);
+    let base = parts[0].rsplit('/').next().unwrap_or(parts[0]);
 
     // Only check commands known to access files by path argument.
     let is_file_access_cmd = matches!(
         base,
-        "cat" | "head" | "tail" | "less" | "more" | "tac" | "nl"
-            | "cp" | "mv" | "rm" | "ln" | "install"
-            | "stat" | "file" | "wc" | "md5sum" | "sha256sum" | "sha1sum"
-            | "readlink" | "realpath"
-            | "source" | "."
+        "cat"
+            | "head"
+            | "tail"
+            | "less"
+            | "more"
+            | "tac"
+            | "nl"
+            | "cp"
+            | "mv"
+            | "rm"
+            | "ln"
+            | "install"
+            | "stat"
+            | "file"
+            | "wc"
+            | "md5sum"
+            | "sha256sum"
+            | "sha1sum"
+            | "readlink"
+            | "realpath"
+            | "source"
+            | "."
     );
     if !is_file_access_cmd {
         return None;
@@ -1188,8 +1202,8 @@ impl ToolExecutor {
 
                 // Apply head_limit (default GREP_DEFAULT_HEAD_LIMIT, 0 = unlimited)
                 let effective_limit = match head_limit {
-                    Some(0) => None,           // explicit 0 = unlimited
-                    Some(n) => Some(n),        // explicit limit
+                    Some(0) => None,                       // explicit 0 = unlimited
+                    Some(n) => Some(n),                    // explicit limit
                     None => Some(GREP_DEFAULT_HEAD_LIMIT), // default
                 };
                 let (lines, was_truncated_by_limit) = if let Some(limit) = effective_limit {
@@ -2022,7 +2036,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let executor = ToolExecutor::new(dir.path());
         let result = executor.resolve_checked("src/main.rs");
-        assert!(result.is_ok(), "relative path inside project should succeed: {result:?}");
+        assert!(
+            result.is_ok(),
+            "relative path inside project should succeed: {result:?}"
+        );
         assert!(result.unwrap().starts_with(dir.path()));
     }
 
@@ -2081,7 +2098,10 @@ mod tests {
         let policy = SandboxPolicy::for_project("/home/user/project");
         // grep is not in the file-access command list (it's a search tool)
         let result = check_bash_path_boundary(&policy, "grep pattern /etc/passwd");
-        assert!(result.is_none(), "grep should not be checked by path boundary");
+        assert!(
+            result.is_none(),
+            "grep should not be checked by path boundary"
+        );
     }
 
     #[test]
@@ -2090,7 +2110,10 @@ mod tests {
         let policy = SandboxPolicy::for_project("/home/user/project");
         // cat in the second pipeline stage should also be caught
         let result = check_bash_path_boundary(&policy, "echo hello | cat /etc/passwd");
-        assert!(result.is_some(), "should block cat /etc/passwd even after pipe");
+        assert!(
+            result.is_some(),
+            "should block cat /etc/passwd even after pipe"
+        );
     }
 
     #[test]
@@ -2168,7 +2191,10 @@ mod tests {
         let policy = SandboxPolicy::for_project("/home/user/project");
         let result = check_bash_path_boundary(&policy, r#"bash -c "cat /etc/passwd""#);
         // Not caught by path boundary check — handled by permission_manager instead
-        assert!(result.is_none(), "bash -c is handled by permission layer, not path check");
+        assert!(
+            result.is_none(),
+            "bash -c is handled by permission layer, not path check"
+        );
     }
 
     #[test]
@@ -2178,7 +2204,10 @@ mod tests {
         use astra_runtime::tool_sandbox::SandboxPolicy;
         let policy = SandboxPolicy::for_project("/home/user/project");
         let result = check_bash_path_boundary(&policy, "echo $(cat /etc/passwd)");
-        assert!(result.is_none(), "command substitution handled by permission layer");
+        assert!(
+            result.is_none(),
+            "command substitution handled by permission layer"
+        );
     }
 
     #[test]
@@ -2190,7 +2219,10 @@ mod tests {
         let policy = SandboxPolicy::for_project("/home/user/project");
         let result = check_bash_path_boundary(&policy, "cat < /etc/passwd");
         // `<` is skipped (not abs path), `/etc/passwd` IS caught
-        assert!(result.is_some(), "redirect target path should still be caught");
+        assert!(
+            result.is_some(),
+            "redirect target path should still be caught"
+        );
     }
 
     #[test]
@@ -2202,7 +2234,10 @@ mod tests {
         use astra_runtime::tool_sandbox::SandboxPolicy;
         let policy = SandboxPolicy::for_project("/home/user/project");
         let result = check_bash_path_boundary(&policy, "cat ~/.ssh/id_rsa");
-        assert!(result.is_none(), "tilde paths not checked (handled by dangerous path detection)");
+        assert!(
+            result.is_none(),
+            "tilde paths not checked (handled by dangerous path detection)"
+        );
     }
 
     #[test]
@@ -2234,7 +2269,10 @@ mod tests {
         use astra_runtime::tool_sandbox::SandboxPolicy;
         let policy = SandboxPolicy::for_project("/home/user/project");
         let result = check_bash_path_boundary(&policy, "python3 -c \"open('/etc/passwd').read()\"");
-        assert!(result.is_none(), "interpreter commands handled by permission layer");
+        assert!(
+            result.is_none(),
+            "interpreter commands handled by permission layer"
+        );
     }
 
     // ── SSRF protection ─────────────────────────────────────────────────────
@@ -2688,8 +2726,15 @@ mod tests {
         }));
         // Should have at most 5 matching lines + metadata
         let match_lines: Vec<&str> = result.lines().filter(|l| l.contains("needle")).collect();
-        assert_eq!(match_lines.len(), 5, "should limit to 5 lines, got: {result}");
-        assert!(result.contains("Results limited to"), "should note truncation, got: {result}");
+        assert_eq!(
+            match_lines.len(),
+            5,
+            "should limit to 5 lines, got: {result}"
+        );
+        assert!(
+            result.contains("Results limited to"),
+            "should note truncation, got: {result}"
+        );
     }
 
     #[test]
@@ -2705,9 +2750,16 @@ mod tests {
             "head_limit": 0
         }));
         // Should NOT have the "Results limited" message
-        assert!(!result.contains("Results limited to"), "head_limit=0 should be unlimited, got: {result}");
+        assert!(
+            !result.contains("Results limited to"),
+            "head_limit=0 should be unlimited, got: {result}"
+        );
         let match_lines: Vec<&str> = result.lines().filter(|l| l.contains("needle")).collect();
-        assert!(match_lines.len() > 250, "should have all lines, got {}", match_lines.len());
+        assert!(
+            match_lines.len() > 250,
+            "should have all lines, got {}",
+            match_lines.len()
+        );
     }
 
     #[test]
@@ -2723,8 +2775,16 @@ mod tests {
             "path": "."
         }));
         let match_lines: Vec<&str> = result.lines().filter(|l| l.contains("needle")).collect();
-        assert_eq!(match_lines.len(), 250, "default limit should be 250, got {}", match_lines.len());
-        assert!(result.contains("Results limited to 250"), "should note default limit, got: {result}");
+        assert_eq!(
+            match_lines.len(),
+            250,
+            "default limit should be 250, got {}",
+            match_lines.len()
+        );
+        assert!(
+            result.contains("Results limited to 250"),
+            "should note default limit, got: {result}"
+        );
     }
 
     #[test]
@@ -2741,9 +2801,16 @@ mod tests {
             "head_limit": 3
         }));
         let match_lines: Vec<&str> = result.lines().filter(|l| l.contains("needle")).collect();
-        assert_eq!(match_lines.len(), 3, "should have 3 lines after offset, got: {result}");
+        assert_eq!(
+            match_lines.len(),
+            3,
+            "should have 3 lines after offset, got: {result}"
+        );
         // First visible line should be line 5 (0-indexed)
-        assert!(result.contains("needle line 5"), "should start at offset 5, got: {result}");
+        assert!(
+            result.contains("needle line 5"),
+            "should start at offset 5, got: {result}"
+        );
     }
 
     #[test]
@@ -2769,14 +2836,19 @@ mod tests {
         cmd.current_dir(dir.path());
 
         let (output, _stderr, exit_code, timed_out) =
-            super::run_readonly_command_with_partial(&mut cmd, 2.0)
-                .expect("should not return Err");
+            super::run_readonly_command_with_partial(&mut cmd, 2.0).expect("should not return Err");
         // Should have captured partial stdout before timeout
-        assert!(output.contains("match_line_1"), "should have partial output, got: {output}");
+        assert!(
+            output.contains("match_line_1"),
+            "should have partial output, got: {output}"
+        );
         assert!(timed_out, "should report timed_out=true");
         assert_eq!(exit_code, -1, "timed out exit code should be -1");
         // Should NOT contain any error metadata in the output (clean stdout only)
-        assert!(!output.contains("Error:"), "output should be clean stdout, got: {output}");
+        assert!(
+            !output.contains("Error:"),
+            "output should be clean stdout, got: {output}"
+        );
     }
 
     #[test]
@@ -2795,11 +2867,12 @@ mod tests {
         }));
         // Count mode should filter zero-count lines, then apply head_limit.
         // Only count the actual count lines (file:N), not metadata lines.
-        let count_lines: Vec<&str> = result
-            .lines()
-            .filter(|l| l.contains(".txt:"))
-            .collect();
-        assert_eq!(count_lines.len(), 1, "should limit to 1 count entry, got: {result}");
+        let count_lines: Vec<&str> = result.lines().filter(|l| l.contains(".txt:")).collect();
+        assert_eq!(
+            count_lines.len(),
+            1,
+            "should limit to 1 count entry, got: {result}"
+        );
     }
 
     #[test]
@@ -2814,8 +2887,14 @@ mod tests {
             "path": ".",
             "output_mode": "files_with_matches"
         }));
-        assert!(result.contains("a.txt"), "should list matching file, got: {result}");
-        assert!(!result.contains("b.txt"), "should not list non-matching file, got: {result}");
+        assert!(
+            result.contains("a.txt"),
+            "should list matching file, got: {result}"
+        );
+        assert!(
+            !result.contains("b.txt"),
+            "should not list non-matching file, got: {result}"
+        );
     }
 
     #[test]
@@ -2829,10 +2908,15 @@ mod tests {
         cmd.current_dir(dir.path());
 
         let (output, _stderr, _exit_code, _timed_out) =
-            super::run_readonly_command_with_partial(&mut cmd, 5.0)
-                .expect("should not return Err");
-        assert!(output.contains("stdout_line"), "should have stdout, got: {output}");
-        assert!(!output.contains("stderr_line"), "should NOT have stderr, got: {output}");
+            super::run_readonly_command_with_partial(&mut cmd, 5.0).expect("should not return Err");
+        assert!(
+            output.contains("stdout_line"),
+            "should have stdout, got: {output}"
+        );
+        assert!(
+            !output.contains("stderr_line"),
+            "should NOT have stderr, got: {output}"
+        );
     }
 
     #[test]
@@ -2841,15 +2925,19 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
 
         let mut cmd = std::process::Command::new("bash");
-        cmd.arg("-c")
-            .arg("echo 'error detail' >&2; exit 2");
+        cmd.arg("-c").arg("echo 'error detail' >&2; exit 2");
         cmd.current_dir(dir.path());
 
         let (stdout, stderr, exit_code, _) =
-            super::run_readonly_command_with_partial(&mut cmd, 5.0)
-                .expect("should not return Err");
-        assert!(stdout.trim().is_empty(), "stdout should be empty, got: {stdout}");
-        assert!(stderr.contains("error detail"), "stderr should be captured, got: {stderr}");
+            super::run_readonly_command_with_partial(&mut cmd, 5.0).expect("should not return Err");
+        assert!(
+            stdout.trim().is_empty(),
+            "stdout should be empty, got: {stdout}"
+        );
+        assert!(
+            stderr.contains("error detail"),
+            "stderr should be captured, got: {stderr}"
+        );
         assert_eq!(exit_code, 2);
     }
 
@@ -2864,7 +2952,10 @@ mod tests {
             "path": "."
         }));
         // Should report the grep error from stderr, not just "grep failed"
-        assert!(result.starts_with("Error"), "should be error, got: {result}");
+        assert!(
+            result.starts_with("Error"),
+            "should be error, got: {result}"
+        );
     }
 
     #[test]
@@ -2890,13 +2981,21 @@ mod tests {
         cmd.current_dir(dir.path());
 
         let (output, _stderr, _, timed_out) =
-            super::run_readonly_command_with_partial(&mut cmd, 2.0)
-                .expect("should not return Err");
+            super::run_readonly_command_with_partial(&mut cmd, 2.0).expect("should not return Err");
         assert!(timed_out);
-        assert!(output.contains("complete_line_1"), "should have complete lines, got: {output}");
-        assert!(output.contains("complete_line_2"), "should have complete lines, got: {output}");
+        assert!(
+            output.contains("complete_line_1"),
+            "should have complete lines, got: {output}"
+        );
+        assert!(
+            output.contains("complete_line_2"),
+            "should have complete lines, got: {output}"
+        );
         // The incomplete line (no trailing newline) should be dropped
-        assert!(!output.contains("incomplete_no_newline"), "should drop incomplete last line, got: {output}");
+        assert!(
+            !output.contains("incomplete_no_newline"),
+            "should drop incomplete last line, got: {output}"
+        );
     }
 
     #[test]
@@ -2920,10 +3019,12 @@ mod tests {
         cmd.current_dir(dir.path());
 
         let (output, _stderr, _exit, timed_out) =
-            super::run_readonly_command_with_partial(&mut cmd, 1.0)
-                .expect("should not return Err");
+            super::run_readonly_command_with_partial(&mut cmd, 1.0).expect("should not return Err");
         assert!(timed_out);
-        assert!(output.trim().is_empty(), "should have no output, got: {output}");
+        assert!(
+            output.trim().is_empty(),
+            "should have no output, got: {output}"
+        );
     }
 
     #[test]
@@ -2932,7 +3033,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let executor = super::ToolExecutor::new(dir.path());
         // Create a binary file that grep will warn about
-        std::fs::write(dir.path().join("bin.dat"), &[0u8, 1, 2, 0xFF, 0xFE]).unwrap();
+        std::fs::write(dir.path().join("bin.dat"), [0u8, 1, 2, 0xFF, 0xFE]).unwrap();
         std::fs::write(dir.path().join("text.txt"), "no match here").unwrap();
 
         let result = executor.grep(&serde_json::json!({
@@ -2940,7 +3041,10 @@ mod tests {
             "path": ".",
             "include": "*"
         }));
-        assert!(result.contains("No matches"), "should report no matches, got: {result}");
+        assert!(
+            result.contains("No matches"),
+            "should report no matches, got: {result}"
+        );
     }
 
     #[test]
@@ -2955,8 +3059,14 @@ mod tests {
             "path": ".",
             "offset": 999
         }));
-        assert!(result.contains("No more results"), "should report no more results, got: {result}");
-        assert!(result.contains("999"), "should mention the offset, got: {result}");
+        assert!(
+            result.contains("No more results"),
+            "should report no more results, got: {result}"
+        );
+        assert!(
+            result.contains("999"),
+            "should mention the offset, got: {result}"
+        );
     }
 
     #[test]
@@ -2993,13 +3103,15 @@ mod tests {
         cmd.current_dir(dir.path());
 
         let (output, _stderr, _, timed_out) =
-            super::run_readonly_command_with_partial(&mut cmd, 2.0)
-                .expect("should not return Err");
+            super::run_readonly_command_with_partial(&mut cmd, 2.0).expect("should not return Err");
         assert!(timed_out);
         assert!(output.contains("needle_1"), "should have partial results");
         // The grep function would append the timeout note — verify the raw
         // output does NOT contain it (clean separation)
-        assert!(!output.contains("[grep timed out"), "raw output should be clean");
+        assert!(
+            !output.contains("[grep timed out"),
+            "raw output should be clean"
+        );
     }
 
     #[test]
@@ -3009,8 +3121,7 @@ mod tests {
 
         // Generate output larger than MAX_OUTPUT_CHARS (30_000)
         let mut cmd = std::process::Command::new("bash");
-        cmd.arg("-c")
-            .arg("yes 'abcdefghij' | head -5000"); // 5000 * 11 = 55000 chars
+        cmd.arg("-c").arg("yes 'abcdefghij' | head -5000"); // 5000 * 11 = 55000 chars
         cmd.current_dir(dir.path());
 
         let (output, _stderr, exit_code, _) =

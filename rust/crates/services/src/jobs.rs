@@ -238,7 +238,10 @@ mod tests {
         }
     }
 
-    fn assert_err_status(r: Result<impl std::fmt::Debug, (StatusCode, Json<ErrorResponse>)>, expected: StatusCode) {
+    fn assert_err_status(
+        r: Result<impl std::fmt::Debug, (StatusCode, Json<ErrorResponse>)>,
+        expected: StatusCode,
+    ) {
         match r {
             Ok(v) => panic!("expected error {}, got Ok({:?})", expected, v),
             Err((status, _)) => assert_eq!(status, expected),
@@ -268,7 +271,10 @@ mod tests {
     #[tokio::test]
     async fn get_nonexistent_job_returns_not_found() {
         let svc = InMemoryJobService::new();
-        assert_err_status(svc.get_job("nonexistent".into()).await, StatusCode::NOT_FOUND);
+        assert_err_status(
+            svc.get_job("nonexistent".into()).await,
+            StatusCode::NOT_FOUND,
+        );
     }
 
     #[tokio::test]
@@ -289,7 +295,10 @@ mod tests {
     #[tokio::test]
     async fn cancel_nonexistent_job_returns_not_found() {
         let svc = InMemoryJobService::new();
-        assert_err_status(svc.cancel_job("nonexistent".into()).await, StatusCode::NOT_FOUND);
+        assert_err_status(
+            svc.cancel_job("nonexistent".into()).await,
+            StatusCode::NOT_FOUND,
+        );
     }
 
     #[tokio::test]
@@ -319,12 +328,15 @@ mod tests {
         };
         let job = unwrap_ok(svc.submit_job("u1".into(), req).await);
 
-        let result = unwrap_ok(svc.job_webhook(JobWebhookData {
-            job_id: job.job_id.clone(),
-            status: "completed".into(),
-            result: Some(serde_json::json!({"accuracy": 0.95})),
-            error: None,
-        }).await);
+        let result = unwrap_ok(
+            svc.job_webhook(JobWebhookData {
+                job_id: job.job_id.clone(),
+                status: "completed".into(),
+                result: Some(serde_json::json!({"accuracy": 0.95})),
+                error: None,
+            })
+            .await,
+        );
         assert_eq!(result["resumed"], true);
 
         let updated = unwrap_ok(svc.get_job(job.job_id).await);
@@ -335,12 +347,15 @@ mod tests {
     #[tokio::test]
     async fn webhook_for_nonexistent_job_still_succeeds() {
         let svc = InMemoryJobService::new();
-        let result = unwrap_ok(svc.job_webhook(JobWebhookData {
-            job_id: "nonexistent".into(),
-            status: "completed".into(),
-            result: None,
-            error: None,
-        }).await);
+        let result = unwrap_ok(
+            svc.job_webhook(JobWebhookData {
+                job_id: "nonexistent".into(),
+                status: "completed".into(),
+                result: None,
+                error: None,
+            })
+            .await,
+        );
         assert_eq!(result["resumed"], true);
     }
 
@@ -359,12 +374,16 @@ mod tests {
         assert!(svc.submit_job("u1".into(), req).await.is_err());
         assert!(svc.get_job("j1".into()).await.is_err());
         assert!(svc.cancel_job("j1".into()).await.is_err());
-        assert!(svc.job_webhook(JobWebhookData {
-            job_id: "j1".into(),
-            status: "done".into(),
-            result: None,
-            error: None,
-        }).await.is_err());
+        assert!(
+            svc.job_webhook(JobWebhookData {
+                job_id: "j1".into(),
+                status: "done".into(),
+                result: None,
+                error: None,
+            })
+            .await
+            .is_err()
+        );
     }
 
     // ── HTTP types ──
@@ -374,7 +393,7 @@ mod tests {
         let json = r#"{"job_type":"train"}"#;
         let r: JobSubmitRequest = serde_json::from_str(json).unwrap();
         assert_eq!(r.job_type, "train");
-        assert_eq!(r.gpu_required, false);
+        assert!(!r.gpu_required);
         assert_eq!(r.timeout_seconds, 3600);
         assert!(r.conda_env.is_none());
         assert_eq!(r.inputs, serde_json::Value::Null);

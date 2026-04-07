@@ -183,9 +183,9 @@ mod tests {
     }
 
     #[test]
-    fn prefilter_ranks_memory_purge_for_recall() {
+    fn prefilter_ranks_memory_tools_for_recall() {
         // memory_store is pinned; memory_search and memory_purge are dynamic.
-        // For memory-related queries, memory_purge should appear in dynamic results.
+        // For memory recall queries, memory_search should appear.
         let state = ConversationState::from_message("之前我记住了什么偏好?", 1);
         let ranked = pre_filter_dynamic(&state, "之前我记住了什么偏好?");
 
@@ -195,8 +195,8 @@ mod tests {
             .map(|&(idx, _)| TOOL_CATALOG[idx].name)
             .collect();
         assert!(
-            top_names.contains(&"memory_purge"),
-            "memory_purge should appear for recall query, got: {:?}",
+            top_names.contains(&"memory_search"),
+            "memory_search should appear for recall query, got: {:?}",
             top_names
         );
     }

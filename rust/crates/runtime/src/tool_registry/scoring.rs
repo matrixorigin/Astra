@@ -246,7 +246,10 @@ fn tool_relevance_score(
             IntentType::Git if state.is_git => score += 0.25,
             IntentType::Git if state.is_fetch || state.references_history => score += 0.15,
             IntentType::Memory if text_or_trigger > 0.05 => score += 0.2,
-            IntentType::Memory if state.references_history || state.is_analytical => score += 0.15,
+            // NOTE: references_history removed here — it conflates
+            // "referring to earlier conversation" with "needs persistent memory",
+            // causing memory_search to be over-selected for conversational queries.
+            IntentType::Memory if state.is_analytical => score += 0.1,
             IntentType::CodeEdit if state.is_mutate => score += 0.15,
             IntentType::CodeRead if state.is_fetch || state.is_analytical => score += 0.1,
             IntentType::Introspect if state.is_analytical => score += 0.15,
@@ -760,10 +763,7 @@ fn ensure_intent_diversity(
         (state.is_github, IntentType::GitHub),
         (state.is_git, IntentType::Git),
         (state.is_analytical, IntentType::Introspect),
-        (
-            state.references_history || state.is_analytical,
-            IntentType::Memory,
-        ),
+        (state.is_analytical, IntentType::Memory),
         (state.is_mutate, IntentType::CodeEdit),
     ];
 
@@ -901,10 +901,7 @@ mod tests {
     #[test]
     fn tfidf_score_bounded_by_one() {
         // Even with perfect match terms, score should be <= 1.0
-        let idx = TOOL_CATALOG
-            .iter()
-            .position(|t| t.name == "bash")
-            .unwrap();
+        let idx = TOOL_CATALOG.iter().position(|t| t.name == "bash").unwrap();
         let terms: Vec<String> = vec![
             "bash".into(),
             "execute".into(),
@@ -967,10 +964,7 @@ mod tests {
             recent_tools: vec!["bash".into()],
             ..Default::default()
         };
-        let tool = TOOL_CATALOG
-            .iter()
-            .find(|t| t.name == "bash")
-            .unwrap();
+        let tool = TOOL_CATALOG.iter().find(|t| t.name == "bash").unwrap();
         assert_eq!(raw_recency_boost(tool, &state), 0.3);
     }
 
@@ -980,10 +974,7 @@ mod tests {
             recent_tools: vec!["bash".into()],
             ..Default::default()
         };
-        let tool = TOOL_CATALOG
-            .iter()
-            .find(|t| t.name == "read_file")
-            .unwrap();
+        let tool = TOOL_CATALOG.iter().find(|t| t.name == "read_file").unwrap();
         // read_file and bash may share an intent (FileSystem), giving 0.1
         // Or they may not. Just verify it's less than 0.3.
         let boost = raw_recency_boost(tool, &state);
@@ -993,10 +984,7 @@ mod tests {
     #[test]
     fn recency_boost_empty_recent() {
         let state = ConversationState::default();
-        let tool = TOOL_CATALOG
-            .iter()
-            .find(|t| t.name == "bash")
-            .unwrap();
+        let tool = TOOL_CATALOG.iter().find(|t| t.name == "bash").unwrap();
         assert_eq!(raw_recency_boost(tool, &state), 0.0);
     }
 
@@ -1008,7 +996,10 @@ mod tests {
     fn pre_filter_returns_nonempty_for_real_query() {
         let state = state_at_turn(1);
         let results = pre_filter_dynamic(&state, "read the contents of a file");
-        assert!(!results.is_empty(), "should return some tools for a real query");
+        assert!(
+            !results.is_empty(),
+            "should return some tools for a real query"
+        );
     }
 
     #[test]
@@ -1025,7 +1016,14 @@ mod tests {
         let state = state_at_turn(1);
         let ctx = vec!["rust".to_string()];
         let results = pre_filter_dynamic_with_file_context(
-            &state, "run tests", None, None, &[], 0.0, &HashMap::new(), &ctx,
+            &state,
+            "run tests",
+            None,
+            None,
+            &[],
+            0.0,
+            &HashMap::new(),
+            &ctx,
         );
         assert!(!results.is_empty());
     }
@@ -1033,18 +1031,14 @@ mod tests {
     #[test]
     fn pre_filter_with_pressure_zero() {
         let state = state_at_turn(1);
-        let results = pre_filter_dynamic_with_pressure(
-            &state, "read file", None, None, &[], 0.0,
-        );
+        let results = pre_filter_dynamic_with_pressure(&state, "read file", None, None, &[], 0.0);
         assert!(!results.is_empty());
     }
 
     #[test]
     fn pre_filter_with_pressure_max() {
         let state = state_at_turn(1);
-        let results = pre_filter_dynamic_with_pressure(
-            &state, "read file", None, None, &[], 1.0,
-        );
+        let results = pre_filter_dynamic_with_pressure(&state, "read file", None, None, &[], 1.0);
         // High pressure = stricter filter, but shouldn't panic
         let _ = results;
     }
@@ -1057,7 +1051,7 @@ mod tests {
         let terms = vec!["run".to_string()];
         let bash_idx = TOOL_CATALOG.iter().position(|t| t.name == "bash").unwrap();
         let score = tfidf_score(&terms, bash_idx);
-        assert!(score >= 0.0 && score <= 1.0);
+        assert!((0.0..=1.0).contains(&score));
     }
 
     #[test]
@@ -1069,13 +1063,16 @@ mod tests {
         // We test a valid but last index instead
         let last_idx = TOOL_CATALOG.len() - 1;
         let score = tfidf_score(&terms, last_idx);
-        assert!(score >= 0.0 && score <= 1.0);
+        assert!((0.0..=1.0).contains(&score));
     }
 
     #[test]
     fn tfidf_score_cjk_query() {
         let terms = vec!["记忆".to_string(), "搜索".to_string()];
-        let mem_idx = TOOL_CATALOG.iter().position(|t| t.name == "memory_search").unwrap();
+        let mem_idx = TOOL_CATALOG
+            .iter()
+            .position(|t| t.name == "memory_search")
+            .unwrap();
         let score = tfidf_score(&terms, mem_idx);
         // CJK terms should match Chinese triggers in memory_search
         assert!(score > 0.0, "CJK query should match memory_search triggers");
@@ -1096,8 +1093,14 @@ mod tests {
 
     #[test]
     fn file_context_boost_docker_only_bash_read_write() {
-        assert_eq!(file_context_tool_boost("bash", &["docker".to_string()]), 0.05);
-        assert_eq!(file_context_tool_boost("grep", &["docker".to_string()]), 0.0);
+        assert_eq!(
+            file_context_tool_boost("bash", &["docker".to_string()]),
+            0.05
+        );
+        assert_eq!(
+            file_context_tool_boost("grep", &["docker".to_string()]),
+            0.0
+        );
     }
 
     // --- pre_filter edge cases ---
@@ -1130,6 +1133,9 @@ mod tests {
             ..Default::default()
         };
         let results = pre_filter_dynamic(&state, "hello how are you");
-        assert!(results.is_empty(), "conversational queries should return empty dynamic tools");
+        assert!(
+            results.is_empty(),
+            "conversational queries should return empty dynamic tools"
+        );
     }
 }
