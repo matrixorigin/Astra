@@ -1358,7 +1358,7 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
             // usage. Keeps the field (as empty string) for thinking-model API
             // compat; only the most recent assistant reasoning is preserved.
             // Heavy checkpoints and persisted events retain full reasoning.
-            super::edge_ledger::strip_stale_reasoning(&mut llm_messages);
+            super::edge_ledger::strip_stale_reasoning(&mut llm_messages, &provider, &model_name);
 
             // Cloud loop: every tool round waits on §5.5 ledger (`POST /tools/result`) then continues LLM.
             let mut merged_tool_results: Vec<Value> = tool_results.clone();

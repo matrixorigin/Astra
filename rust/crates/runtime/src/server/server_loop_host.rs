@@ -363,7 +363,7 @@ impl ServerAgenticLoopHost {
 
         llm_messages.extend(compact_result.messages);
         // Strip old reasoning to reduce input tokens (see edge_ledger::strip_stale_reasoning).
-        crate::turn::edge_ledger::strip_stale_reasoning(&mut llm_messages);
+        crate::turn::edge_ledger::strip_stale_reasoning(&mut llm_messages, provider, model_name);
 
         // Post-compaction: re-inject invoked skill instructions (truncated)
         // so the LLM retains skill context after history summarization.
