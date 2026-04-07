@@ -11,6 +11,7 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
         "Manual save: /checkpoint [label] — heavy JSON first, then session md + journal",
     ),
     ("/history", "Show conversation turns"),
+    ("/export", "Export session as Markdown (timestamped file in cwd)"),
     ("/copy", "Copy last response to clipboard"),
     (
         "/review",

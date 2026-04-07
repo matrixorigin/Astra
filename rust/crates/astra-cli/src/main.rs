@@ -145,6 +145,7 @@ use slash_debug::handle_debug_command;
 use slash_info::handle_info_command;
 use slash_memory::{handle_memory_domain_command, handle_plan_mode_input};
 use slash_session::handle_session_command;
+use slash_session::handle_export_command;
 #[cfg(test)]
 use slash_session::resolve_journal_target_session;
 use slash_skill::handle_skill_command;
@@ -4453,6 +4454,8 @@ async fn handle_slash_command(
         }
 
         "/session" => handle_session_command(arg, state),
+
+        "/export" => handle_export_command(state),
 
         "/checkpoint" => match create_manual_repl_checkpoint(state, arg) {
             Ok(msg) => {
