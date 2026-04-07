@@ -3,6 +3,9 @@
 //! # Architecture
 //!
 //! Tool selection is a **separate concern** from tool execution and LLM chat.
+//! **Agent Skills** are surfaced and ranked in [`crate::turn::skill_tool`] (e.g. `select_skills_for_turn`);
+//! this module only scores tools from [`crate::tool_registry`].
+//!
 //! This module defines the `ToolSelector` trait and three strategies:
 //!
 //! - [`TfIdfSelector`]: Fast heuristic fallback using TF-IDF scoring (no LLM call).
@@ -13,8 +16,8 @@
 //!   Handles semantic understanding natively — "matrixone呢？" after a PR query
 //!   is trivial for an LLM but impossible for heuristics.
 //!
-//! - [`FallbackSelector`]: Runs TF-IDF first, then may call LLM (primary) for skills or when
-//!   confidence is low; if the LLM yields nothing usable, falls back to the TF-IDF result.
+//! - [`FallbackSelector`]: Runs TF-IDF first, then may call LLM (primary) when confidence is low;
+//!   if the LLM yields nothing usable, falls back to the TF-IDF result.
 //!
 //! # Design rationale
 //!
@@ -753,7 +756,7 @@ const TOOL_SELECT_SYSTEM: &str = "\
 You are a tool selector. Given the user's query and context, decide which tools are needed.
 Return ONLY a JSON array of tool names. Select 1-5 items total. Do not explain.
 Pinned tools (bash, read_file, write_file, str_replace, list_dir, grep, glob) are always available — do NOT include them.
-Only select from the dynamic tools listed below.";
+Only select from the dynamic tools listed below. The list is executable registry tools only — never output Agent Skill names (skills use the separate `skill` tool in the main agent loop).";
 
 fn build_tool_select_prompt(
     query: &str,
@@ -762,7 +765,7 @@ fn build_tool_select_prompt(
     catalog: &str,
 ) -> Vec<Value> {
     let system = format!(
-        "{}\n\nDynamic tools and skills:\n{}",
+        "{}\n\nDynamic tools:\n{}",
         TOOL_SELECT_SYSTEM, catalog
     );
     let mut user_msg = format!("Query: {}", query);
