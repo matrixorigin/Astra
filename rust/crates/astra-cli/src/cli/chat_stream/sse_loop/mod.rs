@@ -190,7 +190,13 @@ pub(crate) async fn stream_chat_sse(
         approval_request_tx: p.approval_request_tx,
     };
 
-    let hook_sets = detect_turn_hook_sets(&project_root, task_profile, p.is_plan_subtask);
+    let bare_mode = std::env::var("ASTRA_BARE").map(|v| v == "1").unwrap_or(false);
+    let hook_sets = if bare_mode {
+        // Bare mode: skip all hooks
+        astra_runtime::turn::stop_hooks_yaml::TurnHookSets::default()
+    } else {
+        detect_turn_hook_sets(&project_root, task_profile, p.is_plan_subtask)
+    };
 
     // Build skill resolver — shared with sub-run executor for nested skill invocations.
     let skill_resolver: Option<Arc<dyn astra_runtime::turn::skill_tool::SkillResolver>> = {
@@ -294,8 +300,8 @@ pub(crate) async fn stream_chat_sse(
         pinned_skills: std::collections::HashSet::new(),
         discovered_skills,
         skill_search: p.skill_search.clone(),
-        tool_event_hooks: astra_runtime::skills::hooks::load_tool_event_hooks(&project_root),
-        session_event_hooks: astra_runtime::skills::hooks::load_session_event_hooks(&project_root),
+        tool_event_hooks: if bare_mode { Default::default() } else { astra_runtime::skills::hooks::load_tool_event_hooks(&project_root) },
+        session_event_hooks: if bare_mode { Default::default() } else { astra_runtime::skills::hooks::load_session_event_hooks(&project_root) },
         stop_hooks: hook_sets.stop_hooks,
         stop_hook_runs: 0,
         teammate_idle_hooks: hook_sets.teammate_idle_hooks,
