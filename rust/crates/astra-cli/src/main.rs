@@ -160,6 +160,9 @@ struct Cli {
     api_url: String,
     #[arg(long)]
     profile: Option<String>,
+    /// Model to use (overrides config default_model)
+    #[arg(long = "model")]
+    model: Option<String>,
     /// Print mode: send prompt, print response, exit. No tools, no interaction.
     /// Usage: astra -p "your question" or echo "question" | astra -p
     #[arg(short = 'p', long = "print")]
@@ -5309,6 +5312,7 @@ async fn main() {
     let Cli {
         api_url: _,
         profile,
+        model: cli_model,
         print: print_mode,
         output_format,
         continue_last,
@@ -5316,9 +5320,14 @@ async fn main() {
         command,
     } = cli;
 
+    // Resolve model: --model flag > config default_model > None
+    let resolved_model = cli_model.or_else(|| {
+        command_router::read_config_default_model().ok().flatten()
+    });
+
     // --print mode: headless single-shot, no tool execution
     if print_mode {
-        match run_print_mode(&api, profile.as_deref(), &output_format, command).await {
+        match run_print_mode(&api, profile.as_deref(), &output_format, resolved_model.as_deref(), command).await {
             Ok(code) => std::process::exit(i32::from(code)),
             Err(e) => {
                 eprintln!("{}", format!("Error: {e}").red());
@@ -5346,7 +5355,7 @@ async fn main() {
 
         match resolved_sid {
             Some(sid) => {
-                let result = run_chat_repl(&api, profile.as_deref(), None, Some(&sid)).await;
+                let result = run_chat_repl(&api, profile.as_deref(), resolved_model.as_deref(), Some(&sid)).await;
                 match result {
                     Ok(()) => std::process::exit(0),
                     Err(e) => {
@@ -5362,7 +5371,7 @@ async fn main() {
         }
     }
 
-    match execute_cli_command(command, profile, &api).await {
+    match execute_cli_command(command, profile, resolved_model, &api).await {
         Ok(exit_code) => {
             std::process::exit(i32::from(exit_code));
         }
@@ -6199,6 +6208,7 @@ mod tests {
         let result = execute_cli_command(
             Some(Command::Health),
             Some("nonexistent-profile".to_string()),
+            None,
             &api,
         )
         .await;
