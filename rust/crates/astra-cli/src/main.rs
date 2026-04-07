@@ -3593,8 +3593,10 @@ async fn refresh_dynamic_completions(state: &ReplState) {
         manifests
             .into_iter()
             .map(|m| {
-                let desc = if m.description.len() > 40 {
-                    format!("{}…", &m.description[..39])
+                let mut iter = m.description.chars();
+                let preview: String = iter.by_ref().take(39).collect();
+                let desc = if iter.next().is_some() {
+                    format!("{preview}…")
                 } else {
                     m.description.clone()
                 };
