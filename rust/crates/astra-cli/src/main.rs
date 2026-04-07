@@ -131,8 +131,8 @@ use stream_render::{StreamRenderState, TurnResult, dispatch_turn_event_block};
 
 use repl_runtime::{
     build_repl_editor, check_server_has_models, create_tool_selector,
-    create_tool_selector_with_quality, current_access_token, initialize_repl_state,
-    print_repl_banner, try_silent_auth,
+    create_tool_selector_quiet, create_tool_selector_with_quality, current_access_token,
+    initialize_repl_state, print_repl_banner, try_silent_auth,
 };
 use repl_turn::{ReplTurnContext, create_manual_repl_checkpoint, handle_chat_input};
 use repl_ui::{
@@ -4188,7 +4188,12 @@ async fn try_connect_matrixone() -> Option<sqlx::Pool<sqlx::MySql>> {
 
 // ═══════════════════════════════════════════════════════ Task Commands ════
 
-async fn handle_task_command(arg: &str, state: &mut ReplState) {
+async fn handle_task_command(
+    arg: &str,
+    state: &mut ReplState,
+    api: &astra_thin_client::ThinClient,
+    token: Option<&str>,
+) {
     use astra_services::{TaskCreateRequest, TaskService, TaskStatus};
 
     let svc = match &state.task_service {
@@ -4340,8 +4345,254 @@ async fn handle_task_command(arg: &str, state: &mut ReplState) {
                 Err(e) => eprintln!("{}", format!("  {} {e}", theme::icon_err()).red()),
             }
         }
+        "run" if !sub_arg.is_empty() => {
+            let token_str = match token {
+                Some(t) => t.to_string(),
+                None => {
+                    eprintln!(
+                        "{}",
+                        "  ⚠ No API token available. Use /login first.".yellow()
+                    );
+                    return;
+                }
+            };
+
+            // Create task record
+            let task_id = match svc
+                .create_task(
+                    user_id,
+                    session_id,
+                    TaskCreateRequest {
+                        title: format!(
+                            "run: {}",
+                            if sub_arg.len() > 60 {
+                                format!("{}…", &sub_arg[..60])
+                            } else {
+                                sub_arg.to_string()
+                            }
+                        ),
+                        description: Some(sub_arg.to_string()),
+                        plan: None,
+                        parent_task_id: None,
+                        project_type: None,
+                        goal_pattern: None,
+                    },
+                )
+                .await
+            {
+                Ok(tid) => tid,
+                Err(e) => {
+                    eprintln!("{}", format!("  {} {e}", theme::icon_err()).red());
+                    return;
+                }
+            };
+            let short_id = task_id[..8.min(task_id.len())].to_string();
+
+            // Clone owned values for the background task
+            let api_clone = api.clone();
+            let prompt = sub_arg.to_string();
+            let bg_session_id = state.session_id.clone();
+            let bg_model = state.model.clone();
+            let bg_history = state.history.clone();
+            let bg_unified_skill_registry = state.unified_skill_registry.clone();
+            let bg_skill_search = state.skill_search.clone();
+            let svc_clone = svc.clone();
+            let workspace_root = std::env::current_dir().unwrap_or_default();
+
+            eprintln!(
+                "  {} Background task started: {} ({})",
+                "▶".cyan(),
+                if sub_arg.len() > 50 {
+                    format!("{}…", &sub_arg[..50])
+                } else {
+                    sub_arg.to_string()
+                },
+                short_id.dim()
+            );
+            eprintln!(
+                "  {}",
+                "Use /task status or /task result to check progress.".dim()
+            );
+
+            // Spawn background task
+            let bg_task_id = task_id.clone();
+            tokio::spawn(async move {
+                // Mark in-progress
+                let _ = svc_clone
+                    .update_status(&bg_task_id, TaskStatus::InProgress)
+                    .await;
+
+                // Create fresh auto-approve permission manager for background
+                let mut perm_manager =
+                    PermissionManager::with_project(true, &workspace_root);
+                let mut skill_qt =
+                    astra_runtime::skills::quality::SkillQualityTracker::new();
+
+                // Create a fresh tool selector for the background task
+                let (selector, _modules) =
+                    create_tool_selector_quiet(&api_clone, None);
+
+                let result = stream_chat_sse(ChatTurnParams {
+                    api: &api_clone,
+                    token: &token_str,
+                    message: &prompt,
+                    session_id: bg_session_id.as_deref(),
+                    model: bg_model.as_deref(),
+                    explain: ExplainMode::Off,
+                    render_md: false,
+                    history: &bg_history,
+                    perm_manager: &mut perm_manager,
+                    verbose_mode: false,
+                    quiet: true,
+                    suppress_intermediate_output: true,
+                    selector: &*selector,
+                    recent_tools: &[],
+                    tool_health_entries: &[],
+                    unified_skill_registry: &bg_unified_skill_registry,
+                    plan_only_chat: false,
+                    hide_streaming_assistant_text: true,
+                    is_plan_subtask: false,
+                    plan_subtask_id: None,
+                    delegation_engine: None,
+                    cancel_token: None,
+                    plan_assemble_line_release: None,
+                    stream_event_tx: None,
+                    approval_request_tx: None,
+                    mcp_manager: None,
+                    skill_search: &bg_skill_search,
+                    skill_quality_tracker: &mut skill_qt,
+                    discovered_skills: None,
+                })
+                .await;
+
+                let short = &bg_task_id[..8.min(bg_task_id.len())];
+                match result {
+                    Ok(sr) => {
+                        // Store result in checkpoint state map
+                        let mut state_map = serde_json::Map::new();
+                        state_map.insert(
+                            "full_text".to_string(),
+                            serde_json::Value::String(sr.full_text.clone()),
+                        );
+                        state_map.insert(
+                            "prompt_tokens".to_string(),
+                            serde_json::json!(sr.prompt_tokens),
+                        );
+                        state_map.insert(
+                            "completion_tokens".to_string(),
+                            serde_json::json!(sr.completion_tokens),
+                        );
+                        state_map.insert(
+                            "tool_calls_count".to_string(),
+                            serde_json::json!(sr.tool_calls_count),
+                        );
+                        let _ = svc_clone
+                            .save_checkpoint(
+                                &bg_task_id,
+                                &astra_services::task_orchestrator::TaskCheckpoint {
+                                    active_subtask_id: None,
+                                    turn: 0,
+                                    session_id: bg_session_id.clone(),
+                                    state: state_map,
+                                },
+                            )
+                            .await;
+                        let _ = svc_clone.complete_task(&bg_task_id).await;
+                        eprintln!(
+                            "\n  {} Background task {} completed. Use /task result {} to view.",
+                            theme::icon_ok(),
+                            short.cyan(),
+                            short.cyan()
+                        );
+                    }
+                    Err(e) => {
+                        let _ = svc_clone
+                            .fail_task(&bg_task_id, &e.error)
+                            .await;
+                        eprintln!(
+                            "\n  {} Background task {} failed: {}",
+                            theme::icon_err(),
+                            short.cyan(),
+                            e.error.red()
+                        );
+                    }
+                }
+            });
+        }
+        "result" if !sub_arg.is_empty() => {
+            // Show the full result of a background task
+            match find_task_by_query(&*svc, user_id, sub_arg).await {
+                Ok(Some(tid)) => match svc.get_task(&tid).await {
+                    Ok(Some(t)) => {
+                        let short = &t.task_id[..8.min(t.task_id.len())];
+                        eprintln!(
+                            "\n{}",
+                            format!("─── Task Result ({short}) ─────────────────────────")
+                                .bold()
+                        );
+                        eprintln!("  {:<12} {}", "title:".dim(), t.title);
+                        eprintln!("  {:<12} {}", "status:".dim(), t.status.as_str().cyan());
+                        if let Some(ref err) = t.error_message {
+                            eprintln!("  {:<12} {}", "error:".dim(), err.as_str().red());
+                        }
+                        // Print checkpoint data (the full_text from the agent)
+                        let mut found_result = false;
+                        if let Some(ref cp) = t.checkpoint {
+                            if let Some(full_text) =
+                                cp.state.get("full_text").and_then(|v| v.as_str())
+                            {
+                                found_result = true;
+                                eprintln!();
+                                eprintln!("{full_text}");
+                                if let Some(tokens) =
+                                    cp.state.get("prompt_tokens").and_then(|v| v.as_u64())
+                                {
+                                    let comp = cp
+                                        .state
+                                        .get("completion_tokens")
+                                        .and_then(|v| v.as_u64())
+                                        .unwrap_or(0);
+                                    let tools = cp
+                                        .state
+                                        .get("tool_calls_count")
+                                        .and_then(|v| v.as_u64())
+                                        .unwrap_or(0);
+                                    eprintln!(
+                                        "\n  {}",
+                                        format!("tokens: {tokens}→/{comp}← | tools: {tools}")
+                                            .dim()
+                                    );
+                                }
+                            }
+                        }
+                        if !found_result {
+                            match t.status {
+                                TaskStatus::InProgress | TaskStatus::Pending => {
+                                    eprintln!("  {}", "Task is still running…".yellow());
+                                }
+                                _ => {
+                                    eprintln!("  {}", "No result data available.".dim());
+                                }
+                            }
+                        }
+                        eprintln!();
+                    }
+                    Ok(None) => {
+                        eprintln!("{}", format!("  Task not found: '{sub_arg}'").yellow());
+                    }
+                    Err(e) => eprintln!("{}", format!("  {} {e}", theme::icon_err()).red()),
+                },
+                Ok(None) => {
+                    eprintln!("{}", format!("  Task not found: '{sub_arg}'").yellow());
+                    eprintln!("{}", "  Use /task list to see available tasks.".dim());
+                }
+                Err(e) => eprintln!("{}", format!("  {} {e}", theme::icon_err()).red()),
+            }
+        }
         _ => {
-            eprintln!("  Usage: /task [list | add <title> | done <id> | status <id>]");
+            eprintln!(
+                "  Usage: /task [list | add <title> | done <id> | status <id> | run <prompt> | result <id>]"
+            );
         }
     }
 }
@@ -4590,7 +4841,7 @@ async fn handle_slash_command(
         }
 
         "/task" => {
-            handle_task_command(arg, state).await;
+            handle_task_command(arg, state, api, token).await;
         }
 
         "/resume" => {
@@ -8860,5 +9111,78 @@ total_tokens_out: 500
         let state = ReplState::default();
         unsafe { std::env::remove_var("ASTRA_AUTO_APPROVE"); }
         assert_eq!(state.perm_manager.mode(), permission_manager::PermissionMode::Auto);
+    }
+
+    #[tokio::test]
+    async fn task_run_stores_result_in_checkpoint() {
+        use astra_services::{TaskCreateRequest, TaskService, task_orchestrator::TaskCheckpoint};
+
+        // Use a temp dir for LocalTaskService
+        let tmp = tempfile::tempdir().unwrap();
+        let svc = astra_services::LocalTaskService::new(tmp.path().to_path_buf());
+
+        // Create a task (simulates what /task run does)
+        let tid = svc
+            .create_task(
+                "test-user",
+                "test-session",
+                TaskCreateRequest {
+                    title: "run: test prompt".to_string(),
+                    description: Some("test prompt".to_string()),
+                    plan: None,
+                    parent_task_id: None,
+                    project_type: None,
+                    goal_pattern: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        // Mark in-progress
+        svc.update_status(&tid, astra_services::TaskStatus::InProgress)
+            .await
+            .unwrap();
+
+        // Save checkpoint with result (simulates background task completion)
+        let mut state_map = serde_json::Map::new();
+        state_map.insert(
+            "full_text".to_string(),
+            serde_json::Value::String("Hello from agent".to_string()),
+        );
+        state_map.insert("prompt_tokens".to_string(), serde_json::json!(100));
+        state_map.insert("completion_tokens".to_string(), serde_json::json!(50));
+        state_map.insert("tool_calls_count".to_string(), serde_json::json!(3));
+
+        svc.save_checkpoint(
+            &tid,
+            &TaskCheckpoint {
+                active_subtask_id: None,
+                turn: 0,
+                session_id: Some("test-session".to_string()),
+                state: state_map,
+            },
+        )
+        .await
+        .unwrap();
+
+        // Complete the task
+        svc.complete_task(&tid).await.unwrap();
+
+        // Read back and verify (simulates /task result)
+        let record = svc.get_task(&tid).await.unwrap().unwrap();
+        assert_eq!(record.status, astra_services::TaskStatus::Completed);
+        let cp = record.checkpoint.unwrap();
+        assert_eq!(
+            cp.state.get("full_text").and_then(|v| v.as_str()),
+            Some("Hello from agent")
+        );
+        assert_eq!(
+            cp.state.get("prompt_tokens").and_then(|v| v.as_u64()),
+            Some(100)
+        );
+        assert_eq!(
+            cp.state.get("tool_calls_count").and_then(|v| v.as_u64()),
+            Some(3)
+        );
     }
 }

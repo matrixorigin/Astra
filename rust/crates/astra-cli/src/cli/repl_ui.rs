@@ -55,7 +55,7 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/report", "Last delivery report (/report save = JSON)"),
     // ── Memory & tasks ────────────────────────────────────────────────────
     ("/memory", "Memoria: list, search <q>, inspect <id>, …"),
-    ("/task", "Local tasks: list, add, done, status"),
+    ("/task", "Tasks: list, add, done, status, run <prompt>, result <id>"),
     // ── State & reflection ───────────────────────────────────────────────
     (
         "/explain",
@@ -804,7 +804,7 @@ fn slash_argument_hint(command: &str) -> Option<&'static str> {
         "/plan" => {
             Some("[on|off|status|pause|resume|enter <goal>|auto|exit|decompose|show|set|clear]")
         }
-        "/task" => Some("[list|add <title>|done <id>|status <id>]"),
+        "/task" => Some("[list|add <title>|done <id>|status <id>|run <prompt>|result <id>]"),
         "/resume" => Some("[session_id]"),
         "/stats" => Some("[history]"),
         "/cost" => Some("[detail|history]"),
