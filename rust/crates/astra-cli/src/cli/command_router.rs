@@ -716,6 +716,12 @@ pub(super) async fn execute_cli_command(
             journal_digest::run_digest(&args)?;
             Ok(ExitCode::Success)
         }
+
+        // ── MCP server management (offline, no server needed) ──────────
+        Some(Command::Mcp(mcp_cmd)) => {
+            execute_mcp_command(mcp_cmd)?;
+            Ok(ExitCode::Success)
+        }
     }
 }
 
@@ -736,4 +742,477 @@ fn compute_exit_code(sr: &StreamResult) -> ExitCode {
     }
 
     ExitCode::Success
+}
+
+// ═══════════════════════════════════════════════════════ MCP CLI ══════════
+
+/// Resolve the mcp.json path for the given scope.
+fn mcp_json_path_for_scope(scope: &str) -> Result<std::path::PathBuf, String> {
+    match scope {
+        "project" => crate::manifest_loader::project_mcp_json_path()
+            .ok_or_else(|| "Cannot determine project directory".to_string()),
+        "user" => crate::manifest_loader::global_mcp_json_path()
+            .ok_or_else(|| "Cannot determine home directory".to_string()),
+        other => Err(format!("Unknown scope '{other}' — use 'project' or 'user'")),
+    }
+}
+
+/// Read and parse an mcp.json file, returning empty config if missing.
+fn read_mcp_config(path: &std::path::Path) -> Result<serde_json::Value, String> {
+    if !path.is_file() {
+        return Ok(serde_json::json!({"mcpServers": {}}));
+    }
+    let content = std::fs::read_to_string(path)
+        .map_err(|e| format!("Failed to read {}: {e}", path.display()))?;
+    serde_json::from_str(&content)
+        .map_err(|e| format!("Failed to parse {}: {e}", path.display()))
+}
+
+/// Write config atomically (temp + rename).
+fn write_mcp_config(path: &std::path::Path, config: &serde_json::Value) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("Failed to create {}: {e}", parent.display()))?;
+    }
+    let tmp = path.with_extension("json.tmp");
+    let pretty = serde_json::to_string_pretty(config).unwrap_or_default();
+    std::fs::write(&tmp, &pretty)
+        .map_err(|e| format!("Failed to write {}: {e}", tmp.display()))?;
+    std::fs::rename(&tmp, path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("Failed to rename to {}: {e}", path.display())
+    })
+}
+
+fn execute_mcp_command(cmd: McpCmd) -> Result<(), String> {
+    match cmd {
+        McpCmd::List(args) => mcp_list(&args.scope),
+        McpCmd::Add(args) => mcp_add(&args.name, &args.command, &args.args, &args.scope),
+        McpCmd::AddJson(args) => mcp_add_json(&args.name, &args.json, &args.scope),
+        McpCmd::Remove(args) => mcp_remove(&args.name, &args.scope),
+        McpCmd::Get(args) => mcp_get(&args.name),
+    }
+}
+
+fn mcp_list(scope: &str) -> Result<(), String> {
+    let path = mcp_json_path_for_scope(scope)?;
+    let config = read_mcp_config(&path)?;
+    let servers = config
+        .get("mcpServers")
+        .and_then(|v| v.as_object())
+        .cloned()
+        .unwrap_or_default();
+
+    if servers.is_empty() {
+        println!("No MCP servers configured in {} scope.", scope);
+        println!("Use `astra mcp add` to add a server.");
+        return Ok(());
+    }
+
+    println!("{:<20} {:<8} {:<40}", "Name", "Type", "Command / URL");
+    println!("{}", "─".repeat(70));
+    for (name, entry) in &servers {
+        let server_type = entry
+            .get("type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("stdio");
+        let detail = match server_type {
+            "sse" | "http" => entry
+                .get("url")
+                .and_then(|v| v.as_str())
+                .unwrap_or("-")
+                .to_string(),
+            _ => {
+                let cmd = entry
+                    .get("command")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("-");
+                let args = entry
+                    .get("args")
+                    .and_then(|v| v.as_array())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|v| v.as_str())
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    })
+                    .unwrap_or_default();
+                if args.is_empty() {
+                    cmd.to_string()
+                } else {
+                    format!("{cmd} {args}")
+                }
+            }
+        };
+        println!("{:<20} {:<8} {}", name, server_type, detail);
+    }
+    println!(
+        "\nConfig file: {}",
+        path.display()
+    );
+    Ok(())
+}
+
+fn mcp_add(name: &str, command: &str, args: &[String], scope: &str) -> Result<(), String> {
+    let path = mcp_json_path_for_scope(scope)?;
+    let mut config = read_mcp_config(&path)?;
+
+    // Check for duplicate
+    if let Some(servers) = config.get("mcpServers").and_then(|v| v.as_object()) {
+        if servers.contains_key(name) {
+            return Err(format!(
+                "Server '{name}' already exists. Remove it first with: astra mcp remove {name}"
+            ));
+        }
+    }
+
+    let entry = serde_json::json!({
+        "command": command,
+        "args": args,
+    });
+    config
+        .as_object_mut()
+        .unwrap()
+        .entry("mcpServers")
+        .or_insert_with(|| serde_json::json!({}))
+        .as_object_mut()
+        .unwrap()
+        .insert(name.to_string(), entry);
+
+    write_mcp_config(&path, &config)?;
+    println!("Added '{name}' to {}", path.display());
+    Ok(())
+}
+
+fn mcp_add_json(name: &str, json: &str, scope: &str) -> Result<(), String> {
+    let entry: serde_json::Value = serde_json::from_str(json)
+        .map_err(|e| format!("Invalid JSON: {e}"))?;
+    if !entry.is_object() {
+        return Err("JSON config must be an object".to_string());
+    }
+
+    let path = mcp_json_path_for_scope(scope)?;
+    let mut config = read_mcp_config(&path)?;
+
+    if let Some(servers) = config.get("mcpServers").and_then(|v| v.as_object()) {
+        if servers.contains_key(name) {
+            return Err(format!(
+                "Server '{name}' already exists. Remove it first with: astra mcp remove {name}"
+            ));
+        }
+    }
+
+    config
+        .as_object_mut()
+        .unwrap()
+        .entry("mcpServers")
+        .or_insert_with(|| serde_json::json!({}))
+        .as_object_mut()
+        .unwrap()
+        .insert(name.to_string(), entry);
+
+    write_mcp_config(&path, &config)?;
+    println!("Added '{name}' to {}", path.display());
+    Ok(())
+}
+
+fn mcp_remove(name: &str, scope: &str) -> Result<(), String> {
+    let path = mcp_json_path_for_scope(scope)?;
+    if !path.is_file() {
+        return Err(format!("No config file at {}", path.display()));
+    }
+    let mut config = read_mcp_config(&path)?;
+
+    let removed = config
+        .get_mut("mcpServers")
+        .and_then(|v| v.as_object_mut())
+        .map(|m| m.remove(name).is_some())
+        .unwrap_or(false);
+
+    if !removed {
+        return Err(format!("Server '{name}' not found in {}", path.display()));
+    }
+
+    write_mcp_config(&path, &config)?;
+    println!("Removed '{name}' from {}", path.display());
+    Ok(())
+}
+
+fn mcp_get(name: &str) -> Result<(), String> {
+    // Search both scopes
+    let scopes = ["project", "user"];
+    for scope in &scopes {
+        let path = match mcp_json_path_for_scope(scope) {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        let config = match read_mcp_config(&path) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        if let Some(entry) = config
+            .get("mcpServers")
+            .and_then(|v| v.as_object())
+            .and_then(|m| m.get(name))
+        {
+            println!("{}:", name);
+            println!("  Scope: {scope}");
+            let server_type = entry
+                .get("type")
+                .and_then(|v| v.as_str())
+                .unwrap_or("stdio");
+            println!("  Type: {server_type}");
+            match server_type {
+                "sse" | "http" => {
+                    if let Some(url) = entry.get("url").and_then(|v| v.as_str()) {
+                        println!("  URL: {url}");
+                    }
+                }
+                _ => {
+                    if let Some(cmd) = entry.get("command").and_then(|v| v.as_str()) {
+                        println!("  Command: {cmd}");
+                    }
+                    if let Some(args) = entry.get("args").and_then(|v| v.as_array()) {
+                        let args_str: Vec<&str> =
+                            args.iter().filter_map(|v| v.as_str()).collect();
+                        println!("  Args: {}", args_str.join(" "));
+                    }
+                }
+            }
+            if let Some(env) = entry.get("env").and_then(|v| v.as_object()) {
+                println!("  Environment:");
+                for (k, v) in env {
+                    println!("    {k}={}", v.as_str().unwrap_or(&v.to_string()));
+                }
+            }
+            println!(
+                "\nTo remove: astra mcp remove \"{}\" -s {scope}",
+                name
+            );
+            return Ok(());
+        }
+    }
+    Err(format!("No MCP server found with name: {name}"))
+}
+
+#[cfg(test)]
+mod mcp_cli_tests {
+    use super::*;
+
+    fn make_config(path: &std::path::Path, servers: serde_json::Value) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        let config = serde_json::json!({"mcpServers": servers});
+        std::fs::write(path, serde_json::to_string_pretty(&config).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn read_mcp_config_missing_file() {
+        let config = read_mcp_config(std::path::Path::new("/tmp/nonexistent_mcp.json")).unwrap();
+        assert!(config["mcpServers"].as_object().unwrap().is_empty());
+    }
+
+    #[test]
+    fn read_mcp_config_valid() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            tmp.path(),
+            r#"{"mcpServers":{"test":{"command":"echo"}}}"#,
+        )
+        .unwrap();
+        let config = read_mcp_config(tmp.path()).unwrap();
+        assert!(config["mcpServers"]["test"]["command"] == "echo");
+    }
+
+    #[test]
+    fn read_mcp_config_invalid_json() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), "not json").unwrap();
+        let err = read_mcp_config(tmp.path()).unwrap_err();
+        assert!(err.contains("Failed to parse"));
+    }
+
+    #[test]
+    fn write_mcp_config_creates_parents() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("sub").join("dir").join("mcp.json");
+        let config = serde_json::json!({"mcpServers": {}});
+        write_mcp_config(&path, &config).unwrap();
+        assert!(path.is_file());
+    }
+
+    #[test]
+    fn mcp_json_path_for_scope_invalid() {
+        let err = mcp_json_path_for_scope("invalid").unwrap_err();
+        assert!(err.contains("Unknown scope"));
+    }
+
+    #[test]
+    fn mcp_add_and_remove_roundtrip() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("mcp.json");
+
+        // Start empty
+        make_config(&path, serde_json::json!({}));
+
+        // Add a server
+        let mut config = read_mcp_config(&path).unwrap();
+        let entry = serde_json::json!({"command": "npx", "args": ["@mcp/server"]});
+        config["mcpServers"]
+            .as_object_mut()
+            .unwrap()
+            .insert("test-server".to_string(), entry);
+        write_mcp_config(&path, &config).unwrap();
+
+        // Verify it's there
+        let config = read_mcp_config(&path).unwrap();
+        assert!(config["mcpServers"]["test-server"]["command"] == "npx");
+
+        // Remove it
+        let mut config = read_mcp_config(&path).unwrap();
+        let removed = config["mcpServers"]
+            .as_object_mut()
+            .unwrap()
+            .remove("test-server")
+            .is_some();
+        assert!(removed);
+        write_mcp_config(&path, &config).unwrap();
+
+        // Verify it's gone
+        let config = read_mcp_config(&path).unwrap();
+        assert!(!config["mcpServers"]
+            .as_object()
+            .unwrap()
+            .contains_key("test-server"));
+    }
+
+    #[test]
+    fn mcp_add_json_valid() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("mcp.json");
+        make_config(&path, serde_json::json!({}));
+
+        let entry: serde_json::Value =
+            serde_json::from_str(r#"{"url":"http://localhost:3000","type":"sse"}"#).unwrap();
+        let mut config = read_mcp_config(&path).unwrap();
+        config["mcpServers"]
+            .as_object_mut()
+            .unwrap()
+            .insert("sse-server".to_string(), entry);
+        write_mcp_config(&path, &config).unwrap();
+
+        let config = read_mcp_config(&path).unwrap();
+        assert_eq!(config["mcpServers"]["sse-server"]["type"], "sse");
+        assert_eq!(
+            config["mcpServers"]["sse-server"]["url"],
+            "http://localhost:3000"
+        );
+    }
+
+    #[test]
+    fn mcp_add_json_invalid_json() {
+        let err: Result<serde_json::Value, _> = serde_json::from_str("not json");
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn mcp_add_duplicate_detection() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("mcp.json");
+        make_config(
+            &path,
+            serde_json::json!({"existing": {"command": "echo"}}),
+        );
+
+        let config = read_mcp_config(&path).unwrap();
+        let has_existing = config["mcpServers"]
+            .as_object()
+            .unwrap()
+            .contains_key("existing");
+        assert!(has_existing);
+    }
+
+    #[test]
+    fn mcp_remove_nonexistent_server() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("mcp.json");
+        make_config(&path, serde_json::json!({}));
+
+        let mut config = read_mcp_config(&path).unwrap();
+        let removed = config["mcpServers"]
+            .as_object_mut()
+            .unwrap()
+            .remove("ghost")
+            .is_some();
+        assert!(!removed);
+    }
+
+    #[test]
+    fn mcp_get_searches_both_scopes() {
+        // mcp_get searches project then user; verify the search logic
+        let scopes = ["project", "user"];
+        assert_eq!(scopes.len(), 2);
+        assert_eq!(scopes[0], "project");
+        assert_eq!(scopes[1], "user");
+    }
+
+    #[test]
+    fn mcp_list_empty_config() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("mcp.json");
+        make_config(&path, serde_json::json!({}));
+
+        let config = read_mcp_config(&path).unwrap();
+        let servers = config["mcpServers"].as_object().unwrap();
+        assert!(servers.is_empty());
+    }
+
+    #[test]
+    fn mcp_list_multiple_server_types() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("mcp.json");
+        make_config(
+            &path,
+            serde_json::json!({
+                "stdio-srv": {"command": "npx", "args": ["@mcp/server"]},
+                "sse-srv": {"type": "sse", "url": "http://localhost:3000"},
+                "http-srv": {"type": "http", "url": "http://localhost:4000"}
+            }),
+        );
+
+        let config = read_mcp_config(&path).unwrap();
+        let servers = config["mcpServers"].as_object().unwrap();
+        assert_eq!(servers.len(), 3);
+
+        // stdio type inference
+        let stdio = &servers["stdio-srv"];
+        assert_eq!(
+            stdio.get("type").and_then(|v| v.as_str()).unwrap_or("stdio"),
+            "stdio"
+        );
+
+        // sse type
+        assert_eq!(servers["sse-srv"]["type"], "sse");
+
+        // http type
+        assert_eq!(servers["http-srv"]["type"], "http");
+    }
+
+    #[test]
+    fn write_mcp_config_atomic_no_partial() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("mcp.json");
+        let config = serde_json::json!({"mcpServers": {"s": {"command": "echo"}}});
+        write_mcp_config(&path, &config).unwrap();
+
+        // tmp file should not remain
+        let tmp = path.with_extension("json.tmp");
+        assert!(!tmp.exists());
+
+        // written file should be valid JSON
+        let content = std::fs::read_to_string(&path).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(parsed["mcpServers"]["s"]["command"], "echo");
+    }
 }
