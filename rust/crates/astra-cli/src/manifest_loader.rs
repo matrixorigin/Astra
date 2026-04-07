@@ -38,9 +38,10 @@ use astra_runtime::tool_registry::plugin::{PluginRegistry, PluginToolEntry};
 use astra_runtime::tool_registry::{IntentType, Scope};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use std::path::Path;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 
-use crate::mcp_client::McpServerConfig;
+use crate::mcp_client::{McpServerConfig, RetryConfig, Transport};
 use crate::skill_instructions::{SkillInstruction, SkillMetadata, parse_skill_md};
 
 // ─── Manifest Types ─────────────────────────────────────────────────────────
@@ -418,13 +419,26 @@ pub fn load_skills_directory(registry: &mut PluginRegistry) {
     }
 }
 
-/// Collect all MCP server configs from skill manifests across search paths.
+/// Collect all MCP server configs from skill manifests AND standalone
+/// `.astra/mcp.json` files across search paths.
 ///
-/// Scans the same directories as [`load_skills_directory`], discovers skill
-/// manifests, and returns their `mcp_servers` entries (deduped by server name).
+/// Discovery order (higher priority = loaded first, wins on name collisions):
+/// 1. `{cwd}/.astra/mcp.json` (project-level standalone config)
+/// 2. Skill manifest `mcp_servers:` entries from all search paths
+/// 3. `~/.astra/mcp.json` (user-level global config)
+///
+/// Servers are deduped by name: first occurrence wins.
 pub fn collect_mcp_server_configs() -> Vec<crate::mcp_client::McpServerConfig> {
     let mut seen = std::collections::HashSet::new();
     let mut configs = Vec::new();
+
+    // 1. Project-level .astra/mcp.json (highest priority)
+    if let Ok(cwd) = std::env::current_dir() {
+        let project_mcp = cwd.join(".astra").join("mcp.json");
+        load_mcp_json_into(&project_mcp, &mut seen, &mut configs);
+    }
+
+    // 2. Skill manifest mcp_servers: sections
     for dir in &crate::skill_instructions::skill_search_paths() {
         if !dir.is_dir() {
             continue;
@@ -437,7 +451,171 @@ pub fn collect_mcp_server_configs() -> Vec<crate::mcp_client::McpServerConfig> {
             }
         }
     }
+
+    // 3. User-level ~/.astra/mcp.json (lowest priority)
+    if let Some(home) = dirs::home_dir() {
+        let global_mcp = home.join(".astra").join("mcp.json");
+        load_mcp_json_into(&global_mcp, &mut seen, &mut configs);
+    }
+
     configs
+}
+
+// ─── Standalone .astra/mcp.json Support (CC-compatible) ────────────────────
+
+/// CC-compatible `.mcp.json` / `.astra/mcp.json` config format.
+///
+/// ```json
+/// {
+///   "mcpServers": {
+///     "github": {
+///       "command": "npx",
+///       "args": ["@modelcontextprotocol/server-github"],
+///       "env": { "GITHUB_TOKEN": "..." }
+///     },
+///     "api": {
+///       "type": "sse",
+///       "url": "http://localhost:8080/mcp"
+///     }
+///   }
+/// }
+/// ```
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct McpJsonConfig {
+    /// Map of server name → server config.
+    #[serde(default)]
+    mcp_servers: HashMap<String, McpJsonServerEntry>,
+}
+
+/// A single server entry in the CC-compatible JSON config.
+///
+/// When `type` is absent or `"stdio"`, `command` + `args` + `env` are used.
+/// When `type` is `"sse"` or `"http"`, `url` is used.
+/// When `type` is `"ws"` or `"websocket"`, `url` is used.
+#[derive(Debug, Deserialize)]
+struct McpJsonServerEntry {
+    /// Transport type. Defaults to "stdio" when absent.
+    #[serde(default = "default_stdio")]
+    r#type: String,
+    /// Stdio: command to run (single string, unlike our Vec<String> transport).
+    #[serde(default)]
+    command: Option<String>,
+    /// Stdio: additional command-line arguments.
+    #[serde(default)]
+    args: Vec<String>,
+    /// Stdio: environment variables for the child process.
+    #[serde(default)]
+    env: HashMap<String, String>,
+    /// SSE/WS: server URL.
+    #[serde(default)]
+    url: Option<String>,
+    /// SSE/WS: custom HTTP headers.
+    #[serde(default)]
+    headers: HashMap<String, String>,
+    /// SSE/WS: optional bearer token.
+    #[serde(default)]
+    auth_token: Option<String>,
+    /// Whether the server is disabled (CC uses this to toggle servers off).
+    #[serde(default)]
+    disabled: bool,
+}
+
+fn default_stdio() -> String {
+    "stdio".to_string()
+}
+
+/// Convert a CC-compatible JSON server entry into our `McpServerConfig`.
+fn json_entry_to_config(name: &str, entry: &McpJsonServerEntry) -> Option<McpServerConfig> {
+    if entry.disabled {
+        return None;
+    }
+    let transport = match entry.r#type.as_str() {
+        "stdio" | "" => {
+            let cmd = entry.command.as_deref()?;
+            let mut command = vec![cmd.to_string()];
+            command.extend(entry.args.iter().cloned());
+            Transport::Stdio {
+                command,
+                args: Vec::new(), // args already merged into command vec
+                env: entry.env.clone(),
+            }
+        }
+        "sse" | "http" => {
+            let url = entry.url.as_deref()?;
+            Transport::Sse {
+                url: url.to_string(),
+                auth_token: entry.auth_token.clone(),
+                headers: entry.headers.clone(),
+            }
+        }
+        "ws" | "websocket" => {
+            let url = entry.url.as_deref()?;
+            Transport::Ws {
+                url: url.to_string(),
+                auth_token: entry.auth_token.clone(),
+                headers: entry.headers.clone(),
+            }
+        }
+        other => {
+            eprintln!(
+                "  ⚠ mcp.json: unknown transport type '{}' for server '{}'",
+                other, name
+            );
+            return None;
+        }
+    };
+    Some(McpServerConfig {
+        name: name.to_string(),
+        transport,
+        description: String::new(),
+        enabled: true,
+        retry: RetryConfig::default(),
+    })
+}
+
+/// Load servers from a `.astra/mcp.json` file and merge into the collection.
+fn load_mcp_json_into(
+    path: &Path,
+    seen: &mut std::collections::HashSet<String>,
+    configs: &mut Vec<McpServerConfig>,
+) {
+    if !path.is_file() {
+        return;
+    }
+    let content = match std::fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("  ⚠ Failed to read {}: {e}", path.display());
+            return;
+        }
+    };
+    let json_config: McpJsonConfig = match serde_json::from_str(&content) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("  ⚠ Failed to parse {}: {e}", path.display());
+            return;
+        }
+    };
+    for (name, entry) in &json_config.mcp_servers {
+        if seen.contains(name) {
+            continue;
+        }
+        if let Some(config) = json_entry_to_config(name, entry) {
+            seen.insert(name.clone());
+            configs.push(config);
+        }
+    }
+}
+
+/// Return the path to the project-level `.astra/mcp.json`.
+pub fn project_mcp_json_path() -> Option<PathBuf> {
+    std::env::current_dir().ok().map(|cwd| cwd.join(".astra").join("mcp.json"))
+}
+
+/// Return the path to the user-level `~/.astra/mcp.json`.
+pub fn global_mcp_json_path() -> Option<PathBuf> {
+    dirs::home_dir().map(|home| home.join(".astra").join("mcp.json"))
 }
 
 // ─── Shell Command Execution for Manifest Tools ────────────────────────────
@@ -1231,5 +1409,217 @@ tools: []
 
         assert_eq!(enabled, 2); // enabled-server and default-enabled (default = true)
         assert_eq!(disabled, 1); // disabled-server
+    }
+
+    // ── .astra/mcp.json parsing tests ──
+
+    #[test]
+    fn parse_mcp_json_stdio_server() {
+        let json = r#"{
+            "mcpServers": {
+                "github": {
+                    "command": "npx",
+                    "args": ["@modelcontextprotocol/server-github"],
+                    "env": {"GITHUB_TOKEN": "test-token"}
+                }
+            }
+        }"#;
+        let config: McpJsonConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.mcp_servers.len(), 1);
+        let entry = &config.mcp_servers["github"];
+        assert_eq!(entry.r#type, "stdio");
+        assert_eq!(entry.command.as_deref(), Some("npx"));
+        assert_eq!(entry.args, vec!["@modelcontextprotocol/server-github"]);
+        assert_eq!(entry.env.get("GITHUB_TOKEN").unwrap(), "test-token");
+
+        let converted = json_entry_to_config("github", entry).unwrap();
+        assert_eq!(converted.name, "github");
+        assert!(converted.enabled);
+        match &converted.transport {
+            Transport::Stdio { command, env, .. } => {
+                assert_eq!(command, &["npx", "@modelcontextprotocol/server-github"]);
+                assert_eq!(env.get("GITHUB_TOKEN").unwrap(), "test-token");
+            }
+            _ => panic!("expected stdio transport"),
+        }
+    }
+
+    #[test]
+    fn parse_mcp_json_sse_server() {
+        let json = r#"{
+            "mcpServers": {
+                "api": {
+                    "type": "sse",
+                    "url": "http://localhost:8080/mcp",
+                    "headers": {"X-Api-Key": "secret"}
+                }
+            }
+        }"#;
+        let config: McpJsonConfig = serde_json::from_str(json).unwrap();
+        let entry = &config.mcp_servers["api"];
+        let converted = json_entry_to_config("api", entry).unwrap();
+        match &converted.transport {
+            Transport::Sse { url, headers, .. } => {
+                assert_eq!(url, "http://localhost:8080/mcp");
+                assert_eq!(headers.get("X-Api-Key").unwrap(), "secret");
+            }
+            _ => panic!("expected SSE transport"),
+        }
+    }
+
+    #[test]
+    fn parse_mcp_json_ws_server() {
+        let json = r#"{
+            "mcpServers": {
+                "realtime": {
+                    "type": "websocket",
+                    "url": "ws://localhost:9090/mcp",
+                    "auth_token": "bearer-xyz"
+                }
+            }
+        }"#;
+        let config: McpJsonConfig = serde_json::from_str(json).unwrap();
+        let entry = &config.mcp_servers["realtime"];
+        let converted = json_entry_to_config("realtime", entry).unwrap();
+        match &converted.transport {
+            Transport::Ws { url, auth_token, .. } => {
+                assert_eq!(url, "ws://localhost:9090/mcp");
+                assert_eq!(auth_token.as_deref(), Some("bearer-xyz"));
+            }
+            _ => panic!("expected WS transport"),
+        }
+    }
+
+    #[test]
+    fn parse_mcp_json_disabled_server() {
+        let json = r#"{
+            "mcpServers": {
+                "off": {
+                    "command": "npx",
+                    "args": ["something"],
+                    "disabled": true
+                }
+            }
+        }"#;
+        let config: McpJsonConfig = serde_json::from_str(json).unwrap();
+        let entry = &config.mcp_servers["off"];
+        assert!(json_entry_to_config("off", entry).is_none());
+    }
+
+    #[test]
+    fn parse_mcp_json_missing_command_returns_none() {
+        let json = r#"{
+            "mcpServers": {
+                "bad": {}
+            }
+        }"#;
+        let config: McpJsonConfig = serde_json::from_str(json).unwrap();
+        let entry = &config.mcp_servers["bad"];
+        // stdio without command → None
+        assert!(json_entry_to_config("bad", entry).is_none());
+    }
+
+    #[test]
+    fn parse_mcp_json_multiple_servers() {
+        let json = r#"{
+            "mcpServers": {
+                "fs": {
+                    "command": "npx",
+                    "args": ["@modelcontextprotocol/server-filesystem", "/tmp"]
+                },
+                "api": {
+                    "type": "sse",
+                    "url": "http://example.com/mcp"
+                },
+                "disabled": {
+                    "command": "nope",
+                    "disabled": true
+                }
+            }
+        }"#;
+        let config: McpJsonConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.mcp_servers.len(), 3);
+
+        let mut seen = std::collections::HashSet::new();
+        let mut results = Vec::new();
+        for (name, entry) in &config.mcp_servers {
+            if let Some(c) = json_entry_to_config(name, entry) {
+                if seen.insert(c.name.clone()) {
+                    results.push(c);
+                }
+            }
+        }
+        // "disabled" is filtered out
+        assert_eq!(results.len(), 2);
+        let names: Vec<&str> = results.iter().map(|c| c.name.as_str()).collect();
+        assert!(names.contains(&"fs"));
+        assert!(names.contains(&"api"));
+    }
+
+    #[test]
+    fn parse_mcp_json_implicit_stdio_type() {
+        // No "type" field → defaults to "stdio"
+        let json = r#"{
+            "mcpServers": {
+                "tool": {
+                    "command": "my-tool",
+                    "args": ["--flag"]
+                }
+            }
+        }"#;
+        let config: McpJsonConfig = serde_json::from_str(json).unwrap();
+        let entry = &config.mcp_servers["tool"];
+        assert_eq!(entry.r#type, "stdio"); // default
+        let converted = json_entry_to_config("tool", entry).unwrap();
+        match &converted.transport {
+            Transport::Stdio { command, .. } => {
+                assert_eq!(command, &["my-tool", "--flag"]);
+            }
+            _ => panic!("expected stdio"),
+        }
+    }
+
+    #[test]
+    fn load_mcp_json_into_dedupes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mcp.json");
+        std::fs::write(
+            &path,
+            r#"{"mcpServers":{"a":{"command":"cmd-a"},"b":{"command":"cmd-b"}}}"#,
+        )
+        .unwrap();
+
+        let mut seen = std::collections::HashSet::new();
+        seen.insert("a".to_string()); // pre-existing
+        let mut configs = Vec::new();
+        load_mcp_json_into(&path, &mut seen, &mut configs);
+
+        // Only "b" should be added (a already seen)
+        assert_eq!(configs.len(), 1);
+        assert_eq!(configs[0].name, "b");
+    }
+
+    #[test]
+    fn load_mcp_json_nonexistent_file_noop() {
+        let mut seen = std::collections::HashSet::new();
+        let mut configs = Vec::new();
+        load_mcp_json_into(
+            std::path::Path::new("/nonexistent/mcp.json"),
+            &mut seen,
+            &mut configs,
+        );
+        assert!(configs.is_empty());
+    }
+
+    #[test]
+    fn load_mcp_json_invalid_json_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mcp.json");
+        std::fs::write(&path, "not json!!!").unwrap();
+
+        let mut seen = std::collections::HashSet::new();
+        let mut configs = Vec::new();
+        load_mcp_json_into(&path, &mut seen, &mut configs);
+        assert!(configs.is_empty());
     }
 }

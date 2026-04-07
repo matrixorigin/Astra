@@ -1,4 +1,5 @@
 use super::*;
+use crate::manifest_loader::{project_mcp_json_path, global_mcp_json_path};
 use crate::mcp_client::{ConnectionState, McpClientManager};
 
 pub(super) async fn handle_mcp_command(arg: &str, state: &ReplState) -> Result<(), String> {
@@ -7,10 +8,24 @@ pub(super) async fn handle_mcp_command(arg: &str, state: &ReplState) -> Result<(
     match sub {
         "" | "status" => show_status(state).await,
         "servers" => show_servers(state).await,
+        s if s.starts_with("add ") => handle_mcp_add(&s[4..]).await,
+        "add" => {
+            eprintln!(
+                "{}",
+                "  Usage: /mcp add <name> <command> [args...]\n  Example: /mcp add github npx @modelcontextprotocol/server-github".dim()
+            );
+        }
+        s if s.starts_with("remove ") => handle_mcp_remove(&s[7..]).await,
+        "remove" => {
+            eprintln!(
+                "{}",
+                "  Usage: /mcp remove <name>".dim()
+            );
+        }
         _ => {
             eprintln!(
                 "{}",
-                format!("  Unknown /mcp subcommand: '{sub}'. Try /mcp, /mcp status, /mcp servers")
+                format!("  Unknown /mcp subcommand: '{sub}'. Try /mcp, /mcp add, /mcp remove, /mcp servers")
                     .yellow()
             );
         }
@@ -27,7 +42,7 @@ async fn show_status(state: &ReplState) {
         eprintln!("{}", "  No MCP servers connected.".dim());
         eprintln!(
             "{}",
-            "  Configure servers in manifest.yaml or .astra/mcp.yaml".dim()
+            "  Configure servers in .astra/mcp.json or skill manifest.yaml".dim()
         );
         return;
     }
@@ -80,6 +95,172 @@ async fn show_servers(state: &ReplState) {
             eprintln!("  └─");
         }
     }
+}
+
+/// `/mcp add <name> <command> [args...]` — add a stdio MCP server to project config.
+async fn handle_mcp_add(arg: &str) {
+    let parts: Vec<&str> = arg.trim().split_whitespace().collect();
+    if parts.len() < 2 {
+        eprintln!(
+            "{}",
+            "  Usage: /mcp add <name> <command> [args...]".dim()
+        );
+        eprintln!(
+            "{}",
+            "  Example: /mcp add github npx @modelcontextprotocol/server-github".dim()
+        );
+        return;
+    }
+    let name = parts[0];
+    let command = parts[1];
+    let args: Vec<&str> = parts[2..].to_vec();
+
+    let path = match project_mcp_json_path() {
+        Some(p) => p,
+        None => {
+            eprintln!("{}", "  ⚠ Cannot determine project directory.".yellow());
+            return;
+        }
+    };
+
+    // Load existing or create new config
+    let mut config: serde_json::Value = if path.is_file() {
+        match std::fs::read_to_string(&path) {
+            Ok(content) => serde_json::from_str(&content).unwrap_or_else(|_| {
+                serde_json::json!({"mcpServers": {}})
+            }),
+            Err(_) => serde_json::json!({"mcpServers": {}}),
+        }
+    } else {
+        serde_json::json!({"mcpServers": {}})
+    };
+
+    // Check for duplicate
+    if let Some(servers) = config.get("mcpServers").and_then(|v| v.as_object()) {
+        if servers.contains_key(name) {
+            eprintln!("{}", format!("  ⚠ Server '{name}' already exists in .astra/mcp.json. Remove first with /mcp remove {name}").yellow());
+            return;
+        }
+    }
+
+    // Add new server entry
+    let entry = serde_json::json!({
+        "command": command,
+        "args": args,
+    });
+    config
+        .as_object_mut()
+        .unwrap()
+        .entry("mcpServers")
+        .or_insert_with(|| serde_json::json!({}))
+        .as_object_mut()
+        .unwrap()
+        .insert(name.to_string(), entry);
+
+    // Write atomically (temp + rename)
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let tmp = path.with_extension("json.tmp");
+    let pretty = serde_json::to_string_pretty(&config).unwrap_or_default();
+    match std::fs::write(&tmp, &pretty) {
+        Ok(()) => {
+            if let Err(e) = std::fs::rename(&tmp, &path) {
+                eprintln!("{}", format!("  ⚠ Failed to write {}: {e}", path.display()).yellow());
+                let _ = std::fs::remove_file(&tmp);
+                return;
+            }
+        }
+        Err(e) => {
+            eprintln!("{}", format!("  ⚠ Failed to write {}: {e}", path.display()).yellow());
+            return;
+        }
+    }
+
+    eprintln!(
+        "{}",
+        format!("  ✓ Added '{name}' to {}", path.display()).green()
+    );
+    eprintln!(
+        "{}",
+        "  Restart the session or reconnect to activate.".dim()
+    );
+}
+
+/// `/mcp remove <name>` — remove an MCP server from project config.
+async fn handle_mcp_remove(arg: &str) {
+    let name = arg.trim();
+    if name.is_empty() {
+        eprintln!("{}", "  Usage: /mcp remove <name>".dim());
+        return;
+    }
+
+    let path = match project_mcp_json_path() {
+        Some(p) => p,
+        None => {
+            eprintln!("{}", "  ⚠ Cannot determine project directory.".yellow());
+            return;
+        }
+    };
+
+    if !path.is_file() {
+        eprintln!(
+            "{}",
+            format!("  ⚠ No .astra/mcp.json found at {}", path.display()).yellow()
+        );
+        return;
+    }
+
+    let content = match std::fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("{}", format!("  ⚠ Failed to read {}: {e}", path.display()).yellow());
+            return;
+        }
+    };
+    let mut config: serde_json::Value = match serde_json::from_str(&content) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("{}", format!("  ⚠ Failed to parse {}: {e}", path.display()).yellow());
+            return;
+        }
+    };
+
+    let removed = config
+        .get_mut("mcpServers")
+        .and_then(|v| v.as_object_mut())
+        .map(|m| m.remove(name).is_some())
+        .unwrap_or(false);
+
+    if !removed {
+        eprintln!(
+            "{}",
+            format!("  ⚠ Server '{name}' not found in {}", path.display()).yellow()
+        );
+        return;
+    }
+
+    // Write back atomically
+    let tmp = path.with_extension("json.tmp");
+    let pretty = serde_json::to_string_pretty(&config).unwrap_or_default();
+    match std::fs::write(&tmp, &pretty) {
+        Ok(()) => {
+            if let Err(e) = std::fs::rename(&tmp, &path) {
+                eprintln!("{}", format!("  ⚠ Failed to write {}: {e}", path.display()).yellow());
+                let _ = std::fs::remove_file(&tmp);
+                return;
+            }
+        }
+        Err(e) => {
+            eprintln!("{}", format!("  ⚠ Failed to write {}: {e}", path.display()).yellow());
+            return;
+        }
+    }
+
+    eprintln!(
+        "{}",
+        format!("  ✓ Removed '{name}' from {}", path.display()).green()
+    );
 }
 
 fn print_server_table(manager: &McpClientManager) {
