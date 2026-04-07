@@ -121,9 +121,11 @@ fn create_tool_selector_with_quality_internal(
                 token,
                 model: "default".to_string(),
             };
-            mcp_manager
-                .blocking_write()
-                .set_sampling_config(Some(sampling));
+            tokio::task::block_in_place(|| {
+                handle.block_on(async {
+                    mcp_manager.write().await.set_sampling_config(Some(sampling));
+                })
+            });
         }
     }
 
@@ -132,9 +134,9 @@ fn create_tool_selector_with_quality_internal(
         if let Ok(cwd) = std::env::current_dir() {
             let uri = format!("file://{}", cwd.display());
             let root = rmcp::model::Root::new(uri).with_name("workspace");
-            let roots = mcp_manager.blocking_read().roots().clone();
             tokio::task::block_in_place(|| {
                 handle.block_on(async {
+                    let roots = mcp_manager.read().await.roots().clone();
                     roots.write().await.push(root);
                 })
             });
