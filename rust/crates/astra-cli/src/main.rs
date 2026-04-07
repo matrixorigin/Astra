@@ -169,6 +169,8 @@ struct Cli {
 enum Command {
     /// Start the interactive REPL (default when no args given)
     Interactive,
+    /// Start the HTTP API server
+    Serve(ServeArgs),
     Register(RegisterArgs),
     Login(LoginArgs),
     Whoami,
@@ -210,6 +212,16 @@ struct LoginArgs {
     username: Option<String>,
     #[arg(long)]
     password: Option<String>,
+}
+
+#[derive(Args, Debug)]
+struct ServeArgs {
+    /// Address to listen on
+    #[arg(long, default_value = "127.0.0.1")]
+    host: String,
+    /// Port to listen on
+    #[arg(short, long, default_value_t = 8000)]
+    port: u16,
 }
 
 #[derive(Args, Debug)]
