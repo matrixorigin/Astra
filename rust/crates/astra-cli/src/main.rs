@@ -4475,8 +4475,7 @@ async fn handle_slash_command(
         }
 
         "/skill" | "/skill list" | "/skill info" | "/skill search" | "/skill new"
-        | "/skill create" | "/skill test" | "/skill dev" | "/skill doctor" | "/skill validate"
-        | "/skill config" | "/skill system" => {
+        | "/skill create" | "/skill test" | "/skill dev" | "/skill doctor" | "/skill system" => {
             handle_skill_command(arg, api, state, token).await?;
         }
 
