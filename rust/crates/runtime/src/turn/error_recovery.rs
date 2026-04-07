@@ -27,6 +27,9 @@ pub enum ErrorCategory {
     /// System resource exhaustion (fork limit, OOM, disk full).
     /// Don't retry — block the tool immediately.
     ResourceLimit,
+    /// Local command timed out (e.g. grep on a large repo). Don't retry —
+    /// the search scope is too broad. Suggest narrowing path/pattern.
+    CommandTimeout,
     /// Unknown error type — treat as permanent.
     Unknown,
 }
@@ -71,6 +74,16 @@ pub fn classify_error(error_str: &str) -> ErrorCategory {
     // messages contain "retry" which would otherwise match the Transient rule.
     if is_workspace_read_before_write_error(&lower) {
         return ErrorCategory::InvalidArgs;
+    }
+
+    // Local command timeout: grep/bash timed out because scope was too broad.
+    // Check BEFORE Transient because "timed out" would match the Transient rule,
+    // but command timeouts need different guidance (narrow scope, not retry).
+    if lower.contains("command timed out")
+        || lower.contains("grep timed out")
+        || (lower.contains("timed out after") && !lower.contains("connection"))
+    {
+        return ErrorCategory::CommandTimeout;
     }
 
     // Transient: network, timeout, rate limit, server errors
@@ -297,6 +310,14 @@ pub fn build_recovery_message(
             "⚠ {} failed: system resource limit reached (fork/memory/disk). \
              This tool is now BLOCKED for the rest of this session. \
              Do NOT retry — reduce system load or try a different approach.",
+            tool_name
+        ),
+        ErrorCategory::CommandTimeout => format!(
+            "⚠ {} timed out — the search scope is too broad. \
+             Do NOT retry with the same arguments. Instead: \
+             (1) search a specific subdirectory with 'path', \
+             (2) use 'include' to filter file types (e.g. '*.rs'), \
+             (3) use a more specific pattern.",
             tool_name
         ),
         ErrorCategory::Unknown => {
@@ -941,6 +962,52 @@ mod tests {
         let cat = classify_error("fork: Resource temporarily unavailable");
         assert_eq!(cat, ErrorCategory::ResourceLimit);
         assert_ne!(cat, ErrorCategory::Transient);
+    }
+
+    // ── CommandTimeout classification ──
+
+    #[test]
+    fn classify_command_timeout_grep() {
+        assert_eq!(
+            classify_error("Error: grep timed out after 30s with no results"),
+            ErrorCategory::CommandTimeout
+        );
+    }
+
+    #[test]
+    fn classify_command_timeout_generic() {
+        assert_eq!(
+            classify_error("Error: command timed out after 30s"),
+            ErrorCategory::CommandTimeout
+        );
+    }
+
+    #[test]
+    fn classify_command_timeout_not_connection() {
+        // "connection timed out" should still be Transient, not CommandTimeout
+        assert_eq!(
+            classify_error("connection timed out after 30s"),
+            ErrorCategory::Transient
+        );
+    }
+
+    #[test]
+    fn no_retry_command_timeout() {
+        assert_eq!(should_retry(ErrorCategory::CommandTimeout, 0), None);
+    }
+
+    #[test]
+    fn recovery_message_command_timeout_has_guidance() {
+        let msg = build_recovery_message(
+            "grep",
+            "Error: grep timed out after 30s",
+            ErrorCategory::CommandTimeout,
+            &[],
+        );
+        assert!(msg.contains("timed out"), "got: {msg}");
+        assert!(msg.contains("path"), "should suggest narrowing path, got: {msg}");
+        assert!(msg.contains("include"), "should suggest include filter, got: {msg}");
+        assert!(!msg.contains("retried"), "should NOT mention retry, got: {msg}");
     }
 
     #[test]
