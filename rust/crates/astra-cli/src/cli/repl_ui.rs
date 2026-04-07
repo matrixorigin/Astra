@@ -256,6 +256,7 @@ const SLASH_FIRST_TOKEN_COMPLETIONS: &[(&str, &[(&str, &str)])] = &[
         "/skill",
         &[
             ("browse", "Browse marketplace"),
+            ("config", "Open skill config"),
             ("create", "Generate skill from session"),
             ("dev", "Skill dev mode"),
             ("health", "Skill catalog health"),
@@ -266,28 +267,25 @@ const SLASH_FIRST_TOKEN_COMPLETIONS: &[(&str, &[(&str, &str)])] = &[
             ("surfacing", "Agent catalog surfacing (dynamic/min/cap)"),
             ("system", "System skill helpers"),
             ("test", "Run skill test"),
+            ("validate", "Validate skill manifest"),
         ],
     ),
     (
         "/mcp",
         &[
+            ("add", "Add: /mcp add <name> <command> [args…]"),
+            ("complete", "Completions: /mcp complete <server>:prompt:<name> <arg> [value]"),
+            ("log-level", "Set level: /mcp log-level <server> <level>"),
+            ("ping", "Ping: /mcp ping [server]"),
+            ("prompt", "Invoke: /mcp prompt <server>:<name> [args]"),
+            ("prompts", "List available MCP prompts"),
+            ("remove", "Remove: /mcp remove <name>"),
+            ("resource", "Read: /mcp resource <server>:<uri>"),
+            ("resources", "List available MCP resources"),
             ("servers", "Show server details and tools"),
             ("status", "Show connection status table"),
-            ("prompts", "List available MCP prompts"),
-            ("prompt", "Invoke: /mcp prompt <server>:<name> [args]"),
-            ("resources", "List available MCP resources"),
-            ("resource", "Read: /mcp resource <server>:<uri>"),
             ("subscribe", "Subscribe: /mcp subscribe <server>:<uri>"),
-            (
-                "unsubscribe",
-                "Unsubscribe: /mcp unsubscribe <server>:<uri>",
-            ),
-            ("log-level", "Set level: /mcp log-level <server> <level>"),
-            (
-                "complete",
-                "Completions: /mcp complete <server>:prompt:<name> <arg> [value]",
-            ),
-            ("ping", "Ping: /mcp ping [server]"),
+            ("unsubscribe", "Unsubscribe: /mcp unsubscribe <server>:<uri>"),
         ],
     ),
     (
@@ -304,12 +302,14 @@ const SLASH_FIRST_TOKEN_COMPLETIONS: &[(&str, &[(&str, &str)])] = &[
             ("off", "Plan-only chat off"),
             ("on", "Plan-only chat on"),
             ("parallel", "Parallel subtask hints"),
+            ("pause", "Pause plan execution"),
             ("recommend", "Plan recommendations"),
             ("replan", "Replan from memory"),
             ("resume", "Resume saved plan"),
             ("set", "Set active plan text"),
             ("show", "Show plan from memory"),
             ("stats", "Plan stats"),
+            ("status", "Show plan progress"),
             ("timeline", "Plan timeline"),
         ],
     ),
@@ -325,6 +325,7 @@ const SLASH_FIRST_TOKEN_COMPLETIONS: &[(&str, &[(&str, &str)])] = &[
     (
         "/memory",
         &[
+            ("inspect", "Inspect memory entry (needs id)"),
             ("list", "List memories"),
             ("search", "Search memories (needs query)"),
         ],
@@ -348,6 +349,56 @@ const SLASH_FIRST_TOKEN_COMPLETIONS: &[(&str, &[(&str, &str)])] = &[
             ("staged", "Staged vs HEAD"),
             ("stat", "Diff stat vs HEAD"),
             ("unstaged", "Unstaged only"),
+        ],
+    ),
+    (
+        "/turn",
+        &[
+            ("list", "List all journal turns"),
+        ],
+    ),
+    (
+        "/search",
+        &[
+            ("files", "File glob search"),
+            ("review", "Search review changes"),
+        ],
+    ),
+    (
+        "/style",
+        &[
+            ("list", "List available themes"),
+            ("default", "Default theme"),
+            ("minimal", "Minimal theme"),
+            ("colorful", "Colorful theme"),
+            ("high-contrast", "High-contrast theme"),
+        ],
+    ),
+    (
+        "/allow",
+        &[
+            ("auto", "Auto-approve all tool use"),
+            ("prompt", "Prompt before tool use"),
+            ("deny", "Deny all tool use"),
+        ],
+    ),
+    (
+        "/team",
+        &[
+            ("add-member", "Add member to team"),
+            ("context", "Set shared context for team"),
+            ("create", "Create new team"),
+            ("delete", "Delete a team"),
+            ("info", "Show team information"),
+            ("list", "List all teams"),
+        ],
+    ),
+    (
+        "/compact",
+        &[
+            ("quick", "Fast compaction without summary"),
+            ("summary-only", "Summarize without trimming"),
+            ("no-memoria", "Compact without Memoria"),
         ],
     ),
 ];
