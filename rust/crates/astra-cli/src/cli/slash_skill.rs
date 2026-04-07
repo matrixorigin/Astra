@@ -206,8 +206,8 @@ pub(super) async fn handle_skill_command(
             );
             eprintln!(
                 "    {}  {}",
-                "/skill doctor".cyan(),
-                "Health check all skills".dim()
+                "/skill health".cyan(),
+                "Skill catalog health (registry + disk)".dim()
             );
             eprintln!(
                 "    {}  {}",
@@ -865,10 +865,10 @@ Follow these steps:
             eprintln!();
         }
 
-        "doctor" => {
+        "health" => {
             eprintln!(
                 "\n{}",
-                "─── Skill Health ──────────────────────────────────────────────".bold()
+                "─── Skill catalog health ─────────────────────────────────────".bold()
             );
             // Try API first
             let api_ok = if let Some(tok) = token {
@@ -1379,7 +1379,7 @@ Follow these steps:
         _ => {
             eprintln!(
                         "{}",
-                        format!("  Unknown /skill subcommand: '{sub}'. Try /skill list, /skill search, /skill search-remote, /skill browse, /skill trending, /skill installed, /skill info, /skill info <n> --raw, /skill new, /skill create, /skill test, /skill dev, /skill doctor, /skill stats, /skill pin, /skill unpin, /skill install, /skill publish, /skill uninstall, /skill upgrade, /skill rollback, /skill check-update, /skill pack, /skill unpack, /skill inspect, /skill compose-info, /skill upload-quality").yellow()
+                        format!("  Unknown /skill subcommand: '{sub}'. Try /skill list, /skill search, /skill surfacing, /skill search-remote, /skill browse, /skill trending, /skill installed, /skill info, /skill info <n> --raw, /skill new, /skill create, /skill test, /skill dev, /skill health, /skill stats, /skill pin, /skill unpin, /skill install, /skill publish, /skill uninstall, /skill upgrade, /skill rollback, /skill check-update, /skill pack, /skill unpack, /skill inspect, /skill compose-info, /skill upload-quality").yellow()
                     );
         }
     }

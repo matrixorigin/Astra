@@ -944,7 +944,7 @@ pub(super) fn handle_session_command(arg: &str, state: &mut ReplState) {
             eprintln!("{}", format!("  Unknown subcommand: {other}").red());
             eprintln!(
                 "  {}",
-                "Usage: /session [history|list|errors|export|fork] [session_id] […]".dim()
+                "Usage: /session [history|list|errors|export|fork] …  (export → Markdown file)".dim()
             );
         }
     }
@@ -1091,15 +1091,6 @@ fn export_session_markdown(session_id: &str) {
         }
         Err(e) => eprintln!("{}", format!("  ✗ {e}").red()),
     }
-}
-
-/// Handle top-level `/export` command — exports the active session as Markdown.
-pub(super) fn handle_export_command(state: &ReplState) {
-    let Some(ref sid) = state.session_id else {
-        eprintln!("{}", "  No active session.".yellow());
-        return;
-    };
-    export_session_markdown(sid);
 }
 
 #[cfg(test)]

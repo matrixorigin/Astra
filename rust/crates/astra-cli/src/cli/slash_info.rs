@@ -40,7 +40,7 @@ fn copy_to_clipboard(text: &str) -> bool {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-enum SearchRequest {
+enum GrepRequest {
     Content(String),
     Files(String),
     Review(String),
@@ -53,24 +53,24 @@ struct ReviewMatch<'a> {
     text: &'a str,
 }
 
-fn parse_search_request(arg: &str) -> Result<SearchRequest, &'static str> {
+fn parse_grep_request(arg: &str) -> Result<GrepRequest, &'static str> {
     let trimmed = arg.trim();
     if trimmed.is_empty() {
-        return Err("Usage: /search <pattern> | /search files <glob> | /search review <pattern>");
+        return Err("Usage: /grep <pattern> | /grep files <glob> | /grep review <pattern>");
     }
     if let Some(rest) = trimmed.strip_prefix("files ").map(str::trim) {
         if rest.is_empty() {
-            return Err("Usage: /search files <glob>");
+            return Err("Usage: /grep files <glob>");
         }
-        return Ok(SearchRequest::Files(rest.to_string()));
+        return Ok(GrepRequest::Files(rest.to_string()));
     }
     if let Some(rest) = trimmed.strip_prefix("review ").map(str::trim) {
         if rest.is_empty() {
-            return Err("Usage: /search review <pattern>");
+            return Err("Usage: /grep review <pattern>");
         }
-        return Ok(SearchRequest::Review(rest.to_string()));
+        return Ok(GrepRequest::Review(rest.to_string()));
     }
-    Ok(SearchRequest::Content(trimmed.to_string()))
+    Ok(GrepRequest::Content(trimmed.to_string()))
 }
 
 fn collect_changed_files(staged: &str, unstaged: &str, untracked: &str) -> Vec<String> {
@@ -246,7 +246,7 @@ fn summarize_file_list(files: &[String], limit: usize) -> String {
 fn format_review_search_result(files: &[String], raw: &str) -> String {
     if raw.trim().is_empty() {
         return format!(
-            "Scope: {} changed files\nFiles: {}\n\nNo matches found in changed files\nTip: use /search <pattern> for a workspace-wide scan.",
+            "Scope: {} changed files\nFiles: {}\n\nNo matches found in changed files\nTip: use /grep <pattern> for a workspace-wide scan.",
             files.len(),
             summarize_file_list(files, 6)
         );
@@ -299,7 +299,7 @@ fn review_search(executor: &edge_tools::ToolExecutor, pattern: &str) -> String {
         &untracked.join("\n"),
     );
     if files.is_empty() {
-        return "No changed files found. Use /search <pattern> for workspace-wide search."
+        return "No changed files found. Use /grep <pattern> for workspace-wide search."
             .to_string();
     }
 
@@ -954,15 +954,15 @@ pub(super) async fn handle_info_command(
         "/history" => {
             if state.history.is_empty() {
                 eprintln!("{}", "  No history yet".dim());
-            } else if arg.starts_with("search ") || arg.starts_with("grep ") {
-                // /history search <query>
+            } else if arg.starts_with("grep ") {
+                // /history grep <query>
                 let query = arg
                     .split_once(' ')
                     .map(|x| x.1)
                     .unwrap_or("")
                     .to_lowercase();
                 if query.is_empty() {
-                    eprintln!("{}", "  Usage: /history search <query>".yellow());
+                    eprintln!("{}", "  Usage: /history grep <query>".yellow());
                     return Ok(());
                 }
                 let mut found = 0;
@@ -1025,8 +1025,8 @@ pub(super) async fn handle_info_command(
             }
         }
 
-        "/search" => {
-            let request = match parse_search_request(arg) {
+        "/grep" => {
+            let request = match parse_grep_request(arg) {
                 Ok(request) => request,
                 Err(usage) => {
                     eprintln!("{}", format!("  {usage}").yellow());
@@ -1038,16 +1038,16 @@ pub(super) async fn handle_info_command(
             let executor = edge_tools::ToolExecutor::new(project_root);
 
             let (title, result) = match request {
-                SearchRequest::Content(pattern) => (
-                    format!("Workspace search · {pattern}"),
+                GrepRequest::Content(pattern) => (
+                    format!("Workspace grep · {pattern}"),
                     executor.grep(&serde_json::json!({"pattern": pattern, "path": "."})),
                 ),
-                SearchRequest::Files(pattern) => (
-                    format!("File search · {pattern}"),
+                GrepRequest::Files(pattern) => (
+                    format!("Workspace glob · {pattern}"),
                     executor.glob(&serde_json::json!({"pattern": pattern, "path": "."})),
                 ),
-                SearchRequest::Review(pattern) => {
-                    let title = format!("Review search · {pattern}");
+                GrepRequest::Review(pattern) => {
+                    let title = format!("Review grep · {pattern}");
                     (title, review_search(&executor, &pattern))
                 }
             };
@@ -1183,7 +1183,7 @@ pub(super) async fn handle_info_command(
             None => eprintln!("{}", "  ✗ No response to copy yet".yellow()),
         },
 
-        "/doctor" => {
+        "/diagnostics" => {
             eprintln!(
                 "\n{}",
                 "─── Diagnostics ──────────────────────────────────────────────".bold()
@@ -1640,32 +1640,32 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_search_request_defaults_to_content_search() {
+    fn parse_grep_request_defaults_to_content_search() {
         assert_eq!(
-            parse_search_request("tool timeout").unwrap(),
-            SearchRequest::Content("tool timeout".to_string())
+            parse_grep_request("tool timeout").unwrap(),
+            GrepRequest::Content("tool timeout".to_string())
         );
     }
 
     #[test]
-    fn parse_search_request_supports_files_mode() {
+    fn parse_grep_request_supports_files_mode() {
         assert_eq!(
-            parse_search_request("files Cargo.toml").unwrap(),
-            SearchRequest::Files("Cargo.toml".to_string())
+            parse_grep_request("files Cargo.toml").unwrap(),
+            GrepRequest::Files("Cargo.toml".to_string())
         );
     }
 
     #[test]
-    fn parse_search_request_supports_review_mode() {
+    fn parse_grep_request_supports_review_mode() {
         assert_eq!(
-            parse_search_request("review timeout").unwrap(),
-            SearchRequest::Review("timeout".to_string())
+            parse_grep_request("review timeout").unwrap(),
+            GrepRequest::Review("timeout".to_string())
         );
     }
 
     #[test]
-    fn parse_search_request_rejects_empty_args() {
-        assert!(parse_search_request("").is_err());
+    fn parse_grep_request_rejects_empty_args() {
+        assert!(parse_grep_request("").is_err());
     }
 
     #[test]
@@ -1711,7 +1711,7 @@ mod tests {
         let formatted = format_review_search_result(&files, "");
         assert!(formatted.contains("Scope: 2 changed files"));
         assert!(formatted.contains("No matches found in changed files"));
-        assert!(formatted.contains("Tip: use /search <pattern>"));
+        assert!(formatted.contains("Tip: use /grep <pattern>"));
     }
 
     #[test]

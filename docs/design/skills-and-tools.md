@@ -627,8 +627,9 @@ impl From<std::io::Error> for SkillError {
 ```bash
 /skill                          # Show subcommand help
 /skill list [query] [--source=local|bundled|mcp] [--category=X]
-/skill search <query>           # Fuzzy search with relevance scoring
-/skill info <name>              # Detailed manifest + instruction preview
+/skill search <query>           # Keyword match on catalog (not vector search)
+/skill surfacing …              # Agent catalog listing vs discover_skills thresholds
+/skill info <name> [--raw]      # Manifest + preview; --raw = YAML frontmatter
 /skill pinned                   # [DESIGN] Show pinned skills + budget
 ```
 
@@ -636,15 +637,13 @@ impl From<std::io::Error> for SkillError {
 ```bash
 /skill new <name>               # Scaffold .astra/skills/<name>/
 /skill dev <name|off>           # Dev mode (source injected each turn)
-/skill test <name> [json_args]  # Test execution
-/skill validate <name>          # Validate manifest + instructions
-/skill config <name>            # Show/edit skill config
+/skill test <name> [json_args]  # API test or local manifest + hooks
 /skill system <name|list>       # System prompt integration
 ```
 
-### Health & Diagnostics
+### Health
 ```bash
-/skill doctor                   # Health check (API + local + issues)
+/skill health                   # Catalog + on-disk SKILL.md checks (API when logged in)
 ```
 
 ### Registration & Marketplace [DESIGN TARGET]

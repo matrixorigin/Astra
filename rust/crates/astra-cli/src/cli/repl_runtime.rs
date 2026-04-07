@@ -505,7 +505,7 @@ fn random_tips(logged_in: bool) -> [&'static str; 2] {
         "/session to see current session info",
         "/learn to see learning insights",
         "End a line with \\ to continue on next line",
-        "/doctor runs diagnostics if something feels off",
+        "/diagnostics runs API/binary/auth checks if something feels off",
         "/sync shows cloud sync status",
     ];
 
