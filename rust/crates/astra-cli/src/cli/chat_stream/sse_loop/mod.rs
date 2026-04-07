@@ -46,6 +46,21 @@ pub(crate) async fn stream_chat_sse(
 ) -> Result<StreamResult, crate::TurnFailure> {
     let start = Instant::now();
     let term_width = terminal_width_usize();
+
+    // Paint an immediate spinner so the user sees feedback during init (executor, schemas,
+    // skill discovery, etc.) before the per-turn prep spinner takes over.
+    let show_early_hint = !p.quiet
+        && !p.suppress_intermediate_output
+        && std::io::IsTerminal::is_terminal(&std::io::stderr())
+        && p.plan_assemble_line_release.is_none();
+    let early_spinner: Option<crate::effects::Spinner> = if show_early_hint {
+        Some(crate::effects::Spinner::start_immediate(
+            "Preparing…".to_string(),
+        ))
+    } else {
+        None
+    };
+
     let project_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let file_context = detect_project_languages(&project_root);
     let executor = {
@@ -261,6 +276,10 @@ pub(crate) async fn stream_chat_sse(
     };
 
     // ─── Run the runtime loop ────────────────────────────────────────────
+    // Stop the early spinner — the per-turn prep spinner inside execute_turn takes over.
+    if let Some(s) = early_spinner {
+        s.stop_clear();
+    }
     if let Err(e) = run_agentic_loop_with_host(&mut host, &mut state).await {
         if let Some(shared) = p.discovered_skills {
             *shared = state.discovered_skills;

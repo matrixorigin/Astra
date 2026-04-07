@@ -21,6 +21,18 @@ impl Spinner {
     /// The spinner runs on stderr with `\r` carriage return for in-place updates.
     /// Returns a no-op spinner if stderr is not a terminal.
     pub fn start(prefix: String) -> Self {
+        Self::start_inner(prefix, true)
+    }
+
+    /// Like [`start`](Self::start) but paints immediately without the show-delay.
+    ///
+    /// Use when the caller knows the operation will take a noticeable amount of time
+    /// and wants instant visual feedback.
+    pub fn start_immediate(prefix: String) -> Self {
+        Self::start_inner(prefix, false)
+    }
+
+    fn start_inner(prefix: String, delay: bool) -> Self {
         if !io::stderr().is_terminal() {
             return Self {
                 stop: Arc::new(AtomicBool::new(true)),
@@ -28,17 +40,28 @@ impl Spinner {
             };
         }
 
+        // Paint the first frame on the calling thread so the user sees feedback
+        // before the background thread is scheduled (avoids a blank gap).
+        if !delay {
+            let frame = SPINNER_FRAMES[0];
+            eprint!("\r  {} {}", prefix.as_str().cyan(), format!("{frame}").yellow());
+            let _ = io::stderr().flush();
+        }
+
         let stop = Arc::new(AtomicBool::new(false));
         let stop2 = stop.clone();
+        let start_idx = if delay { 0usize } else { 1usize };
         let handle = std::thread::spawn(move || {
-            // Interruptible delay — can wake early if stop is set
-            if !interruptible_sleep(
-                std::time::Duration::from_millis(SPINNER_SHOW_DELAY_MS),
-                &stop2,
-            ) {
-                return;
+            if delay {
+                // Interruptible delay — can wake early if stop is set
+                if !interruptible_sleep(
+                    std::time::Duration::from_millis(SPINNER_SHOW_DELAY_MS),
+                    &stop2,
+                ) {
+                    return;
+                }
             }
-            let mut idx = 0usize;
+            let mut idx = start_idx;
             // Use Acquire to pair with Release in stop_clear()/Drop
             while !stop2.load(Ordering::Acquire) {
                 let frame = SPINNER_FRAMES[idx % SPINNER_FRAMES.len()];

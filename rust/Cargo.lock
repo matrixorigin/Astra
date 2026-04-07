@@ -180,6 +180,7 @@ dependencies = [
  "tree-sitter-ruby",
  "tree-sitter-rust",
  "tree-sitter-typescript",
+ "unicode-width",
  "url",
  "uuid",
  "wiremock",

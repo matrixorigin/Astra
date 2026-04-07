@@ -224,31 +224,15 @@ impl TerminalRegion {
 /// - Zero-width Unicode (combining marks, etc.) = 0 width
 /// - CJK, emoji, etc. = 2 width
 pub(super) fn visible_char_width(s: &str) -> usize {
+    use unicode_width::UnicodeWidthStr;
     let stripped = strip_ansi_codes(s);
-    stripped.chars().map(char_display_width).sum()
+    UnicodeWidthStr::width(stripped.as_str())
 }
 
-/// Estimate display width of a single character.
+/// Display width of a single character per Unicode Standard Annex #11.
 pub(super) fn char_display_width(c: char) -> usize {
-    match c {
-        // ASCII control characters (including tab, backspace)
-        '\x00'..='\x1f' | '\x7f' => 0,
-        // ASCII printable
-        '\x20'..='\x7e' => 1,
-        // Common zero-width Unicode ranges
-        '\u{200B}'..='\u{200F}' => 0, // Zero-width space, joiners, marks
-        '\u{2060}'..='\u{2064}' => 0, // Word joiner, invisible operators
-        '\u{FEFF}' => 0,              // BOM / zero-width no-break space
-        '\u{FE00}'..='\u{FE0F}' => 0, // Variation selectors
-        // Combining diacritical marks
-        '\u{0300}'..='\u{036F}' => 0,
-        '\u{1AB0}'..='\u{1AFF}' => 0,
-        '\u{1DC0}'..='\u{1DFF}' => 0,
-        '\u{20D0}'..='\u{20FF}' => 0,
-        '\u{FE20}'..='\u{FE2F}' => 0,
-        // Everything else (CJK, emoji, etc.) = 2
-        _ => 2,
-    }
+    use unicode_width::UnicodeWidthChar;
+    UnicodeWidthChar::width(c).unwrap_or(0)
 }
 
 /// Strip ANSI escape sequences from a string.
