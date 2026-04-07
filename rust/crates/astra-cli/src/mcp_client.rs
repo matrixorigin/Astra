@@ -35,13 +35,15 @@ use std::time::Instant;
 use rmcp::{
     ClientHandler, Peer, RoleClient,
     model::{
-        ArgumentInfo, CallToolRequestParams, CallToolResult, ClientRequest, CompleteRequestParams,
-        CompleteResult, CreateElicitationRequestParams, CreateElicitationResult,
-        CreateMessageRequestParams, CreateMessageResult, ElicitationAction,
-        ErrorData as McpHandlerError, GetPromptRequestParams, GetPromptResult, ListRootsResult,
-        LoggingLevel, PingRequest, Prompt, ReadResourceRequestParams, Reference, Resource, Role,
-        Root, SamplingMessage, SamplingMessageContent, SetLevelRequestParams,
-        SubscribeRequestParams, Tool, UnsubscribeRequestParams,
+        ArgumentInfo, CallToolRequestParams, CallToolResult, ClientCapabilities, ClientRequest,
+        CompleteRequestParams, CompleteResult, CreateElicitationRequestParams,
+        CreateElicitationResult, CreateMessageRequestParams, CreateMessageResult,
+        ElicitationAction, ElicitationCapability, ErrorData as McpHandlerError,
+        GetPromptRequestParams, GetPromptResult, Implementation, InitializeRequestParams,
+        ListRootsResult, LoggingLevel, PingRequest, Prompt, ReadResourceRequestParams, Reference,
+        Resource, Role, Root, RootsCapabilities, SamplingCapability, SamplingMessage,
+        SamplingMessageContent, SetLevelRequestParams, SubscribeRequestParams, Tool,
+        UnsubscribeRequestParams,
     },
     serve_client,
     service::{NotificationContext, RequestContext, ServiceError},
@@ -233,6 +235,22 @@ impl ChangeHandler {
 }
 
 impl ClientHandler for ChangeHandler {
+    fn get_info(&self) -> InitializeRequestParams {
+        let mut caps = ClientCapabilities::default();
+        caps.roots = Some(RootsCapabilities {
+            list_changed: Some(true),
+        });
+        if self.sampling.is_some() {
+            caps.sampling = Some(SamplingCapability::default());
+        }
+        caps.elicitation = Some(ElicitationCapability::default());
+
+        InitializeRequestParams::new(
+            caps,
+            Implementation::new("astra", env!("CARGO_PKG_VERSION")),
+        )
+    }
+
     fn on_tool_list_changed(
         &self,
         _context: NotificationContext<RoleClient>,
@@ -3054,5 +3072,42 @@ mcp_servers:
         let req = ClientRequest::PingRequest(ping);
         // Verify the method string extraction works.
         assert_eq!(req.method(), "ping");
+    }
+
+    // --- get_info / capability negotiation tests ---
+
+    #[test]
+    fn get_info_with_sampling_advertises_all_capabilities() {
+        let sampling = Arc::new(SamplingConfig {
+            api: Arc::new(
+                astra_thin_client::ThinClient::new("http://localhost:8000", None).unwrap(),
+            ),
+            token: "tok".into(),
+            model: "test".into(),
+        });
+        let roots = Arc::new(RwLock::new(vec![]));
+        let (handler, _, _, _) = ChangeHandler::new(Some(sampling), roots);
+
+        let info = handler.get_info();
+        assert!(info.capabilities.roots.is_some(), "roots should be advertised");
+        assert!(info.capabilities.sampling.is_some(), "sampling should be advertised");
+        assert!(info.capabilities.elicitation.is_some(), "elicitation should be advertised");
+
+        let roots_caps = info.capabilities.roots.unwrap();
+        assert_eq!(roots_caps.list_changed, Some(true));
+
+        assert_eq!(info.client_info.name, "astra");
+        assert!(!info.client_info.version.is_empty());
+    }
+
+    #[test]
+    fn get_info_without_sampling_omits_sampling_capability() {
+        let roots = Arc::new(RwLock::new(vec![]));
+        let (handler, _, _, _) = ChangeHandler::new(None, roots);
+
+        let info = handler.get_info();
+        assert!(info.capabilities.roots.is_some());
+        assert!(info.capabilities.sampling.is_none(), "sampling should NOT be advertised without config");
+        assert!(info.capabilities.elicitation.is_some());
     }
 }
