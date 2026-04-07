@@ -804,7 +804,10 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
     state: &mut AgenticLoopState,
 ) -> Result<AgenticLoopOutcome, String> {
     // ─── Preamble: fire SessionStart hooks ───────────────────────────────
-    if state.session_event_hooks.has_event(crate::skills::hooks::SessionEvent::SessionStart) {
+    if state
+        .session_event_hooks
+        .has_event(crate::skills::hooks::SessionEvent::SessionStart)
+    {
         let session_id = state.current_session_id.as_deref().unwrap_or("");
         let user_msg = state.message.as_str();
         let hook_output = crate::skills::hooks::evaluate_session_hooks(
@@ -4635,12 +4638,7 @@ mod tests {
         // Two turns: first turn sees the injected context, second turn completes
         let mut host = MockHost::new(vec![
             // Turn 1: LLM sees the hook context + user message, responds with tool call
-            edge_tool_result(
-                vec![make_edge_tool("bash", "xupeng\n")],
-                100,
-                20,
-                Some(50),
-            ),
+            edge_tool_result(vec![make_edge_tool("bash", "xupeng\n")], 100, 20, Some(50)),
             // Turn 2: LLM produces final text
             text_result("Hello xupeng! Branch: main", 120, 30, Some(30)),
         ]);
@@ -4797,7 +4795,7 @@ mod tests {
             .messages
             .push(json!({"role": "user", "content": "hello"}));
 
-        let msg_count_before = state.messages.len();
+        let _msg_count_before = state.messages.len();
         let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
         assert!(matches!(outcome, Ok(AgenticLoopOutcome::Completed)));
 

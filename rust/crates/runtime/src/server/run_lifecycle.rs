@@ -434,8 +434,11 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             let outcome = run_agentic_loop_with_host(&mut host, &mut loop_state).await;
 
             // Fire SessionEnd hooks (best-effort, non-blocking).
-            crate::skills::hooks::fire_session_end(&loop_state.session_event_hooks,
-                loop_state.current_session_id.as_deref().unwrap_or("")).await;
+            crate::skills::hooks::fire_session_end(
+                &loop_state.session_event_hooks,
+                loop_state.current_session_id.as_deref().unwrap_or(""),
+            )
+            .await;
 
             let mut events = host.take_emitted_events();
             let (final_status, error_msg) = match outcome {
@@ -576,8 +579,11 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         let loop_result = run_agentic_loop_with_host(&mut host, &mut state).await;
 
         // Fire SessionEnd hooks (best-effort).
-        crate::skills::hooks::fire_session_end(&state.session_event_hooks,
-            state.current_session_id.as_deref().unwrap_or("")).await;
+        crate::skills::hooks::fire_session_end(
+            &state.session_event_hooks,
+            state.current_session_id.as_deref().unwrap_or(""),
+        )
+        .await;
 
         match loop_result {
             Ok(_outcome) => {
@@ -1012,8 +1018,11 @@ impl SubRunExecutor for ServerSubRunExecutor {
         let outcome = run_agentic_loop_with_host(&mut host, &mut loop_state).await;
 
         // Fire SessionEnd hooks (best-effort).
-        crate::skills::hooks::fire_session_end(&loop_state.session_event_hooks,
-            loop_state.current_session_id.as_deref().unwrap_or("")).await;
+        crate::skills::hooks::fire_session_end(
+            &loop_state.session_event_hooks,
+            loop_state.current_session_id.as_deref().unwrap_or(""),
+        )
+        .await;
 
         match outcome {
             Ok(AgenticLoopOutcome::Completed) => Ok(astra_services::coordination::AgentResult {

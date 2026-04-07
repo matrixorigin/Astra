@@ -289,6 +289,15 @@ fn section_cache_key(tool_names: &[&str], task_type: Option<&str>, confidence: f
 /// enabling server-side KV cache reuse across turns.
 ///
 /// For other providers (OpenAI, DeepSeek, etc.): uses a single content string.
+/// Build the system message(s) for the LLM API.
+///
+/// Returns `(primary, dynamic)`:
+/// - **Anthropic**: `primary` is a multi-block content array with `cache_control` on stable
+///   sections and dynamic profile appended without cache markers. `dynamic` is `None`.
+/// - **OpenAI / other**: `primary` contains only the **stable** text (cacheable prefix).
+///   `dynamic` holds a second system message with the per-turn profile/hints, or `None`
+///   if there is nothing dynamic. This split enables OpenAI's automatic prefix caching:
+///   the stable message stays identical across turns so the provider can reuse the KV cache.
 fn build_system_message(
     tool_names: &[&str],
     profile_desc: &str,
@@ -296,7 +305,7 @@ fn build_system_message(
     task_type: Option<&str>,
     provider: &str,
     model_name: &str,
-) -> Value {
+) -> (Value, Option<Value>) {
     let key = section_cache_key(tool_names, task_type, confidence);
 
     // Try cache for the stable (Global + Session) sections
@@ -391,16 +400,31 @@ fn build_system_message(
                 "text": profile_desc,
             }));
         }
-        json!({
-            "role": "system",
-            "content": blocks,
-        })
+        // Anthropic: everything in one message (cache_control breakpoints handle caching)
+        (
+            json!({
+                "role": "system",
+                "content": blocks,
+            }),
+            None,
+        )
     } else {
-        // OpenAI-compatible: single content string
-        json!({
+        // OpenAI-compatible: split stable / dynamic into separate system messages
+        // so the stable prefix is identical across turns and the provider can reuse
+        // its automatic KV cache.
+        let primary = json!({
             "role": "system",
-            "content": format!("{stable_text}{profile_desc}"),
-        })
+            "content": stable_text,
+        });
+        let dynamic = if profile_desc.is_empty() {
+            None
+        } else {
+            Some(json!({
+                "role": "system",
+                "content": profile_desc,
+            }))
+        };
+        (primary, dynamic)
     }
 }
 
@@ -1265,8 +1289,8 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
 
             // Build provider-aware system message with static/dynamic boundary.
             // Anthropic gets multi-block content with cache_control on stable sections;
-            // OpenAI/others get a single concatenated content string.
-            let system_msg = build_system_message(
+            // OpenAI/others get two messages: stable prefix (cacheable) + dynamic per-turn.
+            let (system_msg, dynamic_msg) = build_system_message(
                 &tool_names,
                 &dynamic_desc,
                 selection_confidence,
@@ -1275,6 +1299,9 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
                 &model_name,
             );
             llm_messages.push(system_msg);
+            if let Some(dyn_msg) = dynamic_msg {
+                llm_messages.push(dyn_msg);
+            }
 
             // Merge tool results into messages (handle continuation turns)
             // Client sends complete message history including tool role messages,
@@ -1499,8 +1526,11 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
                             let memoria_client = crate::turn::cloud::memoria_compact::HttpMemoriaClient::from_env();
                             let memoria_config = crate::turn::cloud::memoria_compact::MemoriaCompactConfig::default();
 
-                            // Get original messages (exclude system message at index 0)
-                            let original_msgs: Vec<Value> = llm_messages.iter().skip(1).cloned().collect();
+                            // Get original messages (exclude leading system messages)
+                            let sys_count = llm_messages.iter()
+                                .take_while(|m| m.get("role").and_then(Value::as_str) == Some("system"))
+                                .count();
+                            let original_msgs: Vec<Value> = llm_messages.iter().skip(sys_count).cloned().collect();
                             let compact_result = crate::turn::cloud::memoria_compact::compact_with_memoria(
                                 &original_msgs,
                                 Some(&session_id),
@@ -1512,12 +1542,17 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
                             )
                             .await;
 
-                            // Rebuild llm_messages with compacted content
-                            let system_msg = llm_messages.first().cloned();
+                            // Rebuild llm_messages with compacted content.
+                            // Preserve all leading system messages (stable + dynamic).
+                            let system_msgs: Vec<Value> = llm_messages
+                                .iter()
+                                .take_while(|m| {
+                                    m.get("role").and_then(Value::as_str) == Some("system")
+                                })
+                                .cloned()
+                                .collect();
                             llm_messages.clear();
-                            if let Some(sys) = system_msg {
-                                llm_messages.push(sys);
-                            }
+                            llm_messages.extend(system_msgs);
                             llm_messages.extend(compact_result.messages);
 
                             // Also prune tool schemas more aggressively
@@ -2416,7 +2451,7 @@ mod tests {
             std::env::remove_var("MO_PROMPT_CACHE_DISABLED");
         }
 
-        let msg = build_system_message(
+        let (msg, _) = build_system_message(
             &["bash", "read_file"],
             "cwd: /test",
             0.8,
@@ -2469,7 +2504,7 @@ mod tests {
             std::env::remove_var("MO_PROMPT_CACHE_DISABLED");
         }
 
-        let msg = build_system_message(
+        let (msg, _) = build_system_message(
             &["bash", "read_file"],
             "cwd: /test",
             0.8,
@@ -2507,7 +2542,7 @@ mod tests {
             std::env::set_var("MO_PROMPT_CACHE_DISABLED", "1");
         }
 
-        let msg = build_system_message(
+        let (msg, _) = build_system_message(
             &["bash"],
             "cwd: /test",
             0.8,
@@ -2532,7 +2567,7 @@ mod tests {
 
     #[test]
     fn build_system_message_openai_has_string_content() {
-        let msg = build_system_message(
+        let (msg, dynamic) = build_system_message(
             &["bash", "read_file"],
             "cwd: /test",
             0.8,
@@ -2541,19 +2576,25 @@ mod tests {
             "gpt-4",
         );
 
-        // Should be a single string content
+        // Primary should be a single string content (stable prefix)
         let content = msg.get("content").expect("should have content");
         assert!(content.is_string(), "OpenAI content should be string");
+
+        // Dynamic profile should be in the second message
+        let dyn_msg = dynamic.expect("should have dynamic message when profile is non-empty");
+        let dyn_content = dyn_msg
+            .get("content")
+            .expect("dynamic msg should have content");
         assert!(
-            content.as_str().unwrap().contains("cwd: /test"),
-            "should contain profile"
+            dyn_content.as_str().unwrap().contains("cwd: /test"),
+            "dynamic message should contain profile"
         );
     }
 
     #[test]
     fn build_system_message_claude_model_triggers_anthropic_format() {
         // Even if provider is not "anthropic", claude model name should trigger it
-        let msg = build_system_message(
+        let (msg, _) = build_system_message(
             &["bash"],
             "",
             0.8,
@@ -2828,7 +2869,7 @@ mod tests {
         }
 
         // Layer 1: System message with cache_control
-        let sys = build_system_message(
+        let (sys, _) = build_system_message(
             &["bash", "read_file"],
             "cwd: /test",
             0.8,
@@ -2876,7 +2917,7 @@ mod tests {
         }
 
         // Layer 1: system message
-        let sys = build_system_message(
+        let (sys, _) = build_system_message(
             &["bash"],
             "cwd: /test",
             0.8,
@@ -2928,7 +2969,7 @@ mod tests {
         for i in 0..34 {
             let tool_name = format!("tool_{i}");
             let tools: Vec<&str> = vec![tool_name.as_str()];
-            let _msg = build_system_message(&tools, "", 0.8, None, "openai", "gpt-4");
+            let (_msg, _) = build_system_message(&tools, "", 0.8, None, "openai", "gpt-4");
         }
 
         let cache_size = section_cache().lock().unwrap().len();
@@ -3191,7 +3232,7 @@ mod tests {
             "github_list_prs",
             "github_get_issue",
         ];
-        let msg = build_system_message(
+        let (msg, _) = build_system_message(
             &tools,
             "profile",
             0.8,
@@ -3219,7 +3260,7 @@ mod tests {
             std::env::remove_var("MO_PROMPT_CACHE_DISABLED");
         }
 
-        let msg = build_system_message(
+        let (msg, _) = build_system_message(
             &["bash", "read_file", "memory_store"],
             "profile",
             0.8,
@@ -3259,7 +3300,7 @@ mod tests {
             std::env::remove_var("MO_PROMPT_CACHE_DISABLED");
         }
 
-        let msg1 = build_system_message(
+        let (msg1, _) = build_system_message(
             &["bash", "read_file"],
             "p1",
             0.8,
@@ -3267,7 +3308,7 @@ mod tests {
             "anthropic",
             "claude-sonnet-4-20250514",
         );
-        let msg2 = build_system_message(
+        let (msg2, _) = build_system_message(
             &["bash", "git_diff", "memory_store"],
             "p2",
             0.5,
@@ -3326,7 +3367,7 @@ mod tests {
         }
 
         // Simulate two turns in the same session (same tools, different profile)
-        let msg_turn1 = build_system_message(
+        let (msg_turn1, _) = build_system_message(
             &["bash", "read_file", "git_diff"],
             "turn1 profile",
             0.8,
@@ -3334,7 +3375,7 @@ mod tests {
             "anthropic",
             "claude-sonnet-4-20250514",
         );
-        let msg_turn2 = build_system_message(
+        let (msg_turn2, _) = build_system_message(
             &["bash", "read_file", "git_diff"],
             "turn2 profile",
             0.8,
@@ -3376,12 +3417,13 @@ mod tests {
     }
 
     /// OpenAI: stable prefix for automatic prefix caching.
-    /// Static content must come first, dynamic content last.
+    /// Static content is in the primary message (identical across turns);
+    /// dynamic profile is in a separate second system message.
     #[test]
     fn openai_stable_prefix_across_turns() {
         let _lock = CACHE_ENV_MUTEX.lock().unwrap();
 
-        let msg1 = build_system_message(
+        let (msg1, dyn1) = build_system_message(
             &["bash", "read_file"],
             "turn1 profile",
             0.8,
@@ -3389,7 +3431,7 @@ mod tests {
             "openai",
             "gpt-4o",
         );
-        let msg2 = build_system_message(
+        let (msg2, dyn2) = build_system_message(
             &["bash", "read_file"],
             "turn2 profile",
             0.8,
@@ -3401,27 +3443,22 @@ mod tests {
         let s1 = msg1["content"].as_str().unwrap();
         let s2 = msg2["content"].as_str().unwrap();
 
-        // Find where they diverge
-        let common_prefix_len = s1
-            .chars()
-            .zip(s2.chars())
-            .take_while(|(a, b)| a == b)
-            .count();
-
-        // The shared prefix should be substantial (all Global + Session content)
-        // Only the profile at the end should differ
-        let total_len = s1.len().min(s2.len());
-        let prefix_ratio = common_prefix_len as f64 / total_len as f64;
-        assert!(
-            prefix_ratio > 0.90,
-            "OpenAI prefix should be >90% shared across turns, got {:.1}% ({common_prefix_len}/{total_len})",
-            prefix_ratio * 100.0
+        // Primary messages should be 100% identical (stable prefix)
+        assert_eq!(
+            s1, s2,
+            "OpenAI primary system messages must be identical across turns"
         );
 
-        // Verify the divergence point is the profile
+        // Dynamic messages should carry the per-turn profile
+        let d1 = dyn1.unwrap();
+        let d2 = dyn2.unwrap();
         assert!(
-            s1[common_prefix_len..].contains("turn1"),
-            "divergence should be at profile content"
+            d1["content"].as_str().unwrap().contains("turn1"),
+            "dynamic msg1 should contain turn1 profile"
+        );
+        assert!(
+            d2["content"].as_str().unwrap().contains("turn2"),
+            "dynamic msg2 should contain turn2 profile"
         );
     }
 
@@ -3430,8 +3467,8 @@ mod tests {
     fn openai_global_prefix_stable_across_tool_sets() {
         let _lock = CACHE_ENV_MUTEX.lock().unwrap();
 
-        let msg1 = build_system_message(&["bash"], "", 0.8, None, "openai", "gpt-4o");
-        let msg2 = build_system_message(
+        let (msg1, _) = build_system_message(&["bash"], "", 0.8, None, "openai", "gpt-4o");
+        let (msg2, _) = build_system_message(
             &["bash", "git_diff", "memory_store", "find_definition"],
             "",
             0.8,
@@ -3465,7 +3502,7 @@ mod tests {
         }
 
         let tools = vec!["bash", "read_file", "memory_store", "git_diff"];
-        let msg = build_system_message(
+        let (msg, _) = build_system_message(
             &tools,
             "",
             0.8,
@@ -3515,7 +3552,7 @@ mod tests {
         }
 
         let tools = vec!["bash", "read_file"];
-        let msg_none = build_system_message(
+        let (msg_none, _) = build_system_message(
             &tools,
             "",
             0.8,
@@ -3523,7 +3560,7 @@ mod tests {
             "anthropic",
             "claude-sonnet-4-20250514",
         );
-        let msg_review = build_system_message(
+        let (msg_review, _) = build_system_message(
             &tools,
             "",
             0.8,
@@ -3531,7 +3568,7 @@ mod tests {
             "anthropic",
             "claude-sonnet-4-20250514",
         );
-        let msg_debug = build_system_message(
+        let (msg_debug, _) = build_system_message(
             &tools,
             "",
             0.8,

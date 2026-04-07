@@ -396,9 +396,7 @@ impl McpConnection {
 
     /// Subscribe to updates for a specific resource URI.
     pub async fn subscribe_resource(&self, uri: &str) -> Result<(), ServiceError> {
-        self.peer
-            .subscribe(SubscribeRequestParams::new(uri))
-            .await
+        self.peer.subscribe(SubscribeRequestParams::new(uri)).await
     }
 
     /// Unsubscribe from updates for a specific resource URI.
@@ -410,9 +408,7 @@ impl McpConnection {
 
     /// Set the logging level for this server.
     pub async fn set_log_level(&self, level: LoggingLevel) -> Result<(), ServiceError> {
-        self.peer
-            .set_level(SetLevelRequestParams::new(level))
-            .await
+        self.peer.set_level(SetLevelRequestParams::new(level)).await
     }
 
     /// Discover `skill://` resources and return (name, skill_md_content) pairs.
@@ -2239,7 +2235,10 @@ mcp_servers:
             let manager = McpClientManager::new();
             let result = manager.get_prompt("nonexistent", "test", None).await;
             assert!(result.is_err());
-            assert!(matches!(result.unwrap_err(), McpError::ServerNotConnected(_)));
+            assert!(matches!(
+                result.unwrap_err(),
+                McpError::ServerNotConnected(_)
+            ));
         });
     }
 }

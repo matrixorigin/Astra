@@ -261,7 +261,10 @@ const SLASH_FIRST_TOKEN_COMPLETIONS: &[(&str, &[(&str, &str)])] = &[
             ("resources", "List available MCP resources"),
             ("resource", "Read: /mcp resource <server>:<uri>"),
             ("subscribe", "Subscribe: /mcp subscribe <server>:<uri>"),
-            ("unsubscribe", "Unsubscribe: /mcp unsubscribe <server>:<uri>"),
+            (
+                "unsubscribe",
+                "Unsubscribe: /mcp unsubscribe <server>:<uri>",
+            ),
             ("log-level", "Set level: /mcp log-level <server> <level>"),
         ],
     ),

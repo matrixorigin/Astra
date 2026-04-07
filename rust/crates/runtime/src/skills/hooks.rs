@@ -522,16 +522,12 @@ async fn run_shell_pre_hook(
 
     let wait_result = tokio::time::timeout(timeout, read_fut).await;
     match wait_result {
-        Ok((_, Ok(status))) if !status.success() => {
-            PreToolDecision::Block(format!(
-                "Hook '{}' exited with status {}",
-                command,
-                status.code().unwrap_or(-1)
-            ))
-        }
-        Ok((buf, Ok(_))) => {
-            parse_pre_hook_output(&buf)
-        }
+        Ok((_, Ok(status))) if !status.success() => PreToolDecision::Block(format!(
+            "Hook '{}' exited with status {}",
+            command,
+            status.code().unwrap_or(-1)
+        )),
+        Ok((buf, Ok(_))) => parse_pre_hook_output(&buf),
         Ok((_, Err(e))) => {
             astra_core::agent_warn!("hook", "Hook I/O error for '{}': {}", command, e);
             PreToolDecision::Allow
@@ -597,9 +593,7 @@ async fn run_shell_post_hook(
     };
 
     match tokio::time::timeout(timeout, read_fut).await {
-        Ok((buf, Ok(status))) if status.success() => {
-            parse_post_hook_output(&buf)
-        }
+        Ok((buf, Ok(status))) if status.success() => parse_post_hook_output(&buf),
         _ => {
             let _ = child.kill().await;
             None
@@ -782,9 +776,14 @@ pub async fn evaluate_session_hooks(
     for hook in hooks {
         match &hook.action {
             HookAction::Shell { command } => {
-                if let Some(result) =
-                    run_shell_session_hook(command, event, session_id, user_message, hook.timeout_secs)
-                        .await
+                if let Some(result) = run_shell_session_hook(
+                    command,
+                    event,
+                    session_id,
+                    user_message,
+                    hook.timeout_secs,
+                )
+                .await
                 {
                     if let Some(ctx) = result.context {
                         contexts.push(ctx);
@@ -862,9 +861,7 @@ async fn run_shell_session_hook(
     };
 
     match tokio::time::timeout(timeout, read_fut).await {
-        Ok((buf, Ok(status))) if status.success() => {
-            Some(parse_session_hook_output(&buf))
-        }
+        Ok((buf, Ok(status))) if status.success() => Some(parse_session_hook_output(&buf)),
         Ok((_, Ok(status))) => {
             astra_core::agent_warn!(
                 "hook",
@@ -913,10 +910,7 @@ fn parse_session_hook_output(stdout: &[u8]) -> SessionHookOutput {
                     .collect()
             })
             .unwrap_or_default();
-        SessionHookOutput {
-            context,
-            env_vars,
-        }
+        SessionHookOutput { context, env_vars }
     } else {
         // Plain text → treat as context
         SessionHookOutput {
@@ -1982,9 +1976,15 @@ session_hooks:
 
         let registry = load_session_event_hooks(dir.path());
         let start = registry.matching(SessionEvent::SessionStart);
-        assert_eq!(start[0].timeout_secs, 30, "should inherit default_timeout_secs");
+        assert_eq!(
+            start[0].timeout_secs, 30,
+            "should inherit default_timeout_secs"
+        );
         let end = registry.matching(SessionEvent::SessionEnd);
-        assert_eq!(end[0].timeout_secs, 5, "explicit timeout should be preserved");
+        assert_eq!(
+            end[0].timeout_secs, 5,
+            "explicit timeout should be preserved"
+        );
     }
 
     #[test]
@@ -2020,9 +2020,13 @@ session_hooks:
             timeout_secs: 5,
         }]);
 
-        let output =
-            evaluate_session_hooks(&registry, SessionEvent::SessionStart, "test-session", Some("hello"))
-                .await;
+        let output = evaluate_session_hooks(
+            &registry,
+            SessionEvent::SessionStart,
+            "test-session",
+            Some("hello"),
+        )
+        .await;
         assert_eq!(output.context.as_deref(), Some("Welcome back, user!"));
     }
 

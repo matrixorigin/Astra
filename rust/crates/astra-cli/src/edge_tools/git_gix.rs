@@ -284,6 +284,41 @@ pub(crate) fn git_show(
     let message = String::from_utf8_lossy(commit.message_raw_sloppy()).to_string();
     out.push_str(&format!("\n    {}\n", message.trim()));
 
+    // Merge commits: gix first-parent diff produces useless tree-level output.
+    // Fall back to `git show --first-parent` via CLI for an actual code diff.
+    let is_merge = commit.parent_ids().count() > 1;
+    if is_merge {
+        let mut cli_args = vec!["show", "--first-parent", "--no-ext-diff", "--no-color"];
+        if stat_only {
+            cli_args.push("--stat");
+        } else {
+            cli_args.push("-p");
+        }
+        // commit_ref is already validated above
+        let cli_ref = commit_ref.to_string();
+        cli_args.push(&cli_ref);
+        if let Some(f) = file_filter {
+            cli_args.push("--");
+            cli_args.push(f);
+        }
+        let cli_out = std::process::Command::new("git")
+            .args(&cli_args)
+            .current_dir(project_root)
+            .output()
+            .ok();
+        if let Some(output) = cli_out {
+            if output.status.success() {
+                let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+                if !stdout.trim().is_empty() {
+                    return truncate_show_at(stdout, limit);
+                }
+                // Empty output with file filter means the file wasn't changed.
+                // Fall through to gix to at least show the commit header.
+            }
+        }
+        // CLI failed or empty — fall through to gix (best effort)
+    }
+
     // Diff: use tree changes API
     let new_tree = match commit.tree() {
         Ok(t) => t,

@@ -36,13 +36,22 @@ pub(super) async fn handle_mcp_command(arg: &str, state: &ReplState) -> Result<(
         s if s.starts_with("log-level ") => handle_mcp_log_level(&s[10..], state).await,
         "log-level" => {
             eprintln!("{}", "  Usage: /mcp log-level <server> <level>".dim());
-            eprintln!("{}", "  Levels: debug, info, notice, warning, error, critical, alert, emergency".dim());
+            eprintln!(
+                "{}",
+                "  Levels: debug, info, notice, warning, error, critical, alert, emergency".dim()
+            );
         }
         s if s.starts_with("prompt ") => {
-            eprintln!("{}", "  Hint: use /mcp prompt <server>:<name> [arg1 arg2 ...]".dim());
+            eprintln!(
+                "{}",
+                "  Hint: use /mcp prompt <server>:<name> [arg1 arg2 ...]".dim()
+            );
         }
         "prompt" => {
-            eprintln!("{}", "  Usage: /mcp prompt <server>:<name> [arg1 arg2 ...]".dim());
+            eprintln!(
+                "{}",
+                "  Usage: /mcp prompt <server>:<name> [arg1 arg2 ...]".dim()
+            );
         }
         _ => {
             eprintln!(
@@ -130,7 +139,10 @@ async fn show_prompts(state: &ReplState) {
     let prompts = manager.all_prompts().await;
 
     if prompts.is_empty() {
-        eprintln!("{}", "  No prompts available from connected MCP servers.".dim());
+        eprintln!(
+            "{}",
+            "  No prompts available from connected MCP servers.".dim()
+        );
         return;
     }
 
@@ -371,7 +383,7 @@ async fn handle_mcp_unsubscribe(arg: &str, state: &ReplState) {
 
 /// `/mcp log-level <server> <level>` — set logging level for an MCP server.
 async fn handle_mcp_log_level(arg: &str, state: &ReplState) {
-    let parts: Vec<&str> = arg.trim().split_whitespace().collect();
+    let parts: Vec<&str> = arg.split_whitespace().collect();
     if parts.len() != 2 {
         eprintln!("{}", "  Usage: /mcp log-level <server> <level>".dim());
         eprintln!(
@@ -469,7 +481,8 @@ pub(super) async fn handle_mcp_prompt_invoke(
         _ => {
             eprintln!(
                 "{}",
-                format!("  ⚠ Invalid format: '{qualified_name}'. Use <server>:<prompt_name>").yellow()
+                format!("  ⚠ Invalid format: '{qualified_name}'. Use <server>:<prompt_name>")
+                    .yellow()
             );
             return Ok(());
         }
@@ -478,7 +491,9 @@ pub(super) async fn handle_mcp_prompt_invoke(
     // Build arguments map: match positional args to prompt argument names
     let manager = state.mcp_manager.read().await;
     let prompts = manager.all_prompts().await;
-    let prompt_def = prompts.iter().find(|(s, p)| s == server_name && p.name == prompt_name);
+    let prompt_def = prompts
+        .iter()
+        .find(|(s, p)| s == server_name && p.name == prompt_name);
 
     let arguments = if !raw_args.is_empty() {
         let arg_values: Vec<&str> = raw_args.split_whitespace().collect();
@@ -489,7 +504,10 @@ pub(super) async fn handle_mcp_prompt_invoke(
             if let Some(ref arg_defs) = def.arguments {
                 for (i, val) in arg_values.iter().enumerate() {
                     if let Some(arg_def) = arg_defs.get(i) {
-                        map.insert(arg_def.name.clone(), serde_json::Value::String(val.to_string()));
+                        map.insert(
+                            arg_def.name.clone(),
+                            serde_json::Value::String(val.to_string()),
+                        );
                     }
                 }
                 // If more values than named args, join remaining as last arg
@@ -500,11 +518,17 @@ pub(super) async fn handle_mcp_prompt_invoke(
                 }
             } else {
                 // No arg definitions — use "input" as key
-                map.insert("input".to_string(), serde_json::Value::String(raw_args.to_string()));
+                map.insert(
+                    "input".to_string(),
+                    serde_json::Value::String(raw_args.to_string()),
+                );
             }
         } else {
             // Prompt definition not found in cache — use "input" as key
-            map.insert("input".to_string(), serde_json::Value::String(raw_args.to_string()));
+            map.insert(
+                "input".to_string(),
+                serde_json::Value::String(raw_args.to_string()),
+            );
         }
         Some(map)
     } else {
@@ -518,7 +542,10 @@ pub(super) async fn handle_mcp_prompt_invoke(
         prompt_name
     );
 
-    let result = match manager.get_prompt(server_name, prompt_name, arguments).await {
+    let result = match manager
+        .get_prompt(server_name, prompt_name, arguments)
+        .await
+    {
         Ok(r) => r,
         Err(e) => {
             eprintln!("{}", format!("  ⚠ Failed to get prompt: {e}").yellow());

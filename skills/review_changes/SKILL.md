@@ -115,6 +115,24 @@ From the diff, identify public API changes (`pub fn`, `pub struct`, `pub enum`, 
 
 For each file with core logic changes (skip trivial formatting):
 
+### 3.0 Read Context Efficiently
+
+**⚠ CRITICAL: NEVER read an entire large file.** Use line ranges from the diff hunk headers:
+
+1. Parse the `@@ -45,7 +45,9 @@` markers from the diff output
+2. Call `read_file` with `start_line` / `end_line` for ~30 lines around each hunk
+3. For files >200 lines, use `outline: true` first to understand structure, then read specific ranges
+4. If the diff touches multiple scattered hunks, make **parallel** `read_file` calls for each range
+
+Example: if the diff shows `@@ -120,8 +120,12 @@`, call:
+```json
+{"path": "src/foo.rs", "start_line": 105, "end_line": 140}
+```
+
+**Merge commits:** `git_show` on a merge commit shows the combined first-parent diff.
+If the output looks incomplete (e.g., no code hunks, only file renames), use
+`git_diff` with `ref: "<first-parent-sha>"` to get the real code diff instead.
+
 ### 3.1 Bug Detection
 
 Check the diff hunks for:
