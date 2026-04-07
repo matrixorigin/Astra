@@ -426,33 +426,27 @@ async fn admin_routes_require_auth() {
 }
 
 #[tokio::test]
-async fn admin_init_require_admin_role() {
+async fn admin_init_variants_match_shared_contract() {
     let contract = load_contract();
+    let app = build_app_with_admin();
 
     let (status, json) = post_json(
-        build_app_with_admin(),
+        app.clone(),
         "/admin/init",
         &[("authorization", "Bearer user-token")],
         serde_json::json!({}),
     )
     .await;
-
     assert_eq!(status.as_u16(), contract.admin_forbidden.status);
     assert_eq!(json, contract.admin_forbidden.json);
-}
-
-#[tokio::test]
-async fn admin_init_matches_shared_contract() {
-    let contract = load_contract();
 
     let (status, json) = post_json(
-        build_app_with_admin(),
+        app,
         "/admin/init",
         &[("authorization", "Bearer admin-token")],
         serde_json::json!({}),
     )
     .await;
-
     assert_eq!(status.as_u16(), contract.admin_init.status);
     assert_eq!(json, contract.admin_init.json);
 }
@@ -578,8 +572,14 @@ async fn admin_role_grant_variants_match_shared_contract() {
     for (label, q) in [
         ("grant", &contract.admin_role_grant),
         ("grant_existing", &contract.admin_role_grant_existing),
-        ("grant_user_not_found", &contract.admin_role_grant_user_not_found),
-        ("grant_role_not_found", &contract.admin_role_grant_role_not_found),
+        (
+            "grant_user_not_found",
+            &contract.admin_role_grant_user_not_found,
+        ),
+        (
+            "grant_role_not_found",
+            &contract.admin_role_grant_role_not_found,
+        ),
     ] {
         let (status, json) = post_json(
             app.clone(),
@@ -602,8 +602,14 @@ async fn admin_role_revoke_variants_match_shared_contract() {
     for (label, q) in [
         ("revoke", &contract.admin_role_revoke),
         ("revoke_missing", &contract.admin_role_revoke_missing),
-        ("revoke_user_not_found", &contract.admin_role_revoke_user_not_found),
-        ("revoke_role_not_found", &contract.admin_role_revoke_role_not_found),
+        (
+            "revoke_user_not_found",
+            &contract.admin_role_revoke_user_not_found,
+        ),
+        (
+            "revoke_role_not_found",
+            &contract.admin_role_revoke_role_not_found,
+        ),
     ] {
         let (status, json) = post_json(
             app.clone(),
