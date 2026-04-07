@@ -260,6 +260,8 @@ const SLASH_FIRST_TOKEN_COMPLETIONS: &[(&str, &[(&str, &str)])] = &[
             ("prompt", "Invoke: /mcp prompt <server>:<name> [args]"),
             ("resources", "List available MCP resources"),
             ("resource", "Read: /mcp resource <server>:<uri>"),
+            ("subscribe", "Subscribe: /mcp subscribe <server>:<uri>"),
+            ("unsubscribe", "Unsubscribe: /mcp unsubscribe <server>:<uri>"),
         ],
     ),
     (

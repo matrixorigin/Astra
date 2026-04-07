@@ -4301,7 +4301,7 @@ async fn handle_slash_command(
         }
 
         "/mcp" | "/mcp status" | "/mcp servers" | "/mcp prompts" | "/mcp resources"
-        | "/mcp resource" => {
+        | "/mcp resource" | "/mcp subscribe" | "/mcp unsubscribe" => {
             slash_mcp::handle_mcp_command(arg, state).await?;
         }
 

@@ -25,6 +25,14 @@ pub(super) async fn handle_mcp_command(arg: &str, state: &ReplState) -> Result<(
         "resource" => {
             eprintln!("{}", "  Usage: /mcp resource <server>:<uri>".dim());
         }
+        s if s.starts_with("subscribe ") => handle_mcp_subscribe(&s[10..], state).await,
+        "subscribe" => {
+            eprintln!("{}", "  Usage: /mcp subscribe <server>:<uri>".dim());
+        }
+        s if s.starts_with("unsubscribe ") => handle_mcp_unsubscribe(&s[12..], state).await,
+        "unsubscribe" => {
+            eprintln!("{}", "  Usage: /mcp unsubscribe <server>:<uri>".dim());
+        }
         s if s.starts_with("prompt ") => {
             eprintln!("{}", "  Hint: use /mcp prompt <server>:<name> [arg1 arg2 ...]".dim());
         }
@@ -257,6 +265,100 @@ async fn handle_mcp_resource_read(arg: &str, state: &ReplState) {
             eprintln!(
                 "{}",
                 format!("  ⚠ Failed to read resource '{uri}' from {server_name}: {e}").yellow()
+            );
+        }
+    }
+}
+
+/// `/mcp subscribe <server>:<uri>` — subscribe to resource updates.
+async fn handle_mcp_subscribe(arg: &str, state: &ReplState) {
+    let rest = arg.trim();
+    if rest.is_empty() {
+        eprintln!("{}", "  Usage: /mcp subscribe <server>:<uri>".dim());
+        return;
+    }
+
+    let (server_name, uri) = match rest.split_once(':') {
+        Some((s, u)) if !s.is_empty() && !u.is_empty() => (s, u),
+        _ => {
+            eprintln!(
+                "{}",
+                format!("  ⚠ Invalid format: '{rest}'. Use <server>:<uri>").yellow()
+            );
+            return;
+        }
+    };
+
+    let manager = state.mcp_manager.read().await;
+    let conn = match manager.get(server_name) {
+        Some(c) => c,
+        None => {
+            eprintln!(
+                "{}",
+                format!("  ⚠ Server '{server_name}' not found.").yellow()
+            );
+            return;
+        }
+    };
+
+    match conn.subscribe_resource(uri).await {
+        Ok(()) => {
+            eprintln!(
+                "{}",
+                format!("  ✓ Subscribed to '{uri}' on {server_name}").green()
+            );
+        }
+        Err(e) => {
+            eprintln!(
+                "{}",
+                format!("  ⚠ Failed to subscribe to '{uri}' on {server_name}: {e}").yellow()
+            );
+        }
+    }
+}
+
+/// `/mcp unsubscribe <server>:<uri>` — unsubscribe from resource updates.
+async fn handle_mcp_unsubscribe(arg: &str, state: &ReplState) {
+    let rest = arg.trim();
+    if rest.is_empty() {
+        eprintln!("{}", "  Usage: /mcp unsubscribe <server>:<uri>".dim());
+        return;
+    }
+
+    let (server_name, uri) = match rest.split_once(':') {
+        Some((s, u)) if !s.is_empty() && !u.is_empty() => (s, u),
+        _ => {
+            eprintln!(
+                "{}",
+                format!("  ⚠ Invalid format: '{rest}'. Use <server>:<uri>").yellow()
+            );
+            return;
+        }
+    };
+
+    let manager = state.mcp_manager.read().await;
+    let conn = match manager.get(server_name) {
+        Some(c) => c,
+        None => {
+            eprintln!(
+                "{}",
+                format!("  ⚠ Server '{server_name}' not found.").yellow()
+            );
+            return;
+        }
+    };
+
+    match conn.unsubscribe_resource(uri).await {
+        Ok(()) => {
+            eprintln!(
+                "{}",
+                format!("  ✓ Unsubscribed from '{uri}' on {server_name}").green()
+            );
+        }
+        Err(e) => {
+            eprintln!(
+                "{}",
+                format!("  ⚠ Failed to unsubscribe from '{uri}' on {server_name}: {e}").yellow()
             );
         }
     }

@@ -411,6 +411,9 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
             tool_event_hooks: astra_runtime::skills::hooks::load_tool_event_hooks(
                 &self.project_root,
             ),
+            session_event_hooks: astra_runtime::skills::hooks::load_session_event_hooks(
+                &self.project_root,
+            ),
             stop_hooks: Vec::new(),
             stop_hook_runs: 0,
             teammate_idle_hooks: Vec::new(),

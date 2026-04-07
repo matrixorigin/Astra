@@ -266,6 +266,7 @@ pub(crate) async fn stream_chat_sse(
         discovered_skills,
         skill_search: p.skill_search.clone(),
         tool_event_hooks: astra_runtime::skills::hooks::load_tool_event_hooks(&project_root),
+        session_event_hooks: astra_runtime::skills::hooks::load_session_event_hooks(&project_root),
         stop_hooks: hook_sets.stop_hooks,
         stop_hook_runs: 0,
         teammate_idle_hooks: hook_sets.teammate_idle_hooks,
