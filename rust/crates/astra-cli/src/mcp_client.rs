@@ -36,7 +36,8 @@ use rmcp::{
     ClientHandler, Peer, RoleClient,
     model::{
         CallToolRequestParams, CallToolResult, GetPromptRequestParams, GetPromptResult, Prompt,
-        ReadResourceRequestParams, Resource, Tool,
+        ReadResourceRequestParams, Resource, SubscribeRequestParams, Tool,
+        UnsubscribeRequestParams,
     },
     serve_client,
     service::{NotificationContext, ServiceError},
@@ -366,6 +367,20 @@ impl McpConnection {
             .collect::<Vec<_>>()
             .join("\n");
         Ok(text)
+    }
+
+    /// Subscribe to updates for a specific resource URI.
+    pub async fn subscribe_resource(&self, uri: &str) -> Result<(), ServiceError> {
+        self.peer
+            .subscribe(SubscribeRequestParams::new(uri))
+            .await
+    }
+
+    /// Unsubscribe from updates for a specific resource URI.
+    pub async fn unsubscribe_resource(&self, uri: &str) -> Result<(), ServiceError> {
+        self.peer
+            .unsubscribe(UnsubscribeRequestParams::new(uri))
+            .await
     }
 
     /// Discover `skill://` resources and return (name, skill_md_content) pairs.
