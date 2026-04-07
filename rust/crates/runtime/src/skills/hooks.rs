@@ -334,6 +334,36 @@ fn apply_default_timeout_session(
 
 // ── Hook execution ──────────────────────────────────────────────────────────
 
+/// Maximum bytes to read from a hook's stdout. Prevents a runaway hook from
+/// consuming unbounded memory. 256 KiB is generous for JSON context output.
+pub(crate) const HOOK_STDOUT_MAX_BYTES: usize = 256 * 1024;
+
+/// Read up to [`HOOK_STDOUT_MAX_BYTES`] from an async reader.
+pub(crate) async fn read_capped(reader: &mut (impl tokio::io::AsyncRead + Unpin)) -> Vec<u8> {
+    use tokio::io::AsyncReadExt;
+    let mut buf = Vec::with_capacity(4096);
+    let mut tmp = [0u8; 8192];
+    loop {
+        match reader.read(&mut tmp).await {
+            Ok(0) => break,
+            Ok(n) => {
+                let remaining = HOOK_STDOUT_MAX_BYTES - buf.len();
+                buf.extend_from_slice(&tmp[..n.min(remaining)]);
+                if buf.len() >= HOOK_STDOUT_MAX_BYTES {
+                    break;
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    buf
+}
+
+/// Convenience: fire SessionEnd hooks, ignoring output.
+pub async fn fire_session_end(registry: &SessionEventHookRegistry, session_id: &str) {
+    let _ = evaluate_session_hooks(registry, SessionEvent::SessionEnd, session_id, None).await;
+}
+
 /// Execute all PreToolUse hooks matching a tool name.
 ///
 /// Returns the aggregate decision:
@@ -449,7 +479,7 @@ async fn run_shell_pre_hook(
     tool_args: &serde_json::Value,
     timeout_secs: u32,
 ) -> PreToolDecision {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::io::AsyncWriteExt;
     use tokio::process::Command;
 
     let input = serde_json::json!({
@@ -480,23 +510,29 @@ async fn run_shell_pre_hook(
     let mut stdout_handle = child.stdout.take();
     let timeout = std::time::Duration::from_secs(timeout_secs as u64);
 
-    let wait_result = tokio::time::timeout(timeout, child.wait()).await;
+    // Read stdout first (capped) to prevent pipe-full deadlock, then wait.
+    let read_fut = async {
+        let buf = match stdout_handle.as_mut() {
+            Some(s) => read_capped(s).await,
+            None => Vec::new(),
+        };
+        let status = child.wait().await;
+        (buf, status)
+    };
+
+    let wait_result = tokio::time::timeout(timeout, read_fut).await;
     match wait_result {
-        Ok(Ok(status)) => {
-            if !status.success() {
-                return PreToolDecision::Block(format!(
-                    "Hook '{}' exited with status {}",
-                    command,
-                    status.code().unwrap_or(-1)
-                ));
-            }
-            let mut buf = Vec::new();
-            if let Some(ref mut stdout) = stdout_handle {
-                let _ = stdout.read_to_end(&mut buf).await;
-            }
+        Ok((_, Ok(status))) if !status.success() => {
+            PreToolDecision::Block(format!(
+                "Hook '{}' exited with status {}",
+                command,
+                status.code().unwrap_or(-1)
+            ))
+        }
+        Ok((buf, Ok(_))) => {
             parse_pre_hook_output(&buf)
         }
-        Ok(Err(e)) => {
+        Ok((_, Err(e))) => {
             astra_core::agent_warn!("hook", "Hook I/O error for '{}': {}", command, e);
             PreToolDecision::Allow
         }
@@ -518,7 +554,7 @@ async fn run_shell_post_hook(
     tool_output: &str,
     timeout_secs: u32,
 ) -> Option<String> {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::io::AsyncWriteExt;
     use tokio::process::Command;
 
     let input = serde_json::json!({
@@ -550,12 +586,18 @@ async fn run_shell_post_hook(
     let mut stdout_handle = child.stdout.take();
     let timeout = std::time::Duration::from_secs(timeout_secs as u64);
 
-    match tokio::time::timeout(timeout, child.wait()).await {
-        Ok(Ok(status)) if status.success() => {
-            let mut buf = Vec::new();
-            if let Some(ref mut stdout) = stdout_handle {
-                let _ = stdout.read_to_end(&mut buf).await;
-            }
+    // Read stdout first (capped) to prevent pipe-full deadlock, then wait.
+    let read_fut = async {
+        let buf = match stdout_handle.as_mut() {
+            Some(s) => read_capped(s).await,
+            None => Vec::new(),
+        };
+        let status = child.wait().await;
+        (buf, status)
+    };
+
+    match tokio::time::timeout(timeout, read_fut).await {
+        Ok((buf, Ok(status))) if status.success() => {
             parse_post_hook_output(&buf)
         }
         _ => {
@@ -698,6 +740,11 @@ impl SessionEventHookRegistry {
         self.hooks.iter().filter(|h| h.event == event).collect()
     }
 
+    /// Check if any hooks exist for the given event (no allocation).
+    pub fn has_event(&self, event: SessionEvent) -> bool {
+        self.hooks.iter().any(|h| h.event == event)
+    }
+
     pub fn is_empty(&self) -> bool {
         self.hooks.is_empty()
     }
@@ -773,7 +820,7 @@ async fn run_shell_session_hook(
     user_message: Option<&str>,
     timeout_secs: u32,
 ) -> Option<SessionHookOutput> {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::io::AsyncWriteExt;
     use tokio::process::Command;
 
     let input = serde_json::json!({
@@ -804,15 +851,21 @@ async fn run_shell_session_hook(
     let mut stdout_handle = child.stdout.take();
     let timeout = std::time::Duration::from_secs(timeout_secs as u64);
 
-    match tokio::time::timeout(timeout, child.wait()).await {
-        Ok(Ok(status)) if status.success() => {
-            let mut buf = Vec::new();
-            if let Some(ref mut stdout) = stdout_handle {
-                let _ = stdout.read_to_end(&mut buf).await;
-            }
+    // Read stdout first (capped) to prevent pipe-full deadlock, then wait.
+    let read_fut = async {
+        let buf = match stdout_handle.as_mut() {
+            Some(s) => read_capped(s).await,
+            None => Vec::new(),
+        };
+        let status = child.wait().await;
+        (buf, status)
+    };
+
+    match tokio::time::timeout(timeout, read_fut).await {
+        Ok((buf, Ok(status))) if status.success() => {
             Some(parse_session_hook_output(&buf))
         }
-        Ok(Ok(status)) => {
+        Ok((_, Ok(status))) => {
             astra_core::agent_warn!(
                 "hook",
                 "Session hook '{}' exited with status {}",
@@ -821,7 +874,7 @@ async fn run_shell_session_hook(
             );
             None
         }
-        Ok(Err(e)) => {
+        Ok((_, Err(e))) => {
             astra_core::agent_warn!("hook", "Session hook I/O error for '{}': {}", command, e);
             None
         }

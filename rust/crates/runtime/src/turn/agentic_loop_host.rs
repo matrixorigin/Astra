@@ -804,7 +804,7 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
     state: &mut AgenticLoopState,
 ) -> Result<AgenticLoopOutcome, String> {
     // ─── Preamble: fire SessionStart hooks ───────────────────────────────
-    if !state.session_event_hooks.matching(crate::skills::hooks::SessionEvent::SessionStart).is_empty() {
+    if state.session_event_hooks.has_event(crate::skills::hooks::SessionEvent::SessionStart) {
         let session_id = state.current_session_id.as_deref().unwrap_or("");
         let user_msg = state.message.as_str();
         let hook_output = crate::skills::hooks::evaluate_session_hooks(
@@ -1079,6 +1079,16 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
         // and execute them as multi-agent coordination runs.
         let (delegation_results, remaining_tool_calls) =
             if let Some(engine) = &state.delegation_engine {
+                // Fire SubagentStart hooks before delegation.
+                if turn_result.accum.tool_calls.iter().any(is_delegation_call) {
+                    let _ = crate::skills::hooks::evaluate_session_hooks(
+                        &state.session_event_hooks,
+                        crate::skills::hooks::SessionEvent::SubagentStart,
+                        state.current_session_id.as_deref().unwrap_or(""),
+                        None,
+                    )
+                    .await;
+                }
                 partition_and_execute_delegations(
                     &turn_result.accum.tool_calls,
                     engine,
@@ -4863,5 +4873,42 @@ print(json.dumps({'context': 'user said: ' + msg}))
                 "SessionEnd hook should not fire at session start"
             );
         }
+    }
+
+    // ── read_capped tests ───────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn read_capped_limits_large_hook_output() {
+        // A hook that outputs more than 256 KiB should be truncated
+        use crate::skills::hooks::HOOK_STDOUT_MAX_BYTES;
+        let registry = crate::skills::hooks::SessionEventHookRegistry::new(vec![
+            crate::skills::hooks::SessionEventHook {
+                event: crate::skills::hooks::SessionEvent::SessionStart,
+                action: crate::skills::hooks::HookAction::Shell {
+                    // dd outputs exactly 300 KiB of zeros, fast
+                    command: format!(
+                        "dd if=/dev/zero bs=1024 count={} 2>/dev/null | tr '\\0' 'x'",
+                        (HOOK_STDOUT_MAX_BYTES + 50_000) / 1024
+                    ),
+                },
+                timeout_secs: 5,
+            },
+        ]);
+
+        let output = crate::skills::hooks::evaluate_session_hooks(
+            &registry,
+            crate::skills::hooks::SessionEvent::SessionStart,
+            "s1",
+            None,
+        )
+        .await;
+        // Output should exist but be capped (plain text → context)
+        let ctx = output.context.unwrap();
+        assert!(
+            ctx.len() <= HOOK_STDOUT_MAX_BYTES,
+            "context should be capped at {} bytes, got {}",
+            HOOK_STDOUT_MAX_BYTES,
+            ctx.len()
+        );
     }
 }
