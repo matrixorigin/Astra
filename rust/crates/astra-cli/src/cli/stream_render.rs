@@ -1000,6 +1000,7 @@ impl StreamRenderState {
     /// Show a tool as "running" with Cursor-style description (single line).
     fn tool_start(&mut self, tool: &str, args: &Value) -> usize {
         let description = self.format_tool_description(tool, args);
+        let styled_desc = style_tool_description(tool, &description);
         if let Some(pane) = self.thinking_pane.take() {
             let summary = pane.summary_line();
             self.clear_thinking_with_summary(pane, &summary);
@@ -1008,9 +1009,10 @@ impl StreamRenderState {
         if self.md.is_some() {
             self.stop_tool_stderr_running();
             if io::stderr().is_terminal() {
+                // Spinner uses plain description (truncated internally with .dim())
                 self.tool_stderr_running = Some(ToolRunningLineSpinner::start(description));
             } else {
-                let line = format!("  {} {} …", "⬢".cyan(), description);
+                let line = format!("  {} {} …", "⬢".cyan(), styled_desc);
                 eprintln!("{line}");
                 self.stderr_lines += 1;
             }
@@ -1020,7 +1022,7 @@ impl StreamRenderState {
         let idx = {
             let mut g = self.tool_ui.lock().unwrap();
             let idx = g.lines.len();
-            let line = format!("  {} {} …", "⬢".cyan(), description);
+            let line = format!("  {} {} …", "⬢".cyan(), styled_desc);
             g.lines.push(line);
             let lines = g.lines.clone();
             g.region.update(lines);
@@ -1029,7 +1031,7 @@ impl StreamRenderState {
         self.tool_stdout_anim = Some(ToolStdoutLineAnim::start(
             self.tool_ui.clone(),
             idx,
-            description,
+            description, // Plain text for spinner animation
         ));
         idx
     }
@@ -1392,12 +1394,13 @@ impl StreamRenderState {
         if self.md.is_some() {
             self.stop_tool_stderr_running();
             let description = self.format_tool_description_with_output(tool, args, Some(output));
+            let styled_desc = style_tool_description(tool, &description);
             let dur_display = format!("{}", duration_suffix.dim());
             let mut out_lines = 1usize;
             if status == "error" {
-                eprintln!("  {} {}{}", theme::icon_err(), description, dur_display);
+                eprintln!("  {} {}{}", theme::icon_err(), styled_desc, dur_display);
             } else {
-                eprintln!("  {} {}{}", theme::icon_ok(), description, dur_display);
+                eprintln!("  {} {}{}", theme::icon_ok(), styled_desc, dur_display);
             }
             if !line.is_empty() {
                 eprintln!("{line}");
@@ -1408,10 +1411,11 @@ impl StreamRenderState {
         }
         self.stop_tool_stdout_anim();
         let description = self.format_tool_description_with_output(tool, args, Some(output));
+        let styled_desc = style_tool_description(tool, &description);
         let dur_display = format!("{}", duration_suffix.dim());
         let mut g = self.tool_ui.lock().unwrap();
         if idx < g.lines.len() {
-            g.lines[idx] = format!("  {icon} {description}{dur_display}");
+            g.lines[idx] = format!("  {icon} {styled_desc}{dur_display}");
             if !line.is_empty() {
                 let insert_pos = idx + 1;
                 if insert_pos <= g.lines.len() {
@@ -1675,6 +1679,50 @@ impl StreamRenderState {
                     Some(summary)
                 }
             }
+            // Skill tool — show first few meaningful output lines
+            "skill" => {
+                if output.trim().is_empty() {
+                    return None;
+                }
+                let meaningful: Vec<&str> = output
+                    .lines()
+                    .map(|l| l.trim())
+                    .filter(|l| !l.is_empty())
+                    .take(3)
+                    .collect();
+                if meaningful.is_empty() {
+                    return None;
+                }
+                let mut parts: Vec<String> =
+                    meaningful.iter().map(|l| truncate_line(l, 60)).collect();
+                let remaining = line_count.saturating_sub(3);
+                if remaining > 0 {
+                    parts.push(format!("… +{remaining} more lines"));
+                }
+                Some(parts.join("\n    "))
+            }
+            // MCP tools — show first few output lines (same as bash/skill)
+            other if other.starts_with("mcp_") => {
+                if output.trim().is_empty() {
+                    return None;
+                }
+                let meaningful: Vec<&str> = output
+                    .lines()
+                    .map(|l| l.trim())
+                    .filter(|l| !l.is_empty())
+                    .take(3)
+                    .collect();
+                if meaningful.is_empty() {
+                    return None;
+                }
+                let mut parts: Vec<String> =
+                    meaningful.iter().map(|l| truncate_line(l, 60)).collect();
+                let remaining = line_count.saturating_sub(3);
+                if remaining > 0 {
+                    parts.push(format!("… +{remaining} more lines"));
+                }
+                Some(parts.join("\n    "))
+            }
             _ => {
                 if line_count > 1 {
                     Some(format!("{line_count} lines"))
@@ -1695,6 +1743,23 @@ impl StreamRenderState {
         g.region.clear();
         g.lines.clear();
     }
+}
+
+/// Apply bold+magenta styling to Skill/MCP tool description prefixes,
+/// matching the visual weight of built-in tools like Read/Edit/Write.
+fn style_tool_description(tool: &str, description: &str) -> String {
+    if tool == "skill" {
+        // "Skill code-review" → bold magenta "Skill" + rest
+        if let Some(rest) = description.strip_prefix("Skill") {
+            return format!("{}{}", "Skill".magenta().bold(), rest);
+        }
+    } else if tool.starts_with("mcp_") {
+        // "MCP server tool" → bold magenta "MCP" + rest
+        if let Some(rest) = description.strip_prefix("MCP") {
+            return format!("{}{}", "MCP".magenta().bold(), rest);
+        }
+    }
+    description.to_string()
 }
 
 fn apply_sse_render_effects(
@@ -2130,5 +2195,101 @@ mod tests {
     #[test]
     fn extract_absolute_path_empty_command() {
         assert_eq!(extract_first_absolute_path(""), None);
+    }
+
+    // ── style_tool_description tests ──
+
+    #[test]
+    fn style_skill_description_has_bold_prefix() {
+        let styled = style_tool_description("skill", "Skill code-review");
+        // Should contain ANSI codes (bold+magenta) and the skill name
+        assert!(styled.contains("code-review"));
+        assert!(styled.contains("Skill"));
+        // Plain text without ANSI should NOT match (it has escape sequences)
+        assert_ne!(styled, "Skill code-review");
+    }
+
+    #[test]
+    fn style_mcp_description_has_bold_prefix() {
+        let styled = style_tool_description("mcp_github_search", "MCP github search");
+        assert!(styled.contains("search"));
+        assert!(styled.contains("MCP"));
+        assert_ne!(styled, "MCP github search");
+    }
+
+    #[test]
+    fn style_regular_tool_unchanged() {
+        let styled = style_tool_description("read_file", "Read src/main.rs");
+        assert_eq!(styled, "Read src/main.rs");
+    }
+
+    #[test]
+    fn style_bash_tool_unchanged() {
+        let styled = style_tool_description("bash", "$ echo hello");
+        assert_eq!(styled, "$ echo hello");
+    }
+
+    // ── Skill/MCP format_tool_description tests ──
+
+    #[test]
+    fn format_skill_description() {
+        let r = StreamRenderState::new();
+        let args = serde_json::json!({"skill_name": "code-review"});
+        let desc = r.format_tool_description("skill", &args);
+        assert_eq!(desc, "Skill code-review");
+    }
+
+    #[test]
+    fn format_mcp_description_with_server_and_tool() {
+        let r = StreamRenderState::new();
+        let desc = r.format_tool_description("mcp_github_search_repos", &serde_json::json!({}));
+        assert_eq!(desc, "MCP github search_repos");
+    }
+
+    #[test]
+    fn format_mcp_description_no_underscore() {
+        let r = StreamRenderState::new();
+        let desc = r.format_tool_description("mcp_mytool", &serde_json::json!({}));
+        assert_eq!(desc, "MCP mytool");
+    }
+
+    // ── Skill/MCP output summary tests ──
+
+    #[test]
+    fn skill_output_summary_shows_lines() {
+        let r = StreamRenderState::new();
+        let output = "Result line 1\nResult line 2\nResult line 3\nLine 4\nLine 5";
+        let summary = r.format_output_summary("skill", output, "ok");
+        assert!(summary.is_some());
+        let s = summary.unwrap();
+        assert!(s.contains("Result line 1"));
+        assert!(s.contains("Result line 2"));
+        assert!(s.contains("… +2 more lines"));
+    }
+
+    #[test]
+    fn skill_output_summary_empty() {
+        let r = StreamRenderState::new();
+        assert!(r.format_output_summary("skill", "", "ok").is_none());
+        assert!(r.format_output_summary("skill", "   \n  \n", "ok").is_none());
+    }
+
+    #[test]
+    fn mcp_output_summary_shows_lines() {
+        let r = StreamRenderState::new();
+        let output = "Found 3 repos\nrepo1\nrepo2\nrepo3";
+        let summary = r.format_output_summary("mcp_github_search", output, "ok");
+        assert!(summary.is_some());
+        let s = summary.unwrap();
+        assert!(s.contains("Found 3 repos"));
+        assert!(s.contains("repo1"));
+    }
+
+    #[test]
+    fn mcp_output_summary_empty() {
+        let r = StreamRenderState::new();
+        assert!(r
+            .format_output_summary("mcp_github_search", "", "ok")
+            .is_none());
     }
 }
