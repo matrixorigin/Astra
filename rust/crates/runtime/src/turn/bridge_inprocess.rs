@@ -3768,4 +3768,160 @@ mod tests {
         assert!(r.preview.is_empty());
         assert_eq!(r.fetch_ms, 0);
     }
+
+    // ── render_sse tests ────────────────────────────────────────────────
+
+    #[test]
+    fn render_sse_formats_data_prefix() {
+        let event = json!({"type": "text_delta", "content": "hi"});
+        let bytes = render_sse(&event);
+        let s = std::str::from_utf8(&bytes).unwrap();
+        assert!(s.starts_with("data: "));
+        assert!(s.ends_with("\n\n"));
+        assert!(s.contains("\"text_delta\""));
+    }
+
+    #[test]
+    fn render_sse_map_delegates_to_render_sse() {
+        let mut map = Map::new();
+        map.insert("type".into(), json!("usage"));
+        map.insert("prompt_tokens".into(), json!(100));
+        let bytes = render_sse_map(&map);
+        let s = std::str::from_utf8(&bytes).unwrap();
+        assert!(s.starts_with("data: "));
+        assert!(s.contains("\"usage\""));
+    }
+
+    // ── apply_forward_llm_sse_event tests ───────────────────────────────
+
+    #[test]
+    fn forward_event_missing_type_returns_error() {
+        let event = json!({"content": "no type field"});
+        let mut saw = false;
+        let mut text = String::new();
+        let mut reasoning = String::new();
+        let mut tc = vec![];
+        let mut usage = Map::new();
+        let mut model = String::new();
+        let result = apply_forward_llm_sse_event(
+            &event, &mut saw, &mut text, &mut reasoning, &mut tc, &mut usage, &mut model,
+        );
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("missing type"));
+    }
+
+    #[test]
+    fn forward_event_inprocess_summary_accumulates() {
+        let event = json!({
+            "type": "_inprocess_summary",
+            "full_text": "accumulated text",
+            "reasoning": "chain of thought",
+            "tool_calls": [{"id": "c1"}],
+            "usage": {"prompt_tokens": 50},
+            "model_used": "claude-sonnet-4"
+        });
+        let mut saw = false;
+        let mut text = String::new();
+        let mut reasoning = String::new();
+        let mut tc = vec![];
+        let mut usage = Map::new();
+        let mut model = String::new();
+        let result = apply_forward_llm_sse_event(
+            &event, &mut saw, &mut text, &mut reasoning, &mut tc, &mut usage, &mut model,
+        )
+        .unwrap();
+        assert!(saw);
+        assert_eq!(text, "accumulated text");
+        assert_eq!(reasoning, "chain of thought");
+        assert_eq!(tc.len(), 1);
+        assert_eq!(usage.get("prompt_tokens").unwrap().as_i64(), Some(50));
+        assert_eq!(model, "claude-sonnet-4");
+        assert!(result.is_empty()); // _inprocess_summary produces no SSE output
+    }
+
+    #[test]
+    fn forward_event_inprocess_summary_missing_fields_defaults() {
+        let event = json!({"type": "_inprocess_summary"});
+        let mut saw = false;
+        let mut text = "old".to_string();
+        let mut reasoning = "old".to_string();
+        let mut tc = vec![json!("old")];
+        let mut usage = Map::new();
+        let mut model = "old".to_string();
+        let _ = apply_forward_llm_sse_event(
+            &event, &mut saw, &mut text, &mut reasoning, &mut tc, &mut usage, &mut model,
+        )
+        .unwrap();
+        assert!(saw);
+        assert_eq!(text, ""); // defaults to empty
+        assert_eq!(reasoning, ""); // defaults to empty
+        assert!(tc.is_empty()); // defaults to empty vec
+        assert_eq!(model, "old"); // not overwritten when absent
+    }
+
+    #[test]
+    fn forward_event_text_delta_forwarded_as_sse() {
+        let event = json!({"type": "text_delta", "content": "hello"});
+        let mut saw = false;
+        let mut text = String::new();
+        let mut reasoning = String::new();
+        let mut tc = vec![];
+        let mut usage = Map::new();
+        let mut model = String::new();
+        let result = apply_forward_llm_sse_event(
+            &event, &mut saw, &mut text, &mut reasoning, &mut tc, &mut usage, &mut model,
+        )
+        .unwrap();
+        assert_eq!(result.len(), 1);
+        let s = std::str::from_utf8(&result[0]).unwrap();
+        assert!(s.contains("text_delta"));
+    }
+
+    #[test]
+    fn forward_event_error_forwarded() {
+        let event = json!({"type": "error", "message": "rate limit"});
+        let mut saw = false;
+        let mut text = String::new();
+        let mut reasoning = String::new();
+        let mut tc = vec![];
+        let mut usage = Map::new();
+        let mut model = String::new();
+        let result = apply_forward_llm_sse_event(
+            &event, &mut saw, &mut text, &mut reasoning, &mut tc, &mut usage, &mut model,
+        )
+        .unwrap();
+        assert_eq!(result.len(), 1);
+    }
+
+    #[test]
+    fn forward_event_unknown_type_returns_empty() {
+        let event = json!({"type": "some_future_event", "data": 42});
+        let mut saw = false;
+        let mut text = String::new();
+        let mut reasoning = String::new();
+        let mut tc = vec![];
+        let mut usage = Map::new();
+        let mut model = String::new();
+        let result = apply_forward_llm_sse_event(
+            &event, &mut saw, &mut text, &mut reasoning, &mut tc, &mut usage, &mut model,
+        )
+        .unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn forward_event_warning_forwarded() {
+        let event = json!({"type": "warning", "message": "approaching limit"});
+        let mut saw = false;
+        let mut text = String::new();
+        let mut reasoning = String::new();
+        let mut tc = vec![];
+        let mut usage = Map::new();
+        let mut model = String::new();
+        let result = apply_forward_llm_sse_event(
+            &event, &mut saw, &mut text, &mut reasoning, &mut tc, &mut usage, &mut model,
+        )
+        .unwrap();
+        assert_eq!(result.len(), 1);
+    }
 }
