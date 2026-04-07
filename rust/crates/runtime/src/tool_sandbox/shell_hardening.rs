@@ -345,4 +345,117 @@ mod tests {
         assert!(is_dangerous_file_path("/home/user/.bashrc"));
         assert!(is_dangerous_file_path(".bashrc"));
     }
+
+    // --- scrub_secrets edge cases ---
+
+    #[test]
+    fn scrub_secrets_removes_password_variants() {
+        let mut env = HashMap::from([
+            ("DB_PASSWORD".into(), "secret".into()),
+            ("MY_SECRET_KEY".into(), "hidden".into()),
+            ("SSH_PRIVATE_KEY".into(), "pk".into()),
+            ("SAFE_VAR".into(), "ok".into()),
+        ]);
+        scrub_secrets_from_env(&mut env);
+        assert!(!env.contains_key("DB_PASSWORD"));
+        assert!(!env.contains_key("MY_SECRET_KEY"));
+        assert!(!env.contains_key("SSH_PRIVATE_KEY"));
+        assert!(env.contains_key("SAFE_VAR"));
+    }
+
+    #[test]
+    fn scrub_secrets_preserves_token_type_and_endpoint() {
+        let mut env = HashMap::from([
+            ("TOKEN_TYPE".into(), "bearer".into()),
+            ("TOKEN_ENDPOINT".into(), "https://auth.example.com".into()),
+        ]);
+        scrub_secrets_from_env(&mut env);
+        assert!(env.contains_key("TOKEN_TYPE"));
+        assert!(env.contains_key("TOKEN_ENDPOINT"));
+    }
+
+    #[test]
+    fn scrub_secrets_case_insensitive_heuristic() {
+        let mut env = HashMap::from([
+            ("my_secret".into(), "v1".into()),
+            ("My_Password".into(), "v2".into()),
+        ]);
+        scrub_secrets_from_env(&mut env);
+        assert!(!env.contains_key("my_secret"));
+        assert!(!env.contains_key("My_Password"));
+    }
+
+    #[test]
+    fn scrub_secrets_empty_env() {
+        let mut env = HashMap::new();
+        scrub_secrets_from_env(&mut env);
+        assert!(env.is_empty());
+    }
+
+    // --- is_dangerous_file_path edge cases ---
+
+    #[test]
+    fn dangerous_path_with_backslashes() {
+        // Windows-style paths should be normalized
+        assert!(is_dangerous_file_path("C:\\Users\\.ssh\\id_rsa"));
+    }
+
+    #[test]
+    fn dangerous_path_empty_string() {
+        assert!(!is_dangerous_file_path(""));
+    }
+
+    #[test]
+    fn dangerous_path_git_internal_nested() {
+        assert!(is_dangerous_file_path("repo/.git/config"));
+        assert!(is_dangerous_file_path(".git/HEAD"));
+    }
+
+    // --- build_hardened_command edge cases ---
+
+    #[test]
+    fn hardened_command_only_extglob() {
+        let config = ShellHardeningConfig {
+            disable_extglob: true,
+            reset_ifs: false,
+            redirect_stdin: false,
+            scrub_secrets: false,
+        };
+        let cmd = build_hardened_command(&config, "echo hello");
+        assert!(cmd.contains("extglob"));
+        assert!(!cmd.contains("IFS="));
+        assert!(!cmd.contains("< /dev/null"));
+    }
+
+    #[test]
+    fn hardened_command_only_ifs() {
+        let config = ShellHardeningConfig {
+            disable_extglob: false,
+            reset_ifs: true,
+            redirect_stdin: false,
+            scrub_secrets: false,
+        };
+        let cmd = build_hardened_command(&config, "ls");
+        assert!(cmd.contains("IFS="));
+        assert!(!cmd.contains("extglob"));
+    }
+
+    #[test]
+    fn stdin_redirect_skipped_for_herestring() {
+        let config = ShellHardeningConfig::default();
+        let cmd = build_hardened_command(&config, "cat <<< 'hello'");
+        assert!(!cmd.ends_with("< /dev/null"));
+    }
+
+    #[test]
+    fn stdin_redirect_skipped_for_pipe_chain() {
+        let config = ShellHardeningConfig {
+            disable_extglob: false,
+            reset_ifs: false,
+            redirect_stdin: true,
+            scrub_secrets: false,
+        };
+        let cmd = build_hardened_command(&config, "echo hello | grep hello");
+        assert!(!cmd.contains("< /dev/null"));
+    }
 }

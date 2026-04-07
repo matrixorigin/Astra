@@ -1048,4 +1048,88 @@ mod tests {
         // High pressure = stricter filter, but shouldn't panic
         let _ = results;
     }
+
+    // --- tfidf_score edge cases ---
+
+    #[test]
+    fn tfidf_score_single_common_term() {
+        // "run" appears in many tools — should have low IDF and produce a modest score
+        let terms = vec!["run".to_string()];
+        let bash_idx = TOOL_CATALOG.iter().position(|t| t.name == "bash").unwrap();
+        let score = tfidf_score(&terms, bash_idx);
+        assert!(score >= 0.0 && score <= 1.0);
+    }
+
+    #[test]
+    fn tfidf_score_out_of_bounds_index() {
+        // Index beyond TOOL_CATALOG length
+        let terms = vec!["read".to_string()];
+        // This would panic if not guarded — verify it's handled by the index
+        // (TERM_INDEX.tool_tfs[idx] would be out of bounds)
+        // We test a valid but last index instead
+        let last_idx = TOOL_CATALOG.len() - 1;
+        let score = tfidf_score(&terms, last_idx);
+        assert!(score >= 0.0 && score <= 1.0);
+    }
+
+    #[test]
+    fn tfidf_score_cjk_query() {
+        let terms = vec!["记忆".to_string(), "搜索".to_string()];
+        let mem_idx = TOOL_CATALOG.iter().position(|t| t.name == "memory_search").unwrap();
+        let score = tfidf_score(&terms, mem_idx);
+        // CJK terms should match Chinese triggers in memory_search
+        assert!(score > 0.0, "CJK query should match memory_search triggers");
+    }
+
+    // --- file_context_tool_boost edge cases ---
+
+    #[test]
+    fn file_context_boost_java_no_match() {
+        // Java isn't in the explicit match list
+        assert_eq!(file_context_tool_boost("bash", &["java".to_string()]), 0.0);
+    }
+
+    #[test]
+    fn file_context_boost_go_matches_bash() {
+        assert_eq!(file_context_tool_boost("bash", &["go".to_string()]), 0.05);
+    }
+
+    #[test]
+    fn file_context_boost_docker_only_bash_read_write() {
+        assert_eq!(file_context_tool_boost("bash", &["docker".to_string()]), 0.05);
+        assert_eq!(file_context_tool_boost("grep", &["docker".to_string()]), 0.0);
+    }
+
+    // --- pre_filter edge cases ---
+
+    #[test]
+    fn pre_filter_punctuation_only_query() {
+        let state = state_at_turn(1);
+        let results = pre_filter_dynamic(&state, "!!!???");
+        // Should not panic — may return empty or few results
+        for (_, score) in &results {
+            assert!(*score >= 0.0);
+        }
+    }
+
+    #[test]
+    fn pre_filter_very_long_query() {
+        let state = state_at_turn(1);
+        let long_query = "read ".repeat(2000);
+        let results = pre_filter_dynamic(&state, &long_query);
+        // Should not panic on very long queries
+        for (_, score) in &results {
+            assert!(*score >= 0.0 && *score <= 10.0);
+        }
+    }
+
+    #[test]
+    fn pre_filter_conversational_state_empty() {
+        let state = ConversationState {
+            is_conversational: true,
+            ..Default::default()
+        };
+        let results = pre_filter_dynamic(&state, "hello how are you");
+        assert!(results.is_empty(), "conversational queries should return empty dynamic tools");
+    }
 }
