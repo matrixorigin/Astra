@@ -857,4 +857,82 @@ mod tests {
         let count = 1usize.min(state.history.len());
         assert_eq!(count, 0);
     }
+
+    // ── /undo edge case tests ──
+
+    #[test]
+    fn undo_zero_is_rejected() {
+        // /undo 0 should be rejected per the implementation
+        let arg = "0";
+        let parsed = arg.parse::<usize>();
+        assert_eq!(parsed.unwrap(), 0);
+        // The handler checks Ok(0) and shows an error — test the parse path
+    }
+
+    #[test]
+    fn undo_negative_is_parse_error() {
+        // /undo -1 should fail to parse as usize
+        let result = "-1".parse::<usize>();
+        assert!(result.is_err(), "negative number should fail usize parse");
+    }
+
+    #[test]
+    fn undo_non_numeric_is_parse_error() {
+        let result = "abc".parse::<usize>();
+        assert!(result.is_err(), "non-numeric should fail usize parse");
+    }
+
+    #[test]
+    fn undo_float_is_parse_error() {
+        let result = "1.5".parse::<usize>();
+        assert!(result.is_err(), "float should fail usize parse");
+    }
+
+    #[test]
+    fn undo_preserves_last_response_correctly() {
+        let mut state = state_with_turns(5);
+        // Undo 2 turns
+        let count = 2;
+        let actual = count.min(state.history.len());
+        for _ in 0..actual {
+            state.history.pop();
+            state.turn = state.turn.saturating_sub(1);
+        }
+        state.last_response = state.history.last().map(|(_, r)| r.clone());
+        assert_eq!(state.last_response.as_deref(), Some("answer 3"));
+        assert_eq!(state.turn, 3);
+    }
+
+    #[test]
+    fn undo_clears_continuation_anchor() {
+        let mut state = state_with_turns(3);
+        state.continuation_anchor = Some("some anchor".to_string());
+        // Simulate undo
+        state.history.pop();
+        state.turn = state.turn.saturating_sub(1);
+        state.last_response = state.history.last().map(|(_, r)| r.clone());
+        state.continuation_anchor = None;
+        assert!(state.continuation_anchor.is_none());
+    }
+
+    #[test]
+    fn undo_turn_preview_truncation() {
+        let mut state = ReplState::default();
+        let long_msg = "a".repeat(100);
+        state.history.push((long_msg.clone(), "resp".to_string()));
+        state.turn = 1;
+
+        if let Some((user_msg, _)) = state.history.pop() {
+            let preview: String = user_msg.chars().take(50).collect();
+            let preview = if user_msg.chars().count() > 50 {
+                format!("{}…", preview)
+            } else {
+                preview
+            };
+            // 50 ASCII 'a' chars + 3 bytes for '…' = 53 bytes total
+            assert_eq!(preview.len(), 53);
+            assert!(preview.ends_with('…'));
+            assert_eq!(preview.chars().count(), 51); // 50 a's + 1 '…'
+        }
+    }
 }

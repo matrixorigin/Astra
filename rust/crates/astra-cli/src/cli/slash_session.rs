@@ -1207,4 +1207,167 @@ mod export_tests {
         assert!(block.contains("</details>"));
         assert!(block.contains("`grep` ✓ (10ms) — pattern in src/"));
     }
+
+    // ── /export edge case tests ──
+
+    #[test]
+    fn build_export_empty_events_only_header() {
+        let md = build_export_markdown("empty-sid", &[]);
+        assert!(md.contains("# Session: empty-sid"));
+        // Should not contain any section headers
+        assert!(!md.contains("## Session Start"));
+        assert!(!md.contains("### Turn"));
+    }
+
+    #[test]
+    fn build_export_turn_error_event() {
+        let evt = evt_from_json(serde_json::json!({
+            "type": "turn_error",
+            "ts": "2025-01-15T10:31:00Z",
+            "turn": 3,
+            "error": "rate limit exceeded",
+        }));
+        let md = build_export_markdown("sid", &[evt]);
+        assert!(md.contains("Turn 3 ❌ Error"));
+        assert!(md.contains("rate limit exceeded"));
+    }
+
+    #[test]
+    fn build_export_compact_event() {
+        let evt = evt_from_json(serde_json::json!({
+            "type": "compact",
+            "ts": "2025-01-15T10:35:00Z",
+            "turns_compacted": 8,
+            "facts_stored": 2,
+        }));
+        let md = build_export_markdown("sid", &[evt]);
+        assert!(md.contains("### Compact"));
+        assert!(md.contains("Turns compacted:** 8"));
+        assert!(md.contains("Facts stored:** 2"));
+    }
+
+    #[test]
+    fn build_export_config_change_event() {
+        let evt = evt_from_json(serde_json::json!({
+            "type": "config_change",
+            "ts": "2025-01-15T10:33:00Z",
+            "config_key": "model",
+            "config_value": "gpt-4o-mini",
+        }));
+        let md = build_export_markdown("sid", &[evt]);
+        assert!(md.contains("⚙️"));
+        assert!(md.contains("model → gpt-4o-mini"));
+    }
+
+    #[test]
+    fn build_export_session_end_event() {
+        let evt = evt_from_json(serde_json::json!({
+            "type": "session_end",
+            "ts": "2025-01-15T11:00:00Z",
+            "turn": 15,
+        }));
+        let md = build_export_markdown("sid", &[evt]);
+        assert!(md.contains("## Session End"));
+        assert!(md.contains("Total turns:** 15"));
+    }
+
+    #[test]
+    fn build_export_sync_marker_event() {
+        let evt = evt_from_json(serde_json::json!({
+            "type": "sync_marker",
+            "ts": "2025-01-15T10:40:00Z",
+            "user_input": "manual checkpoint",
+        }));
+        let md = build_export_markdown("sid", &[evt]);
+        assert!(md.contains("### Sync marker"));
+        assert!(md.contains("manual checkpoint"));
+    }
+
+    #[test]
+    fn build_export_non_ascii_content_preserved() {
+        let evt = evt_from_json(serde_json::json!({
+            "type": "turn",
+            "ts": "2025-01-15T10:31:00Z",
+            "turn": 1,
+            "user_input": "请帮我修改代码 🔧",
+            "assistant_output": "好的，我已经修改了。",
+        }));
+        let md = build_export_markdown("sid", &[evt]);
+        assert!(md.contains("请帮我修改代码 🔧"));
+        assert!(md.contains("好的，我已经修改了。"));
+    }
+
+    #[test]
+    fn build_export_multiple_event_types_in_order() {
+        let events = vec![
+            evt_from_json(serde_json::json!({
+                "type": "session_start",
+                "ts": "2025-01-15T10:30:00Z",
+                "model": "gpt-4o",
+            })),
+            evt_from_json(serde_json::json!({
+                "type": "turn",
+                "ts": "2025-01-15T10:31:00Z",
+                "turn": 1,
+                "user_input": "hello",
+                "assistant_output": "world",
+            })),
+            evt_from_json(serde_json::json!({
+                "type": "turn_error",
+                "ts": "2025-01-15T10:32:00Z",
+                "turn": 2,
+                "error": "timeout",
+            })),
+            evt_from_json(serde_json::json!({
+                "type": "compact",
+                "ts": "2025-01-15T10:33:00Z",
+                "turns_compacted": 5,
+                "facts_stored": 1,
+            })),
+            evt_from_json(serde_json::json!({
+                "type": "session_end",
+                "ts": "2025-01-15T11:00:00Z",
+                "turn": 10,
+            })),
+        ];
+        let md = build_export_markdown("multi", &events);
+        // Check order: session_start before turns before session_end
+        let start_pos = md.find("## Session Start").unwrap();
+        let turn_pos = md.find("### Turn 1").unwrap();
+        let error_pos = md.find("Turn 2 ❌").unwrap();
+        let compact_pos = md.find("### Compact").unwrap();
+        let end_pos = md.find("## Session End").unwrap();
+        assert!(start_pos < turn_pos);
+        assert!(turn_pos < error_pos);
+        assert!(error_pos < compact_pos);
+        assert!(compact_pos < end_pos);
+    }
+
+    #[test]
+    fn build_export_turn_with_empty_user_input_omits_user() {
+        let evt = evt_from_json(serde_json::json!({
+            "type": "turn",
+            "ts": "2025-01-15T10:31:00Z",
+            "turn": 1,
+            "user_input": "",
+            "assistant_output": "some output",
+        }));
+        let md = build_export_markdown("sid", &[evt]);
+        assert!(!md.contains("**User:**"));
+        assert!(md.contains("**Assistant:**"));
+    }
+
+    #[test]
+    fn build_export_ts_truncation() {
+        // Timestamps longer than 19 chars are truncated
+        let evt = evt_from_json(serde_json::json!({
+            "type": "session_start",
+            "ts": "2025-01-15T10:30:00.123456789Z",
+            "model": "test",
+        }));
+        let md = build_export_markdown("sid", &[evt]);
+        assert!(md.contains("2025-01-15T10:30:00"));
+        // Should not include the fractional seconds
+        assert!(!md.contains(".123456789Z"));
+    }
 }

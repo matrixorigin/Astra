@@ -2485,4 +2485,98 @@ mod tests {
         let kept = select_turns_for_compaction(&history, 6, "anything");
         assert_eq!(kept.len(), 2, "should keep all when history < budget");
     }
+
+    #[test]
+    fn select_turns_budget_equals_total_keeps_all() {
+        let history: Vec<(String, String)> = (0..6)
+            .map(|i| (format!("q{i}"), format!("a{i}")))
+            .collect();
+        let kept = select_turns_for_compaction(&history, 6, "anything");
+        assert_eq!(kept.len(), 6, "budget == total should keep all");
+    }
+
+    #[test]
+    fn select_turns_budget_one_keeps_last() {
+        let history: Vec<(String, String)> = vec![
+            ("old question".into(), "old answer".into()),
+            ("recent question".into(), "recent answer".into()),
+            ("latest question".into(), "latest answer".into()),
+        ];
+        let kept = select_turns_for_compaction(&history, 1, "irrelevant");
+        assert_eq!(kept.len(), 1, "budget=1 should keep exactly 1 turn");
+        assert_eq!(*kept.last().unwrap(), 2, "should keep the very last turn");
+    }
+
+    #[test]
+    fn select_turns_all_zero_scores_only_recent() {
+        // No overlap at all between context and older turns
+        let history: Vec<(String, String)> = vec![
+            ("alpha beta gamma".into(), "one two three".into()),
+            ("delta epsilon zeta".into(), "four five six".into()),
+            ("eta theta iota".into(), "seven eight nine".into()),
+            ("recent turn A".into(), "response A".into()),
+            ("recent turn B".into(), "response B".into()),
+        ];
+        let kept = select_turns_for_compaction(&history, 4, "completely unrelated xylophone");
+        // Should keep 2 recent (budget/2) + 0 relevant older = 2 recent minimum
+        // But min_recent = max(4/2, 2) = 2, so keeps turns 3,4
+        // relevance_slots = 2, but all scores are 0, so none added
+        assert!(
+            kept.len() <= 4,
+            "should respect budget even with zero scores: {kept:?}"
+        );
+        assert!(
+            kept.contains(&3) && kept.contains(&4),
+            "must keep the most recent turns: {kept:?}"
+        );
+    }
+
+    #[test]
+    fn select_turns_tied_scores_deterministic() {
+        // Two older turns with identical overlap
+        let history: Vec<(String, String)> = vec![
+            ("deploy kubernetes".into(), "done".into()),
+            ("deploy kubernetes".into(), "done again".into()),
+            ("filler unrelated".into(), "filler response".into()),
+            ("recent turn".into(), "recent response".into()),
+        ];
+        let kept1 = select_turns_for_compaction(&history, 3, "deploy kubernetes cluster");
+        let kept2 = select_turns_for_compaction(&history, 3, "deploy kubernetes cluster");
+        assert_eq!(kept1, kept2, "tied scores should produce deterministic results");
+    }
+
+    #[test]
+    fn tokenize_for_relevance_cjk_characters() {
+        // CJK characters are alphanumeric, should be tokenized
+        let tokens = tokenize_for_relevance("数据库 迁移 schema");
+        assert!(tokens.contains("数据库"), "should tokenize CJK words");
+        assert!(tokens.contains("迁移"));
+        assert!(tokens.contains("schema"));
+    }
+
+    #[test]
+    fn tokenize_for_relevance_hyphenated_words() {
+        let tokens = tokenize_for_relevance("auto-approve real-time");
+        // Hyphens are kept in tokenizer (not split on)
+        assert!(tokens.contains("auto-approve") || tokens.contains("auto"));
+    }
+
+    #[test]
+    fn score_turn_relevance_empty_query_returns_zero() {
+        let empty_tokens = tokenize_for_relevance("");
+        let turn = ("some content here".into(), "and more content".into());
+        let score = score_turn_relevance(&turn, &empty_tokens);
+        assert_eq!(score, 0.0, "empty query should score 0");
+    }
+
+    #[test]
+    fn select_turns_empty_context_still_works() {
+        let history: Vec<(String, String)> = (0..10)
+            .map(|i| (format!("question {i}"), format!("answer {i}")))
+            .collect();
+        let kept = select_turns_for_compaction(&history, 4, "");
+        // With empty context, only recent turns kept
+        assert!(kept.len() <= 4);
+        assert!(kept.contains(&9), "must keep latest turn");
+    }
 }
