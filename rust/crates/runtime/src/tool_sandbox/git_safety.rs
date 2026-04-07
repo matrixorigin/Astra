@@ -480,4 +480,63 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         assert!(!is_bare_git_repo(dir.path()));
     }
+
+    // --- validate_git_command edge cases ---
+
+    #[test]
+    fn non_git_command_returns_empty() {
+        let violations = validate_git_command("echo hello");
+        assert!(violations.is_empty());
+    }
+
+    #[test]
+    fn empty_command_returns_empty() {
+        let violations = validate_git_command("");
+        assert!(violations.is_empty());
+    }
+
+    #[test]
+    fn git_with_path_prefix_detected() {
+        let violations = validate_git_command("/usr/bin/git push --force");
+        assert!(violations.iter().any(|v| matches!(v, GitSafetyViolation::ForcePush)));
+    }
+
+    #[test]
+    fn force_with_lease_is_force_push() {
+        let violations = validate_git_command("git push --force-with-lease");
+        assert!(violations.iter().any(|v| matches!(v, GitSafetyViolation::ForcePush)));
+    }
+
+    #[test]
+    fn multiple_violations_in_one_command() {
+        let violations = validate_git_command("git commit --amend --no-verify");
+        assert!(violations.len() >= 2, "should detect both amend and no-verify");
+    }
+
+    #[test]
+    fn git_config_env_flag_blocked() {
+        let violations = validate_git_command("git --config-env=core.editor=EDITOR commit");
+        assert!(violations.iter().any(|v| matches!(v, GitSafetyViolation::GitExecPathFlag)));
+    }
+
+    #[test]
+    fn violation_display_all_variants() {
+        // Ensure Display impl doesn't panic for any variant
+        let violations = vec![
+            GitSafetyViolation::CommitMessageInjection { pattern: "$()" },
+            GitSafetyViolation::CommitMessageDash,
+            GitSafetyViolation::HookSkipFlag { flag: "--no-verify" },
+            GitSafetyViolation::ForcePush,
+            GitSafetyViolation::ForcePushProtectedBranch { branch: "main".into() },
+            GitSafetyViolation::CdGitCompound,
+            GitSafetyViolation::GitConfigFlag,
+            GitSafetyViolation::GitExecPathFlag,
+            GitSafetyViolation::CommitAmend,
+            GitSafetyViolation::BareRepoDetected,
+        ];
+        for v in &violations {
+            let msg = format!("{v}");
+            assert!(!msg.is_empty());
+        }
+    }
 }
