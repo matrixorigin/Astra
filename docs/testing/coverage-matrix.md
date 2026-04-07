@@ -29,6 +29,8 @@ Legend: **E2E** = `rust/crates/runtime/tests/system_matrix_http_e2e/` with `ASTR
 | Marketplace probe | `journey_full` | `marketplace_contract` |
 | Data versioning lineage | `journey_full` | `data_versioning_contract` |
 | Replay compare | `journey_full` | `replay_contract` |
+| `POST /chat/route` (shape + auth path) | `journey_full` + unit tests in `runtime/src/server/chat_route.rs` | `chat_route_contract` |
+| `GET /models` (authenticated list) | `journey_full` | — (admin create/update/delete still `model_crud_contract` stub) |
 
 ## Large integration binaries (audit — not removed in this pass)
 

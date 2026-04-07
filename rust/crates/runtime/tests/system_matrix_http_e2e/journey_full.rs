@@ -953,6 +953,17 @@ pub async fn run_product_matrix_full_journey(
     )
     .await;
     assert_eq!(st_route, StatusCode::OK, "chat/route: {route_j}");
+    assert!(
+        route_j.get("tool_filter").is_some() && route_j.get("task_type").is_some(),
+        "chat/route shape: {route_j}"
+    );
+
+    let (st_models, models_j) = get_json(app, "/models", Some(auth_header.as_str()), &[]).await;
+    assert_eq!(st_models, StatusCode::OK, "list models: {models_j}");
+    assert!(
+        models_j.as_array().is_some(),
+        "GET /models should return array: {models_j}"
+    );
 
     let (st_sig, sig) = get_json(
         app,
