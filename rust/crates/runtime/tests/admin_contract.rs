@@ -515,84 +515,58 @@ async fn admin_token_create_matches_shared_contract() {
 }
 
 #[tokio::test]
-async fn admin_prompt_optimize_matches_shared_contract() {
+async fn admin_async_jobs_match_shared_contract() {
     let contract = load_contract();
+    let app = build_app_with_admin();
+    let auth = &[("authorization", "Bearer admin-token")];
 
-    let (status, json) = post_json(
-        build_app_with_admin(),
-        "/admin/prompts/optimize",
-        &[("authorization", "Bearer admin-token")],
-        contract.admin_prompt_optimize.request.clone(),
-    )
-    .await;
-
-    assert_eq!(status.as_u16(), contract.admin_prompt_optimize.status);
-    assert_eq!(
-        json["status"],
-        contract.admin_prompt_optimize.json["status"]
-    );
-    assert_eq!(
-        json["message"],
-        contract.admin_prompt_optimize.json["message"]
-    );
-    assert!(Uuid::parse_str(json["job_id"].as_str().unwrap()).is_ok());
+    for (label, path, q, detail_key) in [
+        (
+            "prompt_optimize",
+            "/admin/prompts/optimize",
+            &contract.admin_prompt_optimize,
+            "message",
+        ),
+        (
+            "feedback_export",
+            "/admin/feedback/export",
+            &contract.admin_feedback_export,
+            "download_url",
+        ),
+    ] {
+        let (status, json) = post_json(app.clone(), path, auth, q.request.clone()).await;
+        assert_eq!(status.as_u16(), q.status, "{label}");
+        assert_eq!(json["status"], q.json["status"], "{label}");
+        assert_eq!(json[detail_key], q.json[detail_key], "{label}");
+        assert!(
+            Uuid::parse_str(json["job_id"].as_str().unwrap()).is_ok(),
+            "{label}"
+        );
+    }
 }
 
 #[tokio::test]
-async fn admin_feedback_export_matches_shared_contract() {
+async fn admin_feedback_stats_variants_match_shared_contract() {
     let contract = load_contract();
+    let app = build_app_with_admin();
+    let auth = &[("authorization", "Bearer admin-token")];
 
-    let (status, json) = post_json(
-        build_app_with_admin(),
-        "/admin/feedback/export",
-        &[("authorization", "Bearer admin-token")],
-        contract.admin_feedback_export.request.clone(),
-    )
-    .await;
-
-    assert_eq!(status.as_u16(), contract.admin_feedback_export.status);
-    assert_eq!(
-        json["status"],
-        contract.admin_feedback_export.json["status"]
-    );
-    assert_eq!(
-        json["download_url"],
-        contract.admin_feedback_export.json["download_url"]
-    );
-    assert!(Uuid::parse_str(json["job_id"].as_str().unwrap()).is_ok());
-}
-
-#[tokio::test]
-async fn admin_feedback_stats_matches_shared_contract() {
-    let contract = load_contract();
-
-    let (status, json) = read_json(
-        build_app_with_admin(),
-        "/admin/feedback/stats?agent_id=contract-agent",
-        &[("authorization", "Bearer admin-token")],
-    )
-    .await;
-
-    assert_eq!(status.as_u16(), contract.admin_feedback_stats.status);
-    assert_eq!(json, contract.admin_feedback_stats.json);
-}
-
-#[tokio::test]
-async fn admin_feedback_stats_filtered_matches_shared_contract() {
-    let contract = load_contract();
-
-    let (status, json) = read_json(
-        build_app_with_admin(),
-        "/admin/feedback/stats?agent_id=contract-agent&since=2026-01-04%2000:00:00",
-        &[("authorization", "Bearer admin-token")],
-    )
-    .await;
-
-    assert_eq!(
-        status.as_u16(),
-        contract.admin_feedback_stats_filtered.status
-    );
-    assert_eq!(json, contract.admin_feedback_stats_filtered.json);
+    for (label, path, expected) in [
+        (
+            "default",
+            "/admin/feedback/stats?agent_id=contract-agent",
+            &contract.admin_feedback_stats,
+        ),
+        (
+            "filtered",
+            "/admin/feedback/stats?agent_id=contract-agent&since=2026-01-04%2000:00:00",
+            &contract.admin_feedback_stats_filtered,
+        ),
+    ] {
+        let (status, json) = read_json(app.clone(), path, auth).await;
+        assert_eq!(status.as_u16(), expected.status, "{label}");
+        assert_eq!(json, expected.json, "{label}");
+    }
 }
 
 #[tokio::test]
@@ -644,61 +618,41 @@ async fn admin_role_revoke_variants_match_shared_contract() {
 }
 
 #[tokio::test]
-async fn admin_tokens_match_shared_contract() {
+async fn admin_tokens_variants_match_shared_contract() {
     let contract = load_contract();
+    let app = build_app_with_admin();
+    let auth = &[("authorization", "Bearer admin-token")];
 
-    let (status, json) = read_json(
-        build_app_with_admin(),
-        "/admin/tokens",
-        &[("authorization", "Bearer admin-token")],
-    )
-    .await;
-
-    assert_eq!(status.as_u16(), contract.admin_tokens.status);
-    assert_eq!(json, contract.admin_tokens.json);
+    for (label, path, expected) in [
+        ("all", "/admin/tokens", &contract.admin_tokens),
+        (
+            "llm_global",
+            "/admin/tokens?token_type=llm&scope=global",
+            &contract.admin_tokens_llm_global,
+        ),
+    ] {
+        let (status, json) = read_json(app.clone(), path, auth).await;
+        assert_eq!(status.as_u16(), expected.status, "{label}");
+        assert_eq!(json, expected.json, "{label}");
+    }
 }
 
 #[tokio::test]
-async fn admin_tokens_filters_match_shared_contract() {
+async fn admin_audit_variants_match_shared_contract() {
     let contract = load_contract();
+    let app = build_app_with_admin();
+    let auth = &[("authorization", "Bearer admin-token")];
 
-    let (status, json) = read_json(
-        build_app_with_admin(),
-        "/admin/tokens?token_type=llm&scope=global",
-        &[("authorization", "Bearer admin-token")],
-    )
-    .await;
-
-    assert_eq!(status.as_u16(), contract.admin_tokens_llm_global.status);
-    assert_eq!(json, contract.admin_tokens_llm_global.json);
-}
-
-#[tokio::test]
-async fn admin_audit_matches_shared_contract() {
-    let contract = load_contract();
-
-    let (status, json) = read_json(
-        build_app_with_admin(),
-        "/admin/audit",
-        &[("authorization", "Bearer admin-token")],
-    )
-    .await;
-
-    assert_eq!(status.as_u16(), contract.admin_audit.status);
-    assert_eq!(json, contract.admin_audit.json);
-}
-
-#[tokio::test]
-async fn admin_audit_filters_match_shared_contract() {
-    let contract = load_contract();
-
-    let (status, json) = read_json(
-        build_app_with_admin(),
-        "/admin/audit?user_id=contract-audit-user&limit=1",
-        &[("authorization", "Bearer admin-token")],
-    )
-    .await;
-
-    assert_eq!(status.as_u16(), contract.admin_audit_user_filtered.status);
-    assert_eq!(json, contract.admin_audit_user_filtered.json);
+    for (label, path, expected) in [
+        ("default", "/admin/audit", &contract.admin_audit),
+        (
+            "user_filtered",
+            "/admin/audit?user_id=contract-audit-user&limit=1",
+            &contract.admin_audit_user_filtered,
+        ),
+    ] {
+        let (status, json) = read_json(app.clone(), path, auth).await;
+        assert_eq!(status.as_u16(), expected.status, "{label}");
+        assert_eq!(json, expected.json, "{label}");
+    }
 }
