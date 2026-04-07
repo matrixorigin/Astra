@@ -53,10 +53,17 @@ pub(super) async fn handle_mcp_command(arg: &str, state: &ReplState) -> Result<(
                 "  Usage: /mcp prompt <server>:<name> [arg1 arg2 ...]".dim()
             );
         }
+        s if s.starts_with("complete ") => handle_mcp_complete(&s[9..], state).await,
+        "complete" => {
+            eprintln!("{}", "  Usage: /mcp complete <server>:<prompt|resource> <arg_name> [partial_value]".dim());
+            eprintln!("{}", "  Examples:".dim());
+            eprintln!("{}", "    /mcp complete myserver:prompt:deploy env pr".dim());
+            eprintln!("{}", "    /mcp complete myserver:resource:file://path arg val".dim());
+        }
         _ => {
             eprintln!(
                 "{}",
-                format!("  Unknown /mcp subcommand: '{sub}'. Try /mcp, /mcp add, /mcp remove, /mcp servers, /mcp prompts, /mcp resources, /mcp prompt, /mcp resource")
+                format!("  Unknown /mcp subcommand: '{sub}'. Try /mcp, /mcp add, /mcp remove, /mcp servers, /mcp prompts, /mcp resources, /mcp prompt, /mcp resource, /mcp complete")
                     .yellow()
             );
         }
@@ -875,6 +882,73 @@ fn format_duration(d: std::time::Duration) -> String {
         format!("{}m {}s", secs / 60, secs % 60)
     } else {
         format!("{}h {}m", secs / 3600, (secs % 3600) / 60)
+    }
+}
+
+/// Handle `/mcp complete <server>:<ref_type>:<name> <arg_name> [partial_value]`
+///
+/// ref_type is "prompt" or "resource".
+async fn handle_mcp_complete(arg: &str, state: &ReplState) {
+    let parts: Vec<&str> = arg.split_whitespace().collect();
+    if parts.len() < 2 {
+        eprintln!(
+            "{}",
+            "  Usage: /mcp complete <server>:prompt:<name> <arg_name> [partial_value]".dim()
+        );
+        return;
+    }
+
+    // Parse server:ref_type:name
+    let spec = parts[0];
+    let segments: Vec<&str> = spec.splitn(3, ':').collect();
+    if segments.len() < 3 {
+        eprintln!(
+            "{}",
+            "  Expected format: <server>:prompt:<name> or <server>:resource:<uri>".yellow()
+        );
+        return;
+    }
+    let (server, ref_type, ref_name) = (segments[0], segments[1], segments[2]);
+
+    let reference = match ref_type {
+        "prompt" => rmcp::model::Reference::for_prompt(ref_name),
+        "resource" => rmcp::model::Reference::for_resource(ref_name),
+        _ => {
+            eprintln!(
+                "{}",
+                format!("  Unknown reference type '{ref_type}'. Use 'prompt' or 'resource'.")
+                    .yellow()
+            );
+            return;
+        }
+    };
+
+    let arg_name = parts[1];
+    let arg_value = if parts.len() > 2 { parts[2] } else { "" };
+
+    let manager = state.mcp_manager.read().await;
+    match manager.complete(server, reference, arg_name, arg_value).await {
+        Ok(result) => {
+            if result.completion.values.is_empty() {
+                eprintln!("{}", "  No completions available.".dim());
+            } else {
+                for val in &result.completion.values {
+                    eprintln!("  {val}");
+                }
+                if let Some(total) = result.completion.total {
+                    let shown = result.completion.values.len();
+                    if (total as usize) > shown {
+                        eprintln!("{}", format!("  ({shown} of {total} shown)").dim());
+                    }
+                }
+                if result.completion.has_more_results() {
+                    eprintln!("{}", "  (more results available)".dim());
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!("{}", format!("  Completion failed: {e}").red());
+        }
     }
 }
 

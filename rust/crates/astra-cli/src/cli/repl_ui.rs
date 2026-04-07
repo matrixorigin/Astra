@@ -266,6 +266,7 @@ const SLASH_FIRST_TOKEN_COMPLETIONS: &[(&str, &[(&str, &str)])] = &[
                 "Unsubscribe: /mcp unsubscribe <server>:<uri>",
             ),
             ("log-level", "Set level: /mcp log-level <server> <level>"),
+            ("complete", "Completions: /mcp complete <server>:prompt:<name> <arg> [value]"),
         ],
     ),
     (

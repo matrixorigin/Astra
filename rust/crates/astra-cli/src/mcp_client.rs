@@ -35,10 +35,11 @@ use std::time::Instant;
 use rmcp::{
     ClientHandler, Peer, RoleClient,
     model::{
-        CallToolRequestParams, CallToolResult, CreateElicitationRequestParams,
-        CreateElicitationResult, CreateMessageRequestParams, CreateMessageResult,
-        ElicitationAction, ErrorData as McpHandlerError, GetPromptRequestParams, GetPromptResult,
-        ListRootsResult, LoggingLevel, Prompt, ReadResourceRequestParams, Resource, Role, Root,
+        ArgumentInfo, CallToolRequestParams, CallToolResult, CompleteRequestParams, CompleteResult,
+        CreateElicitationRequestParams, CreateElicitationResult,
+        CreateMessageRequestParams, CreateMessageResult, ElicitationAction,
+        ErrorData as McpHandlerError, GetPromptRequestParams, GetPromptResult, ListRootsResult,
+        LoggingLevel, Prompt, ReadResourceRequestParams, Reference, Resource, Role, Root,
         SamplingMessage, SamplingMessageContent, SetLevelRequestParams, SubscribeRequestParams,
         Tool, UnsubscribeRequestParams,
     },
@@ -836,6 +837,23 @@ impl McpConnection {
         }
         self.peer.get_prompt(params).await
     }
+
+    /// Request argument completions from the server.
+    pub async fn complete(
+        &self,
+        reference: Reference,
+        argument_name: &str,
+        argument_value: &str,
+    ) -> Result<CompleteResult, ServiceError> {
+        let params = CompleteRequestParams::new(
+            reference,
+            ArgumentInfo {
+                name: argument_name.to_string(),
+                value: argument_value.to_string(),
+            },
+        );
+        self.peer.complete(params).await
+    }
 }
 
 /// MCP client manager for multiple server connections.
@@ -1153,6 +1171,23 @@ impl McpClientManager {
                     .map_err(McpError::Service)
             }
         }
+    }
+
+    /// Request argument completions from a specific server.
+    pub async fn complete(
+        &self,
+        server: &str,
+        reference: Reference,
+        argument_name: &str,
+        argument_value: &str,
+    ) -> Result<CompleteResult, McpError> {
+        let conn = self
+            .connections
+            .get(server)
+            .ok_or_else(|| McpError::ServerNotConnected(server.to_string()))?;
+        conn.complete(reference, argument_name, argument_value)
+            .await
+            .map_err(McpError::Service)
     }
 
     /// Number of active connections.
@@ -2895,5 +2930,64 @@ mcp_servers:
         let rt = tokio::runtime::Runtime::new().unwrap();
         let roots = rt.block_on(manager.roots().read());
         assert!(roots.is_empty());
+    }
+
+    // ── Completions Tests ────────────────────────────────────────────────
+
+    #[test]
+    fn complete_request_params_prompt() {
+        use rmcp::model::{ArgumentInfo, CompleteRequestParams, Reference};
+        let params = CompleteRequestParams::new(
+            Reference::for_prompt("deploy"),
+            ArgumentInfo {
+                name: "env".to_string(),
+                value: "pro".to_string(),
+            },
+        );
+        let json = serde_json::to_value(&params).unwrap();
+        assert_eq!(json["ref"]["type"], "ref/prompt");
+        assert_eq!(json["ref"]["name"], "deploy");
+        assert_eq!(json["argument"]["name"], "env");
+        assert_eq!(json["argument"]["value"], "pro");
+    }
+
+    #[test]
+    fn complete_request_params_resource() {
+        use rmcp::model::{ArgumentInfo, CompleteRequestParams, Reference};
+        let params = CompleteRequestParams::new(
+            Reference::for_resource("file:///workspace"),
+            ArgumentInfo {
+                name: "path".to_string(),
+                value: "/src".to_string(),
+            },
+        );
+        let json = serde_json::to_value(&params).unwrap();
+        assert_eq!(json["ref"]["type"], "ref/resource");
+        assert_eq!(json["ref"]["uri"], "file:///workspace");
+    }
+
+    #[test]
+    fn complete_result_roundtrip() {
+        use rmcp::model::{CompleteResult, CompletionInfo};
+        let info = CompletionInfo::with_all_values(vec![
+            "production".to_string(),
+            "preview".to_string(),
+        ])
+        .unwrap();
+        let result = CompleteResult::new(info);
+        let json = serde_json::to_string(&result).unwrap();
+        let back: CompleteResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.completion.values, vec!["production", "preview"]);
+        assert!(!back.completion.has_more_results());
+    }
+
+    #[test]
+    fn completion_info_max_values() {
+        use rmcp::model::CompletionInfo;
+        let too_many: Vec<String> = (0..101).map(|i| format!("v{i}")).collect();
+        assert!(CompletionInfo::new(too_many).is_err());
+
+        let ok: Vec<String> = (0..100).map(|i| format!("v{i}")).collect();
+        assert!(CompletionInfo::new(ok).is_ok());
     }
 }
