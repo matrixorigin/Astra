@@ -1728,4 +1728,49 @@ mod config_cli_tests {
         let final_val: serde_json::Value = serde_json::from_str(&content).unwrap();
         assert_eq!(final_val["key"], "v2");
     }
+
+    // Helper matching config_set's value parsing logic
+    fn parse_value(value: &str) -> serde_json::Value {
+        match value {
+            "true" => serde_json::Value::Bool(true),
+            "false" => serde_json::Value::Bool(false),
+            v if v.parse::<f64>().is_ok() && !v.contains(|c: char| c.is_alphabetic()) => {
+                if let Ok(n) = v.parse::<i64>() {
+                    serde_json::Value::Number(n.into())
+                } else {
+                    serde_json::Value::String(v.to_string())
+                }
+            }
+            v => serde_json::Value::String(v.to_string()),
+        }
+    }
+
+    #[test]
+    fn config_value_parsing_booleans() {
+        assert_eq!(parse_value("true"), serde_json::Value::Bool(true));
+        assert_eq!(parse_value("false"), serde_json::Value::Bool(false));
+    }
+
+    #[test]
+    fn config_value_parsing_integers() {
+        assert_eq!(parse_value("42"), serde_json::Value::Number(42.into()));
+        assert_eq!(parse_value("0"), serde_json::Value::Number(0.into()));
+        assert_eq!(parse_value("-1"), serde_json::Value::Number((-1).into()));
+    }
+
+    #[test]
+    fn config_value_parsing_strings() {
+        assert_eq!(parse_value("gpt-4o"), serde_json::Value::String("gpt-4o".into()));
+        assert_eq!(parse_value(""), serde_json::Value::String("".into()));
+    }
+
+    #[test]
+    fn known_settings_has_default_model() {
+        assert!(KNOWN_SETTINGS.iter().any(|(k, _)| *k == "default_model"));
+    }
+
+    #[test]
+    fn known_settings_has_auto_approve() {
+        assert!(KNOWN_SETTINGS.iter().any(|(k, _)| *k == "auto_approve"));
+    }
 }
