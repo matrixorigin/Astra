@@ -110,6 +110,23 @@ fn create_tool_selector_with_quality_internal(
     let mcp_manager =
         std::sync::Arc::new(tokio::sync::RwLock::new(mcp_client::McpClientManager::new()));
 
+    // Configure sampling so MCP servers can request LLM completions.
+    {
+        if let Some(token) = current_access_token(profile) {
+            let sampling = mcp_client::SamplingConfig {
+                api: std::sync::Arc::new(
+                    astra_thin_client::ThinClient::new(api.api_origin().as_str(), None)
+                        .expect("valid API origin for sampling"),
+                ),
+                token,
+                model: "default".to_string(),
+            };
+            mcp_manager
+                .blocking_write()
+                .set_sampling_config(Some(sampling));
+        }
+    }
+
     {
         let mcp_configs = manifest_loader::collect_mcp_server_configs();
         if !mcp_configs.is_empty() {

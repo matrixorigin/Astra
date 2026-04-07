@@ -70,6 +70,9 @@ async fn show_status(state: &ReplState) {
     }
 
     eprintln!("{}", format!("  MCP Servers: {count} connected").bold());
+    if manager.has_sampling() {
+        eprintln!("  {}", "Sampling: enabled".dim());
+    }
     eprintln!();
 
     print_server_table(&manager);
