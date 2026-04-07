@@ -279,7 +279,10 @@ impl SseStreamHost for CliSseStreamHost<'_> {
         if self.quiet || self.suppress_intermediate_output {
             return;
         }
-        self.render.stop_thinking();
+        // Don't stop the TTFT spinner here — the first SSE frame is often
+        // metadata (session_info, usage) not visible content.  Let the
+        // spinner run until actual thinking/text arrives, which will
+        // dismiss it via StartThinkingSpinner or StopThinkingSpinner.
     }
 
     fn on_idle_tick(&mut self) {
