@@ -214,8 +214,8 @@ pub struct TimeBasedCompactConfig {
 impl Default for TimeBasedCompactConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
-            gap_threshold_minutes: 30,
+            enabled: true,
+            gap_threshold_minutes: 60,
             keep_recent: 5,
         }
     }
@@ -288,8 +288,56 @@ fn find_last_assistant_timestamp(messages: &[Value]) -> Option<u64> {
     None
 }
 
-/// Collect all tool results as `(tool_call_id, estimated_tokens)` pairs.
+/// Tool names whose results are eligible for microcompaction clearing.
+/// Mirrors Claude Code's compactable tools list — only tools producing
+/// large, reproducible output that the LLM can re-run if needed.
+fn is_clearable_tool(name: &str) -> bool {
+    let n = name.to_lowercase();
+    // File read operations
+    n.contains("read_file") || n.contains("file_read") || n.contains("view_file")
+        || n.contains("open_file") || n == "cat"
+        // Shell / terminal
+        || n.contains("bash") || n.contains("shell") || n.contains("terminal")
+        || n == "run_terminal_cmd" || n.contains("powershell")
+        // Search / listing
+        || n.contains("grep") || n.contains("glob") || n.contains("list_dir")
+        || n.contains("find_file") || n.contains("codebase_search")
+        // Web
+        || n.contains("web_search") || n.contains("web_fetch")
+        // File write/edit outputs (the *result* is clearable, the action already happened)
+        || n.contains("file_edit") || n.contains("file_write") || n.contains("edit_file")
+        || n.contains("write_file") || n.contains("create_file")
+}
+
+/// Build a map from tool_call_id → tool function name by scanning assistant messages.
+fn build_tool_name_map(messages: &[Value]) -> std::collections::HashMap<String, String> {
+    let mut map = std::collections::HashMap::new();
+    for msg in messages {
+        if msg.get("role").and_then(Value::as_str) != Some("assistant") {
+            continue;
+        }
+        if let Some(calls) = msg.get("tool_calls").and_then(Value::as_array) {
+            for call in calls {
+                if let (Some(id), Some(name)) = (
+                    call.get("id").and_then(Value::as_str),
+                    call.get("function")
+                        .and_then(|f| f.get("name"))
+                        .and_then(Value::as_str),
+                ) {
+                    map.insert(id.to_string(), name.to_string());
+                }
+            }
+        }
+    }
+    map
+}
+
+/// Collect clearable tool results as `(tool_call_id, estimated_tokens)` pairs.
+/// Only includes results from tools in the clearable set (file reads, shell, search, web, edits).
+/// Tool results without a matching assistant tool_call (no name resolvable) are still included
+/// to avoid leaking memory from orphaned results.
 fn collect_tool_results(messages: &[Value]) -> Vec<(String, usize)> {
+    let name_map = build_tool_name_map(messages);
     messages
         .iter()
         .filter_map(|msg| {
@@ -297,6 +345,13 @@ fn collect_tool_results(messages: &[Value]) -> Vec<(String, usize)> {
                 return None;
             }
             let id = msg.get("tool_call_id").and_then(Value::as_str)?;
+            // If we can resolve the tool name, only keep clearable tools.
+            // If we can't resolve (orphaned result), include it — clearing stale orphans is safe.
+            if let Some(name) = name_map.get(id) {
+                if !is_clearable_tool(name) {
+                    return None;
+                }
+            }
             let tokens = msg
                 .get("content")
                 .and_then(Value::as_str)
@@ -716,8 +771,8 @@ mod tests {
     #[test]
     fn time_based_config_defaults() {
         let config = TimeBasedCompactConfig::default();
-        assert!(!config.enabled);
-        assert_eq!(config.gap_threshold_minutes, 30);
+        assert!(config.enabled);
+        assert_eq!(config.gap_threshold_minutes, 60);
         assert_eq!(config.keep_recent, 5);
     }
 
@@ -949,6 +1004,109 @@ mod tests {
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].1, 0); // numeric content → as_str returns None → 0
         assert_eq!(results[1].1, 0); // array content → as_str returns None → 0
+    }
+
+    // ── Tool name filtering tests ──
+
+    #[test]
+    fn collect_tool_results_filters_non_clearable_tools() {
+        let messages = vec![
+            // Assistant with tool calls — one clearable (bash), one not (think)
+            json!({
+                "role": "assistant", "content": "",
+                "tool_calls": [
+                    {"id": "c1", "type": "function", "function": {"name": "bash", "arguments": "{}"}},
+                    {"id": "c2", "type": "function", "function": {"name": "think", "arguments": "{}"}}
+                ]
+            }),
+            json!({"role": "tool", "tool_call_id": "c1", "content": "bash output"}),
+            json!({"role": "tool", "tool_call_id": "c2", "content": "thinking result"}),
+        ];
+        let results = collect_tool_results(&messages);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0, "c1"); // only bash result collected
+    }
+
+    #[test]
+    fn collect_tool_results_includes_all_clearable_tool_types() {
+        let clearable_names = [
+            "read_file", "file_read", "bash", "shell", "terminal",
+            "grep", "glob", "list_dir", "web_search", "web_fetch",
+            "file_edit", "file_write", "edit_file", "create_file",
+        ];
+        for (i, name) in clearable_names.iter().enumerate() {
+            let call_id = format!("c{i}");
+            let messages = vec![
+                json!({
+                    "role": "assistant", "content": "",
+                    "tool_calls": [{"id": &call_id, "type": "function",
+                                    "function": {"name": name, "arguments": "{}"}}]
+                }),
+                json!({"role": "tool", "tool_call_id": &call_id, "content": "output"}),
+            ];
+            let results = collect_tool_results(&messages);
+            assert_eq!(results.len(), 1, "tool '{}' should be clearable", name);
+        }
+    }
+
+    #[test]
+    fn collect_tool_results_excludes_non_clearable_tools() {
+        let non_clearable = ["think", "memory_store", "memory_search", "ask_user", "TodoRead"];
+        for name in non_clearable {
+            let messages = vec![
+                json!({
+                    "role": "assistant", "content": "",
+                    "tool_calls": [{"id": "c1", "type": "function",
+                                    "function": {"name": name, "arguments": "{}"}}]
+                }),
+                json!({"role": "tool", "tool_call_id": "c1", "content": "output"}),
+            ];
+            let results = collect_tool_results(&messages);
+            assert!(results.is_empty(), "tool '{}' should NOT be clearable", name);
+        }
+    }
+
+    #[test]
+    fn collect_tool_results_orphaned_results_still_collected() {
+        // Tool result without matching assistant tool_call → orphan → still collected
+        let messages = vec![
+            json!({"role": "tool", "tool_call_id": "orphan1", "content": "stale data"}),
+        ];
+        let results = collect_tool_results(&messages);
+        assert_eq!(results.len(), 1);
+    }
+
+    #[test]
+    fn is_clearable_tool_mcp_prefixed_tools() {
+        // MCP tools with slashes like "mcp_server/read_file" should match
+        assert!(is_clearable_tool("mcp_server/read_file"));
+        assert!(is_clearable_tool("something_bash_runner"));
+        assert!(!is_clearable_tool("mcp_server/think"));
+    }
+
+    #[test]
+    fn build_tool_name_map_multiple_assistant_messages() {
+        let messages = vec![
+            json!({
+                "role": "assistant", "content": "",
+                "tool_calls": [
+                    {"id": "c1", "type": "function", "function": {"name": "bash", "arguments": "{}"}},
+                ]
+            }),
+            json!({"role": "tool", "tool_call_id": "c1", "content": "output1"}),
+            json!({
+                "role": "assistant", "content": "",
+                "tool_calls": [
+                    {"id": "c2", "type": "function", "function": {"name": "grep", "arguments": "{}"}},
+                    {"id": "c3", "type": "function", "function": {"name": "think", "arguments": "{}"}},
+                ]
+            }),
+        ];
+        let map = build_tool_name_map(&messages);
+        assert_eq!(map.len(), 3);
+        assert_eq!(map["c1"], "bash");
+        assert_eq!(map["c2"], "grep");
+        assert_eq!(map["c3"], "think");
     }
 
     #[test]
