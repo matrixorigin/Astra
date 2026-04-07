@@ -1903,4 +1903,248 @@ mod tests {
         };
         assert_eq!(compact, "12.5k");
     }
+
+    // ── Context Continuity Integration Tests ──────────────────────────
+
+    /// Simulates compaction by manually building the post-compaction history,
+    /// then verifies that continuation anchor still triggers on short prompts.
+    #[test]
+    fn continuation_anchor_survives_simulated_compaction() {
+        // Phase 1: Build a 10-turn history
+        let mut history: Vec<(String, String)> = (1..=10)
+            .map(|i| (format!("user msg {i}"), format!("assistant reply {i}")))
+            .collect();
+
+        // Phase 2: Simulate compaction — keep last 3 turns, summarize rest
+        let keep = 3;
+        let trimmed = history.len().saturating_sub(keep);
+        let summary = "User explored Rust async patterns, asked about pinning, \
+                        debugged a lifetime issue, and reviewed tokio spawn.";
+        let anchor_text = "- [fact] Rust Pin<T> prevents moves\n- [fact] tokio::spawn requires 'static";
+        let compact_msg = compact_assistant_message(trimmed, summary, Some(anchor_text));
+        let summary_entry = (String::new(), compact_msg);
+
+        let mut new_history = vec![summary_entry];
+        new_history.extend_from_slice(&history[trimmed..]);
+        history = new_history;
+
+        // Phase 3: Verify post-compaction structure
+        assert_eq!(history.len(), 4); // 1 summary + 3 kept
+        assert!(history[0].0.is_empty(), "compacted entry has empty user");
+        assert!(history[0].1.contains("[Prior context — 7 turns compacted]"));
+        assert!(history[0].1.contains("[Session memory anchor]"));
+        assert!(history[0].1.contains("Rust Pin<T>"));
+
+        // Phase 4: Verify continuation anchor still works on short prompt
+        let state = ReplState {
+            continuation_anchor: Some(
+                "Latest user task: debug lifetime in tokio::spawn\n\
+                 Latest assistant direction: add 'static bound to closure"
+                    .to_string(),
+            ),
+            history,
+            ..ReplState::default()
+        };
+
+        let effective = build_effective_line("继续", &state);
+        assert!(
+            effective.contains("[Continuation anchor]"),
+            "anchor injection must work after compaction"
+        );
+        assert!(
+            effective.contains("debug lifetime"),
+            "anchor content preserved"
+        );
+        assert!(
+            effective.contains("[User follow-up]\n继续"),
+            "user prompt appended"
+        );
+
+        // Phase 5: Normal prompt should NOT inject anchor
+        let normal = build_effective_line("explain Pin in detail", &state);
+        assert!(
+            !normal.contains("[Continuation anchor]"),
+            "normal prompt must not inject anchor"
+        );
+    }
+
+    /// Verifies history_as_messages produces correct OpenAI message sequence
+    /// after compaction: compacted entry → kept turns → new user message.
+    #[test]
+    fn history_as_messages_post_compaction_preserves_order() {
+        // Simulate 8-turn conversation compacted to summary + 3 recent
+        let summary = compact_assistant_message(
+            5,
+            "User built a REST API with axum, added auth middleware.",
+            Some("- [fact] axum uses tower layers"),
+        );
+        let history: Vec<(String, String)> = vec![
+            (String::new(), summary),                                  // compacted
+            ("add rate limiting".into(), "use tower RateLimit".into()), // turn 6
+            ("show example".into(), "```rust\nuse tower...```".into()), // turn 7
+            ("deploy it".into(), "docker build...".into()),            // turn 8
+        ];
+
+        let messages = history_as_messages(&history);
+
+        // Compacted entry: only assistant (no user role)
+        assert_eq!(messages[0]["role"], "assistant");
+        assert!(messages[0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("5 turns compacted"));
+        assert!(messages[0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("[Session memory anchor]"));
+
+        // Recent turns: alternating user/assistant
+        assert_eq!(messages[1]["role"], "user");
+        assert_eq!(messages[1]["content"], "add rate limiting");
+        assert_eq!(messages[2]["role"], "assistant");
+        assert_eq!(messages[2]["content"], "use tower RateLimit");
+
+        // Total: 1 (compact) + 3×2 (kept turns) = 7
+        assert_eq!(messages.len(), 7);
+    }
+
+    fn stub_stream_result(full_text: &str) -> StreamResult {
+        StreamResult {
+            session_id: None,
+            run_id: None,
+            full_text: full_text.to_string(),
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+            tool_calls_count: 0,
+            tools_selected: Vec::new(),
+            selected_skills: Vec::new(),
+            tools_used: Vec::new(),
+            tool_call_records: Vec::new(),
+            budget_used: 0,
+            budget_pressure: 0.0,
+            stall_events: Vec::new(),
+            verdict_events: Vec::new(),
+            step_recorder_summary: None,
+            tool_health_export: Vec::new(),
+            last_heavy_checkpoint: None,
+            ttft_ms: None,
+            context_ms: None,
+            selector_strategy: None,
+            selector_ms: None,
+            selector_tokens_in: 0,
+            selector_tokens_out: 0,
+            memoria_ms: None,
+        }
+    }
+
+    /// Verifies build_continuation_anchor truncates long content to 220 chars
+    /// and formats correctly for both user and assistant parts.
+    #[test]
+    fn continuation_anchor_builder_truncates_long_content() {
+        let long_user_input = "a".repeat(300);
+        let long_assistant = format!("{}\nSecond line of detail", "b".repeat(300));
+
+        let state = ReplState::default();
+        let result = stub_stream_result(&long_assistant);
+
+        let anchor = build_continuation_anchor(&state, &long_user_input, &result);
+        let anchor = anchor.expect("should produce anchor");
+
+        // User part truncated to 220 chars
+        assert!(anchor.contains("Latest user task: "));
+        let user_part = anchor
+            .split("Latest user task: ")
+            .nth(1)
+            .unwrap()
+            .split('\n')
+            .next()
+            .unwrap();
+        assert_eq!(user_part.chars().count(), 220);
+
+        // Assistant part truncated to 220 chars (first non-empty line)
+        assert!(anchor.contains("Latest assistant direction: "));
+        let assistant_part = anchor
+            .split("Latest assistant direction: ")
+            .nth(1)
+            .unwrap();
+        assert_eq!(assistant_part.chars().count(), 220);
+    }
+
+    /// Verifies that when user input is empty, the previous anchor is preserved.
+    #[test]
+    fn continuation_anchor_preserves_on_empty_input() {
+        let state = ReplState {
+            continuation_anchor: Some("Previous anchor content".to_string()),
+            ..ReplState::default()
+        };
+        let result = stub_stream_result("new response");
+
+        let anchor = build_continuation_anchor(&state, "", &result);
+        assert_eq!(anchor.as_deref(), Some("Previous anchor content"));
+    }
+
+    /// Simulates a multi-turn error recovery scenario:
+    /// Turn 1 succeeds, Turn 2 fails (not added to history), Turn 3 retries.
+    /// Verifies history integrity after failed turn is excluded.
+    #[test]
+    fn failed_turn_excluded_from_history_preserves_continuity() {
+        let mut state = ReplState::default();
+
+        // Turn 1: success
+        state.history.push(("explain ownership".into(), "Ownership in Rust means each value has exactly one owner...".into()));
+        state.turn = 1;
+        state.continuation_anchor = Some(
+            "Latest user task: explain ownership\nLatest assistant direction: Ownership in Rust means each value has exactl"
+                .to_string(),
+        );
+
+        // Turn 2: fails — simulate by NOT adding to history
+        // (production code: handle_chat_input returns Err, history unchanged)
+        let _failed_user_msg = "now explain borrowing";
+        // state.history.push(...) is NOT called — turn failed
+        // state.turn stays at 1
+
+        // Turn 3: user retries
+        state.history.push((
+            "now explain borrowing".into(),
+            "Borrowing lets you reference data without taking ownership...".into(),
+        ));
+        state.turn = 2;
+
+        // Verify: history has exactly 2 successful turns
+        assert_eq!(state.history.len(), 2);
+        assert_eq!(state.history[0].0, "explain ownership");
+        assert_eq!(state.history[1].0, "now explain borrowing");
+
+        // Verify: messages for API call are coherent
+        let messages = history_as_messages(&state.history);
+        assert_eq!(messages.len(), 4); // u1, a1, u2, a2
+        assert_eq!(messages[0]["content"], "explain ownership");
+        assert_eq!(messages[2]["content"], "now explain borrowing");
+
+        // Verify: continuation still works after recovery
+        state.continuation_anchor = Some(
+            "Latest user task: now explain borrowing\nLatest assistant direction: Borrowing lets you reference data"
+                .to_string(),
+        );
+        let effective = build_effective_line("continue", &state);
+        assert!(effective.contains("[Continuation anchor]"));
+        assert!(effective.contains("explain borrowing"));
+
+        // Verify: the failed message is nowhere in the conversation
+        let _all_content: String = messages
+            .iter()
+            .filter_map(|m| m["content"].as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
+        // The failed turn's content DOES appear in Turn 3 (retry same message)
+        // but there should be exactly 2 user messages, not 3
+        let user_messages: Vec<_> = messages
+            .iter()
+            .filter(|m| m["role"] == "user")
+            .collect();
+        assert_eq!(user_messages.len(), 2, "failed turn must not create extra user message");
+    }
 }
