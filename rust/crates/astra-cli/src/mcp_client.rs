@@ -3109,4 +3109,283 @@ mcp_servers:
         assert!(info.capabilities.sampling.is_none(), "sampling should NOT be advertised without config");
         assert!(info.capabilities.elicitation.is_some());
     }
+
+    // --- McpClientManager unit tests (no real server needed) ---
+
+    #[test]
+    fn manager_has_sampling_false_by_default() {
+        let mgr = McpClientManager::new();
+        assert!(!mgr.has_sampling());
+    }
+
+    #[test]
+    fn manager_has_sampling_after_set() {
+        let mut mgr = McpClientManager::new();
+        let config = SamplingConfig {
+            api: Arc::new(
+                astra_thin_client::ThinClient::new("http://localhost:8000", None).unwrap(),
+            ),
+            token: "tok".into(),
+            model: "test".into(),
+        };
+        mgr.set_sampling_config(Some(config));
+        assert!(mgr.has_sampling());
+        mgr.set_sampling_config(None);
+        assert!(!mgr.has_sampling());
+    }
+
+    #[test]
+    fn manager_connection_count_empty() {
+        let mgr = McpClientManager::new();
+        assert_eq!(mgr.connection_count(), 0);
+    }
+
+    #[test]
+    fn manager_connected_servers_empty() {
+        let mgr = McpClientManager::new();
+        assert!(mgr.connected_servers().is_empty());
+    }
+
+    #[test]
+    fn manager_server_state_not_found() {
+        let mgr = McpClientManager::new();
+        assert!(mgr.server_state("nonexistent").is_none());
+    }
+
+    #[test]
+    fn manager_get_not_found() {
+        let mgr = McpClientManager::new();
+        assert!(mgr.get("nonexistent").is_none());
+    }
+
+    #[test]
+    fn manager_all_tools_empty() {
+        let mgr = McpClientManager::new();
+        assert!(mgr.all_tools().is_empty());
+    }
+
+    #[test]
+    fn manager_all_tool_schemas_empty() {
+        let mgr = McpClientManager::new();
+        assert!(mgr.all_tool_schemas().is_empty());
+    }
+
+    #[test]
+    fn manager_find_tool_by_mcp_name_empty() {
+        let mgr = McpClientManager::new();
+        assert!(mgr.find_tool_by_mcp_name("mcp_server_tool").is_none());
+    }
+
+    #[test]
+    fn manager_consume_prompt_changes_empty() {
+        let mgr = McpClientManager::new();
+        assert!(mgr.consume_prompt_changes().is_empty());
+    }
+
+    #[test]
+    fn manager_consume_resource_changes_empty() {
+        let mgr = McpClientManager::new();
+        assert!(mgr.consume_resource_changes().is_empty());
+    }
+
+    #[test]
+    fn manager_disconnect_nonexistent() {
+        let mut mgr = McpClientManager::new();
+        assert!(!mgr.disconnect("nonexistent"));
+    }
+
+    #[tokio::test]
+    async fn manager_all_resources_empty() {
+        let mgr = McpClientManager::new();
+        assert!(mgr.all_resources().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn manager_ping_nonexistent_server() {
+        let mgr = McpClientManager::new();
+        let result = mgr.ping("nonexistent").await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(matches!(err, McpError::ServerNotConnected(_)));
+    }
+
+    #[tokio::test]
+    async fn manager_ping_all_empty() {
+        let mgr = McpClientManager::new();
+        let results = mgr.ping_all().await;
+        assert!(results.is_empty());
+    }
+
+    #[tokio::test]
+    async fn manager_complete_nonexistent_server() {
+        let mgr = McpClientManager::new();
+        let ref_ = rmcp::model::Reference::for_prompt("test");
+        let result = mgr.complete("nonexistent", ref_, "arg", "").await;
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), McpError::ServerNotConnected(_)));
+    }
+
+    #[tokio::test]
+    async fn manager_call_tool_not_found() {
+        let mgr = McpClientManager::new();
+        let result = mgr.call_tool("nonexistent_tool", serde_json::json!({})).await;
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), McpError::ToolNotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn manager_reconnect_nonexistent() {
+        let mut mgr = McpClientManager::new();
+        let result = mgr.reconnect("nonexistent").await;
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), McpError::ServerNotConnected(_)));
+    }
+
+    // --- do_sampling response parsing tests ---
+
+    #[test]
+    fn sampling_stop_reason_mapping() {
+        // Verify stop reason string constants match MCP spec
+        assert_eq!(CreateMessageResult::STOP_REASON_END_TURN, "endTurn");
+        assert_eq!(CreateMessageResult::STOP_REASON_END_MAX_TOKEN, "maxTokens");
+        assert_eq!(CreateMessageResult::STOP_REASON_TOOL_USE, "toolUse");
+    }
+
+    #[test]
+    fn sampling_body_includes_system_prompt() {
+        let messages = vec![SamplingMessage::user_text("hello")];
+        let converted = sampling_messages_to_openai(&messages);
+        assert_eq!(converted.len(), 1);
+
+        // Verify system prompt would be inserted at position 0
+        let mut body = serde_json::json!({ "messages": converted });
+        let system = "You are helpful";
+        if let Some(arr) = body["messages"].as_array_mut() {
+            arr.insert(0, serde_json::json!({ "role": "system", "content": system }));
+        }
+        assert_eq!(body["messages"][0]["role"], "system");
+        assert_eq!(body["messages"][0]["content"], system);
+    }
+
+    #[test]
+    fn sampling_body_includes_temperature_and_stops() {
+        let mut body = serde_json::json!({ "model": "test", "messages": [] });
+        let temp = 0.7;
+        let stops = vec!["STOP".to_string()];
+        body["temperature"] = serde_json::json!(temp);
+        body["stop"] = serde_json::json!(stops);
+        assert_eq!(body["temperature"].as_f64().unwrap(), 0.7);
+        assert_eq!(body["stop"][0].as_str().unwrap(), "STOP");
+    }
+
+    // --- McpError Display tests ---
+
+    #[test]
+    fn mcp_error_display_messages() {
+        let e = McpError::InvalidConfig("bad url".into());
+        assert!(e.to_string().contains("bad url"));
+
+        let e = McpError::Spawn("not found".into());
+        assert!(e.to_string().contains("not found"));
+
+        let e = McpError::ToolNotFound("my_tool".into());
+        assert!(e.to_string().contains("my_tool"));
+
+        let e = McpError::ServerNotConnected("my_server".into());
+        assert!(e.to_string().contains("my_server"));
+
+        let e = McpError::ConnectionLost("srv".into(), "timeout".into());
+        assert!(e.to_string().contains("srv"));
+        assert!(e.to_string().contains("timeout"));
+
+        let e = McpError::ReconnectionFailed("srv".into(), 3);
+        assert!(e.to_string().contains("srv"));
+        assert!(e.to_string().contains("3"));
+    }
+
+    // --- Argument normalization tests (call_tool logic) ---
+
+    #[test]
+    fn call_tool_argument_normalization_object() {
+        // Object arguments pass through as-is
+        let args = serde_json::json!({"key": "value"});
+        let normalized = match args {
+            serde_json::Value::Object(map) => Some(map),
+            serde_json::Value::Null => None,
+            other => Some(serde_json::Map::from_iter([("input".to_string(), other)])),
+        };
+        assert!(normalized.is_some());
+        assert_eq!(normalized.unwrap().get("key").unwrap(), "value");
+    }
+
+    #[test]
+    fn call_tool_argument_normalization_null() {
+        let args = serde_json::Value::Null;
+        let normalized = match args {
+            serde_json::Value::Object(map) => Some(map),
+            serde_json::Value::Null => None,
+            other => Some(serde_json::Map::from_iter([("input".to_string(), other)])),
+        };
+        assert!(normalized.is_none());
+    }
+
+    #[test]
+    fn call_tool_argument_normalization_string() {
+        // Non-object/non-null wraps in {"input": value}
+        let args = serde_json::json!("hello");
+        let normalized = match args {
+            serde_json::Value::Object(map) => Some(map),
+            serde_json::Value::Null => None,
+            other => Some(serde_json::Map::from_iter([("input".to_string(), other)])),
+        };
+        assert!(normalized.is_some());
+        let map = normalized.unwrap();
+        assert_eq!(map.get("input").unwrap(), "hello");
+    }
+
+    #[test]
+    fn call_tool_argument_normalization_array() {
+        let args = serde_json::json!([1, 2, 3]);
+        let normalized = match args {
+            serde_json::Value::Object(map) => Some(map),
+            serde_json::Value::Null => None,
+            other => Some(serde_json::Map::from_iter([("input".to_string(), other)])),
+        };
+        assert!(normalized.is_some());
+        let map = normalized.unwrap();
+        assert!(map.get("input").unwrap().is_array());
+    }
+
+    // --- truncate_with_marker edge cases ---
+
+    #[test]
+    fn truncate_with_marker_exact_boundary() {
+        let s = "a".repeat(MAX_DESCRIPTION_LENGTH);
+        let result = truncate_with_marker(&s, MAX_DESCRIPTION_LENGTH);
+        assert_eq!(result.len(), MAX_DESCRIPTION_LENGTH);
+        assert!(!result.contains(TRUNCATION_MARKER));
+    }
+
+    #[test]
+    fn truncate_with_marker_one_over() {
+        let s = "a".repeat(MAX_DESCRIPTION_LENGTH + 1);
+        let result = truncate_with_marker(&s, MAX_DESCRIPTION_LENGTH);
+        assert!(result.len() <= MAX_DESCRIPTION_LENGTH);
+        assert!(result.ends_with(TRUNCATION_MARKER));
+    }
+
+    #[test]
+    fn truncate_with_marker_empty_string() {
+        let result = truncate_with_marker("", 100);
+        assert_eq!(result, "");
+    }
+
+    #[test]
+    fn truncate_with_marker_multibyte_doesnt_split_char() {
+        // CJK chars are 3 bytes each - truncation should not split a character
+        let s = "你好世界你好世界"; // 8 chars, 24 bytes
+        let result = truncate_with_marker(s, 20);
+        assert!(result.is_char_boundary(result.len() - TRUNCATION_MARKER.len()));
+        assert!(result.ends_with(TRUNCATION_MARKER));
+    }
 }

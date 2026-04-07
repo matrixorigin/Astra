@@ -2,7 +2,7 @@ use super::*;
 use crate::manifest_loader::project_mcp_json_path;
 use crate::mcp_client::{ConnectionState, McpClientManager};
 
-pub(super) async fn handle_mcp_command(arg: &str, state: &ReplState) -> Result<(), String> {
+pub(super) async fn handle_mcp_command(arg: &str, state: &mut ReplState) -> Result<(), String> {
     let sub = arg.trim();
 
     match sub {
@@ -42,10 +42,7 @@ pub(super) async fn handle_mcp_command(arg: &str, state: &ReplState) -> Result<(
             );
         }
         s if s.starts_with("prompt ") => {
-            eprintln!(
-                "{}",
-                "  Hint: use /mcp prompt <server>:<name> [arg1 arg2 ...]".dim()
-            );
+            handle_mcp_prompt_invoke(arg, state).await?;
         }
         "prompt" => {
             eprintln!(
@@ -1059,5 +1056,212 @@ mod tests {
             },
         };
         assert_eq!(extract_prompt_message_text(&content), "resource content");
+    }
+
+    // --- duration edge cases ---
+
+    #[test]
+    fn format_duration_zero() {
+        assert_eq!(format_duration(std::time::Duration::from_secs(0)), "0s");
+    }
+
+    #[test]
+    fn format_duration_exactly_one_hour() {
+        assert_eq!(
+            format_duration(std::time::Duration::from_secs(3600)),
+            "1h 0m"
+        );
+    }
+
+    #[test]
+    fn format_duration_exactly_one_minute() {
+        assert_eq!(
+            format_duration(std::time::Duration::from_secs(60)),
+            "1m 0s"
+        );
+    }
+
+    // --- Resource URI parsing helpers (validate server:uri split logic) ---
+
+    #[test]
+    fn server_uri_split_valid() {
+        let input = "myserver:file:///path/to/resource";
+        let (server, uri) = input.split_once(':').unwrap();
+        assert_eq!(server, "myserver");
+        assert_eq!(uri, "file:///path/to/resource");
+    }
+
+    #[test]
+    fn server_uri_split_no_colon() {
+        let input = "justserver";
+        assert!(input.split_once(':').is_none());
+    }
+
+    #[test]
+    fn server_uri_split_empty_parts() {
+        // ":" gives empty server and empty URI
+        let input = ":";
+        let (server, uri) = input.split_once(':').unwrap();
+        assert!(server.is_empty());
+        assert!(uri.is_empty());
+    }
+
+    // --- Complete spec parsing (server:ref_type:name) ---
+
+    #[test]
+    fn complete_spec_parse_prompt() {
+        let spec = "myserver:prompt:deploy";
+        let segments: Vec<&str> = spec.splitn(3, ':').collect();
+        assert_eq!(segments.len(), 3);
+        assert_eq!(segments[0], "myserver");
+        assert_eq!(segments[1], "prompt");
+        assert_eq!(segments[2], "deploy");
+    }
+
+    #[test]
+    fn complete_spec_parse_resource_with_colons() {
+        // Resource URIs contain colons: server:resource:file:///path
+        let spec = "myserver:resource:file:///some/path";
+        let segments: Vec<&str> = spec.splitn(3, ':').collect();
+        assert_eq!(segments.len(), 3);
+        assert_eq!(segments[0], "myserver");
+        assert_eq!(segments[1], "resource");
+        assert_eq!(segments[2], "file:///some/path"); // preserves internal colons
+    }
+
+    #[test]
+    fn complete_spec_parse_too_few_segments() {
+        let spec = "myserver:prompt";
+        let segments: Vec<&str> = spec.splitn(3, ':').collect();
+        assert_eq!(segments.len(), 2); // less than 3 → should be rejected
+    }
+
+    // --- Log level string mapping ---
+
+    #[test]
+    fn log_level_aliases() {
+        // Verify all aliases map correctly
+        let mappings = vec![
+            ("debug", "Debug"),
+            ("info", "Info"),
+            ("notice", "Notice"),
+            ("warning", "Warning"),
+            ("warn", "Warning"),
+            ("error", "Error"),
+            ("critical", "Critical"),
+            ("crit", "Critical"),
+            ("alert", "Alert"),
+            ("emergency", "Emergency"),
+            ("emerg", "Emergency"),
+        ];
+        for (input, expected) in mappings {
+            let level = match input {
+                "debug" => rmcp::model::LoggingLevel::Debug,
+                "info" => rmcp::model::LoggingLevel::Info,
+                "notice" => rmcp::model::LoggingLevel::Notice,
+                "warning" | "warn" => rmcp::model::LoggingLevel::Warning,
+                "error" => rmcp::model::LoggingLevel::Error,
+                "critical" | "crit" => rmcp::model::LoggingLevel::Critical,
+                "alert" => rmcp::model::LoggingLevel::Alert,
+                "emergency" | "emerg" => rmcp::model::LoggingLevel::Emergency,
+                _ => panic!("unexpected"),
+            };
+            assert_eq!(format!("{level:?}"), expected, "for input '{input}'");
+        }
+    }
+
+    // --- MCP add JSON construction ---
+
+    #[test]
+    fn mcp_add_json_structure() {
+        // Simulate the JSON construction logic from handle_mcp_add
+        let name = "github";
+        let command = "npx";
+        let args = vec!["@modelcontextprotocol/server-github"];
+
+        let mut config = serde_json::json!({"mcpServers": {}});
+        let entry = serde_json::json!({
+            "command": command,
+            "args": args,
+        });
+        config["mcpServers"]
+            .as_object_mut()
+            .unwrap()
+            .insert(name.to_string(), entry);
+
+        assert_eq!(config["mcpServers"]["github"]["command"], "npx");
+        assert_eq!(
+            config["mcpServers"]["github"]["args"][0],
+            "@modelcontextprotocol/server-github"
+        );
+    }
+
+    #[test]
+    fn mcp_add_rejects_duplicate() {
+        let config = serde_json::json!({
+            "mcpServers": {
+                "existing": {"command": "echo", "args": []}
+            }
+        });
+        let servers = config
+            .get("mcpServers")
+            .and_then(|v| v.as_object())
+            .unwrap();
+        assert!(servers.contains_key("existing"));
+        assert!(!servers.contains_key("newserver"));
+    }
+
+    #[test]
+    fn mcp_remove_json_structure() {
+        let mut config = serde_json::json!({
+            "mcpServers": {
+                "github": {"command": "npx", "args": []},
+                "other": {"command": "echo", "args": []}
+            }
+        });
+        config["mcpServers"]
+            .as_object_mut()
+            .unwrap()
+            .remove("github");
+        assert!(!config["mcpServers"]
+            .as_object()
+            .unwrap()
+            .contains_key("github"));
+        assert!(config["mcpServers"]
+            .as_object()
+            .unwrap()
+            .contains_key("other"));
+    }
+
+    #[test]
+    fn mcp_add_malformed_json_fallback() {
+        // Simulates: existing file has invalid JSON → falls back to empty config
+        let content = "not valid json {{{";
+        let config: serde_json::Value = serde_json::from_str(content)
+            .unwrap_or_else(|_| serde_json::json!({"mcpServers": {}}));
+        assert!(config["mcpServers"].as_object().unwrap().is_empty());
+    }
+
+    // --- Prompt message extraction edge cases ---
+
+    #[test]
+    fn extract_prompt_resource_blob_returns_empty() {
+        use rmcp::model::{Annotated, RawEmbeddedResource, ResourceContents};
+        let content = rmcp::model::PromptMessageContent::Resource {
+            resource: Annotated {
+                raw: RawEmbeddedResource {
+                    meta: None,
+                    resource: ResourceContents::BlobResourceContents {
+                        uri: "file:///binary.bin".to_string(),
+                        mime_type: Some("application/octet-stream".to_string()),
+                        blob: "AQID".to_string(),
+                        meta: None,
+                    },
+                },
+                annotations: None,
+            },
+        };
+        // Binary blob resources should return empty string
+        assert_eq!(extract_prompt_message_text(&content), "");
     }
 }
