@@ -36,20 +36,36 @@ pub(super) async fn handle_mcp_command(arg: &str, state: &mut ReplState) -> Resu
         s if s.starts_with("log-level ") => handle_mcp_log_level(&s[10..], state).await,
         "log-level" => {
             eprintln!("{}", "  Usage: /mcp log-level <server> <level>".dim());
-            eprintln!("{}", "  Levels: debug, info, notice, warning, error, critical, alert, emergency".dim());
+            eprintln!(
+                "{}",
+                "  Levels: debug, info, notice, warning, error, critical, alert, emergency".dim()
+            );
         }
         s if s.starts_with("prompt ") => {
             handle_mcp_prompt_invoke(arg, state).await?;
         }
         "prompt" => {
-            eprintln!("{}", "  Usage: /mcp prompt <server>:<name> [arg1 arg2 ...]".dim());
+            eprintln!(
+                "{}",
+                "  Usage: /mcp prompt <server>:<name> [arg1 arg2 ...]".dim()
+            );
         }
         s if s.starts_with("complete ") => handle_mcp_complete(&s[9..], state).await,
         "complete" => {
-            eprintln!("{}", "  Usage: /mcp complete <server>:<prompt|resource> <arg_name> [partial_value]".dim());
+            eprintln!(
+                "{}",
+                "  Usage: /mcp complete <server>:<prompt|resource> <arg_name> [partial_value]"
+                    .dim()
+            );
             eprintln!("{}", "  Examples:".dim());
-            eprintln!("{}", "    /mcp complete myserver:prompt:deploy env pr".dim());
-            eprintln!("{}", "    /mcp complete myserver:resource:file://path arg val".dim());
+            eprintln!(
+                "{}",
+                "    /mcp complete myserver:prompt:deploy env pr".dim()
+            );
+            eprintln!(
+                "{}",
+                "    /mcp complete myserver:resource:file://path arg val".dim()
+            );
         }
         s if s.starts_with("ping ") => handle_mcp_ping(Some(&s[5..]), state).await,
         "ping" => handle_mcp_ping(None, state).await,
@@ -151,7 +167,10 @@ async fn show_prompts(state: &ReplState) {
     let prompts = manager.all_prompts().await;
 
     if prompts.is_empty() {
-        eprintln!("{}", "  No prompts available from connected MCP servers.".dim());
+        eprintln!(
+            "{}",
+            "  No prompts available from connected MCP servers.".dim()
+        );
         return;
     }
 
@@ -490,7 +509,8 @@ pub(super) async fn handle_mcp_prompt_invoke(
         _ => {
             eprintln!(
                 "{}",
-                format!("  ⚠ Invalid format: '{qualified_name}'. Use <server>:<prompt_name>").yellow()
+                format!("  ⚠ Invalid format: '{qualified_name}'. Use <server>:<prompt_name>")
+                    .yellow()
             );
             return Ok(());
         }
@@ -499,7 +519,9 @@ pub(super) async fn handle_mcp_prompt_invoke(
     // Build arguments map: match positional args to prompt argument names
     let manager = state.mcp_manager.read().await;
     let prompts = manager.all_prompts().await;
-    let prompt_def = prompts.iter().find(|(s, p)| s == server_name && p.name == prompt_name);
+    let prompt_def = prompts
+        .iter()
+        .find(|(s, p)| s == server_name && p.name == prompt_name);
 
     let arguments = if !raw_args.is_empty() {
         let arg_values: Vec<&str> = raw_args.split_whitespace().collect();
@@ -510,7 +532,10 @@ pub(super) async fn handle_mcp_prompt_invoke(
             if let Some(ref arg_defs) = def.arguments {
                 for (i, val) in arg_values.iter().enumerate() {
                     if let Some(arg_def) = arg_defs.get(i) {
-                        map.insert(arg_def.name.clone(), serde_json::Value::String(val.to_string()));
+                        map.insert(
+                            arg_def.name.clone(),
+                            serde_json::Value::String(val.to_string()),
+                        );
                     }
                 }
                 // If more values than named args, join remaining as last arg
@@ -521,11 +546,17 @@ pub(super) async fn handle_mcp_prompt_invoke(
                 }
             } else {
                 // No arg definitions — use "input" as key
-                map.insert("input".to_string(), serde_json::Value::String(raw_args.to_string()));
+                map.insert(
+                    "input".to_string(),
+                    serde_json::Value::String(raw_args.to_string()),
+                );
             }
         } else {
             // Prompt definition not found in cache — use "input" as key
-            map.insert("input".to_string(), serde_json::Value::String(raw_args.to_string()));
+            map.insert(
+                "input".to_string(),
+                serde_json::Value::String(raw_args.to_string()),
+            );
         }
         Some(map)
     } else {
@@ -539,7 +570,10 @@ pub(super) async fn handle_mcp_prompt_invoke(
         prompt_name
     );
 
-    let result = match manager.get_prompt(server_name, prompt_name, arguments).await {
+    let result = match manager
+        .get_prompt(server_name, prompt_name, arguments)
+        .await
+    {
         Ok(r) => r,
         Err(e) => {
             eprintln!("{}", format!("  ⚠ Failed to get prompt: {e}").yellow());
@@ -902,7 +936,10 @@ async fn handle_mcp_complete(arg: &str, state: &ReplState) {
     let arg_value = if parts.len() > 2 { parts[2] } else { "" };
 
     let manager = state.mcp_manager.read().await;
-    match manager.complete(server, reference, arg_name, arg_value).await {
+    match manager
+        .complete(server, reference, arg_name, arg_value)
+        .await
+    {
         Ok(result) => {
             if result.completion.values.is_empty() {
                 eprintln!("{}", "  No completions available.".dim());
@@ -937,12 +974,10 @@ async fn handle_mcp_ping(server: Option<&str>, state: &ReplState) {
     }
 
     match server.map(str::trim) {
-        Some(name) if !name.is_empty() => {
-            match manager.ping(name).await {
-                Ok(d) => eprintln!("  ✓ {name}: {:.1}ms", d.as_secs_f64() * 1000.0),
-                Err(e) => eprintln!("{}", format!("  ✗ {name}: {e}").red()),
-            }
-        }
+        Some(name) if !name.is_empty() => match manager.ping(name).await {
+            Ok(d) => eprintln!("  ✓ {name}: {:.1}ms", d.as_secs_f64() * 1000.0),
+            Err(e) => eprintln!("{}", format!("  ✗ {name}: {e}").red()),
+        },
         _ => {
             let results = manager.ping_all().await;
             for (name, result) in results {
@@ -1051,10 +1086,7 @@ mod tests {
 
     #[test]
     fn format_duration_exactly_one_minute() {
-        assert_eq!(
-            format_duration(std::time::Duration::from_secs(60)),
-            "1m 0s"
-        );
+        assert_eq!(format_duration(std::time::Duration::from_secs(60)), "1m 0s");
     }
 
     // --- Resource URI parsing helpers (validate server:uri split logic) ---
@@ -1199,22 +1231,26 @@ mod tests {
             .as_object_mut()
             .unwrap()
             .remove("github");
-        assert!(!config["mcpServers"]
-            .as_object()
-            .unwrap()
-            .contains_key("github"));
-        assert!(config["mcpServers"]
-            .as_object()
-            .unwrap()
-            .contains_key("other"));
+        assert!(
+            !config["mcpServers"]
+                .as_object()
+                .unwrap()
+                .contains_key("github")
+        );
+        assert!(
+            config["mcpServers"]
+                .as_object()
+                .unwrap()
+                .contains_key("other")
+        );
     }
 
     #[test]
     fn mcp_add_malformed_json_fallback() {
         // Simulates: existing file has invalid JSON → falls back to empty config
         let content = "not valid json {{{";
-        let config: serde_json::Value = serde_json::from_str(content)
-            .unwrap_or_else(|_| serde_json::json!({"mcpServers": {}}));
+        let config: serde_json::Value =
+            serde_json::from_str(content).unwrap_or_else(|_| serde_json::json!({"mcpServers": {}}));
         assert!(config["mcpServers"].as_object().unwrap().is_empty());
     }
 

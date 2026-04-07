@@ -9,17 +9,17 @@ use std::sync::Arc;
 use std::sync::OnceLock;
 
 use astra_core::config::AppSettings;
-use astra_runtime::{build_app, build_server_state, MemoriaForwarder};
+use astra_runtime::{MemoriaForwarder, build_app, build_server_state};
 use async_trait::async_trait;
 use axum::{
+    Router,
     body::{self, Body},
     http::{Request, StatusCode},
-    Router,
 };
 use futures_util::StreamExt;
-use serde_json::{json, Value};
-use sqlx::mysql::MySqlRow;
+use serde_json::{Value, json};
 use sqlx::Row;
+use sqlx::mysql::MySqlRow;
 use tokio::sync::Mutex;
 use tower::util::ServiceExt;
 use uuid::Uuid;

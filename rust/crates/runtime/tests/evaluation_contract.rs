@@ -204,9 +204,7 @@ async fn unconfigured_evaluation_routes_return_503() {
     let post_cases: [(&str, body::Body, bool); 4] = [
         (
             "/evaluation/gate/validate",
-            body::Body::from(
-                r#"{"change_type":"prompt","change_id":"c1","change_content":{}}"#,
-            ),
+            body::Body::from(r#"{"change_type":"prompt","change_id":"c1","change_content":{}}"#),
             true,
         ),
         ("/evaluation/drift/run", body::Body::empty(), false),
@@ -232,8 +230,14 @@ async fn memory_health_and_metrics_use_mock_memoria() {
     let memoria_base_url = start_mock_memoria_health().await;
     let app = build_memoria_backed_app(memoria_base_url);
 
-    let resp = oneshot_eval(app.clone(), "GET", "/evaluation/memory-health", body::Body::empty(), false)
-        .await;
+    let resp = oneshot_eval(
+        app.clone(),
+        "GET",
+        "/evaluation/memory-health",
+        body::Body::empty(),
+        false,
+    )
+    .await;
     assert_eq!(resp.status(), StatusCode::OK);
     let bytes = body::to_bytes(resp.into_body(), 1024 * 64).await.unwrap();
     let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
@@ -244,7 +248,14 @@ async fn memory_health_and_metrics_use_mock_memoria() {
     assert_eq!(json["orphaned_records"], 0);
     assert_eq!(json["healthy"], false);
 
-    let resp = oneshot_eval(app, "GET", "/evaluation/memory-metrics", body::Body::empty(), false).await;
+    let resp = oneshot_eval(
+        app,
+        "GET",
+        "/evaluation/memory-metrics",
+        body::Body::empty(),
+        false,
+    )
+    .await;
     assert_eq!(resp.status(), StatusCode::OK);
     let bytes = body::to_bytes(resp.into_body(), 1024 * 64).await.unwrap();
     let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
@@ -266,7 +277,12 @@ async fn memoria_stubbed_evaluation_routes_return_501() {
             body::Body::empty(),
             false,
         ),
-        ("GET", "/evaluation/slo/dashboard", body::Body::empty(), false),
+        (
+            "GET",
+            "/evaluation/slo/dashboard",
+            body::Body::empty(),
+            false,
+        ),
         (
             "POST",
             "/evaluation/training-data/extract",
@@ -276,10 +292,6 @@ async fn memoria_stubbed_evaluation_routes_return_501() {
     ];
     for (method, uri, b, json_ct) in cases {
         let resp = oneshot_eval(app.clone(), method, uri, b, json_ct).await;
-        assert_eq!(
-            resp.status(),
-            StatusCode::NOT_IMPLEMENTED,
-            "{method} {uri}"
-        );
+        assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED, "{method} {uri}");
     }
 }

@@ -6,8 +6,8 @@ use serde_json::json;
 use sqlx::Row;
 
 use super::harness::{
-    bootstrap, delete_no_content, get_json, grant_astra_admin_role, post_empty, post_json,
-    post_json_collect_body_text, put_json, sse_first_data_json_with_type, E2E_PASSWORD,
+    E2E_PASSWORD, bootstrap, delete_no_content, get_json, grant_astra_admin_role, post_empty,
+    post_json, post_json_collect_body_text, put_json, sse_first_data_json_with_type,
 };
 
 pub async fn run_session_cancel_then_delete() {
