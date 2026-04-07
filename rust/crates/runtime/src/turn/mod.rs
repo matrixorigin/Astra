@@ -49,6 +49,7 @@ pub mod hook_plans;
 pub mod hydrate_reflect;
 pub mod implicit_feedback;
 pub(crate) mod llm_client;
+pub mod llm_request_dump;
 pub mod loop_dispatcher;
 pub mod observer;
 pub mod persist;

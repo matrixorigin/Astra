@@ -1576,6 +1576,16 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
                                 Ok(s) => s,
                                 Err(e2) => {
                                     let kind = classify_llm_error(&e2);
+                                    // Dump full LLM request for post-mortem debugging
+                                    let dump = crate::turn::llm_request_dump::build_llm_request_dump(
+                                        &session_id, &model_name, &provider,
+                                        &e2, &llm_messages, &pruned_tools,
+                                        round_ix, Some(max_output_tokens / 2),
+                                    );
+                                    if let Some(path) = dump.write_local() {
+                                        eprintln!("[llm_error_dump] {path}");
+                                    }
+                                    dump.persist_cloud(&user_id, &turn_chain_id, turn_auxiliary_event_writer.clone());
                                     yield render_sse_map(&build_stream_error_event(
                                         &format!("Context window exceeded even after aggressive compaction: {e2}"),
                                         kind,
@@ -1587,6 +1597,16 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
                         }
                         Err(e) => {
                             let kind = classify_llm_error(&e);
+                            // Dump full LLM request for post-mortem debugging
+                            let dump = crate::turn::llm_request_dump::build_llm_request_dump(
+                                &session_id, &model_name, &provider,
+                                &e, &llm_messages, &pruned_tools,
+                                round_ix, Some(max_output_tokens),
+                            );
+                            if let Some(path) = dump.write_local() {
+                                eprintln!("[llm_error_dump] {path}");
+                            }
+                            dump.persist_cloud(&user_id, &turn_chain_id, turn_auxiliary_event_writer.clone());
                             yield render_sse_map(&build_stream_error_event(&e, kind, kind != "internal"));
                             return;
                         }
