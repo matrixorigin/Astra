@@ -113,6 +113,94 @@ pub(super) fn compact_assistant_message(
     out
 }
 
+// ─── Relevance-scored history pruning ───────────────────────────────────────
+
+/// Lightweight tokenizer for relevance scoring: lowercase, split on
+/// non-alphanumeric boundaries, filter short tokens.
+fn tokenize_for_relevance(text: &str) -> std::collections::HashSet<String> {
+    text.to_lowercase()
+        .split(|c: char| !c.is_alphanumeric() && c != '_' && c != '-')
+        .filter(|w| w.len() >= 2)
+        .map(|w| w.to_string())
+        .collect()
+}
+
+/// Score a single history turn's relevance to a query token set.
+///
+/// Returns 0.0–1.0 based on keyword overlap (Jaccard-like).
+/// Weighs user message higher than assistant response since user messages
+/// carry intent and decision context.
+fn score_turn_relevance(
+    turn: &(String, String),
+    query_tokens: &std::collections::HashSet<String>,
+) -> f64 {
+    if query_tokens.is_empty() {
+        return 0.0;
+    }
+    let user_tokens = tokenize_for_relevance(&turn.0);
+    let assistant_tokens = tokenize_for_relevance(&turn.1);
+
+    let user_overlap = query_tokens.intersection(&user_tokens).count();
+    let assistant_overlap = query_tokens.intersection(&assistant_tokens).count();
+
+    // User messages carry more intent signal (weight 2x)
+    let weighted_overlap = (user_overlap * 2 + assistant_overlap) as f64;
+    let max_possible = (query_tokens.len() * 3) as f64; // 2x user + 1x assistant
+    (weighted_overlap / max_possible).min(1.0)
+}
+
+/// Select which history turns to keep during compaction using relevance scoring.
+///
+/// Strategy:
+/// - Always keep the last `min_recent` turns (guaranteed recency)
+/// - From remaining older turns, score by relevance and keep top-K
+/// - Returns indices (into original history) that should be PRESERVED as
+///   individual turns (not compacted into the summary)
+///
+/// `keep_budget` is the total number of turns to keep (= `context_budget.keep_recent_turns`).
+/// `min_recent` is the minimum guaranteed recent turns (half of keep_budget, at least 2).
+fn select_turns_for_compaction(
+    history: &[(String, String)],
+    keep_budget: usize,
+    recent_context: &str,
+) -> Vec<usize> {
+    let total = history.len();
+    if total <= keep_budget {
+        return (0..total).collect();
+    }
+
+    // Split budget: guaranteed recent + relevance-scored older turns
+    let min_recent = (keep_budget / 2).max(2).min(keep_budget);
+    let relevance_slots = keep_budget.saturating_sub(min_recent);
+
+    // Guaranteed recent turns (last min_recent)
+    let recent_start = total.saturating_sub(min_recent);
+    let mut kept_indices: Vec<usize> = (recent_start..total).collect();
+
+    if relevance_slots > 0 && recent_start > 0 {
+        // Use the current user message as the primary relevance signal.
+        // Recent turns are already guaranteed by min_recent — no need to
+        // add their tokens, which would dilute the signal.
+        let query_tokens = tokenize_for_relevance(recent_context);
+
+        // Score older turns (0..recent_start) by relevance
+        let mut scored: Vec<(usize, f64)> = (0..recent_start)
+            .map(|i| (i, score_turn_relevance(&history[i], &query_tokens)))
+            .collect();
+        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+        // Keep top-K relevant older turns (only if they have nonzero relevance)
+        for &(idx, score) in scored.iter().take(relevance_slots) {
+            if score > 0.0 {
+                kept_indices.push(idx);
+            }
+        }
+    }
+
+    kept_indices.sort_unstable();
+    kept_indices
+}
+
 enum TurnAttempt {
     Completed(Box<Result<StreamResult, crate::TurnFailure>>),
     Interrupted,
@@ -140,7 +228,7 @@ pub(super) async fn handle_chat_input(
     let effective_line = build_effective_line(&line, state);
     let turn_start = Instant::now();
 
-    maybe_auto_compact(state, &ctx, token).await?;
+    maybe_auto_compact(state, &ctx, token, &effective_line).await?;
 
     let session_id = state.session_id.clone();
     match run_chat_turn(state, &ctx, token, &effective_line, session_id.as_deref()).await {
@@ -347,6 +435,7 @@ async fn maybe_auto_compact(
     state: &mut ReplState,
     ctx: &ReplTurnContext<'_>,
     token: &str,
+    current_message: &str,
 ) -> Result<(), String> {
     if state.history.len() <= state.context_budget.keep_recent_turns {
         return Ok(());
@@ -405,7 +494,7 @@ async fn maybe_auto_compact(
     .await;
 
     if let Ok(result) = compact_result {
-        apply_auto_compact_result(state, ctx, token, result).await?;
+        apply_auto_compact_result(state, ctx, token, result, current_message).await?;
     }
 
     Ok(())
@@ -432,6 +521,7 @@ async fn apply_auto_compact_result(
     ctx: &ReplTurnContext<'_>,
     token: &str,
     result: StreamResult,
+    current_message: &str,
 ) -> Result<(), String> {
     let summary = result.full_text.trim().to_string();
     if summary.is_empty() {
@@ -440,18 +530,29 @@ async fn apply_auto_compact_result(
 
     let keep = state.context_budget.keep_recent_turns;
     let total = state.history.len();
-    let trimmed = total.saturating_sub(keep);
-    if trimmed == 0 {
+    if total <= keep {
+        return Ok(());
+    }
+
+    // Use relevance scoring to decide which turns to preserve as individual
+    // messages vs. compact into the summary.
+    let kept_indices = select_turns_for_compaction(&state.history, keep, current_message);
+    let compacted_count = total - kept_indices.len();
+    if compacted_count == 0 {
         return Ok(());
     }
 
     let anchor =
         fetch_compact_memory_anchor_snippet(ctx.api, token, state.session_id.as_deref(), &summary)
             .await;
-    let assistant_text = compact_assistant_message(trimmed, &summary, anchor.as_deref());
+    let assistant_text = compact_assistant_message(compacted_count, &summary, anchor.as_deref());
     let summary_entry = (String::new(), assistant_text);
     let mut new_history = vec![summary_entry];
-    new_history.extend_from_slice(&state.history[trimmed..]);
+
+    // Append the preserved turns (in original order)
+    for &idx in &kept_indices {
+        new_history.push(state.history[idx].clone());
+    }
     state.history = new_history;
     state.recent_tools.clear();
 
@@ -473,10 +574,27 @@ async fn apply_auto_compact_result(
         astra_core::agent_warn!("repl_turn", "failed to persist compacted memory: {e}");
     }
 
+    // Report which turns were kept by relevance (if any older turns survived)
+    let recent_start = total.saturating_sub(keep / 2);
+    let relevance_kept: Vec<usize> = kept_indices
+        .iter()
+        .filter(|&&i| i < recent_start)
+        .copied()
+        .collect();
+    let relevance_note = if relevance_kept.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " ({} older turn{} kept by relevance)",
+            relevance_kept.len(),
+            if relevance_kept.len() == 1 { "" } else { "s" }
+        )
+    };
+
     eprintln!(
         "  {}",
         format!(
-            "{} Compacted {trimmed} turns → {} in context",
+            "{} Compacted {compacted_count} turns → {} in context{relevance_note}",
             crate::theme::icon_ok(),
             state.history.len()
         )
@@ -2230,5 +2348,114 @@ mod tests {
             .filter(|m| m["role"] == "user")
             .collect();
         assert_eq!(user_messages.len(), 2, "failed turn must not create extra user message");
+    }
+
+    // ── Relevance scoring tests ──────────────────────────────────────────
+
+    #[test]
+    fn tokenize_for_relevance_basic() {
+        let tokens = tokenize_for_relevance("Hello World, this is a TEST!");
+        assert!(tokens.contains("hello"));
+        assert!(tokens.contains("world"));
+        assert!(tokens.contains("this"));
+        assert!(tokens.contains("test"));
+        // Single-char tokens filtered out
+        assert!(!tokens.contains("a"));
+    }
+
+    #[test]
+    fn tokenize_for_relevance_empty() {
+        let tokens = tokenize_for_relevance("");
+        assert!(tokens.is_empty());
+    }
+
+    #[test]
+    fn score_turn_relevance_exact_overlap() {
+        let context_tokens = tokenize_for_relevance("database migration schema");
+        let turn = (
+            "How to run database migration?".to_string(),
+            "Use the migration tool.".to_string(),
+        );
+        let score = score_turn_relevance(&turn, &context_tokens);
+        assert!(score > 0.0, "overlapping turn should score > 0, got {score}");
+    }
+
+    #[test]
+    fn score_turn_relevance_no_overlap() {
+        let context_tokens = tokenize_for_relevance("database migration schema");
+        let turn = (
+            "What color is the sky?".to_string(),
+            "It is blue.".to_string(),
+        );
+        let score = score_turn_relevance(&turn, &context_tokens);
+        assert!(
+            score == 0.0,
+            "non-overlapping turn should score 0, got {score}"
+        );
+    }
+
+    #[test]
+    fn score_turn_relevance_user_weighted_higher() {
+        let context_tokens = tokenize_for_relevance("deploy kubernetes cluster");
+        // User message has overlap, assistant doesn't
+        let turn_user_match = (
+            "deploy to kubernetes".to_string(),
+            "Sure, I will help.".to_string(),
+        );
+        // Assistant message has overlap, user doesn't
+        let turn_asst_match = (
+            "Please help me.".to_string(),
+            "deploy to kubernetes cluster".to_string(),
+        );
+        let score_user = score_turn_relevance(&turn_user_match, &context_tokens);
+        let score_asst = score_turn_relevance(&turn_asst_match, &context_tokens);
+        assert!(
+            score_user > score_asst,
+            "user-side match ({score_user}) should score higher than assistant-side ({score_asst})"
+        );
+    }
+
+    #[test]
+    fn select_turns_preserves_recent_and_relevant() {
+        // 10 turns: turns 0,1 are about "database", turns 2-7 are filler, 8-9 are recent
+        let history: Vec<(String, String)> = vec![
+            ("setup database schema".into(), "Done, schema created.".into()),
+            ("add database indexes".into(), "Added indexes on user_id.".into()),
+            ("what is the weather".into(), "It's sunny.".into()),
+            ("tell me a joke".into(), "Why did the chicken...".into()),
+            ("random topic alpha".into(), "Alpha response.".into()),
+            ("random topic beta".into(), "Beta response.".into()),
+            ("random topic gamma".into(), "Gamma response.".into()),
+            ("random topic delta".into(), "Delta response.".into()),
+            ("recent turn one".into(), "Recent reply one.".into()),
+            ("recent turn two".into(), "Recent reply two.".into()),
+        ];
+        let kept = select_turns_for_compaction(&history, 6, "database query optimization");
+        // Should keep at least turns 8,9 (recent) and turns 0,1 (relevant to "database")
+        assert!(
+            kept.contains(&8) && kept.contains(&9),
+            "recent turns 8,9 must be kept: {kept:?}"
+        );
+        assert!(
+            kept.contains(&0) || kept.contains(&1),
+            "relevant database turns 0/1 should be kept: {kept:?}"
+        );
+        // Should NOT keep all filler turns
+        let filler_kept: Vec<usize> = kept.iter().filter(|&&i| (2..8).contains(&i)).copied().collect();
+        assert!(
+            filler_kept.len() < 6,
+            "not all filler turns should be kept: {kept:?}"
+        );
+        assert!(kept.len() <= 6, "total kept should not exceed budget: {kept:?}");
+    }
+
+    #[test]
+    fn select_turns_small_history_keeps_all() {
+        let history: Vec<(String, String)> = vec![
+            ("hello".into(), "world".into()),
+            ("foo".into(), "bar".into()),
+        ];
+        let kept = select_turns_for_compaction(&history, 6, "anything");
+        assert_eq!(kept.len(), 2, "should keep all when history < budget");
     }
 }
