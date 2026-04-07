@@ -4477,8 +4477,9 @@ async fn handle_slash_command(
             handle_info_command(cmd, arg, api, state, token).await?;
         }
 
-        "/skill" | "/skill list" | "/skill info" | "/skill search" | "/skill new"
-        | "/skill create" | "/skill test" | "/skill dev" | "/skill doctor" | "/skill system" => {
+        "/skill" | "/skill list" | "/skill info" | "/skill search" | "/skill surfacing"
+        | "/skill new" | "/skill create" | "/skill test" | "/skill dev" | "/skill doctor"
+        | "/skill system" => {
             handle_skill_command(arg, api, state, token).await?;
         }
 
@@ -4535,7 +4536,7 @@ async fn handle_slash_command(
             }
         }
 
-        "/clear" | "/explain" | "/verbose" | "/compact" | "/reflect" | "/skill-search" | "/undo" => {
+        "/clear" | "/explain" | "/verbose" | "/compact" | "/reflect" | "/undo" => {
             handle_state_command(
                 cmd,
                 arg,

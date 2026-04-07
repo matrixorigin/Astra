@@ -42,10 +42,6 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
         "Cycle explain: off → on (API) → verbose (+stderr)",
     ),
     (
-        "/skill-search",
-        "Session skill surfacing config: show/reset/dynamic/min/cap",
-    ),
-    (
         "/compact",
         "Summarize & trim history — optional: quick | summary-only | no-memoria",
     ),
@@ -92,7 +88,7 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ),
     (
         "/skill",
-        "Skill management: /skill [list|info|search|new|dev|test|doctor|system]",
+        "Skill management: /skill [list|info|search|surfacing|new|dev|test|doctor|system|…]",
     ),
     (
         "/mcp",
@@ -255,6 +251,7 @@ const SLASH_FIRST_TOKEN_COMPLETIONS: &[(&str, &[(&str, &str)])] = &[
             ("list", "List skills"),
             ("new", "Create skill"),
             ("search", "Keyword search catalog"),
+            ("surfacing", "Agent catalog surfacing (dynamic/min/cap)"),
             ("system", "System skill helpers"),
             ("test", "Run skill test"),
         ],
@@ -604,10 +601,13 @@ fn slash_argument_hint(command: &str) -> Option<&'static str> {
         "/search files" => Some("<glob>"),
         "/search review" => Some("<pattern>"),
         "/review" => Some("[latest|<rev>|working]"),
-        "/skill" => Some("[list|info|search|new|test|dev|doctor|system|…]"),
+        "/skill" => Some("[list|info|search|surfacing|new|test|dev|doctor|system|…]"),
         "/skill list" => Some("[query] [--source=local|bundled|mcp] [--category=X]"),
         "/skill info" => Some("<name> [--raw]"),
         "/skill search" => Some("<query> — keyword match on catalog"),
+        "/skill surfacing" => Some(
+            "[show|status|reset|dynamic <on|off>|min <n>|cap <n>] — agent listing vs discover_skills",
+        ),
         "/skill new" => Some("<name>"),
         "/skill create" => Some("<name> — auto-generate from current session"),
         "/skill test" => Some("<name> [json_args]"),

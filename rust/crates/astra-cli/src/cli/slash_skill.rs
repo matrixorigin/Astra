@@ -1,5 +1,119 @@
 use super::*;
 
+// ── Catalog surfacing (SkillSearchSettings → agent context; was /skill-search) ──
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SkillSurfacingCmd {
+    Show,
+    Reset,
+    SetDynamic(bool),
+    SetMinCatalog(usize),
+    SetSurfaceCap(usize),
+}
+
+fn format_skill_surfacing_line(settings: &astra_core::SkillSearchSettings) -> String {
+    format!(
+        "dynamic={}, min_catalog_size={}, surface_cap={}",
+        settings.dynamic_surface, settings.min_catalog_size, settings.surface_cap
+    )
+}
+
+fn parse_skill_surfacing(arg: &str) -> Result<SkillSurfacingCmd, String> {
+    let arg = arg.trim();
+    if arg.is_empty() || matches!(arg, "show" | "status") {
+        return Ok(SkillSurfacingCmd::Show);
+    }
+    if arg == "reset" {
+        return Ok(SkillSurfacingCmd::Reset);
+    }
+
+    let mut parts = arg.split_whitespace();
+    let key = parts.next().unwrap_or_default();
+    let value = parts.next().unwrap_or_default();
+    if parts.next().is_some() {
+        return Err(
+            "Usage: /skill surfacing [show|status|reset|dynamic <on|off>|min <n>|cap <n>]"
+                .to_string(),
+        );
+    }
+
+    match key {
+        "dynamic" => match value.to_ascii_lowercase().as_str() {
+            "on" | "true" | "1" => Ok(SkillSurfacingCmd::SetDynamic(true)),
+            "off" | "false" | "0" => Ok(SkillSurfacingCmd::SetDynamic(false)),
+            _ => Err("Usage: /skill surfacing dynamic <on|off>".to_string()),
+        },
+        "min" => value
+            .parse::<usize>()
+            .ok()
+            .filter(|n| *n > 0)
+            .map(SkillSurfacingCmd::SetMinCatalog)
+            .ok_or_else(|| "Usage: /skill surfacing min <positive-integer>".to_string()),
+        "cap" => value
+            .parse::<usize>()
+            .ok()
+            .filter(|n| *n > 0)
+            .map(SkillSurfacingCmd::SetSurfaceCap)
+            .ok_or_else(|| "Usage: /skill surfacing cap <positive-integer>".to_string()),
+        _ => Err(
+            "Usage: /skill surfacing [show|status|reset|dynamic <on|off>|min <n>|cap <n>]"
+                .to_string(),
+        ),
+    }
+}
+
+fn apply_skill_surfacing(state: &mut ReplState, command: SkillSurfacingCmd) -> (String, bool) {
+    match command {
+        SkillSurfacingCmd::Show => (
+            format!(
+                "Catalog surfacing: {}",
+                format_skill_surfacing_line(&state.skill_search)
+            ),
+            false,
+        ),
+        SkillSurfacingCmd::Reset => {
+            state.skill_search = astra_core::SkillSearchSettings::default();
+            (
+                format!(
+                    "Catalog surfacing reset: {}",
+                    format_skill_surfacing_line(&state.skill_search)
+                ),
+                true,
+            )
+        }
+        SkillSurfacingCmd::SetDynamic(dynamic) => {
+            state.skill_search.dynamic_surface = dynamic;
+            (
+                format!(
+                    "Catalog surfacing updated: {}",
+                    format_skill_surfacing_line(&state.skill_search)
+                ),
+                true,
+            )
+        }
+        SkillSurfacingCmd::SetMinCatalog(min_catalog_size) => {
+            state.skill_search.min_catalog_size = min_catalog_size;
+            (
+                format!(
+                    "Catalog surfacing updated: {}",
+                    format_skill_surfacing_line(&state.skill_search)
+                ),
+                true,
+            )
+        }
+        SkillSurfacingCmd::SetSurfaceCap(surface_cap) => {
+            state.skill_search.surface_cap = surface_cap;
+            (
+                format!(
+                    "Catalog surfacing updated: {}",
+                    format_skill_surfacing_line(&state.skill_search)
+                ),
+                true,
+            )
+        }
+    }
+}
+
 pub(super) async fn handle_skill_command(
     arg: &str,
     api: &astra_thin_client::ThinClient,
@@ -64,6 +178,11 @@ pub(super) async fn handle_skill_command(
                 "    {}  {}",
                 "/skill search <query>".cyan(),
                 "Keyword match (name, tags, description, …)".dim()
+            );
+            eprintln!(
+                "    {}  {}",
+                "/skill surfacing …".cyan(),
+                "Agent catalog: dynamic/min/cap (discover_skills path)".dim()
             );
             eprintln!(
                 "    {}  {}",
@@ -286,6 +405,25 @@ pub(super) async fn handle_skill_command(
                 eprintln!("\n  {} results (showing top 10)", scored.len());
             }
             eprintln!();
+        }
+
+        "surfacing" => {
+            let command = match parse_skill_surfacing(sub_arg) {
+                Ok(command) => command,
+                Err(message) => {
+                    eprintln!("  {}", message.yellow());
+                    return Ok(());
+                }
+            };
+            let (message, changed) = apply_skill_surfacing(state, command);
+            eprintln!("  {}", message.green());
+            if changed && let Some(ref j) = state.journal {
+                let _ = j.append(&astra_services::session_journal::JournalEvent::config_change(
+                    state.session_id.as_deref(),
+                    "skill_search",
+                    &format_skill_surfacing_line(&state.skill_search),
+                ));
+            }
         }
 
         "info" => {
@@ -1880,6 +2018,44 @@ mod tests {
         assert_eq!(q.as_deref(), Some("debug"));
         assert_eq!(s.as_deref(), Some("bundled"));
         assert!(c.is_none());
+    }
+
+    #[test]
+    fn parse_skill_surfacing_supports_status_and_updates() {
+        assert_eq!(parse_skill_surfacing("").unwrap(), SkillSurfacingCmd::Show);
+        assert_eq!(parse_skill_surfacing("status").unwrap(), SkillSurfacingCmd::Show);
+        assert_eq!(
+            parse_skill_surfacing("dynamic off").unwrap(),
+            SkillSurfacingCmd::SetDynamic(false)
+        );
+        assert_eq!(
+            parse_skill_surfacing("min 12").unwrap(),
+            SkillSurfacingCmd::SetMinCatalog(12)
+        );
+        assert_eq!(
+            parse_skill_surfacing("cap 20").unwrap(),
+            SkillSurfacingCmd::SetSurfaceCap(20)
+        );
+    }
+
+    #[test]
+    fn apply_skill_surfacing_mutates_repl_state() {
+        let mut state = ReplState::default();
+
+        let (_, changed) = apply_skill_surfacing(&mut state, SkillSurfacingCmd::SetDynamic(false));
+        assert!(changed);
+        assert!(!state.skill_search.dynamic_surface);
+
+        let (_, changed) = apply_skill_surfacing(&mut state, SkillSurfacingCmd::SetMinCatalog(11));
+        assert!(changed);
+        assert_eq!(state.skill_search.min_catalog_size, 11);
+
+        let (_, changed) = apply_skill_surfacing(&mut state, SkillSurfacingCmd::SetSurfaceCap(19));
+        assert!(changed);
+        assert_eq!(state.skill_search.surface_cap, 19);
+
+        let (_, changed) = apply_skill_surfacing(&mut state, SkillSurfacingCmd::Show);
+        assert!(!changed);
     }
 
     #[test]
