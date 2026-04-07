@@ -4,6 +4,12 @@ This document maps **user-visible capabilities** to **where they are tested**, s
 
 Legend: **E2E** = `rust/crates/runtime/tests/system_matrix_http_e2e/` with `ASTRA_SYSTEM_MATRIX_E2E=1` (real MatrixOne + HTTP + `sqlx` where noted). **Stub** = `build_app(AppState::new(...))` with in-memory/stub services (no DB). **Unit** = `#[cfg(test)]` in crate sources or small integration tests without HTTP.
 
+## Configuration (`AppSettings`)
+
+| Capability | E2E | Removed stub | Other |
+|------------|-----|--------------|-------|
+| Env map defaults / overrides / embedding model errors vs `fixtures/contracts/settings_contract.json` | — | `config_contract` | `astra-core` `config::settings_contract_tests` |
+
 ## Core API (auth, sessions, agents, events)
 
 | Capability | E2E (`system_matrix_http_e2e`) | Removed stub tests (replaced by E2E) | Other |
