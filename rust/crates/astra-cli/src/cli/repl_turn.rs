@@ -221,18 +221,24 @@ pub(super) async fn handle_chat_input(
 }
 
 pub(super) fn build_effective_line(line: &str, state: &ReplState) -> String {
-    let mut effective_line = if let (Some(skill_name), Some(skill_dir)) = (
-        state.skill_dev_name.as_deref(),
-        state.skill_dev_dir.as_deref(),
-    ) {
+    let mut effective_line = if let Some(ref dev) = state.skill_dev {
+        let skill_md = dev.dir.join("SKILL.md");
         // Re-read SKILL.md from disk every turn so external edits are picked up.
-        match std::fs::read_to_string(skill_dir.join("SKILL.md")) {
-            Ok(source) => format!(
+        match std::fs::read_to_string(&skill_md) {
+            Ok(source) if !source.trim().is_empty() => format!(
                 "{}{line}",
-                prompts::build_skill_dev_prefix(skill_name, &source)
+                prompts::build_skill_dev_prefix(
+                    &dev.name,
+                    &skill_md.display().to_string(),
+                    &source,
+                )
             ),
+            Ok(_) => {
+                eprintln!("  ⚠ SKILL.md is empty at {}, dev context skipped", skill_md.display());
+                line.to_string()
+            }
             Err(_) => {
-                eprintln!("  ⚠ SKILL.md not found at {}, dev context skipped", skill_dir.display());
+                eprintln!("  ⚠ SKILL.md not found at {}, dev context skipped", skill_md.display());
                 line.to_string()
             }
         }
@@ -1652,8 +1658,10 @@ mod tests {
         .unwrap();
 
         let state = ReplState {
-            skill_dev_name: Some("test-skill".to_string()),
-            skill_dev_dir: Some(skill_dir),
+            skill_dev: Some(super::super::SkillDevState {
+                name: "test-skill".to_string(),
+                dir: skill_dir,
+            }),
             ..ReplState::default()
         };
 
@@ -1664,16 +1672,109 @@ mod tests {
     }
 
     #[test]
+    fn build_effective_line_skill_dev_picks_up_external_edits() {
+        let tmp = tempfile::tempdir().unwrap();
+        let skill_dir = tmp.path().join("evolving");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(skill_dir.join("SKILL.md"), "---\nname: evolving\n---\nV1").unwrap();
+
+        let state = ReplState {
+            skill_dev: Some(super::super::SkillDevState {
+                name: "evolving".to_string(),
+                dir: skill_dir.clone(),
+            }),
+            ..ReplState::default()
+        };
+
+        let turn1 = build_effective_line("check", &state);
+        assert!(turn1.contains("V1"));
+
+        // Simulate external edit between turns
+        std::fs::write(skill_dir.join("SKILL.md"), "---\nname: evolving\n---\nV2 rewritten").unwrap();
+
+        let turn2 = build_effective_line("check again", &state);
+        assert!(!turn2.contains("V1"), "should not contain old content");
+        assert!(turn2.contains("V2 rewritten"), "should contain new content");
+    }
+
+    #[test]
     fn build_effective_line_skill_dev_missing_file_falls_through() {
         let state = ReplState {
-            skill_dev_name: Some("ghost".to_string()),
-            skill_dev_dir: Some(std::path::PathBuf::from("/nonexistent/path/ghost")),
+            skill_dev: Some(super::super::SkillDevState {
+                name: "ghost".to_string(),
+                dir: std::path::PathBuf::from("/nonexistent/path/ghost"),
+            }),
             ..ReplState::default()
         };
 
         let effective = build_effective_line("hello", &state);
-        // Should fall through without prefix when file is missing
         assert_eq!(effective, "hello");
+    }
+
+    #[test]
+    fn build_effective_line_skill_dev_empty_file_falls_through() {
+        let tmp = tempfile::tempdir().unwrap();
+        let skill_dir = tmp.path().join("empty-skill");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(skill_dir.join("SKILL.md"), "").unwrap();
+
+        let state = ReplState {
+            skill_dev: Some(super::super::SkillDevState {
+                name: "empty-skill".to_string(),
+                dir: skill_dir,
+            }),
+            ..ReplState::default()
+        };
+
+        let effective = build_effective_line("hello", &state);
+        // Empty SKILL.md should not inject a useless prefix
+        assert_eq!(effective, "hello");
+    }
+
+    #[test]
+    fn build_effective_line_skill_dev_shows_actual_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let skill_dir = tmp.path().join("custom-loc");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(skill_dir.join("SKILL.md"), "---\nname: custom-loc\n---\nBody").unwrap();
+
+        let state = ReplState {
+            skill_dev: Some(super::super::SkillDevState {
+                name: "custom-loc".to_string(),
+                dir: skill_dir.clone(),
+            }),
+            ..ReplState::default()
+        };
+
+        let effective = build_effective_line("x", &state);
+        // Must contain the actual path, not a hardcoded .astra/skills/ path
+        let expected_path = skill_dir.join("SKILL.md").display().to_string();
+        assert!(effective.contains(&expected_path), "should contain actual path: {expected_path}");
+    }
+
+    #[test]
+    fn build_effective_line_skill_dev_combines_with_system_skills_and_anchor() {
+        let tmp = tempfile::tempdir().unwrap();
+        let skill_dir = tmp.path().join("combo");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(skill_dir.join("SKILL.md"), "---\nname: combo\n---\nCombo skill").unwrap();
+
+        let state = ReplState {
+            skill_dev: Some(super::super::SkillDevState {
+                name: "combo".to_string(),
+                dir: skill_dir,
+            }),
+            active_system_skills: vec![prompts::builtin_concise_skill()],
+            continuation_anchor: Some("Previous task: fix auth".to_string()),
+            ..ReplState::default()
+        };
+
+        // Short continuation prompt triggers all three layers
+        let effective = build_effective_line("continue", &state);
+        assert!(effective.contains("[SKILL DEV: combo]"), "skill dev prefix");
+        assert!(effective.contains("Concise"), "system skill");
+        assert!(effective.contains("[Continuation anchor]"), "anchor");
+        assert!(effective.contains("fix auth"), "anchor content");
     }
 
     // ── Cost tracking & status line logic tests ──────────────────────────

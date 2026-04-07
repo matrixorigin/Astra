@@ -3,16 +3,16 @@
 /// Provides the full skill source (re-read from disk each turn) plus
 /// structured editing guidelines. Prevents the LLM from re-reading
 /// the file it already has in context.
-pub fn build_skill_dev_prefix(skill_name: &str, skill_src: &str) -> String {
+pub fn build_skill_dev_prefix(skill_name: &str, skill_path: &str, skill_src: &str) -> String {
     format!(
         "[SKILL DEV: {skill_name}]\n\
          You are in skill development mode. The complete, live source of \"{skill_name}\" is below.\n\
-         File: `.astra/skills/{skill_name}/SKILL.md` (re-read from disk each turn)\n\n\
+         File: `{skill_path}` (re-read from disk each turn)\n\n\
          ```markdown\n\
          {skill_src}\n\
          ```\n\n\
          ## Dev Guidelines\n\
-         - Edit via `write_file` — do NOT `read_file` or `grep` for this skill, you already have it.\n\
+         - Edit via `write_file` to `{skill_path}` — do NOT `read_file` or `grep` for this skill, you already have it.\n\
          - After any edit, validate: frontmatter must parse as YAML, `name` must be non-empty.\n\
          - Every step needs a **Success criteria** line.\n\
          - `when_to_use` must start with \"Use when...\" and include trigger phrases.\n\
@@ -92,11 +92,12 @@ mod tests {
 
     #[test]
     fn build_skill_dev_prefix_contains_name_and_src() {
-        let r = build_skill_dev_prefix("my-skill", "# My Skill\nDo stuff");
+        let r = build_skill_dev_prefix("my-skill", "/project/.astra/skills/my-skill/SKILL.md", "# My Skill\nDo stuff");
         assert!(r.contains("my-skill"));
         assert!(r.contains("# My Skill"));
         assert!(r.contains("Do stuff"));
         assert!(r.contains("SKILL DEV"));
+        assert!(r.contains("/project/.astra/skills/my-skill/SKILL.md"));
     }
 
     #[test]

@@ -524,6 +524,13 @@ impl std::fmt::Display for ExplainMode {
     }
 }
 
+/// Active `/skill dev` session — name and directory are always set together.
+#[derive(Clone, Debug)]
+struct SkillDevState {
+    name: String,
+    dir: std::path::PathBuf,
+}
+
 struct ReplState {
     session_id: Option<String>,
     run_id: Option<String>,
@@ -544,8 +551,7 @@ struct ReplState {
     total_session_cost: f64,
     /// Cached pricing data for the active model (used by /cost).
     cached_pricing: astra_services::models::PricingData,
-    skill_dev_name: Option<String>,
-    skill_dev_dir: Option<std::path::PathBuf>,
+    skill_dev: Option<SkillDevState>,
     active_system_skills: Vec<prompts::SystemSkill>,
     context_budget: prompts::ContextBudget,
     journal: Option<session_journal::JournalWriter>,
@@ -660,8 +666,7 @@ impl Default for ReplState {
             total_cache_creation_tokens: 0,
             total_session_cost: 0.0,
             cached_pricing: Default::default(),
-            skill_dev_name: None,
-            skill_dev_dir: None,
+            skill_dev: None,
             active_system_skills: Vec::new(),
             context_budget: prompts::ContextBudget::default(),
             journal: None,
@@ -4629,8 +4634,8 @@ async fn run_chat_repl(
         // have ambiguous display widths that break cursor tracking for CJK input.
         // ANSI color codes are safe — rustyline's calculate_position() treats them
         // as width=0 so cursor math is unaffected.
-        if let Some(ref sname) = state.skill_dev_name {
-            eprintln!("  \u{1f527} {}", format!("Skill dev: {sname}").cyan().dim());
+        if let Some(ref dev) = state.skill_dev {
+            eprintln!("  \u{1f527} {}", format!("Skill dev: {}", dev.name).cyan().dim());
         }
         let prompt_str = if state.plan_mode.is_some() {
             theme::PROMPT_PLAN.to_string()

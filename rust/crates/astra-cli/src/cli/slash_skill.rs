@@ -31,8 +31,8 @@ pub(super) async fn handle_skill_command(
             if mcp > 0 {
                 eprintln!("  {:<16} {}", "mcp:".dim(), mcp.to_string().cyan());
             }
-            if let Some(ref name) = state.skill_dev_name {
-                eprintln!("  {:<16} {} {}", "dev mode:".dim(), name.as_str().cyan(), "(use /skill dev off to exit)".dim());
+            if let Some(ref dev) = state.skill_dev {
+                eprintln!("  {:<16} {} {}", "dev mode:".dim(), dev.name.as_str().cyan(), "(use /skill dev off to exit)".dim());
             }
             eprintln!();
             eprintln!("  {}", "Subcommands:".dim());
@@ -565,17 +565,16 @@ Follow these steps:
 
         "dev" => {
             if sub_arg == "off" {
-                state.skill_dev_name = None;
-                state.skill_dev_dir = None;
+                state.skill_dev = None;
                 eprintln!("  {}", "Exited skill dev mode".green());
                 return Ok(());
             }
             let name = sub_arg;
             if name.is_empty() {
-                if let Some(ref current) = state.skill_dev_name.clone() {
+                if let Some(ref dev) = state.skill_dev {
                     eprintln!(
                         "  \u{1f527} Currently in skill dev mode: {}",
-                        current.as_str().cyan()
+                        dev.name.as_str().cyan()
                     );
                     eprintln!("  Use /skill dev off to exit.");
                 } else {
@@ -611,8 +610,10 @@ Follow these steps:
                     return Ok(());
                 }
             };
-            state.skill_dev_name = Some(name.to_string());
-            state.skill_dev_dir = Some(skill_dir.clone());
+            state.skill_dev = Some(super::SkillDevState {
+                name: name.to_string(),
+                dir: skill_dir.clone(),
+            });
             eprintln!(
                 "\n  \u{1f527} {} {}",
                 "Skill dev mode:".bold(),
