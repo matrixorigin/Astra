@@ -30,7 +30,8 @@ Legend: **E2E** = `rust/crates/runtime/tests/system_matrix_http_e2e/` with `ASTR
 | Data versioning lineage | `journey_full` | `data_versioning_contract` |
 | Replay compare | `journey_full` | `replay_contract` |
 | `POST /chat/route` (shape + auth path) | `journey_full` + unit tests in `runtime/src/server/chat_route.rs` | `chat_route_contract` |
-| `GET /models` (authenticated list) | `journey_full` | — (admin create/update/delete still `model_crud_contract` stub) |
+| `GET /models` (authenticated list) | `journey_full` | — |
+| Models admin CRUD + `infra_llm_models` | `journey_extended::run_models_admin_crud_with_db` (`provider: mock`, `grant_astra_admin_role`) | `model_crud_contract` |
 
 ## Large integration binaries (audit — not removed in this pass)
 
