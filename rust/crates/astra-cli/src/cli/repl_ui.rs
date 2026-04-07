@@ -340,6 +340,126 @@ const SLASH_FIRST_TOKEN_COMPLETIONS: &[(&str, &[(&str, &str)])] = &[
     ),
 ];
 
+// ── Dynamic (second-token) completions ──────────────────────────────────────
+// After `/skill dev ` or `/mcp ping `, complete with skill names / MCP server
+// names etc.  Updated from the REPL loop whenever the registries change.
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum DynKey {
+    SkillName,
+    McpServer,
+}
+
+/// Maps a `(/cmd, subcmd)` pair to the dynamic key whose entries should be offered.
+const DYN_SECOND_TOKEN: &[(&str, &str, DynKey)] = &[
+    ("/skill", "dev", DynKey::SkillName),
+    ("/skill", "test", DynKey::SkillName),
+    ("/skill", "info", DynKey::SkillName),
+    ("/skill", "config", DynKey::SkillName),
+    ("/skill", "validate", DynKey::SkillName),
+    ("/mcp", "ping", DynKey::McpServer),
+    ("/mcp", "log-level", DynKey::McpServer),
+];
+
+#[derive(Default)]
+struct DynamicCompletionData {
+    skill_names: Vec<(String, String)>,
+    mcp_servers: Vec<(String, String)>,
+}
+
+static DYNAMIC_COMPLETIONS: OnceLock<Mutex<DynamicCompletionData>> = OnceLock::new();
+
+fn dynamic_completions() -> &'static Mutex<DynamicCompletionData> {
+    DYNAMIC_COMPLETIONS.get_or_init(|| Mutex::new(DynamicCompletionData::default()))
+}
+
+/// Called from the REPL loop to refresh available skill names for autocomplete.
+pub(super) fn update_skill_completions(names: Vec<(String, String)>) {
+    if let Ok(mut g) = dynamic_completions().lock() {
+        g.skill_names = names;
+    }
+}
+
+/// Called from the REPL loop to refresh available MCP server names for autocomplete.
+pub(super) fn update_mcp_completions(names: Vec<(String, String)>) {
+    if let Ok(mut g) = dynamic_completions().lock() {
+        g.mcp_servers = names;
+    }
+}
+
+/// Try to complete the second token (after `/cmd subcmd `).
+fn slash_second_token_completions(line: &str, pos: usize) -> Option<(usize, Vec<Pair>)> {
+    let (key, partial_lower, arg_start) = parse_second_token_context(line, pos)?;
+    let entries = {
+        let g = dynamic_completions().lock().ok()?;
+        match key {
+            DynKey::SkillName => g.skill_names.clone(),
+            DynKey::McpServer => g.mcp_servers.clone(),
+        }
+    };
+    build_second_token_pairs(&entries, &partial_lower, arg_start)
+}
+
+/// Parse the command line to determine the dynamic key and partial token.
+fn parse_second_token_context(line: &str, pos: usize) -> Option<(DynKey, String, usize)> {
+    let pos = pos.min(line.len());
+    let before = line.get(..pos)?;
+
+    let mut parts = before.splitn(3, char::is_whitespace);
+    let cmd = parts.next()?;
+    if !cmd.starts_with('/') {
+        return None;
+    }
+    let subcmd_raw = parts.next()?;
+    let rest = parts.next().unwrap_or("");
+
+    if rest.contains(' ') {
+        return None;
+    }
+
+    let cmd_lower = cmd.to_ascii_lowercase();
+    let subcmd_lower = subcmd_raw.to_ascii_lowercase();
+    let resolved_cmd = resolve_slash_command(&cmd_lower).unwrap_or(cmd_lower.as_str());
+
+    let key = DYN_SECOND_TOKEN.iter().find_map(|(c, s, k)| {
+        if (*c == resolved_cmd || *c == cmd_lower) && *s == subcmd_lower {
+            Some(*k)
+        } else {
+            None
+        }
+    })?;
+
+    let partial_lower = rest.to_ascii_lowercase();
+    let arg_start = before.len() - rest.len();
+    Some((key, partial_lower, arg_start))
+}
+
+/// Build completion pairs from entries filtered by partial prefix.
+fn build_second_token_pairs(
+    entries: &[(String, String)],
+    partial_lower: &str,
+    arg_start: usize,
+) -> Option<(usize, Vec<Pair>)> {
+    let mut matches: Vec<Pair> = entries
+        .iter()
+        .filter(|(name, _)| name.to_ascii_lowercase().starts_with(partial_lower))
+        .map(|(name, desc)| Pair {
+            display: if desc.is_empty() {
+                name.clone()
+            } else {
+                format!("{:<20}  {}", name, desc)
+            },
+            replacement: name.clone(),
+        })
+        .collect();
+
+    if matches.is_empty() {
+        return None;
+    }
+    matches.sort_by(|a, b| a.replacement.cmp(&b.replacement));
+    Some((arg_start, matches))
+}
+
 fn slash_first_token_option_list(
     cmd_word: &str,
 ) -> Option<&'static [(&'static str, &'static str)]> {
@@ -1543,6 +1663,9 @@ impl Completer for ReplHelper {
             if let Some((start, pairs)) = slash_bare_command_trailing_completions(line, safe_pos) {
                 return Ok((start, pairs));
             }
+            if let Some((start, pairs)) = slash_second_token_completions(line, safe_pos) {
+                return Ok((start, pairs));
+            }
             if let Some((start, pairs)) = slash_first_token_completions(line, safe_pos) {
                 return Ok((start, pairs));
             }
@@ -2273,5 +2396,84 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn second_token_completions_skill_dev() {
+        let skills = vec![
+            ("say-hello".into(), "Greet user".into()),
+            ("summarize".into(), "Summarize text".into()),
+            ("search-code".into(), "Search codebase".into()),
+        ];
+
+        // Full list when cursor is right after "/skill dev "
+        let ctx = parse_second_token_context("/skill dev ", 11);
+        assert!(ctx.is_some(), "should parse '/skill dev ' context");
+        let (key, partial, start) = ctx.unwrap();
+        assert_eq!(key, DynKey::SkillName);
+        assert_eq!(start, 11);
+        let result = build_second_token_pairs(&skills, &partial, start);
+        assert!(result.is_some());
+        let (_, pairs) = result.unwrap();
+        assert_eq!(pairs.len(), 3);
+        assert_eq!(pairs[0].replacement, "say-hello");
+
+        // Partial match — "sa" prefix
+        let ctx = parse_second_token_context("/skill dev sa", 13).unwrap();
+        let result = build_second_token_pairs(&skills, &ctx.1, ctx.2);
+        assert!(result.is_some());
+        let (_, pairs) = result.unwrap();
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0].replacement, "say-hello");
+
+        // No match
+        let ctx = parse_second_token_context("/skill dev xyz", 14).unwrap();
+        let result = build_second_token_pairs(&skills, &ctx.1, ctx.2);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn second_token_completions_skill_test() {
+        let skills = vec![("my-skill".into(), "Test skill".into())];
+        let ctx = parse_second_token_context("/skill test m", 13);
+        assert!(ctx.is_some());
+        let (key, partial, start) = ctx.unwrap();
+        assert_eq!(key, DynKey::SkillName);
+        let result = build_second_token_pairs(&skills, &partial, start);
+        assert!(result.is_some());
+        let (_, pairs) = result.unwrap();
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0].replacement, "my-skill");
+    }
+
+    #[test]
+    fn second_token_completions_mcp_ping() {
+        let servers = vec![
+            ("github".into(), "Connected".into()),
+            ("slack".into(), "Connected".into()),
+        ];
+        let ctx = parse_second_token_context("/mcp ping g", 11);
+        assert!(ctx.is_some());
+        let (key, partial, start) = ctx.unwrap();
+        assert_eq!(key, DynKey::McpServer);
+        let result = build_second_token_pairs(&servers, &partial, start);
+        assert!(result.is_some());
+        let (_, pairs) = result.unwrap();
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0].replacement, "github");
+    }
+
+    #[test]
+    fn second_token_no_completions_for_unknown_subcmd() {
+        // "list" is not a registered DYN_SECOND_TOKEN subcmd for /skill
+        let ctx = parse_second_token_context("/skill list ", 12);
+        assert!(ctx.is_none());
+    }
+
+    #[test]
+    fn second_token_no_completions_past_second_token() {
+        // Already past the second token (3rd space-separated token)
+        let ctx = parse_second_token_context("/skill dev test-skill extra", 27);
+        assert!(ctx.is_none());
     }
 }
