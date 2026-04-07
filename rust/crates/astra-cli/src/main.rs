@@ -200,6 +200,16 @@ struct Cli {
     /// Load MCP server config from JSON file(s) or inline JSON strings
     #[arg(long = "mcp-config", num_args = 1..)]
     mcp_config: Vec<String>,
+    /// Use a specific session ID (must be a valid UUID)
+    #[arg(long = "session-id")]
+    session_id: Option<String>,
+    /// Set a display name for this session
+    #[arg(short = 'n', long = "name")]
+    session_name: Option<String>,
+    /// Minimal mode: skip hooks, auto-memory, background prefetches.
+    /// Only explicitly provided context (--system-prompt, --add-dir, --mcp-config) is used.
+    #[arg(long = "bare")]
+    bare: bool,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -689,6 +699,8 @@ struct SkillDevState {
 struct ReplState {
     session_id: Option<String>,
     run_id: Option<String>,
+    /// Display name for this session (set via --name flag).
+    session_name: Option<String>,
     model: Option<String>,
     turn: u32,
     last_response: Option<String>,
@@ -808,6 +820,7 @@ impl Default for ReplState {
         Self {
             session_id: None,
             run_id: None,
+            session_name: None,
             model: None,
             turn: 0,
             last_response: None,
@@ -4598,6 +4611,21 @@ async fn run_chat_repl(
         );
     }
 
+    // --session-id: override with explicit session UUID
+    if let Ok(sid) = std::env::var("ASTRA_SESSION_ID") {
+        state.session_id = Some(sid.clone());
+        eprintln!(
+            "{}",
+            format!("  Using session {}", truncate_str(&sid, 12))
+                .cyan()
+        );
+    }
+
+    // --name: set session display name
+    if let Ok(name) = std::env::var("ASTRA_SESSION_NAME") {
+        state.session_name = Some(name);
+    }
+
     // Load persisted skill quality data from previous sessions
     let skill_quality_path = dirs::config_dir()
         .unwrap_or_else(|| std::path::PathBuf::from("."))
@@ -5349,8 +5377,16 @@ async fn main() {
         add_dir,
         verbose,
         mcp_config,
+        session_id: cli_session_id,
+        session_name,
+        bare,
         command,
     } = cli;
+
+    // --bare: set env var for minimal mode
+    if bare {
+        unsafe { std::env::set_var("ASTRA_BARE", "1"); }
+    }
 
     // --max-turns: override via env var before RuntimeLimits singleton is initialized
     if let Some(turns) = max_turns {
@@ -5407,6 +5443,20 @@ async fn main() {
         if let Err(e) = command_router::load_mcp_configs(&mcp_config) {
             eprintln!("{}", format!("Warning: failed to load MCP config: {e}").yellow());
         }
+    }
+
+    // --session-id: validate UUID format and export for REPL to pick up
+    if let Some(ref sid) = cli_session_id {
+        if uuid::Uuid::parse_str(sid).is_err() {
+            eprintln!("{}", format!("Error: --session-id must be a valid UUID, got '{sid}'").red());
+            std::process::exit(1);
+        }
+        unsafe { std::env::set_var("ASTRA_SESSION_ID", sid); }
+    }
+
+    // --name: export session display name
+    if let Some(ref name) = session_name {
+        unsafe { std::env::set_var("ASTRA_SESSION_NAME", name); }
     }
 
     // Resolve model: --model flag > config default_model > None
@@ -8487,5 +8537,77 @@ total_tokens_out: 500
         ]).unwrap();
         assert_eq!(cli.allowed_tools, vec!["Read", "Edit"]);
         assert_eq!(cli.disallowed_tools, vec!["Bash"]);
+    }
+
+    // ── --session-id tests ──
+
+    #[test]
+    fn cli_session_id_flag() {
+        let cli = Cli::try_parse_from([
+            "astra", "--session-id", "550e8400-e29b-41d4-a716-446655440000",
+        ]).unwrap();
+        assert_eq!(cli.session_id.as_deref(), Some("550e8400-e29b-41d4-a716-446655440000"));
+    }
+
+    #[test]
+    fn cli_session_id_default_none() {
+        let cli = Cli::try_parse_from(["astra"]).unwrap();
+        assert!(cli.session_id.is_none());
+    }
+
+    // ── --name tests ──
+
+    #[test]
+    fn cli_name_short_flag() {
+        let cli = Cli::try_parse_from(["astra", "-n", "my-session"]).unwrap();
+        assert_eq!(cli.session_name.as_deref(), Some("my-session"));
+    }
+
+    #[test]
+    fn cli_name_long_flag() {
+        let cli = Cli::try_parse_from(["astra", "--name", "review-pr-42"]).unwrap();
+        assert_eq!(cli.session_name.as_deref(), Some("review-pr-42"));
+    }
+
+    #[test]
+    fn cli_name_default_none() {
+        let cli = Cli::try_parse_from(["astra"]).unwrap();
+        assert!(cli.session_name.is_none());
+    }
+
+    // ── --bare tests ──
+
+    #[test]
+    fn cli_bare_flag() {
+        let cli = Cli::try_parse_from(["astra", "--bare"]).unwrap();
+        assert!(cli.bare);
+    }
+
+    #[test]
+    fn cli_bare_default_false() {
+        let cli = Cli::try_parse_from(["astra"]).unwrap();
+        assert!(!cli.bare);
+    }
+
+    #[test]
+    fn cli_bare_with_print_and_system_prompt() {
+        let cli = Cli::try_parse_from([
+            "astra", "--bare", "-p", "--system-prompt", "Be brief",
+            "--add-dir", "/tmp/work",
+        ]).unwrap();
+        assert!(cli.bare);
+        assert!(cli.print);
+        assert_eq!(cli.system_prompt.as_deref(), Some("Be brief"));
+        assert_eq!(cli.add_dir, vec!["/tmp/work"]);
+    }
+
+    #[test]
+    fn cli_session_id_and_name_combined() {
+        let cli = Cli::try_parse_from([
+            "astra", "--session-id", "123e4567-e89b-12d3-a456-426614174000",
+            "-n", "debug-session",
+        ]).unwrap();
+        assert_eq!(cli.session_id.as_deref(), Some("123e4567-e89b-12d3-a456-426614174000"));
+        assert_eq!(cli.session_name.as_deref(), Some("debug-session"));
     }
 }
