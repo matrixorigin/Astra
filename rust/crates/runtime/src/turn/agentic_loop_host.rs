@@ -4797,7 +4797,7 @@ mod tests {
             .messages
             .push(json!({"role": "user", "content": "hello"}));
 
-        let msg_count_before = state.messages.len();
+        let _msg_count_before = state.messages.len();
         let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
         assert!(matches!(outcome, Ok(AgenticLoopOutcome::Completed)));
 
