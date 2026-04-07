@@ -1,4 +1,4 @@
-use std::{fs, path::PathBuf, sync::Arc};
+use std::{fs, net::SocketAddr, path::PathBuf, sync::Arc};
 
 use astra_runtime::{
     AppState, AuthLoginRequestData, AuthRefreshRequestData, AuthRegisterRequestData, AuthService,
@@ -429,6 +429,26 @@ data: {\"type\":\"turn_complete\",\"has_tool_calls\":false}\n\n",
     )
 }
 
+const INTERNAL_CHAT_TURN_PATH: &str = "/internal/chat/turn";
+
+/// Binds a local port and serves `router` on `/internal/chat/turn`-style tests (concrete `Router` type per site).
+macro_rules! spawn_internal_bridge {
+    ($router:expr) => {{
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test listener should bind");
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, $router).await.unwrap();
+        });
+        (addr, server)
+    }};
+}
+
+fn internal_chat_turn_url(addr: SocketAddr) -> String {
+    format!("http://{addr}{INTERNAL_CHAT_TURN_PATH}")
+}
+
 #[derive(Clone, Default)]
 struct SessionCaptureState {
     create_user_id: Arc<Mutex<Option<String>>>,
@@ -697,18 +717,9 @@ fn build_request(path: &str, auth_header: Option<&str>, body: serde_json::Value)
 macro_rules! internal_rebuild_case {
     ($contract:expr, $label:literal, $handler:expr, $check:expr) => {{
         let contract_ref: &BridgeContract = &$contract;
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("test listener should bind");
-        let addr = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move {
-            axum::serve(
-                listener,
-                Router::new().route("/internal/chat/turn", post($handler)),
-            )
-            .await
-            .unwrap();
-        });
+        let (addr, server) = spawn_internal_bridge!(
+            Router::new().route(INTERNAL_CHAT_TURN_PATH, post($handler))
+        );
 
         let app = build_app(
             AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker))
@@ -717,7 +728,7 @@ macro_rules! internal_rebuild_case {
                     capture: SessionCaptureState::default(),
                 }))
                 .with_chat_turn_bridge_secret(contract_ref.bridge_secret.clone())
-                .with_chat_turn_bridge_url(format!("http://{addr}/internal/chat/turn")),
+                .with_chat_turn_bridge_url(internal_chat_turn_url(addr)),
         );
 
         let response = app
@@ -1117,20 +1128,12 @@ async fn chat_turn_bridge_reuses_cached_continuity_state() {
             .as_secs_f64(),
     );
     let server_capture = capture.clone();
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("test listener should bind");
-    let addr = listener.local_addr().unwrap();
-    let server = tokio::spawn(async move {
-        axum::serve(
-            listener,
-            Router::new()
-                .route("/internal/chat/turn", post(capture_internal_turn))
-                .with_state(server_capture),
-        )
-        .await
-        .unwrap();
-    });
+    let (addr, server) = spawn_internal_bridge!(
+        Router::new()
+            .route("/internal/chat/turn", post(capture_internal_turn))
+            .with_state(server_capture)
+    );
+
     let app = build_app(
         AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker))
             .with_chat_turn_bridge_cache(bridge_cache)
@@ -1139,7 +1142,7 @@ async fn chat_turn_bridge_reuses_cached_continuity_state() {
                 capture: SessionCaptureState::default(),
             }))
             .with_chat_turn_bridge_secret(contract.bridge_secret)
-            .with_chat_turn_bridge_url(format!("http://{addr}/internal/chat/turn")),
+            .with_chat_turn_bridge_url(internal_chat_turn_url(addr)),
     );
 
     let response = app
@@ -1284,20 +1287,12 @@ async fn chat_turn_bridge_seeds_default_bridge_cache_state_from_created_at() {
             .as_secs_f64(),
     );
     let server_capture = capture.clone();
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("test listener should bind");
-    let addr = listener.local_addr().unwrap();
-    let server = tokio::spawn(async move {
-        axum::serve(
-            listener,
-            Router::new()
-                .route("/internal/chat/turn", post(capture_internal_turn))
-                .with_state(server_capture),
-        )
-        .await
-        .unwrap();
-    });
+    let (addr, server) = spawn_internal_bridge!(
+        Router::new()
+            .route("/internal/chat/turn", post(capture_internal_turn))
+            .with_state(server_capture)
+    );
+
     let app = build_app(
         AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker))
             .with_chat_turn_bridge_cache(bridge_cache)
@@ -1306,7 +1301,7 @@ async fn chat_turn_bridge_seeds_default_bridge_cache_state_from_created_at() {
                 capture: SessionCaptureState::default(),
             }))
             .with_chat_turn_bridge_secret(contract.bridge_secret)
-            .with_chat_turn_bridge_url(format!("http://{addr}/internal/chat/turn")),
+            .with_chat_turn_bridge_url(internal_chat_turn_url(addr)),
     );
 
     let response = app
@@ -1646,20 +1641,11 @@ async fn http_chat_turn_bridge_forwards_all_trusted_headers() {
     let contract = load_contract();
     let capture = CaptureState::default();
     let server_capture = capture.clone();
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("test listener should bind");
-    let addr = listener.local_addr().unwrap();
-    let server = tokio::spawn(async move {
-        axum::serve(
-            listener,
-            Router::new()
-                .route("/internal/chat/turn", post(capture_internal_turn))
-                .with_state(server_capture),
-        )
-        .await
-        .unwrap();
-    });
+    let (addr, server) = spawn_internal_bridge!(
+        Router::new()
+            .route("/internal/chat/turn", post(capture_internal_turn))
+            .with_state(server_capture)
+    );
 
     let session_capture = SessionCaptureState::default();
     let app = build_app(
@@ -1669,7 +1655,7 @@ async fn http_chat_turn_bridge_forwards_all_trusted_headers() {
                 capture: session_capture,
             }))
             .with_chat_turn_bridge_secret(contract.bridge_secret.clone())
-            .with_chat_turn_bridge_url(format!("http://{addr}/internal/chat/turn")),
+            .with_chat_turn_bridge_url(internal_chat_turn_url(addr)),
     );
 
     let response = app
@@ -1736,18 +1722,9 @@ async fn http_chat_turn_bridge_forwards_all_trusted_headers() {
 async fn http_chat_turn_bridge_filters_bridge_state_events() {
     let contract = load_contract();
     let bridge_cache = Arc::new(Mutex::new(SessionCache::new(1000, 86400.0)));
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("test listener should bind");
-    let addr = listener.local_addr().unwrap();
-    let server = tokio::spawn(async move {
-        axum::serve(
-            listener,
-            Router::new().route("/internal/chat/turn", post(bridge_state_internal_turn)),
-        )
-        .await
-        .unwrap();
-    });
+    let (addr, server) = spawn_internal_bridge!(
+        Router::new().route("/internal/chat/turn", post(bridge_state_internal_turn))
+    );
 
     let app = build_app(
         AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker))
@@ -1757,7 +1734,7 @@ async fn http_chat_turn_bridge_filters_bridge_state_events() {
                 capture: SessionCaptureState::default(),
             }))
             .with_chat_turn_bridge_secret(contract.bridge_secret)
-            .with_chat_turn_bridge_url(format!("http://{addr}/internal/chat/turn")),
+            .with_chat_turn_bridge_url(internal_chat_turn_url(addr)),
     );
 
     let response = app
@@ -1828,21 +1805,10 @@ async fn http_chat_turn_bridge_dispatches_hidden_side_effect_args() {
     let hook_db_capture = HookDbCaptureState::default();
     let activity_capture = ActivityCaptureState::default();
     let auxiliary_event_capture = AuxiliaryEventCaptureState::default();
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("test listener should bind");
-    let addr = listener.local_addr().unwrap();
-    let server = tokio::spawn(async move {
-        axum::serve(
-            listener,
-            Router::new().route(
-                "/internal/chat/turn",
-                post(bridge_state_with_persist_internal_turn),
-            ),
-        )
-        .await
-        .unwrap();
-    });
+    let (addr, server) = spawn_internal_bridge!(Router::new().route(
+        "/internal/chat/turn",
+        post(bridge_state_with_persist_internal_turn),
+    ));
 
     let app = build_app(
         AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker))
@@ -1866,7 +1832,7 @@ async fn http_chat_turn_bridge_dispatches_hidden_side_effect_args() {
                 capture: activity_capture.clone(),
             }))
             .with_chat_turn_bridge_secret(contract.bridge_secret.clone())
-            .with_chat_turn_bridge_url(format!("http://{addr}/internal/chat/turn")),
+            .with_chat_turn_bridge_url(internal_chat_turn_url(addr)),
     );
 
     let response = app
@@ -1997,21 +1963,10 @@ async fn http_chat_turn_bridge_persists_auxiliary_events_after_persist_success()
             .unwrap()
             .as_secs_f64(),
     );
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("test listener should bind");
-    let addr = listener.local_addr().unwrap();
-    let server = tokio::spawn(async move {
-        axum::serve(
-            listener,
-            Router::new().route(
-                "/internal/chat/turn",
-                post(bridge_state_with_aux_persist_internal_turn),
-            ),
-        )
-        .await
-        .unwrap();
-    });
+    let (addr, server) = spawn_internal_bridge!(Router::new().route(
+        "/internal/chat/turn",
+        post(bridge_state_with_aux_persist_internal_turn),
+    ));
 
     let app = build_app(
         AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker))
@@ -2027,7 +1982,7 @@ async fn http_chat_turn_bridge_persists_auxiliary_events_after_persist_success()
                 capture: auxiliary_event_capture.clone(),
             }))
             .with_chat_turn_bridge_secret(contract.bridge_secret.clone())
-            .with_chat_turn_bridge_url(format!("http://{addr}/internal/chat/turn")),
+            .with_chat_turn_bridge_url(internal_chat_turn_url(addr)),
     );
 
     let response = app
@@ -2103,21 +2058,10 @@ async fn http_chat_turn_bridge_persists_auxiliary_events_after_persist_success()
 async fn http_chat_turn_bridge_persists_snapshot_link_after_core_event_success() {
     let contract = load_contract();
     let core_event_capture = CoreEventCaptureState::default();
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("test listener should bind");
-    let addr = listener.local_addr().unwrap();
-    let server = tokio::spawn(async move {
-        axum::serve(
-            listener,
-            Router::new().route(
-                "/internal/chat/turn",
-                post(bridge_state_with_snapshot_link_internal_turn),
-            ),
-        )
-        .await
-        .unwrap();
-    });
+    let (addr, server) = spawn_internal_bridge!(Router::new().route(
+        "/internal/chat/turn",
+        post(bridge_state_with_snapshot_link_internal_turn),
+    ));
 
     let app = build_app(
         AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker))
@@ -2132,7 +2076,7 @@ async fn http_chat_turn_bridge_persists_snapshot_link_after_core_event_success()
                 capture: ToolEventCaptureState::default(),
             }))
             .with_chat_turn_bridge_secret(contract.bridge_secret.clone())
-            .with_chat_turn_bridge_url(format!("http://{addr}/internal/chat/turn")),
+            .with_chat_turn_bridge_url(internal_chat_turn_url(addr)),
     );
 
     let response = app
@@ -2187,21 +2131,10 @@ async fn http_chat_turn_bridge_persists_snapshot_link_after_core_event_success()
 async fn http_chat_turn_bridge_persists_tool_events_after_persist_success() {
     let contract = load_contract();
     let tool_event_capture = ToolEventCaptureState::default();
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("test listener should bind");
-    let addr = listener.local_addr().unwrap();
-    let server = tokio::spawn(async move {
-        axum::serve(
-            listener,
-            Router::new().route(
-                "/internal/chat/turn",
-                post(bridge_state_with_tool_persist_internal_turn),
-            ),
-        )
-        .await
-        .unwrap();
-    });
+    let (addr, server) = spawn_internal_bridge!(Router::new().route(
+        "/internal/chat/turn",
+        post(bridge_state_with_tool_persist_internal_turn),
+    ));
 
     let app = build_app(
         AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker))
@@ -2213,7 +2146,7 @@ async fn http_chat_turn_bridge_persists_tool_events_after_persist_success() {
                 capture: tool_event_capture.clone(),
             }))
             .with_chat_turn_bridge_secret(contract.bridge_secret.clone())
-            .with_chat_turn_bridge_url(format!("http://{addr}/internal/chat/turn")),
+            .with_chat_turn_bridge_url(internal_chat_turn_url(addr)),
     );
 
     let response = app
@@ -2285,21 +2218,10 @@ async fn http_chat_turn_bridge_persists_tool_events_after_persist_success() {
 async fn http_chat_turn_bridge_persists_hook_db_writes_after_hook_success() {
     let contract = load_contract();
     let hook_db_capture = HookDbCaptureState::default();
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("test listener should bind");
-    let addr = listener.local_addr().unwrap();
-    let server = tokio::spawn(async move {
-        axum::serve(
-            listener,
-            Router::new().route(
-                "/internal/chat/turn",
-                post(bridge_state_with_tool_persist_internal_turn),
-            ),
-        )
-        .await
-        .unwrap();
-    });
+    let (addr, server) = spawn_internal_bridge!(Router::new().route(
+        "/internal/chat/turn",
+        post(bridge_state_with_tool_persist_internal_turn),
+    ));
 
     let app = build_app(
         AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker))
@@ -2311,7 +2233,7 @@ async fn http_chat_turn_bridge_persists_hook_db_writes_after_hook_success() {
                 capture: hook_db_capture.clone(),
             }))
             .with_chat_turn_bridge_secret(contract.bridge_secret.clone())
-            .with_chat_turn_bridge_url(format!("http://{addr}/internal/chat/turn")),
+            .with_chat_turn_bridge_url(internal_chat_turn_url(addr)),
     );
 
     let response = app
@@ -2370,21 +2292,10 @@ async fn http_chat_turn_bridge_persists_hook_db_writes_after_hook_success() {
 async fn http_chat_turn_bridge_persists_implicit_feedback_when_hook_flag_uses_inprocess_bridge() {
     let contract = load_contract();
     let hook_db_capture = HookDbCaptureState::default();
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("test listener should bind");
-    let addr = listener.local_addr().unwrap();
-    let server = tokio::spawn(async move {
-        axum::serve(
-            listener,
-            Router::new().route(
-                "/internal/chat/turn",
-                post(bridge_state_with_implicit_feedback_internal_turn),
-            ),
-        )
-        .await
-        .unwrap();
-    });
+    let (addr, server) = spawn_internal_bridge!(Router::new().route(
+        "/internal/chat/turn",
+        post(bridge_state_with_implicit_feedback_internal_turn),
+    ));
 
     let app = build_app(
         AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker))
@@ -2396,7 +2307,7 @@ async fn http_chat_turn_bridge_persists_implicit_feedback_when_hook_flag_uses_in
                 capture: hook_db_capture.clone(),
             }))
             .with_chat_turn_bridge_secret(contract.bridge_secret.clone())
-            .with_chat_turn_bridge_url(format!("http://{addr}/internal/chat/turn")),
+            .with_chat_turn_bridge_url(internal_chat_turn_url(addr)),
     );
 
     let response = app
@@ -2446,21 +2357,10 @@ async fn http_chat_turn_bridge_persists_implicit_feedback_when_hook_flag_uses_in
 async fn http_chat_turn_bridge_marks_reflection_state_when_reflect_called() {
     let contract = load_contract();
     let reflection_capture = ReflectionCaptureState::default();
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("test listener should bind");
-    let addr = listener.local_addr().unwrap();
-    let server = tokio::spawn(async move {
-        axum::serve(
-            listener,
-            Router::new().route(
-                "/internal/chat/turn",
-                post(bridge_state_with_reflection_mark_internal_turn),
-            ),
-        )
-        .await
-        .unwrap();
-    });
+    let (addr, server) = spawn_internal_bridge!(Router::new().route(
+        "/internal/chat/turn",
+        post(bridge_state_with_reflection_mark_internal_turn),
+    ));
 
     let app = build_app(
         AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker))
@@ -2472,7 +2372,7 @@ async fn http_chat_turn_bridge_marks_reflection_state_when_reflect_called() {
                 capture: reflection_capture.clone(),
             }))
             .with_chat_turn_bridge_secret(contract.bridge_secret.clone())
-            .with_chat_turn_bridge_url(format!("http://{addr}/internal/chat/turn")),
+            .with_chat_turn_bridge_url(internal_chat_turn_url(addr)),
     );
 
     let response = app
@@ -2509,21 +2409,10 @@ async fn http_chat_turn_bridge_marks_reflection_state_when_reflect_called() {
 async fn http_chat_turn_bridge_persists_reflection_lesson_when_retry_follows_mark() {
     let contract = load_contract();
     let reflection_capture = ReflectionCaptureState::default();
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("test listener should bind");
-    let addr = listener.local_addr().unwrap();
-    let server = tokio::spawn(async move {
-        axum::serve(
-            listener,
-            Router::new().route(
-                "/internal/chat/turn",
-                post(bridge_state_with_reflection_lesson_internal_turn),
-            ),
-        )
-        .await
-        .unwrap();
-    });
+    let (addr, server) = spawn_internal_bridge!(Router::new().route(
+        "/internal/chat/turn",
+        post(bridge_state_with_reflection_lesson_internal_turn),
+    ));
 
     let app = build_app(
         AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker))
@@ -2538,7 +2427,7 @@ async fn http_chat_turn_bridge_persists_reflection_lesson_when_retry_follows_mar
                 capture: reflection_capture.clone(),
             }))
             .with_chat_turn_bridge_secret(contract.bridge_secret.clone())
-            .with_chat_turn_bridge_url(format!("http://{addr}/internal/chat/turn")),
+            .with_chat_turn_bridge_url(internal_chat_turn_url(addr)),
     );
     {
         let store = RecordingTurnReflectionStateStore {
@@ -2588,21 +2477,10 @@ async fn http_chat_turn_bridge_persists_reflection_lesson_when_retry_follows_mar
 async fn http_chat_turn_bridge_runs_observer_when_hook_flag_uses_inprocess_bridge() {
     let contract = load_contract();
     let observer_capture = ObserverCaptureState::default();
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("test listener should bind");
-    let addr = listener.local_addr().unwrap();
-    let server = tokio::spawn(async move {
-        axum::serve(
-            listener,
-            Router::new().route(
-                "/internal/chat/turn",
-                post(bridge_state_with_observer_internal_turn),
-            ),
-        )
-        .await
-        .unwrap();
-    });
+    let (addr, server) = spawn_internal_bridge!(Router::new().route(
+        "/internal/chat/turn",
+        post(bridge_state_with_observer_internal_turn),
+    ));
 
     let app = build_app(
         AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker))
@@ -2614,7 +2492,7 @@ async fn http_chat_turn_bridge_runs_observer_when_hook_flag_uses_inprocess_bridg
                 capture: observer_capture.clone(),
             }))
             .with_chat_turn_bridge_secret(contract.bridge_secret.clone())
-            .with_chat_turn_bridge_url(format!("http://{addr}/internal/chat/turn")),
+            .with_chat_turn_bridge_url(internal_chat_turn_url(addr)),
     );
 
     let response = app
@@ -2682,21 +2560,10 @@ async fn http_chat_turn_bridge_runs_observer_when_hook_flag_uses_inprocess_bridg
 async fn http_chat_turn_bridge_blocks_prompt_leak_from_bridge_state() {
     let contract = load_contract();
     let bridge_cache = Arc::new(Mutex::new(SessionCache::new(1000, 86400.0)));
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("test listener should bind");
-    let addr = listener.local_addr().unwrap();
-    let server = tokio::spawn(async move {
-        axum::serve(
-            listener,
-            Router::new().route(
-                "/internal/chat/turn",
-                post(prompt_leak_bridge_state_internal_turn),
-            ),
-        )
-        .await
-        .unwrap();
-    });
+    let (addr, server) = spawn_internal_bridge!(Router::new().route(
+        "/internal/chat/turn",
+        post(prompt_leak_bridge_state_internal_turn),
+    ));
 
     let app = build_app(
         AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker))
@@ -2706,7 +2573,7 @@ async fn http_chat_turn_bridge_blocks_prompt_leak_from_bridge_state() {
                 capture: SessionCaptureState::default(),
             }))
             .with_chat_turn_bridge_secret(contract.bridge_secret)
-            .with_chat_turn_bridge_url(format!("http://{addr}/internal/chat/turn")),
+            .with_chat_turn_bridge_url(internal_chat_turn_url(addr)),
     );
 
     let response = app
@@ -2759,21 +2626,10 @@ async fn http_chat_turn_bridge_blocks_prompt_leak_from_bridge_state() {
 async fn http_chat_turn_bridge_synthesizes_warning_before_turn_complete() {
     let contract = load_contract();
     let bridge_cache = Arc::new(Mutex::new(SessionCache::new(1000, 86400.0)));
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("test listener should bind");
-    let addr = listener.local_addr().unwrap();
-    let server = tokio::spawn(async move {
-        axum::serve(
-            listener,
-            Router::new().route(
-                "/internal/chat/turn",
-                post(warning_bridge_state_internal_turn),
-            ),
-        )
-        .await
-        .unwrap();
-    });
+    let (addr, server) = spawn_internal_bridge!(Router::new().route(
+        "/internal/chat/turn",
+        post(warning_bridge_state_internal_turn),
+    ));
 
     let app = build_app(
         AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker))
@@ -2783,7 +2639,7 @@ async fn http_chat_turn_bridge_synthesizes_warning_before_turn_complete() {
             }))
             .with_chat_turn_bridge_cache(bridge_cache.clone())
             .with_chat_turn_bridge_secret(contract.bridge_secret)
-            .with_chat_turn_bridge_url(format!("http://{addr}/internal/chat/turn")),
+            .with_chat_turn_bridge_url(internal_chat_turn_url(addr)),
     );
 
     let response = app
@@ -2838,21 +2694,10 @@ async fn http_chat_turn_bridge_synthesizes_warning_before_turn_complete() {
 async fn http_chat_turn_bridge_synthesizes_explain_before_turn_complete() {
     let contract = load_contract();
     let bridge_cache = Arc::new(Mutex::new(SessionCache::new(1000, 86400.0)));
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("test listener should bind");
-    let addr = listener.local_addr().unwrap();
-    let server = tokio::spawn(async move {
-        axum::serve(
-            listener,
-            Router::new().route(
-                "/internal/chat/turn",
-                post(explain_bridge_state_internal_turn),
-            ),
-        )
-        .await
-        .unwrap();
-    });
+    let (addr, server) = spawn_internal_bridge!(Router::new().route(
+        "/internal/chat/turn",
+        post(explain_bridge_state_internal_turn),
+    ));
 
     let app = build_app(
         AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker))
@@ -2862,7 +2707,7 @@ async fn http_chat_turn_bridge_synthesizes_explain_before_turn_complete() {
             }))
             .with_chat_turn_bridge_cache(bridge_cache.clone())
             .with_chat_turn_bridge_secret(contract.bridge_secret)
-            .with_chat_turn_bridge_url(format!("http://{addr}/internal/chat/turn")),
+            .with_chat_turn_bridge_url(internal_chat_turn_url(addr)),
     );
 
     let response = app
@@ -2927,21 +2772,10 @@ async fn http_chat_turn_bridge_synthesizes_explain_before_turn_complete() {
 #[tokio::test]
 async fn http_chat_turn_bridge_drops_upstream_warning_without_bridge_state() {
     let contract = load_contract();
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("test listener should bind");
-    let addr = listener.local_addr().unwrap();
-    let server = tokio::spawn(async move {
-        axum::serve(
-            listener,
-            Router::new().route(
-                "/internal/chat/turn",
-                post(upstream_warning_without_bridge_state_internal_turn),
-            ),
-        )
-        .await
-        .unwrap();
-    });
+    let (addr, server) = spawn_internal_bridge!(Router::new().route(
+        "/internal/chat/turn",
+        post(upstream_warning_without_bridge_state_internal_turn),
+    ));
 
     let app = build_app(
         AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker))
@@ -2950,7 +2784,7 @@ async fn http_chat_turn_bridge_drops_upstream_warning_without_bridge_state() {
                 capture: SessionCaptureState::default(),
             }))
             .with_chat_turn_bridge_secret(contract.bridge_secret)
-            .with_chat_turn_bridge_url(format!("http://{addr}/internal/chat/turn")),
+            .with_chat_turn_bridge_url(internal_chat_turn_url(addr)),
     );
 
     let response = app
@@ -2997,21 +2831,10 @@ async fn http_chat_turn_bridge_drops_upstream_warning_without_bridge_state() {
 #[tokio::test]
 async fn http_chat_turn_bridge_drops_upstream_explain_without_bridge_state() {
     let contract = load_contract();
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("test listener should bind");
-    let addr = listener.local_addr().unwrap();
-    let server = tokio::spawn(async move {
-        axum::serve(
-            listener,
-            Router::new().route(
-                "/internal/chat/turn",
-                post(upstream_explain_without_bridge_state_internal_turn),
-            ),
-        )
-        .await
-        .unwrap();
-    });
+    let (addr, server) = spawn_internal_bridge!(Router::new().route(
+        "/internal/chat/turn",
+        post(upstream_explain_without_bridge_state_internal_turn),
+    ));
 
     let app = build_app(
         AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker))
@@ -3020,7 +2843,7 @@ async fn http_chat_turn_bridge_drops_upstream_explain_without_bridge_state() {
                 capture: SessionCaptureState::default(),
             }))
             .with_chat_turn_bridge_secret(contract.bridge_secret)
-            .with_chat_turn_bridge_url(format!("http://{addr}/internal/chat/turn")),
+            .with_chat_turn_bridge_url(internal_chat_turn_url(addr)),
     );
 
     let response = app
@@ -3068,21 +2891,10 @@ async fn http_chat_turn_bridge_drops_upstream_explain_without_bridge_state() {
 async fn http_chat_turn_bridge_synthesizes_trusted_session_info() {
     let contract = load_contract();
     let session_capture = SessionCaptureState::default();
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("test listener should bind");
-    let addr = listener.local_addr().unwrap();
-    let server = tokio::spawn(async move {
-        axum::serve(
-            listener,
-            Router::new().route(
-                "/internal/chat/turn",
-                post(conflicting_session_info_internal_turn),
-            ),
-        )
-        .await
-        .unwrap();
-    });
+    let (addr, server) = spawn_internal_bridge!(Router::new().route(
+        "/internal/chat/turn",
+        post(conflicting_session_info_internal_turn),
+    ));
 
     let app = build_app(
         AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker))
@@ -3091,7 +2903,7 @@ async fn http_chat_turn_bridge_synthesizes_trusted_session_info() {
                 capture: session_capture.clone(),
             }))
             .with_chat_turn_bridge_secret(contract.bridge_secret)
-            .with_chat_turn_bridge_url(format!("http://{addr}/internal/chat/turn")),
+            .with_chat_turn_bridge_url(internal_chat_turn_url(addr)),
     );
 
     let response = app
@@ -3137,21 +2949,10 @@ async fn http_chat_turn_bridge_synthesizes_trusted_session_info() {
 #[tokio::test]
 async fn http_chat_turn_bridge_derives_has_tool_calls_from_tool_sigs() {
     let contract = load_contract();
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("test listener should bind");
-    let addr = listener.local_addr().unwrap();
-    let server = tokio::spawn(async move {
-        axum::serve(
-            listener,
-            Router::new().route(
-                "/internal/chat/turn",
-                post(conflicting_has_tool_calls_internal_turn),
-            ),
-        )
-        .await
-        .unwrap();
-    });
+    let (addr, server) = spawn_internal_bridge!(Router::new().route(
+        "/internal/chat/turn",
+        post(conflicting_has_tool_calls_internal_turn),
+    ));
 
     let app = build_app(
         AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker))
@@ -3160,7 +2961,7 @@ async fn http_chat_turn_bridge_derives_has_tool_calls_from_tool_sigs() {
                 capture: SessionCaptureState::default(),
             }))
             .with_chat_turn_bridge_secret(contract.bridge_secret)
-            .with_chat_turn_bridge_url(format!("http://{addr}/internal/chat/turn")),
+            .with_chat_turn_bridge_url(internal_chat_turn_url(addr)),
     );
 
     let response = app
