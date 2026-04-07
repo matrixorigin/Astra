@@ -434,7 +434,10 @@ pub fn evaluate_turn_count_trigger(
 }
 
 /// Apply micro-compaction by replacing tool result content for the given IDs.
-pub fn apply_micro_compact(messages: &[Value], tool_ids_to_clear: &[String]) -> (Vec<Value>, usize) {
+pub fn apply_micro_compact(
+    messages: &[Value],
+    tool_ids_to_clear: &[String],
+) -> (Vec<Value>, usize) {
     if tool_ids_to_clear.is_empty() {
         return (messages.to_vec(), 0);
     }
@@ -447,7 +450,10 @@ pub fn apply_micro_compact(messages: &[Value], tool_ids_to_clear: &[String]) -> 
             if msg.get("role").and_then(Value::as_str) != Some("tool") {
                 return msg.clone();
             }
-            let id = msg.get("tool_call_id").and_then(Value::as_str).unwrap_or("");
+            let id = msg
+                .get("tool_call_id")
+                .and_then(Value::as_str)
+                .unwrap_or("");
             if id.is_empty() || !clear_set.contains(id) {
                 return msg.clone();
             }
@@ -493,9 +499,15 @@ pub fn run_micro_compact(messages: &[Value]) -> Vec<Value> {
     let (compacted, cleared) = apply_micro_compact(messages, &ids_to_clear);
     if cleared > 0 {
         if gap_minutes > 0 {
-            eprintln!("[micro_compact] cleared {} tool results (~{} tokens, {}min gap)", cleared, total_tokens_saved, gap_minutes);
+            eprintln!(
+                "[micro_compact] cleared {} tool results (~{} tokens, {}min gap)",
+                cleared, total_tokens_saved, gap_minutes
+            );
         } else {
-            eprintln!("[micro_compact] cleared {} tool results (~{} tokens)", cleared, total_tokens_saved);
+            eprintln!(
+                "[micro_compact] cleared {} tool results (~{} tokens)",
+                cleared, total_tokens_saved
+            );
         }
     }
     compacted
@@ -849,7 +861,11 @@ mod tests {
             json!({"role": "tool", "tool_call_id": "c3", "content": "r3"}),
             json!({"role": "tool", "tool_call_id": "c4", "content": "r4"}),
         ];
-        let config = TimeBasedCompactConfig { enabled: true, gap_threshold_minutes: 30, keep_recent: 3 };
+        let config = TimeBasedCompactConfig {
+            enabled: true,
+            gap_threshold_minutes: 30,
+            keep_recent: 3,
+        };
         let t = evaluate_time_based_trigger(&messages, &config).unwrap();
         assert!(t.gap_minutes >= 44);
         assert_eq!(t.tool_ids_to_clear.len(), 1); // 4 - keep_recent(3)
@@ -862,7 +878,11 @@ mod tests {
             json!({"role": "assistant", "content": "hi", "timestamp": recent_ts}),
             json!({"role": "tool", "tool_call_id": "c1", "content": "x".repeat(5000)}),
         ];
-        let config = TimeBasedCompactConfig { enabled: true, gap_threshold_minutes: 30, keep_recent: 5 };
+        let config = TimeBasedCompactConfig {
+            enabled: true,
+            gap_threshold_minutes: 30,
+            keep_recent: 5,
+        };
         assert!(evaluate_time_based_trigger(&messages, &config).is_none());
     }
 
@@ -872,12 +892,15 @@ mod tests {
             json!({"role": "assistant", "content": "no ts"}),
             json!({"role": "tool", "tool_call_id": "c1", "content": "data"}),
         ];
-        assert!(evaluate_time_based_trigger(&messages, &TimeBasedCompactConfig::default()).is_none());
+        assert!(
+            evaluate_time_based_trigger(&messages, &TimeBasedCompactConfig::default()).is_none()
+        );
     }
 
     #[test]
     fn find_timestamp_checks_metadata() {
-        let msgs = vec![json!({"role": "assistant", "content": "a", "metadata": {"created_at": 1000u64}})];
+        let msgs =
+            vec![json!({"role": "assistant", "content": "a", "metadata": {"created_at": 1000u64}})];
         assert_eq!(find_last_assistant_timestamp(&msgs), Some(1000));
     }
 
@@ -888,7 +911,11 @@ mod tests {
         let messages: Vec<Value> = (0..12)
             .map(|i| json!({"role": "tool", "tool_call_id": format!("c{i}"), "content": "data"}))
             .collect();
-        let config = TurnCountCompactConfig { enabled: true, trigger_threshold: 8, keep_recent: 3 };
+        let config = TurnCountCompactConfig {
+            enabled: true,
+            trigger_threshold: 8,
+            keep_recent: 3,
+        };
         let t = evaluate_turn_count_trigger(&messages, &config).unwrap();
         assert_eq!(t.total_tool_results, 12);
         assert_eq!(t.tool_ids_to_clear.len(), 9);
@@ -910,7 +937,9 @@ mod tests {
         let messages: Vec<Value> = (0..5)
             .map(|i| json!({"role": "tool", "tool_call_id": format!("c{i}"), "content": "data"}))
             .collect();
-        assert!(evaluate_turn_count_trigger(&messages, &TurnCountCompactConfig::default()).is_none());
+        assert!(
+            evaluate_turn_count_trigger(&messages, &TurnCountCompactConfig::default()).is_none()
+        );
     }
 
     // ── apply_micro_compact ──
@@ -979,9 +1008,7 @@ mod tests {
 
     #[test]
     fn collect_tool_results_null_tool_call_id_skipped() {
-        let messages = vec![
-            json!({"role": "tool", "tool_call_id": null, "content": "output"}),
-        ];
+        let messages = vec![json!({"role": "tool", "tool_call_id": null, "content": "output"})];
         let results = collect_tool_results(&messages);
         assert!(results.is_empty());
     }
@@ -1030,9 +1057,20 @@ mod tests {
     #[test]
     fn collect_tool_results_includes_all_clearable_tool_types() {
         let clearable_names = [
-            "read_file", "file_read", "bash", "shell", "terminal",
-            "grep", "glob", "list_dir", "web_search", "web_fetch",
-            "file_edit", "file_write", "edit_file", "create_file",
+            "read_file",
+            "file_read",
+            "bash",
+            "shell",
+            "terminal",
+            "grep",
+            "glob",
+            "list_dir",
+            "web_search",
+            "web_fetch",
+            "file_edit",
+            "file_write",
+            "edit_file",
+            "create_file",
         ];
         for (i, name) in clearable_names.iter().enumerate() {
             let call_id = format!("c{i}");
@@ -1051,7 +1089,13 @@ mod tests {
 
     #[test]
     fn collect_tool_results_excludes_non_clearable_tools() {
-        let non_clearable = ["think", "memory_store", "memory_search", "ask_user", "TodoRead"];
+        let non_clearable = [
+            "think",
+            "memory_store",
+            "memory_search",
+            "ask_user",
+            "TodoRead",
+        ];
         for name in non_clearable {
             let messages = vec![
                 json!({
@@ -1062,16 +1106,19 @@ mod tests {
                 json!({"role": "tool", "tool_call_id": "c1", "content": "output"}),
             ];
             let results = collect_tool_results(&messages);
-            assert!(results.is_empty(), "tool '{}' should NOT be clearable", name);
+            assert!(
+                results.is_empty(),
+                "tool '{}' should NOT be clearable",
+                name
+            );
         }
     }
 
     #[test]
     fn collect_tool_results_orphaned_results_still_collected() {
         // Tool result without matching assistant tool_call → orphan → still collected
-        let messages = vec![
-            json!({"role": "tool", "tool_call_id": "orphan1", "content": "stale data"}),
-        ];
+        let messages =
+            vec![json!({"role": "tool", "tool_call_id": "orphan1", "content": "stale data"})];
         let results = collect_tool_results(&messages);
         assert_eq!(results.len(), 1);
     }
@@ -1119,10 +1166,7 @@ mod tests {
 
     #[test]
     fn split_clearable_keep_recent_equals_total() {
-        let results = vec![
-            ("c1".to_string(), 100),
-            ("c2".to_string(), 200),
-        ];
+        let results = vec![("c1".to_string(), 100), ("c2".to_string(), 200)];
         let (ids, _) = split_clearable(results, 2);
         assert!(ids.is_empty()); // All are "recent"
     }
@@ -1150,26 +1194,22 @@ mod tests {
 
     #[test]
     fn find_last_assistant_timestamp_no_timestamp_field() {
-        let messages = vec![
-            json!({"role": "assistant", "content": "no timestamp at all"}),
-        ];
+        let messages = vec![json!({"role": "assistant", "content": "no timestamp at all"})];
         // Assistant found, but no timestamp/metadata → returns None
         assert!(find_last_assistant_timestamp(&messages).is_none());
     }
 
     #[test]
     fn find_last_assistant_timestamp_from_metadata_created_at() {
-        let messages = vec![
-            json!({"role": "assistant", "content": "hi", "metadata": {"created_at": 5000}}),
-        ];
+        let messages =
+            vec![json!({"role": "assistant", "content": "hi", "metadata": {"created_at": 5000}})];
         assert_eq!(find_last_assistant_timestamp(&messages), Some(5000));
     }
 
     #[test]
     fn find_last_assistant_timestamp_from_metadata_timestamp() {
-        let messages = vec![
-            json!({"role": "assistant", "content": "hi", "metadata": {"timestamp": 7000}}),
-        ];
+        let messages =
+            vec![json!({"role": "assistant", "content": "hi", "metadata": {"timestamp": 7000}})];
         assert_eq!(find_last_assistant_timestamp(&messages), Some(7000));
     }
 
@@ -1183,9 +1223,8 @@ mod tests {
 
     #[test]
     fn find_last_assistant_timestamp_string_timestamp_not_parsed() {
-        let messages = vec![
-            json!({"role": "assistant", "content": "hi", "timestamp": "2024-01-01"}),
-        ];
+        let messages =
+            vec![json!({"role": "assistant", "content": "hi", "timestamp": "2024-01-01"})];
         // String timestamp → as_u64() returns None → metadata checked → None → returns None
         assert!(find_last_assistant_timestamp(&messages).is_none());
     }
@@ -1249,9 +1288,7 @@ mod tests {
             gap_threshold_minutes: 0,
             keep_recent: 0,
         };
-        let messages = vec![
-            json!({"role": "tool", "tool_call_id": "c1", "content": "data"}),
-        ];
+        let messages = vec![json!({"role": "tool", "tool_call_id": "c1", "content": "data"})];
         assert!(evaluate_time_based_trigger(&messages, &config).is_none());
     }
 

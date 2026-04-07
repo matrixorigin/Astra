@@ -939,7 +939,12 @@ mod tests {
 
     #[test]
     fn scope_serde_round_trip() {
-        let variants = [Scope::Local, Scope::LocalGit, Scope::External, Scope::CrossSession];
+        let variants = [
+            Scope::Local,
+            Scope::LocalGit,
+            Scope::External,
+            Scope::CrossSession,
+        ];
         for v in &variants {
             let json = serde_json::to_string(v).unwrap();
             let back: Scope = serde_json::from_str(&json).unwrap();
@@ -949,8 +954,14 @@ mod tests {
 
     #[test]
     fn scope_serde_uses_snake_case() {
-        assert_eq!(serde_json::to_string(&Scope::LocalGit).unwrap(), r#""local_git""#);
-        assert_eq!(serde_json::to_string(&Scope::CrossSession).unwrap(), r#""cross_session""#);
+        assert_eq!(
+            serde_json::to_string(&Scope::LocalGit).unwrap(),
+            r#""local_git""#
+        );
+        assert_eq!(
+            serde_json::to_string(&Scope::CrossSession).unwrap(),
+            r#""cross_session""#
+        );
     }
 
     // --- TOOL_CATALOG validation ---
@@ -967,15 +978,31 @@ mod tests {
     fn catalog_all_tools_have_nonempty_fields() {
         for tool in TOOL_CATALOG {
             assert!(!tool.name.is_empty(), "tool has empty name");
-            assert!(!tool.description.is_empty(), "tool {} has empty description", tool.name);
-            assert!(!tool.triggers.is_empty(), "tool {} has no triggers", tool.name);
-            assert!(!tool.intents.is_empty(), "tool {} has no intents", tool.name);
+            assert!(
+                !tool.description.is_empty(),
+                "tool {} has empty description",
+                tool.name
+            );
+            assert!(
+                !tool.triggers.is_empty(),
+                "tool {} has no triggers",
+                tool.name
+            );
+            assert!(
+                !tool.intents.is_empty(),
+                "tool {} has no intents",
+                tool.name
+            );
         }
     }
 
     #[test]
     fn catalog_pinned_tools_include_bash_and_read_file() {
-        let pinned: Vec<&str> = TOOL_CATALOG.iter().filter(|t| t.pinned).map(|t| t.name).collect();
+        let pinned: Vec<&str> = TOOL_CATALOG
+            .iter()
+            .filter(|t| t.pinned)
+            .map(|t| t.name)
+            .collect();
         assert!(pinned.contains(&"bash"), "bash should be pinned");
         assert!(pinned.contains(&"read_file"), "read_file should be pinned");
     }
@@ -983,14 +1010,22 @@ mod tests {
     #[test]
     fn catalog_schema_tokens_positive_for_all() {
         for tool in TOOL_CATALOG {
-            assert!(tool.schema_tokens > 0, "tool {} has zero schema_tokens", tool.name);
+            assert!(
+                tool.schema_tokens > 0,
+                "tool {} has zero schema_tokens",
+                tool.name
+            );
         }
     }
 
     #[test]
     fn catalog_has_expected_count() {
         // Sanity check — if tools are added/removed, update this
-        assert!(TOOL_CATALOG.len() >= 30, "expected at least 30 tools, got {}", TOOL_CATALOG.len());
+        assert!(
+            TOOL_CATALOG.len() >= 30,
+            "expected at least 30 tools, got {}",
+            TOOL_CATALOG.len()
+        );
     }
 
     #[test]
@@ -998,14 +1033,22 @@ mod tests {
         for tool in TOOL_CATALOG {
             let mut seen = HashSet::new();
             for trigger in tool.triggers {
-                assert!(seen.insert(*trigger), "tool {} has duplicate trigger: {}", tool.name, trigger);
+                assert!(
+                    seen.insert(*trigger),
+                    "tool {} has duplicate trigger: {}",
+                    tool.name,
+                    trigger
+                );
             }
         }
     }
 
     #[test]
     fn catalog_memory_store_is_pinned() {
-        let ms = TOOL_CATALOG.iter().find(|t| t.name == "memory_store").unwrap();
+        let ms = TOOL_CATALOG
+            .iter()
+            .find(|t| t.name == "memory_store")
+            .unwrap();
         assert!(ms.pinned, "memory_store should be pinned");
     }
 }

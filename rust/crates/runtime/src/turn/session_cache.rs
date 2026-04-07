@@ -66,7 +66,10 @@ mod tests {
     #[test]
     fn preserves_existing_history() {
         let mut entry = Map::new();
-        entry.insert("history".to_string(), json!([{"role": "user", "content": "old"}]));
+        entry.insert(
+            "history".to_string(),
+            json!([{"role": "user", "content": "old"}]),
+        );
         let result = apply_turn_to_session_entry(&entry, "new", &[], "", &[], None, None);
         let hist = result["history"].as_array().unwrap();
         assert!(hist.len() >= 2);

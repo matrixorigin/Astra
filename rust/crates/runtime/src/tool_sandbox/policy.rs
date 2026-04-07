@@ -343,7 +343,13 @@ mod tests {
     #[test]
     fn env_baseline_covers_matrixone_vars() {
         let p = SandboxPolicy::strict("/proj");
-        for var in &["MATRIXONE_HOST", "MATRIXONE_PORT", "MATRIXONE_USER", "MATRIXONE_PASSWORD", "MATRIXONE_DATABASE"] {
+        for var in &[
+            "MATRIXONE_HOST",
+            "MATRIXONE_PORT",
+            "MATRIXONE_USER",
+            "MATRIXONE_PASSWORD",
+            "MATRIXONE_DATABASE",
+        ] {
             assert!(p.is_env_allowed(var), "Baseline missing: {}", var);
         }
     }

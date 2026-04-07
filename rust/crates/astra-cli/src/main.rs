@@ -4635,7 +4635,10 @@ async fn run_chat_repl(
         // ANSI color codes are safe — rustyline's calculate_position() treats them
         // as width=0 so cursor math is unaffected.
         if let Some(ref dev) = state.skill_dev {
-            eprintln!("  \u{1f527} {}", format!("Skill dev: {}", dev.name).cyan().dim());
+            eprintln!(
+                "  \u{1f527} {}",
+                format!("Skill dev: {}", dev.name).cyan().dim()
+            );
         }
         let prompt_str = if state.plan_mode.is_some() {
             theme::PROMPT_PLAN.to_string()

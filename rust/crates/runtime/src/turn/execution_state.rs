@@ -266,10 +266,7 @@ mod tests {
 
     #[test]
     fn exec_state_tool_failures_preserved() {
-        let data = Map::from_iter([(
-            "tool_failures".to_string(),
-            json!({"bash": 2, "read": 1}),
-        )]);
+        let data = Map::from_iter([("tool_failures".to_string(), json!({"bash": 2, "read": 1}))]);
         let out = normalize_execution_state(&data);
         let failures = out["tool_failures"].as_object().unwrap();
         assert_eq!(failures.len(), 2);

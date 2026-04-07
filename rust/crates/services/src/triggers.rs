@@ -350,7 +350,8 @@ mod tests {
 
     #[test]
     fn create_trigger_request_explicit_agent_id() {
-        let json = r#"{"trigger_type":"schedule","name":"t2","user_input":"go","agent_id":"custom"}"#;
+        let json =
+            r#"{"trigger_type":"schedule","name":"t2","user_input":"go","agent_id":"custom"}"#;
         let req: CreateTriggerRequest = serde_json::from_str(json).unwrap();
         assert_eq!(req.agent_id, "custom");
     }

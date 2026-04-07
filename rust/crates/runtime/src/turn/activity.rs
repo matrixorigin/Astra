@@ -37,7 +37,8 @@ mod tests {
 
     #[test]
     fn plan_prefers_llm_response_id() {
-        let plan = build_session_activity_update_plan(false, 0, 0, 0, false, Some("p1"), Some("l1"));
+        let plan =
+            build_session_activity_update_plan(false, 0, 0, 0, false, Some("p1"), Some("l1"));
         assert_eq!(plan.last_event_id.as_deref(), Some("l1"));
     }
 

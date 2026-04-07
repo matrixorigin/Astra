@@ -306,10 +306,7 @@ impl AttachmentBuilder {
 /// and total char budgets.
 ///
 /// If `cwd` is provided, relative paths are resolved against it.
-pub fn restore_recent_files(
-    recent_reads: &[(String, u32)],
-    cwd: Option<&str>,
-) -> Vec<Value> {
+pub fn restore_recent_files(recent_reads: &[(String, u32)], cwd: Option<&str>) -> Vec<Value> {
     if recent_reads.is_empty() {
         return Vec::new();
     }
@@ -487,9 +484,7 @@ mod tests {
 
     #[test]
     fn restore_recent_files_skips_missing() {
-        let reads = vec![
-            ("/nonexistent/path/xyz.rs".to_string(), 1),
-        ];
+        let reads = vec![("/nonexistent/path/xyz.rs".to_string(), 1)];
         let msgs = restore_recent_files(&reads, None);
         assert!(msgs.is_empty());
     }
@@ -502,11 +497,7 @@ mod tests {
         std::fs::write(&f, "content").unwrap();
 
         let path = f.to_string_lossy().to_string();
-        let reads = vec![
-            (path.clone(), 1),
-            (path.clone(), 5),
-            (path.clone(), 3),
-        ];
+        let reads = vec![(path.clone(), 1), (path.clone(), 5), (path.clone(), 3)];
         let msgs = restore_recent_files(&reads, None);
         // Should only produce one message despite 3 entries for same path
         assert_eq!(msgs.len(), 1);
@@ -542,7 +533,12 @@ mod tests {
         let reads = vec![("relative.txt".to_string(), 1)];
         let msgs = restore_recent_files(&reads, Some(dir.to_str().unwrap()));
         assert_eq!(msgs.len(), 1);
-        assert!(msgs[0]["content"].as_str().unwrap().contains("relative content"));
+        assert!(
+            msgs[0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("relative content")
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

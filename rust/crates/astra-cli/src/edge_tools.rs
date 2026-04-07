@@ -1625,8 +1625,7 @@ impl ToolExecutor {
             1.0
         } else {
             // Smooth decay: 1.0 at soft limit → 0.25 at 2× budget
-            let ratio =
-                (agg - AGGREGATE_SOFT_LIMIT) as f64 / (AGGREGATE_OUTPUT_BUDGET * 2) as f64;
+            let ratio = (agg - AGGREGATE_SOFT_LIMIT) as f64 / (AGGREGATE_OUTPUT_BUDGET * 2) as f64;
             (1.0 - ratio * 0.75).max(0.25)
         };
 
@@ -8195,9 +8194,10 @@ impl MyType {
         assert_eq!(executor.scaled_output_limit(), base);
 
         // Just above soft limit → slightly reduced
-        executor
-            .aggregate_output_bytes
-            .store(AGGREGATE_SOFT_LIMIT + 1000, std::sync::atomic::Ordering::Relaxed);
+        executor.aggregate_output_bytes.store(
+            AGGREGATE_SOFT_LIMIT + 1000,
+            std::sync::atomic::Ordering::Relaxed,
+        );
         let slightly_above = executor.scaled_output_limit();
         assert!(
             slightly_above < base,
@@ -8209,9 +8209,10 @@ impl MyType {
         );
 
         // At 2x budget → significantly reduced
-        executor
-            .aggregate_output_bytes
-            .store(AGGREGATE_OUTPUT_BUDGET * 2, std::sync::atomic::Ordering::Relaxed);
+        executor.aggregate_output_bytes.store(
+            AGGREGATE_OUTPUT_BUDGET * 2,
+            std::sync::atomic::Ordering::Relaxed,
+        );
         let at_2x = executor.scaled_output_limit();
         assert!(
             at_2x < base * 3 / 4,
@@ -8231,9 +8232,10 @@ impl MyType {
         assert!(token_only < base);
 
         // Add aggregate pressure on top
-        executor
-            .aggregate_output_bytes
-            .store(AGGREGATE_OUTPUT_BUDGET, std::sync::atomic::Ordering::Relaxed);
+        executor.aggregate_output_bytes.store(
+            AGGREGATE_OUTPUT_BUDGET,
+            std::sync::atomic::Ordering::Relaxed,
+        );
         let both = executor.scaled_output_limit();
         assert!(
             both < token_only,
@@ -8246,9 +8248,10 @@ impl MyType {
         let executor = test_executor();
 
         // Simulate high aggregate output (above soft limit)
-        executor
-            .aggregate_output_bytes
-            .store(AGGREGATE_SOFT_LIMIT + 10_000, std::sync::atomic::Ordering::Relaxed);
+        executor.aggregate_output_bytes.store(
+            AGGREGATE_SOFT_LIMIT + 10_000,
+            std::sync::atomic::Ordering::Relaxed,
+        );
 
         // Small output → not persisted
         let small = "x".repeat(1000);
@@ -8263,10 +8266,7 @@ impl MyType {
             "large output should be persisted, got first 200 chars: {}",
             &result[..result.len().min(200)]
         );
-        assert!(
-            result.contains("tool-results/"),
-            "should contain file path"
-        );
+        assert!(result.contains("tool-results/"), "should contain file path");
         assert!(
             result.contains("</persisted-output>"),
             "should have closing tag"
@@ -8318,26 +8318,34 @@ impl MyType {
     #[test]
     fn persist_to_disk_skipped_for_errors() {
         let executor = test_executor();
-        executor
-            .aggregate_output_bytes
-            .store(AGGREGATE_SOFT_LIMIT + 10_000, std::sync::atomic::Ordering::Relaxed);
+        executor.aggregate_output_bytes.store(
+            AGGREGATE_SOFT_LIMIT + 10_000,
+            std::sync::atomic::Ordering::Relaxed,
+        );
 
         let error_output = format!("Error: {}", "x".repeat(60_000));
         let result = executor.maybe_persist_large_output(error_output.clone(), "bash");
-        assert_eq!(result, error_output, "error outputs should never be persisted");
+        assert_eq!(
+            result, error_output,
+            "error outputs should never be persisted"
+        );
     }
 
     #[test]
     fn persist_to_disk_idempotent_same_content() {
         let executor = test_executor();
-        executor
-            .aggregate_output_bytes
-            .store(AGGREGATE_SOFT_LIMIT + 10_000, std::sync::atomic::Ordering::Relaxed);
+        executor.aggregate_output_bytes.store(
+            AGGREGATE_SOFT_LIMIT + 10_000,
+            std::sync::atomic::Ordering::Relaxed,
+        );
 
         let large = "deterministic content\n".repeat(3000);
         let result1 = executor.maybe_persist_large_output(large.clone(), "bash");
         let result2 = executor.maybe_persist_large_output(large, "bash");
-        assert_eq!(result1, result2, "same content should produce identical reference");
+        assert_eq!(
+            result1, result2,
+            "same content should produce identical reference"
+        );
 
         // Cleanup
         if let Some(path) = result1
@@ -8363,9 +8371,10 @@ impl MyType {
 
         // Set aggregate so remaining budget < file size
         let agg = AGGREGATE_OUTPUT_BUDGET - (file_size / 2);
-        executor
-            .aggregate_output_bytes
-            .store(agg.max(AGGREGATE_SOFT_LIMIT + 1), std::sync::atomic::Ordering::Relaxed);
+        executor.aggregate_output_bytes.store(
+            agg.max(AGGREGATE_SOFT_LIMIT + 1),
+            std::sync::atomic::Ordering::Relaxed,
+        );
 
         // Full read of the large file should auto-downgrade to outline
         let result = executor.read_file(&json!({"path": "big.rs"}));
@@ -8393,9 +8402,10 @@ impl MyType {
         std::fs::write(dir.path().join("data.txt"), &content).unwrap();
 
         // Simulate extreme aggregate pressure
-        executor
-            .aggregate_output_bytes
-            .store(AGGREGATE_OUTPUT_BUDGET * 2, std::sync::atomic::Ordering::Relaxed);
+        executor.aggregate_output_bytes.store(
+            AGGREGATE_OUTPUT_BUDGET * 2,
+            std::sync::atomic::Ordering::Relaxed,
+        );
 
         // Ranged read should still work
         let result = executor.read_file(&json!({
@@ -8427,9 +8437,10 @@ impl MyType {
         std::fs::write(dir.path().join("big.txt"), &content).unwrap();
 
         // Simulate moderate aggregate pressure
-        executor
-            .aggregate_output_bytes
-            .store(AGGREGATE_SOFT_LIMIT + 50_000, std::sync::atomic::Ordering::Relaxed);
+        executor.aggregate_output_bytes.store(
+            AGGREGATE_SOFT_LIMIT + 50_000,
+            std::sync::atomic::Ordering::Relaxed,
+        );
 
         // Read 5 non-contiguous ranges — all should succeed
         let ranges = [(10, 20), (200, 210), (500, 510), (800, 810), (1500, 1510)];
@@ -8503,9 +8514,10 @@ impl MyType {
         let executor = ToolExecutor::new(dir.path());
 
         // Pre-load aggregate to above soft limit
-        executor
-            .aggregate_output_bytes
-            .store(AGGREGATE_SOFT_LIMIT + 10_000, std::sync::atomic::Ordering::Relaxed);
+        executor.aggregate_output_bytes.store(
+            AGGREGATE_SOFT_LIMIT + 10_000,
+            std::sync::atomic::Ordering::Relaxed,
+        );
 
         // Execute bash that produces large output (>50KB)
         let output = executor
@@ -8557,9 +8569,10 @@ impl MyType {
         );
 
         // Read with high pressure — should downgrade or truncate
-        executor
-            .aggregate_output_bytes
-            .store(AGGREGATE_OUTPUT_BUDGET, std::sync::atomic::Ordering::Relaxed);
+        executor.aggregate_output_bytes.store(
+            AGGREGATE_OUTPUT_BUDGET,
+            std::sync::atomic::Ordering::Relaxed,
+        );
         executor.clear_file_state();
         let pressured_result = executor.read_file(&json!({"path": "medium.txt"}));
 
@@ -8584,11 +8597,21 @@ impl MyType {
         let dir = tempfile::tempdir().unwrap();
         let mut exe = ToolExecutor::new(dir.path());
         // Before expansion: /etc is not allowed
-        assert!(!exe.sandbox_policy.as_ref().unwrap().is_path_allowed(std::path::Path::new("/etc/passwd")));
+        assert!(
+            !exe.sandbox_policy
+                .as_ref()
+                .unwrap()
+                .is_path_allowed(std::path::Path::new("/etc/passwd"))
+        );
         // Expand
         exe.expand_sandbox_path(PathBuf::from("/etc"));
         // After expansion: /etc is allowed
-        assert!(exe.sandbox_policy.as_ref().unwrap().is_path_allowed(std::path::Path::new("/etc/passwd")));
+        assert!(
+            exe.sandbox_policy
+                .as_ref()
+                .unwrap()
+                .is_path_allowed(std::path::Path::new("/etc/passwd"))
+        );
     }
 
     #[test]

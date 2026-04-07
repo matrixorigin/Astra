@@ -1281,24 +1281,66 @@ mod tests {
         assert_eq!(DeltaError::InvalidVersion("v".into()).status_code(), 400);
         assert_eq!(DeltaError::InvalidCheckpoint("c".into()).status_code(), 400);
         assert_eq!(DeltaError::ValidationFailed("f".into()).status_code(), 400);
-        assert_eq!(DeltaError::VersionConflict { expected: 1, actual: 2 }.status_code(), 409);
-        assert_eq!(DeltaError::DeltaTooLarge { size: 100, threshold: 50 }.status_code(), 409);
-        assert_eq!(DeltaError::VersionExpired { version: 1, oldest: 5 }.status_code(), 410);
-        assert_eq!(DeltaError::CheckpointNotFound("x".into()).status_code(), 404);
-        assert_eq!(DeltaError::OperationNotAllowed("x".into()).status_code(), 403);
+        assert_eq!(
+            DeltaError::VersionConflict {
+                expected: 1,
+                actual: 2
+            }
+            .status_code(),
+            409
+        );
+        assert_eq!(
+            DeltaError::DeltaTooLarge {
+                size: 100,
+                threshold: 50
+            }
+            .status_code(),
+            409
+        );
+        assert_eq!(
+            DeltaError::VersionExpired {
+                version: 1,
+                oldest: 5
+            }
+            .status_code(),
+            410
+        );
+        assert_eq!(
+            DeltaError::CheckpointNotFound("x".into()).status_code(),
+            404
+        );
+        assert_eq!(
+            DeltaError::OperationNotAllowed("x".into()).status_code(),
+            403
+        );
     }
 
     #[test]
     fn delta_error_retryable() {
-        assert!(DeltaError::VersionConflict { expected: 1, actual: 2 }.is_retryable());
+        assert!(
+            DeltaError::VersionConflict {
+                expected: 1,
+                actual: 2
+            }
+            .is_retryable()
+        );
         assert!(!DeltaError::InvalidVersion("v".into()).is_retryable());
         assert!(!DeltaError::CheckpointNotFound("x".into()).is_retryable());
-        assert!(!DeltaError::DeltaTooLarge { size: 1, threshold: 1 }.is_retryable());
+        assert!(
+            !DeltaError::DeltaTooLarge {
+                size: 1,
+                threshold: 1
+            }
+            .is_retryable()
+        );
     }
 
     #[test]
     fn delta_error_response_json() {
-        let err = DeltaError::VersionConflict { expected: 1, actual: 2 };
+        let err = DeltaError::VersionConflict {
+            expected: 1,
+            actual: 2,
+        };
         let resp = err.to_error_response();
         assert_eq!(resp["error"], "version_conflict");
         assert!(resp["message"].as_str().unwrap().contains("expected 1"));
@@ -1306,7 +1348,10 @@ mod tests {
 
     #[test]
     fn delta_error_display() {
-        let err = DeltaError::DeltaTooLarge { size: 100, threshold: 50 };
+        let err = DeltaError::DeltaTooLarge {
+            size: 100,
+            threshold: 50,
+        };
         assert!(err.to_string().contains("100"));
         assert!(err.to_string().contains("50"));
     }

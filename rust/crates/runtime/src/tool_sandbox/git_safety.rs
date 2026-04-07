@@ -498,25 +498,40 @@ mod tests {
     #[test]
     fn git_with_path_prefix_detected() {
         let violations = validate_git_command("/usr/bin/git push --force");
-        assert!(violations.iter().any(|v| matches!(v, GitSafetyViolation::ForcePush)));
+        assert!(
+            violations
+                .iter()
+                .any(|v| matches!(v, GitSafetyViolation::ForcePush))
+        );
     }
 
     #[test]
     fn force_with_lease_is_force_push() {
         let violations = validate_git_command("git push --force-with-lease");
-        assert!(violations.iter().any(|v| matches!(v, GitSafetyViolation::ForcePush)));
+        assert!(
+            violations
+                .iter()
+                .any(|v| matches!(v, GitSafetyViolation::ForcePush))
+        );
     }
 
     #[test]
     fn multiple_violations_in_one_command() {
         let violations = validate_git_command("git commit --amend --no-verify");
-        assert!(violations.len() >= 2, "should detect both amend and no-verify");
+        assert!(
+            violations.len() >= 2,
+            "should detect both amend and no-verify"
+        );
     }
 
     #[test]
     fn git_config_env_flag_blocked() {
         let violations = validate_git_command("git --config-env=core.editor=EDITOR commit");
-        assert!(violations.iter().any(|v| matches!(v, GitSafetyViolation::GitExecPathFlag)));
+        assert!(
+            violations
+                .iter()
+                .any(|v| matches!(v, GitSafetyViolation::GitExecPathFlag))
+        );
     }
 
     #[test]
@@ -525,9 +540,13 @@ mod tests {
         let violations = vec![
             GitSafetyViolation::CommitMessageInjection { pattern: "$()" },
             GitSafetyViolation::CommitMessageDash,
-            GitSafetyViolation::HookSkipFlag { flag: "--no-verify" },
+            GitSafetyViolation::HookSkipFlag {
+                flag: "--no-verify",
+            },
             GitSafetyViolation::ForcePush,
-            GitSafetyViolation::ForcePushProtectedBranch { branch: "main".into() },
+            GitSafetyViolation::ForcePushProtectedBranch {
+                branch: "main".into(),
+            },
             GitSafetyViolation::CdGitCompound,
             GitSafetyViolation::GitConfigFlag,
             GitSafetyViolation::GitExecPathFlag,

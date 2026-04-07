@@ -437,7 +437,10 @@ pub async fn run_agentic_headless_tool_round<E: EdgeToolRoundRow>(
         let model_result_str = if let Some(sid) = current_session_id {
             let session_dir = astra_services::session_journal::local_sessions_dir().join(sid);
             match super::tool_result_storage::maybe_persist_tool_result(
-                &session_dir, &id, &name, &model_result_str,
+                &session_dir,
+                &id,
+                &name,
+                &model_result_str,
             ) {
                 Some(replacement) => replacement,
                 None => model_result_str,

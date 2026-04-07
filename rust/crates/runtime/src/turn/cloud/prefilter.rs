@@ -136,7 +136,9 @@ mod tests {
         let plan = plan_cloud_skill_candidates(&schemas, &BTreeSet::new(), "search files", 10);
         // file_search should score higher (both tokens match)
         assert_eq!(
-            plan.selected_schemas[0]["function"]["name"].as_str().unwrap(),
+            plan.selected_schemas[0]["function"]["name"]
+                .as_str()
+                .unwrap(),
             "file_search"
         );
     }
@@ -150,7 +152,9 @@ mod tests {
         // "memory" matches name part "memory" via substring overlap → +2 boost
         let plan = plan_cloud_skill_candidates(&schemas, &BTreeSet::new(), "memory", 10);
         assert_eq!(
-            plan.selected_schemas[0]["function"]["name"].as_str().unwrap(),
+            plan.selected_schemas[0]["function"]["name"]
+                .as_str()
+                .unwrap(),
             "memory_store"
         );
     }

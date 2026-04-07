@@ -587,7 +587,13 @@ mod tests {
 
     #[test]
     fn new_service_has_no_pool_or_memoria() {
-        let settings = MatrixOneSettings { host: String::new(), port: 0, user: String::new(), password: String::new(), database: String::new() };
+        let settings = MatrixOneSettings {
+            host: String::new(),
+            port: 0,
+            user: String::new(),
+            password: String::new(),
+            database: String::new(),
+        };
         let svc = DatabaseEvaluationService::new(settings);
         assert!(svc.pool.is_none());
         assert!(svc.memoria_base_url.is_none());
@@ -596,7 +602,13 @@ mod tests {
 
     #[test]
     fn with_memoria_config_filters_empty_key() {
-        let settings = MatrixOneSettings { host: String::new(), port: 0, user: String::new(), password: String::new(), database: String::new() };
+        let settings = MatrixOneSettings {
+            host: String::new(),
+            port: 0,
+            user: String::new(),
+            password: String::new(),
+            database: String::new(),
+        };
         let svc = DatabaseEvaluationService::new(settings)
             .with_memoria_config("http://localhost:8080", Some("".to_string()));
         assert_eq!(svc.memoria_base_url, Some("http://localhost:8080".into()));
@@ -606,7 +618,13 @@ mod tests {
 
     #[test]
     fn with_memoria_config_keeps_valid_key() {
-        let settings = MatrixOneSettings { host: String::new(), port: 0, user: String::new(), password: String::new(), database: String::new() };
+        let settings = MatrixOneSettings {
+            host: String::new(),
+            port: 0,
+            user: String::new(),
+            password: String::new(),
+            database: String::new(),
+        };
         let svc = DatabaseEvaluationService::new(settings)
             .with_memoria_config("http://localhost:8080", Some("secret123".to_string()));
         assert_eq!(svc.memoria_master_key, Some("secret123".into()));
@@ -614,7 +632,13 @@ mod tests {
 
     #[test]
     fn with_memoria_config_none_key() {
-        let settings = MatrixOneSettings { host: String::new(), port: 0, user: String::new(), password: String::new(), database: String::new() };
+        let settings = MatrixOneSettings {
+            host: String::new(),
+            port: 0,
+            user: String::new(),
+            password: String::new(),
+            database: String::new(),
+        };
         let svc = DatabaseEvaluationService::new(settings)
             .with_memoria_config("http://localhost:8080", None);
         assert!(svc.memoria_master_key.is_none());
@@ -624,7 +648,13 @@ mod tests {
 
     #[tokio::test]
     async fn memoria_get_fails_without_config() {
-        let settings = MatrixOneSettings { host: String::new(), port: 0, user: String::new(), password: String::new(), database: String::new() };
+        let settings = MatrixOneSettings {
+            host: String::new(),
+            port: 0,
+            user: String::new(),
+            password: String::new(),
+            database: String::new(),
+        };
         let svc = DatabaseEvaluationService::new(settings);
         let result = svc.memoria_get("/v1/health/storage", "user1").await;
         assert!(result.is_err());
@@ -634,7 +664,13 @@ mod tests {
 
     #[tokio::test]
     async fn memoria_get_fails_without_master_key() {
-        let settings = MatrixOneSettings { host: String::new(), port: 0, user: String::new(), password: String::new(), database: String::new() };
+        let settings = MatrixOneSettings {
+            host: String::new(),
+            port: 0,
+            user: String::new(),
+            password: String::new(),
+            database: String::new(),
+        };
         let svc = DatabaseEvaluationService::new(settings)
             .with_memoria_config("http://localhost:9999", None);
         let result = svc.memoria_get("/v1/health/storage", "user1").await;
@@ -674,11 +710,21 @@ mod tests {
 
     #[test]
     fn compute_overall_avg_weighted() {
-        use super::super::utils::compute_overall_avg;
         use super::super::types::QualityTrendPoint;
+        use super::super::utils::compute_overall_avg;
         let points = vec![
-            QualityTrendPoint { date: "2024-01-01".into(), avg_score: 0.8, count: 10, model: None },
-            QualityTrendPoint { date: "2024-01-02".into(), avg_score: 0.6, count: 10, model: None },
+            QualityTrendPoint {
+                date: "2024-01-01".into(),
+                avg_score: 0.8,
+                count: 10,
+                model: None,
+            },
+            QualityTrendPoint {
+                date: "2024-01-02".into(),
+                avg_score: 0.6,
+                count: 10,
+                model: None,
+            },
         ];
         let avg = compute_overall_avg(&points);
         assert!((avg - 0.7).abs() < 0.001);
@@ -686,11 +732,14 @@ mod tests {
 
     #[test]
     fn compute_overall_avg_zero_counts() {
-        use super::super::utils::compute_overall_avg;
         use super::super::types::QualityTrendPoint;
-        let points = vec![
-            QualityTrendPoint { date: "2024-01-01".into(), avg_score: 0.9, count: 0, model: None },
-        ];
+        use super::super::utils::compute_overall_avg;
+        let points = vec![QualityTrendPoint {
+            date: "2024-01-01".into(),
+            avg_score: 0.9,
+            count: 0,
+            model: None,
+        }];
         assert_eq!(compute_overall_avg(&points), 0.0);
     }
 

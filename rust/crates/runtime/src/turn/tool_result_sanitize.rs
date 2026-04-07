@@ -68,8 +68,7 @@ mod tests {
 
     #[test]
     fn strips_multi_edit_sentinel() {
-        let raw =
-            "Applied 1 edit(s)\n<<<ASTRA_UNIFIED_DIFF>>>\n+a\n<<<END_ASTRA_UNIFIED_DIFF>>>\n";
+        let raw = "Applied 1 edit(s)\n<<<ASTRA_UNIFIED_DIFF>>>\n+a\n<<<END_ASTRA_UNIFIED_DIFF>>>\n";
         let out = tool_result_content_for_model("multi_edit", raw);
         assert!(!out.contains("ASTRA_UNIFIED_DIFF"));
         assert!(out.contains("Applied"));

@@ -73,7 +73,18 @@ mod tests {
 
     #[test]
     fn explain_with_tokens() {
-        let event = build_explain_event(150, Some(1000), Some(500), 5, 20, None, vec![], None, None, None);
+        let event = build_explain_event(
+            150,
+            Some(1000),
+            Some(500),
+            5,
+            20,
+            None,
+            vec![],
+            None,
+            None,
+            None,
+        );
         assert_eq!(event["total_ms"].as_i64().unwrap(), 150);
         assert_eq!(event["prompt_tokens"].as_i64().unwrap(), 1000);
         assert_eq!(event["completion_tokens"].as_i64().unwrap(), 500);

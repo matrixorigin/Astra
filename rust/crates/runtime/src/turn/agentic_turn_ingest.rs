@@ -797,10 +797,10 @@ mod tests {
             pack.ingest_mut(),
         );
         assert_eq!(out2, AgenticTurnIngestOutcome::Break);
-        assert_eq!(pack.total_cache_read, 230);       // 80 + 150
-        assert_eq!(pack.total_cache_creation, 50);     // 20 + 30
-        assert_eq!(pack.total_prompt, 300);            // 100 + 200
-        assert_eq!(pack.total_completion, 150);        // 50 + 100
+        assert_eq!(pack.total_cache_read, 230); // 80 + 150
+        assert_eq!(pack.total_cache_creation, 50); // 20 + 30
+        assert_eq!(pack.total_prompt, 300); // 100 + 200
+        assert_eq!(pack.total_completion, 150); // 50 + 100
     }
 
     #[test]
@@ -883,7 +883,13 @@ mod tests {
         };
         let mut pack = Pack::new();
         ingest_agentic_turn_stream(
-            &snap1, 0, |_| String::new(), "q", &[], true, pack.ingest_mut(),
+            &snap1,
+            0,
+            |_| String::new(),
+            "q",
+            &[],
+            true,
+            pack.ingest_mut(),
         );
         // Second turn: cache_creation but no cache_read
         let snap2 = AgenticTurnStreamSnapshot {
@@ -893,9 +899,15 @@ mod tests {
             ..snap1
         };
         ingest_agentic_turn_stream(
-            &snap2, 0, |_| String::new(), "q", &[], true, pack.ingest_mut(),
+            &snap2,
+            0,
+            |_| String::new(),
+            "q",
+            &[],
+            true,
+            pack.ingest_mut(),
         );
-        assert_eq!(pack.total_cache_read, 90);        // only from turn 1
-        assert_eq!(pack.total_cache_creation, 75);     // only from turn 2
+        assert_eq!(pack.total_cache_read, 90); // only from turn 1
+        assert_eq!(pack.total_cache_creation, 75); // only from turn 2
     }
 }

@@ -52,22 +52,57 @@ fn init_env() {
 struct StubHealth;
 #[async_trait]
 impl HealthChecker for StubHealth {
-    async fn database_healthy(&self) -> bool { true }
+    async fn database_healthy(&self) -> bool {
+        true
+    }
 }
 
 #[derive(Clone)]
 struct StubAuth;
 #[async_trait]
 impl AuthService for StubAuth {
-    async fn register(&self, _: AuthRegisterRequestData) -> Result<AuthUserRecord, (StatusCode, axum::Json<ErrorResponse>)> { unreachable!() }
-    async fn login(&self, _: AuthLoginRequestData) -> Result<AuthTokenRecord, (StatusCode, axum::Json<ErrorResponse>)> { unreachable!() }
-    async fn refresh(&self, _: AuthRefreshRequestData) -> Result<AuthTokenRecord, (StatusCode, axum::Json<ErrorResponse>)> { unreachable!() }
-    async fn logout(&self, _: AuthRefreshRequestData) -> Result<(), (StatusCode, axum::Json<ErrorResponse>)> { unreachable!() }
-    async fn current_user(&self, headers: &HeaderMap) -> Result<AuthUserRecord, (StatusCode, axum::Json<ErrorResponse>)> {
+    async fn register(
+        &self,
+        _: AuthRegisterRequestData,
+    ) -> Result<AuthUserRecord, (StatusCode, axum::Json<ErrorResponse>)> {
+        unreachable!()
+    }
+    async fn login(
+        &self,
+        _: AuthLoginRequestData,
+    ) -> Result<AuthTokenRecord, (StatusCode, axum::Json<ErrorResponse>)> {
+        unreachable!()
+    }
+    async fn refresh(
+        &self,
+        _: AuthRefreshRequestData,
+    ) -> Result<AuthTokenRecord, (StatusCode, axum::Json<ErrorResponse>)> {
+        unreachable!()
+    }
+    async fn logout(
+        &self,
+        _: AuthRefreshRequestData,
+    ) -> Result<(), (StatusCode, axum::Json<ErrorResponse>)> {
+        unreachable!()
+    }
+    async fn current_user(
+        &self,
+        headers: &HeaderMap,
+    ) -> Result<AuthUserRecord, (StatusCode, axum::Json<ErrorResponse>)> {
         if headers.get("authorization").and_then(|v| v.to_str().ok()) == Some(TOKEN) {
-            Ok(AuthUserRecord { user_id: USER_ID.into(), username: "rt-e2e".into(), email: "rt@e2e.test".into(), display_name: None })
+            Ok(AuthUserRecord {
+                user_id: USER_ID.into(),
+                username: "rt-e2e".into(),
+                email: "rt@e2e.test".into(),
+                display_name: None,
+            })
         } else {
-            Err((StatusCode::UNAUTHORIZED, axum::Json(ErrorResponse { detail: "bad".into() })))
+            Err((
+                StatusCode::UNAUTHORIZED,
+                axum::Json(ErrorResponse {
+                    detail: "bad".into(),
+                }),
+            ))
         }
     }
 }
@@ -76,20 +111,78 @@ impl AuthService for StubAuth {
 struct StubSession;
 #[async_trait]
 impl SessionService for StubSession {
-    async fn create_session(&self, user_id: String, req: SessionCreateRequestData) -> Result<SessionRecord, (StatusCode, axum::Json<ErrorResponse>)> {
-        Ok(SessionRecord { session_id: "s-rt-e2e".into(), user_id, agent_id: req.agent_id, title: Some("e2e".into()), metadata: req.metadata.unwrap_or_default(), status: "active".into(), event_count: 0, created_at: "2026-01-01T00:00:00Z".into(), updated_at: None, ended_at: None })
+    async fn create_session(
+        &self,
+        user_id: String,
+        req: SessionCreateRequestData,
+    ) -> Result<SessionRecord, (StatusCode, axum::Json<ErrorResponse>)> {
+        Ok(SessionRecord {
+            session_id: "s-rt-e2e".into(),
+            user_id,
+            agent_id: req.agent_id,
+            title: Some("e2e".into()),
+            metadata: req.metadata.unwrap_or_default(),
+            status: "active".into(),
+            event_count: 0,
+            created_at: "2026-01-01T00:00:00Z".into(),
+            updated_at: None,
+            ended_at: None,
+        })
     }
-    async fn list_sessions(&self, _: SessionListFilter) -> Result<SessionListRecord, (StatusCode, axum::Json<ErrorResponse>)> { unreachable!() }
-    async fn get_session(&self, session_id: String, user_id: String) -> Result<SessionRecord, (StatusCode, axum::Json<ErrorResponse>)> {
-        Ok(SessionRecord { session_id, user_id, agent_id: None, title: None, metadata: serde_json::Map::new(), status: "active".into(), event_count: 0, created_at: "2026-01-01T00:00:00Z".into(), updated_at: None, ended_at: None })
+    async fn list_sessions(
+        &self,
+        _: SessionListFilter,
+    ) -> Result<SessionListRecord, (StatusCode, axum::Json<ErrorResponse>)> {
+        unreachable!()
     }
-    async fn update_session(&self, sid: String, uid: String, _: SessionUpdateRequestData) -> Result<SessionRecord, (StatusCode, axum::Json<ErrorResponse>)> { self.get_session(sid, uid).await }
-    async fn delete_session(&self, _: String, _: String) -> Result<(), (StatusCode, axum::Json<ErrorResponse>)> { Ok(()) }
-    async fn get_session_activity(&self, _: String, _: String, _: u32, _: u32) -> Result<SessionActivityRecord, (StatusCode, axum::Json<ErrorResponse>)> { unreachable!() }
+    async fn get_session(
+        &self,
+        session_id: String,
+        user_id: String,
+    ) -> Result<SessionRecord, (StatusCode, axum::Json<ErrorResponse>)> {
+        Ok(SessionRecord {
+            session_id,
+            user_id,
+            agent_id: None,
+            title: None,
+            metadata: serde_json::Map::new(),
+            status: "active".into(),
+            event_count: 0,
+            created_at: "2026-01-01T00:00:00Z".into(),
+            updated_at: None,
+            ended_at: None,
+        })
+    }
+    async fn update_session(
+        &self,
+        sid: String,
+        uid: String,
+        _: SessionUpdateRequestData,
+    ) -> Result<SessionRecord, (StatusCode, axum::Json<ErrorResponse>)> {
+        self.get_session(sid, uid).await
+    }
+    async fn delete_session(
+        &self,
+        _: String,
+        _: String,
+    ) -> Result<(), (StatusCode, axum::Json<ErrorResponse>)> {
+        Ok(())
+    }
+    async fn get_session_activity(
+        &self,
+        _: String,
+        _: String,
+        _: u32,
+        _: u32,
+    ) -> Result<SessionActivityRecord, (StatusCode, axum::Json<ErrorResponse>)> {
+        unreachable!()
+    }
 }
 
 #[derive(Clone, Default)]
-struct Capture { plans: Arc<Mutex<Vec<TurnToolEventPersistPlan>>> }
+struct Capture {
+    plans: Arc<Mutex<Vec<TurnToolEventPersistPlan>>>,
+}
 
 #[derive(Clone)]
 struct CapturingWriter(Capture);
@@ -119,33 +212,53 @@ fn build_app_with_capture(capture: Capture) -> Router {
         .with_turn_tool_event_writer(Arc::new(CapturingWriter(capture.clone())));
     let ledger = base.edge_callback_ledger();
     let bridge = InProcessChatTurnBridge::new(
-        MatrixOneSettings { host: "127.0.0.1".into(), port: 1, user: "x".into(), password: "x".into(), database: "x".into() },
+        MatrixOneSettings {
+            host: "127.0.0.1".into(),
+            port: 1,
+            user: "x".into(),
+            password: "x".into(),
+            database: "x".into(),
+        },
         enc,
-    ).with_edge_callback_ledger(ledger);
-    let state = base.with_chat_turn_bridge(Arc::new(bridge)).with_chat_turn_bridge_secret("rt-e2e-bridge-secret");
+    )
+    .with_edge_callback_ledger(ledger);
+    let state = base
+        .with_chat_turn_bridge(Arc::new(bridge))
+        .with_chat_turn_bridge_secret("rt-e2e-bridge-secret");
     build_app(state)
 }
 
 async fn chat_turn(app: &Router, payload: Value) -> (StatusCode, Vec<u8>) {
     let req = Request::builder()
-        .method("POST").uri("/chat/turn")
+        .method("POST")
+        .uri("/chat/turn")
         .header("authorization", TOKEN)
         .header("content-type", "application/json")
         .header("x-mo-bridge-test-secret", SECRET)
-        .body(Body::from(payload.to_string())).unwrap();
+        .body(Body::from(payload.to_string()))
+        .unwrap();
     let resp = app.clone().oneshot(req).await.unwrap();
     let st = resp.status();
-    let bytes = body::to_bytes(resp.into_body(), 16 * 1024 * 1024).await.unwrap();
+    let bytes = body::to_bytes(resp.into_body(), 16 * 1024 * 1024)
+        .await
+        .unwrap();
     (st, bytes.to_vec())
 }
 
 async fn post_json(app: &Router, path: &str, payload: Value) -> (StatusCode, Value) {
-    let resp = app.clone().oneshot(
-        Request::builder().method("POST").uri(path)
-            .header("authorization", TOKEN)
-            .header("content-type", "application/json")
-            .body(Body::from(payload.to_string())).unwrap()
-    ).await.unwrap();
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(path)
+                .header("authorization", TOKEN)
+                .header("content-type", "application/json")
+                .body(Body::from(payload.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
     let st = resp.status();
     let bytes = body::to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
     let v = serde_json::from_slice(&bytes).unwrap_or(json!({}));
@@ -160,11 +273,13 @@ async fn consume_sse_posting_results(
     results: HashMap<String, Value>,
 ) -> String {
     let req = Request::builder()
-        .method("POST").uri("/chat/turn")
+        .method("POST")
+        .uri("/chat/turn")
         .header("authorization", TOKEN)
         .header("content-type", "application/json")
         .header("x-mo-bridge-test-secret", SECRET)
-        .body(Body::from(payload.to_string())).unwrap();
+        .body(Body::from(payload.to_string()))
+        .unwrap();
     let resp = app.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 
@@ -182,11 +297,16 @@ async fn consume_sse_posting_results(
                 && s.contains("\"type\":\"tool_request\"")
                 && s.contains(call_id.as_str())
             {
-                let (st, _) = post_json(app, "/tools/result", json!({
-                    "request_id": call_id,
-                    "status": "ok",
-                    "output": output,
-                })).await;
+                let (st, _) = post_json(
+                    app,
+                    "/tools/result",
+                    json!({
+                        "request_id": call_id,
+                        "status": "ok",
+                        "output": output,
+                    }),
+                )
+                .await;
                 assert_eq!(st, StatusCode::OK, "POST /tools/result for {call_id}");
                 posted.insert(call_id.clone());
             }
@@ -204,7 +324,10 @@ fn parse_sse_events(raw: &str) -> Vec<Value> {
 }
 
 fn events_of_type<'a>(events: &'a [Value], ty: &str) -> Vec<&'a Value> {
-    events.iter().filter(|e| e.get("type").and_then(Value::as_str) == Some(ty)).collect()
+    events
+        .iter()
+        .filter(|e| e.get("type").and_then(Value::as_str) == Some(ty))
+        .collect()
 }
 
 async fn wait_persist() {
@@ -239,11 +362,13 @@ async fn multi_tool_parallel_delivery_and_result_collection() {
 
     // bash requires approval — post approval + result; read_file/grep only need result
     let req = Request::builder()
-        .method("POST").uri("/chat/turn")
+        .method("POST")
+        .uri("/chat/turn")
         .header("authorization", TOKEN)
         .header("content-type", "application/json")
         .header("x-mo-bridge-test-secret", SECRET)
-        .body(Body::from(payload.to_string())).unwrap();
+        .body(Body::from(payload.to_string()))
+        .unwrap();
     let resp = app.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 
@@ -262,9 +387,14 @@ async fn multi_tool_parallel_delivery_and_result_collection() {
             && s.contains("\"type\":\"approval_required\"")
             && s.contains("tc-bash-1")
         {
-            let (st, _) = post_json(&app, "/approval/respond", json!({
-                "request_id": "tc-bash-1", "decision": "allow"
-            })).await;
+            let (st, _) = post_json(
+                &app,
+                "/approval/respond",
+                json!({
+                    "request_id": "tc-bash-1", "decision": "allow"
+                }),
+            )
+            .await;
             assert_eq!(st, StatusCode::OK);
             posted_approvals.insert("tc-bash-1".into());
         }
@@ -279,9 +409,14 @@ async fn multi_tool_parallel_delivery_and_result_collection() {
                 && s.contains("\"type\":\"tool_request\"")
                 && s.contains(id)
             {
-                let (st, _) = post_json(&app, "/tools/result", json!({
-                    "request_id": id, "status": "ok", "output": output
-                })).await;
+                let (st, _) = post_json(
+                    &app,
+                    "/tools/result",
+                    json!({
+                        "request_id": id, "status": "ok", "output": output
+                    }),
+                )
+                .await;
                 assert_eq!(st, StatusCode::OK);
                 posted_results.insert(id.into());
             }
@@ -299,17 +434,30 @@ async fn multi_tool_parallel_delivery_and_result_collection() {
     assert_eq!(posted_results.len(), 3, "should have posted 3 tool results");
 
     // Round 2 text appeared
-    assert!(full.contains("Analysis complete"), "missing round 2 text: {full}");
+    assert!(
+        full.contains("Analysis complete"),
+        "missing round 2 text: {full}"
+    );
 
     // No timeout
-    assert!(!full.contains(MSG_TOOL_LEDGER_TIMEOUT), "unexpected timeout");
+    assert!(
+        !full.contains(MSG_TOOL_LEDGER_TIMEOUT),
+        "unexpected timeout"
+    );
 
     // Persistence check
     wait_persist().await;
     let plans = capture.plans.lock().await;
     let all_events: Vec<_> = plans.iter().flat_map(|p| &p.events).collect();
-    let result_events: Vec<_> = all_events.iter().filter(|e| e.event_type == "tool_result").collect();
-    assert!(result_events.len() >= 3, "expected ≥3 persisted tool_result events, got {}", result_events.len());
+    let result_events: Vec<_> = all_events
+        .iter()
+        .filter(|e| e.event_type == "tool_result")
+        .collect();
+    assert!(
+        result_events.len() >= 3,
+        "expected ≥3 persisted tool_result events, got {}",
+        result_events.len()
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -333,11 +481,13 @@ async fn approval_gate_allow_then_tool_request() {
     });
 
     let req = Request::builder()
-        .method("POST").uri("/chat/turn")
+        .method("POST")
+        .uri("/chat/turn")
         .header("authorization", TOKEN)
         .header("content-type", "application/json")
         .header("x-mo-bridge-test-secret", SECRET)
-        .body(Body::from(payload.to_string())).unwrap();
+        .body(Body::from(payload.to_string()))
+        .unwrap();
     let resp = app.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 
@@ -352,17 +502,31 @@ async fn approval_gate_allow_then_tool_request() {
         let s = String::from_utf8_lossy(&acc);
 
         if !approved && s.contains("\"type\":\"approval_required\"") && s.contains("tc-wf-1") {
-            let (st, _) = post_json(&app, "/approval/respond", json!({
-                "request_id": "tc-wf-1", "decision": "allow"
-            })).await;
+            let (st, _) = post_json(
+                &app,
+                "/approval/respond",
+                json!({
+                    "request_id": "tc-wf-1", "decision": "allow"
+                }),
+            )
+            .await;
             assert_eq!(st, StatusCode::OK);
             approved = true;
         }
 
-        if approved && !result_posted && s.contains("\"type\":\"tool_request\"") && s.contains("tc-wf-1") {
-            let (st, _) = post_json(&app, "/tools/result", json!({
-                "request_id": "tc-wf-1", "status": "ok", "output": "{\"success\":true}"
-            })).await;
+        if approved
+            && !result_posted
+            && s.contains("\"type\":\"tool_request\"")
+            && s.contains("tc-wf-1")
+        {
+            let (st, _) = post_json(
+                &app,
+                "/tools/result",
+                json!({
+                    "request_id": "tc-wf-1", "status": "ok", "output": "{\"success\":true}"
+                }),
+            )
+            .await;
             assert_eq!(st, StatusCode::OK);
             result_posted = true;
         }
@@ -370,15 +534,33 @@ async fn approval_gate_allow_then_tool_request() {
 
     let full = String::from_utf8_lossy(&acc);
     assert!(approved, "approval_required event never appeared");
-    assert!(result_posted, "tool_request event never appeared after approval");
+    assert!(
+        result_posted,
+        "tool_request event never appeared after approval"
+    );
 
     let events = parse_sse_events(&full);
-    let approval_idx = events.iter().position(|e| e["type"] == "approval_required").unwrap();
-    let request_idx = events.iter().position(|e| e["type"] == "tool_request" && e.to_string().contains("tc-wf-1")).unwrap();
-    assert!(approval_idx < request_idx, "approval_required must come before tool_request");
+    let approval_idx = events
+        .iter()
+        .position(|e| e["type"] == "approval_required")
+        .unwrap();
+    let request_idx = events
+        .iter()
+        .position(|e| e["type"] == "tool_request" && e.to_string().contains("tc-wf-1"))
+        .unwrap();
+    assert!(
+        approval_idx < request_idx,
+        "approval_required must come before tool_request"
+    );
 
-    assert!(full.contains("File created successfully"), "missing round 2 text");
-    assert!(!full.contains(MSG_TOOL_LEDGER_TIMEOUT), "unexpected timeout");
+    assert!(
+        full.contains("File created successfully"),
+        "missing round 2 text"
+    );
+    assert!(
+        !full.contains(MSG_TOOL_LEDGER_TIMEOUT),
+        "unexpected timeout"
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -402,11 +584,13 @@ async fn approval_denied_skips_tool_execution() {
     });
 
     let req = Request::builder()
-        .method("POST").uri("/chat/turn")
+        .method("POST")
+        .uri("/chat/turn")
         .header("authorization", TOKEN)
         .header("content-type", "application/json")
         .header("x-mo-bridge-test-secret", SECRET)
-        .body(Body::from(payload.to_string())).unwrap();
+        .body(Body::from(payload.to_string()))
+        .unwrap();
     let resp = app.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 
@@ -420,9 +604,14 @@ async fn approval_denied_skips_tool_execution() {
         let s = String::from_utf8_lossy(&acc);
 
         if !denied && s.contains("\"type\":\"approval_required\"") && s.contains("tc-deny-1") {
-            let (st, _) = post_json(&app, "/approval/respond", json!({
-                "request_id": "tc-deny-1", "decision": "deny", "reason": "too dangerous"
-            })).await;
+            let (st, _) = post_json(
+                &app,
+                "/approval/respond",
+                json!({
+                    "request_id": "tc-deny-1", "decision": "deny", "reason": "too dangerous"
+                }),
+            )
+            .await;
             assert_eq!(st, StatusCode::OK);
             denied = true;
         }
@@ -433,22 +622,33 @@ async fn approval_denied_skips_tool_execution() {
 
     // tool_request should NOT appear for a denied tool
     let events = parse_sse_events(&full);
-    let tool_requests: Vec<_> = events.iter()
+    let tool_requests: Vec<_> = events
+        .iter()
         .filter(|e| e["type"] == "tool_request" && e.to_string().contains("tc-deny-1"))
         .collect();
-    assert!(tool_requests.is_empty(), "denied tool should not get tool_request, got: {tool_requests:?}");
+    assert!(
+        tool_requests.is_empty(),
+        "denied tool should not get tool_request, got: {tool_requests:?}"
+    );
 
     // Round 2 text should still appear (LLM continues with denied result in context)
-    assert!(full.contains("won't delete"), "missing round 2 text after denial: {full}");
+    assert!(
+        full.contains("won't delete"),
+        "missing round 2 text after denial: {full}"
+    );
 
     // Persistence: denied result should be persisted
     wait_persist().await;
     let plans = capture.plans.lock().await;
     let all_events: Vec<_> = plans.iter().flat_map(|p| &p.events).collect();
-    let denied_events: Vec<_> = all_events.iter()
+    let denied_events: Vec<_> = all_events
+        .iter()
         .filter(|e| e.event_type == "tool_result" && e.content.contains("user_denied"))
         .collect();
-    assert!(!denied_events.is_empty(), "denied tool_result should be persisted");
+    assert!(
+        !denied_events.is_empty(),
+        "denied tool_result should be persisted"
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -478,11 +678,13 @@ async fn multi_round_three_tool_calls_then_final_answer() {
     });
 
     let req = Request::builder()
-        .method("POST").uri("/chat/turn")
+        .method("POST")
+        .uri("/chat/turn")
         .header("authorization", TOKEN)
         .header("content-type", "application/json")
         .header("x-mo-bridge-test-secret", SECRET)
-        .body(Body::from(payload.to_string())).unwrap();
+        .body(Body::from(payload.to_string()))
+        .unwrap();
     let resp = app.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 
@@ -508,9 +710,14 @@ async fn multi_round_three_tool_calls_then_final_answer() {
                 && s.contains("\"type\":\"approval_required\"")
                 && s.contains(id)
             {
-                let (st, _) = post_json(&app, "/approval/respond", json!({
-                    "request_id": id, "decision": "allow"
-                })).await;
+                let (st, _) = post_json(
+                    &app,
+                    "/approval/respond",
+                    json!({
+                        "request_id": id, "decision": "allow"
+                    }),
+                )
+                .await;
                 assert_eq!(st, StatusCode::OK);
                 approved.insert(id.into());
             }
@@ -518,13 +725,15 @@ async fn multi_round_three_tool_calls_then_final_answer() {
 
         // Post tool results
         for (id, output) in &tool_outputs {
-            if !posted.contains(*id)
-                && s.contains("\"type\":\"tool_request\"")
-                && s.contains(*id)
-            {
-                let (st, _) = post_json(&app, "/tools/result", json!({
-                    "request_id": id, "status": "ok", "output": output
-                })).await;
+            if !posted.contains(*id) && s.contains("\"type\":\"tool_request\"") && s.contains(*id) {
+                let (st, _) = post_json(
+                    &app,
+                    "/tools/result",
+                    json!({
+                        "request_id": id, "status": "ok", "output": output
+                    }),
+                )
+                .await;
                 assert_eq!(st, StatusCode::OK);
                 posted.insert(id.to_string());
             }
@@ -534,23 +743,37 @@ async fn multi_round_three_tool_calls_then_final_answer() {
     let full = String::from_utf8_lossy(&acc);
 
     // All 3 tool rounds completed
-    assert_eq!(posted.len(), 3, "should have posted 3 tool results, got: {posted:?}");
+    assert_eq!(
+        posted.len(),
+        3,
+        "should have posted 3 tool results, got: {posted:?}"
+    );
     assert!(full.contains("tc-r1"), "missing round 1 tool_request");
     assert!(full.contains("tc-r2"), "missing round 2 tool_request");
     assert!(full.contains("tc-r3"), "missing round 3 tool_request");
 
     // Final answer appeared
-    assert!(full.contains("Bug fixed and tests pass"), "missing final answer: {full}");
-    assert!(!full.contains(MSG_TOOL_LEDGER_TIMEOUT), "unexpected timeout");
+    assert!(
+        full.contains("Bug fixed and tests pass"),
+        "missing final answer: {full}"
+    );
+    assert!(
+        !full.contains(MSG_TOOL_LEDGER_TIMEOUT),
+        "unexpected timeout"
+    );
 
     // Persistence: 3 tool_result events
     wait_persist().await;
     let plans = capture.plans.lock().await;
-    let result_count = plans.iter()
+    let result_count = plans
+        .iter()
         .flat_map(|p| &p.events)
         .filter(|e| e.event_type == "tool_result")
         .count();
-    assert!(result_count >= 3, "expected ≥3 persisted tool_results, got {result_count}");
+    assert!(
+        result_count >= 3,
+        "expected ≥3 persisted tool_results, got {result_count}"
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -585,7 +808,10 @@ async fn tool_result_timeout_when_edge_never_responds() {
     let full = String::from_utf8_lossy(&raw);
 
     // The tool_request event should still appear (bridge emits it before waiting)
-    assert!(full.contains("tc-timeout-1"), "tool_request should appear before timeout wait");
+    assert!(
+        full.contains("tc-timeout-1"),
+        "tool_request should appear before timeout wait"
+    );
 
     // The LLM should still get a second round (with timeout as tool result in context)
     // The bridge passes MSG_TOOL_LEDGER_TIMEOUT as the tool result content to the LLM,
@@ -599,11 +825,18 @@ async fn tool_result_timeout_when_edge_never_responds() {
     wait_persist().await;
     let plans = capture.plans.lock().await;
     let all_events: Vec<_> = plans.iter().flat_map(|p| &p.events).collect();
-    let timeout_events: Vec<_> = all_events.iter()
+    let timeout_events: Vec<_> = all_events
+        .iter()
         .filter(|e| e.event_type == "tool_result" && e.content.contains("timed out"))
         .collect();
-    assert!(!timeout_events.is_empty(), "timeout tool_result should be persisted, events: {:?}",
-        all_events.iter().map(|e| format!("{}:{}", e.event_type, &e.content[..e.content.len().min(80)])).collect::<Vec<_>>());
+    assert!(
+        !timeout_events.is_empty(),
+        "timeout tool_result should be persisted, events: {:?}",
+        all_events
+            .iter()
+            .map(|e| format!("{}:{}", e.event_type, &e.content[..e.content.len().min(80)]))
+            .collect::<Vec<_>>()
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -633,7 +866,8 @@ async fn sse_event_ordering_contract() {
     assert!(!events.is_empty(), "should have SSE events");
 
     // turn_complete must be the last application event (pings may follow but are transport-level)
-    let app_events: Vec<_> = events.iter()
+    let app_events: Vec<_> = events
+        .iter()
         .filter(|e| e["type"].as_str() != Some("ping"))
         .collect();
     let last = app_events.last().expect("should have app events");
@@ -644,18 +878,24 @@ async fn sse_event_ordering_contract() {
 
     // session_info should appear before any tool_request or text_delta
     let session_info_idx = events.iter().position(|e| e["type"] == "session_info");
-    let first_tool_or_text = events.iter().position(|e| {
-        e["type"] == "tool_request" || e["type"] == "text_delta"
-    });
+    let first_tool_or_text = events
+        .iter()
+        .position(|e| e["type"] == "tool_request" || e["type"] == "text_delta");
     if let (Some(si), Some(ft)) = (session_info_idx, first_tool_or_text) {
-        assert!(si < ft, "session_info (idx {si}) must come before first tool/text (idx {ft})");
+        assert!(
+            si < ft,
+            "session_info (idx {si}) must come before first tool/text (idx {ft})"
+        );
     }
 
     // usage event should appear before turn_complete
     let usage_idx = events.iter().position(|e| e["type"] == "usage");
     let complete_idx = events.iter().position(|e| e["type"] == "turn_complete");
     if let (Some(u), Some(c)) = (usage_idx, complete_idx) {
-        assert!(u < c, "usage (idx {u}) must come before turn_complete (idx {c})");
+        assert!(
+            u < c,
+            "usage (idx {u}) must come before turn_complete (idx {c})"
+        );
     }
 }
 
@@ -697,7 +937,10 @@ async fn single_tool_round_trip_baseline() {
 
     // If pings are present, they should have a timestamp
     for ping in &pings {
-        assert!(ping.get("ts").is_some(), "ping should have ts field: {ping}");
+        assert!(
+            ping.get("ts").is_some(),
+            "ping should have ts field: {ping}"
+        );
     }
 }
 
@@ -730,7 +973,10 @@ async fn text_only_turn_no_tools() {
 
     // No tool_request events
     let tool_requests = events_of_type(&events, "tool_request");
-    assert!(tool_requests.is_empty(), "text-only turn should have no tool_requests");
+    assert!(
+        tool_requests.is_empty(),
+        "text-only turn should have no tool_requests"
+    );
 
     // turn_complete with has_tool_calls: false
     let completes = events_of_type(&events, "turn_complete");
@@ -758,11 +1004,13 @@ async fn tool_error_result_propagates_to_next_round() {
     });
 
     let req = Request::builder()
-        .method("POST").uri("/chat/turn")
+        .method("POST")
+        .uri("/chat/turn")
         .header("authorization", TOKEN)
         .header("content-type", "application/json")
         .header("x-mo-bridge-test-secret", SECRET)
-        .body(Body::from(payload.to_string())).unwrap();
+        .body(Body::from(payload.to_string()))
+        .unwrap();
     let resp = app.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 
@@ -777,11 +1025,16 @@ async fn tool_error_result_propagates_to_next_round() {
 
         if !posted && s.contains("\"type\":\"tool_request\"") && s.contains("tc-err-1") {
             // Edge returns an error result (like a real read_file permission denied)
-            let (st, _) = post_json(&app, "/tools/result", json!({
-                "request_id": "tc-err-1",
-                "status": "error",
-                "output": "Error: permission denied (os error 13). Cannot read secret.key"
-            })).await;
+            let (st, _) = post_json(
+                &app,
+                "/tools/result",
+                json!({
+                    "request_id": "tc-err-1",
+                    "status": "error",
+                    "output": "Error: permission denied (os error 13). Cannot read secret.key"
+                }),
+            )
+            .await;
             assert_eq!(st, StatusCode::OK);
             posted = true;
         }
@@ -795,16 +1048,23 @@ async fn tool_error_result_propagates_to_next_round() {
         full.contains("permission error"),
         "round 2 should appear with LLM acknowledging the error: {full}"
     );
-    assert!(!full.contains(MSG_TOOL_LEDGER_TIMEOUT), "should not timeout");
+    assert!(
+        !full.contains(MSG_TOOL_LEDGER_TIMEOUT),
+        "should not timeout"
+    );
 
     // Persistence: error result should be persisted
     wait_persist().await;
     let plans = capture.plans.lock().await;
-    let error_events: Vec<_> = plans.iter()
+    let error_events: Vec<_> = plans
+        .iter()
         .flat_map(|p| &p.events)
         .filter(|e| e.event_type == "tool_result" && e.content.contains("permission denied"))
         .collect();
-    assert!(!error_events.is_empty(), "error tool_result should be persisted");
+    assert!(
+        !error_events.is_empty(),
+        "error tool_result should be persisted"
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -828,11 +1088,13 @@ async fn duplicate_tool_result_does_not_break_flow() {
     });
 
     let req = Request::builder()
-        .method("POST").uri("/chat/turn")
+        .method("POST")
+        .uri("/chat/turn")
         .header("authorization", TOKEN)
         .header("content-type", "application/json")
         .header("x-mo-bridge-test-secret", SECRET)
-        .body(Body::from(payload.to_string())).unwrap();
+        .body(Body::from(payload.to_string()))
+        .unwrap();
     let resp = app.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 
@@ -847,11 +1109,16 @@ async fn duplicate_tool_result_does_not_break_flow() {
 
         if s.contains("\"type\":\"tool_request\"") && s.contains("tc-dup-1") && post_count < 2 {
             // Post the result (first time: consumed by bridge; second time: goes to ledger but nobody reads it)
-            let (st, _) = post_json(&app, "/tools/result", json!({
-                "request_id": "tc-dup-1",
-                "status": "ok",
-                "output": "all systems operational"
-            })).await;
+            let (st, _) = post_json(
+                &app,
+                "/tools/result",
+                json!({
+                    "request_id": "tc-dup-1",
+                    "status": "ok",
+                    "output": "all systems operational"
+                }),
+            )
+            .await;
             assert_eq!(st, StatusCode::OK);
             post_count += 1;
         }
@@ -861,8 +1128,14 @@ async fn duplicate_tool_result_does_not_break_flow() {
 
     // The flow should complete normally despite the duplicate
     assert!(post_count >= 1, "should have posted at least once");
-    assert!(full.contains("Status is healthy"), "round 2 text should appear: {full}");
-    assert!(!full.contains(MSG_TOOL_LEDGER_TIMEOUT), "should not timeout");
+    assert!(
+        full.contains("Status is healthy"),
+        "round 2 text should appear: {full}"
+    );
+    assert!(
+        !full.contains(MSG_TOOL_LEDGER_TIMEOUT),
+        "should not timeout"
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -894,11 +1167,13 @@ async fn mixed_approval_and_readonly_in_same_round() {
     });
 
     let req = Request::builder()
-        .method("POST").uri("/chat/turn")
+        .method("POST")
+        .uri("/chat/turn")
         .header("authorization", TOKEN)
         .header("content-type", "application/json")
         .header("x-mo-bridge-test-secret", SECRET)
-        .body(Body::from(payload.to_string())).unwrap();
+        .body(Body::from(payload.to_string()))
+        .unwrap();
     let resp = app.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 
@@ -917,9 +1192,14 @@ async fn mixed_approval_and_readonly_in_same_round() {
             && s.contains("\"type\":\"approval_required\"")
             && s.contains("tc-mix-wf")
         {
-            let (st, _) = post_json(&app, "/approval/respond", json!({
-                "request_id": "tc-mix-wf", "decision": "allow"
-            })).await;
+            let (st, _) = post_json(
+                &app,
+                "/approval/respond",
+                json!({
+                    "request_id": "tc-mix-wf", "decision": "allow"
+                }),
+            )
+            .await;
             assert_eq!(st, StatusCode::OK);
             approved.insert("tc-mix-wf".into());
         }
@@ -930,13 +1210,15 @@ async fn mixed_approval_and_readonly_in_same_round() {
             ("tc-mix-rf", "key: value"),
             ("tc-mix-gr", "config.yaml:1:key: value"),
         ] {
-            if !posted.contains(id)
-                && s.contains("\"type\":\"tool_request\"")
-                && s.contains(id)
-            {
-                let (st, _) = post_json(&app, "/tools/result", json!({
-                    "request_id": id, "status": "ok", "output": output
-                })).await;
+            if !posted.contains(id) && s.contains("\"type\":\"tool_request\"") && s.contains(id) {
+                let (st, _) = post_json(
+                    &app,
+                    "/tools/result",
+                    json!({
+                        "request_id": id, "status": "ok", "output": output
+                    }),
+                )
+                .await;
                 assert_eq!(st, StatusCode::OK);
                 posted.insert(id.into());
             }
@@ -950,33 +1232,50 @@ async fn mixed_approval_and_readonly_in_same_round() {
 
     // Verify ordering: approval_required for write_file comes before its tool_request
     let events = parse_sse_events(&full);
-    let appr_idx = events.iter().position(|e|
-        e["type"] == "approval_required" && e.to_string().contains("tc-mix-wf")
-    );
-    let wf_req_idx = events.iter().position(|e|
-        e["type"] == "tool_request" && e.to_string().contains("tc-mix-wf")
-    );
+    let appr_idx = events
+        .iter()
+        .position(|e| e["type"] == "approval_required" && e.to_string().contains("tc-mix-wf"));
+    let wf_req_idx = events
+        .iter()
+        .position(|e| e["type"] == "tool_request" && e.to_string().contains("tc-mix-wf"));
     if let (Some(a), Some(r)) = (appr_idx, wf_req_idx) {
-        assert!(a < r, "approval_required must precede tool_request for write_file");
+        assert!(
+            a < r,
+            "approval_required must precede tool_request for write_file"
+        );
     }
 
     // read_file and grep should NOT have approval_required events
-    let rf_approvals: Vec<_> = events.iter()
+    let rf_approvals: Vec<_> = events
+        .iter()
         .filter(|e| e["type"] == "approval_required" && e.to_string().contains("tc-mix-rf"))
         .collect();
-    assert!(rf_approvals.is_empty(), "read_file should not need approval");
+    assert!(
+        rf_approvals.is_empty(),
+        "read_file should not need approval"
+    );
 
-    assert!(full.contains("Config updated and verified"), "final text missing: {full}");
-    assert!(!full.contains(MSG_TOOL_LEDGER_TIMEOUT), "unexpected timeout");
+    assert!(
+        full.contains("Config updated and verified"),
+        "final text missing: {full}"
+    );
+    assert!(
+        !full.contains(MSG_TOOL_LEDGER_TIMEOUT),
+        "unexpected timeout"
+    );
 
     // Persistence
     wait_persist().await;
     let plans = capture.plans.lock().await;
-    let result_count = plans.iter()
+    let result_count = plans
+        .iter()
         .flat_map(|p| &p.events)
         .filter(|e| e.event_type == "tool_result")
         .count();
-    assert!(result_count >= 3, "expected ≥3 persisted tool_results, got {result_count}");
+    assert!(
+        result_count >= 3,
+        "expected ≥3 persisted tool_results, got {result_count}"
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1001,8 +1300,14 @@ async fn turn_complete_has_tool_calls_field_accuracy() {
     let results_a = HashMap::from([("tc-htc-1".to_string(), json!("content"))]);
     let full_a = consume_sse_posting_results(&app, payload_tools, results_a).await;
     let events_a = parse_sse_events(&full_a);
-    let complete_a = events_a.iter().find(|e| e["type"] == "turn_complete").expect("turn_complete");
-    assert_eq!(complete_a["has_tool_calls"], true, "turn with tools should have has_tool_calls:true");
+    let complete_a = events_a
+        .iter()
+        .find(|e| e["type"] == "turn_complete")
+        .expect("turn_complete");
+    assert_eq!(
+        complete_a["has_tool_calls"], true,
+        "turn with tools should have has_tool_calls:true"
+    );
 
     // Case B: turn WITHOUT tool calls
     let payload_text = json!({
@@ -1014,9 +1319,15 @@ async fn turn_complete_has_tool_calls_field_accuracy() {
     let (_, raw_b) = chat_turn(&app, payload_text).await;
     let full_b = String::from_utf8_lossy(&raw_b);
     let events_b = parse_sse_events(&full_b);
-    let complete_b = events_b.iter().find(|e| e["type"] == "turn_complete").expect("turn_complete");
+    let complete_b = events_b
+        .iter()
+        .find(|e| e["type"] == "turn_complete")
+        .expect("turn_complete");
     // Note: has_tool_calls may be true if the bridge always sets it based on
     // all_round_tool_calls (which includes tools from prior rounds in the same
     // /chat/turn call). For a pure text turn, it should be false.
-    assert_eq!(complete_b["has_tool_calls"], false, "text-only turn should have has_tool_calls:false, got: {complete_b}");
+    assert_eq!(
+        complete_b["has_tool_calls"], false,
+        "text-only turn should have has_tool_calls:false, got: {complete_b}"
+    );
 }

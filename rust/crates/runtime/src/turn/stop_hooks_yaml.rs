@@ -497,7 +497,10 @@ hooks:
     #[test]
     fn delegation_root_from_git_root() {
         let mut ctx = HashMap::new();
-        ctx.insert("git_root".into(), Value::String("/home/user/project".into()));
+        ctx.insert(
+            "git_root".into(),
+            Value::String("/home/user/project".into()),
+        );
         let r = project_root_from_delegation_context(&ctx).unwrap();
         assert_eq!(r, PathBuf::from("/home/user/project"));
     }
@@ -505,7 +508,10 @@ hooks:
     #[test]
     fn delegation_root_from_workspace_root() {
         let mut ctx = HashMap::new();
-        ctx.insert("workspace_root".into(), Value::String("/home/user/ws".into()));
+        ctx.insert(
+            "workspace_root".into(),
+            Value::String("/home/user/ws".into()),
+        );
         let r = project_root_from_delegation_context(&ctx).unwrap();
         assert_eq!(r, PathBuf::from("/home/user/ws"));
     }
@@ -521,7 +527,10 @@ hooks:
     #[test]
     fn delegation_root_prefers_git_root_over_cwd() {
         let mut ctx = HashMap::new();
-        ctx.insert("git_root".into(), Value::String("/home/user/project".into()));
+        ctx.insert(
+            "git_root".into(),
+            Value::String("/home/user/project".into()),
+        );
         ctx.insert("cwd".into(), Value::String("/tmp".into()));
         let r = project_root_from_delegation_context(&ctx).unwrap();
         assert_eq!(r, PathBuf::from("/home/user/project"));

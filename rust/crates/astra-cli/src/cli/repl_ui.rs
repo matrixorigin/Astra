@@ -1113,14 +1113,7 @@ pub(super) fn print_slash_commands(query: Option<&str>) {
             "🔭",
             "Observability",
             &[
-                "/explain",
-                "/compact",
-                "/turn",
-                "/debug",
-                "/stats",
-                "/cost",
-                "/tools",
-                "/health",
+                "/explain", "/compact", "/turn", "/debug", "/stats", "/cost", "/tools", "/health",
                 "/sync",
             ],
         ),
@@ -2231,14 +2224,7 @@ mod tests {
         let groups: &[&[&str]] = &[
             &["/help", "/model", "/clear", "/history", "/copy", "/exit"],
             &[
-                "/explain",
-                "/compact",
-                "/turn",
-                "/debug",
-                "/stats",
-                "/cost",
-                "/tools",
-                "/health",
+                "/explain", "/compact", "/turn", "/debug", "/stats", "/cost", "/tools", "/health",
                 "/sync",
             ],
             &[

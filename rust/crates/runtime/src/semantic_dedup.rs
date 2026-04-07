@@ -900,7 +900,10 @@ mod tests {
         let a = "This is a Python script that does image processing with numpy and opencv";
         let b = "The database schema has tables for users, roles, permissions and sessions";
         let sim = output_similarity(a, b);
-        assert!(sim < 0.3, "completely different outputs should have low similarity: {sim}");
+        assert!(
+            sim < 0.3,
+            "completely different outputs should have low similarity: {sim}"
+        );
     }
 
     #[test]
@@ -917,12 +920,18 @@ mod tests {
         let a = "src/main.rs:10: fn handle_request()\nsrc/main.rs:25: fn process_data()\nsrc/main.rs:40: fn send_response()";
         let b = "src/main.rs:10: fn handle_request()\nsrc/main.rs:25: fn process_data()\nsrc/main.rs:42: fn send_response()";
         let sim = output_similarity(a, b);
-        assert!(sim > 0.75, "minor difference should have high similarity: {sim}");
+        assert!(
+            sim > 0.75,
+            "minor difference should have high similarity: {sim}"
+        );
     }
 
     #[test]
     fn output_similarity_empty_strings_return_zero() {
         assert_eq!(output_similarity("", ""), 0.0);
-        assert_eq!(output_similarity("", "some content that is long enough"), 0.0);
+        assert_eq!(
+            output_similarity("", "some content that is long enough"),
+            0.0
+        );
     }
 }

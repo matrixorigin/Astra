@@ -666,27 +666,73 @@ mod tests {
     #[tokio::test]
     async fn unconfigured_service_returns_errors() {
         let svc = UnconfiguredDataVersioningService;
-        assert!(svc.create_checkpoint("u1".into(), CreateCheckpointData { name: "cp".into(), description: None }).await.is_err());
+        assert!(
+            svc.create_checkpoint(
+                "u1".into(),
+                CreateCheckpointData {
+                    name: "cp".into(),
+                    description: None
+                }
+            )
+            .await
+            .is_err()
+        );
         assert!(svc.list_checkpoints("u1".into()).await.is_err());
-        assert!(svc.get_events_at_checkpoint("u1".into(), "cp".into()).await.is_err());
-        assert!(svc.get_causal_chain("u1".into(), "e1".into()).await.is_err());
+        assert!(
+            svc.get_events_at_checkpoint("u1".into(), "cp".into())
+                .await
+                .is_err()
+        );
+        assert!(
+            svc.get_causal_chain("u1".into(), "e1".into())
+                .await
+                .is_err()
+        );
         assert!(svc.trace_upstream("u1".into(), "e1".into()).await.is_err());
-        assert!(svc.sandbox_checkpoint("u1".into(), "sb".into(), SandboxCheckpointData { checkpoint_name: "cp".into() }).await.is_err());
-        assert!(svc.sandbox_restore("u1".into(), "sb".into(), SandboxCheckpointData { checkpoint_name: "cp".into() }).await.is_err());
+        assert!(
+            svc.sandbox_checkpoint(
+                "u1".into(),
+                "sb".into(),
+                SandboxCheckpointData {
+                    checkpoint_name: "cp".into()
+                }
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            svc.sandbox_restore(
+                "u1".into(),
+                "sb".into(),
+                SandboxCheckpointData {
+                    checkpoint_name: "cp".into()
+                }
+            )
+            .await
+            .is_err()
+        );
     }
 
     // ── Data type equality ──
 
     #[test]
     fn create_checkpoint_data_equality() {
-        let a = CreateCheckpointData { name: "cp1".into(), description: Some("d".into()) };
-        let b = CreateCheckpointData { name: "cp1".into(), description: Some("d".into()) };
+        let a = CreateCheckpointData {
+            name: "cp1".into(),
+            description: Some("d".into()),
+        };
+        let b = CreateCheckpointData {
+            name: "cp1".into(),
+            description: Some("d".into()),
+        };
         assert_eq!(a, b);
     }
 
     #[test]
     fn sandbox_checkpoint_data_equality() {
-        let a = SandboxCheckpointData { checkpoint_name: "snap1".into() };
+        let a = SandboxCheckpointData {
+            checkpoint_name: "snap1".into(),
+        };
         let b = a.clone();
         assert_eq!(a, b);
     }

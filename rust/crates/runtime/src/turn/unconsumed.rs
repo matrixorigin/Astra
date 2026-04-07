@@ -83,9 +83,7 @@ mod tests {
 
     #[test]
     fn latest_ids_no_assistant() {
-        let history = vec![Map::from_iter([
-            ("role".to_string(), json!("user")),
-        ])];
+        let history = vec![Map::from_iter([("role".to_string(), json!("user"))])];
         assert!(latest_assistant_tool_call_ids(&history).is_empty());
     }
 
@@ -108,7 +106,10 @@ mod tests {
             Map::from_iter([("role".to_string(), json!("user"))]),
             Map::from_iter([
                 ("role".to_string(), json!("assistant")),
-                ("tool_calls".to_string(), json!([{"id": "tc1"}, {"id": "tc2"}])),
+                (
+                    "tool_calls".to_string(),
+                    json!([{"id": "tc1"}, {"id": "tc2"}]),
+                ),
             ]),
         ];
         let ids = latest_assistant_tool_call_ids(&history);
@@ -121,7 +122,10 @@ mod tests {
     fn latest_ids_skips_non_string_ids() {
         let history = vec![Map::from_iter([
             ("role".to_string(), json!("assistant")),
-            ("tool_calls".to_string(), json!([{"id": 42}, {"id": "valid"}])),
+            (
+                "tool_calls".to_string(),
+                json!([{"id": 42}, {"id": "valid"}]),
+            ),
         ])];
         let ids = latest_assistant_tool_call_ids(&history);
         assert_eq!(ids.len(), 1);

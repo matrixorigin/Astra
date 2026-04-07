@@ -138,7 +138,11 @@ mod tests {
 
     #[test]
     fn mixed_tools_split_correctly() {
-        let tools = vec![tool_call("web", "1"), tool_call("bash", "2"), tool_call("web", "3")];
+        let tools = vec![
+            tool_call("web", "1"),
+            tool_call("bash", "2"),
+            tool_call("web", "3"),
+        ];
         let plan = plan_cloud_loop_iteration(&tools, &cloud_names(&["web"]), "", None);
         assert_eq!(plan.cloud_tool_calls.len(), 2);
         assert_eq!(plan.edge_tool_calls.len(), 1);
@@ -147,7 +151,8 @@ mod tests {
     #[test]
     fn text_included_in_assistant_message() {
         let tools = vec![tool_call("web", "1")];
-        let plan = plan_cloud_loop_iteration(&tools, &cloud_names(&["web"]), "thinking aloud", None);
+        let plan =
+            plan_cloud_loop_iteration(&tools, &cloud_names(&["web"]), "thinking aloud", None);
         let msg = plan.assistant_message.unwrap();
         assert_eq!(msg["content"].as_str().unwrap(), "thinking aloud");
     }

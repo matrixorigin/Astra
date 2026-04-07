@@ -206,16 +206,42 @@ mod tests {
     #[test]
     fn constants_start_with_slash() {
         for path in [
-            CHAT_STREAM, CHAT_TURN, TOOLS_RESULT, APPROVAL_RESPOND,
-            AGENTS_EDGE, AGENTS_EDGE_HEARTBEAT, SESSIONS,
-            AUTH_REGISTER, AUTH_LOGIN, AUTH_REFRESH, AUTH_LOGOUT, AUTH_ME,
-            HEALTH, MODELS, SKILLS, SKILLS_STATUS, SKILLS_TEST,
-            MEMORY_STORE, MEMORY_SEARCH, MEMORY_RETRIEVE, MEMORY_PURGE,
-            TASKS, CONTEXT, CHAT_ROUTE, COMPLETIONS,
-            ADMIN_INIT, ADMIN_AUDIT, ADMIN_USERS_GRANT_ROLE,
-            ADMIN_USERS_REVOKE_ROLE, ADMIN_TOKENS, ADMIN_PROMPTS_OPTIMIZE,
-            ADMIN_FEEDBACK_STATS, ADMIN_FEEDBACK_EXPORT,
-            AUDIT_SESSIONS, AUDIT_STATS, AUDIT_TOOLS,
+            CHAT_STREAM,
+            CHAT_TURN,
+            TOOLS_RESULT,
+            APPROVAL_RESPOND,
+            AGENTS_EDGE,
+            AGENTS_EDGE_HEARTBEAT,
+            SESSIONS,
+            AUTH_REGISTER,
+            AUTH_LOGIN,
+            AUTH_REFRESH,
+            AUTH_LOGOUT,
+            AUTH_ME,
+            HEALTH,
+            MODELS,
+            SKILLS,
+            SKILLS_STATUS,
+            SKILLS_TEST,
+            MEMORY_STORE,
+            MEMORY_SEARCH,
+            MEMORY_RETRIEVE,
+            MEMORY_PURGE,
+            TASKS,
+            CONTEXT,
+            CHAT_ROUTE,
+            COMPLETIONS,
+            ADMIN_INIT,
+            ADMIN_AUDIT,
+            ADMIN_USERS_GRANT_ROLE,
+            ADMIN_USERS_REVOKE_ROLE,
+            ADMIN_TOKENS,
+            ADMIN_PROMPTS_OPTIMIZE,
+            ADMIN_FEEDBACK_STATS,
+            ADMIN_FEEDBACK_EXPORT,
+            AUDIT_SESSIONS,
+            AUDIT_STATS,
+            AUDIT_TOOLS,
         ] {
             assert!(path.starts_with('/'), "path should start with /: {path}");
         }
@@ -250,7 +276,10 @@ mod tests {
 
     #[test]
     fn chat_session_decision_trace_path() {
-        assert_eq!(chat_session_decision_trace("s1"), "/chat/session/s1/decision-trace");
+        assert_eq!(
+            chat_session_decision_trace("s1"),
+            "/chat/session/s1/decision-trace"
+        );
     }
 
     // --- Model/Skill paths ---
@@ -333,7 +362,10 @@ mod tests {
 
     #[test]
     fn session_audit_turn_detail_path() {
-        assert_eq!(session_audit_turn_detail("s1", 3), "/sessions/s1/audit/turns/3");
+        assert_eq!(
+            session_audit_turn_detail("s1", 3),
+            "/sessions/s1/audit/turns/3"
+        );
     }
 
     #[test]

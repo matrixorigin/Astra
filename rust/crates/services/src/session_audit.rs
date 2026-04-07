@@ -1758,7 +1758,10 @@ mod tests {
 
     #[test]
     fn compute_duration_invalid_formats() {
-        assert_eq!(compute_duration_secs(Some("not-a-date"), Some("also-not")), 0.0);
+        assert_eq!(
+            compute_duration_secs(Some("not-a-date"), Some("also-not")),
+            0.0
+        );
     }
 
     #[test]

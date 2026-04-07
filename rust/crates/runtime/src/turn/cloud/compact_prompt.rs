@@ -134,13 +134,21 @@ pub fn strip_analysis_block(raw: &str) -> String {
 /// (on the next turn) knows the summary may be incomplete.
 pub fn format_structured_summary(raw: &str) -> String {
     let summary = strip_analysis_block(raw);
-    const REQUIRED: &[&str] = &["### Primary Request", "### Pending Tasks", "### Current State"];
+    const REQUIRED: &[&str] = &[
+        "### Primary Request",
+        "### Pending Tasks",
+        "### Current State",
+    ];
     let missing: Vec<&&str> = REQUIRED.iter().filter(|h| !summary.contains(**h)).collect();
     if missing.is_empty() {
         summary
     } else {
         let names: Vec<&str> = missing.iter().map(|s| **s).collect();
-        format!("[compact warning: missing sections: {}]\n\n{}", names.join(", "), summary)
+        format!(
+            "[compact warning: missing sections: {}]\n\n{}",
+            names.join(", "),
+            summary
+        )
     }
 }
 

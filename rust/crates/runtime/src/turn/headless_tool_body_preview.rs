@@ -238,39 +238,75 @@ mod tests {
 
     #[test]
     fn style_diff_header_lines() {
-        assert!(matches!(diff_line_style("--- a/file.rs"), HeadlessStderrStyle::CyanBold));
-        assert!(matches!(diff_line_style("+++ b/file.rs"), HeadlessStderrStyle::CyanBold));
-        assert!(matches!(diff_line_style("diff --git a/f b/f"), HeadlessStderrStyle::CyanBold));
-        assert!(matches!(diff_line_style("Binary files differ"), HeadlessStderrStyle::CyanBold));
+        assert!(matches!(
+            diff_line_style("--- a/file.rs"),
+            HeadlessStderrStyle::CyanBold
+        ));
+        assert!(matches!(
+            diff_line_style("+++ b/file.rs"),
+            HeadlessStderrStyle::CyanBold
+        ));
+        assert!(matches!(
+            diff_line_style("diff --git a/f b/f"),
+            HeadlessStderrStyle::CyanBold
+        ));
+        assert!(matches!(
+            diff_line_style("Binary files differ"),
+            HeadlessStderrStyle::CyanBold
+        ));
     }
 
     #[test]
     fn style_hunk_header() {
-        assert!(matches!(diff_line_style("@@ -1,3 +1,4 @@"), HeadlessStderrStyle::Magenta));
+        assert!(matches!(
+            diff_line_style("@@ -1,3 +1,4 @@"),
+            HeadlessStderrStyle::Magenta
+        ));
     }
 
     #[test]
     fn style_context_lines() {
-        assert!(matches!(diff_line_style(" unchanged line"), HeadlessStderrStyle::DiffContext));
-        assert!(matches!(diff_line_style("\\ No newline at end of file"), HeadlessStderrStyle::DiffContext));
+        assert!(matches!(
+            diff_line_style(" unchanged line"),
+            HeadlessStderrStyle::DiffContext
+        ));
+        assert!(matches!(
+            diff_line_style("\\ No newline at end of file"),
+            HeadlessStderrStyle::DiffContext
+        ));
     }
 
     #[test]
     fn style_add_remove_lines() {
-        assert!(matches!(diff_line_style("+added line"), HeadlessStderrStyle::DiffAdd));
-        assert!(matches!(diff_line_style("-removed line"), HeadlessStderrStyle::DiffRemove));
+        assert!(matches!(
+            diff_line_style("+added line"),
+            HeadlessStderrStyle::DiffAdd
+        ));
+        assert!(matches!(
+            diff_line_style("-removed line"),
+            HeadlessStderrStyle::DiffRemove
+        ));
     }
 
     #[test]
     fn style_double_prefix_is_header() {
         // "---" and "+++" with rest starting with same char → CyanBold
-        assert!(matches!(diff_line_style("--some line"), HeadlessStderrStyle::CyanBold));
-        assert!(matches!(diff_line_style("++some line"), HeadlessStderrStyle::CyanBold));
+        assert!(matches!(
+            diff_line_style("--some line"),
+            HeadlessStderrStyle::CyanBold
+        ));
+        assert!(matches!(
+            diff_line_style("++some line"),
+            HeadlessStderrStyle::CyanBold
+        ));
     }
 
     #[test]
     fn style_normal_line() {
-        assert!(matches!(diff_line_style("normal text"), HeadlessStderrStyle::Normal));
+        assert!(matches!(
+            diff_line_style("normal text"),
+            HeadlessStderrStyle::Normal
+        ));
         assert!(matches!(diff_line_style(""), HeadlessStderrStyle::Normal));
     }
 

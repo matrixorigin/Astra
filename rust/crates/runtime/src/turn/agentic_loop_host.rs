@@ -1226,7 +1226,11 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
                         .and_then(|f| f.get("arguments"))
                         .and_then(Value::as_str)
                         .and_then(|s| serde_json::from_str::<Value>(s).ok())
-                        .and_then(|a| a.get("skill_name").and_then(Value::as_str).map(String::from));
+                        .and_then(|a| {
+                            a.get("skill_name")
+                                .and_then(Value::as_str)
+                                .map(String::from)
+                        });
                     if let Some(ref name) = skill_name {
                         if let Some(prev) = state.invoked_skills.get(name.as_str()) {
                             let call_id = tc.get("id").and_then(Value::as_str).unwrap_or("unknown");
@@ -1263,15 +1267,20 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
             let current_turn = (state.max_turns - state.remaining_turns) as u32;
             for (call_id, result_text) in &sr {
                 // Extract skill name from the matching fresh_tool_calls
-                if let Some(tc) = fresh_tool_calls.iter().find(|t| {
-                    t.get("id").and_then(Value::as_str) == Some(call_id.as_str())
-                }) {
+                if let Some(tc) = fresh_tool_calls
+                    .iter()
+                    .find(|t| t.get("id").and_then(Value::as_str) == Some(call_id.as_str()))
+                {
                     let name = tc
                         .get("function")
                         .and_then(|f| f.get("arguments"))
                         .and_then(Value::as_str)
                         .and_then(|s| serde_json::from_str::<Value>(s).ok())
-                        .and_then(|a| a.get("skill_name").and_then(Value::as_str).map(String::from));
+                        .and_then(|a| {
+                            a.get("skill_name")
+                                .and_then(Value::as_str)
+                                .map(String::from)
+                        });
                     if let Some(name) = name {
                         if crate::turn::skill_tool::is_skill_call(tc) {
                             state.invoked_skills.insert(
@@ -1430,7 +1439,9 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
                     extract_file_path_from_tool(&edge_result.tool, &edge_result.args)
                 {
                     // Deduplicate: if same path already tracked, update its turn number
-                    if let Some(existing) = state.recent_file_reads.iter_mut().find(|(p, _)| p == &path) {
+                    if let Some(existing) =
+                        state.recent_file_reads.iter_mut().find(|(p, _)| p == &path)
+                    {
                         existing.1 = turn_num;
                     } else {
                         state.recent_file_reads.push((path, turn_num));
@@ -3832,28 +3843,50 @@ mod tests {
 
         let mut host = MockHost::new(turns);
         let mut state = make_state();
-        state.messages.push(json!({"role": "user", "content": "use skill twice"}));
+        state
+            .messages
+            .push(json!({"role": "user", "content": "use skill twice"}));
         state.skill_resolver = Some(Arc::new(resolver));
 
         let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
         assert!(outcome.is_ok());
 
         // First call: full instructions
-        let msg1: Vec<&Value> = state.messages.iter()
+        let msg1: Vec<&Value> = state
+            .messages
+            .iter()
             .filter(|m| m.get("tool_call_id").and_then(Value::as_str) == Some("call_1"))
             .collect();
         assert_eq!(msg1.len(), 1);
-        assert!(msg1[0]["content"].as_str().unwrap().contains("# Skill: test-skill"));
-        assert!(msg1[0]["content"].as_str().unwrap().contains("Follow these instructions carefully."));
+        assert!(
+            msg1[0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("# Skill: test-skill")
+        );
+        assert!(
+            msg1[0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("Follow these instructions carefully.")
+        );
 
         // Second call: stub (dedup)
-        let msg2: Vec<&Value> = state.messages.iter()
+        let msg2: Vec<&Value> = state
+            .messages
+            .iter()
             .filter(|m| m.get("tool_call_id").and_then(Value::as_str) == Some("call_2"))
             .collect();
         assert_eq!(msg2.len(), 1);
         let stub = msg2[0]["content"].as_str().unwrap();
-        assert!(stub.contains("already loaded"), "expected dedup stub, got: {stub}");
-        assert!(!stub.contains("# Skill:"), "stub should NOT contain full instructions");
+        assert!(
+            stub.contains("already loaded"),
+            "expected dedup stub, got: {stub}"
+        );
+        assert!(
+            !stub.contains("# Skill:"),
+            "stub should NOT contain full instructions"
+        );
 
         // Skill should be tracked
         assert!(state.invoked_skills.contains_key("test-skill"));
@@ -3878,22 +3911,38 @@ mod tests {
 
         let mut host = MockHost::new(turns);
         let mut state = make_state();
-        state.messages.push(json!({"role": "user", "content": "use both skills"}));
+        state
+            .messages
+            .push(json!({"role": "user", "content": "use both skills"}));
         state.skill_resolver = Some(Arc::new(resolver));
 
         let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
         assert!(outcome.is_ok());
 
         // Both should get full instructions (different skills, no dedup)
-        let msg1: Vec<&Value> = state.messages.iter()
+        let msg1: Vec<&Value> = state
+            .messages
+            .iter()
             .filter(|m| m.get("tool_call_id").and_then(Value::as_str) == Some("call_1"))
             .collect();
-        assert!(msg1[0]["content"].as_str().unwrap().contains("# Skill: test-skill"));
+        assert!(
+            msg1[0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("# Skill: test-skill")
+        );
 
-        let msg2: Vec<&Value> = state.messages.iter()
+        let msg2: Vec<&Value> = state
+            .messages
+            .iter()
             .filter(|m| m.get("tool_call_id").and_then(Value::as_str) == Some("call_2"))
             .collect();
-        assert!(msg2[0]["content"].as_str().unwrap().contains("# Skill: other-skill"));
+        assert!(
+            msg2[0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("# Skill: other-skill")
+        );
 
         // Both tracked
         assert_eq!(state.invoked_skills.len(), 2);
@@ -4026,16 +4075,16 @@ mod tests {
             .filter(|m| m.get("tool_call_id").and_then(Value::as_str) == Some("call_skill"))
             .collect();
         assert_eq!(skill_msgs.len(), 1);
-        assert!(skill_msgs[0]["content"]
-            .as_str()
-            .unwrap()
-            .contains("# Skill: test-skill"));
+        assert!(
+            skill_msgs[0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("# Skill: test-skill")
+        );
 
         // Host should have emitted a deferred notice
         assert!(
-            host.emitted_lines
-                .iter()
-                .any(|l| l.contains("deferred")),
+            host.emitted_lines.iter().any(|l| l.contains("deferred")),
             "Expected deferred notice in emitted lines: {:?}",
             host.emitted_lines
         );
@@ -4264,7 +4313,10 @@ mod tests {
             .collect();
         assert_eq!(bash_msgs.len(), 1);
         assert!(
-            bash_msgs[0]["content"].as_str().unwrap().contains("Deferred"),
+            bash_msgs[0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("Deferred"),
             "bash should be deferred even when skill fails"
         );
 
@@ -4362,14 +4414,11 @@ mod tests {
         assert!(state.budget_wrapup_injected);
         assert_eq!(state.final_text, "Here is my summary.");
         // Verify a system message was injected about budget
-        let has_budget_msg = state
-            .messages
-            .iter()
-            .any(|m| {
-                m.get("content")
-                    .and_then(|c| c.as_str())
-                    .is_some_and(|s| s.contains("token budget limit"))
-            });
+        let has_budget_msg = state.messages.iter().any(|m| {
+            m.get("content")
+                .and_then(|c| c.as_str())
+                .is_some_and(|s| s.contains("token budget limit"))
+        });
         assert!(has_budget_msg, "expected budget wrapup system message");
     }
 
@@ -4464,7 +4513,10 @@ mod tests {
             .push(json!({"role": "user", "content": "review code"}));
 
         let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
-        assert!(outcome.is_ok(), "429 after tool calls should complete gracefully, got: {outcome:?}");
+        assert!(
+            outcome.is_ok(),
+            "429 after tool calls should complete gracefully, got: {outcome:?}"
+        );
         assert!(
             state.final_text.contains("Rate limit reached"),
             "final_text should mention rate limit: {}",

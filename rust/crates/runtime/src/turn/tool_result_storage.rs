@@ -51,19 +51,31 @@ pub fn maybe_persist_tool_result(
 
     let dir = session_dir.join(TOOL_RESULTS_SUBDIR);
     if let Err(e) = std::fs::create_dir_all(&dir) {
-        eprintln!("[tool_result_storage] failed to create dir {}: {e}", dir.display());
+        eprintln!(
+            "[tool_result_storage] failed to create dir {}: {e}",
+            dir.display()
+        );
         return None;
     }
 
     // Sanitize tool_call_id for filesystem safety
     let safe_id: String = tool_call_id
         .chars()
-        .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect();
     let file_path = dir.join(format!("{safe_id}.txt"));
 
     if let Err(e) = std::fs::write(&file_path, content) {
-        eprintln!("[tool_result_storage] failed to write {}: {e}", file_path.display());
+        eprintln!(
+            "[tool_result_storage] failed to write {}: {e}",
+            file_path.display()
+        );
         return None;
     }
 
@@ -76,7 +88,13 @@ pub fn maybe_persist_tool_result(
 pub fn read_persisted_result(session_dir: &Path, tool_call_id: &str) -> Option<String> {
     let safe_id: String = tool_call_id
         .chars()
-        .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect();
     let file_path = session_dir
         .join(TOOL_RESULTS_SUBDIR)
@@ -146,8 +164,7 @@ mod tests {
         let _ = std::fs::create_dir_all(&dir);
 
         let content = "x".repeat(PERSIST_THRESHOLD_CHARS + 100);
-        let replacement =
-            maybe_persist_tool_result(&dir, "call-42", "bash", &content).unwrap();
+        let replacement = maybe_persist_tool_result(&dir, "call-42", "bash", &content).unwrap();
 
         // Replacement contains the tag
         assert!(replacement.contains(PERSISTED_TAG_OPEN));
@@ -229,8 +246,7 @@ mod tests {
             content.push_str(&format!("line {i}\n"));
         }
 
-        let replacement =
-            maybe_persist_tool_result(&dir, "call-nl", "bash", &content).unwrap();
+        let replacement = maybe_persist_tool_result(&dir, "call-nl", "bash", &content).unwrap();
         // Preview should end at a clean newline
         assert!(replacement.contains("Preview"));
         assert!(replacement.contains("line "));

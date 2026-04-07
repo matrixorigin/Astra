@@ -71,11 +71,8 @@ mod tests {
 
     #[test]
     fn build_skill_dev_prefix_format() {
-        let prefix = build_skill_dev_prefix(
-            "my_skill",
-            "skills/my_skill/SKILL.md",
-            "def run(): pass",
-        );
+        let prefix =
+            build_skill_dev_prefix("my_skill", "skills/my_skill/SKILL.md", "def run(): pass");
         assert!(prefix.starts_with("[SKILL DEV: my_skill]"));
         assert!(prefix.contains("def run(): pass"));
         // Must tell LLM not to re-read the file

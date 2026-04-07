@@ -357,8 +357,12 @@ fn build_system_message(
             .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
 
         // Find the last index of each scope group for breakpoint placement
-        let last_global = sections.iter().rposition(|s| s.scope == prompts::CacheScope::Global);
-        let last_session = sections.iter().rposition(|s| s.scope == prompts::CacheScope::Session);
+        let last_global = sections
+            .iter()
+            .rposition(|s| s.scope == prompts::CacheScope::Global);
+        let last_session = sections
+            .iter()
+            .rposition(|s| s.scope == prompts::CacheScope::Session);
 
         let mut blocks: Vec<Value> = Vec::with_capacity(sections.len() + 1);
         for (i, section) in sections.iter().enumerate() {
@@ -2819,7 +2823,9 @@ mod tests {
     #[test]
     fn all_three_cache_layers_present_for_anthropic() {
         let _lock = CACHE_ENV_MUTEX.lock().unwrap();
-        unsafe { std::env::remove_var("MO_PROMPT_CACHE_DISABLED"); }
+        unsafe {
+            std::env::remove_var("MO_PROMPT_CACHE_DISABLED");
+        }
 
         // Layer 1: System message with cache_control
         let sys = build_system_message(
@@ -2832,7 +2838,10 @@ mod tests {
         );
         let sys_blocks = sys["content"].as_array().expect("array content");
         let has_sys_cache = sys_blocks.iter().any(|b| b.get("cache_control").is_some());
-        assert!(has_sys_cache, "Layer 1: system message should have cache_control");
+        assert!(
+            has_sys_cache,
+            "Layer 1: system message should have cache_control"
+        );
 
         // Layer 2: Tool schemas with cache_control
         let mut tools = vec![
@@ -2862,12 +2871,18 @@ mod tests {
     #[test]
     fn cache_disabled_strips_all_three_layers() {
         let _lock = CACHE_ENV_MUTEX.lock().unwrap();
-        unsafe { std::env::set_var("MO_PROMPT_CACHE_DISABLED", "1"); }
+        unsafe {
+            std::env::set_var("MO_PROMPT_CACHE_DISABLED", "1");
+        }
 
         // Layer 1: system message
         let sys = build_system_message(
-            &["bash"], "cwd: /test", 0.8, None,
-            "anthropic", "claude-sonnet-4-20250514",
+            &["bash"],
+            "cwd: /test",
+            0.8,
+            None,
+            "anthropic",
+            "claude-sonnet-4-20250514",
         );
         let sys_blocks = sys["content"].as_array().unwrap();
         for block in sys_blocks {
@@ -2886,16 +2901,16 @@ mod tests {
         );
 
         // Layer 3: message breakpoint
-        let mut messages = vec![
-            json!({"role": "user", "content": "hello"}),
-        ];
+        let mut messages = vec![json!({"role": "user", "content": "hello"})];
         add_message_cache_breakpoint(&mut messages, "anthropic", "claude-sonnet-4-20250514");
         assert!(
             messages[0]["content"].is_string(),
             "messages should not be modified when cache disabled"
         );
 
-        unsafe { std::env::remove_var("MO_PROMPT_CACHE_DISABLED"); }
+        unsafe {
+            std::env::remove_var("MO_PROMPT_CACHE_DISABLED");
+        }
     }
 
     // ── Section cache eviction test ────────────────────────────────────
@@ -2959,14 +2974,17 @@ mod tests {
     #[test]
     fn message_breakpoint_skips_system_only() {
         let _lock = CACHE_ENV_MUTEX.lock().unwrap();
-        unsafe { std::env::remove_var("MO_PROMPT_CACHE_DISABLED"); }
+        unsafe {
+            std::env::remove_var("MO_PROMPT_CACHE_DISABLED");
+        }
 
-        let mut messages = vec![
-            json!({"role": "system", "content": "sys prompt"}),
-        ];
+        let mut messages = vec![json!({"role": "system", "content": "sys prompt"})];
         add_message_cache_breakpoint(&mut messages, "anthropic", "claude-sonnet-4-20250514");
         // System message should not be modified
-        assert!(messages[0]["content"].is_string(), "system-only: should be untouched");
+        assert!(
+            messages[0]["content"].is_string(),
+            "system-only: should be untouched"
+        );
     }
 
     #[test]
@@ -2980,17 +2998,17 @@ mod tests {
     #[test]
     fn message_breakpoint_array_content_appends_to_last_block() {
         let _lock = CACHE_ENV_MUTEX.lock().unwrap();
-        unsafe { std::env::remove_var("MO_PROMPT_CACHE_DISABLED"); }
+        unsafe {
+            std::env::remove_var("MO_PROMPT_CACHE_DISABLED");
+        }
 
-        let mut messages = vec![
-            json!({
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": "hello"},
-                    {"type": "text", "text": "world"},
-                ]
-            }),
-        ];
+        let mut messages = vec![json!({
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "hello"},
+                {"type": "text", "text": "world"},
+            ]
+        })];
         add_message_cache_breakpoint(&mut messages, "anthropic", "claude-sonnet-4-20250514");
 
         let blocks = messages[0]["content"].as_array().unwrap();
@@ -3019,7 +3037,7 @@ mod tests {
     #[test]
     fn multi_turn_sse_cache_tokens_accumulate_in_accum() {
         use super::super::chat_turn_sse_dispatch::{
-            dispatch_chat_turn_sse_event_block, ChatTurnSseAccum,
+            ChatTurnSseAccum, dispatch_chat_turn_sse_event_block,
         };
 
         fn sse_usage(prompt: u64, completion: u64, cache_read: u64, cache_creation: u64) -> String {
@@ -3046,11 +3064,7 @@ mod tests {
 
         // Turn 3: full cache hit → read tokens high
         let mut accum3 = ChatTurnSseAccum::default();
-        dispatch_chat_turn_sse_event_block(
-            &sse_usage(200, 300, 900, 0),
-            &mut accum3,
-            &mut vec![],
-        );
+        dispatch_chat_turn_sse_event_block(&sse_usage(200, 300, 900, 0), &mut accum3, &mut vec![]);
         assert_eq!(accum3.cache_read_tokens, 900);
 
         // Verify warming pattern: reads increase across turns
@@ -3072,14 +3086,20 @@ mod tests {
         });
 
         // Our bridge extraction logic (from bridge_inprocess.rs)
-        let cache_read = usage.get("prompt_tokens_details")
+        let cache_read = usage
+            .get("prompt_tokens_details")
             .and_then(|d| d.get("cached_tokens"))
             .and_then(Value::as_i64)
             .or_else(|| usage.get("cache_read_input_tokens").and_then(Value::as_i64));
-        let cache_creation = usage.get("prompt_tokens_details")
+        let cache_creation = usage
+            .get("prompt_tokens_details")
             .and_then(|d| d.get("cache_creation_input_tokens"))
             .and_then(Value::as_i64)
-            .or_else(|| usage.get("cache_creation_input_tokens").and_then(Value::as_i64));
+            .or_else(|| {
+                usage
+                    .get("cache_creation_input_tokens")
+                    .and_then(Value::as_i64)
+            });
 
         assert_eq!(cache_read, Some(800));
         assert_eq!(cache_creation, Some(200));
@@ -3097,14 +3117,20 @@ mod tests {
             },
         });
 
-        let cache_read = usage.get("prompt_tokens_details")
+        let cache_read = usage
+            .get("prompt_tokens_details")
             .and_then(|d| d.get("cached_tokens"))
             .and_then(Value::as_i64)
             .or_else(|| usage.get("cache_read_input_tokens").and_then(Value::as_i64));
-        let cache_creation = usage.get("prompt_tokens_details")
+        let cache_creation = usage
+            .get("prompt_tokens_details")
             .and_then(|d| d.get("cache_creation_input_tokens"))
             .and_then(Value::as_i64)
-            .or_else(|| usage.get("cache_creation_input_tokens").and_then(Value::as_i64));
+            .or_else(|| {
+                usage
+                    .get("cache_creation_input_tokens")
+                    .and_then(Value::as_i64)
+            });
 
         assert_eq!(cache_read, Some(600));
         assert_eq!(cache_creation, Some(100));
@@ -3117,7 +3143,8 @@ mod tests {
             "completion_tokens": 500,
         });
 
-        let cache_read = usage.get("prompt_tokens_details")
+        let cache_read = usage
+            .get("prompt_tokens_details")
             .and_then(|d| d.get("cached_tokens"))
             .and_then(Value::as_i64)
             .or_else(|| usage.get("cache_read_input_tokens").and_then(Value::as_i64));
@@ -3135,25 +3162,47 @@ mod tests {
     #[test]
     fn anthropic_cache_breakpoints_within_limit() {
         let _lock = CACHE_ENV_MUTEX.lock().unwrap();
-        unsafe { std::env::remove_var("MO_PROMPT_CACHE_DISABLED"); }
+        unsafe {
+            std::env::remove_var("MO_PROMPT_CACHE_DISABLED");
+        }
 
         // Worst case: many tools → many Session sections
         let tools: Vec<&str> = vec![
-            "bash", "read_file", "write_file", "glob", "grep",
-            "git_status", "git_diff", "git_log", "git_commit",
-            "find_definition", "find_references", "call_graph",
-            "rename_symbol", "dead_code", "extract_members", "type_hierarchy",
-            "multi_edit", "run_build_test",
-            "memory_store", "memory_search",
-            "github_list_prs", "github_get_issue",
+            "bash",
+            "read_file",
+            "write_file",
+            "glob",
+            "grep",
+            "git_status",
+            "git_diff",
+            "git_log",
+            "git_commit",
+            "find_definition",
+            "find_references",
+            "call_graph",
+            "rename_symbol",
+            "dead_code",
+            "extract_members",
+            "type_hierarchy",
+            "multi_edit",
+            "run_build_test",
+            "memory_store",
+            "memory_search",
+            "github_list_prs",
+            "github_get_issue",
         ];
         let msg = build_system_message(
-            &tools, "profile", 0.8, Some("code_review"),
-            "anthropic", "claude-sonnet-4-20250514",
+            &tools,
+            "profile",
+            0.8,
+            Some("code_review"),
+            "anthropic",
+            "claude-sonnet-4-20250514",
         );
 
         let blocks = msg["content"].as_array().unwrap();
-        let cc_count = blocks.iter()
+        let cc_count = blocks
+            .iter()
             .filter(|b| b.get("cache_control").is_some_and(|cc| !cc.is_null()))
             .count();
         assert!(
@@ -3166,16 +3215,22 @@ mod tests {
     #[test]
     fn anthropic_scope_annotations_correct() {
         let _lock = CACHE_ENV_MUTEX.lock().unwrap();
-        unsafe { std::env::remove_var("MO_PROMPT_CACHE_DISABLED"); }
+        unsafe {
+            std::env::remove_var("MO_PROMPT_CACHE_DISABLED");
+        }
 
         let msg = build_system_message(
             &["bash", "read_file", "memory_store"],
-            "profile", 0.8, Some("debugging"),
-            "anthropic", "claude-sonnet-4-20250514",
+            "profile",
+            0.8,
+            Some("debugging"),
+            "anthropic",
+            "claude-sonnet-4-20250514",
         );
 
         let blocks = msg["content"].as_array().unwrap();
-        let cc_blocks: Vec<_> = blocks.iter()
+        let cc_blocks: Vec<_> = blocks
+            .iter()
             .filter(|b| b.get("cache_control").is_some_and(|cc| !cc.is_null()))
             .collect();
 
@@ -3200,40 +3255,64 @@ mod tests {
     #[test]
     fn anthropic_global_prefix_stable_across_tool_sets() {
         let _lock = CACHE_ENV_MUTEX.lock().unwrap();
-        unsafe { std::env::remove_var("MO_PROMPT_CACHE_DISABLED"); }
+        unsafe {
+            std::env::remove_var("MO_PROMPT_CACHE_DISABLED");
+        }
 
         let msg1 = build_system_message(
-            &["bash", "read_file"], "p1", 0.8, None,
-            "anthropic", "claude-sonnet-4-20250514",
+            &["bash", "read_file"],
+            "p1",
+            0.8,
+            None,
+            "anthropic",
+            "claude-sonnet-4-20250514",
         );
         let msg2 = build_system_message(
-            &["bash", "git_diff", "memory_store"], "p2", 0.5, Some("debugging"),
-            "anthropic", "claude-sonnet-4-20250514",
+            &["bash", "git_diff", "memory_store"],
+            "p2",
+            0.5,
+            Some("debugging"),
+            "anthropic",
+            "claude-sonnet-4-20250514",
         );
 
         let blocks1 = msg1["content"].as_array().unwrap();
         let blocks2 = msg2["content"].as_array().unwrap();
 
         // Find the Global breakpoint index in each
-        let global_end_1 = blocks1.iter().position(|b|
-            b.get("cache_control")
-                .and_then(|cc| cc.get("scope"))
-                .and_then(|s| s.as_str()) == Some("global")
-        ).expect("should have global breakpoint");
-        let global_end_2 = blocks2.iter().position(|b|
-            b.get("cache_control")
-                .and_then(|cc| cc.get("scope"))
-                .and_then(|s| s.as_str()) == Some("global")
-        ).expect("should have global breakpoint");
+        let global_end_1 = blocks1
+            .iter()
+            .position(|b| {
+                b.get("cache_control")
+                    .and_then(|cc| cc.get("scope"))
+                    .and_then(|s| s.as_str())
+                    == Some("global")
+            })
+            .expect("should have global breakpoint");
+        let global_end_2 = blocks2
+            .iter()
+            .position(|b| {
+                b.get("cache_control")
+                    .and_then(|cc| cc.get("scope"))
+                    .and_then(|s| s.as_str())
+                    == Some("global")
+            })
+            .expect("should have global breakpoint");
 
         // Same number of Global blocks
-        assert_eq!(global_end_1, global_end_2, "Global prefix length should be identical");
+        assert_eq!(
+            global_end_1, global_end_2,
+            "Global prefix length should be identical"
+        );
 
         // Same content in each Global block
         for i in 0..=global_end_1 {
             let t1 = blocks1[i]["text"].as_str().unwrap();
             let t2 = blocks2[i]["text"].as_str().unwrap();
-            assert_eq!(t1, t2, "Global block {i} should be identical across tool sets");
+            assert_eq!(
+                t1, t2,
+                "Global block {i} should be identical across tool sets"
+            );
         }
     }
 
@@ -3242,16 +3321,26 @@ mod tests {
     #[test]
     fn anthropic_session_prefix_stable_within_session() {
         let _lock = CACHE_ENV_MUTEX.lock().unwrap();
-        unsafe { std::env::remove_var("MO_PROMPT_CACHE_DISABLED"); }
+        unsafe {
+            std::env::remove_var("MO_PROMPT_CACHE_DISABLED");
+        }
 
         // Simulate two turns in the same session (same tools, different profile)
         let msg_turn1 = build_system_message(
-            &["bash", "read_file", "git_diff"], "turn1 profile", 0.8, None,
-            "anthropic", "claude-sonnet-4-20250514",
+            &["bash", "read_file", "git_diff"],
+            "turn1 profile",
+            0.8,
+            None,
+            "anthropic",
+            "claude-sonnet-4-20250514",
         );
         let msg_turn2 = build_system_message(
-            &["bash", "read_file", "git_diff"], "turn2 profile", 0.8, None,
-            "anthropic", "claude-sonnet-4-20250514",
+            &["bash", "read_file", "git_diff"],
+            "turn2 profile",
+            0.8,
+            None,
+            "anthropic",
+            "claude-sonnet-4-20250514",
         );
 
         let b1 = msg_turn1["content"].as_array().unwrap();
@@ -3259,18 +3348,23 @@ mod tests {
 
         // Find Session breakpoint (last block with cache_control but no scope:"global")
         let session_end = |blocks: &[Value]| -> usize {
-            blocks.iter().rposition(|b|
-                b.get("cache_control").is_some_and(|cc| !cc.is_null())
-            ).unwrap()
+            blocks
+                .iter()
+                .rposition(|b| b.get("cache_control").is_some_and(|cc| !cc.is_null()))
+                .unwrap()
         };
         let se1 = session_end(b1);
         let se2 = session_end(b2);
-        assert_eq!(se1, se2, "Session prefix length should be identical across turns");
+        assert_eq!(
+            se1, se2,
+            "Session prefix length should be identical across turns"
+        );
 
         // All blocks up to and including Session breakpoint should be identical
         for i in 0..=se1 {
             assert_eq!(
-                b1[i]["text"].as_str(), b2[i]["text"].as_str(),
+                b1[i]["text"].as_str(),
+                b2[i]["text"].as_str(),
                 "Block {i} should be identical across turns (only profile differs)"
             );
         }
@@ -3288,19 +3382,29 @@ mod tests {
         let _lock = CACHE_ENV_MUTEX.lock().unwrap();
 
         let msg1 = build_system_message(
-            &["bash", "read_file"], "turn1 profile", 0.8, None,
-            "openai", "gpt-4o",
+            &["bash", "read_file"],
+            "turn1 profile",
+            0.8,
+            None,
+            "openai",
+            "gpt-4o",
         );
         let msg2 = build_system_message(
-            &["bash", "read_file"], "turn2 profile", 0.8, None,
-            "openai", "gpt-4o",
+            &["bash", "read_file"],
+            "turn2 profile",
+            0.8,
+            None,
+            "openai",
+            "gpt-4o",
         );
 
         let s1 = msg1["content"].as_str().unwrap();
         let s2 = msg2["content"].as_str().unwrap();
 
         // Find where they diverge
-        let common_prefix_len = s1.chars().zip(s2.chars())
+        let common_prefix_len = s1
+            .chars()
+            .zip(s2.chars())
             .take_while(|(a, b)| a == b)
             .count();
 
@@ -3326,14 +3430,14 @@ mod tests {
     fn openai_global_prefix_stable_across_tool_sets() {
         let _lock = CACHE_ENV_MUTEX.lock().unwrap();
 
-        let msg1 = build_system_message(
-            &["bash"], "", 0.8, None,
-            "openai", "gpt-4o",
-        );
+        let msg1 = build_system_message(&["bash"], "", 0.8, None, "openai", "gpt-4o");
         let msg2 = build_system_message(
             &["bash", "git_diff", "memory_store", "find_definition"],
-            "", 0.8, Some("code_review"),
-            "openai", "gpt-4o",
+            "",
+            0.8,
+            Some("code_review"),
+            "openai",
+            "gpt-4o",
         );
 
         let s1 = msg1["content"].as_str().unwrap();
@@ -3346,7 +3450,8 @@ mod tests {
 
         // Everything before Self-Model should be identical
         assert_eq!(
-            &s1[..self_model_pos_1], &s2[..self_model_pos_2],
+            &s1[..self_model_pos_1],
+            &s2[..self_model_pos_2],
             "Global prefix (before Self-Model) should be identical across tool sets"
         );
     }
@@ -3355,28 +3460,40 @@ mod tests {
     #[test]
     fn global_sections_contain_no_tool_names() {
         let _lock = CACHE_ENV_MUTEX.lock().unwrap();
-        unsafe { std::env::remove_var("MO_PROMPT_CACHE_DISABLED"); }
+        unsafe {
+            std::env::remove_var("MO_PROMPT_CACHE_DISABLED");
+        }
 
         let tools = vec!["bash", "read_file", "memory_store", "git_diff"];
         let msg = build_system_message(
-            &tools, "", 0.8, None,
-            "anthropic", "claude-sonnet-4-20250514",
+            &tools,
+            "",
+            0.8,
+            None,
+            "anthropic",
+            "claude-sonnet-4-20250514",
         );
 
         let blocks = msg["content"].as_array().unwrap();
         // Find the Global breakpoint
-        let global_end = blocks.iter().position(|b|
-            b.get("cache_control")
-                .and_then(|cc| cc.get("scope"))
-                .and_then(|s| s.as_str()) == Some("global")
-        ).unwrap();
+        let global_end = blocks
+            .iter()
+            .position(|b| {
+                b.get("cache_control")
+                    .and_then(|cc| cc.get("scope"))
+                    .and_then(|s| s.as_str())
+                    == Some("global")
+            })
+            .unwrap();
 
         // No Global block should contain any tool name
         for (i, block) in blocks.iter().enumerate().take(global_end + 1) {
             let text = block["text"].as_str().unwrap();
             for tool in &tools {
                 // "bash" appears in generic text like "bash commands", skip it
-                if *tool == "bash" { continue; }
+                if *tool == "bash" {
+                    continue;
+                }
                 assert!(
                     !text.contains(&format!("{tool},")),
                     "Global block {i} should not contain tool name '{tool}' in a tool list"
@@ -3393,38 +3510,64 @@ mod tests {
     #[test]
     fn task_type_change_preserves_global_prefix() {
         let _lock = CACHE_ENV_MUTEX.lock().unwrap();
-        unsafe { std::env::remove_var("MO_PROMPT_CACHE_DISABLED"); }
+        unsafe {
+            std::env::remove_var("MO_PROMPT_CACHE_DISABLED");
+        }
 
         let tools = vec!["bash", "read_file"];
         let msg_none = build_system_message(
-            &tools, "", 0.8, None,
-            "anthropic", "claude-sonnet-4-20250514",
+            &tools,
+            "",
+            0.8,
+            None,
+            "anthropic",
+            "claude-sonnet-4-20250514",
         );
         let msg_review = build_system_message(
-            &tools, "", 0.8, Some("code_review"),
-            "anthropic", "claude-sonnet-4-20250514",
+            &tools,
+            "",
+            0.8,
+            Some("code_review"),
+            "anthropic",
+            "claude-sonnet-4-20250514",
         );
         let msg_debug = build_system_message(
-            &tools, "", 0.8, Some("debugging"),
-            "anthropic", "claude-sonnet-4-20250514",
+            &tools,
+            "",
+            0.8,
+            Some("debugging"),
+            "anthropic",
+            "claude-sonnet-4-20250514",
         );
 
         let get_global_blocks = |msg: &Value| -> Vec<String> {
             let blocks = msg["content"].as_array().unwrap();
-            let global_end = blocks.iter().position(|b|
-                b.get("cache_control")
-                    .and_then(|cc| cc.get("scope"))
-                    .and_then(|s| s.as_str()) == Some("global")
-            ).unwrap();
-            (0..=global_end).map(|i| blocks[i]["text"].as_str().unwrap().to_string()).collect()
+            let global_end = blocks
+                .iter()
+                .position(|b| {
+                    b.get("cache_control")
+                        .and_then(|cc| cc.get("scope"))
+                        .and_then(|s| s.as_str())
+                        == Some("global")
+                })
+                .unwrap();
+            (0..=global_end)
+                .map(|i| blocks[i]["text"].as_str().unwrap().to_string())
+                .collect()
         };
 
         let g_none = get_global_blocks(&msg_none);
         let g_review = get_global_blocks(&msg_review);
         let g_debug = get_global_blocks(&msg_debug);
 
-        assert_eq!(g_none, g_review, "Global prefix should be identical regardless of task type");
-        assert_eq!(g_review, g_debug, "Global prefix should be identical regardless of task type");
+        assert_eq!(
+            g_none, g_review,
+            "Global prefix should be identical regardless of task type"
+        );
+        assert_eq!(
+            g_review, g_debug,
+            "Global prefix should be identical regardless of task type"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -3434,7 +3577,10 @@ mod tests {
     #[test]
     fn classify_llm_error_rate_limit_variants() {
         assert_eq!(classify_llm_error("rate limit exceeded"), "rate_limit");
-        assert_eq!(classify_llm_error("HTTP 429 Too Many Requests"), "rate_limit");
+        assert_eq!(
+            classify_llm_error("HTTP 429 Too Many Requests"),
+            "rate_limit"
+        );
         assert_eq!(classify_llm_error("Rate limiting active"), "rate_limit");
     }
 
@@ -3488,7 +3634,10 @@ mod tests {
     fn header_str_valid_value_returns_some() {
         let mut headers = HeaderMap::new();
         headers.insert("x-mo-user-id", "user-123".parse().unwrap());
-        assert_eq!(header_str(&headers, "x-mo-user-id").as_deref(), Some("user-123"));
+        assert_eq!(
+            header_str(&headers, "x-mo-user-id").as_deref(),
+            Some("user-123")
+        );
     }
 
     #[test]

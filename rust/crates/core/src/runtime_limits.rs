@@ -74,10 +74,7 @@ impl RuntimeLimits {
             max_tool_retries: env_parse("MO_MAX_TOOL_RETRIES", d.max_tool_retries),
             retry_base_ms: env_parse("MO_RETRY_BASE_MS", d.retry_base_ms),
             max_retrieved: env_parse("MO_MAX_RETRIEVED", d.max_retrieved),
-            max_turn_input_tokens: env_parse(
-                "MO_MAX_TURN_INPUT_TOKENS",
-                d.max_turn_input_tokens,
-            ),
+            max_turn_input_tokens: env_parse("MO_MAX_TURN_INPUT_TOKENS", d.max_turn_input_tokens),
         }
     }
 

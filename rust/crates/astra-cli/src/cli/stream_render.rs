@@ -523,7 +523,9 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                             crate::permission_manager::PermissionDecision::Allow => true,
                             crate::permission_manager::PermissionDecision::Deny(_) => false,
                             crate::permission_manager::PermissionDecision::NeedApproval {
-                                detail, reason, ..
+                                detail,
+                                reason,
+                                ..
                             } => {
                                 if let Some(tx) = &self.approval_request_tx {
                                     // Plan execution mode: route through channel

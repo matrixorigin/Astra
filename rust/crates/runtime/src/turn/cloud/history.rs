@@ -75,9 +75,24 @@ mod tests {
         ];
         let result = compact_cloud_loop_history(&history, 50, 2);
         // First tool message compacted, last 2 preserved
-        assert!(result[0]["content"].as_str().unwrap().contains("[compacted]"));
-        assert!(!result[1]["content"].as_str().unwrap().contains("[compacted]"));
-        assert!(!result[2]["content"].as_str().unwrap().contains("[compacted]"));
+        assert!(
+            result[0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("[compacted]")
+        );
+        assert!(
+            !result[1]["content"]
+                .as_str()
+                .unwrap()
+                .contains("[compacted]")
+        );
+        assert!(
+            !result[2]["content"]
+                .as_str()
+                .unwrap()
+                .contains("[compacted]")
+        );
     }
 
     #[test]
@@ -88,8 +103,18 @@ mod tests {
         ];
         let result = compact_cloud_loop_history(&history, 50, 0);
         // assistant message untouched
-        assert!(!result[0]["content"].as_str().unwrap().contains("[compacted]"));
+        assert!(
+            !result[0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("[compacted]")
+        );
         // tool message compacted
-        assert!(result[1]["content"].as_str().unwrap().contains("[compacted]"));
+        assert!(
+            result[1]["content"]
+                .as_str()
+                .unwrap()
+                .contains("[compacted]")
+        );
     }
 }

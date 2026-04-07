@@ -252,7 +252,10 @@ mod tests {
     #[test]
     fn cached_msg_with_reasoning() {
         let msg = build_cached_assistant_message("hi", &[], "thought process");
-        assert_eq!(msg["reasoning_content"].as_str().unwrap(), "thought process");
+        assert_eq!(
+            msg["reasoning_content"].as_str().unwrap(),
+            "thought process"
+        );
     }
 
     #[test]
@@ -266,8 +269,33 @@ mod tests {
     #[test]
     fn persist_thread_minimal() {
         let args = build_persist_thread_args(
-            "u1", "s1", &[], &[], "", &[], &[], "", &[], None, None, None, None, &[], 0, None,
-            None, None, None, None, None, false, false, false, false, false, false,
+            "u1",
+            "s1",
+            &[],
+            &[],
+            "",
+            &[],
+            &[],
+            "",
+            &[],
+            None,
+            None,
+            None,
+            None,
+            &[],
+            0,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
         );
         assert_eq!(args["user_id"].as_str().unwrap(), "u1");
         assert_eq!(args["session_id"].as_str().unwrap(), "s1");
@@ -281,8 +309,33 @@ mod tests {
         let cloud = vec![json!({"id": "c1"})];
         let edge = vec![json!({"id": "e1"})];
         let args = build_persist_thread_args(
-            "u1", "s1", &[], &[], "", &cloud, &edge, "", &[], None, None, None, None, &[], 0,
-            None, None, None, None, None, None, false, false, false, false, false, false,
+            "u1",
+            "s1",
+            &[],
+            &[],
+            "",
+            &cloud,
+            &edge,
+            "",
+            &[],
+            None,
+            None,
+            None,
+            None,
+            &[],
+            0,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
         );
         let calls = args["tool_calls"].as_array().unwrap();
         assert_eq!(calls.len(), 2);
@@ -291,9 +344,33 @@ mod tests {
     #[test]
     fn persist_thread_empty_routing_meta_is_null() {
         let args = build_persist_thread_args(
-            "u1", "s1", &[], &[], "", &[], &[], "", &[], None, None, None, None, &[], 0, None,
-            None, None, None, None, Some(Value::Object(Map::new())), false, false, false, false,
-            false, false,
+            "u1",
+            "s1",
+            &[],
+            &[],
+            "",
+            &[],
+            &[],
+            "",
+            &[],
+            None,
+            None,
+            None,
+            None,
+            &[],
+            0,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(Value::Object(Map::new())),
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
         );
         assert!(args["routing_meta"].is_null());
     }
@@ -301,9 +378,33 @@ mod tests {
     #[test]
     fn persist_thread_nonempty_routing_meta() {
         let args = build_persist_thread_args(
-            "u1", "s1", &[], &[], "", &[], &[], "", &[], None, None, None, None, &[], 0, None,
-            None, None, None, None, Some(json!({"model": "gpt-4"})), false, false, false, false,
-            false, false,
+            "u1",
+            "s1",
+            &[],
+            &[],
+            "",
+            &[],
+            &[],
+            "",
+            &[],
+            None,
+            None,
+            None,
+            None,
+            &[],
+            0,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(json!({"model": "gpt-4"})),
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
         );
         assert_eq!(args["routing_meta"]["model"].as_str().unwrap(), "gpt-4");
     }
@@ -312,8 +413,33 @@ mod tests {
     fn persist_thread_cloud_results_nonempty() {
         let cloud_results = vec![json!({"tool_call_id": "tc1"})];
         let args = build_persist_thread_args(
-            "u1", "s1", &[], &[], "", &[], &[], "", &cloud_results, None, None, None, None, &[],
-            0, None, None, None, None, None, None, false, false, false, false, false, false,
+            "u1",
+            "s1",
+            &[],
+            &[],
+            "",
+            &[],
+            &[],
+            "",
+            &cloud_results,
+            None,
+            None,
+            None,
+            None,
+            &[],
+            0,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
         );
         assert_eq!(args["cloud_tool_results"].as_array().unwrap().len(), 1);
     }
@@ -323,7 +449,21 @@ mod tests {
     #[test]
     fn hook_args_minimal() {
         let args = build_turn_hook_args(
-            "u1", "s1", &[], &[], "", &[], None, None, None, None, 0, None, false, false, false,
+            "u1",
+            "s1",
+            &[],
+            &[],
+            "",
+            &[],
+            None,
+            None,
+            None,
+            None,
+            0,
+            None,
+            false,
+            false,
+            false,
             false,
         );
         assert_eq!(args["user_id"].as_str().unwrap(), "u1");

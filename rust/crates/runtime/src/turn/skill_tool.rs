@@ -518,13 +518,7 @@ pub fn visible_skills_for_host_turn(
     if cfg.use_full_catalog(full.len()) {
         return (full.to_vec(), false);
     }
-    let base = select_skills_for_turn(
-        full,
-        user_message,
-        Some(quality_tracker),
-        Some(pinned),
-        cfg,
-    );
+    let base = select_skills_for_turn(full, user_message, Some(quality_tracker), Some(pinned), cfg);
     let visible = merge_discovered_skills_into_visible(base, full, discovered);
     (visible, true)
 }
@@ -1099,10 +1093,7 @@ async fn execute_pipeline(
     let mut all_passed = true;
 
     for (i, step) in steps.iter().enumerate() {
-        let label = step
-            .label
-            .as_deref()
-            .unwrap_or(step.skill.as_str());
+        let label = step.label.as_deref().unwrap_or(step.skill.as_str());
 
         // Thread previous output into the task context
         let threaded_task = if let Some(ref prev) = previous_output {
@@ -1205,256 +1196,256 @@ fn execute_skill<'a>(
     task_hint: &'a str,
     composition_ctx: Option<&'a crate::skills::composition::CompositionContext>,
     skill_ctx: &'a SkillContext,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = (String, Option<SkillActivation>, Option<bool>)> + Send + 'a>> {
+) -> std::pin::Pin<
+    Box<
+        dyn std::future::Future<Output = (String, Option<SkillActivation>, Option<bool>)>
+            + Send
+            + 'a,
+    >,
+> {
     Box::pin(async move {
-    if let Some(ctx) = composition_ctx {
-        // Depth check
-        if let Err(e) = ctx.check_depth() {
-            return (format!("Composition error: {e}"), None, None);
+        if let Some(ctx) = composition_ctx {
+            // Depth check
+            if let Err(e) = ctx.check_depth() {
+                return (format!("Composition error: {e}"), None, None);
+            }
+            // Timeout check
+            if let Err(e) = ctx.check_timeout() {
+                return (format!("Composition error: {e}"), None, None);
+            }
         }
-        // Timeout check
-        if let Err(e) = ctx.check_timeout() {
-            return (format!("Composition error: {e}"), None, None);
-        }
-    }
 
-    match resolver.resolve(skill_name) {
-        Ok(skill) => {
-            // Composability gate: nested calls must target composable skills
-            if let Some(ctx) = composition_ctx {
-                if ctx.is_nested() {
-                    let composable = skill
-                        .composition
-                        .as_ref()
-                        .map(|c| c.composable)
-                        .unwrap_or(false);
-                    if !composable {
+        match resolver.resolve(skill_name) {
+            Ok(skill) => {
+                // Composability gate: nested calls must target composable skills
+                if let Some(ctx) = composition_ctx {
+                    if ctx.is_nested() {
+                        let composable = skill
+                            .composition
+                            .as_ref()
+                            .map(|c| c.composable)
+                            .unwrap_or(false);
+                        if !composable {
+                            return (
+                                format!(
+                                    "Composition error: skill '{}' is not composable \
+                                 (set composable: true in manifest)",
+                                    skill_name,
+                                ),
+                                None,
+                                None,
+                            );
+                        }
+                    }
+                }
+
+                // Input schema validation
+                if let Some(ref schema) = skill.input_schema {
+                    let args_value: Value = serde_json::json!({ "task": task_hint });
+                    let errors = crate::skills::composition::validate_input(schema, &args_value);
+                    if !errors.is_empty() {
                         return (
                             format!(
-                                "Composition error: skill '{}' is not composable \
-                                 (set composable: true in manifest)",
+                                "Input validation failed for skill '{}':\n{}",
                                 skill_name,
+                                errors
+                                    .iter()
+                                    .map(|e| format!("  - {e}"))
+                                    .collect::<Vec<_>>()
+                                    .join("\n")
                             ),
                             None,
                             None,
                         );
                     }
                 }
-            }
 
-            // Input schema validation
-            if let Some(ref schema) = skill.input_schema {
-                let args_value: Value = serde_json::json!({ "task": task_hint });
-                let errors = crate::skills::composition::validate_input(schema, &args_value);
-                if !errors.is_empty() {
+                // Pipeline execution: if this skill declares steps, run them sequentially
+                let has_pipeline = skill
+                    .composition
+                    .as_ref()
+                    .map(|c| !c.steps.is_empty())
+                    .unwrap_or(false);
+                if has_pipeline {
+                    let steps = &skill.composition.as_ref().unwrap().steps;
+                    // Create a child composition context for the pipeline
+                    let pipeline_ctx;
+                    let ctx_ref = match composition_ctx {
+                        Some(parent) => {
+                            pipeline_ctx = parent.child(
+                                skill_name,
+                                skill.composition.as_ref().and_then(|c| c.max_duration_sec),
+                            );
+                            Some(&pipeline_ctx)
+                        }
+                        None => {
+                            let comp = skill.composition.as_ref().unwrap();
+                            let mut root = match comp.max_depth {
+                            Some(d) => crate::skills::composition::CompositionContext::root_with_max_depth(d),
+                            None => crate::skills::composition::CompositionContext::root(),
+                        };
+                            root.timeout_secs = comp.max_duration_sec.map(|s| s as u64);
+                            pipeline_ctx = root;
+                            Some(&pipeline_ctx)
+                        }
+                    };
+                    return execute_pipeline(
+                        resolver, executor, skill_name, steps, task_hint, ctx_ref, skill_ctx,
+                    )
+                    .await;
+                }
+
+                let is_mcp = skill.source == SkillSourceKind::Mcp;
+
+                // MCP sandbox: block inline shell commands from untrusted sources.
+                if is_mcp && crate::skills::has_inline_shell(&skill.instructions) {
                     return (
                         format!(
-                            "Input validation failed for skill '{}':\n{}",
+                            "Skill '{}' blocked: MCP skills cannot contain inline shell commands.",
                             skill_name,
-                            errors
-                                .iter()
-                                .map(|e| format!("  - {e}"))
-                                .collect::<Vec<_>>()
-                                .join("\n")
                         ),
                         None,
                         None,
                     );
                 }
-            }
 
-            // Pipeline execution: if this skill declares steps, run them sequentially
-            let has_pipeline = skill
-                .composition
-                .as_ref()
-                .map(|c| !c.steps.is_empty())
-                .unwrap_or(false);
-            if has_pipeline {
-                let steps = &skill.composition.as_ref().unwrap().steps;
-                // Create a child composition context for the pipeline
-                let pipeline_ctx;
-                let ctx_ref = match composition_ctx {
-                    Some(parent) => {
-                        pipeline_ctx = parent.child(
-                            skill_name,
-                            skill
-                                .composition
-                                .as_ref()
-                                .and_then(|c| c.max_duration_sec),
+                // Run pre-invocation hooks exactly once before any execution path.
+                run_hooks(&skill.hooks.pre_invoke, is_mcp);
+
+                // Fork execution: delegate to the executor for isolated sub-agent run
+                if skill.execution_context == ExecutionContext::Fork {
+                    if let Some(exec) = executor {
+                        let instructions = substitute_arguments(
+                            &skill.instructions,
+                            task_hint,
+                            &HashMap::new(),
+                            skill.skill_dir.as_deref(),
                         );
-                        Some(&pipeline_ctx)
-                    }
-                    None => {
-                        let comp = skill.composition.as_ref().unwrap();
-                        let mut root = match comp.max_depth {
-                            Some(d) => crate::skills::composition::CompositionContext::root_with_max_depth(d),
-                            None => crate::skills::composition::CompositionContext::root(),
+                        let loaded = LoadedSkill {
+                            manifest: SkillManifest {
+                                name: skill.name.clone(),
+                                model: skill.model.clone(),
+                                max_tokens: skill.max_tokens,
+                                allowed_tools: skill.allowed_tools.clone(),
+                                execution_context: ExecutionContext::Fork,
+                                hooks: Some(skill.hooks.clone()),
+                                source: skill.source.clone(),
+                                effort: skill.effort.clone(),
+                                agent_type: skill.agent_type.clone(),
+                                ..Default::default()
+                            },
+                            instructions,
+                            instruction_tokens: (skill.instructions.len() as u32) / 4,
+                            resources: None,
+                            skill_dir: skill.skill_dir.as_ref().map(std::path::PathBuf::from),
                         };
-                        root.timeout_secs = comp.max_duration_sec.map(|s| s as u64);
-                        pipeline_ctx = root;
-                        Some(&pipeline_ctx)
-                    }
-                };
-                return execute_pipeline(
-                    resolver,
-                    executor,
-                    skill_name,
-                    steps,
-                    task_hint,
-                    ctx_ref,
-                    skill_ctx,
-                )
-                .await;
-            }
+                        let ctx = SkillExecutionContext {
+                            task: task_hint.to_string(),
+                            arguments: HashMap::new(),
+                        };
+                        match exec.execute(&loaded, &ctx).await {
+                            Ok(result) => {
+                                run_hooks(&skill.hooks.post_invoke, is_mcp);
 
-            let is_mcp = skill.source == SkillSourceKind::Mcp;
+                                // Post-execution verification (fork skills only)
+                                let (output, verified) = if !skill.success_criteria.is_empty() {
+                                    let work_dir = skill
+                                        .skill_dir
+                                        .as_ref()
+                                        .map(std::path::PathBuf::from)
+                                        .unwrap_or_else(|| {
+                                            std::env::current_dir().unwrap_or_default()
+                                        });
+                                    let verifier =
+                                        crate::skills::verify::SkillVerifier::new(work_dir);
+                                    let mut manifest = SkillManifest::default();
+                                    manifest.success_criteria = skill.success_criteria.clone();
+                                    let (all_passed, results) = verifier.verify(&manifest).await;
 
-            // MCP sandbox: block inline shell commands from untrusted sources.
-            if is_mcp && crate::skills::has_inline_shell(&skill.instructions) {
-                return (
-                    format!(
-                        "Skill '{}' blocked: MCP skills cannot contain inline shell commands.",
-                        skill_name,
-                    ),
-                    None,
-                    None,
-                );
-            }
-
-            // Run pre-invocation hooks exactly once before any execution path.
-            run_hooks(&skill.hooks.pre_invoke, is_mcp);
-
-            // Fork execution: delegate to the executor for isolated sub-agent run
-            if skill.execution_context == ExecutionContext::Fork {
-                if let Some(exec) = executor {
-                    let instructions = substitute_arguments(
-                        &skill.instructions,
-                        task_hint,
-                        &HashMap::new(),
-                        skill.skill_dir.as_deref(),
-                    );
-                    let loaded = LoadedSkill {
-                        manifest: SkillManifest {
-                            name: skill.name.clone(),
-                            model: skill.model.clone(),
-                            max_tokens: skill.max_tokens,
-                            allowed_tools: skill.allowed_tools.clone(),
-                            execution_context: ExecutionContext::Fork,
-                            hooks: Some(skill.hooks.clone()),
-                            source: skill.source.clone(),
-                            effort: skill.effort.clone(),
-                            agent_type: skill.agent_type.clone(),
-                            ..Default::default()
-                        },
-                        instructions,
-                        instruction_tokens: (skill.instructions.len() as u32) / 4,
-                        resources: None,
-                        skill_dir: skill.skill_dir.as_ref().map(std::path::PathBuf::from),
-                    };
-                    let ctx = SkillExecutionContext {
-                        task: task_hint.to_string(),
-                        arguments: HashMap::new(),
-                    };
-                    match exec.execute(&loaded, &ctx).await {
-                        Ok(result) => {
-                            run_hooks(&skill.hooks.post_invoke, is_mcp);
-
-                            // Post-execution verification (fork skills only)
-                            let (output, verified) = if !skill.success_criteria.is_empty() {
-                                let work_dir = skill
-                                    .skill_dir
-                                    .as_ref()
-                                    .map(std::path::PathBuf::from)
-                                    .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-                                let verifier = crate::skills::verify::SkillVerifier::new(work_dir);
-                                let mut manifest = SkillManifest::default();
-                                manifest.success_criteria = skill.success_criteria.clone();
-                                let (all_passed, results) = verifier.verify(&manifest).await;
-
-                                let mut output = result.output;
-                                if !results.is_empty() {
-                                    output.push_str("\n\n---\n**Verification Results:**\n");
-                                    for r in &results {
-                                        let icon = if r.passed { "✅" } else { "❌" };
-                                        output.push_str(&format!(
-                                            "- {} {} ({}ms){}\n",
-                                            icon,
-                                            r.criterion_id,
-                                            r.duration_ms,
-                                            if let Some(ref err) = r.error {
-                                                format!(" — {err}")
-                                            } else {
-                                                String::new()
-                                            }
-                                        ));
-                                    }
-                                    if !all_passed {
-                                        output.push_str(
+                                    let mut output = result.output;
+                                    if !results.is_empty() {
+                                        output.push_str("\n\n---\n**Verification Results:**\n");
+                                        for r in &results {
+                                            let icon = if r.passed { "✅" } else { "❌" };
+                                            output.push_str(&format!(
+                                                "- {} {} ({}ms){}\n",
+                                                icon,
+                                                r.criterion_id,
+                                                r.duration_ms,
+                                                if let Some(ref err) = r.error {
+                                                    format!(" — {err}")
+                                                } else {
+                                                    String::new()
+                                                }
+                                            ));
+                                        }
+                                        if !all_passed {
+                                            output.push_str(
                                             "\n⚠️ Some required verification criteria failed.\n",
                                         );
+                                        }
                                     }
-                                }
-                                (output, Some(all_passed))
-                            } else {
-                                (result.output, None)
-                            };
+                                    (output, Some(all_passed))
+                                } else {
+                                    (result.output, None)
+                                };
 
-                            return (output, Some(build_activation(&skill)), verified);
-                        }
-                        Err(e) => {
-                            eprintln!(
-                                "  ⚠ Fork execution of skill '{}' failed: {}; falling back to inline",
-                                skill_name, e
-                            );
-                            // pre_invoke already ran; notify lifecycle hooks, then fall back to inline.
-                            run_hooks(&skill.hooks.on_error, is_mcp);
+                                return (output, Some(build_activation(&skill)), verified);
+                            }
+                            Err(e) => {
+                                eprintln!(
+                                    "  ⚠ Fork execution of skill '{}' failed: {}; falling back to inline",
+                                    skill_name, e
+                                );
+                                // pre_invoke already ran; notify lifecycle hooks, then fall back to inline.
+                                run_hooks(&skill.hooks.on_error, is_mcp);
+                            }
                         }
                     }
+                    // No executor available — fall through to inline
                 }
-                // No executor available — fall through to inline
-            }
 
-            // Apply argument substitution: $ARGUMENTS, ${SKILL_DIR}, and ${CTX_*}
-            let context_vars = skill_ctx.as_substitution_vars();
-            let instructions = substitute_arguments(
-                &skill.instructions,
-                task_hint,
-                &context_vars,
-                skill.skill_dir.as_deref(),
-            );
+                // Apply argument substitution: $ARGUMENTS, ${SKILL_DIR}, and ${CTX_*}
+                let context_vars = skill_ctx.as_substitution_vars();
+                let instructions = substitute_arguments(
+                    &skill.instructions,
+                    task_hint,
+                    &context_vars,
+                    skill.skill_dir.as_deref(),
+                );
 
-            // Inline execution (default, and fork-failure fallback)
-            let mut output = format!(
-                "# Skill: {}\n\n\
+                // Inline execution (default, and fork-failure fallback)
+                let mut output = format!(
+                    "# Skill: {}\n\n\
                  You are now executing the **{}** skill. \
                  Follow the instructions below carefully.\n\n\
                  ---\n\n\
                  {}",
-                skill.name, skill.name, instructions
-            );
+                    skill.name, skill.name, instructions
+                );
 
-            if !task_hint.is_empty() {
-                output.push_str(&format!("\n\n---\n\n**Task context:** {}", task_hint));
+                if !task_hint.is_empty() {
+                    output.push_str(&format!("\n\n---\n\n**Task context:** {}", task_hint));
+                }
+
+                if !skill.allowed_tools.is_empty() {
+                    output.push_str(&format!(
+                        "\n\n**Allowed tools for this skill:** {}",
+                        skill.allowed_tools.join(", ")
+                    ));
+                }
+
+                // Run post-invocation hooks (skipped for MCP)
+                run_hooks(&skill.hooks.post_invoke, is_mcp);
+
+                (output, Some(build_activation(&skill)), None)
             }
-
-            if !skill.allowed_tools.is_empty() {
-                output.push_str(&format!(
-                    "\n\n**Allowed tools for this skill:** {}",
-                    skill.allowed_tools.join(", ")
-                ));
-            }
-
-            // Run post-invocation hooks (skipped for MCP)
-            run_hooks(&skill.hooks.post_invoke, is_mcp);
-
-            (output, Some(build_activation(&skill)), None)
+            Err(e) => (
+                format!("Failed to load skill '{}': {}", skill_name, e),
+                None,
+                None,
+            ),
         }
-        Err(e) => (
-            format!("Failed to load skill '{}': {}", skill_name, e),
-            None,
-            None,
-        ),
-    }
     })
 }
 
@@ -3143,11 +3134,26 @@ mod tests {
             &SkillContext::default(),
         )
         .await;
-        assert!(output.contains("all 2 steps completed"), "Expected pipeline completion, got: {output}");
-        assert!(output.contains("Step: Analyze"), "Should contain step-a label");
-        assert!(output.contains("Step: Build"), "Should contain step-b label");
-        assert!(output.contains("Instructions for step-a"), "Should contain step-a output");
-        assert!(output.contains("Instructions for step-b"), "Should contain step-b output");
+        assert!(
+            output.contains("all 2 steps completed"),
+            "Expected pipeline completion, got: {output}"
+        );
+        assert!(
+            output.contains("Step: Analyze"),
+            "Should contain step-a label"
+        );
+        assert!(
+            output.contains("Step: Build"),
+            "Should contain step-b label"
+        );
+        assert!(
+            output.contains("Instructions for step-a"),
+            "Should contain step-a output"
+        );
+        assert!(
+            output.contains("Instructions for step-b"),
+            "Should contain step-b output"
+        );
         assert!(activation.is_some());
         assert_eq!(verified, Some(true));
     }
@@ -3165,7 +3171,10 @@ mod tests {
         )
         .await;
         // Step B should receive step A's output threaded in
-        assert!(output.contains("Previous step output"), "Expected output threading between steps");
+        assert!(
+            output.contains("Previous step output"),
+            "Expected output threading between steps"
+        );
     }
 
     #[tokio::test]
@@ -3262,8 +3271,14 @@ mod tests {
         )
         .await;
         // The missing-step should fail resolution, and never-reached should not appear
-        assert!(!output.contains("never-reached"), "Pipeline should stop before 3rd step");
-        assert!(output.contains("Failed to load skill"), "Should show load failure");
+        assert!(
+            !output.contains("never-reached"),
+            "Pipeline should stop before 3rd step"
+        );
+        assert!(
+            output.contains("Failed to load skill"),
+            "Should show load failure"
+        );
     }
 
     #[tokio::test]

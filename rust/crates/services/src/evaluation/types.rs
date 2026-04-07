@@ -205,7 +205,11 @@ mod tests {
 
     #[test]
     fn export_format_roundtrip() {
-        for variant in [ExportFormat::Jsonl, ExportFormat::Csv, ExportFormat::Parquet] {
+        for variant in [
+            ExportFormat::Jsonl,
+            ExportFormat::Csv,
+            ExportFormat::Parquet,
+        ] {
             let json = serde_json::to_string(&variant).unwrap();
             let parsed: ExportFormat = serde_json::from_str(&json).unwrap();
             assert_eq!(parsed, variant);

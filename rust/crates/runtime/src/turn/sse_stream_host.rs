@@ -826,8 +826,7 @@ mod tests {
     async fn transport_error_aborts_cleanly() {
         // Stream yields one good chunk then an error.
         let chunks: Vec<Result<Vec<u8>, String>> = vec![
-            Ok(sse_event("text_delta", ",\"content\":\"partial\"")
-                .into_bytes()),
+            Ok(sse_event("text_delta", ",\"content\":\"partial\"").into_bytes()),
             Err("connection reset by peer".to_string()),
         ];
         let mut stream = stream::iter(chunks);
@@ -900,8 +899,14 @@ mod tests {
     async fn multiple_tool_requests_executed_sequentially() {
         let events = format!(
             "{}{}",
-            sse_event("tool_request", ",\"request_id\":\"t1\",\"tool\":\"read_file\",\"args\":{\"path\":\"a.rs\"}"),
-            sse_event("tool_request", ",\"request_id\":\"t2\",\"tool\":\"grep\",\"args\":{\"pattern\":\"TODO\"}"),
+            sse_event(
+                "tool_request",
+                ",\"request_id\":\"t1\",\"tool\":\"read_file\",\"args\":{\"path\":\"a.rs\"}"
+            ),
+            sse_event(
+                "tool_request",
+                ",\"request_id\":\"t2\",\"tool\":\"grep\",\"args\":{\"pattern\":\"TODO\"}"
+            ),
         );
         let chunks = chunks_from_sse(&events);
         let mut stream = stream::iter(chunks);
@@ -929,14 +934,16 @@ mod tests {
         // (all within the same SSE stream from a single /chat/turn call)
         let events = format!(
             "{}{}{}",
-            sse_event("tool_request", ",\"request_id\":\"t1\",\"tool\":\"read_file\",\"args\":{\"path\":\"x\"}"),
+            sse_event(
+                "tool_request",
+                ",\"request_id\":\"t1\",\"tool\":\"read_file\",\"args\":{\"path\":\"x\"}"
+            ),
             sse_event("text_delta", ",\"content\":\"Based on the file, \""),
             sse_event("text_delta", ",\"content\":\"here is my analysis.\""),
         );
         let chunks = chunks_from_sse(&events);
         let mut stream = stream::iter(chunks);
-        let mut host = RecordingSseStreamHost::new()
-            .with_tool_output("read_file", "file content");
+        let mut host = RecordingSseStreamHost::new().with_tool_output("read_file", "file content");
         let (result, abort) = consume_sse_stream(
             &mut stream,
             &mut host,
@@ -946,7 +953,10 @@ mod tests {
 
         assert!(abort.is_none());
         assert_eq!(result.tool_results.len(), 1);
-        assert_eq!(result.accum.full_text, "Based on the file, here is my analysis.");
+        assert_eq!(
+            result.accum.full_text,
+            "Based on the file, here is my analysis."
+        );
     }
 
     // ── prioritize_skill_tools unit tests ──────────────────────────────────
@@ -976,7 +986,10 @@ mod tests {
         ];
         super::prioritize_skill_tools(&mut items);
 
-        assert_eq!(tool_name(&items[0]), crate::turn::skill_tool::SKILL_TOOL_NAME);
+        assert_eq!(
+            tool_name(&items[0]),
+            crate::turn::skill_tool::SKILL_TOOL_NAME
+        );
         assert_eq!(tool_name(&items[1]), "write_file");
         assert_eq!(tool_name(&items[2]), "bash");
         assert_eq!(tool_name(&items[3]), "grep");
@@ -984,10 +997,7 @@ mod tests {
 
     #[test]
     fn prioritize_no_skill_preserves_order() {
-        let mut items = vec![
-            make_tool_pending("write_file"),
-            make_tool_pending("bash"),
-        ];
+        let mut items = vec![make_tool_pending("write_file"), make_tool_pending("bash")];
         super::prioritize_skill_tools(&mut items);
 
         assert_eq!(tool_name(&items[0]), "write_file");
@@ -1004,8 +1014,14 @@ mod tests {
         ];
         super::prioritize_skill_tools(&mut items);
 
-        assert_eq!(tool_name(&items[0]), crate::turn::skill_tool::SKILL_TOOL_NAME);
-        assert_eq!(tool_name(&items[1]), crate::turn::skill_tool::SKILL_TOOL_NAME);
+        assert_eq!(
+            tool_name(&items[0]),
+            crate::turn::skill_tool::SKILL_TOOL_NAME
+        );
+        assert_eq!(
+            tool_name(&items[1]),
+            crate::turn::skill_tool::SKILL_TOOL_NAME
+        );
         assert_eq!(tool_name(&items[2]), "bash");
         assert_eq!(tool_name(&items[3]), "write_file");
     }
@@ -1044,8 +1060,7 @@ mod tests {
         let (tx, rx) = test_channel();
         let mut stream = rx;
 
-        let mut host = RecordingSseStreamHost::new()
-            .with_tool_output("bash", "commit abc123");
+        let mut host = RecordingSseStreamHost::new().with_tool_output("bash", "commit abc123");
 
         // "Bridge" task: send tool_request, pause (simulating ledger wait),
         // then send final text once the tool has had time to execute inline.
@@ -1073,7 +1088,10 @@ mod tests {
         )
         .await;
 
-        assert!(result.is_ok(), "timed out — tool execution was likely deferred, causing deadlock");
+        assert!(
+            result.is_ok(),
+            "timed out — tool execution was likely deferred, causing deadlock"
+        );
         let (result, abort) = result.unwrap();
         assert!(abort.is_none(), "unexpected abort: {abort:?}");
         assert_eq!(result.tool_results.len(), 1);
@@ -1103,26 +1121,53 @@ mod tests {
         impl SseStreamHost for OrderTrackingHost {
             fn on_render_effects(&mut self, _: Vec<SseRenderEffect>) {}
             fn on_stream_complete(&mut self) {}
-            async fn execute_tool(&mut self, rid: &str, tool: &str, args: &Value) -> EdgeToolExecResult {
+            async fn execute_tool(
+                &mut self,
+                rid: &str,
+                tool: &str,
+                args: &Value,
+            ) -> EdgeToolExecResult {
                 self.0.lock().unwrap().push(tool.to_string());
-                EdgeToolExecResult { request_id: rid.to_string(), tool: tool.to_string(), args: args.clone(), output: format!("ok-{tool}"), status: "ok".to_string(), duration_ms: 1 }
+                EdgeToolExecResult {
+                    request_id: rid.to_string(),
+                    tool: tool.to_string(),
+                    args: args.clone(),
+                    output: format!("ok-{tool}"),
+                    status: "ok".to_string(),
+                    duration_ms: 1,
+                }
             }
-            async fn resolve_approval(&mut self, rid: &str, _: &str, _: Option<&str>) -> EdgeApprovalResult {
-                EdgeApprovalResult { request_id: rid.to_string(), decision: "allow".to_string(), reason: None }
+            async fn resolve_approval(
+                &mut self,
+                rid: &str,
+                _: &str,
+                _: Option<&str>,
+            ) -> EdgeApprovalResult {
+                EdgeApprovalResult {
+                    request_id: rid.to_string(),
+                    decision: "allow".to_string(),
+                    reason: None,
+                }
             }
         }
 
         let mut host = OrderTrackingHost(order.clone());
         let (result, abort) = consume_sse_stream(
-            &mut stream, &mut host,
+            &mut stream,
+            &mut host,
             std::time::Duration::from_millis(STREAM_IDLE_TIMEOUT_MS),
-        ).await;
+        )
+        .await;
 
         assert!(abort.is_none());
         assert_eq!(result.tool_results.len(), 2);
         let exec_order = order.lock().unwrap();
-        assert_eq!(exec_order[0], crate::turn::skill_tool::SKILL_TOOL_NAME,
-            "skill should execute before bash, got: {:?}", *exec_order);
+        assert_eq!(
+            exec_order[0],
+            crate::turn::skill_tool::SKILL_TOOL_NAME,
+            "skill should execute before bash, got: {:?}",
+            *exec_order
+        );
         assert_eq!(exec_order[1], "bash");
     }
 
@@ -1135,22 +1180,27 @@ mod tests {
         // trailing \n\n — it stays in the framer buffer and gets flushed
         // as the tail blob after the stream ends.
         let complete = sse_event("text_delta", ",\"content\":\"hi\"");
-        let partial_tool = "data: {\"type\":\"tool_request\",\"request_id\":\"t1\",\"tool\":\"bash\",\"args\":{}}";
-        let chunks: Vec<Result<Vec<u8>, String>> = vec![
-            Ok(format!("{complete}{partial_tool}").into_bytes()),
-        ];
+        let partial_tool =
+            "data: {\"type\":\"tool_request\",\"request_id\":\"t1\",\"tool\":\"bash\",\"args\":{}}";
+        let chunks: Vec<Result<Vec<u8>, String>> =
+            vec![Ok(format!("{complete}{partial_tool}").into_bytes())];
         let mut stream = stream::iter(chunks);
-        let mut host = RecordingSseStreamHost::new()
-            .with_tool_output("bash", "tail result");
+        let mut host = RecordingSseStreamHost::new().with_tool_output("bash", "tail result");
 
         let (result, abort) = consume_sse_stream(
-            &mut stream, &mut host,
+            &mut stream,
+            &mut host,
             std::time::Duration::from_millis(STREAM_IDLE_TIMEOUT_MS),
-        ).await;
+        )
+        .await;
 
         assert!(abort.is_none());
         assert_eq!(result.accum.full_text, "hi");
-        assert_eq!(result.tool_results.len(), 1, "tail tool_request should be executed");
+        assert_eq!(
+            result.tool_results.len(),
+            1,
+            "tail tool_request should be executed"
+        );
         assert_eq!(result.tool_results[0].output, "tail result");
     }
 
@@ -1163,18 +1213,42 @@ mod tests {
         let mut host = RecordingSseStreamHost::new();
 
         let _hold = tx.clone();
-        tx.send(Ok(sse_event("reasoning_delta", ",\"content\":\"thinking...\"").into_bytes())).await.unwrap();
+        tx.send(Ok(sse_event(
+            "reasoning_delta",
+            ",\"content\":\"thinking...\"",
+        )
+        .into_bytes()))
+            .await
+            .unwrap();
 
         let (result, abort) = consume_sse_stream(
-            &mut stream, &mut host,
+            &mut stream,
+            &mut host,
             std::time::Duration::from_millis(100),
-        ).await;
+        )
+        .await;
 
         assert_eq!(abort, Some(SseAbortReason::IdleTimeout));
-        assert!(result.accum.full_text.is_empty(), "text should be tombstoned");
-        assert!(result.accum.reasoning_content.is_empty(), "reasoning should be tombstoned");
-        assert!(result.tool_results.is_empty(), "no tools should have executed");
-        assert!(result.accum.error_message.as_ref().unwrap().contains("idle timeout"));
+        assert!(
+            result.accum.full_text.is_empty(),
+            "text should be tombstoned"
+        );
+        assert!(
+            result.accum.reasoning_content.is_empty(),
+            "reasoning should be tombstoned"
+        );
+        assert!(
+            result.tool_results.is_empty(),
+            "no tools should have executed"
+        );
+        assert!(
+            result
+                .accum
+                .error_message
+                .as_ref()
+                .unwrap()
+                .contains("idle timeout")
+        );
     }
 
     /// Unhappy: cancellation with pending tool requests — tombstoned.
@@ -1185,7 +1259,11 @@ mod tests {
         let cancel = tokio_util::sync::CancellationToken::new();
         let mut host = RecordingSseStreamHost::new();
 
-        tx.send(Ok(sse_event("text_delta", ",\"content\":\"hello\"").into_bytes())).await.unwrap();
+        tx.send(Ok(
+            sse_event("text_delta", ",\"content\":\"hello\"").into_bytes()
+        ))
+        .await
+        .unwrap();
 
         let cancel_clone = cancel.clone();
         tokio::spawn(async move {
@@ -1194,13 +1272,25 @@ mod tests {
         });
 
         let (result, abort) = consume_sse_stream_cancellable(
-            &mut stream, &mut host,
+            &mut stream,
+            &mut host,
             std::time::Duration::from_secs(10),
             Some(&cancel),
-        ).await;
+        )
+        .await;
 
         assert_eq!(abort, Some(SseAbortReason::Cancelled));
-        assert!(result.accum.error_message.as_ref().unwrap().contains("Cancelled"));
-        assert!(result.accum.full_text.is_empty(), "text should be tombstoned on cancel");
+        assert!(
+            result
+                .accum
+                .error_message
+                .as_ref()
+                .unwrap()
+                .contains("Cancelled")
+        );
+        assert!(
+            result.accum.full_text.is_empty(),
+            "text should be tombstoned on cancel"
+        );
     }
 }

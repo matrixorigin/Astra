@@ -205,7 +205,13 @@ pub(super) async fn handle_chat_input(
                                 return Ok(());
                             }
                             Err(retry_failure) => {
-                                report_turn_failure(state, ctx.profile, &line, &retry_failure, turn_start);
+                                report_turn_failure(
+                                    state,
+                                    ctx.profile,
+                                    &line,
+                                    &retry_failure,
+                                    turn_start,
+                                );
                                 return Ok(());
                             }
                         },
@@ -234,11 +240,17 @@ pub(super) fn build_effective_line(line: &str, state: &ReplState) -> String {
                 )
             ),
             Ok(_) => {
-                eprintln!("  ⚠ SKILL.md is empty at {}, dev context skipped", skill_md.display());
+                eprintln!(
+                    "  ⚠ SKILL.md is empty at {}, dev context skipped",
+                    skill_md.display()
+                );
                 line.to_string()
             }
             Err(_) => {
-                eprintln!("  ⚠ SKILL.md not found at {}, dev context skipped", skill_md.display());
+                eprintln!(
+                    "  ⚠ SKILL.md not found at {}, dev context skipped",
+                    skill_md.display()
+                );
                 line.to_string()
             }
         }
@@ -945,8 +957,9 @@ fn print_turn_status_line(state: &ReplState, result: &StreamResult, turn_start: 
 
     // Cache savings indicator
     if result.cache_read_tokens > 0 {
-        let cache_pct =
-            result.cache_read_tokens as f64 / (result.prompt_tokens + result.cache_read_tokens).max(1) as f64 * 100.0;
+        let cache_pct = result.cache_read_tokens as f64
+            / (result.prompt_tokens + result.cache_read_tokens).max(1) as f64
+            * 100.0;
         parts.push(format!("cache:{cache_pct:.0}%"));
     }
 
@@ -1095,7 +1108,12 @@ fn report_turn_failure(
     // (first turn failed before apply_turn_success), bootstrap it now so the
     // error is persisted and visible via /turn and /debug.
     if state.journal.is_none() {
-        if let Some(sid) = failure.partial.session_id.as_deref().filter(|s| !s.is_empty()) {
+        if let Some(sid) = failure
+            .partial
+            .session_id
+            .as_deref()
+            .filter(|s| !s.is_empty())
+        {
             initialize_journal(state, sid);
             persist_last_session_id(profile, sid);
             state.session_id = Some(sid.to_string());
@@ -1149,9 +1167,7 @@ fn report_turn_failure(
             "[Interrupted: {}]\n\n{}",
             failure.error, failure.partial.partial_text
         );
-        state
-            .history
-            .push((line.to_string(), partial_with_note));
+        state.history.push((line.to_string(), partial_with_note));
         state.last_response = Some(failure.partial.partial_text.clone());
     }
 }
@@ -1690,7 +1706,11 @@ mod tests {
         assert!(turn1.contains("V1"));
 
         // Simulate external edit between turns
-        std::fs::write(skill_dir.join("SKILL.md"), "---\nname: evolving\n---\nV2 rewritten").unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: evolving\n---\nV2 rewritten",
+        )
+        .unwrap();
 
         let turn2 = build_effective_line("check again", &state);
         assert!(!turn2.contains("V1"), "should not contain old content");
@@ -1736,7 +1756,11 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let skill_dir = tmp.path().join("custom-loc");
         std::fs::create_dir_all(&skill_dir).unwrap();
-        std::fs::write(skill_dir.join("SKILL.md"), "---\nname: custom-loc\n---\nBody").unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: custom-loc\n---\nBody",
+        )
+        .unwrap();
 
         let state = ReplState {
             skill_dev: Some(super::super::SkillDevState {
@@ -1749,7 +1773,10 @@ mod tests {
         let effective = build_effective_line("x", &state);
         // Must contain the actual path, not a hardcoded .astra/skills/ path
         let expected_path = skill_dir.join("SKILL.md").display().to_string();
-        assert!(effective.contains(&expected_path), "should contain actual path: {expected_path}");
+        assert!(
+            effective.contains(&expected_path),
+            "should contain actual path: {expected_path}"
+        );
     }
 
     #[test]
@@ -1757,7 +1784,11 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let skill_dir = tmp.path().join("combo");
         std::fs::create_dir_all(&skill_dir).unwrap();
-        std::fs::write(skill_dir.join("SKILL.md"), "---\nname: combo\n---\nCombo skill").unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: combo\n---\nCombo skill",
+        )
+        .unwrap();
 
         let state = ReplState {
             skill_dev: Some(super::super::SkillDevState {
@@ -1809,8 +1840,7 @@ mod tests {
         // cache_pct = cache_read / (prompt + cache_read) * 100
         let prompt = 200u64;
         let cache_read = 800u64;
-        let cache_pct =
-            cache_read as f64 / (prompt + cache_read).max(1) as f64 * 100.0;
+        let cache_pct = cache_read as f64 / (prompt + cache_read).max(1) as f64 * 100.0;
         assert!((cache_pct - 80.0).abs() < 0.01);
     }
 
@@ -1818,8 +1848,7 @@ mod tests {
     fn cache_hit_percentage_zero_when_no_cache() {
         let prompt = 1000u64;
         let cache_read = 0u64;
-        let cache_pct =
-            cache_read as f64 / (prompt + cache_read).max(1) as f64 * 100.0;
+        let cache_pct = cache_read as f64 / (prompt + cache_read).max(1) as f64 * 100.0;
         assert!((cache_pct - 0.0).abs() < 0.01);
     }
 
@@ -1827,8 +1856,7 @@ mod tests {
     fn cache_hit_percentage_100_when_all_cached() {
         let prompt = 0u64;
         let cache_read = 5000u64;
-        let cache_pct =
-            cache_read as f64 / (prompt + cache_read).max(1) as f64 * 100.0;
+        let cache_pct = cache_read as f64 / (prompt + cache_read).max(1) as f64 * 100.0;
         assert!((cache_pct - 100.0).abs() < 0.01);
     }
 
@@ -1836,8 +1864,8 @@ mod tests {
     fn session_cost_accumulation() {
         let mut state = ReplState::default();
         state.cached_pricing = astra_services::models::PricingData {
-            prompt: 3.0,       // $3/1K prompt tokens
-            completion: 15.0,  // $15/1K completion tokens
+            prompt: 3.0,             // $3/1K prompt tokens
+            completion: 15.0,        // $15/1K completion tokens
             cache_read: Some(0.3),   // $0.3/1K (10% of prompt)
             cache_write: Some(3.75), // $3.75/1K (125% of prompt)
         };

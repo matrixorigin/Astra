@@ -1394,7 +1394,11 @@ mod tests {
             r#"{{"session_id":"s1","last_status":"x","turn_count":0,
             "total_tokens_in":0,"total_tokens_out":0,"recent_tools":[],
             "checkpoint_count":0,"restored_from_cloud":false{}}}"#,
-            if extra.is_empty() { "".to_string() } else { format!(",{extra}") }
+            if extra.is_empty() {
+                "".to_string()
+            } else {
+                format!(",{extra}")
+            }
         )
     }
 
@@ -1432,7 +1436,10 @@ mod tests {
         assert_eq!(loaded.number, 5);
         assert_eq!(loaded.turn, 10);
         assert_eq!(loaded.title, "Phase 1 complete");
-        assert_eq!(loaded.contract_state_json.as_deref(), Some(r#"{"id":"c1"}"#));
+        assert_eq!(
+            loaded.contract_state_json.as_deref(),
+            Some(r#"{"id":"c1"}"#)
+        );
     }
 
     #[test]
@@ -1444,14 +1451,26 @@ mod tests {
 
     #[test]
     fn parse_heavy_checkpoint_number_zero_padded() {
-        assert_eq!(super::parse_heavy_checkpoint_number("000001-heavy.json"), Some(1));
-        assert_eq!(super::parse_heavy_checkpoint_number("000999-heavy.json"), Some(999));
+        assert_eq!(
+            super::parse_heavy_checkpoint_number("000001-heavy.json"),
+            Some(1)
+        );
+        assert_eq!(
+            super::parse_heavy_checkpoint_number("000999-heavy.json"),
+            Some(999)
+        );
     }
 
     #[test]
     fn parse_heavy_checkpoint_number_no_padding() {
-        assert_eq!(super::parse_heavy_checkpoint_number("1-heavy.json"), Some(1));
-        assert_eq!(super::parse_heavy_checkpoint_number("42-heavy.json"), Some(42));
+        assert_eq!(
+            super::parse_heavy_checkpoint_number("1-heavy.json"),
+            Some(1)
+        );
+        assert_eq!(
+            super::parse_heavy_checkpoint_number("42-heavy.json"),
+            Some(42)
+        );
     }
 
     #[test]

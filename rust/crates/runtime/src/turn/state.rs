@@ -134,7 +134,10 @@ mod tests {
         assert!(entry["sections"].is_null());
         assert_eq!(entry["spend_usd"].as_f64().unwrap(), 0.0);
         assert_eq!(entry["turn_count"].as_i64().unwrap(), 0);
-        assert_eq!(entry["created_at"].as_str().unwrap(), "2025-01-01T00:00:00Z");
+        assert_eq!(
+            entry["created_at"].as_str().unwrap(),
+            "2025-01-01T00:00:00Z"
+        );
     }
 
     #[test]
@@ -205,9 +208,8 @@ mod tests {
 
     #[test]
     fn cache_entry_normalizes_created_at_offset() {
-        let entry = Map::from_iter([
-            ("created_at".to_string(), json!("2025-01-01T08:00:00+08:00")),
-        ]);
+        let entry =
+            Map::from_iter([("created_at".to_string(), json!("2025-01-01T08:00:00+08:00"))]);
         let norm = normalize_bridge_cache_entry(&entry).unwrap();
         assert_eq!(norm["created_at"].as_str().unwrap(), "2025-01-01T00:00:00Z");
     }
@@ -216,7 +218,12 @@ mod tests {
     fn cache_entry_tool_quality_defaults_empty_array() {
         let entry = Map::from_iter([("turn_count".to_string(), json!(5))]);
         let norm = normalize_bridge_cache_entry(&entry).unwrap();
-        assert!(norm["tool_quality_assessments"].as_array().unwrap().is_empty());
+        assert!(
+            norm["tool_quality_assessments"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
     }
 
     // --- resolve_turn_identifiers ---

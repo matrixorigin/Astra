@@ -1005,9 +1005,18 @@ mod tests {
             &[],
         );
         assert!(msg.contains("timed out"), "got: {msg}");
-        assert!(msg.contains("path"), "should suggest narrowing path, got: {msg}");
-        assert!(msg.contains("include"), "should suggest include filter, got: {msg}");
-        assert!(!msg.contains("retried"), "should NOT mention retry, got: {msg}");
+        assert!(
+            msg.contains("path"),
+            "should suggest narrowing path, got: {msg}"
+        );
+        assert!(
+            msg.contains("include"),
+            "should suggest include filter, got: {msg}"
+        );
+        assert!(
+            !msg.contains("retried"),
+            "should NOT mention retry, got: {msg}"
+        );
     }
 
     #[test]

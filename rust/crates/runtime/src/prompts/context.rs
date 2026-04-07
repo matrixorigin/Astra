@@ -1106,7 +1106,7 @@ mod tests {
         };
         // compact_trigger = 80_000 * 0.80 = 64_000
         assert!(!b.should_compact(64_000)); // Not > trigger
-        assert!(b.should_compact(64_001));  // > trigger
+        assert!(b.should_compact(64_001)); // > trigger
     }
 
     #[test]
@@ -1120,6 +1120,9 @@ mod tests {
     #[test]
     fn tier_from_rank_clamps_at_3() {
         // Ranks > 3 should still return AggressivePrune
-        assert_eq!(tier_from_compaction_rank(255), CompactionTier::AggressivePrune);
+        assert_eq!(
+            tier_from_compaction_rank(255),
+            CompactionTier::AggressivePrune
+        );
     }
 }

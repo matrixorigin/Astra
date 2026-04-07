@@ -452,10 +452,7 @@ mod tests {
     fn registry_match_best_wins() {
         let m = keyword_registry_match(
             "debug this error",
-            &[
-                ("greet", &["hello"]),
-                ("debug", &["debug", "error"]),
-            ],
+            &[("greet", &["hello"]), ("debug", &["debug", "error"])],
             &[],
         );
         assert_eq!(m.label, Some("debug"));
@@ -593,12 +590,18 @@ mod tests {
 
     #[test]
     fn task_type_code_review() {
-        assert_eq!(classify_chat_route_task_type("review this PR"), "code_review");
+        assert_eq!(
+            classify_chat_route_task_type("review this PR"),
+            "code_review"
+        );
     }
 
     #[test]
     fn task_type_debugging() {
-        assert_eq!(classify_chat_route_task_type("debug this error"), "debugging");
+        assert_eq!(
+            classify_chat_route_task_type("debug this error"),
+            "debugging"
+        );
     }
 
     #[test]

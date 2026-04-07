@@ -321,7 +321,8 @@ pub mod tests {
 
     #[tokio::test]
     async fn success_on_first_attempt() {
-        let body = "### Primary Request\nDoing stuff\n### Pending Tasks\nNone\n### Current State\nDone";
+        let body =
+            "### Primary Request\nDoing stuff\n### Pending Tasks\nNone\n### Current State\nDone";
         let client = MockSummaryClient::success(body);
         let msgs = make_messages(3);
         let result = generate_compact_summary(&msgs, &client).await;

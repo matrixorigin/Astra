@@ -632,12 +632,18 @@ mod tests {
 
     #[test]
     fn substring_boundary_exact() {
-        assert!(substring_boundary_match("open pull request now", "pull request"));
+        assert!(substring_boundary_match(
+            "open pull request now",
+            "pull request"
+        ));
     }
 
     #[test]
     fn substring_boundary_with_suffix() {
-        assert!(substring_boundary_match("pull requests are pending", "pull request"));
+        assert!(substring_boundary_match(
+            "pull requests are pending",
+            "pull request"
+        ));
     }
 
     #[test]
@@ -679,7 +685,8 @@ mod tests {
 
     #[test]
     fn followup_long_message_not_followup() {
-        let s = "this is a really long message that has nothing to do with follow-up patterns at all";
+        let s =
+            "this is a really long message that has nothing to do with follow-up patterns at all";
         let chars: Vec<char> = s.chars().collect();
         assert!(!is_followup_msg(s, &chars, 5));
     }

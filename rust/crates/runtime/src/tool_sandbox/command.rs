@@ -573,11 +573,19 @@ mod tests {
 
     #[test]
     fn sensitive_path_access_variants() {
-        for path in &["/etc/passwd", "/root/.bashrc", "/var/log/syslog", "/proc/1/status", "/sys/class/net"] {
+        for path in &[
+            "/etc/passwd",
+            "/root/.bashrc",
+            "/var/log/syslog",
+            "/proc/1/status",
+            "/sys/class/net",
+        ] {
             let cmd = format!("cat {}", path);
             let risks = analyze_command_risks(&cmd);
             assert!(
-                risks.iter().any(|r| matches!(r, CommandRisk::SensitivePathAccess(_))),
+                risks
+                    .iter()
+                    .any(|r| matches!(r, CommandRisk::SensitivePathAccess(_))),
                 "Not detected for: {}",
                 path
             );
@@ -603,13 +611,21 @@ mod tests {
     #[test]
     fn zsh_zsocket_detected() {
         let risks = analyze_command_risks("zsocket -l 8080");
-        assert!(risks.iter().any(|r| matches!(r, CommandRisk::ZshDangerous(_))));
+        assert!(
+            risks
+                .iter()
+                .any(|r| matches!(r, CommandRisk::ZshDangerous(_)))
+        );
     }
 
     #[test]
     fn zsh_zselect_detected() {
         let risks = analyze_command_risks("zselect -r 0 -t 100");
-        assert!(risks.iter().any(|r| matches!(r, CommandRisk::ZshDangerous(_))));
+        assert!(
+            risks
+                .iter()
+                .any(|r| matches!(r, CommandRisk::ZshDangerous(_)))
+        );
     }
 
     #[test]

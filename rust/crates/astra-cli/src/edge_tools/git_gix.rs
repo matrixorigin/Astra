@@ -2177,7 +2177,12 @@ mod tests {
     #[test]
     fn git_diff_stat_only_rejects_staged_with_ref() {
         let root = repo_root();
-        let result = git_diff(&root, &json!({"stat_only": true, "staged": true, "ref": "HEAD~1"}), 0.0, 0);
+        let result = git_diff(
+            &root,
+            &json!({"stat_only": true, "staged": true, "ref": "HEAD~1"}),
+            0.0,
+            0,
+        );
         assert!(result.contains("not both"), "{result}");
     }
 
@@ -2229,7 +2234,12 @@ mod tests {
     #[test]
     fn git_show_file_filter() {
         let root = repo_root();
-        let result = git_show(&root, &json!({"commit": "HEAD", "file": "README.md"}), 0.0, 0);
+        let result = git_show(
+            &root,
+            &json!({"commit": "HEAD", "file": "README.md"}),
+            0.0,
+            0,
+        );
         // If README.md was changed in HEAD, it should appear; otherwise no diff lines
         assert!(result.contains("commit "), "should show header: {result}");
     }

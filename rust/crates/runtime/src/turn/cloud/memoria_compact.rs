@@ -1905,10 +1905,7 @@ mod tests {
 
     #[test]
     fn working_memory_budget_caps() {
-        let msgs = vec![
-            user(&"x".repeat(500)),
-            assistant(&"y".repeat(500)),
-        ];
+        let msgs = vec![user(&"x".repeat(500)), assistant(&"y".repeat(500))];
         let r = build_working_memory_content(&msgs, 100);
         // Should be capped and not include all content
         assert!(r.len() <= 500); // generous but capped

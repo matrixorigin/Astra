@@ -153,7 +153,12 @@ mod tests {
         // Second turn: cache cold + fingerprint changed
         let event = d.detect_break(&fp2, 0);
         assert!(event.is_some());
-        assert!(event.unwrap().causes.contains(&CacheBreakCause::SystemPromptChanged));
+        assert!(
+            event
+                .unwrap()
+                .causes
+                .contains(&CacheBreakCause::SystemPromptChanged)
+        );
     }
 
     #[test]

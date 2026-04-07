@@ -769,7 +769,10 @@ mod tests {
 
     #[test]
     fn scope_id_global_returns_none() {
-        assert_eq!(DatabaseSkillConfigService::scope_id("user1", "global"), None);
+        assert_eq!(
+            DatabaseSkillConfigService::scope_id("user1", "global"),
+            None
+        );
     }
 
     #[test]
@@ -919,7 +922,9 @@ mod tests {
 
     #[test]
     fn status_response_serialize() {
-        let resp = StatusResponse { status: "ok".into() };
+        let resp = StatusResponse {
+            status: "ok".into(),
+        };
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["status"], "ok");
     }

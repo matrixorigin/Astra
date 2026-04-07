@@ -1655,7 +1655,10 @@ mod tests {
     #[test]
     fn object_array_valid() {
         let map = to_map(json!({"items": [1, 2, 3]}));
-        assert_eq!(object_array(&map, "items"), vec![json!(1), json!(2), json!(3)]);
+        assert_eq!(
+            object_array(&map, "items"),
+            vec![json!(1), json!(2), json!(3)]
+        );
     }
 
     #[test]

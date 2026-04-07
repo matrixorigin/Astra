@@ -92,7 +92,11 @@ mod tests {
 
     #[test]
     fn build_skill_dev_prefix_contains_name_and_src() {
-        let r = build_skill_dev_prefix("my-skill", "/project/.astra/skills/my-skill/SKILL.md", "# My Skill\nDo stuff");
+        let r = build_skill_dev_prefix(
+            "my-skill",
+            "/project/.astra/skills/my-skill/SKILL.md",
+            "# My Skill\nDo stuff",
+        );
         assert!(r.contains("my-skill"));
         assert!(r.contains("# My Skill"));
         assert!(r.contains("Do stuff"));

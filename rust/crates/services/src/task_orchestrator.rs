@@ -2335,8 +2335,16 @@ mod tests {
     fn task_plan_all_completed_100_pct() {
         let plan = TaskPlan {
             subtasks: vec![
-                SubtaskPlan { id: "a".into(), status: TaskStatus::Completed, ..Default::default() },
-                SubtaskPlan { id: "b".into(), status: TaskStatus::Completed, ..Default::default() },
+                SubtaskPlan {
+                    id: "a".into(),
+                    status: TaskStatus::Completed,
+                    ..Default::default()
+                },
+                SubtaskPlan {
+                    id: "b".into(),
+                    status: TaskStatus::Completed,
+                    ..Default::default()
+                },
             ],
             notes: None,
         };
@@ -2348,8 +2356,16 @@ mod tests {
     fn task_plan_failed_counts_as_terminal() {
         let plan = TaskPlan {
             subtasks: vec![
-                SubtaskPlan { id: "a".into(), status: TaskStatus::Failed, ..Default::default() },
-                SubtaskPlan { id: "b".into(), status: TaskStatus::Pending, ..Default::default() },
+                SubtaskPlan {
+                    id: "a".into(),
+                    status: TaskStatus::Failed,
+                    ..Default::default()
+                },
+                SubtaskPlan {
+                    id: "b".into(),
+                    status: TaskStatus::Pending,
+                    ..Default::default()
+                },
             ],
             notes: None,
         };
@@ -2363,8 +2379,16 @@ mod tests {
     fn task_plan_ready_with_all_pending_no_deps() {
         let plan = TaskPlan {
             subtasks: vec![
-                SubtaskPlan { id: "a".into(), status: TaskStatus::Pending, ..Default::default() },
-                SubtaskPlan { id: "b".into(), status: TaskStatus::Pending, ..Default::default() },
+                SubtaskPlan {
+                    id: "a".into(),
+                    status: TaskStatus::Pending,
+                    ..Default::default()
+                },
+                SubtaskPlan {
+                    id: "b".into(),
+                    status: TaskStatus::Pending,
+                    ..Default::default()
+                },
             ],
             notes: None,
         };
@@ -2375,8 +2399,18 @@ mod tests {
     fn task_plan_ready_with_unmet_dependency() {
         let plan = TaskPlan {
             subtasks: vec![
-                SubtaskPlan { id: "a".into(), status: TaskStatus::InProgress, depends_on: vec![], ..Default::default() },
-                SubtaskPlan { id: "b".into(), status: TaskStatus::Pending, depends_on: vec!["a".into()], ..Default::default() },
+                SubtaskPlan {
+                    id: "a".into(),
+                    status: TaskStatus::InProgress,
+                    depends_on: vec![],
+                    ..Default::default()
+                },
+                SubtaskPlan {
+                    id: "b".into(),
+                    status: TaskStatus::Pending,
+                    depends_on: vec!["a".into()],
+                    ..Default::default()
+                },
             ],
             notes: None,
         };
@@ -2387,9 +2421,12 @@ mod tests {
     #[test]
     fn task_plan_ready_with_nonexistent_dependency() {
         let plan = TaskPlan {
-            subtasks: vec![
-                SubtaskPlan { id: "a".into(), status: TaskStatus::Pending, depends_on: vec!["nonexistent".into()], ..Default::default() },
-            ],
+            subtasks: vec![SubtaskPlan {
+                id: "a".into(),
+                status: TaskStatus::Pending,
+                depends_on: vec!["nonexistent".into()],
+                ..Default::default()
+            }],
             notes: None,
         };
         // Dependency doesn't exist, so "a" is blocked

@@ -947,7 +947,10 @@ mod tests {
         let rl = RateLimitCooldown::new();
         let action = rl.record_429(None, false);
         // Below consecutive threshold → WaitAndRetry with default 5000ms
-        assert!(matches!(action, RateLimitAction::WaitAndRetry { delay_ms: 5000 }));
+        assert!(matches!(
+            action,
+            RateLimitAction::WaitAndRetry { delay_ms: 5000 }
+        ));
     }
 
     #[test]

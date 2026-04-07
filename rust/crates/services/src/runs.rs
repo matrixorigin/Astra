@@ -533,21 +533,26 @@ mod tests {
 
     #[test]
     fn text_done() {
-        let out = transform_run_event_for_client(make_event("text_done", json!({"full_text": "all"})));
+        let out =
+            transform_run_event_for_client(make_event("text_done", json!({"full_text": "all"})));
         assert_eq!(out["type"], "text_done");
         assert_eq!(out["full_text"], "all");
     }
 
     #[test]
     fn reasoning_message_content() {
-        let out = transform_run_event_for_client(make_event("reasoning_message_content", json!({"content": "think"})));
+        let out = transform_run_event_for_client(make_event(
+            "reasoning_message_content",
+            json!({"content": "think"}),
+        ));
         assert_eq!(out["type"], "reasoning_message_content");
         assert_eq!(out["content"], "think");
     }
 
     #[test]
     fn thinking_delta() {
-        let out = transform_run_event_for_client(make_event("thinking_delta", json!({"chunk": "t"})));
+        let out =
+            transform_run_event_for_client(make_event("thinking_delta", json!({"chunk": "t"})));
         assert_eq!(out["type"], "thinking_delta");
         assert_eq!(out["content"], "t");
     }
@@ -560,7 +565,10 @@ mod tests {
 
     #[test]
     fn tool_call_start() {
-        let out = transform_run_event_for_client(make_event("tool_call_start", json!({"tool": "bash", "call_id": "c1"})));
+        let out = transform_run_event_for_client(make_event(
+            "tool_call_start",
+            json!({"tool": "bash", "call_id": "c1"}),
+        ));
         assert_eq!(out["type"], "tool_call_start");
         assert_eq!(out["tool"], "bash");
         assert_eq!(out["call_id"], "c1");
@@ -568,7 +576,10 @@ mod tests {
 
     #[test]
     fn tool_result() {
-        let out = transform_run_event_for_client(make_event("tool_result", json!({"call_id": "c1", "result": "ok"})));
+        let out = transform_run_event_for_client(make_event(
+            "tool_result",
+            json!({"call_id": "c1", "result": "ok"}),
+        ));
         assert_eq!(out["type"], "tool_result");
         assert_eq!(out["call_id"], "c1");
     }
@@ -597,23 +608,40 @@ mod tests {
 
     #[test]
     fn plan_events() {
-        let created = transform_run_event_for_client(make_event("plan_created", json!({"plan": {"steps": []}})));
+        let created = transform_run_event_for_client(make_event(
+            "plan_created",
+            json!({"plan": {"steps": []}}),
+        ));
         assert_eq!(created["type"], "plan_created");
-        let step_start = transform_run_event_for_client(make_event("plan_step_start", json!({"step": "s1"})));
+        let step_start =
+            transform_run_event_for_client(make_event("plan_step_start", json!({"step": "s1"})));
         assert_eq!(step_start["type"], "plan_step_start");
-        let step_done = transform_run_event_for_client(make_event("plan_step_done", json!({"step": "s1", "result": "ok"})));
+        let step_done = transform_run_event_for_client(make_event(
+            "plan_step_done",
+            json!({"step": "s1", "result": "ok"}),
+        ));
         assert_eq!(step_done["type"], "plan_step_done");
-        let revised = transform_run_event_for_client(make_event("plan_revised", json!({"plan": {}})));
+        let revised =
+            transform_run_event_for_client(make_event("plan_revised", json!({"plan": {}})));
         assert_eq!(revised["type"], "plan_revised");
     }
 
     #[test]
     fn agent_events() {
-        let delegated = transform_run_event_for_client(make_event("agent_delegated", json!({"agent_id": "a1", "task": "t"})));
+        let delegated = transform_run_event_for_client(make_event(
+            "agent_delegated",
+            json!({"agent_id": "a1", "task": "t"}),
+        ));
         assert_eq!(delegated["type"], "agent_delegated");
-        let progress = transform_run_event_for_client(make_event("agent_progress", json!({"agent_id": "a1", "progress": "50%"})));
+        let progress = transform_run_event_for_client(make_event(
+            "agent_progress",
+            json!({"agent_id": "a1", "progress": "50%"}),
+        ));
         assert_eq!(progress["type"], "agent_progress");
-        let completed = transform_run_event_for_client(make_event("agent_completed", json!({"agent_id": "a1", "result": "done"})));
+        let completed = transform_run_event_for_client(make_event(
+            "agent_completed",
+            json!({"agent_id": "a1", "result": "done"}),
+        ));
         assert_eq!(completed["type"], "agent_completed");
     }
 

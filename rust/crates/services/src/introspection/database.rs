@@ -1123,8 +1123,7 @@ mod tests {
     #[test]
     fn context_trend_query_defaults() {
         use super::super::ContextTrendQuery;
-        let q: ContextTrendQuery =
-            serde_json::from_str(r#"{"session_id":"s1"}"#).unwrap();
+        let q: ContextTrendQuery = serde_json::from_str(r#"{"session_id":"s1"}"#).unwrap();
         assert_eq!(q.turns, 10);
         assert_eq!(q.context_window, 128000);
     }
@@ -1132,8 +1131,7 @@ mod tests {
     #[test]
     fn context_snapshot_query_defaults() {
         use super::super::ContextSnapshotQuery;
-        let q: ContextSnapshotQuery =
-            serde_json::from_str(r#"{"session_id":"s1"}"#).unwrap();
+        let q: ContextSnapshotQuery = serde_json::from_str(r#"{"session_id":"s1"}"#).unwrap();
         assert!(!q.detail);
         assert!(!q.raw);
         assert_eq!(q.raw_token_budget, 2000);
@@ -1143,8 +1141,7 @@ mod tests {
     #[test]
     fn retrieval_quality_query_defaults() {
         use super::super::RetrievalQualityQuery;
-        let q: RetrievalQualityQuery =
-            serde_json::from_str(r#"{"session_id":"s1"}"#).unwrap();
+        let q: RetrievalQualityQuery = serde_json::from_str(r#"{"session_id":"s1"}"#).unwrap();
         assert_eq!(q.turns, 5);
     }
 

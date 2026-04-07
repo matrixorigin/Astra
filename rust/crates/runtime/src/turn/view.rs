@@ -139,10 +139,7 @@ mod tests {
 
     #[test]
     fn compose_with_all_parts() {
-        let sys_map = system("sys prompt")
-            .as_object()
-            .unwrap()
-            .clone();
+        let sys_map = system("sys prompt").as_object().unwrap().clone();
         let recent = vec![user("q"), assistant("a")];
         let result = compose_retrieval_view(Some(&sys_map), Some("retrieved"), &recent);
         assert_eq!(result.len(), 4); // system + retrieved + 2 recent
@@ -181,14 +178,26 @@ mod tests {
 
     #[test]
     fn plan_retrieval_no_user_query_returns_none() {
-        let h = vec![system("s"), user("u"), assistant("a"), user("u2"), assistant("a2")];
+        let h = vec![
+            system("s"),
+            user("u"),
+            assistant("a"),
+            user("u2"),
+            assistant("a2"),
+        ];
         let current = vec![assistant("no user here")];
         assert!(plan_retrieval_inputs(&h, &current, 2, 4).is_none());
     }
 
     #[test]
     fn plan_retrieval_valid_returns_plan() {
-        let h = vec![system("s"), user("u1"), assistant("a1"), user("u2"), assistant("a2")];
+        let h = vec![
+            system("s"),
+            user("u1"),
+            assistant("a1"),
+            user("u2"),
+            assistant("a2"),
+        ];
         let current = vec![user("my question")];
         let plan = plan_retrieval_inputs(&h, &current, 2, 4).unwrap();
         assert_eq!(plan.user_query, "my question");

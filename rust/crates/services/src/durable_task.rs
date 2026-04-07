@@ -6645,7 +6645,8 @@ Time:        3.456 s
 
     #[test]
     fn verification_criterion_defaults() {
-        let json = r#"{"id":"c1","description":"test","verifier":{"kind":"command","cmd":"echo ok"}}"#;
+        let json =
+            r#"{"id":"c1","description":"test","verifier":{"kind":"command","cmd":"echo ok"}}"#;
         let c: VerificationCriterion = serde_json::from_str(json).unwrap();
         assert!(c.required); // default_true
         assert_eq!(c.timeout_sec, 120); // default_timeout
@@ -6793,7 +6794,10 @@ Time:        3.456 s
         ],"require_all":false}"#;
         let v: VerifierKind = serde_json::from_str(json).unwrap();
         match v {
-            VerifierKind::Composite { criteria, require_all } => {
+            VerifierKind::Composite {
+                criteria,
+                require_all,
+            } => {
                 assert_eq!(criteria.len(), 1);
                 assert!(!require_all);
             }

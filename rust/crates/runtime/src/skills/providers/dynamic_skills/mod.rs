@@ -67,8 +67,13 @@ mod tests {
     #[test]
     fn individual_skill_names_present() {
         let all = all_dynamic_skills().join("\n");
-        for name in ["batch", "debug", "reflect", "review", "skillify", "stuck", "verify", "remember"] {
-            assert!(all.contains(&format!("name: {name}")), "missing skill: {name}");
+        for name in [
+            "batch", "debug", "reflect", "review", "skillify", "stuck", "verify", "remember",
+        ] {
+            assert!(
+                all.contains(&format!("name: {name}")),
+                "missing skill: {name}"
+            );
         }
     }
 }

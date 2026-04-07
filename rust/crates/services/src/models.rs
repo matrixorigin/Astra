@@ -1027,17 +1027,15 @@ mod tests {
 
     #[test]
     fn quirks_data_extra_unknown_fields_ignored() {
-        let q: QuirksData = serde_json::from_str(
-            r#"{"no_system_message": true, "unknown_future_field": 42}"#,
-        )
-        .unwrap();
+        let q: QuirksData =
+            serde_json::from_str(r#"{"no_system_message": true, "unknown_future_field": 42}"#)
+                .unwrap();
         assert!(q.no_system_message);
     }
 
     #[test]
     fn quirks_data_wrong_type_for_bool_field_fails() {
-        let result: Result<QuirksData, _> =
-            serde_json::from_str(r#"{"no_system_message": "yes"}"#);
+        let result: Result<QuirksData, _> = serde_json::from_str(r#"{"no_system_message": "yes"}"#);
         assert!(result.is_err());
     }
 

@@ -77,7 +77,7 @@ impl ToolExecutor {
         // Skip for non-existent paths (let the caller produce a clear NotFound).
         if resolved.exists() {
             match resolved.canonicalize() {
-                Ok(_) => {} // reachable — no loop
+                Ok(_) => {}                                              // reachable — no loop
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {} // race — let caller handle
                 Err(e) => {
                     return Err(format!(
@@ -300,8 +300,8 @@ impl ToolExecutor {
 
                         // No outline available — return truncated content with hint
                         let limit = self.scaled_output_limit();
-                        let truncated = &content_for_outline
-                            [..content_for_outline.floor_char_boundary(limit)];
+                        let truncated =
+                            &content_for_outline[..content_for_outline.floor_char_boundary(limit)];
                         let numbered = add_line_numbers(truncated, 1);
                         return format!(
                             "{numbered}\n[Auto-truncated — aggregate output budget is high \
@@ -2430,7 +2430,9 @@ type Handler interface {
         let file_path = dir.path().join("big.txt");
         // Must be >8KB to avoid auto-expand
         let mut f = std::fs::File::create(&file_path).unwrap();
-        for i in 0..500 { writeln!(f, "line {i}: {}", "x".repeat(80)).unwrap(); }
+        for i in 0..500 {
+            writeln!(f, "line {i}: {}", "x".repeat(80)).unwrap();
+        }
         drop(f);
 
         let executor = test_executor_in(dir.path());
@@ -2461,10 +2463,14 @@ type Handler interface {
         let file_b = dir.path().join("b.txt");
         // Files must be >8KB to avoid auto-expand upgrading ranged reads to full reads
         let mut f = std::fs::File::create(&file_a).unwrap();
-        for i in 0..500 { writeln!(f, "a line {i}: {}", "x".repeat(80)).unwrap(); }
+        for i in 0..500 {
+            writeln!(f, "a line {i}: {}", "x".repeat(80)).unwrap();
+        }
         drop(f);
         let mut f = std::fs::File::create(&file_b).unwrap();
-        for i in 0..500 { writeln!(f, "b line {i}: {}", "x".repeat(80)).unwrap(); }
+        for i in 0..500 {
+            writeln!(f, "b line {i}: {}", "x".repeat(80)).unwrap();
+        }
         drop(f);
 
         let executor = test_executor_in(dir.path());
@@ -2533,11 +2539,7 @@ type Handler interface {
     fn read_file_consecutive_identical_outline_dedups() {
         let dir = tempfile::tempdir().unwrap();
         let file_path = dir.path().join("o.rs");
-        std::fs::write(
-            &file_path,
-            "fn alpha() {}\nfn beta() {}\n",
-        )
-        .unwrap();
+        std::fs::write(&file_path, "fn alpha() {}\nfn beta() {}\n").unwrap();
 
         let executor = test_executor_in(dir.path());
         let args = serde_json::json!({ "path": "o.rs", "outline": true });
@@ -3480,11 +3482,7 @@ type Handler interface {
         let exe = test_executor_in(dir.path());
 
         let path = dir.path().join("big.rs");
-        std::fs::write(
-            &path,
-            "pub fn foo() {}\npub fn bar() {}\npub fn baz() {}\n",
-        )
-        .unwrap();
+        std::fs::write(&path, "pub fn foo() {}\npub fn bar() {}\npub fn baz() {}\n").unwrap();
 
         // Read with outline=true (partial view)
         exe.read_file(&json!({"path": "big.rs", "outline": true}));
@@ -3546,9 +3544,7 @@ type Handler interface {
 
         // Simulate: skill execution loaded and returned the file content.
         // The skill runner calls register_external_read.
-        exe.register_external_read(std::path::Path::new(
-            ".astra/skills/say-hello/SKILL.md",
-        ));
+        exe.register_external_read(std::path::Path::new(".astra/skills/say-hello/SKILL.md"));
 
         // Now write_file should succeed without explicit read_file
         let result = exe.write_file(&json!({
@@ -3716,8 +3712,7 @@ type Handler interface {
         assert!(r4.contains("Replaced"), "step 4: {r4}");
 
         // Verify final content
-        let on_disk =
-            std::fs::read_to_string(skill_dir.join("SKILL.md")).unwrap();
+        let on_disk = std::fs::read_to_string(skill_dir.join("SKILL.md")).unwrap();
         assert!(on_disk.contains("version: \"0.2.0\""));
         assert!(on_disk.contains("1. Greet user warmly"));
     }
@@ -3738,9 +3733,7 @@ type Handler interface {
         .unwrap();
 
         // Skill execution loads the file and registers it
-        exe.register_external_read(std::path::Path::new(
-            ".astra/skills/say-hello/SKILL.md",
-        ));
+        exe.register_external_read(std::path::Path::new(".astra/skills/say-hello/SKILL.md"));
 
         // LLM can now edit immediately — no read_file needed!
         let r1 = exe.str_replace(&json!({

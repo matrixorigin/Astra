@@ -98,8 +98,8 @@ impl AgenticLoopHost for SubRunHost {
         if let Some(ref agent_type) = self.agent_type {
             payload["agent_type"] = json!(agent_type);
         }
-        payload["skill_search"] = serde_json::to_value(&state.skill_search)
-            .unwrap_or_else(|_| json!({}));
+        payload["skill_search"] =
+            serde_json::to_value(&state.skill_search).unwrap_or_else(|_| json!({}));
 
         // Attach tool schemas directly (no selector).
         astra_runtime::turn::agentic_prepare_payload::apply_selector_hints_then_attach_filtered_edge_tools(

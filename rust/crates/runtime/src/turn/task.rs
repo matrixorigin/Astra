@@ -77,7 +77,12 @@ mod tests {
     fn classify_file_extension_various() {
         for ext in &[".py", ".go", ".ts", ".js", ".java", ".cpp", ".rb"] {
             let msgs = vec![make_msg("user", &format!("Check {}", ext))];
-            assert_eq!(classify_task(&msgs), Some("code".into()), "failed for {}", ext);
+            assert_eq!(
+                classify_task(&msgs),
+                Some("code".into()),
+                "failed for {}",
+                ext
+            );
         }
     }
 
@@ -85,7 +90,12 @@ mod tests {
     fn classify_reasoning_keywords() {
         for keyword in &["explain", "analyze", "reason", "compare"] {
             let msgs = vec![make_msg("user", &format!("Please {} this", keyword))];
-            assert_eq!(classify_task(&msgs), Some("reasoning".into()), "failed for {}", keyword);
+            assert_eq!(
+                classify_task(&msgs),
+                Some("reasoning".into()),
+                "failed for {}",
+                keyword
+            );
         }
     }
 

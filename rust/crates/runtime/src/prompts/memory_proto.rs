@@ -607,11 +607,7 @@ mod tests {
 
     #[test]
     fn filter_ns_status_matches() {
-        let contents = vec![
-            "[@task/pending] A",
-            "[@task/done] B",
-            "[@task/pending] C",
-        ];
+        let contents = vec!["[@task/pending] A", "[@task/done] B", "[@task/pending] C"];
         let result = filter_ns_status(&contents, "task", "pending");
         assert_eq!(result.len(), 2);
     }

@@ -108,8 +108,7 @@ mod tests {
     #[test]
     fn merge_all_none_returns_none() {
         let skills = vec!["a".into()];
-        let (_, merged, act) =
-            merge_skill_instruction_bodies_for_chat(&skills, |_| Ok(None));
+        let (_, merged, act) = merge_skill_instruction_bodies_for_chat(&skills, |_| Ok(None));
         assert!(merged.is_none());
         assert!(act.is_empty());
     }
@@ -126,8 +125,7 @@ mod tests {
     #[test]
     fn merge_empty_skills_vec() {
         let skills: Vec<String> = vec![];
-        let (out, merged, act) =
-            merge_skill_instruction_bodies_for_chat(&skills, |_| Ok(None));
+        let (out, merged, act) = merge_skill_instruction_bodies_for_chat(&skills, |_| Ok(None));
         assert!(out.is_empty());
         assert!(merged.is_none());
         assert!(act.is_empty());

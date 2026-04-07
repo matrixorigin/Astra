@@ -52,12 +52,18 @@ mod tests {
 
     #[test]
     fn sse_code_unauthorized() {
-        assert_eq!(status_to_sse_error_code(StatusCode::UNAUTHORIZED), "AUTH_ERROR");
+        assert_eq!(
+            status_to_sse_error_code(StatusCode::UNAUTHORIZED),
+            "AUTH_ERROR"
+        );
     }
 
     #[test]
     fn sse_code_forbidden() {
-        assert_eq!(status_to_sse_error_code(StatusCode::FORBIDDEN), "AUTH_ERROR");
+        assert_eq!(
+            status_to_sse_error_code(StatusCode::FORBIDDEN),
+            "AUTH_ERROR"
+        );
     }
 
     #[test]

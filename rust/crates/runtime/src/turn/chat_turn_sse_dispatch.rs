@@ -621,8 +621,14 @@ mod tests {
         let mut a = ChatTurnSseAccum::default();
         let block = format!(
             "{}{}",
-            sse("usage", ",\"prompt_tokens\":100,\"completion_tokens\":50,\"cache_read_tokens\":30,\"cache_creation_tokens\":10"),
-            sse("usage", ",\"prompt_tokens\":200,\"completion_tokens\":80,\"cache_read_tokens\":60,\"cache_creation_tokens\":0"),
+            sse(
+                "usage",
+                ",\"prompt_tokens\":100,\"completion_tokens\":50,\"cache_read_tokens\":30,\"cache_creation_tokens\":10"
+            ),
+            sse(
+                "usage",
+                ",\"prompt_tokens\":200,\"completion_tokens\":80,\"cache_read_tokens\":60,\"cache_creation_tokens\":0"
+            ),
         );
         dispatch_chat_turn_sse_event_block(&block, &mut a, &mut vec![]);
         assert_eq!(a.prompt_tokens, 200);
@@ -822,8 +828,7 @@ mod tests {
     #[test]
     fn done_only_block_is_noop() {
         let mut a = ChatTurnSseAccum::default();
-        let efx =
-            dispatch_chat_turn_sse_event_block("data: [DONE]\n\n", &mut a, &mut vec![]);
+        let efx = dispatch_chat_turn_sse_event_block("data: [DONE]\n\n", &mut a, &mut vec![]);
         assert!(efx.is_empty());
         assert!(!a.has_usage);
     }
@@ -831,14 +836,14 @@ mod tests {
     #[test]
     fn invalid_json_sets_error() {
         let mut a = ChatTurnSseAccum::default();
-        let efx = dispatch_chat_turn_sse_event_block(
-            "data: {not valid json}\n\n",
-            &mut a,
-            &mut vec![],
-        );
+        let efx =
+            dispatch_chat_turn_sse_event_block("data: {not valid json}\n\n", &mut a, &mut vec![]);
         assert!(a.error_message.as_ref().unwrap().contains("invalid JSON"));
         // Should also emit StopThinkingSpinner
-        assert!(efx.iter().any(|e| matches!(e, SseRenderEffect::StopThinkingSpinner)));
+        assert!(
+            efx.iter()
+                .any(|e| matches!(e, SseRenderEffect::StopThinkingSpinner))
+        );
     }
 
     #[test]
@@ -857,11 +862,7 @@ mod tests {
     #[test]
     fn event_missing_type_field_treated_as_unknown() {
         let mut a = ChatTurnSseAccum::default();
-        dispatch_chat_turn_sse_event_block(
-            "data: {\"run_id\":\"r1\"}\n\n",
-            &mut a,
-            &mut vec![],
-        );
+        dispatch_chat_turn_sse_event_block("data: {\"run_id\":\"r1\"}\n\n", &mut a, &mut vec![]);
         // Missing "type" → unwrap_or("") → falls into _ arm → extracts run_id
         assert_eq!(a.run_id.as_deref(), Some("r1"));
     }
@@ -906,24 +907,20 @@ mod tests {
     #[test]
     fn turn_complete_missing_has_tool_calls_defaults_false() {
         let mut a = ChatTurnSseAccum::default();
-        dispatch_chat_turn_sse_event_block(
-            &sse("turn_complete", ""),
-            &mut a,
-            &mut vec![],
-        );
+        dispatch_chat_turn_sse_event_block(&sse("turn_complete", ""), &mut a, &mut vec![]);
         assert!(!a.has_tool_calls);
     }
 
     #[test]
     fn thinking_delta_missing_content_no_panic() {
         let mut a = ChatTurnSseAccum::default();
-        let efx = dispatch_chat_turn_sse_event_block(
-            &sse("thinking_delta", ""),
-            &mut a,
-            &mut vec![],
-        );
+        let efx =
+            dispatch_chat_turn_sse_event_block(&sse("thinking_delta", ""), &mut a, &mut vec![]);
         assert_eq!(a.reasoning_content, "");
-        assert!(efx.iter().any(|e| matches!(e, SseRenderEffect::StartThinkingSpinner)));
+        assert!(
+            efx.iter()
+                .any(|e| matches!(e, SseRenderEffect::StartThinkingSpinner))
+        );
     }
 
     #[test]
@@ -935,8 +932,14 @@ mod tests {
             &mut vec![],
         );
         // Empty content: spinner started but no ThinkingPreviewChunk emitted
-        assert!(efx.iter().any(|e| matches!(e, SseRenderEffect::StartThinkingSpinner)));
-        assert!(!efx.iter().any(|e| matches!(e, SseRenderEffect::ThinkingPreviewChunk(_))));
+        assert!(
+            efx.iter()
+                .any(|e| matches!(e, SseRenderEffect::StartThinkingSpinner))
+        );
+        assert!(
+            !efx.iter()
+                .any(|e| matches!(e, SseRenderEffect::ThinkingPreviewChunk(_)))
+        );
     }
 
     #[test]
