@@ -11,7 +11,7 @@ make test
 # Same as make test plus ignored Matrix E2E + astra-services multi-agent integration
 make test-integration
 
-# Narrow contract smoke (HTTP, admin, config — real routing, stub deps where the test builds AppState)
+# Narrow contract smoke (HTTP + admin integration binaries; settings JSON via astra-core lib tests)
 make test-contract
 
 # Static validation

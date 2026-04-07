@@ -444,9 +444,10 @@ test-integration:
 
 .PHONY: test-contract
 test-contract:
-	@echo "Running core HTTP contract binaries (http/admin/config)..."
+	@echo "Running core HTTP contract binaries (http/admin) + astra-core settings JSON contract..."
 	@$(CARGO) test $(CARGO_MANIFEST_FLAG) $(API_SHELL_PKG) \
-		--test http_contract --test admin_contract --test config_contract
+		--test http_contract --test admin_contract
+	@$(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-core --lib settings_contract_tests
 
 # ============================================================================
 # Code Quality
