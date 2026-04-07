@@ -42,7 +42,7 @@ Eight tests total — overlap with the full journey is avoided (e.g. no separate
 
 | Test name | File / module | Scope |
 |-----------|---------------|-------|
-| `product_matrix_api_journey_hits_multiple_tables` | `journey_full.rs` | Full journey: sessions (list/get/put, close/resume, activity, **platform snapshot**), agents, events, context, decisions, memory proxy, edge, jobs, sandbox, triggers, skills, introspection, learning, evaluation reads, marketplace probe, `chat/turn` SSE + `agent_events`, audit/replay, logout |
+| `product_matrix_api_journey_hits_multiple_tables` | `journey_full.rs` | Full journey: sessions (list/get/put, close/resume, activity, **platform snapshot**), agents, events, context, decisions, memory proxy, edge, jobs, sandbox, triggers, skills, introspection, learning (signals/stats + **POST /api/v1/learning/feedback** after `chat/turn`), evaluation reads, marketplace probe, `chat/turn` SSE + `agent_events`, audit/replay, logout |
 | `e2e_matrix_tasks_lease_and_db_assertions` | `journey_tasks_runs.rs` | `POST /tasks`, `GET /tasks`, `GET /tasks/{id}`, `GET .../progress`, `agent_tasks`; edge register; lease claim / `GET` lease / renew / release; `task_leases`; `PUT /tasks/{id}/status` |
 | `e2e_matrix_chat_run_pause_resume_http` | `journey_tasks_runs.rs` | `POST /chat` (background run), `POST .../pause`, `GET /chat/runs/{id}`, `POST .../resume` |
 | `e2e_matrix_session_cancel_delete` | `journey_extended.rs` | `POST /sessions/{id}/cancel` + `agent_sessions.status`, `DELETE /sessions/{id}` |
