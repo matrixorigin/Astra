@@ -123,7 +123,10 @@ fn create_tool_selector_with_quality_internal(
             };
             tokio::task::block_in_place(|| {
                 handle.block_on(async {
-                    mcp_manager.write().await.set_sampling_config(Some(sampling));
+                    mcp_manager
+                        .write()
+                        .await
+                        .set_sampling_config(Some(sampling));
                 })
             });
         }

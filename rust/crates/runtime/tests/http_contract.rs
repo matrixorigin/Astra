@@ -214,8 +214,7 @@ async fn learning_routes_match_shared_contract_when_authenticated() {
     assert_eq!(status.as_u16(), contract.learning_signals.status);
     assert_eq!(json, contract.learning_signals.json);
 
-    let (status, json) =
-        read_json_with_headers(app.clone(), "/api/v1/learning/stats", auth).await;
+    let (status, json) = read_json_with_headers(app.clone(), "/api/v1/learning/stats", auth).await;
     assert_eq!(status.as_u16(), contract.learning_stats.status);
     assert_eq!(json, contract.learning_stats.json);
 

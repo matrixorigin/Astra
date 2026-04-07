@@ -1,7 +1,7 @@
 use super::*;
-use clap::CommandFactory;
 use crate::permission_manager::PermissionMode;
 use astra_thin_client::paths;
+use clap::CommandFactory;
 use std::io::Read;
 
 /// Exit codes for CLI commands (for scripting integration)
@@ -37,10 +37,9 @@ pub(super) async fn execute_cli_command(
 
         // Start embedded HTTP API server
         Some(Command::Serve(args)) => {
-            let addr: std::net::SocketAddr =
-                format!("{}:{}", args.host, args.port)
-                    .parse()
-                    .map_err(|e| format!("Invalid listen address: {e}"))?;
+            let addr: std::net::SocketAddr = format!("{}:{}", args.host, args.port)
+                .parse()
+                .map_err(|e| format!("Invalid listen address: {e}"))?;
             eprintln!("Starting API server on {addr} ...");
             astra_runtime::serve(addr)
                 .await
@@ -769,9 +768,12 @@ async fn run_doctor(api: &astra_thin_client::ThinClient, profile: Option<&str>) 
     let version = env!("CARGO_PKG_VERSION");
     println!("Version");
     println!("  Binary: {version}");
-    println!("  Executable: {}", std::env::current_exe()
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|_| "unknown".into()));
+    println!(
+        "  Executable: {}",
+        std::env::current_exe()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| "unknown".into())
+    );
     println!();
 
     // 2. API server connectivity
@@ -797,7 +799,8 @@ async fn run_doctor(api: &astra_thin_client::ThinClient, profile: Option<&str>) 
                 Ok(body) => {
                     // Try to extract username from JSON response
                     if let Ok(val) = serde_json::from_str::<serde_json::Value>(&body) {
-                        let user = val.get("username")
+                        let user = val
+                            .get("username")
                             .or_else(|| val.get("name"))
                             .and_then(|v| v.as_str())
                             .unwrap_or("authenticated");
@@ -808,7 +811,9 @@ async fn run_doctor(api: &astra_thin_client::ThinClient, profile: Option<&str>) 
                 }
                 Err(_) => {
                     println!("  Status: ⚠ Token may be expired");
-                    issues.push("Auth token may be expired — try `astra refresh` or `astra login`".into());
+                    issues.push(
+                        "Auth token may be expired — try `astra refresh` or `astra login`".into(),
+                    );
                 }
             }
         }
@@ -834,15 +839,22 @@ async fn run_doctor(api: &astra_thin_client::ThinClient, profile: Option<&str>) 
     // 5. MCP configuration
     println!("MCP Configuration");
     for (scope, path_fn) in &[
-        ("project", crate::manifest_loader::project_mcp_json_path as fn() -> Option<std::path::PathBuf>),
-        ("user", crate::manifest_loader::global_mcp_json_path as fn() -> Option<std::path::PathBuf>),
+        (
+            "project",
+            crate::manifest_loader::project_mcp_json_path as fn() -> Option<std::path::PathBuf>,
+        ),
+        (
+            "user",
+            crate::manifest_loader::global_mcp_json_path as fn() -> Option<std::path::PathBuf>,
+        ),
     ] {
         if let Some(path) = path_fn() {
             if path.is_file() {
                 match std::fs::read_to_string(&path) {
                     Ok(content) => match serde_json::from_str::<serde_json::Value>(&content) {
                         Ok(config) => {
-                            let count = config.get("mcpServers")
+                            let count = config
+                                .get("mcpServers")
                                 .and_then(|v| v.as_object())
                                 .map(|m| m.len())
                                 .unwrap_or(0);
@@ -908,8 +920,7 @@ fn read_mcp_config(path: &std::path::Path) -> Result<serde_json::Value, String> 
     }
     let content = std::fs::read_to_string(path)
         .map_err(|e| format!("Failed to read {}: {e}", path.display()))?;
-    serde_json::from_str(&content)
-        .map_err(|e| format!("Failed to parse {}: {e}", path.display()))
+    serde_json::from_str(&content).map_err(|e| format!("Failed to parse {}: {e}", path.display()))
 }
 
 /// Write config atomically (temp + rename).
@@ -920,8 +931,7 @@ fn write_mcp_config(path: &std::path::Path, config: &serde_json::Value) -> Resul
     }
     let tmp = path.with_extension("json.tmp");
     let pretty = serde_json::to_string_pretty(config).unwrap_or_default();
-    std::fs::write(&tmp, &pretty)
-        .map_err(|e| format!("Failed to write {}: {e}", tmp.display()))?;
+    std::fs::write(&tmp, &pretty).map_err(|e| format!("Failed to write {}: {e}", tmp.display()))?;
     std::fs::rename(&tmp, path).map_err(|e| {
         let _ = std::fs::remove_file(&tmp);
         format!("Failed to rename to {}: {e}", path.display())
@@ -967,10 +977,7 @@ fn mcp_list(scope: &str) -> Result<(), String> {
                 .unwrap_or("-")
                 .to_string(),
             _ => {
-                let cmd = entry
-                    .get("command")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("-");
+                let cmd = entry.get("command").and_then(|v| v.as_str()).unwrap_or("-");
                 let args = entry
                     .get("args")
                     .and_then(|v| v.as_array())
@@ -990,10 +997,7 @@ fn mcp_list(scope: &str) -> Result<(), String> {
         };
         println!("{:<20} {:<8} {}", name, server_type, detail);
     }
-    println!(
-        "\nConfig file: {}",
-        path.display()
-    );
+    println!("\nConfig file: {}", path.display());
     Ok(())
 }
 
@@ -1029,8 +1033,8 @@ fn mcp_add(name: &str, command: &str, args: &[String], scope: &str) -> Result<()
 }
 
 fn mcp_add_json(name: &str, json: &str, scope: &str) -> Result<(), String> {
-    let entry: serde_json::Value = serde_json::from_str(json)
-        .map_err(|e| format!("Invalid JSON: {e}"))?;
+    let entry: serde_json::Value =
+        serde_json::from_str(json).map_err(|e| format!("Invalid JSON: {e}"))?;
     if !entry.is_object() {
         return Err("JSON config must be an object".to_string());
     }
@@ -1117,8 +1121,7 @@ fn mcp_get(name: &str) -> Result<(), String> {
                         println!("  Command: {cmd}");
                     }
                     if let Some(args) = entry.get("args").and_then(|v| v.as_array()) {
-                        let args_str: Vec<&str> =
-                            args.iter().filter_map(|v| v.as_str()).collect();
+                        let args_str: Vec<&str> = args.iter().filter_map(|v| v.as_str()).collect();
                         println!("  Args: {}", args_str.join(" "));
                     }
                 }
@@ -1129,10 +1132,7 @@ fn mcp_get(name: &str) -> Result<(), String> {
                     println!("    {k}={}", v.as_str().unwrap_or(&v.to_string()));
                 }
             }
-            println!(
-                "\nTo remove: astra mcp remove \"{}\" -s {scope}",
-                name
-            );
+            println!("\nTo remove: astra mcp remove \"{}\" -s {scope}", name);
             return Ok(());
         }
     }
@@ -1160,11 +1160,7 @@ mod mcp_cli_tests {
     #[test]
     fn read_mcp_config_valid() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
-        std::fs::write(
-            tmp.path(),
-            r#"{"mcpServers":{"test":{"command":"echo"}}}"#,
-        )
-        .unwrap();
+        std::fs::write(tmp.path(), r#"{"mcpServers":{"test":{"command":"echo"}}}"#).unwrap();
         let config = read_mcp_config(tmp.path()).unwrap();
         assert!(config["mcpServers"]["test"]["command"] == "echo");
     }
@@ -1225,10 +1221,12 @@ mod mcp_cli_tests {
 
         // Verify it's gone
         let config = read_mcp_config(&path).unwrap();
-        assert!(!config["mcpServers"]
-            .as_object()
-            .unwrap()
-            .contains_key("test-server"));
+        assert!(
+            !config["mcpServers"]
+                .as_object()
+                .unwrap()
+                .contains_key("test-server")
+        );
     }
 
     #[test]
@@ -1264,10 +1262,7 @@ mod mcp_cli_tests {
     fn mcp_add_duplicate_detection() {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("mcp.json");
-        make_config(
-            &path,
-            serde_json::json!({"existing": {"command": "echo"}}),
-        );
+        make_config(&path, serde_json::json!({"existing": {"command": "echo"}}));
 
         let config = read_mcp_config(&path).unwrap();
         let has_existing = config["mcpServers"]
@@ -1332,7 +1327,10 @@ mod mcp_cli_tests {
         // stdio type inference
         let stdio = &servers["stdio-srv"];
         assert_eq!(
-            stdio.get("type").and_then(|v| v.as_str()).unwrap_or("stdio"),
+            stdio
+                .get("type")
+                .and_then(|v| v.as_str())
+                .unwrap_or("stdio"),
             "stdio"
         );
 

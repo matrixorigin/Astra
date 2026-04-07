@@ -133,7 +133,9 @@ mod tests {
 
     #[test]
     fn truncate_chars_limits_to_max_unicode_scalars() {
-        let s: String = (0..250).map(|i| char::from(b'a' + (i % 26) as u8)).collect();
+        let s: String = (0..250)
+            .map(|i| char::from(b'a' + (i % 26) as u8))
+            .collect();
         let t = truncate_chars(&s, ERROR_PREVIEW_MAX_CHARS);
         assert_eq!(t.chars().count(), ERROR_PREVIEW_MAX_CHARS);
     }
@@ -149,11 +151,14 @@ mod tests {
     #[test]
     fn dump_to_json_includes_all_fields() {
         let dump = build_llm_request_dump(
-            "sess-1", "kimi-k2.5", "moonshot",
+            "sess-1",
+            "kimi-k2.5",
+            "moonshot",
             "LLM error 400: thinking is enabled but reasoning_content is missing",
             &[json!({"role": "user", "content": "hi"})],
             &[json!({"type": "function", "function": {"name": "bash"}})],
-            2, Some(8192),
+            2,
+            Some(8192),
         );
         let j = dump.to_json();
         assert_eq!(j["session_id"], "sess-1");

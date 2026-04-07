@@ -313,7 +313,8 @@ impl ClientHandler for ChangeHandler {
         &self,
         params: CreateMessageRequestParams,
         _context: RequestContext<RoleClient>,
-    ) -> impl std::future::Future<Output = Result<CreateMessageResult, McpHandlerError>> + Send + '_ {
+    ) -> impl std::future::Future<Output = Result<CreateMessageResult, McpHandlerError>> + Send + '_
+    {
         let sampling = self.sampling.clone();
         async move {
             let config = sampling.ok_or_else(|| {
@@ -335,7 +336,8 @@ impl ClientHandler for ChangeHandler {
     fn list_roots(
         &self,
         _context: RequestContext<RoleClient>,
-    ) -> impl std::future::Future<Output = Result<ListRootsResult, McpHandlerError>> + Send + '_ {
+    ) -> impl std::future::Future<Output = Result<ListRootsResult, McpHandlerError>> + Send + '_
+    {
         let roots = self.roots.clone();
         async move {
             let r = roots.read().await;
@@ -397,7 +399,10 @@ async fn do_sampling(
 
     if let Some(system) = &params.system_prompt {
         if let Some(arr) = body["messages"].as_array_mut() {
-            arr.insert(0, serde_json::json!({ "role": "system", "content": system }));
+            arr.insert(
+                0,
+                serde_json::json!({ "role": "system", "content": system }),
+            );
         }
     }
     if let Some(temp) = params.temperature {
@@ -418,13 +423,9 @@ async fn do_sampling(
         .and_then(|a| a.first())
         .ok_or_else(|| McpHandlerError::internal_error("no choices in LLM response", None))?;
 
-    let text = choice["message"]["content"]
-        .as_str()
-        .unwrap_or("");
+    let text = choice["message"]["content"].as_str().unwrap_or("");
 
-    let finish_reason = choice["finish_reason"]
-        .as_str()
-        .unwrap_or("endTurn");
+    let finish_reason = choice["finish_reason"].as_str().unwrap_or("endTurn");
 
     let stop_reason = match finish_reason {
         "stop" => CreateMessageResult::STOP_REASON_END_TURN,
@@ -433,9 +434,7 @@ async fn do_sampling(
         other => other,
     };
 
-    let model_name = resp["model"]
-        .as_str()
-        .unwrap_or(&config.model);
+    let model_name = resp["model"].as_str().unwrap_or(&config.model);
 
     Ok(CreateMessageResult::new(
         SamplingMessage::assistant_text(text),
@@ -455,7 +454,10 @@ fn enum_schema_values(schema: &rmcp::model::EnumSchema) -> Vec<String> {
     };
     // Legacy / untitled: has "enum" array
     if let Some(arr) = json.get("enum").and_then(|v| v.as_array()) {
-        return arr.iter().filter_map(|v| v.as_str().map(String::from)).collect();
+        return arr
+            .iter()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect();
     }
     // Titled: has "oneOf" with "const" values
     if let Some(arr) = json.get("oneOf").and_then(|v| v.as_array()) {
@@ -580,9 +582,9 @@ async fn do_elicitation(
                         .unwrap_or("str");
 
                     let value = match kind {
-                        "bool" => serde_json::Value::Bool(
-                            matches!(trimmed, "true" | "yes" | "1" | "y"),
-                        ),
+                        "bool" => {
+                            serde_json::Value::Bool(matches!(trimmed, "true" | "yes" | "1" | "y"))
+                        }
                         "int" => match trimmed.parse::<i64>() {
                             Ok(n) => serde_json::Value::Number(n.into()),
                             Err(_) => serde_json::Value::String(trimmed.to_string()),
@@ -590,9 +592,7 @@ async fn do_elicitation(
                         "num" => match trimmed.parse::<f64>() {
                             Ok(n) => serde_json::Number::from_f64(n)
                                 .map(serde_json::Value::Number)
-                                .unwrap_or_else(|| {
-                                    serde_json::Value::String(trimmed.to_string())
-                                }),
+                                .unwrap_or_else(|| serde_json::Value::String(trimmed.to_string())),
                             Err(_) => serde_json::Value::String(trimmed.to_string()),
                         },
                         _ => serde_json::Value::String(trimmed.to_string()),
@@ -614,9 +614,7 @@ async fn do_elicitation(
                 ))
             })
         }
-        CreateElicitationRequestParams::UrlElicitationParams {
-            message, url, ..
-        } => {
+        CreateElicitationRequestParams::UrlElicitationParams { message, url, .. } => {
             tokio::task::spawn_blocking(move || {
                 use std::io::BufRead;
                 let stdin = std::io::stdin();
@@ -1239,9 +1237,7 @@ impl McpClientManager {
             let result = conn.ping().await;
             results.push((
                 name.clone(),
-                result
-                    .map(|_| start.elapsed())
-                    .map_err(McpError::Service),
+                result.map(|_| start.elapsed()).map_err(McpError::Service),
             ));
         }
         results
@@ -1308,14 +1304,15 @@ impl McpClientManager {
             .insert(name.to_string(), ConnectionState::Reconnecting);
 
         // Reconnect with retry
-        let connection = match connect_to_server(config, self.sampling.clone(), self.roots.clone()).await {
-            Ok(conn) => conn,
-            Err(e) => {
-                self.states
-                    .insert(name.to_string(), ConnectionState::Failed);
-                return Err(e);
-            }
-        };
+        let connection =
+            match connect_to_server(config, self.sampling.clone(), self.roots.clone()).await {
+                Ok(conn) => conn,
+                Err(e) => {
+                    self.states
+                        .insert(name.to_string(), ConnectionState::Failed);
+                    return Err(e);
+                }
+            };
         self.states
             .insert(name.to_string(), ConnectionState::Connected);
         let conn = Arc::new(connection);
@@ -1446,7 +1443,16 @@ async fn connect_once(
 ) -> Result<McpConnection, McpError> {
     match &config.transport {
         Transport::Stdio { command, args, env } => {
-            connect_stdio(&config.name, command, args, env, config.clone(), sampling, roots.clone()).await
+            connect_stdio(
+                &config.name,
+                command,
+                args,
+                env,
+                config.clone(),
+                sampling,
+                roots.clone(),
+            )
+            .await
         }
         Transport::Sse {
             url,
@@ -1513,7 +1519,8 @@ async fn connect_stdio(
     let transport = TokioChildProcess::new(cmd).map_err(|e| McpError::Spawn(e.to_string()))?;
 
     // Connect as MCP client with change notification handler
-    let (handler, tools_changed, prompts_changed, resources_changed) = ChangeHandler::new(sampling, roots);
+    let (handler, tools_changed, prompts_changed, resources_changed) =
+        ChangeHandler::new(sampling, roots);
     let running = serve_client(handler, transport)
         .await
         .map_err(|e| McpError::Initialize(e.to_string()))?;
@@ -1578,7 +1585,8 @@ async fn connect_sse(
     let transport = StreamableHttpClientTransport::from_config(transport_config);
 
     // Connect as MCP client with change notification handler
-    let (handler, tools_changed, prompts_changed, resources_changed) = ChangeHandler::new(sampling, roots);
+    let (handler, tools_changed, prompts_changed, resources_changed) =
+        ChangeHandler::new(sampling, roots);
     let running = serve_client(handler, transport)
         .await
         .map_err(|e| McpError::Initialize(format!("SSE connect to {url}: {e}")))?;
@@ -1710,7 +1718,8 @@ async fn connect_ws(
     });
 
     // Connect as MCP client with change notification handler
-    let (handler, tools_changed, prompts_changed, resources_changed) = ChangeHandler::new(sampling, roots);
+    let (handler, tools_changed, prompts_changed, resources_changed) =
+        ChangeHandler::new(sampling, roots);
     let running = serve_client(handler, (rmcp_read, rmcp_write))
         .await
         .map_err(|e| McpError::Initialize(format!("MCP init over WebSocket {url}: {e}")))?;
@@ -2661,7 +2670,8 @@ mcp_servers:
 
     #[test]
     fn change_handler_initial_state() {
-        let (_handler, tools, prompts, resources) = ChangeHandler::new(None, Arc::new(RwLock::new(Vec::new())));
+        let (_handler, tools, prompts, resources) =
+            ChangeHandler::new(None, Arc::new(RwLock::new(Vec::new())));
         assert!(!tools.load(Ordering::Acquire));
         assert!(!prompts.load(Ordering::Acquire));
         assert!(!resources.load(Ordering::Acquire));
@@ -2669,28 +2679,32 @@ mcp_servers:
 
     #[test]
     fn change_handler_sets_tools_flag() {
-        let (handler, tools, _prompts, _resources) = ChangeHandler::new(None, Arc::new(RwLock::new(Vec::new())));
+        let (handler, tools, _prompts, _resources) =
+            ChangeHandler::new(None, Arc::new(RwLock::new(Vec::new())));
         handler.tools_changed.store(true, Ordering::Release);
         assert!(tools.load(Ordering::Acquire));
     }
 
     #[test]
     fn change_handler_sets_prompts_flag() {
-        let (handler, _tools, prompts, _resources) = ChangeHandler::new(None, Arc::new(RwLock::new(Vec::new())));
+        let (handler, _tools, prompts, _resources) =
+            ChangeHandler::new(None, Arc::new(RwLock::new(Vec::new())));
         handler.prompts_changed.store(true, Ordering::Release);
         assert!(prompts.load(Ordering::Acquire));
     }
 
     #[test]
     fn change_handler_sets_resources_flag() {
-        let (handler, _tools, _prompts, resources) = ChangeHandler::new(None, Arc::new(RwLock::new(Vec::new())));
+        let (handler, _tools, _prompts, resources) =
+            ChangeHandler::new(None, Arc::new(RwLock::new(Vec::new())));
         handler.resources_changed.store(true, Ordering::Release);
         assert!(resources.load(Ordering::Acquire));
     }
 
     #[test]
     fn change_handler_flags_independent() {
-        let (handler, tools, prompts, resources) = ChangeHandler::new(None, Arc::new(RwLock::new(Vec::new())));
+        let (handler, tools, prompts, resources) =
+            ChangeHandler::new(None, Arc::new(RwLock::new(Vec::new())));
         handler.tools_changed.store(true, Ordering::Release);
         assert!(tools.load(Ordering::Acquire));
         assert!(!prompts.load(Ordering::Acquire));
@@ -2706,7 +2720,8 @@ mcp_servers:
 
     #[test]
     fn change_handler_clone_shares_flags() {
-        let (handler, tools, prompts, resources) = ChangeHandler::new(None, Arc::new(RwLock::new(Vec::new())));
+        let (handler, tools, prompts, resources) =
+            ChangeHandler::new(None, Arc::new(RwLock::new(Vec::new())));
         let cloned = handler.clone();
         cloned.tools_changed.store(true, Ordering::Release);
         cloned.prompts_changed.store(true, Ordering::Release);
@@ -2793,10 +2808,7 @@ mcp_servers:
         assert!(content.is_array());
         let part = &content[0];
         assert_eq!(part["type"], "image_url");
-        assert_eq!(
-            part["image_url"]["url"],
-            "data:image/png;base64,abc123"
-        );
+        assert_eq!(part["image_url"]["url"], "data:image/png;base64,abc123");
     }
 
     #[test]
@@ -2828,7 +2840,8 @@ mcp_servers:
             token: "tok".to_string(),
             model: "m".to_string(),
         };
-        let (handler, _t, _p, _r) = ChangeHandler::new(Some(Arc::new(config)), Arc::new(RwLock::new(Vec::new())));
+        let (handler, _t, _p, _r) =
+            ChangeHandler::new(Some(Arc::new(config)), Arc::new(RwLock::new(Vec::new())));
         assert!(handler.sampling.is_some());
     }
 
@@ -3026,11 +3039,9 @@ mcp_servers:
     #[test]
     fn complete_result_roundtrip() {
         use rmcp::model::{CompleteResult, CompletionInfo};
-        let info = CompletionInfo::with_all_values(vec![
-            "production".to_string(),
-            "preview".to_string(),
-        ])
-        .unwrap();
+        let info =
+            CompletionInfo::with_all_values(vec!["production".to_string(), "preview".to_string()])
+                .unwrap();
         let result = CompleteResult::new(info);
         let json = serde_json::to_string(&result).unwrap();
         let back: CompleteResult = serde_json::from_str(&json).unwrap();
@@ -3088,9 +3099,18 @@ mcp_servers:
         let (handler, _, _, _) = ChangeHandler::new(Some(sampling), roots);
 
         let info = handler.get_info();
-        assert!(info.capabilities.roots.is_some(), "roots should be advertised");
-        assert!(info.capabilities.sampling.is_some(), "sampling should be advertised");
-        assert!(info.capabilities.elicitation.is_some(), "elicitation should be advertised");
+        assert!(
+            info.capabilities.roots.is_some(),
+            "roots should be advertised"
+        );
+        assert!(
+            info.capabilities.sampling.is_some(),
+            "sampling should be advertised"
+        );
+        assert!(
+            info.capabilities.elicitation.is_some(),
+            "elicitation should be advertised"
+        );
 
         let roots_caps = info.capabilities.roots.unwrap();
         assert_eq!(roots_caps.list_changed, Some(true));
@@ -3106,7 +3126,10 @@ mcp_servers:
 
         let info = handler.get_info();
         assert!(info.capabilities.roots.is_some());
-        assert!(info.capabilities.sampling.is_none(), "sampling should NOT be advertised without config");
+        assert!(
+            info.capabilities.sampling.is_none(),
+            "sampling should NOT be advertised without config"
+        );
         assert!(info.capabilities.elicitation.is_some());
     }
 
@@ -3222,13 +3245,18 @@ mcp_servers:
         let ref_ = rmcp::model::Reference::for_prompt("test");
         let result = mgr.complete("nonexistent", ref_, "arg", "").await;
         assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), McpError::ServerNotConnected(_)));
+        assert!(matches!(
+            result.unwrap_err(),
+            McpError::ServerNotConnected(_)
+        ));
     }
 
     #[tokio::test]
     async fn manager_call_tool_not_found() {
         let mgr = McpClientManager::new();
-        let result = mgr.call_tool("nonexistent_tool", serde_json::json!({})).await;
+        let result = mgr
+            .call_tool("nonexistent_tool", serde_json::json!({}))
+            .await;
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), McpError::ToolNotFound(_)));
     }
@@ -3238,7 +3266,10 @@ mcp_servers:
         let mut mgr = McpClientManager::new();
         let result = mgr.reconnect("nonexistent").await;
         assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), McpError::ServerNotConnected(_)));
+        assert!(matches!(
+            result.unwrap_err(),
+            McpError::ServerNotConnected(_)
+        ));
     }
 
     // --- do_sampling response parsing tests ---
@@ -3261,7 +3292,10 @@ mcp_servers:
         let mut body = serde_json::json!({ "messages": converted });
         let system = "You are helpful";
         if let Some(arr) = body["messages"].as_array_mut() {
-            arr.insert(0, serde_json::json!({ "role": "system", "content": system }));
+            arr.insert(
+                0,
+                serde_json::json!({ "role": "system", "content": system }),
+            );
         }
         assert_eq!(body["messages"][0]["role"], "system");
         assert_eq!(body["messages"][0]["content"], system);

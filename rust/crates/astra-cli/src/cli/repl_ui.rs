@@ -91,7 +91,10 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
         "/skill",
         "Skill management: /skill [list|info|search|new|dev|test]",
     ),
-    ("/mcp", "MCP servers: /mcp [status|servers|prompts|resources|prompt|add|remove|ping|...]"),
+    (
+        "/mcp",
+        "MCP servers: /mcp [status|servers|prompts|resources|prompt|add|remove|ping|...]",
+    ),
     (
         "/report",
         "Show last delivery report (/report save = re-export JSON)",
@@ -266,7 +269,10 @@ const SLASH_FIRST_TOKEN_COMPLETIONS: &[(&str, &[(&str, &str)])] = &[
                 "Unsubscribe: /mcp unsubscribe <server>:<uri>",
             ),
             ("log-level", "Set level: /mcp log-level <server> <level>"),
-            ("complete", "Completions: /mcp complete <server>:prompt:<name> <arg> [value]"),
+            (
+                "complete",
+                "Completions: /mcp complete <server>:prompt:<name> <arg> [value]",
+            ),
             ("ping", "Ping: /mcp ping [server]"),
         ],
     ),

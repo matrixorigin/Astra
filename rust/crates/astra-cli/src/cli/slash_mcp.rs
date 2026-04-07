@@ -52,10 +52,20 @@ pub(super) async fn handle_mcp_command(arg: &str, state: &mut ReplState) -> Resu
         }
         s if s.starts_with("complete ") => handle_mcp_complete(&s[9..], state).await,
         "complete" => {
-            eprintln!("{}", "  Usage: /mcp complete <server>:<prompt|resource> <arg_name> [partial_value]".dim());
+            eprintln!(
+                "{}",
+                "  Usage: /mcp complete <server>:<prompt|resource> <arg_name> [partial_value]"
+                    .dim()
+            );
             eprintln!("{}", "  Examples:".dim());
-            eprintln!("{}", "    /mcp complete myserver:prompt:deploy env pr".dim());
-            eprintln!("{}", "    /mcp complete myserver:resource:file://path arg val".dim());
+            eprintln!(
+                "{}",
+                "    /mcp complete myserver:prompt:deploy env pr".dim()
+            );
+            eprintln!(
+                "{}",
+                "    /mcp complete myserver:resource:file://path arg val".dim()
+            );
         }
         s if s.starts_with("ping ") => handle_mcp_ping(Some(&s[5..]), state).await,
         "ping" => handle_mcp_ping(None, state).await,
@@ -926,7 +936,10 @@ async fn handle_mcp_complete(arg: &str, state: &ReplState) {
     let arg_value = if parts.len() > 2 { parts[2] } else { "" };
 
     let manager = state.mcp_manager.read().await;
-    match manager.complete(server, reference, arg_name, arg_value).await {
+    match manager
+        .complete(server, reference, arg_name, arg_value)
+        .await
+    {
         Ok(result) => {
             if result.completion.values.is_empty() {
                 eprintln!("{}", "  No completions available.".dim());
@@ -961,12 +974,10 @@ async fn handle_mcp_ping(server: Option<&str>, state: &ReplState) {
     }
 
     match server.map(str::trim) {
-        Some(name) if !name.is_empty() => {
-            match manager.ping(name).await {
-                Ok(d) => eprintln!("  ✓ {name}: {:.1}ms", d.as_secs_f64() * 1000.0),
-                Err(e) => eprintln!("{}", format!("  ✗ {name}: {e}").red()),
-            }
-        }
+        Some(name) if !name.is_empty() => match manager.ping(name).await {
+            Ok(d) => eprintln!("  ✓ {name}: {:.1}ms", d.as_secs_f64() * 1000.0),
+            Err(e) => eprintln!("{}", format!("  ✗ {name}: {e}").red()),
+        },
         _ => {
             let results = manager.ping_all().await;
             for (name, result) in results {
@@ -1075,10 +1086,7 @@ mod tests {
 
     #[test]
     fn format_duration_exactly_one_minute() {
-        assert_eq!(
-            format_duration(std::time::Duration::from_secs(60)),
-            "1m 0s"
-        );
+        assert_eq!(format_duration(std::time::Duration::from_secs(60)), "1m 0s");
     }
 
     // --- Resource URI parsing helpers (validate server:uri split logic) ---
@@ -1223,22 +1231,26 @@ mod tests {
             .as_object_mut()
             .unwrap()
             .remove("github");
-        assert!(!config["mcpServers"]
-            .as_object()
-            .unwrap()
-            .contains_key("github"));
-        assert!(config["mcpServers"]
-            .as_object()
-            .unwrap()
-            .contains_key("other"));
+        assert!(
+            !config["mcpServers"]
+                .as_object()
+                .unwrap()
+                .contains_key("github")
+        );
+        assert!(
+            config["mcpServers"]
+                .as_object()
+                .unwrap()
+                .contains_key("other")
+        );
     }
 
     #[test]
     fn mcp_add_malformed_json_fallback() {
         // Simulates: existing file has invalid JSON → falls back to empty config
         let content = "not valid json {{{";
-        let config: serde_json::Value = serde_json::from_str(content)
-            .unwrap_or_else(|_| serde_json::json!({"mcpServers": {}}));
+        let config: serde_json::Value =
+            serde_json::from_str(content).unwrap_or_else(|_| serde_json::json!({"mcpServers": {}}));
         assert!(config["mcpServers"].as_object().unwrap().is_empty());
     }
 
