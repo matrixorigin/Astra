@@ -938,90 +938,7 @@ pub(super) fn handle_session_command(arg: &str, state: &mut ReplState) {
                     target_sid.as_str().cyan()
                 );
             }
-            match session_journal::read_journal(&target_sid) {
-                Ok(events) if events.is_empty() => {
-                    eprintln!("{}", "  No journal entries to export.".dim());
-                }
-                Ok(events) => {
-                    // Export as markdown
-                    let mut md = format!("# Session: {target_sid}\n\n");
-                    for evt in &events {
-                        let ts_short = evt.ts.get(..19).unwrap_or(&evt.ts);
-                        match evt.event_type {
-                            session_journal::JournalEventType::SessionStart => {
-                                md.push_str(&format!(
-                                    "## Session Start\n- **Time:** {ts_short}\n- **Model:** {}\n\n",
-                                    evt.model.as_deref().unwrap_or("default")
-                                ));
-                            }
-                            session_journal::JournalEventType::Turn => {
-                                md.push_str(&format!("### Turn {}\n- **Time:** {ts_short}\n- **Duration:** {}ms\n- **Tokens:** {}→{}\n- **Tools:** {}\n\n**User:** {}\n\n**Assistant:** {}\n\n---\n\n",
-                                            evt.turn.unwrap_or(0),
-                                            evt.duration_ms.unwrap_or(0),
-                                            evt.tokens_in.unwrap_or(0),
-                                            evt.tokens_out.unwrap_or(0),
-                                            evt.tool_count.unwrap_or(0),
-                                            evt.user_input.as_deref().unwrap_or(""),
-                                            evt.assistant_output.as_deref().unwrap_or(""),
-                                        ));
-                            }
-                            session_journal::JournalEventType::TurnError => {
-                                md.push_str(&format!("### Turn {} ❌ Error\n- **Time:** {ts_short}\n- **Error:** {}\n\n---\n\n",
-                                            evt.turn.unwrap_or(0),
-                                            evt.error.as_deref().unwrap_or("unknown"),
-                                        ));
-                            }
-                            session_journal::JournalEventType::Compact => {
-                                md.push_str(&format!("### Compact\n- **Time:** {ts_short}\n- **Turns compacted:** {}\n- **Facts stored:** {}\n\n",
-                                            evt.turns_compacted.unwrap_or(0),
-                                            evt.facts_stored.unwrap_or(0),
-                                        ));
-                            }
-                            session_journal::JournalEventType::ConfigChange => {
-                                md.push_str(&format!(
-                                    "- ⚙️ {ts_short}: {} → {}\n",
-                                    evt.config_key.as_deref().unwrap_or("?"),
-                                    evt.config_value.as_deref().unwrap_or("?"),
-                                ));
-                            }
-                            session_journal::JournalEventType::SessionEnd => {
-                                md.push_str(&format!("## Session End\n- **Time:** {ts_short}\n- **Total turns:** {}\n",
-                                            evt.turn.unwrap_or(0),
-                                        ));
-                            }
-                            session_journal::JournalEventType::SessionFork => {
-                                let parent = evt
-                                    .session_lineage
-                                    .as_ref()
-                                    .map(|l| l.parent_session_id.as_str())
-                                    .unwrap_or("?");
-                                md.push_str(&format!(
-                                    "### Session fork\n- **Time:** {ts_short}\n- **Parent:** {parent}\n- **Note:** {}\n\n",
-                                    evt.user_input.as_deref().unwrap_or(""),
-                                ));
-                            }
-                            session_journal::JournalEventType::SyncMarker => {
-                                md.push_str(&format!(
-                                    "### Sync marker\n- **Time:** {ts_short}\n- **Note:** {}\n\n",
-                                    evt.user_input.as_deref().unwrap_or(""),
-                                ));
-                            }
-                            _ => {}
-                        }
-                    }
-                    let export_path =
-                        format!("session-{}.md", &target_sid[..8.min(target_sid.len())]);
-                    match std::fs::write(&export_path, &md) {
-                        Ok(_) => {
-                            eprintln!("  {} Exported to {}", theme::icon_ok(), export_path.cyan())
-                        }
-                        Err(e) => {
-                            eprintln!("{}", format!("  ✗ Failed to write: {e}").red())
-                        }
-                    }
-                }
-                Err(e) => eprintln!("{}", format!("  ✗ {e}").red()),
-            }
+            export_session_markdown(&target_sid);
         }
         other => {
             eprintln!("{}", format!("  Unknown subcommand: {other}").red());
@@ -1031,6 +948,158 @@ pub(super) fn handle_session_command(arg: &str, state: &mut ReplState) {
             );
         }
     }
+}
+
+// ── Session export ──────────────────────────────────────────────────────────
+
+/// Format tool call records as a summarized markdown block.
+fn format_tool_calls_md(calls: &[session_journal::ToolCallRecord]) -> String {
+    let mut out = String::new();
+    out.push_str("\n<details>\n<summary>Tool calls</summary>\n\n");
+    for tc in calls {
+        let status = if tc.ok { "✓" } else { "✗" };
+        out.push_str(&format!("- `{}` {status} ({}ms)", tc.name, tc.ms));
+        if let Some(ref args) = tc.args_preview {
+            out.push_str(&format!(" — {args}"));
+        }
+        out.push('\n');
+        if let Some(ref err) = tc.error {
+            out.push_str(&format!("  > Error: {err}\n"));
+        }
+        if let Some(ref preview) = tc.result_preview {
+            // Show a short excerpt of the result
+            let short = if preview.len() > 200 {
+                format!("{}…", &preview[..preview.floor_char_boundary(200)])
+            } else {
+                preview.clone()
+            };
+            out.push_str(&format!("  > ```\n  > {}\n  > ```\n", short.replace('\n', "\n  > ")));
+        }
+    }
+    out.push_str("\n</details>\n\n");
+    out
+}
+
+/// Build a markdown export from journal events.
+fn build_export_markdown(session_id: &str, events: &[session_journal::JournalEvent]) -> String {
+    let mut md = format!("# Session: {session_id}\n\n");
+    for evt in events {
+        let ts_short = evt.ts.get(..19).unwrap_or(&evt.ts);
+        match evt.event_type {
+            session_journal::JournalEventType::SessionStart => {
+                md.push_str(&format!(
+                    "## Session Start\n- **Time:** {ts_short}\n- **Model:** {}\n\n",
+                    evt.model.as_deref().unwrap_or("default")
+                ));
+            }
+            session_journal::JournalEventType::Turn => {
+                md.push_str(&format!(
+                    "### Turn {}\n- **Time:** {ts_short}\n- **Duration:** {}ms\n- **Tokens:** {} → {}\n- **Tools used:** {}\n\n",
+                    evt.turn.unwrap_or(0),
+                    evt.duration_ms.unwrap_or(0),
+                    evt.tokens_in.unwrap_or(0),
+                    evt.tokens_out.unwrap_or(0),
+                    evt.tool_count.unwrap_or(0),
+                ));
+
+                if let Some(ref input) = evt.user_input {
+                    if !input.is_empty() {
+                        md.push_str(&format!("**User:**\n\n{input}\n\n"));
+                    }
+                }
+
+                // Tool call details (collapsed)
+                if let Some(ref calls) = evt.tool_calls {
+                    if !calls.is_empty() {
+                        md.push_str(&format_tool_calls_md(calls));
+                    }
+                }
+
+                if let Some(ref output) = evt.assistant_output {
+                    if !output.is_empty() {
+                        md.push_str(&format!("**Assistant:**\n\n{output}\n\n"));
+                    }
+                }
+                md.push_str("---\n\n");
+            }
+            session_journal::JournalEventType::TurnError => {
+                md.push_str(&format!(
+                    "### Turn {} ❌ Error\n- **Time:** {ts_short}\n- **Error:** {}\n\n---\n\n",
+                    evt.turn.unwrap_or(0),
+                    evt.error.as_deref().unwrap_or("unknown"),
+                ));
+            }
+            session_journal::JournalEventType::Compact => {
+                md.push_str(&format!(
+                    "### Compact\n- **Time:** {ts_short}\n- **Turns compacted:** {}\n- **Facts stored:** {}\n\n",
+                    evt.turns_compacted.unwrap_or(0),
+                    evt.facts_stored.unwrap_or(0),
+                ));
+            }
+            session_journal::JournalEventType::ConfigChange => {
+                md.push_str(&format!(
+                    "- ⚙️ {ts_short}: {} → {}\n",
+                    evt.config_key.as_deref().unwrap_or("?"),
+                    evt.config_value.as_deref().unwrap_or("?"),
+                ));
+            }
+            session_journal::JournalEventType::SessionEnd => {
+                md.push_str(&format!(
+                    "## Session End\n- **Time:** {ts_short}\n- **Total turns:** {}\n",
+                    evt.turn.unwrap_or(0),
+                ));
+            }
+            session_journal::JournalEventType::SessionFork => {
+                let parent = evt
+                    .session_lineage
+                    .as_ref()
+                    .map(|l| l.parent_session_id.as_str())
+                    .unwrap_or("?");
+                md.push_str(&format!(
+                    "### Session fork\n- **Time:** {ts_short}\n- **Parent:** {parent}\n- **Note:** {}\n\n",
+                    evt.user_input.as_deref().unwrap_or(""),
+                ));
+            }
+            session_journal::JournalEventType::SyncMarker => {
+                md.push_str(&format!(
+                    "### Sync marker\n- **Time:** {ts_short}\n- **Note:** {}\n\n",
+                    evt.user_input.as_deref().unwrap_or(""),
+                ));
+            }
+            _ => {}
+        }
+    }
+    md
+}
+
+/// Export a session journal to a timestamped Markdown file in the current directory.
+fn export_session_markdown(session_id: &str) {
+    match session_journal::read_journal(session_id) {
+        Ok(events) if events.is_empty() => {
+            eprintln!("{}", "  No journal entries to export.".dim());
+        }
+        Ok(events) => {
+            let md = build_export_markdown(session_id, &events);
+            let now = chrono::Local::now();
+            let export_path = format!("astra-session-{}.md", now.format("%Y%m%d-%H%M"));
+            match std::fs::write(&export_path, &md) {
+                Ok(_) => {
+                    eprintln!("  {} Exported to {}", theme::icon_ok(), export_path.cyan())
+                }
+                Err(e) => eprintln!("{}", format!("  ✗ Failed to write: {e}").red()),
+            }
+        }
+        Err(e) => eprintln!("{}", format!("  ✗ {e}").red()),
+    }
+}
+
+/// Handle top-level `/export` command — exports the active session as Markdown.
+pub(super) fn handle_export_command(state: &ReplState) {
+    let Some(ref sid) = state.session_id else {
+        eprintln!("{}", "  No active session.".yellow());
+        return;
+    };
+    export_session_markdown(sid);
 }
 
 #[cfg(test)]
@@ -1043,5 +1112,104 @@ mod session_display_tests {
         assert_eq!(format_u64_grouped(999), "999");
         assert_eq!(format_u64_grouped(1000), "1,000");
         assert_eq!(format_u64_grouped(12_345_678), "12,345,678");
+    }
+}
+
+#[cfg(test)]
+mod export_tests {
+    use super::*;
+    use astra_services::session_journal::{JournalEvent, ToolCallRecord};
+
+    /// Construct a JournalEvent from a JSON value — avoids listing all fields.
+    fn evt_from_json(json: serde_json::Value) -> JournalEvent {
+        serde_json::from_value(json).expect("valid JournalEvent JSON")
+    }
+
+    #[test]
+    fn build_export_includes_session_start() {
+        let evt = evt_from_json(serde_json::json!({
+            "type": "session_start",
+            "ts": "2025-01-15T10:30:00Z",
+            "model": "gpt-4o",
+        }));
+        let md = build_export_markdown("abc123", &[evt]);
+        assert!(md.contains("# Session: abc123"));
+        assert!(md.contains("## Session Start"));
+        assert!(md.contains("gpt-4o"));
+    }
+
+    #[test]
+    fn build_export_turn_with_tool_calls() {
+        let evt = evt_from_json(serde_json::json!({
+            "type": "turn",
+            "ts": "2025-01-15T10:31:00Z",
+            "turn": 1,
+            "duration_ms": 1500,
+            "tokens_in": 100,
+            "tokens_out": 50,
+            "tool_count": 2,
+            "user_input": "Hello",
+            "assistant_output": "Hi there",
+            "tool_calls": [
+                {
+                    "name": "read_file",
+                    "ok": true,
+                    "ms": 50,
+                    "args_preview": "src/main.rs",
+                    "result_preview": "fn main() { ... }",
+                },
+                {
+                    "name": "bash",
+                    "ok": false,
+                    "ms": 200,
+                    "error": "exit code 1",
+                    "args_preview": "cargo test",
+                },
+            ],
+        }));
+
+        let md = build_export_markdown("test-sid", &[evt]);
+        assert!(md.contains("### Turn 1"));
+        assert!(md.contains("**User:**"));
+        assert!(md.contains("Hello"));
+        assert!(md.contains("<details>"));
+        assert!(md.contains("`read_file` ✓"));
+        assert!(md.contains("`bash` ✗"));
+        assert!(md.contains("exit code 1"));
+        assert!(md.contains("**Assistant:**"));
+        assert!(md.contains("Hi there"));
+    }
+
+    #[test]
+    fn build_export_turn_without_tool_calls_omits_details() {
+        let evt = evt_from_json(serde_json::json!({
+            "type": "turn",
+            "ts": "2025-01-15T10:31:00Z",
+            "turn": 1,
+            "user_input": "hi",
+            "assistant_output": "hello",
+        }));
+
+        let md = build_export_markdown("sid", &[evt]);
+        assert!(!md.contains("<details>"));
+        assert!(md.contains("hello"));
+    }
+
+    #[test]
+    fn format_tool_calls_md_produces_collapsed_block() {
+        let calls = vec![ToolCallRecord {
+            name: "grep".into(),
+            ok: true,
+            ms: 10,
+            error: None,
+            input_bytes: None,
+            output_bytes: None,
+            args_preview: Some("pattern in src/".into()),
+            result_preview: None,
+        }];
+        let block = format_tool_calls_md(&calls);
+        assert!(block.contains("<details>"));
+        assert!(block.contains("</details>"));
+        assert!(block.contains("`grep` ✓ (10ms) — pattern in src/"));
     }
 }
