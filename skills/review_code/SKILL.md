@@ -216,31 +216,44 @@ Based on the existing `nonhappy_path.rs` and `journey_extended.rs` patterns, fla
 
 ## Phase 6: Review Report
 
-```
-╔══════════════════════════════════════════════════════════════╗
-║  🔍 Code Review: Test Quality & Unhappy Paths                ║
-║  Scope: {n} files, +{added}/-{removed} lines                ║
-╠══════════════════════════════════════════════════════════════╣
-║                                                              ║
-║  📊 Test Coverage Summary                                    ║
-║  ├─ Happy path:   {covered}/{total} functions                ║
-║  ├─ Unhappy path: {covered}/{total} error scenarios          ║
-║  ├─ E2E with DB:  {covered}/{total} endpoints                ║
-║  └─ Journey/lifecycle: {yes/no}                              ║
-║                                                              ║
-║  🔴 Missing Tests ({n})                                      ║
-║  {file:line — what's missing and why it matters}             ║
-║                                                              ║
-║  🟡 Weak Tests ({n})                                         ║
-║  {file:line — what's weak and how to strengthen}             ║
-║                                                              ║
-║  ✅ Strong Tests                                              ║
-║  {acknowledge well-written tests}                            ║
-║                                                              ║
-║  📝 Recommended Tests to Add                                 ║
-║  {concrete test scenarios with pseudocode}                   ║
-║                                                              ║
-╚══════════════════════════════════════════════════════════════╝
+Use Markdown format (no ASCII box — it breaks with CJK/emoji width):
+
+```markdown
+---
+title: "Code Review: {commit_or_branch}"
+scope: "{n} files, +{added}/-{removed} lines"
+---
+
+## Test Coverage Summary
+
+| Category | Coverage |
+|----------|----------|
+| Happy path | {covered}/{total} functions |
+| Unhappy path | {covered}/{total} error scenarios |
+| E2E with DB | {covered}/{total} endpoints |
+| Journey/lifecycle | {yes/no} |
+
+## Issues
+
+### 🔴 Missing Tests ({n})
+
+{for each issue}
+- **{file}:{line}** — {what's missing and why it matters}
+{end}
+
+### 🟡 Weak Tests ({n})
+
+{for each issue}
+- **{file}:{line}** — {what's weak and how to strengthen}
+{end}
+
+## ✅ Strong Tests
+
+{acknowledge well-written tests with brief praise}
+
+## 📝 Recommended Tests to Add
+
+{concrete test scenarios with pseudocode}
 ```
 
 ### Severity Guide
