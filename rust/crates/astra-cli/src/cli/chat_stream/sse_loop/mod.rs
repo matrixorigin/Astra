@@ -275,6 +275,7 @@ pub(crate) async fn stream_chat_sse(
         budget_wrapup_injected: false,
         skill_listing_message: None,
         invoked_skills: std::collections::HashMap::new(),
+        recent_file_reads: Vec::new(),
     };
 
     // ─── Run the runtime loop ────────────────────────────────────────────
