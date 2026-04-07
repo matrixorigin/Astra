@@ -730,6 +730,12 @@ pub(super) async fn execute_cli_command(
             clap_complete::generate(args.shell, &mut cmd, "astra", &mut std::io::stdout());
             Ok(ExitCode::Success)
         }
+
+        // ── Doctor: diagnose installation and config ────────────────────
+        Some(Command::Doctor) => {
+            run_doctor(api, profile.as_deref()).await;
+            Ok(ExitCode::Success)
+        }
     }
 }
 
@@ -750,6 +756,136 @@ fn compute_exit_code(sr: &StreamResult) -> ExitCode {
     }
 
     ExitCode::Success
+}
+
+// ═══════════════════════════════════════════════════════ Doctor ═══════════
+
+async fn run_doctor(api: &astra_thin_client::ThinClient, profile: Option<&str>) {
+    println!("Astra Doctor");
+    println!("{}\n", "═".repeat(50));
+    let mut issues: Vec<String> = Vec::new();
+
+    // 1. Version
+    let version = env!("CARGO_PKG_VERSION");
+    println!("Version");
+    println!("  Binary: {version}");
+    println!("  Executable: {}", std::env::current_exe()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "unknown".into()));
+    println!();
+
+    // 2. API server connectivity
+    println!("API Server");
+    println!("  URL: {}", api.api_origin());
+    match api.get_health_text().await {
+        Ok(body) => println!("  Status: ✓ Healthy ({})", body.trim()),
+        Err(e) => {
+            println!("  Status: ✗ Unreachable");
+            issues.push(format!("API server unreachable: {e}"));
+        }
+    }
+    println!();
+
+    // 3. Authentication
+    println!("Authentication");
+    let creds = load_credentials();
+    let name = profile_name(profile, &creds);
+    println!("  Profile: {name}");
+    match get_profile_and_token(profile) {
+        Ok((_, _, _, token)) => {
+            match api.get_auth_me_text(&token).await {
+                Ok(body) => {
+                    // Try to extract username from JSON response
+                    if let Ok(val) = serde_json::from_str::<serde_json::Value>(&body) {
+                        let user = val.get("username")
+                            .or_else(|| val.get("name"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("authenticated");
+                        println!("  Status: ✓ Logged in as {user}");
+                    } else {
+                        println!("  Status: ✓ Authenticated");
+                    }
+                }
+                Err(_) => {
+                    println!("  Status: ⚠ Token may be expired");
+                    issues.push("Auth token may be expired — try `astra refresh` or `astra login`".into());
+                }
+            }
+        }
+        Err(e) => {
+            println!("  Status: ✗ Not logged in");
+            issues.push(format!("Not authenticated: {e}"));
+        }
+    }
+    println!();
+
+    // 4. Project config
+    println!("Project Configuration");
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let astra_dir = cwd.join(".astra");
+    if astra_dir.is_dir() {
+        println!("  .astra/ directory: ✓ Found");
+    } else {
+        println!("  .astra/ directory: - Not found (optional)");
+    }
+    println!("  Working directory: {}", cwd.display());
+    println!();
+
+    // 5. MCP configuration
+    println!("MCP Configuration");
+    for (scope, path_fn) in &[
+        ("project", crate::manifest_loader::project_mcp_json_path as fn() -> Option<std::path::PathBuf>),
+        ("user", crate::manifest_loader::global_mcp_json_path as fn() -> Option<std::path::PathBuf>),
+    ] {
+        if let Some(path) = path_fn() {
+            if path.is_file() {
+                match std::fs::read_to_string(&path) {
+                    Ok(content) => match serde_json::from_str::<serde_json::Value>(&content) {
+                        Ok(config) => {
+                            let count = config.get("mcpServers")
+                                .and_then(|v| v.as_object())
+                                .map(|m| m.len())
+                                .unwrap_or(0);
+                            println!("  {scope}: ✓ {count} server(s) in {}", path.display());
+                        }
+                        Err(e) => {
+                            println!("  {scope}: ✗ Invalid JSON in {}", path.display());
+                            issues.push(format!("MCP {scope} config parse error: {e}"));
+                        }
+                    },
+                    Err(e) => {
+                        println!("  {scope}: ✗ Cannot read {}", path.display());
+                        issues.push(format!("MCP {scope} config read error: {e}"));
+                    }
+                }
+            } else {
+                println!("  {scope}: - No config file");
+            }
+        }
+    }
+    println!();
+
+    // 6. Environment
+    println!("Environment");
+    println!("  OS: {}", std::env::consts::OS);
+    println!("  Arch: {}", std::env::consts::ARCH);
+    if let Ok(shell) = std::env::var("SHELL") {
+        println!("  Shell: {shell}");
+    }
+    if let Ok(term) = std::env::var("TERM") {
+        println!("  Terminal: {term}");
+    }
+    println!();
+
+    // Summary
+    if issues.is_empty() {
+        println!("✓ No issues found");
+    } else {
+        println!("Found {} issue(s):", issues.len());
+        for issue in &issues {
+            println!("  ⚠ {issue}");
+        }
+    }
 }
 
 // ═══════════════════════════════════════════════════════ MCP CLI ══════════
