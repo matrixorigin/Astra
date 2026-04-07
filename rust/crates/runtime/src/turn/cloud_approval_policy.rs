@@ -232,6 +232,11 @@ pub enum CloudGatedToolKind {
 /// Returns [`None`] when the tool is not cloud-gated (treated as read-only for approval purposes).
 #[inline]
 pub fn cloud_gated_tool_kind(name: &str) -> Option<CloudGatedToolKind> {
+    // MCP tools run external server code with unknown side effects —
+    // treat them as Execute (highest-risk) for permission gating.
+    if name.starts_with("mcp_") {
+        return Some(CloudGatedToolKind::Execute);
+    }
     if !CLOUD_APPROVAL_REQUIRED_TOOLS.contains(&name) {
         return None;
     }
@@ -409,5 +414,33 @@ mod tests {
         assert!(!bash_command_is_read_only("./run.sh"));
         assert!(!bash_command_is_read_only("make"));
         assert!(!bash_command_is_read_only("docker run image"));
+    }
+
+    // ── MCP permission gating tests ──
+
+    #[test]
+    fn mcp_tools_require_approval() {
+        assert!(edge_tool_requires_cloud_approval("mcp_filesystem_read"));
+        assert!(edge_tool_requires_cloud_approval("mcp_github_search"));
+        assert!(edge_tool_requires_cloud_approval("mcp_custom_server_do_stuff"));
+    }
+
+    #[test]
+    fn mcp_tools_classified_as_execute() {
+        assert_eq!(
+            cloud_gated_tool_kind("mcp_anything"),
+            Some(CloudGatedToolKind::Execute),
+        );
+        assert_eq!(
+            cloud_gated_tool_kind("mcp_server_tool"),
+            Some(CloudGatedToolKind::Execute),
+        );
+    }
+
+    #[test]
+    fn non_mcp_unknown_tool_not_gated() {
+        // "mcp" without underscore prefix should NOT match
+        assert!(!edge_tool_requires_cloud_approval("mcp"));
+        assert!(!edge_tool_requires_cloud_approval("my_mcp_tool"));
     }
 }
