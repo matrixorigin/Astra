@@ -167,6 +167,12 @@ struct Cli {
     /// Output format for --print mode
     #[arg(long = "output-format", default_value = "text")]
     output_format: String,
+    /// Continue the most recent conversation
+    #[arg(short = 'c', long = "continue")]
+    continue_last: bool,
+    /// Resume a specific session by ID (or prefix)
+    #[arg(short = 'r', long = "resume")]
+    resume: Option<String>,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -4517,6 +4523,7 @@ async fn run_chat_repl(
     api: &astra_thin_client::ThinClient,
     profile: Option<&str>,
     initial_model: Option<&str>,
+    resume_session_id: Option<&str>,
 ) -> Result<(), String> {
     // Try silent auth (validate/refresh token) but don't block entry.
     // If not authenticated, user can still explore — operations that need
@@ -4526,6 +4533,16 @@ async fn run_chat_repl(
     let (editor, hist_path) = build_repl_editor()?;
     let mut readline = readline_actor::ReadlineActor::spawn(editor)?;
     let mut state = initialize_repl_state(profile, initial_model);
+
+    // Apply resume session if requested (-c or -r)
+    if let Some(sid) = resume_session_id {
+        state.session_id = Some(sid.to_string());
+        eprintln!(
+            "{}",
+            format!("  Resuming session {}", truncate_str(sid, 12))
+                .cyan()
+        );
+    }
 
     // Load persisted skill quality data from previous sessions
     let skill_quality_path = dirs::config_dir()
@@ -5267,6 +5284,8 @@ async fn main() {
         profile,
         print: print_mode,
         output_format,
+        continue_last,
+        resume,
         command,
     } = cli;
 
@@ -5277,6 +5296,41 @@ async fn main() {
             Err(e) => {
                 eprintln!("{}", format!("Error: {e}").red());
                 std::process::exit(i32::from(ExitCode::ApiError));
+            }
+        }
+    }
+
+    // -c / --continue: resume most recent session
+    // -r / --resume <ID>: resume specific session
+    if continue_last || resume.is_some() {
+        let session_id = if let Some(ref id) = resume {
+            Some(id.as_str())
+        } else {
+            // -c: use last saved session from profile
+            None // will be resolved inside run_chat_repl from credentials
+        };
+
+        // For -c, resolve the last session ID from credentials
+        let resolved_sid = if continue_last && session_id.is_none() {
+            resumable_last_session_id(profile.as_deref())
+        } else {
+            session_id.map(|s| s.to_string())
+        };
+
+        match resolved_sid {
+            Some(sid) => {
+                let result = run_chat_repl(&api, profile.as_deref(), None, Some(&sid)).await;
+                match result {
+                    Ok(()) => std::process::exit(0),
+                    Err(e) => {
+                        eprintln!("{}", format!("Error: {e}").red());
+                        std::process::exit(i32::from(ExitCode::ApiError));
+                    }
+                }
+            }
+            None => {
+                eprintln!("{}", "No previous session to continue. Start a new one with `astra`.".yellow());
+                std::process::exit(1);
             }
         }
     }
