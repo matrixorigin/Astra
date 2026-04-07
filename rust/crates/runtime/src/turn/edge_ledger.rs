@@ -148,6 +148,17 @@ pub fn assistant_message_with_tool_calls_and_reasoning(
     msg
 }
 
+/// Returns `true` when the provider requires **full** `reasoning_content` to be
+/// preserved on every assistant message in multi-turn tool-call conversations.
+///
+/// Moonshot (Kimi-k2.5, kimi-k2-thinking) rejects requests with empty-string
+/// `reasoning_content` on assistant+tool_calls messages when thinking mode is
+/// active (which is the default for kimi-k2.5).  Other providers (OpenAI,
+/// Anthropic, DeepSeek) accept empty strings and benefit from the token savings.
+pub fn provider_preserves_reasoning(provider: &str, model: &str) -> bool {
+    provider == "moonshot" || model.starts_with("kimi-k2")
+}
+
 /// Strip `reasoning_content` values from older assistant messages to reduce token usage.
 ///
 /// Thinking-model sessions accumulate large reasoning chains on every assistant message.
@@ -155,9 +166,44 @@ pub fn assistant_message_with_tool_calls_and_reasoning(
 /// (replace with empty string) on all assistant messages **except** the last one.
 /// The field is kept (as empty string) so thinking-model API contracts are satisfied.
 ///
+/// **Skipped entirely** when `provider_preserves_reasoning` returns true (e.g. Moonshot),
+/// because those providers reject empty-string reasoning_content.
+///
 /// **Only affects the in-flight messages array** — heavy checkpoints and persisted events
 /// retain the full reasoning for debugging and audit.
-pub fn strip_stale_reasoning(messages: &mut [Value]) {
+pub fn strip_stale_reasoning(messages: &mut [Value], provider: &str, model: &str) {
+    if provider_preserves_reasoning(provider, model) {
+        // Provider requires full reasoning on every assistant message — ensure
+        // the field exists on all assistant+tool_calls messages but do NOT clear
+        // any existing content.
+        //
+        // Moonshot rejects both absent and empty-string `reasoning_content` when
+        // thinking is enabled.  For messages that genuinely never had reasoning
+        // (e.g. pre-thinking-model messages in a mid-session switch), we insert
+        // a single space — the minimum non-empty value Moonshot accepts.
+        if !history_has_reasoning(messages) {
+            return;
+        }
+        let placeholder = Value::String(" ".to_string());
+        for msg in messages.iter_mut() {
+            if msg.get("role").and_then(Value::as_str) != Some("assistant") {
+                continue;
+            }
+            if msg.get("tool_calls").is_none() {
+                continue;
+            }
+            match msg.get("reasoning_content").and_then(Value::as_str) {
+                None => {
+                    msg["reasoning_content"] = placeholder.clone();
+                }
+                Some("") => {
+                    msg["reasoning_content"] = placeholder.clone();
+                }
+                Some(_) => {} // non-empty — keep as-is
+            }
+        }
+        return;
+    }
     // Find index of the last assistant message that has non-empty reasoning.
     let last_reasoning_idx = messages
         .iter()
@@ -375,7 +421,7 @@ mod tests {
             json!({"role": "assistant", "content": null, "reasoning_content": "think2", "tool_calls": []}),
             json!({"role": "tool", "tool_call_id": "t2", "content": "r2"}),
         ];
-        strip_stale_reasoning(&mut msgs);
+        strip_stale_reasoning(&mut msgs, "openai", "gpt-4");
         // First assistant: reasoning cleared to empty
         assert_eq!(msgs[1]["reasoning_content"].as_str(), Some(""));
         // Second assistant: reasoning preserved
@@ -389,7 +435,7 @@ mod tests {
             json!({"role": "assistant", "content": "hello"}),
         ];
         let original = msgs.clone();
-        strip_stale_reasoning(&mut msgs);
+        strip_stale_reasoning(&mut msgs, "openai", "gpt-4");
         assert_eq!(msgs, original);
     }
 
@@ -399,7 +445,7 @@ mod tests {
             json!({"role": "user", "content": "hi"}),
             json!({"role": "assistant", "reasoning_content": "deep thought", "content": "42"}),
         ];
-        strip_stale_reasoning(&mut msgs);
+        strip_stale_reasoning(&mut msgs, "openai", "gpt-4");
         assert_eq!(msgs[1]["reasoning_content"].as_str(), Some("deep thought"));
     }
 
@@ -409,7 +455,7 @@ mod tests {
             json!({"role": "assistant", "reasoning_content": "", "content": "a"}),
             json!({"role": "assistant", "reasoning_content": "real", "content": "b"}),
         ];
-        strip_stale_reasoning(&mut msgs);
+        strip_stale_reasoning(&mut msgs, "openai", "gpt-4");
         // Already-empty field stays empty (not removed).
         assert_eq!(msgs[0]["reasoning_content"].as_str(), Some(""));
         assert_eq!(msgs[1]["reasoning_content"].as_str(), Some("real"));
@@ -428,7 +474,7 @@ mod tests {
             json!({"role": "assistant", "content": null, "reasoning_content": "think", "tool_calls": [{"id":"t2","type":"function","function":{"name":"bash","arguments":"{}"}}]}),
             json!({"role": "tool", "tool_call_id": "t2", "content": "ok2"}),
         ];
-        strip_stale_reasoning(&mut msgs);
+        strip_stale_reasoning(&mut msgs, "openai", "gpt-4");
         // Old assistant+tool_calls at index 1 must now have reasoning_content
         assert_eq!(
             msgs[1]["reasoning_content"].as_str(),
@@ -513,7 +559,7 @@ mod tests {
     #[test]
     fn mid_session_switch_to_thinking_model_all_tool_call_msgs_get_reasoning() {
         let mut msgs = build_mid_switch_session();
-        strip_stale_reasoning(&mut msgs);
+        strip_stale_reasoning(&mut msgs, "openai", "gpt-4");
         assert!(history_has_reasoning(&msgs));
         assert_all_assistant_tool_calls_have_reasoning(&msgs);
     }
@@ -521,7 +567,7 @@ mod tests {
     #[test]
     fn mid_session_switch_preserves_latest_reasoning_content() {
         let mut msgs = build_mid_switch_session();
-        strip_stale_reasoning(&mut msgs);
+        strip_stale_reasoning(&mut msgs, "openai", "gpt-4");
         let last_reasoning = msgs
             .iter()
             .rev()
@@ -543,7 +589,7 @@ mod tests {
     #[test]
     fn old_non_thinking_tool_call_msgs_get_empty_reasoning() {
         let mut msgs = build_mid_switch_session();
-        strip_stale_reasoning(&mut msgs);
+        strip_stale_reasoning(&mut msgs, "openai", "gpt-4");
         assert_eq!(msgs[2]["reasoning_content"].as_str(), Some(""));
         assert_eq!(msgs[6]["reasoning_content"].as_str(), Some(""));
         assert_eq!(msgs[11]["reasoning_content"].as_str(), Some(""));
@@ -653,7 +699,7 @@ mod tests {
         }));
         history.push(json!({"role": "tool", "tool_call_id": "tc-new", "content": "result"}));
 
-        strip_stale_reasoning(&mut history);
+        strip_stale_reasoning(&mut history, "openai", "gpt-4");
         assert_all_assistant_tool_calls_have_reasoning(&history);
     }
 
@@ -670,7 +716,7 @@ mod tests {
             json!({"role": "assistant", "content": "done"}),
         ];
         let original = msgs.clone();
-        strip_stale_reasoning(&mut msgs);
+        strip_stale_reasoning(&mut msgs, "openai", "gpt-4");
         assert_eq!(msgs, original);
     }
 
@@ -693,9 +739,102 @@ mod tests {
                 "tool_calls": [{"id": "tc-2", "type": "function", "function": {"name": "bash", "arguments": "{}"}}]
             }),
         ];
-        strip_stale_reasoning(&mut msgs);
+        strip_stale_reasoning(&mut msgs, "openai", "gpt-4");
         assert_all_assistant_tool_calls_have_reasoning(&msgs);
         assert_eq!(msgs[1]["reasoning_content"].as_str(), Some(""));
         assert_eq!(msgs[5]["reasoning_content"].as_str(), Some("thinking..."));
+    }
+
+    // ── Moonshot / provider_preserves_reasoning tests ────────────────────
+
+    #[test]
+    fn provider_preserves_reasoning_moonshot() {
+        assert!(super::provider_preserves_reasoning("moonshot", "kimi-k2.5"));
+        assert!(super::provider_preserves_reasoning("moonshot", "kimi-k2-thinking"));
+        assert!(super::provider_preserves_reasoning("moonshot", "some-other-model"));
+        assert!(super::provider_preserves_reasoning("other", "kimi-k2.5"));
+        assert!(!super::provider_preserves_reasoning("openai", "gpt-4"));
+        assert!(!super::provider_preserves_reasoning("deepseek", "deepseek-chat"));
+        assert!(!super::provider_preserves_reasoning("anthropic", "claude-3"));
+    }
+
+    #[test]
+    fn moonshot_strip_preserves_all_reasoning_content() {
+        let mut msgs = vec![
+            json!({"role": "user", "content": "q1"}),
+            json!({"role": "assistant", "content": null, "reasoning_content": "think1", "tool_calls": [{"id":"t1","type":"function","function":{"name":"bash","arguments":"{}"}}]}),
+            json!({"role": "tool", "tool_call_id": "t1", "content": "r1"}),
+            json!({"role": "user", "content": "q2"}),
+            json!({"role": "assistant", "content": null, "reasoning_content": "think2", "tool_calls": [{"id":"t2","type":"function","function":{"name":"bash","arguments":"{}"}}]}),
+            json!({"role": "tool", "tool_call_id": "t2", "content": "r2"}),
+        ];
+        strip_stale_reasoning(&mut msgs, "moonshot", "kimi-k2.5");
+        // Both reasoning_content values must be preserved (not cleared).
+        assert_eq!(msgs[1]["reasoning_content"].as_str(), Some("think1"));
+        assert_eq!(msgs[4]["reasoning_content"].as_str(), Some("think2"));
+    }
+
+    #[test]
+    fn moonshot_strip_adds_field_to_missing_tool_call_msgs() {
+        // Mid-session switch: old assistant+tool_calls lacks reasoning_content,
+        // later thinking-model message has it.
+        let mut msgs = vec![
+            json!({"role": "user", "content": "q1"}),
+            json!({"role": "assistant", "content": null, "tool_calls": [{"id":"t1","type":"function","function":{"name":"bash","arguments":"{}"}}]}),
+            json!({"role": "tool", "tool_call_id": "t1", "content": "r1"}),
+            json!({"role": "assistant", "content": null, "reasoning_content": "think", "tool_calls": [{"id":"t2","type":"function","function":{"name":"bash","arguments":"{}"}}]}),
+            json!({"role": "tool", "tool_call_id": "t2", "content": "r2"}),
+        ];
+        strip_stale_reasoning(&mut msgs, "moonshot", "kimi-k2.5");
+        // Old message gets placeholder (no reasoning to preserve).
+        assert_eq!(msgs[1]["reasoning_content"].as_str(), Some(" "));
+        // Thinking message keeps its content.
+        assert_eq!(msgs[3]["reasoning_content"].as_str(), Some("think"));
+    }
+
+    #[test]
+    fn moonshot_strip_noop_without_reasoning() {
+        let mut msgs = vec![
+            json!({"role": "user", "content": "hi"}),
+            json!({"role": "assistant", "content": "hello"}),
+        ];
+        let original = msgs.clone();
+        strip_stale_reasoning(&mut msgs, "moonshot", "kimi-k2.5");
+        assert_eq!(msgs, original);
+    }
+
+    #[test]
+    fn moonshot_full_mid_switch_session_preserves_all() {
+        let mut msgs = build_mid_switch_session();
+        strip_stale_reasoning(&mut msgs, "moonshot", "kimi-k2.5");
+        assert_all_assistant_tool_calls_have_reasoning(&msgs);
+        // Old non-thinking tool_call messages get space placeholder.
+        assert_eq!(msgs[2]["reasoning_content"].as_str(), Some(" "));
+        assert_eq!(msgs[6]["reasoning_content"].as_str(), Some(" "));
+        assert_eq!(msgs[11]["reasoning_content"].as_str(), Some(" "));
+        // The two thinking messages must keep their original content.
+        assert_eq!(
+            msgs[15]["reasoning_content"].as_str(),
+            Some("I need to read the code first, then plan the refactoring.")
+        );
+        assert_eq!(
+            msgs[17]["reasoning_content"].as_str(),
+            Some("Now I'll write the refactored version.")
+        );
+    }
+
+    #[test]
+    fn kimi_model_name_triggers_preserve_even_with_other_provider() {
+        let mut msgs = vec![
+            json!({"role": "user", "content": "q1"}),
+            json!({"role": "assistant", "content": null, "reasoning_content": "think1", "tool_calls": [{"id":"t1","type":"function","function":{"name":"bash","arguments":"{}"}}]}),
+            json!({"role": "tool", "tool_call_id": "t1", "content": "r1"}),
+            json!({"role": "assistant", "content": null, "reasoning_content": "think2", "tool_calls": [{"id":"t2","type":"function","function":{"name":"bash","arguments":"{}"}}]}),
+            json!({"role": "tool", "tool_call_id": "t2", "content": "r2"}),
+        ];
+        // Even if provider is "other", model name "kimi-k2.5" triggers preserve.
+        strip_stale_reasoning(&mut msgs, "other", "kimi-k2.5");
+        assert_eq!(msgs[1]["reasoning_content"].as_str(), Some("think1"));
+        assert_eq!(msgs[3]["reasoning_content"].as_str(), Some("think2"));
     }
 }
