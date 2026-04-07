@@ -33,6 +33,11 @@ pub(super) async fn handle_mcp_command(arg: &str, state: &ReplState) -> Result<(
         "unsubscribe" => {
             eprintln!("{}", "  Usage: /mcp unsubscribe <server>:<uri>".dim());
         }
+        s if s.starts_with("log-level ") => handle_mcp_log_level(&s[10..], state).await,
+        "log-level" => {
+            eprintln!("{}", "  Usage: /mcp log-level <server> <level>".dim());
+            eprintln!("{}", "  Levels: debug, info, notice, warning, error, critical, alert, emergency".dim());
+        }
         s if s.starts_with("prompt ") => {
             eprintln!("{}", "  Hint: use /mcp prompt <server>:<name> [arg1 arg2 ...]".dim());
         }
@@ -359,6 +364,65 @@ async fn handle_mcp_unsubscribe(arg: &str, state: &ReplState) {
             eprintln!(
                 "{}",
                 format!("  ⚠ Failed to unsubscribe from '{uri}' on {server_name}: {e}").yellow()
+            );
+        }
+    }
+}
+
+/// `/mcp log-level <server> <level>` — set logging level for an MCP server.
+async fn handle_mcp_log_level(arg: &str, state: &ReplState) {
+    let parts: Vec<&str> = arg.trim().split_whitespace().collect();
+    if parts.len() != 2 {
+        eprintln!("{}", "  Usage: /mcp log-level <server> <level>".dim());
+        eprintln!(
+            "{}",
+            "  Levels: debug, info, notice, warning, error, critical, alert, emergency".dim()
+        );
+        return;
+    }
+
+    let server_name = parts[0];
+    let level = match parts[1].to_lowercase().as_str() {
+        "debug" => rmcp::model::LoggingLevel::Debug,
+        "info" => rmcp::model::LoggingLevel::Info,
+        "notice" => rmcp::model::LoggingLevel::Notice,
+        "warning" | "warn" => rmcp::model::LoggingLevel::Warning,
+        "error" => rmcp::model::LoggingLevel::Error,
+        "critical" | "crit" => rmcp::model::LoggingLevel::Critical,
+        "alert" => rmcp::model::LoggingLevel::Alert,
+        "emergency" | "emerg" => rmcp::model::LoggingLevel::Emergency,
+        other => {
+            eprintln!(
+                "{}",
+                format!("  ⚠ Unknown level: '{other}'. Use: debug, info, notice, warning, error, critical, alert, emergency").yellow()
+            );
+            return;
+        }
+    };
+
+    let manager = state.mcp_manager.read().await;
+    let conn = match manager.get(server_name) {
+        Some(c) => c,
+        None => {
+            eprintln!(
+                "{}",
+                format!("  ⚠ Server '{server_name}' not found.").yellow()
+            );
+            return;
+        }
+    };
+
+    match conn.set_log_level(level).await {
+        Ok(()) => {
+            eprintln!(
+                "{}",
+                format!("  ✓ Set log level to '{}' on {server_name}", parts[1]).green()
+            );
+        }
+        Err(e) => {
+            eprintln!(
+                "{}",
+                format!("  ⚠ Failed to set log level on {server_name}: {e}").yellow()
             );
         }
     }
