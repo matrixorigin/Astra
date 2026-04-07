@@ -381,7 +381,13 @@ fn collect_journal_turns(
 ) -> Vec<session_journal::JournalEvent> {
     events
         .into_iter()
-        .filter(|e| e.event_type == session_journal::JournalEventType::Turn)
+        .filter(|e| {
+            matches!(
+                e.event_type,
+                session_journal::JournalEventType::Turn
+                    | session_journal::JournalEventType::TurnError
+            )
+        })
         .collect()
 }
 
@@ -574,7 +580,19 @@ fn print_turn_journal_list(turns: &[session_journal::JournalEvent]) {
                 }
             })
             .unwrap_or_default();
-        eprintln!("  {:>4} {:>6} {:>8}  {}", seq, id, ms, preview.dim());
+        let err_mark = if ev.event_type == session_journal::JournalEventType::TurnError {
+            " ✗".red().to_string()
+        } else {
+            String::new()
+        };
+        eprintln!(
+            "  {:>4} {:>6} {:>8}  {}{}",
+            seq,
+            id,
+            ms,
+            preview.dim(),
+            err_mark
+        );
     }
     eprintln!("  {}", "─".repeat(60).cyan().dim());
     eprintln!(
@@ -592,10 +610,19 @@ fn print_turn_trace(ev: &session_journal::JournalEvent, journal_seq: Option<u32>
     let seq_note = journal_seq
         .map(|s| format!(" · journal seq {s}"))
         .unwrap_or_default();
+    let err_tag = if ev.event_type == session_journal::JournalEventType::TurnError {
+        " [ERROR]"
+    } else {
+        ""
+    };
     eprintln!(
         "\n  {}",
-        format!("─── Turn id {id} trace{seq_note} {sep}").cyan()
+        format!("─── Turn id {id} trace{seq_note}{err_tag} {sep}").cyan()
     );
+
+    if let Some(ref err) = ev.error {
+        eprintln!("  {} {}", "Error:".red().bold(), err.as_str().red());
+    }
 
     // Calculate tool time
     let tool_time_ms: u64 = ev

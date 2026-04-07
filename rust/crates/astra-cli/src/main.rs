@@ -437,7 +437,6 @@ pub(crate) struct PartialTurnData {
     pub tool_calls_count: u32,
     #[allow(dead_code)]
     pub tool_health_export: Vec<astra_runtime::pipeline::persistence::ToolHealthEntry>,
-    #[allow(dead_code)]
     pub session_id: Option<String>,
     pub last_heavy_checkpoint: Option<astra_runtime::pipeline::step_protocol::StepCheckpoint>,
     /// Partial text the model generated before the turn was interrupted.

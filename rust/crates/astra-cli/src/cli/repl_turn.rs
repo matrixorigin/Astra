@@ -205,14 +205,14 @@ pub(super) async fn handle_chat_input(
                                 return Ok(());
                             }
                             Err(retry_failure) => {
-                                report_turn_failure(state, &line, &retry_failure, turn_start);
+                                report_turn_failure(state, ctx.profile, &line, &retry_failure, turn_start);
                                 return Ok(());
                             }
                         },
                     }
                 }
 
-                report_turn_failure(state, &line, &failure, turn_start);
+                report_turn_failure(state, ctx.profile, &line, &failure, turn_start);
             }
         },
     }
@@ -1059,6 +1059,7 @@ fn initialize_journal(state: &mut ReplState, session_id: &str) {
 /// Report a turn failure with enriched partial data from the agentic loop.
 fn report_turn_failure(
     state: &mut ReplState,
+    profile: Option<&str>,
     line: &str,
     failure: &crate::TurnFailure,
     turn_start: Instant,
@@ -1075,6 +1076,17 @@ fn report_turn_failure(
             crate::theme::icon_err(),
             failure.error.as_str().red()
         );
+    }
+
+    // If the turn carried a session_id but the journal was never initialised
+    // (first turn failed before apply_turn_success), bootstrap it now so the
+    // error is persisted and visible via /turn and /debug.
+    if state.journal.is_none() {
+        if let Some(sid) = failure.partial.session_id.as_deref().filter(|s| !s.is_empty()) {
+            initialize_journal(state, sid);
+            persist_last_session_id(profile, sid);
+            state.session_id = Some(sid.to_string());
+        }
     }
 
     if let Some(journal) = state.journal.as_ref() {
@@ -1114,6 +1126,7 @@ fn report_turn_failure(
 
         let _ = journal.append(&err_event);
         enqueue_ingestion(state, &err_event);
+        state.last_turn_event = Some(err_event);
     }
 
     // Preserve partial text in conversation history so the next turn has
