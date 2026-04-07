@@ -258,6 +258,8 @@ const SLASH_FIRST_TOKEN_COMPLETIONS: &[(&str, &[(&str, &str)])] = &[
             ("status", "Show connection status table"),
             ("prompts", "List available MCP prompts"),
             ("prompt", "Invoke: /mcp prompt <server>:<name> [args]"),
+            ("resources", "List available MCP resources"),
+            ("resource", "Read: /mcp resource <server>:<uri>"),
         ],
     ),
     (

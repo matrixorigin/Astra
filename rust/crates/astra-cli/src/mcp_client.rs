@@ -564,6 +564,25 @@ impl McpClientManager {
         result
     }
 
+    /// List all resources from all connected servers.
+    /// Returns (server_name, resource) pairs.
+    pub async fn all_resources(&self) -> Vec<(String, Resource)> {
+        let mut result = Vec::new();
+        for (name, conn) in &self.connections {
+            match conn.list_resources().await {
+                Ok(resources) => {
+                    for r in resources {
+                        result.push((name.clone(), r));
+                    }
+                }
+                Err(e) => {
+                    eprintln!("  ⚠ Failed to list resources from {name}: {e}");
+                }
+            }
+        }
+        result
+    }
+
     /// Get a prompt from a specific server.
     pub async fn get_prompt(
         &self,
