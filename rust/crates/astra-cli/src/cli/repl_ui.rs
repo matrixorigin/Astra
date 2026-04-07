@@ -5,6 +5,7 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/help", "Show available commands"),
     ("/model", "List models or set active: /model <name>"),
     ("/clear", "Start a new session"),
+    ("/undo", "Undo last turn(s): /undo [N] — removes last N turns from context"),
     (
         "/checkpoint",
         "Manual save: /checkpoint [label] — heavy JSON first, then session md + journal",

@@ -4530,7 +4530,7 @@ async fn handle_slash_command(
             }
         }
 
-        "/clear" | "/explain" | "/verbose" | "/compact" | "/reflect" | "/skill-search" => {
+        "/clear" | "/explain" | "/verbose" | "/compact" | "/reflect" | "/skill-search" | "/undo" => {
             handle_state_command(
                 cmd,
                 arg,
