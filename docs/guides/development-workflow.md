@@ -66,8 +66,7 @@ make dev-stop
 | Command | Description |
 |---------|-------------|
 | `make test` | Run all Rust workspace tests |
-| `make test-contract` | Run API-shell integration contracts |
-| `make test-contract` | Run specific contract tests (http/admin/auth/config) |
+| `make test-contract` | Run `http_contract` / `admin_contract` (astra-runtime) + settings JSON contract (`astra-core` `settings_contract_tests`) |
 
 ## Typical Workflows
 
