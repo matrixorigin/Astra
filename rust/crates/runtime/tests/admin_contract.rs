@@ -412,27 +412,15 @@ fn build_request_with_json(
 }
 
 #[tokio::test]
-async fn admin_tokens_require_auth() {
+async fn admin_routes_require_auth() {
     let contract = load_contract();
+    let app = build_app_with_admin();
 
-    let (status, json) = read_json(build_app_with_admin(), "/admin/tokens", &[]).await;
-
+    let (status, json) = read_json(app.clone(), "/admin/tokens", &[]).await;
     assert_eq!(status.as_u16(), contract.auth_error.status);
     assert_eq!(json, contract.auth_error.json);
-}
 
-#[tokio::test]
-async fn admin_init_require_auth() {
-    let contract = load_contract();
-
-    let (status, json) = post_json(
-        build_app_with_admin(),
-        "/admin/init",
-        &[],
-        serde_json::json!({}),
-    )
-    .await;
-
+    let (status, json) = post_json(app, "/admin/init", &[], serde_json::json!({})).await;
     assert_eq!(status.as_u16(), contract.auth_error.status);
     assert_eq!(json, contract.auth_error.json);
 }
@@ -470,32 +458,22 @@ async fn admin_init_matches_shared_contract() {
 }
 
 #[tokio::test]
-async fn admin_tokens_require_admin_role() {
+async fn admin_routes_reject_non_admin_user_token() {
     let contract = load_contract();
+    let app = build_app_with_admin();
+    let user = &[("authorization", "Bearer user-token")];
 
-    let (status, json) = read_json(
-        build_app_with_admin(),
-        "/admin/tokens",
-        &[("authorization", "Bearer user-token")],
-    )
-    .await;
-
+    let (status, json) = read_json(app.clone(), "/admin/tokens", user).await;
     assert_eq!(status.as_u16(), contract.admin_forbidden.status);
     assert_eq!(json, contract.admin_forbidden.json);
-}
-
-#[tokio::test]
-async fn admin_token_create_requires_admin_role() {
-    let contract = load_contract();
 
     let (status, json) = post_json(
-        build_app_with_admin(),
+        app,
         "/admin/tokens",
-        &[("authorization", "Bearer user-token")],
+        user,
         contract.admin_token_create.request.clone(),
     )
     .await;
-
     assert_eq!(status.as_u16(), contract.admin_forbidden.status);
     assert_eq!(json, contract.admin_forbidden.json);
 }
@@ -618,143 +596,51 @@ async fn admin_feedback_stats_filtered_matches_shared_contract() {
 }
 
 #[tokio::test]
-async fn admin_role_grant_matches_shared_contract() {
+async fn admin_role_grant_variants_match_shared_contract() {
     let contract = load_contract();
+    let app = build_app_with_admin();
+    let auth = &[("authorization", "Bearer admin-token")];
 
-    let (status, json) = post_json(
-        build_app_with_admin(),
-        "/admin/users/grant-role",
-        &[("authorization", "Bearer admin-token")],
-        contract.admin_role_grant.request.clone(),
-    )
-    .await;
-
-    assert_eq!(status.as_u16(), contract.admin_role_grant.status);
-    assert_eq!(json, contract.admin_role_grant.json);
+    for (label, q) in [
+        ("grant", &contract.admin_role_grant),
+        ("grant_existing", &contract.admin_role_grant_existing),
+        ("grant_user_not_found", &contract.admin_role_grant_user_not_found),
+        ("grant_role_not_found", &contract.admin_role_grant_role_not_found),
+    ] {
+        let (status, json) = post_json(
+            app.clone(),
+            "/admin/users/grant-role",
+            auth,
+            q.request.clone(),
+        )
+        .await;
+        assert_eq!(status.as_u16(), q.status, "{label}");
+        assert_eq!(json, q.json, "{label}");
+    }
 }
 
 #[tokio::test]
-async fn admin_role_grant_existing_matches_shared_contract() {
+async fn admin_role_revoke_variants_match_shared_contract() {
     let contract = load_contract();
+    let app = build_app_with_admin();
+    let auth = &[("authorization", "Bearer admin-token")];
 
-    let (status, json) = post_json(
-        build_app_with_admin(),
-        "/admin/users/grant-role",
-        &[("authorization", "Bearer admin-token")],
-        contract.admin_role_grant_existing.request.clone(),
-    )
-    .await;
-
-    assert_eq!(status.as_u16(), contract.admin_role_grant_existing.status);
-    assert_eq!(json, contract.admin_role_grant_existing.json);
-}
-
-#[tokio::test]
-async fn admin_role_grant_user_not_found_matches_shared_contract() {
-    let contract = load_contract();
-
-    let (status, json) = post_json(
-        build_app_with_admin(),
-        "/admin/users/grant-role",
-        &[("authorization", "Bearer admin-token")],
-        contract.admin_role_grant_user_not_found.request.clone(),
-    )
-    .await;
-
-    assert_eq!(
-        status.as_u16(),
-        contract.admin_role_grant_user_not_found.status
-    );
-    assert_eq!(json, contract.admin_role_grant_user_not_found.json);
-}
-
-#[tokio::test]
-async fn admin_role_grant_role_not_found_matches_shared_contract() {
-    let contract = load_contract();
-
-    let (status, json) = post_json(
-        build_app_with_admin(),
-        "/admin/users/grant-role",
-        &[("authorization", "Bearer admin-token")],
-        contract.admin_role_grant_role_not_found.request.clone(),
-    )
-    .await;
-
-    assert_eq!(
-        status.as_u16(),
-        contract.admin_role_grant_role_not_found.status
-    );
-    assert_eq!(json, contract.admin_role_grant_role_not_found.json);
-}
-
-#[tokio::test]
-async fn admin_role_revoke_matches_shared_contract() {
-    let contract = load_contract();
-
-    let (status, json) = post_json(
-        build_app_with_admin(),
-        "/admin/users/revoke-role",
-        &[("authorization", "Bearer admin-token")],
-        contract.admin_role_revoke.request.clone(),
-    )
-    .await;
-
-    assert_eq!(status.as_u16(), contract.admin_role_revoke.status);
-    assert_eq!(json, contract.admin_role_revoke.json);
-}
-
-#[tokio::test]
-async fn admin_role_revoke_missing_matches_shared_contract() {
-    let contract = load_contract();
-
-    let (status, json) = post_json(
-        build_app_with_admin(),
-        "/admin/users/revoke-role",
-        &[("authorization", "Bearer admin-token")],
-        contract.admin_role_revoke_missing.request.clone(),
-    )
-    .await;
-
-    assert_eq!(status.as_u16(), contract.admin_role_revoke_missing.status);
-    assert_eq!(json, contract.admin_role_revoke_missing.json);
-}
-
-#[tokio::test]
-async fn admin_role_revoke_user_not_found_matches_shared_contract() {
-    let contract = load_contract();
-
-    let (status, json) = post_json(
-        build_app_with_admin(),
-        "/admin/users/revoke-role",
-        &[("authorization", "Bearer admin-token")],
-        contract.admin_role_revoke_user_not_found.request.clone(),
-    )
-    .await;
-
-    assert_eq!(
-        status.as_u16(),
-        contract.admin_role_revoke_user_not_found.status
-    );
-    assert_eq!(json, contract.admin_role_revoke_user_not_found.json);
-}
-
-#[tokio::test]
-async fn admin_role_revoke_role_not_found_matches_shared_contract() {
-    let contract = load_contract();
-
-    let (status, json) = post_json(
-        build_app_with_admin(),
-        "/admin/users/revoke-role",
-        &[("authorization", "Bearer admin-token")],
-        contract.admin_role_revoke_role_not_found.request.clone(),
-    )
-    .await;
-
-    assert_eq!(
-        status.as_u16(),
-        contract.admin_role_revoke_role_not_found.status
-    );
-    assert_eq!(json, contract.admin_role_revoke_role_not_found.json);
+    for (label, q) in [
+        ("revoke", &contract.admin_role_revoke),
+        ("revoke_missing", &contract.admin_role_revoke_missing),
+        ("revoke_user_not_found", &contract.admin_role_revoke_user_not_found),
+        ("revoke_role_not_found", &contract.admin_role_revoke_role_not_found),
+    ] {
+        let (status, json) = post_json(
+            app.clone(),
+            "/admin/users/revoke-role",
+            auth,
+            q.request.clone(),
+        )
+        .await;
+        assert_eq!(status.as_u16(), q.status, "{label}");
+        assert_eq!(json, q.json, "{label}");
+    }
 }
 
 #[tokio::test]
