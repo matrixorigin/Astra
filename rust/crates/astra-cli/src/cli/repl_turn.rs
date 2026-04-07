@@ -268,8 +268,13 @@ pub(super) fn build_effective_line(line: &str, state: &ReplState) -> String {
         .as_deref()
         .filter(|_| is_short_continuation_prompt(line))
     {
+        let goal_line = state
+            .session_goal
+            .as_deref()
+            .map(|g| format!("Session goal: {g}\n"))
+            .unwrap_or_default();
         effective_line = format!(
-            "[Continuation anchor]\nResume the active task/thread below unless the user explicitly changes topic.\n{anchor}\n\n[User follow-up]\n{effective_line}"
+            "[Continuation anchor]\nResume the active task/thread below unless the user explicitly changes topic.\n{goal_line}{anchor}\n\n[User follow-up]\n{effective_line}"
         );
     }
 
@@ -284,8 +289,29 @@ fn is_short_continuation_prompt(line: &str) -> bool {
 
     matches!(
         trimmed.to_ascii_lowercase().as_str(),
-        "continue" | "continue." | "continue!" | "go on" | "resume"
-    ) || matches!(trimmed, "继续" | "继续。" | "继续！")
+        "continue"
+            | "continue."
+            | "continue!"
+            | "go on"
+            | "go ahead"
+            | "resume"
+            | "do it"
+            | "fix it"
+            | "try it"
+            | "run it"
+            | "yes"
+            | "yes."
+            | "ok"
+            | "ok."
+            | "okay"
+            | "sure"
+            | "proceed"
+            | "next"
+            | "keep going"
+    ) || matches!(
+        trimmed,
+        "继续" | "继续。" | "继续！" | "好的" | "好" | "可以" | "是的" | "对" | "行" | "嗯"
+    )
 }
 
 fn build_continuation_anchor(
@@ -863,6 +889,12 @@ fn apply_turn_success(
     state.total_session_cost += turn_cost;
     state.last_response = Some(result.full_text.clone());
     state.continuation_anchor = build_continuation_anchor(state, line, &result);
+
+    // Capture session goal from the first substantive user message.
+    if state.session_goal.is_none() && !line.trim().is_empty() {
+        let goal: String = line.trim().chars().take(220).collect();
+        state.session_goal = Some(goal);
+    }
     state
         .history
         .push((line.to_string(), result.full_text.clone()));
@@ -1625,13 +1657,29 @@ mod tests {
 
     #[test]
     fn short_continuation_prompt_is_detected() {
+        // Original keywords
         assert!(is_short_continuation_prompt("继续"));
         assert!(is_short_continuation_prompt("continue"));
         assert!(is_short_continuation_prompt("resume"));
+        // Expanded keywords
+        assert!(is_short_continuation_prompt("go ahead"));
+        assert!(is_short_continuation_prompt("do it"));
+        assert!(is_short_continuation_prompt("fix it"));
+        assert!(is_short_continuation_prompt("yes"));
+        assert!(is_short_continuation_prompt("ok"));
+        assert!(is_short_continuation_prompt("sure"));
+        assert!(is_short_continuation_prompt("proceed"));
+        assert!(is_short_continuation_prompt("next"));
+        assert!(is_short_continuation_prompt("keep going"));
+        assert!(is_short_continuation_prompt("好的"));
+        assert!(is_short_continuation_prompt("可以"));
+        assert!(is_short_continuation_prompt("是的"));
+        assert!(is_short_continuation_prompt("行"));
+        // Still rejected
         assert!(!is_short_continuation_prompt(
             "继续修这个 bug，并顺便看下另一个问题"
         ));
-        assert!(!is_short_continuation_prompt("fix this"));
+        assert!(!is_short_continuation_prompt("fix this bug"));
     }
 
     #[test]
@@ -1660,6 +1708,42 @@ mod tests {
         let effective = build_effective_line("修一下输入法问题", &state);
         assert!(!effective.contains("[Continuation anchor]"));
         assert_eq!(effective, "修一下输入法问题");
+    }
+
+    #[test]
+    fn build_effective_line_injects_session_goal_with_anchor() {
+        let state = ReplState {
+            continuation_anchor: Some(
+                "Latest user task: fix auth middleware\nLatest assistant direction: add JWT validation"
+                    .to_string(),
+            ),
+            session_goal: Some("build a REST API with axum".to_string()),
+            ..ReplState::default()
+        };
+
+        let effective = build_effective_line("ok", &state);
+        assert!(
+            effective.contains("[Continuation anchor]"),
+            "anchor injected"
+        );
+        assert!(
+            effective.contains("Session goal: build a REST API with axum"),
+            "session goal present"
+        );
+        assert!(
+            effective.contains("fix auth middleware"),
+            "latest task present"
+        );
+
+        // Without session_goal
+        let state_no_goal = ReplState {
+            continuation_anchor: Some("Latest user task: fix auth".to_string()),
+            session_goal: None,
+            ..ReplState::default()
+        };
+        let effective_no_goal = build_effective_line("sure", &state_no_goal);
+        assert!(effective_no_goal.contains("[Continuation anchor]"));
+        assert!(!effective_no_goal.contains("Session goal:"));
     }
 
     #[test]
