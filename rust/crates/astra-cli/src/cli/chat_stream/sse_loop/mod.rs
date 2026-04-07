@@ -83,6 +83,11 @@ pub(crate) async fn stream_chat_sse(
         );
         Vec::new()
     } else {
+        // Refresh any MCP servers that received tool-list-changed notifications
+        if let Some(ref mgr) = p.mcp_manager {
+            let mut m = mgr.write().await;
+            m.refresh_changed_tools().await;
+        }
         let mut schemas = edge_tools::all_tool_schemas();
         // Inject MCP tool schemas from connected servers
         if let Some(ref mgr) = p.mcp_manager {
