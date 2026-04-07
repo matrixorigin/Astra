@@ -216,3 +216,36 @@ pub struct ReplaySessionRequest {
 fn default_mock_mode() -> Option<bool> {
     Some(true)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn replay_session_request_default_mock_mode() {
+        let req: ReplaySessionRequest = serde_json::from_str("{}").unwrap();
+        assert_eq!(req.mock_mode, Some(true));
+        assert!(req.sandbox_name.is_none());
+    }
+
+    #[test]
+    fn replay_session_request_explicit_mock_false() {
+        let req: ReplaySessionRequest = serde_json::from_str(r#"{"mock_mode": false}"#).unwrap();
+        assert_eq!(req.mock_mode, Some(false));
+    }
+
+    #[test]
+    fn replay_response_skip_serializing_none_sandbox() {
+        let resp = ReplayResponse {
+            replay_id: "r1".into(),
+            session_id: "s1".into(),
+            status: "ok".into(),
+            events_replayed: 0,
+            sandbox_name: None,
+            mock_mode: true,
+            created_at: "now".into(),
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(!json.contains("sandbox_name"));
+    }
+}

@@ -564,3 +564,27 @@ pub struct ListInstalledQuery {
 fn default_limit() -> Option<i64> {
     Some(50)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn list_installed_query_default_limit() {
+        let q: ListInstalledQuery = serde_json::from_str("{}").unwrap();
+        assert_eq!(q.limit, Some(50));
+        assert_eq!(q.offset, None);
+    }
+
+    #[test]
+    fn list_installed_query_explicit_limit_overrides() {
+        let q: ListInstalledQuery = serde_json::from_str(r#"{"limit": 10}"#).unwrap();
+        assert_eq!(q.limit, Some(10));
+    }
+
+    #[test]
+    fn list_installed_query_null_limit_is_none() {
+        let q: ListInstalledQuery = serde_json::from_str(r#"{"limit": null}"#).unwrap();
+        assert_eq!(q.limit, None);
+    }
+}

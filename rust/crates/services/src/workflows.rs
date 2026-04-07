@@ -278,3 +278,55 @@ impl WorkflowService for UnconfiguredWorkflowService {
         Err(internal_error("workflow service not configured"))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn workflow_def_record_round_trip() {
+        let rec = WorkflowDefRecord {
+            workflow_id: "w1".into(),
+            name: "test-wf".into(),
+            version: "1.0.0".into(),
+            description: Some("test workflow".into()),
+            definition: serde_json::json!({"steps": []}),
+            is_active: true,
+        };
+        let json = serde_json::to_string(&rec).unwrap();
+        let back: WorkflowDefRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(rec, back);
+    }
+
+    #[test]
+    fn workflow_run_record_round_trip() {
+        let rec = WorkflowRunRecord {
+            run_id: "r1".into(),
+            workflow_id: "w1".into(),
+            agent_run_id: None,
+            status: "running".into(),
+            waiting_for: Some("approval".into()),
+            current_step_idx: 2,
+            step_results: serde_json::json!([]),
+            error: None,
+        };
+        let json = serde_json::to_string(&rec).unwrap();
+        let back: WorkflowRunRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(rec, back);
+    }
+
+    #[test]
+    fn workflow_list_item_none_description() {
+        let item = WorkflowListItem {
+            workflow_id: "w1".into(),
+            name: "wf".into(),
+            version: "1.0".into(),
+            description: None,
+            is_active: false,
+        };
+        let json = serde_json::to_string(&item).unwrap();
+        assert!(json.contains(r#""description":null"#));
+        let back: WorkflowListItem = serde_json::from_str(&json).unwrap();
+        assert_eq!(item, back);
+    }
+}

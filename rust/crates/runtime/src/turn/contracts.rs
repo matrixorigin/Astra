@@ -214,3 +214,30 @@ pub struct TurnLearningOutcome {
 pub trait TurnLearningWriter: Send + Sync {
     async fn record_outcome(&self, outcome: TurnLearningOutcome) -> Result<(), String>;
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tool_event_persist_plan_default_empty() {
+        let plan = TurnToolEventPersistPlan::default();
+        assert!(plan.events.is_empty());
+    }
+
+    #[test]
+    fn hook_db_persist_plan_default_all_none() {
+        let plan = TurnHookDbPersistPlan::default();
+        assert!(plan.decision_audit.is_none());
+        assert!(plan.skill_selection.is_none());
+        assert!(plan.implicit_feedback.is_none());
+        assert!(plan.reflection_mark.is_none());
+        assert!(plan.reflection_lesson.is_none());
+    }
+
+    #[test]
+    fn core_persist_outcome_default_none() {
+        let outcome = TurnCorePersistOutcome::default();
+        assert!(outcome.llm_response_event_id.is_none());
+    }
+}

@@ -294,3 +294,60 @@ pub struct CreateSandboxRequest {
 pub struct SandboxListQuery {
     pub pattern: Option<String>,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sandbox_record_skip_serializing_none_fields() {
+        let rec = SandboxRecord {
+            sandbox_name: "sb1".into(),
+            description: "test".into(),
+            created_by: "u1".into(),
+            created_at: "now".into(),
+            status: None,
+            user_id: None,
+        };
+        let json = serde_json::to_string(&rec).unwrap();
+        assert!(!json.contains("status"));
+        assert!(!json.contains("user_id"));
+    }
+
+    #[test]
+    fn sandbox_record_includes_present_fields() {
+        let rec = SandboxRecord {
+            sandbox_name: "sb1".into(),
+            description: "test".into(),
+            created_by: "u1".into(),
+            created_at: "now".into(),
+            status: Some("running".into()),
+            user_id: Some("u1".into()),
+        };
+        let json = serde_json::to_string(&rec).unwrap();
+        assert!(json.contains("status"));
+        assert!(json.contains("user_id"));
+    }
+
+    #[test]
+    fn create_sandbox_request_default_description() {
+        let req: CreateSandboxRequest = serde_json::from_str(r#"{"name":"test"}"#).unwrap();
+        assert_eq!(req.name, "test");
+        assert_eq!(req.description, "");
+    }
+
+    #[test]
+    fn sandbox_record_serde_round_trip() {
+        let rec = SandboxRecord {
+            sandbox_name: "sb1".into(),
+            description: "desc".into(),
+            created_by: "u1".into(),
+            created_at: "2024-01-01".into(),
+            status: Some("active".into()),
+            user_id: Some("u1".into()),
+        };
+        let json = serde_json::to_string(&rec).unwrap();
+        let back: SandboxRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(rec, back);
+    }
+}
