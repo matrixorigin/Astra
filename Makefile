@@ -29,7 +29,7 @@ help:
 	@echo "Testing:"
 	@echo "  make test               - Workspace + bridge-e2e-hooks (does not run #[ignore] live-DB E2E)"
 	@echo "  make test-integration   - Same as test + Matrix ignored suites (parallel E2E by default; ASTRA_SYSTEM_MATRIX_E2E_TEST_THREADS=1 to serialize)"
-	@echo "  make test-contract      - Run contract tests (http/admin/auth/config)"
+	@echo "  make test-contract      - Run contract tests (http/admin/config)"
 	@echo ""
 	@echo "Code Quality:"
 	@echo "  make check              - Run all static checks (lint + format + type)"
@@ -444,9 +444,9 @@ test-integration:
 
 .PHONY: test-contract
 test-contract:
-	@echo "Running core HTTP contract binaries (http/admin/auth/config)..."
+	@echo "Running core HTTP contract binaries (http/admin/config)..."
 	@$(CARGO) test $(CARGO_MANIFEST_FLAG) $(API_SHELL_PKG) \
-		--test http_contract --test admin_contract --test auth_contract --test config_contract
+		--test http_contract --test admin_contract --test config_contract
 
 # ============================================================================
 # Code Quality

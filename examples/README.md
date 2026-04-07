@@ -5,7 +5,7 @@ The old checked-in Python examples are gone.
 Current runnable examples for this repository are:
 
 - the CLI flows in `README.md`
-- the contract tests in `rust/crates/api-shell/tests/`
+- the integration/contract tests in `rust/crates/runtime/tests/` (see `docs/guides/testing.md`)
 - the local development commands exposed by `make help`
 
 ## Recommended Hands-On Paths

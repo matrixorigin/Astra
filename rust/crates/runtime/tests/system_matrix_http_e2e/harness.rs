@@ -332,6 +332,8 @@ pub struct MatrixE2eCtx {
     pub pool: sqlx::MySqlPool,
     pub memoria: Arc<E2eMemoriaStub>,
     pub user_id: String,
+    /// Registered username (for duplicate-register negative tests).
+    pub username: String,
     pub session_id: String,
     pub edge_agent_id: String,
     pub suffix: String,
@@ -343,7 +345,7 @@ pub struct BootstrapResult {
     pub refresh_token: String,
 }
 
-const E2E_PASSWORD: &str = "E2e-matrix-pass-9";
+pub const E2E_PASSWORD: &str = "E2e-matrix-pass-9";
 
 /// Build app, connect pool, register user, refresh token, create session (with cleanup of stale rows).
 pub async fn bootstrap() -> BootstrapResult {
@@ -459,6 +461,7 @@ pub async fn bootstrap() -> BootstrapResult {
             pool,
             memoria,
             user_id,
+            username,
             session_id,
             edge_agent_id,
             suffix,

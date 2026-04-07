@@ -6,7 +6,7 @@ Use these files as the canonical configuration references:
 
 - `.env.example`
 - `deployment/all-in-one/.env.example`
-- `rust/crates/api-shell/src/config.rs`
+- `rust/crates/core/src/config.rs` (`AppSettings`, `MATRIXONE_*`, `JWT_*`, embeddings, Memoria, bridge)
 
 ## Core Variables
 

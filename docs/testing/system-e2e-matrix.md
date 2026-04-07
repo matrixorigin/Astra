@@ -38,15 +38,16 @@ Evaluation **read** routes in the full journey use `x-user-id` without bearer (s
 
 ## Test binaries (ignored by default)
 
-Five tests total — overlap with the full journey is avoided (e.g. no separate “basic session” test that repeats the same list/get/close/resume steps).
+Six tests total — overlap with the full journey is avoided (e.g. no separate “basic session” test that repeats the same list/get/close/resume steps).
 
 | Test name | File / module | Scope |
-|-----------|---------------|--------|
+|-----------|---------------|-------|
 | `product_matrix_api_journey_hits_multiple_tables` | `journey_full.rs` | Full journey: sessions (list/get/put, close/resume, activity, **platform snapshot**), agents, events, context, decisions, memory proxy, edge, jobs, sandbox, triggers, skills, introspection, learning, evaluation reads, marketplace probe, `chat/turn` SSE + `agent_events`, audit/replay, logout |
 | `e2e_matrix_tasks_lease_and_db_assertions` | `journey_tasks_runs.rs` | `POST /tasks`, `GET /tasks`, `GET /tasks/{id}`, `GET .../progress`, `agent_tasks`; edge register; lease claim / `GET` lease / renew / release; `task_leases`; `PUT /tasks/{id}/status` |
 | `e2e_matrix_chat_run_pause_resume_http` | `journey_tasks_runs.rs` | `POST /chat` (background run), `POST .../pause`, `GET /chat/runs/{id}`, `POST .../resume` |
 | `e2e_matrix_session_cancel_delete` | `journey_extended.rs` | `POST /sessions/{id}/cancel` + `agent_sessions.status`, `DELETE /sessions/{id}` |
 | `e2e_matrix_chat_stream_session_info` | `journey_extended.rs` | `POST /chat/stream` SSE → `session_info` + `run_id` |
+| `e2e_matrix_auth_session_negative_paths` | `journey_extended.rs` | `GET /sessions` without auth (401); duplicate `POST /auth/register`; bad `POST /auth/login`; successful login |
 
 Shared helpers: `tests/system_matrix_http_e2e/harness.rs` (`bootstrap`, HTTP helpers, `cleanup_*`, row getters, SSE helpers, `wait_for_agent_event_types` — polls `agent_events` after `chat/turn` instead of a fixed sleep).
 
@@ -93,10 +94,10 @@ Legend: **DB** = SQL assertion on MatrixOne; **HTTP** = response-only; **—** =
 | WebSocket | — | `/chat/ws` | — | — |
 | Delegation | — | `/chat/runs/.../delegate` | — | — |
 
-## CI / nightly (optional)
+## CI
 
-- **PR**: keep default `cargo test --workspace` (ignored tests off).
-- **Manual**: `.github/workflows/e2e-matrix-nightly.yml` — `workflow_dispatch` with optional **test name filter** (substring) to run a subset (e.g. `e2e_matrix_tasks`) or leave empty for all ignored tests in the binary. Requires MatrixOne + `AppSettings` env (repo secrets/vars) to succeed.
+- **PR** (`.github/workflows/test.yml`): MatrixOne + Redis service containers; `make test` plus ignored **`system_matrix_http_e2e`** and **`multi_agent_integration`** with env vars set in the workflow. See also [`coverage-matrix.md`](./coverage-matrix.md).
+- **Manual / nightly**: `.github/workflows/e2e-matrix-nightly.yml` — `workflow_dispatch` with optional **test name filter** (substring) to run a subset (e.g. `e2e_matrix_tasks`) or leave empty for all ignored tests in the binary.
 
 ## Router groups alignment
 

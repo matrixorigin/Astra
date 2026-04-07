@@ -24,7 +24,7 @@ if [ -f "$PID_FILE" ]; then
     fi
 fi
 
-# Fallback: kill any remaining Rust api-shell processes
+# Fallback: kill any remaining astra-server processes
 PIDS=$(pgrep -f "astra-server" 2>/dev/null)
 if [ -n "$PIDS" ]; then
     echo "$PIDS" | xargs -r kill 2>/dev/null || true

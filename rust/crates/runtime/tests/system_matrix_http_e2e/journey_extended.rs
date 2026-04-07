@@ -1,11 +1,12 @@
-//! Journeys that do not belong in the monolithic product matrix: session cancel/delete, `/chat/stream`.
+//! Journeys that do not belong in the monolithic product matrix: session cancel/delete, `/chat/stream`,
+//! auth/session negative paths (replaces stub `auth_contract` / `session_contract` coverage).
 use axum::http::StatusCode;
 use serde_json::json;
 use sqlx::Row;
 
 use super::harness::{
-    bootstrap, delete_no_content, get_json, post_empty, post_json_collect_body_text,
-    sse_first_data_json_with_type,
+    E2E_PASSWORD, bootstrap, delete_no_content, get_json, post_empty, post_json,
+    post_json_collect_body_text, sse_first_data_json_with_type,
 };
 
 pub async fn run_session_cancel_then_delete() {
@@ -52,6 +53,74 @@ pub async fn run_session_cancel_then_delete() {
     )
     .await;
     assert_eq!(st_get, StatusCode::NOT_FOUND, "get after delete");
+
+    ctx.pool.close().await;
+}
+
+/// Unauthenticated `/sessions`, duplicate register, and bad password login (real DB + services).
+pub async fn run_auth_and_session_negative_paths() {
+    let b = bootstrap().await;
+    let ctx = &b.ctx;
+    let app = &ctx.app;
+
+    let (st_sess, j_sess) = get_json(app, "/sessions", None, &[]).await;
+    assert_eq!(
+        st_sess,
+        StatusCode::UNAUTHORIZED,
+        "GET /sessions without auth: {j_sess}"
+    );
+
+    let dup_email = format!("dup_{}@e2e.test", ctx.suffix);
+    let (st_dup, j_dup) = post_json(
+        app,
+        "/auth/register",
+        None,
+        json!({
+            "username": ctx.username,
+            "email": dup_email,
+            "password": "DifferentPass-1",
+            "display_name": "duplicate probe"
+        }),
+    )
+    .await;
+    assert_eq!(
+        st_dup,
+        StatusCode::BAD_REQUEST,
+        "duplicate username register: {j_dup}"
+    );
+    assert_eq!(
+        j_dup["detail"].as_str(),
+        Some("Username already exists"),
+        "duplicate username detail: {j_dup}"
+    );
+
+    let (st_bad_login, j_bad) = post_json(
+        app,
+        "/auth/login",
+        None,
+        json!({ "username": ctx.username, "password": "wrong-password-not-real" }),
+    )
+    .await;
+    assert_eq!(
+        st_bad_login,
+        StatusCode::UNAUTHORIZED,
+        "bad password login: {j_bad}"
+    );
+    assert_eq!(
+        j_bad["detail"].as_str(),
+        Some("Invalid username or password"),
+        "bad login detail: {j_bad}"
+    );
+
+    // Sanity: bearer still works after negative calls
+    let (st_ok, j_ok) = post_json(
+        app,
+        "/auth/login",
+        None,
+        json!({ "username": ctx.username, "password": E2E_PASSWORD }),
+    )
+    .await;
+    assert_eq!(st_ok, StatusCode::OK, "login still ok: {j_ok}");
 
     ctx.pool.close().await;
 }

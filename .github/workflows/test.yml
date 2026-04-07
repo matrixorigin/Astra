@@ -6,9 +6,50 @@ on:
   pull_request:
     branches: [ main, develop ]
 
+env:
+  CARGO_TERM_COLOR: always
+  # Align with `astra_core::AppSettings` + MatrixOne / Redis service hostnames (GitHub Actions services).
+  MATRIXONE_HOST: matrixone
+  MATRIXONE_PORT: "6001"
+  MATRIXONE_USER: root
+  MATRIXONE_PASSWORD: "111"
+  MATRIXONE_DATABASE: astra_runtime
+  REDIS_HOST: redis
+  REDIS_PORT: "6379"
+  JWT_SECRET_KEY: ci-jwt-secret-key-at-least-32-chars-long
+  SECRET_KEY: ci-app-secret-key-at-least-32-chars-long
+  TOKEN_ENCRYPTION_KEY: ci-token-encryption-key-at-least-32-chars
+  ASTRA_BRIDGE_TEST_SECRET: system-matrix-e2e-secret
+  CHAT_TURN_BRIDGE_SECRET: dev-bridge-secret-change-me
+  EMBEDDING_PROVIDER: openai
+  EMBEDDING_MODEL: BAAI/bge-m3
+  EMBEDDING_DIM: "0"
+
 jobs:
   test:
     runs-on: ubuntu-latest
+    services:
+      matrixone:
+        image: matrixorigin/matrixone:latest
+        ports:
+          - 6001:6001
+        options: >-
+          --health-cmd "mysql -h127.0.0.1 -P6001 -uroot -p111 -e 'SELECT 1'"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+          --health-start-period 30s
+
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 5
+
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -19,5 +60,40 @@ jobs:
             ~/.cargo/git
           key: ${{ runner.os }}-cargo-registry-${{ hashFiles('rust/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-registry-
-      - name: Run test suite
+
+      - name: Install mysql client (for database bootstrap)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq default-mysql-client
+
+      - name: Wait for MatrixOne and create database
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 90); do
+            if mysql -h matrixone -P6001 -uroot -p111 -e "SELECT 1" 2>/dev/null; then
+              echo "MatrixOne is up"
+              break
+            fi
+            echo "waiting for MatrixOne ($i/90)..."
+            sleep 2
+          done
+          mysql -h matrixone -P6001 -uroot -p111 -e "CREATE DATABASE IF NOT EXISTS astra_runtime;"
+
+      - name: Run test suite (workspace + bridge hooks)
         run: make test
+
+      - name: System Matrix HTTP E2E (ignored)
+        working-directory: rust
+        env:
+          ASTRA_SYSTEM_MATRIX_E2E: "1"
+          ASTRA_SYSTEM_MATRIX_E2E_TEST_THREADS: "1"
+        run: |
+          cargo test -p astra-runtime --test system_matrix_http_e2e \
+            --features bridge-e2e-hooks -- --ignored --test-threads=1 --nocapture
+
+      - name: astra-services multi_agent integration (ignored)
+        env:
+          ASTRA_MULTI_AGENT_IT: "1"
+        run: |
+          cargo test --manifest-path rust/Cargo.toml -p astra-services \
+            --test multi_agent_integration -- --ignored --nocapture
