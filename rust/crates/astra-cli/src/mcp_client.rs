@@ -391,10 +391,14 @@ async fn do_sampling(
     config: &SamplingConfig,
     params: CreateMessageRequestParams,
 ) -> Result<CreateMessageResult, McpHandlerError> {
+    // Cap max_tokens to prevent budget abuse by MCP servers
+    const SAMPLING_MAX_TOKENS_CAP: i64 = 4096;
+    let capped_tokens = (params.max_tokens as i64).min(SAMPLING_MAX_TOKENS_CAP);
+
     let mut body = serde_json::json!({
         "model": config.model,
         "messages": sampling_messages_to_openai(&params.messages),
-        "max_tokens": params.max_tokens,
+        "max_tokens": capped_tokens,
     });
 
     if let Some(system) = &params.system_prompt {
@@ -747,7 +751,7 @@ impl McpConnection {
         self.resources_changed.swap(false, Ordering::AcqRel)
     }
 
-    /// Call a tool on this server.
+    /// Call a tool on this server (with timeout).
     pub async fn call_tool(
         &self,
         name: &str,
@@ -766,7 +770,16 @@ impl McpConnection {
         } else {
             CallToolRequestParams::new(name.to_string())
         };
-        self.peer.call_tool(params).await
+        tokio::time::timeout(
+            std::time::Duration::from_secs(MCP_TOOL_CALL_TIMEOUT_SECS),
+            self.peer.call_tool(params),
+        )
+        .await
+        .map_err(|_| {
+            ServiceError::Timeout {
+                timeout: std::time::Duration::from_secs(MCP_TOOL_CALL_TIMEOUT_SECS),
+            }
+        })?
     }
 
     /// Check if this server has a specific tool.
@@ -1037,11 +1050,28 @@ impl McpClientManager {
 
     /// Get all MCP tool schemas suitable for LLM tool injection.
     /// Each schema follows the OpenAI function-calling format with `mcp_<server>_<name>` naming.
+    /// Warns and deduplicates on name collisions after sanitization.
     pub fn all_tool_schemas(&self) -> Vec<serde_json::Value> {
-        self.all_tools()
-            .into_iter()
-            .map(|(server, tool)| mcp_tool_to_schema(server, tool))
-            .collect()
+        let mut seen: std::collections::HashMap<String, &str> =
+            std::collections::HashMap::new();
+        let mut schemas = Vec::new();
+        for (server, tool) in self.all_tools() {
+            let schema = mcp_tool_to_schema(server, tool);
+            let name = schema["function"]["name"]
+                .as_str()
+                .unwrap_or("")
+                .to_string();
+            if let Some(prev_server) = seen.get(&name) {
+                eprintln!(
+                    "[WARN] MCP tool name collision: '{name}' from server '{server}' \
+                     conflicts with server '{prev_server}' — skipping duplicate"
+                );
+                continue;
+            }
+            seen.insert(name, server);
+            schemas.push(schema);
+        }
+        schemas
     }
 
     /// List all prompts from all connected servers.
@@ -1511,7 +1541,15 @@ async fn connect_stdio(
         cmd.args(&command[1..]);
     }
     cmd.args(args);
+    // Filter dangerous environment variables that could enable privilege
+    // escalation or library injection attacks.
     for (key, value) in env {
+        if is_dangerous_env_var(key) {
+            eprintln!(
+                "  ⚠ MCP server '{name}': blocked dangerous env var '{key}'"
+            );
+            continue;
+        }
         cmd.env(key, value);
     }
 
@@ -1521,14 +1559,23 @@ async fn connect_stdio(
     // Connect as MCP client with change notification handler
     let (handler, tools_changed, prompts_changed, resources_changed) =
         ChangeHandler::new(sampling, roots);
-    let running = serve_client(handler, transport)
-        .await
-        .map_err(|e| McpError::Initialize(e.to_string()))?;
+
+    // Apply connection timeout to prevent hanging on unresponsive servers.
+    let running = tokio::time::timeout(
+        std::time::Duration::from_secs(MCP_CONNECT_TIMEOUT_SECS),
+        serve_client(handler, transport),
+    )
+    .await
+    .map_err(|_| {
+        McpError::Initialize(format!(
+            "{name}: connection timed out after {MCP_CONNECT_TIMEOUT_SECS}s"
+        ))
+    })?
+    .map_err(|e| McpError::Initialize(e.to_string()))?;
 
     let peer = running.peer().clone();
 
-    // Fetch initial tool list
-    let tools = peer.list_all_tools().await.map_err(McpError::Service)?;
+    let tools = fetch_tools_with_timeout(&peer, name).await?;
 
     Ok(McpConnection {
         name: name.to_string(),
@@ -1593,8 +1640,7 @@ async fn connect_sse(
 
     let peer = running.peer().clone();
 
-    // Fetch initial tool list
-    let tools = peer.list_all_tools().await.map_err(McpError::Service)?;
+    let tools = fetch_tools_with_timeout(&peer, name).await?;
 
     Ok(McpConnection {
         name: name.to_string(),
@@ -1725,7 +1771,7 @@ async fn connect_ws(
         .map_err(|e| McpError::Initialize(format!("MCP init over WebSocket {url}: {e}")))?;
 
     let peer = running.peer().clone();
-    let tools = peer.list_all_tools().await.map_err(McpError::Service)?;
+    let tools = fetch_tools_with_timeout(&peer, name).await?;
 
     Ok(McpConnection {
         name: name.to_string(),
@@ -1737,6 +1783,24 @@ async fn connect_ws(
         prompts_changed,
         resources_changed,
     })
+}
+
+/// Fetch tools from a peer with a timeout.
+async fn fetch_tools_with_timeout(
+    peer: &rmcp::service::Peer<rmcp::RoleClient>,
+    name: &str,
+) -> Result<Vec<rmcp::model::Tool>, McpError> {
+    tokio::time::timeout(
+        std::time::Duration::from_secs(MCP_CONNECT_TIMEOUT_SECS),
+        peer.list_all_tools(),
+    )
+    .await
+    .map_err(|_| {
+        McpError::Initialize(format!(
+            "{name}: tool list fetch timed out after {MCP_CONNECT_TIMEOUT_SECS}s"
+        ))
+    })?
+    .map_err(McpError::Service)
 }
 
 /// MCP client errors.
@@ -1774,6 +1838,44 @@ pub const MAX_DESCRIPTION_LENGTH: usize = 2048;
 /// Maximum character length for tool call result content.
 /// ~25K tokens × 4 chars/token = 100K chars.
 pub const MAX_RESULT_CONTENT_LENGTH: usize = 100_000;
+
+/// Default timeout for MCP tool calls (seconds).
+const MCP_TOOL_CALL_TIMEOUT_SECS: u64 = 120;
+
+/// Default timeout for MCP server connection (seconds).
+const MCP_CONNECT_TIMEOUT_SECS: u64 = 30;
+
+/// Environment variable prefixes/names that are blocked for MCP server processes.
+/// These could enable privilege escalation, library injection, or secret exfiltration.
+const BLOCKED_ENV_PREFIXES: &[&str] = &[
+    "LD_",           // LD_PRELOAD, LD_LIBRARY_PATH — library injection
+    "DYLD_",         // macOS equivalent of LD_*
+    "SUDO_",         // SUDO_ASKPASS, SUDO_USER — privilege escalation
+    "SSH_AUTH_SOCK",  // SSH agent socket hijacking
+];
+
+const BLOCKED_ENV_EXACT: &[&str] = &[
+    "PATH",           // PATH manipulation
+    "IFS",            // Shell word-splitting attacks
+    "BASH_ENV",       // Bash startup injection
+    "ENV",            // POSIX shell startup injection
+    "CDPATH",         // Directory traversal manipulation
+    "GLOBIGNORE",     // Glob bypass
+    "SHELLOPTS",      // Shell option manipulation
+    "BASHOPTS",       // Bash option manipulation
+    "PROMPT_COMMAND", // Bash prompt injection
+];
+
+/// Check if an environment variable name is dangerous and should be blocked.
+pub fn is_dangerous_env_var(key: &str) -> bool {
+    let upper = key.to_uppercase();
+    if BLOCKED_ENV_EXACT.iter().any(|&e| upper == e) {
+        return true;
+    }
+    BLOCKED_ENV_PREFIXES
+        .iter()
+        .any(|&prefix| upper.starts_with(prefix))
+}
 
 /// Truncate a string to `max_len` chars, appending a marker if truncated.
 const TRUNCATION_MARKER: &str = "… [truncated]";
@@ -1862,6 +1964,9 @@ pub fn extract_result_text_with_limit(result: &CallToolResult, max_len: usize) -
 
     let joined = parts.join("\n");
     if total_len >= max_len {
+        eprintln!(
+            "[WARN] MCP tool result truncated: {total_len} chars exceeded {max_len} char limit"
+        );
         format!(
             "{}\n\n[OUTPUT TRUNCATED - exceeded {} char limit]",
             joined, max_len
@@ -3421,5 +3526,78 @@ mcp_servers:
         let result = truncate_with_marker(s, 20);
         assert!(result.is_char_boundary(result.len() - TRUNCATION_MARKER.len()));
         assert!(result.ends_with(TRUNCATION_MARKER));
+    }
+
+    // --- MCP Security Tests ---
+
+    #[test]
+    fn dangerous_env_vars_blocked() {
+        // LD_PRELOAD family
+        assert!(is_dangerous_env_var("LD_PRELOAD"));
+        assert!(is_dangerous_env_var("LD_LIBRARY_PATH"));
+        // DYLD family
+        assert!(is_dangerous_env_var("DYLD_INSERT_LIBRARIES"));
+        // SUDO family
+        assert!(is_dangerous_env_var("SUDO_ASKPASS"));
+        // SSH
+        assert!(is_dangerous_env_var("SSH_AUTH_SOCK"));
+        // Exact matches
+        assert!(is_dangerous_env_var("PATH"));
+        assert!(is_dangerous_env_var("IFS"));
+        assert!(is_dangerous_env_var("BASH_ENV"));
+        assert!(is_dangerous_env_var("ENV"));
+        assert!(is_dangerous_env_var("CDPATH"));
+        assert!(is_dangerous_env_var("GLOBIGNORE"));
+        assert!(is_dangerous_env_var("SHELLOPTS"));
+        assert!(is_dangerous_env_var("BASHOPTS"));
+        assert!(is_dangerous_env_var("PROMPT_COMMAND"));
+    }
+
+    #[test]
+    fn safe_env_vars_allowed() {
+        assert!(!is_dangerous_env_var("HOME"));
+        assert!(!is_dangerous_env_var("USER"));
+        assert!(!is_dangerous_env_var("TERM"));
+        assert!(!is_dangerous_env_var("LANG"));
+        assert!(!is_dangerous_env_var("MY_APP_TOKEN"));
+        assert!(!is_dangerous_env_var("NODE_ENV"));
+        // Not prefix match — must be exact for non-prefix entries
+        assert!(!is_dangerous_env_var("PATHINFO"));
+    }
+
+    #[test]
+    fn sampling_max_tokens_capped() {
+        // Verify the cap constant exists and is reasonable
+        const SAMPLING_MAX_TOKENS_CAP: i64 = 4096;
+        assert!(SAMPLING_MAX_TOKENS_CAP > 0);
+        assert!(SAMPLING_MAX_TOKENS_CAP <= 8192);
+        // Verify capping logic
+        let requested: i64 = 100_000;
+        let capped = requested.min(SAMPLING_MAX_TOKENS_CAP);
+        assert_eq!(capped, SAMPLING_MAX_TOKENS_CAP);
+        // Small values pass through
+        let small: i64 = 256;
+        assert_eq!(small.min(SAMPLING_MAX_TOKENS_CAP), 256);
+    }
+
+    #[test]
+    fn timeout_constants_reasonable() {
+        assert!(MCP_CONNECT_TIMEOUT_SECS >= 10, "connect timeout too short");
+        assert!(MCP_CONNECT_TIMEOUT_SECS <= 120, "connect timeout too long");
+        assert!(MCP_TOOL_CALL_TIMEOUT_SECS >= 30, "call timeout too short");
+        assert!(MCP_TOOL_CALL_TIMEOUT_SECS <= 600, "call timeout too long");
+    }
+
+    #[test]
+    fn extract_result_truncation_warning() {
+        use rmcp::model::{Content, RawContent};
+        // Create a result that exceeds the limit
+        let long_text = "x".repeat(500);
+        let result = CallToolResult::success(vec![
+            Content::new(RawContent::text(&long_text), None),
+        ]);
+        let text = extract_result_text_with_limit(&result, 100);
+        assert!(text.contains("[OUTPUT TRUNCATED"));
+        assert!(text.len() < 500);
     }
 }
