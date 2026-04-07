@@ -8235,4 +8235,55 @@ total_tokens_out: 500
         assert_eq!(cli.system_prompt.as_deref(), Some("Be concise"));
         assert_eq!(cli.max_turns, Some(5));
     }
+
+    #[test]
+    fn cli_completion_generates_bash_output() {
+        use clap::CommandFactory;
+        let mut buf = Vec::new();
+        clap_complete::generate(
+            clap_complete::Shell::Bash,
+            &mut Cli::command(),
+            "astra",
+            &mut buf,
+        );
+        let output = String::from_utf8(buf).unwrap();
+        assert!(output.contains("astra"));
+        assert!(output.contains("complete"));
+    }
+
+    #[test]
+    fn cli_completion_generates_zsh_output() {
+        use clap::CommandFactory;
+        let mut buf = Vec::new();
+        clap_complete::generate(
+            clap_complete::Shell::Zsh,
+            &mut Cli::command(),
+            "astra",
+            &mut buf,
+        );
+        let output = String::from_utf8(buf).unwrap();
+        assert!(output.contains("astra"));
+        assert!(!output.is_empty());
+    }
+
+    #[test]
+    fn cli_max_turns_rejects_non_numeric() {
+        let result = Cli::try_parse_from(["astra", "--max-turns", "abc"]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn cli_all_flags_combined() {
+        let cli = Cli::try_parse_from([
+            "astra", "--model", "gpt-4o", "-p", "-y",
+            "--system-prompt", "Review code", "--max-turns", "3",
+            "--output-format", "json",
+        ]).unwrap();
+        assert_eq!(cli.model.as_deref(), Some("gpt-4o"));
+        assert!(cli.print);
+        assert!(cli.yes);
+        assert_eq!(cli.system_prompt.as_deref(), Some("Review code"));
+        assert_eq!(cli.max_turns, Some(3));
+        assert_eq!(cli.output_format, "json");
+    }
 }

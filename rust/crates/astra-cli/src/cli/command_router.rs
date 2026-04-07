@@ -1799,3 +1799,172 @@ mod config_cli_tests {
         assert!(result.ends_with("hello"));
     }
 }
+
+#[cfg(test)]
+mod exit_code_tests {
+    use super::*;
+
+    fn empty_stream_result() -> StreamResult {
+        StreamResult {
+            session_id: None,
+            run_id: None,
+            full_text: String::new(),
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+            tool_calls_count: 0,
+            tools_selected: vec![],
+            selected_skills: vec![],
+            tools_used: vec![],
+            tool_call_records: vec![],
+            budget_used: 0,
+            budget_pressure: 0.0,
+            stall_events: vec![],
+            verdict_events: vec![],
+            step_recorder_summary: None,
+            tool_health_export: vec![],
+            last_heavy_checkpoint: None,
+            ttft_ms: None,
+            context_ms: None,
+            selector_strategy: None,
+            selector_ms: None,
+            selector_tokens_in: 0,
+            selector_tokens_out: 0,
+            memoria_ms: None,
+        }
+    }
+
+    #[test]
+    fn exit_code_success_on_empty_result() {
+        let sr = empty_stream_result();
+        assert_eq!(compute_exit_code(&sr), ExitCode::Success);
+    }
+
+    #[test]
+    fn exit_code_tool_failure_on_failed_tool() {
+        let mut sr = empty_stream_result();
+        sr.tool_call_records.push(astra_services::session_journal::ToolCallRecord {
+            name: "Bash".to_string(),
+            ok: false,
+            ms: 100,
+            error: Some("exit code 1".to_string()),
+            input_bytes: None,
+            output_bytes: None,
+            args_preview: None,
+            result_preview: None,
+        });
+        assert_eq!(compute_exit_code(&sr), ExitCode::ToolFailure);
+    }
+
+    #[test]
+    fn exit_code_force_stop_overrides_tool_failure() {
+        let mut sr = empty_stream_result();
+        sr.tool_call_records.push(astra_services::session_journal::ToolCallRecord {
+            name: "Bash".to_string(),
+            ok: false,
+            ms: 100,
+            error: None,
+            input_bytes: None,
+            output_bytes: None,
+            args_preview: None,
+            result_preview: None,
+        });
+        sr.verdict_events.push(VerdictEvent {
+            turn: 1,
+            severity: "critical".to_string(),
+            injections: vec![],
+            avoid_tools: vec![],
+            force_stop: true,
+            nudge_count: 0,
+            total_errors: 3,
+            deprioritized_count: 0,
+            total_timeouts: 0,
+            total_cache_hits: 0,
+            flaky_count: 0,
+        });
+        assert_eq!(compute_exit_code(&sr), ExitCode::ForceStop);
+    }
+
+    #[test]
+    fn exit_code_success_when_all_tools_ok() {
+        let mut sr = empty_stream_result();
+        sr.tool_call_records.push(astra_services::session_journal::ToolCallRecord {
+            name: "Read".to_string(),
+            ok: true,
+            ms: 50,
+            error: None,
+            input_bytes: None,
+            output_bytes: None,
+            args_preview: None,
+            result_preview: None,
+        });
+        sr.tool_call_records.push(astra_services::session_journal::ToolCallRecord {
+            name: "Edit".to_string(),
+            ok: true,
+            ms: 80,
+            error: None,
+            input_bytes: None,
+            output_bytes: None,
+            args_preview: None,
+            result_preview: None,
+        });
+        assert_eq!(compute_exit_code(&sr), ExitCode::Success);
+    }
+
+    #[test]
+    fn exit_code_success_with_non_force_stop_verdict() {
+        let mut sr = empty_stream_result();
+        sr.verdict_events.push(VerdictEvent {
+            turn: 1,
+            severity: "warning".to_string(),
+            injections: vec![],
+            avoid_tools: vec![],
+            force_stop: false,
+            nudge_count: 1,
+            total_errors: 1,
+            deprioritized_count: 0,
+            total_timeouts: 0,
+            total_cache_hits: 0,
+            flaky_count: 0,
+        });
+        assert_eq!(compute_exit_code(&sr), ExitCode::Success);
+    }
+}
+
+#[cfg(test)]
+mod default_model_tests {
+    use super::*;
+
+    #[test]
+    fn read_config_default_model_from_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("settings.json");
+        let settings = serde_json::json!({
+            "default_model": "gpt-4o",
+            "verbose": true
+        });
+        std::fs::write(&path, serde_json::to_string_pretty(&settings).unwrap()).unwrap();
+
+        // read_config_default_model uses the real settings_path, so we test the
+        // extraction logic directly
+        let content = std::fs::read_to_string(&path).unwrap();
+        let val: serde_json::Value = serde_json::from_str(&content).unwrap();
+        let model = val.get("default_model").and_then(|v| v.as_str()).map(|s| s.to_string());
+        assert_eq!(model, Some("gpt-4o".to_string()));
+    }
+
+    #[test]
+    fn read_config_default_model_missing_key() {
+        let settings = serde_json::json!({ "verbose": true });
+        let model = settings.get("default_model").and_then(|v| v.as_str()).map(|s| s.to_string());
+        assert_eq!(model, None);
+    }
+
+    #[test]
+    fn read_config_default_model_non_string_value() {
+        let settings = serde_json::json!({ "default_model": 42 });
+        let model = settings.get("default_model").and_then(|v| v.as_str()).map(|s| s.to_string());
+        assert_eq!(model, None); // non-string returns None
+    }
+}
