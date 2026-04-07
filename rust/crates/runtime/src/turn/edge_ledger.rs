@@ -175,19 +175,27 @@ pub fn strip_stale_reasoning(messages: &mut [Value]) {
         return; // No reasoning in history — nothing to strip.
     };
 
+    // Thinking is active — every assistant message with tool_calls must have
+    // `reasoning_content` (even empty string) or providers like Kimi return 400.
     for (i, msg) in messages.iter_mut().enumerate() {
-        if i >= last_idx {
-            break;
-        }
         if msg.get("role").and_then(Value::as_str) != Some("assistant") {
             continue;
         }
-        if msg
-            .get("reasoning_content")
-            .and_then(Value::as_str)
-            .is_some_and(|s| !s.is_empty())
-        {
-            // Replace with empty string (keep field for API compat).
+        if i < last_idx {
+            if msg
+                .get("reasoning_content")
+                .and_then(Value::as_str)
+                .is_some_and(|s| !s.is_empty())
+            {
+                // Replace with empty string (keep field for API compat).
+                msg["reasoning_content"] = Value::String(String::new());
+            } else if msg.get("reasoning_content").is_none() && msg.get("tool_calls").is_some() {
+                // Assistant tool_call message from before thinking was enabled —
+                // add the field so the provider doesn't reject it.
+                msg["reasoning_content"] = Value::String(String::new());
+            }
+        } else if msg.get("reasoning_content").is_none() && msg.get("tool_calls").is_some() {
+            // Even at or after last_idx, ensure the field exists on tool_call messages.
             msg["reasoning_content"] = Value::String(String::new());
         }
     }
@@ -403,5 +411,29 @@ mod tests {
         // Already-empty field stays empty (not removed).
         assert_eq!(msgs[0]["reasoning_content"].as_str(), Some(""));
         assert_eq!(msgs[1]["reasoning_content"].as_str(), Some("real"));
+    }
+
+    #[test]
+    fn strip_stale_reasoning_adds_field_to_tool_call_msg_missing_it() {
+        // Simulates mid-session model switch: old assistant+tool_calls messages
+        // lack reasoning_content, but a later thinking-model message has it.
+        let mut msgs = vec![
+            json!({"role": "user", "content": "q1"}),
+            json!({"role": "assistant", "content": null, "tool_calls": [{"id":"t1","type":"function","function":{"name":"bash","arguments":"{}"}}]}),
+            json!({"role": "tool", "tool_call_id": "t1", "content": "ok"}),
+            json!({"role": "assistant", "content": "done"}),
+            json!({"role": "user", "content": "q2"}),
+            json!({"role": "assistant", "content": null, "reasoning_content": "think", "tool_calls": [{"id":"t2","type":"function","function":{"name":"bash","arguments":"{}"}}]}),
+            json!({"role": "tool", "tool_call_id": "t2", "content": "ok2"}),
+        ];
+        strip_stale_reasoning(&mut msgs);
+        // Old assistant+tool_calls at index 1 must now have reasoning_content
+        assert_eq!(
+            msgs[1]["reasoning_content"].as_str(),
+            Some(""),
+            "missing reasoning_content must be added as empty string"
+        );
+        // Latest reasoning preserved
+        assert_eq!(msgs[5]["reasoning_content"].as_str(), Some("think"));
     }
 }
