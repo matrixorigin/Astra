@@ -483,6 +483,8 @@ impl ToolExecutor {
         let lines: Vec<&str> = content.lines().collect();
         let s = start.unwrap_or(1).saturating_sub(1).min(lines.len());
         let e = end.unwrap_or(lines.len()).min(lines.len());
+        // Auto-swap if the LLM accidentally reversed start/end.
+        let (s, e) = if s > e { (e, s) } else { (s, e) };
         if s >= e {
             return format!(
                 "(empty range: start_line {} >= end_line {} or file has only {} lines)",

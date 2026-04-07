@@ -100,12 +100,17 @@ impl PlanAssembleLineSpinner {
         let stop2 = stop.clone();
         let handle = std::thread::spawn(move || {
             let t0 = origin;
-            // Use interruptible sleep so stop_clear() doesn't block waiting for this delay
-            if !interruptible_sleep(
-                std::time::Duration::from_millis(SPINNER_SHOW_DELAY_MS),
-                &stop2,
-            ) {
-                return;
+            // Chat request prep paints immediately (the user just finished a tool round
+            // or typed a message — any gap feels like a freeze).  Plan-assemble keeps
+            // the delay to avoid flicker on fast operations.
+            let skip_delay = matches!(kind, SecStatusLineKind::ChatRequestPrep);
+            if !skip_delay {
+                if !interruptible_sleep(
+                    std::time::Duration::from_millis(SPINNER_SHOW_DELAY_MS),
+                    &stop2,
+                ) {
+                    return;
+                }
             }
             let poll_phase =
                 matches!(kind, SecStatusLineKind::ChatRequestPrep) && chat_prep_phase.is_some();
