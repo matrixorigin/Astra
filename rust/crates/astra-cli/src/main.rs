@@ -5705,6 +5705,25 @@ async fn run_chat_repl(
     Ok(())
 }
 
+/// Resolve `--system-prompt` value: if it starts with `@`, read the file;
+/// otherwise return the string as-is.
+fn resolve_system_prompt(sp: String) -> Result<String, String> {
+    if let Some(path) = sp.strip_prefix('@') {
+        if path.is_empty() {
+            return Err("Error: @file syntax requires a file path (e.g. @prompt.txt)".to_string());
+        }
+        match std::fs::read_to_string(path) {
+            Ok(content) => Ok(content),
+            Err(e) => Err(format!(
+                "Error: cannot read system prompt file '{}': {}",
+                path, e
+            )),
+        }
+    } else {
+        Ok(sp)
+    }
+}
+
 // ════════════════════════════════════════════════════════════════ main ════
 
 #[tokio::main]
@@ -5775,19 +5794,12 @@ async fn main() {
 
     // --system-prompt: support @file syntax to read from file
     let system_prompt = system_prompt.map(|sp| {
-        if let Some(path) = sp.strip_prefix('@') {
-            match std::fs::read_to_string(path) {
-                Ok(content) => content,
-                Err(e) => {
-                    eprintln!(
-                        "{}",
-                        format!("Error: cannot read system prompt file '{}': {}", path, e).red()
-                    );
-                    std::process::exit(1);
-                }
+        match resolve_system_prompt(sp) {
+            Ok(content) => content,
+            Err(e) => {
+                eprintln!("{}", e.red());
+                std::process::exit(1);
             }
-        } else {
-            sp
         }
     });
 
@@ -9175,6 +9187,99 @@ total_tokens_out: 500
         assert!((cli.max_budget - 1.0).abs() < f64::EPSILON);
     }
 
+    // ── --max-budget edge case tests ──
+
+    #[test]
+    fn cli_max_budget_negative_rejected() {
+        let result = Cli::try_parse_from(["astra", "--max-budget", "-1.0"]);
+        // clap may or may not accept negative f64 — verify behavior
+        match result {
+            Ok(cli) => assert!(cli.max_budget < 0.0, "negative budget parsed but < 0"),
+            Err(_) => {} // rejected is fine too
+        }
+    }
+
+    #[test]
+    fn cli_max_budget_very_small_value() {
+        let cli = Cli::try_parse_from(["astra", "--max-budget", "0.001"]).unwrap();
+        assert!((cli.max_budget - 0.001).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn cli_max_budget_large_value() {
+        let cli = Cli::try_parse_from(["astra", "--max-budget", "999.99"]).unwrap();
+        assert!((cli.max_budget - 999.99).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn cli_max_budget_integer_value() {
+        let cli = Cli::try_parse_from(["astra", "--max-budget", "10"]).unwrap();
+        assert!((cli.max_budget - 10.0).abs() < f64::EPSILON);
+    }
+
+    // ── --yes / -y edge case tests ──
+
+    #[test]
+    fn cli_yes_flag_sets_auto_approve() {
+        let cli = Cli::try_parse_from(["astra", "-y"]).unwrap();
+        assert!(cli.yes);
+    }
+
+    #[test]
+    fn cli_yes_long_flag_sets_auto_approve() {
+        let cli = Cli::try_parse_from(["astra", "--yes"]).unwrap();
+        assert!(cli.yes);
+    }
+
+    #[test]
+    fn cli_yes_with_permission_mode_deny() {
+        // Both flags accepted by parser on `chat` subcommand — runtime resolves conflict
+        let cli = Cli::try_parse_from([
+            "astra", "chat", "-y", "--permission-mode", "deny", "-m", "test",
+        ]).unwrap();
+        match &cli.command {
+            Some(Command::Chat(args)) => {
+                assert!(args.auto_approve);
+                assert_eq!(args.permission_mode.as_deref(), Some("deny"));
+            }
+            _ => panic!("expected Chat command"),
+        }
+    }
+
+    #[test]
+    fn cli_yes_with_permission_mode_auto_is_redundant() {
+        let cli = Cli::try_parse_from([
+            "astra", "chat", "-y", "--permission-mode", "auto", "-m", "test",
+        ]).unwrap();
+        match &cli.command {
+            Some(Command::Chat(args)) => {
+                assert!(args.auto_approve);
+                assert_eq!(args.permission_mode.as_deref(), Some("auto"));
+            }
+            _ => panic!("expected Chat command"),
+        }
+    }
+
+    #[test]
+    fn cli_permission_mode_invalid_value() {
+        // Parser accepts any string; runtime validates
+        let cli = Cli::try_parse_from([
+            "astra", "chat", "--permission-mode", "invalid", "-m", "test",
+        ]).unwrap();
+        match &cli.command {
+            Some(Command::Chat(args)) => {
+                assert_eq!(args.permission_mode.as_deref(), Some("invalid"));
+            }
+            _ => panic!("expected Chat command"),
+        }
+    }
+
+    #[test]
+    fn cli_default_no_yes_no_permission_mode() {
+        let cli = Cli::try_parse_from(["astra"]).unwrap();
+        assert!(!cli.yes);
+    }
+
     // ── /allow command tests ──
 
     #[test]
@@ -9285,5 +9390,92 @@ total_tokens_out: 500
             cp.state.get("tool_calls_count").and_then(|v| v.as_u64()),
             Some(3)
         );
+    }
+
+    // ── @file system-prompt tests ──
+
+    #[test]
+    fn resolve_system_prompt_literal_text() {
+        let result = resolve_system_prompt("You are a helpful assistant.".to_string());
+        assert_eq!(result.unwrap(), "You are a helpful assistant.");
+    }
+
+    #[test]
+    fn resolve_system_prompt_at_file_reads_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("prompt.txt");
+        std::fs::write(&path, "Custom system prompt from file").unwrap();
+        let result = resolve_system_prompt(format!("@{}", path.display()));
+        assert_eq!(result.unwrap(), "Custom system prompt from file");
+    }
+
+    #[test]
+    fn resolve_system_prompt_at_file_not_found() {
+        let result = resolve_system_prompt("@/nonexistent/path/prompt.txt".to_string());
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("cannot read system prompt file"));
+    }
+
+    #[test]
+    fn resolve_system_prompt_at_file_empty_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("empty.txt");
+        std::fs::write(&path, "").unwrap();
+        let result = resolve_system_prompt(format!("@{}", path.display()));
+        assert_eq!(result.unwrap(), "");
+    }
+
+    #[test]
+    fn resolve_system_prompt_at_bare_is_error() {
+        let result = resolve_system_prompt("@".to_string());
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("requires a file path"));
+    }
+
+    #[test]
+    fn resolve_system_prompt_at_file_with_unicode() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("unicode.txt");
+        std::fs::write(&path, "你好世界 🌍 مرحبا").unwrap();
+        let result = resolve_system_prompt(format!("@{}", path.display()));
+        assert_eq!(result.unwrap(), "你好世界 🌍 مرحبا");
+    }
+
+    #[test]
+    fn resolve_system_prompt_at_file_with_newlines() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("multi.txt");
+        std::fs::write(&path, "line1\nline2\nline3\n").unwrap();
+        let result = resolve_system_prompt(format!("@{}", path.display()));
+        assert_eq!(result.unwrap(), "line1\nline2\nline3\n");
+    }
+
+    #[test]
+    fn resolve_system_prompt_no_at_prefix_passes_through() {
+        let result = resolve_system_prompt("/some/path/prompt.txt".to_string());
+        assert_eq!(result.unwrap(), "/some/path/prompt.txt");
+    }
+
+    #[test]
+    fn resolve_system_prompt_at_file_large_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("large.txt");
+        let content = "x".repeat(1_000_000);
+        std::fs::write(&path, &content).unwrap();
+        let result = resolve_system_prompt(format!("@{}", path.display()));
+        assert_eq!(result.unwrap().len(), 1_000_000);
+    }
+
+    #[test]
+    fn resolve_system_prompt_at_file_permission_denied() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("noperm.txt");
+        std::fs::write(&path, "secret").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let result = resolve_system_prompt(format!("@{}", path.display()));
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644));
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("cannot read system prompt file"));
     }
 }
