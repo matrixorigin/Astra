@@ -904,6 +904,43 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
             },
         )) {
             AgenticIngestIterationControl::Fatal(e) => {
+                // ── Rate-limit graceful degradation ──────────────────────
+                // When the error is a rate-limit (429 / TPM exceeded) AND
+                // the loop has already done meaningful work (tool calls
+                // executed, files written), convert from hard failure to
+                // graceful completion.  This preserves the conversation
+                // context so the next turn can continue where we left off,
+                // instead of losing all accumulated tool results.
+                let lower = e.to_lowercase();
+                let is_rate_limit = lower.contains("rate")
+                    || lower.contains("429")
+                    || lower.contains("too many requests")
+                    || lower.contains("tpm")
+                    || lower.contains("rpm");
+
+                if is_rate_limit && state.total_tool_calls > 0 {
+                    if !quiet {
+                        host.emit_headless_line(
+                            HeadlessStderrStyle::Yellow,
+                            format!(
+                                "⚠ Rate limit hit after {} tool calls — preserving work.",
+                                state.total_tool_calls,
+                            ),
+                        );
+                    }
+                    // Synthesize a final text so the conversation has a
+                    // meaningful assistant message (not an empty failure).
+                    state.final_text = format!(
+                        "[Rate limit reached after {} tool call(s). \
+                         All completed tool results are preserved above. \
+                         You can continue from where I left off in the next message.]\n\n\
+                         Error: {}",
+                        state.total_tool_calls, e,
+                    );
+                    try_write_heavy_checkpoint(state);
+                    return Ok(AgenticLoopOutcome::Completed);
+                }
+
                 try_write_heavy_checkpoint(state);
                 return Err(e);
             }
@@ -4355,5 +4392,100 @@ mod tests {
         // Should complete (hard stop), not error.
         assert!(outcome.is_ok());
         assert!(state.budget_wrapup_injected);
+    }
+
+    // ── Rate-limit graceful degradation tests ───────────────────────────────
+
+    fn error_result(error_msg: &str, prompt: u64, completion: u64) -> HostTurnResult {
+        HostTurnResult {
+            accum: ChatTurnSseAccum {
+                error_message: Some(error_msg.to_string()),
+                has_usage: true,
+                prompt_tokens: prompt,
+                completion_tokens: completion,
+                ..ChatTurnSseAccum::default()
+            },
+            ttft_ms: None,
+            edge_tool_round: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn rate_limit_after_tool_calls_preserves_work() {
+        // Turn 1: successful tool execution
+        // Turn 2: 429 rate limit error
+        // Expected: graceful completion (Ok), not hard error (Err)
+        let mut host = MockHost::new(vec![
+            edge_tool_result(
+                vec![make_edge_tool("bash", "file list output")],
+                20_000,
+                1000,
+                Some(200),
+            ),
+            error_result("Error: 429 Too Many Requests (after 3 retries)", 30_000, 0),
+        ]);
+        let mut state = make_state();
+        state
+            .messages
+            .push(json!({"role": "user", "content": "review code"}));
+
+        let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
+        assert!(outcome.is_ok(), "429 after tool calls should complete gracefully, got: {outcome:?}");
+        assert!(
+            state.final_text.contains("Rate limit reached"),
+            "final_text should mention rate limit: {}",
+            state.final_text,
+        );
+        assert!(
+            state.final_text.contains("1 tool call"),
+            "final_text should mention tool call count",
+        );
+    }
+
+    #[tokio::test]
+    async fn rate_limit_without_tool_calls_is_fatal() {
+        // Turn 1: 429 rate limit error immediately (no prior tool work)
+        // Expected: hard error (Err), because nothing to preserve
+        let mut host = MockHost::new(vec![error_result(
+            "Error: rate limit exceeded (after 3 retries)",
+            0,
+            0,
+        )]);
+        let mut state = make_state();
+        state
+            .messages
+            .push(json!({"role": "user", "content": "hello"}));
+
+        let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
+        assert!(
+            outcome.is_err(),
+            "429 without prior work should be a hard error",
+        );
+    }
+
+    #[tokio::test]
+    async fn non_rate_limit_error_is_always_fatal() {
+        // Turn 1: successful tool execution
+        // Turn 2: non-429 error (e.g., auth error)
+        // Expected: hard error (Err) even with prior tool work
+        let mut host = MockHost::new(vec![
+            edge_tool_result(
+                vec![make_edge_tool("bash", "some output")],
+                20_000,
+                1000,
+                Some(200),
+            ),
+            error_result("Error: authentication failed", 0, 0),
+        ]);
+        let mut state = make_state();
+        state
+            .messages
+            .push(json!({"role": "user", "content": "do stuff"}));
+
+        let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
+        assert!(
+            outcome.is_err(),
+            "non-rate-limit error should always be fatal",
+        );
     }
 }
