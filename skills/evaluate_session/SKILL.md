@@ -30,6 +30,16 @@ $ARGUMENTS
 
 ## 2. Gather Session Data
 
+Use `astra journal digest` first (preferred — offline, no DB needed). Fall back to SQL only when digest is unavailable or when cross-session comparison is needed.
+
+```bash
+# Preferred: use journal digest (offline, no login)
+astra journal digest <session_id>
+astra journal digest --focus summary
+```
+
+If digest is unavailable, query the cloud database:
+
 ```sql
 SELECT 
   event_type, model, skill_name,
@@ -87,9 +97,9 @@ If the user requests optimization, calculate dimension scores and suggest action
 | **balanced** | Weighted: cost 0.3, accuracy 0.4, latency 0.3 | Moderate trade-offs |
 
 ### Scoring
-- **Cost**: `1 - (actual_tokens / baseline_tokens)`
+- **Cost**: `1 - (actual_tokens / baseline_tokens)` where baseline = user_queries × 20,000 (moderate threshold)
 - **Accuracy**: `successful_completions / total_completions`
-- **Latency**: `1 - (actual_calls / baseline_calls)`
+- **Latency**: `1 - (actual_calls / baseline_calls)` where baseline = user_queries × 4 (good threshold)
 
 Show before/after comparison with explicit trade-off impact.
 
@@ -136,3 +146,13 @@ Show before/after comparison with explicit trade-off impact.
 **Cost optimization:** Aggressive compaction, reduce history, smaller model.
 **Accuracy optimization:** Larger context, verification steps, larger model.
 **Latency optimization:** Fewer calls, parallel tools, caching.
+
+---
+
+## Reference: Key Source Files
+
+| Component | File |
+|-----------|------|
+| Journal digest CLI | `rust/crates/astra-cli/src/cli/journal_digest.rs` |
+| Session journal | `rust/crates/services/src/session_journal.rs` |
+| Event ingestion | `rust/crates/services/src/event_ingestion.rs` |

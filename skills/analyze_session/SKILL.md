@@ -1,14 +1,17 @@
 ---
 name: analyze-session
-description: "Developer skill: diagnostic analysis of an astra session. Primary input is `astra journal digest` (stable JSON from local ~/.astra/sessions). Optional deep dive: heavy checkpoints, debug JSON."
+description: "Developer skill: diagnostic analysis and debugging of an astra session. Primary input is `astra journal digest` (stable JSON from local ~/.astra/sessions). Optional deep dive: heavy checkpoints, debug JSON, stall/escalation forensics."
 user_invocable: true
-when_to_use: "When the user wants to analyze a past session for token waste, tool selection accuracy, or context efficiency"
+when_to_use: "When the user wants to analyze a past session for token waste, tool selection accuracy, context efficiency, or diagnose why a session is stuck, slow, or looping"
 arguments:
   - name: TARGET
     description: "Session ID, debug JSON path (/tmp/debug-*.json), or keyword ('this', 'last'). Omit to analyze most recent."
     required: false
   - name: FOCUS
-    description: "Interpretation focus: 'context', 'tools', 'tokens', 'errors', 'flow', or 'all' (default: all)"
+    description: "Interpretation focus: 'context', 'tools', 'tokens', 'errors', 'flow', 'debug', or 'all' (default: all)"
+    required: false
+  - name: SYMPTOM
+    description: "For debug focus: 'stuck', 'slow', 'looping', 'wrong-tools', 'errors', or 'all' (default: all)"
     required: false
 allowed_tools:
   - bash
@@ -82,6 +85,118 @@ Use **only** digest fields. Quote or paraphrase numbers from JSON; do not estima
 
 **context**: `context_ms`, `memoria_ms`, `ttft_ms`, `budget_pressure` patterns.
 
+**debug**: Deep root-cause diagnosis — proceed to Phase 2D below.
+
+---
+
+## Phase 2D: Debug Diagnosis (FOCUS=debug)
+
+When FOCUS is `debug`, perform deep root-cause analysis using journal data. Check ALL symptom categories even if SYMPTOM is specified — problems compound.
+
+### 2D.1 Stall Pattern Analysis
+
+Astra's stall detector (`turn/stall.rs`) recognizes three patterns:
+
+| Stall Type | Pattern | Journal Field |
+|------------|---------|---------------|
+| **sig_stall** | Same tool signature (name + args shape) repeated ≥3 times | `stall_type: "sig_stall"` |
+| **name_stall** | Same tool names repeating across turns | `stall_type: "name_stall"` |
+| **divergence** | Only exploration tools used for N+ rounds, no progress | `stall_type: "divergence"` |
+
+Extract from journal: `type == "StallDetected" OR stall_type != null`
+
+For each stall event, check:
+1. **Was the nudge effective?** Compare tools_used in the stall turn vs next 2 turns
+2. **Did the agent change approach?** Look at `tools_selected` changes
+3. **How many nudges total?** Count stall events — each nudge reduces confidence
+
+### 2D.2 Turn Guard Escalation Analysis
+
+Astra's `TurnGuard` (`turn/turn_guard.rs`) has 3 escalation levels:
+
+| Level | Trigger | Action |
+|-------|---------|--------|
+| **Normal** | nudge_count < 2 AND total_errors < 5 | Hints only |
+| **Warning** | nudge_count ≥ 2 OR total_errors ≥ 5 | Explicit tool avoidance |
+| **Critical** | nudge_count ≥ 3 + errors ≥ 2, OR errors ≥ 8 + deprioritized, OR errors ≥ 10 | Restrict to read-only, force stop on 2nd critical |
+
+Extract from journal: `type == "TurnGuardVerdict"`
+
+Check the escalation trajectory:
+- Normal → Warning → Critical = proper escalation
+- Stuck at Warning for 5+ turns = guard not escalating enough
+- Jump straight to Critical = catastrophic failure cascade
+
+### 2D.3 Tool Health Degradation
+
+From `tool_calls` arrays across turns, build per-tool health:
+
+| Tool | Calls | Consecutive Fails | Deprioritized? | Timeout-Dominant? |
+|------|-------|-------------------|----------------|-------------------|
+
+Flags:
+- 🔴 Tool deprioritized but still being called
+- 🔴 Same tool failing >5 times consecutively
+- 🟡 Tool with >50% timeout rate
+
+### 2D.4 Error Cascade Detection
+
+Build an error timeline from `type == "TurnError" OR type == "Error" OR tool_calls[].ok == false`:
+
+| Turn | Error Source | Error Message | Recovery Action | Recovered? |
+|------|-------------|---------------|-----------------|------------|
+
+Cascade patterns:
+- **Error → Retry → Same Error** = blind retry (no adaptation)
+- **Error → Different Error** = downstream failure
+- **Error → Compaction → Lost Context → More Errors** = compaction-induced amnesia
+- **5+ errors in 3 turns** = catastrophic cascade
+
+### 2D.5 Latency Analysis
+
+| Symptom | Threshold | Root Cause |
+|---------|-----------|------------|
+| High TTFT | >10s | LLM provider latency or huge prompt |
+| High context_ms | >2s | Prompt assembly bottleneck |
+| High selector_ms | >1s | Tool selection bottleneck |
+| High duration_ms with no tools | >120s | LLM generating very long response or stalling |
+
+### 2D.6 Root Cause Decision Tree
+
+```
+Session stuck/looping?
+├─ StallDetected events exist?
+│  ├─ sig_stall → Agent repeating exact same tool calls
+│  ├─ name_stall → Agent cycling through same tool types
+│  └─ divergence → Agent exploring endlessly without progress
+├─ No StallDetected but looping?
+│  └─ Stall detector window too wide (default 6)
+│
+Session producing wrong results?
+├─ Tool selection accuracy low? (<50% tools_used/tools_selected)
+├─ Skill injection issues? (irrelevant skills bloating context)
+├─ Compaction lost critical context? (tokens_in drops then agent re-asks)
+│
+Session slow?
+├─ High TTFT? → LLM provider issue or prompt too large
+├─ High context_ms? → Too many tools selected
+├─ High selector_ms? → Switch to tfidf or reduce tool pool
+├─ Long tool execution? → Check tool_calls[].ms for outliers
+└─ Frequent compaction? → Context window too small for task
+```
+
+### 2D.7 Correction Effectiveness
+
+For each TurnGuard correction in the journal, evaluate:
+
+| Turn | Correction Type | Avoid Tools | Followed? | Effective? |
+|------|----------------|-------------|-----------|------------|
+
+- ✅ **Effective**: Agent changed approach, resolved within 2 turns
+- ⚠️ **Partially effective**: Changed tools but problem persisted
+- ❌ **Ignored**: Same tools despite nudge
+- 🔄 **Wrong correction**: Avoided tool was actually needed
+
 ---
 
 ## Phase 3: Optional deep dive (only if user needs message-level proof)
@@ -91,9 +206,21 @@ Use **only** digest fields. Quote or paraphrase numbers from JSON; do not estima
 
 Do not rebuild Phase-2 statistics from these files if digest already covered them.
 
+### 3.1 Checkpoint Forensics (for debug focus)
+
+When heavy checkpoints exist and FOCUS=debug:
+- **System message size**: token count of system prompt
+- **Tool schemas present**: count tool definitions
+- **History depth**: assistant/user/tool turns in context
+- **Largest tool result**: which tool result consumes most tokens
+- **Repeated content**: same file path appearing multiple times
+- **Nudge messages**: system-role messages containing "STALL" or "DIVERGENCE" or "avoid" — check if agent acknowledged them
+
 ---
 
-## Phase 4: Report template
+## Phase 4: Report
+
+### Standard Report (FOCUS ≠ debug)
 
 Keep the report compact and grounded in digest JSON.
 
@@ -103,15 +230,68 @@ Keep the report compact and grounded in digest JSON.
 4. **Issues**: bullet list tied to digest evidence (stalls, errors, token spikes, missing compactions).
 5. **Recommendations**: 3–5 actionable items.
 
+### Debug Report (FOCUS=debug)
+
+```
+╔══════════════════════════════════════════════════════════════╗
+║  🔧 Astra Session Debug Report                              ║
+║  Session: {session_id}                                       ║
+║  Symptom: {primary_symptom}                                  ║
+╠══════════════════════════════════════════════════════════════╣
+║                                                              ║
+║  🎯 Root Cause: {one-line diagnosis}                         ║
+║                                                              ║
+║  📋 Evidence Chain:                                          ║
+║  ├─ Turn {n}: {first symptom observed}                       ║
+║  ├─ Turn {n}: {escalation/cascade}                           ║
+║  ├─ Turn {n}: {correction attempted}                         ║
+║  └─ Turn {n}: {current state}                                ║
+║                                                              ║
+║  ⚙️ Internal State:                                         ║
+║  ├─ Escalation level: {Normal/Warning/Critical}              ║
+║  ├─ Stall nudges sent: {n}                                   ║
+║  ├─ Tools deprioritized: {list}                              ║
+║  ├─ Consecutive errors: {n}                                  ║
+║  └─ Correction effectiveness: {n}/{total} followed           ║
+║                                                              ║
+║  🔴 Primary Issue                                            ║
+║  {detailed explanation of root cause}                        ║
+║                                                              ║
+║  🟡 Contributing Factors                                     ║
+║  {secondary issues}                                          ║
+║                                                              ║
+║  💊 Recommended Fix                                          ║
+║  {specific actions — code/config changes with file refs}     ║
+║                                                              ║
+╚══════════════════════════════════════════════════════════════╝
+```
+
+### Common Debug Diagnoses & Fixes
+
+| Diagnosis | Fix |
+|-----------|-----|
+| Stall detector window too wide | Reduce `STALL_WINDOW` in `stall.rs` |
+| Nudge ignored by LLM | Strengthen nudge language in `build_stall_reflection()` |
+| Tool deprioritized incorrectly | Adjust consecutive failure threshold in `tool_health.rs` |
+| Compaction too aggressive | Lower budget_pressure thresholds in compaction config |
+| Selector picking wrong strategy | Force `llm` strategy for novel tasks in `tool_selection.rs` |
+| Context window too small | Increase model context or reduce tool schema count |
+| Error recovery not escalating | Adjust thresholds in `error_recovery.rs` EscalationLevel |
+
 ---
 
-## Reference: implementation pointers
+## Reference: Key Source Files
 
 | Component | File |
 |-----------|------|
 | Journal digest CLI | `rust/crates/astra-cli/src/cli/journal_digest.rs` |
 | Session journal | `rust/crates/services/src/session_journal.rs` |
 | Tool selection | `rust/crates/runtime/src/turn/tool_selection.rs` |
-| Compaction (cloud/runtime) | `rust/crates/runtime/src/turn/cloud/compaction.rs` |
-| Stall detection | `rust/crates/runtime/src/stall_detector.rs` |
+| Compaction | `rust/crates/runtime/src/turn/cloud/compaction.rs` |
+| Stall detection | `rust/crates/runtime/src/turn/stall.rs` |
+| Turn guard & verdicts | `rust/crates/runtime/src/turn/turn_guard.rs` |
+| Error recovery & escalation | `rust/crates/runtime/src/turn/error_recovery.rs` |
+| Tool health tracking | `rust/crates/runtime/src/turn/tool_health.rs` |
 | REPL turn handler | `rust/crates/astra-cli/src/cli/repl_turn.rs` |
+| Debug command | `rust/crates/astra-cli/src/cli/slash_debug.rs` |
+| Chat stream | `rust/crates/astra-cli/src/cli/chat_stream/` |

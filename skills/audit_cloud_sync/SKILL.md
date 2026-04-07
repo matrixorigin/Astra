@@ -464,5 +464,5 @@ GROUP BY status;
 | Session restore | `rust/crates/services/src/session_restore.rs` |
 | Session journal | `rust/crates/services/src/session_journal.rs` |
 | Checkpoint heavy save | `rust/crates/services/src/session_journal.rs` |
-| Learning pipeline | `rust/crates/runtime/src/learning/` |
+| Learning pipeline | `rust/crates/services/src/learning.rs`, `rust/crates/runtime/src/pipeline/learning.rs` |
 | Sync log retention | `rust/crates/services/src/state_sync.rs` (SYNC_LOG_*_RETAIN) |

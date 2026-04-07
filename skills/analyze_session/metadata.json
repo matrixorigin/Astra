@@ -1,7 +1,7 @@
 {
   "name": "analyze_session",
   "version": "1.0.0",
-  "description": "Deep diagnostic analysis of astra agent sessions — journal, checkpoints, debug snapshots",
+  "description": "Deep diagnostic analysis and debugging of astra agent sessions — journal, checkpoints, debug snapshots, stall/escalation forensics",
   "category": "development",
   "input_schema": {
     "type": "object",
@@ -12,8 +12,28 @@
       },
       "focus": {
         "type": "string",
-        "enum": ["context", "tools", "tokens", "errors", "flow", "all"],
-        "description": "Analysis focus area (default: all)"
+        "enum": [
+          "context",
+          "tools",
+          "tokens",
+          "errors",
+          "flow",
+          "debug",
+          "all"
+        ],
+        "description": "Analysis focus area (default: all). Use 'debug' for root-cause diagnosis."
+      },
+      "symptom": {
+        "type": "string",
+        "enum": [
+          "stuck",
+          "slow",
+          "looping",
+          "wrong-tools",
+          "errors",
+          "all"
+        ],
+        "description": "For debug focus: primary symptom to diagnose (default: all)"
       }
     }
   },
@@ -51,6 +71,20 @@
       "recommendations": {
         "type": "array",
         "items": { "type": "string" }
+      },
+      "debug_diagnosis": {
+        "type": "object",
+        "description": "Present when focus=debug",
+        "properties": {
+          "root_cause": { "type": "string" },
+          "escalation_level": {
+            "type": "string",
+            "enum": ["normal", "warning", "critical"]
+          },
+          "stall_events": { "type": "number" },
+          "correction_effectiveness": { "type": "number" },
+          "recommended_fix": { "type": "string" }
+        }
       }
     }
   },
@@ -66,6 +100,14 @@
     {
       "input": { "focus": "tools" },
       "description": "Analyze tool selection in the most recent session"
+    },
+    {
+      "input": { "focus": "debug", "symptom": "stuck" },
+      "description": "Diagnose why the most recent session got stuck"
+    },
+    {
+      "input": { "target": "last", "focus": "debug", "symptom": "slow" },
+      "description": "Investigate latency issues in the most recent session"
     }
   ]
 }

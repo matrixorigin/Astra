@@ -1,0 +1,13 @@
+name: batch-parallel
+version: "1.0.0"
+description: "Execute independent tasks in parallel using git worktrees for isolation, then merge results"
+author: "astra"
+
+tools:
+  - bash
+  - read_file
+  - write_file
+  - str_replace
+  - grep
+  - glob
+  - git_worktree

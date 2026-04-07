@@ -1,6 +1,6 @@
 name: analyze-session
 version: "1.0.0"
-description: "Deep diagnostic analysis of astra agent sessions: journal, checkpoints, tool selection, compaction, stall detection"
+description: "Deep diagnostic analysis and debugging of astra agent sessions: journal, checkpoints, tool selection, compaction, stall detection, turn guard escalation, error cascades"
 author: "astra"
 
 tools:

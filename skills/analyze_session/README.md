@@ -1,8 +1,12 @@
 # analyze-session
 
-Deep diagnostic analysis of **astra** agent sessions. Reads the session journal (JSONL),
+Deep diagnostic analysis and debugging of **astra** agent sessions. Reads the session journal (JSONL),
 heavy checkpoints, and debug snapshots to identify inefficiencies in context management,
 tool selection, token usage, error handling, compaction, and stall recovery.
+
+> Now includes all debugging capabilities previously in `debug-session` — stall pattern
+> analysis, turn guard escalation tracing, error cascade detection, tool health degradation,
+> and correction effectiveness evaluation. Use `--focus debug` to access these.
 
 ## Usage
 
@@ -11,6 +15,9 @@ tool selection, token usage, error handling, compaction, and stall recovery.
 /skill analyze-session /tmp/debug-abc123-turn1.json
 /skill analyze-session --focus tokens
 /skill analyze-session last --focus errors
+/skill analyze-session --focus debug
+/skill analyze-session --focus debug --symptom stuck
+/skill analyze-session last --focus debug --symptom slow
 ```
 
 ## What It Analyzes
@@ -22,6 +29,7 @@ tool selection, token usage, error handling, compaction, and stall recovery.
 | **Tokens** | Per-turn prompt/completion, TTFT, context build time, selector overhead |
 | **Errors** | Error cascades, stall detection (sig_stall/name_stall/divergence), TurnGuardVerdict events, tool failure rates |
 | **Flow** | Plan subtask tracking, delegation fan-out/aggregate, turn productivity classification |
+| **Debug** | Root cause diagnosis: stall patterns, turn guard escalation, error cascades, tool health degradation, correction effectiveness, latency bottlenecks |
 
 ## Data Sources
 
@@ -34,11 +42,20 @@ tool selection, token usage, error handling, compaction, and stall recovery.
 
 ## Output
 
+### Standard Analysis (focus ≠ debug)
 A structured health report with:
 - **Health Score** (0–100) across 4 dimensions (context, tools, tokens, error handling)
 - **Critical Issues** with astra-specific root causes
 - **Warnings** for suboptimal patterns
 - **Recommendations** with references to astra source files
+
+### Debug Diagnosis (focus = debug)
+A structured diagnostic report with:
+- **Root cause** — one-line diagnosis
+- **Evidence chain** — timeline of symptom → escalation → correction
+- **Internal state** — escalation level, nudge count, deprioritized tools
+- **Correction effectiveness** — which TurnGuard interventions worked
+- **Recommended fix** — specific code/config changes with file references
 
 ## Astra-Specific Anti-Patterns Detected
 
@@ -52,3 +69,6 @@ A structured health report with:
 - 📛 **Stall ignored**: StallDetected event followed by same tool pattern
 - 📛 **Slow context build**: context_ms >2000ms
 - 📛 **Output explosion**: single tool result >10KB inflating context
+- 📛 **Blind retry**: Error → Retry → Same Error with no adaptation
+- 📛 **Compaction amnesia**: Error → Compaction → Lost Context → More Errors
+- 📛 **Guard stuck**: Warning level for 5+ turns without escalating to Critical

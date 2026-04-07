@@ -197,7 +197,7 @@ If public API changed:
 If a new tool was added or tool schema changed:
 - Is it registered in `edge_tools.rs` tool list?
 - Is it in the appropriate tool category for selection?
-- Is it in `PARALLEL_SAFE_TOOLS` if read-only? (34 tools currently)
+- Is it marked `parallel_safe` if read-only? (see `plan_executor.rs`)
 - Does the tool schema match the implementation?
 
 ### 5.2 Journal Event Changes
@@ -277,6 +277,6 @@ If cloud-synced data structures changed:
 | Code intelligence | `rust/crates/astra-cli/src/edge_tools/code_intel.rs` |
 | Git tools | `rust/crates/astra-cli/src/edge_tools/git_gix.rs` |
 | Edge tools registry | `rust/crates/astra-cli/src/edge_tools.rs` |
-| Tool parallel safety | `rust/crates/astra-cli/src/cli/chat_stream.rs` (PARALLEL_SAFE_TOOLS) |
+| Tool parallel safety | `rust/crates/astra-cli/src/cli/plan_executor.rs` (parallel_safe) |
 | Session journal schema | `rust/crates/services/src/session_journal.rs` |
 | Durable task states | `rust/crates/services/src/durable_task.rs` |

@@ -1,7 +1,7 @@
 ---
 name: batch-parallel
 description: "Execute a batch of independent tasks in parallel using git worktrees for isolation. Each task runs in its own worktree, preventing file conflicts. Results are merged back into the main branch."
-version: "0.1.0"
+version: "1.0.0"
 user_invocable: true
 arguments:
   - name: TASKS

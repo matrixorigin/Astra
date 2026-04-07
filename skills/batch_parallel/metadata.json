@@ -1,0 +1,63 @@
+{
+  "name": "batch_parallel",
+  "version": "1.0.0",
+  "description": "Execute independent tasks in parallel using git worktrees for isolation, then merge results",
+  "category": "development",
+  "input_schema": {
+    "type": "object",
+    "properties": {
+      "tasks": {
+        "type": "string",
+        "description": "Description of the batch tasks to execute — a list of items, a pattern, or a goal to decompose"
+      },
+      "workers": {
+        "type": "integer",
+        "description": "Number of parallel workers (default: 3, max: 8)"
+      },
+      "strategy": {
+        "type": "string",
+        "enum": ["independent", "sequential-merge", "fan-out-merge"],
+        "description": "Execution strategy (default: independent)"
+      }
+    },
+    "required": ["tasks"]
+  },
+  "output_schema": {
+    "type": "object",
+    "properties": {
+      "completed": {
+        "type": "integer",
+        "description": "Number of tasks completed successfully"
+      },
+      "failed": {
+        "type": "integer",
+        "description": "Number of tasks that failed"
+      },
+      "merged": {
+        "type": "boolean",
+        "description": "Whether results were merged back to main branch"
+      },
+      "results": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "properties": {
+            "task_id": { "type": "string" },
+            "status": { "type": "string", "enum": ["success", "failed", "skipped"] },
+            "branch": { "type": "string" }
+          }
+        }
+      }
+    }
+  },
+  "examples": [
+    {
+      "input": { "tasks": "Add error handling to all 5 handler files", "workers": 3 },
+      "description": "Parallel batch of independent file modifications"
+    },
+    {
+      "input": { "tasks": "Migrate 3 SQL queries to new schema", "strategy": "sequential-merge" },
+      "description": "Sequential merge where each task builds on prior"
+    }
+  ]
+}
