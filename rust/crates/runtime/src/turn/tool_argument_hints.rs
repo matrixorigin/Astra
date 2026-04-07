@@ -29,6 +29,11 @@ pub fn command_hint_from_args(args: &Value) -> Option<&str> {
 
 /// One-line detail next to the CLI permission icon (aligned with cloud `approval_required` path).
 pub fn permission_prompt_primary_detail(tool_name: &str, args: &Value) -> Option<String> {
+    // MCP tools: show a compact summary of arguments since they don't have
+    // standard "command" or "path" keys.
+    if tool_name.starts_with("mcp_") {
+        return Some(mcp_args_summary(args));
+    }
     match cloud_gated_tool_kind(tool_name) {
         Some(CloudGatedToolKind::Execute) => command_hint_from_args(args).map(String::from),
         Some(CloudGatedToolKind::Write) => path_hint_from_args(args),
@@ -36,6 +41,39 @@ pub fn permission_prompt_primary_detail(tool_name: &str, args: &Value) -> Option
             .map(String::from)
             .or_else(|| path_hint_from_args(args)),
     }
+}
+
+/// Compact summary of MCP tool arguments for permission prompts.
+fn mcp_args_summary(args: &Value) -> String {
+    let obj = match args.as_object() {
+        Some(o) if !o.is_empty() => o,
+        _ => return "(no arguments)".into(),
+    };
+    let mut parts: Vec<String> = Vec::new();
+    for (k, v) in obj.iter().take(3) {
+        let val_str = match v {
+            Value::String(s) => {
+                if s.len() > 60 {
+                    format!("\"{}…\"", &s[..57])
+                } else {
+                    format!("\"{s}\"")
+                }
+            }
+            other => {
+                let s = other.to_string();
+                if s.len() > 60 {
+                    format!("{}…", &s[..57])
+                } else {
+                    s
+                }
+            }
+        };
+        parts.push(format!("{k}={val_str}"));
+    }
+    if obj.len() > 3 {
+        parts.push(format!("+{} more", obj.len() - 3));
+    }
+    parts.join(", ")
 }
 
 #[cfg(test)]
@@ -113,5 +151,38 @@ mod tests {
             permission_prompt_primary_detail("read_file", &args).as_deref(),
             Some("/r")
         );
+    }
+
+    // ── MCP tool display tests ──
+
+    #[test]
+    fn mcp_args_summary_shows_key_values() {
+        let args = json!({"query": "hello", "limit": 10});
+        let detail = permission_prompt_primary_detail("mcp_search_server", &args).unwrap();
+        assert!(detail.contains("query="));
+        assert!(detail.contains("hello"));
+        assert!(detail.contains("limit="));
+    }
+
+    #[test]
+    fn mcp_args_summary_empty_args() {
+        let detail = permission_prompt_primary_detail("mcp_server_tool", &json!({})).unwrap();
+        assert_eq!(detail, "(no arguments)");
+    }
+
+    #[test]
+    fn mcp_args_summary_truncates_long_values() {
+        let long_val = "x".repeat(100);
+        let args = json!({"data": long_val});
+        let detail = permission_prompt_primary_detail("mcp_server_tool", &args).unwrap();
+        assert!(detail.len() < 100);
+        assert!(detail.contains("…"));
+    }
+
+    #[test]
+    fn mcp_args_summary_limits_to_3_keys() {
+        let args = json!({"a": 1, "b": 2, "c": 3, "d": 4, "e": 5});
+        let detail = permission_prompt_primary_detail("mcp_server_tool", &args).unwrap();
+        assert!(detail.contains("+2 more"));
     }
 }
