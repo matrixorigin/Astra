@@ -154,6 +154,19 @@ impl ContextService for DatabaseContextService {
         let capture_id = Uuid::new_v4().to_string();
         let data_str = request.context_data.to_string();
 
+        // Defense: reject excessively large context snapshots to prevent disk/DB exhaustion
+        const MAX_SNAPSHOT_SIZE: usize = 10 * 1024 * 1024; // 10 MB
+        if data_str.len() > MAX_SNAPSHOT_SIZE {
+            return Err(error_response(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                format!(
+                    "Context snapshot too large ({} bytes, max {})",
+                    data_str.len(),
+                    MAX_SNAPSHOT_SIZE
+                ),
+            ));
+        }
+
         query(
             "INSERT INTO ctx_snapshots \
              (context_capture_id, session_id, event_id, context_data, created_at) \

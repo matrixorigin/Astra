@@ -1275,6 +1275,11 @@ impl ToolExecutor {
             );
         }
 
+        // Security: reject glob patterns with path traversal sequences
+        if pattern.contains("..") || pattern.starts_with('/') || pattern.contains("~/") {
+            return "Error: glob pattern must not contain '..', start with '/', or contain '~/' (path traversal risk)".to_string();
+        }
+
         // Use fd if available (faster, respects .gitignore), fall back to find
         let shell_cmd = format!(
             "cd {} && {{ fd --type f --glob {} 2>/dev/null || find . {} -o -name {} -print | sed 's|^./||'; }} | head -100",
@@ -1963,6 +1968,24 @@ mod tests {
             result.contains("SANDBOX_DENIED") || result.contains("Sandbox"),
             "glob outside project should be blocked: {result}"
         );
+    }
+
+    #[test]
+    fn glob_rejects_path_traversal_patterns() {
+        let dir = tempfile::tempdir().unwrap();
+        let executor = ToolExecutor::new(dir.path());
+        // ".." traversal
+        let result = executor.glob(&serde_json::json!({"pattern": "../../etc/*"}));
+        assert!(result.contains("path traversal"), "should reject ..: {result}");
+        // Absolute path
+        let result = executor.glob(&serde_json::json!({"pattern": "/etc/*.conf"}));
+        assert!(result.contains("path traversal"), "should reject /: {result}");
+        // Tilde expansion
+        let result = executor.glob(&serde_json::json!({"pattern": "~/.*"}));
+        assert!(result.contains("path traversal"), "should reject ~/: {result}");
+        // Normal pattern should work
+        let result = executor.glob(&serde_json::json!({"pattern": "*.rs"}));
+        assert!(!result.contains("path traversal"), "should allow *.rs: {result}");
     }
 
     #[test]

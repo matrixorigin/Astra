@@ -245,6 +245,18 @@ pub fn write_workspace(metadata: &WorkspaceMetadata) -> std::io::Result<()> {
 /// Read workspace metadata from disk.
 pub fn read_workspace(session_id: &str) -> std::io::Result<WorkspaceMetadata> {
     let path = workspace_dir(session_id).join("workspace.yaml");
+    let metadata = std::fs::metadata(&path)?;
+    const MAX_WORKSPACE_YAML_SIZE: u64 = 1024 * 1024; // 1 MB
+    if metadata.len() > MAX_WORKSPACE_YAML_SIZE {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "workspace.yaml too large ({} bytes, max {})",
+                metadata.len(),
+                MAX_WORKSPACE_YAML_SIZE
+            ),
+        ));
+    }
     let content = std::fs::read_to_string(&path)?;
     serde_yaml::from_str(&content)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
@@ -252,6 +264,10 @@ pub fn read_workspace(session_id: &str) -> std::io::Result<WorkspaceMetadata> {
 
 /// Get the workspace directory for a session.
 fn workspace_dir(session_id: &str) -> PathBuf {
+    assert!(
+        crate::session_journal::validate_session_id(session_id).is_ok(),
+        "unsafe session ID passed to workspace_dir: {session_id}"
+    );
     crate::session_journal::local_sessions_dir().join(session_id)
 }
 

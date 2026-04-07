@@ -46,6 +46,26 @@ fn is_dangerous_write_target(rel_path: &str) -> Option<&'static str> {
         ),
         (".npmrc", "NPM config — can change registry or auth tokens"),
         (".env", "Environment variables — may contain secrets"),
+        (
+            ".env.local",
+            "Local env variables — may contain secrets",
+        ),
+        (
+            ".aws/credentials",
+            "AWS credentials — changes affect cloud access",
+        ),
+        (
+            ".aws/config",
+            "AWS config — changes affect cloud access",
+        ),
+        (
+            ".kube/config",
+            "Kubernetes config — changes affect cluster access",
+        ),
+        (
+            ".docker/config.json",
+            "Docker config — may contain registry auth tokens",
+        ),
     ];
     let filename = rel_path.rsplit('/').next().unwrap_or(rel_path);
     for (name, reason) in DANGEROUS_FILES {
@@ -56,6 +76,15 @@ fn is_dangerous_write_target(rel_path: &str) -> Option<&'static str> {
     // Check dangerous directories
     if rel_path.starts_with(".git/") || rel_path.contains("/.git/") {
         return Some("Git internals — corruption risk");
+    }
+    // .env.* variants (e.g. .env.production, .env.staging)
+    if filename.starts_with(".env.") {
+        return Some("Environment variables — may contain secrets");
+    }
+    // .ssh key files
+    if rel_path.contains(".ssh/") && (filename.starts_with("id_") || filename == "authorized_keys2")
+    {
+        return Some("SSH key file — changes affect authentication");
     }
     None
 }
@@ -584,6 +613,22 @@ impl ToolExecutor {
         if path.exists() {
             if let Err(e) = self.check_staleness(&path) {
                 return json!({ "success": false, "error": format!("Pre-write staleness check failed: {e}") }).to_string();
+            }
+        }
+
+        // Defense-in-depth: re-canonicalize immediately before write to detect
+        // symlink swaps (TOCTOU) between the initial resolve_checked and now.
+        if path.exists() {
+            if let Ok(canonical) = path.canonicalize() {
+                if !canonical.starts_with(&self.project_root) {
+                    return json!({
+                        "success": false,
+                        "error": format!(
+                            "Security: path '{}' was replaced with a symlink pointing outside the project",
+                            path.display()
+                        )
+                    }).to_string();
+                }
             }
         }
 
@@ -3123,6 +3168,24 @@ type Handler interface {
         assert!(is_dangerous_write_target(".env").is_some());
         assert!(is_dangerous_write_target("src/main.rs").is_none());
         assert!(is_dangerous_write_target("README.md").is_none());
+    }
+
+    #[test]
+    fn test_dangerous_write_target_expanded_list() {
+        // New entries
+        assert!(is_dangerous_write_target(".env.local").is_some());
+        assert!(is_dangerous_write_target(".env.production").is_some());
+        assert!(is_dangerous_write_target(".env.staging").is_some());
+        assert!(is_dangerous_write_target(".aws/credentials").is_some());
+        assert!(is_dangerous_write_target(".aws/config").is_some());
+        assert!(is_dangerous_write_target(".kube/config").is_some());
+        assert!(is_dangerous_write_target(".docker/config.json").is_some());
+        assert!(is_dangerous_write_target(".ssh/id_rsa").is_some());
+        assert!(is_dangerous_write_target(".ssh/id_ed25519").is_some());
+        assert!(is_dangerous_write_target(".ssh/authorized_keys2").is_some());
+        // Still safe
+        assert!(is_dangerous_write_target("package.json").is_none());
+        assert!(is_dangerous_write_target("Cargo.toml").is_none());
     }
 
     #[test]
