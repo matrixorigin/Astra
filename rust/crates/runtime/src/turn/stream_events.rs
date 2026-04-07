@@ -234,4 +234,166 @@ mod tests {
         );
         assert_eq!(ev.get("tool").and_then(Value::as_str), Some("bash"));
     }
+
+    // --- edge cases ---
+
+    #[test]
+    fn stream_error_event_fields() {
+        let ev = build_stream_error_event("boom", "INTERNAL_ERROR", false);
+        assert_eq!(ev.get("type").and_then(Value::as_str), Some("error"));
+        assert_eq!(ev.get("message").and_then(Value::as_str), Some("boom"));
+        assert_eq!(ev.get("code").and_then(Value::as_str), Some("INTERNAL_ERROR"));
+        assert_eq!(ev.get("retryable").and_then(Value::as_bool), Some(false));
+    }
+
+    #[test]
+    fn stream_error_retryable_true() {
+        let ev = build_stream_error_event("retry me", "LLM_RATE_LIMIT", true);
+        assert_eq!(ev.get("retryable").and_then(Value::as_bool), Some(true));
+    }
+
+    #[test]
+    fn runtime_error_http_401_auth() {
+        let ev = build_runtime_error_event(Value::String("unauthorized".into()), None, Some(401), None);
+        assert_eq!(ev.get("code").and_then(Value::as_str), Some("AUTH_ERROR"));
+    }
+
+    #[test]
+    fn runtime_error_http_403_auth() {
+        let ev = build_runtime_error_event(Value::String("forbidden".into()), None, Some(403), None);
+        assert_eq!(ev.get("code").and_then(Value::as_str), Some("AUTH_ERROR"));
+    }
+
+    #[test]
+    fn runtime_error_http_404_not_found() {
+        let ev = build_runtime_error_event(Value::String("not found".into()), None, Some(404), None);
+        assert_eq!(ev.get("code").and_then(Value::as_str), Some("NOT_FOUND"));
+    }
+
+    #[test]
+    fn runtime_error_http_422_validation() {
+        let ev = build_runtime_error_event(Value::String("bad".into()), None, Some(422), None);
+        assert_eq!(ev.get("code").and_then(Value::as_str), Some("VALIDATION_ERROR"));
+    }
+
+    #[test]
+    fn runtime_error_http_500_internal() {
+        let ev = build_runtime_error_event(Value::String("oops".into()), None, Some(500), None);
+        assert_eq!(ev.get("code").and_then(Value::as_str), Some("INTERNAL_ERROR"));
+    }
+
+    #[test]
+    fn runtime_error_http_detail_overrides_message() {
+        let detail = json!({"error": "custom detail"});
+        let ev = build_runtime_error_event(Value::String("original".into()), None, Some(401), Some(detail.clone()));
+        assert_eq!(ev.get("message"), Some(&detail));
+    }
+
+    #[test]
+    fn runtime_error_kind_permission() {
+        let ev = build_runtime_error_event(Value::String("denied".into()), Some("permission"), None, None);
+        assert_eq!(ev.get("code").and_then(Value::as_str), Some("MODEL_NOT_AVAILABLE"));
+    }
+
+    #[test]
+    fn runtime_error_kind_budget() {
+        let ev = build_runtime_error_event(Value::String("exceeded".into()), Some("budget"), None, None);
+        assert_eq!(ev.get("code").and_then(Value::as_str), Some("BUDGET_EXCEEDED"));
+    }
+
+    #[test]
+    fn runtime_error_kind_rate_limit_has_retry_after() {
+        let ev = build_runtime_error_event(Value::String("slow down".into()), Some("rate_limit"), None, None);
+        assert_eq!(ev.get("code").and_then(Value::as_str), Some("LLM_RATE_LIMIT"));
+        assert_eq!(ev.get("retryable").and_then(Value::as_bool), Some(true));
+        assert_eq!(ev.get("retry_after_ms").and_then(Value::as_i64), Some(5000));
+    }
+
+    #[test]
+    fn runtime_error_kind_timeout_has_retry_after() {
+        let ev = build_runtime_error_event(Value::String("timed out".into()), Some("timeout"), None, None);
+        assert_eq!(ev.get("code").and_then(Value::as_str), Some("LLM_TIMEOUT"));
+        assert_eq!(ev.get("retry_after_ms").and_then(Value::as_i64), Some(2000));
+    }
+
+    #[test]
+    fn runtime_error_kind_transport_fixed_message() {
+        let ev = build_runtime_error_event(Value::String("ignored".into()), Some("transport"), None, None);
+        assert_eq!(ev.get("code").and_then(Value::as_str), Some("LLM_TRANSPORT_ERROR"));
+        // Transport uses a fixed message, ignoring the input
+        assert!(ev.get("message").and_then(Value::as_str).unwrap().contains("connection failed"));
+        assert_eq!(ev.get("retry_after_ms").and_then(Value::as_i64), Some(2000));
+    }
+
+    #[test]
+    fn runtime_error_kind_server_has_retry_after() {
+        let ev = build_runtime_error_event(Value::String("500".into()), Some("server"), None, None);
+        assert_eq!(ev.get("code").and_then(Value::as_str), Some("SERVER_ERROR"));
+        assert_eq!(ev.get("retry_after_ms").and_then(Value::as_i64), Some(1000));
+    }
+
+    #[test]
+    fn runtime_error_unknown_kind_defaults_internal() {
+        let ev = build_runtime_error_event(Value::String("wat".into()), Some("banana"), None, None);
+        assert_eq!(ev.get("code").and_then(Value::as_str), Some("INTERNAL_ERROR"));
+        assert_eq!(ev.get("retryable").and_then(Value::as_bool), Some(false));
+    }
+
+    #[test]
+    fn firewall_warning_event_fields() {
+        let ev = build_firewall_warning_event(3);
+        assert_eq!(ev.get("type").and_then(Value::as_str), Some("warning"));
+        assert_eq!(ev.get("claims_failed").and_then(Value::as_i64), Some(3));
+    }
+
+    #[test]
+    fn edge_tool_call_missing_function_defaults_question_mark() {
+        let tc = Map::from_iter([("id".to_string(), Value::String("c1".into()))]);
+        let ev = build_edge_tool_call_event(&tc);
+        assert_eq!(ev.get("name").and_then(Value::as_str), Some("?"));
+    }
+
+    #[test]
+    fn edge_tool_call_truncated_gives_parse_error() {
+        let tc = Map::from_iter([
+            ("id".to_string(), Value::String("c1".into())),
+            ("_truncated".to_string(), Value::Bool(true)),
+            ("function".to_string(), json!({"name": "write_file", "arguments": "{\"path\":"})),
+        ]);
+        let ev = build_edge_tool_call_event(&tc);
+        let args = ev.get("arguments").and_then(Value::as_object).unwrap();
+        assert!(args.contains_key("_parse_error"));
+    }
+
+    #[test]
+    fn edge_tool_call_valid_json_string_args() {
+        let tc = Map::from_iter([
+            ("id".to_string(), Value::String("c1".into())),
+            ("function".to_string(), json!({"name": "bash", "arguments": "{\"command\": \"ls\"}"})),
+        ]);
+        let ev = build_edge_tool_call_event(&tc);
+        let args = ev.get("arguments").and_then(Value::as_object).unwrap();
+        assert_eq!(args.get("command").and_then(Value::as_str), Some("ls"));
+    }
+
+    #[test]
+    fn approval_required_omits_empty_path() {
+        let ev = build_approval_required_event("r1", "bash", Some(""));
+        assert!(ev.get("path").is_none());
+    }
+
+    #[test]
+    fn approval_required_omits_none_path() {
+        let ev = build_approval_required_event("r1", "bash", None);
+        assert!(ev.get("path").is_none());
+    }
+
+    #[test]
+    fn tool_request_missing_id_empty_request_id() {
+        let tc = Map::from_iter([
+            ("function".to_string(), json!({"name": "read_file", "arguments": "{}"})),
+        ]);
+        let ev = build_tool_request_event(&tc);
+        assert_eq!(ev.get("request_id").and_then(Value::as_str), Some(""));
+    }
 }

@@ -118,4 +118,88 @@ mod tests {
         assert!(!detect_correction("looks good, merge it"));
         assert!(!detect_correction("list the files"));
     }
+
+    // --- edge cases ---
+
+    #[test]
+    fn detect_correction_empty_string() {
+        assert!(!detect_correction(""));
+    }
+
+    #[test]
+    fn detect_correction_whitespace_only() {
+        assert!(!detect_correction("   \t  "));
+    }
+
+    #[test]
+    fn detect_correction_case_sensitivity() {
+        // The regex uses lowercase, so "Wrong" won't match (case sensitive)
+        assert!(!detect_correction("Wrong answer"));
+        // but "wrong" will
+        assert!(detect_correction("wrong answer"));
+    }
+
+    #[test]
+    fn detect_correction_actually_with_comma() {
+        assert!(detect_correction("actually, I meant something else"));
+        assert!(detect_correction("actually I meant something else"));
+    }
+
+    #[test]
+    fn build_skipped_routing_fields() {
+        let meta = build_skipped_routing_metadata("too short");
+        assert_eq!(meta.get("skipped").and_then(Value::as_bool), Some(true));
+        assert_eq!(meta.get("reason").and_then(Value::as_str), Some("too short"));
+    }
+
+    #[test]
+    fn build_routing_metadata_no_tier1() {
+        let meta = build_routing_metadata(
+            "default", "code_edit", 0.95, 2, "keyword", 0.7, 12.5,
+            None, true, &Value::Bool(true), &Value::Bool(true),
+            5000, None, false, false, None,
+        );
+        assert_eq!(meta.get("router").and_then(Value::as_str), Some("default"));
+        assert_eq!(meta.get("intent").and_then(Value::as_str), Some("code_edit"));
+        assert!(meta.get("tier1").is_none()); // has_tier1 = false
+        assert_eq!(meta.get("forced"), Some(&Value::Null));
+    }
+
+    #[test]
+    fn build_routing_metadata_with_tier1() {
+        let meta = build_routing_metadata(
+            "r", "intent", 0.5, 1, "m", 0.5, 10.0,
+            Some("user_override"), true, &Value::Bool(true), &Value::Bool(true),
+            1000, None, true, true, Some(vec!["bash".into()]),
+        );
+        let tier1 = meta.get("tier1").and_then(Value::as_object).unwrap();
+        assert_eq!(tier1.get("compressed").and_then(Value::as_bool), Some(true));
+        assert_eq!(
+            meta.get("forced").and_then(Value::as_str),
+            Some("user_override")
+        );
+    }
+
+    #[test]
+    fn build_routing_metadata_skipped_sections() {
+        let meta = build_routing_metadata(
+            "r", "i", 0.5, 1, "m", 0.5, 0.0,
+            None, false, &Value::Bool(false), &Value::Bool(false),
+            0, None, false, false, None,
+        );
+        let skipped = meta.get("skipped_sections").and_then(Value::as_array).unwrap();
+        // load_tools=false, history=false, memory=false → all three sections skipped
+        assert_eq!(skipped.len(), 3);
+    }
+
+    #[test]
+    fn build_routing_metadata_no_skipped_sections() {
+        let meta = build_routing_metadata(
+            "r", "i", 0.5, 1, "m", 0.5, 0.0,
+            None, true, &Value::Bool(true), &Value::Bool(true),
+            0, None, false, false, None,
+        );
+        let skipped = meta.get("skipped_sections").and_then(Value::as_array).unwrap();
+        assert!(skipped.is_empty());
+    }
 }

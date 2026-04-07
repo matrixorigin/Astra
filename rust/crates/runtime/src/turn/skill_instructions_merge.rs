@@ -92,4 +92,77 @@ mod tests {
         assert!(merged.as_ref().unwrap().contains("## Skill: c"));
         assert_eq!(act, vec!["c".to_string()]);
     }
+
+    // --- edge cases ---
+
+    #[test]
+    fn merge_all_errors_returns_none() {
+        let skills = vec!["a".into(), "b".into()];
+        let (out, merged, act) =
+            merge_skill_instruction_bodies_for_chat(&skills, |_| Err("fail".into()));
+        assert_eq!(out.len(), 2);
+        assert!(merged.is_none());
+        assert!(act.is_empty());
+    }
+
+    #[test]
+    fn merge_all_none_returns_none() {
+        let skills = vec!["a".into()];
+        let (_, merged, act) =
+            merge_skill_instruction_bodies_for_chat(&skills, |_| Ok(None));
+        assert!(merged.is_none());
+        assert!(act.is_empty());
+    }
+
+    #[test]
+    fn merge_empty_body_skipped() {
+        let skills = vec!["a".into()];
+        let (_, merged, act) =
+            merge_skill_instruction_bodies_for_chat(&skills, |_| Ok(Some("".into())));
+        assert!(merged.is_none());
+        assert!(act.is_empty());
+    }
+
+    #[test]
+    fn merge_empty_skills_vec() {
+        let skills: Vec<String> = vec![];
+        let (out, merged, act) =
+            merge_skill_instruction_bodies_for_chat(&skills, |_| Ok(None));
+        assert!(out.is_empty());
+        assert!(merged.is_none());
+        assert!(act.is_empty());
+    }
+
+    #[test]
+    fn merge_multiple_bodies_joined_with_separator() {
+        let skills = vec!["a".into(), "b".into()];
+        let (_, merged, act) = merge_skill_instruction_bodies_for_chat(&skills, |n| {
+            Ok(Some(format!("body of {}", n)))
+        });
+        let text = merged.unwrap();
+        assert!(text.contains("## Skill: a"));
+        assert!(text.contains("## Skill: b"));
+        assert!(text.contains("---")); // separator between sections
+        assert_eq!(act.len(), 2);
+    }
+
+    #[test]
+    fn activated_names_csv_empty() {
+        assert_eq!(skill_instruction_activated_names_csv(&[]), "");
+    }
+
+    #[test]
+    fn activated_names_csv_single() {
+        assert_eq!(
+            skill_instruction_activated_names_csv(&["solo".into()]),
+            "solo"
+        );
+    }
+
+    #[test]
+    fn load_failed_message_unicode() {
+        let msg = skill_instruction_load_failed_message("技能A", "找不到文件");
+        assert!(msg.contains("技能A"));
+        assert!(msg.contains("找不到文件"));
+    }
 }
