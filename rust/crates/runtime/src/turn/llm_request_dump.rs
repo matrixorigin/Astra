@@ -13,6 +13,16 @@ use uuid::Uuid;
 
 use super::contracts::{TurnAuxiliaryEventRecord, TurnAuxiliaryEventWriter};
 
+const ERROR_PREVIEW_MAX_CHARS: usize = 200;
+
+/// First `max_chars` Unicode scalars of `s` (no panic on UTF-8 boundaries).
+fn truncate_chars(s: &str, max_chars: usize) -> &str {
+    s.char_indices()
+        .nth(max_chars)
+        .map(|(i, _)| &s[..i])
+        .unwrap_or(s)
+}
+
 /// Capture the LLM request state at the moment of failure.
 #[derive(Debug, Clone)]
 pub struct LlmRequestDump {
@@ -77,7 +87,7 @@ impl LlmRequestDump {
                 "round": self.round,
                 "message_count": self.messages.len(),
                 "tool_count": self.tools.len(),
-                "error_preview": &self.error[..self.error.len().min(200)],
+                "error_preview": truncate_chars(&self.error, ERROR_PREVIEW_MAX_CHARS),
             })),
             reasoning_content: None,
         };
@@ -115,6 +125,26 @@ pub fn build_llm_request_dump(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn truncate_chars_keeps_short_strings() {
+        assert_eq!(truncate_chars("hello", ERROR_PREVIEW_MAX_CHARS), "hello");
+    }
+
+    #[test]
+    fn truncate_chars_limits_to_max_unicode_scalars() {
+        let s: String = (0..250).map(|i| char::from(b'a' + (i % 26) as u8)).collect();
+        let t = truncate_chars(&s, ERROR_PREVIEW_MAX_CHARS);
+        assert_eq!(t.chars().count(), ERROR_PREVIEW_MAX_CHARS);
+    }
+
+    #[test]
+    fn truncate_chars_does_not_split_utf8() {
+        let wide = "😀".repeat(300);
+        let t = truncate_chars(&wide, ERROR_PREVIEW_MAX_CHARS);
+        assert_eq!(t.chars().count(), ERROR_PREVIEW_MAX_CHARS);
+        assert!(std::str::from_utf8(t.as_bytes()).is_ok());
+    }
 
     #[test]
     fn dump_to_json_includes_all_fields() {
