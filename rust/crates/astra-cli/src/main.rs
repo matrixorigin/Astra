@@ -176,6 +176,9 @@ struct Cli {
     /// Resume a specific session by ID (or prefix)
     #[arg(short = 'r', long = "resume")]
     resume: Option<String>,
+    /// Auto-approve tool calls without prompting
+    #[arg(short = 'y', long = "yes")]
+    yes: bool,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -5317,6 +5320,7 @@ async fn main() {
         output_format,
         continue_last,
         resume,
+        yes: auto_approve,
         command,
     } = cli;
 
@@ -5325,7 +5329,7 @@ async fn main() {
         command_router::read_config_default_model().ok().flatten()
     });
 
-    // --print mode: headless single-shot, no tool execution
+    // --print mode: headless single-shot, always auto-approve (can't prompt)
     if print_mode {
         match run_print_mode(&api, profile.as_deref(), &output_format, resolved_model.as_deref(), command).await {
             Ok(code) => std::process::exit(i32::from(code)),
@@ -5371,7 +5375,7 @@ async fn main() {
         }
     }
 
-    match execute_cli_command(command, profile, resolved_model, &api).await {
+    match execute_cli_command(command, profile, resolved_model, auto_approve, &api).await {
         Ok(exit_code) => {
             std::process::exit(i32::from(exit_code));
         }
@@ -6209,6 +6213,7 @@ mod tests {
             Some(Command::Health),
             Some("nonexistent-profile".to_string()),
             None,
+            false,
             &api,
         )
         .await;
