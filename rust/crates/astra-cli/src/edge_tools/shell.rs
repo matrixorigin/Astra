@@ -172,18 +172,22 @@ fn check_single_command_path_boundary(
         return None;
     }
 
-    // Check each non-flag argument that looks like an absolute path.
+    // Check each non-flag argument for path boundary violations.
     for arg in &parts[1..] {
         // Skip flags
         if arg.starts_with('-') {
             continue;
         }
-        // Only check absolute paths — relative paths resolve inside project_root
-        // which is already the cwd for sandboxed commands.
-        if !arg.starts_with('/') {
-            continue;
-        }
-        if let Err(e) = validate_path(policy, arg) {
+        // For absolute paths, validate directly.
+        // For relative paths, resolve against project_root to catch symlinks
+        // pointing outside the sandbox (e.g., `ln -s /etc/passwd myfile`).
+        let resolved = if arg.starts_with('/') {
+            std::path::PathBuf::from(arg)
+        } else {
+            policy.project_root.join(arg)
+        };
+        let path_str = resolved.to_string_lossy();
+        if let Err(e) = validate_path(policy, &path_str) {
             if e.is_boundary_violation() {
                 return Some(format!(
                     "{}The command references '{}' which is outside the project directory '{}'. \

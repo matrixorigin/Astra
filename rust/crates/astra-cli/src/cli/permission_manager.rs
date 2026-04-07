@@ -95,8 +95,18 @@ impl PermissionRule {
             (None, _) => true, // Bare tool name matches all
             (Some(prefix), Some(cmd)) => {
                 let lower_cmd = cmd.to_lowercase();
-                // Prefix match: "git commit" matches "git commit -m 'foo'"
-                lower_cmd.starts_with(&prefix.to_lowercase())
+                let lower_prefix = prefix.to_lowercase();
+                // Prefix match with word boundary: "git commit" matches
+                // "git commit -m 'foo'" but not "git commitizen".
+                if !lower_cmd.starts_with(&lower_prefix) {
+                    return false;
+                }
+                // After the prefix, the next char must be whitespace, end of string,
+                // or a separator — prevents "git commit" matching "git commitizen".
+                let rest = &lower_cmd[lower_prefix.len()..];
+                rest.is_empty()
+                    || rest.starts_with(char::is_whitespace)
+                    || rest.starts_with(&['-', '=', ';', '|', '&', '>', '<'][..])
             }
             (Some(_), None) => false, // Pattern rule but no command to match
         }
@@ -488,6 +498,28 @@ impl PermissionManager {
         }
     }
 
+    /// Build a pattern-specific allow rule from a tool name and its arguments.
+    /// For execute tools (bash/shell), extracts the first command word to produce
+    /// `Bash(cargo:*)` instead of bare `bash` (which would match everything).
+    /// For write tools, returns the bare tool name (already scoped by nature).
+    pub(super) fn make_allow_rule(name: &str, args: &serde_json::Value) -> String {
+        if let Some(cmd) = command_hint_from_args(args) {
+            let first_word = cmd.split_whitespace().next().unwrap_or("");
+            if !first_word.is_empty() {
+                // Capitalize tool name for readability: bash → Bash
+                let cap = {
+                    let mut c = name.chars();
+                    match c.next() {
+                        None => name.to_string(),
+                        Some(f) => f.to_uppercase().to_string() + c.as_str(),
+                    }
+                };
+                return format!("{cap}({first_word}:*)");
+            }
+        }
+        name.to_string()
+    }
+
     /// Synchronous permission check — blocks on terminal prompt if needed.
     /// Only used by tests; production code uses [`check_nonblocking()`].
     #[cfg(test)]
@@ -498,16 +530,13 @@ impl PermissionManager {
             return false;
         }
 
-        if let Some(&allowed) = self.session_overrides.get(name) {
-            return allowed;
-        }
-
         let side_effect = Self::classify(name);
         if side_effect == SideEffect::Read {
             return true;
         }
 
         // Step 2: Git safety checks (bypass-immune — even auto mode can't skip these).
+        // MUST run before session overrides so "always approve" can't skip them.
         if side_effect == SideEffect::Execute {
             let git_violations = Self::check_git_safety(args);
             if !git_violations.is_empty() {
@@ -588,12 +617,17 @@ impl PermissionManager {
             return false;
         }
 
-        // Step 5: Persistent allow rules.
+        // Step 5: Session overrides (AFTER bypass-immune safety checks).
+        if let Some(&allowed) = self.session_overrides.get(name) {
+            return allowed;
+        }
+
+        // Step 6: Persistent allow rules.
         if self.check_allow_rules(name, args) {
             return true;
         }
 
-        // Step 6: Permission mode determines final action.
+        // Step 7: Permission mode determines final action.
         match self.mode {
             PermissionMode::Auto => return true,
             PermissionMode::Deny => {
@@ -616,8 +650,9 @@ impl PermissionManager {
             'y' => true,
             'a' => {
                 self.session_overrides.insert(name.to_string(), true);
-                // Persist as a project-level allow rule so it survives sessions
-                self.add_allow_rule(name);
+                // Persist as a project-level allow rule with command pattern
+                let rule = Self::make_allow_rule(name, args);
+                self.add_allow_rule(&rule);
                 let scope = if self.project_root.is_some() {
                     "project"
                 } else {
@@ -625,7 +660,7 @@ impl PermissionManager {
                 };
                 eprintln!(
                     "  {}",
-                    format!("  ✓ {name}: always allowed ({scope})").dim()
+                    format!("  ✓ {rule}: always allowed ({scope})").dim()
                 );
                 true
             }
@@ -688,16 +723,7 @@ impl PermissionManager {
             return PermissionDecision::Allow;
         }
 
-        // Step 3: Session overrides from prior approvals.
-        if let Some(&allowed) = self.session_overrides.get(name) {
-            return if allowed {
-                PermissionDecision::Allow
-            } else {
-                PermissionDecision::Deny("Skipped for session".into())
-            };
-        }
-
-        // Step 4: Git safety checks (bypass-immune).
+        // Step 3: Git safety checks (bypass-immune — MUST run before session overrides).
         if side_effect == SideEffect::Execute {
             let git_violations = Self::check_git_safety(args);
             if !git_violations.is_empty() {
@@ -742,12 +768,21 @@ impl PermissionManager {
             return PermissionDecision::Deny("Dangerous pattern".into());
         }
 
-        // Step 5: Persistent allow rules.
+        // Step 5: Session overrides (AFTER bypass-immune safety checks).
+        if let Some(&allowed) = self.session_overrides.get(name) {
+            return if allowed {
+                PermissionDecision::Allow
+            } else {
+                PermissionDecision::Deny("Skipped for session".into())
+            };
+        }
+
+        // Step 6: Persistent allow rules.
         if self.check_allow_rules(name, args) {
             return PermissionDecision::Allow;
         }
 
-        // Step 6: Permission mode.
+        // Step 7: Permission mode.
         match self.mode {
             PermissionMode::Auto => PermissionDecision::Allow,
             PermissionMode::Deny => PermissionDecision::Deny("Denied by mode".into()),
@@ -1293,5 +1328,115 @@ mod tests {
         let decision = pm.check_nonblocking("read_file", &args);
         // read_file is classified as Read → always allowed
         assert!(matches!(decision, PermissionDecision::Allow));
+    }
+
+    // ── Security: session overrides cannot bypass safety checks ──────────────
+
+    #[test]
+    fn session_override_cannot_bypass_git_safety() {
+        // CRITICAL: Even if user previously approved "bash", dangerous git
+        // operations must still require manual approval.
+        let mut pm = PermissionManager::new(true); // auto mode
+        pm.session_overrides.insert("bash".to_string(), true);
+        let args = serde_json::json!({"command": "git push --force"});
+        // Must NOT be Allow — git safety is bypass-immune
+        let decision = pm.check_nonblocking("bash", &args);
+        assert!(
+            matches!(decision, PermissionDecision::NeedApproval { .. }),
+            "session override must not bypass git safety: got {decision:?}"
+        );
+    }
+
+    #[test]
+    fn session_override_cannot_bypass_dangerous_command() {
+        // CRITICAL: "always approve bash" must not auto-approve sudo/rm -rf/etc.
+        let mut pm = PermissionManager::new(true);
+        pm.session_overrides.insert("bash".to_string(), true);
+        let args = serde_json::json!({"command": "sudo rm -rf /"});
+        let decision = pm.check_nonblocking("bash", &args);
+        assert!(
+            matches!(decision, PermissionDecision::Deny(_)),
+            "session override must not bypass dangerous command check: got {decision:?}"
+        );
+    }
+
+    #[test]
+    fn session_override_cannot_bypass_dangerous_path() {
+        // CRITICAL: "always approve write_file" must not auto-approve writes to .git/
+        let mut pm = PermissionManager::new(true);
+        pm.session_overrides.insert("write_file".to_string(), true);
+        let args = serde_json::json!({"path": ".git/config", "content": "bad"});
+        let decision = pm.check_nonblocking("write_file", &args);
+        assert!(
+            matches!(decision, PermissionDecision::NeedApproval { .. }),
+            "session override must not bypass dangerous path check: got {decision:?}"
+        );
+    }
+
+    #[test]
+    fn session_override_still_allows_safe_commands() {
+        // Session override should still work for commands that pass all safety checks.
+        let mut pm = PermissionManager::new(false); // prompt mode
+        pm.session_overrides.insert("bash".to_string(), true);
+        let args = serde_json::json!({"command": "echo hello"});
+        let decision = pm.check_nonblocking("bash", &args);
+        assert!(
+            matches!(decision, PermissionDecision::Allow),
+            "session override should allow safe commands: got {decision:?}"
+        );
+    }
+
+    #[test]
+    fn check_session_override_cannot_bypass_git_safety() {
+        // Same test for the synchronous check() path
+        let mut pm = PermissionManager::new(true);
+        pm.session_overrides.insert("bash".to_string(), true);
+        let args = serde_json::json!({"command": "rm -rf /"});
+        assert!(!pm.check("bash", &args), "check() must deny dangerous commands despite override");
+    }
+
+    // ── Security: make_allow_rule generates pattern-specific rules ───────────
+
+    #[test]
+    fn make_allow_rule_bash_generates_pattern() {
+        let args = serde_json::json!({"command": "cargo test --release"});
+        let rule = PermissionManager::make_allow_rule("bash", &args);
+        assert_eq!(rule, "Bash(cargo:*)");
+    }
+
+    #[test]
+    fn make_allow_rule_no_command_falls_back() {
+        let args = serde_json::json!({"path": "/tmp/foo"});
+        let rule = PermissionManager::make_allow_rule("write_file", &args);
+        assert_eq!(rule, "write_file");
+    }
+
+    #[test]
+    fn make_allow_rule_empty_command_falls_back() {
+        let args = serde_json::json!({"command": ""});
+        let rule = PermissionManager::make_allow_rule("bash", &args);
+        assert_eq!(rule, "bash");
+    }
+
+    // ── Security: word-boundary matching prevents false positives ────────────
+
+    #[test]
+    fn rule_prefix_respects_word_boundary() {
+        let rule = PermissionRule::parse("Bash(git commit:*)");
+        // Should match "git commit -m 'fix'"
+        assert!(rule.matches("bash", Some("git commit -m 'fix'")));
+        // Should NOT match "git commitizen" (different word)
+        assert!(!rule.matches("bash", Some("git commitizen")));
+        // Should match exact "git commit" with no args
+        assert!(rule.matches("bash", Some("git commit")));
+    }
+
+    #[test]
+    fn rule_prefix_allows_separators_after_match() {
+        let rule = PermissionRule::parse("Bash(cargo:*)");
+        assert!(rule.matches("bash", Some("cargo test")));
+        assert!(rule.matches("bash", Some("cargo-test"))); // false: '-' is a separator
+        assert!(rule.matches("bash", Some("cargo=build")));
+        assert!(!rule.matches("bash", Some("cargotest"))); // no boundary
     }
 }
