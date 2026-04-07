@@ -45,8 +45,13 @@ yarn-error.log*
 # Rust
 rust/target/
 
-# IDE / OS
+# Agent tool configs (user-local, not committed)
 .cursor/
+.claude/
+.kiro/steering/
+codex.md
+
+# IDE / OS
 .idea/
 .vscode/
 *.swp

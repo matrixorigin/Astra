@@ -1,0 +1,30 @@
+{
+  "name": "review_code",
+  "version": "1.0.0",
+  "description": "Code review focused on test quality: unhappy paths, E2E with DB assertions, error scenarios",
+  "category": "development",
+  "input_schema": {
+    "type": "object",
+    "properties": {
+      "target": {
+        "type": "string",
+        "description": "What to review: 'staged', 'unstaged', 'branch:<name>', 'commit:<sha>', or file paths"
+      },
+      "focus": {
+        "type": "string",
+        "enum": ["tests", "unhappy", "e2e", "db", "all"],
+        "description": "Review focus (default: all)"
+      }
+    }
+  },
+  "examples": [
+    {
+      "input": { "focus": "unhappy" },
+      "description": "Review unhappy path coverage for all uncommitted changes"
+    },
+    {
+      "input": { "target": "staged", "focus": "e2e" },
+      "description": "Check E2E + DB assertion coverage for staged changes"
+    }
+  ]
+}

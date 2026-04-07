@@ -1,0 +1,10 @@
+name: review-code
+version: "1.0.0"
+description: "Code review focused on test quality: unhappy paths, E2E with DB assertions, error scenarios"
+author: "astra"
+
+tools:
+  - bash
+  - read_file
+  - grep
+  - glob
