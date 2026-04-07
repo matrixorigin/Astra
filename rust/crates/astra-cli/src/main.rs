@@ -188,6 +188,9 @@ struct Cli {
     /// Comma or space-separated list of tool names to allow (e.g. "Bash Edit Read")
     #[arg(long = "allowed-tools", num_args = 1..)]
     allowed_tools: Vec<String>,
+    /// Comma or space-separated list of tool names to deny (e.g. "Bash Edit")
+    #[arg(long = "disallowed-tools", num_args = 1..)]
+    disallowed_tools: Vec<String>,
     /// Additional directories to allow tool access to
     #[arg(long = "add-dir", num_args = 1..)]
     add_dir: Vec<String>,
@@ -5342,6 +5345,7 @@ async fn main() {
         system_prompt,
         max_turns,
         allowed_tools,
+        disallowed_tools,
         add_dir,
         verbose,
         mcp_config,
@@ -5363,6 +5367,19 @@ async fn main() {
             .collect();
         if !normalized.is_empty() {
             unsafe { std::env::set_var("ASTRA_ALLOWED_TOOLS", normalized.join(",")); }
+        }
+    }
+
+    // --disallowed-tools: normalize and export as env var (deny-list, opposite of --allowed-tools)
+    if !disallowed_tools.is_empty() {
+        let normalized: Vec<String> = disallowed_tools
+            .iter()
+            .flat_map(|s| s.split([',', ' ']))
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if !normalized.is_empty() {
+            unsafe { std::env::set_var("ASTRA_DISALLOWED_TOOLS", normalized.join(",")); }
         }
     }
 
@@ -8438,5 +8455,37 @@ total_tokens_out: 500
         assert_eq!(cli.mcp_config, vec!["mcp.json"]);
         assert_eq!(cli.model.as_deref(), Some("gpt-4o"));
         assert!(cli.print);
+    }
+
+    // ── --disallowed-tools tests ──
+
+    #[test]
+    fn cli_disallowed_tools_single() {
+        let cli = Cli::try_parse_from(["astra", "--disallowed-tools", "Bash"]).unwrap();
+        assert_eq!(cli.disallowed_tools, vec!["Bash"]);
+    }
+
+    #[test]
+    fn cli_disallowed_tools_multiple() {
+        let cli = Cli::try_parse_from([
+            "astra", "--disallowed-tools", "Bash", "Edit",
+        ]).unwrap();
+        assert_eq!(cli.disallowed_tools, vec!["Bash", "Edit"]);
+    }
+
+    #[test]
+    fn cli_disallowed_tools_empty_default() {
+        let cli = Cli::try_parse_from(["astra"]).unwrap();
+        assert!(cli.disallowed_tools.is_empty());
+    }
+
+    #[test]
+    fn cli_allowed_and_disallowed_together() {
+        let cli = Cli::try_parse_from([
+            "astra", "--allowed-tools", "Read", "Edit",
+            "--disallowed-tools", "Bash",
+        ]).unwrap();
+        assert_eq!(cli.allowed_tools, vec!["Read", "Edit"]);
+        assert_eq!(cli.disallowed_tools, vec!["Bash"]);
     }
 }

@@ -109,7 +109,7 @@ pub(crate) async fn stream_chat_sse(
     let valid_tool_names = openai_tool_names_from_schemas(&all_schemas);
 
     // --allowed-tools: if set, restrict to only the specified tools
-    let initial_restricted: HashSet<String> = if let Ok(allowed_csv) = std::env::var("ASTRA_ALLOWED_TOOLS") {
+    let mut initial_restricted: HashSet<String> = if let Ok(allowed_csv) = std::env::var("ASTRA_ALLOWED_TOOLS") {
         let allowed: HashSet<&str> = allowed_csv.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
         if !allowed.is_empty() {
             valid_tool_names.iter()
@@ -122,6 +122,13 @@ pub(crate) async fn stream_chat_sse(
     } else {
         HashSet::new()
     };
+
+    // --disallowed-tools: directly add to restricted set
+    if let Ok(denied_csv) = std::env::var("ASTRA_DISALLOWED_TOOLS") {
+        for name in denied_csv.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
+            initial_restricted.insert(name.to_string());
+        }
+    }
 
     let current_session_id = p.session_id.map(|s| s.to_string());
     let mut task_profile = infer_task_execution_profile(p.message);
