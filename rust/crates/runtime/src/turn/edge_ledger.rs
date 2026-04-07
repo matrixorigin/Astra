@@ -205,6 +205,8 @@ pub fn strip_stale_reasoning(messages: &mut [Value]) {
 mod tests {
     use super::*;
 
+    use crate::{RecoveredEventRow, append_recovered_events};
+
     #[test]
     fn callback_keys_match_handler_convention() {
         assert_eq!(tool_callback_key("u42", "r7"), "u42:tool:r7");
@@ -435,5 +437,265 @@ mod tests {
         );
         // Latest reasoning preserved
         assert_eq!(msgs[5]["reasoning_content"].as_str(), Some("think"));
+    }
+
+    // ── Thinking-model / Kimi: reasoning_content on every assistant+tool_calls ──
+
+    fn build_mid_switch_session() -> Vec<Value> {
+        vec![
+            json!({"role": "system", "content": "You are a helpful assistant."}),
+            json!({"role": "user", "content": "list files"}),
+            json!({
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{"id": "tc-1", "type": "function", "function": {"name": "bash", "arguments": "{\"cmd\":\"ls\"}"}}]
+            }),
+            json!({"role": "tool", "tool_call_id": "tc-1", "content": "file1.txt\nfile2.txt"}),
+            json!({"role": "assistant", "content": "Here are the files: file1.txt, file2.txt"}),
+            json!({"role": "user", "content": "read both files"}),
+            json!({
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [
+                    {"id": "tc-2a", "type": "function", "function": {"name": "read_file", "arguments": "{\"path\":\"file1.txt\"}"}},
+                    {"id": "tc-2b", "type": "function", "function": {"name": "read_file", "arguments": "{\"path\":\"file2.txt\"}"}}
+                ]
+            }),
+            json!({"role": "tool", "tool_call_id": "tc-2a", "content": "contents of file1"}),
+            json!({"role": "tool", "tool_call_id": "tc-2b", "content": "contents of file2"}),
+            json!({"role": "assistant", "content": "File1 contains... File2 contains..."}),
+            json!({"role": "user", "content": "write a new file"}),
+            json!({
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{"id": "tc-3", "type": "function", "function": {"name": "write_file", "arguments": "{\"path\":\"new.txt\",\"content\":\"hello\"}"}}]
+            }),
+            json!({"role": "tool", "tool_call_id": "tc-3", "content": "ok"}),
+            json!({"role": "assistant", "content": "Done, created new.txt"}),
+            json!({"role": "user", "content": "refactor the code"}),
+            json!({
+                "role": "assistant",
+                "content": null,
+                "reasoning_content": "I need to read the code first, then plan the refactoring.",
+                "tool_calls": [{"id": "tc-4", "type": "function", "function": {"name": "read_file", "arguments": "{\"path\":\"main.rs\"}"}}]
+            }),
+            json!({"role": "tool", "tool_call_id": "tc-4", "content": "fn main() { println!(\"hello\"); }"}),
+            json!({
+                "role": "assistant",
+                "content": null,
+                "reasoning_content": "Now I'll write the refactored version.",
+                "tool_calls": [{"id": "tc-5", "type": "function", "function": {"name": "write_file", "arguments": "{\"path\":\"main.rs\",\"content\":\"fn main() { greet(); }\"}"}}]
+            }),
+            json!({"role": "tool", "tool_call_id": "tc-5", "content": "ok"}),
+            json!({
+                "role": "assistant",
+                "content": "Refactored the code.",
+                "reasoning_content": "The refactoring is complete."
+            }),
+        ]
+    }
+
+    fn assert_all_assistant_tool_calls_have_reasoning(messages: &[Value]) {
+        for (i, msg) in messages.iter().enumerate() {
+            if msg.get("role").and_then(Value::as_str) != Some("assistant") {
+                continue;
+            }
+            if msg.get("tool_calls").is_none() {
+                continue;
+            }
+            assert!(
+                msg.get("reasoning_content").is_some(),
+                "assistant tool_call message at index {i} is missing reasoning_content"
+            );
+        }
+    }
+
+    #[test]
+    fn mid_session_switch_to_thinking_model_all_tool_call_msgs_get_reasoning() {
+        let mut msgs = build_mid_switch_session();
+        strip_stale_reasoning(&mut msgs);
+        assert!(history_has_reasoning(&msgs));
+        assert_all_assistant_tool_calls_have_reasoning(&msgs);
+    }
+
+    #[test]
+    fn mid_session_switch_preserves_latest_reasoning_content() {
+        let mut msgs = build_mid_switch_session();
+        strip_stale_reasoning(&mut msgs);
+        let last_reasoning = msgs
+            .iter()
+            .rev()
+            .find(|m| {
+                m.get("role").and_then(Value::as_str) == Some("assistant")
+                    && m.get("reasoning_content")
+                        .and_then(Value::as_str)
+                        .is_some_and(|s| !s.is_empty())
+            })
+            .expect("should have at least one message with non-empty reasoning");
+        assert!(
+            !last_reasoning["reasoning_content"]
+                .as_str()
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn old_non_thinking_tool_call_msgs_get_empty_reasoning() {
+        let mut msgs = build_mid_switch_session();
+        strip_stale_reasoning(&mut msgs);
+        assert_eq!(msgs[2]["reasoning_content"].as_str(), Some(""));
+        assert_eq!(msgs[6]["reasoning_content"].as_str(), Some(""));
+        assert_eq!(msgs[11]["reasoning_content"].as_str(), Some(""));
+    }
+
+    #[test]
+    fn recovered_history_with_model_switch_has_reasoning_on_all_tool_call_msgs() {
+        let rows = vec![
+            RecoveredEventRow {
+                event_type: "user_query".into(),
+                content: Some("list files".into()),
+                metadata: None,
+                reasoning_content: None,
+            },
+            RecoveredEventRow {
+                event_type: "tool_call".into(),
+                content: Some(
+                    r#"{"tool_call_id":"tc-1","name":"bash","arguments":"{\"cmd\":\"ls\"}"}"#.into(),
+                ),
+                metadata: None,
+                reasoning_content: None,
+            },
+            RecoveredEventRow {
+                event_type: "tool_result".into(),
+                content: Some(r#"{"result":"file1.txt"}"#.into()),
+                metadata: Some(r#"{"tool_call_id":"tc-1","name":"bash"}"#.into()),
+                reasoning_content: None,
+            },
+            RecoveredEventRow {
+                event_type: "llm_response".into(),
+                content: Some("Here are the files.".into()),
+                metadata: None,
+                reasoning_content: None,
+            },
+            RecoveredEventRow {
+                event_type: "user_query".into(),
+                content: Some("refactor".into()),
+                metadata: None,
+                reasoning_content: None,
+            },
+            RecoveredEventRow {
+                event_type: "tool_call".into(),
+                content: Some(
+                    r#"{"tool_call_id":"tc-2","name":"read_file","arguments":"{\"path\":\"main.rs\"}"}"#
+                        .into(),
+                ),
+                metadata: None,
+                reasoning_content: Some("Let me read the code first.".into()),
+            },
+            RecoveredEventRow {
+                event_type: "tool_result".into(),
+                content: Some(r#"{"result":"fn main() {}"}"#.into()),
+                metadata: Some(r#"{"tool_call_id":"tc-2","name":"read_file"}"#.into()),
+                reasoning_content: None,
+            },
+            RecoveredEventRow {
+                event_type: "llm_response".into(),
+                content: Some("Refactored.".into()),
+                metadata: None,
+                reasoning_content: Some("Done with refactoring.".into()),
+            },
+        ];
+
+        let mut history: Vec<Value> = Vec::new();
+        append_recovered_events(&mut history, &rows);
+        assert_all_assistant_tool_calls_have_reasoning(&history);
+    }
+
+    #[test]
+    fn full_pipeline_recovery_then_strip_all_tool_call_msgs_valid() {
+        let rows = vec![
+            RecoveredEventRow {
+                event_type: "user_query".into(),
+                content: Some("hello".into()),
+                metadata: None,
+                reasoning_content: None,
+            },
+            RecoveredEventRow {
+                event_type: "tool_call".into(),
+                content: Some(r#"{"tool_call_id":"tc-1","name":"bash","arguments":"{}"}"#.into()),
+                metadata: None,
+                reasoning_content: None,
+            },
+            RecoveredEventRow {
+                event_type: "tool_result".into(),
+                content: Some(r#"{"result":"ok"}"#.into()),
+                metadata: Some(r#"{"tool_call_id":"tc-1","name":"bash"}"#.into()),
+                reasoning_content: None,
+            },
+            RecoveredEventRow {
+                event_type: "llm_response".into(),
+                content: Some("done".into()),
+                metadata: None,
+                reasoning_content: None,
+            },
+        ];
+
+        let mut history: Vec<Value> = Vec::new();
+        append_recovered_events(&mut history, &rows);
+
+        history.push(json!({"role": "user", "content": "now use kimi"}));
+        history.push(json!({
+            "role": "assistant",
+            "content": null,
+            "reasoning_content": "I need to search for this.",
+            "tool_calls": [{"id": "tc-new", "type": "function", "function": {"name": "bash", "arguments": "{}"}}]
+        }));
+        history.push(json!({"role": "tool", "tool_call_id": "tc-new", "content": "result"}));
+
+        strip_stale_reasoning(&mut history);
+        assert_all_assistant_tool_calls_have_reasoning(&history);
+    }
+
+    #[test]
+    fn pure_non_thinking_session_no_reasoning_added() {
+        let mut msgs = vec![
+            json!({"role": "user", "content": "hi"}),
+            json!({
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{"id": "tc-1", "type": "function", "function": {"name": "bash", "arguments": "{}"}}]
+            }),
+            json!({"role": "tool", "tool_call_id": "tc-1", "content": "ok"}),
+            json!({"role": "assistant", "content": "done"}),
+        ];
+        let original = msgs.clone();
+        strip_stale_reasoning(&mut msgs);
+        assert_eq!(msgs, original);
+    }
+
+    #[test]
+    fn last_message_is_thinking_tool_call_still_gets_field() {
+        let mut msgs = vec![
+            json!({"role": "user", "content": "hi"}),
+            json!({
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{"id": "tc-1", "type": "function", "function": {"name": "bash", "arguments": "{}"}}]
+            }),
+            json!({"role": "tool", "tool_call_id": "tc-1", "content": "ok"}),
+            json!({"role": "assistant", "content": "done"}),
+            json!({"role": "user", "content": "more"}),
+            json!({
+                "role": "assistant",
+                "content": null,
+                "reasoning_content": "thinking...",
+                "tool_calls": [{"id": "tc-2", "type": "function", "function": {"name": "bash", "arguments": "{}"}}]
+            }),
+        ];
+        strip_stale_reasoning(&mut msgs);
+        assert_all_assistant_tool_calls_have_reasoning(&msgs);
+        assert_eq!(msgs[1]["reasoning_content"].as_str(), Some(""));
+        assert_eq!(msgs[5]["reasoning_content"].as_str(), Some("thinking..."));
     }
 }

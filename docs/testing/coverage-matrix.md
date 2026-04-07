@@ -41,6 +41,7 @@ Legend: **E2E** = `rust/crates/runtime/tests/system_matrix_http_e2e/` with `ASTR
 | `SharedPool` on `AppState` / auth+session service constructors | Compile-time API + real pool in services tests / Matrix E2E | `shared_pool_contract`, `shared_pool_migration_contract` |
 | `/health` includes `persist_ok` / `persist_fail` | `http_contract` + `fixtures/contracts/http_shell_contract.json` | `persist_counter_contract` |
 | Global `PERSIST_*` atomics increment | `runtime/src/bridge/side_effects.rs` `#[cfg(test)]` | `persist_counter_contract` |
+| Thinking models: `reasoning_content` on every assistant+`tool_calls` after mid-session switch / DB recovery | `runtime/src/turn/edge_ledger.rs` `#[cfg(test)]` (`mid_session_switch_*`, `append_recovered_events` + `strip_stale_reasoning` pipeline) | — (avoid extra integration binary) |
 
 ## Large integration binaries (audit — not removed in this pass)
 
