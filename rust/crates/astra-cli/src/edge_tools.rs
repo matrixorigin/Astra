@@ -1091,6 +1091,27 @@ pub fn all_tool_schemas() -> Vec<Value> {
                 }
             }
         }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "task_stop",
+                "description": "Stop/cancel a running task. Use when a task needs to be aborted before completion.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "task_id": {
+                            "type": "string",
+                            "description": "The task ID to stop"
+                        },
+                        "reason": {
+                            "type": "string",
+                            "description": "Optional reason for stopping the task"
+                        }
+                    },
+                    "required": ["task_id"]
+                }
+            }
+        }),
         // ─── Sleep tool ───────────────────────────────────────────────────────
         json!({
             "type": "function",
@@ -2158,6 +2179,63 @@ impl ToolExecutor {
         }).to_string()
     }
 
+    /// Stop/cancel a running task.
+    async fn task_stop(&self, args: &Value) -> String {
+        let task_id = match args.get("task_id").and_then(Value::as_str) {
+            Some(id) if !id.is_empty() => id,
+            _ => return "Error: 'task_id' is required".to_string(),
+        };
+
+        let reason = args.get("reason").and_then(Value::as_str).unwrap_or("user requested");
+        let now = chrono::Utc::now().to_rfc3339();
+
+        let mut tasks = match self.tasks.lock() {
+            Ok(guard) => guard,
+            Err(_) => return "Error: failed to access task list".to_string(),
+        };
+
+        let task = match tasks.iter_mut().find(|t| t.id == task_id) {
+            Some(t) => t,
+            None => return format!("Error: task '{}' not found", task_id),
+        };
+
+        // Only allow stopping tasks that are running or pending
+        if task.status != "pending" && task.status != "in_progress" {
+            return serde_json::json!({
+                "success": false,
+                "message": format!("Cannot stop task '{}': status is '{}' (only 'pending' or 'in_progress' can be stopped)", task_id, task.status)
+            }).to_string();
+        }
+
+        let previous_status = task.status.clone();
+        task.status = "cancelled".to_string();
+        task.description = Some(format!(
+            "{}\n\nCancelled: {} (was: {})",
+            task.description.as_deref().unwrap_or(""),
+            reason,
+            previous_status
+        ));
+        task.updated_at = now;
+
+        // Also cancel any in-progress subtasks
+        let mut cancelled_subtasks = 0;
+        for subtask in &mut task.subtasks {
+            if subtask.status == "pending" || subtask.status == "in_progress" {
+                subtask.status = "cancelled".to_string();
+                cancelled_subtasks += 1;
+            }
+        }
+
+        serde_json::json!({
+            "success": true,
+            "task_id": task_id,
+            "previous_status": previous_status,
+            "reason": reason,
+            "cancelled_subtasks": cancelled_subtasks,
+            "message": format!("Task '{}' cancelled (was: {})", task_id, previous_status)
+        }).to_string()
+    }
+
     /// Sleep for a specified duration without holding a shell process.
     async fn sleep_tool(&self, args: &Value) -> String {
         const MAX_SLEEP_MS: u64 = 300_000; // 5 minutes max
@@ -2959,6 +3037,7 @@ impl ToolExecutor {
             "task_list" => self.task_list(args).await,
             "task_get" => self.task_get(args).await,
             "task_update" => self.task_update(args).await,
+            "task_stop" => self.task_stop(args).await,
             "sleep" => self.sleep_tool(args).await,
             "tool_search" => self.tool_search(args),
             "web_search" => self.web_search(args),
@@ -2968,7 +3047,7 @@ impl ToolExecutor {
                  list_dir, grep, glob, symbols, find_definition, find_references, git_status, \
                  git_diff, git_log, git_show, git_blame, call_graph, run_build_test, web_fetch, \
                  mo_query, memory_search, memory_profile, ask_user, task_create, task_list, \
-                 task_get, task_update, sleep, tool_search, web_search"
+                 task_get, task_update, task_stop, sleep, tool_search, web_search"
             ),
         };
         // Normalize empty output, then apply global safety net
@@ -10206,5 +10285,125 @@ impl MyType {
         
         assert!(parsed["alternatives"].as_array().is_some());
         assert!(parsed["usage"].as_str().is_some());
+    }
+
+    // ─── task_stop tests ──────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn task_stop_cancels_running_task() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = ToolExecutor::new(dir.path());
+        
+        // Create a task
+        exe.task_create(&json!({
+            "title": "Long running task",
+            "description": "This will be stopped"
+        })).await;
+
+        // Update to in_progress
+        exe.task_update(&json!({
+            "task_id": "task-1",
+            "status": "in_progress"
+        })).await;
+
+        // Stop it
+        let result = exe.task_stop(&json!({
+            "task_id": "task-1",
+            "reason": "Taking too long"
+        })).await;
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+
+        assert!(parsed["success"].as_bool().unwrap());
+        assert_eq!(parsed["previous_status"], "in_progress");
+        assert!(parsed["message"].as_str().unwrap().contains("cancelled"));
+
+        // Verify the task is now cancelled
+        let task_result = exe.task_get(&json!({"task_id": "task-1"})).await;
+        let task: serde_json::Value = serde_json::from_str(&task_result).unwrap();
+        assert_eq!(task["status"], "cancelled");
+    }
+
+    #[tokio::test]
+    async fn task_stop_cancels_pending_task() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = ToolExecutor::new(dir.path());
+        
+        // Create a task (defaults to pending)
+        exe.task_create(&json!({
+            "title": "Pending task"
+        })).await;
+
+        // Stop it while pending
+        let result = exe.task_stop(&json!({"task_id": "task-1"})).await;
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+
+        assert!(parsed["success"].as_bool().unwrap());
+        assert_eq!(parsed["previous_status"], "pending");
+    }
+
+    #[tokio::test]
+    async fn task_stop_rejects_completed_task() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = ToolExecutor::new(dir.path());
+        
+        // Create and complete a task
+        exe.task_create(&json!({"title": "Done task"})).await;
+        exe.task_update(&json!({
+            "task_id": "task-1",
+            "status": "completed"
+        })).await;
+
+        // Try to stop it
+        let result = exe.task_stop(&json!({"task_id": "task-1"})).await;
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+
+        assert!(!parsed["success"].as_bool().unwrap());
+        assert!(parsed["message"].as_str().unwrap().contains("Cannot stop"));
+    }
+
+    #[tokio::test]
+    async fn task_stop_cancels_subtasks() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = ToolExecutor::new(dir.path());
+        
+        // Create a task with subtasks
+        exe.task_create(&json!({
+            "title": "Parent task",
+            "subtasks": [
+                {"id": "sub-1", "title": "Subtask 1"},
+                {"id": "sub-2", "title": "Subtask 2"}
+            ]
+        })).await;
+
+        // Start the task
+        exe.task_update(&json!({
+            "task_id": "task-1",
+            "status": "in_progress"
+        })).await;
+
+        // Stop it
+        let result = exe.task_stop(&json!({"task_id": "task-1"})).await;
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+
+        assert!(parsed["success"].as_bool().unwrap());
+        assert_eq!(parsed["cancelled_subtasks"], 2);
+    }
+
+    #[tokio::test]
+    async fn task_stop_not_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = ToolExecutor::new(dir.path());
+        
+        let result = exe.task_stop(&json!({"task_id": "nonexistent"})).await;
+        assert!(result.contains("not found"));
+    }
+
+    #[tokio::test]
+    async fn task_stop_missing_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = ToolExecutor::new(dir.path());
+        
+        let result = exe.task_stop(&json!({})).await;
+        assert!(result.contains("required"));
     }
 }
