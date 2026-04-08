@@ -522,13 +522,22 @@ Decompose this goal into 3-8 concrete subtasks. For EACH subtask, provide:
 4. **depends_on**: IDs of subtasks that must finish first (empty array if none)
 5. **effort**: estimated scope — "small" (<30 lines changed), "medium" (30-100), or "large" (100+)
 6. **files**: list of files likely to be modified (relative paths; best guess from project structure)
-7. **acceptance**: how to verify this subtask is done (e.g., "tests pass", "endpoint returns 200")
+7. **acceptance**: one or more verification assertions, one per line. Use these machine-parseable patterns:
+   - `file_exists: <path>` — file must exist
+   - `file_contains: <path> :: <text>` — file content includes the literal text
+   - `command_succeeds: <shell command>` — exit code 0
+   - `command_output: <shell command> :: contains: <text>` — stdout includes text
+   - `grep: <path> :: <pattern>` — pattern found in file
+   - `tests_pass` — project test suite passes (will run as global check)
+   - `build_succeeds` — project builds without errors (will run as global check)
+   Combine multiple assertions with newlines. Prefer `file_contains`/`grep` over `command_output` when checking file content — never use a file path as a shell command.
 
 Guidelines:
 - Order subtasks so dependencies come first
 - Each subtask should be completable in ONE focused session
 - Always include a testing subtask
 - If the goal involves refactoring, add a "verify no regression" final subtask
+- Acceptance criteria MUST be machine-verifiable assertions, not prose descriptions
 
 Return ONLY this JSON:
 ```json
@@ -541,7 +550,7 @@ Return ONLY this JSON:
       "depends_on": [],
       "effort": "small|medium|large",
       "files": ["src/foo.rs", "tests/test_foo.rs"],
-      "acceptance": "How to verify completion"
+      "acceptance": "file_exists: src/foo.rs\ngrep: src/foo.rs :: pub fn new_feature"
     }
   ],
   "notes": "High-level approach and risk considerations"
@@ -927,6 +936,92 @@ pub fn format_plan(plan: &TaskPlan) -> String {
                 .join(", ")
         ));
     }
+
+    out
+}
+
+/// Format a TaskPlan as markdown suitable for terminal rendering via `StreamingMarkdown`.
+pub fn format_plan_markdown(plan: &TaskPlan, goal: Option<&str>) -> String {
+    let mut out = String::new();
+
+    if let Some(g) = goal {
+        out.push_str(&format!("**Plan:** {g}\n\n"));
+    }
+
+    if let Some(ref notes) = plan.notes {
+        out.push_str(&format!("{notes}\n\n"));
+    }
+
+    for (i, st) in plan.subtasks.iter().enumerate() {
+        let status_icon = match st.status {
+            TaskStatus::Completed => "✓",
+            TaskStatus::InProgress => "▶",
+            TaskStatus::Failed => "✗",
+            TaskStatus::Paused => "⏸",
+            _ => "○",
+        };
+
+        let effort_badge = match st.effort.as_deref() {
+            Some("small") => " `S`",
+            Some("medium") => " `M`",
+            Some("large") => " `L`",
+            _ => "",
+        };
+
+        out.push_str(&format!(
+            "{}. {} **{}**{} — {}\n",
+            i + 1,
+            status_icon,
+            st.id,
+            effort_badge,
+            st.title,
+        ));
+
+        if let Some(ref desc) = st.description {
+            out.push_str(&format!("   {desc}\n"));
+        }
+
+        if !st.files.is_empty() {
+            let files: Vec<_> = st.files.iter().map(|f| format!("`{f}`")).collect();
+            out.push_str(&format!("   Files: {}\n", files.join(", ")));
+        }
+
+        if let Some(ref acc) = st.acceptance {
+            let criteria: Vec<_> = acc.lines().map(|l| format!("`{}`", l.trim())).collect();
+            out.push_str(&format!("   Verify: {}\n", criteria.join(", ")));
+        }
+
+        if !st.depends_on.is_empty() {
+            out.push_str(&format!(
+                "   _(depends on: {})_\n",
+                st.depends_on.join(", ")
+            ));
+        }
+
+        out.push('\n');
+    }
+
+    out.push_str("---\n");
+
+    let mut summary_parts = Vec::new();
+    let small = plan.subtasks.iter().filter(|s| s.effort.as_deref() == Some("small")).count();
+    let medium = plan.subtasks.iter().filter(|s| s.effort.as_deref() == Some("medium")).count();
+    let large = plan.subtasks.iter().filter(|s| s.effort.as_deref() == Some("large")).count();
+    if small + medium + large > 0 {
+        let mut effort_parts = Vec::new();
+        if small > 0 { effort_parts.push(format!("{small} small")); }
+        if medium > 0 { effort_parts.push(format!("{medium} medium")); }
+        if large > 0 { effort_parts.push(format!("{large} large")); }
+        summary_parts.push(effort_parts.join(", "));
+    }
+    summary_parts.push(format!(
+        "{}% ({}/{})",
+        plan.progress_pct(),
+        plan.items_done(),
+        plan.subtasks.len(),
+    ));
+    out.push_str(&summary_parts.join(" | "));
+    out.push('\n');
 
     out
 }
@@ -1912,74 +2007,36 @@ pub fn detect_clarification_questions(llm_text: &str) -> Option<Vec<Clarificatio
 
 /// Format project context for display in plan mode.
 pub fn format_project_context(ctx: &ProjectContext) -> String {
-    let mut out = String::new();
-
-    out.push_str("  📁 Project Context\n");
-
-    // Type detection (human-readable — avoid "Unknown workspace (unknown)" confusion)
-    let stack_label = if ctx.entry_points.contains(&"Cargo.toml".to_string()) {
-        "Rust (Cargo.toml)"
+    let stack = if ctx.entry_points.contains(&"Cargo.toml".to_string()) {
+        "Rust"
     } else if ctx.entry_points.contains(&"package.json".to_string()) {
-        "Node.js (package.json)"
+        "Node.js"
     } else if ctx.entry_points.contains(&"pyproject.toml".to_string())
         || ctx.entry_points.contains(&"setup.py".to_string())
     {
-        "Python (pyproject / setuptools)"
+        "Python"
     } else if ctx.entry_points.contains(&"go.mod".to_string()) {
-        "Go (go.mod)"
+        "Go"
+    } else if !ctx.languages.is_empty() {
+        // Use detected languages as fallback
+        return format_project_context_line(
+            &ctx.languages.join("/"),
+            ctx.source_file_count,
+            ctx.git_branch.as_deref(),
+        );
     } else {
-        "Unrecognized (no Cargo.toml, package.json, go.mod, or pyproject at scan roots)"
+        "unknown"
     };
 
-    let test_hint = ctx
-        .test_framework
-        .as_deref()
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or("not inferred — check README or CI");
-    out.push_str(&format!("  ├─ Stack: {stack_label}\n"));
-    out.push_str(&format!("  ├─ Tests: {test_hint}\n"));
+    format_project_context_line(stack, ctx.source_file_count, ctx.git_branch.as_deref())
+}
 
-    // Languages
-    if !ctx.languages.is_empty() {
-        out.push_str(&format!("  ├─ Languages: {}\n", ctx.languages.join(", ")));
+fn format_project_context_line(stack: &str, file_count: usize, branch: Option<&str>) -> String {
+    let mut parts = vec![stack.to_string(), format!("{file_count} files")];
+    if let Some(b) = branch {
+        parts.push(format!("branch: {b}"));
     }
-
-    // Key directories
-    if !ctx.key_directories.is_empty() {
-        out.push_str(&format!(
-            "  ├─ Key dirs: {}\n",
-            ctx.key_directories.join(", ")
-        ));
-    }
-
-    // File counts
-    let test_info = if ctx.test_file_count > 0 {
-        format!(" ({} test files)", ctx.test_file_count)
-    } else {
-        String::new()
-    };
-    out.push_str(&format!(
-        "  ├─ Source files: {}{}\n",
-        ctx.source_file_count, test_info
-    ));
-
-    // Git info
-    if let Some(ref branch) = ctx.git_branch {
-        let dirty_info = if ctx.has_uncommitted_changes {
-            if ctx.git_dirty_count > 0 {
-                format!(" ({}  modified)", ctx.git_dirty_count)
-            } else {
-                " (uncommitted changes)".to_string()
-            }
-        } else {
-            " ✓".to_string()
-        };
-        out.push_str(&format!("  └─ Git: {}{}\n", branch, dirty_info));
-    } else {
-        out.push_str("  └─ Git: not detected\n");
-    }
-
-    out
+    format!("  ({})", parts.join(", "))
 }
 
 // ─── Plan Tree Progress Display ──────────────────────────────────────────────
@@ -2066,17 +2123,22 @@ fn format_progress_header(pct: u32, done: usize, total: usize) -> String {
     format!("  📋 Progress {} {}% ({}/{})", bar, pct, done, total)
 }
 
-/// Generate a progress bar string.
-fn progress_bar(pct: u32, width: usize) -> String {
+/// Filled and empty segment lengths for a fixed-width bar (`filled` clamped to `width`).
+pub fn progress_bar_segments(pct: u32, width: usize) -> (usize, usize) {
     let filled = (pct as usize * width / 100).min(width);
     let empty = width.saturating_sub(filled);
+    (filled, empty)
+}
+
+/// Generate a progress bar string.
+fn progress_bar(pct: u32, width: usize) -> String {
+    let (filled, empty) = progress_bar_segments(pct, width);
     format!("[{}{}]", "█".repeat(filled), "░".repeat(empty))
 }
 
 /// Generate a mini progress bar.
 fn mini_progress_bar(pct: u32, width: usize) -> String {
-    let filled = (pct as usize * width / 100).min(width);
-    let empty = width.saturating_sub(filled);
+    let (filled, empty) = progress_bar_segments(pct, width);
     format!("[{}{}]", "▓".repeat(filled), "░".repeat(empty))
 }
 
@@ -2448,54 +2510,39 @@ pub fn format_execution_preview(plan: &TaskPlan) -> String {
     let ready = plan.ready_subtasks();
 
     let mut out = String::new();
-    out.push_str("┌── Execution Preview ────────────────────────────\n");
     out.push_str(&format!(
-        "│ {} subtasks, {} ready now\n",
+        "Execution: {} subtasks, {} ready\n",
         plan.subtasks.len(),
         ready.len()
     ));
 
-    // Show parallel groups
     if analysis.groups.len() > 1 || analysis.groups.first().map(|g| g.len()).unwrap_or(0) > 1 {
-        out.push_str("│\n");
-        out.push_str(&format!(
-            "│ Parallel Groups ({} rounds):\n",
-            analysis.groups.len()
-        ));
         for (i, group) in analysis.groups.iter().enumerate() {
-            let names: Vec<_> = group
-                .iter()
-                .filter_map(|id| plan.subtasks.iter().find(|s| &s.id == id))
-                .map(|s| format!("[{}] {}", s.id, s.title))
-                .collect();
-            let parallel_marker = if group.len() > 1 { " ║" } else { "  " };
+            let ids: Vec<_> = group.iter().map(|id| id.as_str()).collect();
+            let parallel = if group.len() > 1 { " (parallel)" } else { "" };
             out.push_str(&format!(
-                "│   Round {}{}: {}\n",
+                "  Round {}{}: {}\n",
                 i + 1,
-                parallel_marker,
-                names.join(", ")
+                parallel,
+                ids.join(", ")
             ));
         }
     }
 
-    // Show file conflicts
     if !analysis.conflicts.is_empty() {
-        out.push_str("│\n");
         out.push_str(&format!(
-            "│ ⚠ {} file conflict(s):\n",
+            "  ⚠ {} file conflict(s): ",
             analysis.conflicts.len()
         ));
-        for c in &analysis.conflicts {
-            out.push_str(&format!(
-                "│   {} ↔ {} ({})\n",
-                c.subtask_a,
-                c.subtask_b,
-                c.shared_files.join(", ")
-            ));
-        }
+        let conflict_strs: Vec<_> = analysis
+            .conflicts
+            .iter()
+            .map(|c| format!("{} ↔ {} ({})", c.subtask_a, c.subtask_b, c.shared_files.join(", ")))
+            .collect();
+        out.push_str(&conflict_strs.join(", "));
+        out.push('\n');
     }
 
-    // Effort estimate
     let total_effort: usize = plan
         .subtasks
         .iter()
@@ -2506,17 +2553,12 @@ pub fn format_execution_preview(plan: &TaskPlan) -> String {
         })
         .sum();
     let effort_label = match total_effort {
-        0..=3 => "Low",
-        4..=8 => "Medium",
-        _ => "High",
+        0..=3 => "low",
+        4..=8 => "medium",
+        _ => "high",
     };
-    out.push_str("│\n");
-    out.push_str(&format!(
-        "│ Estimated effort: {} ({} units)\n",
-        effort_label, total_effort
-    ));
+    out.push_str(&format!("  Effort: {effort_label} ({total_effort} units)\n"));
 
-    out.push_str("└─────────────────────────────────────────────────\n");
     out
 }
 
@@ -5457,10 +5499,9 @@ Done!"#;
             notes: None,
         };
         let preview = format_execution_preview(&plan);
-        assert!(preview.contains("Execution Preview"));
         assert!(preview.contains("2 subtasks"));
-        assert!(preview.contains("2 ready now"));
-        assert!(preview.contains("Estimated effort"));
+        assert!(preview.contains("2 ready"));
+        assert!(preview.contains("Effort:"));
     }
 
     #[test]
@@ -5489,8 +5530,8 @@ Done!"#;
             notes: None,
         };
         let preview = format_execution_preview(&plan);
-        assert!(preview.contains("Parallel Groups"));
         assert!(preview.contains("Round"));
+        assert!(preview.contains("parallel") || preview.contains("Round 1") || preview.contains("Round 2"));
     }
 
     #[test]
@@ -5757,7 +5798,7 @@ Done!"#;
             notes: None,
         };
         let preview = format_execution_preview(&plan);
-        assert!(preview.contains("High"));
+        assert!(preview.contains("high"));
 
         // All small = Low effort
         let plan2 = TaskPlan {
@@ -5770,7 +5811,7 @@ Done!"#;
             notes: None,
         };
         let preview2 = format_execution_preview(&plan2);
-        assert!(preview2.contains("Low"));
+        assert!(preview2.contains("low"));
     }
 
     // ═══════════════════════ Plan Entry Card Tests ═══════════════════════════
@@ -5872,9 +5913,8 @@ Done!"#;
         };
 
         let formatted = format_project_context(&ctx);
-        assert!(formatted.contains("Rust (Cargo.toml)"));
-        assert!(formatted.contains("cargo test"));
-        assert!(formatted.contains("42"));
+        assert!(formatted.contains("Rust"));
+        assert!(formatted.contains("42 files"));
         assert!(formatted.contains("main"));
     }
 

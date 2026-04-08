@@ -98,6 +98,8 @@ pub enum PlanUpdate {
         subtask_id: String,
         event: super::chat_stream::StreamEvent,
     },
+    /// Per-subtask verification report with individual criterion results.
+    VerificationReport(astra_services::durable_task::SubtaskVerificationReport),
     /// Tool requires interactive approval — REPL should prompt the user and
     /// send the response via `response_tx`.
     ApprovalNeeded {
@@ -1051,12 +1053,15 @@ async fn plan_executor_task(
                     }
 
                     // Run verification
-                    let verification_passed = if let Some(ref mut durable) = ctx.durable_task_state
-                    {
-                        durable_bridge::on_subtask_complete(durable, next_id).await
-                    } else {
-                        true
-                    };
+                    let (verification_passed, verification_report) =
+                        if let Some(ref mut durable) = ctx.durable_task_state {
+                            durable_bridge::on_subtask_complete(durable, next_id).await
+                        } else {
+                            (true, None)
+                        };
+                    if let Some(report) = verification_report {
+                        let _ = update_tx.send(PlanUpdate::VerificationReport(report));
+                    }
 
                     // Update subtask status + emit events
                     if let Some(st) = ctx.plan.subtasks.iter_mut().find(|s| s.id == *next_id) {

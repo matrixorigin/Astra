@@ -148,7 +148,7 @@ fn parse_acceptance_to_criteria(
     det: &ProjectDetection,
 ) -> Vec<VerificationCriterion> {
     let mut criteria = Vec::new();
-    let lower = acceptance.to_lowercase();
+    let _lower = acceptance.to_lowercase();
 
     // Split by common delimiters: newlines, semicolons, numbered items
     let parts: Vec<&str> = acceptance
@@ -162,7 +162,10 @@ fn parse_acceptance_to_criteria(
         let part_lower = part.to_lowercase();
         let crit_id = format!("{subtask_id}-ac{idx}");
 
-        if let Some(c) = try_parse_test_criterion(&crit_id, part, &part_lower, det) {
+        // Structured assertion patterns (exact prefix match — highest priority)
+        if let Some(c) = try_parse_structured_assertion(&crit_id, part, &part_lower, det) {
+            criteria.push(c);
+        } else if let Some(c) = try_parse_test_criterion(&crit_id, part, &part_lower, det) {
             criteria.push(c);
         } else if let Some(c) = try_parse_build_criterion(&crit_id, part, &part_lower, det) {
             criteria.push(c);
@@ -181,7 +184,7 @@ fn parse_acceptance_to_criteria(
         } else if let Some(c) = try_parse_flexible_grep_criterion(&crit_id, part, &part_lower) {
             criteria.push(c);
         } else {
-            // Fallback: LLM judge for semantic criteria (deferred — not yet implemented)
+            // Fallback: not machine-parseable — mark as non-required LlmJudge
             criteria.push(VerificationCriterion {
                 id: crit_id,
                 description: part.to_string(),
@@ -192,9 +195,9 @@ fn parse_acceptance_to_criteria(
                     ),
                     pass_threshold: 0.7,
                 },
-                required: !lower.contains("optional"),
+                required: false,
                 timeout_sec: 60,
-                global_only: true, // LlmJudge not yet implemented; skip in per-subtask
+                global_only: true,
             });
         }
     }
@@ -218,6 +221,149 @@ fn parse_acceptance_to_criteria(
     }
 
     criteria
+}
+
+/// Parse structured assertion patterns produced by the decomposition prompt.
+///
+/// Recognized prefixes (case-insensitive):
+/// - `file_exists: <path>`
+/// - `file_contains: <path> :: <text>`
+/// - `command_succeeds: <shell cmd>`
+/// - `command_output: <shell cmd> :: contains: <text>`
+/// - `grep: <path> :: <pattern>`
+/// - `tests_pass`
+/// - `build_succeeds`
+fn try_parse_structured_assertion(
+    id: &str,
+    desc: &str,
+    lower: &str,
+    det: &ProjectDetection,
+) -> Option<VerificationCriterion> {
+    // file_contains: <path> :: <text>
+    if lower.starts_with("file_contains:")
+        && let Some(sep) = desc.find("::")
+    {
+        let prefix_len = "file_contains:".len();
+        let path = desc[prefix_len..sep].trim();
+        let text = desc[sep + 2..].trim();
+        if !path.is_empty() && !text.is_empty() {
+            return Some(VerificationCriterion {
+                id: id.to_string(),
+                description: desc.to_string(),
+                verifier: VerifierKind::ReadFileContains {
+                    path: path.to_string(),
+                    contains: vec![text.to_string()],
+                    not_contains: vec![],
+                },
+                required: true,
+                timeout_sec: 30,
+                global_only: false,
+            });
+        }
+    }
+
+    // file_exists: <path>
+    if lower.starts_with("file_exists:") {
+        let orig_path = desc["file_exists:".len()..].trim();
+        return Some(VerificationCriterion {
+            id: id.to_string(),
+            description: desc.to_string(),
+            verifier: VerifierKind::FileExists {
+                paths: vec![orig_path.to_string()],
+            },
+            required: true,
+            timeout_sec: 10,
+            global_only: false,
+        });
+    }
+
+    // command_output: <cmd> :: contains: <text>
+    if lower.starts_with("command_output:")
+        && let Some(sep) = desc.find("::")
+    {
+        let orig_cmd = desc["command_output:".len()..sep].trim();
+        let orig_contains = desc[sep + 2..].trim();
+        let orig_text = orig_contains.strip_prefix("contains:").unwrap_or(orig_contains).trim();
+        return Some(VerificationCriterion {
+            id: id.to_string(),
+            description: desc.to_string(),
+            verifier: VerifierKind::CommandOutput {
+                cmd: orig_cmd.to_string(),
+                contains: vec![orig_text.to_string()],
+                not_contains: vec![],
+            },
+            required: true,
+            timeout_sec: 60,
+            global_only: false,
+        });
+    }
+
+    // command_succeeds: <cmd>
+    if lower.starts_with("command_succeeds:") {
+        let orig_cmd = desc["command_succeeds:".len()..].trim();
+        return Some(VerificationCriterion {
+            id: id.to_string(),
+            description: desc.to_string(),
+            verifier: VerifierKind::Command {
+                cmd: orig_cmd.to_string(),
+                expected_exit: 0,
+            },
+            required: true,
+            timeout_sec: 120,
+            global_only: false,
+        });
+    }
+
+    // grep: <path> :: <pattern>
+    if lower.starts_with("grep:")
+        && let Some(sep) = desc.find("::")
+    {
+        let orig_path = desc["grep:".len()..sep].trim();
+        let orig_pattern = desc[sep + 2..].trim();
+        return Some(VerificationCriterion {
+            id: id.to_string(),
+            description: desc.to_string(),
+            verifier: VerifierKind::GrepCheck {
+                file: orig_path.to_string(),
+                pattern: orig_pattern.to_string(),
+                should_match: true,
+            },
+            required: true,
+            timeout_sec: 30,
+            global_only: false,
+        });
+    }
+
+    // tests_pass (exact match)
+    if lower.trim() == "tests_pass" {
+        let cmd = detect_test_command(det)?;
+        return Some(VerificationCriterion {
+            id: id.to_string(),
+            description: desc.to_string(),
+            verifier: VerifierKind::TestPass {
+                cmd,
+                min_pass_rate: 1.0,
+            },
+            required: true,
+            timeout_sec: 300,
+            global_only: true,
+        });
+    }
+
+    // build_succeeds (exact match)
+    if lower.trim() == "build_succeeds" {
+        let cmd = detect_build_command(det)?;
+        return Some(VerificationCriterion {
+            id: id.to_string(),
+            description: desc.to_string(),
+            verifier: VerifierKind::BuildPass { cmd },
+            required: true,
+            timeout_sec: 300,
+            global_only: true,
+        });
+    }
+
+    None
 }
 
 fn try_parse_test_criterion(

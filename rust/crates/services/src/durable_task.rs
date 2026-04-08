@@ -731,6 +731,15 @@ pub enum VerifierKind {
         #[serde(default = "default_min_pass_rate")]
         min_pass_rate: f64,
     },
+    /// Read a file and check its content for expected/forbidden strings.
+    /// Safer than CommandOutput with `cat` — avoids shell execution of file paths.
+    ReadFileContains {
+        path: String,
+        #[serde(default)]
+        contains: Vec<String>,
+        #[serde(default)]
+        not_contains: Vec<String>,
+    },
     /// LLM-based semantic judgment (can run on cloud, no local fs needed)
     LlmJudge {
         prompt: String,
@@ -980,6 +989,40 @@ impl VerificationRunner {
                     format!("'{pattern}' should NOT be in {file}")
                 };
                 Ok((passed, evidence, expected))
+            }
+
+            VerifierKind::ReadFileContains {
+                path,
+                contains,
+                not_contains,
+            } => {
+                let full = self.work_dir.join(path);
+                let content = std::fs::read_to_string(&full)
+                    .map_err(|e| format!("read {path}: {e}"))?;
+                let has_all = contains.iter().all(|s| content.contains(s));
+                let has_none = not_contains.iter().all(|s| !content.contains(s));
+                let passed = has_all && has_none;
+                let evidence = if passed {
+                    format!("file {path}: all checks passed")
+                } else {
+                    let mut parts = Vec::new();
+                    for s in contains {
+                        if !content.contains(s) {
+                            parts.push(format!("missing: \"{s}\""));
+                        }
+                    }
+                    for s in not_contains {
+                        if content.contains(s) {
+                            parts.push(format!("unwanted: \"{s}\""));
+                        }
+                    }
+                    format!("file {path}: {}", parts.join(", "))
+                };
+                Ok((
+                    passed,
+                    evidence,
+                    format!("file {path} contains: {:?}, not_contains: {:?}", contains, not_contains),
+                ))
             }
 
             VerifierKind::BuildPass { cmd } => {

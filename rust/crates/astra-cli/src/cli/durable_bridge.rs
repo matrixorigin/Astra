@@ -190,8 +190,12 @@ pub async fn on_subtask_begin(durable: &DurableTaskState, subtask_id: &str) {
 
 /// Call when a subtask's chat turn completes (diff capture + verification).
 ///
-/// Returns `true` if verification passed (or no criteria), `false` if failed.
-pub async fn on_subtask_complete(durable: &mut DurableTaskState, subtask_id: &str) -> bool {
+/// Returns `(passed, report)` — `passed` is true if verification succeeded (or
+/// no criteria). `report` is `Some` when verification actually ran.
+pub async fn on_subtask_complete(
+    durable: &mut DurableTaskState,
+    subtask_id: &str,
+) -> (bool, Option<SubtaskVerificationReport>) {
     let task_id = durable.contract.task_id.clone();
 
     // 1. Complete execution (captures diff)
@@ -235,8 +239,7 @@ pub async fn on_subtask_complete(durable: &mut DurableTaskState, subtask_id: &st
         .unwrap_or((0, false));
 
     if criteria_count == 0 {
-        // No criteria → lifecycle already promoted the row to `Verified` in `complete_subtask_execution`.
-        return true;
+        return (true, None);
     }
 
     // 3. Run verification with progress indication + spinner
@@ -250,8 +253,6 @@ pub async fn on_subtask_complete(durable: &mut DurableTaskState, subtask_id: &st
     spinner.stop_clear();
     match result {
         Ok(report) => {
-            display_verification_report(&report);
-
             // Update our in-memory contract with the result
             if let Some(sub) = durable
                 .contract
@@ -269,7 +270,8 @@ pub async fn on_subtask_complete(durable: &mut DurableTaskState, subtask_id: &st
                 }
             }
 
-            report.all_required_passed
+            let passed = report.all_required_passed;
+            (passed, Some(report))
         }
         Err(e) => {
             eprintln!(
@@ -278,13 +280,16 @@ pub async fn on_subtask_complete(durable: &mut DurableTaskState, subtask_id: &st
                 subtask_id,
                 e,
             );
-            true // Don't block on verification infrastructure failures
+            (true, None) // Don't block on verification infrastructure failures
         }
     }
 }
 
-/// Pretty-print subtask verification results.
-fn display_verification_report(report: &SubtaskVerificationReport) {
+/// Pretty-print subtask verification results (stderr).
+///
+/// Single implementation for CLI: the plan monitor (`display_plan_updates_live` in `main.rs`)
+/// calls this; do not duplicate the formatting elsewhere.
+pub fn display_verification_report(report: &SubtaskVerificationReport) {
     let passed = report.results.iter().filter(|r| r.passed).count();
     let total = report.results.len();
     let icon = if report.all_required_passed {
@@ -1707,7 +1712,7 @@ mod tests {
             last_report: None,
         };
 
-        let passed = on_subtask_complete(&mut durable, "s1").await;
+        let (passed, _report) = on_subtask_complete(&mut durable, "s1").await;
         assert!(passed, "Verification should pass — calculator.py exists");
         assert!(
             matches!(durable.contract.subtasks[0].stage, SubtaskStage::Verified),
@@ -1757,7 +1762,7 @@ mod tests {
         };
 
         // File doesn't exist → verification should fail
-        let passed = on_subtask_complete(&mut durable, "s1").await;
+        let (passed, _report) = on_subtask_complete(&mut durable, "s1").await;
         assert!(!passed, "Verification should FAIL — output.py is missing");
         assert_eq!(durable.contract.subtasks[0].retry_count, 1);
         assert!(
@@ -1843,7 +1848,7 @@ mod tests {
         };
 
         on_subtask_begin(&durable, "s1").await;
-        let passed = on_subtask_complete(&mut durable, "s1").await;
+        let (passed, _report) = on_subtask_complete(&mut durable, "s1").await;
         assert!(passed, "GrepCheck should pass — 'import jwt' is in auth.py");
     }
 
@@ -1918,7 +1923,7 @@ mod tests {
         };
 
         on_subtask_begin(&durable, "s1").await;
-        let passed = on_subtask_complete(&mut durable, "s1").await;
+        let (passed, _report) = on_subtask_complete(&mut durable, "s1").await;
         assert!(
             !passed,
             "GrepCheck should fail — 'rate_limit' is NOT in auth.py"
@@ -1988,7 +1993,7 @@ mod tests {
         };
 
         on_subtask_begin(&durable, "s1").await;
-        let passed = on_subtask_complete(&mut durable, "s1").await;
+        let (passed, _report) = on_subtask_complete(&mut durable, "s1").await;
         assert!(passed, "Command 'true' should exit 0 → pass");
     }
 
@@ -2055,7 +2060,7 @@ mod tests {
         };
 
         on_subtask_begin(&durable, "s1").await;
-        let passed = on_subtask_complete(&mut durable, "s1").await;
+        let (passed, _report) = on_subtask_complete(&mut durable, "s1").await;
         assert!(!passed, "Command 'false' exits 1 → should fail");
     }
 
@@ -2128,7 +2133,7 @@ mod tests {
         };
 
         on_subtask_begin(&durable, "s1").await;
-        let passed = on_subtask_complete(&mut durable, "s1").await;
+        let (passed, _report) = on_subtask_complete(&mut durable, "s1").await;
         // pytest available: should pass and set stage to Verified
         // pytest not available: verification error → treated as pass (non-blocking),
         //   but stage won't change to Verified (stays as-is)
@@ -2256,13 +2261,13 @@ mod tests {
         };
 
         // First failure
-        let passed = on_subtask_complete(&mut durable, "s1").await;
+        let (passed, _report) = on_subtask_complete(&mut durable, "s1").await;
         if !passed {
             assert_eq!(durable.contract.subtasks[0].retry_count, 1);
 
             // Second failure
             durable.contract.subtasks[0].stage = SubtaskStage::Executing;
-            let passed2 = on_subtask_complete(&mut durable, "s1").await;
+            let (passed2, _report2) = on_subtask_complete(&mut durable, "s1").await;
             assert!(!passed2);
             assert_eq!(durable.contract.subtasks[0].retry_count, 2);
         }
@@ -2351,7 +2356,7 @@ mod tests {
         // but the key assertion is that it was *called* (stage changes from
         // AwaitingVerification to either Verified or VerificationFailed).
         on_subtask_begin(&durable, "s1").await;
-        let _passed = on_subtask_complete(&mut durable, "s1").await;
+        let (_passed, _report) = on_subtask_complete(&mut durable, "s1").await;
 
         // Stage must NOT be AwaitingVerification — that would mean verify_subtask
         // was skipped, which is the bug we fixed.
@@ -2402,7 +2407,7 @@ mod tests {
             last_report: None,
         };
 
-        let passed = on_subtask_complete(&mut durable, "s1").await;
+        let (passed, _report) = on_subtask_complete(&mut durable, "s1").await;
         assert!(passed, "Zero criteria should return true immediately");
     }
 

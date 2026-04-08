@@ -90,6 +90,8 @@ mod repl_turn;
 mod repl_ui;
 #[path = "cli/skill_subrun.rs"]
 mod skill_subrun;
+#[path = "cli/sse_utils.rs"]
+mod sse_utils;
 #[path = "cli/slash_account.rs"]
 mod slash_account;
 #[path = "cli/slash_bug.rs"]
@@ -961,6 +963,8 @@ struct ReplState {
     /// True while plan display is in the middle of printing streaming LLM tokens.
     /// Used to insert a newline before the next non-token event.
     plan_in_token_stream: bool,
+    /// Streaming markdown renderer for plan execution token output.
+    plan_md_renderer: Option<streaming_md::StreamingMarkdown>,
     /// Project-level instructions loaded from `.astra/instructions.md`.
     /// Injected into every turn's effective message as `<project_instructions>`.
     project_instructions: Option<String>,
@@ -1043,6 +1047,7 @@ impl Default for ReplState {
             plan_resume_pending: false,
             pending_approval: None,
             plan_in_token_stream: false,
+            plan_md_renderer: None,
             project_instructions: None,
         }
     }
@@ -3419,31 +3424,38 @@ fn display_plan_updates_live(
     use plan_executor::PlanUpdate;
     let mut outcome = PlanMonitorOutcome::Continue;
 
-    // Helper: if we were in the middle of streaming tokens, close that stream
-    // with a newline before printing anything else.
-    let end_token_stream =
-        |in_stream: &mut bool, spinner: &mut Option<effects::PlanActivitySpinner>| {
-            if *in_stream {
-                *in_stream = false;
-                // Stop spinner (if any) and newline to close the streamed text
-                if let Some(s) = spinner.take() {
-                    s.stop_clear();
-                }
-                eprintln!();
-            }
-        };
-
-    // Print via eprintln! (readline is not active during this call).
-    // Always stops the active spinner first to clear its \r line.
-    let print_line =
-        |spinner: &mut Option<effects::PlanActivitySpinner>, in_stream: &mut bool, msg: String| {
-            end_token_stream(in_stream, spinner);
-            // Stop spinner before printing to avoid garbled output
+    /// Finish any in-flight markdown stream: clear spinner, finalize renderer, newline.
+    fn finalize_plan_stream(
+        in_stream: &mut bool,
+        spinner: &mut Option<effects::PlanActivitySpinner>,
+        md: &mut Option<streaming_md::StreamingMarkdown>,
+    ) {
+        if *in_stream {
+            *in_stream = false;
             if let Some(s) = spinner.take() {
                 s.stop_clear();
             }
-            eprintln!("{msg}");
-        };
+            if let Some(renderer) = md {
+                renderer.finish();
+            }
+            *md = None;
+            eprintln!();
+        }
+    }
+
+    /// Clear active plan spinner (if any), finalize token/md stream, then print a line.
+    fn print_plan_monitor_line(
+        spinner: &mut Option<effects::PlanActivitySpinner>,
+        in_stream: &mut bool,
+        md: &mut Option<streaming_md::StreamingMarkdown>,
+        msg: String,
+    ) {
+        finalize_plan_stream(in_stream, spinner, md);
+        if let Some(s) = spinner.take() {
+            s.stop_clear();
+        }
+        eprintln!("{msg}");
+    }
 
     let handle = match state.plan_handle.as_mut() {
         Some(h) => h,
@@ -3537,7 +3549,7 @@ fn display_plan_updates_live(
                 if let Some(tx) = state.pending_approval.take() {
                     let _ = tx.send(false);
                 }
-                print_line(plan_spinner, &mut state.plan_in_token_stream, msg);
+                print_plan_monitor_line(plan_spinner, &mut state.plan_in_token_stream, &mut state.plan_md_renderer, msg);
                 // Auto-display delivery report if available
                 if let Some(ref report) = state.last_delivery_report {
                     eprintln!();
@@ -3568,7 +3580,7 @@ fn display_plan_updates_live(
                 if let Some(tx) = state.pending_approval.take() {
                     let _ = tx.send(false);
                 }
-                print_line(plan_spinner, &mut state.plan_in_token_stream, msg);
+                print_plan_monitor_line(plan_spinner, &mut state.plan_in_token_stream, &mut state.plan_md_renderer, msg);
                 if state.plan_mode.is_some() {
                     eprintln!(
                         "{}",
@@ -3611,6 +3623,14 @@ fn display_plan_updates_live(
             }
             PlanUpdate::DeliveryReport(report) => {
                 state.last_delivery_report = Some(report);
+                continue;
+            }
+            PlanUpdate::VerificationReport(report) => {
+                finalize_plan_stream(&mut state.plan_in_token_stream, plan_spinner, &mut state.plan_md_renderer);
+                if let Some(s) = plan_spinner.take() {
+                    s.stop_clear();
+                }
+                durable_bridge::display_verification_report(&report);
                 continue;
             }
             PlanUpdate::SubtaskRetry {
@@ -3658,7 +3678,7 @@ fn display_plan_updates_live(
                         (format!("  {icon} {name} ({dur}){summary}"), None)
                     }
                     StreamEvent::WaitingForModel => {
-                        end_token_stream(&mut state.plan_in_token_stream, plan_spinner);
+                        finalize_plan_stream(&mut state.plan_in_token_stream, plan_spinner, &mut state.plan_md_renderer);
                         if let Some(s) = plan_spinner.take() {
                             s.stop_clear();
                         }
@@ -3669,7 +3689,7 @@ fn display_plan_updates_live(
                         continue;
                     }
                     StreamEvent::ModelResponding => {
-                        end_token_stream(&mut state.plan_in_token_stream, plan_spinner);
+                        finalize_plan_stream(&mut state.plan_in_token_stream, plan_spinner, &mut state.plan_md_renderer);
                         if let Some(s) = plan_spinner.take() {
                             s.stop_clear();
                         }
@@ -3680,7 +3700,7 @@ fn display_plan_updates_live(
                         continue;
                     }
                     StreamEvent::Thinking(true) => {
-                        end_token_stream(&mut state.plan_in_token_stream, plan_spinner);
+                        finalize_plan_stream(&mut state.plan_in_token_stream, plan_spinner, &mut state.plan_md_renderer);
                         if let Some(s) = plan_spinner.take() {
                             s.stop_clear();
                         }
@@ -3691,20 +3711,21 @@ fn display_plan_updates_live(
                         continue;
                     }
                     StreamEvent::Token(text) => {
-                        // Stream LLM text tokens inline — stop spinner on first token
                         if !state.plan_in_token_stream {
                             if let Some(s) = plan_spinner.take() {
                                 s.stop_clear();
                             }
                             state.plan_in_token_stream = true;
-                            // Dim indent prefix for streaming text
-                            eprint!("    ");
+                            let tw = crossterm::terminal::size().map(|(w, _)| w as usize).unwrap_or(80);
+                            state.plan_md_renderer = Some(streaming_md::StreamingMarkdown::new(tw));
                         }
-                        eprint!("{text}");
+                        if let Some(ref mut md) = state.plan_md_renderer {
+                            md.push(&text);
+                        }
                         continue;
                     }
                     StreamEvent::StatusLine(line) => {
-                        end_token_stream(&mut state.plan_in_token_stream, plan_spinner);
+                        finalize_plan_stream(&mut state.plan_in_token_stream, plan_spinner, &mut state.plan_md_renderer);
                         if let Some(s) = plan_spinner.take() {
                             s.stop_clear();
                         }
@@ -3734,20 +3755,20 @@ fn display_plan_updates_live(
                     detail.as_deref().unwrap_or(""),
                     reason,
                 );
-                print_line(plan_spinner, &mut state.plan_in_token_stream, msg);
+                print_plan_monitor_line(plan_spinner, &mut state.plan_in_token_stream, &mut state.plan_md_renderer, msg);
                 // Store the response channel for the REPL readline handler.
                 // The next user input line will be interpreted as y/n/a to resolve this.
                 state.pending_approval = Some(response_tx);
                 let prompt_msg =
                     "   Type y(es) to approve, n(o) to deny, !(auto-run all):".to_string();
-                print_line(plan_spinner, &mut state.plan_in_token_stream, prompt_msg);
+                print_plan_monitor_line(plan_spinner, &mut state.plan_in_token_stream, &mut state.plan_md_renderer, prompt_msg);
                 continue;
             }
             _ => continue, // ParallelGroupInfo, StepByStepPrompt — future use
         };
 
         // Print the message (stops spinner internally)
-        print_line(plan_spinner, &mut state.plan_in_token_stream, msg);
+        print_plan_monitor_line(plan_spinner, &mut state.plan_in_token_stream, &mut state.plan_md_renderer, msg);
 
         // Optionally start a new spinner after the printed line
         if let Some(label) = post_spinner {
