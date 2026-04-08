@@ -1111,6 +1111,28 @@ pub fn all_tool_schemas() -> Vec<Value> {
                 }
             }
         }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "tool_search",
+                "description": "Search available tools by name or description keywords. Use to discover tools when unsure which one to use. Returns matching tool names with brief descriptions. Supports direct selection with 'select:tool_name' or keyword search.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": "Search query: 'select:tool_name' for exact match, or keywords to search tool names/descriptions. E.g. 'git', 'file read', 'select:str_replace'"
+                        },
+                        "max_results": {
+                            "type": "integer",
+                            "description": "Maximum number of results to return (default: 5, max: 20)",
+                            "default": 5
+                        }
+                    },
+                    "required": ["query"]
+                }
+            }
+        }),
     ]
 }
 
@@ -2129,6 +2151,149 @@ impl ToolExecutor {
         }).to_string()
     }
 
+    /// Search available tools by name or description keywords.
+    /// Supports direct selection with 'select:tool_name' or keyword search.
+    fn tool_search(&self, args: &Value) -> String {
+        let query = match args.get("query").and_then(Value::as_str) {
+            Some(q) if !q.is_empty() => q.trim(),
+            _ => return "Error: 'query' is required".to_string(),
+        };
+
+        let max_results = args
+            .get("max_results")
+            .and_then(Value::as_u64)
+            .unwrap_or(5)
+            .min(20) as usize;
+
+        let all_tools = all_tool_schemas();
+
+        // Direct selection mode: select:tool_name or select:a,b,c
+        if let Some(tool_names) = query.strip_prefix("select:") {
+            let requested: Vec<&str> = tool_names.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
+            let mut found = Vec::new();
+            let mut missing = Vec::new();
+
+            for name in requested {
+                let name_lower = name.to_lowercase();
+                if let Some(tool) = all_tools.iter().find(|t| {
+                    t.get("function")
+                        .and_then(|f| f.get("name"))
+                        .and_then(Value::as_str)
+                        .map(|n| n.to_lowercase() == name_lower)
+                        .unwrap_or(false)
+                }) {
+                    if let Some(func) = tool.get("function") {
+                        let tool_name = func.get("name").and_then(Value::as_str).unwrap_or("");
+                        let desc = func.get("description").and_then(Value::as_str).unwrap_or("");
+                        // Truncate description for readability
+                        let short_desc: String = desc.chars().take(100).collect();
+                        found.push(serde_json::json!({
+                            "name": tool_name,
+                            "description": if desc.len() > 100 { format!("{}...", short_desc) } else { desc.to_string() }
+                        }));
+                    }
+                } else {
+                    missing.push(name.to_string());
+                }
+            }
+
+            return serde_json::json!({
+                "query": query,
+                "matches": found,
+                "missing": missing,
+                "total_tools": all_tools.len()
+            }).to_string();
+        }
+
+        // Keyword search mode
+        let query_lower = query.to_lowercase();
+        let query_terms: Vec<&str> = query_lower.split_whitespace().collect();
+
+        let mut scored: Vec<(usize, &Value)> = all_tools
+            .iter()
+            .filter_map(|tool| {
+                let func = tool.get("function")?;
+                let name = func.get("name")?.as_str()?;
+                let desc = func.get("description").and_then(Value::as_str).unwrap_or("");
+                
+                let name_lower = name.to_lowercase();
+                let desc_lower = desc.to_lowercase();
+                
+                let mut score = 0usize;
+                
+                for term in &query_terms {
+                    // Exact name match (high weight)
+                    if name_lower == *term {
+                        score += 20;
+                    } else if name_lower.contains(term) {
+                        // Partial name match
+                        score += 10;
+                    }
+                    
+                    // Split camelCase/snake_case for part matching
+                    let name_parts: Vec<String> = name
+                        .replace('_', " ")
+                        .chars()
+                        .fold(String::new(), |mut acc, c| {
+                            if c.is_uppercase() && !acc.is_empty() {
+                                acc.push(' ');
+                            }
+                            acc.push(c);
+                            acc
+                        })
+                        .to_lowercase()
+                        .split_whitespace()
+                        .map(String::from)
+                        .collect();
+                    
+                    for part in &name_parts {
+                        if part == *term {
+                            score += 8;
+                        } else if part.contains(term) {
+                            score += 4;
+                        }
+                    }
+                    
+                    // Description match (lower weight)
+                    if desc_lower.contains(term) {
+                        score += 2;
+                    }
+                }
+                
+                if score > 0 {
+                    Some((score, tool))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        // Sort by score descending
+        scored.sort_by(|a, b| b.0.cmp(&a.0));
+
+        let matches: Vec<Value> = scored
+            .into_iter()
+            .take(max_results)
+            .map(|(score, tool)| {
+                let func = tool.get("function").unwrap();
+                let name = func.get("name").and_then(Value::as_str).unwrap_or("");
+                let desc = func.get("description").and_then(Value::as_str).unwrap_or("");
+                let short_desc: String = desc.chars().take(100).collect();
+                serde_json::json!({
+                    "name": name,
+                    "description": if desc.len() > 100 { format!("{}...", short_desc) } else { desc.to_string() },
+                    "score": score
+                })
+            })
+            .collect();
+
+        serde_json::json!({
+            "query": query,
+            "matches": matches,
+            "total_tools": all_tools.len()
+        }).to_string()
+    }
+
     /// Set the MCP client manager for external tool routing.
     pub fn with_mcp_manager(
         mut self,
@@ -2672,13 +2837,14 @@ impl ToolExecutor {
             "task_get" => self.task_get(args).await,
             "task_update" => self.task_update(args).await,
             "sleep" => self.sleep_tool(args).await,
+            "tool_search" => self.tool_search(args),
             _ if name.starts_with("mcp_") => self.execute_mcp_tool(name, args).await,
             _ => format!(
                 "Unknown tool: {name}. Available tools: bash, read_file, write_file, str_replace, \
                  list_dir, grep, glob, symbols, find_definition, find_references, git_status, \
                  git_diff, git_log, git_show, git_blame, call_graph, run_build_test, web_fetch, \
                  mo_query, memory_search, memory_profile, ask_user, task_create, task_list, \
-                 task_get, task_update, sleep"
+                 task_get, task_update, sleep, tool_search"
             ),
         };
         // Normalize empty output, then apply global safety net
@@ -9693,5 +9859,90 @@ impl MyType {
         // We won't actually wait that long, just verify the schema accepts it
         let result = exe.sleep_tool(&json!({"duration_ms": 1, "reason": "test cap"})).await;
         assert!(result.contains("success"));
+    }
+
+    // ── Tool search tests ─────────────────────────────────────────────────────
+
+    #[test]
+    fn tool_search_requires_query() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = ToolExecutor::new(dir.path());
+        let result = exe.tool_search(&json!({}));
+        assert!(result.contains("Error"));
+        assert!(result.contains("query"));
+    }
+
+    #[test]
+    fn tool_search_select_exact_match() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = ToolExecutor::new(dir.path());
+        let result = exe.tool_search(&json!({"query": "select:bash"}));
+        assert!(result.contains("bash"));
+        assert!(result.contains("\"missing\":[]"));
+    }
+
+    #[test]
+    fn tool_search_select_case_insensitive() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = ToolExecutor::new(dir.path());
+        let result = exe.tool_search(&json!({"query": "select:READ_FILE"}));
+        assert!(result.contains("read_file"));
+    }
+
+    #[test]
+    fn tool_search_select_multiple() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = ToolExecutor::new(dir.path());
+        let result = exe.tool_search(&json!({"query": "select:bash,grep,glob"}));
+        assert!(result.contains("bash"));
+        assert!(result.contains("grep"));
+        assert!(result.contains("glob"));
+    }
+
+    #[test]
+    fn tool_search_select_missing_tool() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = ToolExecutor::new(dir.path());
+        let result = exe.tool_search(&json!({"query": "select:nonexistent_tool_xyz"}));
+        assert!(result.contains("nonexistent_tool_xyz"));
+        assert!(result.contains("missing"));
+    }
+
+    #[test]
+    fn tool_search_keyword_finds_git_tools() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = ToolExecutor::new(dir.path());
+        let result = exe.tool_search(&json!({"query": "git", "max_results": 10}));
+        // Should find multiple git-related tools
+        assert!(result.contains("git_status") || result.contains("git_diff") || result.contains("git_log"));
+    }
+
+    #[test]
+    fn tool_search_keyword_file_operations() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = ToolExecutor::new(dir.path());
+        let result = exe.tool_search(&json!({"query": "file read"}));
+        assert!(result.contains("read_file"));
+    }
+
+    #[test]
+    fn tool_search_respects_max_results() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = ToolExecutor::new(dir.path());
+        // Search for a broad term that matches many tools
+        let result = exe.tool_search(&json!({"query": "file", "max_results": 2}));
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        let matches = parsed["matches"].as_array().unwrap();
+        assert!(matches.len() <= 2);
+    }
+
+    #[test]
+    fn tool_search_reports_total_tools() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = ToolExecutor::new(dir.path());
+        let result = exe.tool_search(&json!({"query": "bash"}));
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        let total = parsed["total_tools"].as_u64().unwrap();
+        assert!(total >= 10, "should have many tools registered");
     }
 }
