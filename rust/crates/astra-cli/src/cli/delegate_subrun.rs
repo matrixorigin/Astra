@@ -41,21 +41,38 @@ const DELEGATE_MAX_TURNS: usize = 25;
 ///
 /// Falls back to `default_root` if no valid worktree path is found.
 ///
-/// Security: Canonicalizes paths to defeat symlink TOCTOU attacks.
+/// Security: Returns the **canonicalized** path to prevent TOCTOU attacks where
+/// a symlink target is changed between validation and use.
 fn resolve_worktree_path(
     context: &HashMap<String, serde_json::Value>,
     agent_id: &str,
     worktree_base: &Path,
     default_root: &Path,
 ) -> PathBuf {
+    // Ensure worktree base exists before validation; create if missing.
+    // This handles cold-start scenarios where the base dir hasn't been created yet.
+    if !worktree_base.exists() {
+        if let Err(e) = std::fs::create_dir_all(worktree_base) {
+            eprintln!(
+                "[delegate] failed to create worktree base {}: {}",
+                worktree_base.display(),
+                e
+            );
+            return default_root.to_path_buf();
+        }
+    }
+
     context
         .get(&format!("worktree_path_{}", agent_id))
         .and_then(|v| v.as_str())
         .and_then(|path| {
             let p = PathBuf::from(path);
-            // Canonicalize both paths to resolve symlinks before comparison
+            // Canonicalize both paths to resolve symlinks before comparison.
+            // Return the canonicalized path to prevent TOCTOU races.
             match (p.canonicalize(), worktree_base.canonicalize()) {
-                (Ok(canon_p), Ok(canon_base)) if canon_p.starts_with(&canon_base) => Some(p),
+                (Ok(canon_p), Ok(canon_base)) if canon_p.starts_with(&canon_base) => {
+                    Some(canon_p)
+                }
                 _ => {
                     eprintln!(
                         "[delegate] ignoring untrusted worktree_path for {}: {}",
@@ -526,7 +543,49 @@ mod tests {
         let default = PathBuf::from("/project/root");
 
         let result = resolve_worktree_path(&ctx, "agent-c", &base, &default);
-        assert_eq!(result, agent_wt);
+        // Should return the canonicalized path to prevent TOCTOU
+        assert_eq!(result, agent_wt.canonicalize().unwrap());
+    }
+
+    #[test]
+    fn resolve_worktree_path_returns_canonicalized_path() {
+        // Verify that even with a relative or non-canonical input,
+        // the returned path is fully canonicalized.
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().to_path_buf();
+        let agent_wt = base.join("nested").join("agent-wt");
+        std::fs::create_dir_all(&agent_wt).unwrap();
+
+        // Provide a path with redundant components
+        let non_canonical = base.join("nested").join("..").join("nested").join("agent-wt");
+
+        let mut ctx = HashMap::new();
+        ctx.insert(
+            "worktree_path_agent-x".to_string(),
+            serde_json::json!(non_canonical.to_string_lossy()),
+        );
+        let default = PathBuf::from("/project/root");
+
+        let result = resolve_worktree_path(&ctx, "agent-x", &base, &default);
+        // Result should be fully canonicalized
+        assert_eq!(result, agent_wt.canonicalize().unwrap());
+        assert!(!result.to_string_lossy().contains(".."));
+    }
+
+    #[test]
+    fn resolve_worktree_path_creates_missing_base() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("new-worktree-base");
+        // base does NOT exist yet
+
+        let ctx = HashMap::new();
+        let default = PathBuf::from("/project/root");
+
+        // Should not panic; base gets created
+        let result = resolve_worktree_path(&ctx, "agent-y", &base, &default);
+        assert_eq!(result, default);
+        // Base should now exist
+        assert!(base.exists());
     }
 
     #[test]
