@@ -25,7 +25,7 @@ use astra_services::team_persistence::{
 
 use super::delegation_engine::DelegationEngine;
 use super::run_engine::RunEngine;
-use super::worktree_isolation::{MergeResult, WorktreeManager};
+use super::worktree_isolation::{MergeResult, RepoLock, WorktreeManager};
 
 // ─── Types ──────────────────────────────────────────────────────────────────
 
@@ -79,6 +79,7 @@ pub struct TeamExecutionOrchestrator {
     run_engine: Arc<RunEngine>,
     profile_registry: Arc<RwLock<AgentProfileRegistry>>,
     config: OrchestratorConfig,
+    repo_lock: RepoLock,
 }
 
 impl TeamExecutionOrchestrator {
@@ -95,7 +96,14 @@ impl TeamExecutionOrchestrator {
             run_engine,
             profile_registry,
             config,
+            repo_lock: super::worktree_isolation::new_repo_lock(),
         }
+    }
+
+    /// Set a shared repository lock for concurrent team executions.
+    pub fn with_repo_lock(mut self, lock: RepoLock) -> Self {
+        self.repo_lock = lock;
+        self
     }
 
     /// Execute the full 4-phase lifecycle for a team task.
@@ -177,7 +185,7 @@ impl TeamExecutionOrchestrator {
 
         // Create worktrees if isolated mode
         let mut worktree_mgr = repo_root.map(|root| {
-            WorktreeManager::new(root)
+            WorktreeManager::new(root).with_repo_lock(self.repo_lock.clone())
         });
 
         let agent_ids: Vec<String> = profiles.iter().map(|p| p.agent_id.clone()).collect();
