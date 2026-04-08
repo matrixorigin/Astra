@@ -206,7 +206,7 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
             all_selected_skills: Vec::new(),
             message: config.task.clone(),
             recent_tools: Vec::new(),
-            task_profile: infer_task_execution_profile(&config.task),
+            task_profile,
             api: self.api.clone(),
             api_token: self.token.clone(),
             cancel_flag: None,
@@ -254,32 +254,67 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
 
         let loop_result = run_agentic_loop_with_host(&mut host, &mut state).await;
 
-        let turns_used = (DELEGATE_MAX_TURNS - state.remaining_turns) as u32;
+        let tool_calls = state.total_tool_calls as u32;
+        let agent_id = profile.agent_id.clone();
+        let run_id = config.run_id;
+        let prompt_tokens = state.total_prompt;
+        let completion_tokens = state.total_completion;
+
+        let partial_output = || {
+            if state.final_text.is_empty() {
+                None
+            } else {
+                Some(state.final_text.clone())
+            }
+        };
 
         match loop_result {
-            Ok(_outcome) => Ok(AgentResult {
-                agent_id: profile.agent_id.clone(),
-                run_id: config.run_id,
-                status: "completed".to_string(),
-                output: Some(state.final_text),
-                error: None,
-                prompt_tokens: state.total_prompt,
-                completion_tokens: state.total_completion,
-                tool_calls: turns_used,
-            }),
-            Err(e) => Ok(AgentResult {
-                agent_id: profile.agent_id.clone(),
-                run_id: config.run_id,
+            Ok(astra_runtime::turn::agentic_loop_host::AgenticLoopOutcome::Completed) => {
+                Ok(AgentResult {
+                    agent_id,
+                    run_id,
+                    status: "completed".to_string(),
+                    output: Some(state.final_text),
+                    error: None,
+                    prompt_tokens,
+                    completion_tokens,
+                    tool_calls,
+                })
+            }
+            Ok(astra_runtime::turn::agentic_loop_host::AgenticLoopOutcome::Cancelled) => {
+                Ok(AgentResult {
+                    agent_id,
+                    run_id,
+                    status: "paused".to_string(),
+                    output: partial_output(),
+                    error: None,
+                    prompt_tokens,
+                    completion_tokens,
+                    tool_calls,
+                })
+            }
+            Ok(astra_runtime::turn::agentic_loop_host::AgenticLoopOutcome::Waiting(reason)) => {
+                Ok(AgentResult {
+                    agent_id,
+                    run_id,
+                    status: "waiting".to_string(),
+                    output: Some(reason),
+                    error: None,
+                    prompt_tokens,
+                    completion_tokens,
+                    tool_calls,
+                })
+            }
+            Ok(astra_runtime::turn::agentic_loop_host::AgenticLoopOutcome::Error(err))
+            | Err(err) => Ok(AgentResult {
+                agent_id,
+                run_id,
                 status: "failed".to_string(),
-                output: if state.final_text.is_empty() {
-                    None
-                } else {
-                    Some(state.final_text)
-                },
-                error: Some(e),
-                prompt_tokens: state.total_prompt,
-                completion_tokens: state.total_completion,
-                tool_calls: turns_used,
+                output: partial_output(),
+                error: Some(err),
+                prompt_tokens,
+                completion_tokens,
+                tool_calls,
             }),
         }
     }
