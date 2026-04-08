@@ -1658,6 +1658,194 @@ fn truncate(s: &str, max: usize) -> String {
     }
 }
 
+// ═══════════════════════════ Session Lifecycle ════════════════════════════
+
+/// Result of a single session lifecycle maintenance run.
+#[derive(Debug, Default)]
+pub struct SessionMaintenanceResult {
+    /// Number of sessions deleted (TTL expired).
+    pub sessions_deleted: usize,
+    /// Number of journals compressed (.jsonl → .jsonl.gz).
+    pub journals_compressed: usize,
+    /// Total disk bytes freed by deletion.
+    pub bytes_freed: u64,
+    /// Errors encountered (non-fatal, best-effort).
+    pub errors: Vec<String>,
+}
+
+/// Run session lifecycle maintenance: delete expired sessions and compress old journals.
+///
+/// - `ttl_days`: sessions older than this are deleted entirely (default: 30).
+/// - `compress_after_days`: journals older than this (but younger than ttl) are gzip-compressed (default: 7).
+///
+/// Both thresholds use the journal file's modification time. This function is
+/// idempotent and safe to call at every REPL startup.
+pub fn run_session_maintenance(ttl_days: u64, compress_after_days: u64) -> SessionMaintenanceResult {
+    let dir = journal_dir();
+    if !dir.exists() {
+        return SessionMaintenanceResult::default();
+    }
+    run_session_maintenance_in(dir, ttl_days, compress_after_days)
+}
+
+/// Testable version that operates on an explicit directory.
+fn run_session_maintenance_in(
+    dir: PathBuf,
+    ttl_days: u64,
+    compress_after_days: u64,
+) -> SessionMaintenanceResult {
+    use std::time::{Duration, SystemTime};
+
+    let now = SystemTime::now();
+    let ttl_threshold = now
+        .checked_sub(Duration::from_secs(ttl_days * 86400))
+        .unwrap_or(SystemTime::UNIX_EPOCH);
+    let compress_threshold = now
+        .checked_sub(Duration::from_secs(compress_after_days * 86400))
+        .unwrap_or(SystemTime::UNIX_EPOCH);
+
+    let mut result = SessionMaintenanceResult::default();
+
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(e) => e,
+        Err(e) => {
+            result.errors.push(format!("read_dir failed: {e}"));
+            return result;
+        }
+    };
+
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+
+        // Only process .jsonl files (active journals)
+        let session_id = match name_str.strip_suffix(".jsonl") {
+            Some(sid) => sid.to_string(),
+            None => continue,
+        };
+        // Skip .jsonl.gz — already compressed
+        if name_str.ends_with(".jsonl.gz") {
+            continue;
+        }
+
+        let mtime = match entry.metadata().and_then(|m| m.modified()) {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+
+        if mtime < ttl_threshold {
+            // Session expired: delete journal + session directory
+            let freed = delete_session_files(&dir, &session_id);
+            result.bytes_freed += freed;
+            result.sessions_deleted += 1;
+        } else if mtime < compress_threshold {
+            // Journal old enough to compress
+            match compress_journal(&dir, &session_id) {
+                Ok(()) => result.journals_compressed += 1,
+                Err(e) => result
+                    .errors
+                    .push(format!("compress {session_id}: {e}")),
+            }
+        }
+    }
+
+    // Also clean up orphaned .jsonl.gz files past TTL
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            if let Some(sid) = name_str.strip_suffix(".jsonl.gz") {
+                let mtime = match entry.metadata().and_then(|m| m.modified()) {
+                    Ok(t) => t,
+                    Err(_) => continue,
+                };
+                if mtime < ttl_threshold {
+                    let freed = delete_session_files(&dir, sid);
+                    result.bytes_freed += freed;
+                    result.sessions_deleted += 1;
+                }
+            }
+        }
+    }
+
+    result
+}
+
+/// Delete all files for a session: .jsonl, .jsonl.gz, and the session directory.
+/// Returns the total bytes freed.
+fn delete_session_files(sessions_dir: &Path, session_id: &str) -> u64 {
+    let mut freed: u64 = 0;
+    // Journal file (.jsonl)
+    let journal = sessions_dir.join(format!("{session_id}.jsonl"));
+    if let Ok(meta) = journal.metadata() {
+        freed += meta.len();
+        let _ = std::fs::remove_file(&journal);
+    }
+    // Compressed journal (.jsonl.gz)
+    let gz = sessions_dir.join(format!("{session_id}.jsonl.gz"));
+    if let Ok(meta) = gz.metadata() {
+        freed += meta.len();
+        let _ = std::fs::remove_file(&gz);
+    }
+    // Session directory (checkpoints, workspace, tool results, etc.)
+    let session_dir = sessions_dir.join(session_id);
+    if session_dir.is_dir() {
+        if let Ok(size) = dir_size(&session_dir) {
+            freed += size;
+        }
+        let _ = std::fs::remove_dir_all(&session_dir);
+    }
+    freed
+}
+
+/// Compress a .jsonl file to .jsonl.gz using gzip, then remove the original.
+fn compress_journal(sessions_dir: &Path, session_id: &str) -> std::io::Result<()> {
+    use flate2::write::GzEncoder;
+    use flate2::Compression;
+    use std::io::{BufRead, BufReader, Write};
+
+    let src = sessions_dir.join(format!("{session_id}.jsonl"));
+    let dst = sessions_dir.join(format!("{session_id}.jsonl.gz"));
+
+    // Don't re-compress if .gz already exists
+    if dst.exists() {
+        let _ = std::fs::remove_file(&src);
+        return Ok(());
+    }
+
+    let reader = BufReader::new(std::fs::File::open(&src)?);
+    let file = std::fs::File::create(&dst)?;
+    let mut encoder = GzEncoder::new(file, Compression::default());
+
+    for line in reader.lines() {
+        let line = line?;
+        encoder.write_all(line.as_bytes())?;
+        encoder.write_all(b"\n")?;
+    }
+    encoder.finish()?;
+
+    // Remove original after successful compression
+    std::fs::remove_file(&src)?;
+    Ok(())
+}
+
+/// Recursively compute total size of a directory tree.
+fn dir_size(path: &Path) -> std::io::Result<u64> {
+    let mut total: u64 = 0;
+    if path.is_dir() {
+        for entry in std::fs::read_dir(path)? {
+            let entry = entry?;
+            let ft = entry.file_type()?;
+            if ft.is_file() {
+                total += entry.metadata()?.len();
+            } else if ft.is_dir() {
+                total += dir_size(&entry.path())?;
+            }
+        }
+    }
+    Ok(total)
+}
+
 // ═══════════════════════════════════════════════════════════ Tests ═════
 #[cfg(test)]
 mod tests {
@@ -2739,5 +2927,108 @@ mod tests {
     #[should_panic(expected = "unsafe session ID")]
     fn journal_file_path_panics_on_traversal() {
         let _ = journal_file_path("../../etc/passwd");
+    }
+
+    // ── Session Lifecycle Maintenance Tests ──────────────────────────
+
+    /// Helper: create a journal file with a backdated mtime.
+    fn create_aged_journal(dir: &Path, session_id: &str, age_days: u64) {
+        let path = dir.join(format!("{session_id}.jsonl"));
+        std::fs::write(&path, r#"{"type":"session_start"}"#).unwrap();
+        let mtime = filetime::FileTime::from_system_time(
+            std::time::SystemTime::now()
+                - std::time::Duration::from_secs(age_days * 86400 + 3600),
+        );
+        filetime::set_file_mtime(&path, mtime).unwrap();
+    }
+
+    /// Helper: create a session subdirectory with some data.
+    fn create_session_dir(dir: &Path, session_id: &str) {
+        let session_dir = dir.join(session_id);
+        std::fs::create_dir_all(session_dir.join("step_checkpoints")).unwrap();
+        std::fs::write(
+            session_dir.join("workspace.yaml"),
+            "session_id: test",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn maintenance_deletes_expired_sessions() {
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
+
+        // Session older than TTL (40 days old, TTL=30)
+        create_aged_journal(&dir, "old-session", 40);
+        create_session_dir(&dir, "old-session");
+
+        // Recent session (1 day old)
+        create_aged_journal(&dir, "new-session", 1);
+
+        let result = run_session_maintenance_in(dir.clone(), 30, 7);
+        assert_eq!(result.sessions_deleted, 1);
+        assert!(!dir.join("old-session.jsonl").exists());
+        assert!(!dir.join("old-session").exists());
+        assert!(dir.join("new-session.jsonl").exists());
+    }
+
+    #[test]
+    fn maintenance_compresses_old_journals() {
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
+
+        // Session 10 days old (compress_after=7, ttl=30)
+        create_aged_journal(&dir, "mid-session", 10);
+
+        let result = run_session_maintenance_in(dir.clone(), 30, 7);
+        assert_eq!(result.journals_compressed, 1);
+        assert!(!dir.join("mid-session.jsonl").exists());
+        assert!(dir.join("mid-session.jsonl.gz").exists());
+    }
+
+    #[test]
+    fn maintenance_skips_recent_sessions() {
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
+
+        // Very recent session (0 days old)
+        std::fs::write(
+            dir.join("fresh.jsonl"),
+            r#"{"type":"session_start"}"#,
+        )
+        .unwrap();
+
+        let result = run_session_maintenance_in(dir.clone(), 30, 7);
+        assert_eq!(result.sessions_deleted, 0);
+        assert_eq!(result.journals_compressed, 0);
+        assert!(dir.join("fresh.jsonl").exists());
+    }
+
+    #[test]
+    fn maintenance_deletes_expired_compressed_files() {
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
+
+        // Create an old .jsonl.gz file (40 days old)
+        let gz_path = dir.join("archived.jsonl.gz");
+        std::fs::write(&gz_path, b"fake-gz-data").unwrap();
+        let mtime = filetime::FileTime::from_system_time(
+            std::time::SystemTime::now()
+                - std::time::Duration::from_secs(40 * 86400 + 3600),
+        );
+        filetime::set_file_mtime(&gz_path, mtime).unwrap();
+
+        let result = run_session_maintenance_in(dir.clone(), 30, 7);
+        assert_eq!(result.sessions_deleted, 1);
+        assert!(!gz_path.exists());
+    }
+
+    #[test]
+    fn maintenance_empty_dir_returns_default() {
+        let tmp = tempdir().unwrap();
+        let result = run_session_maintenance_in(tmp.path().to_path_buf(), 30, 7);
+        assert_eq!(result.sessions_deleted, 0);
+        assert_eq!(result.journals_compressed, 0);
+        assert_eq!(result.bytes_freed, 0);
     }
 }
