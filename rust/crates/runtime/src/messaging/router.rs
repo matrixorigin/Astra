@@ -45,6 +45,11 @@ impl AgentMailbox {
         self.stream.get_mut().drain()
     }
 
+    /// Drain up to `limit` messages. Returns `true` if more remain.
+    pub fn drain_bounded(&mut self, limit: usize) -> (Vec<Arc<AgentMessage>>, bool) {
+        self.stream.get_mut().drain_bounded(limit)
+    }
+
     /// Send a message through the router (handles target resolution).
     pub async fn send(&self, msg: AgentMessage) -> Result<(), MailboxError> {
         self.router.send(msg).await
@@ -132,6 +137,14 @@ impl AgentMailboxRouter {
         }
         {
             let mut idx = self.agent_id_index.write().await;
+            if let Some(existing) = idx.get(&addr.agent_id) {
+                if existing != &addr {
+                    eprintln!(
+                        "  ⚠ messaging: agent_id '{}' already registered as {}; overwriting with {}",
+                        addr.agent_id, existing, addr
+                    );
+                }
+            }
             idx.insert(addr.agent_id.clone(), addr.clone());
         }
 
@@ -170,7 +183,13 @@ impl AgentMailboxRouter {
             .delegation_tracker
             .get_agent_id(&parent_run_id)
             .await
-            .unwrap_or_default();
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| {
+                MailboxError::Transport(format!(
+                    "parent run_id '{}' has no agent_id in delegation tracker",
+                    parent_run_id
+                ))
+            })?;
 
         Ok(AgentAddress::new(&parent_run_id, &agent_id))
     }
