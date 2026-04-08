@@ -731,6 +731,7 @@ dependencies = [
  "ciborium",
  "clap",
  "criterion-plot",
+ "futures",
  "is-terminal",
  "itertools",
  "num-traits",
@@ -743,6 +744,7 @@ dependencies = [
  "serde_derive",
  "serde_json",
  "tinytemplate",
+ "tokio",
  "walkdir",
 ]
 

@@ -58,7 +58,7 @@ tree-sitter-bash = "0.23"
 notify = { version = "7", default-features = false, features = ["macos_kqueue"] }
 
 [dev-dependencies]
-criterion = { version = "0.5", features = ["html_reports"] }
+criterion = { version = "0.5", features = ["html_reports", "async_tokio"] }
 futures-util.workspace = true
 sqlx.workspace = true
 tempfile = "3"
@@ -68,4 +68,8 @@ proptest = "1"
 
 [[bench]]
 name = "hot_paths"
+harness = false
+
+[[bench]]
+name = "messaging"
 harness = false
