@@ -163,6 +163,8 @@ impl WorktreeManager {
 
             if !output.status.success() {
                 let stderr = String::from_utf8_lossy(&output.stderr);
+                // Clean up any worktrees already created before this failure
+                let _ = self.cleanup().await;
                 return Err(WorktreeError::Git(format!(
                     "failed to create worktree for {agent_id}: {stderr}"
                 )));
