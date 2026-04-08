@@ -991,6 +991,7 @@ async fn plan_executor_task(
                     skill_search: &ctx.skill_search,
                     skill_quality_tracker: &mut skill_qt,
                     discovered_skills: None,
+                    messaging_metrics: None,
                 })
                 .await;
 

@@ -110,4 +110,7 @@ pub(crate) struct ChatTurnParams<'a> {
     pub(crate) skill_quality_tracker: &'a mut astra_runtime::skills::quality::SkillQualityTracker,
     /// Session-scoped discover cache so surfaced skills survive across user turns.
     pub(crate) discovered_skills: Option<&'a mut HashSet<String>>,
+    /// Shared messaging metrics for inter-agent communication observability.
+    pub(crate) messaging_metrics:
+        Option<Arc<astra_runtime::messaging::MessagingMetrics>>,
 }

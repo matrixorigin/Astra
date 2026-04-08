@@ -227,6 +227,7 @@ pub(super) async fn handle_state_command(
                     skill_search: &state.skill_search,
                     skill_quality_tracker: &mut state.skill_quality_tracker,
                     discovered_skills: None,
+                    messaging_metrics: state.messaging_metrics.clone(),
                 }) => r,
                 _ = tokio::signal::ctrl_c() => {
                     if let Some(ref t) = _cancel_token_guard { t.cancel(); }
@@ -318,6 +319,7 @@ pub(super) async fn handle_state_command(
                             skill_search: &state.skill_search,
                             skill_quality_tracker: &mut state.skill_quality_tracker,
                             discovered_skills: None,
+                            messaging_metrics: state.messaging_metrics.clone(),
                         })
                         .await;
 
@@ -389,6 +391,7 @@ pub(super) async fn handle_state_command(
                                     skill_search: &state.skill_search,
                                     skill_quality_tracker: &mut state.skill_quality_tracker,
                                     discovered_skills: None,
+                                    messaging_metrics: state.messaging_metrics.clone(),
                                 })
                                 .await;
                                 if let Ok(sr2) = synth_result {
