@@ -116,6 +116,8 @@ mod slash_skill;
 mod slash_state;
 #[path = "cli/slash_team.rs"]
 mod slash_team;
+#[path = "cli/slash_agent.rs"]
+mod slash_agent;
 #[path = "cli/stream_render.rs"]
 mod stream_render;
 #[path = "cli/streaming_md.rs"]
@@ -986,6 +988,8 @@ struct ReplState {
     /// Shared dead letter queue (populated when delegation is active).
     dead_letter_queue:
         Option<std::sync::Arc<astra_runtime::messaging::dead_letter::DeadLetterQueue>>,
+    /// Dynamic agent spawner for runtime agent creation.
+    agent_spawner: Option<std::sync::Arc<astra_runtime::orchestration::DynamicAgentSpawner>>,
 }
 
 impl Default for ReplState {
@@ -1078,6 +1082,7 @@ impl Default for ReplState {
             dead_letter_queue: Some(std::sync::Arc::new(
                 astra_runtime::messaging::dead_letter::DeadLetterQueue::new(),
             )),
+            agent_spawner: None, // Created lazily when spawn_agent is first used
         }
     }
 }
@@ -5301,6 +5306,13 @@ async fn handle_slash_command(
 
         "/messaging" => {
             handle_messaging_command(arg, state);
+        }
+
+        "/agent" => {
+            let ctx = slash_agent::AgentCommandContext {
+                spawner: state.agent_spawner.clone(),
+            };
+            slash_agent::handle_agent_command(arg, &ctx);
         }
 
         "/register" | "/login" | "/logout" | "/memory-setup" => {

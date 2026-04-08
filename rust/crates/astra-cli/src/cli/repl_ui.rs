@@ -112,6 +112,10 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
         "Teams: create, list, info, add-member, context, delete",
     ),
     (
+        "/agent",
+        "Spawned agents: list, status, stop, logs",
+    ),
+    (
         "/messaging",
         "Inter-agent messaging: metrics, dlq, status",
     ),
@@ -427,6 +431,16 @@ const SLASH_FIRST_TOKEN_COMPLETIONS: &[(&str, &[(&str, &str)])] = &[
             ("delete", "Delete a team"),
             ("info", "Show team information"),
             ("list", "List all teams"),
+        ],
+    ),
+    (
+        "/agent",
+        &[
+            ("list", "List spawned agents"),
+            ("status", "Show agent status"),
+            ("stop", "Stop an agent"),
+            ("logs", "Show agent logs"),
+            ("help", "Show agent help"),
         ],
     ),
     (
@@ -857,6 +871,7 @@ fn slash_argument_hint(command: &str) -> Option<&'static str> {
         "/sync" => Some("[log|push|pull]"),
         "/style" => Some("[list|default|minimal|colorful|high-contrast]"),
         "/team" => Some("[list|create|info|add-member|delete|context]"),
+        "/agent" => Some("[list|status|stop|logs|help]"),
         "/messaging" => Some("[metrics|dlq|status|help]"),
         _ => None,
     }
@@ -1395,7 +1410,7 @@ pub(super) fn print_slash_commands(query: Option<&str>) {
         (
             "👥",
             "Team & account",
-            &["/team", "/messaging", "/login", "/register", "/logout", "/memory-setup"],
+            &["/team", "/agent", "/messaging", "/login", "/register", "/logout", "/memory-setup"],
         ),
         (
             "🔧",
@@ -2520,7 +2535,7 @@ mod tests {
             &["/memory", "/task"],
             &["/skill"],
             &["/mcp"],
-            &["/team", "/messaging", "/login", "/register", "/logout", "/memory-setup"],
+            &["/team", "/agent", "/messaging", "/login", "/register", "/logout", "/memory-setup"],
             &["/diagnostics", "/allow", "/yolo", "/instructions", "/style"],
         ];
         let known: std::collections::HashSet<&str> =
