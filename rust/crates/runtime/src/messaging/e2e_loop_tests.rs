@@ -214,6 +214,7 @@ mod tests {
             recent_file_reads: Vec::new(),
             mailbox: None,
             ack_tracker: None,
+            dead_letter_queue: None,
         }
     }
 

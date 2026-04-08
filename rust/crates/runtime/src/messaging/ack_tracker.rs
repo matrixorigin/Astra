@@ -83,11 +83,13 @@ pub enum AckOutcome {
     Failed {
         message_id: String,
         attempts: u32,
+        message: Arc<AgentMessage>,
     },
     /// Message was explicitly rejected (Nack).
     Rejected {
         message_id: String,
         reason: Option<String>,
+        message: Arc<AgentMessage>,
     },
 }
 
@@ -140,10 +142,11 @@ impl PendingAckTracker {
 
     /// Process an incoming nack — removes from pending and records failure.
     pub async fn reject(&self, message_id: &str, reason: Option<String>) {
-        if self.pending.write().await.remove(message_id).is_some() {
+        if let Some(entry) = self.pending.write().await.remove(message_id) {
             self.failed.write().await.push(AckOutcome::Rejected {
                 message_id: message_id.to_string(),
                 reason,
+                message: entry.message,
             });
         }
     }
@@ -162,12 +165,8 @@ impl PendingAckTracker {
             for (msg_id, entry) in pending.iter_mut() {
                 if now.duration_since(entry.last_sent_at) >= self.config.ack_timeout {
                     if entry.attempts >= self.config.max_retries {
-                        // Permanently failed.
-                        outcomes.push(AckOutcome::Failed {
-                            message_id: msg_id.clone(),
-                            attempts: entry.attempts,
-                        });
-                        to_remove.push(msg_id.clone());
+                        // Permanently failed — collect message for DLQ.
+                        to_remove.push((msg_id.clone(), entry.attempts, Arc::clone(&entry.message)));
                     } else {
                         // Needs retry.
                         entry.attempts += 1;
@@ -179,8 +178,13 @@ impl PendingAckTracker {
                     }
                 }
             }
-            for id in &to_remove {
+            for (id, attempts, message) in &to_remove {
                 pending.remove(id);
+                outcomes.push(AckOutcome::Failed {
+                    message_id: id.clone(),
+                    attempts: *attempts,
+                    message: Arc::clone(message),
+                });
             }
         }
 

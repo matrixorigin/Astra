@@ -36,7 +36,9 @@
 
 pub mod ack_tracker;
 pub mod db_transport;
+pub mod dead_letter;
 pub mod in_process;
+pub mod metrics;
 pub mod router;
 pub mod send_tool;
 pub mod transport;
@@ -54,7 +56,12 @@ mod delegation_mailbox_tests;
 // Re-export key types for convenience.
 pub use ack_tracker::{AckConfig, AckOutcome, PendingAckTracker};
 pub use db_transport::{CleanupScheduler, DatabaseTransport, TransportMetrics as DbTransportMetrics};
+pub use dead_letter::{DeadLetter, DeadLetterQueue, DeadLetterReason, DeadLetterSummary};
 pub use in_process::{InProcessMetrics, InProcessTransport};
+pub use metrics::{
+    EventDispatcher, LatencySnapshot, LatencyTracker, MessagingEvent, MessagingEventHandler,
+    MessagingMetrics, MetricsSnapshot, StderrEventHandler,
+};
 pub use router::{AgentMailbox, AgentMailboxRouter};
 pub use send_tool::SendResult;
 pub use transport::{MessageStream, MessageTransport};
