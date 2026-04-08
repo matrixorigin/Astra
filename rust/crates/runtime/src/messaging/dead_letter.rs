@@ -14,7 +14,7 @@ use std::time::Instant;
 
 use tokio::sync::RwLock;
 
-use super::types::{AgentMessage, MailboxError};
+use super::types::AgentMessage;
 
 /// Default maximum dead letter entries before eviction.
 const DEFAULT_MAX_SIZE: usize = 1024;
