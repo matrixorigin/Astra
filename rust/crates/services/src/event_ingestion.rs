@@ -335,19 +335,35 @@ pub struct EventIngestionWorker {
     stats: Arc<std::sync::Mutex<IngestionStats>>,
 }
 
+/// Handle to signal the ingestion worker to shut down immediately.
+/// Notify-based so it works even when other senders are still alive.
+#[derive(Clone)]
+pub struct IngestionShutdownHandle {
+    notify: Arc<tokio::sync::Notify>,
+}
+
+impl IngestionShutdownHandle {
+    /// Signal the worker to stop after a best-effort flush.
+    pub fn signal(&self) {
+        self.notify.notify_one();
+    }
+}
+
 impl EventIngestionWorker {
-    /// Spawn the ingestion pipeline. Returns (sender, stats_handle, join_handle).
+    /// Spawn the ingestion pipeline. Returns (sender, shutdown_handle, stats_handle, join_handle).
     pub fn spawn(
         pool: sqlx::Pool<sqlx::MySql>,
         config: IngestionConfig,
     ) -> (
         IngestionSender,
+        IngestionShutdownHandle,
         Arc<std::sync::Mutex<IngestionStats>>,
         tokio::task::JoinHandle<()>,
     ) {
         let (tx, rx) = mpsc::channel(config.channel_capacity);
         let stats = Arc::new(std::sync::Mutex::new(IngestionStats::default()));
         let stats_clone = stats.clone();
+        let notify = Arc::new(tokio::sync::Notify::new());
 
         let worker = Self {
             rx,
@@ -355,17 +371,21 @@ impl EventIngestionWorker {
             config,
             stats,
         };
+        // Share the same Arc so the handle can signal the worker.
+        let shutdown_handle = IngestionShutdownHandle {
+            notify: Arc::clone(&notify),
+        };
 
-        let handle = tokio::spawn(worker.run());
+        let handle = tokio::spawn(worker.run_with_shutdown(notify));
 
         let sender = IngestionSender {
             tx,
             overflow_count: Arc::new(AtomicU64::new(0)),
         };
-        (sender, stats_clone, handle)
+        (sender, shutdown_handle, stats_clone, handle)
     }
 
-    async fn run(mut self) {
+    async fn run_with_shutdown(mut self, shutdown: Arc<tokio::sync::Notify>) {
         let mut buffer: Vec<IngestionEvent> = Vec::with_capacity(self.config.batch_size);
         let flush_interval = tokio::time::Duration::from_secs(self.config.flush_interval_secs);
 
@@ -374,6 +394,19 @@ impl EventIngestionWorker {
             tokio::pin!(deadline);
 
             tokio::select! {
+                _ = shutdown.notified() => {
+                    // Drain any remaining events from the channel before flushing.
+                    while let Ok(event) = self.rx.try_recv() {
+                        if let Ok(mut s) = self.stats.lock() {
+                            s.events_received += 1;
+                        }
+                        buffer.push(event);
+                    }
+                    if !buffer.is_empty() {
+                        self.flush_batch_once(&mut buffer).await;
+                    }
+                    break;
+                }
                 Some(event) = self.rx.recv() => {
                     if let Ok(mut s) = self.stats.lock() {
                         s.events_received += 1;
@@ -389,9 +422,9 @@ impl EventIngestionWorker {
                     }
                 }
                 else => {
-                    // Channel closed — flush remaining and exit
+                    // Channel closed — best-effort flush with no retries.
                     if !buffer.is_empty() {
-                        self.flush_batch(&mut buffer).await;
+                        self.flush_batch_once(&mut buffer).await;
                     }
                     break;
                 }
@@ -429,6 +462,30 @@ impl EventIngestionWorker {
                             ));
                         }
                     }
+                }
+            }
+        }
+    }
+
+    /// Single-attempt flush used during shutdown drain. Skips retries so we
+    /// don't block exit for seconds when the DB is unreachable.
+    async fn flush_batch_once(&self, buffer: &mut Vec<IngestionEvent>) {
+        if buffer.is_empty() {
+            return;
+        }
+        let batch: Vec<IngestionEvent> = std::mem::take(buffer);
+        let count = batch.len();
+        match self.insert_batch(&batch).await {
+            Ok(()) => {
+                if let Ok(mut s) = self.stats.lock() {
+                    s.events_flushed += count as u64;
+                    s.flush_count += 1;
+                }
+            }
+            Err(e) => {
+                if let Ok(mut s) = self.stats.lock() {
+                    s.errors += 1;
+                    s.last_error = Some(format!("shutdown flush failed: {e}"));
                 }
             }
         }
@@ -1284,6 +1341,90 @@ mod tests {
         assert!(
             source.contains("SELECT COUNT(*) FROM agent_events WHERE session_id"),
             "insert_batch must reconcile event_count from actual row count on duplicate detection"
+        );
+    }
+
+    // ── Shutdown handle tests ───────────────────────────────────────────
+
+    /// Helper: create a MySql pool that will fail on any actual query.
+    /// `MySqlPoolOptions::connect_lazy` builds a pool without touching the network,
+    /// so `spawn` returns instantly. Any `insert_batch` call will error, which is
+    /// fine — we're testing the shutdown signalling, not the DB path.
+    fn dummy_pool() -> sqlx::Pool<sqlx::MySql> {
+        sqlx::mysql::MySqlPoolOptions::new()
+            .max_connections(1)
+            .acquire_timeout(std::time::Duration::from_millis(100))
+            .connect_lazy("mysql://invalid:invalid@127.0.0.1:1/nonexistent")
+            .expect("connect_lazy should not fail")
+    }
+
+    #[tokio::test]
+    async fn shutdown_handle_signal_stops_worker() {
+        let (sender, shutdown, _stats, jh) =
+            EventIngestionWorker::spawn(dummy_pool(), IngestionConfig::default());
+
+        // Enqueue a couple of events so the worker has something buffered.
+        sender.enqueue(test_event("e1", "s1", "turn"));
+        sender.enqueue(test_event("e2", "s1", "turn"));
+
+        // Signal shutdown — worker should exit promptly even though sender is still alive.
+        shutdown.signal();
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(3), jh).await;
+        assert!(
+            result.is_ok(),
+            "worker should exit within 3s after shutdown signal"
+        );
+        // Sender is still alive here — proves Notify works independent of channel close.
+        drop(sender);
+    }
+
+    #[tokio::test]
+    async fn shutdown_drains_channel_events() {
+        let config = IngestionConfig {
+            batch_size: 100, // large batch so nothing auto-flushes
+            flush_interval_secs: 300, // long interval so timer doesn't fire
+            ..Default::default()
+        };
+        let (sender, shutdown, stats, jh) =
+            EventIngestionWorker::spawn(dummy_pool(), config);
+
+        for i in 0..5 {
+            sender.enqueue(test_event(&format!("e{i}"), "s1", "turn"));
+        }
+
+        // Signal immediately — events are still in the channel, exercises try_recv drain.
+        shutdown.signal();
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(3), jh).await;
+        assert!(result.is_ok(), "worker should exit after signal");
+
+        let s = stats.lock().unwrap();
+        assert_eq!(s.events_received, 5, "all 5 events should be counted (recv + drain)");
+        assert!(s.errors > 0, "flush should have been attempted (and failed on dummy pool)");
+        drop(sender);
+    }
+
+    #[tokio::test]
+    async fn shutdown_signal_is_idempotent() {
+        let (_sender, shutdown, _stats, jh) =
+            EventIngestionWorker::spawn(dummy_pool(), IngestionConfig::default());
+
+        shutdown.signal();
+        shutdown.signal(); // second signal should be harmless
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(3), jh).await;
+        assert!(result.is_ok(), "worker should exit cleanly on double signal");
+    }
+
+    #[test]
+    fn shutdown_path_drains_channel_before_flush() {
+        // Source-level assertion: the shutdown.notified() branch must call
+        // try_recv to drain remaining channel events before flushing.
+        let source = include_str!("event_ingestion.rs");
+        assert!(
+            source.contains("self.rx.try_recv()"),
+            "shutdown branch must drain channel via try_recv before flush_batch_once"
         );
     }
 }

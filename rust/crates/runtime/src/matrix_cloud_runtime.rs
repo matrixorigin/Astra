@@ -4,6 +4,7 @@
 
 use std::collections::{BTreeMap, HashSet};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tokio::sync::Mutex as TokioMutex;
 
 use astra_core::{MatrixOneSettings, SharedPool};
@@ -22,6 +23,9 @@ use crate::sync_adapters::{
     EventAdapter, LearningAdapter, MatrixOneTransport, PreferenceAdapter, TaskAdapter,
     TemplateAdapter,
 };
+
+/// Max time to wait for the ingestion worker to finish during shutdown.
+const INGESTION_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Environment-driven MatrixOne settings (same defaults as legacy CLI `try_init_ingestion`).
 pub fn matrix_settings_from_env() -> MatrixOneSettings {
@@ -45,6 +49,8 @@ pub struct MatrixCloudRuntime {
     /// Join handle for the background ingestion worker — awaited on graceful shutdown
     /// to ensure all buffered events are flushed to cloud before process exit.
     ingestion_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Notify-based shutdown signal — works even when cloned senders are still alive.
+    ingestion_shutdown: astra_services::event_ingestion::IngestionShutdownHandle,
     /// Live ingestion stats (events_received, events_flushed, errors).
     ingestion_stats: Arc<std::sync::Mutex<astra_services::event_ingestion::IngestionStats>>,
     sync_orchestrator: TokioMutex<SyncOrchestrator>,
@@ -82,7 +88,7 @@ impl MatrixCloudRuntime {
         let task_dirty = Arc::new(Mutex::new(HashSet::new()));
 
         let pool = shared_pool.get().clone();
-        let (sender, ingestion_stats, ingestion_jh) =
+        let (sender, ingestion_shutdown, ingestion_stats, ingestion_jh) =
             event_ingestion::EventIngestionWorker::spawn(pool.clone(), IngestionConfig::default());
         let sync_svc = Arc::new(MatrixOneSyncService::new(pool));
         let transport: Arc<dyn CloudTransport> = Arc::new(MatrixOneTransport::new(
@@ -129,6 +135,7 @@ impl MatrixCloudRuntime {
             shared_pool,
             ingestion: Mutex::new(Some(sender)),
             ingestion_handle: Mutex::new(Some(ingestion_jh)),
+            ingestion_shutdown,
             ingestion_stats,
             sync_orchestrator: TokioMutex::new(orch),
             preference_store,
@@ -211,29 +218,21 @@ impl MatrixCloudRuntime {
         }
     }
 
-    /// Flush and stop the ingestion worker.
-    pub fn shutdown_ingestion(&self) {
-        if let Ok(mut g) = self.ingestion.lock()
-            && let Some(s) = g.take()
-        {
-            s.shutdown();
-        }
-    }
-
     /// Flush and stop the ingestion worker, then **wait** for the background
     /// worker to drain its buffer and exit. Use this on graceful exit paths
     /// to ensure short sessions don't lose their final events.
     pub async fn shutdown_ingestion_and_wait(&self) {
-        // Drop sender first — closes the channel so the worker drains its buffer.
+        // Signal the worker to exit via Notify — works even when cloned senders
+        // are still alive (the channel-close approach fails in that case).
+        self.ingestion_shutdown.signal();
+        // Also drop our sender to release the channel reference.
         if let Ok(mut g) = self.ingestion.lock() {
-            if let Some(s) = g.take() {
-                s.shutdown();
-            }
+            g.take();
         }
-        // Await the worker join handle with a timeout to avoid hanging forever.
+        // Await the worker join handle with a timeout.
         let handle = self.ingestion_handle.lock().ok().and_then(|mut g| g.take());
         if let Some(jh) = handle {
-            match tokio::time::timeout(std::time::Duration::from_secs(15), jh).await {
+            match tokio::time::timeout(INGESTION_SHUTDOWN_TIMEOUT, jh).await {
                 Ok(Ok(())) => {}
                 Ok(Err(e)) => {
                     astra_core::agent_warn!("ingestion", "worker join failed: {e}");
@@ -241,7 +240,7 @@ impl MatrixCloudRuntime {
                 Err(_) => {
                     astra_core::agent_warn!(
                         "ingestion",
-                        "worker flush timed out after 15s, some events may be lost"
+                        "worker flush timed out after {INGESTION_SHUTDOWN_TIMEOUT:?}, some events may be lost"
                     );
                 }
             }
