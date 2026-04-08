@@ -130,6 +130,98 @@ fn check_bash_path_boundary(
     None
 }
 
+fn find_powershell_program() -> Option<&'static str> {
+    for candidate in ["pwsh", "powershell"] {
+        let status = Command::new(candidate)
+            .args([
+                "-NoLogo",
+                "-NoProfile",
+                "-Command",
+                "$PSVersionTable.PSVersion.Major",
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        if status.is_ok() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+/// Check if a PowerShell command references file paths outside the sandbox boundary.
+///
+/// This is intentionally conservative and only inspects common cmdlets whose
+/// first positional argument is usually a file path.
+fn check_powershell_path_boundary(
+    policy: &astra_runtime::tool_sandbox::SandboxPolicy,
+    command: &str,
+) -> Option<String> {
+    let commands = command
+        .split(&['|', ';', '\n', '\r'][..])
+        .flat_map(|segment| segment.split("&&"))
+        .flat_map(|segment| segment.split("||"));
+
+    for segment in commands {
+        let parts: Vec<&str> = segment.split_whitespace().collect();
+        if parts.is_empty() {
+            continue;
+        }
+
+        let base = parts[0].to_ascii_lowercase();
+        let is_file_access_cmd = matches!(
+            base.as_str(),
+            "get-content"
+                | "set-content"
+                | "add-content"
+                | "copy-item"
+                | "move-item"
+                | "remove-item"
+                | "get-item"
+                | "test-path"
+                | "resolve-path"
+                | "rename-item"
+        );
+        if !is_file_access_cmd {
+            continue;
+        }
+
+        for arg in &parts[1..] {
+            if arg.starts_with('-') || arg.starts_with('$') {
+                continue;
+            }
+            let trimmed = arg.trim_matches(|c| c == '"' || c == '\'' || c == '`');
+            if trimmed.is_empty()
+                || trimmed.contains('*')
+                || trimmed.contains('?')
+                || trimmed.starts_with("http://")
+                || trimmed.starts_with("https://")
+            {
+                continue;
+            }
+
+            let resolved = if trimmed.starts_with('/') || trimmed.contains(":\\") {
+                PathBuf::from(trimmed)
+            } else {
+                policy.project_root.join(trimmed)
+            };
+            let path_str = resolved.to_string_lossy();
+            if let Err(e) = validate_path(policy, &path_str)
+                && e.is_boundary_violation()
+            {
+                return Some(format!(
+                    "{}The command references '{}' which is outside the project directory '{}'. \
+                     Ask the user for permission before accessing files outside the project.",
+                    super::SANDBOX_DENIED_PREFIX,
+                    trimmed,
+                    policy.project_root.display(),
+                ));
+            }
+        }
+    }
+    None
+}
+
 /// Check a single (non-compound) command for path boundary violations.
 fn check_single_command_path_boundary(
     policy: &astra_runtime::tool_sandbox::SandboxPolicy,
@@ -260,6 +352,34 @@ fn destructive_command_warning(command: &str) -> Option<&'static str> {
     ];
     for &(pattern, warning) in PATTERNS {
         if command.contains(pattern) {
+            return Some(warning);
+        }
+    }
+    None
+}
+
+fn destructive_powershell_warning(command: &str) -> Option<&'static str> {
+    static PATTERNS: &[(&str, &str)] = &[
+        (
+            "remove-item -recurse",
+            "⚠️ Warning: may recursively delete files or directories",
+        ),
+        (
+            "remove-item -force",
+            "⚠️ Warning: may forcibly delete files or directories",
+        ),
+        (
+            "stop-process -force",
+            "⚠️ Warning: may forcibly terminate processes",
+        ),
+        (
+            "set-executionpolicy",
+            "⚠️ Warning: may change PowerShell execution policy",
+        ),
+    ];
+    let lower = command.to_ascii_lowercase();
+    for &(pattern, warning) in PATTERNS {
+        if lower.contains(pattern) {
             return Some(warning);
         }
     }
@@ -763,15 +883,21 @@ fn is_private_172(host: &str) -> bool {
 }
 
 impl ToolExecutor {
-    pub(crate) fn run_shell_output(
+    fn run_shell_output_with_program(
         &self,
+        program: &str,
+        shell_flag: &str,
         command: &str,
         timeout_secs: f64,
+        harden_command: bool,
     ) -> Result<std::process::Output, String> {
-        // If sandbox is active, wrap command with resource limits
-        let effective_command = if let Some(ref policy) = self.sandbox_policy {
-            if !matches!(policy.mode, SandboxMode::Permissive) {
-                wrap_command_with_limits(policy, command)
+        let effective_command = if harden_command {
+            if let Some(ref policy) = self.sandbox_policy {
+                if !matches!(policy.mode, SandboxMode::Permissive) {
+                    wrap_command_with_limits(policy, command)
+                } else {
+                    command.to_string()
+                }
             } else {
                 command.to_string()
             }
@@ -779,11 +905,11 @@ impl ToolExecutor {
             command.to_string()
         };
 
-        let mut child_cmd = Command::new("bash");
+        let mut child_cmd = Command::new(program);
         child_cmd
-            .arg("-c")
+            .arg(shell_flag)
             .arg(&effective_command)
-            .current_dir(&self.project_root)
+            .current_dir(self.effective_project_root())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 
@@ -941,6 +1067,26 @@ impl ToolExecutor {
         })
     }
 
+    pub(crate) fn run_shell_output(
+        &self,
+        command: &str,
+        timeout_secs: f64,
+    ) -> Result<std::process::Output, String> {
+        self.run_shell_output_with_program("bash", "-c", command, timeout_secs, true)
+    }
+
+    fn run_powershell_output(
+        &self,
+        command: &str,
+        timeout_secs: f64,
+    ) -> Result<std::process::Output, String> {
+        let program = find_powershell_program().ok_or_else(|| {
+            "Error: PowerShell not available. Install 'pwsh' (PowerShell 7+) or 'powershell'."
+                .to_string()
+        })?;
+        self.run_shell_output_with_program(program, "-Command", command, timeout_secs, false)
+    }
+
     pub(crate) fn bash(&self, args: &Value) -> String {
         let command = match args.get("command").and_then(Value::as_str) {
             Some(c) => c,
@@ -1073,6 +1219,73 @@ impl ToolExecutor {
                     if sem.is_error {
                         result.push_str(&format!("\n(exit code {exit_code})"));
                     }
+                }
+
+                result
+            }
+        }
+    }
+
+    pub(crate) fn powershell(&self, args: &Value) -> String {
+        let command = match args.get("command").and_then(Value::as_str) {
+            Some(c) => c,
+            None => return "Error: missing 'command'".to_string(),
+        };
+        let timeout_secs = args.get("timeout").and_then(Value::as_f64).unwrap_or(30.0);
+
+        if let Some(ref policy) = self.sandbox_policy
+            && !matches!(policy.mode, SandboxMode::Permissive)
+        {
+            if let Some(msg) = check_powershell_path_boundary(policy, command) {
+                return msg;
+            }
+        }
+
+        match self.run_powershell_output(command, timeout_secs) {
+            Err(error) => error,
+            Ok(out) => {
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                let mut result = String::new();
+
+                if let Some(warning) = destructive_powershell_warning(command) {
+                    result.push_str(warning);
+                    result.push('\n');
+                }
+
+                if !stdout.is_empty() {
+                    result.push_str(&stdout);
+                }
+                if !stderr.is_empty() {
+                    if !result.is_empty() {
+                        result.push('\n');
+                    }
+                    result.push_str(&stderr);
+                }
+
+                let exit_code = out.status.code().unwrap_or(-1);
+                if result.is_empty() || result.trim().is_empty() {
+                    return if out.status.success() {
+                        "(no output)".to_string()
+                    } else {
+                        format!("Error: command failed (exit code {exit_code})")
+                    };
+                }
+
+                let limit = self.scaled_output_limit();
+                if result.len() > limit {
+                    let end = result.floor_char_boundary(limit);
+                    let cut = result[..end]
+                        .rfind('\n')
+                        .filter(|&pos| pos > end / 2)
+                        .map(|pos| pos + 1)
+                        .unwrap_or(end);
+                    result.truncate(cut);
+                    result.push_str("\n[truncated]");
+                }
+
+                if !out.status.success() {
+                    result.push_str(&format!("\n(exit code {exit_code})"));
                 }
 
                 result
@@ -1840,6 +2053,40 @@ mod tests {
         let executor = test_executor();
         let result = executor.bash(&serde_json::json!({"command": "echo err >&2 && false"}));
         assert!(result.contains("err"), "got: {result}");
+    }
+
+    #[test]
+    fn powershell_missing_command_returns_error() {
+        let executor = test_executor();
+        let result = executor.powershell(&serde_json::json!({}));
+        assert!(result.contains("Error"), "got: {result}");
+    }
+
+    #[test]
+    fn powershell_destructive_warning_detected() {
+        let warning = destructive_powershell_warning("Remove-Item -Force temp.txt");
+        assert!(warning.is_some());
+    }
+
+    #[test]
+    fn powershell_path_boundary_blocks_outside_project() {
+        use astra_runtime::tool_sandbox::SandboxPolicy;
+        let policy = SandboxPolicy::for_project("/home/user/project");
+        let result = check_powershell_path_boundary(&policy, "Get-Content /etc/passwd");
+        assert!(result.is_some(), "should block Get-Content /etc/passwd");
+        assert!(result.unwrap().starts_with(super::SANDBOX_DENIED_PREFIX));
+    }
+
+    #[test]
+    fn powershell_echo_returns_output_when_available() {
+        let Some(_) = find_powershell_program() else {
+            return;
+        };
+        let executor = test_executor();
+        let result = executor.powershell(&serde_json::json!({
+            "command": "Write-Output hello"
+        }));
+        assert!(result.contains("hello"), "got: {result}");
     }
 
     #[test]
