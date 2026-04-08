@@ -399,7 +399,7 @@ impl TurnAuxiliaryEventWriter for DatabaseTurnAuxiliaryEventWriter {
                  (event_id, session_id, user_id, agent_id, agent_version, event_type, content, \
                   parent_event_id, causal_chain_id, `metadata`, reasoning_content, \
                   meta_tool_name, meta_duration_ms, created_at) \
-                 Values (?, ?, ?, ?, '0.1.0', ?, ?, ?, ?, ?, ?, ?, ?, NOW())",
+                 VALUES (?, ?, ?, ?, '0.1.0', ?, ?, ?, ?, ?, ?, ?, ?, NOW())",
             )
             .bind(event.event_id)
             .bind(event.session_id)

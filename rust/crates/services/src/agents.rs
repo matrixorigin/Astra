@@ -451,6 +451,10 @@ impl AgentService for InMemoryAgentService {
         user_id: String,
         request: AgentCreateRequestData,
     ) -> Result<AgentRecord, (StatusCode, Json<ErrorResponse>)> {
+        let mut agents = self.agents.write().expect("agent lock poisoned");
+        if agents.iter().any(|a| a.owner_user_id == user_id && a.name == request.name) {
+            return Err(error_response(StatusCode::CONFLICT, "agent name already exists"));
+        }
         let now = chrono::Utc::now().to_rfc3339();
         let record = AgentRecord {
             agent_id: Uuid::new_v4().to_string(),
@@ -463,7 +467,7 @@ impl AgentService for InMemoryAgentService {
             created_at: now,
             updated_at: None,
         };
-        self.agents.write().expect("agent lock poisoned").push(record.clone());
+        agents.push(record.clone());
         Ok(record)
     }
 
@@ -651,6 +655,32 @@ mod tests {
         let list = svc.list_agents("u1".into()).await.unwrap();
         assert_eq!(list.total, 1);
         assert_eq!(list.agents[0].name, "a1");
+    }
+
+    #[tokio::test]
+    async fn create_duplicate_name_returns_conflict() {
+        let svc = InMemoryAgentService::new();
+        svc.create_agent("u1".into(), AgentCreateRequestData {
+            name: "dup".into(), agent_config: None, data_source: None,
+        }).await.unwrap();
+        let result = svc.create_agent("u1".into(), AgentCreateRequestData {
+            name: "dup".into(), agent_config: None, data_source: None,
+        }).await;
+        assert!(result.is_err());
+        let (status, _) = result.unwrap_err();
+        assert_eq!(status, StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn same_name_different_user_ok() {
+        let svc = InMemoryAgentService::new();
+        svc.create_agent("u1".into(), AgentCreateRequestData {
+            name: "shared".into(), agent_config: None, data_source: None,
+        }).await.unwrap();
+        // Different user can use the same name
+        svc.create_agent("u2".into(), AgentCreateRequestData {
+            name: "shared".into(), agent_config: None, data_source: None,
+        }).await.unwrap();
     }
 
     #[tokio::test]
