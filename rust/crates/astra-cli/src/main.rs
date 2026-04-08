@@ -106,6 +106,8 @@ mod slash_mcp;
 mod plan_interaction;
 #[path = "cli/slash_memory.rs"]
 mod slash_memory;
+#[path = "cli/slash_messaging.rs"]
+mod slash_messaging;
 #[path = "cli/slash_session.rs"]
 mod slash_session;
 #[path = "cli/slash_skill.rs"]
@@ -156,6 +158,7 @@ use slash_debug::handle_debug_command;
 use slash_info::handle_info_command;
 use plan_interaction::{handle_plan_mode_input, plan_execution_ui_active};
 use slash_memory::handle_memory_domain_command;
+use slash_messaging::handle_messaging_command;
 use slash_session::handle_session_command;
 #[cfg(test)]
 use slash_session::resolve_journal_target_session;
@@ -976,6 +979,11 @@ struct ReplState {
     /// Project-level instructions loaded from `.astra/instructions.md`.
     /// Injected into every turn's effective message as `<project_instructions>`.
     project_instructions: Option<String>,
+    /// Shared messaging metrics (populated when delegation is active).
+    messaging_metrics: Option<std::sync::Arc<astra_runtime::messaging::MessagingMetrics>>,
+    /// Shared dead letter queue (populated when delegation is active).
+    dead_letter_queue:
+        Option<std::sync::Arc<astra_runtime::messaging::dead_letter::DeadLetterQueue>>,
 }
 
 impl Default for ReplState {
@@ -1060,6 +1068,8 @@ impl Default for ReplState {
             plan_in_token_stream: false,
             plan_md_renderer: None,
             project_instructions: None,
+            messaging_metrics: None,
+            dead_letter_queue: None,
         }
     }
 }
@@ -5182,6 +5192,10 @@ async fn handle_slash_command(
 
         "/team" => {
             slash_team::handle_team_command(arg, state).await;
+        }
+
+        "/messaging" => {
+            handle_messaging_command(arg, state);
         }
 
         "/register" | "/login" | "/logout" | "/memory-setup" => {

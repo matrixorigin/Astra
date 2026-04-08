@@ -111,6 +111,10 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
         "/team",
         "Teams: create, list, info, add-member, context, delete",
     ),
+    (
+        "/messaging",
+        "Inter-agent messaging: metrics, dlq, status",
+    ),
     ("/login", "Authenticate with the API"),
     ("/register", "Register a new account"),
     ("/logout", "Logout from the API"),
@@ -423,6 +427,15 @@ const SLASH_FIRST_TOKEN_COMPLETIONS: &[(&str, &[(&str, &str)])] = &[
             ("delete", "Delete a team"),
             ("info", "Show team information"),
             ("list", "List all teams"),
+        ],
+    ),
+    (
+        "/messaging",
+        &[
+            ("dlq", "Show dead letter queue"),
+            ("metrics", "Show metrics snapshot"),
+            ("status", "Show mailbox status"),
+            ("help", "Show messaging help"),
         ],
     ),
     (
@@ -844,6 +857,7 @@ fn slash_argument_hint(command: &str) -> Option<&'static str> {
         "/sync" => Some("[log|push|pull]"),
         "/style" => Some("[list|default|minimal|colorful|high-contrast]"),
         "/team" => Some("[list|create|info|add-member|delete|context]"),
+        "/messaging" => Some("[metrics|dlq|status|help]"),
         _ => None,
     }
 }
@@ -1381,7 +1395,7 @@ pub(super) fn print_slash_commands(query: Option<&str>) {
         (
             "👥",
             "Team & account",
-            &["/team", "/login", "/register", "/logout", "/memory-setup"],
+            &["/team", "/messaging", "/login", "/register", "/logout", "/memory-setup"],
         ),
         (
             "🔧",
@@ -2506,7 +2520,7 @@ mod tests {
             &["/memory", "/task"],
             &["/skill"],
             &["/mcp"],
-            &["/team", "/login", "/register", "/logout", "/memory-setup"],
+            &["/team", "/messaging", "/login", "/register", "/logout", "/memory-setup"],
             &["/diagnostics", "/allow", "/yolo", "/instructions", "/style"],
         ];
         let known: std::collections::HashSet<&str> =
