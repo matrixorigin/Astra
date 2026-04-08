@@ -353,6 +353,9 @@ pub struct AgenticLoopState {
 
     /// Tracks messages that require acknowledgment and handles retries.
     pub ack_tracker: Option<crate::messaging::ack_tracker::PendingAckTracker>,
+
+    /// Dead letter queue for permanently failed messages.
+    pub dead_letter_queue: Option<std::sync::Arc<crate::messaging::dead_letter::DeadLetterQueue>>,
 }
 
 /// Consecutive same-category error turns before forcing a strategy change.
@@ -998,13 +1001,33 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
                     let _ = mb.send((*retry_msg).clone()).await;
                 }
             }
-            // Log failures.
+            // Log failures and store in dead-letter queue.
             for outcome in &outcomes {
-                if let crate::messaging::ack_tracker::AckOutcome::Failed { message_id, attempts } = outcome {
+                if let crate::messaging::ack_tracker::AckOutcome::Failed { message_id, attempts, message } = outcome {
                     eprintln!(
                         "  ⚠ messaging: ack timeout exhausted for message {} after {} attempts",
                         message_id, attempts
                     );
+                    if let Some(ref dlq) = state.dead_letter_queue {
+                        dlq.store(
+                            Arc::clone(message),
+                            crate::messaging::dead_letter::DeadLetterReason::AckTimeout { attempts: *attempts },
+                            *attempts,
+                        ).await;
+                    }
+                }
+                if let crate::messaging::ack_tracker::AckOutcome::Rejected { message_id, reason, message } = outcome {
+                    eprintln!(
+                        "  ⚠ messaging: nack for message {}: {}",
+                        message_id, reason.as_deref().unwrap_or("no reason")
+                    );
+                    if let Some(ref dlq) = state.dead_letter_queue {
+                        dlq.store(
+                            Arc::clone(message),
+                            crate::messaging::dead_letter::DeadLetterReason::Rejected { reason: reason.clone() },
+                            1,
+                        ).await;
+                    }
                 }
             }
         }
@@ -2139,6 +2162,7 @@ mod tests {
             recent_file_reads: Vec::new(),
             mailbox: None,
             ack_tracker: None,
+            dead_letter_queue: None,
         }
     }
 

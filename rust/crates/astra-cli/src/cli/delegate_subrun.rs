@@ -281,6 +281,7 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
             recent_file_reads: Vec::new(),
             mailbox: config.mailbox,
             ack_tracker: None,
+            dead_letter_queue: None,
         };
 
         let loop_result = run_agentic_loop_with_host(&mut host, &mut state).await;

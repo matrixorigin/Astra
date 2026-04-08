@@ -343,6 +343,7 @@ pub(crate) async fn stream_chat_sse(
         recent_file_reads: Vec::new(),
         mailbox: None,
         ack_tracker: None,
+        dead_letter_queue: None,
     };
 
     // ─── Run the runtime loop ────────────────────────────────────────────
