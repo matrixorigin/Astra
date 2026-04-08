@@ -487,6 +487,12 @@ pub(super) async fn handle_team_command(arg: &str, state: &mut super::ReplState)
                 }
             };
 
+            if cli_team.members.is_empty() {
+                eprintln!("  {} Team '{}' has no members. Use /team add-member to add agents first.",
+                    theme::icon_err(), team_name);
+                return;
+            }
+
             let delegation_engine = match state.delegation_engine {
                 Some(ref e) => e.clone(),
                 None => {
@@ -569,11 +575,12 @@ pub(super) async fn handle_team_command(arg: &str, state: &mut super::ReplState)
                 );
                 for ar in &dr.agent_results {
                     let status_icon = if ar.status == "completed" { "✓" } else { "✗" };
+                    let first_line = ar.output.as_deref().unwrap_or("(no output)")
+                        .lines().next().unwrap_or("");
                     eprintln!("    {} {} — {}",
                         status_icon.dim(),
                         ar.agent_id.as_str().cyan(),
-                        ar.output.as_deref().unwrap_or("(no output)")
-                            .lines().next().unwrap_or("")
+                        truncate_str(first_line, 80),
                     );
                 }
             }
