@@ -11,9 +11,14 @@ use std::{
     env, fs,
     path::{Path, PathBuf},
     process::{Command, Stdio},
-    sync::atomic::{AtomicBool, Ordering},
+    sync::{atomic::{AtomicBool, Ordering}, Mutex},
     time::Duration,
 };
+
+// Global mutex for environment variable mutations (env_set/env_unset).
+// Required because std::env::set_var and remove_var are unsafe in Rust 2024 edition
+// due to potential data races when called from multiple threads.
+static ENV_MUTEX: Mutex<()> = Mutex::new(());
 
 use astra_runtime::str_preview::truncate_str;
 use astra_runtime::tool_sandbox::{
@@ -1269,6 +1274,41 @@ pub fn all_tool_schemas() -> Vec<Value> {
                 }
             }
         }),
+        // ── Env tool: environment variable management ──────────────────────────────
+        json!({
+            "type": "function",
+            "function": {
+                "name": "env",
+                "description": "Manage environment variables for the current session. List, get, set, unset, or search environment variables. Changes persist only for this session. Sensitive values (tokens, keys, passwords) are automatically masked in output.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "operation": {
+                            "type": "string",
+                            "enum": ["list", "get", "set", "unset", "search"],
+                            "description": "Operation to perform: 'list' shows all vars, 'get' retrieves one var, 'set' creates/updates, 'unset' removes, 'search' finds vars by regex pattern"
+                        },
+                        "name": {
+                            "type": "string",
+                            "description": "Variable name (required for get/set/unset)"
+                        },
+                        "value": {
+                            "type": "string",
+                            "description": "Value to set (required for set operation)"
+                        },
+                        "pattern": {
+                            "type": "string",
+                            "description": "Regex pattern for search (case-insensitive)"
+                        },
+                        "show_values": {
+                            "type": "boolean",
+                            "description": "Show full values in list/search (default: false, shows char count instead)"
+                        }
+                    },
+                    "required": ["operation"]
+                }
+            }
+        }),
     ]
 }
 
@@ -1305,12 +1345,31 @@ const PERSIST_THRESHOLD: usize = 50_000;
 /// Preview size (bytes) included in the persisted-output reference message.
 const PERSIST_PREVIEW_BYTES: usize = 2000;
 
+/// Maximum file size (10MB) for LSP operations to prevent OOM.
+const MAX_LSP_FILE_SIZE: usize = 10 * 1024 * 1024;
+
 /// Directory for persisted tool results within the astra home.
 fn tool_results_dir() -> PathBuf {
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".astra")
         .join("tool-results")
+}
+
+/// Convert UTF-16 column position to char index.
+/// LSP protocol uses UTF-16 code units, Rust uses UTF-8 chars.
+/// Handles surrogate pairs (emoji, etc.) correctly.
+fn utf16_col_to_char_idx(line: &str, col_utf16: usize) -> usize {
+    let mut utf16_offset = 0;
+    for (char_idx, c) in line.chars().enumerate() {
+        // Check if we've reached or passed the target UTF-16 offset
+        if utf16_offset + c.len_utf16() > col_utf16 {
+            return char_idx;
+        }
+        utf16_offset += c.len_utf16();
+    }
+    // Column is past end of line - return line length
+    line.chars().count()
 }
 
 /// Truncate tool output to `max_bytes`, cutting at a newline boundary when
@@ -2588,7 +2647,8 @@ impl ToolExecutor {
                 "note": "Direct JSON API, no HTML parsing needed"
             }));
         }
-        if engine != "github" && query.contains("code") || query.contains("library") || query.contains("package") {
+        // Fixed: operator precedence - parenthesize the OR conditions
+        if engine != "github" && (query.contains("code") || query.contains("library") || query.contains("package")) {
             alternatives.push(serde_json::json!({
                 "engine": "GitHub",
                 "url": format!("https://github.com/search?q={}&type=repositories", encoded_query),
@@ -2645,8 +2705,25 @@ impl ToolExecutor {
                 }
             }
             
+            // Memory info on macOS (using vm_stat)
+            #[cfg(target_os = "macos")]
+            {
+                if let Ok(output) = std::process::Command::new("vm_stat").output() {
+                    if output.status.success() {
+                        let stdout = String::from_utf8_lossy(&output.stdout);
+                        let mut mem = serde_json::Map::new();
+                        for line in stdout.lines().take(5) {
+                            if let Some((key, val)) = line.split_once(':') {
+                                mem.insert(key.trim().to_string(), json!(val.trim()));
+                            }
+                        }
+                        sys_info.insert("memory".to_string(), json!(mem));
+                    }
+                }
+            }
+            
             // Load average on Unix
-            #[cfg(unix)]
+            #[cfg(target_os = "linux")]
             {
                 if let Ok(loadavg) = std::fs::read_to_string("/proc/loadavg") {
                     let parts: Vec<&str> = loadavg.split_whitespace().take(3).collect();
@@ -2658,6 +2735,41 @@ impl ToolExecutor {
                         }));
                     }
                 }
+            }
+            
+            // Load average on macOS (using sysctl)
+            #[cfg(target_os = "macos")]
+            {
+                if let Ok(output) = std::process::Command::new("sysctl")
+                    .args(["-n", "vm.loadavg"])
+                    .output()
+                {
+                    if output.status.success() {
+                        let stdout = String::from_utf8_lossy(&output.stdout);
+                        let parts: Vec<&str> = stdout
+                            .trim()
+                            .trim_start_matches('{')
+                            .trim_end_matches('}')
+                            .split_whitespace()
+                            .take(3)
+                            .collect();
+                        if parts.len() >= 3 {
+                            sys_info.insert("load_avg".to_string(), json!({
+                                "1min": parts[0],
+                                "5min": parts[1],
+                                "15min": parts[2]
+                            }));
+                        }
+                    }
+                }
+            }
+            
+            // Note for Windows users
+            #[cfg(target_os = "windows")]
+            {
+                sys_info.insert("note".to_string(), json!(
+                    "System memory/load info requires external tools on Windows. Use Task Manager or 'systeminfo' command."
+                ));
             }
             
             result.insert("system".to_string(), json!(sys_info));
@@ -2957,13 +3069,24 @@ impl ToolExecutor {
     }
 
     /// Find definition at a specific file position by extracting the symbol under cursor.
-    fn find_definition_at_position(&self, file: &str, line: usize, column: usize) -> String {
+    /// Column is interpreted as UTF-16 code units (LSP protocol).
+    fn find_definition_at_position(&self, file: &str, line: usize, col_utf16: usize) -> String {
         // Read the file and extract symbol at position
         let file_path = if file.starts_with('/') {
             PathBuf::from(file)
         } else {
             self.project_root.join(file)
         };
+        
+        // Check file size to prevent OOM
+        if let Ok(metadata) = std::fs::metadata(&file_path) {
+            if metadata.len() > MAX_LSP_FILE_SIZE as u64 {
+                return json!({
+                    "error": format!("File too large for LSP operations ({} bytes, max {} bytes)",
+                        metadata.len(), MAX_LSP_FILE_SIZE)
+                }).to_string();
+            }
+        }
         
         let content = match std::fs::read_to_string(&file_path) {
             Ok(c) => c,
@@ -2981,16 +3104,18 @@ impl ToolExecutor {
         }
 
         let line_content = lines[line - 1];
-        if column == 0 || column > line_content.len() + 1 {
+        
+        // Convert UTF-16 column to char index (LSP uses UTF-16 code units)
+        let col_idx = utf16_col_to_char_idx(line_content, col_utf16.saturating_sub(1));
+        let chars: Vec<char> = line_content.chars().collect();
+        
+        if col_idx >= chars.len() {
             return json!({
-                "error": format!("Column {} out of range for line {} (length {})", column, line, line_content.len())
+                "error": format!("Column {} (UTF-16) out of range for line {} (length {})", 
+                    col_utf16, line, line_content.len())
             }).to_string();
         }
 
-        // Extract symbol at position (word boundary detection)
-        let col_idx = column - 1;
-        let chars: Vec<char> = line_content.chars().collect();
-        
         // Find word boundaries
         let mut start = col_idx;
         while start > 0 && Self::is_symbol_char(chars.get(start - 1).copied().unwrap_or(' ')) {
@@ -3019,6 +3144,238 @@ impl ToolExecutor {
     /// Check if a character can be part of a symbol name.
     fn is_symbol_char(c: char) -> bool {
         c.is_alphanumeric() || c == '_'
+    }
+
+    // ── Env tool: environment variable management ─────────────────────────────
+
+    /// Environment variable management tool.
+    /// Operations: list, get, set, unset, search
+    fn env_tool(&self, args: &Value) -> String {
+        let operation = args.get("operation").and_then(|v| v.as_str()).unwrap_or("list");
+        
+        match operation {
+            "list" => self.env_list(args),
+            "get" => self.env_get(args),
+            "set" => self.env_set(args),
+            "unset" => self.env_unset(args),
+            "search" => self.env_search(args),
+            _ => json!({
+                "error": format!("Unknown env operation: {}. Use: list, get, set, unset, search", operation)
+            }).to_string()
+        }
+    }
+
+    /// List all environment variables (values masked by default for security).
+    fn env_list(&self, args: &Value) -> String {
+        let show_values = args.get("show_values").and_then(|v| v.as_bool()).unwrap_or(false);
+        
+        let mut vars: Vec<(String, String)> = std::env::vars().collect();
+        vars.sort_by(|a, b| a.0.cmp(&b.0));
+        
+        let entries: Vec<Value> = vars
+            .into_iter()
+            .map(|(name, value)| {
+                let display_value = if Self::is_sensitive_var(&name) {
+                    format!("***MASKED*** ({} chars)", value.len())
+                } else if show_values {
+                    value
+                } else {
+                    format!("({} chars)", value.len())
+                };
+                json!({
+                    "name": name,
+                    "value": display_value
+                })
+            })
+            .collect();
+        
+        json!({
+            "count": entries.len(),
+            "variables": entries
+        }).to_string()
+    }
+
+    /// Get a specific environment variable.
+    fn env_get(&self, args: &Value) -> String {
+        let name = match args.get("name").and_then(|v| v.as_str()) {
+            Some(n) => n,
+            None => return json!({ "error": "Missing required parameter: name" }).to_string(),
+        };
+        
+        match std::env::var(name) {
+            Ok(value) => {
+                let display_value = if Self::is_sensitive_var(name) {
+                    format!("***MASKED*** ({} chars)", value.len())
+                } else {
+                    value
+                };
+                json!({
+                    "name": name,
+                    "value": display_value,
+                    "exists": true
+                }).to_string()
+            }
+            Err(_) => json!({
+                "name": name,
+                "exists": false
+            }).to_string(),
+        }
+    }
+
+    /// Set an environment variable (for this session only).
+    fn env_set(&self, args: &Value) -> String {
+        let name = match args.get("name").and_then(|v| v.as_str()) {
+            Some(n) => n,
+            None => return json!({ "error": "Missing required parameter: name" }).to_string(),
+        };
+        let value = match args.get("value").and_then(|v| v.as_str()) {
+            Some(v) => v,
+            None => return json!({ "error": "Missing required parameter: value" }).to_string(),
+        };
+        
+        // Validate variable name (alphanumeric + underscore, not starting with digit)
+        if name.is_empty() || name.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false) {
+            return json!({ "error": "Invalid variable name: cannot be empty or start with a digit" }).to_string();
+        }
+        if !name.chars().all(|c| c.is_alphanumeric() || c == '_') {
+            return json!({ "error": "Invalid variable name: must contain only alphanumeric characters and underscores" }).to_string();
+        }
+        
+        // Thread-safe environment mutation
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        // SAFETY: Protected by ENV_MUTEX, single-threaded access
+        unsafe {
+            std::env::set_var(name, value);
+        }
+        
+        let display_value = if Self::is_sensitive_var(name) {
+            format!("***MASKED*** ({} chars)", value.len())
+        } else {
+            value.to_string()
+        };
+        
+        json!({
+            "success": true,
+            "name": name,
+            "value": display_value,
+            "note": "Variable set for this session only"
+        }).to_string()
+    }
+
+    /// Unset (remove) an environment variable.
+    fn env_unset(&self, args: &Value) -> String {
+        let name = match args.get("name").and_then(|v| v.as_str()) {
+            Some(n) => n,
+            None => return json!({ "error": "Missing required parameter: name" }).to_string(),
+        };
+        
+        let existed = std::env::var(name).is_ok();
+        
+        // Thread-safe environment mutation
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        // SAFETY: Protected by ENV_MUTEX, single-threaded access
+        unsafe {
+            std::env::remove_var(name);
+        }
+        
+        json!({
+            "success": true,
+            "name": name,
+            "existed": existed,
+            "note": "Variable unset for this session only"
+        }).to_string()
+    }
+
+    /// Search environment variables by regex pattern.
+    fn env_search(&self, args: &Value) -> String {
+        let pattern = match args.get("pattern").and_then(|v| v.as_str()) {
+            Some(p) => p,
+            None => return json!({ "error": "Missing required parameter: pattern" }).to_string(),
+        };
+        let show_values = args.get("show_values").and_then(|v| v.as_bool()).unwrap_or(false);
+        
+        // ReDoS protection: limit pattern length
+        if pattern.len() > 500 {
+            return json!({ "error": "Pattern too long (max 500 characters)" }).to_string();
+        }
+        
+        let regex = match regex::Regex::new(&format!("(?i){}", pattern)) {
+            Ok(r) => r,
+            Err(e) => return json!({ "error": format!("Invalid regex pattern: {}", e) }).to_string(),
+        };
+        
+        let vars: Vec<(String, String)> = std::env::vars().collect();
+        let mut matches: Vec<Value> = Vec::new();
+        
+        for (name, value) in vars {
+            if regex.is_match(&name) || regex.is_match(&value) {
+                let display_value = if Self::is_sensitive_var(&name) {
+                    format!("***MASKED*** ({} chars)", value.len())
+                } else if show_values {
+                    value
+                } else {
+                    format!("({} chars)", value.len())
+                };
+                matches.push(json!({
+                    "name": name,
+                    "value": display_value
+                }));
+            }
+        }
+        
+        matches.sort_by(|a, b| {
+            let a_name = a.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            let b_name = b.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            a_name.cmp(b_name)
+        });
+        
+        json!({
+            "pattern": pattern,
+            "count": matches.len(),
+            "matches": matches
+        }).to_string()
+    }
+
+    /// Check if a variable name suggests it contains sensitive data.
+    fn is_sensitive_var(name: &str) -> bool {
+        let upper = name.to_uppercase();
+        // Core patterns
+        upper.contains("KEY")
+            || upper.contains("TOKEN")
+            || upper.contains("SECRET")
+            || upper.contains("PASSWORD")
+            || upper.contains("PASSWD")
+            || upper.contains("CREDENTIAL")
+            || upper.contains("PRIVATE")
+            || upper.starts_with("API_")
+            || upper.ends_with("_API")
+            || upper.contains("AUTH")
+            || upper.contains("BEARER")
+            || upper.contains("JWT")
+            // Cloud providers
+            || upper.starts_with("AWS_")
+            || upper.starts_with("AZURE_")
+            || upper.starts_with("GCP_")
+            || upper.starts_with("GOOGLE_")
+            // AI providers
+            || upper.contains("OPENAI")
+            || upper.contains("ANTHROPIC")
+            || upper.contains("CLAUDE")
+            || upper.contains("GEMINI")
+            // Code hosting
+            || upper.starts_with("GITHUB_")
+            || upper.starts_with("GITLAB_")
+            || upper.starts_with("GH_")
+            // Databases
+            || upper.contains("DATABASE_URL")
+            || upper.contains("DB_PASS")
+            || upper.starts_with("REDIS_")
+            || upper.starts_with("MONGO")
+            // Other services
+            || upper.starts_with("SLACK_")
+            || upper.starts_with("STRIPE_")
+            || upper.starts_with("SENDGRID")
+            || upper.starts_with("TWILIO")
     }
 
     /// Set the MCP client manager for external tool routing.
@@ -3570,13 +3927,14 @@ impl ToolExecutor {
             "spawn_agent" => agent_spawning::handle_spawn_agent_tool(args, self.spawn_context.as_ref()).await,
             "diagnose" => self.diagnose(args).await,
             "lsp" => self.lsp(args),
+            "env" => self.env_tool(args),
             _ if name.starts_with("mcp_") => self.execute_mcp_tool(name, args).await,
             _ => format!(
                 "Unknown tool: {name}. Available tools: bash, read_file, write_file, str_replace, \
                  list_dir, grep, glob, symbols, find_definition, find_references, git_status, \
                  git_diff, git_log, git_show, git_blame, call_graph, run_build_test, web_fetch, \
                  mo_query, memory_search, memory_profile, ask_user, task_create, task_list, \
-                 task_get, task_update, task_stop, sleep, tool_search, web_search, spawn_agent, diagnose, lsp"
+                 task_get, task_update, task_stop, sleep, tool_search, web_search, spawn_agent, diagnose, lsp, env"
             ),
         };
         // Normalize empty output, then apply global safety net
@@ -11180,5 +11538,182 @@ impl Config {
         
         // Should find symbols
         assert!(!result.contains("Error:") || result.contains("main"));
+    }
+
+    // ── Env tool tests ────────────────────────────────────────────────────────
+
+    #[test]
+    fn env_list_returns_variables() {
+        let exe = test_executor();
+        let result = exe.env_tool(&json!({ "operation": "list" }));
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        
+        assert!(parsed.get("count").is_some());
+        assert!(parsed.get("variables").is_some());
+        let vars = parsed.get("variables").unwrap().as_array().unwrap();
+        assert!(!vars.is_empty());
+    }
+
+    #[test]
+    fn env_get_existing_var() {
+        let exe = test_executor();
+        let result = exe.env_tool(&json!({ 
+            "operation": "get",
+            "name": "HOME"
+        }));
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        
+        assert_eq!(parsed.get("name").unwrap(), "HOME");
+        assert_eq!(parsed.get("exists").unwrap(), true);
+    }
+
+    #[test]
+    fn env_get_missing_var() {
+        let exe = test_executor();
+        let result = exe.env_tool(&json!({ 
+            "operation": "get",
+            "name": "DEFINITELY_NOT_A_REAL_VAR_12345"
+        }));
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        
+        assert_eq!(parsed.get("exists").unwrap(), false);
+    }
+
+    #[test]
+    fn env_set_and_unset() {
+        let exe = test_executor();
+        
+        // Set a variable
+        let result = exe.env_tool(&json!({ 
+            "operation": "set",
+            "name": "TEST_VAR_FOR_ASTRA",
+            "value": "test_value_123"
+        }));
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed.get("success").unwrap(), true);
+        
+        // Verify it's set
+        let result = exe.env_tool(&json!({ 
+            "operation": "get",
+            "name": "TEST_VAR_FOR_ASTRA"
+        }));
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed.get("exists").unwrap(), true);
+        
+        // Unset it
+        let result = exe.env_tool(&json!({ 
+            "operation": "unset",
+            "name": "TEST_VAR_FOR_ASTRA"
+        }));
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed.get("success").unwrap(), true);
+        
+        // Verify it's gone
+        let result = exe.env_tool(&json!({ 
+            "operation": "get",
+            "name": "TEST_VAR_FOR_ASTRA"
+        }));
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed.get("exists").unwrap(), false);
+    }
+
+    #[test]
+    fn env_set_invalid_name() {
+        let exe = test_executor();
+        
+        // Start with digit
+        let result = exe.env_tool(&json!({ 
+            "operation": "set",
+            "name": "123VAR",
+            "value": "test"
+        }));
+        assert!(result.contains("error"));
+        
+        // Empty name
+        let result = exe.env_tool(&json!({ 
+            "operation": "set",
+            "name": "",
+            "value": "test"
+        }));
+        assert!(result.contains("error"));
+    }
+
+    #[test]
+    fn env_search_basic() {
+        let exe = test_executor();
+        let result = exe.env_tool(&json!({ 
+            "operation": "search",
+            "pattern": "PATH"
+        }));
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        
+        assert!(parsed.get("count").is_some());
+        assert!(parsed.get("matches").is_some());
+    }
+
+    #[test]
+    fn env_search_redos_protection() {
+        let exe = test_executor();
+        let long_pattern = "a".repeat(600);
+        let result = exe.env_tool(&json!({ 
+            "operation": "search",
+            "pattern": long_pattern
+        }));
+        
+        assert!(result.contains("error"));
+        assert!(result.contains("too long"));
+    }
+
+    #[test]
+    fn env_sensitive_var_masking() {
+        let exe = test_executor();
+        
+        // Test various sensitive patterns
+        assert!(ToolExecutor::is_sensitive_var("API_KEY"));
+        assert!(ToolExecutor::is_sensitive_var("GITHUB_TOKEN"));
+        assert!(ToolExecutor::is_sensitive_var("AWS_SECRET_ACCESS_KEY"));
+        assert!(ToolExecutor::is_sensitive_var("OPENAI_API_KEY"));
+        assert!(ToolExecutor::is_sensitive_var("ANTHROPIC_API_KEY"));
+        assert!(ToolExecutor::is_sensitive_var("DATABASE_URL"));
+        
+        // Non-sensitive vars
+        assert!(!ToolExecutor::is_sensitive_var("HOME"));
+        assert!(!ToolExecutor::is_sensitive_var("PATH"));
+        assert!(!ToolExecutor::is_sensitive_var("USER"));
+    }
+
+    // ── UTF-16 conversion tests ───────────────────────────────────────────────
+
+    #[test]
+    fn utf16_col_to_char_idx_ascii() {
+        let line = "hello world";
+        assert_eq!(utf16_col_to_char_idx(line, 0), 0);  // h
+        assert_eq!(utf16_col_to_char_idx(line, 5), 5);  // space
+        assert_eq!(utf16_col_to_char_idx(line, 6), 6);  // w
+    }
+
+    #[test]
+    fn utf16_col_to_char_idx_emoji() {
+        // Emoji (😀) takes 2 UTF-16 code units but 1 char
+        let line = "a😀b";
+        assert_eq!(utf16_col_to_char_idx(line, 0), 0);  // a
+        assert_eq!(utf16_col_to_char_idx(line, 1), 1);  // 😀 (first UTF-16 unit)
+        assert_eq!(utf16_col_to_char_idx(line, 2), 1);  // 😀 (second UTF-16 unit, still same char)
+        assert_eq!(utf16_col_to_char_idx(line, 3), 2);  // b
+    }
+
+    #[test]
+    fn utf16_col_to_char_idx_chinese() {
+        // Chinese char takes 1 UTF-16 code unit but 3 UTF-8 bytes
+        let line = "a中b";
+        assert_eq!(utf16_col_to_char_idx(line, 0), 0);  // a
+        assert_eq!(utf16_col_to_char_idx(line, 1), 1);  // 中
+        assert_eq!(utf16_col_to_char_idx(line, 2), 2);  // b
+    }
+
+    #[test]
+    fn utf16_col_past_end() {
+        let line = "abc";
+        assert_eq!(utf16_col_to_char_idx(line, 10), 3);  // past end returns line length
     }
 }
