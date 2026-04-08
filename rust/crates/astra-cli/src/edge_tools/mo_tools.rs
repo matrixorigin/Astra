@@ -45,12 +45,12 @@ fn mo_database() -> &'static str {
 }
 
 fn mo_create_snapshot_sql(name: &str) -> String {
-    format!("CREATE SNAPSHOT `{name}` FOR DATABASE {}", mo_database())
+    format!("CREATE SNAPSHOT `{name}` FOR DATABASE `{}`", mo_database())
 }
 
 fn mo_restore_snapshot_sql(name: &str) -> String {
     let account = mo_current_account();
-    format!("RESTORE ACCOUNT {account} DATABASE {} FROM SNAPSHOT `{name}`", mo_database())
+    format!("RESTORE ACCOUNT `{account}` DATABASE `{}` FROM SNAPSHOT `{name}`", mo_database())
 }
 
 /// Build a mysql Command with connection parameters from environment.

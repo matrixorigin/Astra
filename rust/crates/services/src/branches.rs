@@ -275,7 +275,7 @@ impl BranchService for DatabaseBranchService {
 
         let pool = self.get_pool().await.map_err(internal_error)?;
 
-        let sql = format!("DROP SNAPSHOT IF EXISTS {}", request.name);
+        let sql = format!("DROP SNAPSHOT IF EXISTS `{}`", request.name);
         query(&sql).execute(&pool).await.map_err(internal_error)?;
 
         Ok(StatusResponse {

@@ -1299,16 +1299,7 @@ fn sanitize_snapshot_name(raw: &str) -> String {
 }
 
 fn validate_snapshot_name(name: &str) -> Result<(), String> {
-    if name.is_empty() {
-        return Err("empty snapshot name".into());
-    }
-    if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
-        return Err(format!(
-            "invalid snapshot name '{}': only [a-zA-Z0-9_] allowed",
-            name
-        ));
-    }
-    Ok(())
+    crate::snapshot_sql::validate_sql_identifier(name, "snapshot name")
 }
 
 #[async_trait]
@@ -1356,7 +1347,7 @@ impl TaskBranchOps for TaskBranchService {
 
     async fn cleanup_snapshot(&self, snapshot: &str) -> Result<(), String> {
         validate_snapshot_name(snapshot)?;
-        let sql = format!("DROP SNAPSHOT IF EXISTS {snapshot}");
+        let sql = format!("DROP SNAPSHOT IF EXISTS `{snapshot}`");
         sqlx::query(&sql)
             .execute(&self.pool)
             .await
