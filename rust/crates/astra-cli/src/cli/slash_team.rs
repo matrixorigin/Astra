@@ -3,6 +3,34 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use astra_services::team_persistence::TeamPersistenceService;
 
+// ── Team History & Snapshot Tracking ────────────────────────────────────
+
+/// Record of a past team execution.
+#[derive(Clone, Debug)]
+pub(super) struct TeamHistoryEntry {
+    pub team_name: String,
+    pub task: String,
+    pub delegation_id: String,
+    pub parent_run_id: String,
+    pub status: String,
+    pub agent_count: usize,
+    pub total_prompt_tokens: u64,
+    pub total_completion_tokens: u64,
+    pub error: Option<String>,
+    pub started_at: String,
+}
+
+/// A saved snapshot associated with a team.
+#[derive(Clone, Debug)]
+pub(super) struct TeamSnapshotEntry {
+    pub snapshot_id: String,
+    pub team_name: String,
+    pub label: String,
+    pub git_commit: Option<String>,
+    pub session_id: Option<String>,
+    pub created_at: String,
+}
+
 // ── Team Registry ───────────────────────────────────────────────────────
 
 /// A named team of agent roles that can coordinate on tasks.
@@ -28,12 +56,16 @@ pub(super) struct TeamMember {
 #[derive(Clone, Debug, Default)]
 pub(super) struct TeamRegistry {
     teams: HashMap<String, Team>,
+    history: Vec<TeamHistoryEntry>,
+    snapshots: Vec<TeamSnapshotEntry>,
 }
 
 impl TeamRegistry {
     pub fn new() -> Self {
         let mut reg = Self {
             teams: HashMap::new(),
+            history: Vec::new(),
+            snapshots: Vec::new(),
         };
         // Register built-in team templates
         reg.register_builtins();
@@ -184,9 +216,45 @@ impl TeamRegistry {
         t.shared_context.insert(key, value);
         Ok(())
     }
+
+    pub fn record_execution(&mut self, entry: TeamHistoryEntry) {
+        self.history.push(entry);
+    }
+
+    pub fn get_history(&self, team_name: &str) -> Vec<&TeamHistoryEntry> {
+        self.history
+            .iter()
+            .filter(|e| e.team_name == team_name)
+            .collect()
+    }
+
+    pub fn add_snapshot(&mut self, entry: TeamSnapshotEntry) {
+        self.snapshots.push(entry);
+    }
+
+    pub fn get_snapshots(&self, team_name: &str) -> Vec<&TeamSnapshotEntry> {
+        self.snapshots
+            .iter()
+            .filter(|s| s.team_name == team_name)
+            .collect()
+    }
+
+    pub fn find_snapshot(&self, snapshot_id: &str) -> Option<&TeamSnapshotEntry> {
+        self.snapshots.iter().find(|s| s.snapshot_id == snapshot_id)
+    }
 }
 
 // ── CLI Team → TeamDefinition Conversion ────────────────────────────────
+
+/// Get current git HEAD commit SHA (best-effort).
+fn git_head_sha() -> Option<String> {
+    std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+}
 
 /// Convert a CLI [`Team`] to a runtime [`TeamDefinition`] for the orchestrator.
 ///
@@ -608,6 +676,25 @@ pub(super) async fn handle_team_command(arg: &str, state: &mut super::ReplState)
                 }
             }
             eprintln!();
+
+            // Record this execution in history
+            let (prompt_tok, compl_tok, agent_count) = report
+                .delegation_result
+                .as_ref()
+                .map(|dr| (dr.total_prompt_tokens, dr.total_completion_tokens, dr.agent_results.len()))
+                .unwrap_or((0, 0, 0));
+            state.team_registry.record_execution(TeamHistoryEntry {
+                team_name: team_name.to_string(),
+                task: task.to_string(),
+                delegation_id: report.delegation_id.clone(),
+                parent_run_id: report.parent_run_id.clone(),
+                status: report.status.to_string(),
+                agent_count,
+                total_prompt_tokens: prompt_tok,
+                total_completion_tokens: compl_tok,
+                error: report.error.clone(),
+                started_at: chrono::Utc::now().to_rfc3339(),
+            });
         }
 
         "history" => {
@@ -615,57 +702,140 @@ pub(super) async fn handle_team_command(arg: &str, state: &mut super::ReplState)
             let name = sub_arg.trim();
             if name.is_empty() {
                 eprintln!("{}", "  Usage: /team history <team>".yellow());
-                eprintln!("{}", "  Shows execution history from DurableRunRecords.".dim());
+                eprintln!("{}", "  Shows execution history for a team.".dim());
                 return;
             }
-            match state.team_registry.get(name) {
-                Some(_) => {
-                    eprintln!(
-                        "\n  {} Execution history for team '{}':",
-                        "📜",
-                        name.cyan().bold()
-                    );
-                    eprintln!(
-                        "  {}",
-                        "  No executions recorded yet. Use /team run to execute.".dim()
-                    );
-                    eprintln!(
-                        "  {}",
-                        "  History will be populated from DurableRunRecords after team orchestrator integration.".dim()
-                    );
-                }
-                None => {
-                    eprintln!("  {} Team '{}' not found", theme::icon_err(), name);
+            if state.team_registry.get(name).is_none() {
+                eprintln!("  {} Team '{}' not found", theme::icon_err(), name);
+                return;
+            }
+
+            let entries = state.team_registry.get_history(name);
+            if entries.is_empty() {
+                eprintln!(
+                    "\n  {} No execution history for team '{}'.",
+                    "📜", name.cyan().bold()
+                );
+                eprintln!("  {}", "  Use /team run to execute a task.".dim());
+                return;
+            }
+
+            eprintln!(
+                "\n{}",
+                format!("─── History: {} ({} run{}) ───",
+                    name, entries.len(), if entries.len() == 1 { "" } else { "s" }
+                ).bold()
+            );
+            for (i, e) in entries.iter().enumerate().rev() {
+                let status_icon = match e.status.as_str() {
+                    "completed" => "✅",
+                    "completed_with_conflicts" => "⚠️ ",
+                    _ => "❌",
+                };
+                eprintln!(
+                    "\n  {} #{} {} {}",
+                    status_icon,
+                    i + 1,
+                    e.status.as_str().bold(),
+                    e.started_at.as_str().dim()
+                );
+                eprintln!("    {} {}", "Task:".dim(), truncate_str(&e.task, 70));
+                eprintln!(
+                    "    {} agents: {} | tokens: {}+{} | delegation: {}",
+                    "📊".dim(),
+                    e.agent_count,
+                    e.total_prompt_tokens,
+                    e.total_completion_tokens,
+                    e.delegation_id.get(..8).unwrap_or(&e.delegation_id),
+                );
+                if let Some(ref err) = e.error {
+                    eprintln!("    {} {}", "Error:".red(), truncate_str(err, 60));
                 }
             }
+            eprintln!();
         }
 
         "snapshot" => {
-            // /team snapshot <team>
-            let name = sub_arg.trim();
+            // /team snapshot <team> [label]
+            let mut parts = sub_arg.splitn(2, ' ');
+            let name = parts.next().unwrap_or("").trim();
+            let label = parts.next().unwrap_or("").trim();
             if name.is_empty() {
-                eprintln!("{}", "  Usage: /team snapshot <team>".yellow());
-                eprintln!("{}", "  Creates a CompositeSnapshot of the team's current state.".dim());
+                eprintln!("{}", "  Usage: /team snapshot <team> [label]".yellow());
+                eprintln!("{}", "  Saves team state + git commit as a snapshot.".dim());
                 return;
             }
-            match state.team_registry.get(name) {
-                Some(_) => {
-                    let snapshot_id = format!("team-snap-{}-{}", name, chrono::Utc::now().timestamp());
-                    eprintln!(
-                        "  {} Snapshot '{}' created for team '{}'",
-                        theme::icon_ok(),
-                        snapshot_id.dim(),
-                        name.cyan()
-                    );
-                    eprintln!(
-                        "  {}",
-                        "  Snapshot captures: team definition, git commit, session state.".dim()
-                    );
-                }
-                None => {
-                    eprintln!("  {} Team '{}' not found", theme::icon_err(), name);
-                }
+            if state.team_registry.get(name).is_none() {
+                eprintln!("  {} Team '{}' not found", theme::icon_err(), name);
+                return;
             }
+
+            let snapshot_id = format!(
+                "team-{}-{}",
+                name,
+                chrono::Utc::now().timestamp()
+            );
+            let git_sha = git_head_sha();
+            let session_id = state.session_id.clone();
+            let now = chrono::Utc::now().to_rfc3339();
+
+            let snap_label = if label.is_empty() {
+                format!("team {} snapshot", name)
+            } else {
+                label.to_string()
+            };
+
+            // Build CompositeSnapshot
+            let mut builder = astra_core::composite_snapshot::CompositeSnapshotBuilder::new(
+                session_id.clone().unwrap_or_default(),
+                0,
+            )
+            .label(&snap_label);
+
+            if let Some(ref sha) = git_sha {
+                builder = builder.git_commit(sha);
+            }
+            if let Some(ref sid) = session_id {
+                builder = builder.session_state(sid);
+            }
+
+            let composite = builder.build();
+
+            state.team_registry.add_snapshot(TeamSnapshotEntry {
+                snapshot_id: snapshot_id.clone(),
+                team_name: name.to_string(),
+                label: snap_label,
+                git_commit: git_sha.clone(),
+                session_id,
+                created_at: now,
+            });
+
+            eprintln!(
+                "\n  {} Snapshot '{}' created for team '{}'",
+                theme::icon_ok(),
+                snapshot_id.as_str().dim(),
+                name.cyan()
+            );
+            let dims = composite.dimensions();
+            eprintln!(
+                "    {} Captured: {}",
+                "📸".dim(),
+                dims.join(", "),
+            );
+            if let Some(ref sha) = git_sha {
+                eprintln!(
+                    "    {} Git: {}",
+                    "🔖".dim(),
+                    sha.get(..12).unwrap_or(sha),
+                );
+            }
+            eprintln!(
+                "    {} Use '/team restore {} {}' to restore.",
+                "💡".dim(),
+                name,
+                &snapshot_id,
+            );
+            eprintln!();
         }
 
         "restore" => {
@@ -675,26 +845,82 @@ pub(super) async fn handle_team_command(arg: &str, state: &mut super::ReplState)
             let snapshot_id = parts.next().unwrap_or("").trim();
             if name.is_empty() || snapshot_id.is_empty() {
                 eprintln!("{}", "  Usage: /team restore <team> <snapshot-id>".yellow());
-                eprintln!("{}", "  Restores team state from a CompositeSnapshot.".dim());
+                eprintln!("{}", "  Restores git state from a team snapshot.".dim());
                 return;
             }
-            match state.team_registry.get(name) {
-                Some(_) => {
-                    eprintln!(
-                        "  {} Restoring team '{}' from snapshot '{}'...",
-                        "⏪",
-                        name.cyan(),
-                        snapshot_id.dim()
-                    );
-                    eprintln!(
-                        "  {}",
-                        "  Restore requires runtime CompositeSnapshot integration.".dim()
-                    );
-                }
-                None => {
-                    eprintln!("  {} Team '{}' not found", theme::icon_err(), name);
-                }
+            if state.team_registry.get(name).is_none() {
+                eprintln!("  {} Team '{}' not found", theme::icon_err(), name);
+                return;
             }
+
+            let snap = match state.team_registry.find_snapshot(snapshot_id) {
+                Some(s) => s.clone(),
+                None => {
+                    // Try prefix match
+                    let matches: Vec<_> = state.team_registry.get_snapshots(name)
+                        .into_iter()
+                        .filter(|s| s.snapshot_id.starts_with(snapshot_id))
+                        .collect();
+                    match matches.len() {
+                        0 => {
+                            eprintln!("  {} Snapshot '{}' not found", theme::icon_err(), snapshot_id);
+                            let available = state.team_registry.get_snapshots(name);
+                            if !available.is_empty() {
+                                eprintln!("  {} Available snapshots:", "💡".dim());
+                                for s in available {
+                                    eprintln!("    {} {} — {}",
+                                        "•".dim(), s.snapshot_id.as_str().dim(), s.label);
+                                }
+                            }
+                            return;
+                        }
+                        1 => matches[0].clone(),
+                        _ => {
+                            eprintln!("  {} Ambiguous snapshot prefix '{}'. Matches:", theme::icon_err(), snapshot_id);
+                            for s in matches {
+                                eprintln!("    {} {}", "•".dim(), s.snapshot_id);
+                            }
+                            return;
+                        }
+                    }
+                }
+            };
+
+            if snap.team_name != name {
+                eprintln!("  {} Snapshot '{}' belongs to team '{}', not '{}'",
+                    theme::icon_err(), snap.snapshot_id, snap.team_name, name);
+                return;
+            }
+
+            eprintln!(
+                "\n  {} Restoring team '{}' from snapshot '{}'...",
+                "⏪", name.cyan(), snap.snapshot_id.dim()
+            );
+            eprintln!("    {} {}", "Label:".dim(), snap.label);
+
+            // Restore git state if snapshot has a commit
+            if let Some(ref sha) = snap.git_commit {
+                eprintln!("    {} Checking out git commit {}...", "🔖".dim(), sha.get(..12).unwrap_or(sha));
+                let output = std::process::Command::new("git")
+                    .args(["checkout", sha])
+                    .output();
+                match output {
+                    Ok(o) if o.status.success() => {
+                        eprintln!("    {} Git restored to {}", theme::icon_ok(), sha.get(..12).unwrap_or(sha));
+                    }
+                    Ok(o) => {
+                        let stderr = String::from_utf8_lossy(&o.stderr);
+                        eprintln!("    {} Git checkout failed: {}", theme::icon_err(), truncate_str(stderr.trim(), 60));
+                    }
+                    Err(e) => {
+                        eprintln!("    {} Git checkout error: {}", theme::icon_err(), e);
+                    }
+                }
+            } else {
+                eprintln!("    {} No git commit in snapshot (git state unchanged)", "ℹ️ ".dim());
+            }
+
+            eprintln!("  {} Restore complete.\n", theme::icon_ok());
         }
 
         _ => {
@@ -872,5 +1098,91 @@ mod tests {
             .insert("lang".into(), "rust".into());
         let def = cli_team_to_definition(&team, "u");
         assert_eq!(def.context.get("lang").unwrap(), "rust");
+    }
+
+    // ── History / Snapshot tests ─────────────────────────────────
+
+    #[test]
+    fn record_and_get_history() {
+        let mut reg = TeamRegistry::new();
+        assert!(reg.get_history("dev").is_empty());
+
+        reg.record_execution(TeamHistoryEntry {
+            team_name: "dev".into(),
+            task: "fix auth".into(),
+            delegation_id: "deleg-1".into(),
+            parent_run_id: "run-1".into(),
+            status: "completed".into(),
+            agent_count: 3,
+            total_prompt_tokens: 1000,
+            total_completion_tokens: 500,
+            error: None,
+            started_at: "2025-01-01T00:00:00Z".into(),
+        });
+        reg.record_execution(TeamHistoryEntry {
+            team_name: "dev".into(),
+            task: "add tests".into(),
+            delegation_id: "deleg-2".into(),
+            parent_run_id: "run-2".into(),
+            status: "failed".into(),
+            agent_count: 2,
+            total_prompt_tokens: 600,
+            total_completion_tokens: 200,
+            error: Some("timeout".into()),
+            started_at: "2025-01-02T00:00:00Z".into(),
+        });
+
+        let history = reg.get_history("dev");
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0].task, "fix auth");
+        assert_eq!(history[1].status, "failed");
+        assert_eq!(history[1].error.as_deref(), Some("timeout"));
+
+        // Different team has no history
+        assert!(reg.get_history("review").is_empty());
+    }
+
+    #[test]
+    fn add_and_find_snapshot() {
+        let mut reg = TeamRegistry::new();
+        reg.add_snapshot(TeamSnapshotEntry {
+            snapshot_id: "snap-abc123".into(),
+            team_name: "dev".into(),
+            label: "before refactor".into(),
+            git_commit: Some("deadbeef".into()),
+            session_id: Some("sess-1".into()),
+            created_at: "2025-01-01T00:00:00Z".into(),
+        });
+        reg.add_snapshot(TeamSnapshotEntry {
+            snapshot_id: "snap-def456".into(),
+            team_name: "review".into(),
+            label: "baseline".into(),
+            git_commit: None,
+            session_id: None,
+            created_at: "2025-01-02T00:00:00Z".into(),
+        });
+
+        // Exact match
+        let found = reg.find_snapshot("snap-abc123");
+        assert!(found.is_some());
+        assert_eq!(found.unwrap().label, "before refactor");
+
+        // Non-existent
+        let found = reg.find_snapshot("snap-xyz");
+        assert!(found.is_none());
+
+        // Team-scoped list
+        assert_eq!(reg.get_snapshots("dev").len(), 1);
+        assert_eq!(reg.get_snapshots("review").len(), 1);
+        assert_eq!(reg.get_snapshots("research").len(), 0);
+    }
+
+    #[test]
+    fn git_head_sha_returns_some_in_git_repo() {
+        // This test runs inside a git repo, so should return Some
+        let sha = git_head_sha();
+        assert!(sha.is_some(), "Expected Some(sha) in a git repo");
+        let sha = sha.unwrap();
+        assert!(sha.len() >= 7, "SHA too short: {}", sha);
     }
 }
