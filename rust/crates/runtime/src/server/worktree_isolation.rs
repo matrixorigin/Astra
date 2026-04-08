@@ -17,7 +17,7 @@
 //! ```
 
 use astra_core::composite_snapshot::{CompositeSnapshot, SnapshotRef};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::process::Command;
@@ -162,11 +162,24 @@ impl WorktreeManager {
     ///
     /// Each agent gets its own branch (`agent/{id}-{delegation_id_prefix}`) and
     /// worktree directory. Returns a map of agent_id → worktree path.
+    ///
+    /// Holds the repository lock to prevent concurrent git operations.
     pub async fn create_worktrees(
         &mut self,
         delegation_id: &str,
         agent_ids: &[String],
     ) -> Result<HashMap<String, PathBuf>, WorktreeError> {
+        // Reject duplicate agent_ids early — they'd produce identical branch names
+        let mut seen = HashSet::with_capacity(agent_ids.len());
+        for id in agent_ids {
+            if !seen.insert(id.as_str()) {
+                return Err(WorktreeError::Git(format!(
+                    "duplicate agent_id '{id}' in create_worktrees"
+                )));
+            }
+        }
+
+        let _lock = self.repo_lock.clone().lock_owned().await;
         let base_commit = self.current_head().await?;
         let del_prefix = &delegation_id[..delegation_id.len().min(8)];
 
@@ -294,7 +307,7 @@ impl WorktreeManager {
         delegation_id: &str,
         merge_order: &[String],
     ) -> Result<MergeResult, WorktreeError> {
-        let _lock = self.repo_lock.lock().await;
+        let _lock = self.repo_lock.clone().lock_owned().await;
         let mut result = MergeResult::default();
 
         for agent_id in merge_order {
@@ -640,6 +653,38 @@ mod tests {
 
         assert_ne!(snap_commit, original_base,
             "conflict snapshot should reference pre-merge HEAD (after a1 merged), not original base");
+
+        mgr.cleanup().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn create_worktree_rejects_duplicate_agent_ids() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().to_path_buf();
+        init_test_repo(&repo).await;
+
+        let mut mgr = make_manager(&repo);
+        let agents = vec!["coder".to_string(), "coder".to_string()];
+        let result = mgr.create_worktrees("del-dup12345", &agents).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("duplicate"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn merge_empty_order_returns_empty_result() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().to_path_buf();
+        init_test_repo(&repo).await;
+
+        let mut mgr = make_manager(&repo);
+        let agents = vec!["alpha".to_string()];
+        mgr.create_worktrees("del-empty1234", &agents).await.unwrap();
+
+        let result = mgr.merge_worktrees("del-empty1234", &[]).await.unwrap();
+        assert!(result.merged.is_empty());
+        assert!(result.skipped.is_empty());
+        assert!(result.conflicts.is_empty());
 
         mgr.cleanup().await.unwrap();
     }
