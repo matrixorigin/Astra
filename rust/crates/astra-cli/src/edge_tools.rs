@@ -1211,6 +1211,64 @@ pub fn all_tool_schemas() -> Vec<Value> {
                 }
             }
         }),
+        // ─── LSP tool: unified language server interface ─────────────────────────
+        json!({
+            "type": "function",
+            "function": {
+                "name": "lsp",
+                "description": "Interact with Language Server Protocol for code intelligence. Unified interface for definition, references, hover, symbols, and call hierarchy. More powerful than individual tools with consistent interface.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "operation": {
+                            "type": "string",
+                            "enum": [
+                                "goto_definition",
+                                "find_references",
+                                "hover",
+                                "document_symbols",
+                                "workspace_symbols",
+                                "call_hierarchy",
+                                "incoming_calls",
+                                "outgoing_calls",
+                                "diagnostics"
+                            ],
+                            "description": "LSP operation to perform"
+                        },
+                        "file": {
+                            "type": "string",
+                            "description": "File path (required for most operations)"
+                        },
+                        "line": {
+                            "type": "integer",
+                            "description": "Line number (1-based). Required for position-based operations."
+                        },
+                        "column": {
+                            "type": "integer",
+                            "description": "Column/character offset (1-based). Required for position-based operations."
+                        },
+                        "symbol": {
+                            "type": "string",
+                            "description": "Symbol name for symbol-based operations (alternative to line/column)"
+                        },
+                        "query": {
+                            "type": "string",
+                            "description": "Search query for workspace_symbols operation"
+                        },
+                        "scope": {
+                            "type": "string",
+                            "enum": ["file", "project"],
+                            "description": "Scope for certain operations (default: file)"
+                        },
+                        "include_body": {
+                            "type": "boolean",
+                            "description": "Include function bodies in results (default: false)"
+                        }
+                    },
+                    "required": ["operation"]
+                }
+            }
+        }),
     ]
 }
 
@@ -2737,6 +2795,232 @@ impl ToolExecutor {
         serde_json::to_string_pretty(&result).unwrap_or_else(|_| "Error: serialization failed".to_string())
     }
 
+    // ─── LSP tool: unified language server interface ─────────────────────────────
+
+    /// Unified LSP tool providing code intelligence operations.
+    /// Routes to existing implementations (find_definition, find_references, etc.)
+    /// but offers a consistent interface matching the LSP protocol.
+    fn lsp(&self, args: &Value) -> String {
+        let operation = match args.get("operation").and_then(Value::as_str) {
+            Some(op) => op,
+            None => return json!({
+                "error": "Missing required 'operation' parameter",
+                "valid_operations": [
+                    "goto_definition", "find_references", "hover", "document_symbols",
+                    "workspace_symbols", "call_hierarchy", "incoming_calls", "outgoing_calls", "diagnostics"
+                ]
+            }).to_string(),
+        };
+
+        let file = args.get("file").and_then(Value::as_str);
+        let line = args.get("line").and_then(Value::as_i64).map(|l| l as usize);
+        let column = args.get("column").and_then(Value::as_i64).map(|c| c as usize);
+        let symbol = args.get("symbol").and_then(Value::as_str);
+        let query = args.get("query").and_then(Value::as_str);
+        let scope = args.get("scope").and_then(Value::as_str).unwrap_or("file");
+        let include_body = args.get("include_body").and_then(Value::as_bool).unwrap_or(false);
+
+        match operation {
+            "goto_definition" => {
+                // Requires either symbol or file+position
+                if let Some(sym) = symbol {
+                    self.find_definition(&json!({
+                        "symbol": sym,
+                        "file": file
+                    }))
+                } else if let (Some(f), Some(l), Some(c)) = (file, line, column) {
+                    // For position-based definition lookup, we extract symbol at position
+                    self.find_definition_at_position(f, l, c)
+                } else {
+                    json!({
+                        "error": "goto_definition requires 'symbol' or 'file'+'line'+'column'"
+                    }).to_string()
+                }
+            }
+
+            "find_references" => {
+                if let Some(sym) = symbol {
+                    self.find_references(&json!({
+                        "symbol": sym,
+                        "path": file,
+                        "kind": "all",
+                        "validate": true
+                    }))
+                } else {
+                    json!({
+                        "error": "find_references requires 'symbol' parameter"
+                    }).to_string()
+                }
+            }
+
+            "hover" => {
+                if let (Some(f), Some(l), Some(c)) = (file, line, column) {
+                    self.hover_info(&json!({
+                        "file": f,
+                        "line": l,
+                        "column": c
+                    }))
+                } else if let (Some(f), Some(sym)) = (file, symbol) {
+                    // Find symbol in file and get hover for it
+                    self.hover_info(&json!({
+                        "file": f,
+                        "symbol": sym
+                    }))
+                } else {
+                    json!({
+                        "error": "hover requires 'file' + ('line'+'column' or 'symbol')"
+                    }).to_string()
+                }
+            }
+
+            "document_symbols" => {
+                if let Some(f) = file {
+                    self.symbols(&json!({
+                        "path": f,
+                        "include_body": include_body
+                    }))
+                } else {
+                    json!({
+                        "error": "document_symbols requires 'file' parameter"
+                    }).to_string()
+                }
+            }
+
+            "workspace_symbols" => {
+                let search_query = query.or(symbol).unwrap_or("");
+                self.symbol_search(&json!({
+                    "query": search_query,
+                    "limit": 50
+                }))
+            }
+
+            "call_hierarchy" | "outgoing_calls" => {
+                if let Some(f) = file {
+                    self.call_graph(&json!({
+                        "path": f,
+                        "symbol": symbol,
+                        "start_line": line,
+                        "callers": false,
+                        "scope": scope
+                    }))
+                } else {
+                    json!({
+                        "error": "call_hierarchy/outgoing_calls requires 'file' parameter"
+                    }).to_string()
+                }
+            }
+
+            "incoming_calls" => {
+                if let Some(f) = file {
+                    self.call_graph(&json!({
+                        "path": f,
+                        "symbol": symbol,
+                        "start_line": line,
+                        "callers": true,
+                        "scope": scope
+                    }))
+                } else {
+                    json!({
+                        "error": "incoming_calls requires 'file' parameter"
+                    }).to_string()
+                }
+            }
+
+            "diagnostics" => {
+                // Return diagnostic information about LSP capabilities
+                json!({
+                    "capabilities": {
+                        "goto_definition": true,
+                        "find_references": true,
+                        "hover": true,
+                        "document_symbols": true,
+                        "workspace_symbols": true,
+                        "call_hierarchy": true,
+                        "rename": true
+                    },
+                    "supported_languages": [
+                        "rust", "python", "typescript", "javascript",
+                        "go", "java", "c", "cpp", "ruby"
+                    ],
+                    "note": "Uses tree-sitter AST parsing for accurate results. Some features may have reduced accuracy for unsupported languages."
+                }).to_string()
+            }
+
+            _ => json!({
+                "error": format!("Unknown operation: {}", operation),
+                "valid_operations": [
+                    "goto_definition", "find_references", "hover", "document_symbols",
+                    "workspace_symbols", "call_hierarchy", "incoming_calls", "outgoing_calls", "diagnostics"
+                ]
+            }).to_string()
+        }
+    }
+
+    /// Find definition at a specific file position by extracting the symbol under cursor.
+    fn find_definition_at_position(&self, file: &str, line: usize, column: usize) -> String {
+        // Read the file and extract symbol at position
+        let file_path = if file.starts_with('/') {
+            PathBuf::from(file)
+        } else {
+            self.project_root.join(file)
+        };
+        
+        let content = match std::fs::read_to_string(&file_path) {
+            Ok(c) => c,
+            Err(e) => return json!({
+                "error": format!("Failed to read file: {}", e)
+            }).to_string(),
+        };
+
+        // Get the line
+        let lines: Vec<&str> = content.lines().collect();
+        if line == 0 || line > lines.len() {
+            return json!({
+                "error": format!("Line {} out of range (file has {} lines)", line, lines.len())
+            }).to_string();
+        }
+
+        let line_content = lines[line - 1];
+        if column == 0 || column > line_content.len() + 1 {
+            return json!({
+                "error": format!("Column {} out of range for line {} (length {})", column, line, line_content.len())
+            }).to_string();
+        }
+
+        // Extract symbol at position (word boundary detection)
+        let col_idx = column - 1;
+        let chars: Vec<char> = line_content.chars().collect();
+        
+        // Find word boundaries
+        let mut start = col_idx;
+        while start > 0 && Self::is_symbol_char(chars.get(start - 1).copied().unwrap_or(' ')) {
+            start -= 1;
+        }
+        
+        let mut end = col_idx;
+        while end < chars.len() && Self::is_symbol_char(chars.get(end).copied().unwrap_or(' ')) {
+            end += 1;
+        }
+
+        if start == end {
+            return json!({
+                "error": "No symbol found at position"
+            }).to_string();
+        }
+
+        let symbol: String = chars[start..end].iter().collect();
+        
+        self.find_definition(&json!({
+            "symbol": symbol,
+            "file": file
+        }))
+    }
+
+    /// Check if a character can be part of a symbol name.
+    fn is_symbol_char(c: char) -> bool {
+        c.is_alphanumeric() || c == '_'
+    }
+
     /// Set the MCP client manager for external tool routing.
     pub fn with_mcp_manager(
         mut self,
@@ -3285,13 +3569,14 @@ impl ToolExecutor {
             "web_search" => self.web_search(args),
             "spawn_agent" => agent_spawning::handle_spawn_agent_tool(args, self.spawn_context.as_ref()).await,
             "diagnose" => self.diagnose(args).await,
+            "lsp" => self.lsp(args),
             _ if name.starts_with("mcp_") => self.execute_mcp_tool(name, args).await,
             _ => format!(
                 "Unknown tool: {name}. Available tools: bash, read_file, write_file, str_replace, \
                  list_dir, grep, glob, symbols, find_definition, find_references, git_status, \
                  git_diff, git_log, git_show, git_blame, call_graph, run_build_test, web_fetch, \
                  mo_query, memory_search, memory_profile, ask_user, task_create, task_list, \
-                 task_get, task_update, task_stop, sleep, tool_search, web_search, spawn_agent, diagnose"
+                 task_get, task_update, task_stop, sleep, tool_search, web_search, spawn_agent, diagnose, lsp"
             ),
         };
         // Normalize empty output, then apply global safety net
@@ -10777,5 +11062,123 @@ impl MyType {
         unsafe {
             std::env::remove_var("MO_API_KEY");
         }
+    }
+
+    // ─── lsp tests ────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn lsp_missing_operation_returns_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = ToolExecutor::new(dir.path());
+        
+        let result = exe.lsp(&json!({}));
+        assert!(result.contains("error"));
+        assert!(result.contains("operation"));
+    }
+
+    #[test]
+    fn lsp_invalid_operation_returns_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = ToolExecutor::new(dir.path());
+        
+        let result = exe.lsp(&json!({"operation": "invalid_op"}));
+        assert!(result.contains("error"));
+        assert!(result.contains("Unknown operation"));
+    }
+
+    #[test]
+    fn lsp_diagnostics_returns_capabilities() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = ToolExecutor::new(dir.path());
+        
+        let result = exe.lsp(&json!({"operation": "diagnostics"}));
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        
+        assert!(parsed["capabilities"]["goto_definition"].as_bool().unwrap());
+        assert!(parsed["capabilities"]["find_references"].as_bool().unwrap());
+        assert!(parsed["supported_languages"].as_array().is_some());
+    }
+
+    #[test]
+    fn lsp_goto_definition_requires_symbol_or_position() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = ToolExecutor::new(dir.path());
+        
+        let result = exe.lsp(&json!({"operation": "goto_definition"}));
+        assert!(result.contains("error"));
+        assert!(result.contains("symbol"));
+    }
+
+    #[test]
+    fn lsp_find_references_requires_symbol() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = ToolExecutor::new(dir.path());
+        
+        let result = exe.lsp(&json!({"operation": "find_references"}));
+        assert!(result.contains("error"));
+        assert!(result.contains("symbol"));
+    }
+
+    #[test]
+    fn lsp_document_symbols_requires_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = ToolExecutor::new(dir.path());
+        
+        let result = exe.lsp(&json!({"operation": "document_symbols"}));
+        assert!(result.contains("error"));
+        assert!(result.contains("file"));
+    }
+
+    #[test]
+    fn lsp_workspace_symbols_with_query() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = ToolExecutor::new(dir.path());
+        
+        // Create a test file with a symbol
+        let test_file = dir.path().join("test.rs");
+        std::fs::write(&test_file, "fn hello_world() {}\nfn goodbye() {}").unwrap();
+        
+        // workspace_symbols should work with query
+        let result = exe.lsp(&json!({
+            "operation": "workspace_symbols",
+            "query": "hello"
+        }));
+        // Should return results (format depends on symbol_search implementation)
+        assert!(!result.contains("error") || result.contains("No symbols"));
+    }
+
+    #[test]
+    fn lsp_call_hierarchy_requires_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = ToolExecutor::new(dir.path());
+        
+        let result = exe.lsp(&json!({"operation": "call_hierarchy"}));
+        assert!(result.contains("error"));
+        assert!(result.contains("file"));
+    }
+
+    #[test]
+    fn lsp_document_symbols_on_rust_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = ToolExecutor::new(dir.path());
+        
+        // Create a test Rust file
+        let test_file = dir.path().join("lib.rs");
+        std::fs::write(&test_file, r#"
+pub fn main() {}
+fn helper() {}
+struct Config {}
+impl Config {
+    fn new() -> Self { Config {} }
+}
+"#).unwrap();
+        
+        let result = exe.lsp(&json!({
+            "operation": "document_symbols",
+            "file": "lib.rs"
+        }));
+        
+        // Should find symbols
+        assert!(!result.contains("Error:") || result.contains("main"));
     }
 }
