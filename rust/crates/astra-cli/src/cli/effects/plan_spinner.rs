@@ -4,11 +4,15 @@
 //! label during background plan execution. Used by `display_plan_updates_live`
 //! to provide visual feedback between plan update events.
 //!
-//! Format: `  [subtask] Ns Label ⣾`  or  `  [subtask] Ns/~ETAs Label ⣾`
+//! Format: `  ⬢ [subtask] Label                  3s ⣾`
+//! With ETA: `  ⬢ [subtask] Label              3s/~45s ⣾`
 
-use super::{SPINNER_FRAMES, clear_stderr_line, interruptible_sleep, term_width};
+use super::{
+    ICON_RUNNING, SPINNER_FRAMES, clear_stderr_line, interruptible_sleep, paint_unified_line,
+    term_width,
+};
 use crossterm::style::Stylize;
-use std::io::{self, IsTerminal, Write};
+use std::io::{self, IsTerminal};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -26,8 +30,8 @@ pub struct PlanActivitySpinner {
 impl PlanActivitySpinner {
     /// Start a plan activity spinner with the given subtask tag and label.
     ///
-    /// Example output: `  [api-auth] 3s Waiting for model ⣾`
-    /// With ETA:       `  [api-auth] 3s/~45s Waiting for model ⣾`
+    /// Example output: `  ⬢ [api-auth] Waiting for model      3s ⣾`
+    /// With ETA:       `  ⬢ [api-auth] Waiting for model  3s/~45s ⣾`
     ///
     /// Returns a no-op spinner if stderr is not a terminal.
     pub fn start(subtask_tag: &str, label: &str) -> Self {
@@ -42,16 +46,13 @@ impl PlanActivitySpinner {
         }
 
         let tag = truncate_tag(subtask_tag, 16);
-        let label = label.to_string();
+        let full_label = format!("[{tag}] {label}");
         let t0 = std::time::Instant::now();
         let w = term_width();
+        let icon = format!("{}", ICON_RUNNING.cyan());
 
         // Paint immediately — no startup delay for plan spinners.
-        {
-            let time_part = format!("{:>3}s", 0u64);
-            let frame = SPINNER_FRAMES[0];
-            paint_line(&tag, &time_part, &label, frame, w);
-        }
+        paint_unified_line(&icon, &full_label, "0s", SPINNER_FRAMES[0], w);
 
         let stop = Arc::new(AtomicBool::new(false));
         let stop2 = stop.clone();
@@ -68,11 +69,11 @@ impl PlanActivitySpinner {
                 let frame = SPINNER_FRAMES[spin_idx % SPINNER_FRAMES.len()];
                 spin_idx += 1;
                 let time_part = if eta > 0 {
-                    format!("{:>3}s/~{}s", sec, eta)
+                    format!("{sec}s/~{eta}s")
                 } else {
-                    format!("{:>3}s", sec)
+                    format!("{sec}s")
                 };
-                paint_line(&tag, &time_part, &label, frame, w);
+                paint_unified_line(&icon, &full_label, &time_part, frame, w);
             }
         });
         Self {
@@ -105,30 +106,6 @@ impl Drop for PlanActivitySpinner {
         }
         clear_stderr_line();
     }
-}
-
-/// Paint a single spinner frame to stderr.
-///
-/// Format: `  [tag] Ns label ⣾`
-fn paint_line(tag: &str, time_part: &str, label: &str, frame: char, w: usize) {
-    let tag_part = format!("[{tag}]");
-    let visible = 2
-        + tag_part.chars().count()
-        + 1
-        + time_part.chars().count()
-        + 1
-        + label.chars().count()
-        + 1
-        + 1;
-    eprint!("\r  ");
-    eprint!("{}", tag_part.dim());
-    eprint!(" {}", time_part.dim());
-    eprint!(" {}", label.dim());
-    eprint!(" {}", format!("{frame}").yellow());
-    if visible + 1 < w {
-        eprint!("{}", " ".repeat(w - visible - 1));
-    }
-    let _ = io::stderr().flush();
 }
 
 /// Truncate a subtask tag to fit in the spinner line.

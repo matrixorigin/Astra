@@ -677,8 +677,10 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                 .render
                 .format_output_summary(tool, &output, status)
                 .unwrap_or_default();
+            let tool_description = self.render.format_tool_description(tool, args);
             let _ = tx.send(super::chat_stream::StreamEvent::ToolCompleted {
                 name: tool.to_string(),
+                description: tool_description,
                 status: status.to_string(),
                 duration_ms,
                 output_summary: if output_summary.is_empty() {
@@ -960,7 +962,7 @@ impl StreamRenderState {
         let use_pane = rows > 0 && io::stdout().is_terminal() && !self.suppress_reasoning_viewport;
         if !use_pane && io::stderr().is_terminal() {
             self.thinking_spinner = Some(ThinkingSpinnerKind::Classic(Spinner::start(
-                "  Thinking".to_string(),
+                "Thinking".to_string(),
             )));
         }
     }

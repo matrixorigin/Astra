@@ -4,10 +4,13 @@
 //! - [`ToolRunningLineSpinner`]: stderr spinner for markdown mode
 //! - [`ToolStdoutLineAnim`]: stdout animation via TerminalRegion for raw mode
 
-use super::super::terminal_region::{TerminalRegion, visible_char_width};
-use super::{SPINNER_FRAMES, clear_stderr_line, interruptible_sleep, term_width};
+use super::super::terminal_region::TerminalRegion;
+use super::{
+    ICON_RUNNING, SPINNER_FRAMES, clear_stderr_line, interruptible_sleep, paint_unified_line,
+    term_width,
+};
 use crossterm::style::Stylize;
-use std::io::{self, IsTerminal, Write};
+use std::io::{self, IsTerminal};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -20,7 +23,7 @@ pub struct ToolRegionState {
 
 /// stderr `\r` status while a tool runs (markdown mode).
 ///
-/// Format: `  Ns Running… <description> ⣾`
+/// Format: `  ⬢ description                       3s ⣾`
 pub struct ToolRunningLineSpinner {
     stop: Arc<AtomicBool>,
     handle: Option<std::thread::JoinHandle<()>>,
@@ -40,31 +43,15 @@ impl ToolRunningLineSpinner {
         let detail = truncate_cli_status_detail(&description, 48);
         let t0 = Instant::now();
         let w = term_width();
-        let label = "Running…";
+        let icon = format!("{}", ICON_RUNNING.cyan());
 
-        {
-            let time_part = format!("{:>3}s", 0u64);
-            let frame = SPINNER_FRAMES[0];
-            let plain = format!("  {time_part} {label} {detail} {frame}");
-            let visible = visible_char_width(&plain);
-            eprint!("\r  ");
-            eprint!("{}", time_part.dim());
-            eprint!(" {}", label.dim());
-            eprint!(" {}", detail.as_str().dim());
-            eprint!(" {}", format!("{frame}").yellow());
-            if visible + 1 < w {
-                eprint!("{}", " ".repeat(w - visible - 1));
-            }
-            let _ = io::stderr().flush();
-        }
+        paint_unified_line(&icon, &detail, "0s", SPINNER_FRAMES[0], w);
 
         let stop = Arc::new(AtomicBool::new(false));
         let stop2 = stop.clone();
-        let detail_for_thread = detail.clone();
         let handle = std::thread::spawn(move || {
             let tick = std::time::Duration::from_millis(50);
             let mut spin_idx = 1usize;
-            // Use Acquire to pair with Release in stop_clear()/Drop
             while !stop2.load(Ordering::Acquire) {
                 if !interruptible_sleep(tick, &stop2) {
                     return;
@@ -72,18 +59,8 @@ impl ToolRunningLineSpinner {
                 let sec = t0.elapsed().as_secs();
                 let frame = SPINNER_FRAMES[spin_idx % SPINNER_FRAMES.len()];
                 spin_idx += 1;
-                let time_part = format!("{:>3}s", sec);
-                let plain = format!("  {time_part} {label} {detail_for_thread} {frame}");
-                let visible = visible_char_width(&plain);
-                eprint!("\r  ");
-                eprint!("{}", time_part.dim());
-                eprint!(" {}", label.dim());
-                eprint!(" {}", detail_for_thread.as_str().dim());
-                eprint!(" {}", format!("{frame}").yellow());
-                if visible + 1 < w {
-                    eprint!("{}", " ".repeat(w - visible - 1));
-                }
-                let _ = io::stderr().flush();
+                let time_part = format!("{sec}s");
+                paint_unified_line(&icon, &detail, &time_part, frame, w);
             }
         });
         Self {
@@ -94,7 +71,6 @@ impl ToolRunningLineSpinner {
 
     /// Stop the spinner and clear its line.
     pub fn stop_clear(mut self) {
-        // Use Release to pair with Acquire in the spinner thread
         self.stop.store(true, Ordering::Release);
         if let Some(h) = self.handle.take() {
             let _ = h.join();
@@ -105,12 +81,10 @@ impl ToolRunningLineSpinner {
 
 impl Drop for ToolRunningLineSpinner {
     fn drop(&mut self) {
-        // Use Release to pair with Acquire in the spinner thread
         self.stop.store(true, Ordering::Release);
         if let Some(h) = self.handle.take() {
             let _ = h.join();
         }
-        // Clear line on drop too (e.g., panic unwind)
         clear_stderr_line();
     }
 }

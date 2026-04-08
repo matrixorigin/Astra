@@ -245,9 +245,9 @@ pub async fn on_subtask_complete(
 
     // 3. Run verification with progress indication + spinner
     let label = if has_local_criteria {
-        format!("🔍 Verifying: {subtask_id}")
+        format!("Verifying: {subtask_id}")
     } else {
-        format!("🔍 Verifying (LLM / deferred criteria): {subtask_id}")
+        format!("Verifying (LLM): {subtask_id}")
     };
     let spinner = super::stream_render::Spinner::start(label);
     let result = durable.lifecycle.verify_subtask(&task_id, subtask_id).await;
@@ -382,7 +382,7 @@ pub async fn on_plan_complete(durable: &mut DurableTaskState) -> bool {
         eprintln!("      {} {}", "▸".grey(), cmd_hint);
     }
 
-    let spinner = super::stream_render::Spinner::start("🔬 Running global checks".into());
+    let spinner = super::stream_render::Spinner::start("Running global checks".into());
     let verify_result = durable.lifecycle.verify_global(&task_id).await;
     spinner.stop_clear();
 

@@ -3558,9 +3558,9 @@ fn display_plan_updates_live(
                     .map(|d| format!(" ({})", format_duration_short(d)))
                     .unwrap_or_default();
                 if verification_passed {
-                    (format!("  ✅ {id}{dur}"), PostSpinner::None)
+                    (format!("  {} {id}{}", theme::icon_ok(), dur.dim()), PostSpinner::Activity("Next subtask".to_string()))
                 } else {
-                    (format!("  ⚠ {id} — verification failed{dur}"), PostSpinner::None)
+                    (format!("  {} {id} — verification failed{}", theme::icon_warn(), dur.dim()), PostSpinner::Activity("Next subtask".to_string()))
                 }
             }
             PlanUpdate::SubtaskTurnResult {
@@ -3590,21 +3590,14 @@ fn display_plan_updates_live(
                     state.plan_run_task_last_progress =
                         Some((pct, done as u32, total as u32));
                 }
-                let pct = if total > 0 { done * 100 / total } else { 0 };
-                let eta_str = eta
-                    .map(|d| format!(" — ETA ~{}", format_duration_short(d)))
-                    .unwrap_or_default();
                 // Feed ETA into the active spinner (only PlanActivitySpinner supports it)
                 if let Some(PlanSpinner::Activity(spinner)) = plan_spinner.as_ref() {
                     spinner.set_eta_secs(eta.map(|d| d.as_secs()).unwrap_or(0));
                 }
-                (
-                    format!(
-                        "  📊 {done}/{total} ({pct}%) — {}{eta_str}",
-                        format_duration_short(elapsed),
-                    ),
-                    PostSpinner::None,
-                )
+                // Don't print progress line or stop spinner — just update state silently.
+                // The spinner keeps running so the user always sees activity.
+                let _ = (elapsed, eta); // suppress unused warnings
+                continue;
             }
             PlanUpdate::PlanCompleted { pct, elapsed } => {
                 // Stop spinner
@@ -3710,6 +3703,10 @@ fn display_plan_updates_live(
                     s.stop_clear();
                 }
                 durable_bridge::display_verification_report(&report);
+                // Start a spinner so the user sees activity between verification and next event
+                *plan_spinner = Some(PlanSpinner::Activity(
+                    effects::PlanActivitySpinner::start(current_subtask_tag, "Continuing"),
+                ));
                 continue;
             }
             PlanUpdate::SubtaskRetry {
@@ -3750,17 +3747,18 @@ fn display_plan_updates_live(
                     }
                     StreamEvent::ToolCompleted {
                         name,
+                        description,
                         status,
                         duration_ms,
                         output_summary,
                     } => {
                         let dur = cli_formatting::format_duration_suffix(duration_ms);
                         let icon = if status == "error" { theme::icon_err() } else { theme::icon_ok() };
+                        let styled = stream_render::style_tool_description(&name, &description);
                         let summary = output_summary
                             .map(|s| format!("\n    {}", s.dim()))
                             .unwrap_or_default();
-                        // Re-use the description from the name for completion line
-                        (format!("  {icon} {name}{}{summary}", dur.dim()), PostSpinner::None)
+                        (format!("  {icon} {styled}{}{summary}", dur.dim()), PostSpinner::None)
                     }
                     StreamEvent::WaitingForModel => {
                         finalize_plan_stream(&mut state.plan_in_token_stream, plan_spinner, &mut state.plan_md_renderer, &mut state.plan_thinking_pane);

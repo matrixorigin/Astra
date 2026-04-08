@@ -92,6 +92,48 @@ pub fn interruptible_sleep(duration: std::time::Duration, stop: &AtomicBool) -> 
     !stop.load(Ordering::Acquire)
 }
 
+// ═══════════════════════════════════════════════════════════ Unified paint ══
+
+/// Unified spinner line painter.
+///
+/// All spinner types use this to get a consistent format:
+/// ```text
+///   ⬢ Description                              3s ⣾
+///   ⬢ [tag] Label                           12s/~45s ⣾
+/// ```
+///
+/// - `icon`: pre-styled icon string (e.g., `"⬢".cyan()`)
+/// - `label`: description text (rendered dim)
+/// - `time_part`: pre-formatted time string (e.g., `"3s"` or `"12s/~45s"`)
+/// - `frame`: current braille animation character
+/// - `w`: terminal width
+pub fn paint_unified_line(icon: &str, label: &str, time_part: &str, frame: char, w: usize) {
+    use crossterm::style::Stylize;
+    // Visible widths: "  " + icon + " " + label + "  " + time + " " + frame
+    let icon_vis = icon.chars().count();
+    let label_vis = label.chars().count();
+    let time_vis = time_part.chars().count();
+    let left_vis = 2 + icon_vis + 1 + label_vis;
+    let right_vis = 2 + time_vis + 1 + 1; // 2 spaces gap + time + space + frame
+    let fill = w.saturating_sub(left_vis + right_vis + 1); // +1 margin
+
+    eprint!("\r  {icon} ");
+    eprint!("{}", label.dim());
+    if fill > 0 {
+        eprint!("{}", " ".repeat(fill));
+    }
+    eprint!("  {}", time_part.dim());
+    eprint!(" {}", format!("{frame}").yellow());
+    let total = left_vis + fill + right_vis;
+    if total + 1 < w {
+        eprint!("{}", " ".repeat(w - total - 1));
+    }
+    let _ = io::stderr().flush();
+}
+
+/// Standard icon for running operations (tool calls, system states).
+pub const ICON_RUNNING: &str = "⬢";
+
 /// Which kind of spinner is shown in the single "thinking" stderr slot.
 pub enum ThinkingSpinnerKind {
     /// Classic prefix+braille spinner (e.g., "  Thinking ⣾").

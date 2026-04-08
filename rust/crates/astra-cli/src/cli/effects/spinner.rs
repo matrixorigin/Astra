@@ -1,14 +1,19 @@
 //! Classic prefix + braille spinner on stderr.
+//!
+//! Format: `  ⬢ Thinking                          3s ⣾`
 
-use super::{SPINNER_FRAMES, SPINNER_SHOW_DELAY_MS, clear_stderr_line, interruptible_sleep};
+use super::{
+    ICON_RUNNING, SPINNER_FRAMES, SPINNER_SHOW_DELAY_MS, clear_stderr_line, interruptible_sleep,
+    paint_unified_line, term_width,
+};
 use crossterm::style::Stylize;
-use std::io::{self, IsTerminal, Write};
+use std::io::{self, IsTerminal};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /// A spinner that runs in a background thread.
 ///
-/// Shows a prefix text (e.g., "  Thinking") followed by rotating braille characters.
+/// Shows a running icon with a label, right-aligned elapsed time, and braille animation.
 /// The spinner is delayed by [`SPINNER_SHOW_DELAY_MS`] to avoid flicker on fast operations.
 pub struct Spinner {
     stop: Arc<AtomicBool>,
@@ -16,7 +21,7 @@ pub struct Spinner {
 }
 
 impl Spinner {
-    /// Start a spinner with the given prefix text (e.g., "  Thinking").
+    /// Start a spinner with the given prefix text (e.g., "Thinking").
     ///
     /// The spinner runs on stderr with `\r` carriage return for in-place updates.
     /// Returns a no-op spinner if stderr is not a terminal.
@@ -40,24 +45,21 @@ impl Spinner {
             };
         }
 
+        let w = term_width();
+        let icon = format!("{}", ICON_RUNNING.cyan());
+
         // Paint the first frame on the calling thread so the user sees feedback
         // before the background thread is scheduled (avoids a blank gap).
         if !delay {
-            let frame = SPINNER_FRAMES[0];
-            eprint!(
-                "\r  {} {}",
-                prefix.as_str().cyan(),
-                format!("{frame}").yellow()
-            );
-            let _ = io::stderr().flush();
+            paint_unified_line(&icon, &prefix, "0s", SPINNER_FRAMES[0], w);
         }
 
         let stop = Arc::new(AtomicBool::new(false));
         let stop2 = stop.clone();
         let start_idx = if delay { 0usize } else { 1usize };
+        let t0 = std::time::Instant::now();
         let handle = std::thread::spawn(move || {
             if delay {
-                // Interruptible delay — can wake early if stop is set
                 if !interruptible_sleep(
                     std::time::Duration::from_millis(SPINNER_SHOW_DELAY_MS),
                     &stop2,
@@ -66,17 +68,12 @@ impl Spinner {
                 }
             }
             let mut idx = start_idx;
-            // Use Acquire to pair with Release in stop_clear()/Drop
             while !stop2.load(Ordering::Acquire) {
+                let sec = t0.elapsed().as_secs();
                 let frame = SPINNER_FRAMES[idx % SPINNER_FRAMES.len()];
-                eprint!(
-                    "\r  {} {}",
-                    prefix.as_str().cyan(),
-                    format!("{frame}").yellow()
-                );
-                let _ = io::stderr().flush();
+                let time_part = format!("{sec}s");
+                paint_unified_line(&icon, &prefix, &time_part, frame, w);
                 idx += 1;
-                // Use interruptible sleep so stop_clear() doesn't block
                 if !interruptible_sleep(std::time::Duration::from_millis(80), &stop2) {
                     return;
                 }
@@ -90,7 +87,6 @@ impl Spinner {
 
     /// Stop the spinner and clear its line.
     pub fn stop_clear(mut self) {
-        // Use Release to pair with Acquire in the spinner thread
         self.stop.store(true, Ordering::Release);
         if let Some(h) = self.handle.take() {
             let _ = h.join();
@@ -101,12 +97,10 @@ impl Spinner {
 
 impl Drop for Spinner {
     fn drop(&mut self) {
-        // Use Release to pair with Acquire in the spinner thread
         self.stop.store(true, Ordering::Release);
         if let Some(h) = self.handle.take() {
             let _ = h.join();
         }
-        // Clear line on drop too (e.g., panic unwind)
         clear_stderr_line();
     }
 }

@@ -3,7 +3,10 @@
 //! - [`PlanAssembleLineSpinner`]: Shows progress during plan assembly
 //! - [`ChatTurnPrepLineGuard`]: RAII guard for chat request preparation
 
-use super::{SPINNER_FRAMES, SPINNER_SHOW_DELAY_MS, interruptible_sleep, term_width};
+use super::{
+    ICON_RUNNING, SPINNER_FRAMES, SPINNER_SHOW_DELAY_MS, interruptible_sleep, paint_unified_line,
+    term_width,
+};
 use crossterm::style::Stylize;
 use std::io::{self, IsTerminal, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -100,9 +103,8 @@ impl PlanAssembleLineSpinner {
         let stop2 = stop.clone();
         let handle = std::thread::spawn(move || {
             let t0 = origin;
-            // Chat request prep paints immediately (the user just finished a tool round
-            // or typed a message — any gap feels like a freeze).  Plan-assemble keeps
-            // the delay to avoid flicker on fast operations.
+            let icon = format!("{}", ICON_RUNNING.cyan());
+            // Chat request prep paints immediately; plan-assemble keeps the delay.
             let skip_delay = matches!(kind, SecStatusLineKind::ChatRequestPrep);
             if !skip_delay {
                 if !interruptible_sleep(
@@ -120,11 +122,8 @@ impl PlanAssembleLineSpinner {
                 std::time::Duration::from_millis(200)
             };
             let w = term_width();
-            let mut last_shown_sec: Option<u64> = None;
             let mut spin_idx = 0usize;
-            // Use Acquire to pair with Release in stop_clear()/Drop
             while !stop2.load(Ordering::Acquire) {
-                // `Release` store in `fetch_chat_turn_sse` after successful POST headers.
                 if line_release
                     .as_ref()
                     .is_some_and(|r| r.load(Ordering::Acquire))
@@ -134,26 +133,15 @@ impl PlanAssembleLineSpinner {
                     return;
                 }
                 let sec = t0.elapsed().as_secs();
+                let frame = SPINNER_FRAMES[spin_idx % SPINNER_FRAMES.len()];
+                spin_idx += 1;
+                let time_part = format!("{sec}s");
+
                 match kind {
                     SecStatusLineKind::PlanAssemble => {
-                        if last_shown_sec != Some(sec) {
-                            last_shown_sec = Some(sec);
-                            let line = format!(
-                                "  ⋯ Assembling plan · {:>3}s  (build · network · server · first token)",
-                                sec
-                            );
-                            let visible = line.chars().count();
-                            eprint!("\r{}", line);
-                            // Leave 1 char margin to avoid terminal auto-wrap at exact line width
-                            if visible + 1 < w {
-                                eprint!("{}", " ".repeat(w - visible - 1));
-                            }
-                            let _ = io::stderr().flush();
-                        }
+                        paint_unified_line(&icon, "Assembling plan", &time_part, frame, w);
                     }
                     SecStatusLineKind::ChatRequestPrep => {
-                        spin_idx += 1;
-                        let frame = SPINNER_FRAMES[spin_idx % SPINNER_FRAMES.len()];
                         let phase_raw: String = chat_prep_phase
                             .as_ref()
                             .and_then(|p| p.read().ok())
@@ -173,23 +161,9 @@ impl PlanAssembleLineSpinner {
                                 }
                             })
                             .unwrap_or_else(|| "Working…".to_string());
-                        let time_part = format!("{:>3}s", sec);
-                        // Phase + elapsed first; braille animation trails at the end.
-                        let visible =
-                            2 + time_part.chars().count() + 1 + phase_raw.chars().count() + 1 + 1;
-                        eprint!("\r  ");
-                        eprint!("{}", time_part.dim());
-                        eprint!(" {}", phase_raw.dim());
-                        eprint!(" {}", format!("{frame}").yellow());
-                        // Leave 1 char margin to avoid terminal auto-wrap at exact line width
-                        if visible + 1 < w {
-                            eprint!("{}", " ".repeat(w - visible - 1));
-                        }
-                        let _ = io::stderr().flush();
-                        last_shown_sec = Some(sec);
+                        paint_unified_line(&icon, &phase_raw, &time_part, frame, w);
                     }
                 }
-                // Use interruptible sleep so stop_clear() doesn't block waiting for tick
                 if !interruptible_sleep(tick, &stop2) {
                     return;
                 }
@@ -203,7 +177,6 @@ impl PlanAssembleLineSpinner {
 
     /// Stop the spinner and clear its line.
     pub fn stop_clear(mut self) {
-        // Use Release to pair with Acquire in the spinner thread
         self.stop.store(true, Ordering::Release);
         if let Some(h) = self.handle.take() {
             let _ = h.join();
@@ -214,7 +187,6 @@ impl PlanAssembleLineSpinner {
     /// Clear the spinner line on stderr.
     fn clear_line() {
         let w = term_width();
-        // Leave 1 char margin to avoid terminal auto-wrap at exact line width
         eprint!("\r{}\r", " ".repeat(w.saturating_sub(1)));
         let _ = io::stderr().flush();
     }
@@ -222,12 +194,10 @@ impl PlanAssembleLineSpinner {
 
 impl Drop for PlanAssembleLineSpinner {
     fn drop(&mut self) {
-        // Use Release to pair with Acquire in the spinner thread
         self.stop.store(true, Ordering::Release);
         if let Some(h) = self.handle.take() {
             let _ = h.join();
         }
-        // Clear line on drop too (e.g., panic unwind) to avoid residual spinner
         Self::clear_line();
     }
 }

@@ -27,6 +27,7 @@ pub enum StreamEvent {
     /// Tool execution completed.
     ToolCompleted {
         name: String,
+        description: String,
         status: String,
         duration_ms: u64,
         output_summary: Option<String>,
