@@ -68,8 +68,10 @@ pub async fn execute_send_message(
     let target = match target_str.to_lowercase().as_str() {
         "parent" | "orchestrator" => MessageTarget::Parent,
         "broadcast" | "all" | "peers" => {
-            let did = mailbox.delegation_id.clone().unwrap_or_default();
-            MessageTarget::Broadcast { delegation_id: did }
+            match mailbox.delegation_id.clone().filter(|s| !s.is_empty()) {
+                Some(did) => MessageTarget::Broadcast { delegation_id: did },
+                None => return "Error: cannot broadcast — agent is not part of a delegation group.".to_string(),
+            }
         }
         agent_id => MessageTarget::Direct {
             address: super::types::AgentAddress {

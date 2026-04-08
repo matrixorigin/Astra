@@ -147,7 +147,7 @@ pub struct AgentMessage {
     pub correlation_id: Option<String>,
     /// Time-to-live in milliseconds. `None` = no expiry.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub ttl_ms: Option<u64>,
+    pub ttl_ms: Option<i64>,
 }
 
 impl AgentMessage {
@@ -171,9 +171,14 @@ impl AgentMessage {
         self
     }
 
-    /// Set a TTL.
+    /// Set a TTL. Saturates at i64::MAX milliseconds (~292 million years).
     pub fn with_ttl(mut self, ttl: Duration) -> Self {
-        self.ttl_ms = Some(ttl.as_millis() as u64);
+        let millis = ttl.as_millis();
+        self.ttl_ms = Some(if millis > i64::MAX as u128 {
+            i64::MAX
+        } else {
+            millis as i64
+        });
         self
     }
 
@@ -181,7 +186,8 @@ impl AgentMessage {
     pub fn is_expired(&self) -> bool {
         if let Some(ttl_ms) = self.ttl_ms {
             let now_ms = chrono::Utc::now().timestamp_millis();
-            (now_ms - self.timestamp_ms) >= ttl_ms as i64
+            let elapsed = now_ms.saturating_sub(self.timestamp_ms);
+            elapsed >= ttl_ms
         } else {
             false
         }

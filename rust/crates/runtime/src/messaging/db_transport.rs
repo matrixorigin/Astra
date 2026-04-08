@@ -135,7 +135,7 @@ impl DatabaseTransport {
         let result = query(
             "DELETE FROM agent_message_queue
              WHERE ttl_ms IS NOT NULL
-               AND (timestamp_ms + ttl_ms) < ?",
+               AND timestamp_ms < (? - ttl_ms)",
         )
         .bind(now_ms)
         .execute(&self.pool)
@@ -193,7 +193,7 @@ impl DatabaseTransport {
         .bind(is_broadcast)
         .bind(&payload_json)
         .bind(msg.timestamp_ms)
-        .bind(msg.ttl_ms.map(|t| t as i64))
+        .bind(msg.ttl_ms)
         .execute(&self.pool)
         .await
         .map_err(|e| MailboxError::Transport(format!("insert: {e}")))?;
@@ -315,8 +315,17 @@ async fn poll_loop(
 
         if let Ok(rows) = direct_result {
             for row in rows {
-                let row_id: i64 = row.try_get("id").unwrap_or(0);
-                let json: String = row.try_get("payload_json").unwrap_or_default();
+                let row_id: i64 = match row.try_get("id") {
+                    Ok(id) => id,
+                    Err(_) => continue, // skip corrupted row, don't reset cursor
+                };
+                let json: String = match row.try_get("payload_json") {
+                    Ok(j) => j,
+                    Err(_) => {
+                        last_direct_id = last_direct_id.max(row_id);
+                        continue; // skip but advance cursor past this row
+                    }
+                };
 
                 if let Ok(msg) = serde_json::from_str::<AgentMessage>(&json) {
                     if !msg.is_expired() {
@@ -327,6 +336,8 @@ async fn poll_loop(
                 }
                 last_direct_id = last_direct_id.max(row_id);
             }
+        } else {
+            eprintln!("  ⚠ messaging: direct poll error for {}@{}: {:?}", addr.agent_id, addr.run_id, direct_result.unwrap_err());
         }
 
         // 2. Poll broadcast messages (if in a delegation group).
@@ -344,8 +355,17 @@ async fn poll_loop(
 
             if let Ok(rows) = broadcast_result {
                 for row in rows {
-                    let row_id: i64 = row.try_get("id").unwrap_or(0);
-                    let json: String = row.try_get("payload_json").unwrap_or_default();
+                    let row_id: i64 = match row.try_get("id") {
+                        Ok(id) => id,
+                        Err(_) => continue,
+                    };
+                    let json: String = match row.try_get("payload_json") {
+                        Ok(j) => j,
+                        Err(_) => {
+                            last_broadcast_id = last_broadcast_id.max(row_id);
+                            continue;
+                        }
+                    };
 
                     if let Ok(msg) = serde_json::from_str::<AgentMessage>(&json) {
                         if !msg.is_expired() {
@@ -356,6 +376,8 @@ async fn poll_loop(
                     }
                     last_broadcast_id = last_broadcast_id.max(row_id);
                 }
+            } else {
+                eprintln!("  ⚠ messaging: broadcast poll error for delegation {}: {:?}", did, broadcast_result.unwrap_err());
             }
         }
 
