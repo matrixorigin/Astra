@@ -383,4 +383,18 @@ pub mod tests {
                 .contains("some conversation")
         );
     }
+
+    #[tokio::test]
+    async fn ptl_retry_with_minimum_rounds() {
+        // Exactly 2 messages (1 round) — can't drop below minimum, returns None
+        let client = MockSummaryClient::always_ptl();
+        let msgs = vec![
+            json!({"role": "user", "content": "single question"}),
+            json!({"role": "assistant", "content": "single answer"}),
+        ];
+        let result = generate_compact_summary(&msgs, &client).await;
+        assert!(result.is_none());
+        // Should give up quickly — can't drop the only round
+        assert!(client.call_count.load(Ordering::SeqCst) <= 2);
+    }
 }

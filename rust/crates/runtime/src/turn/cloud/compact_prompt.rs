@@ -490,4 +490,56 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn format_structured_summary_all_sections_missing() {
+        let input = "Just some plain text with no section headers at all.";
+        let result = format_structured_summary(input);
+        assert!(result.contains("[compact warning: missing sections:"));
+        assert!(result.contains("### Primary Request"));
+        assert!(result.contains("### Pending Tasks"));
+        assert!(result.contains("### Current Work"));
+        assert!(result.contains("### Current State"));
+        assert!(result.contains("Just some plain text"));
+    }
+
+    #[test]
+    fn format_structured_summary_partial_empty_sections() {
+        let input = "### Primary Request\n\n### Current State\n";
+        let result = format_structured_summary(input);
+        // Missing Pending Tasks and Current Work
+        assert!(result.contains("[compact warning: missing sections:"));
+        assert!(result.contains("### Pending Tasks"));
+        assert!(result.contains("### Current Work"));
+        // The present (even if empty) sections are preserved
+        assert!(result.contains("### Primary Request"));
+        assert!(result.contains("### Current State"));
+    }
+
+    #[test]
+    fn render_messages_for_summary_empty_input() {
+        let rendered = render_messages_for_summary(&[]);
+        assert!(rendered.is_empty());
+    }
+
+    #[test]
+    fn render_messages_tool_result_null_content() {
+        let msgs = vec![json!({"role": "tool", "content": null, "tool_call_id": "c1"})];
+        // Should not panic
+        let rendered = render_messages_for_summary(&msgs);
+        assert!(rendered.contains("[TOOL RESULT]"));
+    }
+
+    #[test]
+    fn strip_analysis_nested_tags() {
+        // Nested analysis tags: the while-loop strips the first <analysis>…</analysis>
+        // pair (inner close), leaving the outer close tag as a remnant.
+        // This documents current behaviour — no panic, outer content preserved.
+        let input = "<analysis>outer<analysis>inner</analysis>more</analysis>rest";
+        let result = strip_analysis_block(input);
+        assert!(!result.contains("<analysis>"), "opening tags should be removed");
+        // The trailing </analysis> remains because there is no matching open tag
+        assert!(result.contains("rest"));
+        assert!(result.contains("more"));
+    }
 }
