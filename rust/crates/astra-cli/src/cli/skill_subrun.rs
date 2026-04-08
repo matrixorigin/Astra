@@ -80,6 +80,7 @@ impl AgenticLoopHost for SubRunHost {
         let mut payload = chat_turn_base_payload(ChatTurnBasePayloadInput {
             messages: &state.messages,
             session_id: state.current_session_id.as_deref(),
+            agent_id: Some("astra-cli"),
             model: effective_model,
             explain_verbose: false,
             explain_on: false,

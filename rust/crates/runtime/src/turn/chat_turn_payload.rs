@@ -14,6 +14,7 @@ use super::tool_schema_prune::filter_tool_schemas_by_excluded_names;
 pub struct ChatTurnBasePayloadInput<'a> {
     pub messages: &'a [Value],
     pub session_id: Option<&'a str>,
+    pub agent_id: Option<&'a str>,
     pub model: Option<&'a str>,
     pub explain_verbose: bool,
     pub explain_on: bool,
@@ -34,6 +35,7 @@ pub fn chat_turn_base_payload(input: ChatTurnBasePayloadInput<'_>) -> Value {
     let ChatTurnBasePayloadInput {
         messages,
         session_id,
+        agent_id,
         model,
         explain_verbose,
         explain_on,
@@ -46,6 +48,7 @@ pub fn chat_turn_base_payload(input: ChatTurnBasePayloadInput<'_>) -> Value {
     let mut payload = json!({
         "messages": messages,
         "session_id": session_id,
+        "agent_id": agent_id,
         "model": model,
         "explain": chat_turn_explain_field_json(explain_verbose, explain_on),
         "edge_executor_id": edge_executor_id,
@@ -151,6 +154,7 @@ mod tests {
         let p = chat_turn_base_payload(ChatTurnBasePayloadInput {
             messages: &msgs,
             session_id: None,
+            agent_id: Some("test-agent"),
             model: Some("gpt-test"),
             explain_verbose: false,
             explain_on: true,
@@ -179,6 +183,7 @@ mod tests {
         let p = chat_turn_base_payload(ChatTurnBasePayloadInput {
             messages: &[],
             session_id: Some("sess-1"),
+            agent_id: None,
             model: Some("m"),
             explain_verbose: true,
             explain_on: false,
@@ -197,6 +202,7 @@ mod tests {
         let p = chat_turn_base_payload(ChatTurnBasePayloadInput {
             messages: &[],
             session_id: None,
+            agent_id: None,
             model: Some("claude-thinking"),
             explain_verbose: false,
             explain_on: false,
@@ -214,6 +220,7 @@ mod tests {
         let p = chat_turn_base_payload(ChatTurnBasePayloadInput {
             messages: &[],
             session_id: None,
+            agent_id: None,
             model: Some("gpt-4o"),
             explain_verbose: false,
             explain_on: false,

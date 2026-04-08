@@ -146,6 +146,7 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
     let mut payload = chat_turn_base_payload(ChatTurnBasePayloadInput {
         messages: ctx.messages,
         session_id: ctx.current_session_id,
+        agent_id: Some("astra-cli"),
         model: ctx.model,
         explain_verbose: ctx.explain.explain_verbose,
         explain_on: ctx.explain.explain_on,
