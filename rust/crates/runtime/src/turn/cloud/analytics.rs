@@ -1553,4 +1553,147 @@ mod tests {
         assert_eq!(protected, 0);
         assert_eq!(ids.len(), 1);
     }
+
+    // ── Edge-case tests: extract_file_paths ──
+
+    #[test]
+    fn extract_file_paths_unicode() {
+        let paths = extract_file_paths("修改 src/文件.rs 和 café/test.py");
+        assert!(paths.contains(&"src/文件.rs".to_string()));
+        assert!(paths.contains(&"café/test.py".to_string()));
+    }
+
+    #[test]
+    fn extract_file_paths_no_extension_special_files() {
+        // Makefile, Dockerfile, README have no extension and no separator
+        let paths = extract_file_paths("update Makefile and Dockerfile and README");
+        assert!(!paths.contains(&"Makefile".to_string()));
+        assert!(!paths.contains(&"Dockerfile".to_string()));
+        assert!(!paths.contains(&"README".to_string()));
+    }
+
+    #[test]
+    fn extract_file_paths_deeply_nested() {
+        let paths = extract_file_paths("check a/b/c/d/e/f/g/h/i/j.rs");
+        assert!(paths.contains(&"a/b/c/d/e/f/g/h/i/j.rs".to_string()));
+    }
+
+    #[test]
+    fn extract_file_paths_with_line_numbers() {
+        // src/main.rs:42 — colon is trimmed from edges by trim_matches,
+        // but the internal `:42` suffix remains. The path still gets extracted
+        // because it contains a separator (`/`).
+        let paths = extract_file_paths("error at src/main.rs:42");
+        assert!(
+            paths.iter().any(|p| p.starts_with("src/main.rs")),
+            "path with line number suffix should be extracted: {:?}",
+            paths
+        );
+    }
+
+    // ── Edge-case tests: hot file protection ──
+
+    #[test]
+    fn protect_hot_file_basename_collision() {
+        // Two hot files with same basename — both should be in hot set
+        let messages = vec![
+            json!({"role": "user", "content": "compare src/main.rs and lib/main.rs"}),
+            json!({"role": "assistant", "content": "", "tool_calls": [
+                {"id": "c1", "function": {"name": "read_file", "arguments": "{\"path\":\"src/main.rs\"}"}}
+            ]}),
+            json!({"role": "tool", "tool_call_id": "c1", "content": "src/main.rs content here"}),
+            json!({"role": "assistant", "content": "", "tool_calls": [
+                {"id": "c2", "function": {"name": "read_file", "arguments": "{\"path\":\"lib/main.rs\"}"}}
+            ]}),
+            json!({"role": "tool", "tool_call_id": "c2", "content": "lib/main.rs content here"}),
+            json!({"role": "assistant", "content": "", "tool_calls": [
+                {"id": "c3", "function": {"name": "bash", "arguments": "{\"command\":\"ls\"}"}}
+            ]}),
+            json!({"role": "tool", "tool_call_id": "c3", "content": "unrelated output"}),
+        ];
+        let hot = collect_hot_files(&messages, 5);
+        assert!(hot.contains("src/main.rs"));
+        assert!(hot.contains("lib/main.rs"));
+        assert!(hot.contains("main.rs")); // basename
+
+        let mut ids = vec!["c1".to_string(), "c2".to_string(), "c3".to_string()];
+        let protected = protect_hot_file_results(&mut ids, &messages, &hot);
+        assert_eq!(protected, 2); // both c1 and c2 protected
+        assert_eq!(ids, vec!["c3".to_string()]);
+    }
+
+    #[test]
+    fn tool_result_references_multiple_hot_files() {
+        // Tool result mentions 3 hot files — one match is enough for protection
+        let messages = vec![
+            json!({"role": "user", "content": "check src/a.rs and src/b.rs and src/c.rs"}),
+            json!({"role": "assistant", "content": "", "tool_calls": [
+                {"id": "c1", "function": {"name": "bash", "arguments": "{\"command\":\"grep\"}"}}
+            ]}),
+            json!({"role": "tool", "tool_call_id": "c1", "content": "found in src/a.rs, src/b.rs, and src/c.rs"}),
+        ];
+        let hot = collect_hot_files(&messages, 5);
+        let mut ids = vec!["c1".to_string()];
+        let protected = protect_hot_file_results(&mut ids, &messages, &hot);
+        assert_eq!(protected, 1);
+        assert!(ids.is_empty());
+    }
+
+    #[test]
+    fn run_micro_compact_integration_hot_files() {
+        // Build a realistic conversation with 15+ messages:
+        // - 10+ clearable tool results (exceeds trigger_threshold=8 + keep_recent=3)
+        // - User mentions src/foo.rs in a recent message
+        // - One tool result references src/foo.rs → should be preserved
+        let mut messages: Vec<Value> = Vec::new();
+
+        // Generate 12 read_file tool call/result pairs (all clearable)
+        for i in 0..12 {
+            let call_id = format!("call_{i}");
+            let content = if i == 5 {
+                // This tool result references the hot file
+                "content of src/foo.rs: fn main() {}".to_string()
+            } else {
+                format!("content of file_{i}.txt: some data")
+            };
+            messages.push(json!({
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": call_id,
+                    "function": {"name": "read_file", "arguments": format!("{{\"path\":\"file_{i}.txt\"}}")}
+                }]
+            }));
+            messages.push(json!({
+                "role": "tool",
+                "tool_call_id": call_id,
+                "content": content
+            }));
+        }
+
+        // Recent user message mentions src/foo.rs
+        messages.push(json!({"role": "user", "content": "now fix the bug in src/foo.rs"}));
+        messages.push(json!({"role": "assistant", "content": "I'll fix it."}));
+
+        let result = run_micro_compact(&messages);
+
+        // The tool result for call_5 (referencing src/foo.rs) should be preserved
+        let call_5_msg = result.iter().find(|m| {
+            m.get("tool_call_id").and_then(Value::as_str) == Some("call_5")
+        }).unwrap();
+        assert!(
+            call_5_msg["content"].as_str().unwrap().contains("src/foo.rs"),
+            "tool result referencing hot file should be preserved"
+        );
+
+        // Older tool results should be cleared (but recent ones kept)
+        let call_0_msg = result.iter().find(|m| {
+            m.get("tool_call_id").and_then(Value::as_str) == Some("call_0")
+        }).unwrap();
+        assert_eq!(
+            call_0_msg["content"].as_str().unwrap(),
+            MICRO_COMPACT_STUB,
+            "old non-hot tool result should be cleared"
+        );
+    }
 }
