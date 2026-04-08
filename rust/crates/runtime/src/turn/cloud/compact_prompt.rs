@@ -14,23 +14,32 @@ IMPORTANT: First write an <analysis> block where you reason about what to preser
 Then write a <summary> block with the actual summary. The <analysis> block will be stripped.\n\n\
 ## Output format\n\n\
 <analysis>\n\
-Think about: What is the user's goal? What key decisions were made? What files were touched? \
-What errors occurred? What is pending?\n\
+Think step by step:\n\
+1. What is the user's primary goal and current sub-task?\n\
+2. What key decisions were made and WHY?\n\
+3. What files are actively being worked on? What are the exact current contents/state?\n\
+4. What approaches were tried? Which succeeded, which failed, and why?\n\
+5. What errors occurred and how were they fixed (or are they still open)?\n\
+6. What tasks remain and what is the immediate next step?\n\
 </analysis>\n\n\
 <summary>\n\
 ### Primary Request\nThe user's original task/goal in 1-2 sentences.\n\n\
 ### Key Technical Concepts\nDomain knowledge, architecture decisions, constraints discovered.\n\n\
-### Files & Code Modified\nFile paths and what changed. One bullet per file.\n\n\
+### Files & Code Modified\nFile paths and what changed. Include brief code snippets for actively-edited sections. One bullet per file.\n\n\
+### Problem Solving\nApproaches tried, what worked, what failed, and why. Include specific error messages that led to pivots.\n\n\
 ### Errors & Fixes\nErrors encountered and how they were resolved (or still open).\n\n\
 ### All User Messages\nEvery user intent/instruction, preserving their exact meaning.\n\n\
 ### Pending Tasks\nWhat remains to be done. Ordered by priority.\n\n\
+### Current Work\nExact files being edited right now. Relevant code snippets. Immediate focus area.\n\n\
 ### Current State\nWhat was just completed. What the next step should be.\n\
 </summary>\n\n\
 ## Rules\n\
 - Be dense and factual. No filler.\n\
 - Paraphrase tool outputs, don't reproduce verbatim.\n\
+- For ### Files & Code Modified and ### Current Work, include brief code snippets when they help \
+the reader understand the current state (function signatures, struct definitions, key logic).\n\
 - Omit superseded decisions unless the failure is informative.\n\
-- The reader is an LLM that needs only the essentials.";
+- The reader is an LLM that needs only the essentials to continue the task seamlessly.";
 
 /// Build the user message that presents the conversation history for summarization.
 pub fn build_compact_user_prompt(conversation_text: &str) -> String {
@@ -139,6 +148,7 @@ pub fn format_structured_summary(raw: &str) -> String {
     const REQUIRED: &[&str] = &[
         "### Primary Request",
         "### Pending Tasks",
+        "### Current Work",
         "### Current State",
     ];
     let missing: Vec<&&str> = REQUIRED.iter().filter(|h| !summary.contains(**h)).collect();
@@ -436,10 +446,11 @@ mod tests {
 
     #[test]
     fn format_structured_summary_preserves_sections() {
-        let input = "<analysis>x</analysis><summary>### Primary Request\nDo stuff\n### Pending Tasks\nMore\n### Current State\nDone</summary>";
+        let input = "<analysis>x</analysis><summary>### Primary Request\nDo stuff\n### Pending Tasks\nMore\n### Current Work\nEditing foo.rs\n### Current State\nDone</summary>";
         let result = format_structured_summary(input);
         assert!(result.contains("### Primary Request"));
         assert!(result.contains("### Pending Tasks"));
+        assert!(result.contains("### Current Work"));
         assert!(result.contains("### Current State"));
         assert!(!result.contains("[compact warning"));
     }
@@ -450,11 +461,33 @@ mod tests {
         let result = format_structured_summary(input);
         assert!(result.contains("[compact warning"));
         assert!(result.contains("### Pending Tasks"));
+        assert!(result.contains("### Current Work"));
     }
 
     #[test]
     fn compact_system_prompt_has_analysis_instruction() {
         assert!(COMPACT_SYSTEM_PROMPT.contains("<analysis>"));
         assert!(COMPACT_SYSTEM_PROMPT.contains("<summary>"));
+    }
+
+    #[test]
+    fn compact_system_prompt_has_nine_sections() {
+        let sections = [
+            "### Primary Request",
+            "### Key Technical Concepts",
+            "### Files & Code Modified",
+            "### Problem Solving",
+            "### Errors & Fixes",
+            "### All User Messages",
+            "### Pending Tasks",
+            "### Current Work",
+            "### Current State",
+        ];
+        for s in &sections {
+            assert!(
+                COMPACT_SYSTEM_PROMPT.contains(s),
+                "missing section: {s}"
+            );
+        }
     }
 }

@@ -377,6 +377,114 @@ fn find_clearable_tool_results(messages: &[Value], keep_recent: usize) -> (Vec<S
     split_clearable(collect_tool_results(messages), keep_recent)
 }
 
+// ---------------------------------------------------------------------------
+// Semantic Microcompact — Hot File Protection
+// ---------------------------------------------------------------------------
+
+/// Number of recent user messages to scan for hot file references.
+const HOT_FILE_SCAN_TURNS: usize = 5;
+
+/// Extract file-path-like tokens from a string.
+/// Matches patterns like `src/foo.rs`, `./bar/baz.py`, `/home/user/file.txt`.
+fn extract_file_paths(text: &str) -> Vec<String> {
+    let mut paths = Vec::new();
+    // Simple heuristic: tokens containing '/' or '.' with a file extension
+    for token in text.split_whitespace() {
+        // Strip surrounding punctuation (backticks, quotes, parens, commas)
+        let cleaned = token.trim_matches(|c: char| {
+            c == '`' || c == '\'' || c == '"' || c == '(' || c == ')' || c == ',' || c == ':'
+        });
+        if cleaned.is_empty() {
+            continue;
+        }
+        // Must contain a path separator or look like a file path
+        let has_separator = cleaned.contains('/') || cleaned.contains('\\');
+        let has_extension = cleaned.rfind('.').map_or(false, |dot| {
+            let ext = &cleaned[dot + 1..];
+            !ext.is_empty() && ext.len() <= 10 && ext.chars().all(|c| c.is_alphanumeric())
+        });
+        if has_separator || (has_extension && cleaned.len() > 3) {
+            paths.push(cleaned.to_string());
+        }
+    }
+    paths
+}
+
+/// Collect "hot" file paths from the last N user messages.
+fn collect_hot_files(messages: &[Value], scan_turns: usize) -> std::collections::HashSet<String> {
+    let mut hot = std::collections::HashSet::new();
+    let mut user_count = 0usize;
+    for msg in messages.iter().rev() {
+        if msg.get("role").and_then(Value::as_str) != Some("user") {
+            continue;
+        }
+        if let Some(text) = msg.get("content").and_then(Value::as_str) {
+            for path in extract_file_paths(text) {
+                // Store both full path and basename for flexible matching
+                if let Some(base) = path.rsplit('/').next() {
+                    if !base.is_empty() {
+                        hot.insert(base.to_string());
+                    }
+                }
+                hot.insert(path);
+            }
+        }
+        user_count += 1;
+        if user_count >= scan_turns {
+            break;
+        }
+    }
+    hot
+}
+
+/// Check whether a tool result references any hot file.
+fn references_hot_file(
+    msg: &Value,
+    hot_files: &std::collections::HashSet<String>,
+) -> bool {
+    if hot_files.is_empty() {
+        return false;
+    }
+    let content = msg.get("content").and_then(Value::as_str).unwrap_or("");
+    // Check tool_call arguments too (the file path passed to the tool)
+    for hot in hot_files {
+        if content.contains(hot.as_str()) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Filter out tool-result IDs that reference hot files, returning protected count.
+fn protect_hot_file_results(
+    ids_to_clear: &mut Vec<String>,
+    messages: &[Value],
+    hot_files: &std::collections::HashSet<String>,
+) -> usize {
+    if hot_files.is_empty() || ids_to_clear.is_empty() {
+        return 0;
+    }
+    // Build id→message index for quick lookup
+    let tool_msgs: std::collections::HashMap<&str, &Value> = messages
+        .iter()
+        .filter(|m| m.get("role").and_then(Value::as_str) == Some("tool"))
+        .filter_map(|m| {
+            let id = m.get("tool_call_id").and_then(Value::as_str)?;
+            Some((id, m))
+        })
+        .collect();
+
+    let before = ids_to_clear.len();
+    ids_to_clear.retain(|id| {
+        if let Some(msg) = tool_msgs.get(id.as_str()) {
+            !references_hot_file(msg, hot_files)
+        } else {
+            true // not found → keep in clear list
+        }
+    });
+    before - ids_to_clear.len()
+}
+
 /// Stub text replacing cleared tool results.
 pub const MICRO_COMPACT_STUB: &str = "[tool result cleared \u{2014} re-run if needed]";
 
@@ -497,17 +605,36 @@ pub fn run_micro_compact(messages: &[Value]) -> Vec<Value> {
         return messages.to_vec();
     }
 
+    // Semantic protection: preserve tool results referencing "hot" files
+    let hot_files = collect_hot_files(messages, HOT_FILE_SCAN_TURNS);
+    let protected = protect_hot_file_results(&mut ids_to_clear, messages, &hot_files);
+
+    if ids_to_clear.is_empty() {
+        if protected > 0 {
+            eprintln!(
+                "[micro_compact] all {} candidates protected by hot-file references",
+                protected
+            );
+        }
+        return messages.to_vec();
+    }
+
     let (compacted, cleared) = apply_micro_compact(messages, &ids_to_clear);
     if cleared > 0 {
+        let protect_note = if protected > 0 {
+            format!(", {} protected", protected)
+        } else {
+            String::new()
+        };
         if gap_minutes > 0 {
             eprintln!(
-                "[micro_compact] cleared {} tool results (~{} tokens, {}min gap)",
-                cleared, total_tokens_saved, gap_minutes
+                "[micro_compact] cleared {} tool results (~{} tokens, {}min gap{})",
+                cleared, total_tokens_saved, gap_minutes, protect_note
             );
         } else {
             eprintln!(
-                "[micro_compact] cleared {} tool results (~{} tokens)",
-                cleared, total_tokens_saved
+                "[micro_compact] cleared {} tool results (~{} tokens{})",
+                cleared, total_tokens_saved, protect_note
             );
         }
     }
@@ -1346,5 +1473,84 @@ mod tests {
             0,
         );
         assert!((event.compression_ratio - 1.0).abs() < f64::EPSILON);
+    }
+
+    // ── Semantic Microcompact: Hot File Tests ──
+
+    #[test]
+    fn extract_file_paths_basic() {
+        let paths = extract_file_paths("look at src/main.rs and ./lib/utils.py please");
+        assert!(paths.contains(&"src/main.rs".to_string()));
+        assert!(paths.contains(&"./lib/utils.py".to_string()));
+    }
+
+    #[test]
+    fn extract_file_paths_backtick_wrapped() {
+        let paths = extract_file_paths("edit `rust/crates/runtime/src/turn/bridge_inprocess.rs`");
+        assert!(paths.contains(&"rust/crates/runtime/src/turn/bridge_inprocess.rs".to_string()));
+    }
+
+    #[test]
+    fn extract_file_paths_no_false_positives() {
+        let paths = extract_file_paths("hello world 42 true false");
+        assert!(paths.is_empty());
+    }
+
+    #[test]
+    fn collect_hot_files_from_recent_user_messages() {
+        let messages = vec![
+            serde_json::json!({"role": "user", "content": "read src/foo.rs"}),
+            serde_json::json!({"role": "assistant", "content": "here it is"}),
+            serde_json::json!({"role": "user", "content": "now check lib/bar.py"}),
+        ];
+        let hot = collect_hot_files(&messages, 5);
+        assert!(hot.contains("src/foo.rs"));
+        assert!(hot.contains("foo.rs")); // basename
+        assert!(hot.contains("lib/bar.py"));
+        assert!(hot.contains("bar.py"));
+    }
+
+    #[test]
+    fn collect_hot_files_respects_scan_limit() {
+        let messages = vec![
+            serde_json::json!({"role": "user", "content": "old file ancient.rs"}),
+            serde_json::json!({"role": "assistant", "content": "ok"}),
+            serde_json::json!({"role": "user", "content": "recent file new.rs"}),
+        ];
+        let hot = collect_hot_files(&messages, 1); // only last user message
+        assert!(hot.contains("new.rs"));
+        assert!(!hot.contains("ancient.rs"));
+    }
+
+    #[test]
+    fn protect_hot_file_results_preserves_referenced() {
+        let messages = vec![
+            serde_json::json!({"role": "user", "content": "read src/main.rs"}),
+            serde_json::json!({"role": "assistant", "content": "", "tool_calls": [
+                {"id": "c1", "function": {"name": "read_file", "arguments": "{\"path\":\"src/main.rs\"}"}}
+            ]}),
+            serde_json::json!({"role": "tool", "tool_call_id": "c1", "content": "fn main() { ... src/main.rs content ..."}),
+            serde_json::json!({"role": "assistant", "content": "", "tool_calls": [
+                {"id": "c2", "function": {"name": "read_file", "arguments": "{\"path\":\"old.rs\"}"}}
+            ]}),
+            serde_json::json!({"role": "tool", "tool_call_id": "c2", "content": "old file content"}),
+        ];
+        let hot = collect_hot_files(&messages, 5);
+        let mut ids = vec!["c1".to_string(), "c2".to_string()];
+        let protected = protect_hot_file_results(&mut ids, &messages, &hot);
+        assert_eq!(protected, 1); // c1 protected
+        assert_eq!(ids, vec!["c2".to_string()]); // only c2 remains
+    }
+
+    #[test]
+    fn protect_hot_file_results_empty_hot_files_noop() {
+        let messages = vec![
+            serde_json::json!({"role": "tool", "tool_call_id": "c1", "content": "stuff"}),
+        ];
+        let hot = std::collections::HashSet::new();
+        let mut ids = vec!["c1".to_string()];
+        let protected = protect_hot_file_results(&mut ids, &messages, &hot);
+        assert_eq!(protected, 0);
+        assert_eq!(ids.len(), 1);
     }
 }
