@@ -36,6 +36,7 @@
 
 use astra_runtime::tool_registry::plugin::{PluginRegistry, PluginToolEntry};
 use astra_runtime::tool_registry::{IntentType, Scope};
+use crossterm::style::Stylize;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -559,8 +560,8 @@ fn json_entry_to_config(name: &str, entry: &McpJsonServerEntry) -> Option<McpSer
         }
         other => {
             eprintln!(
-                "  ⚠ mcp.json: unknown transport type '{}' for server '{}'",
-                other, name
+                "  {} mcp.json: unknown transport type '{}' for server '{}'",
+                "⚠".yellow(), other, name
             );
             return None;
         }
@@ -586,14 +587,14 @@ fn load_mcp_json_into(
     let content = match std::fs::read_to_string(path) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("  ⚠ Failed to read {}: {e}", path.display());
+            eprintln!("  {} Failed to read {}: {e}", "⚠".yellow(), path.display());
             return;
         }
     };
     let json_config: McpJsonConfig = match serde_json::from_str(&content) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("  ⚠ Failed to parse {}: {e}", path.display());
+            eprintln!("  {} Failed to parse {}: {e}", "⚠".yellow(), path.display());
             return;
         }
     };

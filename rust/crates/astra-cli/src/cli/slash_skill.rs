@@ -318,7 +318,12 @@ pub(super) async fn handle_skill_command(
                 parts.push(format!("{} mcp", mcp_count));
             }
             parts.push(format!("{} total", manifests.len()));
-            eprintln!("\n  {}", parts.join(", "));
+            eprintln!(
+                "\n  {}",
+                parts.iter().enumerate().map(|(i, p)| {
+                    if i == parts.len() - 1 { format!("{}", p.as_str().bold()) } else { p.as_str().dim().to_string() }
+                }).collect::<Vec<_>>().join(", ")
+            );
             eprintln!();
         }
 
@@ -402,7 +407,7 @@ pub(super) async fn handle_skill_command(
                         );
                     }
                 }
-                eprintln!("\n  {} results (showing top 10)", scored.len());
+                eprintln!("\n  {} results {}", scored.len().to_string().cyan(), "(showing top 10)".dim());
             }
             eprintln!();
         }
@@ -633,7 +638,7 @@ Follow these steps:
                 "\u{2713}".green(),
                 skill_dir.display().to_string().cyan()
             );
-            eprintln!("  Files created: SKILL.md");
+            eprintln!("  {} SKILL.md", "Files created:".dim());
             eprintln!("  {}", format!("Dev mode: /skill dev {name}").dim());
         }
 
@@ -665,7 +670,7 @@ Follow these steps:
                 match api.post_skills_test_json(tok, &payload).await {
                     Ok(body) => {
                         eprintln!("  {}", "\u{2713} API test result:".green());
-                        eprintln!("  {body}");
+                        eprintln!("  {}", body.dim());
                         true
                     }
                     Err(_) => false,
@@ -693,7 +698,7 @@ Follow these steps:
                 let test_file = skill_dir.join("test_skill.py");
 
                 if skill_md.exists() {
-                    eprintln!("  Validating SKILL.md ({})...", skill_dir.display());
+                    eprintln!("  {} SKILL.md ({})…", "Validating".dim(), skill_dir.display().to_string().dim());
                     let src = std::fs::read_to_string(&skill_md).map_err(|e| e.to_string())?;
                     let issues = collect_skill_md_issues(name, &src);
                     let mut ok = issues.is_empty();
@@ -705,10 +710,10 @@ Follow these steps:
                         let yaml = &src[3..3 + end];
                         if let Ok(val) = serde_yaml::from_str::<serde_json::Value>(yaml) {
                             let sname = val.get("name").and_then(|v| v.as_str()).unwrap_or("");
-                            eprintln!("  Manifest name: {}", sname.cyan());
+                            eprintln!("  {} {}", "Manifest name:".dim(), sname.cyan());
                         }
                         let body = &src[3 + end + 4..];
-                        eprintln!("  Instruction body: {} chars", body.len());
+                        eprintln!("  {} {} chars", "Instruction body:".dim(), body.len());
                     }
 
                     if ok
@@ -717,13 +722,13 @@ Follow these steps:
                     {
                         if let Some(ref hooks) = manifest.hooks {
                             if !hooks.pre_invoke.is_empty() {
-                                eprintln!("  Running pre_invoke hooks...");
+                                eprintln!("  {} pre_invoke hooks…", "Running".dim());
                                 for action in &hooks.pre_invoke {
                                     if let astra_runtime::skills::hooks::HookAction::Shell {
                                         command,
                                     } = action
                                     {
-                                        eprintln!("  $ {command}");
+                                        eprintln!("  {} {command}", "$".dim());
                                         match std::process::Command::new("sh")
                                             .arg("-c")
                                             .arg(command)

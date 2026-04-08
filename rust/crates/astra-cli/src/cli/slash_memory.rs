@@ -236,7 +236,7 @@ pub(super) async fn handle_memory_domain_command(
                                         "  {}",
                                         "────────────────────────────────────────────────".dim()
                                     );
-                                    eprintln!("  {} memories", arr.len());
+                                    eprintln!("  {} memories", arr.len().to_string().cyan());
                                 }
                             } else {
                                 print_json_or_raw(&body);
@@ -247,7 +247,7 @@ pub(super) async fn handle_memory_domain_command(
                     }
                 }
                 _ => {
-                    eprintln!("  Usage: /memory [list | search <query>]");
+                    eprintln!("  {} /memory [list | search <query>]", "Usage:".dim());
                 }
             }
         }

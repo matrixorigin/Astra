@@ -387,36 +387,47 @@ pub fn build_digest(session_id: &str, focus: DigestFocus) -> Result<JournalDiges
 }
 
 pub fn print_text(d: &JournalDigest) {
-    println!("schema_version: {}", d.schema_version);
-    println!("session_id: {}", d.session_id);
-    println!("journal_file: {}", d.journal_file);
+    use crossterm::style::Stylize;
+    println!("  {} {}", "schema_version:".dim(), d.schema_version);
+    println!("  {} {}", "session_id:".dim(), d.session_id.as_str().cyan());
+    println!("  {} {}", "journal_file:".dim(), d.journal_file);
     println!(
-        "journal_lines: non_empty={} malformed={}",
-        d.journal_lines_non_empty, d.journal_lines_malformed
+        "  {} non_empty={} malformed={}",
+        "journal_lines:".dim(),
+        d.journal_lines_non_empty.to_string().cyan(),
+        if d.journal_lines_malformed > 0 {
+            d.journal_lines_malformed.to_string().red().to_string()
+        } else {
+            d.journal_lines_malformed.to_string()
+        }
     );
     let a = &d.aggregates;
     println!(
-        "aggregates: turns={} turn_errors={} compacts={} stalls={} errors={} tokens_in={} tokens_out={} duration_ms={} tool_calls={} tool_failures={}",
-        a.turn_count,
-        a.turn_error_count,
-        a.compact_count,
-        a.stall_count,
-        a.error_event_count,
-        a.total_tokens_in,
-        a.total_tokens_out,
-        a.total_duration_ms,
-        a.total_tool_calls,
-        a.tool_calls_failed
+        "\n  {}", "Aggregates".bold().cyan()
     );
     println!(
-        "averages (per turn slot): tokens_in={:.1} tokens_out={:.1} duration_ms={:.1}",
+        "  turns={} turn_errors={} compacts={} stalls={} errors={}",
+        a.turn_count.to_string().cyan(), a.turn_error_count, a.compact_count, a.stall_count, a.error_event_count
+    );
+    println!(
+        "  tokens_in={} tokens_out={} duration_ms={} tool_calls={} tool_failures={}",
+        a.total_tokens_in.to_string().cyan(), a.total_tokens_out.to_string().cyan(),
+        a.total_duration_ms, a.total_tool_calls, a.tool_calls_failed
+    );
+    println!(
+        "\n  {}", "Averages (per turn)".bold().cyan()
+    );
+    println!(
+        "  tokens_in={:.1} tokens_out={:.1} duration_ms={:.1}",
         a.avg_tokens_in, a.avg_tokens_out, a.avg_duration_ms
     );
     if !d.turns.is_empty() {
-        println!();
         println!(
-            "{:>4} {:>5} {:>7} {:>7} {:>8}  user_preview",
-            "seq", "id", "tin", "tout", "ms"
+            "\n  {}", "Turns".bold().cyan()
+        );
+        println!(
+            "  {}",
+            format!("{:>4} {:>5} {:>7} {:>7} {:>8}  user_preview", "seq", "id", "tin", "tout", "ms").dim()
         );
         for t in &d.turns {
             let tin = t.tokens_in.unwrap_or(0);
@@ -427,37 +438,33 @@ pub fn print_text(d: &JournalDigest) {
                 .map(|n| n.to_string())
                 .unwrap_or_else(|| "-".to_string());
             println!(
-                "{:>4} {:>5} {:>7} {:>7} {:>8}  {}",
-                t.seq, tid, tin, tout, ms, t.user_input_preview
+                "  {:>4} {:>5} {:>7} {:>7} {:>8}  {}",
+                t.seq, tid, tin, tout, ms, t.user_input_preview.as_str().dim()
             );
         }
     }
     if !d.compaction_events.is_empty() {
-        println!();
-        println!("compaction_events: {}", d.compaction_events.len());
+        println!("\n  {} {}", "compaction_events:".dim(), d.compaction_events.len().to_string().cyan());
         for e in &d.compaction_events {
-            println!("  {} turn={:?} {}", e.ts, e.turn, e.detail);
+            println!("    {} {} {}", e.ts.as_str().dim(), format!("turn={:?}", e.turn).dim(), e.detail);
         }
     }
     if !d.stalls.is_empty() {
-        println!();
-        println!("stalls: {}", d.stalls.len());
+        println!("\n  {} {}", "stalls:".yellow(), d.stalls.len().to_string().cyan());
         for e in &d.stalls {
-            println!("  {} turn={:?} {}", e.ts, e.turn, e.detail);
+            println!("    {} {} {}", e.ts.as_str().dim(), format!("turn={:?}", e.turn).dim(), e.detail);
         }
     }
     if !d.turn_errors.is_empty() {
-        println!();
-        println!("turn_errors: {}", d.turn_errors.len());
+        println!("\n  {} {}", "turn_errors:".red(), d.turn_errors.len().to_string().cyan());
         for e in &d.turn_errors {
-            println!("  {} turn={:?} {}", e.ts, e.turn, e.error);
+            println!("    {} {} {}", e.ts.as_str().dim(), format!("turn={:?}", e.turn).dim(), e.error.as_str().red());
         }
     }
     if !d.other_errors.is_empty() {
-        println!();
-        println!("other_errors: {}", d.other_errors.len());
+        println!("\n  {} {}", "other_errors:".red(), d.other_errors.len().to_string().cyan());
         for e in &d.other_errors {
-            println!("  {} {}", e.ts, e.detail);
+            println!("    {} {}", e.ts.as_str().dim(), e.detail);
         }
     }
 }
