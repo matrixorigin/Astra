@@ -3163,8 +3163,9 @@ impl ToolExecutor {
 
         let line_content = lines[line - 1];
         
-        // Convert UTF-16 column to char index (LSP uses UTF-16 code units)
-        let col_idx = utf16_col_to_char_idx(line_content, col_utf16.saturating_sub(1));
+        // Convert UTF-16 column to char index (LSP uses UTF-16 code units).
+        // col_utf16 is 0-indexed per tool schema, same as utf16_col_to_char_idx expects.
+        let col_idx = utf16_col_to_char_idx(line_content, col_utf16);
         let chars: Vec<char> = line_content.chars().collect();
         
         if col_idx >= chars.len() {
