@@ -2,6 +2,7 @@ use super::*;
 use crate::permission_manager::PermissionMode;
 use astra_thin_client::paths;
 use clap::CommandFactory;
+use crossterm::style::Stylize;
 use std::io::Read;
 
 /// Exit codes for CLI commands (for scripting integration)
@@ -51,7 +52,7 @@ pub(super) async fn execute_cli_command(
             let addr: std::net::SocketAddr = format!("{}:{}", args.host, args.port)
                 .parse()
                 .map_err(|e| format!("Invalid listen address: {e}"))?;
-            eprintln!("Starting API server on {addr} ...");
+            eprintln!("  {} {} on {}", "▸".bold().cyan(), "Starting API server".bold(), addr.to_string().cyan());
             astra_runtime::serve(addr)
                 .await
                 .map_err(|e| format!("Server error: {e}"))?;
@@ -971,16 +972,17 @@ pub(super) async fn run_print_mode(
 // ═══════════════════════════════════════════════════════ Doctor ═══════════
 
 async fn run_doctor(api: &astra_thin_client::ThinClient, profile: Option<&str>) {
-    println!("Astra Doctor");
-    println!("{}\n", "═".repeat(50));
+    println!("\n{}", "Astra Doctor".bold());
+    println!("{}\n", "═".repeat(50).dim());
     let mut issues: Vec<String> = Vec::new();
 
     // 1. Version
     let version = env!("CARGO_PKG_VERSION");
-    println!("Version");
-    println!("  Binary: {version}");
+    println!("{}", "Version".bold().cyan());
+    println!("  {} {}", "Binary:".dim(), version);
     println!(
-        "  Executable: {}",
+        "  {} {}",
+        "Executable:".dim(),
         std::env::current_exe()
             .map(|p| p.display().to_string())
             .unwrap_or_else(|_| "unknown".into())
@@ -988,22 +990,22 @@ async fn run_doctor(api: &astra_thin_client::ThinClient, profile: Option<&str>) 
     println!();
 
     // 2. API server connectivity
-    println!("API Server");
-    println!("  URL: {}", api.api_origin());
+    println!("{}", "API Server".bold().cyan());
+    println!("  {} {}", "URL:".dim(), api.api_origin());
     match api.get_health_text().await {
-        Ok(body) => println!("  Status: ✓ Healthy ({})", body.trim()),
+        Ok(body) => println!("  {} {} {}", "Status:".dim(), "✓".green(), format!("Healthy ({})", body.trim()).green()),
         Err(e) => {
-            println!("  Status: ✗ Unreachable");
+            println!("  {} {} {}", "Status:".dim(), "✗".red(), "Unreachable".red());
             issues.push(format!("API server unreachable: {e}"));
         }
     }
     println!();
 
     // 3. Authentication
-    println!("Authentication");
+    println!("{}", "Authentication".bold().cyan());
     let creds = load_credentials();
     let name = profile_name(profile, &creds);
-    println!("  Profile: {name}");
+    println!("  {} {}", "Profile:".dim(), name);
     match get_profile_and_token(profile) {
         Ok((_, _, _, token)) => {
             match api.get_auth_me_text(&token).await {
@@ -1015,13 +1017,13 @@ async fn run_doctor(api: &astra_thin_client::ThinClient, profile: Option<&str>) 
                             .or_else(|| val.get("name"))
                             .and_then(|v| v.as_str())
                             .unwrap_or("authenticated");
-                        println!("  Status: ✓ Logged in as {user}");
+                        println!("  {} {} {}", "Status:".dim(), "✓".green(), format!("Logged in as {user}").green());
                     } else {
-                        println!("  Status: ✓ Authenticated");
+                        println!("  {} {} {}", "Status:".dim(), "✓".green(), "Authenticated".green());
                     }
                 }
                 Err(_) => {
-                    println!("  Status: ⚠ Token may be expired");
+                    println!("  {} {} {}", "Status:".dim(), "⚠".yellow(), "Token may be expired".yellow());
                     issues.push(
                         "Auth token may be expired — try `astra refresh` or `astra login`".into(),
                     );
@@ -1029,26 +1031,26 @@ async fn run_doctor(api: &astra_thin_client::ThinClient, profile: Option<&str>) 
             }
         }
         Err(e) => {
-            println!("  Status: ✗ Not logged in");
+            println!("  {} {} {}", "Status:".dim(), "✗".red(), "Not logged in".red());
             issues.push(format!("Not authenticated: {e}"));
         }
     }
     println!();
 
     // 4. Project config
-    println!("Project Configuration");
+    println!("{}", "Project Configuration".bold().cyan());
     let cwd = std::env::current_dir().unwrap_or_default();
     let astra_dir = cwd.join(".astra");
     if astra_dir.is_dir() {
-        println!("  .astra/ directory: ✓ Found");
+        println!("  {} {} {}", ".astra/:".dim(), "✓".green(), "Found".green());
     } else {
-        println!("  .astra/ directory: - Not found (optional)");
+        println!("  {} {}", ".astra/:".dim(), "Not found (optional)".dim());
     }
-    println!("  Working directory: {}", cwd.display());
+    println!("  {} {}", "Working dir:".dim(), cwd.display());
     println!();
 
     // 5. MCP configuration
-    println!("MCP Configuration");
+    println!("{}", "MCP Configuration".bold().cyan());
     for (scope, path_fn) in &[
         (
             "project",
@@ -1069,44 +1071,44 @@ async fn run_doctor(api: &astra_thin_client::ThinClient, profile: Option<&str>) 
                                 .and_then(|v| v.as_object())
                                 .map(|m| m.len())
                                 .unwrap_or(0);
-                            println!("  {scope}: ✓ {count} server(s) in {}", path.display());
+                            println!("  {} {} {} in {}", scope, "✓".green(), format!("{count} server(s)").green(), path.display().to_string().dim());
                         }
                         Err(e) => {
-                            println!("  {scope}: ✗ Invalid JSON in {}", path.display());
+                            println!("  {} {} {}", scope, "✗".red(), format!("Invalid JSON in {}", path.display()).red());
                             issues.push(format!("MCP {scope} config parse error: {e}"));
                         }
                     },
                     Err(e) => {
-                        println!("  {scope}: ✗ Cannot read {}", path.display());
+                        println!("  {} {} {}", scope, "✗".red(), format!("Cannot read {}", path.display()).red());
                         issues.push(format!("MCP {scope} config read error: {e}"));
                     }
                 }
             } else {
-                println!("  {scope}: - No config file");
+                println!("  {} {}", scope, "No config file".dim());
             }
         }
     }
     println!();
 
     // 6. Environment
-    println!("Environment");
-    println!("  OS: {}", std::env::consts::OS);
-    println!("  Arch: {}", std::env::consts::ARCH);
+    println!("{}", "Environment".bold().cyan());
+    println!("  {} {}", "OS:".dim(), std::env::consts::OS);
+    println!("  {} {}", "Arch:".dim(), std::env::consts::ARCH);
     if let Ok(shell) = std::env::var("SHELL") {
-        println!("  Shell: {shell}");
+        println!("  {} {shell}", "Shell:".dim());
     }
     if let Ok(term) = std::env::var("TERM") {
-        println!("  Terminal: {term}");
+        println!("  {} {term}", "Terminal:".dim());
     }
     println!();
 
     // Summary
     if issues.is_empty() {
-        println!("✓ No issues found");
+        println!("{} {}", "✓".green().bold(), "No issues found".green());
     } else {
-        println!("Found {} issue(s):", issues.len());
+        println!("{} {}:", "Found".yellow(), format!("{} issue(s)", issues.len()).yellow().bold());
         for issue in &issues {
-            println!("  ⚠ {issue}");
+            println!("  {} {}", "⚠".yellow(), issue);
         }
     }
 }
@@ -1210,13 +1212,18 @@ fn mcp_list(scope: &str) -> Result<(), String> {
         .unwrap_or_default();
 
     if servers.is_empty() {
-        println!("No MCP servers configured in {} scope.", scope);
-        println!("Use `astra mcp add` to add a server.");
+        println!("  {}", "No MCP servers configured.".dim());
+        println!("  Use {} to add a server.", "astra mcp add".cyan());
         return Ok(());
     }
 
-    println!("{:<20} {:<8} {:<40}", "Name", "Type", "Command / URL");
-    println!("{}", "─".repeat(70));
+    println!(
+        "  {:<20} {:<8} {:<40}",
+        "Name".bold(),
+        "Type".bold(),
+        "Command / URL".bold()
+    );
+    println!("  {}", "─".repeat(68).dim());
     for (name, entry) in &servers {
         let server_type = entry
             .get("type")
@@ -1247,9 +1254,9 @@ fn mcp_list(scope: &str) -> Result<(), String> {
                 }
             }
         };
-        println!("{:<20} {:<8} {}", name, server_type, detail);
+        println!("  {:<20} {:<8} {}", name.as_str().cyan(), server_type.dim(), detail);
     }
-    println!("\nConfig file: {}", path.display());
+    println!("\n  {} {}", "Config:".dim(), path.display().to_string().dim());
     Ok(())
 }
 
@@ -1280,7 +1287,7 @@ fn mcp_add(name: &str, command: &str, args: &[String], scope: &str) -> Result<()
         .insert(name.to_string(), entry);
 
     write_mcp_config(&path, &config)?;
-    println!("Added '{name}' to {}", path.display());
+    println!("  {} Added '{}' to {}", "✓".green(), name.cyan(), path.display().to_string().dim());
     Ok(())
 }
 
@@ -1312,7 +1319,7 @@ fn mcp_add_json(name: &str, json: &str, scope: &str) -> Result<(), String> {
         .insert(name.to_string(), entry);
 
     write_mcp_config(&path, &config)?;
-    println!("Added '{name}' to {}", path.display());
+    println!("  {} Added '{}' to {}", "✓".green(), name.cyan(), path.display().to_string().dim());
     Ok(())
 }
 
@@ -1334,7 +1341,7 @@ fn mcp_remove(name: &str, scope: &str) -> Result<(), String> {
     }
 
     write_mcp_config(&path, &config)?;
-    println!("Removed '{name}' from {}", path.display());
+    println!("  {} Removed '{}' from {}", "✓".green(), name.cyan(), path.display().to_string().dim());
     Ok(())
 }
 
@@ -1355,36 +1362,36 @@ fn mcp_get(name: &str) -> Result<(), String> {
             .and_then(|v| v.as_object())
             .and_then(|m| m.get(name))
         {
-            println!("{}:", name);
-            println!("  Scope: {scope}");
+            println!("  {}:", name.bold().cyan());
+            println!("    {} {scope}", "Scope:".dim());
             let server_type = entry
                 .get("type")
                 .and_then(|v| v.as_str())
                 .unwrap_or("stdio");
-            println!("  Type: {server_type}");
+            println!("    {} {server_type}", "Type:".dim());
             match server_type {
                 "sse" | "http" => {
                     if let Some(url) = entry.get("url").and_then(|v| v.as_str()) {
-                        println!("  URL: {url}");
+                        println!("    {} {url}", "URL:".dim());
                     }
                 }
                 _ => {
                     if let Some(cmd) = entry.get("command").and_then(|v| v.as_str()) {
-                        println!("  Command: {cmd}");
+                        println!("    {} {cmd}", "Command:".dim());
                     }
                     if let Some(args) = entry.get("args").and_then(|v| v.as_array()) {
                         let args_str: Vec<&str> = args.iter().filter_map(|v| v.as_str()).collect();
-                        println!("  Args: {}", args_str.join(" "));
+                        println!("    {} {}", "Args:".dim(), args_str.join(" "));
                     }
                 }
             }
             if let Some(env) = entry.get("env").and_then(|v| v.as_object()) {
-                println!("  Environment:");
+                println!("    {}:", "Environment".dim());
                 for (k, v) in env {
-                    println!("    {k}={}", v.as_str().unwrap_or(&v.to_string()));
+                    println!("      {}={}", k.as_str().cyan(), v.as_str().unwrap_or(&v.to_string()));
                 }
             }
-            println!("\nTo remove: astra mcp remove \"{}\" -s {scope}", name);
+            println!("\n  {} astra mcp remove \"{}\" -s {scope}", "To remove:".dim(), name);
             return Ok(());
         }
     }
@@ -1463,26 +1470,26 @@ fn config_list() -> Result<(), String> {
     let path = settings_path()?;
 
     if settings.is_empty() {
-        println!("No settings configured.");
-        println!("Use `astra config set <key> <value>` to set a value.");
-        println!("\nAvailable keys:");
+        println!("  {}", "No settings configured.".dim());
+        println!("  Use {} to set a value.", "astra config set <key> <value>".cyan());
+        println!("\n  {}:", "Available keys".bold());
         for (key, desc) in KNOWN_SETTINGS {
-            println!("  {key:<20} {desc}");
+            println!("    {}  {}", key.cyan(), desc.dim());
         }
         return Ok(());
     }
 
     let (hk, hv) = ("Key", "Value");
-    println!("{hk:<20} {hv}");
-    println!("{}", "─".repeat(50));
+    println!("  {:<20} {hv}", hk.bold());
+    println!("  {}", "─".repeat(50).dim());
     for (key, value) in &settings {
         let display = match value {
             serde_json::Value::String(s) => s.clone(),
             other => other.to_string(),
         };
-        println!("{key:<20} {display}");
+        println!("  {:<20} {display}", key.as_str().cyan());
     }
-    println!("\nConfig file: {}", path.display());
+    println!("\n  {} {}", "Config:".dim(), path.display().to_string().dim());
     Ok(())
 }
 
@@ -1526,7 +1533,7 @@ fn config_set(key: &str, value: &str) -> Result<(), String> {
 
     settings.insert(key.to_string(), json_value);
     write_settings(&settings)?;
-    println!("Set '{key}' = {value}");
+    println!("  {} Set '{}' = {}", "✓".green(), key.cyan(), value);
     Ok(())
 }
 

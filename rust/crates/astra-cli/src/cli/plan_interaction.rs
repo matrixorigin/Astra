@@ -454,7 +454,7 @@ pub async fn handle_plan_mode_input(
     let plan_state = match state.plan_mode.as_mut() {
         Some(ps) => ps,
         None => {
-            eprintln!("  ⚠️ Not in plan mode");
+            eprintln!("  {} {}", "⚠".yellow(), "Not in plan mode".yellow());
             return Ok(());
         }
     };
@@ -945,7 +945,7 @@ async fn handle_plan_command(
                 }
                 eprintln!("{}", "  pause | correct <…> | cancel".dim());
             } else {
-                eprintln!("  No active plan or execution");
+                eprintln!("  {}", "No active plan or execution".dim());
             }
         }
 
@@ -1107,7 +1107,7 @@ async fn handle_plan_command(
             if let Some(ref ps) = state.plan_mode {
                 eprintln!("{}", ps.timeline.format_display());
             } else {
-                eprintln!("  (no timeline data)");
+                eprintln!("  {}", "(no timeline data)".dim());
             }
         }
 
@@ -1120,8 +1120,16 @@ async fn handle_plan_command(
                 let edits = ps.history.len();
                 let timeline_events = ps.timeline.events.len();
 
-                eprintln!("{}", "Metrics".bold());
-                eprintln!("  Progress: {done}/{total} ({pct}%)  v{versions} ({edits} edits)  {timeline_events} events");
+                eprintln!("{}", "Metrics".bold().cyan());
+                eprintln!(
+                    "  {} {}/{} {}  {} {}  {} events",
+                    "Progress:".dim(),
+                    format!("{done}").cyan(), format!("{total}").dim(),
+                    format!("({pct}%)").bold(),
+                    format!("v{versions}").dim(),
+                    format!("({edits} edits)").dim(),
+                    timeline_events,
+                );
 
                 if !ps.plan.subtasks.is_empty() {
                     for st in &ps.plan.subtasks {
@@ -1136,11 +1144,11 @@ async fn handle_plan_command(
                         } else {
                             format!(" {}", format!("(deps: {})", st.depends_on.join(", ")).dim())
                         };
-                        eprintln!("  {icon} {} {}{deps}", st.id, st.title);
+                        eprintln!("  {icon} {} {}{deps}", st.id.clone().cyan(), st.title);
                     }
                 }
             } else {
-                eprintln!("  No active plan for metrics");
+                eprintln!("  {}", "No active plan for metrics".dim());
             }
         }
 
@@ -1148,7 +1156,7 @@ async fn handle_plan_command(
             if let Some(ref ps) = state.plan_mode {
                 eprintln!("{}", ps.version_history.format_log());
             } else {
-                eprintln!("  No version history");
+                eprintln!("  {}", "No version history".dim());
             }
         }
 
@@ -1157,7 +1165,7 @@ async fn handle_plan_command(
                 eprintln!();
                 eprint_plan_markdown_streaming(&ps.plan, Some(&ps.goal));
             } else {
-                eprintln!("  No active plan");
+                eprintln!("  {}", "No active plan".dim());
             }
         }
 

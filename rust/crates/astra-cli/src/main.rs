@@ -1861,12 +1861,12 @@ fn handle_cost_command(arg: &str, state: &ReplState) {
                         String::new()
                     };
                     eprintln!(
-                        "  Turn {:>3}  {:>6}+{:<6} tok  {}{}",
-                        turn_num,
+                        "  {} {:>6}+{:<6} tok  {}{}",
+                        format!("Turn {:>3}", turn_num).dim(),
                         p_tok,
                         c_tok,
                         format_cost(cost),
-                        cache_info
+                        cache_info.dim()
                     );
                 }
             }

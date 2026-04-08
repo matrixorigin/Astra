@@ -25,6 +25,7 @@ use astra_runtime::tool_sandbox::{
 /// for authorization instead of letting the model silently fall back to bash.
 pub const SANDBOX_DENIED_PREFIX: &str = "SANDBOX_DENIED: ";
 use chrono::{DateTime, Utc};
+use crossterm::style::Stylize;
 use reqwest::{Client, Method, StatusCode};
 use serde_json::{Value, json};
 
@@ -1850,16 +1851,16 @@ impl ToolExecutor {
         // Display the question
         eprintln!();
         if let Some(ctx) = context {
-            eprintln!("  \x1b[90m{}\x1b[0m", ctx);
+            eprintln!("  {}", ctx.dim());
         }
-        eprintln!("  \x1b[1;36m❓ {}\x1b[0m", question);
+        eprintln!("  {} {}", "❓".cyan().bold(), question.bold().cyan());
 
         if choices.is_empty() {
             // Free-form input
             let prompt = if let Some(def) = default {
-                format!("  \x1b[90m[default: {}]\x1b[0m > ", def)
+                format!("  {} > ", format!("[default: {def}]").dim())
             } else {
-                "  > ".to_string()
+                format!("  {} ", ">".cyan())
             };
             eprint!("{}", prompt);
             let _ = io::stderr().flush();
@@ -1885,9 +1886,9 @@ impl ToolExecutor {
         } else {
             // Multiple choice
             for (i, choice) in choices.iter().enumerate() {
-                eprintln!("  \x1b[33m{})\x1b[0m {}", i + 1, choice);
+                eprintln!("  {} {}", format!("{})", i + 1).yellow(), choice);
             }
-            eprintln!("  \x1b[90m(Enter number, or type custom response)\x1b[0m");
+            eprintln!("  {}", "(Enter number, or type custom response)".dim());
             eprint!("  > ");
             let _ = io::stderr().flush();
 
@@ -2259,7 +2260,7 @@ impl ToolExecutor {
 
         let reason = args.get("reason").and_then(Value::as_str).unwrap_or("waiting");
         
-        eprintln!("  \x1b[90m💤 Sleeping for {}ms ({})\x1b[0m", duration_ms, reason);
+        eprintln!("  {}", format!("💤 Sleeping for {}ms ({})", duration_ms, reason).dim());
         
         tokio::time::sleep(std::time::Duration::from_millis(duration_ms)).await;
         
