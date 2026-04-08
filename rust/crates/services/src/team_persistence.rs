@@ -10,8 +10,8 @@ use std::collections::HashMap;
 use std::sync::RwLock;
 
 use crate::coordination::{
-    AgentProfile, AgentTier, AggregationStrategy, CoordinationPattern, DelegationRequest,
-    PipelineStage,
+    AgentProfile, AgentProfileRegistry, AgentTier, AggregationStrategy, CoordinationPattern,
+    DelegationRequest, PipelineStage,
 };
 
 // ─── Team Definition Types ──────────────────────────────────────────────────
@@ -81,6 +81,14 @@ pub struct TeamMemberDef {
     pub skills: Vec<String>,
     pub model_override: Option<String>,
     pub mcp_servers: Vec<String>,
+    /// Whether this member can delegate to sub-agents.  
+    /// Defaults to `false` (User tier, no delegation).
+    #[serde(default)]
+    pub can_delegate: bool,
+    /// Maximum delegation depth for this member.
+    /// Only meaningful when `can_delegate` is true.
+    #[serde(default)]
+    pub max_delegation_depth: u32,
 }
 
 /// How the team's agents share the workspace file system.
@@ -105,58 +113,240 @@ impl Default for WorktreeMode {
 
 /// Convert a team member declaration into a full [`AgentProfile`].
 ///
-/// The generated profile is always `AgentTier::User` (cannot delegate) and
-/// inherits the team description as context in its system prompt.
+/// When `registry` is provided and `member.agent_id` matches an existing profile,
+/// the registered profile is used as a base — member fields override where set.
+///
+/// The generated profile inherits the team description as context in its system
+/// prompt and stores team context in `metadata["team_context"]`.
 pub fn resolve_member_to_profile(member: &TeamMemberDef, team: &TeamDefinition) -> AgentProfile {
+    resolve_member_to_profile_with_registry(member, team, None)
+}
+
+/// Resolve with optional registry lookup.
+///
+/// If `registry` contains a profile matching `member.agent_id`, that profile is
+/// used as the base and member-level overrides are applied on top.
+pub fn resolve_member_to_profile_with_registry(
+    member: &TeamMemberDef,
+    team: &TeamDefinition,
+    registry: Option<&AgentProfileRegistry>,
+) -> AgentProfile {
     let agent_id = member
         .agent_id
         .clone()
         .unwrap_or_else(|| format!("team-{}-{}", team.name, member.role));
 
-    let system_prompt = member.system_prompt.clone().unwrap_or_else(|| {
-        format!(
-            "You are the {} in the \"{}\" team. Team description: {}",
-            member.role, team.name, team.description
-        )
-    });
+    // Try to use an existing registered profile as the base
+    let mut profile = registry
+        .and_then(|r| r.get(&agent_id))
+        .cloned()
+        .unwrap_or_else(|| {
+            let tier = if member.can_delegate {
+                AgentTier::System
+            } else {
+                AgentTier::User
+            };
+            AgentProfile::new(&agent_id, &member.role, tier)
+        });
 
-    let mut profile = AgentProfile::new(&agent_id, &member.role, AgentTier::User);
+    // Apply member-level overrides
+    let system_prompt = member.system_prompt.clone().unwrap_or_else(|| {
+        profile.system_prompt.clone().unwrap_or_else(|| {
+            format!(
+                "You are the {} in the \"{}\" team. Team description: {}",
+                member.role, team.name, team.description
+            )
+        })
+    });
     profile.system_prompt = Some(system_prompt);
-    profile.skill_filter = member.skills.clone();
-    profile.model_override = member.model_override.clone();
-    profile.mcp_servers = member.mcp_servers.clone();
+
+    if !member.skills.is_empty() {
+        profile.skill_filter = member.skills.clone();
+    }
+    if member.model_override.is_some() {
+        profile.model_override = member.model_override.clone();
+    }
+    if !member.mcp_servers.is_empty() {
+        profile.mcp_servers = member.mcp_servers.clone();
+    }
+
+    // Override delegation settings from member def
+    if member.can_delegate {
+        profile.can_delegate = true;
+        profile.tier = AgentTier::System;
+        if member.max_delegation_depth > 0 {
+            profile.max_delegation_depth = member.max_delegation_depth;
+        }
+    }
+
+    // Inject team context into profile metadata
+    if !team.context.is_empty() {
+        profile.metadata.insert(
+            "team_context".to_string(),
+            serde_json::to_value(&team.context).unwrap_or_default(),
+        );
+    }
+    profile.metadata.insert(
+        "team_name".to_string(),
+        serde_json::Value::String(team.name.clone()),
+    );
+    profile.metadata.insert(
+        "team_role".to_string(),
+        serde_json::Value::String(member.role.clone()),
+    );
+
     profile
 }
 
-// ─── Bridge: Team → DelegationRequest ───────────────────────────────────────
+// ─── Team Validation ────────────────────────────────────────────────────────
 
-fn parse_aggregation(s: &str) -> AggregationStrategy {
-    match s {
-        "first_success" => AggregationStrategy::FirstSuccess,
-        "consensus" => AggregationStrategy::Consensus,
-        "all_results" | "concatenate" => AggregationStrategy::AllResults,
-        other => AggregationStrategy::LlmGuided {
-            prompt_template: other.to_string(),
-        },
+/// Validation errors for a team definition.
+#[derive(Debug, Clone, PartialEq)]
+pub enum TeamValidationError {
+    /// Adversarial requires exactly 2 members.
+    AdversarialMemberCount(usize),
+    /// Pipeline/Sequential requires at least 1 member.
+    EmptyMembers,
+    /// Duplicate role names within the same team.
+    DuplicateRoles(Vec<String>),
+    /// Duplicate agent IDs (explicit or generated).
+    DuplicateAgentIds(Vec<String>),
+}
+
+impl std::fmt::Display for TeamValidationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::AdversarialMemberCount(n) => {
+                write!(f, "adversarial coordination requires exactly 2 members, got {n}")
+            }
+            Self::EmptyMembers => write!(f, "team must have at least one member"),
+            Self::DuplicateRoles(roles) => {
+                write!(f, "duplicate roles: {}", roles.join(", "))
+            }
+            Self::DuplicateAgentIds(ids) => {
+                write!(f, "duplicate agent IDs: {}", ids.join(", "))
+            }
+        }
     }
 }
 
-/// Convert a [`TeamDefinition`] + task into a [`DelegationRequest`].
+/// Validate a team definition before execution.
 ///
-/// The caller is responsible for registering the resolved profiles in the
-/// `AgentProfileRegistry` before executing the request.
-pub fn team_to_delegation_request(
+/// Checks:
+/// - Non-empty member list
+/// - Adversarial coordination requires exactly 2 members
+/// - No duplicate roles
+/// - No duplicate agent IDs (after resolution)
+pub fn validate_team(team: &TeamDefinition) -> Result<(), Vec<TeamValidationError>> {
+    let mut errors = Vec::new();
+
+    if team.members.is_empty() {
+        errors.push(TeamValidationError::EmptyMembers);
+        return Err(errors);
+    }
+
+    if matches!(team.coordination, TeamCoordination::Adversarial { .. }) && team.members.len() != 2
+    {
+        errors.push(TeamValidationError::AdversarialMemberCount(
+            team.members.len(),
+        ));
+    }
+
+    // Check duplicate roles
+    let mut role_counts: HashMap<&str, usize> = HashMap::new();
+    for m in &team.members {
+        *role_counts.entry(&m.role).or_default() += 1;
+    }
+    let dup_roles: Vec<String> = role_counts
+        .iter()
+        .filter(|(_, count)| **count > 1)
+        .map(|(role, _)| role.to_string())
+        .collect();
+    if !dup_roles.is_empty() {
+        errors.push(TeamValidationError::DuplicateRoles(dup_roles));
+    }
+
+    // Check duplicate agent IDs
+    let mut id_counts: HashMap<String, usize> = HashMap::new();
+    for m in &team.members {
+        let id = m
+            .agent_id
+            .clone()
+            .unwrap_or_else(|| format!("team-{}-{}", team.name, m.role));
+        *id_counts.entry(id).or_default() += 1;
+    }
+    let dup_ids: Vec<String> = id_counts
+        .into_iter()
+        .filter(|(_, count)| *count > 1)
+        .map(|(id, _)| id)
+        .collect();
+    if !dup_ids.is_empty() {
+        errors.push(TeamValidationError::DuplicateAgentIds(dup_ids));
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors)
+    }
+}
+
+// ─── Bulk Resolve ───────────────────────────────────────────────────────────
+
+/// Resolve all team members, validate, and produce profiles + delegation request.
+///
+/// This is the high-level entry point for team execution. It:
+/// 1. Validates the team definition
+/// 2. Resolves all members to profiles (with optional registry lookup)
+/// 3. Builds the delegation request
+/// 4. Returns everything needed for the orchestrator
+pub fn resolve_team(
     team: &TeamDefinition,
     task: &str,
     parent_run_id: &str,
-) -> (DelegationRequest, Vec<AgentProfile>) {
+    registry: Option<&AgentProfileRegistry>,
+) -> Result<(DelegationRequest, Vec<AgentProfile>), String> {
+    // Validate first
+    validate_team(team).map_err(|errs| {
+        errs.iter()
+            .map(|e| e.to_string())
+            .collect::<Vec<_>>()
+            .join("; ")
+    })?;
+
+    // Resolve with optional registry
     let profiles: Vec<AgentProfile> = team
         .members
         .iter()
-        .map(|m| resolve_member_to_profile(m, team))
+        .map(|m| resolve_member_to_profile_with_registry(m, team, registry))
         .collect();
 
-    let pattern = match &team.coordination {
+    let pattern = build_coordination_pattern(&team.coordination, &profiles);
+
+    let context: HashMap<String, serde_json::Value> = team
+        .context
+        .iter()
+        .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
+        .collect();
+
+    let request = DelegationRequest {
+        delegation_id: uuid::Uuid::new_v4().to_string(),
+        parent_run_id: parent_run_id.to_string(),
+        task: task.to_string(),
+        pattern,
+        user_id: team.user_id.clone(),
+        depth: 0,
+        context,
+    };
+
+    Ok((request, profiles))
+}
+
+fn build_coordination_pattern(
+    coordination: &TeamCoordination,
+    profiles: &[AgentProfile],
+) -> CoordinationPattern {
+    match coordination {
         TeamCoordination::Adversarial {
             max_rounds,
             threshold,
@@ -194,7 +384,38 @@ pub fn team_to_delegation_request(
             agent_ids: profiles.iter().map(|p| p.agent_id.clone()).collect(),
             stop_on_success: *stop_on_success,
         },
-    };
+    }
+}
+
+// ─── Bridge: Team → DelegationRequest ───────────────────────────────────────
+
+fn parse_aggregation(s: &str) -> AggregationStrategy {
+    match s {
+        "first_success" => AggregationStrategy::FirstSuccess,
+        "consensus" => AggregationStrategy::Consensus,
+        "all_results" | "concatenate" => AggregationStrategy::AllResults,
+        other => AggregationStrategy::LlmGuided {
+            prompt_template: other.to_string(),
+        },
+    }
+}
+
+/// Convert a [`TeamDefinition`] + task into a [`DelegationRequest`].
+///
+/// **Prefer [`resolve_team`]** for new code — it validates and supports registry lookup.
+/// This function is kept for backward compatibility.
+pub fn team_to_delegation_request(
+    team: &TeamDefinition,
+    task: &str,
+    parent_run_id: &str,
+) -> (DelegationRequest, Vec<AgentProfile>) {
+    let profiles: Vec<AgentProfile> = team
+        .members
+        .iter()
+        .map(|m| resolve_member_to_profile(m, team))
+        .collect();
+
+    let pattern = build_coordination_pattern(&team.coordination, &profiles);
 
     let context: HashMap<String, serde_json::Value> = team
         .context
@@ -621,6 +842,8 @@ pub fn builtin_teams(user_id: &str, now: &str) -> Vec<TeamDefinition> {
                     skills: vec!["review-changes".to_string()],
                     model_override: None,
                     mcp_servers: vec![],
+                    can_delegate: false,
+                    max_delegation_depth: 0,
                 },
                 TeamMemberDef {
                     role: "reviewer".to_string(),
@@ -633,6 +856,8 @@ pub fn builtin_teams(user_id: &str, now: &str) -> Vec<TeamDefinition> {
                     skills: vec!["review-changes".to_string()],
                     model_override: None,
                     mcp_servers: vec![],
+                    can_delegate: false,
+                    max_delegation_depth: 0,
                 },
             ],
             context: HashMap::new(),
@@ -659,6 +884,8 @@ pub fn builtin_teams(user_id: &str, now: &str) -> Vec<TeamDefinition> {
                     skills: vec!["analyze-session".to_string()],
                     model_override: None,
                     mcp_servers: vec![],
+                    can_delegate: false,
+                    max_delegation_depth: 0,
                 },
                 TeamMemberDef {
                     role: "synthesizer".to_string(),
@@ -669,6 +896,8 @@ pub fn builtin_teams(user_id: &str, now: &str) -> Vec<TeamDefinition> {
                     skills: vec![],
                     model_override: None,
                     mcp_servers: vec![],
+                    can_delegate: false,
+                    max_delegation_depth: 0,
                 },
             ],
             context: HashMap::new(),
@@ -694,6 +923,8 @@ pub fn builtin_teams(user_id: &str, now: &str) -> Vec<TeamDefinition> {
                     skills: vec![],
                     model_override: None,
                     mcp_servers: vec![],
+                    can_delegate: false,
+                    max_delegation_depth: 0,
                 },
                 TeamMemberDef {
                     role: "implementer".to_string(),
@@ -704,6 +935,8 @@ pub fn builtin_teams(user_id: &str, now: &str) -> Vec<TeamDefinition> {
                     skills: vec![],
                     model_override: None,
                     mcp_servers: vec![],
+                    can_delegate: false,
+                    max_delegation_depth: 0,
                 },
                 TeamMemberDef {
                     role: "tester".to_string(),
@@ -714,6 +947,8 @@ pub fn builtin_teams(user_id: &str, now: &str) -> Vec<TeamDefinition> {
                     skills: vec!["verify-task".to_string()],
                     model_override: None,
                     mcp_servers: vec![],
+                    can_delegate: false,
+                    max_delegation_depth: 0,
                 },
             ],
             context: HashMap::new(),
@@ -745,6 +980,8 @@ mod tests {
                     skills: vec!["edit".to_string()],
                     model_override: None,
                     mcp_servers: vec![],
+                    can_delegate: false,
+                    max_delegation_depth: 0,
                 },
                 TeamMemberDef {
                     role: "reviewer".to_string(),
@@ -753,6 +990,8 @@ mod tests {
                     skills: vec!["review-changes".to_string()],
                     model_override: Some("claude-3-opus".to_string()),
                     mcp_servers: vec!["github".to_string()],
+                    can_delegate: false,
+                    max_delegation_depth: 0,
                 },
             ],
             context: HashMap::from([("project".to_string(), "test-project".to_string())]),
@@ -1042,6 +1281,8 @@ mod tests {
                 skills: vec!["edit".to_string(), "test".to_string()],
                 model_override: Some("gpt-4".to_string()),
                 mcp_servers: vec!["github".to_string()],
+                can_delegate: false,
+                max_delegation_depth: 0,
             },
             TeamMemberDef {
                 role: "reviewer".to_string(),
@@ -1050,6 +1291,8 @@ mod tests {
                 skills: vec![],
                 model_override: None,
                 mcp_servers: vec![],
+                can_delegate: false,
+                max_delegation_depth: 0,
             },
         ];
 
@@ -1118,5 +1361,379 @@ mod tests {
         assert_eq!(parsed.worktree_mode, WorktreeMode::Isolated);
         assert_eq!(parsed.members.len(), 2);
         assert!(parsed.context.contains_key("project"));
+    }
+
+    // ─── T-2: Validation Tests ─────────────────────────────────────────────
+
+    #[test]
+    fn validate_team_empty_members() {
+        let mut team = test_team();
+        team.members.clear();
+        let err = validate_team(&team).unwrap_err();
+        assert!(err.contains(&TeamValidationError::EmptyMembers));
+    }
+
+    #[test]
+    fn validate_team_adversarial_wrong_count() {
+        let mut team = test_team();
+        team.coordination = TeamCoordination::Adversarial {
+            max_rounds: 3,
+            threshold: 0.8,
+        };
+        // test_team has 2 members, add a third
+        team.members.push(TeamMemberDef {
+            role: "observer".to_string(),
+            agent_id: None,
+            system_prompt: None,
+            skills: vec![],
+            model_override: None,
+            mcp_servers: vec![],
+            can_delegate: false,
+            max_delegation_depth: 0,
+        });
+        let err = validate_team(&team).unwrap_err();
+        assert!(err
+            .iter()
+            .any(|e| matches!(e, TeamValidationError::AdversarialMemberCount(3))));
+    }
+
+    #[test]
+    fn validate_team_adversarial_exact_two_ok() {
+        let mut team = test_team();
+        team.coordination = TeamCoordination::Adversarial {
+            max_rounds: 3,
+            threshold: 0.8,
+        };
+        assert!(validate_team(&team).is_ok());
+    }
+
+    #[test]
+    fn validate_team_duplicate_roles() {
+        let mut team = test_team();
+        // Make both members have the same role
+        team.members[1].role = team.members[0].role.clone();
+        let err = validate_team(&team).unwrap_err();
+        assert!(err.iter().any(|e| matches!(e, TeamValidationError::DuplicateRoles(_))));
+    }
+
+    #[test]
+    fn validate_team_duplicate_agent_ids() {
+        let mut team = test_team();
+        team.members[0].agent_id = Some("same-id".to_string());
+        team.members[1].agent_id = Some("same-id".to_string());
+        let err = validate_team(&team).unwrap_err();
+        assert!(err
+            .iter()
+            .any(|e| matches!(e, TeamValidationError::DuplicateAgentIds(_))));
+    }
+
+    #[test]
+    fn validate_team_valid_pipeline() {
+        let team = test_team(); // pipeline with 2 distinct members
+        assert!(validate_team(&team).is_ok());
+    }
+
+    // ─── T-2: Resolve with Registry Tests ──────────────────────────────────
+
+    #[test]
+    fn resolve_member_uses_registry_base() {
+        let team = test_team();
+        let member = &team.members[0]; // role = "coder", agent_id = "coder-agent"
+
+        let mut registry = AgentProfileRegistry::new();
+        let mut base = AgentProfile::new("coder-agent", "coder", AgentTier::System);
+        base.system_prompt = Some("I am the registered coder.".to_string());
+        base.skill_filter = vec!["search".to_string(), "read".to_string()];
+        base.model_override = Some("gpt-4".to_string());
+        registry.register(base);
+
+        let profile =
+            resolve_member_to_profile_with_registry(member, &team, Some(&registry));
+
+        // Member has no system_prompt override → registry prompt used
+        assert_eq!(
+            profile.system_prompt.as_deref(),
+            Some("I am the registered coder.")
+        );
+        // Member has skills=["edit"] → overrides registry
+        assert_eq!(profile.skill_filter, vec!["edit"]);
+        // Member has no model_override → registry model preserved
+        assert_eq!(profile.model_override.as_deref(), Some("gpt-4"));
+    }
+
+    #[test]
+    fn resolve_member_overrides_registry_with_member_values() {
+        let team = test_team();
+        let mut member = team.members[1].clone(); // reviewer, no agent_id → "team-test-team-reviewer"
+        member.system_prompt = Some("Custom override prompt.".to_string());
+        member.skills = vec!["edit".to_string()];
+        member.model_override = Some("claude-4".to_string());
+
+        let mut registry = AgentProfileRegistry::new();
+        let mut base = AgentProfile::new("team-test-team-reviewer", "reviewer", AgentTier::System);
+        base.system_prompt = Some("Registry prompt.".to_string());
+        base.skill_filter = vec!["search".to_string()];
+        base.model_override = Some("gpt-4".to_string());
+        registry.register(base);
+
+        let profile =
+            resolve_member_to_profile_with_registry(&member, &team, Some(&registry));
+
+        // Member overrides win
+        assert_eq!(
+            profile.system_prompt.as_deref(),
+            Some("Custom override prompt.")
+        );
+        assert_eq!(profile.skill_filter, vec!["edit"]);
+        assert_eq!(profile.model_override.as_deref(), Some("claude-4"));
+    }
+
+    #[test]
+    fn resolve_member_no_registry_generates_auto_id() {
+        let team = test_team();
+        let member = &team.members[1]; // reviewer, agent_id=None
+        let profile = resolve_member_to_profile_with_registry(member, &team, None);
+        assert_eq!(profile.agent_id, "team-test-team-reviewer");
+    }
+
+    #[test]
+    fn resolve_member_no_registry_creates_fresh_profile() {
+        let team = test_team();
+        let member = &team.members[1]; // reviewer, agent_id=None
+        let profile = resolve_member_to_profile_with_registry(member, &team, None);
+
+        // member[1] has system_prompt = Some("Review carefully") → used as-is
+        assert_eq!(profile.system_prompt.as_deref(), Some("Review carefully"));
+        // Default tier is User (can_delegate = false)
+        assert_eq!(profile.tier, AgentTier::User);
+    }
+
+    // ─── T-2: can_delegate / tier propagation ──────────────────────────────
+
+    #[test]
+    fn can_delegate_true_sets_system_tier() {
+        let team = test_team();
+        let mut member = team.members[0].clone();
+        member.can_delegate = true;
+        member.max_delegation_depth = 2;
+
+        let profile = resolve_member_to_profile_with_registry(&member, &team, None);
+        assert_eq!(profile.tier, AgentTier::System);
+        assert!(profile.can_delegate);
+        assert_eq!(profile.max_delegation_depth, 2);
+    }
+
+    #[test]
+    fn can_delegate_false_keeps_user_tier() {
+        let team = test_team();
+        let member = &team.members[0]; // can_delegate = false
+        let profile = resolve_member_to_profile_with_registry(member, &team, None);
+        assert_eq!(profile.tier, AgentTier::User);
+        assert!(!profile.can_delegate);
+    }
+
+    #[test]
+    fn can_delegate_overrides_registry_tier() {
+        let team = test_team();
+        let mut member = team.members[0].clone(); // coder-agent
+        member.can_delegate = true;
+
+        let mut registry = AgentProfileRegistry::new();
+        let base = AgentProfile::new("coder-agent", "coder", AgentTier::User);
+        registry.register(base);
+
+        let profile =
+            resolve_member_to_profile_with_registry(&member, &team, Some(&registry));
+        assert_eq!(profile.tier, AgentTier::System);
+        assert!(profile.can_delegate);
+    }
+
+    // ─── T-2: Metadata injection ───────────────────────────────────────────
+
+    #[test]
+    fn metadata_includes_team_name_and_role() {
+        let team = test_team();
+        let member = &team.members[0]; // coder
+        let profile = resolve_member_to_profile_with_registry(member, &team, None);
+
+        assert_eq!(
+            profile.metadata.get("team_name"),
+            Some(&serde_json::Value::String("test-team".to_string()))
+        );
+        assert_eq!(
+            profile.metadata.get("team_role"),
+            Some(&serde_json::Value::String("coder".to_string()))
+        );
+    }
+
+    #[test]
+    fn metadata_includes_team_context() {
+        let team = test_team(); // has context = {"project": "test-project"}
+        let member = &team.members[0];
+        let profile = resolve_member_to_profile_with_registry(member, &team, None);
+
+        let ctx = profile.metadata.get("team_context").unwrap();
+        let ctx_map: HashMap<String, String> = serde_json::from_value(ctx.clone()).unwrap();
+        assert_eq!(ctx_map.get("project"), Some(&"test-project".to_string()));
+    }
+
+    #[test]
+    fn metadata_empty_context_no_team_context_key() {
+        let mut team = test_team();
+        team.context.clear();
+        let member = &team.members[0];
+        let profile = resolve_member_to_profile_with_registry(member, &team, None);
+
+        // team_name and team_role always present
+        assert!(profile.metadata.contains_key("team_name"));
+        assert!(profile.metadata.contains_key("team_role"));
+        // team_context absent when context is empty
+        assert!(!profile.metadata.contains_key("team_context"));
+    }
+
+    // ─── T-2: resolve_team bulk tests ──────────────────────────────────────
+
+    #[test]
+    fn resolve_team_returns_profiles_and_request() {
+        let team = test_team();
+        let (request, profiles) = resolve_team(&team, "Fix auth", "run-1", None).unwrap();
+
+        assert_eq!(profiles.len(), 2);
+        assert_eq!(request.task, "Fix auth");
+        assert_eq!(request.parent_run_id, "run-1");
+        assert_eq!(request.user_id, team.user_id);
+        assert_eq!(request.depth, 0);
+    }
+
+    #[test]
+    fn resolve_team_with_registry() {
+        let team = test_team();
+        let mut registry = AgentProfileRegistry::new();
+        let mut base = AgentProfile::new("coder-agent", "coder", AgentTier::System);
+        base.system_prompt = Some("Registered coder prompt.".to_string());
+        registry.register(base);
+
+        let (_request, profiles) =
+            resolve_team(&team, "task", "run-1", Some(&registry)).unwrap();
+
+        // First profile (coder-agent) should use registry base prompt
+        assert_eq!(
+            profiles[0].system_prompt.as_deref(),
+            Some("Registered coder prompt.")
+        );
+        // Second profile (reviewer) not in registry → uses member's system_prompt
+        assert_eq!(
+            profiles[1].system_prompt.as_deref(),
+            Some("Review carefully")
+        );
+    }
+
+    #[test]
+    fn resolve_team_rejects_invalid() {
+        let mut team = test_team();
+        team.members.clear();
+        let result = resolve_team(&team, "task", "run-1", None);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("at least one member"));
+    }
+
+    #[test]
+    fn resolve_team_context_propagated_to_request() {
+        let team = test_team();
+        let (request, _) = resolve_team(&team, "task", "run-1", None).unwrap();
+        assert_eq!(
+            request.context.get("project"),
+            Some(&serde_json::Value::String("test-project".to_string()))
+        );
+    }
+
+    // ─── T-2: can_delegate / max_delegation_depth serde ────────────────────
+
+    #[test]
+    fn team_member_def_serde_defaults() {
+        // Deserialize without can_delegate/max_delegation_depth → defaults
+        let json = r#"{
+            "role": "worker",
+            "agent_id": null,
+            "system_prompt": null,
+            "skills": [],
+            "model_override": null,
+            "mcp_servers": []
+        }"#;
+        let member: TeamMemberDef = serde_json::from_str(json).unwrap();
+        assert!(!member.can_delegate);
+        assert_eq!(member.max_delegation_depth, 0);
+    }
+
+    #[test]
+    fn team_member_def_serde_with_delegation() {
+        let json = r#"{
+            "role": "orchestrator",
+            "agent_id": "orch-1",
+            "system_prompt": "Run the show",
+            "skills": ["delegate"],
+            "model_override": null,
+            "mcp_servers": [],
+            "can_delegate": true,
+            "max_delegation_depth": 3
+        }"#;
+        let member: TeamMemberDef = serde_json::from_str(json).unwrap();
+        assert!(member.can_delegate);
+        assert_eq!(member.max_delegation_depth, 3);
+    }
+
+    // ─── T-2: build_coordination_pattern via resolve_team ──────────────────
+
+    #[test]
+    fn resolve_team_pipeline_pattern_stages() {
+        let team = test_team(); // Pipeline coordination
+        let (request, _) = resolve_team(&team, "task", "run-1", None).unwrap();
+        match &request.pattern {
+            CoordinationPattern::Pipeline { stages } => {
+                assert_eq!(stages.len(), 2);
+                assert_eq!(stages[0].agent_id, "coder-agent");
+                assert_eq!(stages[1].agent_id, "team-test-team-reviewer");
+            }
+            _ => panic!("expected Pipeline pattern"),
+        }
+    }
+
+    #[test]
+    fn resolve_team_adversarial_pattern() {
+        let mut team = test_team();
+        team.coordination = TeamCoordination::Adversarial {
+            max_rounds: 5,
+            threshold: 0.9,
+        };
+        let (request, _) = resolve_team(&team, "task", "run-1", None).unwrap();
+        match &request.pattern {
+            CoordinationPattern::AdversarialReview {
+                producer_id,
+                reviewer_id,
+                max_rounds,
+                acceptance_threshold,
+            } => {
+                assert_eq!(producer_id, "coder-agent");
+                assert_eq!(reviewer_id, "team-test-team-reviewer");
+                assert_eq!(*max_rounds, 5);
+                assert!((acceptance_threshold - 0.9).abs() < f64::EPSILON);
+            }
+            _ => panic!("expected AdversarialReview pattern"),
+        }
+    }
+
+    #[test]
+    fn resolve_team_fan_out_pattern() {
+        let mut team = test_team();
+        team.coordination = TeamCoordination::FanOut {
+            aggregation: "best_of".to_string(),
+        };
+        let (request, _) = resolve_team(&team, "task", "run-1", None).unwrap();
+        match &request.pattern {
+            CoordinationPattern::FanOut { agent_ids, .. } => {
+                assert_eq!(agent_ids.len(), 2);
+            }
+            _ => panic!("expected FanOut pattern"),
+        }
     }
 }

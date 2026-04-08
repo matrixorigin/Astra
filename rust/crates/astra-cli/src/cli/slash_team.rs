@@ -284,6 +284,8 @@ fn cli_team_to_definition(
                 skills: m.skills.clone(),
                 model_override: m.model_override.clone(),
                 mcp_servers: vec![],
+                can_delegate: false,
+                max_delegation_depth: 0,
             })
             .collect(),
         context: team.shared_context.clone(),
