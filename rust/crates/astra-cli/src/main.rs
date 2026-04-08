@@ -88,6 +88,8 @@ mod repl_ui;
 mod skill_subrun;
 #[path = "cli/slash_account.rs"]
 mod slash_account;
+#[path = "cli/slash_bug.rs"]
+mod slash_bug;
 #[path = "cli/slash_debug.rs"]
 mod slash_debug;
 #[path = "cli/slash_info.rs"]
@@ -141,6 +143,7 @@ use repl_ui::{
     suggest_commands,
 };
 use slash_account::handle_account_command;
+use slash_bug::handle_bug_command;
 use slash_debug::handle_debug_command;
 use slash_info::handle_info_command;
 use slash_memory::{handle_memory_domain_command, handle_plan_mode_input};
@@ -4851,6 +4854,10 @@ async fn handle_slash_command(
 
         "/cost" => {
             handle_cost_command(arg, state);
+        }
+
+        "/bug" => {
+            handle_bug_command(arg, state);
         }
 
         "/tools" => {

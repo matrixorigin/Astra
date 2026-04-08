@@ -336,6 +336,7 @@ pub(crate) async fn stream_chat_sse(
         consecutive_context_window_errors: 0,
         max_turn_input_tokens: RuntimeLimits::global().max_turn_input_tokens,
         budget_wrapup_injected: false,
+        thinking_budget_tokens: None,
         skill_listing_message: None,
         invoked_skills: std::collections::HashMap::new(),
         recent_file_reads: Vec::new(),

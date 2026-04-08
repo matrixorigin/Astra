@@ -187,24 +187,47 @@ pub fn retry_base_ms() -> u64 {
 
 /// Determine if and how to retry a failed tool call.
 ///
-/// Uses exponential backoff with deterministic jitter to prevent
-/// thundering-herd when multiple tool calls fail simultaneously.
-/// Jitter formula: `base * 2^attempt + (attempt * 7 + 3) % base`
+/// Uses exponential backoff with random jitter to prevent thundering-herd
+/// when multiple tool calls fail simultaneously.
+///
+/// When `retry_after_hint_ms` is `Some(ms)`, the server-requested delay is
+/// honoured (clamped to `[base, MAX_RETRY_AFTER_MS]`).  Otherwise, standard
+/// exponential backoff is used: `base * 2^attempt + random_jitter`.
 pub fn should_retry(category: ErrorCategory, attempt: usize) -> Option<u64> {
+    should_retry_with_hint(category, attempt, None)
+}
+
+/// Maximum server-requested retry delay we'll honour (30 s).
+const MAX_RETRY_AFTER_MS: u64 = 30_000;
+
+/// Like [`should_retry`], but accepts an optional `Retry-After` hint from the
+/// HTTP response (in milliseconds).
+pub fn should_retry_with_hint(
+    category: ErrorCategory,
+    attempt: usize,
+    retry_after_hint_ms: Option<u64>,
+) -> Option<u64> {
     if attempt >= max_tool_retries() {
         return None;
     }
     match category {
         ErrorCategory::Transient => {
             let base = retry_base_ms();
-            // Exponential backoff + deterministic jitter
-            let backoff = base * (1 << attempt);
-            let jitter = if base > 0 {
-                ((attempt as u64) * 7 + 3) % base
+            // Random jitter: [0, base/2)
+            let jitter = if base > 1 {
+                fastrand::u64(0..base / 2)
             } else {
                 0
             };
-            Some(backoff + jitter)
+            if let Some(hint) = retry_after_hint_ms {
+                // Honour server hint, clamped to [base, MAX_RETRY_AFTER_MS]
+                let clamped = hint.clamp(base, MAX_RETRY_AFTER_MS);
+                Some(clamped + jitter)
+            } else {
+                // Exponential backoff + random jitter
+                let backoff = base.saturating_mul(1 << attempt.min(10));
+                Some(backoff + jitter)
+            }
         }
         // All other categories: don't retry
         _ => None,
@@ -674,14 +697,16 @@ mod tests {
 
     #[test]
     fn retry_transient_first_attempt() {
-        // base=500, attempt=0: 500*1 + (0*7+3)%500 = 503
-        assert_eq!(should_retry(ErrorCategory::Transient, 0), Some(503));
+        // base=500, attempt=0: backoff=500, jitter ∈ [0, 250) → [500, 750)
+        let d = should_retry(ErrorCategory::Transient, 0).unwrap();
+        assert!(d >= 500 && d < 750, "attempt 0 delay={d}");
     }
 
     #[test]
     fn retry_transient_second_attempt() {
-        // base=500, attempt=1: 500*2 + (1*7+3)%500 = 1010
-        assert_eq!(should_retry(ErrorCategory::Transient, 1), Some(1010));
+        // base=500, attempt=1: backoff=1000, jitter ∈ [0, 250) → [1000, 1250)
+        let d = should_retry(ErrorCategory::Transient, 1).unwrap();
+        assert!(d >= 1000 && d < 1250, "attempt 1 delay={d}");
     }
 
     #[test]
@@ -1094,6 +1119,60 @@ mod tests {
         assert_eq!(
             classify_error("Error: Is a directory"),
             ErrorCategory::NotFound
+        );
+    }
+
+    // ── should_retry_with_hint tests ──
+
+    #[test]
+    fn retry_with_hint_honours_server_delay() {
+        let delay = should_retry_with_hint(ErrorCategory::Transient, 0, Some(5000)).unwrap();
+        // hint=5000ms, clamped to [500, 30000], plus jitter [0, 250)
+        assert!(delay >= 5000 && delay < 5250, "delay={delay}");
+    }
+
+    #[test]
+    fn retry_with_hint_clamps_low_to_base() {
+        // Server says 50ms but base is 500ms → clamped up to 500
+        let delay = should_retry_with_hint(ErrorCategory::Transient, 0, Some(50)).unwrap();
+        assert!(delay >= 500 && delay < 750, "delay={delay}");
+    }
+
+    #[test]
+    fn retry_with_hint_clamps_high_to_max() {
+        // Server says 60s but max is 30s → clamped down to 30000
+        let delay = should_retry_with_hint(ErrorCategory::Transient, 0, Some(60_000)).unwrap();
+        assert!(delay >= 30_000 && delay < 30_250, "delay={delay}");
+    }
+
+    #[test]
+    fn retry_with_hint_none_uses_exponential() {
+        let delay = should_retry_with_hint(ErrorCategory::Transient, 0, None).unwrap();
+        // Same as should_retry: base=500 + jitter [0, 250) → [500, 750)
+        assert!(delay >= 500 && delay < 750, "delay={delay}");
+    }
+
+    #[test]
+    fn retry_with_hint_respects_max_attempts() {
+        assert!(should_retry_with_hint(ErrorCategory::Transient, 2, Some(1000)).is_none());
+    }
+
+    #[test]
+    fn retry_with_hint_non_transient_never_retries() {
+        assert!(should_retry_with_hint(ErrorCategory::Auth, 0, Some(1000)).is_none());
+        assert!(should_retry_with_hint(ErrorCategory::ResourceLimit, 0, Some(1000)).is_none());
+    }
+
+    #[test]
+    fn retry_jitter_is_non_deterministic() {
+        // Run 20 retries — if jitter is truly random, we should see at least 2 distinct values
+        let delays: Vec<u64> = (0..20)
+            .map(|_| should_retry(ErrorCategory::Transient, 0).unwrap())
+            .collect();
+        let unique: std::collections::HashSet<u64> = delays.iter().copied().collect();
+        assert!(
+            unique.len() >= 2,
+            "expected non-deterministic jitter, got {unique:?}"
         );
     }
 }

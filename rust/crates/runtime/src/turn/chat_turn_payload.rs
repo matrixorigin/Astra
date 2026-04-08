@@ -21,6 +21,9 @@ pub struct ChatTurnBasePayloadInput<'a> {
     pub capabilities: Vec<String>,
     pub project_root: &'a Path,
     pub git_branch: Option<String>,
+    /// Optional thinking/reasoning budget in tokens. When Some, the server should
+    /// constrain extended-thinking output to this many tokens.
+    pub thinking_budget_tokens: Option<u32>,
 }
 
 /// Invariant fields for `POST /chat/stream` (or equivalent) before dynamic tool schemas and callbacks.
@@ -38,8 +41,9 @@ pub fn chat_turn_base_payload(input: ChatTurnBasePayloadInput<'_>) -> Value {
         capabilities,
         project_root,
         git_branch,
+        thinking_budget_tokens,
     } = input;
-    json!({
+    let mut payload = json!({
         "messages": messages,
         "session_id": session_id,
         "model": model,
@@ -51,7 +55,13 @@ pub fn chat_turn_base_payload(input: ChatTurnBasePayloadInput<'_>) -> Value {
             git_branch,
             detect_workspace_context(project_root),
         ),
-    })
+    });
+    if let Some(budget) = thinking_budget_tokens {
+        if let Some(obj) = payload.as_object_mut() {
+            obj.insert("thinking_budget_tokens".to_string(), json!(budget));
+        }
+    }
+    payload
 }
 
 /// Set `edge_profile.active_skills` when the edge detected system skill hints in the user message.
@@ -148,6 +158,7 @@ mod tests {
             capabilities: vec!["bash".into(), "fs".into()],
             project_root: Path::new("/tmp"),
             git_branch: Some("main".into()),
+            thinking_budget_tokens: None,
         });
         assert_eq!(p["messages"], json!(msgs));
         assert_eq!(p["session_id"], Value::Null);
@@ -159,6 +170,8 @@ mod tests {
         assert_eq!(p["edge_profile"]["cwd"], "/tmp");
         assert_eq!(p["edge_profile"]["git_branch"], "main");
         assert!(p["edge_profile"].get("memoria_url").is_some());
+        // thinking_budget_tokens = None → field absent
+        assert!(p.get("thinking_budget_tokens").is_none());
     }
 
     #[test]
@@ -173,9 +186,44 @@ mod tests {
             capabilities: vec![],
             project_root: Path::new("/"),
             git_branch: None,
+            thinking_budget_tokens: None,
         });
         assert_eq!(p["session_id"], "sess-1");
         assert_eq!(p["explain"], json!("verbose"));
+    }
+
+    #[test]
+    fn base_payload_thinking_budget_included_when_some() {
+        let p = chat_turn_base_payload(ChatTurnBasePayloadInput {
+            messages: &[],
+            session_id: None,
+            model: Some("claude-thinking"),
+            explain_verbose: false,
+            explain_on: false,
+            edge_executor_id: "e",
+            capabilities: vec![],
+            project_root: Path::new("/"),
+            git_branch: None,
+            thinking_budget_tokens: Some(10000),
+        });
+        assert_eq!(p["thinking_budget_tokens"], 10000);
+    }
+
+    #[test]
+    fn base_payload_thinking_budget_absent_when_none() {
+        let p = chat_turn_base_payload(ChatTurnBasePayloadInput {
+            messages: &[],
+            session_id: None,
+            model: Some("gpt-4o"),
+            explain_verbose: false,
+            explain_on: false,
+            edge_executor_id: "e",
+            capabilities: vec![],
+            project_root: Path::new("/"),
+            git_branch: None,
+            thinking_budget_tokens: None,
+        });
+        assert!(p.get("thinking_budget_tokens").is_none());
     }
 
     #[test]

@@ -21,6 +21,15 @@ use crate::protocol::{
 };
 use crate::sse::SseParser;
 
+/// Parse the `Retry-After` header value into seconds.
+/// Supports integer seconds format; ignores HTTP-date format.
+/// Clamps to [1, 120] seconds. Returns `None` on missing/unparseable.
+fn parse_retry_after(headers: &HeaderMap) -> Option<u64> {
+    let raw = headers.get("retry-after")?.to_str().ok()?;
+    let secs: u64 = raw.trim().parse().ok()?;
+    Some(secs.clamp(1, 120))
+}
+
 /// Stateless façade over the astra HTTP API (thin client).
 #[derive(Debug, Clone)]
 pub struct ThinClient {
@@ -804,7 +813,10 @@ impl ThinClient {
             .await?)
     }
 
-    /// Retry on 429 up to `max_attempts` (same policy as astra CLI).
+    /// Retry on 429 and transport errors up to `max_attempts`, honouring `Retry-After` header.
+    ///
+    /// Transport errors (connection reset, timeout) are retried with exponential backoff.
+    /// The total retry budget is capped at `max_attempts` across both 429s and transport errors.
     pub async fn post_chat_turn_retry_429(
         &self,
         token: &str,
@@ -812,19 +824,38 @@ impl ThinClient {
         max_attempts: u32,
         quiet: bool,
     ) -> Result<Response, ThinClientError> {
+        let mut last_err: Option<ThinClientError> = None;
         for attempt in 0..max_attempts {
-            let resp = self.post_chat_turn(token, payload).await?;
-            if resp.status().as_u16() == 429 && attempt + 1 < max_attempts {
-                let delay_secs = 2u64 << attempt;
-                if !quiet {
-                    eprintln!("  ⏳ Rate limited (429), retrying in {delay_secs}s…");
+            match self.post_chat_turn(token, payload).await {
+                Ok(resp) => {
+                    if resp.status().as_u16() == 429 && attempt + 1 < max_attempts {
+                        let delay_secs =
+                            parse_retry_after(resp.headers()).unwrap_or(2u64 << attempt);
+                        if !quiet {
+                            eprintln!("  ⏳ Rate limited (429), retrying in {delay_secs}s…");
+                        }
+                        tokio::time::sleep(Duration::from_secs(delay_secs)).await;
+                        continue;
+                    }
+                    return Ok(resp);
                 }
-                tokio::time::sleep(Duration::from_secs(delay_secs)).await;
-                continue;
+                Err(e) => {
+                    if attempt + 1 < max_attempts && e.is_transport() {
+                        let delay_secs = 1u64 << attempt; // 1s, 2s, 4s…
+                        if !quiet {
+                            eprintln!(
+                                "  ⏳ Transport error, retrying in {delay_secs}s… ({e})"
+                            );
+                        }
+                        tokio::time::sleep(Duration::from_secs(delay_secs)).await;
+                        last_err = Some(e);
+                        continue;
+                    }
+                    return Err(e);
+                }
             }
-            return Ok(resp);
         }
-        Err(ThinClientError::SseParse("retry exhausted".into()))
+        Err(last_err.unwrap_or_else(|| ThinClientError::SseParse("retry exhausted".into())))
     }
 
     /// `POST /chat/stream` — yields classified SSE events.
@@ -1574,5 +1605,86 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status().as_u16(), 200);
+    }
+
+    // ── parse_retry_after tests ─────────────────────────────────────────
+
+    #[test]
+    fn parse_retry_after_valid_integer() {
+        let mut headers = HeaderMap::new();
+        headers.insert("retry-after", HeaderValue::from_static("5"));
+        assert_eq!(parse_retry_after(&headers), Some(5));
+    }
+
+    #[test]
+    fn parse_retry_after_clamps_high() {
+        let mut headers = HeaderMap::new();
+        headers.insert("retry-after", HeaderValue::from_static("999"));
+        assert_eq!(parse_retry_after(&headers), Some(120));
+    }
+
+    #[test]
+    fn parse_retry_after_clamps_zero_to_one() {
+        let mut headers = HeaderMap::new();
+        headers.insert("retry-after", HeaderValue::from_static("0"));
+        assert_eq!(parse_retry_after(&headers), Some(1));
+    }
+
+    #[test]
+    fn parse_retry_after_missing_header() {
+        let headers = HeaderMap::new();
+        assert_eq!(parse_retry_after(&headers), None);
+    }
+
+    #[test]
+    fn parse_retry_after_non_numeric() {
+        let mut headers = HeaderMap::new();
+        // HTTP-date format not supported — returns None
+        headers.insert(
+            "retry-after",
+            HeaderValue::from_static("Wed, 09 Apr 2026 12:00:00 GMT"),
+        );
+        assert_eq!(parse_retry_after(&headers), None);
+    }
+
+    #[test]
+    fn parse_retry_after_whitespace_trimmed() {
+        let mut headers = HeaderMap::new();
+        headers.insert("retry-after", HeaderValue::from_static("  10  "));
+        assert_eq!(parse_retry_after(&headers), Some(10));
+    }
+
+    #[tokio::test]
+    async fn retry_429_honours_retry_after_header() {
+        let srv = MockServer::start().await;
+        // First call → 429 with Retry-After: 1, second → 200
+        Mock::given(method("POST"))
+            .and(path("/chat/turn"))
+            .respond_with(
+                ResponseTemplate::new(429)
+                    .insert_header("Retry-After", "1")
+                    .set_body_string("rate limited"),
+            )
+            .up_to_n_times(1)
+            .mount(&srv)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/turn"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("ok"))
+            .mount(&srv)
+            .await;
+
+        let client = ThinClient::new(&srv.uri(), None).unwrap();
+        let payload = serde_json::json!({"msg": "hello"});
+        let start = std::time::Instant::now();
+        let resp = client
+            .post_chat_turn_retry_429("t", &payload, 3, true)
+            .await
+            .unwrap();
+        let elapsed = start.elapsed();
+        assert_eq!(resp.status().as_u16(), 200);
+        // Should wait ~1s (from Retry-After: 1), not 2s (default)
+        assert!(elapsed >= Duration::from_millis(900), "waited too little");
+        assert!(elapsed < Duration::from_millis(1800), "waited too long — Retry-After not honoured");
     }
 }
