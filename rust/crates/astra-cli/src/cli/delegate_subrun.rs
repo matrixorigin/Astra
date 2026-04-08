@@ -260,7 +260,7 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
             skill_listing_message: None,
             invoked_skills: HashMap::new(),
             recent_file_reads: Vec::new(),
-            mailbox: None,
+            mailbox: config.mailbox,
         };
 
         let loop_result = run_agentic_loop_with_host(&mut host, &mut state).await;
