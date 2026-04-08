@@ -2833,10 +2833,10 @@ mod tests {
 
     // ─── Fork Pattern Tests ─────────────────────────────────────────────
 
-    fn fork_request(tasks: Vec<&str>, agent_id: &str) -> DelegationRequest {
+    fn fork_request(del_id: &str, tasks: Vec<&str>, agent_id: &str) -> DelegationRequest {
         DelegationRequest {
-            delegation_id: "del-fork".into(),
-            parent_run_id: "parent-fork".into(),
+            delegation_id: del_id.into(),
+            parent_run_id: format!("parent-{del_id}"),
             task: "fork test".into(),
             pattern: CoordinationPattern::Fork {
                 tasks: tasks.into_iter().map(String::from).collect(),
@@ -2854,13 +2854,13 @@ mod tests {
     async fn fork_spawns_parallel_children() {
         let (_, _engine, tracker, de) = setup_with_executor(Arc::new(EchoExecutor));
 
-        let req = fork_request(vec!["task-a", "task-b", "task-c"], "writer");
+        let req = fork_request("del-fork-spawn", vec!["task-a", "task-b", "task-c"], "writer");
         let result = de.execute(req, "orch").await.unwrap();
 
         assert_eq!(result.agent_results.len(), 3);
         assert_eq!(result.status, "completed");
 
-        let subs = tracker.get_sub_runs("del-fork").await;
+        let subs = tracker.get_sub_runs("del-fork-spawn").await;
         assert_eq!(subs.len(), 3);
         for sub in &subs {
             assert_eq!(sub.agent_id, "writer");
@@ -2902,7 +2902,7 @@ mod tests {
             reg, engine, tracker, Arc::new(DelegateCheckExecutor),
         );
 
-        let req = fork_request(vec!["task-a"], "writer");
+        let req = fork_request("del-fork-deleg", vec!["task-a"], "writer");
         let result = de.execute(req, "orch").await.unwrap();
 
         assert_eq!(result.agent_results[0].output.as_deref(), Some("can_delegate=false,depth=0"));
@@ -2916,7 +2916,7 @@ mod tests {
         let (reg, engine, tracker) = setup();
         let de = DelegationEngine::with_executor(reg, engine, tracker, executor);
 
-        let req = fork_request(vec!["task-a", "task-b"], "writer");
+        let req = fork_request("del-fork-fail", vec!["task-a", "task-b"], "writer");
         let result = de.execute(req, "orch").await.unwrap();
 
         // All children use "writer" which fails → all failed
@@ -2931,7 +2931,7 @@ mod tests {
     async fn fork_single_task() {
         let (_, _, _, de) = setup_with_executor(Arc::new(EchoExecutor));
 
-        let req = fork_request(vec!["only-task"], "writer");
+        let req = fork_request("del-fork-single", vec!["only-task"], "writer");
         let result = de.execute(req, "orch").await.unwrap();
 
         assert_eq!(result.agent_results.len(), 1);
@@ -2968,7 +2968,7 @@ mod tests {
             reg, engine, tracker, Arc::new(ForkContextCheckExecutor),
         );
 
-        let req = fork_request(vec!["a", "b"], "writer");
+        let req = fork_request("del-fork-ctx", vec!["a", "b"], "writer");
         let result = de.execute(req, "orch").await.unwrap();
 
         // Both children should have fork metadata

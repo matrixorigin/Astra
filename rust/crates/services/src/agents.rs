@@ -427,6 +427,9 @@ impl AgentService for UnconfiguredAgentService {
 
 // ── In-memory implementation for testing ─────────────────────────────────────
 
+/// In-memory agent store for unit / integration tests.
+///
+/// Uses `std::sync::RwLock` internally — not intended for production use.
 pub struct InMemoryAgentService {
     agents: std::sync::RwLock<Vec<AgentRecord>>,
 }
@@ -460,7 +463,7 @@ impl AgentService for InMemoryAgentService {
             created_at: now,
             updated_at: None,
         };
-        self.agents.write().unwrap().push(record.clone());
+        self.agents.write().expect("agent lock poisoned").push(record.clone());
         Ok(record)
     }
 
@@ -468,7 +471,7 @@ impl AgentService for InMemoryAgentService {
         &self,
         user_id: String,
     ) -> Result<AgentListRecord, (StatusCode, Json<ErrorResponse>)> {
-        let agents = self.agents.read().unwrap();
+        let agents = self.agents.read().expect("agent lock poisoned");
         let items: Vec<AgentListItem> = agents.iter()
             .filter(|a| a.owner_user_id == user_id)
             .map(|a| AgentListItem {
@@ -490,7 +493,7 @@ impl AgentService for InMemoryAgentService {
         agent_id: String,
         user_id: String,
     ) -> Result<AgentRecord, (StatusCode, Json<ErrorResponse>)> {
-        let agents = self.agents.read().unwrap();
+        let agents = self.agents.read().expect("agent lock poisoned");
         agents.iter()
             .find(|a| a.agent_id == agent_id && a.owner_user_id == user_id)
             .cloned()
@@ -503,7 +506,7 @@ impl AgentService for InMemoryAgentService {
         user_id: String,
         request: AgentUpdateRequestData,
     ) -> Result<AgentRecord, (StatusCode, Json<ErrorResponse>)> {
-        let mut agents = self.agents.write().unwrap();
+        let mut agents = self.agents.write().expect("agent lock poisoned");
         let agent = agents.iter_mut()
             .find(|a| a.agent_id == agent_id && a.owner_user_id == user_id)
             .ok_or_else(|| error_response(StatusCode::NOT_FOUND, "agent not found"))?;
@@ -520,7 +523,7 @@ impl AgentService for InMemoryAgentService {
         agent_id: String,
         user_id: String,
     ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
-        let mut agents = self.agents.write().unwrap();
+        let mut agents = self.agents.write().expect("agent lock poisoned");
         let len_before = agents.len();
         agents.retain(|a| !(a.agent_id == agent_id && a.owner_user_id == user_id));
         if agents.len() == len_before {
