@@ -43,6 +43,10 @@ pub mod types;
 
 #[cfg(test)]
 mod integration_tests;
+#[cfg(test)]
+mod e2e_loop_tests;
+#[cfg(test)]
+mod db_transport_integration_tests;
 
 // Re-export key types for convenience.
 pub use db_transport::DatabaseTransport;
