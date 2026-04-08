@@ -889,21 +889,26 @@ impl VerificationRunner {
                 contains,
                 not_contains,
             } => {
-                let full = self.work_dir.join(path);
-                // Security: prevent path traversal (e.g. "../../../etc/passwd")
-                let canonical = full
-                    .canonicalize()
-                    .map_err(|e| format!("invalid path {path}: {e}"))?;
-                let work_canonical = self
-                    .work_dir
-                    .canonicalize()
-                    .map_err(|e| format!("work_dir canonicalization failed: {e}"))?;
-                if !canonical.starts_with(&work_canonical) {
-                    return Err(format!(
-                        "path '{path}' escapes work directory boundary"
-                    ));
-                }
-                let content = std::fs::read_to_string(&canonical)
+                let resolved = if std::path::Path::new(path).is_absolute() {
+                    std::path::PathBuf::from(path)
+                } else {
+                    let full = self.work_dir.join(path);
+                    // Security: prevent relative path traversal (e.g. "../../../etc/passwd")
+                    let canonical = full
+                        .canonicalize()
+                        .map_err(|e| format!("invalid path {path}: {e}"))?;
+                    let work_canonical = self
+                        .work_dir
+                        .canonicalize()
+                        .map_err(|e| format!("work_dir canonicalization failed: {e}"))?;
+                    if !canonical.starts_with(&work_canonical) {
+                        return Err(format!(
+                            "path '{path}' escapes work directory boundary"
+                        ));
+                    }
+                    canonical
+                };
+                let content = std::fs::read_to_string(&resolved)
                     .map_err(|e| format!("read {path}: {e}"))?;
                 let has_all = contains.iter().all(|s| content.contains(s));
                 let has_none = not_contains.iter().all(|s| !content.contains(s));
@@ -4085,6 +4090,35 @@ mod tests {
                 .map(|e| e.contains("escapes work directory"))
                 .unwrap_or(false),
             "expected boundary escape error, got: {:?}",
+            res.error
+        );
+    }
+
+    #[tokio::test]
+    async fn read_file_contains_allows_absolute_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Create file at a known absolute path outside work_dir
+        let tmp_file = dir.path().join("outside.html");
+        std::fs::write(&tmp_file, "<html>hello</html>").expect("write");
+        // Use a different temp dir as work_dir so the file is outside
+        let work_dir = tempfile::tempdir().expect("work tempdir");
+        let runner = VerificationRunner::new(work_dir.path().to_path_buf());
+        let crit = VerificationCriterion {
+            id: "abs-path".into(),
+            description: "read absolute path outside work_dir".into(),
+            verifier: VerifierKind::ReadFileContains {
+                path: tmp_file.to_str().unwrap().into(),
+                contains: vec!["</html>".into()],
+                not_contains: vec![],
+            },
+            required: true,
+            timeout_sec: 10,
+            global_only: false,
+        };
+        let res = runner.run_criterion(&crit).await;
+        assert!(
+            res.passed,
+            "absolute paths should be allowed; error: {:?}",
             res.error
         );
     }
