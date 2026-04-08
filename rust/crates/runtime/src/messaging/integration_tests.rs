@@ -414,4 +414,162 @@ mod tests {
             }
         }
     }
+
+    // ─── Ack / Nack flow ────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn requires_ack_message_receives_ack_reply() {
+        let (_router, mut parent, mut children, _dt) =
+            setup_delegation(1, "del-ack-reply").await;
+
+        // Child sends message with requires_ack.
+        let msg = AgentMessage::new(
+            children[0].address.clone(),
+            MessageTarget::Parent,
+            MessagePayload::Text {
+                content: "need confirmation".to_string(),
+                summary: None,
+            },
+        )
+        .with_ack_required();
+        assert!(msg.requires_ack);
+
+        children[0].send(msg.clone()).await.unwrap();
+
+        // Parent receives the message.
+        let received = parent.drain();
+        assert_eq!(received.len(), 1);
+        assert!(received[0].requires_ack);
+
+        // Parent sends ack back.
+        let ack = received[0].make_ack(parent.address.clone());
+        parent.send(ack).await.unwrap();
+
+        // Child receives the ack.
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        let replies = children[0].drain();
+        assert_eq!(replies.len(), 1);
+        match &replies[0].payload {
+            MessagePayload::Ack { message_id } => {
+                assert_eq!(message_id, &msg.id);
+            }
+            other => panic!("expected Ack, got: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn nack_message_carries_reason() {
+        let (_router, mut parent, mut children, _dt) =
+            setup_delegation(1, "del-nack").await;
+
+        let msg = AgentMessage::new(
+            children[0].address.clone(),
+            MessageTarget::Parent,
+            MessagePayload::Text {
+                content: "bad request".to_string(),
+                summary: None,
+            },
+        )
+        .with_ack_required();
+
+        children[0].send(msg.clone()).await.unwrap();
+        let received = parent.drain();
+        assert_eq!(received.len(), 1);
+
+        // Parent nacks.
+        let nack = received[0].make_nack(
+            parent.address.clone(),
+            Some("invalid format".to_string()),
+        );
+        parent.send(nack).await.unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        let replies = children[0].drain();
+        assert_eq!(replies.len(), 1);
+        match &replies[0].payload {
+            MessagePayload::Nack { message_id, reason } => {
+                assert_eq!(message_id, &msg.id);
+                assert_eq!(reason.as_deref(), Some("invalid format"));
+            }
+            other => panic!("expected Nack, got: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn send_tool_with_requires_ack_returns_tracked_message() {
+        let (_router, _parent, children, _dt) =
+            setup_delegation(2, "del-ack-tracked").await;
+
+        let args = serde_json::json!({
+            "target": "parent",
+            "content": "tracked message",
+            "requires_ack": true,
+        });
+
+        let result = send_tool::execute_send_message(&children[0], &args).await;
+        assert!(result.display.starts_with("✓"), "Expected success: {}", result.display);
+        assert!(result.tracked_message.is_some(), "Should return tracked message");
+        assert!(result.tracked_message.unwrap().requires_ack);
+    }
+
+    #[tokio::test]
+    async fn send_tool_without_ack_returns_no_tracked_message() {
+        let (_router, _parent, children, _dt) =
+            setup_delegation(2, "del-no-ack").await;
+
+        let args = serde_json::json!({
+            "target": "parent",
+            "content": "regular message",
+        });
+
+        let result = send_tool::execute_send_message(&children[0], &args).await;
+        assert!(result.display.starts_with("✓"));
+        assert!(result.tracked_message.is_none(), "Should NOT track when requires_ack is false");
+    }
+
+    #[tokio::test]
+    async fn ack_tracker_end_to_end_with_mailbox() {
+        use crate::messaging::ack_tracker::{AckConfig, PendingAckTracker};
+
+        let (_router, mut parent, mut children, _dt) =
+            setup_delegation(1, "del-ack-e2e").await;
+
+        // Create a tracker for the child.
+        let tracker = PendingAckTracker::with_config(AckConfig {
+            ack_timeout: std::time::Duration::from_millis(200),
+            max_retries: 2,
+            sweep_interval: std::time::Duration::from_millis(50),
+        });
+
+        // Child sends a requires_ack message and tracks it.
+        let msg = AgentMessage::new(
+            children[0].address.clone(),
+            MessageTarget::Parent,
+            MessagePayload::Text {
+                content: "important".to_string(),
+                summary: None,
+            },
+        )
+        .with_ack_required();
+
+        children[0].send(msg.clone()).await.unwrap();
+        tracker.track(std::sync::Arc::new(msg.clone())).await;
+        assert_eq!(tracker.pending_count().await, 1);
+
+        // Parent acks.
+        let received = parent.drain();
+        let ack = received[0].make_ack(parent.address.clone());
+        parent.send(ack).await.unwrap();
+
+        // Child receives ack and routes to tracker.
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        let replies = children[0].drain();
+        for reply in &replies {
+            if let MessagePayload::Ack { message_id } = &reply.payload {
+                tracker.acknowledge(message_id).await;
+            }
+        }
+
+        assert_eq!(tracker.pending_count().await, 0);
+    }
 }
