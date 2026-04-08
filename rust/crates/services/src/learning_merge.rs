@@ -43,21 +43,29 @@ impl VersionVector {
 
     /// Returns true if `self` causally happened before `other`.
     ///
-    /// `self ≤ other` component-wise AND `self ≠ other`.
+    /// `self ≤ other` component-wise AND `self ≠ other` (missing keys treated as 0).
     pub fn happened_before(&self, other: &VersionVector) -> bool {
-        if self.clocks == other.clocks {
+        // All keys in self must be ≤ corresponding value in other
+        let all_le = self.clocks.iter().all(|(k, v)| *v <= other.get(k));
+        if !all_le {
             return false;
         }
-        self.clocks.iter().all(|(k, v)| {
-            other.clocks.get(k).map_or(false, |ov| v <= ov)
-        })
+        // Must be strictly less in at least one dimension (across all keys in either vector)
+        self.clocks.iter().any(|(k, v)| *v < other.get(k))
+            || other.clocks.iter().any(|(k, v)| *v > self.get(k))
     }
 
     /// Returns true if the events are concurrent (incomparable).
     pub fn concurrent_with(&self, other: &VersionVector) -> bool {
         !self.happened_before(other)
             && !other.happened_before(self)
-            && self.clocks != other.clocks
+            && !self.vv_equal(other)
+    }
+
+    /// VV-aware equality (treats missing keys as 0).
+    fn vv_equal(&self, other: &VersionVector) -> bool {
+        self.clocks.iter().all(|(k, v)| *v == other.get(k))
+            && other.clocks.iter().all(|(k, v)| *v == self.get(k))
     }
 
     /// Get the clock value for an agent (0 if not present).
@@ -256,8 +264,8 @@ mod tests {
     fn vv_missing_key_means_zero() {
         let v1 = make_vv(&[("a", 1)]);
         let v2 = make_vv(&[("a", 1), ("b", 1)]);
-        // v1 is NOT happened-before v2 because v1 doesn't have "b"
-        // but all of v1's clocks ≤ v2's → actually it is
+        // v1={a:1} with missing "b" treated as 0
+        // so v1={a:1,b:0} < v2={a:1,b:1} → happened_before
         assert!(v1.happened_before(&v2));
     }
 

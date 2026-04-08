@@ -23,6 +23,13 @@ use tokio::process::Command;
 
 // ─── Types ──────────────────────────────────────────────────────────────────
 
+/// Sanitize agent_id for safe use in git branch names and filesystem paths.
+fn sanitize_agent_id(id: &str) -> String {
+    id.chars()
+        .filter(|c| c.is_alphanumeric() || *c == '-' || *c == '_')
+        .collect()
+}
+
 /// Manages git worktrees for multi-agent parallel file editing.
 pub struct WorktreeManager {
     repo_root: PathBuf,
@@ -136,7 +143,8 @@ impl WorktreeManager {
         tokio::fs::create_dir_all(&self.worktree_base).await?;
 
         for agent_id in agent_ids {
-            let branch_name = format!("agent/{agent_id}-{del_prefix}");
+            let safe_id = sanitize_agent_id(agent_id);
+            let branch_name = format!("agent/{safe_id}-{del_prefix}");
             let wt_path = self.worktree_base.join(&branch_name.replace('/', "_"));
 
             // git worktree add -b <branch> <path> HEAD
