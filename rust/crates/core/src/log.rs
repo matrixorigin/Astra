@@ -57,6 +57,26 @@ macro_rules! agent_persist_fail {
     };
 }
 
+/// Log-and-discard helper for best-effort persistence calls.
+///
+/// Evaluates `$expr` (an async `Result`). On `Err`, logs a warning with the
+/// component tag, operation label, run ID, and error — then continues.
+/// Persistence failures must not abort control flow, but silent discard
+/// (`let _ = ...`) hides diagnostics.
+///
+/// # Example
+/// ```ignore
+/// log_persist!(engine.persist_status(&id, "running", None, None).await, "bridge", &id, "status");
+/// ```
+#[macro_export]
+macro_rules! log_persist {
+    ($expr:expr, $component:expr, $run_id:expr, $op:expr) => {
+        if let Err(e) = $expr {
+            $crate::agent_warn!($component, "persist {} for run {}: {}", $op, $run_id, e);
+        }
+    };
+}
+
 /// Structured tool event log with key=value fields.
 /// Used for tool errors, retries, and escalations.
 ///

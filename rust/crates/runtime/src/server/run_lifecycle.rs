@@ -38,15 +38,11 @@ use super::delegation_engine::{STATUS_CANCELLED, STATUS_COMPLETED, STATUS_FAILED
 use super::run_engine::RunEngine;
 use super::server_loop_host::ServerAgenticLoopHostBuilder;
 
-/// Log-and-discard helper for best-effort persistence calls.
-/// Mirrors the `log_persist!` macro in `delegation_engine` — persistence
-/// failures must not abort the run lifecycle, but silent discard hides
-/// diagnostics. This logs at warn level instead.
+/// Best-effort persistence helper — delegates to [`astra_core::log_persist!`]
+/// with component tag `"run_lifecycle"`.
 macro_rules! log_persist {
     ($expr:expr, $run_id:expr, $op:expr) => {
-        if let Err(e) = $expr {
-            astra_core::agent_warn!("run_lifecycle", "persist {} for run {}: {}", $op, $run_id, e);
-        }
+        astra_core::log_persist!($expr, "run_lifecycle", $run_id, $op)
     };
 }
 
@@ -105,11 +101,11 @@ pub enum RunStatus {
 impl RunStatus {
     fn as_str(&self) -> &'static str {
         match self {
-            Self::Running => "running",
-            Self::Paused => "paused",
-            Self::Completed => "completed",
-            Self::Failed => "failed",
-            Self::Cancelled => "cancelled",
+            Self::Running => STATUS_RUNNING,
+            Self::Paused => STATUS_PAUSED,
+            Self::Completed => STATUS_COMPLETED,
+            Self::Failed => STATUS_FAILED,
+            Self::Cancelled => STATUS_CANCELLED,
         }
     }
 }

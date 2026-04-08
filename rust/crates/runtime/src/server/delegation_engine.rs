@@ -40,14 +40,11 @@ pub const STATUS_CANCELLED: &str = "cancelled";
 pub const STATUS_WAITING: &str = "waiting";
 pub const STATUS_VERIFICATION_FAILED: &str = "verification_failed";
 
-/// Log-and-discard helper for best-effort persistence calls.
-/// These calls must not abort the delegation flow — a failed status write
-/// is a diagnostic issue, not a control-flow error.
+/// Best-effort persistence helper — delegates to [`astra_core::log_persist!`]
+/// with component tag `"delegation"`.
 macro_rules! log_persist {
     ($expr:expr, $run_id:expr, $op:expr) => {
-        if let Err(e) = $expr {
-            astra_core::agent_warn!("delegation", "persist {} for run {}: {}", $op, $run_id, e);
-        }
+        astra_core::log_persist!($expr, "delegation", $run_id, $op)
     };
 }
 
