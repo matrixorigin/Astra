@@ -411,7 +411,7 @@ async fn handle_mcp_unsubscribe(arg: &str, state: &ReplState) {
 
 /// `/mcp log-level <server> <level>` — set logging level for an MCP server.
 async fn handle_mcp_log_level(arg: &str, state: &ReplState) {
-    let parts: Vec<&str> = arg.trim().split_whitespace().collect();
+    let parts: Vec<&str> = arg.split_whitespace().collect();
     if parts.len() != 2 {
         eprintln!("{}", "  Usage: /mcp log-level <server> <level>".dim());
         eprintln!(
