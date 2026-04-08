@@ -18,7 +18,7 @@ pub fn build_skill_dev_prefix(skill_name: &str, skill_path: &str, skill_src: &st
          - `when_to_use` must start with \"Use when...\" and include trigger phrases.\n\
          - `allowed_tools` should be minimal — list only what the skill actually needs.\n\
          - If the skill takes parameters, define `arguments` in frontmatter and use `$ARG_NAME` in the body.\n\
-         - Prefer built-in tools (`read_file`, `write_file`, `delegate`) over `bash` where possible.\n\n"
+         - Prefer built-in tools (`read_file`, `write_file`) over `bash` where possible.\n\n"
     )
 }
 
