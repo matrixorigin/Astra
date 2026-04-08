@@ -334,13 +334,10 @@ async fn poll_loop(
             let broadcast_result = query(
                 "SELECT id, payload_json FROM agent_message_queue
                  WHERE delegation_id = ? AND is_broadcast = TRUE AND id > ?
-                   AND NOT (from_run_id = ? AND from_agent_id = ?)
                  ORDER BY id ASC LIMIT ?",
             )
             .bind(did)
             .bind(last_broadcast_id)
-            .bind(&addr.run_id)
-            .bind(&addr.agent_id)
             .bind(POLL_BATCH_SIZE)
             .fetch_all(&pool)
             .await;
@@ -445,21 +442,14 @@ mod tests {
     }
 
     #[test]
-    fn broadcast_message_excludes_sender_filter() {
-        // The SQL WHERE clause `NOT (from_run_id=? AND from_agent_id=?)` should
-        // exclude the sender. This test verifies the logic conceptually.
+    fn broadcast_delivers_to_all_subscribers() {
+        // Broadcast delivers to ALL subscribers in a delegation group,
+        // consistent with InProcessTransport behavior. No sender exclusion.
         let sender = addr("run-1", "leader");
         let other = addr("run-2", "worker");
 
-        // Sender should be excluded.
-        let is_sender =
-            sender.run_id == "run-1" && sender.agent_id == "leader";
-        assert!(is_sender);
-
-        // Other should not be excluded.
-        let is_other_sender =
-            other.run_id == "run-1" && other.agent_id == "leader";
-        assert!(!is_other_sender);
+        // Both should receive broadcasts — sender is NOT excluded.
+        assert_ne!(sender, other);
     }
 
     #[test]
