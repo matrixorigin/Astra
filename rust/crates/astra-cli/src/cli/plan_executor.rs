@@ -1253,7 +1253,7 @@ mod tests {
     use astra_runtime::pipeline::entity::EntityGraph;
     use astra_runtime::pipeline::pattern::PatternLibrary;
     use astra_runtime::pipeline::routing::{DomainHint, TaskType};
-    use astra_runtime::tool_selector::{SelectionContext, ToolSelector};
+    use astra_runtime::tool_selector::SelectionContext;
 
     fn test_background_plan_context(
         entity_graph: Option<Arc<Mutex<EntityGraph>>>,
@@ -1261,7 +1261,9 @@ mod tests {
         calibrator: Option<Arc<Mutex<ProgressiveCalibrator>>>,
     ) -> BackgroundPlanContext {
         let mut reg = astra_runtime::skills::UnifiedSkillRegistry::new();
-        reg.add_provider(Box::new(astra_runtime::skills::LocalSkillProvider::standard()));
+        reg.add_provider(Box::new(
+            astra_runtime::skills::LocalSkillProvider::standard(),
+        ));
         reg.add_provider(Box::new(
             astra_runtime::skills::BundledSkillProvider::with_defaults(),
         ));
@@ -1408,11 +1410,8 @@ mod tests {
         let pl = Arc::new(Mutex::new(PatternLibrary::new()));
         let cal = Arc::new(Mutex::new(ProgressiveCalibrator::new(0.15)));
 
-        let ctx = test_background_plan_context(
-            Some(eg.clone()),
-            Some(pl.clone()),
-            Some(cal.clone()),
-        );
+        let ctx =
+            test_background_plan_context(Some(eg.clone()), Some(pl.clone()), Some(cal.clone()));
 
         let selector = crate::repl_runtime::create_background_plan_selector(&ctx);
 
