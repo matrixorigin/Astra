@@ -1019,8 +1019,13 @@ impl Default for ReplState {
             pending_approval: None,
             plan_in_token_stream: false,
             project_instructions: None,
-            messaging_metrics: None,
-            dead_letter_queue: None,
+            // Create shared messaging infrastructure eagerly so /messaging always has data
+            messaging_metrics: Some(std::sync::Arc::new(
+                astra_runtime::messaging::MessagingMetrics::new(),
+            )),
+            dead_letter_queue: Some(std::sync::Arc::new(
+                astra_runtime::messaging::dead_letter::DeadLetterQueue::new(),
+            )),
         }
     }
 }
