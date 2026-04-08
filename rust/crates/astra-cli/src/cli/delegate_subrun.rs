@@ -107,23 +107,27 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
         // worktree path via context, use it as the working directory instead of
         // the shared project root. This enables file-system isolation between agents.
         //
-        // Security: Only accept paths under the system temp dir's worktree base
-        // to prevent arbitrary path injection via team context.
-        let worktree_base = std::env::temp_dir().join("mo-agent-worktrees");
+        // Security: Canonicalize paths to defeat symlink TOCTOU attacks.
+        // Only accept paths that resolve under the system temp dir's worktree base.
+        let worktree_base = astra_core::worktree_base_path();
         let effective_root = config
             .context
             .get(&format!("worktree_path_{}", profile.agent_id))
             .and_then(|v| v.as_str())
             .and_then(|path| {
                 let p = PathBuf::from(path);
-                if p.is_absolute() && p.starts_with(&worktree_base) {
-                    Some(p)
-                } else {
-                    eprintln!(
-                        "[delegate] ignoring untrusted worktree_path for {}: {}",
-                        profile.agent_id, path
-                    );
-                    None
+                // Canonicalize both paths to resolve symlinks before comparison
+                match (p.canonicalize(), worktree_base.canonicalize()) {
+                    (Ok(canon_p), Ok(canon_base)) if canon_p.starts_with(&canon_base) => {
+                        Some(p)
+                    }
+                    _ => {
+                        eprintln!(
+                            "[delegate] ignoring untrusted worktree_path for {}: {}",
+                            profile.agent_id, path
+                        );
+                        None
+                    }
                 }
             })
             .unwrap_or_else(|| self.project_root.clone());

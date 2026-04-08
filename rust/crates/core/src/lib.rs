@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use axum::{
@@ -14,6 +15,17 @@ pub mod runtime_limits;
 pub use config::*;
 pub use runtime_limits::{DEV_MATRIXONE_PASSWORD, RuntimeLimits, warn_default_credentials_once};
 pub use sqlx;
+
+/// Base directory name for per-agent git worktrees under `std::env::temp_dir()`.
+///
+/// Shared between worktree creation (runtime) and path validation (CLI)
+/// to keep the two in sync.
+pub const WORKTREE_BASE_DIR: &str = "mo-agent-worktrees";
+
+/// Return the canonical worktree base path: `<temp_dir>/mo-agent-worktrees`.
+pub fn worktree_base_path() -> PathBuf {
+    std::env::temp_dir().join(WORKTREE_BASE_DIR)
+}
 
 /// Create a one-shot connection pool (legacy — prefer `SharedPool` for production).
 pub async fn connect_matrixone(settings: &MatrixOneSettings) -> Result<Pool<MySql>, sqlx::Error> {

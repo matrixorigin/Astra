@@ -119,7 +119,7 @@ impl From<std::io::Error> for WorktreeError {
 impl WorktreeManager {
     /// Create a new manager rooted at the given git repository.
     pub fn new(repo_root: PathBuf) -> Self {
-        let worktree_base = std::env::temp_dir().join("mo-agent-worktrees");
+        let worktree_base = astra_core::worktree_base_path();
         Self {
             repo_root,
             worktree_base,
@@ -364,10 +364,16 @@ impl WorktreeManager {
     }
 
     /// Remove all worktrees and their temporary branches.
+    ///
+    /// Logs warnings for individual failures but continues cleaning up
+    /// remaining worktrees. Returns an error only if *all* removals failed.
     pub async fn cleanup(&mut self) -> Result<(), WorktreeError> {
+        let mut failures = 0usize;
+        let total = self.active.len();
+
         for (_, info) in self.active.drain() {
             // git worktree remove <path> --force
-            let _ = Command::new("git")
+            let wt_result = Command::new("git")
                 .args([
                     "worktree",
                     "remove",
@@ -378,14 +384,56 @@ impl WorktreeManager {
                 .output()
                 .await;
 
+            if let Err(e) = &wt_result {
+                eprintln!(
+                    "[worktree] warning: failed to remove worktree {:?}: {}",
+                    info.worktree_path, e
+                );
+                failures += 1;
+            } else if let Ok(out) = &wt_result {
+                if !out.status.success() {
+                    eprintln!(
+                        "[worktree] warning: git worktree remove {:?} exited {}: {}",
+                        info.worktree_path,
+                        out.status,
+                        String::from_utf8_lossy(&out.stderr).trim()
+                    );
+                    failures += 1;
+                }
+            }
+
             // git branch -D <branch>
-            let _ = Command::new("git")
+            let br_result = Command::new("git")
                 .args(["branch", "-D", &info.branch_name])
                 .current_dir(&self.repo_root)
                 .output()
                 .await;
+
+            if let Err(e) = &br_result {
+                eprintln!(
+                    "[worktree] warning: failed to delete branch {}: {}",
+                    info.branch_name, e
+                );
+            } else if let Ok(out) = &br_result {
+                if !out.status.success() {
+                    eprintln!(
+                        "[worktree] warning: git branch -D {} exited {}: {}",
+                        info.branch_name,
+                        out.status,
+                        String::from_utf8_lossy(&out.stderr).trim()
+                    );
+                }
+            }
         }
-        Ok(())
+
+        if failures > 0 && failures == total {
+            Err(WorktreeError::Git(format!(
+                "cleanup failed: all {} worktree removals failed",
+                total
+            )))
+        } else {
+            Ok(())
+        }
     }
 
     /// Get the worktree path for a specific agent.
