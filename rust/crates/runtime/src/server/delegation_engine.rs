@@ -29,6 +29,25 @@ use astra_services::coordination::{
 
 use super::run_engine::RunEngine;
 
+// ─── Run Status Constants ───────────────────────────────────────────────────
+
+pub const STATUS_RUNNING: &str = "running";
+pub const STATUS_COMPLETED: &str = "completed";
+pub const STATUS_FAILED: &str = "failed";
+pub const STATUS_PAUSED: &str = "paused";
+pub const STATUS_VERIFICATION_FAILED: &str = "verification_failed";
+
+/// Log-and-discard helper for best-effort persistence calls.
+/// These calls must not abort the delegation flow — a failed status write
+/// is a diagnostic issue, not a control-flow error.
+macro_rules! log_persist {
+    ($expr:expr, $run_id:expr, $op:expr) => {
+        if let Err(e) = $expr {
+            astra_core::agent_warn!("delegation", "persist {} for run {}: {}", $op, $run_id, e);
+        }
+    };
+}
+
 // ─── Sub-run Executor Trait ─────────────────────────────────────────────────
 
 /// Configuration for a sub-run spawned by delegation.
@@ -90,7 +109,7 @@ impl SubRunExecutor for StubSubRunExecutor {
         Ok(AgentResult {
             agent_id: config.agent_profile.agent_id,
             run_id: config.run_id,
-            status: "completed".to_string(),
+            status: STATUS_COMPLETED.to_string(),
             output: Some(format!("[stub] completed task: {}", config.task)),
             error: None,
             prompt_tokens: 0,
@@ -242,7 +261,7 @@ impl DelegationTracker {
             parents.insert(rec.run_id.clone(), parent_run_id.clone());
 
             // Re-create pause flags for paused sub-runs
-            if rec.status == "paused" {
+            if rec.status == STATUS_PAUSED {
                 let flag = Arc::new(AtomicBool::new(true));
                 pause_flags.insert(rec.run_id.clone(), flag);
             }
@@ -573,15 +592,14 @@ impl DelegationEngine {
                 GateVerdict::Pass | GateVerdict::Skip => return current,
                 GateVerdict::Fail { reason, details } => {
                     // Persist retry count to durable store for crash recovery
-                    let _ = self
-                        .run_engine
-                        .persist_retry_count(&current.run_id, attempt)
-                        .await;
+                    log_persist!(
+                        self.run_engine.persist_retry_count(&current.run_id, attempt).await,
+                        &current.run_id, "retry_count"
+                    );
 
                     // Record the gate failure in run events
-                    let _ = self
-                        .run_engine
-                        .append_event(
+                    log_persist!(
+                        self.run_engine.append_event(
                             &current.run_id,
                             serde_json::json!({
                                 "event_type": "verification_gate_failed",
@@ -591,22 +609,23 @@ impl DelegationEngine {
                                     "details": details,
                                 }
                             }),
-                        )
-                        .await;
+                        ).await,
+                        &current.run_id, "gate_failed_event"
+                    );
 
                     if attempt >= max_retries {
                         // Exhausted retries — mark as verification failure
-                        let _ = self
-                            .run_engine
-                            .persist_status(
+                        log_persist!(
+                            self.run_engine.persist_status(
                                 &current.run_id,
-                                "verification_failed",
+                                STATUS_VERIFICATION_FAILED,
                                 None,
                                 Some(&reason),
-                            )
-                            .await;
+                            ).await,
+                            &current.run_id, "verification_failed"
+                        );
                         return AgentResult {
-                            status: "verification_failed".to_string(),
+                            status: STATUS_VERIFICATION_FAILED.to_string(),
                             error: Some(format!(
                                 "verification gate failed after {attempt} attempts: {reason}"
                             )),
@@ -619,15 +638,15 @@ impl DelegationEngine {
                     let retry_config = config_builder();
                     match self.executor.execute(retry_config).await {
                         Ok(r) => {
-                            let _ = self
-                                .run_engine
-                                .persist_status(&r.run_id, &r.status, None, r.error.as_deref())
-                                .await;
+                            log_persist!(
+                                self.run_engine.persist_status(&r.run_id, &r.status, None, r.error.as_deref()).await,
+                                &r.run_id, "status"
+                            );
                             current = r;
                         }
                         Err(e) => {
                             return AgentResult {
-                                status: "failed".to_string(),
+                                status: STATUS_FAILED.to_string(),
                                 error: Some(format!("retry execution failed: {e}")),
                                 ..current
                             };
@@ -721,7 +740,7 @@ impl DelegationEngine {
                 .await;
 
             self.run_engine
-                .persist_status(&sub_run_id, "running", Some("agent_execution"), None)
+                .persist_status(&sub_run_id, STATUS_RUNNING, Some("agent_execution"), None)
                 .await?;
 
             let pause_flag = self.tracker.register_pause_flag(&sub_run_id).await;
@@ -764,14 +783,16 @@ impl DelegationEngine {
                 // Persist final status
                 match &result {
                     Ok(r) => {
-                        let _ = run_engine
-                            .persist_status(&run_id, &r.status, None, r.error.as_deref())
-                            .await;
+                        log_persist!(
+                            run_engine.persist_status(&run_id, &r.status, None, r.error.as_deref()).await,
+                            &run_id, "status"
+                        );
                     }
                     Err(e) => {
-                        let _ = run_engine
-                            .persist_status(&run_id, "failed", None, Some(e.as_str()))
-                            .await;
+                        log_persist!(
+                            run_engine.persist_status(&run_id, STATUS_FAILED, None, Some(e.as_str())).await,
+                            &run_id, "status"
+                        );
                     }
                 }
                 result
@@ -786,7 +807,7 @@ impl DelegationEngine {
                     results.push(AgentResult {
                         agent_id: "unknown".to_string(),
                         run_id: String::new(),
-                        status: "failed".to_string(),
+                        status: STATUS_FAILED.to_string(),
                         output: None,
                         error: Some(e),
                         prompt_tokens: 0,
@@ -798,7 +819,7 @@ impl DelegationEngine {
                     results.push(AgentResult {
                         agent_id: "unknown".to_string(),
                         run_id: String::new(),
-                        status: "failed".to_string(),
+                        status: STATUS_FAILED.to_string(),
                         output: None,
                         error: Some(format!("task join error: {}", e)),
                         prompt_tokens: 0,
@@ -893,7 +914,7 @@ impl DelegationEngine {
                 .await;
 
             self.run_engine
-                .persist_status(&sub_run_id, "running", Some("agent_execution"), None)
+                .persist_status(&sub_run_id, STATUS_RUNNING, Some("agent_execution"), None)
                 .await?;
 
             let pause_flag = self.tracker.register_pause_flag(&sub_run_id).await;
@@ -925,21 +946,21 @@ impl DelegationEngine {
 
             let result = match self.executor.execute(config).await {
                 Ok(r) => {
-                    let _ = self
-                        .run_engine
-                        .persist_status(&sub_run_id, &r.status, None, r.error.as_deref())
-                        .await;
+                    log_persist!(
+                        self.run_engine.persist_status(&sub_run_id, &r.status, None, r.error.as_deref()).await,
+                        &sub_run_id, "status"
+                    );
                     r
                 }
                 Err(e) => {
-                    let _ = self
-                        .run_engine
-                        .persist_status(&sub_run_id, "failed", None, Some(&e))
-                        .await;
+                    log_persist!(
+                        self.run_engine.persist_status(&sub_run_id, STATUS_FAILED, None, Some(e.as_str())).await,
+                        &sub_run_id, "status"
+                    );
                     AgentResult {
                         agent_id: agent_id.clone(),
                         run_id: sub_run_id,
-                        status: "failed".to_string(),
+                        status: STATUS_FAILED.to_string(),
                         output: None,
                         error: Some(e),
                         prompt_tokens: 0,
@@ -1058,7 +1079,7 @@ impl DelegationEngine {
                 })
                 .await;
             self.run_engine
-                .persist_status(&prod_run_id, "running", Some("produce"), None)
+                .persist_status(&prod_run_id, STATUS_RUNNING, Some("produce"), None)
                 .await?;
             let prod_pause = self.tracker.register_pause_flag(&prod_run_id).await;
             self.run_engine
@@ -1086,21 +1107,21 @@ impl DelegationEngine {
             };
             let prod_result = match self.executor.execute(prod_config).await {
                 Ok(r) => {
-                    let _ = self
-                        .run_engine
-                        .persist_status(&prod_run_id, &r.status, None, r.error.as_deref())
-                        .await;
+                    log_persist!(
+                        self.run_engine.persist_status(&prod_run_id, &r.status, None, r.error.as_deref()).await,
+                        &prod_run_id, "status"
+                    );
                     r
                 }
                 Err(e) => {
-                    let _ = self
-                        .run_engine
-                        .persist_status(&prod_run_id, "failed", None, Some(&e))
-                        .await;
+                    log_persist!(
+                        self.run_engine.persist_status(&prod_run_id, STATUS_FAILED, None, Some(e.as_str())).await,
+                        &prod_run_id, "status"
+                    );
                     AgentResult {
                         agent_id: producer_id.to_string(),
                         run_id: prod_run_id,
-                        status: "failed".to_string(),
+                        status: STATUS_FAILED.to_string(),
                         output: None,
                         error: Some(e),
                         prompt_tokens: 0,
@@ -1165,7 +1186,7 @@ impl DelegationEngine {
                 })
                 .await;
             self.run_engine
-                .persist_status(&rev_run_id, "running", Some("review"), None)
+                .persist_status(&rev_run_id, STATUS_RUNNING, Some("review"), None)
                 .await?;
             let rev_pause = self.tracker.register_pause_flag(&rev_run_id).await;
             self.run_engine
@@ -1196,21 +1217,21 @@ impl DelegationEngine {
             };
             let rev_result = match self.executor.execute(rev_config).await {
                 Ok(r) => {
-                    let _ = self
-                        .run_engine
-                        .persist_status(&rev_run_id, &r.status, None, r.error.as_deref())
-                        .await;
+                    log_persist!(
+                        self.run_engine.persist_status(&rev_run_id, &r.status, None, r.error.as_deref()).await,
+                        &rev_run_id, "status"
+                    );
                     r
                 }
                 Err(e) => {
-                    let _ = self
-                        .run_engine
-                        .persist_status(&rev_run_id, "failed", None, Some(&e))
-                        .await;
+                    log_persist!(
+                        self.run_engine.persist_status(&rev_run_id, STATUS_FAILED, None, Some(e.as_str())).await,
+                        &rev_run_id, "status"
+                    );
                     AgentResult {
                         agent_id: reviewer_id.to_string(),
                         run_id: rev_run_id,
-                        status: "failed".to_string(),
+                        status: STATUS_FAILED.to_string(),
                         output: None,
                         error: Some(e),
                         prompt_tokens: 0,
@@ -1244,10 +1265,10 @@ impl DelegationEngine {
         let count = self.tracker.pause_delegation(delegation_id).await;
         // Persist pause status for each sub-run
         for record in self.tracker.get_sub_runs(delegation_id).await {
-            let _ = self
-                .run_engine
-                .persist_status(&record.run_id, "paused", Some("delegation_pause"), None)
-                .await;
+            log_persist!(
+                self.run_engine.persist_status(&record.run_id, STATUS_PAUSED, Some("delegation_pause"), None).await,
+                &record.run_id, "pause"
+            );
         }
         count
     }
@@ -1258,10 +1279,10 @@ impl DelegationEngine {
     pub async fn resume_delegation(&self, delegation_id: &str) -> usize {
         let count = self.tracker.resume_delegation(delegation_id).await;
         for record in self.tracker.get_sub_runs(delegation_id).await {
-            let _ = self
-                .run_engine
-                .persist_status(&record.run_id, "running", Some("delegation_resume"), None)
-                .await;
+            log_persist!(
+                self.run_engine.persist_status(&record.run_id, STATUS_RUNNING, Some("delegation_resume"), None).await,
+                &record.run_id, "resume"
+            );
         }
         count
     }
@@ -1270,10 +1291,10 @@ impl DelegationEngine {
     pub async fn pause_children_of(&self, parent_run_id: &str) -> usize {
         let count = self.tracker.pause_children_of(parent_run_id).await;
         for child_id in self.tracker.get_children(parent_run_id).await {
-            let _ = self
-                .run_engine
-                .persist_status(&child_id, "paused", Some("parent_pause"), None)
-                .await;
+            log_persist!(
+                self.run_engine.persist_status(&child_id, STATUS_PAUSED, Some("parent_pause"), None).await,
+                &child_id, "pause"
+            );
         }
         count
     }
@@ -1282,10 +1303,10 @@ impl DelegationEngine {
     pub async fn resume_children_of(&self, parent_run_id: &str) -> usize {
         let count = self.tracker.resume_children_of(parent_run_id).await;
         for child_id in self.tracker.get_children(parent_run_id).await {
-            let _ = self
-                .run_engine
-                .persist_status(&child_id, "running", Some("parent_resume"), None)
-                .await;
+            log_persist!(
+                self.run_engine.persist_status(&child_id, STATUS_RUNNING, Some("parent_resume"), None).await,
+                &child_id, "resume"
+            );
         }
         count
     }

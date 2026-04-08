@@ -404,6 +404,10 @@ impl AgentProfileRegistry {
             CoordinationPattern::Sequential { agent_ids, .. } => agent_ids.clone(),
         };
 
+        if agent_ids.is_empty() {
+            return Err("delegation pattern has no agents".to_string());
+        }
+
         for target_id in &agent_ids {
             let target = self
                 .get(target_id)
