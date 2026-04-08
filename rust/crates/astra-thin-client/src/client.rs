@@ -843,9 +843,7 @@ impl ThinClient {
                     if attempt + 1 < max_attempts && e.is_transport() {
                         let delay_secs = 1u64 << attempt; // 1s, 2s, 4s…
                         if !quiet {
-                            eprintln!(
-                                "  ⏳ Transport error, retrying in {delay_secs}s… ({e})"
-                            );
+                            eprintln!("  ⏳ Transport error, retrying in {delay_secs}s… ({e})");
                         }
                         tokio::time::sleep(Duration::from_secs(delay_secs)).await;
                         last_err = Some(e);
@@ -1685,6 +1683,9 @@ mod tests {
         assert_eq!(resp.status().as_u16(), 200);
         // Should wait ~1s (from Retry-After: 1), not 2s (default)
         assert!(elapsed >= Duration::from_millis(900), "waited too little");
-        assert!(elapsed < Duration::from_millis(1800), "waited too long — Retry-After not honoured");
+        assert!(
+            elapsed < Duration::from_millis(1800),
+            "waited too long — Retry-After not honoured"
+        );
     }
 }

@@ -134,9 +134,9 @@ use permission_manager::PermissionManager;
 use stream_render::{StreamRenderState, TurnResult, dispatch_turn_event_block};
 
 use repl_runtime::{
-    build_repl_editor, check_server_has_models, create_background_plan_selector, create_tool_selector,
-    create_tool_selector_quiet, create_tool_selector_with_quality, current_access_token,
-    initialize_repl_state, print_repl_banner, try_silent_auth,
+    build_repl_editor, check_server_has_models, create_background_plan_selector,
+    create_tool_selector, create_tool_selector_quiet, create_tool_selector_with_quality,
+    current_access_token, initialize_repl_state, print_repl_banner, try_silent_auth,
 };
 use repl_turn::{ReplTurnContext, create_manual_repl_checkpoint, handle_chat_input};
 use repl_ui::{
@@ -178,10 +178,8 @@ static SIGTERM_RUNTIME: OnceLock<std::sync::Arc<astra_runtime::MatrixCloudRuntim
 fn emergency_session_end() {
     if let Ok(guard) = PANIC_SESSION_GUARD.lock() {
         if let Some(ref ctx) = *guard {
-            let end_event = session_journal::JournalEvent::session_end(
-                Some(ctx.session_id.as_str()),
-                ctx.turn,
-            );
+            let end_event =
+                session_journal::JournalEvent::session_end(Some(ctx.session_id.as_str()), ctx.turn);
             if let Ok(writer) = session_journal::JournalWriter::new(&ctx.session_id) {
                 let _ = writer.append(&end_event);
             }
@@ -4953,70 +4951,62 @@ async fn handle_slash_command(
             }
         }
 
-        "/instructions" => {
-            match arg {
-                "" | "show" => {
-                    if let Some(ref pi) = state.project_instructions {
-                        let lines = pi.lines().count();
-                        eprintln!(
-                            "  {} Project instructions ({lines} lines):\n",
-                            theme::icon_info()
-                        );
-                        for line in pi.lines() {
-                            eprintln!("  {line}");
-                        }
-                        eprintln!();
-                    } else {
-                        eprintln!(
-                            "  {} No project instructions loaded.",
-                            theme::icon_info()
-                        );
-                        eprintln!(
-                            "  {}",
-                            "  Create .astra/instructions.md in your project root to add instructions."
-                                .dim()
-                        );
-                    }
-                }
-                "reload" => {
-                    let no_inst = std::env::var("ASTRA_NO_INSTRUCTIONS")
-                        .map(|v| v == "1")
-                        .unwrap_or(false);
-                    if no_inst {
-                        eprintln!(
-                            "  {} Instructions disabled (--no-instructions).",
-                            theme::icon_warn()
-                        );
-                    } else if let Some(instructions) = discover_project_instructions() {
-                        let lines = instructions.lines().count();
-                        state.project_instructions = Some(instructions);
-                        eprintln!(
-                            "  {} Reloaded project instructions ({lines} lines).",
-                            theme::icon_ok()
-                        );
-                    } else {
-                        state.project_instructions = None;
-                        eprintln!(
-                            "  {} No .astra/instructions.md found.",
-                            theme::icon_info()
-                        );
-                    }
-                }
-                "off" => {
-                    state.project_instructions = None;
+        "/instructions" => match arg {
+            "" | "show" => {
+                if let Some(ref pi) = state.project_instructions {
+                    let lines = pi.lines().count();
                     eprintln!(
-                        "  {} Project instructions disabled for this session.",
-                        theme::icon_ok()
+                        "  {} Project instructions ({lines} lines):\n",
+                        theme::icon_info()
                     );
-                }
-                _ => {
+                    for line in pi.lines() {
+                        eprintln!("  {line}");
+                    }
+                    eprintln!();
+                } else {
+                    eprintln!("  {} No project instructions loaded.", theme::icon_info());
                     eprintln!(
-                        "  {} Usage: /instructions [show|reload|off]",
-                        theme::icon_warn()
+                        "  {}",
+                        "  Create .astra/instructions.md in your project root to add instructions."
+                            .dim()
                     );
                 }
             }
-        }
+            "reload" => {
+                let no_inst = std::env::var("ASTRA_NO_INSTRUCTIONS")
+                    .map(|v| v == "1")
+                    .unwrap_or(false);
+                if no_inst {
+                    eprintln!(
+                        "  {} Instructions disabled (--no-instructions).",
+                        theme::icon_warn()
+                    );
+                } else if let Some(instructions) = discover_project_instructions() {
+                    let lines = instructions.lines().count();
+                    state.project_instructions = Some(instructions);
+                    eprintln!(
+                        "  {} Reloaded project instructions ({lines} lines).",
+                        theme::icon_ok()
+                    );
+                } else {
+                    state.project_instructions = None;
+                    eprintln!("  {} No .astra/instructions.md found.", theme::icon_info());
+                }
+            }
+            "off" => {
+                state.project_instructions = None;
+                eprintln!(
+                    "  {} Project instructions disabled for this session.",
+                    theme::icon_ok()
+                );
+            }
+            _ => {
+                eprintln!(
+                    "  {} Usage: /instructions [show|reload|off]",
+                    theme::icon_warn()
+                );
+            }
+        },
 
         "/clear" | "/explain" | "/verbose" | "/compact" | "/reflect" | "/undo" => {
             handle_state_command(
@@ -5209,16 +5199,15 @@ async fn run_chat_repl(
         if maint.sessions_deleted > 0 || maint.journals_compressed > 0 {
             let mut parts = Vec::new();
             if maint.sessions_deleted > 0 {
-                parts.push(format!("{} expired sessions removed", maint.sessions_deleted));
+                parts.push(format!(
+                    "{} expired sessions removed",
+                    maint.sessions_deleted
+                ));
             }
             if maint.journals_compressed > 0 {
                 parts.push(format!("{} journals compressed", maint.journals_compressed));
             }
-            eprintln!(
-                "  {} {}",
-                theme::icon_ok(),
-                parts.join(", ").dim()
-            );
+            eprintln!("  {} {}", theme::icon_ok(), parts.join(", ").dim());
         }
     }
 
@@ -5436,14 +5425,11 @@ async fn run_chat_repl(
         let mut registry = astra_services::AgentProfileRegistry::new();
         delegate_subrun::register_default_agents(&mut registry);
         let registry = std::sync::Arc::new(tokio::sync::RwLock::new(registry));
-        let run_store =
-            std::sync::Arc::new(astra_services::runs::InMemoryRunStateStore::default());
+        let run_store = std::sync::Arc::new(astra_services::runs::InMemoryRunStateStore::default());
         let engine = astra_runtime::server::delegation_engine::DelegationEngine::with_executor(
             registry,
             std::sync::Arc::new(astra_runtime::server::run_engine::RunEngine::new(run_store)),
-            std::sync::Arc::new(
-                astra_runtime::server::delegation_engine::DelegationTracker::new(),
-            ),
+            std::sync::Arc::new(astra_runtime::server::delegation_engine::DelegationTracker::new()),
             std::sync::Arc::new(executor),
         );
         state.delegation_engine = Some(std::sync::Arc::new(engine));
@@ -5516,8 +5502,7 @@ async fn run_chat_repl(
                 if let Some(tx) = state.pending_approval.take() {
                     let trimmed = line.trim().to_lowercase();
                     let approved = trimmed == "y" || trimmed == "yes" || trimmed == "a";
-                    let autorun =
-                        trimmed == "!" || trimmed == "all" || trimmed == "yolo";
+                    let autorun = trimmed == "!" || trimmed == "all" || trimmed == "yolo";
                     let denied = trimmed == "n" || trimmed == "no";
                     if approved || autorun || denied {
                         let _ = tx.send(approved || autorun);
@@ -5532,8 +5517,7 @@ async fn run_chat_repl(
                             );
                             eprintln!(
                                 "  {}",
-                                "  Use /allow prompt to restore confirmation prompts."
-                                    .dim()
+                                "  Use /allow prompt to restore confirmation prompts.".dim()
                             );
                         } else if approved {
                             eprintln!("  {} Approved", theme::icon_ok());
@@ -6172,13 +6156,11 @@ async fn main() {
     }
 
     // --system-prompt: support @file syntax to read from file
-    let system_prompt = system_prompt.map(|sp| {
-        match resolve_system_prompt(sp) {
-            Ok(content) => content,
-            Err(e) => {
-                eprintln!("{}", e.red());
-                std::process::exit(1);
-            }
+    let system_prompt = system_prompt.map(|sp| match resolve_system_prompt(sp) {
+        Ok(content) => content,
+        Err(e) => {
+            eprintln!("{}", e.red());
+            std::process::exit(1);
         }
     });
 
@@ -9622,8 +9604,15 @@ total_tokens_out: 500
     fn cli_yes_with_permission_mode_deny() {
         // Both flags accepted by parser on `chat` subcommand — runtime resolves conflict
         let cli = Cli::try_parse_from([
-            "astra", "chat", "-y", "--permission-mode", "deny", "-m", "test",
-        ]).unwrap();
+            "astra",
+            "chat",
+            "-y",
+            "--permission-mode",
+            "deny",
+            "-m",
+            "test",
+        ])
+        .unwrap();
         match &cli.command {
             Some(Command::Chat(args)) => {
                 assert!(args.auto_approve);
@@ -9636,8 +9625,15 @@ total_tokens_out: 500
     #[test]
     fn cli_yes_with_permission_mode_auto_is_redundant() {
         let cli = Cli::try_parse_from([
-            "astra", "chat", "-y", "--permission-mode", "auto", "-m", "test",
-        ]).unwrap();
+            "astra",
+            "chat",
+            "-y",
+            "--permission-mode",
+            "auto",
+            "-m",
+            "test",
+        ])
+        .unwrap();
         match &cli.command {
             Some(Command::Chat(args)) => {
                 assert!(args.auto_approve);
@@ -9651,8 +9647,14 @@ total_tokens_out: 500
     fn cli_permission_mode_invalid_value() {
         // Parser accepts any string; runtime validates
         let cli = Cli::try_parse_from([
-            "astra", "chat", "--permission-mode", "invalid", "-m", "test",
-        ]).unwrap();
+            "astra",
+            "chat",
+            "--permission-mode",
+            "invalid",
+            "-m",
+            "test",
+        ])
+        .unwrap();
         match &cli.command {
             Some(Command::Chat(args)) => {
                 assert_eq!(args.permission_mode.as_deref(), Some("invalid"));
@@ -9800,7 +9802,11 @@ total_tokens_out: 500
     fn resolve_system_prompt_at_file_not_found() {
         let result = resolve_system_prompt("@/nonexistent/path/prompt.txt".to_string());
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("cannot read system prompt file"));
+        assert!(
+            result
+                .unwrap_err()
+                .contains("cannot read system prompt file")
+        );
     }
 
     #[test]
@@ -9863,7 +9869,11 @@ total_tokens_out: 500
         let result = resolve_system_prompt(format!("@{}", path.display()));
         let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644));
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("cannot read system prompt file"));
+        assert!(
+            result
+                .unwrap_err()
+                .contains("cannot read system prompt file")
+        );
     }
 
     // ── project instructions tests ──
@@ -9956,7 +9966,10 @@ total_tokens_out: 500
             "should wrap in tags"
         );
         assert!(result.contains("Always use Rust."));
-        assert!(result.contains("hello"), "should still include user message");
+        assert!(
+            result.contains("hello"),
+            "should still include user message"
+        );
     }
 
     #[test]

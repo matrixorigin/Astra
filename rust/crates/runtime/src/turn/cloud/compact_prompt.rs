@@ -484,10 +484,7 @@ mod tests {
             "### Current State",
         ];
         for s in &sections {
-            assert!(
-                COMPACT_SYSTEM_PROMPT.contains(s),
-                "missing section: {s}"
-            );
+            assert!(COMPACT_SYSTEM_PROMPT.contains(s), "missing section: {s}");
         }
     }
 
@@ -537,7 +534,10 @@ mod tests {
         // This documents current behaviour — no panic, outer content preserved.
         let input = "<analysis>outer<analysis>inner</analysis>more</analysis>rest";
         let result = strip_analysis_block(input);
-        assert!(!result.contains("<analysis>"), "opening tags should be removed");
+        assert!(
+            !result.contains("<analysis>"),
+            "opening tags should be removed"
+        );
         // The trailing </analysis> remains because there is no matching open tag
         assert!(result.contains("rest"));
         assert!(result.contains("more"));

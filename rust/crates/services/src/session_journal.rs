@@ -981,9 +981,8 @@ pub fn find_stale_sessions(
 ///
 /// Returns `Ok(bytes_freed)` on success.
 pub fn delete_session(session_id: &str) -> std::io::Result<u64> {
-    validate_session_id(session_id).map_err(|e| {
-        std::io::Error::new(std::io::ErrorKind::InvalidInput, e)
-    })?;
+    validate_session_id(session_id)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
     let journal = journal_file_path(session_id);
     let ws_dir = crate::session_workspace::workspace_dir_for(session_id);
     let mut freed = 0u64;
@@ -1028,13 +1027,12 @@ fn walkdir(path: &std::path::Path) -> u64 {
 /// Returns `Ok((original_bytes, compressed_bytes))` on success.
 /// Only archives if the session has a `session_end` event (i.e., completed).
 pub fn archive_journal(session_id: &str) -> std::io::Result<(u64, u64)> {
-    use flate2::write::GzEncoder;
     use flate2::Compression;
+    use flate2::write::GzEncoder;
     use std::io::Write;
 
-    validate_session_id(session_id).map_err(|e| {
-        std::io::Error::new(std::io::ErrorKind::InvalidInput, e)
-    })?;
+    validate_session_id(session_id)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
     let src = journal_file_path(session_id);
     if !src.exists() {
         return Err(std::io::Error::new(
@@ -1044,7 +1042,10 @@ pub fn archive_journal(session_id: &str) -> std::io::Result<(u64, u64)> {
     }
     // Check the journal has a session_end (don't archive active sessions)
     let content = std::fs::read(&src)?;
-    if !content.windows(b"\"session_end\"".len()).any(|w| w == b"\"session_end\"") {
+    if !content
+        .windows(b"\"session_end\"".len())
+        .any(|w| w == b"\"session_end\"")
+    {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "session has no session_end event — still active?",
@@ -1064,9 +1065,7 @@ pub fn archive_journal(session_id: &str) -> std::io::Result<(u64, u64)> {
 /// Find completed sessions eligible for archival (have session_end, not yet compressed).
 ///
 /// `exclude_id` — the currently active session.
-pub fn find_archivable_sessions(
-    exclude_id: Option<&str>,
-) -> std::io::Result<Vec<(String, u64)>> {
+pub fn find_archivable_sessions(exclude_id: Option<&str>) -> std::io::Result<Vec<(String, u64)>> {
     let dir = journal_dir();
     if !dir.exists() {
         return Ok(Vec::new());
@@ -1710,7 +1709,10 @@ pub struct SessionMaintenanceResult {
 ///
 /// Both thresholds use the journal file's modification time. This function is
 /// idempotent and safe to call at every REPL startup.
-pub fn run_session_maintenance(ttl_days: u64, compress_after_days: u64) -> SessionMaintenanceResult {
+pub fn run_session_maintenance(
+    ttl_days: u64,
+    compress_after_days: u64,
+) -> SessionMaintenanceResult {
     let dir = journal_dir();
     if !dir.exists() {
         return SessionMaintenanceResult::default();
@@ -1772,9 +1774,7 @@ fn run_session_maintenance_in(
             // Journal old enough to compress
             match compress_journal(&dir, &session_id) {
                 Ok(()) => result.journals_compressed += 1,
-                Err(e) => result
-                    .errors
-                    .push(format!("compress {session_id}: {e}")),
+                Err(e) => result.errors.push(format!("compress {session_id}: {e}")),
             }
         }
     }
@@ -1830,8 +1830,8 @@ fn delete_session_files(sessions_dir: &Path, session_id: &str) -> u64 {
 
 /// Compress a .jsonl file to .jsonl.gz using gzip, then remove the original.
 fn compress_journal(sessions_dir: &Path, session_id: &str) -> std::io::Result<()> {
-    use flate2::write::GzEncoder;
     use flate2::Compression;
+    use flate2::write::GzEncoder;
     use std::io::{BufRead, BufReader, Write};
 
     let src = sessions_dir.join(format!("{session_id}.jsonl"));
@@ -2966,8 +2966,7 @@ mod tests {
         let path = dir.join(format!("{session_id}.jsonl"));
         std::fs::write(&path, r#"{"type":"session_start"}"#).unwrap();
         let mtime = filetime::FileTime::from_system_time(
-            std::time::SystemTime::now()
-                - std::time::Duration::from_secs(age_days * 86400 + 3600),
+            std::time::SystemTime::now() - std::time::Duration::from_secs(age_days * 86400 + 3600),
         );
         filetime::set_file_mtime(&path, mtime).unwrap();
     }
@@ -2976,11 +2975,7 @@ mod tests {
     fn create_session_dir(dir: &Path, session_id: &str) {
         let session_dir = dir.join(session_id);
         std::fs::create_dir_all(session_dir.join("step_checkpoints")).unwrap();
-        std::fs::write(
-            session_dir.join("workspace.yaml"),
-            "session_id: test",
-        )
-        .unwrap();
+        std::fs::write(session_dir.join("workspace.yaml"), "session_id: test").unwrap();
     }
 
     #[test]
@@ -3022,11 +3017,7 @@ mod tests {
         let dir = tmp.path().to_path_buf();
 
         // Very recent session (0 days old)
-        std::fs::write(
-            dir.join("fresh.jsonl"),
-            r#"{"type":"session_start"}"#,
-        )
-        .unwrap();
+        std::fs::write(dir.join("fresh.jsonl"), r#"{"type":"session_start"}"#).unwrap();
 
         let result = run_session_maintenance_in(dir.clone(), 30, 7);
         assert_eq!(result.sessions_deleted, 0);
@@ -3043,8 +3034,7 @@ mod tests {
         let gz_path = dir.join("archived.jsonl.gz");
         std::fs::write(&gz_path, b"fake-gz-data").unwrap();
         let mtime = filetime::FileTime::from_system_time(
-            std::time::SystemTime::now()
-                - std::time::Duration::from_secs(40 * 86400 + 3600),
+            std::time::SystemTime::now() - std::time::Duration::from_secs(40 * 86400 + 3600),
         );
         filetime::set_file_mtime(&gz_path, mtime).unwrap();
 

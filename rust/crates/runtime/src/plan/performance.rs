@@ -57,21 +57,15 @@ impl PlanTemplateCache {
     pub fn save(&self) -> Result<(), String> {
         let path = Self::cache_path();
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| format!("create cache dir: {e}"))?;
+            std::fs::create_dir_all(parent).map_err(|e| format!("create cache dir: {e}"))?;
         }
-        let json = serde_json::to_string_pretty(self)
-            .map_err(|e| format!("serialize cache: {e}"))?;
+        let json =
+            serde_json::to_string_pretty(self).map_err(|e| format!("serialize cache: {e}"))?;
         std::fs::write(path, json).map_err(|e| format!("write cache: {e}"))
     }
 
     /// Record a successful plan completion for future reuse.
-    pub fn record_success(
-        &mut self,
-        goal: &str,
-        subtask_titles: Vec<String>,
-        duration_ms: u64,
-    ) {
+    pub fn record_success(&mut self, goal: &str, subtask_titles: Vec<String>, duration_ms: u64) {
         let key = normalize_goal(goal);
         let now = now_unix_secs();
 
@@ -123,23 +117,17 @@ impl PlanTemplateCache {
             .values()
             .filter_map(|t| {
                 let t_words: Vec<&str> = t.goal_pattern.split_whitespace().collect();
-                let overlap = goal_words
-                    .iter()
-                    .filter(|w| t_words.contains(w))
-                    .count();
+                let overlap = goal_words.iter().filter(|w| t_words.contains(w)).count();
                 if overlap == 0 {
                     return None;
                 }
-                let word_score =
-                    overlap as f64 / goal_words.len().max(t_words.len()) as f64;
-                let recency_bonus = if t.last_used > now_unix_secs().saturating_sub(86400 * 7)
-                {
+                let word_score = overlap as f64 / goal_words.len().max(t_words.len()) as f64;
+                let recency_bonus = if t.last_used > now_unix_secs().saturating_sub(86400 * 7) {
                     0.1
                 } else {
                     0.0
                 };
-                let score =
-                    word_score * 0.6 + t.success_rate * 0.3 + recency_bonus;
+                let score = word_score * 0.6 + t.success_rate * 0.3 + recency_bonus;
                 Some((score, t))
             })
             .collect();
@@ -337,11 +325,7 @@ mod tests {
     #[test]
     fn template_cache_no_match_for_unrelated_goal() {
         let mut cache = PlanTemplateCache::default();
-        cache.record_success(
-            "Add user authentication",
-            vec!["Setup auth".into()],
-            1000,
-        );
+        cache.record_success("Add user authentication", vec!["Setup auth".into()], 1000);
 
         let results = cache.lookup("deploy kubernetes cluster", 5);
         assert!(results.is_empty());
@@ -351,7 +335,11 @@ mod tests {
     fn template_cache_updates_on_repeat() {
         let mut cache = PlanTemplateCache::default();
         cache.record_success("add tests", vec!["write tests".into()], 1000);
-        cache.record_success("add tests", vec!["write tests".into(), "run CI".into()], 2000);
+        cache.record_success(
+            "add tests",
+            vec!["write tests".into(), "run CI".into()],
+            2000,
+        );
 
         let results = cache.lookup("add tests", 5);
         assert_eq!(results.len(), 1);
@@ -423,7 +411,10 @@ mod tests {
         cache.record_success("deploy service", vec!["build".into(), "push".into()], 3000);
 
         let before = cache.templates.get("deploy service").unwrap().success_rate;
-        assert!((before - 1.0).abs() < f64::EPSILON, "initial success_rate should be 1.0");
+        assert!(
+            (before - 1.0).abs() < f64::EPSILON,
+            "initial success_rate should be 1.0"
+        );
 
         cache.record_failure("deploy service");
 

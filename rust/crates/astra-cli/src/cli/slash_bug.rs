@@ -14,12 +14,12 @@ pub(super) fn handle_bug_command(arg: &str, state: &ReplState) {
     match arg.trim() {
         "copy" => {
             if copy_to_clipboard(&report) {
-                eprintln!(
-                    "  {} Bug report copied to clipboard.",
-                    "✓".green().bold()
-                );
+                eprintln!("  {} Bug report copied to clipboard.", "✓".green().bold());
             } else {
-                eprintln!("  {} Could not copy to clipboard — printing instead:", "⚠".yellow());
+                eprintln!(
+                    "  {} Could not copy to clipboard — printing instead:",
+                    "⚠".yellow()
+                );
                 eprintln!("{report}");
             }
         }
@@ -30,11 +30,7 @@ pub(super) fn handle_bug_command(arg: &str, state: &ReplState) {
             );
             match std::fs::write(&filename, &report) {
                 Ok(()) => {
-                    eprintln!(
-                        "  {} Saved to {}",
-                        "✓".green().bold(),
-                        filename.green()
-                    );
+                    eprintln!("  {} Saved to {}", "✓".green().bold(), filename.green());
                 }
                 Err(e) => {
                     eprintln!("  {} Could not save: {e}", "✗".red());
@@ -96,11 +92,12 @@ fn build_bug_report(state: &ReplState) -> String {
     // ── Environment ──
     lines.push("## Environment".to_string());
     lines.push(String::new());
+    lines.push(format!("- **Version**: {}", env!("CARGO_PKG_VERSION")));
     lines.push(format!(
-        "- **Version**: {}",
-        env!("CARGO_PKG_VERSION")
+        "- **OS**: {} {}",
+        std::env::consts::OS,
+        std::env::consts::ARCH
     ));
-    lines.push(format!("- **OS**: {} {}", std::env::consts::OS, std::env::consts::ARCH));
 
     if let Ok(shell) = std::env::var("SHELL") {
         lines.push(format!("- **Shell**: {}", shell));
@@ -277,7 +274,10 @@ mod tests {
     fn bug_report_redacts_api_key() {
         unsafe { std::env::set_var("MO_API_KEY", "sk-secret-key-12345") };
         let report = build_bug_report(&test_state());
-        assert!(!report.contains("sk-secret-key-12345"), "API key must be redacted");
+        assert!(
+            !report.contains("sk-secret-key-12345"),
+            "API key must be redacted"
+        );
         assert!(report.contains("[REDACTED"));
         unsafe { std::env::remove_var("MO_API_KEY") };
     }

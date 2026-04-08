@@ -148,10 +148,7 @@ impl PlanMetrics {
         out.push_str("┌── Plan Metrics ──────────────────────────────────\n");
 
         if self.planning_duration_ms > 0 {
-            out.push_str(&format!(
-                "│ Planning:    {}ms\n",
-                self.planning_duration_ms
-            ));
+            out.push_str(&format!("│ Planning:    {}ms\n", self.planning_duration_ms));
         }
         if let Some(exec_ms) = self.execution_duration_ms {
             out.push_str(&format!("│ Execution:   {}ms\n", exec_ms));

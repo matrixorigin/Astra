@@ -116,9 +116,15 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/logout", "Logout from the API"),
     ("/memory-setup", "Guided Memoria configuration"),
     // ── Toggles & style ───────────────────────────────────────────────────
-    ("/allow", "Permission mode: /allow [auto|prompt|deny|all|rules]"),
+    (
+        "/allow",
+        "Permission mode: /allow [auto|prompt|deny|all|rules]",
+    ),
     ("/yolo", "Auto-approve all tools (alias for /allow auto)"),
-    ("/instructions", "Project instructions: /instructions [show|reload|off]"),
+    (
+        "/instructions",
+        "Project instructions: /instructions [show|reload|off]",
+    ),
     (
         "/style",
         "Output theme: default | minimal | colorful | high-contrast",
@@ -1377,7 +1383,18 @@ pub(super) fn print_slash_commands(query: Option<&str>) {
             "Team & account",
             &["/team", "/login", "/register", "/logout", "/memory-setup"],
         ),
-        ("🔧", "System", &["/diagnostics", "/allow", "/yolo", "/instructions", "/style", "/bug"]),
+        (
+            "🔧",
+            "System",
+            &[
+                "/diagnostics",
+                "/allow",
+                "/yolo",
+                "/instructions",
+                "/style",
+                "/bug",
+            ],
+        ),
     ];
 
     for (icon, title, commands) in groups {
