@@ -288,6 +288,9 @@ struct Cli {
     /// Only explicitly provided context (--system-prompt, --add-dir, --mcp-config) is used.
     #[arg(long = "bare")]
     bare: bool,
+    /// Disable auto-loading of .astra/instructions.md project instructions
+    #[arg(long = "no-instructions")]
+    no_instructions: bool,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -899,6 +902,9 @@ struct ReplState {
     /// True while plan display is in the middle of printing streaming LLM tokens.
     /// Used to insert a newline before the next non-token event.
     plan_in_token_stream: bool,
+    /// Project-level instructions loaded from `.astra/instructions.md`.
+    /// Injected into every turn's effective message as `<project_instructions>`.
+    project_instructions: Option<String>,
 }
 
 impl Default for ReplState {
@@ -974,6 +980,7 @@ impl Default for ReplState {
             plan_handle: None,
             pending_approval: None,
             plan_in_token_stream: false,
+            project_instructions: None,
         }
     }
 }
@@ -4919,6 +4926,71 @@ async fn handle_slash_command(
             }
         }
 
+        "/instructions" => {
+            match arg {
+                "" | "show" => {
+                    if let Some(ref pi) = state.project_instructions {
+                        let lines = pi.lines().count();
+                        eprintln!(
+                            "  {} Project instructions ({lines} lines):\n",
+                            theme::icon_info()
+                        );
+                        for line in pi.lines() {
+                            eprintln!("  {line}");
+                        }
+                        eprintln!();
+                    } else {
+                        eprintln!(
+                            "  {} No project instructions loaded.",
+                            theme::icon_info()
+                        );
+                        eprintln!(
+                            "  {}",
+                            "  Create .astra/instructions.md in your project root to add instructions."
+                                .dim()
+                        );
+                    }
+                }
+                "reload" => {
+                    let no_inst = std::env::var("ASTRA_NO_INSTRUCTIONS")
+                        .map(|v| v == "1")
+                        .unwrap_or(false);
+                    if no_inst {
+                        eprintln!(
+                            "  {} Instructions disabled (--no-instructions).",
+                            theme::icon_warn()
+                        );
+                    } else if let Some(instructions) = discover_project_instructions() {
+                        let lines = instructions.lines().count();
+                        state.project_instructions = Some(instructions);
+                        eprintln!(
+                            "  {} Reloaded project instructions ({lines} lines).",
+                            theme::icon_ok()
+                        );
+                    } else {
+                        state.project_instructions = None;
+                        eprintln!(
+                            "  {} No .astra/instructions.md found.",
+                            theme::icon_info()
+                        );
+                    }
+                }
+                "off" => {
+                    state.project_instructions = None;
+                    eprintln!(
+                        "  {} Project instructions disabled for this session.",
+                        theme::icon_ok()
+                    );
+                }
+                _ => {
+                    eprintln!(
+                        "  {} Usage: /instructions [show|reload|off]",
+                        theme::icon_warn()
+                    );
+                }
+            }
+        }
+
         "/clear" | "/explain" | "/verbose" | "/compact" | "/reflect" | "/undo" => {
             handle_state_command(
                 cmd,
@@ -5077,6 +5149,22 @@ async fn run_chat_repl(
             "{}",
             "  ⚠ Auto-approve mode: all tool calls will execute without confirmation.".yellow()
         );
+    }
+
+    // Load project instructions from .astra/instructions.md (unless --no-instructions)
+    let no_instructions = std::env::var("ASTRA_NO_INSTRUCTIONS")
+        .map(|v| v == "1")
+        .unwrap_or(false);
+    if !no_instructions {
+        if let Some(instructions) = discover_project_instructions() {
+            let lines = instructions.lines().count();
+            eprintln!(
+                "  {} {}",
+                theme::icon_ok(),
+                format!("Loaded project instructions ({lines} lines)").dim()
+            );
+            state.project_instructions = Some(instructions);
+        }
     }
 
     // Load persisted skill quality data from previous sessions
@@ -5858,6 +5946,69 @@ fn resolve_system_prompt(sp: String) -> Result<String, String> {
     }
 }
 
+/// Discover project-level instructions from `.astra/instructions.md` files.
+///
+/// Search order (first match per level wins):
+/// 1. `.astra/instructions.md` in the current working directory (project-level)
+/// 2. `~/.astra/instructions.md` in the user home (global/user-level)
+///
+/// Both levels are combined if present: project-level first, then global,
+/// separated by a newline.
+fn discover_project_instructions() -> Option<String> {
+    let project_root = std::env::current_dir().ok();
+    let home = dirs::home_dir();
+    discover_instructions_from_paths(project_root.as_deref(), home.as_deref())
+}
+
+/// Core logic: discover instructions from explicit paths (testable without cwd mutation).
+fn discover_instructions_from_paths(
+    project_root: Option<&std::path::Path>,
+    home: Option<&std::path::Path>,
+) -> Option<String> {
+    let mut parts = Vec::new();
+
+    // Project-level: .astra/instructions.md
+    if let Some(root) = project_root {
+        let project_path = root.join(".astra").join("instructions.md");
+        if let Ok(content) = std::fs::read_to_string(&project_path) {
+            let trimmed = content.trim();
+            if !trimmed.is_empty() {
+                parts.push((project_path.display().to_string(), trimmed.to_string()));
+            }
+        }
+    }
+
+    // User-level: ~/.astra/instructions.md
+    if let Some(h) = home {
+        let user_path = h.join(".astra").join("instructions.md");
+        if let Ok(content) = std::fs::read_to_string(&user_path) {
+            let trimmed = content.trim();
+            if !trimmed.is_empty() {
+                parts.push((user_path.display().to_string(), trimmed.to_string()));
+            }
+        }
+    }
+
+    if parts.is_empty() {
+        return None;
+    }
+
+    let combined = parts
+        .iter()
+        .map(|(path, content)| format!("<!-- source: {} -->\n{}", path, content))
+        .collect::<Vec<_>>()
+        .join("\n\n");
+
+    Some(combined)
+}
+
+/// Format project instructions for injection into the effective message.
+fn format_project_instructions(instructions: &str) -> String {
+    format!(
+        "<project_instructions>\nThe following are project-level instructions that apply to all interactions in this workspace.\n\n{instructions}\n</project_instructions>"
+    )
+}
+
 // ════════════════════════════════════════════════════════════════ main ════
 
 #[tokio::main]
@@ -5902,6 +6053,7 @@ async fn main() {
         session_id: cli_session_id,
         session_name,
         bare,
+        no_instructions,
         command,
     } = cli;
 
@@ -5909,6 +6061,13 @@ async fn main() {
     if bare {
         unsafe {
             std::env::set_var("ASTRA_BARE", "1");
+        }
+    }
+
+    // --no-instructions: disable .astra/instructions.md auto-loading
+    if no_instructions {
+        unsafe {
+            std::env::set_var("ASTRA_NO_INSTRUCTIONS", "1");
         }
     }
 
@@ -5936,6 +6095,19 @@ async fn main() {
             }
         }
     });
+
+    // Merge project instructions into system_prompt for inline/print modes.
+    // REPL mode handles this separately via build_effective_line.
+    let system_prompt = if no_instructions {
+        system_prompt
+    } else {
+        match (system_prompt, discover_project_instructions()) {
+            (Some(sp), Some(pi)) => Some(format!("{sp}\n\n{}", format_project_instructions(&pi))),
+            (Some(sp), None) => Some(sp),
+            (None, Some(pi)) => Some(format_project_instructions(&pi)),
+            (None, None) => None,
+        }
+    };
 
     // --allowed-tools: normalize comma/space-separated list and export as env var
     if !allowed_tools.is_empty() {
@@ -9606,5 +9778,115 @@ total_tokens_out: 500
         let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644));
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("cannot read system prompt file"));
+    }
+
+    // ── project instructions tests ──
+
+    #[test]
+    fn discover_project_instructions_from_tempdir() {
+        let dir = tempfile::tempdir().unwrap();
+        let astra_dir = dir.path().join(".astra");
+        std::fs::create_dir_all(&astra_dir).unwrap();
+        std::fs::write(
+            astra_dir.join("instructions.md"),
+            "Always use Rust.\nPrefer async.",
+        )
+        .unwrap();
+
+        let result = discover_instructions_from_paths(Some(dir.path()), None);
+        let instructions = result.expect("should discover instructions");
+        assert!(instructions.contains("Always use Rust."));
+        assert!(instructions.contains("Prefer async."));
+    }
+
+    #[test]
+    fn discover_project_instructions_empty_file_returns_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let astra_dir = dir.path().join(".astra");
+        std::fs::create_dir_all(&astra_dir).unwrap();
+        std::fs::write(astra_dir.join("instructions.md"), "   \n  \n").unwrap();
+
+        let result = discover_instructions_from_paths(Some(dir.path()), None);
+        assert!(result.is_none(), "empty file should return None");
+    }
+
+    #[test]
+    fn discover_project_instructions_no_file_returns_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let result = discover_instructions_from_paths(Some(dir.path()), Some(dir.path()));
+        assert!(result.is_none(), "no file should return None");
+    }
+
+    #[test]
+    fn discover_project_instructions_combines_project_and_user() {
+        let project = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let p_astra = project.path().join(".astra");
+        let h_astra = home.path().join(".astra");
+        std::fs::create_dir_all(&p_astra).unwrap();
+        std::fs::create_dir_all(&h_astra).unwrap();
+        std::fs::write(p_astra.join("instructions.md"), "Project rules").unwrap();
+        std::fs::write(h_astra.join("instructions.md"), "Global rules").unwrap();
+
+        let result = discover_instructions_from_paths(Some(project.path()), Some(home.path()));
+        let instructions = result.expect("should combine both");
+        assert!(instructions.contains("Project rules"));
+        assert!(instructions.contains("Global rules"));
+        // Project should come first
+        let project_pos = instructions.find("Project rules").unwrap();
+        let global_pos = instructions.find("Global rules").unwrap();
+        assert!(project_pos < global_pos, "project should precede global");
+    }
+
+    #[test]
+    fn discover_project_instructions_user_only() {
+        let project = tempfile::tempdir().unwrap(); // no .astra dir
+        let home = tempfile::tempdir().unwrap();
+        let h_astra = home.path().join(".astra");
+        std::fs::create_dir_all(&h_astra).unwrap();
+        std::fs::write(h_astra.join("instructions.md"), "User-level rules").unwrap();
+
+        let result = discover_instructions_from_paths(Some(project.path()), Some(home.path()));
+        let instructions = result.expect("should find user-level");
+        assert!(instructions.contains("User-level rules"));
+    }
+
+    #[test]
+    fn format_project_instructions_wraps_in_tags() {
+        let content = "Use tabs for indentation.";
+        let formatted = format_project_instructions(content);
+        assert!(formatted.starts_with("<project_instructions>"));
+        assert!(formatted.ends_with("</project_instructions>"));
+        assert!(formatted.contains(content));
+    }
+
+    #[test]
+    fn build_effective_line_includes_project_instructions() {
+        let mut state = ReplState::default();
+        state.project_instructions = Some("Always use Rust.".to_string());
+        let result = repl_turn::build_effective_line("hello", &state);
+        assert!(
+            result.contains("<project_instructions>"),
+            "should wrap in tags"
+        );
+        assert!(result.contains("Always use Rust."));
+        assert!(result.contains("hello"), "should still include user message");
+    }
+
+    #[test]
+    fn build_effective_line_no_instructions_when_none() {
+        let state = ReplState::default();
+        let result = repl_turn::build_effective_line("hello", &state);
+        assert!(
+            !result.contains("<project_instructions>"),
+            "should not inject when None"
+        );
+        assert_eq!(result, "hello");
+    }
+
+    #[test]
+    fn cli_no_instructions_flag() {
+        let cli = Cli::try_parse_from(["astra", "--no-instructions"]).unwrap();
+        assert!(cli.no_instructions);
     }
 }

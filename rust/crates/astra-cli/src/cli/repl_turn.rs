@@ -351,6 +351,12 @@ pub(super) fn build_effective_line(line: &str, state: &ReplState) -> String {
         effective_line = format!("{skill_block}\n\n{effective_line}");
     }
 
+    // Inject project instructions (.astra/instructions.md) if loaded
+    if let Some(ref instructions) = state.project_instructions {
+        let block = super::format_project_instructions(instructions);
+        effective_line = format!("{block}\n\n{effective_line}");
+    }
+
     if let Some(anchor) = state
         .continuation_anchor
         .as_deref()
