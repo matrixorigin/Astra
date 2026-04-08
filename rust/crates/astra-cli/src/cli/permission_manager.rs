@@ -407,13 +407,15 @@ impl PermissionManager {
 
         // Primary signals: AST + heuristic command risks from runtime sandbox.
         // Hard-deny the highest-risk primitives; everything else falls through to ask/allowlist.
+        // Note: OutputRedirection is NOT hard-denied — it's a common pattern for
+        // AI-generated file creation (cat > file << 'EOF').  It falls through to
+        // the permission-mode check so the user can approve interactively.
         let risks = analyze_command_risks(cmd_str);
         if risks.iter().any(|r| {
             matches!(
                 r,
                 CommandRisk::PrivilegeEscalation
                     | CommandRisk::RemoteCodeExecution
-                    | CommandRisk::OutputRedirection
                     | CommandRisk::Eval
             )
         }) {
@@ -1098,10 +1100,11 @@ mod tests {
             PermissionManager::execute_decision("bash", &piped),
             ExecuteDecision::Ask
         );
+        // Output redirection is Ask (not Deny) — common AI pattern for creating files
         let redirected = serde_json::json!({"command": "git status > out.txt"});
         assert_eq!(
             PermissionManager::execute_decision("bash", &redirected),
-            ExecuteDecision::Deny
+            ExecuteDecision::Ask
         );
     }
 
@@ -1130,6 +1133,25 @@ mod tests {
     fn non_shell_tools_never_dangerous() {
         let args = serde_json::json!({"path": "/etc/passwd"});
         assert!(!PermissionManager::is_dangerous("read_file", &args));
+    }
+
+    #[test]
+    fn output_redirection_is_ask_not_deny() {
+        // Heredoc creation — the most common AI file-write pattern
+        let heredoc = serde_json::json!({"command": "cat > /tmp/index.html << 'HTMLEOF'\n<html></html>\nHTMLEOF"});
+        assert_eq!(
+            PermissionManager::execute_decision("bash", &heredoc),
+            ExecuteDecision::Ask
+        );
+        assert!(!PermissionManager::is_dangerous("bash", &heredoc));
+
+        // Simple redirect
+        let echo_redir = serde_json::json!({"command": "echo hello > output.txt"});
+        assert_eq!(
+            PermissionManager::execute_decision("bash", &echo_redir),
+            ExecuteDecision::Ask
+        );
+        assert!(!PermissionManager::is_dangerous("bash", &echo_redir));
     }
 
     // ── auto_approve ──────────────────────────────────────────────────────────
