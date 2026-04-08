@@ -91,6 +91,69 @@ async fn collect_sse_text(resp: reqwest::Response, stream_to_stderr: bool) -> Ss
     result
 }
 
+/// Non-interactive plan decomposition (same `/chat/turn` + [`plan_decompose::parse_plan_response`] path as `/plan enter`).
+///
+/// Does not use the REPL. Cloud template enrichment is skipped (no `MatrixCloudRuntime` in this entrypoint).
+pub(crate) async fn headless_plan_decompose(
+    api: &astra_thin_client::ThinClient,
+    token: &str,
+    goal: &str,
+    session_id: Option<&str>,
+    model: Option<&str>,
+    quiet: bool,
+) -> Result<plan_decompose::TaskPlan, String> {
+    use std::path::PathBuf;
+
+    let project_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    if !quiet {
+        eprintln!("  {} Analyzing project...", "⋯".dim());
+    }
+    let context = plan_decompose::analyze_project(&project_root);
+    let prompt = plan_decompose::decomposition_prompt(goal, &context);
+    if !quiet {
+        eprintln!("  {} Decomposing goal...", "⋯".dim());
+    }
+
+    let mut payload = serde_json::json!({
+        "messages": [{"role": "user", "content": prompt}],
+        "session_id": session_id,
+    });
+    if let Some(m) = model {
+        if let Some(obj) = payload.as_object_mut() {
+            obj.insert("model".to_string(), serde_json::json!(m));
+        }
+    }
+
+    let resp = api
+        .post_chat_turn(token, &payload)
+        .await
+        .map_err(map_thin_err)?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(format!("LLM request failed ({status}): {body}"));
+    }
+
+    let collected = collect_sse_text(resp, false).await;
+    if collected.event_types.iter().any(|t| t == "error") && collected.text.trim().is_empty() {
+        return Err("LLM stream returned an error event with no text".to_string());
+    }
+    let full_text = collected.text;
+    if full_text.trim().is_empty() {
+        return Err("empty model response (no text_delta)".to_string());
+    }
+
+    plan_decompose::parse_plan_response(&full_text).map_err(|e| {
+        let prev = plan_decompose::plan_response_parse_error_preview(&full_text, 10, 700);
+        if prev.is_empty() {
+            format!("failed to parse plan: {e}")
+        } else {
+            format!("failed to parse plan: {e}\n--- response preview ---\n{prev}")
+        }
+    })
+}
+
 /// Enrich a `ProjectContext` with learned plan templates from cloud storage.
 ///
 /// Best-effort: returns quietly if no cloud connection or query fails.

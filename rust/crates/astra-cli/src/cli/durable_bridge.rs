@@ -208,27 +208,44 @@ pub async fn on_subtask_complete(durable: &mut DurableTaskState, subtask_id: &st
         );
     }
 
-    // 2. Check if this subtask has any *local* verification criteria
-    //    (skip global_only and LlmJudge — those only run in on_plan_complete)
-    let has_local_criteria = durable
+    // 2. Decide whether we must run `lifecycle.verify_subtask`.
+    //
+    // `complete_subtask_execution` leaves the durable row in `AwaitingVerification` whenever the
+    // subtask has *any* criteria.  The plan orchestrator (`TaskPlan`) marks the subtask
+    // `Completed` based on this function's return value — so if we return `true` without
+    // calling `verify_subtask`, durable stays non-`Verified` while the executor thinks the plan is
+    // 100% done and immediately calls `on_plan_complete` → `verify_global`, which then errors with
+    // `subtasks not ready for global verification`.
+    //
+    // Criteria that are only `LlmJudge` or `global_only` still need a full `verify_subtask` call
+    // (the lifecycle runner runs all criteria when `skip_heavy` is false); they must not be
+    // silently skipped here.
+    let (criteria_count, has_local_criteria) = durable
         .contract
         .subtasks
         .iter()
         .find(|s| s.id == subtask_id)
         .map(|s| {
-            s.criteria
-                .iter()
-                .any(|c| !c.global_only && !matches!(c.verifier, VerifierKind::LlmJudge { .. }))
+            let n = s.criteria.len();
+            let local = s.criteria.iter().any(|c| {
+                !c.global_only && !matches!(c.verifier, VerifierKind::LlmJudge { .. })
+            });
+            (n, local)
         })
-        .unwrap_or(false);
+        .unwrap_or((0, false));
 
-    if !has_local_criteria {
-        // Silently skip — heavy checks run during global verification
+    if criteria_count == 0 {
+        // No criteria → lifecycle already promoted the row to `Verified` in `complete_subtask_execution`.
         return true;
     }
 
-    // 3. Run lightweight verification with progress indication + spinner
-    let spinner = super::stream_render::Spinner::start(format!("🔍 Verifying: {subtask_id}"));
+    // 3. Run verification with progress indication + spinner
+    let label = if has_local_criteria {
+        format!("🔍 Verifying: {subtask_id}")
+    } else {
+        format!("🔍 Verifying (LLM / deferred criteria): {subtask_id}")
+    };
+    let spinner = super::stream_render::Spinner::start(label);
     let result = durable.lifecycle.verify_subtask(&task_id, subtask_id).await;
     spinner.stop_clear();
     match result {

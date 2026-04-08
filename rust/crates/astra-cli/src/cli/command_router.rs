@@ -266,6 +266,32 @@ pub(super) async fn execute_cli_command(
             Ok(ExitCode::Success)
         }
 
+        Some(Command::Plan(plan_cmd)) => match plan_cmd {
+            PlanCmd::Decompose { goal, json, quiet } => {
+                let (_, _, _, token) = get_profile_and_token(profile.as_deref())?;
+                let session_id = resumable_last_session_id(profile.as_deref());
+                let plan = crate::slash_memory::headless_plan_decompose(
+                    api,
+                    &token,
+                    &goal,
+                    session_id.as_deref(),
+                    global_model.as_deref(),
+                    quiet,
+                )
+                .await?;
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&plan)
+                            .map_err(|e| format!("serialize plan: {e}"))?
+                    );
+                } else {
+                    println!("{}", astra_runtime::plan_decompose::format_plan(&plan));
+                }
+                Ok(ExitCode::Success)
+            }
+        },
+
         Some(Command::Chat(args)) => {
             // Handle --no-color or non-terminal stderr: disable ANSI colors via NO_COLOR env.
             // crossterm checks NO_COLOR to suppress escape sequences globally.

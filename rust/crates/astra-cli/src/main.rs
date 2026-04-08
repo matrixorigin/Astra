@@ -348,9 +348,29 @@ enum Command {
     Completion(CompletionArgs),
     /// Diagnose installation, config, and connectivity
     Doctor,
+    /// Structured plan without the REPL (scripting / CI)
+    #[command(subcommand)]
+    Plan(PlanCmd),
     /// Direct message: astra "your question here"
     #[command(external_subcommand)]
     Message(Vec<String>),
+}
+
+/// Headless plan commands (no interactive `plan>` prompt).
+#[derive(Subcommand, Debug)]
+enum PlanCmd {
+    /// Decompose a goal into a structured plan (same backend as `/plan enter`).
+    Decompose {
+        /// Goal text for decomposition
+        #[arg(short = 'g', long)]
+        goal: String,
+        /// Print parsed plan as JSON on stdout
+        #[arg(long, default_value_t = false)]
+        json: bool,
+        /// Suppress progress messages on stderr
+        #[arg(short, long, default_value_t = false)]
+        quiet: bool,
+    },
 }
 
 #[derive(Args, Debug)]
@@ -9162,6 +9182,32 @@ total_tokens_out: 500
                 assert_eq!(words, &["what", "is", "rust"]);
             }
             _ => panic!("expected Message command"),
+        }
+    }
+
+    #[test]
+    fn cli_plan_decompose_parses() {
+        let cli = Cli::try_parse_from([
+            "astra",
+            "plan",
+            "decompose",
+            "-g",
+            "smoke goal",
+            "--json",
+            "-q",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Command::Plan(PlanCmd::Decompose {
+                ref goal,
+                json,
+                quiet,
+            })) => {
+                assert_eq!(goal, "smoke goal");
+                assert!(json);
+                assert!(quiet);
+            }
+            _ => panic!("expected Plan::Decompose command"),
         }
     }
 
