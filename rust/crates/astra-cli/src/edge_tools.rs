@@ -1135,6 +1135,34 @@ pub fn all_tool_schemas() -> Vec<Value> {
                 }
             }
         }),
+        // ─── Web search tool ──────────────────────────────────────────────────────
+        json!({
+            "type": "function",
+            "function": {
+                "name": "web_search",
+                "description": "Perform a web search and get results. Returns search URLs for multiple engines that can be fetched with web_fetch. Use for finding current information, documentation, or answers not in local knowledge.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": "The search query. Be specific for better results."
+                        },
+                        "engine": {
+                            "type": "string",
+                            "enum": ["google", "duckduckgo", "bing", "wikipedia", "github"],
+                            "description": "Search engine to use (default: google). Use 'wikipedia' for encyclopedic info, 'github' for code/repos."
+                        },
+                        "num_results": {
+                            "type": "integer",
+                            "description": "Number of results to request (default: 10, max: 50)",
+                            "default": 10
+                        }
+                    },
+                    "required": ["query"]
+                }
+            }
+        }),
     ]
 }
 
@@ -2296,6 +2324,99 @@ impl ToolExecutor {
         }).to_string()
     }
 
+    // ─── Web search tool ──────────────────────────────────────────────────────────
+
+    /// Construct web search URLs for various engines.
+    /// Returns URLs that can be fetched with web_fetch to get actual results.
+    fn web_search(&self, args: &Value) -> String {
+        let query = match args.get("query").and_then(Value::as_str) {
+            Some(q) if !q.trim().is_empty() => q.trim(),
+            _ => return serde_json::json!({
+                "error": "Missing or empty 'query' parameter"
+            }).to_string(),
+        };
+
+        let engine = args
+            .get("engine")
+            .and_then(Value::as_str)
+            .unwrap_or("google");
+
+        let num_results = args
+            .get("num_results")
+            .and_then(Value::as_u64)
+            .unwrap_or(10)
+            .min(50) as usize;
+
+        // URL-encode the query
+        let encoded_query = urlencoding::encode(query);
+
+        // Build search URL based on engine
+        let (search_url, engine_name, result_tip) = match engine {
+            "google" => (
+                format!("https://www.google.com/search?q={}&num={}", encoded_query, num_results),
+                "Google",
+                "Use web_fetch with this URL to get search results. Parse the HTML for links."
+            ),
+            "duckduckgo" => (
+                format!("https://html.duckduckgo.com/html/?q={}", encoded_query),
+                "DuckDuckGo",
+                "Use web_fetch with this URL. Results are in HTML format with class='result'."
+            ),
+            "bing" => (
+                format!("https://www.bing.com/search?q={}&count={}", encoded_query, num_results),
+                "Bing",
+                "Use web_fetch with this URL to get search results."
+            ),
+            "wikipedia" => (
+                format!(
+                    "https://en.wikipedia.org/w/api.php?action=opensearch&search={}&limit={}&format=json",
+                    encoded_query, num_results.min(20)
+                ),
+                "Wikipedia",
+                "This returns JSON directly. Format: [query, [titles], [descriptions], [urls]]"
+            ),
+            "github" => (
+                format!("https://github.com/search?q={}&type=repositories", encoded_query),
+                "GitHub",
+                "Use web_fetch with this URL. Consider using gh CLI for better structured results."
+            ),
+            other => {
+                return serde_json::json!({
+                    "error": format!("Unknown engine '{}'. Valid: google, duckduckgo, bing, wikipedia, github", other)
+                }).to_string();
+            }
+        };
+
+        // Build alternative URLs for common engines
+        let mut alternatives = vec![];
+        if engine != "wikipedia" {
+            alternatives.push(serde_json::json!({
+                "engine": "Wikipedia",
+                "url": format!(
+                    "https://en.wikipedia.org/w/api.php?action=opensearch&search={}&limit=5&format=json",
+                    encoded_query
+                ),
+                "note": "Direct JSON API, no HTML parsing needed"
+            }));
+        }
+        if engine != "github" && query.contains("code") || query.contains("library") || query.contains("package") {
+            alternatives.push(serde_json::json!({
+                "engine": "GitHub",
+                "url": format!("https://github.com/search?q={}&type=repositories", encoded_query),
+                "note": "For code/library searches"
+            }));
+        }
+
+        serde_json::json!({
+            "query": query,
+            "engine": engine_name,
+            "search_url": search_url,
+            "tip": result_tip,
+            "alternatives": alternatives,
+            "usage": "Call web_fetch with the search_url to retrieve results. For Wikipedia, results are JSON. For others, parse the HTML response."
+        }).to_string()
+    }
+
     /// Set the MCP client manager for external tool routing.
     pub fn with_mcp_manager(
         mut self,
@@ -2840,13 +2961,14 @@ impl ToolExecutor {
             "task_update" => self.task_update(args).await,
             "sleep" => self.sleep_tool(args).await,
             "tool_search" => self.tool_search(args),
+            "web_search" => self.web_search(args),
             _ if name.starts_with("mcp_") => self.execute_mcp_tool(name, args).await,
             _ => format!(
                 "Unknown tool: {name}. Available tools: bash, read_file, write_file, str_replace, \
                  list_dir, grep, glob, symbols, find_definition, find_references, git_status, \
                  git_diff, git_log, git_show, git_blame, call_graph, run_build_test, web_fetch, \
                  mo_query, memory_search, memory_profile, ask_user, task_create, task_list, \
-                 task_get, task_update, sleep, tool_search"
+                 task_get, task_update, sleep, tool_search, web_search"
             ),
         };
         // Normalize empty output, then apply global safety net
@@ -9946,5 +10068,143 @@ impl MyType {
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
         let total = parsed["total_tools"].as_u64().unwrap();
         assert!(total >= 10, "should have many tools registered");
+    }
+
+    // ─── web_search tests ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn web_search_google_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = ToolExecutor::new(dir.path());
+        let result = exe.web_search(&json!({"query": "rust programming"}));
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        
+        assert_eq!(parsed["engine"], "Google");
+        assert!(parsed["search_url"].as_str().unwrap().contains("google.com"));
+        assert!(parsed["search_url"].as_str().unwrap().contains("rust%20programming"));
+        assert!(parsed["tip"].as_str().is_some());
+    }
+
+    #[test]
+    fn web_search_duckduckgo() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = ToolExecutor::new(dir.path());
+        let result = exe.web_search(&json!({"query": "hello world", "engine": "duckduckgo"}));
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        
+        assert_eq!(parsed["engine"], "DuckDuckGo");
+        assert!(parsed["search_url"].as_str().unwrap().contains("duckduckgo.com"));
+    }
+
+    #[test]
+    fn web_search_wikipedia() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = ToolExecutor::new(dir.path());
+        let result = exe.web_search(&json!({"query": "quantum physics", "engine": "wikipedia"}));
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        
+        assert_eq!(parsed["engine"], "Wikipedia");
+        assert!(parsed["search_url"].as_str().unwrap().contains("wikipedia.org"));
+        assert!(parsed["search_url"].as_str().unwrap().contains("action=opensearch"));
+        assert!(parsed["tip"].as_str().unwrap().contains("JSON"));
+    }
+
+    #[test]
+    fn web_search_github() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = ToolExecutor::new(dir.path());
+        let result = exe.web_search(&json!({"query": "tokio async", "engine": "github"}));
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        
+        assert_eq!(parsed["engine"], "GitHub");
+        assert!(parsed["search_url"].as_str().unwrap().contains("github.com/search"));
+    }
+
+    #[test]
+    fn web_search_bing() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = ToolExecutor::new(dir.path());
+        let result = exe.web_search(&json!({"query": "test query", "engine": "bing"}));
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        
+        assert_eq!(parsed["engine"], "Bing");
+        assert!(parsed["search_url"].as_str().unwrap().contains("bing.com"));
+    }
+
+    #[test]
+    fn web_search_invalid_engine() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = ToolExecutor::new(dir.path());
+        let result = exe.web_search(&json!({"query": "test", "engine": "askjeeves"}));
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        
+        assert!(parsed["error"].as_str().unwrap().contains("Unknown engine"));
+    }
+
+    #[test]
+    fn web_search_empty_query() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = ToolExecutor::new(dir.path());
+        let result = exe.web_search(&json!({"query": ""}));
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        
+        assert!(parsed["error"].as_str().is_some());
+    }
+
+    #[test]
+    fn web_search_missing_query() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = ToolExecutor::new(dir.path());
+        let result = exe.web_search(&json!({}));
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        
+        assert!(parsed["error"].as_str().is_some());
+    }
+
+    #[test]
+    fn web_search_special_characters_encoded() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = ToolExecutor::new(dir.path());
+        let result = exe.web_search(&json!({"query": "C++ templates & generics"}));
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        
+        let url = parsed["search_url"].as_str().unwrap();
+        // Should be URL encoded (no raw & or + in query part)
+        assert!(url.contains("C%2B%2B"));
+        assert!(url.contains("%26")); // & encoded
+    }
+
+    #[test]
+    fn web_search_num_results_respected() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = ToolExecutor::new(dir.path());
+        let result = exe.web_search(&json!({"query": "test", "num_results": 25}));
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        
+        let url = parsed["search_url"].as_str().unwrap();
+        assert!(url.contains("num=25"));
+    }
+
+    #[test]
+    fn web_search_num_results_capped() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = ToolExecutor::new(dir.path());
+        let result = exe.web_search(&json!({"query": "test", "num_results": 100}));
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        
+        let url = parsed["search_url"].as_str().unwrap();
+        // Should be capped at 50
+        assert!(url.contains("num=50"));
+    }
+
+    #[test]
+    fn web_search_has_alternatives() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = ToolExecutor::new(dir.path());
+        let result = exe.web_search(&json!({"query": "test"}));
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        
+        assert!(parsed["alternatives"].as_array().is_some());
+        assert!(parsed["usage"].as_str().is_some());
     }
 }
