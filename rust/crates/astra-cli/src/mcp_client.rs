@@ -32,6 +32,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
+use crossterm::style::Stylize;
 use rmcp::{
     ClientHandler, Peer, RoleClient,
     model::{
@@ -310,7 +311,7 @@ impl ClientHandler for ChangeHandler {
         } else {
             params.data.to_string()
         };
-        eprintln!("  [{level}] {logger}: {data}");
+        eprintln!("  {} {}: {}", format!("[{level}]").dim(), logger.dim(), data);
         std::future::ready(())
     }
 
@@ -545,14 +546,14 @@ async fn do_elicitation(
                 use std::io::BufRead;
                 let stdin = std::io::stdin();
 
-                eprintln!("\n  ╭─ MCP Elicitation Request");
-                eprintln!("  │ {message}");
+                eprintln!("\n  {} {}", "╭─".dim(), "MCP Elicitation Request".bold().cyan());
+                eprintln!("  {} {message}", "│".dim());
 
                 let mut data = serde_json::Map::new();
 
                 for (name, type_hint, is_required) in &fields {
                     let req_marker = if *is_required { "*" } else { "" };
-                    eprint!("  │ {name}{req_marker} ({type_hint}): ");
+                    eprint!("  {} {}{} ({}): ", "│".dim(), name.as_str().cyan(), req_marker, type_hint.as_str().dim());
 
                     let mut line = String::new();
                     if stdin.lock().read_line(&mut line).is_err() || line.is_empty() {
@@ -626,10 +627,10 @@ async fn do_elicitation(
                 use std::io::BufRead;
                 let stdin = std::io::stdin();
 
-                eprintln!("\n  ╭─ MCP Elicitation (URL)");
-                eprintln!("  │ {message}");
-                eprintln!("  │ URL: {url}");
-                eprint!("  │ Press Enter after visiting, or type /cancel: ");
+                eprintln!("\n  {} {}", "╭─".dim(), "MCP Elicitation (URL)".bold().cyan());
+                eprintln!("  {} {message}", "│".dim());
+                eprintln!("  {} {} {url}", "│".dim(), "URL:".dim());
+                eprint!("  {} {}", "│".dim(), "Press Enter after visiting, or type /cancel: ".dim());
 
                 let mut line = String::new();
                 if stdin.lock().read_line(&mut line).is_err() || line.is_empty() {
@@ -780,8 +781,9 @@ impl McpConnection {
         .await
         .map_err(|_| {
             eprintln!(
-                "[ERROR] MCP tool '{}' on server '{}' timed out after {}s",
-                name, self.name, MCP_TOOL_CALL_TIMEOUT_SECS
+                "  {} MCP tool '{}' on server '{}' timed out after {}s",
+                "✗".red(),
+                name.cyan(), self.name.as_str().cyan(), MCP_TOOL_CALL_TIMEOUT_SECS
             );
             ServiceError::Timeout {
                 timeout: std::time::Duration::from_secs(MCP_TOOL_CALL_TIMEOUT_SECS),
@@ -997,7 +999,7 @@ impl McpClientManager {
             {
                 Ok(_) => registered += 1,
                 Err(e) => {
-                    eprintln!("  ⚠ Failed to register MCP skill from {server_name}: {e}");
+                    eprintln!("  {} {}", "⚠".yellow(), format!("Failed to register MCP skill from {server_name}: {e}").dim());
                 }
             }
         }
@@ -1100,7 +1102,7 @@ impl McpClientManager {
                     }
                 }
                 Err(e) => {
-                    eprintln!("  ⚠ Failed to list prompts from {name}: {e}");
+                    eprintln!("  {} {}", "⚠".yellow(), format!("Failed to list prompts from {name}: {e}").dim());
                 }
             }
         }
@@ -1119,7 +1121,7 @@ impl McpClientManager {
                     }
                 }
                 Err(e) => {
-                    eprintln!("  ⚠ Failed to list resources from {name}: {e}");
+                    eprintln!("  {} {}", "⚠".yellow(), format!("Failed to list resources from {name}: {e}").dim());
                 }
             }
         }
@@ -1369,7 +1371,7 @@ impl McpClientManager {
             match skill_registry.register_mcp_skill(name, content).await {
                 Ok(_) => registered += 1,
                 Err(e) => {
-                    eprintln!("  ⚠ Failed to register MCP skill from {name}: {e}");
+                    eprintln!("  {} {}", "⚠".yellow(), format!("Failed to register MCP skill from {name}: {e}").dim());
                 }
             }
         }
@@ -1386,13 +1388,13 @@ impl McpClientManager {
                     match inner.refresh_tools_if_changed().await {
                         Ok(true) => refreshed.push(name.clone()),
                         Ok(false) => {}
-                        Err(e) => eprintln!("  ⚠ Failed to refresh tools for {name}: {e}"),
+                        Err(e) => eprintln!("  {} {}", "⚠".yellow(), format!("Failed to refresh tools for {name}: {e}").dim()),
                     }
                 }
             }
         }
         if !refreshed.is_empty() {
-            eprintln!("  ↻ Refreshed tool lists for: {}", refreshed.join(", "));
+            eprintln!("  {} Refreshed tool lists for: {}", "↻".cyan(), refreshed.join(", "));
         }
         refreshed
     }
@@ -1407,7 +1409,7 @@ impl McpClientManager {
             }
         }
         if !changed.is_empty() {
-            eprintln!("  ↻ Prompt lists changed on: {}", changed.join(", "));
+            eprintln!("  {} Prompt lists changed on: {}", "↻".cyan(), changed.join(", "));
         }
         changed
     }
@@ -1422,7 +1424,7 @@ impl McpClientManager {
             }
         }
         if !changed.is_empty() {
-            eprintln!("  ↻ Resources changed on: {}", changed.join(", "));
+            eprintln!("  {} Resources changed on: {}", "↻".cyan(), changed.join(", "));
         }
         changed
     }
@@ -1559,7 +1561,7 @@ async fn connect_stdio(
     // escalation or library injection attacks.
     for (key, value) in env {
         if is_dangerous_env_var(key) {
-            eprintln!("  ⚠ MCP server '{name}': blocked dangerous env var '{key}'");
+            eprintln!("  {} MCP server '{}': blocked dangerous env var '{}'", "⚠".yellow(), name.cyan(), key.as_str().yellow());
             continue;
         }
         cmd.env(key, value);
@@ -1737,7 +1739,7 @@ async fn connect_ws(
                 Some(Ok(tungstenite::Message::Close(_))) => break,
                 Some(Ok(_)) => {} // ignore binary, ping, pong
                 Some(Err(e)) => {
-                    eprintln!("  ⚠ MCP WebSocket read error [{reader_name}]: {e}");
+                    eprintln!("  {} {}", "⚠".yellow(), format!("MCP WebSocket read error [{reader_name}]: {e}").dim());
                     break;
                 }
                 None => break,
@@ -1768,7 +1770,7 @@ async fn connect_ws(
                     line.clear();
                 }
                 Err(e) => {
-                    eprintln!("  ⚠ MCP WebSocket write-bridge error [{writer_name}]: {e}");
+                    eprintln!("  {} {}", "⚠".yellow(), format!("MCP WebSocket write-bridge error [{writer_name}]: {e}").dim());
                     break;
                 }
             }

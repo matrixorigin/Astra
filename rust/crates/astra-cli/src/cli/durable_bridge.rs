@@ -306,8 +306,12 @@ pub fn display_verification_report(report: &SubtaskVerificationReport) {
     };
 
     eprintln!(
-        "  {}  Verification: {}/{} criteria passed  [{}]",
-        styled_icon, passed, total, report.subtask_id,
+        "  {}  {} {}/{} criteria passed  {}",
+        styled_icon,
+        "Verification:".bold(),
+        format!("{passed}").cyan(),
+        format!("{total}").dim(),
+        format!("[{}]", report.subtask_id).dim(),
     );
 
     // Show individual results (both pass and fail for transparency)
@@ -348,7 +352,7 @@ pub fn display_verification_report(report: &SubtaskVerificationReport) {
                 eprintln!("        got: {}", evidence.yellow());
             }
             if !expected.is_empty() {
-                eprintln!("        expected: {}", expected);
+                eprintln!("        {} {}", "expected:".dim(), expected);
             }
             if let Some(ref err) = r.error {
                 eprintln!("        error: {}", err.clone().red());
@@ -400,7 +404,13 @@ pub async fn on_plan_complete(durable: &mut DurableTaskState) -> bool {
                 format!("{}", icon.red())
             };
 
-            eprintln!("  {}  Global checks: {}/{} passed", styled, passed, total,);
+            eprintln!(
+                "  {}  {} {}/{} passed",
+                styled,
+                "Global checks:".bold(),
+                format!("{passed}").cyan(),
+                format!("{total}").dim(),
+            );
 
             // Show ALL results — passes and failures — for full transparency
             for r in &results {

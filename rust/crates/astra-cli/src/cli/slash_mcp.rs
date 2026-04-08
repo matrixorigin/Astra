@@ -132,10 +132,10 @@ async fn show_servers(state: &ReplState) {
                 .map(|d| format_duration(d))
                 .unwrap_or_else(|| "n/a".to_string());
 
-            eprintln!("{}", format!("  ┌─ {name}").bold());
-            eprintln!("  │ State:   {}", format_state(state));
-            eprintln!("  │ Uptime:  {uptime}");
-            eprintln!("  │ Tools:   {}", tools.len());
+            eprintln!("{}", format!("  ┌─ {name}").bold().cyan());
+            eprintln!("  {} {}   {}", "│".dim(), "State:".dim(), format_state(state));
+            eprintln!("  {} {}  {uptime}", "│".dim(), "Uptime:".dim());
+            eprintln!("  {} {}   {}", "│".dim(), "Tools:".dim(), tools.len().to_string().cyan());
 
             if !tools.is_empty() {
                 for tool in tools.iter().take(10) {
@@ -145,13 +145,13 @@ async fn show_servers(state: &ReplState) {
                     } else {
                         desc.to_string()
                     };
-                    eprintln!("  │   {} {}", tool.name, short_desc.dim());
+                    eprintln!("  {}   {} {}", "│".dim(), tool.name.clone().cyan(), short_desc.dim());
                 }
                 if tools.len() > 10 {
-                    eprintln!("  │   … and {} more", tools.len() - 10);
+                    eprintln!("  {}   {}", "│".dim(), format!("… and {} more", tools.len() - 10).dim());
                 }
             }
-            eprintln!("  └─");
+            eprintln!("  {}", "└─".dim());
         }
     }
 }
