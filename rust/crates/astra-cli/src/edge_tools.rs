@@ -953,6 +953,36 @@ pub fn all_tool_schemas() -> Vec<Value> {
                 }
             }
         }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "ask_user",
+                "description": "Ask the user a question and wait for their response. Use when you need clarification, user preferences, or decisions during execution. Supports both multiple choice and free-form questions. The user can always provide custom text even for multiple choice questions.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "question": {
+                            "type": "string",
+                            "description": "The question to ask the user. Be clear and specific."
+                        },
+                        "choices": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Optional list of choices for multiple choice (2-6 options). User can always provide custom text. Omit for free-form questions."
+                        },
+                        "default": {
+                            "type": "string",
+                            "description": "Optional default answer if user presses Enter without input."
+                        },
+                        "context": {
+                            "type": "string",
+                            "description": "Optional brief context about why you're asking this question."
+                        }
+                    },
+                    "required": ["question"]
+                }
+            }
+        }),
     ]
 }
 
@@ -1545,6 +1575,153 @@ impl ToolExecutor {
         }
     }
 
+    /// Ask the user a question and wait for their response.
+    /// Supports multiple choice and free-form input.
+    fn ask_user(&self, args: &Value) -> String {
+        use crossterm::{
+            event::{self, Event, KeyCode, KeyEvent},
+            terminal::{disable_raw_mode, enable_raw_mode},
+        };
+        use std::io::{self, Write};
+
+        let question = match args.get("question").and_then(Value::as_str) {
+            Some(q) if !q.is_empty() => q,
+            _ => return "Error: 'question' is required".to_string(),
+        };
+
+        let choices: Vec<&str> = args
+            .get("choices")
+            .and_then(Value::as_array)
+            .map(|arr| arr.iter().filter_map(Value::as_str).collect())
+            .unwrap_or_default();
+
+        let default = args.get("default").and_then(Value::as_str);
+        let context = args.get("context").and_then(Value::as_str);
+
+        // Display the question
+        eprintln!();
+        if let Some(ctx) = context {
+            eprintln!("  \x1b[90m{}\x1b[0m", ctx);
+        }
+        eprintln!("  \x1b[1;36m❓ {}\x1b[0m", question);
+
+        if choices.is_empty() {
+            // Free-form input
+            let prompt = if let Some(def) = default {
+                format!("  \x1b[90m[default: {}]\x1b[0m > ", def)
+            } else {
+                "  > ".to_string()
+            };
+            eprint!("{}", prompt);
+            let _ = io::stderr().flush();
+
+            let mut response = String::new();
+            if io::stdin().read_line(&mut response).is_err() {
+                return "Error: failed to read user input".to_string();
+            }
+            let response = response.trim();
+            let answer = if response.is_empty() {
+                default.unwrap_or("").to_string()
+            } else {
+                response.to_string()
+            };
+            serde_json::json!({
+                "answer": answer,
+                "question": question
+            }).to_string()
+        } else {
+            // Multiple choice
+            for (i, choice) in choices.iter().enumerate() {
+                eprintln!("  \x1b[33m{})\x1b[0m {}", i + 1, choice);
+            }
+            eprintln!("  \x1b[90m(Enter number, or type custom response)\x1b[0m");
+            eprint!("  > ");
+            let _ = io::stderr().flush();
+
+            // Try raw mode for single-key selection
+            struct RawModeGuard;
+            impl Drop for RawModeGuard {
+                fn drop(&mut self) {
+                    let _ = disable_raw_mode();
+                }
+            }
+
+            let answer = if enable_raw_mode().is_ok() {
+                let _guard = RawModeGuard;
+                let mut input = String::new();
+                loop {
+                    if let Ok(Event::Key(KeyEvent { code, .. })) = event::read() {
+                        match code {
+                            KeyCode::Char(c) if c.is_ascii_digit() && input.is_empty() => {
+                                let idx = c.to_digit(10).unwrap() as usize;
+                                if idx >= 1 && idx <= choices.len() {
+                                    drop(_guard);
+                                    eprintln!("{}", c);
+                                    break choices[idx - 1].to_string();
+                                }
+                                input.push(c);
+                                eprint!("{}", c);
+                            }
+                            KeyCode::Char(c) => {
+                                input.push(c);
+                                eprint!("{}", c);
+                            }
+                            KeyCode::Backspace if !input.is_empty() => {
+                                input.pop();
+                                eprint!("\x08 \x08");
+                            }
+                            KeyCode::Enter => {
+                                drop(_guard);
+                                eprintln!();
+                                let trimmed = input.trim();
+                                if trimmed.is_empty() {
+                                    break default.unwrap_or(choices[0]).to_string();
+                                }
+                                if let Ok(idx) = trimmed.parse::<usize>() {
+                                    if idx >= 1 && idx <= choices.len() {
+                                        break choices[idx - 1].to_string();
+                                    }
+                                }
+                                break trimmed.to_string();
+                            }
+                            KeyCode::Esc => {
+                                drop(_guard);
+                                eprintln!();
+                                break "[cancelled]".to_string();
+                            }
+                            _ => {}
+                        }
+                    }
+                    let _ = io::stderr().flush();
+                }
+            } else {
+                // Fallback: line-based input
+                let mut response = String::new();
+                if io::stdin().read_line(&mut response).is_err() {
+                    return "Error: failed to read user input".to_string();
+                }
+                let trimmed = response.trim();
+                if trimmed.is_empty() {
+                    default.unwrap_or(choices[0]).to_string()
+                } else if let Ok(idx) = trimmed.parse::<usize>() {
+                    if idx >= 1 && idx <= choices.len() {
+                        choices[idx - 1].to_string()
+                    } else {
+                        trimmed.to_string()
+                    }
+                } else {
+                    trimmed.to_string()
+                }
+            };
+
+            serde_json::json!({
+                "answer": answer,
+                "question": question,
+                "was_custom": !choices.contains(&answer.as_str())
+            }).to_string()
+        }
+    }
+
     /// Set the MCP client manager for external tool routing.
     pub fn with_mcp_manager(
         mut self,
@@ -2081,12 +2258,13 @@ impl ToolExecutor {
                     Err(e) => format!("Error: Invalid chain format: {e}"),
                 }
             }
+            "ask_user" => self.ask_user(args),
             _ if name.starts_with("mcp_") => self.execute_mcp_tool(name, args).await,
             _ => format!(
                 "Unknown tool: {name}. Available tools: bash, read_file, write_file, str_replace, \
                  list_dir, grep, glob, symbols, find_definition, find_references, git_status, \
                  git_diff, git_log, git_show, git_blame, call_graph, run_build_test, web_fetch, \
-                 mo_query, memory_search, memory_profile"
+                 mo_query, memory_search, memory_profile, ask_user"
             ),
         };
         // Normalize empty output, then apply global safety net
