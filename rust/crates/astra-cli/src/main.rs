@@ -5006,6 +5006,7 @@ async fn handle_task_command(
                     skill_quality_tracker: &mut skill_qt,
                     discovered_skills: None,
                     messaging_metrics: None,
+                    agent_spawner: None,
                 })
                 .await;
 
@@ -7311,6 +7312,7 @@ mod tests {
             skill_quality_tracker: &mut skill_qt,
             discovered_skills: None,
             messaging_metrics: None,
+            agent_spawner: None,
         })
         .await
         .unwrap();
@@ -7369,6 +7371,7 @@ mod tests {
             skill_quality_tracker: &mut skill_qt,
             discovered_skills: None,
             messaging_metrics: None,
+            agent_spawner: None,
         })
         .await;
         assert!(result.is_err());
@@ -7443,6 +7446,7 @@ mod tests {
             skill_quality_tracker: &mut skill_qt,
             discovered_skills: None,
             messaging_metrics: None,
+            agent_spawner: None,
         })
         .await
         .unwrap();
