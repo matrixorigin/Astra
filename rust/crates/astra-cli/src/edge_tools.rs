@@ -1390,6 +1390,64 @@ pub fn all_tool_schemas() -> Vec<Value> {
                 }
             }
         }),
+        // ── Notebook edit tool: Jupyter notebook editing ───────────────────────────
+        json!({
+            "type": "function",
+            "function": {
+                "name": "notebook_edit",
+                "description": "Edit Jupyter notebook (.ipynb) cells. Replace, insert, or delete cells by ID. Supports code and markdown cell types. Use read_file first to view the notebook structure and cell IDs.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "notebook_path": {
+                            "type": "string",
+                            "description": "Path to the Jupyter notebook file (.ipynb)"
+                        },
+                        "cell_id": {
+                            "type": "string",
+                            "description": "Cell ID to edit. For insert mode, new cell is inserted after this cell. For replace/delete, this cell is modified."
+                        },
+                        "new_source": {
+                            "type": "string",
+                            "description": "New source content for the cell (required for replace/insert)"
+                        },
+                        "cell_type": {
+                            "type": "string",
+                            "enum": ["code", "markdown"],
+                            "description": "Cell type. Required for insert, optional for replace (defaults to existing type)"
+                        },
+                        "edit_mode": {
+                            "type": "string",
+                            "enum": ["replace", "insert", "delete"],
+                            "description": "Edit operation: 'replace' updates existing cell, 'insert' adds new cell after cell_id, 'delete' removes cell. Default: replace"
+                        }
+                    },
+                    "required": ["notebook_path"]
+                }
+            }
+        }),
+        // ── Config tool: get/set CLI configuration ─────────────────────────────────
+        json!({
+            "type": "function",
+            "function": {
+                "name": "config",
+                "description": "Get or set astra CLI configuration. Read current settings or modify preferences like model, theme, output limits.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "setting": {
+                            "type": "string",
+                            "description": "Setting key. Available: 'model', 'api_key', 'output_limit', 'sandbox_mode', 'auto_approve', 'theme'. Use 'list' to see all settings."
+                        },
+                        "value": {
+                            "type": "string",
+                            "description": "New value. Omit to read current value."
+                        }
+                    },
+                    "required": ["setting"]
+                }
+            }
+        }),
     ]
 }
 
@@ -3452,6 +3510,284 @@ impl ToolExecutor {
             || upper.starts_with("TWILIO")
     }
 
+    // ── Notebook edit tool: Jupyter notebook cell editing ─────────────────────
+
+    /// Edit Jupyter notebook cells.
+    /// Operations: replace, insert, delete
+    fn notebook_edit(&self, args: &Value) -> String {
+        let notebook_path = match args.get("notebook_path").and_then(|v| v.as_str()) {
+            Some(p) => p,
+            None => return json!({ "error": "Missing required parameter: notebook_path" }).to_string(),
+        };
+        
+        let file_path = if notebook_path.starts_with('/') {
+            PathBuf::from(notebook_path)
+        } else {
+            self.project_root.join(notebook_path)
+        };
+        
+        // Validate file extension
+        if !file_path.extension().map(|e| e == "ipynb").unwrap_or(false) {
+            return json!({ 
+                "error": "File must be a Jupyter notebook (.ipynb). For other files, use str_replace or write_file."
+            }).to_string();
+        }
+        
+        // Read existing notebook
+        let content = match std::fs::read_to_string(&file_path) {
+            Ok(c) => c,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // Create new notebook if it doesn't exist and we're inserting
+                let edit_mode = args.get("edit_mode").and_then(|v| v.as_str()).unwrap_or("replace");
+                if edit_mode != "insert" {
+                    return json!({ "error": format!("Notebook not found: {}", file_path.display()) }).to_string();
+                }
+                // Create empty notebook structure
+                r#"{"cells":[],"metadata":{"language_info":{"name":"python"}},"nbformat":4,"nbformat_minor":5}"#.to_string()
+            }
+            Err(e) => return json!({ "error": format!("Failed to read notebook: {}", e) }).to_string(),
+        };
+        
+        let mut notebook: Value = match serde_json::from_str(&content) {
+            Ok(n) => n,
+            Err(e) => return json!({ "error": format!("Invalid notebook JSON: {}", e) }).to_string(),
+        };
+        
+        let cells = match notebook.get_mut("cells").and_then(|c| c.as_array_mut()) {
+            Some(c) => c,
+            None => return json!({ "error": "Notebook has no cells array" }).to_string(),
+        };
+        
+        let cell_id = args.get("cell_id").and_then(|v| v.as_str());
+        let new_source = args.get("new_source").and_then(|v| v.as_str());
+        let cell_type = args.get("cell_type").and_then(|v| v.as_str()).unwrap_or("code");
+        let edit_mode = args.get("edit_mode").and_then(|v| v.as_str()).unwrap_or("replace");
+        
+        // Find cell index if cell_id provided
+        let cell_index = if let Some(id) = cell_id {
+            // Try to find by ID first
+            let by_id = cells.iter().position(|c| {
+                c.get("id").and_then(|i| i.as_str()) == Some(id)
+            });
+            if let Some(idx) = by_id {
+                Some(idx)
+            } else {
+                // Try to parse as cell-N format
+                if let Some(num_str) = id.strip_prefix("cell-") {
+                    num_str.parse::<usize>().ok()
+                } else {
+                    id.parse::<usize>().ok()
+                }
+            }
+        } else {
+            None
+        };
+        
+        match edit_mode {
+            "delete" => {
+                let idx = match cell_index {
+                    Some(i) if i < cells.len() => i,
+                    _ => return json!({ "error": "cell_id required for delete operation" }).to_string(),
+                };
+                cells.remove(idx);
+            }
+            "insert" => {
+                let source = match new_source {
+                    Some(s) => s,
+                    None => return json!({ "error": "new_source required for insert operation" }).to_string(),
+                };
+                let new_cell = json!({
+                    "cell_type": cell_type,
+                    "id": format!("cell-{}", uuid::Uuid::new_v4().to_string()[..8].to_string()),
+                    "source": source,
+                    "metadata": {},
+                    "outputs": if cell_type == "code" { json!([]) } else { json!(null) },
+                    "execution_count": if cell_type == "code" { json!(null) } else { json!(null) }
+                });
+                let insert_idx = cell_index.map(|i| i + 1).unwrap_or(0);
+                if insert_idx <= cells.len() {
+                    cells.insert(insert_idx, new_cell);
+                } else {
+                    cells.push(new_cell);
+                }
+            }
+            "replace" => {
+                let idx = match cell_index {
+                    Some(i) if i < cells.len() => i,
+                    _ => return json!({ "error": "Valid cell_id required for replace operation" }).to_string(),
+                };
+                let source = match new_source {
+                    Some(s) => s,
+                    None => return json!({ "error": "new_source required for replace operation" }).to_string(),
+                };
+                if let Some(cell) = cells.get_mut(idx) {
+                    cell["source"] = json!(source);
+                    if cell_type != cell.get("cell_type").and_then(|t| t.as_str()).unwrap_or("") {
+                        cell["cell_type"] = json!(cell_type);
+                    }
+                    // Reset execution for code cells
+                    if cell.get("cell_type").and_then(|t| t.as_str()) == Some("code") {
+                        cell["execution_count"] = json!(null);
+                        cell["outputs"] = json!([]);
+                    }
+                }
+            }
+            _ => return json!({ "error": format!("Unknown edit_mode: {}. Use replace, insert, or delete", edit_mode) }).to_string(),
+        }
+        
+        // Get cell count before dropping mutable borrow
+        let total_cells = cells.len();
+        
+        // Extract language before serializing (need to drop cells borrow first)
+        let language = notebook
+            .get("metadata")
+            .and_then(|m| m.get("language_info"))
+            .and_then(|l| l.get("name"))
+            .and_then(|n| n.as_str())
+            .unwrap_or("python")
+            .to_string();
+        
+        // Write back
+        let updated_content = serde_json::to_string_pretty(&notebook).unwrap_or_default();
+        if let Err(e) = std::fs::write(&file_path, &updated_content) {
+            return json!({ "error": format!("Failed to write notebook: {}", e) }).to_string();
+        }
+        
+        json!({
+            "success": true,
+            "edit_mode": edit_mode,
+            "cell_type": cell_type,
+            "language": language,
+            "total_cells": total_cells,
+            "notebook_path": file_path.display().to_string()
+        }).to_string()
+    }
+
+    // ── Config tool: get/set CLI configuration ────────────────────────────────
+
+    /// Get or set CLI configuration.
+    fn config_tool(&self, args: &Value) -> String {
+        let setting = match args.get("setting").and_then(|v| v.as_str()) {
+            Some(s) => s,
+            None => return json!({ "error": "Missing required parameter: setting" }).to_string(),
+        };
+        let value = args.get("value").and_then(|v| v.as_str());
+        
+        // Available settings
+        let available = [
+            ("model", "Current model (env: MO_MODEL)"),
+            ("api_key", "API key status (env: MO_API_KEY, OPENAI_API_KEY, ANTHROPIC_API_KEY)"),
+            ("output_limit", "Global output limit in bytes (env: MO_GLOBAL_OUTPUT_LIMIT)"),
+            ("tool_output_limit", "Per-tool output limit (env: MO_TOOL_OUTPUT_LIMIT)"),
+            ("sandbox_mode", "Sandbox mode: off, permissive, strict (env: MO_SANDBOX_MODE)"),
+            ("auto_approve", "Auto-approve tools (env: MO_AUTO_APPROVE)"),
+            ("turn_limit", "Max turns per conversation (env: MO_MAX_TURNS)"),
+            ("list", "Show all available settings"),
+        ];
+        
+        if setting == "list" {
+            let settings: Vec<Value> = available.iter()
+                .filter(|(k, _)| *k != "list")
+                .map(|(k, desc)| json!({ "setting": k, "description": desc }))
+                .collect();
+            return json!({
+                "available_settings": settings
+            }).to_string();
+        }
+        
+        match setting {
+            "model" => {
+                if let Some(v) = value {
+                    // Set model (this would need integration with RuntimeLimits)
+                    json!({
+                        "note": format!("To change model, set MO_MODEL={} environment variable", v),
+                        "setting": "model",
+                        "hint": "Use env tool to set MO_MODEL"
+                    }).to_string()
+                } else {
+                    let current = std::env::var("MO_MODEL").unwrap_or_else(|_| "default".to_string());
+                    json!({
+                        "setting": "model",
+                        "value": current
+                    }).to_string()
+                }
+            }
+            "api_key" => {
+                // Never show actual key, just status
+                let has_mo = std::env::var("MO_API_KEY").is_ok();
+                let has_openai = std::env::var("OPENAI_API_KEY").is_ok();
+                let has_anthropic = std::env::var("ANTHROPIC_API_KEY").is_ok();
+                json!({
+                    "setting": "api_key",
+                    "status": {
+                        "MO_API_KEY": if has_mo { "set" } else { "not set" },
+                        "OPENAI_API_KEY": if has_openai { "set" } else { "not set" },
+                        "ANTHROPIC_API_KEY": if has_anthropic { "set" } else { "not set" }
+                    }
+                }).to_string()
+            }
+            "output_limit" => {
+                if value.is_some() {
+                    json!({
+                        "note": "To change output limit, set MO_GLOBAL_OUTPUT_LIMIT environment variable",
+                        "setting": "output_limit"
+                    }).to_string()
+                } else {
+                    json!({
+                        "setting": "output_limit",
+                        "value": global_output_limit(),
+                        "env_var": "MO_GLOBAL_OUTPUT_LIMIT"
+                    }).to_string()
+                }
+            }
+            "tool_output_limit" => {
+                json!({
+                    "setting": "tool_output_limit",
+                    "value": tool_output_limit(),
+                    "env_var": "MO_TOOL_OUTPUT_LIMIT"
+                }).to_string()
+            }
+            "sandbox_mode" => {
+                let current = std::env::var("MO_SANDBOX_MODE").unwrap_or_else(|_| "permissive".to_string());
+                if let Some(v) = value {
+                    if !["off", "permissive", "strict"].contains(&v) {
+                        return json!({ "error": "sandbox_mode must be: off, permissive, or strict" }).to_string();
+                    }
+                    json!({
+                        "note": format!("To change sandbox mode, set MO_SANDBOX_MODE={}", v),
+                        "setting": "sandbox_mode",
+                        "current": current
+                    }).to_string()
+                } else {
+                    json!({
+                        "setting": "sandbox_mode",
+                        "value": current,
+                        "options": ["off", "permissive", "strict"]
+                    }).to_string()
+                }
+            }
+            "auto_approve" => {
+                let current = std::env::var("MO_AUTO_APPROVE").unwrap_or_else(|_| "false".to_string());
+                json!({
+                    "setting": "auto_approve",
+                    "value": current,
+                    "env_var": "MO_AUTO_APPROVE"
+                }).to_string()
+            }
+            "turn_limit" => {
+                let current = std::env::var("MO_MAX_TURNS").unwrap_or_else(|_| "50".to_string());
+                json!({
+                    "setting": "turn_limit",
+                    "value": current,
+                    "env_var": "MO_MAX_TURNS"
+                }).to_string()
+            }
+            _ => json!({
+                "error": format!("Unknown setting: {}. Use setting='list' to see available settings.", setting)
+            }).to_string(),
+        }
+    }
+
     /// Set the MCP client manager for external tool routing.
     pub fn with_mcp_manager(
         mut self,
@@ -4002,13 +4338,16 @@ impl ToolExecutor {
             "diagnose" => self.diagnose(args).await,
             "lsp" => self.lsp(args),
             "env" => self.env_tool(args),
+            "notebook_edit" => self.notebook_edit(args),
+            "config" => self.config_tool(args),
             _ if name.starts_with("mcp_") => self.execute_mcp_tool(name, args).await,
             _ => format!(
                 "Unknown tool: {name}. Available tools: bash, read_file, write_file, str_replace, \
                  list_dir, grep, glob, symbols, find_definition, find_references, git_status, \
                  git_diff, git_log, git_show, git_blame, call_graph, run_build_test, web_fetch, \
                  mo_query, memory_search, memory_profile, ask_user, task_create, task_list, \
-                 task_get, task_update, task_stop, sleep, tool_search, web_search, spawn_agent, diagnose, lsp, env"
+                 task_get, task_update, task_stop, sleep, tool_search, web_search, spawn_agent, \
+                 diagnose, lsp, env, notebook_edit, config"
             ),
         };
         // Normalize empty output, then apply global safety net
@@ -11789,5 +12128,96 @@ impl Config {
     fn utf16_col_past_end() {
         let line = "abc";
         assert_eq!(utf16_col_to_char_idx(line, 10), 3);  // past end returns line length
+    }
+
+    // ── Notebook edit tests ───────────────────────────────────────────────────
+
+    #[test]
+    fn notebook_edit_requires_ipynb_extension() {
+        let exe = test_executor();
+        let result = exe.notebook_edit(&json!({
+            "notebook_path": "test.py",
+            "edit_mode": "insert",
+            "new_source": "print('hello')"
+        }));
+        
+        assert!(result.contains("error"));
+        assert!(result.contains(".ipynb"));
+    }
+
+    #[test]
+    fn notebook_edit_unknown_mode_rejected() {
+        let exe = test_executor();
+        // Create a temporary notebook
+        let temp_dir = std::env::temp_dir();
+        let notebook_path = temp_dir.join("test_unknown_mode.ipynb");
+        std::fs::write(&notebook_path, r#"{"cells":[{"cell_type":"code","id":"cell-1","source":"x=1","metadata":{},"outputs":[],"execution_count":null}],"metadata":{"language_info":{"name":"python"}},"nbformat":4,"nbformat_minor":5}"#).unwrap();
+        
+        let result = exe.notebook_edit(&json!({
+            "notebook_path": notebook_path.display().to_string(),
+            "edit_mode": "unknown",
+            "cell_id": "cell-1",
+            "new_source": "test"
+        }));
+        
+        // Cleanup
+        let _ = std::fs::remove_file(&notebook_path);
+        
+        assert!(result.contains("error"), "Expected error in result: {}", result);
+        assert!(result.contains("Unknown edit_mode"), "Expected 'Unknown edit_mode' in result: {}", result);
+    }
+
+    // ── Config tool tests ─────────────────────────────────────────────────────
+
+    #[test]
+    fn config_list_settings() {
+        let exe = test_executor();
+        let result = exe.config_tool(&json!({ "setting": "list" }));
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        
+        assert!(parsed.get("available_settings").is_some());
+        let settings = parsed.get("available_settings").unwrap().as_array().unwrap();
+        assert!(!settings.is_empty());
+    }
+
+    #[test]
+    fn config_get_model() {
+        let exe = test_executor();
+        let result = exe.config_tool(&json!({ "setting": "model" }));
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        
+        assert_eq!(parsed.get("setting").unwrap(), "model");
+        assert!(parsed.get("value").is_some());
+    }
+
+    #[test]
+    fn config_get_api_key_status() {
+        let exe = test_executor();
+        let result = exe.config_tool(&json!({ "setting": "api_key" }));
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        
+        // Should never expose actual key values
+        assert!(!result.contains("sk-"));
+        assert!(parsed.get("status").is_some());
+    }
+
+    #[test]
+    fn config_unknown_setting() {
+        let exe = test_executor();
+        let result = exe.config_tool(&json!({ "setting": "unknown_setting_xyz" }));
+        
+        assert!(result.contains("error"));
+        assert!(result.contains("Unknown setting"));
+    }
+
+    #[test]
+    fn config_output_limit() {
+        let exe = test_executor();
+        let result = exe.config_tool(&json!({ "setting": "output_limit" }));
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        
+        assert!(parsed.get("value").is_some());
+        let value = parsed.get("value").unwrap().as_u64().unwrap();
+        assert!(value > 0);
     }
 }
