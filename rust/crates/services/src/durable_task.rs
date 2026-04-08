@@ -5626,6 +5626,87 @@ mod tests {
         assert!(result.evidence.contains("rate limited"));
     }
 
+    /// Slow judge that simulates a network timeout.
+    struct SlowLlmJudge;
+
+    #[async_trait]
+    impl LlmJudge for SlowLlmJudge {
+        async fn evaluate(&self, _prompt: &str, _context: &str) -> Result<f64, String> {
+            // Sleep longer than any reasonable timeout_sec in tests
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            Ok(0.9)
+        }
+    }
+
+    #[tokio::test]
+    async fn llm_judge_timeout_returns_failure_with_error() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let judge: Arc<dyn LlmJudge> = Arc::new(SlowLlmJudge);
+        let runner = VerificationRunner::with_llm_judge(tmp.path().to_path_buf(), judge);
+
+        let criterion = VerificationCriterion {
+            id: "llm-timeout".into(),
+            description: "slow eval".into(),
+            verifier: VerifierKind::LlmJudge {
+                prompt: "Evaluate quality".into(),
+                pass_threshold: 0.7,
+            },
+            required: true,
+            timeout_sec: 1, // 1 second timeout
+            global_only: true,
+        };
+
+        let result = runner.run_criterion(&criterion).await;
+        assert!(!result.passed, "timed-out judge should fail");
+        assert!(
+            result.error.as_deref().unwrap_or("").contains("timed out"),
+            "error should mention timeout, got: {:?}",
+            result.error
+        );
+        assert!(
+            result.duration_ms >= 900,
+            "should have waited ~1s, got {}ms",
+            result.duration_ms
+        );
+    }
+
+    /// Judge that simulates a connection refused / network error.
+    struct NetworkFailLlmJudge;
+
+    #[async_trait]
+    impl LlmJudge for NetworkFailLlmJudge {
+        async fn evaluate(&self, _prompt: &str, _context: &str) -> Result<f64, String> {
+            Err("connection refused: tcp connect error".into())
+        }
+    }
+
+    #[tokio::test]
+    async fn llm_judge_network_failure_returns_descriptive_error() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let judge: Arc<dyn LlmJudge> = Arc::new(NetworkFailLlmJudge);
+        let runner = VerificationRunner::with_llm_judge(tmp.path().to_path_buf(), judge);
+
+        let criterion = VerificationCriterion {
+            id: "llm-net".into(),
+            description: "network check".into(),
+            verifier: VerifierKind::LlmJudge {
+                prompt: "Check code".into(),
+                pass_threshold: 0.5,
+            },
+            required: true,
+            timeout_sec: 30,
+            global_only: true,
+        };
+
+        let result = runner.run_criterion(&criterion).await;
+        assert!(!result.passed, "network error → fail");
+        assert!(
+            result.evidence.contains("connection refused"),
+            "evidence should contain error details: {}",
+            result.evidence
+        );
+    }
+
     #[tokio::test]
     async fn llm_judge_context_includes_file_contents() {
         let tmp = tempfile::TempDir::new().unwrap();
