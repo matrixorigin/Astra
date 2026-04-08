@@ -291,17 +291,20 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
             pinned_skills: HashSet::new(),
             discovered_skills: HashSet::new(),
             skill_search: self.skill_search.clone(),
+            // Use effective_root (agent's worktree) for hooks, not shared project_root.
+            // This ensures each agent loads hooks from its own isolated workspace.
             tool_event_hooks: astra_runtime::skills::hooks::load_tool_event_hooks(
-                &self.project_root,
+                &effective_root,
             ),
             session_event_hooks: astra_runtime::skills::hooks::load_session_event_hooks(
-                &self.project_root,
+                &effective_root,
             ),
             stop_hooks: Vec::new(),
             stop_hook_runs: 0,
             teammate_idle_hooks: Vec::new(),
             teammate_idle_hook_runs: 0,
-            workspace_root_hint: Some(self.project_root.to_string_lossy().into_owned()),
+            // workspace_root_hint guides tools to operate in the correct directory.
+            workspace_root_hint: Some(effective_root.to_string_lossy().into_owned()),
             consecutive_same_error: 0,
             last_error_category: None,
             checkpoint_gate: config.checkpoint_gate.clone(),
