@@ -2224,6 +2224,87 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn worktree_path_per_agent_flows_through_context() {
+        /// Executor that captures the agent-specific worktree_path from context.
+        struct WorktreeCheckExecutor;
+
+        #[async_trait]
+        impl SubRunExecutor for WorktreeCheckExecutor {
+            async fn execute(&self, config: SubRunConfig) -> Result<AgentResult, String> {
+                let key = format!("worktree_path_{}", config.agent_profile.agent_id);
+                let path = config
+                    .context
+                    .get(&key)
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("none")
+                    .to_string();
+                Ok(AgentResult {
+                    agent_id: config.agent_profile.agent_id,
+                    run_id: config.run_id,
+                    status: "completed".to_string(),
+                    output: Some(path),
+                    error: None,
+                    prompt_tokens: 0,
+                    completion_tokens: 0,
+                    tool_calls: 0,
+                })
+            }
+        }
+
+        let (reg, engine, tracker) = setup();
+        // Register two agents
+        {
+            let mut r = reg.write().await;
+            let _ = r.register(AgentProfile::new("agent-a", "Agent A", AgentTier::User));
+            let _ = r.register(AgentProfile::new("agent-b", "Agent B", AgentTier::User));
+        }
+        let de = DelegationEngine::with_executor(
+            reg,
+            engine,
+            tracker,
+            Arc::new(WorktreeCheckExecutor),
+        );
+
+        let mut ctx = HashMap::new();
+        ctx.insert(
+            "worktree_path_agent-a".to_string(),
+            serde_json::json!("/tmp/wt/agent-a"),
+        );
+        ctx.insert(
+            "worktree_path_agent-b".to_string(),
+            serde_json::json!("/tmp/wt/agent-b"),
+        );
+
+        let req = DelegationRequest {
+            delegation_id: "wt-test".into(),
+            parent_run_id: "p".into(),
+            task: "check worktree".into(),
+            pattern: CoordinationPattern::FanOut {
+                agent_ids: vec!["agent-a".into(), "agent-b".into()],
+                aggregation: AggregationStrategy::AllResults,
+                timeout_sec: 30,
+            },
+            user_id: "u".into(),
+            depth: 0,
+            context: ctx,
+        };
+
+        let result = de.execute(req, "orch").await.unwrap();
+        assert_eq!(result.agent_results.len(), 2);
+
+        // Each agent should see its own worktree path
+        for ar in &result.agent_results {
+            let expected_path = format!("/tmp/wt/{}", ar.agent_id);
+            assert_eq!(
+                ar.output.as_deref(),
+                Some(expected_path.as_str()),
+                "agent {} should see its worktree path",
+                ar.agent_id
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn stub_executor_returns_completed() {
         let executor = StubSubRunExecutor;
         let config = SubRunConfig {
