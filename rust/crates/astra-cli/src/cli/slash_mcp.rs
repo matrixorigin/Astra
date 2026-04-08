@@ -844,12 +844,11 @@ async fn handle_mcp_remove(arg: &str) {
 }
 
 fn print_server_table(manager: &McpClientManager) {
-    // Header
     eprintln!(
-        "  {:<20} {:<12} {:<8} {:<10}",
-        "Server", "State", "Tools", "Uptime"
+        "  {}",
+        format!("{:<20} {:<12} {:<8} {:<10}", "Server", "State", "Tools", "Uptime").dim()
     );
-    eprintln!("  {}", "─".repeat(52));
+    eprintln!("  {}", "─".repeat(52).dim());
 
     let mut servers = manager.connected_servers();
     servers.sort();

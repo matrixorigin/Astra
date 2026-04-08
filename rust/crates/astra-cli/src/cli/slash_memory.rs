@@ -1691,8 +1691,9 @@ async fn _old_handle_plan_mode_input(
                         if let Some(questions) = detect_clarification_questions(&full_text) {
                             eprintln!();
                             eprintln!(
-                                "  {} Need clarification before generating plan:",
-                                "❓".yellow()
+                                "  {} {}",
+                                "▸".cyan(),
+                                format!("{} question{} before planning:", questions.len(), if questions.len() == 1 { "" } else { "s" }).bold().cyan()
                             );
                             eprintln!();
 
