@@ -710,6 +710,11 @@ fn commit_turn_journal_workspace_and_sidecars(
         .with_selector_strategy(result.selector_strategy.clone())
         .with_selector_time(result.selector_ms)
         .with_selector_tokens(result.selector_tokens_in, result.selector_tokens_out)
+        .with_selector_learning_telemetry(
+            result.selector_confidence,
+            result.routing_domain_hint.clone(),
+            result.entity_learn_skipped_no_domain,
+        )
         .with_memoria_time(result.memoria_ms)
         .with_cache_tokens(result.cache_read_tokens, result.cache_creation_tokens);
 
@@ -938,16 +943,22 @@ fn commit_turn_journal_workspace_and_sidecars(
     }
 }
 
-fn record_selector_turn_outcome(
-    state: &mut ReplState,
-    selector: &dyn tool_selector::ToolSelector,
+/// Routing + turn quality for journal fields and `ToolSelector::record_outcome`.
+pub(super) struct ReplTurnLearningSnapshot {
+    pub routing: astra_runtime::pipeline::routing::RoutingDecision,
+    pub eval: astra_runtime::pipeline::evaluation::TurnEvaluation,
+}
+
+pub(super) fn analyze_repl_turn_learning(
     line: &str,
+    turn: u32,
+    recent_tools: &[String],
     result: &StreamResult,
-) {
+) -> ReplTurnLearningSnapshot {
     use astra_runtime::pipeline::evaluation::{ToolCallInfo, evaluate_turn};
     use astra_runtime::pipeline::routing::RoutingEngine;
-    let routing = RoutingEngine::analyze(line, state.turn, &state.recent_tools, &[], vec![]);
-    let is_live_query = looks_like_live_query_with_context(line, &state.recent_tools);
+    let routing = RoutingEngine::analyze(line, turn, recent_tools, &[], vec![]);
+    let is_live_query = looks_like_live_query_with_context(line, recent_tools);
 
     let tool_infos: Vec<ToolCallInfo> = result
         .tool_call_records
@@ -974,13 +985,22 @@ fn record_selector_turn_outcome(
         is_live_query,
     );
 
+    ReplTurnLearningSnapshot { routing, eval }
+}
+
+fn record_selector_turn_outcome(
+    selector: &dyn tool_selector::ToolSelector,
+    line: &str,
+    result: &StreamResult,
+    snap: &ReplTurnLearningSnapshot,
+) {
     selector.record_outcome(
         line,
         &result.tools_used,
-        routing.task_type,
-        routing.domain_hint,
-        eval.success,
-        eval.quality,
+        snap.routing.task_type,
+        snap.routing.domain_hint,
+        snap.eval.success,
+        snap.eval.quality,
         false,
         None,
     );
@@ -1034,8 +1054,19 @@ fn apply_turn_success(
         state.tool_health_entries = result.tool_health_export.clone();
     }
 
+    let learning_snap = analyze_repl_turn_learning(line, state.turn, &state.recent_tools, &result);
+    let mut result = result;
+    let routing_domain = learning_snap
+        .routing
+        .domain_hint
+        .map(|d| astra_runtime::pipeline::routing::domain_hint_to_label(d).to_string());
+    let entity_skipped = learning_snap.eval.success
+        && !result.tools_used.is_empty()
+        && learning_snap.routing.domain_hint.is_none();
+    result.set_repl_learning_journal_fields(routing_domain, entity_skipped);
+
     commit_turn_journal_workspace_and_sidecars(state, line, &result, turn_start);
-    record_selector_turn_outcome(state, selector, line, &result);
+    record_selector_turn_outcome(selector, line, &result, &learning_snap);
 
     // ── Skill auto-improvement check ─────────────────────────────────────
     check_skill_improvement(state, line, &result);
@@ -2254,6 +2285,9 @@ mod tests {
             selector_tokens_in: 0,
             selector_tokens_out: 0,
             memoria_ms: None,
+            selector_confidence: None,
+            routing_domain_hint: None,
+            entity_learn_skipped_no_domain: false,
         }
     }
 

@@ -1934,6 +1934,9 @@ mod exit_code_tests {
             selector_tokens_in: 0,
             selector_tokens_out: 0,
             memoria_ms: None,
+            selector_confidence: None,
+            routing_domain_hint: None,
+            entity_learn_skipped_no_domain: false,
         }
     }
 

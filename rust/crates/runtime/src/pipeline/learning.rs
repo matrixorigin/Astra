@@ -120,6 +120,7 @@ fn parse_domain_hint(label: Option<&str>) -> Option<DomainHint> {
         Some("code") => Some(DomainHint::Code),
         Some("memory") => Some(DomainHint::Memory),
         Some("git") => Some(DomainHint::Git),
+        Some("web") => Some(DomainHint::Web),
         Some("system") => Some(DomainHint::System),
         Some("database") => Some(DomainHint::Database),
         _ => None,

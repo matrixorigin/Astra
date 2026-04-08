@@ -288,6 +288,7 @@ pub(crate) async fn stream_chat_sse(
         first_memoria_ms: None,
         first_selector_ms: None,
         first_selector_strategy: None,
+        first_selector_confidence: None,
         selector_tokens_in: 0,
         selector_tokens_out: 0,
         all_selected_skills: Vec::new(),
@@ -414,9 +415,12 @@ pub(crate) async fn stream_chat_sse(
         context_ms: state.first_context_assembly_ms,
         selector_strategy: state.first_selector_strategy,
         selector_ms: state.first_selector_ms,
+        selector_confidence: state.first_selector_confidence,
         selector_tokens_in: state.selector_tokens_in,
         selector_tokens_out: state.selector_tokens_out,
         memoria_ms: state.first_memoria_ms,
+        routing_domain_hint: None,
+        entity_learn_skipped_no_domain: false,
     }))
 }
 

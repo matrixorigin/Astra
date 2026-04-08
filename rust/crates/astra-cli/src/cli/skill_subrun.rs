@@ -382,6 +382,7 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
             first_memoria_ms: None,
             first_selector_ms: None,
             first_selector_strategy: None,
+            first_selector_confidence: None,
             selector_tokens_in: 0,
             selector_tokens_out: 0,
             all_selected_skills: Vec::new(),

@@ -132,9 +132,9 @@ use permission_manager::PermissionManager;
 use stream_render::{StreamRenderState, TurnResult, dispatch_turn_event_block};
 
 use repl_runtime::{
-    build_repl_editor, check_server_has_models, create_tool_selector, create_tool_selector_quiet,
-    create_tool_selector_with_quality, current_access_token, initialize_repl_state,
-    print_repl_banner, try_silent_auth,
+    build_repl_editor, check_server_has_models, create_background_plan_selector, create_tool_selector,
+    create_tool_selector_quiet, create_tool_selector_with_quality, current_access_token,
+    initialize_repl_state, print_repl_banner, try_silent_auth,
 };
 use repl_turn::{ReplTurnContext, create_manual_repl_checkpoint, handle_chat_input};
 use repl_ui::{
@@ -758,6 +758,24 @@ pub(crate) struct StreamResult {
     selector_tokens_out: u64,
     /// Memoria search time in milliseconds (subset of context_ms).
     memoria_ms: Option<u64>,
+    /// First tool-selection confidence (0.0–1.0) from the agentic loop prep pass.
+    selector_confidence: Option<f64>,
+    /// Routing domain label for this user line (filled in REPL when writing the journal row).
+    routing_domain_hint: Option<String>,
+    /// Entity graph skipped learning: success with tools but no routing domain.
+    entity_learn_skipped_no_domain: bool,
+}
+
+impl StreamResult {
+    /// Filled by the REPL after the agentic loop returns (routing + entity-learn eligibility).
+    pub(crate) fn set_repl_learning_journal_fields(
+        &mut self,
+        routing_domain_hint: Option<String>,
+        entity_learn_skipped_no_domain: bool,
+    ) {
+        self.routing_domain_hint = routing_domain_hint;
+        self.entity_learn_skipped_no_domain = entity_learn_skipped_no_domain;
+    }
 }
 
 // ══════════════════════════════════════════════════════════ REPL State ════
@@ -3181,17 +3199,14 @@ fn take_plan_context(
     })
 }
 
-/// Create a fresh `Box<dyn ToolSelector>` for the background plan executor.
+/// Create a `Box<dyn ToolSelector>` for the background plan executor.
 ///
-/// The selector is independent of the REPL's selector so the background task
-/// does not share mutable TF-IDF state with foreground turns.
-fn create_background_selector() -> Box<dyn tool_selector::ToolSelector> {
-    let all_schemas = edge_tools::all_tool_schemas();
-    let mut registry = tool_registry::ToolRegistry::new(all_schemas);
-    let mut plugin_registry = tool_registry::PluginRegistry::new();
-    manifest_loader::load_skills_directory(&mut plugin_registry);
-    registry.register_plugins(&plugin_registry);
-    Box::new(tool_selector::TfIdfSelector::new(registry))
+/// Shares `entity_graph` / `pattern_library` / `calibrator` with [`plan_executor::BackgroundPlanContext`]
+/// when all three are present (same `Arc`s as the REPL). TF-IDF index is still per-selector.
+fn create_background_selector(
+    ctx: &plan_executor::BackgroundPlanContext,
+) -> Box<dyn tool_selector::ToolSelector> {
+    create_background_plan_selector(ctx)
 }
 
 /// Spawn a background plan executor and enter a monitoring loop that displays
@@ -3211,7 +3226,7 @@ async fn start_and_monitor_background_plan(
 
     // ── Extract context & spawn ──────────────────────────────────────
     let ctx = take_plan_context(state, api, current_token, profile)?;
-    let selector = create_background_selector();
+    let selector = create_background_selector(&ctx);
     let handle = plan_executor::spawn_plan_executor(ctx, selector);
     state.plan_handle = Some(handle);
 

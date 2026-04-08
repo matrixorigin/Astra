@@ -18,7 +18,8 @@ use astra_runtime::{
     turn::agentic_prepare_payload::apply_selector_hints_then_attach_filtered_edge_tools,
     turn::agentic_turn_telemetry::{
         accumulate_selector_token_usage, capture_first_selection_report_if_empty,
-        record_first_latency_ms_since, record_first_selector_latency_and_strategy,
+        record_first_latency_ms_since, record_first_selector_confidence,
+        record_first_selector_latency_and_strategy,
     },
     turn::boost_domain_hints::{domain_hints_debug_strings, domain_hints_from_boost_terms},
     turn::chat_turn_api_error::{
@@ -88,6 +89,7 @@ pub(crate) struct PrepareTurnTelemetry<'a> {
     pub first_memoria_ms: &'a mut Option<u64>,
     pub first_selector_ms: &'a mut Option<u64>,
     pub first_selector_strategy: &'a mut Option<String>,
+    pub first_selector_confidence: &'a mut Option<f64>,
     pub selector_tokens_in: &'a mut u64,
     pub selector_tokens_out: &'a mut u64,
     pub first_selection_report: &'a mut Option<tool_registry::SelectionReport>,
@@ -259,6 +261,7 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
             sel_result.strategy,
             sel_result.confidence,
         );
+        record_first_selector_confidence(ctx.telem.first_selector_confidence, sel_result.confidence);
         accumulate_selector_token_usage(
             ctx.telem.selector_tokens_in,
             ctx.telem.selector_tokens_out,

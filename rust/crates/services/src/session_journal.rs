@@ -483,6 +483,11 @@ pub struct ToolCallRecord {
     pub result_preview: Option<String>,
 }
 
+#[inline]
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
 /// A single journal event (one line in the JSONL file).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JournalEvent {
@@ -598,6 +603,15 @@ pub struct JournalEvent {
     /// Tool selection decision trace for post-hoc analysis.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selection_trace: Option<SelectionTrace>,
+    /// Selector confidence from the first tool-selection pass (0.0–1.0).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selector_confidence: Option<f64>,
+    /// Routing domain hint label for this REPL turn (e.g. `github`); omitted when unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub routing_domain_hint: Option<String>,
+    /// True when the turn succeeded with tool calls but routing had no domain — entity graph learn was skipped.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub entity_learn_skipped_no_domain: bool,
 }
 
 /// Event type discriminator.
@@ -1194,6 +1208,9 @@ impl JournalEvent {
             coordination: None,
             edge_policy: None,
             selection_trace: None,
+            selector_confidence: None,
+            routing_domain_hint: None,
+            entity_learn_skipped_no_domain: false,
         }
     }
 
@@ -1437,6 +1454,19 @@ impl JournalEvent {
     /// Set tool selection strategy.
     pub fn with_selector_strategy(mut self, strategy: Option<String>) -> Self {
         self.selector_strategy = strategy;
+        self
+    }
+
+    /// Learning / routing telemetry for this REPL turn (journal + analytics).
+    pub fn with_selector_learning_telemetry(
+        mut self,
+        selector_confidence: Option<f64>,
+        routing_domain_hint: Option<String>,
+        entity_learn_skipped_no_domain: bool,
+    ) -> Self {
+        self.selector_confidence = selector_confidence;
+        self.routing_domain_hint = routing_domain_hint;
+        self.entity_learn_skipped_no_domain = entity_learn_skipped_no_domain;
         self
     }
 

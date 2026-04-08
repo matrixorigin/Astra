@@ -1247,6 +1247,50 @@ async fn plan_executor_task(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Mutex};
+
+    use astra_runtime::pipeline::calibration::ProgressiveCalibrator;
+    use astra_runtime::pipeline::entity::EntityGraph;
+    use astra_runtime::pipeline::pattern::PatternLibrary;
+    use astra_runtime::pipeline::routing::{DomainHint, TaskType};
+    use astra_runtime::tool_selector::{SelectionContext, ToolSelector};
+
+    fn test_background_plan_context(
+        entity_graph: Option<Arc<Mutex<EntityGraph>>>,
+        pattern_library: Option<Arc<Mutex<PatternLibrary>>>,
+        calibrator: Option<Arc<Mutex<ProgressiveCalibrator>>>,
+    ) -> BackgroundPlanContext {
+        let mut reg = astra_runtime::skills::UnifiedSkillRegistry::new();
+        reg.add_provider(Box::new(astra_runtime::skills::LocalSkillProvider::standard()));
+        reg.add_provider(Box::new(
+            astra_runtime::skills::BundledSkillProvider::with_defaults(),
+        ));
+        BackgroundPlanContext {
+            api: astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap(),
+            token: String::new(),
+            profile: None,
+            model: None,
+            plan: TaskPlan::default(),
+            plan_goal: None,
+            plan_corrections: vec![],
+            history: vec![],
+            session_id: None,
+            recent_tools: vec![],
+            tool_health_entries: vec![],
+            unified_skill_registry: Arc::new(reg),
+            skill_search: astra_core::SkillSearchSettings::default(),
+            delegation_engine: None,
+            durable_task_state: None,
+            workspace_root: std::env::temp_dir(),
+            ingestion_user_id: None,
+            matrix_runtime: None,
+            entity_graph,
+            pattern_library,
+            calibrator,
+            plan_execution_config: None,
+            turn: 0,
+        }
+    }
 
     #[test]
     fn plan_update_variants_are_constructible() {
@@ -1356,5 +1400,72 @@ mod tests {
         fn _assert_send<T: Send>() {}
         // BackgroundPlanContext must be Send for tokio::spawn
         _assert_send::<BackgroundPlanContext>();
+    }
+
+    #[tokio::test]
+    async fn background_selector_shares_entity_graph_with_plan_context() {
+        let eg = Arc::new(Mutex::new(EntityGraph::new()));
+        let pl = Arc::new(Mutex::new(PatternLibrary::new()));
+        let cal = Arc::new(Mutex::new(ProgressiveCalibrator::new(0.15)));
+
+        let ctx = test_background_plan_context(
+            Some(eg.clone()),
+            Some(pl.clone()),
+            Some(cal.clone()),
+        );
+
+        let selector = crate::repl_runtime::create_background_plan_selector(&ctx);
+
+        selector.record_outcome(
+            "show matrixorigin issues",
+            &["github_list_issues".to_string()],
+            TaskType::Fetch,
+            Some(DomainHint::GitHub),
+            true,
+            0.9,
+            false,
+            None,
+        );
+
+        let boost = eg.lock().unwrap().boost_for("matrixorigin");
+        assert!(
+            !boost.is_empty(),
+            "outcome recording should update the same EntityGraph Arc as the plan context"
+        );
+
+        let sel_ctx = SelectionContext {
+            query: "matrixorigin help",
+            turn_count: 1,
+            recent_tools: &[],
+            budget_tokens: 800,
+            boost_terms: vec![],
+            budget_pressure: 0.0,
+            memory_domain_hints: vec![],
+            restricted_tools: vec![],
+            file_context: vec![],
+        };
+        let res = selector.select(&sel_ctx).await;
+        assert!(!res.tool_names.is_empty());
+        assert!(!res.failed);
+    }
+
+    #[tokio::test]
+    async fn background_selector_without_pipeline_modules_still_selects() {
+        let ctx = test_background_plan_context(None, None, None);
+        let selector = crate::repl_runtime::create_background_plan_selector(&ctx);
+        let sel_ctx = SelectionContext {
+            query: "list files in current directory",
+            turn_count: 1,
+            recent_tools: &[],
+            budget_tokens: 800,
+            boost_terms: vec![],
+            budget_pressure: 0.0,
+            memory_domain_hints: vec![],
+            restricted_tools: vec![],
+            file_context: vec![],
+        };
+        let res = selector.select(&sel_ctx).await;
+        assert!(!res.tool_names.is_empty());
+        assert!(!res.failed);
     }
 }
