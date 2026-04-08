@@ -145,7 +145,18 @@ pub async fn execute_parallel_round(
             let sem = semaphore.clone();
             let exec = executor.clone();
             join_set.spawn(async move {
-                let _permit = sem.acquire().await.expect("semaphore closed");
+                let _permit = match sem.acquire().await {
+                    Ok(p) => p,
+                    Err(_) => {
+                        return ToolExecResult {
+                            original_index: idx,
+                            call_id: String::new(),
+                            tool_name: String::new(),
+                            content: "semaphore closed".into(),
+                            success: false,
+                        };
+                    }
+                };
                 let (call_id, tool_name, content, success) = exec(tc_owned).await;
                 ToolExecResult {
                     original_index: idx,
@@ -158,9 +169,15 @@ pub async fn execute_parallel_round(
         }
 
         while let Some(result) = join_set.join_next().await {
-            if let Ok(r) = result {
-                let idx = r.original_index;
-                results[idx] = Some(r);
+            match result {
+                Ok(r) => {
+                    let idx = r.original_index;
+                    results[idx] = Some(r);
+                }
+                Err(e) => {
+                    // Task panicked — log and insert error result
+                    eprintln!("[parallel_tool_exec] spawned task panicked: {e}");
+                }
             }
         }
     }
