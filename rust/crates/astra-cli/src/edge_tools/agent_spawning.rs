@@ -137,9 +137,11 @@ mod tests {
     #[test]
     fn test_schema_structure() {
         let schema = get_spawn_agent_schema();
-        assert_eq!(schema["name"], "spawn_agent");
-        assert!(schema["input_schema"]["properties"]["description"].is_object());
-        assert!(schema["input_schema"]["properties"]["prompt"].is_object());
+        // Schema uses standard format: { type: "function", function: { name, parameters } }
+        assert_eq!(schema["type"], "function");
+        assert_eq!(schema["function"]["name"], "spawn_agent");
+        assert!(schema["function"]["parameters"]["properties"]["description"].is_object());
+        assert!(schema["function"]["parameters"]["properties"]["prompt"].is_object());
     }
 
     #[tokio::test]
