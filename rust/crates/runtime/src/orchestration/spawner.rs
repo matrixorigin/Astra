@@ -5,7 +5,6 @@ use crate::messaging::types::AgentAddress;
 use crate::orchestration::builtin_agents::get_agent_type_definition;
 use crate::orchestration::progress::{ProgressBroadcaster, AgentProgressEvent, ProgressEventType};
 use crate::orchestration::spawn_tool::{SpawnAgentInput, SpawnAgentOutput};
-use crate::server::delegation_engine::SubRunConfig;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -14,7 +13,6 @@ use std::time::SystemTime;
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
-use astra_services::coordination::AgentProfile;
 use async_trait::async_trait;
 
 // ─── Spawn Context ──────────────────────────────────────────────────────────
@@ -294,7 +292,7 @@ impl DynamicAgentSpawner {
                 let executor = Arc::clone(executor);
                 let spawner = self.clone_for_task();
                 let agent_id_clone = agent_id.clone();
-                let description = input.description.clone();
+                let _description = input.description.clone();
                 
                 tokio::spawn(async move {
                     let result = executor.execute(run_config).await;
