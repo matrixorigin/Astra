@@ -14,9 +14,9 @@
 //!        └────────┬─────────┘
 //!            ┌────┴─────────────────┐
 //!            │                      │
-//!   InProcessTransport     DatabaseTransport (future)
-//!   (tokio channels,       (MySQL event log,
-//!    µs latency)            ~10ms, zero new deps)
+//!   InProcessTransport     DatabaseTransport
+//!   (tokio channels,       (MySQL poll-based,
+//!    µs latency)            ~100ms, cross-process)
 //! ```
 //!
 //! # Usage
@@ -34,6 +34,7 @@
 //! # }
 //! ```
 
+pub mod db_transport;
 pub mod in_process;
 pub mod router;
 pub mod send_tool;
@@ -44,6 +45,7 @@ pub mod types;
 mod integration_tests;
 
 // Re-export key types for convenience.
+pub use db_transport::DatabaseTransport;
 pub use in_process::InProcessTransport;
 pub use router::{AgentMailbox, AgentMailboxRouter};
 pub use transport::{MessageStream, MessageTransport};
