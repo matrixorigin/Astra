@@ -34,17 +34,13 @@ use crate::turn::agentic_loop_host::{
     AgenticLoopOutcome, AgenticLoopState, run_agentic_loop_with_host,
 };
 
-use super::delegation_engine::{STATUS_CANCELLED, STATUS_COMPLETED, STATUS_FAILED, STATUS_PAUSED, STATUS_RUNNING, STATUS_WAITING};
+use astra_core::{
+    STATUS_CANCELLED, STATUS_COMPLETED, STATUS_FAILED, STATUS_PAUSED, STATUS_RUNNING,
+    STATUS_WAITING,
+};
+
 use super::run_engine::RunEngine;
 use super::server_loop_host::ServerAgenticLoopHostBuilder;
-
-/// Best-effort persistence helper — delegates to [`astra_core::log_persist!`]
-/// with component tag `"run_lifecycle"`.
-macro_rules! log_persist {
-    ($expr:expr, $run_id:expr, $op:expr) => {
-        astra_core::log_persist!($expr, "run_lifecycle", $run_id, $op)
-    };
-}
 
 // ─── Skill wiring for server paths ──────────────────────────────────────────
 
@@ -428,7 +424,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
 
         // Persist to durable store if available
         if let Some(engine) = &self.run_engine {
-            log_persist!(engine.start_run(&run_id, &user_id, &session_id).await, &run_id, "start_run");
+            astra_core::log_persist!(engine.start_run(&run_id, &user_id, &session_id).await, "run_lifecycle", &run_id, "start_run");
         }
 
         // Spawn background agentic loop.
@@ -542,18 +538,18 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             }
 
             if let Some(engine) = &run_engine {
-                log_persist!(
+                astra_core::log_persist!(
                     engine.persist_status(&bg_run_id, status_str, None, error_msg.as_deref()).await,
-                    &bg_run_id, "status"
+                    "run_lifecycle", &bg_run_id, "status"
                 );
-                log_persist!(
+                astra_core::log_persist!(
                     engine.persist_usage(
                         &bg_run_id,
                         loop_state.total_prompt,
                         loop_state.total_completion,
                         loop_state.total_tool_calls,
                     ).await,
-                    &bg_run_id, "usage"
+                    "run_lifecycle", &bg_run_id, "usage"
                 );
             }
         });
@@ -701,16 +697,16 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             }));
             // Persist cancellation
             if let Some(engine) = &self.run_engine {
-                log_persist!(
+                astra_core::log_persist!(
                     engine.persist_status(&run_id, STATUS_CANCELLED, None, None).await,
-                    &run_id, "cancel_status"
+                    "run_lifecycle", &run_id, "cancel_status"
                 );
-                log_persist!(
+                astra_core::log_persist!(
                     engine.append_event(
                         &run_id,
                         json!({"event_type": "run_finished", "data": {"cancelled": true}}),
                     ).await,
-                    &run_id, "cancel_event"
+                    "run_lifecycle", &run_id, "cancel_event"
                 );
             }
         }
@@ -774,13 +770,13 @@ impl RunLifecycleService for AgenticRunLifecycleService {
 
         // Persist pause
         if let Some(engine) = &self.run_engine {
-            log_persist!(
+            astra_core::log_persist!(
                 engine.persist_status(&run_id, STATUS_PAUSED, Some("user_resume"), None).await,
-                &run_id, "pause_status"
+                "run_lifecycle", &run_id, "pause_status"
             );
-            log_persist!(
+            astra_core::log_persist!(
                 engine.append_event(&run_id, json!({"event_type": "run_paused", "data": {}})).await,
-                &run_id, "pause_event"
+                "run_lifecycle", &run_id, "pause_event"
             );
         }
         // Cascade: pause all delegated sub-runs of this parent.
@@ -824,13 +820,13 @@ impl RunLifecycleService for AgenticRunLifecycleService {
 
         // Persist resume
         if let Some(engine) = &self.run_engine {
-            log_persist!(
+            astra_core::log_persist!(
                 engine.persist_status(&run_id, STATUS_RUNNING, None, None).await,
-                &run_id, "resume_status"
+                "run_lifecycle", &run_id, "resume_status"
             );
-            log_persist!(
+            astra_core::log_persist!(
                 engine.append_event(&run_id, json!({"event_type": "run_resumed", "data": {}})).await,
-                &run_id, "resume_event"
+                "run_lifecycle", &run_id, "resume_event"
             );
         }
         // Cascade: resume all delegated sub-runs of this parent.

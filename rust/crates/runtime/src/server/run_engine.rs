@@ -35,7 +35,7 @@ use std::sync::Arc;
 
 use astra_services::runs::{DurableRunRecord, RunStateStore};
 
-use super::delegation_engine::STATUS_RUNNING;
+use astra_core::STATUS_RUNNING;
 
 /// Durable run execution engine.
 ///

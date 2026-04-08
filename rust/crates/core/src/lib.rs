@@ -27,6 +27,16 @@ pub fn worktree_base_path() -> PathBuf {
     std::env::temp_dir().join(WORKTREE_BASE_DIR)
 }
 
+// ─── Run Status Constants ───────────────────────────────────────────────────
+
+pub const STATUS_RUNNING: &str = "running";
+pub const STATUS_COMPLETED: &str = "completed";
+pub const STATUS_FAILED: &str = "failed";
+pub const STATUS_PAUSED: &str = "paused";
+pub const STATUS_CANCELLED: &str = "cancelled";
+pub const STATUS_WAITING: &str = "waiting";
+pub const STATUS_VERIFICATION_FAILED: &str = "verification_failed";
+
 /// Create a one-shot connection pool (legacy — prefer `SharedPool` for production).
 pub async fn connect_matrixone(settings: &MatrixOneSettings) -> Result<Pool<MySql>, sqlx::Error> {
     MySqlPoolOptions::new()

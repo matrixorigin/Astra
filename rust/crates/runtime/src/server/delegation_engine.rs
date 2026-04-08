@@ -27,26 +27,13 @@ use astra_services::coordination::{
     DelegationRequest, DelegationResult, aggregate_results,
 };
 
+use astra_core::{
+    STATUS_COMPLETED, STATUS_FAILED, STATUS_PAUSED, STATUS_RUNNING,
+    STATUS_VERIFICATION_FAILED,
+};
+
 use super::run_engine::RunEngine;
 use crate::messaging::router::AgentMailboxRouter;
-
-// ─── Run Status Constants ───────────────────────────────────────────────────
-
-pub const STATUS_RUNNING: &str = "running";
-pub const STATUS_COMPLETED: &str = "completed";
-pub const STATUS_FAILED: &str = "failed";
-pub const STATUS_PAUSED: &str = "paused";
-pub const STATUS_CANCELLED: &str = "cancelled";
-pub const STATUS_WAITING: &str = "waiting";
-pub const STATUS_VERIFICATION_FAILED: &str = "verification_failed";
-
-/// Best-effort persistence helper — delegates to [`astra_core::log_persist!`]
-/// with component tag `"delegation"`.
-macro_rules! log_persist {
-    ($expr:expr, $run_id:expr, $op:expr) => {
-        astra_core::log_persist!($expr, "delegation", $run_id, $op)
-    };
-}
 
 // ─── Sub-run Executor Trait ─────────────────────────────────────────────────
 
@@ -450,23 +437,6 @@ impl DelegationTracker {
             .get(run_id)
             .is_some_and(|f| f.load(Ordering::Relaxed))
     }
-
-    /// Check if ALL sub-runs in a delegation are paused.
-    /// Returns `(paused_count, total_count)` so callers can detect partial pauses.
-    pub async fn delegation_pause_status(&self, delegation_id: &str) -> (usize, usize) {
-        let records = self.get_sub_runs(delegation_id).await;
-        let flags = self.pause_flags.read().await;
-        let total = records.len();
-        let paused = records
-            .iter()
-            .filter(|r| {
-                flags
-                    .get(&r.run_id)
-                    .is_some_and(|f| f.load(Ordering::Relaxed))
-            })
-            .count();
-        (paused, total)
-    }
 }
 
 impl Default for DelegationTracker {
@@ -623,13 +593,13 @@ impl DelegationEngine {
                 GateVerdict::Pass | GateVerdict::Skip => return current,
                 GateVerdict::Fail { reason, details } => {
                     // Persist retry count to durable store for crash recovery
-                    log_persist!(
+                    astra_core::log_persist!(
                         self.run_engine.persist_retry_count(&current.run_id, attempt).await,
-                        &current.run_id, "retry_count"
+                        "delegation", &current.run_id, "retry_count"
                     );
 
                     // Record the gate failure in run events
-                    log_persist!(
+                    astra_core::log_persist!(
                         self.run_engine.append_event(
                             &current.run_id,
                             serde_json::json!({
@@ -641,19 +611,19 @@ impl DelegationEngine {
                                 }
                             }),
                         ).await,
-                        &current.run_id, "gate_failed_event"
+                        "delegation", &current.run_id, "gate_failed_event"
                     );
 
                     if attempt >= max_retries {
                         // Exhausted retries — mark as verification failure
-                        log_persist!(
+                        astra_core::log_persist!(
                             self.run_engine.persist_status(
                                 &current.run_id,
                                 STATUS_VERIFICATION_FAILED,
                                 None,
                                 Some(&reason),
                             ).await,
-                            &current.run_id, "verification_failed"
+                            "delegation", &current.run_id, "verification_failed"
                         );
                         return AgentResult {
                             status: STATUS_VERIFICATION_FAILED.to_string(),
@@ -669,9 +639,9 @@ impl DelegationEngine {
                     let retry_config = config_builder();
                     match self.executor.execute(retry_config).await {
                         Ok(r) => {
-                            log_persist!(
+                            astra_core::log_persist!(
                                 self.run_engine.persist_status(&r.run_id, &r.status, None, r.error.as_deref()).await,
-                                &r.run_id, "status"
+                                "delegation", &r.run_id, "status"
                             );
                             current = r;
                         }
@@ -838,15 +808,15 @@ impl DelegationEngine {
                 // Persist final status
                 match &result {
                     Ok(r) => {
-                        log_persist!(
+                        astra_core::log_persist!(
                             run_engine.persist_status(&run_id, &r.status, None, r.error.as_deref()).await,
-                            &run_id, "status"
+                            "delegation", &run_id, "status"
                         );
                     }
                     Err(e) => {
-                        log_persist!(
+                        astra_core::log_persist!(
                             run_engine.persist_status(&run_id, STATUS_FAILED, None, Some(e.as_str())).await,
-                            &run_id, "status"
+                            "delegation", &run_id, "status"
                         );
                     }
                 }
@@ -1016,16 +986,16 @@ impl DelegationEngine {
 
             let result = match self.executor.execute(config).await {
                 Ok(r) => {
-                    log_persist!(
+                    astra_core::log_persist!(
                         self.run_engine.persist_status(&sub_run_id, &r.status, None, r.error.as_deref()).await,
-                        &sub_run_id, "status"
+                        "delegation", &sub_run_id, "status"
                     );
                     r
                 }
                 Err(e) => {
-                    log_persist!(
+                    astra_core::log_persist!(
                         self.run_engine.persist_status(&sub_run_id, STATUS_FAILED, None, Some(e.as_str())).await,
-                        &sub_run_id, "status"
+                        "delegation", &sub_run_id, "status"
                     );
                     AgentResult {
                         agent_id: agent_id.clone(),
@@ -1192,16 +1162,16 @@ impl DelegationEngine {
             };
             let prod_result = match self.executor.execute(prod_config).await {
                 Ok(r) => {
-                    log_persist!(
+                    astra_core::log_persist!(
                         self.run_engine.persist_status(&prod_run_id, &r.status, None, r.error.as_deref()).await,
-                        &prod_run_id, "status"
+                        "delegation", &prod_run_id, "status"
                     );
                     r
                 }
                 Err(e) => {
-                    log_persist!(
+                    astra_core::log_persist!(
                         self.run_engine.persist_status(&prod_run_id, STATUS_FAILED, None, Some(e.as_str())).await,
-                        &prod_run_id, "status"
+                        "delegation", &prod_run_id, "status"
                     );
                     AgentResult {
                         agent_id: producer_id.to_string(),
@@ -1317,16 +1287,16 @@ impl DelegationEngine {
             };
             let rev_result = match self.executor.execute(rev_config).await {
                 Ok(r) => {
-                    log_persist!(
+                    astra_core::log_persist!(
                         self.run_engine.persist_status(&rev_run_id, &r.status, None, r.error.as_deref()).await,
-                        &rev_run_id, "status"
+                        "delegation", &rev_run_id, "status"
                     );
                     r
                 }
                 Err(e) => {
-                    log_persist!(
+                    astra_core::log_persist!(
                         self.run_engine.persist_status(&rev_run_id, STATUS_FAILED, None, Some(e.as_str())).await,
-                        &rev_run_id, "status"
+                        "delegation", &rev_run_id, "status"
                     );
                     AgentResult {
                         agent_id: reviewer_id.to_string(),
@@ -1553,9 +1523,9 @@ impl DelegationEngine {
         let count = self.tracker.pause_delegation(delegation_id).await;
         // Persist pause status for each sub-run
         for record in self.tracker.get_sub_runs(delegation_id).await {
-            log_persist!(
+            astra_core::log_persist!(
                 self.run_engine.persist_status(&record.run_id, STATUS_PAUSED, Some("delegation_pause"), None).await,
-                &record.run_id, "pause"
+                "delegation", &record.run_id, "pause"
             );
         }
         count
@@ -1567,9 +1537,9 @@ impl DelegationEngine {
     pub async fn resume_delegation(&self, delegation_id: &str) -> usize {
         let count = self.tracker.resume_delegation(delegation_id).await;
         for record in self.tracker.get_sub_runs(delegation_id).await {
-            log_persist!(
+            astra_core::log_persist!(
                 self.run_engine.persist_status(&record.run_id, STATUS_RUNNING, Some("delegation_resume"), None).await,
-                &record.run_id, "resume"
+                "delegation", &record.run_id, "resume"
             );
         }
         count
@@ -1579,9 +1549,9 @@ impl DelegationEngine {
     pub async fn pause_children_of(&self, parent_run_id: &str) -> usize {
         let count = self.tracker.pause_children_of(parent_run_id).await;
         for child_id in self.tracker.get_children(parent_run_id).await {
-            log_persist!(
+            astra_core::log_persist!(
                 self.run_engine.persist_status(&child_id, STATUS_PAUSED, Some("parent_pause"), None).await,
-                &child_id, "pause"
+                "delegation", &child_id, "pause"
             );
         }
         count
@@ -1591,9 +1561,9 @@ impl DelegationEngine {
     pub async fn resume_children_of(&self, parent_run_id: &str) -> usize {
         let count = self.tracker.resume_children_of(parent_run_id).await;
         for child_id in self.tracker.get_children(parent_run_id).await {
-            log_persist!(
+            astra_core::log_persist!(
                 self.run_engine.persist_status(&child_id, STATUS_RUNNING, Some("parent_resume"), None).await,
-                &child_id, "resume"
+                "delegation", &child_id, "resume"
             );
         }
         count

@@ -1,4 +1,5 @@
 use super::*;
+use astra_core::STATUS_CANCELLED;
 
 pub(super) async fn create_session_handler(
     State(state): State<AppState>,
@@ -143,7 +144,7 @@ pub(super) async fn cancel_session_handler(
             SessionUpdateRequestData {
                 title: None,
                 metadata: None,
-                status: Some("cancelled".to_string()),
+                status: Some(STATUS_CANCELLED.to_string()),
             },
         )
         .await?;

@@ -33,6 +33,7 @@
 //! ```
 
 use super::*;
+use astra_core::STATUS_COMPLETED;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::response::IntoResponse;
 use futures_util::StreamExt;
@@ -483,7 +484,7 @@ async fn handle_chat_message(
                     socket,
                     &WsServerMessage::RunFinished {
                         run_id: record.run_id.clone(),
-                        status: "completed".to_string(),
+                        status: STATUS_COMPLETED.to_string(),
                         error: None,
                     },
                 )
