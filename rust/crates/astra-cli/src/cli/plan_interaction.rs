@@ -98,6 +98,49 @@ pub(super) fn eprint_plan_commands_help() {
     );
 }
 
+/// Result of the interactive plan confirmation prompt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum PlanConfirmChoice {
+    ExecuteAll,
+    StepByStep,
+    Edit,
+    Cancel,
+}
+
+/// Show an interactive selection prompt after plan generation.
+///
+/// Falls back to `eprint_plan_commands_help()` when stdin is not a terminal
+/// or `inquire` returns an error (e.g. user presses Esc).
+pub(super) fn prompt_plan_confirmation(subtask_count: usize) -> Option<PlanConfirmChoice> {
+    use std::io::IsTerminal;
+    if !std::io::stdin().is_terminal() {
+        eprint_plan_commands_help();
+        return None;
+    }
+
+    let options = vec![
+        format!("▶  Execute all ({subtask_count} subtasks)"),
+        "⚙  Step-by-step (confirm each subtask)".to_string(),
+        "✏  Edit plan (describe changes)".to_string(),
+        "✕  Cancel (back to prompt)".to_string(),
+    ];
+
+    eprintln!(); // spacing before prompt
+    match inquire::Select::new("Plan ready —", options)
+        .without_help_message()
+        .prompt()
+    {
+        Ok(choice) if choice.starts_with('▶') => Some(PlanConfirmChoice::ExecuteAll),
+        Ok(choice) if choice.starts_with('⚙') => Some(PlanConfirmChoice::StepByStep),
+        Ok(choice) if choice.starts_with('✏') => Some(PlanConfirmChoice::Edit),
+        Ok(_) => Some(PlanConfirmChoice::Cancel),
+        Err(_) => {
+            // User pressed Esc or other interrupt
+            Some(PlanConfirmChoice::Cancel)
+        }
+    }
+}
+
 /// Compact colored progress bar — uses `astra_runtime::plan::progress_bar_segments` so `filled`
 /// is clamped to `width` (avoids panic on edge `pct` values).
 fn format_progress_bar(pct: u32, width: usize) -> String {
@@ -420,7 +463,21 @@ pub async fn handle_plan_mode_input(
                             None,
                         );
 
+                        let subtask_count = plan_state.plan.subtasks.len();
                         eprint_plan_commands_help();
+
+                        // Offer interactive confirmation if terminal supports it
+                        if let Some(choice) = prompt_plan_confirmation(subtask_count) {
+                            match choice {
+                                PlanConfirmChoice::ExecuteAll => {
+                                    return Box::pin(handle_plan_mode_input("go".into(), token, state, api)).await;
+                                }
+                                PlanConfirmChoice::StepByStep => {
+                                    return Box::pin(handle_plan_mode_input("step".into(), token, state, api)).await;
+                                }
+                                PlanConfirmChoice::Edit | PlanConfirmChoice::Cancel => {}
+                            }
+                        }
                     }
                     Err(e) => {
                         eprint_plan_json_parse_failed(&full_text, &e.to_string());
@@ -1230,7 +1287,21 @@ async fn handle_goal_submission(
                             })),
                         );
 
+                        let subtask_count = plan_state.plan.subtasks.len();
                         eprint_plan_commands_help();
+
+                        // Offer interactive confirmation if terminal supports it
+                        if let Some(choice) = prompt_plan_confirmation(subtask_count) {
+                            match choice {
+                                PlanConfirmChoice::ExecuteAll => {
+                                    return Box::pin(handle_plan_mode_input("go".into(), token, state, api)).await;
+                                }
+                                PlanConfirmChoice::StepByStep => {
+                                    return Box::pin(handle_plan_mode_input("step".into(), token, state, api)).await;
+                                }
+                                PlanConfirmChoice::Edit | PlanConfirmChoice::Cancel => {}
+                            }
+                        }
                     }
                     Err(e) => {
                         eprint_plan_json_parse_failed(&full_text, &e.to_string());

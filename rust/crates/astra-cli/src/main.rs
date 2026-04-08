@@ -3867,12 +3867,8 @@ fn display_plan_updates_live(
                     reason,
                 );
                 print_plan_monitor_line(plan_spinner, &mut state.plan_in_token_stream, &mut state.plan_md_renderer, &mut state.plan_thinking_pane, msg);
-                // Store the response channel for the REPL readline handler.
-                // The next user input line will be interpreted as y/n/a to resolve this.
+                // Store the response channel for the REPL to resolve
                 state.pending_approval = Some(response_tx);
-                let prompt_msg =
-                    "   Type y(es) to approve, n(o) to deny, !(auto-run all):".to_string();
-                print_plan_monitor_line(plan_spinner, &mut state.plan_in_token_stream, &mut state.plan_md_renderer, &mut state.plan_thinking_pane, prompt_msg);
                 continue;
             }
             _ => continue, // ParallelGroupInfo, StepByStepPrompt — future use
@@ -4087,18 +4083,27 @@ async fn run_blocking_plan_monitor(state: &mut ReplState) {
         // Handle pending approval inline (readline is not active).
         if state.pending_approval.is_some() {
             let approved = tokio::task::spawn_blocking(|| {
-                use std::io::Write;
-                let _ = std::io::stderr().flush();
-                let mut line = String::new();
-                if std::io::stdin().read_line(&mut line).is_err() {
-                    eprintln!(
-                        "\n{}  Could not read approval line; treating as deny.",
-                        theme::icon_warn()
-                    );
-                    return false;
+                use std::io::IsTerminal;
+                if std::io::stdin().is_terminal() {
+                    match inquire::Confirm::new("Approve?")
+                        .with_default(false)
+                        .prompt()
+                    {
+                        Ok(v) => v,
+                        Err(_) => false,
+                    }
+                } else {
+                    use std::io::Write;
+                    let _ = std::io::stderr().flush();
+                    eprint!("   Approve? [y/N]: ");
+                    let _ = std::io::stderr().flush();
+                    let mut line = String::new();
+                    if std::io::stdin().read_line(&mut line).is_err() {
+                        return false;
+                    }
+                    let t = line.trim().to_lowercase();
+                    t == "y" || t == "yes"
                 }
-                let trimmed = line.trim().to_lowercase();
-                trimmed == "y" || trimmed == "yes" || trimmed == "!" || trimmed == "a"
             })
             .await
             .unwrap_or(false);
