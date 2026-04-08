@@ -49,15 +49,16 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ),
     (
         "/plan",
-        "Structured plan: on|off|list|status|pause|resume|…",
+        "Structured plan: go|step|pause|resume|exit|show|help",
     ),
-    ("/plan on", "Plan-only chat until /plan off"),
-    ("/plan off", "Exit plan-only chat"),
-    ("/plan list", "List plan history"),
-    ("/plan history", "Plan version history"),
-    ("/plan status", "Running/paused plan progress"),
+    ("/plan go", "Execute plan (auto mode)"),
+    ("/plan step", "Execute plan (step-by-step)"),
+    ("/plan status", "Plan progress and state"),
+    ("/plan show", "Display current plan"),
     ("/plan pause", "Pause plan execution"),
     ("/plan resume", "Resume plan execution"),
+    ("/plan exit", "Leave plan mode"),
+    ("/plan help", "Show all plan commands"),
     ("/report", "Last delivery report (/report save = JSON)"),
     // ── Memory & tasks ────────────────────────────────────────────────────
     ("/memory", "Memoria: list, search <q>, inspect <id>, …"),
@@ -861,7 +862,7 @@ fn slash_argument_hint(command: &str) -> Option<&'static str> {
         "/memory" => Some("[list|search <q>|inspect <id>]"),
         "/diff" => Some("[staged|unstaged|stat|show <rev>|help|<paths…>]"),
         "/plan" => {
-            Some("[on|off|status|pause|resume|enter <goal>|auto|exit|decompose|show|set|clear]")
+            Some("[go|step|pause|resume|exit|status|show|help]")
         }
         "/task" => Some("[list|add <title>|done <id>|status <id>|run <prompt>|result <id>]"),
         "/resume" => Some("[session_id]"),
@@ -2321,8 +2322,8 @@ mod tests {
     #[test]
     fn slash_ctrl_e_reopens_picker_in_slash_context() {
         assert_eq!(
-            slash_ctrl_e_filter("/plan l", false, true),
-            Some(Some("plan l".to_string()))
+            slash_ctrl_e_filter("/plan s", false, true),
+            Some(Some("plan s".to_string()))
         );
     }
 
@@ -2470,10 +2471,10 @@ mod tests {
         // Typing "/plan " should reveal plan sub-commands
         let rows = filtered_slash_rows(Some("plan "));
         assert!(!rows.is_empty());
-        assert!(rows.iter().any(|(cmd, _)| *cmd == "/plan list"));
-        assert!(rows.iter().any(|(cmd, _)| *cmd == "/plan history"));
-        assert!(rows.iter().any(|(cmd, _)| *cmd == "/plan on"));
-        assert!(rows.iter().any(|(cmd, _)| *cmd == "/plan off"));
+        assert!(rows.iter().any(|(cmd, _)| *cmd == "/plan go"));
+        assert!(rows.iter().any(|(cmd, _)| *cmd == "/plan step"));
+        assert!(rows.iter().any(|(cmd, _)| *cmd == "/plan status"));
+        assert!(rows.iter().any(|(cmd, _)| *cmd == "/plan show"));
     }
 
     // ── Pending-execute lifecycle ────────────────────────────────────────

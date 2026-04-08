@@ -283,8 +283,11 @@ pub(super) fn eprint_plan_mode_banner(goal: &str) {
     eprintln!();
     eprintln!(
         "{}",
-        "  go/run  execute    step  step-by-step    exit  leave    help/?  commands"
-            .dim()
+        "  go  execute · step  step-by-step · pause · resume · exit · show · status".dim()
+    );
+    eprintln!(
+        "{}",
+        "  correct <…> · rewind <…> · diff · rollback · timeline · metrics · history · list".dim()
     );
     eprintln!();
 }
@@ -1304,10 +1307,6 @@ async fn handle_plan_command(
         PlanCommand::DisablePlanOnly => {
             state.chat_plan_only = false;
             eprintln!("  {} Plan-only chat disabled (tools re-enabled)", theme::icon_ok());
-        }
-
-        PlanCommand::Approve { .. } | PlanCommand::Reject { .. } => {
-            eprintln!("  {} Approval commands are handled by the execution loop", "💡".cyan());
         }
 
         PlanCommand::Help => {

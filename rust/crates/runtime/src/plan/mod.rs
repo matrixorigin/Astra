@@ -546,10 +546,6 @@ pub enum PlanCommand {
     Timeline,
     /// Show plan metrics.
     Metrics,
-    /// Approve a pending subtask.
-    Approve { subtask_id: Option<String> },
-    /// Reject a pending subtask with reason.
-    Reject { subtask_id: String, reason: String },
     /// Add operator correction for upcoming subtasks.
     Correct { guidance: String },
     /// Clear stacked corrections.
