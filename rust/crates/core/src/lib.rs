@@ -71,7 +71,7 @@ impl SharedPool {
     }
 }
 
-#[derive(Serialize, PartialEq, Eq)]
+#[derive(Debug, Serialize, PartialEq, Eq)]
 pub struct ErrorResponse {
     pub detail: String,
 }

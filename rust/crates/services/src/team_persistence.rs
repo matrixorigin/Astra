@@ -92,21 +92,16 @@ pub struct TeamMemberDef {
 }
 
 /// How the team's agents share the workspace file system.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum WorktreeMode {
     /// All agents share the same working directory (current behaviour).
+    #[default]
     Shared,
     /// Each agent gets an independent git worktree.
     Isolated,
     /// Agents work in a MatrixOne stage area; changes committed on success.
     Staged,
-}
-
-impl Default for WorktreeMode {
-    fn default() -> Self {
-        Self::Shared
-    }
 }
 
 // ─── Resolve: TeamMemberDef → AgentProfile ──────────────────────────────────

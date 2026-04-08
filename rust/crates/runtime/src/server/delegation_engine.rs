@@ -2830,4 +2830,152 @@ mod tests {
         let gated = engine.clone_with_gate(Arc::new(PassGate));
         assert!(gated.gate.is_some());
     }
+
+    // ─── Fork Pattern Tests ─────────────────────────────────────────────
+
+    fn fork_request(tasks: Vec<&str>, agent_id: &str) -> DelegationRequest {
+        DelegationRequest {
+            delegation_id: "del-fork".into(),
+            parent_run_id: "parent-fork".into(),
+            task: "fork test".into(),
+            pattern: CoordinationPattern::Fork {
+                tasks: tasks.into_iter().map(String::from).collect(),
+                agent_id: agent_id.into(),
+                max_turns: 5,
+                aggregation: AggregationStrategy::AllResults,
+            },
+            user_id: "user-1".into(),
+            depth: 0,
+            context: HashMap::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn fork_spawns_parallel_children() {
+        let (_, _engine, tracker, de) = setup_with_executor(Arc::new(EchoExecutor));
+
+        let req = fork_request(vec!["task-a", "task-b", "task-c"], "writer");
+        let result = de.execute(req, "orch").await.unwrap();
+
+        assert_eq!(result.agent_results.len(), 3);
+        assert_eq!(result.status, "completed");
+
+        let subs = tracker.get_sub_runs("del-fork").await;
+        assert_eq!(subs.len(), 3);
+        for sub in &subs {
+            assert_eq!(sub.agent_id, "writer");
+            assert_eq!(sub.depth, 1);
+        }
+
+        // All results should have output
+        for ar in &result.agent_results {
+            assert_eq!(ar.status, "completed");
+            assert!(ar.output.is_some());
+        }
+    }
+
+    #[tokio::test]
+    async fn fork_children_cannot_delegate() {
+        /// Executor that checks can_delegate is false on fork children.
+        struct DelegateCheckExecutor;
+
+        #[async_trait]
+        impl SubRunExecutor for DelegateCheckExecutor {
+            async fn execute(&self, config: SubRunConfig) -> Result<AgentResult, String> {
+                let can_del = config.agent_profile.can_delegate;
+                let depth = config.agent_profile.max_delegation_depth;
+                Ok(AgentResult {
+                    agent_id: config.agent_profile.agent_id,
+                    run_id: config.run_id,
+                    status: "completed".to_string(),
+                    output: Some(format!("can_delegate={can_del},depth={depth}")),
+                    error: None,
+                    prompt_tokens: 0,
+                    completion_tokens: 0,
+                    tool_calls: 0,
+                })
+            }
+        }
+
+        let (reg, engine, tracker) = setup();
+        let de = DelegationEngine::with_executor(
+            reg, engine, tracker, Arc::new(DelegateCheckExecutor),
+        );
+
+        let req = fork_request(vec!["task-a"], "writer");
+        let result = de.execute(req, "orch").await.unwrap();
+
+        assert_eq!(result.agent_results[0].output.as_deref(), Some("can_delegate=false,depth=0"));
+    }
+
+    #[tokio::test]
+    async fn fork_partial_failure() {
+        let executor = Arc::new(FailingExecutor {
+            fail_agents: vec!["writer".to_string()],
+        });
+        let (reg, engine, tracker) = setup();
+        let de = DelegationEngine::with_executor(reg, engine, tracker, executor);
+
+        let req = fork_request(vec!["task-a", "task-b"], "writer");
+        let result = de.execute(req, "orch").await.unwrap();
+
+        // All children use "writer" which fails → all failed
+        assert_eq!(result.agent_results.len(), 2);
+        assert_eq!(result.status, "failed");
+        for ar in &result.agent_results {
+            assert_eq!(ar.status, "failed");
+        }
+    }
+
+    #[tokio::test]
+    async fn fork_single_task() {
+        let (_, _, _, de) = setup_with_executor(Arc::new(EchoExecutor));
+
+        let req = fork_request(vec!["only-task"], "writer");
+        let result = de.execute(req, "orch").await.unwrap();
+
+        assert_eq!(result.agent_results.len(), 1);
+        assert_eq!(result.status, "completed");
+    }
+
+    #[tokio::test]
+    async fn fork_context_includes_fork_metadata() {
+        /// Executor that checks fork context fields.
+        struct ForkContextCheckExecutor;
+
+        #[async_trait]
+        impl SubRunExecutor for ForkContextCheckExecutor {
+            async fn execute(&self, config: SubRunConfig) -> Result<AgentResult, String> {
+                let is_fork = config.context.get("is_fork_child")
+                    .and_then(|v| v.as_bool()).unwrap_or(false);
+                let idx = config.context.get("fork_index")
+                    .and_then(|v| v.as_u64()).unwrap_or(999);
+                Ok(AgentResult {
+                    agent_id: config.agent_profile.agent_id,
+                    run_id: config.run_id,
+                    status: "completed".to_string(),
+                    output: Some(format!("is_fork={is_fork},idx={idx}")),
+                    error: None,
+                    prompt_tokens: 0,
+                    completion_tokens: 0,
+                    tool_calls: 0,
+                })
+            }
+        }
+
+        let (reg, engine, tracker) = setup();
+        let de = DelegationEngine::with_executor(
+            reg, engine, tracker, Arc::new(ForkContextCheckExecutor),
+        );
+
+        let req = fork_request(vec!["a", "b"], "writer");
+        let result = de.execute(req, "orch").await.unwrap();
+
+        // Both children should have fork metadata
+        let outputs: Vec<String> = result.agent_results.iter()
+            .filter_map(|r| r.output.clone())
+            .collect();
+        assert!(outputs.iter().any(|o| o.contains("is_fork=true,idx=0")));
+        assert!(outputs.iter().any(|o| o.contains("is_fork=true,idx=1")));
+    }
 }

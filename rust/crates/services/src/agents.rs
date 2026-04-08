@@ -425,6 +425,112 @@ impl AgentService for UnconfiguredAgentService {
     }
 }
 
+// ── In-memory implementation for testing ─────────────────────────────────────
+
+pub struct InMemoryAgentService {
+    agents: std::sync::RwLock<Vec<AgentRecord>>,
+}
+
+impl Default for InMemoryAgentService {
+    fn default() -> Self { Self::new() }
+}
+
+impl InMemoryAgentService {
+    pub fn new() -> Self {
+        Self { agents: std::sync::RwLock::new(Vec::new()) }
+    }
+}
+
+#[async_trait]
+impl AgentService for InMemoryAgentService {
+    async fn create_agent(
+        &self,
+        user_id: String,
+        request: AgentCreateRequestData,
+    ) -> Result<AgentRecord, (StatusCode, Json<ErrorResponse>)> {
+        let now = chrono::Utc::now().to_rfc3339();
+        let record = AgentRecord {
+            agent_id: Uuid::new_v4().to_string(),
+            name: request.name,
+            agent_type: "custom".to_string(),
+            owner_user_id: user_id,
+            agent_config: request.agent_config.unwrap_or(serde_json::json!({})),
+            data_source: request.data_source.unwrap_or(serde_json::json!({})),
+            is_active: true,
+            created_at: now,
+            updated_at: None,
+        };
+        self.agents.write().unwrap().push(record.clone());
+        Ok(record)
+    }
+
+    async fn list_agents(
+        &self,
+        user_id: String,
+    ) -> Result<AgentListRecord, (StatusCode, Json<ErrorResponse>)> {
+        let agents = self.agents.read().unwrap();
+        let items: Vec<AgentListItem> = agents.iter()
+            .filter(|a| a.owner_user_id == user_id)
+            .map(|a| AgentListItem {
+                agent_id: a.agent_id.clone(),
+                name: a.name.clone(),
+                agent_type: a.agent_type.clone(),
+                owner_user_id: a.owner_user_id.clone(),
+                is_active: a.is_active,
+                created_at: a.created_at.clone(),
+                updated_at: a.updated_at.clone(),
+            })
+            .collect();
+        let total = items.len() as i64;
+        Ok(AgentListRecord { agents: items, total })
+    }
+
+    async fn get_agent(
+        &self,
+        agent_id: String,
+        user_id: String,
+    ) -> Result<AgentRecord, (StatusCode, Json<ErrorResponse>)> {
+        let agents = self.agents.read().unwrap();
+        agents.iter()
+            .find(|a| a.agent_id == agent_id && a.owner_user_id == user_id)
+            .cloned()
+            .ok_or_else(|| error_response(StatusCode::NOT_FOUND, "agent not found"))
+    }
+
+    async fn update_agent(
+        &self,
+        agent_id: String,
+        user_id: String,
+        request: AgentUpdateRequestData,
+    ) -> Result<AgentRecord, (StatusCode, Json<ErrorResponse>)> {
+        let mut agents = self.agents.write().unwrap();
+        let agent = agents.iter_mut()
+            .find(|a| a.agent_id == agent_id && a.owner_user_id == user_id)
+            .ok_or_else(|| error_response(StatusCode::NOT_FOUND, "agent not found"))?;
+        if let Some(name) = request.name { agent.name = name; }
+        if let Some(config) = request.agent_config { agent.agent_config = config; }
+        if let Some(ds) = request.data_source { agent.data_source = ds; }
+        if let Some(active) = request.is_active { agent.is_active = active; }
+        agent.updated_at = Some(chrono::Utc::now().to_rfc3339());
+        Ok(agent.clone())
+    }
+
+    async fn delete_agent(
+        &self,
+        agent_id: String,
+        user_id: String,
+    ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+        let mut agents = self.agents.write().unwrap();
+        let len_before = agents.len();
+        agents.retain(|a| !(a.agent_id == agent_id && a.owner_user_id == user_id));
+        if agents.len() == len_before {
+            Err(error_response(StatusCode::NOT_FOUND, "agent not found"))
+        } else {
+            Ok(())
+        }
+    }
+}
+
 // ── HTTP types ───────────────────────────────────────────────────────────────
 
 #[derive(Deserialize)]
@@ -506,5 +612,156 @@ impl From<AgentListRecord> for AgentListResponse {
                 .collect(),
             total: r.total,
         }
+    }
+}
+
+// ── Tests ────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn create_agent_returns_record() {
+        let svc = InMemoryAgentService::new();
+        let record = svc.create_agent("u1".into(), AgentCreateRequestData {
+            name: "my-agent".into(),
+            agent_config: Some(serde_json::json!({"model": "gpt-4"})),
+            data_source: None,
+        }).await.unwrap();
+        assert_eq!(record.name, "my-agent");
+        assert_eq!(record.owner_user_id, "u1");
+        assert!(record.is_active);
+        assert!(!record.agent_id.is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_agents_filters_by_user() {
+        let svc = InMemoryAgentService::new();
+        svc.create_agent("u1".into(), AgentCreateRequestData {
+            name: "a1".into(), agent_config: None, data_source: None,
+        }).await.unwrap();
+        svc.create_agent("u2".into(), AgentCreateRequestData {
+            name: "a2".into(), agent_config: None, data_source: None,
+        }).await.unwrap();
+
+        let list = svc.list_agents("u1".into()).await.unwrap();
+        assert_eq!(list.total, 1);
+        assert_eq!(list.agents[0].name, "a1");
+    }
+
+    #[tokio::test]
+    async fn get_agent_by_id() {
+        let svc = InMemoryAgentService::new();
+        let created = svc.create_agent("u1".into(), AgentCreateRequestData {
+            name: "test".into(), agent_config: None, data_source: None,
+        }).await.unwrap();
+
+        let fetched = svc.get_agent(created.agent_id.clone(), "u1".into()).await.unwrap();
+        assert_eq!(fetched.agent_id, created.agent_id);
+    }
+
+    #[tokio::test]
+    async fn get_nonexistent_agent_returns_404() {
+        let svc = InMemoryAgentService::new();
+        let result = svc.get_agent("nope".into(), "u1".into()).await;
+        assert!(result.is_err());
+        let (status, _) = result.unwrap_err();
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn update_agent_fields() {
+        let svc = InMemoryAgentService::new();
+        let created = svc.create_agent("u1".into(), AgentCreateRequestData {
+            name: "old".into(), agent_config: None, data_source: None,
+        }).await.unwrap();
+
+        let updated = svc.update_agent(created.agent_id.clone(), "u1".into(), AgentUpdateRequestData {
+            name: Some("new".into()),
+            agent_config: None,
+            data_source: None,
+            is_active: Some(false),
+        }).await.unwrap();
+        assert_eq!(updated.name, "new");
+        assert!(!updated.is_active);
+        assert!(updated.updated_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn delete_agent_removes_it() {
+        let svc = InMemoryAgentService::new();
+        let created = svc.create_agent("u1".into(), AgentCreateRequestData {
+            name: "doomed".into(), agent_config: None, data_source: None,
+        }).await.unwrap();
+
+        svc.delete_agent(created.agent_id.clone(), "u1".into()).await.unwrap();
+        let result = svc.get_agent(created.agent_id, "u1".into()).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn delete_nonexistent_returns_404() {
+        let svc = InMemoryAgentService::new();
+        let result = svc.delete_agent("nope".into(), "u1".into()).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn user_isolation_on_get() {
+        let svc = InMemoryAgentService::new();
+        let created = svc.create_agent("u1".into(), AgentCreateRequestData {
+            name: "private".into(), agent_config: None, data_source: None,
+        }).await.unwrap();
+
+        // u2 cannot access u1's agent
+        let result = svc.get_agent(created.agent_id, "u2".into()).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn unconfigured_service_returns_error() {
+        let svc = UnconfiguredAgentService;
+        assert!(svc.list_agents("u1".into()).await.is_err());
+        assert!(svc.create_agent("u1".into(), AgentCreateRequestData {
+            name: "x".into(), agent_config: None, data_source: None,
+        }).await.is_err());
+    }
+
+    #[test]
+    fn agent_response_from_record() {
+        let record = AgentRecord {
+            agent_id: "a1".into(),
+            name: "test".into(),
+            agent_type: "custom".into(),
+            owner_user_id: "u1".into(),
+            agent_config: serde_json::json!({}),
+            data_source: serde_json::json!({}),
+            is_active: true,
+            created_at: "2026-01-01".into(),
+            updated_at: None,
+        };
+        let resp = AgentResponse::from(record);
+        assert_eq!(resp.agent_id, "a1");
+        assert_eq!(resp.name, "test");
+    }
+
+    #[test]
+    fn agent_list_response_from_record() {
+        let record = AgentListRecord {
+            agents: vec![AgentListItem {
+                agent_id: "a1".into(),
+                name: "test".into(),
+                agent_type: "custom".into(),
+                owner_user_id: "u1".into(),
+                is_active: true,
+                created_at: "2026-01-01".into(),
+                updated_at: None,
+            }],
+            total: 1,
+        };
+        let resp = AgentListResponse::from(record);
+        assert_eq!(resp.total, 1);
+        assert_eq!(resp.agents[0].agent_id, "a1");
     }
 }
