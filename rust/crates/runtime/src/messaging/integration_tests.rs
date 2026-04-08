@@ -871,4 +871,302 @@ mod tests {
         assert_eq!(counter.received.load(Ordering::Relaxed), 1);
         assert_eq!(counter.dead_lettered.load(Ordering::Relaxed), 1);
     }
+
+    // ── Concurrent stress tests ─────────────────────────────────────────────
+
+    /// Stress test: N senders concurrently send M messages each to a single receiver.
+    /// Verifies: no lost messages, correct delivery, no panics under contention.
+    #[tokio::test]
+    async fn stress_concurrent_senders_single_receiver() {
+        const NUM_SENDERS: usize = 10;
+        const MSGS_PER_SENDER: usize = 100;
+        const TOTAL_MSGS: usize = NUM_SENDERS * MSGS_PER_SENDER;
+
+        let transport = Arc::new(InProcessTransport::new());
+        let dt = tracker();
+        let router = Arc::new(AgentMailboxRouter::new(transport, dt.clone()));
+
+        // Register receiver
+        let receiver_addr = addr("run-recv", "receiver");
+        let receiver_mb = router.register(receiver_addr.clone(), None).await.unwrap();
+
+        // Register senders and record relationships
+        let mut sender_mbs = Vec::new();
+        for i in 0..NUM_SENDERS {
+            let sender_run = format!("run-sender-{i}");
+            let sender_addr = addr(&sender_run, "sender");
+            let mb = router.register(sender_addr.clone(), None).await.unwrap();
+            sender_mbs.push((sender_addr, mb));
+
+            // Record parent→sender relationship for authorization
+            dt.record_sub_run(SubRunRecord {
+                run_id: sender_run.clone(),
+                parent_run_id: "run-recv".into(),
+                delegation_id: "stress-test".into(),
+                agent_id: "sender".into(),
+                depth: 1,
+            })
+            .await;
+
+            // Record parent→receiver (mutual visibility for replies)
+            dt.record_sub_run(SubRunRecord {
+                run_id: "run-recv".into(),
+                parent_run_id: sender_run.clone(),
+                delegation_id: "stress-test".into(),
+                agent_id: "receiver".into(),
+                depth: 1,
+            })
+            .await;
+        }
+
+        // Spawn concurrent senders
+        let mut handles = Vec::new();
+        for (i, (sender_addr, sender_mb)) in sender_mbs.into_iter().enumerate() {
+            let recv_addr = receiver_addr.clone();
+            let router_clone = router.clone();
+            handles.push(tokio::spawn(async move {
+                for j in 0..MSGS_PER_SENDER {
+                    let msg = AgentMessage::new(
+                        sender_addr.clone(),
+                        MessageTarget::Direct { address: recv_addr.clone() },
+                        MessagePayload::Text {
+                            content: format!("Hello from sender {i} msg {j}"),
+                            summary: None,
+                        },
+                    );
+                    if let Err(e) = router_clone.send(msg).await {
+                        panic!("Send failed for sender {i} msg {j}: {e}");
+                    }
+                }
+                sender_mb // Return to drop after all sends complete
+            }));
+        }
+
+        // Wait for all senders to complete
+        for handle in handles {
+            let _ = handle.await.unwrap();
+        }
+
+        // Verify receiver got all messages
+        let mut received = 0;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while received < TOTAL_MSGS {
+            match tokio::time::timeout(
+                deadline.saturating_duration_since(std::time::Instant::now()),
+                receiver_mb.recv(),
+            )
+            .await
+            {
+                Ok(Some(_msg)) => received += 1,
+                Ok(None) => break, // Channel closed
+                Err(_) => break,   // Timeout
+            }
+        }
+
+        assert_eq!(
+            received, TOTAL_MSGS,
+            "Expected {TOTAL_MSGS} messages, got {received}"
+        );
+    }
+
+    /// Stress test: N senders, M receivers, each sender broadcasts to all receivers.
+    /// Verifies: fanout correctness, no message loss in multi-receiver scenario.
+    #[tokio::test]
+    async fn stress_broadcast_to_multiple_receivers() {
+        const NUM_SENDERS: usize = 5;
+        const NUM_RECEIVERS: usize = 5;
+        const MSGS_PER_SENDER: usize = 20;
+        const TOTAL_PER_RECEIVER: usize = NUM_SENDERS * MSGS_PER_SENDER;
+
+        let transport = Arc::new(InProcessTransport::new());
+        let dt = tracker();
+        let router = Arc::new(AgentMailboxRouter::new(transport, dt.clone()));
+
+        // Register receivers
+        let mut receiver_mbs = Vec::new();
+        for i in 0..NUM_RECEIVERS {
+            let recv_addr = addr(&format!("run-recv-{i}"), "receiver");
+            let mb = router.register(recv_addr.clone(), None).await.unwrap();
+            receiver_mbs.push((recv_addr, mb));
+        }
+
+        // Register senders and set up relationships
+        let mut sender_addrs = Vec::new();
+        for i in 0..NUM_SENDERS {
+            let sender_run = format!("run-sender-{i}");
+            let sender_addr = addr(&sender_run, "sender");
+            router.register(sender_addr.clone(), None).await.unwrap();
+            sender_addrs.push(sender_addr);
+
+            // Record relationships for all receivers
+            for j in 0..NUM_RECEIVERS {
+                let recv_run = format!("run-recv-{j}");
+                dt.record_sub_run(SubRunRecord {
+                    run_id: recv_run,
+                    parent_run_id: sender_run.clone(),
+                    delegation_id: "broadcast".into(),
+                    agent_id: "receiver".into(),
+                    depth: 1,
+                })
+                .await;
+            }
+        }
+
+        // Spawn concurrent senders, each sending to all receivers
+        let mut handles = Vec::new();
+        for (i, sender_addr) in sender_addrs.into_iter().enumerate() {
+            let router_clone = router.clone();
+            let receivers: Vec<_> = receiver_mbs.iter().map(|(a, _)| a.clone()).collect();
+            handles.push(tokio::spawn(async move {
+                for j in 0..MSGS_PER_SENDER {
+                    for recv_addr in &receivers {
+                        let msg = AgentMessage::new(
+                            sender_addr.clone(),
+                            MessageTarget::Direct { address: recv_addr.clone() },
+                            MessagePayload::Text {
+                                content: format!("Broadcast {i}-{j}"),
+                                summary: None,
+                            },
+                        );
+                        router_clone.send(msg).await.unwrap();
+                    }
+                }
+            }));
+        }
+
+        // Wait for senders
+        for handle in handles {
+            handle.await.unwrap();
+        }
+
+        // Verify each receiver got all messages
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        for (i, (_addr, mb)) in receiver_mbs.iter().enumerate() {
+            let mut received = 0;
+            while received < TOTAL_PER_RECEIVER {
+                match tokio::time::timeout(
+                    deadline.saturating_duration_since(std::time::Instant::now()),
+                    mb.recv(),
+                )
+                .await
+                {
+                    Ok(Some(_)) => received += 1,
+                    Ok(None) | Err(_) => break,
+                }
+            }
+            assert_eq!(
+                received, TOTAL_PER_RECEIVER,
+                "Receiver {i}: expected {TOTAL_PER_RECEIVER}, got {received}"
+            );
+        }
+    }
+
+    /// Stress test: concurrent send + ack + retry + DLQ interactions.
+    /// Verifies: system stability under mixed operations.
+    #[tokio::test]
+    async fn stress_mixed_operations() {
+        use crate::messaging::ack_tracker::PendingAckTracker;
+        use crate::messaging::dead_letter::DeadLetterQueue;
+
+        const NUM_AGENTS: usize = 5;
+        const OPS_PER_AGENT: usize = 50;
+
+        let transport = Arc::new(InProcessTransport::new());
+        let dt = tracker();
+        let router = Arc::new(AgentMailboxRouter::new(transport.clone(), dt.clone()));
+        let ack_tracker = Arc::new(PendingAckTracker::new());
+        let dlq = Arc::new(DeadLetterQueue::new());
+
+        // Register agents in a ring topology
+        let mut agents = Vec::new();
+        for i in 0..NUM_AGENTS {
+            let agent_addr = addr(&format!("run-{i}"), &format!("agent-{i}"));
+            let mb = router.register(agent_addr.clone(), None).await.unwrap();
+            agents.push((agent_addr, mb));
+
+            // Each agent can send to the next
+            let next = (i + 1) % NUM_AGENTS;
+            dt.record_sub_run(SubRunRecord {
+                run_id: format!("run-{next}"),
+                parent_run_id: format!("run-{i}"),
+                delegation_id: "ring".into(),
+                agent_id: format!("agent-{next}"),
+                depth: 1,
+            })
+            .await;
+        }
+
+        // Spawn mixed operations
+        let mut handles = Vec::new();
+        for i in 0..NUM_AGENTS {
+            let sender_addr = agents[i].0.clone();
+            let recv_addr = agents[(i + 1) % NUM_AGENTS].0.clone();
+            let router_clone = router.clone();
+            let ack_clone = ack_tracker.clone();
+            let dlq_clone = dlq.clone();
+
+            handles.push(tokio::spawn(async move {
+                for j in 0..OPS_PER_AGENT {
+                    let msg_id = format!("msg-{i}-{j}");
+
+                    // Create and send a message via router
+                    let mut msg = AgentMessage::new(
+                        sender_addr.clone(),
+                        MessageTarget::Direct { address: recv_addr.clone() },
+                        MessagePayload::Text {
+                            content: format!("Mixed op {i}-{j}"),
+                            summary: None,
+                        },
+                    );
+                    // Override the auto-generated ID for tracking
+                    msg.id = msg_id.clone();
+                    msg.requires_ack = true;
+                    
+                    let msg = Arc::new(msg);
+                    router_clone.send((*msg).clone()).await.unwrap();
+                    ack_clone.track(msg.clone()).await;
+
+                    // Randomly: ack, nack, or let timeout (simulate DLQ)
+                    match j % 3 {
+                        0 => {
+                            // Ack
+                            ack_clone.acknowledge(&msg_id).await;
+                        }
+                        1 => {
+                            // Nack (reject)
+                            ack_clone.reject(&msg_id, Some("test rejection".to_string())).await;
+                        }
+                        _ => {
+                            // Simulate dead-letter after "timeout"
+                            dlq_clone
+                                .store(
+                                    msg,
+                                    crate::messaging::dead_letter::DeadLetterReason::AckTimeout {
+                                        attempts: 3,
+                                    },
+                                    3,
+                                )
+                                .await;
+                        }
+                    }
+                }
+            }));
+        }
+
+        // Wait for all operations
+        for handle in handles {
+            handle.await.unwrap();
+        }
+
+        // Verify system didn't panic and DLQ has expected entries
+        let dlq_summary = dlq.reason_summary().await;
+        // We expect ~1/3 of total messages to be dead-lettered (every j%3==2)
+        // Due to integer rounding, allow some slack
+        let expected_dlq = (NUM_AGENTS * OPS_PER_AGENT) / 3;
+        assert!(
+            dlq_summary.total >= expected_dlq - 5 && dlq_summary.total <= expected_dlq + 5,
+            "Expected ~{expected_dlq} dead letters, got {}",
+            dlq_summary.total
+        );
+    }
 }
