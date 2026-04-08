@@ -5926,12 +5926,7 @@ async fn main() {
     // -c / --continue: resume most recent session
     // -r / --resume <ID>: resume specific session
     if continue_last || resume.is_some() {
-        let session_id = if let Some(ref id) = resume {
-            Some(id.as_str())
-        } else {
-            // -c: use last saved session from profile
-            None // will be resolved inside run_chat_repl from credentials
-        };
+        let session_id = resume.as_deref();
 
         // For -c, resolve the last session ID from credentials
         let resolved_sid = if continue_last && session_id.is_none() {

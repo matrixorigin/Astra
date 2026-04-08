@@ -743,6 +743,7 @@ async fn plan_executor_task(
                     pct: 100,
                     elapsed: plan_start.elapsed(),
                 });
+                return; // Plan is done — exit the execution loop
             } else {
                 let blocked: Vec<_> = ctx
                     .plan

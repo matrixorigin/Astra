@@ -825,7 +825,7 @@ pub(super) async fn run_print_mode(
         token: &token,
         message: &message,
         session_id: session_id.as_deref(),
-        model: model,
+        model,
         explain: ExplainMode::Off,
         render_md: false,
         history: &[],
@@ -863,7 +863,7 @@ pub(super) async fn run_print_mode(
                 token: &token,
                 message: &message,
                 session_id: None,
-                model: model,
+                model,
                 explain: ExplainMode::Off,
                 render_md: false,
                 history: &[],
@@ -1434,7 +1434,8 @@ fn config_list() -> Result<(), String> {
         return Ok(());
     }
 
-    println!("{:<20} {}", "Key", "Value");
+    let (hk, hv) = ("Key", "Value");
+    println!("{hk:<20} {hv}");
     println!("{}", "─".repeat(50));
     for (key, value) in &settings {
         let display = match value {

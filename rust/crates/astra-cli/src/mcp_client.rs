@@ -329,13 +329,12 @@ impl ClientHandler for ChangeHandler {
         }
     }
 
-    fn create_elicitation(
+    async fn create_elicitation(
         &self,
         request: CreateElicitationRequestParams,
         _context: RequestContext<RoleClient>,
-    ) -> impl std::future::Future<Output = Result<CreateElicitationResult, McpHandlerError>> + Send + '_
-    {
-        async move { do_elicitation(request).await }
+    ) -> Result<CreateElicitationResult, McpHandlerError> {
+        do_elicitation(request).await
     }
 
     fn list_roots(
