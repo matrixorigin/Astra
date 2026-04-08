@@ -21,6 +21,8 @@ use crate::server::delegation_engine::DelegationTracker;
 pub struct AgentMailbox {
     /// This agent's address.
     pub address: AgentAddress,
+    /// Delegation group this agent belongs to (if any).
+    pub delegation_id: Option<String>,
     /// Message receive stream (direct + broadcast), mutex-guarded for Sync.
     stream: tokio::sync::Mutex<Box<dyn MessageStream>>,
     /// Router reference for sending.
@@ -118,7 +120,7 @@ impl AgentMailboxRouter {
         delegation_id: Option<String>,
     ) -> Result<AgentMailbox, MailboxError> {
         self.transport
-            .register(addr.clone(), delegation_id)
+            .register(addr.clone(), delegation_id.clone())
             .await?;
 
         self.address_registry
@@ -130,6 +132,7 @@ impl AgentMailboxRouter {
 
         Ok(AgentMailbox {
             address: addr,
+            delegation_id,
             stream: tokio::sync::Mutex::new(stream),
             router: Arc::clone(self),
         })

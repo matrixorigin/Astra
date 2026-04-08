@@ -40,6 +40,9 @@ pub mod send_tool;
 pub mod transport;
 pub mod types;
 
+#[cfg(test)]
+mod integration_tests;
+
 // Re-export key types for convenience.
 pub use in_process::InProcessTransport;
 pub use router::{AgentMailbox, AgentMailboxRouter};
