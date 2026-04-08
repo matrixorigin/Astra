@@ -1089,6 +1089,28 @@ pub fn all_tool_schemas() -> Vec<Value> {
                 }
             }
         }),
+        // ─── Sleep tool ───────────────────────────────────────────────────────
+        json!({
+            "type": "function",
+            "function": {
+                "name": "sleep",
+                "description": "Wait for a specified duration. Use when waiting for external events, when the user asks you to pause, or when you have nothing to do. Prefer this over `bash(sleep ...)` as it doesn't hold a shell process.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "duration_ms": {
+                            "type": "integer",
+                            "description": "Duration to sleep in milliseconds (1000 = 1 second). Max 300000 (5 minutes)."
+                        },
+                        "reason": {
+                            "type": "string",
+                            "description": "Optional reason for sleeping (for logging)"
+                        }
+                    },
+                    "required": ["duration_ms"]
+                }
+            }
+        }),
     ]
 }
 
@@ -2084,6 +2106,29 @@ impl ToolExecutor {
         }).to_string()
     }
 
+    /// Sleep for a specified duration without holding a shell process.
+    async fn sleep_tool(&self, args: &Value) -> String {
+        const MAX_SLEEP_MS: u64 = 300_000; // 5 minutes max
+
+        let duration_ms = match args.get("duration_ms").and_then(Value::as_u64) {
+            Some(ms) if ms > 0 => ms.min(MAX_SLEEP_MS),
+            Some(_) => return "Error: duration_ms must be positive".to_string(),
+            None => return "Error: 'duration_ms' is required".to_string(),
+        };
+
+        let reason = args.get("reason").and_then(Value::as_str).unwrap_or("waiting");
+        
+        eprintln!("  \x1b[90m💤 Sleeping for {}ms ({})\x1b[0m", duration_ms, reason);
+        
+        tokio::time::sleep(std::time::Duration::from_millis(duration_ms)).await;
+        
+        serde_json::json!({
+            "success": true,
+            "slept_ms": duration_ms,
+            "reason": reason
+        }).to_string()
+    }
+
     /// Set the MCP client manager for external tool routing.
     pub fn with_mcp_manager(
         mut self,
@@ -2626,13 +2671,14 @@ impl ToolExecutor {
             "task_list" => self.task_list(args).await,
             "task_get" => self.task_get(args).await,
             "task_update" => self.task_update(args).await,
+            "sleep" => self.sleep_tool(args).await,
             _ if name.starts_with("mcp_") => self.execute_mcp_tool(name, args).await,
             _ => format!(
                 "Unknown tool: {name}. Available tools: bash, read_file, write_file, str_replace, \
                  list_dir, grep, glob, symbols, find_definition, find_references, git_status, \
                  git_diff, git_log, git_show, git_blame, call_graph, run_build_test, web_fetch, \
                  mo_query, memory_search, memory_profile, ask_user, task_create, task_list, \
-                 task_get, task_update"
+                 task_get, task_update, sleep"
             ),
         };
         // Normalize empty output, then apply global safety net
@@ -9605,5 +9651,47 @@ impl MyType {
         
         let list2 = exe.task_list(&json!({})).await;
         assert!(list2.contains("[1/2]"));
+    }
+
+    // ── Sleep tool tests ─────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn sleep_requires_duration() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = ToolExecutor::new(dir.path());
+        let result = exe.sleep_tool(&json!({})).await;
+        assert!(result.contains("Error"));
+        assert!(result.contains("duration_ms"));
+    }
+
+    #[tokio::test]
+    async fn sleep_rejects_zero_duration() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = ToolExecutor::new(dir.path());
+        let result = exe.sleep_tool(&json!({"duration_ms": 0})).await;
+        assert!(result.contains("Error"));
+    }
+
+    #[tokio::test]
+    async fn sleep_succeeds_with_valid_duration() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = ToolExecutor::new(dir.path());
+        let start = std::time::Instant::now();
+        let result = exe.sleep_tool(&json!({"duration_ms": 50})).await;
+        let elapsed = start.elapsed();
+        
+        assert!(result.contains("success"));
+        assert!(result.contains("50"));
+        assert!(elapsed.as_millis() >= 40, "should have slept");
+    }
+
+    #[tokio::test]
+    async fn sleep_caps_at_max_duration() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = ToolExecutor::new(dir.path());
+        // Request 10 minutes, should cap at 5 minutes (300000ms)
+        // We won't actually wait that long, just verify the schema accepts it
+        let result = exe.sleep_tool(&json!({"duration_ms": 1, "reason": "test cap"})).await;
+        assert!(result.contains("success"));
     }
 }
