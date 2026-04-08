@@ -36,6 +36,7 @@
 
 pub mod in_process;
 pub mod router;
+pub mod send_tool;
 pub mod transport;
 pub mod types;
 

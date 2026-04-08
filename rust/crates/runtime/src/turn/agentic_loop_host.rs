@@ -845,6 +845,11 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
         host.inject_tool_schema(delegate_tool_schema());
     }
 
+    // ─── Preamble: auto-inject send_message tool when mailbox is available ────
+    if state.mailbox.is_some() {
+        host.inject_tool_schema(crate::messaging::send_tool::send_message_tool_schema());
+    }
+
     // ─── Preamble: auto-inject skill tool when skills are available ──────
     // Register the skill tool schema once so the LLM knows the `skill` tool exists.
     // The skill listing is refreshed per-turn below (skills may change at runtime
@@ -1193,6 +1198,43 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
             &turn_result.accum.tool_calls
         } else {
             &remaining_tool_calls
+        };
+
+        // ─── Step 3b½: send_message interception ────────────────────────
+        // If the agent has a mailbox, intercept send_message tool calls and
+        // route them through the messaging system.
+        let post_send_tool_calls;
+        let effective_tool_calls = if state.mailbox.is_some() {
+            let mut msg_results: Vec<(String, String)> = Vec::new();
+            let mut remaining = Vec::new();
+            for tc in effective_tool_calls {
+                if crate::messaging::send_tool::is_send_message_call(tc) {
+                    if let Some((call_id, args)) =
+                        crate::messaging::send_tool::parse_send_message_call(tc)
+                    {
+                        let mailbox = state.mailbox.as_ref().unwrap();
+                        let result =
+                            crate::messaging::send_tool::execute_send_message(mailbox, &args)
+                                .await;
+                        msg_results.push((call_id, result));
+                    }
+                } else {
+                    remaining.push(tc.clone());
+                }
+            }
+            for (call_id, result_text) in &msg_results {
+                let tool_msg = serde_json::json!({
+                    "role": "tool",
+                    "tool_call_id": call_id,
+                    "content": result_text,
+                });
+                state.messages.push(tool_msg.clone());
+                state.tool_results.push(tool_msg);
+            }
+            post_send_tool_calls = remaining;
+            &post_send_tool_calls
+        } else {
+            effective_tool_calls
         };
 
         // ─── Step 3c: Skill interception ─────────────────────────────────
