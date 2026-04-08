@@ -976,6 +976,8 @@ struct ReplState {
     plan_in_token_stream: bool,
     /// Streaming markdown renderer for plan execution token output.
     plan_md_renderer: Option<streaming_md::StreamingMarkdown>,
+    /// Thinking preview pane for plan execution (reasoning visibility).
+    plan_thinking_pane: Option<effects::ThinkingPreviewPane>,
     /// Project-level instructions loaded from `.astra/instructions.md`.
     /// Injected into every turn's effective message as `<project_instructions>`.
     project_instructions: Option<String>,
@@ -1067,6 +1069,7 @@ impl Default for ReplState {
             pending_approval: None,
             plan_in_token_stream: false,
             plan_md_renderer: None,
+            plan_thinking_pane: None,
             project_instructions: None,
             // Create shared messaging infrastructure eagerly so /messaging always has data
             messaging_metrics: Some(std::sync::Arc::new(
@@ -3456,7 +3459,14 @@ fn display_plan_updates_live(
         in_stream: &mut bool,
         spinner: &mut Option<effects::PlanActivitySpinner>,
         md: &mut Option<streaming_md::StreamingMarkdown>,
+        thinking_pane: &mut Option<effects::ThinkingPreviewPane>,
     ) {
+        // Finalize thinking pane before any other output
+        if let Some(mut pane) = thinking_pane.take() {
+            let summary = pane.summary_line();
+            pane.clear();
+            eprintln!("{summary}");
+        }
         if *in_stream {
             *in_stream = false;
             if let Some(s) = spinner.take() {
@@ -3475,9 +3485,10 @@ fn display_plan_updates_live(
         spinner: &mut Option<effects::PlanActivitySpinner>,
         in_stream: &mut bool,
         md: &mut Option<streaming_md::StreamingMarkdown>,
+        thinking_pane: &mut Option<effects::ThinkingPreviewPane>,
         msg: String,
     ) {
-        finalize_plan_stream(in_stream, spinner, md);
+        finalize_plan_stream(in_stream, spinner, md, thinking_pane);
         if let Some(s) = spinner.take() {
             s.stop_clear();
         }
@@ -3585,7 +3596,7 @@ fn display_plan_updates_live(
                 if let Some(tx) = state.pending_approval.take() {
                     let _ = tx.send(false);
                 }
-                print_plan_monitor_line(plan_spinner, &mut state.plan_in_token_stream, &mut state.plan_md_renderer, msg);
+                print_plan_monitor_line(plan_spinner, &mut state.plan_in_token_stream, &mut state.plan_md_renderer, &mut state.plan_thinking_pane, msg);
                 // Auto-display delivery report if available
                 if let Some(ref report) = state.last_delivery_report {
                     eprintln!();
@@ -3617,7 +3628,7 @@ fn display_plan_updates_live(
                 if let Some(tx) = state.pending_approval.take() {
                     let _ = tx.send(false);
                 }
-                print_plan_monitor_line(plan_spinner, &mut state.plan_in_token_stream, &mut state.plan_md_renderer, msg);
+                print_plan_monitor_line(plan_spinner, &mut state.plan_in_token_stream, &mut state.plan_md_renderer, &mut state.plan_thinking_pane, msg);
                 if state.plan_mode.is_some() {
                     eprintln!(
                         "{}",
@@ -3663,7 +3674,7 @@ fn display_plan_updates_live(
                 continue;
             }
             PlanUpdate::VerificationReport(report) => {
-                finalize_plan_stream(&mut state.plan_in_token_stream, plan_spinner, &mut state.plan_md_renderer);
+                finalize_plan_stream(&mut state.plan_in_token_stream, plan_spinner, &mut state.plan_md_renderer, &mut state.plan_thinking_pane);
                 if let Some(s) = plan_spinner.take() {
                     s.stop_clear();
                 }
@@ -3715,7 +3726,7 @@ fn display_plan_updates_live(
                         (format!("  {icon} {name} ({dur}){summary}"), None)
                     }
                     StreamEvent::WaitingForModel => {
-                        finalize_plan_stream(&mut state.plan_in_token_stream, plan_spinner, &mut state.plan_md_renderer);
+                        finalize_plan_stream(&mut state.plan_in_token_stream, plan_spinner, &mut state.plan_md_renderer, &mut state.plan_thinking_pane);
                         if let Some(s) = plan_spinner.take() {
                             s.stop_clear();
                         }
@@ -3726,7 +3737,7 @@ fn display_plan_updates_live(
                         continue;
                     }
                     StreamEvent::ModelResponding => {
-                        finalize_plan_stream(&mut state.plan_in_token_stream, plan_spinner, &mut state.plan_md_renderer);
+                        finalize_plan_stream(&mut state.plan_in_token_stream, plan_spinner, &mut state.plan_md_renderer, &mut state.plan_thinking_pane);
                         if let Some(s) = plan_spinner.take() {
                             s.stop_clear();
                         }
@@ -3737,17 +3748,47 @@ fn display_plan_updates_live(
                         continue;
                     }
                     StreamEvent::Thinking(true) => {
-                        finalize_plan_stream(&mut state.plan_in_token_stream, plan_spinner, &mut state.plan_md_renderer);
+                        finalize_plan_stream(&mut state.plan_in_token_stream, plan_spinner, &mut state.plan_md_renderer, &mut state.plan_thinking_pane);
                         if let Some(s) = plan_spinner.take() {
                             s.stop_clear();
                         }
-                        *plan_spinner = Some(effects::PlanActivitySpinner::start(
-                            current_subtask_tag,
-                            "Thinking",
-                        ));
+                        // Start ThinkingPreviewPane if terminal supports it
+                        use std::io::IsTerminal;
+                        let rows = effects::thinking_viewport_rows();
+                        let tw = crossterm::terminal::size().map(|(w, _)| w as usize).unwrap_or(80);
+                        if rows > 0 && std::io::stdout().is_terminal() {
+                            state.plan_thinking_pane = Some(effects::ThinkingPreviewPane::new(rows, tw));
+                        } else {
+                            // Fallback: spinner-only for non-terminal
+                            *plan_spinner = Some(effects::PlanActivitySpinner::start(
+                                current_subtask_tag,
+                                "Thinking",
+                            ));
+                        }
+                        continue;
+                    }
+                    StreamEvent::ThinkingChunk(text) => {
+                        if let Some(ref mut pane) = state.plan_thinking_pane {
+                            pane.push_chunk(&text);
+                        }
+                        continue;
+                    }
+                    StreamEvent::Thinking(false) => {
+                        // Stop thinking pane, print summary
+                        if let Some(mut pane) = state.plan_thinking_pane.take() {
+                            let summary = pane.summary_line();
+                            pane.clear();
+                            eprintln!("{summary}");
+                        }
                         continue;
                     }
                     StreamEvent::Token(text) => {
+                        // Finalize thinking pane before token stream starts
+                        if let Some(mut pane) = state.plan_thinking_pane.take() {
+                            let summary = pane.summary_line();
+                            pane.clear();
+                            eprintln!("{summary}");
+                        }
                         if !state.plan_in_token_stream {
                             if let Some(s) = plan_spinner.take() {
                                 s.stop_clear();
@@ -3762,15 +3803,13 @@ fn display_plan_updates_live(
                         continue;
                     }
                     StreamEvent::StatusLine(line) => {
-                        finalize_plan_stream(&mut state.plan_in_token_stream, plan_spinner, &mut state.plan_md_renderer);
+                        finalize_plan_stream(&mut state.plan_in_token_stream, plan_spinner, &mut state.plan_md_renderer, &mut state.plan_thinking_pane);
                         if let Some(s) = plan_spinner.take() {
                             s.stop_clear();
                         }
                         eprintln!("    {line}");
                         continue;
                     }
-                    // ThinkingChunk, Thinking(false) — skip
-                    _ => continue,
                 }
             }
             PlanUpdate::ApprovalNeeded {
@@ -3792,20 +3831,20 @@ fn display_plan_updates_live(
                     detail.as_deref().unwrap_or(""),
                     reason,
                 );
-                print_plan_monitor_line(plan_spinner, &mut state.plan_in_token_stream, &mut state.plan_md_renderer, msg);
+                print_plan_monitor_line(plan_spinner, &mut state.plan_in_token_stream, &mut state.plan_md_renderer, &mut state.plan_thinking_pane, msg);
                 // Store the response channel for the REPL readline handler.
                 // The next user input line will be interpreted as y/n/a to resolve this.
                 state.pending_approval = Some(response_tx);
                 let prompt_msg =
                     "   Type y(es) to approve, n(o) to deny, !(auto-run all):".to_string();
-                print_plan_monitor_line(plan_spinner, &mut state.plan_in_token_stream, &mut state.plan_md_renderer, prompt_msg);
+                print_plan_monitor_line(plan_spinner, &mut state.plan_in_token_stream, &mut state.plan_md_renderer, &mut state.plan_thinking_pane, prompt_msg);
                 continue;
             }
             _ => continue, // ParallelGroupInfo, StepByStepPrompt — future use
         };
 
         // Print the message (stops spinner internally)
-        print_plan_monitor_line(plan_spinner, &mut state.plan_in_token_stream, &mut state.plan_md_renderer, msg);
+        print_plan_monitor_line(plan_spinner, &mut state.plan_in_token_stream, &mut state.plan_md_renderer, &mut state.plan_thinking_pane, msg);
 
         // Optionally start a new spinner after the printed line
         if let Some(label) = post_spinner {
@@ -3820,6 +3859,10 @@ fn display_plan_updates_live(
                 spinner_label,
             ));
         }
+    }
+    // Tick thinking pane header (elapsed time) after draining all events
+    if let Some(ref mut pane) = state.plan_thinking_pane {
+        pane.tick();
     }
     outcome
 }
@@ -3936,6 +3979,9 @@ fn cleanup_orphan_plan_executor(state: &mut ReplState, plan_spinner: &mut Option
     if let Some(s) = plan_spinner.take() {
         s.stop_clear();
     }
+    if let Some(mut pane) = state.plan_thinking_pane.take() {
+        pane.clear();
+    }
     if let Some(mut h) = state.plan_handle.take() {
         while h.try_recv().is_some() {}
     }
@@ -4035,6 +4081,9 @@ async fn run_blocking_plan_monitor(state: &mut ReplState) {
                         if let Some(s) = plan_spinner.take() {
                             s.stop_clear();
                         }
+                        if let Some(mut pane) = state.plan_thinking_pane.take() {
+                            pane.clear();
+                        }
                         eprintln!(
                             "\n{}  Second interrupt — cancelling plan.",
                             "⏹".yellow()
@@ -4043,6 +4092,9 @@ async fn run_blocking_plan_monitor(state: &mut ReplState) {
                         let _ = handle.send_command(plan_executor::PlanCommand::Pause);
                         if let Some(s) = plan_spinner.take() {
                             s.stop_clear();
+                        }
+                        if let Some(mut pane) = state.plan_thinking_pane.take() {
+                            pane.clear();
                         }
                         eprintln!(
                             "\n{}  Pausing plan… (current subtask will finish first). Press Ctrl-C again within {}s to cancel.",
@@ -4058,6 +4110,9 @@ async fn run_blocking_plan_monitor(state: &mut ReplState) {
 
     if let Some(s) = plan_spinner.take() {
         s.stop_clear();
+    }
+    if let Some(mut pane) = state.plan_thinking_pane.take() {
+        pane.clear();
     }
 
     // Show pause hints when returning to the REPL prompt after a pause.
