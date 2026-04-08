@@ -8,7 +8,7 @@
 
 use async_trait::async_trait;
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use astra_core::SkillSearchSettings;
@@ -30,6 +30,43 @@ use super::permission_manager::PermissionMode;
 use super::skill_subrun::SubRunHost;
 
 const DELEGATE_MAX_TURNS: usize = 25;
+
+// ─── Worktree Path Validation ───────────────────────────────────────────────
+
+/// Resolve worktree path from delegation context with security validation.
+///
+/// Returns the agent-specific worktree path if:
+/// 1. The context contains a `worktree_path_{agent_id}` entry
+/// 2. The path canonicalizes to a location under the worktree base directory
+///
+/// Falls back to `default_root` if no valid worktree path is found.
+///
+/// Security: Canonicalizes paths to defeat symlink TOCTOU attacks.
+fn resolve_worktree_path(
+    context: &HashMap<String, serde_json::Value>,
+    agent_id: &str,
+    worktree_base: &Path,
+    default_root: &Path,
+) -> PathBuf {
+    context
+        .get(&format!("worktree_path_{}", agent_id))
+        .and_then(|v| v.as_str())
+        .and_then(|path| {
+            let p = PathBuf::from(path);
+            // Canonicalize both paths to resolve symlinks before comparison
+            match (p.canonicalize(), worktree_base.canonicalize()) {
+                (Ok(canon_p), Ok(canon_base)) if canon_p.starts_with(&canon_base) => Some(p),
+                _ => {
+                    eprintln!(
+                        "[delegate] ignoring untrusted worktree_path for {}: {}",
+                        agent_id, path
+                    );
+                    None
+                }
+            }
+        })
+        .unwrap_or_else(|| default_root.to_path_buf())
+}
 
 // ─── CliDelegateSubRunExecutor ──────────────────────────────────────────────
 
@@ -106,31 +143,13 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
         // T-9: Worktree CWD injection — when team isolation provides a per-agent
         // worktree path via context, use it as the working directory instead of
         // the shared project root. This enables file-system isolation between agents.
-        //
-        // Security: Canonicalize paths to defeat symlink TOCTOU attacks.
-        // Only accept paths that resolve under the system temp dir's worktree base.
         let worktree_base = astra_core::worktree_base_path();
-        let effective_root = config
-            .context
-            .get(&format!("worktree_path_{}", profile.agent_id))
-            .and_then(|v| v.as_str())
-            .and_then(|path| {
-                let p = PathBuf::from(path);
-                // Canonicalize both paths to resolve symlinks before comparison
-                match (p.canonicalize(), worktree_base.canonicalize()) {
-                    (Ok(canon_p), Ok(canon_base)) if canon_p.starts_with(&canon_base) => {
-                        Some(p)
-                    }
-                    _ => {
-                        eprintln!(
-                            "[delegate] ignoring untrusted worktree_path for {}: {}",
-                            profile.agent_id, path
-                        );
-                        None
-                    }
-                }
-            })
-            .unwrap_or_else(|| self.project_root.clone());
+        let effective_root = resolve_worktree_path(
+            &config.context,
+            &profile.agent_id,
+            &worktree_base,
+            &self.project_root,
+        );
 
         let mut host = SubRunHost {
             api: self.api.clone(),
@@ -464,5 +483,118 @@ mod tests {
             let profile = registry.get(id).unwrap();
             assert_eq!(profile.tier, astra_services::coordination::AgentTier::User);
         }
+    }
+
+    // ─── Worktree Path Resolution Tests ────────────────────────────────────
+
+    #[test]
+    fn resolve_worktree_path_returns_default_when_missing() {
+        let ctx = HashMap::new();
+        let default = PathBuf::from("/project/root");
+        let base = PathBuf::from("/tmp/worktrees");
+
+        let result = resolve_worktree_path(&ctx, "agent-a", &base, &default);
+        assert_eq!(result, default);
+    }
+
+    #[test]
+    fn resolve_worktree_path_returns_default_on_non_string_value() {
+        let mut ctx = HashMap::new();
+        ctx.insert(
+            "worktree_path_agent-b".to_string(),
+            serde_json::json!(12345), // not a string
+        );
+        let default = PathBuf::from("/project/root");
+        let base = PathBuf::from("/tmp/worktrees");
+
+        let result = resolve_worktree_path(&ctx, "agent-b", &base, &default);
+        assert_eq!(result, default);
+    }
+
+    #[test]
+    fn resolve_worktree_path_accepts_valid_worktree_under_base() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().to_path_buf();
+        let agent_wt = base.join("agent-c-wt");
+        std::fs::create_dir_all(&agent_wt).unwrap();
+
+        let mut ctx = HashMap::new();
+        ctx.insert(
+            "worktree_path_agent-c".to_string(),
+            serde_json::json!(agent_wt.to_string_lossy()),
+        );
+        let default = PathBuf::from("/project/root");
+
+        let result = resolve_worktree_path(&ctx, "agent-c", &base, &default);
+        assert_eq!(result, agent_wt);
+    }
+
+    #[test]
+    fn resolve_worktree_path_rejects_path_outside_base() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("worktrees");
+        std::fs::create_dir_all(&base).unwrap();
+
+        // Attempt escape: path is outside the worktree base
+        let escape_path = tmp.path().join("malicious");
+        std::fs::create_dir_all(&escape_path).unwrap();
+
+        let mut ctx = HashMap::new();
+        ctx.insert(
+            "worktree_path_agent-d".to_string(),
+            serde_json::json!(escape_path.to_string_lossy()),
+        );
+        let default = PathBuf::from("/project/root");
+
+        let result = resolve_worktree_path(&ctx, "agent-d", &base, &default);
+        // Should fall back to default
+        assert_eq!(result, default);
+    }
+
+    #[test]
+    fn resolve_worktree_path_rejects_symlink_escape() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("worktrees");
+        std::fs::create_dir_all(&base).unwrap();
+
+        // Create a directory outside the base
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+
+        // Create a symlink inside the base that points outside
+        let symlink_path = base.join("escape-link");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&outside, &symlink_path).unwrap();
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_dir(&outside, &symlink_path).unwrap();
+
+        let mut ctx = HashMap::new();
+        ctx.insert(
+            "worktree_path_agent-e".to_string(),
+            serde_json::json!(symlink_path.to_string_lossy()),
+        );
+        let default = PathBuf::from("/project/root");
+
+        let result = resolve_worktree_path(&ctx, "agent-e", &base, &default);
+        // Canonicalization should reveal the escape; fall back to default
+        assert_eq!(result, default);
+    }
+
+    #[test]
+    fn resolve_worktree_path_rejects_nonexistent_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().to_path_buf();
+        let nonexistent = base.join("does-not-exist");
+
+        let mut ctx = HashMap::new();
+        ctx.insert(
+            "worktree_path_agent-f".to_string(),
+            serde_json::json!(nonexistent.to_string_lossy()),
+        );
+        let default = PathBuf::from("/project/root");
+
+        let result = resolve_worktree_path(&ctx, "agent-f", &base, &default);
+        // Canonicalize fails on nonexistent path; fall back to default
+        assert_eq!(result, default);
     }
 }
