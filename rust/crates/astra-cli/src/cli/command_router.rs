@@ -101,6 +101,7 @@ pub(super) async fn execute_cli_command(
                 skill_search: &skill_search,
                 skill_quality_tracker: &mut skill_qt,
                 discovered_skills: None,
+                messaging_metrics: None,
             })
             .await
             {
@@ -137,6 +138,7 @@ pub(super) async fn execute_cli_command(
                         skill_search: &skill_search,
                         skill_quality_tracker: &mut skill_qt,
                         discovered_skills: None,
+                        messaging_metrics: None,
                     })
                     .await
                     .map_err(|f| f.error)?
@@ -393,6 +395,7 @@ pub(super) async fn execute_cli_command(
                 skill_search: &skill_search,
                 skill_quality_tracker: &mut skill_qt,
                 discovered_skills: None,
+                messaging_metrics: None,
             })
             .await
             {
@@ -429,6 +432,7 @@ pub(super) async fn execute_cli_command(
                         skill_search: &skill_search,
                         skill_quality_tracker: &mut skill_qt,
                         discovered_skills: None,
+                        messaging_metrics: None,
                     })
                     .await
                     .map_err(|f| f.error)?
@@ -878,6 +882,7 @@ pub(super) async fn run_print_mode(
         skill_search: &skill_search,
         skill_quality_tracker: &mut skill_qt,
         discovered_skills: None,
+        messaging_metrics: None,
     })
     .await
     {
@@ -916,6 +921,7 @@ pub(super) async fn run_print_mode(
                 skill_search: &skill_search,
                 skill_quality_tracker: &mut skill_qt,
                 discovered_skills: None,
+                messaging_metrics: None,
             })
             .await
             .map_err(|f| f.error)?

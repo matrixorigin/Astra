@@ -1087,6 +1087,7 @@ pub(super) async fn handle_info_command(
                 skill_search: &state.skill_search,
                 skill_quality_tracker: &mut state.skill_quality_tracker,
                 discovered_skills: None,
+                messaging_metrics: state.messaging_metrics.clone(),
             })
             .await
             .map_err(|f| f.error)?;

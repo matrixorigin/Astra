@@ -344,7 +344,7 @@ pub(crate) async fn stream_chat_sse(
         mailbox: None,
         ack_tracker: None,
         dead_letter_queue: None,
-            messaging_metrics: None,
+        messaging_metrics: p.messaging_metrics.clone(),
     };
 
     // ─── Run the runtime loop ────────────────────────────────────────────
