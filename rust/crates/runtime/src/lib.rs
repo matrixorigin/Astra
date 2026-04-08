@@ -54,6 +54,7 @@ pub mod jobs;
 pub mod marketplace;
 pub mod messaging;
 pub(crate) mod models;
+pub mod orchestration;
 pub mod replay;
 pub mod sandbox;
 pub mod semantic_dedup;
