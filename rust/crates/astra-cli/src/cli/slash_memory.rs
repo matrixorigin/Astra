@@ -1,5 +1,5 @@
 use super::*;
-use crate::sse_utils::collect_sse_text;
+use crate::sse_utils::{collect_sse_text, stream_sse_markdown};
 use astra_runtime::plan_decompose;
 
 /// Non-interactive plan decomposition (same `/chat/turn` + [`plan_decompose::parse_plan_response`] path as `/plan enter`).
@@ -46,7 +46,11 @@ pub(crate) async fn headless_plan_decompose(
         return Err(format!("LLM request failed ({status}): {body}"));
     }
 
-    let collected = collect_sse_text(resp, false).await;
+    let collected = if quiet {
+        collect_sse_text(resp, false).await
+    } else {
+        stream_sse_markdown(resp).await
+    };
     if collected.event_types.iter().any(|t| t == "error") && collected.text.trim().is_empty() {
         return Err("LLM stream returned an error event with no text".to_string());
     }
@@ -490,15 +494,10 @@ pub(super) async fn handle_memory_domain_command(
 
                     match api.post_chat_turn(tok, &payload).await {
                         Ok(resp) if resp.status().is_success() => {
-                            let sse_result = collect_sse_text(resp, true).await;
-                            eprintln!(); // End streaming output
+                            let sse_result = stream_sse_markdown(resp).await;
 
-                            // Parse the plan from the response
                             match plan_decompose::parse_plan_response(&sse_result.text) {
-                                Ok(plan) => {
-                                    eprintln!();
-                                    eprint!("{}", plan_decompose::format_plan(&plan));
-                                }
+                                Ok(_plan) => {}
                                 Err(e) => {
                                     eprint_plan_json_parse_failed(&sse_result.text, &e);
                                 }
@@ -1492,7 +1491,7 @@ async fn _old_handle_plan_mode_input(
     use plan_decompose::{
         ClarificationAnswer, PendingClarifications, PlanEntryChoice, PlanModeState,
         decomposition_prompt, detect_clarification_questions, format_clarification_question,
-        format_plan, format_project_context, parse_clarification_response, parse_plan_entry_choice,
+        format_project_context, parse_clarification_response, parse_plan_entry_choice,
         parse_plan_response,
     };
 
@@ -1573,41 +1572,17 @@ async fn _old_handle_plan_mode_input(
 
         let resp = api.post_chat_turn(tok, &payload).await;
 
+        eprintln!();
         match resp {
             Ok(r) if r.status().is_success() => {
-                let mut full_text = String::new();
-                let mut stream = r.bytes_stream();
-                use futures_util::StreamExt;
+                let sse_result = stream_sse_markdown(r).await;
+                let full_text = sse_result.text;
 
-                eprintln!("  {} Thinking...", "🧠".cyan());
-
-                while let Some(chunk) = stream.next().await {
-                    if let Ok(bytes) = chunk {
-                        let event_str = String::from_utf8_lossy(&bytes);
-                        for line in event_str.lines() {
-                            if let Some(data) = line.strip_prefix("data: ")
-                                && let Ok(json) = serde_json::from_str::<serde_json::Value>(data)
-                                && let Some(content) = json.get("content").and_then(|v| v.as_str())
-                            {
-                                full_text.push_str(content);
-                            }
-                        }
-                    }
-                }
-
-                // Parse and set plan (no clarification check in regeneration)
                 match parse_plan_response(&full_text) {
                     Ok(plan) => {
                         plan_state.set_plan(plan);
                         let _ = plan_state.save_to_file(&PlanModeState::state_path());
-
-                        eprintln!();
-                        eprintln!("{}", format_plan(&plan_state.plan));
-                        eprintln!();
-                        eprintln!("  {} Commands:", "💡".cyan());
-                        eprintln!("    'go' or 'execute' → Run the plan");
-                        eprintln!("    'step' → Run step-by-step with confirmation");
-                        eprintln!("    Or describe changes to modify the plan");
+                        plan_interaction::eprint_plan_commands_help();
                     }
                     Err(e) => {
                         eprint_plan_json_parse_failed(&full_text, &e.to_string());
@@ -1684,14 +1659,10 @@ async fn _old_handle_plan_mode_input(
 
                 plan_state.goal = goal.clone();
 
-                // Show project context
-                eprintln!();
-                eprintln!("{}", format_project_context(&plan_state.context));
-                eprintln!();
-
-                // Streaming plan generation with real-time output
-                eprintln!("  {} Thinking...", "🧠".cyan());
-                eprintln!();
+                if state.verbose_mode {
+                    eprintln!();
+                    eprintln!("{}", format_project_context(&plan_state.context));
+                }
 
                 enrich_with_templates(
                     &mut plan_state.context,
@@ -1707,76 +1678,15 @@ async fn _old_handle_plan_mode_input(
                     "session_id": state.session_id.clone(),
                 });
 
+                eprintln!();
                 let resp = api.post_chat_turn(tok, &payload).await;
 
                 match resp {
                     Ok(r) if r.status().is_success() => {
-                        let mut full_text = String::new();
-                        let mut stream = r.bytes_stream();
-                        use futures_util::StreamExt;
+                        let sse_result = stream_sse_markdown(r).await;
+                        let full_text = sse_result.text;
 
-                        // Track streaming state
-                        let mut in_thinking = false;
-                        let mut in_plan_json = false;
-                        let mut chars_since_nl = 0;
-
-                        while let Some(chunk) = stream.next().await {
-                            if let Ok(bytes) = chunk {
-                                let event_str = String::from_utf8_lossy(&bytes);
-                                for line in event_str.lines() {
-                                    if let Some(data) = line.strip_prefix("data: ")
-                                        && let Ok(json) =
-                                            serde_json::from_str::<serde_json::Value>(data)
-                                        && json.get("type").and_then(|v| v.as_str())
-                                            == Some("text_delta")
-                                        && let Some(content) =
-                                            json.get("content").and_then(|v| v.as_str())
-                                    {
-                                        full_text.push_str(content);
-
-                                        // Stream thinking process to user (before JSON)
-                                        for ch in content.chars() {
-                                            // Detect start of JSON plan
-                                            if ch == '{' && !in_thinking && !in_plan_json {
-                                                in_plan_json = true;
-                                                eprintln!();
-                                                eprintln!();
-                                                eprint!("  {} Parsing plan", "⚙".dim());
-                                                continue;
-                                            }
-
-                                            if in_plan_json {
-                                                // Show progress dots during JSON parsing
-                                                if ch == ',' || ch == '}' {
-                                                    eprint!(".");
-                                                }
-                                                continue;
-                                            }
-
-                                            // Stream thinking text
-                                            if !in_thinking && chars_since_nl == 0 {
-                                                in_thinking = true;
-                                                eprint!("  ");
-                                            }
-
-                                            eprint!("{}", ch);
-
-                                            if ch == '\n' {
-                                                chars_since_nl = 0;
-                                                in_thinking = false;
-                                            } else {
-                                                chars_since_nl += 1;
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        eprintln!();
-
-                        // Check for clarification questions first
                         if let Some(questions) = detect_clarification_questions(&full_text) {
-                            // LLM is asking for clarification instead of producing plan
                             eprintln!();
                             eprintln!(
                                 "  {} Need clarification before generating plan:",
@@ -1790,23 +1700,14 @@ async fn _old_handle_plan_mode_input(
                             };
                             plan_state.pending_clarifications = Some(pending);
 
-                            // Show first question
                             eprint!("{}", format_clarification_question(&questions[0]));
                             let _ = plan_state.save_to_file(&PlanModeState::state_path());
                         } else {
-                            // Parse and set plan
                             match parse_plan_response(&full_text) {
                                 Ok(plan) => {
                                     plan_state.set_plan(plan);
                                     let _ = plan_state.save_to_file(&PlanModeState::state_path());
-
-                                    eprintln!();
-                                    eprintln!("{}", format_plan(&plan_state.plan));
-                                    eprintln!();
-                                    eprintln!("  {} Commands:", "💡".cyan());
-                                    eprintln!("    'go' or 'execute' → Run the plan");
-                                    eprintln!("    'step' → Run step-by-step with confirmation");
-                                    eprintln!("    Or describe changes to modify the plan");
+                                    plan_interaction::eprint_plan_commands_help();
                                 }
                                 Err(e) => {
                                     eprint_plan_json_parse_failed(&full_text, &e.to_string());
@@ -2029,15 +1930,11 @@ async fn _old_handle_plan_mode_input(
     let prompt = plan_state.plan_mode_prompt(&input);
     plan_state.add_turn(&input, ""); // Will update assistant part after response
 
-    // Show thinking indicator
-    eprint!("  ● Thinking...");
-
     let Some(tok) = token else {
-        eprintln!("\r  ✗ Not logged in. Run /login first.");
+        eprintln!("  {} Not logged in. Run /login first.", theme::icon_err());
         return Ok(());
     };
 
-    // Call LLM via SSE (match the format used by /plan decompose)
     let messages = vec![serde_json::json!({
         "role": "user",
         "content": prompt
@@ -2045,27 +1942,22 @@ async fn _old_handle_plan_mode_input(
 
     let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
 
-    // Don't pass session_id for plan mode - let server create ephemeral session
-    // This avoids "Session not found" errors since plan mode is self-contained
     let payload = serde_json::json!({
         "messages": messages,
         "model": state.model.clone(),
         "edge_profile": {
             "cwd": cwd.to_string_lossy(),
         },
-        "edge_tools": [],  // No tools needed for plan editing
+        "edge_tools": [],
     });
 
     let resp = api.post_chat_turn(tok, &payload).await;
 
+    eprintln!();
     match resp {
         Ok(r) if r.status().is_success() => {
-            let sse_result = collect_sse_text(r, false).await;
+            let sse_result = stream_sse_markdown(r).await;
 
-            // Clear thinking indicator
-            eprint!("\r                    \r");
-
-            // Debug: show response info
             if sse_result.text.is_empty() {
                 if sse_result.event_count == 0 {
                     eprintln!(
@@ -2082,33 +1974,28 @@ async fn _old_handle_plan_mode_input(
                 }
             }
 
-            // Try to parse plan update from LLM response
-            let plan_updated = if !sse_result.text.is_empty() {
-                match parse_plan_response(&sse_result.text) {
-                    Ok(plan) => {
-                        plan_state.set_plan(plan.clone());
+            if !sse_result.text.is_empty() {
+                match plan_interaction::try_replace_plan_from_llm_json(&sse_result.text, plan_state) {
+                    Ok(true) => {
                         plan_state.modified = true;
-                        // Save updated state for recovery
                         let _ = plan_state.save_to_file(&PlanModeState::state_path());
-                        eprintln!("{}  Plan updated!", theme::icon_ok());
-                        eprintln!();
-                        let formatted = format_plan(&plan);
-                        eprintln!("{formatted}");
-                        true
                     }
-                    Err(_) => false, // No valid plan JSON — treat as conversational response
+                    Ok(false) => {}
+                    Err(e) => {
+                        eprintln!(
+                            "  {} Model reply is not valid plan JSON: {}",
+                            theme::icon_warn(),
+                            e
+                        );
+                        eprintln!(
+                            "  {} Plan unchanged. Try {} for the current plan.",
+                            "⋯".dim(),
+                            "show".cyan()
+                        );
+                    }
                 }
-            } else {
-                false
-            };
-
-            // Show the LLM text response (skip if we already displayed the plan)
-            if !sse_result.text.is_empty() && !plan_updated {
-                eprintln!();
-                eprintln!("{}", sse_result.text.trim());
             }
 
-            // Update history with assistant response
             if let Some(last) = plan_state.history.last_mut() {
                 last.1 = sse_result.text.chars().take(500).collect();
             }

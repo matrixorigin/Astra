@@ -5,12 +5,32 @@
 //! natural-language plan editing via LLM.
 
 use super::*;
-use crate::sse_utils::collect_sse_text;
+use crate::sse_utils::stream_sse_markdown;
 use astra_runtime::plan::PlanCommand;
 use astra_runtime::plan;
 use astra_runtime::plan::progress_bar_segments;
 use astra_services::session_journal;
 use crossterm::style::Stylize;
+
+/// Replace `plan_state.plan` when `text` is non-empty valid plan JSON.
+///
+/// Returns `Ok(false)` if `text` is empty or whitespace only; `Ok(true)` if the plan
+/// was replaced; `Err` if the text is non-empty but not valid plan JSON.
+pub(crate) fn try_replace_plan_from_llm_json(
+    text: &str,
+    plan_state: &mut plan::PlanModeState,
+) -> Result<bool, String> {
+    if text.trim().is_empty() {
+        return Ok(false);
+    }
+    match plan::parse_plan_response(text) {
+        Ok(plan) => {
+            plan_state.set_plan(plan);
+            Ok(true)
+        }
+        Err(e) => Err(e),
+    }
+}
 
 /// Enrich a `ProjectContext` with learned plan templates from cloud storage.
 pub(super) async fn enrich_with_templates(
@@ -177,8 +197,8 @@ pub async fn handle_plan_mode_input(
     use plan::{
         ClarificationAnswer, PlanEntryChoice, PlanModeState,
         decomposition_prompt, format_clarification_question,
-        format_plan_markdown, parse_clarification_response,
-        parse_plan_entry_choice, parse_plan_response,
+        parse_clarification_response, parse_plan_entry_choice,
+        parse_plan_response,
     };
 
     let plan_state = match state.plan_mode.as_mut() {
@@ -253,13 +273,13 @@ pub async fn handle_plan_mode_input(
             "session_id": state.session_id.clone(),
         });
 
-        let spinner = effects::Spinner::start_immediate("Thinking".into());
+        eprintln!();
         let resp = api.post_chat_turn(tok, &payload).await;
 
         match resp {
             Ok(r) if r.status().is_success() => {
-                let full_text = collect_sse_text(r, false).await.text;
-                spinner.stop_clear();
+                let sse_result = stream_sse_markdown(r).await;
+                let full_text = sse_result.text;
 
                 match parse_plan_response(&full_text) {
                     Ok(plan) => {
@@ -273,8 +293,6 @@ pub async fn handle_plan_mode_input(
                             None,
                         );
 
-                        eprintln!();
-                        eprintln!("{}", format_plan_markdown(&plan_state.plan, Some(&plan_state.goal)));
                         eprint_plan_commands_help();
                     }
                     Err(e) => {
@@ -283,11 +301,9 @@ pub async fn handle_plan_mode_input(
                 }
             }
             Ok(r) => {
-                spinner.stop_clear();
                 eprintln!("  {} LLM call failed ({})", theme::icon_err(), r.status());
             }
             Err(e) => {
-                spinner.stop_clear();
                 eprintln!("  {} Request failed: {}", theme::icon_err(), e);
             }
         }
@@ -443,8 +459,6 @@ pub async fn handle_plan_mode_input(
         return Ok(());
     };
 
-    let spinner = effects::Spinner::start_immediate("Thinking".into());
-
     let messages = vec![serde_json::json!({
         "role": "user",
         "content": prompt
@@ -461,12 +475,12 @@ pub async fn handle_plan_mode_input(
         "edge_tools": [],
     });
 
+    eprintln!();
     let resp = api.post_chat_turn(tok, &payload).await;
 
     match resp {
         Ok(r) if r.status().is_success() => {
-            let sse_result = collect_sse_text(r, false).await;
-            spinner.stop_clear();
+            let sse_result = stream_sse_markdown(r).await;
 
             if sse_result.text.is_empty() {
                 if sse_result.event_count == 0 {
@@ -484,11 +498,10 @@ pub async fn handle_plan_mode_input(
                 }
             }
 
-            let plan_updated = if !sse_result.text.is_empty() {
-                match parse_plan_response(&sse_result.text) {
-                    Ok(plan) => {
-                        let plan_state = state.plan_mode.as_mut().unwrap();
-                        plan_state.set_plan(plan.clone());
+            if !sse_result.text.is_empty() {
+                let plan_state = state.plan_mode.as_mut().unwrap();
+                match try_replace_plan_from_llm_json(&sse_result.text, plan_state) {
+                    Ok(true) => {
                         plan_state.modified = true;
                         let _ = plan_state.save_to_file(&PlanModeState::state_path());
 
@@ -498,25 +511,24 @@ pub async fn handle_plan_mode_input(
                             &format!("Plan edited: {}", input.chars().take(80).collect::<String>()),
                             Some(serde_json::json!({
                                 "instruction": input.chars().take(200).collect::<String>(),
-                                "subtask_count": plan.subtasks.len(),
+                                "subtask_count": plan_state.plan.subtasks.len(),
                             })),
                         );
-
-                        eprintln!("{}  Plan updated!", theme::icon_ok());
-                        eprintln!();
-                        let formatted = format_plan_markdown(&plan, None);
-                        eprintln!("{formatted}");
-                        true
                     }
-                    Err(_) => false,
+                    Ok(false) => {}
+                    Err(e) => {
+                        eprintln!(
+                            "  {} Model reply is not valid plan JSON: {}",
+                            theme::icon_warn(),
+                            e
+                        );
+                        eprintln!(
+                            "  {} Plan unchanged. Try {} for the current plan.",
+                            "⋯".dim(),
+                            "show".cyan()
+                        );
+                    }
                 }
-            } else {
-                false
-            };
-
-            if !sse_result.text.is_empty() && !plan_updated {
-                eprintln!();
-                eprintln!("{}", sse_result.text.trim());
             }
 
             if let Some(plan_state) = state.plan_mode.as_mut() {
@@ -526,11 +538,9 @@ pub async fn handle_plan_mode_input(
             }
         }
         Ok(r) => {
-            spinner.stop_clear();
             eprintln!("  {} LLM call failed ({})", theme::icon_err(), r.status());
         }
         Err(e) => {
-            spinner.stop_clear();
             eprintln!("  {} Request failed: {e}", theme::icon_err());
         }
     }
@@ -1014,7 +1024,7 @@ async fn handle_goal_submission(
     use plan::{
         PendingClarifications, PlanModeState, decomposition_prompt,
         detect_clarification_questions, format_clarification_question,
-        format_plan_markdown, format_project_context, parse_plan_response,
+        format_project_context, parse_plan_response,
     };
 
     let Some(tok) = token else {
@@ -1034,10 +1044,10 @@ async fn handle_goal_submission(
         })),
     );
 
-    eprintln!();
-    eprintln!("{}", format_project_context(&plan_state.context));
-
-    let spinner = effects::Spinner::start_immediate("Thinking".into());
+    if state.verbose_mode {
+        eprintln!();
+        eprintln!("{}", format_project_context(&plan_state.context));
+    }
 
     enrich_with_templates(
         &mut plan_state.context,
@@ -1053,12 +1063,13 @@ async fn handle_goal_submission(
         "session_id": state.session_id.clone(),
     });
 
+    eprintln!();
     let resp = api.post_chat_turn(tok, &payload).await;
 
     match resp {
         Ok(r) if r.status().is_success() => {
-            let full_text = collect_sse_text(r, false).await.text;
-            spinner.stop_clear();
+            let sse_result = stream_sse_markdown(r).await;
+            let full_text = sse_result.text;
 
             if let Some(questions) = detect_clarification_questions(&full_text) {
                 eprintln!();
@@ -1093,8 +1104,6 @@ async fn handle_goal_submission(
                             })),
                         );
 
-                        eprintln!();
-                        eprintln!("{}", format_plan_markdown(&plan_state.plan, Some(&plan_state.goal)));
                         eprint_plan_commands_help();
                     }
                     Err(e) => {
@@ -1104,11 +1113,9 @@ async fn handle_goal_submission(
             }
         }
         Ok(r) => {
-            spinner.stop_clear();
             eprintln!("  {} LLM call failed ({})", theme::icon_err(), r.status());
         }
         Err(e) => {
-            spinner.stop_clear();
             eprintln!("  {} Request failed: {}", theme::icon_err(), e);
         }
     }
@@ -1237,6 +1244,35 @@ mod tests {
             ..Default::default()
         });
         assert!(!plan_idle_review_not_started(&ps));
+    }
+
+    #[test]
+    fn try_replace_plan_from_llm_json_empty_text_no_op() {
+        let mut ps = plan::PlanModeState::new("g".into(), plan::ProjectContext::default());
+        assert_eq!(
+            try_replace_plan_from_llm_json("", &mut ps).unwrap(),
+            false
+        );
+        assert_eq!(
+            try_replace_plan_from_llm_json("   \n\t  ", &mut ps).unwrap(),
+            false
+        );
+    }
+
+    #[test]
+    fn try_replace_plan_from_llm_json_prose_returns_err() {
+        let mut ps = plan::PlanModeState::new("g".into(), plan::ProjectContext::default());
+        let err = try_replace_plan_from_llm_json("Just use natural language.", &mut ps).unwrap_err();
+        assert!(!err.is_empty(), "expected parse error message: {err}");
+    }
+
+    #[test]
+    fn try_replace_plan_from_llm_json_valid_plan_replaces() {
+        let mut ps = plan::PlanModeState::new("g".into(), plan::ProjectContext::default());
+        let json = r#"{"subtasks":[{"id":"t1","title":"step"}]}"#;
+        assert_eq!(try_replace_plan_from_llm_json(json, &mut ps).unwrap(), true);
+        assert_eq!(ps.plan.subtasks.len(), 1);
+        assert_eq!(ps.plan.subtasks[0].id, "t1");
     }
 
     #[test]

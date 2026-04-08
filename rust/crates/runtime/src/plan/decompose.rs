@@ -785,18 +785,12 @@ fn parse_acceptance_checks(raw: Vec<serde_json::Value>) -> Vec<astra_services::d
             match serde_json::from_value::<VerifierKind>(v.clone()) {
                 Ok(vk) => {
                     if matches!(vk, VerifierKind::Command { .. } | VerifierKind::CommandOutput { .. }) {
-                        eprintln!(
-                            "[plan] Filtered shell-execution verifier from LLM acceptance_checks: {v}"
-                        );
                         None
                     } else {
                         Some(vk)
                     }
                 }
-                Err(e) => {
-                    eprintln!(
-                        "[plan] Skipping unrecognised acceptance_check: {v} ({e})"
-                    );
+                Err(_e) => {
                     None
                 }
             }
