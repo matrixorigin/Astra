@@ -1344,6 +1344,7 @@ impl astra_services::LlmJudge for ServerProxyLlmJudge {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use astra_services::durable_task::VerifierKind;
     use astra_services::task_orchestrator::{SubtaskPlan, TaskPlan, TaskStatus};
     use astra_services::{
         LlmJudge, SubtaskDeliverySummary, TaskScope, VerificationCriterion, VerificationResult,
@@ -1360,7 +1361,9 @@ mod tests {
                     status: TaskStatus::Pending,
                     effort: Some("small".into()),
                     files: vec!["src/foo.rs".into()],
-                    acceptance: Some("File src/foo.rs exists".into()),
+                    acceptance_checks: vec![VerifierKind::FileExists {
+                        paths: vec!["src/foo.rs".into()],
+                    }],
                 },
                 SubtaskPlan {
                     id: "s2".into(),
@@ -1370,7 +1373,10 @@ mod tests {
                     status: TaskStatus::Pending,
                     effort: Some("small".into()),
                     files: vec!["tests/foo_test.rs".into()],
-                    acceptance: Some("cargo test passes".into()),
+                    acceptance_checks: vec![VerifierKind::TestPass {
+                        cmd: "cargo test --workspace".into(),
+                        min_pass_rate: 1.0,
+                    }],
                 },
             ],
             notes: None,
@@ -1673,7 +1679,9 @@ mod tests {
                 status: TaskStatus::Pending,
                 effort: Some("small".into()),
                 files: vec!["calculator.py".into()],
-                acceptance: Some("File calculator.py exists".into()),
+                acceptance_checks: vec![VerifierKind::FileExists {
+                    paths: vec!["calculator.py".into()],
+                }],
             }],
             notes: None,
         };
@@ -1738,7 +1746,9 @@ mod tests {
                 status: TaskStatus::Pending,
                 effort: Some("small".into()),
                 files: vec!["output.py".into()],
-                acceptance: Some("File output.py exists".into()),
+                acceptance_checks: vec![VerifierKind::FileExists {
+                    paths: vec!["output.py".into()],
+                }],
             }],
             notes: None,
         };
@@ -1803,7 +1813,11 @@ mod tests {
                 status: TaskStatus::Pending,
                 effort: None,
                 files: vec!["auth.py".into()],
-                acceptance: Some("auth.py contains 'import jwt'".into()),
+                acceptance_checks: vec![VerifierKind::GrepCheck {
+                    file: "auth.py".into(),
+                    pattern: "import jwt".into(),
+                    should_match: true,
+                }],
             }],
             notes: None,
         };
@@ -1878,7 +1892,11 @@ mod tests {
                 status: TaskStatus::Pending,
                 effort: None,
                 files: vec!["auth.py".into()],
-                acceptance: Some("auth.py contains rate_limit".into()),
+                acceptance_checks: vec![VerifierKind::GrepCheck {
+                    file: "auth.py".into(),
+                    pattern: "rate_limit".into(),
+                    should_match: true,
+                }],
             }],
             notes: None,
         };
@@ -1950,7 +1968,10 @@ mod tests {
                 status: TaskStatus::Pending,
                 effort: None,
                 files: vec![],
-                acceptance: Some("Command exits 0".into()),
+                acceptance_checks: vec![VerifierKind::Command {
+                    cmd: "true".into(),
+                    expected_exit: 0,
+                }],
             }],
             notes: None,
         };
@@ -2017,7 +2038,10 @@ mod tests {
                 status: TaskStatus::Pending,
                 effort: None,
                 files: vec![],
-                acceptance: Some("Command exits 0".into()),
+                acceptance_checks: vec![VerifierKind::Command {
+                    cmd: "true".into(),
+                    expected_exit: 0,
+                }],
             }],
             notes: None,
         };
@@ -2090,7 +2114,10 @@ mod tests {
                 status: TaskStatus::Pending,
                 effort: None,
                 files: vec!["test_calc.py".into()],
-                acceptance: Some("pytest passes".into()),
+                acceptance_checks: vec![VerifierKind::TestPass {
+                    cmd: "pytest".into(),
+                    min_pass_rate: 1.0,
+                }],
             }],
             notes: None,
         };
@@ -2171,7 +2198,9 @@ mod tests {
                     status: TaskStatus::Pending,
                     effort: None,
                     files: vec!["module.py".into()],
-                    acceptance: Some("File module.py exists".into()),
+                    acceptance_checks: vec![VerifierKind::FileExists {
+                        paths: vec!["module.py".into()],
+                    }],
                 },
                 SubtaskPlan {
                     id: "s2".into(),
@@ -2181,7 +2210,9 @@ mod tests {
                     status: TaskStatus::Pending,
                     effort: None,
                     files: vec!["test_module.py".into()],
-                    acceptance: Some("File test_module.py exists".into()),
+                    acceptance_checks: vec![VerifierKind::FileExists {
+                        paths: vec!["test_module.py".into()],
+                    }],
                 },
             ],
             notes: None,
@@ -2238,7 +2269,9 @@ mod tests {
                 status: TaskStatus::Pending,
                 effort: None,
                 files: vec!["ghost.txt".into()],
-                acceptance: Some("File ghost.txt exists".into()),
+                acceptance_checks: vec![VerifierKind::FileExists {
+                    paths: vec!["ghost.txt".into()],
+                }],
             }],
             notes: None,
         };
@@ -2293,7 +2326,7 @@ mod tests {
                 status: TaskStatus::Pending,
                 effort: None,
                 files: vec![],
-                acceptance: Some("Code quality is good".into()),
+                acceptance_checks: vec![],
             }],
             notes: None,
         };
@@ -2386,7 +2419,7 @@ mod tests {
                 status: TaskStatus::Pending,
                 effort: None,
                 files: vec![],
-                acceptance: None,
+                acceptance_checks: vec![],
             }],
             notes: None,
         };

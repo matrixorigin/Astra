@@ -1,8 +1,9 @@
-//! Contract Generator — converts TaskPlan → TaskContract with auto-detected verification.
+//! Contract Generator — converts TaskPlan → TaskContract.
 //!
-//! The generator bridges the gap between the human-oriented plan (SubtaskPlan with string
-//! acceptance criteria) and the machine-executable contract (DurableSubtask with structured
-//! VerificationCriterion + VerifierKind).
+//! SubtaskPlan now carries structured `acceptance_checks: Vec<VerifierKind>` directly
+//! from the LLM decomposition. This module wraps them in `VerificationCriterion` with
+//! sensible defaults (required, timeout) and adds project-level global checks
+//! (build, test, lint).
 //!
 //! # Usage
 //!
@@ -132,691 +133,48 @@ pub fn detect_lint_command(det: &ProjectDetection) -> Option<String> {
     }
 }
 
-// ─── Acceptance Parsing ─────────────────────────────────────────────────────
+// ─── VerifierKind → VerificationCriterion ───────────────────────────────────
 
-/// Parse a human-written acceptance string into structured verification criteria.
-///
-/// Supports several patterns:
-/// - "tests pass" → TestPass verifier
-/// - "builds successfully" → BuildPass verifier
-/// - "file X exists" → FileExists verifier
-/// - "output contains X" → CommandOutput verifier
-/// - Anything else → LlmJudge (semantic check)
-fn parse_acceptance_to_criteria(
-    acceptance: &str,
-    subtask_id: &str,
-    det: &ProjectDetection,
-) -> Vec<VerificationCriterion> {
-    let mut criteria = Vec::new();
-    let _lower = acceptance.to_lowercase();
-
-    // Split by common delimiters: newlines, semicolons, numbered items
-    let parts: Vec<&str> = acceptance
-        .split('\n')
-        .flat_map(|line| line.split(';'))
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
-        .collect();
-
-    for (idx, part) in parts.iter().enumerate() {
-        let part_lower = part.to_lowercase();
-        let crit_id = format!("{subtask_id}-ac{idx}");
-
-        // Structured assertion patterns (exact prefix match — highest priority)
-        if let Some(c) = try_parse_structured_assertion(&crit_id, part, &part_lower, det) {
-            criteria.push(c);
-        } else if let Some(c) = try_parse_test_criterion(&crit_id, part, &part_lower, det) {
-            criteria.push(c);
-        } else if let Some(c) = try_parse_build_criterion(&crit_id, part, &part_lower, det) {
-            criteria.push(c);
-        } else if let Some(c) = try_parse_no_warnings_criterion(&crit_id, part, &part_lower, det) {
-            criteria.push(c);
-        } else if let Some(c) = try_parse_grep_criterion(&crit_id, part, &part_lower) {
-            criteria.push(c);
-        } else if let Some(c) = try_parse_function_exists_criterion(&crit_id, part, &part_lower) {
-            criteria.push(c);
-        } else if let Some(c) = try_parse_file_exists_criterion(&crit_id, part, &part_lower) {
-            criteria.push(c);
-        } else if let Some(c) = try_parse_command_output_criterion(&crit_id, part, &part_lower) {
-            criteria.push(c);
-        } else if let Some(c) = try_parse_permission_criterion(&crit_id, part, &part_lower) {
-            criteria.push(c);
-        } else if let Some(c) = try_parse_flexible_grep_criterion(&crit_id, part, &part_lower) {
-            criteria.push(c);
-        } else {
-            // Fallback: not machine-parseable — mark as non-required LlmJudge
-            criteria.push(VerificationCriterion {
-                id: crit_id,
-                description: part.to_string(),
-                verifier: VerifierKind::LlmJudge {
-                    prompt: format!(
-                        "Evaluate whether the following acceptance criterion is met: \"{part}\". \
-                         Respond with a score from 0.0 to 1.0."
-                    ),
-                    pass_threshold: 0.7,
-                },
-                required: false,
-                timeout_sec: 60,
-                global_only: true,
-            });
-        }
-    }
-
-    // If nothing parsed (empty acceptance), add a generic LLM check
-    if criteria.is_empty() && !acceptance.trim().is_empty() {
-        criteria.push(VerificationCriterion {
-            id: format!("{subtask_id}-ac0"),
-            description: acceptance.to_string(),
-            verifier: VerifierKind::LlmJudge {
-                prompt: format!(
-                    "Evaluate whether the following criterion is met: \"{acceptance}\". \
-                     Score 0.0 to 1.0."
-                ),
-                pass_threshold: 0.7,
-            },
-            required: true,
-            timeout_sec: 60,
-            global_only: true, // LlmJudge not yet implemented; skip in per-subtask
-        });
-    }
-
-    criteria
-}
-
-/// Parse structured assertion patterns produced by the decomposition prompt.
-///
-/// Recognized prefixes (case-insensitive):
-/// - `file_exists: <path>`
-/// - `file_contains: <path> :: <text>`
-/// - `command_succeeds: <shell cmd>`
-/// - `command_output: <shell cmd> :: contains: <text>`
-/// - `grep: <path> :: <pattern>`
-/// - `tests_pass`
-/// - `build_succeeds`
-fn try_parse_structured_assertion(
-    id: &str,
-    desc: &str,
-    lower: &str,
-    det: &ProjectDetection,
-) -> Option<VerificationCriterion> {
-    // file_contains: <path> :: <text>
-    if lower.starts_with("file_contains:")
-        && let Some(sep) = desc.find("::")
-    {
-        let prefix_len = "file_contains:".len();
-        let path = desc[prefix_len..sep].trim();
-        let text = desc[sep + 2..].trim();
-        if !path.is_empty() && !text.is_empty() {
-            return Some(VerificationCriterion {
-                id: id.to_string(),
-                description: desc.to_string(),
-                verifier: VerifierKind::ReadFileContains {
-                    path: path.to_string(),
-                    contains: vec![text.to_string()],
-                    not_contains: vec![],
-                },
-                required: true,
-                timeout_sec: 30,
-                global_only: false,
-            });
-        }
-    }
-
-    // file_exists: <path>
-    if lower.starts_with("file_exists:") {
-        let orig_path = desc["file_exists:".len()..].trim();
-        return Some(VerificationCriterion {
-            id: id.to_string(),
-            description: desc.to_string(),
-            verifier: VerifierKind::FileExists {
-                paths: vec![orig_path.to_string()],
-            },
-            required: true,
-            timeout_sec: 10,
-            global_only: false,
-        });
-    }
-
-    // command_output: <cmd> :: contains: <text>
-    if lower.starts_with("command_output:")
-        && let Some(sep) = desc.find("::")
-    {
-        let orig_cmd = desc["command_output:".len()..sep].trim();
-        let orig_contains = desc[sep + 2..].trim();
-        let orig_text = orig_contains.strip_prefix("contains:").unwrap_or(orig_contains).trim();
-        return Some(VerificationCriterion {
-            id: id.to_string(),
-            description: desc.to_string(),
-            verifier: VerifierKind::CommandOutput {
-                cmd: orig_cmd.to_string(),
-                contains: vec![orig_text.to_string()],
-                not_contains: vec![],
-            },
-            required: true,
-            timeout_sec: 60,
-            global_only: false,
-        });
-    }
-
-    // command_succeeds: <cmd>
-    if lower.starts_with("command_succeeds:") {
-        let orig_cmd = desc["command_succeeds:".len()..].trim();
-        return Some(VerificationCriterion {
-            id: id.to_string(),
-            description: desc.to_string(),
-            verifier: VerifierKind::Command {
-                cmd: orig_cmd.to_string(),
-                expected_exit: 0,
-            },
-            required: true,
-            timeout_sec: 120,
-            global_only: false,
-        });
-    }
-
-    // grep: <path> :: <pattern>
-    if lower.starts_with("grep:")
-        && let Some(sep) = desc.find("::")
-    {
-        let orig_path = desc["grep:".len()..sep].trim();
-        let orig_pattern = desc[sep + 2..].trim();
-        return Some(VerificationCriterion {
-            id: id.to_string(),
-            description: desc.to_string(),
-            verifier: VerifierKind::GrepCheck {
-                file: orig_path.to_string(),
-                pattern: orig_pattern.to_string(),
-                should_match: true,
-            },
-            required: true,
-            timeout_sec: 30,
-            global_only: false,
-        });
-    }
-
-    // tests_pass (exact match)
-    if lower.trim() == "tests_pass" {
-        let cmd = detect_test_command(det)?;
-        return Some(VerificationCriterion {
-            id: id.to_string(),
-            description: desc.to_string(),
-            verifier: VerifierKind::TestPass {
-                cmd,
-                min_pass_rate: 1.0,
-            },
-            required: true,
-            timeout_sec: 300,
-            global_only: true,
-        });
-    }
-
-    // build_succeeds (exact match)
-    if lower.trim() == "build_succeeds" {
-        let cmd = detect_build_command(det)?;
-        return Some(VerificationCriterion {
-            id: id.to_string(),
-            description: desc.to_string(),
-            verifier: VerifierKind::BuildPass { cmd },
-            required: true,
-            timeout_sec: 300,
-            global_only: true,
-        });
-    }
-
-    None
-}
-
-fn try_parse_test_criterion(
-    id: &str,
-    desc: &str,
-    lower: &str,
-    det: &ProjectDetection,
-) -> Option<VerificationCriterion> {
-    let is_test = lower.contains("test")
-        && (lower.contains("pass") || lower.contains("succeed") || lower.contains("green"));
-    if !is_test {
-        return None;
-    }
-    let cmd = detect_test_command(det)?;
-    Some(VerificationCriterion {
-        id: id.to_string(),
-        description: desc.to_string(),
-        verifier: VerifierKind::TestPass {
-            cmd,
-            min_pass_rate: 1.0,
-        },
-        required: true,
-        timeout_sec: 300,
-        global_only: true, // Expensive: only run during global verification
-    })
-}
-
-fn try_parse_build_criterion(
-    id: &str,
-    desc: &str,
-    lower: &str,
-    det: &ProjectDetection,
-) -> Option<VerificationCriterion> {
-    let is_build = (lower.contains("build") || lower.contains("compile"))
-        && (lower.contains("pass")
-            || lower.contains("succeed")
-            || lower.contains("success")
-            || lower.contains("without error"));
-    if !is_build {
-        return None;
-    }
-    let cmd = detect_build_command(det)?;
-    Some(VerificationCriterion {
-        id: id.to_string(),
-        description: desc.to_string(),
-        verifier: VerifierKind::BuildPass { cmd },
-        required: true,
-        timeout_sec: 300,
-        global_only: true, // Expensive: only run during global verification
-    })
-}
-
-fn try_parse_file_exists_criterion(
-    id: &str,
-    desc: &str,
-    lower: &str,
-) -> Option<VerificationCriterion> {
-    // Match patterns like "file src/auth.rs exists" or "create src/auth.rs"
-    if !lower.contains("file") && !lower.contains("create") && !lower.contains("exist") {
-        return None;
-    }
-
-    let paths = extract_file_paths(desc);
-    if paths.is_empty() {
-        return None;
-    }
-
-    Some(VerificationCriterion {
-        id: id.to_string(),
-        description: desc.to_string(),
-        verifier: VerifierKind::FileExists { paths },
-        required: true,
-        timeout_sec: 10,
-        global_only: false, // lightweight — run per-subtask
-    })
-}
-
-fn try_parse_grep_criterion(id: &str, desc: &str, lower: &str) -> Option<VerificationCriterion> {
-    // Match "contains X in file Y" or "file Y should contain X"
-    let has_contain = lower.contains("contain") || lower.contains("include");
-    let has_file_ref = lower.contains("in file") || lower.contains("in the file");
-    if !has_contain || !has_file_ref {
-        return None;
-    }
-
-    // Best-effort extraction: look for quoted strings and file paths
-    let paths = extract_file_paths(desc);
-    let quoted = extract_quoted_strings(desc);
-
-    if paths.is_empty() || quoted.is_empty() {
-        return None;
-    }
-
-    Some(VerificationCriterion {
-        id: id.to_string(),
-        description: desc.to_string(),
-        verifier: VerifierKind::GrepCheck {
-            file: paths[0].clone(),
-            pattern: quoted[0].clone(),
-            should_match: !lower.contains("not contain") && !lower.contains("should not"),
-        },
-        required: true,
-        timeout_sec: 10,
-        global_only: false, // lightweight — run per-subtask
-    })
-}
-
-/// Match "Command X outputs 'Y'" or "Running X produces 'Y'" patterns.
-///
-/// Generates a `CommandOutput` verifier that runs the command and checks stdout
-/// contains the expected string. Covers acceptance criteria like:
-/// - "Command /tmp/hellosh outputs 'hello china'"
-/// - "Running the script produces 'hello world!' output"
-/// - "/tmp/foo prints 'bar'"
-fn try_parse_command_output_criterion(
-    id: &str,
-    desc: &str,
-    lower: &str,
-) -> Option<VerificationCriterion> {
-    let has_output_keyword = lower.contains("output")
-        || lower.contains("produce")
-        || lower.contains("print")
-        || lower.contains("return");
-    let has_run_keyword = lower.contains("run")
-        || lower.contains("execut")
-        || lower.contains("command")
-        || lower.contains("script");
-
-    if !has_output_keyword && !has_run_keyword {
-        return None;
-    }
-
-    // Need at least a file path (the command) OR a quoted expected output
-    let paths = extract_file_paths(desc);
-    let quoted = extract_quoted_strings(desc);
-
-    if paths.is_empty() && quoted.is_empty() {
-        return None;
-    }
-
-    // Build the command: prefer file path, fallback to first word after "run"/"execute"
-    let cmd = if !paths.is_empty() {
-        paths[0].clone()
-    } else {
-        return None; // Can't determine what command to run
+/// Wrap a `VerifierKind` into a `VerificationCriterion` with sensible defaults.
+fn wrap_verifier(id: String, verifier: VerifierKind) -> VerificationCriterion {
+    let global_only = matches!(
+        verifier,
+        VerifierKind::BuildPass { .. }
+            | VerifierKind::TestPass { .. }
+            | VerifierKind::LlmJudge { .. }
+    );
+    let timeout_sec = match &verifier {
+        VerifierKind::BuildPass { .. } | VerifierKind::TestPass { .. } => 600,
+        VerifierKind::Command { .. } | VerifierKind::CommandOutput { .. } => 120,
+        _ => 30,
     };
-
-    // Build expected output check — exclude the command path itself from expected output
-    let contains: Vec<String> = quoted
-        .iter()
-        .filter(|q| *q != &cmd && !paths.contains(q))
-        .cloned()
-        .collect();
-    let not_contains = if lower.contains("without error") || lower.contains("no error") {
-        vec!["error".to_string()]
-    } else {
-        vec![]
-    };
-
-    // Only create verifier if we have something to check
-    if contains.is_empty() && not_contains.is_empty() {
-        return None;
-    }
-
-    Some(VerificationCriterion {
-        id: id.to_string(),
-        description: desc.to_string(),
-        verifier: VerifierKind::CommandOutput {
-            cmd,
-            contains,
-            not_contains,
-        },
+    let description = describe_verifier(&verifier);
+    VerificationCriterion {
+        id,
+        description,
+        verifier,
         required: true,
-        timeout_sec: 30,
-        global_only: false, // lightweight — run per-subtask
-    })
+        timeout_sec,
+        global_only,
+    }
 }
 
-/// Match permission/executable criteria.
-///
-/// Generates a `Command` verifier using `test -x <file>` (exit 0 = executable).
-/// Covers acceptance criteria like:
-/// - "Script has executable permissions (ls -l shows x bits)"
-/// - "ls -l shows executable permissions"
-/// - "File is executable"
-fn try_parse_permission_criterion(
-    id: &str,
-    desc: &str,
-    lower: &str,
-) -> Option<VerificationCriterion> {
-    let has_perm_keyword = lower.contains("permission")
-        || lower.contains("executable")
-        || lower.contains("chmod")
-        || lower.contains("x bit");
-
-    if !has_perm_keyword {
-        return None;
-    }
-
-    let paths = extract_file_paths(desc);
-    if paths.is_empty() {
-        return None;
-    }
-
-    Some(VerificationCriterion {
-        id: id.to_string(),
-        description: desc.to_string(),
-        verifier: VerifierKind::Command {
-            cmd: format!("test -x {}", paths[0]),
-            expected_exit: 0,
-        },
-        required: true,
-        timeout_sec: 10,
-        global_only: false, // lightweight — run per-subtask
-    })
-}
-
-/// Match "no warnings" / "zero warnings" / "clean compile" patterns.
-///
-/// Uses the project's build command with a pipe to `grep -c warning` or similar.
-/// Covers acceptance criteria like:
-/// - "No compiler warnings"
-/// - "Code compiles with zero warnings"
-/// - "Clean build (no warnings)"
-fn try_parse_no_warnings_criterion(
-    id: &str,
-    desc: &str,
-    lower: &str,
-    det: &ProjectDetection,
-) -> Option<VerificationCriterion> {
-    let has_warning = lower.contains("warning");
-    let has_negative = lower.contains("no ")
-        || lower.contains("zero")
-        || lower.contains("0 ")
-        || lower.contains("without")
-        || lower.contains("clean");
-
-    if !has_warning || !has_negative {
-        return None;
-    }
-
-    let build_cmd = detect_build_command(det)?;
-
-    // Build a command that fails if warnings are present in stderr.
-    // Redirect stderr to stdout so we can grep both streams.
-    let cmd = format!("{build_cmd} 2>&1 | grep -ci 'warning' | grep -q '^0$'");
-
-    Some(VerificationCriterion {
-        id: id.to_string(),
-        description: desc.to_string(),
-        verifier: VerifierKind::Command {
-            cmd,
-            expected_exit: 0,
-        },
-        required: true,
-        timeout_sec: 300,
-        global_only: true, // build is expensive — global only
-    })
-}
-
-/// Match "Function X exists in file Y" or "Module exports X" patterns.
-///
-/// Generates a `GrepCheck` that searches for the symbol name in the specified file.
-/// Covers acceptance criteria like:
-/// - "Function authenticate exists in src/auth.rs"
-/// - "src/config.ts exports createUser"
-/// - "File src/models.py defines class User"
-fn try_parse_function_exists_criterion(
-    id: &str,
-    desc: &str,
-    lower: &str,
-) -> Option<VerificationCriterion> {
-    let has_symbol_kind = lower.contains("function")
-        || lower.contains("class")
-        || lower.contains("struct")
-        || lower.contains("enum")
-        || lower.contains("trait")
-        || lower.contains("interface")
-        || lower.contains("const ")
-        || lower.contains("export");
-    let has_existence = lower.contains("exist")
-        || lower.contains("define")
-        || lower.contains("declare")
-        || lower.contains("export")
-        || lower.contains("has a ");
-
-    if !has_symbol_kind || !has_existence {
-        return None;
-    }
-
-    let paths = extract_file_paths(desc);
-    if paths.is_empty() {
-        return None;
-    }
-
-    // Try to find the symbol name: first from quoted strings, then from words
-    // immediately following symbol keywords.
-    let quoted = extract_quoted_strings(desc);
-    let symbol = if !quoted.is_empty() {
-        quoted[0].clone()
-    } else {
-        // Look for the word right after "function"/"class"/"struct" etc.
-        let keywords = [
-            "function ",
-            "class ",
-            "struct ",
-            "enum ",
-            "trait ",
-            "interface ",
-            "const ",
-        ];
-        let mut found = None;
-        for kw in &keywords {
-            if let Some(pos) = lower.find(kw) {
-                let after = &desc[pos + kw.len()..];
-                if let Some(word) = after.split_whitespace().next() {
-                    let clean = word.trim_matches(|c: char| !c.is_alphanumeric() && c != '_');
-                    if !clean.is_empty() {
-                        found = Some(clean.to_string());
-                        break;
-                    }
-                }
-            }
+fn describe_verifier(v: &VerifierKind) -> String {
+    match v {
+        VerifierKind::FileExists { paths } => format!("Files exist: {}", paths.join(", ")),
+        VerifierKind::ReadFileContains { path, contains, .. } => {
+            format!("{path} contains {:?}", contains)
         }
-        found?
-    };
-
-    Some(VerificationCriterion {
-        id: id.to_string(),
-        description: desc.to_string(),
-        verifier: VerifierKind::GrepCheck {
-            file: paths[0].clone(),
-            pattern: symbol,
-            should_match: true,
-        },
-        required: true,
-        timeout_sec: 10,
-        global_only: false,
-    })
-}
-
-/// Flexible grep: matches "file X should have Y", "X includes Y", "Y in X" etc.
-///
-/// This is a looser variant of `try_parse_grep_criterion` that doesn't require
-/// the exact "in file" / "contain" keywords. It catches patterns like:
-/// - "src/config.ts includes the string 'API_KEY'"
-/// - "Makefile should have a 'test' target"
-/// - "File src/models.py should have 'class User'"
-fn try_parse_flexible_grep_criterion(
-    id: &str,
-    desc: &str,
-    lower: &str,
-) -> Option<VerificationCriterion> {
-    let paths = extract_file_paths(desc);
-    let quoted = extract_quoted_strings(desc);
-
-    // Need both a file and a pattern to search for
-    if paths.is_empty() || quoted.is_empty() {
-        return None;
-    }
-
-    // Must have some verb indicating containment/presence
-    let has_verb = lower.contains("has ")
-        || lower.contains("have ")
-        || lower.contains("include")
-        || lower.contains("contain")
-        || lower.contains("should")
-        || lower.contains("with ");
-
-    if !has_verb {
-        return None;
-    }
-
-    let should_match = !lower.contains("not have")
-        && !lower.contains("should not")
-        && !lower.contains("shouldn't")
-        && !lower.contains("not contain")
-        && !lower.contains("not include");
-
-    // Filter out quoted strings that are themselves file paths (avoid using the path as a grep pattern)
-    let pattern_candidates: Vec<&String> = quoted.iter().filter(|q| !paths.contains(q)).collect();
-    if pattern_candidates.is_empty() {
-        return None;
-    }
-
-    Some(VerificationCriterion {
-        id: id.to_string(),
-        description: desc.to_string(),
-        verifier: VerifierKind::GrepCheck {
-            file: paths[0].clone(),
-            pattern: pattern_candidates[0].clone(),
-            should_match,
-        },
-        required: true,
-        timeout_sec: 10,
-        global_only: false,
-    })
-}
-
-/// Extract file paths from a string (heuristic: words containing '/' or known extensions/names).
-fn extract_file_paths(text: &str) -> Vec<String> {
-    let extensions = [
-        ".rs", ".py", ".ts", ".tsx", ".js", ".jsx", ".go", ".java", ".rb", ".cpp", ".c", ".h",
-        ".toml", ".yaml", ".yml", ".json", ".sql", ".md", ".txt", ".sh",
-    ];
-    // Well-known filenames without extensions
-    let known_names = [
-        "Makefile",
-        "Dockerfile",
-        "Vagrantfile",
-        "Gemfile",
-        "Rakefile",
-        "Procfile",
-        "CMakeLists",
-        "Justfile",
-    ];
-
-    text.split_whitespace()
-        .map(|w| w.trim_matches(|c: char| c == '`' || c == '\'' || c == '"' || c == ','))
-        .filter(|w| {
-            // Exclude shebangs and interpreter paths (#!/bin/bash, /usr/bin/env, etc.)
-            if w.starts_with("#!")
-                || w.starts_with("/usr/")
-                || w.starts_with("/bin/")
-                || w.starts_with("/sbin/")
-                || w.starts_with("/etc/")
-            {
-                return false;
-            }
-            w.contains('/')
-                || w.contains('\\')
-                || extensions.iter().any(|ext| w.ends_with(ext))
-                || known_names.contains(w)
-        })
-        .map(String::from)
-        .collect()
-}
-
-/// Extract quoted strings (single or double quotes).
-fn extract_quoted_strings(text: &str) -> Vec<String> {
-    let mut results = Vec::new();
-    for delim in ['"', '\'', '`'] {
-        let mut chars = text.chars().peekable();
-        while let Some(c) = chars.next() {
-            if c == delim {
-                let s: String = chars.by_ref().take_while(|&ch| ch != delim).collect();
-                if !s.is_empty() {
-                    results.push(s);
-                }
-            }
+        VerifierKind::GrepCheck { file, pattern, .. } => format!("grep '{pattern}' in {file}"),
+        VerifierKind::Command { cmd, .. } => format!("Command succeeds: {cmd}"),
+        VerifierKind::CommandOutput { cmd, contains, .. } => {
+            format!("{cmd} output contains {:?}", contains)
         }
+        VerifierKind::BuildPass { cmd } => format!("Build passes: {cmd}"),
+        VerifierKind::TestPass { cmd, .. } => format!("Tests pass: {cmd}"),
+        VerifierKind::LlmJudge { prompt, .. } => prompt.clone(),
+        VerifierKind::Composite { .. } => "Composite check".into(),
     }
-    results
 }
 
 // ─── Contract Generator ─────────────────────────────────────────────────────
@@ -854,17 +212,13 @@ impl ContractGenerator {
         let task_id = Uuid::new_v4().to_string();
         let now = chrono::Utc::now().to_rfc3339();
 
-        // Convert SubtaskPlan → DurableSubtask
         let subtasks: Vec<DurableSubtask> = plan
             .subtasks
             .iter()
             .map(|sp| self.convert_subtask(sp))
             .collect();
 
-        // Build scope
         let scope = scope.unwrap_or_else(|| self.infer_scope(goal, &subtasks));
-
-        // Generate global verification criteria
         let global_verification = self.generate_global_criteria();
 
         Ok(TaskContract {
@@ -884,29 +238,33 @@ impl ContractGenerator {
         })
     }
 
-    /// Convert a SubtaskPlan into a DurableSubtask with structured verification.
+    /// Convert a SubtaskPlan into a DurableSubtask.
+    ///
+    /// Wraps each `VerifierKind` from `acceptance_checks` into a `VerificationCriterion`.
+    /// If no checks are provided but `files` are listed, adds a `FileExists` check.
     fn convert_subtask(&self, sp: &SubtaskPlan) -> DurableSubtask {
-        let criteria = match &sp.acceptance {
-            Some(acc) if !acc.trim().is_empty() => {
-                parse_acceptance_to_criteria(acc, &sp.id, &self.detection)
+        let criteria: Vec<VerificationCriterion> = if sp.acceptance_checks.is_empty() {
+            if sp.files.is_empty() {
+                Vec::new()
+            } else {
+                vec![VerificationCriterion {
+                    id: format!("{}-files", sp.id),
+                    description: format!("Modified files exist: {}", sp.files.join(", ")),
+                    verifier: VerifierKind::FileExists {
+                        paths: sp.files.clone(),
+                    },
+                    required: true,
+                    timeout_sec: 10,
+                    global_only: false,
+                }]
             }
-            _ => {
-                // No acceptance string: add file-based criteria if files are specified
-                let mut c = Vec::new();
-                if !sp.files.is_empty() {
-                    c.push(VerificationCriterion {
-                        id: format!("{}-files", sp.id),
-                        description: format!("Modified files exist: {}", sp.files.join(", ")),
-                        verifier: VerifierKind::FileExists {
-                            paths: sp.files.clone(),
-                        },
-                        required: true,
-                        timeout_sec: 10,
-                        global_only: false, // lightweight — run per-subtask
-                    });
-                }
-                c
-            }
+        } else {
+            sp.acceptance_checks
+                .iter()
+                .filter(|vk| !matches!(vk, VerifierKind::Command { .. } | VerifierKind::CommandOutput { .. }))
+                .enumerate()
+                .map(|(i, vk)| wrap_verifier(format!("{}-ac{i}", sp.id), vk.clone()))
+                .collect()
         };
 
         DurableSubtask {
@@ -934,7 +292,6 @@ impl ContractGenerator {
 
         let mut out_of_scope = Vec::new();
         let goal_lower = goal.to_lowercase();
-        // Common things people might expect but aren't in the plan
         if !goal_lower.contains("deploy") {
             out_of_scope.push("Deployment and CI/CD changes".into());
         }
@@ -961,7 +318,6 @@ impl ContractGenerator {
     fn generate_global_criteria(&self) -> Vec<VerificationCriterion> {
         let mut criteria = Vec::new();
 
-        // Global build check
         if let Some(cmd) = detect_build_command(&self.detection) {
             criteria.push(VerificationCriterion {
                 id: "global-build".into(),
@@ -973,7 +329,6 @@ impl ContractGenerator {
             });
         }
 
-        // Global test check
         if let Some(cmd) = detect_test_command(&self.detection) {
             criteria.push(VerificationCriterion {
                 id: "global-test".into(),
@@ -988,7 +343,6 @@ impl ContractGenerator {
             });
         }
 
-        // Global lint check (non-blocking)
         if let Some(cmd) = detect_lint_command(&self.detection) {
             criteria.push(VerificationCriterion {
                 id: "global-lint".into(),
@@ -997,7 +351,7 @@ impl ContractGenerator {
                     cmd,
                     expected_exit: 0,
                 },
-                required: false, // advisory, not blocking
+                required: false,
                 timeout_sec: 300,
                 global_only: true,
             });
@@ -1040,7 +394,15 @@ mod tests {
                     status: TaskStatus::Pending,
                     effort: Some("medium".into()),
                     files: vec!["src/auth.rs".into()],
-                    acceptance: Some("tests pass; file src/auth.rs exists".into()),
+                    acceptance_checks: vec![
+                        VerifierKind::TestPass {
+                            cmd: "cargo test --workspace".into(),
+                            min_pass_rate: 1.0,
+                        },
+                        VerifierKind::FileExists {
+                            paths: vec!["src/auth.rs".into()],
+                        },
+                    ],
                 },
                 SubtaskPlan {
                     id: "api-routes".into(),
@@ -1050,12 +412,16 @@ mod tests {
                     status: TaskStatus::Pending,
                     effort: Some("large".into()),
                     files: vec!["src/routes.rs".into()],
-                    acceptance: Some("build succeeds; endpoint responds correctly".into()),
+                    acceptance_checks: vec![VerifierKind::BuildPass {
+                        cmd: "cargo build".into(),
+                    }],
                 },
             ],
             notes: Some("Use JWT for auth".into()),
         }
     }
+
+    // ─── Project detection tests ────────────────────────────────────────────
 
     #[test]
     fn detect_build_cmd_rust() {
@@ -1104,7 +470,6 @@ mod tests {
 
     #[test]
     fn detect_test_cmd_bare_python() {
-        // Bare Python project: only test_*.py files, no pyproject.toml or setup.py
         let det = ProjectDetection {
             has_test_py: true,
             ..Default::default()
@@ -1136,6 +501,8 @@ mod tests {
         assert_eq!(detect_lint_command(&det), Some("golangci-lint run".into()));
     }
 
+    // ─── Contract generation tests ──────────────────────────────────────────
+
     #[test]
     fn generate_contract_from_plan() {
         let cg = ContractGenerator::new(rust_detection());
@@ -1147,44 +514,30 @@ mod tests {
         assert_eq!(contract.status, ContractStatus::Draft);
         assert_eq!(contract.version, 1);
 
-        // First subtask should have parsed acceptance criteria
         let s0 = &contract.subtasks[0];
         assert_eq!(s0.id, "auth-module");
         assert_eq!(s0.stage, SubtaskStage::Pending);
-        assert!(!s0.criteria.is_empty(), "should have acceptance criteria");
+        assert_eq!(s0.criteria.len(), 2);
 
-        // Check that "tests pass" was parsed into TestPass verifier
         let has_test_verifier = s0
             .criteria
             .iter()
             .any(|c| matches!(c.verifier, VerifierKind::TestPass { .. }));
-        assert!(
-            has_test_verifier,
-            "should parse 'tests pass' into TestPass verifier"
-        );
+        assert!(has_test_verifier, "should have TestPass verifier");
 
-        // Check that "file src/auth.rs exists" was parsed into FileExists
         let has_file_verifier = s0.criteria.iter().any(|c| {
             matches!(&c.verifier, VerifierKind::FileExists { paths } if paths.contains(&"src/auth.rs".to_string()))
         });
-        assert!(
-            has_file_verifier,
-            "should parse 'file exists' into FileExists verifier"
-        );
+        assert!(has_file_verifier, "should have FileExists verifier");
 
-        // Second subtask: "build succeeds" → BuildPass
         let s1 = &contract.subtasks[1];
         assert_eq!(s1.depends_on, vec!["auth-module"]);
         let has_build_verifier = s1
             .criteria
             .iter()
             .any(|c| matches!(c.verifier, VerifierKind::BuildPass { .. }));
-        assert!(
-            has_build_verifier,
-            "should parse 'build succeeds' into BuildPass verifier"
-        );
+        assert!(has_build_verifier, "should have BuildPass verifier");
 
-        // Global verification should include build + test + lint
         assert!(contract.global_verification.len() >= 2);
         let global_ids: Vec<&str> = contract
             .global_verification
@@ -1210,26 +563,40 @@ mod tests {
     }
 
     #[test]
-    fn generate_contract_no_acceptance() {
+    fn generate_contract_no_checks_with_files() {
         let cg = ContractGenerator::new(rust_detection());
         let plan = TaskPlan {
             subtasks: vec![SubtaskPlan {
                 id: "s1".into(),
                 title: "Do thing".into(),
                 files: vec!["src/thing.rs".into()],
-                acceptance: None,
                 ..Default::default()
             }],
             notes: None,
         };
         let contract = cg.generate("Do thing", &plan, None).unwrap();
-        // With no acceptance but files listed, should get FileExists criterion
         let s0 = &contract.subtasks[0];
         assert_eq!(s0.criteria.len(), 1);
         assert!(matches!(
             s0.criteria[0].verifier,
             VerifierKind::FileExists { .. }
         ));
+    }
+
+    #[test]
+    fn generate_contract_no_checks_no_files() {
+        let cg = ContractGenerator::new(rust_detection());
+        let plan = TaskPlan {
+            subtasks: vec![SubtaskPlan {
+                id: "s1".into(),
+                title: "Do thing".into(),
+                ..Default::default()
+            }],
+            notes: None,
+        };
+        let contract = cg.generate("Do thing", &plan, None).unwrap();
+        let s0 = &contract.subtasks[0];
+        assert!(s0.criteria.is_empty());
     }
 
     #[test]
@@ -1244,212 +611,65 @@ mod tests {
         assert!(!contract.global_verification.is_empty());
     }
 
-    #[test]
-    fn parse_acceptance_test_patterns() {
-        let det = rust_detection();
-        let criteria = parse_acceptance_to_criteria("all tests pass", "s1", &det);
-        assert_eq!(criteria.len(), 1);
-        assert!(matches!(
-            criteria[0].verifier,
-            VerifierKind::TestPass { .. }
-        ));
-    }
+    // ─── wrap_verifier tests ────────────────────────────────────────────────
 
     #[test]
-    fn parse_acceptance_build_patterns() {
-        let det = rust_detection();
-        let criteria = parse_acceptance_to_criteria("build succeeds without errors", "s1", &det);
-        assert_eq!(criteria.len(), 1);
-        assert!(matches!(
-            criteria[0].verifier,
-            VerifierKind::BuildPass { .. }
-        ));
-    }
-
-    #[test]
-    fn parse_acceptance_file_exists_pattern() {
-        let det = rust_detection();
-        let criteria = parse_acceptance_to_criteria("file src/auth.rs exists", "s1", &det);
-        assert_eq!(criteria.len(), 1);
-        assert!(matches!(
-            &criteria[0].verifier,
-            VerifierKind::FileExists { paths } if paths == &["src/auth.rs"]
-        ));
-    }
-
-    #[test]
-    fn parse_acceptance_multi_criterion() {
-        let det = rust_detection();
-        let criteria = parse_acceptance_to_criteria(
-            "tests pass; build succeeds; file src/new.rs exists",
-            "s1",
-            &det,
+    fn wrap_verifier_sets_global_only_for_build_and_test() {
+        let c = wrap_verifier(
+            "t1".into(),
+            VerifierKind::BuildPass {
+                cmd: "cargo build".into(),
+            },
         );
-        assert_eq!(criteria.len(), 3);
-        assert!(matches!(
-            criteria[0].verifier,
-            VerifierKind::TestPass { .. }
-        ));
-        assert!(matches!(
-            criteria[1].verifier,
-            VerifierKind::BuildPass { .. }
-        ));
-        assert!(matches!(
-            criteria[2].verifier,
-            VerifierKind::FileExists { .. }
-        ));
-    }
+        assert!(c.global_only);
+        assert_eq!(c.timeout_sec, 600);
 
-    #[test]
-    fn parse_acceptance_fallback_to_llm_judge() {
-        let det = rust_detection();
-        let criteria = parse_acceptance_to_criteria("code follows existing patterns", "s1", &det);
-        assert_eq!(criteria.len(), 1);
-        assert!(matches!(
-            criteria[0].verifier,
-            VerifierKind::LlmJudge { .. }
-        ));
-        assert!(
-            !criteria[0].required,
-            "non-machine-parseable fallback must not block verification"
+        let c = wrap_verifier(
+            "t2".into(),
+            VerifierKind::TestPass {
+                cmd: "cargo test".into(),
+                min_pass_rate: 1.0,
+            },
         );
-        assert!(criteria[0].global_only);
+        assert!(c.global_only);
     }
 
     #[test]
-    fn parse_acceptance_structured_file_exists() {
-        let det = rust_detection();
-        let criteria = parse_acceptance_to_criteria("file_exists: src/x.rs", "s1", &det);
-        assert_eq!(criteria.len(), 1);
-        assert!(matches!(
-            &criteria[0].verifier,
-            VerifierKind::FileExists { paths } if paths == &["src/x.rs"]
-        ));
-        assert!(criteria[0].required);
-        assert!(!criteria[0].global_only);
-    }
-
-    #[test]
-    fn parse_acceptance_structured_file_contains() {
-        let det = rust_detection();
-        let criteria =
-            parse_acceptance_to_criteria("file_contains: src/a.rs :: pub fn foo", "s1", &det);
-        assert_eq!(criteria.len(), 1);
-        assert!(matches!(
-            &criteria[0].verifier,
-            VerifierKind::ReadFileContains { path, contains, not_contains }
-            if path == "src/a.rs"
-                && contains == &["pub fn foo".to_string()]
-                && not_contains.is_empty()
-        ));
-    }
-
-    #[test]
-    fn parse_acceptance_structured_grep() {
-        let det = rust_detection();
-        let criteria = parse_acceptance_to_criteria("grep: src/b.rs :: fn main", "s1", &det);
-        assert_eq!(criteria.len(), 1);
-        assert!(matches!(
-            &criteria[0].verifier,
-            VerifierKind::GrepCheck { file, pattern, should_match }
-            if file == "src/b.rs" && pattern == "fn main" && *should_match
-        ));
-    }
-
-    #[test]
-    fn parse_acceptance_structured_tests_pass_token() {
-        let det = rust_detection();
-        let criteria = parse_acceptance_to_criteria("tests_pass", "s1", &det);
-        assert_eq!(criteria.len(), 1);
-        assert!(matches!(criteria[0].verifier, VerifierKind::TestPass { .. }));
-        assert!(criteria[0].global_only);
-        assert!(criteria[0].required);
-    }
-
-    #[test]
-    fn parse_acceptance_structured_build_succeeds_token() {
-        let det = rust_detection();
-        let criteria = parse_acceptance_to_criteria("build_succeeds", "s1", &det);
-        assert_eq!(criteria.len(), 1);
-        assert!(matches!(criteria[0].verifier, VerifierKind::BuildPass { .. }));
-        assert!(criteria[0].global_only);
-    }
-
-    #[test]
-    fn parse_acceptance_structured_command_succeeds() {
-        let det = rust_detection();
-        let criteria = parse_acceptance_to_criteria("command_succeeds: true", "s1", &det);
-        assert_eq!(criteria.len(), 1);
-        assert!(matches!(
-            &criteria[0].verifier,
-            VerifierKind::Command { cmd, expected_exit } if cmd == "true" && *expected_exit == 0
-        ));
-    }
-
-    #[test]
-    fn parse_acceptance_structured_command_output_contains() {
-        let det = rust_detection();
-        let criteria = parse_acceptance_to_criteria(
-            "command_output: echo hello :: contains: hello",
-            "s1",
-            &det,
+    fn wrap_verifier_local_for_file_checks() {
+        let c = wrap_verifier(
+            "t1".into(),
+            VerifierKind::FileExists {
+                paths: vec!["a.rs".into()],
+            },
         );
-        assert_eq!(criteria.len(), 1);
-        assert!(matches!(
-            &criteria[0].verifier,
-            VerifierKind::CommandOutput { cmd, contains, .. }
-            if cmd == "echo hello" && contains == &["hello".to_string()]
-        ));
-    }
+        assert!(!c.global_only);
+        assert_eq!(c.timeout_sec, 30);
 
-    #[test]
-    fn parse_acceptance_grep_pattern() {
-        let det = rust_detection();
-        let criteria = parse_acceptance_to_criteria(
-            "should contain 'pub fn authenticate' in file src/auth.rs",
-            "s1",
-            &det,
+        let c = wrap_verifier(
+            "t2".into(),
+            VerifierKind::GrepCheck {
+                file: "a.rs".into(),
+                pattern: "fn main".into(),
+                should_match: true,
+            },
         );
-        // Should detect grep pattern
-        assert!(!criteria.is_empty());
-        let has_grep = criteria
-            .iter()
-            .any(|c| matches!(c.verifier, VerifierKind::GrepCheck { .. }));
-        assert!(has_grep, "should parse grep pattern");
+        assert!(!c.global_only);
     }
 
     #[test]
-    fn extract_file_paths_works() {
-        let paths = extract_file_paths("modify src/auth.rs and tests/auth_test.rs");
-        assert_eq!(paths, vec!["src/auth.rs", "tests/auth_test.rs"]);
+    fn wrap_verifier_command_gets_120s_timeout() {
+        let c = wrap_verifier(
+            "t1".into(),
+            VerifierKind::Command {
+                cmd: "echo ok".into(),
+                expected_exit: 0,
+            },
+        );
+        assert_eq!(c.timeout_sec, 120);
+        assert!(!c.global_only);
     }
 
-    #[test]
-    fn extract_file_paths_with_quotes() {
-        let paths = extract_file_paths("create `src/new.rs` file");
-        assert_eq!(paths, vec!["src/new.rs"]);
-    }
-
-    #[test]
-    fn extract_file_paths_excludes_shebangs_and_system_paths() {
-        // Shebangs should not be extracted as file paths
-        let paths = extract_file_paths("contains shebang #!/bin/bash and file /tmp/script.sh");
-        assert_eq!(paths, vec!["/tmp/script.sh"]);
-
-        // System interpreter paths
-        let paths = extract_file_paths("uses /usr/bin/env python and creates src/main.py");
-        assert_eq!(paths, vec!["src/main.py"]);
-
-        // /bin/sh etc.
-        let paths = extract_file_paths("script uses /bin/sh");
-        assert!(paths.is_empty());
-    }
-
-    #[test]
-    fn extract_quoted_strings_works() {
-        let quoted = extract_quoted_strings("contains 'hello world' in file");
-        assert_eq!(quoted, vec!["hello world"]);
-    }
+    // ─── Scope inference tests ──────────────────────────────────────────────
 
     #[test]
     fn inferred_scope_excludes_deploy_and_docs() {
@@ -1483,290 +703,96 @@ mod tests {
         assert!(!scope.out_of_scope.iter().any(|s| s.contains("Deployment")));
     }
 
+    // ─── describe_verifier tests ────────────────────────────────────────────
+
     #[test]
-    fn parse_helloworld_acceptance_text() {
-        let det = ProjectDetection::default();
-        // Subtask 1: "File exists at /tmp/helloworld.sh containing ..."
-        let c1 = parse_acceptance_to_criteria(
-            "File exists at /tmp/helloworld.sh containing 'echo \"hello world!\"' or similar",
-            "create-script",
-            &det,
-        );
-        assert!(
-            !c1.is_empty(),
-            "should parse at least one criterion for 'File exists ...'"
-        );
-        let has_file = c1
-            .iter()
-            .any(|c| matches!(&c.verifier, VerifierKind::FileExists { .. }));
-        assert!(
-            has_file,
-            "should detect FileExists verifier for acceptance text with 'file exists'"
-        );
-
-        // Subtask 2: "ls -l shows executable permissions" → Permission verifier
-        let c2 = parse_acceptance_to_criteria(
-            "Script has executable permissions (ls -l shows x bits) on /tmp/helloworld.sh",
-            "make-exec",
-            &det,
-        );
-        assert!(!c2.is_empty(), "should have at least one criterion");
-        let has_perm = c2
-            .iter()
-            .any(|c| matches!(&c.verifier, VerifierKind::Command { .. }));
-        assert!(
-            has_perm,
-            "should detect Command verifier for permission check"
-        );
-        assert!(
-            !c2[0].global_only,
-            "permission check should run per-subtask"
-        );
-
-        // Subtask 3: "Running the script produces 'hello world!'" → CommandOutput
-        let c3 = parse_acceptance_to_criteria(
-            "Running /tmp/helloworld.sh produces 'hello world!' output without errors",
-            "verify-exec",
-            &det,
-        );
-        assert!(!c3.is_empty(), "should have at least one criterion");
-        let has_cmd_output = c3
-            .iter()
-            .any(|c| matches!(&c.verifier, VerifierKind::CommandOutput { .. }));
-        assert!(
-            has_cmd_output,
-            "should detect CommandOutput verifier for script execution check"
-        );
-        assert!(
-            !c3[0].global_only,
-            "command output check should run per-subtask"
-        );
+    fn convert_subtask_filters_command_variants() {
+        let cg = ContractGenerator::new(rust_detection());
+        let plan = TaskPlan {
+            subtasks: vec![SubtaskPlan {
+                id: "s1".into(),
+                title: "Do thing".into(),
+                acceptance_checks: vec![
+                    VerifierKind::FileExists {
+                        paths: vec!["a.rs".into()],
+                    },
+                    VerifierKind::Command {
+                        cmd: "rm -rf /".into(),
+                        expected_exit: 0,
+                    },
+                    VerifierKind::CommandOutput {
+                        cmd: "cat /etc/passwd".into(),
+                        contains: vec!["root".into()],
+                        not_contains: vec![],
+                    },
+                    VerifierKind::GrepCheck {
+                        file: "a.rs".into(),
+                        pattern: "fn main".into(),
+                        should_match: true,
+                    },
+                ],
+                ..Default::default()
+            }],
+            notes: None,
+        };
+        let contract = cg.generate("Do thing", &plan, None).unwrap();
+        let s0 = &contract.subtasks[0];
+        assert_eq!(s0.criteria.len(), 2, "Command and CommandOutput should be filtered");
+        assert!(matches!(s0.criteria[0].verifier, VerifierKind::FileExists { .. }));
+        assert!(matches!(s0.criteria[1].verifier, VerifierKind::GrepCheck { .. }));
     }
 
     #[test]
-    fn parse_command_output_criterion() {
-        let det = ProjectDetection::default();
-
-        // "Command /tmp/foo outputs 'bar'"
-        let c = parse_acceptance_to_criteria("Command /tmp/foo outputs 'bar'", "s1", &det);
-        assert_eq!(c.len(), 1);
-        match &c[0].verifier {
-            VerifierKind::CommandOutput { cmd, contains, .. } => {
-                assert_eq!(cmd, "/tmp/foo");
-                assert_eq!(contains, &["bar"]);
-            }
-            other => panic!("expected CommandOutput, got {:?}", other),
-        }
-
-        // "/tmp/script prints 'hello world'"
-        let c = parse_acceptance_to_criteria("/tmp/script prints 'hello world'", "s2", &det);
-        assert_eq!(c.len(), 1);
-        assert!(matches!(&c[0].verifier, VerifierKind::CommandOutput { .. }));
-
-        // "execute /tmp/run and output should contain 'done'"
-        let c = parse_acceptance_to_criteria(
-            "execute /tmp/run and output should contain 'done'",
-            "s3",
-            &det,
-        );
-        assert!(!c.is_empty());
-        let has_cmd = c
-            .iter()
-            .any(|c| matches!(&c.verifier, VerifierKind::CommandOutput { .. }));
-        assert!(has_cmd, "should detect command output pattern");
-
-        // Backtick-quoted command path should NOT appear in contains list
-        let c = parse_acceptance_to_criteria(
-            "Command `/tmp/hiworld` outputs exactly 'hi world' and exits with code 0",
-            "s4",
-            &det,
-        );
-        assert_eq!(c.len(), 1);
-        match &c[0].verifier {
-            VerifierKind::CommandOutput { cmd, contains, .. } => {
-                assert_eq!(cmd, "/tmp/hiworld");
-                assert_eq!(
-                    contains,
-                    &["hi world"],
-                    "path should not be in contains list"
-                );
-            }
-            other => panic!("expected CommandOutput, got {:?}", other),
-        }
-    }
-
-    #[test]
-    fn parse_permission_criterion() {
-        let det = ProjectDetection::default();
-
-        // "Script has executable permissions on /tmp/foo.sh"
-        let c = parse_acceptance_to_criteria(
-            "Script has executable permissions on /tmp/foo.sh",
-            "s1",
-            &det,
-        );
-        assert_eq!(c.len(), 1);
-        match &c[0].verifier {
-            VerifierKind::Command { cmd, expected_exit } => {
-                assert!(cmd.contains("test -x"), "cmd should use test -x");
-                assert!(cmd.contains("/tmp/foo.sh"));
-                assert_eq!(*expected_exit, 0);
-            }
-            other => panic!("expected Command, got {:?}", other),
-        }
-
-        // "chmod +x applied, x bit set on /tmp/bar"
-        let c = parse_acceptance_to_criteria("chmod +x applied, x bit set on /tmp/bar", "s2", &det);
-        assert!(!c.is_empty());
-        let has_perm = c
-            .iter()
-            .any(|c| matches!(&c.verifier, VerifierKind::Command { .. }));
-        assert!(
-            has_perm,
-            "should detect permission pattern with chmod keyword"
-        );
-    }
-
-    #[test]
-    fn parse_no_warnings_criterion() {
-        let det = rust_detection();
-
-        // "No compiler warnings"
-        let c = parse_acceptance_to_criteria("No compiler warnings", "s1", &det);
-        assert_eq!(c.len(), 1);
-        match &c[0].verifier {
-            VerifierKind::Command { cmd, expected_exit } => {
-                assert!(cmd.contains("cargo build"), "should use project build cmd");
-                assert!(cmd.contains("warning"), "should grep for warning");
-                assert_eq!(*expected_exit, 0);
-            }
-            other => panic!("expected Command, got {:?}", other),
-        }
-        assert!(c[0].global_only, "no-warnings check should be global_only");
-
-        // "Zero warnings in build output"
-        let c = parse_acceptance_to_criteria("Zero warnings in build output", "s2", &det);
-        assert!(!c.is_empty());
-        assert!(
-            c.iter()
-                .any(|c| matches!(&c.verifier, VerifierKind::Command { .. }))
-        );
-
-        // "Code compiles with clean output without warnings"
-        let c = parse_acceptance_to_criteria(
-            "Code compiles with clean output without warnings",
-            "s3",
-            &det,
-        );
-        assert!(!c.is_empty());
-        assert!(
-            c.iter()
-                .any(|c| matches!(&c.verifier, VerifierKind::Command { .. }))
-        );
-    }
-
-    #[test]
-    fn parse_no_warnings_needs_project_detection() {
-        // Without project detection, no build command → fallback to LlmJudge
-        let det = ProjectDetection::default();
-        let c = parse_acceptance_to_criteria("No compiler warnings", "s1", &det);
-        assert_eq!(c.len(), 1);
-        assert!(
-            matches!(&c[0].verifier, VerifierKind::LlmJudge { .. }),
-            "without build cmd, should fall to LlmJudge"
-        );
-    }
-
-    #[test]
-    fn parse_function_exists_criterion() {
-        let det = ProjectDetection::default();
-
-        // "Function authenticate exists in src/auth.rs"
-        let c =
-            parse_acceptance_to_criteria("Function authenticate exists in src/auth.rs", "s1", &det);
-        assert_eq!(c.len(), 1);
-        match &c[0].verifier {
+    fn verifier_kind_serde_roundtrip() {
+        let checks = vec![
+            VerifierKind::FileExists {
+                paths: vec!["src/lib.rs".into()],
+            },
+            VerifierKind::ReadFileContains {
+                path: "src/lib.rs".into(),
+                contains: vec!["pub fn".into()],
+                not_contains: vec![],
+            },
             VerifierKind::GrepCheck {
-                file,
-                pattern,
-                should_match,
-            } => {
-                assert_eq!(file, "src/auth.rs");
-                assert_eq!(pattern, "authenticate");
-                assert!(*should_match);
-            }
-            other => panic!("expected GrepCheck, got {:?}", other),
+                file: "src/lib.rs".into(),
+                pattern: "fn main".into(),
+                should_match: true,
+            },
+            VerifierKind::BuildPass {
+                cmd: "cargo build".into(),
+            },
+            VerifierKind::TestPass {
+                cmd: "cargo test".into(),
+                min_pass_rate: 1.0,
+            },
+        ];
+        for vk in &checks {
+            let json = serde_json::to_string(vk).unwrap();
+            let roundtripped: VerifierKind = serde_json::from_str(&json).unwrap();
+            let json2 = serde_json::to_string(&roundtripped).unwrap();
+            assert_eq!(json, json2, "roundtrip failed for {json}");
         }
-
-        // "src/models.py defines class User"
-        let c = parse_acceptance_to_criteria("src/models.py defines class User", "s2", &det);
-        assert!(!c.is_empty());
-        let has_grep = c
-            .iter()
-            .any(|c| matches!(&c.verifier, VerifierKind::GrepCheck { .. }));
-        assert!(has_grep, "should detect class existence as grep");
-
-        // "Module src/config.ts exports function createUser"
-        let c = parse_acceptance_to_criteria(
-            "Module src/config.ts exports function createUser",
-            "s3",
-            &det,
-        );
-        assert!(!c.is_empty());
-        let has_grep = c
-            .iter()
-            .any(|c| matches!(&c.verifier, VerifierKind::GrepCheck { .. }));
-        assert!(has_grep, "should detect export existence as grep");
     }
 
     #[test]
-    fn parse_flexible_grep_criterion() {
-        let det = ProjectDetection::default();
+    fn describe_verifier_coverage() {
+        let d = describe_verifier(&VerifierKind::FileExists {
+            paths: vec!["a.rs".into()],
+        });
+        assert!(d.contains("a.rs"));
 
-        // "src/config.ts includes the string 'API_KEY'"
-        let c =
-            parse_acceptance_to_criteria("src/config.ts includes the string 'API_KEY'", "s1", &det);
-        assert_eq!(c.len(), 1);
-        match &c[0].verifier {
-            VerifierKind::GrepCheck {
-                file,
-                pattern,
-                should_match,
-            } => {
-                assert_eq!(file, "src/config.ts");
-                assert_eq!(pattern, "API_KEY");
-                assert!(*should_match);
-            }
-            other => panic!("expected GrepCheck, got {:?}", other),
-        }
+        let d = describe_verifier(&VerifierKind::GrepCheck {
+            file: "b.rs".into(),
+            pattern: "fn main".into(),
+            should_match: true,
+        });
+        assert!(d.contains("fn main") && d.contains("b.rs"));
 
-        // "Makefile should have a 'test' target" — "makefile" contains "file",
-        // so file_exists parser catches it first. Use a path instead:
-        let c =
-            parse_acceptance_to_criteria("build/config.yaml should have 'debug: true'", "s2", &det);
-        assert!(!c.is_empty());
-        match &c[0].verifier {
-            VerifierKind::GrepCheck {
-                file,
-                pattern,
-                should_match,
-            } => {
-                assert_eq!(file, "build/config.yaml");
-                assert_eq!(pattern, "debug: true");
-                assert!(*should_match);
-            }
-            other => panic!("expected GrepCheck, got {:?}", other),
-        }
-
-        // Negative grep with "should not"
-        let c = parse_acceptance_to_criteria("src/auth.rs should not have 'unwrap()'", "s3", &det);
-        assert!(!c.is_empty());
-        let grep = c
-            .iter()
-            .find(|c| matches!(&c.verifier, VerifierKind::GrepCheck { .. }));
-        assert!(grep.is_some(), "should detect negative flexible grep");
-        if let VerifierKind::GrepCheck { should_match, .. } = &grep.unwrap().verifier {
-            assert!(!should_match, "should be negated");
-        }
+        let d = describe_verifier(&VerifierKind::ReadFileContains {
+            path: "c.rs".into(),
+            contains: vec!["hello".into()],
+            not_contains: vec![],
+        });
+        assert!(d.contains("c.rs") && d.contains("hello"));
     }
 }

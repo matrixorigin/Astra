@@ -8,6 +8,7 @@ use std::sync::Arc;
 // ─── Helpers ────────────────────────────────────────────────────────────
 
 fn make_plan() -> astra_services::task_orchestrator::TaskPlan {
+    use astra_services::durable_task::VerifierKind;
     use astra_services::task_orchestrator::{SubtaskPlan, TaskPlan, TaskStatus};
     TaskPlan {
         subtasks: vec![
@@ -17,7 +18,9 @@ fn make_plan() -> astra_services::task_orchestrator::TaskPlan {
                 description: Some("Create a file named hello.txt".into()),
                 depends_on: vec![],
                 status: TaskStatus::Pending,
-                acceptance: Some("File hello.txt exists".into()),
+                acceptance_checks: vec![VerifierKind::FileExists {
+                    paths: vec!["hello.txt".into()],
+                }],
                 effort: None,
                 files: vec!["hello.txt".into()],
             },
@@ -27,7 +30,11 @@ fn make_plan() -> astra_services::task_orchestrator::TaskPlan {
                 description: Some("Write 'Hello, World!' to hello.txt".into()),
                 depends_on: vec!["create-file".into()],
                 status: TaskStatus::Pending,
-                acceptance: Some("hello.txt contains Hello".into()),
+                acceptance_checks: vec![VerifierKind::ReadFileContains {
+                    path: "hello.txt".into(),
+                    contains: vec!["Hello".into()],
+                    not_contains: vec![],
+                }],
                 effort: None,
                 files: vec!["hello.txt".into()],
             },
@@ -209,7 +216,7 @@ async fn verify_global_on_empty_contract_succeeds() {
             description: None,
             depends_on: vec![],
             status: TaskStatus::Pending,
-            acceptance: None,
+            acceptance_checks: vec![],
             effort: None,
             files: vec![],
         }],

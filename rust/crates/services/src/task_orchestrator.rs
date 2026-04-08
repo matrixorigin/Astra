@@ -24,6 +24,8 @@
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
+use crate::durable_task::VerifierKind;
+
 // ─── Task Model ─────────────────────────────────────────────────────────────
 
 /// Task lifecycle status.
@@ -82,9 +84,9 @@ pub struct SubtaskPlan {
     /// Files likely to be modified (relative paths)
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub files: Vec<String>,
-    /// Acceptance criteria — how to verify this subtask is done
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub acceptance: Option<String>,
+    /// Structured verification checks — machine-executable, no heuristic parsing.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub acceptance_checks: Vec<VerifierKind>,
 }
 
 /// Decomposed plan for a complex task.
@@ -2315,7 +2317,7 @@ mod tests {
         assert_eq!(st.status, TaskStatus::Pending);
         assert!(st.effort.is_none());
         assert!(st.files.is_empty());
-        assert!(st.acceptance.is_none());
+        assert!(st.acceptance_checks.is_empty());
     }
 
     #[test]
@@ -2328,7 +2330,7 @@ mod tests {
         let json = serde_json::to_string(&st).unwrap();
         assert!(!json.contains("effort"));
         assert!(!json.contains("files"));
-        assert!(!json.contains("acceptance"));
+        assert!(!json.contains("acceptance_checks"));
     }
 
     #[test]

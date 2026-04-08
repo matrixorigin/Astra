@@ -2,6 +2,13 @@
 #
 # Default profile: infrastructure only (MatrixOne + Redis)
 # App profile: adds init + api
+#
+# Secrets (TOKEN_ENCRYPTION_KEY, JWT_SECRET_KEY, …) must be set for Compose variable
+# substitution — env_file alone does NOT participate in ${VAR:?…} interpolation.
+# Typical run from this directory:
+#   docker compose --env-file ../../.env --profile app up -d
+# Or copy / symlink ../../.env to ./.env here so the default project .env supplies values.
+# See repository .env.example (TOKEN_ENCRYPTION_KEY is required by the Rust API at startup).
 
 services:
   matrixone:
@@ -62,7 +69,8 @@ services:
       - MATRIXONE_PORT=6001
       - REDIS_URL=redis://redis:6379
     env_file:
-      - ../../.env
+      - path: ../../.env
+        required: true
     depends_on:
       matrixone:
         condition: service_healthy
@@ -88,9 +96,12 @@ services:
       - MATRIXONE_PORT=6001
       - MATRIXONE_DATABASE=${MATRIXONE_DATABASE:-astra_runtime}
       - REDIS_URL=redis://redis:6379
-      - JWT_SECRET_KEY=${JWT_SECRET_KEY:-change-me-in-production}
+      # Required at compose parse time (use --env-file ../../.env or a local .env); see file header.
+      - JWT_SECRET_KEY=${JWT_SECRET_KEY:?JWT_SECRET_KEY is required — set in .env (see .env.example)}
+      - TOKEN_ENCRYPTION_KEY=${TOKEN_ENCRYPTION_KEY:?TOKEN_ENCRYPTION_KEY is required — set in .env (see .env.example)}
     env_file:
-      - ../../.env
+      - path: ../../.env
+        required: true
     depends_on:
       init:
         condition: service_completed_successfully
