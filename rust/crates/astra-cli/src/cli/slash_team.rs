@@ -594,11 +594,13 @@ pub(super) async fn handle_team_command(arg: &str, state: &mut super::ReplState)
                 user_id: user_id.clone(),
                 session_id,
                 source_agent_id: "orchestrator".to_string(),
+                progress: None,
             };
 
             let orchestrator = astra_runtime::server::team_orchestrator::TeamExecutionOrchestrator::new(
                 team_store,
-                delegation_engine,
+                delegation_engine.clone(),
+                delegation_engine.tracker().clone(),
                 run_engine,
                 profile_registry,
                 config,

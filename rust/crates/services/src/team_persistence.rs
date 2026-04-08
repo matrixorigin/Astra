@@ -438,13 +438,43 @@ pub fn team_to_delegation_request(
 
 // ─── Persistence Trait ──────────────────────────────────────────────────────
 
-/// CRUD operations for team definitions.
+/// CRUD operations for team definitions and execution history.
 #[async_trait]
 pub trait TeamPersistenceService: Send + Sync {
     async fn save_team(&self, team: &TeamDefinition) -> Result<(), String>;
     async fn load_team(&self, user_id: &str, name: &str) -> Result<Option<TeamDefinition>, String>;
     async fn list_teams(&self, user_id: &str) -> Result<Vec<TeamDefinition>, String>;
     async fn delete_team(&self, user_id: &str, name: &str) -> Result<bool, String>;
+
+    /// Record the start of a team execution. Default: no-op.
+    async fn record_execution_start(
+        &self,
+        _execution_id: &str,
+        _team_id: &str,
+        _user_id: &str,
+        _task: &str,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// Record completion of a team execution. Default: no-op.
+    async fn record_execution_complete(
+        &self,
+        _execution_id: &str,
+        _status: &str,
+        _result_json: Option<&str>,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// List execution history for a team. Default: empty.
+    async fn list_executions(
+        &self,
+        _team_id: &str,
+        _limit: u32,
+    ) -> Result<Vec<TeamExecutionRecord>, String> {
+        Ok(vec![])
+    }
 }
 
 // ─── In-Memory Implementation ───────────────────────────────────────────────

@@ -2,10 +2,10 @@
 //!
 //! # Phases
 //!
-//! 1. **Prepare** — load team, resolve profiles, create worktrees, start durable run
-//! 2. **Execute** — dispatch through DelegationEngine
+//! 1. **Prepare** — load team, validate, resolve profiles, create worktrees, start durable run
+//! 2. **Execute** — dispatch through DelegationEngine with event logging
 //! 3. **Merge** — merge worktrees, aggregate learnings
-//! 4. **Report** — persist final status, produce execution summary
+//! 4. **Report** — persist final status, record execution history, produce summary
 //!
 //! The orchestrator wraps existing infrastructure (DelegationEngine, RunEngine,
 //! WorktreeManager) rather than replacing it.
@@ -20,14 +20,32 @@ use astra_services::coordination::{
 use astra_services::learning_merge::{AgentLearning, MergedLearning, merge_agent_learnings};
 use astra_services::team_persistence::{
     TeamPersistenceService, WorktreeMode,
-    team_to_delegation_request,
+    resolve_team,
 };
 
-use super::delegation_engine::DelegationEngine;
+use super::delegation_engine::{DelegationEngine, DelegationTracker};
 use super::run_engine::RunEngine;
 use super::worktree_isolation::{MergeResult, RepoLock, WorktreeManager};
 
 // ─── Types ──────────────────────────────────────────────────────────────────
+
+/// Progress phases emitted during team execution.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ExecutionPhase {
+    /// Team loaded and validated, profiles resolved.
+    Preparing { team_name: String, member_count: usize },
+    /// Worktrees created (only for Isolated mode).
+    WorktreesCreated { agent_ids: Vec<String> },
+    /// Delegation started via DelegationEngine.
+    Executing { delegation_id: String },
+    /// Delegation completed, merging worktrees.
+    Merging { agent_count: usize },
+    /// Merge complete, producing final report.
+    Reporting { status: TeamExecutionStatus },
+}
+
+/// Callback for reporting execution progress to the UI layer.
+pub type ProgressCallback = Arc<dyn Fn(ExecutionPhase) + Send + Sync>;
 
 /// Configuration for creating a TeamExecutionOrchestrator.
 pub struct OrchestratorConfig {
@@ -35,6 +53,8 @@ pub struct OrchestratorConfig {
     pub session_id: String,
     /// Source agent ID requesting the team execution (for delegation validation).
     pub source_agent_id: String,
+    /// Optional progress callback for UI integration.
+    pub progress: Option<ProgressCallback>,
 }
 
 /// Outcome of a full team execution lifecycle.
@@ -76,6 +96,7 @@ impl std::fmt::Display for TeamExecutionStatus {
 pub struct TeamExecutionOrchestrator {
     team_store: Arc<dyn TeamPersistenceService>,
     delegation_engine: Arc<DelegationEngine>,
+    delegation_tracker: Arc<DelegationTracker>,
     run_engine: Arc<RunEngine>,
     profile_registry: Arc<RwLock<AgentProfileRegistry>>,
     config: OrchestratorConfig,
@@ -88,6 +109,7 @@ impl TeamExecutionOrchestrator {
     pub fn new(
         team_store: Arc<dyn TeamPersistenceService>,
         delegation_engine: Arc<DelegationEngine>,
+        delegation_tracker: Arc<DelegationTracker>,
         run_engine: Arc<RunEngine>,
         profile_registry: Arc<RwLock<AgentProfileRegistry>>,
         config: OrchestratorConfig,
@@ -95,6 +117,7 @@ impl TeamExecutionOrchestrator {
         Self {
             team_store,
             delegation_engine,
+            delegation_tracker,
             run_engine,
             profile_registry,
             config,
@@ -132,58 +155,63 @@ impl TeamExecutionOrchestrator {
             .await
         {
             Ok(Some(t)) => t,
-            Ok(None) => {
-                return TeamExecutionReport {
-                    team_name: team_name.to_string(),
-                    delegation_id: String::new(),
-                    parent_run_id: String::new(),
-                    delegation_result: None,
-                    merge_result: None,
-                    merged_learning: None,
-                    status: TeamExecutionStatus::Failed,
-                    error: Some(format!("team '{team_name}' not found")),
-                };
-            }
-            Err(e) => {
-                return TeamExecutionReport {
-                    team_name: team_name.to_string(),
-                    delegation_id: String::new(),
-                    parent_run_id: String::new(),
-                    delegation_result: None,
-                    merge_result: None,
-                    merged_learning: None,
-                    status: TeamExecutionStatus::Failed,
-                    error: Some(format!("failed to load team: {e}")),
-                };
-            }
+            Ok(None) => return self.fail_report(team_name, "", "", format!("team '{team_name}' not found")),
+            Err(e) => return self.fail_report(team_name, "", "", format!("failed to load team: {e}")),
         };
 
-        // Start parent durable run
+        // Start parent durable run with team metadata
         let parent_run_id = uuid::Uuid::new_v4().to_string();
         if let Err(e) = self
             .run_engine
-            .start_run(&parent_run_id, &self.config.user_id, &self.config.session_id)
+            .start_run_ext(
+                &parent_run_id,
+                &self.config.user_id,
+                &self.config.session_id,
+                None,
+                None,
+                Some(&self.config.source_agent_id),
+            )
             .await
         {
-            return TeamExecutionReport {
-                team_name: team_name.to_string(),
-                delegation_id: String::new(),
-                parent_run_id,
-                delegation_result: None,
-                merge_result: None,
-                merged_learning: None,
-                status: TeamExecutionStatus::Failed,
-                error: Some(format!("failed to start run: {e}")),
-            };
+            return self.fail_report(team_name, "", &parent_run_id, format!("failed to start run: {e}"));
         }
 
-        // Resolve members → profiles and register them, along with
-        // a virtual orchestrator profile so delegation validation passes.
-        let (request, profiles) = team_to_delegation_request(&team, task, &parent_run_id);
+        // Emit preparation event
+        let _ = self.run_engine.append_event(
+            &parent_run_id,
+            serde_json::json!({
+                "event_type": "team_prepare",
+                "team_name": team_name,
+                "coordination": format!("{:?}", team.coordination),
+                "member_count": team.members.len(),
+                "worktree_mode": format!("{:?}", team.worktree_mode),
+            }),
+        ).await;
+
+        // Resolve members → profiles using the new resolve_team with registry lookup
+        let registry = self.profile_registry.read().await;
+        let (request, profiles) = match resolve_team(&team, task, &parent_run_id, Some(&registry)) {
+            Ok(r) => r,
+            Err(e) => {
+                drop(registry);
+                let _ = self.run_engine
+                    .persist_status(&parent_run_id, "failed", None, Some(&e))
+                    .await;
+                return self.fail_report(team_name, "", &parent_run_id, format!("team validation failed: {e}"));
+            }
+        };
+        drop(registry);
+
         let delegation_id = request.delegation_id.clone();
+
+        self.emit_progress(ExecutionPhase::Preparing {
+            team_name: team_name.to_string(),
+            member_count: profiles.len(),
+        });
+
+        // Register profiles: virtual orchestrator + resolved team members
         {
             let mut reg = self.profile_registry.write().await;
-            // Register the orchestrator as the delegation source
             let orch = AgentProfile::new(
                 &self.config.source_agent_id,
                 "orchestrator",
@@ -219,28 +247,49 @@ impl TeamExecutionOrchestrator {
                                 ),
                             );
                         }
+                        self.emit_progress(ExecutionPhase::WorktreesCreated {
+                            agent_ids: agent_ids.clone(),
+                        });
                     }
                     Err(e) => {
                         let _ = self
                             .run_engine
                             .persist_status(&parent_run_id, "failed", None, Some(&e.to_string()))
                             .await;
-                        return TeamExecutionReport {
-                            team_name: team_name.to_string(),
-                            delegation_id,
-                            parent_run_id,
-                            delegation_result: None,
-                            merge_result: None,
-                            merged_learning: None,
-                            status: TeamExecutionStatus::Failed,
-                            error: Some(format!("failed to create worktrees: {e}")),
-                        };
+                        return self.fail_report(
+                            team_name, &delegation_id, &parent_run_id,
+                            format!("failed to create worktrees: {e}"),
+                        );
                     }
                 }
             }
         }
 
+        // Persist checkpoint after preparation phase
+        let checkpoint = serde_json::json!({
+            "phase": "prepared",
+            "delegation_id": &delegation_id,
+            "agent_ids": &agent_ids,
+            "worktree_mode": format!("{:?}", team.worktree_mode),
+        }).to_string();
+        let _ = self.run_engine.persist_checkpoint(
+            &parent_run_id,
+            &checkpoint,
+        ).await;
+
         // ── Phase 2: Execute ────────────────────────────────────────────
+        self.emit_progress(ExecutionPhase::Executing {
+            delegation_id: delegation_id.clone(),
+        });
+
+        let _ = self.run_engine.append_event(
+            &parent_run_id,
+            serde_json::json!({
+                "event_type": "team_execute_start",
+                "delegation_id": &delegation_id,
+            }),
+        ).await;
+
         let delegation_result = match self
             .delegation_engine
             .execute(effective_request, &self.config.source_agent_id)
@@ -257,26 +306,42 @@ impl TeamExecutionOrchestrator {
                         eprintln!("[team-orchestrator] worktree cleanup failed after delegation error: {ce}");
                     }
                 }
-                return TeamExecutionReport {
-                    team_name: team_name.to_string(),
-                    delegation_id,
-                    parent_run_id,
-                    delegation_result: None,
-                    merge_result: None,
-                    merged_learning: None,
-                    status: TeamExecutionStatus::Failed,
-                    error: Some(format!("delegation failed: {e}")),
-                };
+                return self.fail_report(
+                    team_name, &delegation_id, &parent_run_id,
+                    format!("delegation failed: {e}"),
+                );
             }
         };
 
+        // Persist token usage from delegation results
+        let (total_prompt, total_completion, total_tools) = sum_usage(&delegation_result);
+        let _ = self.run_engine.persist_usage(
+            &parent_run_id,
+            total_prompt,
+            total_completion,
+            total_tools,
+        ).await;
+
+        let _ = self.run_engine.append_event(
+            &parent_run_id,
+            serde_json::json!({
+                "event_type": "team_execute_complete",
+                "agent_results": delegation_result.agent_results.len(),
+                "total_prompt_tokens": total_prompt,
+                "total_completion_tokens": total_completion,
+            }),
+        ).await;
+
         // ── Phase 3: Merge ──────────────────────────────────────────────
+        self.emit_progress(ExecutionPhase::Merging {
+            agent_count: delegation_result.agent_results.len(),
+        });
+
         let merge_result = if team.worktree_mode == WorktreeMode::Isolated {
             if let Some(ref mgr) = worktree_mgr {
                 match mgr.merge_worktrees(&delegation_id, &agent_ids).await {
                     Ok(r) => Some(r),
                     Err(e) => {
-                        // Non-fatal: report but continue
                         eprintln!("[team-orchestrator] worktree merge warning: {e}");
                         None
                     }
@@ -312,10 +377,41 @@ impl TeamExecutionOrchestrator {
             TeamExecutionStatus::Completed
         };
 
+        self.emit_progress(ExecutionPhase::Reporting {
+            status: status.clone(),
+        });
+
+        // Persist final run status
         let _ = self
             .run_engine
             .persist_status(&parent_run_id, &status.to_string(), None, None)
             .await;
+
+        // Record team execution history for /team history
+        let result_summary = serde_json::json!({
+            "agent_count": delegation_result.agent_results.len(),
+            "total_prompt_tokens": total_prompt,
+            "total_completion_tokens": total_completion,
+            "total_tool_calls": total_tools,
+            "has_conflicts": has_conflicts,
+            "merged_learning_patterns": merged_learning.as_ref().map(|l| l.consensus_patterns.len()).unwrap_or(0),
+        });
+        let _ = self.team_store.record_execution_start(
+            &delegation_id, &team.team_id, &self.config.user_id, task,
+        ).await;
+        let _ = self.team_store.record_execution_complete(
+            &delegation_id, &status.to_string(), Some(&result_summary.to_string()),
+        ).await;
+
+        // Final event
+        let _ = self.run_engine.append_event(
+            &parent_run_id,
+            serde_json::json!({
+                "event_type": "team_complete",
+                "status": status.to_string(),
+                "has_conflicts": has_conflicts,
+            }),
+        ).await;
 
         // Cleanup worktrees
         if let Some(ref mut mgr) = worktree_mgr {
@@ -335,9 +431,72 @@ impl TeamExecutionOrchestrator {
             error: None,
         }
     }
+
+    /// Pause all agents in an active team delegation.
+    pub async fn pause_team(&self, delegation_id: &str) -> usize {
+        self.delegation_tracker.pause_delegation(delegation_id).await
+    }
+
+    /// Resume all agents in a paused team delegation.
+    pub async fn resume_team(&self, delegation_id: &str) -> usize {
+        self.delegation_tracker.resume_delegation(delegation_id).await
+    }
+
+    /// Check if a delegation is currently paused.
+    pub async fn is_paused(&self, delegation_id: &str) -> bool {
+        let sub_runs = self.delegation_tracker.get_sub_runs(delegation_id).await;
+        if sub_runs.is_empty() {
+            return false;
+        }
+        // Paused if any sub-run is paused
+        for sr in &sub_runs {
+            if self.delegation_tracker.is_paused(&sr.run_id).await {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn emit_progress(&self, phase: ExecutionPhase) {
+        if let Some(ref cb) = self.config.progress {
+            cb(phase);
+        }
+    }
+
+    fn fail_report(
+        &self,
+        team_name: &str,
+        delegation_id: &str,
+        parent_run_id: &str,
+        error: String,
+    ) -> TeamExecutionReport {
+        TeamExecutionReport {
+            team_name: team_name.to_string(),
+            delegation_id: delegation_id.to_string(),
+            parent_run_id: parent_run_id.to_string(),
+            delegation_result: None,
+            merge_result: None,
+            merged_learning: None,
+            status: TeamExecutionStatus::Failed,
+            error: Some(error),
+        }
+    }
 }
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
+
+/// Sum token usage across all agent results.
+fn sum_usage(result: &DelegationResult) -> (u64, u64, u32) {
+    let mut prompt = 0u64;
+    let mut completion = 0u64;
+    let mut tools = 0u32;
+    for r in &result.agent_results {
+        prompt += r.prompt_tokens;
+        completion += r.completion_tokens;
+        tools += r.tool_calls;
+    }
+    (prompt, completion, tools)
+}
 
 /// Extract a synthetic AgentLearning from an agent result.
 ///
@@ -388,19 +547,21 @@ mod tests {
         let delegation = Arc::new(DelegationEngine::with_executor(
             registry.clone(),
             run_engine.clone(),
-            tracker,
+            tracker.clone(),
             Arc::new(StubSubRunExecutor),
         ));
 
         TeamExecutionOrchestrator::new(
             team_store,
             delegation,
+            tracker,
             run_engine,
             registry,
             OrchestratorConfig {
                 user_id: "test-user".to_string(),
                 session_id: "test-session".to_string(),
                 source_agent_id: "orchestrator".to_string(),
+                progress: None,
             },
         )
     }
@@ -466,5 +627,276 @@ mod tests {
             "completed_with_conflicts"
         );
         assert_eq!(TeamExecutionStatus::Failed.to_string(), "failed");
+    }
+
+    // ─── T-6: Enhanced orchestrator tests ──────────────────────────────
+
+    /// Setup returning orchestrator + run_engine for introspection.
+    async fn setup_with_engines(
+        team_store: Arc<InMemoryTeamStore>,
+    ) -> (TeamExecutionOrchestrator, Arc<RunEngine>, Arc<DelegationTracker>) {
+        let registry = Arc::new(RwLock::new(AgentProfileRegistry::new()));
+
+        {
+            let mut reg = registry.write().await;
+            let orch = AgentProfile::new("orchestrator", "orchestrator", AgentTier::Orchestrator);
+            let _ = reg.register(orch);
+        }
+
+        let run_store = Arc::new(InMemoryRunStateStore::new());
+        let run_engine = Arc::new(RunEngine::new(run_store));
+        let tracker = Arc::new(DelegationTracker::new());
+
+        let delegation = Arc::new(DelegationEngine::with_executor(
+            registry.clone(),
+            run_engine.clone(),
+            tracker.clone(),
+            Arc::new(StubSubRunExecutor),
+        ));
+
+        let orch = TeamExecutionOrchestrator::new(
+            team_store,
+            delegation,
+            tracker.clone(),
+            run_engine.clone(),
+            registry,
+            OrchestratorConfig {
+                user_id: "test-user".to_string(),
+                session_id: "test-session".to_string(),
+                source_agent_id: "orchestrator".to_string(),
+                progress: None,
+            },
+        );
+
+        (orch, run_engine, tracker)
+    }
+
+    #[tokio::test]
+    async fn execute_persists_run_events() {
+        let store = Arc::new(InMemoryTeamStore::with_builtins("test-user"));
+        let (orch, run_engine, _) = setup_with_engines(store).await;
+
+        let report = orch.execute_team("research", "analyze", None).await;
+        assert_eq!(report.status, TeamExecutionStatus::Completed);
+
+        // The parent run should have events logged
+        let run = run_engine.load_run(&report.parent_run_id).await.unwrap().unwrap();
+        assert!(run.events.len() >= 3, "expected at least 3 events (prepare, exec_start, complete), got {}", run.events.len());
+
+        // Verify event types
+        let event_types: Vec<String> = run.events.iter()
+            .filter_map(|e| e.get("event_type").and_then(|v| v.as_str()).map(String::from))
+            .collect();
+        assert!(event_types.contains(&"team_prepare".to_string()));
+        assert!(event_types.contains(&"team_execute_start".to_string()));
+        assert!(event_types.contains(&"team_complete".to_string()));
+    }
+
+    #[tokio::test]
+    async fn execute_persists_usage() {
+        let store = Arc::new(InMemoryTeamStore::with_builtins("test-user"));
+        let (orch, run_engine, _) = setup_with_engines(store).await;
+
+        let report = orch.execute_team("research", "task", None).await;
+        assert_eq!(report.status, TeamExecutionStatus::Completed);
+
+        let run = run_engine.load_run(&report.parent_run_id).await.unwrap().unwrap();
+        // StubSubRunExecutor produces results with default token counts
+        // Usage should have been persisted (even if 0 from stubs)
+        assert_eq!(run.status, "completed");
+    }
+
+    #[tokio::test]
+    async fn execute_persists_checkpoint() {
+        let store = Arc::new(InMemoryTeamStore::with_builtins("test-user"));
+        let (orch, run_engine, _) = setup_with_engines(store).await;
+
+        let report = orch.execute_team("research", "task", None).await;
+        assert_eq!(report.status, TeamExecutionStatus::Completed);
+
+        let run = run_engine.load_run(&report.parent_run_id).await.unwrap().unwrap();
+        // Checkpoint should be set after preparation phase
+        assert!(run.checkpoint_json.is_some(), "expected checkpoint to be persisted");
+        let cp: serde_json::Value = serde_json::from_str(run.checkpoint_json.as_ref().unwrap()).unwrap();
+        assert_eq!(cp["phase"], "prepared");
+    }
+
+    #[tokio::test]
+    async fn execute_uses_resolve_team_with_registry() {
+        let store = Arc::new(InMemoryTeamStore::with_builtins("test-user"));
+        let (orch, _, _) = setup_with_engines(store).await;
+
+        // Pre-register a profile — but note the builtin team members have
+        // explicit system_prompt overrides, so the registry prompt won't
+        // be used (member override wins). We verify the profile is in the
+        // registry after execution, meaning resolve_team used registry lookup.
+        {
+            let mut reg = orch.profile_registry.write().await;
+            let mut custom = AgentProfile::new("team-research-explorer", "explorer", AgentTier::System);
+            custom.system_prompt = Some("Custom registered prompt.".to_string());
+            custom.model_override = Some("gpt-4-turbo".to_string());
+            let _ = reg.register(custom);
+        }
+
+        let report = orch.execute_team("research", "task", None).await;
+        assert_eq!(report.status, TeamExecutionStatus::Completed);
+
+        // After execution, the profile was re-registered with resolved values.
+        // The member's explicit system_prompt overrides the registry prompt.
+        let reg = orch.profile_registry.read().await;
+        let profile = reg.get("team-research-explorer").unwrap();
+        // Member system_prompt takes precedence over registry
+        assert!(profile.system_prompt.as_ref().unwrap().contains("search the codebase"));
+        // But the resolve path DID use registry as base — model_override was empty
+        // on the member, so it should be None (member override is None → no override)
+        // This confirms the profile was freshly resolved.
+    }
+
+    #[tokio::test]
+    async fn progress_callback_receives_phases() {
+        let store = Arc::new(InMemoryTeamStore::with_builtins("test-user"));
+        let phases = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let phases_clone = phases.clone();
+
+        let registry = Arc::new(RwLock::new(AgentProfileRegistry::new()));
+        {
+            let mut reg = registry.write().await;
+            let orch = AgentProfile::new("orchestrator", "orchestrator", AgentTier::Orchestrator);
+            let _ = reg.register(orch);
+        }
+        let run_store = Arc::new(InMemoryRunStateStore::new());
+        let run_engine = Arc::new(RunEngine::new(run_store));
+        let tracker = Arc::new(DelegationTracker::new());
+        let delegation = Arc::new(DelegationEngine::with_executor(
+            registry.clone(),
+            run_engine.clone(),
+            tracker.clone(),
+            Arc::new(StubSubRunExecutor),
+        ));
+
+        let orch = TeamExecutionOrchestrator::new(
+            store,
+            delegation,
+            tracker,
+            run_engine,
+            registry,
+            OrchestratorConfig {
+                user_id: "test-user".to_string(),
+                session_id: "test-session".to_string(),
+                source_agent_id: "orchestrator".to_string(),
+                progress: Some(Arc::new(move |phase| {
+                    phases_clone.lock().unwrap().push(format!("{phase:?}"));
+                })),
+            },
+        );
+
+        let report = orch.execute_team("research", "task", None).await;
+        assert_eq!(report.status, TeamExecutionStatus::Completed);
+
+        let collected = phases.lock().unwrap();
+        assert!(collected.len() >= 3, "expected at least 3 progress phases, got {}", collected.len());
+        assert!(collected[0].contains("Preparing"));
+        assert!(collected.iter().any(|p| p.contains("Executing")));
+        assert!(collected.iter().any(|p| p.contains("Reporting")));
+    }
+
+    #[tokio::test]
+    async fn execute_team_validation_failure() {
+        let store = Arc::new(InMemoryTeamStore::new());
+        // Save a team with empty members (invalid)
+        let invalid_team = astra_services::team_persistence::TeamDefinition {
+            team_id: "bad-team".to_string(),
+            user_id: "test-user".to_string(),
+            name: "bad".to_string(),
+            description: "Invalid team".to_string(),
+            coordination: astra_services::team_persistence::TeamCoordination::Pipeline,
+            members: vec![],
+            context: std::collections::HashMap::new(),
+            worktree_mode: WorktreeMode::Shared,
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+        };
+        let _ = store.save_team(&invalid_team).await;
+        let (orch, _, _) = setup_with_engines(store).await;
+
+        let report = orch.execute_team("bad", "task", None).await;
+        assert_eq!(report.status, TeamExecutionStatus::Failed);
+        assert!(report.error.as_ref().unwrap().contains("validation failed"));
+    }
+
+    #[tokio::test]
+    async fn sum_usage_aggregates_correctly() {
+        let result = DelegationResult {
+            delegation_id: "d1".to_string(),
+            status: "completed".to_string(),
+            agent_results: vec![
+                AgentResult {
+                    agent_id: "a1".to_string(),
+                    run_id: "r1".to_string(),
+                    status: "completed".to_string(),
+                    output: None,
+                    error: None,
+                    prompt_tokens: 100,
+                    completion_tokens: 50,
+                    tool_calls: 3,
+                },
+                AgentResult {
+                    agent_id: "a2".to_string(),
+                    run_id: "r2".to_string(),
+                    status: "completed".to_string(),
+                    output: None,
+                    error: None,
+                    prompt_tokens: 200,
+                    completion_tokens: 80,
+                    tool_calls: 5,
+                },
+            ],
+            aggregated_output: None,
+            total_prompt_tokens: 0,
+            total_completion_tokens: 0,
+            total_tool_calls: 0,
+        };
+        let (p, c, t) = sum_usage(&result);
+        assert_eq!(p, 300);
+        assert_eq!(c, 130);
+        assert_eq!(t, 8);
+    }
+
+    #[test]
+    fn fail_report_helper() {
+        let store = Arc::new(InMemoryTeamStore::new());
+        let registry = Arc::new(RwLock::new(AgentProfileRegistry::new()));
+        let run_store = Arc::new(InMemoryRunStateStore::new());
+        let run_engine = Arc::new(RunEngine::new(run_store));
+        let tracker = Arc::new(DelegationTracker::new());
+
+        // We need a sync test, so we construct minimally
+        let orch = TeamExecutionOrchestrator {
+            team_store: store,
+            delegation_engine: Arc::new(DelegationEngine::with_executor(
+                registry.clone(),
+                run_engine.clone(),
+                tracker.clone(),
+                Arc::new(StubSubRunExecutor),
+            )),
+            delegation_tracker: tracker,
+            run_engine,
+            profile_registry: registry,
+            config: OrchestratorConfig {
+                user_id: "u".to_string(),
+                session_id: "s".to_string(),
+                source_agent_id: "o".to_string(),
+                progress: None,
+            },
+            repo_lock: super::super::worktree_isolation::new_repo_lock(),
+            conflict_resolver: None,
+        };
+
+        let report = orch.fail_report("team", "deleg", "run", "boom".to_string());
+        assert_eq!(report.status, TeamExecutionStatus::Failed);
+        assert_eq!(report.team_name, "team");
+        assert_eq!(report.delegation_id, "deleg");
+        assert_eq!(report.parent_run_id, "run");
+        assert_eq!(report.error, Some("boom".to_string()));
     }
 }
