@@ -1309,6 +1309,97 @@ mod tests {
             criteria[0].verifier,
             VerifierKind::LlmJudge { .. }
         ));
+        assert!(
+            !criteria[0].required,
+            "non-machine-parseable fallback must not block verification"
+        );
+        assert!(criteria[0].global_only);
+    }
+
+    #[test]
+    fn parse_acceptance_structured_file_exists() {
+        let det = rust_detection();
+        let criteria = parse_acceptance_to_criteria("file_exists: src/x.rs", "s1", &det);
+        assert_eq!(criteria.len(), 1);
+        assert!(matches!(
+            &criteria[0].verifier,
+            VerifierKind::FileExists { paths } if paths == &["src/x.rs"]
+        ));
+        assert!(criteria[0].required);
+        assert!(!criteria[0].global_only);
+    }
+
+    #[test]
+    fn parse_acceptance_structured_file_contains() {
+        let det = rust_detection();
+        let criteria =
+            parse_acceptance_to_criteria("file_contains: src/a.rs :: pub fn foo", "s1", &det);
+        assert_eq!(criteria.len(), 1);
+        assert!(matches!(
+            &criteria[0].verifier,
+            VerifierKind::ReadFileContains { path, contains, not_contains }
+            if path == "src/a.rs"
+                && contains == &["pub fn foo".to_string()]
+                && not_contains.is_empty()
+        ));
+    }
+
+    #[test]
+    fn parse_acceptance_structured_grep() {
+        let det = rust_detection();
+        let criteria = parse_acceptance_to_criteria("grep: src/b.rs :: fn main", "s1", &det);
+        assert_eq!(criteria.len(), 1);
+        assert!(matches!(
+            &criteria[0].verifier,
+            VerifierKind::GrepCheck { file, pattern, should_match }
+            if file == "src/b.rs" && pattern == "fn main" && *should_match
+        ));
+    }
+
+    #[test]
+    fn parse_acceptance_structured_tests_pass_token() {
+        let det = rust_detection();
+        let criteria = parse_acceptance_to_criteria("tests_pass", "s1", &det);
+        assert_eq!(criteria.len(), 1);
+        assert!(matches!(criteria[0].verifier, VerifierKind::TestPass { .. }));
+        assert!(criteria[0].global_only);
+        assert!(criteria[0].required);
+    }
+
+    #[test]
+    fn parse_acceptance_structured_build_succeeds_token() {
+        let det = rust_detection();
+        let criteria = parse_acceptance_to_criteria("build_succeeds", "s1", &det);
+        assert_eq!(criteria.len(), 1);
+        assert!(matches!(criteria[0].verifier, VerifierKind::BuildPass { .. }));
+        assert!(criteria[0].global_only);
+    }
+
+    #[test]
+    fn parse_acceptance_structured_command_succeeds() {
+        let det = rust_detection();
+        let criteria = parse_acceptance_to_criteria("command_succeeds: true", "s1", &det);
+        assert_eq!(criteria.len(), 1);
+        assert!(matches!(
+            &criteria[0].verifier,
+            VerifierKind::Command { cmd, expected_exit } if cmd == "true" && *expected_exit == 0
+        ));
+    }
+
+    #[test]
+    fn parse_acceptance_structured_command_output_contains() {
+        let det = rust_detection();
+        let criteria = parse_acceptance_to_criteria(
+            "command_output: echo hello :: contains: hello",
+            "s1",
+            &det,
+        );
+        assert_eq!(criteria.len(), 1);
+        assert!(matches!(
+            &criteria[0].verifier,
+            VerifierKind::CommandOutput { cmd, contains, .. }
+            if cmd == "echo hello" && contains == &["hello".to_string()]
+        ));
     }
 
     #[test]

@@ -94,3 +94,45 @@ pub async fn collect_sse_text(
 
     result
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use http::Response;
+
+    fn sse_response(body: &'static str) -> reqwest::Response {
+        let r = Response::builder()
+            .status(200)
+            .body(reqwest::Body::from(body))
+            .expect("test response");
+        reqwest::Response::from(r)
+    }
+
+    #[tokio::test]
+    async fn collect_sse_merges_text_deltas() {
+        let body = concat!(
+            "data: {\"type\":\"text_delta\",\"content\":\"hel\"}\n\n",
+            "data: {\"type\":\"text_delta\",\"content\":\"lo\"}\n\n",
+        );
+        let r = collect_sse_text(sse_response(body), false).await;
+        assert_eq!(r.text, "hello");
+        assert!(r.event_types.contains(&"text_delta".to_string()));
+        assert!(r.event_count >= 2);
+    }
+
+    #[tokio::test]
+    async fn collect_sse_records_error_type() {
+        let body = "data: {\"type\":\"error\",\"message\":\"bad\"}\n\n";
+        let r = collect_sse_text(sse_response(body), false).await;
+        assert!(r.event_types.contains(&"error".to_string()));
+        assert!(r.text.is_empty());
+    }
+
+    #[tokio::test]
+    async fn collect_sse_tail_buffer_text_delta() {
+        // No trailing \n\n — handled by final line scan
+        let body = "data: {\"type\":\"text_delta\",\"content\":\"x\"}\n";
+        let r = collect_sse_text(sse_response(body), false).await;
+        assert_eq!(r.text, "x");
+    }
+}

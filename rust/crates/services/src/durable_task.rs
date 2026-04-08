@@ -4068,6 +4068,75 @@ mod tests {
         assert_eq!(st.retry_count, 0);
     }
 
+    #[tokio::test]
+    async fn read_file_contains_passes_when_strings_present() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("f.txt"), "alpha beta").expect("write");
+        let runner = VerificationRunner::new(dir.path().to_path_buf());
+        let crit = VerificationCriterion {
+            id: "rc1".into(),
+            description: "contains alpha".into(),
+            verifier: VerifierKind::ReadFileContains {
+                path: "f.txt".into(),
+                contains: vec!["alpha".into(), "beta".into()],
+                not_contains: vec![],
+            },
+            required: true,
+            timeout_sec: 10,
+            global_only: false,
+        };
+        let res = runner.run_criterion(&crit).await;
+        assert!(res.passed, "evidence: {}", res.evidence);
+        assert!(res.error.is_none());
+    }
+
+    #[tokio::test]
+    async fn read_file_contains_fails_on_missing_substring() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("g.txt"), "only this").expect("write");
+        let runner = VerificationRunner::new(dir.path().to_path_buf());
+        let crit = VerificationCriterion {
+            id: "rc2".into(),
+            description: "missing needle".into(),
+            verifier: VerifierKind::ReadFileContains {
+                path: "g.txt".into(),
+                contains: vec!["needle".into()],
+                not_contains: vec![],
+            },
+            required: true,
+            timeout_sec: 10,
+            global_only: false,
+        };
+        let res = runner.run_criterion(&crit).await;
+        assert!(!res.passed);
+        assert!(
+            res.evidence.contains("missing"),
+            "evidence: {}",
+            res.evidence
+        );
+    }
+
+    #[tokio::test]
+    async fn read_file_contains_respects_not_contains() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("h.txt"), "clean").expect("write");
+        let runner = VerificationRunner::new(dir.path().to_path_buf());
+        let crit = VerificationCriterion {
+            id: "rc3".into(),
+            description: "no bad".into(),
+            verifier: VerifierKind::ReadFileContains {
+                path: "h.txt".into(),
+                contains: vec!["clean".into()],
+                not_contains: vec!["bad".into()],
+            },
+            required: true,
+            timeout_sec: 10,
+            global_only: false,
+        };
+        let res = runner.run_criterion(&crit).await;
+        assert!(res.passed);
+    }
+
     #[test]
     fn subtask_stage_as_str() {
         assert_eq!(SubtaskStage::Pending.as_str(), "pending");

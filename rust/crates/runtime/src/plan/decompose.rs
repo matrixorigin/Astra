@@ -3824,6 +3824,40 @@ Done!"#;
     }
 
     #[test]
+    fn progress_bar_segments_clamps_fill() {
+        assert_eq!(progress_bar_segments(0, 10), (0, 10));
+        assert_eq!(progress_bar_segments(50, 10), (5, 5));
+        assert_eq!(progress_bar_segments(100, 10), (10, 0));
+        assert_eq!(progress_bar_segments(100, 3), (3, 0));
+        assert_eq!(progress_bar_segments(200, 5), (5, 0));
+        let (f, e) = progress_bar_segments(33, 3);
+        assert_eq!(f + e, 3);
+    }
+
+    #[test]
+    fn format_plan_markdown_includes_goal_and_summary() {
+        let plan = TaskPlan {
+            subtasks: vec![SubtaskPlan {
+                id: "t1".into(),
+                title: "First".into(),
+                description: Some("Desc".into()),
+                depends_on: vec![],
+                status: TaskStatus::Completed,
+                effort: Some("small".into()),
+                files: vec!["a.rs".into()],
+                acceptance: Some("file_exists: a.rs".into()),
+            }],
+            notes: Some("Note line".into()),
+        };
+        let md = format_plan_markdown(&plan, Some("Ship it"));
+        assert!(md.contains("Ship it"));
+        assert!(md.contains("t1"));
+        assert!(md.contains("First"));
+        assert!(md.contains("Note line"));
+        assert!(md.contains("100%") || md.contains("1/1"));
+    }
+
+    #[test]
     fn decomposition_prompt_includes_context() {
         let ctx = ProjectContext {
             root: "/test".to_string(),
