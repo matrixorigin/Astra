@@ -15,7 +15,7 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 
 use astra_services::coordination::{
-    AgentProfileRegistry, AgentResult, DelegationResult,
+    AgentProfile, AgentProfileRegistry, AgentResult, AgentTier, DelegationResult,
 };
 use astra_services::learning_merge::{AgentLearning, MergedLearning, merge_agent_learnings};
 use astra_services::team_persistence::{
@@ -157,11 +157,19 @@ impl TeamExecutionOrchestrator {
             };
         }
 
-        // Resolve members → profiles and register them
+        // Resolve members → profiles and register them, along with
+        // a virtual orchestrator profile so delegation validation passes.
         let (request, profiles) = team_to_delegation_request(&team, task, &parent_run_id);
         let delegation_id = request.delegation_id.clone();
         {
             let mut reg = self.profile_registry.write().await;
+            // Register the orchestrator as the delegation source
+            let orch = AgentProfile::new(
+                &self.config.source_agent_id,
+                "orchestrator",
+                AgentTier::Orchestrator,
+            );
+            let _ = reg.register(orch);
             for profile in &profiles {
                 let _ = reg.register(profile.clone());
             }

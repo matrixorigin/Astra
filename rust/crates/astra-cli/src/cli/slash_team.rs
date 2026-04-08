@@ -243,9 +243,17 @@ fn infer_coordination(team: &Team) -> astra_services::team_persistence::TeamCoor
 
     // Pipeline: if members appear to be sequential stages
     if team.members.len() >= 2
-        && roles
-            .iter()
-            .any(|r| r.contains("analyst") || r.contains("planner"))
+        && roles.iter().any(|r| {
+            r.contains("analyst")
+                || r.contains("planner")
+                || r.contains("explorer")
+                || r.contains("researcher")
+        })
+        && roles.iter().any(|r| {
+            r.contains("synthesizer")
+                || r.contains("implementer")
+                || r.contains("executor")
+        })
     {
         return TeamCoordination::Pipeline;
     }
@@ -497,8 +505,9 @@ pub(super) async fn handle_team_command(arg: &str, state: &mut super::ReplState)
             let team_store = Arc::new(
                 astra_services::team_persistence::InMemoryTeamStore::new(),
             );
-            {
-                let _ = team_store.save_team(&team_def).await;
+            if let Err(e) = team_store.save_team(&team_def).await {
+                eprintln!("  {} Failed to prepare team store: {e}", theme::icon_err());
+                return;
             }
 
             // Reuse the delegation engine's shared registry and run engine
@@ -771,5 +780,90 @@ mod tests {
     fn remove_nonexistent_fails() {
         let mut reg = TeamRegistry::new();
         assert!(reg.remove("ghost").is_err());
+    }
+
+    // ── Coordination inference tests ────────────────────────────────
+
+    fn make_team(roles: &[&str]) -> Team {
+        Team {
+            name: "test".into(),
+            description: "test team".into(),
+            members: roles
+                .iter()
+                .map(|r| TeamMember {
+                    role: r.to_string(),
+                    description: format!("{r} agent"),
+                    skills: vec![],
+                    model_override: None,
+                })
+                .collect(),
+            shared_context: HashMap::new(),
+            created_at: "2024-01-01T00:00:00Z".into(),
+        }
+    }
+
+    #[test]
+    fn infer_adversarial_from_producer_reviewer() {
+        use astra_services::team_persistence::TeamCoordination;
+        let team = make_team(&["producer", "reviewer"]);
+        let coord = infer_coordination(&team);
+        assert!(matches!(coord, TeamCoordination::Adversarial { .. }));
+    }
+
+    #[test]
+    fn infer_adversarial_from_writer_critic() {
+        use astra_services::team_persistence::TeamCoordination;
+        let team = make_team(&["writer", "critic"]);
+        let coord = infer_coordination(&team);
+        assert!(matches!(coord, TeamCoordination::Adversarial { .. }));
+    }
+
+    #[test]
+    fn infer_pipeline_from_analyst_implementer() {
+        use astra_services::team_persistence::TeamCoordination;
+        let team = make_team(&["analyst", "implementer"]);
+        let coord = infer_coordination(&team);
+        assert!(matches!(coord, TeamCoordination::Pipeline));
+    }
+
+    #[test]
+    fn infer_pipeline_from_explorer_synthesizer() {
+        use astra_services::team_persistence::TeamCoordination;
+        let team = make_team(&["explorer", "synthesizer"]);
+        let coord = infer_coordination(&team);
+        assert!(matches!(coord, TeamCoordination::Pipeline));
+    }
+
+    #[test]
+    fn infer_fanout_for_generic_roles() {
+        use astra_services::team_persistence::TeamCoordination;
+        let team = make_team(&["alpha", "beta", "gamma"]);
+        let coord = infer_coordination(&team);
+        assert!(matches!(coord, TeamCoordination::FanOut { .. }));
+    }
+
+    #[test]
+    fn cli_team_to_definition_converts_members() {
+        let team = make_team(&["coder", "tester"]);
+        let def = cli_team_to_definition(&team, "user-123");
+        assert_eq!(def.name, "test");
+        assert_eq!(def.user_id, "user-123");
+        assert_eq!(def.members.len(), 2);
+        assert_eq!(def.members[0].role, "coder");
+        assert_eq!(def.members[1].role, "tester");
+        assert!(def.members[0].agent_id.is_none());
+        assert_eq!(
+            def.members[0].system_prompt.as_deref(),
+            Some("coder agent")
+        );
+    }
+
+    #[test]
+    fn cli_team_to_definition_preserves_context() {
+        let mut team = make_team(&["a"]);
+        team.shared_context
+            .insert("lang".into(), "rust".into());
+        let def = cli_team_to_definition(&team, "u");
+        assert_eq!(def.context.get("lang").unwrap(), "rust");
     }
 }
