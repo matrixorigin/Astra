@@ -11,14 +11,72 @@ use std::{
     env, fs,
     path::{Path, PathBuf},
     process::{Command, Stdio},
-    sync::{atomic::{AtomicBool, Ordering}, Mutex},
+    sync::{atomic::{AtomicBool, Ordering}, RwLock},
     time::Duration,
 };
 
-// Global mutex for environment variable mutations (env_set/env_unset).
-// Required because std::env::set_var and remove_var are unsafe in Rust 2024 edition
-// due to potential data races when called from multiple threads.
-static ENV_MUTEX: Mutex<()> = Mutex::new(());
+// Thread-safe environment variable overlay for the `env` tool.
+// Instead of calling unsafe `std::env::set_var` (which is unsound in
+// multi-threaded programs under Rust 2024 edition), the env tool writes to
+// this overlay. Reads merge overlay values with the real environment.
+// Child processes receive overlay values via `Command::envs()`.
+static ENV_OVERLAY: RwLock<Option<HashMap<String, Option<String>>>> = RwLock::new(None);
+
+/// Read an env var, checking the overlay first then falling back to real env.
+fn env_overlay_get(name: &str) -> Option<String> {
+    if let Ok(guard) = ENV_OVERLAY.read() {
+        if let Some(ref map) = *guard {
+            if let Some(entry) = map.get(name) {
+                return entry.clone(); // Some(val) = set, None = removed
+            }
+        }
+    }
+    std::env::var(name).ok()
+}
+
+/// Set an env var in the overlay (does NOT touch the real process env).
+fn env_overlay_set(name: &str, value: &str) {
+    let mut guard = ENV_OVERLAY.write().unwrap_or_else(|p| p.into_inner());
+    guard.get_or_insert_with(HashMap::new).insert(name.to_string(), Some(value.to_string()));
+}
+
+/// Remove an env var in the overlay (marks it as deleted without touching real env).
+fn env_overlay_remove(name: &str) {
+    let mut guard = ENV_OVERLAY.write().unwrap_or_else(|p| p.into_inner());
+    guard.get_or_insert_with(HashMap::new).insert(name.to_string(), None);
+}
+
+/// Collect all env vars: real env merged with overlay (overlay wins).
+fn env_overlay_all() -> Vec<(String, String)> {
+    let mut result: HashMap<String, String> = std::env::vars().collect();
+    if let Ok(guard) = ENV_OVERLAY.read() {
+        if let Some(ref map) = *guard {
+            for (k, v) in map {
+                match v {
+                    Some(val) => { result.insert(k.clone(), val.clone()); }
+                    None => { result.remove(k); }
+                }
+            }
+        }
+    }
+    let mut pairs: Vec<_> = result.into_iter().collect();
+    pairs.sort_by(|a, b| a.0.cmp(&b.0));
+    pairs
+}
+
+/// Apply overlay env vars to a `Command` so child processes inherit them.
+pub fn apply_env_overlay(cmd: &mut Command) {
+    if let Ok(guard) = ENV_OVERLAY.read() {
+        if let Some(ref map) = *guard {
+            for (k, v) in map {
+                match v {
+                    Some(val) => { cmd.env(k, val); }
+                    None => { cmd.env_remove(k); }
+                }
+            }
+        }
+    }
+}
 
 use astra_runtime::str_preview::truncate_str;
 use astra_runtime::tool_sandbox::{
@@ -3169,8 +3227,7 @@ impl ToolExecutor {
     fn env_list(&self, args: &Value) -> String {
         let show_values = args.get("show_values").and_then(|v| v.as_bool()).unwrap_or(false);
         
-        let mut vars: Vec<(String, String)> = std::env::vars().collect();
-        vars.sort_by(|a, b| a.0.cmp(&b.0));
+        let vars = env_overlay_all();
         
         let entries: Vec<Value> = vars
             .into_iter()
@@ -3202,8 +3259,8 @@ impl ToolExecutor {
             None => return json!({ "error": "Missing required parameter: name" }).to_string(),
         };
         
-        match std::env::var(name) {
-            Ok(value) => {
+        match env_overlay_get(name) {
+            Some(value) => {
                 let display_value = if Self::is_sensitive_var(name) {
                     format!("***MASKED*** ({} chars)", value.len())
                 } else {
@@ -3215,7 +3272,7 @@ impl ToolExecutor {
                     "exists": true
                 }).to_string()
             }
-            Err(_) => json!({
+            None => json!({
                 "name": name,
                 "exists": false
             }).to_string(),
@@ -3241,12 +3298,9 @@ impl ToolExecutor {
             return json!({ "error": "Invalid variable name: must contain only alphanumeric characters and underscores" }).to_string();
         }
         
-        // Thread-safe environment mutation
-        let _guard = ENV_MUTEX.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        // SAFETY: Protected by ENV_MUTEX, single-threaded access
-        unsafe {
-            std::env::set_var(name, value);
-        }
+        // Store in thread-safe overlay (no unsafe set_var needed).
+        // Child processes receive overlay values via apply_env_overlay().
+        env_overlay_set(name, value);
         
         let display_value = if Self::is_sensitive_var(name) {
             format!("***MASKED*** ({} chars)", value.len())
@@ -3269,14 +3323,10 @@ impl ToolExecutor {
             None => return json!({ "error": "Missing required parameter: name" }).to_string(),
         };
         
-        let existed = std::env::var(name).is_ok();
+        let existed = env_overlay_get(name).is_some();
         
-        // Thread-safe environment mutation
-        let _guard = ENV_MUTEX.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        // SAFETY: Protected by ENV_MUTEX, single-threaded access
-        unsafe {
-            std::env::remove_var(name);
-        }
+        // Mark as removed in thread-safe overlay (no unsafe remove_var needed).
+        env_overlay_remove(name);
         
         json!({
             "success": true,
@@ -3304,7 +3354,7 @@ impl ToolExecutor {
             Err(e) => return json!({ "error": format!("Invalid regex pattern: {}", e) }).to_string(),
         };
         
-        let vars: Vec<(String, String)> = std::env::vars().collect();
+        let vars = env_overlay_all();
         let mut matches: Vec<Value> = Vec::new();
         
         for (name, value) in vars {

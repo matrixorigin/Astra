@@ -787,6 +787,9 @@ impl ToolExecutor {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 
+        // Pass env overlay vars to child process so env_set values are visible.
+        super::apply_env_overlay(&mut child_cmd);
+
         // Create a new process group so we can kill the entire tree on timeout.
         // This prevents orphaned git/curl/etc. child processes.
         #[cfg(unix)]
