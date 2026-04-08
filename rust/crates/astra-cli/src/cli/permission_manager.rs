@@ -525,9 +525,16 @@ impl PermissionManager {
             }
         }
 
+        // Styled prompt: highlight key letters, dim separators
         eprint!(
-            "  {} (y)es (n)o (a)lways (!)auto-run (s)kip: ",
-            "Allow?".bold()
+            "  {} {}es · {}o · {}lways · {}uto-run · {}kip  {} ",
+            "▸".cyan(),
+            "y".cyan().bold(),
+            "n".cyan().bold(),
+            "a".cyan().bold(),
+            "!".cyan().bold(),
+            "s".cyan().bold(),
+            "→".dim(),
         );
         let _ = io::stderr().flush();
 
@@ -549,7 +556,15 @@ impl PermissionManager {
                 }
             };
             drop(_guard);
-            eprintln!("{result}");
+            let label: String = match result {
+                'y' => format!("{}", "yes".green()),
+                'a' => format!("{}", "always".green()),
+                'n' => format!("{}", "no".red()),
+                's' => format!("{}", "skip".yellow()),
+                '!' => format!("{}", "auto-run".green()),
+                c => c.to_string(),
+            };
+            eprintln!("{label}");
             result
         } else {
             let mut response = String::new();
