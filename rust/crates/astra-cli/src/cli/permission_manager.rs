@@ -132,9 +132,33 @@ impl PermissionSettings {
         }
     }
 
+    /// Load from the user-level settings file (`~/.astra/permissions.json`).
+    pub fn load_user() -> Self {
+        let Some(home) = dirs::home_dir() else {
+            return Self::default();
+        };
+        let path = home.join(".astra").join("permissions.json");
+        match fs::read_to_string(&path) {
+            Ok(content) => serde_json::from_str(&content).unwrap_or_default(),
+            Err(_) => Self::default(),
+        }
+    }
+
     /// Save to the project-level settings file.
     pub fn save(&self, project_root: &Path) -> io::Result<()> {
         let dir = project_root.join(".kiro");
+        fs::create_dir_all(&dir)?;
+        let path = dir.join("permissions.json");
+        let json = serde_json::to_string_pretty(self)?;
+        fs::write(path, json)
+    }
+
+    /// Save to the user-level settings file (`~/.astra/permissions.json`).
+    pub fn save_user(&self) -> io::Result<()> {
+        let home = dirs::home_dir().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotFound, "HOME directory not found")
+        })?;
+        let dir = home.join(".astra");
         fs::create_dir_all(&dir)?;
         let path = dir.join("permissions.json");
         let json = serde_json::to_string_pretty(self)?;
@@ -158,13 +182,18 @@ impl PermissionSettings {
 pub(super) struct PermissionManager {
     mode: PermissionMode,
     session_overrides: HashMap<String, bool>,
-    /// Persistent rules loaded from settings file.
+    /// Persistent rules loaded from project settings file.
     settings: PermissionSettings,
     /// Project root for settings persistence.
     project_root: Option<PathBuf>,
-    /// Cached parsed rules (invalidated on settings change).
+    /// Cached parsed project-level rules (invalidated on settings change).
     cached_allow: Vec<PermissionRule>,
     cached_deny: Vec<PermissionRule>,
+    /// User-level persistent rules loaded from `~/.astra/permissions.json`.
+    user_settings: PermissionSettings,
+    /// Cached parsed user-level rules.
+    cached_user_allow: Vec<PermissionRule>,
+    cached_user_deny: Vec<PermissionRule>,
 }
 
 impl PermissionManager {
@@ -191,6 +220,12 @@ impl PermissionManager {
         for rule in &self.cached_deny {
             rule.hash(&mut h);
         }
+        for rule in &self.cached_user_allow {
+            rule.hash(&mut h);
+        }
+        for rule in &self.cached_user_deny {
+            rule.hash(&mut h);
+        }
         (self.mode.to_string(), format!("{:016x}", h.finish()))
     }
 
@@ -209,6 +244,9 @@ impl PermissionManager {
             project_root: None,
             cached_allow: Vec::new(),
             cached_deny: Vec::new(),
+            user_settings: PermissionSettings::default(),
+            cached_user_allow: Vec::new(),
+            cached_user_deny: Vec::new(),
         }
     }
 
@@ -228,6 +266,9 @@ impl PermissionManager {
         let settings = PermissionSettings::load(project_root);
         let cached_allow = settings.parsed_allow_rules();
         let cached_deny = settings.parsed_deny_rules();
+        let user_settings = PermissionSettings::load_user();
+        let cached_user_allow = user_settings.parsed_allow_rules();
+        let cached_user_deny = user_settings.parsed_deny_rules();
         Self {
             mode,
             session_overrides: HashMap::new(),
@@ -235,6 +276,9 @@ impl PermissionManager {
             project_root: Some(project_root.to_path_buf()),
             cached_allow,
             cached_deny,
+            user_settings,
+            cached_user_allow,
+            cached_user_deny,
         }
     }
 
@@ -299,16 +343,18 @@ impl PermissionManager {
         }
     }
 
-    /// Check persistent deny rules first (bypass-immune, like Claude Code's step 1a).
+    /// Check persistent deny rules (project + user, bypass-immune).
     fn check_deny_rules(&self, name: &str, args: &serde_json::Value) -> bool {
         let cmd = command_hint_from_args(args);
         self.cached_deny.iter().any(|rule| rule.matches(name, cmd))
+            || self.cached_user_deny.iter().any(|rule| rule.matches(name, cmd))
     }
 
-    /// Check persistent allow rules (like Claude Code's step 2b).
+    /// Check persistent allow rules: project-level first, then user-level.
     fn check_allow_rules(&self, name: &str, args: &serde_json::Value) -> bool {
         let cmd = command_hint_from_args(args);
         self.cached_allow.iter().any(|rule| rule.matches(name, cmd))
+            || self.cached_user_allow.iter().any(|rule| rule.matches(name, cmd))
     }
 
     /// Check if a file path targets a dangerous location.
@@ -1446,5 +1492,94 @@ mod tests {
         assert!(rule.matches("bash", Some("cargo-test"))); // false: '-' is a separator
         assert!(rule.matches("bash", Some("cargo=build")));
         assert!(!rule.matches("bash", Some("cargotest"))); // no boundary
+    }
+
+    // ── User-level permission tests ──────────────────────────────────────
+
+    #[test]
+    fn user_level_allow_rule_permits_tool() {
+        let mut pm = PermissionManager::new(false);
+        // Simulate user-level allow rule
+        pm.user_settings.allow.push("Bash(cargo:*)".to_string());
+        pm.cached_user_allow = pm.user_settings.parsed_allow_rules();
+
+        let args = serde_json::json!({"command": "cargo test"});
+        assert!(pm.check_allow_rules("bash", &args));
+    }
+
+    #[test]
+    fn user_level_deny_blocks_even_with_project_allow() {
+        let mut pm = PermissionManager::new(false);
+        // Project allows bash
+        pm.settings.allow.push("bash".to_string());
+        pm.cached_allow = pm.settings.parsed_allow_rules();
+        // User denies bash(rm:*)
+        pm.user_settings.deny.push("Bash(rm:*)".to_string());
+        pm.cached_user_deny = pm.user_settings.parsed_deny_rules();
+
+        let args = serde_json::json!({"command": "rm -rf /tmp/foo"});
+        // Deny rules checked first → should deny
+        assert!(pm.check_deny_rules("bash", &args));
+    }
+
+    #[test]
+    fn project_deny_overrides_user_allow() {
+        let mut pm = PermissionManager::new(false);
+        // User allows bash(git:*)
+        pm.user_settings.allow.push("Bash(git:*)".to_string());
+        pm.cached_user_allow = pm.user_settings.parsed_allow_rules();
+        // Project denies bash(git push:*)
+        pm.settings.deny.push("Bash(git push:*)".to_string());
+        pm.cached_deny = pm.settings.parsed_deny_rules();
+
+        let args = serde_json::json!({"command": "git push --force"});
+        // Deny checked first → blocks
+        assert!(pm.check_deny_rules("bash", &args));
+    }
+
+    #[test]
+    fn user_allow_does_not_override_project_deny() {
+        let mut pm = PermissionManager::new(false);
+        // Project denies edit
+        pm.settings.deny.push("edit".to_string());
+        pm.cached_deny = pm.settings.parsed_deny_rules();
+        // User allows edit
+        pm.user_settings.allow.push("edit".to_string());
+        pm.cached_user_allow = pm.user_settings.parsed_allow_rules();
+
+        let args = serde_json::json!({});
+        // Deny from project level → blocks
+        assert!(pm.check_deny_rules("edit", &args));
+    }
+
+    #[test]
+    fn user_settings_load_and_save_roundtrip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join(".astra");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("permissions.json");
+
+        let settings = PermissionSettings {
+            allow: vec!["Bash(cargo:*)".to_string()],
+            deny: vec!["Bash(rm:*)".to_string()],
+        };
+        let json = serde_json::to_string_pretty(&settings).unwrap();
+        fs::write(&path, json).unwrap();
+
+        let loaded: PermissionSettings =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(loaded.allow, vec!["Bash(cargo:*)"]);
+        assert_eq!(loaded.deny, vec!["Bash(rm:*)"]);
+    }
+
+    #[test]
+    fn empty_user_settings_no_effect() {
+        let pm = PermissionManager::new(false);
+        assert!(pm.cached_user_allow.is_empty());
+        assert!(pm.cached_user_deny.is_empty());
+        // No user rules → no effect on allow/deny checks
+        let args = serde_json::json!({"command": "cargo test"});
+        assert!(!pm.check_allow_rules("bash", &args));
+        assert!(!pm.check_deny_rules("bash", &args));
     }
 }

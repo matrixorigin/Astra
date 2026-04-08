@@ -25,6 +25,17 @@ pub enum ThinClientError {
     Json(#[from] serde_json::Error),
 }
 
+impl ThinClientError {
+    /// Returns true if this error is a transport-level failure (connection reset,
+    /// timeout, DNS failure) that may succeed on retry.
+    pub fn is_transport(&self) -> bool {
+        match self {
+            Self::Http(e) => e.is_connect() || e.is_timeout() || e.is_request(),
+            _ => false,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -62,5 +73,12 @@ mod tests {
     fn invalid_sse_json_display() {
         let err = ThinClientError::InvalidSseJson(serde_json::json!("not_object"));
         assert!(err.to_string().contains("not_object"));
+    }
+
+    #[test]
+    fn is_transport_false_for_non_http_errors() {
+        assert!(!ThinClientError::InvalidBaseUrl("x".into()).is_transport());
+        assert!(!ThinClientError::InvalidAuthHeader.is_transport());
+        assert!(!ThinClientError::SseParse("x".into()).is_transport());
     }
 }

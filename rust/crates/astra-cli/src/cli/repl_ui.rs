@@ -122,6 +122,7 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
         "Output theme: default | minimal | colorful | high-contrast",
     ),
     ("/diagnostics", "Binary, API, auth, environment checks"),
+    ("/bug", "Generate bug report: /bug [copy|save]"),
 ];
 
 fn command_matches_filter(command: &str, desc: &str, filter: &str) -> bool {
@@ -1364,7 +1365,7 @@ pub(super) fn print_slash_commands(query: Option<&str>) {
             "Team & account",
             &["/team", "/login", "/register", "/logout", "/memory-setup"],
         ),
-        ("🔧", "System", &["/diagnostics", "/allow", "/style"]),
+        ("🔧", "System", &["/diagnostics", "/allow", "/style", "/bug"]),
     ];
 
     for (icon, title, commands) in groups {

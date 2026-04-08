@@ -215,6 +215,7 @@ dependencies = [
  "criterion",
  "dirs",
  "dotenvy",
+ "fastrand",
  "flate2",
  "futures-util",
  "notify",

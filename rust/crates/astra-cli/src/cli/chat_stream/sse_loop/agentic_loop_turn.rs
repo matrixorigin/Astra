@@ -138,6 +138,9 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
     touch_prep_ui_phase(&ctx.prep_ui_phase, "Starting…");
 
     let git_branch = read_git_branch_abbrev();
+    let thinking_budget_tokens: Option<u32> = std::env::var("MO_THINKING_BUDGET")
+        .ok()
+        .and_then(|v| v.parse().ok());
     let mut payload = chat_turn_base_payload(ChatTurnBasePayloadInput {
         messages: ctx.messages,
         session_id: ctx.current_session_id,
@@ -148,6 +151,7 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
         capabilities: astra_thin_client::builtin_capability_preset(),
         project_root: ctx.project_root,
         git_branch,
+        thinking_budget_tokens,
     });
 
     // Inject ephemeral prefix (e.g., skill listing) at the start of messages.

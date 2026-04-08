@@ -2993,11 +2993,11 @@ mod error_recovery_proofs {
     fn transient_retry_policy_uses_exponential_backoff() {
         let d0 = should_retry(ErrorCategory::Transient, 0).unwrap();
         let d1 = should_retry(ErrorCategory::Transient, 1).unwrap();
-        // Exponential backoff with deterministic jitter:
-        // attempt 0: 500*1 + (0*7+3)%500 = 503
-        // attempt 1: 500*2 + (1*7+3)%500 = 1010
-        assert_eq!(d0, 503);
-        assert_eq!(d1, 1010);
+        // Exponential backoff with random jitter:
+        // attempt 0: base=500, backoff=500, jitter ∈ [0, 250) → [500, 750)
+        // attempt 1: base=500, backoff=1000, jitter ∈ [0, 250) → [1000, 1250)
+        assert!(d0 >= 500 && d0 < 750, "attempt 0 out of range: {d0}");
+        assert!(d1 >= 1000 && d1 < 1250, "attempt 1 out of range: {d1}");
         assert!(d1 > d0, "backoff should increase");
         assert!(
             should_retry(ErrorCategory::Transient, 2).is_none(),

@@ -321,6 +321,11 @@ pub struct AgenticLoopState {
     /// The loop allows exactly one more LLM iteration after injection.
     pub budget_wrapup_injected: bool,
 
+    // ── Thinking budget ──
+    /// Optional thinking/reasoning budget in tokens for models with extended thinking.
+    /// When Some, passed to the API request so the server constrains thinking output.
+    pub thinking_budget_tokens: Option<u32>,
+
     // ── Ephemeral skill listing ──
     /// Skill listing message (available skill names + descriptions).
     /// Stored here instead of in `messages` so hosts can inject it ephemerally
@@ -1947,6 +1952,7 @@ mod tests {
             consecutive_context_window_errors: 0,
             max_turn_input_tokens: 0,
             budget_wrapup_injected: false,
+            thinking_budget_tokens: None,
             skill_listing_message: None,
             invoked_skills: std::collections::HashMap::new(),
             recent_file_reads: Vec::new(),
