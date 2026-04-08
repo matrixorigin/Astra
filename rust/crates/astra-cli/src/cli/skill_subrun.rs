@@ -42,26 +42,28 @@ const SUBRUN_MAX_TURNS: usize = 25;
 ///
 /// Owns all resources so it doesn't borrow from a parent scope. Runs in quiet
 /// mode with all terminal rendering suppressed.
-struct SubRunHost {
-    api: astra_thin_client::ThinClient,
-    token: String,
-    model: Option<String>,
-    project_root: PathBuf,
-    executor: edge_tools::ToolExecutor,
-    all_schemas: Vec<Value>,
-    valid_tool_names: HashSet<String>,
-    perm_manager: PermissionManager,
+///
+/// Shared between skill sub-runs and delegate sub-runs.
+pub(crate) struct SubRunHost {
+    pub(crate) api: astra_thin_client::ThinClient,
+    pub(crate) token: String,
+    pub(crate) model: Option<String>,
+    pub(crate) project_root: PathBuf,
+    pub(crate) executor: edge_tools::ToolExecutor,
+    pub(crate) all_schemas: Vec<Value>,
+    pub(crate) valid_tool_names: HashSet<String>,
+    pub(crate) perm_manager: PermissionManager,
     /// Per-response completion token limit from the skill manifest.
-    max_completion_tokens: Option<u32>,
+    pub(crate) max_completion_tokens: Option<u32>,
     /// Effort level from the skill manifest.
-    effort: Option<String>,
+    pub(crate) effort: Option<String>,
     /// Agent type hint from the skill manifest.
-    agent_type: Option<String>,
+    pub(crate) agent_type: Option<String>,
     /// Parent cancellation token — so Ctrl+C / stop propagates into sub-runs.
-    cancel_token: Option<std::sync::Arc<tokio_util::sync::CancellationToken>>,
+    pub(crate) cancel_token: Option<std::sync::Arc<tokio_util::sync::CancellationToken>>,
     /// Same resolver as the parent loop so `skill` tool calls during the SSE edge
     /// round resolve (nested skills run inline — sub-run has no `skill_executor`).
-    skill_resolver: Option<Arc<dyn astra_runtime::turn::skill_tool::SkillResolver>>,
+    pub(crate) skill_resolver: Option<Arc<dyn astra_runtime::turn::skill_tool::SkillResolver>>,
 }
 
 #[async_trait]

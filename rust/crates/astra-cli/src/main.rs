@@ -62,6 +62,8 @@ mod cli_formatting;
 mod cli_utils;
 #[path = "cli/command_router.rs"]
 mod command_router;
+#[path = "cli/delegate_subrun.rs"]
+mod delegate_subrun;
 #[path = "cli/diff_presenter.rs"]
 mod diff_presenter;
 #[path = "cli/durable_bridge.rs"]
@@ -910,9 +912,10 @@ struct ReplState {
     last_delivery_report: Option<astra_services::durable_task::TaskDeliveryReport>,
     /// Stacked operator notes while plan execution is paused (`correct` / `note` at ⏸>).
     plan_execution_corrections: Vec<String>,
-    /// Delegation engine for multi-agent coordination during plan execution.
-    /// Constructed when plan execution starts and a durable contract is available;
-    /// the verification gate is swapped per-subtask via `clone_with_gate`.
+    /// Delegation engine for multi-agent coordination.
+    /// Constructed at REPL startup with a real `CliDelegateSubRunExecutor` when
+    /// the user is authenticated. Falls back to stub creation during plan execution
+    /// if not already initialized.
     delegation_engine:
         Option<std::sync::Arc<astra_runtime::server::delegation_engine::DelegationEngine>>,
     /// Team coordination registry for multi-agent team patterns.
@@ -5418,6 +5421,33 @@ async fn run_chat_repl(
 
     // Seed dynamic Tab-completion with available skills / MCP servers.
     refresh_dynamic_completions(&state).await;
+
+    // ── Wire Delegation Engine (real sub-agent execution) ─────────────────────
+    if let Some(ref token) = current_access_token(profile) {
+        let project_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let executor = delegate_subrun::CliDelegateSubRunExecutor::new(
+            api.clone(),
+            token.clone(),
+            state.model.clone(),
+            project_root,
+            state.perm_manager.mode(),
+            None, // cancel_token set per-turn
+        );
+        let mut registry = astra_services::AgentProfileRegistry::new();
+        delegate_subrun::register_default_agents(&mut registry);
+        let registry = std::sync::Arc::new(tokio::sync::RwLock::new(registry));
+        let run_store =
+            std::sync::Arc::new(astra_services::runs::InMemoryRunStateStore::default());
+        let engine = astra_runtime::server::delegation_engine::DelegationEngine::with_executor(
+            registry,
+            std::sync::Arc::new(astra_runtime::server::run_engine::RunEngine::new(run_store)),
+            std::sync::Arc::new(
+                astra_runtime::server::delegation_engine::DelegationTracker::new(),
+            ),
+            std::sync::Arc::new(executor),
+        );
+        state.delegation_engine = Some(std::sync::Arc::new(engine));
+    }
 
     // ── Main loop ─────────────────────────────────────────────────────────────
     let mut last_ctrl_c_at: Option<std::time::Instant> = None;
