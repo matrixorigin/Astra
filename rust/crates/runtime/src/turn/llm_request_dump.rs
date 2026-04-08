@@ -27,6 +27,7 @@ fn truncate_chars(s: &str, max_chars: usize) -> &str {
 #[derive(Debug, Clone)]
 pub struct LlmRequestDump {
     pub session_id: String,
+    pub agent_id: Option<String>,
     pub model: String,
     pub provider: String,
     pub error: String,
@@ -77,7 +78,7 @@ impl LlmRequestDump {
             event_id: Uuid::now_v7().to_string(),
             user_id: user_id.to_string(),
             session_id: self.session_id.clone(),
-            agent_id: None,
+            agent_id: self.agent_id.clone(),
             event_type: "llm_request_dump".to_string(),
             content: serde_json::to_string(&self.to_json()).unwrap_or_default(),
             parent_event_id: None,
@@ -103,6 +104,7 @@ impl LlmRequestDump {
 /// Build a dump from the current bridge state.
 pub fn build_llm_request_dump(
     session_id: &str,
+    agent_id: Option<&str>,
     model: &str,
     provider: &str,
     error: &str,
@@ -113,6 +115,7 @@ pub fn build_llm_request_dump(
 ) -> LlmRequestDump {
     LlmRequestDump {
         session_id: session_id.to_string(),
+        agent_id: agent_id.map(ToString::to_string),
         model: model.to_string(),
         provider: provider.to_string(),
         error: error.to_string(),
@@ -153,6 +156,7 @@ mod tests {
     fn dump_to_json_includes_all_fields() {
         let dump = build_llm_request_dump(
             "sess-1",
+            Some("test-agent"),
             "kimi-k2.5",
             "moonshot",
             "LLM error 400: thinking is enabled but reasoning_content is missing",

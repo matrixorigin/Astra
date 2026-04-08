@@ -34,12 +34,13 @@ pub(crate) async fn insert_core_turn_event(
          (event_id, session_id, user_id, agent_id, agent_version, event_type, content, \
           parent_event_id, causal_chain_id, token_usage, llm_model_used, llm_params, reasoning_content, \
           token_input, token_output, token_total, created_at) \
-         VALUES (?, ?, ?, ?, '0.1.0', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())",
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())",
     )
     .bind(&event.event_id)
     .bind(&event.session_id)
     .bind(&event.user_id)
     .bind(event.agent_id.as_deref().unwrap_or("astra-cli"))
+    .bind(env!("CARGO_PKG_VERSION"))
     .bind(&event.event_type)
     .bind(&event.content)
     .bind(&event.parent_event_id)
@@ -66,12 +67,13 @@ pub(crate) async fn insert_tool_turn_event(
          (event_id, session_id, user_id, agent_id, agent_version, event_type, content, \
           parent_event_id, causal_chain_id, metadata, skill_name, skill_version, reasoning_content, \
           meta_tool_name, meta_duration_ms, created_at) \
-         VALUES (?, ?, ?, ?, '0.1.0', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())",
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())",
     )
     .bind(&event.event_id)
     .bind(&event.session_id)
     .bind(&event.user_id)
     .bind(event.agent_id.as_deref().unwrap_or("astra-cli"))
+    .bind(env!("CARGO_PKG_VERSION"))
     .bind(&event.event_type)
     .bind(&event.content)
     .bind(&event.parent_event_id)

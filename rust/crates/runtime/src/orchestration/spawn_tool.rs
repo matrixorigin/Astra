@@ -88,58 +88,62 @@ impl SpawnAgentOutput {
 }
 
 /// Generate the JSON schema for spawn_agent tool.
+/// Returns a schema in the standard format: `{ type: "function", function: { name, description, parameters } }`.
 pub fn spawn_agent_schema() -> serde_json::Value {
     json!({
-        "name": "spawn_agent",
-        "description": "Launch a specialized agent to perform a task. Agents run autonomously and can communicate via send_message if named.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "description": {
-                    "type": "string",
-                    "description": "A short (3-5 word) description of the task."
+        "type": "function",
+        "function": {
+            "name": "spawn_agent",
+            "description": "Launch a specialized sub-agent to perform a task. Agents run autonomously and return results. Use for parallel work, independent research, code review, or any task that benefits from dedicated focus. Agent types: 'explore' (fast codebase research), 'code-review' (analyze changes), 'task' (run commands), 'general-purpose' (full capabilities).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "description": {
+                        "type": "string",
+                        "description": "A short (3-5 word) description of the task."
+                    },
+                    "prompt": {
+                        "type": "string",
+                        "description": "Detailed task prompt for the agent. Be specific about what you want."
+                    },
+                    "agent_type": {
+                        "type": "string",
+                        "enum": ["explore", "code-review", "task", "general-purpose"],
+                        "description": "Type of specialized agent. 'explore' for research, 'code-review' for reviewing changes, 'task' for running commands, 'general-purpose' for complex multi-step tasks.",
+                        "default": "general-purpose"
+                    },
+                    "model": {
+                        "type": "string",
+                        "description": "Optional model override (e.g., 'claude-sonnet', 'claude-opus', 'claude-haiku')."
+                    },
+                    "background": {
+                        "type": "boolean",
+                        "description": "Run in background (async). If true, returns immediately with agent_id. Default: true.",
+                        "default": true
+                    },
+                    "name": {
+                        "type": "string",
+                        "description": "Name for agent-to-agent messaging. Makes agent addressable via send_message."
+                    },
+                    "max_turns": {
+                        "type": "integer",
+                        "description": "Max turns before stopping. Default varies by agent_type.",
+                        "minimum": 1,
+                        "maximum": 100
+                    },
+                    "isolated": {
+                        "type": "boolean",
+                        "description": "Create isolated git worktree for this agent.",
+                        "default": false
+                    },
+                    "allowed_tools": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Tool allowlist (overrides agent_type defaults)."
+                    }
                 },
-                "prompt": {
-                    "type": "string",
-                    "description": "Detailed task prompt for the agent."
-                },
-                "agent_type": {
-                    "type": "string",
-                    "enum": ["explore", "code-review", "task", "general-purpose"],
-                    "description": "Type of specialized agent.",
-                    "default": "general-purpose"
-                },
-                "model": {
-                    "type": "string",
-                    "description": "Optional model override (e.g., 'claude-sonnet', 'claude-opus', 'claude-haiku')."
-                },
-                "background": {
-                    "type": "boolean",
-                    "description": "Run in background (async). Default: true.",
-                    "default": true
-                },
-                "name": {
-                    "type": "string",
-                    "description": "Name for agent messaging. Makes agent addressable via send_message."
-                },
-                "max_turns": {
-                    "type": "integer",
-                    "description": "Max turns before stopping. Default varies by agent_type.",
-                    "minimum": 1,
-                    "maximum": 100
-                },
-                "isolated": {
-                    "type": "boolean",
-                    "description": "Create isolated git worktree for this agent.",
-                    "default": false
-                },
-                "allowed_tools": {
-                    "type": "array",
-                    "items": { "type": "string" },
-                    "description": "Tool allowlist (overrides agent_type defaults)."
-                }
-            },
-            "required": ["description", "prompt"]
+                "required": ["description", "prompt"]
+            }
         }
     })
 }
@@ -151,8 +155,9 @@ mod tests {
     #[test]
     fn test_spawn_agent_schema() {
         let schema = spawn_agent_schema();
-        assert_eq!(schema["name"], "spawn_agent");
-        assert!(schema["input_schema"]["properties"]["description"].is_object());
+        assert_eq!(schema["type"], "function");
+        assert_eq!(schema["function"]["name"], "spawn_agent");
+        assert!(schema["function"]["parameters"]["properties"]["description"].is_object());
     }
 
     #[test]

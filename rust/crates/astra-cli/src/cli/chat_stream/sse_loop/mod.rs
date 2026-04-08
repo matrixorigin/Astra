@@ -66,8 +66,20 @@ pub(crate) async fn stream_chat_sse(
     let mut executor = {
         let ex =
             edge_tools::ToolExecutor::new(&project_root).with_cloud(p.api.api_origin(), p.token);
-        if let Some(ref mgr) = p.mcp_manager {
+        let ex = if let Some(ref mgr) = p.mcp_manager {
             ex.with_mcp_manager(mgr.clone())
+        } else {
+            ex
+        };
+        // Wire spawn_agent tool context when spawner is available
+        if let Some(ref spawner) = p.agent_spawner {
+            let spawn_ctx = edge_tools::agent_spawning::SpawnAgentContext {
+                run_id: p.session_id.unwrap_or("ephemeral").to_string(),
+                agent_id: "main".to_string(),  // TODO: support nested agents
+                working_dir: project_root.clone(),
+                spawner: spawner.clone(),
+            };
+            ex.with_spawn_context(spawn_ctx)
         } else {
             ex
         }

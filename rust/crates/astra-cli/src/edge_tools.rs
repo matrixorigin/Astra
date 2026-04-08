@@ -1184,6 +1184,8 @@ pub fn all_tool_schemas() -> Vec<Value> {
                 }
             }
         }),
+        // ── spawn_agent: Dynamic agent spawning ─────────────────────────────────
+        astra_runtime::orchestration::spawn_agent_schema(),
     ]
 }
 

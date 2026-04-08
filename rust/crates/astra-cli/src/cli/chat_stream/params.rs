@@ -114,4 +114,7 @@ pub(crate) struct ChatTurnParams<'a> {
     /// Shared messaging metrics for inter-agent communication observability.
     pub(crate) messaging_metrics:
         Option<Arc<astra_runtime::messaging::MessagingMetrics>>,
+    /// Optional agent spawner for dynamic sub-agent creation via spawn_agent tool.
+    pub(crate) agent_spawner:
+        Option<Arc<astra_runtime::orchestration::DynamicAgentSpawner>>,
 }

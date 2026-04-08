@@ -997,6 +997,7 @@ async fn plan_executor_task(
                     skill_quality_tracker: &mut skill_qt,
                     discovered_skills: None,
                     messaging_metrics: None,
+                    agent_spawner: None,
                 })
                 .await;
 

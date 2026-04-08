@@ -1612,7 +1612,7 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
                                     let kind = classify_llm_error(&e2);
                                     // Dump full LLM request for post-mortem debugging
                                     let dump = crate::turn::llm_request_dump::build_llm_request_dump(
-                                        &session_id, &model_name, &provider,
+                                        &session_id, agent_id.as_deref(), &model_name, &provider,
                                         &e2, &llm_messages, &pruned_tools,
                                         round_ix, Some(max_output_tokens / 2),
                                     );
@@ -1633,7 +1633,7 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
                             let kind = classify_llm_error(&e);
                             // Dump full LLM request for post-mortem debugging
                             let dump = crate::turn::llm_request_dump::build_llm_request_dump(
-                                &session_id, &model_name, &provider,
+                                &session_id, agent_id.as_deref(), &model_name, &provider,
                                 &e, &llm_messages, &pruned_tools,
                                 round_ix, Some(max_output_tokens),
                             );
