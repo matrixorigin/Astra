@@ -155,6 +155,7 @@ dependencies = [
  "dotenvy",
  "futures-util",
  "gix",
+ "http",
  "nix 0.31.2",
  "regex",
  "reqwest 0.12.28",
