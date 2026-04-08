@@ -35,6 +35,8 @@ use std::sync::Arc;
 
 use astra_services::runs::{DurableRunRecord, RunStateStore};
 
+use super::delegation_engine::STATUS_RUNNING;
+
 /// Durable run execution engine.
 ///
 /// Wraps a [`RunStateStore`] and provides high-level operations for
@@ -86,7 +88,7 @@ impl RunEngine {
             parent_run_id: parent_run_id.map(ToString::to_string),
             delegation_id: delegation_id.map(ToString::to_string),
             agent_id: agent_id.map(ToString::to_string),
-            status: "running".to_string(),
+            status: STATUS_RUNNING.to_string(),
             waiting_for: None,
             checkpoint_json: None,
             error_message: None,

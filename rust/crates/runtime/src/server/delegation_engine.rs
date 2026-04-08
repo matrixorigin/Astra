@@ -36,6 +36,8 @@ pub const STATUS_RUNNING: &str = "running";
 pub const STATUS_COMPLETED: &str = "completed";
 pub const STATUS_FAILED: &str = "failed";
 pub const STATUS_PAUSED: &str = "paused";
+pub const STATUS_CANCELLED: &str = "cancelled";
+pub const STATUS_WAITING: &str = "waiting";
 pub const STATUS_VERIFICATION_FAILED: &str = "verification_failed";
 
 /// Log-and-discard helper for best-effort persistence calls.
@@ -450,6 +452,23 @@ impl DelegationTracker {
             .await
             .get(run_id)
             .is_some_and(|f| f.load(Ordering::Relaxed))
+    }
+
+    /// Check if ALL sub-runs in a delegation are paused.
+    /// Returns `(paused_count, total_count)` so callers can detect partial pauses.
+    pub async fn delegation_pause_status(&self, delegation_id: &str) -> (usize, usize) {
+        let records = self.get_sub_runs(delegation_id).await;
+        let flags = self.pause_flags.read().await;
+        let total = records.len();
+        let paused = records
+            .iter()
+            .filter(|r| {
+                flags
+                    .get(&r.run_id)
+                    .is_some_and(|f| f.load(Ordering::Relaxed))
+            })
+            .count();
+        (paused, total)
     }
 }
 

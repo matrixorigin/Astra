@@ -34,8 +34,21 @@ use crate::turn::agentic_loop_host::{
     AgenticLoopOutcome, AgenticLoopState, run_agentic_loop_with_host,
 };
 
+use super::delegation_engine::{STATUS_CANCELLED, STATUS_COMPLETED, STATUS_FAILED, STATUS_PAUSED, STATUS_RUNNING, STATUS_WAITING};
 use super::run_engine::RunEngine;
 use super::server_loop_host::ServerAgenticLoopHostBuilder;
+
+/// Log-and-discard helper for best-effort persistence calls.
+/// Mirrors the `log_persist!` macro in `delegation_engine` — persistence
+/// failures must not abort the run lifecycle, but silent discard hides
+/// diagnostics. This logs at warn level instead.
+macro_rules! log_persist {
+    ($expr:expr, $run_id:expr, $op:expr) => {
+        if let Err(e) = $expr {
+            astra_core::agent_warn!("run_lifecycle", "persist {} for run {}: {}", $op, $run_id, e);
+        }
+    };
+}
 
 // ─── Skill wiring for server paths ──────────────────────────────────────────
 
@@ -419,7 +432,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
 
         // Persist to durable store if available
         if let Some(engine) = &self.run_engine {
-            let _ = engine.start_run(&run_id, &user_id, &session_id).await;
+            log_persist!(engine.start_run(&run_id, &user_id, &session_id).await, &run_id, "start_run");
         }
 
         // Spawn background agentic loop.
@@ -533,24 +546,26 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             }
 
             if let Some(engine) = &run_engine {
-                let _ = engine
-                    .persist_status(&bg_run_id, status_str, None, error_msg.as_deref())
-                    .await;
-                let _ = engine
-                    .persist_usage(
+                log_persist!(
+                    engine.persist_status(&bg_run_id, status_str, None, error_msg.as_deref()).await,
+                    &bg_run_id, "status"
+                );
+                log_persist!(
+                    engine.persist_usage(
                         &bg_run_id,
                         loop_state.total_prompt,
                         loop_state.total_completion,
                         loop_state.total_tool_calls,
-                    )
-                    .await;
+                    ).await,
+                    &bg_run_id, "usage"
+                );
             }
         });
 
         Ok(ChatRunRecord {
             session_id,
             run_id,
-            status: "running".to_string(),
+            status: STATUS_RUNNING.to_string(),
             explain: if request.explain {
                 Some(json!({"mode": "background"}))
             } else {
@@ -690,15 +705,17 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             }));
             // Persist cancellation
             if let Some(engine) = &self.run_engine {
-                let _ = engine
-                    .persist_status(&run_id, "cancelled", None, None)
-                    .await;
-                let _ = engine
-                    .append_event(
+                log_persist!(
+                    engine.persist_status(&run_id, STATUS_CANCELLED, None, None).await,
+                    &run_id, "cancel_status"
+                );
+                log_persist!(
+                    engine.append_event(
                         &run_id,
                         json!({"event_type": "run_finished", "data": {"cancelled": true}}),
-                    )
-                    .await;
+                    ).await,
+                    &run_id, "cancel_event"
+                );
             }
         }
         Ok(CancelRunRecord {
@@ -761,12 +778,14 @@ impl RunLifecycleService for AgenticRunLifecycleService {
 
         // Persist pause
         if let Some(engine) = &self.run_engine {
-            let _ = engine
-                .persist_status(&run_id, "paused", Some("user_resume"), None)
-                .await;
-            let _ = engine
-                .append_event(&run_id, json!({"event_type": "run_paused", "data": {}}))
-                .await;
+            log_persist!(
+                engine.persist_status(&run_id, STATUS_PAUSED, Some("user_resume"), None).await,
+                &run_id, "pause_status"
+            );
+            log_persist!(
+                engine.append_event(&run_id, json!({"event_type": "run_paused", "data": {}})).await,
+                &run_id, "pause_event"
+            );
         }
         // Cascade: pause all delegated sub-runs of this parent.
         if let Some(de) = &self.delegation_engine {
@@ -774,7 +793,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         }
         Ok(RunMutationRecord {
             run_id,
-            status: "paused".to_string(),
+            status: STATUS_PAUSED.to_string(),
             previous_status: previous,
         })
     }
@@ -809,10 +828,14 @@ impl RunLifecycleService for AgenticRunLifecycleService {
 
         // Persist resume
         if let Some(engine) = &self.run_engine {
-            let _ = engine.persist_status(&run_id, "running", None, None).await;
-            let _ = engine
-                .append_event(&run_id, json!({"event_type": "run_resumed", "data": {}}))
-                .await;
+            log_persist!(
+                engine.persist_status(&run_id, STATUS_RUNNING, None, None).await,
+                &run_id, "resume_status"
+            );
+            log_persist!(
+                engine.append_event(&run_id, json!({"event_type": "run_resumed", "data": {}})).await,
+                &run_id, "resume_event"
+            );
         }
         // Cascade: resume all delegated sub-runs of this parent.
         if let Some(de) = &self.delegation_engine {
@@ -820,7 +843,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         }
         Ok(RunMutationRecord {
             run_id,
-            status: "running".to_string(),
+            status: STATUS_RUNNING.to_string(),
             previous_status: previous,
         })
     }
@@ -1040,7 +1063,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
             Ok(AgenticLoopOutcome::Completed) => Ok(astra_services::coordination::AgentResult {
                 agent_id: config.agent_profile.agent_id,
                 run_id: config.run_id,
-                status: "completed".to_string(),
+                status: STATUS_COMPLETED.to_string(),
                 output: if loop_state.final_text.is_empty() {
                     None
                 } else {
@@ -1057,7 +1080,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
                 Ok(astra_services::coordination::AgentResult {
                     agent_id: config.agent_profile.agent_id,
                     run_id: config.run_id,
-                    status: "paused".to_string(),
+                    status: STATUS_PAUSED.to_string(),
                     output: if loop_state.final_text.is_empty() {
                         None
                     } else {
@@ -1073,7 +1096,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
                 Ok(astra_services::coordination::AgentResult {
                     agent_id: config.agent_profile.agent_id,
                     run_id: config.run_id,
-                    status: "waiting".to_string(),
+                    status: STATUS_WAITING.to_string(),
                     output: Some(reason),
                     error: None,
                     prompt_tokens: loop_state.total_prompt,
@@ -1085,7 +1108,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
                 Ok(astra_services::coordination::AgentResult {
                     agent_id: config.agent_profile.agent_id,
                     run_id: config.run_id,
-                    status: "failed".to_string(),
+                    status: STATUS_FAILED.to_string(),
                     output: None,
                     error: Some(err),
                     prompt_tokens: loop_state.total_prompt,
