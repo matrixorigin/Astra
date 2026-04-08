@@ -3736,20 +3736,26 @@ fn display_plan_updates_live(
             PlanUpdate::StreamingEvent { event, .. } => {
                 use chat_stream::StreamEvent;
                 match event {
-                    StreamEvent::ToolStarted { name, description } => (
-                        format!("  ⚡ {name} {description}"),
-                        PostSpinner::Tool(description),
-                    ),
+                    StreamEvent::ToolStarted { name, description } => {
+                        let styled = stream_render::style_tool_description(&name, &description);
+                        (
+                            format!("  {} {} …", "⬢".cyan(), styled),
+                            PostSpinner::Tool(description),
+                        )
+                    }
                     StreamEvent::ToolCompleted {
                         name,
                         status,
                         duration_ms,
                         output_summary,
                     } => {
-                        let dur = format_duration_ms(duration_ms);
-                        let icon = if status == "error" { "✗" } else { "✓" };
-                        let summary = output_summary.map(|s| format!("  {s}")).unwrap_or_default();
-                        (format!("  {icon} {name} ({dur}){summary}"), PostSpinner::None)
+                        let dur = cli_formatting::format_duration_suffix(duration_ms);
+                        let icon = if status == "error" { theme::icon_err() } else { theme::icon_ok() };
+                        let summary = output_summary
+                            .map(|s| format!("\n    {}", s.dim()))
+                            .unwrap_or_default();
+                        // Re-use the description from the name for completion line
+                        (format!("  {icon} {name}{}{summary}", dur.dim()), PostSpinner::None)
                     }
                     StreamEvent::WaitingForModel => {
                         finalize_plan_stream(&mut state.plan_in_token_stream, plan_spinner, &mut state.plan_md_renderer, &mut state.plan_thinking_pane);

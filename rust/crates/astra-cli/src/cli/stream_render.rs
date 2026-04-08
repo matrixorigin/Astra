@@ -1786,7 +1786,7 @@ impl StreamRenderState {
 
 /// Apply bold+magenta styling to Skill/MCP tool description prefixes,
 /// matching the visual weight of built-in tools like Read/Edit/Write.
-fn style_tool_description(tool: &str, description: &str) -> String {
+pub(crate) fn style_tool_description(tool: &str, description: &str) -> String {
     if tool == "skill" {
         // "Skill code-review" → bold magenta "Skill" + rest
         if let Some(rest) = description.strip_prefix("Skill") {
