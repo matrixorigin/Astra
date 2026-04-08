@@ -79,7 +79,7 @@ _db_query() {
     local fallback=${2:-0}
     local db_name
     db_name=$(matrixone_db_name)
-    db_name=${db_name:-mo_astra_runtime}
+    db_name=${db_name:-astra_runtime}
     mysql -N -s -h127.0.0.1 -P6001 -uroot -p111 "$db_name" -e "$sql" 2>/dev/null || echo "$fallback"
 }
 

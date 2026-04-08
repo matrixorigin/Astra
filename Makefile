@@ -350,7 +350,10 @@ dev-seed:
 # ============================================================================
 
 .PHONY: build
-build: build-release
+build:
+	@echo "Building Rust workspace (debug)..."
+	@$(CARGO) build $(CARGO_MANIFEST_FLAG)
+	@echo "✅ Debug artifacts: $(RUST_DEBUG_BIN_DIR)/"
 
 .PHONY: build-release
 build-release:
@@ -359,7 +362,11 @@ build-release:
 	@echo "✅ Release artifacts: $(RUST_RELEASE_BIN_DIR)/"
 
 .PHONY: build-cli
-build-cli: build-cli-release
+build-cli:
+	@echo "Building astra + astra-admin (debug)..."
+	@$(CARGO) build $(CARGO_MANIFEST_FLAG) -p astra-cli -p astra-admin-cli
+	@echo "Binaries:"
+	@for bin in $(CLI_BINS); do echo "  $(RUST_DEBUG_BIN_DIR)/$$bin"; done
 
 .PHONY: build-cli-release
 build-cli-release:
@@ -369,7 +376,10 @@ build-cli-release:
 	@for bin in $(CLI_BINS); do echo "  $(RUST_RELEASE_BIN_DIR)/$$bin"; done
 
 .PHONY: build-server
-build-server: build-server-release
+build-server:
+	@echo "Building astra-server (debug)..."
+	@$(CARGO) build $(CARGO_MANIFEST_FLAG) $(API_SHELL_PKG) --bin $(API_SERVER_BIN)
+	@echo "Binary: $(RUST_DEBUG_BIN_DIR)/$(API_SERVER_BIN)"
 
 .PHONY: build-server-release
 build-server-release:

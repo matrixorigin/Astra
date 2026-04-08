@@ -4,6 +4,7 @@ on:
   pull_request:
     paths:
       - 'prompts/**'
+      - 'skills/**'
       - 'config/**'
       - 'rust/**'
 

@@ -86,7 +86,7 @@ services:
       - ENVIRONMENT=${ENVIRONMENT:-production}
       - MATRIXONE_HOST=matrixone
       - MATRIXONE_PORT=6001
-      - MATRIXONE_DATABASE=${MATRIXONE_DATABASE:-mo_astra_runtime}
+      - MATRIXONE_DATABASE=${MATRIXONE_DATABASE:-astra_runtime}
       - REDIS_URL=redis://redis:6379
       - JWT_SECRET_KEY=${JWT_SECRET_KEY:-change-me-in-production}
     env_file:
