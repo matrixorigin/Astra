@@ -136,6 +136,7 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
                 first_memoria_ms: &mut state.first_memoria_ms,
                 first_selector_ms: &mut state.first_selector_ms,
                 first_selector_strategy: &mut state.first_selector_strategy,
+                first_selector_confidence: &mut state.first_selector_confidence,
                 selector_tokens_in: &mut state.selector_tokens_in,
                 selector_tokens_out: &mut state.selector_tokens_out,
                 first_selection_report: &mut state.first_selection_report,

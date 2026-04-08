@@ -25,6 +25,13 @@ pub fn record_first_selector_latency_and_strategy(
     }
 }
 
+/// On first selector pass, record numeric confidence for journal / analytics.
+pub fn record_first_selector_confidence(slot: &mut Option<f64>, confidence: f64) {
+    if slot.is_none() {
+        *slot = Some(confidence);
+    }
+}
+
 /// Persist the first non-empty selection report and its budget pressure for cross-turn edge hints.
 pub fn capture_first_selection_report_if_empty(
     slot: &mut Option<SelectionReport>,

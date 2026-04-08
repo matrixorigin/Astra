@@ -233,6 +233,58 @@ fn create_tool_selector_with_quality_internal(
     (selector, modules)
 }
 
+/// Tool selector for background plan execution.
+///
+/// When `ctx.entity_graph`, `pattern_library`, and `calibrator` are all `Some`, attaches the
+/// same `Arc`s to [`TfIdfSelector`] so subtasks read the same learned state as the REPL and
+/// the plan learning bridge.
+///
+/// With a non-empty `ctx.token` and unless `ASTRA_BACKGROUND_PLAN_SELECTOR_TFIDF_ONLY` is `1`
+/// or `true`, uses [`FallbackSelector`] + [`LlmToolSelector`] like the foreground REPL.
+pub(super) fn create_background_plan_selector(
+    ctx: &crate::plan_executor::BackgroundPlanContext,
+) -> Box<dyn tool_selector::ToolSelector> {
+    let all_schemas = edge_tools::all_tool_schemas();
+    let mut registry = tool_registry::ToolRegistry::new(all_schemas);
+    let mut plugin_registry = tool_registry::PluginRegistry::new();
+    manifest_loader::load_skills_directory(&mut plugin_registry);
+    registry.register_plugins(&plugin_registry);
+
+    let mut tfidf = tool_selector::TfIdfSelector::new(registry);
+    if let (Some(eg), Some(pl), Some(cal)) = (
+        ctx.entity_graph.as_ref(),
+        ctx.pattern_library.as_ref(),
+        ctx.calibrator.as_ref(),
+    ) {
+        tfidf = tfidf
+            .with_entity_graph(eg.clone())
+            .with_pattern_library(pl.clone())
+            .with_progressive_calibrator(cal.clone());
+    }
+
+    let tfidf_only = std::env::var("ASTRA_BACKGROUND_PLAN_SELECTOR_TFIDF_ONLY")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+
+    if tfidf_only || ctx.token.is_empty() {
+        return Box::new(tfidf);
+    }
+
+    let mut llm = tool_selector::LlmToolSelector::new(ctx.api.clone(), ctx.token.clone());
+    let selector_model = std::env::var("ASTRA_SELECTOR_MODEL")
+        .ok()
+        .or_else(|| pick_cheapest_model(&ctx.api, &ctx.token));
+    if let Some(m) = selector_model {
+        llm = llm.with_model(m);
+    }
+
+    let mut fb = tool_selector::FallbackSelector::new(Box::new(llm), Box::new(tfidf));
+    if let Some(cal) = ctx.calibrator.clone() {
+        fb = fb.with_progressive_calibrator(cal);
+    }
+    Box::new(fb)
+}
+
 /// Pick the model with the smallest context window from /models (proxy for cheapest).
 /// Blocking call — safe to use from sync context when a tokio Handle is available.
 /// Returns None on any error (network, parse, empty list).

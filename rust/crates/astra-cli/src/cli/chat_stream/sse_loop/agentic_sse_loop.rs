@@ -107,9 +107,12 @@ pub(crate) struct StreamResultBuild<'a> {
     pub(crate) context_ms: Option<u64>,
     pub(crate) selector_strategy: Option<String>,
     pub(crate) selector_ms: Option<u64>,
+    pub(crate) selector_confidence: Option<f64>,
     pub(crate) selector_tokens_in: u64,
     pub(crate) selector_tokens_out: u64,
     pub(crate) memoria_ms: Option<u64>,
+    pub(crate) routing_domain_hint: Option<String>,
+    pub(crate) entity_learn_skipped_no_domain: bool,
 }
 
 pub(crate) fn build_stream_result(ctx: StreamResultBuild<'_>) -> StreamResult {
@@ -137,9 +140,12 @@ pub(crate) fn build_stream_result(ctx: StreamResultBuild<'_>) -> StreamResult {
         context_ms,
         selector_strategy,
         selector_ms,
+        selector_confidence,
         selector_tokens_in,
         selector_tokens_out,
         memoria_ms,
+        routing_domain_hint,
+        entity_learn_skipped_no_domain,
     } = ctx;
 
     let report = first_selection_report.unwrap_or_else(|| tool_registry::SelectionReport {
@@ -194,9 +200,12 @@ pub(crate) fn build_stream_result(ctx: StreamResultBuild<'_>) -> StreamResult {
         context_ms,
         selector_strategy,
         selector_ms,
+        selector_confidence,
         selector_tokens_in,
         selector_tokens_out,
         memoria_ms,
+        routing_domain_hint,
+        entity_learn_skipped_no_domain,
     }
 }
 
@@ -240,9 +249,12 @@ mod tests {
             context_ms: Some(100),
             selector_strategy: Some("tfidf".into()),
             selector_ms: Some(5),
+            selector_confidence: Some(0.75),
             selector_tokens_in: 200,
             selector_tokens_out: 50,
             memoria_ms: None,
+            routing_domain_hint: None,
+            entity_learn_skipped_no_domain: false,
         }
     }
 

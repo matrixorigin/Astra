@@ -65,6 +65,20 @@ pub enum DomainHint {
     Database,
 }
 
+/// JSON / journal label for [`DomainHint`] (aligned with `pipeline::learning` payloads).
+#[must_use]
+pub fn domain_hint_to_label(d: DomainHint) -> &'static str {
+    match d {
+        DomainHint::GitHub => "github",
+        DomainHint::Git => "git",
+        DomainHint::Code => "code",
+        DomainHint::Memory => "memory",
+        DomainHint::Web => "web",
+        DomainHint::System => "system",
+        DomainHint::Database => "database",
+    }
+}
+
 // ─── Tool Filter ─────────────────────────────────────────────────────────────
 
 /// Recommended tool selection strategy based on routing analysis.

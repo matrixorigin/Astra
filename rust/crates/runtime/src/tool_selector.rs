@@ -2765,6 +2765,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn record_turn_outcome_without_domain_records_pattern_not_entity_graph() {
+        let graph = Arc::new(Mutex::new(EntityGraph::new()));
+        let lib = Arc::new(Mutex::new(PatternLibrary::new()));
+        let cal = Arc::new(Mutex::new(ProgressiveCalibrator::new(0.15)));
+
+        let selector = TfIdfSelector::new(mock_registry())
+            .with_entity_graph(graph.clone())
+            .with_pattern_library(lib.clone())
+            .with_progressive_calibrator(cal.clone());
+
+        let tools = vec!["github_list_prs".to_string()];
+        for _ in 0..2 {
+            selector.record_turn_outcome(
+                "check matrixorigin PRs",
+                &tools,
+                TaskType::Fetch,
+                None,
+                true,
+                0.88,
+                false,
+                None,
+            );
+        }
+
+        {
+            let g = graph.lock().unwrap();
+            assert!(
+                g.boost_for("matrixorigin").is_empty(),
+                "entity graph must not learn without routing domain"
+            );
+        }
+        {
+            let l = lib.lock().unwrap();
+            let suggestions = l.suggest(TaskType::Fetch, None, 5);
+            assert!(
+                !suggestions.is_empty(),
+                "pattern library should still record chains without domain"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn wiring_backward_compat_no_pipeline_modules() {
         // No pipeline modules → should behave identically to old path
         let selector = TfIdfSelector::new(mock_registry());
