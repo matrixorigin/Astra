@@ -4,6 +4,7 @@
 //! and `skill` tools).  The LLM emits a `send_message` function call, the loop
 //! intercepts it, and this module routes the message through the agent's mailbox.
 
+use std::sync::Arc;
 use serde_json::Value;
 
 use super::router::AgentMailbox;
@@ -35,6 +36,10 @@ pub fn send_message_tool_schema() -> Value {
                         "type": "string",
                         "enum": ["text", "progress", "question", "result"],
                         "description": "Message type. 'text' (default): general message. 'progress': status update. 'question': ask for info. 'result': share a work product."
+                    },
+                    "requires_ack": {
+                        "type": "boolean",
+                        "description": "If true, expect the receiver to acknowledge this message. Defaults to false."
                     }
                 }
             }
@@ -45,18 +50,26 @@ pub fn send_message_tool_schema() -> Value {
 /// Parse LLM tool-call arguments and send via the agent's mailbox.
 ///
 /// Returns a human-readable result string (shown to the LLM as tool output).
+/// Result of executing send_message — contains the display string and optional message_id for ack tracking.
+pub struct SendResult {
+    /// Human-readable result text to return to the LLM.
+    pub display: String,
+    /// If the message was sent successfully with requires_ack, the message_id.
+    pub tracked_message: Option<Arc<AgentMessage>>,
+}
+
 pub async fn execute_send_message(
     mailbox: &AgentMailbox,
     args: &Value,
-) -> String {
+) -> SendResult {
     let target_str = match args.get("target").and_then(|v| v.as_str()) {
         Some(t) => t,
-        None => return "Error: 'target' parameter is required.".to_string(),
+        None => return SendResult { display: "Error: 'target' parameter is required.".to_string(), tracked_message: None },
     };
 
     let content = match args.get("content").and_then(|v| v.as_str()) {
         Some(c) => c,
-        None => return "Error: 'content' parameter is required.".to_string(),
+        None => return SendResult { display: "Error: 'content' parameter is required.".to_string(), tracked_message: None },
     };
 
     let message_type = args
@@ -64,13 +77,21 @@ pub async fn execute_send_message(
         .and_then(|v| v.as_str())
         .unwrap_or("text");
 
+    let requires_ack = args
+        .get("requires_ack")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
     // Resolve target
     let target = match target_str.to_lowercase().as_str() {
         "parent" | "orchestrator" => MessageTarget::Parent,
         "broadcast" | "all" | "peers" => {
             match mailbox.delegation_id.clone().filter(|s| !s.is_empty()) {
                 Some(did) => MessageTarget::Broadcast { delegation_id: did },
-                None => return "Error: cannot broadcast — agent is not part of a delegation group.".to_string(),
+                None => return SendResult {
+                    display: "Error: cannot broadcast — agent is not part of a delegation group.".to_string(),
+                    tracked_message: None,
+                },
             }
         }
         agent_id => MessageTarget::Direct {
@@ -108,11 +129,24 @@ pub async fn execute_send_message(
         MessageTarget::Direct { address } => format!("agent '{}'", address.agent_id),
     };
 
-    let msg = AgentMessage::new(mailbox.address.clone(), target, payload);
+    let mut msg = AgentMessage::new(mailbox.address.clone(), target, payload);
+    if requires_ack {
+        msg = msg.with_ack_required();
+    }
+    let msg = Arc::new(msg);
 
-    match mailbox.send(msg).await {
-        Ok(()) => format!("✓ Message sent to {target_display}."),
-        Err(e) => format!("Failed to send message to {target_display}: {e}"),
+    match mailbox.send((*msg).clone()).await {
+        Ok(()) => {
+            let tracked = if requires_ack { Some(msg) } else { None };
+            SendResult {
+                display: format!("✓ Message sent to {target_display}."),
+                tracked_message: tracked,
+            }
+        }
+        Err(e) => SendResult {
+            display: format!("Failed to send message to {target_display}: {e}"),
+            tracked_message: None,
+        },
     }
 }
 

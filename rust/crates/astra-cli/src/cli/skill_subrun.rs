@@ -437,6 +437,7 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
             invoked_skills: std::collections::HashMap::new(),
             recent_file_reads: Vec::new(),
             mailbox: None,
+            ack_tracker: None,
         };
 
         run_agentic_loop_with_host(&mut host, &mut state).await?;

@@ -90,6 +90,21 @@ pub enum MessagePayload {
 
     /// Coordination signal (lightweight, no LLM context needed).
     Signal(AgentSignal),
+
+    /// Acknowledgment of a received message.
+    Ack {
+        /// The ID of the message being acknowledged.
+        message_id: String,
+    },
+
+    /// Negative acknowledgment — message could not be processed.
+    Nack {
+        /// The ID of the message being rejected.
+        message_id: String,
+        /// Reason for rejection.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
 }
 
 /// Request types for structured request–response exchanges.
@@ -148,6 +163,10 @@ pub struct AgentMessage {
     /// Time-to-live in milliseconds. `None` = no expiry.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ttl_ms: Option<i64>,
+
+    /// Whether the sender expects an acknowledgment for this message.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub requires_ack: bool,
 }
 
 impl AgentMessage {
@@ -162,6 +181,7 @@ impl AgentMessage {
             timestamp_ms,
             correlation_id: None,
             ttl_ms: None,
+            requires_ack: false,
         }
     }
 
@@ -180,6 +200,39 @@ impl AgentMessage {
             millis as i64
         });
         self
+    }
+
+    /// Mark this message as requiring acknowledgment from the receiver.
+    pub fn with_ack_required(mut self) -> Self {
+        self.requires_ack = true;
+        self
+    }
+
+    /// Create an Ack reply for this message (from receiver back to sender).
+    pub fn make_ack(&self, from: AgentAddress) -> Self {
+        Self::new(
+            from,
+            MessageTarget::Direct {
+                address: self.from.clone(),
+            },
+            MessagePayload::Ack {
+                message_id: self.id.clone(),
+            },
+        )
+    }
+
+    /// Create a Nack reply for this message.
+    pub fn make_nack(&self, from: AgentAddress, reason: Option<String>) -> Self {
+        Self::new(
+            from,
+            MessageTarget::Direct {
+                address: self.from.clone(),
+            },
+            MessagePayload::Nack {
+                message_id: self.id.clone(),
+                reason,
+            },
+        )
     }
 
     /// Whether this message has expired.
@@ -207,6 +260,16 @@ pub enum MailboxError {
     NoParent,
     /// Transport-layer error.
     Transport(String),
+    /// Message delivery was not acknowledged within timeout.
+    AckTimeout {
+        message_id: String,
+        attempts: u32,
+    },
+    /// Message was explicitly rejected (Nack'd) by the receiver.
+    Rejected {
+        message_id: String,
+        reason: Option<String>,
+    },
 }
 
 impl std::fmt::Display for MailboxError {
@@ -216,6 +279,13 @@ impl std::fmt::Display for MailboxError {
             Self::ChannelClosed => write!(f, "message channel closed"),
             Self::NoParent => write!(f, "no parent agent in delegation hierarchy"),
             Self::Transport(msg) => write!(f, "transport error: {msg}"),
+            Self::AckTimeout { message_id, attempts } => {
+                write!(f, "ack timeout for message {message_id} after {attempts} attempts")
+            }
+            Self::Rejected { message_id, reason } => {
+                let r = reason.as_deref().unwrap_or("no reason");
+                write!(f, "message {message_id} rejected: {r}")
+            }
         }
     }
 }
@@ -301,5 +371,82 @@ mod tests {
         assert_eq!(msg.correlation_id.as_deref(), Some("req-001"));
         assert_eq!(msg.ttl_ms, Some(30_000));
         assert!(!msg.is_expired());
+    }
+
+    #[test]
+    fn ack_payload_roundtrip() {
+        let ack = MessagePayload::Ack {
+            message_id: "msg-123".into(),
+        };
+        let json = serde_json::to_value(&ack).unwrap();
+        assert_eq!(json["type"], "ack");
+        assert_eq!(json["message_id"], "msg-123");
+
+        let restored: MessagePayload = serde_json::from_value(json).unwrap();
+        match restored {
+            MessagePayload::Ack { message_id } => assert_eq!(message_id, "msg-123"),
+            _ => panic!("expected Ack"),
+        }
+    }
+
+    #[test]
+    fn nack_payload_roundtrip() {
+        let nack = MessagePayload::Nack {
+            message_id: "msg-456".into(),
+            reason: Some("invalid format".into()),
+        };
+        let json = serde_json::to_value(&nack).unwrap();
+        assert_eq!(json["type"], "nack");
+        assert_eq!(json["reason"], "invalid format");
+
+        let restored: MessagePayload = serde_json::from_value(json).unwrap();
+        match restored {
+            MessagePayload::Nack { message_id, reason } => {
+                assert_eq!(message_id, "msg-456");
+                assert_eq!(reason.as_deref(), Some("invalid format"));
+            }
+            _ => panic!("expected Nack"),
+        }
+    }
+
+    #[test]
+    fn make_ack_creates_reply() {
+        let original = AgentMessage::new(
+            AgentAddress::new("r1", "sender"),
+            MessageTarget::Direct {
+                address: AgentAddress::new("r2", "receiver"),
+            },
+            MessagePayload::Text {
+                content: "hello".into(),
+                summary: None,
+            },
+        )
+        .with_ack_required();
+
+        assert!(original.requires_ack);
+
+        let ack = original.make_ack(AgentAddress::new("r2", "receiver"));
+        assert_eq!(ack.from.agent_id, "receiver");
+        match &ack.to {
+            MessageTarget::Direct { address } => {
+                assert_eq!(address.agent_id, "sender");
+            }
+            _ => panic!("expected Direct target"),
+        }
+        match &ack.payload {
+            MessagePayload::Ack { message_id } => assert_eq!(message_id, &original.id),
+            _ => panic!("expected Ack payload"),
+        }
+    }
+
+    #[test]
+    fn requires_ack_not_serialized_when_false() {
+        let msg = AgentMessage::new(
+            AgentAddress::new("r", "a"),
+            MessageTarget::Parent,
+            MessagePayload::Signal(AgentSignal::Heartbeat),
+        );
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(!json.contains("requires_ack"));
     }
 }

@@ -40,9 +40,13 @@
 //!     payload_json  LONGTEXT NOT NULL,     -- full AgentMessage JSON
 //!     timestamp_ms  BIGINT NOT NULL,       -- message creation time
 //!     ttl_ms        BIGINT,               -- optional TTL
+//!     status        VARCHAR(16) DEFAULT 'pending', -- pending/claimed/acked/failed
+//!     claimed_by    VARCHAR(256),         -- consumer ID that claimed the message
+//!     claimed_at_ms BIGINT,               -- when the message was claimed
+//!     attempt_count INT DEFAULT 0,        -- number of delivery attempts
 //!     created_at    DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-//!     INDEX idx_amq_direct    (to_run_id, to_agent_id, id),
-//!     INDEX idx_amq_broadcast (delegation_id, is_broadcast, id)
+//!     INDEX idx_amq_direct    (to_run_id, to_agent_id, status, id),
+//!     INDEX idx_amq_broadcast (delegation_id, is_broadcast, status, id)
 //! );
 //! ```
 
@@ -101,9 +105,13 @@ pub async fn ensure_schema(pool: &Pool<MySql>) -> Result<(), sqlx::Error> {
             payload_json  LONGTEXT NOT NULL,
             timestamp_ms  BIGINT NOT NULL,
             ttl_ms        BIGINT,
+            status        VARCHAR(16) NOT NULL DEFAULT 'pending',
+            claimed_by    VARCHAR(256),
+            claimed_at_ms BIGINT,
+            attempt_count INT NOT NULL DEFAULT 0,
             created_at    DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            INDEX idx_amq_direct    (to_run_id, to_agent_id, id),
-            INDEX idx_amq_broadcast (delegation_id, is_broadcast, id)
+            INDEX idx_amq_direct    (to_run_id, to_agent_id, status, id),
+            INDEX idx_amq_broadcast (delegation_id, is_broadcast, status, id)
         )",
     )
     .execute(pool)
@@ -121,6 +129,10 @@ pub async fn ensure_schema(pool: &Pool<MySql>) -> Result<(), sqlx::Error> {
 pub struct DatabaseTransport {
     pool: Pool<MySql>,
     poll_interval: Duration,
+    /// How long a claimed message stays invisible before being reclaimed.
+    visibility_timeout: Duration,
+    /// Maximum delivery attempts before marking as 'failed'.
+    max_delivery_attempts: u32,
     /// Tracks registered agents and their delegation group.
     registrations: RwLock<HashMap<AgentAddress, Option<String>>>,
     /// Shutdown signal: when sent, all poll tasks stop.
@@ -129,6 +141,12 @@ pub struct DatabaseTransport {
     /// Observable metrics.
     metrics: Arc<TransportMetrics>,
 }
+
+/// Default visibility timeout (how long before an unclaimed message reappears).
+const DEFAULT_VISIBILITY_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Default max delivery attempts.
+const DEFAULT_MAX_DELIVERY_ATTEMPTS: u32 = 5;
 
 impl DatabaseTransport {
     /// Create a new database transport.
@@ -139,6 +157,8 @@ impl DatabaseTransport {
         Self {
             pool,
             poll_interval: DEFAULT_POLL_INTERVAL,
+            visibility_timeout: DEFAULT_VISIBILITY_TIMEOUT,
+            max_delivery_attempts: DEFAULT_MAX_DELIVERY_ATTEMPTS,
             registrations: RwLock::new(HashMap::new()),
             shutdown_tx,
             shutdown_rx,
@@ -149,6 +169,18 @@ impl DatabaseTransport {
     /// Set the poll interval for message streams.
     pub fn with_poll_interval(mut self, interval: Duration) -> Self {
         self.poll_interval = interval;
+        self
+    }
+
+    /// Set the visibility timeout for claimed messages.
+    pub fn with_visibility_timeout(mut self, timeout: Duration) -> Self {
+        self.visibility_timeout = timeout;
+        self
+    }
+
+    /// Set maximum delivery attempts before marking a message as failed.
+    pub fn with_max_delivery_attempts(mut self, max: u32) -> Self {
+        self.max_delivery_attempts = max;
         self
     }
 
@@ -191,6 +223,87 @@ impl DatabaseTransport {
     /// Get a reference to the transport's metrics counters.
     pub fn metrics(&self) -> &Arc<TransportMetrics> {
         &self.metrics
+    }
+
+    /// Acknowledge a message — marks it as 'acked' in the database.
+    ///
+    /// Called by the receiver after processing the message.
+    pub async fn ack_message(&self, message_id: &str) -> Result<bool, MailboxError> {
+        let result = query(
+            "UPDATE agent_message_queue SET status = 'acked' WHERE message_id = ? AND status = 'claimed'",
+        )
+        .bind(message_id)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| MailboxError::Transport(format!("ack: {e}")))?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// Negatively acknowledge a message — marks it as 'failed' in the database.
+    pub async fn nack_message(&self, message_id: &str) -> Result<bool, MailboxError> {
+        let result = query(
+            "UPDATE agent_message_queue SET status = 'failed' WHERE message_id = ? AND status = 'claimed'",
+        )
+        .bind(message_id)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| MailboxError::Transport(format!("nack: {e}")))?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// Reclaim messages that were claimed but never acked within the visibility timeout.
+    ///
+    /// This is called periodically to handle crashed consumers.
+    pub async fn reclaim_stale(&self) -> Result<u64, MailboxError> {
+        let cutoff_ms = chrono::Utc::now().timestamp_millis()
+            - self.visibility_timeout.as_millis() as i64;
+
+        // Messages under max attempts: set back to 'pending' for re-delivery.
+        let reclaimed = query(
+            "UPDATE agent_message_queue
+             SET status = 'pending', claimed_by = NULL, claimed_at_ms = NULL
+             WHERE status = 'claimed'
+               AND claimed_at_ms < ?
+               AND attempt_count < ?",
+        )
+        .bind(cutoff_ms)
+        .bind(self.max_delivery_attempts as i64)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| MailboxError::Transport(format!("reclaim: {e}")))?;
+
+        // Messages over max attempts: mark as 'failed' (dead letter).
+        let _ = query(
+            "UPDATE agent_message_queue
+             SET status = 'failed'
+             WHERE status = 'claimed'
+               AND claimed_at_ms < ?
+               AND attempt_count >= ?",
+        )
+        .bind(cutoff_ms)
+        .bind(self.max_delivery_attempts as i64)
+        .execute(&self.pool)
+        .await;
+
+        Ok(reclaimed.rows_affected())
+    }
+
+    /// Count messages in each status (for diagnostics).
+    pub async fn status_counts(&self) -> Result<HashMap<String, i64>, MailboxError> {
+        let rows = query(
+            "SELECT status, COUNT(*) as cnt FROM agent_message_queue GROUP BY status",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| MailboxError::Transport(format!("status_counts: {e}")))?;
+
+        let mut counts = HashMap::new();
+        for row in rows {
+            let status: String = row.try_get("status").unwrap_or_default();
+            let cnt: i64 = row.try_get("cnt").unwrap_or(0);
+            counts.insert(status, cnt);
+        }
+        Ok(counts)
     }
 
     /// Insert a message into the database.
@@ -267,6 +380,7 @@ impl MessageTransport for DatabaseTransport {
             .clone();
         drop(regs);
 
+        let consumer_id = format!("{}@{}", addr.agent_id, addr.run_id);
         let (tx, rx) = mpsc::unbounded_channel();
         let poll_task = tokio::spawn(poll_loop(
             self.pool.clone(),
@@ -276,6 +390,7 @@ impl MessageTransport for DatabaseTransport {
             tx,
             self.shutdown_rx.clone(),
             Arc::clone(&self.metrics),
+            consumer_id,
         ));
 
         Ok(Box::new(DatabaseMessageStream {
@@ -359,8 +474,8 @@ async fn poll_loop(
     tx: mpsc::UnboundedSender<Arc<AgentMessage>>,
     mut shutdown_rx: watch::Receiver<bool>,
     metrics: Arc<TransportMetrics>,
+    consumer_id: String,
 ) {
-    let mut last_direct_id: i64 = 0;
     let mut last_broadcast_id: i64 = 0;
     let mut consecutive_errors: u32 = 0;
     let mut current_backoff = INITIAL_BACKOFF;
@@ -373,57 +488,81 @@ async fn poll_loop(
 
         let mut had_error = false;
 
-        // 1. Poll direct messages.
-        let direct_result = query(
-            "SELECT id, payload_json FROM agent_message_queue
-             WHERE to_run_id = ? AND to_agent_id = ? AND id > ?
+        // 1. Claim direct messages atomically (UPDATE then SELECT).
+        //    This ensures no two consumers process the same direct message.
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let claim_result = query(
+            "UPDATE agent_message_queue
+             SET status = 'claimed', claimed_by = ?, claimed_at_ms = ?, attempt_count = attempt_count + 1
+             WHERE to_run_id = ? AND to_agent_id = ? AND status = 'pending'
              ORDER BY id ASC LIMIT ?",
         )
+        .bind(&consumer_id)
+        .bind(now_ms)
         .bind(&addr.run_id)
         .bind(&addr.agent_id)
-        .bind(last_direct_id)
         .bind(POLL_BATCH_SIZE)
-        .fetch_all(&pool)
+        .execute(&pool)
         .await;
 
-        if let Ok(rows) = direct_result {
-            for row in rows {
-                let row_id: i64 = match row.try_get("id") {
-                    Ok(id) => id,
-                    Err(_) => continue,
-                };
-                let json: String = match row.try_get("payload_json") {
-                    Ok(j) => j,
-                    Err(_) => {
-                        last_direct_id = last_direct_id.max(row_id);
-                        continue;
-                    }
-                };
+        match claim_result {
+            Ok(result) if result.rows_affected() > 0 => {
+                // Fetch the messages we just claimed.
+                let fetch_result = query(
+                    "SELECT id, payload_json FROM agent_message_queue
+                     WHERE to_run_id = ? AND to_agent_id = ? AND status = 'claimed' AND claimed_by = ?
+                     ORDER BY id ASC",
+                )
+                .bind(&addr.run_id)
+                .bind(&addr.agent_id)
+                .bind(&consumer_id)
+                .fetch_all(&pool)
+                .await;
 
-                if let Ok(msg) = serde_json::from_str::<AgentMessage>(&json) {
-                    if !msg.is_expired() {
-                        metrics.messages_received.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        if tx.send(Arc::new(msg)).is_err() {
-                            return;
+                if let Ok(rows) = fetch_result {
+                    for row in rows {
+                        let json: String = match row.try_get("payload_json") {
+                            Ok(j) => j,
+                            Err(_) => continue,
+                        };
+
+                        if let Ok(msg) = serde_json::from_str::<AgentMessage>(&json) {
+                            if !msg.is_expired() {
+                                metrics.messages_received.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                if tx.send(Arc::new(msg)).is_err() {
+                                    return;
+                                }
+                            }
                         }
                     }
+                } else {
+                    had_error = true;
+                    metrics.poll_errors.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    eprintln!(
+                        "  ⚠ messaging: direct fetch error for {}@{}: {:?}",
+                        addr.agent_id, addr.run_id, fetch_result.unwrap_err()
+                    );
                 }
-                last_direct_id = last_direct_id.max(row_id);
             }
-        } else {
-            had_error = true;
-            metrics.poll_errors.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            eprintln!(
-                "  ⚠ messaging: direct poll error for {}@{}: {:?}",
-                addr.agent_id, addr.run_id, direct_result.unwrap_err()
-            );
+            Ok(_) => {
+                // No pending messages — normal idle.
+            }
+            Err(e) => {
+                had_error = true;
+                metrics.poll_errors.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                eprintln!(
+                    "  ⚠ messaging: direct claim error for {}@{}: {:?}",
+                    addr.agent_id, addr.run_id, e
+                );
+            }
         }
 
         // 2. Poll broadcast messages (if in a delegation group).
+        //    Broadcasts use cursor-based reading (all agents see every broadcast).
         if let Some(ref did) = delegation_id {
             let broadcast_result = query(
                 "SELECT id, payload_json FROM agent_message_queue
-                 WHERE delegation_id = ? AND is_broadcast = TRUE AND id > ?
+                 WHERE delegation_id = ? AND is_broadcast = TRUE AND id > ? AND status IN ('pending', 'claimed')
                  ORDER BY id ASC LIMIT ?",
             )
             .bind(did)

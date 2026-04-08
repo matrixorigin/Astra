@@ -264,7 +264,7 @@ mod tests {
             "content": "I finished the refactoring"
         });
         let result = send_tool::execute_send_message(&children[0], &args).await;
-        assert!(result.starts_with("✓"), "Expected success, got: {result}");
+        assert!(result.display.starts_with("✓"), "Expected success, got: {}", result.display);
 
         let received = parent.try_recv().unwrap();
         match &received.payload {
@@ -286,7 +286,7 @@ mod tests {
             "message_type": "progress"
         });
         let result = send_tool::execute_send_message(&children[0], &args).await;
-        assert!(result.starts_with("✓"), "Expected success, got: {result}");
+        assert!(result.display.starts_with("✓"), "Expected success, got: {}", result.display);
 
         // All children should receive the broadcast
         for (i, child) in children.iter_mut().enumerate() {
@@ -309,8 +309,8 @@ mod tests {
 
         // Router resolves agent_id-only Direct targets via agent_id_index.
         assert!(
-            result.starts_with("✓"),
-            "expected success, got: {result}"
+            result.display.starts_with("✓"),
+            "expected success, got: {}", result.display
         );
         let received = children[1].try_recv();
         assert!(received.is_some(), "peer should have received the message");
@@ -323,8 +323,8 @@ mod tests {
 
         let args = serde_json::json!({ "target": "parent" });
         let result = send_tool::execute_send_message(&children[0], &args).await;
-        assert!(result.contains("Error"));
-        assert!(result.contains("content"));
+        assert!(result.display.contains("Error"));
+        assert!(result.display.contains("content"));
     }
 
     #[tokio::test]
@@ -334,8 +334,8 @@ mod tests {
 
         let args = serde_json::json!({ "content": "hello" });
         let result = send_tool::execute_send_message(&children[0], &args).await;
-        assert!(result.contains("Error"));
-        assert!(result.contains("target"));
+        assert!(result.display.contains("Error"));
+        assert!(result.display.contains("target"));
     }
 
     // ─── Multi-turn conversation simulation ─────────────────────────────────
