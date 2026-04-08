@@ -121,6 +121,45 @@ fn plan_select_theme() -> inquire::ui::RenderConfig<'static> {
     rc
 }
 
+/// Display a clarification question with modern styled formatting.
+///
+/// Category icons are kept, options use `▸` prefix for default, dim `·` for others.
+pub(super) fn eprint_clarification_question(q: &astra_runtime::plan_decompose::ClarificationQuestion) {
+    let icon = match q.category {
+        astra_runtime::plan_decompose::ClarificationCategory::Scope => "📦",
+        astra_runtime::plan_decompose::ClarificationCategory::Approach => "🛤️ ",
+        astra_runtime::plan_decompose::ClarificationCategory::Behavior => "⚙️ ",
+        astra_runtime::plan_decompose::ClarificationCategory::Technical => "🔧",
+        astra_runtime::plan_decompose::ClarificationCategory::Confirmation => "❓",
+    };
+
+    eprintln!("  {} {}", icon, q.question.as_str().bold().cyan());
+    eprintln!();
+
+    for (i, opt) in q.options.iter().enumerate() {
+        let num = i + 1;
+        let is_default = q.default == Some(i);
+        if is_default {
+            eprintln!(
+                "  {} {} {}",
+                "▸".cyan(),
+                format!("[{num}]").cyan(),
+                format!("{opt} (default)").bold()
+            );
+        } else {
+            eprintln!(
+                "    {} {}",
+                format!("[{num}]").dim(),
+                opt.as_str().dim()
+            );
+        }
+    }
+
+    eprintln!();
+    eprint!("  {} ", "→".cyan());
+    let _ = std::io::Write::flush(&mut std::io::stderr());
+}
+
 /// Result of the interactive plan confirmation prompt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum PlanConfirmChoice {
@@ -446,7 +485,7 @@ pub async fn handle_plan_mode_input(
 ) -> Result<(), String> {
     use plan::{
         ClarificationAnswer, PlanEntryChoice, PlanModeState,
-        decomposition_prompt, format_clarification_question,
+        decomposition_prompt,
         parse_clarification_response, parse_plan_entry_choice,
         parse_plan_response,
     };
@@ -477,14 +516,14 @@ pub async fn handle_plan_mode_input(
             ClarificationAnswer::Invalid(msg) => {
                 eprintln!("  {} {}", theme::icon_err(), msg);
                 eprintln!();
-                eprint!("{}", format_clarification_question(&question));
+                eprint_clarification_question(&question);
                 return Ok(());
             }
         }
 
         if let Some(next_q) = pending.next_question() {
             eprintln!();
-            eprint!("{}", format_clarification_question(next_q));
+            eprint_clarification_question(next_q);
             let _ = plan_state.save_to_file(&PlanModeState::state_path());
             return Ok(());
         }
@@ -1304,7 +1343,7 @@ async fn handle_goal_submission(
 ) -> Result<(), String> {
     use plan::{
         PendingClarifications, PlanModeState, decomposition_prompt,
-        detect_clarification_questions, format_clarification_question,
+        detect_clarification_questions,
         format_project_context, parse_plan_response,
     };
 
@@ -1327,7 +1366,7 @@ async fn handle_goal_submission(
 
     if state.verbose_mode {
         eprintln!();
-        eprintln!("{}", format_project_context(&plan_state.context));
+        eprintln!("{}", format_project_context(&plan_state.context).dim());
     }
 
     enrich_with_templates(
@@ -1367,7 +1406,7 @@ async fn handle_goal_submission(
                 };
                 plan_state.pending_clarifications = Some(pending);
 
-                eprint!("{}", format_clarification_question(&questions[0]));
+                eprint_clarification_question(&questions[0]);
                 let _ = plan_state.save_to_file(&PlanModeState::state_path());
             } else {
                 match parse_plan_response(&full_text) {

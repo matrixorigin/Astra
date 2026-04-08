@@ -1877,14 +1877,15 @@ impl ToolExecutor {
         if let Some(ctx) = context {
             eprintln!("  {}", ctx.dim());
         }
-        eprintln!("  {} {}", "❓".cyan().bold(), question.bold().cyan());
+        eprintln!("  {} {}", "▸".cyan(), question.bold().cyan());
 
         if choices.is_empty() {
             // Free-form input
+            eprintln!();
             let prompt = if let Some(def) = default {
-                format!("  {} > ", format!("[default: {def}]").dim())
+                format!("  {} {} ", format!("[{def}]").dim(), "→".cyan())
             } else {
-                format!("  {} ", ">".cyan())
+                format!("  {} ", "→".cyan())
             };
             eprint!("{}", prompt);
             let _ = io::stderr().flush();
@@ -1909,11 +1910,27 @@ impl ToolExecutor {
             }).to_string()
         } else {
             // Multiple choice
+            eprintln!();
             for (i, choice) in choices.iter().enumerate() {
-                eprintln!("  {} {}", format!("{})", i + 1).yellow(), choice);
+                let num = i + 1;
+                let is_default = default.map_or(i == 0, |d| *choice == d);
+                if is_default {
+                    eprintln!(
+                        "  {} {} {}",
+                        "▸".cyan(),
+                        format!("[{num}]").cyan(),
+                        choice.bold()
+                    );
+                } else {
+                    eprintln!(
+                        "    {} {}",
+                        format!("[{num}]").dim(),
+                        choice.dim()
+                    );
+                }
             }
-            eprintln!("  {}", "(Enter number, or type custom response)".dim());
-            eprint!("  > ");
+            eprintln!();
+            eprint!("  {} ", "→".cyan());
             let _ = io::stderr().flush();
 
             // Try raw mode for single-key selection

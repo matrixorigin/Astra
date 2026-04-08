@@ -2072,9 +2072,9 @@ pub fn format_project_context(ctx: &ProjectContext) -> String {
 fn format_project_context_line(stack: &str, file_count: usize, branch: Option<&str>) -> String {
     let mut parts = vec![stack.to_string(), format!("{file_count} files")];
     if let Some(b) = branch {
-        parts.push(format!("branch: {b}"));
+        parts.push(b.to_string());
     }
-    format!("  ({})", parts.join(", "))
+    format!("  {}", parts.join(" · "))
 }
 
 // ─── Plan Tree Progress Display ──────────────────────────────────────────────

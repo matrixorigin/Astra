@@ -1491,10 +1491,11 @@ async fn _old_handle_plan_mode_input(
 ) -> Result<(), String> {
     use plan_decompose::{
         ClarificationAnswer, PendingClarifications, PlanEntryChoice, PlanModeState,
-        decomposition_prompt, detect_clarification_questions, format_clarification_question,
+        decomposition_prompt, detect_clarification_questions,
         format_project_context, parse_clarification_response, parse_plan_entry_choice,
         parse_plan_response,
     };
+    use super::plan_interaction::eprint_clarification_question;
 
     let plan_state = match state.plan_mode.as_mut() {
         Some(ps) => ps,
@@ -1523,7 +1524,7 @@ async fn _old_handle_plan_mode_input(
             ClarificationAnswer::Invalid(msg) => {
                 eprintln!("  {} {}", theme::icon_err(), msg);
                 eprintln!();
-                eprint!("{}", format_clarification_question(&question));
+                eprint_clarification_question(&question);
                 return Ok(());
             }
         }
@@ -1531,7 +1532,7 @@ async fn _old_handle_plan_mode_input(
         // Check if more questions remain
         if let Some(next_q) = pending.next_question() {
             eprintln!();
-            eprint!("{}", format_clarification_question(next_q));
+            eprint_clarification_question(next_q);
             let _ = plan_state.save_to_file(&PlanModeState::state_path());
             return Ok(());
         }
@@ -1662,7 +1663,7 @@ async fn _old_handle_plan_mode_input(
 
                 if state.verbose_mode {
                     eprintln!();
-                    eprintln!("{}", format_project_context(&plan_state.context));
+                    eprintln!("{}", format_project_context(&plan_state.context).dim());
                 }
 
                 enrich_with_templates(
@@ -1701,7 +1702,7 @@ async fn _old_handle_plan_mode_input(
                             };
                             plan_state.pending_clarifications = Some(pending);
 
-                            eprint!("{}", format_clarification_question(&questions[0]));
+                            eprint_clarification_question(&questions[0]);
                             let _ = plan_state.save_to_file(&PlanModeState::state_path());
                         } else {
                             match parse_plan_response(&full_text) {
