@@ -1,5 +1,7 @@
 use super::*;
 use std::collections::HashMap;
+use std::sync::Arc;
+use astra_services::team_persistence::TeamPersistenceService;
 
 // ── Team Registry ───────────────────────────────────────────────────────
 
@@ -184,9 +186,79 @@ impl TeamRegistry {
     }
 }
 
+// ── CLI Team → TeamDefinition Conversion ────────────────────────────────
+
+/// Convert a CLI [`Team`] to a runtime [`TeamDefinition`] for the orchestrator.
+///
+/// Maps the CLI team's built-in coordination heuristic (based on member count
+/// and role names) to the appropriate [`TeamCoordination`] variant.
+fn cli_team_to_definition(
+    team: &Team,
+    user_id: &str,
+) -> astra_services::team_persistence::TeamDefinition {
+    use astra_services::team_persistence::*;
+
+    let coordination = infer_coordination(team);
+    let now = chrono::Utc::now().to_rfc3339();
+    TeamDefinition {
+        team_id: uuid::Uuid::new_v4().to_string(),
+        user_id: user_id.to_string(),
+        name: team.name.clone(),
+        description: team.description.clone(),
+        coordination,
+        members: team
+            .members
+            .iter()
+            .map(|m| TeamMemberDef {
+                role: m.role.clone(),
+                agent_id: None,
+                system_prompt: Some(m.description.clone()),
+                skills: m.skills.clone(),
+                model_override: m.model_override.clone(),
+                mcp_servers: vec![],
+            })
+            .collect(),
+        context: team.shared_context.clone(),
+        worktree_mode: WorktreeMode::Shared,
+        created_at: now.clone(),
+        updated_at: now,
+    }
+}
+
+/// Infer coordination pattern from team structure and member roles.
+fn infer_coordination(team: &Team) -> astra_services::team_persistence::TeamCoordination {
+    use astra_services::team_persistence::TeamCoordination;
+
+    let roles: Vec<&str> = team.members.iter().map(|m| m.role.as_str()).collect();
+
+    // Adversarial: if roles contain producer+reviewer
+    if roles.iter().any(|r| r.contains("producer") || r.contains("writer"))
+        && roles.iter().any(|r| r.contains("reviewer") || r.contains("critic"))
+    {
+        return TeamCoordination::Adversarial {
+            max_rounds: 3,
+            threshold: 0.8,
+        };
+    }
+
+    // Pipeline: if members appear to be sequential stages
+    if team.members.len() >= 2
+        && roles
+            .iter()
+            .any(|r| r.contains("analyst") || r.contains("planner"))
+    {
+        return TeamCoordination::Pipeline;
+    }
+
+    // Default: FanOut for parallel teams
+    TeamCoordination::FanOut {
+        aggregation: "merge".to_string(),
+    }
+}
+
 // ── Slash Command Handler ───────────────────────────────────────────────
 
-pub(super) fn handle_team_command(arg: &str, state: &mut super::ReplState) {
+pub(super) async fn handle_team_command(arg: &str, state: &mut super::ReplState) {
     let mut parts = arg.splitn(2, ' ');
     let sub = parts.next().unwrap_or("").trim();
     let sub_arg = parts.next().unwrap_or("").trim();
@@ -398,37 +470,128 @@ pub(super) fn handle_team_command(arg: &str, state: &mut super::ReplState) {
                 eprintln!("{}", "  Executes a team task through the delegation engine.".dim());
                 return;
             }
-            match state.team_registry.get(team_name) {
-                Some(team) => {
-                    eprintln!(
-                        "\n  {} Dispatching task to team '{}' ({} members)...",
-                        "🚀",
-                        team_name.cyan().bold(),
-                        team.members.len()
-                    );
-                    for m in &team.members {
-                        eprintln!(
-                            "    {} {} {}",
-                            "→".dim(),
-                            m.role.as_str().green(),
-                            format!("— {}", m.description).dim()
-                        );
-                    }
-                    eprintln!(
-                        "\n  {} Task: {}",
-                        "📋",
-                        task
-                    );
-                    eprintln!(
-                        "  {} {}",
-                        "ℹ️ ",
-                        "Team execution requires runtime orchestrator integration.\n    Use the API /v1/team/run endpoint or await full CLI integration.".dim()
-                    );
-                }
+
+            let cli_team = match state.team_registry.get(team_name) {
+                Some(t) => t.clone(),
                 None => {
                     eprintln!("  {} Team '{}' not found", theme::icon_err(), team_name);
+                    return;
+                }
+            };
+
+            let delegation_engine = match state.delegation_engine {
+                Some(ref e) => e.clone(),
+                None => {
+                    eprintln!("  {} Delegation engine not available (not logged in?)", theme::icon_err());
+                    return;
+                }
+            };
+
+            let user_id = state.ingestion_user_id.clone().unwrap_or_else(|| "local".into());
+            let session_id = state.session_id.clone().unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+
+            // Convert CLI team → TeamDefinition for the orchestrator
+            let team_def = cli_team_to_definition(&cli_team, &user_id);
+
+            // Build team store with this team pre-loaded
+            let team_store = Arc::new(
+                astra_services::team_persistence::InMemoryTeamStore::new(),
+            );
+            {
+                let _ = team_store.save_team(&team_def).await;
+            }
+
+            // Reuse the delegation engine's shared registry and run engine
+            let profile_registry = delegation_engine.registry().clone();
+            let run_engine = delegation_engine.run_engine().clone();
+
+            let config = astra_runtime::server::team_orchestrator::OrchestratorConfig {
+                user_id: user_id.clone(),
+                session_id,
+                source_agent_id: "orchestrator".to_string(),
+            };
+
+            let orchestrator = astra_runtime::server::team_orchestrator::TeamExecutionOrchestrator::new(
+                team_store,
+                delegation_engine,
+                run_engine,
+                profile_registry,
+                config,
+            );
+
+            eprintln!(
+                "\n  {} Dispatching task to team '{}' ({} members)...",
+                "🚀", team_name.cyan().bold(), cli_team.members.len()
+            );
+            for m in &cli_team.members {
+                eprintln!(
+                    "    {} {} {}",
+                    "→".dim(),
+                    m.role.as_str().green(),
+                    format!("— {}", m.description).dim()
+                );
+            }
+            eprintln!("\n  {} Task: {}\n", "📋", task);
+
+            let repo_root = std::env::current_dir().ok();
+            let report = orchestrator.execute_team(team_name, task, repo_root).await;
+
+            // Display report
+            match report.status {
+                astra_runtime::server::team_orchestrator::TeamExecutionStatus::Completed => {
+                    eprintln!("  {} Team '{}' completed successfully", "✅", team_name.green().bold());
+                }
+                astra_runtime::server::team_orchestrator::TeamExecutionStatus::CompletedWithConflicts => {
+                    eprintln!("  {} Team '{}' completed with merge conflicts", "⚠️ ", team_name.yellow().bold());
+                }
+                astra_runtime::server::team_orchestrator::TeamExecutionStatus::Failed => {
+                    eprintln!("  {} Team '{}' failed: {}", theme::icon_err(), team_name,
+                        report.error.as_deref().unwrap_or("unknown error"));
                 }
             }
+
+            if let Some(ref dr) = report.delegation_result {
+                eprintln!("  {} Delegation: {} | agents: {} | tokens: {}+{}",
+                    "📊".dim(),
+                    dr.delegation_id.get(..8).unwrap_or(&dr.delegation_id),
+                    dr.agent_results.len(),
+                    dr.total_prompt_tokens,
+                    dr.total_completion_tokens,
+                );
+                for ar in &dr.agent_results {
+                    let status_icon = if ar.status == "completed" { "✓" } else { "✗" };
+                    eprintln!("    {} {} — {}",
+                        status_icon.dim(),
+                        ar.agent_id.as_str().cyan(),
+                        ar.output.as_deref().unwrap_or("(no output)")
+                            .lines().next().unwrap_or("")
+                    );
+                }
+            }
+
+            if let Some(ref merge) = report.merge_result {
+                if merge.conflicts.is_empty() {
+                    eprintln!("  {} Merge: clean ({})",
+                        "🔀".dim(),
+                        if !merge.merged.is_empty() { "success" } else { "no changes" });
+                } else {
+                    eprintln!("  {} Merge: {} conflict(s)", "🔀".dim(), merge.conflicts.len());
+                    for c in &merge.conflicts {
+                        eprintln!("    {} {} — {}", "!".red(), c.agent_id, c.files.join(", "));
+                    }
+                }
+            }
+
+            if let Some(ref learning) = report.merged_learning {
+                if !learning.consensus_patterns.is_empty() || !learning.facts.is_empty() {
+                    eprintln!("  {} Learning: {} patterns, {} facts",
+                        "🧠".dim(),
+                        learning.consensus_patterns.len(),
+                        learning.facts.len(),
+                    );
+                }
+            }
+            eprintln!();
         }
 
         "history" => {

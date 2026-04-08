@@ -1428,6 +1428,16 @@ impl DelegationEngine {
         &self.tracker
     }
 
+    /// Get the shared profile registry.
+    pub fn registry(&self) -> &Arc<RwLock<AgentProfileRegistry>> {
+        &self.registry
+    }
+
+    /// Get the shared run engine.
+    pub fn run_engine(&self) -> &Arc<RunEngine> {
+        &self.run_engine
+    }
+
     // ── Pause / Resume API ──────────────────────────────────────────────────
 
     /// Pause all sub-runs belonging to a delegation.
