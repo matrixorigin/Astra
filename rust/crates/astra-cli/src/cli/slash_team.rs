@@ -1,7 +1,9 @@
 use super::*;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Instant;
 use astra_services::team_persistence::TeamPersistenceService;
+use astra_runtime::server::team_orchestrator::ExecutionPhase;
 
 // ── Team History & Snapshot Tracking ────────────────────────────────────
 
@@ -590,11 +592,58 @@ pub(super) async fn handle_team_command(arg: &str, state: &mut super::ReplState)
             let profile_registry = delegation_engine.registry().clone();
             let run_engine = delegation_engine.run_engine().clone();
 
+            // Wire live progress callback for phase updates
+            let progress: astra_runtime::server::team_orchestrator::ProgressCallback = Arc::new(
+                move |phase: ExecutionPhase| {
+                    match phase {
+                        ExecutionPhase::Preparing { team_name, member_count } => {
+                            eprintln!(
+                                "  {} Preparing team '{}' ({} members)...",
+                                "🔄".dim(), team_name.cyan(), member_count
+                            );
+                        }
+                        ExecutionPhase::WorktreesCreated { ref agent_ids } => {
+                            eprintln!(
+                                "  {} Worktrees created for {} agent{}",
+                                "📂".dim(),
+                                agent_ids.len(),
+                                if agent_ids.len() == 1 { "" } else { "s" }
+                            );
+                            for id in agent_ids {
+                                eprintln!("    {} {}", "→".dim(), id.as_str().dim());
+                            }
+                        }
+                        ExecutionPhase::Executing { ref delegation_id } => {
+                            eprintln!(
+                                "  {} Executing delegation {}...",
+                                "🚀".dim(),
+                                delegation_id.get(..8).unwrap_or(delegation_id).dim()
+                            );
+                        }
+                        ExecutionPhase::Merging { agent_count } => {
+                            eprintln!(
+                                "  {} Merging results from {} agent{}...",
+                                "🔀".dim(),
+                                agent_count,
+                                if agent_count == 1 { "" } else { "s" }
+                            );
+                        }
+                        ExecutionPhase::Reporting { ref status } => {
+                            eprintln!(
+                                "  {} Generating report ({})...",
+                                "📊".dim(),
+                                status.to_string().dim()
+                            );
+                        }
+                    }
+                },
+            );
+
             let config = astra_runtime::server::team_orchestrator::OrchestratorConfig {
                 user_id: user_id.clone(),
                 session_id,
                 source_agent_id: "orchestrator".to_string(),
-                progress: None,
+                progress: Some(progress),
             };
 
             let orchestrator = astra_runtime::server::team_orchestrator::TeamExecutionOrchestrator::new(
@@ -606,9 +655,10 @@ pub(super) async fn handle_team_command(arg: &str, state: &mut super::ReplState)
                 config,
             );
 
+            // Print header
             eprintln!(
-                "\n  {} Dispatching task to team '{}' ({} members)...",
-                "🚀", team_name.cyan().bold(), cli_team.members.len()
+                "\n{}",
+                format!("─── Team Run: {} ───", team_name).bold()
             );
             for m in &cli_team.members {
                 eprintln!(
@@ -618,65 +668,149 @@ pub(super) async fn handle_team_command(arg: &str, state: &mut super::ReplState)
                     format!("— {}", m.description).dim()
                 );
             }
-            eprintln!("\n  {} Task: {}\n", "📋", task);
+            eprintln!("  {} {}\n", "📋 Task:".bold(), task);
 
+            let started_at = chrono::Utc::now().to_rfc3339();
+            let timer = Instant::now();
             let repo_root = std::env::current_dir().ok();
             let report = orchestrator.execute_team(team_name, task, repo_root).await;
+            let elapsed = timer.elapsed();
 
-            // Display report
+            // Display report header with status
+            eprintln!();
             match report.status {
                 astra_runtime::server::team_orchestrator::TeamExecutionStatus::Completed => {
-                    eprintln!("  {} Team '{}' completed successfully", "✅", team_name.green().bold());
-                }
-                astra_runtime::server::team_orchestrator::TeamExecutionStatus::CompletedWithConflicts => {
-                    eprintln!("  {} Team '{}' completed with merge conflicts", "⚠️ ", team_name.yellow().bold());
-                }
-                astra_runtime::server::team_orchestrator::TeamExecutionStatus::Failed => {
-                    eprintln!("  {} Team '{}' failed: {}", theme::icon_err(), team_name,
-                        report.error.as_deref().unwrap_or("unknown error"));
-                }
-            }
-
-            if let Some(ref dr) = report.delegation_result {
-                eprintln!("  {} Delegation: {} | agents: {} | tokens: {}+{}",
-                    "📊".dim(),
-                    dr.delegation_id.get(..8).unwrap_or(&dr.delegation_id),
-                    dr.agent_results.len(),
-                    dr.total_prompt_tokens,
-                    dr.total_completion_tokens,
-                );
-                for ar in &dr.agent_results {
-                    let status_icon = if ar.status == "completed" { "✓" } else { "✗" };
-                    let first_line = ar.output.as_deref().unwrap_or("(no output)")
-                        .lines().next().unwrap_or("");
-                    eprintln!("    {} {} — {}",
-                        status_icon.dim(),
-                        ar.agent_id.as_str().cyan(),
-                        truncate_str(first_line, 80),
+                    eprintln!(
+                        "  {} Team '{}' completed successfully {}",
+                        "✅", team_name.green().bold(),
+                        format!("({})", format_duration(elapsed)).dim()
                     );
                 }
-            }
-
-            if let Some(ref merge) = report.merge_result {
-                if merge.conflicts.is_empty() {
-                    eprintln!("  {} Merge: clean ({})",
-                        "🔀".dim(),
-                        if !merge.merged.is_empty() { "success" } else { "no changes" });
-                } else {
-                    eprintln!("  {} Merge: {} conflict(s)", "🔀".dim(), merge.conflicts.len());
-                    for c in &merge.conflicts {
-                        eprintln!("    {} {} — {}", "!".red(), c.agent_id, c.files.join(", "));
+                astra_runtime::server::team_orchestrator::TeamExecutionStatus::CompletedWithConflicts => {
+                    eprintln!(
+                        "  {} Team '{}' completed with merge conflicts {}",
+                        "⚠️ ", team_name.yellow().bold(),
+                        format!("({})", format_duration(elapsed)).dim()
+                    );
+                }
+                astra_runtime::server::team_orchestrator::TeamExecutionStatus::Failed => {
+                    eprintln!(
+                        "  {} Team '{}' execution failed {}",
+                        theme::icon_err(), team_name.red().bold(),
+                        format!("({})", format_duration(elapsed)).dim()
+                    );
+                    if let Some(ref err) = report.error {
+                        eprintln!("    {} {}", "Error:".red().bold(), err);
                     }
                 }
             }
 
-            if let Some(ref learning) = report.merged_learning {
-                if !learning.consensus_patterns.is_empty() || !learning.facts.is_empty() {
-                    eprintln!("  {} Learning: {} patterns, {} facts",
-                        "🧠".dim(),
-                        learning.consensus_patterns.len(),
-                        learning.facts.len(),
+            // Agent results
+            if let Some(ref dr) = report.delegation_result {
+                let total_tokens = dr.total_prompt_tokens + dr.total_completion_tokens;
+                eprintln!(
+                    "\n  {} {} agent{} | {} tokens ({}↑ {}↓) | delegation {}",
+                    "📊",
+                    dr.agent_results.len(),
+                    if dr.agent_results.len() == 1 { "" } else { "s" },
+                    format_tokens(total_tokens),
+                    format_tokens(dr.total_prompt_tokens),
+                    format_tokens(dr.total_completion_tokens),
+                    dr.delegation_id.get(..8).unwrap_or(&dr.delegation_id).dim(),
+                );
+                for ar in &dr.agent_results {
+                    let (status_icon, status_color) = if ar.status == "completed" {
+                        ("✓", "green")
+                    } else {
+                        ("✗", "red")
+                    };
+                    let first_line = ar.output.as_deref().unwrap_or("(no output)")
+                        .lines().next().unwrap_or("");
+                    let agent_tokens = ar.prompt_tokens + ar.completion_tokens;
+                    match status_color {
+                        "green" => eprintln!(
+                            "    {} {} {} — {}",
+                            status_icon.green(),
+                            ar.agent_id.as_str().cyan(),
+                            format!("({}tok)", format_tokens(agent_tokens)).dim(),
+                            truncate_str(first_line, 72),
+                        ),
+                        _ => eprintln!(
+                            "    {} {} {} — {}",
+                            status_icon.red(),
+                            ar.agent_id.as_str().cyan(),
+                            format!("({}tok)", format_tokens(agent_tokens)).dim(),
+                            truncate_str(first_line, 72),
+                        ),
+                    }
+                }
+            }
+
+            // Merge results
+            if let Some(ref merge) = report.merge_result {
+                if merge.conflicts.is_empty() {
+                    if !merge.merged.is_empty() {
+                        eprintln!(
+                            "\n  {} Merge: {} branch{} merged cleanly",
+                            "🔀",
+                            merge.merged.len(),
+                            if merge.merged.len() == 1 { "" } else { "es" }
+                        );
+                    }
+                } else {
+                    eprintln!(
+                        "\n  {} Merge: {} conflict{}",
+                        "🔀", merge.conflicts.len(),
+                        if merge.conflicts.len() == 1 { "" } else { "s" }
                     );
+                    for c in &merge.conflicts {
+                        eprintln!(
+                            "    {} {} — {}",
+                            "!".red().bold(), c.agent_id.as_str().yellow(),
+                            c.files.join(", ")
+                        );
+                    }
+                }
+            }
+
+            // Learning summary
+            if let Some(ref learning) = report.merged_learning {
+                let has_patterns = !learning.consensus_patterns.is_empty();
+                let has_facts = !learning.facts.is_empty();
+                let has_caution = !learning.cautionary_patterns.is_empty();
+                if has_patterns || has_facts || has_caution {
+                    eprintln!("\n  {} Learning from {} agent{}:",
+                        "🧠",
+                        learning.agent_count,
+                        if learning.agent_count == 1 { "" } else { "s" }
+                    );
+                    if has_patterns {
+                        eprintln!("    {} {} consensus pattern{}",
+                            "•".dim(),
+                            learning.consensus_patterns.len(),
+                            if learning.consensus_patterns.len() == 1 { "" } else { "s" }
+                        );
+                    }
+                    if has_facts {
+                        eprintln!("    {} {} discovered fact{}",
+                            "•".dim(),
+                            learning.facts.len(),
+                            if learning.facts.len() == 1 { "" } else { "s" }
+                        );
+                        for fact in learning.facts.iter().take(3) {
+                            eprintln!("      {} {}", "→".dim(), truncate_str(fact, 70).dim());
+                        }
+                        if learning.facts.len() > 3 {
+                            eprintln!("      {} ...and {} more", "→".dim(), learning.facts.len() - 3);
+                        }
+                    }
+                    if has_caution {
+                        eprintln!("    {} {} cautionary pattern{}",
+                            "⚡".dim(),
+                            learning.cautionary_patterns.len(),
+                            if learning.cautionary_patterns.len() == 1 { "" } else { "s" }
+                        );
+                    }
                 }
             }
             eprintln!();
@@ -697,7 +831,7 @@ pub(super) async fn handle_team_command(arg: &str, state: &mut super::ReplState)
                 total_prompt_tokens: prompt_tok,
                 total_completion_tokens: compl_tok,
                 error: report.error.clone(),
-                started_at: chrono::Utc::now().to_rfc3339(),
+                started_at,
             });
         }
 
@@ -745,11 +879,12 @@ pub(super) async fn handle_team_command(arg: &str, state: &mut super::ReplState)
                 );
                 eprintln!("    {} {}", "Task:".dim(), truncate_str(&e.task, 70));
                 eprintln!(
-                    "    {} agents: {} | tokens: {}+{} | delegation: {}",
+                    "    {} agents: {} | tokens: {} ({}↑ {}↓) | delegation: {}",
                     "📊".dim(),
                     e.agent_count,
-                    e.total_prompt_tokens,
-                    e.total_completion_tokens,
+                    format_tokens(e.total_prompt_tokens + e.total_completion_tokens),
+                    format_tokens(e.total_prompt_tokens),
+                    format_tokens(e.total_completion_tokens),
                     e.delegation_id.get(..8).unwrap_or(&e.delegation_id),
                 );
                 if let Some(ref err) = e.error {
@@ -936,6 +1071,34 @@ pub(super) async fn handle_team_command(arg: &str, state: &mut super::ReplState)
                 .yellow()
             );
         }
+    }
+}
+
+// ─── Formatting helpers ────────────────────────────────────────────────────
+
+/// Format a Duration as a human-readable string (e.g. "2.3s", "1m 12s").
+fn format_duration(d: std::time::Duration) -> String {
+    let secs = d.as_secs();
+    let millis = d.subsec_millis();
+    if secs >= 60 {
+        let mins = secs / 60;
+        let rem = secs % 60;
+        format!("{mins}m {rem}s")
+    } else if secs >= 10 {
+        format!("{secs}s")
+    } else {
+        format!("{secs}.{:01}s", millis / 100)
+    }
+}
+
+/// Format token counts with K/M suffixes for readability.
+fn format_tokens(n: u64) -> String {
+    if n >= 1_000_000 {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    } else if n >= 10_000 {
+        format!("{:.1}K", n as f64 / 1_000.0)
+    } else {
+        n.to_string()
     }
 }
 
@@ -1188,5 +1351,66 @@ mod tests {
         assert!(sha.is_some(), "Expected Some(sha) in a git repo");
         let sha = sha.unwrap();
         assert!(sha.len() >= 7, "SHA too short: {}", sha);
+    }
+
+    // ── Formatting helper tests ─────────────────────────────────
+
+    #[test]
+    fn format_duration_sub_second() {
+        let d = std::time::Duration::from_millis(500);
+        assert_eq!(format_duration(d), "0.5s");
+    }
+
+    #[test]
+    fn format_duration_seconds() {
+        let d = std::time::Duration::from_secs(3) + std::time::Duration::from_millis(200);
+        assert_eq!(format_duration(d), "3.2s");
+    }
+
+    #[test]
+    fn format_duration_ten_plus_seconds() {
+        let d = std::time::Duration::from_secs(42);
+        assert_eq!(format_duration(d), "42s");
+    }
+
+    #[test]
+    fn format_duration_minutes() {
+        let d = std::time::Duration::from_secs(125);
+        assert_eq!(format_duration(d), "2m 5s");
+    }
+
+    #[test]
+    fn format_tokens_small() {
+        assert_eq!(format_tokens(500), "500");
+        assert_eq!(format_tokens(9999), "9999");
+    }
+
+    #[test]
+    fn format_tokens_thousands() {
+        assert_eq!(format_tokens(10000), "10.0K");
+        assert_eq!(format_tokens(42500), "42.5K");
+    }
+
+    #[test]
+    fn format_tokens_millions() {
+        assert_eq!(format_tokens(1_500_000), "1.5M");
+        assert_eq!(format_tokens(2_000_000), "2.0M");
+    }
+
+    // ── Progress callback type check ────────────────────────────
+
+    #[test]
+    fn execution_phase_display() {
+        // Verify the ExecutionPhase variants we use in the progress callback
+        let p = ExecutionPhase::Preparing {
+            team_name: "dev".into(),
+            member_count: 3,
+        };
+        assert!(matches!(p, ExecutionPhase::Preparing { .. }));
+
+        let p = ExecutionPhase::Executing {
+            delegation_id: "abc123".into(),
+        };
+        assert!(matches!(p, ExecutionPhase::Executing { .. }));
     }
 }
