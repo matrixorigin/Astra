@@ -19,15 +19,35 @@
 use astra_core::composite_snapshot::{CompositeSnapshot, SnapshotRef};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use tokio::process::Command;
+use tokio::sync::Mutex;
 
 // ─── Types ──────────────────────────────────────────────────────────────────
 
 /// Sanitize agent_id for safe use in git branch names and filesystem paths.
-fn sanitize_agent_id(id: &str) -> String {
-    id.chars()
+/// Returns `None` if the sanitized result is empty.
+fn sanitize_agent_id(id: &str) -> Option<String> {
+    let sanitized: String = id
+        .chars()
         .filter(|c| c.is_alphanumeric() || *c == '-' || *c == '_')
-        .collect()
+        .collect();
+    if sanitized.is_empty() {
+        None
+    } else {
+        Some(sanitized)
+    }
+}
+
+/// Shared lock for serializing git operations on a single repository.
+///
+/// Multiple concurrent team executions on the same repo must hold this lock
+/// during merge operations to prevent git index corruption.
+pub type RepoLock = Arc<Mutex<()>>;
+
+/// Create a new [`RepoLock`].
+pub fn new_repo_lock() -> RepoLock {
+    Arc::new(Mutex::new(()))
 }
 
 /// Manages git worktrees for multi-agent parallel file editing.
@@ -35,6 +55,7 @@ pub struct WorktreeManager {
     repo_root: PathBuf,
     worktree_base: PathBuf,
     active: HashMap<String, WorktreeInfo>,
+    repo_lock: RepoLock,
 }
 
 /// Metadata for a single agent's worktree.
@@ -103,7 +124,17 @@ impl WorktreeManager {
             repo_root,
             worktree_base,
             active: HashMap::new(),
+            repo_lock: new_repo_lock(),
         }
+    }
+
+    /// Create a new manager with a shared repository lock.
+    ///
+    /// Use this when multiple team executions may target the same repo
+    /// concurrently — pass the same [`RepoLock`] to each manager.
+    pub fn with_repo_lock(mut self, lock: RepoLock) -> Self {
+        self.repo_lock = lock;
+        self
     }
 
     /// Override the base directory for worktrees (useful for testing).
@@ -143,9 +174,20 @@ impl WorktreeManager {
         tokio::fs::create_dir_all(&self.worktree_base).await?;
 
         for agent_id in agent_ids {
-            let safe_id = sanitize_agent_id(agent_id);
+            let safe_id = sanitize_agent_id(agent_id).ok_or_else(|| {
+                WorktreeError::Git(format!(
+                    "agent_id '{agent_id}' contains no valid characters for branch names"
+                ))
+            })?;
             let branch_name = format!("agent/{safe_id}-{del_prefix}");
             let wt_path = self.worktree_base.join(&branch_name.replace('/', "_"));
+
+            let wt_path_str = wt_path.to_str().ok_or_else(|| {
+                WorktreeError::Git(format!(
+                    "worktree path contains invalid UTF-8: {}",
+                    wt_path.to_string_lossy()
+                ))
+            })?;
 
             // git worktree add -b <branch> <path> HEAD
             let output = Command::new("git")
@@ -154,7 +196,7 @@ impl WorktreeManager {
                     "add",
                     "-b",
                     &branch_name,
-                    wt_path.to_str().unwrap_or_default(),
+                    wt_path_str,
                     "HEAD",
                 ])
                 .current_dir(&self.repo_root)
@@ -244,11 +286,15 @@ impl WorktreeManager {
     ///
     /// `merge_order` determines priority when conflicts arise — earlier agents'
     /// changes are merged first and take precedence.
+    ///
+    /// Holds the repository lock for the duration of all merges to prevent
+    /// concurrent git operations from corrupting the index.
     pub async fn merge_worktrees(
         &self,
         delegation_id: &str,
         merge_order: &[String],
     ) -> Result<MergeResult, WorktreeError> {
+        let _lock = self.repo_lock.lock().await;
         let mut result = MergeResult::default();
 
         for agent_id in merge_order {
@@ -265,6 +311,11 @@ impl WorktreeManager {
                 result.skipped.push(agent_id.clone());
                 continue;
             }
+
+            // Capture current HEAD before this merge attempt so that the
+            // conflict snapshot enables rollback to the correct state (which
+            // includes prior successful merges, not the original base).
+            let pre_merge_head = self.current_head().await?;
 
             // Attempt merge
             let output = Command::new("git")
@@ -284,7 +335,7 @@ impl WorktreeManager {
                     turn: 0,
                     created_at: chrono::Utc::now().to_rfc3339(),
                     label: Some(format!("merge conflict for {agent_id}")),
-                    refs: vec![SnapshotRef::GitCommit(info.base_commit.clone())],
+                    refs: vec![SnapshotRef::GitCommit(pre_merge_head)],
                 };
                 result.conflicts.push(ConflictInfo {
                     agent_id: agent_id.clone(),
@@ -308,7 +359,7 @@ impl WorktreeManager {
                     "worktree",
                     "remove",
                     "--force",
-                    info.worktree_path.to_str().unwrap_or_default(),
+                    &info.worktree_path.to_string_lossy(),
                 ])
                 .current_dir(&self.repo_root)
                 .output()
@@ -527,6 +578,68 @@ mod tests {
         assert_eq!(result.conflicts.len(), 1);
         assert_eq!(result.conflicts[0].agent_id, "a2");
         assert!(result.conflicts[0].files.contains(&"README.md".to_string()));
+
+        mgr.cleanup().await.unwrap();
+    }
+
+    #[test]
+    fn sanitize_agent_id_rejects_empty() {
+        assert!(sanitize_agent_id("@@@").is_none());
+        assert!(sanitize_agent_id("").is_none());
+        assert_eq!(sanitize_agent_id("ok-1").unwrap(), "ok-1");
+        assert_eq!(sanitize_agent_id("a!b@c").unwrap(), "abc");
+    }
+
+    #[tokio::test]
+    async fn create_worktree_rejects_invalid_agent_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().to_path_buf();
+        init_test_repo(&repo).await;
+
+        let mut mgr = make_manager(&repo);
+        let agents = vec!["@@@".to_string()];
+        let result = mgr.create_worktrees("del-12345678", &agents).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("no valid characters"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn conflict_snapshot_references_pre_merge_head() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().to_path_buf();
+        init_test_repo(&repo).await;
+
+        let mut mgr = make_manager(&repo);
+        let agents = vec!["a1".to_string(), "a2".to_string()];
+        let paths = mgr.create_worktrees("del-snaptest1", &agents).await.unwrap();
+        let original_base = mgr.active["a1"].base_commit.clone();
+
+        // a1: modify README.md
+        tokio::fs::write(paths["a1"].join("README.md"), "a1 version\n").await.unwrap();
+        Command::new("git").args(["add", "."]).current_dir(&paths["a1"]).output().await.unwrap();
+        Command::new("git").args(["commit", "-m", "a1"]).current_dir(&paths["a1"]).output().await.unwrap();
+
+        // a2: modify README.md differently (will conflict)
+        tokio::fs::write(paths["a2"].join("README.md"), "a2 version\n").await.unwrap();
+        Command::new("git").args(["add", "."]).current_dir(&paths["a2"]).output().await.unwrap();
+        Command::new("git").args(["commit", "-m", "a2"]).current_dir(&paths["a2"]).output().await.unwrap();
+
+        let result = mgr.merge_worktrees("del-snaptest1", &["a1".into(), "a2".into()]).await.unwrap();
+
+        assert_eq!(result.merged, vec!["a1"]);
+        assert_eq!(result.conflicts.len(), 1);
+
+        // The conflict snapshot should reference the post-a1-merge HEAD,
+        // NOT the original base commit.
+        let conflict_snap = &result.conflicts[0].snapshot;
+        let snap_commit = conflict_snap.refs.iter().find_map(|r| match r {
+            SnapshotRef::GitCommit(sha) => Some(sha.clone()),
+            _ => None,
+        }).expect("conflict snapshot should have a GitCommit ref");
+
+        assert_ne!(snap_commit, original_base,
+            "conflict snapshot should reference pre-merge HEAD (after a1 merged), not original base");
 
         mgr.cleanup().await.unwrap();
     }
