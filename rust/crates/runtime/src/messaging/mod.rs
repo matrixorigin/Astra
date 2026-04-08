@@ -34,6 +34,7 @@
 //! # }
 //! ```
 
+pub mod ack_tracker;
 pub mod db_transport;
 pub mod in_process;
 pub mod router;
@@ -51,9 +52,11 @@ mod db_transport_integration_tests;
 mod delegation_mailbox_tests;
 
 // Re-export key types for convenience.
+pub use ack_tracker::{AckConfig, AckOutcome, PendingAckTracker};
 pub use db_transport::{CleanupScheduler, DatabaseTransport, TransportMetrics as DbTransportMetrics};
 pub use in_process::{InProcessMetrics, InProcessTransport};
 pub use router::{AgentMailbox, AgentMailboxRouter};
+pub use send_tool::SendResult;
 pub use transport::{MessageStream, MessageTransport};
 pub use types::{
     AgentAddress, AgentMessage, AgentSignal, MailboxError, MessagePayload, MessageTarget,

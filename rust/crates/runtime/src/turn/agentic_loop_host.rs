@@ -350,6 +350,9 @@ pub struct AgenticLoopState {
     /// When set, incoming messages are drained at each turn start and
     /// progress updates are sent to the parent at turn end.
     pub mailbox: Option<crate::messaging::router::AgentMailbox>,
+
+    /// Tracks messages that require acknowledgment and handles retries.
+    pub ack_tracker: Option<crate::messaging::ack_tracker::PendingAckTracker>,
 }
 
 /// Consecutive same-category error turns before forcing a strategy change.
@@ -911,6 +914,33 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
                 let mut parts = Vec::with_capacity(pending.len());
                 for msg in &pending {
                     let from_label = &msg.from.agent_id;
+
+                    // Route Ack/Nack to our tracker (control messages, not shown to LLM).
+                    match &msg.payload {
+                        crate::messaging::types::MessagePayload::Ack { message_id } => {
+                            if let Some(ref tracker) = state.ack_tracker {
+                                tracker.acknowledge(message_id).await;
+                            }
+                            parts.push(format!("[{from_label} ack]: message {message_id} acknowledged"));
+                            continue;
+                        }
+                        crate::messaging::types::MessagePayload::Nack { message_id, reason } => {
+                            if let Some(ref tracker) = state.ack_tracker {
+                                tracker.reject(message_id, reason.clone()).await;
+                            }
+                            let r = reason.as_deref().unwrap_or("no reason");
+                            parts.push(format!("[{from_label} nack]: message {message_id} rejected — {r}"));
+                            continue;
+                        }
+                        _ => {}
+                    }
+
+                    // Auto-ack: if the sender requested ack, send one back.
+                    if msg.requires_ack {
+                        let ack_reply = msg.make_ack(mailbox.address.clone());
+                        let _ = mailbox.send(ack_reply).await;
+                    }
+
                     match &msg.payload {
                         crate::messaging::types::MessagePayload::Text { content, .. } => {
                             parts.push(format!("[{from_label}]: {content}"));
@@ -938,18 +968,44 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
                         crate::messaging::types::MessagePayload::Signal(sig) => {
                             parts.push(format!("[{from_label} signal]: {sig:?}"));
                         }
+                        // Ack/Nack already handled above.
+                        crate::messaging::types::MessagePayload::Ack { .. } => {}
+                        crate::messaging::types::MessagePayload::Nack { .. } => {}
                     }
                 }
-                let mailbox_text = format!(
-                    "📬 Messages from other agents ({}{}):\n{}",
-                    pending.len(),
-                    if has_more { "+, more queued" } else { "" },
-                    parts.join("\n")
-                );
-                state.messages.push(serde_json::json!({
-                    "role": "system",
-                    "content": mailbox_text,
-                }));
+                if !parts.is_empty() {
+                    let mailbox_text = format!(
+                        "📬 Messages from other agents ({}{}):\n{}",
+                        pending.len(),
+                        if has_more { "+, more queued" } else { "" },
+                        parts.join("\n")
+                    );
+                    state.messages.push(serde_json::json!({
+                        "role": "system",
+                        "content": mailbox_text,
+                    }));
+                }
+            }
+        }
+
+        // Sweep ack tracker for timed-out messages (retry or fail).
+        if let Some(ref tracker) = state.ack_tracker {
+            let outcomes = tracker.sweep().await;
+            let retry_msgs = tracker.get_retry_messages(&outcomes).await;
+            // Re-send retry messages.
+            for retry_msg in retry_msgs {
+                if let Some(ref mut mb) = state.mailbox {
+                    let _ = mb.send((*retry_msg).clone()).await;
+                }
+            }
+            // Log failures.
+            for outcome in &outcomes {
+                if let crate::messaging::ack_tracker::AckOutcome::Failed { message_id, attempts } = outcome {
+                    eprintln!(
+                        "  ⚠ messaging: ack timeout exhausted for message {} after {} attempts",
+                        message_id, attempts
+                    );
+                }
             }
         }
 
@@ -1217,10 +1273,16 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
                         crate::messaging::send_tool::parse_send_message_call(tc)
                     {
                         let mailbox = state.mailbox.as_ref().unwrap();
-                        let result =
+                        let send_result =
                             crate::messaging::send_tool::execute_send_message(mailbox, &args)
                                 .await;
-                        msg_results.push((call_id, result));
+                        // Track ack-requiring messages.
+                        if let Some(tracked_msg) = send_result.tracked_message {
+                            if let Some(ref tracker) = state.ack_tracker {
+                                tracker.track(tracked_msg).await;
+                            }
+                        }
+                        msg_results.push((call_id, send_result.display));
                     } else if let Some(call_id) = tc.get("id").and_then(|v| v.as_str()) {
                         msg_results.push((
                             call_id.to_string(),
@@ -2076,6 +2138,7 @@ mod tests {
             invoked_skills: std::collections::HashMap::new(),
             recent_file_reads: Vec::new(),
             mailbox: None,
+            ack_tracker: None,
         }
     }
 

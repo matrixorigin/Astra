@@ -213,6 +213,7 @@ mod tests {
             invoked_skills: std::collections::HashMap::new(),
             recent_file_reads: Vec::new(),
             mailbox: None,
+            ack_tracker: None,
         }
     }
 
