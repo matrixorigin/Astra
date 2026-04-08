@@ -152,9 +152,7 @@ use slash_account::handle_account_command;
 use slash_bug::handle_bug_command;
 use slash_debug::handle_debug_command;
 use slash_info::handle_info_command;
-use plan_interaction::{
-    clear_plan_background_execution, handle_plan_mode_input, plan_execution_ui_active,
-};
+use plan_interaction::{handle_plan_mode_input, plan_execution_ui_active};
 use slash_memory::handle_memory_domain_command;
 use slash_session::handle_session_command;
 #[cfg(test)]
@@ -948,14 +946,17 @@ struct ReplState {
     /// Shared team persistence service (in-memory or MatrixOne-backed).
     /// Used for execution history and snapshot persistence.
     team_store: std::sync::Arc<dyn astra_services::team_persistence::TeamPersistenceService>,
-    /// Handle for communicating with a background plan executor.
-    /// When Some, a plan is running in the background and the REPL can
-    /// poll for updates via `plan_handle.try_recv()`.
+    /// Handle for communicating with the plan executor.
+    /// When Some, a plan executor is alive (either actively running or paused
+    /// waiting for Resume/Cancel).
     plan_handle: Option<plan_executor::PlanExecutorHandle>,
 
+    /// Set by `handle_plan_command(Resume)` so the main loop re-enters
+    /// the blocking plan monitor after `handle_plan_mode_input` returns.
+    plan_resume_pending: bool,
+
     /// When Some, a plan-executor tool is waiting for user approval.
-    /// The REPL readline handler interprets the next line as y/n and
-    /// sends the bool through this oneshot.
+    /// In blocking mode this is handled inline; kept for edge-case fallback.
     pending_approval: Option<tokio::sync::oneshot::Sender<bool>>,
     /// True while plan display is in the middle of printing streaming LLM tokens.
     /// Used to insert a newline before the next non-token event.
@@ -1039,6 +1040,7 @@ impl Default for ReplState {
                 astra_services::team_persistence::InMemoryTeamStore::new(),
             ),
             plan_handle: None,
+            plan_resume_pending: false,
             pending_approval: None,
             plan_in_token_stream: false,
             project_instructions: None,
@@ -3243,18 +3245,26 @@ fn create_background_selector(
     create_background_plan_selector(ctx)
 }
 
-/// Spawn a background plan executor and enter a monitoring loop that displays
-/// progress until the plan completes, pauses, or errors.
+/// Spawn a plan executor, then block until it finishes, pauses, or errors.
 ///
-/// This replaces the old synchronous `run_plan_execution`: the actual execution
-/// happens in a spawned `tokio` task, while this function polls updates and
-/// forwards Ctrl-C as a pause command.
-async fn start_and_monitor_background_plan(
+/// The executor runs as a `tokio` task; this function enters a monitoring
+/// loop that displays progress in real-time, handles Ctrl-C (→ pause), and
+/// resolves approval prompts inline. The REPL prompt is not shown until
+/// this function returns.
+async fn start_and_monitor_plan(
     state: &mut ReplState,
     current_token: Option<&str>,
     api: &astra_thin_client::ThinClient,
     profile: Option<&str>,
 ) -> Result<(), String> {
+    // ── Cancel any existing executor to prevent orphan tasks ─────
+    if plan_interaction::shutdown_plan_executor(state) {
+        eprintln!(
+            "  {}  Previous plan executor cancelled before starting new run.",
+            theme::icon_warn()
+        );
+    }
+
     // ── Generate durable contract if not already present ─────────
     ensure_durable_task_state(state, Some(api), current_token).await;
 
@@ -3264,10 +3274,11 @@ async fn start_and_monitor_background_plan(
     let handle = plan_executor::spawn_plan_executor(ctx, selector);
     state.plan_handle = Some(handle);
 
-    eprintln!(
-        "{}",
-        "  🔄 Plan executing in background — you can keep typing.".dim()
-    );
+    eprintln!("{}", "  🔄 Plan executing…".dim());
+
+    // ── Block until done / paused / error ────────────────────────────
+    run_blocking_plan_monitor(state).await;
+
     Ok(())
 }
 
@@ -3385,14 +3396,28 @@ async fn ensure_durable_task_state(
     }
 }
 
-/// Drain plan updates from the background executor and display them via
-/// `eprintln!`. Called between prompts when readline is not active.
+/// Outcome of draining plan updates — used by the blocking monitor to decide
+/// whether to keep looping, break on pause, or stop on finish/error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PlanMonitorOutcome {
+    /// Normal drain — more updates may follow.
+    Continue,
+    /// `PlanPaused` received — executor is waiting for Resume/Cancel.
+    Paused,
+    /// `PlanCompleted` or `PlanError` received — executor has exited.
+    Finished,
+}
+
+/// Drain plan updates from the executor channel and display them via
+/// `eprintln!`. Returns the monitor outcome so the caller can decide
+/// whether to keep polling.
 fn display_plan_updates_live(
     state: &mut ReplState,
     plan_spinner: &mut Option<effects::PlanActivitySpinner>,
     current_subtask_tag: &mut String,
-) {
+) -> PlanMonitorOutcome {
     use plan_executor::PlanUpdate;
+    let mut outcome = PlanMonitorOutcome::Continue;
 
     // Helper: if we were in the middle of streaming tokens, close that stream
     // with a newline before printing anything else.
@@ -3422,7 +3447,7 @@ fn display_plan_updates_live(
 
     let handle = match state.plan_handle.as_mut() {
         Some(h) => h,
-        None => return,
+        None => return outcome,
     };
 
     while let Some(update) = handle.try_recv() {
@@ -3508,7 +3533,6 @@ fn display_plan_updates_live(
                 );
                 state.executing_plan = None;
                 state.current_plan_subtask_id = None;
-                clear_plan_background_execution(state);
                 // Deny any pending approval (plan is done)
                 if let Some(tx) = state.pending_approval.take() {
                     let _ = tx.send(false);
@@ -3525,7 +3549,7 @@ fn display_plan_updates_live(
                         "  Still in plan mode — type exit when you want normal chat.".dim()
                     );
                 }
-                return;
+                return PlanMonitorOutcome::Finished;
             }
             PlanUpdate::PlanError { error } => {
                 // Stop spinner
@@ -3540,7 +3564,6 @@ fn display_plan_updates_live(
                 let msg = format!("\n❌  Plan error: {error}");
                 state.executing_plan = None;
                 state.current_plan_subtask_id = None;
-                clear_plan_background_execution(state);
                 // Deny any pending approval (plan failed)
                 if let Some(tx) = state.pending_approval.take() {
                     let _ = tx.send(false);
@@ -3552,19 +3575,22 @@ fn display_plan_updates_live(
                         "  Still in plan mode — type exit to leave or resume after fixing.".dim()
                     );
                 }
-                return;
+                return PlanMonitorOutcome::Finished;
             }
             PlanUpdate::PlanPaused {
                 pct,
                 remaining,
                 elapsed,
-            } => (
-                format!(
-                    "\n⏸  Plan paused — {pct}% done, {remaining} remaining ({})",
-                    format_duration_short(elapsed),
-                ),
-                None,
-            ),
+            } => {
+                outcome = PlanMonitorOutcome::Paused;
+                (
+                    format!(
+                        "\n⏸  Plan paused — {pct}% done, {remaining} remaining ({})",
+                        format_duration_short(elapsed),
+                    ),
+                    None,
+                )
+            }
             PlanUpdate::GlobalVerificationFailed => {
                 ("  ⚠ Global verification failed".to_string(), None)
             }
@@ -3737,6 +3763,7 @@ fn display_plan_updates_live(
             ));
         }
     }
+    outcome
 }
 
 /// Flush queued background plan updates when the REPL is *not* actively reading a line.
@@ -3793,9 +3820,127 @@ fn flush_plan_updates_between_prompts(state: &mut ReplState) {
 
     let mut plan_spinner: Option<effects::PlanActivitySpinner> = None;
     let mut current_subtask_tag = state.current_plan_subtask_id.clone().unwrap_or_default();
-    display_plan_updates_live(state, &mut plan_spinner, &mut current_subtask_tag);
+    let _ = display_plan_updates_live(state, &mut plan_spinner, &mut current_subtask_tag);
     if let Some(spinner) = plan_spinner.take() {
         spinner.stop_clear();
+    }
+}
+
+/// Clear REPL state when the plan update channel closed without `PlanCompleted` / `PlanError`.
+fn cleanup_orphan_plan_executor(state: &mut ReplState, plan_spinner: &mut Option<effects::PlanActivitySpinner>) {
+    if let Some(s) = plan_spinner.take() {
+        s.stop_clear();
+    }
+    if let Some(mut h) = state.plan_handle.take() {
+        while h.try_recv().is_some() {}
+    }
+    state.executing_plan = None;
+    state.current_plan_subtask_id = None;
+    if let Some(tx) = state.pending_approval.take() {
+        let _ = tx.send(false);
+    }
+    eprintln!(
+        "\n{}  Plan executor stopped without a final status (channel closed). State cleared.",
+        theme::icon_warn()
+    );
+}
+
+/// Block the REPL until the plan executor finishes, pauses, or errors.
+///
+/// Replaces the old "fire and forget" background model: the user cannot type
+/// at the prompt while a plan is running. First Ctrl-C sends Pause; a second
+/// Ctrl-C within two seconds sends Cancel. Approval prompts are read from stdin inline.
+async fn run_blocking_plan_monitor(state: &mut ReplState) {
+    let mut plan_spinner: Option<effects::PlanActivitySpinner> = None;
+    let mut current_subtask_tag = state.current_plan_subtask_id.clone().unwrap_or_default();
+    let mut last_ctrl_c: Option<std::time::Instant> = None;
+    const CTRL_C_CANCEL_WINDOW: std::time::Duration = std::time::Duration::from_secs(2);
+
+    loop {
+        // Drain all currently available updates (non-blocking).
+        let outcome =
+            display_plan_updates_live(state, &mut plan_spinner, &mut current_subtask_tag);
+
+        if outcome != PlanMonitorOutcome::Continue {
+            break;
+        }
+
+        // Executor exited without sending PlanCompleted / PlanError (e.g. task panic).
+        if state
+            .plan_handle
+            .as_ref()
+            .is_some_and(|h| h.is_finished())
+        {
+            cleanup_orphan_plan_executor(state, &mut plan_spinner);
+            break;
+        }
+
+        // Handle pending approval inline (readline is not active).
+        if state.pending_approval.is_some() {
+            let approved = tokio::task::spawn_blocking(|| {
+                use std::io::Write;
+                let _ = std::io::stderr().flush();
+                let mut line = String::new();
+                if std::io::stdin().read_line(&mut line).is_err() {
+                    eprintln!(
+                        "\n{}  Could not read approval line; treating as deny.",
+                        theme::icon_warn()
+                    );
+                    return false;
+                }
+                let trimmed = line.trim().to_lowercase();
+                trimmed == "y" || trimmed == "yes" || trimmed == "!" || trimmed == "a"
+            })
+            .await
+            .unwrap_or(false);
+            if let Some(tx) = state.pending_approval.take() {
+                let _ = tx.send(approved);
+            }
+            continue;
+        }
+
+        // Wait for the next event or Ctrl-C.
+        tokio::select! {
+            biased;
+            _ = tokio::signal::ctrl_c() => {
+                if let Some(ref handle) = state.plan_handle {
+                    let now = std::time::Instant::now();
+                    let second_in_window = last_ctrl_c
+                        .is_some_and(|t| now.duration_since(t) < CTRL_C_CANCEL_WINDOW);
+                    last_ctrl_c = Some(now);
+                    if second_in_window {
+                        let _ = handle.send_command(plan_executor::PlanCommand::Cancel);
+                        if let Some(s) = plan_spinner.take() {
+                            s.stop_clear();
+                        }
+                        eprintln!(
+                            "\n{}  Second interrupt — cancelling plan.",
+                            "⏹".yellow()
+                        );
+                    } else {
+                        let _ = handle.send_command(plan_executor::PlanCommand::Pause);
+                        if let Some(s) = plan_spinner.take() {
+                            s.stop_clear();
+                        }
+                        eprintln!(
+                            "\n{}  Pausing plan… (current subtask will finish first). Press Ctrl-C again within {}s to cancel.",
+                            "⏸".yellow(),
+                            CTRL_C_CANCEL_WINDOW.as_secs(),
+                        );
+                    }
+                }
+            }
+            _ = tokio::time::sleep(std::time::Duration::from_millis(30)) => {}
+        }
+    }
+
+    if let Some(s) = plan_spinner.take() {
+        s.stop_clear();
+    }
+
+    // Show pause hints when returning to the REPL prompt after a pause.
+    if state.plan_handle.is_some() {
+        eprint_plan_execution_paused_hints();
     }
 }
 
@@ -5488,7 +5633,6 @@ async fn run_chat_repl(
     }
 
     // ── Main loop ─────────────────────────────────────────────────────────────
-    let mut last_ctrl_c_at: Option<std::time::Instant> = None;
     loop {
         flush_plan_updates_between_prompts(&mut state);
         // Refresh Tab-completion data (skills/MCP may change mid-session).
@@ -5630,7 +5774,7 @@ async fn run_chat_repl(
 
                     // If /plan auto triggered execution, start the background executor
                     if state.executing_plan.is_some() && state.plan_mode.is_none() {
-                        start_and_monitor_background_plan(
+                        start_and_monitor_plan(
                             &mut state,
                             current_token.as_deref(),
                             api,
@@ -5640,26 +5784,38 @@ async fn run_chat_repl(
                     }
                 } else if state.plan_mode.is_some() {
                     // Plan mode: handle input as plan editing
-                    handle_plan_mode_input(line.clone(), current_token.as_deref(), &mut state, api)
-                        .await?;
+                    if let Err(e) = handle_plan_mode_input(
+                        line.clone(),
+                        current_token.as_deref(),
+                        &mut state,
+                        api,
+                    )
+                    .await
+                    {
+                        state.plan_resume_pending = false;
+                        return Err(e);
+                    }
 
-                    // If plan execution was just triggered, start the background executor
+                    // If plan execution was just triggered, start the executor (blocking).
                     if state.executing_plan.is_some() {
-                        start_and_monitor_background_plan(
+                        start_and_monitor_plan(
                             &mut state,
                             current_token.as_deref(),
                             api,
                             profile,
                         )
                         .await?;
+                    } else if state.plan_resume_pending {
+                        // Resume was sent to a paused executor — re-enter blocking monitor.
+                        state.plan_resume_pending = false;
+                        run_blocking_plan_monitor(&mut state).await;
                     }
-                } else if state.executing_plan.is_some() && plan_decompose::is_resume_command(&line)
+                } else if (state.executing_plan.is_some() || state.plan_handle.is_some())
+                    && plan_decompose::is_resume_command(&line)
                 {
                     // Resume paused plan execution
                     eprintln!();
                     eprintln!("{}  Resuming plan execution...", "▶".cyan());
-                    // If the background handle still exists (paused task waiting for
-                    // Resume command), send Resume. Otherwise spawn a fresh executor.
                     if let Some(ref handle) = state.plan_handle {
                         let _ = handle.send_command(plan_executor::PlanCommand::Resume {
                             corrections: if state.plan_execution_corrections.is_empty() {
@@ -5668,9 +5824,10 @@ async fn run_chat_repl(
                                 Some(std::mem::take(&mut state.plan_execution_corrections))
                             },
                         });
-                        // Updates will appear via flush_plan_updates_between_prompts at the next loop iteration
+                        // Re-enter blocking monitor until done/paused/error
+                        run_blocking_plan_monitor(&mut state).await;
                     } else {
-                        start_and_monitor_background_plan(
+                        start_and_monitor_plan(
                             &mut state,
                             current_token.as_deref(),
                             api,
@@ -5679,7 +5836,9 @@ async fn run_chat_repl(
                         .await?;
                     }
                 } else {
-                    if state.executing_plan.is_some() {
+                    let has_paused_plan =
+                        state.executing_plan.is_some() || state.plan_handle.is_some();
+                    if has_paused_plan {
                         if let Some(action) = plan_decompose::parse_plan_paused_user_line(&line) {
                             match action {
                                 plan_decompose::PlanPausedUserAction::ClearCorrections => {
@@ -5718,23 +5877,40 @@ async fn run_chat_repl(
                                                 );
                                             }
                                         }
+                                    } else {
+                                        eprintln!(
+                                            "  {} Rewind not available while plan is held by the executor. Type continue first.",
+                                            theme::icon_warn()
+                                        );
                                     }
                                 }
                             }
                             continue;
                         }
                         // Paused plan: any other non-resume line abandons and becomes normal chat
-                        let plan = state.executing_plan.take().unwrap();
-                        let done = plan.items_done();
-                        let total = plan.subtasks.len();
+                        let had_executor = state.plan_handle.is_some();
+                        plan_interaction::shutdown_plan_executor(&mut state);
+                        let plan = state.executing_plan.take();
                         state.plan_execution_corrections.clear();
-                        if done < total as u32 {
-                            eprintln!(
-                                "{}  Plan abandoned ({}/{} done). Processing as normal chat.",
-                                "·".dim(),
-                                done,
-                                total
-                            );
+                        match plan.as_ref() {
+                            Some(p) => {
+                                let (done, total) = (p.items_done(), p.subtasks.len());
+                                if done < total as u32 {
+                                    eprintln!(
+                                        "{}  Plan abandoned ({}/{} done). Processing as normal chat.",
+                                        "·".dim(),
+                                        done,
+                                        total
+                                    );
+                                }
+                            }
+                            None if had_executor => {
+                                eprintln!(
+                                    "{}  Plan abandoned (executor was cancelled; in-memory progress was not available). Processing as normal chat.",
+                                    "·".dim(),
+                                );
+                            }
+                            None => {}
                         }
                     }
 
@@ -5870,34 +6046,7 @@ async fn run_chat_repl(
             }
             Err(ReadlineError::Interrupted) => {
                 clear_slash_overlay();
-                if let Some(ref handle) = state.plan_handle {
-                    // Plan is running — escalating Ctrl+C: pause → cancel
-                    let now = std::time::Instant::now();
-                    let rapid = last_ctrl_c_at
-                        .map(|t| now.duration_since(t) < std::time::Duration::from_secs(2))
-                        .unwrap_or(false);
-                    last_ctrl_c_at = Some(now);
-
-                    if rapid {
-                        // Second rapid Ctrl+C → cancel
-                        let _ = handle.send_command(plan_executor::PlanCommand::Cancel);
-                        // Deny any pending approval so execute_tool unblocks
-                        if let Some(tx) = state.pending_approval.take() {
-                            let _ = tx.send(false);
-                        }
-                        eprintln!("\n{}  Cancelling plan execution…", theme::icon_err());
-                    } else {
-                        // First Ctrl+C → pause
-                        let _ = handle.send_command(plan_executor::PlanCommand::Pause);
-                        eprintln!(
-                            "\n{}  Pausing plan… (press Ctrl+C again to cancel)",
-                            "⏸".yellow()
-                        );
-                    }
-                } else {
-                    last_ctrl_c_at = None;
-                    eprintln!("^C");
-                }
+                eprintln!("^C");
             }
             Err(ReadlineError::Eof) => {
                 clear_slash_overlay();
@@ -6417,39 +6566,6 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn clear_plan_background_execution_clears_flag_when_set() {
-        let mut state = ReplState::default();
-        let ctx = plan_decompose::ProjectContext::default();
-        let mut ps = plan_decompose::PlanModeState::new("test goal".into(), ctx);
-        ps.background_execution = true;
-        state.plan_mode = Some(ps);
-
-        plan_interaction::clear_plan_background_execution(&mut state);
-
-        let ps = state.plan_mode.as_ref().expect("plan_mode retained");
-        assert!(
-            !ps.background_execution,
-            "background_execution must clear so prompt loses *"
-        );
-    }
-
-    #[test]
-    fn clear_plan_background_execution_no_op_without_plan_mode() {
-        let mut state = ReplState::default();
-        plan_interaction::clear_plan_background_execution(&mut state);
-        assert!(state.plan_mode.is_none());
-    }
-
-    #[test]
-    fn clear_plan_background_execution_no_op_when_not_running() {
-        let mut state = ReplState::default();
-        let ctx = plan_decompose::ProjectContext::default();
-        state.plan_mode = Some(plan_decompose::PlanModeState::new("g".into(), ctx));
-        plan_interaction::clear_plan_background_execution(&mut state);
-        assert!(!state.plan_mode.as_ref().unwrap().background_execution);
-    }
 
     #[test]
     fn dispatch_turn_event_collects_explain_events() {

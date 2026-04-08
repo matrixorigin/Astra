@@ -480,8 +480,9 @@ impl PlanExecutorHandle {
             .map_err(|e| format!("plan executor channel closed: {e}"))
     }
 
-    /// Check if the executor has finished (channel closed).
-    #[allow(dead_code)]
+    /// True when all update senders were dropped (executor task ended) and no more
+    /// messages can arrive. After draining [`Self::try_recv`], an empty queue plus
+    /// `is_finished()` means the executor exited without a terminal `PlanUpdate`.
     pub fn is_finished(&self) -> bool {
         self.update_rx.is_closed()
     }
@@ -1160,10 +1161,6 @@ async fn plan_executor_task(
                     }
                 }
                 Err(failure) => {
-                    // LLM turn failed — mark subtask as pending for retry
-                    if let Some(st) = ctx.plan.subtasks.iter_mut().find(|s| s.id == *next_id) {
-                        st.status = TaskStatus::Pending;
-                    }
                     let mut event = session_journal::JournalEvent::turn_error(
                         ctx.session_id.as_deref(),
                         ctx.turn,
@@ -1172,7 +1169,6 @@ async fn plan_executor_task(
                         &failure.error,
                         0,
                     );
-                    // Enrich with partial data from the failed subtask turn
                     if !failure.partial.tool_call_records.is_empty() {
                         event.tool_calls = Some(failure.partial.tool_call_records.clone());
                     }
@@ -1189,10 +1185,58 @@ async fn plan_executor_task(
                         event.tools_used = Some(failure.partial.tools_used.clone());
                     }
                     emit_event(&update_tx, &ctx, event);
-                    let _ = update_tx.send(PlanUpdate::PlanError {
-                        error: format!("Subtask '{}' failed: {}", next_id, failure.error),
-                    });
-                    return;
+
+                    // Retry: mark subtask back to Pending so the next loop iteration
+                    // picks it up again. Track retries via durable contract or a local
+                    // counter; hard-fail only after exhausting the retry budget.
+                    const MAX_TURN_RETRIES: u32 = 2;
+                    let retry_count = if let Some(ref durable) = ctx.durable_task_state {
+                        durable
+                            .contract
+                            .subtasks
+                            .iter()
+                            .find(|s| s.id == *next_id)
+                            .map(|s| s.retry_count)
+                            .unwrap_or(0)
+                    } else {
+                        // Without durable state, check how many times we've already
+                        // tried this subtask by counting its entries in history.
+                        ctx.history
+                            .iter()
+                            .filter(|(p, _)| p.contains(next_id))
+                            .count() as u32
+                    };
+
+                    if retry_count >= MAX_TURN_RETRIES {
+                        if let Some(st) =
+                            ctx.plan.subtasks.iter_mut().find(|s| s.id == *next_id)
+                        {
+                            st.status = TaskStatus::Failed;
+                        }
+                        let _ = update_tx.send(PlanUpdate::PlanError {
+                            error: format!(
+                                "Subtask '{}' failed after {} attempts: {}",
+                                next_id,
+                                retry_count + 1,
+                                failure.error
+                            ),
+                        });
+                        return;
+                    }
+
+                    if let Some(st) = ctx.plan.subtasks.iter_mut().find(|s| s.id == *next_id)
+                    {
+                        st.status = TaskStatus::Pending;
+                    }
+                    sink.subtask_verification_failed(
+                        next_id,
+                        &title,
+                        false,
+                        retry_count + 1,
+                        MAX_TURN_RETRIES,
+                        Some(failure.error.clone()),
+                    );
+                    break; // re-enter outer loop to re-analyze dependencies
                 }
             }
 

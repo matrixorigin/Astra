@@ -220,16 +220,24 @@ fn journal_plan_event(
     let _ = writer.append(&event);
 }
 
-/// True while a plan run is active: persisted flag and/or live background executor handle.
+/// Cleanly shut down a running plan executor handle.
 ///
-/// Both must be considered — `background_execution` can be missing from disk after an
-/// older save, while `plan_handle` proves the executor is still running.
+/// Sends `Cancel`, drains remaining updates, and returns `true` if a handle was
+/// actually present (i.e. an executor was running). Call this before spawning a
+/// new executor or when exiting plan mode.
+pub fn shutdown_plan_executor(state: &mut ReplState) -> bool {
+    if let Some(mut h) = state.plan_handle.take() {
+        let _ = h.send_command(crate::plan_executor::PlanCommand::Cancel);
+        while h.try_recv().is_some() {}
+        true
+    } else {
+        false
+    }
+}
+
+/// True while a plan executor handle is alive (running or paused waiting for Resume).
 pub fn plan_execution_ui_active(state: &ReplState) -> bool {
     state.plan_handle.is_some()
-        || state
-            .plan_mode
-            .as_ref()
-            .is_some_and(|p| p.background_execution)
 }
 
 /// Idle plan status line: "review — not started" when there is a plan and no subtask has started yet.
@@ -241,23 +249,6 @@ pub fn plan_idle_review_not_started(ps: &plan::PlanModeState) -> bool {
             .subtasks
             .iter()
             .all(|s| s.status == TaskStatus::Pending)
-}
-
-/// Clear `background_execution` after the background executor finishes or errors.
-pub fn clear_plan_background_execution(state: &mut ReplState) {
-    use plan::PlanModeState;
-    if let Some(ref mut ps) = state.plan_mode {
-        if ps.background_execution {
-            ps.background_execution = false;
-            if let Err(e) = ps.save_to_file(&PlanModeState::state_path()) {
-                eprintln!(
-                    "  {} Could not persist plan state (prompt is updated in memory): {}",
-                    theme::icon_warn(),
-                    e
-                );
-            }
-        }
-    }
 }
 
 /// Handle user input while in interactive plan mode (`plan>` prompt).
@@ -662,10 +653,7 @@ async fn handle_plan_command(
 
     match cmd {
         PlanCommand::Cancel => {
-            if let Some(mut h) = state.plan_handle.take() {
-                let _ = h.send_command(crate::plan_executor::PlanCommand::Cancel);
-                while h.try_recv().is_some() {}
-            }
+            shutdown_plan_executor(state);
 
             journal_plan_event(
                 &mut state.journal,
@@ -934,10 +922,6 @@ async fn handle_plan_command(
             state.plan_execution_rounds = 0;
             state.plan_execution_corrections.clear();
             state.executing_plan = Some(plan);
-            if let Some(ref mut ps) = state.plan_mode {
-                ps.background_execution = true;
-                let _ = ps.save_to_file(&PlanModeState::state_path());
-            }
         }
 
         PlanCommand::Resume => {
@@ -949,7 +933,10 @@ async fn handle_plan_command(
                 };
                 match handle.send_command(crate::plan_executor::PlanCommand::Resume { corrections })
                 {
-                    Ok(()) => eprintln!("  {} Resuming plan execution...", "▶".cyan()),
+                    Ok(()) => {
+                        eprintln!("  {} Resuming plan execution...", "▶".cyan());
+                        state.plan_resume_pending = true;
+                    }
                     Err(e) => eprintln!("  {} {}", theme::icon_err(), e),
                 }
             } else if state.executing_plan.is_some() {
@@ -1397,13 +1384,11 @@ mod tests {
     use astra_services::task_orchestrator::{SubtaskPlan, TaskStatus};
 
     #[test]
-    fn plan_execution_ui_active_matrix() {
-        let ctx = plan::ProjectContext::default();
-
+    fn plan_execution_ui_active_follows_handle() {
         let state = ReplState::default();
         assert!(
             !plan_execution_ui_active(&state),
-            "no handle and no plan_mode => inactive"
+            "no handle => inactive"
         );
 
         let mut state = ReplState::default();
@@ -1411,36 +1396,7 @@ mod tests {
         state.plan_handle = Some(handle);
         assert!(
             plan_execution_ui_active(&state),
-            "handle set => active even without plan_mode"
-        );
-
-        let mut state = ReplState::default();
-        let mut ps = plan::PlanModeState::new("g".into(), ctx.clone());
-        ps.background_execution = true;
-        state.plan_mode = Some(ps);
-        assert!(
-            plan_execution_ui_active(&state),
-            "background_execution without handle => active"
-        );
-
-        let mut state = ReplState::default();
-        let (handle, _update_tx, _cmd_rx) = plan_executor::create_plan_channels();
-        state.plan_handle = Some(handle);
-        let mut ps = plan::PlanModeState::new("g".into(), ctx.clone());
-        ps.background_execution = false;
-        state.plan_mode = Some(ps);
-        assert!(
-            plan_execution_ui_active(&state),
-            "handle + plan_mode with bg false => still active"
-        );
-
-        let mut state = ReplState::default();
-        let mut ps = plan::PlanModeState::new("g".into(), ctx);
-        ps.background_execution = false;
-        state.plan_mode = Some(ps);
-        assert!(
-            !plan_execution_ui_active(&state),
-            "no handle and bg false => inactive"
+            "handle present => active"
         );
     }
 
@@ -1502,5 +1458,36 @@ mod tests {
     fn extract_goal_pattern_replaces_long_unknown_words() {
         let p = extract_goal_pattern("add authentication feature");
         assert!(p.contains("*"));
+    }
+
+    #[test]
+    fn shutdown_plan_executor_returns_false_when_no_handle() {
+        let mut state = ReplState::default();
+        assert!(!shutdown_plan_executor(&mut state));
+    }
+
+    #[test]
+    fn shutdown_plan_executor_cancels_and_drains_handle() {
+        let mut state = ReplState::default();
+        let (handle, update_tx, mut cmd_rx) = plan_executor::create_plan_channels();
+        state.plan_handle = Some(handle);
+
+        // Send some trailing updates before shutdown
+        let _ = update_tx.send(plan_executor::PlanUpdate::PlanCompleted {
+            pct: 100,
+            elapsed: std::time::Duration::from_secs(10),
+        });
+
+        let had_handle = shutdown_plan_executor(&mut state);
+        assert!(had_handle, "should return true when handle was present");
+        assert!(state.plan_handle.is_none(), "handle should be cleared");
+
+        // The Cancel command should have been sent
+        let cmd = cmd_rx.try_recv();
+        assert!(
+            matches!(cmd, Ok(plan_executor::PlanCommand::Cancel)),
+            "expected Cancel command, got {:?}",
+            cmd
+        );
     }
 }

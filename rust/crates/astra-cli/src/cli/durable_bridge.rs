@@ -2268,6 +2268,144 @@ mod tests {
         }
     }
 
+    /// Validates that `on_subtask_complete` calls `verify_subtask` even when all
+    /// criteria are LlmJudge (no local criteria). Without this, the durable row
+    /// stays `AwaitingVerification` and `verify_global` later errors with
+    /// "subtasks not ready for global verification".
+    #[tokio::test]
+    async fn on_subtask_complete_calls_verify_for_llm_judge_only_criteria() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let session_dir = tmp.path().join("session");
+        std::fs::create_dir_all(&session_dir).unwrap();
+
+        let lifecycle = create_local_lifecycle(&session_dir, tmp.path());
+        let plan = TaskPlan {
+            subtasks: vec![SubtaskPlan {
+                id: "s1".into(),
+                title: "Implement feature".into(),
+                description: None,
+                depends_on: vec![],
+                status: TaskStatus::Pending,
+                effort: None,
+                files: vec![],
+                acceptance: Some("Code quality is good".into()),
+            }],
+            notes: None,
+        };
+
+        let mut contract = lifecycle
+            .create_contract("user", "sess", "quality check", &plan, TaskScope::default())
+            .await
+            .unwrap();
+
+        // Inject an LlmJudge-only criterion (no local criteria at all)
+        let criteria = vec![VerificationCriterion {
+            id: "llm-quality".into(),
+            description: "Code quality meets standards".into(),
+            verifier: VerifierKind::LlmJudge {
+                prompt: "Is this code well-structured?".into(),
+                pass_threshold: 0.7,
+            },
+            required: true,
+            timeout_sec: 30,
+            global_only: false,
+        }];
+        contract.subtasks[0].criteria = criteria.clone();
+
+        let mut amended_subtasks = contract.subtasks.clone();
+        amended_subtasks[0].criteria = criteria;
+        let amendment = ContractAmendment {
+            reason: "inject LlmJudge-only criteria".into(),
+            updated_subtasks: Some(amended_subtasks),
+            updated_global_verification: None,
+            updated_scope: None,
+        };
+        contract = lifecycle
+            .amend_contract(&contract.contract_id, amendment)
+            .await
+            .unwrap();
+
+        let mut durable = DurableTaskState {
+            contract,
+            lifecycle,
+            last_report: None,
+        };
+
+        // Verify: has_local_criteria should be false, but criteria_count > 0
+        let sub = &durable.contract.subtasks[0];
+        let has_local = sub
+            .criteria
+            .iter()
+            .any(|c| !c.global_only && !matches!(c.verifier, VerifierKind::LlmJudge { .. }));
+        assert!(
+            !has_local,
+            "Test setup: should have no local criteria (only LlmJudge)"
+        );
+        assert!(
+            !sub.criteria.is_empty(),
+            "Test setup: should have at least one criterion"
+        );
+
+        // Run on_subtask_complete — it must not skip verify_subtask.
+        // Without an LLM judge configured, verify_subtask will fail or error,
+        // but the key assertion is that it was *called* (stage changes from
+        // AwaitingVerification to either Verified or VerificationFailed).
+        on_subtask_begin(&durable, "s1").await;
+        let _passed = on_subtask_complete(&mut durable, "s1").await;
+
+        // Stage must NOT be AwaitingVerification — that would mean verify_subtask
+        // was skipped, which is the bug we fixed.
+        let stage = &durable.contract.subtasks[0].stage;
+        assert!(
+            !matches!(stage, SubtaskStage::AwaitingVerification),
+            "Stage must not be AwaitingVerification after on_subtask_complete; got {:?}",
+            stage
+        );
+    }
+
+    /// Validates that on_subtask_complete returns true immediately when there
+    /// are zero criteria (lifecycle promotes to Verified automatically).
+    #[tokio::test]
+    async fn on_subtask_complete_zero_criteria_returns_true() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let session_dir = tmp.path().join("session");
+        std::fs::create_dir_all(&session_dir).unwrap();
+
+        let lifecycle = create_local_lifecycle(&session_dir, tmp.path());
+        let plan = TaskPlan {
+            subtasks: vec![SubtaskPlan {
+                id: "s1".into(),
+                title: "Simple task".into(),
+                description: None,
+                depends_on: vec![],
+                status: TaskStatus::Pending,
+                effort: None,
+                files: vec![],
+                acceptance: None,
+            }],
+            notes: None,
+        };
+
+        let contract = lifecycle
+            .create_contract("user", "sess", "simple", &plan, TaskScope::default())
+            .await
+            .unwrap();
+
+        assert!(
+            contract.subtasks[0].criteria.is_empty(),
+            "Test setup: should have no criteria"
+        );
+
+        let mut durable = DurableTaskState {
+            contract,
+            lifecycle,
+            last_report: None,
+        };
+
+        let passed = on_subtask_complete(&mut durable, "s1").await;
+        assert!(passed, "Zero criteria should return true immediately");
+    }
+
     #[test]
     fn create_gate_for_subtask_returns_none_for_unknown_id() {
         let plan = make_test_plan();
