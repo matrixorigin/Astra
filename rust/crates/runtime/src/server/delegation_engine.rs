@@ -28,6 +28,7 @@ use astra_services::coordination::{
 };
 
 use super::run_engine::RunEngine;
+use crate::messaging::router::AgentMailboxRouter;
 
 // ─── Run Status Constants ───────────────────────────────────────────────────
 
@@ -476,6 +477,8 @@ pub struct DelegationEngine {
     executor: Arc<dyn SubRunExecutor>,
     /// Optional post-completion verification gate.
     gate: Option<Arc<dyn VerificationGate>>,
+    /// Optional mailbox router for inter-agent messaging.
+    mailbox_router: Option<Arc<AgentMailboxRouter>>,
 }
 
 impl DelegationEngine {
@@ -490,6 +493,7 @@ impl DelegationEngine {
             tracker,
             executor: Arc::new(StubSubRunExecutor),
             gate: None,
+            mailbox_router: None,
         }
     }
 
@@ -506,12 +510,19 @@ impl DelegationEngine {
             tracker,
             executor,
             gate: None,
+            mailbox_router: None,
         }
     }
 
     /// Attach a verification gate. Sub-run results will be checked before aggregation.
     pub fn with_gate(mut self, gate: Arc<dyn VerificationGate>) -> Self {
         self.gate = Some(gate);
+        self
+    }
+
+    /// Attach a mailbox router for inter-agent messaging within delegations.
+    pub fn with_mailbox_router(mut self, router: Arc<AgentMailboxRouter>) -> Self {
+        self.mailbox_router = Some(router);
         self
     }
 
@@ -540,6 +551,7 @@ impl DelegationEngine {
             tracker: self.tracker.clone(),
             executor: self.executor.clone(),
             gate: Some(gate),
+            mailbox_router: self.mailbox_router.clone(),
         }
     }
 
@@ -552,6 +564,7 @@ impl DelegationEngine {
             tracker: self.tracker.clone(),
             executor: self.executor.clone(),
             gate: None,
+            mailbox_router: self.mailbox_router.clone(),
         }
     }
 
@@ -764,6 +777,20 @@ impl DelegationEngine {
                 )
             });
 
+            // Register with mailbox router and obtain a mailbox handle (if router available).
+            let mailbox = if let Some(router) = &self.mailbox_router {
+                let addr = crate::messaging::types::AgentAddress {
+                    run_id: sub_run_id.clone(),
+                    agent_id: agent_id.clone(),
+                };
+                router
+                    .register(addr, Some(request.delegation_id.clone()))
+                    .await
+                    .ok()
+            } else {
+                None
+            };
+
             configs.push(SubRunConfig {
                 run_id: sub_run_id,
                 agent_profile: profile,
@@ -779,7 +806,7 @@ impl DelegationEngine {
                 context: request.context.clone(),
                 pause_flag: Some(pause_flag),
                 checkpoint_gate: None,
-                mailbox: None,
+                mailbox,
             });
         }
         drop(reg);
@@ -940,6 +967,19 @@ impl DelegationEngine {
                 )
             });
 
+            let mailbox = if let Some(router) = &self.mailbox_router {
+                let addr = crate::messaging::types::AgentAddress {
+                    run_id: sub_run_id.clone(),
+                    agent_id: agent_id.clone(),
+                };
+                router
+                    .register(addr, Some(request.delegation_id.clone()))
+                    .await
+                    .ok()
+            } else {
+                None
+            };
+
             let config = SubRunConfig {
                 run_id: sub_run_id.clone(),
                 agent_profile: profile,
@@ -955,7 +995,7 @@ impl DelegationEngine {
                 context: request.context.clone(),
                 pause_flag: Some(pause_flag),
                 checkpoint_gate: None,
-                mailbox: None,
+                mailbox,
             };
 
             let result = match self.executor.execute(config).await {
@@ -1104,6 +1144,19 @@ impl DelegationEngine {
                 )
                 .await?;
 
+            let prod_mailbox = if let Some(router) = &self.mailbox_router {
+                let addr = crate::messaging::types::AgentAddress {
+                    run_id: prod_run_id.clone(),
+                    agent_id: producer_id.to_string(),
+                };
+                router
+                    .register(addr, Some(request.delegation_id.clone()))
+                    .await
+                    .ok()
+            } else {
+                None
+            };
+
             let prod_config = SubRunConfig {
                 run_id: prod_run_id.clone(),
                 agent_profile: producer_profile.clone(),
@@ -1119,7 +1172,7 @@ impl DelegationEngine {
                 context: request.context.clone(),
                 pause_flag: Some(prod_pause.clone()),
                 checkpoint_gate: None,
-                mailbox: None,
+                mailbox: prod_mailbox,
             };
             let prod_result = match self.executor.execute(prod_config).await {
                 Ok(r) => {
@@ -1213,6 +1266,19 @@ impl DelegationEngine {
                 )
                 .await?;
 
+            let rev_mailbox = if let Some(router) = &self.mailbox_router {
+                let addr = crate::messaging::types::AgentAddress {
+                    run_id: rev_run_id.clone(),
+                    agent_id: reviewer_id.to_string(),
+                };
+                router
+                    .register(addr, Some(request.delegation_id.clone()))
+                    .await
+                    .ok()
+            } else {
+                None
+            };
+
             let rev_config = SubRunConfig {
                 run_id: rev_run_id.clone(),
                 agent_profile: reviewer_profile.clone(),
@@ -1231,7 +1297,7 @@ impl DelegationEngine {
                 context: request.context.clone(),
                 pause_flag: Some(rev_pause),
                 checkpoint_gate: None,
-                mailbox: None,
+                mailbox: rev_mailbox,
             };
             let rev_result = match self.executor.execute(rev_config).await {
                 Ok(r) => {
@@ -1334,6 +1400,19 @@ impl DelegationEngine {
                 .await;
             let pause_flag = self.tracker.register_pause_flag(&run_id).await;
 
+            let fork_mailbox = if let Some(router) = &self.mailbox_router {
+                let addr = crate::messaging::types::AgentAddress {
+                    run_id: run_id.clone(),
+                    agent_id: agent_id.to_string(),
+                };
+                router
+                    .register(addr, Some(request.delegation_id.clone()))
+                    .await
+                    .ok()
+            } else {
+                None
+            };
+
             // Build fork-specific context: parent messages + fork instruction
             let mut fork_context = request.context.clone();
             fork_context.insert(
@@ -1375,7 +1454,7 @@ impl DelegationEngine {
                 context: fork_context,
                 pause_flag: Some(pause_flag),
                 checkpoint_gate: None,
-                mailbox: None,
+                mailbox: fork_mailbox,
             };
 
             let executor = self.executor.clone();
