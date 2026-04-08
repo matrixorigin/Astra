@@ -52,7 +52,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use sqlx::{MySql, Pool, Row, query};
-use tokio::sync::{RwLock, mpsc};
+use tokio::sync::{RwLock, mpsc, watch};
 
 use super::transport::{MessageStream, MessageTransport};
 use super::types::{AgentAddress, AgentMessage, MailboxError};
@@ -62,6 +62,27 @@ const DEFAULT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Maximum number of messages to fetch per poll cycle.
 const POLL_BATCH_SIZE: i64 = 100;
+
+/// Initial backoff on DB poll error (doubles each consecutive failure).
+const INITIAL_BACKOFF: Duration = Duration::from_millis(200);
+
+/// Maximum backoff on repeated DB poll errors.
+const MAX_BACKOFF: Duration = Duration::from_secs(10);
+
+/// After this many consecutive failures, log a critical warning.
+const CRITICAL_FAILURE_THRESHOLD: u32 = 30;
+
+// ─── Metrics ────────────────────────────────────────────────────────────────
+
+/// Observable counters for the database transport.
+#[derive(Debug, Default)]
+pub struct TransportMetrics {
+    pub messages_sent: std::sync::atomic::AtomicU64,
+    pub messages_received: std::sync::atomic::AtomicU64,
+    pub messages_dropped: std::sync::atomic::AtomicU64,
+    pub poll_errors: std::sync::atomic::AtomicU64,
+    pub send_errors: std::sync::atomic::AtomicU64,
+}
 
 // ─── Schema ─────────────────────────────────────────────────────────────────
 
@@ -102,6 +123,11 @@ pub struct DatabaseTransport {
     poll_interval: Duration,
     /// Tracks registered agents and their delegation group.
     registrations: RwLock<HashMap<AgentAddress, Option<String>>>,
+    /// Shutdown signal: when sent, all poll tasks stop.
+    shutdown_tx: watch::Sender<bool>,
+    shutdown_rx: watch::Receiver<bool>,
+    /// Observable metrics.
+    metrics: Arc<TransportMetrics>,
 }
 
 impl DatabaseTransport {
@@ -109,10 +135,14 @@ impl DatabaseTransport {
     ///
     /// Call [`ensure_schema()`] before first use to create the table.
     pub fn new(pool: Pool<MySql>) -> Self {
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
         Self {
             pool,
             poll_interval: DEFAULT_POLL_INTERVAL,
             registrations: RwLock::new(HashMap::new()),
+            shutdown_tx,
+            shutdown_rx,
+            metrics: Arc::new(TransportMetrics::default()),
         }
     }
 
@@ -156,6 +186,11 @@ impl DatabaseTransport {
     /// Number of currently registered agents (local process only).
     pub async fn agent_count(&self) -> usize {
         self.registrations.read().await.len()
+    }
+
+    /// Get a reference to the transport's metrics counters.
+    pub fn metrics(&self) -> &Arc<TransportMetrics> {
+        &self.metrics
     }
 
     /// Insert a message into the database.
@@ -239,6 +274,8 @@ impl MessageTransport for DatabaseTransport {
             delegation_id,
             self.poll_interval,
             tx,
+            self.shutdown_rx.clone(),
+            Arc::clone(&self.metrics),
         ));
 
         Ok(Box::new(DatabaseMessageStream {
@@ -256,7 +293,16 @@ impl MessageTransport for DatabaseTransport {
                 ))
             }
         }
-        self.insert_message(&msg, false).await
+        match self.insert_message(&msg, false).await {
+            Ok(()) => {
+                self.metrics.messages_sent.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Ok(())
+            }
+            Err(e) => {
+                self.metrics.send_errors.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Err(e)
+            }
+        }
     }
 
     async fn broadcast(
@@ -264,41 +310,68 @@ impl MessageTransport for DatabaseTransport {
         delegation_id: &str,
         msg: Arc<AgentMessage>,
     ) -> Result<(), MailboxError> {
-        // Ensure the message has the right broadcast target for storage.
-        // The actual message's `to` field might already be set correctly by the router.
         let stored_msg = if matches!(&msg.to, super::types::MessageTarget::Broadcast { .. }) {
             (*msg).clone()
         } else {
-            // Wrap with broadcast target for DB storage.
             let mut m = (*msg).clone();
             m.to = super::types::MessageTarget::Broadcast {
                 delegation_id: delegation_id.to_string(),
             };
             m
         };
-        self.insert_message(&stored_msg, true).await
+        match self.insert_message(&stored_msg, true).await {
+            Ok(()) => {
+                self.metrics.messages_sent.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Ok(())
+            }
+            Err(e) => {
+                self.metrics.send_errors.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Err(e)
+            }
+        }
+    }
+
+    async fn health_check(&self) -> Result<(), MailboxError> {
+        query("SELECT 1")
+            .execute(&self.pool)
+            .await
+            .map_err(|e| MailboxError::Transport(format!("health check failed: {e}")))?;
+        Ok(())
+    }
+
+    async fn shutdown(&self) -> Result<(), MailboxError> {
+        // Signal all poll tasks to stop.
+        let _ = self.shutdown_tx.send(true);
+        Ok(())
     }
 }
 
 // ─── Poll Loop ──────────────────────────────────────────────────────────────
 
 /// Background task that polls the database for new messages and pushes them
-/// into a local channel.
+/// into a local channel. Implements exponential backoff on errors and
+/// respects the shutdown signal.
 async fn poll_loop(
     pool: Pool<MySql>,
     addr: AgentAddress,
     delegation_id: Option<String>,
     interval: Duration,
     tx: mpsc::UnboundedSender<Arc<AgentMessage>>,
+    mut shutdown_rx: watch::Receiver<bool>,
+    metrics: Arc<TransportMetrics>,
 ) {
     let mut last_direct_id: i64 = 0;
     let mut last_broadcast_id: i64 = 0;
+    let mut consecutive_errors: u32 = 0;
+    let mut current_backoff = INITIAL_BACKOFF;
 
     loop {
-        // Check if receiver dropped (stream was dropped).
-        if tx.is_closed() {
+        // Check shutdown signal or receiver drop.
+        if *shutdown_rx.borrow() || tx.is_closed() {
             break;
         }
+
+        let mut had_error = false;
 
         // 1. Poll direct messages.
         let direct_result = query(
@@ -317,27 +390,33 @@ async fn poll_loop(
             for row in rows {
                 let row_id: i64 = match row.try_get("id") {
                     Ok(id) => id,
-                    Err(_) => continue, // skip corrupted row, don't reset cursor
+                    Err(_) => continue,
                 };
                 let json: String = match row.try_get("payload_json") {
                     Ok(j) => j,
                     Err(_) => {
                         last_direct_id = last_direct_id.max(row_id);
-                        continue; // skip but advance cursor past this row
+                        continue;
                     }
                 };
 
                 if let Ok(msg) = serde_json::from_str::<AgentMessage>(&json) {
                     if !msg.is_expired() {
+                        metrics.messages_received.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         if tx.send(Arc::new(msg)).is_err() {
-                            return; // receiver dropped
+                            return;
                         }
                     }
                 }
                 last_direct_id = last_direct_id.max(row_id);
             }
         } else {
-            eprintln!("  ⚠ messaging: direct poll error for {}@{}: {:?}", addr.agent_id, addr.run_id, direct_result.unwrap_err());
+            had_error = true;
+            metrics.poll_errors.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            eprintln!(
+                "  ⚠ messaging: direct poll error for {}@{}: {:?}",
+                addr.agent_id, addr.run_id, direct_result.unwrap_err()
+            );
         }
 
         // 2. Poll broadcast messages (if in a delegation group).
@@ -369,6 +448,7 @@ async fn poll_loop(
 
                     if let Ok(msg) = serde_json::from_str::<AgentMessage>(&json) {
                         if !msg.is_expired() {
+                            metrics.messages_received.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             if tx.send(Arc::new(msg)).is_err() {
                                 return;
                             }
@@ -377,11 +457,40 @@ async fn poll_loop(
                     last_broadcast_id = last_broadcast_id.max(row_id);
                 }
             } else {
-                eprintln!("  ⚠ messaging: broadcast poll error for delegation {}: {:?}", did, broadcast_result.unwrap_err());
+                had_error = true;
+                metrics.poll_errors.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                eprintln!(
+                    "  ⚠ messaging: broadcast poll error for delegation {}: {:?}",
+                    did, broadcast_result.unwrap_err()
+                );
             }
         }
 
-        tokio::time::sleep(interval).await;
+        // Backoff logic: on error, increase delay; on success, reset.
+        let sleep_duration = if had_error {
+            consecutive_errors = consecutive_errors.saturating_add(1);
+            if consecutive_errors == CRITICAL_FAILURE_THRESHOLD {
+                eprintln!(
+                    "  🔴 messaging: CRITICAL — {} consecutive poll failures for {}@{}",
+                    consecutive_errors, addr.agent_id, addr.run_id
+                );
+            }
+            let backoff = current_backoff;
+            current_backoff = (current_backoff * 2).min(MAX_BACKOFF);
+            backoff
+        } else {
+            consecutive_errors = 0;
+            current_backoff = INITIAL_BACKOFF;
+            interval
+        };
+
+        // Wait with shutdown awareness.
+        tokio::select! {
+            _ = tokio::time::sleep(sleep_duration) => {}
+            _ = shutdown_rx.changed() => {
+                break;
+            }
+        }
     }
 }
 
@@ -413,6 +522,94 @@ impl MessageStream for DatabaseMessageStream {
 
     fn try_recv(&mut self) -> Option<Arc<AgentMessage>> {
         self.buffer_rx.try_recv().ok()
+    }
+}
+
+// ─── Cleanup Scheduler ──────────────────────────────────────────────────────
+
+/// Default cleanup interval.
+const DEFAULT_CLEANUP_INTERVAL: Duration = Duration::from_secs(300); // 5 minutes
+
+/// Default max message age for cleanup (messages older than this are removed
+/// regardless of TTL).
+const DEFAULT_MAX_AGE: Duration = Duration::from_secs(3600); // 1 hour
+
+/// Periodic background task that cleans up expired and old messages.
+///
+/// Stops when dropped (AbortOnDrop pattern).
+pub struct CleanupScheduler {
+    _task: AbortOnDrop,
+}
+
+impl CleanupScheduler {
+    /// Start a cleanup scheduler for the given transport.
+    ///
+    /// - `cleanup_interval`: how often to run cleanup (default 5 minutes)
+    /// - `max_age`: delete messages older than this regardless of TTL (default 1 hour)
+    pub fn start(
+        transport: &DatabaseTransport,
+        cleanup_interval: Option<Duration>,
+        max_age: Option<Duration>,
+    ) -> Self {
+        let pool = transport.pool.clone();
+        let interval = cleanup_interval.unwrap_or(DEFAULT_CLEANUP_INTERVAL);
+        let age = max_age.unwrap_or(DEFAULT_MAX_AGE);
+        let mut shutdown_rx = transport.shutdown_rx.clone();
+
+        let task = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = tokio::time::sleep(interval) => {}
+                    _ = shutdown_rx.changed() => {
+                        break;
+                    }
+                }
+
+                // 1. Cleanup TTL-expired messages.
+                let now_ms = chrono::Utc::now().timestamp_millis();
+                match query(
+                    "DELETE FROM agent_message_queue
+                     WHERE ttl_ms IS NOT NULL
+                       AND timestamp_ms < (? - ttl_ms)",
+                )
+                .bind(now_ms)
+                .execute(&pool)
+                .await
+                {
+                    Ok(result) => {
+                        let n = result.rows_affected();
+                        if n > 0 {
+                            eprintln!("  ℹ messaging: cleaned up {n} TTL-expired messages");
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("  ⚠ messaging: TTL cleanup error: {e}");
+                    }
+                }
+
+                // 2. Cleanup old messages (regardless of TTL).
+                let cutoff_ms = now_ms - age.as_millis() as i64;
+                match query("DELETE FROM agent_message_queue WHERE timestamp_ms < ?")
+                    .bind(cutoff_ms)
+                    .execute(&pool)
+                    .await
+                {
+                    Ok(result) => {
+                        let n = result.rows_affected();
+                        if n > 0 {
+                            eprintln!("  ℹ messaging: cleaned up {n} messages older than {:?}", age);
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("  ⚠ messaging: age cleanup error: {e}");
+                    }
+                }
+            }
+        });
+
+        Self {
+            _task: AbortOnDrop(task),
+        }
     }
 }
 
@@ -507,5 +704,26 @@ mod tests {
         );
         msg.ttl_ms = Some(0);
         assert!(msg.is_expired(), "TTL=0 should be expired immediately");
+    }
+
+    #[test]
+    fn backoff_constants_are_reasonable() {
+        assert!(INITIAL_BACKOFF >= Duration::from_millis(100));
+        assert!(MAX_BACKOFF <= Duration::from_secs(30));
+        assert!(MAX_BACKOFF > INITIAL_BACKOFF);
+        assert!(CRITICAL_FAILURE_THRESHOLD >= 10);
+    }
+
+    #[test]
+    fn transport_metrics_default() {
+        let m = TransportMetrics::default();
+        assert_eq!(m.messages_sent.load(std::sync::atomic::Ordering::Relaxed), 0);
+        assert_eq!(m.poll_errors.load(std::sync::atomic::Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn cleanup_scheduler_constants() {
+        assert_eq!(DEFAULT_CLEANUP_INTERVAL, Duration::from_secs(300));
+        assert_eq!(DEFAULT_MAX_AGE, Duration::from_secs(3600));
     }
 }
