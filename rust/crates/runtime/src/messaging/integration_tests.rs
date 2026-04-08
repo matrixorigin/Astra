@@ -572,4 +572,303 @@ mod tests {
 
         assert_eq!(tracker.pending_count().await, 0);
     }
+
+    // ─── Dead Letter Queue integration tests ─────────────────────────────────
+
+    #[tokio::test]
+    async fn ack_timeout_stores_in_dlq() {
+        use crate::messaging::ack_tracker::{AckConfig, AckOutcome, PendingAckTracker};
+        use crate::messaging::dead_letter::DeadLetterQueue;
+        use std::time::Duration;
+
+        let (_router, _parent, children, _dt) =
+            setup_delegation(2, "del-dlq-timeout").await;
+
+        let dlq = Arc::new(DeadLetterQueue::new());
+        let tracker = PendingAckTracker::with_config(AckConfig {
+            ack_timeout: Duration::from_millis(10),
+            max_retries: 1, // fail after first attempt
+            sweep_interval: Duration::from_millis(5),
+        });
+
+        // Send message requiring ack
+        let msg = AgentMessage::new(
+            children[0].address.clone(),
+            MessageTarget::Direct {
+                address: children[1].address.clone(),
+            },
+            MessagePayload::Text {
+                content: "urgent task".into(),
+                summary: None,
+            },
+        )
+        .with_ack_required();
+
+        let msg = Arc::new(msg);
+        tracker.track(msg.clone()).await;
+        children[0].send((*msg).clone()).await.unwrap();
+
+        // Don't ack — wait for timeout
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let outcomes = tracker.sweep().await;
+
+        // Store failed in DLQ
+        for outcome in &outcomes {
+            if let AckOutcome::Failed { message, attempts, .. } = outcome {
+                dlq.store(
+                    Arc::clone(message),
+                    crate::messaging::dead_letter::DeadLetterReason::AckTimeout {
+                        attempts: *attempts,
+                    },
+                    *attempts,
+                )
+                .await;
+            }
+        }
+
+        assert_eq!(dlq.count().await, 1);
+        let entries = dlq.list().await;
+        assert_eq!(entries[0].message.id, msg.id);
+    }
+
+    #[tokio::test]
+    async fn nack_stores_in_dlq() {
+        use crate::messaging::ack_tracker::{AckOutcome, PendingAckTracker};
+        use crate::messaging::dead_letter::DeadLetterQueue;
+
+        let (_router, _parent, children, _dt) =
+            setup_delegation(2, "del-dlq-nack").await;
+
+        let dlq = Arc::new(DeadLetterQueue::new());
+        let tracker = PendingAckTracker::new();
+
+        let msg = AgentMessage::new(
+            children[0].address.clone(),
+            MessageTarget::Direct {
+                address: children[1].address.clone(),
+            },
+            MessagePayload::Text {
+                content: "bad request".into(),
+                summary: None,
+            },
+        )
+        .with_ack_required();
+
+        let msg = Arc::new(msg);
+        let msg_id = msg.id.clone();
+        tracker.track(msg.clone()).await;
+        children[0].send((*msg).clone()).await.unwrap();
+
+        // Receiver nacks
+        tracker
+            .reject(&msg_id, Some("invalid format".into()))
+            .await;
+
+        let failures = tracker.failed_outcomes().await;
+        for outcome in &failures {
+            if let AckOutcome::Rejected {
+                message, reason, ..
+            } = outcome
+            {
+                dlq.store(
+                    Arc::clone(message),
+                    crate::messaging::dead_letter::DeadLetterReason::Rejected {
+                        reason: reason.clone(),
+                    },
+                    1,
+                )
+                .await;
+            }
+        }
+
+        assert_eq!(dlq.count().await, 1);
+        let entries = dlq.list().await;
+        match &entries[0].reason {
+            crate::messaging::dead_letter::DeadLetterReason::Rejected { reason } => {
+                assert_eq!(reason.as_deref(), Some("invalid format"));
+            }
+            _ => panic!("expected Rejected reason"),
+        }
+    }
+
+    #[tokio::test]
+    async fn dlq_take_for_retry_removes_entries() {
+        use crate::messaging::ack_tracker::{AckConfig, AckOutcome, PendingAckTracker};
+        use crate::messaging::dead_letter::DeadLetterQueue;
+        use std::time::Duration;
+
+        let (_router, _parent, children, _dt) =
+            setup_delegation(2, "del-dlq-retry").await;
+
+        let dlq = Arc::new(DeadLetterQueue::new());
+        let tracker = PendingAckTracker::with_config(AckConfig {
+            ack_timeout: Duration::from_millis(5),
+            max_retries: 1,
+            sweep_interval: Duration::from_millis(5),
+        });
+
+        // Send 3 messages, all will timeout
+        for i in 0..3 {
+            let msg = AgentMessage::new(
+                children[0].address.clone(),
+                MessageTarget::Direct {
+                    address: children[1].address.clone(),
+                },
+                MessagePayload::Text {
+                    content: format!("msg-{i}"),
+                    summary: None,
+                },
+            )
+            .with_ack_required();
+            tracker.track(Arc::new(msg)).await;
+        }
+
+        tokio::time::sleep(Duration::from_millis(15)).await;
+        let outcomes = tracker.sweep().await;
+        for outcome in &outcomes {
+            if let AckOutcome::Failed {
+                message, attempts, ..
+            } = outcome
+            {
+                dlq.store(
+                    Arc::clone(message),
+                    crate::messaging::dead_letter::DeadLetterReason::AckTimeout {
+                        attempts: *attempts,
+                    },
+                    *attempts,
+                )
+                .await;
+            }
+        }
+
+        assert_eq!(dlq.count().await, 3);
+
+        // Take first 2 for retry by their IDs
+        let all = dlq.list().await;
+        let id0 = all[0].message.id.clone();
+        let id1 = all[1].message.id.clone();
+
+        let r0 = dlq.take_for_retry(&id0).await;
+        assert!(r0.is_some());
+        let r1 = dlq.take_for_retry(&id1).await;
+        assert!(r1.is_some());
+        assert_eq!(dlq.count().await, 1);
+    }
+
+    // ─── Metrics integration tests ───────────────────────────────────────────
+
+    #[tokio::test]
+    async fn metrics_track_send_receive_ack_flow() {
+        use crate::messaging::metrics::MessagingMetrics;
+        use std::sync::atomic::Ordering;
+        use std::time::Duration;
+
+        let (_router, _parent, mut children, _dt) =
+            setup_delegation(2, "del-metrics").await;
+
+        let metrics = Arc::new(MessagingMetrics::new());
+
+        // Send
+        let msg = AgentMessage::new(
+            children[0].address.clone(),
+            MessageTarget::Direct {
+                address: children[1].address.clone(),
+            },
+            MessagePayload::Text {
+                content: "hello".into(),
+                summary: None,
+            },
+        );
+        children[0].send(msg).await.unwrap();
+        metrics.messages_sent.fetch_add(1, Ordering::Relaxed);
+
+        // Receive
+        let received = children[1].try_recv().unwrap();
+        metrics.messages_received.fetch_add(1, Ordering::Relaxed);
+
+        // Simulate ack latency
+        let start = std::time::Instant::now();
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        let ack_msg = received.make_ack(children[1].address.clone());
+        children[1].send(ack_msg).await.unwrap();
+        metrics.acks_sent.fetch_add(1, Ordering::Relaxed);
+        metrics.ack_latency.record(start.elapsed());
+
+        let snap = metrics.snapshot();
+        assert_eq!(snap.messages_sent, 1);
+        assert_eq!(snap.messages_received, 1);
+        assert_eq!(snap.acks_sent, 1);
+        assert!(snap.ack_latency.count > 0);
+        // Latency should be non-zero (we slept 5ms, but don't assert exact bound)
+        assert!(snap.ack_latency.min_us > 0);
+    }
+
+    #[tokio::test]
+    async fn event_dispatcher_receives_messaging_events() {
+        use crate::messaging::metrics::{EventDispatcher, MessagingEvent, MessagingEventHandler};
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        struct Counter {
+            sent: AtomicU32,
+            received: AtomicU32,
+            dead_lettered: AtomicU32,
+        }
+        impl MessagingEventHandler for Counter {
+            fn on_event(&self, event: &MessagingEvent) {
+                match event {
+                    MessagingEvent::Sent { .. } => {
+                        self.sent.fetch_add(1, Ordering::Relaxed);
+                    }
+                    MessagingEvent::Received { .. } => {
+                        self.received.fetch_add(1, Ordering::Relaxed);
+                    }
+                    MessagingEvent::DeadLettered { .. } => {
+                        self.dead_lettered.fetch_add(1, Ordering::Relaxed);
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        let (_router, _parent, children, _dt) =
+            setup_delegation(2, "del-events").await;
+
+        let dispatcher = EventDispatcher::new();
+        let counter = Arc::new(Counter {
+            sent: AtomicU32::new(0),
+            received: AtomicU32::new(0),
+            dead_lettered: AtomicU32::new(0),
+        });
+        dispatcher.add_handler(counter.clone()).await;
+
+        // Fire events
+        dispatcher
+            .dispatch(&MessagingEvent::Sent {
+                message_id: "m1".into(),
+                from: children[0].address.clone(),
+                to: MessageTarget::Direct {
+                    address: children[1].address.clone(),
+                },
+            })
+            .await;
+
+        dispatcher
+            .dispatch(&MessagingEvent::Received {
+                message_id: "m1".into(),
+                from: children[0].address.clone(),
+                to: children[1].address.clone(),
+            })
+            .await;
+
+        dispatcher
+            .dispatch(&MessagingEvent::DeadLettered {
+                message_id: "m1".into(),
+                reason: "ack timeout".into(),
+            })
+            .await;
+
+        assert_eq!(counter.sent.load(Ordering::Relaxed), 1);
+        assert_eq!(counter.received.load(Ordering::Relaxed), 1);
+        assert_eq!(counter.dead_lettered.load(Ordering::Relaxed), 1);
+    }
 }
