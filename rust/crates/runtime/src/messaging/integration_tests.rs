@@ -307,18 +307,13 @@ mod tests {
         });
         let result = send_tool::execute_send_message(&children[0], &args).await;
 
-        // Direct to specific agent_id with empty run_id may not resolve through transport
-        // unless the transport has a lookup. This tests the full path.
-        // For InProcessTransport, direct requires exact AgentAddress match, so this
-        // may fail with "not registered" — which is the expected behavior since
-        // we only know agent_id not run_id. The send_tool returns the error gracefully.
-        // Future improvement: router-level agent_id→address resolution within delegation.
-        if result.starts_with("✓") {
-            let received = children[1].try_recv();
-            assert!(received.is_some());
-        } else {
-            assert!(result.contains("Failed") || result.contains("not registered"));
-        }
+        // Router resolves agent_id-only Direct targets via agent_id_index.
+        assert!(
+            result.starts_with("✓"),
+            "expected success, got: {result}"
+        );
+        let received = children[1].try_recv();
+        assert!(received.is_some(), "peer should have received the message");
     }
 
     #[tokio::test]

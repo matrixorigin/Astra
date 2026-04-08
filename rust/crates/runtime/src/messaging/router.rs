@@ -99,6 +99,8 @@ pub struct AgentMailboxRouter {
     delegation_tracker: Arc<DelegationTracker>,
     /// run_id → registered AgentAddress (for resolving Parent targets).
     address_registry: tokio::sync::RwLock<std::collections::HashMap<String, AgentAddress>>,
+    /// agent_id → AgentAddress (for resolving agent_id-only Direct targets from send_tool).
+    agent_id_index: tokio::sync::RwLock<std::collections::HashMap<String, AgentAddress>>,
 }
 
 impl AgentMailboxRouter {
@@ -110,6 +112,7 @@ impl AgentMailboxRouter {
             transport,
             delegation_tracker,
             address_registry: tokio::sync::RwLock::new(std::collections::HashMap::new()),
+            agent_id_index: tokio::sync::RwLock::new(std::collections::HashMap::new()),
         }
     }
 
@@ -123,10 +126,14 @@ impl AgentMailboxRouter {
             .register(addr.clone(), delegation_id.clone())
             .await?;
 
-        self.address_registry
-            .write()
-            .await
-            .insert(addr.run_id.clone(), addr.clone());
+        {
+            let mut reg = self.address_registry.write().await;
+            reg.insert(addr.run_id.clone(), addr.clone());
+        }
+        {
+            let mut idx = self.agent_id_index.write().await;
+            idx.insert(addr.agent_id.clone(), addr.clone());
+        }
 
         let stream = self.transport.subscribe(&addr).await?;
 
@@ -141,6 +148,7 @@ impl AgentMailboxRouter {
     /// Unregister an agent (typically on completion or failure).
     pub async fn unregister(&self, addr: &AgentAddress) -> Result<(), MailboxError> {
         self.address_registry.write().await.remove(&addr.run_id);
+        self.agent_id_index.write().await.remove(&addr.agent_id);
         self.transport.unregister(addr).await
     }
 
@@ -167,12 +175,33 @@ impl AgentMailboxRouter {
         Ok(AgentAddress::new(&parent_run_id, &agent_id))
     }
 
-    /// Send a message, resolving `Parent` and `Broadcast` targets.
+    /// Resolve a Direct target that may have an empty run_id (from send_tool).
+    ///
+    /// The send_tool only knows the peer's agent_id, not its run_id. This method
+    /// looks up the full address from the agent_id_index populated during register().
+    async fn resolve_direct_addr(&self, address: &AgentAddress) -> AgentAddress {
+        if !address.run_id.is_empty() {
+            return address.clone();
+        }
+        // Empty run_id — resolve by agent_id.
+        if let Some(full_addr) = self.agent_id_index.read().await.get(&address.agent_id) {
+            return full_addr.clone();
+        }
+        // Not found in index — return as-is, transport will return AgentNotFound.
+        address.clone()
+    }
+
+    /// Send a message, resolving `Parent`, `Broadcast`, and agent_id-only `Direct` targets.
     pub async fn send(&self, msg: AgentMessage) -> Result<(), MailboxError> {
         let target = msg.to.clone();
         match target {
-            MessageTarget::Direct { .. } => {
-                self.transport.send(Arc::new(msg)).await
+            MessageTarget::Direct { ref address } => {
+                let resolved = self.resolve_direct_addr(address).await;
+                let resolved_msg = AgentMessage {
+                    to: MessageTarget::Direct { address: resolved },
+                    ..msg
+                };
+                self.transport.send(Arc::new(resolved_msg)).await
             }
             MessageTarget::Broadcast { delegation_id } => {
                 self.transport
