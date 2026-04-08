@@ -14,6 +14,6 @@ pub use builtin_agents::{
 pub use progress::{AgentProgressEvent, ProgressEventType, ProgressBroadcaster};
 pub use spawner::{
     DynamicAgentSpawner, SpawnContext, SpawnedAgentState, SpawnedAgentInfo, AgentStatus,
-    SpawnedAgentMetrics,
+    SpawnedAgentMetrics, SpawnError, SpawnAgentExecutor, SpawnRunConfig, SpawnRunResult,
 };
 pub use spawn_tool::{SpawnAgentInput, SpawnAgentOutput, spawn_agent_schema};

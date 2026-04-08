@@ -1187,6 +1187,30 @@ pub fn all_tool_schemas() -> Vec<Value> {
         }),
         // ── spawn_agent: Dynamic agent spawning ─────────────────────────────────
         astra_runtime::orchestration::spawn_agent_schema(),
+        // ─── Diagnose tool ────────────────────────────────────────────────────────
+        json!({
+            "type": "function",
+            "function": {
+                "name": "diagnose",
+                "description": "Get system diagnostics and health information. Use when debugging issues, checking resource usage, or verifying tool availability. Returns system stats, environment info, and tool status.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "category": {
+                            "type": "string",
+                            "enum": ["all", "system", "environment", "tools", "tasks", "session"],
+                            "description": "What to diagnose: 'all' for everything, 'system' for OS/resources, 'environment' for env vars, 'tools' for available tools, 'tasks' for task status, 'session' for current session info. Default: 'all'"
+                        },
+                        "verbose": {
+                            "type": "boolean",
+                            "description": "Include detailed information. Default: false",
+                            "default": false
+                        }
+                    },
+                    "required": []
+                }
+            }
+        }),
     ]
 }
 
@@ -2507,6 +2531,195 @@ impl ToolExecutor {
         }).to_string()
     }
 
+    // ─── Diagnose tool ────────────────────────────────────────────────────────────
+
+    /// Get system diagnostics and health information.
+    async fn diagnose(&self, args: &Value) -> String {
+        let category = args.get("category").and_then(Value::as_str).unwrap_or("all");
+        let verbose = args.get("verbose").and_then(Value::as_bool).unwrap_or(false);
+        
+        let mut result = serde_json::Map::new();
+
+        // System info
+        if category == "all" || category == "system" {
+            let mut sys_info = serde_json::Map::new();
+            
+            // OS info
+            sys_info.insert("os".to_string(), json!(std::env::consts::OS));
+            sys_info.insert("arch".to_string(), json!(std::env::consts::ARCH));
+            
+            // Current working directory
+            if let Ok(cwd) = std::env::current_dir() {
+                sys_info.insert("cwd".to_string(), json!(cwd.display().to_string()));
+            }
+            
+            // Project root (sandbox)
+            sys_info.insert("project_root".to_string(), json!(self.project_root.display().to_string()));
+            
+            // Memory info (read from /proc/meminfo on Linux)
+            #[cfg(target_os = "linux")]
+            {
+                if let Ok(meminfo) = std::fs::read_to_string("/proc/meminfo") {
+                    let mut mem = serde_json::Map::new();
+                    for line in meminfo.lines().take(3) {
+                        if let Some((key, val)) = line.split_once(':') {
+                            mem.insert(key.trim().to_string(), json!(val.trim()));
+                        }
+                    }
+                    sys_info.insert("memory".to_string(), json!(mem));
+                }
+            }
+            
+            // Load average on Unix
+            #[cfg(unix)]
+            {
+                if let Ok(loadavg) = std::fs::read_to_string("/proc/loadavg") {
+                    let parts: Vec<&str> = loadavg.split_whitespace().take(3).collect();
+                    if parts.len() >= 3 {
+                        sys_info.insert("load_avg".to_string(), json!({
+                            "1min": parts[0],
+                            "5min": parts[1],
+                            "15min": parts[2]
+                        }));
+                    }
+                }
+            }
+            
+            result.insert("system".to_string(), json!(sys_info));
+        }
+
+        // Environment info (only safe vars)
+        if category == "all" || category == "environment" {
+            let mut env_info = serde_json::Map::new();
+            let safe_vars = [
+                "PATH", "HOME", "USER", "SHELL", "TERM", "LANG", "PWD",
+                "RUST_LOG", "MO_MODEL", "MO_API_KEY", // show if set (not value)
+            ];
+            
+            for var in safe_vars {
+                if let Ok(val) = std::env::var(var) {
+                    // For sensitive vars, just show presence
+                    if var.contains("KEY") || var.contains("TOKEN") || var.contains("SECRET") {
+                        env_info.insert(var.to_string(), json!("[SET]"));
+                    } else if verbose {
+                        env_info.insert(var.to_string(), json!(val));
+                    } else {
+                        // Truncate long values
+                        let display = if val.len() > 100 {
+                            format!("{}...", &val[..100])
+                        } else {
+                            val
+                        };
+                        env_info.insert(var.to_string(), json!(display));
+                    }
+                }
+            }
+            
+            result.insert("environment".to_string(), json!(env_info));
+        }
+
+        // Available tools info
+        if category == "all" || category == "tools" {
+            let tools = all_tool_schemas();
+            let tool_names: Vec<&str> = tools.iter()
+                .filter_map(|t| t.get("function").and_then(|f| f.get("name")).and_then(Value::as_str))
+                .collect();
+            
+            let mut tools_info = serde_json::Map::new();
+            tools_info.insert("count".to_string(), json!(tool_names.len()));
+            
+            if verbose {
+                tools_info.insert("available".to_string(), json!(tool_names));
+            } else {
+                // Just show categories
+                let categories = vec![
+                    ("file_ops", vec!["read_file", "write_file", "str_replace", "list_dir"]),
+                    ("search", vec!["grep", "glob", "find_definition", "find_references"]),
+                    ("git", vec!["git_status", "git_diff", "git_log", "git_show"]),
+                    ("tasks", vec!["task_create", "task_list", "task_update", "task_stop"]),
+                    ("utility", vec!["bash", "web_fetch", "sleep", "ask_user"]),
+                ];
+                let mut cat_status = serde_json::Map::new();
+                for (cat, expected) in categories {
+                    let available = expected.iter().filter(|t| tool_names.contains(t)).count();
+                    cat_status.insert(cat.to_string(), json!(format!("{}/{}", available, expected.len())));
+                }
+                tools_info.insert("categories".to_string(), json!(cat_status));
+            }
+            
+            // MCP tools
+            if self.mcp_manager.is_some() {
+                tools_info.insert("mcp_enabled".to_string(), json!(true));
+            }
+            
+            result.insert("tools".to_string(), json!(tools_info));
+        }
+
+        // Task status
+        if category == "all" || category == "tasks" {
+            let tasks = match self.tasks.lock() {
+                Ok(guard) => guard.clone(),
+                Err(_) => vec![],
+            };
+            
+            let mut tasks_info = serde_json::Map::new();
+            tasks_info.insert("total".to_string(), json!(tasks.len()));
+            
+            let pending = tasks.iter().filter(|t| t.status == "pending").count();
+            let in_progress = tasks.iter().filter(|t| t.status == "in_progress").count();
+            let completed = tasks.iter().filter(|t| t.status == "completed").count();
+            let failed = tasks.iter().filter(|t| t.status == "failed" || t.status == "cancelled").count();
+            
+            tasks_info.insert("pending".to_string(), json!(pending));
+            tasks_info.insert("in_progress".to_string(), json!(in_progress));
+            tasks_info.insert("completed".to_string(), json!(completed));
+            tasks_info.insert("failed_or_cancelled".to_string(), json!(failed));
+            
+            if verbose && !tasks.is_empty() {
+                let task_list: Vec<Value> = tasks.iter().map(|t| {
+                    json!({
+                        "id": t.id,
+                        "title": t.title,
+                        "status": t.status,
+                        "subtasks": t.subtasks.len()
+                    })
+                }).collect();
+                tasks_info.insert("list".to_string(), json!(task_list));
+            }
+            
+            result.insert("tasks".to_string(), json!(tasks_info));
+        }
+
+        // Session info
+        if category == "all" || category == "session" {
+            let mut session_info = serde_json::Map::new();
+            
+            // Aggregate output tracking (AtomicUsize uses load, not lock)
+            let bytes = self.aggregate_output_bytes.load(std::sync::atomic::Ordering::Relaxed);
+            session_info.insert("output_bytes_this_turn".to_string(), json!(bytes));
+            session_info.insert("output_budget".to_string(), json!(AGGREGATE_OUTPUT_BUDGET));
+            session_info.insert("output_utilization".to_string(), 
+                json!(format!("{:.1}%", (bytes as f64 / AGGREGATE_OUTPUT_BUDGET as f64) * 100.0)));
+            
+            // Sandbox policy
+            if let Some(ref policy) = self.sandbox_policy {
+                session_info.insert("sandbox_mode".to_string(), json!(format!("{:?}", policy.mode)));
+                if verbose {
+                    let paths: Vec<String> = policy.allowed_paths.iter()
+                        .map(|p| p.display().to_string())
+                        .collect();
+                    session_info.insert("allowed_paths".to_string(), json!(paths));
+                }
+            } else {
+                session_info.insert("sandbox_mode".to_string(), json!("disabled"));
+            }
+            
+            result.insert("session".to_string(), json!(session_info));
+        }
+
+        serde_json::to_string_pretty(&result).unwrap_or_else(|_| "Error: serialization failed".to_string())
+    }
+
     /// Set the MCP client manager for external tool routing.
     pub fn with_mcp_manager(
         mut self,
@@ -3054,13 +3267,14 @@ impl ToolExecutor {
             "tool_search" => self.tool_search(args),
             "web_search" => self.web_search(args),
             "spawn_agent" => agent_spawning::handle_spawn_agent_tool(args, self.spawn_context.as_ref()).await,
+            "diagnose" => self.diagnose(args).await,
             _ if name.starts_with("mcp_") => self.execute_mcp_tool(name, args).await,
             _ => format!(
                 "Unknown tool: {name}. Available tools: bash, read_file, write_file, str_replace, \
                  list_dir, grep, glob, symbols, find_definition, find_references, git_status, \
                  git_diff, git_log, git_show, git_blame, call_graph, run_build_test, web_fetch, \
                  mo_query, memory_search, memory_profile, ask_user, task_create, task_list, \
-                 task_get, task_update, task_stop, sleep, tool_search, web_search, spawn_agent"
+                 task_get, task_update, task_stop, sleep, tool_search, web_search, spawn_agent, diagnose"
             ),
         };
         // Normalize empty output, then apply global safety net
@@ -10418,5 +10632,133 @@ impl MyType {
         
         let result = exe.task_stop(&json!({})).await;
         assert!(result.contains("required"));
+    }
+
+    // ─── diagnose tests ───────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn diagnose_all_categories() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = ToolExecutor::new(dir.path());
+        
+        let result = exe.diagnose(&json!({})).await;
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        
+        // Should have all categories
+        assert!(parsed["system"].is_object());
+        assert!(parsed["environment"].is_object());
+        assert!(parsed["tools"].is_object());
+        assert!(parsed["tasks"].is_object());
+        assert!(parsed["session"].is_object());
+    }
+
+    #[tokio::test]
+    async fn diagnose_system_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = ToolExecutor::new(dir.path());
+        
+        let result = exe.diagnose(&json!({"category": "system"})).await;
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        
+        assert!(parsed["system"].is_object());
+        assert!(parsed["environment"].is_null());
+        assert!(parsed["tools"].is_null());
+    }
+
+    #[tokio::test]
+    async fn diagnose_contains_os_info() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = ToolExecutor::new(dir.path());
+        
+        let result = exe.diagnose(&json!({"category": "system"})).await;
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        
+        assert!(parsed["system"]["os"].is_string());
+        assert!(parsed["system"]["arch"].is_string());
+        assert!(parsed["system"]["project_root"].is_string());
+    }
+
+    #[tokio::test]
+    async fn diagnose_tools_info() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = ToolExecutor::new(dir.path());
+        
+        let result = exe.diagnose(&json!({"category": "tools"})).await;
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        
+        assert!(parsed["tools"]["count"].as_u64().unwrap() > 10);
+        assert!(parsed["tools"]["categories"].is_object());
+    }
+
+    #[tokio::test]
+    async fn diagnose_tools_verbose() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = ToolExecutor::new(dir.path());
+        
+        let result = exe.diagnose(&json!({"category": "tools", "verbose": true})).await;
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        
+        // Verbose mode should list all tools
+        assert!(parsed["tools"]["available"].is_array());
+        let tools = parsed["tools"]["available"].as_array().unwrap();
+        assert!(tools.contains(&json!("bash")));
+        assert!(tools.contains(&json!("diagnose")));
+    }
+
+    #[tokio::test]
+    async fn diagnose_tasks_with_items() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = ToolExecutor::new(dir.path());
+        
+        // Create some tasks
+        exe.task_create(&json!({"title": "Task 1"})).await;
+        exe.task_create(&json!({"title": "Task 2"})).await;
+        exe.task_update(&json!({"task_id": "task-1", "status": "completed"})).await;
+        
+        let result = exe.diagnose(&json!({"category": "tasks"})).await;
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        
+        assert_eq!(parsed["tasks"]["total"], 2);
+        assert_eq!(parsed["tasks"]["completed"], 1);
+        assert_eq!(parsed["tasks"]["pending"], 1);
+    }
+
+    #[tokio::test]
+    async fn diagnose_session_info() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = ToolExecutor::new(dir.path());
+        
+        let result = exe.diagnose(&json!({"category": "session"})).await;
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        
+        assert!(parsed["session"]["output_bytes_this_turn"].is_number());
+        assert!(parsed["session"]["output_budget"].is_number());
+        assert!(parsed["session"]["output_utilization"].is_string());
+    }
+
+    #[tokio::test]
+    async fn diagnose_environment_hides_secrets() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = ToolExecutor::new(dir.path());
+        
+        // Set a mock API key (unsafe in Rust 2024 edition)
+        // SAFETY: This is a single-threaded test
+        unsafe {
+            std::env::set_var("MO_API_KEY", "secret-key-12345");
+        }
+        
+        let result = exe.diagnose(&json!({"category": "environment"})).await;
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        
+        // API key should show [SET] not actual value
+        if let Some(val) = parsed["environment"]["MO_API_KEY"].as_str() {
+            assert_eq!(val, "[SET]");
+        }
+        
+        // Cleanup
+        // SAFETY: This is a single-threaded test
+        unsafe {
+            std::env::remove_var("MO_API_KEY");
+        }
     }
 }

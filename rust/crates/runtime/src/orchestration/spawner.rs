@@ -5,6 +5,7 @@ use crate::messaging::types::AgentAddress;
 use crate::orchestration::builtin_agents::get_agent_type_definition;
 use crate::orchestration::progress::{ProgressBroadcaster, AgentProgressEvent, ProgressEventType};
 use crate::orchestration::spawn_tool::{SpawnAgentInput, SpawnAgentOutput};
+use crate::server::delegation_engine::SubRunConfig;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -12,6 +13,9 @@ use std::sync::Arc;
 use std::time::SystemTime;
 use tokio::sync::RwLock;
 use uuid::Uuid;
+
+use astra_services::coordination::AgentProfile;
+use async_trait::async_trait;
 
 // ─── Spawn Context ──────────────────────────────────────────────────────────
 
@@ -97,6 +101,79 @@ impl From<&SpawnedAgentState> for SpawnedAgentInfo {
     }
 }
 
+// ─── Spawn Agent Executor Trait ─────────────────────────────────────────────
+
+/// Configuration for a spawned agent run.
+pub struct SpawnRunConfig {
+    /// Unique run ID.
+    pub run_id: String,
+    /// Agent ID (name@run_id).
+    pub agent_id: String,
+    /// The agent type (explore, code-review, task, general-purpose).
+    pub agent_type: String,
+    /// Detailed task prompt for the agent.
+    pub task: String,
+    /// System prompt addendum from agent type definition.
+    pub system_prompt_addendum: String,
+    /// Model to use (from agent type or override).
+    pub model: String,
+    /// Max turns allowed.
+    pub max_turns: u32,
+    /// Allowed tools for this agent type.
+    pub allowed_tools: Vec<String>,
+    /// Whether the agent is read-only.
+    pub read_only: bool,
+    /// Working directory for the agent.
+    pub working_dir: PathBuf,
+    /// Optional mailbox for inter-agent messaging.
+    pub mailbox: Option<crate::messaging::router::AgentMailbox>,
+}
+
+impl std::fmt::Debug for SpawnRunConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SpawnRunConfig")
+            .field("run_id", &self.run_id)
+            .field("agent_id", &self.agent_id)
+            .field("agent_type", &self.agent_type)
+            .field("task", &self.task)
+            .field("model", &self.model)
+            .field("max_turns", &self.max_turns)
+            .field("mailbox", &self.mailbox.is_some())
+            .finish()
+    }
+}
+
+/// Result from a spawned agent run.
+#[derive(Debug, Clone)]
+pub struct SpawnRunResult {
+    /// Agent ID.
+    pub agent_id: String,
+    /// Run ID.
+    pub run_id: String,
+    /// Final status.
+    pub status: String,
+    /// Output text (if completed).
+    pub output: Option<String>,
+    /// Error message (if failed).
+    pub error: Option<String>,
+    /// Total prompt tokens.
+    pub prompt_tokens: u64,
+    /// Total completion tokens.
+    pub completion_tokens: u64,
+    /// Total tool calls.
+    pub tool_calls: u32,
+}
+
+/// Trait for executing spawned agent runs.
+///
+/// Similar to `SubRunExecutor` but specifically for spawn_agent.
+/// CLI layer implements this to run the agentic loop.
+#[async_trait]
+pub trait SpawnAgentExecutor: Send + Sync {
+    /// Execute a spawned agent run.
+    async fn execute(&self, config: SpawnRunConfig) -> Result<SpawnRunResult, String>;
+}
+
 // ─── Dynamic Agent Spawner ──────────────────────────────────────────────────
 
 /// Handles dynamic agent creation at runtime.
@@ -110,6 +187,8 @@ pub struct DynamicAgentSpawner {
     active_agents: Arc<RwLock<HashMap<String, SpawnedAgentState>>>,
     /// Progress event broadcaster.
     progress_broadcaster: Arc<ProgressBroadcaster>,
+    /// Optional executor for running agents (provided by CLI layer).
+    executor: Option<Arc<dyn SpawnAgentExecutor>>,
 }
 
 impl DynamicAgentSpawner {
@@ -119,7 +198,19 @@ impl DynamicAgentSpawner {
             mailbox_router,
             active_agents: Arc::new(RwLock::new(HashMap::new())),
             progress_broadcaster: Arc::new(ProgressBroadcaster::default()),
+            executor: None,
         }
+    }
+
+    /// Set the executor for running spawned agents.
+    pub fn with_executor(mut self, executor: Arc<dyn SpawnAgentExecutor>) -> Self {
+        self.executor = Some(executor);
+        self
+    }
+
+    /// Check if an executor is configured.
+    pub fn has_executor(&self) -> bool {
+        self.executor.is_some()
     }
 
     /// Spawn a new agent from the given specification.
@@ -141,12 +232,16 @@ impl DynamicAgentSpawner {
         let run_id = Uuid::new_v4().to_string();
         let agent_id = format!("{}@{}", agent_name, &run_id[..8]);
 
-        // 3. Register mailbox if named
-        let messaging_address = if input.name.is_some() {
+        // 3. Determine model and turns
+        let model = input.model.clone().unwrap_or_else(|| agent_def.default_model.clone());
+        let max_turns = input.max_turns.unwrap_or(agent_def.max_turns);
+
+        // 4. Register mailbox if named
+        let mailbox = if input.name.is_some() {
             let addr = AgentAddress::new(&run_id, &agent_id);
             let delegation_id = Some(context.parent_run_id.clone());
             match self.mailbox_router.register(addr.clone(), delegation_id).await {
-                Ok(_mailbox) => Some(addr),
+                Ok(mb) => Some(mb),
                 Err(e) => {
                     return Err(SpawnError::MailboxRegistration(e.to_string()));
                 }
@@ -155,8 +250,7 @@ impl DynamicAgentSpawner {
             None
         };
 
-        // 4. Determine max turns (will be used when DelegationEngine integration is complete)
-        let _max_turns = input.max_turns.unwrap_or(agent_def.max_turns);
+        let messaging_address = mailbox.as_ref().map(|mb| mb.address.clone());
 
         // 5. Register state
         let state = SpawnedAgentState {
@@ -174,27 +268,124 @@ impl DynamicAgentSpawner {
 
         self.active_agents.write().await.insert(agent_id.clone(), state);
 
-        // 6. Emit progress event
+        // 6. Emit started event
         let emitter = self.progress_broadcaster.for_agent(agent_id.clone());
         emitter.started(&input.description);
 
-        // 7. Return appropriate output
-        // NOTE: Actual execution integration with DelegationEngine is TODO
-        // For now we return Launched to unblock the tool schema
+        // 7. Build run config
+        let run_config = SpawnRunConfig {
+            run_id: run_id.clone(),
+            agent_id: agent_id.clone(),
+            agent_type: input.agent_type.clone(),
+            task: input.prompt.clone(),
+            system_prompt_addendum: agent_def.system_prompt_addendum.clone(),
+            model,
+            max_turns,
+            allowed_tools: agent_def.allowed_tools.iter().cloned().collect(),
+            read_only: agent_def.read_only,
+            working_dir: context.working_dir.clone(),
+            mailbox,
+        };
+
+        // 8. Execute or launch
         if input.background {
+            // Background mode: launch async and return immediately
+            if let Some(ref executor) = self.executor {
+                let executor = Arc::clone(executor);
+                let spawner = self.clone_for_task();
+                let agent_id_clone = agent_id.clone();
+                let description = input.description.clone();
+                
+                tokio::spawn(async move {
+                    let result = executor.execute(run_config).await;
+                    spawner.handle_completion(&agent_id_clone, result).await;
+                });
+            }
+            
             Ok(SpawnAgentOutput::Launched {
                 agent_id,
                 description: input.description,
                 messaging_address: messaging_address.map(|a| a.to_string()),
             })
         } else {
-            // Sync mode: would block until completion
-            // For now, return launched (integration with delegation engine pending)
-            Ok(SpawnAgentOutput::Launched {
-                agent_id,
-                description: input.description,
-                messaging_address: messaging_address.map(|a| a.to_string()),
-            })
+            // Sync mode: wait for completion
+            if let Some(ref executor) = self.executor {
+                // Update status to running
+                self.update_status(&agent_id, AgentStatus::Running { 
+                    activity: "executing".to_string() 
+                }).await;
+
+                let result = executor.execute(run_config).await;
+                let started_at = self.active_agents.read().await
+                    .get(&agent_id)
+                    .map(|s| s.started_at)
+                    .unwrap_or_else(SystemTime::now);
+
+                match result {
+                    Ok(run_result) => {
+                        // Update final status
+                        self.update_status(&agent_id, AgentStatus::Completed {
+                            result: run_result.output.clone().unwrap_or_default(),
+                        }).await;
+
+                        let duration_ms = started_at.elapsed()
+                            .map(|d| d.as_millis() as u64)
+                            .unwrap_or(0);
+
+                        Ok(SpawnAgentOutput::Completed {
+                            agent_id,
+                            result: run_result.output.unwrap_or_default(),
+                            tool_calls: run_result.tool_calls,
+                            duration_ms,
+                        })
+                    }
+                    Err(e) => {
+                        self.update_status(&agent_id, AgentStatus::Failed {
+                            error: e.clone(),
+                        }).await;
+
+                        Ok(SpawnAgentOutput::Failed { error: e })
+                    }
+                }
+            } else {
+                // No executor available - return as launched (degraded mode)
+                Ok(SpawnAgentOutput::Launched {
+                    agent_id,
+                    description: input.description,
+                    messaging_address: messaging_address.map(|a| a.to_string()),
+                })
+            }
+        }
+    }
+
+    /// Handle completion of a background agent.
+    async fn handle_completion(&self, agent_id: &str, result: Result<SpawnRunResult, String>) {
+        match result {
+            Ok(run_result) => {
+                self.update_status(agent_id, AgentStatus::Completed {
+                    result: run_result.output.unwrap_or_default(),
+                }).await;
+                
+                // Update metrics
+                if let Some(state) = self.active_agents.write().await.get_mut(agent_id) {
+                    state.metrics.tool_calls = run_result.tool_calls;
+                    state.metrics.prompt_tokens = run_result.prompt_tokens;
+                    state.metrics.completion_tokens = run_result.completion_tokens;
+                }
+            }
+            Err(e) => {
+                self.update_status(agent_id, AgentStatus::Failed { error: e }).await;
+            }
+        }
+    }
+
+    /// Clone the spawner for use in spawned tasks.
+    fn clone_for_task(&self) -> Self {
+        Self {
+            mailbox_router: Arc::clone(&self.mailbox_router),
+            active_agents: Arc::clone(&self.active_agents),
+            progress_broadcaster: Arc::clone(&self.progress_broadcaster),
+            executor: self.executor.clone(),
         }
     }
 
