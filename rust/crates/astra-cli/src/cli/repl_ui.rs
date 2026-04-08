@@ -116,7 +116,8 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/logout", "Logout from the API"),
     ("/memory-setup", "Guided Memoria configuration"),
     // ── Toggles & style ───────────────────────────────────────────────────
-    ("/allow", "Permission mode: /allow [auto|prompt|deny]"),
+    ("/allow", "Permission mode: /allow [auto|prompt|deny|all|rules]"),
+    ("/yolo", "Auto-approve all tools (alias for /allow auto)"),
     (
         "/style",
         "Output theme: default | minimal | colorful | high-contrast",
@@ -394,6 +395,8 @@ const SLASH_FIRST_TOKEN_COMPLETIONS: &[(&str, &[(&str, &str)])] = &[
             ("auto", "Auto-approve all tool use"),
             ("prompt", "Prompt before tool use"),
             ("deny", "Deny all tool use"),
+            ("all", "Auto-approve all (alias for auto)"),
+            ("rules", "Show current permission rules"),
         ],
     ),
     (
@@ -1365,7 +1368,7 @@ pub(super) fn print_slash_commands(query: Option<&str>) {
             "Team & account",
             &["/team", "/login", "/register", "/logout", "/memory-setup"],
         ),
-        ("🔧", "System", &["/diagnostics", "/allow", "/style", "/bug"]),
+        ("🔧", "System", &["/diagnostics", "/allow", "/yolo", "/style", "/bug"]),
     ];
 
     for (icon, title, commands) in groups {
@@ -2478,7 +2481,7 @@ mod tests {
             &["/skill"],
             &["/mcp"],
             &["/team", "/login", "/register", "/logout", "/memory-setup"],
-            &["/diagnostics", "/allow", "/style"],
+            &["/diagnostics", "/allow", "/yolo", "/style"],
         ];
         let known: std::collections::HashSet<&str> =
             SLASH_COMMANDS.iter().map(|(cmd, _)| *cmd).collect();

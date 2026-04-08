@@ -3633,7 +3633,8 @@ fn display_plan_updates_live(
                 // Store the response channel for the REPL readline handler.
                 // The next user input line will be interpreted as y/n/a to resolve this.
                 state.pending_approval = Some(response_tx);
-                let prompt_msg = "   Type y(es) to approve, n(o) to deny:".to_string();
+                let prompt_msg =
+                    "   Type y(es) to approve, n(o) to deny, !(auto-run all):".to_string();
                 print_line(plan_spinner, &mut state.plan_in_token_stream, prompt_msg);
                 continue;
             }
@@ -4856,40 +4857,65 @@ async fn handle_slash_command(
             handle_account_command(cmd, arg, api, profile, state).await?;
         }
 
-        "/allow" => {
+        "/allow" | "/yolo" => {
             use permission_manager::PermissionMode;
-            match arg {
-                "" => {
-                    // Cycle: Prompt → Auto → Deny → Prompt
-                    let next = match state.perm_manager.mode() {
-                        PermissionMode::Prompt => PermissionMode::Auto,
-                        PermissionMode::Auto => PermissionMode::Deny,
-                        PermissionMode::Deny => PermissionMode::Prompt,
-                    };
-                    state.perm_manager.set_mode(next);
-                    eprintln!(
-                        "  {} Permission mode → {}",
-                        theme::icon_info(),
-                        next.to_string().cyan()
-                    );
-                }
-                _ => match arg.parse::<PermissionMode>() {
-                    Ok(mode) => {
-                        state.perm_manager.set_mode(mode);
+            if cmd == "/yolo" {
+                state.perm_manager.set_mode(PermissionMode::Auto);
+                eprintln!(
+                    "  {} {} All tools auto-approved for this session.",
+                    "⚡".yellow(),
+                    "YOLO mode!".bold().yellow()
+                );
+                eprintln!(
+                    "  {}",
+                    "  Use /allow prompt to restore confirmation prompts.".dim()
+                );
+            } else {
+                match arg {
+                    "" => {
+                        // Cycle: Prompt → Auto → Deny → Prompt
+                        let next = match state.perm_manager.mode() {
+                            PermissionMode::Prompt => PermissionMode::Auto,
+                            PermissionMode::Auto => PermissionMode::Deny,
+                            PermissionMode::Deny => PermissionMode::Prompt,
+                        };
+                        state.perm_manager.set_mode(next);
                         eprintln!(
                             "  {} Permission mode → {}",
                             theme::icon_info(),
-                            mode.to_string().cyan()
+                            next.to_string().cyan()
                         );
                     }
-                    Err(_) => {
+                    "all" => {
+                        state.perm_manager.set_mode(PermissionMode::Auto);
                         eprintln!(
-                            "  {} Unknown mode '{}'. Use: auto, prompt, deny",
-                            theme::icon_warn(),
-                            arg
+                            "  {} Permission mode → {} (all tools auto-approved)",
+                            "⚡".yellow(),
+                            "auto".cyan()
                         );
                     }
-                },
+                    "rules" | "status" => {
+                        let summary = state.perm_manager.rules_summary();
+                        eprint!("{summary}");
+                    }
+                    _ => match arg.parse::<PermissionMode>() {
+                        Ok(mode) => {
+                            state.perm_manager.set_mode(mode);
+                            eprintln!(
+                                "  {} Permission mode → {}",
+                                theme::icon_info(),
+                                mode.to_string().cyan()
+                            );
+                        }
+                        Err(_) => {
+                            eprintln!(
+                                "  {} Unknown mode '{}'. Use: auto, prompt, deny, all, rules",
+                                theme::icon_warn(),
+                                arg
+                            );
+                        }
+                    },
+                }
             }
         }
 
@@ -5316,10 +5342,26 @@ async fn run_chat_repl(
                 if let Some(tx) = state.pending_approval.take() {
                     let trimmed = line.trim().to_lowercase();
                     let approved = trimmed == "y" || trimmed == "yes" || trimmed == "a";
+                    let autorun =
+                        trimmed == "!" || trimmed == "all" || trimmed == "yolo";
                     let denied = trimmed == "n" || trimmed == "no";
-                    if approved || denied {
-                        let _ = tx.send(approved);
-                        if approved {
+                    if approved || autorun || denied {
+                        let _ = tx.send(approved || autorun);
+                        if autorun {
+                            state
+                                .perm_manager
+                                .set_mode(permission_manager::PermissionMode::Auto);
+                            eprintln!(
+                                "  {} {} All tools auto-approved for this session.",
+                                "⚡".yellow(),
+                                "Auto-run enabled!".bold().yellow()
+                            );
+                            eprintln!(
+                                "  {}",
+                                "  Use /allow prompt to restore confirmation prompts."
+                                    .dim()
+                            );
+                        } else if approved {
                             eprintln!("  {} Approved", theme::icon_ok());
                         } else {
                             eprintln!("  {} Denied", theme::icon_err());
