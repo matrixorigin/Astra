@@ -322,10 +322,9 @@ impl CompressionLayer for DuplicateReadElimination {
                         path
                     );
                     freed_chars += content.len().saturating_sub(stub.len());
-                    messages[*i].as_object_mut().unwrap().insert(
-                        "content".into(),
-                        Value::String(stub),
-                    );
+                    if let Some(obj) = messages[*i].as_object_mut() {
+                        obj.insert("content".into(), Value::String(stub));
+                    }
                     count += 1;
                 }
             }
