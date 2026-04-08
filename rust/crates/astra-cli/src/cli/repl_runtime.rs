@@ -161,7 +161,7 @@ fn create_tool_selector_with_quality_internal(
                             match manager.connect_and_discover_skills(config, &reg).await {
                                 Ok(n) if n > 0 => {
                                     eprintln!(
-                                        "  {} Connected MCP server '{}' ({n} skill{})",
+                                        "  {} Connected '{}' ({n} tool{})",
                                         crossterm::style::Stylize::cyan("✓"),
                                         name,
                                         if n == 1 { "" } else { "s" }
@@ -169,7 +169,12 @@ fn create_tool_selector_with_quality_internal(
                                 }
                                 Ok(_) => {}
                                 Err(e) => {
-                                    eprintln!("  ⚠ MCP server '{}' failed: {}", name, e);
+                                    eprintln!(
+                                        "  {} MCP server '{}' failed to connect: {}",
+                                        crossterm::style::Stylize::yellow("⚠"),
+                                        name,
+                                        e
+                                    );
                                 }
                             }
                         }

@@ -331,7 +331,7 @@ impl PermissionManager {
                 self.session_overrides.insert(tool.to_string(), true);
                 eprintln!(
                     "{}",
-                    format!("  ✓ {tool}: allow_session (auto-allow this tool)").dim()
+                    format!("  ✓ {tool}: allowed for this session").dim()
                 );
                 ApprovalDecision::AllowSession
             }
@@ -619,7 +619,7 @@ impl PermissionManager {
                 if self.mode == PermissionMode::Deny {
                     eprintln!(
                         "  {}",
-                        "  Git safety violations denied (--permission-mode=deny)".red()
+                        "  Git safety violation — blocked".red()
                     );
                     return false;
                 }
@@ -627,7 +627,7 @@ impl PermissionManager {
                 if self.mode == PermissionMode::Auto {
                     eprintln!(
                         "  {}",
-                        "  Git safety violations require manual approval even in auto mode"
+                        "  Git safety violation — requires your approval"
                             .yellow()
                     );
                 }
@@ -650,14 +650,14 @@ impl PermissionManager {
             if self.mode == PermissionMode::Deny {
                 eprintln!(
                     "  {}",
-                    "  Sensitive path access denied (--permission-mode=deny)".red()
+                    "  Sensitive path — blocked".red()
                 );
                 return false;
             }
             if self.mode == PermissionMode::Auto {
                 eprintln!(
                     "  {}",
-                    "  Sensitive path access requires manual approval even in auto mode".yellow()
+                    "  Sensitive path — requires your approval".yellow()
                 );
             }
             let (header, detail) = Self::format_tool_display(name, args);
@@ -706,7 +706,7 @@ impl PermissionManager {
                 let (header, _) = Self::format_tool_display(name, args);
                 eprintln!(
                     "  {}",
-                    format!("  ✗ {header}: denied (--permission-mode=deny)").red()
+                    format!("  ✗ {header} — blocked").red()
                 );
                 return false;
             }

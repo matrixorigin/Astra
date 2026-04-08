@@ -2,6 +2,11 @@ use super::*;
 use crate::manifest_loader::project_mcp_json_path;
 use crate::mcp_client::{ConnectionState, McpClientManager};
 
+fn eprint_server_not_found(name: &str) {
+    eprintln!("  {} Server '{}' not found", "⚠".yellow(), name);
+    eprintln!("  {}", "Use /mcp servers to see connected servers".dim());
+}
+
 pub(super) async fn handle_mcp_command(arg: &str, state: &mut ReplState) -> Result<(), String> {
     let sub = arg.trim();
 
@@ -12,10 +17,8 @@ pub(super) async fn handle_mcp_command(arg: &str, state: &mut ReplState) -> Resu
         "resources" => show_resources(state).await,
         s if s.starts_with("add ") => handle_mcp_add(&s[4..]).await,
         "add" => {
-            eprintln!(
-                "{}",
-                "  Usage: /mcp add <name> <command> [args...]\n  Example: /mcp add github npx @modelcontextprotocol/server-github".dim()
-            );
+            eprintln!("{}", "  Usage: /mcp add <name> <command> [args...]".dim());
+            eprintln!("{}", "  Example: /mcp add github npx @modelcontextprotocol/server-github".dim());
         }
         s if s.starts_with("remove ") => handle_mcp_remove(&s[7..]).await,
         "remove" => {
@@ -71,9 +74,14 @@ pub(super) async fn handle_mcp_command(arg: &str, state: &mut ReplState) -> Resu
         "ping" => handle_mcp_ping(None, state).await,
         _ => {
             eprintln!(
-                "{}",
-                format!("  Unknown /mcp subcommand: '{sub}'. Try /mcp, /mcp add, /mcp remove, /mcp servers, /mcp prompts, /mcp resources, /mcp prompt, /mcp resource, /mcp complete, /mcp ping")
-                    .yellow()
+                "  {} Unknown subcommand: {}",
+                "⚠".yellow(),
+                sub.yellow()
+            );
+            eprintln!(
+                "  {} status {} add {} remove {} servers {} prompts {} resources {} ping",
+                "Use:".dim(),
+                "│".dim(), "│".dim(), "│".dim(), "│".dim(), "│".dim(), "│".dim()
             );
         }
     }
@@ -89,16 +97,18 @@ async fn show_status(state: &ReplState) {
         eprintln!("{}", "  No MCP servers connected.".dim());
         eprintln!(
             "{}",
-            "  Configure servers in .astra/mcp.json or skill manifest.yaml".dim()
+            "  Use /mcp add <name> <command> or configure .astra/mcp.json".dim()
         );
         return;
     }
 
-    eprintln!("{}", format!("  MCP Servers: {count} connected").bold());
+    eprintln!("{}", format!("  Servers: {count} connected").bold().cyan());
+    let mut caps = Vec::new();
     if manager.has_sampling() {
-        eprintln!("  {}", "Sampling: enabled".dim());
+        caps.push("sampling");
     }
-    eprintln!("  {}", "Elicitation: enabled".dim());
+    caps.push("elicitation");
+    eprintln!("  {}", format!("Capabilities: {}", caps.join(", ")).dim());
     let roots = manager.roots().read().await;
     if !roots.is_empty() {
         let names: Vec<&str> = roots
@@ -133,9 +143,9 @@ async fn show_servers(state: &ReplState) {
                 .unwrap_or_else(|| "n/a".to_string());
 
             eprintln!("{}", format!("  ┌─ {name}").bold().cyan());
-            eprintln!("  {} {}   {}", "│".dim(), "State:".dim(), format_state(state));
-            eprintln!("  {} {}  {uptime}", "│".dim(), "Uptime:".dim());
-            eprintln!("  {} {}   {}", "│".dim(), "Tools:".dim(), tools.len().to_string().cyan());
+            eprintln!("  {} {:<8} {}", "│".dim(), "State:".dim(), format_state(state));
+            eprintln!("  {} {:<8} {uptime}", "│".dim(), "Uptime:".dim());
+            eprintln!("  {} {:<8} {}", "│".dim(), "Tools:".dim(), tools.len().to_string().cyan());
 
             if !tools.is_empty() {
                 for tool in tools.iter().take(10) {
@@ -176,7 +186,7 @@ async fn show_prompts(state: &ReplState) {
 
     eprintln!(
         "{}",
-        format!("  MCP Prompts: {} available", prompts.len()).bold()
+        format!("  Prompts: {} available", prompts.len()).bold().cyan()
     );
     eprintln!();
 
@@ -234,7 +244,7 @@ async fn show_resources(state: &ReplState) {
 
     eprintln!(
         "{}",
-        format!("  MCP Resources: {} available", resources.len()).bold()
+        format!("  Resources: {} available", resources.len()).bold().cyan()
     );
     eprintln!();
 
@@ -290,10 +300,7 @@ async fn handle_mcp_resource_read(arg: &str, state: &ReplState) {
     let conn = match manager.get(server_name) {
         Some(c) => c,
         None => {
-            eprintln!(
-                "{}",
-                format!("  ⚠ Server '{server_name}' not found.").yellow()
-            );
+            eprint_server_not_found(server_name);
             return;
         }
     };
@@ -338,10 +345,7 @@ async fn handle_mcp_subscribe(arg: &str, state: &ReplState) {
     let conn = match manager.get(server_name) {
         Some(c) => c,
         None => {
-            eprintln!(
-                "{}",
-                format!("  ⚠ Server '{server_name}' not found.").yellow()
-            );
+            eprint_server_not_found(server_name);
             return;
         }
     };
@@ -385,10 +389,7 @@ async fn handle_mcp_unsubscribe(arg: &str, state: &ReplState) {
     let conn = match manager.get(server_name) {
         Some(c) => c,
         None => {
-            eprintln!(
-                "{}",
-                format!("  ⚠ Server '{server_name}' not found.").yellow()
-            );
+            eprint_server_not_found(server_name);
             return;
         }
     };
@@ -444,10 +445,7 @@ async fn handle_mcp_log_level(arg: &str, state: &ReplState) {
     let conn = match manager.get(server_name) {
         Some(c) => c,
         None => {
-            eprintln!(
-                "{}",
-                format!("  ⚠ Server '{server_name}' not found.").yellow()
-            );
+            eprint_server_not_found(server_name);
             return;
         }
     };
