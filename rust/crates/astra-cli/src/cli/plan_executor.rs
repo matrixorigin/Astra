@@ -540,6 +540,10 @@ pub(super) struct BackgroundPlanContext {
     // ─── Execution Config ────────────────────────────────────────────────
     pub plan_execution_config: Option<plan_decompose::PlanExecutionConfig>,
     pub turn: u32,
+
+    /// Local tracking for LLM turn failures (separate from durable verification retries).
+    /// Maps subtask_id → count of turn failures for that subtask.
+    pub turn_retry_counts: std::collections::HashMap<String, u32>,
 }
 
 /// Spawn a background plan executor task.
@@ -1192,27 +1196,18 @@ async fn plan_executor_task(
                     emit_event(&update_tx, &ctx, event);
 
                     // Retry: mark subtask back to Pending so the next loop iteration
-                    // picks it up again. Track retries via durable contract or a local
-                    // counter; hard-fail only after exhausting the retry budget.
+                    // picks it up again. Use local turn_retry_counts for LLM turn failures
+                    // (separate from durable verification retries in contract.subtasks[].retry_count).
                     const MAX_TURN_RETRIES: u32 = 2;
-                    let retry_count = if let Some(ref durable) = ctx.durable_task_state {
-                        durable
-                            .contract
-                            .subtasks
-                            .iter()
-                            .find(|s| s.id == *next_id)
-                            .map(|s| s.retry_count)
-                            .unwrap_or(0)
-                    } else {
-                        // Without durable state, check how many times we've already
-                        // tried this subtask by counting its entries in history.
-                        ctx.history
-                            .iter()
-                            .filter(|(p, _)| p.contains(next_id))
-                            .count() as u32
-                    };
 
-                    if retry_count >= MAX_TURN_RETRIES {
+                    // Increment local turn failure count for this subtask
+                    let retry_count = ctx
+                        .turn_retry_counts
+                        .entry(next_id.clone())
+                        .and_modify(|c| *c += 1)
+                        .or_insert(1);
+
+                    if *retry_count > MAX_TURN_RETRIES {
                         if let Some(st) =
                             ctx.plan.subtasks.iter_mut().find(|s| s.id == *next_id)
                         {
@@ -1222,7 +1217,7 @@ async fn plan_executor_task(
                             error: format!(
                                 "Subtask '{}' failed after {} attempts: {}",
                                 next_id,
-                                retry_count + 1,
+                                *retry_count,
                                 failure.error
                             ),
                         });
@@ -1237,7 +1232,7 @@ async fn plan_executor_task(
                         next_id,
                         &title,
                         false,
-                        retry_count + 1,
+                        *retry_count,
                         MAX_TURN_RETRIES,
                         Some(failure.error.clone()),
                     );
@@ -1340,6 +1335,7 @@ mod tests {
             calibrator,
             plan_execution_config: None,
             turn: 0,
+            turn_retry_counts: std::collections::HashMap::new(),
         }
     }
 

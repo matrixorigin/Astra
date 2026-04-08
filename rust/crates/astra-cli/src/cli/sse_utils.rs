@@ -8,6 +8,10 @@ use crate::theme;
 use futures_util::StreamExt;
 use std::io::IsTerminal;
 
+/// Maximum SSE buffer size (1 MB). If a malformed stream sends data without
+/// `\n\n` delimiters, we truncate the buffer to prevent unbounded memory growth.
+const MAX_SSE_BUFFER: usize = 1024 * 1024;
+
 /// Outcome of collecting text from an SSE stream.
 pub struct SseTextResult {
     pub text: String,
@@ -34,6 +38,16 @@ pub async fn collect_sse_text(
     while let Some(chunk) = stream.next().await {
         let Ok(bytes) = chunk else { break };
         buffer.push_str(&String::from_utf8_lossy(&bytes));
+
+        // Guard against unbounded buffer growth from malformed streams
+        if buffer.len() > MAX_SSE_BUFFER {
+            eprintln!(
+                "\r  {} SSE buffer exceeded {} bytes, truncating incomplete events",
+                theme::icon_warn(),
+                MAX_SSE_BUFFER
+            );
+            buffer.clear();
+        }
 
         while let Some(event_end) = buffer.find("\n\n") {
             let event_str = buffer[..event_end].to_string();
@@ -128,6 +142,16 @@ pub async fn stream_sse_markdown(resp: reqwest::Response) -> SseTextResult {
     while let Some(chunk) = stream.next().await {
         let Ok(bytes) = chunk else { break };
         buffer.push_str(&String::from_utf8_lossy(&bytes));
+
+        // Guard against unbounded buffer growth from malformed streams
+        if buffer.len() > MAX_SSE_BUFFER {
+            eprintln!(
+                "\r  {} SSE buffer exceeded {} bytes, truncating incomplete events",
+                theme::icon_warn(),
+                MAX_SSE_BUFFER
+            );
+            buffer.clear();
+        }
 
         while let Some(event_end) = buffer.find("\n\n") {
             let event_str = buffer[..event_end].to_string();

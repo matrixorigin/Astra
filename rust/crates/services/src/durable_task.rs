@@ -997,7 +997,20 @@ impl VerificationRunner {
                 not_contains,
             } => {
                 let full = self.work_dir.join(path);
-                let content = std::fs::read_to_string(&full)
+                // Security: prevent path traversal (e.g. "../../../etc/passwd")
+                let canonical = full
+                    .canonicalize()
+                    .map_err(|e| format!("invalid path {path}: {e}"))?;
+                let work_canonical = self
+                    .work_dir
+                    .canonicalize()
+                    .map_err(|e| format!("work_dir canonicalization failed: {e}"))?;
+                if !canonical.starts_with(&work_canonical) {
+                    return Err(format!(
+                        "path '{path}' escapes work directory boundary"
+                    ));
+                }
+                let content = std::fs::read_to_string(&canonical)
                     .map_err(|e| format!("read {path}: {e}"))?;
                 let has_all = contains.iter().all(|s| content.contains(s));
                 let has_none = not_contains.iter().all(|s| !content.contains(s));
@@ -4135,6 +4148,37 @@ mod tests {
         };
         let res = runner.run_criterion(&crit).await;
         assert!(res.passed);
+    }
+
+    #[tokio::test]
+    async fn read_file_contains_blocks_path_traversal() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Create a file in work_dir — then try to escape via ../
+        std::fs::write(dir.path().join("legit.txt"), "ok").expect("write");
+        let runner = VerificationRunner::new(dir.path().to_path_buf());
+        let crit = VerificationCriterion {
+            id: "escape".into(),
+            description: "attempt to read /etc/passwd".into(),
+            verifier: VerifierKind::ReadFileContains {
+                path: "../../../etc/passwd".into(),
+                contains: vec!["root".into()],
+                not_contains: vec![],
+            },
+            required: true,
+            timeout_sec: 10,
+            global_only: false,
+        };
+        let res = runner.run_criterion(&crit).await;
+        // Must fail with boundary escape error, NOT succeed in reading /etc/passwd
+        assert!(!res.passed, "path traversal should be blocked");
+        assert!(
+            res.error
+                .as_ref()
+                .map(|e| e.contains("escapes work directory"))
+                .unwrap_or(false),
+            "expected boundary escape error, got: {:?}",
+            res.error
+        );
     }
 
     #[test]

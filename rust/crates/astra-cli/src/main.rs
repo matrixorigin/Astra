@@ -3248,6 +3248,7 @@ fn take_plan_context(
         // Execution config
         plan_execution_config: state.plan_execution_config.clone(),
         turn: state.turn,
+        turn_retry_counts: std::collections::HashMap::new(),
     })
 }
 
