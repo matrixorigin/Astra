@@ -1440,6 +1440,8 @@ pub struct ToolExecutor {
     tasks: std::sync::Mutex<Vec<SessionTask>>,
     /// Counter for generating unique task IDs within the session.
     task_id_counter: std::sync::atomic::AtomicU32,
+    /// Optional agent spawning context for the `spawn_agent` tool.
+    pub spawn_context: Option<agent_spawning::SpawnAgentContext>,
 }
 
 /// A task tracked within the current CLI session.
@@ -1594,6 +1596,7 @@ impl ToolExecutor {
             worktree_session: std::sync::Mutex::new(None),
             tasks: std::sync::Mutex::new(Vec::new()),
             task_id_counter: std::sync::atomic::AtomicU32::new(1),
+            spawn_context: None,
         }
     }
 
@@ -3041,7 +3044,7 @@ impl ToolExecutor {
             "sleep" => self.sleep_tool(args).await,
             "tool_search" => self.tool_search(args),
             "web_search" => self.web_search(args),
-            "spawn_agent" => agent_spawning::handle_spawn_agent_tool(args, self.spawn_context.as_ref()),
+            "spawn_agent" => agent_spawning::handle_spawn_agent_tool(args, self.spawn_context.as_ref()).await,
             _ if name.starts_with("mcp_") => self.execute_mcp_tool(name, args).await,
             _ => format!(
                 "Unknown tool: {name}. Available tools: bash, read_file, write_file, str_replace, \
