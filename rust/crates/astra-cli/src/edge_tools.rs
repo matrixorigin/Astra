@@ -968,7 +968,7 @@ pub fn all_tool_schemas() -> Vec<Value> {
                         "choices": {
                             "type": "array",
                             "items": {"type": "string"},
-                            "description": "Optional list of choices for multiple choice (2-6 options). User can always provide custom text. Omit for free-form questions."
+                            "description": "Optional list of choices for multiple choice (2-9 options). User can always provide custom text. Omit for free-form questions."
                         },
                         "default": {
                             "type": "string",
@@ -1583,6 +1583,9 @@ impl ToolExecutor {
             terminal::{disable_raw_mode, enable_raw_mode},
         };
         use std::io::{self, Write};
+        use std::time::Duration;
+
+        const MAX_INPUT_LEN: usize = 4096; // 4KB limit
 
         let question = match args.get("question").and_then(Value::as_str) {
             Some(q) if !q.is_empty() => q,
@@ -1594,6 +1597,11 @@ impl ToolExecutor {
             .and_then(Value::as_array)
             .map(|arr| arr.iter().filter_map(Value::as_str).collect())
             .unwrap_or_default();
+
+        // Validate choices count (2-9 for single-key optimization)
+        if !choices.is_empty() && (choices.len() < 2 || choices.len() > 9) {
+            return "Error: choices must contain 2-9 options".to_string();
+        }
 
         let default = args.get("default").and_then(Value::as_str);
         let context = args.get("context").and_then(Value::as_str);
@@ -1618,6 +1626,10 @@ impl ToolExecutor {
             let mut response = String::new();
             if io::stdin().read_line(&mut response).is_err() {
                 return "Error: failed to read user input".to_string();
+            }
+            // Truncate if too long
+            if response.len() > MAX_INPUT_LEN {
+                response.truncate(MAX_INPUT_LEN);
             }
             let response = response.trim();
             let answer = if response.is_empty() {
@@ -1649,47 +1661,76 @@ impl ToolExecutor {
             let answer = if enable_raw_mode().is_ok() {
                 let _guard = RawModeGuard;
                 let mut input = String::new();
+                let mut consecutive_errors = 0u8;
                 loop {
-                    if let Ok(Event::Key(KeyEvent { code, .. })) = event::read() {
-                        match code {
-                            KeyCode::Char(c) if c.is_ascii_digit() && input.is_empty() => {
-                                let idx = c.to_digit(10).unwrap() as usize;
-                                if idx >= 1 && idx <= choices.len() {
-                                    drop(_guard);
-                                    eprintln!("{}", c);
-                                    break choices[idx - 1].to_string();
-                                }
-                                input.push(c);
-                                eprint!("{}", c);
-                            }
-                            KeyCode::Char(c) => {
-                                input.push(c);
-                                eprint!("{}", c);
-                            }
-                            KeyCode::Backspace if !input.is_empty() => {
-                                input.pop();
-                                eprint!("\x08 \x08");
-                            }
-                            KeyCode::Enter => {
-                                drop(_guard);
-                                eprintln!();
-                                let trimmed = input.trim();
-                                if trimmed.is_empty() {
-                                    break default.unwrap_or(choices[0]).to_string();
-                                }
-                                if let Ok(idx) = trimmed.parse::<usize>() {
-                                    if idx >= 1 && idx <= choices.len() {
-                                        break choices[idx - 1].to_string();
+                    // Use poll with timeout to avoid infinite spin on persistent errors
+                    match event::poll(Duration::from_millis(100)) {
+                        Ok(true) => {
+                            match event::read() {
+                                Ok(Event::Key(KeyEvent { code, .. })) => {
+                                    consecutive_errors = 0;
+                                    match code {
+                                        KeyCode::Char(c) if c.is_ascii_digit() && input.is_empty() => {
+                                            let idx = c.to_digit(10).unwrap() as usize;
+                                            if idx >= 1 && idx <= choices.len() {
+                                                drop(_guard);
+                                                eprintln!("{}", c);
+                                                break choices[idx - 1].to_string();
+                                            }
+                                            input.push(c);
+                                            eprint!("{}", c);
+                                        }
+                                        KeyCode::Char(c) => {
+                                            if input.len() < MAX_INPUT_LEN {
+                                                input.push(c);
+                                                eprint!("{}", c);
+                                            }
+                                        }
+                                        KeyCode::Backspace if !input.is_empty() => {
+                                            input.pop();
+                                            eprint!("\x08 \x08");
+                                        }
+                                        KeyCode::Enter => {
+                                            drop(_guard);
+                                            eprintln!();
+                                            let trimmed = input.trim();
+                                            if trimmed.is_empty() {
+                                                break default.unwrap_or(choices[0]).to_string();
+                                            }
+                                            if let Ok(idx) = trimmed.parse::<usize>() {
+                                                if idx >= 1 && idx <= choices.len() {
+                                                    break choices[idx - 1].to_string();
+                                                }
+                                            }
+                                            break trimmed.to_string();
+                                        }
+                                        KeyCode::Esc => {
+                                            drop(_guard);
+                                            eprintln!();
+                                            break "[cancelled]".to_string();
+                                        }
+                                        _ => {}
                                     }
                                 }
-                                break trimmed.to_string();
+                                Ok(_) => {} // Ignore non-key events
+                                Err(_) => {
+                                    consecutive_errors += 1;
+                                    if consecutive_errors >= 5 {
+                                        drop(_guard);
+                                        eprintln!();
+                                        break "[error: terminal read failed]".to_string();
+                                    }
+                                }
                             }
-                            KeyCode::Esc => {
+                        }
+                        Ok(false) => continue, // Timeout, poll again
+                        Err(_) => {
+                            consecutive_errors += 1;
+                            if consecutive_errors >= 5 {
                                 drop(_guard);
                                 eprintln!();
-                                break "[cancelled]".to_string();
+                                break "[error: terminal unavailable]".to_string();
                             }
-                            _ => {}
                         }
                     }
                     let _ = io::stderr().flush();
@@ -1699,6 +1740,9 @@ impl ToolExecutor {
                 let mut response = String::new();
                 if io::stdin().read_line(&mut response).is_err() {
                     return "Error: failed to read user input".to_string();
+                }
+                if response.len() > MAX_INPUT_LEN {
+                    response.truncate(MAX_INPUT_LEN);
                 }
                 let trimmed = response.trim();
                 if trimmed.is_empty() {
