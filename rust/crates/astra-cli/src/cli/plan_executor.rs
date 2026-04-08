@@ -1546,4 +1546,80 @@ mod tests {
             "fresh context should have no retry counts"
         );
     }
+
+    #[tokio::test]
+    async fn concurrent_update_send_and_recv() {
+        // Verify that multiple concurrent senders don't lose messages
+        let (handle, update_tx, _cmd_rx) = create_plan_channels();
+        let num_messages = 100;
+
+        let mut tasks = Vec::new();
+        for i in 0..num_messages {
+            let tx = update_tx.clone();
+            tasks.push(tokio::spawn(async move {
+                tx.send(PlanUpdate::SubtaskStarted {
+                    id: format!("s{i}"),
+                    title: format!("task-{i}"),
+                    index: i,
+                    total: num_messages,
+                })
+                .unwrap();
+            }));
+        }
+        drop(update_tx); // drop original sender
+
+        for task in tasks {
+            task.await.unwrap();
+        }
+
+        // All messages should be receivable
+        let mut received = 0;
+        let mut handle = handle;
+        while handle.try_recv().is_some() {
+            received += 1;
+        }
+        assert_eq!(
+            received, num_messages,
+            "all {num_messages} updates should arrive"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_command_is_immediate() {
+        // Verify that Cancel is immediately available on the receiver
+        let (handle, _update_tx, mut cmd_rx) = create_plan_channels();
+        handle.send_command(PlanCommand::Cancel).unwrap();
+
+        // Should be available without any async wait
+        let cmd = cmd_rx.try_recv().unwrap();
+        assert!(matches!(cmd, PlanCommand::Cancel));
+    }
+
+    #[tokio::test]
+    async fn multiple_plan_channels_are_isolated() {
+        // Two independent plan executions should not interfere
+        let (handle1, tx1, mut rx1) = create_plan_channels();
+        let (handle2, tx2, mut rx2) = create_plan_channels();
+
+        handle1.send_command(PlanCommand::Pause).unwrap();
+        tx2.send(PlanUpdate::PlanError {
+            error: "test error".into(),
+        })
+        .unwrap();
+
+        // Channel 1 command should only appear on rx1
+        let cmd = rx1.try_recv().unwrap();
+        assert!(matches!(cmd, PlanCommand::Pause));
+        assert!(rx2.try_recv().is_err(), "rx2 should have no commands");
+
+        // Channel 2 update should only appear on handle2
+        let mut handle2 = handle2;
+        let update = handle2.try_recv().unwrap();
+        assert!(matches!(update, PlanUpdate::PlanError { .. }));
+        let mut handle1 = handle1;
+        assert!(handle1.try_recv().is_none(), "handle1 should have no updates");
+
+        drop(tx1);
+        drop(tx2);
+    }
 }
