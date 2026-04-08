@@ -4884,7 +4884,7 @@ async fn handle_slash_command(
         }
 
         "/team" => {
-            slash_team::handle_team_command(arg, state);
+            slash_team::handle_team_command(arg, state).await;
         }
 
         "/register" | "/login" | "/logout" | "/memory-setup" => {
