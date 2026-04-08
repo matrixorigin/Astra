@@ -32,7 +32,6 @@ use super::run_engine::RunEngine;
 // ─── Sub-run Executor Trait ─────────────────────────────────────────────────
 
 /// Configuration for a sub-run spawned by delegation.
-#[derive(Clone)]
 pub struct SubRunConfig {
     /// Unique ID for this sub-run.
     pub run_id: String,
@@ -53,6 +52,8 @@ pub struct SubRunConfig {
     pub pause_flag: Option<Arc<AtomicBool>>,
     /// Mid-execution checkpoint gate — abort early if contract criteria are violated.
     pub checkpoint_gate: Option<Arc<dyn CheckpointGate>>,
+    /// Optional mailbox for inter-agent messaging during the sub-run.
+    pub mailbox: Option<crate::messaging::router::AgentMailbox>,
 }
 
 impl std::fmt::Debug for SubRunConfig {
@@ -66,6 +67,7 @@ impl std::fmt::Debug for SubRunConfig {
             .field("previous_output", &self.previous_output)
             .field("pause_flag", &self.pause_flag.is_some())
             .field("checkpoint_gate", &self.checkpoint_gate.is_some())
+            .field("mailbox", &self.mailbox.is_some())
             .finish()
     }
 }
@@ -758,6 +760,7 @@ impl DelegationEngine {
                 context: request.context.clone(),
                 pause_flag: Some(pause_flag),
                 checkpoint_gate: None,
+                mailbox: None,
             });
         }
         drop(reg);
@@ -844,6 +847,7 @@ impl DelegationEngine {
                             context: HashMap::new(),
                             pause_flag: None,
                             checkpoint_gate: None,
+                            mailbox: None,
                         }
                     })
                     .await;
@@ -930,6 +934,7 @@ impl DelegationEngine {
                 context: request.context.clone(),
                 pause_flag: Some(pause_flag),
                 checkpoint_gate: None,
+                mailbox: None,
             };
 
             let result = match self.executor.execute(config).await {
@@ -988,6 +993,7 @@ impl DelegationEngine {
                     context: ctx.clone(),
                     pause_flag: None,
                     checkpoint_gate: None,
+                    mailbox: None,
                 })
                 .await
             } else {
@@ -1092,6 +1098,7 @@ impl DelegationEngine {
                 context: request.context.clone(),
                 pause_flag: Some(prod_pause.clone()),
                 checkpoint_gate: None,
+                mailbox: None,
             };
             let prod_result = match self.executor.execute(prod_config).await {
                 Ok(r) => {
@@ -1143,6 +1150,7 @@ impl DelegationEngine {
                     context: ctx.clone(),
                     pause_flag: None,
                     checkpoint_gate: None,
+                    mailbox: None,
                 })
                 .await
             } else {
@@ -1202,6 +1210,7 @@ impl DelegationEngine {
                 context: request.context.clone(),
                 pause_flag: Some(rev_pause),
                 checkpoint_gate: None,
+                mailbox: None,
             };
             let rev_result = match self.executor.execute(rev_config).await {
                 Ok(r) => {
@@ -1345,6 +1354,7 @@ impl DelegationEngine {
                 context: fork_context,
                 pause_flag: Some(pause_flag),
                 checkpoint_gate: None,
+                mailbox: None,
             };
 
             let executor = self.executor.clone();
@@ -2126,6 +2136,7 @@ mod tests {
             context: HashMap::new(),
             pause_flag: None,
             checkpoint_gate: None,
+            mailbox: None,
         };
 
         let result = executor.execute(config).await.unwrap();

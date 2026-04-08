@@ -335,6 +335,7 @@ mod tests {
             skill_listing_message: None,
             invoked_skills: std::collections::HashMap::new(),
             recent_file_reads: Vec::new(),
+            mailbox: None,
         }
     }
 
