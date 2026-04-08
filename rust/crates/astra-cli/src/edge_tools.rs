@@ -20,45 +20,69 @@ use std::{
 // multi-threaded programs under Rust 2024 edition), the env tool writes to
 // this overlay. Reads merge overlay values with the real environment.
 // Child processes receive overlay values via `Command::envs()`.
+//
+// **Visibility caveat**: overlay values are visible to `env_overlay_get`,
+// `env_overlay_all`, and child processes (via `apply_env_overlay`), but
+// NOT to `std::env::var` calls elsewhere in the current process. Code
+// outside this module that reads env vars directly will see the real
+// environment, not the overlay. This is intentional — mutating the real
+// process env is unsound under Rust 2024 edition.
 static ENV_OVERLAY: RwLock<Option<HashMap<String, Option<String>>>> = RwLock::new(None);
+
+/// Acquire the overlay read lock, logging a warning on poison recovery.
+fn overlay_read() -> std::sync::RwLockReadGuard<'static, Option<HashMap<String, Option<String>>>> {
+    ENV_OVERLAY.read().unwrap_or_else(|p| {
+        astra_core::agent_warn!("edge_tools", "ENV_OVERLAY read lock poisoned, recovering");
+        p.into_inner()
+    })
+}
+
+/// Acquire the overlay write lock, logging a warning on poison recovery.
+fn overlay_write() -> std::sync::RwLockWriteGuard<'static, Option<HashMap<String, Option<String>>>> {
+    ENV_OVERLAY.write().unwrap_or_else(|p| {
+        astra_core::agent_warn!("edge_tools", "ENV_OVERLAY write lock poisoned, recovering");
+        p.into_inner()
+    })
+}
 
 /// Read an env var, checking the overlay first then falling back to real env.
 fn env_overlay_get(name: &str) -> Option<String> {
-    if let Ok(guard) = ENV_OVERLAY.read() {
-        if let Some(ref map) = *guard {
-            if let Some(entry) = map.get(name) {
-                return entry.clone(); // Some(val) = set, None = removed
-            }
+    let guard = overlay_read();
+    if let Some(ref map) = *guard {
+        if let Some(entry) = map.get(name) {
+            return entry.clone(); // Some(val) = set, None = removed
         }
     }
+    drop(guard);
     std::env::var(name).ok()
 }
 
 /// Set an env var in the overlay (does NOT touch the real process env).
 fn env_overlay_set(name: &str, value: &str) {
-    let mut guard = ENV_OVERLAY.write().unwrap_or_else(|p| p.into_inner());
-    guard.get_or_insert_with(HashMap::new).insert(name.to_string(), Some(value.to_string()));
+    overlay_write().get_or_insert_with(HashMap::new).insert(name.to_string(), Some(value.to_string()));
 }
 
 /// Remove an env var in the overlay (marks it as deleted without touching real env).
 fn env_overlay_remove(name: &str) {
-    let mut guard = ENV_OVERLAY.write().unwrap_or_else(|p| p.into_inner());
-    guard.get_or_insert_with(HashMap::new).insert(name.to_string(), None);
+    overlay_write().get_or_insert_with(HashMap::new).insert(name.to_string(), None);
 }
 
 /// Collect all env vars: real env merged with overlay (overlay wins).
+///
+/// Acquires the read lock first, then snapshots both sources under the lock
+/// to avoid TOCTOU inconsistency between `std::env::vars()` and the overlay.
 fn env_overlay_all() -> Vec<(String, String)> {
+    let guard = overlay_read();
     let mut result: HashMap<String, String> = std::env::vars().collect();
-    if let Ok(guard) = ENV_OVERLAY.read() {
-        if let Some(ref map) = *guard {
-            for (k, v) in map {
-                match v {
-                    Some(val) => { result.insert(k.clone(), val.clone()); }
-                    None => { result.remove(k); }
-                }
+    if let Some(ref map) = *guard {
+        for (k, v) in map {
+            match v {
+                Some(val) => { result.insert(k.clone(), val.clone()); }
+                None => { result.remove(k); }
             }
         }
     }
+    drop(guard);
     let mut pairs: Vec<_> = result.into_iter().collect();
     pairs.sort_by(|a, b| a.0.cmp(&b.0));
     pairs
@@ -66,13 +90,12 @@ fn env_overlay_all() -> Vec<(String, String)> {
 
 /// Apply overlay env vars to a `Command` so child processes inherit them.
 pub fn apply_env_overlay(cmd: &mut Command) {
-    if let Ok(guard) = ENV_OVERLAY.read() {
-        if let Some(ref map) = *guard {
-            for (k, v) in map {
-                match v {
-                    Some(val) => { cmd.env(k, val); }
-                    None => { cmd.env_remove(k); }
-                }
+    let guard = overlay_read();
+    if let Some(ref map) = *guard {
+        for (k, v) in map {
+            match v {
+                Some(val) => { cmd.env(k, val); }
+                None => { cmd.env_remove(k); }
             }
         }
     }
