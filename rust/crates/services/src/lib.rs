@@ -15,6 +15,7 @@ pub mod events;
 pub mod introspection;
 pub mod jobs;
 pub mod learning;
+pub mod learning_merge;
 pub mod marketplace;
 pub mod marketplace_stats;
 pub mod models;
@@ -39,6 +40,7 @@ pub mod storage;
 pub mod streaming;
 pub mod sync_engine;
 pub mod task_orchestrator;
+pub mod team_persistence;
 pub mod triggers;
 pub mod workflows;
 

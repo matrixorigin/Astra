@@ -103,12 +103,22 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
             &self.project_root,
         );
 
+        // T-9: Worktree CWD injection — when team isolation provides a per-agent
+        // worktree path via context, use it as the working directory instead of
+        // the shared project root. This enables file-system isolation between agents.
+        let effective_root = config
+            .context
+            .get(&format!("worktree_path_{}", profile.agent_id))
+            .and_then(|v| v.as_str())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| self.project_root.clone());
+
         let mut host = SubRunHost {
             api: self.api.clone(),
             token: self.token.clone(),
             model: effective_model,
-            project_root: self.project_root.clone(),
-            executor: edge_tools::ToolExecutor::new(&self.project_root)
+            project_root: effective_root.clone(),
+            executor: edge_tools::ToolExecutor::new(&effective_root)
                 .with_cloud(self.api.api_origin(), &self.token),
             all_schemas,
             valid_tool_names: valid_tool_names.clone(),
