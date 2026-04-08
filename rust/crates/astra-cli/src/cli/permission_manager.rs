@@ -164,9 +164,8 @@ impl PermissionSettings {
 
     /// Save to the user-level settings file (`~/.astra/permissions.json`).
     pub fn save_user(&self) -> io::Result<()> {
-        let home = dirs::home_dir().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::NotFound, "HOME directory not found")
-        })?;
+        let home = dirs::home_dir()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "HOME directory not found"))?;
         let dir = home.join(".astra");
         fs::create_dir_all(&dir)?;
         let path = dir.join("permissions.json");
@@ -356,14 +355,20 @@ impl PermissionManager {
     fn check_deny_rules(&self, name: &str, args: &serde_json::Value) -> bool {
         let cmd = command_hint_from_args(args);
         self.cached_deny.iter().any(|rule| rule.matches(name, cmd))
-            || self.cached_user_deny.iter().any(|rule| rule.matches(name, cmd))
+            || self
+                .cached_user_deny
+                .iter()
+                .any(|rule| rule.matches(name, cmd))
     }
 
     /// Check persistent allow rules: project-level first, then user-level.
     fn check_allow_rules(&self, name: &str, args: &serde_json::Value) -> bool {
         let cmd = command_hint_from_args(args);
         self.cached_allow.iter().any(|rule| rule.matches(name, cmd))
-            || self.cached_user_allow.iter().any(|rule| rule.matches(name, cmd))
+            || self
+                .cached_user_allow
+                .iter()
+                .any(|rule| rule.matches(name, cmd))
     }
 
     /// Check if a file path targets a dangerous location.
@@ -548,11 +553,7 @@ impl PermissionManager {
             let mut response = String::new();
             let _ = io::stdin().read_line(&mut response);
             let ch = response.trim().to_lowercase().chars().next().unwrap_or('n');
-            if response.trim() == "!" {
-                '!'
-            } else {
-                ch
-            }
+            if response.trim() == "!" { '!' } else { ch }
         }
     }
 
@@ -1655,7 +1656,10 @@ mod tests {
         assert!(summary.contains("prompt"), "should show mode");
         assert!(summary.contains("cargo"), "should show allow rule");
         assert!(summary.contains("rm"), "should show deny rule");
-        assert!(summary.contains("edit_file"), "should show session override");
+        assert!(
+            summary.contains("edit_file"),
+            "should show session override"
+        );
     }
 
     #[test]

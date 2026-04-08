@@ -48,14 +48,10 @@ pub enum PlanPhase {
     },
 
     /// Plan generated, user is interactively refining it (`plan>` prompt).
-    Refining {
-        state: PlanModeState,
-    },
+    Refining { state: PlanModeState },
 
     /// Plan execution in progress (foreground or background).
-    Executing {
-        state: PlanExecutionState,
-    },
+    Executing { state: PlanExecutionState },
 
     /// Execution paused — waiting for user input, approval, or error recovery.
     Paused {
@@ -64,9 +60,7 @@ pub enum PlanPhase {
     },
 
     /// All subtasks completed successfully.
-    Completed {
-        summary: PlanExecutionSummary,
-    },
+    Completed { summary: PlanExecutionSummary },
 
     /// Execution failed with unrecoverable error.
     Failed {
@@ -186,9 +180,7 @@ impl PlanPhase {
     /// Get the executing plan goal.
     pub fn executing_goal(&self) -> Option<&str> {
         match self {
-            Self::Executing { state } | Self::Paused { state, .. } => {
-                state.goal.as_deref()
-            }
+            Self::Executing { state } | Self::Paused { state, .. } => state.goal.as_deref(),
             _ => None,
         }
     }
@@ -290,10 +282,8 @@ impl PlanPhase {
 
             // Paused → Refining (replan — preserves existing plan and timeline)
             (Paused { state, .. }, Replan) => {
-                let mut plan_state = PlanModeState::new(
-                    state.goal.unwrap_or_default(),
-                    ProjectContext::default(),
-                );
+                let mut plan_state =
+                    PlanModeState::new(state.goal.unwrap_or_default(), ProjectContext::default());
                 plan_state.plan = state.plan;
                 plan_state.timeline = state.timeline;
                 Ok(Refining { state: plan_state })
@@ -433,10 +423,7 @@ impl PlanAction {
 /// Error when a plan phase transition is invalid.
 #[derive(Debug, Clone)]
 pub enum PlanTransitionError {
-    Invalid {
-        from_phase: String,
-        action: String,
-    },
+    Invalid { from_phase: String, action: String },
 
     ValidationFailed { reason: String },
 }
@@ -445,7 +432,10 @@ impl std::fmt::Display for PlanTransitionError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Invalid { from_phase, action } => {
-                write!(f, "invalid plan transition: cannot {action} from {from_phase}")
+                write!(
+                    f,
+                    "invalid plan transition: cannot {action} from {from_phase}"
+                )
             }
             Self::ValidationFailed { reason } => {
                 write!(f, "plan validation failed: {reason}")
@@ -465,19 +455,11 @@ pub enum PauseReason {
     /// User pressed Ctrl+C or typed a pause command.
     UserRequest,
     /// Waiting for user approval of a tool call.
-    ApprovalNeeded {
-        tool: String,
-        request_id: String,
-    },
+    ApprovalNeeded { tool: String, request_id: String },
     /// Subtask failed and requires manual intervention.
-    SubtaskFailed {
-        subtask_id: String,
-        error: String,
-    },
+    SubtaskFailed { subtask_id: String, error: String },
     /// Step-by-step mode: waiting for user to confirm next subtask.
-    StepByStep {
-        next_subtask_id: String,
-    },
+    StepByStep { next_subtask_id: String },
 }
 
 impl fmt::Display for PauseReason {
@@ -513,8 +495,14 @@ impl fmt::Display for PlanError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::LlmFailure { message } => write!(f, "LLM failure: {message}"),
-            Self::RetriesExhausted { subtask_id, attempts } => {
-                write!(f, "all retries exhausted for subtask {subtask_id} ({attempts} attempts)")
+            Self::RetriesExhausted {
+                subtask_id,
+                attempts,
+            } => {
+                write!(
+                    f,
+                    "all retries exhausted for subtask {subtask_id} ({attempts} attempts)"
+                )
             }
             Self::DependencyDeadlock { blocked_ids } => {
                 write!(f, "dependency deadlock: {blocked_ids:?}")
@@ -594,7 +582,9 @@ impl PlanCommand {
             lower.as_str(),
             "execute" | "go" | "start" | "done" | "run" | "开始" | "执行" | "运行"
         ) {
-            return Some(PlanCommand::Execute { step_by_step: false });
+            return Some(PlanCommand::Execute {
+                step_by_step: false,
+            });
         }
 
         // Step-by-step execute
@@ -606,10 +596,7 @@ impl PlanCommand {
         }
 
         // Resume commands
-        if matches!(
-            lower.as_str(),
-            "continue" | "resume" | "继续" | "next"
-        ) {
+        if matches!(lower.as_str(), "continue" | "resume" | "继续" | "next") {
             return Some(PlanCommand::Resume);
         }
 
@@ -702,7 +689,13 @@ impl PlanCommand {
         }
 
         // Rewind
-        for prefix in ["rewind ", "restart from ", "redo from ", "restart ", "redo "] {
+        for prefix in [
+            "rewind ",
+            "restart from ",
+            "redo from ",
+            "restart ",
+            "redo ",
+        ] {
             if let Some(rest) = strip_prefix_ci_local(trimmed, prefix) {
                 if !rest.is_empty() {
                     return Some(PlanCommand::Rewind {
@@ -1007,9 +1000,7 @@ mod tests {
             last_turn_interrupted: false,
             metrics: metrics::PlanMetrics::default(),
         };
-        let phase = PlanPhase::Executing {
-            state: exec_state,
-        };
+        let phase = PlanPhase::Executing { state: exec_state };
 
         let paused = phase
             .transition(PlanAction::Pause {
@@ -1026,11 +1017,15 @@ mod tests {
     fn plan_command_parse_execute() {
         assert_eq!(
             PlanCommand::parse("go"),
-            Some(PlanCommand::Execute { step_by_step: false })
+            Some(PlanCommand::Execute {
+                step_by_step: false
+            })
         );
         assert_eq!(
             PlanCommand::parse("执行"),
-            Some(PlanCommand::Execute { step_by_step: false })
+            Some(PlanCommand::Execute {
+                step_by_step: false
+            })
         );
         assert_eq!(
             PlanCommand::parse("step"),
@@ -1208,13 +1203,23 @@ mod tests {
         };
         let next = phase
             .transition(PlanAction::Fail {
-                error: PlanError::LlmFailure { message: "timeout after 30s".into() },
+                error: PlanError::LlmFailure {
+                    message: "timeout after 30s".into(),
+                },
             })
             .unwrap();
         match next {
-            PlanPhase::Failed { ref error, ref partial } => {
-                assert!(matches!(error, PlanError::LlmFailure { message } if message.contains("timeout")));
-                assert!(partial.is_some(), "Planning->Failed should produce a partial summary");
+            PlanPhase::Failed {
+                ref error,
+                ref partial,
+            } => {
+                assert!(
+                    matches!(error, PlanError::LlmFailure { message } if message.contains("timeout"))
+                );
+                assert!(
+                    partial.is_some(),
+                    "Planning->Failed should produce a partial summary"
+                );
                 let summary = partial.as_ref().unwrap();
                 assert_eq!(summary.goal, "build auth system");
             }
@@ -1224,17 +1229,23 @@ mod tests {
 
     #[test]
     fn executing_to_completed() {
-        let phase = PlanPhase::Executing { state: make_exec_state() };
+        let phase = PlanPhase::Executing {
+            state: make_exec_state(),
+        };
         let next = phase.transition(PlanAction::Complete).unwrap();
         assert!(matches!(next, PlanPhase::Completed { .. }));
     }
 
     #[test]
     fn executing_to_failed() {
-        let phase = PlanPhase::Executing { state: make_exec_state() };
+        let phase = PlanPhase::Executing {
+            state: make_exec_state(),
+        };
         let next = phase
             .transition(PlanAction::Fail {
-                error: PlanError::Other { message: "boom".into() },
+                error: PlanError::Other {
+                    message: "boom".into(),
+                },
             })
             .unwrap();
         assert!(matches!(next, PlanPhase::Failed { .. }));
@@ -1243,14 +1254,17 @@ mod tests {
     #[test]
     fn paused_to_refining_on_replan_preserves_plan_and_timeline() {
         let mut exec = make_exec_state();
-        exec.plan.subtasks.push(astra_services::task_orchestrator::SubtaskPlan {
-            id: "sub-1".into(),
-            title: "Existing subtask".into(),
-            description: Some("Already in progress".into()),
-            status: TaskStatus::InProgress,
-            ..Default::default()
-        });
-        exec.timeline.record(crate::plan::TimelineEventKind::PlanCreated { subtask_count: 1 });
+        exec.plan
+            .subtasks
+            .push(astra_services::task_orchestrator::SubtaskPlan {
+                id: "sub-1".into(),
+                title: "Existing subtask".into(),
+                description: Some("Already in progress".into()),
+                status: TaskStatus::InProgress,
+                ..Default::default()
+            });
+        exec.timeline
+            .record(crate::plan::TimelineEventKind::PlanCreated { subtask_count: 1 });
 
         let original_subtask_count = exec.plan.subtasks.len();
         let original_timeline_len = exec.timeline.events.len();
@@ -1292,11 +1306,7 @@ mod tests {
     #[test]
     fn completed_to_idle_on_dismiss() {
         let phase = PlanPhase::Completed {
-            summary: PlanExecutionSummary::from_plan(
-                &TaskPlan::default(),
-                "test",
-                1,
-            ),
+            summary: PlanExecutionSummary::from_plan(&TaskPlan::default(), "test", 1),
         };
         let next = phase.transition(PlanAction::Dismiss).unwrap();
         assert!(next.is_idle());
@@ -1305,7 +1315,9 @@ mod tests {
     #[test]
     fn failed_to_idle_on_dismiss() {
         let phase = PlanPhase::Failed {
-            error: PlanError::Other { message: "err".into() },
+            error: PlanError::Other {
+                message: "err".into(),
+            },
             partial: None,
         };
         let next = phase.transition(PlanAction::Dismiss).unwrap();
@@ -1315,13 +1327,13 @@ mod tests {
     #[test]
     fn failed_to_refining_on_retry() {
         let phase = PlanPhase::Failed {
-            error: PlanError::Other { message: "err".into() },
+            error: PlanError::Other {
+                message: "err".into(),
+            },
             partial: None,
         };
         let state = PlanModeState::new("retry".into(), ProjectContext::default());
-        let next = phase
-            .transition(PlanAction::RetryPlan { state })
-            .unwrap();
+        let next = phase.transition(PlanAction::RetryPlan { state }).unwrap();
         assert!(next.is_refining());
     }
 

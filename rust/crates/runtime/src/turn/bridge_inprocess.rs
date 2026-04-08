@@ -2669,7 +2669,10 @@ mod tests {
             json!({"function": {"name": "bash"}}),
             json!({"function": {"name": "read_file"}}),
         ];
-        annotate_tool_schemas_for_caching(&mut tools, &PromptCacheConfig::latch("anthropic", "claude-sonnet-4-20250514"));
+        annotate_tool_schemas_for_caching(
+            &mut tools,
+            &PromptCacheConfig::latch("anthropic", "claude-sonnet-4-20250514"),
+        );
 
         // Only last tool should have cache_control
         assert!(
@@ -2706,7 +2709,10 @@ mod tests {
             json!({"role": "user", "content": "hello"}),
             json!({"role": "assistant", "content": "hi there"}),
         ];
-        add_message_cache_breakpoint(&mut messages, &PromptCacheConfig::latch("anthropic", "claude-sonnet-4-20250514"));
+        add_message_cache_breakpoint(
+            &mut messages,
+            &PromptCacheConfig::latch("anthropic", "claude-sonnet-4-20250514"),
+        );
 
         // System message should be untouched
         assert!(messages[0]["content"].is_string(), "system msg unchanged");
@@ -2743,50 +2749,83 @@ mod tests {
     #[test]
     fn prompt_cache_config_latch_anthropic() {
         let _lock = CACHE_ENV_MUTEX.lock().unwrap();
-        unsafe { std::env::remove_var("MO_PROMPT_CACHE_DISABLED"); }
+        unsafe {
+            std::env::remove_var("MO_PROMPT_CACHE_DISABLED");
+        }
 
         let cfg = PromptCacheConfig::latch("anthropic", "claude-sonnet-4-20250514");
         assert!(cfg.cache_enabled, "cache should be enabled by default");
-        assert!(cfg.is_anthropic, "anthropic provider should set is_anthropic");
-        assert!(cfg.should_annotate(), "anthropic with cache enabled should annotate");
+        assert!(
+            cfg.is_anthropic,
+            "anthropic provider should set is_anthropic"
+        );
+        assert!(
+            cfg.should_annotate(),
+            "anthropic with cache enabled should annotate"
+        );
     }
 
     #[test]
     fn prompt_cache_config_latch_openai() {
         let _lock = CACHE_ENV_MUTEX.lock().unwrap();
-        unsafe { std::env::remove_var("MO_PROMPT_CACHE_DISABLED"); }
+        unsafe {
+            std::env::remove_var("MO_PROMPT_CACHE_DISABLED");
+        }
 
         let cfg = PromptCacheConfig::latch("openai", "gpt-4");
         assert!(!cfg.is_anthropic, "openai should not be anthropic");
-        assert!(!cfg.should_annotate(), "non-anthropic should not annotate even if cache enabled");
+        assert!(
+            !cfg.should_annotate(),
+            "non-anthropic should not annotate even if cache enabled"
+        );
     }
 
     #[test]
     fn prompt_cache_config_latch_unknown_provider() {
         let _lock = CACHE_ENV_MUTEX.lock().unwrap();
-        unsafe { std::env::remove_var("MO_PROMPT_CACHE_DISABLED"); }
+        unsafe {
+            std::env::remove_var("MO_PROMPT_CACHE_DISABLED");
+        }
 
         let cfg = PromptCacheConfig::latch("my-custom-provider", "my-model");
-        assert!(!cfg.is_anthropic, "unknown provider should not be anthropic");
-        assert!(!cfg.should_annotate(), "unknown provider should not annotate");
+        assert!(
+            !cfg.is_anthropic,
+            "unknown provider should not be anthropic"
+        );
+        assert!(
+            !cfg.should_annotate(),
+            "unknown provider should not annotate"
+        );
     }
 
     #[test]
     fn prompt_cache_config_env_disabled() {
         let _lock = CACHE_ENV_MUTEX.lock().unwrap();
-        unsafe { std::env::set_var("MO_PROMPT_CACHE_DISABLED", "1"); }
+        unsafe {
+            std::env::set_var("MO_PROMPT_CACHE_DISABLED", "1");
+        }
 
         let cfg = PromptCacheConfig::latch("anthropic", "claude-sonnet-4-20250514");
-        assert!(!cfg.cache_enabled, "cache should be disabled when env var is set");
-        assert!(!cfg.should_annotate(), "should not annotate when cache disabled");
+        assert!(
+            !cfg.cache_enabled,
+            "cache should be disabled when env var is set"
+        );
+        assert!(
+            !cfg.should_annotate(),
+            "should not annotate when cache disabled"
+        );
 
-        unsafe { std::env::remove_var("MO_PROMPT_CACHE_DISABLED"); }
+        unsafe {
+            std::env::remove_var("MO_PROMPT_CACHE_DISABLED");
+        }
     }
 
     #[test]
     fn prompt_cache_config_latch_idempotent() {
         let _lock = CACHE_ENV_MUTEX.lock().unwrap();
-        unsafe { std::env::remove_var("MO_PROMPT_CACHE_DISABLED"); }
+        unsafe {
+            std::env::remove_var("MO_PROMPT_CACHE_DISABLED");
+        }
 
         let a = PromptCacheConfig::latch("anthropic", "claude-sonnet-4-20250514");
         let b = PromptCacheConfig::latch("anthropic", "claude-sonnet-4-20250514");
@@ -2796,7 +2835,10 @@ mod tests {
 
     #[test]
     fn annotate_tool_schemas_noop_when_cache_disabled() {
-        let cfg = PromptCacheConfig { cache_enabled: false, is_anthropic: true };
+        let cfg = PromptCacheConfig {
+            cache_enabled: false,
+            is_anthropic: true,
+        };
         let mut tools = vec![
             json!({"function": {"name": "bash"}}),
             json!({"function": {"name": "read_file"}}),
@@ -2813,7 +2855,10 @@ mod tests {
 
     #[test]
     fn add_message_breakpoint_noop_when_not_anthropic() {
-        let cfg = PromptCacheConfig { cache_enabled: true, is_anthropic: false };
+        let cfg = PromptCacheConfig {
+            cache_enabled: true,
+            is_anthropic: false,
+        };
         let mut messages = vec![
             json!({"role": "system", "content": "sys"}),
             json!({"role": "user", "content": "hello"}),
@@ -3023,7 +3068,10 @@ mod tests {
             json!({"function": {"name": "bash"}}),
             json!({"function": {"name": "read_file"}}),
         ];
-        annotate_tool_schemas_for_caching(&mut tools, &PromptCacheConfig::latch("anthropic", "claude-sonnet-4-20250514"));
+        annotate_tool_schemas_for_caching(
+            &mut tools,
+            &PromptCacheConfig::latch("anthropic", "claude-sonnet-4-20250514"),
+        );
         assert!(
             tools.last().unwrap().get("cache_control").is_some(),
             "Layer 2: last tool should have cache_control"
@@ -3034,7 +3082,10 @@ mod tests {
             json!({"role": "user", "content": "hello"}),
             json!({"role": "assistant", "content": "hi"}),
         ];
-        add_message_cache_breakpoint(&mut messages, &PromptCacheConfig::latch("anthropic", "claude-sonnet-4-20250514"));
+        add_message_cache_breakpoint(
+            &mut messages,
+            &PromptCacheConfig::latch("anthropic", "claude-sonnet-4-20250514"),
+        );
         let last = messages.last().unwrap();
         let last_arr = last["content"].as_array().expect("converted to array");
         assert!(
@@ -3068,7 +3119,10 @@ mod tests {
 
         // Layer 2: tool schemas
         let mut tools = vec![json!({"function": {"name": "bash"}})];
-        annotate_tool_schemas_for_caching(&mut tools, &PromptCacheConfig::latch("anthropic", "claude-sonnet-4-20250514"));
+        annotate_tool_schemas_for_caching(
+            &mut tools,
+            &PromptCacheConfig::latch("anthropic", "claude-sonnet-4-20250514"),
+        );
         assert!(
             tools[0].get("cache_control").is_none(),
             "tools should not have cache_control when disabled"
@@ -3076,7 +3130,10 @@ mod tests {
 
         // Layer 3: message breakpoint
         let mut messages = vec![json!({"role": "user", "content": "hello"})];
-        add_message_cache_breakpoint(&mut messages, &PromptCacheConfig::latch("anthropic", "claude-sonnet-4-20250514"));
+        add_message_cache_breakpoint(
+            &mut messages,
+            &PromptCacheConfig::latch("anthropic", "claude-sonnet-4-20250514"),
+        );
         assert!(
             messages[0]["content"].is_string(),
             "messages should not be modified when cache disabled"
@@ -3102,7 +3159,13 @@ mod tests {
         for i in 0..34 {
             let tool_name = format!("tool_{i}");
             let tools: Vec<&str> = vec![tool_name.as_str()];
-            let _msg = build_system_message(&tools, "", 0.8, None, &PromptCacheConfig::latch("openai", "gpt-4"));
+            let _msg = build_system_message(
+                &tools,
+                "",
+                0.8,
+                None,
+                &PromptCacheConfig::latch("openai", "gpt-4"),
+            );
         }
 
         let cache_size = section_cache().lock().unwrap().len();
@@ -3153,7 +3216,10 @@ mod tests {
         }
 
         let mut messages = vec![json!({"role": "system", "content": "sys prompt"})];
-        add_message_cache_breakpoint(&mut messages, &PromptCacheConfig::latch("anthropic", "claude-sonnet-4-20250514"));
+        add_message_cache_breakpoint(
+            &mut messages,
+            &PromptCacheConfig::latch("anthropic", "claude-sonnet-4-20250514"),
+        );
         // System message should not be modified
         assert!(
             messages[0]["content"].is_string(),
@@ -3165,7 +3231,10 @@ mod tests {
     fn message_breakpoint_empty_messages_noop() {
         let _lock = CACHE_ENV_MUTEX.lock().unwrap();
         let mut messages: Vec<Value> = vec![];
-        add_message_cache_breakpoint(&mut messages, &PromptCacheConfig::latch("anthropic", "claude-sonnet-4-20250514"));
+        add_message_cache_breakpoint(
+            &mut messages,
+            &PromptCacheConfig::latch("anthropic", "claude-sonnet-4-20250514"),
+        );
         assert!(messages.is_empty());
     }
 
@@ -3183,7 +3252,10 @@ mod tests {
                 {"type": "text", "text": "world"},
             ]
         })];
-        add_message_cache_breakpoint(&mut messages, &PromptCacheConfig::latch("anthropic", "claude-sonnet-4-20250514"));
+        add_message_cache_breakpoint(
+            &mut messages,
+            &PromptCacheConfig::latch("anthropic", "claude-sonnet-4-20250514"),
+        );
 
         let blocks = messages[0]["content"].as_array().unwrap();
         // First block should NOT have cache_control
@@ -3202,7 +3274,10 @@ mod tests {
     fn tool_schemas_empty_list_noop() {
         let _lock = CACHE_ENV_MUTEX.lock().unwrap();
         let mut tools: Vec<Value> = vec![];
-        annotate_tool_schemas_for_caching(&mut tools, &PromptCacheConfig::latch("anthropic", "claude-sonnet-4-20250514"));
+        annotate_tool_schemas_for_caching(
+            &mut tools,
+            &PromptCacheConfig::latch("anthropic", "claude-sonnet-4-20250514"),
+        );
         assert!(tools.is_empty());
     }
 
@@ -3592,7 +3667,13 @@ mod tests {
     fn openai_global_prefix_stable_across_tool_sets() {
         let _lock = CACHE_ENV_MUTEX.lock().unwrap();
 
-        let msg1 = build_system_message(&["bash"], "", 0.8, None, &PromptCacheConfig::latch("openai", "gpt-4o"));
+        let msg1 = build_system_message(
+            &["bash"],
+            "",
+            0.8,
+            None,
+            &PromptCacheConfig::latch("openai", "gpt-4o"),
+        );
         let msg2 = build_system_message(
             &["bash", "git_diff", "memory_store", "find_definition"],
             "",
@@ -3904,7 +3985,13 @@ mod tests {
         let mut usage = Map::new();
         let mut model = String::new();
         let result = apply_forward_llm_sse_event(
-            &event, &mut saw, &mut text, &mut reasoning, &mut tc, &mut usage, &mut model,
+            &event,
+            &mut saw,
+            &mut text,
+            &mut reasoning,
+            &mut tc,
+            &mut usage,
+            &mut model,
         );
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("missing type"));
@@ -3927,7 +4014,13 @@ mod tests {
         let mut usage = Map::new();
         let mut model = String::new();
         let result = apply_forward_llm_sse_event(
-            &event, &mut saw, &mut text, &mut reasoning, &mut tc, &mut usage, &mut model,
+            &event,
+            &mut saw,
+            &mut text,
+            &mut reasoning,
+            &mut tc,
+            &mut usage,
+            &mut model,
         )
         .unwrap();
         assert!(saw);
@@ -3949,7 +4042,13 @@ mod tests {
         let mut usage = Map::new();
         let mut model = "old".to_string();
         let _ = apply_forward_llm_sse_event(
-            &event, &mut saw, &mut text, &mut reasoning, &mut tc, &mut usage, &mut model,
+            &event,
+            &mut saw,
+            &mut text,
+            &mut reasoning,
+            &mut tc,
+            &mut usage,
+            &mut model,
         )
         .unwrap();
         assert!(saw);
@@ -3969,7 +4068,13 @@ mod tests {
         let mut usage = Map::new();
         let mut model = String::new();
         let result = apply_forward_llm_sse_event(
-            &event, &mut saw, &mut text, &mut reasoning, &mut tc, &mut usage, &mut model,
+            &event,
+            &mut saw,
+            &mut text,
+            &mut reasoning,
+            &mut tc,
+            &mut usage,
+            &mut model,
         )
         .unwrap();
         assert_eq!(result.len(), 1);
@@ -3987,7 +4092,13 @@ mod tests {
         let mut usage = Map::new();
         let mut model = String::new();
         let result = apply_forward_llm_sse_event(
-            &event, &mut saw, &mut text, &mut reasoning, &mut tc, &mut usage, &mut model,
+            &event,
+            &mut saw,
+            &mut text,
+            &mut reasoning,
+            &mut tc,
+            &mut usage,
+            &mut model,
         )
         .unwrap();
         assert_eq!(result.len(), 1);
@@ -4003,7 +4114,13 @@ mod tests {
         let mut usage = Map::new();
         let mut model = String::new();
         let result = apply_forward_llm_sse_event(
-            &event, &mut saw, &mut text, &mut reasoning, &mut tc, &mut usage, &mut model,
+            &event,
+            &mut saw,
+            &mut text,
+            &mut reasoning,
+            &mut tc,
+            &mut usage,
+            &mut model,
         )
         .unwrap();
         assert!(result.is_empty());
@@ -4019,7 +4136,13 @@ mod tests {
         let mut usage = Map::new();
         let mut model = String::new();
         let result = apply_forward_llm_sse_event(
-            &event, &mut saw, &mut text, &mut reasoning, &mut tc, &mut usage, &mut model,
+            &event,
+            &mut saw,
+            &mut text,
+            &mut reasoning,
+            &mut tc,
+            &mut usage,
+            &mut model,
         )
         .unwrap();
         assert_eq!(result.len(), 1);

@@ -261,7 +261,10 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
             sel_result.strategy,
             sel_result.confidence,
         );
-        record_first_selector_confidence(ctx.telem.first_selector_confidence, sel_result.confidence);
+        record_first_selector_confidence(
+            ctx.telem.first_selector_confidence,
+            sel_result.confidence,
+        );
         accumulate_selector_token_usage(
             ctx.telem.selector_tokens_in,
             ctx.telem.selector_tokens_out,

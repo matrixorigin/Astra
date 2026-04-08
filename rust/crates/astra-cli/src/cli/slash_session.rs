@@ -361,7 +361,8 @@ pub(super) fn handle_session_command(arg: &str, state: &mut ReplState) {
             eprintln!();
             eprintln!(
                 "  {}",
-                "Subcommands: /session history · errors · export · list · fork · cleanup · verify".dim()
+                "Subcommands: /session history · errors · export · list · fork · cleanup · verify"
+                    .dim()
             );
             eprintln!();
         }
@@ -950,8 +951,7 @@ pub(super) fn handle_session_command(arg: &str, state: &mut ReplState) {
             eprintln!("{}", format!("  Unknown subcommand: {other}").red());
             eprintln!(
                 "  {}",
-                "Usage: /session [history|list|errors|export|fork|cleanup|verify] …"
-                    .dim()
+                "Usage: /session [history|list|errors|export|fork|cleanup|verify] …".dim()
             );
         }
     }
@@ -1147,10 +1147,7 @@ fn handle_session_cleanup(arg: &str, state: &ReplState) {
                 i += 1;
             }
             other => {
-                eprintln!(
-                    "{}",
-                    format!("  ✗ Unknown flag: {other}").red()
-                );
+                eprintln!("{}", format!("  ✗ Unknown flag: {other}").red());
                 eprintln!(
                     "  {}",
                     "Usage: /session cleanup [--days N] [--force] [--compress]".dim()
@@ -1221,13 +1218,11 @@ fn handle_session_cleanup(arg: &str, state: &ReplState) {
     eprintln!();
 
     if !force {
-        eprint!(
-            "  Delete all {} sessions? [y/N] ",
-            stale.len()
-        );
+        eprint!("  Delete all {} sessions? [y/N] ", stale.len());
         let _ = std::io::stderr().flush();
         let mut input = String::new();
-        if std::io::stdin().read_line(&mut input).is_err() || !input.trim().eq_ignore_ascii_case("y")
+        if std::io::stdin().read_line(&mut input).is_err()
+            || !input.trim().eq_ignore_ascii_case("y")
         {
             eprintln!("  Cancelled.");
             return;
@@ -1282,10 +1277,7 @@ fn handle_compress(state: &ReplState, force: bool) {
     };
 
     if archivable.is_empty() {
-        eprintln!(
-            "  {} No completed sessions to compress.",
-            theme::icon_ok()
-        );
+        eprintln!("  {} No completed sessions to compress.", theme::icon_ok());
         return;
     }
 
@@ -1297,10 +1289,7 @@ fn handle_compress(state: &ReplState, force: bool) {
     );
 
     if !force {
-        eprint!(
-            "  Compress {} session journals? [y/N] ",
-            archivable.len()
-        );
+        eprint!("  Compress {} session journals? [y/N] ", archivable.len());
         let _ = std::io::stderr().flush();
         let mut input = String::new();
         if std::io::stdin().read_line(&mut input).is_err()
@@ -1323,7 +1312,11 @@ fn handle_compress(state: &ReplState, force: bool) {
             Err(e) => {
                 errors += 1;
                 let short = &sid[..sid.len().min(12)];
-                eprintln!("    {} {short}…: {}", theme::icon_err(), e.to_string().red());
+                eprintln!(
+                    "    {} {short}…: {}",
+                    theme::icon_err(),
+                    e.to_string().red()
+                );
             }
         }
     }
@@ -1401,7 +1394,11 @@ fn handle_session_verify(state: &ReplState) {
     };
 
     eprintln!("  {}", "Local journal".dim());
-    eprintln!("    {:<20} {}", "events:".dim(), journal_events.to_string().cyan());
+    eprintln!(
+        "    {:<20} {}",
+        "events:".dim(),
+        journal_events.to_string().cyan()
+    );
     eprintln!("    {:<20} {}", "file:".dim(), journal_path.dim());
 
     // Cloud ingestion stats
@@ -1427,17 +1424,9 @@ fn handle_session_verify(state: &ReplState) {
             );
             let overflow = mc.ingestion_overflow_count();
             if lag > 0 {
-                eprintln!(
-                    "    {:<20} {}",
-                    "pending:".dim(),
-                    lag.to_string().yellow()
-                );
+                eprintln!("    {:<20} {}", "pending:".dim(), lag.to_string().yellow());
             } else {
-                eprintln!(
-                    "    {:<20} {}",
-                    "pending:".dim(),
-                    "0 (synced)".green()
-                );
+                eprintln!("    {:<20} {}", "pending:".dim(), "0 (synced)".green());
             }
             if overflow > 0 {
                 eprintln!(
@@ -1458,11 +1447,7 @@ fn handle_session_verify(state: &ReplState) {
                     } else {
                         last_err.clone()
                     };
-                    eprintln!(
-                        "    {:<20} {}",
-                        "last error:".dim(),
-                        truncated.red()
-                    );
+                    eprintln!("    {:<20} {}", "last error:".dim(), truncated.red());
                 }
             }
         } else {
@@ -1489,11 +1474,7 @@ fn handle_session_verify(state: &ReplState) {
             .map(|entries| {
                 entries
                     .flatten()
-                    .filter(|e| {
-                        e.file_name()
-                            .to_string_lossy()
-                            .ends_with(".jsonl.gz")
-                    })
+                    .filter(|e| e.file_name().to_string_lossy().ends_with(".jsonl.gz"))
                     .count()
             })
             .unwrap_or(0);

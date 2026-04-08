@@ -236,10 +236,7 @@ impl MatrixCloudRuntime {
             match tokio::time::timeout(std::time::Duration::from_secs(15), jh).await {
                 Ok(Ok(())) => {}
                 Ok(Err(e)) => {
-                    astra_core::agent_warn!(
-                        "ingestion",
-                        "worker join failed: {e}"
-                    );
+                    astra_core::agent_warn!("ingestion", "worker join failed: {e}");
                 }
                 Err(_) => {
                     astra_core::agent_warn!(

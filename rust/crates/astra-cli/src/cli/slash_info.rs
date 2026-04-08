@@ -1296,11 +1296,7 @@ pub(super) async fn handle_info_command(
             // ── Identity ──
             let model_display = state.model.clone().unwrap_or_else(|| "default".to_string());
             eprintln!("  {:<12}  {}", "model".cyan(), model_display.dim());
-            eprintln!(
-                "  {:<12}  {}",
-                "turn".cyan(),
-                state.turn.to_string().dim()
-            );
+            eprintln!("  {:<12}  {}", "turn".cyan(), state.turn.to_string().dim());
 
             // ── Token usage bar ──
             let est_messages: Vec<serde_json::Value> = state
@@ -1421,11 +1417,7 @@ pub(super) async fn handle_info_command(
                 } else {
                     anchor.clone()
                 };
-                eprintln!(
-                    "  {:<12}  {}",
-                    "anchor".cyan(),
-                    display.dim()
-                );
+                eprintln!("  {:<12}  {}", "anchor".cyan(), display.dim());
             }
             if let Some(ref goal) = state.session_goal {
                 let display = if goal.len() > 60 {
@@ -1433,11 +1425,7 @@ pub(super) async fn handle_info_command(
                 } else {
                     goal.clone()
                 };
-                eprintln!(
-                    "  {:<12}  {}",
-                    "goal".cyan(),
-                    display.dim()
-                );
+                eprintln!("  {:<12}  {}", "goal".cyan(), display.dim());
             }
 
             eprintln!("  {}", "─".repeat(56).cyan().dim());

@@ -438,10 +438,7 @@ fn collect_hot_files(messages: &[Value], scan_turns: usize) -> std::collections:
 }
 
 /// Check whether a tool result references any hot file.
-fn references_hot_file(
-    msg: &Value,
-    hot_files: &std::collections::HashSet<String>,
-) -> bool {
+fn references_hot_file(msg: &Value, hot_files: &std::collections::HashSet<String>) -> bool {
     if hot_files.is_empty() {
         return false;
     }
@@ -1544,9 +1541,8 @@ mod tests {
 
     #[test]
     fn protect_hot_file_results_empty_hot_files_noop() {
-        let messages = vec![
-            serde_json::json!({"role": "tool", "tool_call_id": "c1", "content": "stuff"}),
-        ];
+        let messages =
+            vec![serde_json::json!({"role": "tool", "tool_call_id": "c1", "content": "stuff"})];
         let hot = std::collections::HashSet::new();
         let mut ids = vec!["c1".to_string()];
         let protected = protect_hot_file_results(&mut ids, &messages, &hot);
@@ -1678,18 +1674,23 @@ mod tests {
         let result = run_micro_compact(&messages);
 
         // The tool result for call_5 (referencing src/foo.rs) should be preserved
-        let call_5_msg = result.iter().find(|m| {
-            m.get("tool_call_id").and_then(Value::as_str) == Some("call_5")
-        }).unwrap();
+        let call_5_msg = result
+            .iter()
+            .find(|m| m.get("tool_call_id").and_then(Value::as_str) == Some("call_5"))
+            .unwrap();
         assert!(
-            call_5_msg["content"].as_str().unwrap().contains("src/foo.rs"),
+            call_5_msg["content"]
+                .as_str()
+                .unwrap()
+                .contains("src/foo.rs"),
             "tool result referencing hot file should be preserved"
         );
 
         // Older tool results should be cleared (but recent ones kept)
-        let call_0_msg = result.iter().find(|m| {
-            m.get("tool_call_id").and_then(Value::as_str) == Some("call_0")
-        }).unwrap();
+        let call_0_msg = result
+            .iter()
+            .find(|m| m.get("tool_call_id").and_then(Value::as_str) == Some("call_0"))
+            .unwrap();
         assert_eq!(
             call_0_msg["content"].as_str().unwrap(),
             MICRO_COMPACT_STUB,

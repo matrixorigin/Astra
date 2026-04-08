@@ -2528,9 +2528,8 @@ mod tests {
 
     #[test]
     fn select_turns_budget_equals_total_keeps_all() {
-        let history: Vec<(String, String)> = (0..6)
-            .map(|i| (format!("q{i}"), format!("a{i}")))
-            .collect();
+        let history: Vec<(String, String)> =
+            (0..6).map(|i| (format!("q{i}"), format!("a{i}"))).collect();
         let kept = select_turns_for_compaction(&history, 6, "anything");
         assert_eq!(kept.len(), 6, "budget == total should keep all");
     }
@@ -2582,7 +2581,10 @@ mod tests {
         ];
         let kept1 = select_turns_for_compaction(&history, 3, "deploy kubernetes cluster");
         let kept2 = select_turns_for_compaction(&history, 3, "deploy kubernetes cluster");
-        assert_eq!(kept1, kept2, "tied scores should produce deterministic results");
+        assert_eq!(
+            kept1, kept2,
+            "tied scores should produce deterministic results"
+        );
     }
 
     #[test]

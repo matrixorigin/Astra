@@ -1317,13 +1317,10 @@ impl PlanModeState {
         let data_json = data_value.to_string();
 
         let checksum = crc32_hash(data_json.as_bytes());
-        let wrapper = format!(
-            "{{\"_checksum\":\"{checksum:08x}\",\"data\":{data_json}}}"
-        );
+        let wrapper = format!("{{\"_checksum\":\"{checksum:08x}\",\"data\":{data_json}}}");
 
         let tmp_path = path.with_extension("json.tmp");
-        std::fs::write(&tmp_path, &wrapper)
-            .map_err(|e| format!("write temp plan state: {e}"))?;
+        std::fs::write(&tmp_path, &wrapper).map_err(|e| format!("write temp plan state: {e}"))?;
         std::fs::rename(&tmp_path, path).map_err(|e| {
             let _ = std::fs::remove_file(&tmp_path);
             format!("rename plan state: {e}")
@@ -1345,9 +1342,10 @@ impl PlanModeState {
         })?;
 
         if let Ok(wrapper) = serde_json::from_str::<serde_json::Value>(&raw) {
-            if let (Some(checksum_str), Some(inner)) =
-                (wrapper.get("_checksum").and_then(|v| v.as_str()), wrapper.get("data"))
-            {
+            if let (Some(checksum_str), Some(inner)) = (
+                wrapper.get("_checksum").and_then(|v| v.as_str()),
+                wrapper.get("data"),
+            ) {
                 let inner_json = inner.to_string();
                 let expected = u32::from_str_radix(checksum_str, 16).unwrap_or(0);
                 let actual = crc32_hash(inner_json.as_bytes());
@@ -1383,9 +1381,7 @@ impl PlanModeState {
             Err(primary_err) => {
                 let backup = path.with_extension("json.bak");
                 if backup.exists() {
-                    eprintln!(
-                        "  ⚠ Primary state corrupted, loading backup: {primary_err}"
-                    );
+                    eprintln!("  ⚠ Primary state corrupted, loading backup: {primary_err}");
                     if let Ok(state) = Self::load_from_file(&backup) {
                         let _ = state.save_to_file(path);
                         return Ok(state);
@@ -1394,16 +1390,12 @@ impl PlanModeState {
 
                 let plans_dir = Self::plans_dir();
                 if plans_dir.exists() {
-                    let mut candidates: Vec<_> = Self::list_saved_plans()
-                        .into_iter()
-                        .collect();
+                    let mut candidates: Vec<_> = Self::list_saved_plans().into_iter().collect();
                     if !candidates.is_empty() {
                         candidates.sort_by(|a, b| b.progress_pct.cmp(&a.progress_pct));
                         let best = &candidates[0];
                         if let Ok(state) = Self::load_from_plans_dir(&best.name) {
-                            eprintln!(
-                                "  ⚠ Recovered plan '{}' from plans directory", best.goal
-                            );
+                            eprintln!("  ⚠ Recovered plan '{}' from plans directory", best.goal);
                             return Ok(state);
                         }
                     }
@@ -1585,7 +1577,10 @@ impl PlanModeState {
         if plan_id.is_empty() {
             return Err(PlanLoadError::InvalidId("plan ID must not be empty".into()));
         }
-        if !plan_id.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_') {
+        if !plan_id
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
+        {
             return Err(PlanLoadError::InvalidId(format!(
                 "'{plan_id}': only alphanumeric, dash, and underscore allowed"
             )));
@@ -7224,7 +7219,14 @@ Done!"#;
 
     #[test]
     fn validate_plan_id_rejects_slashes_and_special_chars() {
-        let bad = ["foo/bar", "foo\\bar", "plan.json", "id with space", "a;b", "a&b"];
+        let bad = [
+            "foo/bar",
+            "foo\\bar",
+            "plan.json",
+            "id with space",
+            "a;b",
+            "a&b",
+        ];
         for id in &bad {
             assert!(
                 PlanModeState::validate_plan_id(id).is_err(),
