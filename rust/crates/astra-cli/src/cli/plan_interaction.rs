@@ -5,7 +5,7 @@
 //! natural-language plan editing via LLM.
 
 use super::*;
-use crate::sse_utils::stream_sse_markdown;
+use crate::sse_utils::collect_sse_text;
 use astra_runtime::plan::PlanCommand;
 use astra_runtime::plan;
 use astra_runtime::plan::progress_bar_segments;
@@ -505,7 +505,9 @@ pub async fn handle_plan_mode_input(
 
         match resp {
             Ok(r) if r.status().is_success() => {
-                let sse_result = stream_sse_markdown(r).await;
+                let spinner = effects::Spinner::start("Generating plan".into());
+                let sse_result = collect_sse_text(r, false).await;
+                spinner.stop_clear();
                 let full_text = sse_result.text;
 
                 match parse_plan_response(&full_text) {
@@ -721,7 +723,9 @@ pub async fn handle_plan_mode_input(
 
     match resp {
         Ok(r) if r.status().is_success() => {
-            let sse_result = stream_sse_markdown(r).await;
+            let spinner = effects::Spinner::start("Regenerating plan".into());
+            let sse_result = collect_sse_text(r, false).await;
+            spinner.stop_clear();
 
             if sse_result.text.is_empty() {
                 if sse_result.event_count == 0 {
@@ -1307,7 +1311,9 @@ async fn handle_goal_submission(
 
     match resp {
         Ok(r) if r.status().is_success() => {
-            let sse_result = stream_sse_markdown(r).await;
+            let spinner = effects::Spinner::start("Generating plan".into());
+            let sse_result = collect_sse_text(r, false).await;
+            spinner.stop_clear();
             let full_text = sse_result.text;
 
             if let Some(questions) = detect_clarification_questions(&full_text) {
