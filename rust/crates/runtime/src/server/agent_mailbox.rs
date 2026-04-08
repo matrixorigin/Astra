@@ -99,42 +99,51 @@ impl AgentMessage {
 
 // ───────────────────────────── Mailbox ────────────────────────────────────
 
+/// Internal state behind a single RwLock to prevent deadlocks from
+/// multi-lock acquisition ordering.
+struct MailboxState {
+    queues: HashMap<String, VecDeque<AgentMessage>>,
+    notifiers: HashMap<String, Arc<Notify>>,
+    agents: Vec<String>,
+}
+
 /// Thread-safe in-memory mailbox for agent communication.
 ///
 /// Each registered agent has a queue of incoming messages and a `Notify` handle
 /// for efficient async waiting.
 #[derive(Clone)]
 pub struct AgentMailbox {
-    queues: Arc<RwLock<HashMap<String, VecDeque<AgentMessage>>>>,
-    notifiers: Arc<RwLock<HashMap<String, Arc<Notify>>>>,
-    agents: Arc<RwLock<Vec<String>>>,
+    state: Arc<RwLock<MailboxState>>,
 }
 
 impl AgentMailbox {
     pub fn new() -> Self {
         Self {
-            queues: Arc::new(RwLock::new(HashMap::new())),
-            notifiers: Arc::new(RwLock::new(HashMap::new())),
-            agents: Arc::new(RwLock::new(Vec::new())),
+            state: Arc::new(RwLock::new(MailboxState {
+                queues: HashMap::new(),
+                notifiers: HashMap::new(),
+                agents: Vec::new(),
+            })),
         }
     }
 
     /// Register an agent so it can receive messages.
     pub fn register(&self, agent_id: &str) {
         let id = agent_id.to_string();
-        self.queues.write().unwrap().entry(id.clone()).or_insert_with(VecDeque::new);
-        self.notifiers.write().unwrap().entry(id.clone()).or_insert_with(|| Arc::new(Notify::new()));
-        let mut agents = self.agents.write().unwrap();
-        if !agents.contains(&id) {
-            agents.push(id);
+        let mut s = self.state.write().unwrap();
+        s.queues.entry(id.clone()).or_insert_with(VecDeque::new);
+        s.notifiers.entry(id.clone()).or_insert_with(|| Arc::new(Notify::new()));
+        if !s.agents.contains(&id) {
+            s.agents.push(id);
         }
     }
 
     /// Unregister an agent, dropping its queue.
     pub fn unregister(&self, agent_id: &str) {
-        self.queues.write().unwrap().remove(agent_id);
-        self.notifiers.write().unwrap().remove(agent_id);
-        self.agents.write().unwrap().retain(|a| a != agent_id);
+        let mut s = self.state.write().unwrap();
+        s.queues.remove(agent_id);
+        s.notifiers.remove(agent_id);
+        s.agents.retain(|a| a != agent_id);
     }
 
     /// Send a message. If `to` is `"*"`, broadcasts to all registered agents
@@ -142,11 +151,12 @@ impl AgentMailbox {
     pub fn send(&self, msg: AgentMessage) {
         if msg.is_broadcast() {
             let from = msg.from.clone();
-            let targets: Vec<String> = self.agents.read().unwrap()
-                .iter()
+            let s = self.state.read().unwrap();
+            let targets: Vec<String> = s.agents.iter()
                 .filter(|a| **a != from)
                 .cloned()
                 .collect();
+            drop(s); // release read lock before enqueue which needs write
             for target in targets {
                 let mut cloned = msg.clone();
                 cloned.to = target.clone();
@@ -159,24 +169,28 @@ impl AgentMailbox {
     }
 
     fn enqueue(&self, agent_id: &str, msg: AgentMessage) {
-        if let Some(q) = self.queues.write().unwrap().get_mut(agent_id) {
+        let mut s = self.state.write().unwrap();
+        if let Some(q) = s.queues.get_mut(agent_id) {
             q.push_back(msg);
         }
-        if let Some(n) = self.notifiers.read().unwrap().get(agent_id) {
+        let notifier = s.notifiers.get(agent_id).cloned();
+        drop(s); // release lock before notify
+        if let Some(n) = notifier {
             n.notify_one();
         }
     }
 
     /// Try to receive a message without waiting. Returns `None` if queue is empty.
     pub fn try_recv(&self, agent_id: &str) -> Option<AgentMessage> {
-        self.queues.write().unwrap().get_mut(agent_id)?.pop_front()
+        self.state.write().unwrap().queues.get_mut(agent_id)?.pop_front()
     }
 
     /// Drain all pending messages for an agent.
     pub fn drain(&self, agent_id: &str) -> Vec<AgentMessage> {
-        self.queues
+        self.state
             .write()
             .unwrap()
+            .queues
             .get_mut(agent_id)
             .map(|q| q.drain(..).collect())
             .unwrap_or_default()
@@ -188,7 +202,7 @@ impl AgentMailbox {
             return Some(msg);
         }
 
-        let notifier = self.notifiers.read().unwrap().get(agent_id)?.clone();
+        let notifier = self.state.read().unwrap().notifiers.get(agent_id)?.clone();
 
         tokio::select! {
             _ = notifier.notified() => {
@@ -200,12 +214,12 @@ impl AgentMailbox {
 
     /// Number of pending messages for an agent.
     pub fn pending_count(&self, agent_id: &str) -> usize {
-        self.queues.read().unwrap().get(agent_id).map_or(0, |q| q.len())
+        self.state.read().unwrap().queues.get(agent_id).map_or(0, |q| q.len())
     }
 
     /// List all registered agent IDs.
     pub fn registered_agents(&self) -> Vec<String> {
-        self.agents.read().unwrap().clone()
+        self.state.read().unwrap().agents.clone()
     }
 }
 

@@ -68,7 +68,13 @@ impl StreamingToolExecutor {
         let completed = self.completed.clone();
         let cid = call_id.clone();
 
+        // Insert a placeholder into inflight BEFORE spawning to avoid race
+        // where the task completes before the handle is recorded.
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
         let handle = tokio::spawn(async move {
+            // Wait until handle is registered in inflight map
+            let _ = rx.await;
+
             let _permit = match sem.try_acquire() {
                 Ok(p) => p,
                 Err(_) => {
@@ -98,6 +104,8 @@ impl StreamingToolExecutor {
         });
 
         self.inflight.lock().await.insert(call_id, handle);
+        // Signal task to proceed now that handle is in the map
+        let _ = tx.send(());
         true
     }
 

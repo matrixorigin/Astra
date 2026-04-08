@@ -237,16 +237,22 @@ impl CompressionLayer for ToolResultTruncation {
             if let Some(content) = msg.get("content").and_then(|v| v.as_str()) {
                 let len = content.len();
                 if len > self.max_keep_chars {
+                    // Safe UTF-8 truncation: find the nearest char boundary
+                    let safe_end = content
+                        .char_indices()
+                        .take_while(|(i, _)| *i < self.max_keep_chars)
+                        .last()
+                        .map(|(i, c)| i + c.len_utf8())
+                        .unwrap_or(0);
                     let truncated = format!(
                         "{}… [truncated, was {} chars]",
-                        &content[..self.max_keep_chars],
+                        &content[..safe_end],
                         len
                     );
                     removed_chars += len - truncated.len();
-                    msg.as_object_mut().unwrap().insert(
-                        "content".into(),
-                        Value::String(truncated),
-                    );
+                    if let Some(obj) = msg.as_object_mut() {
+                        obj.insert("content".into(), Value::String(truncated));
+                    }
                     count += 1;
                 }
             }
