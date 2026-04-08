@@ -83,8 +83,9 @@ async fn enrich_with_templates(
     let Some(mc) = matrix_runtime else {
         if verbose {
             eprintln!(
-                "  {} No cloud connection — skipping template search",
-                "⋯".dim()
+                "  {} {}",
+                "⋯".dim(),
+                "No cloud connection — skipping template search".dim()
             );
         }
         return;
@@ -93,20 +94,20 @@ async fn enrich_with_templates(
     let uid = user_id.unwrap_or("anonymous");
 
     if verbose {
-        eprintln!("  {} Searching for similar plan templates...", "⋯".dim());
+        eprintln!("  {} {}", "⋯".cyan(), "Searching for similar plan templates…".dim());
     }
 
     let templates = plan_decompose::query_similar_templates(pool, uid, goal, 3).await;
     if !templates.is_empty() {
         eprintln!(
             "  {} Found {} learned template{}",
-            "📋".cyan(),
-            templates.len(),
+            theme::icon_ok(),
+            format!("{}", templates.len()).cyan(),
             if templates.len() == 1 { "" } else { "s" }
         );
         context.prior_templates = templates;
     } else if verbose {
-        eprintln!("  {} No matching templates found", "⋯".dim());
+        eprintln!("  {} {}", "⋯".dim(), "No matching templates found".dim());
     }
 }
 

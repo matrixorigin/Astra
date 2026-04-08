@@ -125,12 +125,12 @@ fn display_contract_summary(contract: &TaskContract) {
     let n_criteria: usize = contract.subtasks.iter().map(|s| s.criteria.len()).sum();
     let n_global = contract.global_verification.len();
     eprintln!(
-        "\n{}  Contract generated: {} subtasks, {} criteria, {} global checks  [{}]",
-        "📋".cyan(),
-        n_subtasks,
-        n_criteria,
-        n_global,
-        prefix_chars(&contract.contract_id, 8),
+        "\n  {} Contract: {} subtasks, {} criteria, {} global checks  {}",
+        "▸".cyan(),
+        format!("{n_subtasks}").cyan(),
+        format!("{n_criteria}").cyan(),
+        format!("{n_global}").cyan(),
+        format!("[{}]", prefix_chars(&contract.contract_id, 8)).dim(),
     );
 }
 

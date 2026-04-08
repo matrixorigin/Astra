@@ -43,8 +43,9 @@ pub(super) async fn enrich_with_templates(
     let Some(mc) = matrix_runtime else {
         if verbose {
             eprintln!(
-                "  {} No cloud connection — skipping template search",
-                "⋯".dim()
+                "  {} {}",
+                "⋯".dim(),
+                "No cloud connection — skipping template search".dim()
             );
         }
         return;
@@ -53,20 +54,20 @@ pub(super) async fn enrich_with_templates(
     let uid = user_id.unwrap_or("anonymous");
 
     if verbose {
-        eprintln!("  {} Searching for similar plan templates...", "⋯".dim());
+        eprintln!("  {} {}", "⋯".cyan(), "Searching for similar plan templates…".dim());
     }
 
     let templates = plan::query_similar_templates(pool, uid, goal, 3).await;
     if !templates.is_empty() {
         eprintln!(
             "  {} Found {} learned template{}",
-            "📋".cyan(),
-            templates.len(),
+            theme::icon_ok(),
+            format!("{}", templates.len()).cyan(),
             if templates.len() == 1 { "" } else { "s" }
         );
         context.prior_templates = templates;
     } else if verbose {
-        eprintln!("  {} No matching templates found", "⋯".dim());
+        eprintln!("  {} {}", "⋯".dim(), "No matching templates found".dim());
     }
 }
 
@@ -139,6 +140,62 @@ pub(super) fn prompt_plan_confirmation(subtask_count: usize) -> Option<PlanConfi
             Some(PlanConfirmChoice::Cancel)
         }
     }
+}
+
+/// Print a styled execution preview — replaces plain `format_execution_preview()`.
+fn eprint_styled_execution_preview(plan: &astra_runtime::plan::TaskPlan) {
+    let analysis = plan::analyze_parallelism(plan);
+    let ready = plan.ready_subtasks();
+
+    eprintln!(
+        "  {} {} subtasks, {} ready",
+        "Execution:".bold(),
+        format!("{}", plan.subtasks.len()).cyan(),
+        format!("{}", ready.len()).green()
+    );
+
+    if analysis.groups.len() > 1 || analysis.groups.first().map(|g| g.len()).unwrap_or(0) > 1 {
+        for (i, group) in analysis.groups.iter().enumerate() {
+            let ids: Vec<_> = group.iter().map(|id| format!("{}", id.as_str().cyan())).collect();
+            let parallel = if group.len() > 1 {
+                format!(" {}", "(parallel)".dim())
+            } else {
+                String::new()
+            };
+            eprintln!("    {} {}{}: {}", "›".dim(), format!("Round {}", i + 1).dim(), parallel, ids.join(", "));
+        }
+    }
+
+    if !analysis.conflicts.is_empty() {
+        eprint!("    {} {} file conflict(s): ", theme::icon_warn(), analysis.conflicts.len());
+        let strs: Vec<_> = analysis
+            .conflicts
+            .iter()
+            .map(|c| format!("{} ↔ {} ({})", c.subtask_a, c.subtask_b, c.shared_files.join(", ")))
+            .collect();
+        eprintln!("{}", strs.join(", "));
+    }
+
+    let total_effort: usize = plan
+        .subtasks
+        .iter()
+        .map(|s| match s.effort.as_deref() {
+            Some("large") => 3,
+            Some("medium") => 2,
+            _ => 1,
+        })
+        .sum();
+    let effort_label = match total_effort {
+        0..=3 => "low".green().to_string(),
+        4..=8 => "medium".yellow().to_string(),
+        _ => "high".red().to_string(),
+    };
+    eprintln!(
+        "  {} {} ({} units)",
+        "Effort:".bold(),
+        effort_label,
+        format!("{total_effort}").dim()
+    );
 }
 
 /// Compact colored progress bar — uses `astra_runtime::plan::progress_bar_segments` so `filled`
@@ -740,7 +797,7 @@ async fn handle_plan_command(
     api: &astra_thin_client::ThinClient,
 ) -> Result<(), String> {
     use plan::{
-        PlanExecutionConfig, PlanModeState, format_execution_preview,
+        PlanExecutionConfig, PlanModeState,
     };
 
     match cmd {
@@ -872,17 +929,17 @@ async fn handle_plan_command(
             let goal = plan_state.goal.clone();
 
             eprintln!();
-            eprint!("{}", format_execution_preview(&plan));
+            eprint_styled_execution_preview(&plan);
             eprintln!();
 
             if step_by_step {
                 eprintln!(
-                    "{}  Step-by-step mode: you'll confirm each subtask before execution.",
+                    "  {} Step-by-step mode: you'll confirm each subtask before execution.",
                     "⚙".cyan()
                 );
                 eprintln!(
-                    "{}  Staying in plan mode — prompt shows {} while the run is active.",
-                    "💡".cyan(),
+                    "  {} Prompt shows {} while the run is active.",
+                    "→".dim(),
                     "plan*[…]>".yellow()
                 );
                 eprintln!();
@@ -927,12 +984,12 @@ async fn handle_plan_command(
                         state.plan_run_task_id = Some(tid.clone());
                         let short = &tid[..8.min(tid.len())];
                         eprintln!(
-                            "{}  Task created: {} ({})",
+                            "  {} Task created: {} {}",
                             theme::icon_ok(),
-                            goal,
-                            short.dim()
+                            goal.as_str().dim(),
+                            format!("({})", short).dim()
                         );
-                        eprintln!("{}  Track progress: /task status {}", "💡".cyan(), short);
+                        eprintln!("  {} Track progress: {}", "→".dim(), format!("/task status {short}").cyan());
                     }
                     Err(e) => {
                         eprintln!("{}  Could not persist task: {}", theme::icon_warn(), e);
@@ -942,15 +999,14 @@ async fn handle_plan_command(
 
             if !step_by_step {
                 eprintln!(
-                    "{}  Auto-executing plan ({} subtasks)...",
-                    "🚀".green(),
-                    plan.subtasks.len()
+                    "  {} Auto-executing plan ({} subtasks)…",
+                    "▸".green(),
+                    format!("{}", plan.subtasks.len()).cyan()
                 );
                 eprintln!(
-                    "{}  Staying in plan mode — prompt becomes {} ({} = running). {} still works.",
-                    "💡".cyan(),
+                    "  {} Prompt becomes {} while running. {} still works.",
+                    "→".dim(),
                     "plan*[…]>".yellow(),
-                    "*".yellow(),
                     "status".cyan()
                 );
                 eprintln!();

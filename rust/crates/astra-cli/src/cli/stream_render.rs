@@ -331,9 +331,9 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                 }
                 SseRenderEffect::StreamText(s) => {
                     if self.hide_streaming_assistant_text {
-                        if !s.is_empty() {
-                            self.render.push_thinking_preview_chunk(s);
-                        }
+                        // Plan decompose mode: don't show the raw JSON body in
+                        // the thinking preview.  Only genuine <thinking> content
+                        // (via ThinkingPreviewChunk) should appear there.
                         i += 1;
                         continue;
                     }
