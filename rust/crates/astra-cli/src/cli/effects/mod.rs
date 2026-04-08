@@ -98,9 +98,12 @@ pub fn interruptible_sleep(duration: std::time::Duration, stop: &AtomicBool) -> 
 ///
 /// All spinner types use this to get a consistent format:
 /// ```text
-///   ⬢ Description                              3s ⣾
-///   ⬢ [tag] Label                           12s/~45s ⣾
+///   ⬢ Description  3s ⣾
+///   ⬢ [tag] Label  12s/~45s ⣾
 /// ```
+///
+/// Time and braille are placed right after the label (not right-aligned to
+/// the terminal edge), so the line stays compact and readable.
 ///
 /// - `icon`: pre-styled icon string (e.g., `"⬢".cyan()`)
 /// - `label`: description text (rendered dim)
@@ -109,24 +112,21 @@ pub fn interruptible_sleep(duration: std::time::Duration, stop: &AtomicBool) -> 
 /// - `w`: terminal width
 pub fn paint_unified_line(icon: &str, label: &str, time_part: &str, frame: char, w: usize) {
     use crossterm::style::Stylize;
-    // Visible widths: "  " + icon + " " + label + "  " + time + " " + frame
-    let icon_vis = icon.chars().count();
-    let label_vis = label.chars().count();
-    let time_vis = time_part.chars().count();
-    let left_vis = 2 + icon_vis + 1 + label_vis;
-    let right_vis = 2 + time_vis + 1 + 1; // 2 spaces gap + time + space + frame
-    let fill = w.saturating_sub(left_vis + right_vis + 1); // +1 margin
+    let vis_width = crate::terminal_region::visible_char_width;
+    // Visible widths using proper Unicode display width + ANSI stripping
+    let icon_vis = vis_width(icon);
+    let label_vis = vis_width(label);
+    let time_vis = vis_width(time_part);
+    // Layout: "  " + icon + " " + label + "  " + time + " " + frame
+    let content_vis = 2 + icon_vis + 1 + label_vis + 2 + time_vis + 1 + 1;
 
     eprint!("\r  {icon} ");
     eprint!("{}", label.dim());
-    if fill > 0 {
-        eprint!("{}", " ".repeat(fill));
-    }
     eprint!("  {}", time_part.dim());
     eprint!(" {}", format!("{frame}").yellow());
-    let total = left_vis + fill + right_vis;
-    if total + 1 < w {
-        eprint!("{}", " ".repeat(w - total - 1));
+    // Pad trailing spaces to clear any previous longer content
+    if content_vis < w {
+        eprint!("{}", " ".repeat(w - content_vis));
     }
     let _ = io::stderr().flush();
 }
