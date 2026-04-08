@@ -26,6 +26,15 @@ pub enum HookAction {
         id: String,
         config: Option<serde_json::Value>,
     },
+    /// Send an HTTP webhook (POST with JSON body).
+    Http {
+        url: String,
+        #[serde(default)]
+        headers: std::collections::HashMap<String, String>,
+        /// Timeout in seconds for the HTTP request (default: 10).
+        #[serde(default = "default_hook_timeout")]
+        timeout_secs: u32,
+    },
 }
 
 /// Lifecycle hooks for a skill.
@@ -87,6 +96,19 @@ pub struct ToolEventHook {
     /// Optional timeout in seconds for shell actions (default: 10).
     #[serde(default = "default_hook_timeout")]
     pub timeout_secs: u32,
+    /// Execute asynchronously (non-blocking). Default: false.
+    #[serde(default)]
+    pub is_async: bool,
+    /// Execution priority — lower numbers run first. Default: 0.
+    #[serde(default)]
+    pub priority: i32,
+    /// If true, execute only once per session then auto-disable. Default: false.
+    #[serde(default)]
+    pub once: bool,
+    /// Optional condition expression (simple key=value checks on tool args).
+    /// e.g. `"tool_name=bash"` or `"path=*.rs"`.
+    #[serde(default)]
+    pub condition: Option<String>,
 }
 
 fn default_hook_timeout() -> u32 {
@@ -134,22 +156,49 @@ fn glob_match(pattern: &str, text: &str) -> bool {
 }
 
 /// A collection of tool event hooks with efficient lookup.
-#[derive(Clone, Debug, Default)]
+#[derive(Debug, Default)]
 pub struct ToolEventHookRegistry {
     hooks: Vec<ToolEventHook>,
+    /// Track which `once` hooks have already fired (by index in `hooks`).
+    fired_once: std::sync::Mutex<std::collections::HashSet<usize>>,
 }
 
 impl ToolEventHookRegistry {
     pub fn new(hooks: Vec<ToolEventHook>) -> Self {
-        Self { hooks }
+        Self {
+            hooks,
+            fired_once: std::sync::Mutex::new(std::collections::HashSet::new()),
+        }
     }
 
-    /// Return all hooks that match the given event kind and tool name.
+    /// Return all hooks that match the given event kind and tool name,
+    /// sorted by priority (ascending) and filtered by `once` status.
     pub fn matching(&self, event: ToolEventKind, tool_name: &str) -> Vec<&ToolEventHook> {
-        self.hooks
+        let fired = self.fired_once.lock().unwrap_or_else(|e| e.into_inner());
+        let mut result: Vec<(usize, &ToolEventHook)> = self
+            .hooks
             .iter()
-            .filter(|h| h.event == event && h.matches_tool(tool_name))
-            .collect()
+            .enumerate()
+            .filter(|(i, h)| {
+                h.event == event && h.matches_tool(tool_name) && !(h.once && fired.contains(i))
+            })
+            .collect();
+        result.sort_by_key(|(_, h)| h.priority);
+        result.into_iter().map(|(_, h)| h).collect()
+    }
+
+    /// Mark a `once` hook as fired (by matching identity).
+    pub fn mark_once_fired(&self, hook: &ToolEventHook) {
+        if !hook.once {
+            return;
+        }
+        let mut fired = self.fired_once.lock().unwrap_or_else(|e| e.into_inner());
+        for (i, h) in self.hooks.iter().enumerate() {
+            if std::ptr::eq(h, hook) {
+                fired.insert(i);
+                return;
+            }
+        }
     }
 
     pub fn is_empty(&self) -> bool {
@@ -390,10 +439,30 @@ pub async fn evaluate_pre_tool_hooks(
     let mut accumulated_context: Vec<String> = Vec::new();
 
     for hook in hooks {
+        // Async hooks: fire-and-forget in background
+        if hook.is_async {
+            let action = hook.action.clone();
+            let tn = tool_name.to_string();
+            let ta = tool_args.clone();
+            tokio::spawn(async move {
+                run_hook_action_fire_and_forget(&action, &tn, &ta).await;
+            });
+            continue;
+        }
+
         match &hook.action {
             HookAction::Shell { command } => {
                 let decision =
                     run_shell_pre_hook(command, tool_name, tool_args, hook.timeout_secs).await;
+                match decision {
+                    PreToolDecision::Block(reason) => return PreToolDecision::Block(reason),
+                    PreToolDecision::AllowWithContext(ctx) => accumulated_context.push(ctx),
+                    PreToolDecision::Allow => {}
+                }
+            }
+            HookAction::Http { url, headers, timeout_secs } => {
+                let decision =
+                    run_http_pre_hook(url, headers, tool_name, tool_args, *timeout_secs).await;
                 match decision {
                     PreToolDecision::Block(reason) => return PreToolDecision::Block(reason),
                     PreToolDecision::AllowWithContext(ctx) => accumulated_context.push(ctx),
@@ -439,6 +508,19 @@ pub async fn evaluate_post_tool_hooks(
     let mut current_output = tool_output.to_string();
 
     for hook in hooks {
+        // Async hooks: fire-and-forget in background
+        if hook.is_async {
+            let action = hook.action.clone();
+            let tn = tool_name.to_string();
+            let ta = tool_args.clone();
+            let out = current_output.clone();
+            tokio::spawn(async move {
+                run_hook_action_fire_and_forget(&action, &tn, &ta).await;
+                let _ = out; // capture for potential future use
+            });
+            continue;
+        }
+
         match &hook.action {
             HookAction::Shell { command } => {
                 if let Some(modified) = run_shell_post_hook(
@@ -447,6 +529,20 @@ pub async fn evaluate_post_tool_hooks(
                     tool_args,
                     &current_output,
                     hook.timeout_secs,
+                )
+                .await
+                {
+                    current_output = modified;
+                }
+            }
+            HookAction::Http { url, headers, timeout_secs } => {
+                if let Some(modified) = run_http_post_hook(
+                    url,
+                    headers,
+                    tool_name,
+                    tool_args,
+                    &current_output,
+                    *timeout_secs,
                 )
                 .await
                 {
@@ -648,6 +744,162 @@ fn parse_post_hook_output(stdout: &[u8]) -> Option<String> {
     }
 }
 
+// ── HTTP hook execution ─────────────────────────────────────────────────────
+
+/// Execute an HTTP webhook for PreToolUse, returning a decision.
+async fn run_http_pre_hook(
+    url: &str,
+    headers: &std::collections::HashMap<String, String>,
+    tool_name: &str,
+    tool_args: &serde_json::Value,
+    timeout_secs: u32,
+) -> PreToolDecision {
+    let payload = serde_json::json!({
+        "hook_event": "pre_tool_use",
+        "tool_name": tool_name,
+        "tool_input": tool_args,
+    });
+
+    match http_post_json(url, headers, &payload, timeout_secs).await {
+        Some(body) => parse_pre_hook_output(body.as_bytes()),
+        None => PreToolDecision::Allow,
+    }
+}
+
+/// Execute an HTTP webhook for PostToolUse, returning modified output if any.
+async fn run_http_post_hook(
+    url: &str,
+    headers: &std::collections::HashMap<String, String>,
+    tool_name: &str,
+    tool_args: &serde_json::Value,
+    tool_output: &str,
+    timeout_secs: u32,
+) -> Option<String> {
+    let payload = serde_json::json!({
+        "hook_event": "post_tool_use",
+        "tool_name": tool_name,
+        "tool_input": tool_args,
+        "tool_output": tool_output,
+    });
+
+    match http_post_json(url, headers, &payload, timeout_secs).await {
+        Some(body) => parse_post_hook_output(body.as_bytes()),
+        None => None,
+    }
+}
+
+/// POST JSON to a URL with timeout. Returns response body on success, None on failure.
+async fn http_post_json(
+    url: &str,
+    extra_headers: &std::collections::HashMap<String, String>,
+    payload: &serde_json::Value,
+    timeout_secs: u32,
+) -> Option<String> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
+
+    let timeout = std::time::Duration::from_secs(timeout_secs as u64);
+    let body = payload.to_string();
+
+    // Simple HTTP POST using tokio TcpStream (no external HTTP client dependency).
+    // Parse URL to extract host, port, path.
+    let url_str = url.trim();
+    let (host, port, path) = if let Some(rest) = url_str.strip_prefix("http://") {
+        parse_http_url(rest, 80)
+    } else if url_str.starts_with("https://") {
+        // HTTPS not supported without TLS — log warning and skip.
+        astra_core::agent_warn!("hook", "HTTP hook: HTTPS not supported, skipping {}", url);
+        return None;
+    } else {
+        parse_http_url(url_str, 80)
+    };
+
+    let connect_fut = async {
+        let addr = format!("{}:{}", host, port);
+        let mut stream = TcpStream::connect(&addr).await.ok()?;
+
+        let request = format!(
+            "POST {} HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{}\r\n{}",
+            path, host, body.len(),
+            extra_headers.iter().map(|(k, v)| format!("{}: {}\r\n", k, v)).collect::<String>(),
+            body
+        );
+        stream.write_all(request.as_bytes()).await.ok()?;
+
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await.ok()?;
+
+        let text = String::from_utf8_lossy(&response);
+        // Simple HTTP response body extraction: find blank line after headers.
+        if let Some(idx) = text.find("\r\n\r\n") {
+            Some(text[idx + 4..].to_string())
+        } else {
+            None
+        }
+    };
+
+    match tokio::time::timeout(timeout, connect_fut).await {
+        Ok(Some(body)) => Some(body),
+        _ => {
+            astra_core::agent_warn!("hook", "HTTP hook to {} timed out or failed", url);
+            None
+        }
+    }
+}
+
+/// Parse an HTTP URL (without scheme) into (host, port, path).
+fn parse_http_url(url_without_scheme: &str, default_port: u16) -> (String, u16, String) {
+    let (host_port, path) = if let Some(idx) = url_without_scheme.find('/') {
+        (
+            &url_without_scheme[..idx],
+            url_without_scheme[idx..].to_string(),
+        )
+    } else {
+        (url_without_scheme, "/".to_string())
+    };
+
+    let (host, port) = if let Some(idx) = host_port.rfind(':') {
+        let port_str = &host_port[idx + 1..];
+        if let Ok(p) = port_str.parse::<u16>() {
+            (host_port[..idx].to_string(), p)
+        } else {
+            (host_port.to_string(), default_port)
+        }
+    } else {
+        (host_port.to_string(), default_port)
+    };
+
+    (host, port, path)
+}
+
+// ── Fire-and-forget helper for async hooks ──────────────────────────────────
+
+/// Execute a hook action without waiting for completion or checking results.
+async fn run_hook_action_fire_and_forget(
+    action: &HookAction,
+    tool_name: &str,
+    tool_args: &serde_json::Value,
+) {
+    match action {
+        HookAction::Shell { command } => {
+            let _ = run_shell_pre_hook(command, tool_name, tool_args, 30).await;
+        }
+        HookAction::Http {
+            url,
+            headers,
+            timeout_secs,
+        } => {
+            let payload = serde_json::json!({
+                "hook_event": "async_hook",
+                "tool_name": tool_name,
+                "tool_input": tool_args,
+            });
+            let _ = http_post_json(url, headers, &payload, *timeout_secs).await;
+        }
+        _ => {}
+    }
+}
+
 /// Events emitted during the skill lifecycle.
 ///
 /// Can be consumed by telemetry, logging, or debugging systems.
@@ -693,6 +945,20 @@ pub enum SessionEvent {
     UserPromptSubmit,
     /// Fires when a sub-agent (delegation) is spawned.
     SubagentStart,
+    /// Fires when a sub-agent completes (either success or failure).
+    SubagentStop,
+    /// Fires before context compaction begins.
+    PreCompact,
+    /// Fires after context compaction completes.
+    PostCompact,
+    /// Fires when a file has been written or modified by a tool.
+    FileChanged,
+    /// Fires when the working directory changes.
+    CwdChanged,
+    /// Fires when a turn begins (before LLM call).
+    TurnStart,
+    /// Fires when a turn completes (after tool execution + post-tool policy).
+    TurnEnd,
 }
 
 /// A single session event hook configuration.
@@ -707,6 +973,18 @@ pub struct SessionEventHook {
     /// Timeout in seconds for shell actions (default: 10).
     #[serde(default = "default_hook_timeout")]
     pub timeout_secs: u32,
+    /// Execute asynchronously (non-blocking). Default: false.
+    #[serde(default)]
+    pub is_async: bool,
+    /// Execution priority — lower numbers run first. Default: 0.
+    #[serde(default)]
+    pub priority: i32,
+    /// If true, execute only once per session then auto-disable. Default: false.
+    #[serde(default)]
+    pub once: bool,
+    /// Optional condition expression.
+    #[serde(default)]
+    pub condition: Option<String>,
 }
 
 /// Output from a session event hook execution.
@@ -719,19 +997,46 @@ pub struct SessionHookOutput {
 }
 
 /// Registry of session event hooks with lookup by event type.
-#[derive(Clone, Debug, Default)]
+#[derive(Debug, Default)]
 pub struct SessionEventHookRegistry {
     hooks: Vec<SessionEventHook>,
+    /// Track which `once` hooks have already fired (by index).
+    fired_once: std::sync::Mutex<std::collections::HashSet<usize>>,
 }
 
 impl SessionEventHookRegistry {
     pub fn new(hooks: Vec<SessionEventHook>) -> Self {
-        Self { hooks }
+        Self {
+            hooks,
+            fired_once: std::sync::Mutex::new(std::collections::HashSet::new()),
+        }
     }
 
-    /// Return all hooks matching the given event.
+    /// Return all hooks matching the given event, sorted by priority and filtered by `once`.
     pub fn matching(&self, event: SessionEvent) -> Vec<&SessionEventHook> {
-        self.hooks.iter().filter(|h| h.event == event).collect()
+        let fired = self.fired_once.lock().unwrap_or_else(|e| e.into_inner());
+        let mut result: Vec<(usize, &SessionEventHook)> = self
+            .hooks
+            .iter()
+            .enumerate()
+            .filter(|(i, h)| h.event == event && !(h.once && fired.contains(i)))
+            .collect();
+        result.sort_by_key(|(_, h)| h.priority);
+        result.into_iter().map(|(_, h)| h).collect()
+    }
+
+    /// Mark a `once` hook as fired.
+    pub fn mark_once_fired(&self, hook: &SessionEventHook) {
+        if !hook.once {
+            return;
+        }
+        let mut fired = self.fired_once.lock().unwrap_or_else(|e| e.into_inner());
+        for (i, h) in self.hooks.iter().enumerate() {
+            if std::ptr::eq(h, hook) {
+                fired.insert(i);
+                return;
+            }
+        }
     }
 
     /// Check if any hooks exist for the given event (no allocation).
@@ -801,6 +1106,20 @@ pub async fn evaluate_session_hooks(
                     id,
                     event
                 );
+            }
+            HookAction::Http { url, headers, timeout_secs } => {
+                let payload = serde_json::json!({
+                    "hook_event": format!("{:?}", event).to_lowercase(),
+                    "session_id": session_id,
+                    "user_message": user_message,
+                });
+                if let Some(body) = http_post_json(url, headers, &payload, *timeout_secs).await {
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) {
+                        if let Some(ctx) = v.get("context").and_then(|c| c.as_str()) {
+                            contexts.push(ctx.to_string());
+                        }
+                    }
+                }
             }
         }
     }
@@ -1127,6 +1446,10 @@ mod tests {
                 command: "check".into(),
             },
             timeout_secs: 10,
+        is_async: false,
+        condition: None,
+        once: false,
+        priority: 0,
         };
         assert!(hook.matches_tool("bash"));
         assert!(!hook.matches_tool("read_file"));
@@ -1141,6 +1464,10 @@ mod tests {
                 command: "lint".into(),
             },
             timeout_secs: 10,
+        is_async: false,
+        condition: None,
+        once: false,
+        priority: 0,
         };
         assert!(hook.matches_tool("write_file"));
         assert!(hook.matches_tool("write_new_file"));
@@ -1156,6 +1483,10 @@ mod tests {
                 command: "log".into(),
             },
             timeout_secs: 10,
+        is_async: false,
+        condition: None,
+        once: false,
+        priority: 0,
         };
         assert!(hook.matches_tool("bash"));
         assert!(hook.matches_tool("read_file"));
@@ -1170,6 +1501,10 @@ mod tests {
                 command: "echo pre".into(),
             },
             timeout_secs: 5,
+        is_async: false,
+        condition: None,
+        once: false,
+        priority: 0,
         };
         let json = serde_json::to_string(&hook).unwrap();
         let parsed: ToolEventHook = serde_json::from_str(&json).unwrap();
@@ -1186,6 +1521,10 @@ mod tests {
                     command: "pre-bash".into(),
                 },
                 timeout_secs: 10,
+            is_async: false,
+            condition: None,
+            once: false,
+            priority: 0,
             },
             ToolEventHook {
                 event: ToolEventKind::PostToolUse,
@@ -1194,6 +1533,10 @@ mod tests {
                     command: "post-bash".into(),
                 },
                 timeout_secs: 10,
+            is_async: false,
+            condition: None,
+            once: false,
+            priority: 0,
             },
             ToolEventHook {
                 event: ToolEventKind::PreToolUse,
@@ -1202,6 +1545,10 @@ mod tests {
                     command: "pre-read".into(),
                 },
                 timeout_secs: 10,
+            is_async: false,
+            condition: None,
+            once: false,
+            priority: 0,
             },
         ]);
         assert_eq!(registry.len(), 3);
@@ -1340,6 +1687,10 @@ mod tests {
                     command: "validate-command.sh".into(),
                 },
                 timeout_secs: 10,
+            is_async: false,
+            condition: None,
+            once: false,
+            priority: 0,
             },
             ToolEventHook {
                 event: ToolEventKind::PostToolUse,
@@ -1348,6 +1699,10 @@ mod tests {
                     command: "run-linter.sh".into(),
                 },
                 timeout_secs: 30,
+            is_async: false,
+            condition: None,
+            once: false,
+            priority: 0,
             },
         ];
 
@@ -1373,6 +1728,10 @@ mod tests {
                     command: "specific-bash-check".into(),
                 },
                 timeout_secs: 5,
+            is_async: false,
+            condition: None,
+            once: false,
+            priority: 0,
             },
             ToolEventHook {
                 event: ToolEventKind::PreToolUse,
@@ -1381,6 +1740,10 @@ mod tests {
                     command: "glob-bash-check".into(),
                 },
                 timeout_secs: 5,
+            is_async: false,
+            condition: None,
+            once: false,
+            priority: 0,
             },
             ToolEventHook {
                 event: ToolEventKind::PreToolUse,
@@ -1389,6 +1752,10 @@ mod tests {
                     command: "catch-all".into(),
                 },
                 timeout_secs: 5,
+            is_async: false,
+            condition: None,
+            once: false,
+            priority: 0,
             },
         ]);
 
@@ -1420,6 +1787,10 @@ mod tests {
                 command: r#"echo '{"decision": "allow"}'"#.into(),
             },
             timeout_secs: 5,
+        is_async: false,
+        condition: None,
+        once: false,
+        priority: 0,
         }]);
 
         let decision = evaluate_pre_tool_hooks(&registry, "bash", &serde_json::json!({})).await;
@@ -1435,6 +1806,10 @@ mod tests {
                 command: r#"echo '{"decision": "block", "reason": "rm -rf detected"}'"#.into(),
             },
             timeout_secs: 5,
+        is_async: false,
+        condition: None,
+        once: false,
+        priority: 0,
         }]);
 
         let decision = evaluate_pre_tool_hooks(&registry, "bash", &serde_json::json!({})).await;
@@ -1450,6 +1825,10 @@ mod tests {
                 command: r#"echo '{"decision": "allow", "context": "hook injected info"}'"#.into(),
             },
             timeout_secs: 5,
+        is_async: false,
+        condition: None,
+        once: false,
+        priority: 0,
         }]);
 
         let decision =
@@ -1469,6 +1848,10 @@ mod tests {
                 command: "exit 1".into(),
             },
             timeout_secs: 5,
+        is_async: false,
+        condition: None,
+        once: false,
+        priority: 0,
         }]);
 
         let decision = evaluate_pre_tool_hooks(&registry, "bash", &serde_json::json!({})).await;
@@ -1487,6 +1870,10 @@ mod tests {
                 command: r#"echo '{"decision": "block", "reason": "nope"}'"#.into(),
             },
             timeout_secs: 5,
+        is_async: false,
+        condition: None,
+        once: false,
+        priority: 0,
         }]);
 
         let decision =
@@ -1503,6 +1890,10 @@ mod tests {
                 command: r#"INPUT=$(cat); TOOL=$(echo "$INPUT" | grep -o '"tool_name":"[^"]*"' | head -1); if echo "$TOOL" | grep -q 'write_file'; then echo '{"decision":"block","reason":"writes blocked"}'; else echo '{"decision":"allow"}'; fi"#.into(),
             },
             timeout_secs: 5,
+        is_async: false,
+        condition: None,
+        once: false,
+        priority: 0,
         }]);
 
         let allow = evaluate_pre_tool_hooks(&registry, "read_file", &serde_json::json!({})).await;
@@ -1521,6 +1912,10 @@ mod tests {
                 command: r#"echo '{"output": "modified output"}'"#.into(),
             },
             timeout_secs: 5,
+        is_async: false,
+        condition: None,
+        once: false,
+        priority: 0,
         }]);
 
         let result =
@@ -1538,6 +1933,10 @@ mod tests {
                 command: r#"echo '{}'"#.into(),
             },
             timeout_secs: 5,
+        is_async: false,
+        condition: None,
+        once: false,
+        priority: 0,
         }]);
 
         let result =
@@ -1562,6 +1961,10 @@ mod tests {
                 command: "true".into(),
             },
             timeout_secs: 5,
+        is_async: false,
+        condition: None,
+        once: false,
+        priority: 0,
         }]);
 
         let decision = evaluate_pre_tool_hooks(&registry, "bash", &serde_json::json!({})).await;
@@ -1578,6 +1981,10 @@ mod tests {
                     command: r#"echo '{"decision":"allow","context":"hook1 info"}'"#.into(),
                 },
                 timeout_secs: 5,
+            is_async: false,
+            condition: None,
+            once: false,
+            priority: 0,
             },
             ToolEventHook {
                 event: ToolEventKind::PreToolUse,
@@ -1586,6 +1993,10 @@ mod tests {
                     command: r#"echo '{"decision":"allow","context":"hook2 info"}'"#.into(),
                 },
                 timeout_secs: 5,
+            is_async: false,
+            condition: None,
+            once: false,
+            priority: 0,
             },
         ]);
 
@@ -1789,6 +2200,10 @@ hooks:
                 command: "a".into(),
             },
             timeout_secs: 10,
+        is_async: false,
+        condition: None,
+        once: false,
+        priority: 0,
         }];
         // No default → no change
         let result = apply_default_timeout(hooks, None);
@@ -1805,6 +2220,10 @@ hooks:
                 command: "echo hello".into(),
             },
             timeout_secs: 5,
+        is_async: false,
+        condition: None,
+        once: false,
+        priority: 0,
         };
         let json = serde_json::to_string(&hook).unwrap();
         let parsed: SessionEventHook = serde_json::from_str(&json).unwrap();
@@ -1837,6 +2256,10 @@ hooks:
                     command: "greet".into(),
                 },
                 timeout_secs: 5,
+            is_async: false,
+            condition: None,
+            once: false,
+            priority: 0,
             },
             SessionEventHook {
                 event: SessionEvent::SessionEnd,
@@ -1844,6 +2267,10 @@ hooks:
                     command: "cleanup".into(),
                 },
                 timeout_secs: 5,
+            is_async: false,
+            condition: None,
+            once: false,
+            priority: 0,
             },
             SessionEventHook {
                 event: SessionEvent::SessionStart,
@@ -1852,6 +2279,10 @@ hooks:
                     value: "1".into(),
                 },
                 timeout_secs: 10,
+            is_async: false,
+            condition: None,
+            once: false,
+            priority: 0,
             },
         ]);
         assert_eq!(registry.len(), 3);
@@ -2018,6 +2449,10 @@ session_hooks:
                 command: r#"echo '{"context": "Welcome back, user!"}'"#.into(),
             },
             timeout_secs: 5,
+        is_async: false,
+        condition: None,
+        once: false,
+        priority: 0,
         }]);
 
         let output = evaluate_session_hooks(
@@ -2039,6 +2474,10 @@ session_hooks:
                 value: "done".into(),
             },
             timeout_secs: 10,
+        is_async: false,
+        condition: None,
+        once: false,
+        priority: 0,
         }]);
 
         let output =
@@ -2055,6 +2494,10 @@ session_hooks:
                 command: "echo bye".into(),
             },
             timeout_secs: 5,
+        is_async: false,
+        condition: None,
+        once: false,
+        priority: 0,
         }]);
 
         let output =
@@ -2072,6 +2515,10 @@ session_hooks:
                     command: r#"echo '{"context": "hook1"}'"#.into(),
                 },
                 timeout_secs: 5,
+            is_async: false,
+            condition: None,
+            once: false,
+            priority: 0,
             },
             SessionEventHook {
                 event: SessionEvent::SessionStart,
@@ -2079,6 +2526,10 @@ session_hooks:
                     command: r#"echo '{"context": "hook2"}'"#.into(),
                 },
                 timeout_secs: 5,
+            is_async: false,
+            condition: None,
+            once: false,
+            priority: 0,
             },
         ]);
 
@@ -2097,6 +2548,10 @@ session_hooks:
                 command: "exit 1".into(),
             },
             timeout_secs: 5,
+        is_async: false,
+        condition: None,
+        once: false,
+        priority: 0,
         }]);
 
         let output =

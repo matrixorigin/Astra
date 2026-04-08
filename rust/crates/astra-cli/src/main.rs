@@ -62,6 +62,8 @@ mod cli_formatting;
 mod cli_utils;
 #[path = "cli/command_router.rs"]
 mod command_router;
+#[path = "cli/agent_loader.rs"]
+mod agent_loader;
 #[path = "cli/delegate_subrun.rs"]
 mod delegate_subrun;
 #[path = "cli/diff_presenter.rs"]
@@ -5418,12 +5420,17 @@ async fn run_chat_repl(
             api.clone(),
             token.clone(),
             state.model.clone(),
-            project_root,
+            project_root.clone(),
             state.perm_manager.mode(),
             None, // cancel_token set per-turn
         );
         let mut registry = astra_services::AgentProfileRegistry::new();
         delegate_subrun::register_default_agents(&mut registry);
+        // Load custom agent definitions from .astra/agents/*.md (project + user level)
+        let custom_count = agent_loader::load_and_merge(&project_root, &mut registry);
+        if custom_count > 0 {
+            eprintln!("  loaded {custom_count} custom agent(s) from .astra/agents/");
+        }
         let registry = std::sync::Arc::new(tokio::sync::RwLock::new(registry));
         let run_store = std::sync::Arc::new(astra_services::runs::InMemoryRunStateStore::default());
         let engine = astra_runtime::server::delegation_engine::DelegationEngine::with_executor(

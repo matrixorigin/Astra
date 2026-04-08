@@ -696,6 +696,15 @@ impl DelegationEngine {
                 self.execute_adversarial(&request, producer_id, reviewer_id, *max_rounds)
                     .await
             }
+            CoordinationPattern::Fork {
+                tasks,
+                agent_id,
+                max_turns,
+                aggregation,
+            } => {
+                self.execute_fork(&request, tasks, agent_id, *max_turns, aggregation)
+                    .await
+            }
         }
     }
 
@@ -1241,6 +1250,170 @@ impl DelegationEngine {
                 }
             };
             results.push(rev_result);
+        }
+
+        Ok(DelegationResult::from_results(
+            &request.delegation_id,
+            results,
+            None,
+        ))
+    }
+
+    /// Fork: dispatch N tasks sharing the parent's full conversation context.
+    ///
+    /// All fork children receive the same message prefix (the parent's conversation
+    /// history up to this point), enabling prompt cache sharing across children.
+    /// Fork children cannot recursively fork or delegate.
+    async fn execute_fork(
+        &self,
+        request: &DelegationRequest,
+        tasks: &[String],
+        agent_id: &str,
+        _max_turns: u32,
+        _aggregation: &AggregationStrategy,
+    ) -> Result<DelegationResult, String> {
+        let reg = self.registry.read().await;
+        let profile = reg.get(agent_id).cloned().unwrap_or_else(|| {
+            AgentProfile::new(
+                agent_id,
+                agent_id,
+                astra_services::coordination::AgentTier::User,
+            )
+        });
+        drop(reg);
+
+        // Extract parent messages for context inheritance (if provided)
+        let parent_messages = request
+            .context
+            .get("parent_messages")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!([]));
+
+        let session_id = request
+            .context
+            .get("session_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("delegation");
+
+        // Spawn all fork children in parallel
+        let mut handles = Vec::with_capacity(tasks.len());
+        for (i, task) in tasks.iter().enumerate() {
+            let run_id = uuid::Uuid::new_v4().to_string();
+            let _ = self
+                .run_engine
+                .start_run_ext(
+                    &run_id,
+                    &request.user_id,
+                    session_id,
+                    Some(&request.parent_run_id),
+                    Some(&request.delegation_id),
+                    Some(agent_id),
+                )
+                .await;
+            self.tracker
+                .record_sub_run(SubRunRecord {
+                    run_id: run_id.clone(),
+                    parent_run_id: request.parent_run_id.clone(),
+                    delegation_id: request.delegation_id.clone(),
+                    agent_id: agent_id.to_string(),
+                    depth: request.depth + 1,
+                })
+                .await;
+            let _ = self
+                .run_engine
+                .persist_status(&run_id, "running", Some("fork"), None)
+                .await;
+            let pause_flag = self.tracker.register_pause_flag(&run_id).await;
+
+            // Build fork-specific context: parent messages + fork instruction
+            let mut fork_context = request.context.clone();
+            fork_context.insert(
+                "fork_index".to_string(),
+                serde_json::json!(i),
+            );
+            fork_context.insert(
+                "parent_messages".to_string(),
+                parent_messages.clone(),
+            );
+            fork_context.insert(
+                "is_fork_child".to_string(),
+                serde_json::json!(true),
+            );
+
+            let fork_task = format!(
+                "You are fork child #{i} of {total}.\n\
+                 Task: {task}\n\n\
+                 Rules:\n\
+                 - Do NOT fork or delegate to other agents.\n\
+                 - Execute the task directly and report results.\n\
+                 - Be concise in your output.",
+                i = i,
+                total = tasks.len(),
+                task = task,
+            );
+
+            let mut fork_profile = profile.clone();
+            fork_profile.can_delegate = false;
+            fork_profile.max_delegation_depth = 0;
+
+            let config = SubRunConfig {
+                run_id: run_id.clone(),
+                agent_profile: fork_profile,
+                task: fork_task,
+                session_id: session_id.to_string(),
+                user_id: request.user_id.clone(),
+                previous_output: None,
+                context: fork_context,
+                pause_flag: Some(pause_flag),
+                checkpoint_gate: None,
+            };
+
+            let executor = self.executor.clone();
+            let run_engine = self.run_engine.clone();
+            handles.push(tokio::spawn(async move {
+                let result = executor.execute(config).await;
+                match &result {
+                    Ok(r) => {
+                        let _ = run_engine
+                            .persist_status(&run_id, &r.status, None, r.error.as_deref())
+                            .await;
+                    }
+                    Err(e) => {
+                        let _ = run_engine
+                            .persist_status(&run_id, "failed", None, Some(e))
+                            .await;
+                    }
+                }
+                result
+            }));
+        }
+
+        // Collect all results
+        let mut results = Vec::with_capacity(handles.len());
+        for handle in handles {
+            match handle.await {
+                Ok(Ok(r)) => results.push(r),
+                Ok(Err(e)) => results.push(AgentResult {
+                    agent_id: agent_id.to_string(),
+                    run_id: uuid::Uuid::new_v4().to_string(),
+                    status: "failed".to_string(),
+                    output: None,
+                    error: Some(e),
+                    prompt_tokens: 0,
+                    completion_tokens: 0,
+                    tool_calls: 0,
+                }),
+                Err(e) => results.push(AgentResult {
+                    agent_id: agent_id.to_string(),
+                    run_id: uuid::Uuid::new_v4().to_string(),
+                    status: "failed".to_string(),
+                    output: None,
+                    error: Some(format!("fork task panicked: {}", e)),
+                    prompt_tokens: 0,
+                    completion_tokens: 0,
+                    tool_calls: 0,
+                }),
+            }
         }
 
         Ok(DelegationResult::from_results(

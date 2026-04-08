@@ -239,6 +239,9 @@ fn declarative_hooks_for_when(project_root: &Path, cfg: &FileRoot, phase: &str) 
             label: label.to_string(),
             command: command.to_string(),
             working_dir: Some(wd),
+            depends_on: Vec::new(),
+            timeout_secs: None,
+            cache_key: None,
         });
     }
     out
@@ -284,6 +287,9 @@ fn auto_detect_verify_changes_hook(
              If you only modified files outside the project (e.g. /tmp), skip all project checks."
         ),
         working_dir: Some(project_root.to_string_lossy().to_string()),
+        depends_on: Vec::new(),
+        timeout_secs: None,
+        cache_key: None,
     }]
 }
 

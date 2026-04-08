@@ -355,6 +355,104 @@ impl CacheBreakDetector {
 }
 
 // ---------------------------------------------------------------------------
+// D-12: Cache-Aware Compression Hints
+// ---------------------------------------------------------------------------
+
+/// Hint from cache diagnostics to the compression pipeline (D-4).
+/// Tells the compressor which message prefix is cache-valid and should
+/// NOT be compressed/reordered/removed.
+#[derive(Debug, Clone)]
+pub struct CacheAwareCompressionHint {
+    /// Number of messages from the start that form the cache-valid prefix.
+    /// The compression pipeline should not modify these messages.
+    pub protected_prefix_len: usize,
+    /// Estimated tokens in the protected prefix.
+    pub protected_token_estimate: usize,
+    /// Whether the cache is currently healthy (high hit rate).
+    pub cache_healthy: bool,
+    /// Suggested compression strategy based on cache state.
+    pub strategy: CompressionStrategy,
+}
+
+/// Suggested strategy for the compression pipeline.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CompressionStrategy {
+    /// Cache is healthy — only compress messages AFTER the protected prefix.
+    PreservePrefix,
+    /// Cache is already broken — free to compress anything.
+    CompressFreely,
+    /// Cache is marginal — try to preserve prefix but allow light compression.
+    PreservePrefixLight,
+}
+
+impl CacheBreakDetector {
+    /// Generate a compression hint based on current cache state.
+    ///
+    /// The hint tells the compression pipeline (D-4's `CompressionPipeline`)
+    /// how many leading messages are "cache-valid" and should be preserved.
+    ///
+    /// `message_count`: total messages in current conversation.
+    /// `system_message_count`: number of system messages at the start.
+    pub fn compression_hint(
+        &self,
+        message_count: usize,
+        system_message_count: usize,
+    ) -> CacheAwareCompressionHint {
+        let stats = &self.stats;
+        let hit_rate = stats.hit_rate_percent();
+
+        // If cache hit rate is high, protect the prefix
+        let cache_healthy = hit_rate >= 70.0;
+        let cache_marginal = hit_rate >= 40.0 && hit_rate < 70.0;
+
+        let strategy = if cache_healthy {
+            CompressionStrategy::PreservePrefix
+        } else if cache_marginal {
+            CompressionStrategy::PreservePrefixLight
+        } else {
+            CompressionStrategy::CompressFreely
+        };
+
+        // The protected prefix is: system messages + tool schema context.
+        // This is what the API caches (the stable prefix bytes).
+        let protected_prefix_len = if cache_healthy || cache_marginal {
+            // Protect system messages and first few user/assistant exchanges
+            // that form the cache hit prefix
+            system_message_count.min(message_count)
+        } else {
+            0
+        };
+
+        let protected_token_estimate = self
+            .previous
+            .as_ref()
+            .map(|s| s.cache_eligible_tokens)
+            .unwrap_or(0);
+
+        CacheAwareCompressionHint {
+            protected_prefix_len,
+            protected_token_estimate,
+            cache_healthy,
+            strategy,
+        }
+    }
+
+    /// Check if compressing a specific message range would break the cache.
+    /// Returns true if the range overlaps with the cache-valid prefix.
+    pub fn would_break_cache(
+        &self,
+        start_index: usize,
+        _end_index: usize,
+        system_message_count: usize,
+    ) -> bool {
+        if self.stats.hit_rate_percent() < 40.0 {
+            return false; // cache already broken, can't make it worse
+        }
+        start_index < system_message_count
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
@@ -735,5 +833,69 @@ mod tests {
             let e = det.record_turn(s2, Some(0)).unwrap();
             assert!(e.suggestion.is_some(), "TtlExpired should have remediation");
         }
+    }
+
+    // D-12: Cache-aware compression hint tests
+
+    #[test]
+    fn compression_hint_healthy_cache() {
+        let tools = make_tools(&["bash", "edit"]);
+        let mut det = CacheBreakDetector::new();
+
+        // Record 5 turns with no breaks → high hit rate
+        for _ in 0..5 {
+            det.record_turn(snap("prompt", &tools, "claude"), None);
+        }
+
+        let hint = det.compression_hint(20, 2);
+        assert!(hint.cache_healthy);
+        assert_eq!(hint.strategy, CompressionStrategy::PreservePrefix);
+        assert_eq!(hint.protected_prefix_len, 2);
+    }
+
+    #[test]
+    fn compression_hint_broken_cache() {
+        let tools = make_tools(&["bash"]);
+        let mut det = CacheBreakDetector::new();
+
+        // Force breaks by changing prompt each turn
+        for i in 0..5 {
+            det.record_turn(snap(&format!("prompt{}", i), &tools, "claude"), None);
+        }
+
+        let hint = det.compression_hint(20, 2);
+        assert!(!hint.cache_healthy);
+        assert_eq!(hint.strategy, CompressionStrategy::CompressFreely);
+        assert_eq!(hint.protected_prefix_len, 0);
+    }
+
+    #[test]
+    fn would_break_cache_detects_overlap() {
+        let tools = make_tools(&["bash"]);
+        let mut det = CacheBreakDetector::new();
+
+        // Build healthy cache
+        for _ in 0..5 {
+            det.record_turn(snap("prompt", &tools, "claude"), None);
+        }
+
+        // Compressing from index 0 overlaps system messages
+        assert!(det.would_break_cache(0, 5, 2));
+        // Compressing from index 3 does not
+        assert!(!det.would_break_cache(3, 10, 2));
+    }
+
+    #[test]
+    fn would_break_cache_already_broken() {
+        let tools = make_tools(&["bash"]);
+        let mut det = CacheBreakDetector::new();
+
+        // Break cache every turn
+        for i in 0..5 {
+            det.record_turn(snap(&format!("p{}", i), &tools, "claude"), None);
+        }
+
+        // Even overlapping range is fine since cache is already broken
+        assert!(!det.would_break_cache(0, 5, 2));
     }
 }

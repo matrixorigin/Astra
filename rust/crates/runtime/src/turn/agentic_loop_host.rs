@@ -4635,6 +4635,10 @@ mod tests {
                     command: r#"echo '{"context": "Branch: main | Last session: audit"}'"#.into(),
                 },
                 timeout_secs: 5,
+            is_async: false,
+            condition: None,
+            once: false,
+            priority: 0,
             },
         ]);
 
@@ -4692,6 +4696,10 @@ mod tests {
                     value: "session_active".into(),
                 },
                 timeout_secs: 10,
+            is_async: false,
+            condition: None,
+            once: false,
+            priority: 0,
             },
         ]);
 
@@ -4723,6 +4731,10 @@ mod tests {
                     command: r#"echo '{"context": "git: main, 3 uncommitted"}'"#.into(),
                 },
                 timeout_secs: 5,
+            is_async: false,
+            condition: None,
+            once: false,
+            priority: 0,
             },
             crate::skills::hooks::SessionEventHook {
                 event: crate::skills::hooks::SessionEvent::SessionStart,
@@ -4730,6 +4742,10 @@ mod tests {
                     command: r#"echo '{"context": "last session: reviewed PR #42"}'"#.into(),
                 },
                 timeout_secs: 5,
+            is_async: false,
+            condition: None,
+            once: false,
+            priority: 0,
             },
         ]);
 
@@ -4762,6 +4778,10 @@ mod tests {
                     command: "exit 1".into(), // fails
                 },
                 timeout_secs: 5,
+            is_async: false,
+            condition: None,
+            once: false,
+            priority: 0,
             },
         ]);
 
@@ -4824,6 +4844,10 @@ print(json.dumps({'context': 'user said: ' + msg}))
                     .into(),
                 },
                 timeout_secs: 5,
+            is_async: false,
+            condition: None,
+            once: false,
+            priority: 0,
             },
         ]);
 
@@ -4854,6 +4878,10 @@ print(json.dumps({'context': 'user said: ' + msg}))
                     command: r#"echo '{"context": "SHOULD NOT APPEAR"}'"#.into(),
                 },
                 timeout_secs: 5,
+            is_async: false,
+            condition: None,
+            once: false,
+            priority: 0,
             },
         ]);
 
@@ -4893,6 +4921,10 @@ print(json.dumps({'context': 'user said: ' + msg}))
                     ),
                 },
                 timeout_secs: 5,
+            is_async: false,
+            condition: None,
+            once: false,
+            priority: 0,
             },
         ]);
 

@@ -1195,6 +1195,10 @@ pub struct ToolExecutor {
     /// When present, tool names starting with `mcp_` are routed to MCP servers.
     pub mcp_manager:
         Option<std::sync::Arc<tokio::sync::RwLock<crate::mcp_client::McpClientManager>>>,
+    /// File edit journal — records before-state of every file write for undo.
+    pub file_journal: std::sync::Mutex<astra_runtime::turn::file_edit_journal::FileEditJournal>,
+    /// Current turn index for file journal entries. Set externally per-turn.
+    pub journal_turn_index: std::sync::atomic::AtomicU32,
 }
 
 /// Extract owner/repo from git remote URLs in the given directory.
@@ -1273,6 +1277,10 @@ impl ToolExecutor {
             passive_tsc_pending: AtomicBool::new(false),
             passive_lsp: passive_lsp::PassiveLspManager::new(),
             mcp_manager: None,
+            file_journal: std::sync::Mutex::new(
+                astra_runtime::turn::file_edit_journal::FileEditJournal::default(),
+            ),
+            journal_turn_index: std::sync::atomic::AtomicU32::new(0),
         }
     }
 

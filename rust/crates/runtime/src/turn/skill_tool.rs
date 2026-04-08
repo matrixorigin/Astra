@@ -1489,6 +1489,9 @@ fn run_hooks(actions: &[HookAction], skip_shell: bool) {
             HookAction::Custom { id, .. } => {
                 eprintln!("  ⚠ Custom hook '{id}' not yet implemented");
             }
+            HookAction::Http { url, .. } => {
+                eprintln!("  ⚠ HTTP hooks not supported in synchronous skill context: {url}");
+            }
         }
     }
 }
