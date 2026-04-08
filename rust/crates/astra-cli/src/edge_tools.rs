@@ -53,6 +53,8 @@ mod passive_lsp;
 mod passive_tsc_check;
 #[path = "edge_tools/shell.rs"]
 mod shell;
+#[path = "edge_tools/agent_messaging.rs"]
+pub mod agent_messaging;
 
 // ─── Tool schema ─────────────────────────────────────────────────────────────
 

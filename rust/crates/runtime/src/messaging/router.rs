@@ -165,6 +165,18 @@ impl AgentMailboxRouter {
         self.transport.unregister(addr).await
     }
 
+    /// List all registered agent IDs.
+    ///
+    /// Used by the send_message tool to display broadcast recipients.
+    pub async fn list_registered_agents(&self) -> Vec<String> {
+        self.agent_id_index
+            .read()
+            .await
+            .keys()
+            .cloned()
+            .collect()
+    }
+
     /// Resolve the address of a parent run.
     async fn resolve_parent_addr(&self, child_run_id: &str) -> Result<AgentAddress, MailboxError> {
         let parent_run_id = self
