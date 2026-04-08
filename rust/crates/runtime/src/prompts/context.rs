@@ -1021,6 +1021,82 @@ mod tests {
     }
 
     #[test]
+    fn capped_output_tokens_exactly_128k_boundary() {
+        let b = ContextBudget {
+            model_limit: 128_000,
+            compact_threshold: 0.80,
+            keep_recent_turns: 4,
+            memory_budget_chars: 3000,
+            output_reserve_ratio: 0.15,
+            compact_config: CompactConfig::default(),
+        };
+        // 128_000 >= 128_000 → large model path, cap = 16_384
+        // full_reserve = 128_000 * 0.15 = 19_200 → min(19_200, 16_384) = 16_384
+        assert_eq!(capped_output_tokens(&b), 16_384);
+    }
+
+    #[test]
+    fn capped_output_tokens_just_below_128k() {
+        let b = ContextBudget {
+            model_limit: 127_999,
+            compact_threshold: 0.80,
+            keep_recent_turns: 4,
+            memory_budget_chars: 3000,
+            output_reserve_ratio: 0.15,
+            compact_config: CompactConfig::default(),
+        };
+        // 127_999 < 128_000 → small model path, cap = 8_192
+        // full_reserve = 127_999 * 0.15 = 19_199 → min(19_199, 8_192) = 8_192
+        assert_eq!(capped_output_tokens(&b), SMALL_MODEL_OUTPUT_TOKEN_CAP);
+    }
+
+    #[test]
+    fn capped_output_tokens_tiny_4k_model() {
+        let b = ContextBudget {
+            model_limit: 4_096,
+            compact_threshold: 0.80,
+            keep_recent_turns: 4,
+            memory_budget_chars: 3000,
+            output_reserve_ratio: 0.15,
+            compact_config: CompactConfig::default(),
+        };
+        // 4_096 < 128_000 → small model path, cap = 8_192
+        // full_reserve = 4_096 * 0.15 = 614.4 → 614 → min(614, 8192) = 614
+        assert_eq!(capped_output_tokens(&b), 614);
+    }
+
+    #[test]
+    fn capped_output_tokens_extreme_reserve_ratio() {
+        let b = ContextBudget {
+            model_limit: 200_000,
+            compact_threshold: 0.80,
+            keep_recent_turns: 4,
+            memory_budget_chars: 3000,
+            output_reserve_ratio: 0.50,
+            compact_config: CompactConfig::default(),
+        };
+        // 200_000 >= 128_000 → large model path, cap = 16_384
+        // full_reserve = 200_000 * 0.50 = 100_000 → min(100_000, 16_384) = 16_384
+        assert_eq!(capped_output_tokens(&b), DEFAULT_OUTPUT_TOKEN_CAP);
+    }
+
+    #[test]
+    fn capped_output_tokens_min_1_token() {
+        let b = ContextBudget {
+            model_limit: 100,
+            compact_threshold: 0.80,
+            keep_recent_turns: 4,
+            memory_budget_chars: 3000,
+            output_reserve_ratio: 0.15,
+            compact_config: CompactConfig::default(),
+        };
+        // 100 < 128_000 → small model path, cap = 8_192
+        // full_reserve = 100 * 0.15 = 15.0 → 15 → min(15, 8192) = 15
+        let result = capped_output_tokens(&b);
+        assert!(result >= 1, "expected at least 1 token, got {result}");
+    }
+
+    #[test]
     fn capped_output_tokens_very_large_model() {
         let b = ContextBudget {
             model_limit: 2_000_000, // 2M tokens
