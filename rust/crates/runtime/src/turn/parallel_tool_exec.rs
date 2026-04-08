@@ -157,13 +157,30 @@ pub async fn execute_parallel_round(
                         };
                     }
                 };
-                let (call_id, tool_name, content, success) = exec(tc_owned).await;
-                ToolExecResult {
-                    original_index: idx,
-                    call_id,
-                    tool_name,
-                    content,
-                    success,
+                // Wrap execution in catch_unwind so panics produce an error
+                // result with the correct original_index preserved.
+                let res = tokio::task::spawn(async move {
+                    let (call_id, tool_name, content, success) = exec(tc_owned).await;
+                    ToolExecResult {
+                        original_index: idx,
+                        call_id,
+                        tool_name,
+                        content,
+                        success,
+                    }
+                }).await;
+                match res {
+                    Ok(r) => r,
+                    Err(e) => {
+                        eprintln!("[parallel_tool_exec] tool task panicked: {e}");
+                        ToolExecResult {
+                            original_index: idx,
+                            call_id: String::new(),
+                            tool_name: String::new(),
+                            content: format!("internal error: task panicked: {e}"),
+                            success: false,
+                        }
+                    }
                 }
             });
         }
@@ -175,8 +192,7 @@ pub async fn execute_parallel_round(
                     results[idx] = Some(r);
                 }
                 Err(e) => {
-                    // Task panicked — log and insert error result
-                    eprintln!("[parallel_tool_exec] spawned task panicked: {e}");
+                    eprintln!("[parallel_tool_exec] outer task panicked: {e}");
                 }
             }
         }
