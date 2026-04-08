@@ -31,7 +31,7 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     // ── Session & plan ───────────────────────────────────────────────────
     (
         "/session",
-        "Session: cwd, git, workspace — sub: history|errors|export|fork|list",
+        "Session: history|errors|export|fork|list|cleanup|verify",
     ),
     ("/session history", "Session journal-style history"),
     ("/session errors", "Session errors from journal"),
@@ -47,6 +47,11 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
         "/session list",
         "All journals + cwd / git / age from workspace",
     ),
+    (
+        "/session cleanup",
+        "Clean stale sessions: --days N, --force, --compress",
+    ),
+    ("/session verify", "Verify session integrity"),
     (
         "/plan",
         "Structured plan: go|step|pause|resume|exit|show|help",
@@ -286,18 +291,19 @@ const SLASH_FIRST_TOKEN_COMPLETIONS: &[(&str, &[(&str, &str)])] = &[
         "/skill",
         &[
             ("browse", "Browse marketplace"),
-            ("config", "Open skill config"),
             ("create", "Generate skill from session"),
             ("dev", "Skill dev mode"),
             ("health", "Skill catalog health"),
             ("info", "Skill details"),
+            ("install", "Install from marketplace"),
             ("list", "List skills"),
             ("new", "Create skill"),
+            ("pin", "Pin skill to always load"),
             ("search", "Keyword search catalog"),
+            ("stats", "Learning summary"),
             ("surfacing", "Agent catalog surfacing (dynamic/min/cap)"),
             ("system", "System skill helpers"),
             ("test", "Run skill test"),
-            ("validate", "Validate skill manifest"),
         ],
     ),
     (
@@ -369,11 +375,13 @@ const SLASH_FIRST_TOKEN_COMPLETIONS: &[(&str, &[(&str, &str)])] = &[
     (
         "/session",
         &[
+            ("cleanup", "Clean stale sessions"),
             ("errors", "Session errors"),
             ("export", "Export session"),
             ("fork", "Fork session"),
             ("history", "Session conversation history"),
             ("list", "List journals"),
+            ("verify", "Verify session integrity"),
         ],
     ),
     (
@@ -388,13 +396,6 @@ const SLASH_FIRST_TOKEN_COMPLETIONS: &[(&str, &[(&str, &str)])] = &[
         ],
     ),
     ("/turn", &[("list", "List all journal turns")]),
-    (
-        "/search",
-        &[
-            ("files", "File glob search"),
-            ("review", "Search review changes"),
-        ],
-    ),
     (
         "/style",
         &[
@@ -478,8 +479,6 @@ const DYN_SECOND_TOKEN: &[(&str, &str, DynKey)] = &[
     ("/skill", "dev", DynKey::SkillName),
     ("/skill", "test", DynKey::SkillName),
     ("/skill", "info", DynKey::SkillName),
-    ("/skill", "config", DynKey::SkillName),
-    ("/skill", "validate", DynKey::SkillName),
     ("/mcp", "ping", DynKey::McpServer),
     ("/mcp", "log-level", DynKey::McpServer),
 ];
@@ -861,6 +860,7 @@ fn slash_argument_hint(command: &str) -> Option<&'static str> {
         "/mcp" => Some("[status|servers|prompts|resources|prompt|add|remove|ping|complete]"),
         "/memory" => Some("[list|search <q>|inspect <id>]"),
         "/diff" => Some("[staged|unstaged|stat|show <rev>|help|<paths…>]"),
+        "/session" => Some("[history|errors|export|fork|list|cleanup|verify]"),
         "/plan" => {
             Some("[go|step|pause|resume|exit|status|show|help]")
         }

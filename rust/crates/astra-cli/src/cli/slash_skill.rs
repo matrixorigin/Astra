@@ -1387,9 +1387,17 @@ Follow these steps:
 
         _ => {
             eprintln!(
-                        "{}",
-                        format!("  Unknown /skill subcommand: '{sub}'. Try /skill list, /skill search, /skill surfacing, /skill search-remote, /skill browse, /skill trending, /skill installed, /skill info, /skill info <n> --raw, /skill new, /skill create, /skill test, /skill dev, /skill health, /skill stats, /skill pin, /skill unpin, /skill install, /skill publish, /skill uninstall, /skill upgrade, /skill rollback, /skill check-update, /skill pack, /skill unpack, /skill inspect, /skill compose-info, /skill upload-quality").yellow()
-                    );
+                "{}",
+                format!("  Unknown /skill subcommand: '{sub}'").yellow()
+            );
+            eprintln!(
+                "  {}",
+                "Common: list · info · search · new · test · dev · health · surfacing".dim()
+            );
+            eprintln!(
+                "  {}",
+                "Marketplace: browse · install · publish · trending · installed".dim()
+            );
         }
     }
     Ok(())
