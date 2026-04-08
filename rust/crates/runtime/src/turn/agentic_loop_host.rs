@@ -356,6 +356,9 @@ pub struct AgenticLoopState {
 
     /// Dead letter queue for permanently failed messages.
     pub dead_letter_queue: Option<std::sync::Arc<crate::messaging::dead_letter::DeadLetterQueue>>,
+
+    /// Unified messaging metrics (optional, shared across agents in a delegation).
+    pub messaging_metrics: Option<std::sync::Arc<crate::messaging::metrics::MessagingMetrics>>,
 }
 
 /// Consecutive same-category error turns before forcing a strategy change.
@@ -924,12 +927,18 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
                             if let Some(ref tracker) = state.ack_tracker {
                                 tracker.acknowledge(message_id).await;
                             }
+                            if let Some(ref metrics) = state.messaging_metrics {
+                                metrics.acks_received.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            }
                             parts.push(format!("[{from_label} ack]: message {message_id} acknowledged"));
                             continue;
                         }
                         crate::messaging::types::MessagePayload::Nack { message_id, reason } => {
                             if let Some(ref tracker) = state.ack_tracker {
                                 tracker.reject(message_id, reason.clone()).await;
+                            }
+                            if let Some(ref metrics) = state.messaging_metrics {
+                                metrics.nacks_received.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             }
                             let r = reason.as_deref().unwrap_or("no reason");
                             parts.push(format!("[{from_label} nack]: message {message_id} rejected — {r}"));
@@ -938,10 +947,18 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
                         _ => {}
                     }
 
+                    // Track received message.
+                    if let Some(ref metrics) = state.messaging_metrics {
+                        metrics.messages_received.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+
                     // Auto-ack: if the sender requested ack, send one back.
                     if msg.requires_ack {
                         let ack_reply = msg.make_ack(mailbox.address.clone());
                         let _ = mailbox.send(ack_reply).await;
+                        if let Some(ref metrics) = state.messaging_metrics {
+                            metrics.acks_sent.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
                     }
 
                     match &msg.payload {
@@ -995,10 +1012,13 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
         if let Some(ref tracker) = state.ack_tracker {
             let outcomes = tracker.sweep().await;
             let retry_msgs = tracker.get_retry_messages(&outcomes).await;
-            // Re-send retry messages.
-            for retry_msg in retry_msgs {
+            // Re-send retry messages and track retries.
+            for retry_msg in &retry_msgs {
                 if let Some(ref mut mb) = state.mailbox {
-                    let _ = mb.send((*retry_msg).clone()).await;
+                    let _ = mb.send((**retry_msg).clone()).await;
+                }
+                if let Some(ref metrics) = state.messaging_metrics {
+                    metrics.retries.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
             }
             // Log failures and store in dead-letter queue.
@@ -1015,6 +1035,9 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
                             *attempts,
                         ).await;
                     }
+                    if let Some(ref metrics) = state.messaging_metrics {
+                        metrics.dead_letters.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
                 }
                 if let crate::messaging::ack_tracker::AckOutcome::Rejected { message_id, reason, message } = outcome {
                     eprintln!(
@@ -1027,6 +1050,9 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
                             crate::messaging::dead_letter::DeadLetterReason::Rejected { reason: reason.clone() },
                             1,
                         ).await;
+                    }
+                    if let Some(ref metrics) = state.messaging_metrics {
+                        metrics.dead_letters.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }
                 }
             }
@@ -1299,6 +1325,12 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
                         let send_result =
                             crate::messaging::send_tool::execute_send_message(mailbox, &args)
                                 .await;
+                        // Track metrics for successful sends.
+                        if send_result.tracked_message.is_some() || !send_result.display.starts_with("Error:") {
+                            if let Some(ref metrics) = state.messaging_metrics {
+                                metrics.messages_sent.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            }
+                        }
                         // Track ack-requiring messages.
                         if let Some(tracked_msg) = send_result.tracked_message {
                             if let Some(ref tracker) = state.ack_tracker {
@@ -2163,6 +2195,7 @@ mod tests {
             mailbox: None,
             ack_tracker: None,
             dead_letter_queue: None,
+            messaging_metrics: None,
         }
     }
 

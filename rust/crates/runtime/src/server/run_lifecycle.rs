@@ -332,6 +332,7 @@ impl AgenticRunLifecycleService {
             mailbox: None,
             ack_tracker: None,
             dead_letter_queue: None,
+            messaging_metrics: None,
         }
     }
 
@@ -1023,6 +1024,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
             mailbox: config.mailbox,
             ack_tracker: None,
             dead_letter_queue: None,
+            messaging_metrics: None,
         };
 
         let outcome = run_agentic_loop_with_host(&mut host, &mut loop_state).await;
