@@ -55,6 +55,8 @@ mod passive_tsc_check;
 mod shell;
 #[path = "edge_tools/agent_messaging.rs"]
 pub mod agent_messaging;
+#[path = "edge_tools/agent_spawning.rs"]
+pub mod agent_spawning;
 
 // ─── Tool schema ─────────────────────────────────────────────────────────────
 
