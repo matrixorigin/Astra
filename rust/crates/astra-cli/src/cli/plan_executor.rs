@@ -204,15 +204,12 @@ impl PlanOutputSink for StderrSink {
         id: &str,
     ) {
         eprintln!(
-            "\n{}  {}\n{}  Subtask {}/{}{}: {} [{}]",
+            "\n{}  {}\n{}  {} {}",
             "◆".cyan(),
             progress_bar.dim(),
-            "▶".cyan(),
-            index,
-            total,
-            group_label,
-            title,
-            id,
+            format!("▶ [{index}/{total}]").bold().cyan(),
+            title.bold(),
+            format!("[{id}]{group_label}").dim(),
         );
     }
 
@@ -221,10 +218,11 @@ impl PlanOutputSink for StderrSink {
             .map(|d| format!(" ({})", super::format_duration_short(d)))
             .unwrap_or_default();
         eprintln!(
-            "\n{}  Subtask done: {} ({}%){}",
+            "\n{}  {} {} {}{}",
             theme::icon_ok(),
-            title,
-            pct,
+            "Done:".bold(),
+            title.bold(),
+            format!("({pct}%)").cyan(),
             elapsed_str.dim()
         );
     }
@@ -239,23 +237,22 @@ impl PlanOutputSink for StderrSink {
         failure_hint: Option<String>,
     ) {
         let hint = failure_hint.map(|h| format!(" — {h}")).unwrap_or_default();
+        let counter = format!("({attempt}/{max_retries})").dim();
         if retries_exhausted {
             eprintln!(
-                "  {}  Verification failed (attempt {}/{}){}: {}",
+                "  {}  {} {counter}{}: {}",
                 theme::icon_warn(),
-                attempt,
-                max_retries,
-                hint,
-                title,
+                "Verification failed".yellow().bold(),
+                hint.dim(),
+                title.bold(),
             );
         } else {
             eprintln!(
-                "  {}  Verification failed (attempt {}/{}){}, retrying: {}",
+                "  {}  {} {counter}{}, retrying: {}",
                 "↻".yellow(),
-                attempt,
-                max_retries,
-                hint,
-                title,
+                "Verification failed".yellow(),
+                hint.dim(),
+                title.bold(),
             );
         }
     }
@@ -278,10 +275,11 @@ impl PlanOutputSink for StderrSink {
 
     fn plan_paused(&self, pct: u32, _remaining: usize, elapsed: Duration, blocked_ids: &str) {
         eprintln!(
-            "\n{}  Plan execution paused at {}%. Blocked: {}  {}",
+            "\n{}  {} at {}% — blocked: {}  {}",
             "⏸".yellow(),
-            pct,
-            blocked_ids,
+            "Plan paused".bold().yellow(),
+            format!("{pct}").cyan(),
+            blocked_ids.bold(),
             format!("({})", super::format_duration_short(elapsed)).dim(),
         );
     }
@@ -294,19 +292,19 @@ impl PlanOutputSink for StderrSink {
 
     fn step_prompt(&self, _title: &str) {
         eprintln!();
-        eprintln!("{}  Execute this subtask? (y/n/skip/abort)", "❓".yellow());
+        eprintln!("  {}  {}", "❓".yellow(), "Execute this subtask?".bold());
     }
 
     fn step_skipped(&self, title: &str) {
-        eprintln!("{}  Skipping subtask: {}", "→".cyan(), title);
+        eprintln!("  {}  Skipping: {}", "→".dim(), title.dim());
     }
 
     fn step_aborted(&self) {
-        eprintln!("{}  Plan execution aborted by user.", "⏹".red());
+        eprintln!("  {}  {}", "⏹".red(), "Plan execution aborted".bold());
     }
 
     fn step_proceeding(&self) {
-        eprintln!("{}  Proceeding...", "→".cyan());
+        eprintln!("  {}  Proceeding…", "→".cyan());
     }
 
     fn interrupted_pause(&self, pct: u32, remaining: usize) {

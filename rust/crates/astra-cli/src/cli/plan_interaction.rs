@@ -96,14 +96,29 @@ pub(super) fn eprint_plan_json_parse_failed(full_text: &str, _err: &str) {
 
 /// Print available plan mode commands (compact, for after plan generation).
 pub(super) fn eprint_plan_commands_help() {
-    eprintln!("  Type {} for all commands.", "help".cyan());
     eprintln!(
-        "  {} {} to run · {} to modify · {} to leave",
-        "→".dim(),
-        "go".cyan(),
-        "<describe changes>".dim(),
+        "  {} {} to run  {} {} to modify  {} {} to leave",
+        "▸".cyan(),
+        "go".bold().cyan(),
+        "▸".dim(),
+        "describe changes".dim(),
+        "▸".dim(),
         "exit".cyan(),
     );
+}
+
+/// Branded `inquire` theme: cyan prompt, bold+cyan highlight, dim unselected.
+fn plan_select_theme() -> inquire::ui::RenderConfig<'static> {
+    use inquire::ui::{RenderConfig, Color, StyleSheet, Attributes};
+    let cyan = Color::Rgb { r: 0, g: 200, b: 200 };
+    let mut rc = RenderConfig::default_colored();
+    rc.prompt_prefix = inquire::ui::Styled::new("▸").with_fg(cyan);
+    rc.highlighted_option_prefix = inquire::ui::Styled::new("▸").with_fg(cyan);
+    rc.selected_option = Some(
+        StyleSheet::new().with_fg(cyan).with_attr(Attributes::BOLD),
+    );
+    rc.answer = StyleSheet::new().with_fg(cyan).with_attr(Attributes::BOLD);
+    rc
 }
 
 /// Result of the interactive plan confirmation prompt.
@@ -135,6 +150,7 @@ pub(super) fn prompt_plan_confirmation(subtask_count: usize) -> Option<PlanConfi
 
     eprintln!(); // spacing before prompt
     match inquire::Select::new("Plan ready —", options)
+        .with_render_config(plan_select_theme())
         .without_help_message()
         .prompt()
     {
@@ -838,16 +854,22 @@ async fn handle_plan_command(
                         .unwrap_or(ps.goal.as_str());
                     let round = state.plan_execution_rounds;
 
-                    eprintln!("{} {goal_display}", "Plan:".bold());
+                    eprintln!("  {} {}", "Plan:".bold().cyan(), goal_display);
                     let bar = format_progress_bar(pct, 20);
-                    eprintln!("Progress: {bar} {done}/{total} ({pct}%)  round {round}");
+                    eprintln!("  {} {bar} {}/{} {}  {}",
+                        "Progress:".dim(),
+                        format!("{done}").cyan(), format!("{total}").dim(),
+                        format!("({pct}%)").bold(),
+                        format!("round {round}").dim(),
+                    );
                     if let Some(ref stid) = state.current_plan_subtask_id {
-                        eprintln!("Current: {stid}");
+                        eprintln!("  {} {}", "Current:".dim(), stid.clone().cyan());
                     }
                     if !state.plan_execution_corrections.is_empty() {
                         eprintln!(
-                            "Corrections: {} queued",
-                            state.plan_execution_corrections.len()
+                            "  {} {} queued",
+                            "Corrections:".dim(),
+                            format!("{}", state.plan_execution_corrections.len()).yellow()
                         );
                     }
                     eprintln!("{}", "  pause | resume | show | help | exit".dim());
@@ -858,21 +880,27 @@ async fn handle_plan_command(
                     let versions = ps.version_history.versions.len();
                     let edits = ps.history.len();
 
-                    eprintln!("{} {}", "Plan:".bold(), ps.goal);
+                    eprintln!("  {} {}", "Plan:".bold().cyan(), ps.goal);
                     let phase = if plan_idle_review_not_started(ps) {
                         format!("not started — type {} to run", "go".cyan())
                     } else {
                         "editing".to_string()
                     };
-                    eprintln!("Phase: {phase}");
+                    eprintln!("  {} {phase}", "Phase:".dim());
 
                     let bar = format_progress_bar(pct, 20);
-                    eprintln!("Progress: {bar} {done}/{total} ({pct}%)  v{versions} ({edits} edits)");
+                    eprintln!("  {} {bar} {}/{} {}  {} {}",
+                        "Progress:".dim(),
+                        format!("{done}").cyan(), format!("{total}").dim(),
+                        format!("({pct}%)").bold(),
+                        format!("v{versions}").dim(),
+                        format!("({edits} edits)").dim(),
+                    );
 
                     let ready = ps.plan.ready_subtasks();
                     if !ready.is_empty() {
                         let ready_ids: Vec<_> = ready.iter().map(|st| st.id.as_str()).collect();
-                        eprintln!("Ready: {}", ready_ids.join(", ").cyan());
+                        eprintln!("  {} {}", "Ready:".dim(), ready_ids.join(", ").cyan());
                     }
 
                     let blocked: Vec<_> = ps.plan.subtasks.iter()
@@ -885,7 +913,7 @@ async fn handle_plan_command(
                     if !blocked.is_empty() {
                         for st in &blocked {
                             let deps: Vec<_> = st.depends_on.iter().map(|d| d.as_str()).collect();
-                            eprintln!("  {} {} {}", "●".dim(), st.id, format!("(waiting on: {})", deps.join(", ")).dim());
+                            eprintln!("  {} {} {}", "●".dim(), st.id.clone().yellow(), format!("(waiting on: {})", deps.join(", ")).dim());
                         }
                     }
 
@@ -898,17 +926,22 @@ async fn handle_plan_command(
                 let goal = state.executing_plan_goal.as_deref().unwrap_or("(unknown)");
                 let round = state.plan_execution_rounds;
 
-                eprintln!("{} {goal}", "Plan:".bold());
+                eprintln!("  {} {goal}", "Plan:".bold().cyan());
                 let bar = format_progress_bar(pct, 20);
-                eprintln!("Progress: {bar} {done}/{total} ({pct}%)  round {round}");
+                eprintln!("  {} {bar} {}/{} {}  {}",
+                    "Progress:".dim(),
+                    format!("{done}").cyan(), format!("{total}").dim(),
+                    format!("({pct}%)").bold(),
+                    format!("round {round}").dim(),
+                );
 
                 if let Some(ref stid) = state.current_plan_subtask_id {
-                    eprintln!("Current: {stid}");
+                    eprintln!("  {} {}", "Current:".dim(), stid.clone().cyan());
                 }
 
                 let corrections = &state.plan_execution_corrections;
                 if !corrections.is_empty() {
-                    eprintln!("Corrections: {} queued", corrections.len());
+                    eprintln!("  {} {} queued", "Corrections:".dim(), format!("{}", corrections.len()).yellow());
                 }
                 eprintln!("{}", "  pause | correct <…> | cancel".dim());
             } else {
@@ -991,12 +1024,11 @@ async fn handle_plan_command(
                         state.plan_run_task_id = Some(tid.clone());
                         let short = &tid[..8.min(tid.len())];
                         eprintln!(
-                            "  {} Task created: {} {}",
+                            "  {} {} {}",
                             theme::icon_ok(),
-                            goal.as_str().dim(),
-                            format!("({})", short).dim()
+                            "Task created:".bold(),
+                            format!("{} ({})", goal, short).dim()
                         );
-                        eprintln!("  {} Track progress: {}", "→".dim(), format!("/task status {short}").cyan());
                     }
                     Err(e) => {
                         eprintln!("{}  Could not persist task: {}", theme::icon_warn(), e);
@@ -1006,15 +1038,10 @@ async fn handle_plan_command(
 
             if !step_by_step {
                 eprintln!(
-                    "  {} Auto-executing plan ({} subtasks)…",
-                    "▸".green(),
+                    "  {} {} ({} subtasks)",
+                    "▸".bold().cyan(),
+                    "Auto-executing plan".bold(),
                     format!("{}", plan.subtasks.len()).cyan()
-                );
-                eprintln!(
-                    "  {} Prompt becomes {} while running. {} still works.",
-                    "→".dim(),
-                    "plan*[…]>".yellow(),
-                    "status".cyan()
                 );
                 eprintln!();
             }

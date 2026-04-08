@@ -3314,7 +3314,7 @@ async fn start_and_monitor_plan(
     let handle = plan_executor::spawn_plan_executor(ctx, selector);
     state.plan_handle = Some(handle);
 
-    eprintln!("{}", "  🔄 Plan executing…".dim());
+    eprintln!("  {} {}", "▸".bold().cyan(), "Plan executing…".bold());
 
     // ── Block until done / paused / error ────────────────────────────
     run_blocking_plan_monitor(state).await;
@@ -3544,7 +3544,12 @@ fn display_plan_updates_live(
             } => {
                 *current_subtask_tag = id;
                 (
-                    format!("\n▸  [{index}/{total}] {title}"),
+                    format!(
+                        "\n  {} {} {}",
+                        format!("▸ [{index}/{total}]").bold().cyan(),
+                        title.bold(),
+                        ""
+                    ),
                     PostSpinner::Ttft,
                 )
             }
@@ -3558,9 +3563,9 @@ fn display_plan_updates_live(
                     .map(|d| format!(" ({})", format_duration_short(d)))
                     .unwrap_or_default();
                 if verification_passed {
-                    (format!("  {} {id}{}", theme::icon_ok(), dur.dim()), PostSpinner::Activity("Next subtask".to_string()))
+                    (format!("  {} {} {}{}", theme::icon_ok(), "done".bold(), id.dim(), dur.dim()), PostSpinner::Activity("Next subtask".to_string()))
                 } else {
-                    (format!("  {} {id} — verification failed{}", theme::icon_warn(), dur.dim()), PostSpinner::Activity("Next subtask".to_string()))
+                    (format!("  {} {} — {}{}", theme::icon_warn(), id, "verification failed".yellow(), dur.dim()), PostSpinner::Activity("Next subtask".to_string()))
                 }
             }
             PlanUpdate::SubtaskTurnResult {
